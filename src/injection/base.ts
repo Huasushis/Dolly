@@ -1,22 +1,25 @@
 import type { ContextFrame } from "../core/context.js";
-import type { EventBus, EventPayloads, EventName } from "../core/bus.js";
+import type { EventBus } from "../core/bus.js";
 
+/** An injection into the context body */
 export interface InjectionEvent {
   id: string;
   content: string;
-  target: "background" | "working";
-  priority: number;
+  priority: number; // lower = higher priority
 }
 
 export interface InjectionModule {
-  /** Unique identifier for this injection module */
   id: string;
-  /** Triggered when context changes — return injection to insert */
-  onContextChange?(frames: ContextFrame[]): InjectionEvent | null;
-  /** Triggered on any event bus event — return injection to insert */
-  onEvent?(event: EventName, payload: any): InjectionEvent | null;
-  /** Optional default prompt contribution, permanently loaded at the front */
-  defaultPrompt?(): string;
-  /** Initialize the module */
+
+  /** Initial head content — loaded into background prompt at startup. Can be empty. */
+  headContent?(): string;
+
+  /** Triggered when context body changes — return injection to add to body */
+  onContextChange?(frames: ContextFrame[]): InjectionEvent | null | Promise<InjectionEvent | null>;
+
+  /** Triggered on bus events */
+  onEvent?(event: string, payload: any): InjectionEvent | null;
+
+  /** Initialize */
   setup?(bus: EventBus): void;
 }

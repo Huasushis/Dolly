@@ -54,11 +54,11 @@ export class InjectionRegistry {
     return this.load(existing.path);
   }
 
-  getPending(frames: ContextFrame[]): InjectionEvent[] {
+  async getPending(frames: ContextFrame[]): Promise<InjectionEvent[]> {
     const pending: InjectionEvent[] = [];
     for (const { module } of this.modules.values()) {
       if (module.onContextChange) {
-        const result = module.onContextChange(frames);
+        const result = await module.onContextChange(frames);
         if (result) pending.push(result);
       }
     }
@@ -76,14 +76,16 @@ export class InjectionRegistry {
     return pending.sort((a, b) => a.priority - b.priority);
   }
 
-  getDefaultPrompt(): string {
-    const prompts: string[] = [];
+  /** Collect initial head content from all modules */
+  collectHeadContent(): Map<string, string> {
+    const head = new Map<string, string>();
     for (const { module } of this.modules.values()) {
-      if (module.defaultPrompt) {
-        prompts.push(module.defaultPrompt());
+      if (module.headContent) {
+        const content = module.headContent();
+        if (content.trim()) head.set(module.id, content);
       }
     }
-    return prompts.join("\n\n");
+    return head;
   }
 
   listModules(): Array<{ id: string; path: string }> {

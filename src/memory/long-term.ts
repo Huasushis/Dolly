@@ -61,7 +61,7 @@ export class LongTermMemory {
 
   /** Use aux LLM to summarize daily log into memory entries */
   async summarize(rawLog: ContextFrame[]): Promise<LongTermMemoryEntry[]> {
-    const logText = rawLog.map((f) => `[${f.role}] ${f.content}`).join("\n\n");
+    const logText = rawLog.map((f) => f.content).join("\n\n");
     const day = new Date().toISOString().slice(0, 10);
 
     const prompt = `你是一个记忆整理助手。以下是一天的对话日志，请从中提取重要的信息点。

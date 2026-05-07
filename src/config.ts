@@ -21,7 +21,12 @@ const dollyConfigSchema = z.object({
     base_url: "https://api.deepseek.com",
     model: "deepseek-chat",
   })),
-  aux_llm: llmConfigSchema.default(() => ({
+  memory_llm: llmConfigSchema.default(() => ({
+    api_key: process.env.DEEPSEEK_API_KEY ?? "",
+    base_url: "https://api.deepseek.com",
+    model: "deepseek-chat",
+  })),
+  guard_llm: llmConfigSchema.default(() => ({
     api_key: process.env.DEEPSEEK_API_KEY ?? "",
     base_url: "https://api.deepseek.com",
     model: "deepseek-chat",
@@ -30,10 +35,13 @@ const dollyConfigSchema = z.object({
   injection_modules: z.array(z.string()).default(() => [
     resolve(import.meta.dirname, "injection/modules/default-prompt.ts"),
     resolve(import.meta.dirname, "injection/modules/compression.ts"),
+    resolve(import.meta.dirname, "injection/modules/skill.ts"),
   ]),
   monitor_modules: z.array(z.string()).default(() => [
     resolve(import.meta.dirname, "monitor/modules/stdout.ts"),
     resolve(import.meta.dirname, "monitor/modules/forget-detector.ts"),
+    resolve(import.meta.dirname, "monitor/modules/tool-call.ts"),
+    resolve(import.meta.dirname, "monitor/modules/mcp.ts"),
   ]),
   long_term_memory_path: z.string().default(() => resolve(import.meta.dirname, "..", ".memory")),
 });

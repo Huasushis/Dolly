@@ -7,6 +7,7 @@ import { InjectionRegistry } from "./injection/registry.js";
 import { MonitorRegistry } from "./monitor/registry.js";
 import { ShortTermMemory } from "./memory/short-term.js";
 import { LongTermMemory } from "./memory/long-term.js";
+import skillModule from "./injection/modules/skill.js";
 import type { InjectionEvent } from "./injection/base.js";
 import type { ContextFrame } from "./core/context.js";
 
@@ -32,31 +33,32 @@ class Dolly {
     this.injections = new InjectionRegistry(this.bus, this.config.injection_modules);
     this.monitors = new MonitorRegistry(this.bus, this.config.monitor_modules);
     this.shortTerm = new ShortTermMemory(this.bus);
-    this.longTerm = new LongTermMemory(this.config.long_term_memory_path, this.config.aux_llm);
+    this.longTerm = new LongTermMemory(this.config.long_term_memory_path, this.config.memory_llm);
 
-    // Injection removed
+    // Inject guard LLM into skill module for trigger detection
+    const guardClient = new LLMClient(this.config.guard_llm);
+    skillModule.setGuardClient(guardClient);
+
     this.bus.on("injection.removed", (p) => {
       this.context.removeByInjectionId(p.injection_id);
     });
 
-    // Context near capacity → compressor fires
     this.bus.on("context.near_capacity", (p) => {
       const injections = this.injections.handleEvent("context.near_capacity", p);
       for (const inj of injections) this.applyInjection(inj);
     });
 
-    // Tool call detected by monitor → execute
     this.bus.on("tool.call_requested", (p) => {
       this.handleToolCall(p.tool_name, p.params);
     });
-
-    // Long-term memory auto-summarize when idle
-    this.bus.on("memory.long_term_retrieved", () => {});
   }
 
   async start(): Promise<void> {
-    const bg = this.injections.getDefaultPrompt();
-    this.context.setBackgroundPrompt(bg);
+    // Initialize head from all injection modules' headContent()
+    const headContent = this.injections.collectHeadContent();
+    for (const [injectorId, content] of headContent) {
+      this.context.setHead(injectorId, content);
+    }
 
     const dirs = [...new Set(
       [...this.config.injection_modules, ...this.config.monitor_modules]
@@ -91,33 +93,32 @@ class Dolly {
       const text = line.trim();
       if (!text) continue;
       this.resetIdleTimer();
-      await this.processText(text);
+      await this.flow(text);
     }
     rl.close();
   }
 
-  async processText(text: string): Promise<string> {
-    // User text is just an injection into the context — nothing special
-    this.context.addFrame({ role: "user", content: text, pinned: false });
+  /** Text enters the context. No command. No role. Just flow. */
+  async flow(text: string): Promise<string> {
+    // Text enters the body
+    this.context.addFrame(text);
 
-    // Let injection modules react to context change
-    const frames = this.context.getFrames();
-    const pending = this.injections.getPending(frames);
+    // Injection modules react to context change (may be async for guard_llm checks)
+    const body = this.context.getBody();
+    const pending = await this.injections.getPending(body);
     for (const inj of pending) this.applyInjection(inj);
 
-    // Long-term memory retrieval → injection
+    // Long-term memory retrieval → body injection
     const ltr = this.longTerm.injectRelevant(text, 2);
     for (const inj of ltr) {
-      this.context.addFrame({
-        role: "injection", content: inj.content, injection_id: inj.id, pinned: false,
-      });
+      const id = this.context.addFrame(inj.content, { injection_id: inj.id });
       this.shortTerm.track({
         id: inj.id, content: inj.content, relevance_score: 0.5,
         created_at: Date.now() / 1000, last_accessed: Date.now() / 1000,
       });
     }
 
-    // Build context → LLM
+    // Build messages → LLM stream
     const messages = this.context.buildMessages();
     let fullResponse = "";
     let blocked = false;
@@ -134,12 +135,14 @@ class Dolly {
               if (action.payload) {
                 this.applyInjection({
                   id: action.injection_id ?? `mon_${Date.now()}`,
-                  content: action.payload, target: "working", priority: 50,
+                  content: action.payload, priority: 50,
                 });
               }
               break;
             case "remove":
-              if (action.injection_id) this.context.removeByInjectionId(action.injection_id);
+              if (action.injection_id) {
+                this.context.removeByInjectionId(action.injection_id);
+              }
               break;
           }
         }
@@ -149,31 +152,23 @@ class Dolly {
       process.stderr.write(`\n${dim(err.message)}\n`);
     }
 
-    // Response flows back into context
-    this.context.addFrame({ role: "assistant", content: fullResponse, pinned: false });
+    // Response flows back into body
+    this.context.addFrame(fullResponse);
 
+    // Archive to daily log
     this.dailyLog.push(
-      { role: "user", content: text, id: "", timestamp: Date.now() / 1000, distance_from_end: 0, pinned: false },
-      { role: "assistant", content: fullResponse, id: "", timestamp: Date.now() / 1000, distance_from_end: 0, pinned: false }
+      { id: "", content: text, timestamp: Date.now() / 1000, pinned: false },
+      { id: "", content: fullResponse, timestamp: Date.now() / 1000, pinned: false }
     );
 
     return fullResponse;
   }
 
   private applyInjection(inj: InjectionEvent): void {
-    if (inj.target === "background") {
-      const frames = this.context.getFrames();
-      if (frames.length > 0 && frames[0].role === "system") {
-        frames[0].content += `\n\n${inj.content}`;
-      }
-    } else {
-      this.context.addFrame({
-        role: "injection",
-        content: `[INJECTION:id:${inj.id}] ${inj.content}`,
-        injection_id: inj.id,
-        pinned: inj.priority === 0,
-      });
-    }
+    this.context.addFrame(
+      `[注入:${inj.id}] ${inj.content}`,
+      { injection_id: inj.id, pinned: inj.priority === 0 }
+    );
     this.shortTerm.track({
       id: inj.id, content: inj.content,
       relevance_score: 1.0 - inj.priority / 200,
@@ -197,7 +192,7 @@ class Dolly {
     this.applyInjection({
       id: `tool_${name}_${Date.now()}`,
       content: JSON.stringify(result),
-      target: "working", priority: 30,
+      priority: 30,
     });
   }
 
@@ -216,6 +211,5 @@ class Dolly {
 const dolly = new Dolly();
 dolly.start().catch((err) => console.error("Fatal:", err));
 
-// Graceful exit
 process.on("SIGINT", async () => { await dolly.shutdown(); process.exit(0); });
 process.on("SIGTERM", async () => { await dolly.shutdown(); process.exit(0); });
