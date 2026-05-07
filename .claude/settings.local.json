@@ -4,7 +4,8 @@
       "WebFetch(domain:github.com)",
       "Bash(pnpm typecheck *)",
       "Bash(lumina --version)",
-      "Bash(lumina *)"
+      "Bash(lumina *)",
+      "Bash(claude --version)"
     ]
   }
 }
