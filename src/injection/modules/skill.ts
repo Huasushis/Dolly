@@ -1,3 +1,5 @@
+import { existsSync, readdirSync, readFileSync } from "fs";
+import { resolve } from "path";
 import type { InjectionModule, InjectionEvent } from "../base.js";
 import type { ContextFrame } from "../../core/context.js";
 import type { EventBus } from "../../core/bus.js";
@@ -9,19 +11,6 @@ interface SkillDef {
   prompt: string;
 }
 
-const builtinSkills: SkillDef[] = [
-  {
-    name: "code-review",
-    triggers: "用户要求审查代码、检查代码质量、review PR",
-    prompt: "用户要求进行代码审查。请：1) 检查逻辑正确性 2) 安全性审查 3) 性能评估 4) 代码风格改善建议。以结构化格式输出。",
-  },
-  {
-    name: "summarize",
-    triggers: "用户要求总结、摘要、概括一段内容或对话",
-    prompt: "用户要求进行总结。请提取核心要点，以简洁的列表形式输出，每个要点一句话。保留关键数据和结论。",
-  },
-];
-
 class SkillInjector implements InjectionModule {
   id = "skill";
 
@@ -31,8 +20,8 @@ class SkillInjector implements InjectionModule {
   private mcpTools: Array<{ name: string; description: string }> = [];
   private toolsInjected = false;
 
-  setup(bus: EventBus): void {
-    this.skills = [...builtinSkills];
+  setup(_bus: EventBus): void {
+    this.loadSkills();
   }
 
   setGuardClient(client: LLMClient): void {
@@ -41,14 +30,30 @@ class SkillInjector implements InjectionModule {
 
   setMcpTools(tools: Array<{ name: string; description: string }>): void {
     this.mcpTools = tools;
-    this.toolsInjected = false; // re-inject on next context change
+    this.toolsInjected = false;
+  }
+
+  /** Load skill definitions from extensions/skills/*.json */
+  private loadSkills(): void {
+    const dir = resolve(import.meta.dirname!, "..", "..", "..", "extensions", "skills");
+    if (!existsSync(dir)) return;
+    for (const file of readdirSync(dir)) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const raw = readFileSync(resolve(dir, file), "utf-8");
+        const def = JSON.parse(raw);
+        if (def.name && def.triggers && def.prompt) {
+          this.skills.push(def);
+        }
+      } catch {}
+    }
   }
 
   headContent(): string {
     return `工具调用协议：
 - 不等待结果：[TOOL:工具名]\n{参数JSON}\n[/TOOL]
 - 需要结果时务必用：[AWAIT:工具名]\n{参数JSON}\n[/TOOL]
-  注意：读取文件、查询数据等需要结果的操作用 AWAIT。仅通知类(如日志)用 TOOL。
+  注意：读取文件、查询数据等需要结果的操作用 AWAIT。仅通知类用 TOOL。
 
 记忆管理：
 - 当注入信息不再需要时输出 [FORGET:xxx]
@@ -76,7 +81,6 @@ class SkillInjector implements InjectionModule {
 
     for (const skill of this.skills) {
       if (this.seenTriggers.has(skill.name)) continue;
-
       const triggered = await this.checkTrigger(skill, recentText);
       if (!triggered) continue;
 

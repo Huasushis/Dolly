@@ -1,4 +1,6 @@
 import { createInterface } from "readline";
+import { resolve } from "path";
+import { existsSync, readFileSync } from "fs";
 import { loadConfig } from "./config.js";
 import { EventBus } from "./core/bus.js";
 import { ContextManager } from "./core/context.js";
@@ -93,29 +95,21 @@ class Dolly {
     this.injections.startWatcher(dirs);
     this.monitors.startWatcher(dirs);
 
-    // MCP
+    // MCP servers from mcp.json
     try {
-      const tools = await this.mcp.connect({
-        name: "fs",
-        command: "node",
-        args: ["node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", process.cwd()],
-      });
-      L.mcp(`filesystem 已连接: ${tools.length} 工具 (${tools.slice(0,5).join(", ")}...)`);
-    } catch (e: any) {
-      L.mcp(`filesystem 失败: ${e.message}`);
-    }
-
-    // Try playwright via npx
-    try {
-      const pwTools = await this.mcp.connect({
-        name: "playwright",
-        command: "npx",
-        args: ["-y", "@playwright/mcp@latest"],
-      });
-      L.mcp(`playwright 已连接: ${pwTools.length} 工具`);
-    } catch (e: any) {
-      L.mcp(`playwright 失败: ${e.message}`);
-    }
+      const mcpConfigPath = resolve(import.meta.dirname!, "..", "mcp.json");
+      if (existsSync(mcpConfigPath)) {
+        const mcpConfig = JSON.parse(readFileSync(mcpConfigPath, "utf-8"));
+        for (const [name, cfg] of Object.entries(mcpConfig.servers || {}) as any) {
+          try {
+            const tools = await this.mcp.connect({ name, command: cfg.command, args: cfg.args, env: cfg.env });
+            L.mcp(`${name}: ${tools.length} 工具`);
+          } catch (e: any) {
+            L.mcp(`${name}: ${e.message}`);
+          }
+        }
+      }
+    } catch {} // mcp.json optional
 
     const allTools = this.mcp.getTools();
     skillModule.setMcpTools(allTools.map((t) => ({ name: t.name, description: t.description })));

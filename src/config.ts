@@ -1,8 +1,17 @@
 import { config as loadEnv } from "dotenv";
 import { z } from "zod";
 import { resolve } from "path";
+import { existsSync, readdirSync } from "fs";
 
 loadEnv();
+
+function scanDir(dir: string, ext: string): string[] {
+  const full = resolve(import.meta.dirname, "..", dir);
+  if (!existsSync(full)) return [];
+  return readdirSync(full)
+    .filter((f) => f.endsWith(ext))
+    .map((f) => resolve(full, f));
+}
 
 const llmConfigSchema = z.object({
   api_key: z.string(),
@@ -36,12 +45,14 @@ const dollyConfigSchema = z.object({
     resolve(import.meta.dirname, "injection/modules/default-prompt.ts"),
     resolve(import.meta.dirname, "injection/modules/compression.ts"),
     resolve(import.meta.dirname, "injection/modules/skill.ts"),
+    ...scanDir("extensions/injections", ".ts"),
   ]),
   monitor_modules: z.array(z.string()).default(() => [
     resolve(import.meta.dirname, "monitor/modules/stdout.ts"),
     resolve(import.meta.dirname, "monitor/modules/forget-detector.ts"),
     resolve(import.meta.dirname, "monitor/modules/tool-call.ts"),
     resolve(import.meta.dirname, "monitor/modules/mcp.ts"),
+    ...scanDir("extensions/monitors", ".ts"),
   ]),
   long_term_memory_path: z.string().default(() => resolve(import.meta.dirname, "..", ".memory")),
 });
