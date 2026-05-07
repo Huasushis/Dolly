@@ -13,13 +13,17 @@ export class MonitorRegistry {
   private modules: Map<string, RegisteredModule> = new Map();
   private watcher?: ReturnType<typeof watch>;
 
+  private initPromise: Promise<void>;
+
   constructor(
     private bus: EventBus,
     modulePaths: string[]
   ) {
-    for (const p of modulePaths) {
-      this.load(p);
-    }
+    this.initPromise = Promise.all(modulePaths.map((p) => this.load(p))).then(() => {});
+  }
+
+  async ready(): Promise<void> {
+    await this.initPromise;
   }
 
   async load(path: string): Promise<string | null> {

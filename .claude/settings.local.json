@@ -5,7 +5,10 @@
       "Bash(pnpm typecheck *)",
       "Bash(lumina --version)",
       "Bash(lumina *)",
-      "Bash(claude --version)"
+      "Bash(claude --version)",
+      "Bash(tsx *)",
+      "Bash(pnpm tsx *)",
+      "Bash(pnpm exec *)"
     ]
   }
 }

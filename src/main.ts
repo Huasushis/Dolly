@@ -54,6 +54,10 @@ class Dolly {
   }
 
   async start(): Promise<void> {
+    // Wait for all modules to finish async loading
+    await this.injections.ready();
+    await this.monitors.ready();
+
     // Initialize head from all injection modules' headContent()
     const headContent = this.injections.collectHeadContent();
     for (const [injectorId, content] of headContent) {
