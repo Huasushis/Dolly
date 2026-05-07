@@ -1,41 +1,37 @@
 import type { InjectionModule, InjectionEvent } from "../base.js";
 import type { ContextFrame } from "../../core/context.js";
 import type { EventBus } from "../../core/bus.js";
-import type { LLMConfig } from "../../config.js";
 import { LLMClient } from "../../core/llm-client.js";
 
 interface SkillDef {
   name: string;
-  /** Natural language description of when this skill should trigger */
   triggers: string;
-  /** Prompt to inject when triggered */
   prompt: string;
 }
 
-/** Built-in skills */
 const builtinSkills: SkillDef[] = [
   {
     name: "code-review",
     triggers: "用户要求审查代码、检查代码质量、review PR",
-    prompt: "用户要求进行代码审查。请按照以下流程进行：1) 检查逻辑正确性 2) 安全性审查 3) 性能评估 4) 代码风格。以结构化格式给出审查意见。",
+    prompt: "用户要求进行代码审查。请：1) 检查逻辑正确性 2) 安全性审查 3) 性能评估 4) 代码风格改善建议。以结构化格式输出。",
+  },
+  {
+    name: "summarize",
+    triggers: "用户要求总结、摘要、概括一段内容或对话",
+    prompt: "用户要求进行总结。请提取核心要点，以简洁的列表形式输出，每个要点一句话。保留关键数据和结论。",
   },
 ];
 
-/**
- * SKILL injection module.
- * 1. Injects head content teaching LLM about [TOOL]/[AWAIT]/[FORGET]
- * 2. Watches context for skill triggers using guard_llm
- * 3. Injects skill prompt when triggered
- */
 class SkillInjector implements InjectionModule {
   id = "skill";
 
   private guardClient: LLMClient | null = null;
   private skills: SkillDef[] = [];
   private seenTriggers = new Set<string>();
+  private mcpTools: Array<{ name: string; description: string }> = [];
+  private toolsInjected = false;
 
   setup(bus: EventBus): void {
-    // guardClient must be injected by main.ts
     this.skills = [...builtinSkills];
   }
 
@@ -43,52 +39,71 @@ class SkillInjector implements InjectionModule {
     this.guardClient = client;
   }
 
-  headContent(): string {
-    return `工具调用：
-- 调用工具：[TOOL:工具名]\n{参数JSON}\n[/TOOL]
-- 需要等待结果的工具：[AWAIT:工具名]\n{参数JSON}\n[/TOOL]
-
-记忆管理：
-- 当某段注入信息不再需要时，输出 [FORGET:xxx]（xxx 为注入ID），系统会自动移除。
-
-请自然使用这些功能，不必刻意提及它们的存在。`;
+  setMcpTools(tools: Array<{ name: string; description: string }>): void {
+    this.mcpTools = tools;
+    this.toolsInjected = false; // re-inject on next context change
   }
 
-  async onContextChange(frames: ContextFrame[]): Promise<InjectionEvent | null> {
+  headContent(): string {
+    return `工具调用协议：
+- 调用工具：[TOOL:工具名]\n{参数JSON}\n[/TOOL]
+- 等待结果：[AWAIT:工具名]\n{参数JSON}\n[/TOOL]
+- 格式参考：{"key": "value"}（标准 JSON）
+
+记忆管理：
+- 当某段注入信息不再需要时，输出 [FORGET:xxx]（xxx 为注入ID）
+
+请自然地使用这些功能，不要刻意提及机制的存在。`;
+  }
+
+  onContextChange(frames: ContextFrame[]): InjectionEvent | null {
+    // Inject MCP tool list on first call
+    if (!this.toolsInjected && this.mcpTools.length > 0) {
+      this.toolsInjected = true;
+      const toolList = this.mcpTools
+        .map((t) => `  - [TOOL:mcp.${t.name}] ${t.description || t.name}`)
+        .join("\n");
+      return {
+        id: "skill_mcp_tools",
+        content: `[可用 MCP 工具]\n通过 [TOOL:mcp.工具名] 调用：\n${toolList}`,
+        priority: 5,
+      };
+    }
+
+    // Skill trigger detection
     if (!this.guardClient || this.skills.length === 0) return null;
+    const recentText = frames.slice(-8).map((f) => f.content).join("\n");
 
-    // Combine recent context as a single text for guard LLM
-    const recentText = frames.slice(-10).map((f) => f.content).join("\n");
-
+    // Quick keyword pre-filter before calling guard LLM
     for (const skill of this.skills) {
       if (this.seenTriggers.has(skill.name)) continue;
+      const triggered = this.keywordPreFilter(skill, recentText);
+      if (!triggered) continue;
 
-      const triggered = await this.checkTrigger(skill, recentText);
-      if (triggered) {
-        this.seenTriggers.add(skill.name);
-        return {
-          id: `skill_${skill.name}`,
-          content: `[技能:${skill.name}]\n${skill.prompt}`,
-          priority: 20,
-        };
-      }
+      return {
+        id: `skill_${skill.name}`,
+        content: `[技能:${skill.name}]\n${skill.prompt}`,
+        priority: 20,
+      };
     }
+
     return null;
+  }
+
+  /** Fast keyword filter to avoid unnecessary LLM calls */
+  private keywordPreFilter(skill: SkillDef, text: string): boolean {
+    const keywords = skill.triggers.split(/[、，,]/);
+    return keywords.some((kw) => text.includes(kw.trim()));
   }
 
   private async checkTrigger(skill: SkillDef, text: string): Promise<boolean> {
     if (!this.guardClient) return false;
     try {
       const resp = await this.guardClient.chat([
-        {
-          role: "user",
-          content: `以下文本是否触发了"${skill.triggers}"这个条件？仅回复 yes 或 no。\n\n文本：${text.slice(-2000)}`,
-        },
+        { role: "user", content: `以下文本是否触发了"${skill.triggers}"？仅回复 yes 或 no。\n\n${text.slice(-1500)}` },
       ]);
       return resp.trim().toLowerCase().startsWith("yes");
-    } catch {
-      return false;
-    }
+    } catch { return false; }
   }
 }
 

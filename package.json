@@ -11,9 +11,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/server-filesystem": "^2026.1.14",
     "chokidar": "^4.0.0",
     "dotenv": "^16.4.0",
     "openai": "^4.70.0",
+    "tavily-mcp": "^0.2.19",
     "zod": "^3.24.0"
   },
   "devDependencies": {

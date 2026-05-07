@@ -7,6 +7,7 @@ import { InjectionRegistry } from "./injection/registry.js";
 import { MonitorRegistry } from "./monitor/registry.js";
 import { ShortTermMemory } from "./memory/short-term.js";
 import { LongTermMemory } from "./memory/long-term.js";
+import { McpManager } from "./mcp/manager.js";
 import skillModule from "./injection/modules/skill.js";
 import type { InjectionEvent } from "./injection/base.js";
 import type { ContextFrame } from "./core/context.js";
@@ -22,6 +23,7 @@ class Dolly {
   private monitors: MonitorRegistry;
   private shortTerm: ShortTermMemory;
   private longTerm: LongTermMemory;
+  private mcp: McpManager;
   private running = false;
   private dailyLog: ContextFrame[] = [];
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -38,6 +40,9 @@ class Dolly {
     // Inject guard LLM into skill module for trigger detection
     const guardClient = new LLMClient(this.config.guard_llm);
     skillModule.setGuardClient(guardClient);
+
+    // MCP manager
+    this.mcp = new McpManager(this.bus);
 
     this.bus.on("injection.removed", (p) => {
       this.context.removeByInjectionId(p.injection_id);
@@ -70,6 +75,24 @@ class Dolly {
     )];
     this.injections.startWatcher(dirs);
     this.monitors.startWatcher(dirs);
+
+    // Connect MCP servers
+    try {
+      const fsTools = await this.mcp.connect({
+        name: "fs",
+        command: "node",
+        args: ["node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", process.cwd()],
+      });
+      process.stderr.write(dim(`  MCP fs: ${fsTools.length} tools\n`));
+    } catch (e: any) {
+      process.stderr.write(dim(`  MCP fs: ${e.message}\n`));
+    }
+
+    process.stderr.write(dim(`  MCP servers: ${this.mcp.listServers().join(", ") || "none"}\n`));
+
+    // Tell skill module about MCP tools so it can inform the LLM
+    const mcpTools = this.mcp.getTools();
+    skillModule.setMcpTools(mcpTools.map((t) => ({ name: t.name, description: t.description })));
 
     this.running = true;
     this.resetIdleTimer();
@@ -182,15 +205,21 @@ class Dolly {
 
   private async handleToolCall(name: string, params: Record<string, unknown>): Promise<void> {
     let result: unknown;
-    switch (name) {
-      case "datetime":
-        result = { datetime: new Date().toISOString() };
-        break;
-      case "search_memory":
-        result = this.longTerm.search((params.query as string) ?? "", 3);
-        break;
-      default:
-        result = { error: `unknown tool: ${name}` };
+
+    // Route MCP-prefixed calls through MCP manager
+    if (name.startsWith("mcp.")) {
+      result = await this.mcp.callTool(name.slice(4), params);
+    } else {
+      switch (name) {
+        case "datetime":
+          result = { datetime: new Date().toISOString() };
+          break;
+        case "search_memory":
+          result = this.longTerm.search((params.query as string) ?? "", 3);
+          break;
+        default:
+          result = { error: `unknown tool: ${name}` };
+      }
     }
     this.bus.emit("tool.result", { tool_name: name, result });
     this.applyInjection({
