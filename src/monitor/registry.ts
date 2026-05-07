@@ -1,5 +1,6 @@
 import { watch } from "chokidar";
 import { resolve, dirname } from "path";
+import { pathToFileURL } from "url";
 import type { EventBus } from "../core/bus.js";
 import type { MonitorModule, MonitorAction } from "./base.js";
 
@@ -24,7 +25,7 @@ export class MonitorRegistry {
   async load(path: string): Promise<string | null> {
     try {
       const resolved = resolve(path);
-      const mod = await import(resolved);
+      const mod = await import(pathToFileURL(resolved).href);
       const instance: MonitorModule = mod.default ?? mod;
 
       if (this.modules.has(instance.id)) {
@@ -48,7 +49,6 @@ export class MonitorRegistry {
     const existing = this.modules.get(id);
     if (!existing) return null;
 
-    delete require.cache[require.resolve(resolve(existing.path))];
     this.unload(id);
     return this.load(existing.path);
   }

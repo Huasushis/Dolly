@@ -1,5 +1,6 @@
 import { watch } from "chokidar";
 import { resolve, dirname } from "path";
+import { pathToFileURL } from "url";
 import type { ContextFrame } from "../core/context.js";
 import type { EventBus } from "../core/bus.js";
 import type { InjectionModule, InjectionEvent } from "./base.js";
@@ -26,7 +27,7 @@ export class InjectionRegistry {
   async load(path: string): Promise<string | null> {
     try {
       const resolved = resolve(path);
-      const mod = await import(resolved);
+      const mod = await import(pathToFileURL(resolved).href);
       const instance: InjectionModule = mod.default ?? mod;
 
       if (this.modules.has(instance.id)) {
@@ -49,11 +50,6 @@ export class InjectionRegistry {
   async reload(id: string): Promise<string | null> {
     const existing = this.modules.get(id);
     if (!existing) return null;
-
-    // Bust import cache
-    const cacheKey = resolve(existing.path);
-    delete require.cache[require.resolve(cacheKey)];
-
     this.unload(id);
     return this.load(existing.path);
   }
