@@ -46,14 +46,14 @@ class SkillInjector implements InjectionModule {
 
   headContent(): string {
     return `工具调用协议：
-- 调用工具：[TOOL:工具名]\n{参数JSON}\n[/TOOL]
-- 等待结果：[AWAIT:工具名]\n{参数JSON}\n[/TOOL]
-- 格式参考：{"key": "value"}（标准 JSON）
+- 不等待结果：[TOOL:工具名]\n{参数JSON}\n[/TOOL]
+- 需要结果时务必用：[AWAIT:工具名]\n{参数JSON}\n[/TOOL]
+  注意：读取文件、查询数据等需要结果的操作用 AWAIT。仅通知类(如日志)用 TOOL。
 
 记忆管理：
-- 当某段注入信息不再需要时，输出 [FORGET:xxx]（xxx 为注入ID）
+- 当注入信息不再需要时输出 [FORGET:xxx]
 
-请自然地使用这些功能，不要刻意提及机制的存在。`;
+请自然地使用，不提及机制本身。`;
   }
 
   onContextChange(frames: ContextFrame[]): InjectionEvent | null {
@@ -80,6 +80,7 @@ class SkillInjector implements InjectionModule {
       const triggered = this.keywordPreFilter(skill, recentText);
       if (!triggered) continue;
 
+      this.seenTriggers.add(skill.name); // mark immediately to prevent cascade duplicates
       return {
         id: `skill_${skill.name}`,
         content: `[技能:${skill.name}]\n${skill.prompt}`,
@@ -90,10 +91,18 @@ class SkillInjector implements InjectionModule {
     return null;
   }
 
-  /** Fast keyword filter to avoid unnecessary LLM calls */
+  /** Fast keyword filter — check if any trigger segment's key words appear in text */
   private keywordPreFilter(skill: SkillDef, text: string): boolean {
-    const keywords = skill.triggers.split(/[、，,]/);
-    return keywords.some((kw) => text.includes(kw.trim()));
+    // Split trigger into segments, extract key terms from each
+    const segments = skill.triggers.split(/[、，,\s]+/);
+    for (const seg of segments) {
+      // Check if any 2-char+ substring of the segment appears in text
+      for (let i = 0; i <= seg.length - 3; i++) {
+        const sub = seg.slice(i, i + 3);
+        if (text.includes(sub)) return true;
+      }
+    }
+    return false;
   }
 
   private async checkTrigger(skill: SkillDef, text: string): Promise<boolean> {

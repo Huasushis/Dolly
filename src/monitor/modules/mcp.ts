@@ -21,7 +21,7 @@ const mcpModule: MonitorModule = {
 
   onOutput(_text: string, fullResponse: string): MonitorAction | null {
     // Detect [AWAIT:mcp.servername.toolname]
-    const awaitPattern = /\[AWAIT:(mcp\.[^\]]+)\]\s*\n?([\s\S]*?)\[\/TOOL\]/g;
+    const awaitPattern = /\[AWAIT:(mcp\.[^\]]+)\]\s*\n?([\s\S]*?)\[\/(?:TOOL|AWAIT)\]/g;
     let match = awaitPattern.exec(fullResponse);
     if (match) {
       const fullName = match[1].trim();
@@ -34,7 +34,7 @@ const mcpModule: MonitorModule = {
     }
 
     // Detect [TOOL:mcp.servername.toolname] (non-blocking)
-    const toolPattern = /\[TOOL:(mcp\.[^\]]+)\]\s*\n?([\s\S]*?)\[\/TOOL\]/g;
+    const toolPattern = /\[TOOL:(mcp\.[^\]]+)\]\s*\n?([\s\S]*?)\[\/(?:TOOL|AWAIT)\]/g;
     match = toolPattern.exec(fullResponse);
     if (match) {
       const fullName = match[1].trim();

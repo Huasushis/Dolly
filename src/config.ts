@@ -36,7 +36,6 @@ const dollyConfigSchema = z.object({
     resolve(import.meta.dirname, "injection/modules/default-prompt.ts"),
     resolve(import.meta.dirname, "injection/modules/compression.ts"),
     resolve(import.meta.dirname, "injection/modules/skill.ts"),
-    resolve(import.meta.dirname, "injection/modules/test-task.ts"),
   ]),
   monitor_modules: z.array(z.string()).default(() => [
     resolve(import.meta.dirname, "monitor/modules/stdout.ts"),

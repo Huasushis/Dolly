@@ -16,36 +16,26 @@ const toolCallModule: MonitorModule = {
   },
 
   onOutput(text: string, fullResponse: string): MonitorAction | null {
-    // Check for [AWAIT:toolname] ... [/TOOL] — blocking tool call
-    const awaitPattern = /\[AWAIT:([^\]]+)\]\s*\n?([\s\S]*?)\[\/TOOL\]/g;
+    // [AWAIT:name] params [/AWAIT] or [/TOOL] — blocking
+    const awaitPattern = /\[AWAIT:([^\]]+)\]\s*\n?([\s\S]*?)\[\/(?:AWAIT|TOOL)\]/g;
     let match = awaitPattern.exec(fullResponse);
     if (match) {
       const toolName = match[1].trim();
       const paramsStr = match[2].trim();
       let params: Record<string, unknown> = {};
-      try {
-        params = JSON.parse(paramsStr);
-      } catch {
-        params = { raw: paramsStr };
-      }
-
+      try { params = JSON.parse(paramsStr); } catch { params = { raw: paramsStr }; }
       bus?.emit("tool.call_requested", { tool_name: toolName, params });
       return { action: "block", payload: `[WAIT:${toolName}] ` };
     }
 
-    // Check for [TOOL:toolname] ... [/TOOL] — non-blocking
+    // [TOOL:name] params [/TOOL] — non-blocking
     const toolPattern = /\[TOOL:([^\]]+)\]\s*\n?([\s\S]*?)\[\/TOOL\]/g;
     match = toolPattern.exec(fullResponse);
     if (match) {
       const toolName = match[1].trim();
       const paramsStr = match[2].trim();
       let params: Record<string, unknown> = {};
-      try {
-        params = JSON.parse(paramsStr);
-      } catch {
-        params = { raw: paramsStr };
-      }
-
+      try { params = JSON.parse(paramsStr); } catch { params = { raw: paramsStr }; }
       bus?.emit("tool.call_requested", { tool_name: toolName, params });
       return { action: "pass" };
     }
