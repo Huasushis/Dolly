@@ -56,7 +56,7 @@ class SkillInjector implements InjectionModule {
 请自然地使用，不提及机制本身。`;
   }
 
-  onContextChange(frames: ContextFrame[]): InjectionEvent | null {
+  async onContextChange(frames: ContextFrame[]): Promise<InjectionEvent | null> {
     // Inject MCP tool list on first call
     if (!this.toolsInjected && this.mcpTools.length > 0) {
       this.toolsInjected = true;
@@ -70,17 +70,17 @@ class SkillInjector implements InjectionModule {
       };
     }
 
-    // Skill trigger detection
+    // Skill trigger detection via guard_llm
     if (!this.guardClient || this.skills.length === 0) return null;
     const recentText = frames.slice(-8).map((f) => f.content).join("\n");
 
-    // Quick keyword pre-filter before calling guard LLM
     for (const skill of this.skills) {
       if (this.seenTriggers.has(skill.name)) continue;
-      const triggered = this.keywordPreFilter(skill, recentText);
+
+      const triggered = await this.checkTrigger(skill, recentText);
       if (!triggered) continue;
 
-      this.seenTriggers.add(skill.name); // mark immediately to prevent cascade duplicates
+      this.seenTriggers.add(skill.name);
       return {
         id: `skill_${skill.name}`,
         content: `[技能:${skill.name}]\n${skill.prompt}`,
@@ -89,20 +89,6 @@ class SkillInjector implements InjectionModule {
     }
 
     return null;
-  }
-
-  /** Fast keyword filter — check if any trigger segment's key words appear in text */
-  private keywordPreFilter(skill: SkillDef, text: string): boolean {
-    // Split trigger into segments, extract key terms from each
-    const segments = skill.triggers.split(/[、，,\s]+/);
-    for (const seg of segments) {
-      // Check if any 2-char+ substring of the segment appears in text
-      for (let i = 0; i <= seg.length - 3; i++) {
-        const sub = seg.slice(i, i + 3);
-        if (text.includes(sub)) return true;
-      }
-    }
-    return false;
   }
 
   private async checkTrigger(skill: SkillDef, text: string): Promise<boolean> {
