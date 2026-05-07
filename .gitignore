@@ -1,0 +1,13 @@
+# Lumina build output
+.lumina/
+
+# Node.js
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Environment
+.env
+
+# Claude
+CLAUDE.md

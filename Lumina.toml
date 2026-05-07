@@ -1,0 +1,10 @@
+[project]
+name = "Dolly"
+language = "typescript"
+
+[build]
+mode = "monolith"
+
+# Per-module overrides (optional):
+# [modules.MyModule]
+# test = true
