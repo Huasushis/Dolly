@@ -50,12 +50,26 @@ const mcpModule: DollyModule = {
 
 // Handle tool calls (called from main.ts when tool.call_requested fires)
 export async function handleMcpCall(fullName: string, params: Record<string, unknown>): Promise<string> {
+  // Try server.name format first
   const dot = fullName.indexOf(".");
-  if (dot === -1) return JSON.stringify({ error: `invalid MCP tool: ${fullName}` });
-  const serverName = fullName.slice(0, dot);
-  const toolName = fullName.slice(dot + 1);
-  const conn = connections.get(serverName);
-  if (!conn) return JSON.stringify({ error: `MCP server not found: ${serverName}` });
+  if (dot !== -1) {
+    const serverName = fullName.slice(0, dot);
+    const toolName = fullName.slice(dot + 1);
+    const conn = connections.get(serverName);
+    if (conn) return callTool(conn, toolName, params);
+  }
+
+  // Fallback: search all connections for matching tool name
+  for (const [serverName, conn] of connections) {
+    if (conn.tools.has(`${serverName}.${fullName}`) || conn.tools.has(fullName)) {
+      return callTool(conn, fullName.includes(".") ? fullName.split(".").pop()! : fullName, params);
+    }
+  }
+
+  return JSON.stringify({ error: `MCP tool not found: ${fullName}` });
+}
+
+async function callTool(conn: any, toolName: string, params: Record<string, unknown>): Promise<string> {
   try {
     const result = await conn.client.callTool({ name: toolName, arguments: params });
     const texts = (result.content as any[]).filter((i: any) => i.type === "text").map((i: any) => i.text);

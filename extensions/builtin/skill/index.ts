@@ -48,7 +48,7 @@ const skillModule: DollyModule = {
       if (seenTriggers.has(skill.name)) continue;
       try {
         const resp = await guardClient.chat([
-          { role: "user", content: `以下文本是否触发了"${skill.triggers}"？仅回复 yes 或 no。\n\n${recentText.slice(-1500)}` },
+          { role: "user", content: `判断：用户是否在${skill.triggers}？仅回复 yes 或 no。\n\n${recentText.slice(-1000)}` },
         ]);
         if (resp.trim().toLowerCase().startsWith("yes")) {
           seenTriggers.add(skill.name);

@@ -55,14 +55,29 @@ async function run() {
   bus.on("tool.call_requested", async (p: any) => {
     L.mcp(`tool: ${p.tool_name}`);
     let result: unknown;
-    if (p.tool_name.startsWith("mcp.")) {
-      result = await handleMcpCall(p.tool_name.slice(4), p.params);
+    if (p.tool_name.startsWith("mcp.") || !["datetime"].includes(p.tool_name)) {
+      result = await handleMcpCall(p.tool_name.startsWith("mcp.") ? p.tool_name.slice(4) : p.tool_name, p.params);
     } else if (p.tool_name === "datetime") {
       result = { datetime: new Date().toISOString() };
     } else {
       result = { error: `unknown tool: ${p.tool_name}` };
     }
-    context.addBlock("tool_result", JSON.stringify(result), { tool: p.tool_name });
+    const trBlock = context.addBlock("tool_result", JSON.stringify(result), { tool: p.tool_name });
+    L.mcp(`result: ${JSON.stringify(result).slice(0, 150)}`);
+
+    // For blocking calls, add a continuation message to trigger LLM again
+    if (p.blocking) {
+      context.addBlock("message", "工具结果已返回，请根据以上结果继续回答。", { continuation: true });
+      const changes = context.applyMutations([]);
+      let allChanges = [...changes];
+      for (let i = 0; i < 3; i++) {
+        const mutations = await registry.pushChanges(allChanges);
+        if (mutations.length === 0) break;
+        const newChanges = context.applyMutations(mutations);
+        if (newChanges.length === 0) break;
+        allChanges.push(...newChanges);
+      }
+    }
   });
 
   L.llm(`Modules: ${registry.list().join(", ")}`);
@@ -97,6 +112,10 @@ async function run() {
       if (mutations.length === 0) break;
       L.inject(`round ${i + 1}: ${mutations.length} mutations`);
       const newChanges = context.applyMutations(mutations);
+      // Flush context log to memory store
+      for (const entry of context.getLog()) {
+        memory.appendLog(entry.op, entry.detail);
+      }
       if (newChanges.length === 0) break;
       allChanges.push(...newChanges);
     }
