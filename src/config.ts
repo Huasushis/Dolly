@@ -1,66 +1,48 @@
-import { config as loadEnv } from "dotenv";
-import { z } from "zod";
 import { resolve } from "path";
-import { existsSync, readdirSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 
-loadEnv();
-
-function scanDir(dir: string, ext: string): string[] {
-  const full = resolve(import.meta.dirname, "..", dir);
-  if (!existsSync(full)) return [];
-  return readdirSync(full)
-    .filter((f) => f.endsWith(ext))
-    .map((f) => resolve(full, f));
+export interface DollyConfig {
+  name: string;
+  llm: {
+    main: { api_key: string; base_url: string; model: string };
+    memory: { api_key: string; base_url: string; model: string };
+    guard: { api_key: string; base_url: string; model: string };
+  };
+  context: { max_tokens: number; compression_threshold: number };
+  modules: { enabled: string[]; [name: string]: any };
+  memory: { path: string; auto_summarize: boolean; idle_minutes: number };
+  daemon: { pid_dir: string; log_dir: string };
 }
 
-const llmConfigSchema = z.object({
-  api_key: z.string(),
-  base_url: z.string().default("https://api.deepseek.com"),
-  model: z.string().default("deepseek-chat"),
-});
-
-const contextConfigSchema = z.object({
-  max_tokens: z.number().default(32768),
-  compression_threshold: z.number().default(0.8),
-});
-
-const dollyConfigSchema = z.object({
-  main_llm: llmConfigSchema.default(() => ({
-    api_key: process.env.DEEPSEEK_API_KEY ?? "",
-    base_url: "https://api.deepseek.com",
-    model: "deepseek-chat",
-  })),
-  memory_llm: llmConfigSchema.default(() => ({
-    api_key: process.env.DEEPSEEK_API_KEY ?? "",
-    base_url: "https://api.deepseek.com",
-    model: "deepseek-chat",
-  })),
-  guard_llm: llmConfigSchema.default(() => ({
-    api_key: process.env.DEEPSEEK_API_KEY ?? "",
-    base_url: "https://api.deepseek.com",
-    model: "deepseek-chat",
-  })),
-  context: contextConfigSchema.default({ max_tokens: 32768, compression_threshold: 0.8 }),
-  injection_modules: z.array(z.string()).default(() => [
-    resolve(import.meta.dirname, "injection/modules/default-prompt.ts"),
-    resolve(import.meta.dirname, "injection/modules/compression.ts"),
-    resolve(import.meta.dirname, "injection/modules/skill.ts"),
-    ...scanDir("extensions/injections", ".ts"),
-  ]),
-  monitor_modules: z.array(z.string()).default(() => [
-    resolve(import.meta.dirname, "monitor/modules/stdout.ts"),
-    resolve(import.meta.dirname, "monitor/modules/forget-detector.ts"),
-    resolve(import.meta.dirname, "monitor/modules/tool-call.ts"),
-    resolve(import.meta.dirname, "monitor/modules/mcp.ts"),
-    ...scanDir("extensions/monitors", ".ts"),
-  ]),
-  long_term_memory_path: z.string().default(() => resolve(import.meta.dirname, "..", ".memory")),
-});
-
-export type LLMConfig = z.infer<typeof llmConfigSchema>;
-export type ContextConfig = z.infer<typeof contextConfigSchema>;
-export type DollyConfig = z.infer<typeof dollyConfigSchema>;
-
 export function loadConfig(): DollyConfig {
-  return dollyConfigSchema.parse({});
+  const configPath = resolve(import.meta.dirname!, "..", "dolly.json");
+  if (!existsSync(configPath)) throw new Error(`dolly.json not found at ${configPath}`);
+
+  const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+  const envKey = (key: string) => process.env[key] ?? "";
+
+  return {
+    name: raw.name ?? "dolly",
+    llm: {
+      main: {
+        api_key: envKey(raw.llm?.main?.api_key_env ?? "DEEPSEEK_API_KEY"),
+        base_url: raw.llm?.main?.base_url ?? "https://api.deepseek.com",
+        model: raw.llm?.main?.model ?? "deepseek-chat",
+      },
+      memory: {
+        api_key: envKey(raw.llm?.memory?.api_key_env ?? "DEEPSEEK_API_KEY"),
+        base_url: raw.llm?.memory?.base_url ?? "https://api.deepseek.com",
+        model: raw.llm?.memory?.model ?? "deepseek-chat",
+      },
+      guard: {
+        api_key: envKey(raw.llm?.guard?.api_key_env ?? "DEEPSEEK_API_KEY"),
+        base_url: raw.llm?.guard?.base_url ?? "https://api.deepseek.com",
+        model: raw.llm?.guard?.model ?? "deepseek-chat",
+      },
+    },
+    context: { max_tokens: raw.context?.max_tokens ?? 32768, compression_threshold: raw.context?.compression_threshold ?? 0.8 },
+    modules: { enabled: raw.modules?.enabled ?? ["builtin/llm", "builtin/skill", "builtin/mcp"], ...raw.modules },
+    memory: { path: raw.memory?.path ?? ".memory", auto_summarize: raw.memory?.auto_summarize ?? true, idle_minutes: raw.memory?.idle_minutes ?? 60 },
+    daemon: { pid_dir: raw.daemon?.pid_dir ?? ".dolly/daemons", log_dir: raw.daemon?.log_dir ?? ".dolly/logs" },
+  };
 }

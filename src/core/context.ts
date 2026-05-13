@@ -1,146 +1,71 @@
-import { randomUUID } from "crypto";
-import type { EventBus } from "./bus.js";
+import type { Block, BlockChange, BlockMutation } from "../blocks/index.js";
+import { createBlock } from "../blocks/index.js";
 
-/**
- * A frame in the context body — just text with metadata.
- * No role. Content itself carries meaning.
- */
-export interface ContextFrame {
-  id: string;
-  content: string;
-  timestamp: number;
-  injection_id?: string;
-  pinned: boolean;
-}
+interface LogEntry { op: string; detail: unknown; time: number; }
 
-export interface ContextConfig {
-  max_tokens: number;
-  compression_threshold: number;
-}
-
-/**
- * Context = Head + Body
- *
- * Head: Each injector maintains its own text entry (injector_id → content).
- *       Starts empty, mutable. Combined as the LLM background prompt.
- *
- * Body: Ordered stream of ContextFrames. No roles, no categorization.
- *       Everything — user text, LLM output, injections — flows through here.
- */
 export class ContextManager {
-  private head = new Map<string, string>();
-  private body: ContextFrame[] = [];
-  private config: ContextConfig;
+  private systemPrompt = "";
+  private blocks: Block[] = [];
+  private config: { max_tokens: number; compression_threshold: number };
+  private log: LogEntry[] = [];
+  private changeQueue: BlockChange[] = [];
+  private systemBlock: Block;
 
-  constructor(config: ContextConfig, private bus?: EventBus) {
+  constructor(config: { max_tokens: number; compression_threshold: number }) {
     this.config = config;
+    this.systemBlock = createBlock("system", "", { pinned: true });
+    this.blocks = [this.systemBlock];
   }
 
-  // ── Head ───────────────────────────────────────────────
-
-  setHead(injectorId: string, content: string): void {
-    if (content.trim()) {
-      this.head.set(injectorId, content);
-    } else {
-      this.head.delete(injectorId);
-    }
+  setSystemPrompt(text: string): void {
+    this.systemPrompt = text;
+    this.systemBlock.content = text;
   }
 
-  getHead(injectorId: string): string | undefined {
-    return this.head.get(injectorId);
+  addBlock(type: string, content: string, meta: Record<string, unknown> = {}): Block {
+    const block = createBlock(type, content, meta);
+    this.blocks.push(block);
+    this.log.push({ op: "insert", detail: { type, content: content.slice(0, 200) }, time: Date.now() });
+    this.changeQueue.push({ type: "added", block });
+    return block;
   }
 
-  removeHead(injectorId: string): void {
-    this.head.delete(injectorId);
-  }
-
-  buildHeadPrompt(): string {
-    const entries: string[] = [];
-    for (const content of this.head.values()) {
-      if (content.trim()) entries.push(content);
-    }
-    return entries.join("\n\n");
-  }
-
-  // ── Body ───────────────────────────────────────────────
-
-  addFrame(content: string, opts?: { injection_id?: string; pinned?: boolean }): string {
-    const id = randomUUID();
-    this.body.push({
-      id,
-      content,
-      timestamp: Date.now() / 1000,
-      injection_id: opts?.injection_id,
-      pinned: opts?.pinned ?? false,
-    });
-    this.checkCapacity();
-    return id;
-  }
-
-  removeFrame(id: string): boolean {
-    const idx = this.body.findIndex((f) => f.id === id);
-    if (idx === -1 || this.body[idx].pinned) return false;
-    this.body.splice(idx, 1);
+  removeBlock(id: string): boolean {
+    if (id === this.systemBlock.id) return false;
+    const idx = this.blocks.findIndex((b) => b.id === id);
+    if (idx === -1) return false;
+    const [removed] = this.blocks.splice(idx, 1);
+    this.log.push({ op: "delete", detail: { id, type: removed.type }, time: Date.now() });
+    this.changeQueue.push({ type: "removed", block: removed });
     return true;
   }
 
-  /** Remove all body frames created by a given injection */
-  removeByInjectionId(injectionId: string): number {
-    const toRemove = this.body.filter(
-      (f) => f.injection_id === injectionId && !f.pinned
-    );
-    toRemove.forEach((f) => this.removeFrame(f.id));
-    if (toRemove.length > 0) {
-      this.bus?.emit("injection.removed", { injection_id: injectionId });
+  updateBlock(id: string, content?: string, meta?: Record<string, unknown>): boolean {
+    const b = this.blocks.find((x) => x.id === id);
+    if (!b) return false;
+    if (content !== undefined) b.content = content;
+    if (meta !== undefined) b.meta = { ...b.meta, ...meta };
+    this.changeQueue.push({ type: "modified", block: b });
+    return true;
+  }
+
+  getBlocks(): Block[] { return [...this.blocks]; }
+  getBlock(id: string): Block | undefined { return this.blocks.find((b) => b.id === id); }
+
+  applyMutations(mutations: BlockMutation[]): BlockChange[] {
+    const inserts = mutations.filter((m) => m.action === "insert").sort((a: any, b: any) => a.priority - b.priority);
+    for (const m of inserts) {
+      if (m.action === "insert") this.addBlock(m.block.type, m.block.content, m.block.meta);
     }
-    return toRemove.length;
-  }
-
-  getBody(): ContextFrame[] {
-    return [...this.body];
-  }
-
-  pinFrame(id: string): void {
-    const frame = this.body.find((f) => f.id === id);
-    if (frame) frame.pinned = true;
-  }
-
-  bodyTokens(): number {
-    return Math.ceil(this.body.reduce((sum, f) => sum + f.content.length, 0) / 4);
-  }
-
-  estimateTokens(): { count: number; ratio: number } {
-    const totalChars = this.buildHeadPrompt().length +
-      this.body.reduce((sum, f) => sum + f.content.length, 0);
-    const estimate = Math.ceil(totalChars / 4);
-    return { count: estimate, ratio: estimate / this.config.max_tokens };
-  }
-
-  /**
-   * Build messages for the external LLM API.
-   * This is the ONLY place that assigns roles — at the API boundary.
-   * Head → system. Body → single chronological text block (as user, since
-   * the OpenAI protocol requires a role — but the content speaks for itself).
-   */
-  buildMessages(): Array<{ role: string; content: string }> {
-    const msgs: Array<{ role: string; content: string }> = [];
-    const head = this.buildHeadPrompt();
-    if (head) msgs.push({ role: "system", content: head });
-
-    if (this.body.length > 0) {
-      const text = this.body.map((f) => f.content).join("\n\n");
-      msgs.push({ role: "user", content: text });
+    for (const m of mutations) {
+      if (m.action === "delete") this.removeBlock(m.blockId);
+      if (m.action === "update") this.updateBlock(m.blockId, (m as any).content, (m as any).meta);
     }
-    return msgs;
+    const changes = [...this.changeQueue];
+    this.changeQueue = [];
+    return changes;
   }
 
-  private checkCapacity(): void {
-    const { ratio } = this.estimateTokens();
-    if (ratio >= this.config.compression_threshold) {
-      this.bus?.emit("context.near_capacity", {
-        token_count: this.estimateTokens().count,
-        ratio,
-      });
-    }
-  }
+  estimateTokens(): number { return Math.ceil(this.blocks.reduce((s, b) => s + b.content.length, 0) / 4); }
+  getLog(): LogEntry[] { return [...this.log]; }
 }

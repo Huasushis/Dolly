@@ -1,0 +1,36 @@
+{
+  "name": "dolly",
+  "llm": {
+    "main": {
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-chat"
+    },
+    "memory": {
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-chat"
+    },
+    "guard": {
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-chat"
+    }
+  },
+  "context": {
+    "max_tokens": 32768,
+    "compression_threshold": 0.8
+  },
+  "modules": {
+    "enabled": ["builtin/llm", "builtin/skill", "builtin/mcp"]
+  },
+  "memory": {
+    "path": ".memory",
+    "auto_summarize": true,
+    "idle_minutes": 60
+  },
+  "daemon": {
+    "pid_dir": ".dolly/daemons",
+    "log_dir": ".dolly/logs"
+  }
+}
