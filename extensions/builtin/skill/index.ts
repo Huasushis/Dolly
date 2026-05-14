@@ -36,7 +36,7 @@ const skillModule: DollyModule = {
       toolsInjected = true;
       mutations.push({
         action: "insert", priority: 5,
-        block: { type: "injection", content: `可用 MCP 工具: ${mcpToolNames.join(", ")}`, meta: { source: "skill" }, created: Date.now() },
+        block: { type: "injection", content: `可用 MCP 工具: ${mcpToolNames.join(", ")}`, meta: { source: "skill", notify: false }, created: Date.now() },
       });
     }
 

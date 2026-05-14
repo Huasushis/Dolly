@@ -155,12 +155,21 @@ async function main() {
 
   // Stdin
   const rl = createInterface({ input: process.stdin, output: process.stdout });
+  // Save on exit helper
+  const saveProfile = () => {
+    const blocks = context.getBlocks().filter((b) => b.type !== "system");
+    writeFileSync(profileFile, JSON.stringify({ blocks, savedAt: Date.now() }, null, 2));
+  };
+  process.once("SIGINT", () => { saveProfile(); rl.close(); });
+  process.once("SIGTERM", () => { saveProfile(); rl.close(); });
+
   for await (const line of rl) { if (line.trim()) await handleInput(line.trim()); }
   rl.close();
   if (idleTimer) clearTimeout(idleTimer);
   if (midnightTimer) clearInterval(midnightTimer);
   cleanupRelay(instanceName);
   relay.close();
+  saveProfile();
 }
 
 main().catch((err) => { console.error("Fatal:", err); process.exit(1); });
