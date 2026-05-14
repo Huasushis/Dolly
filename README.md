@@ -100,17 +100,22 @@ User Input → Block → ModulePush → LLM Module → API Call → Stream → J
 ## CLI 用法
 
 ```bash
-# 前台（交互式）
-pnpm start
+# 前台运行（交互式，Ctrl-C 自动保存上下文）
+dolly run                          # 默认实例
+dolly run --name=mybot             # 指定实例名（独立 profile）
 
 # 后台守护进程
-node --import tsx src/main.ts start                # 启动
-node --import tsx src/main.ts start --name=agent2  # 多开（独立 profile）
-node --import tsx src/main.ts stop                 # 停止
-node --import tsx src/main.ts stop --name=agent2 -f  # 强制停止
-node --import tsx src/main.ts status               # 查看状态
-node --import tsx src/main.ts status --all          # 所有实例
+dolly start                        # 启动
+dolly start --name=mybot           # 多开（独立 profile + PID）
+dolly stop                         # 停止
+dolly stop --name=mybot -f         # 强制停止
+dolly status                       # 查看状态
+dolly status --all                 # 所有实例
+
+# attach 暂未实现
 ```
+
+上下文保存在 `.dolly/profiles/<name>/context.json`，重启自动恢复。
 
 ## 项目结构
 
@@ -234,16 +239,19 @@ export default myExt;
 ## 路线图
 
 - [x] Block 上下文 + 统一模块
-- [x] MCP 集成（stdlib JSON-RPC）
+- [x] MCP 集成（stdio JSON-RPC）
 - [x] SKILL 语义触发（guard_llm）
 - [x] 三层记忆（即时/短期/长期）
 - [x] 守护进程（start/stop/status）
 - [x] 热加载扩展
-- [ ] `dolly` CLI 命令（全局安装）
-- [ ] 上下文持久化 + 恢复
-- [ ] 多开 profile 隔离
-- [ ] Console 作为独立 extension
-- [ ] LLM 输出结构化（speak/think/tool 分离）
+- [x] `dolly` CLI 命令
+- [x] 上下文持久化 + profile 恢复
+- [x] 多开 profile 隔离
+- [x] Console 作为独立 extension
+- [x] Agent 人设配置
+- [x] 长期记忆印象式总结 + 模糊检索
+- [ ] `dolly attach` 连接到后台实例
+- [ ] LLM 输出 speak/think/tool 结构化
 
 ## 贡献
 
