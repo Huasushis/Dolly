@@ -1,0 +1,37 @@
+{
+  "blocks": [
+    {
+      "id": "b96e017f-d17c-4591-9558-28f53e61ece9",
+      "type": "message",
+      "content": "你好，我叫小明",
+      "meta": {},
+      "created": 1778745553445
+    },
+    {
+      "id": "2eb686e7-1d63-4c46-b01c-67dc71cc32e6",
+      "type": "injection",
+      "content": "可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_tree, fs.move_file, fs.search_files, fs.get_file_info, fs.list_allowed_directories, playwright.browser_close, playwright.browser_resize, playwright.browser_console_messages, playwright.browser_handle_dialog, playwright.browser_evaluate, playwright.browser_file_upload, playwright.browser_drop, playwright.browser_fill_form, playwright.browser_press_key, playwright.browser_type, playwright.browser_navigate, playwright.browser_navigate_back, playwright.browser_network_requests, playwright.browser_network_request, playwright.browser_run_code_unsafe, playwright.browser_take_screenshot, playwright.browser_snapshot, playwright.browser_click, playwright.browser_drag, playwright.browser_hover, playwright.browser_select_option, playwright.browser_tabs, playwright.browser_wait_for",
+      "meta": {
+        "source": "skill"
+      },
+      "created": 1778745558836
+    },
+    {
+      "id": "07bbb2d0-c65b-4f43-a839-b0b013f8ccfd",
+      "type": "skill",
+      "content": "用户正在询问天气。请告知用户你可以通过工具查询天气信息。如果用户提供了城市名，建议使用 datetime 工具先确认日期。",
+      "meta": {
+        "skill": "weather"
+      },
+      "created": 1778745558836
+    },
+    {
+      "id": "07c95e34-a626-4e5c-aa07-d8a39cf1c23b",
+      "type": "response",
+      "content": "你好，小明！我是 Dolly 框架中的 AI 助手，很高兴认识你。有什么我可以帮你的吗？",
+      "meta": {},
+      "created": 1778745558836
+    }
+  ],
+  "savedAt": 1778745558879
+}

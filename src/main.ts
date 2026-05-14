@@ -1,6 +1,7 @@
 import { config as loadEnv } from "dotenv"; loadEnv();
 import { createInterface } from "readline";
 import { resolve as pathResolve } from "path";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { loadConfig } from "./config.js";
 import { ContextManager } from "./core/context.js";
 import { EventBus } from "./core/bus.js";
@@ -52,6 +53,25 @@ async function run() {
   const bg = (config as any).agent?.background ?? "";
   context.setSystemPrompt([persona, bg, registry.buildSystemPrompt()].filter(Boolean).join("\n\n"));
 
+  // Profile persistence
+  const profileDir = pathResolve(import.meta.dirname!, "..", ".dolly", "profiles", instanceName);
+  const profileFile = pathResolve(profileDir, "context.json");
+  if (!existsSync(profileDir)) mkdirSync(profileDir, { recursive: true });
+
+  // Restore previous context
+  if (existsSync(profileFile)) {
+    try {
+      const saved = JSON.parse(readFileSync(profileFile, "utf-8"));
+      for (const b of (saved.blocks ?? [])) context.addBlock(b.type, b.content, b.meta);
+    } catch {}
+  }
+
+  // Save on exit
+  const saveContext = () => {
+    const blocks = context.getBlocks().filter((b) => b.type !== "system");
+    writeFileSync(profileFile, JSON.stringify({ blocks, savedAt: Date.now() }, null, 2));
+  };
+  
   // FORGET handling
   bus.on("forget.requested", (p: any) => {
     context.removeBlock(p.blockId);
@@ -92,6 +112,8 @@ async function run() {
   }
   rl.close();
   if (idleTimer) clearTimeout(idleTimer);
+  saveContext(); // save on clean exit too
+  process.stderr.write("  Saved.\n");
 }
 
 async function cascade(
@@ -112,4 +134,3 @@ async function cascade(
 }
 
 run().catch((err) => { console.error("Fatal:", err); process.exit(1); });
-process.on("SIGINT", () => { process.exit(0); });
