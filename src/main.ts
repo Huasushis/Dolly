@@ -7,19 +7,13 @@ import { ContextManager } from "./core/context.js";
 import { EventBus } from "./core/bus.js";
 import { LockManager } from "./core/lock.js";
 import { ModuleRegistry } from "./modules/registry.js";
-import { MemoryStore } from "./memory/store.js";
-import { LLMClient } from "./core/llm-client.js";
 import { start, stop, status } from "./daemon/index.js";
 import { startRelay, cleanupRelay } from "./daemon/attach.js";
 import { getSpeakHistory } from "../extensions/builtin/console/index.js";
 import { handleMcpCall } from "../extensions/builtin/mcp/index.js";
 import type { ModuleContext } from "./modules/base.js";
 
-const L = {
-  mcp:   (s: string) => process.stderr.write(`\x1b[33m  ⚡\x1b[0m ${s}\n`),
-  mem:   (s: string) => process.stderr.write(`\x1b[34m  ●\x1b[0m ${s}\n`),
-  sleep: (s: string) => process.stderr.write(`\x1b[36m  ~ SLEEP\x1b[0m ${s}\n`),
-};
+const L = { mcp: (s: string) => process.stderr.write(`\x1b[33m  ⚡\x1b[0m ${s}\n`) };
 
 const cmd = process.argv[2] ?? "run";
 const nameArg = process.argv.find((a) => a.startsWith("--name="));
@@ -35,11 +29,9 @@ async function main() {
   const bus = new EventBus();
   const lock = new LockManager();
   const context = new ContextManager(config.context);
-  const memoryClient = new LLMClient(config.llm.memory);
 
   const profileDir = pathResolve(import.meta.dirname!, "..", ".dolly", "profiles", instanceName);
   if (!existsSync(profileDir)) mkdirSync(profileDir, { recursive: true });
-  const memory = new MemoryStore(pathResolve(profileDir, "exts", "builtin-memory"), memoryClient);
 
   const ctx: ModuleContext = {
     getBlocks: () => context.getBlocks(),
@@ -47,28 +39,19 @@ async function main() {
     estimateTokens: () => context.estimateTokens(),
     config: { ...config.modules, _llm_main: config.llm.main, _llm_guard: config.llm.guard, _llm_memory: config.llm.memory },
     emit: (event, payload) => bus.emit(event, payload),
-    log: (op, detail) => { memory.appendLog(op, detail); },
+    log: (_op, _detail) => {}, // handled by memory extension
     lock,
-    setSystemPrompt: (text) => { /* set per-module by registry */ },
-    storagePath: profileDir,  // extensions use this for profile data
-    _storageSet: true,  // prevent registry from overwriting
+    setSystemPrompt: (_text) => {}, // handled by registry
+    storagePath: profileDir,
+    _storageSet: true,
   };
 
   const registry = new ModuleRegistry(ctx, bus, pathResolve(import.meta.dirname!, "..", "extensions"));
+  await registry.discover();
   await registry.loadFromConfig(config.modules.enabled);
 
   const persona = (config as any).agent?.persona ?? "";
   const bg = (config as any).agent?.background ?? "";
-  // Per-module system prompt fragments that can be dynamically updated
-  const promptParts = new Map<string, string>();
-  for (const mod of registry.list()) {
-    // Initial static prompts loaded by registry
-  }
-  const rebuildSystemPrompt = () => {
-    const parts = [persona, bg, ...promptParts.values()].filter(Boolean);
-    context.setSystemPrompt(parts.join("\n\n"));
-  };
-  // Initial build from registry static prompts
   context.setSystemPrompt([persona, bg, registry.buildSystemPrompt()].filter(Boolean).join("\n\n"));
 
   // Profile restore
@@ -88,82 +71,48 @@ async function main() {
     if (p.blocking) await cascade();
   });
 
-  // Cascade function
+  // Cascade
   async function cascade() {
     let changes = context.applyMutations([]);
     for (let i = 0; i < 3; i++) {
       const mutations = await registry.pushChanges(changes);
       if (mutations.length === 0) break;
       changes = context.applyMutations(mutations);
-      for (const e of context.getLog()) memory.appendLog(e.op, e.detail);
       if (changes.length === 0) break;
     }
   }
 
-  // Recall helper
-  function recallParams(line: string): [number, number] {
-    const m = line.match(/\{"recall":"(hard|soft)"\}/);
-    return m?.[1] === "hard" ? [5,5] : m?.[1] === "soft" ? [1,1] : [3,3];
-  }
-
   // Input handler
   async function handleInput(line: string) {
-    // Built-in commands
-    if (line === "/reload") { await registry.reloadAll(); L.mem("所有扩展已重载"); return; }
+    if (line === "/reload") { await registry.reloadAll(); return; }
     const reloadExt = line.match(/^\/reload\s+--ext=(\S+)/);
-    if (reloadExt) { await registry.reload(reloadExt[1]); L.mem(`扩展 ${reloadExt[1]} 已重载`); return; }
-    resetIdle();
-    const [rd, rs] = recallParams(line);
-    const recalled = memory.recall(line, rd, rs);
-    for (const seg of recalled) {
-      const already = context.getBlocks().some((b) => b.type === "memory" && b.content.includes(seg.slice(0, 50)));
-      if (!already) context.addBlock("memory", `[记忆] ${seg}`, { notify: false });
+    if (reloadExt) { await registry.reload(reloadExt[1]); return; }
+    if (line === "/list") {
+      for (const e of registry.listAll()) process.stderr.write(`  ${e.enabled ? "✅" : "⬜"} ${e.id}${e.loaded ? "" : " (未加载)"}\n`);
+      return;
     }
+    const enableExt = line.match(/^\/enable\s+(\S+)/);
+    if (enableExt) { await registry.enable(enableExt[1]); return; }
+    const disableExt = line.match(/^\/disable\s+(\S+)/);
+    if (disableExt) { registry.disable(disableExt[1]); return; }
     context.addBlock("message", line);
     await cascade();
   }
 
-  // Sleep
-  let sleeping = false;
-  let idleTimer: NodeJS.Timeout | null = null;
-  let midnightTimer: NodeJS.Timeout | null = null;
-
-  const sleepCycle = async (fullDay = false) => {
-    if (sleeping) return; sleeping = true;
-    L.sleep(`${fullDay ? "全量" : "增量"}...`);
-    const blocks = context.getBlocks();
-    if (blocks.length > 2) { try { await memory.summarize(blocks, fullDay); } catch {} }
-    const allText = blocks.map((b) => b.content).join("\n");
-    const recalled = memory.recall(allText.slice(-5000), 3, 3);
-    for (const seg of recalled) {
-      const already = context.getBlocks().some((b) => b.type === "memory" && b.content.includes(seg.slice(0, 50)));
-      if (!already) context.addBlock("memory", `[记忆] ${seg}`, { notify: false });
-    }
-    // Background update (fullDay only)
-    if (fullDay) {
-      try {
-        const maxChars = config.context.max_background_chars ?? 2000;
-        const oldBg = context.getBackground();
-        const combined = oldBg + "\n\n" + allText.slice(-6000);
-        const bgPrompt = `以下是你的自述和今天的经历。请更新自述（不超过${maxChars}字符）。记录你认识的人、学到的方法、对事物的评价和认知。\n\n${combined.slice(-12000)}`;
-        const newBg = (await memoryClient.chat([{ role: "user", content: bgPrompt }])).trim().slice(0, maxChars);
-        context.setBackground(newBg);
-        L.sleep("Background 已更新");
-      } catch {}
-    }
-    sleeping = false;
+  // Save helper
+  const saveProfile = () => {
+    const blocks = context.getBlocks().filter((b) => b.type !== "system");
+    writeFileSync(profileFile, JSON.stringify({ blocks, savedAt: Date.now() }, null, 2));
   };
 
-  const resetIdle = () => { if (idleTimer) clearTimeout(idleTimer); idleTimer = setTimeout(sleepCycle, config.memory.idle_minutes * 60 * 1000); };
-  resetIdle();
-  midnightTimer = setInterval(() => { const h = new Date().getHours(), m = new Date().getMinutes(); if (h === 3 && m < 10 && !sleeping) sleepCycle(true); }, 10 * 60 * 1000);
+  process.once("SIGINT", () => { saveProfile(); rl.close(); });
+  process.once("SIGTERM", () => { saveProfile(); rl.close(); });
 
   process.stderr.write(`  Instance: ${instanceName}\n  Modules: ${registry.list().join(", ")}\n  Ready.\n\n`);
 
   // Relay (attach)
   const relay = startRelay(instanceName, (socket) => {
-    // Replay history
-    for (const line of getSpeakHistory()) { socket.write(line + "\n"); }
+    for (const line of getSpeakHistory()) socket.write(line + "\n");
     const rl = createInterface({ input: socket, output: socket });
     (async () => { for await (const line of rl) { if (line.trim()) await handleInput(line.trim()); } })();
     socket.on("close", () => rl.close());
@@ -171,22 +120,8 @@ async function main() {
 
   // Stdin
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  // Save on exit helper
-  const saveProfile = () => {
-    const blocks = context.getBlocks().filter((b) => b.type !== "system");
-    writeFileSync(profileFile, JSON.stringify({ blocks, savedAt: Date.now() }, null, 2));
-  };
-  process.once("SIGINT", () => { saveProfile(); rl.close(); });
-  process.once("SIGTERM", async () => {
-    const blocks = context.getBlocks();
-    if (blocks.length > 2) { try { await memory.summarize(blocks, true); } catch {} }
-    saveProfile(); rl.close();
-  });
-
   for await (const line of rl) { if (line.trim()) await handleInput(line.trim()); }
   rl.close();
-  if (idleTimer) clearTimeout(idleTimer);
-  if (midnightTimer) clearInterval(midnightTimer);
   cleanupRelay(instanceName);
   relay.close();
   saveProfile();
