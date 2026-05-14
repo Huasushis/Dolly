@@ -11,6 +11,8 @@ export interface ModuleContext {
   lock: LockManager;
   /** Extension 本地存储路径（可不存在，extension 自行创建） */
   storagePath: string;
+  /** 内部：标记 storagePath 是否已被 main.ts 预设 */
+  _storageSet?: boolean;
 }
 
 export interface DollyModule {

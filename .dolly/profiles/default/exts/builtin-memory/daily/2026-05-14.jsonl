@@ -1,20 +1,12 @@
-{"op":"insert","detail":{"type":"message","content":"你好，你猜猜我是谁？"},"time":1778761595407}
-{"op":"insert","detail":{"type":"injection","content":"可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_"},"time":1778761595408}
-{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！嗯……这有点难猜呢。从声音和语气上，我暂时没有足够的信息来确定你的身份。不过，既然你让我猜，那我大胆试一下——你是一位对AI技术感兴趣的朋友，或者是一位正在测试我能力的好奇用户？还是说，你是我曾经帮助过的某位老朋友，换了个新账号来和我打招呼？😊\"}\n```"},"time":1778761595409}
-{"op":"insert","detail":{"type":"message","content":"你好，你猜猜我是谁？"},"time":1778761597954}
-{"op":"insert","detail":{"type":"injection","content":"可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_"},"time":1778761597955}
-{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！嗯……这有点难猜呢。从声音和语气上，我暂时没有足够的信息来确定你的身份。不过，既然你让我猜，那我大胆试一下——你是一位对AI技术感兴趣的朋友，或者是一位正在测试我能力的好奇用户？还是说，你是我曾经帮助过的某位老朋友，换了个新账号来和我打招呼？😊\"}\n```"},"time":1778761597955}
-{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！嗯……这有点难猜呢。从声音和语气上，我暂时没有足够的信息来确定你的身份。不过，既然你让我猜，那我大胆试一下——你是一位对AI技术感兴趣的朋友，或者是一位正在测试我能力的好奇用户？还是说，你是我曾经帮助过的某位老朋友，换了个新账号来和我打招呼？😊\"}\n```"},"time":1778761597956}
-{"op":"insert","detail":{"type":"message","content":"你好，你猜猜我是谁？"},"time":1778761620993}
-{"op":"insert","detail":{"type":"injection","content":"可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_"},"time":1778761620994}
-{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！嗯……这有点难猜呢。从声音和语气上，我暂时没有足够的信息来确定你的身份。不过，既然你让我猜，那我大胆试一下——你是一位对AI技术感兴趣的朋友，或者是一位正在测试我能力的好奇用户？还是说，你是我曾经帮助过的某位老朋友，换了个新账号来和我打招呼？😊\"}\n```"},"time":1778761620994}
-{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！嗯……这有点难猜呢。从声音和语气上，我暂时没有足够的信息来确定你的身份。不过，既然你让我猜，那我大胆试一下——你是一位对AI技术感兴趣的朋友，或者是一位正在测试我能力的好奇用户？还是说，你是我曾经帮助过的某位老朋友，换了个新账号来和我打招呼？😊\"}\n```"},"time":1778761620995}
-{"op":"insert","detail":{"type":"message","content":"我是cx"},"time":1778761620995}
-{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"cx！原来是你呀！虽然我可能不记得之前具体的对话内容，但很高兴再次见到你！有什么我可以帮你的吗？😊\"}\n```"},"time":1778761620996}
-{"op":"insert","detail":{"type":"message","content":"我是谁？"},"time":1778761661139}
-{"op":"insert","detail":{"type":"injection","content":"可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_"},"time":1778761661140}
-{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！你是一位正在与 Dolly 框架中的 AI 助手对话的用户。我目前还不知道你的具体身份——你可以告诉我更多关于你自己的信息，比如你的名字、你正在做什么，或者你希望我怎么称呼你。\"}\n```"},"time":1778761661140}
-{"op":"insert","detail":{"type":"message","content":"我是谁？"},"time":1778761665112}
-{"op":"insert","detail":{"type":"injection","content":"可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_"},"time":1778761665113}
-{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！你是一位正在与 Dolly 框架中的 AI 助手对话的用户。我目前还不知道你的具体身份——你可以告诉我更多关于你自己的信息，比如你的名字、你正在做什么，或者你希望我怎么称呼你。\"}\n```"},"time":1778761665114}
-{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！你是一位正在与 Dolly 框架中的 AI 助手对话的用户。我目前还不知道你的具体身份——你可以告诉我更多关于你自己的信息，比如你的名字、你正在做什么，或者你希望我怎么称呼你。\"}\n```"},"time":1778761665114}
+{"op":"insert","detail":{"type":"message","content":"你好"},"time":1778762226553}
+{"op":"insert","detail":{"type":"injection","content":"可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_"},"time":1778762226554}
+{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！我是 Dolly 框架中的 AI 助手，很高兴为你服务。有什么我可以帮你的吗？\"}\n```"},"time":1778762226555}
+{"op":"insert","detail":{"type":"message","content":"你好"},"time":1778762227001}
+{"op":"insert","detail":{"type":"injection","content":"可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_"},"time":1778762227002}
+{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！我是 Dolly 框架中的 AI 助手，很高兴为你服务。有什么我可以帮你的吗？\"}\n```"},"time":1778762227037}
+{"op":"insert","detail":{"type":"skill","content":"## 天气查询\n\n当用户询问天气相关问题时，告知用户你可以通过工具帮助查询天气信息。如果用户提供了城市名，建议先使用工具确认当前日期和时间。"},"time":1778762227038}
+{"op":"insert","detail":{"type":"message","content":"你好"},"time":1778762228016}
+{"op":"insert","detail":{"type":"injection","content":"可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_"},"time":1778762228017}
+{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！我是 Dolly 框架中的 AI 助手，很高兴为你服务。有什么我可以帮你的吗？\"}\n```"},"time":1778762228017}
+{"op":"insert","detail":{"type":"skill","content":"## 天气查询\n\n当用户询问天气相关问题时，告知用户你可以通过工具帮助查询天气信息。如果用户提供了城市名，建议先使用工具确认当前日期和时间。"},"time":1778762228018}
+{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！我是 Dolly 框架中的 AI 助手，很高兴为你服务。有什么我可以帮你的吗？\"}\n```"},"time":1778762228018}

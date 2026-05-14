@@ -1,0 +1,50 @@
+{
+  "blocks": [
+    {
+      "id": "31231f94-a57f-46dc-841c-ca9bfefd4d7d",
+      "type": "message",
+      "content": "你好",
+      "meta": {},
+      "created": 1778762223457
+    },
+    {
+      "id": "3d730222-31b5-4b7c-9377-c2a275045f80",
+      "type": "injection",
+      "content": "可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_tree, fs.move_file, fs.search_files, fs.get_file_info, fs.list_allowed_directories, playwright.browser_close, playwright.browser_resize, playwright.browser_console_messages, playwright.browser_handle_dialog, playwright.browser_evaluate, playwright.browser_file_upload, playwright.browser_drop, playwright.browser_fill_form, playwright.browser_press_key, playwright.browser_type, playwright.browser_navigate, playwright.browser_navigate_back, playwright.browser_network_requests, playwright.browser_network_request, playwright.browser_run_code_unsafe, playwright.browser_take_screenshot, playwright.browser_snapshot, playwright.browser_click, playwright.browser_drag, playwright.browser_hover, playwright.browser_select_option, playwright.browser_tabs, playwright.browser_wait_for",
+      "meta": {
+        "source": "skill",
+        "notify": false
+      },
+      "created": 1778762226551
+    },
+    {
+      "id": "bd2ce255-12b5-4e2c-8332-eac4e30a5960",
+      "type": "response",
+      "content": "```json\n{\"speak\":\"你好！我是 Dolly 框架中的 AI 助手，很高兴为你服务。有什么我可以帮你的吗？\"}\n```",
+      "meta": {
+        "source": "llm"
+      },
+      "created": 1778762226551
+    },
+    {
+      "id": "7f20d628-666b-4b23-8b83-87095e0f6ecc",
+      "type": "skill",
+      "content": "## 天气查询\n\n当用户询问天气相关问题时，告知用户你可以通过工具帮助查询天气信息。如果用户提供了城市名，建议先使用工具确认当前日期和时间。",
+      "meta": {
+        "skill": "weather",
+        "source": "skill"
+      },
+      "created": 1778762227001
+    },
+    {
+      "id": "3a0a5b6d-0452-41ed-8952-c21eb8aedd7b",
+      "type": "response",
+      "content": "```json\n{\"speak\":\"你好！我是 Dolly 框架中的 AI 助手，很高兴为你服务。有什么我可以帮你的吗？\"}\n```",
+      "meta": {
+        "source": "llm"
+      },
+      "created": 1778762228016
+    }
+  ],
+  "savedAt": 1778762228021
+}
