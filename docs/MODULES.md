@@ -159,6 +159,36 @@ interface LockManager {
 /reload --ext=<id>        重载指定扩展
 ```
 
+## 本地存储
+
+每个扩展通过 `ctx.storagePath` 获得独立目录：
+
+```
+profiles/<实例名>/exts/<模块id>/
+```
+
+例如 `builtin/console` 的存储路径：
+```
+.dolly/profiles/default/exts/builtin-console/speak_history.json
+```
+
+`builtin/memory` 的存储路径：
+```
+.dolly/profiles/default/exts/builtin-memory/
+├── daily/{day}.jsonl     # 每日操作日志
+├── entries/{day}.json    # 每日总结
+└── index.json            # 关键词倒排索引
+```
+
+扩展可自由在此目录下读写文件。目录不会自动创建——扩展的 `init()` 中自行 `mkdir`。
+
+```typescript
+async init(ctx: ModuleContext) {
+  if (!existsSync(ctx.storagePath)) mkdirSync(ctx.storagePath);
+  const saved = readFileSync(resolve(ctx.storagePath, "state.json"), "utf-8");
+}
+```
+
 ## 已在 dolly.json 中注册
 
 ```json
