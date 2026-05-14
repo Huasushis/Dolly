@@ -57,15 +57,9 @@ cp .env.example .env
 pnpm start
 ```
 
-启动后直接打字回车。Ctrl+C 退出。
+启动后直接打字回车。Ctrl+C 保存并退出。重启自动恢复上下文。
 
-```bash
-# 后台启动 / 管理
-node --import tsx src/main.ts start              # 启动守护进程
-node --import tsx src/main.ts start --name=agent2  # 多开
-node --import tsx src/main.ts stop               # 停止
-node --import tsx src/main.ts status             # 查看状态
-```
+管理命令：`/list`、`/enable <id>`、`/disable <id>`、`/reload`。
 
 ## 特性
 
@@ -100,22 +94,15 @@ User Input → Block → ModulePush → LLM Module → API Call → Stream → J
 ## CLI 用法
 
 ```bash
-# 前台运行（交互式，Ctrl-C 退出，仅 stop 保存上下文）
-dolly run                          # 默认实例
-dolly run --name=mybot             # 指定实例名（独立 profile）
-
-# 后台守护进程
-dolly start                        # 启动
-dolly start --name=mybot           # 多开（独立 profile + PID）
-dolly stop                         # 停止
-dolly stop --name=mybot -f         # 强制停止
-dolly status                       # 查看状态
-dolly status --all                 # 所有实例
-
-# attach 暂未实现
+pnpm start                                     # = dolly run (前台)
+node --import tsx/esm bin/dolly.js run         # 前台运行
+node --import tsx/esm bin/dolly.js start       # 后台启动
+node --import tsx/esm bin/dolly.js stop        # 停止（触发保存）
+node --import tsx/esm bin/dolly.js status      # 查看状态
+node --import tsx/esm bin/dolly.js attach      # 连接后台实例
 ```
 
-上下文保存在 `.dolly/profiles/<name>/context.json`，重启自动恢复。
+所有命令支持 `--name=xxx` 多开。上下文保存在 `.dolly/profiles/<name>/`。
 
 ## 项目结构
 
@@ -137,18 +124,13 @@ Dolly/
 │   └── memory/store.ts     # 记忆存储（JSONL 日志 + 关键词索引）
 ├── extensions/
 │   └── builtin/            # 内置模块
-│       ├── llm/            #   LLM 调用模块
-│       │   ├── dolly.json  #   模块清单
-│       │   └── index.ts    #   模块代码
-│       ├── skill/          #   SKILL 语义触发模块
-│       │   ├── dolly.json
-│       │   ├── index.ts
-│       │   └── skills/     #   用户 SKILL 定义（*.json）
-│       └── mcp/            #   MCP 集成模块
-│           ├── dolly.json
-│           └── index.ts
-├── .dolly/                 # 运行时数据（PID、profile、日志）
-└── .memory/                # 长期记忆存储
+│       ├── console/        #   控制台交互（speak显示+历史）
+│       ├── llm/            #   LLM 调用（内心世界+forget）
+│       ├── memory/         #   记忆系统（recall+日总结）
+│       ├── skill/          #   SKILL 语义触发
+│       │   └── skills/     #   用户 SKILL（SKILL.md）
+│       └── mcp/            #   MCP 工具集成
+├── .dolly/profiles/        # 实例数据（context/speak/memory）
 ```
 
 ## 配置
@@ -157,24 +139,22 @@ Dolly/
 
 ```json
 {
-  "name": "my-agent",
+  "agent": { "name": "Dolly", "persona": "...", "background": "..." },
   "llm": {
     "main":  { "api_key_env": "DEEPSEEK_API_KEY", "base_url": "https://api.deepseek.com", "model": "deepseek-chat" },
     "memory":{ "api_key_env": "DEEPSEEK_API_KEY", "base_url": "https://api.deepseek.com", "model": "deepseek-chat" },
     "guard": { "api_key_env": "DEEPSEEK_API_KEY", "base_url": "https://api.deepseek.com", "model": "deepseek-chat" }
   },
-  "context": { "max_tokens": 32768, "compression_threshold": 0.8 },
+  "context": { "compression_threshold": 0.8, "decay_rate": 0.1, "protect_window_min": 10 },
   "modules": {
-    "enabled": ["builtin/llm", "builtin/skill", "builtin/mcp"],
-    "builtin/skill": { "max_skills": 10 },
-    "builtin/mcp": { "timeout": 30000 }
+    "enabled": ["builtin/console", "builtin/llm", "builtin/memory", "builtin/skill", "builtin/mcp"],
+    "builtin/skill": { "max_skills": 20 }
   },
-  "memory": { "path": ".memory", "auto_summarize": true, "idle_minutes": 60 },
-  "daemon": { "pid_dir": ".dolly/daemons", "log_dir": ".dolly/logs" }
+  "memory": { "auto_summarize": true, "idle_minutes": 60 }
 }
 ```
 
-`modules` 下可用 `"模块id": { ... }` 传递模块级配置，注入到 `ModuleContext.config`。
+详见 [配置文档](docs/CONFIG.md)。
 
 ### mcp.json
 
@@ -230,7 +210,7 @@ export default myExt;
 | MCP | await 模式 | `"await":true` 时 LLM 等待结果后继续 |
 | SKILL | 语义触发 | guard_llm 判断触发条件，注入 skill 块 |
 | SKILL | 不误触发 | 无关话题不触发任何 SKILL |
-| 记忆 | daily log 写入 | `.memory/daily/YYYY-MM-DD.jsonl` 记录所有操作 |
+| 记忆 | daily log 写入 | `profiles/<name>/exts/builtin-memory/daily/` 记录所有操作 |
 | 记忆 | FORGET 移除 | `{"forget":"block_id"}` 正确移除指定块 |
 | 记忆 | 长期总结 | 空闲时 memory_llm 生成总结条目 |
 | CLI | start/stop/status | 命令正常执行 |
@@ -250,8 +230,9 @@ export default myExt;
 - [x] Console 作为独立 extension
 - [x] Agent 人设配置
 - [x] 长期记忆印象式总结 + 模糊检索
-- [ ] `dolly attach` 连接到后台实例
-- [ ] LLM 输出 speak/think/tool 结构化
+- [x] `dolly attach` 连接后台实例
+- [x] enable/disable/list 扩展管理
+- [x] 指数衰减上下文遗忘
 
 ## 贡献
 
