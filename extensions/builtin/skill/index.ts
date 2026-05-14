@@ -28,7 +28,7 @@ const skillModule: DollyModule = {
   },
 
   systemPrompt(): string {
-    return `工具调用使用 fenced JSON：\`\`\`json\n{"tool":"name","params":{}}\n\`\`\`（需要等待结果加 "await":true）。`;
+    return `你可以通过 {"recall":"hard"} 或 {"recall":"soft"} 请求检索相关记忆。hard 检索更多，soft 更少。`;
   },
 
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
@@ -53,11 +53,17 @@ const skillModule: DollyModule = {
           { role: "user", content: `判断：用户是否在${skill.description}？仅回复 yes 或 no。\n\n${recentText.slice(-1000)}` },
         ]);
         if (resp.trim().toLowerCase().startsWith("yes")) {
-          seenTriggers.add(skill.name);
-          mutations.push({
-            action: "insert", priority: 20,
-            block: { type: "skill", content: skill.body, meta: { skill: skill.name }, created: Date.now() },
-          });
+          // 去重：检查上下文中是否已有同名skill块
+          const alreadyInContext = ctx.getBlocks().some(
+            (b) => b.type === "skill" && b.meta?.skill === skill.name
+          );
+          if (!alreadyInContext) {
+            seenTriggers.add(skill.name);
+            mutations.push({
+              action: "insert", priority: 20,
+              block: { type: "skill", content: skill.body, meta: { skill: skill.name, source: "skill" }, created: Date.now() },
+            });
+          }
         }
       } catch {}
     }

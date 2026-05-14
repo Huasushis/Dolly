@@ -100,7 +100,7 @@ User Input → Block → ModulePush → LLM Module → API Call → Stream → J
 ## CLI 用法
 
 ```bash
-# 前台运行（交互式，Ctrl-C 自动保存上下文）
+# 前台运行（交互式，Ctrl-C 退出，仅 stop 保存上下文）
 dolly run                          # 默认实例
 dolly run --name=mybot             # 指定实例名（独立 profile）
 

@@ -224,7 +224,11 @@ async function run() {
   for await (const line of rl) {
     if (!line.trim()) continue;
     resetIdle();
-    const recalled = memory.recall(line.trim(), 2, 2);
+    // Parse recall tag for memory depth
+    const recallMatch = line.match(/\{"recall":"(hard|soft)"\}/);
+    const recallLevel = recallMatch?.[1] ?? "medium";
+    const [days, segs] = recallLevel === "hard" ? [5,5] : recallLevel === "soft" ? [1,1] : [3,3];
+    const recalled = memory.recall(line.trim(), days, segs);
     for (const seg of recalled) {
       context.addBlock("memory", `[记忆] ${seg}`, { notify: false });
     }
