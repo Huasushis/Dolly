@@ -267,4 +267,4 @@ Fork → Branch → 修改 → `pnpm typecheck` → PR。
 
 ## 许可
 
-MIT © 2026 陈鑫
+MIT © 2026 Huasushis
