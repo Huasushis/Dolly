@@ -82,9 +82,7 @@ JSON 块之外的内容是你的自然语言回复。请自然地使用这些功
       let fullResponse = "";
       for await (const chunk of client.chatStream([{ role: "user", content: sysPrompt }] as any)) {
         fullResponse += chunk;
-        process.stdout.write(chunk);
       }
-      process.stdout.write("\n");
 
       // Parse JSON commands
       const cmds = parseJsonCommands(fullResponse);

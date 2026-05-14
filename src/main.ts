@@ -15,7 +15,6 @@ import type { ModuleContext } from "./modules/base.js";
 const L = {
   inject: (s: string) => process.stderr.write(`\x1b[35m  ◀\x1b[0m ${s}\n`),
   mcp: (s: string) => process.stderr.write(`\x1b[33m  ⚡\x1b[0m ${s}\n`),
-  lock: (s: string) => process.stderr.write(`\x1b[2m  LOCK\x1b[0m ${s}\n`),
   mem: (s: string) => process.stderr.write(`\x1b[34m  ●\x1b[0m ${s}\n`),
 };
 
@@ -49,73 +48,64 @@ async function run() {
   const registry = new ModuleRegistry(ctx, bus, pathResolve(import.meta.dirname!, "..", "extensions"));
   await registry.loadFromConfig(config.modules.enabled);
 
-  // Agent persona from config
   const persona = (config as any).agent?.persona ?? "";
   const bg = (config as any).agent?.background ?? "";
-  const sp = [persona, bg, registry.buildSystemPrompt()].filter(Boolean).join("\n\n");
-  context.setSystemPrompt(sp);
+  context.setSystemPrompt([persona, bg, registry.buildSystemPrompt()].filter(Boolean).join("\n\n"));
 
-  // Tool call handling (MCP + built-in)
+  // Tool calls → MCP or built-in
   bus.on("tool.call_requested", async (p: any) => {
-    L.mcp(`tool: ${p.tool_name}`);
+    L.mcp(p.tool_name);
     let result: unknown;
-    try {
-      result = await handleMcpCall(p.tool_name.startsWith("mcp.") ? p.tool_name.slice(4) : p.tool_name, p.params);
-    } catch {
-      if (p.tool_name === "datetime") result = { datetime: new Date().toISOString() };
-      else result = { error: `unknown tool: ${p.tool_name}` };
-    }
+    try { result = await handleMcpCall(p.tool_name.startsWith("mcp.") ? p.tool_name.slice(4) : p.tool_name, p.params); }
+    catch { result = p.tool_name === "datetime" ? { datetime: new Date().toISOString() } : { error: `unknown tool: ${p.tool_name}` }; }
     context.addBlock("tool_result", JSON.stringify(result), { tool: p.tool_name });
-    L.mcp(`result: ${JSON.stringify(result).slice(0, 120)}`);
+    if (p.blocking) {
+      context.addBlock("message", "工具结果已返回，请根据结果继续。", { continuation: true });
+      await cascade(context, registry, memory, context.applyMutations([]));
+    }
   });
 
-  L.inject(`Modules: ${registry.list().join(", ")}`);
-  process.stderr.write(`  Ready. Type and press Enter.\n\n`);
+  process.stderr.write(`  Modules: ${registry.list().join(", ")}\n  Ready.\n\n`);
 
-  // Idle summarization
+  // Idle
   let idleTimer: NodeJS.Timeout | null = null;
   const resetIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(async () => {
       const blocks = context.getBlocks();
-      if (blocks.length > 2) {
-        L.mem(`Idle — summarizing (${blocks.length} blocks)...`);
-        try { await memory.summarize(blocks); } catch {}
-      }
+      if (blocks.length > 2) { L.mem(`Summarizing...`); try { await memory.summarize(blocks); } catch {} }
     }, config.memory.idle_minutes * 60 * 1000);
   };
+  resetIdle();
 
-  // ── Main loop ──────────────────────────────────────────
+  // Stdin → message blocks
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-
-  // Process a batch of changes through all modules with debounce
-  async function processChanges(changes: typeof context extends { applyMutations: (m: any) => any } ? any[] : any[]) {
-    if (changes.length === 0) return;
-    // 合并: 同一轮只通知一次
-    for (let round = 0; round < 3; round++) {
-      const mutations = await registry.pushChanges(changes);
-      if (mutations.length === 0) break;
-      L.inject(`round ${round + 1}: ${mutations.length} mutations`);
-      const newChanges = context.applyMutations(mutations);
-      // 日志
-      for (const entry of context.getLog()) memory.appendLog(entry.op, entry.detail);
-      if (newChanges.length === 0) break;
-      changes = newChanges;
-    }
-  }
-
   for await (const line of rl) {
     if (!line.trim()) continue;
     resetIdle();
-
     context.addBlock("message", line.trim());
-    const changes = context.applyMutations([]); // flush initial change
-    await processChanges(changes);
+    await cascade(context, registry, memory, context.applyMutations([]));
   }
   rl.close();
   if (idleTimer) clearTimeout(idleTimer);
 }
 
-run().catch((err) => { console.error("Fatal:", err); process.exit(1); });
+async function cascade(
+  context: ContextManager,
+  registry: ModuleRegistry,
+  memory: MemoryStore,
+  changes: any[]
+): Promise<void> {
+  for (let i = 0; i < 3; i++) {
+    const mutations = await registry.pushChanges(changes);
+    if (mutations.length === 0) break;
+    L.inject(`round ${i + 1}: ${mutations.length} mutations`);
+    const newChanges = context.applyMutations(mutations);
+    for (const e of context.getLog()) memory.appendLog(e.op, e.detail);
+    if (newChanges.length === 0) break;
+    changes = newChanges;
+  }
+}
 
+run().catch((err) => { console.error("Fatal:", err); process.exit(1); });
 process.on("SIGINT", () => { process.exit(0); });
