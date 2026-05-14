@@ -9,7 +9,7 @@ import { LockManager } from "./core/lock.js";
 import { ModuleRegistry } from "./modules/registry.js";
 import { start, stop, status } from "./daemon/index.js";
 import { startRelay, cleanupRelay } from "./daemon/attach.js";
-import { getSpeakHistory } from "../extensions/builtin/console/index.js";
+import { getSpeakHistory, replayHistory } from "../extensions/builtin/console/index.js";
 import { handleMcpCall } from "../extensions/builtin/mcp/index.js";
 import type { ModuleContext } from "./modules/base.js";
 
@@ -51,11 +51,11 @@ async function main() {
     log: (_op, _detail) => {}, // handled by memory extension
     lock,
     setSystemPrompt: (_text) => {}, // handled by registry
-    storagePath: profileDir,
-    _storageSet: true,
+    storagePath: "",
   };
 
-  const registry = new ModuleRegistry(ctx, bus, pathResolve(import.meta.dirname!, "..", "extensions"));
+  const profileExtsDir = pathResolve(profileDir, "exts");
+  const registry = new ModuleRegistry(ctx, bus, pathResolve(import.meta.dirname!, "..", "extensions"), profileExtsDir);
   await registry.discover();
   await registry.loadFromConfig(config.modules.enabled);
 
@@ -118,6 +118,7 @@ async function main() {
   process.once("SIGTERM", () => { saveProfile(); rl.close(); });
 
   process.stderr.write(`  Instance: ${instanceName}\n  Modules: ${registry.list().join(", ")}\n  Ready.\n\n`);
+  replayHistory(); // show previous speak after banner
 
   // Relay (attach)
   const relay = startRelay(instanceName, (socket) => {
@@ -128,8 +129,12 @@ async function main() {
   });
 
   // Stdin
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  for await (const line of rl) { if (line.trim()) await handleInput(line.trim()); }
+  const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  process.stdout.write("> ");
+  for await (const line of rl) {
+    if (line.trim()) await handleInput(line.trim());
+    process.stdout.write("> ");
+  }
   rl.close();
   cleanupRelay(instanceName);
   relay.close();

@@ -11,15 +11,11 @@ const consoleModule: DollyModule = {
   id: "builtin/console",
 
   async init(ctx: ModuleContext) {
-    // Use storagePath for speak history persistence
     storageFile = resolve(ctx.storagePath, "speak_history.json");
     if (existsSync(storageFile)) {
       try {
         const saved = JSON.parse(readFileSync(storageFile, "utf-8"));
-        for (const s of (saved.history ?? [])) {
-          speakHistory.push(s);
-          process.stdout.write(s + "\n");
-        }
+        for (const s of (saved.history ?? [])) speakHistory.push(s);
       } catch {}
     }
   },
@@ -41,7 +37,6 @@ speak 之外的一切都是你的内心独白——不会被显示。`;
           if (speakHistory.length > MAX_HISTORY) speakHistory.shift();
           process.stdout.write(s + "\n");
         }
-        // Persist
         if (storageFile) {
           try { writeFileSync(storageFile, JSON.stringify({ history: speakHistory })); } catch {}
         }
@@ -64,5 +59,7 @@ function parseSpeak(text: string): string[] {
 }
 
 export function getSpeakHistory(): string[] { return [...speakHistory]; }
-
+export function replayHistory(): void {
+  if (speakHistory.length > 0) process.stdout.write(speakHistory.join("\n") + "\n");
+}
 export default consoleModule;

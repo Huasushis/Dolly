@@ -9,12 +9,10 @@ export interface ModuleContext {
   emit(event: string, payload: unknown): void;
   log(op: string, detail: unknown): void;
   lock: LockManager;
-  /** Extension 本地存储路径（可不存在，extension 自行创建） */
+  /** Extension 本地存储路径（profiles/<name>/exts/<module-id>/） */
   storagePath: string;
-  /** 修改模块自己的 System Prompt 片段（替换之前的内容） */
+  /** 修改模块自己的 System Prompt 片段 */
   setSystemPrompt(text: string): void;
-  /** 内部：标记 storagePath 是否已被 main.ts 预设 */
-  _storageSet?: boolean;
 }
 
 export interface DollyModule {

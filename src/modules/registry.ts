@@ -16,6 +16,7 @@ export class ModuleRegistry {
     private ctx: ModuleContext,
     private bus: EventBus,
     private extensionsDir: string,
+    private profileExtsDir: string,  // profile/<name>/exts/
   ) {
     ctx.setSystemPrompt = (text: string) => {
       const lastId = this._lastLoadedId;
@@ -25,15 +26,25 @@ export class ModuleRegistry {
 
   private _lastLoadedId = "";
 
-  /** Scan extensions dir for available modules */
+  /** Recursively scan for module directories (those containing dolly.json) */
   async discover(): Promise<string[]> {
-    const { readdirSync, existsSync } = await import("fs");
-    const dir = this.extensionsDir;
-    if (!existsSync(dir)) return [];
-    this.available = readdirSync(dir, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name);
-    return this.available;
+    const { readdirSync, existsSync, statSync } = await import("fs");
+    const results: string[] = [];
+    const scan = (base: string, prefix: string) => {
+      if (!existsSync(base)) return;
+      for (const entry of readdirSync(base, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const full = resolve(base, entry.name);
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (existsSync(resolve(full, "dolly.json"))) {
+          results.push(rel);
+        }
+        scan(full, rel); // recurse
+      }
+    };
+    scan(this.extensionsDir, "");
+    this.available = results;
+    return results;
   }
 
   async loadFromConfig(enabled: string[]): Promise<void> {
@@ -74,9 +85,8 @@ export class ModuleRegistry {
       const instance: DollyModule = mod.default ?? mod;
       this.modules.set(instance.id, instance);
       this.instances.add(dir);
-      if (!this.ctx._storageSet) {
-        this.ctx.storagePath = resolve(dir, "data");
-      }
+      // Set per-module profile storage: profiles/<name>/exts/<module-id>/
+      this.ctx.storagePath = resolve(this.profileExtsDir, instance.id);
       // Load static systemPrompt if the module has one
       if (instance.systemPrompt) {
         const sp = instance.systemPrompt(this.ctx);
