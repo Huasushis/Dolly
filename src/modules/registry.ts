@@ -1,29 +1,38 @@
 import { resolve } from "path";
-import { existsSync, readFileSync, readdirSync } from "fs";
+import { existsSync } from "fs";
 import { pathToFileURL } from "url";
 import type { DollyModule, ModuleContext } from "./base.js";
 import type { BlockChange, BlockMutation } from "../blocks/index.js";
-import type { ContextManager } from "../core/context.js";
 import type { EventBus } from "../core/bus.js";
 
 export class ModuleRegistry {
   private modules = new Map<string, DollyModule>();
   private instances = new Set<string>();
+  private promptFragments = new Map<string, string>(); // moduleId → prompt fragment
 
   constructor(
     private ctx: ModuleContext,
     private bus: EventBus,
     private extensionsDir: string,
-  ) {}
+  ) {
+    // Give ctx a per-module setSystemPrompt
+    ctx.setSystemPrompt = (text: string) => {
+      // Called from within init() — we track by last-loaded module
+      const lastId = this._lastLoadedId;
+      if (lastId) {
+        this.promptFragments.set(lastId, text);
+      }
+    };
+  }
 
-  /** Load modules from dolly.json enabled list */
+  private _lastLoadedId = "";
+
   async loadFromConfig(enabled: string[]): Promise<void> {
     for (const path of enabled) {
       await this.load(resolve(this.extensionsDir, path));
     }
   }
 
-  /** Load a single module directory */
   async load(dir: string): Promise<void> {
     if (this.instances.has(dir)) return;
     if (!existsSync(dir)) return;
@@ -36,29 +45,53 @@ export class ModuleRegistry {
       const instance: DollyModule = mod.default ?? mod;
       this.modules.set(instance.id, instance);
       this.instances.add(dir);
-      // Set per-module storage path (only if not already preset by main.ts)
       if (!this.ctx._storageSet) {
         this.ctx.storagePath = resolve(dir, "data");
       }
+      // Load static systemPrompt if the module has one
+      if (instance.systemPrompt) {
+        const sp = instance.systemPrompt(this.ctx);
+        if (sp) this.promptFragments.set(instance.id, sp);
+      }
+      this._lastLoadedId = instance.id;
       if (instance.init) await instance.init(this.ctx);
+      this._lastLoadedId = "";
     } catch (err) {
       console.error(`[ModuleRegistry] Failed to load ${dir}:`, err);
     }
   }
 
-  /** Collect system prompt from all modules */
-  buildSystemPrompt(): string {
-    const parts: string[] = [];
-    for (const mod of this.modules.values()) {
-      if (mod.systemPrompt) {
-        const p = mod.systemPrompt(this.ctx);
-        if (p) parts.push(p);
+  unload(id: string): void {
+    this.modules.delete(id);
+    this.promptFragments.delete(id);
+    for (const dir of this.instances) {
+      if (dir.endsWith(`/${id}`) || dir.endsWith(`\\${id}`)) {
+        this.instances.delete(dir);
+        break;
       }
     }
-    return parts.join("\n\n");
   }
 
-  /** Push block changes to all modules, collect mutations */
+  async reload(id: string): Promise<void> {
+    const dir = [...this.instances].find((d) => d.endsWith(`/${id}`) || d.endsWith(`\\${id}`));
+    this.unload(id);
+    if (dir) await this.load(dir);
+  }
+
+  async reloadAll(): Promise<void> {
+    const ids = [...this.modules.keys()];
+    for (const id of ids) await this.reload(id);
+  }
+
+  enable(id: string): void {
+    const dir = resolve(this.extensionsDir, id);
+    this.load(dir);
+  }
+
+  buildSystemPrompt(): string {
+    return [...this.promptFragments.values()].filter(Boolean).join("\n\n");
+  }
+
   async pushChanges(changes: BlockChange[]): Promise<BlockMutation[]> {
     const allMutations: BlockMutation[] = [];
     for (const mod of this.modules.values()) {
@@ -74,19 +107,6 @@ export class ModuleRegistry {
     return allMutations;
   }
 
-  list(): string[] {
-    return Array.from(this.modules.keys());
-  }
-
-  /** Hot-reload a module */
-  async reload(id: string): Promise<void> {
-    this.modules.delete(id);
-    for (const dir of this.instances) {
-      if (dir.endsWith(id) || dir.includes(`/${id}`)) {
-        this.instances.delete(dir);
-        await this.load(dir);
-        break;
-      }
-    }
-  }
+  list(): string[] { return Array.from(this.modules.keys()); }
+  has(id: string): boolean { return this.modules.has(id); }
 }

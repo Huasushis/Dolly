@@ -15,7 +15,9 @@ const help = () => {
   console.log(`  start [--name=<n>] 后台启动守护进程（无终端输出）`);
   console.log(`  attach [--name=<n>] 连接到后台实例的终端`);
   console.log(`  stop [--name=<n>]  停止守护进程`);
-  console.log(`  status [--all]     查看实例状态\n`);
+  console.log(`  status [--all]     查看实例状态`);
+  console.log(`  reload [--name=<n>] --ext=<id>  重载指定扩展`);
+  console.log(`  reload [--name=<n>] --all       重载全部扩展\n`);
   console.log(`选项:`);
   console.log(`  --name=<name>       实例名称（默认 default）。用于多开和独立 profile`);
   console.log(`  -f, --force         强制停止\n`);
@@ -33,8 +35,13 @@ switch (cmd) {
     attach(instanceName);
     break;
   }
+  case "reload": {
+    // For foreground: send SIGUSR1 to trigger reload
+    // For daemon: connect via relay and send reload command
+    console.log("reload: connect via dolly attach and type /reload or /reload --ext=<id>");
+    break;
+  }
   case "run": {
-    // Dynamically import and run main with the instance name
     process.env.DOLLY_INSTANCE = instanceName;
     await import("../src/main.ts");
     break;

@@ -49,7 +49,7 @@ async function main() {
     emit: (event, payload) => bus.emit(event, payload),
     log: (op, detail) => { memory.appendLog(op, detail); },
     lock,
-    setSystemPrompt: (text) => { promptParts.set("runtime", text); rebuildSystemPrompt(); },
+    setSystemPrompt: (text) => { /* set per-module by registry */ },
     storagePath: profileDir,  // extensions use this for profile data
     _storageSet: true,  // prevent registry from overwriting
   };
@@ -108,6 +108,10 @@ async function main() {
 
   // Input handler
   async function handleInput(line: string) {
+    // Built-in commands
+    if (line === "/reload") { await registry.reloadAll(); L.mem("所有扩展已重载"); return; }
+    const reloadExt = line.match(/^\/reload\s+--ext=(\S+)/);
+    if (reloadExt) { await registry.reload(reloadExt[1]); L.mem(`扩展 ${reloadExt[1]} 已重载`); return; }
     resetIdle();
     const [rd, rs] = recallParams(line);
     const recalled = memory.recall(line, rd, rs);
@@ -173,7 +177,11 @@ async function main() {
     writeFileSync(profileFile, JSON.stringify({ blocks, savedAt: Date.now() }, null, 2));
   };
   process.once("SIGINT", () => { saveProfile(); rl.close(); });
-  process.once("SIGTERM", () => { saveProfile(); rl.close(); });
+  process.once("SIGTERM", async () => {
+    const blocks = context.getBlocks();
+    if (blocks.length > 2) { try { await memory.summarize(blocks, true); } catch {} }
+    saveProfile(); rl.close();
+  });
 
   for await (const line of rl) { if (line.trim()) await handleInput(line.trim()); }
   rl.close();
