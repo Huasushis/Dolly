@@ -44,7 +44,7 @@ export class MemoryStore {
     const logSlice = text.slice(-10000);
 
     // Step 1: Think — reflect on emotional significance
-    const thinkPrompt = `回顾你今天经历的以下片段。思考：哪些让你感到兴奋、好奇、困惑、满足？哪些值得记住？用 2-3 句内心独白反思。然后给出一个 0.1-1.0 的情绪权重（越高越深刻）和 3-5 个情绪关键词。\n\n格式：\nthink: <反思>\nweight: <数字>\nmood: <关键词,逗号分隔>\n\n日志：\n${logSlice}`;
+    const thinkPrompt = `回顾你今天经历的以下片段。反思：哪些让你情绪波动强烈？极度高兴、十分悲伤、非常愤怒、强烈好奇——无论正面负面，只要印象深刻就值得记住。用 2-3 句内心独白反思。然后给出 0.1-1.0 的情绪强度（越高越深刻，不分正负）和 3-5 个情绪关键词。\n\n格式：\nthink: <反思>\nweight: <数字>\nmood: <关键词,逗号分隔>\n\n日志：\n${logSlice}`;
 
     const thinkResp = await this.summarizeClient.chat([{ role: "user", content: thinkPrompt }]);
     const thinkMatch = thinkResp.match(/think:\s*(.+)/);
