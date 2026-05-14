@@ -4,9 +4,12 @@
   "description": "Base agent prototype for multi-agent collaborative network testing",
   "type": "module",
   "main": "src/main.ts",
+  "bin": {
+    "dolly": "bin/dolly.js"
+  },
   "scripts": {
     "dev": "tsx watch src/main.ts",
-    "start": "tsx src/main.ts",
+    "start": "node --import tsx/esm bin/dolly.js run",
     "build": "tsc",
     "typecheck": "tsc --noEmit"
   },
