@@ -89,35 +89,55 @@ export class ContextManager {
 
   getLog(): LogEntry[] { return [...this.log]; }
 
-  /** Exponential decay forget — one block per call */
+  /** Exponential decay forget */
   private decayCheck(): void {
     const maxT = this.config.max_tokens;
-    const threshold = this.config.compression_threshold;
-    if (this.estimateTokens() <= maxT * threshold) return;
+    const softThreshold = this.config.compression_threshold;
+    const hardThreshold = 0.95;
+    const tokens = this.estimateTokens();
+    if (tokens <= maxT * softThreshold) return;
 
     const now = Date.now();
     const protectMs = (this.config.protect_window_min ?? DEFAULT_PROTECT_MIN) * 60 * 1000;
     const defaultRate = this.config.decay_rate ?? DEFAULT_DECAY;
 
-    const candidates: Array<{ block: Block; prob: number }> = [];
-    for (const b of this.blocks) {
-      if (b.type === "system" || b.meta?.pinned) continue;
-      const ageMs = now - b.created;
-      if (ageMs < protectMs) continue;
-      const rate = (b.meta?.decay_rate as number) ?? defaultRate;
-      const ageHours = ageMs / 3600000;
-      const p = 1 - Math.exp(-rate * ageHours);
-      if (p > 0.001) candidates.push({ block: b, prob: p });
-    }
+    const getCandidates = () => {
+      const candidates: Array<{ block: Block; prob: number }> = [];
+      for (const b of this.blocks) {
+        if (b.type === "system" || b.meta?.pinned) continue;
+        const ageMs = now - b.created;
+        if (ageMs < protectMs) continue;
+        const rate = (b.meta?.decay_rate as number) ?? defaultRate;
+        const ageHours = ageMs / 3600000;
+        const p = 1 - Math.exp(-rate * ageHours);
+        if (p > 0.001) candidates.push({ block: b, prob: p });
+      }
+      return candidates;
+    };
 
-    if (candidates.length === 0) return;
+    const removeOne = (candidates: Array<{ block: Block; prob: number }>) => {
+      const total = candidates.reduce((s, c) => s + c.prob, 0);
+      let r = Math.random() * total;
+      for (const c of candidates) {
+        r -= c.prob;
+        if (r <= 0) { this.removeBlock(c.block.id); return true; }
+      }
+      return false;
+    };
 
-    // Weighted random pick one
-    const total = candidates.reduce((s, c) => s + c.prob, 0);
-    let r = Math.random() * total;
-    for (const c of candidates) {
-      r -= c.prob;
-      if (r <= 0) { this.removeBlock(c.block.id); break; }
+    if (tokens > maxT * hardThreshold) {
+      // Hard threshold: force-delete until below soft threshold
+      let rounds = 0;
+      while (this.estimateTokens() > maxT * softThreshold && rounds < 50) {
+        const candidates = getCandidates();
+        if (candidates.length === 0) break;
+        if (!removeOne(candidates)) break;
+        rounds++;
+      }
+    } else {
+      // Soft threshold: delete one
+      const candidates = getCandidates();
+      if (candidates.length > 0) removeOne(candidates);
     }
   }
 }
