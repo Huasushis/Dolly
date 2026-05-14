@@ -49,6 +49,7 @@ async function main() {
     emit: (event, payload) => bus.emit(event, payload),
     log: (op, detail) => { memory.appendLog(op, detail); },
     lock,
+    setSystemPrompt: (text) => { promptParts.set("runtime", text); rebuildSystemPrompt(); },
     storagePath: profileDir,  // extensions use this for profile data
     _storageSet: true,  // prevent registry from overwriting
   };
@@ -58,6 +59,16 @@ async function main() {
 
   const persona = (config as any).agent?.persona ?? "";
   const bg = (config as any).agent?.background ?? "";
+  // Per-module system prompt fragments that can be dynamically updated
+  const promptParts = new Map<string, string>();
+  for (const mod of registry.list()) {
+    // Initial static prompts loaded by registry
+  }
+  const rebuildSystemPrompt = () => {
+    const parts = [persona, bg, ...promptParts.values()].filter(Boolean);
+    context.setSystemPrompt(parts.join("\n\n"));
+  };
+  // Initial build from registry static prompts
   context.setSystemPrompt([persona, bg, registry.buildSystemPrompt()].filter(Boolean).join("\n\n"));
 
   // Profile restore

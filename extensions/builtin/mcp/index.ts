@@ -36,20 +36,27 @@ const mcpModule: DollyModule = {
       }
     }
 
-    // Notify skill module of available tools
+    // Add available tools to system prompt
     const allNames: string[] = [];
-    for (const [, conn] of connections) for (const [t] of conn.tools) allNames.push(t);
-    setMcpTools(allNames);
-  },
-
-  systemPrompt(): string {
-    return `你可以使用 fenced JSON 调用工具（对外交互）：
+    const allDesc: string[] = [];
+    for (const [, conn] of connections) for (const [t, info] of conn.tools) {
+      allNames.push(t);
+      allDesc.push(`  - ${t}: ${(info as any).description || ""}`);
+    }
+    if (allNames.length > 0) {
+      const base = `你可以使用 fenced JSON 调用工具（对外交互）：
 \`\`\`json
 {"tool":"工具名","params":{...}}
 \`\`\`
 需要等待结果时加 "await":true。
 
-MCP 工具输出的内容用完后应及时遗忘。使用 {"forget":"块ID"} 清理不再需要的工具结果。`;
+MCP 工具输出的内容用完后应及时遗忘。使用 {"forget":"块ID"} 清理不再需要的工具结果。
+
+可用 MCP 工具:
+${allDesc.join("\n")}`;
+      c.setSystemPrompt(base);
+    }
+    setMcpTools(allNames);
   },
 
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {

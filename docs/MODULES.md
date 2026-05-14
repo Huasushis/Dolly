@@ -73,6 +73,24 @@ export default myModule;
 interface ModuleContext {
   /** 所有块（只读副本） */
   getBlocks(): Block[];
+  /** 按 ID 获取块 */
+  getBlock(id: string): Block | undefined;
+  /** 估算 token 数 */
+  estimateTokens(): number;
+  /** 模块级配置（来自 dolly.json modules.<id>） */
+  config: Record<string, unknown>;
+  /** 发送事件到 EventBus */
+  emit(event: string, payload: unknown): void;
+  /** 写入 daily log */
+  log(op: string, detail: unknown): void;
+  /** 锁管理器 */
+  lock: LockManager;
+  /** 修改模块自己的 System Prompt 片段 */
+  setSystemPrompt(text: string): void;
+  /** 模块本地存储路径 */
+  storagePath: string;
+}
+```
 
   /** 按 ID 获取块 */
   getBlock(id: string): Block | undefined;
