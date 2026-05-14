@@ -3,18 +3,18 @@
   "llm": {
     "main": {
       "api_key_env": "DEEPSEEK_API_KEY",
-      "base_url": "https://api.deepseek.com",
-      "model": "deepseek-chat"
+      "base_url": "https://api.llm.ustc.edu.cn/v1",
+      "model": "deepseek-v4-flash-ascend"
     },
     "memory": {
       "api_key_env": "DEEPSEEK_API_KEY",
-      "base_url": "https://api.deepseek.com",
-      "model": "deepseek-chat"
+      "base_url": "https://api.llm.ustc.edu.cn/v1",
+      "model": "deepseek-v4-flash-ascend"
     },
     "guard": {
       "api_key_env": "DEEPSEEK_API_KEY",
-      "base_url": "https://api.deepseek.com",
-      "model": "deepseek-chat"
+      "base_url": "https://api.llm.ustc.edu.cn/v1",
+      "model": "deepseek-v4-flash-ascend"
     }
   },
   "context": {
@@ -22,7 +22,13 @@
     "compression_threshold": 0.8
   },
   "modules": {
-    "enabled": ["builtin/llm", "builtin/skill", "builtin/mcp"]
+    "enabled": ["builtin/llm", "builtin/skill", "builtin/mcp"],
+    "builtin/skill": {
+      "max_skills": 20
+    },
+    "builtin/mcp": {
+      "timeout_ms": 30000
+    }
   },
   "memory": {
     "path": ".memory",
