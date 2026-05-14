@@ -9,6 +9,8 @@ export interface ModuleContext {
   emit(event: string, payload: unknown): void;
   log(op: string, detail: unknown): void;
   lock: LockManager;
+  /** Extension 本地存储路径（可不存在，extension 自行创建） */
+  storagePath: string;
 }
 
 export interface DollyModule {

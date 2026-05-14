@@ -44,18 +44,14 @@ TYPE:message 是用户消息，TYPE:injection 是系统注入，TYPE:tool_result
     ctx = c;
     if (processing) return [];
 
-    const triggers = changes.filter((ch) =>
+    // Respond to any new block added (extensions can set meta.notify=false to skip)
+    const newBlocks = changes.filter((ch) =>
       ch.type === "added" &&
-      (ch.block.type === "message" || ch.block.type === "tool_result") &&
+      ch.block.meta?.notify !== false &&
       !respondedTo.has(ch.block.id)
     );
-    if (triggers.length === 0) return [];
-    for (const t of triggers) respondedTo.add(t.block.id);
-
-    // Only respond to tool_result from blocking calls (has meta.blocking)
-    const toolResults = triggers.filter((t) => t.block.type === "tool_result" && t.block.meta?.blocking);
-    const messages = triggers.filter((t) => t.block.type === "message");
-    if (messages.length === 0 && toolResults.length === 0) return [];
+    if (newBlocks.length === 0) return [];
+    for (const b of newBlocks) respondedTo.add(b.block.id);
 
     processing = true;
     const blocks = ctx.getBlocks();

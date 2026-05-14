@@ -28,7 +28,11 @@ switch (cmd) {
   case "start": start(instanceName); break;
   case "stop": stop(instanceName, force); break;
   case "status": status(args.includes("--all") ? undefined : instanceName); break;
-  case "attach": console.log("TODO: attach not yet implemented"); break;
+  case "attach": {
+    const { attach } = await import("../src/daemon/attach.js");
+    attach(instanceName);
+    break;
+  }
   case "run": {
     // Dynamically import and run main with the instance name
     process.env.DOLLY_INSTANCE = instanceName;

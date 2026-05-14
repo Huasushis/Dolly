@@ -10,6 +10,7 @@ import { ModuleRegistry } from "./modules/registry.js";
 import { MemoryStore } from "./memory/store.js";
 import { LLMClient } from "./core/llm-client.js";
 import { start, stop, status } from "./daemon/index.js";
+import { startRelay, cleanupRelay } from "./daemon/attach.js";
 import { handleMcpCall } from "../extensions/builtin/mcp/index.js";
 import type { ModuleContext } from "./modules/base.js";
 
@@ -44,6 +45,7 @@ async function run() {
     emit: (event, payload) => bus.emit(event, payload),
     log: (op, detail) => { memory.appendLog(op, detail); },
     lock,
+    storagePath: "",
   };
 
   const registry = new ModuleRegistry(ctx, bus, pathResolve(import.meta.dirname!, "..", "extensions"));
@@ -102,6 +104,20 @@ async function run() {
   };
   resetIdle();
 
+  // Relay for attach
+  const relay = startRelay(instanceName, (socket) => {
+    const rl = createInterface({ input: socket, output: socket });
+    (async () => {
+      for await (const line of rl) {
+        if (!line.trim()) continue;
+        resetIdle();
+        context.addBlock("message", line.trim());
+        await cascade(context, registry, memory, context.applyMutations([]));
+      }
+    })();
+    socket.on("close", () => rl.close());
+  });
+
   // Stdin → message blocks
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   for await (const line of rl) {
@@ -112,7 +128,9 @@ async function run() {
   }
   rl.close();
   if (idleTimer) clearTimeout(idleTimer);
-  saveContext(); // save on clean exit too
+  cleanupRelay(instanceName);
+  relay.close();
+  saveContext();
   process.stderr.write("  Saved.\n");
 }
 

@@ -36,6 +36,8 @@ export class ModuleRegistry {
       const instance: DollyModule = mod.default ?? mod;
       this.modules.set(instance.id, instance);
       this.instances.add(dir);
+      // Set per-module storage path
+      (this.ctx as any).storagePath = resolve(dir, "data");
       if (instance.init) await instance.init(this.ctx);
     } catch (err) {
       console.error(`[ModuleRegistry] Failed to load ${dir}:`, err);
