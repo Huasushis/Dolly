@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, rea
 import { resolve } from "path";
 import type { Block } from "../blocks/index.js";
 import { LLMClient } from "../core/llm-client.js";
+import { tokenize, tfVector, cosineSimilarity, extractKeywords } from "./nlp.js";
 
 export interface MemoryEntry {
   id: string; content: string; keywords: string[]; weight: number;
@@ -64,37 +65,34 @@ ${text.slice(-12000)}`;
     return entries;
   }
 
-  /** Semantic-ish search: keyword overlap + fuzzy match */
+  /** Bigram + TF-IDF cosine similarity search */
   search(query: string, topK = 10): MemoryEntry[] {
-    const tokens = query.toLowerCase().split(/[\s,，。]+/).filter((t) => t.length > 1);
-    const scored = new Map<string, number>();
+    const queryTokens = tokenize(query);
+    const queryVec = tfVector(queryTokens);
+    const scored: Array<{ id: string; score: number }> = [];
 
     for (const entry of this.allEntries) {
-      let score = 0;
-      const contentLower = entry.content.toLowerCase();
-      for (const kw of entry.keywords) {
-        const kwLower = kw.toLowerCase();
-        // Exact keyword match
-        for (const token of tokens) {
-          if (kwLower.includes(token) || token.includes(kwLower)) score += 2;
-        }
-        // Content overlap
-        if (contentLower.includes(kwLower)) score += 1;
-      }
-      // Token overlap with content
-      for (const token of tokens) {
-        if (contentLower.includes(token)) score += 0.5;
-      }
-      // Weight boost
+      // Build entry vector from content + keywords
+      const entryText = entry.content + " " + entry.keywords.join(" ");
+      const entryTokens = tokenize(entryText);
+      const entryVec = tfVector(entryTokens);
+      let score = cosineSimilarity(queryVec, entryVec);
+      // Boost by entry weight
       score *= (0.5 + entry.weight);
-      if (score > 0) scored.set(entry.id, score);
+      if (score > 0.01) scored.push({ id: entry.id, score });
     }
 
-    return [...scored.entries()]
-      .sort((a, b) => b[1] - a[1])
+    return scored
+      .sort((a, b) => b.score - a.score)
       .slice(0, topK)
-      .map(([id]) => this._get(id))
+      .map((s) => this._get(s.id))
       .filter(Boolean) as MemoryEntry[];
+  }
+
+  /** Check if today already has memory entries */
+  hasEntriesForToday(): boolean {
+    const today = new Date().toISOString().slice(0, 10);
+    return this.allEntries.some((e) => e.source_day === today);
   }
 
   /** Randomly select one from top-K results for context injection */
