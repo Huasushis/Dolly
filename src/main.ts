@@ -10,6 +10,7 @@ import { ModuleRegistry } from "./modules/registry.js";
 import { start, stop, status } from "./daemon/index.js";
 import { startRelay, cleanupRelay } from "./daemon/attach.js";
 import { getSpeakHistory, replayHistory } from "../extensions/builtin/console/index.js";
+import { resetThinking } from "../extensions/builtin/llm/index.js";
 import { handleMcpCall } from "../extensions/builtin/mcp/index.js";
 import type { ModuleContext } from "./modules/base.js";
 
@@ -71,6 +72,20 @@ async function main() {
 
   // Events
   bus.on("forget.requested", (p: any) => context.removeBlock(p.blockId));
+  // Capture reasoning for memory summary (add then immediately remove)
+  bus.on("reasoning.captured", (p: any) => {
+    const block = context.addBlock("reasoning", p.content, { source: "llm", notify: false });
+    context.removeBlock(block.id);
+  });
+  // Midnight check every 10 min
+  // Midnight check: trigger memory summary + reset deep thinking
+  let midnightTimer = setInterval(() => {
+    const h = new Date().getHours(), m = new Date().getMinutes();
+    if (h === 3 && m < 10) {
+      bus.emit("midnight.tick", {});
+      resetThinking();
+    }
+  }, 10 * 60 * 1000);
   bus.on("tool.call_requested", async (p: any) => {
     L.mcp(p.tool_name);
     let result: unknown;
