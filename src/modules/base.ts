@@ -1,4 +1,5 @@
 import type { Block, BlockChange, BlockMutation } from "../blocks/index.js";
+import type { LockManager } from "../core/lock.js";
 
 export interface ModuleContext {
   getBlocks(): Block[];
@@ -7,6 +8,7 @@ export interface ModuleContext {
   config: Record<string, unknown>;
   emit(event: string, payload: unknown): void;
   log(op: string, detail: unknown): void;
+  lock: LockManager;
 }
 
 export interface DollyModule {
@@ -14,6 +16,4 @@ export interface DollyModule {
   init?(ctx: ModuleContext): Promise<void>;
   onBlocksChanged?(ctx: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]>;
   systemPrompt?(ctx: ModuleContext): string;
-  heartbeatInterval?: number;
-  onHeartbeat?(ctx: ModuleContext): Promise<BlockMutation[]>;
 }

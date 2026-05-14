@@ -8,8 +8,7 @@ import type { EventBus } from "../core/bus.js";
 
 export class ModuleRegistry {
   private modules = new Map<string, DollyModule>();
-  private instances = new Set<string>(); // loaded module dirs
-  private heartbeats = new Map<string, NodeJS.Timeout>();
+  private instances = new Set<string>();
 
   constructor(
     private ctx: ModuleContext,
@@ -37,15 +36,7 @@ export class ModuleRegistry {
       const instance: DollyModule = mod.default ?? mod;
       this.modules.set(instance.id, instance);
       this.instances.add(dir);
-
       if (instance.init) await instance.init(this.ctx);
-      if (instance.heartbeatInterval && instance.heartbeatInterval > 0) {
-        const timer = setInterval(
-          () => this.runHeartbeat(instance),
-          instance.heartbeatInterval! * 1000
-        );
-        this.heartbeats.set(instance.id, timer);
-      }
     } catch (err) {
       console.error(`[ModuleRegistry] Failed to load ${dir}:`, err);
     }
@@ -79,33 +70,13 @@ export class ModuleRegistry {
     return allMutations;
   }
 
-  private async runHeartbeat(mod: DollyModule): Promise<void> {
-    if (!mod.onHeartbeat) return;
-    try {
-      const m = await mod.onHeartbeat(this.ctx);
-      if (m.length > 0) {
-        // Heartbeat mutations go through the context
-        this.ctx.getBlocks(); // ensure context access
-      }
-    } catch (err) {
-      console.error(`[ModuleRegistry] ${mod.id} heartbeat error:`, err);
-    }
-  }
-
   list(): string[] {
     return Array.from(this.modules.keys());
   }
 
   /** Hot-reload a module */
   async reload(id: string): Promise<void> {
-    const mod = this.modules.get(id);
-    if (!mod) return;
-    if (this.heartbeats.has(id)) {
-      clearInterval(this.heartbeats.get(id)!);
-      this.heartbeats.delete(id);
-    }
     this.modules.delete(id);
-    // Find and reload from extensions dir
     for (const dir of this.instances) {
       if (dir.endsWith(id) || dir.includes(`/${id}`)) {
         this.instances.delete(dir);

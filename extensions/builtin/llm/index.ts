@@ -28,7 +28,6 @@ function stripFences(text: string): string {
 
 const llmModule: DollyModule = {
   id: "builtin/llm",
-  heartbeatInterval: 0,
 
   async init(c: ModuleContext) {
     ctx = c;

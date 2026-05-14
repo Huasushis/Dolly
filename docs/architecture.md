@@ -4,8 +4,41 @@
 
 - 上下文不区分输入/输出，一切皆为 **Block**
 - 注入、监控、LLM 调用统一为**模块**（`DollyModule`）
-- 模块通过推送上下文变更和提交块变更来工作
-- MCP、SKILL 作为内置模块提供
+- 模块并发安全：**锁机制**防止重复调度，**合并更新**避免无效计算
+- Agent 作为独立个体，可面向多人
+
+## 完整交互流程
+
+用户输入 `"你好"` 后的完整链路：
+
+```
+1. 输入到达
+   stdin → readline → main.ts 收到文本
+
+2. 创建消息块
+   context.addBlock("message", "你好")  → 块 ID:msg_1
+
+3. 推送变更 → 排队
+   context 发出 changes: [{type:"added", block:msg_1}]
+   主循环: pushChanges → 遍历所有模块 onBlocksChanged
+   各模块返回 mutations（可能 0 个或多个）
+
+4. 合并 → 单次 apply
+   收集所有 mutations → applyMutations → 产生新的 changes
+   如果新 changes 非空 → 再合并一次通知所有模块
+   重复直到稳定（最多 3 轮），每轮只通知一次
+
+5. LLM 模块响应
+   LLM 看到新的 message 块 → 请求锁（最低优先级）
+   其他模块先处理完（SKILL 检测触发? MCP 注入工具列表?）
+   锁交给 LLM → 构建上下文 → 调用 API → 流式输出
+   输出内容作为 response 块插入
+
+6. Console 模块显示
+   Console 监听新 response 块 → 解析内容 → 打印 speak 部分
+```
+
+关键约束：**每一轮变更只通知所有模块一次**。多个模块返回的 mutations 合并后一次 apply，产生的 changes 合并后一次推送。
 
 ## 上下文模型：Block
 
@@ -13,11 +46,11 @@
 
 ```typescript
 interface Block {
-  id: string;           // 唯一 ID
-  type: string;         // 块类型
-  content: string;      // 内容
-  meta: Record<string, unknown>;  // 元数据
-  created: number;      // 时间戳
+  id: string;
+  type: string;
+  content: string;
+  meta: Record<string, unknown>;
+  created: number;
 }
 ```
 
@@ -41,12 +74,51 @@ interface Block {
 
 [ID:def][TYPE:tool_result][TIME:1700000001]
 {"result": "..."}
-
-[ID:ghi][TYPE:injection][TIME:1700000002]
-系统注入的信息
 ```
 
-每块 `[ID][TYPE][TIME]` 头部 + 内容体。role 仅在 OpenAI API 边界拼合。
+## 锁机制
+
+防止多个模块同时触发 LLM 调用。
+
+### 规则
+
+1. **修改上下文前必须获取锁**
+2. **优先级数字越小越先拿到锁**
+3. **LLM 模块固定使用最低优先级**（`Infinity`），让其他模块先处理
+4. **锁等待期间合并变更**：如果排队期间发生多次 update，只处理最终状态
+5. **同一时刻只有一个模块持有锁**
+
+### API
+
+```typescript
+interface LockManager {
+  /** 申请锁，返回一个释放函数。优先级越小越优先 */
+  acquire(moduleId: string, priority: number): Promise<() => void>;
+}
+
+// 使用示例
+const unlock = await ctx.lock.acquire("builtin/llm", Infinity);
+try {
+  // ... 修改上下文
+} finally {
+  unlock();
+}
+```
+
+### 调度实例
+
+```
+时间线：
+  msg_1 到达
+  → pushChanges（所有模块，无锁）
+  → SKILL 返回 mutation: insert skill block
+  → applyMutations → 产生 changes
+  → pushChanges（所有模块，合并通知）
+  → LLM 看到 msg_1 + skill block → acquire(Infinity)
+  → 等待中...（没有其他锁竞争者）
+  → LLM 获取锁 → 调用 API → 流式输出 → release
+  → 稳定，等待下次输入
+```
 
 ## 模块系统
 
@@ -61,9 +133,19 @@ interface DollyModule {
 }
 ```
 
-### 变更推送
+### ModuleContext
 
-当块被 added/removed/modified 时，向所有模块推送：
+```typescript
+interface ModuleContext {
+  getBlocks(): Block[];
+  getBlock(id: string): Block | undefined;
+  estimateTokens(): number;
+  config: Record<string, unknown>;   // 模块级配置（来自 dolly.json）
+  lock: LockManager;                 // 锁管理器
+}
+```
+
+### 变更推送
 
 ```typescript
 interface BlockChange { type: "added" | "removed" | "modified"; block: Block; }
@@ -78,56 +160,63 @@ type BlockMutation =
   | { action: "update"; blockId: string; content?: string; meta?: Record<string, unknown> }
 ```
 
-### LLM 触发
+## Agent 身份
 
-当有新的 `type: "message"` 块加入时触发 LLM。blocking 工具调用完成后通过 continuation message 再次触发。
-
-## 内置模块
-
-### builtin/llm
-
-- 监听新 `message` 块 → 构建上下文 → 调用 LLM API → 流式输出
-- 解析 fenced JSON 命令：`{"tool":"name","params":{}}` / `{"forget":"id"}`
-- 返回 response 块
-
-### builtin/skill
-
-- 加载 `extensions/builtin/skill/skills/*.json`
-- 上下文变化时用 `guard_llm` 语义检测触发条件
-- 触发时插入 `type: "skill"` 块
-
-### builtin/mcp
-
-- 读取 `mcp.json`，启动各 MCP server（stdio JSON-RPC）
-- 发现工具列表，通知 SKILL 模块
-- 处理 `tool.call_requested` 事件，路由到对应 server
-
-## 记忆系统
-
-### 短期记忆
-
-LLM 通过 `{"forget":"block_id"}` 移除不需要的注入块。
-
-### 长期记忆
-
-- **日志**：`.memory/daily/YYYY-MM-DD.jsonl` 记录所有块变更操作
-- **总结**：空闲 `idle_minutes` 分钟后用 `memory_llm` 生成摘要
-- **检索**：关键词倒排索引，按需查询
-
-### 日志格式（JSONL）
+`dolly.json` 中配置 agent 的人设：
 
 ```json
-{"op":"insert","detail":{"type":"message","content":"你好"},"time":1700000000}
-{"op":"delete","detail":{"id":"abc","type":"injection"},"time":1700000001}
+{
+  "agent": {
+    "name": "Dolly",
+    "persona": "你是一个友好、好奇的AI助手。你喜欢帮助别人，但也会表达自己的观点。",
+    "background": "你运行在 Dolly 框架中，可以访问文件系统和浏览器工具。"
+  }
+}
 ```
 
-日志中不真正删除，只记录操作。
+这些直接注入到 System Prompt。不绑定特定用户——agent 是一个独立个体。
+
+## 长期记忆
+
+### 理念
+
+不是“用户需要什么”的仆人记录，而是**“我经历了什么”的个体记忆**。LLM 每天结束时回顾一天，提取印象深刻、需要记住的片段。
+
+### 总结流程
+
+```
+一天结束（idle_minutes 到）
+→ 取当日完整日志（所有块变更）
+→ memory_llm 提取：
+   [{"content": "印象深刻的内容", "keywords": ["关键词"], "weight": 0.8}]
+→ 存储为 MemoryEntry[]
+```
+
+### 检索流程
+
+```
+收到用户输入
+→ 对输入做语义匹配（关键词 + 模糊匹配）
+→ 从 MemoryEntry[] 中选 top-K
+→ 随机选 1 条注入上下文（避免总是同一条）
+→ 注入为 type: "memory" 块
+```
+
+### 存储格式
+
+```
+.memory/
+├── index.json           # 关键词 → entry_id[] 倒排索引
+├── entries/{id}.json   # 单条记忆
+└── daily/{date}.jsonl  # 每日原始日志
+```
 
 ## 运行模式
 
 ```bash
-pnpm start                    # 前台运行
-node --import tsx src/main.ts start --name=xxx  # 后台启动
-node --import tsx src/main.ts stop              # 停止
-node --import tsx src/main.ts status            # 状态
+dolly run                          # 前台运行
+dolly start --name=xxx             # 后台启动
+dolly attach --name=xxx            # 连接到后台实例
+dolly stop --name=xxx              # 停止
+dolly status                       # 状态
 ```
