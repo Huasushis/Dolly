@@ -39,7 +39,7 @@ async function main() {
 
   const profileDir = pathResolve(import.meta.dirname!, "..", ".dolly", "profiles", instanceName);
   if (!existsSync(profileDir)) mkdirSync(profileDir, { recursive: true });
-  const memory = new MemoryStore(pathResolve(profileDir, "memory"), memoryClient);
+  const memory = new MemoryStore(pathResolve(profileDir, "exts", "builtin-memory"), memoryClient);
 
   const ctx: ModuleContext = {
     getBlocks: () => context.getBlocks(),
