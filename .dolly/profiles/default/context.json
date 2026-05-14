@@ -1,115 +1,138 @@
 {
   "blocks": [
     {
-      "id": "161b7c93-74e9-465d-a5a9-11cc9ce3cde0",
+      "id": "e9b31291-0376-4122-8ef4-3f8cfaf591ff",
       "type": "message",
       "content": "你好，我叫小明",
       "meta": {},
-      "created": 1778749854607
+      "created": 1778750481124
     },
     {
-      "id": "06f3796b-75ae-4355-94c0-5990c692e499",
+      "id": "52125c4c-664b-4cbc-9e99-75db1a34cff1",
       "type": "injection",
       "content": "可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_tree, fs.move_file, fs.search_files, fs.get_file_info, fs.list_allowed_directories, playwright.browser_close, playwright.browser_resize, playwright.browser_console_messages, playwright.browser_handle_dialog, playwright.browser_evaluate, playwright.browser_file_upload, playwright.browser_drop, playwright.browser_fill_form, playwright.browser_press_key, playwright.browser_type, playwright.browser_navigate, playwright.browser_navigate_back, playwright.browser_network_requests, playwright.browser_network_request, playwright.browser_run_code_unsafe, playwright.browser_take_screenshot, playwright.browser_snapshot, playwright.browser_click, playwright.browser_drag, playwright.browser_hover, playwright.browser_select_option, playwright.browser_tabs, playwright.browser_wait_for",
       "meta": {
         "source": "skill"
       },
-      "created": 1778749854607
+      "created": 1778750481124
     },
     {
-      "id": "f9098964-63ce-4dbc-bd3c-28662aa6301f",
+      "id": "4a5a4ae9-5baf-4be5-ab80-ca1a91fd55aa",
       "type": "skill",
       "content": "用户正在询问天气。请告知用户你可以通过工具查询天气信息。如果用户提供了城市名，建议使用 datetime 工具先确认日期。",
       "meta": {
         "skill": "weather"
       },
-      "created": 1778749854607
+      "created": 1778750481124
     },
     {
-      "id": "d5fdce68-c3ee-48cb-8ae5-d5aac15b1ed5",
+      "id": "3fb1983d-e955-43e8-97a6-8dcea3a5fbf9",
       "type": "response",
       "content": "你好，小明！我是 Dolly 框架中的 AI 助手，很高兴认识你。有什么我可以帮你的吗？",
       "meta": {},
-      "created": 1778749854607
+      "created": 1778750481124
     },
     {
-      "id": "6db2a99c-190c-40e8-9147-c0abefb1126e",
+      "id": "0168a91c-da1d-4a38-9cf9-ce4fc17102a6",
       "type": "message",
       "content": "今天天气真好啊",
       "meta": {},
-      "created": 1778749854607
+      "created": 1778750481124
     },
     {
-      "id": "2c0959a8-061a-4c04-b2f2-9714c75db3da",
+      "id": "8201025c-6f60-41f7-bc13-15ee9adec4e7",
       "type": "injection",
       "content": "可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_tree, fs.move_file, fs.search_files, fs.get_file_info, fs.list_allowed_directories, playwright.browser_close, playwright.browser_resize, playwright.browser_console_messages, playwright.browser_handle_dialog, playwright.browser_evaluate, playwright.browser_file_upload, playwright.browser_drop, playwright.browser_fill_form, playwright.browser_press_key, playwright.browser_type, playwright.browser_navigate, playwright.browser_navigate_back, playwright.browser_network_requests, playwright.browser_network_request, playwright.browser_run_code_unsafe, playwright.browser_take_screenshot, playwright.browser_snapshot, playwright.browser_click, playwright.browser_drag, playwright.browser_hover, playwright.browser_select_option, playwright.browser_tabs, playwright.browser_wait_for",
       "meta": {
         "source": "skill"
       },
-      "created": 1778749854607
+      "created": 1778750481124
     },
     {
-      "id": "eeb32a39-e266-46c3-af19-8a742ba6ce21",
+      "id": "5f33b3a2-fb4e-4261-b223-16eb4a176d5c",
       "type": "skill",
       "content": "## 天气查询\n\n当用户询问天气相关问题时，告知用户你可以通过工具帮助查询天气信息。如果用户提供了城市名，建议先使用工具确认当前日期和时间。",
       "meta": {
         "skill": "weather"
       },
-      "created": 1778749854607
+      "created": 1778750481124
     },
     {
-      "id": "d139e0a5-1489-4c03-a54e-a58da7062b53",
+      "id": "58e2ff27-1db1-416d-919c-1005b1b8c5ec",
       "type": "response",
       "content": "你好，小明！很高兴见到你！😊\n\n是的，今天的天气确实很好呢！如果你想知道某个城市的具体天气情况，我可以帮你查询哦。比如你想知道哪个城市的天气，告诉我城市名，我就可以帮你查一查。\n\n需要我帮你查天气吗？",
       "meta": {},
-      "created": 1778749854607
+      "created": 1778750481124
     },
     {
-      "id": "21140423-4a64-4d04-a863-c26739b3bb73",
+      "id": "b0467c10-2e9c-4345-aef0-1f0cf15ffd8a",
       "type": "response",
       "content": "好的，今天天气好确实让人心情愉快！😊\n\n如果你想知道某个城市的具体天气情况，可以告诉我城市名字，我就能帮你查询天气信息啦。需要我帮你查查哪里今天的天气吗？",
       "meta": {},
-      "created": 1778749854607
+      "created": 1778750481124
     },
     {
-      "id": "9f5468b8-239b-47e2-ab60-a280ee4fe033",
+      "id": "0a1c3301-a670-43d4-90df-26e6ba3602f0",
       "type": "response",
       "content": "好的，今天天气好确实让人心情愉快！😊\n\n如果你想知道某个城市的具体天气情况，可以告诉我城市名字，我就能帮你查询天气信息啦。需要我帮你查查哪里今天的天气吗？",
       "meta": {},
-      "created": 1778749854607
+      "created": 1778750481124
     },
     {
-      "id": "98c0357b-4210-4759-848b-3040c1ea7642",
+      "id": "0d3b0acd-5120-4184-bb9e-9f41f3ceabd3",
       "type": "message",
       "content": "你好，我是小明",
       "meta": {},
-      "created": 1778749854628
+      "created": 1778750481124
     },
     {
-      "id": "a3443ad0-6cc9-4c69-9518-930bd5f0e250",
+      "id": "70179576-551f-42a3-9bf3-488c27a3d0da",
       "type": "injection",
       "content": "可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_tree, fs.move_file, fs.search_files, fs.get_file_info, fs.list_allowed_directories, playwright.browser_close, playwright.browser_resize, playwright.browser_console_messages, playwright.browser_handle_dialog, playwright.browser_evaluate, playwright.browser_file_upload, playwright.browser_drop, playwright.browser_fill_form, playwright.browser_press_key, playwright.browser_type, playwright.browser_navigate, playwright.browser_navigate_back, playwright.browser_network_requests, playwright.browser_network_request, playwright.browser_run_code_unsafe, playwright.browser_take_screenshot, playwright.browser_snapshot, playwright.browser_click, playwright.browser_drag, playwright.browser_hover, playwright.browser_select_option, playwright.browser_tabs, playwright.browser_wait_for",
       "meta": {
         "source": "skill"
       },
-      "created": 1778749860180
+      "created": 1778750481124
     },
     {
-      "id": "58ed218d-e132-4a27-a2ba-9d4aafb5b50c",
+      "id": "0622943f-11da-47cd-b0d6-a254ed7eba0a",
       "type": "skill",
       "content": "## 天气查询\n\n当用户询问天气相关问题时，告知用户你可以通过工具帮助查询天气信息。如果用户提供了城市名，建议先使用工具确认当前日期和时间。",
       "meta": {
         "skill": "weather"
       },
-      "created": 1778749860180
+      "created": 1778750481124
     },
     {
-      "id": "b0a6d3db-4a59-45b8-bc51-89d507790b51",
+      "id": "b09f74a1-8d39-4119-b6c7-01d16301da14",
       "type": "response",
       "content": "你好，小明！很高兴再次见到你！😊\n\n我是 Dolly 框架中的 AI 助手，有什么我可以帮你的吗？比如查询天气、文件操作、浏览网页等等，尽管告诉我！",
       "meta": {},
-      "created": 1778749860180
+      "created": 1778750481124
+    },
+    {
+      "id": "8c8f2a97-c7d9-4597-812b-d7c7f229be8a",
+      "type": "message",
+      "content": "你好",
+      "meta": {},
+      "created": 1778750481148
+    },
+    {
+      "id": "6323c608-a49c-4353-aca4-614cf254eb62",
+      "type": "injection",
+      "content": "可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_tree, fs.move_file, fs.search_files, fs.get_file_info, fs.list_allowed_directories, playwright.browser_close, playwright.browser_resize, playwright.browser_console_messages, playwright.browser_handle_dialog, playwright.browser_evaluate, playwright.browser_file_upload, playwright.browser_drop, playwright.browser_fill_form, playwright.browser_press_key, playwright.browser_type, playwright.browser_navigate, playwright.browser_navigate_back, playwright.browser_network_requests, playwright.browser_network_request, playwright.browser_run_code_unsafe, playwright.browser_take_screenshot, playwright.browser_snapshot, playwright.browser_click, playwright.browser_drag, playwright.browser_hover, playwright.browser_select_option, playwright.browser_tabs, playwright.browser_wait_for",
+      "meta": {
+        "source": "skill"
+      },
+      "created": 1778750484831
+    },
+    {
+      "id": "95279e0e-a590-4de9-9242-e28e8e511a86",
+      "type": "response",
+      "content": "你好！😊 我是 Dolly 框架中的 AI 助手，很高兴见到你！有什么我可以帮你的吗？比如查询天气、操作文件、浏览网页等等，尽管告诉我！",
+      "meta": {},
+      "created": 1778750484831
     }
   ],
-  "savedAt": 1778749860193
+  "savedAt": 1778750487111
 }

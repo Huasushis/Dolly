@@ -4,15 +4,18 @@ import type { Block } from "../blocks/index.js";
 import { LLMClient } from "../core/llm-client.js";
 import { tokenize, tfVector, cosineSimilarity, extractKeywords } from "./nlp.js";
 
-export interface MemoryEntry {
-  id: string; content: string; keywords: string[]; weight: number;
-  source_day: string; position: number; created_at: number;
+/** 每日总结 */
+export interface DaySummary {
+  day: string;
+  summary: string;
+  keywords: string[];
+  weight: number;
 }
 
 export class MemoryStore {
   private indexPath: string; private entriesDir: string; private dailyDir: string;
-  private index = new Map<string, string[]>();
-  private allEntries: MemoryEntry[] = [];
+  private index = new Map<string, string[]>(); // keyword → day[]
+  private summaries: DaySummary[] = [];
 
   constructor(basePath: string, private summarizeClient: LLMClient) {
     this.indexPath = resolve(basePath, "index.json");
@@ -21,11 +24,7 @@ export class MemoryStore {
     for (const d of [basePath, this.entriesDir, this.dailyDir]) {
       if (!existsSync(d)) mkdirSync(d, { recursive: true });
     }
-    if (existsSync(this.indexPath)) {
-      try { this.index = new Map(Object.entries(JSON.parse(readFileSync(this.indexPath, "utf-8")))); } catch {}
-    }
-    // Load all entries into memory for search
-    this._loadAll();
+    this._load();
   }
 
   appendLog(op: string, detail: unknown): void {
@@ -33,94 +32,125 @@ export class MemoryStore {
     appendFileSync(resolve(this.dailyDir, `${day}.jsonl`), JSON.stringify({ op, detail, time: Date.now() }) + "\n");
   }
 
-  /** Impression-based summarization */
-  async summarize(blocks: Block[]): Promise<MemoryEntry[]> {
-    const text = blocks.map((b, i) => `[${i}][${b.type}] ${b.content.slice(0, 300)}`).join("\n\n");
+  /** 将一天总结为一段话。fullDay=true 凌晨全量覆盖，false 只总结增量 */
+  async summarize(blocks: Block[], fullDay = false): Promise<DaySummary | null> {
     const day = new Date().toISOString().slice(0, 10);
-    const prompt = `回顾你今天的经历。从以下日志中提取你觉得印象深刻、值得记住的片段。不要总结用户需要什么——而是记录你自己经历的、学到的、有感触的。
+    const existing = this.summaries.find((s) => s.day === day);
 
-对每个片段输出一行 JSON：
-{"content":"我经历了什么/学到了什么","keywords":["关键词1","关键词2"],"weight":0.8}
+    // 空闲总结：如果今天已有且不是全量模式，跳过
+    if (!fullDay && existing) return null;
 
-weight: 1.0=非常重要, 0.5=一般, 0.1=不太重要。
-
-日志：
-${text.slice(-12000)}`;
+    const text = blocks.map((b) => `[${b.type}] ${b.content.slice(0, 300)}`).join("\n");
+    const prompt = existing
+      ? `你今天已经有了一段总结：\n${existing.summary}\n\n现在补充新的经历。把新旧合并为一段完整的总结。\n\n新日志：\n${text.slice(-8000)}`
+      : `回顾今天的经历，用一段话总结今天发生的、让你印象深刻的事情。不要列清单——用自然语言讲述。重点写你自己的感受和学到的东西。\n\n日志：\n${text.slice(-10000)}`;
 
     const resp = await this.summarizeClient.chat([{ role: "user", content: prompt }]);
-    const entries: MemoryEntry[] = [];
-    for (const line of resp.split("\n")) {
-      try {
-        const p = JSON.parse(line.trim());
-        if (p.content && p.keywords) {
-          const e: MemoryEntry = {
-            id: `mem_${day}_${entries.length}`, content: p.content,
-            keywords: p.keywords, weight: p.weight ?? 0.5,
-            source_day: day, position: entries.length, created_at: Date.now(),
-          };
-          entries.push(e); this._store(e);
-        }
-      } catch {}
+    const summary = resp.trim();
+    if (!summary || summary.length < 20) return null;
+
+    const keywords = extractKeywords(summary, 10);
+    const entry: DaySummary = { day, summary, keywords, weight: 0.5 };
+
+    if (existing) {
+      // 替换旧条目
+      const idx = this.summaries.indexOf(existing);
+      this.summaries[idx] = entry;
+    } else {
+      this.summaries.push(entry);
     }
-    return entries;
+    this._store(entry);
+    return entry;
   }
 
-  /** Bigram + TF-IDF cosine similarity search */
-  search(query: string, topK = 10): MemoryEntry[] {
+  /** 匹配查询到具体的天 */
+  search(query: string, topK = 5): DaySummary[] {
     const queryTokens = tokenize(query);
     const queryVec = tfVector(queryTokens);
-    const scored: Array<{ id: string; score: number }> = [];
+    const scored: Array<{ day: string; score: number }> = [];
 
-    for (const entry of this.allEntries) {
-      // Build entry vector from content + keywords
-      const entryText = entry.content + " " + entry.keywords.join(" ");
-      const entryTokens = tokenize(entryText);
-      const entryVec = tfVector(entryTokens);
+    for (const s of this.summaries) {
+      const entryVec = tfVector(tokenize(s.summary + " " + s.keywords.join(" ")));
       let score = cosineSimilarity(queryVec, entryVec);
-      // Boost by entry weight
-      score *= (0.5 + entry.weight);
-      if (score > 0.01) scored.push({ id: entry.id, score });
+      score *= (0.5 + s.weight);
+      if (score > 0.01) scored.push({ day: s.day, score });
     }
 
     return scored
       .sort((a, b) => b.score - a.score)
       .slice(0, topK)
-      .map((s) => this._get(s.id))
-      .filter(Boolean) as MemoryEntry[];
+      .map((sc) => this.summaries.find((s) => s.day === sc.day)!)
+      .filter(Boolean);
   }
 
-  /** Check if today already has memory entries */
+  /** 钻进某天的原始日志，提取与查询最相关的片段 */
+  drill(day: string, query: string, maxSegments = 3, segmentChars = 500): string[] {
+    const logPath = resolve(this.dailyDir, `${day}.jsonl`);
+    if (!existsSync(logPath)) return [];
+
+    const lines = readFileSync(logPath, "utf-8").split("\n").filter(Boolean);
+    const queryVec = tfVector(tokenize(query));
+
+    // 把日志分成段落（每 N 行一段），计算与查询的相关度
+    const segSize = 10; // lines per segment
+    const scored: Array<{ text: string; score: number }> = [];
+
+    for (let i = 0; i < lines.length; i += segSize) {
+      const chunk = lines.slice(i, i + segSize);
+      const text = chunk.map((l) => {
+        try { const p = JSON.parse(l); return p.detail?.content ?? p.detail ?? ""; } catch { return l.slice(0, 200); }
+      }).filter(Boolean).join("\n").slice(0, segmentChars * 3);
+
+      if (text.length < 20) continue;
+
+      const segVec = tfVector(tokenize(text));
+      const score = cosineSimilarity(queryVec, segVec);
+      if (score > 0.01) scored.push({ text: text.slice(0, segmentChars), score });
+    }
+
+    return scored
+      .sort((a, b) => b.score - a.score)
+      .slice(0, maxSegments)
+      .map((s) => s.text);
+  }
+
+  /** 搜索 → 钻取 → 返回相关文本片段 */
+  recall(query: string, maxDays = 3, maxSegments = 3): string[] {
+    const days = this.search(query, maxDays);
+    const segments: string[] = [];
+    for (const d of days) {
+      segments.push(...this.drill(d.day, query, maxSegments));
+    }
+    return segments.slice(0, maxSegments * 2);
+  }
+
   hasEntriesForToday(): boolean {
     const today = new Date().toISOString().slice(0, 10);
-    return this.allEntries.some((e) => e.source_day === today);
+    return this.summaries.some((s) => s.day === today);
   }
 
-  /** Randomly select one from top-K results for context injection */
-  pickOne(query: string, topK = 5): MemoryEntry | null {
-    const results = this.search(query, topK);
-    if (results.length === 0) return null;
-    return results[Math.floor(Math.random() * results.length)];
-  }
-
-  private _store(e: MemoryEntry) {
-    writeFileSync(resolve(this.entriesDir, `${e.id}.json`), JSON.stringify(e, null, 2));
-    for (const kw of e.keywords) { const ids = this.index.get(kw) ?? []; ids.push(e.id); this.index.set(kw, ids); }
-    this.allEntries.push(e);
+  private _store(s: DaySummary) {
+    writeFileSync(resolve(this.entriesDir, `${s.day}.json`), JSON.stringify(s, null, 2));
+    for (const kw of s.keywords) {
+      const days = this.index.get(kw) ?? [];
+      if (!days.includes(s.day)) days.push(s.day);
+      this.index.set(kw, days);
+    }
     writeFileSync(this.indexPath, JSON.stringify(Object.fromEntries(this.index), null, 2));
   }
 
-  private _get(id: string): MemoryEntry | undefined {
-    return this.allEntries.find((e) => e.id === id);
-  }
-
-  private _loadAll() {
-    if (!existsSync(this.entriesDir)) return;
-    for (const file of readdirSync(this.entriesDir)) {
-      if (!file.endsWith(".json")) continue;
-      try {
-        const e: MemoryEntry = JSON.parse(readFileSync(resolve(this.entriesDir, file), "utf-8"));
-        this.allEntries.push(e);
-      } catch {}
+  private _load() {
+    if (existsSync(this.indexPath)) {
+      try { this.index = new Map(Object.entries(JSON.parse(readFileSync(this.indexPath, "utf-8")))); } catch {}
+    }
+    if (existsSync(this.entriesDir)) {
+      for (const f of readdirSync(this.entriesDir)) {
+        if (!f.endsWith(".json")) continue;
+        try {
+          const s: DaySummary = JSON.parse(readFileSync(resolve(this.entriesDir, f), "utf-8"));
+          if (s.day && s.summary) this.summaries.push(s);
+        } catch {}
+      }
     }
   }
 }

@@ -88,32 +88,25 @@ async function run() {
   let midnightTimer: NodeJS.Timeout | null = null;
   const sleepStateFile = pathResolve(import.meta.dirname!, "..", config.memory.path, "sleep_state.json");
 
-  const sleepCycle = async () => {
+  const sleepCycle = async (fullDay = false) => {
     if (sleeping) return;
     sleeping = true;
-    L.sleep("开始...");
+    L.sleep(`开始 (${fullDay ? "全量" : "增量"})...`);
     const blocks = context.getBlocks();
 
-    // 1. Summarize (skip if already done today)
-    if (blocks.length > 2 && !memory.hasEntriesForToday()) {
-      L.mem("总结...");
-      try { await memory.summarize(blocks); } catch {}
-    } else { L.mem("今天已有总结，跳过"); }
-
-    // 2. NLP: extract keywords from today, search related memories
-    const allText = blocks.map((b) => b.content).join("\n");
-    const keywords = extractKeywords(allText.slice(-8000), 20);
-    if (keywords.length > 0) {
-      const results = memory.search(keywords.join(" "), 10);
-      if (results.length > 0) {
-        L.mem(`检索到 ${results.length} 条相关记忆`);
-        // 3. Inject 1-3 memories silently
-        const toInject = results.sort(() => Math.random() - 0.5).slice(0, 3);
-        for (const e of toInject) {
-          context.addBlock("memory", `[长期记忆] ${e.content}`, { memory_id: e.id, notify: false });
-        }
-      }
+    // 1. Summarize
+    if (blocks.length > 2) {
+      L.mem(`${fullDay ? "全量" : "增量"}总结...`);
+      try { await memory.summarize(blocks, fullDay); } catch {}
     }
+
+    // 2-3. Recall: search day summaries → drill daily logs → inject segments
+    const allText = blocks.map((b) => b.content).join("\n");
+    const recalled = memory.recall(allText.slice(-5000), 3, 3);
+    for (const seg of recalled) {
+      context.addBlock("memory", `[记忆] ${seg}`, { notify: false });
+    }
+    if (recalled.length > 0) L.mem(`注入 ${recalled.length} 段记忆`);
 
     // 4. Skill auto-creation (guard_llm)
     const autoSkills = (config as any).memory?.sleep?.auto_create_skills ?? true;
@@ -210,7 +203,7 @@ async function run() {
   midnightTimer = setInterval(() => {
     const h = new Date().getHours();
     const m = new Date().getMinutes();
-    if (h === 3 && m < 10 && !sleeping) sleepCycle();
+    if (h === 3 && m < 10 && !sleeping) sleepCycle(true);
   }, 10 * 60 * 1000);
 
   // ── Main loop ──────────────────────────────────────────
@@ -220,9 +213,10 @@ async function run() {
       for await (const line of rl) {
         if (!line.trim()) continue;
         resetIdle();
-        // Inject memory before cascade
-        const mem = memory.pickOne(line.trim(), 5);
-        if (mem) { context.addBlock("memory", `[长期记忆] ${mem.content}`, { memory_id: mem.id, notify: false }); }
+        const recalled = memory.recall(line.trim(), 2, 2);
+        for (const seg of recalled) {
+          context.addBlock("memory", `[记忆] ${seg}`, { notify: false });
+        }
         context.addBlock("message", line.trim());
         await cascade(context, registry, memory);
       }
@@ -234,8 +228,10 @@ async function run() {
   for await (const line of rl) {
     if (!line.trim()) continue;
     resetIdle();
-    const mem = memory.pickOne(line.trim(), 5);
-    if (mem) { context.addBlock("memory", `[长期记忆] ${mem.content}`, { memory_id: mem.id, notify: false }); }
+    const recalled = memory.recall(line.trim(), 2, 2);
+    for (const seg of recalled) {
+      context.addBlock("memory", `[记忆] ${seg}`, { notify: false });
+    }
     context.addBlock("message", line.trim());
     await cascade(context, registry, memory);
   }
