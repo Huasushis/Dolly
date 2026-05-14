@@ -27,15 +27,6 @@ const skillModule: DollyModule = {
     loadSkills();
   },
 
-  systemPrompt(): string {
-    return `你可以使用 fenced JSON 调用工具：
-\`\`\`json
-{"tool":"工具名","params":{...}}
-\`\`\`
-需要等待结果时加 "await":true。
-
-你可以通过 {"recall":"hard"} 或 {"recall":"soft"} 请求检索相关记忆。hard 检索更多（5天5段），soft 更少（1天1段），默认 medium（3天3段）。`;
-  },
 
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     ctx = c;

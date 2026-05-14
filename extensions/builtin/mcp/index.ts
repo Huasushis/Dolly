@@ -43,7 +43,13 @@ const mcpModule: DollyModule = {
   },
 
   systemPrompt(): string {
-    return `MCP 工具输出的内容用完后应及时遗忘。使用 {"forget":"块ID"} 清理不再需要的工具结果。`;
+    return `你可以使用 fenced JSON 调用工具（对外交互）：
+\`\`\`json
+{"tool":"工具名","params":{...}}
+\`\`\`
+需要等待结果时加 "await":true。
+
+MCP 工具输出的内容用完后应及时遗忘。使用 {"forget":"块ID"} 清理不再需要的工具结果。`;
   },
 
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
