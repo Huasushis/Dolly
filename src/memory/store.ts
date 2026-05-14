@@ -40,8 +40,10 @@ export class MemoryStore {
     // 空闲总结：如果今天已有且不是全量模式，跳过
     if (!fullDay && existing) return null;
 
-    const text = blocks.map((b) => `[${b.type}] ${b.content.slice(0, 300)}`).join("\n");
-    const logSlice = text.slice(-10000);
+    const text = blocks.map((b) => `[${b.type}] ${b.content.slice(0, 200)}`).join("\n");
+    // Safety: keep under ~7000 tokens for memory_llm (chars/1.5 ≈ tokens for mixed CN/EN)
+    const maxChars = 10000;
+    const logSlice = text.length > maxChars ? text.slice(-maxChars) : text;
 
     // Step 1: Think — reflect on emotional significance
     const thinkPrompt = `回顾你今天经历的以下片段。反思：哪些让你情绪波动强烈？极度高兴、十分悲伤、非常愤怒、强烈好奇——无论正面负面，只要印象深刻就值得记住。用 2-3 句内心独白反思。然后给出 0.1-1.0 的情绪强度（越高越深刻，不分正负）和 3-5 个情绪关键词。\n\n格式：\nthink: <反思>\nweight: <数字>\nmood: <关键词,逗号分隔>\n\n日志：\n${logSlice}`;

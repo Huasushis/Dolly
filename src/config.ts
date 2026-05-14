@@ -8,7 +8,7 @@ export interface DollyConfig {
     memory: { api_key: string; base_url: string; model: string };
     guard: { api_key: string; base_url: string; model: string };
   };
-  context: { max_tokens: number; compression_threshold: number };
+  context: { max_tokens: number; compression_threshold: number; decay_rate?: number; protect_window_min?: number; max_background_chars?: number };
   modules: { enabled: string[]; [name: string]: any };
   memory: { path: string; auto_summarize: boolean; idle_minutes: number };
   daemon: { pid_dir: string; log_dir: string };
@@ -40,7 +40,13 @@ export function loadConfig(): DollyConfig {
         model: raw.llm?.guard?.model ?? "deepseek-chat",
       },
     },
-    context: { max_tokens: raw.context?.max_tokens ?? 32768, compression_threshold: raw.context?.compression_threshold ?? 0.8 },
+    context: {
+      max_tokens: raw.context?.max_tokens ?? raw.llm?.main?.max_tokens ?? 32768,
+      compression_threshold: raw.context?.compression_threshold ?? 0.8,
+      decay_rate: raw.context?.decay_rate,
+      protect_window_min: raw.context?.protect_window_min,
+      max_background_chars: raw.context?.max_background_chars,
+    },
     modules: { enabled: raw.modules?.enabled ?? ["builtin/llm", "builtin/skill", "builtin/mcp"], ...raw.modules },
     memory: { path: raw.memory?.path ?? ".memory", auto_summarize: raw.memory?.auto_summarize ?? true, idle_minutes: raw.memory?.idle_minutes ?? 60 },
     daemon: { pid_dir: raw.daemon?.pid_dir ?? ".dolly/daemons", log_dir: raw.daemon?.log_dir ?? ".dolly/logs" },

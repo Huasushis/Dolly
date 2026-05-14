@@ -122,6 +122,18 @@ async function main() {
       const already = context.getBlocks().some((b) => b.type === "memory" && b.content.includes(seg.slice(0, 50)));
       if (!already) context.addBlock("memory", `[记忆] ${seg}`, { notify: false });
     }
+    // Background update (fullDay only)
+    if (fullDay) {
+      try {
+        const maxChars = config.context.max_background_chars ?? 2000;
+        const oldBg = context.getBackground();
+        const combined = oldBg + "\n\n" + allText.slice(-6000);
+        const bgPrompt = `以下是你的自述和今天的经历。请更新自述（不超过${maxChars}字符）。记录你认识的人、学到的方法、对事物的评价和认知。\n\n${combined.slice(-12000)}`;
+        const newBg = (await memoryClient.chat([{ role: "user", content: bgPrompt }])).trim().slice(0, maxChars);
+        context.setBackground(newBg);
+        L.sleep("Background 已更新");
+      } catch {}
+    }
     sleeping = false;
   };
 
