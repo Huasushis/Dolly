@@ -64,10 +64,11 @@ async function main() {
   const bg = (config as any).agent?.background ?? "";
   context.setSystemPrompt([persona, bg, registry.buildSystemPrompt()].filter(Boolean).join("\n\n"));
 
-  // Profile restore
+  // Profile restore — drain changeQueue after so modules don't see old blocks as new
   const profileFile = pathResolve(profileDir, "context.json");
   if (existsSync(profileFile)) {
     try { const saved = JSON.parse(readFileSync(profileFile, "utf-8")); for (const b of (saved.blocks ?? [])) context.addBlock(b.type, b.content, b.meta); } catch {}
+    context.applyMutations([]); // drain — restored blocks are context, not new events
   }
 
   // Events
@@ -129,8 +130,18 @@ async function main() {
     writeFileSync(profileFile, JSON.stringify({ blocks, savedAt: Date.now() }, null, 2));
   };
 
-  process.once("SIGINT", () => { saveProfile(); rl.close(); });
-  process.once("SIGTERM", () => { saveProfile(); rl.close(); });
+  let shuttingDown = false;
+  async function shutdown() {
+    if (shuttingDown) { process.exit(1); }
+    shuttingDown = true;
+    saveProfile();
+    rl.close();
+    cleanupRelay(instanceName);
+    relay.close();
+    clearInterval(midnightTimer);
+  }
+  process.on("SIGINT", () => { shutdown(); });
+  process.on("SIGTERM", () => { shutdown(); });
 
   process.stderr.write(`  Instance: ${instanceName}\n  Modules: ${registry.list().join(", ")}\n  Ready.\n\n`);
   replayHistory(); // show previous speak after banner
@@ -153,6 +164,7 @@ async function main() {
   rl.close();
   cleanupRelay(instanceName);
   relay.close();
+  clearInterval(midnightTimer);
   saveProfile();
 }
 
