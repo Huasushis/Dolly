@@ -11,6 +11,7 @@ import { MemoryStore } from "./memory/store.js";
 import { LLMClient } from "./core/llm-client.js";
 import { start, stop, status } from "./daemon/index.js";
 import { startRelay, cleanupRelay } from "./daemon/attach.js";
+import { getSpeakHistory } from "../extensions/builtin/console/index.js";
 import { handleMcpCall } from "../extensions/builtin/mcp/index.js";
 import type { ModuleContext } from "./modules/base.js";
 
@@ -145,6 +146,8 @@ async function main() {
 
   // Relay (attach)
   const relay = startRelay(instanceName, (socket) => {
+    // Replay history
+    for (const line of getSpeakHistory()) { socket.write(line + "\n"); }
     const rl = createInterface({ input: socket, output: socket });
     (async () => { for await (const line of rl) { if (line.trim()) await handleInput(line.trim()); } })();
     socket.on("close", () => rl.close());
