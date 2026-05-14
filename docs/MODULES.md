@@ -1,22 +1,14 @@
 # Dolly 模块开发指南
 
-## 模块概念
+模块是 Dolly 的核心扩展单元。每个模块可以读取上下文、响应块变更、插入/删除/修改块。
 
-Dolly 的模块是注入器、监控器和工具的统一体。一个模块可以：
-- 读取上下文块
-- 在块变更时被推送通知
-- 返回块变更（插入/删除/修改块）
-- 提供 System Prompt 片段
-- 设置心跳定时器
-
-## 第一个模块
-
-创建 `extensions/my-module/` 目录：
+## 模块结构
 
 ```
 extensions/my-module/
 ├── dolly.json          # 模块清单
-└── index.ts            # 模块代码
+├── index.ts            # 模块代码
+└── data/               # 本地存储（可选，框架传入 storagePath）
 ```
 
 ### dolly.json
@@ -25,31 +17,36 @@ extensions/my-module/
 {
   "name": "my-module",
   "version": "0.1.0",
-  "description": "我的模块",
-  "main": "index.ts"
+  "description": "我的模块"
 }
 ```
 
 ### index.ts
 
 ```typescript
-import type { DollyModule, BlockChange, BlockMutation, ModuleContext } from "../../src/modules/base.js";
+import type { DollyModule, ModuleContext } from "../../src/modules/base.js";
+import type { BlockChange, BlockMutation } from "../../src/blocks/index.js";
 
 const myModule: DollyModule = {
   id: "my-module",
 
+  async init(ctx: ModuleContext): Promise<void> {
+    // 初始化：读取本地存储、设置状态
+    // ctx.storagePath → extensions/my-module/data/
+  },
+
   async onBlocksChanged(ctx: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     const mutations: BlockMutation[] = [];
 
-    for (const change of changes) {
-      if (change.type === "added" && change.block.type === "message") {
-        // 当有新消息时，插入一个响应块
+    for (const ch of changes) {
+      // ch.type: "added" | "removed" | "modified"
+      if (ch.type === "added" && ch.block.type === "message") {
         mutations.push({
           action: "insert",
           priority: 50,
           block: {
             type: "injection",
-            content: `我看到了新消息: ${change.block.content.slice(0, 100)}`,
+            content: "我看到了新消息",
             meta: { source: "my-module" },
             created: Date.now(),
           },
@@ -58,6 +55,10 @@ const myModule: DollyModule = {
     }
 
     return mutations;
+  },
+
+  systemPrompt(ctx: ModuleContext): string {
+    return "可选：注入到 System Prompt 的内容";
   },
 };
 
@@ -70,20 +71,29 @@ export default myModule;
 
 ```typescript
 interface ModuleContext {
-  /** 获取所有块 */
+  /** 所有块（只读副本） */
   getBlocks(): Block[];
 
-  /** 获取特定块 */
+  /** 按 ID 获取块 */
   getBlock(id: string): Block | undefined;
 
-  /** 估算 token 数 */
+  /** 估算当前 token 数 */
   estimateTokens(): number;
 
-  /** 更新模块的 System Prompt 片段 */
-  setSystemPrompt(text: string): void;
+  /** 模块级配置（来自 dolly.json modules.<id>） */
+  config: Record<string, unknown>;
 
-  /** 发送事件 */
-  emit(event: string, payload: any): void;
+  /** 发送事件到 EventBus */
+  emit(event: string, payload: unknown): void;
+
+  /** 写入 daily log */
+  log(op: string, detail: unknown): void;
+
+  /** 锁管理器（防止并发 LLM 调用） */
+  lock: LockManager;
+
+  /** 模块本地存储路径。可不存在，模块自行创建 */
+  storagePath: string;
 }
 ```
 
@@ -94,7 +104,7 @@ interface Block {
   id: string;
   type: string;
   content: string;
-  meta: Record<string, unknown>;
+  meta: Record<string, unknown>;  // notify: false 可跳过 LLM 触发
   created: number;
 }
 ```
@@ -117,45 +127,65 @@ type BlockMutation =
   | { action: "update"; blockId: string; content?: string; meta?: Record<string, unknown> }
 ```
 
+### LockManager
+
+```typescript
+interface LockManager {
+  /** 申请锁。priority 越小越优先。返回释放函数 */
+  acquire(moduleId: string, priority: number): Promise<() => void>;
+}
+```
+
+LLM 模块固定使用最低优先级（`Infinity`），让其他模块先处理。
+
 ### 内置块类型
 
 | type | 用途 |
 |------|------|
-| `system` | System Prompt（置顶，不可删） |
-| `message` | 用户输入 / 外部消息 |
+| `system` | System Prompt（置顶） |
+| `message` | 用户/外部输入 |
 | `response` | LLM 输出 |
-| `tool_call` | 工具调用请求 |
 | `tool_result` | 工具调用结果 |
-| `injection` | 模块注入的内容 |
-| `skill` | SKILL 触发内容 |
-| `forget` | 遗忘标记 |
+| `injection` | 模块注入 |
+| `skill` | SKILL 触发注入 |
+| `memory` | 长期记忆注入 |
 
-## 心跳
+## 本地存储
 
-模块可以设置心跳定时器，用于定期检查：
-
-```typescript
-const myModule: DollyModule = {
-  id: "my-module",
-  heartbeatInterval: 60, // 每 60 秒
-
-  async onHeartbeat(ctx: ModuleContext): Promise<BlockMutation[]> {
-    // 检查是否需要做什么
-    return [];
-  },
-};
-```
-
-## System Prompt
-
-模块可以提供 System Prompt 片段，所有模块的片段拼接为完整的 System Prompt：
+每个模块通过 `ctx.storagePath` 获得独立目录（`extensions/<id>/data/`），可自由读写：
 
 ```typescript
-const myModule: DollyModule = {
-  id: "my-module",
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 
-  systemPrompt(ctx: ModuleContext): string {
-    return `你可以使用以下自定义功能：...`;
-  },
-};
+async init(ctx: ModuleContext) {
+  if (!existsSync(ctx.storagePath)) mkdirSync(ctx.storagePath);
+  const saved = readFileSync(ctx.storagePath + "/state.json", "utf-8");
+  // ...
+}
 ```
+
+## 静默块
+
+不想触发 LLM 响应的块，设置 `meta.notify: false`：
+
+```typescript
+mutations.push({
+  action: "insert", priority: 99,
+  block: { type: "internal", content: "...", meta: { notify: false }, created: Date.now() },
+});
+```
+
+## 在 dolly.json 中注册
+
+```json
+{
+  "modules": {
+    "enabled": ["builtin/llm", "builtin/skill", "builtin/mcp", "my-module"],
+    "my-module": {
+      "custom_option": "value"
+    }
+  }
+}
+```
+
+`my-module` 下的配置对象直接传给 `ModuleContext.config`。放入 `extensions/`，在 `enabled` 列表中加入即可生效。
