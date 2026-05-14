@@ -19,6 +19,15 @@ const cmd = process.argv[2] ?? "run";
 const nameArg = process.argv.find((a) => a.startsWith("--name="));
 const instanceName = nameArg ? nameArg.split("=")[1] : "default";
 
+if (cmd === "help" || cmd === "--help") {
+  console.log("Usage: dolly [run|start|stop|status|reload] [--name=xxx]");
+  console.log("  run      前台运行");
+  console.log("  start    后台启动");
+  console.log("  stop     停止实例");
+  console.log("  status   查看状态");
+  console.log("  reload   重载扩展 (--ext=<id>)");
+  process.exit(0);
+}
 if (cmd === "start") { start(instanceName); process.exit(0); }
 if (cmd === "stop") { stop(instanceName); process.exit(0); }
 if (cmd === "status") { status(instanceName); process.exit(0); }
