@@ -30,7 +30,7 @@
     "max_background_chars": 2000
   },
   "modules": {
-    "enabled": ["builtin/console", "builtin/llm", "builtin/skill", "builtin/mcp"],
+    "enabled": ["builtin/console", "builtin/llm", "builtin/memory", "builtin/skill", "builtin/mcp"],
     "builtin/skill": {
       "max_skills": 20
     },

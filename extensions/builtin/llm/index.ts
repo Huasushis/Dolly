@@ -38,12 +38,6 @@ const llmModule: DollyModule = {
 \`\`\`json
 {"forget":"块ID"}
 \`\`\`
-你可以请求检索相关记忆：
-\`\`\`json
-{"recall":"hard"}
-\`\`\`
-hard 深度回忆，soft 轻量提示。默认不检索。
-
 主动管理你的上下文——不需要的信息及时遗忘，保持思维清晰。`;
   },
 
