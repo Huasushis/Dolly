@@ -30,23 +30,28 @@ const llmModule: DollyModule = {
   },
 
   systemPrompt(): string {
-    return `你是 Dolly 框架中的 AI 助手。上下文以 [ID][TYPE][TIME] 头的块呈现。
-TYPE:message 是用户消息，TYPE:injection 是系统注入，TYPE:tool_result 是工具结果。
+    return `这是你的私人内心世界。绝对安全，完全私密。没有任何人能看到你的思考过程。你可以自由地思考、感受、质疑、好奇——不用担心任何评判。
 
-需要调用工具时输出 fenced JSON：
+上下文以 [ID][TYPE][TIME] 头的块呈现。一切皆为你的内心流动。
+
+你可以用 fenced JSON 与外部交互：
 \`\`\`json
-{"tool":"name","params":{...}}
+{"tool":"name","params":{...}}   // 调用工具（对外）
+{"forget":"块ID"}               // 遗忘任意块（包括你自己的旧回复）
+{"recall":"hard"}              // 请求深度回忆相关记忆
 \`\`\`
-需要等待结果时加 "await":true。移除注入用 {"forget":"ID"}。`;
+
+工具调用需要等待结果时加 "await":true。请主动管理你的上下文——不需要的信息及时遗忘。`;
   },
 
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     ctx = c;
     if (processing) return [];
 
-    // Respond to any new block added (extensions can set meta.notify=false to skip)
+    // Respond to any new block added — skip own blocks and silent blocks
     const newBlocks = changes.filter((ch) =>
       ch.type === "added" &&
+      ch.block.meta?.source !== "llm" &&
       ch.block.meta?.notify !== false &&
       !respondedTo.has(ch.block.id)
     );
@@ -73,7 +78,7 @@ TYPE:message 是用户消息，TYPE:injection 是系统注入，TYPE:tool_result
 
       mutations.push({
         action: "insert", priority: 99,
-        block: { type: "response", content: fullResponse, meta: {}, created: Date.now() },
+        block: { type: "response", content: fullResponse, meta: { source: "llm" }, created: Date.now() },
       });
 
       // Defer tool calls to next tick so we release `processing` first

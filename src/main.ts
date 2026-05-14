@@ -37,7 +37,9 @@ async function run() {
   const lock = new LockManager();
   const context = new ContextManager(config.context);
   const memoryClient = new LLMClient(config.llm.memory);
-  const memory = new MemoryStore(pathResolve(import.meta.dirname!, "..", config.memory.path), memoryClient);
+  const profileDir = pathResolve(import.meta.dirname!, "..", ".dolly", "profiles", instanceName);
+  if (!existsSync(profileDir)) mkdirSync(profileDir, { recursive: true });
+  const memory = new MemoryStore(pathResolve(profileDir, "memory"), memoryClient);
 
   const ctx: ModuleContext = {
     getBlocks: () => context.getBlocks(),
@@ -57,17 +59,11 @@ async function run() {
   const bg = (config as any).agent?.background ?? "";
   context.setSystemPrompt([persona, bg, registry.buildSystemPrompt()].filter(Boolean).join("\n\n"));
 
-  // Profile
-  const profileDir = pathResolve(import.meta.dirname!, "..", ".dolly", "profiles", instanceName);
+  // Profile restore (run with --name restores previous context)
   const profileFile = pathResolve(profileDir, "context.json");
-  if (!existsSync(profileDir)) mkdirSync(profileDir, { recursive: true });
   if (existsSync(profileFile)) {
     try { const saved = JSON.parse(readFileSync(profileFile, "utf-8")); for (const b of (saved.blocks ?? [])) context.addBlock(b.type, b.content, b.meta); } catch {}
   }
-  const saveContext = () => {
-    const blocks = context.getBlocks().filter((b) => b.type !== "system");
-    writeFileSync(profileFile, JSON.stringify({ blocks, savedAt: Date.now() }, null, 2));
-  };
 
   // Events
   bus.on("forget.requested", (p: any) => context.removeBlock(p.blockId));
@@ -240,8 +236,6 @@ async function run() {
   if (midnightTimer) clearInterval(midnightTimer);
   cleanupRelay(instanceName);
   relay.close();
-  saveContext();
-  process.stderr.write("  Saved.\n");
 }
 
 async function cascade(
@@ -253,7 +247,6 @@ async function cascade(
   for (let i = 0; i < 3; i++) {
     const mutations = await registry.pushChanges(changes);
     if (mutations.length === 0) break;
-    L.inject(`round ${i + 1}: ${mutations.length} mutations`);
     const newChanges = context.applyMutations(mutations);
     for (const e of context.getLog()) memory.appendLog(e.op, e.detail);
     if (newChanges.length === 0) break;

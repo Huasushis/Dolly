@@ -3,15 +3,27 @@ import { createBlock } from "../blocks/index.js";
 
 interface LogEntry { op: string; detail: unknown; time: number; }
 
+export interface ContextConfig {
+  max_tokens: number;
+  compression_threshold: number;
+  decay_rate?: number;
+  protect_window_min?: number;
+  max_background_chars?: number;
+}
+
+const DEFAULT_DECAY = 0.1;       // per hour
+const DEFAULT_PROTECT_MIN = 10;  // minutes
+
 export class ContextManager {
   private systemPrompt = "";
+  private background = "";
   private blocks: Block[] = [];
-  private config: { max_tokens: number; compression_threshold: number };
+  private config: ContextConfig;
   private log: LogEntry[] = [];
   private changeQueue: BlockChange[] = [];
   private systemBlock: Block;
 
-  constructor(config: { max_tokens: number; compression_threshold: number }) {
+  constructor(config: ContextConfig) {
     this.config = config;
     this.systemBlock = createBlock("system", "", { pinned: true });
     this.blocks = [this.systemBlock];
@@ -21,6 +33,9 @@ export class ContextManager {
     this.systemPrompt = text;
     this.systemBlock.content = text;
   }
+
+  getBackground(): string { return this.background; }
+  setBackground(text: string): void { this.background = text; }
 
   addBlock(type: string, content: string, meta: Record<string, unknown> = {}): Block {
     const block = createBlock(type, content, meta);
@@ -61,11 +76,48 @@ export class ContextManager {
       if (m.action === "delete") this.removeBlock(m.blockId);
       if (m.action === "update") this.updateBlock(m.blockId, (m as any).content, (m as any).meta);
     }
+    this.decayCheck();
     const changes = [...this.changeQueue];
     this.changeQueue = [];
     return changes;
   }
 
-  estimateTokens(): number { return Math.ceil(this.blocks.reduce((s, b) => s + b.content.length, 0) / 4); }
+  estimateTokens(): number {
+    return Math.ceil((this.systemPrompt.length + this.background.length +
+      this.blocks.reduce((s, b) => s + b.content.length, 0)) / 4);
+  }
+
   getLog(): LogEntry[] { return [...this.log]; }
+
+  /** Exponential decay forget — one block per call */
+  private decayCheck(): void {
+    const maxT = this.config.max_tokens;
+    const threshold = this.config.compression_threshold;
+    if (this.estimateTokens() <= maxT * threshold) return;
+
+    const now = Date.now();
+    const protectMs = (this.config.protect_window_min ?? DEFAULT_PROTECT_MIN) * 60 * 1000;
+    const defaultRate = this.config.decay_rate ?? DEFAULT_DECAY;
+
+    const candidates: Array<{ block: Block; prob: number }> = [];
+    for (const b of this.blocks) {
+      if (b.type === "system" || b.meta?.pinned) continue;
+      const ageMs = now - b.created;
+      if (ageMs < protectMs) continue;
+      const rate = (b.meta?.decay_rate as number) ?? defaultRate;
+      const ageHours = ageMs / 3600000;
+      const p = 1 - Math.exp(-rate * ageHours);
+      if (p > 0.001) candidates.push({ block: b, prob: p });
+    }
+
+    if (candidates.length === 0) return;
+
+    // Weighted random pick one
+    const total = candidates.reduce((s, c) => s + c.prob, 0);
+    let r = Math.random() * total;
+    for (const c of candidates) {
+      r -= c.prob;
+      if (r <= 0) { this.removeBlock(c.block.id); break; }
+    }
+  }
 }

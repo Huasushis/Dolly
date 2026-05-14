@@ -23,8 +23,11 @@
     }
   },
   "context": {
-    "max_tokens": 32768,
-    "compression_threshold": 0.8
+    "max_tokens": 131072,
+    "compression_threshold": 0.8,
+    "decay_rate": 0.1,
+    "protect_window_min": 10,
+    "max_background_chars": 2000
   },
   "modules": {
     "enabled": ["builtin/console", "builtin/llm", "builtin/skill", "builtin/mcp"],
