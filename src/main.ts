@@ -49,7 +49,7 @@ async function main() {
     emit: (event, payload) => bus.emit(event, payload),
     log: (op, detail) => { memory.appendLog(op, detail); },
     lock,
-    storagePath: "",
+    storagePath: profileDir,  // console/memory extensions use this for profile data
   };
 
   const registry = new ModuleRegistry(ctx, bus, pathResolve(import.meta.dirname!, "..", "extensions"));
