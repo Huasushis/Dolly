@@ -52,15 +52,19 @@ async function run() {
   const bg = (config as any).agent?.background ?? "";
   context.setSystemPrompt([persona, bg, registry.buildSystemPrompt()].filter(Boolean).join("\n\n"));
 
+  // FORGET handling
+  bus.on("forget.requested", (p: any) => {
+    context.removeBlock(p.blockId);
+  });
+
   // Tool calls → MCP or built-in
   bus.on("tool.call_requested", async (p: any) => {
     L.mcp(p.tool_name);
     let result: unknown;
     try { result = await handleMcpCall(p.tool_name.startsWith("mcp.") ? p.tool_name.slice(4) : p.tool_name, p.params); }
     catch { result = p.tool_name === "datetime" ? { datetime: new Date().toISOString() } : { error: `unknown tool: ${p.tool_name}` }; }
-    context.addBlock("tool_result", JSON.stringify(result), { tool: p.tool_name });
+    context.addBlock("tool_result", JSON.stringify(result), { tool: p.tool_name, blocking: p.blocking });
     if (p.blocking) {
-      context.addBlock("message", "工具结果已返回，请根据结果继续。", { continuation: true });
       await cascade(context, registry, memory, context.applyMutations([]));
     }
   });

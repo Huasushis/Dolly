@@ -7,7 +7,6 @@ let ctx: ModuleContext;
 let respondedTo = new Set<string>();
 let processing = false;
 
-/** Extract fenced JSON commands from LLM response */
 function parseJsonCommands(text: string): Array<Record<string, unknown>> {
   const cmds: Array<Record<string, unknown>> = [];
   const re = /```json\s*\n([\s\S]*?)```/g;
@@ -21,11 +20,6 @@ function parseJsonCommands(text: string): Array<Record<string, unknown>> {
   return cmds;
 }
 
-/** Strip JSON fences from text for display */
-function stripFences(text: string): string {
-  return text.replace(/```json\s*\n[\s\S]*?```/g, "").trim();
-}
-
 const llmModule: DollyModule = {
   id: "builtin/llm",
 
@@ -33,50 +27,45 @@ const llmModule: DollyModule = {
     ctx = c;
     const cfg = (c.config as any)._llm_main;
     client = new LLMClient(cfg ?? { api_key: "", base_url: "https://api.deepseek.com", model: "deepseek-chat" });
-    ctx = c;
   },
 
   systemPrompt(): string {
-    return `你是 Dolly 框架中的 AI 助手。上下文以带 [ID][TYPE][TIME] 头的块呈现。
+    return `你是 Dolly 框架中的 AI 助手。上下文以 [ID][TYPE][TIME] 头的块呈现。
 TYPE:message 是用户消息，TYPE:injection 是系统注入，TYPE:tool_result 是工具结果。
 
-需要调用工具时，输出一个 fenced JSON 块（不要用 [] 标签）：
+需要调用工具时输出 fenced JSON：
 \`\`\`json
-{"tool": "工具名", "params": { ... }}
+{"tool":"name","params":{...}}
 \`\`\`
-
-需要等待结果时加 "await": true：
-\`\`\`json
-{"tool": "工具名", "params": { ... }, "await": true}
-\`\`\`
-
-需要移除某段注入时：
-\`\`\`json
-{"forget": "块ID"}
-\`\`\`
-
-JSON 块之外的内容是你的自然语言回复。请自然地使用这些功能。`;
+需要等待结果时加 "await":true。移除注入用 {"forget":"ID"}。`;
   },
 
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     ctx = c;
-    const mutations: BlockMutation[] = [];
-    if (processing) return mutations;
+    if (processing) return [];
 
-    const newMessages = changes.filter(
-      (ch) => ch.type === "added" && ch.block.type === "message" && !respondedTo.has(ch.block.id)
+    const triggers = changes.filter((ch) =>
+      ch.type === "added" &&
+      (ch.block.type === "message" || ch.block.type === "tool_result") &&
+      !respondedTo.has(ch.block.id)
     );
-    if (newMessages.length === 0) return mutations;
-    for (const m of newMessages) respondedTo.add(m.block.id);
+    if (triggers.length === 0) return [];
+    for (const t of triggers) respondedTo.add(t.block.id);
+
+    // Only respond to tool_result from blocking calls (has meta.blocking)
+    const toolResults = triggers.filter((t) => t.block.type === "tool_result" && t.block.meta?.blocking);
+    const messages = triggers.filter((t) => t.block.type === "message");
+    if (messages.length === 0 && toolResults.length === 0) return [];
 
     processing = true;
-
     const blocks = ctx.getBlocks();
     const serialized = blocks.map((b) =>
       `[ID:${b.id}][TYPE:${b.type}][TIME:${Math.floor(b.created / 1000)}]\n${b.content}`
     ).join("\n\n");
 
-    const sysPrompt = `你是 Dolly 框架中的 AI 助手。\n\n上下文块（[ID][TYPE][TIME] 头 + 内容）：\n${serialized}\n\n需要工具时输出 fenced JSON：\n\`\`\`json\n{"tool":"name","params":{}}\n\`\`\`\n需要等待加 "await":true。移除注入用 {"forget":"ID"}。`;
+    const sysPrompt = `你是 Dolly 框架中的 AI 助手。\n\n上下文：\n${serialized}\n\n需要工具时输出 fenced JSON：\n\`\`\`json\n{"tool":"name","params":{}}\n\`\`\`\n需要等待加 "await":true。移除注入用 {"forget":"ID"}。`;
+
+    const mutations: BlockMutation[] = [];
 
     try {
       let fullResponse = "";
@@ -84,27 +73,30 @@ JSON 块之外的内容是你的自然语言回复。请自然地使用这些功
         fullResponse += chunk;
       }
 
-      // Parse JSON commands
       const cmds = parseJsonCommands(fullResponse);
-      for (const cmd of cmds) {
-        if (cmd.forget) {
-          mutations.push({ action: "delete", blockId: cmd.forget as string });
-        } else if (cmd.tool) {
-          ctx.emit("tool.call_requested", {
-            tool_name: cmd.tool,
-            params: cmd.params ?? {},
-            blocking: cmd.await === true,
-          });
-        }
-      }
-
-      // Display text (sans fences)
-      const displayText = stripFences(fullResponse);
 
       mutations.push({
         action: "insert", priority: 99,
         block: { type: "response", content: fullResponse, meta: {}, created: Date.now() },
       });
+
+      // Defer tool calls to next tick so we release `processing` first
+      if (cmds.length > 0) {
+        setImmediate(() => {
+          for (const cmd of cmds) {
+            if (cmd.forget) {
+              // Mutations are already returned, need to emit for main handler
+              ctx.emit("forget.requested", { blockId: cmd.forget as string });
+            } else if (cmd.tool) {
+              ctx.emit("tool.call_requested", {
+                tool_name: cmd.tool,
+                params: cmd.params ?? {},
+                blocking: cmd.await === true,
+              });
+            }
+          }
+        });
+      }
     } catch (err: any) {
       process.stderr.write(`\n[LLM] Error: ${err.message}\n`);
     }
