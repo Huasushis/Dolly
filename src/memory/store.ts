@@ -41,16 +41,31 @@ export class MemoryStore {
     if (!fullDay && existing) return null;
 
     const text = blocks.map((b) => `[${b.type}] ${b.content.slice(0, 300)}`).join("\n");
-    const prompt = existing
-      ? `你今天已经有了一段总结：\n${existing.summary}\n\n现在补充新的经历。把新旧合并为一段完整的总结。\n\n新日志：\n${text.slice(-8000)}`
-      : `回顾今天的经历，用一段话总结今天发生的、让你印象深刻的事情。不要列清单——用自然语言讲述。重点写你自己的感受和学到的东西。\n\n日志：\n${text.slice(-10000)}`;
+    const logSlice = text.slice(-10000);
 
-    const resp = await this.summarizeClient.chat([{ role: "user", content: prompt }]);
+    // Step 1: Think — reflect on emotional significance
+    const thinkPrompt = `回顾你今天经历的以下片段。思考：哪些让你感到兴奋、好奇、困惑、满足？哪些值得记住？用 2-3 句内心独白反思。然后给出一个 0.1-1.0 的情绪权重（越高越深刻）和 3-5 个情绪关键词。\n\n格式：\nthink: <反思>\nweight: <数字>\nmood: <关键词,逗号分隔>\n\n日志：\n${logSlice}`;
+
+    const thinkResp = await this.summarizeClient.chat([{ role: "user", content: thinkPrompt }]);
+    const thinkMatch = thinkResp.match(/think:\s*(.+)/);
+    const weightMatch = thinkResp.match(/weight:\s*([\d.]+)/);
+    const moodMatch = thinkResp.match(/mood:\s*(.+)/);
+    const reflection = thinkMatch?.[1]?.trim() ?? "";
+    const weight = Math.min(1, Math.max(0.1, parseFloat(weightMatch?.[1] ?? "0.5")));
+    const mood = moodMatch?.[1]?.trim() ?? "";
+
+    // Step 2: Summarize with emotional context
+    const summaryPrompt = existing
+      ? `你今天已经有了一段总结：\n${existing.summary}\n\n${reflection ? `你的反思：${reflection}\n` : ""}补充新的经历。把新旧合并为一段完整的总结。融入你的情绪感受。\n\n新日志：\n${logSlice}`
+      : `${reflection ? `你的反思：${reflection}\n` : ""}基于以上反思，用一段话总结今天。不要列清单——融合事实和情绪感受。\n\n日志：\n${logSlice}`;
+
+    const resp = await this.summarizeClient.chat([{ role: "user", content: summaryPrompt }]);
     const summary = resp.trim();
     if (!summary || summary.length < 20) return null;
 
-    const keywords = extractKeywords(summary, 10);
-    const entry: DaySummary = { day, summary, keywords, weight: 0.5 };
+    const moodKeywords = mood.split(/[,，\s]+/).filter((k) => k.length > 0);
+    const keywords = [...new Set([...extractKeywords(summary, 8), ...moodKeywords])].slice(0, 12);
+    const entry: DaySummary = { day, summary, keywords, weight };
 
     if (existing) {
       // 替换旧条目
