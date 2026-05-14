@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, readdirSync } from "fs";
 import { resolve } from "path";
 import type { Block } from "../blocks/index.js";
 import { LLMClient } from "../core/llm-client.js";
@@ -117,7 +117,6 @@ ${text.slice(-12000)}`;
 
   private _loadAll() {
     if (!existsSync(this.entriesDir)) return;
-    const { readdirSync } = require("fs");
     for (const file of readdirSync(this.entriesDir)) {
       if (!file.endsWith(".json")) continue;
       try {

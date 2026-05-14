@@ -1,10 +1,14 @@
-import { existsSync, readdirSync, readFileSync } from "fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "fs";
 import { resolve } from "path";
 import type { DollyModule, ModuleContext } from "../../../src/modules/base.js";
 import type { BlockChange, BlockMutation } from "../../../src/blocks/index.js";
 import { LLMClient } from "../../../src/core/llm-client.js";
 
-interface SkillDef { name: string; triggers: string; prompt: string; }
+interface SkillDef {
+  name: string;        // from frontmatter, must match dir name
+  description: string; // when to use (also used for trigger detection)
+  body: string;        // Markdown instructions
+}
 
 let ctx: ModuleContext;
 let guardClient: LLMClient;
@@ -18,20 +22,19 @@ const skillModule: DollyModule = {
 
   async init(c: ModuleContext) {
     ctx = c;
-    const cfg = (c.config as any).llm?.guard ?? (c.config as any)._llm_guard;
+    const cfg = (c.config as any)._llm_guard;
     guardClient = new LLMClient(cfg ?? { api_key: "", base_url: "https://api.deepseek.com", model: "deepseek-chat" });
     loadSkills();
   },
 
   systemPrompt(): string {
-    return `工具调用：用 [TOOL:name]\\n{params}\\n[/TOOL] 或 [AWAIT:name]\\n{params}\\n[/TOOL]（需要结果时）。FORGET 用 [FORGET:id]。`;
+    return `工具调用使用 fenced JSON：\`\`\`json\n{"tool":"name","params":{}}\n\`\`\`（需要等待结果加 "await":true）。`;
   },
 
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     ctx = c;
     const mutations: BlockMutation[] = [];
 
-    // Inject MCP tools list on first block change
     if (!toolsInjected && mcpToolNames.length > 0) {
       toolsInjected = true;
       mutations.push({
@@ -40,7 +43,6 @@ const skillModule: DollyModule = {
       });
     }
 
-    // Guard LLM skill trigger detection
     if (skills.length === 0) return mutations;
     const recentText = ctx.getBlocks().slice(-8).map((b) => b.content).join("\n");
 
@@ -48,13 +50,13 @@ const skillModule: DollyModule = {
       if (seenTriggers.has(skill.name)) continue;
       try {
         const resp = await guardClient.chat([
-          { role: "user", content: `判断：用户是否在${skill.triggers}？仅回复 yes 或 no。\n\n${recentText.slice(-1000)}` },
+          { role: "user", content: `判断：用户是否在${skill.description}？仅回复 yes 或 no。\n\n${recentText.slice(-1000)}` },
         ]);
         if (resp.trim().toLowerCase().startsWith("yes")) {
           seenTriggers.add(skill.name);
           mutations.push({
             action: "insert", priority: 20,
-            block: { type: "skill", content: skill.prompt, meta: { skill: skill.name }, created: Date.now() },
+            block: { type: "skill", content: skill.body, meta: { skill: skill.name }, created: Date.now() },
           });
         }
       } catch {}
@@ -64,14 +66,35 @@ const skillModule: DollyModule = {
   },
 };
 
+/** Parse YAML frontmatter from SKILL.md */
+function parseFrontmatter(text: string): { frontmatter: Record<string, string>; body: string } | null {
+  const match = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  if (!match) return null;
+  const fm: Record<string, string> = {};
+  for (const line of match[1].split("\n")) {
+    const kv = line.match(/^(\w[\w-]*):\s*(.*)$/);
+    if (kv) fm[kv[1]] = kv[2].trim();
+  }
+  return { frontmatter: fm, body: match[2].trim() };
+}
+
+/** Load skills from subdirectories containing SKILL.md (Agent Skills standard) */
 function loadSkills() {
-  const dir = resolve(import.meta.dirname!, "skills");
-  if (!existsSync(dir)) return;
-  for (const file of readdirSync(dir)) {
-    if (!file.endsWith(".json")) continue;
+  const base = resolve(import.meta.dirname!, "skills");
+  if (!existsSync(base)) return;
+  for (const entry of readdirSync(base)) {
+    const dir = resolve(base, entry);
+    if (!statSync(dir).isDirectory()) continue;
+    const mdFile = resolve(dir, "SKILL.md");
+    if (!existsSync(mdFile)) continue;
     try {
-      const def = JSON.parse(readFileSync(resolve(dir, file), "utf-8"));
-      if (def.name && def.triggers && def.prompt) skills.push(def);
+      const raw = readFileSync(mdFile, "utf-8");
+      const parsed = parseFrontmatter(raw);
+      if (!parsed) continue;
+      const { frontmatter, body } = parsed;
+      if (frontmatter.name && frontmatter.description) {
+        skills.push({ name: frontmatter.name, description: frontmatter.description, body });
+      }
     } catch {}
   }
 }
