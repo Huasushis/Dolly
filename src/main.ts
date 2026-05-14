@@ -209,7 +209,9 @@ async function run() {
       for await (const line of rl) {
         if (!line.trim()) continue;
         resetIdle();
-        const recalled = memory.recall(line.trim(), 2, 2);
+        const rm = line.match(/{"recall":"(hard|soft)"}/);
+        const [rd, rs] = rm?.[1] === "hard" ? [5,5] : rm?.[1] === "soft" ? [1,1] : [3,3];
+        const recalled = memory.recall(line.trim(), rd, rs);
         for (const seg of recalled) {
           context.addBlock("memory", `[记忆] ${seg}`, { notify: false });
         }
@@ -230,7 +232,9 @@ async function run() {
     const [days, segs] = recallLevel === "hard" ? [5,5] : recallLevel === "soft" ? [1,1] : [3,3];
     const recalled = memory.recall(line.trim(), days, segs);
     for (const seg of recalled) {
-      context.addBlock("memory", `[记忆] ${seg}`, { notify: false });
+      // 去重：检查上下文是否已有相同内容
+      const already = context.getBlocks().some((b) => b.type === "memory" && b.content.includes(seg.slice(0, 50)));
+      if (!already) context.addBlock("memory", `[记忆] ${seg}`, { notify: false });
     }
     context.addBlock("message", line.trim());
     await cascade(context, registry, memory);
