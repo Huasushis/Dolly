@@ -79,13 +79,12 @@ function parseFrontmatter(text: string): { frontmatter: Record<string, string>; 
 }
 
 /** Load skills from subdirectories containing SKILL.md (Agent Skills standard) */
-function loadSkills() {
-  const base = resolve(import.meta.dirname!, "skills");
-  if (!existsSync(base)) return;
-  for (const entry of readdirSync(base)) {
-    const dir = resolve(base, entry);
-    if (!statSync(dir).isDirectory()) continue;
-    const mdFile = resolve(dir, "SKILL.md");
+function loadSkillsDir(dir: string) {
+  if (!existsSync(dir)) return;
+  for (const entry of readdirSync(dir)) {
+    const full = resolve(dir, entry);
+    if (!statSync(full).isDirectory()) continue;
+    const mdFile = resolve(full, "SKILL.md");
     if (!existsSync(mdFile)) continue;
     try {
       const raw = readFileSync(mdFile, "utf-8");
@@ -97,6 +96,16 @@ function loadSkills() {
       }
     } catch {}
   }
+}
+
+function loadSkills() {
+  // Built-in skills
+  loadSkillsDir(resolve(import.meta.dirname!, "skills"));
+  // Project skills (npx skills add target)
+  loadSkillsDir(resolve(import.meta.dirname!, "..", "..", "..", "skills"));
+  // Global skills (~/.dolly/skills)
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  if (home) loadSkillsDir(resolve(home, ".dolly", "skills"));
 }
 
 export function setMcpTools(tools: string[]) { mcpToolNames = tools; toolsInjected = false; }
