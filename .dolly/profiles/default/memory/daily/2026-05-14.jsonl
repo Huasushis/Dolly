@@ -1,7 +1,9 @@
-{"op":"insert","detail":{"type":"message","content":"你好"},"time":1778759456765}
-{"op":"insert","detail":{"type":"injection","content":"可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_"},"time":1778759456766}
-{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！很高兴见到你。有什么我可以帮你的吗？\"}\n```"},"time":1778759456767}
-{"op":"insert","detail":{"type":"message","content":"你好"},"time":1778759459862}
-{"op":"insert","detail":{"type":"injection","content":"可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_"},"time":1778759459863}
-{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！很高兴见到你。有什么我可以帮你的吗？\"}\n```"},"time":1778759459865}
-{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！我是 Dolly 框架中的 AI 助手，很高兴为你服务。请问有什么我可以帮你的吗？\"}\n```"},"time":1778759459865}
+{"op":"insert","detail":{"type":"message","content":"hi!"},"time":1778760844790}
+{"op":"insert","detail":{"type":"injection","content":"可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_"},"time":1778760844791}
+{"op":"insert","detail":{"type":"skill","content":"## 天气查询\n\n当用户询问天气相关问题时，告知用户你可以通过工具帮助查询天气信息。如果用户提供了城市名，建议先使用工具确认当前日期和时间。"},"time":1778760844791}
+{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！有什么我可以帮你的吗？\"}\n```"},"time":1778760844792}
+{"op":"insert","detail":{"type":"message","content":"hi!"},"time":1778760845787}
+{"op":"insert","detail":{"type":"injection","content":"可用 MCP 工具: fs.read_file, fs.read_text_file, fs.read_media_file, fs.read_multiple_files, fs.write_file, fs.edit_file, fs.create_directory, fs.list_directory, fs.list_directory_with_sizes, fs.directory_"},"time":1778760845788}
+{"op":"insert","detail":{"type":"skill","content":"## 天气查询\n\n当用户询问天气相关问题时，告知用户你可以通过工具帮助查询天气信息。如果用户提供了城市名，建议先使用工具确认当前日期和时间。"},"time":1778760845789}
+{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！有什么我可以帮你的吗？\"}\n```"},"time":1778760845789}
+{"op":"insert","detail":{"type":"response","content":"```json\n{\"speak\":\"你好！很高兴见到你。今天有什么我可以帮你的吗？\"}\n```"},"time":1778760845790}

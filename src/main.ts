@@ -142,7 +142,7 @@ async function main() {
   resetIdle();
   midnightTimer = setInterval(() => { const h = new Date().getHours(), m = new Date().getMinutes(); if (h === 3 && m < 10 && !sleeping) sleepCycle(true); }, 10 * 60 * 1000);
 
-  process.stderr.write(`  Modules: ${registry.list().join(", ")}\n  Ready.\n\n`);
+  process.stderr.write(`  Instance: ${instanceName}\n  Modules: ${registry.list().join(", ")}\n  Ready.\n\n`);
 
   // Relay (attach)
   const relay = startRelay(instanceName, (socket) => {
