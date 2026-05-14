@@ -164,6 +164,28 @@ async init(ctx: ModuleContext) {
 }
 ```
 
+## 防自响应
+
+> **每个 extension 创建的块必须加 `meta.source = ownId`。`onBlocksChanged` 中过滤 `ch.block.meta?.source === ownId`。**
+
+示例：
+```typescript
+// 创建块时标记来源
+block: { type: "response", content, meta: { source: "llm" }, created: Date.now() }
+
+// onBlocksChanged 中过滤
+const newBlocks = changes.filter((ch) =>
+  ch.type === "added" && ch.block.meta?.source !== ownId
+);
+```
+
+## 遗忘速率
+
+每个块可设 `meta.decay_rate`（/小时），控制遗忘速度：
+- 默认 0.1（半衰期 ~7 小时）
+- MCP 工具输出 0.5（快速遗忘）
+- 设为 0 永不遗忘（同 pinned）
+
 ## 静默块
 
 不想触发 LLM 响应的块，设置 `meta.notify: false`：
