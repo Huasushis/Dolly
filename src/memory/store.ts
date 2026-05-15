@@ -4,12 +4,22 @@ import type { Block } from "../blocks/index.js";
 import { LLMClient } from "../core/llm-client.js";
 import { tokenize, tfVector, cosineSimilarity, extractKeywords } from "./nlp.js";
 
-/** 每日总结 */
 export interface DaySummary {
   day: string;
-  summary: string;
-  keywords: string[];
-  weight: number;
+  emotion: string;           // Step 1: emotional reflection
+  emotionKeywords: string[];
+  emotionWeight: number;
+  lessons: string;           // Step 2: lessons learned
+  lessonsKeywords: string[];
+  summary: string;           // Step 3: overall summary
+  keywords: string[];        // combined (emotion + lessons + summary)
+  weight: number;            // emotional weight
+}
+
+export interface RecallResult {
+  day: string;
+  summary: string;           // the full summary text
+  segments: string[];        // drill-down raw log segments
 }
 
 export class MemoryStore {
@@ -32,47 +42,78 @@ export class MemoryStore {
     appendFileSync(resolve(this.dailyDir, `${day}.jsonl`), JSON.stringify({ op, detail, time: Date.now() }) + "\n");
   }
 
-  /** 将一天总结为一段话。fullDay=true 凌晨全量覆盖，false 只总结增量 */
+  /** 三步总结。fullDay=true 凌晨全量，false 只做增量 */
   async summarize(blocks: Block[], fullDay = false): Promise<DaySummary | null> {
     const day = new Date().toISOString().slice(0, 10);
     const existing = this.summaries.find((s) => s.day === day);
-
-    // 空闲总结：如果今天已有且不是全量模式，跳过
     if (!fullDay && existing) return null;
 
     const text = blocks.map((b) => `[${b.type}] ${b.content.slice(0, 200)}`).join("\n");
-    // Safety: keep under ~7000 tokens for memory_llm (chars/1.5 ≈ tokens for mixed CN/EN)
     const maxChars = 10000;
     const logSlice = text.length > maxChars ? text.slice(-maxChars) : text;
 
-    // Step 1: Think — reflect on emotional significance
-    const thinkPrompt = `回顾你今天经历的以下片段。反思：哪些让你情绪波动强烈？极度高兴、十分悲伤、非常愤怒、强烈好奇——无论正面负面，只要印象深刻就值得记住。用 2-3 句内心独白反思。然后给出 0.1-1.0 的情绪强度（越高越深刻，不分正负）和 3-5 个情绪关键词。\n\n格式：\nthink: <反思>\nweight: <数字>\nmood: <关键词,逗号分隔>\n\n日志：\n${logSlice}`;
+    // ── Step 1: 情绪反思 ──
+    const thinkPrompt = `回顾你今天经历过的以下片段。反思：哪些让你情绪波动强烈？极度高兴、十分悲伤、非常愤怒、强烈好奇——无论正面负面，只要印象深刻就值得记住。用 2-3 句内心独白反思。然后给出 0.1-1.0 的情绪强度（越高越深刻，不分正负）和 3-5 个情绪关键词。
+
+格式：
+think: <反思>
+weight: <数字>
+mood: <关键词,逗号分隔>
+
+日志：
+${logSlice}`;
 
     const thinkResp = await this.summarizeClient.chat([{ role: "user", content: thinkPrompt }]);
-    const thinkMatch = thinkResp.match(/think:\s*(.+)/);
+    const thinkMatch = thinkResp.match(/think:\s*([\s\S]+?)(?=\nweight:|\nmood:|$)/);
     const weightMatch = thinkResp.match(/weight:\s*([\d.]+)/);
-    const moodMatch = thinkResp.match(/mood:\s*(.+)/);
-    const reflection = thinkMatch?.[1]?.trim() ?? "";
+    const moodMatch = thinkResp.match(/mood:\s*([\s\S]+?)$/);
+    const emotion = thinkMatch?.[1]?.trim() ?? thinkResp.slice(0, 300);
     const weight = Math.min(1, Math.max(0.1, parseFloat(weightMatch?.[1] ?? "0.5")));
-    const mood = moodMatch?.[1]?.trim() ?? "";
+    const moodStr = moodMatch?.[1]?.trim() ?? "";
+    const emotionKeywords = moodStr.split(/[,，\s]+/).filter((k) => k.length > 0).slice(0, 5);
 
-    // Step 2: Summarize with emotional context
+    // ── Step 2: 收获与教训 ──
+    const lessonsPrompt = `回顾今天：你是否学到了令你欣喜的新东西？或者遭受了令人难受的教训？有没有让你"啊哈！"的瞬间，或者让你后悔、警醒的事？
+
+列出 3-5 个关键词，并用一段话描述这些收获/教训——不要只列关键词，要讲清楚它们之间的关联和来龙去脉。
+
+格式：
+lessons: <一段话描述收获与教训>
+keywords: <关键词,逗号分隔>
+
+日志：
+${logSlice}`;
+
+    const lessonsResp = await this.summarizeClient.chat([{ role: "user", content: lessonsPrompt }]);
+    const lessonsMatch = lessonsResp.match(/lessons:\s*([\s\S]+?)(?=\nkeywords:|$)/);
+    const lessonsKwMatch = lessonsResp.match(/keywords:\s*([\s\S]+?)$/);
+    const lessons = lessonsMatch?.[1]?.trim() ?? lessonsResp.slice(0, 300);
+    const lessonsKwStr = lessonsKwMatch?.[1]?.trim() ?? "";
+    const lessonsKeywords = lessonsKwStr.split(/[,，\s]+/).filter((k) => k.length > 0).slice(0, 5);
+
+    // ── Step 3: 总体总结 ──
     const summaryPrompt = existing
-      ? `你今天已经有了一段总结：\n${existing.summary}\n\n${reflection ? `你的反思：${reflection}\n` : ""}补充新的经历。把新旧合并为一段完整的总结。融入你的情绪感受。\n\n新日志：\n${logSlice}`
-      : `${reflection ? `你的反思：${reflection}\n` : ""}基于以上反思，用一段话总结今天。不要列清单——融合事实和情绪感受。\n\n日志：\n${logSlice}`;
+      ? `你今天已经有了一段总结：\n${existing.summary}\n\n补充新的经历。把新旧合并为一段完整的总结。融合你的情绪感受和收获教训。\n\n情绪：${emotion}\n收获与教训：${lessons}\n\n新日志：\n${logSlice}`
+      : `基于你的情绪反思和收获教训，用一段话总结今天。不要列清单——融合事实、情绪感受和成长体会。\n\n情绪：${emotion}\n收获与教训：${lessons}\n\n日志：\n${logSlice}`;
 
     const resp = await this.summarizeClient.chat([{ role: "user", content: summaryPrompt }]);
     const summary = resp.trim();
     if (!summary || summary.length < 20) return null;
 
-    const moodKeywords = mood.split(/[,，\s]+/).filter((k) => k.length > 0);
-    const keywords = [...new Set([...extractKeywords(summary, 8), ...moodKeywords])].slice(0, 12);
-    const entry: DaySummary = { day, summary, keywords, weight };
+    const allKeywords = [...new Set([
+      ...emotionKeywords,
+      ...lessonsKeywords,
+      ...extractKeywords(summary, 8),
+    ])].slice(0, 15);
+
+    const entry: DaySummary = {
+      day, emotion, emotionKeywords, emotionWeight: weight,
+      lessons, lessonsKeywords,
+      summary, keywords: allKeywords, weight,
+    };
 
     if (existing) {
-      // 替换旧条目
-      const idx = this.summaries.indexOf(existing);
-      this.summaries[idx] = entry;
+      this.summaries[this.summaries.indexOf(existing)] = entry;
     } else {
       this.summaries.push(entry);
     }
@@ -108,8 +149,7 @@ export class MemoryStore {
     const lines = readFileSync(logPath, "utf-8").split("\n").filter(Boolean);
     const queryVec = tfVector(tokenize(query));
 
-    // 把日志分成段落（每 N 行一段），计算与查询的相关度
-    const segSize = 10; // lines per segment
+    const segSize = 10;
     const scored: Array<{ text: string; score: number }> = [];
 
     for (let i = 0; i < lines.length; i += segSize) {
@@ -131,14 +171,18 @@ export class MemoryStore {
       .map((s) => s.text);
   }
 
-  /** 搜索 → 钻取 → 返回相关文本片段 */
-  recall(query: string, maxDays = 3, maxSegments = 3): string[] {
+  /** 搜索 → 钻取 → 返回总结+片段 */
+  recall(query: string, maxDays = 3, maxSegments = 3): RecallResult[] {
     const days = this.search(query, maxDays);
-    const segments: string[] = [];
+    const results: RecallResult[] = [];
     for (const d of days) {
-      segments.push(...this.drill(d.day, query, maxSegments));
+      results.push({
+        day: d.day,
+        summary: d.summary,
+        segments: this.drill(d.day, query, maxSegments),
+      });
     }
-    return segments.slice(0, maxSegments * 2);
+    return results;
   }
 
   hasEntriesForToday(): boolean {

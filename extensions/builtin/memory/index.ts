@@ -24,11 +24,11 @@ const memoryModule: DollyModule = {
   },
 
   systemPrompt(): string {
-    return `你可以请求检索相关记忆：
+    return `每次对话时，系统会自动注入相关记忆（包含当天总结和相关片段）。你也可以主动请求更深入的回忆：
 \`\`\`json
 {"recall":"hard"}
 \`\`\`
-hard 深度回忆（5天5段），soft 轻量（1天1段），默认不检索。`;
+hard 深度回忆（5天5段），soft 轻量（1天1段）。`;
   },
 
   async onBlocksChanged(ctx: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
@@ -37,19 +37,31 @@ hard 深度回忆（5天5段），soft 轻量（1天1段），默认不检索。
     for (const ch of changes) {
       store.appendLog(ch.type, { type: ch.block.type, content: ch.block.content.slice(0, 200) });
     }
-    // Recall on new message blocks
+    // Auto-recall on new message blocks (always; explicit recall tag increases depth)
     for (const ch of changes) {
       if (ch.type !== "added" || ch.block.type !== "message") continue;
       const rm = ch.block.content.match(/\{"recall":"(hard|soft)"\}/);
-      const [rd, rs] = rm?.[1] === "hard" ? [5,5] : rm?.[1] === "soft" ? [1,1] : [3,3];
+      const [rd, rs] = rm?.[1] === "hard" ? [5,5] : rm?.[1] === "soft" ? [1,1] : [3,2]; // default: 3d 2seg
       const recalled = store.recall(ch.block.content, rd, rs);
-      for (const seg of recalled) {
-        const already = ctx.getBlocks().some((b) => b.type === "memory" && b.content.includes(seg.slice(0, 50)));
-        if (!already) {
+      for (const r of recalled) {
+        // Inject summary first (if not already present)
+        const summaryKey = `summary:${r.day}`;
+        const hasSummary = ctx.getBlocks().some((b) => b.type === "memory" && b.content.includes(summaryKey));
+        if (!hasSummary && r.summary) {
           mutations.push({
-            action: "insert", priority: 90,
-            block: { type: "memory", content: `[记忆] ${seg}`, meta: { source: "memory", notify: false }, created: Date.now() },
+            action: "insert", priority: 85,
+            block: { type: "memory", content: `[记忆 ${r.day} 总结] ${r.summary}`, meta: { source: "memory", notify: false }, created: Date.now() },
           });
+        }
+        // Inject drill segments
+        for (const seg of r.segments) {
+          const already = ctx.getBlocks().some((b) => b.type === "memory" && b.content.includes(seg.slice(0, 50)));
+          if (!already) {
+            mutations.push({
+              action: "insert", priority: 90,
+              block: { type: "memory", content: `[记忆 ${r.day} 片段] ${seg}`, meta: { source: "memory", notify: false }, created: Date.now() },
+            });
+          }
         }
       }
     }
