@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
 import { resolve } from "path";
 import type { DollyModule, ModuleContext } from "../../../src/modules/base.js";
 import type { BlockChange, BlockMutation } from "../../../src/blocks/index.js";
@@ -9,6 +9,13 @@ let store: MemoryStore;
 let client: LLMClient;
 let idleTimer: NodeJS.Timeout | null = null;
 let idleMinutes = 60;
+let recallMode: "hard" | "soft" | "default" = "default"; // persistent until midnight reset
+
+function recallDepth(): [number, number] {
+  if (recallMode === "hard") return [5, 5];
+  if (recallMode === "soft") return [1, 1];
+  return [3, 2];
+}
 
 const memoryModule: DollyModule = {
   id: "builtin/memory",
@@ -24,11 +31,12 @@ const memoryModule: DollyModule = {
   },
 
   systemPrompt(): string {
-    return `每次对话时，系统会自动注入相关记忆（包含当天总结和相关片段）。你也可以主动请求更深入的回忆：
+    return `每次对话时，系统会自动注入相关记忆。你可以调节回忆深度：
 \`\`\`json
 {"recall":"hard"}
 \`\`\`
-hard 深度回忆（5天5段），soft 轻量（1天1段）。`;
+hard 深度回忆（5天5段，持续生效直到改变或凌晨重置）
+soft 轻量回忆（1天1段，同上）`;
   },
 
   async onBlocksChanged(ctx: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
@@ -37,14 +45,29 @@ hard 深度回忆（5天5段），soft 轻量（1天1段）。`;
     for (const ch of changes) {
       store.appendLog(ch.type, { type: ch.block.type, content: ch.block.content.slice(0, 200) });
     }
-    // Auto-recall on new message blocks (always; explicit recall tag increases depth)
+
+    // Check for recall mode changes in any new block
+    for (const ch of changes) {
+      if (ch.type !== "added") continue;
+      const re = /```json\s*\n([\s\S]*?)```/g;
+      let m;
+      while ((m = re.exec(ch.block.content))) {
+        try {
+          const obj = JSON.parse(m[1].trim());
+          if (obj?.recall === "hard") recallMode = "hard";
+          if (obj?.recall === "soft") recallMode = "soft";
+        } catch {}
+      }
+    }
+
+    // Auto-recall on new message blocks
     for (const ch of changes) {
       if (ch.type !== "added" || ch.block.type !== "message") continue;
+      // Allow per-message explicit override
       const rm = ch.block.content.match(/\{"recall":"(hard|soft)"\}/);
-      const [rd, rs] = rm?.[1] === "hard" ? [5,5] : rm?.[1] === "soft" ? [1,1] : [3,2]; // default: 3d 2seg
+      const [rd, rs] = rm?.[1] === "hard" ? [5,5] : rm?.[1] === "soft" ? [1,1] : recallDepth();
       const recalled = store.recall(ch.block.content, rd, rs);
       for (const r of recalled) {
-        // Inject summary first (if not already present)
         const summaryKey = `summary:${r.day}`;
         const hasSummary = ctx.getBlocks().some((b) => b.type === "memory" && b.content.includes(summaryKey));
         if (!hasSummary && r.summary) {
@@ -53,7 +76,6 @@ hard 深度回忆（5天5段），soft 轻量（1天1段）。`;
             block: { type: "memory", content: `[记忆 ${r.day} 总结] ${r.summary}`, meta: { source: "memory", notify: false }, created: Date.now() },
           });
         }
-        // Inject drill segments
         for (const seg of r.segments) {
           const already = ctx.getBlocks().some((b) => b.type === "memory" && b.content.includes(seg.slice(0, 50)));
           if (!already) {
@@ -78,4 +100,5 @@ function resetTimer() {
 }
 
 export function getStore() { return store; }
+export function resetRecall() { recallMode = "default"; }
 export default memoryModule;

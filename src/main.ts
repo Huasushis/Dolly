@@ -11,6 +11,7 @@ import { start, stop, status, isRunning } from "./daemon/index.js";
 import { startRelay, cleanupRelay, attachClient, waitForPort } from "./daemon/attach.js";
 import { getSpeakHistory } from "../extensions/builtin/console/index.js";
 import { resetThinking } from "../extensions/builtin/llm/index.js";
+import { resetRecall } from "../extensions/builtin/memory/index.js";
 import { handleMcpCall } from "../extensions/builtin/mcp/index.js";
 import type { ModuleContext } from "./modules/base.js";
 
@@ -93,7 +94,7 @@ async function main() {
 
   let midnightTimer = setInterval(() => {
     const h = new Date().getHours(), m = new Date().getMinutes();
-    if (h === 3 && m < 10) { bus.emit("midnight.tick", {}); resetThinking(); }
+    if (h === 3 && m < 10) { bus.emit("midnight.tick", {}); resetThinking(); resetRecall(); }
   }, 10 * 60 * 1000);
 
   bus.on("tool.call_requested", async (p: any) => {
