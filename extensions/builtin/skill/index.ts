@@ -5,73 +5,63 @@ import type { BlockChange, BlockMutation } from "../../../src/blocks/index.js";
 import { LLMClient } from "../../../src/core/llm-client.js";
 
 interface SkillDef {
-  name: string;
-  description: string;
-  body: string;
+  name: string;        // from frontmatter, must match dir name
+  description: string; // when to use (also used for trigger detection)
+  body: string;        // Markdown instructions
 }
 
 let ctx: ModuleContext;
 let guardClient: LLMClient;
 let skills: SkillDef[] = [];
-let triggered = new Set<string>();
+let seenTriggers = new Set<string>();
+let toolsInjected = false;
+let mcpToolNames: string[] = [];
 
 const skillModule: DollyModule = {
   id: "builtin/skill",
 
   async init(c: ModuleContext) {
     ctx = c;
-    // Reuse main LLM config for guard detection (cheap yes/no calls)
-    const llmCfg = (c.config as any)["builtin/llm"] ?? { api_key: "", base_url: "https://api.deepseek.com", model: "deepseek-chat" };
-    guardClient = new LLMClient(llmCfg);
-    loadSkills(c);
+    const cfg = (c.config as any)._llm_guard;
+    guardClient = new LLMClient(cfg ?? { api_key: "", base_url: "https://api.deepseek.com", model: "deepseek-chat" });
+    loadSkills();
   },
+
 
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     ctx = c;
-    if (skills.length === 0) return [];
-
-    const newMsgs = changes.filter((ch) => ch.type === "added" && ch.block.type === "message");
-    if (newMsgs.length === 0) return [];
-
     const mutations: BlockMutation[] = [];
-    const recentText = ctx.getBlocks().slice(-8).map((b) => b.content).join("\n").slice(-2000);
 
-    // Batch: one LLM call checks all unmatched skills at once
-    const candidates = skills.filter((s) => !triggered.has(s.name));
-    if (candidates.length === 0) return [];
+    if (skills.length === 0) return mutations;
+    const recentText = ctx.getBlocks().slice(-8).map((b) => b.content).join("\n");
 
-    try {
-      const skillList = candidates.map((s, i) => `${i}: ${s.name} — ${s.description}`).join("\n");
-      const resp = await guardClient.chat([
-        { role: "user", content: `下面是一段对话上下文和一系列技能描述。判断哪些技能当前被触发（可能有零个、一个或多个）。只回复匹配的技能序号（逗号分隔），不匹配则回复 none。
-
-技能：
-${skillList}
-
-上下文：
-${recentText}` },
-      ]);
-      const hits = resp.trim();
-      if (hits.toLowerCase() === "none") return [];
-
-      const indices = hits.split(/[,，\s]+/).map((s) => parseInt(s.trim())).filter((n) => !isNaN(n) && n >= 0 && n < candidates.length);
-      for (const idx of indices) {
-        const skill = candidates[idx];
-        const already = ctx.getBlocks().some((b) => b.type === "skill" && b.meta?.skill === skill.name);
-        if (!already) {
-          triggered.add(skill.name);
-          mutations.push({
-            action: "insert", priority: 20,
-            block: { type: "skill", content: skill.body, meta: { skill: skill.name, source: "skill" }, created: Date.now() },
-          });
+    for (const skill of skills) {
+      if (seenTriggers.has(skill.name)) continue;
+      try {
+        const resp = await guardClient.chat([
+          { role: "user", content: `判断：用户是否在${skill.description}？仅回复 yes 或 no。\n\n${recentText.slice(-1000)}` },
+        ]);
+        if (resp.trim().toLowerCase().startsWith("yes")) {
+          // 去重：检查上下文中是否已有同名skill块
+          const alreadyInContext = ctx.getBlocks().some(
+            (b) => b.type === "skill" && b.meta?.skill === skill.name
+          );
+          if (!alreadyInContext) {
+            seenTriggers.add(skill.name);
+            mutations.push({
+              action: "insert", priority: 20,
+              block: { type: "skill", content: skill.body, meta: { skill: skill.name, source: "skill" }, created: Date.now() },
+            });
+          }
         }
-      }
-    } catch {}
+      } catch {}
+    }
 
     return mutations;
   },
 };
 
+/** Parse YAML frontmatter from SKILL.md */
 function parseFrontmatter(text: string): { frontmatter: Record<string, string>; body: string } | null {
   const match = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   if (!match) return null;
@@ -83,6 +73,7 @@ function parseFrontmatter(text: string): { frontmatter: Record<string, string>; 
   return { frontmatter: fm, body: match[2].trim() };
 }
 
+/** Load skills from subdirectories containing SKILL.md (Agent Skills standard) */
 function loadSkillsDir(dir: string) {
   if (!existsSync(dir)) return;
   for (const entry of readdirSync(dir)) {
@@ -102,20 +93,16 @@ function loadSkillsDir(dir: string) {
   }
 }
 
-function loadSkills(c: ModuleContext) {
-  const cfg = (c.config as any)["builtin/skill"] ?? {};
-
-  // Built-in skills (always loaded)
+function loadSkills() {
+  // Built-in skills
   loadSkillsDir(resolve(import.meta.dirname!, "skills"));
-
-  // Configurable directories from dolly.json modules.builtin/skill.skills_dirs
-  const dirs: string[] = cfg.skills_dirs ?? [];
-  for (const d of dirs) {
-    const expanded = d.startsWith("~") ? resolve(process.env.HOME || process.env.USERPROFILE || "", d.slice(1)) : resolve(d);
-    loadSkillsDir(expanded);
-  }
+  // Project skills (npx skills add target)
+  loadSkillsDir(resolve(import.meta.dirname!, "..", "..", "..", "skills"));
+  // Global skills (~/.dolly/skills)
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  if (home) loadSkillsDir(resolve(home, ".dolly", "skills"));
 }
 
-export function setMcpTools(_tools: string[]) {} // deprecated, kept for compat
-export function getSkills() { return skills; }
+export function setMcpTools(tools: string[]) { mcpToolNames = tools; toolsInjected = false; }
+
 export default skillModule;

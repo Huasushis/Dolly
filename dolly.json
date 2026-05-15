@@ -29,7 +29,7 @@
       "idle_minutes": 60
     },
     "builtin/skill": {
-      "skills_dirs": ["./skills", "~/.dolly/skills"]
+      "max_skills": 20
     },
     "builtin/mcp": {
       "timeout_ms": 30000
