@@ -1,8 +1,0 @@
-{"op":"added","detail":{"type":"message","content":"你好"},"time":1778827192966}
-{"op":"added","detail":{"type":"response","content":"```json\n{\"speak\":\"你好呀 cx！😊 又见面了～想聊点什么，还是有什么需要我帮忙的？\"}\n```"},"time":1778827193128}
-{"op":"added","detail":{"type":"message","content":"你好"},"time":1778827582978}
-{"op":"added","detail":{"type":"response","content":"```json\n{\"speak\":\"哈哈，第三次说“你好”啦！看来你是想测试我的记忆力？😄 放心吧，我记得你是 cx，刚才我们还聊过我会做什么、为什么会有这些能力呢！今天有什么新想法吗？\"}\n```"},"time":1778827583349}
-{"op":"added","detail":{"type":"message","content":"你好，我是test_user"},"time":1778827661525}
-{"op":"added","detail":{"type":"response","content":"```json\n{\"speak\":\"你好，test_user！欢迎！😊 我是你的AI助手，有什么需要帮忙的吗？尽管说～\"}\n```"},"time":1778827661881}
-{"op":"added","detail":{"type":"message","content":"你好，我是test_user"},"time":1778827754726}
-{"op":"added","detail":{"type":"response","content":"```json\n{\"speak\":\"你好，test_user！又见面啦～😊 我记住了你的提醒，需要工具时我会用 fenced JSON 格式调用。今天有什么需要我帮忙的吗？\"}\n```"},"time":1778827754943}
