@@ -31,7 +31,9 @@
       "model": "deepseek-chat",
       "idle_minutes": 60
     },
-    "builtin/skill": { "max_skills": 20 },
+    "builtin/skill": {
+      "skills_dirs": ["./skills", "~/.dolly/skills"]
+    },
     "builtin/mcp": { "timeout_ms": 30000 }
   },
   "daemon": {
@@ -59,7 +61,7 @@ AI 的人设和背景，直接注入 System Prompt。
 |------|--------|
 | `builtin/llm` | `api_key_env`, `base_url`, `model`, `enable_thinking` |
 | `builtin/memory` | `api_key_env`, `base_url`, `model`, `idle_minutes` |
-| `builtin/skill` | `max_skills` |
+| `builtin/skill` | `skills_dirs`（目录列表，~ 展开为用户目录） |
 | `builtin/mcp` | `timeout_ms` |
 
 `enable_thinking`（默认 false）：启用后 LLM 可用 `{"thinking":"difficult"}` 进入深度思考，用 `{"thinking":"solved"}` 退出。凌晨 3 点自动关闭防止浪费 reasoning token。
