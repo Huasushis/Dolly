@@ -21,12 +21,12 @@ const memoryModule: DollyModule = {
   id: "builtin/memory",
 
   async init(ctx: ModuleContext) {
-    const cfg = (ctx.config as any)["builtin/memory"] ?? (ctx.config as any)._llm_memory;
+    const cfg = (ctx.config as any)["builtin/memory"];
     client = new LLMClient(cfg ?? { api_key: "", base_url: "https://api.deepseek.com", model: "deepseek-chat" });
     const memPath = resolve(ctx.storagePath, "memory-store");
     if (!existsSync(memPath)) mkdirSync(memPath, { recursive: true });
     store = new MemoryStore(memPath, client);
-    idleMinutes = cfg?.idle_minutes ?? (ctx.config as any).memory?.idle_minutes ?? 60;
+    idleMinutes = cfg?.idle_minutes ?? 60;
     resetTimer();
   },
 

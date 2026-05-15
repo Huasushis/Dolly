@@ -25,8 +25,9 @@ export function start(name = "default"): void {
   }
   const child = spawn("node", ["--import", "tsx", "src/main.ts", "--daemon", `--name=${name}`], {
     cwd: resolve(import.meta.dirname!, "..", ".."),
-    detached: true, stdio: "ignore",
+    detached: true, stdio: ["ignore", "ignore", "pipe"],
   });
+  child.stderr?.on("data", (d) => process.stderr.write(`[daemon] ${d}`));
   writeFileSync(pf, String(child.pid!));
   child.unref();
 }

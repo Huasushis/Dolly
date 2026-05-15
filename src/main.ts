@@ -7,7 +7,7 @@ import { ContextManager } from "./core/context.js";
 import { EventBus } from "./core/bus.js";
 import { LockManager } from "./core/lock.js";
 import { ModuleRegistry } from "./modules/registry.js";
-import { start, stop, status, isRunning } from "./daemon/index.js";
+import { start, stop, status, isRunning, pidFile } from "./daemon/index.js";
 import { startRelay, cleanupRelay, attachClient, waitForPort } from "./daemon/attach.js";
 import { getSpeakHistory } from "../extensions/builtin/console/index.js";
 import { resetThinking } from "../extensions/builtin/llm/index.js";
@@ -42,8 +42,7 @@ if (!isDaemonMode) {
     await waitForPort(instanceName);
   }
   process.stderr.write(`Connected to "${instanceName}". Type /exit to quit, Ctrl-C to exit.\n\n`);
-  attachClient(instanceName); // blocks via active socket, exits on close
-  process.exit(0);
+  attachClient(instanceName); // exits via socket.on("close") → process.exit(0)
 }
 
 // ── Daemon mode (internal, --daemon flag) ────────────────────────
@@ -136,7 +135,10 @@ async function main() {
     writeFileSync(profileFile, JSON.stringify({ blocks, savedAt: Date.now() }, null, 2));
   };
 
-  // Daemon: relay handles all I/O. Broadcast speaks to all connected clients.
+  // Daemon: write PID file so client mode detects us as running
+  writeFileSync(pidFile(instanceName), String(process.pid));
+
+  // Relay handles all I/O. Broadcast speaks to all connected clients.
   const clients = new Set<any>();
   bus.on("speak", (p: any) => {
     const line = p.text + "\n";
@@ -152,6 +154,7 @@ async function main() {
         if (line.trim() === "/exit") { socket.end(); break; }
         if (line.trim()) await handleInput(line.trim());
       }
+      socket.end(); // client half-closed — flush and close
     })();
     socket.on("close", () => { clients.delete(socket); rl.close(); });
   });

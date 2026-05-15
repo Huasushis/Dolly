@@ -1,4 +1,4 @@
-import { createServer, Socket } from "net";
+import { createServer, Socket, connect } from "net";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from "fs";
 import { resolve } from "path";
 
@@ -40,15 +40,11 @@ export function attachClient(name: string): void {
     process.exit(1);
   }
   const port = parseInt(readFileSync(portFile, "utf-8"));
-  const socket = new (require("net").Socket)();
-  socket.connect(port, "127.0.0.1", () => {
-    process.stdin.setRawMode?.(true);
-    process.stdin.pipe(socket);
+  const socket = connect(port, "127.0.0.1", () => {
+    process.stdin.on("data", (chunk) => socket.write(chunk));
+    process.stdin.on("end", () => { socket.end(); });
     socket.pipe(process.stdout);
-    socket.on("close", () => {
-      process.stdin.setRawMode?.(false);
-      process.exit(0);
-    });
+    socket.on("close", () => { process.exit(0); });
   });
 }
 

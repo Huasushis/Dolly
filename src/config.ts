@@ -28,14 +28,34 @@ export function loadConfig(): DollyConfig {
 
   const raw = JSON.parse(readFileSync(configPath, "utf-8"));
 
-  // Legacy top-level llm → inject into module configs if not already there
-  if (raw.llm) {
-    if (raw.llm.main && !raw.modules?.["builtin/llm"]?.model) {
-      raw.modules ??= {};
-      raw.modules["builtin/llm"] = { ...raw.llm.main, ...raw.modules["builtin/llm"] };
-      raw.modules["builtin/memory"] = { ...raw.llm.memory, ...raw.modules["builtin/memory"] };
-    }
+  const envKey = (key: string) => process.env[key] ?? "";
+
+  // Resolve LLM configs: api_key_env → api_key, and inject memory.idle_minutes
+  const modules = { ...raw.modules };
+  const llmCfg = modules["builtin/llm"] ?? raw.llm?.main;
+  if (llmCfg) {
+    modules["builtin/llm"] = {
+      api_key: envKey(llmCfg.api_key_env ?? "DEEPSEEK_API_KEY"),
+      base_url: llmCfg.base_url ?? "https://api.deepseek.com",
+      model: llmCfg.model ?? "deepseek-chat",
+      enable_thinking: llmCfg.enable_thinking ?? false,
+      ...modules["builtin/llm"],
+    };
   }
+  const memCfg = modules["builtin/memory"] ?? raw.llm?.memory;
+  if (memCfg) {
+    modules["builtin/memory"] = {
+      api_key: envKey(memCfg.api_key_env ?? "DEEPSEEK_API_KEY"),
+      base_url: memCfg.base_url ?? "https://api.deepseek.com",
+      model: memCfg.model ?? "deepseek-chat",
+      idle_minutes: memCfg.idle_minutes ?? raw.memory?.idle_minutes ?? 60,
+      ...modules["builtin/memory"],
+    };
+  }
+  // Clean dangling _llm_* from old config — now resolved above
+  delete (modules as any)._llm_main;
+  delete (modules as any)._llm_memory;
+  delete (modules as any)._llm_guard;
 
   return {
     name: raw.name ?? "dolly",
@@ -46,7 +66,7 @@ export function loadConfig(): DollyConfig {
       protect_window_min: raw.context?.protect_window_min,
       max_background_chars: raw.context?.max_background_chars,
     },
-    modules: { enabled: raw.modules?.enabled ?? ["builtin/llm", "builtin/skill", "builtin/mcp"], ...raw.modules },
+    modules: { enabled: modules.enabled ?? raw.modules?.enabled ?? ["builtin/llm", "builtin/skill", "builtin/mcp"], ...modules },
     daemon: { pid_dir: raw.daemon?.pid_dir ?? ".dolly/daemons", log_dir: raw.daemon?.log_dir ?? ".dolly/logs" },
   };
 }
