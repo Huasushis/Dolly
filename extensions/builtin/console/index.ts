@@ -28,14 +28,14 @@ const consoleModule: DollyModule = {
 speak 之外的一切都是你的内心独白——不会被显示。`;
   },
 
-  async onBlocksChanged(_c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
+  async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     for (const ch of changes) {
       if (ch.type === "added" && ch.block.type === "response") {
         const speaks = parseSpeak(ch.block.content);
         for (const s of speaks) {
           speakHistory.push(s);
           if (speakHistory.length > MAX_HISTORY) speakHistory.shift();
-          process.stdout.write(s + "\n");
+          c.emit("speak", { text: s }); // broadcast via bus — relay/client handles display
         }
         if (storageFile) {
           try { writeFileSync(storageFile, JSON.stringify({ history: speakHistory })); } catch {}
@@ -48,11 +48,18 @@ speak 之外的一切都是你的内心独白——不会被显示。`;
 
 function parseSpeak(text: string): string[] {
   const results: string[] = [];
-  const re = /```json\s*\n\{"speak":"([^"]+)"\}\s*```/g;
+  // Match fenced JSON blocks, parse properly to handle escapes
+  const re = /```json\s*\n([\s\S]*?)```/g;
   let m;
-  while ((m = re.exec(text))) results.push(m[1]);
+  while ((m = re.exec(text))) {
+    try {
+      const obj = JSON.parse(m[1].trim());
+      if (obj && typeof obj.speak === "string") results.push(obj.speak);
+    } catch {}
+  }
+  // Fallback: show non-codeblock text, strip control chars
   if (results.length === 0) {
-    const cleaned = text.replace(/```json[\s\S]*?```/g, "").trim();
+    const cleaned = text.replace(/```json[\s\S]*?```/g, "").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "").trim();
     if (cleaned) results.push(cleaned);
   }
   return results;
