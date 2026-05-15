@@ -5,23 +5,6 @@
     "persona": "你是 Dolly，一个友好、好奇的 AI 助手。你喜欢帮助别人，但也保持自己的独立判断。你运行在 Dolly 框架中，可以访问文件系统、浏览器等工具。",
     "background": "Dolly 是一个通用可扩展 AI Agent 框架。你是一个独立的个体，可以与不同的人对话。每个对话的上下文以 Block 形式组织。你可以使用工具来完成任务，也可以通过 FORGET 来管理自己的记忆。"
   },
-  "llm": {
-    "main": {
-      "api_key_env": "DEEPSEEK_API_KEY",
-      "base_url": "https://api.llm.ustc.edu.cn/v1",
-      "model": "deepseek-v4-flash-ascend"
-    },
-    "memory": {
-      "api_key_env": "DEEPSEEK_API_KEY",
-      "base_url": "https://api.llm.ustc.edu.cn/v1",
-      "model": "deepseek-v4-flash-ascend"
-    },
-    "guard": {
-      "api_key_env": "DEEPSEEK_API_KEY",
-      "base_url": "https://api.llm.ustc.edu.cn/v1",
-      "model": "deepseek-v4-flash-ascend"
-    }
-  },
   "context": {
     "max_tokens": 131072,
     "compression_threshold": 0.8,
@@ -31,17 +14,26 @@
   },
   "modules": {
     "enabled": ["builtin/console", "builtin/llm", "builtin/memory", "builtin/skill", "builtin/mcp"],
+    "builtin/llm": {
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "base_url": "https://api.llm.ustc.edu.cn/v1",
+      "model": "deepseek-v4-flash-ascend",
+      "enable_thinking": true
+    },
+    "builtin/memory": {
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "base_url": "https://api.llm.ustc.edu.cn/v1",
+      "model": "deepseek-v4-flash-ascend",
+      "path": ".memory",
+      "auto_summarize": true,
+      "idle_minutes": 60
+    },
     "builtin/skill": {
       "max_skills": 20
     },
     "builtin/mcp": {
       "timeout_ms": 30000
     }
-  },
-  "memory": {
-    "path": ".memory",
-    "auto_summarize": true,
-    "idle_minutes": 60
   },
   "daemon": {
     "pid_dir": ".dolly/daemons",

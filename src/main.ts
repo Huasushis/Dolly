@@ -60,7 +60,7 @@ async function main() {
     getBlocks: () => context.getBlocks(),
     getBlock: (id) => context.getBlock(id),
     estimateTokens: () => context.estimateTokens(),
-    config: { ...config.modules, _llm_main: config.llm.main, _llm_guard: config.llm.guard, _llm_memory: config.llm.memory },
+    config: config.modules,
     emit: (event, payload) => bus.emit(event, payload),
     log: (_op, _detail) => {},
     lock,

@@ -27,9 +27,9 @@ const llmModule: DollyModule = {
 
   async init(c: ModuleContext) {
     ctx = c;
-    const cfg = (c.config as any)._llm_main;
+    const cfg = (c.config as any)["builtin/llm"] ?? (c.config as any)._llm_main;
     client = new LLMClient(cfg ?? { api_key: "", base_url: "https://api.deepseek.com", model: "deepseek-chat" });
-    thinkingEnabled = (c.config as any).llm?.main?.enable_thinking ?? false;
+    thinkingEnabled = cfg?.enable_thinking ?? false;
   },
 
   systemPrompt(): string {

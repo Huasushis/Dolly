@@ -100,19 +100,30 @@ type BlockMutation =
 - **保护窗口**：10 分钟内的块永不删除
 - 不同扩展可设不同 `decay_rate`
 
+## 进程模型
+
+```
+dolly run (客户端) ──pipe──→ relay socket ──→ daemon (服务器)
+                                ↑
+                          web UI / API (未来)
+```
+
+- **daemon** 持久运行：MCP 连接、LLM 调用、上下文、记忆全在此。`stdin` 忽略，所有 I/O 通过 relay socket
+- **console（dolly run）** 只是客户端投影：自动启动 daemon（如果没在跑），通过 socket 转发输入/接收输出
+- daemon 停止时自动保存 profile。每次 cascade 后也自动保存
+
 ## Profile 与多开
 
 ```
 .dolly/profiles/<name>/
-├── context.json         # stop 时保存，run 恢复
-├── memory/              # 独立记忆存储
-│   ├── index.json
-│   ├── entries/{day}.json
-│   └── daily/{day}.jsonl
+├── context.json             # 每次 cascade 后自动保存
+├── exts/                    # 各扩展存储目录
+│   └── builtin-memory/
+│       ├── index.json
+│       ├── entries/{day}.json
+│       └── daily/{day}.jsonl
 └── ...
 ```
-
-`run` 模式不保存（瞬态），`stop` 触发保存。
 
 ## Fenced JSON 协议
 
@@ -130,6 +141,8 @@ type BlockMutation =
 | 模块 | 职责 | systemPrompt |
 |------|------|-------------|
 | builtin/console | speak 显示 + 历史缓冲 | 教 LLM 用 `{"speak":"..."}` |
-| builtin/llm | API 调用 + 流式输出 | 内心世界安全环境 + 工具/forget/recall |
-| builtin/skill | 语义触发 + 去重 | recall 标签使用 |
+| builtin/llm | API 调用 + 流式输出 + thinking | 第一人称内心世界 + forget |
+| builtin/skill | 语义触发 + 去重 | — |
+| builtin/mcp | MCP 工具连接 + 调用 | 可用工具列表 + tool 用法 |
+| builtin/memory | daily log + 总结 + 检索 | recall 标签使用 |
 | builtin/mcp | MCP server 连接 + 工具路由 | 及时遗忘 MCP 输出 |
