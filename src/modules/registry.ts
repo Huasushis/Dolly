@@ -169,4 +169,22 @@ export class ModuleRegistry {
       }
     }
   }
+
+  /** Route CLI command to matching extension. Returns true if handled. */
+  async dispatchCli(extName: string, args: string[]): Promise<boolean> {
+    for (const [id, mod] of this.modules) {
+      // Match extension by id suffix (e.g., "builtin/memory" matches "memory")
+      if (id === `builtin/${extName}` || id === extName) {
+        if (mod.handleCli) {
+          this.currentStoragePath = resolve(this.profileExtsDir, id);
+          try {
+            await mod.handleCli(args, this.ctx);
+            return true;
+          } catch (err) { console.error(`[ModuleRegistry] ${id} handleCli error:`, err); }
+        }
+      }
+    }
+    process.stderr.write(`Unknown command: ${extName}\n`);
+    return false;
+  }
 }

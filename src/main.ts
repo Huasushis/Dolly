@@ -145,6 +145,23 @@ async function main() {
 
   // ── Input handler ──
   async function handleInput(line: string) {
+    // Try structured JSON command: {"cmd":"ext","args":[...]}
+    try {
+      const obj = JSON.parse(line);
+      if (obj && typeof obj.cmd === "string") {
+        const extName = obj.cmd;
+        const extArgs: string[] = obj.args ?? [];
+        // Route to extension via relay's response socket (handled per-command)
+        if (extName === "console") {
+          context.addBlock("outer", extArgs.join(" "), { source: "console" });
+          await cascade();
+        } else {
+          await registry.dispatchCli(extName, extArgs);
+        }
+        return;
+      }
+    } catch {}
+    // Legacy text commands
     if (line === "/reload") { await registry.reloadAll(); return; }
     const reloadExt = line.match(/^\/reload\s+--ext=(\S+)/);
     if (reloadExt) { await registry.reload(reloadExt[1]); return; }
@@ -152,6 +169,7 @@ async function main() {
     if (enableExt) { await registry.enable(enableExt[1]); return; }
     const disableExt = line.match(/^\/disable\s+(\S+)/);
     if (disableExt) { registry.disable(disableExt[1]); return; }
+    // Raw text → outer block
     context.addBlock("outer", line, { source: "console" });
     await cascade();
   }

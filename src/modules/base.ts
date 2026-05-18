@@ -26,4 +26,6 @@ export interface DollyModule {
   onStop?(ctx: ModuleContext): Promise<void>;
   /** Called after profile restore on startup */
   onStart?(ctx: ModuleContext): Promise<void>;
+  /** Handle CLI command: dolly <extName> <args...> */
+  handleCli?(args: string[], ctx: ModuleContext): Promise<void>;
 }

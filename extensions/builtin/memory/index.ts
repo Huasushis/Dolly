@@ -41,6 +41,26 @@ hard 深度回忆（5天5段，持续生效直到改变或凌晨重置）
 soft 轻量回忆（1天1段，同上）`;
   },
 
+  async handleCli(args: string[], _c: ModuleContext) {
+    if (args[0] === "midnight") {
+      process.stderr.write("Forcing midnight pipeline...\n");
+      const blocks = ctx.getBlocks();
+      const summary = await store.summarize(blocks, true);
+      if (summary) process.stderr.write(`Summary done: ${summary.day}\n`);
+    } else if (args[0] === "recall") {
+      const query = args.slice(1).join(" ");
+      const results = store.recall(query, 3, 3);
+      for (const r of results) {
+        process.stdout.write(`[${r.day}] ${r.summary.slice(0, 200)}\n`);
+        for (const seg of r.segments) process.stdout.write(`  ${seg.slice(0, 100)}\n`);
+      }
+    } else if (args[0] === "search") {
+      const query = args.slice(1).join(" ");
+      const days = store.search(query, 5);
+      for (const d of days) process.stdout.write(`${d.day}: ${d.summary.slice(0, 150)}\n`);
+    }
+  },
+
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     ctx = c;
     const mutations: BlockMutation[] = [];

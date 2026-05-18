@@ -25,6 +25,11 @@ const skillModule: DollyModule = {
     loadSkills();
   },
 
+  async handleCli(args: string[], _c: ModuleContext) {
+    if (args[0] === "reload") { skills = []; seenTriggers = new Set(); loadSkills(); process.stdout.write(`${skills.length} skills loaded\n`); }
+    else if (args[0] === "list") { for (const s of skills) process.stdout.write(`${s.name}: ${s.description}\n`); }
+  },
+
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     ctx = c;
 

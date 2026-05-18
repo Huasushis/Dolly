@@ -28,6 +28,11 @@ const consoleModule: DollyModule = {
 speak 之外的一切都是你的内心独白——不会被显示。`;
   },
 
+  async handleCli(args: string[], _c: ModuleContext) {
+    if (args[0] === "history") for (const s of speakHistory) process.stdout.write(s + "\n");
+    else if (args[0] === "clear") { speakHistory.length = 0; process.stdout.write("cleared\n"); }
+  },
+
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     for (const ch of changes) {
       if (ch.type !== "added") continue;
