@@ -9,10 +9,12 @@ export interface ModuleContext {
   emit(event: string, payload: unknown): void;
   log(op: string, detail: unknown): void;
   lock: LockManager;
-  /** Extension 本地存储路径（profiles/<name>/exts/<module-id>/） */
   storagePath: string;
-  /** 修改模块自己的 System Prompt 片段 */
   setSystemPrompt(text: string): void;
+  /** Persist arbitrary state to <storagePath>/save.json */
+  saveState(data: Record<string, unknown>): void;
+  /** Read previously saved state */
+  loadState(): Record<string, unknown> | null;
 }
 
 export interface DollyModule {
@@ -20,4 +22,8 @@ export interface DollyModule {
   init?(ctx: ModuleContext): Promise<void>;
   onBlocksChanged?(ctx: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]>;
   systemPrompt?(ctx: ModuleContext): string;
+  /** Called on daemon shutdown */
+  onStop?(ctx: ModuleContext): Promise<void>;
+  /** Called after profile restore on startup */
+  onStart?(ctx: ModuleContext): Promise<void>;
 }

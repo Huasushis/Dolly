@@ -66,6 +66,8 @@ async function main() {
     lock,
     setSystemPrompt: (_text) => {},
     storagePath: profileDir,
+    saveState: (_data) => {},
+    loadState: () => null,
   };
 
   const profileExtsDir = pathResolve(profileDir, "exts");
@@ -182,11 +184,22 @@ async function main() {
     socket.on("close", () => { clients.delete(socket); rl.close(); });
   });
 
+  // Call onStart on all modules after restore
+  await registry.dispatchStart();
+
   process.stderr.write(`  Daemon: ${instanceName}\n  Modules: ${registry.list().join(", ")}\n  Ready.\n`);
 
+  async function shutdown() {
+    await registry.dispatchStop();
+    saveProfile();
+    cleanupRelay(instanceName);
+    relay.close();
+    clearInterval(midnightTimer);
+    process.exit(0);
+  }
   await new Promise<void>((resolve) => {
-    process.on("SIGINT", () => { saveProfile(); cleanupRelay(instanceName); relay.close(); clearInterval(midnightTimer); process.exit(0); });
-    process.on("SIGTERM", () => { saveProfile(); cleanupRelay(instanceName); relay.close(); clearInterval(midnightTimer); process.exit(0); });
+    process.on("SIGINT", () => { shutdown(); });
+    process.on("SIGTERM", () => { shutdown(); });
   });
 }
 

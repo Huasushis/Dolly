@@ -1,5 +1,5 @@
 import { resolve } from "path";
-import { existsSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import { pathToFileURL } from "url";
 import type { DollyModule, ModuleContext } from "./base.js";
 import type { BlockChange, BlockMutation } from "../blocks/index.js";
@@ -11,6 +11,7 @@ export class ModuleRegistry {
   private promptFragments = new Map<string, string>();
   private enabledList: string[] = [];
   private available: string[] = []; // all found in extensions/
+  private currentStoragePath = ""; // per-module during loading
 
   constructor(
     private ctx: ModuleContext,
@@ -21,6 +22,12 @@ export class ModuleRegistry {
     ctx.setSystemPrompt = (text: string) => {
       const lastId = this._lastLoadedId;
       if (lastId) this.promptFragments.set(lastId, text);
+    };
+    ctx.saveState = (data: Record<string, unknown>) => {
+      try { writeFileSync(resolve(this.currentStoragePath, "save.json"), JSON.stringify(data)); } catch {}
+    };
+    ctx.loadState = (): Record<string, unknown> | null => {
+      try { return JSON.parse(readFileSync(resolve(this.currentStoragePath, "save.json"), "utf-8")); } catch { return null; }
     };
   }
 
@@ -86,7 +93,8 @@ export class ModuleRegistry {
       this.modules.set(instance.id, instance);
       this.instances.add(dir);
       // Set per-module profile storage: profiles/<name>/exts/<module-id>/
-      this.ctx.storagePath = resolve(this.profileExtsDir, instance.id);
+      this.currentStoragePath = resolve(this.profileExtsDir, instance.id);
+      this.ctx.storagePath = this.currentStoragePath;
       // Load static systemPrompt if the module has one
       if (instance.systemPrompt) {
         const sp = instance.systemPrompt(this.ctx);
@@ -143,4 +151,22 @@ export class ModuleRegistry {
 
   list(): string[] { return Array.from(this.modules.keys()); }
   has(id: string): boolean { return this.modules.has(id); }
+
+  async dispatchStop(): Promise<void> {
+    for (const [id, mod] of this.modules) {
+      if (mod.onStop) {
+        this.currentStoragePath = resolve(this.profileExtsDir, id);
+        try { await mod.onStop(this.ctx); } catch (err) { console.error(`[ModuleRegistry] ${id} onStop error:`, err); }
+      }
+    }
+  }
+
+  async dispatchStart(): Promise<void> {
+    for (const [id, mod] of this.modules) {
+      if (mod.onStart) {
+        this.currentStoragePath = resolve(this.profileExtsDir, id);
+        try { await mod.onStart(this.ctx); } catch (err) { console.error(`[ModuleRegistry] ${id} onStart error:`, err); }
+      }
+    }
+  }
 }
