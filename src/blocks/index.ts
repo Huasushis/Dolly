@@ -1,18 +1,19 @@
 import { randomUUID } from "crypto";
 
+/** Framework-native block types: system (pinned prompt), inner (AI-internal), outer (external input) */
 export const BlockType = {
-  SYSTEM: "system", MESSAGE: "message", RESPONSE: "response",
-  TOOL_CALL: "tool_call", TOOL_RESULT: "tool_result",
-  INJECTION: "injection", SKILL: "skill", FORGET: "forget", LOG: "log",
+  SYSTEM: "system",
+  INNER: "inner",
+  OUTER: "outer",
 } as const;
 
 export type BlockTypeKey = (typeof BlockType)[keyof typeof BlockType];
 
 export interface Block {
   id: string;
-  type: string;
+  type: string;       // "system" | "inner" | "outer"
   content: string;
-  meta: Record<string, unknown>;
+  meta: Record<string, unknown>;  // framework: pinned, source, decay_rate. extension: subtype, skill, tool, ...
   created: number;
 }
 
@@ -31,5 +32,6 @@ export type BlockMutation =
   | { action: "update"; blockId: string; content?: string; meta?: Record<string, unknown> };
 
 export function serializeBlock(block: Block): string {
-  return `[ID:${block.id}][TYPE:${block.type}][TIME:${Math.floor(block.created / 1000)}]\n${block.content}`;
+  const subtype = block.meta?.subtype ?? block.type;
+  return `[ID:${block.id}][TYPE:${block.type}/${subtype}][TIME:${Math.floor(block.created / 1000)}]\n${block.content}`;
 }

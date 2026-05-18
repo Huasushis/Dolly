@@ -131,7 +131,7 @@ ${logSlice}`;
       const entryVec = tfVector(tokenize(s.summary + " " + s.keywords.join(" ")));
       let score = cosineSimilarity(queryVec, entryVec);
       score *= (0.5 + s.weight);
-      if (score > 0.01) scored.push({ day: s.day, score });
+      if (score > 0.08) scored.push({ day: s.day, score });
     }
 
     return scored
@@ -162,7 +162,7 @@ ${logSlice}`;
 
       const segVec = tfVector(tokenize(text));
       const score = cosineSimilarity(queryVec, segVec);
-      if (score > 0.01) scored.push({ text: text.slice(0, segmentChars), score });
+      if (score > 0.05) scored.push({ text: text.slice(0, segmentChars), score });
     }
 
     return scored

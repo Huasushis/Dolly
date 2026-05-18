@@ -23,18 +23,18 @@ const instanceName = nameArg ? nameArg.split("=")[1] : "default";
 const isDaemonMode = process.argv.includes("--daemon");
 
 if (cmd === "help" || cmd === "--help") {
-  console.log("Usage: dolly [run|start|stop|status] [--name=xxx]");
-  console.log("  run      连接到实例（自动启动 daemon）");
+  console.log("Usage: dolly [start|stop|status] [--name=xxx]");
   console.log("  start    后台启动 daemon");
   console.log("  stop     停止 daemon");
   console.log("  status   查看状态");
+  console.log("  console  连接交互式终端 (extension: builtin/console)");
   process.exit(0);
 }
 if (cmd === "start") { start(instanceName); process.exit(0); }
 if (cmd === "stop") { stop(instanceName); process.exit(0); }
 if (cmd === "status") { status(instanceName); process.exit(0); }
 
-// ── Client mode (dolly run) ──────────────────────────────────────
+// ── Client mode (dolly console / dolly <ext> <args>) ──────────────
 if (!isDaemonMode) {
   if (!isRunning(instanceName)) {
     process.stderr.write(`Starting daemon for "${instanceName}"...\n`);
@@ -73,42 +73,66 @@ async function main() {
   await registry.discover();
   await registry.loadFromConfig(config.modules.enabled);
 
+  // System prompt: persona + module prompts, no static background
   const persona = (config as any).agent?.persona ?? "";
-  const bg = (config as any).agent?.background ?? "";
-  context.setSystemPrompt([persona, bg, registry.buildSystemPrompt()].filter(Boolean).join("\n\n"));
+  context.setSystemPrompt([persona, registry.buildSystemPrompt()].filter(Boolean).join("\n\n"));
 
-  // Profile restore
+  // Profile restore (preserving original block identity)
   const profileFile = pathResolve(profileDir, "context.json");
   if (existsSync(profileFile)) {
-    try { const saved = JSON.parse(readFileSync(profileFile, "utf-8")); for (const b of (saved.blocks ?? [])) context.addBlock(b.type, b.content, b.meta); } catch {}
+    try {
+      const saved = JSON.parse(readFileSync(profileFile, "utf-8"));
+      for (const b of (saved.blocks ?? [])) context.restoreBlock(b);
+    } catch {}
     context.applyMutations([]);
   }
 
-  // Events
-  bus.on("forget.requested", (p: any) => context.removeBlock(p.blockId));
+  // ── Framework-native: forget scanning ──
+  // Scan ALL new blocks for {"forget":"ID"} and remove target blocks
+  function scanForget(changes: import("./blocks/index.js").BlockChange[]) {
+    const re = /```json\s*\n([\s\S]*?)```/g;
+    for (const ch of changes) {
+      if (ch.type !== "added") continue;
+      let m;
+      while ((m = re.exec(ch.block.content))) {
+        try {
+          const obj = JSON.parse(m[1].trim());
+          if (obj?.forget) context.removeBlock(obj.forget as string);
+        } catch {}
+      }
+    }
+  }
+
+  // ── Bus: reasoning capture (add to log only, not context) ──
   bus.on("reasoning.captured", (p: any) => {
-    const block = context.addBlock("reasoning", p.content, { source: "llm", notify: false });
-    context.removeBlock(block.id);
+    const block = context.addBlock("inner", p.content, { source: "llm", subtype: "reasoning" });
+    context.removeBlock(block.id); // log only, not context
   });
 
+  // ── Bus: tool calls ──
+  bus.on("tool.call_requested", async (p: any) => {
+    L.mcp(p.tool_name);
+    const unlock = await lock.acquire("mcp", 0);
+    try {
+      let result: unknown;
+      try { result = await handleMcpCall(p.tool_name.startsWith("mcp.") ? p.tool_name.slice(4) : p.tool_name, p.params); }
+      catch { result = { error: `unknown tool: ${p.tool_name}` }; }
+      context.addBlock("outer", JSON.stringify(result), { source: "mcp", subtype: "tool_result", tool: p.tool_name, decay_rate: 0.5 });
+    } finally { unlock(); }
+    await cascade();
+  });
+
+  // ── Midnight timer ──
   let midnightTimer = setInterval(() => {
     const h = new Date().getHours(), m = new Date().getMinutes();
     if (h === 3 && m < 10) { bus.emit("midnight.tick", {}); resetThinking(); resetRecall(); }
   }, 10 * 60 * 1000);
 
-  bus.on("tool.call_requested", async (p: any) => {
-    L.mcp(p.tool_name);
-    let result: unknown;
-    try { result = await handleMcpCall(p.tool_name.startsWith("mcp.") ? p.tool_name.slice(4) : p.tool_name, p.params); }
-    catch { result = p.tool_name === "datetime" ? { datetime: new Date().toISOString() } : { error: `unknown tool: ${p.tool_name}` }; }
-    context.addBlock("tool_result", JSON.stringify(result), { tool: p.tool_name, blocking: p.blocking, source: "mcp", decay_rate: 0.5 });
-    if (p.blocking) await cascade();
-  });
-
-  // Cascade
+  // ── Cascade ──
   async function cascade() {
     let changes = context.applyMutations([]);
     for (let i = 0; i < 3; i++) {
+      scanForget(changes); // framework scans for forget commands
       const mutations = await registry.pushChanges(changes);
       if (mutations.length === 0) break;
       changes = context.applyMutations(mutations);
@@ -117,7 +141,7 @@ async function main() {
     saveProfile();
   }
 
-  // Input handler
+  // ── Input handler ──
   async function handleInput(line: string) {
     if (line === "/reload") { await registry.reloadAll(); return; }
     const reloadExt = line.match(/^\/reload\s+--ext=(\S+)/);
@@ -126,7 +150,7 @@ async function main() {
     if (enableExt) { await registry.enable(enableExt[1]); return; }
     const disableExt = line.match(/^\/disable\s+(\S+)/);
     if (disableExt) { registry.disable(disableExt[1]); return; }
-    context.addBlock("message", line);
+    context.addBlock("outer", line, { source: "console" });
     await cascade();
   }
 
@@ -135,10 +159,9 @@ async function main() {
     writeFileSync(profileFile, JSON.stringify({ blocks, savedAt: Date.now() }, null, 2));
   };
 
-  // Daemon: write PID file so client mode detects us as running
   writeFileSync(pidFile(instanceName), String(process.pid));
 
-  // Relay handles all I/O. Broadcast speaks to all connected clients.
+  // ── Relay + speak broadcast ──
   const clients = new Set<any>();
   bus.on("speak", (p: any) => {
     const line = p.text + "\n";
@@ -154,29 +177,16 @@ async function main() {
         if (line.trim() === "/exit") { socket.end(); break; }
         if (line.trim()) await handleInput(line.trim());
       }
-      socket.end(); // client half-closed — flush and close
+      socket.end();
     })();
     socket.on("close", () => { clients.delete(socket); rl.close(); });
   });
 
   process.stderr.write(`  Daemon: ${instanceName}\n  Modules: ${registry.list().join(", ")}\n  Ready.\n`);
 
-  // Keep alive until SIGTERM
   await new Promise<void>((resolve) => {
-    process.on("SIGINT", () => {
-      saveProfile();
-      cleanupRelay(instanceName);
-      relay.close();
-      clearInterval(midnightTimer);
-      process.exit(0);
-    });
-    process.on("SIGTERM", () => {
-      saveProfile();
-      cleanupRelay(instanceName);
-      relay.close();
-      clearInterval(midnightTimer);
-      process.exit(0);
-    });
+    process.on("SIGINT", () => { saveProfile(); cleanupRelay(instanceName); relay.close(); clearInterval(midnightTimer); process.exit(0); });
+    process.on("SIGTERM", () => { saveProfile(); cleanupRelay(instanceName); relay.close(); clearInterval(midnightTimer); process.exit(0); });
   });
 }
 

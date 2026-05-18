@@ -7,9 +7,10 @@ import { LLMClient } from "../../../src/core/llm-client.js";
 
 let store: MemoryStore;
 let client: LLMClient;
+let ctx: ModuleContext;
 let idleTimer: NodeJS.Timeout | null = null;
 let idleMinutes = 60;
-let recallMode: "hard" | "soft" | "default" = "default"; // persistent until midnight reset
+let recallMode: "hard" | "soft" | "default" = "default";
 
 function recallDepth(): [number, number] {
   if (recallMode === "hard") return [5, 5];
@@ -20,8 +21,9 @@ function recallDepth(): [number, number] {
 const memoryModule: DollyModule = {
   id: "builtin/memory",
 
-  async init(ctx: ModuleContext) {
-    const cfg = (ctx.config as any)["builtin/memory"];
+  async init(c: ModuleContext) {
+    ctx = c;
+    const cfg = (c.config as any)["builtin/memory"];
     client = new LLMClient(cfg ?? { api_key: "", base_url: "https://api.deepseek.com", model: "deepseek-chat" });
     const memPath = resolve(ctx.storagePath, "memory-store");
     if (!existsSync(memPath)) mkdirSync(memPath, { recursive: true });
@@ -39,8 +41,10 @@ hard 深度回忆（5天5段，持续生效直到改变或凌晨重置）
 soft 轻量回忆（1天1段，同上）`;
   },
 
-  async onBlocksChanged(ctx: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
+  async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
+    ctx = c;
     const mutations: BlockMutation[] = [];
+
     // Log all changes
     for (const ch of changes) {
       store.appendLog(ch.type, { type: ch.block.type, content: ch.block.content.slice(0, 200) });
@@ -60,33 +64,38 @@ soft 轻量回忆（1天1段，同上）`;
       }
     }
 
-    // Auto-recall on new message blocks
-    for (const ch of changes) {
-      if (ch.type !== "added" || ch.block.type !== "message") continue;
-      // Allow per-message explicit override
-      const rm = ch.block.content.match(/\{"recall":"(hard|soft)"\}/);
-      const [rd, rs] = rm?.[1] === "hard" ? [5,5] : rm?.[1] === "soft" ? [1,1] : recallDepth();
-      const recalled = store.recall(ch.block.content, rd, rs);
-      for (const r of recalled) {
+    // Collect all new outer blocks (messages), batch recall once
+    const newMessages = changes.filter((ch) => ch.type === "added" && ch.block.type === "outer");
+    if (newMessages.length === 0) { resetTimer(); return mutations; }
+
+    const queryText = newMessages.map((ch) => ch.block.content).join("\n");
+    const rm = queryText.match(/\{"recall":"(hard|soft)"\}/);
+    const [rd, rs] = rm?.[1] === "hard" ? [5,5] : rm?.[1] === "soft" ? [1,1] : recallDepth();
+    const recalled = store.recall(queryText, rd, rs);
+
+    // Inject summaries + segments (deduped, similarity-filtered already by store)
+    for (const r of recalled) {
+      if (r.summary) {
         const summaryKey = `summary:${r.day}`;
-        const hasSummary = ctx.getBlocks().some((b) => b.type === "memory" && b.content.includes(summaryKey));
-        if (!hasSummary && r.summary) {
+        const hasSummary = ctx.getBlocks().some((b) => b.type === "inner" && b.content.includes(summaryKey));
+        if (!hasSummary) {
           mutations.push({
             action: "insert", priority: 85,
-            block: { type: "memory", content: `[记忆 ${r.day} 总结] ${r.summary}`, meta: { source: "memory", notify: false }, created: Date.now() },
+            block: { type: "inner", content: `[记忆 ${r.day}] ${r.summary}`, meta: { source: "memory", subtype: "memory" }, created: Date.now() },
           });
         }
-        for (const seg of r.segments) {
-          const already = ctx.getBlocks().some((b) => b.type === "memory" && b.content.includes(seg.slice(0, 50)));
-          if (!already) {
-            mutations.push({
-              action: "insert", priority: 90,
-              block: { type: "memory", content: `[记忆 ${r.day} 片段] ${seg}`, meta: { source: "memory", notify: false }, created: Date.now() },
-            });
-          }
+      }
+      for (const seg of r.segments) {
+        const already = ctx.getBlocks().some((b) => b.type === "inner" && b.content.includes(seg.slice(0, 50)));
+        if (!already) {
+          mutations.push({
+            action: "insert", priority: 90,
+            block: { type: "inner", content: `[记忆 ${r.day}] ${seg}`, meta: { source: "memory", subtype: "memory" }, created: Date.now() },
+          });
         }
       }
     }
+
     resetTimer();
     return mutations;
   },
@@ -95,7 +104,9 @@ soft 轻量回忆（1天1段，同上）`;
 function resetTimer() {
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = setTimeout(async () => {
-    // Summarization handled internally by store when idle
+    // Incremental summarization during idle
+    const blocks = ctx.getBlocks();
+    await store.summarize(blocks, false);
   }, idleMinutes * 60 * 1000);
 }
 

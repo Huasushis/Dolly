@@ -30,16 +30,17 @@ speak 之外的一切都是你的内心独白——不会被显示。`;
 
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     for (const ch of changes) {
-      if (ch.type === "added" && ch.block.type === "response") {
-        const speaks = parseSpeak(ch.block.content);
-        for (const s of speaks) {
-          speakHistory.push(s);
-          if (speakHistory.length > MAX_HISTORY) speakHistory.shift();
-          c.emit("speak", { text: s }); // broadcast via bus — relay/client handles display
-        }
-        if (storageFile) {
-          try { writeFileSync(storageFile, JSON.stringify({ history: speakHistory })); } catch {}
-        }
+      if (ch.type !== "added") continue;
+      // Only parse inner blocks (LLM responses, etc.)
+      if (ch.block.type !== "inner") continue;
+      const speaks = parseSpeak(ch.block.content);
+      for (const s of speaks) {
+        speakHistory.push(s);
+        if (speakHistory.length > MAX_HISTORY) speakHistory.shift();
+        c.emit("speak", { text: s });
+      }
+      if (storageFile && speaks.length > 0) {
+        try { writeFileSync(storageFile, JSON.stringify({ history: speakHistory })); } catch {}
       }
     }
     return [];
@@ -48,7 +49,6 @@ speak 之外的一切都是你的内心独白——不会被显示。`;
 
 function parseSpeak(text: string): string[] {
   const results: string[] = [];
-  // Match fenced JSON blocks, parse properly to handle escapes
   const re = /```json\s*\n([\s\S]*?)```/g;
   let m;
   while ((m = re.exec(text))) {
@@ -57,7 +57,6 @@ function parseSpeak(text: string): string[] {
       if (obj && typeof obj.speak === "string") results.push(obj.speak);
     } catch {}
   }
-  // Fallback: show non-codeblock text, strip control chars
   if (results.length === 0) {
     const cleaned = text.replace(/```json[\s\S]*?```/g, "").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "").trim();
     if (cleaned) results.push(cleaned);
@@ -66,7 +65,4 @@ function parseSpeak(text: string): string[] {
 }
 
 export function getSpeakHistory(): string[] { return [...speakHistory]; }
-export function replayHistory(): void {
-  if (speakHistory.length > 0) process.stdout.write(speakHistory.join("\n") + "\n");
-}
 export default consoleModule;

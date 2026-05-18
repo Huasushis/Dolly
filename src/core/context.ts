@@ -8,7 +8,6 @@ export interface ContextConfig {
   compression_threshold: number;
   decay_rate?: number;
   protect_window_min?: number;
-  max_background_chars?: number;
 }
 
 const DEFAULT_DECAY = 0.1;       // per hour
@@ -16,7 +15,6 @@ const DEFAULT_PROTECT_MIN = 10;  // minutes
 
 export class ContextManager {
   private systemPrompt = "";
-  private background = "";
   private blocks: Block[] = [];
   private config: ContextConfig;
   private log: LogEntry[] = [];
@@ -34,15 +32,20 @@ export class ContextManager {
     this.systemBlock.content = text;
   }
 
-  getBackground(): string { return this.background; }
-  setBackground(text: string): void { this.background = text; }
-
   addBlock(type: string, content: string, meta: Record<string, unknown> = {}): Block {
     const block = createBlock(type, content, meta);
     this.blocks.push(block);
     this.log.push({ op: "insert", detail: { type, content: content.slice(0, 200) }, time: Date.now() });
     this.changeQueue.push({ type: "added", block });
     return block;
+  }
+
+  /** Restore a block from profile save — preserves original id and created timestamp */
+  restoreBlock(b: { id: string; type: string; content: string; meta: Record<string, unknown>; created: number }): void {
+    const block: Block = { id: b.id, type: b.type, content: b.content, meta: b.meta ?? {}, created: b.created };
+    this.blocks.push(block);
+    this.log.push({ op: "restore", detail: { id: block.id, type: block.type }, time: Date.now() });
+    this.changeQueue.push({ type: "added", block });
   }
 
   removeBlock(id: string): boolean {
@@ -83,7 +86,7 @@ export class ContextManager {
   }
 
   estimateTokens(): number {
-    return Math.ceil((this.systemPrompt.length + this.background.length +
+    return Math.ceil((this.systemPrompt.length +
       this.blocks.reduce((s, b) => s + b.content.length, 0)) / 4);
   }
 

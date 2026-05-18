@@ -4,7 +4,6 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { DollyModule, ModuleContext } from "../../../src/modules/base.js";
 import type { BlockChange, BlockMutation } from "../../../src/blocks/index.js";
-import { setMcpTools } from "../skill/index.js";
 
 interface McpServerConfig { command: string; args: string[]; env?: Record<string, string>; }
 interface ConnInfo { client: Client; transport: StdioClientTransport; tools: Map<string, any>; }
@@ -17,7 +16,6 @@ const mcpModule: DollyModule = {
 
   async init(c: ModuleContext) {
     ctx = c;
-    // Load mcp.json
     const mcpPath = resolve(import.meta.dirname!, "..", "..", "..", "mcp.json");
     if (!existsSync(mcpPath)) return;
 
@@ -37,37 +35,27 @@ const mcpModule: DollyModule = {
     }
 
     // Add available tools to system prompt
-    const allNames: string[] = [];
     const allDesc: string[] = [];
     for (const [, conn] of connections) for (const [t, info] of conn.tools) {
-      allNames.push(t);
       allDesc.push(`  - ${t}: ${(info as any).description || ""}`);
     }
-    if (allNames.length > 0) {
-      const base = `你可以使用 fenced JSON 调用工具（对外交互）：
+    if (allDesc.length > 0) {
+      c.setSystemPrompt(`你可以使用 fenced JSON 调用工具：
 \`\`\`json
 {"tool":"工具名","params":{...}}
 \`\`\`
-需要等待结果时加 "await":true。
-
-MCP 工具输出的内容用完后应及时遗忘。使用 {"forget":"块ID"} 清理不再需要的工具结果。
-
 可用 MCP 工具:
-${allDesc.join("\n")}`;
-      c.setSystemPrompt(base);
+${allDesc.join("\n")}`);
     }
-    setMcpTools(allNames);
   },
 
-  async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
+  async onBlocksChanged(c: ModuleContext, _changes: BlockChange[]): Promise<BlockMutation[]> {
     ctx = c;
     return [];
   },
 };
 
-// Handle tool calls (called from main.ts when tool.call_requested fires)
 export async function handleMcpCall(fullName: string, params: Record<string, unknown>): Promise<string> {
-  // Try server.name format first
   const dot = fullName.indexOf(".");
   if (dot !== -1) {
     const serverName = fullName.slice(0, dot);
@@ -76,7 +64,6 @@ export async function handleMcpCall(fullName: string, params: Record<string, unk
     if (conn) return callTool(conn, toolName, params);
   }
 
-  // Fallback: search all connections for matching tool name
   for (const [serverName, conn] of connections) {
     if (conn.tools.has(`${serverName}.${fullName}`) || conn.tools.has(fullName)) {
       return callTool(conn, fullName.includes(".") ? fullName.split(".").pop()! : fullName, params);
