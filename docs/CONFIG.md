@@ -7,15 +7,13 @@
   "name": "dolly",
   "agent": {
     "name": "Dolly",
-    "persona": "你是 Dolly，一个友好的 AI 助手...",
-    "background": "Dolly 是一个通用可扩展 AI Agent 框架..."
+    "persona": "你是 Dolly，一个友好、好奇的 AI 助手。"
   },
   "context": {
     "max_tokens": 131072,
     "compression_threshold": 0.8,
     "decay_rate": 0.1,
-    "protect_window_min": 10,
-    "max_background_chars": 2000
+    "protect_window_min": 10
   },
   "modules": {
     "enabled": ["builtin/console", "builtin/llm", "builtin/memory", "builtin/skill", "builtin/mcp"],
@@ -31,50 +29,51 @@
       "model": "deepseek-chat",
       "idle_minutes": 60
     },
-    "builtin/skill": { "max_skills": 20 },
-    "builtin/mcp": { "timeout_ms": 30000 }
+    "builtin/skill": {
+      "skills_dirs": ["./skills", "~/.dolly/skills"]
+    },
+    "builtin/mcp": {}
   },
   "daemon": {
-    "pid_dir": ".dolly/daemons",
-    "log_dir": ".dolly/logs"
+    "pid_dir": ".dolly/daemons"
   }
 }
 ```
 
 ### agent
 
-AI 的人设和背景，直接注入 System Prompt。
-
 | 字段 | 说明 |
 |------|------|
 | `name` | Agent 名字 |
-| `persona` | 性格/行为描述 |
-| `background` | 框架背景说明 |
+| `persona` | 性格/行为描述，直接注入 System Prompt |
+
+没有 `background`——background 由 memory extension 每天凌晨从上下文压缩生成，是一个 pinned inner 块。
 
 ### modules
 
-每个模块的配置都在 `modules` 下，键为模块 ID。LLM 配置也在此：
+每个模块的配置在 `modules` 下，键为模块 ID。`api_key_env` 指定的环境变量会被自动解析为 `api_key`。
 
-| 模块 | 配置项 |
-|------|--------|
-| `builtin/llm` | `api_key_env`, `base_url`, `model`, `enable_thinking` |
-| `builtin/memory` | `api_key_env`, `base_url`, `model`, `idle_minutes` |
-| `builtin/skill` | `max_skills` |
-| `builtin/mcp` | `timeout_ms` |
-
-`enable_thinking`（默认 false）：启用后 LLM 可用 `{"thinking":"difficult"}` 进入深度思考，用 `{"thinking":"solved"}` 退出。凌晨 3 点自动关闭防止浪费 reasoning token。
-
-向后兼容：旧的顶层 `llm` 字段仍能工作，会自动迁移到 modules 下。
+| 模块 | 配置项 | 说明 |
+|------|--------|------|
+| `builtin/llm` | `api_key_env`, `base_url`, `model`, `enable_thinking` | 主 LLM 配置 |
+| `builtin/memory` | `api_key_env`, `base_url`, `model`, `idle_minutes` | 记忆总结 LLM + 空闲分钟数 |
+| `builtin/skill` | `skills_dirs` | 额外扫描的 skills 目录列表，`~` 展开为用户目录 |
+| `builtin/mcp` | 无特殊配置 | MCP 服务器列表在 `mcp.json` |
 
 ### context
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `max_tokens` | 32768 | 硬限制，超 95% 强制清除 |
-| `compression_threshold` | 0.8 | 软阈值，超此值触发遗忘 |
+| `compression_threshold` | 0.8 | 软阈值 |
 | `decay_rate` | 0.1 | 默认遗忘速率 /小时 |
 | `protect_window_min` | 10 | 保护窗口（分钟） |
-| `max_background_chars` | 2000 | Background 最大字符数 |
+
+### daemon
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `pid_dir` | `.dolly/daemons` | PID 文件目录 |
 
 ## mcp.json
 
@@ -102,10 +101,15 @@ DEEPSEEK_API_KEY=sk-xxx
 ## CLI
 
 ```bash
-dolly run [--name=xxx]     # 连接实例（自动启动 daemon）
-dolly start [--name=xxx]   # 后台启动 daemon
-dolly stop [--name=xxx]    # 停止 daemon
-dolly status               # 查看状态
+dolly start [--name=xxx]     # 后台启动 daemon
+dolly stop [--name=xxx]      # 停止 daemon
+dolly status                 # 查看状态
+dolly console [--name=xxx]   # 交互式终端
+dolly memory midnight        # 强制执行午夜流水线
+dolly memory recall <q>      # 搜索记忆
+dolly skill reload           # 重载 skills
+dolly skill list             # 列出 skills
+dolly mcp reload             # 重载 MCP 连接
 ```
 
-`dolly run` 不再自己初始化模块，而是自动启动 daemon（如果没在跑）再通过 relay 连接。daemon 持久运行 MCP/LLM/memory，console 只是一个客户端投影。
+向后兼容：旧的顶层 `llm` 字段仍能工作，会自动迁移到 modules 下。
