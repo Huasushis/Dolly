@@ -31,6 +31,10 @@ if (cmd === "serve") {
 if (cmd === "start") { start(instanceName); process.exit(0); }
 if (cmd === "stop") { await stop(instanceName, force); process.exit(0); }
 if (cmd === "status") { status(args.includes("--all") ? undefined : instanceName); process.exit(0); }
+if (cmd === "enable" || cmd === "disable" || cmd === "reload") {
+  await sendCommand("__daemon__", [cmd, ...args.filter(a => !a.startsWith("--"))]);
+  process.exit(0);
+}
 
 // ── Help: show framework commands, plus extension commands if daemon is ready ──
 if (!cmd || cmd === "help" || cmd === "--help") {

@@ -181,6 +181,16 @@ async function main() {
             }
             out += `\n管理命令:\n  /reload                      重载全部扩展\n  /reload --ext=<id>           重载指定扩展\n  /enable <id>                 启用扩展\n  /disable <id>                禁用扩展\n`;
             if (socket) { socket.write(out); socket.end(); }
+          } else if (extArgs[0] === "reload") {
+            if (extArgs[1]) await registry.reload(extArgs[1]);
+            else await registry.reloadAll();
+            if (socket) socket.write(`Reloaded: ${extArgs[1] || "all"}\n`);
+          } else if (extArgs[0] === "enable") {
+            await registry.enable(extArgs[1]);
+            if (socket) socket.write(`Enabled: ${extArgs[1]}\n`);
+          } else if (extArgs[0] === "disable") {
+            registry.disable(extArgs[1]);
+            if (socket) socket.write(`Disabled: ${extArgs[1]}\n`);
           } else if (extArgs[0] === "shutdown") {
             await registry.dispatchStop();
             saveProfile();
