@@ -59,7 +59,7 @@
 | `builtin/memory` | `api_key_env`, `base_url`, `model`, `idle_minutes` | 记忆总结 LLM + 空闲分钟数 |
 | `builtin/skill` | `skills_dirs` | 额外扫描的 skills 目录列表，`~` 展开为用户目录 |
 | `builtin/mcp` | 无特殊配置 | MCP 服务器列表在 `mcp.json` |
-| `builtin/console` | `port` | Web 控制台端口，默认 0（随机）。占用时跳过不报错 |
+| `builtin/console` | `port` | Web 控制台端口，默认 8080。占用时跳过不报错 |
 
 ### context
 
@@ -114,15 +114,19 @@ DEEPSEEK_API_KEY=sk-xxx
 ## CLI
 
 ```bash
-dolly start [--name=xxx]     # 后台启动 daemon
-dolly stop [--name=xxx]      # 停止 daemon
-dolly status                 # 查看状态
-dolly console [--name=xxx]   # 交互式终端
-dolly memory midnight        # 强制执行午夜流水线
-dolly memory recall <q>      # 搜索记忆
-dolly skill reload           # 重载 skills
-dolly skill list             # 列出 skills
-dolly mcp reload             # 重载 MCP 连接
+dolly serve [--config=<p>]          # 前台运行（日志可见）
+dolly start [--config=<p>]          # 后台启动（= serve --daemon）
+dolly stop [--name=xxx] [-f]        # 停止 daemon
+dolly status                        # 查看状态
+dolly console                       # 交互式终端
+dolly memory midnight               # 强制执行午夜流水线
+dolly memory recall <q>             # 搜索记忆
+dolly skill reload                  # 重载 skills
+dolly skill list                    # 列出 skills
+dolly mcp reload                    # 重载 MCP 连接
+dolly enable <ext-id>               # 启用扩展
+dolly disable <ext-id>              # 禁用扩展
+dolly reload [--ext=<id>]           # 重载扩展
 ```
 
 向后兼容：旧的顶层 `llm` 字段仍能工作，会自动迁移到 modules 下。

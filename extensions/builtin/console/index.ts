@@ -94,6 +94,7 @@ speak 之外的一切都是你的内心独白——不会被显示。`;
         speakHistory.push(s);
         if (speakHistory.length > MAX_HISTORY) speakHistory.shift();
         c.emit("speak", { text: s });
+        for (const ws of wsClients) { try { ws.send(JSON.stringify({ type: "speak", text: s })); } catch {} }
       }
       if (storageFile && speaks.length > 0) {
         try { writeFileSync(storageFile, JSON.stringify({ history: speakHistory })); } catch {}

@@ -105,6 +105,7 @@ interface DollyModule {
   onStop?(ctx: ModuleContext): Promise<void>;      // daemon 关闭前调用
   onStart?(ctx: ModuleContext): Promise<void>;     // profile 恢复后调用
   handleCli?(args: string[], ctx: ModuleContext): Promise<void>;  // dolly <ext> <args...>
+  cliInfo?: CliCommand[];                         // 静态 CLI 元数据，用于 `dolly help` 动态生成
 }
 ```
 
