@@ -70,4 +70,11 @@ function parseSpeak(text: string): string[] {
 }
 
 export function getSpeakHistory(): string[] { return [...speakHistory]; }
+
+consoleModule.cliInfo = [
+  { cmd: "console", sub: "", desc: "交互式终端" },
+  { cmd: "console", sub: "history", desc: "显示 speak 历史" },
+  { cmd: "console", sub: "clear", desc: "清除 speak 历史" },
+];
+
 export default consoleModule;

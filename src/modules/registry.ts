@@ -152,6 +152,16 @@ export class ModuleRegistry {
   list(): string[] { return Array.from(this.modules.keys()); }
   has(id: string): boolean { return this.modules.has(id); }
 
+  collectCliInfo(): Array<{ id: string; cmds: import("./base.js").CliCommand[] }> {
+    const result: Array<{ id: string; cmds: import("./base.js").CliCommand[] }> = [];
+    for (const [id, mod] of this.modules) {
+      if (mod.cliInfo && mod.cliInfo.length > 0) {
+        result.push({ id, cmds: mod.cliInfo });
+      }
+    }
+    return result;
+  }
+
   async dispatchStop(): Promise<void> {
     for (const [id, mod] of this.modules) {
       if (mod.onStop) {

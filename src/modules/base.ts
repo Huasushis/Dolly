@@ -1,6 +1,12 @@
 import type { Block, BlockChange, BlockMutation } from "../blocks/index.js";
 import type { LockManager } from "../core/lock.js";
 
+export interface CliCommand {
+  cmd: string;        // top-level command, e.g. "memory"
+  sub: string;        // subcommand, e.g. "recall <query>"
+  desc: string;       // one-line description
+}
+
 export interface ModuleContext {
   getBlocks(): Block[];
   getBlock(id: string): Block | undefined;
@@ -27,4 +33,6 @@ export interface DollyModule {
   onStart?(ctx: ModuleContext): Promise<void>;
   /** Handle CLI command: dolly <extName> <args...> */
   handleCli?(args: string[], ctx: ModuleContext): Promise<void>;
+  /** Static CLI metadata for help generation */
+  cliInfo?: CliCommand[];
 }

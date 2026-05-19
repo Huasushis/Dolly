@@ -133,6 +133,12 @@ function resetTimer() {
 export function getStore() { return store; }
 export function resetRecall() { recallMode = "default"; }
 
+memoryModule.cliInfo = [
+  { cmd: "memory", sub: "midnight", desc: "强制执行午夜总结（总结+background+mskill）" },
+  { cmd: "memory", sub: "recall <query>", desc: "搜索相关记忆片段" },
+  { cmd: "memory", sub: "search <query>", desc: "搜索日总结" },
+];
+
 /** Full midnight pipeline: summarize day → generate background → generate mskills */
 export async function runMidnight(): Promise<BlockMutation[]> {
   const mutations: BlockMutation[] = [];

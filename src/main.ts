@@ -163,14 +163,34 @@ async function main() {
   }
 
   // ── Input handler ──
-  async function handleInput(line: string) {
-    // Try structured JSON command: {"cmd":"ext","args":[...]}
+  async function handleInput(line: string, socket?: any) {
     try {
       const obj = JSON.parse(line);
       if (obj && typeof obj.cmd === "string") {
         const extName = obj.cmd;
         const extArgs: string[] = obj.args ?? [];
-        // Route to extension via relay's response socket (handled per-command)
+        if (extName === "__daemon__") {
+          if (extArgs[0] === "help") {
+            const info = registry.collectCliInfo();
+            let out = "\nExtension 命令:\n";
+            for (const ext of info) {
+              for (const c of ext.cmds) {
+                const sub = c.sub ? ` ${c.sub}` : "";
+                out += `  dolly ${c.cmd}${sub.padEnd(24 - c.cmd.length)}  ${c.desc}\n`;
+              }
+            }
+            out += `\n管理命令:\n  /reload                      重载全部扩展\n  /reload --ext=<id>           重载指定扩展\n  /enable <id>                 启用扩展\n  /disable <id>                禁用扩展\n`;
+            if (socket) { socket.write(out); socket.end(); }
+          } else if (extArgs[0] === "shutdown") {
+            await registry.dispatchStop();
+            saveProfile();
+            cleanupRelay(instanceName);
+            relay.close();
+            clearInterval(midnightTimer);
+            process.exit(0);
+          }
+          return;
+        }
         if (extName === "console") {
           context.addBlock("outer", extArgs.join(" "), { source: "console" });
           await cascade();
@@ -214,7 +234,7 @@ async function main() {
     (async () => {
       for await (const line of rl) {
         if (line.trim() === "/exit") { socket.end(); break; }
-        if (line.trim()) await handleInput(line.trim());
+        if (line.trim()) await handleInput(line.trim(), socket);
       }
     })();
     socket.on("close", () => { clients.delete(socket); rl.close(); });

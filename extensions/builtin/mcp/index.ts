@@ -102,4 +102,10 @@ async function callTool(conn: any, toolName: string, params: Record<string, unkn
   }
 }
 
+mcpModule.cliInfo = [
+  { cmd: "mcp", sub: "reload", desc: "重连所有 MCP server" },
+  { cmd: "mcp", sub: "list", desc: "列出所有 MCP 工具" },
+  { cmd: "mcp", sub: "status", desc: "查看 MCP 连接状态" },
+];
+
 export default mcpModule;

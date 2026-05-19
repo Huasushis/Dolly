@@ -121,4 +121,10 @@ function loadSkills() {
 
 export function clearSeenTriggers() { seenTriggers = new Set(); }
 export function getSkills() { return skills; }
+
+skillModule.cliInfo = [
+  { cmd: "skill", sub: "reload", desc: "重新扫描所有 SKILL.md 目录" },
+  { cmd: "skill", sub: "list", desc: "列出所有已加载 skill" },
+];
+
 export default skillModule;
