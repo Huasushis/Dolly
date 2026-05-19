@@ -11,7 +11,7 @@ import { start, stop, status, isRunning, pidFile } from "./daemon/index.js";
 import { startRelay, cleanupRelay, attachClient, waitForPort } from "./daemon/attach.js";
 import { getSpeakHistory } from "../extensions/builtin/console/index.js";
 import { resetThinking } from "../extensions/builtin/llm/index.js";
-import { resetRecall } from "../extensions/builtin/memory/index.js";
+import { resetRecall, runMidnight } from "../extensions/builtin/memory/index.js";
 import { handleMcpCall } from "../extensions/builtin/mcp/index.js";
 import type { ModuleContext } from "./modules/base.js";
 
@@ -125,13 +125,31 @@ async function main() {
   });
 
   // ── Midnight timer ──
-  let midnightTimer = setInterval(() => {
+  let midnightRan = false;
+  let midnightTimer = setInterval(async () => {
     const h = new Date().getHours(), m = new Date().getMinutes();
-    if (h === 3 && m < 10) { bus.emit("midnight.tick", {}); resetThinking(); resetRecall(); }
+    if (h === 3 && m < 10) {
+      if (midnightRan) return;
+      midnightRan = true;
+      resetThinking();
+      resetRecall();
+      bus.emit("midnight.tick", {});
+      // Run full midnight pipeline: summarize + background + mskill
+      try {
+        const mutations = await runMidnight();
+        if (mutations.length > 0) context.applyMutations(mutations);
+        saveProfile();
+      } catch (e: any) { process.stderr.write(`[midnight] ${e.message}\n`); }
+    }
+    if (h === 3 && m >= 10) midnightRan = false;
   }, 10 * 60 * 1000);
 
   // ── Cascade ──
   async function cascade() {
+    // Pre-cascade: force decay if over hard threshold
+    if (context.estimateTokens() > config.context.max_tokens * 0.95) {
+      context.decayCheck();
+    }
     let changes = context.applyMutations([]);
     for (let i = 0; i < 3; i++) {
       scanForget(changes); // framework scans for forget commands

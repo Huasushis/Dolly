@@ -92,8 +92,8 @@ export class ContextManager {
 
   getLog(): LogEntry[] { return [...this.log]; }
 
-  /** Exponential decay forget */
-  private decayCheck(): void {
+  /** Exponential decay forget — public for pre-cascade check */
+  decayCheck(): void {
     const maxT = this.config.max_tokens;
     const softThreshold = this.config.compression_threshold;
     const hardThreshold = 0.95;
