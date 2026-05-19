@@ -22,6 +22,7 @@ const skillModule: DollyModule = {
     ctx = c;
     const cfg = (c.config as any)["builtin/skill"] ?? {};
     guardClient = new LLMClient(cfg);
+    c.on("midnight.tick", () => { seenTriggers = new Set(); });
     loadSkills();
   },
 
@@ -119,7 +120,6 @@ function loadSkills() {
   }
 }
 
-export function clearSeenTriggers() { seenTriggers = new Set(); }
 export function getSkills() { return skills; }
 
 skillModule.cliInfo = [

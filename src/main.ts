@@ -9,11 +9,7 @@ import { LockManager } from "./core/lock.js";
 import { ModuleRegistry } from "./modules/registry.js";
 import { start, stop, status, isRunning, pidFile } from "./daemon/index.js";
 import { startRelay, cleanupRelay, attachClient, waitForPort } from "./daemon/attach.js";
-import { getSpeakHistory } from "../extensions/builtin/console/index.js";
-import { resetThinking } from "../extensions/builtin/llm/index.js";
-import { resetRecall, runMidnight } from "../extensions/builtin/memory/index.js";
-import { clearSeenTriggers } from "../extensions/builtin/skill/index.js";
-import { handleMcpCall } from "../extensions/builtin/mcp/index.js";
+// All extension interaction via EventBus — no direct imports from builtin/
 import type { ModuleContext } from "./modules/base.js";
 
 const L = { mcp: (s: string) => process.stderr.write(`\x1b[33m  ⚡\x1b[0m ${s}\n`) };
@@ -63,6 +59,7 @@ async function main() {
     estimateTokens: () => context.estimateTokens(),
     config: config.modules,
     emit: (event, payload) => bus.emit(event, payload),
+    on: (event, handler) => bus.on(event, handler),
     lock,
     setSystemPrompt: (_text) => {},
     storagePath: profileDir,
@@ -111,39 +108,34 @@ async function main() {
     context.removeBlock(block.id); // log only, not context
   });
 
-  // ── Bus: tool calls ──
-  bus.on("tool.call_requested", async (p: any) => {
+  // ── Bus: tool calls → forward to mcp extension ──
+  bus.on("tool.call_requested", (p: any) => {
     L.mcp(p.tool_name);
-    const unlock = await lock.acquire("mcp", 0);
-    try {
-      let result: unknown;
-      try { result = await handleMcpCall(p.tool_name.startsWith("mcp.") ? p.tool_name.slice(4) : p.tool_name, p.params); }
-      catch { result = { error: `unknown tool: ${p.tool_name}` }; }
-      context.addBlock("outer", JSON.stringify(result), { source: "mcp", subtype: "tool_result", tool: p.tool_name, decay_rate: 0.5 });
-    } finally { unlock(); }
+    bus.emit("tool.execute", p);
+  });
+  bus.on("tool.result", async (p: any) => {
+    context.addBlock("outer", JSON.stringify(p.result), { source: "mcp", subtype: "tool_result", tool: p.tool_name, decay_rate: 0.5 });
     await cascade();
   });
 
-  // ── Midnight timer ──
+  // ── Midnight timer: emit event, each extension handles itself ──
   let midnightRan = false;
-  let midnightTimer = setInterval(async () => {
+  let midnightTimer = setInterval(() => {
     const h = new Date().getHours(), m = new Date().getMinutes();
     if (h === 3 && m < 10) {
       if (midnightRan) return;
       midnightRan = true;
-      resetThinking();
-      resetRecall();
-      clearSeenTriggers();
       bus.emit("midnight.tick", {});
-      // Run full midnight pipeline: summarize + background + mskill
-      try {
-        const mutations = await runMidnight();
-        if (mutations.length > 0) context.applyMutations(mutations);
-        saveProfile();
-      } catch (e: any) { process.stderr.write(`[midnight] ${e.message}\n`); }
     }
     if (h === 3 && m >= 10) midnightRan = false;
   }, 10 * 60 * 1000);
+
+  bus.on("midnight.mutations", (p: any) => {
+    if (p.mutations.length > 0) {
+      context.applyMutations(p.mutations);
+      saveProfile();
+    }
+  });
 
   // ── Cascade ──
   async function cascade() {
@@ -245,7 +237,7 @@ async function main() {
 
   const relay = startRelay(instanceName, (socket) => {
     clients.add(socket);
-    for (const line of getSpeakHistory()) socket.write(line + "\n");
+    bus.emit("client.connected", { socket });
     const rl = createInterface({ input: socket, output: socket });
     (async () => {
       for await (const line of rl) {

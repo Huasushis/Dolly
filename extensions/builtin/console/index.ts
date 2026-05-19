@@ -24,6 +24,11 @@ const consoleModule: DollyModule = {
       } catch {}
     }
 
+    // Send speak history to new relay clients
+    ctx.on("client.connected", (p: any) => {
+      for (const line of speakHistory) { try { p.socket.write(line + "\n"); } catch {} }
+    });
+
     // Start HTTP + WebSocket server
     const port = (ctx.config as any)["builtin/console"]?.port ?? 8080;
     try {
@@ -120,8 +125,6 @@ function parseSpeak(text: string): string[] {
   }
   return results;
 }
-
-export function getSpeakHistory(): string[] { return [...speakHistory]; }
 
 consoleModule.cliInfo = [
   { cmd: "console", sub: "", desc: "交互式终端" },

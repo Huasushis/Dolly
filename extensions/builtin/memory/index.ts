@@ -29,6 +29,11 @@ const memoryModule: DollyModule = {
     if (!existsSync(memPath)) mkdirSync(memPath, { recursive: true });
     store = new MemoryStore(memPath, client);
     idleMinutes = cfg?.idle_minutes ?? 60;
+    c.on("midnight.tick", async () => {
+      recallMode = "default";
+      const mutations = await _runMidnight();
+      if (mutations.length > 0) c.emit("midnight.mutations", { mutations });
+    });
     resetTimer();
   },
 
@@ -131,7 +136,6 @@ function resetTimer() {
 }
 
 export function getStore() { return store; }
-export function resetRecall() { recallMode = "default"; }
 
 memoryModule.cliInfo = [
   { cmd: "memory", sub: "midnight", desc: "强制执行午夜总结（总结+background+mskill）" },
@@ -140,7 +144,7 @@ memoryModule.cliInfo = [
 ];
 
 /** Full midnight pipeline: summarize day → generate background → generate mskills */
-export async function runMidnight(): Promise<BlockMutation[]> {
+async function _runMidnight(): Promise<BlockMutation[]> {
   const mutations: BlockMutation[] = [];
   const blocks = ctx.getBlocks();
 

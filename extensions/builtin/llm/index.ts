@@ -30,6 +30,7 @@ const llmModule: DollyModule = {
     const cfg = (c.config as any)["builtin/llm"];
     client = new LLMClient(cfg ?? { api_key: "", base_url: "https://api.deepseek.com", model: "deepseek-chat" });
     thinkingEnabled = cfg?.enable_thinking ?? false;
+    c.on("midnight.tick", () => { thinkingActive = false; respondedTo = new Set(); });
   },
 
   systemPrompt(): string {
@@ -150,5 +151,4 @@ const llmModule: DollyModule = {
   },
 };
 
-export function resetThinking() { thinkingActive = false; respondedTo = new Set(); }
 export default llmModule;

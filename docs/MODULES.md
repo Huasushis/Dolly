@@ -86,6 +86,7 @@ interface ModuleContext {
   estimateTokens(): number;                       // 粗略 token 估算
   config: Record<string, unknown>;                // dolly.json modules.<id> 已解析配置
   emit(event: string, payload: unknown): void;    // 发事件到 EventBus
+  on(event: string, handler: (payload: any) => void): void;  // 订阅 EventBus 事件
   lock: LockManager;                              // 优先级 async 互斥锁
   setSystemPrompt(text: string): void;            // 设置自己的 System Prompt 片段
   storagePath: string;                            // profiles/<name>/exts/<id>/ 的路径

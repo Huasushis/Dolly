@@ -13,6 +13,7 @@ export interface ModuleContext {
   estimateTokens(): number;
   config: Record<string, unknown>;
   emit(event: string, payload: unknown): void;
+  on(event: string, handler: (payload: any) => void): void;
   lock: LockManager;
   storagePath: string;
   setSystemPrompt(text: string): void;

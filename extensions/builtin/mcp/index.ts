@@ -34,6 +34,16 @@ const mcpModule: DollyModule = {
       }
     }
 
+    // Listen for tool execution requests
+    c.on("tool.execute", async (p: any) => {
+      let result: unknown;
+      try {
+        const fullName = p.tool_name.startsWith("mcp.") ? p.tool_name.slice(4) : p.tool_name;
+        result = await handleMcpCall(fullName, p.params);
+      } catch { result = { error: `unknown tool: ${p.tool_name}` }; }
+      c.emit("tool.result", { result, tool_name: p.tool_name });
+    });
+
     // Add available tools to system prompt
     const allDesc: string[] = [];
     for (const [, conn] of connections) for (const [t, info] of conn.tools) {
@@ -74,7 +84,7 @@ ${allDesc.join("\n")}`);
   },
 };
 
-export async function handleMcpCall(fullName: string, params: Record<string, unknown>): Promise<string> {
+async function handleMcpCall(fullName: string, params: Record<string, unknown>): Promise<string> {
   const dot = fullName.indexOf(".");
   if (dot !== -1) {
     const serverName = fullName.slice(0, dot);
