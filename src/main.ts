@@ -216,7 +216,6 @@ async function main() {
         if (line.trim() === "/exit") { socket.end(); break; }
         if (line.trim()) await handleInput(line.trim());
       }
-      socket.end();
     })();
     socket.on("close", () => { clients.delete(socket); rl.close(); });
   });

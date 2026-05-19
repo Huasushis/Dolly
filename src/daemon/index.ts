@@ -23,7 +23,7 @@ export function start(name = "default"): void {
     try { process.kill(pid, 0); return; } catch {} // already running
     unlinkSync(pf); // stale PID
   }
-  const child = spawn("node", ["--import", "tsx", "src/main.ts", "--daemon", `--name=${name}`], {
+  const child = spawn("node", ["--import", "tsx/esm", "src/main.ts", "--daemon", `--name=${name}`], {
     cwd: resolve(import.meta.dirname!, "..", ".."),
     detached: true, stdio: ["ignore", "ignore", "pipe"],
   });

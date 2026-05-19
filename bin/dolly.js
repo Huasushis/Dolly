@@ -2,7 +2,11 @@
 import { start, stop, status, isRunning } from "../src/daemon/index.js";
 import { waitForPort } from "../src/daemon/attach.js";
 import { connect } from "net";
+import { readFileSync } from "fs";
+import { resolve, dirname } from "path";
+import { fileURLToPath } from "url";
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const cmd = process.argv[2];
 const args = process.argv.slice(3);
 const nameArg = args.find((a) => a.startsWith("--name="));
@@ -37,31 +41,27 @@ if (cmd === "stop") { stop(instanceName, force); process.exit(0); }
 if (cmd === "status") { status(args.includes("--all") ? undefined : instanceName); process.exit(0); }
 
 // ── Extension commands: connect to daemon ──
-async function sendCommand(extName: string, extArgs: string[]) {
+async function sendCommand(extName, extArgs) {
   if (!isRunning(instanceName)) {
     process.stderr.write(`Starting daemon for "${instanceName}"...\n`);
     start(instanceName);
     await waitForPort(instanceName);
   }
-  return new Promise<void>((resolve, reject) => {
-    const { readFileSync } = require("fs");
-    const port = parseInt(readFileSync(`.dolly/sockets/${instanceName}.port`, "utf-8"));
+  const socketPath = resolve(__dirname, "..", ".dolly", "sockets", `${instanceName}.port`);
+  const port = parseInt(readFileSync(socketPath, "utf-8"));
+  return new Promise((resolve, reject) => {
     const socket = connect(port, "127.0.0.1", () => {
-      // Send structured command
-      socket.write(JSON.stringify({ cmd: extName, args: extArgs }) + "\n");
-      // For interactive console: pipe stdin/stdout
       if (extName === "console") {
         process.stdin.on("data", (d) => socket.write(d));
-        process.stdin.on("end", () => socket.end());
-        socket.pipe(process.stdout);
-        socket.on("close", () => process.exit(0));
+        let idle;
+        socket.on("data", (d) => { process.stdout.write(d); clearTimeout(idle); idle = setTimeout(() => resolve(undefined), 2000); });
+        socket.on("close", () => resolve(undefined));
       } else {
-        // One-shot: read response and exit
+        socket.write(JSON.stringify({ cmd: extName, args: extArgs }) + "\n");
         let buf = "";
         socket.on("data", (d) => { buf += d; });
-        socket.on("close", () => { if (buf.trim()) process.stdout.write(buf); process.exit(0); });
-        // Timeout after 30s
-        setTimeout(() => { if (buf.trim()) process.stdout.write(buf); process.exit(0); }, 30000);
+        socket.on("close", () => { if (buf.trim()) process.stdout.write(buf); resolve(undefined); });
+        setTimeout(() => { if (buf.trim()) process.stdout.write(buf); resolve(undefined); }, 30000);
       }
     });
     socket.on("error", reject);
