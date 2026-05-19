@@ -63,7 +63,6 @@ async function main() {
     estimateTokens: () => context.estimateTokens(),
     config: config.modules,
     emit: (event, payload) => bus.emit(event, payload),
-    log: (_op, _detail) => {},
     lock,
     setSystemPrompt: (_text) => {},
     storagePath: profileDir,
