@@ -214,6 +214,22 @@ Extension 在一次 `onBlocksChanged` 调用中应一次性处理所有未处理
 | `reasoning.captured` | llm | main.ts | `{ content: string }` |
 | `midnight.tick` | main.ts timer | memory | `{}` |
 
+## 通信模式
+
+Extension 与框架/其他 Extension 通信有四种方式：
+
+| 方式 | 方向 | 机制 | 示例 |
+|------|------|------|------|
+| **Cascade + Mutations** | Ext → Context | `onBlocksChanged` 返回 `BlockMutation[]`，框架 apply 后产生新一轮 BlockChange | skill 注入指令块、memory 注入记忆块、llm 生成 response |
+| **EventBus emit/on** | Ext ↔ Ext/Daemon | `ctx.emit(event, payload)` 发事件，`bus.on(event, handler)` 收事件 | console emit `"speak"`、main.ts 广播到 relay |
+| **handleCli** | CLI → Ext | `dolly <ext> <args>` → TCP relay → `handleCli(args, ctx)` | `dolly memory midnight`、`dolly skill reload` |
+| **直接 addBlock** | Ext → Context | 任意时机调用 `ctx.addBlock()` + 触发 cascade（定时器、webhook、监听器） | 聊天监听器收到新消息 |
+
+**Extension 生命周期**：
+```
+init() → [onStart() → 每次cascade: onBlocksChanged() → CLI: handleCli()] → onStop()
+```
+
 ## CLI 命令
 
 框架原生命令：`dolly start/stop/status`。

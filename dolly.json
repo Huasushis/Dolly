@@ -27,6 +27,7 @@
     "builtin/skill": {
       "skills_dirs": ["./skills", "~/.dolly/skills"]
     },
+    "builtin/console": { "port": 8080 },
     "builtin/mcp": {}
   },
   "daemon": {

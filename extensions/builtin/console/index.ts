@@ -1,11 +1,16 @@
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { resolve } from "path";
+import { createServer, Server } from "http";
+import { WebSocketServer, WebSocket } from "ws";
 import type { DollyModule, ModuleContext } from "../../../src/modules/base.js";
 import type { BlockChange, BlockMutation } from "../../../src/blocks/index.js";
 
 const speakHistory: string[] = [];
 const MAX_HISTORY = 200;
 let storageFile = "";
+let httpServer: Server | null = null;
+let wss: WebSocketServer | null = null;
+const wsClients = new Set<WebSocket>();
 
 const consoleModule: DollyModule = {
   id: "builtin/console",
@@ -17,6 +22,52 @@ const consoleModule: DollyModule = {
         const saved = JSON.parse(readFileSync(storageFile, "utf-8"));
         for (const s of (saved.history ?? [])) speakHistory.push(s);
       } catch {}
+    }
+
+    // Start HTTP + WebSocket server
+    const port = (ctx.config as any)["builtin/console"]?.port ?? 8080;
+    try {
+      const htmlPath = resolve(import.meta.dirname!, "web", "index.html");
+      const html = existsSync(htmlPath) ? readFileSync(htmlPath, "utf-8") : "<h1>Dolly Console</h1>";
+
+      httpServer = createServer((_req, res) => {
+        const url = _req.url || "/";
+        if (url === "/history") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ history: speakHistory }));
+        } else {
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(html);
+        }
+      });
+
+      wss = new WebSocketServer({ server: httpServer });
+      wss.on("connection", (ws) => {
+        wsClients.add(ws);
+        ws.send(JSON.stringify({ type: "status", text: "connected" }));
+        ws.on("message", (data) => {
+          try {
+            const obj = JSON.parse(data.toString());
+            if (obj.type === "input" && obj.text) {
+              ctx.emit("console.input", { text: obj.text });
+            }
+          } catch {}
+        });
+        ws.on("close", () => wsClients.delete(ws));
+      });
+
+      httpServer.listen(port, "0.0.0.0", () => {
+        process.stderr.write(`[console] Web UI: http://localhost:${(httpServer!.address() as any)?.port ?? port}\n`);
+      });
+      httpServer.on("error", (err: any) => {
+        if (err.code === "EADDRINUSE") {
+          process.stderr.write(`[console] port ${port} busy, HTTP server skipped\n`);
+          httpServer = null;
+          wss = null;
+        }
+      });
+    } catch (err: any) {
+      process.stderr.write(`[console] HTTP server: ${err.message}\n`);
     }
   },
 

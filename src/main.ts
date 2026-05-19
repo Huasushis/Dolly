@@ -230,6 +230,12 @@ async function main() {
 
   writeFileSync(pidFile(instanceName), String(process.pid));
 
+  // ── Bus: console input from Web UI ──
+  bus.on("console.input", async (p: any) => {
+    context.addBlock("outer", p.text, { source: "console" });
+    await cascade();
+  });
+
   // ── Relay + speak broadcast ──
   const clients = new Set<any>();
   bus.on("speak", (p: any) => {

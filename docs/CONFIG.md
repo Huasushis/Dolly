@@ -59,6 +59,7 @@
 | `builtin/memory` | `api_key_env`, `base_url`, `model`, `idle_minutes` | 记忆总结 LLM + 空闲分钟数 |
 | `builtin/skill` | `skills_dirs` | 额外扫描的 skills 目录列表，`~` 展开为用户目录 |
 | `builtin/mcp` | 无特殊配置 | MCP 服务器列表在 `mcp.json` |
+| `builtin/console` | `port` | Web 控制台端口，默认 0（随机）。占用时跳过不报错 |
 
 ### context
 
@@ -74,6 +75,18 @@
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `pid_dir` | `.dolly/daemons` | PID 文件目录 |
+
+## 配置生命周期
+
+| 配置项 | 生效时机 | 说明 |
+|--------|----------|------|
+| `agent.persona` | 首次启动 + 每次 `dolly serve` | 注入 system prompt。profile 恢复后 blocks 保留，persona 从 dolly.json 重新读取 |
+| `context.*` | 每次启动 | 传给 ContextManager |
+| `modules.enabled` | 每次启动 | 决定加载哪些 extension。运行时 enable/disable 只改内存，不写回 dolly.json |
+| `modules.<id>.*` | extension init 时 | 每个 extension 启动时读取自己的配置段 |
+| `daemon.pid_dir` | 每次 start/stop | PID 文件目录 |
+
+**规则**：stop 保存 context blocks 到 profile。start 时恢复 blocks + 从 dolly.json 重新读取所有配置。只有 blocks 在 stop/start 间持久化。
 
 ## mcp.json
 

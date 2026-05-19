@@ -35,19 +35,27 @@ node --import tsx/esm bin/dolly.js console
 
 ```bash
 # 框架命令
-node --import tsx/esm bin/dolly.js start       # 后台启动 daemon
-node --import tsx/esm bin/dolly.js stop        # 停止 daemon
-node --import tsx/esm bin/dolly.js status      # 查看状态
+dolly serve                        # 前台运行（日志可见）
+dolly serve --daemon               # 后台启动 daemon
+dolly start                        # = serve --daemon
+dolly stop [-f]                    # 停止 daemon
+dolly status                       # 查看状态
+dolly help                         # 动态帮助（含 extension 命令）
 
-# Extension 命令
-node --import tsx/esm bin/dolly.js console       # 交互式终端
-node --import tsx/esm bin/dolly.js memory midnight  # 强制执行午夜总结
-node --import tsx/esm bin/dolly.js memory recall <q> # 搜索记忆
-node --import tsx/esm bin/dolly.js skill reload   # 重载 skills
-node --import tsx/esm bin/dolly.js mcp reload     # 重载 MCP 连接
+# Extension 命令（连 daemon，自动启动）
+dolly console                      # 交互式终端 + Web UI (http://localhost:8080)
+dolly console history              # 查看 speak 历史
+dolly memory midnight             # 强制执行午夜总结
+dolly memory recall <q>           # 搜索记忆
+dolly skill reload                # 重载 skills
+dolly skill list                  # 列出 skills
+dolly mcp reload                  # 重连 MCP
+dolly enable <ext-id>             # 启用扩展
+dolly disable <ext-id>            # 禁用扩展
+dolly reload [--ext=<id>]         # 重载扩展
 ```
 
-所有命令支持 `--name=xxx` 多开。
+所有命令支持 `--name=xxx`、`--config=<path>`。
 
 ## 项目结构
 
