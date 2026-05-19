@@ -36,7 +36,7 @@ const help = () => {
 if (!cmd || cmd === "help" || cmd === "--help") help();
 
 // ── Framework-native commands ──
-if (cmd === "start") { start(instanceName); process.exit(0); }
+if (cmd === "start") { start(instanceName); await waitForPort(instanceName); process.exit(0); }
 if (cmd === "stop") { stop(instanceName, force); process.exit(0); }
 if (cmd === "status") { status(args.includes("--all") ? undefined : instanceName); process.exit(0); }
 

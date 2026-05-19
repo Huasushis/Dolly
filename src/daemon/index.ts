@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync } from "fs";
 import { resolve } from "path";
+
 import { spawn } from "child_process";
 
 const PID_DIR = resolve(import.meta.dirname!, "..", "..", ".dolly", "daemons");
@@ -20,12 +21,14 @@ export function start(name = "default"): void {
   const pf = pidFile(name);
   if (existsSync(pf)) {
     const pid = parseInt(readFileSync(pf, "utf-8"));
-    try { process.kill(pid, 0); return; } catch {} // already running
-    unlinkSync(pf); // stale PID
+    try { process.kill(pid, 0); return; } catch {}
+    unlinkSync(pf);
   }
-  const child = spawn("node", ["--import", "tsx/esm", "src/main.ts", "--daemon", `--name=${name}`], {
+  const child = spawn(process.execPath, ["--import", "tsx/esm", "src/main.ts", "--daemon", `--name=${name}`], {
     cwd: resolve(import.meta.dirname!, "..", ".."),
-    detached: true, stdio: ["ignore", "ignore", "pipe"],
+    detached: true,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
   });
   child.stderr?.on("data", (d) => process.stderr.write(`[daemon] ${d}`));
   writeFileSync(pf, String(child.pid!));
