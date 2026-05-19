@@ -12,6 +12,7 @@ import { startRelay, cleanupRelay, attachClient, waitForPort } from "./daemon/at
 import { getSpeakHistory } from "../extensions/builtin/console/index.js";
 import { resetThinking } from "../extensions/builtin/llm/index.js";
 import { resetRecall, runMidnight } from "../extensions/builtin/memory/index.js";
+import { clearSeenTriggers } from "../extensions/builtin/skill/index.js";
 import { handleMcpCall } from "../extensions/builtin/mcp/index.js";
 import type { ModuleContext } from "./modules/base.js";
 
@@ -133,6 +134,7 @@ async function main() {
       midnightRan = true;
       resetThinking();
       resetRecall();
+      clearSeenTriggers();
       bus.emit("midnight.tick", {});
       // Run full midnight pipeline: summarize + background + mskill
       try {

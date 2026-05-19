@@ -49,6 +49,25 @@ ${allDesc.join("\n")}`);
     }
   },
 
+  async handleCli(args: string[], _c: ModuleContext) {
+    if (args[0] === "reload") {
+      // Close and reconnect all
+      for (const [name, conn] of connections) {
+        try { await conn.transport.close(); } catch {}
+      }
+      connections.clear();
+      if (mcpModule.init) await mcpModule.init(_c);
+      process.stdout.write(`${connections.size} MCP servers reconnected\n`);
+    } else if (args[0] === "list") {
+      for (const [name, conn] of connections) {
+        for (const [t] of conn.tools) process.stdout.write(`${t}\n`);
+      }
+    } else if (args[0] === "status") {
+      process.stdout.write(`${connections.size} MCP servers connected\n`);
+      for (const [name] of connections) process.stdout.write(`  ${name}\n`);
+    }
+  },
+
   async onBlocksChanged(c: ModuleContext, _changes: BlockChange[]): Promise<BlockMutation[]> {
     ctx = c;
     return [];
