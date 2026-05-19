@@ -16,8 +16,20 @@ const configArg = args.find((a) => a.startsWith("--config="));
 const configPath = configArg ? configArg.split("=")[1] : "./dolly.json";
 
 // ── Framework-native commands ──
+const isDaemon = args.includes("--daemon");
+process.env.DOLLY_CONFIG = configPath;
+
+if (cmd === "serve") {
+  if (isDaemon) {
+    start(instanceName);
+    await waitForPort(instanceName);
+    process.exit(0);
+  }
+  // Foreground: import main.ts directly
+  await import("../src/main.ts");
+}
 if (cmd === "start") { start(instanceName); process.exit(0); }
-if (cmd === "stop") { stop(instanceName, force); process.exit(0); }
+if (cmd === "stop") { await stop(instanceName, force); process.exit(0); }
 if (cmd === "status") { status(args.includes("--all") ? undefined : instanceName); process.exit(0); }
 
 // ── Help: show framework commands, plus extension commands if daemon is ready ──

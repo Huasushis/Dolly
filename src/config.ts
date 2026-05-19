@@ -13,8 +13,10 @@ export interface DollyConfig {
 }
 
 export function loadConfig(): DollyConfig {
-  const configPath = resolve(import.meta.dirname!, "..", "dolly.json");
-  if (!existsSync(configPath)) throw new Error(`dolly.json not found at ${configPath}`);
+  const configPath = process.env.DOLLY_CONFIG
+    ? resolve(process.env.DOLLY_CONFIG)
+    : resolve(import.meta.dirname!, "..", "dolly.json");
+  if (!existsSync(configPath)) throw new Error(`Config not found: ${configPath}`);
 
   const raw = JSON.parse(readFileSync(configPath, "utf-8"));
   const envKey = (key: string) => process.env[key] ?? "";

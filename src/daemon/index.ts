@@ -35,13 +35,32 @@ export function start(name = "default"): void {
   child.unref();
 }
 
-export function stop(name = "default", force = false): void {
+export async function stop(name = "default", force = false): Promise<void> {
   ensureDir();
   const pf = pidFile(name);
   if (!existsSync(pf)) return;
   const pid = parseInt(readFileSync(pf, "utf-8"));
-  try { process.kill(pid, force ? "SIGKILL" : "SIGTERM"); unlinkSync(pf); }
-  catch { unlinkSync(pf); }
+  if (force) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+    unlinkSync(pf);
+    return;
+  }
+  // Graceful: send shutdown via TCP relay (cross-platform, no SIGTERM issues)
+  try {
+    const portPath = resolve(PID_DIR, "..", "sockets", `${name}.port`);
+    if (existsSync(portPath)) {
+      const port = parseInt(readFileSync(portPath, "utf-8"));
+      const { connect } = await import("net");
+      await new Promise<void>((resolve) => {
+        const s = connect(port, "127.0.0.1", () => {
+          s.write(JSON.stringify({ cmd: "__daemon__", args: ["shutdown"] }) + "\n");
+          setTimeout(() => { s.destroy(); resolve(); }, 3000);
+        });
+        s.on("error", () => { try { process.kill(pid, "SIGKILL"); } catch {}; unlinkSync(pf); resolve(); });
+      });
+    }
+  } catch {}
+  unlinkSync(pf);
 }
 
 export function status(name?: string): void {
