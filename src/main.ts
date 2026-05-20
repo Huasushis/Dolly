@@ -74,9 +74,9 @@ async function main() {
   await registry.loadFromConfig(config.modules.enabled);
 
   // System prompt: persona + module prompts, no static background
-  const persona = (config as any).agent?.persona ?? "";
+  const persona = config.agent?.persona ?? "";
   // Logging: tee to stderr + file
-  const logLevel = (config as any).log_level ?? "info";
+  const logLevel = config.log_level ?? "info";
   const logFile = pathResolve(profileDir, "dolly.log");
   function dlog(msg: string) {
     const line = `[${new Date().toISOString().slice(11,19)}] ${msg}\n`;

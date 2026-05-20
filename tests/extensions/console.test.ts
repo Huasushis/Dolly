@@ -13,6 +13,13 @@ function parseSpeak(text: string): string[] {
     } catch {}
   }
   if (results.length === 0) {
+    const jsonRe = /\{"speak"\s*:\s*"((?:[^"\\]|\\.)*)"\}/g;
+    let jm;
+    while ((jm = jsonRe.exec(text))) {
+      try { results.push(JSON.parse(`{"speak":"${jm[1]}"}`).speak); } catch {}
+    }
+  }
+  if (results.length === 0) {
     const cleaned = text.replace(/```json[\s\S]*?```/g, "").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "").trim();
     if (cleaned) results.push(cleaned);
   }
@@ -57,11 +64,16 @@ describe("Console speak parsing", () => {
       assert.deepEqual(result, ["helloworldrest"]);
     });
 
-    it("multi-speak in single block: only first speak extracted (JSON limitation)", () => {
-      // JSON only allows one "speak" key; last one wins in JSON.parse
-      const text = '```json\n{"speak":"a"}\n```';
+    it("extracts raw JSON speak without fenced code block", () => {
+      const text = '{"speak":"你好"}';
       const result = parseSpeak(text);
-      assert.deepEqual(result, ["a"]);
+      assert.deepEqual(result, ["你好"]);
+    });
+
+    it("extracts multiple raw JSON speaks from text", () => {
+      const text = '{"speak":"第一句"} some text {"speak":"第二句"}';
+      const result = parseSpeak(text);
+      assert.deepEqual(result, ["第一句", "第二句"]);
     });
   });
 });

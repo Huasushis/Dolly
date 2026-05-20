@@ -134,6 +134,7 @@ speak 之外的一切都是你的内心独白——不会被显示。`;
 
 function parseSpeak(text: string): string[] {
   const results: string[] = [];
+  // Primary: fenced JSON ```json\n{"speak":"..."}\n```
   const re = /```json\s*\n([\s\S]*?)```/g;
   let m;
   while ((m = re.exec(text))) {
@@ -142,6 +143,15 @@ function parseSpeak(text: string): string[] {
       if (obj && typeof obj.speak === "string") results.push(obj.speak);
     } catch {}
   }
+  // Fallback: raw JSON {"speak":"..."} without fenced block (LLM sometimes skips fences)
+  if (results.length === 0) {
+    const jsonRe = /\{"speak"\s*:\s*"((?:[^"\\]|\\.)*)"\}/g;
+    let jm;
+    while ((jm = jsonRe.exec(text))) {
+      try { results.push(JSON.parse(`{"speak":"${jm[1]}"}`).speak); } catch {}
+    }
+  }
+  // Last resort: strip code blocks and return remaining text
   if (results.length === 0) {
     const cleaned = text.replace(/```json[\s\S]*?```/g, "").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "").trim();
     if (cleaned) results.push(cleaned);

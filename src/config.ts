@@ -7,6 +7,8 @@ export interface LLMConfig {
 
 export interface DollyConfig {
   name: string;
+  log_level?: string;
+  agent?: { name?: string; persona?: string };
   context: { max_tokens: number; compression_threshold: number; decay_rate?: number; protect_window_min?: number };
   modules: { enabled: string[]; [name: string]: any };
   daemon: { pid_dir: string };
@@ -52,6 +54,8 @@ export function loadConfig(): DollyConfig {
 
   return {
     name: raw.name ?? "dolly",
+    log_level: raw.log_level ?? "info",
+    agent: raw.agent,
     context: {
       max_tokens: raw.context?.max_tokens ?? 32768,
       compression_threshold: raw.context?.compression_threshold ?? 0.8,

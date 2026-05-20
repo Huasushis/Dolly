@@ -100,7 +100,7 @@ const llmModule: DollyModule = {
     ).join("\n\n");
 
     const sysPrompt = sysBlock?.content ?? "";
-    const userPrompt = `上下文：\n${serialized}\n\n需要工具时输出 fenced JSON：\n\`\`\`json\n{"tool":"name","params":{}}\n\`\`\``;
+    const userPrompt = `上下文：\n${serialized}`;
 
     const mutations: BlockMutation[] = [];
 
