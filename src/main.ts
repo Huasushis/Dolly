@@ -1,7 +1,7 @@
 import { config as loadEnv } from "dotenv"; loadEnv();
 import { createInterface } from "readline";
 import { resolve as pathResolve } from "path";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, appendFileSync } from "fs";
 import { loadConfig } from "./config.js";
 import { ContextManager } from "./core/context.js";
 import { EventBus } from "./core/bus.js";
@@ -75,9 +75,20 @@ async function main() {
 
   // System prompt: persona + module prompts, no static background
   const persona = (config as any).agent?.persona ?? "";
+  // Logging: tee to stderr + file
+  const logLevel = (config as any).log_level ?? "info";
+  const logFile = pathResolve(profileDir, "dolly.log");
+  function dlog(msg: string) {
+    const line = `[${new Date().toISOString().slice(11,19)}] ${msg}\n`;
+    process.stderr.write(line);
+    try { appendFileSync(logFile, line); } catch {}
+  }
+  if (logLevel === "debug") dlog(`Config: ${process.env.DOLLY_CONFIG ?? "dolly.json"}`);
+
   const sysPrompt = [persona, registry.buildSystemPrompt()].filter(Boolean).join("\n\n");
   context.setSystemPrompt(sysPrompt);
-  if (isForeground) process.stderr.write(`[system] Prompt (${sysPrompt.length} chars)\n`);
+  if (logLevel === "debug") dlog(`System Prompt:\n${sysPrompt}`);
+  else dlog(`System prompt loaded (${sysPrompt.length} chars)`);
 
   // Profile restore (preserving original block identity)
   const profileFile = pathResolve(profileDir, "context.json");
@@ -262,6 +273,7 @@ async function main() {
     await registry.dispatchStop();
     saveProfile();
     cleanupRelay(instanceName);
+    try { unlinkSync(pidFile(instanceName)); } catch {}
     relay.close();
     clearInterval(midnightTimer);
     process.exit(0);

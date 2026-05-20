@@ -96,7 +96,7 @@ const llmModule: DollyModule = {
       `[ID:${b.id}][TYPE:${b.type}/${b.meta?.subtype ?? b.type}][TIME:${Math.floor(b.created / 1000)}]\n${b.content}`
     ).join("\n\n");
 
-    const sysPrompt = `你是 Dolly 框架中的 AI 助手。\n\n上下文：\n${serialized}\n\n需要工具时输出 fenced JSON：\n\`\`\`json\n{"tool":"name","params":{}}\n\`\`\``;
+    const sysPrompt = `上下文：\n${serialized}\n\n需要工具时输出 fenced JSON：\n\`\`\`json\n{"tool":"name","params":{}}\n\`\`\``;
 
     const mutations: BlockMutation[] = [];
 

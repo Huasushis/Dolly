@@ -156,6 +156,8 @@
         const obj = JSON.parse(e.data);
         if (obj.type === "speak") {
           addMsg(obj.text, "inner");
+        } else if (obj.type === "user") {
+          addMsg("> " + obj.text, "outer");
         } else if (obj.type === "status") {
           addMsg(obj.text, "status");
         }

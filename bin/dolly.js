@@ -25,11 +25,12 @@ if (cmd === "serve") {
     await waitForPort(instanceName);
     process.exit(0);
   }
-  // Foreground: run main.ts in daemon mode, keep alive until Ctrl-C
+  // Foreground: run main.ts in daemon mode
   process.argv.push("--daemon");
   process.argv.push("--foreground");
   await import("../src/main.ts");
-  // main.ts in foreground mode keeps process alive
+  // main() is async and returns immediately — keep bin/dolly.js alive until Ctrl-C
+  await new Promise(() => {});
 }
 if (cmd === "start") {
   start(instanceName);

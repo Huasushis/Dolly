@@ -95,16 +95,26 @@ speak 之外的一切都是你的内心独白——不会被显示。`;
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     for (const ch of changes) {
       if (ch.type !== "added") continue;
-      // Only parse inner blocks (LLM responses, etc.)
-      if (ch.block.type !== "inner") continue;
-      const speaks = parseSpeak(ch.block.content);
-      for (const s of speaks) {
-        speakHistory.push(s);
-        if (speakHistory.length > MAX_HISTORY) speakHistory.shift();
-        c.emit("speak", { text: s });
-        for (const ws of wsClients) { try { ws.send(JSON.stringify({ type: "speak", text: s })); } catch {} }
+      // Save outer blocks as user messages
+      if (ch.block.type === "outer") {
+        const text = ch.block.content;
+        if (text.trim()) {
+          speakHistory.push("> " + text);
+          if (speakHistory.length > MAX_HISTORY) speakHistory.shift();
+          for (const ws of wsClients) { try { ws.send(JSON.stringify({ type: "user", text })); } catch {} }
+        }
       }
-      if (storageFile && speaks.length > 0) {
+      // Parse inner blocks for speak
+      if (ch.block.type === "inner") {
+        const speaks = parseSpeak(ch.block.content);
+        for (const s of speaks) {
+          speakHistory.push(s);
+          if (speakHistory.length > MAX_HISTORY) speakHistory.shift();
+          c.emit("speak", { text: s });
+          for (const ws of wsClients) { try { ws.send(JSON.stringify({ type: "speak", text: s })); } catch {} }
+        }
+      }
+      if (storageFile && (ch.block.type === "inner" || ch.block.type === "outer")) {
         try { writeFileSync(storageFile, JSON.stringify({ history: speakHistory })); } catch {}
       }
     }
