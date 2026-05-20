@@ -126,16 +126,16 @@
     msgs.scrollTop = msgs.scrollHeight;
   }
 
-  // Load history on page load — "> " prefix = user (right), else AI (left)
+  // Load history on page load
   (async () => {
     try {
       const resp = await fetch('/history');
       const data = await resp.json();
-      for (const line of (data.history || [])) {
-        if (line.startsWith("> ")) {
-          addMsg(line.slice(2), "outer");
-        } else {
-          addMsg(line, "inner");
+      for (const entry of (data.history || [])) {
+        if (typeof entry === "object" && entry.type) {
+          addMsg(entry.text, entry.type === "user" ? "outer" : "inner");
+        } else if (typeof entry === "string") {
+          addMsg(entry.startsWith("> ") ? entry.slice(2) : entry, entry.startsWith("> ") ? "outer" : "inner");
         }
       }
     } catch {}

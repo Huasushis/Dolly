@@ -5,7 +5,8 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { DollyModule, ModuleContext } from "../../../src/modules/base.js";
 import type { BlockChange, BlockMutation } from "../../../src/blocks/index.js";
 
-const speakHistory: string[] = [];
+interface ChatEntry { type: "user" | "speak"; text: string }
+const chatHistory: ChatEntry[] = [];
 const MAX_HISTORY = 200;
 let storageFile = "";
 let httpServer: Server | null = null;
@@ -16,17 +17,20 @@ const consoleModule: DollyModule = {
   id: "builtin/console",
 
   async init(ctx: ModuleContext) {
-    storageFile = resolve(ctx.storagePath, "speak_history.json");
+    storageFile = resolve(ctx.storagePath, "chat_history.json");
     if (existsSync(storageFile)) {
       try {
         const saved = JSON.parse(readFileSync(storageFile, "utf-8"));
-        for (const s of (saved.history ?? [])) speakHistory.push(s);
+        for (const s of (saved.history ?? [])) {
+          if (typeof s === "object" && s.type) chatHistory.push(s);
+          else if (typeof s === "string") chatHistory.push(s.startsWith("> ") ? { type: "user", text: s.slice(2) } : { type: "speak", text: s });
+        }
       } catch {}
     }
 
     // Send speak history to new relay clients
     ctx.on("client.connected", (p: any) => {
-      for (const line of speakHistory) { try { p.socket.write(line + "\n"); } catch {} }
+      for (const entry of chatHistory) { try { p.socket.write((entry.type === "user" ? "> " : "") + entry.text + "\n"); } catch {} }
     });
 
     // Start HTTP + WebSocket server
@@ -39,7 +43,7 @@ const consoleModule: DollyModule = {
         const url = _req.url || "/";
         if (url === "/history") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ history: speakHistory }));
+          res.end(JSON.stringify({ history: chatHistory }));
         } else {
           res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
           res.end(html);
@@ -89,38 +93,38 @@ speak 之外的一切都是你的内心独白——不会被显示。`;
 
   async onStop(_c: ModuleContext) {
     if (storageFile) {
-      try { writeFileSync(storageFile, JSON.stringify({ history: speakHistory })); } catch {}
+      try { writeFileSync(storageFile, JSON.stringify({ history: chatHistory })); } catch {}
     }
   },
 
   async handleCli(args: string[], _c: ModuleContext) {
-    if (args[0] === "history") for (const s of speakHistory) process.stdout.write(s + "\n");
-    else if (args[0] === "clear") { speakHistory.length = 0; process.stdout.write("cleared\n"); }
+    if (args[0] === "history") for (const s of chatHistory) process.stdout.write(s + "\n");
+    else if (args[0] === "clear") { chatHistory.length = 0; process.stdout.write("cleared\n"); }
   },
 
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     for (const ch of changes) {
       if (ch.type !== "added") continue;
-      // Save outer blocks as user messages (with prefix for history distinction)
+      // Save outer blocks as user messages
       if (ch.block.type === "outer") {
         const text = ch.block.content;
         if (text.trim()) {
-          speakHistory.push("> " + text);
-          if (speakHistory.length > MAX_HISTORY) speakHistory.shift();
+          chatHistory.push({ type: "user", text });
+          if (chatHistory.length > MAX_HISTORY) chatHistory.shift();
         }
       }
       // Parse inner blocks for speak output
       if (ch.block.type === "inner") {
         const speaks = parseSpeak(ch.block.content);
         for (const s of speaks) {
-          speakHistory.push(s);
-          if (speakHistory.length > MAX_HISTORY) speakHistory.shift();
+          chatHistory.push({ type: "speak", text: s });
+          if (chatHistory.length > MAX_HISTORY) chatHistory.shift();
           c.emit("speak", { text: s });
           for (const ws of wsClients) { try { ws.send(JSON.stringify({ type: "speak", text: s })); } catch {} }
         }
       }
       if (storageFile && (ch.block.type === "inner" || ch.block.type === "outer")) {
-        try { writeFileSync(storageFile, JSON.stringify({ history: speakHistory })); } catch {}
+        try { writeFileSync(storageFile, JSON.stringify({ history: chatHistory })); } catch {}
       }
     }
     return [];
