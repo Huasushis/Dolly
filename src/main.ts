@@ -75,7 +75,9 @@ async function main() {
 
   // ── Logging: structured JSONL, one file per session ──
   const logLevel = config.log_level ?? "info";
-  const logDir = pathResolve(import.meta.dirname!, "..", ".dolly", "logs", instanceName);
+  const logDir = instanceName === "default"
+    ? pathResolve(import.meta.dirname!, "..", ".dolly", "logs")
+    : pathResolve(import.meta.dirname!, "..", ".dolly", "logs", instanceName);
   mkdirSync(logDir, { recursive: true });
   const logFile = pathResolve(logDir, `${new Date().toISOString().replace(/[:.]/g, "-").slice(0,19)}.jsonl`);
   function dlog(event: string, detail: unknown) {
