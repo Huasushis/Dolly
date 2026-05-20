@@ -87,6 +87,12 @@ const consoleModule: DollyModule = {
 speak 之外的一切都是你的内心独白——不会被显示。`;
   },
 
+  async onStop(_c: ModuleContext) {
+    if (storageFile) {
+      try { writeFileSync(storageFile, JSON.stringify({ history: speakHistory })); } catch {}
+    }
+  },
+
   async handleCli(args: string[], _c: ModuleContext) {
     if (args[0] === "history") for (const s of speakHistory) process.stdout.write(s + "\n");
     else if (args[0] === "clear") { speakHistory.length = 0; process.stdout.write("cleared\n"); }
@@ -95,16 +101,15 @@ speak 之外的一切都是你的内心独白——不会被显示。`;
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     for (const ch of changes) {
       if (ch.type !== "added") continue;
-      // Save outer blocks as user messages
+      // Save outer blocks as user messages (with prefix for history distinction)
       if (ch.block.type === "outer") {
         const text = ch.block.content;
         if (text.trim()) {
           speakHistory.push("> " + text);
           if (speakHistory.length > MAX_HISTORY) speakHistory.shift();
-          for (const ws of wsClients) { try { ws.send(JSON.stringify({ type: "user", text })); } catch {} }
         }
       }
-      // Parse inner blocks for speak
+      // Parse inner blocks for speak output
       if (ch.block.type === "inner") {
         const speaks = parseSpeak(ch.block.content);
         for (const s of speaks) {

@@ -126,13 +126,17 @@
     msgs.scrollTop = msgs.scrollHeight;
   }
 
-  // Load history on page load
+  // Load history on page load — "> " prefix = user (right), else AI (left)
   (async () => {
     try {
       const resp = await fetch('/history');
       const data = await resp.json();
       for (const line of (data.history || [])) {
-        addMsg(line, 'inner');
+        if (line.startsWith("> ")) {
+          addMsg(line.slice(2), "outer");
+        } else {
+          addMsg(line, "inner");
+        }
       }
     } catch {}
   })();
@@ -156,8 +160,6 @@
         const obj = JSON.parse(e.data);
         if (obj.type === "speak") {
           addMsg(obj.text, "inner");
-        } else if (obj.type === "user") {
-          addMsg("> " + obj.text, "outer");
         } else if (obj.type === "status") {
           addMsg(obj.text, "status");
         }
