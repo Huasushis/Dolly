@@ -25,9 +25,11 @@ if (cmd === "serve") {
     await waitForPort(instanceName);
     process.exit(0);
   }
-  // Foreground: run main.ts in daemon mode
+  // Foreground: run main.ts in daemon mode, keep alive until Ctrl-C
   process.argv.push("--daemon");
+  process.argv.push("--foreground");
   await import("../src/main.ts");
+  // main.ts in foreground mode keeps process alive
 }
 if (cmd === "start") {
   start(instanceName);

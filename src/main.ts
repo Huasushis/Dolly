@@ -18,6 +18,7 @@ const cmd = process.argv[2] ?? "run";
 const nameArg = process.argv.find((a) => a.startsWith("--name="));
 const instanceName = nameArg ? nameArg.split("=")[1] : "default";
 const isDaemonMode = process.argv.includes("--daemon");
+const isForeground = process.argv.includes("--foreground");
 
 if (cmd === "help" || cmd === "--help") {
   console.log("Usage: dolly [start|stop|status] [--name=xxx]");
@@ -74,7 +75,9 @@ async function main() {
 
   // System prompt: persona + module prompts, no static background
   const persona = (config as any).agent?.persona ?? "";
-  context.setSystemPrompt([persona, registry.buildSystemPrompt()].filter(Boolean).join("\n\n"));
+  const sysPrompt = [persona, registry.buildSystemPrompt()].filter(Boolean).join("\n\n");
+  context.setSystemPrompt(sysPrompt);
+  if (isForeground) process.stderr.write(`[system] Prompt (${sysPrompt.length} chars)\n`);
 
   // Profile restore (preserving original block identity)
   const profileFile = pathResolve(profileDir, "context.json");
@@ -252,8 +255,10 @@ async function main() {
   await registry.dispatchStart();
 
   process.stderr.write(`  Daemon: ${instanceName}\n  Modules: ${registry.list().join(", ")}\n  Ready.\n`);
+  if (isForeground) process.stderr.write("  (Ctrl-C to stop)\n");
 
   async function shutdown() {
+    process.stderr.write("\nShutting down...\n");
     await registry.dispatchStop();
     saveProfile();
     cleanupRelay(instanceName);
@@ -261,10 +266,10 @@ async function main() {
     clearInterval(midnightTimer);
     process.exit(0);
   }
-  await new Promise<void>((resolve) => {
-    process.on("SIGINT", () => { shutdown(); });
-    process.on("SIGTERM", () => { shutdown(); });
-  });
+  process.on("SIGINT", () => { shutdown(); });
+  process.on("SIGTERM", () => { shutdown(); });
+  // Keep alive — foreground: Ctrl-C triggers shutdown; background: runs until stopped
+  await new Promise<void>(() => {});
 }
 
 main().catch((err) => { console.error("Fatal:", err); process.exit(1); });
