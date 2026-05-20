@@ -234,7 +234,10 @@ async function main() {
     writeFileSync(profileFile, JSON.stringify({ blocks, savedAt: Date.now() }, null, 2));
   };
 
-  writeFileSync(pidFile(instanceName), String(process.pid));
+  // Ensure .dolly/daemons/ exists (foreground serve doesn't go through daemon start())
+  const pf = pidFile(instanceName);
+  mkdirSync(pathResolve(pf, ".."), { recursive: true });
+  writeFileSync(pf, String(process.pid));
 
   // ── Bus: console input from Web UI ──
   bus.on("console.input", async (p: any) => {
