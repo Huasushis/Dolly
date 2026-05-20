@@ -159,11 +159,6 @@ function parseSpeak(text: string): string[] {
       try { results.push(JSON.parse(`{"speak":"${jm[1]}"}`).speak); } catch {}
     }
   }
-  // Last resort: strip code blocks and return remaining text
-  if (results.length === 0) {
-    const cleaned = text.replace(/```json[\s\S]*?```/g, "").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "").trim();
-    if (cleaned) results.push(cleaned);
-  }
   return results;
 }
 

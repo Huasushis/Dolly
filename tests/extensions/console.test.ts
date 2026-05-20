@@ -19,10 +19,6 @@ function parseSpeak(text: string): string[] {
       try { results.push(JSON.parse(`{"speak":"${jm[1]}"}`).speak); } catch {}
     }
   }
-  if (results.length === 0) {
-    const cleaned = text.replace(/```json[\s\S]*?```/g, "").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "").trim();
-    if (cleaned) results.push(cleaned);
-  }
   return results;
 }
 
@@ -52,16 +48,16 @@ describe("Console speak parsing", () => {
       assert.deepEqual(result, ['他说"你好"']);
     });
 
-    it("fallback: shows non-codeblock text", () => {
+    it("returns empty for plain text without speak format", () => {
       const text = "这是普通回复文本，没有 JSON 块";
       const result = parseSpeak(text);
-      assert.deepEqual(result, ["这是普通回复文本，没有 JSON 块"]);
+      assert.deepEqual(result, []);
     });
 
-    it("strips control characters in fallback", () => {
-      const text = "hello\x00world```json\n{}\n```rest";
+    it("returns empty for text with non-speak fenced JSON only", () => {
+      const text = 'hello\x00world```json\n{"tool":"x"}\n```rest';
       const result = parseSpeak(text);
-      assert.deepEqual(result, ["helloworldrest"]);
+      assert.deepEqual(result, []);
     });
 
     it("extracts raw JSON speak without fenced code block", () => {
