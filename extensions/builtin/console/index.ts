@@ -47,6 +47,7 @@ const consoleModule: DollyModule = {
       });
 
       wss = new WebSocketServer({ server: httpServer });
+      (wss as any).on?.("error", () => {}); // suppress WS errors on port conflict
       wss.on("connection", (ws) => {
         wsClients.add(ws);
         ws.send(JSON.stringify({ type: "status", text: "connected" }));
@@ -61,15 +62,17 @@ const consoleModule: DollyModule = {
         ws.on("close", () => wsClients.delete(ws));
       });
 
-      httpServer.listen(port, "0.0.0.0", () => {
-        process.stderr.write(`[console] Web UI: http://localhost:${(httpServer!.address() as any)?.port ?? port}\n`);
-      });
       httpServer.on("error", (err: any) => {
         if (err.code === "EADDRINUSE") {
           process.stderr.write(`[console] port ${port} busy, HTTP server skipped\n`);
+          try { httpServer?.close(); } catch {}
           httpServer = null;
           wss = null;
         }
+      });
+      httpServer.listen(port, "0.0.0.0", () => {
+        const addr = httpServer!.address() as any;
+        process.stderr.write(`[console] Web UI: http://localhost:${addr?.port ?? port}\n`);
       });
     } catch (err: any) {
       process.stderr.write(`[console] HTTP server: ${err.message}\n`);

@@ -28,9 +28,8 @@ export function start(name = "default"): void {
     cwd: resolve(import.meta.dirname!, "..", ".."),
     detached: true,
     windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: "ignore",
   });
-  child.stderr?.on("data", (d) => process.stderr.write(`[daemon] ${d}`));
   writeFileSync(pf, String(child.pid!));
   child.unref();
 }
@@ -56,11 +55,11 @@ export async function stop(name = "default", force = false): Promise<void> {
           s.write(JSON.stringify({ cmd: "__daemon__", args: ["shutdown"] }) + "\n");
           setTimeout(() => { s.destroy(); resolve(); }, 3000);
         });
-        s.on("error", () => { try { process.kill(pid, "SIGKILL"); } catch {}; unlinkSync(pf); resolve(); });
+        s.on("error", () => { try { process.kill(pid, "SIGKILL"); } catch {}; try { unlinkSync(pf); } catch {}; resolve(); });
       });
     }
   } catch {}
-  unlinkSync(pf);
+  try { unlinkSync(pf); } catch {}
 }
 
 export function status(name?: string): void {

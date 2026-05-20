@@ -25,10 +25,15 @@ if (cmd === "serve") {
     await waitForPort(instanceName);
     process.exit(0);
   }
-  // Foreground: import main.ts directly
+  // Foreground: run main.ts in daemon mode
+  process.argv.push("--daemon");
   await import("../src/main.ts");
 }
-if (cmd === "start") { start(instanceName); process.exit(0); }
+if (cmd === "start") {
+  start(instanceName);
+  await waitForPort(instanceName);
+  process.exit(0);
+}
 if (cmd === "stop") { await stop(instanceName, force); process.exit(0); }
 if (cmd === "status") { status(args.includes("--all") ? undefined : instanceName); process.exit(0); }
 if (cmd === "enable" || cmd === "disable" || cmd === "reload") {
