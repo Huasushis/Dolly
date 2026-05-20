@@ -22,7 +22,8 @@
       "api_key_env": "DEEPSEEK_API_KEY",
       "base_url": "https://api.llm.ustc.edu.cn/v1",
       "model": "deepseek-v4-flash-ascend",
-      "idle_minutes": 60
+      "idle_minutes": 60,
+      "enable_thinking": true
     },
     "builtin/skill": {
       "skills_dirs": ["./skills", "~/.dolly/skills"]

@@ -186,29 +186,47 @@ ${bgText}`;
     }
   } catch {}
 
-  // Step 3: Generate mskills from today's lessons (multi-step with NLP dedup)
-  try {
-    // 3a. List candidates: LLM proposes skill descriptions
-    const candidatePrompt = `基于今天的收获与教训，列出你可能学到的新能力。只列出名称和一句话描述。不要写详细内容。最多 3 个。\n\n教训：\n${summary.lessons}\n\n格式：\ncandidate_name: <英文短名>\ncandidate_desc: <触发条件，一句话>\n\n没有值得封装的能力就回复 none。`;
-    const candidateResp = await client.chat([{ role: "user", content: candidatePrompt }]);
-    if (candidateResp.trim().toLowerCase().startsWith("none")) return mutations;
+  // Step 3: Generate mskills from today's lessons (multi-step with NLP dedup + thinking)
+  const enableThinking = (ctx.config as any)["builtin/memory"]?.enable_thinking ?? false;
+  const thinkOpt = enableThinking ? { enable_thinking: true } : undefined;
+  const chat = (prompt: string) =>
+    enableThinking ? client.chatWithReasoning([{ role: "user", content: prompt }], thinkOpt).then(r => r.content) : client.chat([{ role: "user", content: prompt }]);
 
-    // Parse candidates
-    const candidates: Array<{ name: string; desc: string }> = [];
-    const candSections = candidateResp.split(/\n(?=candidate_name:)/);
-    for (const sec of candSections) {
-      const nm = sec.match(/candidate_name:\s*(.+)/);
-      const dm = sec.match(/candidate_desc:\s*(.+)/);
-      if (nm && dm) candidates.push({ name: nm[1].trim(), desc: dm[1].trim() });
+  function parseFencedJson(text: string): Record<string, unknown> | null {
+    const m = text.match(/```json\s*\n([\s\S]*?)```/);
+    if (!m) return null;
+    try { const o = JSON.parse(m[1].trim()); return o && typeof o === "object" && !Array.isArray(o) ? o as any : null; } catch { return null; }
+  }
+  function parseFencedJsonAll(text: string): Record<string, unknown>[] {
+    const results: Record<string, unknown>[] = [];
+    const re = /```json\s*\n([\s\S]*?)```/g;
+    let m;
+    while ((m = re.exec(text))) {
+      try { const o = JSON.parse(m[1].trim()); if (o && typeof o === "object" && !Array.isArray(o)) results.push(o); } catch {}
     }
-    if (candidates.length === 0) return mutations;
+    return results;
+  }
+
+  try {
+    // 3a. List candidates: LLM proposes skill descriptions (structured JSON output)
+    const candidatePrompt = `基于今天的收获与教训，列出你可能学到的新能力。只列出名称和一句话描述。最多 3 个。如果没有值得封装的能力，返回 {"candidates":[]}。
+
+教训：\n${summary.lessons}
+
+用 fenced JSON 输出：
+\`\`\`json
+{"candidates":[{"name":"英文短名","desc":"触发条件一句话"}]}
+\`\`\``;
+    const candidateResp = await chat(candidatePrompt);
+    const candObj = parseFencedJson(candidateResp);
+    const candList: Array<{ name: string; desc: string }> = (candObj?.candidates as any[])?.filter((c: any) => c.name && c.desc) ?? [];
+    if (candList.length === 0) return mutations;
 
     // 3b. Load existing skills for NLP dedup
     const { readdirSync, existsSync: es2, readFileSync: rfs2 } = await import("fs");
     const { tokenize, tfVector, cosineSimilarity } = await import("../../../src/memory/nlp.js");
     const existingSkills: Array<{ name: string; desc: string; body: string; path: string }> = [];
 
-    // Scan mskill directory
     const mskillRoot = resolve(ctx.storagePath, "mskills");
     if (es2(mskillRoot)) {
       for (const entry of readdirSync(mskillRoot)) {
@@ -231,7 +249,7 @@ ${bgText}`;
     const { writeFileSync: wfs, mkdirSync: mkdir } = await import("fs");
 
     // 3c. NLP dedup + AI decision per candidate
-    for (const cand of candidates) {
+    for (const cand of candList) {
       const candVec = tfVector(tokenize(cand.name + " " + cand.desc));
       const similar = existingSkills
         .map((s) => ({ skill: s, score: cosineSimilarity(candVec, tfVector(tokenize(s.name + " " + s.desc))) }))
@@ -240,43 +258,43 @@ ${bgText}`;
         .slice(0, 3);
 
       if (similar.length === 0) {
-        // 3d. Novel: let AI generate full skill body
-        const novelPrompt = `你学到一个新能力，创建为技能。\n\n名称：${cand.name}\n描述：${cand.desc}\n\n输出完整 skill（markdown body，不要 frontmatter）：`;
-        const bodyResp = await client.chat([{ role: "user", content: novelPrompt }]);
+        // 3d. Novel: generate full skill body
+        const novelPrompt = `你学到一个新能力，创建为技能。用 fenced JSON 输出：\n\n名称：${cand.name}\n触发条件：${cand.desc}\n\n\`\`\`json\n{"body":"完整 markdown 技能内容"}\n\`\`\``;
+        const bodyResp = await chat(novelPrompt);
+        const bodyObj = parseFencedJson(bodyResp);
+        const body = (bodyObj?.body as string) ?? bodyResp.trim();
         const skillName = cand.name.replace(/[^a-zA-Z0-9一-鿿_-]/g, "-").slice(0, 40);
         const mskillDir = resolve(ctx.storagePath, "mskills", skillName);
         if (!es2(mskillDir)) mkdir(mskillDir, { recursive: true });
-        const md = `---\nname: ${skillName}\ndescription: ${cand.desc}\n---\n\n${bodyResp.trim()}`;
-        wfs(resolve(mskillDir, "SKILL.md"), md);
+        wfs(resolve(mskillDir, "SKILL.md"), `---\nname: ${skillName}\ndescription: ${cand.desc}\n---\n\n${body}`);
       } else {
-        // 3e. Similar found: show full existing skill, let AI decide create/modify/skip
+        // 3e. Similar found: show full existing skill, AI decides via structured JSON
         const similarText = similar.map((s, i) =>
-          `${i}: 相似度=${s.score.toFixed(2)}\n名称：${s.skill.name}\n描述：${s.skill.desc}\n内容：\n${s.skill.body.slice(0, 2000)}`
-        ).join("\n\n");
+          `${i}: 相似度=${s.score.toFixed(2)}\n名称：${s.skill.name}\n描述：${s.skill.desc}\n完整内容：\n${s.skill.body}`
+        ).join("\n\n---\n\n");
 
-        const decidePrompt = `你学到：${cand.name} — ${cand.desc}\n\n发现以下相似技能：\n${similarText}\n\n决定：create（新建，与已有不同）、modify N（修改第N个，把已有和新学融合）、skip（不建）。只回复决定。`;
-        const decision = await client.chat([{ role: "user", content: decidePrompt }]);
-        const decisionStr = decision.trim().toLowerCase();
+        const decidePrompt = `你学到：${cand.name} — ${cand.desc}\n\n发现以下相似技能（含完整内容）：\n${similarText}\n\n决定如何处理。用 fenced JSON 输出：\n\`\`\`json\n{"action":"create|modify|skip","modify_index":0,"body":"如果是 create 或 modify，输出完整 markdown body"}\n\`\`\``;
+        const decisionResp = await chat(decidePrompt);
+        const decObj = parseFencedJson(decisionResp);
+        const action = (decObj?.action as string) ?? "skip";
 
-        if (decisionStr.startsWith("modify")) {
-          const idxMatch = decisionStr.match(/modify\s*(\d+)/);
-          const idx = idxMatch ? parseInt(idxMatch[1]) : 0;
+        if (action === "modify") {
+          const idx = (decObj?.modify_index as number) ?? 0;
           const target = similar[idx]?.skill;
           if (target && target.path) {
-            // Show FULL original skill + new insight, let AI merge
-            const mergePrompt = `原始技能完整内容：\n\n${target.body}\n\n新学到的：${cand.name} — ${cand.desc}\n\n请把新内容融入原始技能，输出更新后的完整 markdown body（不要 frontmatter）：`;
-            const merged = await client.chat([{ role: "user", content: mergePrompt }]);
-            const md = `---\nname: ${target.name}\ndescription: ${target.desc}\n---\n\n${merged.trim()}`;
-            wfs(target.path, md);
+            const body = (decObj?.body as string);
+            if (body) {
+              wfs(target.path, `---\nname: ${target.name}\ndescription: ${target.desc}\n---\n\n${body}`);
+            }
           }
-        } else if (decisionStr.startsWith("create")) {
-          const createPrompt = `你学到一个新能力，它与现有技能不同。创建完整技能。\n\n名称：${cand.name}\n描述：${cand.desc}\n\n输出完整 skill（markdown body，不要 frontmatter）：`;
-          const bodyResp = await client.chat([{ role: "user", content: createPrompt }]);
-          const skillName = cand.name.replace(/[^a-zA-Z0-9一-鿿_-]/g, "-").slice(0, 40);
-          const mskillDir = resolve(ctx.storagePath, "mskills", skillName);
-          if (!es2(mskillDir)) mkdir(mskillDir, { recursive: true });
-          const md = `---\nname: ${skillName}\ndescription: ${cand.desc}\n---\n\n${bodyResp.trim()}`;
-          wfs(resolve(mskillDir, "SKILL.md"), md);
+        } else if (action === "create") {
+          const body = (decObj?.body as string);
+          if (body) {
+            const skillName = cand.name.replace(/[^a-zA-Z0-9一-鿿_-]/g, "-").slice(0, 40);
+            const mskillDir = resolve(ctx.storagePath, "mskills", skillName);
+            if (!es2(mskillDir)) mkdir(mskillDir, { recursive: true });
+            wfs(resolve(mskillDir, "SKILL.md"), `---\nname: ${skillName}\ndescription: ${cand.desc}\n---\n\n${body}`);
+          }
         }
         // skip → do nothing
       }
