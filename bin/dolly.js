@@ -2,7 +2,7 @@
 import { start, stop, status, isRunning } from "../src/daemon/index.js";
 import { waitForPort } from "../src/daemon/attach.js";
 import { connect } from "net";
-import { readFileSync } from "fs";
+import { readFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -84,6 +84,10 @@ async function sendCommand(extName, extArgs) {
     await waitForPort(instanceName);
   }
   const socketPath = resolve(__dirname, "..", ".dolly", "sockets", `${instanceName}.port`);
+  if (!existsSync(socketPath)) {
+    process.stderr.write(`Daemon not running. Use 'dolly start' first.\n`);
+    process.exit(1);
+  }
   const port = parseInt(readFileSync(socketPath, "utf-8"));
   return new Promise((resolve, reject) => {
     const socket = connect(port, "127.0.0.1", () => {

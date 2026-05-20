@@ -64,8 +64,8 @@ export async function stop(name = "default", force = false): Promise<void> {
 
 export function status(name?: string): void {
   ensureDir();
-  if (!existsSync(PID_DIR)) { console.log("No daemons running."); return; }
-  const files = name ? [pidFile(name)] : readdirSync(PID_DIR).map((f) => resolve(PID_DIR, f));
+  const files = name ? [pidFile(name)] : (existsSync(PID_DIR) ? readdirSync(PID_DIR).map((f) => resolve(PID_DIR, f)) : []);
+  if (files.length === 0) { console.log(`Not running: ${name ?? "any"}`); return; }
   for (const pf of files) {
     if (!existsSync(pf)) { if (name) console.log(`Not running: ${name}`); continue; }
     const n = pf.replace(/\.pid$/, "").split(/[\\/]/).pop();
