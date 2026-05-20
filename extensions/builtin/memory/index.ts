@@ -49,9 +49,9 @@ soft 轻量回忆（1天1段，同上）`;
   async handleCli(args: string[], _c: ModuleContext) {
     if (args[0] === "midnight") {
       process.stderr.write("Forcing midnight pipeline...\n");
-      const blocks = ctx.getBlocks();
-      const summary = await store.summarize(blocks, true);
-      if (summary) process.stderr.write(`Summary done: ${summary.day}\n`);
+      const mutations = await _runMidnight();
+      if (mutations.length > 0) ctx.emit("midnight.mutations", { mutations });
+      process.stderr.write(`Midnight pipeline done: ${mutations.length} mutations\n`);
     } else if (args[0] === "recall") {
       const query = args.slice(1).join(" ");
       const results = store.recall(query, 3, 3);

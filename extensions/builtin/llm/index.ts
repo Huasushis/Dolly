@@ -6,6 +6,7 @@ let client: LLMClient;
 let ctx: ModuleContext;
 let respondedTo = new Set<string>();   // cleared on midnight reset
 let processing = false;
+let pendingQueue: BlockChange[] = [];
 let thinkingEnabled = false;
 let thinkingActive = false;
 
@@ -74,8 +75,8 @@ const llmModule: DollyModule = {
       }
     }
 
-    // Silently skip when busy — unresponded blocks retry next cascade
-    if (processing) return [];
+    // Queue pending changes when busy — they will be processed when current LLM call finishes
+    if (processing) { pendingQueue.push(...changes); return []; }
 
     // Respond to new outer blocks (external input) not from self
     const newBlocks = changes.filter((ch) =>
@@ -147,8 +148,19 @@ const llmModule: DollyModule = {
 
     processing = false;
     if (mutations.length > 0) for (const b of newBlocks) respondedTo.add(b.block.id);
+
+    // Drain pending queue: insert a trigger block so next cascade picks them up
+    if (pendingQueue.length > 0) {
+      mutations.push({
+        action: "insert", priority: 99,
+        block: { type: "inner", content: "", meta: { source: "llm", subtype: "_retrigger" }, created: Date.now() },
+      });
+      pendingQueue = [];
+    }
+
     return mutations;
   },
 };
 
+llmModule.cliInfo = [];
 export default llmModule;
