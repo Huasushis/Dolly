@@ -262,13 +262,8 @@ async function main() {
     await cascade();
   });
 
-  // ── Relay + speak broadcast ──
+  // ── Relay ──
   const clients = new Set<any>();
-  bus.on("speak", (p: any) => {
-    dlog("speak", p.text.slice(0, 200));
-    const line = p.text + "\n";
-    for (const s of clients) { try { s.write(line); } catch {} }
-  });
 
   const relay = startRelay(instanceName, (socket) => {
     clients.add(socket);

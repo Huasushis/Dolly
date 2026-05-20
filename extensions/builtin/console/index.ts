@@ -12,6 +12,7 @@ let storageFile = "";
 let httpServer: Server | null = null;
 let wss: WebSocketServer | null = null;
 const wsClients = new Set<WebSocket>();
+const tcpClients = new Set<any>();
 
 const consoleModule: DollyModule = {
   id: "builtin/console",
@@ -29,8 +30,10 @@ const consoleModule: DollyModule = {
       } catch {}
     }
 
-    // Send speak history to new relay clients
+    // Send speak history to new relay clients and track them for broadcast
     ctx.on("client.connected", (p: any) => {
+      tcpClients.add(p.socket);
+      p.socket.on("close", () => tcpClients.delete(p.socket));
       for (const entry of chatHistory) { try { p.socket.write((entry.type === "user" ? "> " : "") + entry.text + "\n"); } catch {} }
     });
 
@@ -122,6 +125,7 @@ speak 之外的一切都是你的内心独白——不会被显示。`;
           if (chatHistory.length > MAX_HISTORY) chatHistory.shift();
           c.emit("speak", { text: s });
           for (const ws of wsClients) { try { ws.send(JSON.stringify({ type: "speak", text: s })); } catch {} }
+          for (const s of tcpClients) { try { s.write(s + "\n"); } catch {} }
         }
       }
       if (storageFile && (ch.block.type === "inner" || ch.block.type === "outer")) {
