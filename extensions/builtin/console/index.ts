@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { resolve } from "path";
 import { createServer, Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
@@ -18,6 +18,7 @@ const consoleModule: DollyModule = {
 
   async init(ctx: ModuleContext) {
     storageFile = resolve(ctx.storagePath, "chat_history.json");
+    if (!existsSync(ctx.storagePath)) mkdirSync(ctx.storagePath, { recursive: true });
     if (existsSync(storageFile)) {
       try {
         const saved = JSON.parse(readFileSync(storageFile, "utf-8"));

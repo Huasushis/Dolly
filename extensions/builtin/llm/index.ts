@@ -92,11 +92,15 @@ const llmModule: DollyModule = {
 
     processing = true;
     const blocks = ctx.getBlocks();
-    const serialized = blocks.map((b) =>
+    // Separate system block from working context
+    const sysBlock = blocks.find(b => b.type === "system");
+    const workingBlocks = blocks.filter(b => b.type !== "system");
+    const serialized = workingBlocks.map((b) =>
       `[ID:${b.id}][TYPE:${b.type}/${b.meta?.subtype ?? b.type}][TIME:${Math.floor(b.created / 1000)}]\n${b.content}`
     ).join("\n\n");
 
-    const sysPrompt = `上下文：\n${serialized}\n\n需要工具时输出 fenced JSON：\n\`\`\`json\n{"tool":"name","params":{}}\n\`\`\``;
+    const sysPrompt = sysBlock?.content ?? "";
+    const userPrompt = `上下文：\n${serialized}\n\n需要工具时输出 fenced JSON：\n\`\`\`json\n{"tool":"name","params":{}}\n\`\`\``;
 
     const mutations: BlockMutation[] = [];
 
@@ -108,7 +112,7 @@ const llmModule: DollyModule = {
       if (extraBody) {
         const unlock = await ctx.lock.acquire("builtin/llm", Infinity);
         try {
-          const result = await client.chatWithReasoning([{ role: "user", content: sysPrompt }] as any, extraBody);
+          const result = await client.chatWithReasoning([{ role: "system", content: sysPrompt }, { role: "user", content: userPrompt }] as any, extraBody);
 
           if (result.reasoning) {
             ctx.emit("reasoning.captured", { content: result.reasoning });
@@ -127,7 +131,7 @@ const llmModule: DollyModule = {
         } finally { unlock(); }
       } else {
         let fullResponse = "";
-        for await (const chunk of client.chatStream([{ role: "user", content: sysPrompt }] as any)) {
+        for await (const chunk of client.chatStream([{ role: "system", content: sysPrompt }, { role: "user", content: userPrompt }] as any)) {
           fullResponse += chunk;
         }
 
