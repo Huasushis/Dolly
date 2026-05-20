@@ -24,11 +24,12 @@ describe("System prompt verification", () => {
     const inst = mod.default;
     const ctx = { config: { "builtin/llm": { enable_thinking: false } } };
     const prompt = inst.systemPrompt ? inst.systemPrompt(ctx) : "";
-    assert.ok(prompt.includes("speak"), "LLM sysPrompt should mention speak");
-    assert.ok(!prompt.includes("\"tool\""), "LLM sysPrompt should NOT teach tool");
-    assert.ok(!prompt.includes("\"recall\""), "LLM sysPrompt should NOT teach recall");
+    assert.ok(!prompt.includes("\"speak\""), "LLM sysPrompt should NOT teach speak (console's domain)");
+    assert.ok(!prompt.includes("\"tool\""), "LLM sysPrompt should NOT teach tool (MCP's domain)");
+    assert.ok(!prompt.includes("\"recall\""), "LLM sysPrompt should NOT teach recall (memory's domain)");
     assert.ok(prompt.includes("私人内心世界"), "LLM sysPrompt should be about inner world");
     assert.ok(prompt.includes("心") || prompt.includes("想") || prompt.includes("感受"), "LLM sysPrompt should encourage thinking");
+    assert.ok(prompt.includes("forget"), "LLM sysPrompt should teach forget (its own domain)");
   });
 
   it("Console module systemPrompt teaches fenced JSON speak", async () => {
