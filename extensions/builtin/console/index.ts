@@ -88,11 +88,15 @@ const consoleModule: DollyModule = {
   },
 
   systemPrompt(): string {
-    return `当你需要向用户展示内容时，使用 fenced JSON：
+    return `重要：你对外说的每一句话，都必须用这种格式：
 \`\`\`json
-{"speak":"你要对用户说的话"}
+{"speak":"你要说的话"}
 \`\`\`
-speak 之外的一切都是你的内心独白——不会被显示。`;
+不放在 {"speak":"..."} 里的内容用户完全看不到——那是你私人的内心独白。
+示例：
+\`\`\`json
+{"speak":"你好！很高兴认识你。"}
+\`\`\``;
   },
 
   async onStop(_c: ModuleContext) {
