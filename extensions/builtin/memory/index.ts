@@ -186,40 +186,99 @@ ${bgText}`;
     }
   } catch {}
 
-  // Step 3: Generate mskills from today's lessons
+  // Step 3: Generate mskills from today's lessons (multi-step with NLP dedup)
   try {
-    const skillsPrompt = `基于今天的收获与教训，判断是否学到了可以复用的新能力。
+    // 3a. List candidates: LLM proposes skill descriptions
+    const candidatePrompt = `基于今天的收获与教训，列出你可能学到的新能力。只列出名称和一句话描述。不要写详细内容。最多 3 个。\n\n教训：\n${summary.lessons}\n\n格式：\ncandidate_name: <英文短名>\ncandidate_desc: <触发条件，一句话>\n\n没有值得封装的能力就回复 none。`;
+    const candidateResp = await client.chat([{ role: "user", content: candidatePrompt }]);
+    if (candidateResp.trim().toLowerCase().startsWith("none")) return mutations;
 
-教训：
-${summary.lessons}
+    // Parse candidates
+    const candidates: Array<{ name: string; desc: string }> = [];
+    const candSections = candidateResp.split(/\n(?=candidate_name:)/);
+    for (const sec of candSections) {
+      const nm = sec.match(/candidate_name:\s*(.+)/);
+      const dm = sec.match(/candidate_desc:\s*(.+)/);
+      if (nm && dm) candidates.push({ name: nm[1].trim(), desc: dm[1].trim() });
+    }
+    if (candidates.length === 0) return mutations;
 
-三步判断：
-1. 列出今天可能学会的能力（最多3个）
-2. 对每个能力判断：换个场景还能用吗？只能在这个场景用就淘汰
-3. 对通过的判断：和已有技能重复吗？去重
+    // 3b. Load existing skills for NLP dedup
+    const { readdirSync, existsSync: es2, readFileSync: rfs2 } = await import("fs");
+    const { tokenize, tfVector, cosineSimilarity } = await import("../../../src/memory/nlp.js");
+    const existingSkills: Array<{ name: string; desc: string; body: string; path: string }> = [];
 
-最终输出通过的技能（0个或多个），格式：
-skill_name: <英文短名>
-skill_desc: <触发条件，一句话>
-skill_body: <详细指令，markdown>
+    // Scan mskill directory
+    const mskillRoot = resolve(ctx.storagePath, "mskills");
+    if (es2(mskillRoot)) {
+      for (const entry of readdirSync(mskillRoot)) {
+        const skillDir = resolve(mskillRoot, entry);
+        const mdFile = resolve(skillDir, "SKILL.md");
+        if (es2(mdFile)) {
+          const raw = rfs2(mdFile, "utf-8");
+          const fmMatch = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+          if (fmMatch) {
+            const fm: Record<string, string> = {};
+            for (const line of fmMatch[1].split("\n")) {
+              const kv = line.match(/^(\w[\w-]*):\s*(.*)$/);
+              if (kv) fm[kv[1]] = kv[2].trim();
+            }
+            existingSkills.push({ name: fm.name ?? entry, desc: fm.description ?? "", body: fmMatch[2].trim(), path: mdFile });
+          }
+        }
+      }
+    }
+    const { writeFileSync: wfs, mkdirSync: mkdir } = await import("fs");
 
-没有通过的就回复 none。`;
-    const skillsResp = await client.chat([{ role: "user", content: skillsPrompt }]);
-    if (!skillsResp.trim().toLowerCase().startsWith("none")) {
-      const sections = skillsResp.split(/\n(?=skill_name:)/);
-      const { writeFileSync: wfs, mkdirSync: mkdir, existsSync: es } = await import("fs");
+    // 3c. NLP dedup + AI decision per candidate
+    for (const cand of candidates) {
+      const candVec = tfVector(tokenize(cand.name + " " + cand.desc));
+      const similar = existingSkills
+        .map((s) => ({ skill: s, score: cosineSimilarity(candVec, tfVector(tokenize(s.name + " " + s.desc))) }))
+        .filter((s) => s.score > 0.3)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 3);
 
-      for (const sec of sections) {
-        const nameMatch = sec.match(/skill_name:\s*(.+)/);
-        const descMatch = sec.match(/skill_desc:\s*(.+)/);
-        const bodyMatch = sec.match(/skill_body:\s*([\s\S]+)/);
-        if (!nameMatch || !descMatch || !bodyMatch) continue;
-
-        const skillName = nameMatch[1].trim().replace(/[^a-zA-Z0-9一-鿿_-]/g, "-").slice(0, 40);
+      if (similar.length === 0) {
+        // 3d. Novel: let AI generate full skill body
+        const novelPrompt = `你学到一个新能力，创建为技能。\n\n名称：${cand.name}\n描述：${cand.desc}\n\n输出完整 skill（markdown body，不要 frontmatter）：`;
+        const bodyResp = await client.chat([{ role: "user", content: novelPrompt }]);
+        const skillName = cand.name.replace(/[^a-zA-Z0-9一-鿿_-]/g, "-").slice(0, 40);
         const mskillDir = resolve(ctx.storagePath, "mskills", skillName);
-        if (!es(mskillDir)) mkdir(mskillDir, { recursive: true });
-        const md = `---\nname: ${skillName}\ndescription: ${descMatch[1].trim()}\n---\n\n${bodyMatch[1].trim()}`;
+        if (!es2(mskillDir)) mkdir(mskillDir, { recursive: true });
+        const md = `---\nname: ${skillName}\ndescription: ${cand.desc}\n---\n\n${bodyResp.trim()}`;
         wfs(resolve(mskillDir, "SKILL.md"), md);
+      } else {
+        // 3e. Similar found: show full existing skill, let AI decide create/modify/skip
+        const similarText = similar.map((s, i) =>
+          `${i}: 相似度=${s.score.toFixed(2)}\n名称：${s.skill.name}\n描述：${s.skill.desc}\n内容：\n${s.skill.body.slice(0, 2000)}`
+        ).join("\n\n");
+
+        const decidePrompt = `你学到：${cand.name} — ${cand.desc}\n\n发现以下相似技能：\n${similarText}\n\n决定：create（新建，与已有不同）、modify N（修改第N个，把已有和新学融合）、skip（不建）。只回复决定。`;
+        const decision = await client.chat([{ role: "user", content: decidePrompt }]);
+        const decisionStr = decision.trim().toLowerCase();
+
+        if (decisionStr.startsWith("modify")) {
+          const idxMatch = decisionStr.match(/modify\s*(\d+)/);
+          const idx = idxMatch ? parseInt(idxMatch[1]) : 0;
+          const target = similar[idx]?.skill;
+          if (target && target.path) {
+            // Show FULL original skill + new insight, let AI merge
+            const mergePrompt = `原始技能完整内容：\n\n${target.body}\n\n新学到的：${cand.name} — ${cand.desc}\n\n请把新内容融入原始技能，输出更新后的完整 markdown body（不要 frontmatter）：`;
+            const merged = await client.chat([{ role: "user", content: mergePrompt }]);
+            const md = `---\nname: ${target.name}\ndescription: ${target.desc}\n---\n\n${merged.trim()}`;
+            wfs(target.path, md);
+          }
+        } else if (decisionStr.startsWith("create")) {
+          const createPrompt = `你学到一个新能力，它与现有技能不同。创建完整技能。\n\n名称：${cand.name}\n描述：${cand.desc}\n\n输出完整 skill（markdown body，不要 frontmatter）：`;
+          const bodyResp = await client.chat([{ role: "user", content: createPrompt }]);
+          const skillName = cand.name.replace(/[^a-zA-Z0-9一-鿿_-]/g, "-").slice(0, 40);
+          const mskillDir = resolve(ctx.storagePath, "mskills", skillName);
+          if (!es2(mskillDir)) mkdir(mskillDir, { recursive: true });
+          const md = `---\nname: ${skillName}\ndescription: ${cand.desc}\n---\n\n${bodyResp.trim()}`;
+          wfs(resolve(mskillDir, "SKILL.md"), md);
+        }
+        // skip → do nothing
       }
     }
   } catch {}
