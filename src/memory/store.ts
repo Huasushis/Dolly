@@ -115,10 +115,15 @@ export class MemoryStore {
     const queryVec = tfVector(queryTokens);
     const scored: Array<{ day: string; score: number }> = [];
 
+    const now = new Date();
     for (const s of this.summaries) {
       const entryVec = tfVector(tokenize(s.summary + " " + s.keywords.join(" ")));
       let score = cosineSimilarity(queryVec, entryVec);
       score *= (0.5 + s.weight);
+      // Time decay: newer entries rank higher
+      const daysOld = (now.getTime() - new Date(s.day).getTime()) / 86400000;
+      const timeWeight = 1 / (1 + daysOld * 0.3);
+      score *= timeWeight;
       if (score > 0.04) scored.push({ day: s.day, score });
     }
 

@@ -88,8 +88,8 @@ hard 深度回忆（5天5段），soft 轻量回忆（1天1段）`;
       }
     }
 
-    // Collect all new outer blocks (messages), batch recall once
-    const newMessages = changes.filter((ch) => ch.type === "added" && ch.block.type === "outer");
+    // Collect all new non-self blocks, batch recall once
+    const newMessages = changes.filter((ch) => ch.type === "added" && ch.block.meta?.source !== "memory");
     if (newMessages.length === 0) { resetTimer(); return mutations; }
 
     const queryText = newMessages.map((ch) => ch.block.content).join("\n");

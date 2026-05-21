@@ -34,8 +34,8 @@ const skillModule: DollyModule = {
   async onBlocksChanged(c: ModuleContext, changes: BlockChange[]): Promise<BlockMutation[]> {
     ctx = c;
 
-    // Only trigger on new outer blocks (external input)
-    const newMsgs = changes.filter((ch) => ch.type === "added" && ch.block.type === "outer");
+    // Trigger on all new non-self blocks
+    const newMsgs = changes.filter((ch) => ch.type === "added" && ch.block.meta?.source !== "skill");
     if (newMsgs.length === 0 || skills.length === 0) return [];
 
     const mutations: BlockMutation[] = [];

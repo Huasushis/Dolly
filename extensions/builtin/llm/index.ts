@@ -67,17 +67,15 @@ const llmModule: DollyModule = {
     const hasRetrigger = changes.some(ch => ch.type === "added" && ch.block.meta?.subtype === "_retrigger");
     let newBlocks;
     if (hasRetrigger) {
-      // Scan entire context for unprocessed outer blocks (pending queue was just drained)
+      // Scan entire context for unprocessed non-self blocks (pending queue was just drained)
       newBlocks = ctx.getBlocks().filter(b =>
-        b.type === "outer" &&
         b.meta?.source !== "llm" &&
         !respondedTo.has(b.id)
       ).map(b => ({ type: "added" as const, block: b }));
     } else {
-      // Normal: filter current changes
+      // Normal: filter current changes (all non-self blocks)
       newBlocks = changes.filter((ch) =>
         ch.type === "added" &&
-        ch.block.type === "outer" &&
         ch.block.meta?.source !== "llm" &&
         !respondedTo.has(ch.block.id)
       );
