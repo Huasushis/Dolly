@@ -45,6 +45,18 @@ async function main() {
   console.log(`Recall/memory entries: ${recallLines.length}`);
   recallLines.forEach(l => console.log(l.slice(0, 200)));
 
+  console.log("\n=== TEST 4: Thinking mode ===");
+  // Complex analysis should trigger thinking
+  const r4 = await send("请详细分析以下代码的时间复杂度并给出优化方案：for(let i=0;i<n;i++){for(let j=i;j<n;j++){for(let k=0;k<j;k++){console.log(i+j+k)}}}", 30000);
+  console.log("Response:", r4.slice(0, 300));
+  await sleep(5000);
+
+  console.log("\n=== CHECK THINKING IN LOG ===");
+  const log2 = readFileSync(".dolly/profiles/default/exts/builtin/memory/memory-store/daily/2026-05-21.jsonl", "utf-8");
+  const thinkingLines = log2.split("\n").filter(l => l.includes("thinking") || l.includes("reasoning"));
+  console.log(`Thinking/reasoning entries: ${thinkingLines.length}`);
+  thinkingLines.forEach(l => console.log(l.slice(0, 200)));
+
   console.log("\n=== DONE ===");
 }
 
