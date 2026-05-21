@@ -78,10 +78,10 @@ export class MemoryStore {
     const lessonsKwStr = kw2Match?.[1]?.trim() ?? "";
     const lessonsKeywords = lessonsKwStr.split(/[,，\s]+/).filter((k) => k.length > 0).slice(0, 5);
 
-    // ── Step 3: 摘要（合并事实+了解到信息，一段话）──
+    // ── Step 3: 摘要（第三人称，合并事实+了解到的信息）──
     const summaryPrompt = existing
-      ? `已有摘要：${existing.summary}\n\n合并新内容，更新为一段新摘要。\n关键事实：${facts}\n了解到：${lessons}\n新日志：\n${logSlice}`
-      : `用一段话总结今天。包含关键事实和了解到的信息。\n关键事实：${facts}\n了解到：${lessons}\n日志：\n${logSlice}`;
+      ? `已有摘要：${existing.summary}\n\n合并新内容，更新为一段新摘要（第三人称）。\n关键事实：${facts}\n了解到：${lessons}\n新日志：\n${logSlice}`
+      : `用第三人称写一段摘要，描述今天发生了什么、用户分享了什么信息。\n关键事实：${facts}\n了解到：${lessons}\n日志：\n${logSlice}`;
 
     const resp = await this.summarizeClient.chat([{ role: "user", content: summaryPrompt }]);
     process.stderr.write(`[summarize:3] ${resp.slice(0, 100)}\n`);
