@@ -52,7 +52,7 @@ export class MemoryStore {
     const maxChars = 10000;
     const logSlice = text.length > maxChars ? text.slice(-maxChars) : text;
 
-    const LOG_FORMAT = `日志格式：[outer]=用户输入，[inner]=你的回复/记忆注入。所有[inner]内容（含[记忆]标记）也属于已有信息。**严格禁止编造日志中没有出现的内容。** 只能从日志中提取，不能添加任何日志之外的情节、细节、情感。`;
+    const LOG_FORMAT = `日志格式：[outer]=用户输入，[inner]=你的回复/记忆注入。所有[inner]内容（含[记忆]标记）也属于已有信息。**严格禁止编造。** 任何情绪描述（如"感到温暖""心里一震"）必须有原文依据——如果日志里用户只说"今天下雨"，你不能写成"他今天心情很低落"。事实是事实，情绪是情绪，不能混淆。`;
 
     // ── Step 1: 关键事实（谁说了什么，有什么重要信息）──
     const thinkPrompt = `${LOG_FORMAT}\n\n提取今天对话中用户分享的关键信息：人名、密码、偏好、事件。只提取[outer]中确实出现的内容。\n\n格式：\nfacts: <一句话>\nweight: <0.1-1.0>\nkeywords: <词,词,词>\n\n日志：\n${logSlice}`;
