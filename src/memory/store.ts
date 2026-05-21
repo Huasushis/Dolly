@@ -118,13 +118,17 @@ export class MemoryStore {
     const now = new Date();
     for (const s of this.summaries) {
       const entryVec = tfVector(tokenize(s.summary + " " + s.keywords.join(" ")));
-      let score = cosineSimilarity(queryVec, entryVec);
-      score *= (0.5 + s.weight);
-      // Time decay: newer entries rank higher
+      const sim = cosineSimilarity(queryVec, entryVec);
+      if (sim < 0.02) continue; // very loose filter — LLM handles false positives
+      const entryText = s.summary + " " + s.keywords.join(" ");
+      const matchCount = queryTokens.filter(t => entryText.includes(t)).length;
+      const importance = 0.5 + s.weight;
+      let score = sim * importance + matchCount * 0.01; // token match bonus
+      // Recency boost: small additive bonus for newer entries, not a multiplier
       const daysOld = (now.getTime() - new Date(s.day).getTime()) / 86400000;
-      const timeWeight = 1 / (1 + daysOld * 0.3);
-      score *= timeWeight;
-      if (score > 0.04) scored.push({ day: s.day, score });
+      const recencyBoost = 0.08 * Math.exp(-daysOld / 30);
+      score += recencyBoost;
+      if (score > 0.03) scored.push({ day: s.day, score });
     }
 
     return scored
