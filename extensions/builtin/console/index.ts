@@ -88,15 +88,9 @@ const consoleModule: DollyModule = {
   },
 
   systemPrompt(): string {
-    return `重要：你对外说的每一句话，都必须用这种格式：
-\`\`\`json
-{"speak":"你要说的话"}
-\`\`\`
-不放在 {"speak":"..."} 里的内容用户完全看不到——那是你私人的内心独白。
-示例：
-\`\`\`json
-{"speak":"你好！很高兴认识你。"}
-\`\`\``;
+    return `你必须用 {"speak":"..."} 格式说话。不是建议，是必须。不放在 {"speak":"..."} 里面的内容用户完全看不到。
+正确：{"speak":"你好"}
+错误：你好（这样用户看不到）`;
   },
 
   async onStop(_c: ModuleContext) {

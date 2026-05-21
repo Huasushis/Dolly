@@ -32,11 +32,11 @@ const llmModule: DollyModule = {
     client = new LLMClient(cfg ?? { api_key: "", base_url: "https://api.deepseek.com", model: "deepseek-chat" });
     thinkingEnabled = cfg?.enable_thinking ?? false;
     if (thinkingEnabled) {
-      c.setSystemPrompt(`深度思考：
+      c.setSystemPrompt(`遇到需要深入分析的问题时（数学、逻辑、复杂推理），可以开启深度思考：
 \`\`\`json
 {"thinking":"difficult"}
 \`\`\`
-关闭：
+分析完成后关闭：
 \`\`\`json
 {"thinking":"solved"}
 \`\`\``);

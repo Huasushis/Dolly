@@ -33,7 +33,7 @@ describe("System prompt verification", () => {
     const inst = mod.default;
     const prompt = inst.systemPrompt ? inst.systemPrompt({} as any) : "";
     assert.ok(prompt.includes("speak"), "console prompt must mention speak");
-    assert.ok(prompt.includes("```json"), "console prompt must teach fenced JSON format");
+    assert.ok(prompt.includes('"speak"'), "console prompt must teach speak format");
   });
 
   it("Full system prompt assembly includes persona + framework inner world", () => {

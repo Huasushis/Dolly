@@ -53,7 +53,7 @@ describe("LLM Extension Features (config/static checks)", () => {
     const mod = await import(ext("builtin/console/index.ts"));
     const prompt = mod.default.systemPrompt({} as any);
     assert.ok(prompt.includes("speak"), "console prompt must mention speak");
-    assert.ok(prompt.includes("```json") || prompt.includes("fenced JSON"), "console prompt must use fenced JSON");
+    assert.ok(prompt.includes('"speak"'), "console prompt must teach speak");
   });
 
   it("module prompts don't cross-contaminate", async () => {
