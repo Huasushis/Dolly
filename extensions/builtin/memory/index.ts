@@ -159,7 +159,9 @@ async function _runMidnight(): Promise<BlockMutation[]> {
   }
 
   // Step 1: Summarize today
+  process.stderr.write(`[midnight] summarizing ${blocks.length} blocks...\n`);
   const summary = await store.summarize(blocks, true);
+  process.stderr.write(`[midnight] summarize returned: ${summary ? summary.day : 'null'}\n`);
   if (!summary) return mutations;
 
   // Step 2: Generate new background (compress entire context)

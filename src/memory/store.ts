@@ -64,6 +64,7 @@ mood: <关键词,逗号分隔>
 ${logSlice}`;
 
     const thinkResp = await this.summarizeClient.chat([{ role: "user", content: thinkPrompt }]);
+    process.stderr.write(`[summarize:1] ${thinkResp.slice(0, 100)}\n`);
     const thinkMatch = thinkResp.match(/think:\s*([\s\S]+?)(?=\nweight:|\nmood:|$)/);
     const weightMatch = thinkResp.match(/weight:\s*([\d.]+)/);
     const moodMatch = thinkResp.match(/mood:\s*([\s\S]+?)$/);
@@ -85,6 +86,7 @@ keywords: <关键词,逗号分隔>
 ${logSlice}`;
 
     const lessonsResp = await this.summarizeClient.chat([{ role: "user", content: lessonsPrompt }]);
+    process.stderr.write(`[summarize:2] ${lessonsResp.slice(0, 100)}\n`);
     const lessonsMatch = lessonsResp.match(/lessons:\s*([\s\S]+?)(?=\nkeywords:|$)/);
     const lessonsKwMatch = lessonsResp.match(/keywords:\s*([\s\S]+?)$/);
     const lessons = lessonsMatch?.[1]?.trim() ?? lessonsResp.slice(0, 300);
@@ -97,6 +99,7 @@ ${logSlice}`;
       : `基于你的情绪反思和收获教训，用一段话总结今天。不要列清单——融合事实、情绪感受和成长体会。\n\n情绪：${emotion}\n收获与教训：${lessons}\n\n日志：\n${logSlice}`;
 
     const resp = await this.summarizeClient.chat([{ role: "user", content: summaryPrompt }]);
+    process.stderr.write(`[summarize:3] ${resp.slice(0, 100)}\n`);
     const summary = resp.trim();
     if (!summary || summary.length < 20) return null;
 
