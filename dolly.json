@@ -12,7 +12,7 @@
     "protect_window_min": 10
   },
   "modules": {
-    "enabled": ["builtin/console", "builtin/llm", "builtin/memory", "builtin/skill", "builtin/mcp"],
+    "enabled": ["builtin/console", "builtin/memory", "builtin/skill", "builtin/llm", "builtin/mcp"],
     "builtin/llm": {
       "api_key_env": "DEEPSEEK_API_KEY",
       "base_url": "https://api.llm.ustc.edu.cn/v1",
