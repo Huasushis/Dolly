@@ -99,14 +99,11 @@ const llmModule: DollyModule = {
     const mutations: BlockMutation[] = [];
 
     try {
-      const extraBody = (thinkingEnabled && thinkingActive)
-        ? { enable_thinking: true }
-        : undefined;
-
-      if (extraBody) {
+      if (thinkingEnabled && thinkingActive) {
+        // Deep thinking mode
         const unlock = await ctx.lock.acquire("builtin/llm", Infinity);
         try {
-          const result = await client.chatWithReasoning([{ role: "system", content: sysPrompt }, { role: "user", content: userPrompt }] as any, extraBody);
+          const result = await client.chatWithReasoning([{ role: "system", content: sysPrompt }, { role: "user", content: userPrompt }] as any);
 
           if (result.reasoning) {
             ctx.emit("reasoning.captured", { content: result.reasoning });
@@ -117,13 +114,13 @@ const llmModule: DollyModule = {
             block: { type: "inner", content: result.content, meta: { source: "llm", subtype: "response" }, created: Date.now() },
           });
 
-          // Emit tool calls synchronously (not setImmediate — lock is held)
           const cmds = parseJsonCommands(result.content);
           for (const cmd of cmds) {
             if (cmd.tool) ctx.emit("tool.call_requested", { tool_name: cmd.tool, params: cmd.params ?? {} });
           }
         } finally { unlock(); }
       } else {
+        // Normal streaming
         let fullResponse = "";
         for await (const chunk of client.chatStream([{ role: "system", content: sysPrompt }, { role: "user", content: userPrompt }] as any)) {
           fullResponse += chunk;
@@ -134,7 +131,18 @@ const llmModule: DollyModule = {
           block: { type: "inner", content: fullResponse, meta: { source: "llm", subtype: "response" }, created: Date.now() },
         });
 
+        // If thinking was just turned ON, do a second reasoning pass
         const cmds = parseJsonCommands(fullResponse);
+        const justTurnedOn = thinkingEnabled && cmds.some(c => c.thinking === "difficult") && !thinkingActive;
+        if (justTurnedOn) {
+          thinkingActive = true;
+          const unlock = await ctx.lock.acquire("builtin/llm", Infinity);
+          try {
+            const result2 = await client.chatWithReasoning([{ role: "system", content: sysPrompt }, { role: "user", content: userPrompt }] as any);
+            if (result2.reasoning) ctx.emit("reasoning.captured", { content: result2.reasoning });
+          } finally { unlock(); }
+        }
+
         if (cmds.length > 0) {
           setImmediate(() => {
             for (const cmd of cmds) {

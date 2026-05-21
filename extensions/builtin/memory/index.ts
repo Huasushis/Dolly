@@ -188,9 +188,8 @@ ${bgText}`;
 
   // Step 3: Generate mskills from today's lessons (multi-step with NLP dedup + thinking)
   const enableThinking = (ctx.config as any)["builtin/memory"]?.enable_thinking ?? false;
-  const thinkOpt = enableThinking ? { enable_thinking: true } : undefined;
   const chat = (prompt: string) =>
-    enableThinking ? client.chatWithReasoning([{ role: "user", content: prompt }], thinkOpt).then(r => r.content) : client.chat([{ role: "user", content: prompt }]);
+    enableThinking ? client.chatWithReasoning([{ role: "user", content: prompt }]).then(r => r.content) : client.chat([{ role: "user", content: prompt }]);
 
   function parseFencedJson(text: string): Record<string, unknown> | null {
     const m = text.match(/```json\s*\n([\s\S]*?)```/);

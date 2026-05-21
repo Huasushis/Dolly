@@ -18,7 +18,6 @@ export class LLMClient {
     return resp.choices[0]?.message?.content ?? "";
   }
 
-  /** Stream chat. extraBody passed as extra_body to API. onReasoning called with collected reasoning after stream ends. */
   async *chatStream(
     messages: Array<{ role: string; content: string }>,
     extraBody?: Record<string, unknown>,
@@ -35,17 +34,16 @@ export class LLMClient {
     }
   }
 
-  /** Non-streaming call for when reasoning is needed */
+  /** DeepSeek thinking mode: reasoning_effort + extra_body.thinking.type */
   async chatWithReasoning(
     messages: Array<{ role: string; content: string }>,
-    extraBody?: Record<string, unknown>,
   ): Promise<{ content: string; reasoning: string }> {
-    const params: any = {
-      model: this.model, messages: messages as any, temperature: 0.7,
-    };
-    if (extraBody) params.extra_body = extraBody;
-
-    const resp = await this.client.chat.completions.create(params);
+    const resp = await this.client.chat.completions.create({
+      model: this.model,
+      messages: messages as any,
+      temperature: 0.7,
+      extra_body: { thinking: { type: "enabled" } },
+    } as any);
     const msg = resp.choices[0]?.message as any;
     return {
       content: msg?.content ?? "",
