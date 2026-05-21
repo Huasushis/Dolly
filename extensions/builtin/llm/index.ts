@@ -63,13 +63,25 @@ const llmModule: DollyModule = {
     // Queue pending changes when busy — they will be processed when current LLM call finishes
     if (processing) { pendingQueue.push(...changes); return []; }
 
-    // Respond to new outer blocks (external input) not from self
-    const newBlocks = changes.filter((ch) =>
-      ch.type === "added" &&
-      ch.block.type === "outer" &&
-      ch.block.meta?.source !== "llm" &&
-      !respondedTo.has(ch.block.id)
-    );
+    // Check if we just drained pendingQueue — if so, scan ALL context blocks for unresponded
+    const hasRetrigger = changes.some(ch => ch.type === "added" && ch.block.meta?.subtype === "_retrigger");
+    let newBlocks;
+    if (hasRetrigger) {
+      // Scan entire context for unprocessed outer blocks (pending queue was just drained)
+      newBlocks = ctx.getBlocks().filter(b =>
+        b.type === "outer" &&
+        b.meta?.source !== "llm" &&
+        !respondedTo.has(b.id)
+      ).map(b => ({ type: "added" as const, block: b }));
+    } else {
+      // Normal: filter current changes
+      newBlocks = changes.filter((ch) =>
+        ch.type === "added" &&
+        ch.block.type === "outer" &&
+        ch.block.meta?.source !== "llm" &&
+        !respondedTo.has(ch.block.id)
+      );
+    }
     if (newBlocks.length === 0) return [];
 
     processing = true;
