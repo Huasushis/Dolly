@@ -38,12 +38,11 @@ const memoryModule: DollyModule = {
   },
 
   systemPrompt(): string {
-    return `每次对话时，系统会自动注入相关记忆。你可以调节回忆深度：
+    return `系统会自动注入相关记忆。当你面对一个你不确定的问题——特别是别人问你"你还记得吗？""我之前说过什么？"这类问题时——主动使用 recall 查找记忆：
 \`\`\`json
 {"recall":"hard"}
 \`\`\`
-hard 深度回忆（5天5段，持续生效直到改变或凌晨重置）
-soft 轻量回忆（1天1段，同上）`;
+hard 深度回忆（5天5段），soft 轻量回忆（1天1段）`;
   },
 
   async handleCli(args: string[], _c: ModuleContext) {
