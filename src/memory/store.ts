@@ -119,7 +119,7 @@ export class MemoryStore {
       const entryVec = tfVector(tokenize(s.summary + " " + s.keywords.join(" ")));
       let score = cosineSimilarity(queryVec, entryVec);
       score *= (0.5 + s.weight);
-      if (score > 0.08) scored.push({ day: s.day, score });
+      if (score > 0.04) scored.push({ day: s.day, score });
     }
 
     return scored
