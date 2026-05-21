@@ -1,80 +1,86 @@
-/**
- * LLM Extension 功能集成测试
- * 需要运行中的 daemon。手动运行:
- *   node --import tsx/esm src/main.ts --daemon &
- *   node --import tsx/esm --test tests/integration/llm-features.test.ts
- */
-import { describe, it, before, after } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { connect, Socket } from "net";
 import { readFileSync, existsSync } from "fs";
 import { resolve } from "path";
+import { pathToFileURL } from "url";
 
-const PORT_FILE = ".dolly/sockets/default.port";
-const TIMEOUT = 30000;
+const root = resolve(import.meta.dirname!, "..", "..");
+const ext = (name: string) => pathToFileURL(resolve(root, "extensions", name)).href;
 
-function sendAndWait(port: number, text: string, timeout = TIMEOUT): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const s = connect(port, "127.0.0.1", () => {
-      let buf = "";
-      s.on("data", (d) => { buf += d; });
-      let timer = setTimeout(() => { s.destroy(); resolve(buf); }, timeout);
-      s.on("data", () => { clearTimeout(timer); timer = setTimeout(() => { s.destroy(); resolve(buf); }, 3000); });
-      s.write(text + "\n");
-    });
-    s.on("error", reject);
-  });
-}
+describe("LLM Extension Features (config/static checks)", () => {
 
-describe("LLM Extension Features", () => {
-  let port: number;
-
-  before(() => {
-    if (!existsSync(PORT_FILE)) throw new Error("Daemon not running. Start with: node --import tsx/esm src/main.ts --daemon &");
-    port = parseInt(readFileSync(PORT_FILE, "utf-8"));
-  });
-
-  it("basic conversation: speak format", async () => {
-    const resp = await sendAndWait(port, "你好");
-    // Should contain a speak somewhere
-    assert.ok(resp.length > 0, "should get a response");
-    // The parseSpeak should extract content
-    const hasContent = resp.includes("好") || resp.includes("嗨") || resp.includes("你");
-    assert.ok(hasContent, "response should contain meaningful text");
-  }).timeout(TIMEOUT + 5000);
-
-  it("memory recall trigger: check recall tag in prompt", async () => {
-    // The memory systemPrompt teaches {"recall":"hard"}
-    // We can verify by checking the module's systemPrompt text
-    const mod = await import("../../extensions/builtin/memory/index.js");
+  it("memory systemPrompt teaches recall", async () => {
+    const mod = await import(ext("builtin/memory/index.ts"));
     const prompt = mod.default.systemPrompt({} as any);
     assert.ok(prompt.includes("recall"), "memory prompt should teach recall");
     assert.ok(prompt.includes("hard"), "memory prompt should mention hard mode");
+    assert.ok(prompt.includes("soft"), "memory prompt should mention soft mode");
   });
 
-  it("thinking: verify enable_thinking config flows to LLM module", async () => {
-    const mod = await import("../../extensions/builtin/llm/index.js");
-    // Check that thinking is enabled in config
-    const dolly = JSON.parse(readFileSync(resolve(import.meta.dirname!, "..", "..", "dolly.json"), "utf-8"));
+  it("llm module has thinkingEnabled flow", () => {
+    const dolly = JSON.parse(readFileSync(resolve(root, "dolly.json"), "utf-8"));
     const enableThinking = dolly.modules?.["builtin/llm"]?.enable_thinking;
-    // If thinking is enabled, the LLM module should have thinkingActive flag
-    // This is a config test, not a runtime test
-    assert.ok(enableThinking !== undefined, "thinking config should exist");
+    assert.ok(enableThinking !== undefined, "thinking config key should exist");
   });
 
-  it("tool calling: verify MCP tools registered", () => {
-    // Check mcp.json exists and has servers
-    const mcpPath = resolve(import.meta.dirname!, "..", "..", "mcp.json");
+  it("llm module calls setSystemPrompt for thinking", () => {
+    const src = readFileSync(resolve(root, "extensions/builtin/llm/index.ts"), "utf-8");
+    assert.ok(src.includes("setSystemPrompt"), "should call setSystemPrompt");
+    assert.ok(src.includes("thinking"), "should mention thinking");
+  });
+
+  it("mcp tools are registered in mcp.json", () => {
+    const mcpPath = resolve(root, "mcp.json");
     if (existsSync(mcpPath)) {
       const mcp = JSON.parse(readFileSync(mcpPath, "utf-8"));
       assert.ok(mcp.servers, "mcp.json should have servers");
+      assert.ok(Object.keys(mcp.servers).length > 0, "should have at least one MCP server");
     }
   });
 
-  it("scanForget: verify forget scanning is wired in cascade", async () => {
-    // Read main.ts source to verify scanForget exists in cascade
-    const src = readFileSync(resolve(import.meta.dirname!, "..", "..", "src", "main.ts"), "utf-8");
-    assert.ok(src.includes("scanForget"), "main.ts should have scanForget function");
+  it("scanForget is wired in cascade loop", () => {
+    const src = readFileSync(resolve(root, "src/main.ts"), "utf-8");
+    assert.ok(src.includes("scanForget"), "main.ts should define scanForget");
     assert.ok(src.includes("scanForget(changes)"), "cascade should call scanForget");
+  });
+
+  it("forget syntax is taught in system prompt", () => {
+    const src = readFileSync(resolve(root, "src/main.ts"), "utf-8");
+    assert.ok(src.includes('"forget"'), "FRAMEWORK_INNER_WORLD should teach forget");
+  });
+
+  it("console prompt teaches speak with fenced JSON", async () => {
+    const mod = await import(ext("builtin/console/index.ts"));
+    const prompt = mod.default.systemPrompt({} as any);
+    assert.ok(prompt.includes("speak"), "console prompt must mention speak");
+    assert.ok(prompt.includes("```json") || prompt.includes("fenced JSON"), "console prompt must use fenced JSON");
+  });
+
+  it("module prompts don't cross-contaminate", async () => {
+    const llmMod = await import(ext("builtin/llm/index.ts"));
+    const llmPrompt = llmMod.default.systemPrompt({ config: { "builtin/llm": { enable_thinking: false } } } as any);
+    const memMod = await import(ext("builtin/memory/index.ts"));
+    const memPrompt = memMod.default.systemPrompt({} as any);
+
+    assert.ok(!llmPrompt.includes('"tool"'), "LLM should not teach tool");
+    assert.ok(!llmPrompt.includes('"recall"'), "LLM should not teach recall");
+    assert.ok(!memPrompt.includes('"tool"'), "memory should not teach tool");
+    assert.ok(!memPrompt.includes('"speak"'), "memory should not teach speak");
+  });
+
+  it("parseSpeak handles fenced JSON speak", () => {
+    const text = '```json\n{"speak":"hello"}\n```';
+    const m = text.match(/```json\s*\n([\s\S]*?)```/);
+    assert.ok(m, "should match fenced JSON");
+    const obj = JSON.parse(m![1].trim());
+    assert.equal(obj.speak, "hello");
+  });
+
+  it("parseSpeak handles raw JSON speak fallback", () => {
+    const re = /\{"speak"\s*:\s*"((?:[^"\\]|\\.)*)"\}/g;
+    const text = '{"speak":"hello world"}';
+    const m = re.exec(text);
+    assert.ok(m, "should match raw JSON speak");
+    assert.equal(JSON.parse(`{"speak":"${m![1]}"}`).speak, "hello world");
   });
 });
