@@ -52,51 +52,36 @@ export class MemoryStore {
     const maxChars = 10000;
     const logSlice = text.length > maxChars ? text.slice(-maxChars) : text;
 
-    // ── Step 1: 情绪反思 ──
-    const thinkPrompt = `回顾你今天经历过的以下片段。反思：哪些让你情绪波动强烈？极度高兴、十分悲伤、非常愤怒、强烈好奇——无论正面负面，只要印象深刻就值得记住。用 2-3 句内心独白反思。然后给出 0.1-1.0 的情绪强度（越高越深刻，不分正负）和 3-5 个情绪关键词。
+    const LOG_FORMAT = `日志格式：[outer]=用户输入，[inner]=你的回复/记忆注入。所有[inner]内容（含[记忆]标记）也属于已有信息。**严格禁止编造日志中没有出现的内容。** 只能从日志中提取，不能添加任何日志之外的情节、细节、情感。`;
 
-格式：
-think: <反思>
-weight: <数字>
-mood: <关键词,逗号分隔>
-
-日志：
-${logSlice}`;
+    // ── Step 1: 关键事实（谁说了什么，有什么重要信息）──
+    const thinkPrompt = `${LOG_FORMAT}\n\n提取今天对话中用户分享的关键信息：人名、密码、偏好、事件。只提取[outer]中确实出现的内容。\n\n格式：\nfacts: <一句话>\nweight: <0.1-1.0>\nkeywords: <词,词,词>\n\n日志：\n${logSlice}`;
 
     const thinkResp = await this.summarizeClient.chat([{ role: "user", content: thinkPrompt }]);
     process.stderr.write(`[summarize:1] ${thinkResp.slice(0, 100)}\n`);
-    const thinkMatch = thinkResp.match(/think:\s*([\s\S]+?)(?=\nweight:|\nmood:|$)/);
+    const factsMatch = thinkResp.match(/facts:\s*([\s\S]+?)(?=\nweight:|\nkeywords:|$)/);
     const weightMatch = thinkResp.match(/weight:\s*([\d.]+)/);
-    const moodMatch = thinkResp.match(/mood:\s*([\s\S]+?)$/);
-    const emotion = thinkMatch?.[1]?.trim() ?? thinkResp.slice(0, 300);
+    const kwMatch = thinkResp.match(/keywords:\s*([\s\S]+?)$/);
+    const facts = factsMatch?.[1]?.trim() ?? thinkResp.slice(0, 300);
     const weight = Math.min(1, Math.max(0.1, parseFloat(weightMatch?.[1] ?? "0.5")));
-    const moodStr = moodMatch?.[1]?.trim() ?? "";
-    const emotionKeywords = moodStr.split(/[,，\s]+/).filter((k) => k.length > 0).slice(0, 5);
+    const factsKwStr = kwMatch?.[1]?.trim() ?? "";
+    const factsKeywords = factsKwStr.split(/[,，\s]+/).filter((k) => k.length > 0).slice(0, 5);
 
-    // ── Step 2: 收获与教训 ──
-    const lessonsPrompt = `回顾今天：你是否学到了令你欣喜的新东西？或者遭受了令人难受的教训？有没有让你"啊哈！"的瞬间，或者让你后悔、警醒的事？
-
-列出 3-5 个关键词，并用一段话描述这些收获/教训——不要只列关键词，要讲清楚它们之间的关联和来龙去脉。
-
-格式：
-lessons: <一段话描述收获与教训>
-keywords: <关键词,逗号分隔>
-
-日志：
-${logSlice}`;
+    // ── Step 2: 了解到的信息（你从对话中知道了什么新东西）──
+    const lessonsPrompt = `${LOG_FORMAT}\n\n从今天的对话中，关于对方你了解到了哪些新信息？总结成一段话。\n\n格式：\nlessons: <一段话>\nkeywords: <词,词,词>\n\n日志：\n${logSlice}`;
 
     const lessonsResp = await this.summarizeClient.chat([{ role: "user", content: lessonsPrompt }]);
     process.stderr.write(`[summarize:2] ${lessonsResp.slice(0, 100)}\n`);
     const lessonsMatch = lessonsResp.match(/lessons:\s*([\s\S]+?)(?=\nkeywords:|$)/);
-    const lessonsKwMatch = lessonsResp.match(/keywords:\s*([\s\S]+?)$/);
+    const kw2Match = lessonsResp.match(/keywords:\s*([\s\S]+?)$/);
     const lessons = lessonsMatch?.[1]?.trim() ?? lessonsResp.slice(0, 300);
-    const lessonsKwStr = lessonsKwMatch?.[1]?.trim() ?? "";
+    const lessonsKwStr = kw2Match?.[1]?.trim() ?? "";
     const lessonsKeywords = lessonsKwStr.split(/[,，\s]+/).filter((k) => k.length > 0).slice(0, 5);
 
-    // ── Step 3: 总体总结 ──
+    // ── Step 3: 摘要（合并事实+了解到信息，一段话）──
     const summaryPrompt = existing
-      ? `你今天已经有了一段总结：\n${existing.summary}\n\n补充新的经历。把新旧合并为一段完整的总结。融合你的情绪感受和收获教训。\n\n情绪：${emotion}\n收获与教训：${lessons}\n\n新日志：\n${logSlice}`
-      : `基于你的情绪反思和收获教训，用一段话总结今天。不要列清单——融合事实、情绪感受和成长体会。\n\n情绪：${emotion}\n收获与教训：${lessons}\n\n日志：\n${logSlice}`;
+      ? `已有摘要：${existing.summary}\n\n合并新内容，更新为一段新摘要。\n关键事实：${facts}\n了解到：${lessons}\n新日志：\n${logSlice}`
+      : `用一段话总结今天。包含关键事实和了解到的信息。\n关键事实：${facts}\n了解到：${lessons}\n日志：\n${logSlice}`;
 
     const resp = await this.summarizeClient.chat([{ role: "user", content: summaryPrompt }]);
     process.stderr.write(`[summarize:3] ${resp.slice(0, 100)}\n`);
@@ -104,13 +89,13 @@ ${logSlice}`;
     if (!summary || summary.length < 20) return null;
 
     const allKeywords = [...new Set([
-      ...emotionKeywords,
+      ...factsKeywords,
       ...lessonsKeywords,
       ...extractKeywords(summary, 8),
     ])].slice(0, 15);
 
     const entry: DaySummary = {
-      day, emotion, emotionKeywords, emotionWeight: weight,
+      day, emotion: facts, emotionKeywords: factsKeywords, emotionWeight: weight,
       lessons, lessonsKeywords,
       summary, keywords: allKeywords, weight,
     };
