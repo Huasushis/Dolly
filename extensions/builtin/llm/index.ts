@@ -12,6 +12,7 @@ let thinkingActive = false;
 
 function parseJsonCommands(text: string): Array<Record<string, unknown>> {
   const cmds: Array<Record<string, unknown>> = [];
+  // Primary: fenced JSON ```json\n{...}\n```
   const re = /```json\s*\n([\s\S]*?)```/g;
   let m;
   while ((m = re.exec(text))) {
@@ -19,6 +20,17 @@ function parseJsonCommands(text: string): Array<Record<string, unknown>> {
       const obj = JSON.parse(m[1].trim());
       if (obj && typeof obj === "object" && !Array.isArray(obj)) cmds.push(obj);
     } catch {}
+  }
+  // Fallback: raw JSON {...} at start of lines
+  if (cmds.length === 0) {
+    const rawRe = /\{[\s\S]*?"(?:thinking|tool|forget)"[\s\S]*?\}/g;
+    let rm;
+    while ((rm = rawRe.exec(text))) {
+      try {
+        const obj = JSON.parse(rm[0]);
+        if (obj && typeof obj === "object" && !Array.isArray(obj)) cmds.push(obj);
+      } catch {}
+    }
   }
   return cmds;
 }
