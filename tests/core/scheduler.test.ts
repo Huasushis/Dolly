@@ -234,6 +234,42 @@ describe("Scheduler", () => {
       const intervalAfterSecondAdjust = scheduler.getInterval("upstream")!;
       expect(intervalAfterSecondAdjust).toBeGreaterThan(intervalAfterAdjustRates);
     });
+
+    it("same tick: report() + adjustRates() must not double-adjust the same upstream", () => {
+      scheduler.register({
+        id: "upstream",
+        config: { initialIntervalMs: 1000, minIntervalMs: 500, maxIntervalMs: 60000 },
+      });
+      scheduler.register({
+        id: "downstream",
+        config: { initialIntervalMs: 1000, minIntervalMs: 500, maxIntervalMs: 60000 },
+      });
+      scheduler.setTopology("downstream", ["upstream"]);
+
+      const intervalBefore = scheduler.getInterval("upstream")!;
+
+      // Simulate a single tick: orchestrator calls report() then adjustRates()
+      // report() triggers backoff on upstream
+      scheduler.report({
+        moduleId: "downstream",
+        executionTimeMs: 5000,
+        bufferEmpty: false,
+      });
+      const afterReport = scheduler.getInterval("upstream")!;
+      expect(afterReport).toBeGreaterThan(intervalBefore); // report did adjust
+
+      // adjustRates() in the same tick — should NOT stack another adjustment
+      const buffers = new Map([["upstream", 10], ["downstream", 10]]);
+      const limited = scheduler.adjustRates(buffers, { totalBufferThreshold: 5 });
+      const afterAdjust = scheduler.getInterval("upstream")!;
+
+      // upstream was skipped by adjustRates (adjustedByReport flag)
+      expect(afterAdjust).toBe(afterReport);
+
+      // But downstream (also busy, no flag) DOES get rate-limited
+      const downstreamAfter = scheduler.getInterval("downstream")!;
+      expect(downstreamAfter).toBeGreaterThan(1000);
+    });
   });
 
   describe("stop", () => {
