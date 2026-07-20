@@ -35,14 +35,15 @@ describe("Orchestrator", () => {
   // Pino transport worker threads may try to write to the log file after
   // the temp directory has been removed, causing ENOENT uncaught exceptions.
   // We suppress these specific errors at the process level.
-  const enoentHandler = (err: Error) => {
-    if (
-      err &&
-      (err as any).code === "ENOENT" &&
-      (err as any).path &&
-      typeof (err as any).path === "string" &&
-      (err as any).path.includes("dolly-orch-test-")
-    ) {
+  const enoentHandler = (err: any) => {
+    // Pino transport worker (thread-stream) may emit ENOENT after temp dir removal.
+    // Check both standard .code/.path and the error message string.
+    const isEnoent = err?.code === "ENOENT" || (typeof err?.message === "string" && err.message.includes("ENOENT"));
+    const isLogRelated = isEnoent && (
+      (typeof err?.path === "string" && err.path.includes("dolly-orch-test-")) ||
+      (typeof err?.message === "string" && err.message.includes("dolly-orch-test-"))
+    );
+    if (isLogRelated) {
       // Suppress expected ENOENT from pino transport worker after temp dir cleanup
     } else {
       throw err;

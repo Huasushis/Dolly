@@ -416,7 +416,7 @@ export class Scheduler {
    * Compute next interval via AIMD logic (shared by upstream and self-adjustment).
    * @param targetInterval  - The interval of the module being adjusted
    * @param executionTimeMs - How long the reporting module took
-   * @param reportInterval  - The reporting module's current interval (for comparison)
+   * @param reportInterval  - The reporting module's current interval (for FAST_RATIO comparison)
    * @param bufferEmpty     - Whether the reporting module's buffer is empty
    */
   private computeAimdInterval(
@@ -425,12 +425,14 @@ export class Scheduler {
     reportInterval: number,
     bufferEmpty: boolean,
   ): number {
-    if (executionTimeMs > reportInterval || !bufferEmpty) {
-      // Slow or backlog → backoff
+    // Backoff: downstream took longer than target's tick interval → upstream is too fast
+    // Or: downstream buffer not empty → pipeline backing up
+    if (executionTimeMs > targetInterval || !bufferEmpty) {
       return targetInterval * BACKOFF_FACTOR;
     }
+    // Speedup: downstream processed quickly (relative to its own interval) AND buffer empty
+    // → pipeline healthy, upstream can go faster
     if (executionTimeMs < reportInterval * FAST_RATIO && bufferEmpty) {
-      // Fast and empty → speed up
       return targetInterval * UPSTREAM_SPEEDUP_FACTOR;
     }
     return targetInterval;

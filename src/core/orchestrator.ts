@@ -162,6 +162,13 @@ export class Orchestrator {
     }
 
     this.logger.info("Orchestrator stopped");
+
+    // Flush transport worker to ensure all pending log writes complete
+    // before the logger's file handles become invalid (e.g. temp dir cleanup)
+    await new Promise<void>((resolve) => {
+      this.logger.flush(() => resolve());
+      setTimeout(resolve, 200);
+    });
   }
 
   /** Scheduler 的 onTick 回调 */
