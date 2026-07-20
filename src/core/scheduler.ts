@@ -276,7 +276,7 @@ export class Scheduler {
         if (!upState) continue;
 
         const nextInterval = this.computeAimdInterval(
-          upState.currentInterval, executionTimeMs, currentInterval, bufferEmpty,
+          upState.currentInterval, executionTimeMs, bufferEmpty,
         );
         const clamped = clamp(nextInterval, upState.config.minIntervalMs, upState.config.maxIntervalMs);
 
@@ -290,7 +290,7 @@ export class Scheduler {
     } else {
       // No upstream: adjust SELF (source module fallback)
       const nextInterval = this.computeAimdInterval(
-        currentInterval, executionTimeMs, currentInterval, bufferEmpty,
+        currentInterval, executionTimeMs, bufferEmpty,
       );
       const clamped = clamp(nextInterval, state.config.minIntervalMs, state.config.maxIntervalMs);
 
@@ -415,24 +415,22 @@ export class Scheduler {
   /**
    * Compute next interval via AIMD logic (shared by upstream and self-adjustment).
    * @param targetInterval  - The interval of the module being adjusted
-   * @param executionTimeMs - How long the reporting module took
-   * @param reportInterval  - The reporting module's current interval (for FAST_RATIO comparison)
+   * @param executionTimeMs - How long the reporting module took to execute
    * @param bufferEmpty     - Whether the reporting module's buffer is empty
    */
   private computeAimdInterval(
     targetInterval: number,
     executionTimeMs: number,
-    reportInterval: number,
     bufferEmpty: boolean,
   ): number {
-    // Backoff: downstream took longer than target's tick interval → upstream is too fast
+    // Backoff: downstream took longer than target's tick interval → upstream is producing too fast
     // Or: downstream buffer not empty → pipeline backing up
     if (executionTimeMs > targetInterval || !bufferEmpty) {
       return targetInterval * BACKOFF_FACTOR;
     }
-    // Speedup: downstream processed quickly (relative to its own interval) AND buffer empty
-    // → pipeline healthy, upstream can go faster
-    if (executionTimeMs < reportInterval * FAST_RATIO && bufferEmpty) {
+    // Speedup: downstream processed in less than half of TARGET's interval AND buffer empty
+    // → downstream easily keeps up with upstream's pace, upstream can go faster
+    if (executionTimeMs < targetInterval * FAST_RATIO && bufferEmpty) {
       return targetInterval * UPSTREAM_SPEEDUP_FACTOR;
     }
     return targetInterval;

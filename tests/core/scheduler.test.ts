@@ -79,16 +79,81 @@ describe("Scheduler", () => {
 
       const upstreamIntervalBefore = scheduler.getInterval("upstream")!;
 
-      // Report underload: execution time < interval * 0.5, buffer empty
+      // Report underload: execution time < upstream interval * 0.5, buffer empty
       scheduler.report({
         moduleId: "downstream",
-        executionTimeMs: 100, // < downstream interval * 0.5
+        executionTimeMs: 100, // < upstream interval * 0.5 (1000)
         bufferEmpty: true,
       });
 
       const upstreamIntervalAfter = scheduler.getInterval("upstream")!;
       // UPSTREAM_SPEEDUP_FACTOR = 0.8, so interval should decrease
       expect(upstreamIntervalAfter).toBeLessThan(upstreamIntervalBefore);
+    });
+
+    it("should NOT speed up upstream when execution exceeds target interval (LLM regression)", () => {
+      // Regression test: upstream (LLM) has large interval (10s),
+      // downstream is fast (1s interval, 300ms execution).
+      // Old bug: downstream's "fast" report would speed up LLM because
+      // executionTimeMs was compared against downstream interval, not LLM's.
+      scheduler.register({
+        id: "llm",
+        config: { initialIntervalMs: 10000, minIntervalMs: 2000, maxIntervalMs: 60000 },
+      });
+      scheduler.register({
+        id: "downstream",
+        config: { initialIntervalMs: 1000, minIntervalMs: 500, maxIntervalMs: 60000 },
+      });
+      scheduler.setTopology("downstream", ["llm"]);
+
+      const llmIntervalBefore = scheduler.getInterval("llm")!;
+
+      // Downstream execution (300ms) < LLM interval * 0.5 (5000ms) → speedup triggers
+      // This is CORRECT behavior: downstream handles output easily, LLM can go faster.
+      scheduler.report({
+        moduleId: "downstream",
+        executionTimeMs: 300,
+        bufferEmpty: true,
+      });
+
+      const llmIntervalAfterSpeedup = scheduler.getInterval("llm")!;
+      expect(llmIntervalAfterSpeedup).toBeLessThan(llmIntervalBefore);
+
+      // Now verify backoff: downstream execution (15000ms) > LLM interval → backoff
+      scheduler.report({
+        moduleId: "downstream",
+        executionTimeMs: 15000,
+        bufferEmpty: true,
+      });
+
+      const llmIntervalAfterBackoff = scheduler.getInterval("llm")!;
+      expect(llmIntervalAfterBackoff).toBeGreaterThan(llmIntervalAfterSpeedup);
+    });
+
+    it("should NOT speed up when executionTimeMs >= targetInterval * 0.5", () => {
+      // Speedup only when downstream finishes in < half of upstream's interval
+      scheduler.register({
+        id: "upstream",
+        config: { initialIntervalMs: 2000, minIntervalMs: 500, maxIntervalMs: 60000 },
+      });
+      scheduler.register({
+        id: "downstream",
+        config: { initialIntervalMs: 1000, minIntervalMs: 500, maxIntervalMs: 60000 },
+      });
+      scheduler.setTopology("downstream", ["upstream"]);
+
+      const upstreamBefore = scheduler.getInterval("upstream")!;
+
+      // downstream execution = 1200ms, upstream interval * 0.5 = 1000ms
+      // 1200 >= 1000 → NO speedup, NO backoff (neutral zone)
+      scheduler.report({
+        moduleId: "downstream",
+        executionTimeMs: 1200,
+        bufferEmpty: true,
+      });
+
+      const upstreamAfter = scheduler.getInterval("upstream")!;
+      expect(upstreamAfter).toBe(upstreamBefore);
     });
   });
 

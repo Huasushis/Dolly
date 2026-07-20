@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterAll } from "vitest";
 import { Orchestrator } from "../../src/core/orchestrator.js";
 import type { DollyConfig, Block } from "../../src/core/types.js";
 import type { Module, DollyExtension } from "../../src/sdk/types.js";
@@ -19,15 +19,26 @@ function createMockExtension(name: string, moduleFactory: (id: string) => Module
 
 describe("Integration: Pipeline", () => {
   let tempDir: string;
+  const tempDirs: string[] = [];
 
   beforeEach(() => {
     tempDir = mkdtempSync(path.join(tmpdir(), "dolly-int-test-"));
+    tempDirs.push(tempDir);
   });
 
-  afterEach(() => {
-    if (existsSync(tempDir)) {
-      rmSync(tempDir, { recursive: true, force: true });
+  afterAll(() => {
+    // Clean up all temp dirs after ALL tests complete, ensuring pino
+    // transport worker threads have finished flushing and closed.
+    for (const dir of tempDirs) {
+      if (existsSync(dir)) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
     }
+    tempDirs.length = 0;
   });
 
   it("end-to-end: input → orchestrator → mock module → page output", async () => {

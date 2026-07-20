@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterAll } from "vitest";
 import { Orchestrator } from "../../src/core/orchestrator.js";
 import type { DollyConfig } from "../../src/core/types.js";
 import type { Module, ModuleContext, DollyExtension } from "../../src/sdk/types.js";
@@ -31,35 +31,11 @@ function createMockExtension(name: string, modules: Map<string, Module>): DollyE
 describe("Orchestrator", () => {
   let tempDir: string;
   let config: DollyConfig;
-
-  // Pino transport worker threads may try to write to the log file after
-  // the temp directory has been removed, causing ENOENT uncaught exceptions.
-  // We suppress these specific errors at the process level.
-  const enoentHandler = (err: any) => {
-    // Pino transport worker (thread-stream) may emit ENOENT after temp dir removal.
-    // Check both standard .code/.path and the error message string.
-    const isEnoent = err?.code === "ENOENT" || (typeof err?.message === "string" && err.message.includes("ENOENT"));
-    const isLogRelated = isEnoent && (
-      (typeof err?.path === "string" && err.path.includes("dolly-orch-test-")) ||
-      (typeof err?.message === "string" && err.message.includes("dolly-orch-test-"))
-    );
-    if (isLogRelated) {
-      // Suppress expected ENOENT from pino transport worker after temp dir cleanup
-    } else {
-      throw err;
-    }
-  };
-
-  beforeAll(() => {
-    process.on("uncaughtException", enoentHandler);
-  });
-
-  afterAll(() => {
-    process.off("uncaughtException", enoentHandler);
-  });
+  const tempDirs: string[] = [];
 
   beforeEach(() => {
     tempDir = mkdtempSync(path.join(tmpdir(), "dolly-orch-test-"));
+    tempDirs.push(tempDir);
     config = {
       name: "test",
       dataDir: tempDir,
@@ -78,14 +54,19 @@ describe("Orchestrator", () => {
     };
   });
 
-  afterEach(() => {
-    if (existsSync(tempDir)) {
-      try {
-        rmSync(tempDir, { recursive: true, force: true });
-      } catch {
-        // Ignore cleanup errors - pino transport may still hold file handles
+  afterAll(() => {
+    // Clean up all temp dirs after ALL tests complete, ensuring pino
+    // transport worker threads have finished flushing and closed.
+    for (const dir of tempDirs) {
+      if (existsSync(dir)) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // Ignore cleanup errors
+        }
       }
     }
+    tempDirs.length = 0;
   });
 
   describe("module registration and execution", () => {
