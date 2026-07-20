@@ -26,3 +26,24 @@ DEVELOPMENT.md
 docs/TESTCHECKLIST.md
 .dolly/
 .devflow/
+
+# Experiment report
+EXPERIMENT_REPORT.md
+
+# LevelUpper test configs
+test/levelupper-configs/
+
+# IDE / Editor
+.qoder/
+.vscode/
+.idea/
+
+# Debug
+debug.log
+
+# Test data (too large for GitHub)
+test/memory-data/
+
+# OS
+Thumbs.db
+.DS_Store

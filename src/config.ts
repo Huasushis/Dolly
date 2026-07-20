@@ -1,68 +1,100 @@
+import { readFileSync, existsSync } from "fs";
 import { resolve } from "path";
-import { existsSync, readFileSync } from "fs";
+import { z } from "zod";
+import type { DollyConfig, ModuleConfig, ScheduleConfig } from "./core/types.js";
 
-export interface LLMConfig {
-  api_key: string; base_url: string; model: string; enable_thinking?: boolean;
+// ── Zod Schemas ──────────────────────────────────────────────────
+
+const LLMProviderSchema = z.object({
+  base_url: z.string(),
+  api_key: z.string(),
+  model: z.string(),
+});
+
+const ScheduleSchema = z.object({
+  initialIntervalMs: z.number().optional(),
+  minIntervalMs: z.number().optional(),
+  maxIntervalMs: z.number().optional(),
+});
+
+const ModuleSchema = z.object({
+  id: z.string(),
+  extension: z.string(),
+  inputPages: z.array(z.string()),
+  outputPages: z.array(z.string()),
+  schedule: ScheduleSchema.optional(),
+  config: z.record(z.any()).optional(),
+});
+
+const ConfigSchema = z.object({
+  name: z.string().default("default"),
+  dataDir: z.string().default(".dolly/profiles/default"),
+  llm: z.record(LLMProviderSchema).default({}),
+  pages: z.array(z.object({ id: z.string() })).default([]),
+  modules: z.array(ModuleSchema).default([]),
+  logging: z.object({ level: z.string().default("info") }).default({}),
+});
+
+// ── Defaults ─────────────────────────────────────────────────────
+
+const DEFAULT_SCHEDULE: ScheduleConfig = {
+  initialIntervalMs: 2000,
+  minIntervalMs: 500,
+  maxIntervalMs: 60000,
+};
+
+// ── Env var replacement ─────────────────────────────────────────
+
+function replaceEnvVars(obj: unknown): unknown {
+  if (typeof obj === "string") {
+    return obj.replace(/\$(\w+)/g, (_, name) => process.env[name] ?? "");
+  }
+  if (Array.isArray(obj)) return obj.map(replaceEnvVars);
+  if (obj !== null && typeof obj === "object") {
+    return Object.fromEntries(
+      Object.entries(obj as Record<string, unknown>).map(([k, v]) => [k, replaceEnvVars(v)])
+    );
+  }
+  return obj;
 }
 
-export interface DollyConfig {
-  name: string;
-  log_level?: string;
-  agent?: { name?: string; persona?: string };
-  context: { max_tokens: number; compression_threshold: number; decay_rate?: number; protect_window_min?: number };
-  modules: { enabled: string[]; [name: string]: any };
-  daemon: { pid_dir: string };
-}
+// ── Public API ───────────────────────────────────────────────────
 
-export function loadConfig(): DollyConfig {
-  const configPath = process.env.DOLLY_CONFIG
-    ? resolve(process.env.DOLLY_CONFIG)
-    : resolve(import.meta.dirname!, "..", "dolly.json");
-  if (!existsSync(configPath)) throw new Error(`Config not found: ${configPath}`);
+/**
+ * Load and validate a Dolly config file.
+ * @param configPath  Path to JSON config (default: ./dolly.json)
+ */
+export function loadConfig(configPath?: string): DollyConfig {
+  const path = resolve(configPath ?? "dolly.json");
+  if (!existsSync(path)) throw new Error(`Config not found: ${path}`);
 
-  const raw = JSON.parse(readFileSync(configPath, "utf-8"));
-  const envKey = (key: string) => process.env[key] ?? "";
+  const raw = JSON.parse(readFileSync(path, "utf-8"));
+  const withEnv = replaceEnvVars(raw);
+  const parsed = ConfigSchema.parse(withEnv);
 
-  const modules: Record<string, any> = { ...raw.modules };
-
-  // Resolve builtin/llm config
-  const llmRaw = modules["builtin/llm"] ?? raw.llm?.main;
-  modules["builtin/llm"] = {
-    api_key: envKey(llmRaw?.api_key_env ?? "DEEPSEEK_API_KEY"),
-    base_url: llmRaw?.base_url ?? "https://api.deepseek.com",
-    model: llmRaw?.model ?? "deepseek-chat",
-    enable_thinking: llmRaw?.enable_thinking ?? false,
-  };
-
-  // Resolve builtin/memory config
-  const memRaw = modules["builtin/memory"] ?? raw.llm?.memory;
-  modules["builtin/memory"] = {
-    api_key: envKey(memRaw?.api_key_env ?? "DEEPSEEK_API_KEY"),
-    base_url: memRaw?.base_url ?? "https://api.deepseek.com",
-    model: memRaw?.model ?? "deepseek-chat",
-    idle_minutes: memRaw?.idle_minutes ?? raw.memory?.idle_minutes ?? 60,
-  };
-
-  // Resolve builtin/skill config (guard llm reuses main config)
-  const skillRaw = modules["builtin/skill"] ?? {};
-  modules["builtin/skill"] = {
-    api_key: envKey(skillRaw?.api_key_env ?? "DEEPSEEK_API_KEY"),
-    base_url: skillRaw?.base_url ?? modules["builtin/llm"].base_url,
-    model: skillRaw?.model ?? modules["builtin/llm"].model,
-    skills_dirs: skillRaw?.skills_dirs ?? ["./skills", "~/.dolly/skills"],
-  };
+  // Fill schedule defaults for each module
+  const modules: ModuleConfig[] = parsed.modules.map((m) => ({
+    ...m,
+    schedule: {
+      initialIntervalMs: m.schedule?.initialIntervalMs ?? DEFAULT_SCHEDULE.initialIntervalMs,
+      minIntervalMs: m.schedule?.minIntervalMs ?? DEFAULT_SCHEDULE.minIntervalMs,
+      maxIntervalMs: m.schedule?.maxIntervalMs ?? DEFAULT_SCHEDULE.maxIntervalMs,
+    },
+  }));
 
   return {
-    name: raw.name ?? "dolly",
-    log_level: raw.log_level ?? "info",
-    agent: raw.agent,
-    context: {
-      max_tokens: raw.context?.max_tokens ?? 32768,
-      compression_threshold: raw.context?.compression_threshold ?? 0.8,
-      decay_rate: raw.context?.decay_rate,
-      protect_window_min: raw.context?.protect_window_min,
-    },
-    modules: { enabled: modules.enabled ?? raw.modules?.enabled ?? ["builtin/llm", "builtin/mcp"], ...modules },
-    daemon: { pid_dir: raw.daemon?.pid_dir ?? ".dolly/daemons" },
+    name: parsed.name,
+    dataDir: resolve(parsed.dataDir),
+    llm: parsed.llm,
+    pages: parsed.pages,
+    modules,
+    logging: parsed.logging,
   };
+}
+
+/**
+ * Resolve profile data directory to an absolute path.
+ */
+export function configToProfileDir(_configPath: string, dataDir: string): string {
+  return resolve(dataDir);
 }
