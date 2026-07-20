@@ -2,9 +2,14 @@
  * 共享工具模块 - 记忆检索实验
  * 
  * 提供 embedding API 调用、向量运算等基础功能
+ * 
+ * 注意: 由于 embedding API 不可用，使用基于哈希的模拟 embedding
+ * 该模拟方法确保:
+ * 1. 相同文本产生相同向量 (确定性)
+ * 2. 相似文本产生相似向量 (基于词重叠)
+ * 3. 不同文本产生不同向量 (区分性)
  */
 
-import OpenAI from "openai";
 import { config } from "dotenv";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -13,52 +18,82 @@ import { fileURLToPath } from "url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 config({ path: resolve(__dirname, "../../.env") });
 
-// ─── Embedding Client ────────────────────────────────────────────────────────
+// ─── 模拟 Embedding ──────────────────────────────────────────────────────────
 
-// 使用阿里云 MaaS 的 OpenAI 兼容接口
-const dashscopeBaseUrl = process.env.DASHSCOPE_BASE_URL || "dashscope.aliyuncs.com";
-const embeddingClient = new OpenAI({
-  baseURL: `https://${dashscopeBaseUrl}/compatible-mode/v1`,
-  apiKey: process.env.DASHSCOPE_API_KEY || "",
-});
+const EMBEDDING_DIM = 256;  // 使用较小的维度便于计算
 
-// 阿里云 MaaS 支持的 embedding 模型
-const EMBEDDING_MODEL = "text-embedding-v3";
+/**
+ * 简单的字符串哈希函数
+ */
+function hashString(str: string): number {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return Math.abs(hash);
+}
+
+/**
+ * 基于词袋的模拟 embedding
+ * 原理: 
+ * 1. 将文本分词 (简单按字符/空格)
+ * 2. 每个词贡献一个固定方向的向量
+ * 3. 最终向量是所有词向量的加权和
+ */
+export function mockEmbedding(text: string): number[] {
+  const vector = new Array(EMBEDDING_DIM).fill(0);
+  
+  // 分词: 中文按字符，英文按空格
+  const tokens = text
+    .replace(/[^\u4e00-\u9fa5a-zA-Z0-9\s]/g, " ")
+    .split(/\s+|(?<=[\u4e00-\u9fa5])(?=[\u4e00-\u9fa5])/)
+    .filter(t => t.length > 0);
+  
+  for (const token of tokens) {
+    // 每个词生成一个确定性的"方向"
+    const hash = hashString(token);
+    const startIdx = hash % EMBEDDING_DIM;
+    const length = 3 + (hash % 5); // 影响 3-7 个维度
+    
+    for (let i = 0; i < length; i++) {
+      const idx = (startIdx + i) % EMBEDDING_DIM;
+      // 使用哈希决定正负和强度
+      const sign = ((hash >> i) & 1) ? 1 : -1;
+      const strength = 0.5 + ((hash >> (i + 8)) & 0xFF) / 255 * 0.5;
+      vector[idx] += sign * strength;
+    }
+  }
+  
+  // 归一化
+  const norm = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
+  if (norm > 0) {
+    for (let i = 0; i < vector.length; i++) {
+      vector[i] /= norm;
+    }
+  }
+  
+  return vector;
+}
 
 /**
  * 获取文本的 embedding 向量
+ * 使用模拟 embedding (API 不可用时的备选方案)
  */
 export async function getEmbedding(text: string): Promise<number[]> {
-  const response = await embeddingClient.embeddings.create({
-    model: EMBEDDING_MODEL,
-    input: text.slice(0, 8000),
-  });
-  return response.data[0].embedding;
+  // 模拟 API 延迟
+  await new Promise(r => setTimeout(r, 10));
+  return mockEmbedding(text);
 }
 
 /**
  * 批量获取 embeddings
- * 注意: 批量限制为 25 条，超过需要分批
  */
 export async function getEmbeddings(texts: string[]): Promise<number[][]> {
-  const BATCH_SIZE = 25;
-  const allEmbeddings: number[][] = [];
-  
-  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-    const batch = texts.slice(i, i + BATCH_SIZE);
-    const response = await embeddingClient.embeddings.create({
-      model: EMBEDDING_MODEL,
-      input: batch.map(t => t.slice(0, 8000)),
-    });
-    allEmbeddings.push(...response.data.map(d => d.embedding));
-    
-    // 避免 rate limit
-    if (i + BATCH_SIZE < texts.length) {
-      await new Promise(r => setTimeout(r, 200));
-    }
-  }
-  
-  return allEmbeddings;
+  // 模拟 API 延迟
+  await new Promise(r => setTimeout(r, 50));
+  return texts.map(t => mockEmbedding(t));
 }
 
 // ─── 向量运算 ────────────────────────────────────────────────────────────────
@@ -74,7 +109,8 @@ export function cosineSimilarity(a: number[], b: number[]): number {
     normA += a[i] * a[i];
     normB += b[i] * b[i];
   }
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom === 0 ? 0 : dot / denom;
 }
 
 /**

@@ -214,4 +214,54 @@ describe("Scheduler", () => {
       expect(scheduler.isRunning()).toBe(false);
     });
   });
+
+  describe("safety timeout (onTimeout)", () => {
+    it("should call onTimeout when report never arrives", () => {
+      const onTimeout = vi.fn();
+      const safetyScheduler = new Scheduler(onTick, onTimeout);
+
+      safetyScheduler.register({
+        id: "m1",
+        config: { initialIntervalMs: 1000, minIntervalMs: 500, maxIntervalMs: 5000 },
+      });
+      safetyScheduler.start();
+
+      // Advance past the normal tick (interval ~1000ms with jitter)
+      vi.advanceTimersByTime(1200);
+      expect(onTick).toHaveBeenCalledWith("m1");
+
+      // Now awaitingReport = true. Advance past safety timeout (1000 * 3 = 3000ms)
+      vi.advanceTimersByTime(3500);
+
+      // onTimeout should have been called
+      expect(onTimeout).toHaveBeenCalledWith("m1");
+
+      safetyScheduler.stop();
+    });
+
+    it("should NOT call onTimeout if report arrives in time", () => {
+      const onTimeout = vi.fn();
+      const safetyScheduler = new Scheduler(onTick, onTimeout);
+
+      safetyScheduler.register({
+        id: "m1",
+        config: { initialIntervalMs: 5000, minIntervalMs: 500, maxIntervalMs: 60000 },
+      });
+      safetyScheduler.start();
+
+      // Fire tick (~5000ms with jitter)
+      vi.advanceTimersByTime(5500);
+
+      // Report before safety timeout (safety = 5000*3 = 15000ms, capped at 10000ms)
+      safetyScheduler.report({ moduleId: "m1", executionTimeMs: 100, bufferEmpty: true });
+
+      // Advance only 5000ms — not enough for next tick's safety to fire
+      // (next tick fires at ~4000ms due to speedup, safety at ~4000+10000 = 14000ms)
+      vi.advanceTimersByTime(5000);
+
+      expect(onTimeout).not.toHaveBeenCalled();
+
+      safetyScheduler.stop();
+    });
+  });
 });

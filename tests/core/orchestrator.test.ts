@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
 import { Orchestrator } from "../../src/core/orchestrator.js";
 import type { DollyConfig } from "../../src/core/types.js";
 import type { Module, ModuleContext, DollyExtension } from "../../src/sdk/types.js";
@@ -32,6 +32,31 @@ describe("Orchestrator", () => {
   let tempDir: string;
   let config: DollyConfig;
 
+  // Pino transport worker threads may try to write to the log file after
+  // the temp directory has been removed, causing ENOENT uncaught exceptions.
+  // We suppress these specific errors at the process level.
+  const enoentHandler = (err: Error) => {
+    if (
+      err &&
+      (err as any).code === "ENOENT" &&
+      (err as any).path &&
+      typeof (err as any).path === "string" &&
+      (err as any).path.includes("dolly-orch-test-")
+    ) {
+      // Suppress expected ENOENT from pino transport worker after temp dir cleanup
+    } else {
+      throw err;
+    }
+  };
+
+  beforeAll(() => {
+    process.on("uncaughtException", enoentHandler);
+  });
+
+  afterAll(() => {
+    process.off("uncaughtException", enoentHandler);
+  });
+
   beforeEach(() => {
     tempDir = mkdtempSync(path.join(tmpdir(), "dolly-orch-test-"));
     config = {
@@ -54,7 +79,11 @@ describe("Orchestrator", () => {
 
   afterEach(() => {
     if (existsSync(tempDir)) {
-      rmSync(tempDir, { recursive: true, force: true });
+      try {
+        rmSync(tempDir, { recursive: true, force: true });
+      } catch {
+        // Ignore cleanup errors - pino transport may still hold file handles
+      }
     }
   });
 

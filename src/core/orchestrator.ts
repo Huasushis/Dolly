@@ -41,7 +41,10 @@ export class Orchestrator {
     });
     this.mediaManager = new MediaManager(path.join(config.dataDir, "media"));
     this.blockManager = new BlockManager(this.mediaManager);
-    this.scheduler = new Scheduler((moduleId) => this.onTick(moduleId));
+    this.scheduler = new Scheduler(
+          (moduleId) => this.onTick(moduleId),
+          (moduleId) => this.onTimeout(moduleId),
+        );
   }
 
   /** 加载并注册 extension */
@@ -184,6 +187,12 @@ export class Orchestrator {
         bufferEmpty: false,
       });
     });
+  }
+
+  /** Scheduler 安全超时回调：放弃卡住的执行，允许下一轮 tick 启动新执行 */
+  private onTimeout(moduleId: string): void {
+    this.logger.warn({ moduleId }, "Module execution timed out, abandoning current execution");
+    this.executing.delete(moduleId);
   }
 
   /** 异步执行 module */

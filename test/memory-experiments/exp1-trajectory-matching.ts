@@ -137,6 +137,9 @@ async function runExperiment() {
   console.log("║  实验 1: 向量轨迹匹配 (Vector Trajectory Matching)                   ║");
   console.log("╚══════════════════════════════════════════════════════════════════════╝\n");
 
+  // 定义 cosine 距离函数 (在函数作用域内)
+  const cosDistFn = (a: number[], b: number[]) => 1 - cosineSimilarity(a, b);
+
   // 1. 获取所有序列的 embeddings
   console.log("📡 正在获取 embeddings...");
   const allTexts: string[] = [];
@@ -181,7 +184,6 @@ async function runExperiment() {
       const sameType = typeA === typeB;
 
       // DTW 相似度（使用 cosine 距离作为基础距离）
-      const cosDistFn = (a: number[], b: number[]) => 1 - cosineSimilarity(a, b);
       const dtwDist = dtwDistance(seqA, seqB, cosDistFn);
       const dtwSim = dtwSimilarity(seqA, seqB, cosDistFn);
 

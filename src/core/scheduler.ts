@@ -47,6 +47,9 @@ const MODULE_BUFFER_BUSY_THRESHOLD = 5;
 /** Safety timeout multiplier: if report() doesn't arrive within interval × this, force re-tick */
 const SAFETY_TIMEOUT_MULTIPLIER = 3;
 
+/** Maximum safety timeout in ms (prevents excessively long waits for slow modules) */
+const MAX_SAFETY_TIMEOUT_MS = 10_000;
+
 export interface AdjustRatesOptions {
   /** Total buffer item count across all modules that triggers rate limiting */
   totalBufferThreshold?: number;
@@ -57,9 +60,14 @@ export class Scheduler {
   private topology: Map<string, Set<string>> = new Map(); // moduleId → upstream module IDs
   private running = false;
   private onTick: (moduleId: string) => void;
+  private onTimeout?: (moduleId: string) => void;
 
-  constructor(onTick: (moduleId: string) => void) {
+  constructor(
+    onTick: (moduleId: string) => void,
+    onTimeout?: (moduleId: string) => void,
+  ) {
     this.onTick = onTick;
+    this.onTimeout = onTimeout;
   }
 
   /**
@@ -121,12 +129,28 @@ export class Scheduler {
       this.entries.set(entry.id, state);
       this.scheduleNext(entry.id);
     } else {
+      // Clean up existing state if re-registering
+      const existing = this.entries.get(entry.id);
+      if (existing) {
+        if (existing.timer) {
+          clearTimeout(existing.timer);
+          existing.timer = undefined;
+        }
+        if (existing.safetyTimer) {
+          clearTimeout(existing.safetyTimer);
+          existing.safetyTimer = undefined;
+        }
+      }
       this.entries.set(entry.id, {
         config,
         currentInterval,
         awaitingReport: false,
         bufferCount: 0,
       });
+      // If running, restart chain with new interval
+      if (this.running) {
+        this.scheduleNext(entry.id);
+      }
     }
   }
 
@@ -164,10 +188,14 @@ export class Scheduler {
     const state = this.entries.get(moduleId);
     if (!state) return;
 
-    // Clear pending timer to avoid stale interval firing
+    // Clear pending timers to avoid stale callbacks
     if (state.timer) {
       clearTimeout(state.timer);
       state.timer = undefined;
+    }
+    if (state.safetyTimer) {
+      clearTimeout(state.safetyTimer);
+      state.safetyTimer = undefined;
     }
 
     // Merge with defaults and apply jitter
@@ -441,13 +469,14 @@ export class Scheduler {
       state.safetyTimer = setTimeout(() => {
         state.safetyTimer = undefined;
         if (state.awaitingReport) {
-          // report() never came — force recovery
+          // report() never came — notify orchestrator and force recovery
           state.awaitingReport = false;
+          this.onTimeout?.(moduleId);
           if (this.running) {
             this.scheduleNext(moduleId);
           }
         }
-      }, state.currentInterval * SAFETY_TIMEOUT_MULTIPLIER);
+      }, Math.min(state.currentInterval * SAFETY_TIMEOUT_MULTIPLIER, MAX_SAFETY_TIMEOUT_MS));
     }, state.currentInterval);
   }
 }

@@ -267,7 +267,7 @@ async function runExperiment() {
       const [patternEmbs, entityEmbs, controlEmbs] = await Promise.all([
         getEmbeddings(patternTexts),
         getEmbeddings(entityTexts),
-        getEmbeddings(controlEmbs.length ? controlTexts : controlTexts),
+        getEmbeddings(controlTexts),
       ]);
 
       // 计算平均相似度
