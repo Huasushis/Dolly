@@ -21,6 +21,8 @@ interface SchedulerEntryState {
   awaitingReport: boolean;
   /** Latest known buffer count for this module (updated via adjustRates) */
   bufferCount: number;
+  /** Set by report(), cleared by adjustRates() — prevents double adjustment */
+  adjustedByReport: boolean;
 }
 
 const DEFAULT_SCHEDULE: ScheduleConfig = {
@@ -125,6 +127,7 @@ export class Scheduler {
         currentInterval,
         awaitingReport: false,
         bufferCount: 0,
+        adjustedByReport: false,
       };
       this.entries.set(entry.id, state);
       this.scheduleNext(entry.id);
@@ -146,6 +149,7 @@ export class Scheduler {
         currentInterval,
         awaitingReport: false,
         bufferCount: 0,
+        adjustedByReport: false,
       });
       // If running, restart chain with new interval
       if (this.running) {
@@ -282,6 +286,7 @@ export class Scheduler {
 
         if (clamped !== upState.currentInterval) {
           upState.currentInterval = clamped;
+          upState.adjustedByReport = true;
           if (this.running) {
             this.scheduleNext(upId);
           }
@@ -387,6 +392,7 @@ export class Scheduler {
 
     // Find busy modules: buffer count exceeds per-module threshold
     // Skip modules already at or near maxInterval (>= 80%) — further adjustment is wasteful
+    // Skip modules already adjusted by report() this cycle — report feedback has priority
     let limited = false;
     for (const [moduleId, count] of moduleBuffers) {
       if (count <= MODULE_BUFFER_BUSY_THRESHOLD) continue;
@@ -394,6 +400,12 @@ export class Scheduler {
       const state = this.entries.get(moduleId);
       if (!state) continue;
       if (state.currentInterval >= state.config.maxIntervalMs * 0.8) continue;
+
+      // report() already adjusted this module — clear flag and skip
+      if (state.adjustedByReport) {
+        state.adjustedByReport = false;
+        continue;
+      }
 
       const nextInterval = clamp(
         state.currentInterval * RATE_LIMIT_FACTOR,

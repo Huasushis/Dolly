@@ -201,6 +201,41 @@ describe("Scheduler", () => {
     });
   });
 
+  describe("report/adjustRates coordination", () => {
+    it("adjustRates should skip modules already adjusted by report() in same cycle", () => {
+      scheduler.register({
+        id: "upstream",
+        config: { initialIntervalMs: 1000, minIntervalMs: 500, maxIntervalMs: 60000 },
+      });
+      scheduler.register({
+        id: "downstream",
+        config: { initialIntervalMs: 1000, minIntervalMs: 500, maxIntervalMs: 60000 },
+      });
+      scheduler.setTopology("downstream", ["upstream"]);
+
+      // report() adjusts upstream (backoff)
+      scheduler.report({
+        moduleId: "downstream",
+        executionTimeMs: 5000,
+        bufferEmpty: false,
+      });
+      const intervalAfterReport = scheduler.getInterval("upstream")!;
+
+      // adjustRates with high buffer count — should NOT adjust upstream again
+      const buffers = new Map([["upstream", 10], ["downstream", 5]]);
+      scheduler.adjustRates(buffers, { totalBufferThreshold: 5 });
+
+      const intervalAfterAdjustRates = scheduler.getInterval("upstream")!;
+      // Interval should NOT have changed further (report already handled it)
+      expect(intervalAfterAdjustRates).toBe(intervalAfterReport);
+
+      // Next call to adjustRates SHOULD apply (flag was cleared)
+      scheduler.adjustRates(buffers, { totalBufferThreshold: 5 });
+      const intervalAfterSecondAdjust = scheduler.getInterval("upstream")!;
+      expect(intervalAfterSecondAdjust).toBeGreaterThan(intervalAfterAdjustRates);
+    });
+  });
+
   describe("stop", () => {
     it("should return pending modules that had awaiting reports", () => {
       scheduler.register({
