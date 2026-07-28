@@ -69,7 +69,7 @@ describe("one source Block is indexed at most once", () => {
     const query = h.store.session(h.namespace, h.authorization, "query");
     const jobs = query.featureJobs();
     expect(jobs).toHaveLength(1);
-    expect(jobs[0]!.requiredByAdmissionIds.sort()).toEqual(
+    expect([...jobs[0]!.requiredByAdmissionIds].sort()).toEqual(
       [a.preparation.admission.admissionId, b.preparation.admission.admissionId].sort(),
     );
   });

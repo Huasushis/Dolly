@@ -210,7 +210,7 @@ export function delivered(options: {
 function snapshotOf(document: EmbeddingDescriptorDocument): EmbeddingDescriptorSnapshot {
   const registry = new EmbeddingDescriptorRegistry({
     schemaDigest: SCHEMA_DIGEST,
-    allowedStrategyIds: [...EMBEDDING_STRATEGIES],
+    allowedStrategyIds: new Set(EMBEDDING_STRATEGIES),
   });
   const ref = registry.register(document);
   registry.setStatus(ref, "active");

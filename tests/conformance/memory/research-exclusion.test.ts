@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  assertJsonValue,
+  type JsonValue,
+} from "../../../src/core/canonical-json.js";
+import {
   PROVIDER_INDEPENDENT_DEFAULTS,
   RESEARCH_DISABLED,
   RESEARCH_MECHANISMS,
@@ -28,6 +32,11 @@ const CORPUS = [
   "the deployment pipeline runs integration tests on every commit",
   "budget forecasts for the next quarter are attached",
 ];
+
+function jsonValue(value: unknown): JsonValue {
+  assertJsonValue(value);
+  return value;
+}
 
 /**
  * The fields §3 invariant 12 names. A research harness may store them; the
@@ -264,17 +273,17 @@ describe("record schema version", () => {
   it("refuses version 1 and its former job field", () => {
     const h = harness();
     const [record] = seed(h, false);
-    expect(parseMemoryRecord(record as never).recordId).toBe(record!.recordId);
+    expect(parseMemoryRecord(jsonValue({ ...record })).recordId).toBe(record!.recordId);
     expect(
       codeOf(() =>
-        parseMemoryRecord({ ...(record as Record<string, unknown>), schemaVersion: "dolly.memory-record/1" }),
+        parseMemoryRecord(jsonValue({ ...record, schemaVersion: "dolly.memory-record/1" })),
       ),
     ).toBe("MEMORY_RECORD_INVALID");
 
-    const { creationModuleJobId, ...withoutJob } = record as unknown as Record<string, unknown>;
+    const { creationModuleJobId, ...withoutJob } = record;
     expect(creationModuleJobId).toBeDefined();
-    expect(codeOf(() => parseMemoryRecord({ ...withoutJob, jobId: "job-seed" } as never))).toBe(
-      "MEMORY_RECORD_INVALID",
-    );
+    expect(
+      codeOf(() => parseMemoryRecord(jsonValue({ ...withoutJob, jobId: "job-seed" }))),
+    ).toBe("MEMORY_RECORD_INVALID");
   });
 });
