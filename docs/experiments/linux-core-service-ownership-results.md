@@ -167,6 +167,68 @@ The complete local evidence is under `artifacts/p0-1/`: both source archives,
 both boundary runs, both full runs, the four projections, and two empty diff
 files. Those generated artifacts are not committed.
 
+## Focused Linux attached-process and protocol tests
+
+On 2026-07-28, the two Linux-only tests in
+`tests/conformance/security/linux-module-attached-process-integration.test.ts`
+ran in a systemd 255 container with Linux control group version 2, kernel
+6.8.0-106-generic, and Node.js 20.20.2. The Core process ran in the delegated
+`core` subgroup of a user service, rather than directly from `docker exec`.
+A direct invocation outside that service skipped both tests and was rejected as
+evidence.
+
+The retained JSON report names both assertions and records two passed, zero
+failed, and zero skipped tests:
+
+| Test | Kernel or process observation |
+|---|---|
+| `terminates a descendant that left the process group` | The descendant was a member of the Module control group, had a different process-group identifier from the launcher, and was live before termination. After `cgroup.kill`, the descendant was gone and `cgroup.events` reported `populated 0`; cleanup then removed the empty control group. |
+| `carries the Extension protocol on descriptors 0 and 1 after exec` | A real `ExtensionProcessHost` completed its handshake and one Run over descriptors 0 and 1. The fixture returned `process.pid`, which equalled the launcher's process identifier and confirmed that the process executing the fixture retained the launcher process identifier across `exec`. |
+
+Each test enabled the delegated root's `cpu`, `memory`, and `pids` controllers
+before creating the Module control group. The earlier attempt that omitted
+`prepareDelegatedCgroupRoot` failed with `EACCES` while writing `memory.max`;
+that was an invalid test setup, not a product failure. Finding 2 below remains
+a product gap because no caller in `src/` owns that preparation step.
+
+The test limits were 256 MiB and 64 tasks. The `oom_kill` counter in
+`memory.events` was unchanged in both tests, so their termination observations
+were not caused by the kernel out-of-memory handler. Cleanup checked that the
+descendant process, user service unit, and Module control group were absent
+after both the passing run and the negative test.
+
+The negative test changed the adapter to send `SIGKILL` only to the direct
+launcher process and to incorrectly report that process's exit as the whole
+Module's exit. The first assertion then failed at its required distinction:
+the adapter reported `exited === true`, but `cgroup.events` still reported
+`populated 1` because the descendant survived. The second test was deliberately
+filtered out of this negative run and is recorded as skipped, not passed.
+
+The generated evidence is retained locally and is not committed:
+
+| File | SHA-256 |
+|---|---|
+| `artifacts/p0-2/control/result.json` | `15406113bcb4056945e02cb03f01476dbd3c009dd411f893fefd8d589af316c0` |
+| `artifacts/p0-2/direct-pid.json` | `959e78a790a42b8ac64a22063a8afe657ca4b5eb341061efd898ba4b69b52bfd` |
+| `artifacts/p0-2/direct-pid.patch` | `3f94c1d5ecdb7df737fd031e082bd7461442b7796ae88ba4513df54b501a5662` |
+
+The source copied into the passing container had these SHA-256 values:
+
+| Source | SHA-256 |
+|---|---|
+| Linux integration test | `6e974a27804e3038e68d308403af61f3027e714f9005e4eef5d4ea40eeadeea9` |
+| Extension process fixture | `67bdf89ce8a8f96f1edc84f71b3f948e96880b29fb369f9efb62f65f7c64edd0` |
+| Control-group implementation | `914de56002553a79a365f9325827063dd394c58a7c9ff0fe5b971716f7ea925f` |
+| Attached-process adapter | `7332b3bc6a53b59c4fbf321bd3b97f519176907591a8b15d6b815287e2f4f85a` |
+
+These two focused tests do not use `startModuleProcess`. They establish the
+adapter's whole-control-group termination behavior and the standard-stream
+transport after `exec`; they do not establish the complete runtime assembly or
+the full experiment matrix. The integration script also did not yet reject an
+all-skipped Vitest result on its own, so the named assertion results and counts
+were checked directly in the JSON report. That runner defect is tracked
+separately rather than hidden by this successful run.
+
 ## How an interruption point is established
 
 Protocol version 3 requires that "a barrier confirms the exact interruption point before
