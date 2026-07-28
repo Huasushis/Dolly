@@ -9,12 +9,17 @@
  * the daemon refused to act and that the process is still alive afterwards.
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  spawn,
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { NetworkExposurePolicy } from "../../../src/core/network-exposure.js";
 import type {
@@ -77,7 +82,7 @@ class StubIdentityProbe implements ProcessIdentityProbe {
 }
 
 async function waitForLine(
-  child: ChildProcessWithoutNullStreams,
+  child: ChildProcess & { readonly stdout: Readable },
   marker: string,
 ): Promise<string> {
   return new Promise<string>((resolve, reject) => {
@@ -102,7 +107,7 @@ describe("daemon process identity, recovery, and registry evidence", () => {
   let registry: TestInstanceRegistry;
   let records: InstanceProcessRecordStore;
   let managers: DaemonInstanceManager[];
-  let children: Set<ChildProcessWithoutNullStreams>;
+  let children: Set<ChildProcess>;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "dolly-daemon-identity-"));

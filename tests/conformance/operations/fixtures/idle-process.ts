@@ -6,6 +6,8 @@
  * must still be alive after reconciliation refuses to act on it.
  */
 
+export {};
+
 process.stdout.write(`READY ${process.pid}\n`);
 const keepAlive = setInterval(() => undefined, 1_000);
 const stop = (): void => {

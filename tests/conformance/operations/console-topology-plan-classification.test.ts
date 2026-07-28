@@ -36,6 +36,18 @@ function trackHarness(): ConsoleHarness {
   return harness;
 }
 
+async function rejectedConsoleOperation(
+  operation: Promise<unknown>,
+): Promise<ConsoleOperationError> {
+  try {
+    await operation;
+  } catch (error) {
+    if (error instanceof ConsoleOperationError) return error;
+    throw error;
+  }
+  throw new Error("expected the console operation to reject");
+}
+
 function moduleProposal(
   moduleId: string,
   inputPageIds: readonly string[],
@@ -404,10 +416,8 @@ describe("TOPO-PLAN-004 capability and ownership refusals", () => {
       operationId: "op-disabled",
       actor: ACTOR,
     });
-    await expect(attempt).rejects.toThrowError(
-      expect.objectContaining({ code: "TOPOLOGY_CAPABILITY_DISABLED" }),
-    );
-    const error = await attempt.catch((caught: unknown) => caught as ConsoleOperationError);
+    const error = await rejectedConsoleOperation(attempt);
+    expect(error.code).toBe("TOPOLOGY_CAPABILITY_DISABLED");
     expect(error.message).toContain("Module execution is disabled");
     expect(harness.currentDocument().modules).toEqual([]);
   });
@@ -450,10 +460,8 @@ describe("TOPO-PLAN-004 capability and ownership refusals", () => {
       operationId: "op-owned",
       actor: ACTOR,
     });
-    await expect(attempt).rejects.toThrowError(
-      expect.objectContaining({ code: "TOPOLOGY_OWNED_BY_ANOTHER_CONTRACT" }),
-    );
-    const error = await attempt.catch((caught: unknown) => caught as ConsoleOperationError);
+    const error = await rejectedConsoleOperation(attempt);
+    expect(error.code).toBe("TOPOLOGY_OWNED_BY_ANOTHER_CONTRACT");
     expect(error.message).toContain("console-extension.md Section 4.2");
     expect(harness.currentRevision()).toBe(seeded.newRevision);
   });

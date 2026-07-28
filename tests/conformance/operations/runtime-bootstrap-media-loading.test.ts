@@ -14,10 +14,7 @@ import type {
   MediaByteStore,
   MediaInspector,
 } from "../../../src/core/media-store.js";
-import {
-  openDollyRuntime,
-  type RuntimeBootstrapError,
-} from "../../../src/core/runtime-bootstrap.js";
+import { openDollyRuntime } from "../../../src/core/runtime-bootstrap.js";
 import {
   createDefaultDollyInstanceConfig,
   dollyInstanceConfigSchema,
@@ -219,7 +216,7 @@ describe("runtime Media dependency loading", () => {
   it("reports a stable error when enabled Media cannot load Sharp", async () => {
     initializeLocalMedia();
 
-    await expect(open()).rejects.toMatchObject<Partial<RuntimeBootstrapError>>({
+    await expect(open()).rejects.toMatchObject({
       code: "RUNTIME_MEDIA_INSPECTOR_UNAVAILABLE",
       message: "Enabled persistent Media requires the optional Sharp image inspector",
     });

@@ -4,10 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  InstanceControllerLock,
-  InstanceControllerLockError,
-} from "../../../src/core/instance-controller-lock.js";
+import { InstanceControllerLock } from "../../../src/core/instance-controller-lock.js";
 
 const INSTANCE_ID = "11111111-1111-4111-8111-111111111111";
 const FIRST_CONTROLLER = "22222222-2222-4222-8222-222222222222";
@@ -63,7 +60,7 @@ describe("instance controller kernel lock", () => {
       controllerId: SECOND_CONTROLLER,
       processId: 202,
       now: () => NOW,
-    })).rejects.toMatchObject<Partial<InstanceControllerLockError>>({
+    })).rejects.toMatchObject({
       code: "CONTROLLER_LOCK_HELD",
     });
 
@@ -118,7 +115,7 @@ describe("instance controller kernel lock", () => {
       instanceId: INSTANCE_ID,
       controllerId: SECOND_CONTROLLER,
       now: () => NOW,
-    })).rejects.toMatchObject<Partial<InstanceControllerLockError>>({
+    })).rejects.toMatchObject({
       code: "CONTROLLER_LOCK_HELD",
     });
 

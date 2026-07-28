@@ -10,14 +10,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InstanceConfigStore } from "../../../src/core/instance-config-store.js";
-import {
-  InstanceControllerLock,
-  InstanceControllerLockError,
-} from "../../../src/core/instance-controller-lock.js";
+import { InstanceControllerLock } from "../../../src/core/instance-controller-lock.js";
 import {
   defaultDollyRuntimeDirectories,
   openDollyRuntime,
-  RuntimeBootstrapError,
 } from "../../../src/core/runtime-bootstrap.js";
 import {
   createDefaultDollyInstanceConfig,
@@ -167,7 +163,7 @@ describe("production runtime bootstrap", () => {
       controllerId: FIRST_CONTROLLER,
       processId: 101,
       now: () => NOW,
-    })).rejects.toMatchObject<Partial<RuntimeBootstrapError>>({
+    })).rejects.toMatchObject({
       code: "RUNTIME_MODULE_MIGRATION_REQUIRED",
     });
     expect(existsSync(join(initialized.stateDirectory, "module-result-commits.json"))).toBe(false);
@@ -225,7 +221,7 @@ describe("production runtime bootstrap", () => {
       controllerId: SECOND_CONTROLLER,
       processId: 202,
       now: () => NOW,
-    })).rejects.toMatchObject<Partial<InstanceControllerLockError>>({
+    })).rejects.toMatchObject({
       code: "CONTROLLER_LOCK_HELD",
     });
 
@@ -289,7 +285,7 @@ describe("production runtime bootstrap", () => {
 
     await heldControllerLock.release();
     allowAcquire();
-    await expect(startup).rejects.toMatchObject<Partial<RuntimeBootstrapError>>({
+    await expect(startup).rejects.toMatchObject({
       code: "RUNTIME_CONFIG_CHANGED_DURING_START",
     });
     acquireSpy.mockRestore();
@@ -346,7 +342,7 @@ describe("production runtime bootstrap", () => {
       controllerId: FIRST_CONTROLLER,
       processId: 101,
       now: () => NOW,
-    })).rejects.toMatchObject<Partial<RuntimeBootstrapError>>({
+    })).rejects.toMatchObject({
       code: "RUNTIME_MODULE_MIGRATION_REQUIRED",
     });
     expect(existsSync(join(defaultStateRoot, INSTANCE_ID, "core-state.json"))).toBe(false);
@@ -373,7 +369,7 @@ describe("production runtime bootstrap", () => {
       controllerId: SECOND_CONTROLLER,
       processId: 202,
       now: () => NOW,
-    })).rejects.toMatchObject<Partial<RuntimeBootstrapError>>({
+    })).rejects.toMatchObject({
       code: "RUNTIME_TOPOLOGY_MISMATCH",
     });
     expect(existsSync(join(registryDirectory, "controllers", `${INSTANCE_ID}.lock`))).toBe(false);
