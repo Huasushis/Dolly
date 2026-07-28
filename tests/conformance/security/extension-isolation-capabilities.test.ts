@@ -518,7 +518,12 @@ describe("Extension process isolation and capability checks", () => {
       await first.stop();
 
       second = createHost("stale-capability", secondScratch, {
-        config: { staleHandle: oldHandle },
+        config: {
+          staleHandle: {
+            schemaVersion: oldHandle.schemaVersion,
+            handle: oldHandle.handle,
+          },
+        },
       });
       await second.start();
       await expect(

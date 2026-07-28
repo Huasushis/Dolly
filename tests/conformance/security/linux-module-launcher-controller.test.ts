@@ -38,10 +38,11 @@ function createHarness(options: HarnessOptions = {}): Harness {
   const sent: JsonValue[] = [];
   let closed = false;
   const waitForLauncherExit = vi.fn(async () => options.launcherExitObserved ?? true);
+  const configuredProcessIds = options.cgroupProcessIds;
   const readModuleCgroupProcessIds =
-    typeof options.cgroupProcessIds === "function"
-      ? options.cgroupProcessIds
-      : async () => options.cgroupProcessIds ?? [LAUNCHER_PROCESS_ID];
+    typeof configuredProcessIds === "function"
+      ? configuredProcessIds
+      : async () => configuredProcessIds ?? [LAUNCHER_PROCESS_ID];
   const timeoutMs = options.timeoutMs ?? 50;
   const controller = new LinuxModuleLauncherController({
     channel: {

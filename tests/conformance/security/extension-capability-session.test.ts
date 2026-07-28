@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { isJsonObject } from "../../../src/core/canonical-json.js";
 import {
   ExtensionCapabilityAuthority,
   type ExtensionCapabilityGrant,
@@ -216,7 +217,11 @@ describe("extension capability session authority", () => {
     const pending = deferred<{ ok: boolean }>();
     const handle = session.issue(
       grant({ maxInvocations: 2, maxArgumentBytes: 24, maxResultBytes: 24 }),
-      async ({ key }) => {
+      async (argumentsValue) => {
+        if (!isJsonObject(argumentsValue) || typeof argumentsValue.key !== "string") {
+          throw new TypeError("the test handler requires a string key");
+        }
+        const { key } = argumentsValue;
         if (key === "pending") return pending.promise;
         return { ok: true };
       },
