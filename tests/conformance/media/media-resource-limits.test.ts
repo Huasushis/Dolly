@@ -10,6 +10,7 @@ import {
   type MediaRegistrationRequest,
   type MediaStoreSnapshot,
   type StorageAdapter,
+  type VolatileStorageAdapter,
 } from "../../../src/core/media-store.js";
 import { ReferenceGraph } from "../../../src/core/reference-graph.js";
 
@@ -392,7 +393,7 @@ describe("MediaStore resource limits", () => {
   it("reserves storage-record capacity before PUT and does not exceed it concurrently", async () => {
     const putStarted = createSignal();
     const putCanFinish = createSignal();
-    const putOriginal = vi.fn<StorageAdapter["putOriginal"]>(async ({ mediaId }) => {
+    const putOriginal = vi.fn<VolatileStorageAdapter["putOriginal"]>(async ({ mediaId }) => {
       putStarted.resolve();
       await putCanFinish.promise;
       return { locator: `objects/${mediaId}` };
@@ -507,6 +508,9 @@ describe("MediaStore resource limits", () => {
 
     signCanFinish.resolve();
     const firstGrant = await firstAccess;
+    if (firstGrant.accessMode === "inline") {
+      throw new Error("expected provider access to return a URL grant");
+    }
     expect(store.listProviderAccessRecords()).toHaveLength(1);
     expect(store.recordProviderAccessOutcome({
       leaseId: firstGrant.leaseId,
@@ -522,6 +526,9 @@ describe("MediaStore resource limits", () => {
       acceptedAccessModes: ["private-signed"],
       signedUrlExpiresInSeconds: 60,
     });
+    if (nextGrant.accessMode === "inline") {
+      throw new Error("expected provider access to return a URL grant");
+    }
     expect(signGet).toHaveBeenCalledTimes(2);
     expect(store.recordProviderAccessOutcome({
       leaseId: nextGrant.leaseId,

@@ -7,6 +7,7 @@ import {
   type MediaInspector,
   type StorageAdapter,
   type StoragePutResult,
+  type VolatileStorageAdapter,
 } from "../../../src/core/media-store.js";
 
 const NOW = "2026-07-24T00:00:00.000Z";
@@ -126,7 +127,7 @@ describe("Media original storage concurrency", () => {
       code: "ECONNRESET",
     });
     const deleteObject = vi
-      .fn<StorageAdapter["deleteObject"]>()
+      .fn<VolatileStorageAdapter["deleteObject"]>()
       .mockRejectedValueOnce(unavailable)
       .mockResolvedValueOnce("deleted");
     const adapter: StorageAdapter = {

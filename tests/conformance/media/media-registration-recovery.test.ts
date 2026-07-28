@@ -212,7 +212,11 @@ describe("Media registration recovery", () => {
       ]);
 
       const reopened = openCore(root, fileBytes, "second");
-      const pendingMediaId = reopened.media!.listRegistrations()[0]!.media.mediaId;
+      const pendingRegistration = reopened.media!.listRegistrations()[0];
+      if (pendingRegistration === undefined || pendingRegistration.state === "deleted") {
+        throw new Error("expected recovery to retain an active registration record");
+      }
+      const pendingMediaId = pendingRegistration.media.mediaId;
       const recovery = await reopened.media!.recoverRegistrations();
       expect(recovery.pending).toEqual(expectedPending ? [INPUT.registrationId] : []);
       expect(recovery.completed).toEqual(expectedPending ? [] : [INPUT.registrationId]);

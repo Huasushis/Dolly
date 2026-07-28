@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BlockStore, BlockStoreError } from "../../../src/core/block-store.js";
+import { BlockStore } from "../../../src/core/block-store.js";
 import { ReferenceGraph } from "../../../src/core/reference-graph.js";
 import {
   InMemoryMediaByteStore,
@@ -71,12 +71,12 @@ describe("Block media references", () => {
       );
 
     expect(() => commitCrop(audio.mediaId, 0.1, 0.9)).toThrowError(
-      expect.objectContaining<BlockStoreError>({
+      expect.objectContaining({
         code: "BLOCK_MEDIA_REFERENCE_INVALID",
       }),
     );
     expect(() => commitCrop(image.mediaId, 0.006, 0.014)).toThrowError(
-      expect.objectContaining<BlockStoreError>({
+      expect.objectContaining({
         code: "BLOCK_MEDIA_REFERENCE_INVALID",
       }),
     );

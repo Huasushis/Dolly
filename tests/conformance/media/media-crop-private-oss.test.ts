@@ -105,6 +105,9 @@ describe("private object-storage crop", () => {
     expect(store.listProviderAccessRecords()).toEqual([
       expect.objectContaining({ mediaId: media.mediaId, crop }),
     ]);
+    if (grant.accessMode !== "private-signed") {
+      throw new Error(`expected a private-signed grant, received ${grant.accessMode}`);
+    }
     expect(store.recordProviderAccessOutcome({
       leaseId: grant.leaseId,
       requestId: "provider-request-1",
