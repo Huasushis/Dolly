@@ -221,7 +221,11 @@ function brokerWith(options: {
 describe("embedding model provider broker", () => {
   it("rejects previous embedding invocation versions and removed context fields", async () => {
     const { registry, descriptor } = createTextDescriptor();
-    const { broker, secrets, transport } = brokerWith({ descriptors: registry, descriptor });
+    const secrets = new FakeSecretResolver();
+    const transport = new FakeTransport(async () =>
+      new FakeResponse(200, providerBody(descriptor.modelId)),
+    );
+    const { broker } = brokerWith({ descriptors: registry, descriptor, secrets, transport });
     const current = invocation(descriptor);
 
     for (const schemaVersion of [

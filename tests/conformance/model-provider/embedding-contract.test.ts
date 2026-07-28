@@ -414,7 +414,11 @@ describe("embedding descriptor and exact-wire contract", () => {
         vectorSpaceId: "fixture-text-vector-space-v1",
       },
     ]);
-    expect(Object.isFrozen(output.items[0]!.vector)).toBe(true);
+    const first = output.items[0];
+    if (first === undefined || first.status !== "succeeded") {
+      throw new Error("expected the first embedding result to succeed");
+    }
+    expect(Object.isFrozen(first.vector)).toBe(true);
   });
 
   it("rejects duplicate, foreign, and missing provider correlations without fabricating vectors", () => {

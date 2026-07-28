@@ -1,4 +1,8 @@
-import { createServer, type Server } from "node:http";
+import {
+  createServer,
+  type IncomingHttpHeaders,
+  type Server,
+} from "node:http";
 import type { AddressInfo } from "node:net";
 import { describe, expect, it, vi } from "vitest";
 import { EndpointBindingRegistry } from "../../../src/core/model-provider-binding.js";
@@ -109,7 +113,7 @@ describe("production Node model HTTP transport", () => {
     const observations: Array<{
       method?: string;
       url?: string;
-      headers: typeof import("node:http").IncomingHttpHeaders;
+      headers: IncomingHttpHeaders;
       body: string;
     }> = [];
     const server = createServer((request, response) => {

@@ -226,9 +226,13 @@ function brokerWith(options: {
 describe("private endpoint binding and model provider broker", () => {
   it("rejects previous chat invocation versions and removed context fields", async () => {
     const { registry, snapshot } = createDescriptor();
-    const { broker, secrets, transport } = brokerWith({
+    const secrets = new FakeSecretResolver();
+    const transport = new FakeTransport(async () => new FakeResponse(200, providerBody()));
+    const { broker } = brokerWith({
       descriptors: registry,
       descriptor: snapshot.ref,
+      secrets,
+      transport,
     });
     const current = invocation(snapshot.ref);
 
