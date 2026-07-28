@@ -13,14 +13,14 @@ describe("public software development kit", () => {
   });
 
   it("describes the current immutable Block content", () => {
-    const content: BlockContent = {
+    const content = {
       items: [
         { type: "text", text: "hello" },
         { type: "block-reference", blockId: "block-1" },
         { type: "media-reference", mediaId: "media-1" },
         { type: "data", schema: "example.data/1", value: { answer: 42 } },
       ],
-    };
+    } as const satisfies BlockContent;
     const value: JsonValue = content;
     const proposal: BlockProposal = {
       payload: { schema: "dolly.content/1", value },

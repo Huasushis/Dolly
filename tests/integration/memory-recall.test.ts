@@ -29,6 +29,8 @@ describe.skipIf(!liveEnabled)("Integration: Memory Recall @integration", () => {
 
   const mockBlockAccess: BlockAccess = {
     get: (id: string) => blockStore.get(id) ?? null,
+    acquire: () => undefined,
+    release: () => undefined,
   };
 
   const mockMediaAccess: MediaAccess = {

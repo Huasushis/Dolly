@@ -3,11 +3,11 @@ import { Scheduler } from "../../src/core/scheduler.js";
 
 describe("Scheduler", () => {
   let scheduler: Scheduler;
-  let onTick: ReturnType<typeof vi.fn>;
+  let onTick: (moduleId: string) => void;
 
   beforeEach(() => {
     vi.useFakeTimers();
-    onTick = vi.fn();
+    onTick = vi.fn<(moduleId: string) => void>();
     scheduler = new Scheduler(onTick);
   });
 
@@ -353,7 +353,7 @@ describe("Scheduler", () => {
 
   describe("safety timeout (onTimeout)", () => {
     it("should call onTimeout when report never arrives", () => {
-      const onTimeout = vi.fn();
+      const onTimeout = vi.fn<(moduleId: string) => void>();
       const safetyScheduler = new Scheduler(onTick, onTimeout);
 
       safetyScheduler.register({
@@ -376,7 +376,7 @@ describe("Scheduler", () => {
     });
 
     it("should NOT call onTimeout if report arrives in time", () => {
-      const onTimeout = vi.fn();
+      const onTimeout = vi.fn<(moduleId: string) => void>();
       const safetyScheduler = new Scheduler(onTick, onTimeout);
 
       safetyScheduler.register({
