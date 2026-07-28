@@ -8,6 +8,7 @@ dist/
 
 # Environment
 .env
+/dolly.json
 
 # Claude
 .claude/
@@ -15,6 +16,19 @@ CLAUDE.md
 
 # Reports
 report/
+/artifacts/
+/typecheck.log
+
+# Local test temporary files
+/.tmp/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local takeover archives
+/dolly-src.tar.gz
+/takeover-baseline-*-code.tar.gz
 
 # Dev notes
 DEVELOPMENT.md
