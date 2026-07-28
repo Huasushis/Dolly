@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "dolly.instance/9",
+  "instanceId": "00000000-0000-4000-8000-000000000001",
+  "displayName": "Example Dolly",
+  "stateDirectory": null,
+  "core": {
+    "limits": {
+      "maxFailedAttempts": 3,
+      "maxStateBytes": 67108864,
+      "maxModuleResultCommitJournalBytes": 16777216
+    },
+    "media": {
+      "enabled": true,
+      "maxMediaBytes": 1048576,
+      "maxTotalMediaBytes": 1073741824,
+      "maxRegistrationRecords": 10000,
+      "maxStorageRecords": 10000,
+      "maxProviderAccessRecords": 10000,
+      "deletedRegistrationRetentionMs": 86400000,
+      "ingress": {
+        "maxActiveCapabilities": 1024,
+        "maxConcurrentOperations": 32,
+        "maxCapabilityLifetimeMs": 3600000
+      }
+    },
+    "scheduler": {
+      "pollIntervalMs": 100,
+      "retryBaseMs": 250,
+      "retryMaxMs": 30000
+    }
+  },
+  "pages": [
+    {
+      "pageId": "main"
+    }
+  ],
+  "modules": [],
+  "logging": {
+    "level": "info"
+  }
+}

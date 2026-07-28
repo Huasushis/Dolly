@@ -8,6 +8,224 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif; padding: 2rem; }
   h1 { font-size: 1.4rem; margin-bottom: 1.5rem; color: #58a6ff; }
+  h2 { font-size: 1rem; margin: 1.5rem 0 .75rem; color: #8b949e; }
+  .bar { display: flex; gap: .75rem; margin-bottom: 1.5rem; align-items: center; flex-wrap: wrap; }
+  .bar input { flex: 1; min-width: 200px; background: #161b22; border: 1px solid #30363d; color: #c9d1d9; padding: .45rem .7rem; border-radius: 6px; font-size: .85rem; }
+  button { background: #238636; color: #fff; border: none; padding: .45rem .9rem; border-radius: 6px; cursor: pointer; font-size: .85rem; }
+  button:hover { background: #2ea043; }
+  button.stop { background: #da3633; }
+  button.stop:hover { background: #f85149; }
+  button.restart { background: #9e6a03; }
+  button.restart:hover { background: #bb8009; }
+  button.secondary { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; }
+  button.secondary:hover { background: #30363d; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: .5rem .7rem; border-bottom: 1px solid #21262d; font-size: .85rem; }
+  th { color: #8b949e; font-weight: 500; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.running { background: #3fb950; }
+  .dot.stopped { background: #6e7681; }
+  .dot.failed { background: #f85149; }
+  #login { max-width: 340px; margin: 6rem auto; background: #161b22; padding: 1.5rem; border-radius: 8px; border: 1px solid #30363d; }
+  #login h2 { margin-bottom: 1rem; font-size: 1.1rem; color: #c9d1d9; }
+  #login label { display: block; margin: .6rem 0 .2rem; font-size: .82rem; color: #8b949e; }
+  #login input { width: 100%; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: .45rem; border-radius: 6px; }
+  #login button { width: 100%; margin-top: 1rem; }
+  .err { color: #f85149; font-size: .82rem; margin-top: .5rem; }
+  .conn-status { font-size: .78rem; padding: .2rem .6rem; border-radius: 12px; margin-left: auto; }
+  .conn-status.on { background: #0d2818; color: #3fb950; }
+  .conn-status.off { background: #2d1214; color: #f85149; }
+  #logPanel { background: #010409; border: 1px solid #21262d; border-radius: 6px; padding: .75rem; height: 260px; overflow-y: auto; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: .78rem; line-height: 1.6; }
+  .log-line { white-space: pre-wrap; word-break: break-all; }
+  .log-line .ts { color: #484f58; margin-right: .5rem; }
+  .log-line .src { color: #58a6ff; margin-right: .5rem; }
+  .log-line.error { color: #f85149; }
+  .log-line.info { color: #c9d1d9; }
+  .log-line.warn { color: #d29922; }
+  .log-toolbar { display: flex; align-items: center; gap: .75rem; margin-bottom: .5rem; }
+  .log-toolbar span { font-size: .82rem; color: #8b949e; }
+</style>
+</head>
+<body>
+
+<div id="login" style="display:none">
+  <h2>Dolly Daemon Login</h2>
+  <label>Username</label>
+  <input id="user" value="admin">
+  <label>Password</label>
+  <input id="pass" type="password">
+  <button onclick="doLogin()">Login</button>
+  <div id="loginErr" class="err"></div>
+</div>
+
+<div id="panel" style="display:none">
+  <h1>Dolly Daemon</h1>
+
+  <div class="bar">
+    <input id="cfgPath" placeholder="Config file path, e.g. dolly.json">
+    <button onclick="startInstance()">Start</button>
+    <button class="secondary" onclick="refresh()">Refresh</button>
+    <span id="connStatus" class="conn-status off">WS: connecting…</span>
+  </div>
+
+  <table>
+    <thead><tr><th>Status</th><th>Config Path</th><th>PID</th><th>Port</th><th>Started</th><th>Action</th></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+  <h2>Live Logs</h2>
+  <div class="log-toolbar">
+    <span id="logCount">0 lines</span>
+    <button class="secondary" onclick="clearLogs()">Clear</button>
+  </div>
+  <div id="logPanel"></div>
+</div>
+
+<script>
+let auth = localStorage.getItem("dolly_auth") || "";
+let ws = null;
+let logLines = 0;
+const MAX_LOGS = 500;
+const $ = (s) => document.getElementById(s);
+
+async function api(method, path, body) {
+  const opts = { method, headers: { "Authorization": "Basic " + btoa(auth), "Content-Type": "application/json" } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
+  if (r.status === 401) { showLogin(); throw new Error("Unauthorized"); }
+  return r.json();
+}
+
+function showLogin() { $("login").style.display = "block"; $("panel").style.display = "none"; if (ws) { ws.close(); ws = null; } }
+function showPanel() { $("login").style.display = "none"; $("panel").style.display = "block"; }
+
+function doLogin() {
+  auth = $("user").value + ":" + $("pass").value;
+  api("GET", "/api/health").then(() => {
+    localStorage.setItem("dolly_auth", auth);
+    showPanel(); refresh(); connectWs();
+  }).catch(() => { $("loginErr").textContent = "Invalid credentials"; });
+}
+
+function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+function renderInstances(list) {
+  $("tbody").innerHTML = list.map(i => {
+    const p = i.configPath.replace(/'/g, "\\'");
+    const actions = i.status === "running"
+      ? `<button class="stop" onclick="stopInstance('${p}')">Stop</button> <button class="restart" onclick="restartInstance('${p}')">Restart</button>`
+      : i.status === "failed"
+      ? `<button class="restart" onclick="restartInstance('${p}')">Retry</button>`
+      : `<button onclick="startInstancePath('${p}')">Start</button>`;
+    return `<tr>
+      <td><span class="dot ${i.status}"></span>${i.status}</td>
+      <td title="${esc(i.configPath)}">${esc(i.configPath)}</td>
+      <td>${i.pid}</td><td>${i.port}</td>
+      <td>${new Date(i.startedAt).toLocaleString()}</td>
+      <td>${actions}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function refresh() {
+  try {
+    const list = await api("GET", "/api/instances");
+    renderInstances(list);
+  } catch {}
+}
+
+async function startInstance() {
+  const p = $("cfgPath").value.trim();
+  if (!p) return;
+  await api("POST", "/api/instances/start", { configPath: p });
+  $("cfgPath").value = "";
+}
+
+async function startInstancePath(p) {
+  await api("POST", "/api/instances/start", { configPath: p });
+}
+
+async function stopInstance(p) {
+  await api("POST", "/api/instances/stop", { configPath: p });
+}
+
+async function restartInstance(p) {
+  await api("POST", "/api/instances/restart", { configPath: p });
+}
+
+function addLogLine(entry) {
+  const panel = $("logPanel");
+  const div = document.createElement("div");
+  const level = entry.level || "info";
+  div.className = "log-line " + level;
+  const ts = new Date(entry.ts || Date.now()).toLocaleTimeString();
+  const src = entry.configPath ? entry.configPath.split(/[/\\]/).pop() : "daemon";
+  div.innerHTML = `<span class="ts">${ts}</span><span class="src">[${esc(src)}]</span>${esc(entry.line || "")}`;
+  panel.appendChild(div);
+  logLines++;
+  while (panel.children.length > MAX_LOGS) { panel.removeChild(panel.firstChild); }
+  panel.scrollTop = panel.scrollHeight;
+  $("logCount").textContent = Math.min(logLines, MAX_LOGS) + " lines";
+}
+
+function clearLogs() {
+  $("logPanel").innerHTML = "";
+  logLines = 0;
+  $("logCount").textContent = "0 lines";
+}
+
+// ── WebSocket (F5: replaces 5s polling) ──────────────────────────
+
+function connectWs() {
+  if (ws) { ws.close(); ws = null; }
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const token = btoa(auth);
+  ws = new WebSocket(`${proto}://${location.host}/ws?auth=${encodeURIComponent(token)}`);
+
+  ws.onopen = () => {
+    $("connStatus").textContent = "WS: connected";
+    $("connStatus").className = "conn-status on";
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === "instances") {
+        renderInstances(msg.data);
+      } else if (msg.type === "log") {
+        addLogLine(msg.data);
+      }
+    } catch {}
+  };
+
+  ws.onclose = () => {
+    $("connStatus").textContent = "WS: disconnected";
+    $("connStatus").className = "conn-status off";
+    // Auto-reconnect after 3s
+    setTimeout(() => {
+      if ($("panel").style.display !== "none") connectWs();
+    }, 3000);
+  };
+
+  ws.onerror = () => {};
+}
+
+// ── Init ─────────────────────────────────────────────────────────
+
+if (auth) { showPanel(); refresh(); connectWs(); } else { showLogin(); }
+</script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dolly Daemon</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #c9d1d9; font-family: system-ui, sans-serif; padding: 2rem; }
+  h1 { font-size: 1.4rem; margin-bottom: 1.5rem; color: #58a6ff; }
   .bar { display: flex; gap: .75rem; margin-bottom: 1.5rem; align-items: center; }
   .bar input { flex: 1; background: #161b22; border: 1px solid #30363d; color: #c9d1d9; padding: .45rem .7rem; border-radius: 6px; font-size: .85rem; }
   button { background: #238636; color: #fff; border: none; padding: .45rem .9rem; border-radius: 6px; cursor: pointer; font-size: .85rem; }

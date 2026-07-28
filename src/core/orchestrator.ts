@@ -14,8 +14,14 @@ import { Scheduler } from "./scheduler.js";
 import { BlockManager } from "./block-manager.js";
 import { MediaManager } from "./media.js";
 import { EventBus } from "./events.js";
-import type { Module, ModuleContext, DollyExtension } from "../sdk/types.js";
+import type {
+  DollyExtension,
+  LLMClient,
+  Module,
+  ModuleContext,
+} from "./legacy-in-process-extension.js";
 import { createLogger, type Logger } from "./logger.js";
+import OpenAI from "openai";
 
 export class Orchestrator {
   private pages: Map<string, Page> = new Map();
@@ -28,9 +34,16 @@ export class Orchestrator {
   private eventBus: EventBus;
   private logger: Logger;
   private running: boolean = false;
+  private stopPromise: Promise<void> | undefined;
   private executing: Set<string> = new Set();
   private pageLocks: Map<string, Mutex> = new Map();
   private config: DollyConfig;
+  /**
+   * Tracks which block IDs each module has already processed (across all rounds).
+   * Used to compute repeat_count: when a block appears again in a module's input,
+   * its repeat_count is incremented.
+   */
+  private processedBlocks: Map<string, Set<string>> = new Map();
 
   constructor(config: DollyConfig) {
     this.config = config;
@@ -39,7 +52,16 @@ export class Orchestrator {
       level: config.logging.level,
       logDir: path.join(config.dataDir, "logs"),
     });
-    this.mediaManager = new MediaManager(path.join(config.dataDir, "media"));
+    // Read OSS config from environment variables (optional, degrades to local storage)
+    const ossConfig = process.env.OSS_ACCESS_KEY_ID && process.env.OSS_ACCESS_KEY_SECRET
+      ? {
+          accessKeyId: process.env.OSS_ACCESS_KEY_ID,
+          accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET,
+          endpoint: process.env.OSS_ENDPOINT ?? "oss-cn-shanghai.aliyuncs.com",
+          bucket: process.env.OSS_BUCKET ?? "mydolly",
+        }
+      : undefined;
+    this.mediaManager = new MediaManager(path.join(config.dataDir, "media"), ossConfig);
     this.blockManager = new BlockManager(this.mediaManager);
     this.scheduler = new Scheduler(
           (moduleId) => this.onTick(moduleId),
@@ -54,6 +76,15 @@ export class Orchestrator {
 
   /** 初始化：创建 Page、实例化 Module、注册到 Scheduler、设置拓扑 */
   async init(): Promise<void> {
+    try {
+      await this.initialize();
+    } catch (error) {
+      await this.stop();
+      throw error;
+    }
+  }
+
+  private async initialize(): Promise<void> {
     // 1. 创建 Pages
     for (const pageConfig of this.config.pages) {
       this.pages.set(pageConfig.id, new Page(pageConfig.id));
@@ -74,21 +105,44 @@ export class Orchestrator {
       const module = ext.createModule({
         id: moduleConfig.id,
         config: moduleConfig.config ?? {},
+        inputPages: moduleConfig.inputPages,
+        outputPages: moduleConfig.outputPages,
+        schedule: moduleConfig.schedule,
       });
 
-      // 创建 ModuleContext
+      // G5: optionally provide an LLM client from the first configured provider
+      let llmClient: LLMClient | undefined;
+      const providerNames = Object.keys(this.config.llm);
+      if (providerNames.length > 0) {
+        const provider = this.config.llm[providerNames[0]];
+        const openai = new OpenAI({ baseURL: provider.base_url, apiKey: provider.api_key });
+        llmClient = {
+          chat: (messages, options) =>
+            openai.chat.completions.create({
+              model: provider.model,
+              messages: messages as any,
+              ...options,
+            }),
+        };
+      }
+
+      // G1: storage paths grouped by extension name
+      // Spec: <dataDir>/exts/<ext-name>/<module-id>/  +  <dataDir>/exts/<ext-name>/ (shared)
       const ctx: ModuleContext = {
-        storagePath: path.join(this.config.dataDir, "modules", moduleConfig.id),
-        sharedPath: path.join(this.config.dataDir, "shared"),
+        storagePath: path.join(this.config.dataDir, "exts", moduleConfig.extension, moduleConfig.id),
+        sharedPath: path.join(this.config.dataDir, "exts", moduleConfig.extension),
         media: {
           get: (id, format) => this.mediaManager.get(id, format),
           crop: (id, rect) => this.mediaManager.crop(id, rect),
         },
         blocks: {
           get: (id) => this.blockManager.get(id),
+          acquire: (id) => this.blockManager.acquire(id),
+          release: (id) => this.blockManager.release(id),
         },
+        llm: llmClient,
         logger: this.logger.child({ module: moduleConfig.id }),
-        config: moduleConfig.config ?? {},
+        config: { ...(moduleConfig.config ?? {}), llm: this.config.llm },
       };
 
       await module.init(ctx);
@@ -147,7 +201,12 @@ export class Orchestrator {
   }
 
   /** 停止 */
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    this.stopPromise ??= this.performStop();
+    return this.stopPromise;
+  }
+
+  private async performStop(): Promise<void> {
     this.running = false;
     this.scheduler.stop();
     this.blockManager.stop();
@@ -163,12 +222,7 @@ export class Orchestrator {
 
     this.logger.info("Orchestrator stopped");
 
-    // Flush transport worker to ensure all pending log writes complete
-    // before the logger's file handles become invalid (e.g. temp dir cleanup)
-    await new Promise<void>((resolve) => {
-      this.logger.flush(() => resolve());
-      setTimeout(resolve, 200);
-    });
+    await this.logger.close();
   }
 
   /** Scheduler 的 onTick 回调 */
@@ -222,15 +276,38 @@ export class Orchestrator {
       }
     }
 
-    // 2. 合并（相同 id → repeat_count++）
+    // 2. 合并（相同 id → repeat_count++）并追踪跨轮次重复
+    const processed = this.processedBlocks.get(moduleId) ?? new Set<string>();
     const blockMap = new Map<string, Block>();
     for (const block of allBlocks) {
       const existing = blockMap.get(block.id);
       if (existing) {
         existing.repeat_count = (existing.repeat_count ?? 1) + 1;
       } else {
-        blockMap.set(block.id, { ...block, repeat_count: block.repeat_count ?? 1 });
+        // Cross-round repeat detection: if this module has seen this block before,
+        // increment repeat_count to reflect how many times this module has processed it.
+        const repeatCount = processed.has(block.id)
+          ? (block.repeat_count ?? 1) + 1
+          : (block.repeat_count ?? 1);
+        blockMap.set(block.id, { ...block, repeat_count: repeatCount });
       }
+    }
+    // Record all block IDs this module has now processed
+    for (const blockId of blockMap.keys()) {
+      processed.add(blockId);
+    }
+    // Prevent unbounded growth: if Set exceeds capacity limit, rebuild
+    // keeping only blocks still alive in BlockManager
+    if (processed.size > 10000) {
+      const pruned = new Set<string>();
+      for (const id of processed) {
+        if (this.blockManager.get(id)) {
+          pruned.add(id);
+        }
+      }
+      this.processedBlocks.set(moduleId, pruned);
+    } else {
+      this.processedBlocks.set(moduleId, processed);
     }
 
     const mergedBlocks = [...blockMap.values()];
@@ -292,7 +369,7 @@ export class Orchestrator {
         if (item && typeof item === "object" && this.isRawMedia(item)) {
           try {
             const mediaId = await this.registerRawMedia(item);
-            rawBlock.content[i] = { type: item.type, _mediaId: mediaId };
+            rawBlock.content[i] = { type: item.type, mediaId: mediaId };
           } catch (err) {
             this.logger.error({ err, moduleId }, "Failed to register media");
           }
@@ -389,9 +466,9 @@ export class Orchestrator {
     return true;
   }
 
-  /** 检查 content item 是否是原始多媒体（有 url/base64/file 但没有 _mediaId） */
+  /** 检查 content item 是否是原始多媒体（有 url/base64/file 但没有 mediaId） */
   private isRawMedia(item: any): boolean {
-    if (item._mediaId) return false;
+    if (item.mediaId) return false;
     return !!(item.url || item.base64 || item.file);
   }
 
@@ -408,7 +485,12 @@ export class Orchestrator {
       throw new Error("No valid media source found");
     }
 
-    const mimeType = item.mimeType ?? item.type ?? "application/octet-stream";
+    const MIME_MAP: Record<string, string> = {
+      image: "image/png",
+      audio: "audio/mpeg",
+      video: "video/mp4",
+    };
+    const mimeType = item.mimeType ?? MIME_MAP[item.type] ?? "application/octet-stream";
     return this.mediaManager.register(source, mimeType);
   }
 }

@@ -23,6 +23,12 @@ interface SchedulerEntryState {
   bufferCount: number;
   /** Set by report(), cleared by adjustRates() — prevents double adjustment */
   adjustedByReport: boolean;
+  /**
+   * Pending interval computed by report() AIMD feedback.
+   * Applied on the NEXT scheduleNext() call (i.e. after the current timer fires),
+   * so interval changes take effect on the next cycle, not immediately.
+   */
+  pendingInterval?: number;
 }
 
 const DEFAULT_SCHEDULE: ScheduleConfig = {
@@ -49,8 +55,8 @@ const MODULE_BUFFER_BUSY_THRESHOLD = 5;
 /** Safety timeout multiplier: if report() doesn't arrive within interval × this, force re-tick */
 const SAFETY_TIMEOUT_MULTIPLIER = 3;
 
-/** Maximum safety timeout in ms (prevents excessively long waits for slow modules) */
-const MAX_SAFETY_TIMEOUT_MS = 10_000;
+/** Default safety timeout cap in ms (used when config.safetyTimeoutMs is not set) */
+const DEFAULT_SAFETY_TIMEOUT_CAP_MS = 60_000;
 
 export interface AdjustRatesOptions {
   /** Total buffer item count across all modules that triggers rate limiting */
@@ -254,9 +260,21 @@ export class Scheduler {
 
   /**
    * Report execution result for a module.
-   * - If module has upstream registered: adjusts their intervals via AIMD.
-   * - If module has NO upstream (source module): adjusts its OWN interval as fallback.
-   * Modules whose interval changed are immediately rescheduled.
+   *
+   * AIMD design intent:
+   * - The module that just finished (the "reporter") provides feedback about its own
+   *   processing capacity. We use this feedback to adjust its DIRECT UPSTREAM modules
+   *   (the modules that output into the same Page the reporter reads from).
+   * - If the reporter is overloaded (slow execution or non-empty buffer), we INCREASE
+   *   upstream intervals (slow down upstream) to reduce input pressure.
+   * - If the reporter is underloaded (fast execution + empty buffer), we DECREASE
+   *   upstream intervals (speed up upstream) to improve throughput.
+   *
+   * Interval changes are deferred: stored as pendingInterval and applied on the
+   * upstream module's next scheduling cycle, NOT immediately. This avoids resetting
+   * a running timer mid-cycle (spec: "周期可以在修改的下一次生效").
+   *
+   * If module has NO upstream (source module): adjusts its OWN interval as fallback.
    */
   report(report: SchedulerReport): void {
     const state = this.entries.get(report.moduleId);
@@ -274,7 +292,9 @@ export class Scheduler {
     const { currentInterval } = state;
 
     if (upstreamIds && upstreamIds.size > 0) {
-      // Adjust UPSTREAM modules' intervals based on this module's feedback
+      // Adjust UPSTREAM modules' intervals based on this module's feedback.
+      // The adjustment is deferred via pendingInterval — it will take effect
+      // when the upstream module's current timer fires and scheduleNext is called.
       for (const upId of upstreamIds) {
         const upState = this.entries.get(upId);
         if (!upState) continue;
@@ -285,11 +305,9 @@ export class Scheduler {
         const clamped = clamp(nextInterval, upState.config.minIntervalMs, upState.config.maxIntervalMs);
 
         if (clamped !== upState.currentInterval) {
-          upState.currentInterval = clamped;
+          // Defer: store as pending, applied on next scheduleNext cycle
+          upState.pendingInterval = clamped;
           upState.adjustedByReport = true;
-          if (this.running) {
-            this.scheduleNext(upId);
-          }
         }
       }
     } else {
@@ -310,9 +328,11 @@ export class Scheduler {
     }
   }
 
-  /** Get current interval for a module. */
+  /** Get the effective interval for a module (includes pending adjustments). */
   getInterval(moduleId: string): number | undefined {
-    return this.entries.get(moduleId)?.currentInterval;
+    const state = this.entries.get(moduleId);
+    if (!state) return undefined;
+    return state.pendingInterval ?? state.currentInterval;
   }
 
   /** Check whether the scheduler is currently running. */
@@ -399,7 +419,9 @@ export class Scheduler {
 
       const state = this.entries.get(moduleId);
       if (!state) continue;
-      if (state.currentInterval >= state.config.maxIntervalMs * 0.8) continue;
+      // Skip modules already at or near maxInterval (>= 80%) — further adjustment is wasteful
+      // (skip this check when maxIntervalMs is -1 / unbounded)
+      if (state.config.maxIntervalMs !== -1 && state.currentInterval >= state.config.maxIntervalMs * 0.8) continue;
 
       // report() already adjusted this module — clear flag and skip
       if (state.adjustedByReport) {
@@ -407,14 +429,22 @@ export class Scheduler {
         continue;
       }
 
+      // Use effective interval (pending takes priority over current)
+      const effectiveInterval = state.pendingInterval ?? state.currentInterval;
       const nextInterval = clamp(
-        state.currentInterval * RATE_LIMIT_FACTOR,
+        effectiveInterval * RATE_LIMIT_FACTOR,
         state.config.minIntervalMs,
         state.config.maxIntervalMs,
       );
 
-      if (nextInterval > state.currentInterval) {
-        state.currentInterval = nextInterval;
+      if (nextInterval > effectiveInterval) {
+        // Write to pendingInterval if a deferred adjustment already exists,
+        // otherwise update currentInterval directly (adjustRates is an external pressure signal)
+        if (state.pendingInterval !== undefined) {
+          state.pendingInterval = nextInterval;
+        } else {
+          state.currentInterval = nextInterval;
+        }
         limited = true;
       }
     }
@@ -426,22 +456,29 @@ export class Scheduler {
 
   /**
    * Compute next interval via AIMD logic (shared by upstream and self-adjustment).
-   * @param targetInterval  - The interval of the module being adjusted
-   * @param executionTimeMs - How long the reporting module took to execute
-   * @param bufferEmpty     - Whether the reporting module's buffer is empty
+   *
+   * AIMD (Additive Increase / Multiplicative Decrease) applied to upstream frequency:
+   * - "Multiplicative Decrease" of upstream RATE = multiply upstream INTERVAL by BACKOFF_FACTOR
+   *   (triggered when downstream is overloaded: slow execution or buffer backlog)
+   * - "Additive Increase" of upstream RATE = multiply upstream INTERVAL by UPSTREAM_SPEEDUP_FACTOR
+   *   (triggered when downstream is underloaded: fast execution + empty buffer)
+   *
+   * @param targetInterval  - The current interval of the UPSTREAM module being adjusted
+   * @param executionTimeMs - How long the DOWNSTREAM (reporting) module took to execute
+   * @param bufferEmpty     - Whether the DOWNSTREAM (reporting) module's input buffer is empty
    */
   private computeAimdInterval(
     targetInterval: number,
     executionTimeMs: number,
     bufferEmpty: boolean,
   ): number {
-    // Backoff: downstream took longer than target's tick interval → upstream is producing too fast
-    // Or: downstream buffer not empty → pipeline backing up
+    // Backoff: downstream took longer than upstream's tick interval → upstream producing too fast
+    // Or: downstream buffer not empty → pipeline backing up, upstream should slow down
     if (executionTimeMs > targetInterval || !bufferEmpty) {
       return targetInterval * BACKOFF_FACTOR;
     }
-    // Speedup: downstream processed in less than half of TARGET's interval AND buffer empty
-    // → downstream easily keeps up with upstream's pace, upstream can go faster
+    // Speedup: downstream processed in < half of upstream's interval AND buffer empty
+    // → downstream easily keeps up, upstream can produce faster (reduce interval)
     if (executionTimeMs < targetInterval * FAST_RATIO && bufferEmpty) {
       return targetInterval * UPSTREAM_SPEEDUP_FACTOR;
     }
@@ -451,6 +488,13 @@ export class Scheduler {
   private scheduleNext(moduleId: string): void {
     const state = this.entries.get(moduleId);
     if (!state || !this.running) return;
+
+    // Apply deferred interval adjustment (from report() AIMD feedback) if pending.
+    // This ensures interval changes take effect on the next cycle, not immediately.
+    if (state.pendingInterval !== undefined) {
+      state.currentInterval = state.pendingInterval;
+      state.pendingInterval = undefined;
+    }
 
     // Clear any existing timer
     if (state.timer) {
@@ -477,22 +521,50 @@ export class Scheduler {
       // waiting for another module's output), force re-tick to prevent stall.
       if (state.safetyTimer) {
         clearTimeout(state.safetyTimer);
-      }
-      state.safetyTimer = setTimeout(() => {
         state.safetyTimer = undefined;
-        if (state.awaitingReport) {
-          // report() never came — notify orchestrator and force recovery
-          state.awaitingReport = false;
-          this.onTimeout?.(moduleId);
-          if (this.running) {
-            this.scheduleNext(moduleId);
+      }
+
+      const safetyMs = this.computeSafetyTimeout(state);
+      if (safetyMs > 0) {
+        state.safetyTimer = setTimeout(() => {
+          state.safetyTimer = undefined;
+          if (state.awaitingReport) {
+            // report() never came — notify orchestrator and force recovery
+            state.awaitingReport = false;
+            this.onTimeout?.(moduleId);
+            if (this.running) {
+              this.scheduleNext(moduleId);
+            }
           }
-        }
-      }, Math.min(state.currentInterval * SAFETY_TIMEOUT_MULTIPLIER, MAX_SAFETY_TIMEOUT_MS));
+        }, safetyMs);
+      }
     }, state.currentInterval);
+  }
+
+  /**
+   * Compute the safety timeout for a module.
+   * - config.safetyTimeoutMs === -1 → disabled (returns 0)
+   * - config.safetyTimeoutMs set → use it directly
+   * - default → Math.min(currentInterval * SAFETY_TIMEOUT_MULTIPLIER, DEFAULT_SAFETY_TIMEOUT_CAP_MS)
+   */
+  private computeSafetyTimeout(state: SchedulerEntryState): number {
+    const configured = state.config.safetyTimeoutMs;
+    if (configured === -1) return 0; // disabled
+    if (configured !== undefined && configured > 0) return configured;
+    return Math.min(
+      state.currentInterval * SAFETY_TIMEOUT_MULTIPLIER,
+      DEFAULT_SAFETY_TIMEOUT_CAP_MS,
+    );
   }
 }
 
+/**
+ * Clamp a value between min and max.
+ * When max === -1, no upper limit is applied (unbounded).
+ */
 function clamp(value: number, min: number, max: number): number {
+  if (max === -1) {
+    return Math.max(min, value);
+  }
   return Math.max(min, Math.min(max, value));
 }

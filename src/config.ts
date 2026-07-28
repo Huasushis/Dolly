@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync } from "fs";
 import { resolve } from "path";
 import { z } from "zod";
 import type { DollyConfig, ModuleConfig, ScheduleConfig } from "./core/types.js";
@@ -15,6 +15,7 @@ const ScheduleSchema = z.object({
   initialIntervalMs: z.number().optional(),
   minIntervalMs: z.number().optional(),
   maxIntervalMs: z.number().optional(),
+  safetyTimeoutMs: z.number().optional(),
 });
 
 const ModuleSchema = z.object({
@@ -79,6 +80,7 @@ export function loadConfig(configPath?: string): DollyConfig {
       initialIntervalMs: m.schedule?.initialIntervalMs ?? DEFAULT_SCHEDULE.initialIntervalMs,
       minIntervalMs: m.schedule?.minIntervalMs ?? DEFAULT_SCHEDULE.minIntervalMs,
       maxIntervalMs: m.schedule?.maxIntervalMs ?? DEFAULT_SCHEDULE.maxIntervalMs,
+      safetyTimeoutMs: m.schedule?.safetyTimeoutMs,
     },
   }));
 
@@ -97,4 +99,21 @@ export function loadConfig(configPath?: string): DollyConfig {
  */
 export function configToProfileDir(_configPath: string, dataDir: string): string {
   return resolve(dataDir);
+}
+
+/**
+ * Read raw config JSON without validation (for CLI `config show/edit`).
+ */
+export function readConfigRaw(configPath: string): unknown {
+  const path = resolve(configPath);
+  if (!existsSync(path)) throw new Error(`Config not found: ${path}`);
+  return JSON.parse(readFileSync(path, "utf-8"));
+}
+
+/**
+ * Write raw config JSON back to disk (for CLI `config edit`).
+ */
+export function writeConfigRaw(configPath: string, data: unknown): void {
+  const path = resolve(configPath);
+  writeFileSync(path, JSON.stringify(data, null, 2) + "\n");
 }

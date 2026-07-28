@@ -1,7 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from "vitest";
 import { Orchestrator } from "../../src/core/orchestrator.js";
 import type { DollyConfig } from "../../src/core/types.js";
-import type { Module, ModuleContext, DollyExtension } from "../../src/sdk/types.js";
+import type {
+  DollyExtension,
+  Module,
+  ModuleContext,
+} from "../../src/core/legacy-in-process-extension.js";
 import { mkdtempSync, rmSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";

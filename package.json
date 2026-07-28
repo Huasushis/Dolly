@@ -1,23 +1,49 @@
 {
   "name": "dolly",
   "version": "0.1.0",
-  "description": "Base agent prototype for multi-agent collaborative network testing",
+  "description": "Local-first agent runtime with isolated, capability-based extensions",
   "type": "module",
-  "main": "src/main.ts",
+  "main": "./dist/src/entry.js",
+  "types": "./dist/src/entry.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/entry.d.ts",
+      "import": "./dist/src/entry.js"
+    },
+    "./sdk": {
+      "types": "./dist/src/sdk/index.d.ts",
+      "import": "./dist/src/sdk/index.js"
+    }
+  },
   "bin": {
-    "dolly": "bin/dolly.js"
+    "dolly": "./bin/dolly.js"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.9.0"
   },
   "scripts": {
     "dev": "tsx watch src/main.ts",
-    "start": "node --import tsx/esm bin/dolly.js run",
-    "build": "tsc",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "start": "node bin/dolly.js run",
+    "build": "node scripts/build.mjs",
+    "prepack": "npm run build",
+    "typecheck": "node --max-old-space-size=4096 node_modules/typescript/bin/tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts",
+    "test:conformance": "vitest run --config vitest.config.ts tests/conformance",
+    "test:legacy": "vitest run --config vitest.legacy.config.ts",
+    "test:live": "vitest run --config vitest.live.config.ts"
   },
   "dependencies": {
     "@lancedb/lancedb": "^0.31.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@modelcontextprotocol/server-filesystem": "^2026.1.14",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "ali-oss": "^6.23.0",
     "async-mutex": "^0.5.0",
     "chokidar": "^4.0.0",
     "dotenv": "^16.4.0",
@@ -25,11 +51,18 @@
     "openai": "^4.70.0",
     "pino": "^10.3.1",
     "pino-pretty": "^13.1.3",
+    "sharp": "^0.35.3",
     "tavily-mcp": "^0.2.19",
     "ws": "^8.20.1",
     "zod": "^3.24.0"
   },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "sharp"
+    ]
+  },
   "devDependencies": {
+    "@types/ali-oss": "^6.23.3",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.18.1",
     "tsx": "^4.0.0",

@@ -1,38 +1,56 @@
-import { defineExtension } from "../../src/sdk/index.js";
-import type { Module, ModuleContext, RawBlock, ExecuteInput } from "../../src/sdk/index.js";
-import { join } from "path";
+import {
+  defineExtension,
+  type ExecuteInput,
+  type Module,
+  type ModuleContext,
+  type RawBlock,
+} from "../../src/core/legacy-in-process-extension.js";
+import { join, resolve } from "path";
+import { watch, type FSWatcher } from "chokidar";
 
-/** A single skill entry stored in memory and on disk. */
+/** A single skill entry loaded from SKILL.md. */
 interface SkillEntry {
   name: string;
   description: string;
   body: string;
-  updatedAt: number;
+  filePath: string;
 }
 
-/** Shape of the persisted JSON file per skill. */
-interface SkillFile {
-  name: string;
-  description: string;
-  body: string;
-  updatedAt: number;
-}
+/**
+ * Parse a SKILL.md file content.
+ * Expected format:
+ * ---
+ * name: xxx
+ * description: xxx
+ * ---
+ * <markdown body>
+ */
+function parseSkillMd(content: string, filePath: string): SkillEntry | null {
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  if (!match) return null;
 
-/** Race a promise against a timeout (ms). */
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((res, rej) => {
-    const timer = setTimeout(() => rej(new Error(`Timeout: ${label} exceeded ${ms}ms`)), ms);
-    promise.then(
-      (v) => { clearTimeout(timer); res(v); },
-      (e) => { clearTimeout(timer); rej(e); },
-    );
-  });
+  const frontmatter = match[1];
+  const body = match[2].trim();
+
+  let name = "";
+  let description = "";
+  for (const line of frontmatter.split(/\r?\n/)) {
+    const kv = line.match(/^(\w+)\s*:\s*(.*)$/);
+    if (kv) {
+      const key = kv[1].toLowerCase();
+      if (key === "name") name = kv[2].trim();
+      else if (key === "description") description = kv[2].trim();
+    }
+  }
+
+  if (!name) return null;
+  return { name, description, body, filePath };
 }
 
 export default defineExtension({
   name: "skill",
-  version: "0.3.0",
-  description: "Skill registry with persistent CRUD (passive query only)",
+  version: "0.4.0",
+  description: "Skill registry: reads SKILL.md files, passive query only",
   createModule({ id, config }) {
     return new SkillModule(id, config);
   },
@@ -41,42 +59,45 @@ export default defineExtension({
 class SkillModule implements Module {
   id: string;
   private skills: Map<string, SkillEntry> = new Map();
-  private syncIntervalMs: number;
-  private fileTimeoutMs: number;
-  private lastSync: number = 0;
-  private storageDir: string = "";
+  private skillsDir: string = "";
   private ctx: ModuleContext | null = null;
   private fs: (typeof import("fs/promises")) | null = null;
+  private watcher: FSWatcher | null = null;
+  private lifecycle: "new" | "initializing" | "running" | "stopping" | "stopped" = "new";
+  private syncChain: Promise<void> = Promise.resolve();
 
   constructor(id: string, config: Record<string, any>) {
     this.id = id;
-    this.syncIntervalMs = (config.sync_interval_ms as number | undefined) ?? 30_000;
-    this.fileTimeoutMs = (config.file_timeout_ms as number | undefined) ?? 5_000;
+    this.skillsDir = (config.skillsDir as string | undefined) ?? "";
   }
 
   async init(ctx: ModuleContext): Promise<void> {
+    if (this.lifecycle !== "new") {
+      throw new Error(`Skill module cannot initialize from state ${this.lifecycle}`);
+    }
+    this.lifecycle = "initializing";
     this.ctx = ctx;
-    this.storageDir = join(ctx.storagePath, "skills");
+    if (!this.skillsDir) {
+      this.skillsDir = join(ctx.storagePath, "skills");
+    }
+    this.skillsDir = resolve(this.skillsDir);
 
-    // Lazy-load fs/promises to avoid blocking startup
     this.fs = await import("fs/promises");
+    await this.fs.mkdir(this.skillsDir, { recursive: true });
 
-    // Ensure storage directory exists
-    await withTimeout(
-      this.fs.mkdir(this.storageDir, { recursive: true }),
-      this.fileTimeoutMs,
-      `mkdir(${this.storageDir})`,
-    );
-
-    await this.syncFromDisk();
+    try {
+      await this.syncFromDisk();
+      await this.startWatcher();
+      this.lifecycle = "running";
+    } catch (error) {
+      await this.watcher?.close();
+      this.watcher = null;
+      this.lifecycle = "stopped";
+      throw error;
+    }
   }
 
   async execute(_input: ExecuteInput): Promise<RawBlock | null> {
-    // Periodic sync to pick up external file changes (hot-reload)
-    if (Date.now() - this.lastSync > this.syncIntervalMs) {
-      await this.syncFromDisk();
-    }
-    // Skill module is a passive registry — never intercepts user input
     return null;
   }
 
@@ -85,138 +106,124 @@ class SkillModule implements Module {
   }
 
   getOutputPremise(): string {
-    const count = this.skills.size;
-    if (count === 0) {
+    if (this.skills.size === 0) {
       return "Skill module loaded. No skills registered.";
     }
-    return `Skill module loaded (${count} skill(s) available). Query via listSkills() or getSkill(name).`;
+    const entries = Array.from(this.skills.values())
+      .map((s) => `${s.name}(${s.description})`)
+      .join(", ");
+    return `可用技能: ${entries}`;
   }
 
   async onStop(): Promise<void> {
-    // no-op
-  }
-
-  // ---- Public CRUD API ----
-
-  /** Register a new skill. Rejects if a skill with the same name already exists. */
-  addSkill(name: string, description: string, body: string): Promise<void> {
-    if (this.skills.has(name)) {
-      return Promise.reject(new Error(`Skill "${name}" already exists. Use updateSkill() to modify it.`));
+    if (this.lifecycle === "stopped") return;
+    this.lifecycle = "stopping";
+    if (this.watcher) {
+      await this.watcher.close();
+      this.watcher = null;
     }
-    const entry: SkillEntry = { name, description, body, updatedAt: Date.now() };
-    this.skills.set(name, entry);
-    return this.persistSkill(entry);
+    await this.syncChain;
+    this.ctx = null;
+    this.lifecycle = "stopped";
   }
 
-  /** Get a skill's full body content by name. Rejects if not found. */
+  // ---- Public query API ----
+
   getSkill(name: string): Promise<string> {
     const entry = this.skills.get(name);
     if (!entry) {
       const available = Array.from(this.skills.keys()).join(", ") || "(none)";
       return Promise.reject(
-        new Error(`Skill "${name}" not found. Available skills: ${available}`),
+        new Error(`Skill "${name}" not found. Available: ${available}`),
       );
     }
     return Promise.resolve(entry.body);
   }
 
-  /** Update an existing skill. Rejects if the skill does not exist. */
-  updateSkill(name: string, updates: { description?: string; body?: string }): Promise<void> {
-    const entry = this.skills.get(name);
-    if (!entry) {
-      return Promise.reject(new Error(`Skill "${name}" not found. Cannot update.`));
+  listSkills(): Array<{ name: string; description: string; filePath: string }> {
+    return Array.from(this.skills.values()).map(({ name, description, filePath }) => ({
+      name,
+      description,
+      filePath,
+    }));
+  }
+
+  async refresh(): Promise<void> {
+    if (this.lifecycle !== "running") {
+      throw new Error(`Skill module cannot refresh from state ${this.lifecycle}`);
     }
-    if (updates.description !== undefined) entry.description = updates.description;
-    if (updates.body !== undefined) entry.body = updates.body;
-    entry.updatedAt = Date.now();
-    return this.persistSkill(entry);
+    await this.queueSync();
   }
 
-  /** Delete a skill by name. Rejects if the skill does not exist. */
-  deleteSkill(name: string): Promise<void> {
-    if (!this.skills.has(name)) {
-      return Promise.reject(new Error(`Skill "${name}" not found. Cannot delete.`));
+  // ---- Private ----
+
+  private async startWatcher(): Promise<void> {
+    this.watcher = watch(this.skillsDir, {
+      persistent: true,
+      ignoreInitial: true,
+      depth: 1,
+    });
+
+    const resync = () => void this.queueSync();
+
+    this.watcher.on("add", resync);
+    this.watcher.on("change", resync);
+    this.watcher.on("unlink", resync);
+    this.watcher.on("addDir", resync);
+    this.watcher.on("unlinkDir", resync);
+    this.watcher.on("error", (err) => {
+      this.ctx?.logger.warn({ err }, "Skill watcher failed");
+    });
+
+    await new Promise<void>((resolveReady, rejectReady) => {
+      const watcher = this.watcher!;
+      const onReady = () => {
+        watcher.off("error", onInitialError);
+        resolveReady();
+      };
+      const onInitialError = (error: unknown) => {
+        watcher.off("ready", onReady);
+        rejectReady(error);
+      };
+      watcher.once("ready", onReady);
+      watcher.once("error", onInitialError);
+    });
+  }
+
+  private queueSync(): Promise<void> {
+    if (this.lifecycle === "stopping" || this.lifecycle === "stopped") {
+      return Promise.resolve();
     }
-    this.skills.delete(name);
-    return this.removeSkillFile(name);
+    const next = this.syncChain.then(() => this.syncFromDisk());
+    this.syncChain = next.catch((err) => {
+      this.ctx?.logger.warn({ err }, "Skill watcher resync failed");
+    });
+    return next;
   }
 
-  /** List all registered skills (name + description). */
-  listSkills(): Array<{ name: string; description: string }> {
-    return Array.from(this.skills.values()).map(({ name, description }) => ({ name, description }));
-  }
-
-  // ---- Private: persistence ----
-
-  private async persistSkill(entry: SkillEntry): Promise<void> {
-    if (!this.fs) return;
-    const filePath = join(this.storageDir, `${entry.name}.json`);
-    const data: SkillFile = {
-      name: entry.name,
-      description: entry.description,
-      body: entry.body,
-      updatedAt: entry.updatedAt,
-    };
-    try {
-      await withTimeout(
-        this.fs.writeFile(filePath, JSON.stringify(data, null, 2), "utf-8"),
-        this.fileTimeoutMs,
-        `writeFile(${filePath})`,
-      );
-    } catch (err) {
-      this.ctx?.logger.warn({ filePath, err }, "Failed to persist skill");
-    }
-  }
-
-  private async removeSkillFile(name: string): Promise<void> {
-    if (!this.fs) return;
-    const filePath = join(this.storageDir, `${name}.json`);
-    try {
-      await withTimeout(
-        this.fs.unlink(filePath),
-        this.fileTimeoutMs,
-        `unlink(${filePath})`,
-      );
-    } catch {
-      // File may not exist — ignore
-    }
-  }
-
-  /** Load all .json skill files from disk into memory. */
+  /** Scan skillsDir for SKILL.md files (in subdirectories) and load them. */
   private async syncFromDisk(): Promise<void> {
     if (!this.fs) return;
     try {
-      const files = await withTimeout(
-        this.fs.readdir(this.storageDir),
-        this.fileTimeoutMs,
-        `readdir(${this.storageDir})`,
-      );
-
+      const entries = await this.fs.readdir(this.skillsDir, { withFileTypes: true });
       const seen = new Set<string>();
-      for (const file of files) {
-        if (!file.endsWith(".json")) continue;
-        const name = file.slice(0, -5); // strip .json
-        seen.add(name);
-        const filePath = join(this.storageDir, file);
+
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const skillMdPath = join(this.skillsDir, entry.name, "SKILL.md");
         try {
-          const raw = await withTimeout(
-            this.fs.readFile(filePath, "utf-8"),
-            this.fileTimeoutMs,
-            `readFile(${filePath})`,
-          );
-          const data: SkillFile = JSON.parse(raw);
-          this.skills.set(name, {
-            name: data.name ?? name,
-            description: data.description ?? "",
-            body: data.body ?? "",
-            updatedAt: data.updatedAt ?? 0,
-          });
-        } catch (err) {
-          this.ctx?.logger.warn({ filePath, err }, "Failed to load skill from disk");
+          const content = await this.fs.readFile(skillMdPath, "utf-8");
+          const parsed = parseSkillMd(content, skillMdPath);
+          if (parsed) {
+            seen.add(parsed.name);
+            this.skills.set(parsed.name, parsed);
+          }
+        } catch {
+          // SKILL.md not found in this subdirectory — skip
         }
       }
 
-      // Remove in-memory skills whose files were deleted externally
+      // Remove skills whose directories/files were deleted
       for (const name of this.skills.keys()) {
         if (!seen.has(name)) {
           this.skills.delete(name);
@@ -226,7 +233,6 @@ class SkillModule implements Module {
       this.ctx?.logger.warn({ err }, "Failed to sync skills from disk");
     }
 
-    this.lastSync = Date.now();
     this.ctx?.logger.info({ skillCount: this.skills.size }, "Skills synced from disk");
   }
 }

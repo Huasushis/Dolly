@@ -12,50 +12,61 @@
     .msg.user { align-self: flex-end; background: #0f3460; }
     .msg.bot  { align-self: flex-start; background: #16213e; }
     .msg .src { font-size: 0.75em; opacity: 0.6; margin-bottom: 2px; }
+    .msg img { display: block; max-width: 240px; border-radius: 6px; margin-top: 4px; }
+    #preview { display: flex; gap: 6px; flex-wrap: wrap; background: #16213e; }
+    #preview:not(:empty) { padding: 8px 12px; }
+    #preview img { height: 48px; border-radius: 4px; border: 1px solid #0f3460; }
     #input-bar { display: flex; gap: 8px; padding: 12px; background: #16213e; }
-    #input-bar input { flex: 1; padding: 10px; border: none; border-radius: 6px; background: #0f3460; color: #eee; font-size: 1em; }
+    #input-bar input[type="text"] { flex: 1; padding: 10px; border: none; border-radius: 6px; background: #0f3460; color: #eee; font-size: 1em; }
     #input-bar button { padding: 10px 20px; border: none; border-radius: 6px; background: #e94560; color: #fff; cursor: pointer; font-size: 1em; }
+    #input-bar button.icon { background: #0f3460; padding: 10px 14px; }
     #status { text-align: center; padding: 4px; font-size: 0.8em; opacity: 0.5; }
   </style>
 </head>
 <body>
   <div id="status">connecting…</div>
   <div id="messages"></div>
+  <div id="preview"></div>
   <div id="input-bar">
+    <input id="file" type="file" accept="image/*" multiple hidden />
+    <button id="attach" class="icon" title="Attach images">&#128206;</button>
     <input id="text" type="text" placeholder="Type a message…" />
     <button id="send">Send</button>
   </div>
   <script>
-    const ws = new WebSocket(`ws://${location.hostname}:3000`);
     const messagesEl = document.getElementById("messages");
     const statusEl = document.getElementById("status");
     const textEl = document.getElementById("text");
+    const fileEl = document.getElementById("file");
+    const previewEl = document.getElementById("preview");
 
-    function addMsg(text, cls, src) {
+    let ws = null;
+    let pendingImages = []; // base64 strings (no data: prefix)
+    let reconnectTimer = null;
+
+    function addMsg(text, cls, src, images) {
       const div = document.createElement("div");
       div.className = `msg ${cls}`;
-      if (src) div.innerHTML = `<div class="src">${src}</div>`;
-      div.appendChild(document.createTextNode(text));
+      if (src) {
+        const srcEl = document.createElement("div");
+        srcEl.className = "src";
+        srcEl.textContent = src;
+        div.appendChild(srcEl);
+      }
+      if (text) div.appendChild(document.createTextNode(text));
+      if (images && images.length) {
+        for (const b64 of images) {
+          const img = document.createElement("img");
+          img.src = b64.startsWith("data:") ? b64 : `data:image/png;base64,${b64}`;
+          div.appendChild(img);
+        }
+      }
       messagesEl.appendChild(div);
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
-    ws.onopen = () => { statusEl.textContent = "connected"; };
-    ws.onclose = () => { statusEl.textContent = "disconnected"; };
-
-    ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      if (msg.type === "history") {
-        for (const h of msg.messages) {
-          const text = extractText(h.payload);
-          if (text) addMsg(text, h.direction === "incoming" ? "user" : "bot", h.payload.source);
-        }
-      } else if (msg.type === "incoming") {
-        addMsg(extractText(msg) || "[no text]", "bot", msg.source);
-      }
-    };
-
     function extractText(obj) {
+      if (!obj) return "";
       if (obj.text) return obj.text;
       if (Array.isArray(obj.content)) {
         return obj.content.filter(i => i.type === "text").map(i => i.text).join("\n");
@@ -63,16 +74,101 @@
       return "";
     }
 
+    function extractImages(obj) {
+      if (obj && Array.isArray(obj.content)) {
+        return obj.content.filter(i => i.type === "image" && i.base64).map(i => i.base64);
+      }
+      return [];
+    }
+
+    function setStatus(text, isError) {
+      statusEl.textContent = text;
+      statusEl.style.color = isError ? "#e94560" : "";
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimer) return;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, 2000);
+    }
+
+    function connect() {
+      setStatus("connecting…");
+      try {
+        ws = new WebSocket(`ws://${location.hostname}:${location.port}`);
+      } catch (err) {
+        setStatus(`connection failed: ${err && err.message ? err.message : err} — retrying…`, true);
+        scheduleReconnect();
+        return;
+      }
+
+      ws.onopen = () => { setStatus("connected"); };
+
+      ws.onclose = () => {
+        setStatus("disconnected — reconnecting…", true);
+        scheduleReconnect();
+      };
+
+      ws.onerror = () => {
+        setStatus("connection error — reconnecting…", true);
+        // onclose fires after onerror; reconnect is handled there
+      };
+
+      ws.onmessage = (e) => {
+        let msg;
+        try { msg = JSON.parse(e.data); } catch { return; }
+        if (msg.type === "history") {
+          for (const h of msg.messages) {
+            const payload = h.payload || {};
+            const text = extractText(payload);
+            const images = extractImages(payload);
+            addMsg(text || (images.length ? "" : "[no text]"), h.direction === "incoming" ? "user" : "bot", payload.source, images);
+          }
+        } else if (msg.type === "incoming") {
+          const text = extractText(msg);
+          const images = extractImages(msg);
+          addMsg(text || (images.length ? "" : "[no text]"), "bot", msg.source, images);
+        }
+      };
+    }
+
     function send() {
       const text = textEl.value.trim();
       if (!text) return;
-      ws.send(JSON.stringify({ type: "user_input", text }));
-      addMsg(text, "user", "you");
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        setStatus("not connected — message not sent", true);
+        return;
+      }
+      const payload = { type: "user_input", text };
+      if (pendingImages.length) payload.images = pendingImages;
+      ws.send(JSON.stringify(payload));
+      addMsg(text, "user", "you", pendingImages.map(b => `data:image/png;base64,${b}`));
       textEl.value = "";
+      pendingImages = [];
+      previewEl.innerHTML = "";
     }
+
+    document.getElementById("attach").onclick = () => fileEl.click();
+    fileEl.onchange = () => {
+      for (const file of fileEl.files) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          pendingImages.push(String(reader.result).split(",")[1]);
+          const img = document.createElement("img");
+          img.src = reader.result;
+          previewEl.appendChild(img);
+        };
+        reader.readAsDataURL(file);
+      }
+      fileEl.value = "";
+    };
 
     document.getElementById("send").onclick = send;
     textEl.onkeydown = (e) => { if (e.key === "Enter") send(); };
+
+    connect();
   </script>
 </body>
 </html>

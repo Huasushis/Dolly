@@ -2,7 +2,21 @@ import { randomUUID } from "crypto";
 import { existsSync, mkdirSync } from "fs";
 import { readFile, writeFile, unlink } from "fs/promises";
 import path from "path";
+import sharp from "sharp";
 import type { Media, Rect } from "./types.js";
+
+// ─── OSS Configuration ───────────────────────────────────────────────────────
+
+export interface OSSConfig {
+  accessKeyId: string;
+  accessKeySecret: string;
+  endpoint: string;
+  bucket: string;
+  /** Public URL prefix for generating accessible URLs (e.g. https://bucket.oss-cn-hangzhou.aliyuncs.com) */
+  publicUrlPrefix?: string;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const MIME_EXT: Record<string, string> = {
   "image/png": ".png",
@@ -32,20 +46,58 @@ function isFilePath(str: string): boolean {
   return str.startsWith("file://") || str.startsWith("/") || /^[A-Z]:\\/i.test(str);
 }
 
+function isImageMime(mimeType: string): boolean {
+  return mimeType.startsWith("image/");
+}
+
+// ─── MediaManager ────────────────────────────────────────────────────────────
+
 export class MediaManager {
   private mediaDir: string;
   private store = new Map<string, Media>();
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private ossConfig: OSSConfig | null = null;
+  private ossClient: any = null;
 
-  constructor(mediaDir: string) {
+  constructor(mediaDir: string, ossConfig?: OSSConfig) {
     this.mediaDir = mediaDir;
     if (!existsSync(this.mediaDir)) {
       mkdirSync(this.mediaDir, { recursive: true });
     }
+    if (ossConfig) {
+      this.ossConfig = ossConfig;
+    }
+  }
+
+  /** Lazily initialise the OSS client */
+  private async getOSSClient(): Promise<any> {
+    if (!this.ossConfig) return null;
+    if (this.ossClient) return this.ossClient;
+    const OSS = (await import("ali-oss")).default;
+    this.ossClient = new OSS({
+      accessKeyId: this.ossConfig.accessKeyId,
+      accessKeySecret: this.ossConfig.accessKeySecret,
+      endpoint: this.ossConfig.endpoint,
+      bucket: this.ossConfig.bucket,
+    });
+    return this.ossClient;
+  }
+
+  /** Build the public URL for an OSS object key */
+  private ossPublicUrl(objectKey: string): string {
+    if (this.ossConfig?.publicUrlPrefix) {
+      return `${this.ossConfig.publicUrlPrefix.replace(/\/$/, "")}/${objectKey}`;
+    }
+    // Fallback: construct from endpoint + bucket
+    const { endpoint, bucket } = this.ossConfig!;
+    const host = endpoint.replace(/^https?:\/\//, "").replace(/\/$/, "");
+    return `https://${bucket}.${host}/${objectKey}`;
   }
 
   /**
    * 注册媒体资源，支持 Buffer / base64 / URL / file://
+   * G4: 自动提取图片 width/height 元数据
+   * G3: 如果启用 OSS，上传到 OSS
    * @returns mediaId
    */
   async register(source: Buffer | string, mimeType: string): Promise<string> {
@@ -90,35 +142,128 @@ export class MediaManager {
       refCount: 1,
     };
 
+    // G4: Extract image metadata (width/height)
+    if (isImageMime(mimeType)) {
+      try {
+        const meta = await sharp(data).metadata();
+        if (meta.width) media.width = meta.width;
+        if (meta.height) media.height = meta.height;
+      } catch {
+        // Non-fatal: metadata extraction failure shouldn't block registration
+      }
+    }
+    // G4: Audio/video duration — TODO: integrate ffprobe or file header parsing
+
+    // G3: Upload to OSS if configured
+    if (this.ossConfig) {
+      try {
+        const client = await this.getOSSClient();
+        const objectKey = `media/${id}${ext}`;
+        await client.put(objectKey, data);
+        media.ossObjectKey = objectKey;
+        media.url = this.ossPublicUrl(objectKey);
+      } catch {
+        // Non-fatal: OSS upload failure doesn't block local registration
+      }
+    }
+
     this.store.set(id, media);
     return id;
   }
 
   /**
    * 按需获取媒体内容
+   * G3: 如果启用 OSS 且 format="url"，返回 OSS 公开 URL
    */
   async get(id: string, format: "buffer" | "base64" | "url" = "buffer"): Promise<Buffer | string> {
     const media = this.store.get(id);
     if (!media) throw new Error(`Media not found: ${id}`);
-    if (!media.localPath) throw new Error(`Media has no local file: ${id}`);
-
-    const buf = await readFile(media.localPath);
 
     switch (format) {
-      case "buffer":
-        return buf;
-      case "base64":
-        return `data:${media.mimeType};base64,${buf.toString("base64")}`;
       case "url":
-        return media.url ?? media.localPath;
+        // G3: Prefer OSS URL if available
+        if (media.url) return media.url;
+        if (!media.localPath) throw new Error(`Media has no local file or URL: ${id}`);
+        return media.localPath;
+      case "buffer": {
+        if (!media.localPath) throw new Error(`Media has no local file: ${id}`);
+        return readFile(media.localPath);
+      }
+      case "base64": {
+        if (!media.localPath) throw new Error(`Media has no local file: ${id}`);
+        const buf = await readFile(media.localPath);
+        return `data:${media.mimeType};base64,${buf.toString("base64")}`;
+      }
     }
   }
 
   /**
-   * 图片裁剪 — 占位实现，后续引入 sharp
+   * D5: 图片裁剪
+   * - 如果启用 OSS 且图片已有 OSS URL，使用 OSS URL 参数裁剪（无需本地处理）
+   * - 否则使用 sharp 本地裁剪并注册为新 media 对象
+   * @param id 原始图片 mediaId
+   * @param rect 归一化裁剪区域 (topLeft/bottomRight, 0~1.0)
+   * @returns 新 mediaId（裁剪后的图片）
    */
-  async crop(_id: string, _rect: Rect): Promise<string> {
-    throw new Error("crop not implemented: sharp integration pending");
+  async crop(id: string, rect: Rect): Promise<string> {
+    const media = this.store.get(id);
+    if (!media) throw new Error(`Media not found: ${id}`);
+    if (!isImageMime(media.mimeType)) throw new Error(`Cannot crop non-image media: ${id}`);
+
+    // Validate rect
+    const { topLeft, bottomRight } = rect;
+    if (topLeft.x < 0 || topLeft.y < 0 || bottomRight.x > 1 || bottomRight.y > 1) {
+      throw new Error(`Invalid crop rect: coordinates must be in [0, 1.0]`);
+    }
+    if (topLeft.x >= bottomRight.x || topLeft.y >= bottomRight.y) {
+      throw new Error(`Invalid crop rect: topLeft must be above-left of bottomRight`);
+    }
+
+    // Strategy 1: OSS URL parameter crop (no local processing needed)
+    if (this.ossConfig && media.ossObjectKey && media.width && media.height) {
+      const px = Math.round(topLeft.x * media.width);
+      const py = Math.round(topLeft.y * media.height);
+      const pw = Math.round((bottomRight.x - topLeft.x) * media.width);
+      const ph = Math.round((bottomRight.y - topLeft.y) * media.height);
+      const ossCropUrl = `${this.ossPublicUrl(media.ossObjectKey)}?x-oss-process=image/crop,x_${px},y_${py},w_${pw},h_${ph}`;
+
+      // Register as new media with the OSS crop URL
+      const newId = randomUUID().replace(/-/g, "");
+      const newMedia: Media = {
+        id: newId,
+        mimeType: media.mimeType,
+        url: ossCropUrl,
+        ossObjectKey: `${media.ossObjectKey}?crop=${px}_${py}_${pw}_${ph}`,
+        width: pw,
+        height: ph,
+        size: 0, // Unknown until accessed
+        createdAt: Date.now(),
+        refCount: 1,
+      };
+      this.store.set(newId, newMedia);
+      return newId;
+    }
+
+    // Strategy 2: Local sharp crop
+    if (!media.localPath) throw new Error(`Media has no local file for cropping: ${id}`);
+    const inputData = await readFile(media.localPath);
+    const meta = await sharp(inputData).metadata();
+    const imgW = meta.width ?? 0;
+    const imgH = meta.height ?? 0;
+    if (imgW === 0 || imgH === 0) throw new Error(`Cannot determine image dimensions: ${id}`);
+
+    const px = Math.round(topLeft.x * imgW);
+    const py = Math.round(topLeft.y * imgH);
+    const pw = Math.round((bottomRight.x - topLeft.x) * imgW);
+    const ph = Math.round((bottomRight.y - topLeft.y) * imgH);
+
+    const croppedBuf = await sharp(inputData)
+      .extract({ left: px, top: py, width: pw, height: ph })
+      .toBuffer();
+
+    // Register cropped image as new media
+    const newId = await this.register(croppedBuf, media.mimeType);
+    return newId;
   }
 
   /**
@@ -140,7 +285,7 @@ export class MediaManager {
   }
 
   /**
-   * 删除本地文件 + 标记 OSS 待删除
+   * 删除本地文件 + G3: 删除 OSS 对象
    */
   async destroy(id: string): Promise<void> {
     const media = this.store.get(id);
@@ -150,7 +295,15 @@ export class MediaManager {
       await unlink(media.localPath);
     }
 
-    // TODO: 如果有 ossObjectKey，标记需要删除 OSS 对象（暂未实现）
+    // G3: Delete OSS object if exists
+    if (this.ossConfig && media.ossObjectKey) {
+      try {
+        const client = await this.getOSSClient();
+        await client.delete(media.ossObjectKey);
+      } catch {
+        // Non-fatal: log but don't throw
+      }
+    }
 
     this.store.delete(id);
   }

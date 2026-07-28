@@ -1,7 +1,15 @@
-import { defineExtension } from "../../src/sdk/index.js";
-import type { Module, ModuleContext, DollyExtension } from "../../src/sdk/types.js";
+import {
+  defineExtension,
+  type DollyExtension,
+  type Module,
+  type ModuleContext,
+} from "../../src/core/legacy-in-process-extension.js";
 import type { RawBlock, ExecuteInput } from "../../src/core/types.js";
 import { WebSocketServer, WebSocket } from "ws";
+import { createServer, type Server } from "http";
+import { readFileSync } from "fs";
+import { resolve, dirname } from "path";
+import { fileURLToPath } from "url";
 
 /** 待处理的用户输入 */
 interface PendingInput {
@@ -19,6 +27,7 @@ interface WsIncomingMessage {
 class ConsoleModule implements Module {
   id: string;
   private wss: WebSocketServer | null = null;
+  private httpServer: Server | null = null;
   private pendingInputs: PendingInput[] = [];
   private port: number;
   private clients: Set<WebSocket> = new Set();
@@ -35,7 +44,26 @@ class ConsoleModule implements Module {
   async init(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
 
-    this.wss = new WebSocketServer({ port: this.port });
+    const httpServer = createServer((req, res) => {
+      if (req.url === "/" || req.url === "/index.html") {
+        const htmlPath = resolve(dirname(fileURLToPath(import.meta.url)), "web", "index.html");
+        try {
+          const html = readFileSync(htmlPath, "utf-8");
+          res.writeHead(200, { "Content-Type": "text/html" });
+          res.end(html);
+        } catch {
+          res.writeHead(404);
+          res.end("Not found");
+        }
+      } else {
+        res.writeHead(404);
+        res.end("Not found");
+      }
+    });
+
+    this.httpServer = httpServer;
+    this.wss = new WebSocketServer({ server: httpServer });
+    httpServer.listen(this.port);
 
     this.wss.on("connection", (ws: WebSocket) => {
       this.clients.add(ws);
@@ -133,6 +161,12 @@ class ConsoleModule implements Module {
         this.wss!.close(() => resolve());
       });
       this.wss = null;
+    }
+    if (this.httpServer) {
+      await new Promise<void>((resolve) => {
+        this.httpServer!.close(() => resolve());
+      });
+      this.httpServer = null;
     }
   }
 

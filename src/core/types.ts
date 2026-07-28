@@ -1,10 +1,31 @@
-// 裁剪矩形
-export interface Rect {
+/**
+ * Deprecated data model used only by the old in-process orchestrator.
+ * New runtime and public SDK code must use block-store.ts and block-content.ts.
+ */
+
+// 坐标点
+export interface Point {
   x: number;
   y: number;
-  width: number;
-  height: number;
+  label?: string;
 }
+
+// 裁剪矩形（归一化坐标：topLeft 左上角，bottomRight 右下角）
+export interface Rect {
+  topLeft: { x: number; y: number };
+  bottomRight: { x: number; y: number };
+}
+
+// 坐标系统类型
+export type CoordinateSystem = "normalized" | "qwen" | "pixel";
+
+// 数据项（Block content 数组元素）
+export type DataItem =
+  | { type: "text"; text: string }
+  | { type: "image"; mediaId: string; crop?: Rect; point?: Point; pointLabel?: string }
+  | { type: "audio"; mediaId: string }
+  | { type: "video"; mediaId: string }
+  | { type: "forward"; blockId: string };
 
 // Block 主体
 export interface Block {
@@ -46,7 +67,14 @@ export interface Media {
 export interface ScheduleConfig {
   initialIntervalMs: number;
   minIntervalMs: number;
+  /** Maximum interval in ms. Use -1 for no upper limit. */
   maxIntervalMs: number;
+  /**
+   * Safety timeout in ms. If report() doesn't arrive within this time, force re-tick.
+   * Use -1 to disable the safety timer entirely.
+   * Default: Math.min(currentInterval * 3, 60_000)
+   */
+  safetyTimeoutMs?: number;
 }
 
 // Module 配置

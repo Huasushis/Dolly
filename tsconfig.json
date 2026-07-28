@@ -12,6 +12,6 @@
     "declaration": true,
     "sourceMap": true
   },
-  "include": ["src/**/*", "extensions/**/*", "daemon/**/*"],
+  "include": ["src/**/*", "extensions/**/*", "daemon/**/*", "tests/**/*"],
   "exclude": ["node_modules", "dist"]
 }

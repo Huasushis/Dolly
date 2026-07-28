@@ -48,31 +48,31 @@ describe("BlockManager", () => {
       expect(bm.get(block.id)).toEqual(block);
     });
 
-    it("should allow duplicate IDs (overwrites)", () => {
+    it("should reject duplicate IDs and preserve the original", () => {
       const block1 = makeBlock({ id: "dup" });
       const block2 = makeBlock({ id: "dup" });
       bm.register(block1);
-      bm.register(block2);
-      expect(bm.get("dup")).toEqual(block2);
+      expect(() => bm.register(block2)).toThrow("Block ID already registered");
+      expect(bm.get("dup")).toEqual(block1);
     });
 
     it("should reject forward reference to unknown block", () => {
       const block = makeBlock({
-        content: [{ _forwardBlockId: "nonexistent" }],
+        content: [{ type: "forward", blockId: "nonexistent" }],
       });
       expect(() => bm.register(block)).toThrow("Forward reference to unknown block");
     });
 
-    it("should reject forward reference with timestamp violation", () => {
+    it("should use commit order rather than caller timestamps", () => {
       const earlier = makeBlock({ id: "earlier", timestamp: 2000 });
       bm.register(earlier);
 
       const forwardBlock = makeBlock({
         id: "forwarder",
         timestamp: 1000, // earlier than referenced block
-        content: [{ _forwardBlockId: "earlier" }],
+        content: [{ type: "forward", blockId: "earlier" }],
       });
-      expect(() => bm.register(forwardBlock)).toThrow("timestamp violation");
+      expect(() => bm.register(forwardBlock)).not.toThrow();
     });
 
     it("should accept valid forward reference", () => {
@@ -82,14 +82,28 @@ describe("BlockManager", () => {
       const forwardBlock = makeBlock({
         id: "forwarder",
         timestamp: 2000,
-        content: [{ _forwardBlockId: "base" }],
+        content: [{ type: "forward", blockId: "base" }],
       });
       expect(() => bm.register(forwardBlock)).not.toThrow();
     });
 
+    it("should not expose a mutable alias to committed state", () => {
+      const block = makeBlock({
+        id: "immutable",
+        content: [{ type: "text", text: "original" }],
+      });
+      bm.register(block);
+
+      (block.content[0] as { text: string }).text = "caller mutation";
+      expect((bm.get("immutable")!.content[0] as { text: string }).text).toBe("original");
+      expect(() => {
+        (bm.get("immutable")!.content[0] as { text: string }).text = "read mutation";
+      }).toThrow();
+    });
+
     it("should acquire media references on register", () => {
       const block = makeBlock({
-        content: [{ _mediaId: "media1" }, { _mediaId: "media2" }],
+        content: [{ type: "image", mediaId: "media1" }, { type: "image", mediaId: "media2" }],
       });
       bm.register(block);
       expect(mediaManager.acquire).toHaveBeenCalledWith("media1");
@@ -103,7 +117,7 @@ describe("BlockManager", () => {
       const forwarder = makeBlock({
         id: "fwd",
         timestamp: 2000,
-        content: [{ _forwardBlockId: "base" }],
+        content: [{ type: "forward", blockId: "base" }],
       });
       bm.register(forwarder);
 
@@ -170,7 +184,7 @@ describe("BlockManager", () => {
     it("should release media references on eviction", async () => {
       const block = makeBlock({
         timestamp: Date.now() - 200,
-        content: [{ _mediaId: "m1" }],
+        content: [{ type: "image", mediaId: "m1" }],
       });
       bm.register(block);
 
@@ -188,7 +202,7 @@ describe("BlockManager", () => {
       const forwarder = makeBlock({
         id: "fwd",
         timestamp: Date.now() - 200,
-        content: [{ _forwardBlockId: "base" }],
+        content: [{ type: "forward", blockId: "base" }],
       });
       bm.register(forwarder);
 

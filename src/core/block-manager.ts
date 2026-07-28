@@ -1,19 +1,24 @@
 import { randomUUID } from "crypto";
 import type { Block } from "./types.js";
 import type { MediaManager } from "./media.js";
+import { deepFreeze } from "./canonical-json.js";
 
 const DEFAULT_TTL_MS = 60 * 60 * 1000; // 1 小时
 const DEFAULT_CLEANUP_INTERVAL_MS = 60_000; // 60 秒
 
 /**
  * 从 Block content 中提取 mediaId 引用
- * 约定：content 项若有 `_mediaId` 字段则视为 media 引用
+ * 约定：type 为 image/audio/video 且含 `mediaId` 字段的项视为 media 引用
  */
 function extractMediaIds(content: any[]): string[] {
   const ids: string[] = [];
   for (const item of content) {
-    if (item && typeof item === "object" && typeof item._mediaId === "string") {
-      ids.push(item._mediaId);
+    if (
+      item && typeof item === "object" &&
+      (item.type === "image" || item.type === "audio" || item.type === "video") &&
+      typeof item.mediaId === "string"
+    ) {
+      ids.push(item.mediaId);
     }
   }
   return ids;
@@ -21,13 +26,17 @@ function extractMediaIds(content: any[]): string[] {
 
 /**
  * 从 Block content 中提取 forward block 引用
- * 约定：content 项若有 `_forwardBlockId` 字段则视为 forward 引用
+ * 约定：type 为 forward 且含 `blockId` 字段的项视为 forward 引用
  */
 function extractForwardBlockIds(content: any[]): string[] {
   const ids: string[] = [];
   for (const item of content) {
-    if (item && typeof item === "object" && typeof item._forwardBlockId === "string") {
-      ids.push(item._forwardBlockId);
+    if (
+      item && typeof item === "object" &&
+      item.type === "forward" &&
+      typeof item.blockId === "string"
+    ) {
+      ids.push(item.blockId);
     }
   }
   return ids;
@@ -65,26 +74,25 @@ export class BlockManager {
    * - 校验 forward 引用的 block 是否存在且时间戳更早
    */
   register(block: Block): void {
+    if (this.blocks.has(block.id)) {
+      throw new Error(`Block ID already registered: ${block.id}`);
+    }
+
+    const stored = deepFreeze(structuredClone(block)) as Block;
     // forward 校验
-    const forwardIds = extractForwardBlockIds(block.content);
+    const forwardIds = extractForwardBlockIds(stored.content);
     for (const fid of forwardIds) {
       const referenced = this.blocks.get(fid);
       if (!referenced) {
         throw new Error(`Forward reference to unknown block: ${fid}`);
       }
-      if (referenced.timestamp >= block.timestamp) {
-        throw new Error(
-          `Forward reference timestamp violation: block ${block.id} (${block.timestamp}) ` +
-          `references block ${fid} (${referenced.timestamp}) which is not earlier`
-        );
-      }
     }
 
-    this.blocks.set(block.id, block);
-    this.refCounts.set(block.id, 0);
+    this.blocks.set(stored.id, stored);
+    this.refCounts.set(stored.id, 0);
 
     // 增加被引用 media 的计数
-    for (const mediaId of extractMediaIds(block.content)) {
+    for (const mediaId of extractMediaIds(stored.content)) {
       this.mediaManager.acquire(mediaId);
     }
 
