@@ -100,6 +100,7 @@ interface FakeCgroupBehavior {
  */
 class FakeCgroupFileSystem implements ModuleCgroupFileSystem {
   readonly writeLog: { path: string; content: string }[] = [];
+  readonly removalLog: string[] = [];
   readonly #files = new Map<string, string>();
   readonly #directories = new Set<string>();
   readonly #behavior: FakeCgroupBehavior;
@@ -166,6 +167,7 @@ class FakeCgroupFileSystem implements ModuleCgroupFileSystem {
   }
 
   async removeDirectory(path: string): Promise<void> {
+    this.removalLog.push(path);
     if (!this.#directories.has(path)) throw errno("ENOENT", `rmdir ${path}`);
     if ((await this.listChildDirectoryNames(path)).length > 0) {
       throw errno("ENOTEMPTY", `rmdir ${path}`);
@@ -714,6 +716,28 @@ describe("Module cgroup removal", () => {
     expect(await fileSystem.directoryExists(result.cgroup.path)).toBe(true);
   });
 
+  it("does not block termination after a premature removal request", async () => {
+    const fileSystem = newFileSystem();
+    const result = await prepare(fileSystem);
+    if (!result.prepared) throw new Error("preparation failed");
+    const cgroup = result.cgroup;
+    fileSystem.setPopulated(cgroup.path, true);
+    cgroup.recordVerifiedMembership([4321]);
+
+    // Do not await the rejection first. A pre-proof removal must not briefly
+    // present itself as an active removal and reject this termination.
+    const prematureRemoval = cgroup.remove();
+    const termination = cgroup.terminate({ timeoutMs: 500, pollIntervalMs: 1 });
+    await expect(prematureRemoval).resolves.toMatchObject({
+      removed: false,
+      code: "MODULE_CGROUP_REMOVE_BEFORE_PROOF",
+    });
+    await expect(termination).resolves.toMatchObject({
+      terminated: true,
+      evidence: "populated-zero",
+    });
+  });
+
   it("removes child control groups a Module created before removing the group", async () => {
     const fileSystem = newFileSystem();
     const result = await prepare(fileSystem);
@@ -734,6 +758,23 @@ describe("Module cgroup removal", () => {
       `${cgroup.path}/nested/deeper`,
     ]);
     expect(await fileSystem.directoryExists(cgroup.path)).toBe(false);
+  });
+
+  it("shares one filesystem removal between simultaneous callers", async () => {
+    const fileSystem = newFileSystem();
+    const result = await prepare(fileSystem);
+    if (!result.prepared) throw new Error("preparation failed");
+    const cgroup = result.cgroup;
+    fileSystem.setPopulated(cgroup.path, true);
+    cgroup.recordVerifiedMembership([4321]);
+    expect((await cgroup.terminate()).terminated).toBe(true);
+
+    const first = cgroup.remove();
+    const second = cgroup.remove();
+    expect(second).toBe(first);
+    await expect(first).resolves.toMatchObject({ removed: true });
+    await expect(second).resolves.toMatchObject({ removed: true });
+    expect(fileSystem.removalLog.filter((path) => path === cgroup.path)).toHaveLength(1);
   });
 
   it("waits for an earlier termination before it removes the control group", async () => {

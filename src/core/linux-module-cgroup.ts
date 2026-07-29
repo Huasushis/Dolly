@@ -1042,6 +1042,16 @@ export class ModuleCgroup {
   remove(
     options: ModuleCgroupRemovalOptions = {},
   ): Promise<ModuleCgroupRemovalResult> {
+    // A rejected pre-proof call does not acquire the removal lock. A
+    // termination may already be in progress and must remain free to obtain
+    // the proof that makes a later removal valid.
+    if (!this.#terminationProven) {
+      return Promise.resolve({
+        removed: false,
+        code: "MODULE_CGROUP_REMOVE_BEFORE_PROOF",
+        detail: `${this.path} has not been proven empty, so removing it would destroy the evidence that its processes stopped`,
+      });
+    }
     if (this.#removalResult !== undefined) return Promise.resolve(this.#removalResult);
     if (this.#removalPromise !== undefined) return this.#removalPromise;
     const removal = this.#removeOnce(options);
@@ -1062,13 +1072,6 @@ export class ModuleCgroup {
   async #removeOnce(
     options: ModuleCgroupRemovalOptions,
   ): Promise<ModuleCgroupRemovalResult> {
-    if (!this.#terminationProven) {
-      return {
-        removed: false,
-        code: "MODULE_CGROUP_REMOVE_BEFORE_PROOF",
-        detail: `${this.path} has not been proven empty, so removing it would destroy the evidence that its processes stopped`,
-      };
-    }
     const terminationWaitTimeoutMs =
       options.terminationWaitTimeoutMs ?? DEFAULT_TERMINATION_TIMEOUT_MS;
     if (!(await this.#waitForTerminationOperations(terminationWaitTimeoutMs))) {
