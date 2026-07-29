@@ -21,7 +21,10 @@
  *    waits for `cgroup.events` to report `populated 0`. A direct child exit or
  *    a child process handle is never accepted as evidence, and no operation
  *    here ever sends a signal to a process identifier.
- * 3. **Stop proof after a Core restart.** `LinuxModuleCgroupStopProver`
+ * 3. **Removal.** After an empty-group proof, it removes the Module cgroup and
+ *    any empty child groups. Removal waits for termination calls that began
+ *    before it, so it cannot delete files another termination call is reading.
+ * 4. **Stop proof after a Core restart.** `LinuxModuleCgroupStopProver`
  *    implements the `ModuleProcessStopProver` interface startup recovery uses,
  *    with the three proofs ADR 0009 accepts: `populated 0` within the same
  *    Linux boot, a missing path that still carries the record's non-reused
@@ -148,7 +151,7 @@ export interface ModuleCgroupFailure {
 }
 
 // ---------------------------------------------------------------------------
-// Filesystem seam
+// Filesystem interface
 // ---------------------------------------------------------------------------
 
 /**
@@ -738,6 +741,8 @@ export type ModuleCgroupTerminationFailureCode =
    */
   | "MODULE_CGROUP_MEMBERSHIP_UNOBSERVED"
   | "MODULE_CGROUP_KILL_WRITE_FAILED"
+  /** Removal has begun, so a new termination call must not reopen the path race. */
+  | "MODULE_CGROUP_REMOVAL_IN_PROGRESS"
   /** The finite wait expired while the group still held a process. */
   | "MODULE_CGROUP_STILL_POPULATED"
   /** The control files could not be read, so emptiness is unproven, not false. */
@@ -764,6 +769,8 @@ export type ModuleCgroupRemovalResult =
       readonly removed: false;
       readonly code:
         | "MODULE_CGROUP_REMOVE_BEFORE_PROOF"
+        /** Existing termination calls did not finish before the bounded wait. */
+        | "MODULE_CGROUP_TERMINATION_PENDING"
         | "MODULE_CGROUP_REMOVE_FAILED";
       readonly detail: string;
     };
@@ -771,6 +778,14 @@ export type ModuleCgroupRemovalResult =
 export interface ModuleCgroupWaitOptions {
   readonly timeoutMs?: number;
   readonly pollIntervalMs?: number;
+}
+
+export interface ModuleCgroupRemovalOptions {
+  /**
+   * Maximum time removal waits for termination calls that began before removal.
+   * On expiry no directory is removed, and a later caller may retry removal.
+   */
+  readonly terminationWaitTimeoutMs?: number;
 }
 
 interface ModuleCgroupConstructorOptions {
@@ -804,6 +819,10 @@ export class ModuleCgroup {
   readonly #pollIntervalMs: number;
   #membershipObserved = false;
   #terminationProven = false;
+  #activeTerminationOperations = 0;
+  readonly #terminationWaiters = new Set<() => void>();
+  #removalPromise: Promise<ModuleCgroupRemovalResult> | undefined;
+  #removalResult: Extract<ModuleCgroupRemovalResult, { readonly removed: true }> | undefined;
 
   constructor(options: ModuleCgroupConstructorOptions) {
     this.identity = options.identity;
@@ -900,6 +919,39 @@ export class ModuleCgroup {
   async terminate(
     options: ModuleCgroupWaitOptions = {},
   ): Promise<ModuleCgroupTerminationResult> {
+    if (this.#removalResult !== undefined) {
+      return {
+        terminated: false,
+        code: "MODULE_CGROUP_PATH_UNAVAILABLE",
+        detail: `${this.path} has already been removed after its empty-group proof`,
+        waitedMs: 0,
+        readings: 0,
+      };
+    }
+    if (this.#removalPromise !== undefined) {
+      return {
+        terminated: false,
+        code: "MODULE_CGROUP_REMOVAL_IN_PROGRESS",
+        detail: `${this.path} is being removed after an empty-group proof, so a new termination call is refused`,
+        waitedMs: 0,
+        readings: 0,
+      };
+    }
+    this.#activeTerminationOperations += 1;
+    try {
+      return await this.#terminateOnce(options);
+    } finally {
+      this.#activeTerminationOperations -= 1;
+      if (this.#activeTerminationOperations === 0) {
+        for (const resolve of this.#terminationWaiters) resolve();
+        this.#terminationWaiters.clear();
+      }
+    }
+  }
+
+  async #terminateOnce(
+    options: ModuleCgroupWaitOptions,
+  ): Promise<ModuleCgroupTerminationResult> {
     const timeoutMs = options.timeoutMs ?? DEFAULT_TERMINATION_TIMEOUT_MS;
     const intervalMs = options.pollIntervalMs ?? this.#pollIntervalMs;
     const startedAt = Date.now();
@@ -983,14 +1035,47 @@ export class ModuleCgroup {
   /**
    * Removes the proven-empty group. A Module process may have created child
    * cgroups, which the kernel requires to be removed first; they are empty
-   * after termination, so they are removed here and reported.
+   * after termination, so they are removed here and reported. A removal holds
+   * the path against new termination calls and waits for calls already in
+   * progress; on timeout it leaves the directory in place.
    */
-  async remove(): Promise<ModuleCgroupRemovalResult> {
+  remove(
+    options: ModuleCgroupRemovalOptions = {},
+  ): Promise<ModuleCgroupRemovalResult> {
+    if (this.#removalResult !== undefined) return Promise.resolve(this.#removalResult);
+    if (this.#removalPromise !== undefined) return this.#removalPromise;
+    const removal = this.#removeOnce(options);
+    this.#removalPromise = removal;
+    void removal.then(
+      (result) => {
+        if (this.#removalPromise !== removal) return;
+        if (result.removed) this.#removalResult = result;
+        this.#removalPromise = undefined;
+      },
+      () => {
+        if (this.#removalPromise === removal) this.#removalPromise = undefined;
+      },
+    );
+    return removal;
+  }
+
+  async #removeOnce(
+    options: ModuleCgroupRemovalOptions,
+  ): Promise<ModuleCgroupRemovalResult> {
     if (!this.#terminationProven) {
       return {
         removed: false,
         code: "MODULE_CGROUP_REMOVE_BEFORE_PROOF",
         detail: `${this.path} has not been proven empty, so removing it would destroy the evidence that its processes stopped`,
+      };
+    }
+    const terminationWaitTimeoutMs =
+      options.terminationWaitTimeoutMs ?? DEFAULT_TERMINATION_TIMEOUT_MS;
+    if (!(await this.#waitForTerminationOperations(terminationWaitTimeoutMs))) {
+      return {
+        removed: false,
+        code: "MODULE_CGROUP_TERMINATION_PENDING",
+        detail: `${this.path} still has a termination call in progress after ${terminationWaitTimeoutMs} ms; removal did not address the directory`,
       };
     }
     const removedChildCgroups: string[] = [];
@@ -1010,6 +1095,20 @@ export class ModuleCgroup {
       };
     }
     return { removed: true, removedChildCgroups };
+  }
+
+  #waitForTerminationOperations(timeoutMs: number): Promise<boolean> {
+    if (this.#activeTerminationOperations === 0) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const finish = (completed: boolean): void => {
+        clearTimeout(timer);
+        this.#terminationWaiters.delete(onTerminationsFinished);
+        resolve(completed);
+      };
+      const onTerminationsFinished = (): void => finish(true);
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      this.#terminationWaiters.add(onTerminationsFinished);
+    });
   }
 
   async #removeChildCgroups(

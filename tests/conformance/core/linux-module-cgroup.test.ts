@@ -71,6 +71,16 @@ function parentPath(path: string): string {
   return path.slice(0, path.lastIndexOf("/"));
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 interface FakeCgroupBehavior {
   /** Base names a newly created control group does not get at all. */
   readonly absentFiles?: readonly string[];
@@ -724,6 +734,63 @@ describe("Module cgroup removal", () => {
       `${cgroup.path}/nested/deeper`,
     ]);
     expect(await fileSystem.directoryExists(cgroup.path)).toBe(false);
+  });
+
+  it("waits for an earlier termination before it removes the control group", async () => {
+    const inner = newFileSystem();
+    const firstEventsReadStarted = deferred<void>();
+    const releaseFirstEventsRead = deferred<void>();
+    let holdFirstEventsRead = false;
+    let firstEventsReadHeld = false;
+    const fileSystem = new ReadOverrideFileSystem(inner, (path) => {
+      if (
+        holdFirstEventsRead &&
+        !firstEventsReadHeld &&
+        path.endsWith("/cgroup.events")
+      ) {
+        firstEventsReadHeld = true;
+        firstEventsReadStarted.resolve();
+        return releaseFirstEventsRead.promise.then(() => inner.readTextFile(path));
+      }
+      return undefined;
+    });
+    const result = await prepare(fileSystem);
+    if (!result.prepared) throw new Error("preparation failed");
+    const cgroup = result.cgroup;
+    inner.setPopulated(cgroup.path, true);
+    cgroup.recordVerifiedMembership([4321]);
+    holdFirstEventsRead = true;
+
+    const firstTermination = cgroup.terminate({ timeoutMs: 500, pollIntervalMs: 1 });
+    await firstEventsReadStarted.promise;
+
+    // A forced retry may proceed while the first call is blocked. It proves
+    // the group empty, but must not let removal delete the path the first call
+    // is still reading.
+    const secondTermination = await cgroup.terminate({ timeoutMs: 500, pollIntervalMs: 1 });
+    expect(secondTermination).toMatchObject({ terminated: true, evidence: "populated-zero" });
+    const removal = cgroup.remove({ terminationWaitTimeoutMs: 10 });
+    const refusedTermination = await cgroup.terminate();
+    expect(refusedTermination).toMatchObject({
+      terminated: false,
+      code: "MODULE_CGROUP_REMOVAL_IN_PROGRESS",
+    });
+
+    const timedOutRemoval = await removal;
+    expect(timedOutRemoval).toMatchObject({
+      removed: false,
+      code: "MODULE_CGROUP_TERMINATION_PENDING",
+    });
+    expect(await inner.directoryExists(cgroup.path)).toBe(true);
+
+    // A timed-out removal does not schedule a delayed deletion. Once the old
+    // call finishes, a caller must explicitly retry removal.
+    releaseFirstEventsRead.resolve();
+    expect(await firstTermination).toMatchObject({ terminated: true, evidence: "populated-zero" });
+    await Promise.resolve();
+    expect(await inner.directoryExists(cgroup.path)).toBe(true);
+    expect(await cgroup.remove()).toMatchObject({ removed: true });
+    expect(await inner.directoryExists(cgroup.path)).toBe(false);
   });
 });
 

@@ -1,6 +1,6 @@
 /**
- * The adapter between a started child launcher and the Extension process host's
- * attached-process seam.
+ * The adapter between a started child launcher and an Extension process host
+ * that receives an already-started process.
  *
  * `ExtensionProcessHost` deliberately does not know how its attachment
  * terminates a process, so nothing in the host can require whole-group
@@ -65,6 +65,16 @@ const FIXTURE_PACKAGE_MANIFEST: ExtensionPackageManifest = {
   requestedCapabilities: [],
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 /**
  * The control-group files `ModuleCgroup.terminate` reads and writes, in memory.
  * `killEmptiesGroup` is what a working kernel does; leaving it off is how a
@@ -113,6 +123,29 @@ class FakeCgroupFileSystem implements ModuleCgroupFileSystem {
   /** Every `cgroup.kill` write this filesystem received. */
   get killWrites(): { path: string; content: string }[] {
     return this.writes.filter((write) => write.path.endsWith("/cgroup.kill"));
+  }
+}
+
+/** Lets the second termination prove exit before the first one finishes. */
+class OutOfOrderTerminationFileSystem extends FakeCgroupFileSystem {
+  readonly firstEventsReadStarted = deferred<void>();
+  readonly releaseFirstEventsRead = deferred<void>();
+  #eventsReads = 0;
+
+  constructor() {
+    super({ killEmptiesGroup: false });
+  }
+
+  override async readTextFile(path: string): Promise<string> {
+    if (!path.endsWith("/cgroup.events")) return await super.readTextFile(path);
+    this.#eventsReads += 1;
+    if (this.#eventsReads === 1) {
+      this.firstEventsReadStarted.resolve();
+      await this.releaseFirstEventsRead.promise;
+      return await super.readTextFile(path);
+    }
+    if (this.#eventsReads === 2) return "populated 0\nfrozen 0\n";
+    return await super.readTextFile(path);
   }
 }
 
@@ -339,6 +372,107 @@ describe("Linux Module attached process adapter", () => {
         interval: 5,
       });
       expect(isAlive(started.child)).toBe(true);
+    } finally {
+      await stopChild(started?.child);
+      rmSync(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+
+  it("does not make forced termination wait for an earlier control-group read", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-attached-adapter-concurrent-"));
+    let started: StartedChild | undefined;
+    try {
+      started = startChild(["-e", "process.stdin.resume()"], scratch);
+      const fileSystem = new OutOfOrderTerminationFileSystem();
+      const attached = attachLinuxModuleProcess({
+        launcher: started.launcher,
+        cgroup: verifiedCgroup(fileSystem),
+        terminationTimeoutMs: 40,
+        pollIntervalMs: 2,
+      });
+
+      attached.requestTermination();
+      await fileSystem.firstEventsReadStarted.promise;
+
+      // The first read is still pending. Forced termination must issue its own
+      // cgroup.kill and can independently obtain the empty-group proof.
+      attached.forceTermination();
+      await vi.waitFor(() => expect(attached.exited).toBe(true), {
+        timeout: 1_000,
+        interval: 5,
+      });
+      expect(fileSystem.killWrites).toHaveLength(2);
+      expect(attached.terminationAttempts).toEqual([
+        expect.objectContaining({ terminated: true, evidence: "populated-zero" }),
+      ]);
+
+      // Exit is already proven. A later call must not start file access that
+      // could race removal of the now-empty control group.
+      attached.forceTermination();
+      expect(fileSystem.killWrites).toHaveLength(2);
+
+      // Let the first invocation finish after the path becomes unreadable. Its
+      // failure is placed before the second invocation's success, matching call
+      // order rather than completion order.
+      fileSystem.readable = false;
+      fileSystem.releaseFirstEventsRead.resolve();
+      await vi.waitFor(() => expect(attached.terminationAttempts).toHaveLength(2), {
+        timeout: 1_000,
+        interval: 5,
+      });
+      expect(attached.terminationAttempts[0]).toMatchObject({
+        terminated: false,
+        code: "MODULE_CGROUP_PATH_UNAVAILABLE",
+      });
+      expect(attached.terminationAttempts[1]).toMatchObject({
+        terminated: true,
+        evidence: "populated-zero",
+      });
+    } finally {
+      await stopChild(started?.child);
+      rmSync(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+
+  it("notifies every exit callback even when another callback throws", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-attached-adapter-callbacks-"));
+    let started: StartedChild | undefined;
+    try {
+      started = startChild(["-e", "process.stdin.resume()"], scratch);
+      const attached = attachLinuxModuleProcess({
+        launcher: started.launcher,
+        cgroup: verifiedCgroup(new FakeCgroupFileSystem()),
+        terminationTimeoutMs: 100,
+      });
+      const calls: string[] = [];
+      attached.onExit(() => {
+        calls.push("throwing");
+        throw new Error("exit callback failure");
+      });
+      attached.onExit(() => {
+        calls.push("second");
+      });
+      attached.onExit(async () => {
+        calls.push("async");
+        throw new Error("async exit callback failure");
+      });
+
+      attached.requestTermination();
+      await vi.waitFor(() => expect(attached.exited).toBe(true), {
+        timeout: 1_000,
+        interval: 5,
+      });
+      await Promise.resolve();
+      expect(calls).toEqual(["throwing", "second", "async"]);
+
+      expect(() =>
+        attached.onExit(() => {
+          calls.push("late");
+          throw new Error("late exit callback failure");
+        }),
+      ).not.toThrow();
+      await Promise.resolve();
+      expect(calls).toEqual(["throwing", "second", "async", "late"]);
     } finally {
       await stopChild(started?.child);
       rmSync(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });

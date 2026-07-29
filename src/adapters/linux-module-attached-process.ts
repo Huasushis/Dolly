@@ -2,21 +2,22 @@
  * Presents a started child launcher, together with its verified Module control
  * group, as the attached process `ExtensionProcessHost` speaks to.
  *
- * This is the second half of the seam. `ExtensionProcessHost` owns the
- * Extension protocol but deliberately does not know how its attachment
- * terminates a process, because Architecture Decision Record 0009 requires Core
- * to terminate the whole Module control group once membership is verified, and
- * the host must not know that control groups exist. The consequence is that no
- * host test can require whole-group termination: an adapter that signalled one
+ * `ExtensionProcessHost` owns the Extension protocol but deliberately does not
+ * know how its attachment terminates a process. This adapter supplies that
+ * missing operation because Architecture Decision Record 0009 requires Core to
+ * terminate the whole Module control group once membership is verified, and the
+ * host must not know that control groups exist. The consequence is that no host
+ * test can require whole-group termination: an adapter that signalled one
  * process identifier would satisfy every contract the host states while leaving
  * descendants running. That obligation is discharged here, and is tested here.
  *
- * Two rules follow, and both are load-bearing:
+ * Two rules are required:
  *
- * - Both termination steps terminate the whole group. Neither signals a process
- *   identifier, and neither does nothing. A second call costs nothing because
- *   `cgroup.kill` is idempotent, while doing nothing would assert that the
- *   first call had already succeeded - an assertion nothing has verified.
+ * - While exit remains unproven, both termination steps terminate the whole
+ *   group. Neither signals a process identifier, and neither does nothing. A
+ *   second call costs nothing because `cgroup.kill` is idempotent, while doing
+ *   nothing would assert that the first call had already succeeded - an
+ *   assertion nothing has verified.
  * - An exit is reported only from `cgroup.events` reporting `populated 0`.
  *   Neither termination call returning, nor the launcher child's own exit, is
  *   evidence: after membership is verified a descendant can outlive the direct
@@ -56,9 +57,10 @@ export interface LinuxModuleAttachedProcessOptions {
 
 export interface LinuxModuleAttachedProcess extends AttachedExtensionProcess {
   /**
-   * Every whole-group termination this adapter performed, in order, including
-   * the ones that failed to prove the group empty. The Linux Module executor
-   * reports the last failure when it cannot confirm termination.
+   * Every completed whole-group termination, ordered by invocation. A later
+   * invocation may complete while an earlier one is still pending; once the
+   * earlier invocation completes, its result appears before the later result.
+   * Failed proofs are retained for diagnosis.
    */
   readonly terminationAttempts: readonly ModuleCgroupTerminationResult[];
 }
@@ -85,11 +87,32 @@ export function attachLinuxModuleProcess(
       ? {}
       : { pollIntervalMs: options.pollIntervalMs }),
   };
-  const attempts: ModuleCgroupTerminationResult[] = [];
-  const observers = new Set<() => void>();
+  const completedAttempts = new Map<number, ModuleCgroupTerminationResult>();
+  const exitCallbacks = new Set<() => void>();
+  let nextAttempt = 0;
   let exited = false;
 
-  const terminateWholeGroup = async (): Promise<void> => {
+  const notifyExitCallback = (callback: () => void): void => {
+    try {
+      // A callback typed as returning void can still be an async function.
+      // Consume its rejection so caller code cannot create an unhandled
+      // rejection after the kernel exit has already been recorded.
+      void Promise.resolve((callback as () => unknown)()).catch(() => undefined);
+    } catch {
+      // A callback belongs to a caller. It cannot invalidate the kernel exit
+      // proof or prevent the remaining callbacks from receiving it.
+    }
+  };
+
+  const reportExit = (): void => {
+    if (exited) return;
+    exited = true;
+    const callbacks = [...exitCallbacks];
+    exitCallbacks.clear();
+    for (const callback of callbacks) notifyExitCallback(callback);
+  };
+
+  const terminateWholeGroup = async (attempt: number): Promise<void> => {
     let result: ModuleCgroupTerminationResult;
     try {
       result = await cgroup.terminate(waitOptions);
@@ -104,19 +127,20 @@ export function attachLinuxModuleProcess(
         readings: 0,
       };
     }
-    attempts.push(result);
-    if (!result.terminated || exited) return;
-    exited = true;
-    for (const observer of observers) observer();
-    observers.clear();
+    completedAttempts.set(attempt, result);
+    if (result.terminated) reportExit();
   };
 
-  // Both steps are the same whole-group operation. The host's two-step
-  // escalation exists for a mechanism that has a gentler first step; this one
-  // does not, and repeating the group termination is both harmless and the only
-  // honest option.
+  // While exit remains unproven, both steps are the same whole-group operation.
+  // The host's two-step escalation exists for a mechanism that has a gentler
+  // first step; this one does not, and repeating the group termination is both
+  // harmless and the only honest option.
   const terminateGroup = (): void => {
-    void terminateWholeGroup();
+    // Once the group has been proven empty, another write would add no proof
+    // and could race a caller that is removing the empty control group.
+    if (exited) return;
+    const attempt = nextAttempt++;
+    void terminateWholeGroup(attempt);
   };
 
   return {
@@ -126,14 +150,16 @@ export function attachLinuxModuleProcess(
     get exited() {
       return exited;
     },
-    onExit: (observer: () => void) => {
-      if (exited) observer();
-      else observers.add(observer);
+    onExit: (callback: () => void) => {
+      if (exited) notifyExitCallback(callback);
+      else exitCallbacks.add(callback);
     },
     requestTermination: terminateGroup,
     forceTermination: terminateGroup,
     get terminationAttempts() {
-      return attempts;
+      return [...completedAttempts.entries()]
+        .sort(([left], [right]) => left - right)
+        .map(([, result]) => result);
     },
   };
 }

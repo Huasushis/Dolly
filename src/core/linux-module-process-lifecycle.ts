@@ -286,8 +286,9 @@ export type ModuleProcessStopResult =
  *
  * The record moves to `stopping` before termination begins, so a Core that
  * dies during the stop leaves the intent visible. It moves to `stopped` only
- * after the group is proven empty; an unproven stop leaves the record in
- * `stopping` for a later Core invocation to resolve, and never claims success.
+ * after the group is proven empty and its directory is removed; an unproven
+ * stop or failed removal leaves the record in `stopping` for a later Core
+ * invocation to resolve, and never claims success.
  */
 export async function stopModuleProcess(options: {
   readonly records: ModuleProcessRecordWriter;
@@ -305,6 +306,18 @@ export async function stopModuleProcess(options: {
       stopped: false,
       code: termination.code,
       detail: termination.detail,
+    };
+  }
+  const removal = await cgroup.remove(
+    options.timeoutMs === undefined
+      ? {}
+      : { terminationWaitTimeoutMs: options.timeoutMs },
+  );
+  if (!removal.removed) {
+    return {
+      stopped: false,
+      code: removal.code,
+      detail: removal.detail,
     };
   }
   const record = records.updateModuleProcessRecordState(

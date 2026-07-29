@@ -86,6 +86,7 @@ function recordWriter(): ModuleProcessRecordWriter & { readonly log: string[] } 
 function fakeCgroupFileSystem(overrides: {
   readonly populated?: () => string;
   readonly failCreate?: boolean;
+  readonly failRemove?: boolean;
 } = {}) {
   const files = new Map<string, string>();
   const directories = new Set<string>();
@@ -97,6 +98,9 @@ function fakeCgroupFileSystem(overrides: {
       directories.add(path);
     },
     async removeDirectory(path: string): Promise<void> {
+      if (overrides.failRemove) {
+        throw Object.assign(new Error("removal denied"), { code: "EACCES" });
+      }
       directories.delete(path);
     },
     async directoryExists(path: string): Promise<boolean> {
@@ -298,5 +302,41 @@ describe("Linux Module process lifecycle order", () => {
     });
     expect(proven.stopped).toBe(true);
     expect(records.log.at(-1)).toBe("state:stopped");
+    expect(fileSystem.directories.has(started.cgroup.path)).toBe(false);
+  });
+
+  it("keeps the process record stopping when an empty group cannot be removed", async () => {
+    const records = recordWriter();
+    const fileSystem = fakeCgroupFileSystem({
+      populated: () => "populated 0\nfrozen 0\n",
+      failRemove: true,
+    });
+    const started = await startModuleProcess({
+      records,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher: async () => launcher(),
+      execution: EXECUTION,
+      cgroupFileSystem: fileSystem,
+    });
+    expect(started.started).toBe(true);
+    if (!started.started) throw new Error("expected a start");
+
+    const stopped = await stopModuleProcess({
+      records,
+      processGenerationId: IDENTITY.processGenerationId,
+      cgroup: started.cgroup,
+      timeoutMs: 200,
+    });
+    expect(stopped).toMatchObject({
+      stopped: false,
+      code: "MODULE_CGROUP_REMOVE_FAILED",
+    });
+    expect(records.log.at(-1)).toBe("state:stopping");
+    expect(records.log).not.toContain("state:stopped");
+    expect(fileSystem.directories.has(started.cgroup.path)).toBe(true);
   });
 });
