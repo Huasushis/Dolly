@@ -94,15 +94,42 @@ open-file limit、丢失的失败证据，以及第一处漏关控制描述符�
 adapter 的整组终止和 `exec` 后文件描述符 0/1 上的协议传输，不证明完整 runtime assembly。当前脚本还会
 把全 skipped 的 Vitest 结果当成功；本轮人工核对 JSON 避免了假阳性，脚本本身仍要修。
 
-### P0-3　整组终止 adapter 的并发与退出回调异常：待修
+### P0-3　整组终止并发、目录删除与退出回调：checkpoint，尚未完成验收
 
-`requestTermination()` 与 `forceTermination()` 目前都在不等待结果的情况下启动
-`terminateWholeGroup()`。并发时先完成的一次可能让 host 返回并移除 control group，而仍在运行
-的另一次随后才记录路径失败；`terminationAttempts` 也按完成顺序 push，与“调用顺序”注释冲突。
-修复不能简单排队等待第一次可能卡住的文件读写：重复的 `cgroup.kill` 必须仍可发起，同时清理过程
-必须等待所有已经开始的操作。另一个缺口是任意一个退出回调抛异常会阻止后续回调，
-还可能形成未处理的 Promise rejection；应先复制并清空回调集合，再逐个隔离异常。改动时把源码里的
-“second half of the seam”换成直接描述，并为并发完成顺序和退出回调抛异常补精确测试。
+提交 `26edeea` 已实现第一版修复，**但还没有做反向变异或新的独立代码审查，不能标为完成**。
+这一版的职责划分是：
+
+- `attachLinuxModuleProcess` 的两个终止方法在空组尚未证明时仍各自发起 `cgroup.kill`；
+  不把第二次排在第一次的可能卡住的文件读写之后。完成的 `terminationAttempts` 改为按调用顺序
+  返回，而不是按完成顺序；一旦已有 `populated 0` 证明，后续调用不再重新访问将被删除的路径；
+- `ModuleCgroup.remove()` 是真正拥有文件系统路径的强制点。它先拒绝新的 `terminate()`，再有限
+  等待已开始的 terminate 调用；超时返回 `MODULE_CGROUP_TERMINATION_PENDING`，不删除目录，也不
+  安排后台删除。之后必须由调用者显式重试；
+- `stopModuleProcess()` 只有在空组证明和目录删除均成功后才把记录写为 `stopped`。删除失败会保留
+  `stopping`；
+- 退出回调先从集合复制并清空。同步抛错和 async callback 的 rejected Promise 都被隔离，不能阻止
+  其他 callback 或形成未处理 rejection；
+- 同时去掉了源码和测试中未解释的 “seam” / “load-bearing” 隐喻。
+
+已在本机设置 `TMPDIR` 后验证：
+
+- `tests/conformance/core/linux-module-cgroup.test.ts`：46/46；
+- `tests/conformance/core/linux-module-process-lifecycle.test.ts`：6/6；
+- `tests/conformance/core/linux-module-attached-process.test.ts`：12/12；
+- `npm.cmd run typecheck -- --pretty false`：exit 0。
+
+**交接者先做以下工作，先不要宣称 P0-3 完成：**
+
+1. 独立审查 `ModuleCgroup.remove()` 的锁定和 timeout 路径，特别是 removal Promise 的清理、重试和
+   同时调用 `remove()` 的行为；
+2. 在独立副本中移除 `#waitForTerminationOperations()` 的等待，运行新的 cgroup removal 用例，必须
+   在“超时不删除目录”的强制点失败；恢复副本后再继续；
+3. 在独立副本中让第二次终止等待第一次，新的 attached-process 并发用例必须失败；再让 async
+   callback 的 rejection 不被 catch，callback 用例必须以未处理 rejection 失败；
+4. 如果上述证伪均成立，重新在 Linux systemd 容器运行两条 P0-2 用例。控制结果的源码 hash 会随
+   这次改动变化，公共结果文档必须追加新 run，而不能覆盖旧证据；
+5. 然后处理运行脚本的全 skipped 假阳性。`runner_skip_audit` 的结论已确认：Vitest JSON 的
+   `success: true` 不代表用例执行，必须检查测试级 passed/pending/failed/todo 计数和实际文件集合。
 
 ### P1-1　`typecheck` 覆盖和诊断修复 ✓ 完成
 
@@ -203,6 +230,7 @@ M14 重复案例。P0-1 的两个完整 manifest 也各自报 4,391 次计划执
 | 记录回收判定抽为纯函数 + 10 例测试 | `src/core/core-startup-recovery.ts` | 三条守卫分别置真 → 4/1/2 例失败 |
 | P0-1 手写 launcher control 换成产品适配器 | `core-standin.mts` | 14 例边界 A/B + 233 例完整 A/B，逐案例三字段 diff 均为空 |
 | P0-2 真实 Linux control group 与文件描述符验证 | Linux integration test、fixture、control-group implementation | 未修改产品实现时 2/2 pass；仅终止直接进程的证伪在 `populated 1` 处失败；清理后零残留 |
+| P0-3 并发终止和删除顺序 checkpoint | attached-process adapter、`ModuleCgroup`、停止生命周期 | 本机 46/46 + 6/6 + 12/12、typecheck exit 0；仍待独立审查、反向变异和 Linux 重跑 |
 | 恢复完整 TypeScript 范围并修复 91 条诊断 | `tsconfig.json`、`package.json`、33 个测试文件 | 标准 `typecheck` exit 0；按受影响文件精确运行的用例全绿，5 个未启用的付费 live 用例明确 skipped |
 
 最终核实：`npm.cmd run typecheck -- --pretty false` **exit 0**；目录 **v3、570 例、
