@@ -261,9 +261,17 @@ describe.skipIf(!available)("Linux Module executor exit through systemd", () => 
         .toBe(true);
       const report = JSON.parse(readFileSync(reportPath, "utf8")) as ExitFixtureReport;
       expect(report.serviceInvocationId).toBe(properties.get("InvocationID"));
-      expect(properties.get("ControlGroup")).toBe(
-        report.core.cgroupPath.slice(0, -"/core".length),
-      );
+      // The fixture captured live process membership from /proc before the
+      // product executor ended Core. Some systemd versions clear ControlGroup
+      // after the last process exits; if it is retained, it must agree with
+      // that live path.
+      const serviceCgroupPath = report.core.cgroupPath.slice(0, -"/core".length);
+      const retainedServiceCgroupPath = properties.get("ControlGroup");
+      if (retainedServiceCgroupPath !== "") {
+        expect(retainedServiceCgroupPath).toBe(serviceCgroupPath);
+      }
+      expect(serviceCgroupPath.endsWith(`/${unitName}`)).toBe(true);
+      expect(report.serviceCgroupFilesystemPath).toBe(`/sys/fs/cgroup${serviceCgroupPath}`);
       expect(report.launcher.cgroupPath).toBe(report.core.cgroupPath);
       expect(report.moduleCgroupFilesystemPath.startsWith(
         `${report.serviceCgroupFilesystemPath}/`,
