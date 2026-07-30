@@ -115,6 +115,14 @@ function parseProperties(text: string): ReadonlyMap<string, string> {
   return properties;
 }
 
+function readFileOrNull(path: string): string | null {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
 async function showUnit(unitName: string): Promise<ReadonlyMap<string, string>> {
   const names = [
     "ActiveState",
@@ -133,7 +141,7 @@ async function showUnit(unitName: string): Promise<ReadonlyMap<string, string>> 
   ];
   const { stdout } = await execFileAsync(
     "systemctl",
-    ["--user", "show", unitName, ...names.map((name) => `--property=${name}`)],
+    ["--user", "show", "--all", unitName, ...names.map((name) => `--property=${name}`)],
     { encoding: "utf8", timeout: 10_000, maxBuffer: 128 * 1024 },
   );
   return parseProperties(stdout);
@@ -241,7 +249,17 @@ describe.skipIf(!available)("Linux Module executor exit through systemd", () => 
       expect(command.killed, `systemd-run timed out: ${command.stderr}`).toBe(false);
 
       const properties = await showUnit(unitName);
-      expect(Object.fromEntries(properties)).toMatchObject({
+      const systemdProperties = Object.fromEntries(properties);
+      // This first record is emitted before assertions so a deliberately
+      // broken product exit path still leaves the actual service status in
+      // the retained Linux validation log.
+      console.info(JSON.stringify({
+        unitName,
+        systemdRunExitCode: command.exitCode,
+        systemdRunSignal: command.signal,
+        systemd: systemdProperties,
+      }));
+      expect(systemdProperties).toMatchObject({
         ActiveState: "failed",
         SubState: "failed",
         Result: "exit-code",
@@ -260,14 +278,15 @@ describe.skipIf(!available)("Linux Module executor exit through systemd", () => 
       expect(existsSync(reportPath), `fixture output: ${command.stdout}\n${command.stderr}`)
         .toBe(true);
       const report = JSON.parse(readFileSync(reportPath, "utf8")) as ExitFixtureReport;
+      expect(report.serviceInvocationId).toMatch(/^[0-9a-f]{32}$/);
       expect(report.serviceInvocationId).toBe(properties.get("InvocationID"));
       // The fixture captured live process membership from /proc before the
-      // product executor ended Core. Some systemd versions clear ControlGroup
-      // after the last process exits; if it is retained, it must agree with
-      // that live path.
+      // product executor ended Core. systemd can clear ControlGroup after it
+      // releases the empty unit cgroup; if retained, it must agree with that
+      // live path.
       const serviceCgroupPath = report.core.cgroupPath.slice(0, -"/core".length);
       const retainedServiceCgroupPath = properties.get("ControlGroup");
-      if (retainedServiceCgroupPath !== "") {
+      if (retainedServiceCgroupPath !== undefined && retainedServiceCgroupPath !== "") {
         expect(retainedServiceCgroupPath).toBe(serviceCgroupPath);
       }
       expect(serviceCgroupPath.endsWith(`/${unitName}`)).toBe(true);
@@ -279,7 +298,8 @@ describe.skipIf(!available)("Linux Module executor exit through systemd", () => 
 
       const state = openCoreState(statePath);
       expect(state.revision).toBe(2);
-      expect(state.listModuleProcessRecords()).toEqual([
+      const processRecords = state.listModuleProcessRecords();
+      expect(processRecords).toEqual([
         expect.objectContaining({
           processGenerationId: report.processGenerationId,
           serviceInvocationId: report.serviceInvocationId,
@@ -302,22 +322,38 @@ describe.skipIf(!available)("Linux Module executor exit through systemd", () => 
         unitName,
         systemdRunExitCode: command.exitCode,
         systemdRunSignal: command.signal,
-        systemd: Object.fromEntries(properties),
+        systemd: systemdProperties,
         core: report.core,
         launcher: report.launcher,
-        processRecordState: "stopping",
+        serviceCgroupFilesystemPath: report.serviceCgroupFilesystemPath,
+        moduleCgroupFilesystemPath: report.moduleCgroupFilesystemPath,
+        stateRevision: state.revision,
+        processRecord: processRecords[0],
+        fallbackFilePresent: false,
         moduleCgroupRemoved: true,
         serviceCgroupRemoved: true,
       }));
 
       await cleanupExactUnit(unitName);
-      unitCleaned = true;
       const { stdout: remainingUnit } = await execFileAsync(
         "systemctl",
         ["--user", "list-units", "--all", "--no-legend", unitName],
         { encoding: "utf8", timeout: 10_000 },
       );
       expect(remainingUnit.trim()).toBe("");
+      unitCleaned = true;
+    } catch (error) {
+      // The fixture uses only synthetic test data. Preserve it in the retained
+      // Linux log before removing the temporary directory so a failed
+      // counterexample can be attributed to the product path it exercised.
+      console.info(JSON.stringify({
+        filesBeforeFailureCleanup: {
+          report: readFileOrNull(reportPath),
+          state: readFileOrNull(statePath),
+          fallback: readFileOrNull(fallbackPath),
+        },
+      }));
+      throw error;
     } finally {
       if (!unitCleaned) await cleanupExactUnit(unitName);
       rmSync(scratch, { recursive: true, force: true });
