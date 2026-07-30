@@ -260,13 +260,34 @@ describe("CORE state atomic write fault injection", () => {
     return claimActive ? "old" : "new";
   }
 
-  /** A store whose single write failed may not be used again. */
+  /** A store whose single write failed may not expose its in-memory view again. */
   function assertReopenRequired(state: ClaimedState): void {
-    expect(() => state.store.runAtomicUpdate(() => undefined)).toThrowError(
-      expect.objectContaining<Partial<CoreStateError>>({
-        code: "CORE_STATE_REOPEN_REQUIRED",
-      }),
-    );
+    const operations: readonly [label: string, operation: () => unknown][] = [
+      ["revision", () => state.store.revision],
+      ["complete snapshot", () => state.store.snapshot()],
+      ["flush", () => state.store.flush()],
+      ["process-record list", () => state.store.listModuleProcessRecords()],
+      [
+        "process-record lookup",
+        () => state.store.getModuleProcessRecord(PROCESS_GENERATION_ID),
+      ],
+      ["submission-record list", () => state.store.listModuleSubmissionRecords()],
+      [
+        "submission-record lookup",
+        () => state.store.getModuleSubmissionRecord(state.identity.runId),
+      ],
+      ["reference graph", () => state.store.referenceGraph.snapshot()],
+      ["Block store", () => state.store.blocks.snapshot()],
+      ["Delivery store", () => state.store.deliveries.snapshot()],
+      ["atomic update", () => state.store.runAtomicUpdate(() => undefined)],
+    ];
+    for (const [label, operation] of operations) {
+      expect(operation, label).toThrowError(
+        expect.objectContaining<Partial<CoreStateError>>({
+          code: "CORE_STATE_REOPEN_REQUIRED",
+        }),
+      );
+    }
   }
 
   /**
@@ -507,7 +528,7 @@ describe("CORE state atomic write fault injection", () => {
     clearFaults();
 
     expect(committedRevision()).toBe(state.revision + 1);
-    expect(state.store.revision).toBe(state.revision);
+    assertReopenRequired(state);
 
     // Every later write rereads the exact revision first, so the store fails
     // closed rather than replacing the newer file with its stale view.

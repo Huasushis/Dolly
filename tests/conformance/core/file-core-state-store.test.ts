@@ -178,9 +178,31 @@ describe("CORE atomic file state", () => {
     expect(openStore(path, "reopen").snapshot()).toEqual(store.snapshot());
   });
 
+  it("keeps file persistence wiring and reference-graph mutations under store control", () => {
+    const store = openStore(path, "owned");
+
+    expect(store.blocks.referenceGraph).toBe(store.referenceGraph);
+    expect(Object.getOwnPropertyDescriptor(store.blocks, "referenceGraph")?.value)
+      .toBe(store.referenceGraph);
+    expect(() => store.blocks.setMutationObserver(undefined)).toThrowError(TypeError);
+    expect(() => store.deliveries.setMutationObserver(undefined)).toThrowError(TypeError);
+    expect(() =>
+      store.referenceGraph.registerNode({ kind: "block", id: "unpersisted" }),
+    ).toThrowError(TypeError);
+    expect(() =>
+      store.blocks.referenceGraph.registerNode({ kind: "block", id: "nested-unpersisted" }),
+    ).toThrowError(TypeError);
+
+    store.deliveries.createPage("persisted-page");
+    expect(openStore(path, "reopen").deliveries.validateOutputPages(["persisted-page"]))
+      .toEqual(["persisted-page"]);
+  });
+
   it("rejects stale writers instead of overwriting a newer runtime revision", () => {
     const first = openStore(path, "first");
     const stale = openStore(path, "stale");
+    const readStaleBlocks = stale.blocks.snapshot;
+    const readStaleReferenceGraph = stale.referenceGraph.snapshot;
     first.deliveries.createPage("first-page");
 
     expect(() => stale.deliveries.createPage("stale-page")).toThrowError(
@@ -188,7 +210,21 @@ describe("CORE atomic file state", () => {
         code: "DELIVERY_PERSISTENCE_FAILED",
       }),
     );
-    expect(stale.revision).toBe(0);
+    expect(() => stale.revision).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
+    expect(readStaleBlocks).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
+    expect(readStaleReferenceGraph).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
 
     const truth = openStore(path, "truth");
     expect(truth.deliveries.validateOutputPages(["first-page"])).toEqual(["first-page"]);

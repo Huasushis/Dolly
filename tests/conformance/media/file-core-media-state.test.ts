@@ -55,6 +55,10 @@ describe("MEDIA atomic Core/Media state", () => {
 
   it("restores Media before validating an attached Block in the same revision", async () => {
     const first = openStore(root, "first");
+    expect(first.media!.referenceGraph).toBe(first.referenceGraph);
+    expect(Object.getOwnPropertyDescriptor(first.media!, "referenceGraph")?.value)
+      .toBe(first.referenceGraph);
+    expect(() => first.media!.setMutationObserver(undefined)).toThrowError(TypeError);
     first.deliveries.createPage("page");
     first.deliveries.registerConsumer("page", "consumer", "from-now");
     const media = await first.media!.registerMedia(

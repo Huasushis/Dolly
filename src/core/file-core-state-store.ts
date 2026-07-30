@@ -168,11 +168,107 @@ function nextRevision(current: number): number {
   return current + 1;
 }
 
+const MUTATION_OBSERVER_METHODS = new Set<PropertyKey>(["setMutationObserver"]);
+const REFERENCE_GRAPH_MUTATION_METHODS = new Set<PropertyKey>([
+  "registerNode",
+  "addStrongReference",
+  "removeStrongReference",
+  "acquireLease",
+  "releaseLease",
+  "beginRemoval",
+  "completeRemoval",
+  "cancelRemoval",
+  "unregisterUnreachable",
+]);
+
+/**
+ * Exposes an in-memory component owned by `FileCoreStateStore`. Every normal
+ * property access and method call first verifies that the store has not
+ * entered an uncertain state that requires reopening. Methods that could
+ * replace persistence wiring or mutate the reference graph outside a
+ * persisted store operation are unavailable on the exposed object, while the
+ * store keeps the original object internally.
+ */
+function exposeCheckedObject<T extends object>(options: {
+  readonly target: T;
+  readonly assertUsable: () => void;
+  readonly label: string;
+  readonly forbiddenMethods?: ReadonlySet<PropertyKey>;
+  readonly replacements?: ReadonlyMap<unknown, unknown>;
+}): T {
+  const checkedMethods = new Map<
+    PropertyKey,
+    { readonly original: unknown; readonly checked: unknown }
+  >();
+  const forbiddenMethods = new Map<PropertyKey, () => never>();
+  return new Proxy(options.target, {
+    get(target, property) {
+      options.assertUsable();
+      if (options.forbiddenMethods?.has(property)) {
+        let reject = forbiddenMethods.get(property);
+        if (reject === undefined) {
+          reject = () => {
+            options.assertUsable();
+            throw new TypeError(
+              `${options.label}.${String(property)} is managed by FileCoreStateStore`,
+            );
+          };
+          forbiddenMethods.set(property, reject);
+        }
+        return reject;
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      const replacement = options.replacements?.get(value);
+      if (replacement !== undefined) return replacement;
+      if (typeof value !== "function") return value;
+      const cached = checkedMethods.get(property);
+      if (cached?.original === value) return cached.checked;
+      const checked = (...args: unknown[]) => {
+        options.assertUsable();
+        return Reflect.apply(value, target, args) as unknown;
+      };
+      checkedMethods.set(property, { original: value, checked });
+      return checked;
+    },
+    getOwnPropertyDescriptor(target, property) {
+      options.assertUsable();
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+      if (descriptor === undefined || !("value" in descriptor)) return descriptor;
+      const replacement = options.replacements?.get(descriptor.value);
+      return replacement === undefined ? descriptor : { ...descriptor, value: replacement };
+    },
+    set() {
+      options.assertUsable();
+      throw new TypeError(`${options.label} properties cannot be replaced`);
+    },
+    defineProperty() {
+      options.assertUsable();
+      throw new TypeError(`${options.label} properties cannot be redefined`);
+    },
+    deleteProperty() {
+      options.assertUsable();
+      throw new TypeError(`${options.label} properties cannot be deleted`);
+    },
+    setPrototypeOf() {
+      options.assertUsable();
+      throw new TypeError(`${options.label} prototype cannot be replaced`);
+    },
+    preventExtensions() {
+      options.assertUsable();
+      throw new TypeError(`${options.label} cannot be made non-extensible`);
+    },
+  });
+}
+
 export class FileCoreStateStore {
   readonly referenceGraph: ReferenceGraph;
   readonly media: MediaStore | undefined;
   readonly blocks: BlockStore;
   readonly deliveries: DeliveryStore;
+  readonly #referenceGraph: ReferenceGraph;
+  readonly #media: MediaStore | undefined;
+  readonly #blocks: BlockStore;
+  readonly #deliveries: DeliveryStore;
   readonly #path: string;
   readonly #lockPath: string;
   readonly #maxBytes: number;
@@ -263,16 +359,22 @@ export class FileCoreStateStore {
     });
 
     this.#revision = document.revision;
+    let loaded: {
+      readonly referenceGraph: ReferenceGraph;
+      readonly media: MediaStore | undefined;
+      readonly blocks: BlockStore;
+      readonly deliveries: DeliveryStore;
+    };
     try {
       if ((document.media === undefined) !== (options.media === undefined)) {
         throw new Error("Configured Media durability does not match the state document");
       }
-      this.referenceGraph = new ReferenceGraph({ snapshot: document.referenceGraph });
-      this.media = options.media === undefined
+      const referenceGraph = new ReferenceGraph({ snapshot: document.referenceGraph });
+      const media = options.media === undefined
         ? undefined
         : new MediaStore({
             durability: options.media.durability,
-            referenceGraph: this.referenceGraph,
+            referenceGraph,
             bytes: options.media.bytes,
             inspector: options.media.inspector,
             ...(options.media.adapters === undefined
@@ -302,27 +404,63 @@ export class FileCoreStateStore {
             snapshot: document.media!,
             onMutation: () => undefined,
           });
-      this.blocks = new BlockStore({
+      const blocks = new BlockStore({
         nextBlockId: options.nextBlockId,
         now: options.now,
-        referenceGraph: this.referenceGraph,
+        referenceGraph,
         snapshot: document.blocks,
-        ...(this.media === undefined ? {} : { media: this.media }),
+        ...(media === undefined ? {} : { media }),
         ...(options.blockLimits === undefined ? {} : { limits: options.blockLimits }),
       });
-      this.deliveries = new DeliveryStore({
-        blocks: this.blocks,
+      const deliveries = new DeliveryStore({
+        blocks,
         maxFailedAttempts: options.maxFailedAttempts,
         nextId: options.nextDeliveryId,
         now: options.now,
         snapshot: document.deliveries,
       });
+      loaded = { referenceGraph, media, blocks, deliveries };
     } catch {
       throw new CoreStateError(
         "CORE_STATE_DOCUMENT_INVALID",
         "Core state components are inconsistent",
       );
     }
+
+    this.#referenceGraph = loaded.referenceGraph;
+    this.#media = loaded.media;
+    this.#blocks = loaded.blocks;
+    this.#deliveries = loaded.deliveries;
+    const assertUsable = () => this.#assertUsable();
+    this.referenceGraph = exposeCheckedObject({
+      target: this.#referenceGraph,
+      assertUsable,
+      label: "FileCoreStateStore.referenceGraph",
+      forbiddenMethods: REFERENCE_GRAPH_MUTATION_METHODS,
+    });
+    this.media = this.#media === undefined
+      ? undefined
+      : exposeCheckedObject({
+          target: this.#media,
+          assertUsable,
+          label: "FileCoreStateStore.media",
+          forbiddenMethods: MUTATION_OBSERVER_METHODS,
+          replacements: new Map([[this.#referenceGraph, this.referenceGraph]]),
+        });
+    this.blocks = exposeCheckedObject({
+      target: this.#blocks,
+      assertUsable,
+      label: "FileCoreStateStore.blocks",
+      forbiddenMethods: MUTATION_OBSERVER_METHODS,
+      replacements: new Map([[this.#referenceGraph, this.referenceGraph]]),
+    });
+    this.deliveries = exposeCheckedObject({
+      target: this.#deliveries,
+      assertUsable,
+      label: "FileCoreStateStore.deliveries",
+      forbiddenMethods: MUTATION_OBSERVER_METHODS,
+      replacements: new Map([[this.#blocks, this.blocks]]),
+    });
 
     for (const record of document.moduleProcessRecords) {
       this.#moduleProcessRecords.set(record.processGenerationId, record);
@@ -332,48 +470,55 @@ export class FileCoreStateStore {
     }
 
     const persist = () => this.#persistCurrent();
-    this.media?.setMutationObserver(persist);
-    this.blocks.setMutationObserver(persist);
-    this.deliveries.setMutationObserver(persist);
+    this.#media?.setMutationObserver(persist);
+    this.#blocks.setMutationObserver(persist);
+    this.#deliveries.setMutationObserver(persist);
   }
 
   get revision(): number {
+    this.#assertUsable();
     return this.#revision;
   }
 
   snapshot(): CoreStateDocument {
+    this.#assertUsable();
     return this.#createDocument(
       this.#revision,
-      this.referenceGraph,
-      this.media,
-      this.blocks,
-      this.deliveries,
+      this.#referenceGraph,
+      this.#media,
+      this.#blocks,
+      this.#deliveries,
     );
   }
 
   flush(): void {
-    this.media?.flushPersistence();
-    this.blocks.flushPersistence();
-    this.deliveries.flushPersistence();
+    this.#assertUsable();
+    this.#media?.flushPersistence();
+    this.#blocks.flushPersistence();
+    this.#deliveries.flushPersistence();
   }
 
   listModuleProcessRecords(): readonly ModuleProcessRecord[] {
+    this.#assertUsable();
     return [...this.#moduleProcessRecords.values()].sort((a, b) =>
       a.processGenerationId < b.processGenerationId ? -1 : 1,
     );
   }
 
   getModuleProcessRecord(processGenerationId: string): ModuleProcessRecord | undefined {
+    this.#assertUsable();
     return this.#moduleProcessRecords.get(processGenerationId);
   }
 
   listModuleSubmissionRecords(): readonly ModuleSubmissionRecord[] {
+    this.#assertUsable();
     return [...this.#moduleSubmissionRecords.values()].sort((a, b) =>
       a.runId < b.runId ? -1 : 1,
     );
   }
 
   getModuleSubmissionRecord(runId: string): ModuleSubmissionRecord | undefined {
+    this.#assertUsable();
     return this.#moduleSubmissionRecords.get(runId);
   }
 
@@ -383,6 +528,7 @@ export class FileCoreStateStore {
    * identifier is never reused, so an existing entry is a conflict.
    */
   appendModuleProcessRecord(record: ModuleProcessRecord): ModuleProcessRecord {
+    this.#assertUsable();
     assertValidModuleProcessRecord(record);
     if (record.state !== "starting") {
       throw new ModuleProcessRecordError(
@@ -418,6 +564,7 @@ export class FileCoreStateStore {
     state: ModuleProcessRecordState,
     failureCode?: string,
   ): ModuleProcessRecord {
+    this.#assertUsable();
     const existing = this.#moduleProcessRecords.get(processGenerationId);
     if (!existing) {
       throw new ModuleProcessRecordError(
@@ -455,6 +602,7 @@ export class FileCoreStateStore {
    * make this update before the protocol send, never after.
    */
   appendModuleSubmissionRecord(record: ModuleSubmissionRecord): ModuleSubmissionRecord {
+    this.#assertUsable();
     assertValidModuleSubmissionRecord(record);
     if (this.#moduleSubmissionRecords.has(record.runId)) {
       throw new ModuleProcessRecordError(
@@ -497,6 +645,7 @@ export class FileCoreStateStore {
    * only in the update that records the matching Claim as terminal.
    */
   removeModuleSubmissionRecord(runId: string): void {
+    this.#assertUsable();
     const existing = this.#moduleSubmissionRecords.get(runId);
     if (!existing) {
       throw new ModuleProcessRecordError(
@@ -518,6 +667,7 @@ export class FileCoreStateStore {
    * references. Records pinned by unresolved evidence stay in place.
    */
   removeModuleProcessRecord(processGenerationId: string): void {
+    this.#assertUsable();
     const existing = this.#moduleProcessRecords.get(processGenerationId);
     if (!existing) {
       throw new ModuleProcessRecordError(
@@ -641,10 +791,10 @@ export class FileCoreStateStore {
       const revision = nextRevision(this.#revision);
       const document = this.#createDocument(
         revision,
-        this.referenceGraph,
-        this.media,
-        this.blocks,
-        this.deliveries,
+        this.#referenceGraph,
+        this.#media,
+        this.#blocks,
+        this.#deliveries,
       );
       try {
         this.#writeDocument(document);
