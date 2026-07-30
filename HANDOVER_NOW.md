@@ -1,14 +1,15 @@
 # 当前状态与待办（接手先读这一份）
 
-写于 2026-07-26 深夜，最近一次更新为 2026-07-31。当前实现链最新提交为 `0cf5cb4`，
-远端 `main` 已同步；最近一次完整 Windows 测试仍以 `f78538b` 为基线，之后四项修复分别有
-精确测试和完整 TypeScript 检查，不能把两种验证范围混写。实际 HEAD 必须用 Git 读取。P0-3 的 Linux
+写于 2026-07-26 深夜，最近一次更新为 2026-07-31。当前实现链最新提交为 `6f66501`，
+远端 `main` 已同步；当前完整 Windows 验证包含 `ba4a852` 的 Core-state version 17 实现和
+`6f66501` 的权威文档同步。实际 HEAD 必须用 Git 读取。P0-3 的 Linux
 源码复验仍绑定到 `e9d5975`，不能改标签冒充当前 HEAD；其后的证据提交与实现提交也不能倒改
 历史实验的来源标签。`119eac5` 和 `8321b1c` 裁定 Claim 与 Module submission record 的规则，
 `2d5532a` 收窄发布包依赖，`1421e1b` 把 Console Claim 处置绑定到当前证据，`9624e19` 把
 结果提交绑定到同一个 FileCore，`f78538b` 在发送与恢复前核验 Module 执行证据；`f635041`、
 `76ae60b`、`3e0403c`、`0cf5cb4` 分别修复配置回调重入、Linux executor 期限校验、Media 删除超时
-恢复和 Aether 推理控制测试。上一轮所有并行
+恢复和 Aether 推理控制测试；`e07bcfa` 阻止仓库被意外发布，`ba4a852` 实现 Core-state
+version 17 的显式迁移、未知 submission 历史和启动恢复，`6f66501` 同步权威文档。上一轮所有并行
 会话同时到达上限而停止，任务表随之丢失，所以这份文件是权威的接续点；下文把更早结果明确标为
 历史结果，不用追加日志的方式保留过期结论。
 
@@ -27,10 +28,10 @@ v5 的同一组 233 个 proposed-arm 案例已在 `e9d5975` 上逐案例复跑�
 同一个 launcher、Module control group、协议会话、Core 服务绑定和持久记录交叉绑定后再交给
 `ReactiveModuleRuntime`。当前工作应先处理下列 P0 风险，而不是把 ADR 0009 改成 Accepted。
 
-当前 Windows 工作树在 `f78538b` 上以最多 4 个 worker 跑完整默认测试：124 个测试文件通过、
-4 个按平台跳过，1570 例通过、47 例跳过；完整 TypeScript 检查退出码为 0，差异检查通过。
-第一次使用默认并发时有 5 个真实子进程或发布包用例超时；三个失败文件串行分别为 26/26、
-10/10、1/1，通过低并发完整复跑后不再失败。该结果证明当前 Windows 测试集合通过，不替代
+当前 Windows 工作树在 `6f66501` 对应源码上以最多 4 个 worker 跑完整默认测试：127 个测试文件
+通过、4 个按平台跳过，1622 例通过、47 例跳过；完整 TypeScript 检查和构建退出码均为 0，
+限定差异检查通过。第一次完整运行只发现一处仍期待 version 16 的过期测试断言；修正后该文件
+52/52，通过低并发完整复跑后不再失败。该结果证明当前 Windows 测试集合通过，不替代
 下文列明的 Linux 内核证据，也不证明未接入产品的 Module、OSS、网页界面或 computer-use 可用。
 
 ---
@@ -203,8 +204,7 @@ Linux 文件共 26/26 通过。证据、单文件补丁、逐文件 SHA-256 与�
    `populated 0` 和目录删除的证明。
    `stopModuleProcess()` 在自己的路径上稍后重新证明这些条件，不能阻止别的调用者先持久化并暴露
    一个没有证明的 `stopped`；
-4. △ **规范已裁定（`119eac5`、`8321b1c`），实现已提交（`9624e19`、`f78538b`），
-   持久格式迁移仍未完成**：
+4. ✓ **持久格式迁移已完成（`ba4a852`），权威文档已同步（`6f66501`）**：
    每条 submission record 必须精确匹配 active Claim；Claim 变为 `released`、`nacked`、
    `committed` 或 `dead-lettered` 时，必须在同一 Core-state update 删除匹配记录。terminal
    Claim 与 submission record 共存是失败关闭，不是后续收集输入。成功结果顺序为 durable
@@ -215,14 +215,14 @@ Linux 文件共 26/26 通过。证据、单文件补丁、逐文件 SHA-256 与�
    submission 和 acknowledgement 操作。但 runtime 的构造接口仍允许分别注入 Delivery、
    submission 与 result coordinator，普通产品启动入口也继续拒绝 Module，所以尚未证明这些操作
    与实际 actor process generation 属于同一次启动。
-   更重要的是，旧版与当前 `FileCoreStateStore` 写入规则共用 version 16 标签；active Claim
-   缺记录仍有迁移歧义，不能自动判为 `never-submitted`。两次独立审查得到的最小 version 17
-   方案是在 Core-state 顶层保存一个集合：每项是一个精确 active Claim 的五字段身份，含义是
-   “无法判断该 Run 从未获得发送授权，还是旧 writer 曾删除其 submission record”。这个集合
-   不能伪装成 submission record；其中的 Claim 必须阻断自动 release、nack、ack 和再次 submission，
-   只能由有审计记录的操作员处置与 Claim 终态在同一次 Core-state update 中清除。迁移还必须完整
-   验证旧文档、令 revision 加一、让新摘要覆盖 schema version，并允许在已有备份与源字节完全相同
-   时安全重试。启用 Module 前仍须实现并显式执行该迁移；
+   Version 17 顶层的 `activeClaimsWithUnknownSubmissionHistory` 保存精确 active Claim 的五字段
+   身份，表示旧格式不能证明 matching submission record 从未写入还是曾被独立删除。该项不是
+   submission record，也不证明发送从未获授权。v15/v16 在 controller lock 内直接迁移到 v17，
+   revision 加一、摘要覆盖 `schemaVersion`、按真实源版本保留精确字节备份；同字节备份可重试，
+   不同或部分备份拒绝。迁移在备份前用重新 claim 的当前配置走与普通启动相同的组件恢复函数。
+   普通 submission、ack、nack、release 与 result-commit ack 均拒绝未知历史；启动只在 submission
+   与未知历史项都不存在时按 `never-authorized-to-send` 释放。当前没有产品级、持久审计的操作员
+   处置命令，因此带未知历史的 Claim 会安全地保持阻塞；这项产品完整性缺口不能被写成已经解决。
 5. 所有权未知时的 control-group 清理有超时，但它之前的同步 `stopping` 持久化调用没有时间上界；
    若该调用不返回，默认 `process.exit(1)` 强制点也到不了；
 6. ✓ **已修（`7462046`）**：`FileCoreStateStore.runAtomicUpdate()` 现在只接受静态返回
@@ -386,21 +386,24 @@ M14 重复案例。P0-1 的两个完整 manifest 也各自报 4,391 次计划执
 | 锁释放确认失败后关闭旧 store | `FileCoreStateStore.#withMutationLock()` | 按回调是否已返回区分回调错误与释放确认错误；精确测试 53 pass、1 个平台限定 skip |
 | 根 CLI 回调不再暴露 Core 写接口 | `src/entry.ts`、CLI runtime test | 冻结的 `state/status/stop` 对象；根声明无 Core store/commit coordinator；5/5 + typecheck |
 | FileCore 公开能力与失败边界 | `9624e19` 的 `FileCoreStateStore`、结果提交产品构造与故障测试 | 公开组件是冻结的空原型允许列表；持久化失败或内存/磁盘摘要不一致后要求重开；结果提交从同一个 FileCore 取得全部状态操作 |
-| Claim 与 submission record 强规则 | ADR 0009、`core-runtime.md`、`security-operations.md`、`9624e19`、`f78538b` | 终态转换与记录删除同一次 Core-state update；terminal+record 失败关闭；发送前复核 Claim、submission 与输入摘要；version 16 歧义仍不得自动重试 |
+| Claim 与 submission record 强规则 | ADR 0009、`core-runtime.md`、`security-operations.md`、`9624e19`、`f78538b`、`ba4a852` | 终态转换与记录删除同一次 Core-state update；terminal+record 失败关闭；发送前复核 Claim、submission 与输入摘要；v15/v16 歧义迁移为 v17 的精确未知历史项并阻断普通处置 |
+| Core-state version 17 迁移与恢复 | `ba4a852` 的 `FileCoreStateStore`、启动恢复、CLI 与反例；`6f66501` 的权威文档 | 两轮独立审查确认 P0 闭合；精确集 100 pass / 1 平台 skip，完整集 1622 pass / 47 skip；同 revision 分叉、配置不兼容、备份重试与未知历史均有真实强制点 |
 | 配置回调不可重入 | `f635041` 的 `FileCoreStateStore` 与三个反例 | clock、Block 标识符和 Delivery 标识符回调不能重入同一个 Core；拒绝前后没有持久状态变化 |
 | Linux executor 期限参数 | `76ae60b` 的 executor 与精确测试 | 两个期限都在副作用前验证；8 个无效值反例、精确文件 34/34 |
 | Media 删除超时恢复 | `3e0403c` 的 `MediaStore` 与恢复测试 | 超时归为可重试网络故障；适配器忽略取消信号时不并发重复删除；精确文件 7/7 |
 | Aether 推理控制测试 | `0cf5cb4` 的模型请求测试与 LLM 规范 | 开启、关闭与缺省分别按准确对象形式编码或省略；13/13，且不发送 `enable_thinking` |
-| 当前完整 Windows 验证 | 默认 Vitest 配置，最多 4 个 worker；标准 TypeScript 检查 | 124 个测试文件通过、4 个跳过；1570 例通过、47 例跳过；TypeScript 退出码 0；无残留 Node 进程 |
+| 当前完整 Windows 验证 | 默认 Vitest 配置，最多 4 个 worker；标准 TypeScript 检查与构建 | 127 个测试文件通过、4 个跳过；1622 例通过、47 例跳过；TypeScript 与构建退出码 0；测试产生的 Node 进程均已退出 |
 | 恢复完整 TypeScript 范围并修复 91 条诊断 | `tsconfig.json`、`package.json`、33 个测试文件 | 标准 `typecheck` exit 0；按受影响文件精确运行的用例全绿，5 个未启用的付费 live 用例明确 skipped |
 
-当前实现链最新核实点为 `0cf5cb4`，远端 `main` 已同步；最近一次完整 Windows 测试基线仍为
-`f78538b`，其后四项修复的统一精确验证为 142 例通过、1 例按平台跳过，完整 TypeScript 检查通过。
+当前实现链最新核实点为 `6f66501`，远端 `main` 已同步；最近一次完整 Windows 测试包含
+`ba4a852` 的 version 17 产品改动：127 个文件通过、4 个按平台跳过，1622 例通过、47 例跳过，
+完整 TypeScript 检查和构建通过。
 P0-3 Linux 复验使用的源码与 runner 仍是 `e9d5975`；后续提交不能冒充该实验来源。当前实现链中，
 `119eac5` / `8321b1c`
 记录规则，`2d5532a` 收窄发布包，`1421e1b` 修复 Console 处置证据，`9624e19` 修复 FileCore 与
 结果提交边界，`f78538b` 修复发送和恢复证据，`f635041` 修复配置回调重入，`76ae60b` 修复
-Linux executor 期限校验，`3e0403c` 修复 Media 删除超时恢复，`0cf5cb4` 修正 Aether 推理控制测试。
+Linux executor 期限校验，`3e0403c` 修复 Media 删除超时恢复，`0cf5cb4` 修正 Aether 推理控制测试，
+`e07bcfa` 阻止意外发布，`ba4a852` 实现 version 17，`6f66501` 同步权威文档。
 目录为 **v5、570 例、1 个 exclusive**。catalog
 v5 修改了 live-Core 终止判据，所以该组必须重跑；当前 233 例 proposed-arm 选择集已重跑，但
 完整 570 例和目录声明的重复次数仍未执行。更早 catalog v3 的 P0-3 工件只作为历史运行保留。
@@ -505,9 +508,10 @@ v5 修改了 live-Core 终止判据，所以该组必须重跑；当前 233 例 
 
 ## 环境（不读这段会浪费大量时间）
 
-**C 盘仍极度紧张。** 本轮开始时可用 0 字节；只删除了三个可再生成且精确核对路径的
-Codex/Node 缓存目录，没有删除主运行时、历史会话、其他项目工件或用户应用。完整测试后曾测得
-约 104 MB 可用，数值会继续波动。`/tmp` 默认映射到 C:，所以：
+**C 盘仍极度紧张且会反复回到 0 字节。** 本轮只按完整路径删除了可重新生成的 Codex/Node/
+VS Code 缓存、失败插件安装的 staging 目录，以及旧的临时诊断和 MkDocs 构建目录；没有删除
+主运行时、历史会话、项目工件或用户应用。删除后空间仍会被活跃的 Codex 数据库迅速占满，
+不能把一次短暂的可用空间当作问题已解决。`/tmp` 默认映射到 C:，所以：
 
 - `tsc` 崩成 `Zone Allocation failed`，**崩溃后 grep 不到 `error TS`，和零错误长得一样**；
 - vitest 报 `Tests no tests`，看着像文件里没有用例；
