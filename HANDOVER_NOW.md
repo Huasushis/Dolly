@@ -1,7 +1,9 @@
 # 当前状态与待办（接手先读这一份）
 
-写于 2026-07-26 深夜，最近一次更新为 2026-07-30 完成 P0-3 终止范围验收。上一轮所有并行
-会话同时到达上限而停止，任务表随之丢失，所以这份文件是权威的接续点。
+写于 2026-07-26 深夜，最近一次更新为 2026-07-31。P0-3 当前源码复验绑定到提交
+`e9d5975`；其后的 `d5acea1`、`6ea62f8` 和 `8ef9f07` 只提交了证据与文档，没有改产品源码。
+上一轮所有并行会话同时到达上限而停止，任务表随之丢失，所以这份文件是权威的接续点；下文把
+更早结果明确标为历史结果，不用追加日志的方式保留过期结论。
 
 `TASK_HANDOVER.md` 有 2269 行、55 个小节，**按时间顺序堆叠，后面的小节会推翻前面的**
 （例如 0.29 说"装配做不出来"，已被 0.35 和 0.52b 推翻两次）。**不要从头读它**。
@@ -11,11 +13,11 @@
 
 ## 一句话状态
 
-ADR 0009（Linux Core 服务进程归属）的**终止范围**已通过独立审查、14 个反向变异和新的
-Linux 逐案例运行；但启动失败后的控制组所有权仍有 P0 设计错误，不能声称完整运行时已经正确。
-运行时也没有把同一个已启动 launcher、已验证 Module control group、
-`attachLinuxModuleProcess` 和 `ExtensionProcessHost` 端到端连接起来。实验已经改用产品
-launcher control 和停止生命周期，但仍使用实验协议，因此完整装配的剩余缺口数仍必须视为未知。
+ADR 0009（Linux Core 服务进程归属）的终止范围和启动失败后的五项已知所有权缺陷已经改进并有
+聚焦证据；catalog v5 的同一组 233 个 proposed-arm 案例也已在 `e9d5975` 上逐案例复跑。
+这些证据仍不等于完整运行时：普通启动入口继续拒绝配置了 Module 的实例，而且产品代码还没有把
+同一个 launcher、Module control group、协议会话、Core 服务绑定和持久记录交叉绑定后再交给
+`ReactiveModuleRuntime`。当前工作应先处理下列 P0 风险，而不是把 ADR 0009 改成 Accepted。
 
 ---
 
@@ -91,55 +93,120 @@ open-file limit、丢失的失败证据，以及第一处漏关控制描述符�
 **范围限制**：这两例直接驱动 launcher controller，没有运行 `startModuleProcess`，因此只证明
 adapter 的整组终止和 `exec` 后文件描述符 0/1 上的协议传输，不证明完整 runtime assembly。
 全 skipped 假阳性已在提交 `e391ff9` 修复：runner 设置“Linux 集成环境必须存在”的环境变量，
-三个相关测试文件若仍看不到 delegated `core` subgroup 会在收集阶段失败。Linux 正向运行 25/25，
-普通容器进程中的证伪退出码为 1。
+三个相关测试文件若仍看不到 delegated `core` subgroup 会在收集阶段失败。该提交当时的三文件
+Linux 运行是 25/25，普通容器进程中的证伪退出码为 1；这是历史 runner 结果。当前四文件 26/26
+结果见 P0-4，不能把两次运行的文件数混写。
 
-### P0-3　整组终止、能力关闭、通道关闭与持久状态：✓ 完成终止范围验收
+### P0-3　整组终止、能力关闭、通道关闭与持久状态：✓ 当前 v5 选择集已复跑
 
-产品提交为 `3e20e77`，runner 修复为 `e391ff9`。终止成功现在必须同时证明：能力会话已同步拒绝
-新调用且已有处理程序结束、协议通道已观察到关闭、整个 Module control group 已为空、目录已删除，
-而且匹配的持久记录已写成 `stopped`。`stopping` 写失败仍启动物理清理，但禁止报告成功；并发停止
-共享同一最终状态；协议挂接失败、初始化未结束或记录与控制组不匹配均不能被当作成功。
+`3e20e77` 是 2026-07-30 的历史实现基线，不是当前源码提交。它建立的终止判据仍有效：能力会话先
+同步拒绝新调用并等待已开始的处理程序结束，协议通道已观察到关闭，整个 Module control group 已
+证明为空且目录已删除，最后才能把匹配记录写成 `stopped`。当时的本机 91/91、14/14 个定向变异及
+catalog v3 的 Linux 工件保留为历史证据，路径为 `artifacts/p0-3/`。
 
-验收证据：
+catalog v5 修正了 `live-core-termination` 的判据：必须观察产品对 control-group 文件的操作和目录
+删除，不能再因只看到 `populated 0` 就接受仍存在的目录。因此 catalog v3/v4 的 live 结果不能作为
+当前判据的替代。当前证据是在干净的 `e9d597579b71fcd5d1711696dfc649c0ea4dac21` 上重新执行同一
+233 个 proposed-arm 案例，外层 runner 留存的 `source-status.txt` 为空：
 
-- 本机精确 4 文件 91/91，主 `typecheck` exit 0；
-- 冻结六文件逐 SHA-256 一致的隔离副本中，14/14 个定向变异都使预定的单个断言失败，底层
-  Vitest 均 exit 1；报告在
-  `artifacts/p0-3/mutation/module-termination-mutation-tests-20260730-004/REPORT.md`；
-- 独立代码复审没有再发现当前终止补丁的错误成功或错误 control group 终止；
-- Linux 冻结归档 SHA-256 为
-  `74e292fc35196d46ffcc74e5cf0ebd6d7a0ed1d4763fb1a552b6a1c9ad35ebe8`；
-- P0-2 两个命名测试重新实际执行，2/2 pass、0 skipped，JSON SHA-256 为
-  `dcdd24d0dce695d2f987cce828c5a0fae8d51df352b2de92437fc57cee0eab2d`；
-- `SC-13-07-cleanup-timeout` 1/1 pass；它使用真实进程、control group、成员资格和 `cgroup.kill`，
-  但以确定性文件系统注入保持 `cgroup.events` 为 `populated 1`，不能描述成真实内核长期不清空；
-- `live-core-termination` 为 12 pass、4 个逐例合理的 not-applicable、0 fail/inconclusive；
-- 三个 proposed 组完整重跑 233 行：225 pass、8 not-applicable、0 fail/inconclusive；210/7/16
-  分组计数不变。按 `caseId + status + reason` 排序后与 P0-1 的 retained projection 逐行相同，
-  新增、缺失和变化均为 0。工件在 `artifacts/p0-3/`。
+- catalog v5，分组仍为 fixed-interruption 210、capability-idempotency 7、
+  live-core-termination 16；
+- 225 pass、8 个逐例列明理由的 not-applicable、0 fail、0 inconclusive；
+- 与历史 233 个案例相比，没有新增或缺失标识符；221 行的 `status + reason` 不变；
+- 其余 12 行全部是 live-core-termination 的 pass，状态未变。理由由含糊的
+  `proved-group-termination` 改为与当前判据一致的 `proved-module-cleanup`。这 12 行已逐例审定，
+  不是用汇总相同代替逐例比较；
+- 16 份 live-core-termination 的 `invariant-evaluation.json` 均已读取核对；233 个结果均无非零
+  exit code、超时、缺失工件或 invariant violation；
+- 清理尝试 233 个 unit、失败 0，状态目录已删除且残留检查为 clean；
+- 留存副本共 8,030 个文件、8,761,267 字节；排序后的逐文件 SHA-256 清单摘要为
+  `ce4cf5ca4d3842e9e36bde6bb2d9530a7fa937d072a63bf22c43e865c4aeeb2b`。
 
-**不得夸大**：233 行的 `iterations` 仍全部为 1，不是 manifest 计划的 4,391 次；M14 聚焦工件没有
-停止前 descendant process identifier 快照；变异只分别证明了错误 control-group path 和错误 process
-generation，没有对 `instanceId`、`moduleId` 做逐字段变异；stand-in 仍不等于完整 runtime assembly。
+当前可复核证据在
+`docs/experiments/evidence/linux-core-service-ownership-e9d5975/`；总核对结果在
+`validation-report.json`，原始 manifest、逐案例结果和清理结果在其 `run/` 子目录。
 
-### P0-4　启动失败后的控制组所有权与持久状态：当前最高优先级
+**范围限制**：233 行的 `iterations` 仍全部为 1，不是 manifest 计划的 4,391 次；只执行了三个
+proposed-arm 组，不是 catalog v5 的全部 570 例；fixed-interruption 仍使用实验 Core stand-in 和
+`dolly.experiment.module-protocol/1`，没有证明真实 `ExtensionProcessHost` 或完整运行时装配。
+`SC-13-07-cleanup-timeout` 的历史聚焦测试以确定性文件系统注入保持 `populated 1`，不能描述成真实
+内核长期不清空。历史变异也没有对 `instanceId`、`moduleId` 做逐字段证明。
 
-已由三个独立审查交叉确认，当前实现有以下 P0 错误，尚未修改：
+### P0-4　启动失败后的控制组所有权与持久状态：✓ 五项已知缺陷已修复
 
-1. 产品 launcher control 保留了 `membershipVerified: true`，但 `startModuleProcess` 捕获普通异常后
-   丢弃该事实，错误地走验证前退出；额外 process identifier 已在组内时也可能只观察 launcher 退出，
-   错写 `stopped`；
-2. `running` 在协议 `initialize()` 前写入，违反规范定义；该写入失败又会使 executor 丢失已经验证的
-   control group，无法执行整组终止；
-3. `startLauncher()` 的 rejected Promise 不能区分“未创建进程”和“spawn 后失去控制”，现有真实
-   launcher 确实可能在 spawn 后抛错；准备好的空 control group 也会遗留；
-4. `coreMustExit` 目前只是返回值和错误文本，没有真实 Core 服务退出强制点；
-5. `FileCoreStateStore` 进入“必须重新打开”状态后仍可读取回滚后的内存记录，不能把它当作磁盘事实。
+原来列出的五项缺陷已由 `46180c8`、`2f501c3`、`46a034d` 和 `2333ce1` 修改：
 
-下一步先写跨层反例，再改契约：控制组一旦准备成功，每个结果必须在函数内完成可验证清理，或把
-`ModuleCgroup` 交给 executor；`running` 只在协议初始化成功后写；成员资格已验证或观察到任何成员时
-必须整组终止。不要让 core 识别 adapter 的 Error 类，也不要新增无法解释的状态名。
+1. launcher 授权失败现在返回观察到的 process identifier、成员资格、命令是否可能送达以及
+   `ModuleCgroup`；生命周期不再丢掉“已经观察到成员”这一事实，也不再把只看到 launcher 退出当作
+   整组已经停止；
+2. 持久记录只在协议 `initialize()` 成功后写成 `running`。初始化或该写入失败时，executor 仍持有
+   同一个 control group，并走整组停止证明；
+3. `startLauncher()` 抛错被视为“进程可能已经创建但所有权未知”，而不是猜成未创建；可以证明为空的
+   已准备 control group 会清理，无法证明所有权时要求 Core 退出；
+4. `coreMustExit` 已有产品强制点：默认在有界的尽力清理之后执行 `process.exit(1)`，不再只是返回值
+   或错误文字；
+5. `FileCoreStateStore` 进入 `CORE_STATE_REOPEN_REQUIRED` 后拒绝所有公开读写，包括先前保留的方法
+   引用和嵌套状态路径；回滚后的内存对象不能再冒充磁盘事实。
+
+真实 Linux 的产品强制点已经正反向验证。提交
+`edbfd268478f65cb430aa5ece23c9dcd6634c872` 的正向 1/1 测试把产品 executor 自身作为一次性
+systemd 服务主进程，未注入 `exitCoreProcess`：服务得到 `Result=exit-code`、
+`ExecMainStatus=1`，没有写 fallback 文件，持久记录留在 `stopping`，Core、launcher、Module
+control group 和服务 control group 均消失。反向副本只把默认退出函数改为返回，测试即以
+`ExecMainStatus=92` 和明确 fallback 原因失败；外层 runner 观察到预期的非零测试状态。随后四个精确
+Linux 文件共 26/26 通过。证据、单文件补丁、逐文件 SHA-256 与精确清理记录在
+`docs/experiments/evidence/linux-module-executor-systemd-edbfd26/`，解释在
+`docs/experiments/linux-module-executor-systemd-results.md`。
+
+**范围限制**：这只证明“launcher 在内核确认前谎报成员资格并拒绝退出”这一条 fail-closed 路径，
+以及四个列明的 Linux 文件没有回归。测试刻意使用 `Restart=no`；它不证明成功启动、服务重启与
+恢复、生产 Core 服务绑定、其他 launcher 失败，或 runtime startup 已经调用产品 Linux executor。
+
+### Linux 验证 runner：两种模式均留存来源，输出目录不可被覆盖
+
+`run-disposable-container.sh` 现在有两个互斥模式：重复的 `--test-file` 运行列明的精确 Linux
+测试文件；不带 `--test-file` 时把筛选参数原样交给所有权实验 runner。两种模式都在各自的唯一工件
+目录写入 `source-commit.txt`、`source-status.txt`、`command.txt` 和 `environment.txt`，源码与依赖
+只读挂载，只有测试缓存与工件目录可写。
+
+外层 runner 独占 `--output-dir` 和 `--disposable`；调用者试图传入任一参数会直接失败，不能把
+`/dolly-artifacts` 改到未留存位置，也不能伪造隔离声明。容器、镜像和工件目录都按单次调用唯一命名，
+清理只能使用该次调用的完整名称，不能按前缀批量删除。
+
+### P0-5　当前最高风险：先写跨层反例，再决定修复顺序
+
+以下是当前代码审查已找到、尚未由上面的证据关闭的风险：
+
+1. `openProtocolSession()` 不接收刚启动的 launcher 或 `ModuleCgroup`，所以类型与运行时都没有强制
+   返回的协议会话属于同一次启动、同一个进程和同一个 control group；
+2. Core 服务绑定、持久 process record、当前 boot/service invocation 和 control-group identity
+   分别有检查，但启动边界没有把它们作为一个不可拆分的前置条件交叉核验；
+3. `stopped` 仍可通过通用记录状态更新接口直接写入；类型没有要求调用者同时提交已关闭协议通道、
+   已结束 capability handler、`populated 0` 和目录删除的证明；
+4. submission record 的写接口没有在同一次持久更新中强制匹配现存 active Claim 的 job、token、
+   run、attempt 与 Module generation；当前一致性主要依赖调用者和启动恢复阶段检查；
+5. 所有权未知时的 control-group 清理有超时，但它之前的同步 `stopping` 持久化调用没有时间上界；
+   若该调用不返回，默认 `process.exit(1)` 强制点也到不了；
+6. `FileCoreStateStore.runAtomicUpdate()` 的回调类型允许返回 Promise。若传入异步回调，外层会在
+   Promise 完成前结束“原子更新”并持久化，之后的变更与异常不再属于同一次更新；
+7. Linux executor 没有像 `coreExitCleanupTimeoutMs` 一样验证 `terminationTimeoutMs` 和
+   `channelCloseTimeoutMs`；`NaN` 等无效值会破坏“有界等待”的含义；
+8. `runtime-bootstrap.ts` 仍拒绝配置了 Module 的运行时，也没有生产调用者把 service binding、
+   launcher、control group、协议会话、持久记录、Claim 与 submission record 装配成一条路径。
+
+处理这些问题时不要只补单元分支：每项先在真正的跨层强制点构造会失败的反例，尤其要证明“来自另一
+次启动的会话/记录”不能被接受，以及没有停止证明时任何路径都不能写 `stopped`。
+
+另外有四项已审查但优先级稍低的后续问题，不能因未列入上面的 P0 顺序而遗忘：
+
+1. 跨进程锁可能在持久更新已经提交后才因释放失败而抛错；当前调用层可能回滚内存视图，却没有把
+   `FileCoreStateStore` 标为必须重新打开；
+2. 真正进入 `CORE_STATE_REOPEN_REQUIRED` 的 store 在 Linux executor 内没有替换或让 Core
+   退出重开的产品策略，普通终止重试会永久持有失效对象；
+3. state file 的父目录若通过符号链接或 Windows junction 形成两个路径别名，同一文件可能得到
+   两个不同的锁标识；应复用现有配置存储的规范父目录做法；
+4. 单次读取 `cgroup.procs` 不能阻止进程在验证后迁移到 sibling control group。ADR 0009 已承认
+   这需要执行后端强制，当前产品路径仍没有该保证。
 
 ### P1-1　`typecheck` 覆盖和诊断修复 ✓ 完成
 
@@ -198,8 +265,8 @@ M14 重复案例。P0-1 的两个完整 manifest 也各自报 4,391 次计划执
 
 根因已定位：catalog 的 TSV 第 8 列是重复次数，`run.sh` 的主循环只读取 7 个变量且没有
 重复循环，`record_result()` 又把已实现 handler 的 `iterations` 固定为 1。因此旧的
-“4.5 秒/次 → 10.6 小时/遍”不是完整重复计划的实测，不能作为停止规则依据；本轮两次
-233 例单次运行各约 6 分钟也不能外推真实重复耗时。
+“4.5 秒/次 → 10.6 小时/遍”不是完整重复计划的实测，不能作为停止规则依据；P0-1 的两次历史
+233 例单次运行和当前 `e9d5975` 的单次复跑也都不能外推真实重复耗时。
 
 下一步必须先让 runner 从目录读取重复次数和固定种子、实际执行并诚实记录每次迭代，再用
 一个小选择集证伪：目标迭代数减一时案例或完整性检查必须变红。之后才测并行容器上限并定
@@ -208,9 +275,10 @@ M14 重复案例。P0-1 的两个完整 manifest 也各自报 4,391 次计划执
 ### P3　收尾项
 
 - **`live-core-termination` / `capability-idempotency` 的独立复现**：现有结果全部出自
-  同一台机器同一镜像。换人换机器跑一遍。同步标识用
-  **219 文件 / `sha256:bad7e1c76b80a3e2e3aa057a914363ba5a18b8a912c303fb7dd2639b689660fd`**
-  （远端从解出文件重算 `mismatches 0 of 219`），**不要用更早的摘要**。
+  同一台机器同一镜像。换人换机器跑一遍。当前可移交的同步来源是提交中的
+  `docs/experiments/evidence/linux-core-service-ownership-e9d5975/`，其
+  `validation-report.json` 记录 8,030 个文件的完整副本和逐文件清单摘要；不要再用旧的
+  219 文件摘要代表当前结果。
 - **`raceRepetition` 从未跑过**：2026-07-27 的 P0-1 manifest 计划 4,391 次，但 233 条
   结果全部为 `iterations: 1`；runner 忽略 catalog 的重复列。"跑过一次"不等于"没有
   时序竞态"。
@@ -229,7 +297,7 @@ M14 重复案例。P0-1 的两个完整 manifest 也各自报 4,391 次计划执
 
 ---
 
-## 我这一轮改了什么（都已核实）
+## 已核实的重要改动与当前证据
 
 | 改动 | 位置 | 核实 |
 |---|---|---|
@@ -240,13 +308,15 @@ M14 重复案例。P0-1 的两个完整 manifest 也各自报 4,391 次计划执
 | 记录回收判定抽为纯函数 + 10 例测试 | `src/core/core-startup-recovery.ts` | 三条守卫分别置真 → 4/1/2 例失败 |
 | P0-1 手写 launcher control 换成产品适配器 | `core-standin.mts` | 14 例边界 A/B + 233 例完整 A/B，逐案例三字段 diff 均为空 |
 | P0-2 真实 Linux control group 与文件描述符验证 | Linux integration test、fixture、control-group implementation | 未修改产品实现时 2/2 pass；仅终止直接进程的证伪在 `populated 1` 处失败；清理后零残留 |
-| P0-3 完整终止证明 | executor、`ModuleCgroup`、停止生命周期、实验调用点 | 本机 91/91 + 14/14 定向变异；Linux 2/2、1/1、12 pass + 4 not-applicable 和完整 233 行均符合各自判据；逐案例三字段 diff 为空 |
-| Linux runner 拒绝全 skipped 并恢复执行位 | 三个入口脚本、三个 Linux integration 文件、catalog | 普通容器证伪 exit 1；systemd 容器 25/25、0 skipped；catalog v4 仍为 570 例 |
+| P0-3 完整终止证明 | executor、`ModuleCgroup`、停止生命周期、实验调用点 | `3e20e77` 的本机与变异结果保留为历史；`e9d5975` 上 catalog v5 的同一 233 例为 225 pass / 8 not-applicable，221 行不变，12 行审定为只改 reason |
+| P0-4 启动失败所有权与 Core 退出 | 生命周期、Linux executor、`FileCoreStateStore` | 五项已知缺陷已修；真实 systemd 正向 1/1、默认退出反向变异失败、四文件 26/26，范围限制见 P0-4 |
+| Linux runner 的执行与证据边界 | 一次性容器入口、精确 Linux 测试入口、实验入口 | 两种模式均记录来源、状态、命令和环境；拒绝调用者覆盖 `--output-dir` / `--disposable`；catalog v5 为 570 例 |
 | 恢复完整 TypeScript 范围并修复 91 条诊断 | `tsconfig.json`、`package.json`、33 个测试文件 | 标准 `typecheck` exit 0；按受影响文件精确运行的用例全绿，5 个未启用的付费 live 用例明确 skipped |
 
-最终核实：`npm.cmd run typecheck -- --pretty false` **exit 0**；目录 **v4、570 例、
-1 个 exclusive**。catalog v4 只删除过期实现状态，案例与判据不变；P0-3 产品实验工件仍准确标记为
-运行时使用的 catalog v3。
+当前核实点：P0-3 复验使用的源码与 runner 提交为 `e9d5975`，后续文档与证据提交截至
+`8ef9f07`；目录为 **v5、570 例、1 个 exclusive**。catalog v5 修改了 live-Core 终止判据，
+所以该组必须重跑；当前 233 例 proposed-arm 选择集已重跑，但完整 570 例和目录声明的重复次数
+仍未执行。更早 catalog v3 的 P0-3 工件只作为历史运行保留。
 
 ---
 
@@ -259,10 +329,16 @@ M14 重复案例。P0-1 的两个完整 manifest 也各自报 4,391 次计划执
 - vitest 报 `Tests no tests`，看着像文件里没有用例；
 - 写 `/tmp` 一律 `No space left on device`。
 
+PowerShell 中每次运行 `tsc` 或 Vitest 前先设置：
+
+```powershell
+New-Item -ItemType Directory -Force E:\Huasushis\program\Dolly\.tmp | Out-Null
+$env:TEMP='E:\Huasushis\program\Dolly\.tmp'
+$env:TMP='E:\Huasushis\program\Dolly\.tmp'
+$env:TMPDIR='E:\Huasushis\program\Dolly\.tmp'
 ```
-mkdir -p /e/dolly-tmp
-export TMPDIR=/e/dolly-tmp TMP=/e/dolly-tmp TEMP=/e/dolly-tmp
-```
+
+若从 Git Bash 运行，同一目录写作 `/e/Huasushis/program/Dolly/.tmp`，三个环境变量必须指向它。
 
 **不许整目录跑 vitest**：实测汇总行报 `Test Files 11 passed (11)`，而 34 个文件里
 **23 个从没跑过**。逐文件跑，核对实际用例数。
@@ -326,11 +402,16 @@ export TMPDIR=/e/dolly-tmp TMP=/e/dolly-tmp TEMP=/e/dolly-tmp
 
 - v2：`live-core-termination` 判据按 membership 阶段拆开（改了案例数据）→ 升。
 - v3：新增 `exclusive` 字段（改了每个案例携带的数据）→ 升。
+- v4：删除无法由静态目录诚实声明的 `status: "not-implemented"`；选择集和判据不变 → 升，
+  v3/v4 的同一选择集可直接比较。
+- v5：`live-core-termination` 必须观察产品 control-group 文件操作和目录删除，不能只接受
+  `populated 0`；判据改变 → 升，v3/v4 的该组必须重跑。
 - `--exclude-id` 过滤能力（对任意选择集输出逐字节相同）→ **不升**。
 
 **判据修订必须落在目录上，不能落在 handler 里**：一个由跑这些案例的人在案例失败时
 可以自行改写的判据，不是预注册判据。
 
-**v1 与 v2 的 `live-core-termination` 结果不得合并。** 曾出现工件标签
+**不同判据版本的 `live-core-termination` 结果不得合并。** v1/v2 曾出现工件标签
 `catalogVersion: 1` 而 evaluator 施加 v2 判据的情况——发现者主动作废重跑，
-**不是改标签让它对上**（那是伪造）。
+**不是改标签让它对上**（那是伪造）。同样，v3/v4 不能冒充 v5；当前合格复跑是
+`docs/experiments/evidence/linux-core-service-ownership-e9d5975/`。
