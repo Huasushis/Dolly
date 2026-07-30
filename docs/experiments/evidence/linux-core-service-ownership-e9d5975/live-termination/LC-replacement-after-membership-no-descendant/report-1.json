@@ -1,0 +1,130 @@
+{
+  "caseId": "LC-replacement-after-membership-no-descendant",
+  "invocation": 1,
+  "boundary": "M00",
+  "timing": "before",
+  "workload": "live-termination",
+  "barrierTarget": null,
+  "reachedBarrier": false,
+  "pid": 46567,
+  "at": "2026-07-30T18:13:31.155Z",
+  "phase": "live-termination-complete",
+  "terminationReason": "replacement",
+  "membershipTiming": "after",
+  "descendant": "none",
+  "binding": {
+    "serviceInvocationId": "0dd56a169f6540c8a8f4bd1fb98fa270",
+    "bootId": "09c618af-c410-4c27-ac99-5316df1c7303",
+    "delegatedRootCgroupPath": "/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-after-membership-no-descendant.service",
+    "coreCgroupPath": "/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-after-membership-no-descendant.service/core",
+    "mainPid": 46567
+  },
+  "generations": [
+    {
+      "ordinal": 1,
+      "processGenerationId": "pg-4951c9a8981940d29528f296b613a3a7",
+      "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-after-membership-no-descendant.service/dolly-module-pg-4951c9a8981940d29528f296b613a3a7-ae146b9b7f9c6b7895659a529f99ac93433c77e02228cf3158b133d05496414b",
+      "started": true,
+      "executionAuthorized": true,
+      "preMembership": null,
+      "descendantRequested": false,
+      "descendantStarted": false,
+      "descendantPid": null,
+      "hardTimeoutExpired": false,
+      "membersBeforeTermination": [
+        "46630"
+      ],
+      "populatedBeforeTermination": "1",
+      "cgroupOperations": [
+        "read-cgroup-events",
+        "write-cgroup-kill",
+        "read-cgroup-events",
+        "read-cgroup-events",
+        "remove-cgroup-directory"
+      ],
+      "groupTerminationAttempted": true,
+      "terminationOutcome": {
+        "terminated": true,
+        "record": {
+          "state": "stopped"
+        }
+      },
+      "membersAfterTermination": [],
+      "populatedAfterTermination": null,
+      "groupDirectoryPresentAfterTermination": false,
+      "recordState": "stopped",
+      "recordFailureCode": null
+    },
+    {
+      "ordinal": 2,
+      "processGenerationId": "pg-62a91841c082454c99d07a212c9d1b26",
+      "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-after-membership-no-descendant.service/dolly-module-pg-62a91841c082454c99d07a212c9d1b26-876636c5e89cfbd6ff4f514a34f96ac628e7534b30f9f311a25c509f8b55bd29",
+      "started": true,
+      "executionAuthorized": true,
+      "preMembership": null,
+      "descendantRequested": false,
+      "descendantStarted": false,
+      "descendantPid": null,
+      "hardTimeoutExpired": false,
+      "membersBeforeTermination": [
+        "46647"
+      ],
+      "populatedBeforeTermination": "1",
+      "cgroupOperations": [
+        "read-cgroup-events",
+        "write-cgroup-kill",
+        "read-cgroup-events",
+        "remove-cgroup-directory"
+      ],
+      "groupTerminationAttempted": true,
+      "terminationOutcome": {
+        "terminated": true,
+        "record": {
+          "state": "stopped"
+        }
+      },
+      "membersAfterTermination": [],
+      "populatedAfterTermination": null,
+      "groupDirectoryPresentAfterTermination": false,
+      "recordState": "stopped",
+      "recordFailureCode": null
+    }
+  ],
+  "replacementStartedAfterProof": true,
+  "coreStayedAlive": true,
+  "corePid": 46567,
+  "signalledRecoveredProcessId": false,
+  "stateAfter": {
+    "revision": 8,
+    "activeClaims": [],
+    "moduleProcessRecords": [
+      {
+        "processGenerationId": "pg-4951c9a8981940d29528f296b613a3a7",
+        "moduleGenerationId": "dolly-test-module-generation-1-1",
+        "state": "stopped",
+        "declaredExternalEffects": "core-capabilities-only",
+        "serviceInvocationId": "0dd56a169f6540c8a8f4bd1fb98fa270",
+        "bootId": "09c618af-c410-4c27-ac99-5316df1c7303",
+        "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-after-membership-no-descendant.service/dolly-module-pg-4951c9a8981940d29528f296b613a3a7-ae146b9b7f9c6b7895659a529f99ac93433c77e02228cf3158b133d05496414b"
+      },
+      {
+        "processGenerationId": "pg-62a91841c082454c99d07a212c9d1b26",
+        "moduleGenerationId": "dolly-test-module-generation-1-2",
+        "state": "stopped",
+        "declaredExternalEffects": "core-capabilities-only",
+        "serviceInvocationId": "0dd56a169f6540c8a8f4bd1fb98fa270",
+        "bootId": "09c618af-c410-4c27-ac99-5316df1c7303",
+        "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-after-membership-no-descendant.service/dolly-module-pg-62a91841c082454c99d07a212c9d1b26-876636c5e89cfbd6ff4f514a34f96ac628e7534b30f9f311a25c509f8b55bd29"
+      }
+    ],
+    "moduleSubmissionRecords": [],
+    "commitRecords": [],
+    "deliveriesByPage": {},
+    "blockCount": 0,
+    "capabilityJournal": [],
+    "externalEffects": [],
+    "resultReceipts": [],
+    "strongReferenceCount": 0,
+    "leaseCount": 0
+  }
+}

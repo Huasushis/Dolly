@@ -1,0 +1,160 @@
+{
+  "valid": true,
+  "sourceCommit": "e9d597579b71fcd5d1711696dfc649c0ea4dac21",
+  "sourceStatusEmpty": true,
+  "protocolVersion": 3,
+  "catalogVersion": 5,
+  "selectedCaseCount": 233,
+  "resultCounts": {
+    "passed": 225,
+    "failed": 0,
+    "inconclusive": 0,
+    "notApplicable": 8
+  },
+  "groupCounts": {
+    "fixedInterruptionMatrix": 210,
+    "capabilityIdempotency": 7,
+    "liveCoreTermination": 16
+  },
+  "orderedCasesSha256": "6deb5adf172a984c2ebfb0feabd6ecb437ab98fa6604f11de3bf2cf92ec6fd9a",
+  "historicalOrderedCasesSha256": "6deb5adf172a984c2ebfb0feabd6ecb437ab98fa6604f11de3bf2cf92ec6fd9a",
+  "comparison": {
+    "addedCaseIds": [],
+    "removedCaseIds": [],
+    "unchangedCaseCount": 221,
+    "changedCaseCount": 12,
+    "changedCases": [
+      {
+        "caseId": "LC-failure-cleanup-after-membership-no-descendant",
+        "historicalStatus": "passed",
+        "currentStatus": "passed",
+        "historicalReason": "core-survived-and-proved-group-termination-failure-cleanup-after-membership",
+        "currentReason": "core-survived-and-proved-module-cleanup-failure-cleanup-after-membership"
+      },
+      {
+        "caseId": "LC-failure-cleanup-after-membership-with-descendant",
+        "historicalStatus": "passed",
+        "currentStatus": "passed",
+        "historicalReason": "core-survived-and-proved-group-termination-failure-cleanup-after-membership",
+        "currentReason": "core-survived-and-proved-module-cleanup-failure-cleanup-after-membership"
+      },
+      {
+        "caseId": "LC-failure-cleanup-before-membership-no-descendant",
+        "historicalStatus": "passed",
+        "currentStatus": "passed",
+        "historicalReason": "core-survived-and-proved-group-termination-failure-cleanup-before-membership",
+        "currentReason": "core-survived-and-proved-module-cleanup-failure-cleanup-before-membership"
+      },
+      {
+        "caseId": "LC-hard-timeout-after-membership-no-descendant",
+        "historicalStatus": "passed",
+        "currentStatus": "passed",
+        "historicalReason": "core-survived-and-proved-group-termination-hard-timeout-after-membership",
+        "currentReason": "core-survived-and-proved-module-cleanup-hard-timeout-after-membership"
+      },
+      {
+        "caseId": "LC-hard-timeout-after-membership-with-descendant",
+        "historicalStatus": "passed",
+        "currentStatus": "passed",
+        "historicalReason": "core-survived-and-proved-group-termination-hard-timeout-after-membership",
+        "currentReason": "core-survived-and-proved-module-cleanup-hard-timeout-after-membership"
+      },
+      {
+        "caseId": "LC-hard-timeout-before-membership-no-descendant",
+        "historicalStatus": "passed",
+        "currentStatus": "passed",
+        "historicalReason": "core-survived-and-proved-group-termination-hard-timeout-before-membership",
+        "currentReason": "core-survived-and-proved-module-cleanup-hard-timeout-before-membership"
+      },
+      {
+        "caseId": "LC-orderly-stop-after-membership-no-descendant",
+        "historicalStatus": "passed",
+        "currentStatus": "passed",
+        "historicalReason": "core-survived-and-proved-group-termination-orderly-stop-after-membership",
+        "currentReason": "core-survived-and-proved-module-cleanup-orderly-stop-after-membership"
+      },
+      {
+        "caseId": "LC-orderly-stop-after-membership-with-descendant",
+        "historicalStatus": "passed",
+        "currentStatus": "passed",
+        "historicalReason": "core-survived-and-proved-group-termination-orderly-stop-after-membership",
+        "currentReason": "core-survived-and-proved-module-cleanup-orderly-stop-after-membership"
+      },
+      {
+        "caseId": "LC-orderly-stop-before-membership-no-descendant",
+        "historicalStatus": "passed",
+        "currentStatus": "passed",
+        "historicalReason": "core-survived-and-proved-group-termination-orderly-stop-before-membership",
+        "currentReason": "core-survived-and-proved-module-cleanup-orderly-stop-before-membership"
+      },
+      {
+        "caseId": "LC-replacement-after-membership-no-descendant",
+        "historicalStatus": "passed",
+        "currentStatus": "passed",
+        "historicalReason": "core-survived-and-proved-group-termination-replacement-after-membership",
+        "currentReason": "core-survived-and-proved-module-cleanup-replacement-after-membership"
+      },
+      {
+        "caseId": "LC-replacement-after-membership-with-descendant",
+        "historicalStatus": "passed",
+        "currentStatus": "passed",
+        "historicalReason": "core-survived-and-proved-group-termination-replacement-after-membership",
+        "currentReason": "core-survived-and-proved-module-cleanup-replacement-after-membership"
+      },
+      {
+        "caseId": "LC-replacement-before-membership-no-descendant",
+        "historicalStatus": "passed",
+        "currentStatus": "passed",
+        "historicalReason": "core-survived-and-proved-group-termination-replacement-before-membership",
+        "currentReason": "core-survived-and-proved-module-cleanup-replacement-before-membership"
+      }
+    ]
+  },
+  "notApplicableCaseIds": [
+    "FM-M11-after-no-output-proposed",
+    "FM-M11-before-no-output-proposed",
+    "FM-M12-after-no-output-proposed",
+    "FM-M12-before-no-output-proposed",
+    "LC-failure-cleanup-before-membership-with-descendant",
+    "LC-hard-timeout-before-membership-with-descendant",
+    "LC-orderly-stop-before-membership-with-descendant",
+    "LC-replacement-before-membership-with-descendant"
+  ],
+  "perCaseChecks": {
+    "uniqueCaseIds": 233,
+    "caseArtifactDirectories": 233,
+    "nonzeroExitCodes": 0,
+    "timeouts": 0,
+    "retries": 0,
+    "iterationsOtherThanOne": 0,
+    "missingRequiredArtifacts": 0,
+    "invariantViolations": 0
+  },
+  "liveTerminationReportsChecked": 16,
+  "cleanup": {
+    "ok": true,
+    "unitAttempts": 233,
+    "unitFailures": 0,
+    "stateDirectoryRemoved": true,
+    "residueClean": true
+  },
+  "fullArtifactCopy": {
+    "fileCount": 8030,
+    "byteCount": 8761267,
+    "sha256InventoryDigest": "ce4cf5ca4d3842e9e36bde6bb2d9530a7fa937d072a63bf22c43e865c4aeeb2b",
+    "sha256InventoryDefinition": "SHA-256 of all '<file SHA-256>  <forward-slash relative path>\\n' lines sorted by relative path"
+  },
+  "keyFileSha256": {
+    "command.txt": "9d3b3cc55d93c910cef510af283d6d56086d7a74f2a225a486be1863ca5bf7f2",
+    "environment.txt": "d9c65b6f815997218e3e98547d94d9faad0e44beba9ad77d5446be08159d024b",
+    "source-commit.txt": "1ec48163e9555ff417650876abc7f23ae2ea87830bf0b5fd623bf45caa36d887",
+    "source-status.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "run/ordered-cases.tsv": "6deb5adf172a984c2ebfb0feabd6ecb437ab98fa6604f11de3bf2cf92ec6fd9a",
+    "run/results.jsonl": "4cec017e76a3822a624f9536575b85633ff22f519e46f43600f82513a004ab42",
+    "run/manifest.json": "9935c18ddb3c1dcbdd919868c3719ccdde9ee26380ae2746e01ca9557d1f2412",
+    "run/summary.json": "a68b68d1fe60a0fffcf243cd32938caaa2ac9496a64cb65e6b27f02518b8260c",
+    "run/cleanup.json": "5a76c6716d86dd71566493660f84db17866dfdd9d221e8ff96d306aede32aece",
+    "run/run.log": "8370afa49b99872065b618db9028ceadf4f3fe621527effbc2077cd7fa476529"
+  },
+  "failures": []
+}

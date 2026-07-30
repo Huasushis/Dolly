@@ -1,0 +1,87 @@
+{
+  "caseId": "LC-hard-timeout-after-membership-no-descendant",
+  "invocation": 1,
+  "boundary": "M00",
+  "timing": "before",
+  "workload": "live-termination",
+  "barrierTarget": null,
+  "reachedBarrier": false,
+  "pid": 44325,
+  "at": "2026-07-30T18:13:20.782Z",
+  "phase": "live-termination-complete",
+  "terminationReason": "hard-timeout",
+  "membershipTiming": "after",
+  "descendant": "none",
+  "binding": {
+    "serviceInvocationId": "88c8574c832341a9b3b2f8450225b393",
+    "bootId": "09c618af-c410-4c27-ac99-5316df1c7303",
+    "delegatedRootCgroupPath": "/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-hard-timeout-after-membership-no-descendant.service",
+    "coreCgroupPath": "/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-hard-timeout-after-membership-no-descendant.service/core",
+    "mainPid": 44325
+  },
+  "generations": [
+    {
+      "ordinal": 1,
+      "processGenerationId": "pg-41eb3742d0e946aaab4637d0e0fa484a",
+      "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-hard-timeout-after-membership-no-descendant.service/dolly-module-pg-41eb3742d0e946aaab4637d0e0fa484a-bc19930f3d45c4dc348cef8878e0f79a1eed71422ac20965e35ee54efa6777b0",
+      "started": true,
+      "executionAuthorized": true,
+      "preMembership": null,
+      "descendantRequested": false,
+      "descendantStarted": false,
+      "descendantPid": null,
+      "hardTimeoutExpired": true,
+      "membersBeforeTermination": [
+        "44392"
+      ],
+      "populatedBeforeTermination": "1",
+      "cgroupOperations": [
+        "read-cgroup-events",
+        "write-cgroup-kill",
+        "read-cgroup-events",
+        "read-cgroup-events",
+        "remove-cgroup-directory"
+      ],
+      "groupTerminationAttempted": true,
+      "terminationOutcome": {
+        "terminated": true,
+        "record": {
+          "state": "stopped"
+        }
+      },
+      "membersAfterTermination": [],
+      "populatedAfterTermination": null,
+      "groupDirectoryPresentAfterTermination": false,
+      "recordState": "stopped",
+      "recordFailureCode": null
+    }
+  ],
+  "replacementStartedAfterProof": null,
+  "coreStayedAlive": true,
+  "corePid": 44325,
+  "signalledRecoveredProcessId": false,
+  "stateAfter": {
+    "revision": 4,
+    "activeClaims": [],
+    "moduleProcessRecords": [
+      {
+        "processGenerationId": "pg-41eb3742d0e946aaab4637d0e0fa484a",
+        "moduleGenerationId": "dolly-test-module-generation-1-1",
+        "state": "stopped",
+        "declaredExternalEffects": "core-capabilities-only",
+        "serviceInvocationId": "88c8574c832341a9b3b2f8450225b393",
+        "bootId": "09c618af-c410-4c27-ac99-5316df1c7303",
+        "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-hard-timeout-after-membership-no-descendant.service/dolly-module-pg-41eb3742d0e946aaab4637d0e0fa484a-bc19930f3d45c4dc348cef8878e0f79a1eed71422ac20965e35ee54efa6777b0"
+      }
+    ],
+    "moduleSubmissionRecords": [],
+    "commitRecords": [],
+    "deliveriesByPage": {},
+    "blockCount": 0,
+    "capabilityJournal": [],
+    "externalEffects": [],
+    "resultReceipts": [],
+    "strongReferenceCount": 0,
+    "leaseCount": 0
+  }
+}

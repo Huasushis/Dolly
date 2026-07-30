@@ -1,0 +1,12 @@
+2026-07-30T18:13:30.583Z starting dolly-test-20260730T180705Z-228-replacement-after-membership-no-descendant.service reason=replacement membership=after descendant=none
+2026-07-30T18:13:30.621Z unit started invocation=0dd56a169f6540c8a8f4bd1fb98fa270 cgroup=/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-after-membership-no-descendant.service mainpid=46567
+2026-07-30T18:13:31.206Z stand-in reported; invocation=0dd56a169f6540c8a8f4bd1fb98fa270 restarts=0
+2026-07-30T18:13:30.876Z 0001 service-binding-verified 0dd56a169f6540c8a8f4bd1fb98fa270
+2026-07-30T18:13:30.923Z 0002 recovery-complete live-termination
+2026-07-30T18:13:31.021Z 0003 extension-ready pg-4951c9a8981940d29528f296b613a3a7
+2026-07-30T18:13:31.024Z 0004 before-termination pg-4951c9a8981940d29528f296b613a3a7 members=1 populated=1
+2026-07-30T18:13:31.058Z 0005 after-termination pg-4951c9a8981940d29528f296b613a3a7 stopped=true populated=null
+2026-07-30T18:13:31.139Z 0006 extension-ready pg-62a91841c082454c99d07a212c9d1b26
+2026-07-30T18:13:31.140Z 0007 before-termination pg-62a91841c082454c99d07a212c9d1b26 members=1 populated=1
+2026-07-30T18:13:31.152Z 0008 after-termination pg-62a91841c082454c99d07a212c9d1b26 stopped=true populated=null
+2026-07-30T18:13:31.318Z outcome passed core-survived-and-proved-module-cleanup-replacement-after-membership

@@ -1,0 +1,94 @@
+{
+  "caseId": "LC-failure-cleanup-before-membership-with-descendant",
+  "invocation": 1,
+  "boundary": "M00",
+  "timing": "before",
+  "workload": "live-termination",
+  "barrierTarget": null,
+  "reachedBarrier": false,
+  "pid": 45833,
+  "at": "2026-07-30T18:13:27.546Z",
+  "phase": "live-termination-complete",
+  "terminationReason": "failure-cleanup",
+  "membershipTiming": "before",
+  "descendant": "forked",
+  "binding": {
+    "serviceInvocationId": "20dec06eb8b144e89b7e5596da13fa5b",
+    "bootId": "09c618af-c410-4c27-ac99-5316df1c7303",
+    "delegatedRootCgroupPath": "/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-failure-cleanup-before-membership-with-descendant.service",
+    "coreCgroupPath": "/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-failure-cleanup-before-membership-with-descendant.service/core",
+    "mainPid": 45833
+  },
+  "generations": [
+    {
+      "ordinal": 1,
+      "processGenerationId": "pg-0b1ab6a521f841029e72d012787b2fb7",
+      "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-failure-cleanup-before-membership-with-descendant.service/dolly-module-pg-0b1ab6a521f841029e72d012787b2fb7-28e2f6c636df87703d96a6956b257481d508bdbdc2d99f53d590401b64c13c09",
+      "started": false,
+      "startFailure": {
+        "code": "MODULE_PROCESS_STOP_REQUESTED",
+        "detail": "a stop was requested before the launcher was authorized to execute",
+        "coreMustExit": false
+      },
+      "preMembership": {
+        "at": "2026-07-30T18:13:27.510Z",
+        "members": [],
+        "populated": "0"
+      },
+      "executionAuthorized": false,
+      "cgroupOperations": [
+        "read-cgroup-events",
+        "read-cgroup-events",
+        "remove-cgroup-directory"
+      ],
+      "launcherExit": {
+        "code": 11,
+        "signal": null
+      },
+      "groupTerminationAttempted": false,
+      "groupTerminationSkippedBecause": "no member was observed, so cleanup observed launcher exit, read the current empty state, and removed the directory without cgroup.kill",
+      "genericTerminationWithoutObservedMembership": {
+        "ran": true,
+        "refused": true,
+        "code": "MODULE_CGROUP_MEMBERSHIP_UNOBSERVED",
+        "detail": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-failure-cleanup-before-membership-with-descendant.service/dolly-module-probe-007cd63b84ee483a9e1d56a73c05fcc6-fe7f8d16f87e7c33452d95656973dad17c5ccc85249153cf32912f49e7f79d64 has never been observed to hold a process, so \"populated 0\" would repeat its pre-membership state instead of proving termination; use the launcher control descriptor for the pre-membership phase"
+      },
+      "membersAfterStop": [],
+      "populatedAfterStop": null,
+      "groupDirectoryPresentAfterStop": false,
+      "recordState": "stopped",
+      "recordFailureCode": "MODULE_PROCESS_STOP_REQUESTED",
+      "descendantRequested": true,
+      "descendantStarted": false
+    }
+  ],
+  "replacementStartedAfterProof": null,
+  "coreStayedAlive": true,
+  "corePid": 45833,
+  "signalledRecoveredProcessId": false,
+  "stateAfter": {
+    "revision": 2,
+    "activeClaims": [],
+    "moduleProcessRecords": [
+      {
+        "processGenerationId": "pg-0b1ab6a521f841029e72d012787b2fb7",
+        "moduleGenerationId": "dolly-test-module-generation-1-1",
+        "state": "stopped",
+        "declaredExternalEffects": "core-capabilities-only",
+        "serviceInvocationId": "20dec06eb8b144e89b7e5596da13fa5b",
+        "bootId": "09c618af-c410-4c27-ac99-5316df1c7303",
+        "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-failure-cleanup-before-membership-with-descendant.service/dolly-module-pg-0b1ab6a521f841029e72d012787b2fb7-28e2f6c636df87703d96a6956b257481d508bdbdc2d99f53d590401b64c13c09",
+        "failureCode": "MODULE_PROCESS_STOP_REQUESTED"
+      }
+    ],
+    "moduleSubmissionRecords": [],
+    "commitRecords": [],
+    "deliveriesByPage": {},
+    "blockCount": 0,
+    "capabilityJournal": [],
+    "externalEffects": [],
+    "resultReceipts": [],
+    "strongReferenceCount": 0,
+    "leaseCount": 0
+  }
+}

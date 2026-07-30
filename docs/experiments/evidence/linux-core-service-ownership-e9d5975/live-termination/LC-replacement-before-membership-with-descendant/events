@@ -1,0 +1,9 @@
+2026-07-30T18:13:29.919Z starting dolly-test-20260730T180705Z-228-replacement-before-membership-with-descendant.service reason=replacement membership=before descendant=forked
+2026-07-30T18:13:29.962Z unit started invocation=c0d1fb9bfec74d74b6008521c1216bcc cgroup=/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-before-membership-with-descendant.service mainpid=46424
+2026-07-30T18:13:30.387Z stand-in reported; invocation=c0d1fb9bfec74d74b6008521c1216bcc restarts=0
+2026-07-30T18:13:30.218Z 0001 service-binding-verified c0d1fb9bfec74d74b6008521c1216bcc
+2026-07-30T18:13:30.267Z 0002 recovery-complete live-termination
+2026-07-30T18:13:30.283Z 0003 pre-membership-stop-requested pg-8572905c540741bbb1d6d34cc2e5347c members=0
+2026-07-30T18:13:30.316Z 0004 generic-termination-without-observed-membership true MODULE_CGROUP_MEMBERSHIP_UNOBSERVED
+2026-07-30T18:13:30.318Z 0005 replacement-withheld the old control group was not proven empty
+2026-07-30T18:13:30.499Z outcome not-applicable extension-cannot-fork-a-descendant-before-execution-is-authorized

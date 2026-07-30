@@ -1,0 +1,10 @@
+2026-07-30T18:13:28.535Z starting dolly-test-20260730T180705Z-228-failure-cleanup-after-membership-with-descendant.service reason=failure-cleanup membership=after descendant=forked
+2026-07-30T18:13:28.577Z unit started invocation=0cdaf03bc895495898546c5fc009d358 cgroup=/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-failure-cleanup-after-membership-with-descendant.service mainpid=46128
+2026-07-30T18:13:29.067Z stand-in reported; invocation=0cdaf03bc895495898546c5fc009d358 restarts=0
+2026-07-30T18:13:28.833Z 0001 service-binding-verified 0cdaf03bc895495898546c5fc009d358
+2026-07-30T18:13:28.879Z 0002 recovery-complete live-termination
+2026-07-30T18:13:28.965Z 0003 extension-ready pg-a15f96575cea4363b3c6c6c88abb322e
+2026-07-30T18:13:28.968Z 0004 descendant-started 46202
+2026-07-30T18:13:28.970Z 0005 before-termination pg-a15f96575cea4363b3c6c6c88abb322e members=2 populated=1
+2026-07-30T18:13:29.004Z 0006 after-termination pg-a15f96575cea4363b3c6c6c88abb322e stopped=true populated=null
+2026-07-30T18:13:29.177Z outcome passed core-survived-and-proved-module-cleanup-failure-cleanup-after-membership

@@ -1,0 +1,1 @@
+./scripts/experiments/linux-core-service-ownership/run.sh --disposable --output-dir /dolly-artifacts --mode full --service-mode user --seed 1 --group fixed-interruption-matrix --group capability-idempotency --group live-core-termination --arm proposed 

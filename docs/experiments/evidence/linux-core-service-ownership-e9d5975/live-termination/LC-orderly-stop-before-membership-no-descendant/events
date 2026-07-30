@@ -1,0 +1,8 @@
+2026-07-30T18:13:23.723Z starting dolly-test-20260730T180705Z-228-orderly-stop-before-membership-no-descendant.service reason=orderly-stop membership=before descendant=none
+2026-07-30T18:13:23.766Z unit started invocation=816910ede69a455583ad92b0ccc156d2 cgroup=/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-orderly-stop-before-membership-no-descendant.service mainpid=45099
+2026-07-30T18:13:24.187Z stand-in reported; invocation=816910ede69a455583ad92b0ccc156d2 restarts=0
+2026-07-30T18:13:24.029Z 0001 service-binding-verified 816910ede69a455583ad92b0ccc156d2
+2026-07-30T18:13:24.077Z 0002 recovery-complete live-termination
+2026-07-30T18:13:24.094Z 0003 pre-membership-stop-requested pg-3c911622baf34cdfbd97c33ed4857378 members=0
+2026-07-30T18:13:24.127Z 0004 generic-termination-without-observed-membership true MODULE_CGROUP_MEMBERSHIP_UNOBSERVED
+2026-07-30T18:13:24.299Z outcome passed core-survived-and-proved-module-cleanup-orderly-stop-before-membership

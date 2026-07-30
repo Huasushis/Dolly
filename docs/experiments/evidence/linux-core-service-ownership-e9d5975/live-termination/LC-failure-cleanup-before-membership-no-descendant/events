@@ -1,0 +1,8 @@
+2026-07-30T18:13:26.497Z starting dolly-test-20260730T180705Z-228-failure-cleanup-before-membership-no-descendant.service reason=failure-cleanup membership=before descendant=none
+2026-07-30T18:13:26.541Z unit started invocation=eeab81992f354d7faf4b2e5708e7b950 cgroup=/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-failure-cleanup-before-membership-no-descendant.service mainpid=45690
+2026-07-30T18:13:26.954Z stand-in reported; invocation=eeab81992f354d7faf4b2e5708e7b950 restarts=0
+2026-07-30T18:13:26.802Z 0001 service-binding-verified eeab81992f354d7faf4b2e5708e7b950
+2026-07-30T18:13:26.847Z 0002 recovery-complete live-termination
+2026-07-30T18:13:26.865Z 0003 pre-membership-stop-requested pg-d2501fc8cf44480f84a9b804e6c4f595 members=0
+2026-07-30T18:13:26.897Z 0004 generic-termination-without-observed-membership true MODULE_CGROUP_MEMBERSHIP_UNOBSERVED
+2026-07-30T18:13:27.060Z outcome passed core-survived-and-proved-module-cleanup-failure-cleanup-before-membership

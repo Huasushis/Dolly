@@ -1,7 +1,8 @@
 # Linux Core service process ownership — results
 
-Status: Partial. Three proposed-arm groups of protocol version 3 have run with
-the product launcher control adapter. The complete matrix and the real
+Status: Partial. Three proposed-arm groups of protocol version 3 have been
+revalidated from clean source at commit `e9d5975`, using catalog version 5 and
+the product launcher control adapter. The complete 570-case matrix and the real
 `ExtensionProcessHost` migration have not run.
 
 This records what has actually been executed of the preregistered experiment in
@@ -229,7 +230,7 @@ not reject an all-skipped Vitest result on its own, so the named assertion
 results and counts were checked directly in the JSON report. Commit `e391ff9`
 later fixed that runner defect; the historical result remains recorded as run.
 
-## P0-3 termination confirmation and Linux rerun
+## P0-3 historical evidence: termination confirmation and Linux rerun
 
 On 2026-07-30, commit `3e20e77` tightened the Linux Module executor and process
 lifecycle so that termination is confirmed only after all of these conditions
@@ -313,11 +314,12 @@ All 233 case results had exit code zero, no timeout, no invariant violation,
 and no missing required artifact. Cleanup attempted 233 systemd units with
 zero failures, and the exact disposable container was absent after the run.
 
-The current and P0-1 result ledgers were independently parsed, sorted by case
+The `3e20e77` and P0-1 result ledgers were independently parsed, sorted by case
 identifier, and projected to `caseId`, `status`, and `reason`. Both had 233
 unique identifiers. There were no missing, added, or changed rows, and the
-ordered current projection matched the retained P0-1 projection line for line.
-This is a per-case comparison, not an inference from equal summary counts.
+ordered `3e20e77` projection matched the retained P0-1 projection line for
+line. This is a per-case comparison, not an inference from equal summary
+counts.
 
 Retained complete-run files:
 
@@ -336,29 +338,115 @@ records `iterations: 1`. This run confirms one execution of every selected
 case. It does not establish the planned repetition count or the absence of
 timing races.
 
-### Runner correction after the evidence run
+### Historical runner correction after the evidence run
 
-Commit `e391ff9` also removed the catalog's stale
+Commit `e391ff9` removed the catalog's then-stale
 `status: "not-implemented"` field. Catalog version 4 has the same 570 cases,
 filters, and pass criteria as version 3; handler availability is measured by
 the runner and recorded in the result ledger. The P0-3 artifacts correctly
 retain catalog version 3 because that is the code that produced them.
 
-The Linux integration runner now sets
+At `e391ff9`, the Linux integration runner set
 `DOLLY_LINUX_MODULE_INTEGRATION_REQUIRED=1`. If the systemd service fails to
-place the test process in the delegated `core` subgroup, the three Linux test
-files fail during collection rather than allowing an all-skipped success. A
-negative run outside the subgroup exited 1. A positive systemd-container run
-executed 25 tests across the three files: 25 passed, 0 failed, 0 pending or
-skipped, and 0 todo. Its JSON is retained at
+place the test process in the delegated `core` subgroup, those Linux test files
+fail during collection rather than allowing an all-skipped success. A negative
+run outside the subgroup exited 1. The positive systemd-container run at that
+commit executed the then-listed three files and 25 tests: 25 passed, 0 failed,
+0 pending or skipped, and 0 todo. Its JSON is retained at
 `artifacts/p0-3/runner-fix/result.json`, with SHA-256
 `98b66976649986e50cdb3a01cde145c5a88cea1a11ac1a44999212e58f97d444`.
 
-These results accept the termination behavior described above. They do not
-accept the complete Linux startup design. In particular, process ownership can
-still be lost on failures after membership verification or while writing the
-`running` record, and no runtime startup caller yet assembles the same launcher,
-control group, attached process, and `ExtensionProcessHost` end to end.
+The runner's default list now contains four files. The retained four-file
+regression executed 26 tests and passed all 26, including the product Linux
+Module executor's default process-exit path through systemd. That later result,
+its counterexample, and its limits are recorded separately in
+[`linux-module-executor-systemd-results.md`](linux-module-executor-systemd-results.md).
+The historical `e391ff9` 25-of-25 result above remains a three-file snapshot;
+it is not rewritten as the later four-file run.
+
+The historical P0-3 results accept the termination behavior described above.
+They do not accept the complete Linux startup design. In particular, process
+ownership can still be lost on failures after membership verification or while
+writing the `running` record, and no runtime startup caller yet assembles the
+same launcher, control group, attached process, and `ExtensionProcessHost` end
+to end.
+
+## Current-source revalidation of the proposed-arm groups
+
+On 2026-07-31, the same selected groups were run from clean source at commit
+`e9d597579b71fcd5d1711696dfc649c0ea4dac21`. The retained
+`source-status.txt` is empty. This run used protocol version 3, catalog version
+5, the proposed arm, and one execution of each selected case:
+
+```
+cases  233   passed 225   not applicable 8   failed 0   inconclusive 0
+cleanup units attempted 233   failed 0
+residue clean true
+```
+
+The disposable execution copy did not contain Git metadata, so its internal
+manifest records an unknown commit and `dirtyWorktree: true` with zero dirty
+files. The outer `source-commit.txt` and empty `source-status.txt`, captured
+before making that copy, provide the source binding stated above.
+
+The selected cases remain 210 fixed-interruption cases, 7 capability
+idempotency cases, and 16 live-termination cases. The ordered case list has
+SHA-256
+`6deb5adf172a984c2ebfb0feabd6ecb437ab98fa6604f11de3bf2cf92ec6fd9a`,
+the same value as the retained historical ordered list. There were no added or
+removed case identifiers.
+
+The validator compared `caseId`, `status`, and `reason` for every selected
+case. All three fields were unchanged for 221 cases. The other 12 were still
+passes; only their reason text changed from
+`core-survived-and-proved-group-termination-...` to
+`core-survived-and-proved-module-cleanup-...`. These 12 are the live
+termination cases for the three applicable membership/descendant combinations
+under each of the four termination reasons. The change therefore records the
+narrower operation actually proved; it is not a changed case result.
+
+All 16 retained live-termination reports were also checked individually. Their
+recorded control-group operations followed exactly one of two orders:
+
+- the eight before-membership reports recorded `read-cgroup-events`,
+  `read-cgroup-events`, then `remove-cgroup-directory`; they did not use
+  `cgroup.kill`, because process membership had not been observed;
+- the eight after-membership reports recorded `read-cgroup-events`,
+  `write-cgroup-kill`, two further `read-cgroup-events` operations, then
+  `remove-cgroup-directory`.
+
+Every one of those reports records a live Core process and a final durable
+process state of `stopped`. Four before-membership cases with a requested
+descendant remain not applicable because execution was never authorized, so
+the Extension could not have created that descendant. The other four
+not-applicable rows remain the M11 and M12 `no-output` cases.
+
+All 233 result rows have `iterations: 1`, zero retries, exit code zero, no
+timeout, no invariant violation, and no missing required artifact. Although the
+manifest retains a plan for 4,391 executions, this run did not execute those
+repetitions. It establishes neither the full 570-case catalog nor the planned
+race repetitions.
+
+The committed compact evidence is under
+[`evidence/linux-core-service-ownership-e9d5975/`](evidence/linux-core-service-ownership-e9d5975/).
+It contains the command, environment, clean-source records, selected run files,
+all 16 live-termination report sets, and
+[`validation-report.json`](evidence/linux-core-service-ownership-e9d5975/validation-report.json).
+Its 134 files include
+[`SHA256SUMS`](evidence/linux-core-service-ownership-e9d5975/SHA256SUMS) with
+the digest of every other retained file; that manifest itself has SHA-256
+`0dfaa191929fd976475be4edc13156a0978cb3fa267203e871a33ccb0d605cf5`.
+The validation report also records that the full run artifact copy contained
+8,030 files, with sorted SHA-256 inventory digest
+`ce4cf5ca4d3842e9e36bde6bb2d9530a7fa937d072a63bf22c43e865c4aeeb2b`,
+rather than implying that the compact committed copy contains every per-case
+artifact.
+
+This revalidation does not prove that `createLinuxModuleExecutor` ends the Core
+process through its default exit function. That behavior is established
+separately by the positive and counterexample runs in
+[`linux-module-executor-systemd-results.md`](linux-module-executor-systemd-results.md).
+Neither result proves runtime startup wiring.
 
 ## How an interruption point is established
 
@@ -506,13 +594,15 @@ does not carry. `FM-M07-before-processor-loop-proposed` became `failed`, with
 
 Both changes were reverted and both cases pass again.
 
-## Cleanup
+## Cleanup of the retained 210-case run
 
 Run-level: the reserved `dolly-test-` namespace held nothing before the run and nothing after it;
 cleanup stopped 210 units with none failing, removed no control groups because the service manager
 had already removed each unit's own tree, and removed the run state directory. The summary records
 `residue.clean: true`.
 
-Host-level, after every run including the fault injections: no container, no `dolly-test-*` unit, no
-`dolly-test-*` or `dolly-module-*` control group, and no leftover unit file. Every destructive case
-ran inside a disposable container; none ran against the shared machine.
+Host-level, after the retained run and its fault injections: no container, no `dolly-test-*` unit,
+no `dolly-test-*` or `dolly-module-*` control group, and no leftover unit file. Every destructive
+case ran inside a disposable container; none ran against the shared machine. The current-source
+revalidation has its separate 233-attempt, zero-failure cleanup record in the compact evidence
+linked above.

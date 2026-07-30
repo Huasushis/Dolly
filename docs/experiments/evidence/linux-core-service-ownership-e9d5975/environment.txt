@@ -1,0 +1,4 @@
+cgroup filesystem: cgroup2fs
+root controllers:  cpuset cpu io memory hugetlb pids rdma misc
+lingering:         Linger=yes
+python3:           Python 3.12.3

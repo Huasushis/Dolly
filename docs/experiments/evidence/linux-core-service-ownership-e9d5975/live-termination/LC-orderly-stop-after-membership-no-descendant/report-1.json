@@ -1,0 +1,87 @@
+{
+  "caseId": "LC-orderly-stop-after-membership-no-descendant",
+  "invocation": 1,
+  "boundary": "M00",
+  "timing": "before",
+  "workload": "live-termination",
+  "barrierTarget": null,
+  "reachedBarrier": false,
+  "pid": 45385,
+  "at": "2026-07-30T18:13:25.503Z",
+  "phase": "live-termination-complete",
+  "terminationReason": "orderly-stop",
+  "membershipTiming": "after",
+  "descendant": "none",
+  "binding": {
+    "serviceInvocationId": "cff17dd0a516446088611fd17f34a409",
+    "bootId": "09c618af-c410-4c27-ac99-5316df1c7303",
+    "delegatedRootCgroupPath": "/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-orderly-stop-after-membership-no-descendant.service",
+    "coreCgroupPath": "/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-orderly-stop-after-membership-no-descendant.service/core",
+    "mainPid": 45385
+  },
+  "generations": [
+    {
+      "ordinal": 1,
+      "processGenerationId": "pg-bc9c755474994087a03026109155a887",
+      "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-orderly-stop-after-membership-no-descendant.service/dolly-module-pg-bc9c755474994087a03026109155a887-bf00eb9122cb46bb470eddc874d9fff3a3ec3f206f0dd166fb8453024a62d42d",
+      "started": true,
+      "executionAuthorized": true,
+      "preMembership": null,
+      "descendantRequested": false,
+      "descendantStarted": false,
+      "descendantPid": null,
+      "hardTimeoutExpired": false,
+      "membersBeforeTermination": [
+        "45448"
+      ],
+      "populatedBeforeTermination": "1",
+      "cgroupOperations": [
+        "read-cgroup-events",
+        "write-cgroup-kill",
+        "read-cgroup-events",
+        "read-cgroup-events",
+        "remove-cgroup-directory"
+      ],
+      "groupTerminationAttempted": true,
+      "terminationOutcome": {
+        "terminated": true,
+        "record": {
+          "state": "stopped"
+        }
+      },
+      "membersAfterTermination": [],
+      "populatedAfterTermination": null,
+      "groupDirectoryPresentAfterTermination": false,
+      "recordState": "stopped",
+      "recordFailureCode": null
+    }
+  ],
+  "replacementStartedAfterProof": null,
+  "coreStayedAlive": true,
+  "corePid": 45385,
+  "signalledRecoveredProcessId": false,
+  "stateAfter": {
+    "revision": 4,
+    "activeClaims": [],
+    "moduleProcessRecords": [
+      {
+        "processGenerationId": "pg-bc9c755474994087a03026109155a887",
+        "moduleGenerationId": "dolly-test-module-generation-1-1",
+        "state": "stopped",
+        "declaredExternalEffects": "core-capabilities-only",
+        "serviceInvocationId": "cff17dd0a516446088611fd17f34a409",
+        "bootId": "09c618af-c410-4c27-ac99-5316df1c7303",
+        "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-orderly-stop-after-membership-no-descendant.service/dolly-module-pg-bc9c755474994087a03026109155a887-bf00eb9122cb46bb470eddc874d9fff3a3ec3f206f0dd166fb8453024a62d42d"
+      }
+    ],
+    "moduleSubmissionRecords": [],
+    "commitRecords": [],
+    "deliveriesByPage": {},
+    "blockCount": 0,
+    "capabilityJournal": [],
+    "externalEffects": [],
+    "resultReceipts": [],
+    "strongReferenceCount": 0,
+    "leaseCount": 0
+  }
+}

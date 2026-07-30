@@ -1,0 +1,8 @@
+2026-07-30T18:13:17.630Z starting dolly-test-20260730T180705Z-228-hard-timeout-before-membership-with-descendant.service reason=hard-timeout membership=before descendant=forked
+2026-07-30T18:13:17.671Z unit started invocation=c743a8d880f24e8aad45036329f054ad cgroup=/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-hard-timeout-before-membership-with-descendant.service mainpid=44182
+2026-07-30T18:13:18.088Z stand-in reported; invocation=c743a8d880f24e8aad45036329f054ad restarts=0
+2026-07-30T18:13:17.939Z 0001 service-binding-verified c743a8d880f24e8aad45036329f054ad
+2026-07-30T18:13:17.986Z 0002 recovery-complete live-termination
+2026-07-30T18:13:18.004Z 0003 pre-membership-stop-requested pg-f17b8768ebf540b88bf82ed10fc24c5c members=0
+2026-07-30T18:13:18.036Z 0004 generic-termination-without-observed-membership true MODULE_CGROUP_MEMBERSHIP_UNOBSERVED
+2026-07-30T18:13:18.202Z outcome not-applicable extension-cannot-fork-a-descendant-before-execution-is-authorized

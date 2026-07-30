@@ -1,0 +1,9 @@
+2026-07-30T18:13:29.269Z starting dolly-test-20260730T180705Z-228-replacement-before-membership-no-descendant.service reason=replacement membership=before descendant=none
+2026-07-30T18:13:29.305Z unit started invocation=cc28c13d73a34129993cfeb8e0f76db9 cgroup=/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-before-membership-no-descendant.service mainpid=46281
+2026-07-30T18:13:29.721Z stand-in reported; invocation=cc28c13d73a34129993cfeb8e0f76db9 restarts=0
+2026-07-30T18:13:29.564Z 0001 service-binding-verified cc28c13d73a34129993cfeb8e0f76db9
+2026-07-30T18:13:29.611Z 0002 recovery-complete live-termination
+2026-07-30T18:13:29.629Z 0003 pre-membership-stop-requested pg-489607fea14047eab72fc50c230eef0f members=0
+2026-07-30T18:13:29.662Z 0004 generic-termination-without-observed-membership true MODULE_CGROUP_MEMBERSHIP_UNOBSERVED
+2026-07-30T18:13:29.664Z 0005 replacement-withheld the old control group was not proven empty
+2026-07-30T18:13:29.832Z outcome passed core-survived-and-proved-module-cleanup-replacement-before-membership

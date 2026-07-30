@@ -1,0 +1,15 @@
+Core service: first invocation 3addfdc405ca482cb0bf7d521e9aa137, last observed 3addfdc405ca482cb0bf7d521e9aa137, NRestarts=0
+Core service: first main process 45242, last observed 45242
+module control group observed during the run: dolly-module-pg-c8aa83b0fb6143c381c9803137027360-9815a64f1b04e405f0d633924f4b68683e5a9af958d51e2a6b34de2598142a45
+  removed by the time the run finished
+after cleanup: the delegated service root /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-orderly-stop-before-membership-with-descendant.service and every Module control group below it are gone
+after cleanup: the unit is no longer loaded
+passed core-service-was-never-restarted [INV-04] the Core service kept one invocation (3addfdc405ca482cb0bf7d521e9aa137) and restarted 0 time(s)
+passed module-started-inside-the-validated-core-service [INV-04] the Module was started under a verified Core service binding
+passed declared-core-capabilities-only [INV-05] the Module process record declared core-capabilities-only external effects
+passed no-signal-by-recovered-process-identifier [INV-07] termination addressed the control group; no recovered process identifier was signalled
+passed execution-was-never-authorized [INV-01] Core stopped the start before authorizing execution (MODULE_PROCESS_STOP_REQUESTED)
+passed stop-was-requested-before-controller-configuration [INV-01] the stop was requested before the controller began configuration and membership verification
+passed no-member-was-observed-at-the-stop-check [INV-01] kernel files showed no member and populated 0 when the early stop was requested
+not-evaluable descendant-before-membership [INV-01] the Extension is executed only after membership is verified, so it cannot fork a descendant before that point; this run reached the early stop check with execution never authorized and no descendant started
+evaluation LC-orderly-stop-before-membership-with-descendant: 7 passed, 0 failed, 1 not evaluable

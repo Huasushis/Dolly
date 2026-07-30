@@ -1,0 +1,2 @@
+status=not-applicable
+reason=extension-cannot-fork-a-descendant-before-execution-is-authorized

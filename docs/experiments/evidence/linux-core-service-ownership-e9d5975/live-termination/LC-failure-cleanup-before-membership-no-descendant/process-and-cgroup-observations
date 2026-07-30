@@ -1,0 +1,19 @@
+Core service: first invocation eeab81992f354d7faf4b2e5708e7b950, last observed eeab81992f354d7faf4b2e5708e7b950, NRestarts=0
+Core service: first main process 45690, last observed 45690
+module control group observed during the run: dolly-module-pg-d2501fc8cf44480f84a9b804e6c4f595-ca25890ae0dd862b43d1dc2b560f432fab5fca6caca210741af5ca5569ae5270
+  removed by the time the run finished
+after cleanup: the delegated service root /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-failure-cleanup-before-membership-no-descendant.service and every Module control group below it are gone
+after cleanup: the unit is no longer loaded
+passed core-service-was-never-restarted [INV-04] the Core service kept one invocation (eeab81992f354d7faf4b2e5708e7b950) and restarted 0 time(s)
+passed module-started-inside-the-validated-core-service [INV-04] the Module was started under a verified Core service binding
+passed declared-core-capabilities-only [INV-05] the Module process record declared core-capabilities-only external effects
+passed no-signal-by-recovered-process-identifier [INV-07] termination addressed the control group; no recovered process identifier was signalled
+passed execution-was-never-authorized [INV-01] Core stopped the start before authorizing execution (MODULE_PROCESS_STOP_REQUESTED)
+passed stop-was-requested-before-controller-configuration [INV-01] the stop was requested before the controller began configuration and membership verification
+passed no-member-was-observed-at-the-stop-check [INV-01] kernel files showed no member and populated 0 when the early stop was requested
+passed launcher-exit-was-observed [INV-01] the launcher's exit through its control descriptor was observed ({"code":11,"signal":null}), so Core did not have to exit
+passed no-process-remains-in-the-module-group [INV-01] the Module control group holds no process after the pre-membership stop
+passed the-group-was-removed-after-launcher-exit [INV-06] Core performed read-cgroup-events, read-cgroup-events, remove-cgroup-directory, removed the Module control group without cgroup.kill, and persisted stopped
+passed generic-termination-was-refused-without-observed-membership [INV-06] generic termination refused to claim whole-group termination without observed membership (MODULE_CGROUP_MEMBERSHIP_UNOBSERVED)
+passed no-residue [INV-12] this case left no unit, process, or control group behind
+evaluation LC-failure-cleanup-before-membership-no-descendant: 12 passed, 0 failed, 0 not evaluable

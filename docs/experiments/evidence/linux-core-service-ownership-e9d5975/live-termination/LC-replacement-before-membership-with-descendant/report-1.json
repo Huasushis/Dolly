@@ -1,0 +1,94 @@
+{
+  "caseId": "LC-replacement-before-membership-with-descendant",
+  "invocation": 1,
+  "boundary": "M00",
+  "timing": "before",
+  "workload": "live-termination",
+  "barrierTarget": null,
+  "reachedBarrier": false,
+  "pid": 46424,
+  "at": "2026-07-30T18:13:30.320Z",
+  "phase": "live-termination-complete",
+  "terminationReason": "replacement",
+  "membershipTiming": "before",
+  "descendant": "forked",
+  "binding": {
+    "serviceInvocationId": "c0d1fb9bfec74d74b6008521c1216bcc",
+    "bootId": "09c618af-c410-4c27-ac99-5316df1c7303",
+    "delegatedRootCgroupPath": "/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-before-membership-with-descendant.service",
+    "coreCgroupPath": "/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-before-membership-with-descendant.service/core",
+    "mainPid": 46424
+  },
+  "generations": [
+    {
+      "ordinal": 1,
+      "processGenerationId": "pg-8572905c540741bbb1d6d34cc2e5347c",
+      "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-before-membership-with-descendant.service/dolly-module-pg-8572905c540741bbb1d6d34cc2e5347c-e4f7411ff6ea079c930a85be5a0766b8eda641c563cba77efaa7df79856d3ce1",
+      "started": false,
+      "startFailure": {
+        "code": "MODULE_PROCESS_STOP_REQUESTED",
+        "detail": "a stop was requested before the launcher was authorized to execute",
+        "coreMustExit": false
+      },
+      "preMembership": {
+        "at": "2026-07-30T18:13:30.283Z",
+        "members": [],
+        "populated": "0"
+      },
+      "executionAuthorized": false,
+      "cgroupOperations": [
+        "read-cgroup-events",
+        "read-cgroup-events",
+        "remove-cgroup-directory"
+      ],
+      "launcherExit": {
+        "code": 11,
+        "signal": null
+      },
+      "groupTerminationAttempted": false,
+      "groupTerminationSkippedBecause": "no member was observed, so cleanup observed launcher exit, read the current empty state, and removed the directory without cgroup.kill",
+      "genericTerminationWithoutObservedMembership": {
+        "ran": true,
+        "refused": true,
+        "code": "MODULE_CGROUP_MEMBERSHIP_UNOBSERVED",
+        "detail": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-before-membership-with-descendant.service/dolly-module-probe-68e248cf2fbc4c87a665b57a1d8bac9c-8783719e061153e3b81d6d00f224338ef4fb50eb568390061d22bd0297f0b584 has never been observed to hold a process, so \"populated 0\" would repeat its pre-membership state instead of proving termination; use the launcher control descriptor for the pre-membership phase"
+      },
+      "membersAfterStop": [],
+      "populatedAfterStop": null,
+      "groupDirectoryPresentAfterStop": false,
+      "recordState": "stopped",
+      "recordFailureCode": "MODULE_PROCESS_STOP_REQUESTED",
+      "descendantRequested": true,
+      "descendantStarted": false
+    }
+  ],
+  "replacementStartedAfterProof": false,
+  "coreStayedAlive": true,
+  "corePid": 46424,
+  "signalledRecoveredProcessId": false,
+  "stateAfter": {
+    "revision": 2,
+    "activeClaims": [],
+    "moduleProcessRecords": [
+      {
+        "processGenerationId": "pg-8572905c540741bbb1d6d34cc2e5347c",
+        "moduleGenerationId": "dolly-test-module-generation-1-1",
+        "state": "stopped",
+        "declaredExternalEffects": "core-capabilities-only",
+        "serviceInvocationId": "c0d1fb9bfec74d74b6008521c1216bcc",
+        "bootId": "09c618af-c410-4c27-ac99-5316df1c7303",
+        "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-before-membership-with-descendant.service/dolly-module-pg-8572905c540741bbb1d6d34cc2e5347c-e4f7411ff6ea079c930a85be5a0766b8eda641c563cba77efaa7df79856d3ce1",
+        "failureCode": "MODULE_PROCESS_STOP_REQUESTED"
+      }
+    ],
+    "moduleSubmissionRecords": [],
+    "commitRecords": [],
+    "deliveriesByPage": {},
+    "blockCount": 0,
+    "capabilityJournal": [],
+    "externalEffects": [],
+    "resultReceipts": [],
+    "strongReferenceCount": 0,
+    "leaseCount": 0
+  }
+}

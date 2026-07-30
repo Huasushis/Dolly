@@ -1,0 +1,24 @@
+Core service: first invocation 88c8574c832341a9b3b2f8450225b393, last observed 88c8574c832341a9b3b2f8450225b393, NRestarts=0
+Core service: first main process 44325, last observed 44325
+module control group observed during the run: dolly-module-pg-41eb3742d0e946aaab4637d0e0fa484a-bc19930f3d45c4dc348cef8878e0f79a1eed71422ac20965e35ee54efa6777b0
+  removed by the time the run finished
+after cleanup: the delegated service root /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-hard-timeout-after-membership-no-descendant.service and every Module control group below it are gone
+after cleanup: the unit is no longer loaded
+passed core-service-was-never-restarted [INV-04] the Core service kept one invocation (88c8574c832341a9b3b2f8450225b393) and restarted 0 time(s)
+passed module-started-inside-the-validated-core-service [INV-04] the Module was started under a verified Core service binding
+passed declared-core-capabilities-only [INV-05] the Module process record declared core-capabilities-only external effects
+passed no-signal-by-recovered-process-identifier [INV-07] termination addressed the control group; no recovered process identifier was signalled
+passed execution-was-authorized-after-membership-was-verified [INV-01] Core verified control-group membership and then authorized execution
+not-evaluable module-group-held-a-descendant [INV-01] this case runs without a descendant by design
+passed group-termination-proven-by-populated-zero [INV-06] Core performed read-cgroup-events, write-cgroup-kill, read-cgroup-events, read-cgroup-events, remove-cgroup-directory, proved the group empty after cgroup.kill, and removed its directory
+passed no-process-survived-the-group-termination [INV-06] no process remained in the Module control group after termination
+passed module-process-record-reached-stopped [INV-01] the Module process record moved to stopped only after the group was proven empty
+passed hard-timeout-actually-expired [INV-03] Core's own finite deadline expired before it terminated the Module
+not-evaluable replacement-started-only-after-the-old-group-was-proven-empty [INV-06] this case terminates for hard-timeout and starts no replacement
+passed never-more-than-one-live-process-generation [INV-01] exactly one Module process generation existed
+not-evaluable no-duplicate-output-commit [INV-02] a live-termination case commits no output Block
+not-evaluable declared-environment-observed [INV-09] the Extension environment is compared in the fixed interruption matrix; this case terminates the Module before any result
+not-evaluable limit-bypasses [INV-10] control-group limits are evaluated by the resource-limits group
+not-evaluable unreconciled-references-or-leases [INV-11] this case opens no Claim, so it holds no strong reference or access lease
+passed no-residue [INV-12] this case left no unit, process, or control group behind
+evaluation LC-hard-timeout-after-membership-no-descendant: 11 passed, 0 failed, 6 not evaluable

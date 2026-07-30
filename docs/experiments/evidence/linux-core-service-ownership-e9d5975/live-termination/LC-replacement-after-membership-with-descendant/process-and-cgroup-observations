@@ -1,0 +1,29 @@
+Core service: first invocation 7752007607ff406ba2e3a4a0b9ffe45a, last observed 7752007607ff406ba2e3a4a0b9ffe45a, NRestarts=0
+Core service: first main process 46730, last observed 46730
+module control group observed during the run: dolly-module-pg-b0fa78b4e439408a9d24802b7f2a382f-f430a38bcf92c44ae09589202f078b41eadb7a2fdb00459838b7004cc07dabe1
+  removed by the time the run finished
+module control group observed during the run: dolly-module-pg-eb5dba8e80104ba9898b1027c06deb22-5f65f8c4d9921a669b776a094f362ddd8bac16c21dc41cbdec148aa86554c3c6
+  removed by the time the run finished
+after cleanup: the delegated service root /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-replacement-after-membership-with-descendant.service and every Module control group below it are gone
+after cleanup: the unit is no longer loaded
+passed core-service-was-never-restarted [INV-04] the Core service kept one invocation (7752007607ff406ba2e3a4a0b9ffe45a) and restarted 0 time(s)
+passed module-started-inside-the-validated-core-service [INV-04] the Module was started under a verified Core service binding
+passed declared-core-capabilities-only [INV-05] the Module process record declared core-capabilities-only external effects
+passed no-signal-by-recovered-process-identifier [INV-07] termination addressed the control group; no recovered process identifier was signalled
+passed execution-was-authorized-after-membership-was-verified [INV-01] Core verified control-group membership and then authorized execution
+passed descendant-existed-before-termination [INV-01] the Extension confirmed descendant 46807 before Core terminated anything
+passed module-group-held-the-extension-and-its-descendant [INV-01] the Module control group held 2 processes before termination
+passed group-termination-proven-by-populated-zero [INV-06] Core performed read-cgroup-events, write-cgroup-kill, read-cgroup-events, read-cgroup-events, remove-cgroup-directory, proved the group empty after cgroup.kill, and removed its directory
+passed no-process-survived-the-group-termination [INV-06] no process remained in the Module control group after termination
+passed module-process-record-reached-stopped [INV-01] the Module process record moved to stopped only after the group was proven empty
+not-evaluable hard-timeout-actually-expired [INV-03] this case terminates for replacement
+passed replacement-started-only-after-the-old-group-was-proven-empty [INV-06] the replacement generation started only after the old control group was proven empty
+passed replacement-generation-ran-and-was-itself-terminated [INV-01] the replacement generation started, ran, and was itself terminated with a proven empty group
+passed never-more-than-one-live-process-generation [INV-01] 2 Module generation(s) ran in sequence and each ended stopped
+not-evaluable no-duplicate-output-commit [INV-02] a live-termination case commits no output Block
+not-evaluable no-unknown-outcome-retried [INV-03] no Extension outcome was pending at termination
+not-evaluable declared-environment-observed [INV-09] the Extension environment is compared in the fixed interruption matrix; this case terminates the Module before any result
+not-evaluable limit-bypasses [INV-10] control-group limits are evaluated by the resource-limits group
+not-evaluable unreconciled-references-or-leases [INV-11] this case opens no Claim, so it holds no strong reference or access lease
+passed no-residue [INV-12] this case left no unit, process, or control group behind
+evaluation LC-replacement-after-membership-with-descendant: 14 passed, 0 failed, 6 not evaluable

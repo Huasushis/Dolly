@@ -1,0 +1,87 @@
+{
+  "caseId": "LC-failure-cleanup-after-membership-no-descendant",
+  "invocation": 1,
+  "boundary": "M00",
+  "timing": "before",
+  "workload": "live-termination",
+  "barrierTarget": null,
+  "reachedBarrier": false,
+  "pid": 45976,
+  "at": "2026-07-30T18:13:28.288Z",
+  "phase": "live-termination-complete",
+  "terminationReason": "failure-cleanup",
+  "membershipTiming": "after",
+  "descendant": "none",
+  "binding": {
+    "serviceInvocationId": "378c817ee18b47b0b219e4be1748ff26",
+    "bootId": "09c618af-c410-4c27-ac99-5316df1c7303",
+    "delegatedRootCgroupPath": "/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-failure-cleanup-after-membership-no-descendant.service",
+    "coreCgroupPath": "/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-failure-cleanup-after-membership-no-descendant.service/core",
+    "mainPid": 45976
+  },
+  "generations": [
+    {
+      "ordinal": 1,
+      "processGenerationId": "pg-746d2dbf96a74ee6ae4d10414af994b1",
+      "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-failure-cleanup-after-membership-no-descendant.service/dolly-module-pg-746d2dbf96a74ee6ae4d10414af994b1-b82f692e84fe015bed7d71a740d30a792825dc844b3c7257d3462780b1c720a8",
+      "started": true,
+      "executionAuthorized": true,
+      "preMembership": null,
+      "descendantRequested": false,
+      "descendantStarted": false,
+      "descendantPid": null,
+      "hardTimeoutExpired": false,
+      "membersBeforeTermination": [
+        "46043"
+      ],
+      "populatedBeforeTermination": "1",
+      "cgroupOperations": [
+        "read-cgroup-events",
+        "write-cgroup-kill",
+        "read-cgroup-events",
+        "read-cgroup-events",
+        "remove-cgroup-directory"
+      ],
+      "groupTerminationAttempted": true,
+      "terminationOutcome": {
+        "terminated": true,
+        "record": {
+          "state": "stopped"
+        }
+      },
+      "membersAfterTermination": [],
+      "populatedAfterTermination": null,
+      "groupDirectoryPresentAfterTermination": false,
+      "recordState": "stopped",
+      "recordFailureCode": null
+    }
+  ],
+  "replacementStartedAfterProof": null,
+  "coreStayedAlive": true,
+  "corePid": 45976,
+  "signalledRecoveredProcessId": false,
+  "stateAfter": {
+    "revision": 4,
+    "activeClaims": [],
+    "moduleProcessRecords": [
+      {
+        "processGenerationId": "pg-746d2dbf96a74ee6ae4d10414af994b1",
+        "moduleGenerationId": "dolly-test-module-generation-1-1",
+        "state": "stopped",
+        "declaredExternalEffects": "core-capabilities-only",
+        "serviceInvocationId": "378c817ee18b47b0b219e4be1748ff26",
+        "bootId": "09c618af-c410-4c27-ac99-5316df1c7303",
+        "moduleCgroupPath": "/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-failure-cleanup-after-membership-no-descendant.service/dolly-module-pg-746d2dbf96a74ee6ae4d10414af994b1-b82f692e84fe015bed7d71a740d30a792825dc844b3c7257d3462780b1c720a8"
+      }
+    ],
+    "moduleSubmissionRecords": [],
+    "commitRecords": [],
+    "deliveriesByPage": {},
+    "blockCount": 0,
+    "capabilityJournal": [],
+    "externalEffects": [],
+    "resultReceipts": [],
+    "strongReferenceCount": 0,
+    "leaseCount": 0
+  }
+}

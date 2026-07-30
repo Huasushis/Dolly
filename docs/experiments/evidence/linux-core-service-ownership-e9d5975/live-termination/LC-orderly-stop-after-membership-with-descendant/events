@@ -1,0 +1,10 @@
+2026-07-30T18:13:25.754Z starting dolly-test-20260730T180705Z-228-orderly-stop-after-membership-with-descendant.service reason=orderly-stop membership=after descendant=forked
+2026-07-30T18:13:25.803Z unit started invocation=5473837db77740b9af50b9f021e63cee cgroup=/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-orderly-stop-after-membership-with-descendant.service mainpid=45537
+2026-07-30T18:13:26.311Z stand-in reported; invocation=5473837db77740b9af50b9f021e63cee restarts=0
+2026-07-30T18:13:26.085Z 0001 service-binding-verified 5473837db77740b9af50b9f021e63cee
+2026-07-30T18:13:26.136Z 0002 recovery-complete live-termination
+2026-07-30T18:13:26.222Z 0003 extension-ready pg-2112854cf5af407e92f9a6e5d392b870
+2026-07-30T18:13:26.225Z 0004 descendant-started 45617
+2026-07-30T18:13:26.227Z 0005 before-termination pg-2112854cf5af407e92f9a6e5d392b870 members=2 populated=1
+2026-07-30T18:13:26.261Z 0006 after-termination pg-2112854cf5af407e92f9a6e5d392b870 stopped=true populated=null
+2026-07-30T18:13:26.418Z outcome passed core-survived-and-proved-module-cleanup-orderly-stop-after-membership

@@ -1,0 +1,8 @@
+2026-07-30T18:13:27.152Z starting dolly-test-20260730T180705Z-228-failure-cleanup-before-membership-with-descendant.service reason=failure-cleanup membership=before descendant=forked
+2026-07-30T18:13:27.187Z unit started invocation=20dec06eb8b144e89b7e5596da13fa5b cgroup=/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-failure-cleanup-before-membership-with-descendant.service mainpid=45833
+2026-07-30T18:13:27.605Z stand-in reported; invocation=20dec06eb8b144e89b7e5596da13fa5b restarts=0
+2026-07-30T18:13:27.447Z 0001 service-binding-verified 20dec06eb8b144e89b7e5596da13fa5b
+2026-07-30T18:13:27.492Z 0002 recovery-complete live-termination
+2026-07-30T18:13:27.511Z 0003 pre-membership-stop-requested pg-0b1ab6a521f841029e72d012787b2fb7 members=0
+2026-07-30T18:13:27.543Z 0004 generic-termination-without-observed-membership true MODULE_CGROUP_MEMBERSHIP_UNOBSERVED
+2026-07-30T18:13:27.713Z outcome not-applicable extension-cannot-fork-a-descendant-before-execution-is-authorized

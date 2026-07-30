@@ -1,0 +1,8 @@
+2026-07-30T18:13:24.383Z starting dolly-test-20260730T180705Z-228-orderly-stop-before-membership-with-descendant.service reason=orderly-stop membership=before descendant=forked
+2026-07-30T18:13:24.427Z unit started invocation=3addfdc405ca482cb0bf7d521e9aa137 cgroup=/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-orderly-stop-before-membership-with-descendant.service mainpid=45242
+2026-07-30T18:13:24.848Z stand-in reported; invocation=3addfdc405ca482cb0bf7d521e9aa137 restarts=0
+2026-07-30T18:13:24.695Z 0001 service-binding-verified 3addfdc405ca482cb0bf7d521e9aa137
+2026-07-30T18:13:24.742Z 0002 recovery-complete live-termination
+2026-07-30T18:13:24.759Z 0003 pre-membership-stop-requested pg-c8aa83b0fb6143c381c9803137027360 members=0
+2026-07-30T18:13:24.791Z 0004 generic-termination-without-observed-membership true MODULE_CGROUP_MEMBERSHIP_UNOBSERVED
+2026-07-30T18:13:24.954Z outcome not-applicable extension-cannot-fork-a-descendant-before-execution-is-authorized

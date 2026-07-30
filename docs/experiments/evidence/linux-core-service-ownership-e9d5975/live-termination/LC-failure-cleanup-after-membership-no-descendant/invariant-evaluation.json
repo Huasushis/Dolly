@@ -1,0 +1,119 @@
+{
+  "caseId": "LC-failure-cleanup-after-membership-no-descendant",
+  "terminationReason": "failure-cleanup",
+  "membershipTiming": "after",
+  "descendant": "none",
+  "checks": [
+    {
+      "id": "core-service-was-never-restarted",
+      "invariant": "INV-04",
+      "status": "passed",
+      "detail": "the Core service kept one invocation (378c817ee18b47b0b219e4be1748ff26) and restarted 0 time(s)"
+    },
+    {
+      "id": "module-started-inside-the-validated-core-service",
+      "invariant": "INV-04",
+      "status": "passed",
+      "detail": "the Module was started under a verified Core service binding"
+    },
+    {
+      "id": "declared-core-capabilities-only",
+      "invariant": "INV-05",
+      "status": "passed",
+      "detail": "the Module process record declared core-capabilities-only external effects"
+    },
+    {
+      "id": "no-signal-by-recovered-process-identifier",
+      "invariant": "INV-07",
+      "status": "passed",
+      "detail": "termination addressed the control group; no recovered process identifier was signalled"
+    },
+    {
+      "id": "execution-was-authorized-after-membership-was-verified",
+      "invariant": "INV-01",
+      "status": "passed",
+      "detail": "Core verified control-group membership and then authorized execution"
+    },
+    {
+      "id": "module-group-held-a-descendant",
+      "invariant": "INV-01",
+      "status": "not-evaluable",
+      "detail": "this case runs without a descendant by design"
+    },
+    {
+      "id": "group-termination-proven-by-populated-zero",
+      "invariant": "INV-06",
+      "status": "passed",
+      "detail": "Core performed read-cgroup-events, write-cgroup-kill, read-cgroup-events, read-cgroup-events, remove-cgroup-directory, proved the group empty after cgroup.kill, and removed its directory"
+    },
+    {
+      "id": "no-process-survived-the-group-termination",
+      "invariant": "INV-06",
+      "status": "passed",
+      "detail": "no process remained in the Module control group after termination"
+    },
+    {
+      "id": "module-process-record-reached-stopped",
+      "invariant": "INV-01",
+      "status": "passed",
+      "detail": "the Module process record moved to stopped only after the group was proven empty"
+    },
+    {
+      "id": "hard-timeout-actually-expired",
+      "invariant": "INV-03",
+      "status": "not-evaluable",
+      "detail": "this case terminates for failure-cleanup"
+    },
+    {
+      "id": "replacement-started-only-after-the-old-group-was-proven-empty",
+      "invariant": "INV-06",
+      "status": "not-evaluable",
+      "detail": "this case terminates for failure-cleanup and starts no replacement"
+    },
+    {
+      "id": "never-more-than-one-live-process-generation",
+      "invariant": "INV-01",
+      "status": "passed",
+      "detail": "exactly one Module process generation existed"
+    },
+    {
+      "id": "no-duplicate-output-commit",
+      "invariant": "INV-02",
+      "status": "not-evaluable",
+      "detail": "a live-termination case commits no output Block"
+    },
+    {
+      "id": "no-unknown-outcome-retried",
+      "invariant": "INV-03",
+      "status": "not-evaluable",
+      "detail": "no Extension outcome was pending at termination"
+    },
+    {
+      "id": "declared-environment-observed",
+      "invariant": "INV-09",
+      "status": "not-evaluable",
+      "detail": "the Extension environment is compared in the fixed interruption matrix; this case terminates the Module before any result"
+    },
+    {
+      "id": "limit-bypasses",
+      "invariant": "INV-10",
+      "status": "not-evaluable",
+      "detail": "control-group limits are evaluated by the resource-limits group"
+    },
+    {
+      "id": "unreconciled-references-or-leases",
+      "invariant": "INV-11",
+      "status": "not-evaluable",
+      "detail": "this case opens no Claim, so it holds no strong reference or access lease"
+    },
+    {
+      "id": "no-residue",
+      "invariant": "INV-12",
+      "status": "passed",
+      "detail": "this case left no unit, process, or control group behind"
+    }
+  ],
+  "passed": 10,
+  "failed": 0,
+  "notEvaluable": 8
+}

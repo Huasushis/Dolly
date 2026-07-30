@@ -1,0 +1,83 @@
+{
+  "caseId": "LC-orderly-stop-before-membership-no-descendant",
+  "terminationReason": "orderly-stop",
+  "membershipTiming": "before",
+  "descendant": "none",
+  "checks": [
+    {
+      "id": "core-service-was-never-restarted",
+      "invariant": "INV-04",
+      "status": "passed",
+      "detail": "the Core service kept one invocation (816910ede69a455583ad92b0ccc156d2) and restarted 0 time(s)"
+    },
+    {
+      "id": "module-started-inside-the-validated-core-service",
+      "invariant": "INV-04",
+      "status": "passed",
+      "detail": "the Module was started under a verified Core service binding"
+    },
+    {
+      "id": "declared-core-capabilities-only",
+      "invariant": "INV-05",
+      "status": "passed",
+      "detail": "the Module process record declared core-capabilities-only external effects"
+    },
+    {
+      "id": "no-signal-by-recovered-process-identifier",
+      "invariant": "INV-07",
+      "status": "passed",
+      "detail": "termination addressed the control group; no recovered process identifier was signalled"
+    },
+    {
+      "id": "execution-was-never-authorized",
+      "invariant": "INV-01",
+      "status": "passed",
+      "detail": "Core stopped the start before authorizing execution (MODULE_PROCESS_STOP_REQUESTED)"
+    },
+    {
+      "id": "stop-was-requested-before-controller-configuration",
+      "invariant": "INV-01",
+      "status": "passed",
+      "detail": "the stop was requested before the controller began configuration and membership verification"
+    },
+    {
+      "id": "no-member-was-observed-at-the-stop-check",
+      "invariant": "INV-01",
+      "status": "passed",
+      "detail": "kernel files showed no member and populated 0 when the early stop was requested"
+    },
+    {
+      "id": "launcher-exit-was-observed",
+      "invariant": "INV-01",
+      "status": "passed",
+      "detail": "the launcher's exit through its control descriptor was observed ({\"code\":11,\"signal\":null}), so Core did not have to exit"
+    },
+    {
+      "id": "no-process-remains-in-the-module-group",
+      "invariant": "INV-01",
+      "status": "passed",
+      "detail": "the Module control group holds no process after the pre-membership stop"
+    },
+    {
+      "id": "the-group-was-removed-after-launcher-exit",
+      "invariant": "INV-06",
+      "status": "passed",
+      "detail": "Core performed read-cgroup-events, read-cgroup-events, remove-cgroup-directory, removed the Module control group without cgroup.kill, and persisted stopped"
+    },
+    {
+      "id": "generic-termination-was-refused-without-observed-membership",
+      "invariant": "INV-06",
+      "status": "passed",
+      "detail": "generic termination refused to claim whole-group termination without observed membership (MODULE_CGROUP_MEMBERSHIP_UNOBSERVED)"
+    },
+    {
+      "id": "no-residue",
+      "invariant": "INV-12",
+      "status": "passed",
+      "detail": "this case left no unit, process, or control group behind"
+    }
+  ],
+  "passed": 12,
+  "failed": 0,
+  "notEvaluable": 0
+}

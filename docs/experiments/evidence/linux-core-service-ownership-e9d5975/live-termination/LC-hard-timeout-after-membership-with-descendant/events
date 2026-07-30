@@ -1,0 +1,11 @@
+2026-07-30T18:13:21.024Z starting dolly-test-20260730T180705Z-228-hard-timeout-after-membership-with-descendant.service reason=hard-timeout membership=after descendant=forked
+2026-07-30T18:13:21.063Z unit started invocation=a35ac8f00b1f41b8a160667bc980b6fc cgroup=/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-20260730T180705Z-228-hard-timeout-after-membership-with-descendant.service mainpid=44711
+2026-07-30T18:13:23.512Z stand-in reported; invocation=a35ac8f00b1f41b8a160667bc980b6fc restarts=0
+2026-07-30T18:13:21.315Z 0001 service-binding-verified a35ac8f00b1f41b8a160667bc980b6fc
+2026-07-30T18:13:21.361Z 0002 recovery-complete live-termination
+2026-07-30T18:13:21.452Z 0003 extension-ready pg-ec225918ab004257a4b630b16b7b3c35
+2026-07-30T18:13:21.454Z 0004 descendant-started 44786
+2026-07-30T18:13:23.458Z 0005 hard-timeout-expired true
+2026-07-30T18:13:23.461Z 0006 before-termination pg-ec225918ab004257a4b630b16b7b3c35 members=2 populated=1
+2026-07-30T18:13:23.499Z 0007 after-termination pg-ec225918ab004257a4b630b16b7b3c35 stopped=true populated=null
+2026-07-30T18:13:23.637Z outcome passed core-survived-and-proved-module-cleanup-hard-timeout-after-membership

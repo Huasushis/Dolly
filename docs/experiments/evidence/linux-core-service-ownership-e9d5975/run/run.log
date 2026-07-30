@@ -1,0 +1,20 @@
+2026-07-30T18:07:05Z run 20260730T180705Z-228 mode=full profile=default service-mode=user
+2026-07-30T18:07:05Z artifacts /dolly-artifacts/20260730T180705Z-228
+2026-07-30T18:07:05Z inventory before: 0 item(s) under this run's prefix, 0 belonging to another run
+2026-07-30T18:07:05Z manifest written; 233 case(s) selected
+2026-07-30T18:13:32Z walked 233 case(s); 233 had a handler
+2026-07-30T18:13:35Z inventory after: 0 item(s) belonging to another run were excluded (0 appeared during this run)
+2026-07-30T18:13:35Z cleanup ok=true units=233/0 cgroups=0/0
+experiment            linux-core-service-process-ownership
+run                   20260730T180705Z-228 (mode full, profile default)
+cases                 233
+passed                225
+failed                0
+inconclusive          0
+not applicable        8
+selection             narrowed: 233 of 570 case(s) (by group, arm)
+cleanup ok            true
+residue clean         true
+verdict               pass (every case that must satisfy the strict invariants passed with its artifacts)
+experiment result     pass
+2026-07-30T18:13:35Z summary written to /dolly-artifacts/20260730T180705Z-228/summary.json
