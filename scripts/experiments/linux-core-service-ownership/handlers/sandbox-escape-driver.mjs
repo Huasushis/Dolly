@@ -249,7 +249,7 @@ await runDriver(async () => {
     if (outcome.outcome !== "executing") {
       throw new Error(`the launcher was not authorized to execute: ${outcome.code}`);
     }
-    cgroup.recordVerifiedMembership(outcome.verifiedProcessIds);
+    cgroup.recordObservedProcessIds(outcome.verifiedProcessIds);
     const diagnostics = collectStream(started.child.stderr, 8192);
     const reader = createJsonLineReader(started.child.stdout);
     report = await reader.next(40_000);

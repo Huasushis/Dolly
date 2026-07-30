@@ -184,39 +184,51 @@ the Extension retains no Core management descriptor. The launcher accepts only
 a Core-validated descriptor through that protected control descriptor; it
 accepts no Extension-controlled path or command input.
 
-Before Core has verified membership, it asks the launcher to exit through that
-protected descriptor and waits for its observed exit. It does not send a signal
-using a PID alone. If that exit cannot be proven in the bounded pre-membership
-phase, Core exits unsuccessfully and lets the Core service's systemd cleanup
-remove the whole service cgroup; it does not start a replacement or attempt a
-PID-based cleanup. After membership is verified, every hard timeout, orderly
-stop, failure cleanup, and replacement terminates the whole Module cgroup with
-`cgroup.kill` or an equivalent group operation. Core may report termination,
-close a process record, release or classify a Claim, or start a replacement only
-after the protocol channel is closed, `cgroup.events` reports `populated 0`, and
-every applicable capability handler has reached a terminal state. A direct
-child-process handle or a child exit event is never sufficient proof after
-cgroup membership.
+Before Core has observed any member in the Module cgroup, and while the
+`execute` command is known not to have begun delivery, it asks the launcher to
+exit through the protected descriptor and waits for its observed exit. It does
+not send a signal using a process identifier alone. Core then reads
+`cgroup.events` again and removes the prepared cgroup directory. The process
+record may become `stopped` only after the fresh reading reports `populated 0`
+and directory removal succeeds. If the fresh reading finds a member, Core
+instead terminates the whole Module cgroup. If launcher exit cannot be proven,
+or delivery of `execute` may have begun, Core exits unsuccessfully and lets the
+Core service's systemd cleanup remove the whole service cgroup; it does not
+start a replacement or attempt process-identifier-based cleanup.
 
-`populated 0` carries two different facts, and reading evidence about this
-decision requires telling them apart. Read after an interruption that happened
-before the launcher joined, it says that nothing of this process generation
-ever ran. Read after termination of a running Module, it says that what ran has
-stopped. Both satisfy the rule above, so both are correct outcomes; but only
-the second one demonstrates whole-group termination, because in the first case
-there was nothing in the group to terminate. Measurement confirms the two
-states are indistinguishable from outside: with the group prepared and its
-limits written, but before membership, the kernel reports the same empty
-members list and the same `populated 0` as it does before the launcher is
-started at all.
+Once a kernel file has shown any member in the Module cgroup, every hard
+timeout, orderly stop, failure cleanup, and replacement terminates the whole
+Module cgroup with `cgroup.kill` or an equivalent group operation. This remains
+required when the observed list fails exact launcher-only verification and
+execution is refused. If that list does not contain the launcher and launcher
+exit is also unconfirmed, Core attempts the group cleanup and still exits so
+systemd removes any launcher outside that group. Core may report termination,
+close a process record, release or classify a Claim, or start a replacement
+only after the applicable protocol channel is closed, `cgroup.events` reports
+`populated 0`, the Module cgroup directory is removed, and every applicable
+capability handler has reached a terminal state. A direct child-process handle
+or a child exit event is never sufficient proof after any cgroup member has
+been observed.
 
-That first phase is also one window rather than a sequence of observable steps.
-The shipped controller configures the launcher, waits for it to report itself
-in the cgroup, verifies membership from the kernel, and authorizes `exec` in
-one call, so no interruption can be placed between those sub-steps. This is a
-property of the implementation, not a limit of any experiment, and evidence
-about that phase must not be read as though the sub-steps were separately
-observed.
+`populated 0` carries different facts in these two paths, and evidence about
+this decision must distinguish them. After execution was withheld and launcher
+exit was observed, a fresh reading says that the group is empty at that moment;
+successful directory removal then makes that current-state check enforceable.
+It does not prove that no process briefly joined earlier. After `cgroup.kill`
+of a group whose membership was observed, the same reading proves whole-group
+termination. Measurement confirms why the reading alone is insufficient: with
+the group prepared and its limits written, but before any observed membership,
+the kernel reports the same empty members list and the same `populated 0` as it
+does before the launcher is started at all.
+
+The shipped controller performs configuration, the launcher's in-cgroup
+report, kernel membership verification, and execution authorization in one
+operation, but it evaluates the stop request again immediately before sending
+`execute`. A test can hold the kernel membership read, request termination,
+and prove that no execution command is sent. The current live-Core experiment's
+earliest stop callback runs before this controller operation begins, so that
+experiment does not by itself cover termination during membership reading or
+an uncertain `execute` send; those require separate cases.
 
 `none` isolation is forbidden for an executable Module. Ordinary `process`
 isolation is not, by itself, enough to meet this decision, even for code that an
@@ -288,11 +300,10 @@ Individual implementations therefore exist, but that is not an assembled
 runtime. The executor still receives a no-argument protocol-session factory
 from its caller, and no startup caller connects the same started launcher and
 verified Module control group to `attachLinuxModuleProcess`. The assembly has
-never been run end to end. The obligations only a Linux kernel can settle also
-remain unobserved: that whole-group termination reaches a descendant which left
-the process group, and that the launcher's standard streams really carry the
-Extension protocol after `exec`. Tests for both exist and have never been
-executed.
+never been run end to end. Focused Linux tests now show that whole-group
+termination reaches a descendant which left the process group and that the
+launcher's standard streams carry the Extension protocol after `exec`; those
+results do not replace the missing end-to-end runtime assembly.
 
 These three shared one shape with each other and with the transport seam that
 preceded them: a written interface, a comment asserting an implementation
@@ -500,9 +511,12 @@ Before this ADR can become `Accepted`, Linux tests must cover at least:
    delegated Module cgroup, descendants, a CPU loop, and active capability
    handlers, proving old cgroup cleanup before the next Core recovery;
 3. ordinary hard timeout, orderly stop, failure cleanup, and replacement while
-   Core remains alive, before and after launcher membership and before and after
-   an Extension forks a descendant; each must prove cgroup-level termination and
-   `populated 0`, not merely disappearance of the direct child;
+   Core remains alive, before and after a cgroup member is observed and before
+   and after an Extension forks a descendant; an observed member requires
+   `cgroup.kill`, `populated 0`, and directory removal, while the earlier path
+   requires an observed launcher exit, a fresh `populated 0` reading, and
+   directory removal without claiming whole-group termination; uncertain
+   launcher exit or `execute` delivery must force a nonzero Core exit;
 4. service-manager restart in a disposable environment, login termination with
    and without lingering, and machine reboot recovery, including a same-boot
    missing old cgroup path and a changed boot identifier;

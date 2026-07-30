@@ -11,7 +11,6 @@
 //   1  at least one failed
 //   2  the evaluation could not be performed
 //   3  the case is structurally impossible, proven from this run's evidence
-//   4  the case definition and the shipped pre-membership design disagree
 
 import { readFileSync, writeFileSync } from "node:fs";
 
@@ -19,27 +18,24 @@ import { readFileSync, writeFileSync } from "node:fs";
  * What a `before membership` case is required to prove.
  *
  * Catalogue version 1 asked all sixteen cases for "control-group-level
- * termination proven by populated 0". The shipped design refuses to give that
- * for the pre-membership phase on purpose: `ModuleCgroup.terminate` returns
- * `MODULE_CGROUP_MEMBERSHIP_UNOBSERVED` for a group whose membership was never
- * observed, because an empty reading there would only repeat the state the
- * group had before anything joined. ADR 0009 directs that phase to the
- * launcher's control descriptor instead.
+ * termination proven by populated 0". That is the wrong proof before any
+ * member is observed: a plain empty reading repeats the group's initial state.
+ * The product instead observes launcher exit, reads the current empty state
+ * again, and removes the directory without writing `cgroup.kill`.
  *
  * That disagreement was adjudicated by revising the catalogue, not this file:
  * a criterion the person running the cases can rewrite when the cases fail is
- * not a pre-registered criterion. Catalogue version 2 splits the requirement by
- * phase and, for this phase, requires the launcher-control-descriptor path
- * *and* that a `populated 0` proof was refused rather than reported.
+ * not a pre-registered criterion. Catalogue version 2 split the requirement by
+ * phase. Catalogue version 5 additionally requires direct evidence that the
+ * product removed the case's directory before this report was written.
  *
- * The second half is a strengthening, not a relaxation. It makes the refusal
- * itself an invariant under test: if a later change let this phase report
- * `populated 0`, these cases go red.
+ * A separate fresh group verifies that generic `terminate()` still refuses to
+ * call a plain empty reading whole-group termination proof. That check does not
+ * replace the case's launcher-exit, empty-state, and directory-removal proof.
  *
- * Results produced under catalogue version 1 used the superseded single
- * criterion and MUST NOT be merged with these.
+ * Results produced under older catalogue versions MUST NOT be reinterpreted
+ * with this evaluator.
  */
-const PRE_MEMBERSHIP_POLICY = "launcher-control-descriptor";
 
 function parseArguments(argv) {
   const options = {};
@@ -106,7 +102,6 @@ function finish(code) {
           terminationReason: reason,
           membershipTiming: membership,
           descendant: options.descendant,
-          preMembershipPolicy: PRE_MEMBERSHIP_POLICY,
           checks,
           passed: passed.length,
           failed: failed.length,
@@ -199,27 +194,41 @@ if (membership === "before") {
   );
 
   // The trace is written before each step proceeds, so it is the run's own
-  // ordered record. `pre-membership-stop-requested` can only have been appended
-  // from inside the shipped `stopRequested` seam, which runs after the launcher
-  // joined the group and before Core verified it.
-  const reachedSeam = trace.some((line) => line.includes("pre-membership-stop-requested"));
+  // ordered record. The lifecycle invokes this callback before the product
+  // controller starts configuration and membership verification.
+  const reachedStopCheck = trace.some((line) =>
+    line.includes("pre-membership-stop-requested"),
+  );
   decide(
-    "stop-was-requested-at-the-pre-membership-seam",
+    "stop-was-requested-before-controller-configuration",
     "INV-01",
-    reachedSeam,
-    "the stop was requested after the launcher joined the group and before Core verified membership",
-    "the run never reached the pre-membership stop seam",
+    reachedStopCheck,
+    "the stop was requested before the controller began configuration and membership verification",
+    "the run never reached the stop check before controller configuration",
+  );
+
+  const stateAtStopCheck = first.preMembership ?? {};
+  decide(
+    "no-member-was-observed-at-the-stop-check",
+    "INV-01",
+    Array.isArray(stateAtStopCheck.members) &&
+      stateAtStopCheck.members.length === 0 &&
+      stateAtStopCheck.populated === "0",
+    "kernel files showed no member and populated 0 when the early stop was requested",
+    `the early stop observed ${String(stateAtStopCheck.members?.length)} member(s) and populated ${String(
+      stateAtStopCheck.populated,
+    )}`,
   );
 
   if (wantsDescendant) {
     // Structural impossibility, established from this run rather than asserted
     // from the case name: the Extension only exists after `exec`, and `exec` is
     // authorized only after membership is verified.
-    if (!authorized && reachedSeam && first.descendantStarted === false) {
+    if (!authorized && reachedStopCheck && first.descendantStarted === false) {
       skip(
         "descendant-before-membership",
         "INV-01",
-        "the Extension is executed only after membership is verified, so it cannot fork a descendant before that point; this run reached the pre-membership seam with execution never authorized and no descendant started",
+        "the Extension is executed only after membership is verified, so it cannot fork a descendant before that point; this run reached the early stop check with execution never authorized and no descendant started",
       );
       finish(3);
     }
@@ -234,8 +243,10 @@ if (membership === "before") {
   decide(
     "launcher-exit-was-observed",
     "INV-01",
-    first.startFailure?.coreMustExit === false,
-    "the launcher's exit through its control descriptor was observed, so Core did not have to exit",
+    first.startFailure?.coreMustExit === false && first.launcherExit !== null,
+    `the launcher's exit through its control descriptor was observed (${JSON.stringify(
+      first.launcherExit,
+    )}), so Core did not have to exit`,
     "the launcher's exit could not be observed, so ADR 0009 requires Core to exit and let the service cleanup remove the group",
   );
 
@@ -247,54 +258,54 @@ if (membership === "before") {
     `${(first.membersAfterStop ?? []).length} process(es) remain in the Module control group`,
   );
 
-  if (PRE_MEMBERSHIP_POLICY === "report-disagreement") {
-    skip(
-      "group-termination-proven-by-populated-zero",
-      "INV-06",
-      `the case requires a "populated 0" proof, and the shipped pre-membership path deliberately does not produce one (${String(
-        first.groupTerminationSkippedBecause,
-      )}); this disagreement is reported rather than resolved here`,
-    );
-    decide(
-      "no-residue",
-      "INV-12",
-      options.residue === "0",
-      "this case left no unit, process, or control group behind",
-      "this case left a unit, process, or control group behind",
-    );
-    finish(4);
-  }
-
-  // Catalogue version 2, first half: this phase never performs a group
-  // termination, so nothing may be left behind by one either.
+  // This phase does not write cgroup.kill. It must instead observe launcher
+  // exit, read the current empty state again, remove the directory, and only
+  // then persist `stopped`.
+  const cgroupOperations = Array.isArray(first.cgroupOperations)
+    ? first.cgroupOperations
+    : [];
+  const emptyStateRead = cgroupOperations.lastIndexOf("read-cgroup-events");
+  const directoryRemoval = cgroupOperations.lastIndexOf(
+    "remove-cgroup-directory",
+  );
   decide(
-    "the-group-was-removed-without-a-group-termination",
+    "the-group-was-removed-after-launcher-exit",
     "INV-06",
     first.groupTerminationAttempted === false &&
-      (first.populatedAfterStop === "0" || first.populatedAfterStop === null),
-    "the launcher-control-descriptor path stopped the launcher and left no process in the group",
-    `the Module control group still reported populated ${String(first.populatedAfterStop)}`,
+      !cgroupOperations.includes("write-cgroup-kill") &&
+      emptyStateRead >= 0 &&
+      directoryRemoval > emptyStateRead &&
+      first.groupDirectoryPresentAfterStop === false &&
+      first.populatedAfterStop === null &&
+      first.recordState === "stopped",
+    `Core performed ${cgroupOperations.join(", ")}, removed the Module control group without cgroup.kill, and persisted stopped`,
+    `cleanup operations=${JSON.stringify(cgroupOperations)}, directoryPresent=${String(
+      first.groupDirectoryPresentAfterStop,
+    )}, populated=${String(first.populatedAfterStop)}, recordState=${String(
+      first.recordState,
+    )}, groupTerminationAttempted=${String(first.groupTerminationAttempted)}`,
   );
 
-  // Catalogue version 2, second half, and the reason this revision is a
-  // strengthening: the refusal is asked for and must happen. The stand-in
-  // reopens the group and asks the shipped code to prove it empty; a group
-  // never observed to hold a process must answer
-  // MODULE_CGROUP_MEMBERSHIP_UNOBSERVED. A run in which that proof succeeded
-  // is a failure of this case even though nothing crashed.
-  const probe = first.populatedZeroRefusalProbe ?? {};
+  // A different, fresh group verifies that generic termination does not call
+  // a plain empty reading whole-group termination proof.
+  const genericTermination =
+    first.genericTerminationWithoutObservedMembership ?? {};
   decide(
-    "a-populated-zero-proof-was-refused-for-this-phase",
+    "generic-termination-was-refused-without-observed-membership",
     "INV-06",
-    probe.ran === true &&
-      probe.refused === true &&
-      probe.code === "MODULE_CGROUP_MEMBERSHIP_UNOBSERVED",
-    `the shipped code refused to prove this group empty before membership was observed (${String(probe.code)})`,
-    probe.ran === true
-      ? `the shipped code did not refuse a populated 0 proof for the pre-membership phase (${String(
-          probe.code ?? probe.evidence,
-        )}: ${String(probe.detail)})`
-      : `the refusal could not be tested: ${String(probe.reason)}`,
+    genericTermination.ran === true &&
+      genericTermination.refused === true &&
+      genericTermination.code === "MODULE_CGROUP_MEMBERSHIP_UNOBSERVED",
+    `generic termination refused to claim whole-group termination without observed membership (${String(
+      genericTermination.code,
+    )})`,
+    genericTermination.ran === true
+      ? `generic termination did not refuse the empty group (${String(
+          genericTermination.code ?? genericTermination.evidence,
+        )}: ${String(genericTermination.detail)})`
+      : `the independent generic termination check could not run: ${String(
+          genericTermination.reason,
+        )}`,
   );
 
   decide(
@@ -350,12 +361,32 @@ if (wantsDescendant) {
 }
 
 const outcome = first.terminationOutcome ?? {};
+const postMembershipCgroupOperations = Array.isArray(first.cgroupOperations)
+  ? first.cgroupOperations
+  : [];
+const cgroupKill = postMembershipCgroupOperations.indexOf("write-cgroup-kill");
+const emptyStateAfterKill = postMembershipCgroupOperations.lastIndexOf(
+  "read-cgroup-events",
+);
+const postMembershipDirectoryRemoval = postMembershipCgroupOperations.lastIndexOf(
+  "remove-cgroup-directory",
+);
 decide(
   "group-termination-proven-by-populated-zero",
   "INV-06",
-  outcome.terminated === true,
-  "the Module control group was terminated and proven empty by cgroup.events reporting populated 0",
-  `the Module control group was not proven empty (${String(outcome.code)}: ${String(outcome.detail)})`,
+  outcome.terminated === true &&
+    first.groupTerminationAttempted === true &&
+    cgroupKill >= 0 &&
+    emptyStateAfterKill > cgroupKill &&
+    postMembershipDirectoryRemoval > emptyStateAfterKill &&
+    first.groupDirectoryPresentAfterTermination === false &&
+    first.populatedAfterTermination === null,
+  `Core performed ${postMembershipCgroupOperations.join(", ")}, proved the group empty after cgroup.kill, and removed its directory`,
+  `termination outcome=${JSON.stringify(outcome)}, operations=${JSON.stringify(
+    postMembershipCgroupOperations,
+  )}, directoryPresent=${String(
+    first.groupDirectoryPresentAfterTermination,
+  )}, populated=${String(first.populatedAfterTermination)}`,
 );
 
 decide(

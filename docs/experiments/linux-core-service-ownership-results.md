@@ -448,17 +448,17 @@ assembly gaps must be treated as unknown until it runs.
   prepared and the launcher does not yet exist. Both cases run and both pass, but they collapse to
   one interruption point. The retained observations show it directly — at both barriers the Module
   control group exists with its limits and reports `members` empty, `populated 0`.
-- **Boundary 4 is one wide window, not a sequence of observable steps.** The shipped launcher
-  controller performs `configure`, waits for the launcher's in-cgroup report, verifies kernel
-  membership, and sends `execute` inside a single `authorizeExecution` call, so an interruption
-  cannot be placed between those sub-steps. The observations bracket it: at `M04-before` the group
-  is present and `populated 0`; at `M04-after` it holds the executing Extension and is
-  `populated 1`.
+- **Boundary 4 was one wide window in the retained run.** That instrument did not expose a stop
+  between `configure`, the launcher's in-cgroup report, the kernel membership read, and `execute`.
+  The current controller now checks a stop request again immediately before sending `execute`, and
+  focused tests can hold the membership read to exercise that ordering. The retained observations
+  still bracket only the older window: at `M04-before` the group is present and `populated 0`; at
+  `M04-after` it holds the executing Extension and is `populated 1`.
 - **A pass at `M03-after` or `M04-before` is not evidence about stopping a running Module.** At
-  those points the control group was never populated, so recovery's `populated 0` proof establishes
-  that nothing of that generation ever ran, rather than that something which ran has stopped. Both
-  satisfy what ADR 0009 requires before a replacement may start, but they are different facts and
-  only the later boundaries demonstrate the second one.
+  those points the retained run observed no control-group member and never authorized the
+  Extension. Its `populated 0` reading showed only the group's current empty state; it did not prove
+  that no process had briefly joined. Only later boundaries demonstrate whole-group termination
+  after observed membership.
 - **`M12` fires on the first output Delivery append only.** The `multiple-output-pages` workload
   performs three. This is a determinism trade-off, made once and recorded here.
 - **The `process-descendant` workload has no descendant before boundary 9.** The protocol asks for

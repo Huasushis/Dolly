@@ -65,6 +65,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
+  existsSync,
   fsyncSync,
   mkdirSync,
   openSync,
@@ -333,7 +334,16 @@ function buildCommitCoordinator(
  */
 function instrument<T extends object>(
   target: T,
-  hooks: Readonly<Record<string, { before?: () => void; after?: () => void; once?: boolean }>>,
+  hooks: Readonly<
+    Record<
+      string,
+      {
+        before?: (...arguments_: readonly unknown[]) => void;
+        after?: () => void;
+        once?: boolean;
+      }
+    >
+  >,
 ): T {
   const fired = new Set<string>();
   return new Proxy(target, {
@@ -347,7 +357,7 @@ function instrument<T extends object>(
         const skip = hook.once === true && fired.has(name);
         if (!skip) {
           fired.add(name);
-          hook.before?.();
+          hook.before?.(...args);
         }
         const result = (value as (...values: unknown[]) => unknown).apply(object, args);
         if (!skip) hook.after?.();
@@ -565,7 +575,7 @@ async function runWorkload(
       environment: declaredEnvironment,
     },
   });
-  if (!started.started) {
+  if (!started.executionAuthorized) {
     return {
       phase: "module-start-failed",
       failure: started.failure,
@@ -739,6 +749,7 @@ async function runWorkload(
   }
 
   await awaitFrame("ready", 30_000);
+  records.updateModuleProcessRecordState(processGenerationId, "running");
   at("M04", "after", String(started.record.processGenerationId));
 
   // --- Boundary 5: Delivery Claim persistence.
@@ -1163,10 +1174,40 @@ async function runLiveTermination(
       );
     }
 
+    // This ordered list records only operations aimed at this generation's
+    // derived Module cgroup. It lets the evaluator distinguish a real
+    // `cgroup.kill` and empty-state read from a report that merely claims one.
+    const cgroupOperations: string[] = [];
+    const cgroupFileSystem: ModuleCgroupFileSystem = instrument(
+      nodeModuleCgroupFileSystem,
+      {
+        readTextFile: {
+          before: (path) => {
+            if (path === `${derived.filesystemPath}/cgroup.events`) {
+              cgroupOperations.push("read-cgroup-events");
+            }
+          },
+        },
+        writeTextFile: {
+          before: (path) => {
+            if (path === `${derived.filesystemPath}/cgroup.kill`) {
+              cgroupOperations.push("write-cgroup-kill");
+            }
+          },
+        },
+        removeDirectory: {
+          before: (path) => {
+            if (path === derived.filesystemPath) {
+              cgroupOperations.push("remove-cgroup-directory");
+            }
+          },
+        },
+      },
+    );
+
     let launcherHandle: ReturnType<typeof startLinuxModuleLauncher> | undefined;
-    // Filled in at the one moment the launcher is inside the group and Core has
-    // not yet verified it. `stopRequested` is the shipped seam for exactly that
-    // point, so the reading is taken there rather than at a guessed time.
+    // Filled when the lifecycle performs its early stop check, before the
+    // product controller begins configuration and membership verification.
     let preMembership: Record<string, unknown> | null = null;
 
     const startLauncher = async (): Promise<ModuleLauncherControl> => {
@@ -1209,6 +1250,7 @@ async function runLiveTermination(
       identity,
       limits: MODULE_LIMITS,
       maxOpenFiles: MAX_OPEN_FILES,
+      cgroupFileSystem,
       startLauncher,
       execution: {
         program: configuration.interpreterProgram,
@@ -1222,8 +1264,9 @@ async function runLiveTermination(
       },
       stopRequested: () => {
         if (!stopBeforeMembership) return false;
-        // The launcher has joined the group and Core has not verified it. This
-        // is the whole "before membership" moment, read from kernel files.
+        // The lifecycle evaluates this callback before the product controller
+        // begins configuration and membership verification. Record the actual
+        // kernel state instead of claiming the launcher has already joined.
         preMembership = {
           at: now(),
           members: cgroupMembers(derived.filesystemPath),
@@ -1237,34 +1280,28 @@ async function runLiveTermination(
       },
     });
 
-    if (!started.started) {
-      // The shipped pre-membership path stops the launcher through its control
-      // descriptor and never terminates the group.
+    if (!started.executionAuthorized) {
+      // With no observed member, the product lifecycle observes launcher exit,
+      // reads the group's current empty state again, and removes the directory
+      // without writing cgroup.kill.
       //
-      // Catalogue version 2 requires this phase to prove something stronger
-      // than "no `populated 0` was reported": it requires that a `populated 0`
-      // proof was *refused*. So this asks the shipped code for one. A group
-      // that was never observed to hold a process must answer
-      // `MODULE_CGROUP_MEMBERSHIP_UNOBSERVED`, because an empty reading there
-      // would only repeat the state the group had before anything joined.
-      //
-      // The probe is the test of that refusal. If a later change let this
-      // phase report `populated 0`, this call would succeed instead and the
-      // before-membership cases would go red, which is the point of asking.
+      // The independent check below asks the generic termination operation to
+      // terminate a different group in which no member was ever observed. It
+      // must refuse to call a plain empty reading whole-group termination
+      // proof. This is distinct from the case cleanup above, where observed
+      // launcher exit plus successful directory removal supplies the missing
+      // enforcement.
       const record = store
         .listModuleProcessRecords()
         .find((item) => item.processGenerationId === processGenerationId);
       const afterMembers = cgroupMembers(derived.filesystemPath);
-      let refusalProbe: Record<string, unknown> = {
+      let genericTerminationCheck: Record<string, unknown> = {
         ran: false,
-        reason: "the Module control group could not be reopened for the probe",
+        reason: "the independent control group could not be prepared",
       };
       try {
-        // A fresh group, never joined by anything. The case's own group cannot
-        // be reopened for this — `prepareModuleCgroup` answers
-        // `MODULE_CGROUP_PATH_IN_USE`, because non-reuse of a
-        // process-generation path is itself an ADR 0009 rule — and a group that
-        // was never joined is the exact subject of the refusal anyway.
+        // Use a fresh group so this check cannot reuse or change the case's
+        // directory-removal evidence.
         const probeIdentity = {
           instanceId: configuration.instanceId,
           moduleId: configuration.moduleId,
@@ -1277,27 +1314,30 @@ async function runLiveTermination(
         });
         if (probed.prepared) {
           const outcome = await probed.cgroup.terminate({ timeoutMs: 2_000 });
-          refusalProbe = outcome.terminated
+          genericTerminationCheck = outcome.terminated
             ? {
                 ran: true,
                 refused: false,
                 evidence: outcome.evidence,
                 detail:
-                  "the shipped code proved this group empty in the pre-membership phase, which catalogue version 2 requires it to refuse",
+                  "generic termination incorrectly treated a plain empty reading as whole-group termination proof",
               }
             : { ran: true, refused: true, code: outcome.code, detail: outcome.detail };
         } else {
-          refusalProbe = { ran: false, reason: `prepare failed: ${probed.failure.code}` };
+          genericTerminationCheck = {
+            ran: false,
+            reason: `prepare failed: ${probed.failure.code}`,
+          };
         }
       } catch (error) {
-        refusalProbe = {
+        genericTerminationCheck = {
           ran: false,
           reason: error instanceof Error ? error.message : String(error),
         };
       }
       barrier.note(
-        "populated-zero-refusal-probe",
-        `${String(refusalProbe["ran"])} ${String(refusalProbe["code"] ?? refusalProbe["reason"] ?? "")}`,
+        "generic-termination-without-observed-membership",
+        `${String(genericTerminationCheck["ran"])} ${String(genericTerminationCheck["code"] ?? genericTerminationCheck["reason"] ?? "")}`,
       );
       return {
         ordinal,
@@ -1307,12 +1347,17 @@ async function runLiveTermination(
         startFailure: started.failure,
         preMembership,
         executionAuthorized: false,
-        groupTerminationAttempted: false,
+        cgroupOperations,
+        launcherExit: launcherHandle?.exit ?? null,
+        groupTerminationAttempted: cgroupOperations.includes("write-cgroup-kill"),
         groupTerminationSkippedBecause:
-          "the shipped pre-membership path stops the launcher through its control descriptor",
-        populatedZeroRefusalProbe: refusalProbe,
+          started.failure.coreMustExit
+            ? "startup cleanup was unconfirmed and the Core service must exit"
+            : "no member was observed, so cleanup observed launcher exit, read the current empty state, and removed the directory without cgroup.kill",
+        genericTerminationWithoutObservedMembership: genericTerminationCheck,
         membersAfterStop: afterMembers,
         populatedAfterStop: cgroupPopulated(derived.filesystemPath),
+        groupDirectoryPresentAfterStop: existsSync(derived.filesystemPath),
         recordState: record?.state ?? null,
         recordFailureCode: record?.failureCode ?? null,
         descendantRequested: wantsDescendant,
@@ -1351,6 +1396,7 @@ async function runLiveTermination(
       });
 
     await awaitFrame("ready", 30_000);
+    store.updateModuleProcessRecordState(processGenerationId, "running");
     barrier.note("extension-ready", processGenerationId);
 
     await channel.send({
@@ -1436,12 +1482,14 @@ async function runLiveTermination(
       hardTimeoutExpired: timeoutExpired,
       membersBeforeTermination: membersBefore,
       populatedBeforeTermination: populatedBefore,
-      groupTerminationAttempted: true,
+      cgroupOperations,
+      groupTerminationAttempted: cgroupOperations.includes("write-cgroup-kill"),
       terminationOutcome: stopped.stopped
         ? { terminated: true, record: { state: stopped.record.state } }
         : { terminated: false, code: stopped.code, detail: stopped.detail },
       membersAfterTermination: membersAfter,
       populatedAfterTermination: populatedAfter,
+      groupDirectoryPresentAfterTermination: existsSync(derived.filesystemPath),
       recordState: record?.state ?? null,
       recordFailureCode: record?.failureCode ?? null,
     };

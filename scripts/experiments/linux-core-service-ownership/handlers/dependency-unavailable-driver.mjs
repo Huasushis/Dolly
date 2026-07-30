@@ -394,7 +394,7 @@ await runDriver(async () => {
     observations.push(`startModuleProcess: ${JSON.stringify(result)}`);
     observations.push(`derived path ${derived.filesystemPath}`);
 
-    assertions.equal("the start is refused", false, result.started);
+    assertions.equal("the start is refused", false, result.executionAuthorized);
     assertions.equal(
       "the refusal is the record failure",
       "MODULE_PROCESS_RECORD_FAILED",
@@ -455,7 +455,11 @@ await runDriver(async () => {
       const identity = identityFor(suffix);
       const derived = deriveModuleCgroupPath(delegatedRootCgroupPath, identity);
       const records = countingRecords(undefined, undefined);
-      const seen = { authorize: 0, exitRequests: 0 };
+      const seen = {
+        authorizationCalls: 0,
+        confirmedExecutionAuthorizations: 0,
+        exitRequests: 0,
+      };
 
       // Construct a failing control channel: send() always throws.
       const channel = {
@@ -496,8 +500,12 @@ await runDriver(async () => {
           // Track calls through the adapter.
           const originalAuthorize = control.authorizeExecution.bind(control);
           control.authorizeExecution = async (req) => {
-            seen.authorize += 1;
-            return originalAuthorize(req);
+            seen.authorizationCalls += 1;
+            const authorization = await originalAuthorize(req);
+            if (authorization.executionAuthorized) {
+              seen.confirmedExecutionAuthorizations += 1;
+            }
+            return authorization;
           };
           const originalExit = control.requestExit.bind(control);
           control.requestExit = async () => {
@@ -519,7 +527,11 @@ await runDriver(async () => {
 
     const unobserved = await runOnce("sc1305a", false);
     observations.push(`exit not observed: ${JSON.stringify(unobserved.result)}`);
-    assertions.equal("the start is refused", false, unobserved.result.started);
+    assertions.equal(
+      "the start is refused",
+      false,
+      unobserved.result.executionAuthorized,
+    );
     assertions.equal(
       "the refusal is a launcher control send failure",
       "MODULE_PROCESS_LAUNCHER_FAILED",
@@ -527,7 +539,16 @@ await runDriver(async () => {
     );
     // The step that must never have happened: the Extension was never
     // authorized to replace the launcher.
-    assertions.equal("no execution was authorized", 0, unobserved.seen.authorize);
+    assertions.equal(
+      "the authorization path was exercised",
+      1,
+      unobserved.seen.authorizationCalls,
+    );
+    assertions.equal(
+      "no execution was authorized",
+      0,
+      unobserved.seen.confirmedExecutionAuthorizations,
+    );
     assertions.equal("the launcher was asked to exit", 1, unobserved.seen.exitRequests);
     assertions.equal(
       "Core is required to exit when the launcher's exit is unproven",
@@ -540,7 +561,11 @@ await runDriver(async () => {
     // escalation above could be a constant rather than a decision.
     const observed = await runOnce("sc1305b", true);
     observations.push(`exit observed: ${JSON.stringify(observed.result)}`);
-    assertions.equal("the control start is also refused", false, observed.result.started);
+    assertions.equal(
+      "the control start is also refused",
+      false,
+      observed.result.executionAuthorized,
+    );
     assertions.equal(
       "Core is not required to exit when the launcher's exit is proven",
       false,
@@ -738,7 +763,7 @@ await runDriver(async () => {
       // Deterministic membership: the launcher controller verified kernel
       // membership from `cgroup.procs` before authorizing the fixture, so this
       // records that proof rather than waiting on a reading that may be held.
-      cgroup.recordVerifiedMembership([1]);
+      cgroup.recordObservedProcessIds([1]);
 
       const states = [];
       let currentRecord = {

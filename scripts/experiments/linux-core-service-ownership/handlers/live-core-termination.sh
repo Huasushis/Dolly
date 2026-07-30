@@ -4,11 +4,13 @@
 # The fixed interruption matrix kills Core and asks what the restarted Core
 # reconciles. This group asks the opposite question: Core is never interrupted,
 # and what is terminated is one Module. ADR 0009 requires every such
-# termination — an ordinary hard timeout, an orderly stop, failure cleanup, and
-# starting a replacement generation — to go through whole-control-group
-# termination and to be proven by `cgroup.events` reporting `populated 0`. A
-# direct child exit, a process-group signal, or a recovered process identifier
-# is never that proof.
+# termination. Once a Module cgroup member is observed, an ordinary hard
+# timeout, orderly stop, failure cleanup, and replacement use whole-control-
+# group termination, `cgroup.events` reporting `populated 0`, and directory
+# removal. Before any member is observed, cleanup instead requires observed
+# launcher exit, a fresh empty-state reading, and directory removal. A direct
+# child exit, a process-group signal, or a recovered process identifier is
+# never sufficient after membership was observed.
 #
 # The case that makes the difference observable is the one with a descendant.
 # The fixture starts it with `start_new_session`, so it leaves the Extension's
@@ -349,13 +351,12 @@ evaluation_exit=$?
 rm -rf "${WORK_DIR}"
 
 case "${evaluation_exit}" in
-  0) finish passed "core-survived-and-proved-group-termination-${REASON}-${MEMBERSHIP}-membership" ;;
+  0) finish passed "core-survived-and-proved-module-cleanup-${REASON}-${MEMBERSHIP}-membership" ;;
   1) finish failed "invariant-violated-${REASON}-${MEMBERSHIP}-membership" ;;
   # The Extension is executed only after Core verifies control-group membership,
   # so it cannot have forked a descendant before that point. The evaluator
   # reports this only after confirming from the run's own trace that execution
   # was never authorized; it is never asserted from the case name alone.
   3) finish not-applicable "extension-cannot-fork-a-descendant-before-execution-is-authorized" ;;
-  4) finish inconclusive "pre-membership-populated-zero-conflicts-with-adr-0009-design" ;;
   *) finish inconclusive invariant-evaluation-did-not-complete ;;
 esac

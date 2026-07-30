@@ -105,7 +105,7 @@ await runDriver(async () => {
       });
       observations.push(`launcher outcome ${JSON.stringify(outcome)}`);
       assertions.equal("launcher authorized to execute", "executing", outcome.outcome);
-      cgroup.recordVerifiedMembership(outcome.verifiedProcessIds);
+      cgroup.recordObservedProcessIds(outcome.verifiedProcessIds);
 
       const reader = createJsonLineReader(started.child.stdout);
       const report = await reader.next(15_000);
@@ -151,7 +151,7 @@ await runDriver(async () => {
         fixture: fixturePath("fixture-pids.py"),
       });
       assertions.equal("launcher authorized to execute", "executing", outcome.outcome);
-      cgroup.recordVerifiedMembership(outcome.verifiedProcessIds);
+      cgroup.recordObservedProcessIds(outcome.verifiedProcessIds);
 
       const reader = createJsonLineReader(started.child.stdout);
       const report = await reader.next(20_000);
@@ -188,7 +188,7 @@ await runDriver(async () => {
         fixture: fixturePath("fixture-cpu.py"),
       });
       assertions.equal("launcher authorized to execute", "executing", outcome.outcome);
-      cgroup.recordVerifiedMembership(outcome.verifiedProcessIds);
+      cgroup.recordObservedProcessIds(outcome.verifiedProcessIds);
 
       const reader = createJsonLineReader(started.child.stdout);
       const start = await reader.next(15_000);
@@ -238,7 +238,7 @@ await runDriver(async () => {
         additionalInheritedStdio: ["pipe"],
       });
       assertions.equal("launcher authorized to execute", "executing", outcome.outcome);
-      cgroup.recordVerifiedMembership(outcome.verifiedProcessIds);
+      cgroup.recordObservedProcessIds(outcome.verifiedProcessIds);
 
       const reader = createJsonLineReader(started.child.stdout);
       const report = await reader.next(20_000);
@@ -272,7 +272,7 @@ await runDriver(async () => {
         protocolStdio: ["pipe", "pipe", "pipe"],
       });
       assertions.equal("launcher authorized to execute", "executing", outcome.outcome);
-      cgroup.recordVerifiedMembership(outcome.verifiedProcessIds);
+      cgroup.recordObservedProcessIds(outcome.verifiedProcessIds);
 
       const received = [];
       let firstError;
@@ -419,7 +419,7 @@ await runDriver(async () => {
         fixture: fixturePath("fixture-hang.py"),
       });
       assertions.equal("launcher authorized to execute", "executing", outcome.outcome);
-      cgroup.recordVerifiedMembership(outcome.verifiedProcessIds);
+      cgroup.recordObservedProcessIds(outcome.verifiedProcessIds);
 
       const reader = createJsonLineReader(started.child.stdout);
       const report = await reader.next(15_000);

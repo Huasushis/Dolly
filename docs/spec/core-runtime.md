@@ -980,14 +980,20 @@ authority to send, so the record has no separate authorization flag.
 
 The process-record lifecycle is:
 
-- `starting`: the record is durable, but the child launcher may or may not
-  have been created; Extension code has not been authorized to execute.
+- `starting`: the record is durable, but process startup and authenticated
+  initialization are not complete. The child launcher may or may not have
+  been created, and execution authorization may already have been delivered.
+  Execution authorization is Core's permission for the launcher to execute the
+  Extension, carried by the launcher protocol's `execute` command. A failed
+  start result may still mean that delivery of this command is unknown.
 - `running`: Core verified the launcher's cgroup membership from kernel files
   and the Extension completed authenticated initialization.
 - `stopping`: stop intent is persisted before group termination begins.
 - `stopped`: recorded only after the ADR 0009 empty-cgroup proof
   (`populated 0`, the qualified missing-path rule, or a changed boot
-  identifier plus fresh service verification).
+  identifier plus fresh service verification). Before execution authorization,
+  an observed launcher exit followed by a fresh `populated 0` reading and
+  successful removal of the prepared cgroup directory is also sufficient.
 
 Every transition is part of a Core-state update. A submission record may be
 written only while its process record is `running`. A `stopped` process record
@@ -1469,14 +1475,22 @@ It MUST NOT overlap the timed-out run with a new run.
 For the proposed Linux Module runner, the preceding portable `terminate()`
 promise is not the production termination proof. Initialization, hard timeout,
 orderly stop, protocol failure, and replacement use the ADR 0009 Linux execution
-backend. After launcher membership is verified, that backend terminates the
+backend. Once a kernel file has shown any member, that backend terminates the
 entire Module cgroup and Core waits for the protocol channel to close,
-`cgroup.events` to report `populated 0`, and applicable capability handlers to
-reach a terminal state. A direct child exit, a process identifier, or a Node.js
-child-process handle does not permit generation fencing, Claim disposition, or
-replacement. Before membership is verified, Core uses the reviewed launcher's
-protected control channel; if it cannot prove launcher exit, Core exits and lets
-the Core service cleanup perform the only safe group termination.
+`cgroup.events` to report `populated 0`, directory removal, and applicable
+capability handlers to reach a terminal state. Exact launcher-only membership
+remains a prerequisite for sending `execute`, but a failed exact check does not
+erase the observed member or the whole-group termination duty. A direct child
+exit, a process identifier, or a Node.js child-process handle does not permit
+generation fencing, Claim disposition, or replacement.
+
+Before any member is observed, Core may complete cleanup only when execution
+authorization is known not to have begun delivery, the reviewed launcher's
+exit is observed through its protected control channel, a fresh
+`cgroup.events` reading reports `populated 0`, and the prepared directory is
+removed. If launcher exit or `execute` delivery is uncertain, Core exits with a
+failure status and lets the Core service cleanup perform the only safe outer
+group termination.
 
 When orderly shutdown begins before Core starts handling a hard timeout,
 shutdown cancellation wins: timeout callbacks MUST NOT start failure handling,
@@ -2133,10 +2147,14 @@ following cases.
   code before the reviewed launcher joins its cgroup, and rejects a child that
   tries to leave or alter that cgroup, access Core state/manager controls, retain
   a Core descriptor, or signal Core;
-- normal hard timeout, orderly stop, protocol failure, Core crash, and child
-  descendant creation all prove whole-cgroup termination, `populated 0`, closed
-  protocol, and terminal capability handlers before any replacement or Claim
-  disposition;
+- after any Module cgroup member is observed, normal hard timeout, orderly
+  stop, protocol failure, Core crash, and child descendant creation prove
+  whole-cgroup termination, `populated 0`, directory removal, closed protocol,
+  and terminal capability handlers before any replacement or Claim
+  disposition; before any member is observed, cleanup instead proves launcher
+  exit, a fresh current-empty reading, and directory removal, while uncertain
+  launcher exit or execution authorization delivery forces the Core service to
+  exit with failure;
 - package/configuration revision changes cannot alter an unresolved process or
   submission record, and a changed Linux boot identifier or missing old cgroup
   path follows the explicit recovery rule in ADR 0009;

@@ -247,9 +247,13 @@ field is `launcherProtocol`.
   out-of-order, unknown, or oversized frame, or expiry of its fixed internal
   deadline. It never forks, performs network input/output, reads Extension
   configuration, or executes anything before the `execute` command.
-- Core bounds every phase with a finite wait. When launcher exit cannot be
-  observed before membership verification, the ADR 0009 pre-membership rule
-  applies: Core exits unsuccessfully so the service cleanup removes the whole
+- Core bounds every phase with a finite wait. Before any cgroup member is
+  observed and while `execute` is known not to have begun delivery, Core may
+  complete cleanup only after observing launcher exit, reading a fresh
+  `populated 0`, and removing the prepared cgroup directory. If a member is
+  observed, Core terminates the whole Module cgroup even when exact launcher
+  membership verification fails. If launcher exit or `execute` delivery is
+  uncertain, Core exits unsuccessfully so service cleanup removes the whole
   service cgroup.
 
 This control protocol and its launcher exist in the codebase, and their
@@ -258,13 +262,16 @@ server: the launcher joined the prepared cgroup and executed only after Core
 verified membership from kernel files, a launcher that falsely reported
 membership was refused without any signal being sent, and a malformed,
 oversized, out-of-order, or unknown-version frame, a closed control descriptor,
-and the fixed deadline each ended in a nonzero exit. Those tests exercise the
-start side only. Whole-group termination, the code that would write a Module
-process record before a real launch, and Module activation itself do not exist
-yet, so this section remains a proposal for the profile as a whole. The tests
-also do not run in an ordinary shell, because a process outside a delegated
-subtree cannot create the Module cgroup; a repository script starts them inside
-a transient delegated service so they cannot silently skip.
+and the fixed deadline each ended in a nonzero exit. Focused tests also exercise
+whole-group termination, including a descendant outside the Extension's
+process group, and the ordered start now writes a Module process record before
+a real launcher is created. The runtime still does not assemble that launcher,
+its verified control group, and the product Extension protocol host end to end,
+and Module activation remains disabled, so this section remains a proposal for
+the profile as a whole. The Linux tests do not run in an ordinary shell,
+because a process outside a delegated subtree cannot create the Module cgroup;
+a repository script starts them inside a transient delegated service so they
+cannot silently skip.
 
 The current working directory, host paths, user home directory, and private
 deployment layout MUST NOT be part of the process protocol. Persistent and shared storage
@@ -747,11 +754,15 @@ NOT report the process as stopped, and MUST NOT create a replacement Module
 generation on the strength of that failed confirmation.
 
 For the Linux executable Module profile in Section 4.1, a direct child-process
-exit stops being sufficient termination evidence once the launcher has joined
-its Module cgroup. Confirmation additionally requires a closed protocol channel
-and a Module cgroup reporting `populated 0` in `cgroup.events`, as defined by
-ADR 0009. The portable two-condition rule above remains the minimum for other
-uses of `process` isolation while the creating host process is still alive.
+exit stops being sufficient termination evidence once any member has been
+observed in the Module cgroup. Confirmation additionally requires a closed
+protocol channel, `cgroup.kill` or an equivalent group operation, a Module
+cgroup reporting `populated 0` in `cgroup.events`, and directory removal, as
+defined by ADR 0009. Before any member is observed and before `execute` delivery
+begins, confirmation instead requires an observed launcher exit, a fresh
+empty-state reading, and directory removal. The portable two-condition rule
+above remains the minimum for other uses of `process` isolation while the
+creating host process is still alive.
 
 Completion delivery is not assumed to be exactly once. The host MUST attach the
 core `moduleJobId`, fresh `runId`, `moduleGenerationId`, and attempt number. It

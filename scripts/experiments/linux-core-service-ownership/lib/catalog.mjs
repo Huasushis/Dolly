@@ -43,7 +43,13 @@ export const PROTOCOL_VERSION = 3;
 // ledger; the catalog cannot know it without inspecting the filesystem. Case
 // selection and pass criteria are unchanged, so versions 3 and 4 remain
 // directly comparable.
-export const CATALOG_VERSION = 4;
+//
+// Version 5, 2026-07-30: requires the live-Core termination evaluator to
+// observe the product's control-group file operations and directory removal.
+// This corrects an evaluator that accepted a remaining directory merely
+// because it reported `populated 0`. Results from earlier versions must be
+// rerun for the live-Core termination group.
+export const CATALOG_VERSION = 5;
 
 // The protocol does not fix the signal used to terminate Core at an
 // interruption point. Hypothesis 2 names the non-catchable `SIGKILL`, which is
@@ -582,19 +588,17 @@ function resourceLimitCases() {
 /**
  * Amendment 1, 2026-07-26. The single proof requirement below originally read
  * "requiring control-group-level termination proven by populated 0" for all
- * sixteen cases. That is not satisfiable before launcher membership is
- * verified, and not by accident: `ModuleCgroup.terminate()` refuses to run
- * there with `MODULE_CGROUP_MEMBERSHIP_UNOBSERVED`, because a `populated 0`
- * read at that point only repeats the group's pre-membership state and proves
- * nothing. Architecture Decision Record 0009 argues the same. Demanding a
- * proof the design deliberately rejects as a false positive is worse than
- * demanding none.
+ * sixteen cases. That is not the right requirement before any member is
+ * observed: generic `ModuleCgroup.terminate()` refuses to turn a plain empty
+ * reading into whole-group termination proof. Demanding that proof would
+ * confuse a group's initial empty state with termination evidence.
  *
- * The requirement is therefore split by phase. The replacement is not weaker:
- * the pre-membership half must additionally show that the false-positive proof
- * was refused, which turns that design decision into a tested invariant. If
- * someone later lets the pre-membership phase report `populated 0`, these
- * cases must fail.
+ * The requirement is therefore split by phase. Before any observed member,
+ * the case must prove launcher exit, a fresh empty-state reading, directory
+ * removal, and a durable stopped record without writing `cgroup.kill`. A
+ * different fresh group also verifies that generic termination still refuses
+ * to call a plain empty reading whole-group termination proof. These are
+ * separate facts and both are tested.
  *
  * This amendment is recorded here, in the pre-registered catalogue, rather
  * than in a handler. A criterion that the party running the cases can rewrite
@@ -602,11 +606,12 @@ function resourceLimitCases() {
  */
 const LIVE_CORE_PROOF_REQUIREMENT = {
   "after-membership":
-    "requiring control-group-level termination proven by populated 0",
+    "requiring cgroup.kill, a later populated 0 reading, and removal of the control-group directory",
   "before-membership":
-    "requiring the launcher control descriptor path, an observed launcher exit, " +
-    "coreMustExit false, and later removal of the group, and requiring that a " +
-    "populated 0 proof was refused for this phase rather than reported",
+    "requiring no observed member at the early stop check, observed launcher exit, " +
+    "a fresh empty-state reading followed by directory removal without cgroup.kill, " +
+    "a durable stopped record, Core not needing to exit (`coreMustExit: false`), and " +
+    "an independent check that generic termination rejects a group with no observed member",
 };
 
 function liveCoreCases() {
