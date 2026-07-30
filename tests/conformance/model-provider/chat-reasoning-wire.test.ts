@@ -131,25 +131,32 @@ function decodeStream(
 }
 
 describe("descriptor-bound chat reasoning wire behavior", () => {
-  it("never emits enable_thinking for an always-on forbidden-field descriptor", () => {
+  it("uses the measured Aether object control for on, off, and endpoint default", () => {
     const snapshot = activeSnapshot({
       endpointId: "owner-aether-fixture",
       modelId: "qwen3.6-27b",
-      reasoning: alwaysOnReasoning(),
+      reasoning: objectFormReasoning(),
     });
-    const decision = mapReasoningPolicy(
+    const required = mapReasoningPolicy(
       snapshot.document.features.reasoning,
       "require",
       "non-stream",
     );
-    expect(decision).toMatchObject({ directive: "omit", requireObserved: true });
-
-    const plan = encodeOpenAiCompatibleChatRequest(
-      snapshot,
-      textInput(decision.directive),
-      { maxOutputTokens: 256 },
+    const disabled = mapReasoningPolicy(
+      snapshot.document.features.reasoning,
+      "disable",
+      "non-stream",
     );
-    expect(plan.body).toEqual({
+    const endpointDefault = mapReasoningPolicy(
+      snapshot.document.features.reasoning,
+      "default",
+      "non-stream",
+    );
+    expect(required).toMatchObject({ directive: "enable", requireObserved: true });
+    expect(disabled).toMatchObject({ directive: "disable", requireObserved: false });
+    expect(endpointDefault).toMatchObject({ directive: "omit", requireObserved: false });
+
+    const commonBody = {
       model: "qwen3.6-27b",
       messages: [
         { role: "system", content: [{ type: "text", text: "Be precise." }] },
@@ -157,10 +164,41 @@ describe("descriptor-bound chat reasoning wire behavior", () => {
       ],
       stream: false,
       max_tokens: 256,
+    };
+    const enabledBody = encodeOpenAiCompatibleChatRequest(
+      snapshot,
+      textInput(required.directive),
+      { maxOutputTokens: 256 },
+    ).body;
+    const disabledBody = encodeOpenAiCompatibleChatRequest(
+      snapshot,
+      textInput(disabled.directive),
+      { maxOutputTokens: 256 },
+    ).body;
+    const endpointDefaultBody = encodeOpenAiCompatibleChatRequest(
+      snapshot,
+      textInput(endpointDefault.directive),
+      { maxOutputTokens: 256 },
+    ).body;
+
+    expect(enabledBody).toEqual({
+      ...commonBody,
+      thinking: { type: "enabled" },
     });
-    expect(plan.body).not.toHaveProperty("enable_thinking");
-    expect(JSON.stringify(plan.body)).not.toContain("owner-aether-fixture");
-    expect(JSON.stringify(plan.body)).not.toMatch(/api[_-]?key|base[_-]?url/i);
+    expect(disabledBody).toEqual({
+      ...commonBody,
+      thinking: { type: "disabled" },
+    });
+    // This deployment reasons by default. Omitting both controls preserves that
+    // measured endpoint behavior without pretending the descriptor proves it.
+    expect(endpointDefaultBody).toEqual(commonBody);
+
+    for (const body of [enabledBody, disabledBody, endpointDefaultBody]) {
+      expect(body).not.toHaveProperty("enable_thinking");
+      expect(body).not.toHaveProperty("extra_body");
+      expect(JSON.stringify(body)).not.toContain("owner-aether-fixture");
+      expect(JSON.stringify(body)).not.toMatch(/api[_-]?key|base[_-]?url/i);
+    }
   });
 
   it("maps boolean request control only for a descriptor that explicitly declares it", () => {

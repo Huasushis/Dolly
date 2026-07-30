@@ -242,8 +242,10 @@ mapping from the reasoning policy to the provider request is:
 The model provider broker owns the actual request field. The LLM
 extension MUST NOT add
 `enable_thinking` or another provider field itself. The optional owner Aether
-fixture is defined only by its exact descriptor in `model-provider.md`; its
-always-on and forbidden-field behavior MUST NOT become a generic Qwen rule.
+fixture is defined only by its exact descriptor in `model-provider.md`. That
+deployment reasons by default, rejects `enable_thinking`, and is
+request-controlled through its measured `thinking.type` object strategy. None
+of those endpoint-specific facts may become a generic Qwen rule.
 
 ### 6.3 Observation and replay
 
@@ -470,9 +472,11 @@ Required deterministic cases include:
    known provider result, tool effect, Block, turn, or retained strong reference;
 7. all reasoning support/policy combinations, observed/empty/unavailable
    results, stream fragmentation, separate final content, and required replay;
-8. proof that an always-on descriptor with a forbidden `enable_thinking` field
-   causes no extension-side field injection and still requires per-response
-   observation when the reasoning policy is `require`;
+8. proof that the optional owner Aether fixture uses only its declared
+   `thinking.type` object strategy for explicit on and off, preserves the
+   endpoint default by omitting both controls, never emits `enable_thinking`,
+   and still requires per-response observation when the reasoning policy is
+   `require`;
 9. text-only, image-only, and mixed ordered content; unsupported modality;
    derived text disclosure; Media crop geometry; and host-owned access
    cleanup without a URL reaching extension state;
