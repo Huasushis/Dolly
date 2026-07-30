@@ -1,7 +1,7 @@
 # 当前状态与待办（接手先读这一份）
 
-写于 2026-07-26 深夜，2026-07-28 完成 P0-2 和完整类型检查后更新。上一轮所有并行会话同时到达
-上限而停止，任务表随之丢失，所以这份文件是权威的接续点。
+写于 2026-07-26 深夜，最近一次更新为 2026-07-30 完成 P0-3 终止范围验收。上一轮所有并行
+会话同时到达上限而停止，任务表随之丢失，所以这份文件是权威的接续点。
 
 `TASK_HANDOVER.md` 有 2269 行、55 个小节，**按时间顺序堆叠，后面的小节会推翻前面的**
 （例如 0.29 说"装配做不出来"，已被 0.35 和 0.52b 推翻两次）。**不要从头读它**。
@@ -11,13 +11,11 @@
 
 ## 一句话状态
 
-ADR 0009（Linux Core 服务进程归属）已有独立的产品实现，但**不能再声称“零件已经
-齐了”**。运行时没有把同一个已启动 launcher、已验证 Module control group、
-`attachLinuxModuleProcess` 和 `ExtensionProcessHost` 端到端连接起来；现有接口是否还缺
-连接点也没有证明，因此剩余缺口数必须视为未知。实验已经改用产品
-`createModuleLauncherControl`，但仍使用实验协议。另有两条聚焦的 Linux 测试已经运行真实
-`attachLinuxModuleProcess`，其中协议测试还运行了真实 `ExtensionProcessHost`；这不等于完整
-运行时装配或实验矩阵已经跑通。
+ADR 0009（Linux Core 服务进程归属）的**终止范围**已通过独立审查、14 个反向变异和新的
+Linux 逐案例运行；但启动失败后的控制组所有权仍有 P0 设计错误，不能声称完整运行时已经正确。
+运行时也没有把同一个已启动 launcher、已验证 Module control group、
+`attachLinuxModuleProcess` 和 `ExtensionProcessHost` 端到端连接起来。实验已经改用产品
+launcher control 和停止生命周期，但仍使用实验协议，因此完整装配的剩余缺口数仍必须视为未知。
 
 ---
 
@@ -91,45 +89,57 @@ open-file limit、丢失的失败证据，以及第一处漏关控制描述符�
 `docs/experiments/linux-core-service-ownership-results.md`；本地工件在 `artifacts/p0-2/`。
 
 **范围限制**：这两例直接驱动 launcher controller，没有运行 `startModuleProcess`，因此只证明
-adapter 的整组终止和 `exec` 后文件描述符 0/1 上的协议传输，不证明完整 runtime assembly。当前脚本还会
-把全 skipped 的 Vitest 结果当成功；本轮人工核对 JSON 避免了假阳性，脚本本身仍要修。
+adapter 的整组终止和 `exec` 后文件描述符 0/1 上的协议传输，不证明完整 runtime assembly。
+全 skipped 假阳性已在提交 `e391ff9` 修复：runner 设置“Linux 集成环境必须存在”的环境变量，
+三个相关测试文件若仍看不到 delegated `core` subgroup 会在收集阶段失败。Linux 正向运行 25/25，
+普通容器进程中的证伪退出码为 1。
 
-### P0-3　整组终止并发、目录删除与退出回调：checkpoint，尚未完成验收
+### P0-3　整组终止、能力关闭、通道关闭与持久状态：✓ 完成终止范围验收
 
-提交 `26edeea` 已实现第一版修复，**但还没有做反向变异或新的独立代码审查，不能标为完成**。
-这一版的职责划分是：
+产品提交为 `3e20e77`，runner 修复为 `e391ff9`。终止成功现在必须同时证明：能力会话已同步拒绝
+新调用且已有处理程序结束、协议通道已观察到关闭、整个 Module control group 已为空、目录已删除，
+而且匹配的持久记录已写成 `stopped`。`stopping` 写失败仍启动物理清理，但禁止报告成功；并发停止
+共享同一最终状态；协议挂接失败、初始化未结束或记录与控制组不匹配均不能被当作成功。
 
-- `attachLinuxModuleProcess` 的两个终止方法在空组尚未证明时仍各自发起 `cgroup.kill`；
-  不把第二次排在第一次的可能卡住的文件读写之后。完成的 `terminationAttempts` 改为按调用顺序
-  返回，而不是按完成顺序；一旦已有 `populated 0` 证明，后续调用不再重新访问将被删除的路径；
-- `ModuleCgroup.remove()` 是真正拥有文件系统路径的强制点。它先拒绝新的 `terminate()`，再有限
-  等待已开始的 terminate 调用；超时返回 `MODULE_CGROUP_TERMINATION_PENDING`，不删除目录，也不
-  安排后台删除。之后必须由调用者显式重试；
-- `stopModuleProcess()` 只有在空组证明和目录删除均成功后才把记录写为 `stopped`。删除失败会保留
-  `stopping`；
-- 退出回调先从集合复制并清空。同步抛错和 async callback 的 rejected Promise 都被隔离，不能阻止
-  其他 callback 或形成未处理 rejection；
-- 同时去掉了源码和测试中未解释的 “seam” / “load-bearing” 隐喻。
+验收证据：
 
-已在本机设置 `TMPDIR` 后验证：
+- 本机精确 4 文件 91/91，主 `typecheck` exit 0；
+- 冻结六文件逐 SHA-256 一致的隔离副本中，14/14 个定向变异都使预定的单个断言失败，底层
+  Vitest 均 exit 1；报告在
+  `artifacts/p0-3/mutation/module-termination-mutation-tests-20260730-004/REPORT.md`；
+- 独立代码复审没有再发现当前终止补丁的错误成功或错误 control group 终止；
+- Linux 冻结归档 SHA-256 为
+  `74e292fc35196d46ffcc74e5cf0ebd6d7a0ed1d4763fb1a552b6a1c9ad35ebe8`；
+- P0-2 两个命名测试重新实际执行，2/2 pass、0 skipped，JSON SHA-256 为
+  `dcdd24d0dce695d2f987cce828c5a0fae8d51df352b2de92437fc57cee0eab2d`；
+- `SC-13-07-cleanup-timeout` 1/1 pass；它使用真实进程、control group、成员资格和 `cgroup.kill`，
+  但以确定性文件系统注入保持 `cgroup.events` 为 `populated 1`，不能描述成真实内核长期不清空；
+- `live-core-termination` 为 12 pass、4 个逐例合理的 not-applicable、0 fail/inconclusive；
+- 三个 proposed 组完整重跑 233 行：225 pass、8 not-applicable、0 fail/inconclusive；210/7/16
+  分组计数不变。按 `caseId + status + reason` 排序后与 P0-1 的 retained projection 逐行相同，
+  新增、缺失和变化均为 0。工件在 `artifacts/p0-3/`。
 
-- `tests/conformance/core/linux-module-cgroup.test.ts`：46/46；
-- `tests/conformance/core/linux-module-process-lifecycle.test.ts`：6/6；
-- `tests/conformance/core/linux-module-attached-process.test.ts`：12/12；
-- `npm.cmd run typecheck -- --pretty false`：exit 0。
+**不得夸大**：233 行的 `iterations` 仍全部为 1，不是 manifest 计划的 4,391 次；M14 聚焦工件没有
+停止前 descendant process identifier 快照；变异只分别证明了错误 control-group path 和错误 process
+generation，没有对 `instanceId`、`moduleId` 做逐字段变异；stand-in 仍不等于完整 runtime assembly。
 
-**交接者先做以下工作，先不要宣称 P0-3 完成：**
+### P0-4　启动失败后的控制组所有权与持久状态：当前最高优先级
 
-1. 独立审查 `ModuleCgroup.remove()` 的锁定和 timeout 路径，特别是 removal Promise 的清理、重试和
-   同时调用 `remove()` 的行为；
-2. 在独立副本中移除 `#waitForTerminationOperations()` 的等待，运行新的 cgroup removal 用例，必须
-   在“超时不删除目录”的强制点失败；恢复副本后再继续；
-3. 在独立副本中让第二次终止等待第一次，新的 attached-process 并发用例必须失败；再让 async
-   callback 的 rejection 不被 catch，callback 用例必须以未处理 rejection 失败；
-4. 如果上述证伪均成立，重新在 Linux systemd 容器运行两条 P0-2 用例。控制结果的源码 hash 会随
-   这次改动变化，公共结果文档必须追加新 run，而不能覆盖旧证据；
-5. 然后处理运行脚本的全 skipped 假阳性。`runner_skip_audit` 的结论已确认：Vitest JSON 的
-   `success: true` 不代表用例执行，必须检查测试级 passed/pending/failed/todo 计数和实际文件集合。
+已由三个独立审查交叉确认，当前实现有以下 P0 错误，尚未修改：
+
+1. 产品 launcher control 保留了 `membershipVerified: true`，但 `startModuleProcess` 捕获普通异常后
+   丢弃该事实，错误地走验证前退出；额外 process identifier 已在组内时也可能只观察 launcher 退出，
+   错写 `stopped`；
+2. `running` 在协议 `initialize()` 前写入，违反规范定义；该写入失败又会使 executor 丢失已经验证的
+   control group，无法执行整组终止；
+3. `startLauncher()` 的 rejected Promise 不能区分“未创建进程”和“spawn 后失去控制”，现有真实
+   launcher 确实可能在 spawn 后抛错；准备好的空 control group 也会遗留；
+4. `coreMustExit` 目前只是返回值和错误文本，没有真实 Core 服务退出强制点；
+5. `FileCoreStateStore` 进入“必须重新打开”状态后仍可读取回滚后的内存记录，不能把它当作磁盘事实。
+
+下一步先写跨层反例，再改契约：控制组一旦准备成功，每个结果必须在函数内完成可验证清理，或把
+`ModuleCgroup` 交给 executor；`running` 只在协议初始化成功后写；成员资格已验证或观察到任何成员时
+必须整组终止。不要让 core 识别 adapter 的 Error 类，也不要新增无法解释的状态名。
 
 ### P1-1　`typecheck` 覆盖和诊断修复 ✓ 完成
 
@@ -230,11 +240,13 @@ M14 重复案例。P0-1 的两个完整 manifest 也各自报 4,391 次计划执
 | 记录回收判定抽为纯函数 + 10 例测试 | `src/core/core-startup-recovery.ts` | 三条守卫分别置真 → 4/1/2 例失败 |
 | P0-1 手写 launcher control 换成产品适配器 | `core-standin.mts` | 14 例边界 A/B + 233 例完整 A/B，逐案例三字段 diff 均为空 |
 | P0-2 真实 Linux control group 与文件描述符验证 | Linux integration test、fixture、control-group implementation | 未修改产品实现时 2/2 pass；仅终止直接进程的证伪在 `populated 1` 处失败；清理后零残留 |
-| P0-3 并发终止和删除顺序 checkpoint | attached-process adapter、`ModuleCgroup`、停止生命周期 | 本机 46/46 + 6/6 + 12/12、typecheck exit 0；仍待独立审查、反向变异和 Linux 重跑 |
+| P0-3 完整终止证明 | executor、`ModuleCgroup`、停止生命周期、实验调用点 | 本机 91/91 + 14/14 定向变异；Linux 2/2、1/1、12 pass + 4 not-applicable 和完整 233 行均符合各自判据；逐案例三字段 diff 为空 |
+| Linux runner 拒绝全 skipped 并恢复执行位 | 三个入口脚本、三个 Linux integration 文件、catalog | 普通容器证伪 exit 1；systemd 容器 25/25、0 skipped；catalog v4 仍为 570 例 |
 | 恢复完整 TypeScript 范围并修复 91 条诊断 | `tsconfig.json`、`package.json`、33 个测试文件 | 标准 `typecheck` exit 0；按受影响文件精确运行的用例全绿，5 个未启用的付费 live 用例明确 skipped |
 
-最终核实：`npm.cmd run typecheck -- --pretty false` **exit 0**；目录 **v3、570 例、
-1 个 exclusive**；P0-2 未修改实现的两个命名用例均通过，仅终止直接进程的证伪在预期强制点失败。
+最终核实：`npm.cmd run typecheck -- --pretty false` **exit 0**；目录 **v4、570 例、
+1 个 exclusive**。catalog v4 只删除过期实现状态，案例与判据不变；P0-3 产品实验工件仍准确标记为
+运行时使用的 catalog v3。
 
 ---
 

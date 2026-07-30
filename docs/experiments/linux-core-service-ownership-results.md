@@ -224,10 +224,141 @@ The source copied into the passing container had these SHA-256 values:
 These two focused tests do not use `startModuleProcess`. They establish the
 adapter's whole-control-group termination behavior and the standard-stream
 transport after `exec`; they do not establish the complete runtime assembly or
-the full experiment matrix. The integration script also did not yet reject an
-all-skipped Vitest result on its own, so the named assertion results and counts
-were checked directly in the JSON report. That runner defect is tracked
-separately rather than hidden by this successful run.
+the full experiment matrix. At the time of this run, the integration script did
+not reject an all-skipped Vitest result on its own, so the named assertion
+results and counts were checked directly in the JSON report. Commit `e391ff9`
+later fixed that runner defect; the historical result remains recorded as run.
+
+## P0-3 termination confirmation and Linux rerun
+
+On 2026-07-30, commit `3e20e77` tightened the Linux Module executor and process
+lifecycle so that termination is confirmed only after all of these conditions
+hold:
+
+- the capability-session close call has synchronously rejected new calls and
+  every already-started capability handler has finished;
+- the Extension protocol channel has been observed closed;
+- the whole Module control group has been proven empty and its directory has
+  been removed; and
+- the matching durable process record has been written as `stopped`.
+
+A failure to persist `stopping` no longer prevents physical cleanup, but it
+does prevent a successful termination result. Protocol attachment failure,
+unfinished protocol initialization, a mismatched durable record, and a failed
+final write likewise cannot be treated as confirmed termination.
+
+### Source and platform
+
+The Linux runs used one source archive with SHA-256
+`74e292fc35196d46ffcc74e5cf0ebd6d7a0ed1d4763fb1a552b6a1c9ad35ebe8`.
+It contained the product and experiment changes later committed as `3e20e77`.
+The environment was Ubuntu 24.04.4, kernel 6.8.0-106-generic, systemd 255,
+control group version 2, Node.js 20.20.2, and Python 3.12.3. Each experiment
+ran as an unprivileged account under a delegated systemd user service in a
+uniquely named disposable container.
+
+The archive lost the executable mode on two experiment entry scripts, and its
+host dependency view contained absolute symbolic links that did not resolve in
+the container. The successful runs used a unique execution copy that changed
+only those script modes and the read-only dependency mount. Product sources
+and experiment sources were byte-identical to the archive. Commit `e391ff9`
+subsequently records the three public Linux entry scripts as executable.
+
+### Local review and mutation tests
+
+Four exact conformance files passed 91 of 91 tests, and the complete TypeScript
+check exited zero. An independent review found no remaining false-success or
+wrong-control-group termination path in this change.
+
+Fourteen isolated mutations were then applied one at a time to frozen source
+copies. Every mutation made its intended single test fail, with underlying
+Vitest exit code 1 and no compilation or missing-test failure. The retained
+report is
+`artifacts/p0-3/mutation/module-termination-mutation-tests-20260730-004/REPORT.md`,
+whose SHA-256 is
+`1ad4e954f7ae6778a73fcc6b47ce016f147ccbf24e70886dec17d59410e73592`.
+
+The mutation evidence has a deliberate limit. It separately rejects a wrong
+control-group path and a wrong process generation, but it does not mutate
+`instanceId` and `moduleId` one field at a time. It must not be cited as
+field-by-field proof for those two values.
+
+### Focused runs
+
+| Selection | Result | Scope |
+|---|---:|---|
+| The two attached-process Linux tests | 2 passed, 0 skipped | A real descendant outside the launcher's process group was terminated through `cgroup.kill`; the real protocol also completed over descriptors 0 and 1. |
+| `SC-13-07-cleanup-timeout` | 1 passed | Real processes, control-group membership, and `cgroup.kill` were used. The `cgroup.events` read was deterministically held at `populated 1`, so this proves refusal without an empty-group result, not a kernel that naturally remained populated. |
+| `live-core-termination`, proposed arm | 12 passed, 4 not applicable | The four not-applicable cases require a descendant before execution authorization, when the Extension cannot have created one. No case failed or was inconclusive. |
+| `FM-M14-after-process-descendant-proposed` | 1 passed | The trace reached `M14-after`, process and submission records were closed, and no Module control group remained. The artifacts do not contain a pre-stop descendant process identifier, so direct proof that this particular run killed a descendant remains incomplete. |
+
+The new attached-process JSON is retained at
+`artifacts/p0-3/p0-2/result.json`, with SHA-256
+`dcdd24d0dce695d2f987cce828c5a0fae8d51df352b2de92437fc57cee0eab2d`.
+The three focused experiment directories are under `artifacts/p0-3/focused/`.
+
+### Complete proposed-arm comparison
+
+The same three groups used for P0-1 were run again: 210 fixed-interruption
+cases, 7 capability-idempotency cases, and 16 live-termination cases. All 233
+selected cases had a handler and produced this result:
+
+```
+cases  233   passed 225   not applicable 8   failed 0   inconclusive 0
+cleanup ok true   residue clean true
+verdict  pass
+```
+
+All 233 case results had exit code zero, no timeout, no invariant violation,
+and no missing required artifact. Cleanup attempted 233 systemd units with
+zero failures, and the exact disposable container was absent after the run.
+
+The current and P0-1 result ledgers were independently parsed, sorted by case
+identifier, and projected to `caseId`, `status`, and `reason`. Both had 233
+unique identifiers. There were no missing, added, or changed rows, and the
+ordered current projection matched the retained P0-1 projection line for line.
+This is a per-case comparison, not an inference from equal summary counts.
+
+Retained complete-run files:
+
+| File | SHA-256 |
+|---|---|
+| `artifacts/p0-3/full-proposed/20260730T032758Z-184/results.jsonl` | `b0a77ddb5c195fc86d5a6740e5a0a5fb3ac21ac5abfa6dcc5868b32afb263b42` |
+| `artifacts/p0-3/full-proposed/20260730T032758Z-184/summary.json` | `f03b85e07ab2aec6dd527e5693cf27028e685f1825f7ecfe3a7163b275af51ee` |
+| `artifacts/p0-3/full-proposed/20260730T032758Z-184/manifest.json` | `083af20ee194378f5501e299bcd5654af619ae598934fa81c75eb7db7ca48281` |
+
+The UTF-8, line-feed-separated list of each retained relative path and SHA-256
+contains 8,025 entries and hashes to
+`17c6fe2a47f001e1d628b93b857da3b550f7ee9cef3d22c556ce1898413c4df5`.
+
+The manifest still plans 4,391 executions, but every one of the 233 result rows
+records `iterations: 1`. This run confirms one execution of every selected
+case. It does not establish the planned repetition count or the absence of
+timing races.
+
+### Runner correction after the evidence run
+
+Commit `e391ff9` also removed the catalog's stale
+`status: "not-implemented"` field. Catalog version 4 has the same 570 cases,
+filters, and pass criteria as version 3; handler availability is measured by
+the runner and recorded in the result ledger. The P0-3 artifacts correctly
+retain catalog version 3 because that is the code that produced them.
+
+The Linux integration runner now sets
+`DOLLY_LINUX_MODULE_INTEGRATION_REQUIRED=1`. If the systemd service fails to
+place the test process in the delegated `core` subgroup, the three Linux test
+files fail during collection rather than allowing an all-skipped success. A
+negative run outside the subgroup exited 1. A positive systemd-container run
+executed 25 tests across the three files: 25 passed, 0 failed, 0 pending or
+skipped, and 0 todo. Its JSON is retained at
+`artifacts/p0-3/runner-fix/result.json`, with SHA-256
+`98b66976649986e50cdb3a01cde145c5a88cea1a11ac1a44999212e58f97d444`.
+
+These results accept the termination behavior described above. They do not
+accept the complete Linux startup design. In particular, process ownership can
+still be lost on failures after membership verification or while writing the
+`running` record, and no runtime startup caller yet assembles the same launcher,
+control group, attached process, and `ExtensionProcessHost` end to end.
 
 ## How an interruption point is established
 
