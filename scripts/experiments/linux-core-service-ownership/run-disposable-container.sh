@@ -66,6 +66,10 @@ while [ $# -gt 0 ]; do
     --base) BASE_IMAGE="$2"; shift 2 ;;
     --keep) KEEP_CONTAINER="yes"; shift ;;
     --test-file) TEST_FILES+=("$2"); shift 2 ;;
+    --output-dir|--output-dir=*|--disposable)
+      echo "$1 is managed by the disposable-container runner and cannot be overridden." >&2
+      exit 1
+      ;;
     *) RUNNER_ARGS+=("$1"); shift ;;
   esac
 done
