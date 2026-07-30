@@ -13,7 +13,9 @@ import {
   openDollyRuntime,
   RuntimeBootstrapError,
   type DollyRuntimeDirectories,
-  type DollyRuntimeSession,
+  type DollyRuntimeSession as InternalDollyRuntimeSession,
+  type DollyRuntimeSessionState,
+  type DollyRuntimeStatus,
 } from "./core/runtime-bootstrap.js";
 import {
   createDefaultDollyInstanceConfig,
@@ -58,6 +60,17 @@ interface TextOutput {
   write(text: string): unknown;
 }
 
+/**
+ * The limited runtime session passed to the command-line interface shutdown
+ * hook. It exposes lifecycle state, status, and orderly stop, but not the
+ * mutable Core state or result-commit coordinator owned by the runtime.
+ */
+export interface DollyRuntimeSession {
+  readonly state: DollyRuntimeSessionState;
+  status(): Readonly<DollyRuntimeStatus>;
+  stop(): Promise<void>;
+}
+
 export interface DollyCliContext {
   readonly cwd?: string;
   readonly directories?: DollyRuntimeDirectories;
@@ -65,6 +78,18 @@ export interface DollyCliContext {
   readonly stderr?: TextOutput;
   /** Test and embedding hook. The default waits for SIGINT or SIGTERM. */
   readonly waitForShutdown?: (session: DollyRuntimeSession) => Promise<void>;
+}
+
+function createPublicRuntimeSession(
+  session: InternalDollyRuntimeSession,
+): DollyRuntimeSession {
+  return Object.freeze({
+    get state(): DollyRuntimeSessionState {
+      return session.state;
+    },
+    status: () => session.status(),
+    stop: () => session.stop(),
+  });
 }
 
 interface ParsedArguments {
@@ -340,10 +365,13 @@ async function execute(
       configPath: parsed.configPath,
       ...directories,
     });
-    writeLine(stdout, `Dolly ready: ${session.config.instanceId}`);
-    writeLine(stdout, JSON.stringify(session.status()));
+    const status = session.status();
+    writeLine(stdout, `Dolly ready: ${status.instanceId}`);
+    writeLine(stdout, JSON.stringify(status));
     try {
-      await (context.waitForShutdown ?? (() => waitForProcessSignal()))(session);
+      await (context.waitForShutdown ?? (() => waitForProcessSignal()))(
+        createPublicRuntimeSession(session),
+      );
     } finally {
       await session.stop();
     }

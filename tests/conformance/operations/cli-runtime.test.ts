@@ -118,14 +118,31 @@ describe("public CLI runtime boundary", () => {
     expect(await runDollyCli(["init", "--config", configPath], init.value)).toBe(0);
 
     let observedReady = false;
+    let observedStatus = false;
+    let publicObjectOnly = false;
     const running = context({
       waitForShutdown: async (session) => {
         observedReady = session.state === "ready";
+        observedStatus = session.status().state === "ready";
+        publicObjectOnly =
+          Object.isFrozen(session) &&
+          !("core" in session) &&
+          !("commits" in session) &&
+          !("config" in session) &&
+          !("recovery" in session);
+        if (false) {
+          // @ts-expect-error Public runtime sessions do not expose mutable Core state.
+          session.core;
+          // @ts-expect-error Public runtime sessions do not expose commit coordination.
+          session.commits;
+        }
       },
     });
     expect(await runDollyCli(["run", "--config", configPath], running.value)).toBe(0);
 
     expect(observedReady).toBe(true);
+    expect(observedStatus).toBe(true);
+    expect(publicObjectOnly).toBe(true);
     expect(running.stdout.text()).toMatch(/Dolly ready: [0-9a-f-]+/u);
     expect(running.stdout.text()).toContain("Dolly stopped");
     const instanceId = (JSON.parse(readFileSync(configPath, "utf8")) as { instanceId: string }).instanceId;
