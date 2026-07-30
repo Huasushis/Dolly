@@ -261,6 +261,7 @@ function referencesForProposal(proposal: BlockProposal): ReturnType<typeof conte
 }
 
 export class BlockStore {
+  readonly #storeIdentity = {};
   readonly #records = new Map<string, Block>();
   readonly #commitEffects = new Map<string, BlockCommitEffect>();
   readonly #nextBlockId: () => string;
@@ -289,6 +290,11 @@ export class BlockStore {
       }
     }
     if (options.snapshot) this.#restore(options.snapshot);
+  }
+
+  /** Returns whether both values operate on this exact Block store instance. */
+  isSameBlockStore(other: BlockStore): boolean {
+    return this.#storeIdentity === other.#storeIdentity;
   }
 
   get size(): number {

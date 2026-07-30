@@ -104,7 +104,6 @@ vi.mock("../../../src/core/synchronous-cross-process-lock.js", async (importOrig
 const NOW = "2026-07-26T00:00:00.000Z";
 const PACKAGE_DIGEST = `sha256:${"a".repeat(64)}`;
 const CONFIG_REVISION = `sha256:${"b".repeat(64)}`;
-const INPUT_DIGEST = `sha256:${"c".repeat(64)}`;
 const PROCESS_GENERATION_ID = "process-generation-1";
 const MODULE_GENERATION_ID = "module-generation-1";
 /** The shapes systemd and the Linux kernel report; a record stores no other. */
@@ -229,7 +228,7 @@ describe("CORE state atomic write fault injection", () => {
       attempt: claim.attempt,
       moduleGenerationId: MODULE_GENERATION_ID,
       processGenerationId: PROCESS_GENERATION_ID,
-      inputDigest: INPUT_DIGEST,
+      inputDigest: canonicalJsonDigest(store.deliveries.inspectClaimInput(identity)),
       createdAt: NOW,
     });
     expect(store.deliveries.listActiveClaims()).toHaveLength(1);
@@ -241,10 +240,7 @@ describe("CORE state atomic write fault injection", () => {
    * and its submission record disappears together.
    */
   function makeClaimTerminal(state: ClaimedState): void {
-    state.store.runAtomicUpdate(() => {
-      state.store.deliveries.releaseClaim(state.identity);
-      state.store.removeModuleSubmissionRecord(state.identity.runId);
-    });
+    state.store.releaseDeliveryClaim(state.identity);
   }
 
   function committedRevision(): unknown {
@@ -379,6 +375,83 @@ describe("CORE state atomic write fault injection", () => {
 
     assertReopenRequired(state);
     expect(assertOneCompleteView("second", state)).toBe("old");
+  });
+
+  it("copies accessor-based Claim identity before checking or changing persisted state", () => {
+    const state = seedClaimedState("first");
+    const reads = new Map<keyof ClaimIdentity, number>();
+    const supplied = Object.create(null) as ClaimIdentity;
+    for (const property of [
+      "moduleJobId",
+      "claimToken",
+      "runId",
+      "attempt",
+      "moduleGenerationId",
+    ] as const) {
+      Object.defineProperty(supplied, property, {
+        enumerable: true,
+        get() {
+          const count = (reads.get(property) ?? 0) + 1;
+          reads.set(property, count);
+          if (property === "runId" && count === 3) return "another-run";
+          return state.identity[property];
+        },
+      });
+    }
+
+    expect(state.store.releaseDeliveryClaim(supplied)).toBe("released");
+    expect(Object.fromEntries(reads)).toEqual({
+      moduleJobId: 1,
+      claimToken: 1,
+      runId: 1,
+      attempt: 1,
+      moduleGenerationId: 1,
+    });
+
+    const reopened = openStore("second");
+    expect(reopened.deliveries.inspectClaim(state.identity).status).toBe("released");
+    expect(reopened.getModuleSubmissionRecord(state.identity.runId)).toBeUndefined();
+  });
+
+  it("copies negative-acknowledgement failure data before choosing a terminal result", () => {
+    const state = seedClaimedState("first");
+    let failureReads = 0;
+    const supplied = Object.create(null) as ClaimIdentity & {
+      readonly failure: {
+        readonly code: string;
+        readonly retryable: boolean;
+      };
+    };
+    for (const property of [
+      "moduleJobId",
+      "claimToken",
+      "runId",
+      "attempt",
+      "moduleGenerationId",
+    ] as const) {
+      Object.defineProperty(supplied, property, {
+        enumerable: true,
+        value: state.identity[property],
+      });
+    }
+    Object.defineProperty(supplied, "failure", {
+      enumerable: true,
+      get() {
+        failureReads += 1;
+        return {
+          code: "TEMPORARY_FAILURE",
+          retryable: failureReads < 5,
+        };
+      },
+    });
+
+    expect(state.store.negativelyAcknowledgeDeliveryClaim(supplied))
+      .toBe("retry-scheduled");
+    expect(failureReads).toBe(1);
+
+    const reopened = openStore("second");
+    expect(reopened.deliveries.inspectClaim(state.identity).status).toBe("nacked");
+    expect(reopened.getModuleSubmissionRecord(state.identity.runId)).toBeUndefined();
   });
 
   it("keeps the old view when the replacement payload cannot be written", () => {

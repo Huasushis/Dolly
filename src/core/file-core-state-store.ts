@@ -27,8 +27,10 @@ import {
 } from "./block-store.js";
 import {
   DeliveryStore,
+  type DeliveryClaimIdentity,
   type DeliveryStoreOptions,
   type DeliveryStoreSnapshot,
+  type NegativeAcknowledgementRequest,
 } from "./delivery-store.js";
 import {
   ReferenceGraph,
@@ -51,6 +53,7 @@ import {
   type ModuleProcessRecordState,
   type ModuleSubmissionRecord,
 } from "./module-process-records.js";
+import { type ModuleResultCommitOperations } from "./module-result-commit.js";
 import { parseStrictJsonBytes } from "./strict-json.js";
 import {
   SynchronousCrossProcessLockError,
@@ -168,103 +171,519 @@ function nextRevision(current: number): number {
   return current + 1;
 }
 
-const MUTATION_OBSERVER_METHODS = new Set<PropertyKey>(["setMutationObserver"]);
-const REFERENCE_GRAPH_MUTATION_METHODS = new Set<PropertyKey>([
-  "registerNode",
-  "addStrongReference",
-  "removeStrongReference",
-  "acquireLease",
-  "releaseLease",
-  "beginRemoval",
-  "completeRemoval",
-  "cancelRemoval",
-  "unregisterUnreachable",
+const REFERENCE_GRAPH_PUBLIC_METHODS = [
+  "hasNode",
+  "hasStrongReference",
+  "hasLease",
+  "getLease",
+  "isReachable",
+  "isReachableFromStrongReference",
+  "unreachable",
+  "strongReferenceCountFor",
+  "leaseCountFor",
+  "snapshot",
+] as const;
+
+const BLOCK_STORE_PUBLIC_METHODS = [
+  "isSameBlockStore",
+  "get",
+  "has",
+  "inspectCommitEffect",
+  "flushPersistence",
+  "snapshot",
+  "validateSource",
+  "validateInput",
+  "normalizeInput",
+  "commit",
+  "commitOnce",
+  "releaseCommitEffect",
+  "collectUnreachable",
+] as const;
+
+const DELIVERY_STORE_PUBLIC_METHODS = [
+  "usesSameBlockStore",
+  "flushPersistence",
+  "snapshot",
+  "createPage",
+  "registerConsumer",
+  "inspectSubscription",
+  "inspectPending",
+  "append",
+  "appendOnce",
+  "validateOutputPages",
+  "validateClaimPages",
+  "inspectClaim",
+  "inspectClaimInput",
+  "inspectClaimInputBlockIds",
+  "inspectClaimInputMediaReferences",
+  "inspectAppendEffect",
+  "listPageIds",
+  "claim",
+  "listDeadLetters",
+  "listActiveClaims",
+  "pruneTerminal",
+] as const;
+
+const MEDIA_STORE_PUBLIC_METHODS = [
+  "flushPersistence",
+  "snapshot",
+  "registerMedia",
+  "listRegistrations",
+  "removeExpiredDeletedRegistrations",
+  "recoverRegistrations",
+  "releaseRegistration",
+  "getMedia",
+  "verifyStoredBytes",
+  "resolve",
+  "storeOriginal",
+  "storageRecordCount",
+  "listStorageRecords",
+  "recoverUploads",
+  "retryUpload",
+  "cancelUpload",
+  "resolveProviderAccess",
+  "recordProviderAccessOutcome",
+  "markProviderAccessUnknownAfterRestart",
+  "listProviderAccessRecords",
+  "collectUnreachable",
+  "recoverDeletions",
+  "retryDeletion",
+] as const;
+
+const MODULE_RESULT_COMMIT_BLOCK_METHODS = [
+  "validateSource",
+  "validateInput",
+  "normalizeInput",
+  "inspectCommitEffect",
+  "commitOnce",
+  "releaseCommitEffect",
+] as const;
+
+const MODULE_RESULT_COMMIT_DELIVERY_METHODS = [
+  "validateOutputPages",
+  "inspectClaim",
+  "inspectClaimInput",
+  "inspectClaimInputBlockIds",
+  "inspectClaimInputMediaReferences",
+  "inspectAppendEffect",
+  "listPageIds",
+  "appendOnce",
+  "usesSameBlockStore",
+] as const;
+
+const BLOCK_STORE_MUTATION_METHODS = new Set<PropertyKey>([
+  "flushPersistence",
+  "commit",
+  "commitOnce",
+  "releaseCommitEffect",
+  "collectUnreachable",
 ]);
 
+const DELIVERY_STORE_MUTATION_METHODS = new Set<PropertyKey>([
+  "flushPersistence",
+  "createPage",
+  "registerConsumer",
+  "append",
+  "appendOnce",
+  "claim",
+  "pruneTerminal",
+]);
+
+const MEDIA_STORE_MUTATION_METHODS = new Set<PropertyKey>([
+  "flushPersistence",
+  "registerMedia",
+  "removeExpiredDeletedRegistrations",
+  "recoverRegistrations",
+  "releaseRegistration",
+  "storeOriginal",
+  "recoverUploads",
+  "retryUpload",
+  "cancelUpload",
+  "resolveProviderAccess",
+  "recordProviderAccessOutcome",
+  "markProviderAccessUnknownAfterRestart",
+  "collectUnreachable",
+  "recoverDeletions",
+  "retryDeletion",
+]);
+
+const MEDIA_STORE_ASYNCHRONOUS_MUTATION_METHODS = new Set<PropertyKey>([
+  "registerMedia",
+  "recoverRegistrations",
+  "storeOriginal",
+  "recoverUploads",
+  "retryUpload",
+  "cancelUpload",
+  "resolveProviderAccess",
+  "collectUnreachable",
+  "recoverDeletions",
+  "retryDeletion",
+]);
+
+const exposedObjectTargets = new WeakMap<object, object>();
+
 /**
- * Exposes an in-memory component owned by `FileCoreStateStore`. Every normal
- * property access and method call first verifies that the store has not
- * entered an uncertain state that requires reopening. Methods that could
- * replace persistence wiring or mutate the reference graph outside a
- * persisted store operation are unavailable on the exposed object, while the
- * store keeps the original object internally.
+ * Exposes only the listed operations of an in-memory component owned by
+ * `FileCoreStateStore`. The returned object has no prototype, is frozen, and
+ * contains wrappers rather than the component's own methods. This keeps the
+ * underlying component and its persistence controls unreachable while every
+ * property access and method call verifies that the store remains usable.
  */
 function exposeCheckedObject<T extends object>(options: {
   readonly target: T;
   readonly assertUsable: () => void;
   readonly label: string;
-  readonly forbiddenMethods?: ReadonlySet<PropertyKey>;
-  readonly replacements?: ReadonlyMap<unknown, unknown>;
+  readonly methods: readonly PropertyKey[];
+  readonly properties?: readonly PropertyKey[];
+  readonly replacements?: ReadonlyMap<PropertyKey, unknown>;
+  readonly mutationMethods?: ReadonlySet<PropertyKey>;
+  readonly asynchronousMutationMethods?: ReadonlySet<PropertyKey>;
+  readonly invokeMutation?: (
+    property: PropertyKey,
+    asynchronous: boolean,
+    operation: () => unknown,
+  ) => unknown;
 }): T {
-  const checkedMethods = new Map<
-    PropertyKey,
-    { readonly original: unknown; readonly checked: unknown }
-  >();
-  const forbiddenMethods = new Map<PropertyKey, () => never>();
-  return new Proxy(options.target, {
-    get(target, property) {
-      options.assertUsable();
-      if (options.forbiddenMethods?.has(property)) {
-        let reject = forbiddenMethods.get(property);
-        if (reject === undefined) {
-          reject = () => {
-            options.assertUsable();
-            throw new TypeError(
-              `${options.label}.${String(property)} is managed by FileCoreStateStore`,
-            );
-          };
-          forbiddenMethods.set(property, reject);
-        }
-        return reject;
-      }
-      const value = Reflect.get(target, property, target) as unknown;
-      const replacement = options.replacements?.get(value);
-      if (replacement !== undefined) return replacement;
-      if (typeof value !== "function") return value;
-      const cached = checkedMethods.get(property);
-      if (cached?.original === value) return cached.checked;
-      const checked = (...args: unknown[]) => {
+  const exposed = Object.create(null) as Record<PropertyKey, unknown>;
+  const defined = new Set<PropertyKey>();
+  for (const property of options.methods) {
+    if (defined.has(property)) {
+      throw new TypeError(
+        `${options.label}.${String(property)} is listed more than once`,
+      );
+    }
+    defined.add(property);
+    const method = Reflect.get(options.target, property, options.target) as unknown;
+    if (typeof method !== "function") {
+      throw new TypeError(
+        `${options.label}.${String(property)} is not a method`,
+      );
+    }
+    Object.defineProperty(exposed, property, {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: (...args: unknown[]) => {
         options.assertUsable();
-        return Reflect.apply(value, target, args) as unknown;
-      };
-      checkedMethods.set(property, { original: value, checked });
-      return checked;
-    },
-    getOwnPropertyDescriptor(target, property) {
-      options.assertUsable();
-      const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
-      if (descriptor === undefined || !("value" in descriptor)) return descriptor;
-      const replacement = options.replacements?.get(descriptor.value);
-      return replacement === undefined ? descriptor : { ...descriptor, value: replacement };
-    },
-    set() {
-      options.assertUsable();
-      throw new TypeError(`${options.label} properties cannot be replaced`);
-    },
-    defineProperty() {
-      options.assertUsable();
-      throw new TypeError(`${options.label} properties cannot be redefined`);
-    },
-    deleteProperty() {
-      options.assertUsable();
-      throw new TypeError(`${options.label} properties cannot be deleted`);
-    },
-    setPrototypeOf() {
-      options.assertUsable();
-      throw new TypeError(`${options.label} prototype cannot be replaced`);
-    },
-    preventExtensions() {
-      options.assertUsable();
-      throw new TypeError(`${options.label} cannot be made non-extensible`);
-    },
+        const copiedArguments = args.map((argument) =>
+          argument !== null &&
+          (typeof argument === "object" || typeof argument === "function")
+            ? exposedObjectTargets.get(argument) ?? argument
+            : argument);
+        const operation = () =>
+          Reflect.apply(method, options.target, copiedArguments) as unknown;
+        if (!options.mutationMethods?.has(property)) return operation();
+        if (options.invokeMutation === undefined) {
+          throw new TypeError(
+            `${options.label}.${String(property)} has no mutation boundary`,
+          );
+        }
+        return options.invokeMutation(
+          property,
+          options.asynchronousMutationMethods?.has(property) ?? false,
+          operation,
+        );
+      },
+    });
+  }
+  for (const property of options.properties ?? []) {
+    if (defined.has(property)) {
+      throw new TypeError(
+        `${options.label}.${String(property)} is listed more than once`,
+      );
+    }
+    defined.add(property);
+    if (
+      !options.replacements?.has(property) &&
+      !(property in options.target)
+    ) {
+      throw new TypeError(
+        `${options.label}.${String(property)} is not a property`,
+      );
+    }
+    Object.defineProperty(exposed, property, {
+      configurable: false,
+      enumerable: true,
+      get() {
+        options.assertUsable();
+        return options.replacements?.has(property)
+          ? options.replacements.get(property)
+          : Reflect.get(options.target, property, options.target);
+      },
+    });
+  }
+  exposedObjectTargets.set(exposed, options.target);
+  return Object.freeze(exposed) as T;
+}
+
+function copyAndFreezeClaimIdentity(
+  input: DeliveryClaimIdentity,
+): DeliveryClaimIdentity {
+  const moduleJobId = input.moduleJobId;
+  const claimToken = input.claimToken;
+  const runId = input.runId;
+  const attempt = input.attempt;
+  const moduleGenerationId = input.moduleGenerationId;
+  return Object.freeze({
+    moduleJobId,
+    claimToken,
+    runId,
+    attempt,
+    moduleGenerationId,
   });
 }
 
+function copyAndFreezeNegativeAcknowledgement(
+  input: NegativeAcknowledgementRequest,
+): NegativeAcknowledgementRequest {
+  const identity = copyAndFreezeClaimIdentity(input);
+  const suppliedFailure = input.failure as unknown;
+  const failureCode =
+    suppliedFailure !== null && typeof suppliedFailure === "object"
+      ? Reflect.get(suppliedFailure, "code")
+      : undefined;
+  const retryable =
+    suppliedFailure !== null && typeof suppliedFailure === "object"
+      ? Reflect.get(suppliedFailure, "retryable")
+      : undefined;
+  return Object.freeze({
+    ...identity,
+    failure: Object.freeze({
+      code: failureCode,
+      retryable,
+    }),
+  }) as NegativeAcknowledgementRequest;
+}
+
+const MODULE_PROCESS_RECORD_FIELDS = new Set([
+  "schemaVersion",
+  "instanceId",
+  "moduleId",
+  "moduleGenerationId",
+  "processGenerationId",
+  "packageDigest",
+  "configurationReference",
+  "declaredExternalEffects",
+  "serviceInvocationId",
+  "bootId",
+  "moduleCgroupPath",
+  "state",
+  "createdAt",
+  "updatedAt",
+  "diagnosticPid",
+  "failureCode",
+]);
+
+const MODULE_PROCESS_CONFIGURATION_FIELDS = new Set([
+  "configId",
+  "revision",
+  "configVersion",
+]);
+
+const MODULE_SUBMISSION_RECORD_FIELDS = new Set([
+  "schemaVersion",
+  "moduleJobId",
+  "claimToken",
+  "runId",
+  "attempt",
+  "moduleGenerationId",
+  "processGenerationId",
+  "inputDigest",
+  "createdAt",
+]);
+
+function copyUnrecognizedFields(
+  source: Record<string, unknown>,
+  sourceKeys: readonly string[],
+  recognizedFields: ReadonlySet<string>,
+  target: Record<string, unknown>,
+): void {
+  for (const key of sourceKeys) {
+    if (!recognizedFields.has(key)) {
+      target[key] = Reflect.get(source, key);
+    }
+  }
+}
+
+function copyModuleProcessRecordInput(input: ModuleProcessRecord): unknown {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) {
+    return input;
+  }
+  const source = input as unknown as Record<string, unknown>;
+  const sourceKeys = Object.keys(source);
+  const configurationInput = Reflect.get(source, "configurationReference") as unknown;
+  let configurationReference: unknown = configurationInput;
+  if (
+    configurationInput !== null &&
+    typeof configurationInput === "object" &&
+    !Array.isArray(configurationInput)
+  ) {
+    const configurationSource =
+      configurationInput as Record<string, unknown>;
+    const configurationKeys = Object.keys(configurationSource);
+    const copiedConfiguration: Record<string, unknown> = {
+      configId: Reflect.get(configurationSource, "configId"),
+      revision: Reflect.get(configurationSource, "revision"),
+      configVersion: Reflect.get(configurationSource, "configVersion"),
+    };
+    copyUnrecognizedFields(
+      configurationSource,
+      configurationKeys,
+      MODULE_PROCESS_CONFIGURATION_FIELDS,
+      copiedConfiguration,
+    );
+    configurationReference = copiedConfiguration;
+  }
+
+  const diagnosticPid = Reflect.get(source, "diagnosticPid") as unknown;
+  const failureCode = Reflect.get(source, "failureCode") as unknown;
+  const copied: Record<string, unknown> = {
+    schemaVersion: Reflect.get(source, "schemaVersion"),
+    instanceId: Reflect.get(source, "instanceId"),
+    moduleId: Reflect.get(source, "moduleId"),
+    moduleGenerationId: Reflect.get(source, "moduleGenerationId"),
+    processGenerationId: Reflect.get(source, "processGenerationId"),
+    packageDigest: Reflect.get(source, "packageDigest"),
+    configurationReference,
+    declaredExternalEffects: Reflect.get(source, "declaredExternalEffects"),
+    serviceInvocationId: Reflect.get(source, "serviceInvocationId"),
+    bootId: Reflect.get(source, "bootId"),
+    moduleCgroupPath: Reflect.get(source, "moduleCgroupPath"),
+    state: Reflect.get(source, "state"),
+    createdAt: Reflect.get(source, "createdAt"),
+    updatedAt: Reflect.get(source, "updatedAt"),
+    ...(diagnosticPid === undefined ? {} : { diagnosticPid }),
+    ...(failureCode === undefined ? {} : { failureCode }),
+  };
+  copyUnrecognizedFields(
+    source,
+    sourceKeys,
+    MODULE_PROCESS_RECORD_FIELDS,
+    copied,
+  );
+  return copied;
+}
+
+function copyModuleSubmissionRecordInput(
+  input: ModuleSubmissionRecord,
+): unknown {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) {
+    return input;
+  }
+  const source = input as unknown as Record<string, unknown>;
+  const sourceKeys = Object.keys(source);
+  const copied: Record<string, unknown> = {
+    schemaVersion: Reflect.get(source, "schemaVersion"),
+    moduleJobId: Reflect.get(source, "moduleJobId"),
+    claimToken: Reflect.get(source, "claimToken"),
+    runId: Reflect.get(source, "runId"),
+    attempt: Reflect.get(source, "attempt"),
+    moduleGenerationId: Reflect.get(source, "moduleGenerationId"),
+    processGenerationId: Reflect.get(source, "processGenerationId"),
+    inputDigest: Reflect.get(source, "inputDigest"),
+    createdAt: Reflect.get(source, "createdAt"),
+  };
+  copyUnrecognizedFields(
+    source,
+    sourceKeys,
+    MODULE_SUBMISSION_RECORD_FIELDS,
+    copied,
+  );
+  return copied;
+}
+
+/**
+ * Verifies the part of the Core-state document that crosses the Delivery,
+ * Module process, and Module submission record collections.
+ */
+function assertSubmissionRecordsMatchActiveClaims(
+  deliveries: DeliveryStore,
+  processRecords: readonly ModuleProcessRecord[],
+  submissionRecords: readonly ModuleSubmissionRecord[],
+): void {
+  const processByGeneration = new Map(
+    processRecords.map((record) => [record.processGenerationId, record]),
+  );
+  try {
+    for (const submission of submissionRecords) {
+      const claim = deliveries.inspectClaim(submission);
+      const processRecord = processByGeneration.get(submission.processGenerationId);
+      if (
+        claim.status !== "active" ||
+        processRecord === undefined ||
+        processRecord.state === "starting" ||
+        claim.consumerId !== processRecord.moduleId ||
+        submission.moduleGenerationId !== processRecord.moduleGenerationId ||
+        canonicalJsonDigest(deliveries.inspectClaimInput(submission)) !== submission.inputDigest
+      ) {
+        throw new Error("Module submission record does not match active Core state");
+      }
+    }
+  } catch {
+    throw new CoreStateError(
+      "CORE_STATE_DOCUMENT_INVALID",
+      "Every Module submission record must match one exact active Claim, its Module process, and its persisted input",
+    );
+  }
+}
+
+/**
+ * The ReferenceGraph operations exposed by FileCore state. This is a
+ * read-only object, not a ReferenceGraph instance, because graph mutations
+ * must be persisted through the owning FileCore operation.
+ */
+export type FileCoreReferenceGraphOperations = Pick<
+  ReferenceGraph,
+  (typeof REFERENCE_GRAPH_PUBLIC_METHODS)[number]
+>;
+
+/**
+ * The Block operations exposed by FileCore state. This frozen object retains
+ * the normal persisted Block API but omits persistence-observer replacement
+ * and does not have BlockStore's class identity.
+ */
+export type FileCoreBlockOperations = Pick<
+  BlockStore,
+  Exclude<(typeof BLOCK_STORE_PUBLIC_METHODS)[number], "isSameBlockStore">
+> & {
+  readonly isSameBlockStore: (
+    other: FileCoreBlockOperations | BlockStore,
+  ) => boolean;
+  readonly size: number;
+  readonly referenceGraph: FileCoreReferenceGraphOperations;
+};
+
+/**
+ * The Delivery operations exposed by FileCore state. Exact Claim terminal
+ * changes are omitted because FileCore must update the matching Module
+ * submission record in the same persisted state change.
+ */
+export type FileCoreDeliveryOperations = Pick<
+  DeliveryStore,
+  Exclude<(typeof DELIVERY_STORE_PUBLIC_METHODS)[number], "usesSameBlockStore">
+> & {
+  readonly usesSameBlockStore: (
+    blocks: FileCoreBlockOperations | BlockStore,
+  ) => boolean;
+};
+
+/**
+ * The Media operations exposed by FileCore state. This frozen object omits
+ * persistence-observer replacement and exposes only the read-only graph
+ * operations owned by the same FileCore state.
+ */
+export type FileCoreMediaOperations = Pick<
+  MediaStore,
+  (typeof MEDIA_STORE_PUBLIC_METHODS)[number]
+> & {
+  readonly referenceGraph: FileCoreReferenceGraphOperations;
+};
+
 export class FileCoreStateStore {
-  readonly referenceGraph: ReferenceGraph;
-  readonly media: MediaStore | undefined;
-  readonly blocks: BlockStore;
-  readonly deliveries: DeliveryStore;
+  readonly referenceGraph: FileCoreReferenceGraphOperations;
+  readonly media: FileCoreMediaOperations | undefined;
+  readonly blocks: FileCoreBlockOperations;
+  readonly deliveries: FileCoreDeliveryOperations;
   readonly #referenceGraph: ReferenceGraph;
   readonly #media: MediaStore | undefined;
   readonly #blocks: BlockStore;
@@ -279,6 +698,8 @@ export class FileCoreStateStore {
   #deferPersistence = false;
   #deferredMutation = false;
   #reopenRequired = false;
+  #componentMutationInProgress = false;
+  #persistedStateDigest: string;
 
   constructor(options: FileCoreStateStoreOptions) {
     if (
@@ -359,6 +780,7 @@ export class FileCoreStateStore {
     });
 
     this.#revision = document.revision;
+    this.#persistedStateDigest = document.stateDigest;
     let loaded: {
       readonly referenceGraph: ReferenceGraph;
       readonly media: MediaStore | undefined;
@@ -426,40 +848,84 @@ export class FileCoreStateStore {
         "Core state components are inconsistent",
       );
     }
+    assertSubmissionRecordsMatchActiveClaims(
+      loaded.deliveries,
+      document.moduleProcessRecords,
+      document.moduleSubmissionRecords,
+    );
 
     this.#referenceGraph = loaded.referenceGraph;
     this.#media = loaded.media;
     this.#blocks = loaded.blocks;
     this.#deliveries = loaded.deliveries;
     const assertUsable = () => this.#assertUsable();
+    const invokeMutation = (
+      _property: PropertyKey,
+      asynchronous: boolean,
+      operation: () => unknown,
+    ) => this.#invokeComponentMutation(asynchronous, operation);
     this.referenceGraph = exposeCheckedObject({
       target: this.#referenceGraph,
       assertUsable,
       label: "FileCoreStateStore.referenceGraph",
-      forbiddenMethods: REFERENCE_GRAPH_MUTATION_METHODS,
-    });
+      methods: REFERENCE_GRAPH_PUBLIC_METHODS,
+    }) as unknown as FileCoreReferenceGraphOperations;
     this.media = this.#media === undefined
       ? undefined
       : exposeCheckedObject({
           target: this.#media,
           assertUsable,
           label: "FileCoreStateStore.media",
-          forbiddenMethods: MUTATION_OBSERVER_METHODS,
-          replacements: new Map([[this.#referenceGraph, this.referenceGraph]]),
-        });
+          methods: MEDIA_STORE_PUBLIC_METHODS,
+          properties: ["referenceGraph"],
+          replacements: new Map([["referenceGraph", this.referenceGraph]]),
+          mutationMethods: MEDIA_STORE_MUTATION_METHODS,
+          asynchronousMutationMethods: MEDIA_STORE_ASYNCHRONOUS_MUTATION_METHODS,
+          invokeMutation,
+        }) as unknown as FileCoreMediaOperations;
     this.blocks = exposeCheckedObject({
       target: this.#blocks,
       assertUsable,
       label: "FileCoreStateStore.blocks",
-      forbiddenMethods: MUTATION_OBSERVER_METHODS,
-      replacements: new Map([[this.#referenceGraph, this.referenceGraph]]),
-    });
+      methods: BLOCK_STORE_PUBLIC_METHODS,
+      properties: ["size", "referenceGraph"],
+      replacements: new Map([["referenceGraph", this.referenceGraph]]),
+      mutationMethods: BLOCK_STORE_MUTATION_METHODS,
+      invokeMutation,
+    }) as unknown as FileCoreBlockOperations;
     this.deliveries = exposeCheckedObject({
       target: this.#deliveries,
       assertUsable,
       label: "FileCoreStateStore.deliveries",
-      forbiddenMethods: MUTATION_OBSERVER_METHODS,
-      replacements: new Map([[this.#blocks, this.blocks]]),
+      methods: DELIVERY_STORE_PUBLIC_METHODS,
+      mutationMethods: DELIVERY_STORE_MUTATION_METHODS,
+      invokeMutation,
+    }) as unknown as FileCoreDeliveryOperations;
+    Object.defineProperties(this, {
+      referenceGraph: {
+        configurable: false,
+        enumerable: true,
+        writable: false,
+        value: this.referenceGraph,
+      },
+      media: {
+        configurable: false,
+        enumerable: true,
+        writable: false,
+        value: this.media,
+      },
+      blocks: {
+        configurable: false,
+        enumerable: true,
+        writable: false,
+        value: this.blocks,
+      },
+      deliveries: {
+        configurable: false,
+        enumerable: true,
+        writable: false,
+        value: this.deliveries,
+      },
     });
 
     for (const record of document.moduleProcessRecords) {
@@ -473,6 +939,70 @@ export class FileCoreStateStore {
     this.#media?.setMutationObserver(persist);
     this.#blocks.setMutationObserver(persist);
     this.#deliveries.setMutationObserver(persist);
+  }
+
+  /** @internal Only product composition uses this complete operation set. */
+  createModuleResultCommitOperations(): ModuleResultCommitOperations {
+    this.#assertUsable();
+    const assertUsable = () => this.#assertUsable();
+    const invokeMutation = (
+      _property: PropertyKey,
+      asynchronous: boolean,
+      operation: () => unknown,
+    ) => this.#invokeComponentMutation(asynchronous, operation);
+    const blocks = exposeCheckedObject({
+      target: this.#blocks,
+      assertUsable,
+      label: "FileCoreStateStore Module result Block operations",
+      methods: MODULE_RESULT_COMMIT_BLOCK_METHODS,
+      mutationMethods: BLOCK_STORE_MUTATION_METHODS,
+      invokeMutation,
+    });
+    const deliveries = exposeCheckedObject({
+      target: this.#deliveries,
+      assertUsable,
+      label: "FileCoreStateStore Module result Delivery operations",
+      methods: MODULE_RESULT_COMMIT_DELIVERY_METHODS,
+      mutationMethods: DELIVERY_STORE_MUTATION_METHODS,
+      invokeMutation,
+    });
+    const operations = Object.create(null) as Record<PropertyKey, unknown>;
+    Object.defineProperties(operations, {
+      blocks: {
+        configurable: false,
+        enumerable: true,
+        writable: false,
+        value: blocks,
+      },
+      deliveries: {
+        configurable: false,
+        enumerable: true,
+        writable: false,
+        value: deliveries,
+      },
+      getModuleSubmissionRecord: {
+        configurable: false,
+        enumerable: true,
+        writable: false,
+        value: (runId: string) => {
+          this.#assertUsable();
+          return this.#moduleSubmissionRecords.get(runId);
+        },
+      },
+      acknowledgeDeliveryClaim: {
+        configurable: false,
+        enumerable: true,
+        writable: false,
+        value: (identity: DeliveryClaimIdentity) =>
+          this.#applyClaimTerminalState(
+            identity,
+            copyAndFreezeClaimIdentity,
+            true,
+            (copiedIdentity) => this.#deliveries.ack(copiedIdentity),
+          ),
+      },
+    });
+    return Object.freeze(operations) as unknown as ModuleResultCommitOperations;
   }
 
   get revision(): number {
@@ -529,25 +1059,26 @@ export class FileCoreStateStore {
    */
   appendModuleProcessRecord(record: ModuleProcessRecord): ModuleProcessRecord {
     this.#assertUsable();
-    assertValidModuleProcessRecord(record);
-    if (record.state !== "starting") {
+    const copiedRecord = copyModuleProcessRecordInput(record);
+    assertValidModuleProcessRecord(copiedRecord);
+    if (copiedRecord.state !== "starting") {
       throw new ModuleProcessRecordError(
         "MODULE_PROCESS_RECORD_STATE_INVALID",
         "A new Module process record must begin in the starting state",
       );
     }
-    if (this.#moduleProcessRecords.has(record.processGenerationId)) {
+    if (this.#moduleProcessRecords.has(copiedRecord.processGenerationId)) {
       throw new ModuleProcessRecordError(
         "MODULE_PROCESS_RECORD_CONFLICT",
-        `Module process record "${record.processGenerationId}" already exists`,
+        `Module process record "${copiedRecord.processGenerationId}" already exists`,
       );
     }
-    const stored = deepFreeze({ ...record });
-    this.#moduleProcessRecords.set(record.processGenerationId, stored);
+    const stored = deepFreeze(copiedRecord);
+    this.#moduleProcessRecords.set(copiedRecord.processGenerationId, stored);
     try {
       this.#persistCurrent();
     } catch (error) {
-      this.#moduleProcessRecords.delete(record.processGenerationId);
+      this.#moduleProcessRecords.delete(copiedRecord.processGenerationId);
       throw error;
     }
     return stored;
@@ -603,14 +1134,17 @@ export class FileCoreStateStore {
    */
   appendModuleSubmissionRecord(record: ModuleSubmissionRecord): ModuleSubmissionRecord {
     this.#assertUsable();
-    assertValidModuleSubmissionRecord(record);
-    if (this.#moduleSubmissionRecords.has(record.runId)) {
+    const copiedRecord = copyModuleSubmissionRecordInput(record);
+    assertValidModuleSubmissionRecord(copiedRecord);
+    if (this.#moduleSubmissionRecords.has(copiedRecord.runId)) {
       throw new ModuleProcessRecordError(
         "MODULE_SUBMISSION_RECORD_CONFLICT",
-        `Module submission record for Run "${record.runId}" already exists`,
+        `Module submission record for Run "${copiedRecord.runId}" already exists`,
       );
     }
-    const processRecord = this.#moduleProcessRecords.get(record.processGenerationId);
+    const processRecord = this.#moduleProcessRecords.get(
+      copiedRecord.processGenerationId,
+    );
     if (!processRecord) {
       throw new ModuleProcessRecordError(
         "MODULE_SUBMISSION_RECORD_UNAUTHORIZED",
@@ -623,28 +1157,100 @@ export class FileCoreStateStore {
         `A Module submission record requires a running process record, not ${processRecord.state}`,
       );
     }
-    if (processRecord.moduleGenerationId !== record.moduleGenerationId) {
+    if (processRecord.moduleGenerationId !== copiedRecord.moduleGenerationId) {
       throw new ModuleProcessRecordError(
         "MODULE_SUBMISSION_RECORD_UNAUTHORIZED",
         "A Module submission record must match its process record's Module generation",
       );
     }
-    const stored = deepFreeze({ ...record });
-    this.#moduleSubmissionRecords.set(record.runId, stored);
+    let claim: ReturnType<DeliveryStore["inspectClaim"]>;
+    let persistedInputDigest: string;
+    try {
+      claim = this.#deliveries.inspectClaim(copiedRecord);
+      persistedInputDigest = canonicalJsonDigest(
+        this.#deliveries.inspectClaimInput(copiedRecord),
+      );
+    } catch {
+      throw new ModuleProcessRecordError(
+        "MODULE_SUBMISSION_RECORD_UNAUTHORIZED",
+        "A Module submission record requires one exact persisted Delivery Claim",
+      );
+    }
+    if (claim.status !== "active") {
+      throw new ModuleProcessRecordError(
+        "MODULE_SUBMISSION_RECORD_UNAUTHORIZED",
+        "A Module submission record requires an active Delivery Claim",
+      );
+    }
+    if (claim.consumerId !== processRecord.moduleId) {
+      throw new ModuleProcessRecordError(
+        "MODULE_SUBMISSION_RECORD_UNAUTHORIZED",
+        "A Module submission record's Claim must belong to the Module process",
+      );
+    }
+    if (copiedRecord.inputDigest !== persistedInputDigest) {
+      throw new ModuleProcessRecordError(
+        "MODULE_SUBMISSION_RECORD_UNAUTHORIZED",
+        "A Module submission record input digest must match the persisted Claim input",
+      );
+    }
+    const stored = deepFreeze(copiedRecord);
+    this.#moduleSubmissionRecords.set(copiedRecord.runId, stored);
     try {
       this.#persistCurrent();
     } catch (error) {
-      this.#moduleSubmissionRecords.delete(record.runId);
+      this.#moduleSubmissionRecords.delete(copiedRecord.runId);
       throw error;
     }
     return stored;
   }
 
   /**
-   * Removes one Module submission record. Per ADR 0009 the caller may do this
-   * only in the update that records the matching Claim as terminal.
+   * Commits one exact Delivery Claim and removes its matching Module
+   * submission record in the same Core-state update.
    */
-  removeModuleSubmissionRecord(runId: string): void {
+  acknowledgeDeliveryClaim(
+    identity: DeliveryClaimIdentity,
+  ): "committed" | "already-committed" {
+    return this.#applyClaimTerminalState(
+      identity,
+      copyAndFreezeClaimIdentity,
+      true,
+      (copiedIdentity) => this.#deliveries.ack(copiedIdentity),
+    );
+  }
+
+  /**
+   * Releases one exact Delivery Claim and removes its matching Module
+   * submission record in the same Core-state update.
+   */
+  releaseDeliveryClaim(
+    identity: DeliveryClaimIdentity,
+  ): "released" | "already-released" {
+    return this.#applyClaimTerminalState(
+      identity,
+      copyAndFreezeClaimIdentity,
+      false,
+      (copiedIdentity) => this.#deliveries.releaseClaim(copiedIdentity),
+    );
+  }
+
+  /**
+   * Records one exact Delivery Claim failure and removes its matching Module
+   * submission record in the same Core-state update.
+   */
+  negativelyAcknowledgeDeliveryClaim(
+    request: NegativeAcknowledgementRequest,
+  ): "retry-scheduled" | "dead-lettered" {
+    return this.#applyClaimTerminalState(
+      request,
+      copyAndFreezeNegativeAcknowledgement,
+      false,
+      (copiedRequest) => this.#deliveries.nack(copiedRequest),
+    );
+  }
+
+  #removeModuleSubmissionRecord(runId: string): void {
     this.#assertUsable();
     const existing = this.#moduleSubmissionRecords.get(runId);
     if (!existing) {
@@ -664,7 +1270,8 @@ export class FileCoreStateStore {
 
   /**
    * Collects one `stopped` Module process record that no submission record
-   * references. Records pinned by unresolved evidence stay in place.
+   * references and whose Module generation has no active Claim. Records
+   * pinned by unresolved evidence stay in place.
    */
   removeModuleProcessRecord(processGenerationId: string): void {
     this.#assertUsable();
@@ -688,6 +1295,16 @@ export class FileCoreStateStore {
           "A Module process record referenced by a submission record may not be removed",
         );
       }
+    }
+    if (
+      this.#deliveries
+        .listActiveClaims()
+        .some((claim) => claim.moduleGenerationId === existing.moduleGenerationId)
+    ) {
+      throw new ModuleProcessRecordError(
+        "MODULE_PROCESS_RECORD_IN_USE",
+        "A Module process record for a generation with an active Claim may not be removed",
+      );
     }
     this.#moduleProcessRecords.delete(processGenerationId);
     try {
@@ -747,7 +1364,6 @@ export class FileCoreStateStore {
       }
     } catch (error) {
       this.#deferPersistence = false;
-      const mutated = this.#deferredMutation;
       this.#deferredMutation = false;
       this.#moduleProcessRecords.clear();
       for (const [key, value] of processRecords) this.#moduleProcessRecords.set(key, value);
@@ -755,29 +1371,162 @@ export class FileCoreStateStore {
       for (const [key, value] of submissionRecords) {
         this.#moduleSubmissionRecords.set(key, value);
       }
-      if (returnedValue || mutated) {
-        // Another component inside the update may have changed its own
-        // in-memory state, or an asynchronous continuation may still try to
-        // use this store. Neither can be allowed to persist after this point.
+      if (returnedValue) {
+        // An asynchronous continuation could still mutate a component after
+        // this callback has returned, so equality at this instant is not
+        // enough to keep the store usable.
         this.#reopenRequired = true;
-        if (returnedValue) throw error;
-        throw new CoreStateError(
-          "CORE_STATE_REOPEN_REQUIRED",
-          "A Core state update failed after changing runtime state; reopen the store",
-        );
+        throw error;
       }
+      this.#confirmInMemoryStateMatchesPersistedState();
       throw error;
     }
     this.#deferPersistence = false;
     const mutated = this.#deferredMutation;
     this.#deferredMutation = false;
-    if (!mutated) return;
+    if (!mutated) {
+      this.#confirmInMemoryStateMatchesPersistedState();
+      return;
+    }
     try {
       this.#persistCurrent();
+      this.#confirmInMemoryStateMatchesPersistedState();
     } catch (error) {
       this.#reopenRequired = true;
       throw error;
     }
+  }
+
+  /**
+   * Applies one exact Claim terminal change and removes its matching
+   * submission record before the single deferred Core-state write.
+   */
+  #applyClaimTerminalState<
+    Request extends DeliveryClaimIdentity,
+    Result,
+  >(
+    suppliedRequest: Request,
+    copyRequest: (request: Request) => Request,
+    requireSubmission: boolean,
+    changeClaim: (request: Request) => Result,
+  ): Result {
+    this.#assertUsable();
+    const request = copyRequest(suppliedRequest);
+    const claim = this.#deliveries.inspectClaim(request);
+    const submission = this.#moduleSubmissionRecords.get(request.runId);
+    if (
+      submission !== undefined &&
+      (
+        submission.moduleJobId !== request.moduleJobId ||
+        submission.claimToken !== request.claimToken ||
+        submission.runId !== request.runId ||
+        submission.attempt !== request.attempt ||
+        submission.moduleGenerationId !== request.moduleGenerationId
+      )
+    ) {
+      this.#reopenRequired = true;
+      throw new CoreStateError(
+        "CORE_STATE_REOPEN_REQUIRED",
+        "The Module submission record does not match its exact Delivery Claim; reopen the store",
+      );
+    }
+    if (claim.status !== "active" && submission !== undefined) {
+      this.#reopenRequired = true;
+      throw new CoreStateError(
+        "CORE_STATE_REOPEN_REQUIRED",
+        "A terminal Delivery Claim still has a Module submission record; reopen the store",
+      );
+    }
+    if (
+      requireSubmission &&
+      claim.status === "active" &&
+      submission === undefined
+    ) {
+      throw new ModuleProcessRecordError(
+        "MODULE_SUBMISSION_RECORD_NOT_FOUND",
+        "An active Delivery Claim requires its exact Module submission record before acknowledgement",
+      );
+    }
+
+    let result!: Result;
+    this.runAtomicUpdate(() => {
+      result = changeClaim(request);
+      if (submission !== undefined) {
+        this.#removeModuleSubmissionRecord(request.runId);
+      }
+    });
+    return result;
+  }
+
+  #invokeComponentMutation<Result>(
+    asynchronous: boolean,
+    operation: () => Result,
+  ): Result {
+    this.#assertUsable();
+    if (this.#deferPersistence) {
+      if (asynchronous) {
+        throw new CoreStateError(
+          "CORE_STATE_IO_FAILED",
+          "An asynchronous component mutation cannot run inside an atomic Core state update",
+        );
+      }
+      return operation();
+    }
+
+    this.#componentMutationInProgress = true;
+    let result: Result;
+    try {
+      result = operation();
+    } catch (error) {
+      this.#componentMutationInProgress = false;
+      this.#confirmInMemoryStateMatchesPersistedState();
+      throw error;
+    }
+
+    const possiblePromise = result as unknown;
+    if (
+      possiblePromise !== null &&
+      (typeof possiblePromise === "object" || typeof possiblePromise === "function") &&
+      typeof (possiblePromise as PromiseLike<unknown>).then === "function"
+    ) {
+      return Promise.resolve(possiblePromise).then(
+        (value) => {
+          this.#componentMutationInProgress = false;
+          this.#confirmInMemoryStateMatchesPersistedState();
+          return value;
+        },
+        (error: unknown) => {
+          this.#componentMutationInProgress = false;
+          this.#confirmInMemoryStateMatchesPersistedState();
+          throw error;
+        },
+      ) as Result;
+    }
+
+    this.#componentMutationInProgress = false;
+    this.#confirmInMemoryStateMatchesPersistedState();
+    return result;
+  }
+
+  #confirmInMemoryStateMatchesPersistedState(): void {
+    try {
+      const current = this.#createDocument(
+        this.#revision,
+        this.#referenceGraph,
+        this.#media,
+        this.#blocks,
+        this.#deliveries,
+      );
+      if (current.stateDigest === this.#persistedStateDigest) return;
+    } catch {
+      // Failure to serialize all current component state is itself a loss of
+      // proof that memory still equals the last successful write.
+    }
+    this.#reopenRequired = true;
+    throw new CoreStateError(
+      "CORE_STATE_REOPEN_REQUIRED",
+      "In-memory Core state no longer matches the last successful write; reopen the store",
+    );
   }
 
   #assertUsable(): void {
@@ -787,10 +1536,25 @@ export class FileCoreStateStore {
         "This Core state store failed an update and must be reopened",
       );
     }
+    if (this.#componentMutationInProgress) {
+      throw new CoreStateError(
+        "CORE_STATE_LOCKED",
+        "A Core state component mutation is still in progress",
+      );
+    }
+  }
+
+  #assertPersistenceUsable(): void {
+    if (this.#reopenRequired) {
+      throw new CoreStateError(
+        "CORE_STATE_REOPEN_REQUIRED",
+        "This Core state store failed an update and must be reopened",
+      );
+    }
   }
 
   #persistCurrent(): void {
-    this.#assertUsable();
+    this.#assertPersistenceUsable();
     if (this.#deferPersistence) {
       this.#deferredMutation = true;
       return;
@@ -827,6 +1591,7 @@ export class FileCoreStateStore {
         throw error;
       }
       this.#revision = revision;
+      this.#persistedStateDigest = document.stateDigest;
     });
   }
 

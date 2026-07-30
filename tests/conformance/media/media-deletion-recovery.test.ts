@@ -185,8 +185,11 @@ function volatileHarness(
 }
 
 async function makeCollectible(
-  mediaStore: MediaStore,
-  blocks: BlockStore,
+  mediaStore: Pick<MediaStore, "registerMedia" | "releaseRegistration">,
+  blocks: Pick<
+    BlockStore,
+    "collectUnreachable" | "commitOnce" | "releaseCommitEffect"
+  >,
   registrationId: string,
   beforeRelease?: (media: Media) => Promise<void>,
 ): Promise<Media> {

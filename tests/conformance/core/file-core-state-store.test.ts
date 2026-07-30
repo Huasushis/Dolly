@@ -7,14 +7,25 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type BlockProposal } from "../../../src/core/block-store.js";
+import {
+  BlockStore,
+  type BlockProposal,
+} from "../../../src/core/block-store.js";
 import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
-import { DeliveryStoreError } from "../../../src/core/delivery-store.js";
+import {
+  DeliveryStore,
+  DeliveryStoreError,
+} from "../../../src/core/delivery-store.js";
 import {
   CoreStateError,
   FileCoreStateStore,
   migrateCoreStateDocumentToVersion16,
 } from "../../../src/core/file-core-state-store.js";
+import {
+  MediaStore,
+  type MediaByteStore,
+} from "../../../src/core/media-store.js";
+import { ReferenceGraph } from "../../../src/core/reference-graph.js";
 import { withSynchronousCrossProcessLock } from "../../../src/core/synchronous-cross-process-lock.js";
 
 const NOW = "2026-07-24T00:00:00.000Z";
@@ -38,6 +49,50 @@ function openStore(
     nextBlockId: () => `${prefix}-block-${++blockId}`,
     nextDeliveryId: (kind) => `${prefix}-${kind}-${++runtimeId}`,
     now: () => NOW,
+  });
+}
+
+class PersistentMediaBytes implements MediaByteStore {
+  readonly durability = "persistent" as const;
+  readonly #values = new Map<string, Uint8Array>();
+
+  async put(mediaId: string, bytes: Uint8Array): Promise<void> {
+    this.#values.set(mediaId, Uint8Array.from(bytes));
+  }
+
+  async get(mediaId: string): Promise<Uint8Array> {
+    const bytes = this.#values.get(mediaId);
+    if (bytes === undefined) throw new Error(`Bytes for ${mediaId} do not exist`);
+    return Uint8Array.from(bytes);
+  }
+
+  async delete(mediaId: string): Promise<void> {
+    this.#values.delete(mediaId);
+  }
+
+  async has(mediaId: string): Promise<boolean> {
+    return this.#values.has(mediaId);
+  }
+}
+
+function openStoreWithMedia(path: string): FileCoreStateStore {
+  let blockId = 0;
+  let runtimeId = 0;
+  return new FileCoreStateStore({
+    path,
+    maxFailedAttempts: 3,
+    nextBlockId: () => `media-block-${++blockId}`,
+    nextDeliveryId: (kind) => `media-${kind}-${++runtimeId}`,
+    now: () => NOW,
+    media: {
+      durability: "persistent",
+      bytes: new PersistentMediaBytes(),
+      inspector: {
+        inspect: async () => ({ mimeType: "application/octet-stream" }),
+      },
+      maxMediaBytes: 1024,
+      idNamespace: "file-core-view-test",
+    },
   });
 }
 
@@ -89,7 +144,7 @@ describe("CORE atomic file state", () => {
     ).toBe(1);
     expect(reopened.referenceGraph.leaseCountFor({ kind: "block", id: block.id })).toBe(1);
 
-    expect(reopened.deliveries.nack({
+    expect(reopened.negativelyAcknowledgeDeliveryClaim({
       moduleJobId: claim.moduleJobId,
       claimToken: claim.claimToken,
       runId: claim.runId,
@@ -132,7 +187,7 @@ describe("CORE atomic file state", () => {
       maxBytes: 1024 * 1024,
     })!;
     expect(claim.hasMore).toBe(true);
-    expect(first.deliveries.releaseClaim({
+    expect(first.releaseDeliveryClaim({
       moduleJobId: claim.moduleJobId,
       claimToken: claim.claimToken,
       runId: claim.runId,
@@ -178,20 +233,77 @@ describe("CORE atomic file state", () => {
     expect(openStore(path, "reopen").snapshot()).toEqual(store.snapshot());
   });
 
-  it("keeps file persistence wiring and reference-graph mutations under store control", () => {
+  it("exposes only frozen null-prototype component operations", () => {
     const store = openStore(path, "owned");
+    const storeWithMedia = openStoreWithMedia(join(root, "media-core-state.json"));
+    const views = [
+      store.referenceGraph,
+      store.blocks,
+      store.deliveries,
+      storeWithMedia.media!,
+      storeWithMedia.media!.referenceGraph,
+    ];
+
+    for (const view of views) {
+      expect(Object.getPrototypeOf(view)).toBeNull();
+      expect(Object.isFrozen(view)).toBe(true);
+      expect(Reflect.get(view, "valueOf")).toBeUndefined();
+      expect(Reflect.get(view, "constructor")).toBeUndefined();
+      expect(Reflect.set(view, "injected", () => view)).toBe(false);
+      expect(Reflect.defineProperty(view, "injected", {
+        value: () => view,
+      })).toBe(false);
+      expect(Reflect.setPrototypeOf(view, {
+        injected() {
+          return this;
+        },
+      })).toBe(false);
+      expect(Reflect.get(view, "injected")).toBeUndefined();
+    }
+    for (const [owner, property] of [
+      [store, "referenceGraph"],
+      [store, "blocks"],
+      [store, "deliveries"],
+      [storeWithMedia, "media"],
+    ] as const) {
+      const original = Reflect.get(owner, property);
+      expect(Object.getOwnPropertyDescriptor(owner, property)).toMatchObject({
+        configurable: false,
+        writable: false,
+        value: original,
+      });
+      expect(Reflect.set(owner, property, Object.create(null))).toBe(false);
+      expect(Reflect.defineProperty(owner, property, {
+        value: Object.create(null),
+      })).toBe(false);
+      expect(Reflect.get(owner, property)).toBe(original);
+    }
 
     expect(store.blocks.referenceGraph).toBe(store.referenceGraph);
-    expect(Object.getOwnPropertyDescriptor(store.blocks, "referenceGraph")?.value)
-      .toBe(store.referenceGraph);
+    expect(Object.getOwnPropertyDescriptor(store.blocks, "referenceGraph")?.get)
+      .toEqual(expect.any(Function));
+    expect(store.blocks.isSameBlockStore(store.blocks)).toBe(true);
+    expect(store.deliveries.usesSameBlockStore(store.blocks)).toBe(true);
+    // @ts-expect-error FileCore does not expose persistence observer replacement.
     expect(() => store.blocks.setMutationObserver(undefined)).toThrowError(TypeError);
+    // @ts-expect-error The Delivery persistence observer is intentionally not public.
     expect(() => store.deliveries.setMutationObserver(undefined)).toThrowError(TypeError);
     expect(() =>
+      // @ts-expect-error FileCore exposes only read operations on the reference graph.
       store.referenceGraph.registerNode({ kind: "block", id: "unpersisted" }),
     ).toThrowError(TypeError);
     expect(() =>
+      // @ts-expect-error Nested reference graph access is read-only too.
       store.blocks.referenceGraph.registerNode({ kind: "block", id: "nested-unpersisted" }),
     ).toThrowError(TypeError);
+    expect(() => ReferenceGraph.prototype.snapshot.call(store.referenceGraph))
+      .toThrowError(TypeError);
+    expect(() => BlockStore.prototype.snapshot.call(store.blocks))
+      .toThrowError(TypeError);
+    expect(() => DeliveryStore.prototype.snapshot.call(store.deliveries))
+      .toThrowError(TypeError);
+    expect(() => MediaStore.prototype.snapshot.call(storeWithMedia.media))
+      .toThrowError(TypeError);
 
     store.deliveries.createPage("persisted-page");
     expect(openStore(path, "reopen").deliveries.validateOutputPages(["persisted-page"]))
@@ -201,13 +313,15 @@ describe("CORE atomic file state", () => {
   it("rejects stale writers instead of overwriting a newer runtime revision", () => {
     const first = openStore(path, "first");
     const stale = openStore(path, "stale");
+    const staleBlocks = stale.blocks;
     const readStaleBlocks = stale.blocks.snapshot;
     const readStaleReferenceGraph = stale.referenceGraph.snapshot;
+    const readStaleBlockCount = () => staleBlocks.size;
     first.deliveries.createPage("first-page");
 
     expect(() => stale.deliveries.createPage("stale-page")).toThrowError(
-      expect.objectContaining<Partial<DeliveryStoreError>>({
-        code: "DELIVERY_PERSISTENCE_FAILED",
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
       }),
     );
     expect(() => stale.revision).toThrowError(
@@ -225,6 +339,11 @@ describe("CORE atomic file state", () => {
         code: "CORE_STATE_REOPEN_REQUIRED",
       }),
     );
+    expect(readStaleBlockCount).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
 
     const truth = openStore(path, "truth");
     expect(truth.deliveries.validateOutputPages(["first-page"])).toEqual(["first-page"]);
@@ -233,21 +352,26 @@ describe("CORE atomic file state", () => {
     );
   });
 
-  it("retries a mutation whose first atomic write could not acquire the lock", () => {
+  it("requires a reopen when a changed component could not acquire the write lock", () => {
     const store = openStore(path, "first");
     withSynchronousCrossProcessLock({ resourceId: `${path}.lock` }, () => {
       expect(() => store.deliveries.createPage("page")).toThrowError(
-        expect.objectContaining<Partial<DeliveryStoreError>>({
-          code: "DELIVERY_PERSISTENCE_FAILED",
+        expect.objectContaining<Partial<CoreStateError>>({
+          code: "CORE_STATE_REOPEN_REQUIRED",
         }),
       );
     });
-    expect(store.revision).toBe(0);
-    expect(() => store.flush()).not.toThrow();
-    expect(store.revision).toBe(1);
-    expect(openStore(path, "reopen").deliveries.validateOutputPages(["page"])).toEqual([
-      "page",
-    ]);
+    expect(() => store.revision).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
+    expect(() => openStore(path, "reopen").deliveries.validateOutputPages(["page"]))
+      .toThrowError(
+        expect.objectContaining<Partial<DeliveryStoreError>>({
+          code: "PAGE_NOT_FOUND",
+        }),
+      );
   });
 
   it("retries the exact Claim release after an atomic write failure", () => {
@@ -275,13 +399,21 @@ describe("CORE atomic file state", () => {
     };
 
     withSynchronousCrossProcessLock({ resourceId: `${path}.lock` }, () => {
-      expect(() => store.deliveries.releaseClaim(request)).toThrowError(
-        expect.objectContaining<Partial<DeliveryStoreError>>({
-          code: "DELIVERY_PERSISTENCE_FAILED",
+      expect(() => store.releaseDeliveryClaim(request)).toThrowError(
+        expect.objectContaining<Partial<CoreStateError>>({
+          code: "CORE_STATE_LOCKED",
         }),
       );
     });
-    expect(store.deliveries.releaseClaim(request)).toBe("already-released");
+    expect(() => store.releaseDeliveryClaim(request)).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
+
+    const retry = openStore(path, "retry");
+    expect(retry.deliveries.inspectClaim(request).status).toBe("active");
+    expect(retry.releaseDeliveryClaim(request)).toBe("released");
 
     const reopened = openStore(path, "reopened");
     expect(reopened.deliveries.inspectClaim(request).status).toBe("released");

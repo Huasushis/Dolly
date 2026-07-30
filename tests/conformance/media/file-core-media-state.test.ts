@@ -56,8 +56,9 @@ describe("MEDIA atomic Core/Media state", () => {
   it("restores Media before validating an attached Block in the same revision", async () => {
     const first = openStore(root, "first");
     expect(first.media!.referenceGraph).toBe(first.referenceGraph);
-    expect(Object.getOwnPropertyDescriptor(first.media!, "referenceGraph")?.value)
-      .toBe(first.referenceGraph);
+    expect(Object.getOwnPropertyDescriptor(first.media!, "referenceGraph")?.get)
+      .toEqual(expect.any(Function));
+    // @ts-expect-error FileCore does not expose persistence observer replacement.
     expect(() => first.media!.setMutationObserver(undefined)).toThrowError(TypeError);
     first.deliveries.createPage("page");
     first.deliveries.registerConsumer("page", "consumer", "from-now");

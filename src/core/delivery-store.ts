@@ -425,6 +425,15 @@ export class DeliveryStore {
     if (options.snapshot) this.#restore(options.snapshot);
   }
 
+  /** Returns whether this Delivery store uses the supplied exact Block store. */
+  usesSameBlockStore(blocks: BlockStore): boolean {
+    try {
+      return blocks.isSameBlockStore(this.#blocks);
+    } catch {
+      return false;
+    }
+  }
+
   setMutationObserver(observer: (() => void) | undefined): void {
     if (observer !== undefined && typeof observer !== "function") {
       throw new TypeError("DeliveryStore mutation observer must be a function");
@@ -755,6 +764,23 @@ export class DeliveryStore {
   }
 
   /**
+   * Rebuilds the immutable input of one exact Claim from its persisted Module
+   * job and Delivery records. Callers do not supply any part of the input.
+   */
+  inspectClaimInput(request: DeliveryClaimIdentity): ReactiveModuleInput {
+    this.flushPersistence();
+    const claim = this.#requireClaim(request);
+    const moduleJob = this.#moduleJobs.get(claim.moduleJobId);
+    if (!moduleJob) {
+      throw new DeliveryStoreError(
+        "CLAIM_STALE",
+        `Claim ${request.claimToken} has no Module job`,
+      );
+    }
+    return this.#buildReactiveInput(moduleJob.deliveryIds, moduleJob.hasMore);
+  }
+
+  /**
    * Return the distinct IDs of Blocks delivered directly to this claim. This
    * reads the Module job's persisted Delivery IDs on every call instead of
    * keeping a second list, so a claim cannot drift away from its input
@@ -843,6 +869,18 @@ export class DeliveryStore {
     return effect === undefined
       ? null
       : deepFreeze({ effectId, ...effect });
+  }
+
+  /**
+   * Lists every existing Page identity without exposing the rest of the
+   * Delivery snapshot. Append effects can target only existing Pages, and
+   * Pages are not removed, so callers can inspect a deterministic effect ID
+   * for each Page without scanning the unbounded append-effect history.
+   */
+  listPageIds(): readonly string[] {
+    this.flushPersistence();
+    return deepFreeze([...this.#pages.keys()].sort((left, right) =>
+      left.localeCompare(right)));
   }
 
   claim(request: ClaimRequest): DeliveryClaim | null {

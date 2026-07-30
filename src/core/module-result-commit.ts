@@ -17,7 +17,15 @@ import {
   type MediaReferenceItem,
   type Rect,
 } from "./block-content.js";
-import { type DeliveryClaimIdentity, type DeliveryStore } from "./delivery-store.js";
+import {
+  type ClaimDescriptor,
+  type DeliveryClaimIdentity,
+  type DeliveryStore,
+} from "./delivery-store.js";
+import {
+  assertValidModuleSubmissionRecord,
+  type ModuleSubmissionRecord,
+} from "./module-process-records.js";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
@@ -86,6 +94,18 @@ export interface ModuleResultCommitHookEvent {
   readonly pageId?: string;
 }
 
+/**
+ * `MODULE_RESULT_PERSISTED_STATE_CONFLICT` means the journal, Delivery Claim,
+ * Module submission record, and Block or Delivery effects form a persisted
+ * combination that the result-commit protocol does not allow. Repository
+ * document shape and journal-transition violations continue to use
+ * `MODULE_RESULT_COMMIT_REPOSITORY_CONFLICT`.
+ *
+ * `MODULE_RESULT_OPERATION_CONTRACT_VIOLATION` means an operation supplied to
+ * the coordinator returned a Promise or another thenable even though its
+ * contract requires a synchronous result. It does not describe persisted
+ * state found before the operation ran.
+ */
 export type ModuleResultCommitErrorCode =
   | "MODULE_JOB_ID_INVALID"
   | "MODULE_JOB_RESULT_CONFLICT"
@@ -94,6 +114,8 @@ export type ModuleResultCommitErrorCode =
   | "MODULE_JOB_OUTPUT_INVALID"
   | "MODULE_RESULT_COMMIT_RECORD_MISSING"
   | "MODULE_RESULT_COMMIT_REPOSITORY_CONFLICT"
+  | "MODULE_RESULT_PERSISTED_STATE_CONFLICT"
+  | "MODULE_RESULT_OPERATION_CONTRACT_VIOLATION"
   | "MODULE_RESULT_COMMIT_DOCUMENT_INVALID"
   | "MODULE_RESULT_COMMIT_LIMIT_EXCEEDED"
   | "MODULE_RESULT_COMMIT_LOCKED"
@@ -393,6 +415,18 @@ export function assertModuleResultCommitRecord(record: ModuleResultCommitRecord)
       "A committed Module job is missing output Deliveries",
     );
   }
+  const expectedRevision =
+    record.state === "prepared"
+      ? 1 + (record.blockId === undefined ? 0 : 1) + record.outputDeliveries.length
+      : record.blockProposal === undefined
+        ? 2
+        : 3 + record.outputPageIds.length;
+  if (record.revision !== expectedRevision) {
+    throw new ModuleResultCommitError(
+      "MODULE_RESULT_COMMIT_REPOSITORY_CONFLICT",
+      "Module result commit revision does not match its recorded effects and state",
+    );
+  }
 }
 
 function sameImmutableIdentity(
@@ -526,9 +560,58 @@ export class InMemoryModuleResultCommitRepository
   }
 }
 
-export interface ModuleResultCommitCoordinatorOptions {
-  readonly blocks: BlockStore;
-  readonly deliveries: DeliveryStore;
+/**
+ * The complete set of Core-state operations used by one Module result commit.
+ * Persistent product construction obtains this set from one
+ * `FileCoreStateStore`; it deliberately omits raw Delivery Claim terminal
+ * methods.
+ */
+export type ModuleResultCommitBlockOperations = Pick<
+  BlockStore,
+  | "commitOnce"
+  | "inspectCommitEffect"
+  | "normalizeInput"
+  | "releaseCommitEffect"
+  | "validateInput"
+  | "validateSource"
+>;
+
+export type ModuleResultCommitDeliveryOperations = Pick<
+  DeliveryStore,
+  | "appendOnce"
+  | "inspectAppendEffect"
+  | "inspectClaim"
+  | "inspectClaimInput"
+  | "inspectClaimInputBlockIds"
+  | "inspectClaimInputMediaReferences"
+  | "listPageIds"
+  | "validateOutputPages"
+> & {
+  usesSameBlockStore(blocks: ModuleResultCommitBlockOperations): boolean;
+};
+
+export interface ModuleResultCommitOperations {
+  readonly blocks: ModuleResultCommitBlockOperations;
+  readonly deliveries: ModuleResultCommitDeliveryOperations;
+  /**
+   * Acknowledges the Delivery Claim through the owning Core-state boundary.
+   * Persistent implementations remove its matching submission record in the
+   * same state update.
+   */
+  readonly acknowledgeDeliveryClaim: (
+    identity: DeliveryClaimIdentity,
+  ) => "committed" | "already-committed";
+  /**
+   * Reads the submission record from the same Core-state document that owns
+   * Delivery Claim completion.
+   */
+  readonly getModuleSubmissionRecord: (
+    runId: string,
+  ) => ModuleSubmissionRecord | undefined;
+}
+
+export interface ModuleResultCommitCoordinatorOptions
+  extends ModuleResultCommitOperations {
   readonly repository: ModuleResultCommitRepository;
   readonly now: () => string;
   readonly afterEffect?: (
@@ -536,17 +619,34 @@ export interface ModuleResultCommitCoordinatorOptions {
   ) => void | Promise<void>;
 }
 
+/**
+ * @internal Product composition must use `createModuleResultCommitCoordinator`
+ * so Block, Delivery, submission, and acknowledgement operations all come
+ * from one `FileCoreStateStore`. Direct construction remains available for
+ * isolated protocol tests.
+ */
 export class ModuleResultCommitCoordinator {
-  readonly #blocks: BlockStore;
-  readonly #deliveries: DeliveryStore;
+  readonly #blocks: ModuleResultCommitBlockOperations;
+  readonly #deliveries: ModuleResultCommitCoordinatorOptions["deliveries"];
+  readonly #acknowledgeDeliveryClaim:
+    ModuleResultCommitCoordinatorOptions["acknowledgeDeliveryClaim"];
+  readonly #getModuleSubmissionRecord:
+    ModuleResultCommitCoordinatorOptions["getModuleSubmissionRecord"];
   readonly #repository: ModuleResultCommitRepository;
   readonly #now: () => string;
   readonly #afterEffect?: ModuleResultCommitCoordinatorOptions["afterEffect"];
   readonly #inFlight = new Map<string, Promise<ModuleResultCommitRecord>>();
 
   constructor(options: ModuleResultCommitCoordinatorOptions) {
+    if (!options.deliveries.usesSameBlockStore(options.blocks)) {
+      throw new TypeError(
+        "Module result commit requires its Block and Delivery operations to use the same Block store",
+      );
+    }
     this.#blocks = options.blocks;
     this.#deliveries = options.deliveries;
+    this.#acknowledgeDeliveryClaim = options.acknowledgeDeliveryClaim;
+    this.#getModuleSubmissionRecord = options.getModuleSubmissionRecord;
     this.#repository = options.repository;
     this.#now = options.now;
     this.#afterEffect = options.afterEffect;
@@ -603,6 +703,7 @@ export class ModuleResultCommitCoordinator {
       moduleGenerationId: input.moduleGenerationId,
     };
     const claim = this.#deliveries.inspectClaim(claimRequest);
+    this.#assertClaimMatchesIdentity(claim, claimRequest);
     const source = this.#blocks.validateSource(input.source);
     this.#assertSourceMatchesClaim(source, claim.consumerId);
     const outputPageIds = this.#deliveries.validateOutputPages(input.outputPageIds);
@@ -626,17 +727,9 @@ export class ModuleResultCommitCoordinator {
     if (existing) {
       assertModuleResultCommitRecord(existing);
       this.#assertSameResult(existing, input, resultDigest);
-      if (existing.state === "prepared") {
-        this.#assertPreparedResultAllowed(existing);
-      }
       return existing;
     }
-    if (claim.status !== "active") {
-      throw new ModuleResultCommitError(
-        "MODULE_JOB_CLAIM_NOT_ACTIVE",
-        `Claim for ${claim.moduleJobId} is ${claim.status}`,
-      );
-    }
+    this.#assertActiveClaimHasSubmission(claim, claimRequest);
     if (blockProposal !== undefined) {
       this.#assertOutputBlockReferencesAllowed(blockProposal, claimRequest);
       this.#assertOutputMediaReferencesAllowed(blockProposal, claimRequest);
@@ -661,6 +754,21 @@ export class ModuleResultCommitCoordinator {
       updatedAt: now,
       ...(blockProposal === undefined ? {} : { blockProposal }),
     });
+    try {
+      this.#assertNoEffectsBeforePrepared(prepared);
+    } catch (error) {
+      if (
+        !(error instanceof ModuleResultCommitError) ||
+        error.code !== "MODULE_RESULT_PERSISTED_STATE_CONFLICT"
+      ) {
+        throw error;
+      }
+      const raced = this.#repository.get(claim.moduleJobId);
+      if (!raced) throw error;
+      assertModuleResultCommitRecord(raced);
+      this.#assertSameResult(raced, input, resultDigest);
+      return raced;
+    }
     const created = this.#repository.createPrepared(prepared);
     if (created === "created") return prepared;
     const raced = this.#repository.get(claim.moduleJobId)!;
@@ -694,20 +802,95 @@ export class ModuleResultCommitCoordinator {
     }
   }
 
-  #assertPreparedResultAllowed(record: ModuleResultCommitRecord): void {
-    const claimRequest: DeliveryClaimIdentity = {
+  #claimIdentity(
+    record: Pick<
+      ModuleResultCommitRecord,
+      "moduleJobId" | "claimToken" | "runId" | "attempt" | "moduleGenerationId"
+    >,
+  ): DeliveryClaimIdentity {
+    return {
       moduleJobId: record.moduleJobId,
       claimToken: record.claimToken,
       runId: record.runId,
       attempt: record.attempt,
       moduleGenerationId: record.moduleGenerationId,
     };
-    const claim = this.#deliveries.inspectClaim(claimRequest);
-    this.#assertSourceMatchesClaim(record.source, claim.consumerId);
-    if (record.blockProposal !== undefined) {
-      this.#assertOutputBlockReferencesAllowed(record.blockProposal, claimRequest);
-      this.#assertOutputMediaReferencesAllowed(record.blockProposal, claimRequest);
+  }
+
+  #assertClaimMatchesIdentity(
+    claim: ClaimDescriptor,
+    identity: DeliveryClaimIdentity,
+  ): void {
+    if (
+      claim.moduleJobId === identity.moduleJobId &&
+      claim.claimToken === identity.claimToken &&
+      claim.runId === identity.runId &&
+      claim.attempt === identity.attempt &&
+      claim.moduleGenerationId === identity.moduleGenerationId
+    ) {
+      return;
     }
+    throw new ModuleResultCommitError(
+      "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+      `Delivery Claim does not match Module job ${identity.moduleJobId}`,
+      { moduleJobId: identity.moduleJobId },
+    );
+  }
+
+  #assertSubmissionMatchesIdentity(
+    submission: ModuleSubmissionRecord | undefined,
+    identity: DeliveryClaimIdentity,
+  ): void {
+    if (
+      submission !== undefined &&
+      submission.moduleJobId === identity.moduleJobId &&
+      submission.claimToken === identity.claimToken &&
+      submission.runId === identity.runId &&
+      submission.attempt === identity.attempt &&
+      submission.moduleGenerationId === identity.moduleGenerationId &&
+      submission.inputDigest ===
+        canonicalJsonDigest(this.#deliveries.inspectClaimInput(identity))
+    ) {
+      return;
+    }
+    throw new ModuleResultCommitError(
+      "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+      `Module job ${identity.moduleJobId} requires its exact submission record`,
+      { moduleJobId: identity.moduleJobId },
+    );
+  }
+
+  #readModuleSubmissionRecord(runId: string): ModuleSubmissionRecord | undefined {
+    const submission: unknown = this.#getModuleSubmissionRecord(runId);
+    if (submission === undefined) return undefined;
+    try {
+      assertValidModuleSubmissionRecord(submission);
+    } catch {
+      throw new ModuleResultCommitError(
+        "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+        `Run ${runId} has an invalid Module submission record`,
+        { runId },
+      );
+    }
+    return submission;
+  }
+
+  #assertActiveClaimHasSubmission(
+    claim: ClaimDescriptor,
+    identity: DeliveryClaimIdentity,
+  ): void {
+    this.#assertClaimMatchesIdentity(claim, identity);
+    if (claim.status !== "active") {
+      throw new ModuleResultCommitError(
+        "MODULE_JOB_CLAIM_NOT_ACTIVE",
+        `A new Module result requires an active Claim; ${identity.moduleJobId} is ${claim.status}`,
+        { claimStatus: claim.status, moduleJobId: identity.moduleJobId },
+      );
+    }
+    this.#assertSubmissionMatchesIdentity(
+      this.#readModuleSubmissionRecord(identity.runId),
+      identity,
+    );
   }
 
   #assertSourceMatchesClaim(source: SourceIdentity, consumerId: string): void {
@@ -777,6 +960,248 @@ export class ModuleResultCommitCoordinator {
     }
   }
 
+  #validatePersistentState(
+    record: ModuleResultCommitRecord,
+  ): "active" | "committed" {
+    const identity = this.#claimIdentity(record);
+    const claim = this.#deliveries.inspectClaim(identity);
+    this.#assertClaimMatchesIdentity(claim, identity);
+    this.#assertSourceMatchesClaim(record.source, claim.consumerId);
+    const submission = this.#readModuleSubmissionRecord(record.runId);
+
+    if (claim.status === "active") {
+      if (record.state !== "prepared") {
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          `Committed Module result ${record.moduleJobId} still has an active Claim`,
+          { moduleJobId: record.moduleJobId },
+        );
+      }
+      this.#assertPreparedResultStillValid(record);
+      this.#assertSubmissionMatchesIdentity(submission, identity);
+      if (record.blockProposal !== undefined) {
+        this.#assertOutputBlockReferencesAllowed(record.blockProposal, identity);
+        this.#assertOutputMediaReferencesAllowed(record.blockProposal, identity);
+      }
+      this.#assertRecordedEffects(record, false);
+      return "active";
+    }
+
+    if (claim.status === "committed") {
+      if (submission !== undefined) {
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          `Committed Claim for Module job ${record.moduleJobId} still has a submission record`,
+          { moduleJobId: record.moduleJobId },
+        );
+      }
+      this.#assertRecordedEffects(record, true);
+      return "committed";
+    }
+
+    throw new ModuleResultCommitError(
+      "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+      `Module result ${record.moduleJobId} cannot continue from Claim state ${claim.status}`,
+      { claimStatus: claim.status, moduleJobId: record.moduleJobId },
+    );
+  }
+
+  #assertPreparedResultStillValid(record: ModuleResultCommitRecord): void {
+    try {
+      const outputPageIds = this.#deliveries.validateOutputPages(
+        record.outputPageIds,
+      );
+      if (
+        outputPageIds.length !== record.outputPageIds.length ||
+        !outputPageIds.every(
+          (pageId, index) => pageId === record.outputPageIds[index],
+        )
+      ) {
+        throw new Error("Output Page validation changed the journal");
+      }
+      if (record.blockProposal !== undefined) {
+        this.#blocks.validateInput(record.blockProposal, record.source);
+      }
+    } catch {
+      throw new ModuleResultCommitError(
+        "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+        `Prepared Module result ${record.moduleJobId} is no longer valid against its Block and Delivery stores`,
+        { moduleJobId: record.moduleJobId },
+      );
+    }
+  }
+
+  #assertRecordedEffects(
+    record: ModuleResultCommitRecord,
+    requireComplete: boolean,
+  ): void {
+    this.#assertNoUndeclaredDeliveryEffects(record);
+    if (
+      requireComplete &&
+      (record.blockProposal !== undefined
+        ? record.blockId === undefined ||
+          record.outputDeliveries.length !== record.outputPageIds.length
+        : record.outputPageIds.length !== 0)
+    ) {
+      throw new ModuleResultCommitError(
+        "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+        `Module result ${record.moduleJobId} reached a committed Claim before all effects were recorded`,
+        { moduleJobId: record.moduleJobId },
+      );
+    }
+
+    const blockEffect = this.#blocks.inspectCommitEffect(
+      this.#blockEffectId(record.moduleJobId),
+    );
+    if (record.blockProposal === undefined) {
+      if (blockEffect === null) return;
+      throw new ModuleResultCommitError(
+        "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+        `No-Block Module result ${record.moduleJobId} has an unexpected Block effect`,
+        { moduleJobId: record.moduleJobId },
+      );
+    }
+
+    const expectedBlockEffectDigest = canonicalJsonDigest({
+      proposal: record.blockProposal,
+      source: record.source,
+    });
+    if (
+      (record.blockId !== undefined && blockEffect === null) ||
+      (blockEffect !== null &&
+        (blockEffect.digest !== expectedBlockEffectDigest ||
+          (record.state === "prepared" && !blockEffect.strongReferenceHeld) ||
+          (record.blockId !== undefined && blockEffect.record.id !== record.blockId)))
+    ) {
+      throw new ModuleResultCommitError(
+        "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+        `Module result ${record.moduleJobId} does not match its recorded Block effect`,
+        { moduleJobId: record.moduleJobId },
+      );
+    }
+
+    if (record.blockId === undefined) {
+      for (const pageId of record.outputPageIds) {
+        if (
+          this.#deliveries.inspectAppendEffect(
+            this.#deliveryEffectId(record.moduleJobId, pageId),
+          ) === null
+        ) {
+          continue;
+        }
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          `Module result ${record.moduleJobId} has a Delivery effect before its Block journal entry`,
+          { moduleJobId: record.moduleJobId, pageId },
+        );
+      }
+      return;
+    }
+    if (blockEffect === null) {
+      throw new ModuleResultCommitError(
+        "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+        `Module result ${record.moduleJobId} does not match its recorded Block effect`,
+        { moduleJobId: record.moduleJobId },
+      );
+    }
+
+    for (let index = 0; index < record.outputPageIds.length; index += 1) {
+      const pageId = record.outputPageIds[index]!;
+      const output = record.outputDeliveries[index];
+      const deliveryEffect = this.#deliveries.inspectAppendEffect(
+        this.#deliveryEffectId(record.moduleJobId, pageId),
+      );
+      if (output !== undefined) {
+        if (
+          deliveryEffect !== null &&
+          deliveryEffect.pageId === output.pageId &&
+          deliveryEffect.blockId === record.blockId &&
+          deliveryEffect.record.deliveryId === output.deliveryId &&
+          deliveryEffect.record.pageId === output.pageId &&
+          deliveryEffect.record.blockId === record.blockId
+        ) {
+          continue;
+        }
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          `Module result ${record.moduleJobId} does not match its recorded Delivery effect`,
+          { moduleJobId: record.moduleJobId, pageId },
+        );
+      }
+
+      const isNextEffect =
+        record.blockId !== undefined &&
+        index === record.outputDeliveries.length;
+      if (deliveryEffect === null) continue;
+      if (
+        isNextEffect &&
+        deliveryEffect.pageId === pageId &&
+        deliveryEffect.blockId === record.blockId &&
+        deliveryEffect.record.pageId === pageId &&
+        deliveryEffect.record.blockId === record.blockId
+      ) {
+        continue;
+      }
+      throw new ModuleResultCommitError(
+        "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+        `Module result ${record.moduleJobId} has an output Delivery effect before its preceding journal entry`,
+        { moduleJobId: record.moduleJobId, pageId },
+      );
+    }
+  }
+
+  #assertNoEffectsBeforePrepared(record: ModuleResultCommitRecord): void {
+    if (
+      this.#blocks.inspectCommitEffect(
+        this.#blockEffectId(record.moduleJobId),
+      ) !== null
+    ) {
+      throw new ModuleResultCommitError(
+        "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+        `Module job ${record.moduleJobId} has a Block effect but no prepared result journal`,
+        { moduleJobId: record.moduleJobId },
+      );
+    }
+    for (const pageId of record.outputPageIds) {
+      if (
+        this.#deliveries.inspectAppendEffect(
+          this.#deliveryEffectId(record.moduleJobId, pageId),
+        ) === null
+      ) {
+        continue;
+      }
+      throw new ModuleResultCommitError(
+        "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+        `Module job ${record.moduleJobId} has an output Delivery effect but no prepared result journal`,
+        { moduleJobId: record.moduleJobId, pageId },
+      );
+    }
+    this.#assertNoUndeclaredDeliveryEffects(record);
+  }
+
+  #assertNoUndeclaredDeliveryEffects(record: ModuleResultCommitRecord): void {
+    const declaredPageIds = new Set(record.outputPageIds);
+    for (const pageId of this.#deliveries.listPageIds()) {
+      const effect = this.#deliveries.inspectAppendEffect(
+        this.#deliveryEffectId(record.moduleJobId, pageId),
+      );
+      if (effect === null) continue;
+      if (effect.pageId !== pageId) {
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          `Module job ${record.moduleJobId} has a Delivery effect whose target does not match its effect identity`,
+          { moduleJobId: record.moduleJobId, pageId },
+        );
+      }
+      if (declaredPageIds.has(effect.pageId)) continue;
+      throw new ModuleResultCommitError(
+        "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+        `Module job ${record.moduleJobId} has a Delivery effect for undeclared output Page ${effect.pageId}`,
+        { moduleJobId: record.moduleJobId, pageId: effect.pageId },
+      );
+    }
+  }
+
   #runExclusive(moduleJobId: string): Promise<ModuleResultCommitRecord> {
     const existing = this.#inFlight.get(moduleJobId);
     if (existing) return existing;
@@ -789,7 +1214,7 @@ export class ModuleResultCommitCoordinator {
 
   async #resume(moduleJobId: string): Promise<ModuleResultCommitRecord> {
     for (;;) {
-      let record = this.#repository.get(moduleJobId);
+      const record = this.#repository.get(moduleJobId);
       if (!record) {
         throw new ModuleResultCommitError(
           "MODULE_RESULT_COMMIT_RECORD_MISSING",
@@ -797,78 +1222,36 @@ export class ModuleResultCommitCoordinator {
         );
       }
       assertModuleResultCommitRecord(record);
-      if (record.state === "prepared") {
-        this.#assertPreparedResultAllowed(record);
-      }
-      if (record.state === "committed") {
-        if (record.blockProposal !== undefined) {
-          const blockEffectId = this.#blockEffectId(moduleJobId);
-          const effect = this.#blocks.inspectCommitEffect(blockEffectId);
-          if (!effect) {
-            throw new ModuleResultCommitError(
-              "MODULE_RESULT_COMMIT_REPOSITORY_CONFLICT",
-              `Committed Module job ${moduleJobId} is missing its Block effect`,
-            );
+      const claimState = this.#validatePersistentState(record);
+      if (claimState === "committed") {
+        if (record.state === "committed") {
+          if (record.blockProposal !== undefined) {
+            this.#blocks.releaseCommitEffect(this.#blockEffectId(moduleJobId));
           }
-          const block = this.#blocks.commitOnce(
-            blockEffectId,
-            record.blockProposal,
-            record.source,
-          );
-          if (record.blockId !== block.id) {
-            throw new ModuleResultCommitError(
-              "MODULE_RESULT_COMMIT_REPOSITORY_CONFLICT",
-              `Committed Module job ${moduleJobId} points to another output Block`,
-            );
-          }
-          for (const output of record.outputDeliveries) {
-            const deliveryEffectId = this.#deliveryEffectId(moduleJobId, output.pageId);
-            const deliveryEffect = this.#deliveries.inspectAppendEffect(deliveryEffectId);
-            if (!deliveryEffect) {
-              throw new ModuleResultCommitError(
-                "MODULE_RESULT_COMMIT_REPOSITORY_CONFLICT",
-                `Committed Module job ${moduleJobId} is missing an output Delivery effect`,
-              );
-            }
-            const delivery = this.#deliveries.appendOnce(
-              deliveryEffectId,
-              output.pageId,
-              block.id,
-            );
-            if (delivery.deliveryId !== output.deliveryId) {
-              throw new ModuleResultCommitError(
-                "MODULE_RESULT_COMMIT_REPOSITORY_CONFLICT",
-                `Committed Module job ${moduleJobId} points to another output Delivery`,
-              );
-            }
-          }
+          return record;
         }
-        this.#deliveries.ack({
-          moduleJobId: record.moduleJobId,
-          claimToken: record.claimToken,
-          runId: record.runId,
-          attempt: record.attempt,
-          moduleGenerationId: record.moduleGenerationId,
+        const committed = immutableRecord({
+          ...record,
+          state: "committed",
+          revision: record.revision + 1,
+          updatedAt: canonicalTime(this.#now),
         });
-        if (record.blockProposal !== undefined) {
+        if (!this.#repository.compareAndSet(moduleJobId, record.revision, committed)) {
+          continue;
+        }
+        if (committed.blockProposal !== undefined) {
           this.#blocks.releaseCommitEffect(this.#blockEffectId(moduleJobId));
         }
-        return record;
+        return committed;
       }
 
       if (record.blockProposal !== undefined) {
-        const block = this.#blocks.commitOnce(
-          this.#blockEffectId(moduleJobId),
-          record.blockProposal,
-          record.source,
-        );
-        if (record.blockId !== undefined && record.blockId !== block.id) {
-          throw new ModuleResultCommitError(
-            "MODULE_RESULT_COMMIT_REPOSITORY_CONFLICT",
-            `Module job ${moduleJobId} points to another output Block`,
-          );
-        }
         if (record.blockId === undefined) {
+          const block = this.#blocks.commitOnce(
+            this.#blockEffectId(moduleJobId),
+            record.blockProposal,
+            record.source,
+          );
           await this.#afterEffect?.({ phase: "after-block-effect", moduleJobId });
           const next = immutableRecord({
             ...record,
@@ -906,13 +1289,7 @@ export class ModuleResultCommitCoordinator {
         continue;
       }
 
-      this.#deliveries.ack({
-        moduleJobId: record.moduleJobId,
-        claimToken: record.claimToken,
-        runId: record.runId,
-        attempt: record.attempt,
-        moduleGenerationId: record.moduleGenerationId,
-      });
+      this.#acknowledgeAndConfirm(record);
       await this.#afterEffect?.({ phase: "after-ack-effect", moduleJobId });
       const committed = immutableRecord({
         ...record,
@@ -928,6 +1305,60 @@ export class ModuleResultCommitCoordinator {
       }
       return committed;
     }
+  }
+
+  /**
+   * A callback response is not proof that it changed the same Delivery store.
+   * The exact Claim in the store used by this coordinator must be committed
+   * before the journal can advance or recovery can finish.
+   */
+  #acknowledgeAndConfirm(record: ModuleResultCommitRecord): void {
+    const identity = this.#claimIdentity(record);
+    let acknowledgementError: unknown;
+    let returnedPromise = false;
+    try {
+      const result: unknown = this.#acknowledgeDeliveryClaim(identity);
+      returnedPromise =
+        result !== null &&
+        (typeof result === "object" || typeof result === "function") &&
+        typeof (result as { readonly then?: unknown }).then === "function";
+      if (returnedPromise) {
+        acknowledgementError = new ModuleResultCommitError(
+          "MODULE_RESULT_OPERATION_CONTRACT_VIOLATION",
+          "Delivery Claim acknowledgement must complete synchronously",
+          { moduleJobId: record.moduleJobId },
+        );
+      }
+    } catch (error) {
+      acknowledgementError = error;
+    }
+
+    let claim: ClaimDescriptor;
+    try {
+      claim = this.#deliveries.inspectClaim(identity);
+    } catch (error) {
+      throw acknowledgementError ?? error;
+    }
+    this.#assertClaimMatchesIdentity(claim, identity);
+    this.#assertSourceMatchesClaim(record.source, claim.consumerId);
+    const submission = this.#readModuleSubmissionRecord(record.runId);
+    if (
+      !returnedPromise &&
+      claim.status === "committed" &&
+      submission === undefined
+    ) {
+      return;
+    }
+    if (acknowledgementError !== undefined) throw acknowledgementError;
+    throw new ModuleResultCommitError(
+      "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+      `Acknowledgement for Module job ${record.moduleJobId} did not commit its exact Claim and remove its submission record`,
+      {
+        claimStatus: claim.status,
+        moduleJobId: record.moduleJobId,
+        submissionPresent: submission !== undefined,
+      },
+    );
   }
 
   #blockEffectId(moduleJobId: string): string {

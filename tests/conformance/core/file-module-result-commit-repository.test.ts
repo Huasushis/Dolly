@@ -7,8 +7,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { BlockStore, type BlockProposal } from "../../../src/core/block-store.js";
-import { DeliveryStore } from "../../../src/core/delivery-store.js";
+import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
+import { DeliveryStore, type DeliveryClaim } from "../../../src/core/delivery-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
+import type { ModuleSubmissionRecord } from "../../../src/core/module-process-records.js";
 import {
   ModuleResultCommitCoordinator,
   ModuleResultCommitError,
@@ -26,6 +28,23 @@ function proposal(text: string): BlockProposal {
       schema: "dolly.content/1",
       value: { items: [{ type: "text", text, format: "plain" }] },
     },
+  };
+}
+
+function submissionForClaim(
+  deliveries: DeliveryStore,
+  claim: DeliveryClaim,
+): ModuleSubmissionRecord {
+  return {
+    schemaVersion: "dolly.module-submission-record/1",
+    moduleJobId: claim.moduleJobId,
+    claimToken: claim.claimToken,
+    runId: claim.runId,
+    attempt: claim.attempt,
+    moduleGenerationId: claim.moduleGenerationId,
+    processGenerationId: `${claim.moduleGenerationId}-process`,
+    inputDigest: canonicalJsonDigest(deliveries.inspectClaimInput(claim)),
+    createdAt: NOW,
   };
 }
 
@@ -108,6 +127,38 @@ describe("CORE durable Module result commit repository", () => {
     );
   });
 
+  it.each([
+    [
+      "prepared effects",
+      () => ({ ...preparedRecord(), revision: 2 }),
+    ],
+    [
+      "committed effects",
+      () => ({
+        ...preparedRecord(),
+        state: "committed" as const,
+        revision: 5,
+        blockId: "block-2",
+        outputDeliveries: [{ pageId: "output", deliveryId: "delivery-1" }],
+      }),
+    ],
+  ] as const)("rejects a file whose revision does not match its %s", (_label, record) => {
+    writeFileSync(
+      path,
+      `${JSON.stringify({
+        schemaVersion: "dolly.module-result-commit-repository/1",
+        revision: 1,
+        records: [record()],
+      })}\n`,
+      "utf8",
+    );
+    expect(() => new FileModuleResultCommitRepository({ path })).toThrowError(
+      expect.objectContaining<Partial<ModuleResultCommitError>>({
+        code: "MODULE_RESULT_COMMIT_DOCUMENT_INVALID",
+      }),
+    );
+  });
+
   it("rejects the previous commit schema and processingId field", () => {
     const repository = new FileModuleResultCommitRepository({ path });
     const current = preparedRecord();
@@ -169,11 +220,21 @@ describe("CORE durable Module result commit repository", () => {
       maxCount: 1,
       maxBytes: 1024 * 1024,
     })!;
+    const submissions = new Map<string, ModuleSubmissionRecord>([
+      [claim.runId, submissionForClaim(deliveries, claim)],
+    ]);
+    const acknowledgeDeliveryClaim = (identity: Parameters<DeliveryStore["ack"]>[0]) => {
+      const result = deliveries.ack(identity);
+      submissions.delete(identity.runId);
+      return result;
+    };
     let injected = false;
     const firstRepository = new FileModuleResultCommitRepository({ path });
     const interrupted = new ModuleResultCommitCoordinator({
       blocks,
       deliveries,
+      getModuleSubmissionRecord: (runId) => submissions.get(runId),
+      acknowledgeDeliveryClaim,
       repository: firstRepository,
       now: () => NOW,
       afterEffect: (event) => {
@@ -203,6 +264,8 @@ describe("CORE durable Module result commit repository", () => {
     const recovered = new ModuleResultCommitCoordinator({
       blocks,
       deliveries,
+      getModuleSubmissionRecord: (runId) => submissions.get(runId),
+      acknowledgeDeliveryClaim,
       repository: reopenedRepository,
       now: () => NOW,
     });

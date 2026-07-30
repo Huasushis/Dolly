@@ -134,7 +134,7 @@ describe("production runtime bootstrap", () => {
       releasedClaims: [],
       unknownOutcomeClaims: [],
       stoppedProcessGenerationIds: [],
-      collectedRecords: { submissionRecords: 0, processRecords: 0 },
+      collectedRecords: { processRecords: 0 },
     });
     expect(runtime.status()).toMatchObject({
       schemaVersion: "dolly.runtime-status/3",

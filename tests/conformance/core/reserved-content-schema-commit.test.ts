@@ -19,7 +19,9 @@
 
 import { describe, expect, it } from "vitest";
 import { BlockStore, BlockStoreError, type BlockProposal } from "../../../src/core/block-store.js";
-import { DeliveryStore } from "../../../src/core/delivery-store.js";
+import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
+import { DeliveryStore, type DeliveryClaim } from "../../../src/core/delivery-store.js";
+import type { ModuleSubmissionRecord } from "../../../src/core/module-process-records.js";
 import {
   InMemoryModuleResultCommitRepository,
   ModuleResultCommitCoordinator,
@@ -32,6 +34,23 @@ import {
 const NOW = "2026-07-26T00:00:00.000Z";
 const CONSOLE_INGRESS = { kind: "module", id: "console.ingress" } as const;
 const IMPOSTOR = { kind: "module", id: "helpful.summarizer" } as const;
+
+function submissionForClaim(
+  deliveries: DeliveryStore,
+  claim: DeliveryClaim,
+): ModuleSubmissionRecord {
+  return {
+    schemaVersion: "dolly.module-submission-record/1",
+    moduleJobId: claim.moduleJobId,
+    claimToken: claim.claimToken,
+    runId: claim.runId,
+    attempt: claim.attempt,
+    moduleGenerationId: claim.moduleGenerationId,
+    processGenerationId: `${claim.moduleGenerationId}-process`,
+    inputDigest: canonicalJsonDigest(deliveries.inspectClaimInput(claim)),
+    createdAt: NOW,
+  };
+}
 
 function consolePolicy(): ReservedContentSchemaPolicy {
   return new ReservedContentSchemaPolicy([
@@ -228,10 +247,19 @@ describe("CORE-RESERVED-003 the Module result path", () => {
       maxCount: 1,
       maxBytes: 1024 * 1024,
     })!;
+    const submissions = new Map<string, ModuleSubmissionRecord>([
+      [claim.runId, submissionForClaim(deliveries, claim)],
+    ]);
     const repository = new InMemoryModuleResultCommitRepository();
     const coordinator = new ModuleResultCommitCoordinator({
       blocks: store.blocks,
       deliveries,
+      getModuleSubmissionRecord: (runId) => submissions.get(runId),
+      acknowledgeDeliveryClaim: (identity) => {
+        const result = deliveries.ack(identity);
+        submissions.delete(identity.runId);
+        return result;
+      },
       repository,
       now: () => NOW,
     });

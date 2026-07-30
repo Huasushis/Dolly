@@ -5,7 +5,9 @@ import {
   type SourceIdentity,
 } from "../../../src/core/block-store.js";
 import { type MediaReferenceItem, type Rect } from "../../../src/core/block-content.js";
-import { DeliveryStore } from "../../../src/core/delivery-store.js";
+import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
+import { DeliveryStore, type DeliveryClaim } from "../../../src/core/delivery-store.js";
+import type { ModuleSubmissionRecord } from "../../../src/core/module-process-records.js";
 import {
   InMemoryModuleResultCommitRepository,
   ModuleResultCommitCoordinator,
@@ -84,6 +86,23 @@ function blockAndMediaProposal(blockId: string, mediaId: string): BlockProposal 
   };
 }
 
+function submissionForClaim(
+  deliveries: DeliveryStore,
+  claim: DeliveryClaim,
+): ModuleSubmissionRecord {
+  return {
+    schemaVersion: "dolly.module-submission-record/1",
+    moduleJobId: claim.moduleJobId,
+    claimToken: claim.claimToken,
+    runId: claim.runId,
+    attempt: claim.attempt,
+    moduleGenerationId: claim.moduleGenerationId,
+    processGenerationId: `${claim.moduleGenerationId}-process`,
+    inputDigest: canonicalJsonDigest(deliveries.inspectClaimInput(claim)),
+    createdAt: NOW,
+  };
+}
+
 function createHarness(
   inputReferences: readonly ReturnType<typeof mediaReference>[],
   makeInputProposal?: (blocks: BlockStore) => BlockProposal,
@@ -120,10 +139,19 @@ function createHarness(
     maxCount: 1,
     maxBytes: 1024 * 1024,
   })!;
+  const submissions = new Map<string, ModuleSubmissionRecord>([
+    [claim.runId, submissionForClaim(deliveries, claim)],
+  ]);
   const repository = new InMemoryModuleResultCommitRepository();
   const coordinator = new ModuleResultCommitCoordinator({
     blocks,
     deliveries,
+    getModuleSubmissionRecord: (runId) => submissions.get(runId),
+    acknowledgeDeliveryClaim: (identity) => {
+      const result = deliveries.ack(identity);
+      submissions.delete(identity.runId);
+      return result;
+    },
     repository,
     now: () => NOW,
   });

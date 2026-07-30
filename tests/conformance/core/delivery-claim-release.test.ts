@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { BlockStore, type BlockProposal } from "../../../src/core/block-store.js";
+import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
 import {
   DeliveryStore,
   DeliveryStoreError,
+  type DeliveryClaim,
 } from "../../../src/core/delivery-store.js";
+import type { ModuleSubmissionRecord } from "../../../src/core/module-process-records.js";
 import {
   InMemoryModuleResultCommitRepository,
   ModuleResultCommitCoordinator,
@@ -63,6 +66,23 @@ function claimOne(deliveries: DeliveryStore, moduleGenerationId: string) {
   })!;
 }
 
+function submissionForClaim(
+  deliveries: DeliveryStore,
+  claim: DeliveryClaim,
+): ModuleSubmissionRecord {
+  return {
+    schemaVersion: "dolly.module-submission-record/1",
+    moduleJobId: claim.moduleJobId,
+    claimToken: claim.claimToken,
+    runId: claim.runId,
+    attempt: claim.attempt,
+    moduleGenerationId: claim.moduleGenerationId,
+    processGenerationId: `${claim.moduleGenerationId}-process`,
+    inputDigest: canonicalJsonDigest(deliveries.inspectClaimInput(claim)),
+    createdAt: NOW,
+  };
+}
+
 describe("CORE orderly Delivery Claim release", () => {
   it("preserves the Module job input while revoking the old Claim", async () => {
     const { blocks, deliveries } = createHarness();
@@ -72,6 +92,9 @@ describe("CORE orderly Delivery Claim release", () => {
     deliveries.append("input", secondBlock.id);
     const claim = claimOne(deliveries, "generation-1");
     const request = claimRequest(claim);
+    const submissions = new Map<string, ModuleSubmissionRecord>([
+      [claim.runId, submissionForClaim(deliveries, claim)],
+    ]);
     expect(claim.deliveryIds).toEqual([firstDelivery.deliveryId]);
     expect(claim.hasMore).toBe(true);
     expect(blocks.referenceGraph.leaseCountFor({ kind: "block", id: firstBlock.id })).toBe(1);
@@ -96,6 +119,7 @@ describe("CORE orderly Delivery Claim release", () => {
     }));
 
     expect(deliveries.releaseClaim(request)).toBe("released");
+    submissions.delete(claim.runId);
     expect(deliveries.releaseClaim(request)).toBe("already-released");
     expect(deliveries.inspectClaim(request).status).toBe("released");
     expect(deliveries.listActiveClaims()).toEqual([]);
@@ -134,6 +158,12 @@ describe("CORE orderly Delivery Claim release", () => {
     const coordinator = new ModuleResultCommitCoordinator({
       blocks,
       deliveries,
+      getModuleSubmissionRecord: (runId) => submissions.get(runId),
+      acknowledgeDeliveryClaim: (identity) => {
+        const result = deliveries.ack(identity);
+        submissions.delete(identity.runId);
+        return result;
+      },
       repository: new InMemoryModuleResultCommitRepository(),
       now: () => NOW,
     });

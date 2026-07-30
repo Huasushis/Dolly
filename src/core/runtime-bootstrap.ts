@@ -17,9 +17,8 @@ import {
 } from "./instance-config-store.js";
 import { InstanceControllerLock } from "./instance-controller-lock.js";
 import type { MediaInspector } from "./media-store.js";
-import {
-  ModuleResultCommitCoordinator,
-} from "./module-result-commit.js";
+import { createModuleResultCommitCoordinator } from "./module-result-commit-factory.js";
+import type { ModuleResultCommitCoordinator } from "./module-result-commit.js";
 import {
   dollyInstanceConfigSchema,
   type DollyInstanceConfig,
@@ -328,9 +327,8 @@ export async function openDollyRuntime(
       path: join(config.stateDirectory, "module-result-commits.json"),
       maxBytes: config.document.core.limits.maxModuleResultCommitJournalBytes,
     });
-    const commits = new ModuleResultCommitCoordinator({
-      blocks: core.blocks,
-      deliveries: core.deliveries,
+    const commits = createModuleResultCommitCoordinator({
+      core,
       repository,
       now,
     });
