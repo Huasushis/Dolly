@@ -216,6 +216,7 @@ describe("Media deletion recovery", () => {
   const roots: string[] = [];
 
   afterEach(() => {
+    vi.useRealTimers();
     for (const root of roots.splice(0)) {
       rmSync(root, { recursive: true, force: true });
     }
@@ -326,6 +327,122 @@ describe("Media deletion recovery", () => {
     );
     expect(deleteObject.mock.lastCall?.[0]).not.toHaveProperty("objectVersion");
     expect(reopened.media!.getMedia(registered.mediaId)).toBeNull();
+  });
+
+  it("keeps a timed-out deletion retryable and waits for an adapter call that ignores abort", async () => {
+    vi.useFakeTimers();
+    const root = mkdtempSync(join(tmpdir(), "dolly-media-delete-timeout-"));
+    roots.push(root);
+    const bytes = new FileMediaByteStore({
+      directory: join(root, "bytes"),
+      maxMediaBytes: 1024,
+    });
+    let finishFirstDelete!: () => void;
+    const firstDeleteCanFinish = new Promise<void>((resolve) => {
+      finishFirstDelete = resolve;
+    });
+    let objectExists = true;
+    let firstSignal: AbortSignal | undefined;
+    let activeDeletes = 0;
+    let maximumActiveDeletes = 0;
+    const deleteObject = vi.fn<DeleteImplementation>(async (input) => {
+      const invocation = deleteObject.mock.calls.length;
+      activeDeletes += 1;
+      maximumActiveDeletes = Math.max(maximumActiveDeletes, activeDeletes);
+      try {
+        if (invocation === 1) {
+          if (typeof input !== "string") firstSignal = input.signal;
+          await firstDeleteCanFinish;
+        }
+        if (!objectExists) return "not-found";
+        objectExists = false;
+        return "deleted";
+      } finally {
+        activeDeletes -= 1;
+      }
+    });
+    const adapter = storageAdapter("timeout-storage", deleteObject, "persistent");
+    const referenceGraph = new ReferenceGraph();
+    const media = new MediaStore({
+      durability: "persistent",
+      referenceGraph,
+      bytes,
+      inspector,
+      adapters: [adapter],
+      maxMediaBytes: 1024,
+      idNamespace: "deletion-timeout",
+      now: () => START,
+      deleteRetryDelayMs: () => 0,
+      storageRequestTimeoutMs: 25,
+      onMutation: () => undefined,
+    });
+    let blockId = 0;
+    const blocks = new BlockStore({
+      referenceGraph,
+      media,
+      nextBlockId: () => `timeout-block-${++blockId}`,
+      now: () => START,
+    });
+    const registered = await makeCollectible(
+      media,
+      blocks,
+      "registration-delete-timeout",
+      async (value) => {
+        await media.storeOriginal(value.mediaId, adapter.descriptor.adapterId);
+      },
+    );
+
+    try {
+      const deletion = media.collectUnreachable();
+      const timeoutRejection = expect(deletion).rejects.toMatchObject({
+        code: "STORAGE_REQUEST_TIMEOUT",
+      });
+      for (
+        let index = 0;
+        index < 10 && deleteObject.mock.calls.length === 0;
+        index += 1
+      ) {
+        await Promise.resolve();
+      }
+      expect(deleteObject).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(25);
+      await timeoutRejection;
+
+      expect(firstSignal?.aborted).toBe(true);
+      expect(media.listStorageRecords(registered.mediaId)).toEqual([
+        expect.objectContaining({
+          state: "delete-failed",
+          deleteAttempts: 1,
+          deleteRetryable: true,
+          nextDeleteAttemptAt: START,
+          lastDeleteErrorCode: "TRANSIENT_NETWORK",
+        }),
+      ]);
+
+      await expect(media.recoverDeletions()).resolves.toEqual({
+        deleted: [],
+        failed: [registered.mediaId],
+      });
+      expect(deleteObject).toHaveBeenCalledOnce();
+      expect(maximumActiveDeletes).toBe(1);
+      expect(media.getMedia(registered.mediaId)).toEqual(registered);
+
+      finishFirstDelete();
+      await deleteObject.mock.results[0]?.value;
+      for (let index = 0; index < 5; index += 1) await Promise.resolve();
+
+      await expect(media.recoverDeletions()).resolves.toEqual({
+        deleted: [registered.mediaId],
+        failed: [],
+      });
+      expect(deleteObject).toHaveBeenCalledTimes(2);
+      expect(maximumActiveDeletes).toBe(1);
+      expect(media.listStorageRecords(registered.mediaId)).toEqual([]);
+      expect(media.getMedia(registered.mediaId)).toBeNull();
+    } finally {
+      finishFirstDelete();
+    }
   });
 
   it("retains AccessDenied and deletes only after an explicit retry", async () => {

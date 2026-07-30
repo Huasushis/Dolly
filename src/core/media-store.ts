@@ -578,7 +578,13 @@ function classifyDeleteError(error: unknown): ClassifiedDeleteError {
     return { code: "PROVIDER_UNAVAILABLE", retryable: true };
   }
   if (
-    ["ETIMEDOUT", "ECONNRESET", "EAI_AGAIN", "RequestTimeout"].includes(providerCode)
+    [
+      "ETIMEDOUT",
+      "ECONNRESET",
+      "EAI_AGAIN",
+      "RequestTimeout",
+      "STORAGE_REQUEST_TIMEOUT",
+    ].includes(providerCode)
   ) {
     return { code: "TRANSIENT_NETWORK", retryable: true };
   }
@@ -914,6 +920,12 @@ export class MediaStore implements MediaReferenceResolver {
   readonly #adapters = new Map<string, StorageAdapter>();
   readonly #storageRecords = new Map<string, MediaStorageRecord>();
   readonly #storageOperationTails = new Map<string, Promise<void>>();
+  /**
+   * A persistent delete call can outlive Dolly's timeout when its adapter
+   * ignores AbortSignal. Keep that storage record here until the adapter
+   * promise settles so deletion recovery cannot start an overlapping call.
+   */
+  readonly #activeStorageDeleteRequests = new Set<string>();
   readonly #registrationOperationTails = new Map<string, Promise<void>>();
   readonly #deletingMediaIds = new Set<string>();
   readonly #providerAccess = new Map<string, ProviderAccessRecord>();
@@ -2205,6 +2217,11 @@ export class MediaStore implements MediaReferenceResolver {
       (record) => record.state === "delete-failed",
     );
     if (failedRecords.length === 0) return true;
+    if (failedRecords.some(
+      (record) => this.#activeStorageDeleteRequests.has(record.storageRecordId),
+    )) {
+      return false;
+    }
     if (requireDueTime) {
       const now = Date.parse(canonicalTime(this.#now));
       if (failedRecords.some(
@@ -2337,15 +2354,7 @@ export class MediaStore implements MediaReferenceResolver {
         let result: "deleted" | "not-found";
         try {
           if (isPersistentStorageAdapter(adapter)) {
-            result = await this.#callStorageAdapter((signal) =>
-              adapter.deleteObject(this.#persistentDeleteInput(
-                record.locator,
-                record.objectVersioning,
-                record.objectVersion,
-                record.entityTag,
-                signal,
-              )),
-            );
+            result = await this.#callPersistentStorageDelete(record, adapter);
           } else {
             result = await adapter.deleteObject(record.locator, record.objectVersion);
           }
@@ -4100,6 +4109,32 @@ export class MediaStore implements MediaReferenceResolver {
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
+  }
+
+  async #callPersistentStorageDelete(
+    record: MediaStorageRecord,
+    adapter: PersistentStorageAdapter,
+  ): Promise<"deleted" | "not-found"> {
+    if (this.#activeStorageDeleteRequests.has(record.storageRecordId)) {
+      throw Object.assign(
+        new Error("The previous storage delete request has not settled"),
+        { code: "STORAGE_REQUEST_TIMEOUT" },
+      );
+    }
+    this.#activeStorageDeleteRequests.add(record.storageRecordId);
+    return this.#callStorageAdapter(async (signal) => {
+      try {
+        return await adapter.deleteObject(this.#persistentDeleteInput(
+          record.locator,
+          record.objectVersioning,
+          record.objectVersion,
+          record.entityTag,
+          signal,
+        ));
+      } finally {
+        this.#activeStorageDeleteRequests.delete(record.storageRecordId);
+      }
+    });
   }
 
   async #runStorageOperation<T>(
