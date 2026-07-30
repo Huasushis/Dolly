@@ -699,6 +699,7 @@ export class FileCoreStateStore {
   #deferredMutation = false;
   #reopenRequired = false;
   #componentMutationInProgress = false;
+  #configuredCallbackInProgress = false;
   #persistedStateDigest: string;
 
   constructor(options: FileCoreStateStoreOptions) {
@@ -721,7 +722,12 @@ export class FileCoreStateStore {
     }
     this.#path = resolve(options.path);
     this.#lockPath = `${this.#path}.lock`;
-    this.#now = options.now;
+    const now = () => this.#invokeConfiguredCallback(options.now);
+    const nextBlockId = () =>
+      this.#invokeConfiguredCallback(options.nextBlockId);
+    const nextDeliveryId: DeliveryStoreOptions["nextId"] = (kind) =>
+      this.#invokeConfiguredCallback(options.nextDeliveryId, kind);
+    this.#now = now;
     mkdirSync(dirname(this.#path), { recursive: true, mode: 0o700 });
 
     const document = this.#withMutationLock(() => {
@@ -757,13 +763,13 @@ export class FileCoreStateStore {
                   options.media.deletedRegistrationRetentionMs,
               }),
           idNamespace: options.media.idNamespace,
-          now: options.now,
+          now,
           onMutation: () => undefined,
         });
       }
       const blocks = new BlockStore({
-        nextBlockId: options.nextBlockId,
-        now: options.now,
+        nextBlockId,
+        now,
         referenceGraph,
         ...(media === undefined ? {} : { media }),
         ...(options.blockLimits === undefined ? {} : { limits: options.blockLimits }),
@@ -771,8 +777,8 @@ export class FileCoreStateStore {
       const deliveries = new DeliveryStore({
         blocks,
         maxFailedAttempts: options.maxFailedAttempts,
-        nextId: options.nextDeliveryId,
-        now: options.now,
+        nextId: nextDeliveryId,
+        now,
       });
       const initial = this.#createDocument(0, referenceGraph, media, blocks, deliveries);
       this.#writeDocument(initial);
@@ -822,13 +828,13 @@ export class FileCoreStateStore {
                     options.media.deletedRegistrationRetentionMs,
                 }),
             idNamespace: options.media.idNamespace,
-            now: options.now,
+            now,
             snapshot: document.media!,
             onMutation: () => undefined,
           });
       const blocks = new BlockStore({
-        nextBlockId: options.nextBlockId,
-        now: options.now,
+        nextBlockId,
+        now,
         referenceGraph,
         snapshot: document.blocks,
         ...(media === undefined ? {} : { media }),
@@ -837,8 +843,8 @@ export class FileCoreStateStore {
       const deliveries = new DeliveryStore({
         blocks,
         maxFailedAttempts: options.maxFailedAttempts,
-        nextId: options.nextDeliveryId,
-        now: options.now,
+        nextId: nextDeliveryId,
+        now,
         snapshot: document.deliveries,
       });
       loaded = { referenceGraph, media, blocks, deliveries };
@@ -1508,6 +1514,24 @@ export class FileCoreStateStore {
     return result;
   }
 
+  #invokeConfiguredCallback<Arguments extends readonly unknown[], Result>(
+    callback: (...args: Arguments) => Result,
+    ...args: Arguments
+  ): Result {
+    if (this.#configuredCallbackInProgress) {
+      throw new CoreStateError(
+        "CORE_STATE_LOCKED",
+        "A configured Core callback is already running",
+      );
+    }
+    this.#configuredCallbackInProgress = true;
+    try {
+      return callback(...args);
+    } finally {
+      this.#configuredCallbackInProgress = false;
+    }
+  }
+
   #confirmInMemoryStateMatchesPersistedState(): void {
     try {
       const current = this.#createDocument(
@@ -1540,6 +1564,12 @@ export class FileCoreStateStore {
       throw new CoreStateError(
         "CORE_STATE_LOCKED",
         "A Core state component mutation is still in progress",
+      );
+    }
+    if (this.#configuredCallbackInProgress) {
+      throw new CoreStateError(
+        "CORE_STATE_LOCKED",
+        "Core state cannot be accessed from its configured clock or identifier generator",
       );
     }
   }
