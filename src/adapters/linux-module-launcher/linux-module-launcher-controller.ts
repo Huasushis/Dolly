@@ -99,6 +99,11 @@ export interface LinuxModuleLauncherFailed {
   readonly code: LinuxModuleLauncherFailureCode;
   readonly message: string;
   /**
+   * Every process identifier read from `cgroup.procs` before the failure.
+   * This is empty when the process list could not be read successfully.
+   */
+  readonly observedProcessIds: readonly number[];
+  /**
    * Whether kernel cgroup membership was verified before the failure. Once it
    * is `true`, ADR 0009 requires cgroup-level termination and a `populated 0`
    * observation; a child exit is no longer sufficient evidence.
@@ -184,6 +189,7 @@ export class LinuxModuleLauncherController {
   #inCgroupReceived = false;
   #pendingInCgroup?: PendingWait;
   #abort?: ControllerAbort;
+  #observedProcessIds: readonly number[] = [];
   #verifiedProcessIds: readonly number[] = [];
 
   constructor(options: LinuxModuleLauncherControllerOptions) {
@@ -369,6 +375,7 @@ export class LinuxModuleLauncherController {
         message: `The Module cgroup process list could not be read: ${String(cause)}`,
       } satisfies ControllerAbort;
     }
+    this.#observedProcessIds = [...processIds];
     if (!processIds.includes(request.launcherProcessId)) {
       throw {
         code: "LAUNCHER_MEMBERSHIP_UNVERIFIED",
@@ -402,6 +409,7 @@ export class LinuxModuleLauncherController {
         outcome: "failed",
         code: abort.code,
         message: abort.message,
+        observedProcessIds: this.#observedProcessIds,
         membershipVerified: true,
         launcherExitObserved: false,
       };
@@ -417,6 +425,7 @@ export class LinuxModuleLauncherController {
       outcome: "failed",
       code: abort.code,
       message: abort.message,
+      observedProcessIds: this.#observedProcessIds,
       membershipVerified: false,
       launcherExitObserved,
     };

@@ -125,6 +125,7 @@ describe("LinuxModuleLauncherController authorization sequence", () => {
     expect(result).toMatchObject({
       outcome: "failed",
       code: "LAUNCHER_MEMBERSHIP_UNVERIFIED",
+      observedProcessIds: [],
       membershipVerified: false,
       launcherExitObserved: true,
     });
@@ -143,6 +144,7 @@ describe("LinuxModuleLauncherController authorization sequence", () => {
     expect(result).toMatchObject({
       outcome: "failed",
       code: "LAUNCHER_MEMBERSHIP_UNVERIFIED",
+      observedProcessIds: [LAUNCHER_PROCESS_ID, 99],
       membershipVerified: false,
     });
     expect(harness.commandNames()).toEqual(["configure", "exit"]);
@@ -210,6 +212,7 @@ describe("LinuxModuleLauncherController authorization sequence", () => {
     expect(result).toMatchObject({
       outcome: "failed",
       code: "LAUNCHER_STOP_REQUESTED",
+      observedProcessIds: [LAUNCHER_PROCESS_ID],
       membershipVerified: true,
       // After membership, ADR 0009 requires cgroup-level termination evidence,
       // so no child exit is claimed here.
