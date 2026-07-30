@@ -126,6 +126,15 @@ function assertCoreExitCleanupTimeout(timeoutMs: number): void {
   }
 }
 
+function assertPositiveSafeIntegerTimeout(
+  optionName: "terminationTimeoutMs" | "channelCloseTimeoutMs",
+  timeoutMs: number,
+): void {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    throw new TypeError(`${optionName} must be a positive safe integer`);
+  }
+}
+
 /**
  * Waits only until the cleanup deadline. The cleanup Promise keeps running
  * after that deadline, but its rejection is consumed because Core exits
@@ -168,6 +177,14 @@ function assertContext(
 export function createLinuxModuleExecutor(
   options: LinuxModuleExecutorOptions,
 ): ModuleExecutor<ReactiveModuleInput, ReactiveModuleResult> {
+  assertPositiveSafeIntegerTimeout(
+    "terminationTimeoutMs",
+    options.terminationTimeoutMs,
+  );
+  assertPositiveSafeIntegerTimeout(
+    "channelCloseTimeoutMs",
+    options.channelCloseTimeoutMs,
+  );
   const coreExitCleanupTimeoutMs =
     options.coreExitCleanupTimeoutMs ?? DEFAULT_CORE_EXIT_CLEANUP_TIMEOUT_MS;
   assertCoreExitCleanupTimeout(coreExitCleanupTimeoutMs);

@@ -215,6 +215,8 @@ function executorFor(options: {
   readonly fileSystem?: ReturnType<typeof cgroupFileSystem>;
   readonly startLauncher?: () => Promise<ModuleLauncherControl>;
   readonly openProtocolSession?: () => LinuxModuleProtocolSession;
+  readonly terminationTimeoutMs?: number;
+  readonly channelCloseTimeoutMs?: number;
   readonly coreExitCleanupTimeoutMs?: number;
   readonly exitCoreProcess?: (status: number) => void;
 }) {
@@ -246,8 +248,8 @@ function executorFor(options: {
       cgroupFileSystem: fileSystem,
     },
     openProtocolSession: options.openProtocolSession ?? (() => options.session),
-    terminationTimeoutMs: 200,
-    channelCloseTimeoutMs: 200,
+    terminationTimeoutMs: options.terminationTimeoutMs ?? 200,
+    channelCloseTimeoutMs: options.channelCloseTimeoutMs ?? 200,
     coreExitCleanupTimeoutMs: options.coreExitCleanupTimeoutMs ?? 200,
     // Unit tests must inspect the path after it would end Core. A separate
     // child-process test covers the production `process.exit` default.
@@ -288,6 +290,52 @@ function waitForChildExit(
 }
 
 describe("Linux Module executor termination proof", () => {
+  it.each([
+    { optionName: "terminationTimeoutMs" as const, value: Number.NaN },
+    { optionName: "terminationTimeoutMs" as const, value: Number.POSITIVE_INFINITY },
+    { optionName: "terminationTimeoutMs" as const, value: 0 },
+    { optionName: "terminationTimeoutMs" as const, value: -1 },
+    { optionName: "channelCloseTimeoutMs" as const, value: Number.NaN },
+    { optionName: "channelCloseTimeoutMs" as const, value: Number.POSITIVE_INFINITY },
+    { optionName: "channelCloseTimeoutMs" as const, value: 0 },
+    { optionName: "channelCloseTimeoutMs" as const, value: -1 },
+  ])(
+    "rejects $optionName=$value before launcher, control-group, or protocol side effects",
+    ({ optionName, value }) => {
+      const records = recordStore();
+      const fileSystem = cgroupFileSystem(() => "populated 0\nfrozen 0\n");
+      const session = protocolSession();
+      const startLauncher = vi.fn(async (): Promise<ModuleLauncherControl> => ({
+        processId: 4242,
+        configure: async () => undefined,
+        authorizeExecution: async () => confirmedExecutionAuthorization(),
+        requestExit: async () => true,
+      }));
+      const openProtocolSession = vi.fn(() => session);
+
+      expect(() =>
+        executorFor({
+          populated: () => "populated 0\nfrozen 0\n",
+          session,
+          records,
+          fileSystem,
+          startLauncher,
+          openProtocolSession,
+          [optionName]: value,
+        }),
+      ).toThrowError(`${optionName} must be a positive safe integer`);
+
+      expect(startLauncher).not.toHaveBeenCalled();
+      expect(openProtocolSession).not.toHaveBeenCalled();
+      expect(fileSystem.directories).toHaveLength(0);
+      expect(fileSystem.writeLog).toHaveLength(0);
+      expect(records.log).toHaveLength(0);
+      expect(session.initialize).not.toHaveBeenCalled();
+      expect(session.closeCapabilitySession).not.toHaveBeenCalled();
+      expect(session.waitForChannelClosed).not.toHaveBeenCalled();
+    },
+  );
+
   it("uses a direct nonzero process exit when unconfirmed ownership reaches the production default", async () => {
     const child = spawn(process.execPath, ["--import", "tsx/esm", CORE_EXIT_FIXTURE], {
       cwd: process.cwd(),
