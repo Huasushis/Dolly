@@ -30,6 +30,7 @@ import {
   noRecordedObligations,
   type InstanceObligations,
 } from "../../../../src/daemon/console/instance-obligations.js";
+import { ConsoleOperationError } from "../../../../src/daemon/console/operation-catalog.js";
 import type {
   PreservedUnknownOutcomeClaim,
   UnknownOutcomeClaimStore,
@@ -50,6 +51,7 @@ export class RecordingClaimStore implements UnknownOutcomeClaimStore {
   #claims: readonly PreservedUnknownOutcomeClaim[];
   readonly #auditLog: readonly ConsoleAuditEvent[];
   #outcome: UnknownOutcomeDispositionOutcome = "released";
+  #beforeNextApply: (() => void) | undefined;
 
   constructor(claims: readonly PreservedUnknownOutcomeClaim[], auditLog: readonly ConsoleAuditEvent[]) {
     this.#claims = claims;
@@ -64,11 +66,38 @@ export class RecordingClaimStore implements UnknownOutcomeClaimStore {
     this.#outcome = outcome;
   }
 
+  beforeNextApply(operation: () => void): void {
+    this.#beforeNextApply = operation;
+  }
+
   listPreservedClaims(): Promise<readonly PreservedUnknownOutcomeClaim[]> {
     return Promise.resolve(this.#claims);
   }
 
   applyDisposition(request: UnknownOutcomeDispositionRequest): Promise<UnknownOutcomeDispositionOutcome> {
+    const beforeApply = this.#beforeNextApply;
+    this.#beforeNextApply = undefined;
+    beforeApply?.();
+    const current = this.#claims.find((claim) =>
+      claim.identity.moduleJobId === request.identity.moduleJobId &&
+      claim.identity.claimToken === request.identity.claimToken &&
+      claim.identity.runId === request.identity.runId &&
+      claim.identity.attempt === request.identity.attempt &&
+      claim.identity.moduleGenerationId === request.identity.moduleGenerationId
+    );
+    if (
+      current === undefined ||
+      current.evidenceDigest !== request.expectedEvidenceDigest
+    ) {
+      throw new ConsoleOperationError(
+        "UNKNOWN_OUTCOME_EVIDENCE_STALE",
+        "The unknown-outcome Claim evidence changed at the store boundary",
+        {
+          expectedEvidenceDigest: request.expectedEvidenceDigest,
+          currentEvidenceDigest: current?.evidenceDigest,
+        },
+      );
+    }
     this.applied.push({ request, auditEventsAtCall: [...this.#auditLog] });
     return Promise.resolve(
       request.disposition === "dead-letter"

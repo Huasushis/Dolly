@@ -5,21 +5,30 @@
  * The four obligations are asserted directly: the exact Claim and the evidence
  * Core considered are shown, only the three stated dispositions are offered, a
  * forced release is refused until an explicit warning about repeating an
- * external effect is acknowledged, and the Section 11 audit event is written
- * **before** the disposition is applied. The last one is checked by recording
- * the audit log as it stood at the moment the store was called.
+ * external effect is acknowledged, a request audit event is written before the
+ * disposition is applied, and a separate event records actual success or
+ * failure. The ordering is checked by recording the audit log as it stood at
+ * the moment the store was called.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
-import { BlockStore } from "../../../src/core/block-store.js";
-import { DeliveryStore } from "../../../src/core/delivery-store.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
+import type {
+  ClaimDescriptor,
+  DeliveryClaimIdentity,
+} from "../../../src/core/delivery-store.js";
+import type { ModuleSubmissionRecord } from "../../../src/core/module-process-records.js";
 import { AdminHttpServer } from "../../../src/daemon/console/admin-http-server.js";
 import { runConsoleCliCommand } from "../../../src/daemon/console/console-cli.js";
+import { ConsoleOperationError } from "../../../src/daemon/console/operation-catalog.js";
 import {
   buildForcedReleaseWarning,
   buildPreservedClaim,
-  deliveryStoreDispositionApplier,
+  deliveryClaimDispositionApplier,
+  unprovenExternalEffects,
+  type DeliveryClaimDispositionOperations,
   type PreservedUnknownOutcomeClaim,
+  type UnknownOutcomeDispositionRequest,
   type UnknownOutcomeEvidence,
 } from "../../../src/daemon/console/unknown-outcome.js";
 import {
@@ -50,7 +59,7 @@ function evidence(overrides: Partial<UnknownOutcomeEvidence> = {}): UnknownOutco
     moduleProcessRecord: {
       processGenerationId: "process-generation-3",
       state: "stopped",
-      declaredExternalEffects: "core-capabilities",
+      declaredExternalEffects: "core-capabilities-only",
     },
     moduleProcessStopProof: { proven: true, evidence: "populated-zero" },
     submissionRecord: { runId: "run-7", processGenerationId: "process-generation-3" },
@@ -210,6 +219,47 @@ describe("SEC-CLAIM-001 the operator sees the exact Claim and the evidence Core 
     expect(response.body.error.code).toBe("UNKNOWN_OUTCOME_CLAIM_NOT_FOUND");
     expect(harness.claimStore.applied).toHaveLength(0);
   });
+
+  it("rejects evidence that could make the audit record unbounded", () => {
+    const tooManyIntents = Array.from({ length: 1025 }, (_, index) => ({
+      intentId: `effect-${index}`,
+      description: "bounded description",
+      recordedOutcome: "unknown" as const,
+    }));
+    expect(() =>
+      buildPreservedClaim({
+        identity: IDENTITY,
+        moduleId: "summarizer",
+        evidence: evidence({ externalEffectIntents: tooManyIntents }),
+      }),
+    ).toThrow("at most 1024 entries");
+
+    expect(() =>
+      buildPreservedClaim({
+        identity: IDENTITY,
+        moduleId: "summarizer",
+        evidence: evidence({
+          externalEffectIntents: [
+            {
+              intentId: "effect-1",
+              description: "x".repeat(8193),
+              recordedOutcome: "unknown",
+            },
+          ],
+        }),
+      }),
+    ).toThrow("1 to 8192 UTF-8 bytes");
+
+    expect(() =>
+      buildPreservedClaim({
+        identity: IDENTITY,
+        moduleId: "summarizer",
+        evidence: evidence({
+          resultJournalEntry: { text: "x".repeat(1024 * 1024) },
+        }),
+      }),
+    ).toThrow("1048576-byte limit");
+  });
 });
 
 describe("SEC-CLAIM-002 a forced release warns before anything is applied", () => {
@@ -225,12 +275,18 @@ describe("SEC-CLAIM-002 a forced release warns before anything is applied", () =
     expect(refused.status).toBe(400);
     expect(refused.body.error.code).toBe("UNKNOWN_OUTCOME_WARNING_REQUIRED");
     const warning = refused.body.error.details.warning;
+    expect(warning.schemaVersion).toBe("dolly.unknown-outcome-warning/2");
     expect(warning.disposition).toBe("release");
     expect(warning.identity).toEqual(IDENTITY);
     expect(warning.consequence).toContain("repeat an external effect");
-    expect(warning.unprovenExternalEffects).toEqual([
-      "effect-1: posted the summary to the outbound webhook",
+    expect(warning.externalEffectsThatMayRepeat).toEqual([
+      {
+        intentId: "effect-1",
+        description: "posted the summary to the outbound webhook",
+        recordedOutcome: "unknown",
+      },
     ]);
+    expect(warning).not.toHaveProperty("unprovenExternalEffects");
     expect(typeof warning.acknowledgementDigest).toBe("string");
 
     // Nothing was released, dead-lettered, or otherwise touched.
@@ -245,6 +301,69 @@ describe("SEC-CLAIM-002 a forced release warns before anything is applied", () =
     );
     expect(issued).toHaveLength(1);
     expect(issued[0]!.result).toBe("refused");
+  });
+
+  it("warns about both completed effects and effects whose completion is unknown", async () => {
+    const harness = trackHarness();
+    const externalEffectIntents = [
+      {
+        intentId: "effect-unknown",
+        description: "may have sent the notification",
+        recordedOutcome: "unknown",
+      },
+      {
+        intentId: "effect-no-effect",
+        description: "was proven not to have started",
+        recordedOutcome: "no-effect",
+      },
+      {
+        intentId: "effect-terminal",
+        description: "sent the billing request",
+        recordedOutcome: "terminal",
+      },
+      {
+        intentId: "effect-retry-safe",
+        description: "uses an idempotency key",
+        recordedOutcome: "retry-safe",
+      },
+    ] satisfies UnknownOutcomeEvidence["externalEffectIntents"];
+    expect(
+      unprovenExternalEffects(evidence({ externalEffectIntents })),
+    ).toEqual(["effect-unknown: may have sent the notification"]);
+    harness.claimStore.setClaims([
+      preservedClaim({
+        externalEffectIntents,
+      }),
+    ]);
+    const client = await startConsole(harness);
+
+    const refused = await client.post(
+      `/v1/admin/instances/${harness.instanceId}/claims/unknown-outcome/disposition`,
+      {
+        claimToken: IDENTITY.claimToken,
+        disposition: "release",
+        operationId: "op-terminal-effect",
+      },
+    );
+
+    expect(refused.status).toBe(400);
+    const warning = refused.body.error.details.warning;
+    expect(warning.schemaVersion).toBe("dolly.unknown-outcome-warning/2");
+    expect(warning.externalEffectsThatMayRepeat).toEqual([
+      {
+        intentId: "effect-terminal",
+        description: "sent the billing request",
+        recordedOutcome: "terminal",
+      },
+      {
+        intentId: "effect-unknown",
+        description: "may have sent the notification",
+        recordedOutcome: "unknown",
+      },
+    ]);
+    const { acknowledgementDigest, ...warningBody } = warning;
+    expect(acknowledgementDigest).toBe(canonicalJsonDigest(warningBody));
+    expect(harness.claimStore.applied).toHaveLength(0);
   });
 
   it("refuses an acknowledgement that names different evidence", async () => {
@@ -285,7 +404,7 @@ describe("SEC-CLAIM-002 a forced release warns before anything is applied", () =
     expect(harness.claimStore.applied).toHaveLength(0);
   });
 
-  it("writes the audit event before the disposition reaches the Claim store", async () => {
+  it("records the request before the store call and actual success afterwards", async () => {
     const harness = trackHarness();
     const claim = preservedClaim();
     harness.claimStore.setClaims([claim]);
@@ -308,23 +427,176 @@ describe("SEC-CLAIM-002 a forced release warns before anything is applied", () =
     const applied = harness.claimStore.applied[0]!;
     expect(applied.request.identity).toEqual(IDENTITY);
     expect(applied.request.disposition).toBe("release");
+    expect(applied.request.expectedEvidenceDigest).toBe(claim.evidenceDigest);
 
-    // The audit log as it stood when the store was called already carries the
-    // disposition event, so the record cannot be written only on success.
-    const auditAtCall = applied.auditEventsAtCall.filter(
-      (event) => event.eventType === "console.claim.unknown-outcome.disposition",
+    const requestedAtCall = applied.auditEventsAtCall.filter(
+      (event) =>
+        event.eventType ===
+        "console.claim.unknown-outcome.disposition-requested",
     );
-    expect(auditAtCall).toHaveLength(1);
-    const event = auditAtCall[0]!;
-    expect(event.result).toBe("succeeded");
-    expect(event.moduleGenerationId).toBe(IDENTITY.moduleGenerationId);
-    expect(event.actor.principalId).toBe("operator");
-    expect(event.details?.disposition).toBe("release");
-    expect(event.details?.forced).toBe(true);
-    expect(event.details?.claimToken).toBe(IDENTITY.claimToken);
-    expect(event.details?.evidenceDigest).toBe(claim.evidenceDigest);
-    expect(JSON.stringify(event.details?.evidence)).toContain("posted the summary");
-    expect(String(event.details?.warning)).toContain("repeat an external effect");
+    expect(requestedAtCall).toHaveLength(1);
+    expect(
+      applied.auditEventsAtCall.filter(
+        (event) =>
+          event.eventType === "console.claim.unknown-outcome.disposition",
+      ),
+    ).toHaveLength(0);
+
+    const requested = requestedAtCall[0]!;
+    expect(requested.moduleGenerationId).toBe(IDENTITY.moduleGenerationId);
+    expect(requested.actor.principalId).toBe("operator");
+    expect(requested.details).toMatchObject({
+      disposition: "release",
+      dispositionStatus: "requested",
+      forced: true,
+      claimToken: IDENTITY.claimToken,
+      evidenceDigest: claim.evidenceDigest,
+      evidenceComponentDigests: {
+        moduleProcessRecordDigest: canonicalJsonDigest(
+          claim.evidence.moduleProcessRecord!,
+        ),
+        moduleProcessStopProofDigest: canonicalJsonDigest(
+          claim.evidence.moduleProcessStopProof!,
+        ),
+        submissionRecordDigest: canonicalJsonDigest(
+          claim.evidence.submissionRecord!,
+        ),
+        resultJournalEntryDigest: null,
+      },
+      externalEffectIntentCounts: {
+        total: 1,
+        "no-effect": 0,
+        "retry-safe": 0,
+        terminal: 0,
+        unknown: 1,
+      },
+      externalEffectIntents: [
+        {
+          intentId: "effect-1",
+          recordedOutcome: "unknown",
+          descriptionDigest: canonicalJsonDigest(
+            "posted the summary to the outbound webhook",
+          ),
+        },
+      ],
+    });
+    const requestedText = JSON.stringify(requested.details);
+    expect(requestedText).not.toContain("posted the summary");
+    expect(requestedText).not.toContain("preservedReason");
+    expect(requestedText).not.toContain("warning");
+
+    const actual = harness.auditLog.filter(
+      (event) =>
+        event.eventType === "console.claim.unknown-outcome.disposition" &&
+        event.operationId === "op-confirmed",
+    );
+    expect(actual).toHaveLength(1);
+    expect(actual[0]).toMatchObject({
+      result: "succeeded",
+      details: {
+        dispositionStatus: "succeeded",
+        outcome: "released",
+        evidenceDigest: claim.evidenceDigest,
+      },
+    });
+    expect(JSON.stringify(actual[0]!.details)).not.toContain(
+      "posted the summary",
+    );
+  });
+
+  it("fails safely when evidence changes at the store boundary", async () => {
+    const harness = trackHarness();
+    const claim = preservedClaim();
+    harness.claimStore.setClaims([claim]);
+    harness.claimStore.beforeNextApply(() => {
+      harness.claimStore.setClaims([
+        preservedClaim({
+          externalEffectIntents: [
+            {
+              intentId: "effect-1",
+              description: "posted the summary to the outbound webhook",
+              recordedOutcome: "terminal",
+            },
+          ],
+        }),
+      ]);
+    });
+    const client = await startConsole(harness);
+
+    const response = await client.post(
+      `/v1/admin/instances/${harness.instanceId}/claims/unknown-outcome/disposition`,
+      {
+        claimToken: IDENTITY.claimToken,
+        disposition: "dead-letter",
+        operationId: "op-store-race",
+      },
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatchObject({
+      code: "UNKNOWN_OUTCOME_EVIDENCE_STALE",
+    });
+    expect(harness.claimStore.applied).toHaveLength(0);
+    expect(
+      harness.auditLog.filter(
+        (event) =>
+          event.operationId === "op-store-race" &&
+          event.eventType ===
+            "console.claim.unknown-outcome.disposition-requested",
+      ),
+    ).toHaveLength(1);
+    const actual = harness.auditLog.filter(
+      (event) =>
+        event.operationId === "op-store-race" &&
+        event.eventType === "console.claim.unknown-outcome.disposition",
+    );
+    expect(actual).toHaveLength(1);
+    expect(actual[0]).toMatchObject({
+      result: "failed",
+      details: {
+        dispositionStatus: "failed",
+        cause: "UNKNOWN_OUTCOME_EVIDENCE_STALE",
+      },
+    });
+  });
+
+  it("standardizes a store failure while preserving its stable cause", async () => {
+    const harness = trackHarness();
+    harness.claimStore.setClaims([preservedClaim()]);
+    harness.claimStore.beforeNextApply(() => {
+      throw Object.assign(new Error("simulated state write failure"), {
+        code: "CORE_STATE_IO_FAILED",
+      });
+    });
+    const client = await startConsole(harness);
+
+    const response = await client.post(
+      `/v1/admin/instances/${harness.instanceId}/claims/unknown-outcome/disposition`,
+      {
+        claimToken: IDENTITY.claimToken,
+        disposition: "dead-letter",
+        operationId: "op-store-error",
+      },
+    );
+
+    expect(response.status).toBe(500);
+    expect(response.body.error).toMatchObject({
+      code: "ADMIN_OPERATION_FAILED",
+      details: { cause: "CORE_STATE_IO_FAILED" },
+    });
+    expect(harness.claimStore.applied).toHaveLength(0);
+    const actual = harness.auditLog.find(
+      (event) =>
+        event.operationId === "op-store-error" &&
+        event.eventType === "console.claim.unknown-outcome.disposition",
+    );
+    expect(actual).toMatchObject({
+      result: "failed",
+      details: {
+        dispositionStatus: "failed",
+        cause: "CORE_STATE_IO_FAILED",
+      },
+    });
   });
 
   it("needs no warning for a dead letter or for leaving the Claim unresolved", async () => {
@@ -353,6 +625,15 @@ describe("SEC-CLAIM-002 a forced release warns before anything is applied", () =
       "dead-letter",
       "leave-unresolved",
     ]);
+    expect(harness.claimStore.applied[1]!.request.reasonCode).toBe(
+      "operator-left-unresolved",
+    );
+    const leaveAudit = harness.auditLog.find(
+      (event) =>
+        event.eventType === "console.claim.unknown-outcome.disposition" &&
+        event.operationId === "op-leave",
+    );
+    expect(leaveAudit?.details?.reasonCode).toBe("operator-left-unresolved");
   });
 });
 
@@ -379,6 +660,18 @@ describe("SEC-CLAIM-003 the CLI drives the same flow with the same codes", () =>
     expect(refused.exitCode).toBe(1);
     const failure = JSON.parse(refused.stdout).error;
     expect(failure.code).toBe("UNKNOWN_OUTCOME_WARNING_REQUIRED");
+    expect(failure.details.warning).toMatchObject({
+      schemaVersion: "dolly.unknown-outcome-warning/2",
+      externalEffectsThatMayRepeat: [
+        {
+          intentId: "effect-1",
+          recordedOutcome: "unknown",
+        },
+      ],
+    });
+    expect(failure.details.warning).not.toHaveProperty(
+      "unprovenExternalEffects",
+    );
     expect(harness.claimStore.applied).toHaveLength(0);
 
     const accepted = await runConsoleCliCommand(
@@ -401,7 +694,9 @@ describe("SEC-CLAIM-003 the CLI drives the same flow with the same codes", () =>
     expect(JSON.parse(accepted.stdout).outcome).toBe("released");
     expect(harness.claimStore.applied).toHaveLength(1);
     const auditAtCall = harness.claimStore.applied[0]!.auditEventsAtCall.filter(
-      (event) => event.eventType === "console.claim.unknown-outcome.disposition",
+      (event) =>
+        event.eventType ===
+        "console.claim.unknown-outcome.disposition-requested",
     );
     expect(auditAtCall).toHaveLength(1);
     expect(auditAtCall[0]!.actor.interface).toBe("cli");
@@ -423,98 +718,302 @@ describe("SEC-CLAIM-003 the CLI drives the same flow with the same codes", () =>
   });
 });
 
-describe("SEC-CLAIM-004 dispositions applied to a real Delivery store", () => {
-  function realStore() {
-    let blockId = 0;
-    let runtimeId = 0;
-    const blocks = new BlockStore({
-      nextBlockId: () => `block-${++blockId}`,
-      now: () => "2026-07-26T00:00:00.000Z",
-    });
-    const deliveries = new DeliveryStore({
-      blocks,
-      maxFailedAttempts: 3,
-      nextId: (kind) => `${kind}-${++runtimeId}`,
-      now: () => "2026-07-26T00:00:00.000Z",
-    });
-    deliveries.createPage("input");
-    deliveries.registerConsumer("input", "worker", "from-now");
-    const block = blocks.commit(
-      { payload: { schema: "test.content/1", value: { text: "hello" } } },
-      { kind: "module", id: "worker" },
+describe("SEC-CLAIM-004 the adapter requires one atomic store operation", () => {
+  const CURRENT_EVIDENCE_DIGEST = preservedClaim().evidenceDigest;
+
+  function sameIdentity(
+    actual: DeliveryClaimIdentity,
+    expected: DeliveryClaimIdentity,
+  ): boolean {
+    return (
+      actual.moduleJobId === expected.moduleJobId &&
+      actual.claimToken === expected.claimToken &&
+      actual.runId === expected.runId &&
+      actual.attempt === expected.attempt &&
+      actual.moduleGenerationId === expected.moduleGenerationId
     );
-    deliveries.append("input", block.id);
-    const claim = deliveries.claim({
-      consumerId: "worker",
-      pageIds: ["input"],
-      moduleGenerationId: "generation-3",
-      maxCount: 1,
-      maxBytes: 1024 * 1024,
-    })!;
-    return { deliveries, claim };
   }
 
-  it("dead-letters every remaining Delivery instead of discarding it", async () => {
-    const { deliveries, claim } = realStore();
-    const apply = deliveryStoreDispositionApplier(deliveries);
-    expect(deliveries.listActiveClaims()).toHaveLength(1);
+  function activeClaim(): ClaimDescriptor {
+    return {
+      ...IDENTITY,
+      consumerId: "summarizer",
+      status: "active",
+    };
+  }
 
-    const outcome = await apply({
-      identity: {
-        moduleJobId: claim.moduleJobId,
-        claimToken: claim.claimToken,
-        runId: claim.runId,
-        attempt: claim.attempt,
-        moduleGenerationId: claim.moduleGenerationId,
+  function submissionRecord(): ModuleSubmissionRecord {
+    return {
+      schemaVersion: "dolly.module-submission-record/1",
+      ...IDENTITY,
+      processGenerationId: "process-generation-3",
+      inputDigest: `sha256:${"a".repeat(64)}`,
+      createdAt: "2026-07-26T00:00:00.000Z",
+    };
+  }
+
+  function createDispositionOperations() {
+    const state: {
+      claim: ClaimDescriptor;
+      submissionRecord: ModuleSubmissionRecord | undefined;
+      evidenceDigest: string | undefined;
+    } = {
+      claim: activeClaim(),
+      submissionRecord: submissionRecord(),
+      evidenceDigest: CURRENT_EVIDENCE_DIGEST,
+    };
+    let beforeApply: (() => void) | undefined;
+    const operations: DeliveryClaimDispositionOperations = {
+      inspectUnknownOutcomeClaim: vi.fn((identity) => {
+        if (!sameIdentity(state.claim, identity)) {
+          throw new Error("The requested Claim is not in this store");
+        }
+        return {
+          claim: { ...state.claim },
+          submissionRecord:
+            state.submissionRecord === undefined
+              ? undefined
+              : { ...state.submissionRecord },
+          evidenceDigest: state.evidenceDigest,
+        };
+      }),
+      applyUnknownOutcomeDisposition: vi.fn((request) => {
+        const operation = beforeApply;
+        beforeApply = undefined;
+        operation?.();
+        if (
+          !sameIdentity(state.claim, request.identity) ||
+          state.claim.status !== "active" ||
+          state.evidenceDigest !== request.expectedEvidenceDigest
+        ) {
+          throw new ConsoleOperationError(
+            "UNKNOWN_OUTCOME_EVIDENCE_STALE",
+            "The Claim evidence changed before the atomic update",
+          );
+        }
+        if (request.disposition === "leave-unresolved") {
+          return "left-unresolved";
+        }
+        state.claim = {
+          ...state.claim,
+          status:
+            request.disposition === "release" ? "released" : "dead-lettered",
+        };
+        state.submissionRecord = undefined;
+        state.evidenceDigest = undefined;
+        return request.disposition === "release" ? "released" : "dead-lettered";
+      }),
+    };
+    return {
+      operations,
+      state,
+      beforeNextApply(operation: () => void): void {
+        beforeApply = operation;
       },
-      disposition: "dead-letter",
-      reasonCode: "operator-dead-letter",
-    });
+    };
+  }
 
-    expect(outcome).toBe("dead-lettered");
-    const deadLetters = deliveries.listDeadLetters();
-    expect(deadLetters).toHaveLength(claim.deliveryIds.length);
-    expect(deadLetters.map((record) => record.deliveryId).sort()).toEqual(
-      [...claim.deliveryIds].sort(),
-    );
-    expect(deadLetters[0]!.failureCode).toBe("operator-dead-letter");
-    expect(deliveries.listActiveClaims()).toHaveLength(0);
+  function request(
+    disposition: UnknownOutcomeDispositionRequest["disposition"],
+  ): UnknownOutcomeDispositionRequest {
+    return {
+      identity: IDENTITY,
+      disposition,
+      reasonCode:
+        disposition === "release"
+          ? "operator-forced-release"
+          : disposition === "dead-letter"
+            ? "operator-dead-letter"
+            : "operator-left-unresolved",
+      expectedEvidenceDigest: CURRENT_EVIDENCE_DIGEST,
+    };
+  }
+
+  it("uses the single compare-and-apply operation for all three dispositions", async () => {
+    for (const expected of [
+      ["release", "released", "released"],
+      ["dead-letter", "dead-lettered", "dead-lettered"],
+      ["leave-unresolved", "left-unresolved", "active"],
+    ] as const) {
+      const current = createDispositionOperations();
+      expect(Object.keys(current.operations).sort()).toEqual([
+        "applyUnknownOutcomeDisposition",
+        "inspectUnknownOutcomeClaim",
+      ]);
+      const outcome = await deliveryClaimDispositionApplier(current.operations)(
+        request(expected[0]),
+      );
+      expect(outcome).toBe(expected[1]);
+      expect(current.state.claim.status).toBe(expected[2]);
+      expect(
+        current.operations.applyUnknownOutcomeDisposition,
+      ).toHaveBeenCalledOnce();
+      if (expected[0] === "leave-unresolved") {
+        expect(current.state.submissionRecord).toBeDefined();
+        expect(current.state.evidenceDigest).toBe(CURRENT_EVIDENCE_DIGEST);
+      } else {
+        expect(current.state.submissionRecord).toBeUndefined();
+        expect(current.state.evidenceDigest).toBeUndefined();
+      }
+    }
   });
 
-  it("releases the exact Claim and leaves an unresolved one untouched", async () => {
-    const released = realStore();
-    const releaseOutcome = await deliveryStoreDispositionApplier(released.deliveries)({
-      identity: {
-        moduleJobId: released.claim.moduleJobId,
-        claimToken: released.claim.claimToken,
-        runId: released.claim.runId,
-        attempt: released.claim.attempt,
-        moduleGenerationId: released.claim.moduleGenerationId,
-      },
-      disposition: "release",
-      reasonCode: "operator-forced-release",
-    });
-    expect(releaseOutcome).toBe("released");
-    expect(released.deliveries.listActiveClaims()).toHaveLength(0);
-    expect(released.deliveries.listDeadLetters()).toHaveLength(0);
-    expect(
-      released.deliveries.inspectPending("worker", ["input"]).pendingCount,
-    ).toBe(released.claim.deliveryIds.length);
+  it("reports stale evidence when the first inspection sees a changed digest", async () => {
+    const current = createDispositionOperations();
+    const changedDigest = canonicalJsonDigest({ changedBeforeInspection: true });
+    current.state.evidenceDigest = changedDigest;
 
-    const untouched = realStore();
-    const leftOutcome = await deliveryStoreDispositionApplier(untouched.deliveries)({
-      identity: {
-        moduleJobId: untouched.claim.moduleJobId,
-        claimToken: untouched.claim.claimToken,
-        runId: untouched.claim.runId,
-        attempt: untouched.claim.attempt,
-        moduleGenerationId: untouched.claim.moduleGenerationId,
+    await expect(
+      deliveryClaimDispositionApplier(current.operations)(request("release")),
+    ).rejects.toMatchObject({
+      code: "UNKNOWN_OUTCOME_EVIDENCE_STALE",
+      details: {
+        expectedEvidenceDigest: CURRENT_EVIDENCE_DIGEST,
+        currentEvidenceDigest: changedDigest,
       },
-      disposition: "leave-unresolved",
-      reasonCode: "operator-left-unresolved",
     });
-    expect(leftOutcome).toBe("left-unresolved");
-    expect(untouched.deliveries.listActiveClaims()).toHaveLength(1);
-    expect(untouched.deliveries.listDeadLetters()).toHaveLength(0);
+    expect(
+      current.operations.applyUnknownOutcomeDisposition,
+    ).not.toHaveBeenCalled();
+    expect(current.state.claim.status).toBe("active");
+    expect(current.state.submissionRecord).toBeDefined();
+  });
+
+  it("reports stale evidence when the first inspection returns another Claim identity", async () => {
+    const applyUnknownOutcomeDisposition = vi.fn(() => "released" as const);
+    const operations: DeliveryClaimDispositionOperations = {
+      inspectUnknownOutcomeClaim: vi.fn(() => ({
+        claim: {
+          ...activeClaim(),
+          claimToken: "claim-other",
+        },
+        submissionRecord: undefined,
+        evidenceDigest: CURRENT_EVIDENCE_DIGEST,
+      })),
+      applyUnknownOutcomeDisposition,
+    };
+
+    await expect(
+      deliveryClaimDispositionApplier(operations)(request("release")),
+    ).rejects.toMatchObject({
+      code: "UNKNOWN_OUTCOME_EVIDENCE_STALE",
+      details: { claimToken: IDENTITY.claimToken },
+    });
+    expect(applyUnknownOutcomeDisposition).not.toHaveBeenCalled();
+  });
+
+  it("detects evidence changed after inspection before any terminal change", async () => {
+    const current = createDispositionOperations();
+    const changedDigest = canonicalJsonDigest({ changed: true });
+    current.beforeNextApply(() => {
+      current.state.evidenceDigest = changedDigest;
+    });
+
+    await expect(
+      deliveryClaimDispositionApplier(current.operations)(
+        request("dead-letter"),
+      ),
+    ).rejects.toMatchObject({
+      code: "UNKNOWN_OUTCOME_EVIDENCE_STALE",
+    });
+    expect(current.state.claim.status).toBe("active");
+    expect(current.state.submissionRecord).toBeDefined();
+    expect(current.state.evidenceDigest).toBe(changedDigest);
+  });
+
+  it("rejects a terminal outcome from a no-op operation", async () => {
+    const current = createDispositionOperations();
+    const operations: DeliveryClaimDispositionOperations = {
+      inspectUnknownOutcomeClaim:
+        current.operations.inspectUnknownOutcomeClaim,
+      applyUnknownOutcomeDisposition: vi.fn(() => "released" as const),
+    };
+
+    await expect(
+      deliveryClaimDispositionApplier(operations)(request("release")),
+    ).rejects.toMatchObject({ code: "ADMIN_OPERATION_FAILED" });
+    expect(current.state.claim.status).toBe("active");
+    expect(current.state.submissionRecord).toBeDefined();
+  });
+
+  it("rejects an operation wired to another store", async () => {
+    const local = createDispositionOperations();
+    const foreign = createDispositionOperations();
+    const operations: DeliveryClaimDispositionOperations = {
+      inspectUnknownOutcomeClaim:
+        local.operations.inspectUnknownOutcomeClaim,
+      applyUnknownOutcomeDisposition:
+        foreign.operations.applyUnknownOutcomeDisposition,
+    };
+
+    await expect(
+      deliveryClaimDispositionApplier(operations)(request("release")),
+    ).rejects.toMatchObject({ code: "ADMIN_OPERATION_FAILED" });
+    expect(local.state.claim.status).toBe("active");
+    expect(local.state.submissionRecord).toBeDefined();
+    expect(foreign.state.claim.status).toBe("released");
+  });
+
+  it("rejects a Promise even when it changes the inspected store synchronously", async () => {
+    const current = createDispositionOperations();
+    const asynchronousApply = ((
+      dispositionRequest: UnknownOutcomeDispositionRequest,
+    ) =>
+      Promise.resolve(
+        current.operations.applyUnknownOutcomeDisposition(dispositionRequest),
+      )) as unknown as DeliveryClaimDispositionOperations["applyUnknownOutcomeDisposition"];
+    const operations: DeliveryClaimDispositionOperations = {
+      inspectUnknownOutcomeClaim:
+        current.operations.inspectUnknownOutcomeClaim,
+      applyUnknownOutcomeDisposition: asynchronousApply,
+    };
+
+    await expect(
+      deliveryClaimDispositionApplier(operations)(request("release")),
+    ).rejects.toMatchObject({ code: "ADMIN_OPERATION_FAILED" });
+    expect(current.state.claim.status).toBe("released");
+  });
+
+  it("rejects a terminal Claim that still has its submission record", async () => {
+    const current = createDispositionOperations();
+    const operations: DeliveryClaimDispositionOperations = {
+      inspectUnknownOutcomeClaim:
+        current.operations.inspectUnknownOutcomeClaim,
+      applyUnknownOutcomeDisposition: vi.fn(() => {
+        current.state.claim = {
+          ...current.state.claim,
+          status: "released",
+        };
+        current.state.evidenceDigest = undefined;
+        return "released" as const;
+      }),
+    };
+
+    await expect(
+      deliveryClaimDispositionApplier(operations)(request("release")),
+    ).rejects.toMatchObject({ code: "ADMIN_OPERATION_FAILED" });
+    expect(current.state.submissionRecord).toBeDefined();
+  });
+
+  it("rejects leave-unresolved when the submission record changes", async () => {
+    const current = createDispositionOperations();
+    const operations: DeliveryClaimDispositionOperations = {
+      inspectUnknownOutcomeClaim:
+        current.operations.inspectUnknownOutcomeClaim,
+      applyUnknownOutcomeDisposition: vi.fn(() => {
+        current.state.submissionRecord = {
+          ...current.state.submissionRecord!,
+          createdAt: "2026-07-26T00:00:01.000Z",
+        };
+        return "left-unresolved" as const;
+      }),
+    };
+
+    await expect(
+      deliveryClaimDispositionApplier(operations)(
+        request("leave-unresolved"),
+      ),
+    ).rejects.toMatchObject({ code: "ADMIN_OPERATION_FAILED" });
+    expect(current.state.claim.status).toBe("active");
   });
 });

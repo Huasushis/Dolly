@@ -479,10 +479,12 @@ records live in one atomic Core-state update as defined by `core-runtime.md`,
 and a submitted Run without a
 committed result MUST NOT be automatically negatively acknowledged, released,
 or retried unless the result journal and every possible external effect have
-durable no-effect, retry-safe, or terminal evidence. A trusted Extension with
-direct ambient effect authority is never automatically retried after such a
-submission, and the first Linux Module profile automatically activates only a
-Module whose configuration declares Core-capability-only external effects.
+durable no-effect or retry-safe evidence. A `terminal` outcome proves that an
+effect completed; without a separate durable idempotency or replay contract, it
+does not authorize Core to repeat the Run automatically. A trusted Extension
+with direct ambient effect authority is never automatically retried after such
+a submission, and the first Linux Module profile automatically activates only
+a Module whose configuration declares Core-capability-only external effects.
 Unknown outcomes are preserved for the audited operator flow below.
 
 Prompt text, model responses, tool arguments, generated blocks, and extension
@@ -515,6 +517,18 @@ where applicable, and configuration revision. They MUST exclude credentials,
 signed URLs, raw media, full prompts,
 and response bodies by default. Untrusted strings MUST be encoded so they cannot
 forge log records.
+
+For an unknown-outcome disposition, "record the evidence considered" means a
+bounded, verifiable summary rather than a copy of user or provider content. The
+request and result events record the digest of the complete evidence; the
+canonical JSON digest, or `null` when absent, for the Module process record,
+stop proof, submission record, and result journal entry; and, for each
+external-effect intent, its stable intent ID, recorded outcome, and the
+canonical JSON digest of its description. They MAY also record counts and
+presence or status fields. They MUST NOT record the descriptions, journal
+content, or other full evidence. These digests allow a later reviewer who
+already holds the evidence to verify it; they do not reconstruct evidence that
+has been deleted.
 
 Operational logs MUST be structured, bounded, rotated, and protected with the
 same ownership as state. Public error responses use stable error codes and
@@ -585,10 +599,18 @@ record, recover the result journal through the allowed `prepared` and
 `committed` states, and only then apply a permitted disposition to remaining
 Claims. A committed journal record belongs beside its exact committed Claim and
 no submission record; it is not an alternative match for a submission record.
-The current startup reconciliation implements only part of this order and
-cannot authorize Module activation until it enforces the complete
-Claim/submission relationship. Recovery never assumes a Module process died
-because its record is old or its process identifier is gone.
+The current file-based Core state writer (`FileCoreStateStore`) enforces the
+complete Claim, process-record, submission-record, and persisted-input
+relationship when it opens state and at the relevant mutation boundaries.
+Startup reconciliation enforces the order above when its stop-proof and
+external-effect evidence sources are supplied. This enforcement cannot
+determine whether an active Claim whose submission record is missing from
+historical version 16 state was never submitted or lost its record through an
+earlier writer, so that Claim remains unresolved. Product startup still rejects
+configured Modules and does not connect the existing Linux process-control,
+execution, and stop-proof implementations to the runtime. Recovery never
+assumes a Module process died because its record is old or its process
+identifier is gone.
 
 ### 13.1 Unknown Module outcomes
 
@@ -605,17 +627,47 @@ operator interface MUST:
    Module process record and its stop proof, the submission record or its
    absence, the result journal entry or its absence, and each external-effect
    intent with its recorded outcome;
-2. offer only dispositions whose consequence is stated plainly — release for
+2. offer only dispositions whose consequence is stated plainly: release for
    another attempt, dead letter, or leave unresolved;
 3. require an explicit confirmation for a forced release that warns it can
-   repeat an already completed external effect, since Core cannot prove the
-   effect did not happen; and
-4. emit the audit event in section 11 recording the actor, the chosen
-   disposition, and the evidence shown, before the disposition is applied.
+   repeat an external effect known to have completed or not proven absent; and
+4. emit `console.claim.unknown-outcome.disposition-requested`, recording the
+   actor, chosen disposition, and bounded evidence summary from section 11
+   before applying it, then emit
+   `console.claim.unknown-outcome.disposition` with actual success or failure.
+
+The Hypertext Transfer Protocol (HTTP) application programming interface (API)
+and command-line interface (CLI) forced-release responses both use wire schema
+`dolly.unknown-outcome-warning/2`. Its
+`externalEffectsThatMayRepeat` array contains each effect whose
+`recordedOutcome` is `terminal` or `unknown`, including its `intentId`,
+description, and recorded outcome. `terminal` means the effect is known to have
+completed; `unknown` means completion cannot be ruled out. Both can be repeated
+by another Run. The version 1 field `unprovenExternalEffects` named only effects
+with an `unknown` outcome; version 2 does not reuse that field name for the
+broader set. Issuing this response records the stable event type
+`console.claim.unknown-outcome.warning-issued`.
 
 When an audited disposition makes a submitted Claim terminal, Core MUST remove
 the matching Module submission record in the same Core-state update as the
-Claim transition.
+Claim transition. The same update MUST first compare the evidence digest shown
+to the operator with the current evidence and MUST reject a mismatch before
+changing either record. Inspection before and after separate terminal
+operations does not satisfy this atomic comparison.
+
+Construction of evidence for this operator flow MUST reject, rather than
+truncate, more than 1,024 external-effect intents, an intent description or
+preserved-reason string longer than 8,192 UTF-8 bytes, duplicate or invalid
+intent IDs, or a complete evidence value larger than 1,048,576 canonical JSON
+bytes. Claim, run, Module, generation, and intent identifiers are limited to
+128 characters by the identifier grammar used by Core.
+
+`preservedReason` is the operator-facing explanation of why Core refused an
+automatic decision; it is not proof that an effect did or did not occur. An
+entry in `externalEffectIntents` describes one possible external effect:
+`intentId` is its stable identifier, `description` is the bounded explanation
+shown to the operator, and `recordedOutcome` is the durable status Core
+considered.
 
 An operator disposition MUST NOT weaken the automatic rules: it never converts
 missing evidence into proof, and Core still refuses to start a replacement

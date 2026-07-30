@@ -16,7 +16,11 @@
  * interface as an attribute of the actor and never as a different event.
  */
 
-import { deepFreeze, type JsonValue } from "../../core/canonical-json.js";
+import {
+  canonicalJsonDigest,
+  deepFreeze,
+  type JsonValue,
+} from "../../core/canonical-json.js";
 import {
   InstanceConfigError,
   type InstanceConfigStore,
@@ -121,6 +125,81 @@ export interface UnknownOutcomeDispositionRequestInput {
   readonly operationId: string;
   readonly actor: ConsoleActor;
   readonly acknowledgedWarningDigest?: string;
+}
+
+function unknownOutcomeAuditDetails(
+  claim: PreservedUnknownOutcomeClaim,
+  disposition: UnknownOutcomeDisposition,
+  reasonCode: string,
+): Readonly<Record<string, JsonValue>> {
+  const externalEffectIntentCounts = {
+    total: claim.evidence.externalEffectIntents.length,
+    "no-effect": 0,
+    "retry-safe": 0,
+    terminal: 0,
+    unknown: 0,
+  };
+  for (const intent of claim.evidence.externalEffectIntents) {
+    externalEffectIntentCounts[intent.recordedOutcome] += 1;
+  }
+  const componentDigest = (value: JsonValue | null): string | null =>
+    value === null ? null : canonicalJsonDigest(value);
+  return {
+    disposition,
+    reasonCode,
+    forced: disposition === "release",
+    claimToken: claim.identity.claimToken,
+    moduleJobId: claim.identity.moduleJobId,
+    runId: claim.identity.runId,
+    attempt: claim.identity.attempt,
+    moduleId: claim.moduleId,
+    evidenceDigest: claim.evidenceDigest,
+    evidenceComponentDigests: {
+      moduleProcessRecordDigest: componentDigest(
+        claim.evidence.moduleProcessRecord,
+      ),
+      moduleProcessStopProofDigest: componentDigest(
+        claim.evidence.moduleProcessStopProof,
+      ),
+      submissionRecordDigest: componentDigest(claim.evidence.submissionRecord),
+      resultJournalEntryDigest: componentDigest(
+        claim.evidence.resultJournalEntry,
+      ),
+    },
+    externalEffectIntentCounts,
+    externalEffectIntents: claim.evidence.externalEffectIntents.map((intent) => ({
+      intentId: intent.intentId,
+      recordedOutcome: intent.recordedOutcome,
+      descriptionDigest: canonicalJsonDigest(intent.description),
+    })),
+  };
+}
+
+function dispositionApplyCause(error: unknown): string {
+  if (error instanceof ConsoleOperationError) {
+    const cause = error.details.cause;
+    return typeof cause === "string" ? cause : error.code;
+  }
+  return errorCode(error);
+}
+
+function assertDispositionOutcome(
+  disposition: UnknownOutcomeDisposition,
+  outcome: UnknownOutcomeDispositionOutcome,
+): void {
+  if (
+    (disposition === "release" &&
+      (outcome === "released" || outcome === "already-released")) ||
+    (disposition === "dead-letter" && outcome === "dead-lettered") ||
+    (disposition === "leave-unresolved" && outcome === "left-unresolved")
+  ) {
+    return;
+  }
+  throw new ConsoleOperationError(
+    "ADMIN_OPERATION_FAILED",
+    "The unknown-outcome Claim store returned a disposition outcome that does not match the request",
+    { cause: "ADMIN_OPERATION_FAILED" },
+  );
 }
 
 export class ConsoleOperations {
@@ -440,11 +519,60 @@ export class ConsoleOperations {
     }
 
     const reasonCode =
-      disposition === "release" ? "operator-forced-release" : "operator-dead-letter";
+      disposition === "release"
+        ? "operator-forced-release"
+        : disposition === "dead-letter"
+          ? "operator-dead-letter"
+          : "operator-left-unresolved";
 
-    // The audit event is written before the disposition is applied, so a crash
-    // between the two leaves evidence that the decision was taken rather than a
-    // silently applied change.
+    const auditDetails = unknownOutcomeAuditDetails(claim, disposition, reasonCode);
+
+    // This event records only that the operator made the request. Its event
+    // type and status do not claim that the Claim state has changed.
+    this.#audit({
+      eventType: "console.claim.unknown-outcome.disposition-requested",
+      result: "succeeded",
+      operationId: input.operationId,
+      instanceId: input.instanceId,
+      actor: input.actor,
+      configRevision: instance.desiredConfigRevision,
+      moduleGenerationId: claim.identity.moduleGenerationId,
+      details: { ...auditDetails, dispositionStatus: "requested" },
+    });
+
+    let outcome: UnknownOutcomeDispositionOutcome;
+    try {
+      outcome = await store.applyDisposition({
+        identity: claim.identity,
+        disposition,
+        reasonCode,
+        expectedEvidenceDigest: claim.evidenceDigest,
+      });
+      assertDispositionOutcome(disposition, outcome);
+    } catch (error) {
+      const cause = dispositionApplyCause(error);
+      this.#audit({
+        eventType: "console.claim.unknown-outcome.disposition",
+        result: "failed",
+        operationId: input.operationId,
+        instanceId: input.instanceId,
+        actor: input.actor,
+        configRevision: instance.desiredConfigRevision,
+        moduleGenerationId: claim.identity.moduleGenerationId,
+        details: { ...auditDetails, dispositionStatus: "failed", cause },
+      });
+      if (
+        error instanceof ConsoleOperationError &&
+        error.code === "UNKNOWN_OUTCOME_EVIDENCE_STALE"
+      ) {
+        throw error;
+      }
+      throw new ConsoleOperationError(
+        "ADMIN_OPERATION_FAILED",
+        "The unknown-outcome Claim disposition failed",
+        { cause },
+      );
+    }
     this.#audit({
       eventType: "console.claim.unknown-outcome.disposition",
       result: "succeeded",
@@ -453,29 +581,7 @@ export class ConsoleOperations {
       actor: input.actor,
       configRevision: instance.desiredConfigRevision,
       moduleGenerationId: claim.identity.moduleGenerationId,
-      details: {
-        disposition,
-        forced: disposition === "release",
-        claimToken: claim.identity.claimToken,
-        moduleJobId: claim.identity.moduleJobId,
-        runId: claim.identity.runId,
-        attempt: claim.identity.attempt,
-        moduleId: claim.moduleId,
-        evidenceDigest: claim.evidenceDigest,
-        evidence: claim.evidence as unknown as JsonValue,
-        ...(disposition === "release"
-          ? {
-              warning:
-                "A forced release can repeat an external effect that already completed, because Core cannot prove it did not happen",
-            }
-          : {}),
-      },
-    });
-
-    const outcome = await store.applyDisposition({
-      identity: claim.identity,
-      disposition,
-      reasonCode,
+      details: { ...auditDetails, dispositionStatus: "succeeded", outcome },
     });
     return deepFreeze({
       instanceId: input.instanceId,
