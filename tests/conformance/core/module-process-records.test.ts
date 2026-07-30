@@ -118,6 +118,155 @@ describe("CORE Module process and submission records", () => {
     expect(reopened.snapshot().schemaVersion).toBe("dolly.core-state/16");
   });
 
+  it("rejects a returned value without reading it or persisting a partial update", () => {
+    const store = openStore("first");
+    const savedBlocksSnapshot = store.blocks.snapshot;
+    const beforeRevision = store.revision;
+    const beforeBytes = readFileSync(path, "utf8");
+    let thenGetterReads = 0;
+    const returnedValue = Object.defineProperty({}, "then", {
+      get() {
+        thenGetterReads += 1;
+        store.deliveries.createPage("then-getter-page");
+        return () => undefined;
+      },
+    });
+    const operation = () => {
+      store.appendModuleProcessRecord(processRecord());
+      return returnedValue;
+    };
+
+    if (false) {
+      // The callback contract preserves its actual return type, so TypeScript
+      // cannot apply the permissive `() => void` assignment rule here.
+      // @ts-expect-error Atomic updates may not return a Promise.
+      store.runAtomicUpdate(async () => undefined);
+      // @ts-expect-error Atomic updates may not return any other value.
+      store.runAtomicUpdate(() => "unexpected");
+    }
+
+    expect(() =>
+      store.runAtomicUpdate(operation as unknown as () => undefined),
+    ).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
+    expect(thenGetterReads).toBe(0);
+    expect(() => store.revision).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
+    expect(savedBlocksSnapshot).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
+    expect(readFileSync(path, "utf8")).toBe(beforeBytes);
+    const reopened = openStore("reopened");
+    expect(reopened.revision).toBe(beforeRevision);
+    expect(reopened.listModuleProcessRecords()).toEqual([]);
+    expect(() =>
+      reopened.deliveries.validateOutputPages(["then-getter-page"]),
+    ).toThrowError();
+  });
+
+  it("prevents an asynchronous continuation from writing after rejection", async () => {
+    const store = openStore("first");
+    const savedDeliveriesSnapshot = store.deliveries.snapshot;
+    const beforeRevision = store.revision;
+    const beforeBytes = readFileSync(path, "utf8");
+    let releaseContinuation!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseContinuation = resolve;
+    });
+    let continuation!: Promise<void>;
+    const operation = () => {
+      store.appendModuleProcessRecord(processRecord());
+      continuation = (async () => {
+        await gate;
+        store.updateModuleProcessRecordState("process-generation-1", "running");
+      })();
+      return continuation;
+    };
+
+    expect(() =>
+      store.runAtomicUpdate(operation as unknown as () => void),
+    ).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
+    releaseContinuation();
+    await expect(continuation).rejects.toEqual(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
+    expect(savedDeliveriesSnapshot).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
+    expect(readFileSync(path, "utf8")).toBe(beforeBytes);
+    const reopened = openStore("reopened");
+    expect(reopened.revision).toBe(beforeRevision);
+    expect(reopened.listModuleProcessRecords()).toEqual([]);
+  });
+
+  it("fails closed before a returned Promise makes its first state change", async () => {
+    const store = openStore("first");
+    const beforeRevision = store.revision;
+    const beforeBytes = readFileSync(path, "utf8");
+    let releaseContinuation!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseContinuation = resolve;
+    });
+    let continuation!: Promise<void>;
+    const operation = () => {
+      continuation = (async () => {
+        await gate;
+        store.appendModuleProcessRecord(processRecord());
+      })();
+      return continuation;
+    };
+
+    expect(() =>
+      store.runAtomicUpdate(operation as unknown as () => void),
+    ).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
+    releaseContinuation();
+    await expect(continuation).rejects.toEqual(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
+    expect(readFileSync(path, "utf8")).toBe(beforeBytes);
+    const reopened = openStore("reopened");
+    expect(reopened.revision).toBe(beforeRevision);
+    expect(reopened.listModuleProcessRecords()).toEqual([]);
+  });
+
+  it("propagates an exception without poisoning an unchanged store", () => {
+    const store = openStore("first");
+    const beforeRevision = store.revision;
+    const beforeBytes = readFileSync(path, "utf8");
+    const stopped = new Error("stop");
+
+    expect(() =>
+      store.runAtomicUpdate(() => {
+        throw stopped;
+      }),
+    ).toThrow(stopped);
+    expect(store.revision).toBe(beforeRevision);
+    expect(store.listModuleProcessRecords()).toEqual([]);
+    expect(readFileSync(path, "utf8")).toBe(beforeBytes);
+  });
+
   it("never reuses a process-generation identifier", () => {
     const store = openStore("first");
     store.appendModuleProcessRecord(processRecord());

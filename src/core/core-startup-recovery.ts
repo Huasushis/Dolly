@@ -109,10 +109,20 @@ export interface ModuleRecordStore {
   /** Collects one stopped process record that nothing references any more. */
   removeModuleProcessRecord(processGenerationId: string): void;
   /**
-   * Applies the callback's changes as one Core-state update so a Claim and
-   * its Module records become terminal together.
+   * Persists the callback's related changes as one Core-state revision.
+   * Recovery uses this when a terminal Claim transition and the matching
+   * submission-record removal must be committed together.
    */
-  runAtomicUpdate<T>(operation: () => T): T;
+  runAtomicUpdate<Operation extends () => unknown>(
+    operation: Operation &
+      ([ReturnType<Operation>] extends [never]
+        ? unknown
+        : ReturnType<Operation> extends PromiseLike<unknown>
+          ? never
+          : ReturnType<Operation> extends void
+            ? unknown
+            : never),
+  ): void;
 }
 
 export interface CoreStartupRecoveryOptions {

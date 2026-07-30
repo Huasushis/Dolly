@@ -699,18 +699,29 @@ export class FileCoreStateStore {
   }
 
   /**
-   * Applies several changes as one Core-state update. Architecture Decision
-   * Record 0009 requires a Delivery Claim, its Module process record, and its
-   * Module submission record to become durable together, so recovery can
-   * never observe one without the other. Persistence is deferred until the
-   * operation returns and then written once.
+   * Persists the callback's mutually dependent Core-state changes together.
+   * Recovery uses this to make a terminal Delivery Claim transition and the
+   * matching Module submission-record removal durable in one update.
+   * Persistence is deferred until the operation returns without a value and
+   * then written once. Returning any value is rejected because a Promise
+   * would otherwise let the callback continue after the update had already
+   * been written.
    *
    * The operation must not depend on partial persistence: if it throws, no
    * Core-state update is written. If the single write itself fails, the
    * in-memory state can no longer be proven equal to the file, so the store
    * fails closed and requires a reopen.
    */
-  runAtomicUpdate<T>(operation: () => T): T {
+  runAtomicUpdate<Operation extends () => unknown>(
+    operation: Operation &
+      ([ReturnType<Operation>] extends [never]
+        ? unknown
+        : ReturnType<Operation> extends PromiseLike<unknown>
+          ? never
+          : ReturnType<Operation> extends void
+            ? unknown
+            : never),
+  ): void {
     this.#assertUsable();
     if (this.#deferPersistence) {
       throw new CoreStateError(
@@ -723,9 +734,17 @@ export class FileCoreStateStore {
     const submissionRecords = new Map(this.#moduleSubmissionRecords);
     this.#deferPersistence = true;
     this.#deferredMutation = false;
-    let result: T;
+    let returnedValue = false;
+    let result: unknown;
     try {
       result = operation();
+      if (result !== undefined) {
+        returnedValue = true;
+        throw new CoreStateError(
+          "CORE_STATE_REOPEN_REQUIRED",
+          "A Core state update callback returned a value; callbacks must return undefined and the store must be reopened",
+        );
+      }
     } catch (error) {
       this.#deferPersistence = false;
       const mutated = this.#deferredMutation;
@@ -736,10 +755,12 @@ export class FileCoreStateStore {
       for (const [key, value] of submissionRecords) {
         this.#moduleSubmissionRecords.set(key, value);
       }
-      if (mutated) {
+      if (returnedValue || mutated) {
         // Another component inside the update may have changed its own
-        // in-memory state, which this store cannot roll back.
+        // in-memory state, or an asynchronous continuation may still try to
+        // use this store. Neither can be allowed to persist after this point.
         this.#reopenRequired = true;
+        if (returnedValue) throw error;
         throw new CoreStateError(
           "CORE_STATE_REOPEN_REQUIRED",
           "A Core state update failed after changing runtime state; reopen the store",
@@ -750,14 +771,13 @@ export class FileCoreStateStore {
     this.#deferPersistence = false;
     const mutated = this.#deferredMutation;
     this.#deferredMutation = false;
-    if (!mutated) return result;
+    if (!mutated) return;
     try {
       this.#persistCurrent();
     } catch (error) {
       this.#reopenRequired = true;
       throw error;
     }
-    return result;
   }
 
   #assertUsable(): void {
