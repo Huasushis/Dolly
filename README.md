@@ -149,7 +149,7 @@ unchanged for two instances gives them the same identity.
 | `init` | Create and register a new local instance |
 | `run` | Run an initialized instance in the foreground |
 | `config show` | Validate and print the public configuration, with secrets redacted |
-| `migrate-core-state` | Migrate a **stopped** instance's Core state to schema version 16 |
+| `migrate-core-state` | Migrate a **stopped** instance's Core state to the current supported schema |
 | `help` | Print usage |
 
 Options: `--config <path>` (default `./dolly.json`), `--name <name>` (with `init`
@@ -157,13 +157,21 @@ only), `--confirm` (with `migrate-core-state` only), `-h` / `--help`, and
 `-v` / `--version`.
 
 Without `--confirm`, `migrate-core-state` only describes what it would do and
-changes nothing. With `--confirm` it takes the instance controller lock first, so
-it fails rather than touching the state of a running instance, and it keeps the
-original bytes beside the state file. It will also tell you, before you run it,
-that any Delivery Claim still active after the migration makes the next startup
-stop with `STARTUP_ACTIVE_CLAIM_UNRESOLVED` — that refusal is correct behavior,
-not a defect, because Core genuinely cannot tell whether such a Claim's work
-already executed.
+changes nothing and does not guess which older schema or backup suffix the state
+file uses. With `--confirm` it takes the instance controller lock, then verifies
+that the instance identity and configuration revision have not changed before it
+derives the state path or writes anything. It validates the complete source
+document against that claimed configuration, including the Delivery failure
+limit and whether Media is enabled. It then keeps the exact original bytes in a
+source-version-specific backup and reports the actual source schema, target
+schema, and backup path returned by the migration.
+
+An active Delivery Claim whose older state lacks an exact Module submission
+record remains explicitly unresolved after migration. Startup reports
+`STARTUP_ACTIVE_CLAIM_UNRESOLVED` instead of guessing whether sending was
+authorized; resolving that uncertainty requires a separate audited operator
+action. Dolly does not yet provide that operator command, so the affected
+Module remains blocked.
 
 ### Configuration
 

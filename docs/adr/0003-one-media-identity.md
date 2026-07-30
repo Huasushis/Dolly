@@ -99,7 +99,7 @@ identities MUST NOT be preserved as parallel identifiers.
 The current closed values are `dolly.media/2`,
 `dolly.media-registration/4`, `dolly.media-storage-record/4`,
 `dolly.media-access-grant/5`, and `dolly.media-store/9`, nested in
-`dolly.core-state/16` with `dolly.reference-graph/4`. Instance configuration
+`dolly.core-state/17` with `dolly.reference-graph/4`. Instance configuration
 uses `dolly.instance/9`.
 Readers reject the immediately preceding values rather than guessing a
 migration.

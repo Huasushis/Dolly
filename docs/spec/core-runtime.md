@@ -840,16 +840,22 @@ attempts recorded for that Module job. A later Claim increases `attempt`,
 including after an orderly shutdown, but releasing the earlier Claim does not
 record a failed attempt or increase `failedAttemptCount`.
 
+An **unknown submission history item** records an exact active Claim migrated
+from an older Core-state format when Dolly cannot determine whether its
+submission record ever existed. Section 7.7 defines its complete identity and
+storage rules.
+
 The persisted Claim state `released` means Core has confirmed that the Run's
 executor cannot submit a result, and that either no submission record exists in
-a state known to satisfy Section 7.7 or the result journal and every possible
-external effect have no-effect or retry-safe evidence. A terminal external
-effect outcome requires the Claim to remain unresolved unless a separate
-durable idempotency contract proves retry safety. Absence in a version 16 state
-is not sufficient by itself because earlier version 16 writers permitted
-independent submission-record removal. The old Claim can no longer be
-acknowledged or negatively acknowledged, and the same immutable Delivery batch
-remains pending for the same Module job. The state is required because
+a version 17 state that also has no unknown submission history item for that
+exact Claim, or the result journal and every possible external effect have
+no-effect or retry-safe evidence. A terminal external effect outcome requires
+the Claim to remain unresolved unless a separate durable idempotency contract
+proves retry safety. Version 15 and version 16 absence is not sufficient by
+itself because those formats cannot prove that an older writer never removed
+the record independently. The old Claim can no longer be acknowledged or
+negatively acknowledged, and the same immutable Delivery batch remains pending
+for the same Module job. The state is required because
 `active` still authorizes a Run, `nacked` and `dead-lettered` classify failure,
 and `committed` records success; none of those states represents an orderly
 shutdown that preserves pending work.
@@ -920,35 +926,43 @@ The current dead-letter record schema is `dolly.dead-letter/2`. Version 2 uses
 `moduleJobId` for the originating Module job. Readers MUST reject version 1 and
 its former field rather than accepting it as an alias.
 
-The current file-backed Core state document is `dolly.core-state/16`. It contains
+The current file-backed Core state document is `dolly.core-state/17`. It contains
 the revision, `referenceGraph`, optional Media state, Block state, Delivery
-store state, `moduleProcessRecords`, `moduleSubmissionRecords`, and a digest over
-that payload. Version 16 contains
+store state, `moduleProcessRecords`, `moduleSubmissionRecords`, the collection
+of unknown submission history items defined below, and a digest over every one
+of those fields including `schemaVersion`. Version 17 contains
 `dolly.delivery-store/6`, including the required stored Module-job `hasMore`
 and `failedAttemptCount` values, and accepts
 `dolly.media-store/9`, including persistent upload recovery, bounded resource
 records, generated identifier sequence state, URL-provider-request outcome
-state, and temporary Media-read leases. Readers MUST reject every earlier Core
-state schema and any unknown field or digest mismatch; they MUST NOT silently
-migrate an older Delivery store snapshot during startup.
+state, and temporary Media-read leases. Normal startup readers MUST reject
+version 15, version 16, any unknown field, and any digest mismatch; they MUST
+NOT silently migrate an older Core-state or Delivery-store snapshot.
 
-Version 16 stores `moduleProcessRecords` and `moduleSubmissionRecords` in the
-same complete Core-state document as the Delivery store state, not in another
-file or result store. The document version does not by itself enable a Module:
-runtime startup still rejects every configured Module, so both collections are
-empty in product-created state today. The rules below state the required target
-for enabling Modules; the record shapes shown below describe the current version
-16 representation, not a chosen future representation. Earlier version 16
-writers permitted a submission record to be removed independently of its Claim
-transition and treated a record beside a terminal Claim as later cleanup. The
-current file-based Core-state store (`FileCoreStateStore`) instead makes every
-Claim terminal transition and matching record removal one Core-state update,
-rejects direct terminal methods on its public Delivery store, and rejects a
-terminal Claim beside a submission record. The unchanged version 16 label
-cannot show whether an existing file was written before those enforcement
-points existed. Before Module activation, Dolly MUST therefore select a new
-Core-state schema version and an explicit migration that establishes the target
-relationship. This specification does not prescribe that version's fields.
+Version 17 stores `moduleProcessRecords`, `moduleSubmissionRecords`, and unknown
+submission history items in the same complete Core-state document as the
+Delivery store state, not in another file or result store. As defined in
+Section 7.6, each item identifies an exact active Claim migrated from version 15
+or version 16 for which Dolly cannot determine whether a matching Module
+submission record was never written or was removed by an older writer. The
+serialized collection
+`activeClaimsWithUnknownSubmissionHistory` contains exactly the Claim's
+`moduleJobId`, claim token (`claimToken`), `runId`, attempt number (`attempt`),
+and `moduleGenerationId`. An item is not a submission record, is not authority
+to send, and is not proof that sending was never authorized. Each item MUST
+match one exact active Claim, be unique by `runId`, and be disjoint from the
+submission-record collection.
+
+Earlier version 16 writers permitted a submission record to be removed
+independently of its Claim transition and treated a record beside a terminal
+Claim as later cleanup. `FileCoreStateStore` now makes every Claim terminal
+transition and matching record removal one Core-state update, rejects direct
+terminal methods on its public Delivery store, and rejects a terminal Claim
+beside a submission record. Version 17 and its explicit migration establish the
+missing historical distinction without interpreting an ambiguous older
+document as evidence that sending was never authorized. The document version
+does not by itself enable a Module; the remaining activation requirements in
+this specification and ADR 0009 still apply.
 
 A Module process record contains the instance, Module, Module-generation, and
 non-reused process-generation identifiers; validated package digest and
@@ -975,9 +989,9 @@ identifiers MUST match.
 Before writing or accepting a submission record, Core MUST recompute
 `inputDigest` from the exact canonical `dolly.reactive-module-input/2` document
 bound to that Claim and compare the result with the record. It MUST NOT trust a
-stored digest without the durable input needed to perform that comparison. A
-future Core-state schema and migration must preserve enough information for
-this validation without this specification prescribing its fields.
+stored digest without the durable input needed to perform that comparison.
+Version 17 preserves the Delivery-store input needed for this validation when
+it migrates an older document.
 
 A Claim that is not active MUST have no submission record; finding both is a
 fail-closed consistency error, not permission to collect the record later. An
@@ -1069,30 +1083,39 @@ retained and must not be collected. Its process identity, package digest,
 configuration reference, and external-effect declaration are immutable. Its
 lifecycle state may advance to `stopped` only after startup verifies a stop
 proof bound to that exact process record. The exact container layout inside
-`dolly.core-state/16` follows the existing Core-state document conventions; the
+`dolly.core-state/17` follows the existing Core-state document conventions; the
 identity keys are the non-reused `processGenerationId` for process records and
-`runId` for submission records.
+`runId` for submission records and unknown submission history items.
 
-Reading a `dolly.core-state/15` document reports
-`CORE_STATE_MIGRATION_REQUIRED`; version 16 is never inferred from it during
-startup. The explicit offline migration verifies the version 15 digest, writes
-the original bytes to a `.v15.backup` file beside the state file, and then
-atomically replaces the state file with a version 16 document whose record
-collections are empty. It runs under the same Core-state lock, refuses to
-overwrite an existing backup, and refuses to alter an already current document.
-The caller is responsible for running it only against a stopped instance.
+Reading a `dolly.core-state/15` or `dolly.core-state/16` document during normal
+startup reports `CORE_STATE_MIGRATION_REQUIRED`; startup never infers version
+17. The explicit `migrate-core-state` command migrates either supported older
+version directly to version 17. It first inspects the instance configuration,
+acquires that instance's controller lock, and then claims the same instance
+identity and configuration revision. While holding that lock, it restores and
+validates the source and proposed target with the claimed failure limit, Media
+enablement, Media identifier namespace, Media limits, and Core-state byte
+limit. A configuration revision change, incompatible snapshot, invalid
+cross-record relationship, or oversized target fails before a backup is
+created or the source is replaced.
 
-The version 15 to version 16 migration preserves existing Claims and creates
-both Module record collections empty. An active Claim after that migration
-remains unresolved because Core cannot determine whether its Run executed. The
-migration therefore fails closed; it does not prove that an arbitrary version
-16 document satisfies the target rule above. An active Claim without a
-submission record in existing version 16 state is likewise ambiguous: the Run
-may never have been authorized, or an earlier writer may have removed its
-record independently. Migration and recovery MUST NOT automatically call that
-state `never-submitted`, release the Claim, or retry the Run. They MUST preserve
-it as unresolved until durable evidence or an audited operator action
-establishes a disposition.
+Migration increments the Core-state revision exactly once, computes a version
+17 digest that includes `schemaVersion`, writes the exact original bytes beside
+the state file as `.v15.backup` or `.v16.backup`, and then atomically replaces
+the source. A retry may reuse an existing backup only when it is a regular file
+whose bytes exactly equal the still-current source; a partial or different
+backup fails closed. The Core-state file lock protects the replacement in
+addition to the instance controller lock.
+
+For every migrated active Claim without a matching submission record, migration
+writes its exact five-field identity to the unknown submission history
+collection. Version 15 has no Module record collections, while version 16
+process and submission records are preserved and revalidated. Migration and
+recovery MUST NOT call an item in that collection `never-submitted`, release or
+retry its Claim, or create a new submission record for it. Only an active Claim
+written under version 17 rules with neither a submission record nor an exact
+unknown submission history item proves that Core was never authorized to send
+that Run.
 
 The Module result commit journal remains separate because it records output
 effects. For a successful submitted Run, the required order is:
@@ -1126,8 +1149,17 @@ it must identify the exact Claim and warn that release or retry can repeat an
 external effect. A matching active Claim with a submission record and neither
 evidence nor an audited disposition remains an unknown outcome. An active Claim
 without a submission record may be released after its old Module cgroup is
-proven empty only when the state is known to satisfy the target rule; the
-version 16 ambiguity above remains unresolved.
+proven empty only when version 17 also contains no matching
+unknown submission history item. When that item exists,
+`FileCoreStateStore` rejects ordinary submission creation, acknowledgement,
+negative acknowledgement, release, and result-commit acknowledgement before
+changing state. Startup recovery likewise preserves the exact active Claim and
+fails closed.
+
+Dolly currently has no product command that records an audited operator
+disposition and removes an unknown submission history item. A Claim marked this
+way therefore remains blocked after migration; the audit requirements below do
+not imply that the missing command already exists.
 
 `operator-left-unresolved` is the audit reason code for an operator choice that
 deliberately makes no Claim transition: the exact Claim remains active and its
@@ -1944,7 +1976,7 @@ Block, claim, or Module correctness.
 | Termination wait expires | Report that termination is unconfirmed and retain the same `terminate()` Promise for a later `stop()` call; do not invoke process `stop()` as substitute proof. |
 | Shutdown cancellation | If shutdown began before Core started handling a hard timeout, stop new claims, request cancellation, preserve any result acceptance already in progress, and prove the required process termination. Release the exact Claim only when submission/effect evidence permits it, removing a matching submission record in the same Core-state update; otherwise preserve the Claim as an unknown outcome. Do not blindly classify, negatively acknowledge, enter in dead letter, or increase `failedAttemptCount`. |
 | Claim release persistence is uncertain | Flush pending persistence and inspect the exact Claim and submission record. If state `released` and absence of the matching submission record cannot both be confirmed, report `RUNTIME_RECOVERY_REQUIRED` and retain the Claim identity for a later `stop()` call. |
-| Process crash | On restart, verify the Core service and old Module cgroups, reconcile the commit journal and outbox, then reread one complete Core-state update. Keep an active Claim unchanged until durable process, submission, and external-effect evidence proves its outcome; version 16 absence alone proves nothing. A terminal Claim with a submission record fails closed. If evidence is unavailable, block Module activation or retain an unknown outcome instead of acknowledging, negatively acknowledging, retrying, releasing, or entering it in dead letter. |
+| Process crash | On restart, verify the Core service and old Module cgroups, reconcile the commit journal and outbox, then reread one complete version 17 Core-state update. After all old processes are proven stopped, the absence of both a submission record and an exact unknown submission history item proves `never-authorized-to-send`; a matching unknown submission history item instead preserves the active Claim and blocks startup. A terminal Claim with a submission record fails closed. If submitted-Run evidence is unavailable, block Module activation or retain an unknown outcome instead of acknowledging, negatively acknowledging, retrying, releasing, or entering it in dead letter. |
 
 Errors crossing the core boundary MUST use stable machine-readable codes plus a
 human-readable message and structured cause. Raw secrets, credentials, and
@@ -2041,11 +2073,13 @@ With `persistent` durability, before Modules enter READY, recovery MUST:
 - recover Module result journal records through the Section 7.7 boundaries,
   reread one complete Core-state update, and then interpret each active Claim
   with its matching process and submission records plus external-effect evidence;
-- release only a Claim with no submission record after its old Module cgroup is
-  proven empty and after establishing that the Core-state document satisfies the
-  target invariant; never infer that fact from ambiguous version 16 absence;
-  preserve any submitted Claim without safe evidence as an unknown outcome; and
-  fail closed on an orphan, identity mismatch, terminal Claim with a submission
+- release only a Claim with no submission record after every old Module process
+  is proven stopped and version 17 also has no exact
+  unknown submission history item; report that release as
+  `never-authorized-to-send`;
+- preserve a Claim with an unknown submission history item and any submitted
+  Claim without safe evidence as an unknown outcome; and
+- fail closed on an orphan, identity mismatch, terminal Claim with a submission
   record, or any committed journal record beside an active Claim;
 - restore consumer checkpoints, Module jobs, and strong references;
 - advance every restarted Module generation;
@@ -2067,17 +2101,24 @@ Page topology before it makes Modules ready.
 
 An implementation MUST distinguish a clean stop from crash recovery.
 
-Startup reconciliation reports the following codes. An active Claim with no
-matching durable process record still reports
-`STARTUP_ACTIVE_CLAIM_UNRESOLVED`, which remains the response while Modules
-are disabled and no records exist. `STARTUP_MODULE_PROCESS_UNPROVEN` means an
-old process record is not `stopped` and no accepted proof showed its Module
-cgroup empty; startup never assumes a process died.
+Startup reconciliation reports the following codes. An active Claim reports
+`STARTUP_ACTIVE_CLAIM_UNRESOLVED` when Module-record operations are unavailable,
+when its exact unknown submission history item exists, or when submitted-Run
+evidence cannot support a safe disposition. A Claim written under version 17
+rules with neither a submission record nor an unknown submission history item
+does not use that error: after every old process is proven stopped, recovery releases it as
+`never-authorized-to-send`. `STARTUP_MODULE_PROCESS_UNPROVEN` means an old
+process record is not `stopped` and no accepted proof showed its Module cgroup
+empty; startup never assumes a process died.
 `STARTUP_MODULE_RECORD_INCONSISTENT` means that a submission record cannot be
-linked to its exact active Claim.
+linked to its exact active Claim, or that an unknown submission history item is
+not unique, does not contain exactly the five Claim identity fields, does not
+match its exact active Claim, overlaps a submission record, or disagrees with
+the store's exact-identity query.
 `STARTUP_CLAIM_RELEASE_UNCONFIRMED` means startup cannot synchronously confirm
-both parts of a permitted release: the exact Claim is `released` in the
-Delivery store recovery is reading, and its submission record is absent.
+all parts of a permitted release: the exact Claim is `released` in the Delivery
+store recovery is reading, its submission record is absent, and no exact
+unknown-submission-history item remains.
 `STARTUP_JOURNAL_CLAIM_INCONSISTENT` means either that result-journal recovery
 rejected a combination of journal record, Claim, submission record, Block
 effect, or output Delivery effect, or that a journal record still exists beside
@@ -2102,10 +2143,11 @@ enforces the journal order above. `CoreStartupRecovery` converts
 `MODULE_RESULT_PERSISTED_STATE_CONFLICT` into
 `STARTUP_JOURNAL_CLAIM_INCONSISTENT`. It passes document, size-limit, lock,
 input/output, and synchronous-operation-contract failures through unchanged;
-those errors do not prove a persisted Claim inconsistency. Recovery also keeps
-an active version 16 Claim with a missing submission record unresolved. These
-checks do not repair the historical version 16 ambiguity described in Section
-7.7. Startup accepts Module-cgroup stop proof and external-effect evidence
+those errors do not prove a persisted Claim inconsistency. Recovery keeps a
+migrated Claim with unknown submission history unresolved and permits no
+ordinary Claim transition. These checks preserve, rather than repair or guess
+through, the historical version 15 and version 16 ambiguity described in
+Section 7.7. Startup accepts Module-cgroup stop proof and external-effect evidence
 through injected interfaces. The Linux stop-proof implementation exists, but
 `runtime-bootstrap.ts` does not pass it to startup recovery. The effect-intent
 record protocol and recovery adapter (`effectIntentEvidenceSource`) also exist,
@@ -2308,13 +2350,16 @@ following cases.
   success requires state `released` and absence of that record, and repeated
   uncertainty reports `RUNTIME_RECOVERY_REQUIRED` while preserving the Claim
   identity for a later `stop()` call;
-- startup with an active Claim and no durable records of process state and
-  result submission reports `STARTUP_ACTIVE_CLAIM_UNRESOLVED` instead of
-  acknowledging, negatively acknowledging, retrying, or recording it in dead
-  letter;
-- startup with an active Claim but no submission record in version 16 state
-  does not infer `never-submitted`, release the Claim, or retry the Run without
-  additional durable evidence or audited operator resolution;
+- startup recovery constructed without durable Module-record operations reports
+  `STARTUP_ACTIVE_CLAIM_UNRESOLVED` for an active Claim instead of guessing from
+  unavailable state;
+- startup releases an active version 17 Claim as `never-authorized-to-send` only
+  after every old process is proven stopped and both its submission record and
+  exact unknown submission history item are absent;
+- startup with an unknown submission history item does not create a submission
+  record, acknowledge, negatively acknowledge, release, retry, or record the
+  Claim in dead letter, and no product operator command currently clears that
+  item;
 - a terminal Claim beside a submission record fails closed rather than
   collecting that record, and injected crashes cover each boundary from a
   `prepared` result journal record through atomic positive acknowledgement and

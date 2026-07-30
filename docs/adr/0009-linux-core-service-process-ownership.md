@@ -398,9 +398,15 @@ returns successfully. If the write result is uncertain, Core rereads the exact
 state; until it can prove the update's result, it does not send. Therefore a
 submission record absent from a valid recovered Core-state update means Core
 never received durable authority to send that Run only when the writer or an
-explicit migration is known to enforce this decision. A separate record file
-is forbidden because an independently durable Claim and record could create a
-misleading torn recovery view.
+explicit migration is known to enforce this decision. Version 17 makes that
+distinction explicit. An **unknown submission history item** records the exact
+identity of an active Claim migrated from an older Core-state format when Dolly
+cannot determine whether its submission record ever existed. It contains the
+Claim's `moduleJobId`, claim token, `runId`, attempt, and
+`moduleGenerationId`. Absence proves no authority only when the exact active
+Claim is also absent from that collection. A separate record file is forbidden
+because an independently durable Claim and record could create a misleading
+torn recovery view.
 
 Every submission record matches exactly one active Claim in the same Core-state
 update. An active Claim may have zero or one matching submission record. Any
@@ -450,19 +456,21 @@ exactly-once Module execution or exactly-once external effects.
 The required startup reconciliation order is:
 
 1. Verify the current Core service and prove every old Module cgroup empty.
-2. Open and validate one complete Core-state update. Any active Claim lacking a
-   matching process record, any submission record lacking its exact active
-   Claim, a terminal Claim beside a submission record, or any record identity
-   mismatch is unresolved and blocks Module activation.
+2. Open and validate one complete Core-state update. Any submission record
+   lacking its exact active Claim or process record, a terminal Claim beside a
+   submission record, an invalid unknown submission history item, or any record
+   identity mismatch blocks Module activation.
 3. Reconcile the existing result-commit journal, then reread Core state because
    journal recovery can atomically complete a Claim and remove its submission
    record before marking a `prepared` journal record `committed`.
 4. For each remaining active Claim, inspect the matching process and submission
    records from that one Core-state update.
-5. When no submission record exists in a state known to satisfy this decision,
-   and the old process cgroup was proven empty, release only the exact Claim:
-   Core was never authorized to send it. Absence in ambiguous version 16 state
-   does not meet this condition.
+5. In version 17, when neither a submission record nor an exact
+   unknown submission history item exists and every old process was proven
+   stopped, release only the exact Claim with reason
+   `never-authorized-to-send`. A matching unknown submission history item keeps
+   the Claim active and blocks startup; ambiguous version 15 or version 16
+   absence never meets this condition directly.
 6. A valid `prepared` journal record with its active Claim and submission record
    resumes under step 3; it is not an unknown outcome merely because the journal
    is not yet `committed`. When no valid recoverable result record exists,
@@ -655,27 +663,47 @@ verify the interpreter before Module activation and fail closed when it is
 absent, in the same way it fails closed on missing systemd or cgroup version 2
 delegation.
 
-The existing migration from Core-state version 15 to version 16 requires a
-stopped instance and verification that no old Dolly process is running. It
-creates a state backup, preserves existing Claims, and atomically adds empty
-Module process and submission record collections. Any active Claim remains
-unresolved because Core cannot determine whether its Run executed; the
-migration's refusal to infer an outcome is its safety property.
+The explicit `migrate-core-state` command migrates Core-state version 15 or
+version 16 directly to the current version 17. It inspects the instance
+configuration, acquires that instance's controller lock, and then claims the
+same instance identity and configuration revision. While holding the lock, it
+restores and validates both the source and proposed target with the claimed
+failure limit, Media enablement, Media identifier namespace, Media limits, and
+Core-state byte limit. Validation failure or a configuration revision change
+therefore leaves the source unchanged and creates no backup.
 
-Earlier version 16 writers did not enforce the Claim and submission record
+A successful migration increments the Core-state revision exactly once. Its
+version 17 digest covers `schemaVersion` as well as the rest of the document.
+Before atomic replacement, migration writes an exact source-byte backup named
+for the actual source version, `.v15.backup` or `.v16.backup`. A retry may reuse
+that path only when it is a regular file whose bytes exactly match the
+still-current source; a partial or different backup fails closed.
+
+Earlier version 16 writers did not enforce the Claim and submission-record
 invariant above at every mutation boundary: they permitted independent record
-removal and later collection beside a terminal Claim. The current file-based
-Core-state store (`FileCoreStateStore`) makes the terminal Claim transition and
-matching record removal one Core-state update, rejects direct terminal Delivery
-methods on its public store, and rejects a terminal Claim beside a submission
-record. Because both implementations use the same version 16 label, a future
-migration MUST NOT interpret an active Claim with no version 16 submission
-record as proof that the Run was never submitted. It must keep the Claim
-unresolved until durable evidence or an audited operator action establishes an
-explicit disposition.
-Before Module activation, Dolly MUST select a new Core-state schema version and
-an explicit migration that enforces the invariant. This decision does not define
-that version's fields. The Linux service validation and required failure tests
-must also pass. A later configuration revision must pin the package and
-configuration revision of every unresolved Run; package upgrades and
-process-record collection cannot alter or erase that evidence.
+removal and later collection beside a terminal Claim. Version 15 has no Module
+record collections. Version 17 therefore stores every migrated active Claim
+without a matching submission record as an unknown submission history item. The
+field
+`activeClaimsWithUnknownSubmissionHistory` contains exactly the Claim's
+`moduleJobId`, claim token (`claimToken`), `runId`, attempt number (`attempt`),
+and `moduleGenerationId`. An item means Dolly cannot determine whether the
+older writer never created a submission record or removed it independently; it
+is neither a submission record nor proof that sending was never authorized.
+
+`FileCoreStateStore` requires each item to match one exact active Claim, be
+unique by `runId`, and not overlap a submission record. It rejects ordinary
+submission creation, acknowledgement, negative acknowledgement, release, and
+result-commit acknowledgement for that Claim without changing state. Startup
+recovery also fails closed. Only a version 17 active Claim with neither a
+submission record nor an exact unknown submission history item may be released
+as `never-authorized-to-send`, and only after every old process is proven
+stopped.
+
+Dolly currently has no product-level operator command that records an audited
+disposition and removes an unknown submission history item. Such a Claim remains
+blocked after migration. The Linux service validation and other required
+failure tests must still pass before Module activation. A later configuration
+revision must pin the package and configuration revision of every unresolved
+Run; package upgrades and process-record collection cannot alter or erase that
+evidence.
