@@ -819,11 +819,14 @@ including after an orderly shutdown, but releasing the earlier Claim does not
 record a failed attempt or increase `failedAttemptCount`.
 
 The persisted Claim state `released` means Core has confirmed that the Run's
-executor cannot submit a result, and that no submission record exists or the
-result journal and every possible external effect have no-effect, retry-safe, or
-terminal evidence. The old Claim can no longer be acknowledged or negatively
-acknowledged, and the same immutable Delivery batch remains pending for the same
-Module job. The state is required because
+executor cannot submit a result, and that either no submission record exists in
+a state known to satisfy Section 7.7 or the result journal and every possible
+external effect have no-effect, retry-safe, or terminal evidence. Absence in a
+version 16 state is not sufficient by itself because the current version 16
+writer permits independent submission-record removal. The old Claim can no
+longer be acknowledged or negatively acknowledged, and the same immutable
+Delivery batch remains pending for the same Module job. The state is required
+because
 `active` still authorizes a Run, `nacked` and `dead-lettered` classify failure,
 and `committed` records success; none of those states represents an orderly
 shutdown that preserves pending work.
@@ -832,10 +835,13 @@ After shutdown cancellation and proof that the executor stopped, Core MUST first
 apply the same submission and external-effect evidence rule. It may release the
 exact Claim identified by `moduleJobId`, claim token, `runId`, attempt, and
 `moduleGenerationId` only when that rule permits release. Release does not increase
-`failedAttemptCount`. If the release write reports failure or its result is
-otherwise uncertain, Core MUST flush pending persistence and inspect that exact
-Claim. It may finish stopping only if inspection confirms state `released` for
-the expected consumer. If it cannot confirm that state, it MUST report
+`failedAttemptCount`. If a matching submission record exists, the update that
+records `released` MUST also remove that record. If the release write reports
+failure or its result is otherwise uncertain, Core MUST flush pending
+persistence and inspect that exact Claim and submission record. It may finish
+stopping only if inspection confirms state `released` for the expected consumer
+and confirms that no matching submission record remains. If it cannot confirm
+both facts, it MUST report
 `RUNTIME_RECOVERY_REQUIRED`, retain the exact Claim identity, and let a later
 `stop()` call retry or reconcile the same release. It MUST NOT infer a failure
 classification or issue a negative acknowledgement.
@@ -907,8 +913,17 @@ Version 16 stores `moduleProcessRecords` and `moduleSubmissionRecords` in the
 same complete Core-state document as the Delivery store state, not in another
 file or result store. The document version does not by itself enable a Module:
 runtime startup still rejects every configured Module, so both collections are
-empty in any deployment today. A
-Module process record contains the instance, Module, Module-generation, and
+empty in product-created state today. The rules below state the required target
+for enabling Modules; the record shapes shown below describe the current version
+16 representation, not a chosen future representation. The current version 16
+writer permits a submission record to be removed independently of its Claim
+transition, and current recovery can treat a record beside a terminal Claim as
+later cleanup. Those behaviors do not satisfy this section and do not authorize
+Module activation. Before Module activation, Dolly MUST select a new Core-state
+schema version and an explicit migration that enforces the target relationship.
+This specification does not prescribe that version's fields.
+
+A Module process record contains the instance, Module, Module-generation, and
 non-reused process-generation identifiers; validated package digest and
 configuration reference revision; the recorded external-effect declaration from
 Section 5.2; verified Core-service invocation and Linux boot identifiers;
@@ -920,11 +935,31 @@ A Module submission record contains the exact active Claim identity
 (`moduleJobId`, claim token, `runId`, attempt, and `moduleGenerationId`), the
 matching process generation, canonical input digest, and durable authorization
 to send `module.execute`. The record is written in a confirmed Core-state update
-before the protocol send. An active Claim has exactly one matching live process
-record and zero or one matching submission record; identity mismatch, orphan
-record, or a partial/unknown state write is a fail-closed recovery error. Core
-allocates the process-generation identifier and pins the package/configuration
-revision in that same state update before starting a child launcher.
+before the protocol send. Every submission record MUST match exactly one active
+Claim in the same Core-state document. An active Claim has zero or one matching
+submission record. When that record exists, its `processGenerationId` selects
+exactly one Module process record; other stopped records retained for the same
+Module generation are history, not additional matches. The selected process
+record may become `stopped` during recovery, but it MUST be `running` when Core
+first writes the submission record. The Claim's consumer identifier MUST equal
+the selected process record's `moduleId`, and their Module-generation
+identifiers MUST match.
+
+Before writing or accepting a submission record, Core MUST recompute
+`inputDigest` from the exact canonical `dolly.reactive-module-input/2` document
+bound to that Claim and compare the result with the record. It MUST NOT trust a
+stored digest without the durable input needed to perform that comparison. A
+future Core-state schema and migration must preserve enough information for
+this validation without this specification prescribing its fields.
+
+A Claim that is not active MUST have no submission record; finding both is a
+fail-closed consistency error, not permission to collect the record later. An
+identity mismatch, orphan record, missing durable input for digest validation,
+or partial or unknown state write also fails closed. Core allocates the
+process-generation identifier and pins the package/configuration revision in
+the earlier update that creates the process record, before starting a child
+launcher. The later submission-record update refers to those pinned values; it
+does not allocate or change them.
 
 The record shapes are:
 
@@ -996,13 +1031,17 @@ The process-record lifecycle is:
   successful removal of the prepared cgroup directory is also sufficient.
 
 Every transition is part of a Core-state update. A submission record may be
-written only while its process record is `running`. A `stopped` process record
-with no remaining active Claim or submission record may be removed in a later
-Core-state update; a record referenced by an unresolved Claim, submission
-record, or unknown outcome is pinned and must not be altered or collected. The
-exact container layout inside `dolly.core-state/16` follows the existing
-Core-state document conventions; the identity keys are the non-reused
-`processGenerationId` for process records and `runId` for submission records.
+written only while its process record is `running` and its exact Claim is
+active. A transition of that Claim to `released`, `nacked`, `committed`, or
+`dead-lettered` MUST remove the matching submission record in the same
+Core-state update. That terminal transition is the only permitted removal of a
+submission record. A `stopped` process record with no remaining active Claim or
+submission record may be removed in a later Core-state update; a record
+referenced by an unresolved Claim, submission record, or unknown outcome is
+pinned and must not be altered or collected. The exact container layout inside
+`dolly.core-state/16` follows the existing Core-state document conventions; the
+identity keys are the non-reused `processGenerationId` for process records and
+`runId` for submission records.
 
 Reading a `dolly.core-state/15` document reports
 `CORE_STATE_MIGRATION_REQUIRED`; version 16 is never inferred from it during
@@ -1013,33 +1052,70 @@ collections are empty. It runs under the same Core-state lock, refuses to
 overwrite an existing backup, and refuses to alter an already current document.
 The caller is responsible for running it only against a stopped instance.
 
-The Module result commit journal remains separate because it records output
-effects, but recovery first completes that journal, rereads one complete
-Core-state update, and then interprets active Claims. A remaining Claim without
-a submission record may be released only after its old Module cgroup has been
-proven empty. A remaining Claim with a submission record and no committed result
-is an unknown outcome unless its external-effect evidence permits a safe
-disposition. A committed journal record with a contradictory active Claim fails
-closed. Core removes a submission record only in the same Core-state update that
-makes its Claim terminal.
+The version 15 to version 16 migration preserves existing Claims and creates
+both Module record collections empty. An active Claim after that migration
+remains unresolved because Core cannot determine whether its Run executed. The
+migration therefore fails closed; it does not prove that an arbitrary version
+16 document satisfies the target rule above. An active Claim without a
+submission record in existing version 16 state is likewise ambiguous: the Run
+may never have been authorized, or the current writer may have removed its
+record independently. Migration and recovery MUST NOT automatically call that
+state `never-submitted`, release the Claim, or retry the Run. They MUST preserve
+it as unresolved until durable evidence or an audited operator action
+establishes a disposition.
 
-Records that no longer describe anything Core can act on are collected. A
-submission record whose Claim is no longer active belongs to a Run that already
-reached a terminal state through an evidence-checked path, and a stopped
-process record is collectable once no submission record references it and no
-active Claim belongs to its Module generation. Collection MUST NOT require the
-result-commit journal to still hold the matching commit: that would couple
-recovery to the journal never deleting anything, so a later retention or
-cleanup policy would turn every historical record into a startup failure.
+The Module result commit journal remains separate because it records output
+effects. For a successful submitted Run, the required order is:
+
+1. write and synchronize the `prepared` journal record before any result
+   effect; this durable state lets recovery resume the remaining work;
+2. apply and record the recoverable Block and output Delivery effects while the
+   journal record remains `prepared`;
+3. make one Core-state update that positively acknowledges the exact active
+   Claim and removes its matching submission record; and
+4. change the journal record from `prepared` to `committed`.
+
+A crash between steps 3 and 4 may therefore leave a matching `prepared` journal
+record beside a Claim whose status is `committed` and no submission record.
+Recovery may finish step 4 only after it verifies the exact identities and that
+all Block and output Delivery effects required by the `prepared` record are
+complete. Missing or contradictory effects fail closed. This allowed boundary
+does not permit any terminal Claim to coexist with a submission record. A
+`prepared` journal record may otherwise coexist only with its exact active Claim
+and matching submission record. A `committed` journal record MUST match a Claim
+whose status is `committed`, with no submission record. Every other combination,
+including any terminal Claim beside a submission record, is a fail-closed
+consistency error.
+
+For a negative acknowledgement, dead-letter disposition, or release of a
+submitted Claim, Core first requires the result and external-effect evidence
+specified in Sections 7.6 and 9.4 or an explicit audited operator disposition,
+then changes the Claim and removes its submission record in one Core-state
+update. An operator disposition is not evidence that repeating the Run is safe;
+it must identify the exact Claim and warn that release or retry can repeat an
+external effect. A matching active Claim with a submission record and neither
+evidence nor an audited disposition remains an unknown outcome. An active Claim
+without a submission record may be released after its old Module cgroup is
+proven empty only when the state is known to satisfy the target rule; the
+version 16 ambiguity above remains unresolved.
+
+These journal and Core-state rules support recovery and idempotent replay. They
+do not provide exactly-once Module execution or exactly-once external effects;
+the at-least-once and idempotency rules in Section 7.6 still apply.
+
+Submission records are never removed by later collection. A stopped process
+record is collectable once no submission record references it and no active
+Claim belongs to its Module generation. Process-record collection MUST NOT
+require the result-commit journal to retain a matching committed record.
 Records are kept while a Claim preserved as an unknown outcome belongs to their
 Module generation, because the audited operator flow needs the evidence they
 carry.
 
-Changes that must become terminal together, such as releasing a Claim and
-removing its submission record, are applied as one Core-state update and
-written once. If that single write fails, the in-memory state can no longer be
-proven equal to the file, so the store fails closed and requires a reopen
-rather than continuing from an unproven state.
+Every terminal Claim transition that has a matching submission record and the
+removal of that record are applied as one Core-state update and written once.
+If that single write fails, the in-memory state can no longer be proven equal to
+the file, so the store fails closed and requires a reopen rather than continuing
+from an unproven state.
 
 The Core-state writer must hold the instance controller lock, write and
 synchronize the replacement file, atomically rename it, and synchronize its
@@ -1386,7 +1462,8 @@ limited to a Delivery Claim's input Media. These rules also do not
 provide an Extension Media-read capability: the isolated Extension runtime is
 still disabled.
 
-Before positive acknowledgement, the runtime MUST:
+To complete a positive acknowledgement, the runtime MUST perform these steps
+in order:
 
 1. validate the optional proposal, optional Module description replacements, retention
    changes, and all referenced capabilities;
@@ -1395,9 +1472,12 @@ Before positive acknowledgement, the runtime MUST:
 4. append its output-Page deliveries through a transaction or durable outbox;
 5. commit any Module description replacements and retention changes under the same
    Module job result;
-6. commit the input positive acknowledgement;
+6. in one Core-state update, commit the input positive acknowledgement and
+   remove the matching Module submission record;
 7. close run-scoped AccessLeases;
-8. publish completion metrics and events.
+8. change the Module result commit journal record from `prepared` to
+   `committed`; and
+9. publish completion metrics and events.
 
 If this sequence cannot complete, recovery MUST be able to determine whether
 the run was committed. Re-execution MUST not duplicate already committed
@@ -1430,7 +1510,10 @@ The current Module result commit coordinator requires a Delivery Claim and
 input acknowledgement. It therefore defines a completion boundary only for
 reactive Module jobs. The first runtime MUST reject periodic, source, and manual
 activation. Source and manual support requires a separate, specified completion
-boundary rather than a fabricated empty Delivery batch.
+boundary rather than a fabricated empty Delivery batch. The current coordinator
+does not yet remove a Module submission record in the same Core-state update as
+positive acknowledgement, so it does not yet satisfy the Section 7.7 completion
+order and cannot authorize Linux Module activation.
 
 ### 9.4 Cancellation and timeouts
 
@@ -1800,19 +1883,19 @@ Block, claim, or Module correctness.
 
 | Condition | Required behavior |
 | --- | --- |
-| Module throws or rejects | For an unsubmitted Run, classify under policy. For a submitted Run, first require the result journal and every possible external effect to have no-effect, retry-safe, or terminal evidence; otherwise retain the exact Claim as an unknown outcome. Close run-scoped AccessLeases only when that disposition is durable and keep the actor serialized. |
-| Invalid BlockProposal | Commit no output Block or Delivery. A submitted Run may be negatively acknowledged or entered in dead letter only after the same external-effect evidence rule; otherwise preserve its Claim as an unknown outcome. |
+| Module throws or rejects | For a Run proven not submitted under Section 7.7, classify under policy. For a submitted Run, first require the result journal and every possible external effect to have no-effect, retry-safe, or terminal evidence; otherwise retain the exact Claim as an unknown outcome. Any terminal disposition removes the matching submission record in the same Core-state update. Close run-scoped AccessLeases only when that disposition is durable and keep the actor serialized. |
+| Invalid BlockProposal | Commit no output Block or Delivery. A submitted Run may be negatively acknowledged or entered in dead letter only after the same external-effect evidence rule, with Claim transition and submission-record removal in one Core-state update; otherwise preserve its Claim as an unknown outcome. |
 | Missing Block or Media reference | Reject before commit; do not create a partial Block. |
 | Soft timeout | Signal cancellation; mark unhealthy; do not overlap a replacement run. |
-| Hard timeout with isolation | For the Linux Module runner, prove whole-Module-cgroup termination, protocol closure, and terminal capability handlers, then apply the submission/effect evidence rule before fencing, classification, or Claim disposition. If any proof or evidence is missing, keep the Claim active, report recovery required or unknown outcome, and do not start a replacement. |
+| Hard timeout with isolation | For the Linux Module runner, prove whole-Module-cgroup termination, protocol closure, and terminal capability handlers, then apply the submission/effect evidence rule before fencing, classification, or Claim disposition. A permitted terminal disposition and matching submission-record removal use one Core-state update. If any proof or evidence is missing, keep the Claim active, report recovery required or unknown outcome, and do not start a replacement. |
 | Output store unavailable | Leave input unacknowledged and retry through idempotent outbox and commit recovery. |
 | Mailbox full | Apply configured backpressure; never silently discard. |
 | Scheduler policy failure | Fall back to a declared safe fixed policy or fail visibly; do not alter delivery state. |
 | Initialization failure or timeout | Use the synchronously returned executor handle to terminate the process and prevent a late `start()` from reopening resources; issue no Claim and start no replacement without proof that the process stopped. |
 | Termination wait expires | Report that termination is unconfirmed and retain the same `terminate()` Promise for a later `stop()` call; do not invoke process `stop()` as substitute proof. |
-| Shutdown cancellation | If shutdown began before Core started handling a hard timeout, stop new claims, request cancellation, preserve any result acceptance already in progress, and prove the required process termination. Release the exact Claim only when submission/effect evidence permits it; otherwise preserve the Claim as an unknown outcome. Do not blindly classify, negatively acknowledge, enter in dead letter, or increase `failedAttemptCount`. |
-| Claim release persistence is uncertain | Flush pending persistence and inspect the exact Claim. If state `released` cannot be confirmed, report `RUNTIME_RECOVERY_REQUIRED` and retain the Claim identity for a later `stop()` call. |
-| Process crash | On restart, verify the Core service and old Module cgroups, reconcile the commit journal and outbox, then reread one complete Core-state update. Keep an active Claim unchanged until durable process, submission, and external-effect evidence proves its outcome; if evidence is unavailable, block Module activation or retain an unknown outcome instead of acknowledging, negatively acknowledging, retrying, releasing, or entering it in dead letter. |
+| Shutdown cancellation | If shutdown began before Core started handling a hard timeout, stop new claims, request cancellation, preserve any result acceptance already in progress, and prove the required process termination. Release the exact Claim only when submission/effect evidence permits it, removing a matching submission record in the same Core-state update; otherwise preserve the Claim as an unknown outcome. Do not blindly classify, negatively acknowledge, enter in dead letter, or increase `failedAttemptCount`. |
+| Claim release persistence is uncertain | Flush pending persistence and inspect the exact Claim and submission record. If state `released` and absence of the matching submission record cannot both be confirmed, report `RUNTIME_RECOVERY_REQUIRED` and retain the Claim identity for a later `stop()` call. |
+| Process crash | On restart, verify the Core service and old Module cgroups, reconcile the commit journal and outbox, then reread one complete Core-state update. Keep an active Claim unchanged until durable process, submission, and external-effect evidence proves its outcome; version 16 absence alone proves nothing. A terminal Claim with a submission record fails closed. If evidence is unavailable, block Module activation or retain an unknown outcome instead of acknowledging, negatively acknowledging, retrying, releasing, or entering it in dead letter. |
 
 Errors crossing the core boundary MUST use stable machine-readable codes plus a
 human-readable message and structured cause. Raw secrets, credentials, and
@@ -1835,7 +1918,8 @@ The runtime reports `RUNTIME_RECOVERY_REQUIRED` when it cannot safely determine
 a result commit, termination, failure classification, or the outcome of
 releasing a Claim. Startup reports `STARTUP_ACTIVE_CLAIM_UNRESOLVED` when an
 active Claim lacks durable records of process state and result submission that
-are needed to continue safely.
+are needed to continue safely, including an active Claim whose missing version
+16 submission record cannot be interpreted.
 
 ## 15. Stop and recovery
 
@@ -1855,15 +1939,19 @@ Instance stop MUST proceed in this order:
    bounded wait expires, report recovery required and retain the same
    termination operation for a later `stop()` call;
 7. finish or recover result acceptance that began before shutdown; a confirmed
-   commit wins and its Claim remains committed;
+   commit wins, its Claim remains `committed`, and no matching submission record
+   remains;
 8. after termination proof, apply the submission and external-effect evidence
    rule to an active Claim for a Run cancelled because shutdown began before Core
    started handling a hard timeout. Release it only when that rule permits; else
    preserve the exact Claim as an unknown outcome. Do not blindly send it to
-   failure classification, negative acknowledgement, or dead letter;
-9. flush release persistence and inspect the exact Claim when the release
-   result is uncertain; report `RUNTIME_RECOVERY_REQUIRED` and retain its
-   identity if state `released` cannot be confirmed;
+   failure classification, negative acknowledgement, or dead letter. If a
+   matching submission record exists, record `released` and remove that record
+   in the same Core-state update;
+9. flush release persistence and inspect the exact Claim and submission record
+   when the release result is uncertain; report `RUNTIME_RECOVERY_REQUIRED` and
+   retain its identity unless state `released` and absence of the matching
+   submission record are both confirmed;
 10. finish the failure path for any hard timeout whose handling began before
     shutdown, without converting it to shutdown cancellation;
 11. release generation-scoped access leases and strong references;
@@ -1893,13 +1981,15 @@ With `persistent` durability, before Modules enter READY, recovery MUST:
 - revalidate the source and Media-reference boundary of every `prepared`
   Module result commit record before resuming its effects;
 - replay the durable outbox idempotently;
-- recover committed Module results, reread one complete Core-state update, and
-  then interpret each active Claim with its matching process and submission
-  records plus external-effect evidence;
+- recover Module result journal records through the Section 7.7 boundaries,
+  reread one complete Core-state update, and then interpret each active Claim
+  with its matching process and submission records plus external-effect evidence;
 - release only a Claim with no submission record after its old Module cgroup is
-  proven empty; preserve any submitted Claim without safe evidence as an unknown
-  outcome; and fail closed on an orphan, identity mismatch, or a committed result
-  that contradicts an active Claim;
+  proven empty and after establishing that the Core-state document satisfies the
+  target invariant; never infer that fact from ambiguous version 16 absence;
+  preserve any submitted Claim without safe evidence as an unknown outcome; and
+  fail closed on an orphan, identity mismatch, terminal Claim with a submission
+  record, or any committed journal record beside an active Claim;
 - restore consumer checkpoints, Module jobs, and strong references;
 - advance every restarted Module generation;
 - quarantine corrupt records rather than silently skipping them;
@@ -1927,19 +2017,22 @@ are disabled and no records exist. `STARTUP_MODULE_PROCESS_UNPROVEN` means an
 old process record is not `stopped` and no accepted proof showed its Module
 cgroup empty; startup never assumes a process died.
 `STARTUP_MODULE_RECORD_INCONSISTENT` means a submission record cannot be
-linked to its exact active Claim or to a committed result.
-`STARTUP_JOURNAL_CLAIM_INCONSISTENT` means a committed result contradicts a
-remaining active Claim. A Claim preserved as an unknown outcome is reported,
+linked to its exact active Claim, including when its Claim is already terminal.
+`STARTUP_JOURNAL_CLAIM_INCONSISTENT` means a committed journal record exists
+beside an active Claim. A Claim preserved as an unknown outcome is reported,
 never silently acknowledged, negatively acknowledged, retried, released, or
 recorded in dead letter.
 
-The current implementation performs this reconciliation over the durable
-records and reports these codes, but it obtains the Module-cgroup stop proof
-and the external-effect evidence from injected interfaces that no Linux backend
-supplies yet. While none is wired in, any process record that is not already
-`stopped` fails startup as unproven. That is the intended fail-closed behavior:
-recovery never assumes a process died. With no Module records at all, which is
-every deployment while Modules are rejected, behavior is unchanged.
+The current implementation performs part of this reconciliation over durable
+version 16 records and reports these codes, but it does not yet enforce the
+target Claim/submission invariant or the result-journal completion order. It
+also obtains the Module-cgroup stop proof and external-effect evidence from
+injected interfaces that no Linux backend supplies yet. While none is wired in,
+any process record that is not already `stopped` fails startup as unproven. That
+is the intended fail-closed process behavior, but it does not correct the
+version 16 ambiguity described in Section 7.7. With no Module records at all,
+which is every product-created deployment while Modules are rejected, behavior
+is unchanged.
 
 A runtime with `volatile` durability starts from explicitly empty state after
 process loss and reports that no restart recovery was attempted; it MUST NOT emit a
@@ -2033,9 +2126,11 @@ A debug or audit mode SHOULD continuously check:
 12. for the Linux Module runner, no replacement Module generation starts until
     the old Module cgroup is proven empty, its protocol channel is closed, and
     applicable capability handlers are terminal.
-13. every active Claim has exactly the matching process/submission-record
-    relationship defined in Section 7.7; a submitted Claim without a committed
-    result has explicit external-effect evidence or remains an unknown outcome.
+13. every submission record matches exactly one active Claim, no terminal Claim
+    has a submission record, and every active Claim has the process and optional
+    submission-record relationship defined in Section 7.7; a submitted Claim
+    without a committed result has explicit external-effect evidence or remains
+    an unknown outcome.
 
 Violation of an invariant MUST produce a structured high-severity event. A
 production runtime SHOULD fail closed or quarantine the affected Module rather
@@ -2121,17 +2216,26 @@ following cases.
   status `cancelled` with reason `shutdown`, then releases the exact Claim after
   confirmation that the executor stopped without failure classification,
   negative acknowledgement, dead-letter disposition, or an increase to
-  `failedAttemptCount`;
+  `failedAttemptCount`; a matching submission record is removed in the same
+  Core-state update;
 - handling of a hard timeout that began before shutdown remains subject to the
   failure policy after confirmed termination;
 - an uncertain write that releases a Claim is reconciled by flushing
-  persistence and inspecting the exact Claim, and repeated uncertainty reports
-  `RUNTIME_RECOVERY_REQUIRED` while preserving its identity for a later
-  `stop()` call;
+  persistence and inspecting the exact Claim and matching submission record;
+  success requires state `released` and absence of that record, and repeated
+  uncertainty reports `RUNTIME_RECOVERY_REQUIRED` while preserving the Claim
+  identity for a later `stop()` call;
 - startup with an active Claim and no durable records of process state and
   result submission reports `STARTUP_ACTIVE_CLAIM_UNRESOLVED` instead of
   acknowledging, negatively acknowledging, retrying, or recording it in dead
   letter;
+- startup with an active Claim but no submission record in version 16 state
+  does not infer `never-submitted`, release the Claim, or retry the Run without
+  additional durable evidence or audited operator resolution;
+- a terminal Claim beside a submission record fails closed rather than
+  collecting that record, and injected crashes cover each boundary from a
+  `prepared` result journal record through atomic positive acknowledgement and
+  submission-record removal to a `committed` journal record;
 - a submitted Run whose provider/storage/tool accepts an effect and loses its
   response remains an unknown outcome, with zero negative acknowledgements,
   releases, retries, or replacement effects unless a durable query supplies

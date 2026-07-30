@@ -577,13 +577,18 @@ startup, and the separate offline migration keeps the original bytes beside the
 state file before it replaces the document, as `core-runtime.md` Section 7.7
 describes.
 
-Linux Module recovery has a fixed order defined by ADR 0009 and implemented in
-Core startup reconciliation: verify the Core service binding, prove every old
-Module control group empty before marking its process record stopped, check
-that each Module submission record matches an exact active Claim or a committed
-result, recover the result journal, and only then dispose of remaining Claims.
-Recovery never assumes a Module process died because its record is old or its
-process identifier is gone.
+Linux Module recovery MUST follow the fixed order defined by ADR 0009: verify
+the Core service binding, prove every old Module control group empty before
+marking its process record stopped, check that each Module submission record
+matches its exact active Claim and reject a terminal Claim beside a submission
+record, recover the result journal through the allowed `prepared` and
+`committed` states, and only then apply a permitted disposition to remaining
+Claims. A committed journal record belongs beside its exact committed Claim and
+no submission record; it is not an alternative match for a submission record.
+The current startup reconciliation implements only part of this order and
+cannot authorize Module activation until it enforces the complete
+Claim/submission relationship. Recovery never assumes a Module process died
+because its record is old or its process identifier is gone.
 
 ### 13.1 Unknown Module outcomes
 
@@ -597,9 +602,9 @@ operator interface MUST:
 
 1. identify the exact Claim (`moduleJobId`, claim token, `runId`, attempt, and
    `moduleGenerationId`) and show the evidence Core actually considered: the
-   Module process record and its stop proof, the submission record, the result
-   journal entry or its absence, and each external-effect intent with its
-   recorded outcome;
+   Module process record and its stop proof, the submission record or its
+   absence, the result journal entry or its absence, and each external-effect
+   intent with its recorded outcome;
 2. offer only dispositions whose consequence is stated plainly — release for
    another attempt, dead letter, or leave unresolved;
 3. require an explicit confirmation for a forced release that warns it can
@@ -607,6 +612,10 @@ operator interface MUST:
    effect did not happen; and
 4. emit the audit event in section 11 recording the actor, the chosen
    disposition, and the evidence shown, before the disposition is applied.
+
+When an audited disposition makes a submitted Claim terminal, Core MUST remove
+the matching Module submission record in the same Core-state update as the
+Claim transition.
 
 An operator disposition MUST NOT weaken the automatic rules: it never converts
 missing evidence into proof, and Core still refuses to start a replacement

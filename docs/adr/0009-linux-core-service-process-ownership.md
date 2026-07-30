@@ -383,48 +383,95 @@ For this decision, a **Core-state update** is one atomic replacement of the
 complete persisted Core state, including Delivery Claims, Module process
 records, and Module submission records. It is not another repository or result
 store. The term is necessary because absence of a submission record proves
-anything only when it is observed in the same committed state as its Claim.
+anything only when it is observed in the same committed state as its Claim and
+that state is known to have been written under the invariant below.
 Each update synchronizes its file, atomically replaces the old file, and
 synchronizes its parent directory to durable storage (`fsync`). Invalid
-versions, identity mismatches, a record that cannot be linked to an active
-Claim, or a partial or unknown update fail closed.
+versions, identity mismatches, a submission record that cannot be linked to its
+exact active Claim, a terminal Claim beside a submission record, or a partial
+or unknown update fail closed.
 
 Before `module.execute`, Core makes one confirmed Core-state update containing
-the exact active Claim, matching ready process record, process generation,
+the exact active Claim, matching running process record, process generation,
 canonical input digest, and authority to send. It sends only after that update
 returns successfully. If the write result is uncertain, Core rereads the exact
 state; until it can prove the update's result, it does not send. Therefore a
 submission record absent from a valid recovered Core-state update means Core
-never received durable authority to send that Run. A separate record file is
-forbidden because an independently durable Claim and record could create a
+never received durable authority to send that Run only when the writer or an
+explicit migration is known to enforce this decision. A separate record file
+is forbidden because an independently durable Claim and record could create a
 misleading torn recovery view.
+
+Every submission record matches exactly one active Claim in the same Core-state
+update. An active Claim may have zero or one matching submission record. Any
+submission record selects exactly one Module process record by its
+process-generation identifier; stopped historical records for the same Module
+generation are not additional matches. The Claim's consumer identifier must
+equal that process record's `moduleId`, and their Module-generation identifiers
+must match. Core recomputes the canonical input digest from the exact durable
+input bound to the Claim before writing the record and again during recovery. A
+missing input or digest mismatch fails closed.
+
+Any transition of a submitted Claim to `released`, `nacked`, `committed`, or
+`dead-lettered` removes its record in that same Core-state update. A terminal
+Claim and submission record may never coexist and may not be repaired by later
+record collection.
 
 The existing result-commit journal remains the sole authoritative result store.
 It remains a separately synchronized journal because it records Block, output
 Delivery, and acknowledgement effects, but its recovery always precedes
-interpretation of active Claims. Core may remove a submission record only in
-the same Core-state update that records the matching Claim as terminal, and
-only after the result journal is committed or recovery has established a
-no-send or no-effect outcome.
+interpretation of active Claims. A successful Run moves through a synchronized
+`prepared` journal record, recoverable Block and output Delivery effects, one
+Core-state update that positively acknowledges the exact Claim and removes its
+submission record, and finally a `committed` journal record. A crash after the
+`prepared` record is recoverable because that record is durable before any
+result effect and identifies the work recovery must resume. A crash after the
+Core-state update but before the final journal update may therefore leave a
+`prepared` record with a Claim whose status is `committed` and no submission
+record. Recovery may mark the journal record `committed` only after verifying
+the exact result and that all required Block and output Delivery effects are
+complete; missing or contradictory effects fail closed. This ordering does not
+allow any terminal Claim with a submission record. Other terminal Claim
+dispositions require the no-send, no-effect, retry-safe, or terminal evidence
+applicable to that disposition, or an explicit audited operator disposition,
+before the same atomic Claim transition and record removal. The operator
+disposition is not evidence that repeating the Run is safe and must warn that
+release or retry can repeat an external effect.
+
+A `prepared` journal record may otherwise coexist only with its exact active
+Claim and matching submission record. A `committed` journal record must match a
+Claim whose status is `committed`, with no submission record. Every other
+combination fails closed.
+
+This ordering provides recoverable, idempotent completion. It does not provide
+exactly-once Module execution or exactly-once external effects.
 
 The required startup reconciliation order is:
 
 1. Verify the current Core service and prove every old Module cgroup empty.
 2. Open and validate one complete Core-state update. Any active Claim lacking a
-   matching process record, or any record identity mismatch, is unresolved and
-   blocks Module activation.
+   matching process record, any submission record lacking its exact active
+   Claim, a terminal Claim beside a submission record, or any record identity
+   mismatch is unresolved and blocks Module activation.
 3. Reconcile the existing result-commit journal, then reread Core state because
-   journal recovery can complete a Claim.
+   journal recovery can atomically complete a Claim and remove its submission
+   record before marking a `prepared` journal record `committed`.
 4. For each remaining active Claim, inspect the matching process and submission
    records from that one Core-state update.
-5. When no submission record exists, and the old process cgroup was proven
-   empty, release only the exact Claim: Core was never authorized to send it.
-6. When a submission record exists but no committed result exists, preserve the
-   Claim as an unknown outcome unless every possible effect has durable
-   no-effect, retry-safe, or terminal evidence.
-7. When a result commit exists, the existing result-commit journal is
-   authoritative; a remaining contradictory active Claim is a fail-closed
-   consistency error.
+5. When no submission record exists in a state known to satisfy this decision,
+   and the old process cgroup was proven empty, release only the exact Claim:
+   Core was never authorized to send it. Absence in ambiguous version 16 state
+   does not meet this condition.
+6. A valid `prepared` journal record with its active Claim and submission record
+   resumes under step 3; it is not an unknown outcome merely because the journal
+   is not yet `committed`. When no valid recoverable result record exists,
+   preserve a submitted Claim as an unknown outcome unless every possible effect
+   has durable no-effect, retry-safe, or terminal evidence or an explicit
+   audited operator disposition.
+7. A `prepared` journal record with a Claim whose status is `committed` and no
+   submission record may finish the verified transition described above. A
+   `committed` journal record requires that same Claim status and absence of the
+   submission record; every other journal/Claim combination fails closed.
 
 Neither durable record alone authorizes acknowledgement, negative
 acknowledgement, retry, dead letter, Claim release after an unknown outcome, or
@@ -536,10 +583,14 @@ Before this ADR can become `Accepted`, Linux tests must cover at least:
    failing closed;
 8. Core-state write, file synchronization, atomic replacement, and parent
    directory synchronization faults at every boundary; recovery must reject a
-   partial or mismatched Claim/process/submission view;
+   partial or mismatched Claim/process/submission view, including a terminal
+   Claim beside a submission record;
 9. result reconciliation, active Claims, unknown submission outcomes, and
    capability effects before remote acceptance, after remote acceptance, and
    after a lost response never producing duplicate output or an unsafe retry;
+   injected failures must cover `prepared` result, atomic positive
+   acknowledgement and submission-record removal, and `committed` result
+   boundaries;
 10. rejected reuse of a process-generation identifier or Module cgroup path,
    and a package or configuration upgrade that cannot alter or erase the
    pinned revisions of an unresolved process record, submission record, or
@@ -586,11 +637,23 @@ verify the interpreter before Module activation and fail closed when it is
 absent, in the same way it fails closed on missing systemd or cgroup version 2
 delegation.
 
-Existing active Claims and legacy process data cannot be inferred into the new
-record schemas. Migration requires a stopped instance, verification that no old
-Dolly process is running, a state backup, and an atomic Core-state migration that
-creates empty Module process and submission record collections. Core may activate
-no Module until that migration, the Linux service validation, and the required
-failure tests pass. A later configuration revision must pin the package and
-configuration revision of every unresolved Run; package upgrades and record
-collection cannot alter or erase that evidence.
+The existing migration from Core-state version 15 to version 16 requires a
+stopped instance and verification that no old Dolly process is running. It
+creates a state backup, preserves existing Claims, and atomically adds empty
+Module process and submission record collections. Any active Claim remains
+unresolved because Core cannot determine whether its Run executed; the
+migration's refusal to infer an outcome is its safety property.
+
+The current version 16 implementation does not enforce the Claim and submission
+record invariant above at every mutation boundary: it permits independent
+record removal and later collection beside a terminal Claim. A future migration
+MUST NOT interpret an active Claim with no version 16 submission record as proof
+that the Run was never submitted. It must keep the Claim unresolved until
+durable evidence or an audited operator action establishes an explicit
+disposition.
+Before Module activation, Dolly MUST select a new Core-state schema version and
+an explicit migration that enforces the invariant. This decision does not define
+that version's fields. The Linux service validation and required failure tests
+must also pass. A later configuration revision must pin the package and
+configuration revision of every unresolved Run; package upgrades and
+process-record collection cannot alter or erase that evidence.
