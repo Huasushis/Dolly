@@ -1,11 +1,14 @@
 # 当前状态与待办（接手先读这一份）
 
-写于 2026-07-26 深夜，最近一次更新为 2026-07-31。当前已完整验证的产品实现提交为
-`f78538b`；本文件与规范修订会提交在它之后，实际 HEAD 必须用 Git 读取。P0-3 的 Linux
+写于 2026-07-26 深夜，最近一次更新为 2026-07-31。当前实现链最新提交为 `0cf5cb4`，
+远端 `main` 已同步；最近一次完整 Windows 测试仍以 `f78538b` 为基线，之后四项修复分别有
+精确测试和完整 TypeScript 检查，不能把两种验证范围混写。实际 HEAD 必须用 Git 读取。P0-3 的 Linux
 源码复验仍绑定到 `e9d5975`，不能改标签冒充当前 HEAD；其后的证据提交与实现提交也不能倒改
 历史实验的来源标签。`119eac5` 和 `8321b1c` 裁定 Claim 与 Module submission record 的规则，
 `2d5532a` 收窄发布包依赖，`1421e1b` 把 Console Claim 处置绑定到当前证据，`9624e19` 把
-结果提交绑定到同一个 FileCore，`f78538b` 在发送与恢复前核验 Module 执行证据。上一轮所有并行
+结果提交绑定到同一个 FileCore，`f78538b` 在发送与恢复前核验 Module 执行证据；`f635041`、
+`76ae60b`、`3e0403c`、`0cf5cb4` 分别修复配置回调重入、Linux executor 期限校验、Media 删除超时
+恢复和 Aether 推理控制测试。上一轮所有并行
 会话同时到达上限而停止，任务表随之丢失，所以这份文件是权威的接续点；下文把更早结果明确标为
 历史结果，不用追加日志的方式保留过期结论。
 
@@ -229,8 +232,10 @@ Linux 文件共 26/26 通过。证据、单文件补丁、逐文件 SHA-256 与�
    的异步后续代码不能再写该 store。四类反例分别覆盖：带 `then` getter 的返回值、首次变更后的
    异步后续代码、首次变更前等待的异步后续代码，以及未改变状态就同步抛错时 store 仍可用。两个
    直接类型反例也留在测试中；受影响的精确测试为 30/30，完整 `typecheck` exit 0；
-7. Linux executor 没有像 `coreExitCleanupTimeoutMs` 一样验证 `terminationTimeoutMs` 和
-   `channelCloseTimeoutMs`；`NaN` 等无效值会破坏“有界等待”的含义；
+7. ✓ **两项 executor 期限已修（`76ae60b`）**：`terminationTimeoutMs` 和
+   `channelCloseTimeoutMs` 现在都在任何 launcher、control group、记录存储或协议会话副作用前
+   验证为有限、正的安全整数。两项参数的 `NaN`、`Infinity`、零和负数共 8 个反例均通过，
+   精确文件 34/34；其他 control-group 等待与轮询参数仍须另行审查；
 8. `runtime-bootstrap.ts` 仍拒绝配置了 Module 的运行时，也没有生产调用者把 service binding、
    launcher、control group、协议会话、持久记录、Claim 与 submission record 装配成一条路径。
 9. ✓ **根入口暴露已修（`4e9dae3`）**：`DollyCliContext.waitForShutdown` 现在收到独立冻结对象，
@@ -252,11 +257,9 @@ Linux 文件共 26/26 通过。证据、单文件补丁、逐文件 SHA-256 与�
     分开持久化或给出等价证明，不能把另一个 Claim 的记录当成本次授权。启动恢复接口当前接收的
     `no-effect` / `retry-safe` 证据本身也不回显精确 Claim 身份；接入真实 evidence source 前必须像
     停止证明的 `recordIdentityDigest` 一样绑定身份，防止错误适配器复用另一 Run 的安全结论。
-13. `FileCoreStateStore.updateModuleProcessRecordState()` 读取并校验旧记录后才调用可注入的 `now()`，
-    期间没有重入保护。错误或恶意 clock 可在外层 `running → stopping` 的 `now()` 中先完成嵌套
-    `running → stopped`，随后外层用陈旧快照把状态倒退为 `stopping` 并持久化。该反例目前来自
-    源码审查，精确测试未覆盖；必须先审计 FileCore 的全部 clock、标识符生成器与回调，再在真正
-    写入边界加统一重入保护和可证伪测试，不能只修这一处调用顺序。
+13. ✓ **已修（`f635041`）**：`FileCoreStateStore` 对配置的 clock、Block 标识符生成器和 Delivery
+    标识符生成器使用同一非重入守卫；回调中再次访问同一个 Core 会被拒绝。三个反例分别覆盖 clock、
+    Block 和 Delivery 路径，证明没有 revision、磁盘或组件状态变化，且拒绝后原 store 仍可继续使用。
 
 处理这些问题时不要只补单元分支：每项先在真正的跨层强制点构造会失败的反例，尤其要证明“来自另一
 次启动的会话/记录”不能被接受，以及没有停止证明时任何路径都不能写 `stopped`。
@@ -384,14 +387,21 @@ M14 重复案例。P0-1 的两个完整 manifest 也各自报 4,391 次计划执
 | 根 CLI 回调不再暴露 Core 写接口 | `src/entry.ts`、CLI runtime test | 冻结的 `state/status/stop` 对象；根声明无 Core store/commit coordinator；5/5 + typecheck |
 | FileCore 公开能力与失败边界 | `9624e19` 的 `FileCoreStateStore`、结果提交产品构造与故障测试 | 公开组件是冻结的空原型允许列表；持久化失败或内存/磁盘摘要不一致后要求重开；结果提交从同一个 FileCore 取得全部状态操作 |
 | Claim 与 submission record 强规则 | ADR 0009、`core-runtime.md`、`security-operations.md`、`9624e19`、`f78538b` | 终态转换与记录删除同一次 Core-state update；terminal+record 失败关闭；发送前复核 Claim、submission 与输入摘要；version 16 歧义仍不得自动重试 |
+| 配置回调不可重入 | `f635041` 的 `FileCoreStateStore` 与三个反例 | clock、Block 标识符和 Delivery 标识符回调不能重入同一个 Core；拒绝前后没有持久状态变化 |
+| Linux executor 期限参数 | `76ae60b` 的 executor 与精确测试 | 两个期限都在副作用前验证；8 个无效值反例、精确文件 34/34 |
+| Media 删除超时恢复 | `3e0403c` 的 `MediaStore` 与恢复测试 | 超时归为可重试网络故障；适配器忽略取消信号时不并发重复删除；精确文件 7/7 |
+| Aether 推理控制测试 | `0cf5cb4` 的模型请求测试与 LLM 规范 | 开启、关闭与缺省分别按准确对象形式编码或省略；13/13，且不发送 `enable_thinking` |
 | 当前完整 Windows 验证 | 默认 Vitest 配置，最多 4 个 worker；标准 TypeScript 检查 | 124 个测试文件通过、4 个跳过；1570 例通过、47 例跳过；TypeScript 退出码 0；无残留 Node 进程 |
 | 恢复完整 TypeScript 范围并修复 91 条诊断 | `tsconfig.json`、`package.json`、33 个测试文件 | 标准 `typecheck` exit 0；按受影响文件精确运行的用例全绿，5 个未启用的付费 live 用例明确 skipped |
 
-当前实现核实点为 `f78538b`，远端 `main` 已同步到该实现提交；本文件与规范提交会位于其后。
+当前实现链最新核实点为 `0cf5cb4`，远端 `main` 已同步；最近一次完整 Windows 测试基线仍为
+`f78538b`，其后四项修复的统一精确验证为 142 例通过、1 例按平台跳过，完整 TypeScript 检查通过。
 P0-3 Linux 复验使用的源码与 runner 仍是 `e9d5975`；后续提交不能冒充该实验来源。当前实现链中，
 `119eac5` / `8321b1c`
 记录规则，`2d5532a` 收窄发布包，`1421e1b` 修复 Console 处置证据，`9624e19` 修复 FileCore 与
-结果提交边界，`f78538b` 修复发送和恢复证据。目录为 **v5、570 例、1 个 exclusive**。catalog
+结果提交边界，`f78538b` 修复发送和恢复证据，`f635041` 修复配置回调重入，`76ae60b` 修复
+Linux executor 期限校验，`3e0403c` 修复 Media 删除超时恢复，`0cf5cb4` 修正 Aether 推理控制测试。
+目录为 **v5、570 例、1 个 exclusive**。catalog
 v5 修改了 live-Core 终止判据，所以该组必须重跑；当前 233 例 proposed-arm 选择集已重跑，但
 完整 570 例和目录声明的重复次数仍未执行。更早 catalog v3 的 P0-3 工件只作为历史运行保留。
 
@@ -430,8 +440,9 @@ v5 修改了 live-Core 终止判据，所以该组必须重跑；当前 233 例 
   必须作为另一个明确可选用途。
 - 启用前还必须：由受信适配器验证 bucket 私有和对象版本控制；明确选择并记录
   `adapterId` / `storageRecordId`，不能取插入顺序中的第一个；提供列出和处置未知访问的产品操作；
-  文档给出包含删除和版本清理的最小权限；修正删除超时被错误分类为不可重试的问题。没有这些条件时，
-  “private”只是调用方标签，未版本化 URL 也不能保证读取到登记时的不可变字节。
+  文档给出包含删除和版本清理的最小权限。删除超时的分类与防止并发重复删除已在 `3e0403c` 修复，
+  但没有关闭这些更广的设计与产品接入门槛；在门槛满足前，“private”只是调用方标签，未版本化 URL
+  也不能保证读取到登记时的不可变字节。
 
 ### 模型配置与 embedding
 
@@ -443,7 +454,8 @@ v5 修改了 live-Core 终止判据，所以该组必须重跑；当前 233 例 
   仓库研究又记录了该端点可用另一种 `thinking.type` 对象控制。模型描述必须声明准确的控制编码、
   缺省行为和允许值，而不能把端点写成 `alwaysOnReasoning()`。对这个端点，只有非空
   `reasoning_content` 能证明该次响应实际产生推理；该观察规则不能外推到返回摘要或结构化块的其他
-  Provider。
+  Provider。`0cf5cb4` 已让 Aether 测试按开启、关闭和缺省三种请求核对这些事实，但这仍是请求编码
+  测试，不是真实端点响应实验。
 - 当前私有端点绑定让多个 operation 共用一个 `exactUrl`。同一部署的 Chat 与 embedding 路径可能
   被错误发往同一个 URL；绑定必须按 `(endpointId, operation)` 保存准确 URL，或明确限制一个绑定
   只能含一个 operation。
@@ -460,8 +472,8 @@ v5 修改了 live-Core 终止判据，所以该组必须重跑；当前 233 例 
 - systemd 检查只看 `PassEnvironment` / `EnvironmentFiles`，没有证明实际 Core 进程环境已删除
   凭据；服务绑定接口也不接收 `instanceId`，不能证明合格 unit 就是当前 Dolly instance 的预定
   unit。这两项都必须在真实 systemd 中用反向哨兵测试。
-- `terminationTimeoutMs`、`channelCloseTimeoutMs` 以及部分 control-group 等待参数没有统一验证为
-  有限、正的安全整数；`NaN`、零或负数会破坏有界终止声明。
+- `terminationTimeoutMs` 和 `channelCloseTimeoutMs` 已在 `76ae60b` 验证为有限、正的安全整数；
+  其他 control-group 等待与轮询参数尚未完成同范围审查，仍不能把两项修复扩大成完整有界终止证明。
 - 当前 headless 文档是目标契约。完整 XFCE 桌面暴露面板、应用查找器、文件管理器、终端和文件
   选择器，模型可借此绕过“不得获得 shell、任意路径或任意应用”的应用层限制。第一个安全目标应只让
   模型控制浏览器窗口并隐藏这些入口；若必须控制完整桌面，应把整个会话放入一次性容器或虚拟机，
