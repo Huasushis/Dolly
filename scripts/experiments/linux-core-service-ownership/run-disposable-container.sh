@@ -212,11 +212,11 @@ fi
 # point is handed to that account before the run starts.
 docker exec "${CONTAINER_NAME}" chown -R dolly:dolly /dolly-artifacts
 
-# The working tree is mounted read-only, so the run needs a writable view whose
-# `node_modules` resolves inside the container. Every source entry is
-# symbolically linked rather than copied, which keeps the source itself
-# unmodifiable while letting the dependency link point at the mounted
-# dependencies.
+# The working tree is mounted read-only, so the run needs a writable view.
+# Every source entry is symbolically linked rather than copied. `node_modules`
+# itself is a writable directory because Vite creates `.vite-temp` there; each
+# installed dependency inside it remains a link to the read-only dependency
+# mount, so a test cannot modify installed package contents.
 WORK_TREE=/dolly-run
 docker exec "${CONTAINER_NAME}" bash -c "
   set -e
@@ -227,7 +227,12 @@ docker exec "${CONTAINER_NAME}" bash -c "
     ln -sfn \"\${entry}\" ${WORK_TREE}/\"\${name}\"
   done
   if [ -d /dolly-dependencies ]; then
-    ln -sfn /dolly-dependencies ${WORK_TREE}/node_modules
+    mkdir -p ${WORK_TREE}/node_modules/.vite-temp
+    while IFS= read -r -d '' dependency; do
+      name=\"\$(basename \"\${dependency}\")\"
+      [ \"\${name}\" = .vite-temp ] && continue
+      ln -sfn \"\${dependency}\" ${WORK_TREE}/node_modules/\"\${name}\"
+    done < <(find /dolly-dependencies -mindepth 1 -maxdepth 1 -print0)
   fi
   chown -R dolly:dolly ${WORK_TREE}
 "
