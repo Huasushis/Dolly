@@ -11,6 +11,8 @@
 # files fail during collection if the delegated environment is missing instead
 # of allowing an all-skipped run to exit successfully.
 #
+# With no file arguments, the runner executes every real Linux Module test.
+# File arguments replace that list, which keeps focused reproduction exact.
 # Usage, from a checkout with dependencies installed:
 #
 #   ./scripts/run-linux-module-launcher-integration.sh
@@ -40,6 +42,16 @@ fi
 # package entry point directly with the Node.js executable instead.
 NODE_PATH_RESOLVED="$(command -v node)"
 UNIT_NAME="dolly-test-launcher-integration-$$"
+if [ "$#" -eq 0 ]; then
+  TEST_FILES=(
+    tests/conformance/security/linux-module-launcher-integration.test.ts
+    tests/conformance/security/linux-module-cgroup-integration.test.ts
+    tests/conformance/security/linux-module-attached-process-integration.test.ts
+    tests/conformance/security/linux-module-executor-systemd-integration.test.ts
+  )
+else
+  TEST_FILES=("$@")
+fi
 
 exec systemd-run \
   --user \
@@ -58,4 +70,4 @@ exec systemd-run \
   --config vitest.config.ts \
   --pool=forks \
   --maxWorkers=1 \
-  "${@:-tests/conformance/security/linux-module-launcher-integration.test.ts}"
+  "${TEST_FILES[@]}"
