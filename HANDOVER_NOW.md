@@ -1,9 +1,11 @@
 # 当前状态与待办（接手先读这一份）
 
-写于 2026-07-26 深夜，最近一次更新为 2026-07-31。P0-3 当前源码复验绑定到提交
-`e9d5975`；其后的 `d5acea1`、`6ea62f8` 和 `8ef9f07` 只提交了证据与文档，没有改产品源码。
-上一轮所有并行会话同时到达上限而停止，任务表随之丢失，所以这份文件是权威的接续点；下文把
-更早结果明确标为历史结果，不用追加日志的方式保留过期结论。
+写于 2026-07-26 深夜，最近一次更新为 2026-07-31，当前 HEAD 为 `1fd90e1`。P0-3 的 Linux
+源码复验仍绑定到 `e9d5975`，不能改标签冒充当前 HEAD；其后的 `d5acea1`、`6ea62f8`、
+`8ef9f07` 和 `e9200c5` 只提交了证据或文档。`7462046` 随后修复异步 Core-state update，
+`1fd90e1` 修复持久更新完成后锁释放确认失败时继续使用不确定内存状态的问题。上一轮所有并行
+会话同时到达上限而停止，任务表随之丢失，所以这份文件是权威的接续点；下文把更早结果明确标为
+历史结果，不用追加日志的方式保留过期结论。
 
 `TASK_HANDOVER.md` 有 2269 行、55 个小节，**按时间顺序堆叠，后面的小节会推翻前面的**
 （例如 0.29 说"装配做不出来"，已被 0.35 和 0.52b 推翻两次）。**不要从头读它**。
@@ -13,8 +15,9 @@
 
 ## 一句话状态
 
-ADR 0009（Linux Core 服务进程归属）的终止范围和启动失败后的五项已知所有权缺陷已经改进并有
-聚焦证据；catalog v5 的同一组 233 个 proposed-arm 案例也已在 `e9d5975` 上逐案例复跑。
+ADR 0009（Linux Core 服务进程归属）的终止范围和启动失败后的五项已知所有权缺陷已有对应实现与
+聚焦证据，但默认 Core 退出前的同步持久化仍无期限，不能声称强制退出有端到端时间上界；catalog
+v5 的同一组 233 个 proposed-arm 案例已在 `e9d5975` 上逐案例复跑。
 这些证据仍不等于完整运行时：普通启动入口继续拒绝配置了 Module 的实例，而且产品代码还没有把
 同一个 launcher、Module control group、协议会话、Core 服务绑定和持久记录交叉绑定后再交给
 `ReactiveModuleRuntime`。当前工作应先处理下列 P0 风险，而不是把 ADR 0009 改成 Accepted。
@@ -132,9 +135,10 @@ proposed-arm 组，不是 catalog v5 的全部 570 例；fixed-interruption 仍�
 `SC-13-07-cleanup-timeout` 的历史聚焦测试以确定性文件系统注入保持 `populated 1`，不能描述成真实
 内核长期不清空。历史变异也没有对 `instanceId`、`moduleId` 做逐字段证明。
 
-### P0-4　启动失败后的控制组所有权与持久状态：✓ 五项已知缺陷已修复
+### P0-4　启动失败后的控制组所有权与持久状态：五项有对应修改，退出期限仍开放
 
-原来列出的五项缺陷已由 `46180c8`、`2f501c3`、`46a034d` 和 `2333ce1` 修改：
+原来列出的五项缺陷已有 `46180c8`、`2f501c3`、`46a034d` 和 `2333ce1` 的对应修改。这里的
+“对应修改”不等于五项风险全部关闭，尤其不能把默认退出函数存在写成强制退出已有总期限：
 
 1. launcher 授权失败现在返回观察到的 process identifier、成员资格、命令是否可能送达以及
    `ModuleCgroup`；生命周期不再丢掉“已经观察到成员”这一事实，也不再把只看到 launcher 退出当作
@@ -143,12 +147,13 @@ proposed-arm 组，不是 catalog v5 的全部 570 例；fixed-interruption 仍�
    同一个 control group，并走整组停止证明；
 3. `startLauncher()` 抛错被视为“进程可能已经创建但所有权未知”，而不是猜成未创建；可以证明为空的
    已准备 control group 会清理，无法证明所有权时要求 Core 退出；
-4. `coreMustExit` 已有产品强制点：默认在有界的尽力清理之后执行 `process.exit(1)`，不再只是返回值
-   或错误文字；
+4. `coreMustExit` 已有默认产品退出函数：执行到该函数时调用 `process.exit(1)`，不再只是返回值或
+   错误文字。真实 systemd 正反例证明了该函数会被走到并且不可删；但在它之前执行的同步
+   `stopping` 写入与文件同步没有时间上界，所以“Core 必定在期限内退出”仍是 P0-5 第 5 项；
 5. `FileCoreStateStore` 进入 `CORE_STATE_REOPEN_REQUIRED` 后拒绝所有公开读写，包括先前保留的方法
    引用和嵌套状态路径；回滚后的内存对象不能再冒充磁盘事实。
 
-真实 Linux 的产品强制点已经正反向验证。提交
+真实 Linux 已正反向验证默认退出函数这一路径。提交
 `edbfd268478f65cb430aa5ece23c9dcd6634c872` 的正向 1/1 测试把产品 executor 自身作为一次性
 systemd 服务主进程，未注入 `exitCoreProcess`：服务得到 `Result=exit-code`、
 `ExecMainStatus=1`，没有写 fallback 文件，持久记录留在 `stopping`，Core、launcher、Module
@@ -175,36 +180,58 @@ Linux 文件共 26/26 通过。证据、单文件补丁、逐文件 SHA-256 与�
 
 ### P0-5　当前最高风险：先写跨层反例，再决定修复顺序
 
-以下是当前代码审查已找到、尚未由上面的证据关闭的风险：
+以下编号保持稳定，便于后续交接引用；除明确标为“已修”的项目外，都是当前代码审查已确认且尚未由
+上面证据关闭的风险：
 
 1. `openProtocolSession()` 不接收刚启动的 launcher 或 `ModuleCgroup`，所以类型与运行时都没有强制
    返回的协议会话属于同一次启动、同一个进程和同一个 control group；
 2. Core 服务绑定、持久 process record、当前 boot/service invocation 和 control-group identity
    分别有检查，但启动边界没有把它们作为一个不可拆分的前置条件交叉核验；
-3. `stopped` 仍可通过通用记录状态更新接口直接写入；类型没有要求调用者同时提交已关闭协议通道、
-   已结束 capability handler、`populated 0` 和目录删除的证明；
-4. submission record 的写接口没有在同一次持久更新中强制匹配现存 active Claim 的 job、token、
-   run、attempt 与 Module generation；当前一致性主要依赖调用者和启动恢复阶段检查；
+3. `FileCoreStateStore.updateModuleProcessRecordState()` 是公开的状态写入方法，并接受
+   `stopped`；类型没有要求调用者同时提交已关闭协议通道、已结束 capability handler、
+   `populated 0` 和目录删除的证明。
+   `stopModuleProcess()` 在自己的路径上稍后重新证明这些条件，不能阻止别的调用者先持久化并暴露
+   一个没有证明的 `stopped`；
+4. submission record 与 Claim 的规范强度互相冲突。`core-runtime.md` 一处要求每条 submission
+   record 精确匹配 active Claim，并把找不到 Claim 的孤立记录定为 fail-closed；另一处又把“没有
+   active Claim 的 submission record”解释成已终止、可收集的残留。当前写接口只强制匹配
+   `running` process record 和 Module generation，不强制匹配 Claim 的 job、token、run、attempt；
+   启动恢复实现了较弱的后一种解释。这项规范冲突尚未裁定，不能把任一方向写成已经决定的方案；
 5. 所有权未知时的 control-group 清理有超时，但它之前的同步 `stopping` 持久化调用没有时间上界；
    若该调用不返回，默认 `process.exit(1)` 强制点也到不了；
-6. `FileCoreStateStore.runAtomicUpdate()` 的回调类型允许返回 Promise。若传入异步回调，外层会在
-   Promise 完成前结束“原子更新”并持久化，之后的变更与异常不再属于同一次更新；
+6. ✓ **已修（`7462046`）**：`FileCoreStateStore.runAtomicUpdate()` 现在只接受静态返回
+   `void` 或 `never` 的回调；直接传入 `async` 回调或返回非 `undefined` 值的回调都会被 TypeScript
+   拒绝。运行时也拒绝通过类型断言绕过后返回的任何非 `undefined` 值，不读取返回对象的 `then`
+   getter，不持久化局部更新，并使原 store 进入 `CORE_STATE_REOPEN_REQUIRED`，所以已返回 Promise
+   的异步后续代码不能再写该 store。四类反例分别覆盖：带 `then` getter 的返回值、首次变更后的
+   异步后续代码、首次变更前等待的异步后续代码，以及未改变状态就同步抛错时 store 仍可用。两个
+   直接类型反例也留在测试中；受影响的精确测试为 30/30，完整 `typecheck` exit 0；
 7. Linux executor 没有像 `coreExitCleanupTimeoutMs` 一样验证 `terminationTimeoutMs` 和
    `channelCloseTimeoutMs`；`NaN` 等无效值会破坏“有界等待”的含义；
 8. `runtime-bootstrap.ts` 仍拒绝配置了 Module 的运行时，也没有生产调用者把 service binding、
    launcher、control group、协议会话、持久记录、Claim 与 submission record 装配成一条路径。
+9. `DollyRuntimeSession.core` 公开暴露具体的 `FileCoreStateStore`，不是只读或按职责收窄的接口；
+   任何拿到 runtime session 的调用者都能直接使用上述 process/submission record 写入方法。当前
+   没有证据证明这些写入只能从持有对应运行时证明的路径到达；
+10. store 只按 `processGenerationId` 防重复；它允许同一个 instance、Module 和 Module generation
+    同时存在多条 `starting`、`running` 或 `stopping` 记录。后续恢复检查不能撤销这种重叠已经被
+    持久化并可能被其他代码观察到的事实。
 
 处理这些问题时不要只补单元分支：每项先在真正的跨层强制点构造会失败的反例，尤其要证明“来自另一
 次启动的会话/记录”不能被接受，以及没有停止证明时任何路径都不能写 `stopped`。
 
-另外有四项已审查但优先级稍低的后续问题，不能因未列入上面的 P0 顺序而遗忘：
+另外有四项已审查的后续问题；第 1 项已经修复，其余三项仍开放：
 
-1. 跨进程锁可能在持久更新已经提交后才因释放失败而抛错；当前调用层可能回滚内存视图，却没有把
-   `FileCoreStateStore` 标为必须重新打开；
+1. ✓ **已修（`1fd90e1`）**：跨进程锁在持久更新提交后才报告释放确认失败时，
+   `FileCoreStateStore` 现在进入 `CORE_STATE_REOPEN_REQUIRED`。判断边界是锁内回调是否已经
+   返回：回调自身抛错仍按原错误处理，不误把未完成更新标成释放失败；回调已返回后，
+   外层锁调用再抛错才表示提交可能已完成而释放确认失败。反例保留真实的锁获取、回调与释放，
+   只在三者结束后注入错误，并证明磁盘是新 revision、记录 API 回滚出的内存是旧 revision、原 store
+   及失败前取得的读取方法都拒绝继续使用。相关精确测试为 53 pass、1 个平台限定的 skip；
 2. 真正进入 `CORE_STATE_REOPEN_REQUIRED` 的 store 在 Linux executor 内没有替换或让 Core
    退出重开的产品策略，普通终止重试会永久持有失效对象；
 3. state file 的父目录若通过符号链接或 Windows junction 形成两个路径别名，同一文件可能得到
-   两个不同的锁标识；应复用现有配置存储的规范父目录做法；
+   两个不同的锁标识；当前没有跨别名互斥证据，修复方式尚未决定；
 4. 单次读取 `cgroup.procs` 不能阻止进程在验证后迁移到 sibling control group。ADR 0009 已承认
    这需要执行后端强制，当前产品路径仍没有该保证。
 
@@ -309,14 +336,17 @@ M14 重复案例。P0-1 的两个完整 manifest 也各自报 4,391 次计划执
 | P0-1 手写 launcher control 换成产品适配器 | `core-standin.mts` | 14 例边界 A/B + 233 例完整 A/B，逐案例三字段 diff 均为空 |
 | P0-2 真实 Linux control group 与文件描述符验证 | Linux integration test、fixture、control-group implementation | 未修改产品实现时 2/2 pass；仅终止直接进程的证伪在 `populated 1` 处失败；清理后零残留 |
 | P0-3 完整终止证明 | executor、`ModuleCgroup`、停止生命周期、实验调用点 | `3e20e77` 的本机与变异结果保留为历史；`e9d5975` 上 catalog v5 的同一 233 例为 225 pass / 8 not-applicable，221 行不变，12 行审定为只改 reason |
-| P0-4 启动失败所有权与 Core 退出 | 生命周期、Linux executor、`FileCoreStateStore` | 五项已知缺陷已修；真实 systemd 正向 1/1、默认退出反向变异失败、四文件 26/26，范围限制见 P0-4 |
+| P0-4 启动失败所有权与 Core 退出 | 生命周期、Linux executor、`FileCoreStateStore` | 五项有对应修改；真实 systemd 正向 1/1、默认退出反向变异失败、四文件 26/26；前置同步持久化无期限，范围限制见 P0-4 / P0-5 |
 | Linux runner 的执行与证据边界 | 一次性容器入口、精确 Linux 测试入口、实验入口 | 两种模式均记录来源、状态、命令和环境；拒绝调用者覆盖 `--output-dir` / `--disposable`；catalog v5 为 570 例 |
+| 拒绝异步 Core-state update | `FileCoreStateStore.runAtomicUpdate()`、启动恢复接口 | 类型与运行时都拒绝异步回调和非 `undefined` 返回值；四类反例通过，精确测试 30/30，完整 `typecheck` exit 0 |
+| 锁释放确认失败后关闭旧 store | `FileCoreStateStore.#withMutationLock()` | 按回调是否已返回区分回调错误与释放确认错误；精确测试 53 pass、1 个平台限定 skip |
 | 恢复完整 TypeScript 范围并修复 91 条诊断 | `tsconfig.json`、`package.json`、33 个测试文件 | 标准 `typecheck` exit 0；按受影响文件精确运行的用例全绿，5 个未启用的付费 live 用例明确 skipped |
 
-当前核实点：P0-3 复验使用的源码与 runner 提交为 `e9d5975`，后续文档与证据提交截至
-`8ef9f07`；目录为 **v5、570 例、1 个 exclusive**。catalog v5 修改了 live-Core 终止判据，
-所以该组必须重跑；当前 233 例 proposed-arm 选择集已重跑，但完整 570 例和目录声明的重复次数
-仍未执行。更早 catalog v3 的 P0-3 工件只作为历史运行保留。
+当前核实点：HEAD 为 `1fd90e1`。P0-3 Linux 复验使用的源码与 runner 仍是 `e9d5975`；其后的
+文档/证据提交为 `d5acea1`、`6ea62f8`、`8ef9f07`、`e9200c5`，产品代码修复为 `7462046` 和
+`1fd90e1`。目录为 **v5、570 例、1 个 exclusive**。catalog v5 修改了 live-Core 终止判据，所以
+该组必须重跑；当前 233 例 proposed-arm 选择集已重跑，但完整 570 例和目录声明的重复次数仍未
+执行。更早 catalog v3 的 P0-3 工件只作为历史运行保留。
 
 ---
 
