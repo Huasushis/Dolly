@@ -44,7 +44,7 @@ import {
 import {
   startModuleProcess,
   type ModuleLauncherControl,
-  type ModuleProcessRecordWriter,
+  type ModuleProcessRecordStore,
 } from "../../../src/core/linux-module-process-lifecycle.js";
 import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
 
@@ -277,9 +277,12 @@ function cgroupFileSystem(): ModuleCgroupFileSystem {
   };
 }
 
-function recordWriter(): ModuleProcessRecordWriter {
+function recordStore(): ModuleProcessRecordStore {
   const records = new Map<string, ModuleProcessRecord>();
   return {
+    getModuleProcessRecord(processGenerationId) {
+      return records.get(processGenerationId);
+    },
     appendModuleProcessRecord(record) {
       records.set(record.processGenerationId, record);
       return record;
@@ -442,7 +445,7 @@ describe("Module launcher control adapter", () => {
 
     const derived = deriveModuleCgroupPath(DELEGATED_ROOT, IDENTITY);
     const started = await startModuleProcess({
-      records: recordWriter(),
+      records: recordStore(),
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,

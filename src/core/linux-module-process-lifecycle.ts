@@ -39,8 +39,9 @@ import {
 } from "./linux-module-cgroup.js";
 import type { ModuleProcessRecord } from "./module-process-records.js";
 
-/** The durable record operations one Module process lifecycle needs. */
-export interface ModuleProcessRecordWriter {
+/** The durable Module process record reads and writes one lifecycle needs. */
+export interface ModuleProcessRecordStore {
+  getModuleProcessRecord(processGenerationId: string): ModuleProcessRecord | undefined;
   appendModuleProcessRecord(record: ModuleProcessRecord): ModuleProcessRecord;
   updateModuleProcessRecordState(
     processGenerationId: string,
@@ -122,7 +123,7 @@ export type ModuleProcessStartResult =
   | { readonly started: false; readonly failure: ModuleProcessStartFailure };
 
 export interface StartModuleProcessOptions {
-  readonly records: ModuleProcessRecordWriter;
+  readonly records: ModuleProcessRecordStore;
   /** The record to persist before any child exists. Its state must be `starting`. */
   readonly processRecord: ModuleProcessRecord;
   readonly delegatedRootCgroupPath: string;
@@ -281,50 +282,187 @@ export type ModuleProcessStopResult =
     };
 
 /**
- * Terminates one Module process by terminating its whole control group and
- * proving the group empty.
+ * Terminates one Module process after the capability session, protocol channel,
+ * and whole control group have all reached their required terminal state.
  *
  * The record moves to `stopping` before termination begins, so a Core that
  * dies during the stop leaves the intent visible. It moves to `stopped` only
- * after the group is proven empty and its directory is removed; an unproven
- * stop or failed removal leaves the record in `stopping` for a later Core
- * invocation to resolve, and never claims success.
+ * after every supplied condition is confirmed and the proven-empty group
+ * directory is removed; an unproven stop or failed removal leaves the record
+ * in `stopping` for a later Core invocation to resolve, and never claims
+ * success. An existing `stopped` record is not trusted as a substitute for
+ * these live observations. If the stopping intent cannot be persisted, the
+ * physical stop still runs so the process tree is not left executing, but the
+ * operation preserves the directory and refuses to report success.
  */
 export async function stopModuleProcess(options: {
-  readonly records: ModuleProcessRecordWriter;
+  readonly records: ModuleProcessRecordStore;
   readonly processGenerationId: string;
   readonly cgroup: ModuleCgroup;
   readonly timeoutMs?: number;
+  /**
+   * Must synchronously reject new capability calls when invoked, and returns a
+   * Promise that resolves after every already-started handler settles.
+   */
+  readonly closeCapabilitySession: () => Promise<void>;
+  /** Resolves true only after the Extension protocol channel is observed closed. */
+  readonly waitForChannelClosed: (timeoutMs: number) => Promise<boolean>;
+  readonly channelCloseTimeoutMs?: number;
 }): Promise<ModuleProcessStopResult> {
   const { records, processGenerationId, cgroup } = options;
-  records.updateModuleProcessRecordState(processGenerationId, "stopping");
-  const termination = await cgroup.terminate(
-    options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs },
-  );
-  if (!termination.terminated) {
+  if (cgroup.identity.processGenerationId !== processGenerationId) {
     return {
       stopped: false,
-      code: termination.code,
-      detail: termination.detail,
+      code: "MODULE_PROCESS_RECORD_STATE_INVALID",
+      detail: `the requested process generation ${processGenerationId} does not own control group ${cgroup.path}`,
     };
   }
-  const removal = await cgroup.remove(
-    options.timeoutMs === undefined
-      ? {}
-      : { terminationWaitTimeoutMs: options.timeoutMs },
-  );
-  if (!removal.removed) {
+
+  let recordFailure: { readonly code: string; readonly detail: string } | undefined;
+  try {
+    const current = records.getModuleProcessRecord(processGenerationId);
+    if (current === undefined) {
+      recordFailure = {
+        code: "MODULE_PROCESS_RECORD_NOT_FOUND",
+        detail: `the Module process record ${processGenerationId} does not exist`,
+      };
+    } else if (!recordMatchesCgroup(current, processGenerationId, cgroup)) {
+      recordFailure = {
+        code: "MODULE_PROCESS_RECORD_STATE_INVALID",
+        detail: `the Module process record ${processGenerationId} does not match control group ${cgroup.path}`,
+      };
+    } else if (current.state !== "stopped" && current.state !== "stopping") {
+      records.updateModuleProcessRecordState(processGenerationId, "stopping");
+    }
+  } catch (error) {
+    recordFailure = {
+      code: "MODULE_PROCESS_RECORD_FAILED",
+      detail: `the Module process record ${processGenerationId} could not be marked stopping: ${describe(error)}`,
+    };
+  }
+
+  // Call capability close before whole-group termination: the call itself must
+  // synchronously reject new capability invocations. Then start every remaining
+  // condition before awaiting one of them. Neither a rejected close nor a
+  // record failure may leave the complete process tree running.
+  let capabilityClose: Promise<void>;
+  try {
+    capabilityClose = options.closeCapabilitySession();
+  } catch (error) {
+    capabilityClose = Promise.reject(error);
+  }
+  let channelClose: Promise<boolean>;
+  try {
+    channelClose = options.waitForChannelClosed(options.channelCloseTimeoutMs ?? 5_000);
+  } catch (error) {
+    channelClose = Promise.reject(error);
+  }
+  const cgroupTermination = cgroup.removed
+    ? Promise.resolve(undefined)
+    : cgroup.terminate(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs });
+  const [terminationOutcome, capabilityOutcome, channelOutcome] = await Promise.allSettled([
+    cgroupTermination,
+    capabilityClose,
+    channelClose,
+  ]);
+
+  if (terminationOutcome.status === "rejected") {
     return {
       stopped: false,
-      code: removal.code,
-      detail: removal.detail,
+      code: "MODULE_CGROUP_TERMINATION_FAILED",
+      detail: `the Module control-group termination operation failed: ${describe(terminationOutcome.reason)}`,
     };
   }
-  const record = records.updateModuleProcessRecordState(
-    processGenerationId,
-    "stopped",
+  const termination = terminationOutcome.value;
+  if (termination !== undefined && !termination.terminated) {
+    return { stopped: false, code: termination.code, detail: termination.detail };
+  }
+  if (capabilityOutcome.status === "rejected") {
+    return {
+      stopped: false,
+      code: "MODULE_CAPABILITY_SESSION_CLOSE_FAILED",
+      detail: `the capability session did not close: ${describe(capabilityOutcome.reason)}`,
+    };
+  }
+  if (channelOutcome.status === "rejected" || !channelOutcome.value) {
+    return {
+      stopped: false,
+      code: "MODULE_PROTOCOL_CHANNEL_CLOSE_UNCONFIRMED",
+      detail:
+        channelOutcome.status === "rejected"
+          ? `the Extension protocol channel close check failed: ${describe(channelOutcome.reason)}`
+          : "the Extension protocol channel was not observed closed",
+    };
+  }
+  if (recordFailure !== undefined) {
+    return { stopped: false, ...recordFailure };
+  }
+
+  if (!cgroup.removed) {
+    const removal = await cgroup.remove(
+      options.timeoutMs === undefined
+        ? {}
+        : { terminationWaitTimeoutMs: options.timeoutMs },
+    );
+    if (!removal.removed) {
+      return { stopped: false, code: removal.code, detail: removal.detail };
+    }
+  }
+  let finalRecord: ModuleProcessRecord | undefined;
+  try {
+    finalRecord = records.getModuleProcessRecord(processGenerationId);
+  } catch (error) {
+    return {
+      stopped: false,
+      code: "MODULE_PROCESS_RECORD_FAILED",
+      detail: `the Module process record ${processGenerationId} could not be read after termination: ${describe(error)}`,
+    };
+  }
+  if (finalRecord === undefined) {
+    return {
+      stopped: false,
+      code: "MODULE_PROCESS_RECORD_NOT_FOUND",
+      detail: `the Module process record ${processGenerationId} disappeared before it could be closed`,
+    };
+  }
+  if (!recordMatchesCgroup(finalRecord, processGenerationId, cgroup)) {
+    return {
+      stopped: false,
+      code: "MODULE_PROCESS_RECORD_STATE_INVALID",
+      detail: `the Module process record ${processGenerationId} no longer matches control group ${cgroup.path}`,
+    };
+  }
+  if (finalRecord.state === "stopped") return { stopped: true, record: finalRecord };
+  if (finalRecord.state !== "stopping") {
+    return {
+      stopped: false,
+      code: "MODULE_PROCESS_RECORD_STATE_INVALID",
+      detail: `the Module process record ${processGenerationId} changed to ${finalRecord.state} while it was stopping`,
+    };
+  }
+  try {
+    const record = records.updateModuleProcessRecordState(processGenerationId, "stopped");
+    return { stopped: true, record };
+  } catch (error) {
+    return {
+      stopped: false,
+      code: "MODULE_PROCESS_RECORD_FAILED",
+      detail: `the Module process record ${processGenerationId} could not be marked stopped: ${describe(error)}`,
+    };
+  }
+}
+
+function recordMatchesCgroup(
+  record: ModuleProcessRecord,
+  processGenerationId: string,
+  cgroup: ModuleCgroup,
+): boolean {
+  return (
+    record.processGenerationId === processGenerationId &&
+    record.instanceId === cgroup.identity.instanceId &&
+    record.moduleId === cgroup.identity.moduleId &&
+    record.moduleCgroupPath === cgroup.path
   );
-  return { stopped: true, record };
 }
 
 /**
@@ -337,7 +475,7 @@ export async function stopModuleProcess(options: {
  * service control group. Core never signals a process identifier instead.
  */
 async function abandonPreMembership(
-  records: ModuleProcessRecordWriter,
+  records: ModuleProcessRecordStore,
   processGenerationId: string,
   launcher: ModuleLauncherControl,
   code: ModuleProcessStartFailureCode,
@@ -370,7 +508,7 @@ async function abandonPreMembership(
  * safe, conservative view for a later Core invocation.
  */
 function markStopped(
-  records: ModuleProcessRecordWriter,
+  records: ModuleProcessRecordStore,
   processGenerationId: string,
   failureCode: string,
 ): void {

@@ -741,11 +741,24 @@ await runDriver(async () => {
       cgroup.recordVerifiedMembership([1]);
 
       const states = [];
+      let currentRecord = {
+        processGenerationId: identity.processGenerationId,
+        instanceId: identity.instanceId,
+        moduleId: identity.moduleId,
+        moduleCgroupPath: cgroup.path,
+        state: "running",
+      };
       const records = {
-        appendModuleProcessRecord: (record) => record,
+        getModuleProcessRecord: (id) =>
+          id === currentRecord.processGenerationId ? currentRecord : undefined,
+        appendModuleProcessRecord: (record) => {
+          currentRecord = record;
+          return record;
+        },
         updateModuleProcessRecordState: (id, state, failureCode) => {
           states.push(state);
-          return { processGenerationId: id, state, failureCode };
+          currentRecord = { ...currentRecord, processGenerationId: id, state, failureCode };
+          return currentRecord;
         },
       };
       const stop = await stopModuleProcess({
@@ -753,6 +766,10 @@ await runDriver(async () => {
         processGenerationId: identity.processGenerationId,
         cgroup,
         timeoutMs: 300,
+        // This fixture opens neither an Extension capability session nor an
+        // Extension protocol channel; only the real cgroup proof is applicable.
+        closeCapabilitySession: () => Promise.resolve(),
+        waitForChannelClosed: () => Promise.resolve(true),
       });
       // Real cleanup, with the real filesystem, whatever the reading said.
       const realCgroup = { path: cgroup.path, readPopulated: async () => {

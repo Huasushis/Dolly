@@ -116,7 +116,7 @@ import {
   startModuleProcess,
   stopModuleProcess,
   type ModuleLauncherControl,
-  type ModuleProcessRecordWriter,
+  type ModuleProcessRecordStore,
 } from "../../../../src/core/linux-module-process-lifecycle.js";
 import type { ModuleProcessRecord } from "../../../../src/core/module-process-records.js";
 import { buildReactiveModuleInput } from "../../../../src/core/reactive-module-input.js";
@@ -178,6 +178,42 @@ function now(): string {
 
 function digestOf(value: unknown): string {
   return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+}
+
+/** Tracks real protocol end/error events and provides a finite close wait. */
+function createProtocolChannelCloseWaiter(): {
+  readonly closed: boolean;
+  markClosed(): void;
+  wait(timeoutMs: number): Promise<boolean>;
+} {
+  let closed = false;
+  const waiters = new Set<() => void>();
+  return {
+    get closed() {
+      return closed;
+    },
+    markClosed() {
+      if (closed) return;
+      closed = true;
+      for (const resolve of waiters) resolve();
+      waiters.clear();
+    },
+    wait(timeoutMs) {
+      if (closed) return Promise.resolve(true);
+      return new Promise((resolve) => {
+        const onClosed = () => {
+          clearTimeout(timer);
+          waiters.delete(onClosed);
+          resolve(true);
+        };
+        const timer = setTimeout(() => {
+          waiters.delete(onClosed);
+          resolve(false);
+        }, timeoutMs);
+        waiters.add(onClosed);
+      });
+    },
+  };
 }
 
 function fsyncDirectory(path: string): void {
@@ -445,13 +481,13 @@ async function runWorkload(
   );
 
   // --- Boundaries 2 to 4: the ordered Module process start.
-  const records: ModuleProcessRecordWriter = instrument(store, {
+  const records: ModuleProcessRecordStore = instrument(store, {
     appendModuleProcessRecord: {
       before: () => at("M02", "before"),
       after: () => at("M02", "after", processGenerationId),
       once: true,
     },
-  }) as unknown as ModuleProcessRecordWriter;
+  }) as unknown as ModuleProcessRecordStore;
 
   const cgroupFileSystem: ModuleCgroupFileSystem = instrument(nodeModuleCgroupFileSystem, {
     createDirectory: { before: () => at("M03", "before"), once: true },
@@ -541,16 +577,16 @@ async function runWorkload(
 
   // --- The Extension protocol channel over the launcher's own descriptors.
   const child = launcherHandle!.child;
-  let channelClosed = false;
+  const channelClose = createProtocolChannelCloseWaiter();
   let onFrame: (message: JsonValue) => void = () => undefined;
   const channel = new FramedJsonChannel(child.stdout!, child.stdin!, {
     maxFrameBytes: 4 * 1024 * 1024,
     onMessage: (message) => onFrame(message),
     onError: () => {
-      channelClosed = true;
+      channelClose.markClosed();
     },
     onEnd: () => {
-      channelClosed = true;
+      channelClose.markClosed();
     },
   });
 
@@ -791,12 +827,14 @@ async function runWorkload(
 
   // --- Boundary 14: Module process record closure and collection.
   at("M14", "before");
-  await session.close();
   const stopped = await stopModuleProcess({
     records: store,
     processGenerationId,
     cgroup,
     timeoutMs: 20_000,
+    closeCapabilitySession: () => session.close(),
+    waitForChannelClosed: (timeoutMs) => channelClose.wait(timeoutMs),
+    channelCloseTimeoutMs: 20_000,
   });
   if (!stopped.stopped) {
     return {
@@ -826,7 +864,7 @@ async function runWorkload(
     runId: claim.runId,
     moduleJobId: claim.moduleJobId,
     commitState: commitRecord.state,
-    channelClosed,
+    channelClosed: channelClose.closed,
     inboundFrameTypes: inbound.map((frame) => String(frame["type"])),
   };
 }
@@ -1287,11 +1325,12 @@ async function runLiveTermination(
     // --- The Extension protocol channel, as in the interruption matrix.
     const child = launcherHandle!.child;
     let onFrame: (message: JsonValue) => void = () => undefined;
+    const channelClose = createProtocolChannelCloseWaiter();
     const channel = new FramedJsonChannel(child.stdout!, child.stdin!, {
       maxFrameBytes: 4 * 1024 * 1024,
       onMessage: (message) => onFrame(message),
-      onError: () => undefined,
-      onEnd: () => undefined,
+      onError: () => channelClose.markClosed(),
+      onEnd: () => channelClose.markClosed(),
     });
     const waiters = new Map<string, (frame: Record<string, unknown>) => void>();
     onFrame = (message) => {
@@ -1360,6 +1399,11 @@ async function runLiveTermination(
       processGenerationId,
       cgroup,
       timeoutMs: 20_000,
+      // This live-termination case does not create a capability authority or
+      // issue handles, so there is no applicable capability session to close.
+      closeCapabilitySession: () => Promise.resolve(),
+      waitForChannelClosed: (timeoutMs) => channelClose.wait(timeoutMs),
+      channelCloseTimeoutMs: 20_000,
     });
     const membersAfter = cgroupMembers(derived.filesystemPath);
     const populatedAfter = cgroupPopulated(derived.filesystemPath);

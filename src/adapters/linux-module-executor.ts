@@ -12,9 +12,10 @@
  *   in `linux-module-process-lifecycle.ts`, which persists the process record
  *   before any child exists and verifies control-group membership from kernel
  *   files before the Extension may execute; and
- * - terminates by terminating the whole Module control group and proving it
- *   empty, then waits for the protocol channel to close, rather than by
- *   signalling a child.
+ * - terminates by synchronously closing the capability session, then starts
+ *   whole-group termination and protocol-channel observation; confirmation
+ *   waits for terminal handlers, an empty group, and a closed channel rather
+ *   than treating a signal to one child as proof.
  *
  * `terminate()` resolves only when every part of that proof holds. Anything
  * else raises `ModuleExecutorTerminationUnconfirmedError`, which the reactive
@@ -38,9 +39,10 @@ import type {
 import {
   startModuleProcess,
   stopModuleProcess,
+  type ModuleProcessStartFailure,
+  type ModuleProcessStartResult,
   type StartModuleProcessOptions,
 } from "../core/linux-module-process-lifecycle.js";
-import type { ModuleCgroup } from "../core/linux-module-cgroup.js";
 
 /**
  * The Extension protocol operations this executor needs, named here so the
@@ -70,9 +72,10 @@ export interface LinuxModuleProtocolSession {
   }): Promise<ReactiveModuleResult>;
   cancel(runId: string, reason: string): Promise<void>;
   /**
-   * Closes the capability session, revoking every handle and delivering an
-   * abort signal, then resolves once every started handler is terminal.
-   * ADR 0009 requires this before a Claim may be classified.
+   * The call synchronously rejects new capability invocations, revokes every
+   * handle, and delivers an abort signal. Its Promise resolves once every
+   * already-started handler is terminal. ADR 0009 requires both parts before a
+   * Claim may be classified.
    */
   closeCapabilitySession(): Promise<void>;
   /** Resolves once the protocol channel is observed closed. */
@@ -86,8 +89,13 @@ export interface LinuxModuleExecutorOptions {
   readonly lifecycle: Omit<StartModuleProcessOptions, "startLauncher"> & {
     readonly startLauncher: StartModuleProcessOptions["startLauncher"];
   };
-  /** Attaches the Extension protocol to the started launcher's streams. */
-  readonly openProtocolSession: () => Promise<LinuxModuleProtocolSession>;
+  /**
+   * Attaches the Extension protocol to the started launcher's streams and
+   * synchronously returns the session handle. Authentication and Module
+   * initialization belong to `initialize()`. If attachment fails, this call
+   * must throw before it creates capability state that would need closing.
+   */
+  readonly openProtocolSession: () => LinuxModuleProtocolSession;
   /** Bound on the whole-group termination proof. */
   readonly terminationTimeoutMs: number;
   /** Bound on observing the protocol channel closed after termination. */
@@ -112,87 +120,179 @@ function assertContext(
 export function createLinuxModuleExecutor(
   options: LinuxModuleExecutorOptions,
 ): ModuleExecutor<ReactiveModuleInput, ReactiveModuleResult> {
-  let cgroup: ModuleCgroup | undefined;
   let session: LinuxModuleProtocolSession | undefined;
-  let terminated = false;
+  let processStart: Promise<ModuleProcessStartResult> | undefined;
+  let startOperation: Promise<void> | undefined;
+  let terminationRequested = false;
+  let terminationConfirmed = false;
+  let terminationOperation: Promise<void> | undefined;
+  let sessionReported = false;
+  let protocolSessionOpenFailed = false;
+  let protocolSessionOpenError: unknown;
+  let reportSession!: (session: LinuxModuleProtocolSession | undefined) => void;
+  const sessionAvailable = new Promise<LinuxModuleProtocolSession | undefined>((resolve) => {
+    reportSession = resolve;
+  });
 
-  const proveStopped = async (): Promise<void> => {
-    if (terminated) return;
-    terminated = true;
+  const setAvailableSession = (available: LinuxModuleProtocolSession | undefined): void => {
+    if (sessionReported) return;
+    sessionReported = true;
+    reportSession(available);
+  };
 
-    // Capability handles are revoked and their handlers drained before the
-    // group is terminated, so no handler can still be running when Core
-    // decides what the Claim's outcome was.
-    if (session) {
-      try {
-        await session.closeCapabilitySession();
-      } catch (error) {
-        throw new ModuleExecutorTerminationUnconfirmedError(
-          `the capability session did not close: ${describe(error)}`,
-        );
-      }
-    }
-
-    if (!cgroup) {
-      // No control group was ever prepared, so no process of this generation
-      // can exist. There is nothing to prove empty.
-      return;
-    }
-
-    const stopped = await stopModuleProcess({
-      records: options.lifecycle.records,
-      processGenerationId: options.lifecycle.identity.processGenerationId,
-      cgroup,
-      timeoutMs: options.terminationTimeoutMs,
-    });
-    if (!stopped.stopped) {
-      throw new ModuleExecutorTerminationUnconfirmedError(
-        `the Module control group was not proven empty: ${stopped.code}: ${stopped.detail}`,
+  const start = (): Promise<void> => {
+    if (startOperation !== undefined) return startOperation;
+    if (terminationRequested) {
+      return Promise.reject(
+        new Error("The Linux Module executor cannot start after termination was requested"),
       );
     }
 
-    if (session) {
-      const closed = await session.waitForChannelClosed(options.channelCloseTimeoutMs);
-      if (!closed) {
-        // The group is empty, so nothing can still execute, but ADR 0009 also
-        // requires the protocol channel to be observed closed before Core may
-        // report termination. Reporting success here would let a late frame
-        // race a replacement generation.
-        throw new ModuleExecutorTerminationUnconfirmedError(
-          "the Extension protocol channel was not observed closed after the Module control group emptied",
+    const configuredStopRequested = options.lifecycle.stopRequested;
+    processStart = startModuleProcess({
+      ...options.lifecycle,
+      stopRequested: () =>
+        terminationRequested || configuredStopRequested?.() === true,
+    });
+    const currentProcessStart = processStart;
+    startOperation = (async (): Promise<void> => {
+      let started: ModuleProcessStartResult;
+      try {
+        started = await currentProcessStart;
+      } catch (error) {
+        setAvailableSession(undefined);
+        throw error;
+      }
+      if (!started.started) {
+        setAvailableSession(undefined);
+        throw startFailureError(started.failure);
+      }
+      let opened: LinuxModuleProtocolSession;
+      try {
+        opened = options.openProtocolSession();
+      } catch (error) {
+        protocolSessionOpenFailed = true;
+        protocolSessionOpenError = error;
+        setAvailableSession(undefined);
+        throw error;
+      }
+      session = opened;
+      setAvailableSession(opened);
+      if (terminationRequested) {
+        throw new Error(
+          "The Linux Module executor was asked to terminate before protocol initialization",
         );
       }
+      await opened.initialize();
+      if (terminationRequested) {
+        throw new Error(
+          "The Linux Module executor was asked to terminate during protocol initialization",
+        );
+      }
+    })();
+    return startOperation;
+  };
+
+  const performTermination = async (): Promise<void> => {
+    const currentProcessStart = processStart;
+    if (currentProcessStart === undefined) return;
+
+    let started: ModuleProcessStartResult;
+    try {
+      started = await currentProcessStart;
+    } catch (error) {
+      throw new ModuleExecutorTerminationUnconfirmedError(
+        `the Module process start failed without returning its process ownership state: ${describe(error)}; Core must exit so its service cleanup removes any unreported process`,
+      );
     }
+    if (!started.started) {
+      await startOperation?.catch(() => undefined);
+      if (started.failure.coreMustExit) {
+        throw new ModuleExecutorTerminationUnconfirmedError(
+          `${started.failure.code}: ${started.failure.detail}; Core must exit so its service cleanup removes any unaccounted launcher`,
+        );
+      }
+      return;
+    }
+    // Once the launcher has been authorized, opening the protocol session may
+    // create capability state. Wait until that attempt finishes so a late
+    // session cannot appear after whole-group termination has already begun.
+    const availableSession = await sessionAvailable;
+    let stopped;
+    try {
+      stopped = await stopModuleProcess({
+        records: options.lifecycle.records,
+        processGenerationId: options.lifecycle.identity.processGenerationId,
+        cgroup: started.cgroup,
+        timeoutMs: options.terminationTimeoutMs,
+        closeCapabilitySession: () => {
+          if (!availableSession) {
+            const detail = protocolSessionOpenFailed
+              ? `: ${describe(protocolSessionOpenError)}`
+              : " after the Module process was started";
+            return Promise.reject(
+              new Error(`the Extension protocol session was not available${detail}`),
+            );
+          }
+          // The close call synchronously rejects new capability invocations.
+          // Invoke it before stopModuleProcess can write cgroup.kill; only its
+          // returned Promise waits for already-started handlers to finish.
+          return availableSession.closeCapabilitySession();
+        },
+        waitForChannelClosed: (timeoutMs) => {
+          return availableSession
+            ? availableSession.waitForChannelClosed(timeoutMs)
+            : Promise.resolve(false);
+        },
+        channelCloseTimeoutMs: options.channelCloseTimeoutMs,
+      });
+    } catch (error) {
+      throw new ModuleExecutorTerminationUnconfirmedError(
+        `the Module stop state could not be persisted: ${describe(error)}`,
+      );
+    }
+    if (!stopped.stopped) {
+      throw new ModuleExecutorTerminationUnconfirmedError(
+        `${stopped.code}: ${stopped.detail}`,
+      );
+    }
+    // Physical termination may finish while initialize() is still unwinding.
+    // Do not confirm termination until that start operation can no longer
+    // create or reopen resources.
+    await startOperation?.catch(() => undefined);
+  };
+
+  const proveStopped = (): Promise<void> => {
+    if (terminationConfirmed) return Promise.resolve();
+    if (terminationOperation !== undefined) return terminationOperation;
+    terminationRequested = true;
+    const operation = performTermination();
+    terminationOperation = operation;
+    void operation.then(
+      () => {
+        terminationConfirmed = true;
+        if (terminationOperation === operation) terminationOperation = undefined;
+      },
+      () => {
+        if (terminationOperation === operation) terminationOperation = undefined;
+      },
+    );
+    return operation;
   };
 
   return Object.freeze({
     isolation: "process" as const,
 
-    start: async (): Promise<void> => {
-      const started = await startModuleProcess(options.lifecycle);
-      if (!started.started) {
-        // A start that leaves an unaccounted launcher is not a plain failure:
-        // ADR 0009 requires Core to exit so its service cleanup removes the
-        // whole service control group. The distinction is carried in the
-        // message so the caller can act on it.
-        terminated = true;
-        throw new Error(
-          started.failure.coreMustExit
-            ? `${started.failure.code}: ${started.failure.detail}; Core must exit so its service cleanup removes the service control group`
-            : `${started.failure.code}: ${started.failure.detail}`,
-        );
-      }
-      cgroup = started.cgroup;
-      const opened = await options.openProtocolSession();
-      session = opened;
-      await opened.initialize();
-    },
+    start,
 
     execute: async (
       input: ReactiveModuleInput,
       context: ModuleRunContext,
     ): Promise<ReactiveModuleResult> => {
       assertContext(context, options.moduleGenerationId);
+      if (terminationRequested) {
+        throw new Error("The Linux Module executor cannot accept work during termination");
+      }
       if (!session) {
         throw new Error("The Linux Module executor has no protocol session");
       }
@@ -218,4 +318,12 @@ export function createLinuxModuleExecutor(
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function startFailureError(failure: ModuleProcessStartFailure): Error {
+  return new Error(
+    failure.coreMustExit
+      ? `${failure.code}: ${failure.detail}; Core must exit so its service cleanup removes the service control group`
+      : `${failure.code}: ${failure.detail}`,
+  );
 }

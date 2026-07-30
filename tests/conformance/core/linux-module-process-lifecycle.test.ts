@@ -14,10 +14,13 @@ import {
   startModuleProcess,
   stopModuleProcess,
   type ModuleLauncherControl,
-  type ModuleProcessRecordWriter,
+  type ModuleProcessRecordStore,
 } from "../../../src/core/linux-module-process-lifecycle.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
-import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
+import {
+  canTransitionModuleProcessRecordState,
+  type ModuleProcessRecord,
+} from "../../../src/core/module-process-records.js";
 
 const DELEGATED_ROOT = "/system.slice/dolly-core.service";
 const IDENTITY = {
@@ -36,6 +39,13 @@ const EXECUTION = {
   argumentVector: ["/opt/dolly/node", "/opt/dolly/extensions/worker/index.mjs"],
   environment: { DOLLY_EXTENSION: "worker" },
 };
+
+// These lifecycle tests have no Extension protocol layer. Supplying both
+// operations explicitly keeps the product API fail-closed for real callers.
+const NO_PROTOCOL_SESSION = {
+  closeCapabilitySession: async (): Promise<void> => undefined,
+  waitForChannelClosed: async (): Promise<boolean> => true,
+} as const;
 
 function processRecord(): ModuleProcessRecord {
   return {
@@ -61,17 +71,23 @@ function processRecord(): ModuleProcessRecord {
 }
 
 /** Records every write so a test can assert the exact order of steps. */
-function recordWriter(): ModuleProcessRecordWriter & { readonly log: string[] } {
+function recordStore(): ModuleProcessRecordStore & { readonly log: string[] } {
   const log: string[] = [];
   let current = processRecord();
   return {
     log,
+    getModuleProcessRecord(processGenerationId) {
+      return current.processGenerationId === processGenerationId ? current : undefined;
+    },
     appendModuleProcessRecord(record) {
       log.push("append");
       current = record;
       return record;
     },
     updateModuleProcessRecordState(_id, state, failureCode) {
+      if (!canTransitionModuleProcessRecordState(current.state, state)) {
+        throw new Error(`invalid process-record transition ${current.state} -> ${state}`);
+      }
       log.push(failureCode === undefined ? `state:${state}` : `state:${state}:${failureCode}`);
       current = { ...current, state };
       return current;
@@ -154,7 +170,7 @@ function launcher(
 
 describe("Linux Module process lifecycle order", () => {
   it("persists the process record before it creates the control group or a launcher", async () => {
-    const records = recordWriter();
+    const records = recordStore();
     const fileSystem = fakeCgroupFileSystem();
     const control = launcher();
     const startLauncher = vi.fn(async () => control);
@@ -182,7 +198,7 @@ describe("Linux Module process lifecycle order", () => {
   });
 
   it("never starts a launcher when the control group cannot be prepared", async () => {
-    const records = recordWriter();
+    const records = recordStore();
     const startLauncher = vi.fn(async () => launcher());
 
     const result = await startModuleProcess({
@@ -206,7 +222,7 @@ describe("Linux Module process lifecycle order", () => {
   });
 
   it("asks the launcher to exit and does not authorize execution when stop was requested", async () => {
-    const records = recordWriter();
+    const records = recordStore();
     const control = launcher();
 
     const result = await startModuleProcess({
@@ -231,7 +247,7 @@ describe("Linux Module process lifecycle order", () => {
   });
 
   it("requires Core to exit when a pre-membership launcher exit cannot be observed", async () => {
-    const records = recordWriter();
+    const records = recordStore();
     const control = launcher({
       async authorizeExecution() {
         throw new Error("membership could not be verified");
@@ -264,7 +280,7 @@ describe("Linux Module process lifecycle order", () => {
   });
 
   it("marks a process stopped only after its whole group is proven empty", async () => {
-    const records = recordWriter();
+    const records = recordStore();
     let populated = "populated 1\nfrozen 0\n";
     const fileSystem = fakeCgroupFileSystem({ populated: () => populated });
     const started = await startModuleProcess({
@@ -284,6 +300,7 @@ describe("Linux Module process lifecycle order", () => {
     // While the group still reports members, the stop is refused and the
     // record stays in `stopping` for a later Core invocation.
     const refused = await stopModuleProcess({
+      ...NO_PROTOCOL_SESSION,
       records,
       processGenerationId: IDENTITY.processGenerationId,
       cgroup: started.cgroup,
@@ -295,6 +312,7 @@ describe("Linux Module process lifecycle order", () => {
 
     populated = "populated 0\nfrozen 0\n";
     const proven = await stopModuleProcess({
+      ...NO_PROTOCOL_SESSION,
       records,
       processGenerationId: IDENTITY.processGenerationId,
       cgroup: started.cgroup,
@@ -306,7 +324,7 @@ describe("Linux Module process lifecycle order", () => {
   });
 
   it("keeps the process record stopping when an empty group cannot be removed", async () => {
-    const records = recordWriter();
+    const records = recordStore();
     const fileSystem = fakeCgroupFileSystem({
       populated: () => "populated 0\nfrozen 0\n",
       failRemove: true,
@@ -326,6 +344,7 @@ describe("Linux Module process lifecycle order", () => {
     if (!started.started) throw new Error("expected a start");
 
     const stopped = await stopModuleProcess({
+      ...NO_PROTOCOL_SESSION,
       records,
       processGenerationId: IDENTITY.processGenerationId,
       cgroup: started.cgroup,
@@ -338,5 +357,156 @@ describe("Linux Module process lifecycle order", () => {
     expect(records.log.at(-1)).toBe("state:stopping");
     expect(records.log).not.toContain("state:stopped");
     expect(fileSystem.directories.has(started.cgroup.path)).toBe(true);
+  });
+
+  it("does not use an existing stopped record instead of current protocol evidence", async () => {
+    const records = recordStore();
+    const fileSystem = fakeCgroupFileSystem();
+    const started = await startModuleProcess({
+      records,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher: async () => launcher(),
+      execution: EXECUTION,
+      cgroupFileSystem: fileSystem,
+    });
+    expect(started.started).toBe(true);
+    if (!started.started) throw new Error("expected a start");
+    await expect(
+      stopModuleProcess({
+        ...NO_PROTOCOL_SESSION,
+        records,
+        processGenerationId: IDENTITY.processGenerationId,
+        cgroup: started.cgroup,
+      }),
+    ).resolves.toMatchObject({ stopped: true });
+
+    await expect(
+      stopModuleProcess({
+        ...NO_PROTOCOL_SESSION,
+        records,
+        processGenerationId: IDENTITY.processGenerationId,
+        cgroup: started.cgroup,
+        waitForChannelClosed: async () => false,
+      }),
+    ).resolves.toMatchObject({
+      stopped: false,
+      code: "MODULE_PROTOCOL_CHANNEL_CLOSE_UNCONFIRMED",
+    });
+  });
+
+  it("lets simultaneous stop calls share the final durable state", async () => {
+    const records = recordStore();
+    const fileSystem = fakeCgroupFileSystem();
+    const started = await startModuleProcess({
+      records,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher: async () => launcher(),
+      execution: EXECUTION,
+      cgroupFileSystem: fileSystem,
+    });
+    expect(started.started).toBe(true);
+    if (!started.started) throw new Error("expected a start");
+
+    const first = stopModuleProcess({
+      ...NO_PROTOCOL_SESSION,
+      records,
+      processGenerationId: IDENTITY.processGenerationId,
+      cgroup: started.cgroup,
+    });
+    const second = stopModuleProcess({
+      ...NO_PROTOCOL_SESSION,
+      records,
+      processGenerationId: IDENTITY.processGenerationId,
+      cgroup: started.cgroup,
+    });
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      expect.objectContaining({ stopped: true }),
+      expect.objectContaining({ stopped: true }),
+    ]);
+    expect(records.log.filter((entry) => entry === "state:stopped")).toHaveLength(1);
+  });
+
+  it("refuses a control group owned by another process generation", async () => {
+    const records = recordStore();
+    const fileSystem = fakeCgroupFileSystem();
+    const started = await startModuleProcess({
+      records,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher: async () => launcher(),
+      execution: EXECUTION,
+      cgroupFileSystem: fileSystem,
+    });
+    expect(started.started).toBe(true);
+    if (!started.started) throw new Error("expected a start");
+
+    const stopped = await stopModuleProcess({
+      ...NO_PROTOCOL_SESSION,
+      records,
+      processGenerationId: "process-generation-2",
+      cgroup: started.cgroup,
+    });
+
+    expect(stopped).toMatchObject({
+      stopped: false,
+      code: "MODULE_PROCESS_RECORD_STATE_INVALID",
+    });
+    expect(fileSystem.files.has(`${started.cgroup.path}/cgroup.kill`)).toBe(false);
+    expect(records.log).not.toContain("state:stopping");
+    expect(records.log).not.toContain("state:stopped");
+  });
+
+  it("does not close a process record whose control-group path does not match", async () => {
+    const records = recordStore();
+    const fileSystem = fakeCgroupFileSystem();
+    const started = await startModuleProcess({
+      records,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher: async () => launcher(),
+      execution: EXECUTION,
+      cgroupFileSystem: fileSystem,
+    });
+    expect(started.started).toBe(true);
+    if (!started.started) throw new Error("expected a start");
+    const recordsWithWrongPath: ModuleProcessRecordStore = {
+      ...records,
+      getModuleProcessRecord(processGenerationId) {
+        const record = records.getModuleProcessRecord(processGenerationId);
+        return record === undefined
+          ? undefined
+          : { ...record, moduleCgroupPath: `${record.moduleCgroupPath}-other` };
+      },
+    };
+
+    const stopped = await stopModuleProcess({
+      ...NO_PROTOCOL_SESSION,
+      records: recordsWithWrongPath,
+      processGenerationId: IDENTITY.processGenerationId,
+      cgroup: started.cgroup,
+    });
+
+    expect(stopped).toMatchObject({
+      stopped: false,
+      code: "MODULE_PROCESS_RECORD_STATE_INVALID",
+    });
+    expect(fileSystem.files.get(`${started.cgroup.path}/cgroup.kill`)).toBe("1");
+    expect(fileSystem.directories.has(started.cgroup.path)).toBe(true);
+    expect(records.log).not.toContain("state:stopping");
+    expect(records.log).not.toContain("state:stopped");
   });
 });

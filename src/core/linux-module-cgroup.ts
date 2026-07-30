@@ -843,6 +843,11 @@ export class ModuleCgroup {
     return this.#terminationProven;
   }
 
+  /** Whether the proven-empty control-group directory has been removed. */
+  get removed(): boolean {
+    return this.#removalResult !== undefined;
+  }
+
   /**
    * Records the kernel `cgroup.procs` evidence the launcher controller gathers
    * when it verifies launcher membership. Only a non-empty list counts: a
