@@ -9,7 +9,7 @@ Commands:
   init                 Create and register a new local instance
   run                  Run an initialized instance in the foreground
   config show          Validate and print the public instance configuration
-  migrate-core-state   Migrate a stopped instance's Core state to schema 16
+  migrate-core-state   Migrate a stopped instance's Core state to the current schema
   help                 Show this help
 
 Options:

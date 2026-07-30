@@ -93,11 +93,19 @@ export interface ReleasedClaimReport {
   readonly attempt: number;
   readonly moduleGenerationId: string;
   /**
+   * `never-authorized-to-send` means version 17 persisted the active Claim
+   * without a Module submission record or a migration marker for unknown
+   * history. Under that format's invariant, no Extension process-protocol send
+   * was durably authorized for the Run.
+   *
    * `no-external-effect` follows the Module process declaration.
    * `external-effects-safe-to-retry` follows persistent evidence that the
    * submitted Run caused no effect or that retrying cannot add another effect.
    */
-  readonly reason: "no-external-effect" | "external-effects-safe-to-retry";
+  readonly reason:
+    | "never-authorized-to-send"
+    | "no-external-effect"
+    | "external-effects-safe-to-retry";
 }
 
 export interface UnknownOutcomeClaimReport {
@@ -130,6 +138,18 @@ export interface CoreStartupStateStore {
   listModuleSubmissionRecords(): readonly ModuleSubmissionRecord[];
   getModuleProcessRecord(processGenerationId: string): ModuleProcessRecord | undefined;
   getModuleSubmissionRecord(runId: string): ModuleSubmissionRecord | undefined;
+  /**
+   * Lists the complete five-field identities of migrated active Claims whose
+   * submission history cannot be determined.
+   */
+  listActiveClaimsWithUnknownSubmissionHistory():
+    readonly DeliveryClaimIdentity[];
+  /**
+   * Checks all five identity fields against that same persisted collection.
+   */
+  hasActiveClaimWithUnknownSubmissionHistory(
+    identity: DeliveryClaimIdentity,
+  ): boolean;
   updateModuleProcessRecordState(
     processGenerationId: string,
     state: "starting" | "running" | "stopping" | "stopped",
@@ -235,6 +255,39 @@ function claimIdentity(claim: ClaimDescriptor): DeliveryClaimIdentity {
     attempt: claim.attempt,
     moduleGenerationId: claim.moduleGenerationId,
   };
+}
+
+const DELIVERY_CLAIM_IDENTITY_FIELDS = [
+  "moduleJobId",
+  "claimToken",
+  "runId",
+  "attempt",
+  "moduleGenerationId",
+] as const;
+
+function isDeliveryClaimIdentity(value: unknown): value is DeliveryClaimIdentity {
+  return (
+    hasExactlyProperties(value, DELIVERY_CLAIM_IDENTITY_FIELDS) &&
+    typeof value.moduleJobId === "string" &&
+    typeof value.claimToken === "string" &&
+    typeof value.runId === "string" &&
+    Number.isSafeInteger(value.attempt) &&
+    (value.attempt as number) >= 1 &&
+    typeof value.moduleGenerationId === "string"
+  );
+}
+
+function hasSameClaimIdentity(
+  left: DeliveryClaimIdentity,
+  right: DeliveryClaimIdentity,
+): boolean {
+  return (
+    left.moduleJobId === right.moduleJobId &&
+    left.claimToken === right.claimToken &&
+    left.runId === right.runId &&
+    left.attempt === right.attempt &&
+    left.moduleGenerationId === right.moduleGenerationId
+  );
 }
 
 /**
@@ -468,6 +521,22 @@ export class CoreStartupRecovery {
         `Released Claim ${claim.runId} still has a Module submission record`,
       );
     }
+    let hasUnknownSubmissionHistory: unknown;
+    try {
+      hasUnknownSubmissionHistory =
+        records.hasActiveClaimWithUnknownSubmissionHistory(identity);
+    } catch {
+      throw new CoreStartupRecoveryError(
+        "STARTUP_CLAIM_RELEASE_UNCONFIRMED",
+        `Unknown submission-history removal for released Claim ${claim.runId} could not be confirmed`,
+      );
+    }
+    if (hasUnknownSubmissionHistory !== false) {
+      throw new CoreStartupRecoveryError(
+        "STARTUP_CLAIM_RELEASE_UNCONFIRMED",
+        `Released Claim ${claim.runId} still has unknown submission history`,
+      );
+    }
     if (releaseThrew) {
       // The durable states are authoritative when the callback throws after
       // its synchronous Core-state update completed.
@@ -586,10 +655,31 @@ export class CoreStartupRecovery {
    */
   #assertRecordsLinkToClaims(): void {
     if (!this.#moduleRecords) return;
+    const records = this.#moduleRecords;
     const activeClaims = new Map(
       this.#deliveries.listActiveClaims().map((claim) => [claim.runId, claim]),
     );
-    for (const submission of this.#moduleRecords.listModuleSubmissionRecords()) {
+    let submissions: unknown;
+    let unknownSubmissionHistory: unknown;
+    try {
+      submissions = records.listModuleSubmissionRecords();
+      unknownSubmissionHistory =
+        records.listActiveClaimsWithUnknownSubmissionHistory();
+    } catch {
+      throw new CoreStartupRecoveryError(
+        "STARTUP_MODULE_RECORD_INCONSISTENT",
+        "Core-state Module record collections could not be read",
+      );
+    }
+    if (!Array.isArray(submissions) || !Array.isArray(unknownSubmissionHistory)) {
+      throw new CoreStartupRecoveryError(
+        "STARTUP_MODULE_RECORD_INCONSISTENT",
+        "Core-state Module record collections must be arrays",
+      );
+    }
+
+    const submittedRunIds = new Set<string>();
+    for (const submission of submissions as readonly ModuleSubmissionRecord[]) {
       const claim = activeClaims.get(submission.runId);
       if (!claim) {
         throw new CoreStartupRecoveryError(
@@ -606,6 +696,60 @@ export class CoreStartupRecovery {
         throw new CoreStartupRecoveryError(
           "STARTUP_MODULE_RECORD_INCONSISTENT",
           `Module submission record for Run ${submission.runId} does not match its active Claim identity`,
+        );
+      }
+      submittedRunIds.add(submission.runId);
+    }
+
+    const unknownHistoryByRunId = new Map<string, DeliveryClaimIdentity>();
+    for (const candidate of unknownSubmissionHistory) {
+      if (!isDeliveryClaimIdentity(candidate)) {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_RECORD_INCONSISTENT",
+          "An unknown submission-history entry must contain exactly the five Delivery Claim identity fields",
+        );
+      }
+      if (unknownHistoryByRunId.has(candidate.runId)) {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_RECORD_INCONSISTENT",
+          `Unknown submission history contains more than one entry for Run ${candidate.runId}`,
+        );
+      }
+      const claim = activeClaims.get(candidate.runId);
+      if (!claim || !hasSameClaimIdentity(candidate, claimIdentity(claim))) {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_RECORD_INCONSISTENT",
+          `Unknown submission history for Run ${candidate.runId} does not match its exact active Claim identity`,
+        );
+      }
+      if (submittedRunIds.has(candidate.runId)) {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_RECORD_INCONSISTENT",
+          `Run ${candidate.runId} cannot have both a Module submission record and unknown submission history`,
+        );
+      }
+      unknownHistoryByRunId.set(candidate.runId, candidate);
+    }
+
+    for (const claim of activeClaims.values()) {
+      const identity = claimIdentity(claim);
+      let queried: unknown;
+      try {
+        queried =
+          records.hasActiveClaimWithUnknownSubmissionHistory(identity);
+      } catch {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_RECORD_INCONSISTENT",
+          `Unknown submission history for Run ${claim.runId} could not be queried`,
+        );
+      }
+      if (
+        typeof queried !== "boolean" ||
+        queried !== unknownHistoryByRunId.has(claim.runId)
+      ) {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_RECORD_INCONSISTENT",
+          `Unknown submission-history list and exact query disagree for Run ${claim.runId}`,
         );
       }
     }
@@ -626,14 +770,31 @@ export class CoreStartupRecovery {
     }
     const submission = this.#moduleRecords.getModuleSubmissionRecord(claim.runId);
     if (!submission) {
-      // Version 16 allowed a submission record to be removed independently
-      // while its Claim remained active. Process stop proof establishes only
-      // that no old process remains; it cannot establish whether this Run was
-      // sent before that record disappeared.
+      let hasUnknownSubmissionHistory: unknown;
+      try {
+        hasUnknownSubmissionHistory =
+          this.#moduleRecords.hasActiveClaimWithUnknownSubmissionHistory(
+            claimIdentity(claim),
+          );
+      } catch {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_RECORD_INCONSISTENT",
+          `Unknown submission history for Run ${claim.runId} could not be queried`,
+        );
+      }
+      if (hasUnknownSubmissionHistory !== true) {
+        if (hasUnknownSubmissionHistory !== false) {
+          throw new CoreStartupRecoveryError(
+            "STARTUP_MODULE_RECORD_INCONSISTENT",
+            `Unknown submission-history query returned an invalid result for Run ${claim.runId}`,
+          );
+        }
+        return { kind: "release", reason: "never-authorized-to-send" };
+      }
       return {
         kind: "outcome-unknown",
         reason:
-          "the Core-state version does not prove whether the missing Module submission record was never written or was removed separately",
+          "migration from an older Core-state version cannot prove whether the missing Module submission record was never written or was removed separately",
       };
     }
     const processRecord = this.#moduleRecords.getModuleProcessRecord(

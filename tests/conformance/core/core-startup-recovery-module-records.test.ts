@@ -146,6 +146,20 @@ describe("CORE startup reconciliation with Module records", () => {
     } as ModuleSubmissionRecord;
   }
 
+  function exactIdentity(
+    claim: ReturnType<typeof seedActiveClaim>,
+  ): ReturnType<
+    FileCoreStateStore["listActiveClaimsWithUnknownSubmissionHistory"]
+  >[number] {
+    return {
+      moduleJobId: claim.moduleJobId,
+      claimToken: claim.claimToken,
+      runId: claim.runId,
+      attempt: claim.attempt,
+      moduleGenerationId: claim.moduleGenerationId,
+    };
+  }
+
   /**
    * Supplies a deliberately inconsistent submission-record view without using
    * a product write API to create an invalid Core-state update.
@@ -165,12 +179,42 @@ describe("CORE startup reconciliation with Module records", () => {
       getModuleProcessRecord: (processGenerationId) =>
         store.getModuleProcessRecord(processGenerationId),
       getModuleSubmissionRecord,
+      listActiveClaimsWithUnknownSubmissionHistory: () =>
+        store.listActiveClaimsWithUnknownSubmissionHistory(),
+      hasActiveClaimWithUnknownSubmissionHistory: (identity) =>
+        store.hasActiveClaimWithUnknownSubmissionHistory(identity),
       updateModuleProcessRecordState: (processGenerationId, state, failureCode) =>
         store.updateModuleProcessRecordState(processGenerationId, state, failureCode),
       releaseDeliveryClaim,
       removeModuleProcessRecord: (processGenerationId) =>
         store.removeModuleProcessRecord(processGenerationId),
       runAtomicUpdate: (operation) => store.runAtomicUpdate(operation),
+    };
+  }
+
+  function withUnknownSubmissionHistory(
+    store: FileCoreStateStore,
+    identities: ReturnType<
+      FileCoreStateStore["listActiveClaimsWithUnknownSubmissionHistory"]
+    >,
+    hasIdentity: CoreStartupStateStore["hasActiveClaimWithUnknownSubmissionHistory"] = (
+      supplied,
+    ) =>
+      identities.some(
+        (identity) =>
+          identity.moduleJobId === supplied.moduleJobId &&
+          identity.claimToken === supplied.claimToken &&
+          identity.runId === supplied.runId &&
+          identity.attempt === supplied.attempt &&
+          identity.moduleGenerationId === supplied.moduleGenerationId,
+      ),
+    submissionRecords: readonly ModuleSubmissionRecord[] =
+      store.listModuleSubmissionRecords(),
+  ): CoreStartupStateStore {
+    return {
+      ...withSubmissionRecords(store, submissionRecords),
+      listActiveClaimsWithUnknownSubmissionHistory: () => identities,
+      hasActiveClaimWithUnknownSubmissionHistory: hasIdentity,
     };
   }
 
@@ -232,25 +276,26 @@ describe("CORE startup reconciliation with Module records", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("keeps the existing refusal when an active Claim has no durable records", async () => {
+  it("releases a version 17 Claim that was never authorized to send", async () => {
     const store = openStore("first");
-    seedActiveClaim(store);
+    const claim = seedActiveClaim(store);
 
-    await expect(
-      new CoreStartupRecovery({
-        deliveries: store.deliveries,
-        commits: openCommits(store),
-        moduleRecords: store,
-      }).recover(),
-    ).rejects.toThrowError(
-      expect.objectContaining<Partial<CoreStartupRecoveryError>>({
-        code: "STARTUP_ACTIVE_CLAIM_UNRESOLVED",
+    const report = await new CoreStartupRecovery({
+      deliveries: store.deliveries,
+      commits: openCommits(store),
+      moduleRecords: store,
+    }).recover();
+
+    expect(report.releasedClaims).toEqual([
+      expect.objectContaining({
+        runId: claim.runId,
+        reason: "never-authorized-to-send",
       }),
-    );
-    expect(store.deliveries.listActiveClaims()).toHaveLength(1);
+    ]);
+    expect(store.deliveries.listActiveClaims()).toEqual([]);
   });
 
-  it("keeps a version 16 Claim unresolved when its submission record is absent", async () => {
+  it("keeps a migrated Claim unresolved when its submission history is unknown", async () => {
     const store = openStore("first");
     const claim = seedActiveClaim(store);
     store.appendModuleProcessRecord(processRecord());
@@ -259,7 +304,7 @@ describe("CORE startup reconciliation with Module records", () => {
       new CoreStartupRecovery({
         deliveries: store.deliveries,
         commits: openCommits(store),
-        moduleRecords: store,
+        moduleRecords: withUnknownSubmissionHistory(store, [exactIdentity(claim)]),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
@@ -273,6 +318,124 @@ describe("CORE startup reconciliation with Module records", () => {
     expect(reopened.getModuleProcessRecord("process-generation-1")).toMatchObject({
       state: "stopped",
     });
+  });
+
+  it("releases a never-authorized Claim only after every old process is proven stopped", async () => {
+    const store = openStore("first");
+    const claim = seedActiveClaim(store);
+    store.appendModuleProcessRecord(processRecord());
+
+    const report = await new CoreStartupRecovery({
+      deliveries: store.deliveries,
+      commits: openCommits(store),
+      moduleRecords: store,
+      processStopProver: provenStopped,
+    }).recover();
+
+    expect(report).toMatchObject({
+      releasedClaims: [
+        { runId: claim.runId, reason: "never-authorized-to-send" },
+      ],
+      stoppedProcessGenerationIds: ["process-generation-1"],
+      collectedRecords: { processRecords: 1 },
+    });
+    expect(store.deliveries.inspectClaim(claim).status).toBe("released");
+  });
+
+  it.each([
+    ["Module job identifier", { moduleJobId: "different-module-job" }],
+    ["Claim token", { claimToken: "different-claim-token" }],
+    ["Run identifier", { runId: "different-run" }],
+    ["attempt number", { attempt: 2 }],
+    [
+      "Module generation identifier",
+      { moduleGenerationId: "different-module-generation" },
+    ],
+  ] as const)(
+    "rejects unknown submission history with a mismatched %s",
+    async (_field, override) => {
+      const store = openStore("first");
+      const claim = seedActiveClaim(store);
+      const mismatched = {
+        ...exactIdentity(claim),
+        ...override,
+      };
+
+      await expect(
+        new CoreStartupRecovery({
+          deliveries: store.deliveries,
+          commits: openCommits(store),
+          moduleRecords: withUnknownSubmissionHistory(store, [mismatched]),
+        }).recover(),
+      ).rejects.toMatchObject({
+        code: "STARTUP_MODULE_RECORD_INCONSISTENT",
+      });
+      expect(store.deliveries.inspectClaim(claim).status).toBe("active");
+    },
+  );
+
+  it("rejects duplicate unknown submission-history entries", async () => {
+    const store = openStore("first");
+    const claim = seedActiveClaim(store);
+
+    await expect(
+      new CoreStartupRecovery({
+        deliveries: store.deliveries,
+        commits: openCommits(store),
+        moduleRecords: withUnknownSubmissionHistory(store, [
+          exactIdentity(claim),
+          exactIdentity(claim),
+        ]),
+      }).recover(),
+    ).rejects.toMatchObject({
+      code: "STARTUP_MODULE_RECORD_INCONSISTENT",
+    });
+    expect(store.deliveries.inspectClaim(claim).status).toBe("active");
+  });
+
+  it("rejects a Claim present in both submission-history classifications", async () => {
+    const store = openStore("first");
+    const claim = seedActiveClaim(store);
+    store.appendModuleProcessRecord(processRecord());
+    store.updateModuleProcessRecordState("process-generation-1", "running");
+    const submission = submissionFor(claim);
+
+    await expect(
+      new CoreStartupRecovery({
+        deliveries: store.deliveries,
+        commits: openCommits(store),
+        moduleRecords: withUnknownSubmissionHistory(
+          store,
+          [exactIdentity(claim)],
+          undefined,
+          [submission],
+        ),
+        processStopProver: provenStopped,
+      }).recover(),
+    ).rejects.toMatchObject({
+      code: "STARTUP_MODULE_RECORD_INCONSISTENT",
+    });
+    expect(store.deliveries.inspectClaim(claim).status).toBe("active");
+  });
+
+  it("rejects disagreement between the unknown-history list and exact query", async () => {
+    const store = openStore("first");
+    const claim = seedActiveClaim(store);
+
+    await expect(
+      new CoreStartupRecovery({
+        deliveries: store.deliveries,
+        commits: openCommits(store),
+        moduleRecords: withUnknownSubmissionHistory(
+          store,
+          [],
+          (identity) => identity.runId === claim.runId,
+        ),
+      }).recover(),
+    ).rejects.toMatchObject({
+      code: "STARTUP_MODULE_RECORD_INCONSISTENT",
+    });
+    expect(store.deliveries.inspectClaim(claim).status).toBe("active");
   });
 
   it("refuses to release when the old Module cgroup cannot be proven empty", async () => {
@@ -780,7 +943,7 @@ describe("CORE startup reconciliation with Module records", () => {
     expect(store.deliveries.inspectClaim(claim).status).toBe("released");
   });
 
-  it("keeps a version 16 Claim unresolved after two stopped process attempts", async () => {
+  it("keeps a migrated Claim unresolved after two stopped process attempts", async () => {
     const store = openStore("first");
     const claim = seedActiveClaim(store);
     store.appendModuleProcessRecord(processRecord());
@@ -794,7 +957,7 @@ describe("CORE startup reconciliation with Module records", () => {
       new CoreStartupRecovery({
         deliveries: store.deliveries,
         commits: openCommits(store),
-        moduleRecords: store,
+        moduleRecords: withUnknownSubmissionHistory(store, [exactIdentity(claim)]),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
@@ -809,9 +972,9 @@ describe("CORE startup reconciliation with Module records", () => {
     ]);
   });
 
-  it("keeps an ambiguous version 16 Claim unresolved while a process is unstopped", async () => {
+  it("proves every old process stopped before classifying migrated Claim history", async () => {
     const store = openStore("first");
-    seedActiveClaim(store);
+    const claim = seedActiveClaim(store);
     store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.updateModuleProcessRecordState("process-generation-1", "stopped");
@@ -823,7 +986,7 @@ describe("CORE startup reconciliation with Module records", () => {
       new CoreStartupRecovery({
         deliveries: store.deliveries,
         commits: openCommits(store),
-        moduleRecords: store,
+        moduleRecords: withUnknownSubmissionHistory(store, [exactIdentity(claim)]),
         // This prover refuses, so the second record cannot be marked stopped.
         processStopProver: unprovenStop,
       }).recover(),

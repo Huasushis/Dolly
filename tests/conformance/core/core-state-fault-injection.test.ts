@@ -29,10 +29,17 @@ import {
 import {
   CoreStateError,
   FileCoreStateStore,
-  migrateCoreStateDocumentToVersion16,
+  migrateCoreStateDocumentToVersion17,
 } from "../../../src/core/file-core-state-store.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import { type ModuleProcessRecord } from "../../../src/core/module-process-records.js";
+
+const MIGRATION_OPTIONS = {
+  runtimeConfiguration: {
+    maxFailedAttempts: 3,
+    media: { enabled: false as const },
+  },
+};
 
 const faults = vi.hoisted(() => ({
   beforeOpen: undefined as ((path: string, flags: string) => void) | undefined,
@@ -253,8 +260,8 @@ describe("CORE state atomic write fault injection", () => {
    */
   function assertOneCompleteView(prefix: string, state: ClaimedState): "old" | "new" {
     const document = JSON.parse(readFileSync(path, "utf8")) as Record<string, JsonValue>;
-    const { schemaVersion, stateDigest, ...payload } = document;
-    expect(schemaVersion).toBe("dolly.core-state/16");
+    const { stateDigest, ...payload } = document;
+    expect(document.schemaVersion).toBe("dolly.core-state/17");
     expect(canonicalJsonDigest(payload)).toBe(stateDigest);
     expect(readdirSync(root).filter(isTemporaryCoreStatePath)).toEqual([]);
 
@@ -339,6 +346,7 @@ describe("CORE state atomic write fault injection", () => {
     delete current.stateDigest;
     delete current.moduleProcessRecords;
     delete current.moduleSubmissionRecords;
+    delete current.activeClaimsWithUnknownSubmissionHistory;
     const legacy = {
       schemaVersion: "dolly.core-state/15",
       stateDigest: canonicalJsonDigest(current),
@@ -712,12 +720,14 @@ describe("CORE state atomic write fault injection", () => {
     expect(reopened.getModuleSubmissionRecord(state.identity.runId)).toBeDefined();
   });
 
-  it("refuses to migrate version 15 when a backup already exists", () => {
+  it("refuses to migrate version 15 when an existing backup has different bytes", () => {
     const raw = seedVersion15Document();
     const backupPath = `${path}.v15.backup`;
     writeFileSync(backupPath, "earlier backup\n", "utf8");
 
-    expect(() => migrateCoreStateDocumentToVersion16(path)).toThrowError(
+    expect(() =>
+      migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS),
+    ).toThrowError(
       expect.objectContaining<Partial<CoreStateError>>({ code: "CORE_STATE_IO_FAILED" }),
     );
 
@@ -737,7 +747,9 @@ describe("CORE state atomic write fault injection", () => {
     const tamperedRaw = `${JSON.stringify(tampered)}\n`;
     writeFileSync(path, tamperedRaw, "utf8");
 
-    expect(() => migrateCoreStateDocumentToVersion16(path)).toThrowError(
+    expect(() =>
+      migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS),
+    ).toThrowError(
       expect.objectContaining<Partial<CoreStateError>>({
         code: "CORE_STATE_DOCUMENT_INVALID",
       }),
@@ -754,7 +766,9 @@ describe("CORE state atomic write fault injection", () => {
       if (to === resolve(path)) throw injectedFailure("EPERM", "rename");
     };
 
-    expect(() => migrateCoreStateDocumentToVersion16(path)).toThrowError(
+    expect(() =>
+      migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS),
+    ).toThrowError(
       expect.objectContaining<Partial<CoreStateError>>({ code: "CORE_STATE_IO_FAILED" }),
     );
     clearFaults();
@@ -767,19 +781,67 @@ describe("CORE state atomic write fault injection", () => {
       }),
     );
 
-    // The backup written before the replacement survives the failure and
-    // blocks every retry until an operator removes it.
+    // The backup written before the replacement survives the failure. Because
+    // it is byte-for-byte identical to the still-current source file, the next
+    // migration can verify and reuse it.
     expect(readFileSync(backupPath, "utf8")).toBe(raw);
-    expect(() => migrateCoreStateDocumentToVersion16(path)).toThrowError(
-      expect.objectContaining<Partial<CoreStateError>>({ code: "CORE_STATE_IO_FAILED" }),
-    );
-    rmSync(backupPath);
-    expect(migrateCoreStateDocumentToVersion16(path)).toBe("migrated");
+    expect(migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS)).toEqual({
+      status: "migrated",
+      sourceSchemaVersion: "dolly.core-state/15",
+      backupPath: resolve(backupPath),
+    });
 
     const migrated = openStore("migrated");
-    expect(migrated.snapshot().schemaVersion).toBe("dolly.core-state/16");
+    expect(migrated.snapshot().schemaVersion).toBe("dolly.core-state/17");
     expect(migrated.listModuleProcessRecords()).toEqual([]);
     expect(migrated.listModuleSubmissionRecords()).toEqual([]);
     expect(migrated.deliveries.listActiveClaims()).toHaveLength(1);
+    expect(migrated.listActiveClaimsWithUnknownSubmissionHistory()).toHaveLength(1);
+  });
+
+  it("does not report an already-current migration until the renamed file can be synchronized", () => {
+    seedVersion15Document();
+    faults.afterRename = (_from, to) => {
+      if (to === resolve(path)) throw injectedFailure("EIO", "fsync");
+    };
+
+    expect(() =>
+      migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS),
+    ).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_IO_FAILED",
+      }),
+    );
+    clearFaults();
+    expect(
+      (JSON.parse(readFileSync(path, "utf8")) as Record<string, JsonValue>)
+        .schemaVersion,
+    ).toBe("dolly.core-state/17");
+
+    let currentFileDescriptor: number | undefined;
+    faults.afterOpen = (openedPath, flags, descriptor) => {
+      if (openedPath === resolve(path) && flags === "r+") {
+        currentFileDescriptor = descriptor;
+      }
+    };
+    faults.beforeFsync = (descriptor) => {
+      if (descriptor === currentFileDescriptor) {
+        throw injectedFailure("EIO", "fsync");
+      }
+    };
+    expect(() =>
+      migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS),
+    ).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_IO_FAILED",
+      }),
+    );
+    expect(currentFileDescriptor).toBeTypeOf("number");
+
+    clearFaults();
+    expect(migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS)).toEqual({
+      status: "already-current",
+      schemaVersion: "dolly.core-state/17",
+    });
   });
 });

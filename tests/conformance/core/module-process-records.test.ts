@@ -175,7 +175,7 @@ describe("CORE Module process and submission records", () => {
     const reopened = openStore("second");
     expect(reopened.listModuleProcessRecords()).toEqual([record]);
     expect(reopened.getModuleProcessRecord("process-generation-1")).toEqual(record);
-    expect(reopened.snapshot().schemaVersion).toBe("dolly.core-state/16");
+    expect(reopened.snapshot().schemaVersion).toBe("dolly.core-state/17");
   });
 
   it("copies an accessor-based process record once before validation and persistence", () => {

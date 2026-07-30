@@ -1,5 +1,6 @@
 /**
- * Durable Module process and submission records for `dolly.core-state/16`.
+ * Durable Module process and submission records stored in the Core-state
+ * document.
  *
  * A Module process record describes one attempt to start one existing Module
  * generation. A Module submission record states that one existing Run may
@@ -80,7 +81,13 @@ export type ModuleProcessRecordErrorCode =
   | "MODULE_SUBMISSION_RECORD_INVALID"
   | "MODULE_SUBMISSION_RECORD_CONFLICT"
   | "MODULE_SUBMISSION_RECORD_NOT_FOUND"
-  | "MODULE_SUBMISSION_RECORD_UNAUTHORIZED";
+  | "MODULE_SUBMISSION_RECORD_UNAUTHORIZED"
+  /**
+   * An older Core-state format cannot prove whether this Claim's submission
+   * record ever existed, so Dolly must not submit it again or make it terminal
+   * through an ordinary acknowledgement, negative acknowledgement, or release.
+   */
+  | "MODULE_CLAIM_SUBMISSION_HISTORY_UNKNOWN";
 
 export class ModuleProcessRecordError extends Error {
   constructor(readonly code: ModuleProcessRecordErrorCode, message: string) {

@@ -1,5 +1,9 @@
 import { join, resolve } from "node:path";
-import { migrateCoreStateDocumentToVersion16 } from "./core/file-core-state-store.js";
+import {
+  CoreStateError,
+  migrateCoreStateDocumentToVersion17,
+  type CoreStateMigrationResult,
+} from "./core/file-core-state-store.js";
 import {
   InstanceConfigError,
   InstanceConfigStore,
@@ -29,7 +33,7 @@ Commands:
   init                 Create and register a new local instance
   run                  Run an initialized instance in the foreground
   config show          Validate and print the public instance configuration
-  migrate-core-state   Migrate a stopped instance's Core state to schema 16
+  migrate-core-state   Migrate a stopped instance's Core state to the current schema
   help                 Show this help
 
 Options:
@@ -183,11 +187,11 @@ function parseArguments(argv: readonly string[], cwd: string): ParsedArguments {
 }
 
 /**
- * Migrates one instance's Core state from `dolly.core-state/15` to version 16.
+ * Migrates one stopped instance's Core state to the current supported schema.
  *
  * The migration is deliberately an explicit operator command rather than an
  * automatic startup step: Architecture Decision Record 0009 requires a stopped
- * instance, and reading a version 15 document at startup fails closed with
+ * instance, and reading an older document at startup fails closed with
  * `CORE_STATE_MIGRATION_REQUIRED` instead of guessing. The instance controller
  * lock is taken so the command cannot run against a live instance, and the
  * original bytes are kept beside the state file before it is replaced.
@@ -199,41 +203,46 @@ async function migrateCoreState(options: {
   readonly stdout: TextOutput;
 }): Promise<number> {
   const { configPath, directories, confirmed, stdout } = options;
-  const inspected = configStore(directories).inspect(configPath);
-  const statePath = join(inspected.stateDirectory, "core-state.json");
+  const store = configStore(directories);
+  const inspected = store.inspect(configPath);
 
   if (!confirmed) {
+    const statePath = join(inspected.stateDirectory, "core-state.json");
     writeLine(stdout, `Instance:        ${inspected.instanceId}`);
     writeLine(stdout, `Core state:      ${statePath}`);
-    writeLine(stdout, `Backup will be:  ${statePath}.v15.backup`);
+    writeLine(
+      stdout,
+      "Backup:          chosen from the validated source schema during migration",
+    );
     writeLine(stdout, "");
     writeLine(
       stdout,
-      "This replaces the Core state document with schema version 16, which adds",
+      "This validates a supported older Core state document and migrates it",
     );
     writeLine(
       stdout,
-      "empty Module process and submission record collections. Existing Delivery",
+      "directly to the current schema. The confirmed command reports the exact",
     );
-    writeLine(stdout, "Claims are preserved exactly as they are.");
+    writeLine(stdout, "source schema, target schema, and backup path.");
     writeLine(stdout, "");
     writeLine(
       stdout,
-      "Stop the instance first. Any Delivery Claim that is still active after the",
+      "Stop the instance first. An active Delivery Claim whose older state lacks",
     );
     writeLine(
       stdout,
-      "migration has no Module process record, so the next startup reports",
+      "an exact Module submission record remains explicitly unresolved. The next",
     );
     writeLine(
       stdout,
-      "STARTUP_ACTIVE_CLAIM_UNRESOLVED and refuses to run. That refusal is correct:",
+      "startup reports STARTUP_ACTIVE_CLAIM_UNRESOLVED rather than guessing",
     );
     writeLine(
       stdout,
-      "Core cannot tell whether such a Claim's Run executed. Resolving it is a",
+      "whether sending was authorized. Resolving it is a separate audited",
     );
-    writeLine(stdout, "separate audited operator action.");
+    writeLine(stdout, "operator action. Dolly does not yet provide that command, so the");
+    writeLine(stdout, "affected Module remains blocked.");
     writeLine(stdout, "");
     writeLine(stdout, "Re-run with --confirm to perform the migration.");
     return 0;
@@ -245,22 +254,58 @@ async function migrateCoreState(options: {
     directory: join(resolve(directories.registryDirectory), "controllers"),
     instanceId: inspected.instanceId,
   });
+  let statePath: string;
+  let result: CoreStateMigrationResult;
   try {
-    const result = migrateCoreStateDocumentToVersion16(statePath);
-    if (result === "already-current") {
-      writeLine(stdout, `Core state at ${statePath} is already schema version 16`);
-      return 0;
-    }
-    writeLine(stdout, `Migrated ${statePath} to dolly.core-state/16`);
-    writeLine(stdout, `Backup:   ${statePath}.v15.backup`);
-    writeLine(
-      stdout,
-      "Keep the backup until the instance has started successfully at least once.",
-    );
-    return 0;
+    const claimed = store.claim(configPath, {
+      instanceId: inspected.instanceId,
+      configRevision: inspected.configRevision,
+    });
+    statePath = join(claimed.stateDirectory, "core-state.json");
+    result = migrateCoreStateDocumentToVersion17(statePath, {
+      maxBytes: claimed.document.core.limits.maxStateBytes,
+      runtimeConfiguration: {
+        maxFailedAttempts: claimed.document.core.limits.maxFailedAttempts,
+        media: claimed.document.core.media.enabled
+          ? {
+              enabled: true,
+              idNamespace: claimed.instanceId,
+              maxMediaBytes: claimed.document.core.media.maxMediaBytes,
+              maxTotalMediaBytes:
+                claimed.document.core.media.maxTotalMediaBytes,
+              maxRegistrationRecords:
+                claimed.document.core.media.maxRegistrationRecords,
+              maxStorageRecords:
+                claimed.document.core.media.maxStorageRecords,
+              maxProviderAccessRecords:
+                claimed.document.core.media.maxProviderAccessRecords,
+              deletedRegistrationRetentionMs:
+                claimed.document.core.media.deletedRegistrationRetentionMs,
+            }
+          : { enabled: false },
+      },
+    });
   } finally {
     await lock.release();
   }
+
+  if (result.status === "already-current") {
+    writeLine(
+      stdout,
+      `Core state at ${statePath} is already ${result.schemaVersion}`,
+    );
+    return 0;
+  }
+  writeLine(
+    stdout,
+    `Migrated ${statePath} from ${result.sourceSchemaVersion} to dolly.core-state/17`,
+  );
+  writeLine(stdout, `Backup:   ${result.backupPath}`);
+  writeLine(
+    stdout,
+    "Keep the backup until the instance has started successfully at least once.",
+  );
+  return 0;
 }
 
 function configStore(directories: DollyRuntimeDirectories) {
@@ -385,6 +430,7 @@ async function execute(
 function publicError(error: unknown): { readonly code: string; readonly message: string } {
   if (
     error instanceof DollyCliError ||
+    error instanceof CoreStateError ||
     error instanceof InstanceConfigError ||
     error instanceof InstanceControllerLockError ||
     error instanceof RuntimeBootstrapError ||

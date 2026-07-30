@@ -5,7 +5,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   BlockStore,
@@ -19,7 +19,7 @@ import {
 import {
   CoreStateError,
   FileCoreStateStore,
-  migrateCoreStateDocumentToVersion16,
+  migrateCoreStateDocumentToVersion17,
 } from "../../../src/core/file-core-state-store.js";
 import {
   MediaStore,
@@ -29,6 +29,12 @@ import { ReferenceGraph } from "../../../src/core/reference-graph.js";
 import { withSynchronousCrossProcessLock } from "../../../src/core/synchronous-cross-process-lock.js";
 
 const NOW = "2026-07-24T00:00:00.000Z";
+const MIGRATION_OPTIONS = {
+  runtimeConfiguration: {
+    maxFailedAttempts: 3,
+    media: { enabled: false as const },
+  },
+};
 
 function proposal(text: string): BlockProposal {
   return {
@@ -352,6 +358,26 @@ describe("CORE atomic file state", () => {
     );
   });
 
+  it("rejects a same-revision replacement instead of overwriting its bytes", () => {
+    const store = openStore(path, "original");
+    store.deliveries.createPage("original-page");
+
+    const replacementPath = join(root, "replacement-core-state.json");
+    const replacement = openStore(replacementPath, "replacement");
+    replacement.deliveries.createPage("replacement-page");
+    expect(replacement.revision).toBe(store.revision);
+
+    const replacementBytes = readFileSync(replacementPath);
+    writeFileSync(path, replacementBytes);
+
+    expect(() => store.deliveries.createPage("later-page")).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_REOPEN_REQUIRED",
+      }),
+    );
+    expect(readFileSync(path)).toEqual(replacementBytes);
+  });
+
   it("requires a reopen when a changed component could not acquire the write lock", () => {
     const store = openStore(path, "first");
     withSynchronousCrossProcessLock({ resourceId: `${path}.lock` }, () => {
@@ -425,7 +451,7 @@ describe("CORE atomic file state", () => {
     openStore(path, "first");
     writeFileSync(
       path,
-      '{"schemaVersion":"dolly.core-state/16","revision":0,"revision":1,"stateDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","referenceGraph":{},"blocks":{},"deliveries":{},"moduleProcessRecords":[],"moduleSubmissionRecords":[]}',
+      '{"schemaVersion":"dolly.core-state/17","revision":0,"revision":1,"stateDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","referenceGraph":{},"blocks":{},"deliveries":{},"moduleProcessRecords":[],"moduleSubmissionRecords":[],"activeClaimsWithUnknownSubmissionHistory":[]}',
       "utf8",
     );
     expect(() => openStore(path, "bad-json")).toThrowError(
@@ -462,11 +488,67 @@ describe("CORE atomic file state", () => {
     );
   });
 
+  it("rejects invalid nested state in older documents before reporting that migration is required", () => {
+    for (const version of ["15", "16"] as const) {
+      const legacyPath = join(root, `core-state-version-${version}.json`);
+      const store = openStore(legacyPath, `version-${version}`);
+      store.deliveries.createPage("input");
+      store.deliveries.registerConsumer("input", "worker", "from-now");
+      const block = store.blocks.commit(proposal("input"), {
+        kind: "external",
+        id: "console",
+      });
+      store.deliveries.append("input", block.id);
+      store.deliveries.claim({
+        consumerId: "worker",
+        pageIds: ["input"],
+        moduleGenerationId: "generation-1",
+        maxCount: 1,
+        maxBytes: 1024 * 1024,
+      });
+
+      const current = JSON.parse(
+        readFileSync(legacyPath, "utf8"),
+      ) as Record<string, unknown>;
+      const deliveries = current.deliveries as {
+        claims: Array<Record<string, unknown>>;
+      };
+      deliveries.claims[0]!.runId = `${deliveries.claims[0]!.runId as string}-different`;
+      const basePayload = {
+        revision: current.revision,
+        referenceGraph: current.referenceGraph,
+        blocks: current.blocks,
+        deliveries: current.deliveries,
+      };
+      const legacyPayload =
+        version === "15"
+          ? basePayload
+          : {
+              ...basePayload,
+              moduleProcessRecords: current.moduleProcessRecords,
+              moduleSubmissionRecords: current.moduleSubmissionRecords,
+            };
+      const legacy = {
+        schemaVersion: `dolly.core-state/${version}`,
+        stateDigest: canonicalJsonDigest(legacyPayload as never),
+        ...legacyPayload,
+      };
+      writeFileSync(legacyPath, `${JSON.stringify(legacy)}\n`, "utf8");
+
+      expect(() => openStore(legacyPath, `invalid-${version}`)).toThrowError(
+        expect.objectContaining<Partial<CoreStateError>>({
+          code: "CORE_STATE_DOCUMENT_INVALID",
+        }),
+      );
+    }
+  });
+
   it("requires an explicit migration instead of silently upgrading version 15", () => {
     openStore(path, "current");
     const current = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
     delete current.moduleProcessRecords;
     delete current.moduleSubmissionRecords;
+    delete current.activeClaimsWithUnknownSubmissionHistory;
     const legacyPayload = {
       revision: current.revision,
       referenceGraph: current.referenceGraph,
@@ -486,14 +568,22 @@ describe("CORE atomic file state", () => {
       }),
     );
 
-    expect(migrateCoreStateDocumentToVersion16(path)).toBe("migrated");
+    expect(migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS)).toEqual({
+      status: "migrated",
+      sourceSchemaVersion: "dolly.core-state/15",
+      backupPath: resolve(`${path}.v15.backup`),
+    });
     const migrated = openStore(path, "migrated");
-    expect(migrated.snapshot().schemaVersion).toBe("dolly.core-state/16");
+    expect(migrated.snapshot().schemaVersion).toBe("dolly.core-state/17");
     expect(migrated.listModuleProcessRecords()).toEqual([]);
     expect(migrated.listModuleSubmissionRecords()).toEqual([]);
+    expect(migrated.listActiveClaimsWithUnknownSubmissionHistory()).toEqual([]);
     expect(JSON.parse(readFileSync(`${path}.v15.backup`, "utf8"))).toMatchObject({
       schemaVersion: "dolly.core-state/15",
     });
-    expect(migrateCoreStateDocumentToVersion16(path)).toBe("already-current");
+    expect(migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS)).toEqual({
+      status: "already-current",
+      schemaVersion: "dolly.core-state/17",
+    });
   });
 });
