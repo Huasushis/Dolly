@@ -153,6 +153,9 @@ operate. It does not infer their domain semantics.
   second effect, normally through a stable idempotency key and a queryable
   outcome. **Terminal outcome** means a durably recorded completed, permanently
   rejected, or explicitly operator-resolved result for that exact operation.
+  A terminal outcome proves what happened; it does not prove that repeating
+  the operation is safe. Without a separate durable idempotency contract, it
+  does not permit automatic negative acknowledgement, release, or retry.
 - **Mailbox**: Pending triggers and Deliveries that may start a Module actor.
 - **Module description**: Bounded text a Module publishes to describe the input
   it accepts or the output it may produce. The runtime stores each revision as
@@ -761,14 +764,16 @@ The default Dolly delivery guarantee SHOULD be at-least-once.
   durable records of process state and result submission prove whether the old
   executor can still run and whether it submitted a result. Only a proven
   failed Run may proceed to negative acknowledgement. The current startup
-  recovery lacks those records and therefore rejects startup while an active
-  Claim remains.
+  recovery reads and cross-checks those records. When an active Claim lacks the
+  records or other durable evidence needed to establish its outcome, recovery
+  leaves the Claim active and reports `STARTUP_ACTIVE_CLAIM_UNRESOLVED`.
 - For the proposed Linux Module runner, a submitted Run may be negatively
   acknowledged only after the Module result commit journal and every possible
-  external effect have no-effect, retry-safe, or terminal evidence. Process
-  exit, cgroup cleanup, cancellation, timeout, or an Extension error alone is
-  not that evidence. Otherwise the exact Claim remains active with an unknown
-  outcome for audited operator action.
+  external effect have no-effect or retry-safe evidence. A terminal external
+  effect outcome does not by itself prove that repeating the Run is safe.
+  Process exit, cgroup cleanup, cancellation, timeout, or an Extension error
+  alone is not sufficient evidence. Otherwise the exact Claim remains active
+  with an unknown outcome for audited operator action.
 - A Module exception MUST NOT silently discard input.
 
 An effect slot, represented by `effectSlot`, is the stable identifier assigned
@@ -788,6 +793,23 @@ must persist an intent, stable key, and exact Claim/Run association before the
 input/output operation. The responsible capability contract then persists or
 queries its terminal outcome. An in-memory duplicate map, an Extension-declared
 `retrySafe` flag, or a cancelled local Promise is not durable evidence.
+
+The current `EffectIntentJournal` and `effectIntentEvidenceSource` implement the
+record rules and the adapter consumed by startup and runtime recovery. Dolly
+does not yet provide a persistent product `EffectIntentStore`, and no product
+capability execution path is required to write through this journal before it
+authorizes an external effect. Consequently, both an empty journal and a set of
+records whose outcomes are all `no-effect` remain `unknown`: neither proves that
+every possible effect for the Run was recorded. A `terminal` record proves a
+durable final effect result, not retry safety.
+
+The current `dolly.effect-intent/2` record also carries both the stable
+idempotency key and one exact Claim/Run identity. It rejects reuse of that key
+by a retry Run because the current shape cannot safely distinguish the stable
+logical effect from each Run that was authorized to request it. Before product
+integration, the persistent schema must represent those as separate related
+records or otherwise prove both relationships; silently treating a record from
+another Claim as this Run's authorization is forbidden.
 
 Positive acknowledgement operations MUST be idempotent for the same valid
 claim token. A repeated positive acknowledgement MAY report
@@ -821,12 +843,13 @@ record a failed attempt or increase `failedAttemptCount`.
 The persisted Claim state `released` means Core has confirmed that the Run's
 executor cannot submit a result, and that either no submission record exists in
 a state known to satisfy Section 7.7 or the result journal and every possible
-external effect have no-effect, retry-safe, or terminal evidence. Absence in a
-version 16 state is not sufficient by itself because the current version 16
-writer permits independent submission-record removal. The old Claim can no
-longer be acknowledged or negatively acknowledged, and the same immutable
-Delivery batch remains pending for the same Module job. The state is required
-because
+external effect have no-effect or retry-safe evidence. A terminal external
+effect outcome requires the Claim to remain unresolved unless a separate
+durable idempotency contract proves retry safety. Absence in a version 16 state
+is not sufficient by itself because earlier version 16 writers permitted
+independent submission-record removal. The old Claim can no longer be
+acknowledged or negatively acknowledged, and the same immutable Delivery batch
+remains pending for the same Module job. The state is required because
 `active` still authorizes a Run, `nacked` and `dead-lettered` classify failure,
 and `committed` records success; none of those states represents an orderly
 shutdown that preserves pending work.
@@ -915,13 +938,17 @@ file or result store. The document version does not by itself enable a Module:
 runtime startup still rejects every configured Module, so both collections are
 empty in product-created state today. The rules below state the required target
 for enabling Modules; the record shapes shown below describe the current version
-16 representation, not a chosen future representation. The current version 16
-writer permits a submission record to be removed independently of its Claim
-transition, and current recovery can treat a record beside a terminal Claim as
-later cleanup. Those behaviors do not satisfy this section and do not authorize
-Module activation. Before Module activation, Dolly MUST select a new Core-state
-schema version and an explicit migration that enforces the target relationship.
-This specification does not prescribe that version's fields.
+16 representation, not a chosen future representation. Earlier version 16
+writers permitted a submission record to be removed independently of its Claim
+transition and treated a record beside a terminal Claim as later cleanup. The
+current file-based Core-state store (`FileCoreStateStore`) instead makes every
+Claim terminal transition and matching record removal one Core-state update,
+rejects direct terminal methods on its public Delivery store, and rejects a
+terminal Claim beside a submission record. The unchanged version 16 label
+cannot show whether an existing file was written before those enforcement
+points existed. Before Module activation, Dolly MUST therefore select a new
+Core-state schema version and an explicit migration that establishes the target
+relationship. This specification does not prescribe that version's fields.
 
 A Module process record contains the instance, Module, Module-generation, and
 non-reused process-generation identifiers; validated package digest and
@@ -1038,7 +1065,10 @@ Core-state update. That terminal transition is the only permitted removal of a
 submission record. A `stopped` process record with no remaining active Claim or
 submission record may be removed in a later Core-state update; a record
 referenced by an unresolved Claim, submission record, or unknown outcome is
-pinned and must not be altered or collected. The exact container layout inside
+retained and must not be collected. Its process identity, package digest,
+configuration reference, and external-effect declaration are immutable. Its
+lifecycle state may advance to `stopped` only after startup verifies a stop
+proof bound to that exact process record. The exact container layout inside
 `dolly.core-state/16` follows the existing Core-state document conventions; the
 identity keys are the non-reused `processGenerationId` for process records and
 `runId` for submission records.
@@ -1058,7 +1088,7 @@ remains unresolved because Core cannot determine whether its Run executed. The
 migration therefore fails closed; it does not prove that an arbitrary version
 16 document satisfies the target rule above. An active Claim without a
 submission record in existing version 16 state is likewise ambiguous: the Run
-may never have been authorized, or the current writer may have removed its
+may never have been authorized, or an earlier writer may have removed its
 record independently. Migration and recovery MUST NOT automatically call that
 state `never-submitted`, release the Claim, or retry the Run. They MUST preserve
 it as unresolved until durable evidence or an audited operator action
@@ -1098,6 +1128,13 @@ evidence nor an audited disposition remains an unknown outcome. An active Claim
 without a submission record may be released after its old Module cgroup is
 proven empty only when the state is known to satisfy the target rule; the
 version 16 ambiguity above remains unresolved.
+
+`operator-left-unresolved` is the audit reason code for an operator choice that
+deliberately makes no Claim transition: the exact Claim remains active and its
+submission record remains unchanged. The code records that review; it is not
+no-effect evidence, a terminal disposition, or permission to retry the Run.
+A stable code is required because structured audit records cannot use
+free-form prose to identify this operator choice consistently.
 
 These journal and Core-state rules support recovery and idempotent replay. They
 do not provide exactly-once Module execution or exactly-once external effects;
@@ -1437,6 +1474,7 @@ is the durable journal record saved before Core commits its Block, output
 Deliveries, and acknowledgement; the word describes commit progress, not a
 second kind of Module result.
 
+- The Claim MUST be active and have one exact, valid Module submission record.
 - The result `source` MUST identify the Claim's consumer Module exactly.
 - Each `media-reference` in the optional output Block MUST reuse a `mediaId`
   found in a `media-reference` of one of that Claim's input Blocks. A resolver
@@ -1448,9 +1486,15 @@ second kind of Module result.
   the full image, enlarge a delivered crop, or combine separate delivered
   crops into a larger region.
 
-The same validation MUST run again before Core resumes a `prepared` record.
-It prevents a tampered or stale journal record from bypassing the check during
-recovery. It also means that a Module result cannot introduce Media registered
+While the Claim remains active, the same validation MUST run again before each
+new Block or output Delivery effect. It prevents a tampered or stale journal
+record from bypassing the check during recovery. If the Claim is already
+`committed` and the submission record is absent, recovery may only verify that
+the `prepared` journal already records every required effect and that every
+effect exists with the same identifiers and content; it then changes only the
+journal to `committed`. It MUST NOT recreate a missing effect, acknowledge the
+Claim again, or depend on input Deliveries that may already have been pruned.
+These rules also mean that a Module result cannot introduce Media registered
 during that run, nor make a Media reference valid by presenting a different
 grant issued by trusted Core. Those flows need separately specified host
 operations.
@@ -1506,14 +1550,19 @@ file name `module-result-commits.json`. The configured byte bound is
 migration or reject startup. It MUST NOT silently ignore the old file and begin
 with an empty repository.
 
-The current Module result commit coordinator requires a Delivery Claim and
-input acknowledgement. It therefore defines a completion boundary only for
+The current Module result commit coordinator requires an exact Delivery Claim,
+its valid Module submission record, and the Core-state operation that both
+positively acknowledges that Claim and removes the record. It verifies the two
+postconditions before advancing the journal and enforces the allowed recovery
+combinations above. It therefore defines a completion boundary only for
 reactive Module jobs. The first runtime MUST reject periodic, source, and manual
 activation. Source and manual support requires a separate, specified completion
-boundary rather than a fabricated empty Delivery batch. The current coordinator
-does not yet remove a Module submission record in the same Core-state update as
-positive acknowledgement, so it does not yet satisfy the Section 7.7 completion
-order and cannot authorize Linux Module activation.
+boundary rather than a fabricated empty Delivery batch. The product bootstrap
+still rejects every configured Module. Linux process-control, process-execution,
+and stop-proof implementations exist, but `runtime-bootstrap.ts` does not
+construct or connect them to the reactive runtime, result coordinator, and
+external-effect evidence source. These remaining gaps still prevent product
+startup from activating a Linux Module.
 
 ### 9.4 Cancellation and timeouts
 
@@ -1883,7 +1932,7 @@ Block, claim, or Module correctness.
 
 | Condition | Required behavior |
 | --- | --- |
-| Module throws or rejects | For a Run proven not submitted under Section 7.7, classify under policy. For a submitted Run, first require the result journal and every possible external effect to have no-effect, retry-safe, or terminal evidence; otherwise retain the exact Claim as an unknown outcome. Any terminal disposition removes the matching submission record in the same Core-state update. Close run-scoped AccessLeases only when that disposition is durable and keep the actor serialized. |
+| Module throws or rejects | For a Run proven not submitted under Section 7.7, classify under policy. For a submitted Run, first require the result journal and every possible external effect to have no-effect or retry-safe evidence; a terminal effect outcome alone does not prove that repeating the Run is safe. Otherwise retain the exact Claim as an unknown outcome. Any permitted Claim disposition removes the matching submission record in the same Core-state update. Close run-scoped AccessLeases only when that disposition is durable and keep the actor serialized. |
 | Invalid BlockProposal | Commit no output Block or Delivery. A submitted Run may be negatively acknowledged or entered in dead letter only after the same external-effect evidence rule, with Claim transition and submission-record removal in one Core-state update; otherwise preserve its Claim as an unknown outcome. |
 | Missing Block or Media reference | Reject before commit; do not create a partial Block. |
 | Soft timeout | Signal cancellation; mark unhealthy; do not overlap a replacement run. |
@@ -1911,9 +1960,17 @@ names a source other than its Claim's consumer Module, and
 these rules, including an undelivered Media reference or an invalid
 crop reuse. Module result commit recovery uses `MODULE_RESULT_COMMIT_RECORD_MISSING`,
 `MODULE_RESULT_COMMIT_REPOSITORY_CONFLICT`,
+`MODULE_RESULT_PERSISTED_STATE_CONFLICT`,
+`MODULE_RESULT_OPERATION_CONTRACT_VIOLATION`,
 `MODULE_RESULT_COMMIT_DOCUMENT_INVALID`,
 `MODULE_RESULT_COMMIT_LIMIT_EXCEEDED`, `MODULE_RESULT_COMMIT_LOCKED`, and
-`MODULE_RESULT_COMMIT_IO_FAILED`. Removed names are not compatibility aliases.
+`MODULE_RESULT_COMMIT_IO_FAILED`.
+`MODULE_RESULT_PERSISTED_STATE_CONFLICT` means the persisted Claim,
+submission record, result journal, Block effect, or Delivery effect contradicts
+another persisted part of the same commit. `MODULE_RESULT_OPERATION_CONTRACT_VIOLATION`
+means an operation that must finish synchronously returned a Promise or another
+thenable value; it does not assert that persisted state is inconsistent.
+Removed names are not compatibility aliases.
 The runtime reports `RUNTIME_RECOVERY_REQUIRED` when it cannot safely determine
 a result commit, termination, failure classification, or the outcome of
 releasing a Claim. Startup reports `STARTUP_ACTIVE_CLAIM_UNRESOLVED` when an
@@ -2016,23 +2073,49 @@ matching durable process record still reports
 are disabled and no records exist. `STARTUP_MODULE_PROCESS_UNPROVEN` means an
 old process record is not `stopped` and no accepted proof showed its Module
 cgroup empty; startup never assumes a process died.
-`STARTUP_MODULE_RECORD_INCONSISTENT` means a submission record cannot be
-linked to its exact active Claim, including when its Claim is already terminal.
-`STARTUP_JOURNAL_CLAIM_INCONSISTENT` means a committed journal record exists
-beside an active Claim. A Claim preserved as an unknown outcome is reported,
-never silently acknowledged, negatively acknowledged, retried, released, or
-recorded in dead letter.
+`STARTUP_MODULE_RECORD_INCONSISTENT` means that a submission record cannot be
+linked to its exact active Claim.
+`STARTUP_CLAIM_RELEASE_UNCONFIRMED` means startup cannot synchronously confirm
+both parts of a permitted release: the exact Claim is `released` in the
+Delivery store recovery is reading, and its submission record is absent.
+`STARTUP_JOURNAL_CLAIM_INCONSISTENT` means either that result-journal recovery
+rejected a combination of journal record, Claim, submission record, Block
+effect, or output Delivery effect, or that a journal record still exists beside
+an active Claim after recovery. A Claim preserved as an unknown outcome is
+reported, never silently acknowledged, negatively acknowledged, retried,
+released, or recorded in dead letter.
 
-The current implementation performs part of this reconciliation over durable
-version 16 records and reports these codes, but it does not yet enforce the
-target Claim/submission invariant or the result-journal completion order. It
-also obtains the Module-cgroup stop proof and external-effect evidence from
-injected interfaces that no Linux backend supplies yet. While none is wired in,
-any process record that is not already `stopped` fails startup as unproven. That
-is the intended fail-closed process behavior, but it does not correct the
-version 16 ambiguity described in Section 7.7. With no Module records at all,
-which is every product-created deployment while Modules are rejected, behavior
-is unchanged.
+Malformed Core-state JSON, an invalid document schema or digest, and a
+submission record that does not match its active Claim, process record, and
+persisted input are rejected earlier by the current file-based Core-state
+store (`FileCoreStateStore`) as `CORE_STATE_DOCUMENT_INVALID`.
+`CoreStartupRecovery` is constructed only after that store opens, so those
+document errors are not converted into a `STARTUP_*` code.
+
+`FileCoreStateStore` makes each terminal Claim transition and matching
+submission record removal one Core-state update. The result coordinator
+enforces the journal order above. `CoreStartupRecovery` converts
+`MODULE_JOB_ID_INVALID`, `MODULE_JOB_RESULT_CONFLICT`,
+`MODULE_JOB_CLAIM_NOT_ACTIVE`, `MODULE_JOB_SOURCE_MISMATCH`,
+`MODULE_JOB_OUTPUT_INVALID`, `MODULE_RESULT_COMMIT_RECORD_MISSING`,
+`MODULE_RESULT_COMMIT_REPOSITORY_CONFLICT`, and
+`MODULE_RESULT_PERSISTED_STATE_CONFLICT` into
+`STARTUP_JOURNAL_CLAIM_INCONSISTENT`. It passes document, size-limit, lock,
+input/output, and synchronous-operation-contract failures through unchanged;
+those errors do not prove a persisted Claim inconsistency. Recovery also keeps
+an active version 16 Claim with a missing submission record unresolved. These
+checks do not repair the historical version 16 ambiguity described in Section
+7.7. Startup accepts Module-cgroup stop proof and external-effect evidence
+through injected interfaces. The Linux stop-proof implementation exists, but
+`runtime-bootstrap.ts` does not pass it to startup recovery. The effect-intent
+record protocol and recovery adapter (`effectIntentEvidenceSource`) also exist,
+but Dolly has no persistent product store and does not connect intent
+persistence to capability execution. The adapter is therefore not an
+authoritative recovery source and remains unwired; `runtime-bootstrap.ts`
+passes no external-effect evidence source.
+Consequently, any process record that is not already `stopped` fails product
+startup as unproven. With no Module records at all, which is every
+product-created deployment while Modules are rejected, behavior is unchanged.
 
 A runtime with `volatile` durability starts from explicitly empty state after
 process loss and reports that no restart recovery was attempted; it MUST NOT emit a
@@ -2239,7 +2322,8 @@ following cases.
 - a submitted Run whose provider/storage/tool accepts an effect and loses its
   response remains an unknown outcome, with zero negative acknowledgements,
   releases, retries, or replacement effects unless a durable query supplies
-  no-effect, retry-safe, or terminal evidence;
+  no-effect or retry-safe evidence; a terminal outcome without a separate
+  durable idempotency contract remains unresolved;
 - a direct ambient effect from an Extension fixture during initialization,
   creation, stop, or execution makes that fixture ineligible for the first
   Linux Module runner and cannot be bypassed by a missing submission record;

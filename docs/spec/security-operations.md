@@ -599,9 +599,11 @@ record, recover the result journal through the allowed `prepared` and
 `committed` states, and only then apply a permitted disposition to remaining
 Claims. A committed journal record belongs beside its exact committed Claim and
 no submission record; it is not an alternative match for a submission record.
-The current file-based Core state writer (`FileCoreStateStore`) enforces the
-complete Claim, process-record, submission-record, and persisted-input
-relationship when it opens state and at the relevant mutation boundaries.
+The current file-based Core-state store (`FileCoreStateStore`) validates every
+submission record that exists against its exact active Claim, process record,
+and persisted input when it opens state and at the submission and terminal
+mutation boundaries. It does not interpret an absent submission record as
+proof that a Run was never submitted.
 Startup reconciliation enforces the order above when its stop-proof and
 external-effect evidence sources are supplied. This enforcement cannot
 determine whether an active Claim whose submission record is missing from
@@ -657,7 +659,7 @@ operations does not satisfy this atomic comparison.
 
 Construction of evidence for this operator flow MUST reject, rather than
 truncate, more than 1,024 external-effect intents, an intent description or
-preserved-reason string longer than 8,192 UTF-8 bytes, duplicate or invalid
+the value of `preservedReason` longer than 8,192 UTF-8 bytes, duplicate or invalid
 intent IDs, or a complete evidence value larger than 1,048,576 canonical JSON
 bytes. Claim, run, Module, generation, and intent identifiers are limited to
 128 characters by the identifier grammar used by Core.

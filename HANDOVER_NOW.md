@@ -1,10 +1,11 @@
 # 当前状态与待办（接手先读这一份）
 
-写于 2026-07-26 深夜，最近一次更新为 2026-07-31，当前 HEAD 为 `119eac5`。P0-3 的 Linux
-源码复验仍绑定到 `e9d5975`，不能改标签冒充当前 HEAD；其后的 `d5acea1`、`6ea62f8`、
-`8ef9f07` 和 `e9200c5` 只提交了证据或文档。`7462046` 修复异步 Core-state update，
-`1fd90e1` 修复锁释放确认失败时继续使用不确定内存状态的问题，`4e9dae3` 收窄根入口公开的
-运行时会话，`119eac5` 裁定 Claim 与 Module submission record 的强一致性规则。上一轮所有并行
+写于 2026-07-26 深夜，最近一次更新为 2026-07-31。当前已完整验证的产品实现提交为
+`f78538b`；本文件与规范修订会提交在它之后，实际 HEAD 必须用 Git 读取。P0-3 的 Linux
+源码复验仍绑定到 `e9d5975`，不能改标签冒充当前 HEAD；其后的证据提交与实现提交也不能倒改
+历史实验的来源标签。`119eac5` 和 `8321b1c` 裁定 Claim 与 Module submission record 的规则，
+`2d5532a` 收窄发布包依赖，`1421e1b` 把 Console Claim 处置绑定到当前证据，`9624e19` 把
+结果提交绑定到同一个 FileCore，`f78538b` 在发送与恢复前核验 Module 执行证据。上一轮所有并行
 会话同时到达上限而停止，任务表随之丢失，所以这份文件是权威的接续点；下文把更早结果明确标为
 历史结果，不用追加日志的方式保留过期结论。
 
@@ -22,6 +23,12 @@ v5 的同一组 233 个 proposed-arm 案例已在 `e9d5975` 上逐案例复跑�
 这些证据仍不等于完整运行时：普通启动入口继续拒绝配置了 Module 的实例，而且产品代码还没有把
 同一个 launcher、Module control group、协议会话、Core 服务绑定和持久记录交叉绑定后再交给
 `ReactiveModuleRuntime`。当前工作应先处理下列 P0 风险，而不是把 ADR 0009 改成 Accepted。
+
+当前 Windows 工作树在 `f78538b` 上以最多 4 个 worker 跑完整默认测试：124 个测试文件通过、
+4 个按平台跳过，1570 例通过、47 例跳过；完整 TypeScript 检查退出码为 0，差异检查通过。
+第一次使用默认并发时有 5 个真实子进程或发布包用例超时；三个失败文件串行分别为 26/26、
+10/10、1/1，通过低并发完整复跑后不再失败。该结果证明当前 Windows 测试集合通过，不替代
+下文列明的 Linux 内核证据，也不证明未接入产品的 Module、OSS、网页界面或 computer-use 可用。
 
 ---
 
@@ -193,12 +200,26 @@ Linux 文件共 26/26 通过。证据、单文件补丁、逐文件 SHA-256 与�
    `populated 0` 和目录删除的证明。
    `stopModuleProcess()` 在自己的路径上稍后重新证明这些条件，不能阻止别的调用者先持久化并暴露
    一个没有证明的 `stopped`；
-4. ✓ **规范已裁定（`119eac5`），产品强制点未完成**：每条 submission record 必须精确匹配
-   active Claim；Claim 变为 `released`、`nacked`、`committed` 或 `dead-lettered` 时，必须在同一
-   Core-state update 删除匹配记录。terminal Claim 与 submission record 共存是失败关闭，不是
-   后续收集输入。成功结果顺序为 durable `prepared` journal → 幂等输出效果 → 原子
-   acknowledgement 与记录删除 → `committed` journal。当前 version 16 写接口和启动恢复仍实现
-   较弱规则，且 version 16 中 active Claim 缺记录有迁移歧义，不能自动判为 `never-submitted`；
+4. △ **规范已裁定（`119eac5`、`8321b1c`），实现已提交（`9624e19`、`f78538b`），
+   持久格式迁移仍未完成**：
+   每条 submission record 必须精确匹配 active Claim；Claim 变为 `released`、`nacked`、
+   `committed` 或 `dead-lettered` 时，必须在同一 Core-state update 删除匹配记录。terminal
+   Claim 与 submission record 共存是失败关闭，不是后续收集输入。成功结果顺序为 durable
+   `prepared` journal → 幂等输出效果 → 原子 acknowledgement 与记录删除 → `committed`
+   journal。`ReactiveModuleRuntime` 现在要求调用方在发送前持久化 submission record，并复核
+   精确 Claim、持久输入摘要和记录；无操作、错摘要、异步返回或无法复核都会在调用 Extension
+   前停止。`createModuleResultCommitCoordinator()` 只从同一个 FileCore 取得 Block、Delivery、
+   submission 和 acknowledgement 操作。但 runtime 的构造接口仍允许分别注入 Delivery、
+   submission 与 result coordinator，普通产品启动入口也继续拒绝 Module，所以尚未证明这些操作
+   与实际 actor process generation 属于同一次启动。
+   更重要的是，旧版与当前 `FileCoreStateStore` 写入规则共用 version 16 标签；active Claim
+   缺记录仍有迁移歧义，不能自动判为 `never-submitted`。两次独立审查得到的最小 version 17
+   方案是在 Core-state 顶层保存一个集合：每项是一个精确 active Claim 的五字段身份，含义是
+   “无法判断该 Run 从未获得发送授权，还是旧 writer 曾删除其 submission record”。这个集合
+   不能伪装成 submission record；其中的 Claim 必须阻断自动 release、nack、ack 和再次 submission，
+   只能由有审计记录的操作员处置与 Claim 终态在同一次 Core-state update 中清除。迁移还必须完整
+   验证旧文档、令 revision 加一、让新摘要覆盖 schema version，并允许在已有备份与源字节完全相同
+   时安全重试。启用 Module 前仍须实现并显式执行该迁移；
 5. 所有权未知时的 control-group 清理有超时，但它之前的同步 `stopping` 持久化调用没有时间上界；
    若该调用不返回，默认 `process.exit(1)` 强制点也到不了；
 6. ✓ **已修（`7462046`）**：`FileCoreStateStore.runAtomicUpdate()` 现在只接受静态返回
@@ -222,7 +243,20 @@ Linux 文件共 26/26 通过。证据、单文件补丁、逐文件 SHA-256 与�
     持久化并可能被其他代码观察到的事实；
 11. `removeModuleProcessRecord()` 删除记录后，当前 Map 不再记得该 `processGenerationId`；
     `appendModuleProcessRecord()` 可把同一标识再次落盘。ADR 0009 所称 process generation 与
-    control-group path 永不复用因此没有持久强制点，不能只依赖随机生成器或当前 Map。
+    control-group path 永不复用因此没有持久强制点，不能只依赖随机生成器或当前 Map；
+12. `f78538b` 中的 `EffectIntentJournal` 和 `effectIntentEvidenceSource` 已把外部效果记录绑定到
+    Claim 的五个身份字段，并且不会把 `terminal` 误作重试安全。但产品没有持久
+    `EffectIntentStore`，能力执行路径也没有被强制经过该记录；因此空记录和全部为 `no-effect` 的
+    记录都只能回答 `unknown`。`dolly.effect-intent/2` 还把稳定的幂等键与单次 Run 的授权关系放在
+    同一条记录里，只能安全拒绝跨重试 Run 复用。产品接入前必须把稳定效果身份与每次 Run 的授权关系
+    分开持久化或给出等价证明，不能把另一个 Claim 的记录当成本次授权。启动恢复接口当前接收的
+    `no-effect` / `retry-safe` 证据本身也不回显精确 Claim 身份；接入真实 evidence source 前必须像
+    停止证明的 `recordIdentityDigest` 一样绑定身份，防止错误适配器复用另一 Run 的安全结论。
+13. `FileCoreStateStore.updateModuleProcessRecordState()` 读取并校验旧记录后才调用可注入的 `now()`，
+    期间没有重入保护。错误或恶意 clock 可在外层 `running → stopping` 的 `now()` 中先完成嵌套
+    `running → stopped`，随后外层用陈旧快照把状态倒退为 `stopping` 并持久化。该反例目前来自
+    源码审查，精确测试未覆盖；必须先审计 FileCore 的全部 clock、标识符生成器与回调，再在真正
+    写入边界加统一重入保护和可证伪测试，不能只修这一处调用顺序。
 
 处理这些问题时不要只补单元分支：每项先在真正的跨层强制点构造会失败的反例，尤其要证明“来自另一
 次启动的会话/记录”不能被接受，以及没有停止证明时任何路径都不能写 `stopped`。
@@ -348,21 +382,120 @@ M14 重复案例。P0-1 的两个完整 manifest 也各自报 4,391 次计划执
 | 拒绝异步 Core-state update | `FileCoreStateStore.runAtomicUpdate()`、启动恢复接口 | 类型与运行时都拒绝异步回调和非 `undefined` 返回值；四类反例通过，精确测试 30/30，完整 `typecheck` exit 0 |
 | 锁释放确认失败后关闭旧 store | `FileCoreStateStore.#withMutationLock()` | 按回调是否已返回区分回调错误与释放确认错误；精确测试 53 pass、1 个平台限定 skip |
 | 根 CLI 回调不再暴露 Core 写接口 | `src/entry.ts`、CLI runtime test | 冻结的 `state/status/stop` 对象；根声明无 Core store/commit coordinator；5/5 + typecheck |
-| Claim 与 submission record 强规则 | ADR 0009、`core-runtime.md`、`security-operations.md` | 终态转换与记录删除同一次 Core-state update；terminal+record 失败关闭；version 16 歧义不得自动重试 |
+| FileCore 公开能力与失败边界 | `9624e19` 的 `FileCoreStateStore`、结果提交产品构造与故障测试 | 公开组件是冻结的空原型允许列表；持久化失败或内存/磁盘摘要不一致后要求重开；结果提交从同一个 FileCore 取得全部状态操作 |
+| Claim 与 submission record 强规则 | ADR 0009、`core-runtime.md`、`security-operations.md`、`9624e19`、`f78538b` | 终态转换与记录删除同一次 Core-state update；terminal+record 失败关闭；发送前复核 Claim、submission 与输入摘要；version 16 歧义仍不得自动重试 |
+| 当前完整 Windows 验证 | 默认 Vitest 配置，最多 4 个 worker；标准 TypeScript 检查 | 124 个测试文件通过、4 个跳过；1570 例通过、47 例跳过；TypeScript 退出码 0；无残留 Node 进程 |
 | 恢复完整 TypeScript 范围并修复 91 条诊断 | `tsconfig.json`、`package.json`、33 个测试文件 | 标准 `typecheck` exit 0；按受影响文件精确运行的用例全绿，5 个未启用的付费 live 用例明确 skipped |
 
-当前核实点：HEAD 为 `119eac5`。P0-3 Linux 复验使用的源码与 runner 仍是 `e9d5975`；其后的
-文档/证据提交为 `d5acea1`、`6ea62f8`、`8ef9f07`、`e9200c5`，产品代码修复为 `7462046` 和
-`1fd90e1`、`4e9dae3`，规范裁决为 `119eac5`。目录为 **v5、570 例、1 个 exclusive**。catalog
+当前实现核实点为 `f78538b`，远端 `main` 已同步到该实现提交；本文件与规范提交会位于其后。
+P0-3 Linux 复验使用的源码与 runner 仍是 `e9d5975`；后续提交不能冒充该实验来源。当前实现链中，
+`119eac5` / `8321b1c`
+记录规则，`2d5532a` 收窄发布包，`1421e1b` 修复 Console 处置证据，`9624e19` 修复 FileCore 与
+结果提交边界，`f78538b` 修复发送和恢复证据。目录为 **v5、570 例、1 个 exclusive**。catalog
 v5 修改了 live-Core 终止判据，所以该组必须重跑；当前 233 例 proposed-arm 选择集已重跑，但
 完整 570 例和目录声明的重复次数仍未执行。更早 catalog v3 的 P0-3 工件只作为历史运行保留。
 
 ---
 
+## 2026-07-31 公共产品审查：当前事实与启用门槛
+
+以下结论来自独立只读审查；它们区分“组件或目标文档存在”和“受支持产品入口可用”，不得把前者写成
+后者。
+
+### 网页管理界面
+
+- 当前没有可由受支持命令启动的图形界面。`AdminHttpServer` 和 `ConsoleGateway` 是 JSON /
+  WebSocket 组件，`ConsoleOperations` 只在测试夹具中装配；发布包没有网页资源或完整构造入口。
+- 当前两套浏览器会话都在回环地址设置敏感 Cookie。Cookie 不按端口隔离，同一
+  `127.0.0.1` 或 `::1` 上另一个本地服务可以接收或覆盖它；在威胁模型包含不受信任本地客户端时，
+  不能据此启用真实浏览器界面。应选择不依赖浏览器自动携带 Cookie 的凭据和一次性 WebSocket
+  票据，或受信任的独立 HTTPS 来源，并增加真实浏览器的跨端口反例。
+- Console 审计记录器仍是可选的，而且若状态修改后审计写入失败，调用方可能得到失败而操作已生效。
+  产品构造必须强制持久审计，并为不可原子提交的外部操作保存操作标识、开始记录和可查询结果。
+- `extensions/console/`、`daemon/` 和旧网页仍是未受支持的迁移材料；它们包含全接口监听、查询字符串
+  凭据、`localStorage` 凭据和未转义内容等问题，必须继续排除在发布包与产品入口之外。
+
+### Media 与对象存储
+
+- 当前受支持运行时只创建本地 Media 字节存储；没有对象存储服务（Object Storage Service，OSS）
+  配置，也没有 AccessKey（AK）、endpoint 或 bucket 的产品入口。当前 Chat 和 embedding 编码器都
+  拒绝 Media。`AliOssDirectObjectStore` 是未接入且不符合当前 `StorageAdapter` 契约的辅助实现，
+  不能用它宣称 OSS 已可用。
+- 现有辅助实现会在签名 URL 中包含裁剪查询参数与 `versionId`；这只说明依赖源码会签这些参数，
+  没有证明真实 OSS 的像素裁剪、私有 bucket、Aether 或 DashScope 实际取图成功。
+- 当前 `MediaStore` 把每个存储适配器的一份远端原始对象当作长期副本，直到整个 Media 被回收才删；
+  这与“只在模型接口需要 URL 时临时上传”的用户目标冲突。最贴近原意的待裁方向是：本地原始字节
+  始终权威；具体模型操作确实要求 URL 时才上传一个私有、带精确版本的原始对象；所有裁剪复用该
+  对象；所有相关请求有可信完成结果后删除，结果未知时保留并交给操作员处置。长期远端副本若保留，
+  必须作为另一个明确可选用途。
+- 启用前还必须：由受信适配器验证 bucket 私有和对象版本控制；明确选择并记录
+  `adapterId` / `storageRecordId`，不能取插入顺序中的第一个；提供列出和处置未知访问的产品操作；
+  文档给出包含删除和版本清理的最小权限；修正删除超时被错误分类为不可重试的问题。没有这些条件时，
+  “private”只是调用方标签，未版本化 URL 也不能保证读取到登记时的不可变字节。
+
+### 模型配置与 embedding
+
+- 当前产品配置没有模型描述或私有端点绑定入口，Module 仍被启动守卫拒绝；新的大语言模型
+  （Large Language Model，LLM）、视觉语言模型（Vision-Language Model，VLM）和 embedding
+  代码是未装配组件，不依赖用户 Aether 或 DashScope 的主要原因是产品路径尚不存在，不是通用配置
+  已经完成。
+- `enable_thinking` 不能作为通用字段。用户的 Aether `qwen3.6-27b` 缺省产生推理，但不接受该字段；
+  仓库研究又记录了该端点可用另一种 `thinking.type` 对象控制。模型描述必须声明准确的控制编码、
+  缺省行为和允许值，而不能把端点写成 `alwaysOnReasoning()`。对这个端点，只有非空
+  `reasoning_content` 能证明该次响应实际产生推理；该观察规则不能外推到返回摘要或结构化块的其他
+  Provider。
+- 当前私有端点绑定让多个 operation 共用一个 `exactUrl`。同一部署的 Chat 与 embedding 路径可能
+  被错误发往同一个 URL；绑定必须按 `(endpointId, operation)` 保存准确 URL，或明确限制一个绑定
+  只能含一个 operation。
+- 描述和配置可以声明图像 embedding，但已安装编码器、broker、能力入口和 Memory 都拒绝 Media。
+  百炼 / DashScope 图像向量化目前不可执行；只有文本 embedding 的用户必须继续正常工作。Memory
+  能力应从宿主实际解析成功的操作句柄推导，不能由 `hasEmbeddingDescriptor` 之类的用户布尔值自报。
+- 推理重放、完整工具轮次、流式响应和持久会话仍未实现。默认测试不得访问 Aether、DashScope、
+  OSS 或付费端点；真实端点测试必须显式启用、没有硬编码回退，并保存所用模型描述摘要。
+
+### Linux 服务与无图形服务器
+
+- 当前不能声称 Linux Module、后台服务或 computer-use 可用。普通运行入口拒绝 Module，发布包没有
+  生产 systemd unit、Python launcher、delegated control-group 准备或完整 runtime 装配。
+- systemd 检查只看 `PassEnvironment` / `EnvironmentFiles`，没有证明实际 Core 进程环境已删除
+  凭据；服务绑定接口也不接收 `instanceId`，不能证明合格 unit 就是当前 Dolly instance 的预定
+  unit。这两项都必须在真实 systemd 中用反向哨兵测试。
+- `terminationTimeoutMs`、`channelCloseTimeoutMs` 以及部分 control-group 等待参数没有统一验证为
+  有限、正的安全整数；`NaN`、零或负数会破坏有界终止声明。
+- 当前 headless 文档是目标契约。完整 XFCE 桌面暴露面板、应用查找器、文件管理器、终端和文件
+  选择器，模型可借此绕过“不得获得 shell、任意路径或任意应用”的应用层限制。第一个安全目标应只让
+  模型控制浏览器窗口并隐藏这些入口；若必须控制完整桌面，应把整个会话放入一次性容器或虚拟机，
+  只挂载允许的合成文件并限制网络，且与运维人员桌面分离。
+- 重启后 USTC 的软件状态未知，本轮审查未连接服务器。先重新盘点，再完成 CU0 基础设施、CU1
+  无模型确定性动作、CU2 Dolly 取消与恢复；在此之前不运行模型实验。共享服务器不能证明整机重启
+  恢复，也不能按名称前缀清理他人的容器或进程。
+
+### 公共仓库与发布包
+
+- README 和开发指南链接到本地存在但 Git 未跟踪的 `docs/takeover/project-roadmap.md`；规范索引还
+  把未跟踪的 `confirmed-user-requirements.md` 和 `.qoder/TASK_HANDOVER.md` 放在权威链顶端。公共
+  贡献者无法取得这些真源，必须先把权威需求整理到已跟踪文档并修复链接。
+- 当前 `npm pack --dry-run` 清单本身干净：82 个文件、194366 字节，`.env`、测试和文档没有进入包。
+  但 package smoke test 只提取少数文件并运行 help/version，没有真实安装、import、`init`、`run`、
+  信号、原生依赖或 Linux 权限验证。
+- README 使用 npm 安装说明，仓库只有 `pnpm-lock.yaml` 且没有 `packageManager` 固定工具版本；
+  源码安装与已发布包的路径也没有区分。公共发布前必须建立干净 Linux 安装矩阵与真实发布包流程。
+- 发布清单有 17 个运行时依赖，但当前发布的 JavaScript 除 Node.js 内置模块外只导入 `sharp`；
+  其余旧 LLM、MCP、OSS 和开发遗留依赖仍会被每个命令行用户安装。应从发布入口闭包反向生成或核对
+  运行时依赖，而不是只证明文件没有进入包。
+- `engines.node` 声称 `>=20.9.0`，但测试使用 Node.js 20.11 才提供的 `import.meta.dirname`，
+  Vite 8 又要求更高的 20.x 或 22.x；截至 2026-07-31，Node.js 20 已结束支持。公共发布前必须选择
+  受支持的 Node.js 版本、让 package metadata、锁文件和安装矩阵一致，并在最低版本真实安装验证。
+  时间敏感事实以 [Node.js 官方发布表](https://nodejs.org/en/about/previous-releases) 和
+  [`import.meta.dirname` 版本记录](https://nodejs.org/api/esm.html#importmetadirname) 为准。
+
+---
+
 ## 环境（不读这段会浪费大量时间）
 
-**C 盘 100% 满，可用 0 字节。** 占用是机器所有者自己的应用，不是本项目产生的，未做删除。
-`/tmp` 映射到 C:，所以：
+**C 盘仍极度紧张。** 本轮开始时可用 0 字节；只删除了三个可再生成且精确核对路径的
+Codex/Node 缓存目录，没有删除主运行时、历史会话、其他项目工件或用户应用。完整测试后曾测得
+约 104 MB 可用，数值会继续波动。`/tmp` 默认映射到 C:，所以：
 
 - `tsc` 崩成 `Zone Allocation failed`，**崩溃后 grep 不到 `error TS`，和零错误长得一样**；
 - vitest 报 `Tests no tests`，看着像文件里没有用例；
@@ -375,17 +508,20 @@ New-Item -ItemType Directory -Force E:\Huasushis\program\Dolly\.tmp | Out-Null
 $env:TEMP='E:\Huasushis\program\Dolly\.tmp'
 $env:TMP='E:\Huasushis\program\Dolly\.tmp'
 $env:TMPDIR='E:\Huasushis\program\Dolly\.tmp'
+$env:npm_config_cache='E:\Huasushis\program\Dolly\.tmp\npm-cache'
+$env:npm_config_logs_dir='E:\Huasushis\program\Dolly\.tmp\npm-logs'
 ```
 
 若从 Git Bash 运行，同一目录写作 `/e/Huasushis/program/Dolly/.tmp`，三个环境变量必须指向它。
 
-**不许整目录跑 vitest**：实测汇总行报 `Test Files 11 passed (11)`，而 34 个文件里
-**23 个从没跑过**。逐文件跑，核对实际用例数。
+**不要把目录路径当作 Vitest 的完整性证明**：曾有一次目录筛选只报告
+`Test Files 11 passed (11)`，而目标 34 个文件中 23 个没有运行。完整默认集合使用
+`npm.cmd test -- --maxWorkers=4`；定向验证要逐文件列出并核对实际用例数。
 
 **声称 typecheck 干净必须核对 exit code**：0 干净 / 2 有错误 / **其他值是崩溃**。
 只 grep 不看 exit code 是漏洞。
 
-**Linux 环境**：本机无（无 docker/podman/systemd，WSL 无发行版，C 盘满装不上）。
+**Linux 环境**：本机无（无 docker/podman/systemd，WSL 无发行版）；不要为能力实验在本机补装。
 `ssh ustc` 有 docker + cgroup2 + systemd 255，但 `Linger=no`——ADR 0009 的 user service
 需要 lingering，**所以 ustc 主机上直跑不成立**（提案组每例都会停在
 `CORE_SERVICE_USER_LINGERING_DISABLED → MODULE_ACTIVATION_SERVICE_UNVERIFIED`），

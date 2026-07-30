@@ -432,11 +432,12 @@ record. Recovery may mark the journal record `committed` only after verifying
 the exact result and that all required Block and output Delivery effects are
 complete; missing or contradictory effects fail closed. This ordering does not
 allow any terminal Claim with a submission record. Other terminal Claim
-dispositions require the no-send, no-effect, retry-safe, or terminal evidence
-applicable to that disposition, or an explicit audited operator disposition,
-before the same atomic Claim transition and record removal. The operator
-disposition is not evidence that repeating the Run is safe and must warn that
-release or retry can repeat an external effect.
+dispositions require no-send, no-effect, or retry-safe evidence applicable to
+that disposition, or an explicit audited operator disposition, before the same
+atomic Claim transition and record removal. A durable terminal external-effect
+outcome does not prove that repeating the Run is safe without a separate
+durable idempotency contract. The operator disposition is not retry-safety
+evidence and must warn that release or retry can repeat an external effect.
 
 A `prepared` journal record may otherwise coexist only with its exact active
 Claim and matching submission record. A `committed` journal record must match a
@@ -466,8 +467,9 @@ The required startup reconciliation order is:
    resumes under step 3; it is not an unknown outcome merely because the journal
    is not yet `committed`. When no valid recoverable result record exists,
    preserve a submitted Claim as an unknown outcome unless every possible effect
-   has durable no-effect, retry-safe, or terminal evidence or an explicit
-   audited operator disposition.
+   has durable no-effect or retry-safe evidence, or an explicit audited operator
+   disposition. A terminal effect outcome without a separate durable
+   idempotency contract remains unresolved.
 7. A `prepared` journal record with a Claim whose status is `committed` and no
    submission record may finish the verified transition described above. A
    `committed` journal record requires that same Claim status and absence of the
@@ -494,14 +496,30 @@ in-memory duplicate map is not restart evidence. Aborting a local handler proves
 only that Core stopped waiting; it does not prove that a remote operation did
 not complete.
 
+The current `EffectIntentJournal` and `effectIntentEvidenceSource` implement
+this record protocol and expose it to recovery, but no persistent product
+`EffectIntentStore` exists and no product capability execution path is required
+to write through it. An empty journal or records that are all `no-effect`
+therefore cannot prove that every possible effect for a Run was recorded; both
+remain unknown. A `terminal` outcome proves only a durable final result.
+
+The current `dolly.effect-intent/2` record puts the stable idempotency key and
+one exact Claim/Run identity in the same record. It safely rejects reusing that
+key from another retry Run, but that also means it cannot yet model both one
+stable logical effect and every Run authorized to request it. Product
+integration requires a persistent schema that represents those relationships
+separately or proves an equivalent relationship before recovery can use a
+record from another Claim.
+
 All Claim dispositions use the same evidence, not only startup recovery. A
 normal failure, timeout, cancellation, or orderly stop may negatively
 acknowledge, release, or retry a submitted Run only when the result journal and
-every possible effect have a durable no-effect, retry-safe, or terminal
-outcome. Otherwise Core preserves the exact active Claim as an unknown outcome
-for audited operator action. That operator action must be recorded with the
-exact Claim and the evidence considered, and a forced release must warn that it
-can repeat an external effect before it is confirmed.
+every possible effect have durable no-effect or retry-safe evidence. A terminal
+effect outcome alone does not prove that repeating the Run is safe. Otherwise
+Core preserves the exact active Claim as an unknown outcome for audited
+operator action. That operator action must be recorded with the exact Claim
+and the evidence considered, and a forced release must warn that it can repeat
+an external effect before it is confirmed.
 
 Ordinary `process` isolation cannot enumerate direct file, network, or
 subprocess effects made by a trusted Extension. A trusted Module that can make
@@ -644,13 +662,17 @@ Module process and submission record collections. Any active Claim remains
 unresolved because Core cannot determine whether its Run executed; the
 migration's refusal to infer an outcome is its safety property.
 
-The current version 16 implementation does not enforce the Claim and submission
-record invariant above at every mutation boundary: it permits independent
-record removal and later collection beside a terminal Claim. A future migration
-MUST NOT interpret an active Claim with no version 16 submission record as proof
-that the Run was never submitted. It must keep the Claim unresolved until
-durable evidence or an audited operator action establishes an explicit
-disposition.
+Earlier version 16 writers did not enforce the Claim and submission record
+invariant above at every mutation boundary: they permitted independent record
+removal and later collection beside a terminal Claim. The current file-based
+Core-state store (`FileCoreStateStore`) makes the terminal Claim transition and
+matching record removal one Core-state update, rejects direct terminal Delivery
+methods on its public store, and rejects a terminal Claim beside a submission
+record. Because both implementations use the same version 16 label, a future
+migration MUST NOT interpret an active Claim with no version 16 submission
+record as proof that the Run was never submitted. It must keep the Claim
+unresolved until durable evidence or an audited operator action establishes an
+explicit disposition.
 Before Module activation, Dolly MUST select a new Core-state schema version and
 an explicit migration that enforces the invariant. This decision does not define
 that version's fields. The Linux service validation and required failure tests
