@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { BlockStore, type BlockProposal } from "../../../src/core/block-store.js";
-import { DeliveryStore, type DeliveryClaim } from "../../../src/core/delivery-store.js";
+import {
+  DeliveryStore,
+  type DeliveryClaim,
+  type DeliveryClaimIdentity,
+} from "../../../src/core/delivery-store.js";
+import type { ModuleSubmissionRecord } from "../../../src/core/module-process-records.js";
 import {
   InMemoryModuleResultCommitRepository,
   ModuleResultCommitCoordinator,
@@ -25,10 +30,27 @@ import {
   ReactiveModuleRuntime,
   type ReactiveModuleInput,
   type ReactiveModuleResult,
+  type ReactiveModuleRuntimeOptions,
   type ReactiveModuleTickResult,
 } from "../../../src/core/reactive-module-runtime.js";
 
 const NOW = "2026-07-26T00:00:00.000Z";
+
+function submissionForClaim(
+  claim: DeliveryClaimIdentity & { readonly inputDigest: string },
+): ModuleSubmissionRecord {
+  return {
+    schemaVersion: "dolly.module-submission-record/1",
+    moduleJobId: claim.moduleJobId,
+    claimToken: claim.claimToken,
+    runId: claim.runId,
+    attempt: claim.attempt,
+    moduleGenerationId: claim.moduleGenerationId,
+    processGenerationId: `${claim.moduleGenerationId}-process`,
+    inputDigest: claim.inputDigest,
+    createdAt: NOW,
+  };
+}
 
 interface FakeTimerState {
   readonly id: number;
@@ -1382,9 +1404,24 @@ describe("CORE scheduler over the real Delivery store", () => {
     deliveries.createPage("middle");
     deliveries.registerConsumer("input", "producer", "from-now");
     deliveries.registerConsumer("middle", "sink", "from-now");
+    const submissions = new Map<string, ModuleSubmissionRecord>();
+    const runtimeDeliveries: ReactiveModuleRuntimeOptions["deliveries"] = {
+      validateClaimPages: deliveries.validateClaimPages.bind(deliveries),
+      validateOutputPages: deliveries.validateOutputPages.bind(deliveries),
+      claim: deliveries.claim.bind(deliveries),
+      flushPersistence: deliveries.flushPersistence.bind(deliveries),
+      inspectClaim: deliveries.inspectClaim.bind(deliveries),
+      inspectClaimInput: deliveries.inspectClaimInput.bind(deliveries),
+    };
     const commits = new ModuleResultCommitCoordinator({
       blocks,
       deliveries,
+      getModuleSubmissionRecord: (runId) => submissions.get(runId),
+      acknowledgeDeliveryClaim: (identity) => {
+        const result = deliveries.ack(identity);
+        submissions.delete(identity.runId);
+        return result;
+      },
       repository: new InMemoryModuleResultCommitRepository(),
       now: () => NOW,
     });
@@ -1403,7 +1440,21 @@ describe("CORE scheduler over the real Delivery store", () => {
       terminationTimeoutMs: 1_000,
       maxRunsPerGeneration: 100,
       maxGenerations: 8,
-      deliveries,
+      deliveries: runtimeDeliveries,
+      persistModuleSubmission: (request) => {
+        submissions.set(request.runId, submissionForClaim(request));
+      },
+      releaseDeliveryClaim: (identity) => {
+        const result = deliveries.releaseClaim(identity);
+        submissions.delete(identity.runId);
+        return result;
+      },
+      negativelyAcknowledgeDeliveryClaim: (request) => {
+        const result = deliveries.nack(request);
+        submissions.delete(request.runId);
+        return result;
+      },
+      getModuleSubmissionRecord: (runId) => submissions.get(runId),
       commits,
       nextModuleGenerationId: () => `generation-${++generation}`,
       monotonicNow: () => 1,
@@ -1411,10 +1462,15 @@ describe("CORE scheduler over the real Delivery store", () => {
         isolation: "process" as const,
         start: async () => undefined,
         terminate: async () => undefined,
-        execute: async (): Promise<ReactiveModuleResult> => ({
-          schemaVersion: "dolly.module-result/1",
-          blockProposal: proposal("produced"),
-        }),
+        execute: async (_input, context): Promise<ReactiveModuleResult> => {
+          if (!submissions.has(context.runId)) {
+            throw new Error("The submitted Module Run has no persisted submission");
+          }
+          return {
+            schemaVersion: "dolly.module-result/1",
+            blockProposal: proposal("produced"),
+          };
+        },
       }),
       classifyFailure: (failure) => ({ code: failure.code, retryable: true }),
     });

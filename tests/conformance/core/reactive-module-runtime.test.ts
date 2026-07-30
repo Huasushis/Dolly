@@ -1,6 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import { BlockStore, type BlockProposal } from "../../../src/core/block-store.js";
-import { DeliveryStore, type FailureClassification } from "../../../src/core/delivery-store.js";
+import type {
+  ExternalEffectEvidence,
+  ExternalEffectEvidenceSource,
+} from "../../../src/core/core-startup-recovery.js";
+import {
+  DeliveryClaimPersistenceUnconfirmedError,
+  DeliveryStore,
+  type DeliveryClaim,
+  type FailureClassification,
+} from "../../../src/core/delivery-store.js";
+import type { ModuleSubmissionRecord } from "../../../src/core/module-process-records.js";
 import {
   InMemoryModuleResultCommitRepository,
   ModuleResultCommitCoordinator,
@@ -11,6 +21,7 @@ import {
   type ReactiveModuleFailure,
   type ReactiveModuleInput,
   type ReactiveModuleResult,
+  type ReactiveModuleRuntimeOptions,
 } from "../../../src/core/reactive-module-runtime.js";
 import type { ModuleExecutor } from "../../../src/core/module-actor.js";
 
@@ -41,7 +52,25 @@ interface HarnessOptions {
   ) => ModuleExecutor<ReactiveModuleInput, ReactiveModuleResult>;
   readonly afterEffect?: (event: ModuleResultCommitHookEvent) => void | Promise<void>;
   readonly classifyFailure?: (failure: ReactiveModuleFailure) => FailureClassification;
-  readonly wrapDeliveries?: (deliveries: DeliveryStore) => DeliveryStore;
+  readonly wrapDeliveries?: (
+    deliveries: DeliveryStore,
+  ) => ReactiveModuleRuntimeOptions["deliveries"];
+  readonly wrapReleaseDeliveryClaim?: (
+    releaseDeliveryClaim: ReactiveModuleRuntimeOptions["releaseDeliveryClaim"],
+    deliveries: DeliveryStore,
+    submissionRecords: Map<string, ModuleSubmissionRecord>,
+  ) => ReactiveModuleRuntimeOptions["releaseDeliveryClaim"];
+  readonly wrapNegativelyAcknowledgeDeliveryClaim?: (
+    negativelyAcknowledgeDeliveryClaim:
+      ReactiveModuleRuntimeOptions["negativelyAcknowledgeDeliveryClaim"],
+    deliveries: DeliveryStore,
+    submissionRecords: Map<string, ModuleSubmissionRecord>,
+  ) => ReactiveModuleRuntimeOptions["negativelyAcknowledgeDeliveryClaim"];
+  readonly wrapPersistModuleSubmission?: (
+    persistModuleSubmission: ReactiveModuleRuntimeOptions["persistModuleSubmission"],
+    submissionRecords: Map<string, ModuleSubmissionRecord>,
+  ) => ReactiveModuleRuntimeOptions["persistModuleSubmission"];
+  readonly reportDeletedSubmissionAsPresent?: boolean;
   readonly outputPageIds?: readonly string[];
   readonly maxResultBytes?: number;
   readonly executionTimeoutMs?: number;
@@ -51,6 +80,8 @@ interface HarnessOptions {
   /** Unit-test executors simulate the process-isolation contract by default. */
   readonly simulateProcessIsolation?: boolean;
   readonly declaredExternalEffects?: "none" | "core-capabilities-only";
+  /** `null` deliberately leaves the product evidence source unconfigured. */
+  readonly externalEffectEvidence?: ExternalEffectEvidenceSource | null;
 }
 
 function createHarness(options: HarnessOptions) {
@@ -74,9 +105,52 @@ function createHarness(options: HarnessOptions) {
   const inputBlock = blocks.commit(proposal("input"), { kind: "external", id: "console" });
   deliveries.append("input", inputBlock.id);
   const repository = new InMemoryModuleResultCommitRepository();
+  const submissionRecords = new Map<string, ModuleSubmissionRecord>();
+  const submittedRecords = new Map<string, ModuleSubmissionRecord>();
+  const persistModuleSubmission: ReactiveModuleRuntimeOptions["persistModuleSubmission"] = (
+    request,
+  ): void => {
+    const submission: ModuleSubmissionRecord = {
+      schemaVersion: "dolly.module-submission-record/1",
+      moduleJobId: request.moduleJobId,
+      claimToken: request.claimToken,
+      runId: request.runId,
+      attempt: request.attempt,
+      moduleGenerationId: request.moduleGenerationId,
+      processGenerationId: "process-generation-unit-test-1",
+      inputDigest: request.inputDigest,
+      createdAt: NOW,
+    };
+    submissionRecords.set(request.runId, submission);
+    submittedRecords.set(request.runId, submission);
+  };
+  const removeSubmissionAfterTerminalClaim = (
+    identity: Parameters<DeliveryStore["inspectClaim"]>[0],
+    expectedStatuses: readonly ReturnType<DeliveryStore["inspectClaim"]>["status"][],
+  ): void => {
+    const descriptor = deliveries.inspectClaim(identity);
+    if (expectedStatuses.includes(descriptor.status)) {
+      submissionRecords.delete(identity.runId);
+    }
+  };
   const commits = new ModuleResultCommitCoordinator({
     blocks,
     deliveries,
+    acknowledgeDeliveryClaim: (identity) => {
+      try {
+        const result = deliveries.ack(identity);
+        submissionRecords.delete(identity.runId);
+        return result;
+      } catch (error) {
+        try {
+          removeSubmissionAfterTerminalClaim(identity, ["committed"]);
+        } catch {
+          // The test store cannot confirm that its terminal mutation persisted.
+        }
+        throw error;
+      }
+    },
+    getModuleSubmissionRecord: (runId) => submissionRecords.get(runId),
     repository,
     now: () => NOW,
     ...(options.afterEffect === undefined ? {} : { afterEffect: options.afterEffect }),
@@ -87,7 +161,66 @@ function createHarness(options: HarnessOptions) {
       code: failure.code,
       retryable: failure.stage !== "result-rejected-before-prepare",
     }));
-  const runtimeDeliveries = options.wrapDeliveries?.(deliveries) ?? deliveries;
+  const configuredDeliveries = options.wrapDeliveries?.(deliveries) ?? deliveries;
+  const runtimeDeliveries: ReactiveModuleRuntimeOptions["deliveries"] = {
+    validateClaimPages: configuredDeliveries.validateClaimPages.bind(configuredDeliveries),
+    validateOutputPages: configuredDeliveries.validateOutputPages.bind(configuredDeliveries),
+    claim: (request) => configuredDeliveries.claim(request),
+    flushPersistence: () => configuredDeliveries.flushPersistence(),
+    inspectClaim: (request) => configuredDeliveries.inspectClaim(request),
+    inspectClaimInput: (request) =>
+      configuredDeliveries.inspectClaimInput(request),
+  };
+  const persistSubmission = vi.fn(
+    options.wrapPersistModuleSubmission?.(
+      persistModuleSubmission,
+      submissionRecords,
+    ) ?? persistModuleSubmission,
+  );
+  const releaseClaim = (identity: Parameters<DeliveryStore["releaseClaim"]>[0]) => {
+    try {
+      const result = deliveries.releaseClaim(identity);
+      submissionRecords.delete(identity.runId);
+      return result;
+    } catch (error) {
+      try {
+        removeSubmissionAfterTerminalClaim(identity, ["released"]);
+      } catch {
+        // The test store cannot confirm that its terminal mutation persisted.
+      }
+      throw error;
+    }
+  };
+  const releaseDeliveryClaim = vi.fn(
+    options.wrapReleaseDeliveryClaim?.(
+      releaseClaim,
+      deliveries,
+      submissionRecords,
+    ) ?? releaseClaim,
+  );
+  const negativelyAcknowledgeClaim = (
+    request: Parameters<DeliveryStore["nack"]>[0],
+  ) => {
+    try {
+      const result = deliveries.nack(request);
+      submissionRecords.delete(request.runId);
+      return result;
+    } catch (error) {
+      try {
+        removeSubmissionAfterTerminalClaim(request, ["nacked", "dead-lettered"]);
+      } catch {
+        // The test store cannot confirm that its terminal mutation persisted.
+      }
+      throw error;
+    }
+  };
+  const negativelyAcknowledgeDeliveryClaim = vi.fn(
+    options.wrapNegativelyAcknowledgeDeliveryClaim?.(
+      negativelyAcknowledgeClaim,
+      deliveries,
+      submissionRecords,
+    ) ?? negativelyAcknowledgeClaim,
+  );
   const createExecutor =
     options.simulateProcessIsolation === false
       ? options.createExecutor
@@ -97,6 +230,14 @@ function createHarness(options: HarnessOptions) {
           terminate: async () => undefined,
           ...options.createExecutor(moduleGenerationId),
         });
+  const externalEffectEvidence =
+    options.externalEffectEvidence === undefined
+      ? {
+          inspectRunEffects: async (): Promise<ExternalEffectEvidence> => ({
+            kind: "no-effect",
+          }),
+        }
+      : options.externalEffectEvidence;
   const runtime = new ReactiveModuleRuntime({
     moduleId: "worker",
     initialModuleGenerationId: "generation-1",
@@ -113,6 +254,13 @@ function createHarness(options: HarnessOptions) {
     maxRunsPerGeneration: 100,
     maxGenerations: 8,
     deliveries: runtimeDeliveries,
+    persistModuleSubmission: persistSubmission,
+    releaseDeliveryClaim,
+    negativelyAcknowledgeDeliveryClaim,
+    getModuleSubmissionRecord: (runId) =>
+      options.reportDeletedSubmissionAsPresent === true
+        ? submittedRecords.get(runId)
+        : submissionRecords.get(runId),
     commits,
     nextModuleGenerationId: () => `generation-${++generation}`,
     monotonicNow: () => 1,
@@ -121,8 +269,34 @@ function createHarness(options: HarnessOptions) {
     ...(options.declaredExternalEffects === undefined
       ? {}
       : { declaredExternalEffects: options.declaredExternalEffects }),
+    ...(externalEffectEvidence === null ? {} : { externalEffectEvidence }),
   });
-  return { blocks, deliveries, repository, commits, runtime };
+  return {
+    blocks,
+    deliveries,
+    runtimeDeliveries,
+    repository,
+    submissionRecords,
+    persistModuleSubmission: persistSubmission,
+    commits,
+    releaseDeliveryClaim,
+    negativelyAcknowledgeDeliveryClaim,
+    externalEffectEvidence,
+    runtime,
+  };
+}
+
+function readAndClaimDeliveries(
+  deliveries: DeliveryStore,
+): ReactiveModuleRuntimeOptions["deliveries"] {
+  return {
+    validateClaimPages: deliveries.validateClaimPages.bind(deliveries),
+    validateOutputPages: deliveries.validateOutputPages.bind(deliveries),
+    claim: deliveries.claim.bind(deliveries),
+    flushPersistence: deliveries.flushPersistence.bind(deliveries),
+    inspectClaim: deliveries.inspectClaim.bind(deliveries),
+    inspectClaimInput: deliveries.inspectClaimInput.bind(deliveries),
+  };
 }
 
 async function startedHarness(options: HarnessOptions) {
@@ -152,6 +326,247 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
       expect.objectContaining({ code: "RUNTIME_CONFIGURATION_INVALID" }),
     );
     expect(createExecutor).not.toHaveBeenCalled();
+  });
+
+  it("uses the negative-acknowledgement callback without terminal Delivery methods", async () => {
+    const harness = await startedHarness({
+      wrapDeliveries: readAndClaimDeliveries,
+      createExecutor: () => ({
+        execute: async () => Promise.reject(new Error("execution failed")),
+      }),
+    });
+
+    expect(harness.runtimeDeliveries).not.toHaveProperty("ack");
+    expect(harness.runtimeDeliveries).not.toHaveProperty("releaseClaim");
+    expect(harness.runtimeDeliveries).not.toHaveProperty("nack");
+    await expect(harness.runtime.tick()).resolves.toMatchObject({
+      status: "retry-scheduled",
+      failure: { code: "MODULE_EXECUTION_FAILED", retryable: true },
+    });
+    expect(harness.negativelyAcknowledgeDeliveryClaim).toHaveBeenCalledOnce();
+    expect(harness.releaseDeliveryClaim).not.toHaveBeenCalled();
+    await harness.runtime.stop();
+  });
+
+  it("uses the release callback without terminal Delivery methods", async () => {
+    const executionStarted = deferred<void>();
+    const execution = deferred<ReactiveModuleResult>();
+    const harness = await startedHarness({
+      wrapDeliveries: readAndClaimDeliveries,
+      createExecutor: () => ({
+        execute: async () => {
+          executionStarted.resolve();
+          return execution.promise;
+        },
+        cancel: () => execution.reject(new Error("shutdown")),
+      }),
+    });
+
+    const tick = harness.runtime.tick();
+    await executionStarted.promise;
+    const stop = harness.runtime.stop();
+    await expect(tick).resolves.toMatchObject({
+      status: "cancelled",
+      reason: "shutdown",
+    });
+    await expect(stop).resolves.toBeUndefined();
+    expect(harness.releaseDeliveryClaim).toHaveBeenCalledOnce();
+    expect(harness.negativelyAcknowledgeDeliveryClaim).not.toHaveBeenCalled();
+  });
+
+  it("does not accept a release callback result while the exact Claim remains active", async () => {
+    const executionStarted = deferred<void>();
+    const execution = deferred<ReactiveModuleResult>();
+    const harness = await startedHarness({
+      wrapDeliveries: readAndClaimDeliveries,
+      wrapReleaseDeliveryClaim: () => () => "released",
+      createExecutor: () => ({
+        execute: async () => {
+          executionStarted.resolve();
+          return execution.promise;
+        },
+        cancel: () => execution.reject(new Error("shutdown")),
+      }),
+    });
+
+    const tick = harness.runtime.tick();
+    await executionStarted.promise;
+    const stop = harness.runtime.stop();
+    await expect(tick).resolves.toMatchObject({
+      status: "cancelled",
+      reason: "shutdown",
+    });
+    await expect(stop).rejects.toMatchObject({
+      code: "RUNTIME_RECOVERY_REQUIRED",
+    });
+    expect(harness.deliveries.listActiveClaims()).toEqual([
+      expect.objectContaining({ status: "active" }),
+    ]);
+  });
+
+  it("does not accept a raw Claim release that leaves the submission record", async () => {
+    const executionStarted = deferred<void>();
+    const execution = deferred<ReactiveModuleResult>();
+    const harness = await startedHarness({
+      wrapReleaseDeliveryClaim: (_releaseDeliveryClaim, deliveries) =>
+        (identity) => deliveries.releaseClaim(identity),
+      createExecutor: () => ({
+        execute: async () => {
+          executionStarted.resolve();
+          return execution.promise;
+        },
+        cancel: () => execution.reject(new Error("shutdown")),
+      }),
+    });
+
+    const tick = harness.runtime.tick();
+    await executionStarted.promise;
+    const stop = harness.runtime.stop();
+    const cancelled = await tick;
+    expect(cancelled).toMatchObject({ status: "cancelled" });
+    if (cancelled.status !== "cancelled") throw new Error("expected cancellation");
+    await expect(stop).rejects.toMatchObject({ code: "RUNTIME_RECOVERY_REQUIRED" });
+    expect(harness.deliveries.inspectClaim(cancelled).status).toBe("released");
+    expect(harness.submissionRecords.get(cancelled.runId)).toBeDefined();
+  });
+
+  it("does not accept submission deletion while the exact Claim remains active", async () => {
+    const executionStarted = deferred<void>();
+    const execution = deferred<ReactiveModuleResult>();
+    const harness = await startedHarness({
+      wrapReleaseDeliveryClaim: (
+        _releaseDeliveryClaim,
+        _deliveries,
+        submissionRecords,
+      ) => (identity) => {
+        submissionRecords.delete(identity.runId);
+        return "released";
+      },
+      createExecutor: () => ({
+        execute: async () => {
+          executionStarted.resolve();
+          return execution.promise;
+        },
+        cancel: () => execution.reject(new Error("shutdown")),
+      }),
+    });
+
+    const tick = harness.runtime.tick();
+    await executionStarted.promise;
+    const stop = harness.runtime.stop();
+    const cancelled = await tick;
+    expect(cancelled).toMatchObject({ status: "cancelled" });
+    if (cancelled.status !== "cancelled") throw new Error("expected cancellation");
+    await expect(stop).rejects.toMatchObject({ code: "RUNTIME_RECOVERY_REQUIRED" });
+    expect(harness.deliveries.inspectClaim(cancelled).status).toBe("active");
+    expect(harness.submissionRecords.get(cancelled.runId)).toBeUndefined();
+  });
+
+  it("rejects a Promise-like release result even after both state changes complete", async () => {
+    const executionStarted = deferred<void>();
+    const execution = deferred<ReactiveModuleResult>();
+    const harness = await startedHarness({
+      wrapReleaseDeliveryClaim:
+        (releaseDeliveryClaim) =>
+        ((identity: Parameters<
+          ReactiveModuleRuntimeOptions["releaseDeliveryClaim"]
+        >[0]) => {
+          releaseDeliveryClaim(identity);
+          return { then: () => undefined };
+        }) as unknown as ReactiveModuleRuntimeOptions["releaseDeliveryClaim"],
+      createExecutor: () => ({
+        execute: async () => {
+          executionStarted.resolve();
+          return execution.promise;
+        },
+        cancel: () => execution.reject(new Error("shutdown")),
+      }),
+    });
+
+    const tick = harness.runtime.tick();
+    await executionStarted.promise;
+    const stop = harness.runtime.stop();
+    const cancelled = await tick;
+    expect(cancelled).toMatchObject({ status: "cancelled" });
+    if (cancelled.status !== "cancelled") throw new Error("expected cancellation");
+    await expect(stop).rejects.toMatchObject({ code: "RUNTIME_RECOVERY_REQUIRED" });
+    expect(harness.deliveries.inspectClaim(cancelled).status).toBe("released");
+    expect(harness.submissionRecords.get(cancelled.runId)).toBeUndefined();
+  });
+
+  it("does not accept a raw negative acknowledgement that leaves the submission record", async () => {
+    const harness = await startedHarness({
+      wrapNegativelyAcknowledgeDeliveryClaim: (
+        _negativelyAcknowledgeDeliveryClaim,
+        deliveries,
+      ) => (request) => deliveries.nack(request),
+      createExecutor: () => ({
+        execute: async () => Promise.reject(new Error("execution failed")),
+      }),
+    });
+
+    const result = await harness.runtime.tick();
+    expect(result).toMatchObject({
+      status: "recovery-required",
+      reason: "nack-outcome-unknown",
+    });
+    if (result.status !== "recovery-required") {
+      throw new Error("expected recovery");
+    }
+    expect(harness.deliveries.inspectClaim(result).status).toBe("nacked");
+    expect(harness.submissionRecords.get(result.runId)).toBeDefined();
+  });
+
+  it("does not accept submission deletion while a negatively acknowledged Claim remains active", async () => {
+    const harness = await startedHarness({
+      wrapNegativelyAcknowledgeDeliveryClaim: (
+        _negativelyAcknowledgeDeliveryClaim,
+        _deliveries,
+        submissionRecords,
+      ) => (request) => {
+        submissionRecords.delete(request.runId);
+        return "retry-scheduled";
+      },
+      createExecutor: () => ({
+        execute: async () => Promise.reject(new Error("execution failed")),
+      }),
+    });
+
+    const result = await harness.runtime.tick();
+    expect(result).toMatchObject({
+      status: "recovery-required",
+      reason: "nack-outcome-unknown",
+    });
+    if (result.status !== "recovery-required") {
+      throw new Error("expected recovery");
+    }
+    expect(harness.deliveries.inspectClaim(result).status).toBe("active");
+    expect(harness.submissionRecords.get(result.runId)).toBeUndefined();
+  });
+
+  it("rejects a Promise returned after both negative-acknowledgement state changes complete", async () => {
+    const harness = await startedHarness({
+      wrapDeliveries: readAndClaimDeliveries,
+      wrapNegativelyAcknowledgeDeliveryClaim:
+        (negativelyAcknowledgeDeliveryClaim) =>
+        ((request: Parameters<
+          ReactiveModuleRuntimeOptions["negativelyAcknowledgeDeliveryClaim"]
+        >[0]) => {
+          const status = negativelyAcknowledgeDeliveryClaim(request);
+          return Promise.resolve(status);
+        }) as unknown as ReactiveModuleRuntimeOptions["negativelyAcknowledgeDeliveryClaim"],
+      createExecutor: () => ({
+        execute: async () => Promise.reject(new Error("execution failed")),
+      }),
+    });
+
+    await expect(harness.runtime.tick()).resolves.toMatchObject({
+      status: "recovery-required",
+      reason: "nack-outcome-unknown",
+    });
+    const claim = harness.deliveries.snapshot().claims[0];
+    expect(claim?.status).toBe("nacked");
+    expect(claim && harness.submissionRecords.get(claim.runId)).toBeUndefined();
   });
 
   it("rejects a Promise-returning process factory before claiming or executing", async () => {
@@ -316,6 +731,118 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     await harness.runtime.stop();
   });
 
+  it("commits a no-Block result without targeting configured output Pages", async () => {
+    const harness = await startedHarness({
+      outputPageIds: ["output"],
+      createExecutor: () => ({
+        execute: async () => ({
+          schemaVersion: "dolly.module-result/1",
+        }),
+      }),
+    });
+
+    const result = await harness.runtime.tick();
+    expect(result).toMatchObject({
+      status: "committed",
+      record: {
+        state: "committed",
+        outputPageIds: [],
+        outputDeliveries: [],
+      },
+    });
+    if (result.status !== "committed") throw new Error("expected committed result");
+    expect(result.record.blockId).toBeUndefined();
+    expect(harness.deliveries.claim({
+      consumerId: "sink",
+      pageIds: ["output"],
+      moduleGenerationId: "sink-generation-1",
+      maxCount: 1,
+      maxBytes: 1024,
+    })).toBeNull();
+    await harness.runtime.stop();
+  });
+
+  it("does not report a commit while its submission reader still reports the deleted record", async () => {
+    const harness = await startedHarness({
+      reportDeletedSubmissionAsPresent: true,
+      createExecutor: () => ({
+        execute: async () => ({
+          schemaVersion: "dolly.module-result/1",
+          blockProposal: proposal("committed with stale submission reader"),
+        }),
+      }),
+    });
+
+    const result = await harness.runtime.tick();
+    expect(result).toMatchObject({
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    });
+    if (result.status !== "recovery-required") {
+      throw new Error("expected commit recovery");
+    }
+    expect(harness.repository.get(result.moduleJobId)).toMatchObject({
+      state: "committed",
+    });
+    expect(harness.deliveries.inspectClaim(result).status).toBe("committed");
+    expect(harness.submissionRecords.get(result.runId)).toBeUndefined();
+
+    await expect(harness.runtime.recover()).resolves.toMatchObject({
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    });
+    await expect(harness.runtime.stop()).rejects.toMatchObject({
+      code: "RUNTIME_RECOVERY_REQUIRED",
+    });
+  });
+
+  it("does not trust a matching result journal when its own Delivery store still reports an active Claim", async () => {
+    const harness = await startedHarness({
+      wrapDeliveries: (deliveries) => {
+        let activeDescriptor: ReturnType<DeliveryStore["inspectClaim"]> | undefined;
+        return {
+          ...readAndClaimDeliveries(deliveries),
+          claim: (request) => {
+            const claim = deliveries.claim(request);
+            if (claim) activeDescriptor = deliveries.inspectClaim(claim);
+            return claim;
+          },
+          inspectClaim: (identity) =>
+            activeDescriptor ?? deliveries.inspectClaim(identity),
+        };
+      },
+      createExecutor: () => ({
+        execute: async () => ({
+          schemaVersion: "dolly.module-result/1",
+          blockProposal: proposal("committed in a different Delivery store"),
+        }),
+      }),
+    });
+
+    const uncertain = await harness.runtime.tick();
+    expect(uncertain).toMatchObject({
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    });
+    if (uncertain.status !== "recovery-required") {
+      throw new Error("Expected the runtime Delivery store to prevent commit confirmation");
+    }
+    expect(harness.repository.get(uncertain.moduleJobId)).toMatchObject({
+      state: "committed",
+    });
+    expect(harness.deliveries.inspectClaim(uncertain).status).toBe("committed");
+    expect(harness.runtimeDeliveries.inspectClaim(uncertain).status).toBe("active");
+
+    await expect(harness.runtime.recover()).resolves.toMatchObject({
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+      runId: uncertain.runId,
+    });
+    await expect(harness.runtime.stop()).rejects.toMatchObject({
+      code: "RUNTIME_RECOVERY_REQUIRED",
+    });
+  });
+
   it("waits for an unconfirmed Claim persistence write before executing its exact first attempt", async () => {
     let persistenceAvailable = false;
     let persistenceWrites = 0;
@@ -409,6 +936,71 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     await harness.runtime.stop();
   });
 
+  it("does not send a Run when Claim persistence recovers without an exact submission record", async () => {
+    let persistenceAvailable = false;
+    const execute = vi.fn(async () => ({
+      schemaVersion: "dolly.module-result/1" as const,
+    }));
+    const harness = await startedHarness({
+      wrapPersistModuleSubmission: () => () => undefined,
+      createExecutor: () => ({ execute }),
+    });
+    harness.deliveries.setMutationObserver(() => {
+      if (!persistenceAvailable) throw new Error("simulated persistence failure");
+    });
+
+    const claimUnconfirmed = await harness.runtime.tick();
+    expect(claimUnconfirmed).toMatchObject({
+      status: "recovery-required",
+      reason: "claim-persistence-unconfirmed",
+    });
+    if (claimUnconfirmed.status !== "recovery-required") {
+      throw new Error("expected Claim persistence recovery");
+    }
+    expect(execute).not.toHaveBeenCalled();
+
+    persistenceAvailable = true;
+    await expect(harness.runtime.recover()).resolves.toMatchObject({
+      status: "recovery-required",
+      reason: "submission-persistence-unconfirmed",
+      runId: claimUnconfirmed.runId,
+      attempt: claimUnconfirmed.attempt,
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(harness.submissionRecords.get(claimUnconfirmed.runId)).toBeUndefined();
+    expect(harness.deliveries.inspectClaim(claimUnconfirmed).status).toBe("active");
+  });
+
+  it("does not send a Run when the persisted submission has the wrong input digest", async () => {
+    const execute = vi.fn(async () => ({
+      schemaVersion: "dolly.module-result/1" as const,
+    }));
+    const harness = await startedHarness({
+      wrapPersistModuleSubmission:
+        (persistModuleSubmission, submissionRecords) => (request) => {
+          persistModuleSubmission(request);
+          const submission = submissionRecords.get(request.runId);
+          if (!submission) throw new Error("expected submission");
+          submissionRecords.set(request.runId, {
+            ...submission,
+            inputDigest: `sha256:${"f".repeat(64)}`,
+          });
+        },
+      createExecutor: () => ({ execute }),
+    });
+
+    const result = await harness.runtime.tick();
+    expect(result).toMatchObject({
+      status: "recovery-required",
+      reason: "submission-persistence-unconfirmed",
+    });
+    expect(execute).not.toHaveBeenCalled();
+    if (result.status !== "recovery-required") {
+      throw new Error("expected submission persistence recovery");
+    }
+    expect(harness.deliveries.inspectClaim(result).status).toBe("active");
+  });
+
   it("does not treat another persisted active Claim as an unconfirmed Claim", async () => {
     const execute = vi.fn(async () => ({ schemaVersion: "dolly.module-result/1" as const }));
     const harness = await startedHarness({ createExecutor: () => ({ execute }) });
@@ -474,6 +1066,48 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
       stage: "module-execution",
       code: "MODULE_EXECUTION_FAILED",
     });
+    await harness.runtime.stop();
+  });
+
+  it("preserves a soft timeout until persistent evidence permits negative acknowledgement", async () => {
+    const executionStarted = deferred<void>();
+    const execution = deferred<ReactiveModuleResult>();
+    let evidence: ExternalEffectEvidence = {
+      kind: "unknown",
+      reason: "provider outcome is not available",
+    };
+    const inspectRunEffects = vi.fn(async () => evidence);
+    const harness = await startedHarness({
+      declaredExternalEffects: "core-capabilities-only",
+      externalEffectEvidence: { inspectRunEffects },
+      createExecutor: () => ({
+        execute: async () => {
+          executionStarted.resolve();
+          return execution.promise;
+        },
+        cancel: () => execution.reject(new Error("cancelled after timeout")),
+      }),
+    });
+
+    const tick = harness.runtime.tick();
+    await executionStarted.promise;
+    const activeRun = harness.runtime.activeRun;
+    if (!activeRun) throw new Error("expected an active Run");
+    expect(harness.runtime.softTimeout(activeRun.runId)).toBe(
+      "cancellation-requested",
+    );
+    await expect(tick).resolves.toMatchObject({
+      status: "recovery-required",
+      reason: "external-effect-outcome-unknown",
+    });
+    expect(harness.negativelyAcknowledgeDeliveryClaim).not.toHaveBeenCalled();
+
+    evidence = { kind: "no-effect" };
+    await expect(harness.runtime.recover()).resolves.toMatchObject({
+      status: "retry-scheduled",
+      failure: { code: "MODULE_TIMED_OUT", retryable: true },
+    });
+    expect(inspectRunEffects).toHaveBeenCalledTimes(2);
     await harness.runtime.stop();
   });
 
@@ -603,6 +1237,8 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     }));
     let executorCreations = 0;
     const harness = await startedHarness({
+      declaredExternalEffects: "none",
+      externalEffectEvidence: null,
       classifyFailure,
       createExecutor: () => {
         executorCreations += 1;
@@ -668,8 +1304,13 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     const oldResult = deferred<ReactiveModuleResult>();
     const oldStarted = deferred<void>();
     const terminate = vi.fn().mockResolvedValue(undefined);
+    const inspectRunEffects = vi.fn(
+      async (): Promise<ExternalEffectEvidence> => ({ kind: "retry-safe" }),
+    );
     let generations = 0;
     const harness = await startedHarness({
+      declaredExternalEffects: "core-capabilities-only",
+      externalEffectEvidence: { inspectRunEffects },
       createExecutor: () => {
         generations += 1;
         return generations === 1
@@ -698,6 +1339,7 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     const first = await firstTick;
     expect(first).toMatchObject({ status: "retry-scheduled", failure: { retryable: true } });
     expect(terminate).toHaveBeenCalledOnce();
+    expect(inspectRunEffects).toHaveBeenCalledOnce();
     expect(harness.runtime.moduleGenerationId).not.toBe(oldRun.moduleGenerationId);
 
     const second = await harness.runtime.tick();
@@ -807,6 +1449,164 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     await harness.runtime.stop();
   });
 
+  it("preserves an ordinary execution failure when no external-effect evidence source exists", async () => {
+    const classify = vi.fn((failure: ReactiveModuleFailure) => ({
+      code: failure.code,
+      retryable: true,
+    }));
+    const harness = await startedHarness({
+      declaredExternalEffects: "core-capabilities-only",
+      externalEffectEvidence: null,
+      classifyFailure: classify,
+      createExecutor: () => ({
+        execute: async () => Promise.reject(new Error("execution failed")),
+      }),
+    });
+
+    const result = await harness.runtime.tick();
+    expect(result).toMatchObject({
+      status: "recovery-required",
+      reason: "external-effect-outcome-unknown",
+    });
+    if (result.status !== "recovery-required") throw new Error("expected recovery");
+    expect(classify).not.toHaveBeenCalled();
+    expect(harness.negativelyAcknowledgeDeliveryClaim).not.toHaveBeenCalled();
+    expect(harness.deliveries.inspectClaim(result).status).toBe("active");
+    expect(harness.submissionRecords.get(result.runId)).toBeDefined();
+    await expect(harness.runtime.recover()).resolves.toMatchObject({
+      status: "recovery-required",
+      reason: "external-effect-outcome-unknown",
+    });
+    await expect(harness.runtime.stop()).rejects.toMatchObject({
+      code: "RUNTIME_RECOVERY_REQUIRED",
+    });
+  });
+
+  it.each(["no-effect", "retry-safe"] as const)(
+    "negatively acknowledges an execution failure with persistent %s evidence",
+    async (kind) => {
+      const inspectRunEffects = vi.fn(
+        async (): Promise<ExternalEffectEvidence> => ({ kind }),
+      );
+      const harness = await startedHarness({
+        declaredExternalEffects: "core-capabilities-only",
+        externalEffectEvidence: { inspectRunEffects },
+        createExecutor: () => ({
+          execute: async () => Promise.reject(new Error("execution failed")),
+        }),
+      });
+
+      const result = await harness.runtime.tick();
+      expect(result).toMatchObject({
+        status: "retry-scheduled",
+        failure: { code: "MODULE_EXECUTION_FAILED", retryable: true },
+      });
+      if (result.status === "idle") throw new Error("expected a claimed Run");
+      expect(inspectRunEffects).toHaveBeenCalledWith(
+        expect.objectContaining({
+          moduleJobId: result.moduleJobId,
+          claimToken: result.claimToken,
+          runId: result.runId,
+          attempt: result.attempt,
+          moduleGenerationId: result.moduleGenerationId,
+        }),
+      );
+      expect(harness.submissionRecords.get(result.runId)).toBeUndefined();
+      await harness.runtime.stop();
+    },
+  );
+
+  it("preserves an execution failure with terminal evidence because it does not prove retry safety", async () => {
+    const inspectRunEffects = vi.fn(
+      async (): Promise<ExternalEffectEvidence> => ({ kind: "terminal" }),
+    );
+    const harness = await startedHarness({
+      declaredExternalEffects: "core-capabilities-only",
+      externalEffectEvidence: { inspectRunEffects },
+      createExecutor: () => ({
+        execute: async () => Promise.reject(new Error("execution failed")),
+      }),
+    });
+
+    const result = await harness.runtime.tick();
+    expect(result).toMatchObject({
+      status: "recovery-required",
+      reason: "external-effect-retry-safety-unproven",
+    });
+    if (result.status !== "recovery-required") throw new Error("expected recovery");
+    expect(harness.negativelyAcknowledgeDeliveryClaim).not.toHaveBeenCalled();
+    expect(harness.deliveries.inspectClaim(result).status).toBe("active");
+    expect(harness.submissionRecords.get(result.runId)).toBeDefined();
+    await expect(harness.runtime.recover()).resolves.toMatchObject({
+      status: "recovery-required",
+      reason: "external-effect-retry-safety-unproven",
+    });
+    expect(inspectRunEffects).toHaveBeenCalledTimes(2);
+    await expect(harness.runtime.stop()).rejects.toMatchObject({
+      code: "RUNTIME_RECOVERY_REQUIRED",
+    });
+  });
+
+  it("rechecks persistent external-effect evidence before recovering a failure", async () => {
+    let evidenceResult: unknown = { kind: "no-effect" };
+    let evidenceError: Error | undefined;
+    const inspectRunEffects = vi.fn(
+      () => {
+        if (evidenceError) throw evidenceError;
+        return evidenceResult;
+      },
+    ) as unknown as ExternalEffectEvidenceSource["inspectRunEffects"];
+    const harness = await startedHarness({
+      declaredExternalEffects: "core-capabilities-only",
+      externalEffectEvidence: { inspectRunEffects },
+      createExecutor: () => ({
+        execute: async () => Promise.reject(new Error("execution failed")),
+      }),
+    });
+
+    await expect(harness.runtime.tick()).resolves.toMatchObject({
+      status: "recovery-required",
+      reason: "external-effect-outcome-unknown",
+    });
+
+    evidenceError = new Error("evidence source failed synchronously");
+    await expect(harness.runtime.recover()).resolves.toMatchObject({
+      status: "recovery-required",
+      reason: "external-effect-outcome-unknown",
+    });
+    evidenceError = undefined;
+
+    evidenceResult = Promise.resolve({
+      kind: "unknown",
+      reason: "provider outcome is not available",
+    });
+    await expect(harness.runtime.recover()).resolves.toMatchObject({
+      status: "recovery-required",
+      reason: "external-effect-outcome-unknown",
+    });
+
+    evidenceResult = Promise.resolve({ kind: "no-effect", extra: true });
+    await expect(harness.runtime.recover()).resolves.toMatchObject({
+      status: "recovery-required",
+      reason: "external-effect-outcome-unknown",
+    });
+
+    evidenceResult = Promise.reject(new Error("evidence store unavailable"));
+    await expect(harness.runtime.recover()).resolves.toMatchObject({
+      status: "recovery-required",
+      reason: "external-effect-outcome-unknown",
+    });
+
+    evidenceResult = Promise.resolve({ kind: "no-effect" });
+    await expect(harness.runtime.recover()).resolves.toMatchObject({
+      status: "retry-scheduled",
+      failure: { code: "MODULE_EXECUTION_FAILED", retryable: true },
+    });
+    expect(inspectRunEffects).toHaveBeenCalledTimes(6);
+    expect(harness.negativelyAcknowledgeDeliveryClaim).toHaveBeenCalledOnce();
+    await harness.runtime.stop();
+  });
+
   it("preserves the Claim when a Module that may cause external effects has no committed result", async () => {
     // The Module executed and could have reached a provider through a
     // capability, so a missing journal record is an unknown outcome rather
@@ -824,6 +1624,7 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     } as unknown as ReactiveModuleResult;
     const harness = await startedHarness({
       declaredExternalEffects: "core-capabilities-only",
+      externalEffectEvidence: null,
       classifyFailure: classify,
       createExecutor: () => ({ execute: async () => invalidResult }),
     });
@@ -850,6 +1651,7 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
       },
     } as unknown as ReactiveModuleResult;
     const harness = await startedHarness({
+      externalEffectEvidence: null,
       createExecutor: () => ({ execute: async () => invalidResult }),
     });
 
@@ -897,23 +1699,15 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     let loseResponse = true;
     let executions = 0;
     const harness = await startedHarness({
-      wrapDeliveries: (deliveries) =>
-        new Proxy(deliveries, {
-          get(target, property) {
-            if (property === "nack") {
-              return (request: Parameters<DeliveryStore["nack"]>[0]) => {
-                const result = target.nack(request);
-                if (loseResponse) {
-                  loseResponse = false;
-                  throw new Error("lost response");
-                }
-                return result;
-              };
-            }
-            const value = Reflect.get(target, property, target) as unknown;
-            return typeof value === "function" ? value.bind(target) : value;
-          },
-        }),
+      wrapNegativelyAcknowledgeDeliveryClaim:
+        (negativelyAcknowledgeDeliveryClaim) => (request) => {
+          const result = negativelyAcknowledgeDeliveryClaim(request);
+          if (loseResponse) {
+            loseResponse = false;
+            throw new Error("lost response");
+          }
+          return result;
+        },
       createExecutor: () => ({
         execute: async () => {
           executions += 1;
@@ -922,8 +1716,19 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
         },
       }),
     });
+    const inspectClaim = vi.spyOn(harness.runtimeDeliveries, "inspectClaim");
 
-    await expect(harness.runtime.tick()).resolves.toMatchObject({ status: "retry-scheduled" });
+    const first = await harness.runtime.tick();
+    expect(first).toMatchObject({ status: "retry-scheduled" });
+    if (first.status === "idle") throw new Error("expected a claimed Module job");
+    expect(inspectClaim).toHaveBeenCalledWith({
+      moduleJobId: first.moduleJobId,
+      claimToken: first.claimToken,
+      runId: first.runId,
+      attempt: first.attempt,
+      moduleGenerationId: first.moduleGenerationId,
+    });
+    expect(harness.submissionRecords.get(first.runId)).toBeUndefined();
     await expect(harness.runtime.tick()).resolves.toMatchObject({ status: "committed", attempt: 2 });
     expect(executions).toBe(2);
     await harness.runtime.stop();
@@ -985,6 +1790,8 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
       retryable: true,
     }));
     const harness = await startedHarness({
+      declaredExternalEffects: "none",
+      externalEffectEvidence: null,
       classifyFailure,
       createExecutor: () => ({
         execute: async () => {
@@ -1029,6 +1836,55 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
         (moduleJob) => moduleJob.moduleJobId === result.moduleJobId,
       )?.failedAttemptCount,
     ).toBe(0);
+  });
+
+  it("preserves a shutdown-cancelled Claim until persistent evidence permits release", async () => {
+    const executionStarted = deferred<void>();
+    const execution = deferred<ReactiveModuleResult>();
+    let evidence: ExternalEffectEvidence = {
+      kind: "unknown",
+      reason: "provider outcome is not available",
+    };
+    const inspectRunEffects = vi.fn(async () => evidence);
+    const harness = await startedHarness({
+      declaredExternalEffects: "core-capabilities-only",
+      externalEffectEvidence: { inspectRunEffects },
+      createExecutor: () => ({
+        execute: async () => {
+          executionStarted.resolve();
+          return execution.promise;
+        },
+        cancel: () => execution.reject(new Error("shutdown")),
+      }),
+    });
+
+    const tick = harness.runtime.tick();
+    await executionStarted.promise;
+    const stop = harness.runtime.stop();
+    const result = await tick;
+    expect(result).toMatchObject({ status: "cancelled", reason: "shutdown" });
+    if (result.status !== "cancelled") throw new Error("expected cancellation");
+    await expect(stop).rejects.toMatchObject({
+      code: "RUNTIME_RECOVERY_REQUIRED",
+    });
+    expect(harness.releaseDeliveryClaim).not.toHaveBeenCalled();
+    expect(harness.deliveries.inspectClaim(result).status).toBe("active");
+    expect(harness.submissionRecords.get(result.runId)).toBeDefined();
+
+    evidence = { kind: "terminal" };
+    await expect(harness.runtime.stop()).rejects.toMatchObject({
+      code: "RUNTIME_RECOVERY_REQUIRED",
+    });
+    expect(harness.releaseDeliveryClaim).not.toHaveBeenCalled();
+    expect(harness.deliveries.inspectClaim(result).status).toBe("active");
+    expect(harness.submissionRecords.get(result.runId)).toBeDefined();
+
+    evidence = { kind: "retry-safe" };
+    await expect(harness.runtime.stop()).resolves.toBeUndefined();
+    expect(inspectRunEffects).toHaveBeenCalledTimes(3);
+    expect(harness.releaseDeliveryClaim).toHaveBeenCalledOnce();
+    expect(harness.deliveries.inspectClaim(result).status).toBe("released");
+    expect(harness.submissionRecords.get(result.runId)).toBeUndefined();
   });
 
   it("does not start timeout failure handling after shutdown begins", async () => {
@@ -1107,6 +1963,7 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     expect(releaseClaim).toHaveBeenCalledOnce();
     expect(persistenceWrites).toBe(2);
     expect(harness.deliveries.inspectClaim(result).status).toBe("released");
+    expect(harness.submissionRecords.get(result.runId)).toBeUndefined();
   });
 
   it("retries unconfirmed Claim release persistence on a later stop call", async () => {

@@ -1,5 +1,6 @@
 /**
- * Durable evidence about external effects a capability may have caused.
+ * Record protocol for durable evidence about external effects a capability may
+ * have caused.
  *
  * Architecture Decision Record 0009 requires every capability that can cause
  * an external effect to persist an intent with a stable idempotency key
@@ -9,26 +10,31 @@
  *
  * `ExtensionCapabilityAuthority` deduplicates within one live session using an
  * in-memory map, which is correct for a repeated invocation inside that
- * session and useless after Core exits. This journal is the durable half. It
- * answers one question for startup recovery: for this exact Claim and Run, did
- * any effect cross its boundary, and is its outcome known?
+ * session and useless after Core exits. This journal and its evidence adapter
+ * define the record protocol, but the repository does not yet provide the
+ * persistent store or integration with the only code path that can authorize
+ * an external effect. Until both exist, the journal is not sufficient recovery
+ * evidence for a complete Run.
  *
  * The journal deliberately stores no argument values, no response payload, and
  * no credential. It stores identities, a digest of the intended operation, and
  * an outcome. Recovery needs to know *whether* an effect happened, not what it
- * contained, and everything it stores survives into an operator-visible
- * unknown outcome.
+ * contained.
  */
 
 import { canonicalJsonDigest, deepFreeze } from "../canonical-json.js";
+import type {
+  ExternalEffectEvidence,
+  ExternalEffectEvidenceSource,
+} from "../core-startup-recovery.js";
+import type { DeliveryClaimIdentity } from "../delivery-store.js";
 
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const MAX_IDENTIFIER_LENGTH = 256;
 
 /**
- * How far an intended effect got. The three terminal values are the same
- * vocabulary startup recovery uses to decide a Claim, so a journal entry maps
- * onto that decision without translation.
+ * How far an intended effect got. `terminal` means the operation has a durable
+ * final result; it does not prove that repeating the operation is safe.
  */
 export type EffectOutcome =
   /** Persisted before the operation started; nothing is known yet. */
@@ -44,12 +50,13 @@ export type EffectOutcome =
   | { readonly kind: "unknown"; readonly reason: string };
 
 export interface EffectIntentRecord {
-  readonly schemaVersion: "dolly.effect-intent/1";
+  readonly schemaVersion: "dolly.effect-intent/2";
   /** The exact Claim and Run this effect belongs to. */
   readonly moduleJobId: string;
   readonly runId: string;
   readonly attempt: number;
   readonly claimToken: string;
+  readonly moduleGenerationId: string;
   /**
    * The stable key that makes repeating this operation safe. Architecture
    * Decision Record 0009 requires it to derive from the Module job identifier
@@ -81,13 +88,21 @@ export class EffectIntentError extends Error {
 }
 
 /**
- * Durable storage for intent records. A file-backed implementation writes
- * through the same atomic replacement Core state uses; tests supply an
- * in-memory one that can simulate a restart by being reconstructed.
+ * Storage boundary for intent records. The repository does not yet provide a
+ * persistent product implementation or connect this boundary to capability
+ * execution. Tests supply an in-memory store; it cannot prove that evidence
+ * survived a Core process crash.
  */
 export interface EffectIntentStore {
   list(): readonly EffectIntentRecord[];
-  put(record: EffectIntentRecord): void;
+  /**
+   * Inserts when `expected` is absent, or replaces only the exact current
+   * record supplied as `expected`. `false` means another write won.
+   */
+  compareAndSet(
+    expected: EffectIntentRecord | undefined,
+    replacement: EffectIntentRecord,
+  ): boolean;
 }
 
 function isIdentifier(value: unknown): value is string {
@@ -98,6 +113,23 @@ function isIdentifier(value: unknown): value is string {
     if (codePoint < 0x20 || codePoint === 0x7f) return false;
   }
   return true;
+}
+
+function recordMatchesClaim(
+  record: EffectIntentRecord,
+  identity: DeliveryClaimIdentity,
+): boolean {
+  return (
+    record.moduleJobId === identity.moduleJobId &&
+    record.claimToken === identity.claimToken &&
+    record.runId === identity.runId &&
+    record.attempt === identity.attempt &&
+    record.moduleGenerationId === identity.moduleGenerationId
+  );
+}
+
+function sameOutcome(left: EffectOutcome, right: EffectOutcome): boolean {
+  return canonicalJsonDigest(left) === canonicalJsonDigest(right);
 }
 
 function assertOutcome(outcome: EffectOutcome): void {
@@ -132,20 +164,11 @@ function assertOutcome(outcome: EffectOutcome): void {
 }
 
 /**
- * The disposition an effect journal permits for one Run, using the vocabulary
- * `CoreStartupRecovery` already understands.
- */
-export type RunEffectEvidence =
-  | { readonly kind: "no-effect" | "retry-safe" | "terminal" }
-  | { readonly kind: "unknown"; readonly reason: string };
-
-/**
  * Records intents before input/output and answers what recovery may conclude.
  *
- * The safety rule is one-sided on purpose: an absent record means no effect
- * was ever authorized *only* because the intent is written before the
- * operation starts. Every other combination that is not provably safe answers
- * `unknown`, which preserves the Claim for audited operator action.
+ * Until a persistent product store is connected to the only code path that can
+ * authorize an external effect, an absent record proves nothing and answers
+ * `unknown`.
  */
 export class EffectIntentJournal {
   readonly #store: EffectIntentStore;
@@ -166,6 +189,7 @@ export class EffectIntentJournal {
     readonly runId: string;
     readonly attempt: number;
     readonly claimToken: string;
+    readonly moduleGenerationId: string;
     readonly idempotencyKey: string;
     readonly capabilityType: string;
     readonly operation: string;
@@ -175,6 +199,7 @@ export class EffectIntentJournal {
       moduleJobId: request.moduleJobId,
       runId: request.runId,
       claimToken: request.claimToken,
+      moduleGenerationId: request.moduleGenerationId,
       idempotencyKey: request.idempotencyKey,
       capabilityType: request.capabilityType,
       operation: request.operation,
@@ -200,26 +225,46 @@ export class EffectIntentJournal {
       intent: request.intent as never,
     });
 
-    const existing = this.#find(request.moduleJobId, request.idempotencyKey);
-    if (existing) {
+    const recordsForKey = this.#store
+      .list()
+      .filter(
+        (record) =>
+          record.moduleJobId === request.moduleJobId &&
+          record.idempotencyKey === request.idempotencyKey,
+      );
+    if (recordsForKey.some((record) => record.intentDigest !== intentDigest)) {
       // The same key with a different intent would make the key meaningless as
       // duplicate suppression, so it is refused rather than overwritten.
-      if (existing.intentDigest !== intentDigest) {
-        throw new EffectIntentError(
-          "EFFECT_INTENT_CONFLICT",
-          `Idempotency key "${request.idempotencyKey}" already names a different effect`,
-        );
-      }
+      throw new EffectIntentError(
+        "EFFECT_INTENT_CONFLICT",
+        `Idempotency key "${request.idempotencyKey}" already names a different effect`,
+      );
+    }
+    const existing = recordsForKey.find(
+      (record) =>
+        record.runId === request.runId &&
+        record.attempt === request.attempt &&
+        record.claimToken === request.claimToken &&
+        record.moduleGenerationId === request.moduleGenerationId,
+    );
+    if (existing) {
       return existing;
+    }
+    if (recordsForKey.length > 0) {
+      throw new EffectIntentError(
+        "EFFECT_INTENT_CONFLICT",
+        `Idempotency key "${request.idempotencyKey}" is already linked to a different exact Claim; the current schema cannot safely link one stable effect across retry Runs`,
+      );
     }
 
     const now = this.#now();
     const record: EffectIntentRecord = deepFreeze({
-      schemaVersion: "dolly.effect-intent/1" as const,
+      schemaVersion: "dolly.effect-intent/2" as const,
       moduleJobId: request.moduleJobId,
       runId: request.runId,
       attempt: request.attempt,
       claimToken: request.claimToken,
+      moduleGenerationId: request.moduleGenerationId,
       idempotencyKey: request.idempotencyKey,
       capabilityType: request.capabilityType,
       operation: request.operation,
@@ -228,48 +273,83 @@ export class EffectIntentJournal {
       createdAt: now,
       updatedAt: now,
     });
-    this.#store.put(record);
+    if (!this.#store.compareAndSet(undefined, record)) {
+      throw new EffectIntentError(
+        "EFFECT_INTENT_CONFLICT",
+        `Effect intent "${request.idempotencyKey}" changed while it was being recorded`,
+      );
+    }
     return record;
   }
 
   /** Settles an intent once its outcome is known. */
   recordOutcome(
-    moduleJobId: string,
+    identity: DeliveryClaimIdentity,
     idempotencyKey: string,
     outcome: EffectOutcome,
   ): EffectIntentRecord {
     assertOutcome(outcome);
-    const existing = this.#find(moduleJobId, idempotencyKey);
+    const existing = this.#find(identity, idempotencyKey);
     if (!existing) {
       throw new EffectIntentError(
         "EFFECT_INTENT_NOT_FOUND",
-        `No effect intent named "${idempotencyKey}" for Module job "${moduleJobId}"`,
+        `No effect intent named "${idempotencyKey}" matches Run "${identity.runId}" and its exact Claim`,
       );
     }
+    if (sameOutcome(existing.outcome, outcome)) return existing;
+    if (
+      existing.outcome.kind === "no-effect" ||
+      existing.outcome.kind === "terminal" ||
+      existing.outcome.kind === "unknown"
+    ) {
+      if (
+        existing.outcome.kind !== "unknown" ||
+        (outcome.kind !== "no-effect" && outcome.kind !== "terminal")
+      ) {
+        throw new EffectIntentError(
+          "EFFECT_INTENT_CONFLICT",
+          `Effect intent "${idempotencyKey}" already has an outcome that cannot be rewritten`,
+        );
+      }
+    }
     const updated = deepFreeze({ ...existing, outcome, updatedAt: this.#now() });
-    this.#store.put(updated);
+    if (!this.#store.compareAndSet(existing, updated)) {
+      throw new EffectIntentError(
+        "EFFECT_INTENT_CONFLICT",
+        `Effect intent "${idempotencyKey}" changed while its outcome was being recorded`,
+      );
+    }
     return updated;
   }
 
-  /** Every intent recorded for one Run, in the order the store returns them. */
-  listForRun(moduleJobId: string, runId: string): readonly EffectIntentRecord[] {
+  /** Every intent recorded for one exact Claim and Run. */
+  listForRun(identity: DeliveryClaimIdentity): readonly EffectIntentRecord[] {
     return this.#store
       .list()
-      .filter((record) => record.moduleJobId === moduleJobId && record.runId === runId);
+      .filter((record) => recordMatchesClaim(record, identity));
   }
 
   /**
    * What recovery may conclude about one Run's external effects.
    *
-   * No records means no effect was ever authorized, because the intent is
-   * written before the operation. Records that are all `no-effect` or
-   * `terminal` are safe. An intent still marked `intended` is the crash case:
-   * Core died between writing the intent and learning the result, so the
-   * outcome is unknown and the Claim must be preserved.
+   * No records answers `unknown`: this adapter is not yet connected to the only
+   * code path that can authorize an external effect and cannot prove that the
+   * journal is complete. Exact records that are all `no-effect` prove only that
+   * those recorded operations did not occur; another effect could be missing,
+   * so the whole Run remains unknown. A `terminal` record proves at least one
+   * final result exists; without a separate durable idempotency contract it
+   * does not permit retry or release. An intent still marked `intended` is the
+   * crash case: Core recorded the intent but never recorded an outcome.
    */
-  evidenceForRun(moduleJobId: string, runId: string): RunEffectEvidence {
-    const records = this.listForRun(moduleJobId, runId);
-    if (records.length === 0) return { kind: "no-effect" };
+  evidenceForRun(identity: DeliveryClaimIdentity): ExternalEffectEvidence {
+    const records = this.listForRun(identity);
+    if (records.length === 0) {
+      return {
+        kind: "unknown",
+        reason:
+          "No exact effect intent is recorded, and this journal is not yet connected to the only code path that can authorize an external effect",
+      };
+    }
 
     const unresolved = records.filter(
       (record) => record.outcome.kind === "intended" || record.outcome.kind === "unknown",
@@ -287,17 +367,26 @@ export class EffectIntentJournal {
         } unresolved for this Run (${first.capabilityType}/${first.operation}: ${reason})`,
       };
     }
-    return records.every((record) => record.outcome.kind === "no-effect")
-      ? { kind: "no-effect" }
-      : { kind: "terminal" };
+    if (records.every((record) => record.outcome.kind === "no-effect")) {
+      return {
+        kind: "unknown",
+        reason:
+          "Recorded effects are no-effect, but this journal is not yet connected to the only code path that can authorize an external effect",
+      };
+    }
+    return { kind: "terminal" };
   }
 
-  #find(moduleJobId: string, idempotencyKey: string): EffectIntentRecord | undefined {
+  #find(
+    identity: DeliveryClaimIdentity,
+    idempotencyKey: string,
+  ): EffectIntentRecord | undefined {
     return this.#store
       .list()
       .find(
         (record) =>
-          record.moduleJobId === moduleJobId && record.idempotencyKey === idempotencyKey,
+          recordMatchesClaim(record, identity) &&
+          record.idempotencyKey === idempotencyKey,
       );
   }
 }
@@ -305,20 +394,16 @@ export class EffectIntentJournal {
 /**
  * Adapts the journal to the evidence source startup recovery consumes.
  *
- * Recovery asks about one submission record; the journal answers about the
- * exact Module job and Run that record names. Nothing else about the
- * submission is consulted, so a record for a different Run cannot make this
- * one look safe.
+ * Recovery asks about one submission record; the journal requires all five
+ * fields of its exact Claim identity. A record for another claim token,
+ * attempt, or Module generation cannot make this Run look safe.
  */
-export function effectIntentEvidenceSource(journal: EffectIntentJournal): {
-  inspectRunEffects(submission: {
-    readonly moduleJobId: string;
-    readonly runId: string;
-  }): Promise<RunEffectEvidence>;
-} {
+export function effectIntentEvidenceSource(
+  journal: EffectIntentJournal,
+): ExternalEffectEvidenceSource {
   return {
     async inspectRunEffects(submission) {
-      return journal.evidenceForRun(submission.moduleJobId, submission.runId);
+      return journal.evidenceForRun(submission);
     },
   };
 }

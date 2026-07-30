@@ -59,9 +59,10 @@ import {
   isProcessGenerationId,
   moduleCgroupDirectoryName,
 } from "./linux-identifier-formats.js";
-import type {
-  ModuleProcessStopProof,
-  ModuleProcessStopProver,
+import {
+  moduleProcessStopProofIdentityDigest,
+  type ModuleProcessStopProof,
+  type ModuleProcessStopProver,
 } from "./core-startup-recovery.js";
 import type { ModuleProcessRecord } from "./module-process-records.js";
 import { constants } from "node:fs";
@@ -1244,6 +1245,16 @@ export function decideModuleProcessStopProof(
   record: ModuleProcessRecord,
   observation: ModuleProcessStopObservation,
 ): ModuleProcessStopProof {
+  const accepted = (
+    evidence: Extract<
+      ModuleProcessStopProof,
+      { readonly proven: true }
+    >["evidence"],
+  ): ModuleProcessStopProof => ({
+    proven: true,
+    evidence,
+    recordIdentityDigest: moduleProcessStopProofIdentityDigest(record),
+  });
   if (!observation.serviceBindingVerified) {
     return {
       proven: false,
@@ -1261,7 +1272,7 @@ export function decideModuleProcessStopProof(
     // A process from an earlier boot cannot still exist. Core still derives a
     // fresh non-reused path for the replacement; the old path is never reused
     // as an identity.
-    return { proven: true, evidence: "changed-boot-identifier" };
+    return accepted("changed-boot-identifier");
   }
   if (
     !isDerivedModuleCgroupPath(
@@ -1282,7 +1293,7 @@ export function decideModuleProcessStopProof(
             proven: false,
             reason: `${record.moduleCgroupPath} still reports "populated 1", so a Module process may still be running`,
           }
-        : { proven: true, evidence: "populated-zero" };
+        : accepted("populated-zero");
     case "missing":
       if (observation.pathRecreated) {
         return {
@@ -1293,7 +1304,7 @@ export function decideModuleProcessStopProof(
       // The path carries a process-generation identifier Core never reuses, so
       // a missing directory cannot be a different generation's group, and the
       // kernel removes a control group only when it is empty.
-      return { proven: true, evidence: "missing-path" };
+      return accepted("missing-path");
     case "unreadable":
       return {
         proven: false,

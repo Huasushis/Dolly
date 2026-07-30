@@ -26,6 +26,7 @@ import {
   type ModuleCgroupLimits,
   type ModuleProcessStopObservation,
 } from "../../../src/core/linux-module-cgroup.js";
+import { moduleProcessStopProofIdentityDigest } from "../../../src/core/core-startup-recovery.js";
 import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
 
 const DELEGATED_ROOT = "/user.slice/user-1000.slice/user@1000.service/dolly.service";
@@ -919,17 +920,25 @@ describe("cgroup.events parsing", () => {
 
 describe("Module process stop proof", () => {
   it("accepts a changed Linux boot identifier", () => {
+    const record = processRecord({
+      bootId: "99999999-2222-3333-4444-555555555555",
+    });
     const proof = decideModuleProcessStopProof(
-      processRecord({ bootId: "99999999-2222-3333-4444-555555555555" }),
+      record,
       observation({ events: { kind: "populated", populated: true } }),
     );
-    expect(proof).toEqual({ proven: true, evidence: "changed-boot-identifier" });
+    expect(proof).toEqual({
+      proven: true,
+      evidence: "changed-boot-identifier",
+      recordIdentityDigest: moduleProcessStopProofIdentityDigest(record),
+    });
   });
 
   it("accepts populated 0 within the same boot", () => {
     expect(decideModuleProcessStopProof(processRecord(), observation())).toEqual({
       proven: true,
       evidence: "populated-zero",
+      recordIdentityDigest: moduleProcessStopProofIdentityDigest(processRecord()),
     });
   });
 
@@ -939,7 +948,11 @@ describe("Module process stop proof", () => {
         processRecord(),
         observation({ events: { kind: "missing" } }),
       ),
-    ).toEqual({ proven: true, evidence: "missing-path" });
+    ).toEqual({
+      proven: true,
+      evidence: "missing-path",
+      recordIdentityDigest: moduleProcessStopProofIdentityDigest(processRecord()),
+    });
   });
 
   it("fails closed on a populated, recreated, unreadable, or unparsable path", () => {
@@ -1007,6 +1020,7 @@ describe("LinuxModuleCgroupStopProver observations", () => {
     expect(await prover(fileSystem).proveStopped(record)).toEqual({
       proven: true,
       evidence: "populated-zero",
+      recordIdentityDigest: moduleProcessStopProofIdentityDigest(record),
     });
   });
 
@@ -1023,6 +1037,7 @@ describe("LinuxModuleCgroupStopProver observations", () => {
     expect(await prover(newFileSystem()).proveStopped(record)).toEqual({
       proven: true,
       evidence: "missing-path",
+      recordIdentityDigest: moduleProcessStopProofIdentityDigest(record),
     });
   });
 

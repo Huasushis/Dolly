@@ -15,10 +15,12 @@ import {
 } from "../../../src/core/extension-process-host.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
+import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import { ModuleResultCommitCoordinator } from "../../../src/core/module-result-commit.js";
 import {
   ReactiveModuleRuntime,
   type ReactiveModuleFailure,
+  type ReactiveModuleRuntimeOptions,
 } from "../../../src/core/reactive-module-runtime.js";
 
 const NOW = "2026-07-26T00:00:00.000Z";
@@ -70,17 +72,61 @@ describe("Reactive Module runtime with a real Extension process", () => {
       core.deliveries.registerConsumer("input", "worker", "from-now");
       core.deliveries.registerConsumer("output", "sink", "from-now");
 
+      const processGenerationId = "process-generation-real-process-test-1";
+      core.appendModuleProcessRecord({
+        schemaVersion: "dolly.module-process-record/1",
+        instanceId: "instance-real-process",
+        moduleId: "worker",
+        moduleGenerationId: "module-generation-1",
+        processGenerationId,
+        packageDigest: `sha256:${"a".repeat(64)}`,
+        configurationReference: {
+          configId: "config-real-process",
+          revision: `sha256:${"b".repeat(64)}`,
+          configVersion: 1,
+        },
+        declaredExternalEffects: "none",
+        serviceInvocationId: "2812432ad29e4d3bbd6776c62cafa929",
+        bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
+        moduleCgroupPath: deriveModuleCgroupPath(
+          "/system.slice/dolly-core.service",
+          {
+            instanceId: "instance-real-process",
+            moduleId: "worker",
+            processGenerationId,
+          },
+        ).filesystemPath,
+        state: "starting",
+        createdAt: NOW,
+        updatedAt: NOW,
+      });
+
       const firstInputBlock = core.blocks.commit(proposal("first input"), {
         kind: "external",
         id: "console",
       });
       const firstInputDelivery = core.deliveries.append("input", firstInputBlock.id);
+      // ReactiveModuleRuntime is not yet composed by the product bootstrap.
+      // This fixture supplies the explicit submission callback and lets the
+      // runtime verify its durable postconditions before sending the Run. It
+      // exercises the FileCore boundary, but does not claim to prove Linux
+      // service or control-group binding.
+      const runtimeDeliveries: ReactiveModuleRuntimeOptions["deliveries"] = {
+        validateClaimPages: core.deliveries.validateClaimPages.bind(core.deliveries),
+        validateOutputPages: core.deliveries.validateOutputPages.bind(core.deliveries),
+        claim: core.deliveries.claim.bind(core.deliveries),
+        flushPersistence: core.deliveries.flushPersistence.bind(core.deliveries),
+        inspectClaim: core.deliveries.inspectClaim.bind(core.deliveries),
+        inspectClaimInput: core.deliveries.inspectClaimInput.bind(core.deliveries),
+      };
       const repository = new FileModuleResultCommitRepository({
         path: commitRepositoryPath,
       });
       const commits = new ModuleResultCommitCoordinator({
         blocks: core.blocks,
         deliveries: core.deliveries,
+        acknowledgeDeliveryClaim: (identity) => core.acknowledgeDeliveryClaim(identity),
+        getModuleSubmissionRecord: (runId) => core.getModuleSubmissionRecord(runId),
         repository,
         now: () => NOW,
       });
@@ -104,7 +150,20 @@ describe("Reactive Module runtime with a real Extension process", () => {
         terminationTimeoutMs: 3_000,
         maxRunsPerGeneration: 10,
         maxGenerations: 2,
-        deliveries: core.deliveries,
+        declaredExternalEffects: "none",
+        deliveries: runtimeDeliveries,
+        persistModuleSubmission: (request) => {
+          core.appendModuleSubmissionRecord({
+            schemaVersion: "dolly.module-submission-record/1",
+            ...request,
+            processGenerationId,
+            createdAt: NOW,
+          });
+        },
+        releaseDeliveryClaim: (identity) => core.releaseDeliveryClaim(identity),
+        negativelyAcknowledgeDeliveryClaim: (request) =>
+          core.negativelyAcknowledgeDeliveryClaim(request),
+        getModuleSubmissionRecord: (runId) => core.getModuleSubmissionRecord(runId),
         commits,
         nextModuleGenerationId: () => `module-generation-${++moduleGeneration}`,
         monotonicNow: () => ++monotonicTime,
@@ -157,6 +216,7 @@ describe("Reactive Module runtime with a real Extension process", () => {
       });
 
       await runtime.start();
+      core.updateModuleProcessRecordState(processGenerationId, "running");
       const firstProcessId = hosts[0]?.snapshot.pid;
       expect(firstProcessId).toBeTypeOf("number");
       if (firstProcessId === undefined) {
@@ -179,6 +239,7 @@ describe("Reactive Module runtime with a real Extension process", () => {
         throw new Error("Expected the real child result to commit");
       }
       expect(core.deliveries.inspectClaim(committed).status).toBe("committed");
+      expect(core.getModuleSubmissionRecord(committed.runId)).toBeUndefined();
       expect(repository.get(committed.moduleJobId)).toEqual(committed.record);
       if (committed.record.blockId === undefined) {
         throw new Error("Expected the real child result to create one Block");
@@ -217,6 +278,7 @@ describe("Reactive Module runtime with a real Extension process", () => {
         interval: 5,
       });
 
+      core.updateModuleProcessRecordState(processGenerationId, "stopping");
       const stop = runtime.stop();
       const cancelled = await secondTick;
       expect(cancelled).toMatchObject({
@@ -229,8 +291,10 @@ describe("Reactive Module runtime with a real Extension process", () => {
         throw new Error("Expected orderly stop to cancel the active run");
       }
       await expect(stop).resolves.toBeUndefined();
+      core.updateModuleProcessRecordState(processGenerationId, "stopped");
 
       expect(core.deliveries.inspectClaim(cancelled).status).toBe("released");
+      expect(core.getModuleSubmissionRecord(cancelled.runId)).toBeUndefined();
       expect(classifyFailure).not.toHaveBeenCalled();
       expect(hosts).toHaveLength(1);
       expect(hosts[0]?.snapshot.state).toBe("stopped");
@@ -266,6 +330,8 @@ describe("Reactive Module runtime with a real Extension process", () => {
       });
       expect(reopenedCore.deliveries.inspectClaim(committed).status).toBe("committed");
       expect(reopenedCore.deliveries.inspectClaim(cancelled).status).toBe("released");
+      expect(reopenedCore.getModuleSubmissionRecord(committed.runId)).toBeUndefined();
+      expect(reopenedCore.getModuleSubmissionRecord(cancelled.runId)).toBeUndefined();
       expect(reopenedRepository.get(committed.moduleJobId)).toEqual(committed.record);
     } finally {
       if (runtime && runtime.state !== "stopped") {

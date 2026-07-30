@@ -1,9 +1,11 @@
-import { deepFreeze } from "./canonical-json.js";
+import { canonicalJsonDigest, deepFreeze } from "./canonical-json.js";
 import {
   type ClaimDescriptor,
+  type DeliveryClaimIdentity,
   type DeliveryStore,
 } from "./delivery-store.js";
 import {
+  ModuleResultCommitError,
   type ModuleResultCommitCoordinator,
   type ModuleResultCommitRecord,
 } from "./module-result-commit.js";
@@ -14,6 +16,11 @@ import {
 
 export type CoreStartupRecoveryErrorCode =
   | "STARTUP_ACTIVE_CLAIM_UNRESOLVED"
+  /**
+   * Startup could not confirm that the exact Claim became released and its
+   * matching submission record disappeared in the same Core-state update.
+   */
+  | "STARTUP_CLAIM_RELEASE_UNCONFIRMED"
   | "STARTUP_JOURNAL_CLAIM_INCONSISTENT"
   | "STARTUP_MODULE_RECORD_INCONSISTENT"
   | "STARTUP_MODULE_PROCESS_UNPROVEN";
@@ -36,6 +43,11 @@ export type ModuleProcessStopProof =
   | {
       readonly proven: true;
       readonly evidence: "populated-zero" | "missing-path" | "changed-boot-identifier";
+      /**
+       * Digest of the process generation, control-group path, Linux boot, and
+       * Core service invocation from the exact process record proved stopped.
+       */
+      readonly recordIdentityDigest: string;
     }
   | { readonly proven: false; readonly reason: string };
 
@@ -43,12 +55,26 @@ export interface ModuleProcessStopProver {
   proveStopped(record: ModuleProcessRecord): Promise<ModuleProcessStopProof>;
 }
 
+/** Identifies the immutable process-record fields a stop proof must echo. */
+export function moduleProcessStopProofIdentityDigest(
+  record: ModuleProcessRecord,
+): string {
+  return canonicalJsonDigest({
+    processGenerationId: record.processGenerationId,
+    moduleCgroupPath: record.moduleCgroupPath,
+    bootId: record.bootId,
+    serviceInvocationId: record.serviceInvocationId,
+  });
+}
+
 /**
  * Durable evidence about every external effect a submitted Run could have
  * caused. `no-effect` proves the operation never crossed its effect boundary,
  * `retry-safe` proves repeating it cannot add a second effect, and `terminal`
- * proves a durably recorded final outcome. `unknown` keeps the exact Claim
- * active for audited operator action.
+ * proves only that a final outcome is durably recorded. A terminal outcome
+ * does not make repeating the operation safe without a separate durable
+ * idempotency contract, which Dolly does not currently have. `unknown` and
+ * `terminal` therefore keep the exact Claim active for audited operator action.
  */
 export type ExternalEffectEvidence =
   | { readonly kind: "no-effect" | "retry-safe" | "terminal" }
@@ -66,7 +92,12 @@ export interface ReleasedClaimReport {
   readonly runId: string;
   readonly attempt: number;
   readonly moduleGenerationId: string;
-  readonly reason: "never-submitted" | "no-external-effect" | "effect-evidence-safe";
+  /**
+   * `no-external-effect` follows the Module process declaration.
+   * `external-effects-safe-to-retry` follows persistent evidence that the
+   * submitted Run caused no effect or that retrying cannot add another effect.
+   */
+  readonly reason: "no-external-effect" | "external-effects-safe-to-retry";
 }
 
 export interface UnknownOutcomeClaimReport {
@@ -83,19 +114,18 @@ export interface CoreStartupRecoveryReport {
   readonly releasedClaims: readonly ReleasedClaimReport[];
   readonly unknownOutcomeClaims: readonly UnknownOutcomeClaimReport[];
   readonly stoppedProcessGenerationIds: readonly string[];
-  /** Module records collected because nothing references them any more. */
+  /** Process records collected because nothing references them any more. */
   readonly collectedRecords: {
-    readonly submissionRecords: number;
     readonly processRecords: number;
   };
 }
 
 /**
- * The durable Module record view for one complete Core-state update, plus the
- * transitions startup may apply to it. `FileCoreStateStore` satisfies this
- * interface; startup never reads these records from a second file.
+ * The Core-state store that startup uses to read and update Module records and
+ * the exact terminal state of a Delivery Claim in the same update.
+ * `FileCoreStateStore` satisfies this interface.
  */
-export interface ModuleRecordStore {
+export interface CoreStartupStateStore {
   listModuleProcessRecords(): readonly ModuleProcessRecord[];
   listModuleSubmissionRecords(): readonly ModuleSubmissionRecord[];
   getModuleProcessRecord(processGenerationId: string): ModuleProcessRecord | undefined;
@@ -105,14 +135,16 @@ export interface ModuleRecordStore {
     state: "starting" | "running" | "stopping" | "stopped",
     failureCode?: string,
   ): ModuleProcessRecord;
-  removeModuleSubmissionRecord(runId: string): void;
+  /**
+   * Releases the exact active Claim and removes its matching submission record
+   * in the same Core-state update.
+   */
+  releaseDeliveryClaim(
+    identity: DeliveryClaimIdentity,
+  ): "released" | "already-released";
   /** Collects one stopped process record that nothing references any more. */
   removeModuleProcessRecord(processGenerationId: string): void;
-  /**
-   * Persists the callback's related changes as one Core-state revision.
-   * Recovery uses this when a terminal Claim transition and the matching
-   * submission-record removal must be committed together.
-   */
+  /** Persists related process-record removals as one Core-state revision. */
   runAtomicUpdate<Operation extends () => unknown>(
     operation: Operation &
       ([ReturnType<Operation>] extends [never]
@@ -126,20 +158,76 @@ export interface ModuleRecordStore {
 }
 
 export interface CoreStartupRecoveryOptions {
-  readonly deliveries: DeliveryStore;
+  readonly deliveries: Pick<DeliveryStore, "inspectClaim" | "listActiveClaims">;
   readonly commits: ModuleResultCommitCoordinator;
-  readonly moduleRecords?: ModuleRecordStore;
+  readonly moduleRecords?: CoreStartupStateStore;
   readonly processStopProver?: ModuleProcessStopProver;
   readonly externalEffectEvidence?: ExternalEffectEvidenceSource;
 }
 
-function claimIdentity(claim: ClaimDescriptor): {
-  moduleJobId: string;
-  claimToken: string;
-  runId: string;
-  attempt: number;
-  moduleGenerationId: string;
-} {
+function hasExactlyProperties(
+  value: unknown,
+  properties: readonly string[],
+): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const ownProperties = Reflect.ownKeys(value);
+  return (
+    ownProperties.length === properties.length &&
+    ownProperties.every(
+      (property) =>
+        typeof property === "string" && properties.includes(property),
+    )
+  );
+}
+
+function isAcceptedProcessStopProof(
+  value: unknown,
+): value is Extract<ModuleProcessStopProof, { readonly proven: true }> {
+  return (
+    hasExactlyProperties(value, [
+      "proven",
+      "evidence",
+      "recordIdentityDigest",
+    ]) &&
+    value.proven === true &&
+    typeof value.recordIdentityDigest === "string" &&
+    (value.evidence === "populated-zero" ||
+      value.evidence === "missing-path" ||
+      value.evidence === "changed-boot-identifier")
+  );
+}
+
+function isRejectedProcessStopProof(
+  value: unknown,
+): value is Extract<ModuleProcessStopProof, { readonly proven: false }> {
+  return (
+    hasExactlyProperties(value, ["proven", "reason"]) &&
+    value.proven === false &&
+    typeof value.reason === "string"
+  );
+}
+
+export function isExternalEffectEvidence(
+  value: unknown,
+): value is ExternalEffectEvidence {
+  if (
+    hasExactlyProperties(value, ["kind"]) &&
+    (value.kind === "no-effect" ||
+      value.kind === "retry-safe" ||
+      value.kind === "terminal")
+  ) {
+    return true;
+  }
+  return (
+    hasExactlyProperties(value, ["kind", "reason"]) &&
+    value.kind === "unknown" &&
+    typeof value.reason === "string"
+  );
+}
+
+function claimIdentity(claim: ClaimDescriptor): DeliveryClaimIdentity {
   return {
     moduleJobId: claim.moduleJobId,
     claimToken: claim.claimToken,
@@ -159,20 +247,15 @@ function claimIdentity(claim: ClaimDescriptor): {
 /**
  * Chooses which Module records no longer describe anything Core can act on.
  *
- * A submission record whose Claim is gone belongs to a Run that already
- * reached a terminal state through an evidence-checked path. A process record
- * is collectable only when it is stopped, no active Claim's submission record
- * references its process generation, and no active Claim belongs to its Module
- * generation.
+ * A submission record must always match an active Claim and therefore has no
+ * later collection phase. A process record is collectable only when it is
+ * stopped, no submission record references its process generation, and no
+ * active Claim belongs to its Module generation.
  *
  * The three process-record conditions overlap on every state reachable through
  * `recover()`: an operator-visible unknown outcome keeps both a Claim and its
- * submission record, so two conditions retain the same record and removing any
- * one of them changes nothing observable. That redundancy is deliberate, but it
- * means a test driven only through `recover()` cannot show which condition did
- * the retaining. This selection is therefore exported as a pure function, so a
- * test can build a record set in which each condition is the only thing
- * standing between a record and collection.
+ * submission record. This selection is exported as a pure function so tests
+ * can independently prove both conditions that retain a process record.
  *
  * Over-collection is the dangerous direction: a record removed here is evidence
  * an operator needs to resolve an unknown outcome, and nothing recreates it.
@@ -185,23 +268,15 @@ export function selectCollectableModuleRecords(input: {
   readonly processRecords: readonly ModuleProcessRecord[];
   readonly submissionRecords: readonly ModuleSubmissionRecord[];
 }): {
-  readonly submissionRecords: readonly ModuleSubmissionRecord[];
   readonly processRecords: readonly ModuleProcessRecord[];
 } {
-  const activeRunIds = new Set<string>();
   const activeGenerations = new Set<string>();
   for (const claim of input.activeClaims) {
-    activeRunIds.add(claim.runId);
     activeGenerations.add(claim.moduleGenerationId);
   }
 
-  const submissionRecords = input.submissionRecords.filter(
-    (record) => !activeRunIds.has(record.runId),
-  );
   const referencedProcessGenerations = new Set(
-    input.submissionRecords
-      .filter((record) => activeRunIds.has(record.runId))
-      .map((record) => record.processGenerationId),
+    input.submissionRecords.map((record) => record.processGenerationId),
   );
   const processRecords = input.processRecords.filter(
     (record) =>
@@ -209,13 +284,13 @@ export function selectCollectableModuleRecords(input: {
       !referencedProcessGenerations.has(record.processGenerationId) &&
       !activeGenerations.has(record.moduleGenerationId),
   );
-  return { submissionRecords, processRecords };
+  return { processRecords };
 }
 
 export class CoreStartupRecovery {
-  readonly #deliveries: DeliveryStore;
+  readonly #deliveries: Pick<DeliveryStore, "inspectClaim" | "listActiveClaims">;
   readonly #commits: ModuleResultCommitCoordinator;
-  readonly #moduleRecords: ModuleRecordStore | undefined;
+  readonly #moduleRecords: CoreStartupStateStore | undefined;
   readonly #processStopProver: ModuleProcessStopProver | undefined;
   readonly #externalEffectEvidence: ExternalEffectEvidenceSource | undefined;
 
@@ -231,10 +306,39 @@ export class CoreStartupRecovery {
     const stoppedProcessGenerationIds = await this.#proveOldProcessesStopped();
     this.#assertRecordsLinkToClaims();
 
-    const recoveredCommits = await this.#commits.recoverAll();
+    let recoveredCommits: readonly ModuleResultCommitRecord[];
+    try {
+      recoveredCommits = await this.#commits.recoverAll();
+    } catch (error) {
+      if (error instanceof ModuleResultCommitError) {
+        switch (error.code) {
+          case "MODULE_JOB_ID_INVALID":
+          case "MODULE_JOB_RESULT_CONFLICT":
+          case "MODULE_JOB_CLAIM_NOT_ACTIVE":
+          case "MODULE_JOB_SOURCE_MISMATCH":
+          case "MODULE_JOB_OUTPUT_INVALID":
+          case "MODULE_RESULT_COMMIT_RECORD_MISSING":
+          case "MODULE_RESULT_COMMIT_REPOSITORY_CONFLICT":
+          case "MODULE_RESULT_PERSISTED_STATE_CONFLICT":
+            throw new CoreStartupRecoveryError(
+              "STARTUP_JOURNAL_CLAIM_INCONSISTENT",
+              `Module result journal recovery failed with ${error.code}: ${error.message}`,
+            );
+          default:
+            throw error;
+        }
+      }
+      throw error;
+    }
 
     const releasedClaims: ReleasedClaimReport[] = [];
     const unknownOutcomeClaims: UnknownOutcomeClaimReport[] = [];
+    const unresolvedClaims: Array<
+      DeliveryClaimIdentity & {
+        readonly kind: "outcome-unknown" | "retry-safety-unproven";
+        readonly reason: string;
+      }
+    > = [];
     for (const claim of this.#deliveries.listActiveClaims()) {
       if (this.#commits.inspect(claim.moduleJobId) !== null) {
         throw new CoreStartupRecoveryError(
@@ -244,37 +348,45 @@ export class CoreStartupRecovery {
       }
       const disposition = await this.#decideClaim(claim);
       if (disposition.kind === "release") {
-        // The Claim and its submission record become terminal in one
-        // Core-state update, so recovery can never see one without the other.
         const records = this.#moduleRecords;
-        const releaseClaim = (): void => {
-          this.#deliveries.releaseClaim(claimIdentity(claim));
-          if (records?.getModuleSubmissionRecord(claim.runId)) {
-            records.removeModuleSubmissionRecord(claim.runId);
-          }
-        };
-        if (records) records.runAtomicUpdate(releaseClaim);
-        else releaseClaim();
+        if (!records) {
+          throw new CoreStartupRecoveryError(
+            "STARTUP_CLAIM_RELEASE_UNCONFIRMED",
+            `Active Claim ${claim.runId} cannot be released without its Core-state record store`,
+          );
+        }
+        this.#releaseClaimAndConfirm(claim, records);
         releasedClaims.push({ ...claimIdentity(claim), reason: disposition.reason });
       } else {
-        unknownOutcomeClaims.push({
+        const entry = {
           ...claimIdentity(claim),
           reason: disposition.reason,
-        });
+        };
+        unresolvedClaims.push({ ...entry, kind: disposition.kind });
+        if (disposition.kind === "outcome-unknown") {
+          unknownOutcomeClaims.push(entry);
+        }
       }
     }
 
     const collectedRecords = this.#collectTerminalRecords();
 
-    if (unknownOutcomeClaims.length > 0) {
-      const detail = unknownOutcomeClaims
-        .map((entry) => `${entry.moduleJobId}/${entry.runId}: ${entry.reason}`)
+    if (unresolvedClaims.length > 0) {
+      const detail = unresolvedClaims
+        .map(
+          (entry) =>
+            `${entry.moduleJobId}/${entry.runId} [${
+              entry.kind === "retry-safety-unproven"
+                ? "external-effect retry safety unproven"
+                : "outcome unknown"
+            }]: ${entry.reason}`,
+        )
         .join("; ");
       throw new CoreStartupRecoveryError(
         "STARTUP_ACTIVE_CLAIM_UNRESOLVED",
-        `${unknownOutcomeClaims.length} active Delivery Claim${
-          unknownOutcomeClaims.length === 1 ? "" : "s"
-        } remain with an unknown outcome and require audited operator action (${detail})`,
+        `${unresolvedClaims.length} active Delivery Claim${
+          unresolvedClaims.length === 1 ? "" : "s"
+        } remain unresolved and require audited operator action (${detail})`,
       );
     }
 
@@ -288,44 +400,110 @@ export class CoreStartupRecovery {
   }
 
   /**
+   * Releases one Claim through the Core-state boundary, then confirms the
+   * exact terminal state through the same Delivery store startup is reading.
+   */
+  #releaseClaimAndConfirm(
+    claim: ClaimDescriptor,
+    records: CoreStartupStateStore,
+  ): void {
+    const identity = claimIdentity(claim);
+    let result: unknown;
+    let releaseThrew = false;
+    try {
+      result = records.releaseDeliveryClaim(identity);
+    } catch {
+      releaseThrew = true;
+    }
+
+    let persisted: ClaimDescriptor | undefined;
+    try {
+      persisted = this.#deliveries.inspectClaim(identity);
+    } catch {
+      // The stable recovery error below is more useful than exposing which
+      // storage callback failed first.
+    }
+    if (
+      !releaseThrew &&
+      result !== "released" &&
+      result !== "already-released"
+    ) {
+      throw new CoreStartupRecoveryError(
+        "STARTUP_CLAIM_RELEASE_UNCONFIRMED",
+        `Release of active Claim ${claim.runId} did not complete synchronously`,
+      );
+    }
+    if (!persisted) {
+      throw new CoreStartupRecoveryError(
+        "STARTUP_CLAIM_RELEASE_UNCONFIRMED",
+        `Release of active Claim ${claim.runId} could not be confirmed in the Delivery store used by startup`,
+      );
+    }
+    if (
+      persisted.moduleJobId !== claim.moduleJobId ||
+      persisted.consumerId !== claim.consumerId ||
+      persisted.claimToken !== claim.claimToken ||
+      persisted.runId !== claim.runId ||
+      persisted.attempt !== claim.attempt ||
+      persisted.moduleGenerationId !== claim.moduleGenerationId ||
+      persisted.status !== "released"
+    ) {
+      throw new CoreStartupRecoveryError(
+        "STARTUP_CLAIM_RELEASE_UNCONFIRMED",
+        `Release of active Claim ${claim.runId} was not persisted in the Delivery store used by startup`,
+      );
+    }
+    let submission: ModuleSubmissionRecord | undefined;
+    try {
+      submission = records.getModuleSubmissionRecord(claim.runId);
+    } catch {
+      throw new CoreStartupRecoveryError(
+        "STARTUP_CLAIM_RELEASE_UNCONFIRMED",
+        `Submission-record removal for released Claim ${claim.runId} could not be confirmed`,
+      );
+    }
+    if (submission !== undefined) {
+      throw new CoreStartupRecoveryError(
+        "STARTUP_CLAIM_RELEASE_UNCONFIRMED",
+        `Released Claim ${claim.runId} still has a Module submission record`,
+      );
+    }
+    if (releaseThrew) {
+      // The durable states are authoritative when the callback throws after
+      // its synchronous Core-state update completed.
+      return;
+    }
+  }
+
+  /**
    * Collects Module records that no longer describe anything Core can act on.
    *
-   * A submission record whose Claim is gone belongs to a Run that already
-   * reached a terminal state through an evidence-checked path. A stopped
-   * process record is collectable once no submission record references it and
-   * no active Claim belongs to its Module generation. Both are removed in one
-   * Core-state update so a partial collection cannot be observed.
+   * A stopped process record is collectable once no submission record
+   * references it and no active Claim belongs to its Module generation.
    *
    * Records are kept while anything still needs them: a Claim preserved as an
    * unknown outcome keeps its whole Module generation's records, because an
    * operator resolving it needs the evidence they carry.
    */
-  #collectTerminalRecords(): { submissionRecords: number; processRecords: number } {
+  #collectTerminalRecords(): { processRecords: number } {
     const records = this.#moduleRecords;
-    if (!records) return { submissionRecords: 0, processRecords: 0 };
+    if (!records) return { processRecords: 0 };
 
-    const {
-      submissionRecords: collectableSubmissions,
-      processRecords: collectableProcessRecords,
-    } = selectCollectableModuleRecords({
+    const { processRecords: collectableProcessRecords } = selectCollectableModuleRecords({
       activeClaims: this.#deliveries.listActiveClaims(),
       processRecords: records.listModuleProcessRecords(),
       submissionRecords: records.listModuleSubmissionRecords(),
     });
 
-    if (collectableSubmissions.length === 0 && collectableProcessRecords.length === 0) {
-      return { submissionRecords: 0, processRecords: 0 };
+    if (collectableProcessRecords.length === 0) {
+      return { processRecords: 0 };
     }
     records.runAtomicUpdate(() => {
-      for (const record of collectableSubmissions) {
-        records.removeModuleSubmissionRecord(record.runId);
-      }
       for (const record of collectableProcessRecords) {
         records.removeModuleProcessRecord(record.processGenerationId);
       }
     });
     return {
-      submissionRecords: collectableSubmissions.length,
       processRecords: collectableProcessRecords.length,
     };
   }
@@ -346,11 +524,49 @@ export class CoreStartupRecovery {
           `Module process record ${record.processGenerationId} is ${record.state} and no stop proof is available`,
         );
       }
-      const proof = await this.#processStopProver.proveStopped(record);
-      if (!proof.proven) {
+      let pendingProof: unknown;
+      try {
+        pendingProof = this.#processStopProver.proveStopped(record);
+      } catch {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_PROCESS_UNPROVEN",
+          `Module control group stop prover failed for process generation ${record.processGenerationId}`,
+        );
+      }
+      if (!(pendingProof instanceof Promise)) {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_PROCESS_UNPROVEN",
+          `Module control group stop prover returned an invalid result for process generation ${record.processGenerationId}`,
+        );
+      }
+      let proof: unknown;
+      try {
+        proof = await pendingProof;
+      } catch {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_PROCESS_UNPROVEN",
+          `Module control group stop prover failed for process generation ${record.processGenerationId}`,
+        );
+      }
+      if (isRejectedProcessStopProof(proof)) {
         throw new CoreStartupRecoveryError(
           "STARTUP_MODULE_PROCESS_UNPROVEN",
           `Module control group for process generation ${record.processGenerationId} could not be proven empty: ${proof.reason}`,
+        );
+      }
+      if (!isAcceptedProcessStopProof(proof)) {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_PROCESS_UNPROVEN",
+          `Module control group stop prover returned an invalid result for process generation ${record.processGenerationId}`,
+        );
+      }
+      if (
+        proof.recordIdentityDigest !==
+        moduleProcessStopProofIdentityDigest(record)
+      ) {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_PROCESS_UNPROVEN",
+          `Module control group stop proof does not match process generation ${record.processGenerationId}`,
         );
       }
       this.#moduleRecords!.updateModuleProcessRecordState(
@@ -364,8 +580,9 @@ export class CoreStartupRecovery {
 
   /**
    * Rejects a Core-state update whose Module records cannot be linked to the
-   * Claims in that same update: a submission record without its exact active
-   * Claim, or an identity mismatch, is a fail-closed recovery error.
+   * Claims in that same update. A submission record without its exact active
+   * Claim, including one whose Claim is already terminal, is a fail-closed
+   * recovery error.
    */
   #assertRecordsLinkToClaims(): void {
     if (!this.#moduleRecords) return;
@@ -375,18 +592,10 @@ export class CoreStartupRecovery {
     for (const submission of this.#moduleRecords.listModuleSubmissionRecords()) {
       const claim = activeClaims.get(submission.runId);
       if (!claim) {
-        // A submission record whose Claim is gone describes a Run that already
-        // reached a terminal state through an evidence-checked path: it was
-        // committed, acknowledged, or released. The record has no remaining
-        // purpose, so it is collected rather than treated as an inconsistency.
-        //
-        // Requiring a committed result here instead would make recovery depend
-        // on the result-commit journal never deleting anything. That coupling
-        // is not written down anywhere and would turn every historical record
-        // into a startup failure the moment the journal gains a retention or
-        // cleanup policy. `#collectTerminalRecords` removes it after the
-        // remaining Claims have been decided.
-        continue;
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_RECORD_INCONSISTENT",
+          `Module submission record for Run ${submission.runId} has no matching active Claim`,
+        );
       }
       if (
         claim.moduleJobId !== submission.moduleJobId ||
@@ -406,56 +615,39 @@ export class CoreStartupRecovery {
     claim: ClaimDescriptor,
   ): Promise<
     | { kind: "release"; reason: ReleasedClaimReport["reason"] }
-    | { kind: "unknown"; reason: string }
+    | { kind: "outcome-unknown"; reason: string }
+    | { kind: "retry-safety-unproven"; reason: string }
   > {
     if (!this.#moduleRecords) {
       return {
-        kind: "unknown",
+        kind: "outcome-unknown",
         reason: "no durable Module process or submission record is available",
       };
     }
     const submission = this.#moduleRecords.getModuleSubmissionRecord(claim.runId);
     if (!submission) {
-      // Without a submission record there is no link from this Claim to one
-      // exact process record, and one Module generation may legitimately have
-      // several start attempts. What Architecture Decision Record 0009 step 5
-      // actually requires is that no process of that generation can still be
-      // running, so every process record of the generation must be stopped.
-      const generationRecords = this.#moduleRecords
-        .listModuleProcessRecords()
-        .filter((record) => record.moduleGenerationId === claim.moduleGenerationId);
-      if (generationRecords.length === 0) {
-        return {
-          kind: "unknown",
-          reason: "no Module process record matches this Claim",
-        };
-      }
-      const running = generationRecords.filter((record) => record.state !== "stopped");
-      if (running.length > 0) {
-        return {
-          kind: "unknown",
-          reason: `${running.length} Module process record${
-            running.length === 1 ? " is" : "s are"
-          } not stopped for this Claim's Module generation`,
-        };
-      }
-      // Core never received durable authority to send this Run, and every old
-      // Module control group of that generation is proven empty, so the exact
-      // Claim is safe to release for a later attempt.
-      return { kind: "release", reason: "never-submitted" };
+      // Version 16 allowed a submission record to be removed independently
+      // while its Claim remained active. Process stop proof establishes only
+      // that no old process remains; it cannot establish whether this Run was
+      // sent before that record disappeared.
+      return {
+        kind: "outcome-unknown",
+        reason:
+          "the Core-state version does not prove whether the missing Module submission record was never written or was removed separately",
+      };
     }
     const processRecord = this.#moduleRecords.getModuleProcessRecord(
       submission.processGenerationId,
     );
     if (!processRecord) {
       return {
-        kind: "unknown",
+        kind: "outcome-unknown",
         reason: "no Module process record matches this Claim's submission record",
       };
     }
     if (processRecord.state !== "stopped") {
       return {
-        kind: "unknown",
+        kind: "outcome-unknown",
         reason: `matching Module process record is ${processRecord.state}`,
       };
     }
@@ -464,15 +656,51 @@ export class CoreStartupRecovery {
     }
     if (!this.#externalEffectEvidence) {
       return {
-        kind: "unknown",
+        kind: "outcome-unknown",
         reason: "the Run was submitted and no external-effect evidence source is available",
       };
     }
-    const evidence = await this.#externalEffectEvidence.inspectRunEffects(submission);
-    if (evidence.kind === "unknown") {
-      return { kind: "unknown", reason: evidence.reason };
+    let pendingEvidence: unknown;
+    try {
+      pendingEvidence = this.#externalEffectEvidence.inspectRunEffects(submission);
+    } catch {
+      return {
+        kind: "outcome-unknown",
+        reason: "the external-effect evidence source failed",
+      };
     }
-    return { kind: "release", reason: "effect-evidence-safe" };
+    if (!(pendingEvidence instanceof Promise)) {
+      return {
+        kind: "outcome-unknown",
+        reason: "the external-effect evidence source returned an invalid result",
+      };
+    }
+    let evidence: unknown;
+    try {
+      evidence = await pendingEvidence;
+    } catch {
+      return {
+        kind: "outcome-unknown",
+        reason: "the external-effect evidence source failed",
+      };
+    }
+    if (!isExternalEffectEvidence(evidence)) {
+      return {
+        kind: "outcome-unknown",
+        reason: "the external-effect evidence source returned an invalid result",
+      };
+    }
+    if (evidence.kind === "unknown") {
+      return { kind: "outcome-unknown", reason: evidence.reason };
+    }
+    if (evidence.kind === "terminal") {
+      return {
+        kind: "retry-safety-unproven",
+        reason:
+          "the external effect has a durable terminal outcome, but no durable idempotency contract proves that repeating the Run is safe",
+      };
+    }
+    return { kind: "release", reason: "external-effects-safe-to-retry" };
   }
 
 }

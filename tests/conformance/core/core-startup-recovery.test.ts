@@ -3,15 +3,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type BlockProposal } from "../../../src/core/block-store.js";
+import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
 import { CoreStartupRecovery } from "../../../src/core/core-startup-recovery.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
+import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import {
   ModuleResultCommitCoordinator,
+  ModuleResultCommitError,
   type ModuleResultCommitCoordinatorOptions,
 } from "../../../src/core/module-result-commit.js";
 
 const NOW = "2026-07-24T00:00:00.000Z";
+const PACKAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+const CONFIGURATION_DIGEST = `sha256:${"b".repeat(64)}`;
+const SERVICE_INVOCATION_ID = "2812432ad29e4d3bbd6776c62cafa929";
+const BOOT_ID = "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9";
 
 function proposal(text: string): BlockProposal {
   return {
@@ -43,10 +50,63 @@ function coordinator(
   return new ModuleResultCommitCoordinator({
     blocks: core.blocks,
     deliveries: core.deliveries,
+    getModuleSubmissionRecord: (runId) =>
+      core.getModuleSubmissionRecord(runId),
+    acknowledgeDeliveryClaim: (identity) => core.acknowledgeDeliveryClaim(identity),
     repository,
     now: () => NOW,
     ...(afterEffect === undefined ? {} : { afterEffect }),
   });
+}
+
+function appendStoppedProcessAndSubmission(
+  core: FileCoreStateStore,
+  claim: {
+    readonly moduleJobId: string;
+    readonly claimToken: string;
+    readonly runId: string;
+    readonly attempt: number;
+    readonly moduleGenerationId: string;
+  },
+): void {
+  const processGenerationId = "process-generation-1";
+  core.appendModuleProcessRecord({
+    schemaVersion: "dolly.module-process-record/1",
+    instanceId: "instance-1",
+    moduleId: "worker",
+    moduleGenerationId: claim.moduleGenerationId,
+    processGenerationId,
+    packageDigest: PACKAGE_DIGEST,
+    configurationReference: {
+      configId: "config-1",
+      revision: CONFIGURATION_DIGEST,
+      configVersion: 1,
+    },
+    declaredExternalEffects: "core-capabilities-only",
+    serviceInvocationId: SERVICE_INVOCATION_ID,
+    bootId: BOOT_ID,
+    moduleCgroupPath: deriveModuleCgroupPath("/system.slice/dolly-core.service", {
+      instanceId: "instance-1",
+      moduleId: "worker",
+      processGenerationId,
+    }).filesystemPath,
+    state: "starting",
+    createdAt: NOW,
+    updatedAt: NOW,
+  });
+  core.updateModuleProcessRecordState(processGenerationId, "running");
+  core.appendModuleSubmissionRecord({
+    schemaVersion: "dolly.module-submission-record/1",
+    moduleJobId: claim.moduleJobId,
+    claimToken: claim.claimToken,
+    runId: claim.runId,
+    attempt: claim.attempt,
+    moduleGenerationId: claim.moduleGenerationId,
+    processGenerationId,
+    inputDigest: canonicalJsonDigest(core.deliveries.inspectClaimInput(claim)),
+    createdAt: NOW,
+  });
+  core.updateModuleProcessRecordState(processGenerationId, "stopped");
 }
 
 describe("CORE startup journal recovery", () => {
@@ -64,7 +124,7 @@ describe("CORE startup journal recovery", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it("recovers prepared effects before checking for unresolved active Claims", async () => {
+  it("recovers a prepared result for an active Claim with its exact submission", async () => {
     const first = openCore(statePath, "first");
     first.deliveries.createPage("input");
     first.deliveries.createPage("output");
@@ -82,6 +142,7 @@ describe("CORE startup journal recovery", () => {
       maxCount: 1,
       maxBytes: 1024 * 1024,
     })!;
+    appendStoppedProcessAndSubmission(first, claim);
     const repository = new FileModuleResultCommitRepository({ path: journalPath });
     const interrupted = coordinator(first, repository, (event) => {
       if (event.phase === "after-block-effect") throw new Error("simulated interruption");
@@ -103,6 +164,7 @@ describe("CORE startup journal recovery", () => {
     const recovery = new CoreStartupRecovery({
       deliveries: restarted.deliveries,
       commits: coordinator(restarted, restartedRepository),
+      moduleRecords: restarted,
     });
     const report = await recovery.recover();
     expect(report.recoveredCommits).toHaveLength(1);
@@ -122,16 +184,9 @@ describe("CORE startup journal recovery", () => {
       maxBytes: 1024 * 1024,
     })!;
     expect(sink.deliveryIds).toHaveLength(1);
-    restarted.deliveries.ack({
-      moduleJobId: sink.moduleJobId,
-      claimToken: sink.claimToken,
-      runId: sink.runId,
-      attempt: sink.attempt,
-      moduleGenerationId: sink.moduleGenerationId,
-    });
   });
 
-  it("reconciles a terminal journal against a core snapshot captured before its ack", async () => {
+  it("fails closed when a committed result journal has an active Claim", async () => {
     const first = openCore(statePath, "first");
     first.deliveries.createPage("input");
     first.deliveries.createPage("output");
@@ -148,6 +203,7 @@ describe("CORE startup journal recovery", () => {
       maxCount: 1,
       maxBytes: 1024 * 1024,
     })!;
+    appendStoppedProcessAndSubmission(first, claim);
     const repository = new FileModuleResultCommitRepository({ path: journalPath });
     let captured: Buffer | undefined;
     let interrupted = false;
@@ -175,18 +231,21 @@ describe("CORE startup journal recovery", () => {
 
     const restarted = openCore(statePath, "second");
     const restartedRepository = new FileModuleResultCommitRepository({ path: journalPath });
-    const report = await new CoreStartupRecovery({
+    await expect(new CoreStartupRecovery({
       deliveries: restarted.deliveries,
       commits: coordinator(restarted, restartedRepository),
-    }).recover();
-    expect(report.recoveredCommits).toEqual([]);
+      moduleRecords: restarted,
+    }).recover()).rejects.toMatchObject({
+      code: "STARTUP_JOURNAL_CLAIM_INCONSISTENT",
+    });
     expect(restarted.deliveries.inspectClaim({
       moduleJobId: claim.moduleJobId,
       claimToken: claim.claimToken,
       runId: claim.runId,
       attempt: claim.attempt,
       moduleGenerationId: claim.moduleGenerationId,
-    }).status).toBe("committed");
+    }).status).toBe("active");
+    expect(restarted.getModuleSubmissionRecord(claim.runId)).toBeDefined();
   });
 
   it("refuses a journal-free active Claim and leaves it unchanged", async () => {
@@ -242,7 +301,7 @@ describe("CORE startup journal recovery", () => {
       attempt: claim.attempt,
       moduleGenerationId: claim.moduleGenerationId,
     };
-    first.deliveries.releaseClaim(request);
+    first.releaseDeliveryClaim(request);
 
     const restarted = openCore(statePath, "second");
     const repository = new FileModuleResultCommitRepository({ path: journalPath });
@@ -254,7 +313,7 @@ describe("CORE startup journal recovery", () => {
       releasedClaims: [],
       unknownOutcomeClaims: [],
       stoppedProcessGenerationIds: [],
-      collectedRecords: { submissionRecords: 0, processRecords: 0 },
+      collectedRecords: { processRecords: 0 },
     });
     expect(restarted.deliveries.inspectClaim(request).status).toBe("released");
 
@@ -271,4 +330,76 @@ describe("CORE startup journal recovery", () => {
       attempt: 2,
     });
   });
+
+  it.each([
+    "MODULE_JOB_SOURCE_MISMATCH",
+    "MODULE_JOB_OUTPUT_INVALID",
+  ] as const)(
+    "maps %s from result-journal recovery to the startup boundary",
+    async (resultCommitCode) => {
+      const core = openCore(statePath, "first");
+      const resultCommitError = new ModuleResultCommitError(
+        resultCommitCode,
+        "persisted result does not match the active Claim",
+      );
+      const commits = {
+        recoverAll: async () => {
+          throw resultCommitError;
+        },
+      } as unknown as ModuleResultCommitCoordinator;
+
+      await expect(
+        new CoreStartupRecovery({
+          deliveries: core.deliveries,
+          commits,
+        }).recover(),
+      ).rejects.toMatchObject({
+        code: "STARTUP_JOURNAL_CLAIM_INCONSISTENT",
+        message: expect.stringContaining(resultCommitCode),
+      });
+    },
+  );
+
+  it("passes through a non-result-commit recovery error unchanged", async () => {
+    const core = openCore(statePath, "first");
+    const storageFailure = new Error("result journal storage unavailable");
+    const commits = {
+      recoverAll: async () => {
+        throw storageFailure;
+      },
+    } as unknown as ModuleResultCommitCoordinator;
+
+    await expect(
+      new CoreStartupRecovery({
+        deliveries: core.deliveries,
+        commits,
+      }).recover(),
+    ).rejects.toBe(storageFailure);
+  });
+
+  it.each([
+    "MODULE_RESULT_COMMIT_IO_FAILED",
+    "MODULE_RESULT_OPERATION_CONTRACT_VIOLATION",
+  ] as const)(
+    "does not misclassify %s as a Claim inconsistency",
+    async (resultCommitCode) => {
+      const core = openCore(statePath, "first");
+      const originalError = new ModuleResultCommitError(
+        resultCommitCode,
+        "result commit operation did not complete normally",
+      );
+      const commits = {
+        recoverAll: async () => {
+          throw originalError;
+        },
+      } as unknown as ModuleResultCommitCoordinator;
+
+      await expect(
+        new CoreStartupRecovery({
+          deliveries: core.deliveries,
+          commits,
+        }).recover(),
+      ).rejects.toBe(originalError);
+    },
+  );
 });

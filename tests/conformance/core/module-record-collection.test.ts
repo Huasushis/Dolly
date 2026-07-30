@@ -82,7 +82,6 @@ describe("Module record collection, one retention condition at a time", () => {
     });
 
     expect(selected.processRecords).toEqual([record]);
-    expect(selected.submissionRecords).toEqual([]);
   });
 
   it("keeps a process record that is not stopped, when nothing else would keep it", () => {
@@ -137,15 +136,13 @@ describe("Module record collection, one retention condition at a time", () => {
     });
 
     expect(selected.processRecords).toEqual([]);
-    // The submission belongs to an active Claim, so it is retained too.
-    expect(selected.submissionRecords).toEqual([]);
   });
 
   it("keeps a process record of an active Claim's Module generation with no submission record", () => {
-    // The Claim was never submitted, so no submission record references this
-    // process generation. The Module-generation condition is the only thing
-    // retaining the record, and an operator resolving the Claim needs it to
-    // decide whether the Module ever ran.
+    // Version 16 cannot prove whether the missing submission record was never
+    // written or was removed separately. No submission references this process
+    // generation, so the Module-generation condition is the only thing
+    // retaining the record for audited operator action.
     const record = processRecord({
       processGenerationId: "process-generation-1",
       moduleGenerationId: "module-generation-1",
@@ -158,35 +155,6 @@ describe("Module record collection, one retention condition at a time", () => {
     });
 
     expect(selected.processRecords).toEqual([]);
-  });
-
-  it("keeps a submission record whose Claim is still active", () => {
-    const submission = submissionRecord({ runId: "run-active" });
-
-    const selected = selectCollectableModuleRecords({
-      activeClaims: [{ runId: "run-active", moduleGenerationId: "module-generation-1" }],
-      processRecords: [],
-      submissionRecords: [submission],
-    });
-
-    expect(selected.submissionRecords).toEqual([]);
-  });
-
-  it("collects a submission record whose Claim is gone but keeps one whose Claim is active", () => {
-    // A Claim that is gone reached a terminal state through an evidence-checked
-    // path, so its submission record informs nothing. Selecting per record
-    // rather than per collection keeps one resolved Run from holding another
-    // Run's evidence, and keeps one unresolved Run from releasing it.
-    const resolved = submissionRecord({ runId: "run-resolved", moduleJobId: "job-1" });
-    const unresolved = submissionRecord({ runId: "run-active", moduleJobId: "job-2" });
-
-    const selected = selectCollectableModuleRecords({
-      activeClaims: [{ runId: "run-active", moduleGenerationId: "module-generation-1" }],
-      processRecords: [],
-      submissionRecords: [resolved, unresolved],
-    });
-
-    expect(selected.submissionRecords).toEqual([resolved]);
   });
 
   it("keeps every record of a Module generation with two Claims when one is still active", () => {

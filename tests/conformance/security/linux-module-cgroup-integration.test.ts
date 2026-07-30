@@ -35,6 +35,7 @@ import {
   type ModuleCgroupFileSystem,
   type ModuleCgroupLimits,
 } from "../../../src/core/linux-module-cgroup.js";
+import { moduleProcessStopProofIdentityDigest } from "../../../src/core/core-startup-recovery.js";
 import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
 
 const LIMITS: ModuleCgroupLimits = {
@@ -392,6 +393,7 @@ describe.skipIf(delegatedRoot === undefined)("Module cgroup on a real Linux kern
     expect(await prover.proveStopped(record())).toEqual({
       proven: true,
       evidence: "populated-zero",
+      recordIdentityDigest: moduleProcessStopProofIdentityDigest(record()),
     });
 
     // 2. A live process makes the same path unprovable.
@@ -403,9 +405,14 @@ describe.skipIf(delegatedRoot === undefined)("Module cgroup on a real Linux kern
 
     // 3. A different boot identifier proves the old process cannot exist even
     //    while this path is populated by a new one.
-    expect(
-      await prover.proveStopped(record({ bootId: "00000000-0000-0000-0000-000000000000" })),
-    ).toEqual({ proven: true, evidence: "changed-boot-identifier" });
+    const previousBootRecord = record({
+      bootId: "00000000-0000-0000-0000-000000000000",
+    });
+    expect(await prover.proveStopped(previousBootRecord)).toEqual({
+      proven: true,
+      evidence: "changed-boot-identifier",
+      recordIdentityDigest: moduleProcessStopProofIdentityDigest(previousBootRecord),
+    });
 
     // 4. After real termination and removal the missing path is proof.
     await recordMembershipFromKernel(cgroup);
@@ -414,6 +421,7 @@ describe.skipIf(delegatedRoot === undefined)("Module cgroup on a real Linux kern
     expect(await prover.proveStopped(record())).toEqual({
       proven: true,
       evidence: "missing-path",
+      recordIdentityDigest: moduleProcessStopProofIdentityDigest(record()),
     });
   });
 
