@@ -39,16 +39,22 @@
 # Options:
 #   --base <image>   Base image, for a mirror where the default is unreachable
 #   --keep           Leave the container running for inspection after the run
+#   --test-file <path>
+#                    Run this exact Linux integration test instead of the
+#                    ownership experiment. Repeat the option for more files.
 set -euo pipefail
 
 REPOSITORY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 EXPERIMENT_DIR="${REPOSITORY_ROOT}/scripts/experiments/linux-core-service-ownership"
-IMAGE_TAG="dolly-experiment"
 # The container name must be unique across concurrent runs, including runs
 # started by different sessions whose process identifiers can coincide.
 CONTAINER_NAME="dolly-experiment-$$-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+# A matching unique image tag prevents concurrent builds from retagging the
+# image between another invocation's build and container creation.
+IMAGE_TAG="${CONTAINER_NAME}-image"
 BASE_IMAGE="ubuntu:24.04"
 KEEP_CONTAINER="no"
+TEST_FILES=()
 
 # Options this script owns are consumed here; everything else is passed
 # through to the experiment runner unchanged, so the runner's own filters
@@ -59,9 +65,15 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --base) BASE_IMAGE="$2"; shift 2 ;;
     --keep) KEEP_CONTAINER="yes"; shift ;;
+    --test-file) TEST_FILES+=("$2"); shift 2 ;;
     *) RUNNER_ARGS+=("$1"); shift ;;
   esac
 done
+
+if [ "${#TEST_FILES[@]}" -gt 0 ] && [ "${#RUNNER_ARGS[@]}" -gt 0 ]; then
+  echo "--test-file cannot be combined with ownership experiment filters." >&2
+  exit 1
+fi
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "This script requires docker to create the disposable environment." >&2
@@ -115,6 +127,7 @@ cleanup() {
     return
   fi
   docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  docker image rm "${IMAGE_TAG}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 # A hangup means the terminal went away, not that the experiment should stop.
@@ -183,6 +196,17 @@ fi
 DOLLY_UID="$(docker exec "${CONTAINER_NAME}" id -u dolly)"
 echo "Service manager state: ${state}; unprivileged account uid ${DOLLY_UID}"
 
+# Source identity is written while the artifact directory still belongs to
+# the host account. The directory is handed to the container account below.
+if [ "${#TEST_FILES[@]}" -gt 0 ]; then
+  git -C "${REPOSITORY_ROOT}" rev-parse HEAD > "${ARTIFACT_ROOT}/source-commit.txt"
+  git -C "${REPOSITORY_ROOT}" status --short > "${ARTIFACT_ROOT}/source-status.txt"
+  {
+    printf '%q ' ./scripts/run-linux-module-launcher-integration.sh "${TEST_FILES[@]}"
+    printf '\n'
+  } > "${ARTIFACT_ROOT}/command.txt"
+fi
+
 # The artifact volume is created by the host account, whose identifier need not
 # exist inside the container. The experiment runs unprivileged, so the mount
 # point is handed to that account before the run starts.
@@ -211,18 +235,34 @@ docker exec "${CONTAINER_NAME}" bash -c "
 # Report the conditions the matrix depends on, so a run that silently lost one
 # of them is visible in its own output rather than only in a failed case.
 docker exec "${CONTAINER_NAME}" bash -c '
-  echo "cgroup filesystem: $(stat -fc %T /sys/fs/cgroup)"
-  echo "root controllers:  $(cat /sys/fs/cgroup/cgroup.controllers)"
-  echo "lingering:         $(loginctl show-user dolly -p Linger)"
-  echo "python3:           $(python3 -V 2>&1)"
+  set -o pipefail
+  {
+    echo "cgroup filesystem: $(stat -fc %T /sys/fs/cgroup)"
+    echo "root controllers:  $(cat /sys/fs/cgroup/cgroup.controllers)"
+    echo "lingering:         $(loginctl show-user dolly -p Linger)"
+    echo "python3:           $(python3 -V 2>&1)"
+  } | tee /dolly-artifacts/environment.txt
 '
 
-echo "Running the experiment as the unprivileged account"
-docker exec -u dolly \
-  -e "XDG_RUNTIME_DIR=/run/user/${DOLLY_UID}" \
-  -w "${WORK_TREE}" \
-  "${CONTAINER_NAME}" \
-  ./scripts/experiments/linux-core-service-ownership/run.sh \
-  --disposable --output-dir /dolly-artifacts "${RUNNER_ARGS[@]+"${RUNNER_ARGS[@]}"}"
+if [ "${#TEST_FILES[@]}" -gt 0 ]; then
+  echo "Running exact Linux integration test files as the unprivileged account"
+  docker exec -u dolly \
+    -e "XDG_RUNTIME_DIR=/run/user/${DOLLY_UID}" \
+    -w "${WORK_TREE}" \
+    "${CONTAINER_NAME}" \
+    bash -c '
+      set -o pipefail
+      ./scripts/run-linux-module-launcher-integration.sh "$@" \
+        2>&1 | tee /dolly-artifacts/linux-integration.log
+    ' bash "${TEST_FILES[@]}"
+else
+  echo "Running the experiment as the unprivileged account"
+  docker exec -u dolly \
+    -e "XDG_RUNTIME_DIR=/run/user/${DOLLY_UID}" \
+    -w "${WORK_TREE}" \
+    "${CONTAINER_NAME}" \
+    ./scripts/experiments/linux-core-service-ownership/run.sh \
+    --disposable --output-dir /dolly-artifacts "${RUNNER_ARGS[@]+"${RUNNER_ARGS[@]}"}"
+fi
 
 echo "Artifacts: ${ARTIFACT_ROOT}"
