@@ -1,9 +1,10 @@
 # 当前状态与待办（接手先读这一份）
 
-写于 2026-07-26 深夜，最近一次更新为 2026-07-31，当前 HEAD 为 `1fd90e1`。P0-3 的 Linux
+写于 2026-07-26 深夜，最近一次更新为 2026-07-31，当前 HEAD 为 `119eac5`。P0-3 的 Linux
 源码复验仍绑定到 `e9d5975`，不能改标签冒充当前 HEAD；其后的 `d5acea1`、`6ea62f8`、
-`8ef9f07` 和 `e9200c5` 只提交了证据或文档。`7462046` 随后修复异步 Core-state update，
-`1fd90e1` 修复持久更新完成后锁释放确认失败时继续使用不确定内存状态的问题。上一轮所有并行
+`8ef9f07` 和 `e9200c5` 只提交了证据或文档。`7462046` 修复异步 Core-state update，
+`1fd90e1` 修复锁释放确认失败时继续使用不确定内存状态的问题，`4e9dae3` 收窄根入口公开的
+运行时会话，`119eac5` 裁定 Claim 与 Module submission record 的强一致性规则。上一轮所有并行
 会话同时到达上限而停止，任务表随之丢失，所以这份文件是权威的接续点；下文把更早结果明确标为
 历史结果，不用追加日志的方式保留过期结论。
 
@@ -192,11 +193,12 @@ Linux 文件共 26/26 通过。证据、单文件补丁、逐文件 SHA-256 与�
    `populated 0` 和目录删除的证明。
    `stopModuleProcess()` 在自己的路径上稍后重新证明这些条件，不能阻止别的调用者先持久化并暴露
    一个没有证明的 `stopped`；
-4. submission record 与 Claim 的规范强度互相冲突。`core-runtime.md` 一处要求每条 submission
-   record 精确匹配 active Claim，并把找不到 Claim 的孤立记录定为 fail-closed；另一处又把“没有
-   active Claim 的 submission record”解释成已终止、可收集的残留。当前写接口只强制匹配
-   `running` process record 和 Module generation，不强制匹配 Claim 的 job、token、run、attempt；
-   启动恢复实现了较弱的后一种解释。这项规范冲突尚未裁定，不能把任一方向写成已经决定的方案；
+4. ✓ **规范已裁定（`119eac5`），产品强制点未完成**：每条 submission record 必须精确匹配
+   active Claim；Claim 变为 `released`、`nacked`、`committed` 或 `dead-lettered` 时，必须在同一
+   Core-state update 删除匹配记录。terminal Claim 与 submission record 共存是失败关闭，不是
+   后续收集输入。成功结果顺序为 durable `prepared` journal → 幂等输出效果 → 原子
+   acknowledgement 与记录删除 → `committed` journal。当前 version 16 写接口和启动恢复仍实现
+   较弱规则，且 version 16 中 active Claim 缺记录有迁移歧义，不能自动判为 `never-submitted`；
 5. 所有权未知时的 control-group 清理有超时，但它之前的同步 `stopping` 持久化调用没有时间上界；
    若该调用不返回，默认 `process.exit(1)` 强制点也到不了；
 6. ✓ **已修（`7462046`）**：`FileCoreStateStore.runAtomicUpdate()` 现在只接受静态返回
@@ -210,12 +212,17 @@ Linux 文件共 26/26 通过。证据、单文件补丁、逐文件 SHA-256 与�
    `channelCloseTimeoutMs`；`NaN` 等无效值会破坏“有界等待”的含义；
 8. `runtime-bootstrap.ts` 仍拒绝配置了 Module 的运行时，也没有生产调用者把 service binding、
    launcher、control group、协议会话、持久记录、Claim 与 submission record 装配成一条路径。
-9. `DollyRuntimeSession.core` 公开暴露具体的 `FileCoreStateStore`，不是只读或按职责收窄的接口；
-   任何拿到 runtime session 的调用者都能直接使用上述 process/submission record 写入方法。当前
-   没有证据证明这些写入只能从持有对应运行时证明的路径到达；
+9. ✓ **根入口暴露已修（`4e9dae3`）**：`DollyCliContext.waitForShutdown` 现在收到独立冻结对象，
+   只含 `state`、`status()` 和幂等 `stop()`；真实 JavaScript 对象与生成的根声明都不含
+   `FileCoreStateStore` 或 `ModuleResultCommitCoordinator`。精确测试 5/5、完整 `typecheck`
+   exit 0。未通过 package exports 暴露的内部 `DollyRuntimeSession` 类仍保留具体字段供内部测试，
+   不能把根入口修复扩大表述成整个内部调用图已经封闭；
 10. store 只按 `processGenerationId` 防重复；它允许同一个 instance、Module 和 Module generation
     同时存在多条 `starting`、`running` 或 `stopping` 记录。后续恢复检查不能撤销这种重叠已经被
-    持久化并可能被其他代码观察到的事实。
+    持久化并可能被其他代码观察到的事实；
+11. `removeModuleProcessRecord()` 删除记录后，当前 Map 不再记得该 `processGenerationId`；
+    `appendModuleProcessRecord()` 可把同一标识再次落盘。ADR 0009 所称 process generation 与
+    control-group path 永不复用因此没有持久强制点，不能只依赖随机生成器或当前 Map。
 
 处理这些问题时不要只补单元分支：每项先在真正的跨层强制点构造会失败的反例，尤其要证明“来自另一
 次启动的会话/记录”不能被接受，以及没有停止证明时任何路径都不能写 `stopped`。
@@ -340,13 +347,15 @@ M14 重复案例。P0-1 的两个完整 manifest 也各自报 4,391 次计划执
 | Linux runner 的执行与证据边界 | 一次性容器入口、精确 Linux 测试入口、实验入口 | 两种模式均记录来源、状态、命令和环境；拒绝调用者覆盖 `--output-dir` / `--disposable`；catalog v5 为 570 例 |
 | 拒绝异步 Core-state update | `FileCoreStateStore.runAtomicUpdate()`、启动恢复接口 | 类型与运行时都拒绝异步回调和非 `undefined` 返回值；四类反例通过，精确测试 30/30，完整 `typecheck` exit 0 |
 | 锁释放确认失败后关闭旧 store | `FileCoreStateStore.#withMutationLock()` | 按回调是否已返回区分回调错误与释放确认错误；精确测试 53 pass、1 个平台限定 skip |
+| 根 CLI 回调不再暴露 Core 写接口 | `src/entry.ts`、CLI runtime test | 冻结的 `state/status/stop` 对象；根声明无 Core store/commit coordinator；5/5 + typecheck |
+| Claim 与 submission record 强规则 | ADR 0009、`core-runtime.md`、`security-operations.md` | 终态转换与记录删除同一次 Core-state update；terminal+record 失败关闭；version 16 歧义不得自动重试 |
 | 恢复完整 TypeScript 范围并修复 91 条诊断 | `tsconfig.json`、`package.json`、33 个测试文件 | 标准 `typecheck` exit 0；按受影响文件精确运行的用例全绿，5 个未启用的付费 live 用例明确 skipped |
 
-当前核实点：HEAD 为 `1fd90e1`。P0-3 Linux 复验使用的源码与 runner 仍是 `e9d5975`；其后的
+当前核实点：HEAD 为 `119eac5`。P0-3 Linux 复验使用的源码与 runner 仍是 `e9d5975`；其后的
 文档/证据提交为 `d5acea1`、`6ea62f8`、`8ef9f07`、`e9200c5`，产品代码修复为 `7462046` 和
-`1fd90e1`。目录为 **v5、570 例、1 个 exclusive**。catalog v5 修改了 live-Core 终止判据，所以
-该组必须重跑；当前 233 例 proposed-arm 选择集已重跑，但完整 570 例和目录声明的重复次数仍未
-执行。更早 catalog v3 的 P0-3 工件只作为历史运行保留。
+`1fd90e1`、`4e9dae3`，规范裁决为 `119eac5`。目录为 **v5、570 例、1 个 exclusive**。catalog
+v5 修改了 live-Core 终止判据，所以该组必须重跑；当前 233 例 proposed-arm 选择集已重跑，但
+完整 570 例和目录声明的重复次数仍未执行。更早 catalog v3 的 P0-3 工件只作为历史运行保留。
 
 ---
 
