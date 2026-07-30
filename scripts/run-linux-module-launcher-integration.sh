@@ -5,8 +5,11 @@
 # These scenarios need the process that runs them to sit in a delegated
 # cgroup v2 subtree named `core`, exactly as Architecture Decision Record 0009
 # places the Dolly Core service. An ordinary shell is not in such a subtree, so
-# the test file skips itself and reports why. Running the suite through this
-# script is the only way to make those scenarios execute.
+# the test file normally skips itself and reports why. Running the suite through
+# this script is the only way to make those scenarios execute. The script sets
+# `DOLLY_LINUX_MODULE_INTEGRATION_REQUIRED=1`, which makes the relevant test
+# files fail during collection if the delegated environment is missing instead
+# of allowing an all-skipped run to exit successfully.
 #
 # Usage, from a checkout with dependencies installed:
 #
@@ -48,6 +51,7 @@ exec systemd-run \
   -p Delegate=yes \
   -p DelegateSubgroup=core \
   -p Type=exec \
+  --setenv=DOLLY_LINUX_MODULE_INTEGRATION_REQUIRED=1 \
   "--working-directory=${REPOSITORY_ROOT}" \
   -- \
   "${NODE_PATH_RESOLVED}" "${VITEST_ENTRY}" run \

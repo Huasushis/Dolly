@@ -31,6 +31,15 @@ function delegatedSubgroupAvailable(): boolean {
 
 const available = delegatedSubgroupAvailable();
 
+if (
+  process.env.DOLLY_LINUX_MODULE_INTEGRATION_REQUIRED === "1" &&
+  !available
+) {
+  throw new Error(
+    "The Linux Module integration runner did not place the test process in the required delegated control-group subtree",
+  );
+}
+
 if (!available) {
   // eslint-disable-next-line no-console
   console.warn(

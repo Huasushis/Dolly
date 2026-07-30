@@ -83,6 +83,15 @@ function delegatedRootCgroupPath(): string | undefined {
 }
 
 const delegatedRoot = delegatedRootCgroupPath();
+if (
+  process.env.DOLLY_LINUX_MODULE_INTEGRATION_REQUIRED === "1" &&
+  delegatedRoot === undefined
+) {
+  throw new Error(
+    "The Linux Module integration runner did not place the test process in the required delegated control-group subtree",
+  );
+}
+
 if (delegatedRoot === undefined) {
   // eslint-disable-next-line no-console
   console.warn(

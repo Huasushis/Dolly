@@ -13,10 +13,11 @@
 #   * writes the machine-readable summary, including failed and inconclusive
 #     cases, and exits non-zero unless the run met its declared criterion.
 #
-# What it does not do: no case is implemented yet. Every case is enumerated and
-# reported as inconclusive with the reason `case-handler-not-implemented`. That
-# is deliberate: the protocol treats a case without artifacts as inconclusive,
-# never as passing, so an unimplemented matrix can never look like a result.
+# The catalog deliberately does not claim whether a handler exists, because it
+# is a pure case enumerator and does not inspect the filesystem. This runner
+# checks each selected handler at execution time. A missing handler is recorded
+# as inconclusive with reason `case-handler-not-implemented`, so an incomplete
+# selection cannot look like a passing result.
 #
 # See docs/experiments/linux-core-service-ownership-runbook.md for how to
 # prepare an environment, which cases may run where, and how to read a failure.

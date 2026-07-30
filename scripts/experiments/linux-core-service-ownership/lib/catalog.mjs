@@ -37,7 +37,13 @@ export const PROTOCOL_VERSION = 3;
 // counts as passing it. No pass criterion changed, so version 2 and version 3
 // results remain directly comparable; the version moves only so that a reader
 // can tell which catalogue produced a result.
-export const CATALOG_VERSION = 3;
+//
+// Version 4, 2026-07-30: removes the stale `status: "not-implemented"` field.
+// Handler availability is measured by the runner and recorded in the result
+// ledger; the catalog cannot know it without inspecting the filesystem. Case
+// selection and pass criteria are unchanged, so versions 3 and 4 remain
+// directly comparable.
+export const CATALOG_VERSION = 4;
 
 // The protocol does not fix the signal used to terminate Core at an
 // interruption point. Hypothesis 2 names the non-catchable `SIGKILL`, which is
@@ -200,7 +206,6 @@ function fixedMatrixCases(arm, signals) {
               requiredArtifacts: INTERRUPTION_ARTIFACTS,
               repetition: RACE_BOUNDARIES.has(boundary.id) ? RACE_REPETITION : null,
               timeoutSeconds: 180,
-              status: "not-implemented",
             });
           }
         }
@@ -479,7 +484,6 @@ function storageFaultCases() {
           requiredArtifacts: INTERRUPTION_ARTIFACTS,
           repetition: null,
           timeoutSeconds: 180,
-          status: "not-implemented",
         });
       }
     }
@@ -545,7 +549,6 @@ function separateCases() {
         requiredArtifacts: PLAIN_ARTIFACTS,
         repetition: null,
         timeoutSeconds: 300,
-        status: "not-implemented",
       });
     });
   }
@@ -573,7 +576,6 @@ function resourceLimitCases() {
     requiredArtifacts: PLAIN_ARTIFACTS,
     repetition: null,
     timeoutSeconds: 300,
-    status: "not-implemented",
   }));
 }
 
@@ -634,7 +636,6 @@ function liveCoreCases() {
           requiredArtifacts: [ARTIFACTS.events, ARTIFACTS.observations, ARTIFACTS.outcome],
           repetition: null,
           timeoutSeconds: 240,
-          status: "not-implemented",
         });
       }
     }
@@ -665,7 +666,6 @@ function baselineTransientUnitCase() {
     requiredArtifacts: PLAIN_ARTIFACTS,
     repetition: RACE_REPETITION,
     timeoutSeconds: 300,
-    status: "not-implemented",
   };
 }
 
