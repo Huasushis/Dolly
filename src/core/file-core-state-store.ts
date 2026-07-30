@@ -979,9 +979,19 @@ export class FileCoreStateStore {
   }
 
   #withMutationLock<T>(operation: () => T): T {
+    let operationReturned = false;
     try {
-      return withSynchronousCrossProcessLock({ resourceId: this.#lockPath }, operation);
+      return withSynchronousCrossProcessLock({ resourceId: this.#lockPath }, () => {
+        const result = operation();
+        operationReturned = true;
+        return result;
+      });
     } catch (error) {
+      // The lock callback runs only after acquisition. Once it has returned,
+      // any error from the surrounding lock call belongs to mandatory release
+      // confirmation. The update may already be durable, while a record API
+      // may restore its previous in-memory entry when this error propagates.
+      if (operationReturned) this.#reopenRequired = true;
       if (!(error instanceof SynchronousCrossProcessLockError)) throw error;
       if (error.code === "CROSS_PROCESS_LOCK_HELD") {
         throw new CoreStateError(

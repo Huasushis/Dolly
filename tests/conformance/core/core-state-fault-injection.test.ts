@@ -4,11 +4,11 @@
  * synchronizing it, renaming it, and synchronizing the parent directory.
  *
  * Every injected failure must leave exactly one complete committed view on
- * disk. Per ADR 0009 a Delivery Claim, its Module process record, and its
- * Module submission record become durable in one Core-state update, so
- * recovery may observe the complete old revision or the complete new one, but
- * never a released Claim whose submission record survives, a submission record
- * without its Claim, or a submission record without its process record.
+ * disk. Per ADR 0009 a terminal Delivery Claim transition and the matching
+ * Module submission-record removal become durable in one Core-state update.
+ * Recovery may observe the complete old revision or the complete new one, but
+ * never a released Claim whose submission record survives, or a surviving
+ * submission record without its referenced Module process record.
  */
 
 import {
@@ -43,6 +43,7 @@ const faults = vi.hoisted(() => ({
   beforeFsync: undefined as ((descriptor: number) => void) | undefined,
   beforeRename: undefined as ((from: string, to: string) => void) | undefined,
   afterRename: undefined as ((from: string, to: string) => void) | undefined,
+  failAfterLockRelease: false,
 }));
 
 // The synchronous file operations of the atomic writer are wrapped so a test
@@ -73,6 +74,31 @@ vi.mock("node:fs", async (importOriginal) => {
     },
   };
   return { ...patched, default: patched };
+});
+
+// This wrapper retains the real lock acquisition, callback, and release. The
+// one-shot failure happens only after all three completed, which isolates the
+// store's handling of a failed release confirmation from callback failures.
+vi.mock("../../../src/core/synchronous-cross-process-lock.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../../../src/core/synchronous-cross-process-lock.js")>();
+  return {
+    ...actual,
+    withSynchronousCrossProcessLock<Result>(
+      options: Parameters<typeof actual.withSynchronousCrossProcessLock>[0],
+      operation: () => Result,
+    ): Result {
+      const result = actual.withSynchronousCrossProcessLock(options, operation);
+      if (faults.failAfterLockRelease) {
+        faults.failAfterLockRelease = false;
+        throw new actual.SynchronousCrossProcessLockError(
+          "CROSS_PROCESS_LOCK_OWNERSHIP_LOST",
+          "injected failure after lock release",
+        );
+      }
+      return result;
+    },
+  };
 });
 
 const NOW = "2026-07-26T00:00:00.000Z";
@@ -107,6 +133,7 @@ function clearFaults(): void {
   faults.beforeFsync = undefined;
   faults.beforeRename = undefined;
   faults.afterRename = undefined;
+  faults.failAfterLockRelease = false;
 }
 
 function injectedFailure(code: string, syscall: string): NodeJS.ErrnoException {
@@ -513,6 +540,70 @@ describe("CORE state atomic write fault injection", () => {
     });
     expect(reopened.deliveries.listActiveClaims()).toHaveLength(1);
     expect(reopened.getModuleSubmissionRecord(state.identity.runId)).toBeDefined();
+  });
+
+  it("preserves a lock callback error without requiring a reopen", () => {
+    const state = seedClaimedState("first");
+    const committed = readFileSync(path);
+    writeFileSync(path, "{}\n", "utf8");
+
+    try {
+      expect(() =>
+        state.store.updateModuleProcessRecordState(PROCESS_GENERATION_ID, "stopping"),
+      ).toThrowError(
+        expect.objectContaining<Partial<CoreStateError>>({
+          code: "CORE_STATE_DOCUMENT_INVALID",
+        }),
+      );
+    } finally {
+      writeFileSync(path, committed);
+    }
+
+    expect(state.store.getModuleProcessRecord(PROCESS_GENERATION_ID)).toMatchObject({
+      state: "running",
+    });
+    expect(
+      state.store.updateModuleProcessRecordState(PROCESS_GENERATION_ID, "stopping"),
+    ).toMatchObject({ state: "stopping" });
+  });
+
+  it("requires a reopen when lock release confirmation fails after a record commit", () => {
+    const state = seedClaimedState("first");
+    const readsObtainedBeforeFailure: readonly [
+      label: string,
+      operation: () => unknown,
+    ][] = [
+      ["complete snapshot", state.store.snapshot.bind(state.store)],
+      ["reference graph", state.store.referenceGraph.snapshot],
+      ["Block store", state.store.blocks.snapshot],
+      ["Delivery store", state.store.deliveries.snapshot],
+    ];
+    faults.failAfterLockRelease = true;
+
+    expect(() =>
+      state.store.updateModuleProcessRecordState(PROCESS_GENERATION_ID, "stopping"),
+    ).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({ code: "CORE_STATE_IO_FAILED" }),
+    );
+    expect(faults.failAfterLockRelease).toBe(false);
+
+    // The callback and real release completed before the injected error. The
+    // file therefore contains the new record even though the record API has
+    // handled the error by restoring its previous in-memory Map entry.
+    expect(committedRevision()).toBe(state.revision + 1);
+    const reopened = openStore("second");
+    expect(reopened.getModuleProcessRecord(PROCESS_GENERATION_ID)).toMatchObject({
+      state: "stopping",
+    });
+
+    assertReopenRequired(state);
+    for (const [label, operation] of readsObtainedBeforeFailure) {
+      expect(operation, label).toThrowError(
+        expect.objectContaining<Partial<CoreStateError>>({
+          code: "CORE_STATE_REOPEN_REQUIRED",
+        }),
+      );
+    }
   });
 
   it("never replaces a newer committed file after a post-rename failure", () => {
