@@ -15,7 +15,7 @@ rmSync(distDirectory, { recursive: true, force: true });
 const compiler = resolve(repositoryRoot, "node_modules", "typescript", "bin", "tsc");
 const compileResult = spawnSync(
   process.execPath,
-  [compiler, "--project", resolve(repositoryRoot, "tsconfig.json")],
+  [compiler, "--project", resolve(repositoryRoot, "tsconfig.build.json")],
   { cwd: repositoryRoot, stdio: "inherit" },
 );
 
