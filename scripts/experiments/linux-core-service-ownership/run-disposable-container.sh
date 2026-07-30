@@ -196,13 +196,23 @@ fi
 DOLLY_UID="$(docker exec "${CONTAINER_NAME}" id -u dolly)"
 echo "Service manager state: ${state}; unprivileged account uid ${DOLLY_UID}"
 
-# Source identity is written while the artifact directory still belongs to
-# the host account. The directory is handed to the container account below.
+# Source identity and the exact inner command are written while the artifact
+# directory still belongs to the host account. The directory is handed to the
+# container account below.
+git -C "${REPOSITORY_ROOT}" rev-parse HEAD > "${ARTIFACT_ROOT}/source-commit.txt"
+git -C "${REPOSITORY_ROOT}" status --short > "${ARTIFACT_ROOT}/source-status.txt"
 if [ "${#TEST_FILES[@]}" -gt 0 ]; then
-  git -C "${REPOSITORY_ROOT}" rev-parse HEAD > "${ARTIFACT_ROOT}/source-commit.txt"
-  git -C "${REPOSITORY_ROOT}" status --short > "${ARTIFACT_ROOT}/source-status.txt"
   {
     printf '%q ' ./scripts/run-linux-module-launcher-integration.sh "${TEST_FILES[@]}"
+    printf '\n'
+  } > "${ARTIFACT_ROOT}/command.txt"
+else
+  {
+    printf '%q ' \
+      ./scripts/experiments/linux-core-service-ownership/run.sh \
+      --disposable \
+      --output-dir /dolly-artifacts \
+      "${RUNNER_ARGS[@]+"${RUNNER_ARGS[@]}"}"
     printf '\n'
   } > "${ARTIFACT_ROOT}/command.txt"
 fi
