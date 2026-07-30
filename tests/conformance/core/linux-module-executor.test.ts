@@ -7,12 +7,18 @@
  * `ModuleExecutorTerminationUnconfirmedError`, which the reactive runtime
  * already treats as "preserve the Claim, start no replacement".
  */
+import {
+  spawn,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   createLinuxModuleExecutor,
   type LinuxModuleProtocolSession,
 } from "../../../src/adapters/linux-module-executor.js";
 import {
+  ModuleActor,
   ModuleExecutorTerminationUnconfirmedError,
   type ModuleExecutor,
 } from "../../../src/core/module-actor.js";
@@ -35,6 +41,9 @@ const IDENTITY = {
   processGenerationId: "process-generation-1",
 };
 const MODULE_GENERATION_ID = "module-generation-1";
+const CORE_EXIT_FIXTURE = fileURLToPath(
+  new URL("./fixtures/linux-module-executor-core-exit.ts", import.meta.url),
+);
 const TERMINATION_CONTEXT = {
   moduleId: IDENTITY.moduleId,
   moduleGenerationId: MODULE_GENERATION_ID,
@@ -108,7 +117,12 @@ function recordStore(
   };
 }
 
-function cgroupFileSystem(populated: () => string) {
+function cgroupFileSystem(
+  populated: () => string,
+  options: {
+    readonly onWrite?: (path: string, contents: string) => void | Promise<void>;
+  } = {},
+) {
   const directories = new Set<string>();
   const files = new Map<string, string>();
   const writeLog: { path: string; contents: string }[] = [];
@@ -139,6 +153,7 @@ function cgroupFileSystem(populated: () => string) {
     async writeTextFile(path: string, contents: string) {
       writeLog.push({ path, contents });
       files.set(path, contents);
+      await options.onWrite?.(path, contents);
     },
   };
 }
@@ -200,6 +215,8 @@ function executorFor(options: {
   readonly fileSystem?: ReturnType<typeof cgroupFileSystem>;
   readonly startLauncher?: () => Promise<ModuleLauncherControl>;
   readonly openProtocolSession?: () => LinuxModuleProtocolSession;
+  readonly coreExitCleanupTimeoutMs?: number;
+  readonly exitCoreProcess?: (status: number) => void;
 }) {
   const records = options.records ?? recordStore();
   const fileSystem = options.fileSystem ?? cgroupFileSystem(options.populated);
@@ -231,12 +248,120 @@ function executorFor(options: {
     openProtocolSession: options.openProtocolSession ?? (() => options.session),
     terminationTimeoutMs: 200,
     channelCloseTimeoutMs: 200,
+    coreExitCleanupTimeoutMs: options.coreExitCleanupTimeoutMs ?? 200,
+    // Unit tests must inspect the path after it would end Core. A separate
+    // child-process test covers the production `process.exit` default.
+    exitCoreProcess: options.exitCoreProcess ?? (() => undefined),
   });
   assertRequiredExecutorOperations(executor);
   return executor;
 }
 
+function waitForChildExit(
+  child: ChildProcessWithoutNullStreams,
+  timeoutMs: number,
+): Promise<{ readonly code: number | null; readonly stdout: string; readonly stderr: string }> {
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      reject(new Error(`child did not exit within ${timeoutMs} ms`));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
 describe("Linux Module executor termination proof", () => {
+  it("uses a direct nonzero process exit when unconfirmed ownership reaches the production default", async () => {
+    const child = spawn(process.execPath, ["--import", "tsx/esm", CORE_EXIT_FIXTURE], {
+      cwd: process.cwd(),
+      stdio: "pipe",
+      windowsHide: true,
+    });
+
+    const result = await waitForChildExit(child, 3_000);
+    expect(result.stdout).toContain("STARTED");
+    expect(result.stdout).not.toContain("EXIT_HOOK_RETURNED");
+    expect(result.stderr).toBe("");
+    expect(result.code).toBe(1);
+  });
+
+  it("keeps the cleanup deadline alive until the production Core exit runs", async () => {
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx/esm", CORE_EXIT_FIXTURE, "hanging-cleanup"],
+      {
+        cwd: process.cwd(),
+        stdio: "pipe",
+        windowsHide: true,
+      },
+    );
+
+    const result = await waitForChildExit(child, 3_000);
+    expect(result.stdout).toContain("STARTED");
+    expect(result.stdout).not.toContain("EXIT_HOOK_RETURNED");
+    expect(result.stderr).toBe("");
+    expect(result.code).toBe(1);
+  });
+
+  it("requests Core exit before ModuleActor converts the startup failure", async () => {
+    const eventOrder: string[] = [];
+    const executor = executorFor({
+      populated: () => "populated 0\nfrozen 0\n",
+      session: protocolSession(),
+      exitCoreProcess: (status) => eventOrder.push(`exit:${status}`),
+      startLauncher: async () => ({
+        processId: 4242,
+        configure: async () => {
+          throw new Error("the launcher control channel failed");
+        },
+        authorizeExecution: async () => confirmedExecutionAuthorization(),
+        requestExit: async () => false,
+      }),
+    });
+    const actor = new ModuleActor<ReactiveModuleInput, ReactiveModuleResult>({
+      moduleId: IDENTITY.moduleId,
+      initialModuleGenerationId: MODULE_GENERATION_ID,
+      maxQueuedRuns: 4,
+      maxQueuedInputBytes: 1024,
+      maxInputBytes: 512,
+      maxRunsPerGeneration: 100,
+      maxGenerations: 8,
+      requireProcessIsolation: true,
+      initializationTimeoutMs: 200,
+      terminationTimeoutMs: 200,
+      nextModuleGenerationId: () => "module-generation-2",
+      monotonicNow: () => 1,
+      snapshotInput: (input) => structuredClone(input),
+      measureInputBytes: (input) => Buffer.byteLength(JSON.stringify(input)),
+      snapshotOutput: (output) => structuredClone(output),
+      createExecutor: () => executor,
+      acceptResult: () => undefined,
+    });
+
+    const failure = await actor.start().catch((error: unknown) => error);
+    eventOrder.push("actor-failed");
+    expect(failure).toMatchObject({ code: "ACTOR_FAILED" });
+    expect(eventOrder).toEqual(["exit:1", "actor-failed"]);
+    expect(actor.state).toBe("failed");
+  });
+
   it("does not create a process while the executor is being built", async () => {
     const session = protocolSession();
     const executor = executorFor({
@@ -766,11 +891,13 @@ describe("Linux Module executor termination proof", () => {
     expect(requestExit).toHaveBeenCalledOnce();
   });
 
-  it("never reports termination after a start failure that requires Core to exit", async () => {
+  it("ends Core after a start failure whose launcher cannot be accounted for", async () => {
+    const exitStatuses: number[] = [];
     const session = protocolSession();
     const executor = executorFor({
       populated: () => "populated 0\nfrozen 0\n",
       session,
+      exitCoreProcess: (status) => exitStatuses.push(status),
       startLauncher: async () => ({
         processId: 4242,
         configure: async () => {
@@ -780,7 +907,10 @@ describe("Linux Module executor termination proof", () => {
         requestExit: async () => false,
       }),
     });
-    await expect(executor.start()).rejects.toThrowError(/Core must exit/);
+    await expect(executor.start()).rejects.toThrowError(
+      ModuleExecutorTerminationUnconfirmedError,
+    );
+    expect(exitStatuses).toEqual([1]);
 
     await expect(executor.terminate(TERMINATION_CONTEXT)).rejects.toThrowError(
       ModuleExecutorTerminationUnconfirmedError,
@@ -788,18 +918,27 @@ describe("Linux Module executor termination proof", () => {
     await expect(executor.terminate(TERMINATION_CONTEXT)).rejects.toThrowError(
       ModuleExecutorTerminationUnconfirmedError,
     );
+    expect(exitStatuses).toEqual([1]);
   });
 
-  it("terminates observed group members but still requires Core exit for an unobserved launcher", async () => {
+  it("starts observed-group cleanup before ending Core for an unobserved launcher", async () => {
     let populated = "populated 1\nfrozen 0\n";
     const records = recordStore();
-    const fileSystem = cgroupFileSystem(() => populated);
+    const fileSystem = cgroupFileSystem(() => populated, {
+      onWrite(path, contents) {
+        if (path.endsWith("/cgroup.kill") && contents === "1") {
+          populated = "populated 0\nfrozen 0\n";
+        }
+      },
+    });
+    const exitStatuses: number[] = [];
     const session = protocolSession();
     const executor = executorFor({
       populated: () => populated,
       session,
       records,
       fileSystem,
+      exitCoreProcess: (status) => exitStatuses.push(status),
       startLauncher: async () => ({
         processId: 4242,
         configure: async () => undefined,
@@ -816,8 +955,9 @@ describe("Linux Module executor termination proof", () => {
       }),
     });
 
-    await expect(executor.start()).rejects.toThrowError(/Core must exit/);
-    populated = "populated 0\nfrozen 0\n";
+    await expect(executor.start()).rejects.toThrowError(
+      ModuleExecutorTerminationUnconfirmedError,
+    );
     await expect(executor.terminate(TERMINATION_CONTEXT)).rejects.toThrowError(
       ModuleExecutorTerminationUnconfirmedError,
     );
@@ -831,6 +971,103 @@ describe("Linux Module executor termination proof", () => {
     expect(records.log).not.toContain("state:stopped");
     expect(fileSystem.directories.has(processRecord().moduleCgroupPath)).toBe(true);
     expect(session.closeCapabilitySession).not.toHaveBeenCalled();
+    expect(exitStatuses).toEqual([1]);
+  });
+
+  it("ends Core even when recording the stopping intent fails", async () => {
+    let populated = "populated 1\nfrozen 0\n";
+    const records = recordStore({
+      rejectStateChange: (state) => state === "stopping",
+    });
+    const fileSystem = cgroupFileSystem(() => populated, {
+      onWrite(path, contents) {
+        if (path.endsWith("/cgroup.kill") && contents === "1") {
+          populated = "populated 0\nfrozen 0\n";
+        }
+      },
+    });
+    const exitStatuses: number[] = [];
+    const executor = executorFor({
+      populated: () => populated,
+      session: protocolSession(),
+      records,
+      fileSystem,
+      exitCoreProcess: (status) => exitStatuses.push(status),
+      startLauncher: async () => ({
+        processId: 4242,
+        configure: async () => undefined,
+        authorizeExecution: async () => ({
+          executionAuthorized: false,
+          code: "LAUNCHER_MEMBERSHIP_UNVERIFIED",
+          detail: "the execute command may have reached the launcher",
+          membershipVerified: true,
+          observedProcessIds: [4242],
+          executeCommandMayHaveBeenDelivered: true,
+          launcherExitObserved: false,
+        }),
+        requestExit: async () => false,
+      }),
+    });
+
+    await expect(executor.start()).rejects.toThrowError(
+      ModuleExecutorTerminationUnconfirmedError,
+    );
+    expect(exitStatuses).toEqual([1]);
+    expect(
+      fileSystem.writeLog.filter(
+        ({ path, contents }) => path.endsWith("/cgroup.kill") && contents === "1",
+      ),
+    ).toHaveLength(1);
+    expect(records.current?.state).toBe("starting");
+    expect(records.log).not.toContain("state:stopped");
+  });
+
+  it("does not let a hanging control-group cleanup prevent the required Core exit", async () => {
+    const cleanupNeverSettles = new Promise<void>(() => undefined);
+    const fileSystem = cgroupFileSystem(
+      () => "populated 1\nfrozen 0\n",
+      {
+        onWrite(path, contents) {
+          if (path.endsWith("/cgroup.kill") && contents === "1") {
+            return cleanupNeverSettles;
+          }
+        },
+      },
+    );
+    const exitStatuses: number[] = [];
+    const executor = executorFor({
+      populated: () => "populated 1\nfrozen 0\n",
+      session: protocolSession(),
+      fileSystem,
+      coreExitCleanupTimeoutMs: 20,
+      exitCoreProcess: (status) => exitStatuses.push(status),
+      startLauncher: async () => ({
+        processId: 4242,
+        configure: async () => undefined,
+        authorizeExecution: async () => ({
+          executionAuthorized: false,
+          code: "LAUNCHER_MEMBERSHIP_UNVERIFIED",
+          detail: "the control group contained an unexplained process",
+          membershipVerified: false,
+          observedProcessIds: [99],
+          executeCommandMayHaveBeenDelivered: false,
+          launcherExitObserved: false,
+        }),
+        requestExit: async () => false,
+      }),
+    });
+
+    const startedAt = Date.now();
+    await expect(executor.start()).rejects.toThrowError(
+      ModuleExecutorTerminationUnconfirmedError,
+    );
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(exitStatuses).toEqual([1]);
+    expect(
+      fileSystem.writeLog.filter(
+        ({ path, contents }) => path.endsWith("/cgroup.kill") && contents === "1",
+      ),
+    ).toHaveLength(1);
   });
 
   it("does not allow start to create resources after termination already completed", async () => {

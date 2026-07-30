@@ -507,6 +507,7 @@ describe("Module launcher control adapter", () => {
       waitForChannelClosed: vi.fn(async () => true),
     };
     const openProtocolSession = vi.fn(() => session);
+    const exitStatuses: number[] = [];
     const executor = createLinuxModuleExecutor({
       moduleId: IDENTITY.moduleId,
       moduleGenerationId: "module-generation-a",
@@ -529,6 +530,8 @@ describe("Module launcher control adapter", () => {
       openProtocolSession,
       terminationTimeoutMs: 200,
       channelCloseTimeoutMs: 200,
+      coreExitCleanupTimeoutMs: 200,
+      exitCoreProcess: (status) => exitStatuses.push(status),
     });
     if (executor.start === undefined || executor.terminate === undefined) {
       throw new Error("the Linux Module executor is missing required operations");
@@ -556,11 +559,15 @@ describe("Module launcher control adapter", () => {
     if (coreMustExit) {
       expect(String(startError)).toContain("Core must exit");
       expect(String(startError)).toContain("execute command may have reached");
+      expect(exitStatuses).toEqual([1]);
     } else {
       expect(String(startError)).not.toContain("Core must exit");
+      expect(exitStatuses).toEqual([]);
     }
     expect(openProtocolSession).not.toHaveBeenCalled();
-    expect(records.current?.state).toBe("starting");
+    expect(records.current?.state).toBe(
+      coreMustExit || terminateWhileMembershipIsRead ? "stopping" : "starting",
+    );
     expect(
       harness.controllerHarness.sent.some((frame) => frame.includes('"command":"execute"')),
     ).toBe(false);

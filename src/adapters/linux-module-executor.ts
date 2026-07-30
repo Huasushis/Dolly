@@ -43,6 +43,9 @@ import {
   type ModuleProcessStartResult,
   type StartModuleProcessOptions,
 } from "../core/linux-module-process-lifecycle.js";
+import type { ModuleCgroup } from "../core/linux-module-cgroup.js";
+
+const DEFAULT_CORE_EXIT_CLEANUP_TIMEOUT_MS = 1_000;
 
 /**
  * The Extension protocol operations this executor needs, named here so the
@@ -100,6 +103,51 @@ export interface LinuxModuleExecutorOptions {
   readonly terminationTimeoutMs: number;
   /** Bound on observing the protocol channel closed after termination. */
   readonly channelCloseTimeoutMs: number;
+  /**
+   * The longest Core waits for best-effort cleanup before ending itself after
+   * a launcher failure that cannot prove process ownership. This bound is
+   * separate from normal termination because process exit is required even
+   * when a control-group file operation never settles.
+   */
+  readonly coreExitCleanupTimeoutMs?: number;
+  /**
+   * Immediately ends the current Core process with the supplied status.
+   * Production uses `process.exit`; tests inject a returning function so they
+   * can inspect the failure path without ending the test process.
+   */
+  readonly exitCoreProcess?: (status: number) => void;
+}
+
+function assertCoreExitCleanupTimeout(timeoutMs: number): void {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
+    throw new TypeError(
+      "coreExitCleanupTimeoutMs must be an integer between 1 and 60000",
+    );
+  }
+}
+
+/**
+ * Waits only until the cleanup deadline. The cleanup Promise keeps running
+ * after that deadline, but its rejection is consumed because Core exits
+ * immediately afterwards and cannot use its result as termination proof.
+ */
+async function waitForBestEffortCleanup(
+  cleanup: Promise<unknown>,
+  timeoutMs: number,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settledCleanup = cleanup.then(
+    () => undefined,
+    () => undefined,
+  );
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  try {
+    await Promise.race([settledCleanup, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function assertContext(
@@ -120,6 +168,10 @@ function assertContext(
 export function createLinuxModuleExecutor(
   options: LinuxModuleExecutorOptions,
 ): ModuleExecutor<ReactiveModuleInput, ReactiveModuleResult> {
+  const coreExitCleanupTimeoutMs =
+    options.coreExitCleanupTimeoutMs ?? DEFAULT_CORE_EXIT_CLEANUP_TIMEOUT_MS;
+  assertCoreExitCleanupTimeout(coreExitCleanupTimeoutMs);
+  const exitCoreProcess = options.exitCoreProcess ?? ((status: number) => process.exit(status));
   let session: LinuxModuleProtocolSession | undefined;
   let processStart: Promise<ModuleProcessStartResult> | undefined;
   let startOperation: Promise<void> | undefined;
@@ -127,6 +179,7 @@ export function createLinuxModuleExecutor(
   let terminationRequested = false;
   let terminationConfirmed = false;
   let terminationOperation: Promise<void> | undefined;
+  let coreExitOperation: Promise<void> | undefined;
   let sessionReported = false;
   let protocolSessionOpenFailed = false;
   let protocolSessionOpenError: unknown;
@@ -139,6 +192,63 @@ export function createLinuxModuleExecutor(
     if (sessionReported) return;
     sessionReported = true;
     reportSession(available);
+  };
+
+  /**
+   * Preserves the durable `stopping` intent and starts whole-group cleanup
+   * when members were observed. Neither operation can prove recovery in this
+   * failure mode, so both are bounded and followed by a nonzero Core exit.
+   */
+  const exitCoreAfterUnconfirmedProcessOwnership = (
+    detail: string,
+    failureCode: string | undefined,
+    cgroup: ModuleCgroup | undefined,
+  ): Promise<void> => {
+    if (coreExitOperation !== undefined) return coreExitOperation;
+
+    let rejectExitOperation!: (reason: unknown) => void;
+    const operation = new Promise<void>((_resolve, reject) => {
+      rejectExitOperation = reject;
+    });
+    // Store the operation before invoking the exit hook. A test hook can
+    // synchronously re-enter `terminate()`, while `process.exit` never
+    // returns in production.
+    coreExitOperation = operation;
+    terminationRequested = true;
+
+    void (async (): Promise<void> => {
+      try {
+        try {
+          options.lifecycle.records.updateModuleProcessRecordState(
+            options.lifecycle.identity.processGenerationId,
+            "stopping",
+          );
+        } catch {
+          // The exit remains required even when the durable intent is lost.
+        }
+
+        if (cgroup?.membershipObserved && !cgroup.removed) {
+          const cleanup = cgroup.terminate({
+            timeoutMs: Math.min(options.terminationTimeoutMs, coreExitCleanupTimeoutMs),
+          });
+          await waitForBestEffortCleanup(cleanup, coreExitCleanupTimeoutMs);
+        }
+
+        exitCoreProcess(1);
+        rejectExitOperation(
+          new ModuleExecutorTerminationUnconfirmedError(
+            `${failureCode === undefined ? detail : `${failureCode}: ${detail}`}; Core must exit, but the configured Core exit function returned without ending the process`,
+          ),
+        );
+      } catch (error) {
+        rejectExitOperation(
+          new ModuleExecutorTerminationUnconfirmedError(
+            `${failureCode === undefined ? detail : `${failureCode}: ${detail}`}; Core must exit, but the configured Core exit function failed: ${describe(error)}`,
+          ),
+        );
+      }
+    })();
+    return operation;
   };
 
   const start = (): Promise<void> => {
@@ -162,10 +272,21 @@ export function createLinuxModuleExecutor(
         started = await currentProcessStart;
       } catch (error) {
         setAvailableSession(undefined);
-        throw error;
+        return await exitCoreAfterUnconfirmedProcessOwnership(
+          `the Module process start failed without returning its process ownership state: ${describe(error)}`,
+          undefined,
+          undefined,
+        );
       }
       if (!started.executionAuthorized) {
         setAvailableSession(undefined);
+        if (started.failure.coreMustExit) {
+          return await exitCoreAfterUnconfirmedProcessOwnership(
+            started.failure.detail,
+            started.failure.code,
+            started.cgroup,
+          );
+        }
         throw startFailureError(started.failure);
       }
       let opened: LinuxModuleProtocolSession;
@@ -212,41 +333,19 @@ export function createLinuxModuleExecutor(
     try {
       started = await currentProcessStart;
     } catch (error) {
-      throw new ModuleExecutorTerminationUnconfirmedError(
-        `the Module process start failed without returning its process ownership state: ${describe(error)}; Core must exit so its service cleanup removes any unreported process`,
+      return await exitCoreAfterUnconfirmedProcessOwnership(
+        `the Module process start failed without returning its process ownership state: ${describe(error)}`,
+        undefined,
+        undefined,
       );
     }
     let cgroup;
     if (!started.executionAuthorized) {
-      await startOperation?.catch(() => undefined);
       if (started.failure.coreMustExit) {
-        let groupCleanupDetail = "no control-group member was observed";
-        if (
-          started.cgroup !== undefined &&
-          started.cgroup.membershipObserved &&
-          !started.cgroup.removed
-        ) {
-          try {
-            options.lifecycle.records.updateModuleProcessRecordState(
-              options.lifecycle.identity.processGenerationId,
-              "stopping",
-            );
-          } catch {
-            // The physical group termination below must still be attempted.
-          }
-          try {
-            const termination = await started.cgroup.terminate({
-              timeoutMs: options.terminationTimeoutMs,
-            });
-            groupCleanupDetail = termination.terminated
-              ? "the observed control-group members were terminated, but the group and process record were preserved for service recovery"
-              : `${termination.code}: ${termination.detail}`;
-          } catch (error) {
-            groupCleanupDetail = `control-group termination failed: ${describe(error)}`;
-          }
-        }
-        throw new ModuleExecutorTerminationUnconfirmedError(
-          `${started.failure.code}: ${started.failure.detail}; ${groupCleanupDetail}; Core must exit so its service cleanup removes any unaccounted process`,
+        return await exitCoreAfterUnconfirmedProcessOwnership(
+          started.failure.detail,
+          started.failure.code,
+          started.cgroup,
         );
       }
       if (started.cgroup === undefined) return;
@@ -313,6 +412,7 @@ export function createLinuxModuleExecutor(
 
   const proveStopped = (): Promise<void> => {
     if (terminationConfirmed) return Promise.resolve();
+    if (coreExitOperation !== undefined) return coreExitOperation;
     if (terminationOperation !== undefined) return terminationOperation;
     terminationRequested = true;
     const operation = performTermination();
@@ -375,9 +475,5 @@ function describe(error: unknown): string {
 }
 
 function startFailureError(failure: ModuleProcessStartFailure): Error {
-  return new Error(
-    failure.coreMustExit
-      ? `${failure.code}: ${failure.detail}; Core must exit so its service cleanup removes the service control group`
-      : `${failure.code}: ${failure.detail}`,
-  );
+  return new Error(`${failure.code}: ${failure.detail}`);
 }
