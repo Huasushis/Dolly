@@ -172,6 +172,7 @@ describe("PKG-001 distributable package", () => {
         tarFiles.get("package/package.json")?.toString("utf8") ?? "null",
       );
       expect(packageJson).toMatchObject({
+        private: true,
         main: "./dist/src/entry.js",
         types: "./dist/src/entry.d.ts",
         bin: { dolly: "./bin/dolly.js" },
