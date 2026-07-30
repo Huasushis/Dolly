@@ -1,6 +1,8 @@
 # Linux Core service process ownership experiment runbook
 
-Status: Draft; the runner enumerates every case but implements none yet
+Status: Draft; catalog version 5 enumerates 570 cases, one of them exclusive, and every catalog
+entry resolves to an existing handler file. That file check does not establish that the full
+matrix passes.
 
 This runbook explains how to prepare an environment for the preregistered experiment in
 `linux-core-service-process-ownership.md` (protocol version 3), how to run the harness, where its
@@ -14,18 +16,21 @@ created.
 
 - `run.sh` — the runner. It checks the environment, writes the manifest, walks the ordered case
   list, cleans up, and writes the machine-readable summary.
-- `lib/catalog.mjs` — the complete case enumeration. Every case names the protocol or Architecture
-  Decision Record (ADR) clause it comes from, so the enumeration can be audited clause by clause.
+- `lib/catalog.mjs` — catalog version 5, with 570 cases. Every case names the protocol or
+  Architecture Decision Record (ADR) clause it comes from, so the enumeration can be audited
+  clause by clause. One case, `SC-03-02-user-manager-restart`, is marked `exclusive`.
 - `lib/manifest.mjs` — writes `manifest.json` and the ordered case list the runner iterates.
 - `lib/summarize.mjs` — writes `summary.json` and decides the run verdict.
 - `lib/safety.sh` — inventory and cleanup helpers, including every rule from the protocol's
   "Safety and cleanup" section.
-- `handlers/` — empty. This is where case implementations go.
+- `handlers/` — the case handlers and their supporting programs. All 570 catalog entries currently
+  resolve to a handler file.
 
-**No case is implemented.** Every case is reported as `inconclusive` with the reason
-`case-handler-not-implemented`. This is not a placeholder that might silently pass later: the
-protocol says a case without artifacts is inconclusive rather than passing, and the summary
-enforces that rule independently of whatever a handler claims.
+Handler-file resolution is only a static completeness check. It does not show that a handler
+exercises the required product boundary, retains every required artifact, or passes in either
+service scope. Those claims require the recorded Linux runs and per-case results described below.
+If a selected handler file is missing in a future revision, the runner still records that case as
+`inconclusive` with the reason `case-handler-not-implemented`.
 
 ## Environment requirements
 
@@ -65,13 +70,20 @@ is **not** disposable. It may run only cases the catalog marks non-disruptive, a
 scope, under the profile that enforces exactly that:
 
 ```sh
+# Preview the permitted selection without running handlers.
 bash scripts/experiments/linux-core-service-ownership/run.sh \
-  --profile ustc-non-disruptive --mode smoke
+  --profile ustc-non-disruptive --list
 ```
 
 The profile forces `--non-disruptive-only`, refuses the system service scope, and refuses to be
 combined with `--disposable`. Independently of the profile, the runner refuses to start when the
 selection contains any disruptive case and `--disposable` was not given.
+
+The earlier example used `--profile ustc-non-disruptive --mode smoke` as a harness self-check.
+That claim is awaiting review: smoke mode still requires every selected result to be
+`inconclusive`, while all selected catalog entries now resolve to handlers that may return other
+statuses. Do not quote a smoke invocation as a passing harness check or as experiment evidence
+without a new recorded run and a review of that criterion.
 
 A case is disruptive when it needs one of these, and the catalog records which one:
 
@@ -98,9 +110,6 @@ RUNNER=scripts/experiments/linux-core-service-ownership/run.sh
 # List the selection without touching anything.
 bash "$RUNNER" --list
 
-# Harness self-check: expects every case to be inconclusive and no residue.
-bash "$RUNNER" --mode smoke
-
 # Real run in a disposable environment, user scope, against an installed unit.
 bash "$RUNNER" --mode full --disposable --service-mode user \
   --core-unit dolly-core@inst1.service --seed 1
@@ -109,6 +118,10 @@ bash "$RUNNER" --mode full --disposable --service-mode user \
 Invoke it through `bash` as shown, or `chmod +x` it first. Case handlers are also invoked through
 `bash`, so a handler committed without the executable bit still runs rather than being silently
 skipped.
+
+The historical `--mode smoke` criterion expects every selected case to be `inconclusive`. It has
+not been revalidated since handler coverage reached 570 of 570 catalog entries, so it is not
+currently a claimed passing self-check.
 
 Useful options:
 
@@ -129,16 +142,35 @@ run is incomplete because inconclusive cases remain.
 
 Disruptive cases must not run on a shared host. `run-disposable-container.sh` builds a container
 with its own systemd instance, user lingering enabled, and control group version 2 delegated to an
-unprivileged account, runs the selection inside it with `--disposable`, and destroys it afterwards.
-Options it does not own are passed through to the runner unchanged, so `--group`, `--id-prefix`,
-and the rest behave the same inside and outside.
+unprivileged account, then destroys it afterwards. In experiment mode, it invokes the experiment
+runner with `--disposable`; options it does not own are passed through unchanged, so `--group`,
+`--id-prefix`, and the other experiment filters behave the same inside and outside. The wrapper
+owns `--output-dir` and `--disposable`; attempts to supply either are rejected rather than
+overriding its artifact mount or isolation declaration.
 
 ```bash
 CONTAINER=scripts/experiments/linux-core-service-ownership/run-disposable-container.sh
 
 # Docker Hub is unreachable from some networks; point --base at a mirror then.
 bash "$CONTAINER" --base docker.m.daocloud.io/library/ubuntu:24.04 --group dependency-unavailable
+
+# Run exact Linux integration test files instead of the ownership experiment.
+# --test-file is repeatable.
+bash "$CONTAINER" --base docker.m.daocloud.io/library/ubuntu:24.04 \
+  --test-file tests/conformance/security/linux-module-launcher-integration.test.ts \
+  --test-file tests/conformance/security/linux-module-cgroup-integration.test.ts
 ```
+
+`--test-file` switches the wrapper from the ownership experiment to the exact Linux integration
+test runner. It may be repeated, but it cannot be combined with options passed to the ownership
+experiment, including its selection filters. Wrapper options such as `--base` and `--keep` remain
+available in either mode.
+
+Both modes record `source-commit.txt`, `source-status.txt`, `command.txt`, and `environment.txt` in
+the invocation's artifact directory. The repository source and installed dependencies are mounted
+read-only. The temporary working tree contains links to those read-only inputs, while
+`node_modules/.vite-temp` is writable because the test runner needs to create Vite's temporary
+files there.
 
 **Use `--base` when the default base image cannot be resolved.** On a network where
 `registry-1.docker.io` does not resolve, the run fails during the image build with
@@ -307,8 +339,7 @@ ignore file.
 - `fail` — at least one such case failed, or cleanup left residue. Under the protocol's stopping
   rule the first failure stops architectural promotion but not diagnosis: revise the implementation
   or the ADR, record a new protocol version, and rerun the complete matrix. Do not delete the case.
-- `incomplete` — no failure, but inconclusive cases remain. This is the expected verdict for any
-  run of the current skeleton.
+- `incomplete` — no failure, but inconclusive cases remain.
 - `harness-ok` / `harness-fail` — only from `--mode smoke`. A smoke run sets
   `harnessSelfCheck: true` and `experimentResult: "none"`, so it can never be quoted as evidence
   about the hypotheses.
@@ -381,7 +412,9 @@ copied into the summary.
 
 These block a complete run and are not defects in the runner:
 
-1. No handler exists. All 570 cases are inconclusive.
+1. All 570 catalog entries resolve to handler files, but no complete catalog version 5 result has
+   been established merely by that file check. Full evidence still requires the prescribed
+   service scopes, clean environments, retained artifacts, and per-case results.
 2. There is no installable Core service unit yet, so no case can exercise the real restart path.
    Until one exists, `manifest.json` records `serviceConfiguration.available: false` and the
    configuration digest is null.

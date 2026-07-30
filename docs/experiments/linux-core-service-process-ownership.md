@@ -1,6 +1,8 @@
 # Linux Core service process ownership experiment
 
-Status: Preregistered; no implementation result yet
+Status: Protocol version 3 preregistration. Partial results are recorded
+separately in `docs/experiments/linux-core-service-ownership-results.md`; the
+stopping rule below has not been met.
 
 Protocol version: 3
 
@@ -76,9 +78,9 @@ state must agree.
 The experiment compares the proposed design, in which Core is the main service
 process, with two deliberately limited baselines:
 
-- the current direct child `ExtensionProcessHost` outside a validated stable
-  service, which is expected to prove cleanup only while its creating Core
-  process remains alive; and
+- the protocol-version-3 direct-child `ExtensionProcessHost` baseline outside a
+  validated stable service, which is expected to prove cleanup only while its
+  creating Core process remains alive; and
 - the rejected transient systemd service for each process generation from ADR
   0008, used only in a deterministic delayed creation reproduction and never as
   a proposed fallback.
