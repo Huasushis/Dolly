@@ -161,7 +161,7 @@ function verifiedCgroup(
     fileSystem,
     pollIntervalMs: 2,
   });
-  if (options.membershipObserved !== false) cgroup.recordVerifiedMembership([4_242]);
+  if (options.membershipObserved !== false) cgroup.recordObservedProcessIds([4_242]);
   return cgroup;
 }
 

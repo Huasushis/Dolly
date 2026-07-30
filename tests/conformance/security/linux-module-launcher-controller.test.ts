@@ -222,6 +222,90 @@ describe("LinuxModuleLauncherController authorization sequence", () => {
     expect(harness.waitForLauncherExit).not.toHaveBeenCalled();
   });
 
+  it("reports that execute may have been delivered when its send times out", async () => {
+    const sent: JsonValue[] = [];
+    const controller = new LinuxModuleLauncherController({
+      channel: {
+        send: async (message) => {
+          sent.push(message);
+          const command = String((message as Record<string, unknown>).command);
+          if (command === "execute") {
+            await new Promise<void>(() => undefined);
+          }
+        },
+        close: () => undefined,
+      },
+      readModuleCgroupProcessIds: async () => [LAUNCHER_PROCESS_ID],
+      waitForLauncherExit: async () => true,
+      configureTimeoutMs: 30,
+      inCgroupTimeoutMs: 100,
+      membershipTimeoutMs: 100,
+      exitObservationTimeoutMs: 100,
+    });
+
+    const authorization = controller.authorizeExecution(REQUEST);
+    for (let attempt = 0; attempt < 100 && sent.length < 1; attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    controller.receiveControlMessage(
+      createLauncherInCgroupEvent() as unknown as JsonValue,
+    );
+    const result = await authorization;
+
+    expect(result).toMatchObject({
+      outcome: "failed",
+      code: "LAUNCHER_CONTROL_TIMEOUT",
+      observedProcessIds: [LAUNCHER_PROCESS_ID],
+      executeCommandMayHaveBeenDelivered: true,
+      membershipVerified: true,
+      launcherExitObserved: false,
+    });
+    expect(
+      sent.map((message) => String((message as Record<string, unknown>).command)),
+    ).toEqual(["configure", "execute", "exit"]);
+  });
+
+  it("returns the original failure when sending exit times out", async () => {
+    const sent: string[] = [];
+    const controller = new LinuxModuleLauncherController({
+      channel: {
+        send: async (message) => {
+          const command = String((message as Record<string, unknown>).command);
+          sent.push(command);
+          if (command === "exit") {
+            await new Promise<void>(() => undefined);
+          }
+        },
+        close: () => undefined,
+      },
+      readModuleCgroupProcessIds: async () => [],
+      waitForLauncherExit: async () => true,
+      configureTimeoutMs: 30,
+      inCgroupTimeoutMs: 100,
+      membershipTimeoutMs: 100,
+      exitObservationTimeoutMs: 100,
+    });
+
+    const authorization = controller.authorizeExecution(REQUEST);
+    for (let attempt = 0; attempt < 100 && sent.length < 1; attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    controller.receiveControlMessage(
+      createLauncherInCgroupEvent() as unknown as JsonValue,
+    );
+    const result = await authorization;
+
+    expect(result).toMatchObject({
+      outcome: "failed",
+      code: "LAUNCHER_MEMBERSHIP_UNVERIFIED",
+      observedProcessIds: [],
+      executeCommandMayHaveBeenDelivered: false,
+      membershipVerified: false,
+      launcherExitObserved: true,
+    });
+    expect(sent).toEqual(["configure", "exit"]);
+  });
+
   it("rejects an out-of-order or malformed frame from the launcher", async () => {
     for (const frame of [
       { launcherProtocol: 1, event: "executing" },

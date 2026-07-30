@@ -169,7 +169,7 @@ describe.skipIf(delegatedRoot === undefined)("Module cgroup on a real Linux kern
   async function recordMembershipFromKernel(cgroup: ModuleCgroup): Promise<void> {
     const processIds = await readProcessIds(cgroup.path);
     expect(processIds.length, `${cgroup.path} holds no process`).toBeGreaterThan(0);
-    cgroup.recordVerifiedMembership(processIds);
+    cgroup.recordObservedProcessIds(processIds);
   }
 
   beforeAll(async () => {

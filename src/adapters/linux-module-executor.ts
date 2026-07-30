@@ -123,6 +123,7 @@ export function createLinuxModuleExecutor(
   let session: LinuxModuleProtocolSession | undefined;
   let processStart: Promise<ModuleProcessStartResult> | undefined;
   let startOperation: Promise<void> | undefined;
+  let startCompleted = false;
   let terminationRequested = false;
   let terminationConfirmed = false;
   let terminationOperation: Promise<void> | undefined;
@@ -163,7 +164,7 @@ export function createLinuxModuleExecutor(
         setAvailableSession(undefined);
         throw error;
       }
-      if (!started.started) {
+      if (!started.executionAuthorized) {
         setAvailableSession(undefined);
         throw startFailureError(started.failure);
       }
@@ -189,6 +190,16 @@ export function createLinuxModuleExecutor(
           "The Linux Module executor was asked to terminate during protocol initialization",
         );
       }
+      options.lifecycle.records.updateModuleProcessRecordState(
+        options.lifecycle.identity.processGenerationId,
+        "running",
+      );
+      if (terminationRequested) {
+        throw new Error(
+          "The Linux Module executor was asked to terminate while its running state was persisted",
+        );
+      }
+      startCompleted = true;
     })();
     return startOperation;
   };
@@ -205,27 +216,62 @@ export function createLinuxModuleExecutor(
         `the Module process start failed without returning its process ownership state: ${describe(error)}; Core must exit so its service cleanup removes any unreported process`,
       );
     }
-    if (!started.started) {
+    let cgroup;
+    if (!started.executionAuthorized) {
       await startOperation?.catch(() => undefined);
       if (started.failure.coreMustExit) {
+        let groupCleanupDetail = "no control-group member was observed";
+        if (
+          started.cgroup !== undefined &&
+          started.cgroup.membershipObserved &&
+          !started.cgroup.removed
+        ) {
+          try {
+            options.lifecycle.records.updateModuleProcessRecordState(
+              options.lifecycle.identity.processGenerationId,
+              "stopping",
+            );
+          } catch {
+            // The physical group termination below must still be attempted.
+          }
+          try {
+            const termination = await started.cgroup.terminate({
+              timeoutMs: options.terminationTimeoutMs,
+            });
+            groupCleanupDetail = termination.terminated
+              ? "the observed control-group members were terminated, but the group and process record were preserved for service recovery"
+              : `${termination.code}: ${termination.detail}`;
+          } catch (error) {
+            groupCleanupDetail = `control-group termination failed: ${describe(error)}`;
+          }
+        }
         throw new ModuleExecutorTerminationUnconfirmedError(
-          `${started.failure.code}: ${started.failure.detail}; Core must exit so its service cleanup removes any unaccounted launcher`,
+          `${started.failure.code}: ${started.failure.detail}; ${groupCleanupDetail}; Core must exit so its service cleanup removes any unaccounted process`,
         );
       }
-      return;
+      if (started.cgroup === undefined) return;
+      cgroup = started.cgroup;
+    } else {
+      cgroup = started.cgroup;
     }
+
+    const executionAuthorized = started.executionAuthorized;
     // Once the launcher has been authorized, opening the protocol session may
     // create capability state. Wait until that attempt finishes so a late
     // session cannot appear after whole-group termination has already begun.
-    const availableSession = await sessionAvailable;
+    // A failed authorization never opens an Extension protocol session.
+    const availableSession = executionAuthorized
+      ? await sessionAvailable
+      : undefined;
     let stopped;
     try {
       stopped = await stopModuleProcess({
         records: options.lifecycle.records,
         processGenerationId: options.lifecycle.identity.processGenerationId,
-        cgroup: started.cgroup,
+        cgroup,
         timeoutMs: options.terminationTimeoutMs,
         closeCapabilitySession: () => {
+          if (!executionAuthorized) return Promise.resolve();
           if (!availableSession) {
             const detail = protocolSessionOpenFailed
               ? `: ${describe(protocolSessionOpenError)}`
@@ -240,6 +286,7 @@ export function createLinuxModuleExecutor(
           return availableSession.closeCapabilitySession();
         },
         waitForChannelClosed: (timeoutMs) => {
+          if (!executionAuthorized) return Promise.resolve(true);
           return availableSession
             ? availableSession.waitForChannelClosed(timeoutMs)
             : Promise.resolve(false);
@@ -259,7 +306,9 @@ export function createLinuxModuleExecutor(
     // Physical termination may finish while initialize() is still unwinding.
     // Do not confirm termination until that start operation can no longer
     // create or reopen resources.
-    await startOperation?.catch(() => undefined);
+    if (executionAuthorized) {
+      await startOperation?.catch(() => undefined);
+    }
   };
 
   const proveStopped = (): Promise<void> => {
@@ -292,6 +341,11 @@ export function createLinuxModuleExecutor(
       assertContext(context, options.moduleGenerationId);
       if (terminationRequested) {
         throw new Error("The Linux Module executor cannot accept work during termination");
+      }
+      if (!startCompleted) {
+        throw new Error(
+          "The Linux Module executor cannot accept work before protocol initialization is complete and the running record is persisted",
+        );
       }
       if (!session) {
         throw new Error("The Linux Module executor has no protocol session");

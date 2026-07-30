@@ -153,6 +153,13 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function confirmedExecutionAuthorization(processId = 4242) {
+  return {
+    executionAuthorized: true,
+    verifiedProcessIds: [processId],
+  } as const;
+}
+
 function protocolSession(
   overrides: Partial<LinuxModuleProtocolSession> = {},
 ): LinuxModuleProtocolSession {
@@ -211,7 +218,7 @@ function executorFor(options: {
         (async () => ({
           processId: 4242,
           configure: async () => undefined,
-          authorizeExecution: async () => undefined,
+          authorizeExecution: async () => confirmedExecutionAuthorization(),
           requestExit: async () => true,
         })),
       execution: {
@@ -239,6 +246,120 @@ describe("Linux Module executor termination proof", () => {
     // Construction returns a terminable handle; nothing has started.
     expect(typeof executor.terminate).toBe("function");
     expect(session.initialize).not.toHaveBeenCalled();
+  });
+
+  it("persists running only after protocol initialization completes", async () => {
+    const records = recordStore();
+    const initializationStarted = deferred<void>();
+    const allowInitialization = deferred<void>();
+    const session = protocolSession({
+      initialize: vi.fn(async () => {
+        initializationStarted.resolve();
+        await allowInitialization.promise;
+      }),
+    });
+    const executor = executorFor({
+      populated: () => "populated 0\nfrozen 0\n",
+      session,
+      records,
+    });
+
+    const start = executor.start();
+    await initializationStarted.promise;
+    expect(records.current?.state).toBe("starting");
+    expect(records.log).not.toContain("state:running");
+
+    allowInitialization.resolve();
+    await start;
+    expect(records.current?.state).toBe("running");
+    expect(records.log.filter((entry) => entry === "state:running")).toHaveLength(1);
+  });
+
+  it("retains termination ownership when persisting running fails", async () => {
+    let populated = "populated 1\nfrozen 0\n";
+    const records = recordStore({
+      rejectStateChange: (state) => state === "running",
+    });
+    const fileSystem = cgroupFileSystem(() => populated);
+    const session = protocolSession();
+    const executor = executorFor({
+      populated: () => populated,
+      session,
+      records,
+      fileSystem,
+    });
+
+    await expect(executor.start()).rejects.toThrowError(
+      /simulated failure persisting process-record state running/,
+    );
+    expect(session.initialize).toHaveBeenCalledOnce();
+    expect(records.current?.state).toBe("starting");
+    await expect(
+      executor.execute(
+        {
+          schemaVersion: "dolly.reactive-module-input/2",
+          claimedDeliveryIds: [],
+          blockGroups: [],
+          hasMore: false,
+        },
+        {
+          moduleId: IDENTITY.moduleId,
+          moduleGenerationId: MODULE_GENERATION_ID,
+          moduleJobId: "module-job-before-running-write",
+          runId: "run-before-running-write",
+          attempt: 1,
+          startedAt: Date.now(),
+          signal: new AbortController().signal,
+        },
+      ),
+    ).rejects.toThrowError(
+      /before protocol initialization is complete and the running record is persisted/,
+    );
+    expect(session.execute).not.toHaveBeenCalled();
+
+    populated = "populated 0\nfrozen 0\n";
+    await expect(executor.terminate(TERMINATION_CONTEXT)).resolves.toBeUndefined();
+    expect(session.closeCapabilitySession).toHaveBeenCalledOnce();
+    expect(session.waitForChannelClosed).toHaveBeenCalledOnce();
+    expect(
+      fileSystem.writeLog.filter(
+        ({ path, contents }) => path.endsWith("/cgroup.kill") && contents === "1",
+      ),
+    ).toHaveLength(1);
+    expect(records.log).toContain("state:stopping");
+    expect(records.current?.state).toBe("stopped");
+    expect(fileSystem.directories.has(processRecord().moduleCgroupPath)).toBe(false);
+  });
+
+  it("retains termination ownership when protocol initialization fails", async () => {
+    const records = recordStore();
+    const fileSystem = cgroupFileSystem(() => "populated 0\nfrozen 0\n");
+    const session = protocolSession({
+      initialize: vi.fn(async () => {
+        throw new Error("authenticated initialization failed");
+      }),
+    });
+    const executor = executorFor({
+      populated: () => "populated 0\nfrozen 0\n",
+      session,
+      records,
+      fileSystem,
+    });
+
+    await expect(executor.start()).rejects.toThrowError(/initialization failed/);
+    expect(records.current?.state).toBe("starting");
+    expect(records.log).not.toContain("state:running");
+
+    await expect(executor.terminate(TERMINATION_CONTEXT)).resolves.toBeUndefined();
+    expect(session.closeCapabilitySession).toHaveBeenCalledOnce();
+    expect(session.waitForChannelClosed).toHaveBeenCalledOnce();
+    expect(
+      fileSystem.writeLog.filter(
+        ({ path, contents }) => path.endsWith("/cgroup.kill") && contents === "1",
+      ),
+    ).toHaveLength(1);
+    expect(records.current?.state).toBe("stopped");
+    expect(fileSystem.directories.has(processRecord().moduleCgroupPath)).toBe(false);
   });
 
   it("proves termination only after the capability session, the group, and the channel", async () => {
@@ -415,6 +536,7 @@ describe("Linux Module executor termination proof", () => {
         authorizeExecution: async () => {
           authorizationStarted.resolve();
           await allowAuthorization.promise;
+          return confirmedExecutionAuthorization();
         },
         requestExit: async () => true,
       }),
@@ -608,7 +730,7 @@ describe("Linux Module executor termination proof", () => {
   it("waits for an in-progress start and prevents execution authorization", async () => {
     const configureStarted = deferred<void>();
     const allowConfigure = deferred<void>();
-    const authorizeExecution = vi.fn(async () => undefined);
+    const authorizeExecution = vi.fn(async () => confirmedExecutionAuthorization());
     const requestExit = vi.fn(async () => true);
     const session = protocolSession();
     const executor = executorFor({
@@ -654,7 +776,7 @@ describe("Linux Module executor termination proof", () => {
         configure: async () => {
           throw new Error("the launcher control channel failed");
         },
-        authorizeExecution: async () => undefined,
+        authorizeExecution: async () => confirmedExecutionAuthorization(),
         requestExit: async () => false,
       }),
     });
@@ -668,11 +790,54 @@ describe("Linux Module executor termination proof", () => {
     );
   });
 
+  it("terminates observed group members but still requires Core exit for an unobserved launcher", async () => {
+    let populated = "populated 1\nfrozen 0\n";
+    const records = recordStore();
+    const fileSystem = cgroupFileSystem(() => populated);
+    const session = protocolSession();
+    const executor = executorFor({
+      populated: () => populated,
+      session,
+      records,
+      fileSystem,
+      startLauncher: async () => ({
+        processId: 4242,
+        configure: async () => undefined,
+        authorizeExecution: async () => ({
+          executionAuthorized: false,
+          code: "LAUNCHER_MEMBERSHIP_UNVERIFIED",
+          detail: "the control group contained only an unexplained process",
+          membershipVerified: false,
+          observedProcessIds: [99],
+          executeCommandMayHaveBeenDelivered: false,
+          launcherExitObserved: false,
+        }),
+        requestExit: async () => false,
+      }),
+    });
+
+    await expect(executor.start()).rejects.toThrowError(/Core must exit/);
+    populated = "populated 0\nfrozen 0\n";
+    await expect(executor.terminate(TERMINATION_CONTEXT)).rejects.toThrowError(
+      ModuleExecutorTerminationUnconfirmedError,
+    );
+
+    expect(
+      fileSystem.writeLog.filter(
+        ({ path, contents }) => path.endsWith("/cgroup.kill") && contents === "1",
+      ),
+    ).toHaveLength(1);
+    expect(records.current?.state).toBe("stopping");
+    expect(records.log).not.toContain("state:stopped");
+    expect(fileSystem.directories.has(processRecord().moduleCgroupPath)).toBe(true);
+    expect(session.closeCapabilitySession).not.toHaveBeenCalled();
+  });
+
   it("does not allow start to create resources after termination already completed", async () => {
     const startLauncher = vi.fn(async (): Promise<ModuleLauncherControl> => ({
       processId: 4242,
       configure: async () => undefined,
-      authorizeExecution: async () => undefined,
+      authorizeExecution: async () => confirmedExecutionAuthorization(),
       requestExit: async () => true,
     }));
     const executor = executorFor({

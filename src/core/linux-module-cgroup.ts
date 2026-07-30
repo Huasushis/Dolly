@@ -9,7 +9,7 @@
  * the delegated root itself keeps no processes and can distribute the `cpu`,
  * `memory`, and `pids` controllers to its children.
  *
- * This module owns three things and nothing else:
+ * This module owns four things and nothing else:
  *
  * 1. **Preparation.** The path is derived from Core's own instance, Module, and
  *    process-generation identities; no Extension or configuration value
@@ -30,12 +30,16 @@
  *    Linux boot, a missing path that still carries the record's non-reused
  *    process-generation identifier, and a changed Linux boot identifier.
  *
- * Reading `populated 0` proves nothing until the group has been observed to
- * hold a member: a group that nobody has joined yet reports `populated 0` too.
- * `docs/takeover/linux-cgroup-delegation-probe-20260726.md` records exactly
- * that false positive from the mechanism probe, so `ModuleCgroup.terminate`
- * refuses to report success unless membership was observed first, either from
- * the kernel `cgroup.procs` file or from a `populated 1` reading.
+ * A `populated 0` reading alone cannot prove whole-group termination until the
+ * group has been observed to hold a member: a group that nobody has joined yet
+ * reports `populated 0` too. The same reading has a narrower valid use after
+ * execution authorization was withheld and the launcher's exit was observed:
+ * it confirms the group's current empty state immediately before directory
+ * removal, and successful removal completes that cleanup proof.
+ * `docs/takeover/linux-cgroup-delegation-probe-20260726.md` records the
+ * termination false positive, so `ModuleCgroup.terminate` refuses to report
+ * success unless membership was observed first, either from the kernel
+ * `cgroup.procs` file or from a `populated 1` reading.
  *
  * That ordering rule applies to a live Module, not to startup recovery. During
  * recovery the Core process that could have started the process is gone and
@@ -769,6 +773,8 @@ export type ModuleCgroupRemovalResult =
       readonly removed: false;
       readonly code:
         | "MODULE_CGROUP_REMOVE_BEFORE_PROOF"
+        /** The group state could not be read, so removing it would discard evidence. */
+        | "MODULE_CGROUP_PATH_UNAVAILABLE"
         /** Existing termination calls did not finish before the bounded wait. */
         | "MODULE_CGROUP_TERMINATION_PENDING"
         | "MODULE_CGROUP_REMOVE_FAILED";
@@ -819,6 +825,7 @@ export class ModuleCgroup {
   readonly #pollIntervalMs: number;
   #membershipObserved = false;
   #terminationProven = false;
+  #launcherExitObservedBeforeExecutionAuthorization = false;
   #activeTerminationOperations = 0;
   readonly #terminationWaiters = new Set<() => void>();
   #removalPromise: Promise<ModuleCgroupRemovalResult> | undefined;
@@ -838,9 +845,14 @@ export class ModuleCgroup {
     return this.#membershipObserved;
   }
 
-  /** Whether this group has been proven empty since it was terminated. */
+  /** Whether this group has been proven empty after whole-group termination. */
   get terminationProven(): boolean {
     return this.#terminationProven;
+  }
+
+  /** Whether the launcher exit was observed before execution authorization. */
+  get launcherExitObservedBeforeExecutionAuthorization(): boolean {
+    return this.#launcherExitObservedBeforeExecutionAuthorization;
   }
 
   /** Whether the proven-empty control-group directory has been removed. */
@@ -849,15 +861,14 @@ export class ModuleCgroup {
   }
 
   /**
-   * Records the kernel `cgroup.procs` evidence the launcher controller gathers
-   * when it verifies launcher membership. Only a non-empty list counts: a
-   * launcher's own report is never evidence, and an empty file is the
-   * pre-membership state.
+   * Records a non-empty process list read from the kernel `cgroup.procs` file.
+   * This establishes that the group held members even when exact launcher-only
+   * verification later fails. A launcher's own report is never evidence.
    */
-  recordVerifiedMembership(processIds: readonly number[]): void {
+  recordObservedProcessIds(processIds: readonly number[]): void {
     if (processIds.length === 0) {
       throw new TypeError(
-        "recordVerifiedMembership needs at least one process identifier read from cgroup.procs",
+        "recordObservedProcessIds needs at least one process identifier read from cgroup.procs",
       );
     }
     this.#membershipObserved = true;
@@ -873,6 +884,46 @@ export class ModuleCgroup {
     } catch {
       return undefined;
     }
+  }
+
+  /**
+   * Removes a group after the caller observed the launcher exit and before
+   * execution authorization was confirmed.
+   *
+   * At that point the launcher can no longer place a process into the group.
+   * A fresh `populated 0` reading therefore proves the prepared directory is
+   * empty without writing `cgroup.kill`. If any member has been observed, the
+   * caller must instead terminate the whole group. An unreadable state or a
+   * failed removal preserves the directory and never reports success.
+   */
+  async removeAfterLauncherExitBeforeExecutionAuthorization(): Promise<ModuleCgroupRemovalResult> {
+    if (this.#removalResult !== undefined) return this.#removalResult;
+    this.#launcherExitObservedBeforeExecutionAuthorization = true;
+    if (this.#membershipObserved) {
+      return {
+        removed: false,
+        code: "MODULE_CGROUP_REMOVE_BEFORE_PROOF",
+        detail: `${this.path} has held a process, so it requires whole-group termination before removal`,
+      };
+    }
+
+    const populated = await this.readPopulated();
+    if (populated === undefined) {
+      return {
+        removed: false,
+        code: "MODULE_CGROUP_PATH_UNAVAILABLE",
+        detail: `cgroup.events of ${this.path} could not be read after the launcher exited, so the group cannot be removed`,
+      };
+    }
+    if (populated) {
+      return {
+        removed: false,
+        code: "MODULE_CGROUP_REMOVE_BEFORE_PROOF",
+        detail: `${this.path} still holds a process after the launcher exited, so it requires whole-group termination`,
+      };
+    }
+
+    return await this.#beginRemoval();
   }
 
   /**
@@ -1054,9 +1105,15 @@ export class ModuleCgroup {
       return Promise.resolve({
         removed: false,
         code: "MODULE_CGROUP_REMOVE_BEFORE_PROOF",
-        detail: `${this.path} has not been proven empty, so removing it would destroy the evidence that its processes stopped`,
+        detail: `${this.path} has not been proven empty after whole-group termination, so removing it would destroy process evidence`,
       });
     }
+    return this.#beginRemoval(options);
+  }
+
+  #beginRemoval(
+    options: ModuleCgroupRemovalOptions = {},
+  ): Promise<ModuleCgroupRemovalResult> {
     if (this.#removalResult !== undefined) return Promise.resolve(this.#removalResult);
     if (this.#removalPromise !== undefined) return this.#removalPromise;
     const removal = this.#removeOnce(options);

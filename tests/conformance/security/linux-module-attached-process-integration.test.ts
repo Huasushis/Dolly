@@ -217,12 +217,12 @@ async function cleanupTestResources(resources: TestResources): Promise<void> {
 
   if (cgroup !== undefined) {
     if (!cgroup.membershipObserved && launcher?.controller.membershipVerified) {
-      cgroup.recordVerifiedMembership([launcher.processId]);
+      cgroup.recordObservedProcessIds([launcher.processId]);
     }
 
     if (!cgroup.membershipObserved) {
       const processIds = await cgroupProcessIds(cgroup.path);
-      if (processIds.length > 0) cgroup.recordVerifiedMembership(processIds);
+      if (processIds.length > 0) cgroup.recordObservedProcessIds(processIds);
     }
 
     if (!cgroup.membershipObserved && launcher !== undefined) {
@@ -394,7 +394,7 @@ async function startModule(
   }
   // Membership was verified from kernel files, so the group is the unit of
   // termination from here on.
-  cgroup.recordVerifiedMembership(outcome.verifiedProcessIds);
+  cgroup.recordObservedProcessIds(outcome.verifiedProcessIds);
   return { launcher, cgroup, oomKillCountBefore };
 }
 

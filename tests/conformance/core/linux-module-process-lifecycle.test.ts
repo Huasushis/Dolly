@@ -159,6 +159,10 @@ function launcher(
     },
     async authorizeExecution() {
       log.push("authorize");
+      return {
+        executionAuthorized: true,
+        verifiedProcessIds: [4242],
+      } as const;
     },
     async requestExit() {
       log.push("exit");
@@ -187,14 +191,92 @@ describe("Linux Module process lifecycle order", () => {
       cgroupFileSystem: fileSystem,
     });
 
-    expect(result.started).toBe(true);
+    expect(result.executionAuthorized).toBe(true);
+    if (!result.executionAuthorized) throw new Error("expected authorization");
     // The record is durable before anything else can exist.
     expect(records.log[0]).toBe("append");
     expect(fileSystem.directories.size).toBeGreaterThan(0);
     // The launcher is created only after the group is prepared.
     expect(startLauncher).toHaveBeenCalledOnce();
     expect(control.log).toEqual(["configure", "authorize"]);
-    expect(records.log.at(-1)).toBe("state:running");
+    expect(result.record.state).toBe("starting");
+    expect(records.log).not.toContain("state:running");
+  });
+
+  it("requires Core to exit when authorization reports an invalid process list", async () => {
+    const records = recordStore();
+    const fileSystem = fakeCgroupFileSystem();
+    const control = launcher({
+      async authorizeExecution() {
+        return {
+          executionAuthorized: true,
+          verifiedProcessIds: [4242, 99],
+        } as const;
+      },
+    });
+
+    const result = await startModuleProcess({
+      records,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher: async () => control,
+      execution: EXECUTION,
+      cgroupFileSystem: fileSystem,
+    });
+
+    expect(result.executionAuthorized).toBe(false);
+    if (result.executionAuthorized) throw new Error("expected a refusal");
+    expect(result.failure).toMatchObject({
+      code: "MODULE_PROCESS_MEMBERSHIP_UNVERIFIED",
+      coreMustExit: true,
+    });
+    expect(result.cgroup?.membershipObserved).toBe(true);
+    expect(fileSystem.directories.size).toBe(1);
+    expect(records.log).not.toContain("state:running");
+    expect(records.log).not.toContain("state:stopped");
+  });
+
+  it("requires Core to exit when execute may have been delivered without observed membership", async () => {
+    const records = recordStore();
+    const fileSystem = fakeCgroupFileSystem();
+    const control = launcher({
+      async authorizeExecution() {
+        return {
+          executionAuthorized: false,
+          code: "LAUNCHER_CONTROL_TIMEOUT",
+          detail: "the execute send result is unknown",
+          membershipVerified: false,
+          observedProcessIds: [],
+          executeCommandMayHaveBeenDelivered: true,
+          launcherExitObserved: true,
+        } as const;
+      },
+    });
+
+    const result = await startModuleProcess({
+      records,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher: async () => control,
+      execution: EXECUTION,
+      cgroupFileSystem: fileSystem,
+    });
+
+    expect(result.executionAuthorized).toBe(false);
+    if (result.executionAuthorized) throw new Error("expected a refusal");
+    expect(result.failure).toMatchObject({
+      code: "MODULE_PROCESS_LAUNCHER_FAILED",
+      coreMustExit: true,
+    });
+    expect(control.log).toEqual(["configure"]);
+    expect(fileSystem.directories.size).toBe(1);
+    expect(records.log).not.toContain("state:stopped");
   });
 
   it("never starts a launcher when the control group cannot be prepared", async () => {
@@ -213,8 +295,8 @@ describe("Linux Module process lifecycle order", () => {
       cgroupFileSystem: fakeCgroupFileSystem({ failCreate: true }),
     });
 
-    expect(result.started).toBe(false);
-    if (result.started) throw new Error("expected a refusal");
+    expect(result.executionAuthorized).toBe(false);
+    if (result.executionAuthorized) throw new Error("expected a refusal");
     expect(result.failure.code).toBe("MODULE_PROCESS_CGROUP_FAILED");
     expect(startLauncher).not.toHaveBeenCalled();
     // The record stays as evidence, marked stopped because no process joined.
@@ -224,6 +306,7 @@ describe("Linux Module process lifecycle order", () => {
   it("asks the launcher to exit and does not authorize execution when stop was requested", async () => {
     const records = recordStore();
     const control = launcher();
+    const fileSystem = fakeCgroupFileSystem();
 
     const result = await startModuleProcess({
       records,
@@ -235,15 +318,44 @@ describe("Linux Module process lifecycle order", () => {
       startLauncher: async () => control,
       execution: EXECUTION,
       stopRequested: () => true,
-      cgroupFileSystem: fakeCgroupFileSystem(),
+      cgroupFileSystem: fileSystem,
     });
 
-    expect(result.started).toBe(false);
-    if (result.started) throw new Error("expected a refusal");
+    expect(result.executionAuthorized).toBe(false);
+    if (result.executionAuthorized) throw new Error("expected a refusal");
     expect(result.failure.code).toBe("MODULE_PROCESS_STOP_REQUESTED");
     expect(result.failure.coreMustExit).toBe(false);
     // The launcher was told to exit and never authorized to execute.
     expect(control.log).toEqual(["configure", "exit"]);
+    expect(fileSystem.directories.size).toBe(0);
+    expect(records.log.at(-1)).toBe("state:stopped:MODULE_PROCESS_STOP_REQUESTED");
+  });
+
+  it("retains the prepared control group when launcher creation has an unknown outcome", async () => {
+    const records = recordStore();
+    const fileSystem = fakeCgroupFileSystem();
+
+    const result = await startModuleProcess({
+      records,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher: async () => {
+        throw new Error("launcher construction failed after spawn may have begun");
+      },
+      execution: EXECUTION,
+      cgroupFileSystem: fileSystem,
+    });
+
+    expect(result.executionAuthorized).toBe(false);
+    if (result.executionAuthorized) throw new Error("expected a refusal");
+    expect(result.failure.code).toBe("MODULE_PROCESS_LAUNCHER_FAILED");
+    expect(result.failure.coreMustExit).toBe(true);
+    expect("cgroup" in result).toBe(true);
+    expect(records.log).not.toContain("state:stopped:LAUNCHER_START_FAILED");
+    expect(fileSystem.directories.size).toBe(1);
   });
 
   it("requires Core to exit when a pre-membership launcher exit cannot be observed", async () => {
@@ -269,8 +381,8 @@ describe("Linux Module process lifecycle order", () => {
       cgroupFileSystem: fakeCgroupFileSystem(),
     });
 
-    expect(result.started).toBe(false);
-    if (result.started) throw new Error("expected a refusal");
+    expect(result.executionAuthorized).toBe(false);
+    if (result.executionAuthorized) throw new Error("expected a refusal");
     expect(result.failure.code).toBe("MODULE_PROCESS_MEMBERSHIP_UNVERIFIED");
     // There is no safe way to address the launcher, so the service cleanup is
     // the only remaining group termination.
@@ -294,8 +406,8 @@ describe("Linux Module process lifecycle order", () => {
       execution: EXECUTION,
       cgroupFileSystem: fileSystem,
     });
-    expect(started.started).toBe(true);
-    if (!started.started) throw new Error("expected a start");
+    expect(started.executionAuthorized).toBe(true);
+    if (!started.executionAuthorized) throw new Error("expected a start");
 
     // While the group still reports members, the stop is refused and the
     // record stays in `stopping` for a later Core invocation.
@@ -340,8 +452,8 @@ describe("Linux Module process lifecycle order", () => {
       execution: EXECUTION,
       cgroupFileSystem: fileSystem,
     });
-    expect(started.started).toBe(true);
-    if (!started.started) throw new Error("expected a start");
+    expect(started.executionAuthorized).toBe(true);
+    if (!started.executionAuthorized) throw new Error("expected a start");
 
     const stopped = await stopModuleProcess({
       ...NO_PROTOCOL_SESSION,
@@ -373,8 +485,8 @@ describe("Linux Module process lifecycle order", () => {
       execution: EXECUTION,
       cgroupFileSystem: fileSystem,
     });
-    expect(started.started).toBe(true);
-    if (!started.started) throw new Error("expected a start");
+    expect(started.executionAuthorized).toBe(true);
+    if (!started.executionAuthorized) throw new Error("expected a start");
     await expect(
       stopModuleProcess({
         ...NO_PROTOCOL_SESSION,
@@ -412,8 +524,8 @@ describe("Linux Module process lifecycle order", () => {
       execution: EXECUTION,
       cgroupFileSystem: fileSystem,
     });
-    expect(started.started).toBe(true);
-    if (!started.started) throw new Error("expected a start");
+    expect(started.executionAuthorized).toBe(true);
+    if (!started.executionAuthorized) throw new Error("expected a start");
 
     const first = stopModuleProcess({
       ...NO_PROTOCOL_SESSION,
@@ -448,8 +560,8 @@ describe("Linux Module process lifecycle order", () => {
       execution: EXECUTION,
       cgroupFileSystem: fileSystem,
     });
-    expect(started.started).toBe(true);
-    if (!started.started) throw new Error("expected a start");
+    expect(started.executionAuthorized).toBe(true);
+    if (!started.executionAuthorized) throw new Error("expected a start");
 
     const stopped = await stopModuleProcess({
       ...NO_PROTOCOL_SESSION,
@@ -481,8 +593,8 @@ describe("Linux Module process lifecycle order", () => {
       execution: EXECUTION,
       cgroupFileSystem: fileSystem,
     });
-    expect(started.started).toBe(true);
-    if (!started.started) throw new Error("expected a start");
+    expect(started.executionAuthorized).toBe(true);
+    if (!started.executionAuthorized) throw new Error("expected a start");
     const recordsWithWrongPath: ModuleProcessRecordStore = {
       ...records,
       getModuleProcessRecord(processGenerationId) {

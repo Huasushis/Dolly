@@ -21,8 +21,12 @@
  *      from the launcher's own report; and
  *   5. only then authorize the launcher to replace itself with the Extension.
  *
- * Stopping is equally fixed: terminate the whole control group and prove it
- * empty. A direct child exit is never that proof once membership is verified.
+ * Once any control-group member has been observed, stopping terminates the
+ * whole group and proves it empty. Before any member is observed, and only
+ * while execution authorization is known not to have been delivered, an
+ * observed launcher exit followed by a fresh empty-state reading and
+ * successful directory removal is sufficient. An uncertain launcher exit or
+ * uncertain authorization delivery requires the Core service to exit.
  *
  * This module starts no Module by itself and is not wired into runtime
  * startup. `runtime-bootstrap.ts` still rejects every configured Module; that
@@ -80,20 +84,45 @@ export interface ModuleLauncherControl {
     readonly moduleCgroupPath: string;
     readonly maxOpenFiles: number;
   }): Promise<void>;
+
   /**
-   * Verifies kernel membership and then authorizes `exec`. It rejects when the
-   * launcher was not authorized, for any reason; resolving means the execute
-   * authorization was sent.
+   * Verifies kernel membership and then authorizes `exec`. Expected launcher
+   * failures are returned with their kernel observations. Throwing is reserved
+   * for a broken adapter contract or another unexpected failure.
    */
   authorizeExecution(request: {
     readonly moduleCgroupPath: string;
     readonly program: string;
     readonly argumentVector: readonly string[];
     readonly environment: Readonly<Record<string, string>>;
-  }): Promise<void>;
+    /** Read immediately before the launcher controller sends `execute`. */
+    readonly stopRequested: () => boolean;
+  }): Promise<ModuleLauncherExecutionAuthorization>;
   /** Asks the launcher to exit and waits for its observed exit. */
   requestExit(): Promise<boolean>;
 }
+
+/** The kernel evidence and result of one execution-authorization attempt. */
+export type ModuleLauncherExecutionAuthorization =
+  | {
+      /** Delivery of the execute authorization was confirmed. */
+      readonly executionAuthorized: true;
+      /** The exact process list accepted by kernel membership verification. */
+      readonly verifiedProcessIds: readonly number[];
+    }
+  | {
+      /** Execution authorization was not confirmed and cleanup is required. */
+      readonly executionAuthorized: false;
+      readonly code: string;
+      readonly detail: string;
+      readonly membershipVerified: boolean;
+      /** Every process identifier read from `cgroup.procs` before failure. */
+      readonly observedProcessIds: readonly number[];
+      /** Whether the `execute` command may have reached the launcher. */
+      readonly executeCommandMayHaveBeenDelivered: boolean;
+      /** Whether the launcher's exit was observed through its process handle. */
+      readonly launcherExitObserved: boolean;
+    };
 
 export type ModuleProcessStartFailureCode =
   | "MODULE_PROCESS_RECORD_FAILED"
@@ -106,21 +135,25 @@ export interface ModuleProcessStartFailure {
   readonly code: ModuleProcessStartFailureCode;
   readonly detail: string;
   /**
-   * Whether the launcher was left running with no proof that it stopped. ADR
-   * 0009 requires Core to exit in that case and let the Core service's own
-   * cleanup remove the whole service control group, because there is no safe
-   * way to address the launcher without its control channel.
+   * Whether this Core invocation must exit before recovery can continue. This
+   * is required when a launcher may exist outside the prepared control group,
+   * or when the remaining state cannot be proved or persisted safely.
    */
   readonly coreMustExit: boolean;
 }
 
 export type ModuleProcessStartResult =
   | {
-      readonly started: true;
+      readonly executionAuthorized: true;
       readonly record: ModuleProcessRecord;
       readonly cgroup: ModuleCgroup;
     }
-  | { readonly started: false; readonly failure: ModuleProcessStartFailure };
+  | {
+      readonly executionAuthorized: false;
+      readonly failure: ModuleProcessStartFailure;
+      /** Present whenever a prepared group still requires cleanup or proof. */
+      readonly cgroup?: ModuleCgroup;
+    };
 
 export interface StartModuleProcessOptions {
   readonly records: ModuleProcessRecordStore;
@@ -177,7 +210,7 @@ export async function startModuleProcess(
     record = records.appendModuleProcessRecord(options.processRecord);
   } catch (error) {
     return {
-      started: false,
+      executionAuthorized: false,
       failure: {
         code: "MODULE_PROCESS_RECORD_FAILED",
         detail: `the Module process record could not be persisted: ${describe(error)}`,
@@ -197,8 +230,22 @@ export async function startModuleProcess(
       : { fileSystem: options.cgroupFileSystem }),
   });
   if (!prepared.prepared) {
-    markStopped(records, identity.processGenerationId, prepared.failure.code);
-    return { started: false, failure: cgroupFailure(prepared.failure) };
+    const stoppedPersisted = markStopped(
+      records,
+      identity.processGenerationId,
+      prepared.failure.code,
+    );
+    const failure = cgroupFailure(prepared.failure);
+    return {
+      executionAuthorized: false,
+      failure: stoppedPersisted
+        ? failure
+        : {
+            ...failure,
+            detail: `${failure.detail}; the stopped process record could not be persisted`,
+            coreMustExit: true,
+          },
+    };
   }
   const cgroup = prepared.cgroup;
 
@@ -208,13 +255,13 @@ export async function startModuleProcess(
   try {
     launcher = await options.startLauncher();
   } catch (error) {
-    markStopped(records, identity.processGenerationId, "LAUNCHER_START_FAILED");
     return {
-      started: false,
+      executionAuthorized: false,
+      cgroup,
       failure: {
         code: "MODULE_PROCESS_LAUNCHER_FAILED",
-        detail: `the child launcher could not be started: ${describe(error)}`,
-        coreMustExit: false,
+        detail: `the child launcher did not return a process handle, but process creation may already have begun: ${describe(error)}`,
+        coreMustExit: true,
       },
     };
   }
@@ -225,9 +272,10 @@ export async function startModuleProcess(
       maxOpenFiles: options.maxOpenFiles,
     });
   } catch (error) {
-    return await abandonPreMembership(
+    return await finishFailedStartBeforeExecutionAuthorization(
       records,
       identity.processGenerationId,
+      cgroup,
       launcher,
       "MODULE_PROCESS_LAUNCHER_FAILED",
       `the launcher did not report control-group membership: ${describe(error)}`,
@@ -235,9 +283,10 @@ export async function startModuleProcess(
   }
 
   if (options.stopRequested?.() === true) {
-    return await abandonPreMembership(
+    return await finishFailedStartBeforeExecutionAuthorization(
       records,
       identity.processGenerationId,
+      cgroup,
       launcher,
       "MODULE_PROCESS_STOP_REQUESTED",
       "a stop was requested before the launcher was authorized to execute",
@@ -246,31 +295,115 @@ export async function startModuleProcess(
 
   // Steps 4 and 5. Membership is verified from kernel files inside
   // `authorizeExecution`, which sends `execute` only after that proof.
+  let authorization: ModuleLauncherExecutionAuthorization;
   try {
-    await launcher.authorizeExecution({
+    authorization = await launcher.authorizeExecution({
       moduleCgroupPath: cgroup.path,
       program: options.execution.program,
       argumentVector: options.execution.argumentVector,
       environment: options.execution.environment,
+      stopRequested: () => options.stopRequested?.() === true,
     });
   } catch (error) {
-    return await abandonPreMembership(
+    return await finishFailedStartBeforeExecutionAuthorization(
       records,
       identity.processGenerationId,
+      cgroup,
       launcher,
       "MODULE_PROCESS_MEMBERSHIP_UNVERIFIED",
       `the launcher's control-group membership was not verified: ${describe(error)}`,
     );
   }
 
-  // The launcher's process identifier is now inside the group, so the group is
-  // the unit of termination from here on.
-  cgroup.recordVerifiedMembership([launcher.processId]);
-  const running = records.updateModuleProcessRecordState(
-    identity.processGenerationId,
-    "running",
-  );
-  return { started: true, record: running, cgroup };
+  if (!authorization.executionAuthorized) {
+    const code: ModuleProcessStartFailureCode =
+      authorization.code === "LAUNCHER_STOP_REQUESTED"
+        ? "MODULE_PROCESS_STOP_REQUESTED"
+        : authorization.code === "LAUNCHER_MEMBERSHIP_UNVERIFIED"
+          ? "MODULE_PROCESS_MEMBERSHIP_UNVERIFIED"
+          : "MODULE_PROCESS_LAUNCHER_FAILED";
+    const detail = `${authorization.code}: ${authorization.detail}`;
+    if (authorization.observedProcessIds.length === 0) {
+      if (authorization.executeCommandMayHaveBeenDelivered) {
+        return {
+          executionAuthorized: false,
+          cgroup,
+          failure: {
+            code,
+            detail: `${detail}; the execute command may have reached the launcher, so an observed launcher exit and an empty control group do not prove that no Extension process existed`,
+            coreMustExit: true,
+          },
+        };
+      }
+      if (authorization.membershipVerified) {
+        return {
+          executionAuthorized: false,
+          cgroup,
+          failure: {
+            code,
+            detail: `${detail}; the launcher adapter reported verified membership without the process list that proved it`,
+            coreMustExit: true,
+          },
+        };
+      }
+      return await finishFailedStartBeforeExecutionAuthorization(
+        records,
+        identity.processGenerationId,
+        cgroup,
+        launcher,
+        code,
+        detail,
+        authorization.launcherExitObserved,
+      );
+    }
+
+    cgroup.recordObservedProcessIds(authorization.observedProcessIds);
+    const launcherCanBeTerminated =
+      authorization.observedProcessIds.includes(launcher.processId) ||
+      authorization.launcherExitObserved;
+    const coreMustExit =
+      !launcherCanBeTerminated ||
+      authorization.executeCommandMayHaveBeenDelivered;
+    const failureDetail = !launcherCanBeTerminated
+      ? `${detail}; the launcher was neither observed in the control group nor observed to exit`
+      : authorization.executeCommandMayHaveBeenDelivered
+        ? `${detail}; the execute command may have reached the launcher before the failure was reported`
+        : detail;
+    return {
+      executionAuthorized: false,
+      cgroup,
+      failure: {
+        code,
+        detail: failureDetail,
+        coreMustExit,
+      },
+    };
+  }
+
+  const verifiedProcessIds = authorization.verifiedProcessIds;
+  if (
+    verifiedProcessIds.length !== 1 ||
+    verifiedProcessIds[0] !== launcher.processId
+  ) {
+    if (verifiedProcessIds.length > 0) {
+      cgroup.recordObservedProcessIds(verifiedProcessIds);
+    }
+    return {
+      executionAuthorized: false,
+      cgroup,
+      failure: {
+        code: "MODULE_PROCESS_MEMBERSHIP_UNVERIFIED",
+        detail: `the launcher adapter confirmed execution without the exact launcher-only process list for ${cgroup.path}; a protocol session was not opened for that invalid result`,
+        coreMustExit: true,
+      },
+    };
+  }
+
+  // Protocol authentication and Module initialization have not completed, so
+  // the durable record deliberately remains `starting` here. The executor
+  // writes `running` only after its protocol session finishes initialization.
+  cgroup.recordObservedProcessIds(verifiedProcessIds);
+  return { executionAuthorized: true, record, cgroup };
 }
 
 export type ModuleProcessStopResult =
@@ -357,7 +490,11 @@ export async function stopModuleProcess(options: {
   } catch (error) {
     channelClose = Promise.reject(error);
   }
-  const cgroupTermination = cgroup.removed
+  const launcherExitedBeforeExecutionAuthorization =
+    cgroup.launcherExitObservedBeforeExecutionAuthorization &&
+    !cgroup.membershipObserved;
+  const cgroupTermination =
+    cgroup.removed || launcherExitedBeforeExecutionAuthorization
     ? Promise.resolve(undefined)
     : cgroup.terminate(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs });
   const [terminationOutcome, capabilityOutcome, channelOutcome] = await Promise.allSettled([
@@ -399,11 +536,13 @@ export async function stopModuleProcess(options: {
   }
 
   if (!cgroup.removed) {
-    const removal = await cgroup.remove(
-      options.timeoutMs === undefined
-        ? {}
-        : { terminationWaitTimeoutMs: options.timeoutMs },
-    );
+    const removal = launcherExitedBeforeExecutionAuthorization
+      ? await cgroup.removeAfterLauncherExitBeforeExecutionAuthorization()
+      : await cgroup.remove(
+          options.timeoutMs === undefined
+            ? {}
+            : { terminationWaitTimeoutMs: options.timeoutMs },
+        );
     if (!removal.removed) {
       return { stopped: false, code: removal.code, detail: removal.detail };
     }
@@ -466,60 +605,94 @@ function recordMatchesCgroup(
 }
 
 /**
- * Gives up before membership was verified.
+ * Finishes a failed start before execution authorization was confirmed.
  *
- * The launcher has not been authorized to execute anything, so asking it to
- * exit through its control channel is the whole cleanup. When that exit cannot
- * be observed, the launcher may still be running outside a group Core can
- * terminate, so Core must exit and let its service's cleanup remove the whole
- * service control group. Core never signals a process identifier instead.
+ * After the launcher's exit is observed, a fresh empty-group reading and
+ * successful directory removal are both required before the record can be
+ * marked stopped. If a process is observed, the prepared group is returned so
+ * the executor can terminate the whole group. Core never signals a process
+ * identifier directly.
  */
-async function abandonPreMembership(
+async function finishFailedStartBeforeExecutionAuthorization(
   records: ModuleProcessRecordStore,
   processGenerationId: string,
+  cgroup: ModuleCgroup,
   launcher: ModuleLauncherControl,
   code: ModuleProcessStartFailureCode,
   detail: string,
+  knownLauncherExitObserved?: boolean,
 ): Promise<ModuleProcessStartResult> {
-  let exited = false;
-  try {
-    exited = await launcher.requestExit();
-  } catch {
-    exited = false;
+  let launcherExitObserved = knownLauncherExitObserved;
+  if (launcherExitObserved === undefined) {
+    try {
+      launcherExitObserved = await launcher.requestExit();
+    } catch {
+      launcherExitObserved = false;
+    }
   }
-  if (exited) {
-    markStopped(records, processGenerationId, code);
-    return { started: false, failure: { code, detail, coreMustExit: false } };
+  if (!launcherExitObserved) {
+    return {
+      executionAuthorized: false,
+      cgroup,
+      failure: {
+        code,
+        detail: `${detail}; the launcher's exit could not be observed`,
+        coreMustExit: true,
+      },
+    };
   }
+
+  const removal = await cgroup.removeAfterLauncherExitBeforeExecutionAuthorization();
+  if (removal.removed) {
+    const stoppedPersisted = markStopped(records, processGenerationId, code);
+    return {
+      executionAuthorized: false,
+      failure: {
+        code,
+        detail: stoppedPersisted
+          ? detail
+          : `${detail}; the empty control group was removed but the stopped process record could not be persisted`,
+        coreMustExit: !stoppedPersisted,
+      },
+    };
+  }
+
+  const cleanupCanBeRetried =
+    cgroup.membershipObserved ||
+    cgroup.launcherExitObservedBeforeExecutionAuthorization;
   return {
-    started: false,
+    executionAuthorized: false,
+    cgroup,
     failure: {
       code,
-      detail: `${detail}; the launcher's exit could not be observed`,
-      coreMustExit: true,
+      detail: `${detail}; ${removal.detail}`,
+      coreMustExit: !cleanupCanBeRetried,
     },
   };
 }
 
 /**
- * Records a stop that needs no group proof because no process ever joined the
- * group. A failure to write it is deliberately not escalated: the caller is
- * already reporting a start failure, and the record's current state is still a
- * safe, conservative view for a later Core invocation.
+ * Records a stopped state after the caller has proved that no process can
+ * remain, either because process creation never began or because the launcher
+ * exited before execution authorization and the empty group was removed. The
+ * return value prevents a caller from treating a failed durable write as
+ * completed cleanup.
  */
 function markStopped(
   records: ModuleProcessRecordStore,
   processGenerationId: string,
   failureCode: string,
-): void {
+): boolean {
   try {
     records.updateModuleProcessRecordState(
       processGenerationId,
       "stopped",
       failureCode,
     );
+    return true;
   } catch {
     // Left in its current state; recovery re-proves it before reuse.
+    return false;
   }
 }
 

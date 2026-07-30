@@ -7,13 +7,9 @@
  * the launcher. Both now have product implementations.
  *
  * 1. `LinuxModuleLauncherController` runs the whole pre-execution sequence in
- *    one `authorizeExecution` call, reports failure as a returned outcome
- *    rather than by throwing, and exposes neither `processId` nor
- *    `requestExit`. The conversion from that outcome to the exception
- *    `startModuleProcess` expects has to be total: a failure variant nobody
- *    mapped would return normally and be indistinguishable from success, which
- *    is the failure direction Architecture Decision Record 0009 rejects
- *    everywhere else.
+ *    one `authorizeExecution` call, reports failure as a returned outcome,
+ *    and exposes neither `processId` nor `requestExit`. The product adapter
+ *    must preserve that structured evidence for `startModuleProcess`.
  * 2. The launcher control protocol addresses the Module control group by its
  *    path below the cgroup version 2 mount point, because the launcher writes
  *    its own process identifier into `<path>/cgroup.procs`. The ordered start
@@ -25,6 +21,10 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+import {
+  createLinuxModuleExecutor,
+  type LinuxModuleProtocolSession,
+} from "../../../src/adapters/linux-module-executor.js";
 import { createModuleLauncherControl } from "../../../src/adapters/linux-module-launcher/module-launcher-control.js";
 import {
   LinuxModuleLauncherController,
@@ -92,7 +92,7 @@ interface ControllerHarness {
   /** Process identifiers `cgroup.procs` reports during verification. */
   members: number[];
   /** Runs when the controller starts its kernel membership read. */
-  membershipReadHook: (() => void) | undefined;
+  membershipReadHook: (() => void | Promise<void>) | undefined;
   exitObserved: boolean;
   readonly channel: LinuxModuleLauncherControlChannel;
 }
@@ -102,7 +102,7 @@ function controllerHarness(): ControllerHarness {
   const state = {
     failNextSend: false,
     members: [LAUNCHER_PROCESS_ID] as number[],
-    membershipReadHook: undefined as (() => void) | undefined,
+    membershipReadHook: undefined as (() => void | Promise<void>) | undefined,
     exitObserved: true,
   };
   const channel: LinuxModuleLauncherControlChannel = {
@@ -117,7 +117,7 @@ function controllerHarness(): ControllerHarness {
   const controller = new LinuxModuleLauncherController({
     channel,
     readModuleCgroupProcessIds: async () => {
-      state.membershipReadHook?.();
+      await state.membershipReadHook?.();
       return state.members;
     },
     waitForLauncherExit: async () => state.exitObserved,
@@ -145,7 +145,7 @@ function controllerHarness(): ControllerHarness {
     get membershipReadHook() {
       return state.membershipReadHook;
     },
-    set membershipReadHook(value: (() => void) | undefined) {
+    set membershipReadHook(value: (() => void | Promise<void>) | undefined) {
       state.membershipReadHook = value;
     },
     get exitObserved() {
@@ -199,6 +199,14 @@ function reportInCgroup(harness: ControllerHarness): void {
   );
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 const CONFIGURE = {
   moduleCgroupPath: deriveModuleCgroupPath(DELEGATED_ROOT, IDENTITY).filesystemPath,
   maxOpenFiles: 64,
@@ -209,6 +217,7 @@ const EXECUTION = {
   program: "/usr/bin/node",
   argumentVector: ["/usr/bin/node", "/opt/extension/main.mjs"],
   environment: {},
+  stopRequested: () => false,
 } as const;
 
 /**
@@ -217,7 +226,11 @@ const EXECUTION = {
  */
 async function authorizeAndCapture(
   code: LinuxModuleLauncherFailureCode,
-): Promise<{ control: ModuleLauncherControl; error: unknown; harness: LauncherHarness }> {
+): Promise<{
+  control: ModuleLauncherControl;
+  authorization: Awaited<ReturnType<ModuleLauncherControl["authorizeExecution"]>>;
+  harness: LauncherHarness;
+}> {
   const harness = launcherHarness();
   const control = createModuleLauncherControl({ launcher: harness.launcher });
   await control.configure(CONFIGURE);
@@ -226,10 +239,7 @@ async function authorizeAndCapture(
   if (code === "LAUNCHER_STOP_REQUESTED") harness.controllerHarness.controller.requestStop();
   if (code === "LAUNCHER_MEMBERSHIP_UNVERIFIED") harness.controllerHarness.members = [];
 
-  const authorized = control.authorizeExecution(EXECUTION).then(
-    () => undefined,
-    (error: unknown) => error,
-  );
+  const authorization = control.authorizeExecution(EXECUTION);
 
   // The remaining codes need an event once the controller is waiting.
   if (code === "LAUNCHER_CONTROL_CHANNEL_CLOSED") {
@@ -243,43 +253,58 @@ async function authorizeAndCapture(
     reportInCgroup(harness.controllerHarness);
   }
 
-  return { control, error: await authorized, harness };
+  return { control, authorization: await authorization, harness };
 }
 
 /** An in-memory control-group filesystem sufficient for `prepareModuleCgroup`. */
-function cgroupFileSystem(): ModuleCgroupFileSystem {
+function cgroupFileSystem(
+  populated: () => string = () => "populated 0\nfrozen 0\n",
+): ModuleCgroupFileSystem & {
+  readonly directories: Set<string>;
+  readonly writeLog: readonly { readonly path: string; readonly content: string }[];
+} {
   const files = new Map<string, string>();
+  const directories = new Set<string>();
+  const writeLog: { path: string; content: string }[] = [];
   return {
+    directories,
+    writeLog,
     async readTextFile(path) {
-      if (path.endsWith("/cgroup.events")) return "populated 0\nfrozen 0\n";
+      if (path.endsWith("/cgroup.events")) return populated();
       const value = files.get(path);
       if (value === undefined) throw new Error(`${path} does not exist`);
       return value;
     },
     async writeTextFile(path, content) {
+      writeLog.push({ path, content });
       files.set(path, content);
     },
-    async createDirectory() {
-      // The directory is implied by the files written into it.
+    async createDirectory(path) {
+      directories.add(path);
     },
-    async removeDirectory() {
-      // Nothing to remove in memory.
+    async removeDirectory(path) {
+      directories.delete(path);
     },
     async listChildDirectoryNames() {
       return [];
     },
-    async directoryExists() {
-      return true;
+    async directoryExists(path) {
+      return directories.has(path);
     },
-    async writableFileExists() {
-      return true;
+    async writableFileExists(path) {
+      return directories.has(path.slice(0, path.lastIndexOf("/")));
     },
   };
 }
 
-function recordStore(): ModuleProcessRecordStore {
+function recordStore(): ModuleProcessRecordStore & {
+  readonly current: ModuleProcessRecord | undefined;
+} {
   const records = new Map<string, ModuleProcessRecord>();
   return {
+    get current() {
+      return records.get(IDENTITY.processGenerationId);
+    },
     getModuleProcessRecord(processGenerationId) {
       return records.get(processGenerationId);
     },
@@ -337,20 +362,24 @@ describe("Module launcher control adapter", () => {
     const authorized = control.authorizeExecution(EXECUTION);
     await Promise.resolve();
     reportInCgroup(harness.controllerHarness);
-    await expect(authorized).resolves.toBeUndefined();
+    await expect(authorized).resolves.toMatchObject({
+      executionAuthorized: true,
+      verifiedProcessIds: [LAUNCHER_PROCESS_ID],
+    });
     // Both commands crossed the control descriptor, in order.
     expect(harness.controllerHarness.sent).toHaveLength(2);
     expect(harness.controllerHarness.sent[0]).toContain("configure");
     expect(harness.controllerHarness.sent[1]).toContain("execute");
   });
 
-  it.each(ALL_FAILURE_CODES)("turns the %s outcome into a thrown failure", async (code) => {
-    const { error } = await authorizeAndCapture(code);
-    // The conversion must be total. A code nobody mapped would resolve, and the
-    // ordered start would treat it as an authorized execution.
-    expect(error).toBeInstanceOf(Error);
-    expect(error).toMatchObject({ code });
-    expect(String((error as Error).message)).toContain(code);
+  it.each(ALL_FAILURE_CODES)("preserves the %s failure outcome", async (code) => {
+    const { authorization } = await authorizeAndCapture(code);
+    expect(authorization).toMatchObject({
+      executionAuthorized: false,
+      code,
+    });
+    if (authorization.executionAuthorized) throw new Error("expected a refusal");
+    expect(authorization.detail.length).toBeGreaterThan(0);
   });
 
   it("carries the controller's observed-exit evidence into requestExit", async () => {
@@ -367,7 +396,10 @@ describe("Module launcher control adapter", () => {
     harness.controllerHarness.exitObserved = false;
     const control = createModuleLauncherControl({ launcher: harness.launcher });
     await control.configure(CONFIGURE);
-    await expect(control.authorizeExecution(EXECUTION)).rejects.toBeInstanceOf(Error);
+    await expect(control.authorizeExecution(EXECUTION)).resolves.toMatchObject({
+      executionAuthorized: false,
+      launcherExitObserved: false,
+    });
 
     await expect(control.requestExit()).resolves.toBe(false);
   });
@@ -399,14 +431,157 @@ describe("Module launcher control adapter", () => {
     await Promise.resolve();
     reportInCgroup(harness.controllerHarness);
 
-    await expect(authorized).rejects.toMatchObject({
+    await expect(authorized).resolves.toMatchObject({
+      executionAuthorized: false,
       code: "LAUNCHER_STOP_REQUESTED",
       membershipVerified: true,
+      observedProcessIds: [LAUNCHER_PROCESS_ID],
+      executeCommandMayHaveBeenDelivered: false,
       launcherExitObserved: false,
     });
     // A direct child exit is not a whole-control-group termination proof after
     // membership has been verified, including on this failure path.
     await expect(control.requestExit()).resolves.toBe(false);
+  });
+
+  it.each([
+    {
+      caseName: "a stop after verified membership",
+      terminateWhileMembershipIsRead: false,
+      coreMustExit: false,
+      arrange(harness: LauncherHarness) {
+        harness.controllerHarness.membershipReadHook = () => {
+          harness.controllerHarness.controller.requestStop();
+        };
+      },
+    },
+    {
+      caseName: "an extra process observed during membership verification",
+      terminateWhileMembershipIsRead: false,
+      coreMustExit: false,
+      arrange(harness: LauncherHarness) {
+        harness.controllerHarness.members = [LAUNCHER_PROCESS_ID, 99];
+      },
+    },
+    {
+      caseName: "a termination request while membership is being read",
+      terminateWhileMembershipIsRead: true,
+      coreMustExit: false,
+      arrange(_harness: LauncherHarness) {
+        // The test body installs a blocking read so it can call terminate.
+      },
+    },
+    {
+      caseName: "execute delivery becomes uncertain",
+      terminateWhileMembershipIsRead: false,
+      coreMustExit: true,
+      arrange(harness: LauncherHarness) {
+        harness.controllerHarness.membershipReadHook = () => {
+          harness.controllerHarness.failNextSend = true;
+        };
+      },
+    },
+  ])("terminates the whole group after $caseName", async ({
+    arrange,
+    terminateWhileMembershipIsRead,
+    coreMustExit,
+  }) => {
+    const harness = launcherHarness();
+    arrange(harness);
+    const membershipReadStarted = deferred<void>();
+    const allowMembershipRead = deferred<void>();
+    if (terminateWhileMembershipIsRead) {
+      harness.controllerHarness.membershipReadHook = async () => {
+        membershipReadStarted.resolve();
+        await allowMembershipRead.promise;
+      };
+    }
+    let populated = "populated 1\nfrozen 0\n";
+    const fileSystem = cgroupFileSystem(() => populated);
+    const records = recordStore();
+    const session: LinuxModuleProtocolSession = {
+      initialize: vi.fn(async () => undefined),
+      execute: vi.fn(async () => ({ schemaVersion: "dolly.module-result/1" }) as const),
+      cancel: vi.fn(async () => undefined),
+      closeCapabilitySession: vi.fn(async () => undefined),
+      waitForChannelClosed: vi.fn(async () => true),
+    };
+    const openProtocolSession = vi.fn(() => session);
+    const executor = createLinuxModuleExecutor({
+      moduleId: IDENTITY.moduleId,
+      moduleGenerationId: "module-generation-a",
+      lifecycle: {
+        records,
+        processRecord: processRecord(),
+        delegatedRootCgroupPath: DELEGATED_ROOT,
+        identity: IDENTITY,
+        limits: LIMITS,
+        maxOpenFiles: 64,
+        startLauncher: async () =>
+          createModuleLauncherControl({ launcher: harness.launcher }),
+        execution: {
+          program: EXECUTION.program,
+          argumentVector: EXECUTION.argumentVector,
+          environment: EXECUTION.environment,
+        },
+        cgroupFileSystem: fileSystem,
+      },
+      openProtocolSession,
+      terminationTimeoutMs: 200,
+      channelCloseTimeoutMs: 200,
+    });
+    if (executor.start === undefined || executor.terminate === undefined) {
+      throw new Error("the Linux Module executor is missing required operations");
+    }
+
+    const startOutcome = executor.start().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await vi.waitFor(() => expect(harness.controllerHarness.sent).toHaveLength(1));
+    reportInCgroup(harness.controllerHarness);
+    let termination: Promise<void> | undefined;
+    if (terminateWhileMembershipIsRead) {
+      await membershipReadStarted.promise;
+      termination = executor.terminate({
+        moduleId: IDENTITY.moduleId,
+        moduleGenerationId: "module-generation-a",
+      });
+      populated = "populated 0\nfrozen 0\n";
+      allowMembershipRead.resolve();
+    }
+    const startError = await startOutcome;
+
+    expect(startError).toBeInstanceOf(Error);
+    if (coreMustExit) {
+      expect(String(startError)).toContain("Core must exit");
+      expect(String(startError)).toContain("execute command may have reached");
+    } else {
+      expect(String(startError)).not.toContain("Core must exit");
+    }
+    expect(openProtocolSession).not.toHaveBeenCalled();
+    expect(records.current?.state).toBe("starting");
+    expect(
+      harness.controllerHarness.sent.some((frame) => frame.includes('"command":"execute"')),
+    ).toBe(false);
+
+    populated = "populated 0\nfrozen 0\n";
+    termination ??= executor.terminate({
+      moduleId: IDENTITY.moduleId,
+      moduleGenerationId: "module-generation-a",
+    });
+    if (coreMustExit) {
+      await expect(termination).rejects.toThrowError(/Core must exit/);
+    } else {
+      await expect(termination).resolves.toBeUndefined();
+    }
+    expect(
+      fileSystem.writeLog.filter(
+        ({ path, content }) => path.endsWith("/cgroup.kill") && content === "1",
+      ),
+    ).toHaveLength(1);
+    expect(fileSystem.directories.has(CONFIGURE.moduleCgroupPath)).toBe(coreMustExit);
+    expect(records.current?.state).toBe(coreMustExit ? "stopping" : "stopped");
   });
 
   it("asks through the control descriptor and waits when the sequence never ran", async () => {
@@ -439,6 +614,10 @@ describe("Module launcher control adapter", () => {
       }),
       authorizeExecution: vi.fn(async (request) => {
         authorized.push(request.moduleCgroupPath);
+        return {
+          executionAuthorized: true,
+          verifiedProcessIds: [LAUNCHER_PROCESS_ID],
+        } as const;
       }),
       requestExit: vi.fn(async () => true),
     };
@@ -460,7 +639,7 @@ describe("Module launcher control adapter", () => {
       cgroupFileSystem: cgroupFileSystem(),
     });
 
-    expect(started.started).toBe(true);
+    expect(started.executionAuthorized).toBe(true);
     // The launcher writes its own process identifier into
     // `<moduleCgroupPath>/cgroup.procs`, so the path has to be the filesystem
     // form. The kernel-relative form would be rejected by the launcher control

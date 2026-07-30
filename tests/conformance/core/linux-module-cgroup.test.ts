@@ -90,6 +90,8 @@ interface FakeCgroupBehavior {
   readonly unwritableFiles?: readonly string[];
   /** Whether writing `cgroup.kill` empties the group, as the kernel does. */
   readonly killEmptiesGroup?: boolean;
+  /** Number of directory removals that fail before normal behavior resumes. */
+  readonly removeFailures?: number;
 }
 
 /**
@@ -104,9 +106,11 @@ class FakeCgroupFileSystem implements ModuleCgroupFileSystem {
   readonly #files = new Map<string, string>();
   readonly #directories = new Set<string>();
   readonly #behavior: FakeCgroupBehavior;
+  #remainingRemoveFailures: number;
 
   constructor(behavior: FakeCgroupBehavior = {}) {
     this.#behavior = behavior;
+    this.#remainingRemoveFailures = behavior.removeFailures ?? 0;
   }
 
   /** Creates a group directly, bypassing the code under test. */
@@ -168,6 +172,10 @@ class FakeCgroupFileSystem implements ModuleCgroupFileSystem {
 
   async removeDirectory(path: string): Promise<void> {
     this.removalLog.push(path);
+    if (this.#remainingRemoveFailures > 0) {
+      this.#remainingRemoveFailures -= 1;
+      throw errno("EBUSY", `rmdir ${path}`);
+    }
     if (!this.#directories.has(path)) throw errno("ENOENT", `rmdir ${path}`);
     if ((await this.listChildDirectoryNames(path)).length > 0) {
       throw errno("ENOTEMPTY", `rmdir ${path}`);
@@ -620,7 +628,7 @@ describe("Whole-group termination", () => {
   it("proves termination once membership was verified from cgroup.procs", async () => {
     const { fileSystem, cgroup } = await prepared();
     fileSystem.setPopulated(cgroup.path, true);
-    cgroup.recordVerifiedMembership([4321]);
+    cgroup.recordObservedProcessIds([4321]);
     const result = await cgroup.terminate({ timeoutMs: 500, pollIntervalMs: 1 });
     expect(result.terminated).toBe(true);
     if (!result.terminated) return;
@@ -638,14 +646,14 @@ describe("Whole-group termination", () => {
 
   it("rejects an empty process list as membership evidence", async () => {
     const { cgroup } = await prepared();
-    expect(() => cgroup.recordVerifiedMembership([])).toThrow(TypeError);
+    expect(() => cgroup.recordObservedProcessIds([])).toThrow(TypeError);
     expect(cgroup.membershipObserved).toBe(false);
   });
 
   it("reports a bounded timeout instead of pretending the group emptied", async () => {
     const { fileSystem, cgroup } = await prepared({ killEmptiesGroup: false });
     fileSystem.setPopulated(cgroup.path, true);
-    cgroup.recordVerifiedMembership([4321]);
+    cgroup.recordObservedProcessIds([4321]);
     const result = await cgroup.terminate({ timeoutMs: 60, pollIntervalMs: 5 });
     expect(result.terminated).toBe(false);
     if (result.terminated) return;
@@ -666,7 +674,7 @@ describe("Whole-group termination", () => {
     if (!result.prepared) throw new Error("preparation failed");
     const cgroup = result.cgroup;
     fileSystem.setPopulated(cgroup.path, true);
-    cgroup.recordVerifiedMembership([4321]);
+    cgroup.recordObservedProcessIds([4321]);
     killed = true;
     const terminated = await cgroup.terminate({ timeoutMs: 40, pollIntervalMs: 5 });
     expect(terminated.terminated).toBe(false);
@@ -678,7 +686,7 @@ describe("Whole-group termination", () => {
   it("reports an unavailable path when cgroup.kill cannot be written", async () => {
     const { fileSystem, cgroup } = await prepared();
     fileSystem.setPopulated(cgroup.path, true);
-    cgroup.recordVerifiedMembership([4321]);
+    cgroup.recordObservedProcessIds([4321]);
     await fileSystem.removeDirectory(cgroup.path);
     const terminated = await cgroup.terminate({ timeoutMs: 50, pollIntervalMs: 5 });
     expect(terminated.terminated).toBe(false);
@@ -705,6 +713,67 @@ describe("Whole-group termination", () => {
 });
 
 describe("Module cgroup removal", () => {
+  it("removes an empty group after launcher exit without claiming termination", async () => {
+    const fileSystem = newFileSystem();
+    const result = await prepare(fileSystem);
+    if (!result.prepared) throw new Error("preparation failed");
+
+    const removal =
+      await result.cgroup.removeAfterLauncherExitBeforeExecutionAuthorization();
+
+    expect(removal.removed).toBe(true);
+    expect(result.cgroup.removed).toBe(true);
+    expect(result.cgroup.terminationProven).toBe(false);
+    expect(
+      result.cgroup.launcherExitObservedBeforeExecutionAuthorization,
+    ).toBe(true);
+    expect(
+      fileSystem.writeLog.some(({ path }) => path.endsWith("/cgroup.kill")),
+    ).toBe(false);
+  });
+
+  it("retains a group that still has a member after launcher exit", async () => {
+    const fileSystem = newFileSystem();
+    const result = await prepare(fileSystem);
+    if (!result.prepared) throw new Error("preparation failed");
+    fileSystem.setPopulated(result.cgroup.path, true);
+
+    const removal =
+      await result.cgroup.removeAfterLauncherExitBeforeExecutionAuthorization();
+
+    expect(removal).toMatchObject({
+      removed: false,
+      code: "MODULE_CGROUP_REMOVE_BEFORE_PROOF",
+    });
+    expect(result.cgroup.membershipObserved).toBe(true);
+    expect(result.cgroup.terminationProven).toBe(false);
+    expect(await fileSystem.directoryExists(result.cgroup.path)).toBe(true);
+  });
+
+  it("rechecks an empty group when a prior removal failed", async () => {
+    const fileSystem = newFileSystem({ removeFailures: 1 });
+    const result = await prepare(fileSystem);
+    if (!result.prepared) throw new Error("preparation failed");
+
+    const first =
+      await result.cgroup.removeAfterLauncherExitBeforeExecutionAuthorization();
+    expect(first).toMatchObject({
+      removed: false,
+      code: "MODULE_CGROUP_REMOVE_FAILED",
+    });
+    expect(result.cgroup.membershipObserved).toBe(false);
+
+    fileSystem.setPopulated(result.cgroup.path, true);
+    const second =
+      await result.cgroup.removeAfterLauncherExitBeforeExecutionAuthorization();
+    expect(second).toMatchObject({
+      removed: false,
+      code: "MODULE_CGROUP_REMOVE_BEFORE_PROOF",
+    });
+    expect(result.cgroup.membershipObserved).toBe(true);
+    expect(await fileSystem.directoryExists(result.cgroup.path)).toBe(true);
+  });
+
   it("refuses to remove a group that has not been proven empty", async () => {
     const fileSystem = newFileSystem();
     const result = await prepare(fileSystem);
@@ -722,7 +791,7 @@ describe("Module cgroup removal", () => {
     if (!result.prepared) throw new Error("preparation failed");
     const cgroup = result.cgroup;
     fileSystem.setPopulated(cgroup.path, true);
-    cgroup.recordVerifiedMembership([4321]);
+    cgroup.recordObservedProcessIds([4321]);
 
     // Do not await the rejection first. A pre-proof removal must not briefly
     // present itself as an active removal and reject this termination.
@@ -746,7 +815,7 @@ describe("Module cgroup removal", () => {
     fileSystem.addCgroup(`${cgroup.path}/nested`);
     fileSystem.addCgroup(`${cgroup.path}/nested/deeper`);
     fileSystem.setPopulated(cgroup.path, true);
-    cgroup.recordVerifiedMembership([4321]);
+    cgroup.recordObservedProcessIds([4321]);
     expect((await cgroup.terminate({ timeoutMs: 500, pollIntervalMs: 1 })).terminated).toBe(
       true,
     );
@@ -766,7 +835,7 @@ describe("Module cgroup removal", () => {
     if (!result.prepared) throw new Error("preparation failed");
     const cgroup = result.cgroup;
     fileSystem.setPopulated(cgroup.path, true);
-    cgroup.recordVerifiedMembership([4321]);
+    cgroup.recordObservedProcessIds([4321]);
     expect((await cgroup.terminate()).terminated).toBe(true);
 
     const first = cgroup.remove();
@@ -799,7 +868,7 @@ describe("Module cgroup removal", () => {
     if (!result.prepared) throw new Error("preparation failed");
     const cgroup = result.cgroup;
     inner.setPopulated(cgroup.path, true);
-    cgroup.recordVerifiedMembership([4321]);
+    cgroup.recordObservedProcessIds([4321]);
     holdFirstEventsRead = true;
 
     const firstTermination = cgroup.terminate({ timeoutMs: 500, pollIntervalMs: 1 });

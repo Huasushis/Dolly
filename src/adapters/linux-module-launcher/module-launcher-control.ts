@@ -14,12 +14,10 @@
  *   requires is unaffected: the caller's stop check still happens before this
  *   adapter asks the controller to do anything, and the controller still
  *   verifies membership from kernel files before it sends `execute`.
- * - The controller reports failure as a returned outcome, while
- *   `ModuleLauncherControl` reports it by throwing. That conversion is total by
- *   construction: everything that is not the `executing` outcome throws, and
- *   the failure code is described by an exhaustive switch, so a new code cannot
- *   be added without a case here. A variant nobody mapped would otherwise
- *   return normally and be indistinguishable from an authorized execution.
+ * - The controller and `ModuleLauncherControl` both return structured failure
+ *   evidence. The conversion is total by construction: everything that is not
+ *   the `executing` outcome becomes `executionAuthorized: false`, and the
+ *   failure code is described by an exhaustive switch.
  * - The controller has no `requestExit`. On failure it has already asked the
  *   launcher to exit through the protected control descriptor and waited for
  *   the observed exit, so this adapter reports that evidence instead of asking
@@ -33,6 +31,7 @@ import type {
   LinuxModuleLauncherFailed,
   LinuxModuleLauncherFailureCode,
 } from "./linux-module-launcher-controller.js";
+import type { ModuleLauncherControl } from "../../core/linux-module-process-lifecycle.js";
 
 /** The launcher members this adapter needs. A started launcher satisfies it. */
 export interface ModuleLauncherControlOptions {
@@ -44,20 +43,6 @@ export interface ModuleLauncherControlOptions {
   };
   /** Bound on observing the launcher's exit when the sequence never ran. */
   readonly exitObservationTimeoutMs?: number;
-}
-
-export class LinuxModuleLauncherControlError extends Error {
-  constructor(
-    readonly code: LinuxModuleLauncherFailureCode,
-    /** Whether kernel membership was verified before the failure. */
-    readonly membershipVerified: boolean,
-    /** Whether the launcher's exit was actually observed. */
-    readonly launcherExitObserved: boolean,
-    message: string,
-  ) {
-    super(message);
-    this.name = "LinuxModuleLauncherControlError";
-  }
 }
 
 /**
@@ -90,35 +75,9 @@ function describeLauncherFailure(code: LinuxModuleLauncherFailureCode): string {
   }
 }
 
-function launcherFailureError(
-  failure: LinuxModuleLauncherFailed,
-): LinuxModuleLauncherControlError {
-  return new LinuxModuleLauncherControlError(
-    failure.code,
-    failure.membershipVerified,
-    failure.launcherExitObserved,
-    `${failure.code}: ${describeLauncherFailure(failure.code)}; ${failure.message}`,
-  );
-}
-
-export interface ModuleLauncherControlAdapter {
-  readonly processId: number;
-  configure(request: {
-    readonly moduleCgroupPath: string;
-    readonly maxOpenFiles: number;
-  }): Promise<void>;
-  authorizeExecution(request: {
-    readonly moduleCgroupPath: string;
-    readonly program: string;
-    readonly argumentVector: readonly string[];
-    readonly environment: Readonly<Record<string, string>>;
-  }): Promise<void>;
-  requestExit(): Promise<boolean>;
-}
-
 export function createModuleLauncherControl(
   options: ModuleLauncherControlOptions,
-): ModuleLauncherControlAdapter {
+): ModuleLauncherControl {
   const { launcher } = options;
   const exitObservationTimeoutMs = options.exitObservationTimeoutMs ?? 5_000;
   let configured: { moduleCgroupPath: string; maxOpenFiles: number } | undefined;
@@ -155,13 +114,26 @@ export function createModuleLauncherControl(
         program: request.program,
         argumentVector: request.argumentVector,
         environment: request.environment,
+        stopRequested: request.stopRequested,
       });
       if (outcome.outcome === "executing") {
         executing = true;
-        return;
+        return {
+          executionAuthorized: true,
+          verifiedProcessIds: outcome.verifiedProcessIds,
+        };
       }
       failure = outcome;
-      throw launcherFailureError(outcome);
+      return {
+        executionAuthorized: false,
+        code: outcome.code,
+        detail: `${describeLauncherFailure(outcome.code)}; ${outcome.message}`,
+        membershipVerified: outcome.membershipVerified,
+        observedProcessIds: outcome.observedProcessIds,
+        executeCommandMayHaveBeenDelivered:
+          outcome.executeCommandMayHaveBeenDelivered,
+        launcherExitObserved: outcome.launcherExitObserved,
+      };
     },
 
     async requestExit() {

@@ -50,6 +50,8 @@ export interface LinuxModuleLauncherExecutionRequest {
   readonly program: string;
   readonly argumentVector: readonly string[];
   readonly environment: Readonly<Record<string, string>>;
+  /** Checked synchronously immediately before the `execute` frame is sent. */
+  readonly stopRequested?: () => boolean;
 }
 
 export interface LinuxModuleLauncherControllerOptions {
@@ -103,6 +105,8 @@ export interface LinuxModuleLauncherFailed {
    * This is empty when the process list could not be read successfully.
    */
   readonly observedProcessIds: readonly number[];
+  /** Whether the `execute` send began, so delivery can no longer be disproved. */
+  readonly executeCommandMayHaveBeenDelivered: boolean;
   /**
    * Whether kernel cgroup membership was verified before the failure. Once it
    * is `true`, ADR 0009 requires cgroup-level termination and a `populated 0`
@@ -191,6 +195,7 @@ export class LinuxModuleLauncherController {
   #abort?: ControllerAbort;
   #observedProcessIds: readonly number[] = [];
   #verifiedProcessIds: readonly number[] = [];
+  #executeCommandMayHaveBeenDelivered = false;
 
   constructor(options: LinuxModuleLauncherControllerOptions) {
     this.#channel = options.channel;
@@ -308,12 +313,13 @@ export class LinuxModuleLauncherController {
       // A control-protocol violation or channel loss observed while membership
       // was being read must still prevent authorization.
       this.#throwIfAborted();
-      if (this.#stopRequested) {
+      if (this.#stopRequested || request.stopRequested?.() === true) {
         throw {
           code: "LAUNCHER_STOP_REQUESTED",
           message: "A stop was requested before the launcher was authorized to execute",
         } satisfies ControllerAbort;
       }
+      this.#executeCommandMayHaveBeenDelivered = true;
       await withTimeout(
         this.#channel.send(asLauncherControlJson(execute)).catch((cause: unknown) => {
           throw {
@@ -324,6 +330,7 @@ export class LinuxModuleLauncherController {
         this.#configureTimeoutMs,
         "The execute command was not written before its timeout",
       );
+      this.#throwIfAborted();
 
       this.#phase = "settled";
       return {
@@ -397,9 +404,11 @@ export class LinuxModuleLauncherController {
     // Asking the launcher to exit is always done through the control
     // descriptor. A send failure is expected when the channel already closed
     // and must not change the reported reason.
-    await this.#channel
-      .send(asLauncherControlJson(createLauncherExitCommand()))
-      .catch(() => undefined);
+    await withTimeout(
+      this.#channel.send(asLauncherControlJson(createLauncherExitCommand())),
+      this.#configureTimeoutMs,
+      "The exit command was not written before its timeout",
+    ).catch(() => undefined);
 
     if (this.#membershipVerified) {
       // After membership, ADR 0009 requires cgroup-level termination and a
@@ -410,6 +419,8 @@ export class LinuxModuleLauncherController {
         code: abort.code,
         message: abort.message,
         observedProcessIds: this.#observedProcessIds,
+        executeCommandMayHaveBeenDelivered:
+          this.#executeCommandMayHaveBeenDelivered,
         membershipVerified: true,
         launcherExitObserved: false,
       };
@@ -426,6 +437,8 @@ export class LinuxModuleLauncherController {
       code: abort.code,
       message: abort.message,
       observedProcessIds: this.#observedProcessIds,
+      executeCommandMayHaveBeenDelivered:
+        this.#executeCommandMayHaveBeenDelivered,
       membershipVerified: false,
       launcherExitObserved,
     };
