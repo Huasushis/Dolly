@@ -1,0 +1,3 @@
+container=dolly-experiment-1923117-9bc1ffb5
+container_removed=yes
+image_removed=yes

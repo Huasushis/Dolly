@@ -1,0 +1,49 @@
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.10 [39m[90m/dolly-run[39m
+
+[90mstdout[2m | tests/conformance/security/linux-module-executor-systemd-integration.test.ts[2m > [22m[2mLinux Module executor exit through systemd[2m > [22m[2mends Core with status 1 and lets systemd remove the unowned launcher
+[22m[39m{"unitName":"dolly-test-executor-exit-273-1785434223954.service","systemdRunExitCode":92,"systemdRunSignal":null,"systemd":{"Type":"exec","ExitType":"main","Restart":"no","Result":"exit-code","ExecMainCode":"1","ExecMainStatus":"92","ControlGroup":"","Delegate":"yes","DelegateSubgroup":"core","KillMode":"control-group","ActiveState":"failed","SubState":"failed","InvocationID":"81287982114745e388282cb294e905f3"}}
+{"filesBeforeFailureCleanup":{"report":"{\"processGenerationId\":\"process-systemd-exit\",\"serviceInvocationId\":\"81287982114745e388282cb294e905f3\",\"core\":{\"processId\":285,\"startTimeTicks\":\"123837151\",\"cgroupPath\":\"/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-executor-exit-273-1785434223954.service/core\"},\"launcher\":{\"processId\":310,\"startTimeTicks\":\"123837187\",\"cgroupPath\":\"/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-executor-exit-273-1785434223954.service/core\"},\"serviceCgroupFilesystemPath\":\"/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-executor-exit-273-1785434223954.service\",\"moduleCgroupFilesystemPath\":\"/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-executor-exit-273-1785434223954.service/dolly-module-process-systemd-exit-ee55f562d24dcdb9e3738589bec9f8072845f2935f393e30fa6a12ef6bab4579\"}\n","state":"{\"blocks\":{\"commitEffects\":[],\"nextSequence\":\"1\",\"records\":[],\"schemaVersion\":\"dolly.block-store/3\"},\"deliveries\":{\"appendEffects\":[],\"claims\":[],\"deadLetters\":[],\"deliveries\":[],\"maxFailedAttempts\":3,\"moduleJobs\":[],\"nextGlobalSequence\":\"1\",\"pages\":[],\"schemaVersion\":\"dolly.delivery-store/6\",\"usedIds\":[]},\"moduleProcessRecords\":[{\"bootId\":\"09c618af-c410-4c27-ac99-5316df1c7303\",\"configurationReference\":{\"configId\":\"config-systemd-exit\",\"configVersion\":1,\"revision\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\"},\"createdAt\":\"2026-07-30T17:57:04.310Z\",\"declaredExternalEffects\":\"none\",\"instanceId\":\"instance-systemd-exit\",\"moduleCgroupPath\":\"/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-executor-exit-273-1785434223954.service/dolly-module-process-systemd-exit-ee55f562d24dcdb9e3738589bec9f8072845f2935f393e30fa6a12ef6bab4579\",\"moduleGenerationId\":\"generation-systemd-exit\",\"moduleId\":\"module-systemd-exit\",\"packageDigest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"processGenerationId\":\"process-systemd-exit\",\"schemaVersion\":\"dolly.module-process-record/1\",\"serviceInvocationId\":\"81287982114745e388282cb294e905f3\",\"state\":\"stopping\",\"updatedAt\":\"2026-07-30T17:57:06.348Z\"}],\"moduleSubmissionRecords\":[],\"referenceGraph\":{\"leases\":[],\"nodes\":[],\"schemaVersion\":\"dolly.reference-graph/4\",\"strongReferences\":[]},\"revision\":2,\"schemaVersion\":\"dolly.core-state/16\",\"stateDigest\":\"sha256:993fe1e4789957b2d8de239e5ec86bdca1890f64cdcd218167b26d793839cf99\"}\n","fallback":"{\"status\":92,\"reason\":\"executor start rejected instead of ending Core\",\"error\":\"ModuleExecutorTerminationUnconfirmedError: MODULE_PROCESS_MEMBERSHIP_UNVERIFIED: LAUNCHER_MEMBERSHIP_UNVERIFIED: the kernel control-group files did not confirm the launcher's membership; The Module cgroup does not contain the launcher process identifier; the launcher's exit could not be observed; Core must exit, but the configured Core exit function returned without ending the process\"}\n"}}
+
+ [31m❯[39m tests/conformance/security/linux-module-executor-systemd-integration.test.ts [2m([22m[2m1 test[22m[2m | [22m[31m1 failed[39m[2m)[22m[33m 2452[2mms[22m[39m
+[31m     [31m×[31m ends Core with status 1 and lets systemd remove the unowned launcher[39m[33m 2451[2mms[22m[39m
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 1 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m tests/conformance/security/linux-module-executor-systemd-integration.test.ts[2m > [22mLinux Module executor exit through systemd[2m > [22mends Core with status 1 and lets systemd remove the unowned launcher
+[31m[1mAssertionError[22m: expected { Type: 'exec', …(12) } to match object { ActiveState: 'failed', …(10) }
+(2 matching properties omitted from actual)[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[33m@@ -1,11 +1,11 @@[39m
+[2m  {[22m
+[2m    "ActiveState": "failed",[22m
+[2m    "Delegate": "yes",[22m
+[2m    "DelegateSubgroup": "core",[22m
+[2m    "ExecMainCode": "1",[22m
+[32m-   "ExecMainStatus": "1",[39m
+[31m+   "ExecMainStatus": "92",[39m
+[2m    "ExitType": "main",[22m
+[2m    "KillMode": "control-group",[22m
+[2m    "Restart": "no",[22m
+[2m    "Result": "exit-code",[22m
+[2m    "SubState": "failed",[22m
+
+[36m [2m❯[22m ../dolly/tests/conformance/security/linux-module-executor-systemd-integration.test.ts:[2m262:33[22m[39m
+    [90m260|[39m         systemd[33m:[39m systemdProperties[33m,[39m
+    [90m261|[39m       }))[33m;[39m
+    [90m262|[39m       [34mexpect[39m(systemdProperties)[33m.[39m[34mtoMatchObject[39m({
+    [90m   |[39m                                 [31m^[39m
+    [90m263|[39m         [33mActiveState[39m[33m:[39m [32m"failed"[39m[33m,[39m
+    [90m264|[39m         [33mSubState[39m[33m:[39m [32m"failed"[39m[33m,[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯[22m[39m
+
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m   Start at [22m 17:57:03
+[2m   Duration [22m 2.92s[2m (transform 254ms, setup 0ms, import 309ms, tests 2.45s, environment 0ms)[22m
+

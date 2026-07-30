@@ -1,0 +1,14 @@
+diff --git a/src/adapters/linux-module-executor.ts b/src/adapters/linux-module-executor.ts
+index cfb882a..2264cbe 100644
+--- a/src/adapters/linux-module-executor.ts
++++ b/src/adapters/linux-module-executor.ts
+@@ -171,7 +171,8 @@ export function createLinuxModuleExecutor(
+   const coreExitCleanupTimeoutMs =
+     options.coreExitCleanupTimeoutMs ?? DEFAULT_CORE_EXIT_CLEANUP_TIMEOUT_MS;
+   assertCoreExitCleanupTimeout(coreExitCleanupTimeoutMs);
+-  const exitCoreProcess = options.exitCoreProcess ?? ((status: number) => process.exit(status));
++  const exitCoreProcess =
++    options.exitCoreProcess ?? ((_status: number) => undefined);
+   let session: LinuxModuleProtocolSession | undefined;
+   let processStart: Promise<ModuleProcessStartResult> | undefined;
+   let startOperation: Promise<void> | undefined;

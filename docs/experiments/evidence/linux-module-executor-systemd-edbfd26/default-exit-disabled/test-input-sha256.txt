@@ -1,0 +1,5 @@
+4e813f6d49be56ba707162cfc6ebdc2247b76432541febc78f7f25fc4491a498  src/adapters/linux-module-executor.ts
+4c033aa5fc3ea3e3c4eb6add37b18d61f649f617b67b56400c660b7b1d5a5694  tests/conformance/security/linux-module-executor-systemd-integration.test.ts
+2535c01989faac6bc6b16c40cf4b61db22b233bb36374c369db5500e6140bfab  tests/conformance/security/fixtures/linux-module-executor-systemd-exit.ts
+6b368aba8c82ca628f7090afdbd1a88f027a939d795b319f22ca600190d09f92  scripts/run-linux-module-launcher-integration.sh
+2220eea894b7f72ba889731c68b32a77241c3f38715adb43a366a2fe3cd9d10e  scripts/experiments/linux-core-service-ownership/run-disposable-container.sh

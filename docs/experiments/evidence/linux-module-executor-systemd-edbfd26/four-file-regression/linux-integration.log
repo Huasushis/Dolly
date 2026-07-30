@@ -1,0 +1,22 @@
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.10 [39m[90m/dolly-run[39m
+
+ [32m✓[39m tests/conformance/security/linux-module-attached-process-integration.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 246[2mms[22m[39m
+ [32m✓[39m tests/conformance/security/linux-module-cgroup-integration.test.ts [2m([22m[2m11 tests[22m[2m)[22m[33m 1064[2mms[22m[39m
+     [33m[2m✓[22m[39m terminates a whole group of descendants and proves populated 0 [33m 431[2mms[22m[39m
+     [33m[2m✓[22m[39m reports a bounded timeout when the group does not empty [33m 331[2mms[22m[39m
+[90mstdout[2m | tests/conformance/security/linux-module-executor-systemd-integration.test.ts[2m > [22m[2mLinux Module executor exit through systemd[2m > [22m[2mends Core with status 1 and lets systemd remove the unowned launcher
+[22m[39m{"unitName":"dolly-test-executor-exit-336-1785434445194.service","systemdRunExitCode":1,"systemdRunSignal":null,"systemd":{"Type":"exec","ExitType":"main","Restart":"no","Result":"exit-code","ExecMainCode":"1","ExecMainStatus":"1","ControlGroup":"","Delegate":"yes","DelegateSubgroup":"core","KillMode":"control-group","ActiveState":"failed","SubState":"failed","InvocationID":"f366b89716f04179aed7dd7c7629f34e"}}
+
+[90mstdout[2m | tests/conformance/security/linux-module-executor-systemd-integration.test.ts[2m > [22m[2mLinux Module executor exit through systemd[2m > [22m[2mends Core with status 1 and lets systemd remove the unowned launcher
+[22m[39m{"unitName":"dolly-test-executor-exit-336-1785434445194.service","systemdRunExitCode":1,"systemdRunSignal":null,"systemd":{"Type":"exec","ExitType":"main","Restart":"no","Result":"exit-code","ExecMainCode":"1","ExecMainStatus":"1","ControlGroup":"","Delegate":"yes","DelegateSubgroup":"core","KillMode":"control-group","ActiveState":"failed","SubState":"failed","InvocationID":"f366b89716f04179aed7dd7c7629f34e"},"core":{"processId":348,"startTimeTicks":"123859275","cgroupPath":"/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-executor-exit-336-1785434445194.service/core"},"launcher":{"processId":372,"startTimeTicks":"123859314","cgroupPath":"/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-executor-exit-336-1785434445194.service/core"},"serviceCgroupFilesystemPath":"/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-executor-exit-336-1785434445194.service","moduleCgroupFilesystemPath":"/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-executor-exit-336-1785434445194.service/dolly-module-process-systemd-exit-ee55f562d24dcdb9e3738589bec9f8072845f2935f393e30fa6a12ef6bab4579","stateRevision":2,"processRecord":{"bootId":"09c618af-c410-4c27-ac99-5316df1c7303","configurationReference":{"configId":"config-systemd-exit","configVersion":1,"revision":"sha256:1111111111111111111111111111111111111111111111111111111111111111"},"createdAt":"2026-07-30T18:00:45.571Z","declaredExternalEffects":"none","instanceId":"instance-systemd-exit","moduleCgroupPath":"/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-executor-exit-336-1785434445194.service/dolly-module-process-systemd-exit-ee55f562d24dcdb9e3738589bec9f8072845f2935f393e30fa6a12ef6bab4579","moduleGenerationId":"generation-systemd-exit","moduleId":"module-systemd-exit","packageDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","processGenerationId":"process-systemd-exit","schemaVersion":"dolly.module-process-record/1","serviceInvocationId":"f366b89716f04179aed7dd7c7629f34e","state":"stopping","updatedAt":"2026-07-30T18:00:47.609Z"},"fallbackFilePresent":false,"moduleCgroupRemoved":true,"serviceCgroupRemoved":true}
+
+ [32m✓[39m tests/conformance/security/linux-module-executor-systemd-integration.test.ts [2m([22m[2m1 test[22m[2m)[22m[33m 2517[2mms[22m[39m
+     [33m[2m✓[22m[39m ends Core with status 1 and lets systemd remove the unowned launcher [33m 2515[2mms[22m[39m
+ [32m✓[39m tests/conformance/security/linux-module-launcher-integration.test.ts [2m([22m[2m12 tests[22m[2m)[22m[33m 10339[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m4 passed[39m[22m[90m (4)[39m
+[2m      Tests [22m [1m[32m26 passed[39m[22m[90m (26)[39m
+[2m   Start at [22m 18:00:42
+[2m   Duration [22m 15.36s[2m (transform 418ms, setup 0ms, import 579ms, tests 14.17s, environment 1ms)[22m
+
