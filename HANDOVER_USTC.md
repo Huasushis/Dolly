@@ -143,6 +143,7 @@ USTC 目录布局：
   npm-cache/              Dolly 测试可使用的项目专用 npm 缓存
   cache/                  Dolly 命令可使用的项目专用通用缓存
   tmp/                    Dolly 命令可使用的项目专用临时目录
+  validation/             转移和接管验证的原始输出；按日期和用途分目录
   Dolly-transfer-20260731.tar.gz  已校验的转移压缩包；确认不再需要回滚后可精确删除
 ```
 
@@ -227,7 +228,9 @@ npm test -- --maxWorkers=4
 - 唯一失败是 `tests/conformance/core/linux-core-service-binding-service.test.ts` 的真实 systemd 正面案例。产品检查要求 `ExecStart` 使用 systemd 的 `:` 前缀来禁止环境变量展开，但测试中的 `runProbeInTransientService` 直接把 `process.execPath` 传给 `systemd-run`，没有构造该前缀，因此同时得到 `CORE_SERVICE_EXEC_START_ENVIRONMENT_EXPANDED`。这说明当前正面测试装配与被测契约不一致；仍需在真实 systemd 上验证正确的 `systemd-run` 表达方式，再修改测试并证明故障案例仍能单独变红。不要把它记成产品通过，也不要在未复核 systemd 语义时仅删除断言；
 - 不要用 `pnpm test --maxWorkers=4`，因为参数会先被 pnpm 自身解析。`pnpm run test --maxWorkers=4` 虽然能进入 Vitest，但会让 `tests/conformance/operations/package-install-smoke.test.ts` 把 pnpm 当成 npm，再向 `pnpm pack` 传 npm 专有的 `--cache`，产生第二个测试执行器相关失败。通过仓库声明的 npm 脚本运行时，该包安装测试通过。后续应让测试明确支持实际执行器或明确只接受 npm，并分别为选择逻辑增加反例。
 
-因此，远端副本、依赖、类型检查和构建已核对，完整 Linux 测试尚未全绿。接手者的第一项代码工作前应先保存上述失败的原始输出或重新运行该单例，确认它仍是同一个问题。
+因此，远端副本、依赖、类型检查和构建已核对，完整 Linux 测试尚未全绿。接手者的第一项代码工作前应先检查下述原始输出并重新运行该单例，确认它仍是同一个问题。
+
+在提交 `40f0ccb` 上重跑完整测试仍得到完全相同的计数和失败。原始输出保存在 `/home/ubuntu/codex-dolly/validation/20260731-transfer/npm-test.log`，大小 24,636 字节，权限为 `0600`，SHA-256 为 `6226C7619BA4D922291909A24235E487F85A74F209729D241008CC1520E4E0BB`。这份日志是转移核验材料，不在 Git 仓库内；后续运行应写入新的日期或运行目录，不得覆盖它。
 
 以下规则来自反复失败，属于强制工作方式：
 
