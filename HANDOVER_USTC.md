@@ -203,9 +203,9 @@ Linux 重新安装依赖后，至少执行：
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm run typecheck -- --pretty false
+pnpm run typecheck --pretty false
 pnpm run build
-pnpm test -- --maxWorkers=4
+pnpm test --maxWorkers=4
 ```
 
 安装本身会替换 Windows 的原生依赖；源代码和 Git 状态必须保持可核对。TypeScript 检查必须看退出码：0 才是干净，2 是类型错误，其他值是崩溃。测试必须核对实际收集到的文件数和用例数；传目录后只运行一部分不是完整性证明。
