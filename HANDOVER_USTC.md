@@ -127,7 +127,7 @@ Dolly 不只是工程项目。所有者提出的 Additive Increase/Multiplicativ
 - `scripts/`：构建、Linux 一次性容器 runner、实验和检查脚本。使用前读对应文档，不能按名称猜用途。
 - `artifacts/`：本机保存的大型实验工件，约 98 MiB。
 - `.tmp/`：Windows 测试缓存和临时文件，约 246 MiB。它不是证据来源。
-- `dist/` 和 `node_modules/`：Windows 生成物和依赖。完整转移会保留它们，但 Linux 上不能把 Windows 原生依赖当作可运行依赖，必须重新安装。
+- `dist/` 和 `node_modules/`：Windows 生成物和依赖，不复制到 Linux。远端必须按锁文件重新安装依赖并重新构建。
 - `.dolly/`：本地实例数据。不要当作公开示例。
 - `HANDOVER_NOW.md`：当前状态入口。
 - `TASK_HANDOVER.md`：只供定点查历史。
@@ -137,7 +137,7 @@ USTC 目录布局：
 
 ```text
 /home/ubuntu/codex-dolly/
-  Dolly/                  当前 Windows 工作区的完整副本
+  Dolly/                  当前项目内容的副本；Windows 可重建目录不在其中
   previous-server-work/   以前散落在用户目录顶层的 Dolly Linux 工件
 ```
 
@@ -145,7 +145,7 @@ USTC 目录布局：
 
 ## 7. 转移时的 Git 和文件状态
 
-转移包含整个本地工作区：`.git`、所有已跟踪文件、未跟踪文件、忽略文件、`.env`、Windows `node_modules`、缓存和实验工件。`.env` 含私有 API/OSS 配置，远端权限应为 `0600`；不得显示值、写入日志、提交或复制到实验报告。
+转移包含完整项目内容：`.git`、所有已跟踪和未跟踪文件、`.env`、本地实例数据、历史归档和实验工件。Windows 可重建目录 `node_modules/`、`.tmp/`、`.pnpm-store/` 和 `dist/` 不复制到 Linux；应在远端按锁文件重新安装依赖并重新构建。`.env` 含私有 API/OSS 配置，远端权限应为 `0600`；不得显示值、写入日志、提交或复制到实验报告。
 
 转移前以下文件不是 `a134241` 的已提交内容，必须保留，不能随手清理、覆盖或混入无关提交：
 
