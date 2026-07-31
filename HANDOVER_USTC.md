@@ -45,13 +45,13 @@ Page、Module、Block 和 Premise 这些名称已经来自所有者的原始模�
 
 ## 3. 当前真实状态
 
-转移前本地分支为 `main`，`HEAD` 和 `origin/main` 都是 `a134241`。最近三次已推送提交为：
+转移时本地和远端分支均为 `main`。最后一个包含产品代码变化的提交是 `a134241`；它之后先有三次只修改 USTC 交接文档的已推送提交：
 
-- `ba4a852 feat(core): migrate state safely to version 17`
-- `6f66501 docs: define version 17 state recovery`
-- `a134241 docs: checkpoint version 17 verification`
+- `7029651 docs: prepare USTC project handoff`
+- `90707ab docs: exclude Windows build data from USTC copy`
+- `d6aa7f7 docs: correct pnpm validation commands`
 
-实际提交必须以 Git 为准。转移前的完整 Windows 验证为：127 个测试文件通过、4 个按平台跳过；1622 个测试通过、47 个跳过；完整 TypeScript 检查和构建退出码为 0。该结果只证明当时的默认 Windows 测试集合通过，不证明 Linux 内核行为、真实模型、对象存储、网页界面或完整 Module 运行可用。
+本交接还会继续产生纯文档提交，因此实际 `HEAD` 必须以 Git 为准。产品代码基线 `a134241` 的完整 Windows 验证为：127 个测试文件通过、4 个按平台跳过；1622 个测试通过、47 个跳过；完整 TypeScript 检查和构建退出码为 0。该结果只证明当时的默认 Windows 测试集合通过，不证明 Linux 内核行为、真实模型、对象存储、网页界面或完整 Module 运行可用。
 
 最重要的产品事实：普通启动入口仍会拒绝包含 Module 的配置，错误为 `RUNTIME_MODULE_MIGRATION_REQUIRED`。底层的持久状态、投递、进程协议、能力检查、Linux control group 适配器等已经有大量代码和证据，但还没有装配成受支持的完整 Module 执行路径。不要为了展示功能而移除 `src/core/runtime-bootstrap.ts` 中的拒绝条件。
 
@@ -139,6 +139,11 @@ USTC 目录布局：
 /home/ubuntu/codex-dolly/
   Dolly/                  当前项目内容的副本；Windows 可重建目录不在其中
   previous-server-work/   以前散落在用户目录顶层的 Dolly Linux 工件
+  pnpm-store/             Dolly 在 Linux 上重新安装依赖时使用的项目专用 pnpm store
+  npm-cache/              Dolly 测试可使用的项目专用 npm 缓存
+  cache/                  Dolly 命令可使用的项目专用通用缓存
+  tmp/                    Dolly 命令可使用的项目专用临时目录
+  Dolly-transfer-20260731.tar.gz  已校验的转移压缩包；确认不再需要回滚后可精确删除
 ```
 
 `previous-server-work/` 有 52 个顶层项目，约 3.5 GiB，包括旧源码副本、依赖、Linux runner 输出、日志和证据。它们不是当前工作区，也不能用目录名推断为当前证据；需要时按 `HANDOVER_NOW.md` 和结果文档核对来源提交。未经核对不要删除。
@@ -163,6 +168,10 @@ USTC 目录布局：
 ```
 
 这些变化来自此前工作，当前交接不替它们背书。开始修改前先查看具体 diff。每次只 stage 已核对的精确文件，先检查 `git diff --cached`，做小提交并及时 push。禁止用 `git reset --hard`、`git checkout --` 或大范围恢复破坏已有工作。
+
+用于转移的干净压缩包是 Windows 上的 `E:\Huasushis\program\Dolly-ustc-linux-clean-20260731.tar.gz`，服务器内保存为 `/home/ubuntu/codex-dolly/Dolly-transfer-20260731.tar.gz`。它大小为 209,224,305 字节，SHA-256 为 `3ED96258D5BC2D14FE3FD5CBAB6EF8FD4BE2526D979D4D0FCD4CCF41E382C7DD`；上传前后摘要一致。压缩包共检查 45,847 个条目，没有任何路径名为 `node_modules` 的目录，也没有 `.tmp`、`.pnpm-store` 或根目录 `dist`。它包含 `.git`、`.env`、交接文件、原始想法、早期规范和未跟踪实验材料。
+
+解压后的工作区约 637 MiB；关键文件摘要与本地一致，Git 的已跟踪修改和未跟踪文件清单也逐项一致。三个由 Git 记录为可执行的 Linux 脚本已经恢复执行位，远端仓库的 `core.filemode=true`；项目根目录权限为 `0700`，`.env` 权限为 `0600`。GNU tar 关于 `SCHILY.fflags` 的提示来自 Windows 文件标志，未发现路径缺失或解压失败。压缩包目前作为一次回滚副本保留在 Dolly 专用目录内，不再需要时只精确删除该文件。
 
 ## 8. USTC 环境和操作边界
 
@@ -202,13 +211,23 @@ Linux 上不要沿用 Windows `.tmp` 环境说明；在 `~/codex-dolly/Dolly/` �
 Linux 重新安装依赖后，至少执行：
 
 ```bash
-pnpm install --frozen-lockfile
+pnpm install --frozen-lockfile --store-dir /home/ubuntu/codex-dolly/pnpm-store
 pnpm run typecheck --pretty false
 pnpm run build
-pnpm test --maxWorkers=4
+npm test -- --maxWorkers=4
 ```
 
 安装本身会替换 Windows 的原生依赖；源代码和 Git 状态必须保持可核对。TypeScript 检查必须看退出码：0 才是干净，2 是类型错误，其他值是崩溃。测试必须核对实际收集到的文件数和用例数；传目录后只运行一部分不是完整性证明。
+
+2026-07-31 的转移核验已经完成依赖安装。安装得到的是 Linux x86-64 原生依赖，而不是从 Windows 复制的 `node_modules/`。同一远端副本上：
+
+- `pnpm run typecheck --pretty false` 通过；
+- `pnpm run build` 通过；
+- `npm test -- --maxWorkers=4` 实际收集 131 个测试文件和 1669 个测试，其中 126 个文件通过、1 个失败、4 个跳过；1637 个用例通过、1 个失败、31 个跳过；
+- 唯一失败是 `tests/conformance/core/linux-core-service-binding-service.test.ts` 的真实 systemd 正面案例。产品检查要求 `ExecStart` 使用 systemd 的 `:` 前缀来禁止环境变量展开，但测试中的 `runProbeInTransientService` 直接把 `process.execPath` 传给 `systemd-run`，没有构造该前缀，因此同时得到 `CORE_SERVICE_EXEC_START_ENVIRONMENT_EXPANDED`。这说明当前正面测试装配与被测契约不一致；仍需在真实 systemd 上验证正确的 `systemd-run` 表达方式，再修改测试并证明故障案例仍能单独变红。不要把它记成产品通过，也不要在未复核 systemd 语义时仅删除断言；
+- 不要用 `pnpm test --maxWorkers=4`，因为参数会先被 pnpm 自身解析。`pnpm run test --maxWorkers=4` 虽然能进入 Vitest，但会让 `tests/conformance/operations/package-install-smoke.test.ts` 把 pnpm 当成 npm，再向 `pnpm pack` 传 npm 专有的 `--cache`，产生第二个测试执行器相关失败。通过仓库声明的 npm 脚本运行时，该包安装测试通过。后续应让测试明确支持实际执行器或明确只接受 npm，并分别为选择逻辑增加反例。
+
+因此，远端副本、依赖、类型检查和构建已核对，完整 Linux 测试尚未全绿。接手者的第一项代码工作前应先保存上述失败的原始输出或重新运行该单例，确认它仍是同一个问题。
 
 以下规则来自反复失败，属于强制工作方式：
 
@@ -231,7 +250,7 @@ pnpm test --maxWorkers=4
 
 不要直接大改。第一轮应同时完成并留下书面结果：
 
-1. 核对远端完整副本的文件清单、Git 提交、脏工作树和 `.env` 权限；重新安装 Linux 依赖并验证最小命令。
+1. 复核已经完成的远端文件摘要、Git 提交、脏工作树、`.env` 权限和 Linux 验证结果；先重现并解释上文唯一的真实 systemd 失败，不要无理由重新安装依赖。
 2. 对照实际 HEAD 复核 `HANDOVER_NOW.md` 的每个“当前”陈述，尤其转移后是否已经过期。
 3. 从 P0-5 选择一个跨层风险，在真正产品边界先写会失败的反例，再决定最小修复；不得移除 Module 启动拒绝条件。
 4. 同时为至少一个独立研究方向完成预注册或审查现有实验设计。不要用旧脚本的一次运行替代研究。
