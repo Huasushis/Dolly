@@ -59,29 +59,18 @@ RUN find /etc/systemd/system /lib/systemd/system \
       \( -name '*udev*' -o -name '*getty*' -o -name '*remote-fs*' \) \
       -exec rm -f {} + 2>/dev/null || true
 
-# The experiment runs as an unprivileged account with its own systemd user
+# The experiment runs as a new unprivileged account with its own systemd user
 # manager, which is the deployment shape Architecture Decision Record 0009
-# describes for a user service. The source tree is mounted read-only and may
-# deliberately be owner-only, so the container account uses the source tree
-# owner's numeric user identifier. Recent Ubuntu images already contain an
-# `ubuntu` account with identifier 1000; rename that account when it owns the
-# mounted tree rather than creating a second account that cannot traverse it.
+# describes for a user service. It deliberately does not reuse the numeric
+# owner of the host checkout: doing so would make owner-only credentials such
+# as an ignored `.env` readable through a bind mount. The runner instead gives
+# this account a readable snapshot containing only Git-tracked files.
 # Lingering is enabled so the user manager survives the end of a login session,
 # which is itself one of the cases.
-ARG SOURCE_OWNER_UID=1000
 RUN set -eux; \
-    case "${SOURCE_OWNER_UID}" in \
-      ''|*[!0-9]*|0) echo "SOURCE_OWNER_UID must name an unprivileged numeric user identifier" >&2; exit 1 ;; \
-    esac; \
-    existing_user="$(getent passwd "${SOURCE_OWNER_UID}" | cut -d: -f1 || true)"; \
-    getent group dolly >/dev/null || groupadd --system dolly; \
-    if [ -n "${existing_user}" ] && [ "${existing_user}" != dolly ]; then \
-      usermod --login dolly --home /home/dolly --move-home --shell /bin/bash --gid dolly "${existing_user}"; \
-    elif [ "${existing_user}" = dolly ]; then \
-      usermod --shell /bin/bash --gid dolly dolly; \
-    else \
-      useradd --uid "${SOURCE_OWNER_UID}" --gid dolly --create-home --shell /bin/bash dolly; \
-    fi; \
+    groupadd --system dolly; \
+    useradd --gid dolly --create-home --shell /bin/bash dolly; \
+    usermod --groups '' --lock dolly; \
     mkdir -p /var/lib/systemd/linger; \
     touch /var/lib/systemd/linger/dolly
 

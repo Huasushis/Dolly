@@ -55,6 +55,8 @@ IMAGE_TAG="${CONTAINER_NAME}-image"
 BASE_IMAGE="ubuntu:24.04"
 KEEP_CONTAINER="no"
 TEST_FILES=()
+CONTAINER_CREATED="no"
+SOURCE_SNAPSHOT=""
 
 # Options this script owns are consumed here; everything else is passed
 # through to the experiment runner unchanged, so the runner's own filters
@@ -84,17 +86,6 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-# A private checkout may grant traversal only to its owner. Bind mounts retain
-# numeric ownership and mode bits, so the unprivileged container account must
-# use the checkout owner's user identifier rather than the base image's next
-# available identifier. Running the integration test as root would invalidate
-# the permission and user-service boundary it is meant to exercise.
-SOURCE_OWNER_UID="$(stat -c %u "${REPOSITORY_ROOT}")"
-if [ "${SOURCE_OWNER_UID}" -eq 0 ]; then
-  echo "The repository is owned by root; this runner requires an unprivileged source owner." >&2
-  exit 1
-fi
-
 # Printed beside every removal command this script suggests.
 #
 # Container names carry a random suffix precisely so concurrent runs cannot
@@ -113,14 +104,6 @@ warn_against_bulk_removal() {
 }
 
 cleanup() {
-  # The run writes artifacts as the container's unprivileged account, whose
-  # identifier is unrelated to the host's. Ownership is handed back before the
-  # container goes away, so the evidence stays readable and writable on the
-  # host. This touches only this invocation's own directory.
-  if [ -n "${ARTIFACT_ROOT:-}" ] && [ -d "${ARTIFACT_ROOT}" ]; then
-    docker exec "${CONTAINER_NAME}" \
-      chown -R "$(id -u):$(id -g)" /dolly-artifacts >/dev/null 2>&1 || true
-  fi
   if [ "${CLEANUP_REASON:-}" = "hangup" ]; then
     # A lost terminal is not a decision to abandon the run. The full matrix
     # takes long enough that a dropped connection is likely, and destroying the
@@ -132,33 +115,87 @@ cleanup() {
     echo "  ${ARTIFACT_ROOT}" >&2
     echo "Remove it when the run has finished with this exact name:" >&2
     echo "  docker rm -f ${CONTAINER_NAME}" >&2
+    echo "Its required tracked-source snapshot remains at ${SOURCE_SNAPSHOT}." >&2
     warn_against_bulk_removal
     return
   fi
   if [ "${KEEP_CONTAINER}" = "yes" ]; then
     echo "Container ${CONTAINER_NAME} left running; remove it with this exact name:" >&2
     echo "  docker rm -f ${CONTAINER_NAME}" >&2
+    echo "Its required tracked-source snapshot remains at ${SOURCE_SNAPSHOT}." >&2
     warn_against_bulk_removal
     return
   fi
-  docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  # The run has ended and will not write more evidence. Hand only this
+  # invocation's artifact directory back to the host account before removing
+  # the container. Doing this before the hangup/keep checks would make a live
+  # unprivileged run lose write access halfway through.
+  if [ -n "${ARTIFACT_ROOT:-}" ] && [ -d "${ARTIFACT_ROOT}" ]; then
+    docker exec "${CONTAINER_NAME}" \
+      chown -R "$(id -u):$(id -g)" /dolly-artifacts >/dev/null 2>&1 || true
+  fi
+  if [ "${CONTAINER_CREATED}" = "yes" ] \
+      && ! docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1; then
+    echo "Could not remove exact container ${CONTAINER_NAME}; preserving its source snapshot at" >&2
+    echo "  ${SOURCE_SNAPSHOT}" >&2
+    warn_against_bulk_removal
+    return
+  fi
   docker image rm "${IMAGE_TAG}" >/dev/null 2>&1 || true
+  if [ -n "${SOURCE_SNAPSHOT}" ] && [ -d "${SOURCE_SNAPSHOT}" ]; then
+    expected_snapshot="${ARTIFACT_ROOT}.tracked-source"
+    if [ "${SOURCE_SNAPSHOT}" != "${expected_snapshot}" ]; then
+      echo "Refusing to remove unexpected source snapshot path ${SOURCE_SNAPSHOT}." >&2
+      return
+    fi
+    rm -rf -- "${SOURCE_SNAPSHOT}"
+  fi
 }
 trap cleanup EXIT
 # A hangup means the terminal went away, not that the experiment should stop.
 # Marking the reason lets `cleanup` leave the container alone in that case.
 trap 'CLEANUP_REASON=hangup' HUP
 
+# Each invocation gets separate evidence and source-snapshot directories. The
+# snapshot is an archive of the exact HEAD commit: dirty, ignored, or untracked
+# owner files such as `.env` are not mounted into the privileged experiment
+# container. It remains a host-owned temporary input and the container receives
+# it read-only.
+ARTIFACT_PARENT="${REPOSITORY_ROOT}/artifacts/experiments/linux-core-service-ownership"
+ARTIFACT_ROOT="${ARTIFACT_PARENT}/container-$$-$(date -u +%Y%m%dT%H%M%SZ)"
+SOURCE_SNAPSHOT="${ARTIFACT_ROOT}.tracked-source"
+mkdir -p "${ARTIFACT_PARENT}"
+mkdir "${ARTIFACT_ROOT}"
+mkdir "${SOURCE_SNAPSHOT}"
+(
+  cd "${REPOSITORY_ROOT}"
+  git archive --format=tar HEAD
+) | tar --extract --file=- --directory "${SOURCE_SNAPSHOT}"
+chmod -R a+rX,go-w "${SOURCE_SNAPSHOT}"
+
+if [ -e "${SOURCE_SNAPSHOT}/.env" ] \
+    || [ -e "${SOURCE_SNAPSHOT}/.git" ] \
+    || [ -e "${SOURCE_SNAPSHOT}/node_modules" ] \
+    || [ -L "${SOURCE_SNAPSHOT}/node_modules" ]; then
+  echo "The tracked-source snapshot unexpectedly contains private repository state." >&2
+  exit 1
+fi
+# Node resolves dependencies relative to each source file's real path under
+# `/dolly`, while Vite needs one writable temporary directory. This controlled
+# link points only at the ephemeral dependency view built later in the
+# container; no host checkout path is exposed.
+ln -s /dolly-run/node_modules "${SOURCE_SNAPSHOT}/node_modules"
+
 echo "Building the disposable image from ${BASE_IMAGE}"
 docker build \
   --build-arg "BASE=${BASE_IMAGE}" \
-  --build-arg "SOURCE_OWNER_UID=${SOURCE_OWNER_UID}" \
   -t "${IMAGE_TAG}" \
   "${EXPERIMENT_DIR}"
 
-# The working tree is mounted read-only so a run cannot modify the source it
-# is testing. Artifacts go to a separate writable directory on the host, which
-# survives the container so a run's evidence can be inspected afterwards.
+# The tracked-source snapshot is mounted read-only so a run cannot modify the
+# source it is testing or read ignored/untracked owner files. Artifacts go to a
+# separate writable directory on the host, which survives the container so a
+# run's evidence can be inspected afterwards.
 #
 # Each invocation gets its own artifact directory. Concurrent runs would
 # otherwise share one tree, and handing its ownership back at the end of one
@@ -166,9 +203,6 @@ docker build \
 # unrelated identifiers, so one run's `chown` makes the tree unwritable for
 # another. A per-invocation directory removes the shared resource rather than
 # asking callers to serialise.
-ARTIFACT_ROOT="${REPOSITORY_ROOT}/artifacts/experiments/linux-core-service-ownership/container-$$-$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "${ARTIFACT_ROOT}"
-
 # Handlers run TypeScript through the installed development dependencies.
 # `node_modules` is often a symbolic link to a directory outside the working
 # tree, and the directories on the way to that target may not be traversable
@@ -192,10 +226,11 @@ docker run -d --name "${CONTAINER_NAME}" \
   --privileged \
   --tmpfs /run --tmpfs /run/lock \
   --cgroupns=private \
-  -v "${REPOSITORY_ROOT}:/dolly:ro" \
+  -v "${SOURCE_SNAPSHOT}:/dolly:ro" \
   -v "${ARTIFACT_ROOT}:/dolly-artifacts:rw" \
   "${DEPENDENCY_MOUNT[@]+"${DEPENDENCY_MOUNT[@]}"}" \
   "${IMAGE_TAG}" >/dev/null
+CONTAINER_CREATED="yes"
 
 # systemd needs a moment to reach a running state before the user manager and
 # its delegated control-group tree exist.
@@ -213,13 +248,20 @@ if [ "${state:-}" != "running" ] && [ "${state:-}" != "degraded" ]; then
 fi
 
 DOLLY_UID="$(docker exec "${CONTAINER_NAME}" id -u dolly)"
-echo "Service manager state: ${state}; unprivileged account uid ${DOLLY_UID}"
+DOLLY_GID="$(docker exec "${CONTAINER_NAME}" id -g dolly)"
+DOLLY_GROUPS="$(docker exec "${CONTAINER_NAME}" id -G dolly)"
+if [ "${DOLLY_UID}" -eq 0 ] || [ "${DOLLY_GROUPS}" != "${DOLLY_GID}" ]; then
+  echo "The experiment account is root or retains supplementary groups; refusing to run." >&2
+  exit 1
+fi
+echo "Service manager state: ${state}; unprivileged account uid ${DOLLY_UID}, gid ${DOLLY_GID}"
 
 # Source identity and the exact inner command are written while the artifact
 # directory still belongs to the host account. The directory is handed to the
 # container account below.
 git -C "${REPOSITORY_ROOT}" rev-parse HEAD > "${ARTIFACT_ROOT}/source-commit.txt"
 git -C "${REPOSITORY_ROOT}" status --short > "${ARTIFACT_ROOT}/source-status.txt"
+printf 'git archive HEAD\n' > "${ARTIFACT_ROOT}/source-snapshot.txt"
 if [ "${#TEST_FILES[@]}" -gt 0 ]; then
   {
     printf '%q ' ./scripts/run-linux-module-launcher-integration.sh "${TEST_FILES[@]}"
@@ -266,6 +308,34 @@ docker exec "${CONTAINER_NAME}" bash -c "
   chown -R dolly:dolly ${WORK_TREE}
 "
 
+# These checks make the security shape observable before any test or hostile
+# fixture runs. In particular, the account must not see ignored checkout state,
+# and changing either bind mount from read-only to read-write must fail here.
+docker exec -u dolly "${CONTAINER_NAME}" bash -c '
+  set -e
+  test -r /dolly/package.json
+  test ! -w /dolly/package.json
+  test ! -e /dolly/.env
+  test ! -e /dolly/.git
+  test "$(readlink /dolly/node_modules)" = /dolly-run/node_modules
+  test -w /dolly-run/node_modules/.vite-temp
+  test -w /dolly-artifacts
+  if [ -d /dolly-dependencies ]; then
+    test -r /dolly-dependencies
+    test ! -w /dolly-dependencies
+  fi
+  {
+    echo "tracked_commit_source=true"
+    echo "source_readable=true"
+    echo "source_writable=false"
+    echo "private_env_present=false"
+    echo "git_directory_present=false"
+    echo "dependencies_writable=false"
+    echo "vite_temp_writable=true"
+    echo "artifacts_writable=true"
+  } | tee /dolly-artifacts/preflight.txt
+'
+
 # Report the conditions the matrix depends on, so a run that silently lost one
 # of them is visible in its own output rather than only in a failed case.
 docker exec "${CONTAINER_NAME}" bash -c '
@@ -274,6 +344,9 @@ docker exec "${CONTAINER_NAME}" bash -c '
     echo "cgroup filesystem: $(stat -fc %T /sys/fs/cgroup)"
     echo "root controllers:  $(cat /sys/fs/cgroup/cgroup.controllers)"
     echo "lingering:         $(loginctl show-user dolly -p Linger)"
+    echo "systemd:           $(systemd --version | sed -n '1p')"
+    echo "node:              $(node --version)"
+    echo "dolly identity:    uid=$(id -u dolly) gid=$(id -g dolly) groups=$(id -G dolly)"
     echo "python3:           $(python3 -V 2>&1)"
   } | tee /dolly-artifacts/environment.txt
 '
