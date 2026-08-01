@@ -84,6 +84,17 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
+# A private checkout may grant traversal only to its owner. Bind mounts retain
+# numeric ownership and mode bits, so the unprivileged container account must
+# use the checkout owner's user identifier rather than the base image's next
+# available identifier. Running the integration test as root would invalidate
+# the permission and user-service boundary it is meant to exercise.
+SOURCE_OWNER_UID="$(stat -c %u "${REPOSITORY_ROOT}")"
+if [ "${SOURCE_OWNER_UID}" -eq 0 ]; then
+  echo "The repository is owned by root; this runner requires an unprivileged source owner." >&2
+  exit 1
+fi
+
 # Printed beside every removal command this script suggests.
 #
 # Container names carry a random suffix precisely so concurrent runs cannot
@@ -139,7 +150,11 @@ trap cleanup EXIT
 trap 'CLEANUP_REASON=hangup' HUP
 
 echo "Building the disposable image from ${BASE_IMAGE}"
-docker build --build-arg "BASE=${BASE_IMAGE}" -t "${IMAGE_TAG}" "${EXPERIMENT_DIR}"
+docker build \
+  --build-arg "BASE=${BASE_IMAGE}" \
+  --build-arg "SOURCE_OWNER_UID=${SOURCE_OWNER_UID}" \
+  -t "${IMAGE_TAG}" \
+  "${EXPERIMENT_DIR}"
 
 # The working tree is mounted read-only so a run cannot modify the source it
 # is testing. Artifacts go to a separate writable directory on the host, which
