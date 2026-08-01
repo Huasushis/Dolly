@@ -51,6 +51,7 @@ import {
   canTransitionModuleProcessRecordState,
   type ModuleProcessRecord,
   type ModuleProcessRecordState,
+  type ModuleProcessStoppedRecordWriter,
   type ModuleSubmissionRecord,
 } from "./module-process-records.js";
 import { type ModuleResultCommitOperations } from "./module-result-commit.js";
@@ -189,6 +190,11 @@ export interface FileCoreStateStoreOptions {
   readonly now: () => string;
   readonly blockLimits?: Partial<BlockStoreLimits>;
   readonly media?: FileCoreMediaOptions;
+}
+
+export interface FileCoreStateStoreWithStoppedRecordWriter {
+  readonly store: FileCoreStateStore;
+  readonly stoppedRecordWriter: ModuleProcessStoppedRecordWriter;
 }
 
 export interface FileCoreMediaOptions {
@@ -1243,6 +1249,11 @@ export type FileCoreMediaOperations = Pick<
   readonly referenceGraph: FileCoreReferenceGraphOperations;
 };
 
+const pendingStoppedRecordWriters = new WeakMap<
+  FileCoreStateStore,
+  ModuleProcessStoppedRecordWriter
+>();
+
 export class FileCoreStateStore {
   readonly referenceGraph: FileCoreReferenceGraphOperations;
   readonly media: FileCoreMediaOperations | undefined;
@@ -1485,6 +1496,21 @@ export class FileCoreStateStore {
     this.#media?.setMutationObserver(persist);
     this.#blocks.setMutationObserver(persist);
     this.#deliveries.setMutationObserver(persist);
+
+    // The terminal writer is deliberately not a property of the store. The
+    // construction factory below retrieves this frozen, store-bound closure
+    // once and distributes it only to stop-proof coordinators.
+    pendingStoppedRecordWriters.set(
+      this,
+      Object.freeze({
+        isBoundTo: (record: ModuleProcessRecord) => {
+          this.#assertUsable();
+          return this.#moduleProcessRecords.get(record.processGenerationId) === record;
+        },
+        writeStopped: (processGenerationId: string, failureCode?: string) =>
+          this.#writeStoppedModuleProcessRecord(processGenerationId, failureCode),
+      }),
+    );
   }
 
   /** @internal Only product composition uses this complete operation set. */
@@ -1665,12 +1691,41 @@ export class FileCoreStateStore {
   }
 
   /**
-   * Advances one Module process record along
-   * starting -> running -> stopping -> stopped. Marking a record `stopped`
-   * requires the caller to hold the ADR 0009 empty-cgroup proof; this store
-   * enforces only the transition order and durability.
+   * Advances one non-terminal Module process state. The terminal transition
+   * is intentionally absent from this generic API, including at runtime for
+   * JavaScript callers; only the separately distributed stopped-record writer
+   * can perform it after the required process-group proof.
    */
   updateModuleProcessRecordState(
+    processGenerationId: string,
+    state: "running" | "stopping",
+    failureCode?: string,
+  ): ModuleProcessRecord {
+    if ((state as ModuleProcessRecordState) === "stopped") {
+      throw new ModuleProcessRecordError(
+        "MODULE_PROCESS_STOP_PROOF_REQUIRED",
+        "A Module process record may be marked stopped only through the stop-proof writer",
+      );
+    }
+    return this.#writeModuleProcessRecordState(
+      processGenerationId,
+      state,
+      failureCode,
+    );
+  }
+
+  #writeStoppedModuleProcessRecord(
+    processGenerationId: string,
+    failureCode?: string,
+  ): ModuleProcessRecord {
+    return this.#writeModuleProcessRecordState(
+      processGenerationId,
+      "stopped",
+      failureCode,
+    );
+  }
+
+  #writeModuleProcessRecordState(
     processGenerationId: string,
     state: ModuleProcessRecordState,
     failureCode?: string,
@@ -2322,6 +2377,27 @@ export class FileCoreStateStore {
       );
     }
   }
+}
+
+/**
+ * Constructs FileCore state together with its store-bound terminal-write
+ * capability. Callers that use `new FileCoreStateStore(...)` receive no way to
+ * acquire that capability later. This internal composition function is not
+ * re-exported from Dolly's package surface.
+ */
+export function createFileCoreStateStoreWithStoppedRecordWriter(
+  options: FileCoreStateStoreOptions,
+): FileCoreStateStoreWithStoppedRecordWriter {
+  const store = new FileCoreStateStore(options);
+  const stoppedRecordWriter = pendingStoppedRecordWriters.get(store);
+  pendingStoppedRecordWriters.delete(store);
+  if (stoppedRecordWriter === undefined) {
+    throw new CoreStateError(
+      "CORE_STATE_IO_FAILED",
+      "The Module process stopped-record writer could not be constructed",
+    );
+  }
+  return Object.freeze({ store, stoppedRecordWriter });
 }
 
 function atomicWriteCoreStateFile(

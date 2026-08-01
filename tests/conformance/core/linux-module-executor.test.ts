@@ -26,6 +26,7 @@ import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js
 import {
   canTransitionModuleProcessRecordState,
   type ModuleProcessRecord,
+  type ModuleProcessStoppedRecordWriter,
 } from "../../../src/core/module-process-records.js";
 import type {
   ModuleLauncherControl,
@@ -81,6 +82,7 @@ function processRecord(): ModuleProcessRecord {
 interface TestRecordStore extends ModuleProcessRecordStore {
   readonly current: ModuleProcessRecord | undefined;
   readonly log: readonly string[];
+  readonly stoppedRecordWriter: ModuleProcessStoppedRecordWriter;
 }
 
 function recordStore(
@@ -90,11 +92,28 @@ function recordStore(
 ): TestRecordStore {
   const log: string[] = [];
   let current = processRecord();
+  const stoppedRecordWriter: ModuleProcessStoppedRecordWriter = {
+    isBoundTo(record) {
+      return current === record;
+    },
+    writeStopped(_id, failureCode) {
+      if (options.rejectStateChange?.("stopped") === true) {
+        throw new Error("simulated failure persisting process-record state stopped");
+      }
+      if (!canTransitionModuleProcessRecordState(current.state, "stopped")) {
+        throw new Error(`invalid process-record transition ${current.state} -> stopped`);
+      }
+      log.push("state:stopped");
+      current = { ...current, state: "stopped", failureCode };
+      return current;
+    },
+  };
   return {
     get current() {
       return current;
     },
     log,
+    stoppedRecordWriter,
     getModuleProcessRecord(processGenerationId) {
       return current.processGenerationId === processGenerationId ? current : undefined;
     },
@@ -227,6 +246,7 @@ function executorFor(options: {
     moduleGenerationId: MODULE_GENERATION_ID,
     lifecycle: {
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,

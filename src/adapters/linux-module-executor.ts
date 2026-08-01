@@ -383,6 +383,7 @@ export function createLinuxModuleExecutor(
     try {
       stopped = await stopModuleProcess({
         records: options.lifecycle.records,
+        stoppedRecordWriter: options.lifecycle.stoppedRecordWriter,
         processGenerationId: options.lifecycle.identity.processGenerationId,
         cgroup,
         timeoutMs: options.terminationTimeoutMs,

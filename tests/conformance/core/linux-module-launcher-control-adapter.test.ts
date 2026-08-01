@@ -46,7 +46,10 @@ import {
   type ModuleLauncherControl,
   type ModuleProcessRecordStore,
 } from "../../../src/core/linux-module-process-lifecycle.js";
-import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
+import type {
+  ModuleProcessRecord,
+  ModuleProcessStoppedRecordWriter,
+} from "../../../src/core/module-process-records.js";
 
 const DELEGATED_ROOT = "/user.slice/user-1000.slice/user@1000.service/dolly.service";
 const IDENTITY = {
@@ -299,11 +302,28 @@ function cgroupFileSystem(
 
 function recordStore(): ModuleProcessRecordStore & {
   readonly current: ModuleProcessRecord | undefined;
+  readonly stoppedRecordWriter: ModuleProcessStoppedRecordWriter;
 } {
   const records = new Map<string, ModuleProcessRecord>();
   return {
     get current() {
       return records.get(IDENTITY.processGenerationId);
+    },
+    stoppedRecordWriter: {
+      isBoundTo(record) {
+        return records.get(record.processGenerationId) === record;
+      },
+      writeStopped(processGenerationId, failureCode) {
+        const current = records.get(processGenerationId);
+        if (!current) throw new Error(`no record for ${processGenerationId}`);
+        const next = {
+          ...current,
+          state: "stopped",
+          ...(failureCode === undefined ? {} : { failureCode }),
+        } as ModuleProcessRecord;
+        records.set(processGenerationId, next);
+        return next;
+      },
     },
     getModuleProcessRecord(processGenerationId) {
       return records.get(processGenerationId);
@@ -513,6 +533,7 @@ describe("Module launcher control adapter", () => {
       moduleGenerationId: "module-generation-a",
       lifecycle: {
         records,
+        stoppedRecordWriter: records.stoppedRecordWriter,
         processRecord: processRecord(),
         delegatedRootCgroupPath: DELEGATED_ROOT,
         identity: IDENTITY,
@@ -630,8 +651,10 @@ describe("Module launcher control adapter", () => {
     };
 
     const derived = deriveModuleCgroupPath(DELEGATED_ROOT, IDENTITY);
+    const records = recordStore();
     const started = await startModuleProcess({
-      records: recordStore(),
+      records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,

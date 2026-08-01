@@ -60,6 +60,21 @@ export interface ModuleProcessRecord {
   readonly failureCode?: string;
 }
 
+/**
+ * Narrow authority to persist the terminal state of a Module process record.
+ * Ordinary record stores do not expose this operation: product composition
+ * gives the capability only to coordinators that first prove the whole
+ * process group has stopped.
+ */
+export interface ModuleProcessStoppedRecordWriter {
+  /** Uses the store's stable current-record identity to reject another store. */
+  isBoundTo(record: ModuleProcessRecord): boolean;
+  writeStopped(
+    processGenerationId: string,
+    failureCode?: string,
+  ): ModuleProcessRecord;
+}
+
 export interface ModuleSubmissionRecord {
   readonly schemaVersion: "dolly.module-submission-record/1";
   readonly moduleJobId: string;
@@ -77,6 +92,7 @@ export type ModuleProcessRecordErrorCode =
   | "MODULE_PROCESS_RECORD_CONFLICT"
   | "MODULE_PROCESS_RECORD_NOT_FOUND"
   | "MODULE_PROCESS_RECORD_STATE_INVALID"
+  | "MODULE_PROCESS_STOP_PROOF_REQUIRED"
   | "MODULE_PROCESS_RECORD_IN_USE"
   | "MODULE_SUBMISSION_RECORD_INVALID"
   | "MODULE_SUBMISSION_RECORD_CONFLICT"

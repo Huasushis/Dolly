@@ -11,6 +11,7 @@ import {
 } from "./module-result-commit.js";
 import {
   type ModuleProcessRecord,
+  type ModuleProcessStoppedRecordWriter,
   type ModuleSubmissionRecord,
 } from "./module-process-records.js";
 
@@ -136,6 +137,7 @@ export interface CoreStartupRecoveryReport {
 export interface CoreStartupStateStore {
   listModuleProcessRecords(): readonly ModuleProcessRecord[];
   listModuleSubmissionRecords(): readonly ModuleSubmissionRecord[];
+  /** Returns the store's stable immutable object for the current record version. */
   getModuleProcessRecord(processGenerationId: string): ModuleProcessRecord | undefined;
   getModuleSubmissionRecord(runId: string): ModuleSubmissionRecord | undefined;
   /**
@@ -152,7 +154,7 @@ export interface CoreStartupStateStore {
   ): boolean;
   updateModuleProcessRecordState(
     processGenerationId: string,
-    state: "starting" | "running" | "stopping" | "stopped",
+    state: "running" | "stopping",
     failureCode?: string,
   ): ModuleProcessRecord;
   /**
@@ -181,6 +183,8 @@ export interface CoreStartupRecoveryOptions {
   readonly deliveries: Pick<DeliveryStore, "inspectClaim" | "listActiveClaims">;
   readonly commits: ModuleResultCommitCoordinator;
   readonly moduleRecords?: CoreStartupStateStore;
+  /** Store-bound capability held only by this stop-proof coordinator. */
+  readonly stoppedRecordWriter?: ModuleProcessStoppedRecordWriter;
   readonly processStopProver?: ModuleProcessStopProver;
   readonly externalEffectEvidence?: ExternalEffectEvidenceSource;
 }
@@ -344,6 +348,7 @@ export class CoreStartupRecovery {
   readonly #deliveries: Pick<DeliveryStore, "inspectClaim" | "listActiveClaims">;
   readonly #commits: ModuleResultCommitCoordinator;
   readonly #moduleRecords: CoreStartupStateStore | undefined;
+  readonly #stoppedRecordWriter: ModuleProcessStoppedRecordWriter | undefined;
   readonly #processStopProver: ModuleProcessStopProver | undefined;
   readonly #externalEffectEvidence: ExternalEffectEvidenceSource | undefined;
 
@@ -351,6 +356,7 @@ export class CoreStartupRecovery {
     this.#deliveries = options.deliveries;
     this.#commits = options.commits;
     this.#moduleRecords = options.moduleRecords;
+    this.#stoppedRecordWriter = options.stoppedRecordWriter;
     this.#processStopProver = options.processStopProver;
     this.#externalEffectEvidence = options.externalEffectEvidence;
   }
@@ -578,19 +584,20 @@ export class CoreStartupRecovery {
   }
 
   /**
-   * Marks every old Module process record stopped, but only after the prover
-   * supplies one of the accepted proofs. Without a prover, a record that is
-   * not already stopped blocks startup rather than being assumed dead.
+   * Re-proves every old Module process record, including records already
+   * labelled stopped. Version 17 did not persist the authority that produced
+   * that label, so trusting it across startup would preserve historical
+   * proofless writes. A non-terminal record additionally needs the separately
+   * distributed stopped-record writer before its state can change.
    */
   async #proveOldProcessesStopped(): Promise<readonly string[]> {
     const records = this.#moduleRecords?.listModuleProcessRecords() ?? [];
     const stopped: string[] = [];
     for (const record of records) {
-      if (record.state === "stopped") continue;
       if (!this.#processStopProver) {
         throw new CoreStartupRecoveryError(
           "STARTUP_MODULE_PROCESS_UNPROVEN",
-          `Module process record ${record.processGenerationId} is ${record.state} and no stop proof is available`,
+          `Module process record ${record.processGenerationId} is ${record.state} and no fresh stop proof is available`,
         );
       }
       let pendingProof: unknown;
@@ -638,10 +645,49 @@ export class CoreStartupRecovery {
           `Module control group stop proof does not match process generation ${record.processGenerationId}`,
         );
       }
-      this.#moduleRecords!.updateModuleProcessRecordState(
-        record.processGenerationId,
-        "stopped",
-      );
+      if (record.state !== "stopped") {
+        if (!this.#stoppedRecordWriter) {
+          throw new CoreStartupRecoveryError(
+            "STARTUP_MODULE_PROCESS_UNPROVEN",
+            `Module process record ${record.processGenerationId} is ${record.state} and startup does not hold its store-bound stopped-record writer`,
+          );
+        }
+        const current = this.#moduleRecords!.getModuleProcessRecord(
+          record.processGenerationId,
+        );
+        if (
+          current === undefined ||
+          moduleProcessStopProofIdentityDigest(current) !==
+            moduleProcessStopProofIdentityDigest(record) ||
+          !this.#stoppedRecordWriter.isBoundTo(current)
+        ) {
+          throw new CoreStartupRecoveryError(
+            "STARTUP_MODULE_PROCESS_UNPROVEN",
+            `The stopped-record writer is not bound to process generation ${record.processGenerationId} in the startup recovery store`,
+          );
+        }
+        try {
+          this.#stoppedRecordWriter.writeStopped(record.processGenerationId);
+        } catch {
+          throw new CoreStartupRecoveryError(
+            "STARTUP_MODULE_PROCESS_UNPROVEN",
+            `Module process record ${record.processGenerationId} could not be durably marked stopped after its proof`,
+          );
+        }
+        const persisted = this.#moduleRecords!.getModuleProcessRecord(
+          record.processGenerationId,
+        );
+        if (
+          persisted?.state !== "stopped" ||
+          moduleProcessStopProofIdentityDigest(persisted) !==
+            moduleProcessStopProofIdentityDigest(record)
+        ) {
+          throw new CoreStartupRecoveryError(
+            "STARTUP_MODULE_PROCESS_UNPROVEN",
+            `The stopped-record writer did not update process generation ${record.processGenerationId} in the startup recovery store`,
+          );
+        }
+      }
       stopped.push(record.processGenerationId);
     }
     return stopped;

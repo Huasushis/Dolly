@@ -364,6 +364,15 @@ of the Core service cgroup before a later Core invocation begins Module
 recovery. The later Core marks the prior process record stopped only after it
 has verified the new service boundary and that the old Module cgroup is empty.
 
+The ordinary process-record state operation cannot write `stopped`, including
+when called from JavaScript without TypeScript checks. File-backed Core state
+provides that transition through a separate, frozen writer bound to the exact
+record object in one store; lifecycle and recovery coordinators must verify the
+binding before use and re-read the same store after use. A returned object is
+not evidence that the durable state changed. Because version 17 did not record
+which authority produced an existing `stopped` label, startup re-proves those
+records as well as non-terminal records before it relies on or collects them.
+
 A live Core uses its exact child-process handle only during the pre-membership
 launcher phase. After restart, it never signals a recovered process identifier;
 a process identifier may be retained only as diagnostic data. The record never
@@ -589,7 +598,10 @@ Before this ADR can become `Accepted`, Linux tests must cover at least:
    `cgroup.kill`, `populated 0`, and directory removal, while the earlier path
    requires an observed launcher exit, a fresh `populated 0` reading, and
    directory removal without claiming whole-group termination; uncertain
-   launcher exit or `execute` delivery must force a nonzero Core exit;
+   launcher exit or `execute` delivery must force a nonzero Core exit. A cgroup
+   preparation refusal must separately report a path never created, a path
+   confirmed removed, or an unconfirmed path; reuse and failed cleanup are
+   unconfirmed and must also force a nonzero Core exit;
 4. service-manager restart in a disposable environment, login termination with
    and without lingering, and machine reboot recovery, including a same-boot
    missing old cgroup path and a changed boot identifier;

@@ -6,7 +6,9 @@ import {
   startLinuxModuleLauncher,
 } from "../../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
 import { createModuleLauncherControl } from "../../../../src/adapters/linux-module-launcher/module-launcher-control.js";
-import { FileCoreStateStore } from "../../../../src/core/file-core-state-store.js";
+import {
+  createFileCoreStateStoreWithStoppedRecordWriter,
+} from "../../../../src/core/file-core-state-store.js";
 import {
   deriveModuleCgroupPath,
   prepareDelegatedCgroupRoot,
@@ -117,13 +119,14 @@ async function main(): Promise<void> {
   };
   const moduleCgroup = deriveModuleCgroupPath(delegatedRootCgroupPath, identity);
   const now = (): string => new Date().toISOString();
-  const state = new FileCoreStateStore({
-    path: statePath,
-    maxFailedAttempts: 3,
-    nextBlockId: () => "unused-block",
-    nextDeliveryId: (kind) => `unused-${kind}`,
-    now,
-  });
+  const { store: state, stoppedRecordWriter } =
+    createFileCoreStateStoreWithStoppedRecordWriter({
+      path: statePath,
+      maxFailedAttempts: 3,
+      nextBlockId: () => "unused-block",
+      nextDeliveryId: (kind) => `unused-${kind}`,
+      now,
+    });
   const createdAt = now();
   const processRecord: ModuleProcessRecord = {
     schemaVersion: "dolly.module-process-record/1",
@@ -153,6 +156,7 @@ async function main(): Promise<void> {
     moduleGenerationId: MODULE_GENERATION_ID,
     lifecycle: {
       records: state,
+      stoppedRecordWriter,
       processRecord,
       delegatedRootCgroupPath,
       identity,

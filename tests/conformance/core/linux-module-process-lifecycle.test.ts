@@ -20,6 +20,7 @@ import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js
 import {
   canTransitionModuleProcessRecordState,
   type ModuleProcessRecord,
+  type ModuleProcessStoppedRecordWriter,
 } from "../../../src/core/module-process-records.js";
 
 const DELEGATED_ROOT = "/system.slice/dolly-core.service";
@@ -71,11 +72,33 @@ function processRecord(): ModuleProcessRecord {
 }
 
 /** Records every write so a test can assert the exact order of steps. */
-function recordStore(): ModuleProcessRecordStore & { readonly log: string[] } {
+function recordStore(): ModuleProcessRecordStore & {
+  readonly log: string[];
+  readonly stoppedRecordWriter: ModuleProcessStoppedRecordWriter;
+} {
   const log: string[] = [];
   let current = processRecord();
+  const writeState = (
+    state: ModuleProcessRecord["state"],
+    failureCode?: string,
+  ): ModuleProcessRecord => {
+    if (!canTransitionModuleProcessRecordState(current.state, state)) {
+      throw new Error(`invalid process-record transition ${current.state} -> ${state}`);
+    }
+    log.push(failureCode === undefined ? `state:${state}` : `state:${state}:${failureCode}`);
+    current = { ...current, state };
+    return current;
+  };
   return {
     log,
+    stoppedRecordWriter: {
+      isBoundTo(record) {
+        return current === record;
+      },
+      writeStopped(_id, failureCode) {
+        return writeState("stopped", failureCode);
+      },
+    },
     getModuleProcessRecord(processGenerationId) {
       return current.processGenerationId === processGenerationId ? current : undefined;
     },
@@ -85,12 +108,7 @@ function recordStore(): ModuleProcessRecordStore & { readonly log: string[] } {
       return record;
     },
     updateModuleProcessRecordState(_id, state, failureCode) {
-      if (!canTransitionModuleProcessRecordState(current.state, state)) {
-        throw new Error(`invalid process-record transition ${current.state} -> ${state}`);
-      }
-      log.push(failureCode === undefined ? `state:${state}` : `state:${state}:${failureCode}`);
-      current = { ...current, state };
-      return current;
+      return writeState(state, failureCode);
     },
   };
 }
@@ -101,8 +119,9 @@ function recordStore(): ModuleProcessRecordStore & { readonly log: string[] } {
  */
 function fakeCgroupFileSystem(overrides: {
   readonly populated?: () => string;
-  readonly failCreate?: boolean;
+  readonly createErrorCode?: "EACCES" | "EEXIST";
   readonly failRemove?: boolean;
+  readonly failWrite?: boolean;
 } = {}) {
   const files = new Map<string, string>();
   const directories = new Set<string>();
@@ -110,7 +129,12 @@ function fakeCgroupFileSystem(overrides: {
     files,
     directories,
     async createDirectory(path: string): Promise<void> {
-      if (overrides.failCreate) throw Object.assign(new Error("denied"), { code: "EACCES" });
+      if (overrides.createErrorCode !== undefined) {
+        if (overrides.createErrorCode === "EEXIST") directories.add(path);
+        throw Object.assign(new Error("directory creation refused"), {
+          code: overrides.createErrorCode,
+        });
+      }
       directories.add(path);
     },
     async removeDirectory(path: string): Promise<void> {
@@ -142,6 +166,9 @@ function fakeCgroupFileSystem(overrides: {
       return value;
     },
     async writeTextFile(path: string, contents: string): Promise<void> {
+      if (overrides.failWrite) {
+        throw Object.assign(new Error("limit write denied"), { code: "EACCES" });
+      }
       files.set(path, contents);
     },
   };
@@ -181,6 +208,7 @@ describe("Linux Module process lifecycle order", () => {
 
     const result = await startModuleProcess({
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,
@@ -217,6 +245,7 @@ describe("Linux Module process lifecycle order", () => {
 
     const result = await startModuleProcess({
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,
@@ -258,6 +287,7 @@ describe("Linux Module process lifecycle order", () => {
 
     const result = await startModuleProcess({
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,
@@ -285,6 +315,7 @@ describe("Linux Module process lifecycle order", () => {
 
     const result = await startModuleProcess({
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,
@@ -292,15 +323,112 @@ describe("Linux Module process lifecycle order", () => {
       maxOpenFiles: 256,
       startLauncher,
       execution: EXECUTION,
-      cgroupFileSystem: fakeCgroupFileSystem({ failCreate: true }),
+      cgroupFileSystem: fakeCgroupFileSystem({ createErrorCode: "EACCES" }),
     });
 
     expect(result.executionAuthorized).toBe(false);
     if (result.executionAuthorized) throw new Error("expected a refusal");
-    expect(result.failure.code).toBe("MODULE_PROCESS_CGROUP_FAILED");
+    expect(result.failure).toMatchObject({
+      code: "MODULE_PROCESS_CGROUP_FAILED",
+      coreMustExit: true,
+    });
     expect(startLauncher).not.toHaveBeenCalled();
-    // The record stays as evidence, marked stopped because no process joined.
-    expect(records.log).toContain("state:stopped:MODULE_CGROUP_CREATE_FAILED");
+    // A failed mkdir does not prove that the named path was never created, so
+    // startup recovery must retain and re-prove the durable starting record.
+    expect(records.log).toEqual(["append"]);
+    expect(records.log).not.toContain("state:stopped");
+  });
+
+  it("does not mark a reused control-group path stopped", async () => {
+    const records = recordStore();
+    const fileSystem = fakeCgroupFileSystem({ createErrorCode: "EEXIST" });
+    const startLauncher = vi.fn(async () => launcher());
+
+    const result = await startModuleProcess({
+      records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher,
+      execution: EXECUTION,
+      cgroupFileSystem: fileSystem,
+    });
+
+    expect(result.executionAuthorized).toBe(false);
+    if (result.executionAuthorized) throw new Error("expected a refusal");
+    expect(result.failure).toMatchObject({
+      code: "MODULE_PROCESS_CGROUP_FAILED",
+      coreMustExit: true,
+    });
+    expect(result.failure.detail).toContain("MODULE_CGROUP_PATH_IN_USE");
+    expect(startLauncher).not.toHaveBeenCalled();
+    expect(fileSystem.directories.size).toBe(1);
+    expect(records.log).toEqual(["append"]);
+    expect(records.log).not.toContain("state:stopped");
+  });
+
+  it("does not mark a partially created control group stopped when cleanup fails", async () => {
+    const records = recordStore();
+    const fileSystem = fakeCgroupFileSystem({ failWrite: true, failRemove: true });
+    const startLauncher = vi.fn(async () => launcher());
+
+    const result = await startModuleProcess({
+      records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher,
+      execution: EXECUTION,
+      cgroupFileSystem: fileSystem,
+    });
+
+    expect(result.executionAuthorized).toBe(false);
+    if (result.executionAuthorized) throw new Error("expected a refusal");
+    expect(result.failure).toMatchObject({
+      code: "MODULE_PROCESS_CGROUP_FAILED",
+      coreMustExit: true,
+    });
+    expect(result.failure.detail).toContain("MODULE_CGROUP_LIMIT_WRITE_FAILED");
+    expect(result.failure.detail).toContain("could also not be removed");
+    expect(startLauncher).not.toHaveBeenCalled();
+    expect(fileSystem.directories.size).toBe(1);
+    expect(records.log).toEqual(["append"]);
+    expect(records.log).not.toContain("state:stopped");
+  });
+
+  it("does not require Core exit when failed preparation proves its new path was removed", async () => {
+    const records = recordStore();
+    const fileSystem = fakeCgroupFileSystem({ failWrite: true });
+    const startLauncher = vi.fn(async () => launcher());
+
+    const result = await startModuleProcess({
+      records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher,
+      execution: EXECUTION,
+      cgroupFileSystem: fileSystem,
+    });
+
+    expect(result.executionAuthorized).toBe(false);
+    if (result.executionAuthorized) throw new Error("expected a refusal");
+    expect(result.failure).toMatchObject({
+      code: "MODULE_PROCESS_CGROUP_FAILED",
+      coreMustExit: false,
+    });
+    expect(startLauncher).not.toHaveBeenCalled();
+    expect(fileSystem.directories.size).toBe(0);
+    expect(records.log).toEqual(["append"]);
   });
 
   it("asks the launcher to exit and does not authorize execution when stop was requested", async () => {
@@ -310,6 +438,7 @@ describe("Linux Module process lifecycle order", () => {
 
     const result = await startModuleProcess({
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,
@@ -331,12 +460,49 @@ describe("Linux Module process lifecycle order", () => {
     expect(records.log.at(-1)).toBe("state:stopped:MODULE_PROCESS_STOP_REQUESTED");
   });
 
+  it("does not report failed-start cleanup complete when a structural writer performs no write", async () => {
+    const records = recordStore();
+    const fileSystem = fakeCgroupFileSystem();
+    const noOpWriter: ModuleProcessStoppedRecordWriter = {
+      isBoundTo: () => true,
+      writeStopped() {
+        return { ...processRecord(), state: "stopped" };
+      },
+    };
+
+    const result = await startModuleProcess({
+      records,
+      stoppedRecordWriter: noOpWriter,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher: async () => launcher(),
+      execution: EXECUTION,
+      stopRequested: () => true,
+      cgroupFileSystem: fileSystem,
+    });
+
+    expect(result.executionAuthorized).toBe(false);
+    if (result.executionAuthorized) throw new Error("expected a refusal");
+    expect(result.failure).toMatchObject({
+      code: "MODULE_PROCESS_STOP_REQUESTED",
+      coreMustExit: true,
+    });
+    expect(records.getModuleProcessRecord(IDENTITY.processGenerationId)?.state).toBe(
+      "starting",
+    );
+    expect(fileSystem.directories.size).toBe(0);
+  });
+
   it("retains the prepared control group when launcher creation has an unknown outcome", async () => {
     const records = recordStore();
     const fileSystem = fakeCgroupFileSystem();
 
     const result = await startModuleProcess({
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,
@@ -371,6 +537,7 @@ describe("Linux Module process lifecycle order", () => {
 
     const result = await startModuleProcess({
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,
@@ -397,6 +564,7 @@ describe("Linux Module process lifecycle order", () => {
     const fileSystem = fakeCgroupFileSystem({ populated: () => populated });
     const started = await startModuleProcess({
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,
@@ -414,6 +582,7 @@ describe("Linux Module process lifecycle order", () => {
     const refused = await stopModuleProcess({
       ...NO_PROTOCOL_SESSION,
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processGenerationId: IDENTITY.processGenerationId,
       cgroup: started.cgroup,
       timeoutMs: 20,
@@ -426,6 +595,7 @@ describe("Linux Module process lifecycle order", () => {
     const proven = await stopModuleProcess({
       ...NO_PROTOCOL_SESSION,
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processGenerationId: IDENTITY.processGenerationId,
       cgroup: started.cgroup,
       timeoutMs: 200,
@@ -433,6 +603,49 @@ describe("Linux Module process lifecycle order", () => {
     expect(proven.stopped).toBe(true);
     expect(records.log.at(-1)).toBe("state:stopped");
     expect(fileSystem.directories.has(started.cgroup.path)).toBe(false);
+  });
+
+  it("does not report a normal stop complete when a structural writer performs no write", async () => {
+    const records = recordStore();
+    let populated = "populated 1\nfrozen 0\n";
+    const fileSystem = fakeCgroupFileSystem({ populated: () => populated });
+    const started = await startModuleProcess({
+      records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher: async () => launcher(),
+      execution: EXECUTION,
+      cgroupFileSystem: fileSystem,
+    });
+    if (!started.executionAuthorized) throw new Error("expected authorization");
+    records.updateModuleProcessRecordState(IDENTITY.processGenerationId, "running");
+    populated = "populated 0\nfrozen 0\n";
+
+    const stopped = await stopModuleProcess({
+      ...NO_PROTOCOL_SESSION,
+      records,
+      stoppedRecordWriter: {
+        isBoundTo: () => true,
+        writeStopped() {
+          return { ...processRecord(), state: "stopped" };
+        },
+      },
+      processGenerationId: IDENTITY.processGenerationId,
+      cgroup: started.cgroup,
+      timeoutMs: 200,
+    });
+
+    expect(stopped).toMatchObject({
+      stopped: false,
+      code: "MODULE_PROCESS_RECORD_FAILED",
+    });
+    expect(records.getModuleProcessRecord(IDENTITY.processGenerationId)?.state).toBe(
+      "stopping",
+    );
   });
 
   it("keeps the process record stopping when an empty group cannot be removed", async () => {
@@ -443,6 +656,7 @@ describe("Linux Module process lifecycle order", () => {
     });
     const started = await startModuleProcess({
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,
@@ -458,6 +672,7 @@ describe("Linux Module process lifecycle order", () => {
     const stopped = await stopModuleProcess({
       ...NO_PROTOCOL_SESSION,
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processGenerationId: IDENTITY.processGenerationId,
       cgroup: started.cgroup,
       timeoutMs: 200,
@@ -476,6 +691,7 @@ describe("Linux Module process lifecycle order", () => {
     const fileSystem = fakeCgroupFileSystem();
     const started = await startModuleProcess({
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,
@@ -491,6 +707,7 @@ describe("Linux Module process lifecycle order", () => {
       stopModuleProcess({
         ...NO_PROTOCOL_SESSION,
         records,
+        stoppedRecordWriter: records.stoppedRecordWriter,
         processGenerationId: IDENTITY.processGenerationId,
         cgroup: started.cgroup,
       }),
@@ -500,6 +717,7 @@ describe("Linux Module process lifecycle order", () => {
       stopModuleProcess({
         ...NO_PROTOCOL_SESSION,
         records,
+        stoppedRecordWriter: records.stoppedRecordWriter,
         processGenerationId: IDENTITY.processGenerationId,
         cgroup: started.cgroup,
         waitForChannelClosed: async () => false,
@@ -515,6 +733,7 @@ describe("Linux Module process lifecycle order", () => {
     const fileSystem = fakeCgroupFileSystem();
     const started = await startModuleProcess({
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,
@@ -530,12 +749,14 @@ describe("Linux Module process lifecycle order", () => {
     const first = stopModuleProcess({
       ...NO_PROTOCOL_SESSION,
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processGenerationId: IDENTITY.processGenerationId,
       cgroup: started.cgroup,
     });
     const second = stopModuleProcess({
       ...NO_PROTOCOL_SESSION,
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processGenerationId: IDENTITY.processGenerationId,
       cgroup: started.cgroup,
     });
@@ -551,6 +772,7 @@ describe("Linux Module process lifecycle order", () => {
     const fileSystem = fakeCgroupFileSystem();
     const started = await startModuleProcess({
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,
@@ -566,6 +788,7 @@ describe("Linux Module process lifecycle order", () => {
     const stopped = await stopModuleProcess({
       ...NO_PROTOCOL_SESSION,
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processGenerationId: "process-generation-2",
       cgroup: started.cgroup,
     });
@@ -584,6 +807,7 @@ describe("Linux Module process lifecycle order", () => {
     const fileSystem = fakeCgroupFileSystem();
     const started = await startModuleProcess({
       records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processRecord: processRecord(),
       delegatedRootCgroupPath: DELEGATED_ROOT,
       identity: IDENTITY,
@@ -608,6 +832,7 @@ describe("Linux Module process lifecycle order", () => {
     const stopped = await stopModuleProcess({
       ...NO_PROTOCOL_SESSION,
       records: recordsWithWrongPath,
+      stoppedRecordWriter: records.stoppedRecordWriter,
       processGenerationId: IDENTITY.processGenerationId,
       cgroup: started.cgroup,
     });

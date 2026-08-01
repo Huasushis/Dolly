@@ -47,7 +47,7 @@ function processIsAlive(pid: number): boolean {
 }
 
 describe("Reactive Module runtime with a real Extension process", () => {
-  it("commits and acknowledges one Claim, then releases an active Claim during orderly stop", async () => {
+  it("commits and acknowledges one Claim, then releases an active Claim during orderly runtime stop", async () => {
     const root = mkdtempSync(join(tmpdir(), "dolly-reactive-module-real-process-"));
     const coreStatePath = join(root, "core-state.json");
     const commitRepositoryPath = join(root, "module-result-commits.json");
@@ -291,7 +291,15 @@ describe("Reactive Module runtime with a real Extension process", () => {
         throw new Error("Expected orderly stop to cancel the active run");
       }
       await expect(stop).resolves.toBeUndefined();
-      core.updateModuleProcessRecordState(processGenerationId, "stopped");
+
+      // This fixture observes only its directly spawned Extension process. It
+      // does not run the Linux lifecycle's delegated-control-group inspection
+      // and removal proof, so it must leave the durable process record in
+      // `stopping` for startup recovery rather than declare the whole group
+      // stopped from one child-process exit.
+      expect(core.getModuleProcessRecord(processGenerationId)?.state).toBe(
+        "stopping",
+      );
 
       expect(core.deliveries.inspectClaim(cancelled).status).toBe("released");
       expect(core.getModuleSubmissionRecord(cancelled.runId)).toBeUndefined();
@@ -332,6 +340,9 @@ describe("Reactive Module runtime with a real Extension process", () => {
       expect(reopenedCore.deliveries.inspectClaim(cancelled).status).toBe("released");
       expect(reopenedCore.getModuleSubmissionRecord(committed.runId)).toBeUndefined();
       expect(reopenedCore.getModuleSubmissionRecord(cancelled.runId)).toBeUndefined();
+      expect(
+        reopenedCore.getModuleProcessRecord(processGenerationId)?.state,
+      ).toBe("stopping");
       expect(reopenedRepository.get(committed.moduleJobId)).toEqual(committed.record);
     } finally {
       if (runtime && runtime.state !== "stopped") {

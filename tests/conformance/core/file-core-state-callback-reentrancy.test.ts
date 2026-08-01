@@ -5,9 +5,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   CoreStateError,
   FileCoreStateStore,
+  createFileCoreStateStoreWithStoppedRecordWriter,
 } from "../../../src/core/file-core-state-store.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
-import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
+import type {
+  ModuleProcessRecord,
+  ModuleProcessStoppedRecordWriter,
+} from "../../../src/core/module-process-records.js";
 
 const NOW = "2026-07-31T00:00:00.000Z";
 const LATER = "2026-07-31T00:00:05.000Z";
@@ -73,22 +77,24 @@ describe("FileCore configured callback reentrancy", () => {
 
   it("rejects a clock that tries to change a process record while an outer transition uses its old state", () => {
     let store!: FileCoreStateStore;
+    let stoppedRecordWriter!: ModuleProcessStoppedRecordWriter;
     let reenter = false;
     let blockId = 0;
     let deliveryId = 0;
-    store = new FileCoreStateStore({
-      path,
-      maxFailedAttempts: 3,
-      nextBlockId: () => `block-${++blockId}`,
-      nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
-      now: () => {
-        if (reenter) {
-          reenter = false;
-          store.updateModuleProcessRecordState(PROCESS_GENERATION_ID, "stopped");
-        }
-        return LATER;
-      },
-    });
+    ({ store, stoppedRecordWriter } =
+      createFileCoreStateStoreWithStoppedRecordWriter({
+        path,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => {
+          if (reenter) {
+            reenter = false;
+            stoppedRecordWriter.writeStopped(PROCESS_GENERATION_ID);
+          }
+          return LATER;
+        },
+      }));
     store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState(PROCESS_GENERATION_ID, "running");
     const revisionBefore = store.revision;

@@ -13,12 +13,16 @@ import {
   type ModuleProcessStopProof,
 } from "../../../src/core/core-startup-recovery.js";
 import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
-import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
+import {
+  createFileCoreStateStoreWithStoppedRecordWriter,
+  FileCoreStateStore,
+} from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { ModuleResultCommitCoordinator } from "../../../src/core/module-result-commit.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import type {
   ModuleProcessRecord,
+  ModuleProcessStoppedRecordWriter,
   ModuleSubmissionRecord,
 } from "../../../src/core/module-process-records.js";
 
@@ -33,17 +37,31 @@ describe("CORE startup reconciliation with Module records", () => {
   let root: string;
   let statePath: string;
   let journalPath: string;
+  const stoppedRecordWriters = new WeakMap<
+    FileCoreStateStore,
+    ModuleProcessStoppedRecordWriter
+  >();
 
   function openStore(prefix: string, path = statePath): FileCoreStateStore {
     let blockId = 0;
     let runtimeId = 0;
-    return new FileCoreStateStore({
+    const created = createFileCoreStateStoreWithStoppedRecordWriter({
       path,
       maxFailedAttempts: 3,
       nextBlockId: () => `${prefix}-block-${++blockId}`,
       nextDeliveryId: (kind) => `${prefix}-${kind}-${++runtimeId}`,
       now: () => NOW,
     });
+    stoppedRecordWriters.set(created.store, created.stoppedRecordWriter);
+    return created.store;
+  }
+
+  function stoppedRecordWriterFor(
+    store: FileCoreStateStore,
+  ): ModuleProcessStoppedRecordWriter {
+    const writer = stoppedRecordWriters.get(store);
+    if (!writer) throw new Error("Test store has no stopped-record writer");
+    return writer;
   }
 
   function openCommits(store: FileCoreStateStore): ModuleResultCommitCoordinator {
@@ -305,6 +323,7 @@ describe("CORE startup reconciliation with Module records", () => {
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: withUnknownSubmissionHistory(store, [exactIdentity(claim)]),
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
@@ -329,6 +348,7 @@ describe("CORE startup reconciliation with Module records", () => {
       deliveries: store.deliveries,
       commits: openCommits(store),
       moduleRecords: store,
+      stoppedRecordWriter: stoppedRecordWriterFor(store),
       processStopProver: provenStopped,
     }).recover();
 
@@ -410,6 +430,7 @@ describe("CORE startup reconciliation with Module records", () => {
           undefined,
           [submission],
         ),
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
@@ -448,6 +469,7 @@ describe("CORE startup reconciliation with Module records", () => {
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: store,
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: unprovenStop,
       }).recover(),
     ).rejects.toThrowError(
@@ -479,6 +501,155 @@ describe("CORE startup reconciliation with Module records", () => {
     );
   });
 
+  it("refuses to trust an existing stopped label without a fresh proof and preserves it", async () => {
+    const store = openStore("first");
+    store.appendModuleProcessRecord(processRecord());
+    store.updateModuleProcessRecordState("process-generation-1", "running");
+    stoppedRecordWriterFor(store).writeStopped("process-generation-1");
+    const beforeRevision = store.revision;
+
+    await expect(
+      new CoreStartupRecovery({
+        deliveries: store.deliveries,
+        commits: openCommits(store),
+        moduleRecords: store,
+      }).recover(),
+    ).rejects.toMatchObject({
+      code: "STARTUP_MODULE_PROCESS_UNPROVEN",
+      message: expect.stringContaining("stopped and no fresh stop proof is available"),
+    });
+
+    expect(store.revision).toBe(beforeRevision);
+    expect(store.getModuleProcessRecord("process-generation-1")).toMatchObject({
+      state: "stopped",
+    });
+    const reopened = openStore("second");
+    expect(reopened.revision).toBe(beforeRevision);
+    expect(reopened.getModuleProcessRecord("process-generation-1")).toMatchObject({
+      state: "stopped",
+    });
+  });
+
+  it("rejects a structured stop proof without the store-bound writer and preserves durable state", async () => {
+    const store = openStore("first");
+    store.appendModuleProcessRecord(processRecord());
+    const beforeRevision = store.revision;
+
+    await expect(
+      new CoreStartupRecovery({
+        deliveries: store.deliveries,
+        commits: openCommits(store),
+        moduleRecords: store,
+        processStopProver: provenStopped,
+      }).recover(),
+    ).rejects.toMatchObject({
+      code: "STARTUP_MODULE_PROCESS_UNPROVEN",
+      message: expect.stringContaining("does not hold its store-bound stopped-record writer"),
+    });
+
+    expect(store.revision).toBe(beforeRevision);
+    expect(store.getModuleProcessRecord("process-generation-1")).toMatchObject({
+      state: "starting",
+    });
+    const reopened = openStore("second");
+    expect(reopened.revision).toBe(beforeRevision);
+    expect(reopened.getModuleProcessRecord("process-generation-1")).toMatchObject({
+      state: "starting",
+    });
+  });
+
+  it("accepts a fresh proof for an existing stopped record without distributing write authority", async () => {
+    const store = openStore("first");
+    store.appendModuleProcessRecord(processRecord());
+    stoppedRecordWriterFor(store).writeStopped("process-generation-1");
+
+    const report = await new CoreStartupRecovery({
+      deliveries: store.deliveries,
+      commits: openCommits(store),
+      moduleRecords: store,
+      processStopProver: provenStopped,
+    }).recover();
+
+    expect(report.stoppedProcessGenerationIds).toEqual(["process-generation-1"]);
+    expect(report.collectedRecords.processRecords).toBe(1);
+    expect(store.getModuleProcessRecord("process-generation-1")).toBeUndefined();
+  });
+
+  it("rejects a failed fresh proof for an existing stopped record", async () => {
+    const store = openStore("first");
+    store.appendModuleProcessRecord(processRecord());
+    stoppedRecordWriterFor(store).writeStopped("process-generation-1");
+    const beforeRevision = store.revision;
+
+    await expect(
+      new CoreStartupRecovery({
+        deliveries: store.deliveries,
+        commits: openCommits(store),
+        moduleRecords: store,
+        processStopProver: unprovenStop,
+      }).recover(),
+    ).rejects.toMatchObject({ code: "STARTUP_MODULE_PROCESS_UNPROVEN" });
+
+    expect(store.revision).toBe(beforeRevision);
+    expect(store.getModuleProcessRecord("process-generation-1")).toMatchObject({
+      state: "stopped",
+    });
+  });
+
+  it("rejects a structural stopped-record writer that performs no durable write", async () => {
+    const store = openStore("first");
+    store.appendModuleProcessRecord(processRecord());
+    const beforeRevision = store.revision;
+
+    await expect(
+      new CoreStartupRecovery({
+        deliveries: store.deliveries,
+        commits: openCommits(store),
+        moduleRecords: store,
+        stoppedRecordWriter: {
+          isBoundTo: () => true,
+          writeStopped: () => processRecord({ state: "stopped" }),
+        },
+        processStopProver: provenStopped,
+      }).recover(),
+    ).rejects.toMatchObject({
+      code: "STARTUP_MODULE_PROCESS_UNPROVEN",
+      message: expect.stringContaining("did not update process generation"),
+    });
+
+    expect(store.revision).toBe(beforeRevision);
+    expect(store.getModuleProcessRecord("process-generation-1")).toMatchObject({
+      state: "starting",
+    });
+  });
+
+  it("rejects a stopped-record writer bound to a different state store", async () => {
+    const store = openStore("first");
+    const otherStore = openStore("other", join(root, "other-core-state.json"));
+    store.appendModuleProcessRecord(processRecord());
+    otherStore.appendModuleProcessRecord(processRecord());
+
+    await expect(
+      new CoreStartupRecovery({
+        deliveries: store.deliveries,
+        commits: openCommits(store),
+        moduleRecords: store,
+        stoppedRecordWriter: stoppedRecordWriterFor(otherStore),
+        processStopProver: provenStopped,
+      }).recover(),
+    ).rejects.toMatchObject({
+      code: "STARTUP_MODULE_PROCESS_UNPROVEN",
+      message: expect.stringContaining("is not bound to process generation"),
+    });
+
+    expect(store.getModuleProcessRecord("process-generation-1")).toMatchObject({
+      state: "starting",
+    });
+    expect(otherStore.getModuleProcessRecord("process-generation-1")).toMatchObject({
+      state: "starting",
+    });
+  });
+
   it.each(invalidProcessStopProofs)(
     "keeps the Claim active when the stop prover returns %s",
     async (_description, proof) => {
@@ -495,6 +666,7 @@ describe("CORE startup reconciliation with Module records", () => {
           deliveries: store.deliveries,
           commits: openCommits(store),
           moduleRecords: store,
+          stoppedRecordWriter: stoppedRecordWriterFor(store),
           processStopProver,
         }).recover(),
       ).rejects.toMatchObject({
@@ -522,6 +694,7 @@ describe("CORE startup reconciliation with Module records", () => {
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: store,
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: {
           proveStopped: async (): Promise<ModuleProcessStopProof> => ({
             proven: true,
@@ -554,6 +727,7 @@ describe("CORE startup reconciliation with Module records", () => {
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: store,
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
         externalEffectEvidence: {
           inspectRunEffects: async (): Promise<ExternalEffectEvidence> => ({
@@ -587,6 +761,7 @@ describe("CORE startup reconciliation with Module records", () => {
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: store,
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toThrowError(
@@ -610,6 +785,7 @@ describe("CORE startup reconciliation with Module records", () => {
       deliveries: store.deliveries,
       commits: openCommits(store),
       moduleRecords: store,
+      stoppedRecordWriter: stoppedRecordWriterFor(store),
       processStopProver: provenStopped,
     }).recover();
 
@@ -634,6 +810,7 @@ describe("CORE startup reconciliation with Module records", () => {
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: store,
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
         externalEffectEvidence: {
           inspectRunEffects: async (): Promise<ExternalEffectEvidence> => ({
@@ -661,6 +838,7 @@ describe("CORE startup reconciliation with Module records", () => {
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: store,
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
         externalEffectEvidence: {
           inspectRunEffects: async (): Promise<ExternalEffectEvidence> => ({
@@ -697,6 +875,7 @@ describe("CORE startup reconciliation with Module records", () => {
           deliveries: store.deliveries,
           commits: openCommits(store),
           moduleRecords: store,
+          stoppedRecordWriter: stoppedRecordWriterFor(store),
           processStopProver: provenStopped,
           externalEffectEvidence,
         }).recover(),
@@ -730,6 +909,7 @@ describe("CORE startup reconciliation with Module records", () => {
           [submission],
           () => "released",
         ),
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
@@ -758,6 +938,7 @@ describe("CORE startup reconciliation with Module records", () => {
           [submission],
           (identity) => store.releaseDeliveryClaim(identity),
         ),
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
@@ -789,6 +970,7 @@ describe("CORE startup reconciliation with Module records", () => {
         },
         (runId) => store.getModuleSubmissionRecord(runId),
       ),
+      stoppedRecordWriter: stoppedRecordWriterFor(store),
       processStopProver: provenStopped,
     }).recover();
 
@@ -825,6 +1007,7 @@ describe("CORE startup reconciliation with Module records", () => {
           [submission],
           (identity) => otherStore.releaseDeliveryClaim(identity),
         ),
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
@@ -856,6 +1039,7 @@ describe("CORE startup reconciliation with Module records", () => {
           [submission],
           asynchronousRelease,
         ),
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
@@ -881,6 +1065,7 @@ describe("CORE startup reconciliation with Module records", () => {
       deliveries: store.deliveries,
       commits,
       moduleRecords: store,
+      stoppedRecordWriter: stoppedRecordWriterFor(store),
       processStopProver: provenStopped,
     }).recover();
 
@@ -912,6 +1097,7 @@ describe("CORE startup reconciliation with Module records", () => {
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: withSubmissionRecords(store, [mismatched]),
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toThrowError(
@@ -935,6 +1121,7 @@ describe("CORE startup reconciliation with Module records", () => {
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: withSubmissionRecords(store, [submission]),
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
@@ -948,7 +1135,7 @@ describe("CORE startup reconciliation with Module records", () => {
     const claim = seedActiveClaim(store);
     store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
-    store.updateModuleProcessRecordState("process-generation-1", "stopped");
+    stoppedRecordWriterFor(store).writeStopped("process-generation-1");
     store.appendModuleProcessRecord(
       processRecord({ processGenerationId: "process-generation-2" }),
     );
@@ -958,6 +1145,7 @@ describe("CORE startup reconciliation with Module records", () => {
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: withUnknownSubmissionHistory(store, [exactIdentity(claim)]),
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
@@ -977,25 +1165,51 @@ describe("CORE startup reconciliation with Module records", () => {
     const claim = seedActiveClaim(store);
     store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
-    store.updateModuleProcessRecordState("process-generation-1", "stopped");
+    stoppedRecordWriterFor(store).writeStopped("process-generation-1");
     store.appendModuleProcessRecord(
       processRecord({ processGenerationId: "process-generation-2" }),
     );
+    const provedProcessGenerationIds: string[] = [];
+    const refusesSecondProcess = {
+      proveStopped: async (
+        record: ModuleProcessRecord,
+      ): Promise<ModuleProcessStopProof> => {
+        provedProcessGenerationIds.push(record.processGenerationId);
+        if (record.processGenerationId === "process-generation-2") {
+          return {
+            proven: false,
+            reason: "the second cgroup is still populated",
+          };
+        }
+        return {
+          proven: true,
+          evidence: "populated-zero",
+          recordIdentityDigest: moduleProcessStopProofIdentityDigest(record),
+        };
+      },
+    };
 
     await expect(
       new CoreStartupRecovery({
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: withUnknownSubmissionHistory(store, [exactIdentity(claim)]),
-        // This prover refuses, so the second record cannot be marked stopped.
-        processStopProver: unprovenStop,
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
+        processStopProver: refusesSecondProcess,
       }).recover(),
     ).rejects.toThrowError(
       expect.objectContaining<Partial<CoreStartupRecoveryError>>({
         code: "STARTUP_MODULE_PROCESS_UNPROVEN",
       }),
     );
+    expect(provedProcessGenerationIds).toEqual([
+      "process-generation-1",
+      "process-generation-2",
+    ]);
     expect(store.deliveries.listActiveClaims()).toHaveLength(1);
+    expect(store.getModuleProcessRecord("process-generation-2")).toMatchObject({
+      state: "starting",
+    });
   });
 
   it("does not collect a process record when a terminal Claim still has a submission record", async () => {
@@ -1004,7 +1218,7 @@ describe("CORE startup reconciliation with Module records", () => {
     store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     const submission = store.appendModuleSubmissionRecord(submissionFor(claim));
-    store.updateModuleProcessRecordState("process-generation-1", "stopped");
+    stoppedRecordWriterFor(store).writeStopped("process-generation-1");
     store.releaseDeliveryClaim(claim);
 
     await expect(
@@ -1012,6 +1226,7 @@ describe("CORE startup reconciliation with Module records", () => {
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: withSubmissionRecords(store, [submission]),
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
@@ -1034,6 +1249,7 @@ describe("CORE startup reconciliation with Module records", () => {
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: store,
+        stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
       }).recover(),
     ).rejects.toThrowError(

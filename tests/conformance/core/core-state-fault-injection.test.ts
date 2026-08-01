@@ -29,10 +29,14 @@ import {
 import {
   CoreStateError,
   FileCoreStateStore,
+  createFileCoreStateStoreWithStoppedRecordWriter,
   migrateCoreStateDocumentToVersion17,
 } from "../../../src/core/file-core-state-store.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
-import { type ModuleProcessRecord } from "../../../src/core/module-process-records.js";
+import {
+  type ModuleProcessRecord,
+  type ModuleProcessStoppedRecordWriter,
+} from "../../../src/core/module-process-records.js";
 
 const MIGRATION_OPTIONS = {
   runtimeConfiguration: {
@@ -127,6 +131,7 @@ interface ClaimIdentity {
 
 interface ClaimedState {
   readonly store: FileCoreStateStore;
+  readonly stoppedRecordWriter: ModuleProcessStoppedRecordWriter;
   readonly blockId: string;
   readonly identity: ClaimIdentity;
   readonly revision: number;
@@ -203,7 +208,16 @@ describe("CORE state atomic write fault injection", () => {
    * the Run of that Claim.
    */
   function seedClaimedState(prefix: string): ClaimedState {
-    const store = openStore(prefix);
+    let blockId = 0;
+    let runtimeId = 0;
+    const { store, stoppedRecordWriter } =
+      createFileCoreStateStoreWithStoppedRecordWriter({
+        path,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `${prefix}-block-${++blockId}`,
+        nextDeliveryId: (kind) => `${prefix}-${kind}-${++runtimeId}`,
+        now: () => NOW,
+      });
     store.deliveries.createPage("input");
     store.deliveries.registerConsumer("input", "worker", "from-now");
     const block = store.blocks.commit(
@@ -239,7 +253,13 @@ describe("CORE state atomic write fault injection", () => {
       createdAt: NOW,
     });
     expect(store.deliveries.listActiveClaims()).toHaveLength(1);
-    return { store, blockId: block.id, identity, revision: store.revision };
+    return {
+      store,
+      stoppedRecordWriter,
+      blockId: block.id,
+      identity,
+      revision: store.revision,
+    };
   }
 
   /**
@@ -606,7 +626,7 @@ describe("CORE state atomic write fault injection", () => {
     // Every later operation refuses, including a read-modify-write that would
     // otherwise silently start from the stale in-memory view.
     expect(() =>
-      state.store.updateModuleProcessRecordState(PROCESS_GENERATION_ID, "stopped"),
+      state.stoppedRecordWriter.writeStopped(PROCESS_GENERATION_ID),
     ).toThrowError(
       expect.objectContaining<Partial<CoreStateError>>({
         code: "CORE_STATE_REOPEN_REQUIRED",

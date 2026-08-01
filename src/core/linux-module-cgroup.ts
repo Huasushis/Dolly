@@ -591,13 +591,20 @@ export interface PrepareModuleCgroupOptions {
 
 export type PrepareModuleCgroupResult =
   | { readonly prepared: true; readonly cgroup: ModuleCgroup }
-  | { readonly prepared: false; readonly failure: ModuleCgroupFailure };
+  | {
+      readonly prepared: false;
+      readonly failure: ModuleCgroupFailure;
+      /** What preparation proved about the derived path before returning. */
+      readonly pathState: "not-created" | "removed" | "unconfirmed";
+    };
 
 /**
  * Creates one Module cgroup, writes every required limit, reads each one back,
  * and verifies that the termination files exist. It fails closed on the first
- * problem and removes the directory it created, so a rejected preparation
- * leaves nothing behind.
+ * problem and attempts to remove the directory it created. A rejected result
+ * states whether no path was created, removal was confirmed, or path state is
+ * unconfirmed; callers must not infer successful cleanup from the failure
+ * code or message.
  */
 export async function prepareModuleCgroup(
   options: PrepareModuleCgroupOptions,
@@ -615,7 +622,11 @@ export async function prepareModuleCgroup(
     );
   } catch (error) {
     if (error instanceof ModuleCgroupError) {
-      return { prepared: false, failure: { code: error.code, detail: error.message } };
+      return {
+        prepared: false,
+        failure: { code: error.code, detail: error.message },
+        pathState: "not-created",
+      };
     }
     throw error;
   }
@@ -627,6 +638,7 @@ export async function prepareModuleCgroup(
     const code = errorCode(error);
     return {
       prepared: false,
+      pathState: "unconfirmed",
       failure: {
         code: code === "EEXIST" ? "MODULE_CGROUP_PATH_IN_USE" : "MODULE_CGROUP_CREATE_FAILED",
         detail:
@@ -643,12 +655,18 @@ export async function prepareModuleCgroup(
     // The group has never held a process at this point, so removing the empty
     // directory is safe. A removal problem is reported, never swallowed.
     let detail = failure.detail;
+    let pathState: "removed" | "unconfirmed" = "removed";
     try {
       await fileSystem.removeDirectory(path);
     } catch (error) {
+      pathState = "unconfirmed";
       detail = `${detail}; the partially prepared control group ${path} could also not be removed: ${describeError(error)}`;
     }
-    return { prepared: false, failure: { code: failure.code, detail } };
+    return {
+      prepared: false,
+      failure: { code: failure.code, detail },
+      pathState,
+    };
   };
 
   const readBack: Record<string, string> = {};

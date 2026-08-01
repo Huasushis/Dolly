@@ -41,15 +41,19 @@ import {
   type ModuleCgroupLimits,
   type ModuleCgroupFileSystem,
 } from "./linux-module-cgroup.js";
-import type { ModuleProcessRecord } from "./module-process-records.js";
+import type {
+  ModuleProcessRecord,
+  ModuleProcessStoppedRecordWriter,
+} from "./module-process-records.js";
 
 /** The durable Module process record reads and writes one lifecycle needs. */
 export interface ModuleProcessRecordStore {
+  /** Returns the store's stable immutable object for the current record version. */
   getModuleProcessRecord(processGenerationId: string): ModuleProcessRecord | undefined;
   appendModuleProcessRecord(record: ModuleProcessRecord): ModuleProcessRecord;
   updateModuleProcessRecordState(
     processGenerationId: string,
-    state: "starting" | "running" | "stopping" | "stopped",
+    state: "running" | "stopping",
     failureCode?: string,
   ): ModuleProcessRecord;
 }
@@ -157,6 +161,8 @@ export type ModuleProcessStartResult =
 
 export interface StartModuleProcessOptions {
   readonly records: ModuleProcessRecordStore;
+  /** Held only by this proof-owning lifecycle coordinator. */
+  readonly stoppedRecordWriter: ModuleProcessStoppedRecordWriter;
   /** The record to persist before any child exists. Its state must be `starting`. */
   readonly processRecord: ModuleProcessRecord;
   readonly delegatedRootCgroupPath: string;
@@ -184,11 +190,12 @@ export interface StartModuleProcessOptions {
 
 function cgroupFailure(
   failure: ModuleCgroupFailure,
+  coreMustExit: boolean,
 ): ModuleProcessStartFailure {
   return {
     code: "MODULE_PROCESS_CGROUP_FAILED",
     detail: `${failure.code}: ${failure.detail}`,
-    coreMustExit: false,
+    coreMustExit,
   };
 }
 
@@ -230,21 +237,17 @@ export async function startModuleProcess(
       : { fileSystem: options.cgroupFileSystem }),
   });
   if (!prepared.prepared) {
-    const stoppedPersisted = markStopped(
-      records,
-      identity.processGenerationId,
-      prepared.failure.code,
+    const failure = cgroupFailure(
+      prepared.failure,
+      prepared.pathState === "unconfirmed",
     );
-    const failure = cgroupFailure(prepared.failure);
     return {
       executionAuthorized: false,
-      failure: stoppedPersisted
-        ? failure
-        : {
-            ...failure,
-            detail: `${failure.detail}; the stopped process record could not be persisted`,
-            coreMustExit: true,
-          },
+      // A preparation refusal can mean that a pre-existing path was found or
+      // that a partially created path could not be removed. Neither is proof
+      // that no process remains, so the starting record is retained for
+      // startup recovery instead of being declared stopped here.
+      failure,
     };
   }
   const cgroup = prepared.cgroup;
@@ -274,6 +277,7 @@ export async function startModuleProcess(
   } catch (error) {
     return await finishFailedStartBeforeExecutionAuthorization(
       records,
+      options.stoppedRecordWriter,
       identity.processGenerationId,
       cgroup,
       launcher,
@@ -285,6 +289,7 @@ export async function startModuleProcess(
   if (options.stopRequested?.() === true) {
     return await finishFailedStartBeforeExecutionAuthorization(
       records,
+      options.stoppedRecordWriter,
       identity.processGenerationId,
       cgroup,
       launcher,
@@ -307,6 +312,7 @@ export async function startModuleProcess(
   } catch (error) {
     return await finishFailedStartBeforeExecutionAuthorization(
       records,
+      options.stoppedRecordWriter,
       identity.processGenerationId,
       cgroup,
       launcher,
@@ -348,6 +354,7 @@ export async function startModuleProcess(
       }
       return await finishFailedStartBeforeExecutionAuthorization(
         records,
+        options.stoppedRecordWriter,
         identity.processGenerationId,
         cgroup,
         launcher,
@@ -430,6 +437,8 @@ export type ModuleProcessStopResult =
  */
 export async function stopModuleProcess(options: {
   readonly records: ModuleProcessRecordStore;
+  /** Held only by this proof-owning lifecycle coordinator. */
+  readonly stoppedRecordWriter: ModuleProcessStoppedRecordWriter;
   readonly processGenerationId: string;
   readonly cgroup: ModuleCgroup;
   readonly timeoutMs?: number;
@@ -580,7 +589,22 @@ export async function stopModuleProcess(options: {
     };
   }
   try {
-    const record = records.updateModuleProcessRecordState(processGenerationId, "stopped");
+    if (!options.stoppedRecordWriter.isBoundTo(finalRecord)) {
+      throw new Error(
+        "the stopped-record writer is bound to a different lifecycle record store",
+      );
+    }
+    options.stoppedRecordWriter.writeStopped(processGenerationId);
+    const record = records.getModuleProcessRecord(processGenerationId);
+    if (
+      record === undefined ||
+      record.state !== "stopped" ||
+      !recordMatchesCgroup(record, processGenerationId, cgroup)
+    ) {
+      throw new Error(
+        "the stopped-record writer did not persist the terminal state in the lifecycle record store",
+      );
+    }
     return { stopped: true, record };
   } catch (error) {
     return {
@@ -615,6 +639,7 @@ function recordMatchesCgroup(
  */
 async function finishFailedStartBeforeExecutionAuthorization(
   records: ModuleProcessRecordStore,
+  stoppedRecordWriter: ModuleProcessStoppedRecordWriter,
   processGenerationId: string,
   cgroup: ModuleCgroup,
   launcher: ModuleLauncherControl,
@@ -644,7 +669,12 @@ async function finishFailedStartBeforeExecutionAuthorization(
 
   const removal = await cgroup.removeAfterLauncherExitBeforeExecutionAuthorization();
   if (removal.removed) {
-    const stoppedPersisted = markStopped(records, processGenerationId, code);
+    const stoppedPersisted = markStopped(
+      records,
+      stoppedRecordWriter,
+      processGenerationId,
+      code,
+    );
     return {
       executionAuthorized: false,
       failure: {
@@ -672,24 +702,24 @@ async function finishFailedStartBeforeExecutionAuthorization(
 }
 
 /**
- * Records a stopped state after the caller has proved that no process can
- * remain, either because process creation never began or because the launcher
- * exited before execution authorization and the empty group was removed. The
- * return value prevents a caller from treating a failed durable write as
- * completed cleanup.
+ * Records a stopped state after the launcher exited before execution
+ * authorization and the freshly observed empty group was removed. The return
+ * value prevents a caller from treating a failed durable write as completed
+ * cleanup.
  */
 function markStopped(
   records: ModuleProcessRecordStore,
+  stoppedRecordWriter: ModuleProcessStoppedRecordWriter,
   processGenerationId: string,
   failureCode: string,
 ): boolean {
   try {
-    records.updateModuleProcessRecordState(
-      processGenerationId,
-      "stopped",
-      failureCode,
-    );
-    return true;
+    const record = records.getModuleProcessRecord(processGenerationId);
+    if (record === undefined || !stoppedRecordWriter.isBoundTo(record)) {
+      return false;
+    }
+    stoppedRecordWriter.writeStopped(processGenerationId, failureCode);
+    return records.getModuleProcessRecord(processGenerationId)?.state === "stopped";
   } catch {
     // Left in its current state; recovery re-proves it before reuse.
     return false;

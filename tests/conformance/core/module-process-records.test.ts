@@ -11,11 +11,13 @@ import type {
 import {
   CoreStateError,
   FileCoreStateStore,
+  createFileCoreStateStoreWithStoppedRecordWriter,
 } from "../../../src/core/file-core-state-store.js";
 import {
   ModuleProcessRecordError,
   assertValidModuleProcessRecord,
   type ModuleProcessRecord,
+  type ModuleProcessStoppedRecordWriter,
   type ModuleSubmissionRecord,
 } from "../../../src/core/module-process-records.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
@@ -93,17 +95,33 @@ describe("CORE Module process and submission records", () => {
   let root: string;
   let path: string;
   let clock: string;
+  let stoppedRecordWriters: WeakMap<
+    FileCoreStateStore,
+    ModuleProcessStoppedRecordWriter
+  >;
 
   function openStore(prefix: string): FileCoreStateStore {
     let blockId = 0;
     let runtimeId = 0;
-    return new FileCoreStateStore({
+    const created = createFileCoreStateStoreWithStoppedRecordWriter({
       path,
       maxFailedAttempts: 3,
       nextBlockId: () => `${prefix}-block-${++blockId}`,
       nextDeliveryId: (kind) => `${prefix}-${kind}-${++runtimeId}`,
       now: () => clock,
     });
+    stoppedRecordWriters.set(created.store, created.stoppedRecordWriter);
+    return created.store;
+  }
+
+  function stoppedRecordWriterFor(
+    store: FileCoreStateStore,
+  ): ModuleProcessStoppedRecordWriter {
+    const writer = stoppedRecordWriters.get(store);
+    if (writer === undefined) {
+      throw new Error("Test fixture did not retain the store-bound stopped-record writer");
+    }
+    return writer;
   }
 
   function seedActiveClaim(
@@ -161,6 +179,7 @@ describe("CORE Module process and submission records", () => {
     root = mkdtempSync(join(tmpdir(), "dolly-module-records-"));
     path = join(root, "core-state.json");
     clock = NOW;
+    stoppedRecordWriters = new WeakMap();
   });
 
   afterEach(() => {
@@ -391,15 +410,17 @@ describe("CORE Module process and submission records", () => {
     const running = store.updateModuleProcessRecordState("process-generation-1", "running");
     expect(running).toMatchObject({ state: "running", updatedAt: LATER });
 
-    expect(() =>
-      store.updateModuleProcessRecordState("process-generation-1", "starting"),
-    ).toThrowError(
+    const updateThroughRuntime = store.updateModuleProcessRecordState.bind(store) as (
+      processGenerationId: string,
+      state: string,
+    ) => ModuleProcessRecord;
+    expect(() => updateThroughRuntime("process-generation-1", "starting")).toThrowError(
       expect.objectContaining<Partial<ModuleProcessRecordError>>({
         code: "MODULE_PROCESS_RECORD_STATE_INVALID",
       }),
     );
 
-    store.updateModuleProcessRecordState("process-generation-1", "stopped", "STOP_PROVEN");
+    stoppedRecordWriterFor(store).writeStopped("process-generation-1", "STOP_PROVEN");
     expect(store.getModuleProcessRecord("process-generation-1")).toMatchObject({
       state: "stopped",
       failureCode: "STOP_PROVEN",
@@ -411,6 +432,80 @@ describe("CORE Module process and submission records", () => {
         code: "MODULE_PROCESS_RECORD_STATE_INVALID",
       }),
     );
+  });
+
+  it("hides the stopped-record writer from direct construction and freezes the factory writer", () => {
+    let blockId = 0;
+    let runtimeId = 0;
+    const directStore = new FileCoreStateStore({
+      path,
+      maxFailedAttempts: 3,
+      nextBlockId: () => `direct-block-${++blockId}`,
+      nextDeliveryId: (kind) => `direct-${kind}-${++runtimeId}`,
+      now: () => clock,
+    });
+    expect(
+      (directStore as unknown as Record<string, unknown>).stoppedRecordWriter,
+    ).toBeUndefined();
+    expect(
+      (directStore as unknown as Record<string, unknown>).writeStopped,
+    ).toBeUndefined();
+
+    const store = openStore("factory");
+    const writer = stoppedRecordWriterFor(store);
+    expect(Object.isFrozen(writer)).toBe(true);
+
+    store.appendModuleProcessRecord(
+      processRecord({ processGenerationId: "process-generation-factory" }),
+    );
+    expect(() => writer.writeStopped("process-generation-other")).toThrowError(
+      expect.objectContaining<Partial<ModuleProcessRecordError>>({
+        code: "MODULE_PROCESS_RECORD_NOT_FOUND",
+      }),
+    );
+    expect(store.getModuleProcessRecord("process-generation-factory")).toMatchObject({
+      state: "starting",
+    });
+    const stopped = writer.writeStopped("process-generation-factory", "STOP_PROVEN");
+    expect(stopped).toMatchObject({
+      processGenerationId: "process-generation-factory",
+      state: "stopped",
+      failureCode: "STOP_PROVEN",
+    });
+    expect(
+      openStore("reopened").getModuleProcessRecord("process-generation-factory"),
+    ).toEqual(stopped);
+  });
+
+  it("rejects a generic stopped write without stop proof and preserves durable state", () => {
+    const store = openStore("first");
+    store.appendModuleProcessRecord(processRecord());
+    const beforeRevision = store.revision;
+    const beforeBytes = readFileSync(path, "utf8");
+    clock = LATER;
+
+    // Exercise the runtime boundary rather than relying only on TypeScript's
+    // call-site type. JavaScript consumers must receive the same refusal.
+    const updateThroughRuntime = store.updateModuleProcessRecordState.bind(store) as (
+      processGenerationId: string,
+      state: string,
+    ) => ModuleProcessRecord;
+    expect(() => updateThroughRuntime("process-generation-1", "stopped")).toThrowError(
+      expect.objectContaining<Partial<ModuleProcessRecordError>>({
+        code: "MODULE_PROCESS_STOP_PROOF_REQUIRED",
+      }),
+    );
+
+    expect(store.revision).toBe(beforeRevision);
+    expect(readFileSync(path, "utf8")).toBe(beforeBytes);
+    expect(store.getModuleProcessRecord("process-generation-1")).toMatchObject({
+      state: "starting",
+      updatedAt: NOW,
+    });
+    expect(openStore("reopened").getModuleProcessRecord("process-generation-1")).toMatchObject({
+      state: "starting",
+      updatedAt: NOW,
+    });
   });
 
   it("authorizes a submission record only for an exact active Claim and running process", () => {
@@ -811,7 +906,7 @@ describe("CORE Module process and submission records", () => {
     store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionForClaim(store, claim));
-    store.updateModuleProcessRecordState("process-generation-1", "stopped");
+    stoppedRecordWriterFor(store).writeStopped("process-generation-1");
 
     expect(() => store.removeModuleProcessRecord("process-generation-1")).toThrowError(
       expect.objectContaining<Partial<ModuleProcessRecordError>>({
@@ -828,7 +923,7 @@ describe("CORE Module process and submission records", () => {
     const store = openStore("first");
     const claim = seedActiveClaim(store);
     store.appendModuleProcessRecord(processRecord());
-    store.updateModuleProcessRecordState("process-generation-1", "stopped");
+    stoppedRecordWriterFor(store).writeStopped("process-generation-1");
 
     expect(() => store.removeModuleProcessRecord("process-generation-1")).toThrowError(
       expect.objectContaining<Partial<ModuleProcessRecordError>>({

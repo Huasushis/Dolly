@@ -579,6 +579,7 @@ describe("Module cgroup preparation", () => {
     expect(result.prepared).toBe(false);
     if (result.prepared) return;
     expect(result.failure.code).toBe("MODULE_CGROUP_TERMINATION_UNSUPPORTED");
+    expect(result.pathState).toBe("removed");
     expect(await fileSystem.directoryExists(modulePath())).toBe(false);
   });
 
@@ -589,6 +590,7 @@ describe("Module cgroup preparation", () => {
     expect(result.prepared).toBe(false);
     if (result.prepared) return;
     expect(result.failure.code).toBe("MODULE_CGROUP_PATH_IN_USE");
+    expect(result.pathState).toBe("unconfirmed");
     expect(await fileSystem.directoryExists(modulePath())).toBe(true);
   });
 
@@ -598,6 +600,7 @@ describe("Module cgroup preparation", () => {
     expect(result.prepared).toBe(false);
     if (result.prepared) return;
     expect(result.failure.code).toBe("MODULE_CGROUP_LIMITS_INVALID");
+    expect(result.pathState).toBe("not-created");
     expect(fileSystem.writeLog).toEqual([]);
     expect(await fileSystem.directoryExists(modulePath())).toBe(false);
   });

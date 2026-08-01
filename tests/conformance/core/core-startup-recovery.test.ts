@@ -4,8 +4,15 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type BlockProposal } from "../../../src/core/block-store.js";
 import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
-import { CoreStartupRecovery } from "../../../src/core/core-startup-recovery.js";
-import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
+import {
+  CoreStartupRecovery,
+  moduleProcessStopProofIdentityDigest,
+  type ModuleProcessStopProof,
+} from "../../../src/core/core-startup-recovery.js";
+import {
+  FileCoreStateStore,
+  createFileCoreStateStoreWithStoppedRecordWriter,
+} from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import {
@@ -13,12 +20,26 @@ import {
   ModuleResultCommitError,
   type ModuleResultCommitCoordinatorOptions,
 } from "../../../src/core/module-result-commit.js";
+import type {
+  ModuleProcessRecord,
+  ModuleProcessStoppedRecordWriter,
+} from "../../../src/core/module-process-records.js";
 
 const NOW = "2026-07-24T00:00:00.000Z";
 const PACKAGE_DIGEST = `sha256:${"a".repeat(64)}`;
 const CONFIGURATION_DIGEST = `sha256:${"b".repeat(64)}`;
 const SERVICE_INVOCATION_ID = "2812432ad29e4d3bbd6776c62cafa929";
 const BOOT_ID = "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9";
+
+const provenStopped = {
+  proveStopped: async (
+    record: ModuleProcessRecord,
+  ): Promise<ModuleProcessStopProof> => ({
+    proven: true,
+    evidence: "populated-zero",
+    recordIdentityDigest: moduleProcessStopProofIdentityDigest(record),
+  }),
+};
 
 function proposal(text: string): BlockProposal {
   return {
@@ -34,6 +55,22 @@ function openCore(
   let blockId = 0;
   let runtimeId = 0;
   return new FileCoreStateStore({
+    path,
+    maxFailedAttempts,
+    nextBlockId: () => `${prefix}-block-${++blockId}`,
+    nextDeliveryId: (kind) => `${prefix}-${kind}-${++runtimeId}`,
+    now: () => NOW,
+  });
+}
+
+function openCoreWithStoppedRecordWriter(
+  path: string,
+  prefix: string,
+  maxFailedAttempts = 3,
+) {
+  let blockId = 0;
+  let runtimeId = 0;
+  return createFileCoreStateStoreWithStoppedRecordWriter({
     path,
     maxFailedAttempts,
     nextBlockId: () => `${prefix}-block-${++blockId}`,
@@ -61,6 +98,7 @@ function coordinator(
 
 function appendStoppedProcessAndSubmission(
   core: FileCoreStateStore,
+  stoppedRecordWriter: ModuleProcessStoppedRecordWriter,
   claim: {
     readonly moduleJobId: string;
     readonly claimToken: string;
@@ -106,7 +144,7 @@ function appendStoppedProcessAndSubmission(
     inputDigest: canonicalJsonDigest(core.deliveries.inspectClaimInput(claim)),
     createdAt: NOW,
   });
-  core.updateModuleProcessRecordState(processGenerationId, "stopped");
+  stoppedRecordWriter.writeStopped(processGenerationId);
 }
 
 describe("CORE startup journal recovery", () => {
@@ -125,7 +163,10 @@ describe("CORE startup journal recovery", () => {
   });
 
   it("recovers a prepared result for an active Claim with its exact submission", async () => {
-    const first = openCore(statePath, "first");
+    const {
+      store: first,
+      stoppedRecordWriter,
+    } = openCoreWithStoppedRecordWriter(statePath, "first");
     first.deliveries.createPage("input");
     first.deliveries.createPage("output");
     first.deliveries.registerConsumer("input", "worker", "from-now");
@@ -142,7 +183,7 @@ describe("CORE startup journal recovery", () => {
       maxCount: 1,
       maxBytes: 1024 * 1024,
     })!;
-    appendStoppedProcessAndSubmission(first, claim);
+    appendStoppedProcessAndSubmission(first, stoppedRecordWriter, claim);
     const repository = new FileModuleResultCommitRepository({ path: journalPath });
     const interrupted = coordinator(first, repository, (event) => {
       if (event.phase === "after-block-effect") throw new Error("simulated interruption");
@@ -159,12 +200,17 @@ describe("CORE startup journal recovery", () => {
     })).rejects.toThrow("simulated interruption");
     expect(repository.get(claim.moduleJobId)).toMatchObject({ state: "prepared" });
 
-    const restarted = openCore(statePath, "second");
+    const {
+      store: restarted,
+      stoppedRecordWriter: restartedStoppedRecordWriter,
+    } = openCoreWithStoppedRecordWriter(statePath, "second");
     const restartedRepository = new FileModuleResultCommitRepository({ path: journalPath });
     const recovery = new CoreStartupRecovery({
       deliveries: restarted.deliveries,
       commits: coordinator(restarted, restartedRepository),
       moduleRecords: restarted,
+      stoppedRecordWriter: restartedStoppedRecordWriter,
+      processStopProver: provenStopped,
     });
     const report = await recovery.recover();
     expect(report.recoveredCommits).toHaveLength(1);
@@ -187,7 +233,10 @@ describe("CORE startup journal recovery", () => {
   });
 
   it("fails closed when a committed result journal has an active Claim", async () => {
-    const first = openCore(statePath, "first");
+    const {
+      store: first,
+      stoppedRecordWriter,
+    } = openCoreWithStoppedRecordWriter(statePath, "first");
     first.deliveries.createPage("input");
     first.deliveries.createPage("output");
     first.deliveries.registerConsumer("input", "worker", "from-now");
@@ -203,7 +252,7 @@ describe("CORE startup journal recovery", () => {
       maxCount: 1,
       maxBytes: 1024 * 1024,
     })!;
-    appendStoppedProcessAndSubmission(first, claim);
+    appendStoppedProcessAndSubmission(first, stoppedRecordWriter, claim);
     const repository = new FileModuleResultCommitRepository({ path: journalPath });
     let captured: Buffer | undefined;
     let interrupted = false;
@@ -229,12 +278,17 @@ describe("CORE startup journal recovery", () => {
     expect(repository.get(claim.moduleJobId)?.state).toBe("committed");
     writeFileSync(statePath, captured!);
 
-    const restarted = openCore(statePath, "second");
+    const {
+      store: restarted,
+      stoppedRecordWriter: restartedStoppedRecordWriter,
+    } = openCoreWithStoppedRecordWriter(statePath, "second");
     const restartedRepository = new FileModuleResultCommitRepository({ path: journalPath });
     await expect(new CoreStartupRecovery({
       deliveries: restarted.deliveries,
       commits: coordinator(restarted, restartedRepository),
       moduleRecords: restarted,
+      stoppedRecordWriter: restartedStoppedRecordWriter,
+      processStopProver: provenStopped,
     }).recover()).rejects.toMatchObject({
       code: "STARTUP_JOURNAL_CLAIM_INCONSISTENT",
     });

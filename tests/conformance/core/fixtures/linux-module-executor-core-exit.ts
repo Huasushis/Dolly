@@ -54,6 +54,15 @@ const executor = createLinuxModuleExecutor({
         return currentRecord;
       },
     },
+    stoppedRecordWriter: {
+      isBoundTo(record) {
+        return currentRecord === record;
+      },
+      writeStopped(_processGenerationId, failureCode) {
+        currentRecord = { ...currentRecord, state: "stopped", failureCode };
+        return currentRecord;
+      },
+    },
     processRecord,
     delegatedRootCgroupPath,
     identity,
