@@ -97,6 +97,11 @@ function skipReason(): string | undefined {
 }
 
 const reason = skipReason();
+if (process.env.DOLLY_LINUX_MODULE_INTEGRATION_REQUIRED === "1" && reason) {
+  throw new Error(
+    `the required real systemd integration environment is unavailable: ${reason}`,
+  );
+}
 
 /**
  * Skips at run time rather than at collection so the reporter still names the
@@ -110,6 +115,7 @@ function requireSystemd(ctx: { skip: (note?: string) => void }): void {
 async function runProbeInTransientService(
   unitSuffix: string,
   extraProperties: readonly string[],
+  expandEnvironment: "yes" | "no" = "no",
 ): Promise<ProbeOutput> {
   const unitName = `${UNIT_PREFIX}${unitSuffix}`;
   const args = [
@@ -117,6 +123,7 @@ async function runProbeInTransientService(
     "--pipe",
     "--wait",
     "--collect",
+    `--expand-environment=${expandEnvironment}`,
     `--unit=${unitName}`,
     ...COMMON_UNIT_PROPERTIES,
     ...extraProperties,
@@ -176,11 +183,34 @@ describe("Core service binding against a real systemd service", () => {
     expect(observation.delegatedRootControllers).toEqual(
       expect.arrayContaining(["cpu", "memory", "pids"]),
     );
+    expect(observation.unit.execStart).toHaveLength(1);
+    expect(observation.unit.execStart[0]!.flags).toContain("no-env-expand");
 
     // A server without user lingering is a known deployment blocker, so it is
     // the one failure this environment may still report. Nothing else may fail.
     expect(failureCodesOf(output.result!)).toEqual(
       observation.lingerEnabled === true ? [] : ["CORE_SERVICE_USER_LINGERING_DISABLED"],
+    );
+  }, 90_000);
+
+  it("rejects an ExecStart whose arguments permit environment expansion", async (ctx) => {
+    requireSystemd(ctx);
+    const output = await runProbeInTransientService(
+      "expanded",
+      ["-p", "DelegateSubgroup=core"],
+      "yes",
+    );
+    expect(output.observed).toBe(true);
+    const observation = output.observation!;
+    expect(observation.unit.execStart).toHaveLength(1);
+    expect(observation.unit.execStart[0]!.flags).not.toContain("no-env-expand");
+    expect(failureCodesOf(output.result!)).toEqual(
+      observation.lingerEnabled === true
+        ? ["CORE_SERVICE_EXEC_START_ENVIRONMENT_EXPANDED"]
+        : [
+            "CORE_SERVICE_EXEC_START_ENVIRONMENT_EXPANDED",
+            "CORE_SERVICE_USER_LINGERING_DISABLED",
+          ],
     );
   }, 90_000);
 
@@ -247,6 +277,7 @@ describe("Core service binding against a real systemd service", () => {
       "systemd-run",
       [
         "--user",
+        "--expand-environment=no",
         `--unit=${unitName}`,
         "-p",
         "Type=exec",

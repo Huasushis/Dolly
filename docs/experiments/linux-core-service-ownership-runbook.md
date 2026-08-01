@@ -39,8 +39,9 @@ restart the service manager, end login sessions, and reboot the machine.
 
 - **Linux kernel 5.15 or newer**, pinned for the run. `cgroup.kill` needs 5.14; the manifest
   records the exact release.
-- **systemd 251 or newer**, pinned for the run. `DelegateSubgroup` needs 251 and `ExitType` needs
-  249, and ADR 0009 requires both.
+- **systemd 254 or newer**, pinned for the run. `DelegateSubgroup`, `RestartMode`, and
+  `systemd-run --expand-environment=` first appear in 254; `ExitType` needs 249, and ADR 0009
+  requires all four behaviors.
 - **Control group version 2** mounted at `/sys/fs/cgroup`, with explicit delegation.
 - **`cpu`, `memory`, and `pids` controllers** delegable, because the required limits are written
   into the delegated groups and read back.
@@ -166,11 +167,19 @@ test runner. It may be repeated, but it cannot be combined with options passed t
 experiment, including its selection filters. Wrapper options such as `--base` and `--keep` remain
 available in either mode.
 
-Both modes record `source-commit.txt`, `source-status.txt`, `command.txt`, and `environment.txt` in
-the invocation's artifact directory. The repository source and installed dependencies are mounted
-read-only. The temporary working tree contains links to those read-only inputs, while
-`node_modules/.vite-temp` is writable because the test runner needs to create Vite's temporary
-files there.
+Both modes record `source-commit.txt`, `source-status.txt`, `source-snapshot.txt`, `command.txt`,
+`preflight.txt`, and `environment.txt` in the invocation's artifact directory. The wrapper archives
+the exact `HEAD` commit to a unique temporary snapshot; dirty, ignored, and untracked checkout files
+are therefore never test inputs, and it never mounts the checkout itself, `.git`, or owner files
+such as `.env`. That snapshot and the installed dependencies are mounted read-only.
+The container uses a new non-root account with no supplementary groups. Before running any test or
+hostile fixture, the wrapper proves that the source and dependencies are readable but not writable,
+the private checkout files are absent, and only `node_modules/.vite-temp` plus the invocation's
+artifact directory are writable. A controlled `node_modules` link inside the snapshot points to
+that ephemeral dependency view so Node resolution follows no host checkout path. The temporary
+snapshot is removed by its exact recorded path only after the exact container is removed; `--keep`
+and a lost terminal retain both. Required Linux integration mode turns any unavailable prerequisite
+into a collection failure, so an all-skipped file cannot be reported as a passing run.
 
 **Use `--base` when the default base image cannot be resolved.** On a network where
 `registry-1.docker.io` does not resolve, the run fails during the image build with
