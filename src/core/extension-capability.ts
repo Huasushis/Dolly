@@ -52,6 +52,10 @@ export interface ExtensionCapabilityInvocation {
   readonly arguments: JsonValue;
   readonly moduleJobId?: string;
   readonly runId?: string;
+  /** Host-verified attempt number for the active Run; never extension authority. */
+  readonly attempt?: number;
+  /** Host-verified absolute deadline for the active Run. */
+  readonly deadline?: string;
   readonly idempotencyKey?: string;
 }
 
@@ -63,6 +67,8 @@ export interface ExtensionCapabilityInvocationContext {
   readonly resourceScope: JsonValue;
   readonly moduleJobId?: string;
   readonly runId?: string;
+  readonly attempt?: number;
+  readonly deadline?: string;
   readonly idempotencyKey?: string;
   readonly signal: AbortSignal;
 }
@@ -336,6 +342,32 @@ export class ExtensionCapabilityAuthority {
       if (invocation.moduleJobId !== undefined) assertId(invocation.moduleJobId, "moduleJobId");
       if (invocation.runId !== undefined) assertId(invocation.runId, "runId");
     }
+    if (invocation.attempt !== undefined) {
+      if (
+        invocation.moduleJobId === undefined ||
+        invocation.runId === undefined ||
+        !Number.isSafeInteger(invocation.attempt) ||
+        invocation.attempt <= 0
+      ) {
+        throw new ExtensionCapabilityError(
+          "CAPABILITY_SCOPE_MISMATCH",
+          "Capability attempt does not identify a valid active Run",
+        );
+      }
+    }
+    if (invocation.deadline !== undefined) {
+      if (
+        invocation.moduleJobId === undefined ||
+        invocation.runId === undefined ||
+        invocation.attempt === undefined
+      ) {
+        throw new ExtensionCapabilityError(
+          "CAPABILITY_SCOPE_MISMATCH",
+          "Capability deadline does not identify a complete active Run",
+        );
+      }
+      canonicalTime(invocation.deadline, "deadline");
+    }
     if (record.grant.requireIdempotencyKey === true) {
       assertId(invocation.idempotencyKey, "idempotencyKey");
     } else if (invocation.idempotencyKey !== undefined) {
@@ -362,7 +394,6 @@ export class ExtensionCapabilityAuthority {
       operation: invocation.operation,
       arguments: argumentsValue,
       ...(invocation.moduleJobId === undefined ? {} : { moduleJobId: invocation.moduleJobId }),
-      ...(invocation.runId === undefined ? {} : { runId: invocation.runId }),
     });
     this.#assertActiveSession(session);
     if (record.revoked) {
@@ -397,8 +428,15 @@ export class ExtensionCapabilityAuthority {
     }
 
     const controller = new AbortController();
-    const operation = session[TRACK_IN_FLIGHT_INVOCATION](controller, () =>
-      this.#execute(session, record, invocation, argumentsValue, controller.signal),
+    const operation = session[TRACK_IN_FLIGHT_INVOCATION](
+      controller,
+      {
+        ...(invocation.moduleJobId === undefined
+          ? {}
+          : { moduleJobId: invocation.moduleJobId }),
+        ...(invocation.runId === undefined ? {} : { runId: invocation.runId }),
+      },
+      () => this.#execute(session, record, invocation, argumentsValue, controller.signal),
     );
     record.invocations += 1;
     record.concurrent += 1;
@@ -451,6 +489,8 @@ export class ExtensionCapabilityAuthority {
           ? {}
           : { moduleJobId: invocation.moduleJobId }),
         ...(invocation.runId === undefined ? {} : { runId: invocation.runId }),
+        ...(invocation.attempt === undefined ? {} : { attempt: invocation.attempt }),
+        ...(invocation.deadline === undefined ? {} : { deadline: invocation.deadline }),
         ...(invocation.idempotencyKey === undefined
           ? {}
           : { idempotencyKey: invocation.idempotencyKey }),
@@ -554,7 +594,14 @@ export class ExtensionCapabilityAuthority {
 export class ExtensionCapabilitySession {
   #closed = false;
   #closePromise?: Promise<void>;
-  readonly #inFlightInvocations = new Map<Promise<JsonValue>, AbortController>();
+  readonly #inFlightInvocations = new Map<
+    Promise<JsonValue>,
+    {
+      readonly controller: AbortController;
+      readonly moduleJobId?: string;
+      readonly runId?: string;
+    }
+  >();
 
   constructor(
     private readonly authority: ExtensionCapabilityAuthority,
@@ -582,6 +629,7 @@ export class ExtensionCapabilitySession {
 
   [TRACK_IN_FLIGHT_INVOCATION](
     controller: AbortController,
+    scope: { readonly moduleJobId?: string; readonly runId?: string },
     execute: () => Promise<JsonValue>,
   ): Promise<JsonValue> {
     if (this.#closed) {
@@ -591,12 +639,34 @@ export class ExtensionCapabilitySession {
       );
     }
     const operation = Promise.resolve().then(execute);
-    this.#inFlightInvocations.set(operation, controller);
+    this.#inFlightInvocations.set(operation, { controller, ...scope });
     void operation.then(
       () => this.#inFlightInvocations.delete(operation),
       () => this.#inFlightInvocations.delete(operation),
     );
     return operation;
+  }
+
+  /**
+   * Revokes the current authorization for one Run without destroying handles
+   * that a long-lived Module may use in a later Run.
+   */
+  cancelExecution(scope: ExtensionExecutionScope): void {
+    assertId(scope.moduleJobId, "moduleJobId");
+    assertId(scope.runId, "runId");
+    const reason = new ExtensionCapabilityError(
+      "CAPABILITY_REVOKED",
+      "Capability authorization for the Run was revoked",
+    );
+    for (const invocation of this.#inFlightInvocations.values()) {
+      if (
+        invocation.moduleJobId === scope.moduleJobId &&
+        invocation.runId === scope.runId &&
+        !invocation.controller.signal.aborted
+      ) {
+        invocation.controller.abort(reason);
+      }
+    }
   }
 
   close(): Promise<void> {
@@ -613,8 +683,8 @@ export class ExtensionCapabilitySession {
       "CAPABILITY_SESSION_CLOSED",
       "Extension capability session is closed",
     );
-    for (const [, controller] of inFlight) {
-      if (!controller.signal.aborted) controller.abort(reason);
+    for (const [, invocation] of inFlight) {
+      if (!invocation.controller.signal.aborted) invocation.controller.abort(reason);
     }
     void Promise.allSettled(inFlight.map(([operation]) => operation)).then(() => resolveClose());
     return close;

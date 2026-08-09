@@ -287,6 +287,32 @@ describe("extension capability session authority", () => {
     ).rejects.toMatchObject({ code: "CAPABILITY_SCOPE_MISMATCH" });
   });
 
+  it("deduplicates one stable Module-job effect across retry Runs", async () => {
+    const broker = authority();
+    const session = broker.openSession(identity("session-a"));
+    const handler = vi.fn(async () => ({ value: "once" }));
+    const handle = session.issue(grant({ requireIdempotencyKey: true }), handler);
+    const first = {
+      handle,
+      operation: "read",
+      arguments: { key: "one" },
+      moduleJobId: "module-job-a",
+      runId: "run-a",
+      attempt: 1,
+      idempotencyKey: "module-job-a-effect-one",
+    } as const;
+
+    await expect(session.invoke(first)).resolves.toEqual({ value: "once" });
+    await expect(
+      session.invoke({ ...first, runId: "run-b", attempt: 2 }),
+    ).resolves.toEqual({ value: "once" });
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    await expect(
+      session.invoke({ ...first, moduleJobId: "module-job-b", runId: "run-c" }),
+    ).rejects.toMatchObject({ code: "CAPABILITY_SCOPE_MISMATCH" });
+  });
+
   it("revokes in-flight observability and sanitizes dependency failures", async () => {
     const broker = authority();
     const session = broker.openSession(identity("session-a"));

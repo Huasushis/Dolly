@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { spawn } from "node:child_process";
 
@@ -50,7 +50,15 @@ async function probeSubprocess() {
   return code === 0;
 }
 
-async function invokeCapability(handle, operation = "read") {
+async function invokeCapability(
+  handle,
+  operation = "read",
+  executionScope = {
+    moduleJobId: "module-job-capability",
+    runId: "run-capability",
+    idempotencyKey: "fixture-effect",
+  },
+) {
   return request("capability.invoke", {
     protocolVersion,
     sessionId: initialized.sessionId,
@@ -59,9 +67,9 @@ async function invokeCapability(handle, operation = "read") {
     arguments: { key: "fixture-key" },
     ...(mode === "old-module-job-field"
       ? { processingId: "module-job-capability" }
-      : { moduleJobId: "module-job-capability" }),
-    ...(mode === "capability-missing-run-id" ? {} : { runId: "run-capability" }),
-    idempotencyKey: "fixture-effect",
+      : { moduleJobId: executionScope.moduleJobId }),
+    ...(mode === "capability-missing-run-id" ? {} : { runId: executionScope.runId }),
+    idempotencyKey: executionScope.idempotencyKey,
   });
 }
 
@@ -233,6 +241,7 @@ async function handleHostRequest(message) {
     }
     if (
       mode === "capability" ||
+      mode === "capability-active-run" ||
       mode === "stale-capability" ||
       mode === "old-module-job-field" ||
       mode === "capability-missing-run-id"
@@ -241,7 +250,17 @@ async function handleHostRequest(message) {
         mode === "stale-capability"
           ? initialized.config.staleHandle
           : initialized.capabilities[0].handle;
-      const capabilityResponse = await invokeCapability(handle);
+      const capabilityResponse = await invokeCapability(
+        handle,
+        "read",
+        mode === "capability-active-run"
+          ? {
+              moduleJobId: params.moduleJobId,
+              runId: params.runId,
+              idempotencyKey: `${params.moduleJobId}-fixture-effect`,
+            }
+          : undefined,
+      );
       respond(id, {
         protocolVersion,
         sessionId: params.sessionId,
@@ -250,6 +269,32 @@ async function handleHostRequest(message) {
         runId: params.runId,
         result: capabilityErrorCodeOf(capabilityResponse),
       });
+      return;
+    }
+    if (mode === "capability-result-before-effect") {
+      const capabilityResponse = invokeCapability(
+        initialized.capabilities[0].handle,
+        "read",
+        {
+          moduleJobId: params.moduleJobId,
+          runId: params.runId,
+          idempotencyKey: `${params.moduleJobId}-fixture-effect`,
+        },
+      );
+      const markerPath = initialized.config.capabilityStartedMarkerPath;
+      for (let attempt = 0; attempt < 200 && !existsSync(markerPath); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      if (!existsSync(markerPath)) throw new Error("capability handler did not start");
+      respond(id, {
+        protocolVersion,
+        sessionId: params.sessionId,
+        moduleId: params.moduleId,
+        moduleGenerationId: params.moduleGenerationId,
+        runId: params.runId,
+        result: { respondedBeforeCapability: true },
+      });
+      await capabilityResponse;
       return;
     }
     respond(id, {

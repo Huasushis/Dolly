@@ -154,6 +154,79 @@ const ONE_MESSAGE = {
 };
 
 describe("Extension model operation capability", () => {
+  it("binds one reusable handle to each host-verified active Run", async () => {
+    let handleSeed = 0;
+    const authority = new ExtensionCapabilityAuthority({
+      now: () => NOW,
+      nextHandle: () => Buffer.alloc(32, (handleSeed += 1)).toString("base64url"),
+    });
+    const session = authority.openSession(IDENTITY);
+    const invoke = vi.fn(async (invocation: ChatBrokerInvocation) => succeededChat(invocation));
+    const definition = createModelOperationCapability({
+      descriptor: chatRef(),
+      ownerScope: "owner-1",
+      budgets: BUDGETS,
+      executionScope: "active-run",
+      expiresAt: EXPIRES_AT,
+      now: () => NOW,
+      chat: { invoke },
+    });
+    const handle = session.issue(definition.grant, definition.handler);
+
+    expect(definition.grant.executionScope).toBeUndefined();
+    expect(definition.grant.resourceScope).toMatchObject({
+      executionScope: "active-run",
+    });
+
+    await session.invoke({
+      handle,
+      operation: "chat",
+      arguments: ONE_MESSAGE,
+      moduleJobId: "module-job-a",
+      runId: "run-a",
+      attempt: 1,
+      deadline: "2026-07-26T00:00:10.000Z",
+    });
+    await session.invoke({
+      handle,
+      operation: "chat",
+      arguments: ONE_MESSAGE,
+      moduleJobId: "module-job-b",
+      runId: "run-b",
+      attempt: 2,
+      deadline: "2026-07-26T00:00:20.000Z",
+    });
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke.mock.calls.map(([invocation]) => invocation.context)).toEqual([
+      expect.objectContaining({
+        operationId: "module-job-a",
+        moduleJobId: "module-job-a",
+        runId: "run-a",
+        attempt: 1,
+      }),
+      expect.objectContaining({
+        operationId: "module-job-b",
+        moduleJobId: "module-job-b",
+        runId: "run-b",
+        attempt: 2,
+      }),
+    ]);
+
+    await expect(
+      session.invoke({
+        handle,
+        operation: "chat",
+        arguments: ONE_MESSAGE,
+        moduleJobId: "module-job-c",
+        runId: "run-c",
+      }),
+    ).rejects.toMatchObject({ code: "CAPABILITY_SCOPE_MISMATCH" });
+    await expect(
+      session.invoke({ handle, operation: "describe", arguments: {} }),
+    ).rejects.toMatchObject({ code: "CAPABILITY_SCOPE_MISMATCH" });
+  });
+
   it("binds one descriptor and builds the invocation identity from the session", async () => {
     const invoke = vi.fn(async (invocation: ChatBrokerInvocation) => succeededChat(invocation));
     const descriptor = chatRef();

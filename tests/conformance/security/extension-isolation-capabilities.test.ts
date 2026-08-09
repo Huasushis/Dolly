@@ -543,6 +543,127 @@ describe("Extension process isolation and capability checks", () => {
     }
   });
 
+  it("binds one process-lifetime capability handle to each current Run", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-active-run-capability-"));
+    const host = createHost("capability-active-run", scratch);
+    const observed: Array<{ moduleJobId?: string; runId?: string; attempt?: number }> = [];
+    host.grantCapability(
+      {
+        capabilityType: "private-storage",
+        capabilityVersion: "v1",
+        operations: ["read"],
+        resourceScope: { descriptor: "fixture-model", executionScope: "active-run" },
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        maxInvocations: 2,
+        maxConcurrentInvocations: 1,
+        maxArgumentBytes: 256,
+        maxResultBytes: 256,
+        requireIdempotencyKey: true,
+      },
+      async (_argumentsValue, context) => {
+        observed.push({
+          moduleJobId: context.moduleJobId,
+          runId: context.runId,
+          attempt: (context as typeof context & { attempt?: number }).attempt,
+        });
+        return { fromHost: true };
+      },
+    );
+
+    try {
+      await host.start();
+      await expect(host.execute(execution())).resolves.toEqual({ fromHost: true });
+      await expect(
+        host.execute({
+          ...execution(),
+          moduleJobId: "module-job-b",
+          runId: "run-b",
+          attempt: 2,
+        }),
+      ).resolves.toEqual({ fromHost: true });
+      expect(observed).toEqual([
+        { moduleJobId: "module-job-a", runId: "run-a", attempt: 1 },
+        { moduleJobId: "module-job-b", runId: "run-b", attempt: 2 },
+      ]);
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a Module result while one of that Run's capabilities is still active", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-result-before-capability-"));
+    const capabilityStartedMarkerPath = join(scratch, "capability-started");
+    const host = createHost("capability-result-before-effect", scratch, {
+      config: { capabilityStartedMarkerPath },
+    });
+    let handlerStarted = false;
+    let handlerAborted = false;
+    const finishHandler = deferred<{ fromHost: boolean }>();
+    host.grantCapability(
+      {
+        capabilityType: "private-storage",
+        capabilityVersion: "v1",
+        operations: ["read"],
+        resourceScope: { descriptor: "fixture-model" },
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        maxInvocations: 1,
+        maxConcurrentInvocations: 1,
+        maxArgumentBytes: 256,
+        maxResultBytes: 256,
+        requireIdempotencyKey: true,
+      },
+      async (_argumentsValue, context) => {
+        handlerStarted = true;
+        context.signal.addEventListener(
+          "abort",
+          () => {
+            handlerAborted = true;
+          },
+          { once: true },
+        );
+        writeFileSync(capabilityStartedMarkerPath, "started", "utf8");
+        return finishHandler.promise;
+      },
+    );
+
+    try {
+      await host.start();
+      const result = host.execute(execution()).then(
+        (value) => ({ status: "succeeded" as const, value }),
+        (error: unknown) => ({ status: "failed" as const, error }),
+      );
+      await vi.waitFor(() => expect(handlerStarted).toBe(true), {
+        timeout: 1_000,
+        interval: 5,
+      });
+      await vi.waitFor(() => expect(handlerAborted).toBe(true), {
+        timeout: 1_000,
+        interval: 5,
+      });
+      finishHandler.resolve({ fromHost: true });
+      const boundedResult = Promise.race([
+        result,
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(
+            () => reject(new Error(`Module result did not settle from ${host.snapshot.state}`)),
+            3_000,
+          );
+        }),
+      ]);
+      await expect(boundedResult).resolves.toEqual({
+        status: "failed",
+        error: expect.any(ModuleExecutorTerminatedError),
+      });
+      expect(host.snapshot.state).toBe("stopped");
+    } finally {
+      finishHandler.resolve({ fromHost: true });
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("rejects Module job and Run identifiers that do not match the active Run", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-forged-run-identifiers-"));
     const host = createHost("capability", scratch);

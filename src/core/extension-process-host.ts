@@ -399,7 +399,10 @@ interface PendingRequest {
 interface ActiveRun {
   readonly moduleJobId: string;
   readonly runId: string;
+  readonly attempt: number;
+  readonly deadline: string;
   readonly requestId: string;
+  acceptingCapabilities: boolean;
   cancellationSent: boolean;
 }
 
@@ -1014,7 +1017,10 @@ export class ExtensionProcessHost {
           this.#activeRun = {
             moduleJobId: invocation.moduleJobId,
             runId: invocation.runId,
+            attempt: invocation.attempt,
+            deadline: invocation.deadline,
             requestId: id,
+            acceptingCapabilities: true,
             cancellationSent: false,
           };
         },
@@ -1081,6 +1087,11 @@ export class ExtensionProcessHost {
     if (!active || active.runId !== runId) return "not-active";
     if (active.cancellationSent) return "already-sent";
     active.cancellationSent = true;
+    active.acceptingCapabilities = false;
+    this.#capabilitySession.cancelExecution({
+      moduleJobId: active.moduleJobId,
+      runId: active.runId,
+    });
     try {
       await this.#channel!.send({
         jsonrpc: "2.0",
@@ -1343,6 +1354,24 @@ export class ExtensionProcessHost {
       }
       const pending = this.#pending.get(message.id);
       if (!pending) return;
+      if (pending.method === "module.execute") {
+        const active = this.#activeRun;
+        if (!active || active.requestId !== pending.id) {
+          throw new ExtensionProcessHostError(
+            "EXTENSION_PROCESS_PROTOCOL_VIOLATION",
+            "Module result does not belong to the active Run",
+          );
+        }
+        // Close admission at the response frame, before any promise
+        // continuation can race a capability handler to completion.
+        active.acceptingCapabilities = false;
+        if (this.#activeCapabilityRequests !== 0) {
+          throw new ExtensionProcessHostError(
+            "EXTENSION_PROCESS_PROTOCOL_VIOLATION",
+            "Extension returned a Module result before its capability requests settled",
+          );
+        }
+      }
       if (message.error !== undefined) {
         clearTimeout(pending.timer);
         this.#pending.delete(message.id);
@@ -1384,7 +1413,11 @@ export class ExtensionProcessHost {
     // scope mismatch. Architecture Decision Record 0009 depends on this: the
     // absence of a Module submission record may mean no Core-mediated
     // external effect was authorized for that Run.
-    if (this.#state !== "executing" || !this.#activeRun) {
+    if (
+      this.#state !== "executing" ||
+      !this.#activeRun ||
+      !this.#activeRun.acceptingCapabilities
+    ) {
       await this.#sendRpcError(
         id,
         "CAPABILITY_SCOPE_MISMATCH",
@@ -1442,6 +1475,8 @@ export class ExtensionProcessHost {
         arguments: paramsValue.arguments as JsonValue,
         moduleJobId: active.moduleJobId,
         runId: active.runId,
+        attempt: active.attempt,
+        deadline: active.deadline,
         ...(paramsValue.idempotencyKey === undefined
           ? {}
           : { idempotencyKey: paramsValue.idempotencyKey as string }),

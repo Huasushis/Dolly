@@ -82,6 +82,8 @@ export interface ModelOperationLimits {
   readonly maxResultBytes: number;
   /** Ceiling on invocations for the whole capability session. */
   readonly maxInvocations: number;
+  /** Ceiling on provider dispatches attributable to one Run. */
+  readonly maxInvocationsPerRun: number;
   /** Ceiling on invocations inside one sliding rate window. */
   readonly maxInvocationsPerWindow: number;
   readonly rateWindowMs: number;
@@ -96,6 +98,7 @@ export const DEFAULT_MODEL_OPERATION_LIMITS: ModelOperationLimits = deepFreeze({
   maxArgumentBytes: 128 * 1_024,
   maxResultBytes: 128 * 1_024,
   maxInvocations: 64,
+  maxInvocationsPerRun: 8,
   maxInvocationsPerWindow: 8,
   rateWindowMs: 60_000,
 });
@@ -124,7 +127,11 @@ export interface ModelOperationCapabilityOptions {
   /** Upper-level retry number of the Module work, not a provider dispatch count. */
   readonly attempt?: number;
   readonly budgets: ModelInvocationBudgets;
-  readonly executionScope: ExtensionExecutionScope;
+  /**
+   * Either pins the handle to one exact Run or explicitly authorizes reuse by
+   * this Module process while the host has a verified active Run.
+   */
+  readonly executionScope: ExtensionExecutionScope | "active-run";
   readonly expiresAt: string;
   readonly now: () => string;
   readonly chat?: ChatModelBrokerPort;
@@ -255,13 +262,26 @@ export function createModelOperationCapability(
   }
   const descriptor = deepFreeze({ ...options.descriptor });
   const modality: ModelModality = MODALITY_BY_DESCRIPTOR_OPERATION[descriptor.operation];
-  const moduleJobId = assertHostIdentifier(options.executionScope.moduleJobId, "moduleJobId");
-  const runId = assertHostIdentifier(options.executionScope.runId, "runId");
+  const grantScope = options.executionScope !== "active-run"
+    ? {
+        moduleJobId: assertHostIdentifier(options.executionScope.moduleJobId, "moduleJobId"),
+        runId: assertHostIdentifier(options.executionScope.runId, "runId"),
+      }
+    : undefined;
   const ownerScope = assertHostIdentifier(options.ownerScope, "ownerScope");
-  const operationId = assertHostIdentifier(options.operationId ?? moduleJobId, "operationId");
-  const attempt = options.attempt ?? 1;
-  if (!Number.isSafeInteger(attempt) || attempt <= 0) {
+  const configuredOperationId =
+    options.operationId === undefined
+      ? undefined
+      : assertHostIdentifier(options.operationId, "operationId");
+  const configuredAttempt = options.attempt ?? (grantScope === undefined ? undefined : 1);
+  if (
+    configuredAttempt !== undefined &&
+    (!Number.isSafeInteger(configuredAttempt) || configuredAttempt <= 0)
+  ) {
     throw configError("Model operation attempt must be a positive safe integer");
+  }
+  if (grantScope === undefined && configuredAttempt !== undefined) {
+    throw configError("A reusable model handle takes its attempt from the active Run");
   }
 
   const available: readonly ModelOperationName[] = [modality, "describe"];
@@ -296,7 +316,8 @@ export function createModelOperationCapability(
   let requestSequence = 0;
   const nextRequestId =
     options.nextRequestId ??
-    (() => `${operationId}-model-request-${(requestSequence += 1).toString(10)}`);
+    (() =>
+      `${configuredOperationId ?? grantScope?.moduleJobId ?? "model-operation"}-model-request-${(requestSequence += 1).toString(10)}`);
 
   const grant: ExtensionCapabilityGrant = {
     capabilityType: MODEL_OPERATION_CAPABILITY_TYPE,
@@ -316,7 +337,9 @@ export function createModelOperationCapability(
       },
       modality,
       ownerScope,
-      moduleJobId,
+      ...(grantScope === undefined
+        ? { executionScope: "active-run" }
+        : { moduleJobId: grantScope.moduleJobId }),
       reasoningPolicies: [...reasoningPolicies],
       roles: [...roles],
       limits: { ...limits },
@@ -326,11 +349,22 @@ export function createModelOperationCapability(
     maxConcurrentInvocations: options.maxConcurrentInvocations ?? 1,
     maxArgumentBytes: limits.maxArgumentBytes,
     maxResultBytes: limits.maxResultBytes,
-    executionScope: { moduleJobId, runId },
+    ...(grantScope === undefined ? {} : { executionScope: grantScope }),
     ...(options.requireIdempotencyKey === true ? { requireIdempotencyKey: true } : {}),
   };
 
   const rateWindow: number[] = [];
+  const invocationsByRun = new Map<string, number>();
+  const consumeRunSlot = (scope: ExtensionExecutionScope): void => {
+    const key = `${scope.moduleJobId}\u0000${scope.runId}`;
+    const used = invocationsByRun.get(key) ?? 0;
+    if (used >= limits.maxInvocationsPerRun) {
+      throw modelQuota("MODEL_RATE_LIMITED", "Model operation Run limit reached", {
+        maxInvocationsPerRun: limits.maxInvocationsPerRun,
+      });
+    }
+    invocationsByRun.set(key, used + 1);
+  };
   const consumeRateSlot = (): void => {
     const stamp = monotonicNow();
     if (!Number.isFinite(stamp)) {
@@ -351,10 +385,26 @@ export function createModelOperationCapability(
     rateWindow.push(stamp);
   };
 
+  const resolveInvocationExecution = (
+    context: ExtensionCapabilityInvocationContext,
+  ): { readonly scope: ExtensionExecutionScope; readonly attempt: number } => {
+    const scope = resolveExecutionScope(grantScope, context);
+    const attempt = configuredAttempt ?? context.attempt;
+    if (attempt === undefined || !Number.isSafeInteger(attempt) || attempt <= 0) {
+      throw new ExtensionCapabilityError(
+        "CAPABILITY_SCOPE_MISMATCH",
+        "Model operation requires the host-verified active Run attempt",
+      );
+    }
+    return { scope, attempt };
+  };
+
   const buildContext = (
     context: ExtensionCapabilityInvocationContext,
+    execution: { readonly scope: ExtensionExecutionScope; readonly attempt: number },
   ): ModelInvocationContext => {
-    const scope = resolveExecutionScope({ moduleJobId, runId }, context);
+    const { scope, attempt } = execution;
+    const operationId = configuredOperationId ?? scope.moduleJobId;
     const startedMs = Date.parse(now());
     if (!Number.isFinite(startedMs)) {
       throw new ExtensionCapabilityError(
@@ -364,7 +414,24 @@ export function createModelOperationCapability(
     }
     // The deadline is host arithmetic over the granted wall-time budget; an
     // extension can neither extend it nor observe the provider timeout.
-    const deadline = new Date(startedMs + budgets.maxWallTimeMs).toISOString();
+    const grantedDeadlineMs = startedMs + budgets.maxWallTimeMs;
+    const runDeadlineMs =
+      grantScope === undefined && context.deadline !== undefined
+        ? Date.parse(context.deadline)
+        : grantedDeadlineMs;
+    if (!Number.isFinite(runDeadlineMs)) {
+      throw new ExtensionCapabilityError(
+        "CAPABILITY_SCOPE_MISMATCH",
+        "Model operation active Run deadline is invalid",
+      );
+    }
+    if (grantScope === undefined && context.deadline === undefined) {
+      throw new ExtensionCapabilityError(
+        "CAPABILITY_SCOPE_MISMATCH",
+        "Model operation requires the host-verified active Run deadline",
+      );
+    }
+    const deadline = new Date(Math.min(grantedDeadlineMs, runDeadlineMs)).toISOString();
     return {
       operationId,
       instanceId: context.identity.instanceId,
@@ -561,6 +628,10 @@ export function createModelOperationCapability(
     context: ExtensionCapabilityInvocationContext,
   ): Promise<JsonValue> => {
     const operation = context.operation as ModelOperationName;
+    // Even read-only description is available only inside the Run explicitly
+    // selected by this grant. This keeps "active-run" executable policy, not
+    // merely descriptive metadata in resourceScope.
+    const execution = resolveInvocationExecution(context);
     if (!enabled.has(operation)) {
       throw modelDenied(
         "MODEL_OPERATION_DENIED",
@@ -587,6 +658,7 @@ export function createModelOperationCapability(
           maxInputItems: budgets.maxInputItems,
           maxOutputBytes: budgets.maxOutputBytes,
           maxWallTimeMs: budgets.maxWallTimeMs,
+          maxInvocationsPerRun: limits.maxInvocationsPerRun,
           ...(grantedMaxOutputTokens === undefined
             ? {}
             : { maxOutputTokens: grantedMaxOutputTokens }),
@@ -617,11 +689,12 @@ export function createModelOperationCapability(
       );
     }
 
-    const invocationContext = buildContext(context);
+    const invocationContext = buildContext(context, execution);
     const requestId = assertHostIdentifier(nextRequestId(), "requestId");
 
     if (operation === "chat") {
       const prepared = chatArguments(argumentsValue);
+      consumeRunSlot(execution.scope);
       consumeRateSlot();
       const result = await options.chat!.invoke(
         {
@@ -668,6 +741,7 @@ export function createModelOperationCapability(
     }
 
     const input = embeddingArguments(argumentsValue);
+    consumeRunSlot(execution.scope);
     consumeRateSlot();
     const result = await options.embedding!.invoke(
       {
