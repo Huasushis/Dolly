@@ -1,0 +1,676 @@
+{
+  "$schema": "./schema-v1.json",
+  "schemaVersion": "dolly-experiment-preregistration/v1",
+  "experimentId": "memory-association-task-switch-v0",
+  "experimentVersion": 9,
+  "title": "Memory representations and repeated positional association in an interrupted-task Agent pilot",
+  "status": "frozen-before-first-run",
+  "scope": "exploratory-component",
+  "protocol": {
+    "path": "docs/experiments/protocol.md",
+    "sha256": "1a2934531fbe052662464f6a0d3b2fd531b3d7904daa431810a1db979683fafe"
+  },
+  "authorityReferences": [
+    ".qoder/specs/dolly_owner_addendum_20260801.txt",
+    "AGENTS.md",
+    "docs/spec/memory-extension.md sections 10 and 17",
+    "src/extensions/memory/index.ts",
+    "src/extensions/memory/records.ts",
+    "src/extensions/memory/retrieval.ts",
+    "https://hermes-agent.nousresearch.com/docs/user-guide/features/memory",
+    "https://github.com/NousResearch/hermes-agent/blob/826bf9b6d865b11bfedfca14bd35c563f07a8a66/tools/session_search_tool.py",
+    "https://docs.letta.com/guides/core-concepts/memory/context-hierarchy",
+    "https://docs.mem0.ai/open-source/features/graph-memory",
+    "https://arxiv.org/abs/2501.13956",
+    "https://arxiv.org/abs/2504.19413"
+  ],
+  "definitions": {
+    "capability probe": "A standalone experiment that measures a candidate mechanism without connecting it to Dolly's runtime or claiming supported product behavior.",
+    "Agent pilot": "A bounded live-model fixture in which one general task prompt receives an interrupted conversation and one condition-specific memory evidence packet, then returns a structured continuation; it is not Dolly's product Agent.",
+    "task-resume success": "The live Agent identifies the original task, returns the exact latest next action, idempotency key, and retention duration, cites the expected checkpoint and constraint records, and cites none of the declared unrelated records.",
+    "repeated positional association": "A term-pair statistic admitted only when the terms occur in records no more than two positions apart in at least two distinct episodes; it is association evidence, not causal evidence.",
+    "learning": "A post-exposure step that builds association statistics and, for the live fixture, asks the same model to produce a cited task checkpoint, extractive summary, reusable procedure, and durable task fact from records that precede the resume cue.",
+    "active-context clearing": "Replacing active conversation context with only the interrupting task's two messages and the later resume cue while earlier task records remain available solely through the selected memory condition."
+  },
+  "question": "On frozen synthetic interrupted-task cases, which combination of content retrieval, repeated position-aware co-occurrence, temporal neighbours, an explicit task checkpoint, an extractive summary, a reusable procedure, and a durable prompt lets a live qwen3.6-27b Agent recover and continue the task after active-context clearing, and does the after-learning result improve by at least 0.20 absolute over the same before-learning cases without increasing unrelated-record use by more than 0.05?",
+  "hypotheses": {
+    "primary": [
+      {
+        "id": "h1-live-combined-versus-content",
+        "statement": "After learning, the combined memory condition improves live task-resume success over normalized-content evidence alone by at least 0.20 absolute on the live pilot seeds.",
+        "outcomeMeasure": "agent_task_resume_success"
+      },
+      {
+        "id": "h2-live-learning",
+        "statement": "For the combined memory condition, after-learning live task-resume success exceeds before-learning success by at least 0.20 absolute on identical pilot cases.",
+        "outcomeMeasure": "agent_learning_gain"
+      },
+      {
+        "id": "h3-local-position-recurrence",
+        "statement": "In the deterministic mechanism study, repeated positional association improves task-resume evidence sufficiency over normalized-content retrieval by at least 0.20 absolute on evaluation seeds.",
+        "outcomeMeasure": "local_evidence_success"
+      },
+      {
+        "id": "h4-position-negative-controls",
+        "statement": "The repeated positional condition exceeds both position-shuffled and no-position conditions by at least 0.10 absolute local evidence success after learning.",
+        "outcomeMeasure": "position_control_gain"
+      },
+      {
+        "id": "h5-recurrence-ablation",
+        "statement": "The repeated positional condition exceeds the single-observation condition by at least 0.10 absolute local evidence success after learning.",
+        "outcomeMeasure": "recurrence_control_gain"
+      }
+    ],
+    "guardrails": [
+      {
+        "id": "g1-unrelated-evidence",
+        "statement": "The combined live condition increases unrelated-record use by no more than 0.05 absolute versus normalized content alone.",
+        "outcomeMeasure": "unrelated_record_use"
+      },
+      {
+        "id": "g2-context-isolation",
+        "statement": "Every case excludes all original-task records from active context before memory evidence is added.",
+        "outcomeMeasure": "active_context_leakage"
+      },
+      {
+        "id": "g3-local-determinism",
+        "statement": "All three deterministic repetitions of a split, seed, phase, and condition produce identical normalized outputs.",
+        "outcomeMeasure": "repeat_determinism"
+      },
+      {
+        "id": "g4-reasoning-observation",
+        "statement": "Every live response used for an efficacy row reports whether reasoning_content was non-empty; request acceptance alone is never counted as reasoning evidence.",
+        "outcomeMeasure": "reasoning_observation_coverage"
+      }
+    ]
+  },
+  "decision": {
+    "currentProductState": "Dolly's current Memory component is not wired into the supported runtime. It has lexical, injected-vector, reciprocal-rank-fusion, and adjacent-context mechanics, but no supported repeated association, learned summary or procedure composition, automatic task recovery, or live product Agent path.",
+    "changesIfSupported": [
+      "Use the successful factors to design a natural-conversation benchmark with independent task families, a public local-model fixture, and a versioned task-thread checkpoint contract.",
+      "Require associated evidence to carry source record identifiers, episode count, proximity statistic, construction version, and an explicit non-causal label.",
+      "Keep raw transcripts, task checkpoints, reusable procedures, durable facts, and retrieval indexes as distinguishable memory representations with separate admission and deletion rules."
+    ],
+    "changesIfRejected": [
+      "Do not add repeated positional association or learned representation composition merely because the owner described the desired effect.",
+      "Retain failed cases and test explicit task threads, query decomposition, temporal graphs, or a different learning workflow under a new preregistration."
+    ],
+    "prohibitedClaims": [
+      "The live owner Aether fixture is optional deployment evidence and cannot be the only reproducible backend for a future supported feature.",
+      "This probe does not show that Dolly Memory is integrated, persistent across restarts, secure under deletion, or supported in a product run.",
+      "A position or explicit-dependency result is not proof of causal inference.",
+      "The fixed English generator and narrow cue rule do not prove general semantic understanding, autonomous learning, or arbitrary task recovery.",
+      "No result may justify removing or bypassing the Module startup refusal."
+    ]
+  },
+  "conditions": {
+    "baselines": [
+      {
+        "id": "no-memory",
+        "description": "The fixed natural-language resume cue is delivered after active-context clearing, but no external memory evidence is supplied.",
+        "frozenParameters": {
+          "evidence": "empty",
+          "topK": 4
+        }
+      },
+      {
+        "id": "exact-lexical-bm25",
+        "description": "Unicode NFKC lowercase exact-token BM25 returns raw records with no term aliases, learning, association, or context expansion.",
+        "frozenParameters": {
+          "tokenPattern": "contiguous Unicode letters or decimal digits",
+          "k1": 1.2,
+          "b": 0.75,
+          "minimumScoreExclusive": 0,
+          "topK": 4
+        }
+      },
+      {
+        "id": "sham-replay",
+        "description": "A matched-size packet from the interrupting task and unrelated records is replayed, controlling for extra context without relevant learning.",
+        "frozenParameters": {
+          "selection": "newest unrelated records up to the combined packet byte budget",
+          "relevantRecordsAllowed": false,
+          "topK": 4
+        }
+      }
+    ],
+    "treatments": [
+      {
+        "id": "normalized-content",
+        "description": "Term-frequency inverse-document-frequency cosine retrieval uses a frozen limited normalization table and returns only scored raw records.",
+        "frozenParameters": {
+          "similarity": "TF-IDF cosine",
+          "idf": "ln((N+1)/(df+1))+1",
+          "normalizationTable": {
+            "billing": "invoice",
+            "intake": "import",
+            "importer": "import",
+            "continue": "resume",
+            "back": "resume",
+            "failed": "rejected",
+            "entries": "rows",
+            "keep": "retain",
+            "preserve": "retain",
+            "retained": "retain"
+          },
+          "minimumScoreExclusive": 0,
+          "topK": 4
+        }
+      },
+      {
+        "id": "normalized-content-position-recurrence",
+        "description": "Normalized content is expanded with record terms that repeatedly co-occur within two positions in at least two distinct prior episodes.",
+        "frozenParameters": {
+          "contentWeight": 1,
+          "associationWeight": 1,
+          "maximumPositionDistance": 2,
+          "minimumDistinctEpisodes": 2,
+          "proximityPerEpisode": "maximum 1/distance",
+          "edgeScore": "mean per-episode proximity over supporting episodes",
+          "candidateAssociation": "maximum edge score from a normalized query term to a candidate term that is absent from the normalized query; query-to-query edges cannot boost a candidate",
+          "topK": 4
+        }
+      },
+      {
+        "id": "normalized-content-recurrence-no-position",
+        "description": "Position ablation counts repeated term co-occurrence anywhere in the same episode with uniform weight.",
+        "frozenParameters": {
+          "maximumPositionDistance": "entire episode",
+          "minimumDistinctEpisodes": 2,
+          "proximityPerEpisode": 1,
+          "topK": 4
+        }
+      },
+      {
+        "id": "normalized-content-position-single-observation",
+        "description": "Recurrence ablation admits position-weighted term association after only one supporting episode.",
+        "frozenParameters": {
+          "maximumPositionDistance": 2,
+          "minimumDistinctEpisodes": 1,
+          "proximityPerEpisode": "maximum 1/distance",
+          "topK": 4
+        }
+      },
+      {
+        "id": "normalized-content-position-shuffled",
+        "description": "Negative control preserves every record and frequency but shuffles record positions independently inside each episode before association construction.",
+        "frozenParameters": {
+          "shuffle": "Fisher-Yates by case seed XOR 0x706f7330",
+          "maximumPositionDistance": 2,
+          "minimumDistinctEpisodes": 2,
+          "topK": 4
+        }
+      },
+      {
+        "id": "normalized-content-temporal-neighbours",
+        "description": "The highest normalized-content record is returned with one preceding and two following records from the same episode order, without cross-episode learning.",
+        "frozenParameters": {
+          "seedMatches": 1,
+          "precedingRecords": 1,
+          "followingRecords": 2,
+          "topK": 4
+        }
+      },
+      {
+        "id": "explicit-task-checkpoint",
+        "description": "After learning, a cited structured task checkpoint provides the task identifier, completed step, exact next action, explicit reason, idempotency key, durable constraint, and source record identifiers.",
+        "frozenParameters": {
+          "beforeLearning": "no learned checkpoint",
+          "afterLearning": "live learner output for model rows and role-derived upper bound for local rows",
+          "requiredSourceCitations": 2,
+          "causalSemantics": "only explicit reason and dependency fields; no inferred causality"
+        }
+      },
+      {
+        "id": "summary-only",
+        "description": "After learning, an extractive task summary with source citations is supplied without raw records, a reusable procedure, or durable prompt facts.",
+        "frozenParameters": {
+          "beforeLearning": "no learned summary",
+          "afterLearning": "live learner output for model rows and role-derived upper bound for local rows",
+          "maximumCharacters": 900
+        }
+      },
+      {
+        "id": "skill-and-long-term-prompt",
+        "description": "After learning, a reusable procedure and durable task fact are supplied without the task checkpoint, summary, or raw retrieved records.",
+        "frozenParameters": {
+          "beforeLearning": "no learned procedure or durable fact",
+          "afterLearning": "live learner output for model rows and role-derived upper bound for local rows",
+          "maximumCharactersEach": 600
+        }
+      },
+      {
+        "id": "combined-memory",
+        "description": "Normalized content, repeated positional association, the cited task checkpoint, extractive summary, reusable procedure, and durable prompt fact are combined under a fixed evidence byte budget.",
+        "frozenParameters": {
+          "beforeLearning": "normalized-content packet only",
+          "afterLearningOrder": [
+            "explicit task checkpoint",
+            "durable fact",
+            "reusable procedure",
+            "summary",
+            "raw position-associated records"
+          ],
+          "maximumEvidenceBytes": 6000,
+          "deduplicateBySourceRecordId": true
+        }
+      }
+    ]
+  },
+  "data": {
+    "generatorOrDataset": {
+      "id": "synthetic-interrupted-task-records",
+      "version": "2",
+      "contentDefinition": "Each seed deterministically creates two historical original-task episodes where an invoice-import anchor is immediately followed by a rejected-row retention constraint, one current original-task checkpoint with a random idempotency key but no repeated constraint, a one-off nearby header-color distractor, repeated far chart-color distractors, a short exact-lexical identity distractor, an interrupting certificate-rotation task, and a final natural-language resume cue. Active context contains only the interrupting task and cue. Expected and forbidden record identifiers are assigned from generator roles before retrieval or a model call."
+    },
+    "training": {
+      "name": "training",
+      "seeds": [101, 102, 103, 104, 105, 106, 107, 108],
+      "caseFactors": [
+        "two historical and one current original-task episodes",
+        "one interrupting task",
+        "before-learning and after-learning phases",
+        "thirteen memory conditions",
+        "three deterministic repetitions"
+      ]
+    },
+    "development": {
+      "name": "development",
+      "seeds": [201, 202, 203, 204],
+      "caseFactors": [
+        "disjoint generated projects and values",
+        "before-learning and after-learning phases",
+        "thirteen memory conditions",
+        "three deterministic repetitions"
+      ]
+    },
+    "evaluation": {
+      "name": "evaluation",
+      "seeds": [301, 302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312],
+      "caseFactors": [
+        "held-out generated projects and values",
+        "before-learning and after-learning phases",
+        "thirteen deterministic memory conditions",
+        "live pilot restricted to seeds 301 and 302 and nine declared conditions"
+      ]
+    },
+    "splitIsolation": "Seeds, project identifiers, interrupting projects, retention durations, idempotency keys, timezones, and colors are disjoint by split. Evaluation output cannot change templates, normalization, weights, windows, prompts, conditions, validators, or decision rules.",
+    "tuningUsesTrainingAndDevelopmentOnly": true
+  },
+  "backend": {
+    "allowedKinds": ["local", "live"],
+    "requiredKind": "live",
+    "silentFallbackAllowed": false,
+    "credentialsRequired": true,
+    "networkRequired": true
+  },
+  "randomness": {
+    "generator": "xorshift32 with unsigned 32-bit arithmetic",
+    "generatorVersion": "2",
+    "streamSeparation": "Dataset generation uses the case seed; order uses seed XOR 0x9e3779b9; position shuffle uses seed XOR 0x706f7330; paired bootstrap uses 0x4d454d30. No stream consumes another stream's values.",
+    "executionOrder": "Deterministic rows are Fisher-Yates shuffled by the separate order stream. Live learning calls run once per pilot seed before randomized paired condition calls; the same source records and active context are reused but model conversation state is not shared across conditions.",
+    "repetitionsPerCase": {
+      "default": 1,
+      "overrides": [
+        {
+          "casePlanId": "training-local",
+          "totalRepetitions": 3,
+          "scope": "Every local condition and learning phase for each training seed."
+        },
+        {
+          "casePlanId": "development-local",
+          "totalRepetitions": 3,
+          "scope": "Every local condition and learning phase for each development seed."
+        },
+        {
+          "casePlanId": "evaluation-local",
+          "totalRepetitions": 3,
+          "scope": "Every local condition and learning phase for each evaluation seed."
+        }
+      ]
+    }
+  },
+  "metrics": {
+    "primary": {
+      "name": "agent_task_resume_success",
+      "unit": "binary per live Agent case",
+      "aggregation": "Macro mean over pilot seeds; compare paired conditions on identical seed and learning phase.",
+      "direction": "maximize",
+      "population": "After-learning live qwen3.6-27b combined-memory versus normalized-content cases on pilot seeds 301 and 302."
+    },
+    "secondary": [
+      {
+        "name": "agent_learning_gain",
+        "unit": "absolute proportion",
+        "aggregation": "Paired after-minus-before live task-resume success for combined-memory by pilot seed.",
+        "direction": "maximize",
+        "population": "Identical live pilot cases before and after learning."
+      },
+      {
+        "name": "local_evidence_success",
+        "unit": "binary per deterministic case",
+        "aggregation": "Checkpoint and constraint both in top four with no forbidden record; repetitions averaged within seed, then macro mean across evaluation seeds.",
+        "direction": "maximize",
+        "population": "All deterministic evaluation conditions and phases."
+      },
+      {
+        "name": "position_control_gain",
+        "unit": "absolute proportion",
+        "aggregation": "Repeated positional condition minus each no-position and position-shuffled control on paired evaluation seeds after learning.",
+        "direction": "maximize",
+        "population": "Deterministic held-out evaluation cases."
+      },
+      {
+        "name": "recurrence_control_gain",
+        "unit": "absolute proportion",
+        "aggregation": "Repeated positional condition minus single-observation control on paired evaluation seeds after learning.",
+        "direction": "maximize",
+        "population": "Deterministic held-out evaluation cases."
+      },
+      {
+        "name": "checkpoint_reciprocal_rank",
+        "unit": "reciprocal rank, zero when absent",
+        "aggregation": "Macro mean across deterministic evaluation seeds after averaging repetitions.",
+        "direction": "maximize",
+        "population": "Deterministic evaluation cases by condition and phase."
+      },
+      {
+        "name": "live_reasoning_present",
+        "unit": "binary per live response",
+        "aggregation": "Proportion whose response message has non-empty reasoning_content.",
+        "direction": "maximize",
+        "population": "Every live learner and Agent response; this is observation metadata, not an efficacy gate."
+      }
+    ],
+    "guardrails": [
+      {
+        "name": "unrelated_record_use",
+        "unit": "binary per case",
+        "aggregation": "One if returned or cited evidence contains any declared forbidden record; macro mean by condition.",
+        "direction": "minimize",
+        "population": "Deterministic and live evaluation cases."
+      },
+      {
+        "name": "active_context_leakage",
+        "unit": "leaked original-task record count",
+        "aggregation": "Maximum across all generated cases before memory evidence is attached.",
+        "direction": "zero",
+        "population": "Every training, development, deterministic evaluation, and live pilot case."
+      },
+      {
+        "name": "repeat_determinism",
+        "unit": "proportion of deterministic groups with identical normalized outcomes",
+        "aggregation": "Exact retrieved identifiers, serialized scores, trigger state, evidence packet, and metrics across three repetitions.",
+        "direction": "maximize",
+        "population": "All local split, seed, phase, and condition groups."
+      },
+      {
+        "name": "reasoning_observation_coverage",
+        "unit": "proportion",
+        "aggregation": "Proportion of live raw rows with explicit non-empty reasoning_content observation and character count fields.",
+        "direction": "maximize",
+        "population": "Every live learner and Agent response, including failures."
+      }
+    ],
+    "minimumEffect": {
+      "metric": "agent_task_resume_success",
+      "magnitude": 0.2,
+      "scale": "absolute",
+      "confidenceLevel": 0.95,
+      "intervalMethod": "Exact paired pilot-seed bootstrap with all 10,000 resamples reported; the two-seed interval is explicitly exploratory and cannot authorize product promotion.",
+      "comparison": "After-learning combined-memory minus after-learning normalized-content on live pilot seeds 301 and 302."
+    }
+  },
+  "execution": {
+    "factorialDesign": "The local mechanism study crosses 24 split seeds, two learning phases, thirteen conditions, and three repetitions. The live pilot uses seeds 301 and 302, one learning call per seed, and one Agent call for each of nine declared conditions in both phases.",
+    "casePlan": [
+      {
+        "id": "training-local",
+        "phase": "training",
+        "maximumCount": 624,
+        "requiredWhen": "Always required before development or evaluation rows are analyzed.",
+        "formula": "8 seeds * 2 phases * 13 conditions * 3 repetitions"
+      },
+      {
+        "id": "development-local",
+        "phase": "development",
+        "maximumCount": 312,
+        "requiredWhen": "Always required after training and before evaluation; version 0 parameters remain frozen regardless of observations.",
+        "formula": "4 seeds * 2 phases * 13 conditions * 3 repetitions"
+      },
+      {
+        "id": "evaluation-local",
+        "phase": "evaluation",
+        "maximumCount": 936,
+        "requiredWhen": "Required when local generator and preregistration validation pass without an abort.",
+        "formula": "12 seeds * 2 phases * 13 conditions * 3 repetitions"
+      },
+      {
+        "id": "live-pilot",
+        "phase": "evaluation",
+        "maximumCount": 36,
+        "requiredWhen": "Required only with explicit RUN_LIVE_INTEGRATION=1 and RUN_PAID_INTEGRATION=1, present Aether credentials, matching endpoint capability, exactly 38 logical calls including two learning calls, and at most 152 transport attempts.",
+        "formula": "2 seeds * 2 phases * 9 Agent conditions; the two per-seed learning calls are model-raw rows, not Agent case rows"
+      }
+    ],
+    "plannedMaximumCases": 1908,
+    "maxCases": 1908,
+    "maxEventsPerCase": 96,
+    "maxRawRecordsPerCase": 40,
+    "maxVirtualTimeMsPerCase": 10000,
+    "maxWallClockMs": 7200000,
+    "failurePolicy": "Any missing planned case row, malformed terminal model response, non-finite score, duplicate identity, context leak, artifact failure, checksum mismatch, secret or endpoint leakage, unplanned network request, more than 38 logical live calls or 152 transport attempts, or validation failure makes the run inconclusive. A live error cannot fall back to local output.",
+    "retryPolicy": "Local cases and completed model responses are never retried. A logical live call may make at most four request attempts only after a timeout, network or JSON transport failure, HTTP 408, HTTP 425, HTTP 429, or HTTP 5xx. Every failed attempt remains in model-raw.jsonl; malformed, truncated, empty, or otherwise usable HTTP 200 responses are not retried. Machine-readable limits are in domainDesign.liveEndpointProfile.retryPolicy."
+  },
+  "stoppingRules": {
+    "plannedCompletion": "Write all 1872 deterministic case rows, then run exactly two logical learning calls and 36 paired logical Agent calls if live opt-ins and credentials are present. Persist one raw row for every request attempt before using its result, with 38 to 152 raw rows for the 38 logical calls, then write aggregates and run independent validation. No attempt or case row is removed after results are read.",
+    "earlyEfficacyStopAllowed": false,
+    "abortConditions": [
+      "The preregistration or protocol hash differs from the bytes recorded in the manifest.",
+      "Active context contains an original-task record, an expected identifier is absent from retained memory, or ground truth is constructed after retrieval.",
+      "A request contains enable_thinking, a learner request omits thinking.type=enabled, an Agent request omits thinking.type=disabled, a request names a model other than qwen3.6-27b, or a response lacks an explicit reasoning_content observation.",
+      "The program exposes the API key or endpoint URL in console output or stored artifacts.",
+      "The run reaches Dolly runtime or Module launch code, private user data, DashScope, OSS, or any network destination other than the configured Aether origin.",
+      "The run exceeds 38 logical live model calls, 152 request attempts, 7200 seconds, 1908 case rows, or an artifact/resource bound."
+    ]
+  },
+  "decisionRules": {
+    "classificationOrder": "Any abort, missing row, malformed response, checksum failure, validator failure, context leak, secret leak, or local nondeterminism is inconclusive. A guardrail breach is rejected. Otherwise all candidate-support thresholds are evaluated; this classification can only select a next experiment, never a product default.",
+    "supported": [
+      "All 1908 planned case rows, all 38 logical live calls have terminal responses, every one of the 38 to 152 request attempts is retained as a model-raw row, and required artifacts exist; independent validation passes, repeat_determinism and reasoning_observation_coverage equal 1, and active_context_leakage equals 0.",
+      "The combined live condition's primary paired gain is at least 0.20 and no pilot seed has a negative delta.",
+      "The combined live condition's learning gain is at least 0.20.",
+      "The deterministic position and recurrence control gains each reach 0.10 and repeated positional association reaches a 0.20 gain over normalized content.",
+      "Combined unrelated_record_use is no more than normalized content plus 0.05."
+    ],
+    "rejected": [
+      "A complete valid run misses a primary, learning, position-control, recurrence-control, or local-evidence threshold.",
+      "A complete valid run regresses unrelated-record use by more than 0.05 absolute."
+    ],
+    "inconclusive": [
+      "Any planned row, raw response, required artifact, validation check, opt-in, credential, or endpoint capability is missing or invalid.",
+      "The two-seed live pilot remains exploratory even when candidate-supported; it cannot prove a general or product-level effect."
+    ]
+  },
+  "artifacts": {
+    "rootPattern": "artifacts/experiments/probes/memory-association-task-switch-v0",
+    "requiredFiles": [
+      "run-manifest.json",
+      "preregistration.json",
+      "cases.jsonl",
+      "model-raw.jsonl",
+      "analysis.json",
+      "validation.json",
+      "sha256sums.txt"
+    ],
+    "runManifestFields": [
+      "experimentId",
+      "experimentVersion",
+      "protocolSha256",
+      "preregistrationSha256",
+      "sourceCommit",
+      "dirtyWorktree",
+      "configuration",
+      "dataset",
+      "modelEndpointCapabilityProfile",
+      "modelIdentifier",
+      "backend",
+      "seeds",
+      "executionOrder",
+      "resourceBudgets",
+      "perCaseAccounting",
+      "rawOutputs",
+      "validatorResults",
+      "aggregateMetrics",
+      "startedAt",
+      "finishedAt",
+      "failure",
+      "algorithmVersion",
+      "nodeVersion",
+      "platform"
+    ]
+  },
+  "independentValidation": {
+    "analyzerPath": "scripts/experiments/probes/memory-association-task-switch-v0/verify.mjs",
+    "readsOnlyArtifacts": true,
+    "importsTreatmentImplementation": false,
+    "requiredChecks": [
+      "The verify entry path reads only preregistration and artifacts and never calls generation, retrieval, learning, or model-request functions.",
+      "Recompute every row metric from preregistered ground-truth fields, active-context identifiers, retrieved or cited evidence identifiers, and structured Agent output.",
+      "Verify factorial coverage, exact identities, three-repeat local equality, live call count and order, finite scores, model/thinking metadata, reasoning observation coverage, aggregates, decision classification, and checksums.",
+      "Scan every stored and console-safe field for the configured endpoint or API-key values without writing those values into the validation report."
+    ],
+    "mutationTests": [
+      "Remove an expected constraint identifier from one copied result and require failure.",
+      "Insert one forbidden identifier into a copied live citation list and require failure.",
+      "Alter one copied aggregate metric and require failure.",
+      "Alter one copied JSONL byte and require checksum failure.",
+      "Change reasoningPresent without changing the recorded reasoning character count and require failure."
+    ]
+  },
+  "safetyBoundary": {
+    "productRuntimeUsed": false,
+    "moduleLaunchAllowed": false,
+    "networkAccessAllowed": true,
+    "privateDataAllowed": false,
+    "paidServicesAllowed": true,
+    "knownP0PathReachable": false,
+    "moduleStartupRefusalMustRemain": true
+  },
+  "domainDesign": {
+    "implementationStatus": "Versions 2 through 6 established that this Aether route can spend 700 to 3600 completion tokens entirely in non-empty reasoning_content and return no content, and version 5 also exposed an undeclared 90-second harness timeout. Version 7 raised max_tokens to 5200 and asked for internal analysis under 200 words: its learner completed, but one Agent exhausted 5200 tokens and a later call timed out at 180 seconds. Version 8 used the route's measured thinking.type=disabled mode for scored Agent calls; its learner and first three Agent calls completed, then a disabled Agent request timed out after 90 seconds. Repository capability research confirms this relay accepts thinking.type enabled or disabled and has no measured reasoning-budget request field, so inventing one is prohibited. Version 9 retains version 8's paired request profiles and preregisters up to four attempts only for enumerated transport failures or retryable HTTP status codes. Every attempt is retained; HTTP 200 content failures are never retried. Data, prompts, splits, conditions, 38 logical calls, metrics, and effect thresholds are otherwise unchanged. Reasoning-enabled Agent efficacy remains outside this run's support. Earlier failures and frozen preregistration bytes remain retained under the experiment artifact root. The harness remains standalone and may not import Dolly runtime or current Memory implementation.",
+    "rowAccounting": "cases.jsonl contains 1872 deterministic case rows and, when live execution is opted in, 36 Agent case rows. model-raw.jsonl separately contains one row per request attempt: 38 rows when no retry is needed and at most 152 rows. Exactly two logical calls are learners and 36 are Agent calls; learner responses are not case rows.",
+    "currentConsumerAudit": {
+      "lexical": "Current Memory uses Unicode tokens and BM25 but is not wired into the supported runtime.",
+      "contextExpansion": "Current context expansion takes nearby same-Page records once; it does not aggregate repeated co-occurrence and cannot be called causal association.",
+      "occurrenceAndOrder": "Records preserve order and occurrences preserve delivery evidence, but baseline retrieval does not use occurrence count for rank.",
+      "automaticRecall": "Automatic recall is disabled by default and current action consumes explicit query payloads; no task switch detector or resume state machine exists."
+    },
+    "taskSequence": [
+      "Retain scripted original-task records containing task identity, completed step, next action, idempotency key, explicit reason, and a separately repeated durable constraint.",
+      "Replace active context with a different certificate-rotation task and its completion.",
+      "Append a natural-language cue using a content paraphrase to resume the named original project.",
+      "Automatically invoke the selected memory condition from the cue and attach its bounded evidence packet.",
+      "Ask the same general live Agent prompt to produce a structured continuation and cited evidence."
+    ],
+    "automaticCueRule": "The harness invokes memory when the final lowercased cue contains resume, continue, or back and follows a differently named task. It receives natural text rather than a Dolly memory-query payload. This fixed detector is a pilot fixture, not a general result.",
+    "recordLayout": {
+      "trueAssociation": "Two historical episodes place differently worded rejected-row retention constraints immediately after invoice-import anchors; the current episode omits that constraint.",
+      "latestCheckpoint": "The current anchor says parsing is complete and that the next action is an idempotency guard using a seed-specific key because duplicate deliveries were observed.",
+      "singleNearbyDistractor": "Only the current episode places an unrelated header-color note within two positions of its anchor.",
+      "repeatedFarDistractor": "Each original-task episode contains a chart-color note at least three positions from the anchor.",
+      "lexicalIdentityDistractor": "A separate short note contains only the project identifier and an unrelated color subject.",
+      "activeContext": "Only the interrupting task start, interrupting task completion, and resume cue remain before evidence attachment."
+    },
+    "associationConstruction": {
+      "input": "Retained records before the resume cue; active context, generator roles, expected labels, live learner output, and evaluation results are excluded.",
+      "nodes": "Normalized non-stopword terms; records remain returned evidence units.",
+      "stopwords": [
+        "a", "an", "and", "are", "as", "at", "be", "because", "been", "before",
+        "by", "can", "did", "do", "does", "for", "from", "go", "has", "have",
+        "in", "into", "is", "it", "later", "now", "of", "on", "only", "or",
+        "so", "than", "that", "the", "their", "then", "there", "this", "to",
+        "was", "we", "were", "when", "with", "work", "you"
+      ],
+      "evidenceUnit": "For each unordered term pair and episode, retain the maximum eligible proximity among record pairs containing those terms.",
+      "recurrence": "Count distinct supporting episodes, not repeated tokens inside one record or episode.",
+      "score": "Mean per-episode maximum proximity after the condition-specific recurrence and position rules.",
+      "nonCausal": "Repeated proximity is reported as association only. Explicit dependency fields in a task checkpoint may preserve a stated reason but do not infer one."
+    },
+    "learningWorkflow": {
+      "local": "Build condition-specific association statistics and idealized role-derived representation upper bounds without a model.",
+      "live": "For each pilot seed, qwen3.6-27b receives all prior original-task records once and returns strict JSON containing a cited checkpoint, extractive summary, reusable procedure, and durable fact. The output is persisted and reused unchanged across after-learning conditions.",
+      "beforeAfter": "Before-learning learned representations are absent and association maps are empty; raw content and temporal-neighbour baselines remain available. After-learning uses the learned artifacts. Source records, active context, query, Agent prompt, model, and budgets are identical.",
+      "sham": "Sham replay supplies only unrelated records under a matched evidence-byte budget to separate relevant learning from extra context."
+    },
+    "liveEndpointProfile": {
+      "environmentVariables": [
+        "AETHER_BASE_URL",
+        "AETHER_API_KEY"
+      ],
+      "model": "qwen3.6-27b",
+      "route": "configured origin plus /v1/chat/completions",
+      "request": {
+        "thinking": {
+          "type": "enabled"
+        },
+        "enable_thinking": "forbidden",
+        "temperature": 0,
+        "max_tokens": 5200,
+        "timeout_ms": 180000
+      },
+      "agentRequest": {
+        "thinking": {
+          "type": "disabled"
+        },
+        "enable_thinking": "forbidden",
+        "temperature": 0,
+        "max_tokens": 800,
+        "timeout_ms": 90000
+      },
+      "reasoningEvidence": "Only a non-empty response message reasoning_content proves reasoning for that call. Content and reasoning remain separate in raw artifacts.",
+      "secretHandling": "Load .env without printing values; never store the API key, configured origin, authorization header, or unredacted request URL. Artifacts use the label owner-aether-qwen36 only.",
+      "logicalCallBudget": 38,
+      "requestAttemptBudget": 152,
+      "retryPolicy": {
+        "maxAttemptsPerLogicalCall": 4,
+        "retryDelayMs": 1000,
+        "maxRequestAttempts": 152
+      },
+      "fallback": "none"
+    },
+    "liveAgentConditions": [
+      "no-memory",
+      "exact-lexical-bm25",
+      "sham-replay",
+      "normalized-content",
+      "normalized-content-position-recurrence",
+      "normalized-content-position-shuffled",
+      "normalized-content-temporal-neighbours",
+      "explicit-task-checkpoint",
+      "combined-memory"
+    ],
+    "liveAgentOutput": {
+      "format": "one strict JSON object with no prose",
+      "requiredFields": [
+        "taskId",
+        "nextAction",
+        "idempotencyKey",
+        "retentionDays",
+        "usedEvidenceIds",
+        "uncertain"
+      ],
+      "success": "taskId, nextAction, idempotencyKey, and retentionDays exactly match generator ground truth; usedEvidenceIds contains the checkpoint and one true constraint identifier and contains no forbidden identifier; uncertain is false.",
+      "failure": "Malformed JSON, a missing or extra required field, wrong state, missing evidence, forbidden evidence, uncertainty, HTTP error, or truncated response."
+    },
+    "independenceAndLimits": [
+      "The live model path is a private optional fixture; the deterministic local path remains reproducible without a key, model, or network.",
+      "The same model performs learning and continuation, so a later study must compare independent learners and public local models.",
+      "Role-derived local summaries are representation upper bounds and do not measure extraction quality.",
+      "The two-seed live pilot measures feasibility and failure modes, not population-level generality.",
+      "Synthetic English templates and a frozen hand-written normalization table may favor declared conditions.",
+      "No real tool side effect is executed; exact next-action reconstruction is measured instead of completed external work.",
+      "Persistence, restart, deletion, namespace isolation, concurrency, multimodal data, and Dolly integration remain untested."
+    ]
+  }
+}
