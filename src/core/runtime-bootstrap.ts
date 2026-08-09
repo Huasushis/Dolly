@@ -331,6 +331,10 @@ export async function openDollyRuntime(
       core,
       repository,
       now,
+      // Non-empty Module configurations are still rejected above. Product
+      // composition must supply every validated consumer mailbox before that
+      // guard can ever be reconsidered.
+      mailboxes: [],
     });
     const recovery = await new CoreStartupRecovery({
       deliveries: core.deliveries,

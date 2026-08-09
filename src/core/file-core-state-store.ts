@@ -28,6 +28,8 @@ import {
 import {
   DeliveryStore,
   type DeliveryClaimIdentity,
+  type DeliveryMailboxCapacity,
+  type DeliveryOutputEffectInput,
   type DeliveryStoreOptions,
   type DeliveryStoreSnapshot,
   type NegativeAcknowledgementRequest,
@@ -54,7 +56,10 @@ import {
   type ModuleProcessStoppedRecordWriter,
   type ModuleSubmissionRecord,
 } from "./module-process-records.js";
-import { type ModuleResultCommitOperations } from "./module-result-commit.js";
+import {
+  type ModuleResultCommitOperations,
+  type ModuleResultCommitOutputDelivery,
+} from "./module-result-commit.js";
 import { parseStrictJsonBytes } from "./strict-json.js";
 import {
   SynchronousCrossProcessLockError,
@@ -1531,7 +1536,9 @@ export class FileCoreStateStore {
   }
 
   /** @internal Only product composition uses this complete operation set. */
-  createModuleResultCommitOperations(): ModuleResultCommitOperations {
+  createModuleResultCommitOperations(
+    mailboxes: readonly DeliveryMailboxCapacity[] = [],
+  ): ModuleResultCommitOperations {
     this.#assertUsable();
     const assertUsable = () => this.#assertUsable();
     const invokeMutation = (
@@ -1578,6 +1585,15 @@ export class FileCoreStateStore {
           return this.#moduleSubmissionRecords.get(runId);
         },
       },
+      commitOutputBatch: {
+        configurable: false,
+        enumerable: true,
+        writable: false,
+        value: (input: {
+          readonly claim: DeliveryClaimIdentity;
+          readonly outputs: readonly DeliveryOutputEffectInput[];
+        }) => this.#commitModuleResultOutputBatch(mailboxes, input),
+      },
       acknowledgeDeliveryClaim: {
         configurable: false,
         enumerable: true,
@@ -1592,6 +1608,90 @@ export class FileCoreStateStore {
       },
     });
     return Object.freeze(operations) as unknown as ModuleResultCommitOperations;
+  }
+
+  #commitModuleResultOutputBatch(
+    mailboxes: readonly DeliveryMailboxCapacity[],
+    supplied: {
+      readonly claim: DeliveryClaimIdentity;
+      readonly outputs: readonly DeliveryOutputEffectInput[];
+    },
+  ):
+    | {
+        readonly status: "committed";
+        readonly outputDeliveries: readonly ModuleResultCommitOutputDelivery[];
+      }
+    | {
+        readonly status: "backpressured";
+        readonly blockedConsumerIds: readonly string[];
+      } {
+    this.#assertUsable();
+    const claim = copyAndFreezeClaimIdentity(supplied.claim);
+    const outputs = supplied.outputs.map((output) => deepFreeze({
+      effectId: output.effectId,
+      pageId: output.pageId,
+      blockId: output.blockId,
+    }));
+    const copiedMailboxes = mailboxes.map((mailbox) => deepFreeze({
+      consumerId: mailbox.consumerId,
+      pageIds: [...mailbox.pageIds],
+      maxResidentCount: mailbox.maxResidentCount,
+      maxResidentBytes: mailbox.maxResidentBytes,
+    }));
+    const persistedClaim = this.#deliveries.inspectClaim(claim);
+    const submission = this.#moduleSubmissionRecords.get(claim.runId);
+    if (this.#activeClaimsWithUnknownSubmissionHistory.has(claim.runId)) {
+      throw new ModuleProcessRecordError(
+        "MODULE_CLAIM_SUBMISSION_HISTORY_UNKNOWN",
+        "A migrated active Claim with unknown submission history cannot commit output",
+      );
+    }
+    if (
+      persistedClaim.status !== "active" ||
+      submission === undefined ||
+      submission.moduleJobId !== claim.moduleJobId ||
+      submission.claimToken !== claim.claimToken ||
+      submission.runId !== claim.runId ||
+      submission.attempt !== claim.attempt ||
+      submission.moduleGenerationId !== claim.moduleGenerationId
+    ) {
+      throw new ModuleProcessRecordError(
+        "MODULE_SUBMISSION_RECORD_NOT_FOUND",
+        "An output batch requires its exact active Claim and Module submission record",
+      );
+    }
+
+    let blockedConsumerIds: readonly string[] = [];
+    let outputDeliveries: readonly ModuleResultCommitOutputDelivery[] = [];
+    this.runAtomicUpdate(() => {
+      const capacity = this.#deliveries.inspectOutputCommitCapacity({
+        claim,
+        outputs,
+        mailboxes: copiedMailboxes,
+      });
+      blockedConsumerIds = capacity.blockedConsumerIds;
+      if (blockedConsumerIds.length > 0) return;
+      outputDeliveries = outputs.map((output) => {
+        const delivery = this.#deliveries.appendOnce(
+          output.effectId,
+          output.pageId,
+          output.blockId,
+        );
+        return deepFreeze({ pageId: output.pageId, deliveryId: delivery.deliveryId });
+      });
+      this.#deliveries.ack(claim);
+      this.#removeModuleSubmissionRecord(claim.runId);
+    });
+    if (blockedConsumerIds.length > 0) {
+      return deepFreeze({
+        status: "backpressured" as const,
+        blockedConsumerIds: [...blockedConsumerIds],
+      });
+    }
+    return deepFreeze({
+      status: "committed" as const,
+      outputDeliveries: [...outputDeliveries],
+    });
   }
 
   get revision(): number {

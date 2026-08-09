@@ -42,6 +42,7 @@ describe("product Module result commit construction", () => {
       core,
       repository: new InMemoryModuleResultCommitRepository(),
       now: () => NOW,
+      mailboxes: [],
     });
 
     expect(coordinator).toBeInstanceOf(ModuleResultCommitCoordinator);
@@ -91,6 +92,7 @@ describe("product Module result commit construction", () => {
         core: assembledCore,
         repository,
         now: () => NOW,
+        mailboxes: [],
       }),
     ).toThrowError(
       new TypeError(
@@ -111,6 +113,7 @@ describe("product Module result commit construction", () => {
         core: new Proxy(core, {}),
         repository,
         now: () => NOW,
+        mailboxes: [],
       }),
     ).toThrowError(
       new TypeError(
@@ -147,6 +150,7 @@ describe("product Module result commit construction", () => {
         core,
         repository: new InMemoryModuleResultCommitRepository(),
         now: () => NOW,
+        mailboxes: [],
       }),
     ).not.toThrow();
   });
@@ -170,6 +174,7 @@ describe("product Module result commit construction", () => {
         core,
         repository,
         now: () => NOW,
+        mailboxes: [],
       }),
     ).toThrowError(
       new TypeError(

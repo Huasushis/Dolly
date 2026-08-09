@@ -39,6 +39,93 @@ function createHarness(maxFailedAttempts = 3) {
 }
 
 describe("CORE-004 per-consumer claim/ack recovery", () => {
+  it("projects fan-out capacity per subscribed occurrence before any mutation", () => {
+    const { blocks, deliveries } = createHarness();
+    for (const pageId of ["input", "output-a", "output-b"]) {
+      deliveries.createPage(pageId);
+    }
+    deliveries.registerConsumer("input", "worker", "from-now");
+    deliveries.registerConsumer("output-a", "sink", "from-now");
+    deliveries.registerConsumer("output-b", "sink", "from-now");
+    const inputBlock = blocks.commit(proposal("input"), source);
+    deliveries.append("input", inputBlock.id);
+    const claim = deliveries.claim({
+      consumerId: "worker",
+      pageIds: ["input"],
+      moduleGenerationId: "generation-1",
+      maxCount: 1,
+      maxBytes: 1024 * 1024,
+    })!;
+    const outputBlock = blocks.commit(proposal("fan out"), source);
+    const before = deliveries.snapshot();
+
+    const capacity = deliveries.inspectOutputCommitCapacity({
+      claim,
+      outputs: [
+        { effectId: "effect-a", pageId: "output-a", blockId: outputBlock.id },
+        { effectId: "effect-b", pageId: "output-b", blockId: outputBlock.id },
+      ],
+      mailboxes: [{
+        consumerId: "sink",
+        pageIds: ["output-a", "output-b"],
+        maxResidentCount: 1,
+        maxResidentBytes: 1024 * 1024,
+      }],
+    });
+
+    expect(capacity.blockedConsumerIds).toEqual(["sink"]);
+    expect(capacity.projections).toEqual([
+      expect.objectContaining({
+        consumerId: "sink",
+        residentCount: 0,
+        acknowledgedInputCount: 0,
+        appendedOutputCount: 2,
+        projectedResidentCount: 2,
+        maxResidentCount: 1,
+        blocked: true,
+      }),
+    ]);
+    expect(deliveries.snapshot()).toEqual(before);
+  });
+
+  it("credits the exact claimed input in a capacity-neutral self-loop", () => {
+    const { blocks, deliveries } = createHarness();
+    deliveries.createPage("loop");
+    deliveries.registerConsumer("loop", "worker", "from-now");
+    const inputBlock = blocks.commit(proposal("loop input"), source);
+    deliveries.append("loop", inputBlock.id);
+    const claim = deliveries.claim({
+      consumerId: "worker",
+      pageIds: ["loop"],
+      moduleGenerationId: "generation-1",
+      maxCount: 1,
+      maxBytes: 1024 * 1024,
+    })!;
+    const outputBlock = blocks.commit(proposal("loop replacement"), source);
+
+    const capacity = deliveries.inspectOutputCommitCapacity({
+      claim,
+      outputs: [{ effectId: "loop-effect", pageId: "loop", blockId: outputBlock.id }],
+      mailboxes: [{
+        consumerId: "worker",
+        pageIds: ["loop"],
+        maxResidentCount: 1,
+        maxResidentBytes: 1024 * 1024,
+      }],
+    });
+
+    expect(capacity.blockedConsumerIds).toEqual([]);
+    expect(capacity.projections).toEqual([
+      expect.objectContaining({
+        residentCount: 1,
+        acknowledgedInputCount: 1,
+        appendedOutputCount: 1,
+        projectedResidentCount: 1,
+        blocked: false,
+      }),
+    ]);
+  });
+
   it("keeps claimed Deliveries resident across all subscribed Pages", () => {
     const { blocks, deliveries } = createHarness();
     deliveries.createPage("page-a");

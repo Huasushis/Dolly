@@ -1,4 +1,5 @@
 import { FileCoreStateStore } from "./file-core-state-store.js";
+import { type DeliveryMailboxCapacity } from "./delivery-store.js";
 import {
   ModuleResultCommitCoordinator,
   type ModuleResultCommitHookEvent,
@@ -9,6 +10,7 @@ export interface CreateModuleResultCommitCoordinatorOptions {
   readonly core: FileCoreStateStore;
   readonly repository: ModuleResultCommitRepository;
   readonly now: () => string;
+  readonly mailboxes: readonly DeliveryMailboxCapacity[];
   readonly afterEffect?: (
     event: ModuleResultCommitHookEvent,
   ) => void | Promise<void>;
@@ -67,7 +69,7 @@ export function createModuleResultCommitCoordinator(
   const operations = Reflect.apply(
     FileCoreStateStore.prototype.createModuleResultCommitOperations,
     options.core,
-    [],
+    [options.mailboxes],
   );
 
   return new ModuleResultCommitCoordinator({

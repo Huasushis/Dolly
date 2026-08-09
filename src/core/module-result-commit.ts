@@ -20,6 +20,7 @@ import {
 import {
   type ClaimDescriptor,
   type DeliveryClaimIdentity,
+  type DeliveryOutputEffectInput,
   type DeliveryStore,
 } from "./delivery-store.js";
 import {
@@ -636,6 +637,24 @@ export interface ModuleResultCommitOperations {
   readonly getModuleSubmissionRecord: (
     runId: string,
   ) => ModuleSubmissionRecord | undefined;
+  /**
+   * Product FileCore implementations append every output effect, acknowledge
+   * the exact Claim, and remove its submission record in one durable update.
+   * Direct protocol fixtures may omit this operation and retain the legacy
+   * stepwise recovery path.
+   */
+  readonly commitOutputBatch?: (input: {
+    readonly claim: DeliveryClaimIdentity;
+    readonly outputs: readonly DeliveryOutputEffectInput[];
+  }) =>
+    | {
+        readonly status: "committed";
+        readonly outputDeliveries: readonly ModuleResultCommitOutputDelivery[];
+      }
+    | {
+        readonly status: "backpressured";
+        readonly blockedConsumerIds: readonly string[];
+      };
 }
 
 export interface ModuleResultCommitCoordinatorOptions
@@ -660,6 +679,8 @@ export class ModuleResultCommitCoordinator {
     ModuleResultCommitCoordinatorOptions["acknowledgeDeliveryClaim"];
   readonly #getModuleSubmissionRecord:
     ModuleResultCommitCoordinatorOptions["getModuleSubmissionRecord"];
+  readonly #commitOutputBatch:
+    ModuleResultCommitCoordinatorOptions["commitOutputBatch"];
   readonly #repository: ModuleResultCommitRepository;
   readonly #now: () => string;
   readonly #afterEffect?: ModuleResultCommitCoordinatorOptions["afterEffect"];
@@ -675,6 +696,7 @@ export class ModuleResultCommitCoordinator {
     this.#deliveries = options.deliveries;
     this.#acknowledgeDeliveryClaim = options.acknowledgeDeliveryClaim;
     this.#getModuleSubmissionRecord = options.getModuleSubmissionRecord;
+    this.#commitOutputBatch = options.commitOutputBatch;
     this.#repository = options.repository;
     this.#now = options.now;
     this.#afterEffect = options.afterEffect;
@@ -1250,6 +1272,12 @@ export class ModuleResultCommitCoordinator {
         );
       }
       assertModuleResultCommitRecord(record);
+      if (
+        this.#commitOutputBatch !== undefined &&
+        this.#synchronizeNextRecordedEffect(record)
+      ) {
+        continue;
+      }
       const claimState = this.#validatePersistentState(record);
       if (claimState === "committed") {
         if (record.state === "committed") {
@@ -1290,6 +1318,22 @@ export class ModuleResultCommitCoordinator {
           this.#repository.compareAndSet(moduleJobId, record.revision, next);
           continue;
         }
+      }
+
+      if (this.#commitOutputBatch !== undefined) {
+        const batch = this.#commitOutputBatch({
+          claim: this.#claimIdentity(record),
+          outputs: record.outputPageIds.map((pageId) => ({
+            effectId: this.#deliveryEffectId(moduleJobId, pageId),
+            pageId,
+            blockId: record.blockId!,
+          })),
+        });
+        if (batch.status === "backpressured") {
+          throw new ModuleResultCommitBackpressureError(batch.blockedConsumerIds);
+        }
+        await this.#afterEffect?.({ phase: "after-ack-effect", moduleJobId });
+        continue;
       }
 
       const nextPageId = record.outputPageIds[record.outputDeliveries.length];
@@ -1333,6 +1377,71 @@ export class ModuleResultCommitCoordinator {
       }
       return committed;
     }
+  }
+
+  /**
+   * A FileCore output batch can commit all Delivery effects and its Claim
+   * before the separate result journal advances. Catch up exactly one durable
+   * effect per revision so the existing transition validator still detects
+   * missing, reordered, or conflicting effects.
+   */
+  #synchronizeNextRecordedEffect(record: ModuleResultCommitRecord): boolean {
+    if (record.blockProposal !== undefined && record.blockId === undefined) {
+      const blockEffect = this.#blocks.inspectCommitEffect(
+        this.#blockEffectId(record.moduleJobId),
+      );
+      if (blockEffect === null) return false;
+      const expectedDigest = canonicalJsonDigest({
+        proposal: record.blockProposal,
+        source: record.source,
+      });
+      if (blockEffect.digest !== expectedDigest || !blockEffect.strongReferenceHeld) {
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          `Module result ${record.moduleJobId} has a conflicting Block effect`,
+          { moduleJobId: record.moduleJobId },
+        );
+      }
+      const next = immutableRecord({
+        ...record,
+        revision: record.revision + 1,
+        updatedAt: canonicalTime(this.#now),
+        blockId: blockEffect.record.id,
+      });
+      this.#repository.compareAndSet(record.moduleJobId, record.revision, next);
+      return true;
+    }
+
+    if (record.blockId === undefined) return false;
+    const pageId = record.outputPageIds[record.outputDeliveries.length];
+    if (pageId === undefined) return false;
+    const effect = this.#deliveries.inspectAppendEffect(
+      this.#deliveryEffectId(record.moduleJobId, pageId),
+    );
+    if (effect === null) return false;
+    if (
+      effect.pageId !== pageId ||
+      effect.blockId !== record.blockId ||
+      effect.record.pageId !== pageId ||
+      effect.record.blockId !== record.blockId
+    ) {
+      throw new ModuleResultCommitError(
+        "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+        `Module result ${record.moduleJobId} has a conflicting Delivery effect`,
+        { moduleJobId: record.moduleJobId, pageId },
+      );
+    }
+    const next = immutableRecord({
+      ...record,
+      revision: record.revision + 1,
+      updatedAt: canonicalTime(this.#now),
+      outputDeliveries: [
+        ...record.outputDeliveries,
+        { pageId, deliveryId: effect.record.deliveryId },
+      ],
+    });
+    this.#repository.compareAndSet(record.moduleJobId, record.revision, next);
+    return true;
   }
 
   /**

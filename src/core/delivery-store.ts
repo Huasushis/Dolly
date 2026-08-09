@@ -113,6 +113,7 @@ export type DeliveryStoreErrorCode =
   | "CLAIM_LIMIT_INVALID"
   | "FAILURE_CLASSIFICATION_INVALID"
   | "CLAIM_ITEM_OVERSIZE"
+  | "OUTPUT_CAPACITY_INVALID"
   | "MODULE_JOB_INPUT_PAGE_SET_CHANGED"
   | "DELIVERY_SNAPSHOT_INVALID"
   | "CLAIM_PERSISTENCE_UNCONFIRMED"
@@ -274,6 +275,39 @@ export interface DeliveryResidentStatus {
   readonly residentCount: number;
   readonly residentBytes: number;
   readonly oldestEnqueuedAt: string | null;
+}
+
+export interface DeliveryMailboxCapacity {
+  readonly consumerId: string;
+  readonly pageIds: readonly string[];
+  readonly maxResidentCount: number;
+  readonly maxResidentBytes: number;
+}
+
+export interface DeliveryOutputEffectInput {
+  readonly effectId: string;
+  readonly pageId: string;
+  readonly blockId: string;
+}
+
+export interface DeliveryOutputCapacityProjection {
+  readonly consumerId: string;
+  readonly residentCount: number;
+  readonly residentBytes: number;
+  readonly acknowledgedInputCount: number;
+  readonly acknowledgedInputBytes: number;
+  readonly appendedOutputCount: number;
+  readonly appendedOutputBytes: number;
+  readonly projectedResidentCount: number;
+  readonly projectedResidentBytes: number;
+  readonly maxResidentCount: number;
+  readonly maxResidentBytes: number;
+  readonly blocked: boolean;
+}
+
+export interface DeliveryOutputCapacityStatus {
+  readonly blockedConsumerIds: readonly string[];
+  readonly projections: readonly DeliveryOutputCapacityProjection[];
 }
 
 export interface DeliveryPageSnapshot {
@@ -723,6 +757,201 @@ export class DeliveryStore {
       residentCount,
       residentBytes,
       oldestEnqueuedAt: resident[0]?.record.enqueuedAt ?? null,
+    });
+  }
+
+  /**
+   * Computes the exact consumer-mailbox occupancy that would remain after one
+   * Module result atomically appends its missing output effects and
+   * acknowledges its input Claim. This method is read-only; FileCore performs
+   * the checked mutations and submission-record removal in one persisted
+   * update.
+   */
+  inspectOutputCommitCapacity(input: {
+    readonly claim: DeliveryClaimIdentity;
+    readonly outputs: readonly DeliveryOutputEffectInput[];
+    readonly mailboxes: readonly DeliveryMailboxCapacity[];
+  }): DeliveryOutputCapacityStatus {
+    this.flushPersistence();
+    const claim = this.#requireClaim(input.claim);
+    if (claim.status !== "active") {
+      throw new DeliveryStoreError(
+        "CLAIM_STALE",
+        `Claim ${input.claim.claimToken} is no longer active`,
+      );
+    }
+    const moduleJob = this.#moduleJobs.get(claim.moduleJobId)!;
+
+    const effects = new Set<string>();
+    const outputPages = new Set<string>();
+    const missingOutputs: DeliveryOutputEffectInput[] = [];
+    for (const output of input.outputs) {
+      if (output === null || typeof output !== "object") {
+        throw new DeliveryStoreError(
+          "OUTPUT_CAPACITY_INVALID",
+          "An output effect must be an object",
+        );
+      }
+      assertId(output.effectId, "effectId");
+      assertId(output.pageId, "pageId");
+      assertId(output.blockId, "blockId");
+      if (effects.has(output.effectId) || outputPages.has(output.pageId)) {
+        throw new DeliveryStoreError(
+          "OUTPUT_CAPACITY_INVALID",
+          "Output effects must use unique effect and Page identifiers",
+        );
+      }
+      effects.add(output.effectId);
+      outputPages.add(output.pageId);
+      this.#requirePage(output.pageId);
+      if (!this.#blocks.has(output.blockId)) {
+        throw new DeliveryStoreError(
+          "BLOCK_NOT_FOUND",
+          `Block ${output.blockId} is not committed`,
+        );
+      }
+      const existing = this.#appendEffects.get(output.effectId);
+      if (existing !== undefined) {
+        if (existing.pageId !== output.pageId || existing.blockId !== output.blockId) {
+          throw new DeliveryStoreError(
+            "DELIVERY_EFFECT_CONFLICT",
+            `Delivery effect ${output.effectId} was already committed with another target`,
+            { effectId: output.effectId },
+          );
+        }
+      } else {
+        missingOutputs.push(output);
+      }
+    }
+
+    const capacities = new Map<string, DeliveryMailboxCapacity>();
+    for (const capacity of input.mailboxes) {
+      if (capacity === null || typeof capacity !== "object") {
+        throw new DeliveryStoreError(
+          "OUTPUT_CAPACITY_INVALID",
+          "A mailbox capacity must be an object",
+        );
+      }
+      assertId(capacity.consumerId, "consumerId");
+      if (
+        capacities.has(capacity.consumerId) ||
+        !Number.isSafeInteger(capacity.maxResidentCount) ||
+        capacity.maxResidentCount <= 0 ||
+        !Number.isSafeInteger(capacity.maxResidentBytes) ||
+        capacity.maxResidentBytes <= 0
+      ) {
+        throw new DeliveryStoreError(
+          "OUTPUT_CAPACITY_INVALID",
+          "Mailbox capacities require unique consumers and positive safe-integer limits",
+        );
+      }
+      const pageIds = this.validateClaimPages(capacity.consumerId, capacity.pageIds);
+      const registeredPageIds = [...this.#pages.values()]
+        .filter((page) => page.subscriptions.has(capacity.consumerId))
+        .map((page) => page.id)
+        .sort();
+      if (
+        registeredPageIds.length !== pageIds.length ||
+        registeredPageIds.some((pageId, index) => pageId !== pageIds[index])
+      ) {
+        throw new DeliveryStoreError(
+          "OUTPUT_CAPACITY_INVALID",
+          `Mailbox capacity for ${capacity.consumerId} must name every subscribed Page`,
+          { consumerId: capacity.consumerId },
+        );
+      }
+      capacities.set(capacity.consumerId, {
+        consumerId: capacity.consumerId,
+        pageIds,
+        maxResidentCount: capacity.maxResidentCount,
+        maxResidentBytes: capacity.maxResidentBytes,
+      });
+    }
+
+    const affectedConsumers = new Set<string>();
+    for (const output of input.outputs) {
+      for (const consumerId of this.#requirePage(output.pageId).subscriptions.keys()) {
+        affectedConsumers.add(consumerId);
+        if (!capacities.has(consumerId)) {
+          throw new DeliveryStoreError(
+            "OUTPUT_CAPACITY_INVALID",
+            `Output consumer ${consumerId} has no mailbox capacity`,
+            { consumerId },
+          );
+        }
+      }
+    }
+
+    const projections: DeliveryOutputCapacityProjection[] = [];
+    for (const consumerId of [...affectedConsumers].sort()) {
+      const capacity = capacities.get(consumerId)!;
+      const resident = this.inspectResident(consumerId, capacity.pageIds);
+      let acknowledgedInputCount = 0;
+      let acknowledgedInputBytes = 0;
+      if (consumerId === moduleJob.consumerId) {
+        for (const deliveryId of moduleJob.deliveryIds) {
+          const delivery = this.#deliveries.get(deliveryId)!;
+          if (delivery.obligations.get(consumerId) !== "claimed") {
+            throw new DeliveryStoreError(
+              "CLAIM_STALE",
+              `Claim ${input.claim.claimToken} no longer owns its exact input`,
+            );
+          }
+          acknowledgedInputCount += 1;
+          acknowledgedInputBytes += canonicalJsonByteLength(
+            this.#blocks.get(delivery.record.blockId)!,
+          );
+        }
+      }
+
+      let appendedOutputCount = 0;
+      let appendedOutputBytes = 0;
+      for (const output of missingOutputs) {
+        const page = this.#requirePage(output.pageId);
+        if (!page.subscriptions.has(consumerId)) continue;
+        appendedOutputCount += 1;
+        appendedOutputBytes += canonicalJsonByteLength(this.#blocks.get(output.blockId)!);
+      }
+      const projectedResidentCount =
+        resident.residentCount - acknowledgedInputCount + appendedOutputCount;
+      const projectedResidentBytes =
+        resident.residentBytes - acknowledgedInputBytes + appendedOutputBytes;
+      if (
+        !Number.isSafeInteger(acknowledgedInputBytes) ||
+        !Number.isSafeInteger(appendedOutputBytes) ||
+        !Number.isSafeInteger(projectedResidentCount) ||
+        !Number.isSafeInteger(projectedResidentBytes) ||
+        projectedResidentCount < 0 ||
+        projectedResidentBytes < 0
+      ) {
+        throw new DeliveryStoreError(
+          "OUTPUT_CAPACITY_INVALID",
+          "Output capacity projection is outside the safe integer range",
+          { consumerId },
+        );
+      }
+      projections.push(deepFreeze({
+        consumerId,
+        residentCount: resident.residentCount,
+        residentBytes: resident.residentBytes,
+        acknowledgedInputCount,
+        acknowledgedInputBytes,
+        appendedOutputCount,
+        appendedOutputBytes,
+        projectedResidentCount,
+        projectedResidentBytes,
+        maxResidentCount: capacity.maxResidentCount,
+        maxResidentBytes: capacity.maxResidentBytes,
+        blocked:
+          projectedResidentCount > capacity.maxResidentCount ||
+          projectedResidentBytes > capacity.maxResidentBytes,
+      }));
+    }
+    return deepFreeze({
+      blockedConsumerIds: projections
+        .filter((projection) => projection.blocked)
+        .map((projection) => projection.consumerId),
+      projections,
     });
   }
 
