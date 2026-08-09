@@ -131,6 +131,114 @@ function decodeStream(
 }
 
 describe("descriptor-bound chat reasoning wire behavior", () => {
+  it("decodes only the measured closed Aether Qwen response envelope", () => {
+    const document = chatDescriptor({
+      endpointId: "owner-aether-fixture",
+      modelId: "qwen3.6-27b",
+      reasoning: objectFormReasoning(),
+    });
+    const registry = new ModelDescriptorRegistry({
+      schemaDigest: SCHEMA_DIGEST,
+      allowedStrategyIds: new Set([...CHAT_STRATEGIES, "aether.qwen.chat.response.v2"]),
+    });
+    const ref = registry.register({
+      ...document,
+      adapter: {
+        ...document.adapter,
+        responseStrategyId: "aether.qwen.chat.response.v2",
+      },
+    });
+    registry.setStatus(ref, "active");
+    const snapshot = registry.snapshot(ref);
+    const decision = mapReasoningPolicy(
+      snapshot.document.features.reasoning,
+      "require",
+      "non-stream",
+    );
+    const measured = {
+      choices: [{
+        finish_reason: "stop",
+        index: 0,
+        message: {
+          content: '{"answer":"EMBER-7421"}',
+          provider_specific_fields: { refusal: null },
+          reasoning_content: "ground the answer in the fetched record",
+          role: "assistant",
+        },
+        provider_specific_fields: {},
+      }],
+      error: null,
+      model: "qwen3.6-reasoner",
+      usage: {
+        completion_tokens: 42,
+        prompt_tokens: 12,
+        prompt_tokens_details: null,
+        total_tokens: 54,
+      },
+    };
+
+    expect(
+      decodeOpenAiCompatibleChatResponse(
+        snapshot,
+        Buffer.from(JSON.stringify(measured)),
+        decision,
+      ),
+    ).toMatchObject({
+      finalContent: '{"answer":"EMBER-7421"}',
+      finishReason: "stop",
+      reasoning: {
+        state: "observed",
+        parts: ["ground the answer in the fetched record"],
+      },
+    });
+
+    const currentEnvelope = {
+      id: "chatcmpl-current",
+      object: "chat.completion",
+      created: 1_786_293_600,
+      model: measured.model,
+      choices: measured.choices,
+      usage: measured.usage,
+    };
+    expect(
+      decodeOpenAiCompatibleChatResponse(
+        snapshot,
+        Buffer.from(JSON.stringify(currentEnvelope)),
+        decision,
+      ),
+    ).toMatchObject({
+      finalContent: '{"answer":"EMBER-7421"}',
+      finishReason: "stop",
+    });
+
+    for (const mutation of [
+      { ...measured, id: "silently-opened" },
+      { ...measured, error: { message: "provider failure" } },
+      {
+        ...measured,
+        choices: [{ ...measured.choices[0], provider_specific_fields: { new_field: true } }],
+      },
+      {
+        ...measured,
+        choices: [{
+          ...measured.choices[0],
+          message: {
+            ...measured.choices[0].message,
+            provider_specific_fields: { refusal: "blocked" },
+          },
+        }],
+      },
+    ]) {
+      expect(() =>
+        decodeOpenAiCompatibleChatResponse(
+          snapshot,
+          Buffer.from(JSON.stringify(mutation)),
+          decision,
+        )
+      ).toThrowError(ModelChatError);
+    }
+  });
+
   it("uses the measured Aether object control for on, off, and endpoint default", () => {
     const snapshot = activeSnapshot({
       endpointId: "owner-aether-fixture",

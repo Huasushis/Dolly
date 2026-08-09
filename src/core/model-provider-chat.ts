@@ -669,6 +669,66 @@ function validateProviderEnvelope(value: unknown): Record<string, unknown> {
   return value;
 }
 
+function validateAetherQwenEnvelope(value: unknown): Record<string, unknown> {
+  if (!isPlainObject(value)) {
+    throw new ModelChatError(
+      "CHAT_PROVIDER_PROTOCOL_ERROR",
+      "Aether Qwen response must be an object",
+    );
+  }
+  const keys = Object.keys(value).sort().join(",");
+  const legacyEnvelope = keys === "choices,error,model,usage";
+  const openAiEnvelope = keys === "choices,created,id,model,object,usage";
+  if (!legacyEnvelope && !openAiEnvelope) {
+    throw new ModelChatError(
+      "CHAT_PROVIDER_PROTOCOL_ERROR",
+      "Aether Qwen response does not match a measured envelope",
+    );
+  }
+  if (
+    (legacyEnvelope && value.error !== null) ||
+    (openAiEnvelope &&
+      (typeof value.id !== "string" ||
+        value.id.length === 0 ||
+        value.object !== "chat.completion" ||
+        typeof value.created !== "number" ||
+        !Number.isSafeInteger(value.created))) ||
+    typeof value.model !== "string" ||
+    value.model.length === 0 ||
+    !Array.isArray(value.choices)
+  ) {
+    throw new ModelChatError(
+      "CHAT_PROVIDER_PROTOCOL_ERROR",
+      "Aether Qwen response identity, error, or choices are invalid",
+    );
+  }
+  return value;
+}
+
+function validateAetherProviderFields(choice: Record<string, unknown>): void {
+  closed(
+    choice.provider_specific_fields,
+    [],
+    "Aether Qwen choice provider-specific fields",
+  );
+  closed(
+    choice.message,
+    ["role", "content", "reasoning_content", "provider_specific_fields"],
+    "Aether Qwen provider message",
+  );
+  closed(
+    choice.message.provider_specific_fields,
+    ["refusal"],
+    "Aether Qwen message provider-specific fields",
+  );
+  if (choice.message.provider_specific_fields.refusal !== null) {
+    throw new ModelChatError(
+      "CHAT_PROVIDER_PROTOCOL_ERROR",
+      "Aether Qwen returned an unsupported refusal value",
+    );
+  }
+}
+
 export function decodeOpenAiCompatibleChatResponse(
   snapshot: ChatDescriptorSnapshot,
   bytes: Uint8Array,
@@ -680,7 +740,11 @@ export function decodeOpenAiCompatibleChatResponse(
       "A non-stream response requires a non-stream reasoning decision",
     );
   }
-  if (snapshot.document.adapter.responseStrategyId !== "openai.chat.response.v1") {
+  const responseStrategyId = snapshot.document.adapter.responseStrategyId;
+  if (
+    responseStrategyId !== "openai.chat.response.v1" &&
+    responseStrategyId !== "aether.qwen.chat.response.v2"
+  ) {
     throw new ModelChatError(
       "CHAT_STRATEGY_UNSUPPORTED",
       "The selected response strategy has no installed codec",
@@ -698,7 +762,10 @@ export function decodeOpenAiCompatibleChatResponse(
       "Provider response is not bounded strict JSON",
     );
   }
-  const envelope = validateProviderEnvelope(value);
+  const aetherQwen = responseStrategyId === "aether.qwen.chat.response.v2";
+  const envelope = aetherQwen
+    ? validateAetherQwenEnvelope(value)
+    : validateProviderEnvelope(value);
   if ((envelope.choices as unknown[]).length !== 1) {
     throw new ModelChatError(
       "CHAT_PROVIDER_PROTOCOL_ERROR",
@@ -706,7 +773,13 @@ export function decodeOpenAiCompatibleChatResponse(
     );
   }
   const choice = (envelope.choices as unknown[])[0];
-  closed(choice, ["index", "message", "finish_reason", "logprobs"], "provider choice");
+  closed(
+    choice,
+    aetherQwen
+      ? ["index", "message", "finish_reason", "provider_specific_fields"]
+      : ["index", "message", "finish_reason", "logprobs"],
+    "provider choice",
+  );
   if (choice.index !== 0 || typeof choice.finish_reason !== "string") {
     throw new ModelChatError("CHAT_PROVIDER_PROTOCOL_ERROR", "Provider choice is invalid");
   }
@@ -716,32 +789,38 @@ export function decodeOpenAiCompatibleChatResponse(
       "Provider returned an undeclared finish reason",
     );
   }
+  if (aetherQwen) {
+    validateAetherProviderFields(choice);
+  }
   closed(
     choice.message,
-    ["role", "content", "reasoning_content", "tool_calls", "refusal"],
+    aetherQwen
+      ? ["role", "content", "reasoning_content", "provider_specific_fields"]
+      : ["role", "content", "reasoning_content", "tool_calls", "refusal"],
     "provider message",
   );
-  if (choice.message.role !== "assistant") {
+  const message = choice.message;
+  if (message.role !== "assistant") {
     throw new ModelChatError("CHAT_PROVIDER_PROTOCOL_ERROR", "Provider role is invalid");
   }
-  if (choice.message.content !== null && typeof choice.message.content !== "string") {
+  if (message.content !== null && typeof message.content !== "string") {
     throw new ModelChatError("CHAT_PROVIDER_PROTOCOL_ERROR", "Provider content is invalid");
   }
   if (
-    choice.message.reasoning_content !== undefined &&
-    choice.message.reasoning_content !== null &&
-    typeof choice.message.reasoning_content !== "string"
+    message.reasoning_content !== undefined &&
+    message.reasoning_content !== null &&
+    typeof message.reasoning_content !== "string"
   ) {
     throw new ModelChatError(
       "CHAT_PROVIDER_PROTOCOL_ERROR",
       "Provider reasoning channel is invalid",
     );
   }
-  const toolCalls = parseToolCalls(snapshot, choice.message.tool_calls);
-  const finalContent = choice.message.content ?? "";
+  const toolCalls = parseToolCalls(snapshot, message.tool_calls);
+  const finalContent = message.content ?? "";
   const reasoningContent =
-    typeof choice.message.reasoning_content === "string"
-      ? choice.message.reasoning_content
+    typeof message.reasoning_content === "string"
+      ? message.reasoning_content
       : undefined;
   const outputBytes =
     Buffer.byteLength(finalContent, "utf8") +
