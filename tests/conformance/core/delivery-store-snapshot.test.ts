@@ -76,6 +76,37 @@ function createHarness(maxFailedAttempts = 3) {
 }
 
 describe("CORE DeliveryStore restart snapshot", () => {
+  it("notifies change listeners only after persistence succeeds", () => {
+    const { blocks, deliveries } = createHarness();
+    deliveries.createPage("page");
+    deliveries.registerConsumer("page", "consumer", "from-now");
+    const block = blocks.commit(proposal("durable wake"), source);
+    let notifications = 0;
+    const unsubscribe = deliveries.subscribeChanges(() => {
+      notifications += 1;
+    });
+
+    deliveries.setMutationObserver(() => {
+      throw new Error("persistence failed");
+    });
+    expect(() => deliveries.append("page", block.id)).toThrowError(
+      expect.objectContaining<Partial<DeliveryStoreError>>({
+        code: "DELIVERY_PERSISTENCE_FAILED",
+      }),
+    );
+    expect(notifications).toBe(0);
+
+    deliveries.setMutationObserver(() => undefined);
+    deliveries.flushPersistence();
+    expect(notifications).toBe(1);
+
+    unsubscribe();
+    unsubscribe();
+    const second = blocks.commit(proposal("after unsubscribe"), source);
+    deliveries.append("page", second.id);
+    expect(notifications).toBe(1);
+  });
+
   it("persists the configured subscription start and reports pending work", () => {
     const original = createHarness();
     original.deliveries.createPage("page");

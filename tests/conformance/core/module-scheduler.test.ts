@@ -287,6 +287,72 @@ function eventTypes(events: readonly SchedulerEvent[], moduleId?: string): strin
 }
 
 describe("CORE scheduler run loop serialization", () => {
+  it("wakes from persisted Delivery changes and coalesces an arrival burst", async () => {
+    let blockId = 0;
+    let deliveryId = 0;
+    const blocks = new BlockStore({
+      nextBlockId: () => `wake-block-${++blockId}`,
+      now: () => NOW,
+    });
+    const deliveries = new DeliveryStore({
+      blocks,
+      maxFailedAttempts: 3,
+      nextId: (kind) => `${kind}-wake-${++deliveryId}`,
+      now: () => NOW,
+    });
+    deliveries.createPage("input");
+    deliveries.registerConsumer("input", "worker", "from-now");
+
+    const clock = new FakeSchedulerClock();
+    const runtime = new FakeModuleRuntime(() => ({ status: "idle" }));
+    const scheduler = new ModuleScheduler({
+      instanceId: "instance-1",
+      deliveries,
+      clock,
+      pollIntervalMs: 60_000,
+      retryBaseMs: 250,
+      retryMaxMs: 2_000,
+      maxConcurrentModules: 1,
+      backpressureAction: "pause-upstream",
+      downstreamRecheckMs: 50,
+      noProgressAfterMs: 1_000,
+      claimLimitCount: 8,
+      claimLimitBytes: 4_096,
+      retryJitterRatio: 0,
+    });
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+    });
+    scheduler.start();
+    await drain(clock);
+    expect(runtime.tickCount).toBe(0);
+
+    for (const text of ["one", "two", "three"]) {
+      const block = blocks.commit(
+        { payload: { schema: "test.content/1", value: { text } } },
+        { kind: "external", id: "console" },
+      );
+      deliveries.append("input", block.id);
+    }
+    await drain(clock);
+
+    expect(clock.monotonicNow()).toBe(0);
+    expect(runtime.tickCount).toBe(1);
+    await scheduler.stop();
+    expect(clock.liveTimerCount).toBe(0);
+
+    const afterStop = blocks.commit(
+      { payload: { schema: "test.content/1", value: { text: "after-stop" } } },
+      { kind: "external", id: "console" },
+    );
+    deliveries.append("input", afterStop.id);
+    expect(clock.liveTimerCount).toBe(0);
+  });
+
   it("drives one tick for a Module with pending input and never overlaps it", async () => {
     const { clock, mailboxes, scheduler, events } = createScheduler();
     const runtime = new FakeModuleRuntime();

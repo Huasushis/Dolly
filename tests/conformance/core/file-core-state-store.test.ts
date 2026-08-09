@@ -115,6 +115,44 @@ describe("CORE atomic file state", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  it("publishes Delivery changes only after an enclosing atomic write succeeds", () => {
+    const committed = openStore(path, "committed-notification");
+    let committedNotifications = 0;
+    committed.deliveries.subscribeChanges(() => {
+      committedNotifications += 1;
+    });
+
+    committed.runAtomicUpdate(() => {
+      committed.deliveries.createPage("committed-page");
+      expect(committedNotifications).toBe(0);
+    });
+    expect(committedNotifications).toBe(1);
+    expect(openStore(path, "committed-reopen").deliveries.listPageIds()).toContain(
+      "committed-page",
+    );
+
+    const failedPath = join(root, "failed-core-state.json");
+    const failed = openStore(failedPath, "failed-notification");
+    const beforeBytes = readFileSync(failedPath);
+    let failedNotifications = 0;
+    failed.deliveries.subscribeChanges(() => {
+      failedNotifications += 1;
+    });
+
+    expect(() =>
+      failed.runAtomicUpdate(() => {
+        failed.deliveries.createPage("not-persisted");
+        expect(failedNotifications).toBe(0);
+        throw new Error("abort atomic update");
+      }),
+    ).toThrow();
+    expect(failedNotifications).toBe(0);
+    expect(readFileSync(failedPath)).toEqual(beforeBytes);
+    expect(openStore(failedPath, "failed-reopen").deliveries.listPageIds()).not.toContain(
+      "not-persisted",
+    );
+  });
+
   it("reconstructs one coherent reference, Block, and Delivery state at an active claim", () => {
     const first = openStore(path, "first");
     first.deliveries.createPage("input");

@@ -577,6 +577,7 @@ const DELIVERY_STORE_PUBLIC_METHODS = [
   "registerConsumer",
   "inspectSubscription",
   "inspectPending",
+  "subscribeChanges",
   "append",
   "appendOnce",
   "validateOutputPages",
@@ -722,7 +723,11 @@ function exposeCheckedObject<T extends object>(options: {
       );
     }
     defined.add(property);
-    const method = Reflect.get(options.target, property, options.target) as unknown;
+    const method = (
+      options.replacements?.has(property)
+        ? options.replacements.get(property)
+        : Reflect.get(options.target, property, options.target)
+    ) as unknown;
     if (typeof method !== "function") {
       throw new TypeError(
         `${options.label}.${String(property)} is not a method`,
@@ -1277,6 +1282,8 @@ export class FileCoreStateStore {
   #reopenRequired = false;
   #componentMutationInProgress = false;
   #configuredCallbackInProgress = false;
+  readonly #deliveryChangeListeners = new Set<() => void>();
+  #deliveryChangePending = false;
   #persistedStateDigest: string;
 
   constructor(options: FileCoreStateStoreOptions) {
@@ -1449,6 +1456,9 @@ export class FileCoreStateStore {
       assertUsable,
       label: "FileCoreStateStore.deliveries",
       methods: DELIVERY_STORE_PUBLIC_METHODS,
+      replacements: new Map([
+        ["subscribeChanges", (listener: () => void) => this.#subscribeDeliveryChanges(listener)],
+      ]),
       mutationMethods: DELIVERY_STORE_MUTATION_METHODS,
       invokeMutation,
     }) as unknown as FileCoreDeliveryOperations;
@@ -1496,6 +1506,12 @@ export class FileCoreStateStore {
     this.#media?.setMutationObserver(persist);
     this.#blocks.setMutationObserver(persist);
     this.#deliveries.setMutationObserver(persist);
+    this.#deliveries.subscribeChanges(() => {
+      this.#deliveryChangePending = true;
+      if (!this.#deferPersistence && !this.#componentMutationInProgress) {
+        this.#publishDeliveryChanges();
+      }
+    });
 
     // The terminal writer is deliberately not a property of the store. The
     // construction factory below retrieves this frozen, store-bound closure
@@ -2011,6 +2027,7 @@ export class FileCoreStateStore {
     } catch (error) {
       this.#deferPersistence = false;
       this.#deferredMutation = false;
+      this.#deliveryChangePending = false;
       this.#moduleProcessRecords.clear();
       for (const [key, value] of processRecords) this.#moduleProcessRecords.set(key, value);
       this.#moduleSubmissionRecords.clear();
@@ -2036,12 +2053,15 @@ export class FileCoreStateStore {
     this.#deferredMutation = false;
     if (!mutated) {
       this.#confirmInMemoryStateMatchesPersistedState();
+      this.#publishDeliveryChanges();
       return;
     }
     try {
       this.#persistCurrent();
       this.#confirmInMemoryStateMatchesPersistedState();
+      this.#publishDeliveryChanges();
     } catch (error) {
+      this.#deliveryChangePending = false;
       this.#reopenRequired = true;
       throw error;
     }
@@ -2136,6 +2156,7 @@ export class FileCoreStateStore {
     } catch (error) {
       this.#componentMutationInProgress = false;
       this.#confirmInMemoryStateMatchesPersistedState();
+      this.#publishDeliveryChanges();
       throw error;
     }
 
@@ -2149,11 +2170,13 @@ export class FileCoreStateStore {
         (value) => {
           this.#componentMutationInProgress = false;
           this.#confirmInMemoryStateMatchesPersistedState();
+          this.#publishDeliveryChanges();
           return value;
         },
         (error: unknown) => {
           this.#componentMutationInProgress = false;
           this.#confirmInMemoryStateMatchesPersistedState();
+          this.#publishDeliveryChanges();
           throw error;
         },
       ) as Result;
@@ -2161,7 +2184,42 @@ export class FileCoreStateStore {
 
     this.#componentMutationInProgress = false;
     this.#confirmInMemoryStateMatchesPersistedState();
+    this.#publishDeliveryChanges();
     return result;
+  }
+
+  #subscribeDeliveryChanges(listener: () => void): () => void {
+    this.#assertUsable();
+    if (typeof listener !== "function") {
+      throw new TypeError("FileCoreStateStore Delivery change listener must be a function");
+    }
+    this.#deliveryChangeListeners.add(listener);
+    let subscribed = true;
+    return () => {
+      if (!subscribed) return;
+      subscribed = false;
+      this.#deliveryChangeListeners.delete(listener);
+    };
+  }
+
+  #publishDeliveryChanges(): void {
+    if (!this.#deliveryChangePending) return;
+    this.#deliveryChangePending = false;
+    for (const listener of [...this.#deliveryChangeListeners]) {
+      try {
+        const result: unknown = listener();
+        if (
+          result !== null &&
+          (typeof result === "object" || typeof result === "function") &&
+          typeof (result as { readonly then?: unknown }).then === "function"
+        ) {
+          void Promise.resolve(result).catch(() => undefined);
+        }
+      } catch {
+        // Delivery-change listeners are wake-up hints and cannot change the
+        // result of an already persisted Core-state update.
+      }
+    }
   }
 
   #invokeConfiguredCallback<Arguments extends readonly unknown[], Result>(

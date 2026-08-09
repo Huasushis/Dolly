@@ -164,6 +164,13 @@ export interface DeliveryStoreOptions {
   readonly onMutation?: () => void;
 }
 
+/**
+ * A best-effort notification that a DeliveryStore mutation is durably visible
+ * to readers of this store.  It carries no authority and no mutable state: a
+ * scheduler must re-read `inspectPending` before making a decision.
+ */
+export type DeliveryStoreChangeListener = () => void;
+
 interface PageState {
   readonly id: string;
   nextSequence: bigint;
@@ -405,6 +412,7 @@ export class DeliveryStore {
   readonly #claims = new Map<string, ClaimState>();
   readonly #appendEffects = new Map<string, DeliveryAppendEffect>();
   readonly #deadLetters: DeadLetterRecord[] = [];
+  readonly #changeListeners = new Set<DeliveryStoreChangeListener>();
   #onMutation: (() => void) | undefined;
   #persistenceDirty = false;
   #notifyingMutation = false;
@@ -439,6 +447,25 @@ export class DeliveryStore {
       throw new TypeError("DeliveryStore mutation observer must be a function");
     }
     this.#onMutation = observer;
+  }
+
+  /**
+   * Subscribe to successfully persisted Delivery-state changes.  Repeated
+   * mutations may be coalesced by the consumer; the callback is only a wake-up
+   * hint and callers must always inspect the current store state.  Listener
+   * failures cannot break a committed Delivery mutation.
+   */
+  subscribeChanges(listener: DeliveryStoreChangeListener): () => void {
+    if (typeof listener !== "function") {
+      throw new TypeError("DeliveryStore change listener must be a function");
+    }
+    this.#changeListeners.add(listener);
+    let subscribed = true;
+    return () => {
+      if (!subscribed) return;
+      subscribed = false;
+      this.#changeListeners.delete(listener);
+    };
   }
 
   flushPersistence(): void {
@@ -2236,7 +2263,10 @@ export class DeliveryStore {
   }
 
   #persistMutation(): void {
-    if (!this.#onMutation) return;
+    if (!this.#onMutation) {
+      this.#notifyChangeListeners();
+      return;
+    }
     this.#persistenceDirty = true;
     this.#notifyMutationObserver();
   }
@@ -2256,6 +2286,7 @@ export class DeliveryStore {
         throw new TypeError("DeliveryStore mutation observers must complete synchronously");
       }
       this.#persistenceDirty = false;
+      this.#notifyChangeListeners();
     } catch {
       throw new DeliveryStoreError(
         "DELIVERY_PERSISTENCE_FAILED",
@@ -2263,6 +2294,24 @@ export class DeliveryStore {
       );
     } finally {
       this.#notifyingMutation = false;
+    }
+  }
+
+  #notifyChangeListeners(): void {
+    for (const listener of [...this.#changeListeners]) {
+      try {
+        const result: unknown = listener();
+        if (
+          result !== null &&
+          (typeof result === "object" || typeof result === "function") &&
+          typeof (result as { readonly then?: unknown }).then === "function"
+        ) {
+          void Promise.resolve(result).catch(() => undefined);
+        }
+      } catch {
+        // A wake-up observer is not part of Delivery persistence and cannot
+        // make a successfully committed mutation fail.
+      }
     }
   }
 }

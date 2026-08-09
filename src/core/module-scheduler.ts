@@ -93,6 +93,12 @@ export interface SchedulerPendingSnapshot {
  */
 export interface SchedulerPendingReader {
   inspectPending(consumerId: string, pageIds: readonly string[]): SchedulerPendingSnapshot;
+  /**
+   * Optional durable-change notification.  It is only a wake-up hint; the
+   * scheduler re-reads every mailbox before deciding.  The returned function
+   * must unsubscribe idempotently.
+   */
+  subscribeChanges?(listener: () => void): () => void;
 }
 
 export type { DownstreamAvailability, DownstreamPressure };
@@ -568,6 +574,7 @@ export class ModuleScheduler {
   #lastProgressAt: number | null = null;
   #noProgressActive = false;
   #stopPromise: Promise<void> | null = null;
+  #unsubscribeDeliveryChanges: (() => void) | null = null;
 
   constructor(options: ModuleSchedulerOptions) {
     if (!ID_PATTERN.test(options.instanceId)) {
@@ -614,6 +621,15 @@ export class ModuleScheduler {
       throw new ModuleSchedulerError(
         "SCHEDULER_CONFIGURATION_INVALID",
         "deliveries must supply inspectPending",
+      );
+    }
+    if (
+      options.deliveries.subscribeChanges !== undefined &&
+      typeof options.deliveries.subscribeChanges !== "function"
+    ) {
+      throw new ModuleSchedulerError(
+        "SCHEDULER_CONFIGURATION_INVALID",
+        "deliveries.subscribeChanges must be a function when present",
       );
     }
     if (options.policy !== undefined && typeof options.policy.decide !== "function") {
@@ -764,6 +780,17 @@ export class ModuleScheduler {
     if (this.#state === "running") return;
     this.#state = "running";
     this.#lastProgressAt = this.#clock.monotonicNow();
+    if (this.#deliveries.subscribeChanges) {
+      const unsubscribe = this.#deliveries.subscribeChanges(() => this.wake());
+      if (typeof unsubscribe !== "function") {
+        this.#state = "created";
+        throw new ModuleSchedulerError(
+          "SCHEDULER_CONFIGURATION_INVALID",
+          "deliveries.subscribeChanges must return an unsubscribe function",
+        );
+      }
+      this.#unsubscribeDeliveryChanges = unsubscribe;
+    }
     this.#armPoll();
     this.#requestPass();
   }
@@ -786,6 +813,15 @@ export class ModuleScheduler {
   stop(): Promise<void> {
     if (this.#stopPromise) return this.#stopPromise;
     this.#state = "stopping";
+    const unsubscribe = this.#unsubscribeDeliveryChanges;
+    this.#unsubscribeDeliveryChanges = null;
+    if (unsubscribe) {
+      try {
+        unsubscribe();
+      } catch {
+        // A best-effort change observer cannot weaken scheduler shutdown.
+      }
+    }
     this.#cancelTimers();
     this.#stopPromise = (async () => {
       // A settling tick can never enqueue another one while stopping, but it
