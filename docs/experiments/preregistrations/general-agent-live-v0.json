@@ -1,0 +1,88 @@
+{
+  "schemaVersion": "dolly.experiment-preregistration/1",
+  "experimentId": "general-agent-live-v0",
+  "experimentVersion": 8,
+  "status": "exploratory-effect-demo",
+  "registeredAt": "2026-08-09T00:00:00.000Z",
+  "question": "Can one Scheduler-driven, process-isolated Module use only host-granted model and private-storage capabilities to recover a hidden synthetic fact and commit a grounded answer, while the same Agent without the storage capability does not guess it?",
+  "architectureBoundary": {
+    "productBootstrapModulesRemainRejected": true,
+    "candidateCompositionOnly": true,
+    "hostOwnsProviderUrlAndCredential": true,
+    "extensionEnvironmentIsEmpty": true,
+    "modelTransport": "experiment-only bounded fetch with redirects forbidden; the production pinned-DNS transport and proxy integration remain unproven",
+    "linuxControlGroupProofIncluded": false,
+    "unsupportedClaim": "This demo is not evidence that product Module startup or the Linux group lifecycle is supported."
+  },
+  "baseline": {
+    "conditionId": "no-storage-tool",
+    "description": "The same child and model capability receive the task but no private-storage handle. A valid result must report insufficient evidence and must not contain the hidden codename."
+  },
+  "treatment": {
+    "conditionId": "private-storage-tool",
+    "description": "The child receives a read-only Module-private-storage handle, must list keys, get the selected key, then answer from the returned value."
+  },
+  "data": {
+    "kind": "synthetic",
+    "task": "Find the active deployment codename in private memory. Use available tools and do not guess.",
+    "hiddenKey": "deployment-note",
+    "hiddenCodename": "EMBER-7421",
+    "decoyKey": "archived-note",
+    "seed": 7421
+  },
+  "modelFixture": {
+    "source": "owner-provided Aether OpenAI-compatible deployment",
+    "model": "qwen3.6-27b",
+    "descriptorReasoningControl": "thinking.type object",
+    "responseStrategyId": "aether.qwen.chat.response.v2",
+    "agentJsonFraming": "one bare JSON object or one json-labelled code fence with no surrounding text; object fields remain closed",
+    "toolContractPrompt": "the Agent receives the exact closed argument shape and list limit for each granted tool; capability enforcement remains authoritative",
+    "planningReasoningPolicy": "require",
+    "continuationReasoningPolicy": "disable",
+    "temperature": 0,
+    "planningMaxOutputTokens": 5200,
+    "continuationMaxOutputTokens": 800,
+    "maxModelInvocationsPerTreatmentRun": 3,
+    "maxModelInvocationsPerBaselineRun": 1,
+    "automaticProviderRetries": 0
+  },
+  "casePlan": [
+    { "conditionId": "no-storage-tool", "repetitions": 1 },
+    { "conditionId": "private-storage-tool", "repetitions": 1 }
+  ],
+  "metrics": {
+    "baselineNoSecretGuess": "baseline committed answer omits EMBER-7421 and reports grounded=false",
+    "treatmentToolSequence": "treatment records storage.list before storage.get before answer",
+    "treatmentGroundedAnswer": "treatment answer contains EMBER-7421, grounded=true, and evidenceKeys contains deployment-note",
+    "reasoningObserved": "the treatment planning model result contains reasoning.state=observed with at least one non-empty part",
+    "schedulerCompletion": "one committed output Delivery, zero pending input Delivery, and no remaining Module submission",
+    "secretIsolation": "child reports no AETHER_API_KEY/AETHER_BASE_URL environment variables and artifacts contain neither configured value"
+  },
+  "minimumEffect": {
+    "requiredCases": 2,
+    "allMetricsMustPass": true,
+    "minimumDifference": "treatment succeeds on the hidden fact while baseline does not contain it"
+  },
+  "stoppingRules": {
+    "stopOnFirstInfrastructureOrProtocolFailure": true,
+    "perModelCallTimeoutMs": 180000,
+    "perCaseTimeoutMs": 420000,
+    "maximumProviderCalls": 4,
+    "noUnregisteredRetry": true,
+    "replacementAfterInfrastructureFailure": "at most one fresh run id; preserve the failed run and never merge its cases or calls into the replacement"
+  },
+  "artifacts": {
+    "root": "artifacts/experiments/probes/general-agent-live-v0",
+    "required": [
+      "preregistration.json",
+      "provider-responses.jsonl",
+      "model-calls.jsonl",
+      "cases.jsonl",
+      "run-manifest.json",
+      "verification.json"
+    ],
+    "rawPerCall": true,
+    "forbidden": ["provider URL", "API key", "authorization header"]
+  },
+  "decisionRule": "If every metric passes, continue with the same capability-mediated vertical chain and add a simple task-switch Memory baseline. Otherwise keep product Module startup rejected and revise the failing capability, prompt/protocol, or Scheduler composition boundary before integration."
+}
