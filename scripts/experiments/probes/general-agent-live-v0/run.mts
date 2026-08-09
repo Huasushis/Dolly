@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import {
   appendFileSync,
   mkdirSync,
@@ -45,6 +46,7 @@ import {
   createModelOperationCapability,
   type ChatModelBrokerPort,
 } from "../../../../src/core/provider-capabilities/model-operation-capability.js";
+import { createToolInvocationCapabilityV2 } from "../../../../src/core/provider-capabilities/tool-invocation-capability.js";
 import {
   ReactiveModuleHost,
   type ManagedReactiveModuleRuntime,
@@ -54,16 +56,19 @@ import {
   type ReactiveModuleFailure,
   type ReactiveModuleRuntimeOptions,
 } from "../../../../src/core/reactive-module-runtime.js";
+import {
+  InMemoryToolJournalRepository,
+  ToolPolicySession,
+  ToolRegistry,
+  type ToolDescriptor,
+  type ToolExecutor,
+  type ToolTurnBudget,
+} from "../../../../src/core/tool-policy.js";
 import { waitForAgentCase } from "./wait-for-case.mjs";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "../../../..");
 const workspaceRoot = resolve(repositoryRoot, "..");
-const artifactRoot = join(repositoryRoot, "artifacts/experiments/probes/general-agent-live-v0");
-const preregistrationPath = join(
-  repositoryRoot,
-  "docs/experiments/preregistrations/general-agent-live-v0.json",
-);
 const extensionPath = join(scriptDirectory, "extension.mjs");
 const NOW = "2026-08-09T00:00:00.000Z";
 const HIDDEN_CODENAME = "EMBER-7421";
@@ -78,6 +83,30 @@ const CHAT_STRATEGIES = new Set([
   "openai.reasoning-content.stream.v1",
   "thinking-object.enabled-disabled.v1",
 ]);
+const REGISTRY_EXPERIMENT_IMPLEMENTATION_PATHS = [
+  "scripts/experiments/probes/general-agent-live-v0/run.mts",
+  "scripts/experiments/probes/general-agent-live-v0/extension.mjs",
+  "scripts/experiments/probes/general-agent-live-v0/verify-tool-registry.mjs",
+] as const;
+
+type AgentConditionId =
+  | "no-storage-tool"
+  | "private-storage-tool"
+  | "tool-registry-storage";
+
+interface AgentExperimentConfiguration {
+  readonly experimentId: "general-agent-live-v0" | "general-agent-tool-registry-v0";
+  readonly experimentVersion: number;
+  readonly runId: string;
+  readonly artifactRoot: string;
+  readonly preregistrationPath: string;
+  readonly executionOrder: readonly {
+    readonly evaluationSeed: number;
+    readonly repetition: number;
+    readonly conditionId: AgentConditionId;
+    readonly modelRequestIdBase: string;
+  }[];
+}
 
 function sha256(bytes: string | Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
@@ -193,11 +222,86 @@ class ExperimentFetchTransport implements ModelHttpTransport {
   }
 }
 
-function parseArguments(argv: readonly string[]): { runId: string } {
-  if (argv.length !== 2 || argv[0] !== "--run-id" || !/^live-v8-[A-Za-z0-9._-]+$/u.test(argv[1]!)) {
-    throw new Error("usage: run.mts --run-id live-v8-<identifier>");
+function parseArguments(argv: readonly string[]): AgentExperimentConfiguration {
+  if (argv.length !== 2 || argv[0] !== "--run-id") {
+    throw new Error(
+      "usage: run.mts --run-id live-v8-<identifier>|registry-v1-<identifier>",
+    );
   }
-  return { runId: argv[1]! };
+  const runId = argv[1]!;
+  if (/^live-v8-[A-Za-z0-9._-]+$/u.test(runId)) {
+    return {
+      experimentId: "general-agent-live-v0",
+      experimentVersion: 8,
+      runId,
+      artifactRoot: join(
+        repositoryRoot,
+        "artifacts/experiments/probes/general-agent-live-v0",
+      ),
+      preregistrationPath: join(
+        repositoryRoot,
+        "docs/experiments/preregistrations/general-agent-live-v0.json",
+      ),
+      executionOrder: [
+        {
+          evaluationSeed: 7421,
+          repetition: 1,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool",
+        },
+        {
+          evaluationSeed: 7421,
+          repetition: 1,
+          conditionId: "private-storage-tool",
+          modelRequestIdBase: "private-storage-tool",
+        },
+      ],
+    };
+  }
+  if (/^registry-v1-[A-Za-z0-9._-]+$/u.test(runId)) {
+    return {
+      experimentId: "general-agent-tool-registry-v0",
+      experimentVersion: 1,
+      runId,
+      artifactRoot: join(
+        repositoryRoot,
+        "artifacts/experiments/probes/general-agent-tool-registry-v0",
+      ),
+      preregistrationPath: join(
+        repositoryRoot,
+        "docs/experiments/preregistrations/general-agent-tool-registry-v0.json",
+      ),
+      executionOrder: [
+        {
+          evaluationSeed: 7421,
+          repetition: 1,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7421",
+        },
+        {
+          evaluationSeed: 7421,
+          repetition: 1,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7421",
+        },
+        {
+          evaluationSeed: 7422,
+          repetition: 2,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7422",
+        },
+        {
+          evaluationSeed: 7422,
+          repetition: 2,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7422",
+        },
+      ],
+    };
+  }
+  throw new Error(
+    "usage: run.mts --run-id live-v8-<identifier>|registry-v1-<identifier>",
+  );
 }
 
 function loadAetherEnvironment(): { baseUrl: string; apiKey: string } {
@@ -334,6 +438,161 @@ function safeModelCall(
   };
 }
 
+const STORAGE_TOOL_LIST_LIMIT = 3;
+const STORAGE_TOOL_BUDGET: ToolTurnBudget = {
+  maxRounds: 2,
+  maxCalls: 2,
+  maxCallsPerRound: 1,
+  maxApprovals: 0,
+  maxCallBytes: 2 * 1024,
+};
+
+function storageToolDescriptors(): readonly ToolDescriptor[] {
+  return [
+    {
+      toolId: "storage.list",
+      wireName: "storage_list",
+      description: "List private-memory keys in lexical order before reading a relevant item; for discovery, request the largest limit allowed by argumentSchema.",
+      argumentSchema: {
+        type: "object",
+        properties: {
+          prefix: { type: "string", maxBytes: 256 },
+          limit: { type: "integer", minimum: 1, maximum: STORAGE_TOOL_LIST_LIMIT },
+          after: { type: "string", maxBytes: 256 },
+        },
+        required: ["prefix", "limit"],
+        additionalProperties: false,
+        maxProperties: 3,
+      },
+      resultSchema: {
+        type: "object",
+        properties: {
+          schemaVersion: {
+            type: "string",
+            maxBytes: 64,
+            enum: ["dolly.storage-list/1"],
+          },
+          keys: {
+            type: "array",
+            items: { type: "string", maxBytes: 256 },
+            maxItems: STORAGE_TOOL_LIST_LIMIT,
+          },
+          truncated: { type: "boolean" },
+          nextAfter: { type: "string", maxBytes: 256 },
+        },
+        required: ["schemaVersion", "keys", "truncated"],
+        additionalProperties: false,
+        maxProperties: 4,
+      },
+      effectClass: "read",
+      resourceScope: "module-private-storage",
+      approval: "never",
+      idempotency: "effect-key",
+      outcomeQuery: "supported",
+      parallel: "safe",
+      deadlineMs: 1_000,
+      maxArgumentBytes: 1_024,
+      maxResultBytes: 4 * 1_024,
+    },
+    {
+      toolId: "storage.get",
+      wireName: "storage_get",
+      description: "Read one private-memory item by a key returned from the list operation.",
+      argumentSchema: {
+        type: "object",
+        properties: { key: { type: "string", minBytes: 1, maxBytes: 256 } },
+        required: ["key"],
+        additionalProperties: false,
+        maxProperties: 1,
+      },
+      resultSchema: {
+        type: "object",
+        properties: {
+          schemaVersion: {
+            type: "string",
+            maxBytes: 64,
+            enum: ["dolly.storage-get/1"],
+          },
+          found: { type: "enum", values: [true] },
+          value: {
+            type: "object",
+            properties: {
+              status: { type: "string", maxBytes: 32 },
+              codename: { type: "string", maxBytes: 64 },
+            },
+            required: ["status", "codename"],
+            additionalProperties: false,
+            maxProperties: 2,
+          },
+          updatedAt: { type: "string", maxBytes: 64 },
+        },
+        required: ["schemaVersion", "found", "value", "updatedAt"],
+        additionalProperties: false,
+        maxProperties: 4,
+      },
+      effectClass: "read",
+      resourceScope: "module-private-storage",
+      approval: "never",
+      idempotency: "effect-key",
+      outcomeQuery: "supported",
+      parallel: "safe",
+      deadlineMs: 1_000,
+      maxArgumentBytes: 1_024,
+      maxResultBytes: 4 * 1_024,
+    },
+  ];
+}
+
+function createReadOnlyStorageToolExecutor(options: {
+  readonly storage: ModulePrivateStorageBackend;
+  readonly instanceId: string;
+  readonly moduleId: string;
+}): ToolExecutor {
+  const namespace = options.storage.namespaceFor(options.instanceId, options.moduleId);
+  const binding = { namespace, instanceId: options.instanceId, moduleId: options.moduleId };
+  return {
+    execute: async (request) => {
+      if (request.toolId === "storage.list") {
+        const prefix = request.arguments.prefix as string;
+        const limit = request.arguments.limit as number;
+        const after = request.arguments.after as string | undefined;
+        const matching = options.storage
+          .read(binding)
+          .entries.filter(
+            (entry) =>
+              entry.key.startsWith(prefix) && (after === undefined || entry.key > after),
+          );
+        const page = matching.slice(0, limit);
+        const truncated = page.length < matching.length;
+        return {
+          status: "succeeded" as const,
+          content: {
+            schemaVersion: "dolly.storage-list/1",
+            keys: page.map((entry) => entry.key),
+            truncated,
+            ...(truncated ? { nextAfter: page[page.length - 1]!.key } : {}),
+          },
+        };
+      }
+      if (request.toolId === "storage.get") {
+        const key = request.arguments.key as string;
+        const entry = options.storage.read(binding).entries.find((candidate) => candidate.key === key);
+        if (!entry) return { status: "failed" as const, code: "STORAGE_KEY_NOT_FOUND" };
+        return {
+          status: "succeeded" as const,
+          content: {
+            schemaVersion: "dolly.storage-get/1",
+            found: true,
+            value: entry.value,
+            updatedAt: entry.updatedAt,
+          },
+        };
+      }
+      return { status: "failed" as const, code: "TOOL_NOT_IMPLEMENTED" };
+    },
+  };
+}
+
 function processIsAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -356,16 +615,20 @@ function parseAgentResult(blockValue: JsonValue): Record<string, unknown> {
 }
 
 async function runCondition(options: {
-  conditionId: "no-storage-tool" | "private-storage-tool";
+  conditionId: AgentConditionId;
+  evaluationSeed: number;
+  repetition: number;
+  modelRequestIdBase: string;
   runDirectory: string;
   broker: ChatModelBrokerPort;
 }): Promise<JsonValue> {
+  const caseIdentity = `${options.conditionId}-seed-${options.evaluationSeed}`;
   const conditionRoot = mkdtempSync(
-    join(resolve(workspaceRoot, ".tmp"), `general-agent-${options.conditionId}-`),
+    join(resolve(workspaceRoot, ".tmp"), `general-agent-${caseIdentity}-`),
   );
-  const instanceId = `instance-agent-${options.conditionId}`;
+  const instanceId = `instance-agent-${caseIdentity}`;
   const moduleId = "general-agent";
-  const moduleGenerationId = `module-generation-${options.conditionId}-1`;
+  const moduleGenerationId = `module-generation-${caseIdentity}-1`;
   const extensionHosts: ExtensionProcessHost[] = [];
   let host: ReactiveModuleHost | undefined;
   let childPid: number | undefined;
@@ -380,8 +643,8 @@ async function runCondition(options: {
     const core = new FileCoreStateStore({
       path: join(conditionRoot, "core-state.json"),
       maxFailedAttempts: 1,
-      nextBlockId: () => `block-${options.conditionId}-${++blockSequence}`,
-      nextDeliveryId: (kind) => `${kind}-${options.conditionId}-${++deliverySequence}`,
+      nextBlockId: () => `block-${caseIdentity}-${++blockSequence}`,
+      nextDeliveryId: (kind) => `${kind}-${caseIdentity}-${++deliverySequence}`,
       now: () => NOW,
     });
     core.deliveries.createPage("input");
@@ -499,7 +762,7 @@ async function runCondition(options: {
           shutdownRequestTimeoutMs: 2_000,
           forceKillDelayMs: 500,
           terminationTimeoutMs: 5_000,
-          nextIdentifier: (purpose) => `${purpose}-${options.conditionId}-${++identifierSequence}`,
+          nextIdentifier: (purpose) => `${purpose}-${caseIdentity}-${++identifierSequence}`,
         });
         processGenerationId = extensionHost.snapshot.processGenerationId;
         core.appendModuleProcessRecord({
@@ -510,13 +773,17 @@ async function runCondition(options: {
           processGenerationId,
           packageDigest: `sha256:${"a".repeat(64)}`,
           configurationReference: {
-            configId: `config-${options.conditionId}`,
+            configId: `config-${caseIdentity}`,
             revision: `sha256:${"b".repeat(64)}`,
             configVersion: 1,
           },
           declaredExternalEffects: "core-capabilities-only",
           serviceInvocationId:
-            options.conditionId === "no-storage-tool" ? "1".repeat(32) : "2".repeat(32),
+            options.conditionId === "no-storage-tool"
+              ? "1".repeat(32)
+              : options.conditionId === "private-storage-tool"
+                ? "2".repeat(32)
+                : "3".repeat(32),
           bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
           // Candidate composition only: this records the intended path but the
           // experiment does not claim delegated-cgroup attachment or stop proof.
@@ -549,15 +816,15 @@ async function runCondition(options: {
           reasoningPolicies: ["require", "disable"],
           roles: ["system", "user"],
           limits: {
-            maxInvocations: options.conditionId === "private-storage-tool" ? 3 : 1,
-            maxInvocationsPerRun: options.conditionId === "private-storage-tool" ? 3 : 1,
-            maxInvocationsPerWindow: options.conditionId === "private-storage-tool" ? 3 : 1,
+            maxInvocations: options.conditionId === "no-storage-tool" ? 1 : 3,
+            maxInvocationsPerRun: options.conditionId === "no-storage-tool" ? 1 : 3,
+            maxInvocationsPerWindow: options.conditionId === "no-storage-tool" ? 1 : 3,
             rateWindowMs: 60_000,
           },
           maxConcurrentInvocations: 1,
           requireIdempotencyKey: true,
           nextRequestId: () =>
-            `agent-${options.conditionId}-model-request-${++modelRequestSequence}`,
+            `agent-${options.modelRequestIdBase}-model-request-${++modelRequestSequence}`,
         });
         extensionHost.grantCapability(modelDefinition.grant, modelDefinition.handler);
         if (options.conditionId === "private-storage-tool") {
@@ -572,6 +839,46 @@ async function runCondition(options: {
             requireIdempotencyKey: true,
           });
           extensionHost.grantCapability(storageDefinition.grant, storageDefinition.handler);
+        } else if (options.conditionId === "tool-registry-storage") {
+          const descriptors = storageToolDescriptors();
+          const registry = new ToolRegistry(
+            descriptors,
+            descriptors.map((descriptor) => descriptor.toolId),
+          );
+          const toolExecutor = createReadOnlyStorageToolExecutor({
+            storage,
+            instanceId,
+            moduleId,
+          });
+          const toolDefinition = createToolInvocationCapabilityV2({
+            executionScope: "active-run",
+            expiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+            operations: ["list-tools", "execute-round"],
+            limits: {
+              maxInvocations: 3,
+              maxInvocationsPerRun: 3,
+              maxCallsPerRound: 1,
+            },
+            maxConcurrentInvocations: 1,
+            resolveRun: ({ moduleJobId }) => ({
+              registry,
+              budget: STORAGE_TOOL_BUDGET,
+              policy: new ToolPolicySession({
+                moduleJobId,
+                registry,
+                repository: new InMemoryToolJournalRepository(),
+                approval: {
+                  decide: async () => {
+                    throw new Error("Read-only experiment tools must not request approval");
+                  },
+                },
+                executor: toolExecutor,
+                budget: STORAGE_TOOL_BUDGET,
+                approvalPolicyRevision: "read-only-tools-v1",
+              }),
+            }),
+          });
+          extensionHost.grantCapability(toolDefinition.grant, toolDefinition.handler);
         }
         extensionHosts.push(extensionHost);
         const executor = createExtensionProcessModuleExecutor(extensionHost, {
@@ -701,6 +1008,8 @@ async function runCondition(options: {
     return {
       schemaVersion: "general-agent-live/case/1",
       conditionId: options.conditionId,
+      evaluationSeed: options.evaluationSeed,
+      repetition: options.repetition,
       result: result as unknown as JsonValue,
       schedulerCompletion,
       childPidRecorded: true,
@@ -733,9 +1042,58 @@ async function main(): Promise<void> {
   if (process.env.RUN_LIVE_INTEGRATION !== "1" || process.env.RUN_PAID_INTEGRATION !== "1") {
     throw new Error("RUN_LIVE_INTEGRATION=1 and RUN_PAID_INTEGRATION=1 are required");
   }
-  const { runId } = parseArguments(process.argv.slice(2));
+  const experiment = parseArguments(process.argv.slice(2));
+  const { artifactRoot, preregistrationPath, runId } = experiment;
   mkdirSync(resolve(workspaceRoot, ".tmp"), { recursive: true, mode: 0o700 });
   const preregistrationBytes = readFileSync(preregistrationPath);
+  const protocolBytes = readFileSync(join(repositoryRoot, "docs/experiments/protocol.md"));
+  const protocolSha256 = sha256(protocolBytes);
+  let implementationSha256: Readonly<Record<string, string>> = {};
+  if (experiment.experimentId === "general-agent-tool-registry-v0") {
+    const preregistration = JSON.parse(preregistrationBytes.toString("utf8")) as {
+      protocol?: { sha256?: unknown };
+      domainDesign?: { implementationFiles?: unknown };
+    };
+    if (preregistration.protocol?.sha256 !== protocolSha256) {
+      throw new Error("experiment protocol bytes differ from the frozen preregistration");
+    }
+    const registeredFiles = preregistration.domainDesign?.implementationFiles;
+    if (
+      registeredFiles === null ||
+      Array.isArray(registeredFiles) ||
+      typeof registeredFiles !== "object"
+    ) {
+      throw new Error("experiment implementation file digests are absent");
+    }
+    const registeredPaths = Object.keys(registeredFiles).sort();
+    if (
+      JSON.stringify(registeredPaths) !==
+      JSON.stringify([...REGISTRY_EXPERIMENT_IMPLEMENTATION_PATHS].sort())
+    ) {
+      throw new Error("experiment implementation file inventory is invalid");
+    }
+    implementationSha256 = Object.fromEntries(
+      Object.entries(registeredFiles as Record<string, unknown>).map(([path, expected]) => {
+        if (typeof expected !== "string" || !/^[0-9a-f]{64}$/u.test(expected)) {
+          throw new Error(`experiment implementation digest is invalid for ${path}`);
+        }
+        const actual = sha256(readFileSync(join(repositoryRoot, path)));
+        if (actual !== expected) {
+          throw new Error(`experiment implementation bytes differ for ${path}`);
+        }
+        return [path, actual];
+      }),
+    );
+  }
+  const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  }).trim();
+  const dirtyWorktree =
+    execFileSync("git", ["status", "--porcelain=v1"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+    }).trim().length > 0;
   const fixture = loadAetherEnvironment();
   const exactUrl = completionUrl(fixture.baseUrl);
   const host = exactUrl.hostname.replace(/^\[|\]$/gu, "");
@@ -804,11 +1162,18 @@ async function main(): Promise<void> {
     }),
     now: () => new Date().toISOString(),
   });
+  const maximumProviderCalls = experiment.executionOrder.reduce(
+    (total, plannedCase) =>
+      total + (plannedCase.conditionId === "no-storage-tool" ? 1 : 3),
+    0,
+  );
   let providerCalls = 0;
   const observedBroker: ChatModelBrokerPort = {
     invoke: async (invocation, options) => {
       providerCalls += 1;
-      if (providerCalls > 4) throw new Error("registered provider-call budget exceeded");
+      if (providerCalls > maximumProviderCalls) {
+        throw new Error("registered provider-call budget exceeded");
+      }
       const startedAt = new Date().toISOString();
       const result = await broker.invoke(invocation, options);
       const completedAt = new Date().toISOString();
@@ -824,9 +1189,23 @@ async function main(): Promise<void> {
   const startedAt = new Date().toISOString();
   let status: "completed" | "failed" = "completed";
   let failure: string | undefined;
+  const caseRows: JsonValue[] = [];
+  const perCaseAccounting: JsonValue[] = [];
   try {
-    for (const conditionId of ["no-storage-tool", "private-storage-tool"] as const) {
-      const caseRow = await runCondition({ conditionId, runDirectory, broker: observedBroker });
+    for (const plannedCase of experiment.executionOrder) {
+      const providerCallsBeforeCase = providerCalls;
+      const caseRow = await runCondition({
+        ...plannedCase,
+        runDirectory,
+        broker: observedBroker,
+      });
+      caseRows.push(caseRow);
+      perCaseAccounting.push({
+        evaluationSeed: plannedCase.evaluationSeed,
+        repetition: plannedCase.repetition,
+        conditionId: plannedCase.conditionId,
+        providerCalls: providerCalls - providerCallsBeforeCase,
+      });
       appendFileSync(casesPath, `${JSON.stringify(caseRow)}\n`, "utf8");
     }
   } catch (error) {
@@ -834,16 +1213,147 @@ async function main(): Promise<void> {
     failure = error instanceof Error ? error.message : "unknown failure";
   }
   const completedAt = new Date().toISOString();
-  const manifest = {
-    schemaVersion: "general-agent-live/run-manifest/1",
-    experimentId: "general-agent-live-v0",
-    experimentVersion: 8,
+  const rows = caseRows as unknown as readonly {
+    conditionId?: string;
+    result?: {
+      actions?: readonly string[];
+      answer?: { answer?: unknown; grounded?: unknown; evidenceKeys?: unknown };
+      reasoningObserved?: readonly boolean[];
+    };
+  }[];
+  const baselineRows = rows.filter((row) => row.conditionId === "no-storage-tool");
+  const treatmentRows = rows.filter((row) => row.conditionId !== "no-storage-tool");
+  const expectedTreatmentActions =
+    experiment.experimentId === "general-agent-tool-registry-v0"
+      ? ["storage_list", "storage_get", "answer"]
+      : ["storage.list", "storage.get", "answer"];
+  const baselineHiddenCodenameRate =
+    baselineRows.length === 0
+      ? null
+      : baselineRows.filter((row) =>
+          JSON.stringify(row.result?.answer ?? null).includes(HIDDEN_CODENAME),
+        ).length / baselineRows.length;
+  const treatmentGroundedRecoveryRate =
+    treatmentRows.length === 0
+      ? null
+      : treatmentRows.filter(
+          (row) =>
+            row.result?.answer?.grounded === true &&
+            typeof row.result.answer.answer === "string" &&
+            row.result.answer.answer.includes(HIDDEN_CODENAME) &&
+            Array.isArray(row.result.answer.evidenceKeys) &&
+            row.result.answer.evidenceKeys.includes("deployment-note"),
+        ).length / treatmentRows.length;
+  const exactToolSequenceRate =
+    treatmentRows.length === 0
+      ? null
+      : treatmentRows.filter(
+          (row) => JSON.stringify(row.result?.actions) === JSON.stringify(expectedTreatmentActions),
+        ).length / treatmentRows.length;
+  const reasoningObservationRate =
+    treatmentRows.length === 0
+      ? null
+      : treatmentRows.filter((row) => row.result?.reasoningObserved?.[0] === true).length /
+        treatmentRows.length;
+  const aggregateMetrics = {
+    pairedGroundedRecovery:
+      treatmentGroundedRecoveryRate === null || baselineHiddenCodenameRate === null
+        ? null
+        : treatmentGroundedRecoveryRate - baselineHiddenCodenameRate,
+    treatmentGroundedRecoveryRate,
+    baselineHiddenCodenameRate,
+    exactToolSequenceRate,
+    reasoningObservationRate,
+  };
+  const analysis = {
+    schemaVersion: "general-agent-tool-registry/analysis/1",
+    experimentId: experiment.experimentId,
+    experimentVersion: experiment.experimentVersion,
     runId,
     status,
-    ...(failure === undefined ? {} : { failure }),
+    observedCases: caseRows.length,
+    plannedCases: experiment.executionOrder.length,
+    providerCalls,
+    aggregateMetrics,
+    provisionalClassification:
+      status !== "completed"
+        ? "inconclusive"
+        : aggregateMetrics.pairedGroundedRecovery === 1 && exactToolSequenceRate === 1
+          ? "candidate-supported-pending-independent-validation"
+          : "candidate-rejected-pending-independent-validation",
+    productBootstrapModulesRemainRejected: true,
+    linuxControlGroupProof: false,
+  };
+  const analysisPath = join(runDirectory, "analysis.json");
+  writeFileSync(analysisPath, `${JSON.stringify(analysis, null, 2)}\n`, { flag: "wx" });
+  const rawOutputs = {
+    providerResponsesSha256: sha256(readFileSync(providerResponsesPath)),
+    modelCallsSha256: sha256(readFileSync(modelCallsPath)),
+    casesSha256: sha256(readFileSync(casesPath)),
+    analysisSha256: sha256(readFileSync(analysisPath)),
+  };
+  const manifest = {
+    schemaVersion: "general-agent-live/run-manifest/1",
+    experimentId: experiment.experimentId,
+    experimentVersion: experiment.experimentVersion,
+    protocolSha256,
+    runId,
+    status,
+    failure: failure ?? null,
     startedAt,
+    finishedAt: completedAt,
     completedAt,
     preregistrationSha256: sha256(preregistrationBytes),
+    sourceCommit,
+    dirtyWorktree,
+    configuration: {
+      conditionIds: [...new Set(experiment.executionOrder.map((entry) => entry.conditionId))],
+      configuredStorageListLimit:
+        experiment.experimentId === "general-agent-tool-registry-v0"
+          ? STORAGE_TOOL_LIST_LIMIT
+          : 8,
+      productBootstrapComposition: false,
+      implementationSha256,
+    },
+    dataset: {
+      id: "synthetic-private-memory-codename",
+      version: "1",
+      entriesPerCase: 2,
+    },
+    modelEndpointCapabilityProfile: {
+      networkScope,
+      descriptorVersion: descriptorRef.descriptorVersion,
+      operation: descriptorRef.operation,
+      responseStrategyId: "aether.qwen.chat.response.v2",
+      endpointAndCredentialRedacted: true,
+    },
+    modelIdentifier: "qwen3.6-27b",
+    backend: {
+      kind: "live",
+      adapter: "openai-compatible-chat",
+      silentFallbackAllowed: false,
+    },
+    seeds: [...new Set(experiment.executionOrder.map((entry) => entry.evaluationSeed))],
+    executionOrder: experiment.executionOrder.map((entry) => ({
+      evaluationSeed: entry.evaluationSeed,
+      repetition: entry.repetition,
+      conditionId: entry.conditionId,
+    })),
+    resourceBudgets: {
+      maximumCases: experiment.executionOrder.length,
+      maximumProviderCalls,
+      perModelCallTimeoutMs: 180_000,
+      perCaseTimeoutMs: 420_000,
+      maximumToolCapabilityInvocationsPerTreatment: 3,
+    },
+    perCaseAccounting,
+    rawOutputs,
+    validatorResults: {
+      preregistrationStructure:
+        experiment.experimentId === "general-agent-tool-registry-v0" ? "valid-before-run" : "legacy",
+      independentValidation: "pending",
+    },
+    aggregateMetrics,
     providerCalls,
     secretLeasesReleased: secretReleases,
     model: "qwen3.6-27b",
@@ -853,9 +1363,10 @@ async function main(): Promise<void> {
     linuxControlGroupProof: false,
     proxyEnvironmentPresent: Boolean(process.env.http_proxy || process.env.https_proxy),
     artifacts: {
-      "provider-responses.jsonl": sha256(readFileSync(providerResponsesPath)),
-      "model-calls.jsonl": sha256(readFileSync(modelCallsPath)),
-      "cases.jsonl": sha256(readFileSync(casesPath)),
+      "provider-responses.jsonl": rawOutputs.providerResponsesSha256,
+      "model-calls.jsonl": rawOutputs.modelCallsSha256,
+      "cases.jsonl": rawOutputs.casesSha256,
+      "analysis.json": rawOutputs.analysisSha256,
     },
   };
   writeFileSync(

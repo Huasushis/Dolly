@@ -1,0 +1,375 @@
+{
+  "$schema": "./schema-v1.json",
+  "schemaVersion": "dolly-experiment-preregistration/v1",
+  "experimentId": "general-agent-tool-registry-v0",
+  "experimentVersion": 1,
+  "title": "Host tool-registry contract live Agent canary",
+  "status": "frozen-before-first-run",
+  "scope": "live-canary",
+  "protocol": {
+    "path": "docs/experiments/protocol.md",
+    "sha256": "1a2934531fbe052662464f6a0d3b2fd531b3d7904daa431810a1db979683fafe"
+  },
+  "authorityReferences": [
+    ".qoder/specs/dolly_new.txt",
+    "AGENTS.md",
+    "docs/spec/core-runtime.md",
+    "docs/spec/extension-process-protocol.md",
+    "docs/spec/llm-extension.md",
+    "docs/spec/model-provider.md"
+  ],
+  "definitions": {
+    "agent": "The process-isolated reactive Module candidate driven by ModuleScheduler for one exact Delivery Claim.",
+    "toolRegistryView": "The host-issued dolly.tool-registry-view/2 response containing only selected tool contracts and their binding digest.",
+    "rawStorageCapability": "A module-private-storage capability handle exposed directly to Extension code; the treatment forbids this handle.",
+    "groundedRecovery": "The committed answer contains EMBER-7421, sets grounded true, and cites deployment-note after successful registered tool observations.",
+    "evaluationSeed": "A preregistered repetition identity and execution-order key; the owner Aether deployment exposes no verified provider seed control."
+  },
+  "question": "Can the Scheduler-driven process-isolated Agent recover the hidden synthetic deployment codename without a raw storage capability, deriving every tool name, argument rule, result rule, and limit from the host-issued version-two tool registry?",
+  "hypotheses": {
+    "primary": [
+      {
+        "id": "h1-registry-grounded-recovery",
+        "statement": "For both evaluation repetitions, the registry treatment completes storage_list then storage_get and commits a grounded answer while its paired no-tool baseline does not contain the hidden codename.",
+        "outcomeMeasure": "paired-grounded-recovery"
+      }
+    ],
+    "guardrails": [
+      {
+        "id": "g1-capability-boundary",
+        "statement": "The treatment child receives only model-operation and tool-invocation handles and never receives module-private-storage, an endpoint, a credential, or a capability handle in model context.",
+        "outcomeMeasure": "capability-boundary-violations"
+      },
+      {
+        "id": "g2-contract-identity",
+        "statement": "Every tool round uses the exact registry digest shown to the model, and the selected list limit never exceeds the schema maximum of three.",
+        "outcomeMeasure": "registry-contract-violations"
+      },
+      {
+        "id": "g3-runtime-boundary",
+        "statement": "Every case reaches one Scheduler commit, stops its exact child process, and leaves product Module startup refusal and the missing Linux control-group proof explicit.",
+        "outcomeMeasure": "runtime-boundary-violations"
+      }
+    ]
+  },
+  "decision": {
+    "currentProductState": "A prior live effect demo succeeded with a raw private-storage handle and a handwritten tool prompt; tool-invocation/v2 exists as a tested candidate component, product Module startup remains rejected, and no durable tool journal is installed.",
+    "changesIfSupported": [
+      "Use tool-registry view version two instead of handwritten tool definitions in the next read-only task-switch and benchmark demos.",
+      "Treat the registry-derived JSON-action adapter as the temporary Aether path while native function-call replay remains unsupported.",
+      "Proceed to a source-citing structured task checkpoint demo using the same Scheduler and active-Run capability boundary."
+    ],
+    "changesIfRejected": [
+      "Keep the previous raw-capability effect as historical evidence only and revise the registry projection, active-Run resolver, or prompt adapter before another frozen version.",
+      "Do not integrate tool-invocation/v2 into a product Module composition or claim generic tool use."
+    ],
+    "prohibitedClaims": [
+      "The product Module startup path is supported.",
+      "Effectful tools are crash safe or have a durable journal.",
+      "The provider supports native function calling or complete tool-round replay.",
+      "Linux control-group ownership and termination proof passed.",
+      "One private Aether fixture establishes cross-model or cross-provider generality."
+    ]
+  },
+  "conditions": {
+    "baselines": [
+      {
+        "id": "no-storage-tool",
+        "description": "The same child, task, Scheduler path, and model descriptor receive no tool-invocation or storage handle and must report insufficient evidence without guessing.",
+        "frozenParameters": {
+          "capabilityTypes": ["model-operation"],
+          "reasoningPolicy": "disable",
+          "maximumModelCalls": 1
+        }
+      }
+    ],
+    "treatments": [
+      {
+        "id": "tool-registry-storage",
+        "description": "The child receives model-operation and tool-invocation/v2 only, lists the registry, executes read-only storage tools through ToolPolicySession, and answers from observations.",
+        "frozenParameters": {
+          "capabilityTypes": ["model-operation", "tool-invocation"],
+          "forbiddenCapabilityType": "module-private-storage",
+          "registrySchemaVersion": "dolly.tool-registry-view/2",
+          "configuredListLimit": 3,
+          "toolBudget": {
+            "maxRounds": 2,
+            "maxCalls": 2,
+            "maxCallsPerRound": 1,
+            "maxApprovals": 0,
+            "maxCallBytes": 2048
+          },
+          "maximumModelCalls": 3
+        }
+      }
+    ]
+  },
+  "data": {
+    "generatorOrDataset": {
+      "id": "synthetic-private-memory-codename",
+      "version": "1",
+      "contentDefinition": "Each evaluation case stores archived-note with ASH-0000 and deployment-note with active codename EMBER-7421 in a fresh Module-private namespace."
+    },
+    "training": {
+      "name": "historical-design",
+      "seeds": [6, 7],
+      "caseFactors": [
+        "Retained live-v6 and live-v7 failures informed the need for an exact argument contract and bounded model continuation."
+      ]
+    },
+    "development": {
+      "name": "historical-vertical-chain",
+      "seeds": [8, 9],
+      "caseFactors": [
+        "Retained live-v8 runs established the raw private-storage effect and transport failure categories before this registry treatment was frozen."
+      ]
+    },
+    "evaluation": {
+      "name": "registry-canary",
+      "seeds": [7421, 7422],
+      "caseFactors": [
+        "no-storage-tool and tool-registry-storage are paired once for each evaluation seed with counterbalanced condition order."
+      ]
+    },
+    "splitIsolation": "Historical runs may motivate the frozen design, but no registry-v1 evaluation response or aggregate may be inspected before this file is frozen. Evaluation artifacts never replace or merge historical rows.",
+    "tuningUsesTrainingAndDevelopmentOnly": true
+  },
+  "backend": {
+    "allowedKinds": ["live"],
+    "requiredKind": "live",
+    "silentFallbackAllowed": false,
+    "credentialsRequired": true,
+    "networkRequired": true
+  },
+  "randomness": {
+    "generator": "owner Aether deployment at temperature zero with no verified provider seed parameter",
+    "generatorVersion": "qwen3.6-27b-owner-fixture-2026-08-09",
+    "streamSeparation": "Evaluation seeds identify independent fresh Core state, Extension process, tool journal, storage namespace, and model request identifiers; they are not misreported as provider pseudorandom seeds.",
+    "executionOrder": "Seed 7421 runs baseline then treatment; seed 7422 runs treatment then baseline to expose simple order or endpoint-drift sensitivity.",
+    "repetitionsPerCase": 2
+  },
+  "metrics": {
+    "primary": {
+      "name": "paired-grounded-recovery",
+      "unit": "paired success-rate difference",
+      "aggregation": "mean over the two evaluation-seed treatment indicators minus their paired baseline hidden-codename indicators",
+      "direction": "maximize",
+      "population": "The two preregistered evaluation seed pairs using the owner Aether qwen3.6-27b live fixture."
+    },
+    "secondary": [
+      {
+        "name": "exact-tool-sequence-rate",
+        "unit": "proportion",
+        "aggregation": "fraction of treatment cases with storage_list then storage_get then answer",
+        "direction": "maximize",
+        "population": "All preregistered treatment cases with structurally valid artifacts."
+      },
+      {
+        "name": "reasoning-observation-rate",
+        "unit": "proportion",
+        "aggregation": "fraction of treatment planning calls with at least one non-empty reasoning part",
+        "direction": "maximize",
+        "population": "The first model call in each preregistered treatment case."
+      }
+    ],
+    "guardrails": [
+      {
+        "name": "capability-boundary-violations",
+        "unit": "count",
+        "aggregation": "sum of forbidden child capability, endpoint, credential, or handle observations",
+        "direction": "zero",
+        "population": "All case rows, model calls, provider raws, manifests, and retained Extension result fields."
+      },
+      {
+        "name": "registry-contract-violations",
+        "unit": "count",
+        "aggregation": "sum of registry digest mismatches, missing schemas, internal-field exposure, and model arguments beyond the list maximum",
+        "direction": "zero",
+        "population": "Every list-tools response and execute-round result in both treatment cases."
+      },
+      {
+        "name": "runtime-boundary-violations",
+        "unit": "count",
+        "aggregation": "sum of incomplete Scheduler commits, live recorded child processes, product guard changes, and falsely claimed Linux group proof",
+        "direction": "zero",
+        "population": "All four preregistered cases and the final run manifest."
+      }
+    ],
+    "minimumEffect": {
+      "metric": "paired-grounded-recovery",
+      "magnitude": 1,
+      "scale": "absolute",
+      "confidenceLevel": 0.8,
+      "intervalMethod": "descriptive paired two-repetition canary interval; no inferential product promotion",
+      "comparison": "Both treatment repetitions must recover the hidden codename through the exact tool sequence, and neither paired baseline may contain it."
+    }
+  },
+  "execution": {
+    "factorialDesign": "Two conditions crossed with two evaluation seeds; each case creates fresh Core state, storage, process, model capability, and Scheduler runtime.",
+    "casePlan": [
+      {
+        "id": "evaluation-baseline",
+        "phase": "evaluation",
+        "maximumCount": 2,
+        "requiredWhen": "Always run one no-storage-tool baseline for each of the two evaluation seeds.",
+        "formula": "2 seeds * 1 baseline"
+      },
+      {
+        "id": "evaluation-treatment",
+        "phase": "evaluation",
+        "maximumCount": 2,
+        "requiredWhen": "Always run one tool-registry-storage treatment for each of the two evaluation seeds.",
+        "formula": "2 seeds * 1 treatment"
+      }
+    ],
+    "plannedMaximumCases": 4,
+    "maxCases": 4,
+    "maxEventsPerCase": 100000,
+    "maxRawRecordsPerCase": 100000,
+    "maxVirtualTimeMsPerCase": 420000,
+    "maxWallClockMs": 1800000,
+    "failurePolicy": "Record the current case and raw provider response when possible, stop the entire run on the first infrastructure, protocol, model-content, capability, Scheduler, verifier, or process-lifecycle failure, and classify the run inconclusive.",
+    "retryPolicy": "No provider or case retry. At most one separately identified whole-run replacement is allowed only after infrastructure failure; it never merges rows with the failed run."
+  },
+  "stoppingRules": {
+    "plannedCompletion": "Complete all four cases, exactly eight logical provider calls, all artifact digests, and independent verification before evaluating support.",
+    "earlyEfficacyStopAllowed": false,
+    "abortConditions": [
+      "Any provider call exceeds 180000 milliseconds, returns transport failure, or produces a malformed registered response envelope.",
+      "Any case exceeds 420000 milliseconds or the run exceeds 1800000 milliseconds.",
+      "Any capability, tool policy, Scheduler, process, artifact, secret-isolation, or product-refusal invariant fails.",
+      "Any run would exceed four cases, eight provider calls, or six treatment tool capability invocations."
+    ]
+  },
+  "decisionRules": {
+    "classificationOrder": "First classify any infrastructure, protocol, artifact, verifier, secret, capability, runtime, or model-content failure as inconclusive; otherwise apply every guardrail; only then evaluate the primary and secondary effects.",
+    "supported": [
+      "All four cases and exactly eight provider calls complete with valid artifacts and independent verification.",
+      "Both baselines omit EMBER-7421 with grounded false, while both treatments perform storage_list then storage_get then answer, recover EMBER-7421 with grounded true, and cite deployment-note.",
+      "All capability, registry-contract, source-independence, Scheduler, child-stop, secret, product-refusal, and support-boundary guardrails equal zero violations."
+    ],
+    "rejected": [
+      "With structurally valid provider, capability, process, and artifact evidence, either treatment fails the exact sequence or grounded recovery while its paired baseline remains valid.",
+      "With otherwise valid evidence, a treatment requires a handwritten tool name or configured list-limit literal in Extension source."
+    ],
+    "inconclusive": [
+      "Any planned case or provider raw is absent, malformed, timed out, transport-failed, or belongs to another run or preregistration digest.",
+      "Any capability or registry mismatch, unexpected model content, secret leak, Scheduler quarantine, unconfirmed process termination, artifact hash failure, or independent-verifier failure occurs.",
+      "The baseline guesses the hidden codename, because that removes the intended no-evidence contrast rather than supporting the treatment."
+    ]
+  },
+  "artifacts": {
+    "rootPattern": "artifacts/experiments/probes/general-agent-tool-registry-v0/runs/{runId}",
+    "requiredFiles": [
+      "preregistration.json",
+      "provider-responses.jsonl",
+      "model-calls.jsonl",
+      "cases.jsonl",
+      "analysis.json",
+      "run-manifest.json",
+      "validation.json"
+    ],
+    "runManifestFields": [
+      "schemaVersion",
+      "experimentId",
+      "experimentVersion",
+      "protocolSha256",
+      "runId",
+      "status",
+      "startedAt",
+      "finishedAt",
+      "completedAt",
+      "preregistrationSha256",
+      "sourceCommit",
+      "dirtyWorktree",
+      "configuration",
+      "dataset",
+      "modelEndpointCapabilityProfile",
+      "modelIdentifier",
+      "backend",
+      "seeds",
+      "executionOrder",
+      "resourceBudgets",
+      "perCaseAccounting",
+      "rawOutputs",
+      "validatorResults",
+      "aggregateMetrics",
+      "providerCalls",
+      "secretLeasesReleased",
+      "model",
+      "reasoningControl",
+      "modelTransport",
+      "productBootstrapModulesRemainRejected",
+      "linuxControlGroupProof",
+      "failure",
+      "artifacts"
+    ]
+  },
+  "independentValidation": {
+    "analyzerPath": "scripts/experiments/probes/general-agent-live-v0/verify-tool-registry.mjs",
+    "readsOnlyArtifacts": true,
+    "importsTreatmentImplementation": false,
+    "requiredChecks": [
+      "Byte-identical preregistration, exact manifest identity, all required artifact digests, four case rows, and eight raw provider responses.",
+      "Exact paired baseline and treatment outcomes, tool sequence, tool arguments, registry schemas and digest identity, capability inventory, reasoning observation, Scheduler completion, and child stop.",
+      "No configured endpoint, API key, authorization header, capability handle field, raw storage capability, or product/Linux support overclaim appears in retained artifacts.",
+      "The treatment planning prompt contains the machine-readable registry while the Extension source contains no selected storage tool name or configured list-limit constant."
+    ],
+    "mutationTests": [
+      "Changing one treatment capability type to module-private-storage must fail validation.",
+      "Changing one tool-round registry digest must fail validation.",
+      "Changing the list schema maximum or model-selected list argument above three must fail validation.",
+      "Removing one provider raw, case row, artifact digest, reasoning observation, Scheduler completion, or child-stop proof must fail validation.",
+      "Injecting a configured fixture value or a capability handle field into any scanned artifact must fail validation."
+    ]
+  },
+  "safetyBoundary": {
+    "productRuntimeUsed": true,
+    "moduleLaunchAllowed": true,
+    "networkAccessAllowed": true,
+    "privateDataAllowed": true,
+    "paidServicesAllowed": true,
+    "knownP0PathReachable": false,
+    "moduleStartupRefusalMustRemain": true
+  },
+  "domainDesign": {
+    "implementationStatus": "Candidate integration only: real Core components and a real isolated child are assembled outside product bootstrap; product Module startup stays rejected.",
+    "implementationFiles": {
+      "scripts/experiments/probes/general-agent-live-v0/run.mts": "abbd6db7c0f041a62f32a0df392ec84c5e69669c4d006afe32eff07b2f9e8d6b",
+      "scripts/experiments/probes/general-agent-live-v0/extension.mjs": "2386159cb3931f3f92f8c2605fc6758927fa0ef5df03cdc1b021d5b5f6038b09",
+      "scripts/experiments/probes/general-agent-live-v0/verify-tool-registry.mjs": "db51724f45e00b12b7045f07ebdd010950a6b66262a4b7f48f59b83d049a3825"
+    },
+    "model": {
+      "endpointFixture": "owner Aether OpenAI-compatible deployment",
+      "modelId": "qwen3.6-27b",
+      "temperature": 0,
+      "planningReasoningPolicy": "require",
+      "continuationReasoningPolicy": "disable",
+      "planningMaxOutputTokens": 5200,
+      "continuationMaxOutputTokens": 800,
+      "responseStrategyId": "aether.qwen.chat.response.v2",
+      "automaticProviderRetries": 0
+    },
+    "toolPath": {
+      "childCapabilityTypes": ["model-operation", "tool-invocation"],
+      "registryVersion": "dolly.tool-registry-view/2",
+      "roundResultVersion": "dolly.tool-round-result/2",
+      "schemaDialect": "dolly.tool-value-schema/1",
+      "configuredListLimit": 3,
+      "rawStorageHandleToChild": false,
+      "journal": "InMemoryToolJournalRepository is acceptable only because both tools are read-only and this canary makes no crash-recovery claim."
+    },
+    "executionOrder": [
+      { "evaluationSeed": 7421, "conditionId": "no-storage-tool", "repetition": 1 },
+      { "evaluationSeed": 7421, "conditionId": "tool-registry-storage", "repetition": 1 },
+      { "evaluationSeed": 7422, "conditionId": "tool-registry-storage", "repetition": 2 },
+      { "evaluationSeed": 7422, "conditionId": "no-storage-tool", "repetition": 2 }
+    ],
+    "supportBoundary": {
+      "durableToolJournal": false,
+      "nativeProviderToolCalling": false,
+      "linuxControlGroupProof": false,
+      "productBootstrapModulesRemainRejected": true
+    }
+  }
+}

@@ -102,15 +102,108 @@ function modelOutput(result) {
   return result.output;
 }
 
+function toolRegistryView(value, moduleJobId) {
+  if (value === null || Array.isArray(value) || typeof value !== "object") {
+    throw new Error("tool registry view is not one object");
+  }
+  const keys = Object.keys(value).sort();
+  const expected = ["budget", "moduleJobId", "registryDigest", "schemaVersion", "tools"];
+  if (JSON.stringify(keys) !== JSON.stringify(expected)) {
+    throw new Error("tool registry view keys do not match version two");
+  }
+  if (
+    value.schemaVersion !== "dolly.tool-registry-view/2" ||
+    value.moduleJobId !== moduleJobId ||
+    typeof value.registryDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(value.registryDigest) ||
+    value.budget === null ||
+    Array.isArray(value.budget) ||
+    typeof value.budget !== "object" ||
+    !Array.isArray(value.tools) ||
+    value.tools.length === 0
+  ) {
+    throw new Error("tool registry view identity is invalid");
+  }
+  const names = new Set();
+  for (const tool of value.tools) {
+    if (tool === null || Array.isArray(tool) || typeof tool !== "object") {
+      throw new Error("tool registry entry is not one object");
+    }
+    const toolKeys = Object.keys(tool).sort();
+    const expectedToolKeys = [
+      "approval",
+      "argumentSchema",
+      "description",
+      "effectClass",
+      "idempotency",
+      "limits",
+      "name",
+      "outcomeQuery",
+      "parallel",
+      "schemaDialect",
+      "successResultSchema",
+    ].sort();
+    if (JSON.stringify(toolKeys) !== JSON.stringify(expectedToolKeys)) {
+      throw new Error("tool registry entry keys are invalid");
+    }
+    if (
+      typeof tool.name !== "string" ||
+      names.has(tool.name) ||
+      typeof tool.description !== "string" ||
+      tool.schemaDialect !== "dolly.tool-value-schema/1" ||
+      tool.argumentSchema === null ||
+      Array.isArray(tool.argumentSchema) ||
+      typeof tool.argumentSchema !== "object" ||
+      tool.successResultSchema === null ||
+      Array.isArray(tool.successResultSchema) ||
+      typeof tool.successResultSchema !== "object" ||
+      tool.limits === null ||
+      Array.isArray(tool.limits) ||
+      typeof tool.limits !== "object"
+    ) {
+      throw new Error("tool registry entry contract is invalid");
+    }
+    names.add(tool.name);
+  }
+  return value;
+}
+
+function successfulToolObservation(value, registry, callId, name, roundIndex) {
+  if (
+    value?.schemaVersion !== "dolly.tool-round-result/2" ||
+    value.moduleJobId !== registry.moduleJobId ||
+    value.registryDigest !== registry.registryDigest ||
+    value.roundIndex !== roundIndex ||
+    value.state !== "complete" ||
+    value.canContinue !== true ||
+    !Array.isArray(value.results) ||
+    value.results.length !== 1
+  ) {
+    throw new Error("tool round result is incomplete or belongs to another registry");
+  }
+  const result = value.results[0];
+  if (
+    result?.callId !== callId ||
+    result.name !== name ||
+    result.status !== "succeeded" ||
+    result.code !== "OK" ||
+    !Object.hasOwn(result, "content")
+  ) {
+    throw new Error("tool round did not return one successful matching observation");
+  }
+  return result.content;
+}
+
 async function runAgent(params) {
   const model = capability("model-operation");
   if (!model) throw new Error("model-operation capability is absent");
   const storage = capability("module-private-storage");
+  const toolInvocation = capability("tool-invocation");
   const task = taskText(params.input);
   const observations = [];
   const reasoningObserved = [];
 
-  if (!storage) {
+  if (!storage && !toolInvocation) {
     const result = await invokeCapability(
       model,
       "chat",
@@ -144,6 +237,117 @@ async function runAgent(params) {
         Object.hasOwn(process.env, "AETHER_API_KEY") ||
         Object.hasOwn(process.env, "AETHER_BASE_URL"),
     };
+  }
+
+  if (toolInvocation) {
+    const registry = toolRegistryView(
+      await invokeCapability(
+        toolInvocation,
+        "list-tools",
+        {},
+        params,
+        `${params.moduleJobId}:tool-registry`,
+      ),
+      params.moduleJobId,
+    );
+    for (let round = 1; round <= 3; round += 1) {
+      const system = [
+        "You are a grounded task Agent. The Host supplied the exact read-only tool registry JSON below.",
+        "Choose only a name present in registry.tools and obey its argumentSchema and limits exactly.",
+        "For this task, discover the available memory keys before reading the relevant item. Never guess hidden values.",
+        "Return exactly one JSON object and no markdown.",
+        "For a tool action use exactly keys action,arguments, where action is the selected tool name.",
+        "For the final action use exactly keys action,answer,grounded,evidenceKeys and set action to answer.",
+        "Keep internal reasoning under 120 words and reserve output budget for JSON.",
+        `Registry: ${JSON.stringify(registry)}`,
+      ].join(" ");
+      const result = await invokeCapability(
+        model,
+        "chat",
+        {
+          messages: [
+            { role: "system", parts: [{ kind: "text", text: system }] },
+            {
+              role: "user",
+              parts: [{ kind: "text", text: JSON.stringify({ task, observations }) }],
+            },
+          ],
+          reasoning: round === 1 ? "require" : "disable",
+          maxOutputTokens: round === 1 ? 5200 : 800,
+          stream: false,
+        },
+        params,
+        `${params.moduleJobId}:model-round-${round}`,
+      );
+      const output = modelOutput(result);
+      reasoningObserved.push(
+        output.reasoning?.state === "observed" &&
+        Array.isArray(output.reasoning.parts) &&
+        output.reasoning.parts.some((part) => typeof part === "string" && part.length > 0),
+      );
+      const rawAction = parseModelObject(output.finalContent);
+      if (rawAction?.action === "answer") {
+        const action = strictObject(
+          output.finalContent,
+          ["action", "answer", "grounded", "evidenceKeys"],
+        );
+        return {
+          conditionId: "tool-registry-storage",
+          task,
+          actions: [...observations.map((entry) => entry.name), "answer"],
+          toolArguments: observations.map((entry) => ({
+            name: entry.name,
+            arguments: entry.arguments,
+          })),
+          toolRoundRegistryDigests: observations.map((entry) => entry.registryDigest),
+          toolRegistry: registry,
+          capabilityTypes: initialized.capabilities
+            .map((entry) => entry.capabilityType)
+            .sort(),
+          answer: {
+            answer: action.answer,
+            grounded: action.grounded,
+            evidenceKeys: action.evidenceKeys,
+          },
+          reasoningObserved,
+          childCredentialEnvironmentPresent:
+            Object.hasOwn(process.env, "AETHER_API_KEY") ||
+            Object.hasOwn(process.env, "AETHER_BASE_URL"),
+        };
+      }
+      const action = strictObject(output.finalContent, ["action", "arguments"]);
+      const selected = registry.tools.find((tool) => tool.name === action.action);
+      if (!selected) throw new Error("model selected a tool absent from the registry");
+      const toolRound = observations.length + 1;
+      const callId = `agent-tool-call-${toolRound}`;
+      const toolResult = await invokeCapability(
+        toolInvocation,
+        "execute-round",
+        {
+          roundIndex: toolRound,
+          calls: [{
+            callId,
+            name: selected.name,
+            argumentsJson: JSON.stringify(action.arguments),
+          }],
+        },
+        params,
+        `${params.moduleJobId}:tool-round-${toolRound}`,
+      );
+      observations.push({
+        name: selected.name,
+        arguments: action.arguments,
+        registryDigest: toolResult.registryDigest,
+        result: successfulToolObservation(
+          toolResult,
+          registry,
+          callId,
+          selected.name,
+          toolRound,
+        ),
+      });
+    }
+    throw new Error("Agent exhausted its registered round budget without answering");
   }
 
   for (let round = 1; round <= 3; round += 1) {
