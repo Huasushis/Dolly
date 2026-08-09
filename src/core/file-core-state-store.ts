@@ -577,6 +577,7 @@ const DELIVERY_STORE_PUBLIC_METHODS = [
   "registerConsumer",
   "inspectSubscription",
   "inspectPending",
+  "inspectResident",
   "subscribeChanges",
   "append",
   "appendOnce",

@@ -259,6 +259,23 @@ export interface DeliveryPendingStatus {
   readonly oldestEnqueuedAt: string | null;
 }
 
+/**
+ * Deliveries that still occupy a consumer mailbox. An active Claim remains
+ * resident until it is acknowledged or dead-lettered; moving it from pending
+ * to claimed must not manufacture free capacity.
+ */
+export interface DeliveryResidentStatus {
+  readonly consumerId: string;
+  readonly pageIds: readonly string[];
+  readonly pendingCount: number;
+  readonly pendingBytes: number;
+  readonly claimedCount: number;
+  readonly claimedBytes: number;
+  readonly residentCount: number;
+  readonly residentBytes: number;
+  readonly oldestEnqueuedAt: string | null;
+}
+
 export interface DeliveryPageSnapshot {
   readonly id: string;
   readonly nextSequence: string;
@@ -650,6 +667,62 @@ export class DeliveryStore {
       pendingCount: pending.length,
       pendingBytes,
       oldestEnqueuedAt: pending[0]?.record.enqueuedAt ?? null,
+    });
+  }
+
+  inspectResident(consumerId: string, pageIds: readonly string[]): DeliveryResidentStatus {
+    this.flushPersistence();
+    const validatedPageIds = this.validateClaimPages(consumerId, pageIds);
+    const pageSet = new Set(validatedPageIds);
+    const resident = [...this.#deliveries.values()]
+      .filter((delivery) => {
+        const status = delivery.obligations.get(consumerId);
+        return (
+          pageSet.has(delivery.record.pageId) &&
+          (status === "pending" || status === "claimed")
+        );
+      })
+      .sort((left, right) =>
+        BigInt(left.record.globalSequence) < BigInt(right.record.globalSequence) ? -1 : 1,
+      );
+    let pendingCount = 0;
+    let pendingBytes = 0;
+    let claimedCount = 0;
+    let claimedBytes = 0;
+    for (const delivery of resident) {
+      const bytes = canonicalJsonByteLength(this.#blocks.get(delivery.record.blockId)!);
+      if (delivery.obligations.get(consumerId) === "pending") {
+        pendingCount += 1;
+        pendingBytes += bytes;
+      } else {
+        claimedCount += 1;
+        claimedBytes += bytes;
+      }
+      if (!Number.isSafeInteger(pendingBytes) || !Number.isSafeInteger(claimedBytes)) {
+        throw new DeliveryStoreError(
+          "CLAIM_LIMIT_INVALID",
+          "Resident Block bytes exceed the safe integer range",
+        );
+      }
+    }
+    const residentCount = pendingCount + claimedCount;
+    const residentBytes = pendingBytes + claimedBytes;
+    if (!Number.isSafeInteger(residentCount) || !Number.isSafeInteger(residentBytes)) {
+      throw new DeliveryStoreError(
+        "CLAIM_LIMIT_INVALID",
+        "Resident Delivery count or Block bytes exceed the safe integer range",
+      );
+    }
+    return deepFreeze({
+      consumerId,
+      pageIds: [...validatedPageIds],
+      pendingCount,
+      pendingBytes,
+      claimedCount,
+      claimedBytes,
+      residentCount,
+      residentBytes,
+      oldestEnqueuedAt: resident[0]?.record.enqueuedAt ?? null,
     });
   }
 

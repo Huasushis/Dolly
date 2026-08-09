@@ -39,6 +39,49 @@ function createHarness(maxFailedAttempts = 3) {
 }
 
 describe("CORE-004 per-consumer claim/ack recovery", () => {
+  it("keeps claimed Deliveries resident across all subscribed Pages", () => {
+    const { blocks, deliveries } = createHarness();
+    deliveries.createPage("page-a");
+    deliveries.createPage("page-b");
+    deliveries.registerConsumer("page-a", "consumer", "from-now");
+    deliveries.registerConsumer("page-b", "consumer", "from-now");
+    const repeated = blocks.commit(proposal("same resident block"), source);
+    deliveries.append("page-a", repeated.id);
+    deliveries.append("page-b", repeated.id);
+
+    const before = deliveries.inspectResident("consumer", ["page-a", "page-b"]);
+    expect(before).toMatchObject({
+      pendingCount: 2,
+      claimedCount: 0,
+      residentCount: 2,
+    });
+
+    const claim = deliveries.claim({
+      consumerId: "consumer",
+      pageIds: ["page-a", "page-b"],
+      moduleGenerationId: "generation-1",
+      maxCount: 1,
+      maxBytes: 1024 * 1024,
+    });
+    expect(claim).not.toBeNull();
+    expect(deliveries.inspectPending("consumer", ["page-a", "page-b"]).pendingCount).toBe(1);
+    expect(deliveries.inspectResident("consumer", ["page-a", "page-b"])).toEqual({
+      ...before,
+      pendingCount: 1,
+      pendingBytes: before.pendingBytes / 2,
+      claimedCount: 1,
+      claimedBytes: before.claimedBytes + before.pendingBytes / 2,
+    });
+
+    deliveries.ack(claim!);
+    expect(deliveries.inspectResident("consumer", ["page-a", "page-b"])).toMatchObject({
+      pendingCount: 1,
+      claimedCount: 0,
+      residentCount: 1,
+      residentBytes: before.residentBytes / 2,
+    });
+  });
+
   it("truncates the exact canonical input envelope and reports remaining work", () => {
     let blockId = 0;
     let allocatedId = 0;
