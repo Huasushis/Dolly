@@ -37,6 +37,7 @@ import {
   type ReactiveModuleInput,
 } from "./reactive-module-input.js";
 import {
+  ModuleResultCommitBackpressureError,
   type ModuleResultCommitCoordinator,
   type ModuleResultCommitRecord,
   moduleJobResultDigest,
@@ -83,6 +84,11 @@ export type ReactiveModuleTickResult =
   | (DeliveryClaimIdentity & {
       readonly status: "cancelled";
       readonly reason: "shutdown";
+    })
+  | (DeliveryClaimIdentity & {
+      readonly status: "output-backpressured";
+      readonly stage: "output-commit";
+      readonly blockedConsumerIds: readonly string[];
     })
   | (DeliveryClaimIdentity & {
       readonly status: "recovery-required";
@@ -231,6 +237,13 @@ interface UnresolvedRun {
     ReactiveModuleTickResult,
     { readonly status: "recovery-required" }
   >["reason"];
+}
+
+interface DeferredOutputCommit {
+  readonly claim: DeliveryClaim;
+  readonly output: ReactiveModuleResult;
+  readonly failure: ReactiveModuleFailure;
+  readonly blockedConsumerIds: readonly string[];
 }
 
 function assertPositiveLimit(value: number, label: string): void {
@@ -384,6 +397,7 @@ export class ReactiveModuleRuntime {
   #inFlight: Promise<ReactiveModuleTickResult> | undefined;
   #recoveryInFlight: Promise<ReactiveModuleRecoveryResult> | undefined;
   #unresolved: UnresolvedRun | undefined;
+  #deferredOutputCommit: DeferredOutputCommit | undefined;
   #acceptingOperations = true;
 
   constructor(options: ReactiveModuleRuntimeOptions) {
@@ -560,7 +574,10 @@ export class ReactiveModuleRuntime {
       );
     }
 
-    const operation = this.#performTick();
+    const deferred = this.#deferredOutputCommit;
+    const operation = deferred
+      ? this.#tryRecoverCommit(deferred.claim, deferred.output, deferred.failure)
+      : this.#performTick();
     this.#inFlight = operation;
     void operation.then(
       () => {
@@ -635,7 +652,12 @@ export class ReactiveModuleRuntime {
     }
 
     const unresolved = this.#unresolved;
-    if (!unresolved) return { status: "nothing-to-recover" };
+    if (!unresolved) {
+      const deferred = this.#deferredOutputCommit;
+      return deferred
+        ? this.#tryRecoverCommit(deferred.claim, deferred.output, deferred.failure)
+        : { status: "nothing-to-recover" };
+    }
 
     if (unresolved.kind === "executor-termination") {
       return deepFreeze({
@@ -683,7 +705,8 @@ export class ReactiveModuleRuntime {
       if (
         this.#claimAwaitingPersistenceConfirmation ||
         this.#claimAwaitingSubmissionPersistence ||
-        this.#unresolved
+        this.#unresolved ||
+        this.#deferredOutputCommit
       ) {
         throw new ReactiveModuleRuntimeError(
           "RUNTIME_RECOVERY_REQUIRED",
@@ -695,7 +718,8 @@ export class ReactiveModuleRuntime {
     if (
       this.#claimAwaitingPersistenceConfirmation ||
       this.#claimAwaitingSubmissionPersistence ||
-      this.#unresolved
+      this.#unresolved ||
+      this.#deferredOutputCommit
     ) {
       throw new ReactiveModuleRuntimeError(
         "RUNTIME_RECOVERY_REQUIRED",
@@ -931,6 +955,7 @@ export class ReactiveModuleRuntime {
       const outputPageIds = outputPageIdsForResult(this.#outputPageIds, output);
       if (sameCommittedResult(record, claim, this.#source, outputPageIds, output)) {
         if (this.#claimIsCommittedByRuntimeStore(claim)) {
+          this.#deferredOutputCommit = undefined;
           this.#unresolved = undefined;
           this.#activeClaim = undefined;
           return deepFreeze({
@@ -953,7 +978,23 @@ export class ReactiveModuleRuntime {
         failure: noRecordFailure,
         reason: "commit-result-conflict",
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof ModuleResultCommitBackpressureError) {
+        this.#deferredOutputCommit = {
+          claim,
+          output,
+          failure: noRecordFailure,
+          blockedConsumerIds: error.blockedConsumerIds,
+        };
+        this.#unresolved = undefined;
+        this.#activeClaim = undefined;
+        return deepFreeze({
+          ...claimIdentity(claim),
+          status: "output-backpressured" as const,
+          stage: "output-commit" as const,
+          blockedConsumerIds: [...error.blockedConsumerIds],
+        });
+      }
       try {
         const existing = this.#commits.inspect(claim.moduleJobId);
         // No journal record means this Run produced no committed result. The
@@ -961,6 +1002,7 @@ export class ReactiveModuleRuntime {
         // Failure handling therefore needs either a declaration that effects
         // are impossible or persistent evidence that completion is safe.
         if (existing === null) {
+          this.#deferredOutputCommit = undefined;
           return this.#nackAfterExternalEffectEvidence(claim, noRecordFailure);
         }
       } catch {
@@ -1330,6 +1372,7 @@ export class ReactiveModuleRuntime {
     claim: DeliveryClaim,
     unresolved: Omit<UnresolvedRun, "claim">,
   ): Extract<ReactiveModuleTickResult, { readonly status: "recovery-required" }> {
+    this.#deferredOutputCommit = undefined;
     this.#unresolved = { claim, ...unresolved };
     this.#activeClaim = undefined;
     return deepFreeze({

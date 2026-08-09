@@ -119,7 +119,8 @@ export type ModuleResultCommitErrorCode =
   | "MODULE_RESULT_COMMIT_DOCUMENT_INVALID"
   | "MODULE_RESULT_COMMIT_LIMIT_EXCEEDED"
   | "MODULE_RESULT_COMMIT_LOCKED"
-  | "MODULE_RESULT_COMMIT_IO_FAILED";
+  | "MODULE_RESULT_COMMIT_IO_FAILED"
+  | "MODULE_RESULT_OUTPUT_BACKPRESSURED";
 
 export class ModuleResultCommitError extends Error {
   constructor(
@@ -129,6 +130,33 @@ export class ModuleResultCommitError extends Error {
   ) {
     super(message);
     this.name = "ModuleResultCommitError";
+  }
+}
+
+/**
+ * The exact Module result is durable, but one or more downstream consumers do
+ * not currently have room for its output Deliveries. This is not an unknown
+ * outcome and not permission to execute the Module again: callers retain the
+ * Claim and resume this same commit after capacity changes.
+ */
+export class ModuleResultCommitBackpressureError extends ModuleResultCommitError {
+  readonly blockedConsumerIds: readonly string[];
+
+  constructor(blockedConsumerIds: readonly string[]) {
+    const normalized = [...new Set(blockedConsumerIds)].sort();
+    if (
+      normalized.length === 0 ||
+      normalized.some((consumerId) => !ID_PATTERN.test(consumerId))
+    ) {
+      throw new TypeError("Output backpressure requires valid blocked consumer identifiers");
+    }
+    super(
+      "MODULE_RESULT_OUTPUT_BACKPRESSURED",
+      `Module result output is waiting for downstream capacity: ${normalized.join(", ")}`,
+      { blockedConsumerIds: normalized },
+    );
+    this.name = "ModuleResultCommitBackpressureError";
+    this.blockedConsumerIds = deepFreeze(normalized);
   }
 }
 

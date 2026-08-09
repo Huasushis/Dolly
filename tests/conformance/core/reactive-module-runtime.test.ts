@@ -13,6 +13,7 @@ import {
 import type { ModuleSubmissionRecord } from "../../../src/core/module-process-records.js";
 import {
   InMemoryModuleResultCommitRepository,
+  ModuleResultCommitBackpressureError,
   ModuleResultCommitCoordinator,
   type ModuleResultCommitHookEvent,
 } from "../../../src/core/module-result-commit.js";
@@ -1381,6 +1382,69 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     if (result.status !== "committed") throw new Error("expected recovered commit");
     expect(result.record.outputDeliveries).toHaveLength(1);
     await harness.runtime.stop();
+  });
+
+  it("resumes an output-backpressured commit without executing the Module twice", async () => {
+    let capacityAvailable = false;
+    const execute = vi.fn().mockResolvedValue({
+      schemaVersion: "dolly.module-result/1",
+      blockProposal: proposal("wait for capacity"),
+    });
+    const harness = await startedHarness({
+      createExecutor: () => ({ execute }),
+      afterEffect: (event) => {
+        if (!capacityAvailable && event.phase === "after-block-effect") {
+          throw new ModuleResultCommitBackpressureError(["sink"]);
+        }
+      },
+    });
+
+    const waiting = await harness.runtime.tick();
+    expect(waiting).toMatchObject({
+      status: "output-backpressured",
+      stage: "output-commit",
+      blockedConsumerIds: ["sink"],
+    });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(harness.submissionRecords.size).toBe(1);
+    expect(harness.deliveries.listActiveClaims()).toHaveLength(1);
+
+    capacityAvailable = true;
+    const committed = await harness.runtime.tick();
+    expect(committed).toMatchObject({ status: "committed", recovered: true });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(harness.submissionRecords.size).toBe(0);
+    expect(harness.deliveries.listActiveClaims()).toEqual([]);
+    await harness.runtime.stop();
+  });
+
+  it("keeps the exact Claim durable when shutdown meets an output-backpressured commit", async () => {
+    const execute = vi.fn().mockResolvedValue({
+      schemaVersion: "dolly.module-result/1",
+      blockProposal: proposal("preserve on shutdown"),
+    });
+    const harness = await startedHarness({
+      createExecutor: () => ({ execute }),
+      afterEffect: (event) => {
+        if (event.phase === "after-block-effect") {
+          throw new ModuleResultCommitBackpressureError(["sink"]);
+        }
+      },
+    });
+
+    const waiting = await harness.runtime.tick();
+    expect(waiting).toMatchObject({ status: "output-backpressured" });
+    await expect(harness.runtime.stop()).rejects.toMatchObject({
+      code: "RUNTIME_RECOVERY_REQUIRED",
+    });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(harness.submissionRecords.size).toBe(1);
+    expect(harness.deliveries.listActiveClaims()).toEqual([
+      expect.objectContaining({
+        moduleJobId: waiting.status === "output-backpressured" ? waiting.moduleJobId : "invalid",
+        status: "active",
+      }),
+    ]);
   });
 
   it("blocks new work until a repeatedly interrupted prepared commit is recovered", async () => {

@@ -190,6 +190,15 @@ function retryResult(index: number): ReactiveModuleTickResult {
   };
 }
 
+function outputBackpressuredResult(index: number): ReactiveModuleTickResult {
+  return {
+    ...claimIdentity(index),
+    status: "output-backpressured",
+    stage: "output-commit",
+    blockedConsumerIds: ["sink"],
+  };
+}
+
 /**
  * A Module runtime stand-in that records how many ticks were ever in flight at
  * once. The serialization invariant of Section 9.1 is checked against
@@ -994,6 +1003,54 @@ describe("CORE scheduler retry backoff", () => {
     expect(delays).toEqual([250, 500, 1_000, 1_000, 1_000]);
     const retries = events.filter((event) => event.type === "scheduler.retry_scheduled");
     expect(retries[0]).toMatchObject({ retryCount: 1, retryDelayMs: 250, retryJitterMs: 0 });
+    await scheduler.stop();
+  });
+
+  it("resumes an output commit on the first pass after backoff even when no input remains", async () => {
+    const { clock, mailboxes, scheduler } = createScheduler({
+      retryBaseMs: 250,
+      retryMaxMs: 1_000,
+      retryJitterRatio: 0,
+    });
+    const runtime = new FakeModuleRuntime((tickCount) =>
+      tickCount === 1 ? outputBackpressuredResult(1) : committedResult(1),
+    );
+    mailboxes.set("worker", 1, 100);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: ["output"],
+      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+    });
+    scheduler.start();
+    await drain(clock);
+
+    expect(runtime.tickCount).toBe(1);
+    expect(scheduler.status("worker")).toMatchObject({
+      schedulingState: "backpressured",
+      retryCount: 1,
+      lastTickStatus: "output-backpressured",
+      counters: { outputBackpressured: 1 },
+    });
+
+    // The original input is already held by the exact Claim, so the normal
+    // pending queue is empty. Recovery must still resume the prepared commit.
+    mailboxes.set("worker", 0, 0);
+    await advance(clock, 249);
+    expect(runtime.tickCount).toBe(1);
+    // The retry deadline is a lower bound. The fixed baseline observes it on
+    // the next poll (300 ms here); no dedicated per-Module retry timer exists.
+    await advance(clock, 50);
+    expect(runtime.tickCount).toBe(1);
+    await advance(clock, 1);
+
+    expect(runtime.tickCount).toBe(2);
+    expect(scheduler.status("worker")).toMatchObject({
+      lastTickStatus: "committed",
+      retryCount: 0,
+      counters: { committed: 1, outputBackpressured: 1 },
+    });
     await scheduler.stop();
   });
 

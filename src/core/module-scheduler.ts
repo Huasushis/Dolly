@@ -336,6 +336,7 @@ export interface SchedulerModuleCounters {
   readonly dispatched: number;
   readonly committed: number;
   readonly retryScheduled: number;
+  readonly outputBackpressured: number;
   readonly deadLettered: number;
   readonly cancelled: number;
   readonly recoveryRequired: number;
@@ -450,6 +451,7 @@ interface MutableCounters {
   dispatched: number;
   committed: number;
   retryScheduled: number;
+  outputBackpressured: number;
   deadLettered: number;
   cancelled: number;
   recoveryRequired: number;
@@ -473,6 +475,7 @@ interface ModuleEntry {
   pendingSinceMonotonic: number | null;
   mailboxFull: boolean;
   inFlight: Promise<void> | null;
+  outputCommitWaiting: boolean;
   dispatchPending: SchedulerPendingSnapshot | null;
   arrivalsDuringLastRunCount: number;
   arrivalsDuringLastRunBytes: number;
@@ -532,6 +535,7 @@ function newCounters(): MutableCounters {
     dispatched: 0,
     committed: 0,
     retryScheduled: 0,
+    outputBackpressured: 0,
     deadLettered: 0,
     cancelled: 0,
     recoveryRequired: 0,
@@ -736,6 +740,7 @@ export class ModuleScheduler {
       pendingSinceMonotonic: null,
       mailboxFull: false,
       inFlight: null,
+      outputCommitWaiting: false,
       dispatchPending: null,
       arrivalsDuringLastRunCount: 0,
       arrivalsDuringLastRunBytes: 0,
@@ -1104,6 +1109,30 @@ export class ModuleScheduler {
     }
 
     const snapshot = this.#buildSnapshot(entry, now);
+    if (entry.outputCommitWaiting) {
+      const blockedBy = snapshot.downstream
+        .filter((pressure) => pressure.availability !== "available")
+        .map((pressure) => pressure.moduleId);
+      entry.blockingDownstreamIds = blockedBy;
+      const decision: SchedulerDecision = deepFreeze({
+        eligible: blockedBy.length === 0,
+        eligibleAt: blockedBy.length === 0 ? now : null,
+        claimLimitCount: this.#claimLimitCount,
+        claimLimitBytes: this.#claimLimitBytes,
+        reasonCode:
+          blockedBy.length === 0 ? "OUTPUT_COMMIT_RESUME" : "DOWNSTREAM_BACKPRESSURE",
+        policyName: "scheduler-output-commit",
+        policyVersion: "1",
+      });
+      if (blockedBy.length > 0) {
+        this.#applyBackpressure(entry, blockedBy, now, snapshot, decision);
+        return;
+      }
+      this.#exitBackpressure(entry);
+      this.#recordReason(entry, true, decision.reasonCode, snapshot, decision);
+      this.#dispatch(entry, decision, snapshot, now);
+      return;
+    }
     const decision = this.#decide(entry, snapshot);
     if (decision === null) return;
     entry.lastPolicyName = decision.policyName;
@@ -1301,11 +1330,22 @@ export class ModuleScheduler {
         return;
       case "committed":
         entry.counters.committed += 1;
+        entry.outputCommitWaiting = false;
+        this.#exitBackpressure(entry);
         entry.retryCount = 0;
         entry.retryDelayMs = 0;
         entry.retryJitterMs = 0;
         entry.lastSuccessAt = now;
         this.#recordProgress(now);
+        return;
+      case "output-backpressured":
+        entry.counters.outputBackpressured += 1;
+        entry.outputCommitWaiting = true;
+        entry.backpressured = true;
+        entry.blockingDownstreamIds = [...result.blockedConsumerIds];
+        entry.lastFailureAt = now;
+        entry.retryCount += 1;
+        this.#scheduleRetry(entry, now);
         return;
       case "retry-scheduled":
         entry.counters.retryScheduled += 1;
