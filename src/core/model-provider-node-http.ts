@@ -79,6 +79,20 @@ export interface NodeModelHttpTransportOptions {
   readonly maxHeaderBytes?: number;
 }
 
+/** @internal Exported only so the Node callback shape remains directly falsifiable. */
+export function createPinnedModelLookup(
+  address: ResolvedNetworkAddress,
+): NonNullable<RequestOptions["lookup"]> {
+  return (_hostname, lookupOptions, callback) => {
+    const pinned = { address: address.address, family: address.family };
+    if ((lookupOptions as { all?: boolean }).all === true) {
+      callback(null, [pinned]);
+      return;
+    }
+    callback(null, pinned.address, pinned.family);
+  };
+}
+
 export class NodeModelHttpTransport implements ModelHttpTransport {
   readonly #resolver: SecureDnsResolver;
   readonly #maxHeaderBytes: number;
@@ -128,9 +142,7 @@ export class NodeModelHttpTransport implements ModelHttpTransport {
         signal: input.signal,
         agent: false,
         maxHeaderSize: this.#maxHeaderBytes,
-        lookup: (_hostname, _options, callback) => {
-          callback(null, address.address, address.family);
-        },
+        lookup: createPinnedModelLookup(address),
         ...(input.networkScope === "public"
           ? {
               minVersion: "TLSv1.2" as const,

@@ -16,7 +16,10 @@ import {
   type EmbeddingBrokerInvocation,
 } from "../../../src/core/model-provider-embedding-broker.js";
 import { EmbeddingDescriptorRegistry } from "../../../src/core/model-provider-embedding.js";
-import { NodeModelHttpTransport } from "../../../src/core/model-provider-node-http.js";
+import {
+  createPinnedModelLookup,
+  NodeModelHttpTransport,
+} from "../../../src/core/model-provider-node-http.js";
 import type { SecureDnsResolver } from "../../../src/core/secure-remote-fetch.js";
 import { EMBEDDING_STRATEGIES, textEmbeddingDescriptor } from "./fixtures.js";
 
@@ -109,6 +112,21 @@ function setupBroker(port: number): {
 }
 
 describe("production Node model HTTP transport", () => {
+  it("returns the pinned address in Node's all-address lookup shape", async () => {
+    const lookup = createPinnedModelLookup({ address: "93.184.216.34", family: 4 });
+    const result = await new Promise<unknown>((resolve, reject) => {
+      lookup(
+        "provider.example.test",
+        { all: true },
+        ((error: Error | null, addresses: unknown) => {
+          if (error) reject(error);
+          else resolve(addresses);
+        }) as never,
+      );
+    });
+    expect(result).toEqual([{ address: "93.184.216.34", family: 4 }]);
+  });
+
   it("executes an exact loopback route with bounded identity-encoded HTTP", async () => {
     const observations: Array<{
       method?: string;
