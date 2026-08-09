@@ -77,6 +77,40 @@ export interface ProviderToolDefinition {
   readonly parameters: ToolValueSchema;
 }
 
+/**
+ * The schema language currently enforced by `ToolPolicySession`.
+ *
+ * It is deliberately named instead of being presented as JSON Schema: string
+ * bounds are UTF-8 byte bounds and the enum representation is Dolly's closed
+ * `ToolValueSchema` representation.
+ */
+export const TOOL_VALUE_SCHEMA_DIALECT = "dolly.tool-value-schema/1" as const;
+
+export interface ToolRegistryToolView {
+  readonly name: string;
+  readonly description: string;
+  readonly schemaDialect: typeof TOOL_VALUE_SCHEMA_DIALECT;
+  readonly argumentSchema: Extract<ToolValueSchema, { type: "object" }>;
+  readonly successResultSchema: ToolValueSchema;
+  readonly effectClass: ToolEffectClass;
+  readonly approval: ToolDescriptor["approval"];
+  readonly idempotency: ToolDescriptor["idempotency"];
+  readonly outcomeQuery: ToolDescriptor["outcomeQuery"];
+  readonly parallel: ToolDescriptor["parallel"];
+  readonly limits: {
+    readonly deadlineMs: number;
+    readonly maxArgumentBytes: number;
+    readonly maxResultBytes: number;
+  };
+}
+
+/** A frozen, Extension-safe projection of one selected tool registry. */
+export interface ToolRegistrySnapshot {
+  readonly schemaVersion: "dolly.tool-registry-snapshot/1";
+  readonly registryDigest: string;
+  readonly tools: readonly ToolRegistryToolView[];
+}
+
 export interface ToolCallRequest {
   readonly providerCallId: string;
   readonly wireName: string;
@@ -506,6 +540,56 @@ export class InMemoryToolJournalRepository implements ToolJournalRepository {
   }
 }
 
+function createToolRegistrySnapshot(
+  descriptors: readonly ToolDescriptor[],
+): ToolRegistrySnapshot {
+  // Wire names are restricted to ASCII. Compare code units directly so a
+  // registry digest never depends on the host ICU/locale installation.
+  const ordered = [...descriptors].sort((left, right) =>
+    left.wireName < right.wireName ? -1 : left.wireName > right.wireName ? 1 : 0,
+  );
+  const registryDigest = canonicalJsonDigest({
+    schemaVersion: "dolly.tool-registry-binding/1",
+    descriptors: ordered.map((descriptor) => ({
+      toolId: descriptor.toolId,
+      wireName: descriptor.wireName,
+      description: descriptor.description,
+      argumentSchema: descriptor.argumentSchema,
+      resultSchema: descriptor.resultSchema,
+      effectClass: descriptor.effectClass,
+      resourceScope: descriptor.resourceScope,
+      approval: descriptor.approval,
+      idempotency: descriptor.idempotency,
+      outcomeQuery: descriptor.outcomeQuery,
+      parallel: descriptor.parallel,
+      deadlineMs: descriptor.deadlineMs,
+      maxArgumentBytes: descriptor.maxArgumentBytes,
+      maxResultBytes: descriptor.maxResultBytes,
+    })),
+  });
+  return frozenJson({
+    schemaVersion: "dolly.tool-registry-snapshot/1" as const,
+    registryDigest,
+    tools: ordered.map((descriptor) => ({
+      name: descriptor.wireName,
+      description: descriptor.description,
+      schemaDialect: TOOL_VALUE_SCHEMA_DIALECT,
+      argumentSchema: descriptor.argumentSchema,
+      successResultSchema: descriptor.resultSchema,
+      effectClass: descriptor.effectClass,
+      approval: descriptor.approval,
+      idempotency: descriptor.idempotency,
+      outcomeQuery: descriptor.outcomeQuery,
+      parallel: descriptor.parallel,
+      limits: {
+        deadlineMs: descriptor.deadlineMs,
+        maxArgumentBytes: descriptor.maxArgumentBytes,
+        maxResultBytes: descriptor.maxResultBytes,
+      },
+    })),
+  });
+}
+
 export class ToolRegistry {
   readonly #byId = new Map<string, ToolDescriptor>();
   readonly #byWireName = new Map<string, ToolDescriptor>();
@@ -588,6 +672,10 @@ export class ToolRegistry {
       }),
     );
   }
+
+  snapshot(): ToolRegistrySnapshot {
+    return createToolRegistrySnapshot([...this.#byId.values()]);
+  }
 }
 
 export interface ToolPolicySessionOptions {
@@ -601,6 +689,8 @@ export interface ToolPolicySessionOptions {
 }
 
 export class ToolPolicySession {
+  readonly moduleJobId: string;
+  readonly registryDigest: string;
   readonly #moduleJobId: string;
   readonly #registry: ToolRegistry;
   readonly #repository: ToolJournalRepository;
@@ -619,7 +709,9 @@ export class ToolPolicySession {
     assertNonNegativeInteger(options.budget.maxApprovals, "maxApprovals");
     assertPositiveInteger(options.budget.maxCallBytes, "maxCallBytes");
     this.#moduleJobId = options.moduleJobId;
+    this.moduleJobId = options.moduleJobId;
     this.#registry = options.registry;
+    this.registryDigest = options.registry.snapshot().registryDigest;
     this.#repository = options.repository;
     this.#approval = options.approval;
     this.#executor = options.executor;

@@ -7,7 +7,9 @@ import {
 } from "../../../src/core/extension-capability.js";
 import {
   createToolInvocationCapability,
+  createToolInvocationCapabilityV2,
   type ToolInvocationCapabilityOptions,
+  type ToolInvocationRunBinding,
   type ToolPolicySessionPort,
   type ToolRegistryView,
 } from "../../../src/core/provider-capabilities/index.js";
@@ -174,6 +176,32 @@ function createHarness(options: HarnessOptions = {}) {
         runId: EXECUTION_SCOPE.runId,
       });
     },
+  };
+}
+
+function createV2Binding(options: {
+  readonly moduleJobId: string;
+  readonly registry: ToolRegistry;
+  readonly executor?: ToolExecutor;
+  readonly budget?: ToolTurnBudget;
+}): ToolInvocationRunBinding {
+  const budget = options.budget ?? BUDGET;
+  return {
+    registry: options.registry,
+    budget,
+    policy: new ToolPolicySession({
+      moduleJobId: options.moduleJobId,
+      registry: options.registry,
+      repository: new InMemoryToolJournalRepository(),
+      approval: { decide: vi.fn().mockResolvedValue({ decision: "approved", code: "APPROVED" }) },
+      executor:
+        options.executor ??
+        ({
+          execute: vi.fn().mockResolvedValue({ status: "succeeded", content: { value: "ok" } }),
+        } as ToolExecutor),
+      budget,
+      approvalPolicyRevision: "policy-1",
+    }),
   };
 }
 
@@ -541,5 +569,246 @@ describe("Extension tool invocation capability", () => {
       code: "CAPABILITY_REVOKED",
     });
     expect(harness.executor.execute).not.toHaveBeenCalled();
+  });
+});
+
+describe("Extension tool invocation capability version two", () => {
+  it("publishes the complete selected tool contract without internal authority fields", async () => {
+    const registry = new ToolRegistry([readTool, hiddenTool], [readTool.toolId]);
+    const binding = createV2Binding({ moduleJobId: EXECUTION_SCOPE.moduleJobId, registry });
+    const authority = new ExtensionCapabilityAuthority({ now: () => NOW });
+    const session = authority.openSession(IDENTITY);
+    const definition = createToolInvocationCapabilityV2({
+      executionScope: EXECUTION_SCOPE,
+      binding,
+      expiresAt: EXPIRES_AT,
+    });
+    const handle = session.issue(definition.grant, definition.handler);
+
+    const view = await session.invoke({
+      handle,
+      operation: "list-tools",
+      arguments: {},
+      ...EXECUTION_SCOPE,
+    });
+
+    expect(view).toEqual({
+      schemaVersion: "dolly.tool-registry-view/2",
+      moduleJobId: "module-job-a",
+      registryDigest: registry.snapshot().registryDigest,
+      budget: BUDGET,
+      tools: [
+        {
+          name: "read_note",
+          description: "Read one note",
+          schemaDialect: "dolly.tool-value-schema/1",
+          argumentSchema: readTool.argumentSchema,
+          successResultSchema: readTool.resultSchema,
+          effectClass: "read",
+          approval: "never",
+          idempotency: "effect-key",
+          outcomeQuery: "supported",
+          parallel: "safe",
+          limits: {
+            deadlineMs: 1_000,
+            maxArgumentBytes: 128,
+            maxResultBytes: 128,
+          },
+        },
+      ],
+    });
+    expect(JSON.stringify(view)).not.toContain("notes.read");
+    expect(JSON.stringify(view)).not.toContain("resourceScope");
+    expect(definition.grant).toMatchObject({
+      capabilityVersion: "v2",
+      resourceScope: {
+        schemaVersion: "dolly.capability-scope.tool-invocation/2",
+        registryDigest: registry.snapshot().registryDigest,
+        toolWireNames: ["read_note"],
+      },
+    });
+
+    const hidden = await session.invoke({
+      handle,
+      operation: "execute-round",
+      arguments: {
+        roundIndex: 1,
+        calls: [
+          { callId: "call-hidden", name: "hidden_note", argumentsJson: '{"key":"a"}' },
+        ],
+      },
+      ...EXECUTION_SCOPE,
+    });
+    expect(results(hidden)).toEqual([
+      ["denied", "TOOL_NOT_ALLOWED", "round-1-call-1"],
+    ]);
+  });
+
+  it("rejects an advertised registry that differs from the executing policy", () => {
+    const advertised = new ToolRegistry([readTool], [readTool.toolId]);
+    const changedResultTool: ToolDescriptor = {
+      ...readTool,
+      resultSchema: {
+        type: "object",
+        properties: { value: { type: "string", maxBytes: 63 } },
+        required: ["value"],
+        additionalProperties: false,
+        maxProperties: 1,
+      },
+    };
+    const executing = new ToolRegistry([changedResultTool], [changedResultTool.toolId]);
+    const executingBinding = createV2Binding({
+      moduleJobId: EXECUTION_SCOPE.moduleJobId,
+      registry: executing,
+    });
+
+    expect(() =>
+      createToolInvocationCapabilityV2({
+        executionScope: EXECUTION_SCOPE,
+        binding: { ...executingBinding, registry: advertised },
+        expiresAt: EXPIRES_AT,
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "CAPABILITY_CONFIG_INVALID",
+        message: "Tool policy and advertised registry use different descriptors",
+      }),
+    );
+
+    const foreignJob = createV2Binding({ moduleJobId: "module-job-other", registry: advertised });
+    expect(() =>
+      createToolInvocationCapabilityV2({
+        executionScope: EXECUTION_SCOPE,
+        binding: foreignJob,
+        expiresAt: EXPIRES_AT,
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "CAPABILITY_CONFIG_INVALID",
+        message: "Tool policy belongs to another Module job",
+      }),
+    );
+  });
+
+  it("changes the binding digest when executable schema, policy, limit, or scope changes", () => {
+    const baseline = new ToolRegistry([readTool], [readTool.toolId]).snapshot().registryDigest;
+    const variants: readonly ToolDescriptor[] = [
+      {
+        ...readTool,
+        argumentSchema: {
+          ...readTool.argumentSchema,
+          properties: { key: { type: "string", maxBytes: 31 } },
+        },
+      },
+      {
+        ...readTool,
+        resultSchema: { type: "string", maxBytes: 64 },
+      },
+      {
+        ...readTool,
+        effectClass: "write",
+        approval: "required",
+      },
+      { ...readTool, maxResultBytes: 127 },
+      { ...readTool, resourceScope: "notes-other" },
+    ];
+
+    for (const descriptor of variants) {
+      expect(new ToolRegistry([descriptor], [descriptor.toolId]).snapshot().registryDigest).not.toBe(
+        baseline,
+      );
+    }
+  });
+
+  it("resolves and freezes one host-owned binding per active Module job", async () => {
+    const secondTool: ToolDescriptor = {
+      ...readTool,
+      toolId: "notes.second",
+      wireName: "read_second",
+      description: "Read the second note store",
+    };
+    const registryA = new ToolRegistry([readTool], [readTool.toolId]);
+    const registryB = new ToolRegistry([secondTool], [secondTool.toolId]);
+    const executeA = vi.fn().mockResolvedValue({ status: "succeeded", content: { value: "a" } });
+    const executeB = vi.fn().mockResolvedValue({ status: "succeeded", content: { value: "b" } });
+    const bindingA = createV2Binding({
+      moduleJobId: "module-job-a",
+      registry: registryA,
+      executor: { execute: executeA },
+    });
+    const bindingB = createV2Binding({
+      moduleJobId: "module-job-b",
+      registry: registryB,
+      executor: { execute: executeB },
+    });
+    const resolveRun = vi.fn((context: { moduleJobId: string }) =>
+      context.moduleJobId === "module-job-a" ? bindingA : bindingB,
+    );
+    const authority = new ExtensionCapabilityAuthority({ now: () => NOW });
+    const session = authority.openSession(IDENTITY);
+    const definition = createToolInvocationCapabilityV2({
+      executionScope: "active-run",
+      resolveRun,
+      expiresAt: EXPIRES_AT,
+    });
+    const handle = session.issue(definition.grant, definition.handler);
+    const invoke = (
+      moduleJobId: string,
+      runId: string,
+      operation: "list-tools" | "execute-round",
+      argumentsValue: JsonValue,
+      attempt = 1,
+    ) =>
+      session.invoke({
+        handle,
+        operation,
+        arguments: argumentsValue,
+        moduleJobId,
+        runId,
+        attempt,
+        deadline: "2026-07-26T00:01:00.000Z",
+      });
+
+    const viewA = await invoke("module-job-a", "run-a", "list-tools", {});
+    const viewB = await invoke("module-job-b", "run-b", "list-tools", {});
+    const retryViewA = await invoke("module-job-a", "run-a-retry", "list-tools", {}, 2);
+    expect((viewA as { registryDigest: string }).registryDigest).toBe(
+      registryA.snapshot().registryDigest,
+    );
+    expect((viewB as { registryDigest: string }).registryDigest).toBe(
+      registryB.snapshot().registryDigest,
+    );
+    expect((retryViewA as { registryDigest: string }).registryDigest).toBe(
+      registryA.snapshot().registryDigest,
+    );
+    expect(resolveRun).toHaveBeenCalledTimes(2);
+    expect(resolveRun).toHaveBeenNthCalledWith(1, {
+      moduleJobId: "module-job-a",
+      runId: "run-a",
+      attempt: 1,
+      deadline: "2026-07-26T00:01:00.000Z",
+    });
+
+    await invoke("module-job-a", "run-a", "execute-round", {
+      roundIndex: 1,
+      calls: [{ callId: "call-a", name: "read_note", argumentsJson: '{"key":"a"}' }],
+    });
+    await invoke("module-job-b", "run-b", "execute-round", {
+      roundIndex: 1,
+      calls: [{ callId: "call-b", name: "read_second", argumentsJson: '{"key":"b"}' }],
+    });
+    expect(executeA).toHaveBeenCalledOnce();
+    expect(executeB).toHaveBeenCalledOnce();
+
+    await expect(
+      session.invoke({
+        handle,
+        operation: "list-tools",
+        arguments: {},
+        moduleJobId: "module-job-c",
+        runId: "run-c",
+        deadline: "2026-07-26T00:01:00.000Z",
+      }),
+    ).rejects.toMatchObject({ code: "CAPABILITY_SCOPE_MISMATCH" });
   });
 });

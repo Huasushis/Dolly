@@ -18,6 +18,7 @@ import {
 } from "../../../src/core/extension-process-host.js";
 import type { JsonValue } from "../../../src/core/canonical-json.js";
 import type { ExtensionPackageManifest } from "../../../src/core/extension-installation-registry.js";
+import { createToolInvocationCapabilityV2 } from "../../../src/core/provider-capabilities/index.js";
 import {
   ModuleActor,
   ModuleExecutorTerminationUnconfirmedError,
@@ -25,6 +26,13 @@ import {
 } from "../../../src/core/module-actor.js";
 import type { ReactiveModuleInput } from "../../../src/core/reactive-module-input.js";
 import type { ReactiveModuleResult } from "../../../src/core/reactive-module-runtime.js";
+import {
+  InMemoryToolJournalRepository,
+  ToolPolicySession,
+  ToolRegistry,
+  type ToolDescriptor,
+  type ToolTurnBudget,
+} from "../../../src/core/tool-policy.js";
 
 const FIXTURE = fileURLToPath(
   new URL("./fixtures/extension-process-fixture.mjs", import.meta.url),
@@ -581,6 +589,97 @@ describe("Extension process isolation and capability checks", () => {
           attempt: 2,
         }),
       ).resolves.toEqual({ fromHost: true });
+      expect(observed).toEqual([
+        { moduleJobId: "module-job-a", runId: "run-a", attempt: 1 },
+        { moduleJobId: "module-job-b", runId: "run-b", attempt: 2 },
+      ]);
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("projects the Host-selected version-two tool registry for each active Run", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-tool-registry-active-run-"));
+    const host = createHost("tool-registry-active-run", scratch);
+    const budget: ToolTurnBudget = {
+      maxRounds: 2,
+      maxCalls: 4,
+      maxCallsPerRound: 2,
+      maxApprovals: 0,
+      maxCallBytes: 512,
+    };
+    const descriptor = (moduleJobId: string): ToolDescriptor => ({
+      toolId: `notes.${moduleJobId}`,
+      wireName: moduleJobId === "module-job-a" ? "read_note" : "read_second",
+      description: `Read notes selected for ${moduleJobId}`,
+      argumentSchema: {
+        type: "object",
+        properties: { key: { type: "string", maxBytes: 32 } },
+        required: ["key"],
+        additionalProperties: false,
+        maxProperties: 1,
+      },
+      resultSchema: { type: "string", maxBytes: 64 },
+      effectClass: "read",
+      resourceScope: `scope.${moduleJobId}`,
+      approval: "never",
+      idempotency: "effect-key",
+      outcomeQuery: "supported",
+      parallel: "safe",
+      deadlineMs: 1_000,
+      maxArgumentBytes: 128,
+      maxResultBytes: 128,
+    });
+    const observed: Array<{ moduleJobId: string; runId: string; attempt: number }> = [];
+    const definition = createToolInvocationCapabilityV2({
+      executionScope: "active-run",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      resolveRun: (context) => {
+        observed.push({
+          moduleJobId: context.moduleJobId,
+          runId: context.runId,
+          attempt: context.attempt,
+        });
+        const selected = descriptor(context.moduleJobId);
+        const registry = new ToolRegistry([selected], [selected.toolId]);
+        return {
+          registry,
+          budget,
+          policy: new ToolPolicySession({
+            moduleJobId: context.moduleJobId,
+            registry,
+            repository: new InMemoryToolJournalRepository(),
+            approval: { decide: vi.fn() },
+            executor: { execute: vi.fn() },
+            budget,
+            approvalPolicyRevision: "policy-1",
+          }),
+        };
+      },
+    });
+    host.grantCapability(definition.grant, definition.handler);
+
+    try {
+      await host.start();
+      const first = await host.execute(execution());
+      const second = await host.execute({
+        ...execution(),
+        moduleJobId: "module-job-b",
+        runId: "run-b",
+        attempt: 2,
+      });
+      expect(first).toMatchObject({
+        schemaVersion: "dolly.tool-registry-view/2",
+        moduleJobId: "module-job-a",
+        tools: [{ name: "read_note", schemaDialect: "dolly.tool-value-schema/1" }],
+      });
+      expect(second).toMatchObject({
+        schemaVersion: "dolly.tool-registry-view/2",
+        moduleJobId: "module-job-b",
+        tools: [{ name: "read_second", schemaDialect: "dolly.tool-value-schema/1" }],
+      });
       expect(observed).toEqual([
         { moduleJobId: "module-job-a", runId: "run-a", attempt: 1 },
         { moduleJobId: "module-job-b", runId: "run-b", attempt: 2 },

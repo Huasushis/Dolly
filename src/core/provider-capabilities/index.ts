@@ -14,14 +14,23 @@ export {
 } from "./model-operation-capability.js";
 export {
   createToolInvocationCapability,
+  createToolInvocationCapabilityV2,
   DEFAULT_TOOL_INVOCATION_LIMITS,
+  DEFAULT_TOOL_INVOCATION_V2_LIMITS,
   TOOL_INVOCATION_CAPABILITY_TYPE,
   TOOL_INVOCATION_CAPABILITY_VERSION,
+  TOOL_INVOCATION_CAPABILITY_VERSION_V2,
+  type ToolInvocationActiveRunContext,
   type ToolInvocationCapabilityOptions,
+  type ToolInvocationCapabilityV2Options,
   type ToolInvocationDenialReason,
   type ToolInvocationLimits,
   type ToolInvocationOperation,
+  type ToolInvocationRunBinding,
+  type ToolInvocationV2Limits,
   type ToolPolicySessionPort,
+  type ToolPolicySessionV2Port,
+  type ToolRegistrySnapshotView,
   type ToolRegistryView,
 } from "./tool-invocation-capability.js";
 export {

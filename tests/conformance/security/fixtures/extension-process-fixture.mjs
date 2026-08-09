@@ -58,13 +58,14 @@ async function invokeCapability(
     runId: "run-capability",
     idempotencyKey: "fixture-effect",
   },
+  argumentsValue = { key: "fixture-key" },
 ) {
   return request("capability.invoke", {
     protocolVersion,
     sessionId: initialized.sessionId,
     handle,
     operation,
-    arguments: { key: "fixture-key" },
+    arguments: argumentsValue,
     ...(mode === "old-module-job-field"
       ? { processingId: "module-job-capability" }
       : { moduleJobId: executionScope.moduleJobId }),
@@ -281,6 +282,27 @@ async function handleHostRequest(message) {
               idempotencyKey: `${params.moduleJobId}-fixture-effect`,
             }
           : undefined,
+      );
+      respond(id, {
+        protocolVersion,
+        sessionId: params.sessionId,
+        moduleId: params.moduleId,
+        moduleGenerationId: params.moduleGenerationId,
+        runId: params.runId,
+        result: capabilityErrorCodeOf(capabilityResponse),
+      });
+      return;
+    }
+    if (mode === "tool-registry-active-run") {
+      const capabilityResponse = await invokeCapability(
+        initialized.capabilities[0].handle,
+        "list-tools",
+        {
+          moduleJobId: params.moduleJobId,
+          runId: params.runId,
+          idempotencyKey: `${params.moduleJobId}-tool-registry`,
+        },
+        {},
       );
       respond(id, {
         protocolVersion,

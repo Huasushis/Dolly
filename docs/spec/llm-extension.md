@@ -315,6 +315,49 @@ Duplicate/unrepresentable wire names fail registry construction. Tool names are
 not decoded by delimiter-dependent regular expressions. Malformed arguments
 produce a typed terminal result, never an assumed `{}`.
 
+The compatibility response `dolly.tool-registry-view/1` exposes only a tool
+name, description, and argument schema. It is insufficient for a model-assisted
+agent because it omits the successful-result contract and the policy limits
+that the host actually enforces. New integrations MUST use
+`dolly.tool-registry-view/2`. Version 2 exposes, for each selected tool:
+
+- its wire name and description;
+- `schemaDialect: "dolly.tool-value-schema/1"`;
+- the closed argument schema and successful-result schema;
+- effect class, approval, idempotency, outcome-query, and parallel policy; and
+- deadline, argument-byte, and result-byte limits.
+
+`dolly.tool-value-schema/1` is Dolly's bounded structured-value language. In
+particular, string bounds count UTF-8 bytes and its enum representation is not
+JSON Schema. A provider adapter MUST NOT label or transmit it as JSON Schema
+without an independently tested conversion.
+
+The version 2 response also carries the complete turn budget and a
+`registryDigest`. The digest is calculated from the selected host execution
+descriptors, including internal identifiers and resource scopes that are not
+otherwise disclosed. The host MUST reject a capability binding when the policy
+session digest and advertised-registry digest differ. Changing a schema,
+effect policy, execution limit, internal tool identity, or resource scope
+therefore creates another digest.
+
+A long-lived Extension process receives a `tool-invocation/v2` handle only in
+explicit `active-run` mode. For every request, the process host supplies the
+verified `moduleJobId`, `runId`, attempt, and deadline; an Extension field does
+not select them. The host resolves and freezes one registry, budget, policy
+session, and journal binding per Module job. A retry keeps the `moduleJobId`,
+may change the `runId`, and MUST reuse the same binding and digest. Another
+Module job may resolve a different binding. A fixed-Run version 2 handle remains
+available for bounded tests and one-shot hosts.
+
+The current source has this versioned registry/capability boundary and the
+in-memory policy state machine, but no durable `ToolJournalRepository` product
+implementation or production Module composition. Consequently it does not yet
+support crash-safe effectful tools. The current chat request schema also cannot
+represent an assistant tool call followed by a typed tool-result unit, so a
+registry-derived, schema-checked JSON action is the honest interim Agent path;
+native provider function calling requires a separately versioned chat-round
+contract.
+
 ### 8.2 Turn transitions
 
 ```text
