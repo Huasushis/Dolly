@@ -120,12 +120,24 @@ export interface ChatFeatures {
     readonly maxSchemaBytes: number;
     readonly strategyId: string;
   }>;
+  /**
+   * A syntactically valid JSON object without schema enforcement. This is a
+   * separate capability from `structuredOutput`: providers commonly expose
+   * one without supporting the other, and callers must not mistake JSON
+   * syntax for schema validation.
+   *
+   * Absent only on legacy descriptor schema v3. Descriptor v4 requires an
+   * explicit supported/unsupported declaration.
+   */
+  readonly jsonObjectOutput?: SupportStatus<{
+    readonly strategyId: string;
+  }>;
   readonly reasoning: ReasoningWireFeatures;
   readonly finishReasons: readonly string[];
 }
 
 export interface ChatDescriptorDocument {
-  readonly schemaVersion: "dolly.model-descriptor/3";
+  readonly schemaVersion: "dolly.model-descriptor/3" | "dolly.model-descriptor/4";
   readonly descriptorVersion: string;
   readonly endpointId: string;
   readonly operation: "chat-completion";
@@ -594,7 +606,11 @@ function normalizeReasoning(value: unknown): ReasoningWireFeatures {
   };
 }
 
-function normalizeChatFeatures(value: unknown, input: DescriptorInput): ChatFeatures {
+function normalizeChatFeatures(
+  value: unknown,
+  input: DescriptorInput,
+  schemaVersion: ChatDescriptorDocument["schemaVersion"],
+): ChatFeatures {
   closed(
     value,
     [
@@ -607,6 +623,7 @@ function normalizeChatFeatures(value: unknown, input: DescriptorInput): ChatFeat
       "mediaRequirementIds",
       "tools",
       "structuredOutput",
+      ...(schemaVersion === "dolly.model-descriptor/4" ? ["jsonObjectOutput"] : []),
       "reasoning",
       "finishReasons",
     ],
@@ -626,6 +643,17 @@ function normalizeChatFeatures(value: unknown, input: DescriptorInput): ChatFeat
       );
     }
   }
+  const jsonObjectOutput =
+    schemaVersion === "dolly.model-descriptor/4"
+      ? supportStatus(
+          value.jsonObjectOutput,
+          "features.jsonObjectOutput",
+          (candidate, label) => {
+            closed(candidate, ["strategyId"], label);
+            return { strategyId: name(candidate.strategyId, `${label}.strategyId`) };
+          },
+        )
+      : undefined;
   return {
     roles: uniqueNames(value.roles, "features.roles"),
     messageOrderStrategyId: name(
@@ -682,6 +710,7 @@ function normalizeChatFeatures(value: unknown, input: DescriptorInput): ChatFeat
         };
       },
     ),
+    ...(jsonObjectOutput === undefined ? {} : { jsonObjectOutput }),
     reasoning: normalizeReasoning(value.reasoning),
     finishReasons: uniqueNames(value.finishReasons, "features.finishReasons"),
   };
@@ -704,7 +733,10 @@ export function validateChatDescriptor(value: unknown): ChatDescriptorDocument {
     ],
     "descriptor",
   );
-  if (value.schemaVersion !== "dolly.model-descriptor/3") {
+  if (
+    value.schemaVersion !== "dolly.model-descriptor/3" &&
+    value.schemaVersion !== "dolly.model-descriptor/4"
+  ) {
     throw new ModelDescriptorError("DESCRIPTOR_INVALID", "Descriptor schema is unsupported");
   }
   if (value.operation !== "chat-completion") {
@@ -738,7 +770,8 @@ export function validateChatDescriptor(value: unknown): ChatDescriptorDocument {
       "A non-streaming descriptor cannot declare an adapter stream strategy",
     );
   }
-  const features = normalizeChatFeatures(value.features, input);
+  const schemaVersion = value.schemaVersion;
+  const features = normalizeChatFeatures(value.features, input, schemaVersion);
   if (
     features.reasoning.observation.state === "supported" &&
     features.reasoning.observation.value.streamStrategyId !== undefined &&
@@ -751,7 +784,7 @@ export function validateChatDescriptor(value: unknown): ChatDescriptorDocument {
   }
 
   return deepFreeze({
-    schemaVersion: "dolly.model-descriptor/3",
+    schemaVersion,
     descriptorVersion: name(value.descriptorVersion, "descriptorVersion"),
     endpointId: logicalEndpointId(value.endpointId),
     operation: "chat-completion",
@@ -809,6 +842,9 @@ function strategies(document: ChatDescriptorDocument): readonly string[] {
   }
   if (document.features.structuredOutput.state === "supported") {
     values.push(document.features.structuredOutput.value.strategyId);
+  }
+  if (document.features.jsonObjectOutput?.state === "supported") {
+    values.push(document.features.jsonObjectOutput.value.strategyId);
   }
   const reasoning = document.features.reasoning;
   if (reasoning.requestControl.kind !== "forbidden") values.push(reasoning.requestControl.strategyId);

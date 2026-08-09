@@ -47,7 +47,7 @@ export type ChatPart =
     };
 
 export interface ChatInput {
-  readonly schemaVersion: "dolly.model.chat-input/2";
+  readonly schemaVersion: "dolly.model.chat-input/2" | "dolly.model.chat-input/3";
   readonly messages: readonly {
     readonly role: string;
     readonly parts: readonly ChatPart[];
@@ -59,6 +59,7 @@ export interface ChatInput {
   }[];
   readonly outputContract:
     | { readonly kind: "text" }
+    | { readonly kind: "json-object" }
     | { readonly kind: "json-schema"; readonly schema: JsonValue };
   readonly reasoning: ReasoningWireDirective;
   readonly stream: boolean;
@@ -299,7 +300,11 @@ function normalizeInput(snapshot: ChatDescriptorSnapshot, input: ChatInput): Jso
     "chat input",
     "CHAT_INPUT_INVALID",
   );
-  if (input.schemaVersion !== "dolly.model.chat-input/2" || typeof input.stream !== "boolean") {
+  if (
+    (input.schemaVersion !== "dolly.model.chat-input/2" &&
+      input.schemaVersion !== "dolly.model.chat-input/3") ||
+    typeof input.stream !== "boolean"
+  ) {
     throw new ModelChatError("CHAT_INPUT_INVALID", "Chat input schema is invalid");
   }
   if (
@@ -464,7 +469,29 @@ function normalizeInput(snapshot: ChatDescriptorSnapshot, input: ChatInput): Jso
   if (!isPlainObject(input.outputContract)) {
     throw new ModelChatError("CHAT_INPUT_INVALID", "Output contract is invalid");
   }
-  if (input.outputContract.kind === "json-schema") {
+  if (input.outputContract.kind === "json-object") {
+    closed(input.outputContract, ["kind"], "outputContract", "CHAT_INPUT_INVALID");
+    if (input.schemaVersion !== "dolly.model.chat-input/3") {
+      throw new ModelChatError(
+        "CHAT_INPUT_INVALID",
+        "JSON-object output requires chat input schema version 3",
+      );
+    }
+    const feature = descriptor.features.jsonObjectOutput;
+    if (feature?.state !== "supported") {
+      throw new ModelChatError(
+        "CHAT_FEATURE_UNSUPPORTED",
+        "JSON-object output is unsupported",
+      );
+    }
+    if (feature.value.strategyId !== "openai.response-format.json-object.v1") {
+      throw new ModelChatError(
+        "CHAT_STRATEGY_UNSUPPORTED",
+        "JSON-object output strategy is unsupported",
+      );
+    }
+    body.response_format = { type: "json_object" };
+  } else if (input.outputContract.kind === "json-schema") {
     closed(input.outputContract, ["kind", "schema"], "outputContract", "CHAT_INPUT_INVALID");
     if (descriptor.features.structuredOutput.state !== "supported") {
       throw new ModelChatError(

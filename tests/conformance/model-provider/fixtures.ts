@@ -16,6 +16,7 @@ export const CHAT_STRATEGIES = new Set([
   "openai.reasoning-content.stream.v1",
   "openai.enable-thinking.boolean.v1",
   "thinking-object.enabled-disabled.v1",
+  "openai.response-format.json-object.v1",
 ]);
 
 export const EMBEDDING_STRATEGIES = new Set([
@@ -94,9 +95,14 @@ export function chatDescriptor(options: {
   descriptorVersion?: string;
   reasoning?: ReasoningWireFeatures;
   maxRequestBytes?: number;
+  jsonObjectOutput?: "supported" | "unsupported";
 } = {}): ChatDescriptorDocument {
+  const schemaVersion =
+    options.jsonObjectOutput === undefined
+      ? "dolly.model-descriptor/3" as const
+      : "dolly.model-descriptor/4" as const;
   return {
-    schemaVersion: "dolly.model-descriptor/3",
+    schemaVersion,
     descriptorVersion: options.descriptorVersion ?? "v1",
     endpointId: options.endpointId ?? "fixture-chat-endpoint",
     operation: "chat-completion",
@@ -144,6 +150,17 @@ export function chatDescriptor(options: {
       mediaRequirementIds: [],
       tools: { state: "unsupported" },
       structuredOutput: { state: "unsupported" },
+      ...(options.jsonObjectOutput === undefined
+        ? {}
+        : {
+            jsonObjectOutput:
+              options.jsonObjectOutput === "supported"
+                ? {
+                    state: "supported" as const,
+                    value: { strategyId: "openai.response-format.json-object.v1" },
+                  }
+                : { state: "unsupported" as const },
+          }),
       reasoning: options.reasoning ?? alwaysOnReasoning(),
       finishReasons: ["stop", "length", "tool_calls"],
     },

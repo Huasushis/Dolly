@@ -24,9 +24,11 @@ import {
 import { EmbeddingDescriptorRegistry } from "../../../src/core/model-provider-embedding.js";
 import {
   createModelOperationCapability,
+  createModelOperationCapabilityV2,
   type ChatModelBrokerPort,
   type EmbeddingModelBrokerPort,
   type ModelOperationCapabilityOptions,
+  type ModelOperationCapabilityV2Options,
 } from "../../../src/core/provider-capabilities/index.js";
 import {
   CHAT_STRATEGIES,
@@ -275,6 +277,74 @@ describe("Extension model operation capability", () => {
     });
   });
 
+  it("keeps the v2 JSON-object syntax Host-granted and schema-free", async () => {
+    let handleSeed = 0;
+    const authority = new ExtensionCapabilityAuthority({
+      now: () => NOW,
+      nextHandle: () => Buffer.alloc(32, (handleSeed += 1)).toString("base64url"),
+    });
+    const session = authority.openSession(IDENTITY);
+    const invoke = vi.fn(async (invocation: ChatBrokerInvocation) => succeededChat(invocation));
+    const options: ModelOperationCapabilityV2Options = {
+      descriptor: chatRef(),
+      ownerScope: "owner-1",
+      budgets: BUDGETS,
+      executionScope: EXECUTION_SCOPE,
+      expiresAt: EXPIRES_AT,
+      now: () => NOW,
+      chat: { invoke },
+      outputContracts: ["json-object"],
+    };
+    const definition = createModelOperationCapabilityV2(options);
+    const handle = session.issue(definition.grant, definition.handler);
+    const call = (operation: string, argumentsValue: JsonValue) =>
+      session.invoke({
+        handle,
+        operation,
+        arguments: argumentsValue,
+        moduleJobId: EXECUTION_SCOPE.moduleJobId,
+        runId: EXECUTION_SCOPE.runId,
+      });
+
+    expect(definition.grant).toMatchObject({
+      capabilityVersion: "v2",
+      resourceScope: { outputContracts: ["json-object"] },
+    });
+    await expect(call("describe", {})).resolves.toMatchObject({
+      schemaVersion: "dolly.model-operation-description/2",
+      outputContracts: ["json-object"],
+    });
+    await expect(
+      call("chat", { ...ONE_MESSAGE, outputContract: { kind: "json-object" } }),
+    ).resolves.toMatchObject({ status: "succeeded" });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke.mock.calls[0]![0].input).toEqual({
+      schemaVersion: "dolly.model.chat-input/3",
+      messages: [{ role: "user", parts: [{ kind: "text", text: "hi" }] }],
+      outputContract: { kind: "json-object" },
+      stream: false,
+    });
+
+    await expect(call("chat", ONE_MESSAGE)).rejects.toMatchObject({
+      code: "CAPABILITY_DENIED",
+      details: { reason: "MODEL_OUTPUT_CONTRACT_DENIED", requested: "text" },
+    });
+    await expect(
+      call("chat", {
+        ...ONE_MESSAGE,
+        outputContract: { kind: "json-object", schema: { type: "object" } },
+      }),
+    ).rejects.toMatchObject({ code: "CAPABILITY_ARGUMENT_INVALID" });
+    await expect(
+      call("chat", { ...ONE_MESSAGE, outputContract: { kind: "json-schema" } }),
+    ).rejects.toMatchObject({ code: "CAPABILITY_ARGUMENT_INVALID" });
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    expect(() =>
+      createModelOperationCapabilityV2({ ...options, outputContracts: [] }),
+    ).toThrowError(expect.objectContaining({ code: "CAPABILITY_CONFIG_INVALID" }));
+  });
+
   it("refuses every attempt to name the model, endpoint, budget, or context", async () => {
     const harness = createHarness();
 
@@ -286,6 +356,7 @@ describe("Extension model operation capability", () => {
       { ...ONE_MESSAGE, deadline: "2030-01-01T00:00:00.000Z" },
       { ...ONE_MESSAGE, ownerScope: "owner-2" },
       { ...ONE_MESSAGE, moduleJobId: "module-job-b" },
+      { ...ONE_MESSAGE, outputContract: { kind: "json-object" } },
     ]) {
       await expect(harness.invoke("chat", forged)).rejects.toMatchObject({
         code: "CAPABILITY_ARGUMENT_INVALID",

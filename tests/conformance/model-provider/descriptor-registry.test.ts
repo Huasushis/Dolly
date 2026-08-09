@@ -86,6 +86,48 @@ describe("model descriptor registry", () => {
     );
   });
 
+  it("keeps JSON-object syntax separate, explicit, and strategy-pinned in descriptor v4", () => {
+    const descriptors = registry();
+    const supported = descriptors.register(chatDescriptor({ jsonObjectOutput: "supported" }));
+    descriptors.setStatus(supported, "active");
+    expect(descriptors.snapshot(supported).document).toMatchObject({
+      schemaVersion: "dolly.model-descriptor/4",
+      features: {
+        structuredOutput: { state: "unsupported" },
+        jsonObjectOutput: {
+          state: "supported",
+          value: { strategyId: "openai.response-format.json-object.v1" },
+        },
+      },
+    });
+
+    const deniedStrategies = new Set(CHAT_STRATEGIES);
+    deniedStrategies.delete("openai.response-format.json-object.v1");
+    expect(() =>
+      registry(deniedStrategies).register(chatDescriptor({ jsonObjectOutput: "supported" })),
+    ).toThrowError(
+      expect.objectContaining<Partial<ModelDescriptorError>>({
+        code: "DESCRIPTOR_STRATEGY_DENIED",
+      }),
+    );
+
+    const legacy = chatDescriptor();
+    expect(() =>
+      registry().register({
+        ...legacy,
+        features: { ...legacy.features, jsonObjectOutput: { state: "unsupported" } },
+      }),
+    ).toThrowError(
+      expect.objectContaining<Partial<ModelDescriptorError>>({ code: "DESCRIPTOR_INVALID" }),
+    );
+
+    const missingDeclaration = chatDescriptor({ jsonObjectOutput: "unsupported" });
+    const { jsonObjectOutput: _removed, ...features } = missingDeclaration.features;
+    expect(() => registry().register({ ...missingDeclaration, features })).toThrowError(
+      expect.objectContaining<Partial<ModelDescriptorError>>({ code: "DESCRIPTOR_INVALID" }),
+    );
+  });
+
   it.each(["dolly.model-descriptor/1", "dolly.model-descriptor/2"])(
     "rejects obsolete descriptor schema %s",
     (schemaVersion) => {

@@ -145,6 +145,13 @@ introduce a second media-view identity. Registries MUST reject versions 1 and 2;
 migration creates and validates a new version 3 document instead of accepting
 multiple versions at one runtime boundary.
 
+Chat descriptor schema version 4 adds an explicit `jsonObjectOutput` feature.
+Version 3 remains a legacy chat descriptor whose absent declaration means that
+JSON-object output is unsupported. Version 4 MUST declare the feature as either
+supported or unsupported. This feature promises only a syntactically valid JSON
+object. It is distinct from `structuredOutput`, which promises enforcement of a
+named schema dialect; one MUST NOT be inferred from the other.
+
 The normative schemas MUST be closed. A descriptor MUST NOT contain endpoint
 addresses, routes, proxy settings, secret references or values, authentication
 headers, paths, capability handles, media grants, signed URLs, request-specific
@@ -204,6 +211,14 @@ The host issues an opaque, session-local handle bound to:
 
 Possession authorizes only the host-side grant. The handle is not persistent
 configuration and MUST NOT expose its binding or underlying authorities.
+
+Model-operation capability version 1 remains a closed text-output interface.
+Version 2 adds a host-frozen set of output contract kinds. An Extension may
+select only a granted kind and may not supply a provider strategy, output
+schema, endpoint, model, or credential through that selection. The current
+version-2 kinds are `text` and `json-object`. A JSON Schema contract remains a
+separate host-reviewed interface because accepting an Extension-supplied schema
+would change request size, provider behavior, and output trust.
 
 ### 2.4 Frozen invocation snapshot
 
@@ -570,6 +585,9 @@ interface ChatFeatures {
     maxSchemaBytes: number;
     strategyId: string;
   }>;
+  jsonObjectOutput?: SupportStatus<{
+    strategyId: string;
+  }>;
   reasoning: ReasoningWireFeatures;
   finishReasons: readonly string[];
 }
@@ -595,7 +613,7 @@ type ChatPart =
     };
 
 interface ChatInput {
-  schemaVersion: "dolly.model.chat-input/2";
+  schemaVersion: "dolly.model.chat-input/2" | "dolly.model.chat-input/3";
   messages: readonly {
     role: string;
     parts: readonly ChatPart[];
@@ -607,6 +625,7 @@ interface ChatInput {
   }[];
   outputContract:
     | { kind: "text" }
+    | { kind: "json-object" }
     | { kind: "json-schema"; schema: JsonValue };
   reasoning: ReasoningWireDirective;
   stream: boolean;
@@ -624,6 +643,15 @@ interface ChatOutput {
   finishReason: string;
 }
 ~~~
+
+Input version 2 MUST reject `json-object`. Input version 3 may use it only when
+the frozen descriptor is version 4, `jsonObjectOutput` is supported, and its
+allowlisted strategy is `openai.response-format.json-object.v1`. That strategy
+emits exactly `response_format: {"type":"json_object"}`. It does not validate
+the returned object against an application schema; the consumer still validates
+its closed result contract. Plain text, JSON-object syntax, and JSON Schema are
+three different contracts and failures MUST remain visible rather than silently
+downgrading between them.
 
 The normative schema is closed and validates roles, schema dialect, limits,
 tool names, finish reasons, and media requirement identifiers against the frozen

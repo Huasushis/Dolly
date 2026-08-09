@@ -39,10 +39,12 @@ import {
 
 export const MODEL_OPERATION_CAPABILITY_TYPE = "model-operation";
 export const MODEL_OPERATION_CAPABILITY_VERSION = "v1";
+export const MODEL_OPERATION_CAPABILITY_VERSION_V2 = "v2";
 
 /** The modality an extension may ask for; one handle carries exactly one. */
 export type ModelModality = "chat" | "embedding" | "rerank";
 export type ModelOperationName = ModelModality | "describe";
+export type ModelOutputContractKind = "text" | "json-object";
 
 /**
  * The reason a model operation was refused before any provider dispatch.
@@ -57,6 +59,7 @@ export type ModelOperationDenialReason =
   | "MODEL_MEDIA_NOT_GRANTED"
   | "MODEL_STREAMING_NOT_GRANTED"
   | "MODEL_TOOLS_NOT_GRANTED"
+  | "MODEL_OUTPUT_CONTRACT_DENIED"
   | "MODEL_REASONING_POLICY_DENIED"
   | "MODEL_ROLE_DENIED"
   | "MODEL_RATE_LIMITED"
@@ -149,6 +152,11 @@ export interface ModelOperationCapabilityOptions {
   readonly nextRequestId?: () => string;
 }
 
+export interface ModelOperationCapabilityV2Options extends ModelOperationCapabilityOptions {
+  /** Output syntaxes this Host grants. No schema or provider strategy is Extension-controlled. */
+  readonly outputContracts: readonly ModelOutputContractKind[];
+}
+
 function modelDenied(
   reason: ModelOperationDenialReason,
   message: string,
@@ -186,6 +194,7 @@ function resolveLimits(overrides: Partial<ModelOperationLimits> | undefined): Mo
  * was frozen when the handle was issued.
  */
 const CHAT_ARGUMENT_FIELDS = ["messages", "reasoning", "maxOutputTokens", "stream"] as const;
+const CHAT_ARGUMENT_FIELDS_V2 = [...CHAT_ARGUMENT_FIELDS, "outputContract"] as const;
 const EMBEDDING_ARGUMENT_FIELDS = ["items", "outputDimension"] as const;
 
 interface RequestedChatPart {
@@ -247,8 +256,10 @@ function readChatParts(
  * owner scope, the allowed operation, and finite rate, byte, item, time, and
  * expiry limits, all enforced here before the broker is called.
  */
-export function createModelOperationCapability(
+function buildModelOperationCapability(
   options: ModelOperationCapabilityOptions,
+  capabilityVersion: typeof MODEL_OPERATION_CAPABILITY_VERSION | typeof MODEL_OPERATION_CAPABILITY_VERSION_V2,
+  configuredOutputContracts: readonly ModelOutputContractKind[],
 ): ExtensionCapabilityDefinition {
   const limits = resolveLimits(options.limits);
   try {
@@ -300,6 +311,16 @@ export function createModelOperationCapability(
   }
   const enabled = new Set<ModelOperationName>(operations);
 
+  const outputContracts = [...new Set(configuredOutputContracts)];
+  if (outputContracts.length === 0) {
+    throw configError("A model operation capability requires an output contract");
+  }
+  for (const outputContract of outputContracts) {
+    if (outputContract !== "text" && outputContract !== "json-object") {
+      throw configError(`Model output contract ${String(outputContract)} is not defined`);
+    }
+  }
+
   const reasoningPolicies = [...new Set(options.reasoningPolicies ?? ["default"])];
   for (const policy of reasoningPolicies) {
     if (!["default", "prefer", "require", "disable"].includes(policy)) {
@@ -321,7 +342,7 @@ export function createModelOperationCapability(
 
   const grant: ExtensionCapabilityGrant = {
     capabilityType: MODEL_OPERATION_CAPABILITY_TYPE,
-    capabilityVersion: MODEL_OPERATION_CAPABILITY_VERSION,
+    capabilityVersion,
     operations,
     resourceScope: {
       schemaVersion: "dolly.capability-scope.model-operation/1",
@@ -342,6 +363,9 @@ export function createModelOperationCapability(
         : { moduleJobId: grantScope.moduleJobId }),
       reasoningPolicies: [...reasoningPolicies],
       roles: [...roles],
+      ...(capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V2
+        ? { outputContracts: [...outputContracts] }
+        : {}),
       limits: { ...limits },
     },
     expiresAt: options.expiresAt,
@@ -481,7 +505,13 @@ export function createModelOperationCapability(
     readonly reasoningPolicy: ReasoningPolicy;
     readonly budgets: ModelInvocationBudgets;
   } => {
-    const parsed = assertClosedArguments(argumentsValue, [...CHAT_ARGUMENT_FIELDS], "model.chat");
+    const parsed = assertClosedArguments(
+      argumentsValue,
+      capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V2
+        ? [...CHAT_ARGUMENT_FIELDS_V2]
+        : [...CHAT_ARGUMENT_FIELDS],
+      "model.chat",
+    );
     const stream = readField(parsed, "stream");
     if (stream !== undefined) {
       if (typeof stream !== "boolean") {
@@ -538,10 +568,34 @@ export function createModelOperationCapability(
       grantedMaxOutputTokens ?? Number.MAX_SAFE_INTEGER,
     );
     const maxOutputTokens = requestedOutputTokens ?? grantedMaxOutputTokens;
+    let outputContract: ModelOutputContractKind = "text";
+    const requestedOutputContract = readField(parsed, "outputContract");
+    if (requestedOutputContract !== undefined) {
+      const contract = assertClosedArguments(
+        requestedOutputContract,
+        ["kind"],
+        "model.chat.outputContract",
+      );
+      const kind = requireString(contract, "kind", "model.chat.outputContract");
+      if (kind !== "text" && kind !== "json-object") {
+        throw capabilityArgumentError("model.chat.outputContract.kind is unsupported");
+      }
+      outputContract = kind;
+    }
+    if (!outputContracts.includes(outputContract)) {
+      throw modelDenied(
+        "MODEL_OUTPUT_CONTRACT_DENIED",
+        "This model handle does not grant the requested output contract",
+        { requested: outputContract },
+      );
+    }
     const input: ChatBrokerInvocation["input"] = {
-      schemaVersion: "dolly.model.chat-input/2",
+      schemaVersion:
+        capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V2
+          ? "dolly.model.chat-input/3"
+          : "dolly.model.chat-input/2",
       messages: normalizedMessages,
-      outputContract: { kind: "text" },
+      outputContract: { kind: outputContract },
       stream: false,
     };
     const inputBytes = canonicalJsonByteLength(input as unknown as JsonValue);
@@ -642,12 +696,18 @@ export function createModelOperationCapability(
     if (operation === "describe") {
       assertClosedArguments(argumentsValue, [], "model.describe");
       return {
-        schemaVersion: "dolly.model-operation-description/1",
+        schemaVersion:
+          capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V2
+            ? "dolly.model-operation-description/2"
+            : "dolly.model-operation-description/1",
         modality,
         model: modelProjection(),
         grantedOperations: [...operations].sort(),
         reasoningPolicies: [...reasoningPolicies].sort(),
         roles: [...roles].sort(),
+        ...(capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V2
+          ? { outputContracts: [...outputContracts].sort() }
+          : {}),
         limits: {
           maxMessages: limits.maxMessages,
           maxPartsPerMessage: limits.maxPartsPerMessage,
@@ -787,6 +847,32 @@ export function createModelOperationCapability(
   };
 
   return { grant, handler };
+}
+
+/** Legacy v1 handle: text output only and a closed v1 argument contract. */
+export function createModelOperationCapability(
+  options: ModelOperationCapabilityOptions,
+): ExtensionCapabilityDefinition {
+  return buildModelOperationCapability(
+    options,
+    MODEL_OPERATION_CAPABILITY_VERSION,
+    ["text"],
+  );
+}
+
+/**
+ * Version two makes the output syntax an explicit Host grant. The Extension
+ * may select only among those frozen kinds; it cannot provide a schema,
+ * endpoint, adapter, or provider wire strategy.
+ */
+export function createModelOperationCapabilityV2(
+  options: ModelOperationCapabilityV2Options,
+): ExtensionCapabilityDefinition {
+  return buildModelOperationCapability(
+    options,
+    MODEL_OPERATION_CAPABILITY_VERSION_V2,
+    options.outputContracts,
+  );
 }
 
 /** Exposed for hosts that need the modality a descriptor reference implies. */

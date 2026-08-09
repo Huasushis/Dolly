@@ -1,16 +1,20 @@
 export {
   createModelOperationCapability,
+  createModelOperationCapabilityV2,
   DEFAULT_MODEL_OPERATION_LIMITS,
   modalityForDescriptor,
   MODEL_OPERATION_CAPABILITY_TYPE,
   MODEL_OPERATION_CAPABILITY_VERSION,
+  MODEL_OPERATION_CAPABILITY_VERSION_V2,
   type ChatModelBrokerPort,
   type EmbeddingModelBrokerPort,
   type ModelModality,
   type ModelOperationCapabilityOptions,
+  type ModelOperationCapabilityV2Options,
   type ModelOperationDenialReason,
   type ModelOperationLimits,
   type ModelOperationName,
+  type ModelOutputContractKind,
 } from "./model-operation-capability.js";
 export {
   createToolInvocationCapability,

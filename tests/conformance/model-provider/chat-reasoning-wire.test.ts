@@ -309,6 +309,77 @@ describe("descriptor-bound chat reasoning wire behavior", () => {
     }
   });
 
+  it("emits JSON-object response format only for the separately pinned v4 capability", () => {
+    const snapshot = activeSnapshot({
+      endpointId: "owner-aether-fixture",
+      modelId: "qwen3.6-27b",
+      reasoning: objectFormReasoning(),
+      jsonObjectOutput: "supported",
+    });
+    const input: ChatInput = {
+      ...textInput("disable"),
+      schemaVersion: "dolly.model.chat-input/3",
+      outputContract: { kind: "json-object" },
+    };
+    expect(
+      encodeOpenAiCompatibleChatRequest(snapshot, input, { maxOutputTokens: 256 }).body,
+    ).toEqual({
+      model: "qwen3.6-27b",
+      messages: [
+        { role: "system", content: [{ type: "text", text: "Be precise." }] },
+        { role: "user", content: [{ type: "text", text: "What is 2 + 2?" }] },
+      ],
+      stream: false,
+      response_format: { type: "json_object" },
+      thinking: { type: "disabled" },
+      max_tokens: 256,
+    });
+
+    expect(() =>
+      encodeOpenAiCompatibleChatRequest(activeSnapshot(), input),
+    ).toThrowError(
+      expect.objectContaining<Partial<ModelChatError>>({ code: "CHAT_FEATURE_UNSUPPORTED" }),
+    );
+    expect(() =>
+      encodeOpenAiCompatibleChatRequest(snapshot, {
+        ...input,
+        schemaVersion: "dolly.model.chat-input/2",
+      }),
+    ).toThrowError(
+      expect.objectContaining<Partial<ModelChatError>>({ code: "CHAT_INPUT_INVALID" }),
+    );
+    expect(() =>
+      encodeOpenAiCompatibleChatRequest(snapshot, {
+        ...input,
+        outputContract: { kind: "json-object", schema: {} },
+      } as unknown as ChatInput),
+    ).toThrowError(
+      expect.objectContaining<Partial<ModelChatError>>({ code: "CHAT_INPUT_INVALID" }),
+    );
+
+    const wrongStrategyDescriptor = chatDescriptor({ jsonObjectOutput: "supported" });
+    const wrongRegistry = new ModelDescriptorRegistry({
+      schemaDigest: SCHEMA_DIGEST,
+      allowedStrategyIds: new Set([...CHAT_STRATEGIES, "fixture.json-object.wrong.v1"]),
+    });
+    const wrongRef = wrongRegistry.register({
+      ...wrongStrategyDescriptor,
+      features: {
+        ...wrongStrategyDescriptor.features,
+        jsonObjectOutput: {
+          state: "supported",
+          value: { strategyId: "fixture.json-object.wrong.v1" },
+        },
+      },
+    });
+    wrongRegistry.setStatus(wrongRef, "active");
+    expect(() =>
+      encodeOpenAiCompatibleChatRequest(wrongRegistry.snapshot(wrongRef), input),
+    ).toThrowError(
+      expect.objectContaining<Partial<ModelChatError>>({ code: "CHAT_STRATEGY_UNSUPPORTED" }),
+    );
+  });
+
   it("maps boolean request control only for a descriptor that explicitly declares it", () => {
     const snapshot = activeSnapshot({ reasoning: requestControlledReasoning() });
     const prefer = mapReasoningPolicy(
