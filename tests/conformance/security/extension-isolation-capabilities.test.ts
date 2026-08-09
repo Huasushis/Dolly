@@ -592,6 +592,41 @@ describe("Extension process isolation and capability checks", () => {
     }
   });
 
+  it("does not treat a settled capability handler as active while its response is delivered", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-capability-then-error-"));
+    const host = createHost("capability-then-business-error", scratch);
+    const handler = vi.fn(async () => ({ fromHost: true }));
+    host.grantCapability(
+      {
+        capabilityType: "private-storage",
+        capabilityVersion: "v1",
+        operations: ["read"],
+        resourceScope: { descriptor: "fixture-model", executionScope: "active-run" },
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        maxInvocations: 1,
+        maxConcurrentInvocations: 1,
+        maxArgumentBytes: 256,
+        maxResultBytes: 256,
+        requireIdempotencyKey: true,
+      },
+      handler,
+    );
+
+    try {
+      await host.start();
+      const processGenerationId = host.snapshot.processGenerationId;
+      await expect(host.execute(execution())).rejects.toMatchObject({
+        code: "EXTENSION_INTERNAL",
+      });
+      expect(handler).toHaveBeenCalledOnce();
+      expect(host.snapshot).toMatchObject({ state: "ready", processGenerationId });
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a Module result while one of that Run's capabilities is still active", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-result-before-capability-"));
     const capabilityStartedMarkerPath = join(scratch, "capability-started");

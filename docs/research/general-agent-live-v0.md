@@ -47,13 +47,13 @@ The successful run was not selected by silently retrying failed cases. Each chan
 - Initial static imports resolved `src/` relative to `scripts/`; no run or provider call began. The path was corrected and import preflight moved before run artifact creation.
 - Descriptor preflight rejected two real contradictions: a non-streaming model declared a stream decoder, then its reasoning observer still declared a streaming strategy.
 - Candidate process-record creation rejected a human-readable fake `serviceInvocationId`; the fixture now uses a syntactically valid 32-hex value while still reporting `linuxControlGroupProof=false`.
-- `live-v1-20260809g` showed that the production pinned-DNS transport could not reach this fixture from the current host. The effect experiment therefore uses a bounded, no-redirect `fetch` transport and explicitly does not claim production proxy support.
+- `live-v1-20260809g` showed that the production pinned-DNS transport could not reach this fixture in that run. A later transport audit found that its pinned lookup returned the single-address callback shape even when Node 20 requested `all:true`; therefore that failure does not prove a proxy was required. The effect experiment uses a bounded, no-redirect `fetch` transport and explicitly does not claim either the corrected production direct path or production proxy support.
 - Aether returned two measured response envelopes across retained runs: a relay envelope from the Memory v9 evidence and an OpenAI-top-level envelope with Aether provider-specific choice/message fields in the current run. Response strategy `aether.qwen.chat.response.v2` accepts exactly those two closed variants and rejects unknown hybrids.
 - The model sometimes wrapped its sole JSON object in a `json` code fence. The Agent adapter accepts either bare JSON or one code fence with no surrounding text; it does not search arbitrary prose for JSON.
 - `live-v6-20260809a` selected the correct `storage.list` action but requested `limit=20`, exceeding the enforced maximum of 8. The next version supplied the exact closed tool argument contract. This exposes a product design requirement: capability descriptors need machine-readable input schemas and limits instead of handwritten prompt text.
 - `live-v7-20260809a` failed before receiving a provider body. `live-v8-20260809a` completed `list → get` but its final provider response failed in transit. Version 8 registered at most one fresh replacement run after infrastructure failure, preserving and never merging the failed run. The sole replacement was `live-v8-20260809b`.
 
-These failures also exposed a separate lifecycle defect: an Extension execution failure does not yet reach the experiment waiter promptly enough in every path. The experiment Extension now returns a sanitized JSON-RPC failure, but the Core/actor/Scheduler propagation still needs a dedicated bounded-latency counterexample.
+These failures initially looked like a slow lifecycle path, but the retained Core state disproved that interpretation. A capability-mediated Run with `core-capabilities-only` effects and no complete persistent effect evidence must not be retried or dead-lettered after a provider failure: Runtime correctly returns `recovery-required`, Scheduler correctly quarantines the Module, and the active Claim remains fenced. The defect was the experiment waiter, which observed only commits and dead letters and therefore ignored this known safe terminal state until its 420-second timeout. The waiter now observes Scheduler quarantine and immediately reports its exact reason; it does not relabel an unknown external-effect outcome as a dead letter.
 
 ## Supported and unsupported conclusions
 
@@ -81,7 +81,7 @@ Not supported:
 2. Make capability tool contracts machine-readable and inject them into Agent context. A name-only tool list is insufficient.
 3. Keep endpoint/model response strategies explicit. Do not weaken the generic OpenAI decoder to accept arbitrary extra fields.
 4. Add an approved proxy-capable production model transport without surrendering destination and response bounds.
-5. Add a bounded failure-propagation test from capability/model error through Extension host, actor, runtime, Scheduler, nack/dead-letter, and waiter.
+5. Preserve fail-closed quarantine for unknown external-effect outcomes, make every waiter surface it promptly, and require a persistent complete effect-intent/outcome journal before any such failure can become safely retryable or dead-lettered.
 6. Before product integration, close per-Run budget accounting, request-ID uniqueness, generation/handle rotation, and durable idempotency evidence.
 7. Use the independently supported, source-citing structured task checkpoint as the first simple Memory behavior. Keep association, recurrence, summarization, and procedure factors in independent experiments rather than baking them into the first product Memory design.
 

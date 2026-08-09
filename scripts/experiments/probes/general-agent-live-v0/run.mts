@@ -54,6 +54,7 @@ import {
   type ReactiveModuleFailure,
   type ReactiveModuleRuntimeOptions,
 } from "../../../../src/core/reactive-module-runtime.js";
+import { waitForAgentCase } from "./wait-for-case.mjs";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "../../../..");
@@ -340,24 +341,6 @@ function processIsAlive(pid: number): boolean {
   } catch {
     return false;
   }
-}
-
-async function waitForCase(
-  core: FileCoreStateStore,
-  repository: FileModuleResultCommitRepository,
-  timeoutMs: number,
-) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const committed = repository.list().find((record) => record.state === "committed");
-    if (committed) return committed;
-    const deadLetters = core.deliveries.listDeadLetters();
-    if (deadLetters.length > 0) {
-      throw new Error(`Module input was dead-lettered: ${deadLetters[0]!.failureCode}`);
-    }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
-  }
-  throw new Error("Agent case exceeded its registered wall-clock bound");
 }
 
 function parseAgentResult(blockValue: JsonValue): Record<string, unknown> {
@@ -698,7 +681,12 @@ async function runCondition(options: {
       { kind: "external", id: "experiment" },
     );
     core.deliveries.append("input", taskBlock.id);
-    const committed = await waitForCase(core, repository, 420_000);
+    const committed = await waitForAgentCase({
+      findCommitted: () => repository.list().find((record) => record.state === "committed"),
+      listDeadLetters: () => core.deliveries.listDeadLetters(),
+      readSchedulerStatus: () => scheduler.status(moduleId),
+      timeoutMs: 420_000,
+    });
     if (!committed.blockId) throw new Error("Agent result committed no Block");
     const block = core.blocks.get(committed.blockId);
     if (!block) throw new Error("Committed Agent Block is missing");

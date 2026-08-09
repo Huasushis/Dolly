@@ -169,6 +169,27 @@ async function handleHostRequest(message) {
       });
       return;
     }
+    if (mode === "capability-then-business-error") {
+      await invokeCapability(
+        initialized.capabilities[0].handle,
+        "read",
+        {
+          moduleJobId: params.moduleJobId,
+          runId: params.runId,
+          idempotencyKey: `${params.moduleJobId}-fixture-effect`,
+        },
+      );
+      send({
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: -32_000,
+          message: "fixture business error after capability",
+          data: { errorCode: "FIXTURE_FAILURE", retryable: false },
+        },
+      });
+      return;
+    }
     if (mode === "cpu-loop") {
       while (true) {
         // Deliberately block this child process only.
