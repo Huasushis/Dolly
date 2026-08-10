@@ -51,7 +51,8 @@ const PYTHON = "/usr/bin/python3";
 const INSTANCE_ID = "44444444-4444-4444-8444-444444444444";
 const FIRST_MODULE_ID = "scheduler-first";
 const SECOND_MODULE_ID = "scheduler-second";
-const MODULE_IDS = [FIRST_MODULE_ID, SECOND_MODULE_ID] as const;
+const DRAINER_MODULE_ID = "scheduler-drainer";
+const MODULE_IDS = [FIRST_MODULE_ID, SECOND_MODULE_ID, DRAINER_MODULE_ID] as const;
 const LIMITS: ModuleCgroupLimits = {
   memoryMaxBytes: 268_435_456,
   maxProcesses: 64,
@@ -113,7 +114,7 @@ if (
 }
 
 describe.skipIf(!available)("installed reactive Module host in a real control group", () => {
-  it("auto-wakes two installed process Modules and reopens their committed pipeline", async () => {
+  it("recovers a full downstream mailbox without re-executing its producers", async () => {
     if (integrationUnitName === undefined) {
       throw new Error("The transient Core service unit name is unavailable");
     }
@@ -163,7 +164,11 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       const configurationSchema = {
         $schema: JSON_SCHEMA_2020_12,
         type: "object",
-        properties: { prefix: { type: "string" } },
+        properties: {
+          prefix: { type: "string" },
+          delayMs: { type: "integer", minimum: 0 },
+          emitOutput: { type: "boolean" },
+        },
         required: ["prefix"],
         additionalProperties: false,
       } as const;
@@ -209,6 +214,14 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         configVersion: 1,
         schema: configurationSchema,
         configuration: { prefix: "second" },
+      });
+      const drainerConfiguration = configurations.create({
+        configId: "scheduler-drainer-config",
+        extensionId: "org.example.scheduler-installed",
+        moduleKind: "transform",
+        configVersion: 1,
+        schema: configurationSchema,
+        configuration: { prefix: "drainer", delayMs: 2_000, emitOutput: false },
       });
       const defaults = createDefaultDollyInstanceConfig(INSTANCE_ID);
       const configuration = validateDollyInstanceConfig({
@@ -282,6 +295,36 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
             cancellationGraceMs: 1_000,
             terminationTimeoutMs: 10_000,
           },
+        }, {
+          moduleId: DRAINER_MODULE_ID,
+          extensionId: "org.example.scheduler-installed",
+          packageVersion: "1.0.0",
+          moduleKind: "transform",
+          isolation: "process",
+          configurationReference: {
+            configId: drainerConfiguration.configId,
+            revision: drainerConfiguration.revision,
+            configVersion: drainerConfiguration.configVersion,
+          },
+          permissionPolicyIds: [],
+          inputPageIds: ["output"],
+          outputPageIds: [],
+          subscriptionStart: "from-now",
+          activation: { kind: "reactive" },
+          limits: {
+            claim: { maxCount: 1, maxBytes: 64 * 1_024 },
+            maxInputBytes: 64 * 1_024,
+            maxResultBytes: 64 * 1_024,
+            maxFrameBytes: 128 * 1_024,
+            maxRunsPerGeneration: 10,
+            maxGenerations: 2,
+          },
+          timeouts: {
+            initializationTimeoutMs: 10_000,
+            executionTimeoutMs: 5_000,
+            cancellationGraceMs: 1_000,
+            terminationTimeoutMs: 10_000,
+          },
         }],
       });
 
@@ -302,7 +345,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       coreState.store.deliveries.createPage("output");
       coreState.store.deliveries.registerConsumer("input", FIRST_MODULE_ID, "from-now");
       coreState.store.deliveries.registerConsumer("middle", SECOND_MODULE_ID, "from-now");
-      coreState.store.deliveries.registerConsumer("output", "sink", "from-now");
+      coreState.store.deliveries.registerConsumer("output", DRAINER_MODULE_ID, "from-now");
       const repository = new FileModuleResultCommitRepository({ path: commitPath });
       const events: SchedulerEvent[] = [];
       const actorEvents: ModuleActorEvent[] = [];
@@ -322,14 +365,14 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           maxResidentCount: 10,
           maxResidentBytes: 1024 * 1024,
         }, {
-          consumerId: "sink",
+          consumerId: DRAINER_MODULE_ID,
           pageIds: ["output"],
           maxResidentCount: 1,
           maxResidentBytes: 1024 * 1024,
         }],
         clock: systemSchedulerClock(),
         scheduling: {
-          maxConcurrentModules: 2,
+          maxConcurrentModules: 3,
           backpressureAction: "pause-upstream",
           downstreamRecheckMs: 100,
           noProgressAfterMs: 5_000,
@@ -403,10 +446,12 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       coreState.store.deliveries.append("input", input.id);
       expect(await waitFor(
         () =>
-          coreState.store.deliveries.inspectPending("sink", ["output"]).pendingCount === 1,
+          repository.list().length === 2 &&
+          coreState.store.deliveries.inspectResident(DRAINER_MODULE_ID, ["output"])
+              .claimedCount === 1,
         5_000,
       )).toBe(true);
-      for (const moduleId of MODULE_IDS) {
+      for (const moduleId of [FIRST_MODULE_ID, SECOND_MODULE_ID]) {
         expect(events).toContainEqual(expect.objectContaining({
           type: "scheduler.dispatched",
           moduleId,
@@ -422,7 +467,17 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         expect.objectContaining({ state: "committed", source: { kind: "module", id: FIRST_MODULE_ID } }),
         expect.objectContaining({ state: "committed", source: { kind: "module", id: SECOND_MODULE_ID } }),
       ]));
-      expect(actorEvents.filter((event) => event.type === "run.started")).toHaveLength(2);
+      const actorRunCount = (moduleId: string): number => {
+        const consumers = new Map(coreState.store.deliveries.snapshot().moduleJobs.map((job) =>
+          [job.moduleJobId, job.consumerId]
+        ));
+        return actorEvents.filter((event) =>
+          event.type === "run.started" && consumers.get(event.moduleJobId) === moduleId
+        ).length;
+      };
+      expect(actorRunCount(FIRST_MODULE_ID)).toBe(1);
+      expect(actorRunCount(SECOND_MODULE_ID)).toBe(1);
+      expect(actorRunCount(DRAINER_MODULE_ID)).toBe(1);
 
       const secondInput = coreState.store.blocks.commit(proposal("fill the sink boundary"), {
         kind: "external",
@@ -437,32 +492,24 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         ),
         5_000,
       )).toBe(true);
-      expect(actorEvents.filter((event) => event.type === "run.started")).toHaveLength(4);
+      expect(actorRunCount(FIRST_MODULE_ID)).toBe(2);
+      expect(actorRunCount(SECOND_MODULE_ID)).toBe(2);
+      expect(actorRunCount(DRAINER_MODULE_ID)).toBe(1);
       expect(repository.list()).toHaveLength(4);
       expect(repository.list().filter((record) => record.state === "prepared"))
         .toHaveLength(1);
-      expect(coreState.store.deliveries.inspectResident("sink", ["output"]))
-        .toMatchObject({ residentCount: 1, pendingCount: 1, claimedCount: 0 });
-
-      const sinkClaim = coreState.store.deliveries.claim({
-        consumerId: "sink",
-        pageIds: ["output"],
-        moduleGenerationId: "integration-sink-generation",
-        maxCount: 1,
-        maxBytes: 64 * 1_024,
-      });
-      if (sinkClaim === null) {
-        throw new Error("The full sink did not expose its existing Delivery");
-      }
-      expect(coreState.store.acknowledgeDeliveryClaim(sinkClaim)).toBe("committed");
+      expect(coreState.store.deliveries.inspectResident(DRAINER_MODULE_ID, ["output"]))
+        .toMatchObject({ residentCount: 1, pendingCount: 0, claimedCount: 1 });
       expect(await waitFor(
         () =>
-          repository.list().length === 4 &&
+          repository.list().length === 5 &&
           repository.list().every((record) => record.state === "committed") &&
-          coreState.store.deliveries.inspectPending("sink", ["output"]).pendingCount === 1,
+          actorRunCount(DRAINER_MODULE_ID) === 2,
         5_000,
       )).toBe(true);
-      expect(actorEvents.filter((event) => event.type === "run.started")).toHaveLength(4);
+      expect(actorRunCount(FIRST_MODULE_ID)).toBe(2);
+      expect(actorRunCount(SECOND_MODULE_ID)).toBe(2);
+      expect(actorRunCount(DRAINER_MODULE_ID)).toBe(2);
 
       await composed.host.stop();
       stopped = true;
@@ -490,7 +537,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         record.blockId !== undefined &&
         JSON.stringify(reopened.blocks.get(record.blockId)).includes("second:1:run-2")
       );
-      expect(reopenedRepository.list()).toHaveLength(4);
+      expect(reopenedRepository.list()).toHaveLength(5);
       expect(committed).toMatchObject({
         state: "committed",
         source: { kind: "module", id: SECOND_MODULE_ID },
@@ -506,7 +553,8 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           },
         },
       });
-      expect(reopened.deliveries.inspectPending("sink", ["output"]).pendingCount).toBe(1);
+      expect(reopened.deliveries.inspectPending(DRAINER_MODULE_ID, ["output"]).pendingCount)
+        .toBe(1);
       expect(reopened.deliveries.inspectPending(SECOND_MODULE_ID, ["middle"]).pendingCount)
         .toBe(0);
       expect(reopened.deliveries.inspectPending(FIRST_MODULE_ID, ["input"]).pendingCount)
@@ -523,10 +571,16 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         configuredPollIntervalMs: 60_000,
         outputCommittedWithinMs: 5_000,
         outputBackpressureObserved: true,
-        actorRunsBeforeCapacityRelease: 4,
-        actorRunsAfterCapacityRelease: actorEvents.filter((event) =>
-          event.type === "run.started"
-        ).length,
+        actorRunsBeforeCapacityRelease: {
+          [FIRST_MODULE_ID]: 2,
+          [SECOND_MODULE_ID]: 2,
+          [DRAINER_MODULE_ID]: 1,
+        },
+        actorRunsAfterCapacityRelease: {
+          [FIRST_MODULE_ID]: actorRunCount(FIRST_MODULE_ID),
+          [SECOND_MODULE_ID]: actorRunCount(SECOND_MODULE_ID),
+          [DRAINER_MODULE_ID]: actorRunCount(DRAINER_MODULE_ID),
+        },
         committedModuleResults: reopenedRepository.list().length,
         finalRecordStates: processGenerationIds.map((processGenerationId) =>
           reopened.getModuleProcessRecord(processGenerationId)?.state

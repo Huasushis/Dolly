@@ -37,27 +37,39 @@ function handle(message) {
   }
   if (method === "module.execute") {
     executionCount += 1;
-    respond(id, {
-      protocolVersion: "3.0",
-      sessionId: params.sessionId,
-      moduleId: params.moduleId,
-      moduleGenerationId: params.moduleGenerationId,
-      runId: params.runId,
-      result: {
-        schemaVersion: "dolly.module-result/1",
-        blockProposal: {
-          payload: {
-            schema: "dolly.content/1",
-            value: {
-              items: [{
-                type: "text",
-                text: `${initialized.config.prefix}:${params.input.blockGroups.length}:run-${executionCount}`,
-              }],
-            },
-          },
+    const reply = () => {
+      respond(id, {
+        protocolVersion: "3.0",
+        sessionId: params.sessionId,
+        moduleId: params.moduleId,
+        moduleGenerationId: params.moduleGenerationId,
+        runId: params.runId,
+        result: {
+          schemaVersion: "dolly.module-result/1",
+          ...(initialized.config.emitOutput === false
+            ? {}
+            : {
+                blockProposal: {
+                  payload: {
+                    schema: "dolly.content/1",
+                    value: {
+                      items: [{
+                        type: "text",
+                        text: `${initialized.config.prefix}:${params.input.blockGroups.length}:run-${executionCount}`,
+                      }],
+                    },
+                  },
+                },
+              }),
         },
-      },
-    });
+      });
+    };
+    const delayMs = initialized.config.delayMs ?? 0;
+    if (delayMs > 0) {
+      setTimeout(reply, delayMs);
+    } else {
+      reply();
+    }
     return;
   }
   if (method === "module.stop") {
