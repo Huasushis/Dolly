@@ -120,6 +120,16 @@ export type ReactiveModuleRecoveryResult =
   | { readonly status: "nothing-to-recover" }
   | Exclude<ReactiveModuleTickResult, { readonly status: "idle" }>;
 
+/**
+ * Per-dispatch input Claim limits chosen by the Scheduler. The runtime's
+ * configured `claimMax*` values remain hard upper bounds; a policy may only
+ * reduce a batch for one tick.
+ */
+export interface ReactiveModuleClaimLimits {
+  readonly claimLimitCount: number;
+  readonly claimLimitBytes: number;
+}
+
 export type ReactiveModuleRuntimeErrorCode =
   | "RUNTIME_BUSY"
   | "RUNTIME_FAILED"
@@ -537,7 +547,7 @@ export class ReactiveModuleRuntime {
     return this.#actor.start();
   }
 
-  tick(): Promise<ReactiveModuleTickResult> {
+  tick(limits?: ReactiveModuleClaimLimits): Promise<ReactiveModuleTickResult> {
     if (!this.#acceptingOperations) {
       return Promise.reject(
         new ReactiveModuleRuntimeError("RUNTIME_STOPPING", "Reactive Module runtime is stopping"),
@@ -574,10 +584,28 @@ export class ReactiveModuleRuntime {
       );
     }
 
+    const claimLimitCount = limits?.claimLimitCount ?? this.#claimMaxCount;
+    const claimLimitBytes = limits?.claimLimitBytes ?? this.#claimMaxBytes;
+    if (
+      !Number.isSafeInteger(claimLimitCount) ||
+      claimLimitCount <= 0 ||
+      claimLimitCount > this.#claimMaxCount ||
+      !Number.isSafeInteger(claimLimitBytes) ||
+      claimLimitBytes <= 0 ||
+      claimLimitBytes > this.#claimMaxBytes
+    ) {
+      return Promise.reject(
+        new ReactiveModuleRuntimeError(
+          "RUNTIME_CONFIGURATION_INVALID",
+          "Per-dispatch Claim limits must be positive safe integers within the runtime maximum",
+        ),
+      );
+    }
+
     const deferred = this.#deferredOutputCommit;
     const operation = deferred
       ? this.#tryRecoverCommit(deferred.claim, deferred.output, deferred.failure)
-      : this.#performTick();
+      : this.#performTick(claimLimitCount, claimLimitBytes);
     this.#inFlight = operation;
     void operation.then(
       () => {
@@ -729,15 +757,18 @@ export class ReactiveModuleRuntime {
     await this.#releaseActiveClaimAfterShutdown();
   }
 
-  async #performTick(): Promise<ReactiveModuleTickResult> {
+  async #performTick(
+    claimLimitCount: number,
+    claimLimitBytes: number,
+  ): Promise<ReactiveModuleTickResult> {
     let claim: DeliveryClaim | null;
     try {
       claim = this.#deliveries.claim({
         consumerId: this.#moduleId,
         pageIds: this.#inputPageIds,
         moduleGenerationId: this.#actor.moduleGenerationId,
-        maxCount: this.#claimMaxCount,
-        maxBytes: this.#claimMaxBytes,
+        maxCount: claimLimitCount,
+        maxBytes: claimLimitBytes,
         maxInputBytes: this.#maxInputBytes,
       });
     } catch (error) {

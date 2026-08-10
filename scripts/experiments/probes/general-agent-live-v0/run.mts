@@ -1276,7 +1276,7 @@ async function runCondition(options: {
       get moduleGenerationId() {
         return runtime.moduleGenerationId;
       },
-      tick: () => runtime.tick(),
+      tick: (limits) => runtime.tick(limits),
       start: async () => {
         try {
           await runtime.start();

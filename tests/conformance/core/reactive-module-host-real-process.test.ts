@@ -211,7 +211,7 @@ describe("reactive Module host with a real child process", () => {
         get moduleGenerationId() {
           return runtime.moduleGenerationId;
         },
-        tick: () => runtime.tick(),
+        tick: (limits) => runtime.tick(limits),
         start: async () => {
           await runtime.start();
           core.updateModuleProcessRecordState(processGenerationId, "running");

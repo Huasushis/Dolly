@@ -5,7 +5,10 @@ import {
   type DownstreamPressure,
   type FixedSchedulerSnapshot,
 } from "./scheduler-policy.js";
-import type { ReactiveModuleTickResult } from "./reactive-module-runtime.js";
+import type {
+  ReactiveModuleClaimLimits,
+  ReactiveModuleTickResult,
+} from "./reactive-module-runtime.js";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
@@ -77,7 +80,7 @@ export function systemSchedulerClock(): SchedulerClock {
  */
 export interface SchedulableModuleRuntime {
   readonly moduleGenerationId: string;
-  tick(): Promise<ReactiveModuleTickResult>;
+  tick(limits?: ReactiveModuleClaimLimits): Promise<ReactiveModuleTickResult>;
 }
 
 export interface SchedulerPendingSnapshot {
@@ -477,6 +480,8 @@ interface ModuleEntry {
   inFlight: Promise<void> | null;
   outputCommitWaiting: boolean;
   dispatchPending: SchedulerPendingSnapshot | null;
+  dispatchClaimLimitCount: number | null;
+  dispatchClaimLimitBytes: number | null;
   arrivalsDuringLastRunCount: number;
   arrivalsDuringLastRunBytes: number;
   lastRunStartedAt: number | null;
@@ -742,6 +747,8 @@ export class ModuleScheduler {
       inFlight: null,
       outputCommitWaiting: false,
       dispatchPending: null,
+      dispatchClaimLimitCount: null,
+      dispatchClaimLimitBytes: null,
       arrivalsDuringLastRunCount: 0,
       arrivalsDuringLastRunBytes: 0,
       lastRunStartedAt: null,
@@ -1208,7 +1215,11 @@ export class ModuleScheduler {
       typeof decision.reasonCode !== "string" ||
       typeof decision.policyName !== "string" ||
       typeof decision.policyVersion !== "string" ||
-      (decision.eligibleAt !== null && !Number.isFinite(decision.eligibleAt))
+      (decision.eligibleAt !== null && !Number.isFinite(decision.eligibleAt)) ||
+      !Number.isSafeInteger(decision.claimLimitCount) ||
+      decision.claimLimitCount <= 0 ||
+      !Number.isSafeInteger(decision.claimLimitBytes) ||
+      decision.claimLimitBytes <= 0
     ) {
       throw new TypeError("Scheduler policy returned an invalid decision");
     }
@@ -1265,6 +1276,8 @@ export class ModuleScheduler {
     entry.counters.dispatched += 1;
     entry.lastRunStartedAt = now;
     entry.dispatchPending = entry.pending;
+    entry.dispatchClaimLimitCount = decision.claimLimitCount;
+    entry.dispatchClaimLimitBytes = decision.claimLimitBytes;
     entry.nextEligibleAt = null;
     this.#activeCount += 1;
     this.#emitModule(entry, {
@@ -1277,7 +1290,10 @@ export class ModuleScheduler {
 
     let tick: Promise<ReactiveModuleTickResult>;
     try {
-      tick = entry.runtime.tick();
+      tick = entry.runtime.tick({
+        claimLimitCount: decision.claimLimitCount,
+        claimLimitBytes: decision.claimLimitBytes,
+      });
     } catch (error) {
       tick = Promise.reject(error);
     }
@@ -1445,7 +1461,11 @@ export class ModuleScheduler {
    */
   #measureArrivals(entry: ModuleEntry, result: ReactiveModuleTickResult | null): void {
     const before = entry.dispatchPending;
+    const claimLimitCount = entry.dispatchClaimLimitCount;
+    const claimLimitBytes = entry.dispatchClaimLimitBytes;
     entry.dispatchPending = null;
+    entry.dispatchClaimLimitCount = null;
+    entry.dispatchClaimLimitBytes = null;
     if (!before || !entry.pendingAvailable) return;
     let after: SchedulerPendingSnapshot;
     try {
@@ -1460,8 +1480,14 @@ export class ModuleScheduler {
       entry.arrivalsDuringLastRunBytes = Math.max(0, after.pendingBytes - before.pendingBytes);
       return;
     }
-    const retainedCount = Math.max(0, before.pendingCount - this.#claimLimitCount);
-    const retainedBytes = Math.max(0, before.pendingBytes - this.#claimLimitBytes);
+    const retainedCount = Math.max(
+      0,
+      before.pendingCount - (claimLimitCount ?? this.#claimLimitCount),
+    );
+    const retainedBytes = Math.max(
+      0,
+      before.pendingBytes - (claimLimitBytes ?? this.#claimLimitBytes),
+    );
     entry.arrivalsDuringLastRunCount = Math.max(0, after.pendingCount - retainedCount);
     entry.arrivalsDuringLastRunBytes = Math.max(0, after.pendingBytes - retainedBytes);
   }

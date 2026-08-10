@@ -28,6 +28,7 @@ import {
 } from "../../../src/core/module-scheduler.js";
 import {
   ReactiveModuleRuntime,
+  type ReactiveModuleClaimLimits,
   type ReactiveModuleInput,
   type ReactiveModuleResult,
   type ReactiveModuleRuntimeOptions,
@@ -210,13 +211,15 @@ class FakeModuleRuntime implements SchedulableModuleRuntime {
   concurrent = 0;
   maxConcurrent = 0;
   readonly waiting: Array<ReturnType<typeof deferred<ReactiveModuleTickResult>>> = [];
+  readonly receivedClaimLimits: ReactiveModuleClaimLimits[] = [];
   #auto: ((tickCount: number) => ReactiveModuleTickResult) | null;
 
   constructor(auto?: (tickCount: number) => ReactiveModuleTickResult) {
     this.#auto = auto ?? null;
   }
 
-  tick(): Promise<ReactiveModuleTickResult> {
+  tick(limits?: ReactiveModuleClaimLimits): Promise<ReactiveModuleTickResult> {
+    if (limits !== undefined) this.receivedClaimLimits.push({ ...limits });
     this.tickCount += 1;
     this.concurrent += 1;
     this.maxConcurrent = Math.max(this.maxConcurrent, this.concurrent);
@@ -773,6 +776,39 @@ describe("CORE scheduler policy boundary", () => {
     expect(scheduler.status("worker").policyName).toBe("fixed-baseline");
     expect(scheduler.status("worker").policyVersion).toBe("1");
     expect(scheduler.instanceStatus().policyName).toBe("fixed-baseline");
+    await scheduler.stop();
+  });
+
+  it("passes the policy-selected Claim limits to the Module runtime", async () => {
+    const policy: SchedulerPolicy = {
+      decide: () => ({
+        eligible: true,
+        eligibleAt: 0,
+        claimLimitCount: 2,
+        claimLimitBytes: 200,
+        reasonCode: "SMALL_BATCH",
+        policyName: "small-batch",
+        policyVersion: "1",
+      }),
+    };
+    const { clock, mailboxes, scheduler } = createScheduler({ policy });
+    const runtime = new FakeModuleRuntime(() => ({ status: "idle" }));
+    mailboxes.set("worker", 5, 500);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(runtime.receivedClaimLimits).toEqual([{
+      claimLimitCount: 2,
+      claimLimitBytes: 200,
+    }]);
     await scheduler.stop();
   });
 

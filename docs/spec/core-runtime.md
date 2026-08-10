@@ -1910,6 +1910,14 @@ interface SchedulerDecision {
 }
 ```
 
+`claimLimitCount` and `claimLimitBytes` are executable batch parameters, not
+observability fields. The scheduler MUST pass the exact validated decision
+values to the runtime tick that it dispatches, and the runtime MUST use them for
+that tick's Delivery Claim. Per-Module runtime configuration supplies hard
+maximum count and byte limits; a decision outside those maxima MUST fail before
+claiming input. Direct runtime callers that omit per-dispatch values use the
+configured maxima.
+
 **Downstream pressure** is the read-only count and byte report for one
 downstream Module in this snapshot. `available` means that the scheduler has
 confirmed capacity under its configured bounds, `blocked` means that it has

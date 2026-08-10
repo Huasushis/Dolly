@@ -307,6 +307,40 @@ async function startedHarness(options: HarnessOptions) {
 }
 
 describe("CORE-004 reactive Module claim/run/commit coordination", () => {
+  it("uses per-dispatch Claim limits without exceeding the runtime maximum", async () => {
+    let observedInput: ReactiveModuleInput | undefined;
+    const harness = await startedHarness({
+      createExecutor: () => ({
+        execute: async (input) => {
+          observedInput = input;
+          return { schemaVersion: "dolly.module-result/1" };
+        },
+      }),
+    });
+    for (const value of ["second", "third"]) {
+      const block = harness.blocks.commit(proposal(value), { kind: "external", id: "console" });
+      harness.deliveries.append("input", block.id);
+    }
+
+    await expect(harness.runtime.tick({
+      claimLimitCount: 11,
+      claimLimitBytes: 1024 * 1024,
+    })).rejects.toMatchObject({ code: "RUNTIME_CONFIGURATION_INVALID" });
+    expect(harness.deliveries.inspectPending("worker", ["input"]).pendingCount).toBe(3);
+
+    await expect(harness.runtime.tick({
+      claimLimitCount: 1,
+      claimLimitBytes: 1024 * 1024,
+    })).resolves.toMatchObject({ status: "committed" });
+    expect(observedInput).toMatchObject({
+      hasMore: true,
+      blockGroups: [{ occurrenceCount: 1 }],
+    });
+    expect(observedInput?.blockGroups).toHaveLength(1);
+    expect(harness.deliveries.inspectPending("worker", ["input"]).pendingCount).toBe(2);
+    await harness.runtime.stop();
+  });
+
   it("rejects an invalid process termination timeout before creating an executor", () => {
     const createExecutor = vi.fn(() => ({
       execute: async () => ({ schemaVersion: "dolly.module-result/1" as const }),
