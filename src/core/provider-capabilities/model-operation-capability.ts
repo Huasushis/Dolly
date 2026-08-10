@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { canonicalJsonByteLength, deepFreeze, type JsonValue } from "../canonical-json.js";
 import {
   assertClosedArguments,
@@ -347,11 +348,9 @@ function buildModelOperationCapability(
   const grantedMaxOutputTokens = budgets.maxOutputTokens;
   const now = options.now;
   const monotonicNow = options.monotonicNow ?? (() => Date.now());
-  let requestSequence = 0;
   const nextRequestId =
     options.nextRequestId ??
-    (() =>
-      `${configuredOperationId ?? grantScope?.moduleJobId ?? "model-operation"}-model-request-${(requestSequence += 1).toString(10)}`);
+    (() => `model-request-${randomUUID()}`);
 
   const grant: ExtensionCapabilityGrant = {
     capabilityType: MODEL_OPERATION_CAPABILITY_TYPE,

@@ -586,6 +586,18 @@ describe("Extension model operation capability", () => {
     expect(harness.chat.invoke).toHaveBeenCalledTimes(3);
   });
 
+  it("allocates distinct default provider request identities across capability factories", async () => {
+    const first = createHarness();
+    const second = createHarness();
+
+    await first.invoke("chat", ONE_MESSAGE);
+    await second.invoke("chat", ONE_MESSAGE);
+
+    const firstRequest = (first.chat.invoke as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    const secondRequest = (second.chat.invoke as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(firstRequest.requestId).not.toBe(secondRequest.requestId);
+  });
+
   it("returns a provider failure as an honest envelope without provider detail", async () => {
     const invoke = vi.fn(
       async (invocation: ChatBrokerInvocation): Promise<ChatBrokerResult> => ({
