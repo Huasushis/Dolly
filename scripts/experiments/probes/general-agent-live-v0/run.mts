@@ -21,7 +21,7 @@ import {
 } from "../../../../src/core/capabilities/effect-intent-journal.js";
 import { FileEffectIntentStore } from "../../../../src/core/capabilities/file-effect-intent-store.js";
 import {
-  createModulePrivateStorageCapability,
+  createModulePrivateStorageCapabilityV2,
   ModulePrivateStorageBackend,
 } from "../../../../src/core/capabilities/module-private-storage-capability.js";
 import type { JsonValue } from "../../../../src/core/canonical-json.js";
@@ -1392,13 +1392,18 @@ async function runCondition(options: {
           : createModelOperationCapability(modelOptions);
         extensionHost.grantCapability(modelDefinition.grant, modelDefinition.handler);
         if (options.conditionId === "private-storage-tool") {
-          const storageDefinition = createModulePrivateStorageCapability({
+          const storageDefinition = createModulePrivateStorageCapabilityV2({
             backend: storage,
             instanceId,
             moduleId,
             operations: ["list", "get"],
+            executionScope: "active-run",
             expiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
-            limits: { maxInvocations: 2, maxListResults: 8 },
+            limits: {
+              maxInvocations: 2,
+              maxInvocationsPerRun: 2,
+              maxListResults: 8,
+            },
             maxConcurrentInvocations: 1,
             requireIdempotencyKey: true,
           });

@@ -1,7 +1,14 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
   ExtensionCapabilityAuthority,
   type ExtensionCapabilityHandle,
@@ -10,6 +17,8 @@ import {
 } from "../../../src/core/extension-capability.js";
 import {
   createModulePrivateStorageCapability,
+  createModulePrivateStorageCapabilityV2,
+  MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION_V2,
   ModulePrivateStorageBackend,
   type ModulePrivateStorageLimits,
   type ModulePrivateStorageOperation,
@@ -38,9 +47,17 @@ const ALL_OPERATIONS: readonly ModulePrivateStorageOperation[] = [
 ];
 
 const scratchRoots: string[] = [];
+const taskScratchParent = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "../../../..",
+  ".tmp",
+);
+mkdirSync(taskScratchParent, { recursive: true, mode: 0o700 });
+const taskScratchRoot = mkdtempSync(join(taskScratchParent, "module-private-storage-tests-"));
 
 function createRoot(): string {
-  const root = mkdtempSync(join(tmpdir(), "dolly-module-private-storage-"));
+  mkdirSync(taskScratchRoot, { recursive: true, mode: 0o700 });
+  const root = mkdtempSync(join(taskScratchRoot, "case-"));
   scratchRoots.push(root);
   return root;
 }
@@ -49,6 +66,10 @@ afterEach(() => {
   while (scratchRoots.length > 0) {
     rmSync(scratchRoots.pop()!, { recursive: true, force: true });
   }
+});
+
+afterAll(() => {
+  rmSync(taskScratchRoot, { recursive: true, force: true });
 });
 
 function createBackend(root: string): ModulePrivateStorageBackend {
@@ -134,6 +155,102 @@ function createHarness(
 }
 
 describe("Extension Module-private storage capability", () => {
+  it("rejects a version 2 grant that omits an explicit execution scope", () => {
+    const root = createRoot();
+    expect(() =>
+      createModulePrivateStorageCapabilityV2({
+        backend: createBackend(root),
+        instanceId: "instance-a",
+        moduleId: "module-a",
+        operations: ["get"],
+        expiresAt: "2026-07-27T00:00:00.000Z",
+      } as never),
+    ).toThrow(expect.objectContaining({ code: "CAPABILITY_CONFIG_INVALID" }));
+  });
+
+  it("binds a version 2 reusable handle to Host-verified Runs and enforces each Run limit", async () => {
+    const root = createRoot();
+    const backend = createBackend(root);
+    const clock = { wall: "2026-07-26T00:00:00.000Z" };
+    const session = createAuthority(clock).openSession(MODULE_A_IDENTITY);
+    const definition = createModulePrivateStorageCapabilityV2({
+      backend,
+      instanceId: "instance-a",
+      moduleId: "module-a",
+      operations: ["get"],
+      executionScope: "active-run",
+      expiresAt: "2026-07-27T00:00:00.000Z",
+      limits: {
+        maxInvocations: 8,
+        maxInvocationsPerRun: 2,
+      },
+    });
+    const handle = session.issue(definition.grant, definition.handler);
+
+    expect(definition.grant).toMatchObject({
+      capabilityVersion: MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION_V2,
+      resourceScope: {
+        schemaVersion: "dolly.capability-scope.module-private-storage/2",
+        executionScope: "active-run",
+        limits: { maxInvocationsPerRun: 2 },
+      },
+    });
+
+    const invoke = (moduleJobId: string | undefined, runId: string | undefined) =>
+      session.invoke({
+        handle,
+        operation: "get",
+        arguments: { key: "alpha" },
+        ...(moduleJobId === undefined ? {} : { moduleJobId }),
+        ...(runId === undefined ? {} : { runId }),
+      });
+
+    await expect(invoke("module-job-a", "run-a")).resolves.toMatchObject({ found: false });
+    await expect(invoke("module-job-a", "run-a")).resolves.toMatchObject({ found: false });
+    await expect(invoke("module-job-a", "run-a")).rejects.toMatchObject({
+      code: "CAPABILITY_QUOTA_EXCEEDED",
+      details: { limit: "maxInvocationsPerRun", allowed: 2 },
+    });
+    await expect(invoke("module-job-b", "run-b")).resolves.toMatchObject({ found: false });
+    await expect(invoke("module-job-b", "run-b")).resolves.toMatchObject({ found: false });
+    await expect(invoke(undefined, undefined)).rejects.toMatchObject({
+      code: "CAPABILITY_SCOPE_MISMATCH",
+    });
+    expect(readdirSync(root)).toEqual([]);
+  });
+
+  it("keeps a version 2 fixed-Run handle pinned to its exact Module job and Run", async () => {
+    const root = createRoot();
+    const backend = createBackend(root);
+    const clock = { wall: "2026-07-26T00:00:00.000Z" };
+    const session = createAuthority(clock).openSession(MODULE_A_IDENTITY);
+    const definition = createModulePrivateStorageCapabilityV2({
+      backend,
+      instanceId: "instance-a",
+      moduleId: "module-a",
+      operations: ["get"],
+      executionScope: { moduleJobId: "module-job-a", runId: "run-a" },
+      expiresAt: "2026-07-27T00:00:00.000Z",
+      limits: { maxInvocations: 2, maxInvocationsPerRun: 2 },
+    });
+    const handle = session.issue(definition.grant, definition.handler);
+
+    expect(definition.grant.resourceScope).toMatchObject({
+      schemaVersion: "dolly.capability-scope.module-private-storage/2",
+      moduleJobId: "module-job-a",
+    });
+    await expect(
+      session.invoke({
+        handle,
+        operation: "get",
+        arguments: { key: "alpha" },
+        moduleJobId: "module-job-a",
+        runId: "run-b",
+      }),
+    ).rejects.toMatchObject({ code: "CAPABILITY_SCOPE_MISMATCH" });
+    expect(readdirSync(root)).toEqual([]);
+  });
+
   it("derives the namespace from the authenticated Module and isolates Modules", async () => {
     const root = createRoot();
     const backend = createBackend(root);

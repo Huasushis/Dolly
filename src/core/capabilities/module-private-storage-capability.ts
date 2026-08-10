@@ -39,6 +39,7 @@ import {
   optionalString,
   readField,
   requireString,
+  resolveExecutionScope,
   utf8ByteLength,
   type ExtensionCapabilityDefinition,
   type ResolvedExecutionScope,
@@ -46,6 +47,7 @@ import {
 
 export const MODULE_PRIVATE_STORAGE_CAPABILITY_TYPE = "module-private-storage";
 export const MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION = "v1";
+export const MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION_V2 = "v2";
 
 export type ModulePrivateStorageOperation = "get" | "set" | "delete" | "list";
 
@@ -402,6 +404,11 @@ export interface ModulePrivateStorageLimits {
   readonly maxInvocations: number;
 }
 
+export interface ModulePrivateStorageLimitsV2 extends ModulePrivateStorageLimits {
+  /** Host-enforced operation ceiling for one exact Module Run. */
+  readonly maxInvocationsPerRun: number;
+}
+
 export const DEFAULT_MODULE_PRIVATE_STORAGE_LIMITS: ModulePrivateStorageLimits =
   deepFreeze({
     maxKeyBytes: 128,
@@ -412,6 +419,12 @@ export const DEFAULT_MODULE_PRIVATE_STORAGE_LIMITS: ModulePrivateStorageLimits =
     maxArgumentBytes: 32 * 1_024,
     maxResultBytes: 32 * 1_024,
     maxInvocations: 4_096,
+  });
+
+export const DEFAULT_MODULE_PRIVATE_STORAGE_LIMITS_V2: ModulePrivateStorageLimitsV2 =
+  deepFreeze({
+    ...DEFAULT_MODULE_PRIVATE_STORAGE_LIMITS,
+    maxInvocationsPerRun: 64,
   });
 
 export interface ModulePrivateStorageCapabilityOptions {
@@ -432,10 +445,29 @@ export interface ModulePrivateStorageCapabilityOptions {
   readonly requireIdempotencyKey?: boolean;
 }
 
+export interface ModulePrivateStorageCapabilityV2Options extends Omit<
+  ModulePrivateStorageCapabilityOptions,
+  "executionScope" | "limits"
+> {
+  /** Explicitly fixed to one Run or reused only through Host-verified active Runs. */
+  readonly executionScope: ResolvedExecutionScope | "active-run";
+  readonly limits?: Partial<ModulePrivateStorageLimitsV2>;
+}
+
 function resolveStorageLimits(
   overrides: Partial<ModulePrivateStorageLimits> | undefined,
 ): ModulePrivateStorageLimits {
   const limits = { ...DEFAULT_MODULE_PRIVATE_STORAGE_LIMITS, ...(overrides ?? {}) };
+  for (const [label, value] of Object.entries(limits)) {
+    assertPositiveLimit(value, `module private storage ${label}`);
+  }
+  return deepFreeze(limits);
+}
+
+function resolveStorageLimitsV2(
+  overrides: Partial<ModulePrivateStorageLimitsV2> | undefined,
+): ModulePrivateStorageLimitsV2 {
+  const limits = { ...DEFAULT_MODULE_PRIVATE_STORAGE_LIMITS_V2, ...(overrides ?? {}) };
   for (const [label, value] of Object.entries(limits)) {
     assertPositiveLimit(value, `module private storage ${label}`);
   }
@@ -449,7 +481,31 @@ function entryBytes(key: string, value: JsonValue): number {
 export function createModulePrivateStorageCapability(
   options: ModulePrivateStorageCapabilityOptions,
 ): ExtensionCapabilityDefinition {
-  const limits = resolveStorageLimits(options.limits);
+  return buildModulePrivateStorageCapability(
+    options,
+    MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION,
+    resolveStorageLimits(options.limits),
+  );
+}
+
+/** Builds the explicit active-Run-capable, per-Run-bounded storage grant. */
+export function createModulePrivateStorageCapabilityV2(
+  options: ModulePrivateStorageCapabilityV2Options,
+): ExtensionCapabilityDefinition {
+  return buildModulePrivateStorageCapability(
+    options,
+    MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION_V2,
+    resolveStorageLimitsV2(options.limits),
+  );
+}
+
+function buildModulePrivateStorageCapability(
+  options: ModulePrivateStorageCapabilityOptions | ModulePrivateStorageCapabilityV2Options,
+  capabilityVersion:
+    | typeof MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION
+    | typeof MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION_V2,
+  limits: ModulePrivateStorageLimits | ModulePrivateStorageLimitsV2,
+): ExtensionCapabilityDefinition {
   const instanceId = assertHostIdentifier(options.instanceId, "instanceId");
   const moduleId = assertHostIdentifier(options.moduleId, "moduleId");
   if (!Array.isArray(options.operations) || options.operations.length === 0) {
@@ -469,7 +525,17 @@ export function createModulePrivateStorageCapability(
   }
   const enabled = new Set<ModulePrivateStorageOperation>(operations);
   const namespace = options.backend.namespaceFor(instanceId, moduleId);
-  const grantScope = options.executionScope
+  const activeRun = options.executionScope === "active-run";
+  if (
+    capabilityVersion === MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION_V2 &&
+    options.executionScope === undefined
+  ) {
+    throw new ExtensionCapabilityError(
+      "CAPABILITY_CONFIG_INVALID",
+      "Module private storage version 2 requires an explicit execution scope",
+    );
+  }
+  const grantScope = options.executionScope !== undefined && !activeRun
     ? {
         moduleJobId: assertHostIdentifier(options.executionScope.moduleJobId, "moduleJobId"),
         runId: assertHostIdentifier(options.executionScope.runId, "runId"),
@@ -478,14 +544,22 @@ export function createModulePrivateStorageCapability(
 
   const grant: ExtensionCapabilityGrant = {
     capabilityType: MODULE_PRIVATE_STORAGE_CAPABILITY_TYPE,
-    capabilityVersion: MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION,
+    capabilityVersion,
     operations,
     resourceScope: {
-      schemaVersion: "dolly.capability-scope.module-private-storage/1",
+      schemaVersion:
+        capabilityVersion === MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION_V2
+          ? "dolly.capability-scope.module-private-storage/2"
+          : "dolly.capability-scope.module-private-storage/1",
       namespace,
       instanceId,
       moduleId,
       limits: { ...limits },
+      ...(capabilityVersion === MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION_V2
+        ? activeRun
+          ? { executionScope: "active-run" }
+          : { moduleJobId: grantScope!.moduleJobId }
+        : {}),
     },
     expiresAt: options.expiresAt,
     maxInvocations: limits.maxInvocations,
@@ -494,6 +568,19 @@ export function createModulePrivateStorageCapability(
     maxResultBytes: limits.maxResultBytes,
     ...(grantScope === undefined ? {} : { executionScope: grantScope }),
     ...(options.requireIdempotencyKey === true ? { requireIdempotencyKey: true } : {}),
+  };
+
+  const invocationsByRun = new Map<string, number>();
+  const consumeRunSlot = (context: ExtensionCapabilityInvocationContext): void => {
+    if (capabilityVersion !== MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION_V2) return;
+    const execution = resolveExecutionScope(grantScope, context);
+    const key = `${execution.moduleJobId}\u0000${execution.runId}`;
+    const used = invocationsByRun.get(key) ?? 0;
+    const maximum = (limits as ModulePrivateStorageLimitsV2).maxInvocationsPerRun;
+    if (used >= maximum) {
+      throw capabilityQuotaError("maxInvocationsPerRun", maximum);
+    }
+    invocationsByRun.set(key, used + 1);
   };
 
   const bindingFor = (context: ExtensionCapabilityInvocationContext): NamespaceBinding => {
@@ -548,6 +635,7 @@ export function createModulePrivateStorageCapability(
     if (operation === "get") {
       const parsed = assertClosedArguments(argumentsValue, ["key"], "storage.get");
       const key = readKey(parsed, "storage.get");
+      consumeRunSlot(context);
       const entry = options.backend
         .read(binding)
         .entries.find((candidate) => candidate.key === key);
@@ -577,6 +665,7 @@ export function createModulePrivateStorageCapability(
       const limit =
         optionalBoundedInteger(parsed, "limit", "storage.list", limits.maxListResults) ??
         limits.maxListResults;
+      consumeRunSlot(context);
       const matching = options.backend
         .read(binding)
         .entries.filter(
@@ -603,6 +692,7 @@ export function createModulePrivateStorageCapability(
       if (canonicalJsonByteLength(value) > limits.maxValueBytes) {
         throw capabilityQuotaError("maxValueBytes", limits.maxValueBytes);
       }
+      consumeRunSlot(context);
       const document = options.backend.read(binding);
       const existing = document.entries.find((entry) => entry.key === key);
       if (!existing && document.entries.length + 1 > limits.maxEntries) {
@@ -636,6 +726,7 @@ export function createModulePrivateStorageCapability(
 
     const parsed = assertClosedArguments(argumentsValue, ["key"], "storage.delete");
     const key = readKey(parsed, "storage.delete");
+    consumeRunSlot(context);
     const document = options.backend.read(binding);
     if (!document.entries.some((entry) => entry.key === key)) {
       return {

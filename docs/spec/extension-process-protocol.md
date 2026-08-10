@@ -575,6 +575,28 @@ Read, write, delete, publish, external communication, and administrative
 operations MUST be distinct grants. A broad `filesystem`, `network`, `shell`,
 or `all tools` capability MUST NOT be granted by default.
 
+The compatibility `module-private-storage/v1` handle may be fixed to one
+Module job and Run, or may retain its original session-wide scope. It MUST NOT
+be used as a reusable handle for a long-lived Module process because it has no
+per-Run invocation limit.
+
+A long-lived Module process uses `module-private-storage/v2`. The host MUST
+choose one of two explicit execution scopes when it creates the handle:
+
+- a fixed `{moduleJobId, runId}` for a one-shot process or bounded test; or
+- `active-run`, meaning the process host supplies the identifiers of the
+  Module job and execution attempt that it is currently running.
+
+Omitting the version 2 execution scope is invalid; absence MUST NOT mean broader
+authority. An `active-run` request is accepted only while the process host has
+an exact active Run, and the Extension cannot select or override that Run on
+the wire. In addition to the finite process-session invocation ceiling,
+version 2 enforces `maxInvocationsPerRun` independently for each exact
+`(moduleJobId, runId)` pair. A failed or exhausted Run MUST NOT consume another
+Run's per-Run allowance. The process-session expiry and total invocation limit
+remain finite, so a product host must rotate the handle or restart the process
+through its normal generation lifecycle before either is exhausted.
+
 Model-operation and generic outbound-network capabilities are distinct. A large
 language model (LLM), Memory, or other ordinary model consumer receives only a
   descriptor-bound model operation handle. It MUST NOT receive the underlying

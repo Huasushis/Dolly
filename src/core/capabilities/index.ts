@@ -19,14 +19,19 @@ export {
 } from "./structured-log-capability.js";
 export {
   createModulePrivateStorageCapability,
+  createModulePrivateStorageCapabilityV2,
   DEFAULT_MODULE_PRIVATE_STORAGE_LIMITS,
+  DEFAULT_MODULE_PRIVATE_STORAGE_LIMITS_V2,
   MODULE_PRIVATE_STORAGE_CAPABILITY_TYPE,
   MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION,
+  MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION_V2,
   ModulePrivateStorageBackend,
   type ModulePrivateStorageBackendOptions,
   type ModulePrivateStorageCapabilityOptions,
+  type ModulePrivateStorageCapabilityV2Options,
   type ModulePrivateStorageEntry,
   type ModulePrivateStorageLimits,
+  type ModulePrivateStorageLimitsV2,
   type ModulePrivateStorageOperation,
 } from "./module-private-storage-capability.js";
 export {
