@@ -14,6 +14,7 @@ import {
   decodeOpenAiCompatibleChatResponse,
   encodeOpenAiCompatibleChatRequest,
   mapReasoningPolicy,
+  validateChatOutputContract,
   type ChatInput,
   type ChatOutput,
   type ReasoningPolicy,
@@ -1014,6 +1015,7 @@ export class ChatModelBroker {
         transportResult.responseBytes,
         decision,
       );
+      validateChatOutputContract(output, invocation.input.outputContract);
       if (canonicalJsonByteLength(output) > invocation.budgets.maxOutputBytes) {
         return failedResult(
           invocation,

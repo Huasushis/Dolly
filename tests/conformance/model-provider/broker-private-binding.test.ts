@@ -99,8 +99,11 @@ class FakeTransport implements ModelHttpTransport {
   }
 }
 
-function providerBody(reasoningContent: string | undefined = "2 + 2 equals 4"): Buffer {
-  const message: Record<string, unknown> = { role: "assistant", content: "4" };
+function providerBody(
+  reasoningContent: string | undefined = "2 + 2 equals 4",
+  content = "4",
+): Buffer {
+  const message: Record<string, unknown> = { role: "assistant", content };
   if (reasoningContent !== undefined) message.reasoning_content = reasoningContent;
   return Buffer.from(
     JSON.stringify({
@@ -112,7 +115,7 @@ function providerBody(reasoningContent: string | undefined = "2 + 2 equals 4"): 
   );
 }
 
-function createDescriptor(): {
+function createDescriptor(options: { jsonObjectOutput?: "supported" | "unsupported" } = {}): {
   registry: ModelDescriptorRegistry;
   snapshot: ChatDescriptorSnapshot;
 } {
@@ -120,7 +123,7 @@ function createDescriptor(): {
     schemaDigest: SCHEMA_DIGEST,
     allowedStrategyIds: CHAT_STRATEGIES,
   });
-  const ref = registry.register(chatDescriptor());
+  const ref = registry.register(chatDescriptor(options));
   registry.setStatus(ref, "active");
   return { registry, snapshot: registry.snapshot(ref) };
 }
@@ -423,6 +426,58 @@ describe("private endpoint binding and model provider broker", () => {
       usage: { providerAttempts: 1 },
     });
     expect(result).not.toHaveProperty("providerRequestId");
+  });
+
+  it("fails provider responses that violate the requested JSON-object syntax", async () => {
+    const { registry, snapshot } = createDescriptor({ jsonObjectOutput: "supported" });
+    const request: ChatBrokerInvocation = {
+      ...invocation(snapshot.ref),
+      reasoningPolicy: "default",
+      input: {
+        ...invocation(snapshot.ref).input,
+        schemaVersion: "dolly.model.chat-input/3",
+        outputContract: { kind: "json-object" },
+      },
+    };
+
+    const validTransport = new FakeTransport(
+      async () => new FakeResponse(200, providerBody(undefined, '{"answer":4}')),
+    );
+    const valid = brokerWith({
+      descriptors: registry,
+      descriptor: snapshot.ref,
+      transport: validTransport,
+    });
+    await expect(valid.broker.invoke(request)).resolves.toMatchObject({
+      status: "succeeded",
+      output: { finalContent: '{"answer":4}' },
+    });
+
+    for (const content of [
+      "not JSON",
+      "[]",
+      "null",
+      "```json\n{\"answer\":4}\n```",
+      'prose before {"answer":4}',
+    ]) {
+      const transport = new FakeTransport(
+        async () => new FakeResponse(200, providerBody(undefined, content)),
+      );
+      const { broker } = brokerWith({
+        descriptors: registry,
+        descriptor: snapshot.ref,
+        transport,
+      });
+      await expect(broker.invoke(request)).resolves.toMatchObject({
+        status: "failed",
+        error: {
+          code: "PROVIDER_PROTOCOL_ERROR",
+          phase: "response",
+          retryClass: "never",
+        },
+      });
+      expect(transport.requests).toHaveLength(1);
+    }
   });
 
   it("rejects exhausted budgets before resolving a secret or dispatching", async () => {

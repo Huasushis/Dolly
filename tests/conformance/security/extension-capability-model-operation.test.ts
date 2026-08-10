@@ -62,12 +62,12 @@ const BUDGETS: ModelInvocationBudgets = {
   maxOutputTokens: 512,
 };
 
-function chatRef(): DescriptorRef {
+function chatRef(options: { jsonObjectOutput?: "supported" | "unsupported" } = {}): DescriptorRef {
   const registry = new ModelDescriptorRegistry({
     schemaDigest: SCHEMA_DIGEST,
     allowedStrategyIds: CHAT_STRATEGIES,
   });
-  const ref = registry.register(chatDescriptor());
+  const ref = registry.register(chatDescriptor(options));
   registry.setStatus(ref, "active");
   return ref;
 }
@@ -286,7 +286,7 @@ describe("Extension model operation capability", () => {
     const session = authority.openSession(IDENTITY);
     const invoke = vi.fn(async (invocation: ChatBrokerInvocation) => succeededChat(invocation));
     const options: ModelOperationCapabilityV2Options = {
-      descriptor: chatRef(),
+      descriptor: chatRef({ jsonObjectOutput: "supported" }),
       ownerScope: "owner-1",
       budgets: BUDGETS,
       executionScope: EXECUTION_SCOPE,

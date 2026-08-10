@@ -126,6 +126,18 @@ describe("model descriptor registry", () => {
     expect(() => registry().register({ ...missingDeclaration, features })).toThrowError(
       expect.objectContaining<Partial<ModelDescriptorError>>({ code: "DESCRIPTOR_INVALID" }),
     );
+
+    for (const state of ["unknown", "inapplicable"] as const) {
+      const descriptor = chatDescriptor({ jsonObjectOutput: "unsupported" });
+      expect(() =>
+        registry().register({
+          ...descriptor,
+          features: { ...descriptor.features, jsonObjectOutput: { state } },
+        }),
+      ).toThrowError(
+        expect.objectContaining<Partial<ModelDescriptorError>>({ code: "DESCRIPTOR_INVALID" }),
+      );
+    }
   });
 
   it.each(["dolly.model-descriptor/1", "dolly.model-descriptor/2"])(

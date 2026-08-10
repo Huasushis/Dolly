@@ -77,6 +77,36 @@ export interface ChatOutput {
   readonly finishReason: string;
 }
 
+/**
+ * Verifies the provider response against the request-side syntax promise.
+ * Provider `response_format` support is not trusted as validation evidence:
+ * the broker checks the returned bytes again before reporting success.
+ */
+export function validateChatOutputContract(
+  output: ChatOutput,
+  contract: ChatInput["outputContract"],
+): void {
+  if (contract.kind === "text") return;
+  let value: unknown;
+  try {
+    value = JSON.parse(output.finalContent);
+  } catch {
+    throw new ModelChatError(
+      "CHAT_PROVIDER_PROTOCOL_ERROR",
+      "Provider output does not satisfy the requested JSON syntax",
+    );
+  }
+  if (
+    contract.kind === "json-object" &&
+    (value === null || Array.isArray(value) || typeof value !== "object")
+  ) {
+    throw new ModelChatError(
+      "CHAT_PROVIDER_PROTOCOL_ERROR",
+      "Provider output is not one JSON object",
+    );
+  }
+}
+
 export interface ChatWirePlan {
   readonly method: "POST";
   readonly routeId: "chat-completions";

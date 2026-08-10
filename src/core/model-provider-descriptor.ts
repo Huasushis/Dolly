@@ -654,6 +654,16 @@ function normalizeChatFeatures(
           },
         )
       : undefined;
+  if (
+    jsonObjectOutput !== undefined &&
+    jsonObjectOutput.state !== "supported" &&
+    jsonObjectOutput.state !== "unsupported"
+  ) {
+    throw new ModelDescriptorError(
+      "DESCRIPTOR_INVALID",
+      "features.jsonObjectOutput must be explicitly supported or unsupported",
+    );
+  }
   return {
     roles: uniqueNames(value.roles, "features.roles"),
     messageOrderStrategyId: name(
