@@ -1,0 +1,31 @@
+source commit: ad6f42db38e9dd5e2022008e251c6669e592c698
+source snapshot: git archive HEAD
+outer command: bash scripts/experiments/linux-core-service-ownership/run-disposable-container.sh --base docker.m.daocloud.io/library/ubuntu:24.04 --test-file tests/conformance/security/installed-reactive-module-host-integration.test.ts
+inner command: ./scripts/run-linux-module-launcher-integration.sh tests/conformance/security/installed-reactive-module-host-integration.test.ts
+exact container: dolly-experiment-940851-e19037cb
+host artifact root: /home/ubuntu/codex-dolly/Dolly/artifacts/experiments/linux-core-service-ownership/container-940851-20260810T054432Z
+post-run exact docker inspect status: 1 (container absent)
+
+preflight:
+tracked_commit_source=true
+source_readable=true
+source_writable=false
+private_env_present=false
+git_directory_present=false
+dependencies_writable=false
+vite_temp_writable=true
+artifacts_writable=true
+
+environment:
+cgroup filesystem: cgroup2fs
+root controllers: cpuset cpu io memory hugetlb pids rdma misc
+lingering: Linger=yes
+systemd: systemd 255 (255.4-1ubuntu8.16)
+node: v20.20.2
+dolly identity: uid=1001 gid=997 groups=997
+python3: Python 3.12.3
+
+The outer worktree was dirty, but the runner archived only the exact tracked
+commit shown above. It mounted that snapshot and dependencies read-only, did
+not mount .env or .git, and provided separate writable test and artifact
+directories.
