@@ -38,7 +38,11 @@ function store(): EffectIntentStore & { readonly records: EffectIntentRecord[] }
       const index = records.findIndex(
         (existing) =>
           existing.moduleJobId === replacement.moduleJobId &&
-          existing.idempotencyKey === replacement.idempotencyKey,
+          existing.idempotencyKey === replacement.idempotencyKey &&
+          existing.runId === replacement.runId &&
+          existing.attempt === replacement.attempt &&
+          existing.claimToken === replacement.claimToken &&
+          existing.moduleGenerationId === replacement.moduleGenerationId,
       );
       if (expected === undefined) {
         if (index >= 0) return false;
@@ -237,26 +241,46 @@ describe("effect intent record protocol", () => {
     );
   });
 
-  it.each([
-    ["Run", { runId: "run-2" }],
-    ["claim token", { claimToken: "claim-token-2" }],
-    ["attempt", { attempt: 2 }],
-    ["Module generation", { moduleGenerationId: "module-generation-2" }],
-  ] satisfies ReadonlyArray<
-    readonly [string, Partial<DeliveryClaimIdentity>]
-  >)(
-    "refuses to reuse one idempotency key for a different exact Claim (%s differs)",
-    (_field, identityOverride) => {
-      const journal = new EffectIntentJournal({ store: store(), now: () => NOW });
-      journal.recordIntent(intent());
+  it("records one stable effect separately for a retry Run", () => {
+    const backing = store();
+    const journal = new EffectIntentJournal({ store: backing, now: () => NOW });
+    const first = journal.recordIntent(intent());
+    const retryIdentity = claim({
+      runId: "run-2",
+      attempt: 2,
+      claimToken: "claim-token-2",
+      moduleGenerationId: "module-generation-2",
+    });
+    const retry = journal.recordIntent(intent({ ...retryIdentity }));
 
-      expect(() => journal.recordIntent(intent(identityOverride))).toThrowError(
-        expect.objectContaining<Partial<EffectIntentError>>({
-          code: "EFFECT_INTENT_CONFLICT",
-        }),
-      );
-    },
-  );
+    expect(backing.records).toHaveLength(2);
+    expect(first.idempotencyKey).toBe(retry.idempotencyKey);
+    expect(first.intentDigest).toBe(retry.intentDigest);
+    expect(journal.listForRun(claim())).toEqual([first]);
+    expect(journal.listForRun(retryIdentity)).toEqual([retry]);
+
+    journal.recordOutcome(claim(), first.idempotencyKey, {
+      kind: "terminal",
+      resultDigest: `sha256:${"8".repeat(64)}`,
+    });
+    expect(journal.evidenceForRun(claim())).toEqual({ kind: "terminal" });
+    expect(journal.evidenceForRun(retryIdentity).kind).toBe("unknown");
+  });
+
+  it("still refuses a different intent under a stable key in a retry Run", () => {
+    const journal = new EffectIntentJournal({ store: store(), now: () => NOW });
+    journal.recordIntent(intent());
+    expect(() => journal.recordIntent(intent({
+      runId: "run-2",
+      attempt: 2,
+      claimToken: "claim-token-2",
+      intent: { url: "https://elsewhere.invalid/" },
+    }))).toThrowError(
+      expect.objectContaining<Partial<EffectIntentError>>({
+        code: "EFFECT_INTENT_CONFLICT",
+      }),
+    );
+  });
 
   it("returns the existing record when the same effect is recorded again", () => {
     const backing = store();

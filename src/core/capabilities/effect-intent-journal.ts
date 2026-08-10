@@ -96,8 +96,10 @@ export class EffectIntentError extends Error {
 export interface EffectIntentStore {
   list(): readonly EffectIntentRecord[];
   /**
-   * Inserts when `expected` is absent, or replaces only the exact current
-   * record supplied as `expected`. `false` means another write won.
+   * Inserts the replacement's complete Claim/Run identity when `expected` is
+   * absent, or replaces only that exact current record when `expected` is
+   * supplied. More than one Run may carry the same stable idempotency key for
+   * the same Module job. `false` means another write won.
    */
   compareAndSet(
     expected: EffectIntentRecord | undefined,
@@ -250,13 +252,6 @@ export class EffectIntentJournal {
     if (existing) {
       return existing;
     }
-    if (recordsForKey.length > 0) {
-      throw new EffectIntentError(
-        "EFFECT_INTENT_CONFLICT",
-        `Idempotency key "${request.idempotencyKey}" is already linked to a different exact Claim; the current schema cannot safely link one stable effect across retry Runs`,
-      );
-    }
-
     const now = this.#now();
     const record: EffectIntentRecord = deepFreeze({
       schemaVersion: "dolly.effect-intent/2" as const,
