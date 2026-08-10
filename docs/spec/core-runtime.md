@@ -816,22 +816,24 @@ input/output operation. The responsible capability contract then persists or
 queries its terminal outcome. An in-memory duplicate map, an Extension-declared
 `retrySafe` flag, or a cancelled local Promise is not durable evidence.
 
-The current `EffectIntentJournal` and `effectIntentEvidenceSource` implement the
-record rules and the adapter consumed by startup and runtime recovery. Dolly
-does not yet provide a persistent product `EffectIntentStore`, and no product
-capability execution path is required to write through this journal before it
-authorizes an external effect. Consequently, both an empty journal and a set of
-records whose outcomes are all `no-effect` remain `unknown`: neither proves that
-every possible effect for the Run was recorded. A `terminal` record proves a
-durable final effect result, not retry safety.
+The current `EffectIntentJournal`, `FileEffectIntentStore`, and
+`effectIntentEvidenceSource` implement the record rules, crash-recoverable
+individual-record storage, and the adapter consumed by startup and runtime
+recovery. No product capability execution path is yet required to write through
+this store before it authorizes an external effect, and the store has no durable
+Run-level record proving that capability admission closed after every possible
+effect was recorded. Consequently, both an empty journal and a set of records
+whose outcomes are all `no-effect` remain `unknown`: neither proves that every
+possible effect for the Run was recorded. A `terminal` record proves a durable
+final effect result, not retry safety.
 
-The current `dolly.effect-intent/2` record also carries both the stable
-idempotency key and one exact Claim/Run identity. It rejects reuse of that key
-by a retry Run because the current shape cannot safely distinguish the stable
-logical effect from each Run that was authorized to request it. Before product
-integration, the persistent schema must represent those as separate related
-records or otherwise prove both relationships; silently treating a record from
-another Claim as this Run's authorization is forbidden.
+The current `dolly.effect-intent/2` record carries both the stable idempotency
+key and one exact Claim/Run identity. A retry Run records a separate record with
+the same `moduleJobId`, idempotency key, and intent digest, plus its own claim
+token, Run identifier, attempt, and Module generation. A different intent under
+that stable key is a conflict. Evidence inspection uses only the exact Run's
+record; it never treats another Claim's related record as authorization for the
+current Run.
 
 Positive acknowledgement operations MUST be idempotent for the same valid
 claim token. A repeated positive acknowledgement MAY report
@@ -2180,11 +2182,12 @@ through, the historical version 15 and version 16 ambiguity described in
 Section 7.7. Startup accepts Module-cgroup stop proof and external-effect evidence
 through injected interfaces. The Linux stop-proof implementation exists, but
 `runtime-bootstrap.ts` does not pass it to startup recovery. The effect-intent
-record protocol and recovery adapter (`effectIntentEvidenceSource`) also exist,
-but Dolly has no persistent product store and does not connect intent
-persistence to capability execution. The adapter is therefore not an
-authoritative recovery source and remains unwired; `runtime-bootstrap.ts`
-passes no external-effect evidence source.
+record protocol, file store, and recovery adapter
+(`effectIntentEvidenceSource`) also exist, but Dolly does not connect intent
+persistence to capability execution or persist the required Run-level
+completeness record. The adapter is therefore not an authoritative recovery
+source and remains unwired; `runtime-bootstrap.ts` passes no external-effect
+evidence source.
 Consequently, any process record that is not already `stopped` fails product
 startup as unproven. With no Module records at all, which is every
 product-created deployment while Modules are rejected, behavior is unchanged.

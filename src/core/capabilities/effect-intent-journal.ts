@@ -31,6 +31,7 @@ import type { DeliveryClaimIdentity } from "../delivery-store.js";
 
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const MAX_IDENTIFIER_LENGTH = 256;
+const MAX_OUTCOME_DETAIL_LENGTH = 4_096;
 
 /**
  * How far an intended effect got. `terminal` means the operation has a durable
@@ -78,12 +79,216 @@ export type EffectIntentErrorCode =
   | "EFFECT_INTENT_INVALID"
   | "EFFECT_INTENT_CONFLICT"
   | "EFFECT_INTENT_NOT_FOUND"
-  | "EFFECT_INTENT_OUTCOME_INVALID";
+  | "EFFECT_INTENT_OUTCOME_INVALID"
+  | "EFFECT_INTENT_DOCUMENT_INVALID"
+  | "EFFECT_INTENT_IO_FAILED"
+  | "EFFECT_INTENT_LIMIT_EXCEEDED"
+  | "EFFECT_INTENT_LOCKED";
 
 export class EffectIntentError extends Error {
   constructor(readonly code: EffectIntentErrorCode, message: string) {
     super(message);
     this.name = "EffectIntentError";
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function assertClosedKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  label: string,
+): void {
+  if (Object.keys(value).some((key) => !allowed.includes(key))) {
+    throw new EffectIntentError(
+      "EFFECT_INTENT_INVALID",
+      `${label} contains an unknown field`,
+    );
+  }
+}
+
+function isCanonicalTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+/** Validates one persisted effect-intent record without trusting its source. */
+export function assertEffectIntentRecord(
+  value: unknown,
+): asserts value is EffectIntentRecord {
+  if (!isPlainObject(value)) {
+    throw new EffectIntentError(
+      "EFFECT_INTENT_INVALID",
+      "Effect intent record must be an object",
+    );
+  }
+  assertClosedKeys(
+    value,
+    [
+      "schemaVersion",
+      "moduleJobId",
+      "runId",
+      "attempt",
+      "claimToken",
+      "moduleGenerationId",
+      "idempotencyKey",
+      "capabilityType",
+      "operation",
+      "intentDigest",
+      "outcome",
+      "createdAt",
+      "updatedAt",
+    ],
+    "Effect intent record",
+  );
+  if (value.schemaVersion !== "dolly.effect-intent/2") {
+    throw new EffectIntentError(
+      "EFFECT_INTENT_INVALID",
+      "Effect intent record schema version is not supported",
+    );
+  }
+  for (const field of [
+    "moduleJobId",
+    "runId",
+    "claimToken",
+    "moduleGenerationId",
+    "idempotencyKey",
+    "capabilityType",
+    "operation",
+  ] as const) {
+    if (!isIdentifier(value[field])) {
+      throw new EffectIntentError(
+        "EFFECT_INTENT_INVALID",
+        `Effect intent field "${field}" must be an identifier`,
+      );
+    }
+  }
+  if (!Number.isSafeInteger(value.attempt) || (value.attempt as number) < 1) {
+    throw new EffectIntentError(
+      "EFFECT_INTENT_INVALID",
+      "Effect intent attempt must be a positive integer",
+    );
+  }
+  if (typeof value.intentDigest !== "string" || !DIGEST_PATTERN.test(value.intentDigest)) {
+    throw new EffectIntentError(
+      "EFFECT_INTENT_INVALID",
+      "Effect intent digest must be a sha256 digest",
+    );
+  }
+  if (!isPlainObject(value.outcome) || typeof value.outcome.kind !== "string") {
+    throw new EffectIntentError(
+      "EFFECT_INTENT_OUTCOME_INVALID",
+      "Effect intent outcome must be an object with a known kind",
+    );
+  }
+  switch (value.outcome.kind) {
+    case "intended":
+      assertClosedKeys(value.outcome, ["kind"], "Intended effect outcome");
+      break;
+    case "no-effect":
+      assertClosedKeys(value.outcome, ["kind", "detail"], "No-effect outcome");
+      if (
+        typeof value.outcome.detail !== "string" ||
+        value.outcome.detail.length === 0 ||
+        value.outcome.detail.length > MAX_OUTCOME_DETAIL_LENGTH
+      ) {
+        throw new EffectIntentError(
+          "EFFECT_INTENT_OUTCOME_INVALID",
+          "A no-effect outcome needs a bounded stated reason",
+        );
+      }
+      break;
+    case "terminal":
+      assertClosedKeys(value.outcome, ["kind", "resultDigest"], "Terminal effect outcome");
+      if (
+        typeof value.outcome.resultDigest !== "string" ||
+        !DIGEST_PATTERN.test(value.outcome.resultDigest)
+      ) {
+        throw new EffectIntentError(
+          "EFFECT_INTENT_OUTCOME_INVALID",
+          "A terminal effect outcome needs a sha256 result digest",
+        );
+      }
+      break;
+    case "unknown":
+      assertClosedKeys(value.outcome, ["kind", "reason"], "Unknown effect outcome");
+      if (
+        typeof value.outcome.reason !== "string" ||
+        value.outcome.reason.length === 0 ||
+        value.outcome.reason.length > MAX_OUTCOME_DETAIL_LENGTH
+      ) {
+        throw new EffectIntentError(
+          "EFFECT_INTENT_OUTCOME_INVALID",
+          "An unknown effect outcome needs a bounded stated reason",
+        );
+      }
+      break;
+    default:
+      throw new EffectIntentError(
+        "EFFECT_INTENT_OUTCOME_INVALID",
+        "Unknown effect outcome kind",
+      );
+  }
+  if (
+    !isCanonicalTimestamp(value.createdAt) ||
+    !isCanonicalTimestamp(value.updatedAt) ||
+    Date.parse(value.updatedAt) < Date.parse(value.createdAt)
+  ) {
+    throw new EffectIntentError(
+      "EFFECT_INTENT_INVALID",
+      "Effect intent timestamps must be canonical and ordered",
+    );
+  }
+}
+
+/** Whether two records identify the same authorization of one logical effect. */
+export function sameEffectIntentRecordIdentity(
+  left: EffectIntentRecord,
+  right: EffectIntentRecord,
+): boolean {
+  return (
+    left.moduleJobId === right.moduleJobId &&
+    left.idempotencyKey === right.idempotencyKey &&
+    left.runId === right.runId &&
+    left.attempt === right.attempt &&
+    left.claimToken === right.claimToken &&
+    left.moduleGenerationId === right.moduleGenerationId
+  );
+}
+
+/** Enforces immutable identity/intent fields and monotonic outcome settlement. */
+export function assertEffectIntentTransition(
+  current: EffectIntentRecord,
+  next: EffectIntentRecord,
+): void {
+  assertEffectIntentRecord(current);
+  assertEffectIntentRecord(next);
+  if (
+    !sameEffectIntentRecordIdentity(current, next) ||
+    current.capabilityType !== next.capabilityType ||
+    current.operation !== next.operation ||
+    current.intentDigest !== next.intentDigest ||
+    current.createdAt !== next.createdAt ||
+    Date.parse(next.updatedAt) < Date.parse(current.updatedAt)
+  ) {
+    throw new EffectIntentError(
+      "EFFECT_INTENT_CONFLICT",
+      "Effect intent immutable fields or update order changed",
+    );
+  }
+  if (sameOutcome(current.outcome, next.outcome)) return;
+  const allowed =
+    current.outcome.kind === "intended" ||
+    (current.outcome.kind === "unknown" &&
+      (next.outcome.kind === "no-effect" || next.outcome.kind === "terminal"));
+  if (!allowed) {
+    throw new EffectIntentError(
+      "EFFECT_INTENT_CONFLICT",
+      "Effect intent outcome transition is not permitted",
+    );
   }
 }
 
@@ -268,6 +473,7 @@ export class EffectIntentJournal {
       createdAt: now,
       updatedAt: now,
     });
+    assertEffectIntentRecord(record);
     if (!this.#store.compareAndSet(undefined, record)) {
       throw new EffectIntentError(
         "EFFECT_INTENT_CONFLICT",
@@ -308,6 +514,7 @@ export class EffectIntentJournal {
       }
     }
     const updated = deepFreeze({ ...existing, outcome, updatedAt: this.#now() });
+    assertEffectIntentTransition(existing, updated);
     if (!this.#store.compareAndSet(existing, updated)) {
       throw new EffectIntentError(
         "EFFECT_INTENT_CONFLICT",
