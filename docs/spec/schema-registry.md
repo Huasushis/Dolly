@@ -539,6 +539,14 @@ falsifiable and none asserts only that a status string was returned.
   `validatorDigest`.
 - **A narrow reserved-name check.** `reserved-content-schema.ts` plus its
   enforcement point in `BlockStore.normalizeInput`, described in Section 8.3.
+- **A product-before-startup registration-set component.**
+  `content-schema-registry.ts` validates derived Extension namespaces, exact
+  publisher and Module-role identity, validator digests, conflicts, value byte
+  limits, and pinned validators. `BlockStore.normalizeInput` can enforce that
+  complete immutable set before allocating a Block identifier. It deliberately
+  cannot establish package provenance: no package manifest version or product
+  startup builder supplies its inputs yet, so its presence is component
+  evidence rather than a supported registry.
 
 ### 11.2 What this contract depends on that does not exist
 

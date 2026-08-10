@@ -12,6 +12,10 @@ import {
   type BlockContent,
   type MediaReferenceItem,
 } from "./block-content.js";
+import {
+  ContentSchemaRegistrationError,
+  type ContentSchemaRegistrationSet,
+} from "./content-schema-registry.js";
 import { ReferenceGraph, type ResourceTarget } from "./reference-graph.js";
 import {
   findReservedSchemaViolation,
@@ -36,6 +40,8 @@ export type BlockStoreErrorCode =
   | "BLOCK_MEDIA_MISMATCH"
   | "BLOCK_MEDIA_RESOLVER_UNAVAILABLE"
   | "BLOCK_RESERVED_SCHEMA_FORBIDDEN"
+  | "SCHEMA_VALUE_INVALID"
+  | "SCHEMA_VALUE_LIMIT_EXCEEDED"
   | "BLOCK_SNAPSHOT_INVALID"
   | "BLOCK_PERSISTENCE_FAILED";
 
@@ -104,6 +110,8 @@ export interface BlockStoreOptions {
    * it authorizes nobody, so a reserved name is refused rather than opened.
    */
   readonly reservedContentSchemas?: ReservedContentSchemaPolicy;
+  /** Complete producer/validator set built from verified installation identity. */
+  readonly contentSchemas?: ContentSchemaRegistrationSet;
   readonly referenceGraph?: ReferenceGraph;
   readonly limits?: Partial<BlockStoreLimits>;
   readonly snapshot?: BlockStoreSnapshot;
@@ -268,6 +276,7 @@ export class BlockStore {
   readonly #now: () => string;
   readonly #media?: MediaReferenceResolver;
   readonly #reservedContentSchemas?: ReservedContentSchemaPolicy;
+  readonly #contentSchemas?: ContentSchemaRegistrationSet;
   readonly #limits: BlockStoreLimits;
   readonly referenceGraph: ReferenceGraph;
   #onMutation: (() => void) | undefined;
@@ -279,7 +288,16 @@ export class BlockStore {
     this.#nextBlockId = options.nextBlockId;
     this.#now = options.now;
     this.#media = options.media;
+    if (
+      options.reservedContentSchemas !== undefined &&
+      options.contentSchemas !== undefined
+    ) {
+      throw new TypeError(
+        "BlockStore cannot combine the interim reserved-name policy with a complete content schema registration set",
+      );
+    }
     this.#reservedContentSchemas = options.reservedContentSchemas;
+    this.#contentSchemas = options.contentSchemas;
     this.referenceGraph = options.referenceGraph ?? new ReferenceGraph();
     this.#onMutation = options.onMutation;
     this.#limits = { ...DEFAULT_LIMITS, ...options.limits };
@@ -380,13 +398,14 @@ export class BlockStore {
   ): ValidatedBlockInput {
     const source = this.validateSource(sourceInput);
     const proposal = normalizeProposal(proposalInput, this.#limits);
-    this.#assertReservedSchemasAuthorized(proposal, source);
+    this.#assertContentSchemasAuthorized(proposal, source);
     return deepFreeze({ proposal, source });
   }
 
   /**
-   * Refuses a proposal carrying a reserved content-item schema its source does
-   * not own.
+   * Refuses a proposal carrying a registered or reserved content-item schema
+   * its source does not own, and applies the pinned value validator and byte
+   * bound when a complete registration set is present.
    *
    * This runs in `normalizeInput`, which is the single gate every Block
    * creation passes through: `commit` and `commitOnce` both call it before
@@ -395,11 +414,32 @@ export class BlockStore {
    * before any commit record exists. Refusing here means a forged boundary is
    * never created and then withdrawn — it never exists at all.
    */
-  #assertReservedSchemasAuthorized(proposal: BlockProposal, source: SourceIdentity): void {
+  #assertContentSchemasAuthorized(proposal: BlockProposal, source: SourceIdentity): void {
     if (proposal.payload.schema !== "dolly.content/1") return;
     // `normalizeProposal` has already parsed and rejected malformed content, so
     // this parse cannot introduce a new failure mode.
     const content = parseBlockContent(proposal.payload.value, this.#limits.maxContentItems);
+    if (this.#contentSchemas !== undefined) {
+      try {
+        this.#contentSchemas.validate(content.items, source);
+      } catch (error) {
+        if (error instanceof ContentSchemaRegistrationError) {
+          if (
+            error.code !== "BLOCK_RESERVED_SCHEMA_FORBIDDEN" &&
+            error.code !== "SCHEMA_VALUE_INVALID" &&
+            error.code !== "SCHEMA_VALUE_LIMIT_EXCEEDED"
+          ) {
+            throw new BlockStoreError(
+              "BLOCK_CONTENT_INVALID",
+              "Content schema registration set failed during commit",
+            );
+          }
+          throw new BlockStoreError(error.code, error.message, error.details);
+        }
+        throw error;
+      }
+      return;
+    }
     const violation = findReservedSchemaViolation(
       content.items,
       source,

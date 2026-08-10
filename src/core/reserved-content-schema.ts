@@ -13,9 +13,10 @@
  * below is a closed constant compiled into Core; nothing can register a new
  * reserved name, claim one at runtime, or supply its own validator. The general
  * registry — publisher authorization, pinned validator digests, and reserved
- * name collisions failing before Module start — is a separate, larger contract
- * that does not exist yet, and inventing a partial one here would give the
- * appearance of authorization without its guarantees.
+ * name collisions failing before Module start — is a separate, larger
+ * contract. A candidate immutable registration set and Block commit check now
+ * exist, but no package manifest or startup builder supplies their provenance;
+ * they are not a product replacement for this interim policy yet.
  *
  * The policy is fail-closed. A deployment that names no producer for a reserved
  * schema authorizes nobody, so forgetting to configure the grant denies the
