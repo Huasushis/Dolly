@@ -7,7 +7,10 @@ import {
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createInstalledReactiveModuleRuntime } from "../../../src/adapters/installed-reactive-module-runtime.js";
+import {
+  composeInstalledReactiveModuleHost,
+  createInstalledReactiveModuleRuntime,
+} from "../../../src/adapters/installed-reactive-module-runtime.js";
 import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
 import { ExtensionInstallationRegistry } from "../../../src/core/extension-installation-registry.js";
 import { createFileCoreStateStoreWithStoppedRecordWriter } from "../../../src/core/file-core-state-store.js";
@@ -213,5 +216,64 @@ describe("installed reactive Module runtime composition", () => {
     })).toThrow(/writer is not bound to its FileCoreStateStore/u);
     expect(first.store.listModuleProcessRecords()).toEqual([]);
     expect(second.store.listModuleProcessRecords()).toEqual([]);
+  });
+
+  it("builds one Scheduler host without accepting a supplied manifest or runtime", () => {
+    const pair = coreState("first");
+    const complete = options(pair);
+    const {
+      configurations: _configurations,
+      core: _core,
+      installations: _installations,
+      instanceConfiguration: _instanceConfiguration,
+      mailboxes,
+      moduleId: _moduleId,
+      monotonicNow: _monotonicNow,
+      stoppedRecordWriter: _stoppedRecordWriter,
+      ...runtime
+    } = complete;
+    const clock = {
+      monotonicNow: () => 0,
+      schedule: () => ({ cancel: () => undefined }),
+    };
+    const scheduling = {
+      maxConcurrentModules: 1,
+      backpressureAction: "pause-upstream" as const,
+      downstreamRecheckMs: 100,
+      noProgressAfterMs: 5_000,
+      claimLimitCount: 1,
+      claimLimitBytes: 1024,
+      retryJitterRatio: 0,
+      lowWatermarkRatio: 1,
+    };
+    const composed = composeInstalledReactiveModuleHost({
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
+      mailboxes,
+      clock,
+      scheduling,
+      runtime,
+    });
+
+    expect(composed.host.state).toBe("created");
+    expect(composed.installedRuntime.runtime.moduleGenerationId)
+      .toBe("module-generation-a");
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
+    expect(() => composeInstalledReactiveModuleHost({
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
+      mailboxes: [{
+        ...mailboxes[0]!,
+        pageIds: ["output"],
+      }],
+      clock,
+      scheduling,
+      runtime,
+    })).toThrow(/mailbox Pages do not match Module worker/u);
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
 });

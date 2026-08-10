@@ -59,7 +59,8 @@ fi
 # though its parent is the service main process.
 VITEST_POOL="forks"
 for test_file in "${TEST_FILES[@]}"; do
-  if [ "${test_file}" = "tests/conformance/security/linux-extension-module-executor-integration.test.ts" ]; then
+  if [ "${test_file}" = "tests/conformance/security/linux-extension-module-executor-integration.test.ts" ] ||
+     [ "${test_file}" = "tests/conformance/security/installed-reactive-module-host-integration.test.ts" ]; then
     VITEST_POOL="threads"
   fi
 done
