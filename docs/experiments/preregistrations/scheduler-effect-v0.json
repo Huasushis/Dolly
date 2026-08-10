@@ -1,0 +1,173 @@
+{
+  "schemaVersion": "dolly.experiment-preregistration/0",
+  "experimentId": "scheduler-effect-v0",
+  "status": "locked-before-first-run",
+  "lockedAt": "2026-08-09T00:00:00Z",
+  "ownerIntentSources": [
+    ".qoder/specs/dolly_new.txt:17-46",
+    ".qoder/specs/dolly_owner_addendum_20260801.txt"
+  ],
+  "plainLanguageQuestion": "When Modules consume every currently queued Block serially and emit at most one Block to all output Pages, which scheduling rule best matches production rate to downstream processing capacity without avoidable latency, empty calls, unfairness, unstable queues, or hidden no-progress states?",
+  "scope": {
+    "inScope": [
+      "a deterministic discrete-event model of Page broadcast and Module activation",
+      "a small real-timer line-graph probe using Node.js timers",
+      "fixed-period, pure event-driven, queue-watermark, and downstream backlog/service-time adaptive-period policies",
+      "line, fan-out, fan-in, cycle, and self-loop graphs",
+      "different service rates, output sizes, load shocks, duplicate delivery occurrence counts, arrivals during a run, serial execution, and explicit too-fast/too-slow Module feedback"
+    ],
+    "outOfScope": [
+      "starting Dolly's product Module runtime",
+      "changing or bypassing the Module migration refusal",
+      "proving crash safety, durable delivery, process isolation, or production support",
+      "selecting final production constants",
+      "language-model quality"
+    ]
+  },
+  "hypotheses": [
+    {
+      "id": "H1",
+      "prediction": "Pure event-driven activation has fewer empty calls and at least 10% lower p95 latency than fixed-period activation under stable light load, without lower throughput."
+    },
+    {
+      "id": "H2",
+      "prediction": "The queue-watermark policy reduces Module calls by at least 15% under sustained load but increases p95 latency by at least 10% under light load relative to pure event-driven activation."
+    },
+    {
+      "id": "H3",
+      "prediction": "The downstream backlog/service-time adaptive-period policy reduces peak queued bytes by at least 15% or recovery time by at least 20 ms in shock and large-output workloads relative to pure event-driven activation, while losing no more than 10% throughput."
+    },
+    {
+      "id": "H4",
+      "prediction": "Ignoring queued bytes or averaging fan-out pressure causes at least one large-output or heterogeneous fan-out case to cross a queue bound, take at least 20% longer to recover, or retain at least 15% more queued bytes than the full adaptive policy."
+    },
+    {
+      "id": "H5",
+      "prediction": "Using explicit too-fast/too-slow feedback reduces out-of-preferred-cadence calls by at least 20% relative to the same adaptive policy with feedback removed."
+    },
+    {
+      "id": "H6",
+      "prediction": "At least one cyclic or self-loop workload demonstrates that activation timing alone cannot guarantee progress; the probe must expose rather than hide sustained no-progress or backpressure."
+    }
+  ],
+  "policies": [
+    {
+      "id": "fixed-period",
+      "rule": "Every Module receives a tick every 20 ms. A busy Module never overlaps itself; missed ticks are counted and coalesced. An idle Module is invoked even with empty input, so empty calls are measured rather than suppressed."
+    },
+    {
+      "id": "event-driven",
+      "rule": "An idle Module with pending input becomes eligible immediately. It is never invoked with empty input. Queue and output backpressure remain independent hard limits."
+    },
+    {
+      "id": "queue-watermark",
+      "rule": "An idle Module becomes eligible when pending record count reaches 4, pending serialized bytes reach 49152, or the oldest pending record reaches 35 ms. This is byte-aware and has a finite age bound."
+    },
+    {
+      "id": "downstream-backlog-service-adaptive-period",
+      "rule": "Each Module has an eligibility interval initially 8 ms, bounded to 1..80 ms. Every 10 ms control sample computes, for each direct downstream, the maximum of pending-count ratio, pending-byte ratio, arrivals-during-last-run/input-count ratio, and last service-time/15 ms. Fan-out uses the maximum downstream pressure. Pressure >=0.8 multiplies the upstream interval by 1.5; pressure <=0.25 subtracts 1 ms; otherwise it holds. Eligibility still requires pending input. Explicit too-fast feedback multiplies the reporting Module's interval by 1.5 and raises it to its preferred minimum; too-slow feedback subtracts 2 ms. When feedback and downstream pressure conflict, the longer interval wins and the conflict is recorded."
+    }
+  ],
+  "ablations": [
+    {
+      "id": "adaptive-count-only",
+      "removedFactor": "pending bytes, service time, and arrivals during the run"
+    },
+    {
+      "id": "adaptive-mean-fanout",
+      "removedFactor": "worst-downstream aggregation; arithmetic mean is used"
+    },
+    {
+      "id": "adaptive-no-module-feedback",
+      "removedFactor": "explicit too-fast and too-slow feedback"
+    }
+  ],
+  "data": {
+    "simulationTopologies": ["line", "fan-out", "fan-in", "cycle", "self-loop"],
+    "loadProfiles": {
+      "stable": "12 ms nominal source inter-arrival with deterministic seeded +/-20% jitter",
+      "shock": "20 ms nominal before 300 ms, 5 ms from 300 through 650 ms, then 20 ms through the 1200 ms horizon, with deterministic seeded +/-20% jitter"
+    },
+    "simulationHorizonMs": 1200,
+    "queueLimits": {
+      "recordsPerModule": 12,
+      "serializedBytesPerModule": 131072
+    },
+    "cycleHopLimit": 8,
+    "selfLoopHopLimit": 6,
+    "realTimerProbe": "A line graph receives a stable/shock arrival sequence for 500 ms and drains for 300 ms. It uses actual Node.js setTimeout timing; it is a portability smoke check, not deterministic correctness evidence.",
+    "sourceData": "Synthetic only; no model, owner endpoint, key, or private service is used."
+  },
+  "backend": {
+    "simulation": "Node.js deterministic discrete-event loop with integer microsecond ordering represented as floating-point milliseconds",
+    "realTiming": "Node.js 20 setTimeout and performance.now",
+    "models": []
+  },
+  "seeds": [104729, 130363, 155921],
+  "repetitions": {
+    "simulationPerCase": 3,
+    "realTimingPerPolicy": 3
+  },
+  "metrics": [
+    {"id": "throughputPerSecond", "definition": "terminal delivery occurrences divided by observed seconds"},
+    {"id": "p95LatencyMs", "definition": "nearest-rank p95 from external arrival to terminal consumption, retaining duplicate occurrence counts"},
+    {"id": "peakQueuedRecords", "definition": "maximum pending queue record count summed over Modules"},
+    {"id": "peakQueuedBytes", "definition": "maximum pending serialized bytes summed over Modules"},
+    {"id": "fairnessJain", "definition": "minimum Jain fairness index across source acceptance counts and terminal Module occurrence counts; singleton sets equal 1"},
+    {"id": "emptyCalls", "definition": "Module starts with zero pending records"},
+    {"id": "stabilityTimeMs", "definition": "first pre-shock time after which total queued bytes remain at or below 25% of aggregate byte capacity for 100 ms; null if absent"},
+    {"id": "recoveryTimeMs", "definition": "time after the 650 ms shock end until total queued bytes remains at or below 25% of aggregate byte capacity for 100 ms; null if absent"},
+    {"id": "deadlock", "definition": "pending or blocked work exists but no executable event capable of changing it remains"},
+    {"id": "noProgress", "definition": "pending or blocked work exists and no terminal occurrence is consumed for at least 150 ms"},
+    {"id": "serialViolations", "definition": "a Module starts while that same Module is already running or blocked on output"},
+    {"id": "arrivalsDuringRun", "definition": "records delivered to a Module after its batch was claimed and before its output committed"},
+    {"id": "duplicateOccurrencesMerged", "definition": "additional occurrences merged into an existing same-Block queue record"},
+    {"id": "feedbackOutsidePreferredCadence", "definition": "sum of too-fast and too-slow Module feedback reports"}
+  ],
+  "minimumMeaningfulDifferences": {
+    "throughputRelative": 0.05,
+    "p95LatencyRelative": 0.10,
+    "peakQueuedBytesRelative": 0.15,
+    "emptyCallsRelative": 0.20,
+    "recoveryTimeMs": 20,
+    "fairnessJainAbsolute": 0.05,
+    "feedbackOutsidePreferredCadenceRelative": 0.20
+  },
+  "invariants": [
+    "serialViolations equals zero",
+    "every emitted output is zero or one Block per Module run",
+    "one output Block is broadcast atomically to all configured targets or remains blocked",
+    "same Block identifiers delivered more than once to one Module occupy one queue record and increase occurrence count",
+    "arrivals while a Module runs remain queued for a later run",
+    "no policy silently drops work when a finite queue bound is reached"
+  ],
+  "analysis": {
+    "primaryUnit": "one topology/load/policy/seed case",
+    "pairing": "compare policies within identical topology, load profile, and seed",
+    "aggregation": "report every case and median paired deltas; do not replace case-level failures with an overall mean",
+    "independentCheck": "an analyzer rereads raw JSONL, reconstructs key metrics, and rejects disagreement with the run-end record",
+    "realTimingUse": "report each repetition and timer slip; do not pool it with deterministic simulation"
+  },
+  "decisionRules": [
+    "Any serial violation, silent loss, duplicate-count mismatch, or atomic-broadcast violation rejects that implementation independent of performance.",
+    "No policy becomes a default from this probe. A policy is only a candidate when its predicted advantage exceeds the frozen minimum meaningful difference in at least two relevant topology/load pairs without a safety failure or more than 10% throughput loss.",
+    "If pure event-driven activation wins latency and empty-call metrics without overload, retain it as the simple reactive baseline.",
+    "If watermark batching saves calls but harms light-load latency, expose batching as an explicit workload choice rather than a universal default.",
+    "If full adaptive control beats its ablations only in heterogeneous fan-out or large-byte cases, restrict later engineering to those pressure signals and do not generalize it to every Module.",
+    "If cyclic cases show no progress, add explicit dependency-cycle/no-progress detection; do not tune timing constants to conceal it.",
+    "Contradictory or sub-threshold results preserve the simple baseline and trigger a revised preregistration before more tuning."
+  ],
+  "stoppingRules": [
+    "Run the complete frozen matrix once for all three seeds; do not stop when a favored policy wins.",
+    "Stop a case at 1200 ms simulation time plus a 400 ms drain window, or earlier only on an explicit deadlock with no state-changing event.",
+    "Do not retune thresholds after seeing results in this version.",
+    "Abort the whole run if raw JSONL cannot be written, invariant accounting disagrees, or the independent analyzer disagrees with any frozen key metric."
+  ],
+  "artifacts": {
+    "probeDirectory": "scripts/experiments/probes/scheduler-effect-v0",
+    "rawDirectory": "artifacts/experiments/probes/scheduler-effect-v0/raw",
+    "summary": "artifacts/experiments/probes/scheduler-effect-v0/summary.json",
+    "manifest": "artifacts/experiments/probes/scheduler-effect-v0/manifest.json",
+    "report": "docs/research/scheduler-effect-v0.md"
+  }
+}
