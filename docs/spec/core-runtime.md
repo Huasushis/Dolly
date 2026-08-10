@@ -451,12 +451,22 @@ submissions, Claim terminal transitions, and result effects therefore cannot be
 supplied from different Core stores. The restricted stopped-record writer must
 prove that it came from the same store, and result commits require the durable
 file repository rather than an in-memory test repository. Runtime limits,
-routes, timeouts, and configuration come from the resolved Module record. This
-first boundary accepts only `declaredExternalEffects: "none"` and no permission
-policy identifiers; it grants no effect capability. A capability-bearing Agent
-requires a later host-owned permission and durable-effect composition instead
-of an arbitrary setup callback. The runtime is returned unstarted and product
-bootstrap still does not consume it.
+routes, timeouts, and configuration come from the resolved Module record.
+Because ordinary process isolation cannot prove that Extension code avoided
+ambient filesystem, network, or subprocess effects, this boundary no longer
+accepts an external-effect declaration or effect evidence from its caller. It
+rejects either field before executor construction. Until the closed instance
+configuration in Section 5.2 exists, it records the conservative
+`"core-capabilities-only"` disposition and supplies no evidence source, so any
+submitted Run without a committed result is preserved for recovery rather than
+automatically retried or dead-lettered. This interim record value is not
+evidence that process isolation blocked ambient effects and grants no
+capability. The boundary still rejects non-empty permission-policy identifiers,
+and the installed package format currently requires an empty
+requested-capability list. A capability-bearing Agent requires a later
+host-owned permission and durable-effect composition instead of an arbitrary
+setup callback. The runtime is returned unstarted and product bootstrap still
+does not consume it.
 
 ### 5.2 Proposed Linux Module process limits
 
@@ -534,6 +544,10 @@ startup recovery already applies the disposition rules that depend on it. The
 configuration half does not exist yet: no released instance schema accepts
 `linuxProcessLimits` or `declaredExternalEffects`, so today no operator can
 supply the declaration and no Module can be activated to produce a record.
+The candidate installed-process factory therefore cannot select either
+operator assertion. It uses the preserve-only interim behavior described in
+Section 5.1 and refuses caller-supplied declarations and evidence. This is a
+fail-closed bridge, not an implementation of `dolly.instance/10`.
 
 ## 6. Block model
 

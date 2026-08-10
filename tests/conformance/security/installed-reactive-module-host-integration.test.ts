@@ -403,7 +403,6 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
           binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
-          declaredExternalEffects: "none",
           launcher: {
             interpreterProgram: PYTHON,
             launcherScriptPath: defaultLauncherScriptPath(),
@@ -450,7 +449,11 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           ),
         ).toBe(processGenerationIds[index]);
         expect(coreState.store.getModuleProcessRecord(processGenerationIds[index]!))
-          .toMatchObject({ state: "running", packageDigest: installed.packageDigest });
+          .toMatchObject({
+            state: "running",
+            packageDigest: installed.packageDigest,
+            declaredExternalEffects: "core-capabilities-only",
+          });
         expect(existsSync(moduleCgroupPaths[index]!)).toBe(true);
       });
 

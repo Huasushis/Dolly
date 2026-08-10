@@ -301,7 +301,6 @@ describe("installed Extension Module resolution", () => {
         createdAt: "2026-08-10T00:00:00.000Z",
         updatedAt: "2026-08-10T00:00:00.000Z",
       },
-      declaredExternalEffects: "none",
       launcher: {
         interpreterProgram: "/usr/bin/python3",
         launcherScriptPath: "/opt/dolly/launcher.py",
@@ -326,6 +325,7 @@ describe("installed Extension Module resolution", () => {
     });
     expect(processRecord.processGenerationId).toBe(PROCESS_IDENTITY.processGenerationId);
     expect(processRecord.moduleGenerationId).toBe(MODULE_GENERATION_ID);
+    expect(processRecord.declaredExternalEffects).toBe("core-capabilities-only");
     expect(derived.executorOptions.lifecycle.execution).toEqual({
       program: process.execPath,
       argumentVector: [process.execPath, installed.entrypointPath],
@@ -381,7 +381,6 @@ describe("installed Extension Module resolution", () => {
         createdAt: "2026-08-10T00:00:00.000Z",
         updatedAt: "2026-08-10T00:00:00.000Z",
       },
-      declaredExternalEffects: "none" as const,
       launcher: {
         interpreterProgram: "/usr/bin/python3",
         launcherScriptPath: "/opt/dolly/launcher.py",
@@ -395,6 +394,13 @@ describe("installed Extension Module resolution", () => {
       channelCloseTimeoutMs: 1_000,
     };
 
+    const callerEffectDeclaration = {
+      ...base,
+      declaredExternalEffects: "none" as const,
+    };
+    expect(() => deriveInstalledLinuxExtensionModuleExecutor(
+      callerEffectDeclaration,
+    )).toThrow(/cannot accept a caller-supplied external-effect declaration/u);
     expect(() => deriveInstalledLinuxExtensionModuleExecutor({
       ...base,
       lifecycle: {
@@ -512,7 +518,6 @@ describe("installed Extension Module resolution", () => {
         },
         maxOpenFiles: 64,
       },
-      declaredExternalEffects: "none",
       launcher: {
         interpreterProgram: "/usr/bin/python3",
         launcherScriptPath: "/opt/dolly/launcher.py",

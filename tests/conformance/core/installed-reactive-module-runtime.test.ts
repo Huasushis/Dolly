@@ -206,7 +206,6 @@ describe("installed reactive Module runtime composition", () => {
         },
         maxOpenFiles: 64,
       },
-      declaredExternalEffects: "none" as const,
       launcher: {
         interpreterProgram: "/usr/bin/python3",
         launcherScriptPath: "/opt/dolly/launcher.py",
@@ -291,7 +290,7 @@ describe("installed reactive Module runtime composition", () => {
       processGenerationId,
       packageDigest: installed.packageDigest,
       configurationReference: reference,
-      declaredExternalEffects: "none",
+      declaredExternalEffects: "core-capabilities-only",
       serviceInvocationId: BINDING.serviceInvocationId,
       bootId: BINDING.bootId,
       moduleCgroupPath: deriveModuleCgroupPath(BINDING.delegatedRootCgroupPath, {
@@ -407,6 +406,26 @@ describe("installed reactive Module runtime composition", () => {
     })).toThrow(/writer is not bound to its FileCoreStateStore/u);
     expect(first.store.listModuleProcessRecords()).toEqual([]);
     expect(second.store.listModuleProcessRecords()).toEqual([]);
+  });
+
+  it("rejects caller-supplied external-effect recovery claims", () => {
+    const pair = coreState("effect-claim");
+    const callerDeclaredNone = {
+      ...options(pair),
+      declaredExternalEffects: "none" as const,
+    };
+    const callerEvidence = {
+      ...options(pair),
+      externalEffectEvidence: {
+        inspectRunEffects: async () => ({ kind: "no-effect" as const }),
+      },
+    };
+
+    expect(() => createInstalledReactiveModuleRuntime(callerDeclaredNone))
+      .toThrow(/cannot accept caller-supplied external-effect recovery inputs/u);
+    expect(() => createInstalledReactiveModuleRuntime(callerEvidence))
+      .toThrow(/cannot accept caller-supplied external-effect recovery inputs/u);
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
 
   it("builds one Scheduler host without accepting a supplied manifest or runtime", async () => {

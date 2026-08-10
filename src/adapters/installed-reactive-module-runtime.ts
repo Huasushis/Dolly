@@ -1,7 +1,6 @@
 import {
   consumeCoreStartupRecoveryHandoff,
   type CoreStartupRecoveryHandoff,
-  type ExternalEffectEvidenceSource,
 } from "../core/core-startup-recovery.js";
 import type { DeliveryMailboxCapacity, FailureClassification } from "../core/delivery-store.js";
 import type { ExtensionInstallationRegistry } from "../core/extension-installation-registry.js";
@@ -34,6 +33,7 @@ import {
 import type { DollyInstanceConfig } from "../core/runtime-config.js";
 import {
   createInstalledLinuxExtensionModuleGenerationFactory,
+  INSTALLED_PROCESS_EFFECT_DECLARATION,
   type InstalledLinuxExtensionModuleGenerationFactory,
   type InstalledLinuxExtensionModuleGenerationFactoryOptions,
 } from "./installed-linux-extension-module-executor.js";
@@ -52,7 +52,6 @@ export interface InstalledReactiveModuleRuntimeOptions extends Omit<
   | "cancellationGraceMs"
   | "configureHost"
   | "configurations"
-  | "declaredExternalEffects"
   | "executionTimeoutMs"
   | "host"
   | "installations"
@@ -77,12 +76,9 @@ export interface InstalledReactiveModuleRuntimeOptions extends Omit<
   readonly monotonicNow: () => number;
   readonly lifecycle: InstalledRuntimeLifecycleOptions;
   readonly host: InstalledRuntimeHostOptions;
-  /** The first installed runtime grants no effect capability. */
-  readonly declaredExternalEffects: "none";
   readonly classifyFailure: (
     failure: ReactiveModuleFailure,
   ) => FailureClassification;
-  readonly externalEffectEvidence?: ExternalEffectEvidenceSource;
   readonly onActorEvent?: (event: ModuleActorEvent) => void;
   readonly afterCommitEffect?: (
     event: ModuleResultCommitHookEvent,
@@ -121,6 +117,14 @@ function createInstalledReactiveModuleRuntimeInternal(
     readonly initialDeferredCommit?: DeferredModuleResultCommit;
   },
 ): InstalledReactiveModuleRuntime {
+  if (
+    Object.hasOwn(options, "declaredExternalEffects") ||
+    Object.hasOwn(options, "externalEffectEvidence")
+  ) {
+    throw new TypeError(
+      "Installed Module runtime cannot accept caller-supplied external-effect recovery inputs",
+    );
+  }
   if (Object.getPrototypeOf(options.core) !== FileCoreStateStore.prototype) {
     throw new TypeError("Installed Module runtime requires one direct FileCoreStateStore");
   }
@@ -173,7 +177,8 @@ function createInstalledReactiveModuleRuntimeInternal(
       processRecord.configurationReference.configId !== reference.configId ||
       processRecord.configurationReference.revision !== reference.revision ||
       processRecord.configurationReference.configVersion !== reference.configVersion ||
-      processRecord.declaredExternalEffects !== options.declaredExternalEffects
+      processRecord.declaredExternalEffects !==
+        INSTALLED_PROCESS_EFFECT_DECLARATION
     ) {
       throw new TypeError(
         "Deferred Module result does not match its stopped installed process, package, configuration, and effect declaration",
@@ -205,7 +210,6 @@ function createInstalledReactiveModuleRuntimeInternal(
       records: options.core,
       stoppedRecordWriter: options.stoppedRecordWriter,
     },
-    declaredExternalEffects: options.declaredExternalEffects,
     launcher: options.launcher,
     host: {
       ...options.host,
@@ -280,10 +284,7 @@ function createInstalledReactiveModuleRuntimeInternal(
       : { initialDeferredCommit: options.initialDeferredCommit }),
     nextModuleGenerationId: options.nextModuleGenerationId,
     monotonicNow: options.monotonicNow,
-    declaredExternalEffects: options.declaredExternalEffects,
-    ...(options.externalEffectEvidence === undefined
-      ? {}
-      : { externalEffectEvidence: options.externalEffectEvidence }),
+    declaredExternalEffects: INSTALLED_PROCESS_EFFECT_DECLARATION,
     createExecutor: generations.createExecutor,
     classifyFailure: options.classifyFailure,
     ...(options.onActorEvent === undefined

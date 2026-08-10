@@ -552,7 +552,6 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
         limits: LIMITS,
         maxOpenFiles: 64,
       },
-      declaredExternalEffects: "none",
       launcher: {
         interpreterProgram: PYTHON,
         launcherScriptPath: defaultLauncherScriptPath(),
@@ -613,6 +612,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       state: "running",
       packageDigest: installed.packageDigest,
       configurationReference: instanceConfiguration.modules[0]?.configurationReference,
+      declaredExternalEffects: "core-capabilities-only",
       serviceInvocationId: inspectedBinding.binding.serviceInvocationId,
       bootId: inspectedBinding.binding.bootId,
     });

@@ -10,7 +10,6 @@ import type { ModuleExecutor } from "../core/module-actor.js";
 import type { ModuleConfigurationStore } from "../core/module-configuration-store.js";
 import {
   assertValidModuleProcessRecord,
-  type DeclaredExternalEffects,
   type ModuleProcessRecord,
 } from "../core/module-process-records.js";
 import type { ReactiveModuleInput } from "../core/reactive-module-input.js";
@@ -45,7 +44,6 @@ export interface InstalledLinuxExtensionModuleExecutorOptions {
   readonly binding: VerifiedCoreServiceBinding;
   readonly lifecycle: InstalledLifecycleOptions;
   readonly processRecord: ProcessRecordDetails;
-  readonly declaredExternalEffects: DeclaredExternalEffects;
   readonly launcher: InstalledLauncherOptions;
   readonly host: InstalledHostOptions;
   readonly executionTimeoutMs: number;
@@ -58,6 +56,15 @@ export interface InstalledLinuxExtensionModuleExecutorOptions {
   readonly configureHost?: LinuxExtensionModuleExecutorOptions["configureHost"];
   readonly onStandardErrorChunk?: LinuxExtensionModuleExecutorOptions["onStandardErrorChunk"];
 }
+
+/**
+ * Ordinary process isolation cannot prove the absence of ambient effects.
+ * Until a closed instance schema and effect-evidence composition exist, an
+ * installed process is recorded in the disposition that preserves submitted
+ * failures instead of treating them as safe to retry.
+ */
+export const INSTALLED_PROCESS_EFFECT_DECLARATION =
+  "core-capabilities-only" as const;
 
 export interface InstalledLinuxExtensionModuleExecutorDerivation {
   readonly resolvedModule: InstalledExtensionModule;
@@ -83,6 +90,11 @@ function assertNoDerivedFields(
 export function deriveInstalledLinuxExtensionModuleExecutor(
   options: InstalledLinuxExtensionModuleExecutorOptions,
 ): InstalledLinuxExtensionModuleExecutorDerivation {
+  if (Object.hasOwn(options, "declaredExternalEffects")) {
+    throw new TypeError(
+      "Installed Linux Extension executor cannot accept a caller-supplied external-effect declaration",
+    );
+  }
   assertNoDerivedFields(
     options.lifecycle,
     ["delegatedRootCgroupPath", "execution", "processRecord"],
@@ -148,7 +160,7 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     configurationReference: Object.freeze({
       ...resolvedModule.module.configurationReference,
     }),
-    declaredExternalEffects: options.declaredExternalEffects,
+    declaredExternalEffects: INSTALLED_PROCESS_EFFECT_DECLARATION,
     serviceInvocationId: options.binding.serviceInvocationId,
     bootId: options.binding.bootId,
     moduleCgroupPath: derivedCgroupPath,

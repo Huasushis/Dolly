@@ -263,6 +263,15 @@ this first path, even when an operator calls it trusted: a later design may
 expose an explicit audited manual workflow, but it must not treat absence of a
 submission record as proof that such an Extension made no effect.
 
+The current installed-process candidate does not yet have the configuration
+field that could carry that audited assertion. It therefore rejects a caller's
+external-effect declaration or evidence source and uses a conservative durable
+disposition with no retry-safety evidence. A submitted failure remains an
+unknown outcome. This keeps the candidate useful for successful Scheduler and
+Linux lifecycle tests without claiming that process isolation enforces a
+no-effect policy; it is not sufficient to remove the public Module startup
+refusal.
+
 ### Attaching the protocol transport to the launcher child
 
 This decision keeps `ExtensionProcessHost` in Core and keeps each Module a
