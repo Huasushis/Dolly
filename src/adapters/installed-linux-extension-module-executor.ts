@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ExtensionInstallationRegistry } from "../core/extension-installation-registry.js";
 import {
   resolveInstalledExtensionModule,
@@ -211,4 +212,123 @@ export function createInstalledLinuxExtensionModuleExecutor(
   return createLinuxExtensionModuleExecutor(
     deriveInstalledLinuxExtensionModuleExecutor(options).executorOptions,
   );
+}
+
+type InstalledGenerationLifecycleOptions = Omit<InstalledLifecycleOptions, "identity">;
+
+export interface InstalledLinuxExtensionModuleGenerationFactoryOptions extends Omit<
+  InstalledLinuxExtensionModuleExecutorOptions,
+  "lifecycle" | "moduleGenerationId" | "processRecord"
+> {
+  readonly lifecycle: InstalledGenerationLifecycleOptions;
+  /** Generates one never-reused process identity for each Module generation. */
+  readonly nextProcessGenerationId?: () => string;
+  /** Supplies the process-record timestamp without mixing it with monotonic scheduling time. */
+  readonly wallClockNow?: () => number;
+}
+
+export interface InstalledLinuxExtensionModuleGenerationFactory {
+  readonly createExecutor: (
+    moduleGenerationId: string,
+  ) => ModuleExecutor<ReactiveModuleInput, ReactiveModuleResult>;
+  /**
+   * Returns the exact process generation that owns submissions from this
+   * Module generation. It is unavailable until `createExecutor` succeeds.
+   */
+  readonly processGenerationIdFor: (moduleGenerationId: string) => string;
+}
+
+function processGenerationTimestamp(wallClockNow: () => number): string {
+  const milliseconds = wallClockNow();
+  if (!Number.isSafeInteger(milliseconds) || milliseconds < 0) {
+    throw new TypeError("Module process record wall clock must be a non-negative safe integer");
+  }
+  try {
+    return new Date(milliseconds).toISOString();
+  } catch {
+    throw new TypeError("Module process record wall clock is outside the ISO timestamp range");
+  }
+}
+
+/**
+ * Owns the one-to-one Module-generation to process-generation mapping used by
+ * both executor creation and durable submission records. Creating the factory
+ * or an executor starts no process; `ModuleActor` remains the owner of start.
+ */
+export function createInstalledLinuxExtensionModuleGenerationFactory(
+  options: InstalledLinuxExtensionModuleGenerationFactoryOptions,
+): InstalledLinuxExtensionModuleGenerationFactory {
+  const {
+    lifecycle,
+    nextProcessGenerationId: nextProcessGenerationIdOption,
+    wallClockNow: wallClockNowOption,
+    ...fixedOptions
+  } = options;
+  const initiallyResolved = resolveInstalledExtensionModule({
+    instanceConfiguration: fixedOptions.instanceConfiguration,
+    moduleId: fixedOptions.moduleId,
+    installations: fixedOptions.installations,
+    configurations: fixedOptions.configurations,
+  });
+  const nextProcessGenerationId = nextProcessGenerationIdOption ??
+    (() => `process-${randomUUID()}`);
+  const wallClockNow = wallClockNowOption ?? Date.now;
+  const processByModuleGeneration = new Map<string, string>();
+  const usedProcessGenerations = new Set<string>();
+
+  const createExecutor = (
+    moduleGenerationId: string,
+  ): ModuleExecutor<ReactiveModuleInput, ReactiveModuleResult> => {
+    if (processByModuleGeneration.has(moduleGenerationId)) {
+      throw new TypeError(
+        `Module generation ${moduleGenerationId} already has an installed Linux executor`,
+      );
+    }
+    const processGenerationId = nextProcessGenerationId();
+    if (
+      usedProcessGenerations.has(processGenerationId) ||
+      lifecycle.records.getModuleProcessRecord(processGenerationId) !== undefined
+    ) {
+      throw new TypeError(
+        `Process generation ${processGenerationId} has already been used`,
+      );
+    }
+    // Reserve even an invalid generated value locally. A generator that emits
+    // it again remains fail-closed instead of turning a failed construction
+    // into an identity-reuse path.
+    usedProcessGenerations.add(processGenerationId);
+    const timestamp = processGenerationTimestamp(wallClockNow);
+    const derived = deriveInstalledLinuxExtensionModuleExecutor({
+      ...fixedOptions,
+      moduleGenerationId,
+      lifecycle: {
+        ...lifecycle,
+        identity: {
+          instanceId: initiallyResolved.instanceId,
+          moduleId: initiallyResolved.module.moduleId,
+          processGenerationId,
+        },
+      },
+      processRecord: {
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      },
+    });
+    const executor = createLinuxExtensionModuleExecutor(derived.executorOptions);
+    processByModuleGeneration.set(moduleGenerationId, processGenerationId);
+    return executor;
+  };
+
+  return Object.freeze({
+    createExecutor,
+    processGenerationIdFor: (moduleGenerationId: string): string => {
+      const processGenerationId = processByModuleGeneration.get(moduleGenerationId);
+      if (processGenerationId === undefined) {
+        throw new TypeError(
+          `Module generation ${moduleGenerationId} does not have a process generation`,
+        );
+      }
+      return processGenerationId;
+    },
+  });
 }

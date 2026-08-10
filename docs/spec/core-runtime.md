@@ -426,6 +426,16 @@ integration, live Linux control-group ownership, restart recovery, or orderly
 product shutdown. `openDollyRuntime` does not call either function and retains
 the configured-Module refusal in Section 5.1.
 
+`createInstalledLinuxExtensionModuleGenerationFactory` owns the next narrower
+identity rule. It creates at most one executor for each non-reused Module
+generation, gives each one a distinct process generation absent from the
+durable process-record store, and exposes the exact mapping that a future
+product composer must use when persisting a Run submission. Thus executor
+creation and submission authorization cannot capture two different process
+identities. This factory still does not persist or start the process by itself;
+`ModuleActor` and the Linux lifecycle remain the only owners of those actions.
+The current product bootstrap does not construct the factory.
+
 ### 5.2 Proposed Linux Module process limits
 
 This section defines the configuration required before the first Linux Module

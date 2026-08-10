@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createInstalledLinuxExtensionModuleExecutor,
+  createInstalledLinuxExtensionModuleGenerationFactory,
   deriveInstalledLinuxExtensionModuleExecutor,
   type InstalledLinuxExtensionModuleExecutorOptions,
 } from "../../../src/adapters/installed-linux-extension-module-executor.js";
@@ -455,5 +456,84 @@ describe("installed Extension Module resolution", () => {
       instanceConfiguration: instanceConfiguration("2.0.0", configuration.revision),
     })).toThrow(/Untrusted extensions require sandbox/u);
     expect(base.lifecycle.records.appendModuleProcessRecord).not.toHaveBeenCalled();
+  });
+
+  it("binds every Module generation to one new process generation", () => {
+    const source = resolve(scratch, "source-v1");
+    writePackage(source, "1.0.0");
+    installations.installNodePackage({ sourceDirectory: source, trust: "trusted" });
+    const configuration = configurations.create({
+      configId: "worker-config",
+      extensionId: "org.example.installed",
+      moduleKind: "transform",
+      configVersion: 1,
+      schema: CONFIGURATION_SCHEMA,
+      configuration: { prefix: "verified" },
+    });
+    const records = recordStore();
+    vi.mocked(records.getModuleProcessRecord).mockImplementation((processGenerationId) =>
+      processGenerationId === "process-installed-existing"
+        ? ({} as ModuleProcessRecord)
+        : undefined
+    );
+    const processGenerationIds = [
+      "process-installed-a",
+      "process-installed-b",
+      "process-installed-b",
+      "process-installed-existing",
+    ];
+    let nextProcessGeneration = 0;
+    const factory = createInstalledLinuxExtensionModuleGenerationFactory({
+      instanceConfiguration: instanceConfiguration("1.0.0", configuration.revision),
+      moduleId: "worker",
+      installations,
+      configurations,
+      binding: CORE_BINDING,
+      lifecycle: {
+        records,
+        stoppedRecordWriter: stoppedRecordWriter(),
+        limits: {
+          memoryMaxBytes: 64 * 1_024 * 1_024,
+          maxProcesses: 16,
+          cpuQuotaMicros: 50_000,
+          cpuPeriodMicros: 100_000,
+        },
+        maxOpenFiles: 64,
+      },
+      declaredExternalEffects: "none",
+      launcher: {
+        interpreterProgram: "/usr/bin/python3",
+        launcherScriptPath: "/opt/dolly/launcher.py",
+      },
+      host: {
+        isolationPolicy: new ExtensionIsolationPolicy(),
+      },
+      executionTimeoutMs: 1_000,
+      cancellationGraceMs: 250,
+      terminationTimeoutMs: 2_000,
+      channelCloseTimeoutMs: 1_000,
+      nextProcessGenerationId: () => {
+        const processGenerationId = processGenerationIds[nextProcessGeneration++];
+        if (processGenerationId === undefined) throw new Error("test IDs exhausted");
+        return processGenerationId;
+      },
+      wallClockNow: () => Date.parse("2026-08-10T00:00:00.000Z"),
+    });
+
+    expect(() => factory.processGenerationIdFor("module-generation-a"))
+      .toThrow(/does not have a process generation/u);
+    expect(factory.createExecutor("module-generation-a").isolation).toBe("process");
+    expect(factory.createExecutor("module-generation-b").isolation).toBe("process");
+    expect(factory.processGenerationIdFor("module-generation-a"))
+      .toBe("process-installed-a");
+    expect(factory.processGenerationIdFor("module-generation-b"))
+      .toBe("process-installed-b");
+    expect(() => factory.createExecutor("module-generation-a"))
+      .toThrow(/already has an installed Linux executor/u);
+    expect(() => factory.createExecutor("module-generation-c"))
+      .toThrow(/Process generation process-installed-b has already been used/u);
+    expect(() => factory.createExecutor("module-generation-d"))
+      .toThrow(/Process generation process-installed-existing has already been used/u);
+    expect(records.appendModuleProcessRecord).not.toHaveBeenCalled();
   });
 });
