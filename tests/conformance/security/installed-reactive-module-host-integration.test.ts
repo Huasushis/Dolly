@@ -31,6 +31,7 @@ import {
 } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
+import { resolveInstalledContentSchemaRegistrationSet } from "../../../src/core/installed-extension-module.js";
 import {
   deriveModuleCgroupPath,
   prepareDelegatedCgroupRoot,
@@ -335,12 +336,19 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       let protocolIdentifier = 0;
       let processGenerationIndex = 0;
       const now = (): string => new Date().toISOString();
+      const contentSchemas = resolveInstalledContentSchemaRegistrationSet({
+        instanceConfiguration: configuration,
+        installations,
+        reservedRegistrations: [],
+        maxRegisteredValueBytes: 64 * 1_024,
+      });
       const coreState = createFileCoreStateStoreWithStoppedRecordWriter({
         path: statePath,
         maxFailedAttempts: 3,
         nextBlockId: () => `scheduler-block-${++blockId}`,
         nextDeliveryId: (kind) => `scheduler-${kind}-${++deliveryId}`,
         now,
+        contentSchemas,
       });
       coreState.store.deliveries.createPage("input");
       coreState.store.deliveries.createPage("middle");
@@ -383,6 +391,8 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         installations,
         configurations,
         coreState,
+        contentSchemas,
+        maxRegisteredContentValueBytes: 64 * 1_024,
         startupRecoveryHandoff,
         mailboxes,
         clock: systemSchedulerClock(),
@@ -579,6 +589,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         nextBlockId: () => `reopened-block-${++blockId}`,
         nextDeliveryId: (kind) => `reopened-${kind}-${++deliveryId}`,
         now,
+        contentSchemas,
       });
       const reopenedRepository = new FileModuleResultCommitRepository({ path: commitPath });
       const committed = reopenedRepository.list().find((record) =>

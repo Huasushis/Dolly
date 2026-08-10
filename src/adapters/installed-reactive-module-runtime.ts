@@ -2,12 +2,15 @@ import {
   consumeCoreStartupRecoveryHandoff,
   type CoreStartupRecoveryHandoff,
 } from "../core/core-startup-recovery.js";
+import { canonicalJsonDigest } from "../core/canonical-json.js";
+import { ContentSchemaRegistrationSet } from "../core/content-schema-registry.js";
 import type { DeliveryMailboxCapacity, FailureClassification } from "../core/delivery-store.js";
 import type { ExtensionInstallationRegistry } from "../core/extension-installation-registry.js";
 import { FileCoreStateStore } from "../core/file-core-state-store.js";
 import type { FileCoreStateStoreWithStoppedRecordWriter } from "../core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../core/file-module-result-commit-repository.js";
 import {
+  resolveInstalledContentSchemaRegistrationSet,
   resolveInstalledExtensionModule,
   type InstalledExtensionModule,
 } from "../core/installed-extension-module.js";
@@ -318,6 +321,10 @@ export interface InstalledReactiveModuleHostOptions {
   readonly installations: ExtensionInstallationRegistry;
   readonly configurations: ModuleConfigurationStore;
   readonly coreState: FileCoreStateStoreWithStoppedRecordWriter;
+  /** Exact set already bound to `coreState.store.blocks`. */
+  readonly contentSchemas: ContentSchemaRegistrationSet;
+  /** Product-before-bootstrap resource ceiling used to rederive the set. */
+  readonly maxRegisteredContentValueBytes: number;
   readonly mailboxes: readonly DeliveryMailboxCapacity[];
   /** One-use, store-bound proof produced only after startup stopped old processes. */
   readonly startupRecoveryHandoff: CoreStartupRecoveryHandoff;
@@ -341,6 +348,30 @@ export interface InstalledReactiveModuleHost {
 export function composeInstalledReactiveModuleHost(
   options: InstalledReactiveModuleHostOptions,
 ): InstalledReactiveModuleHost {
+  if (!(options.contentSchemas instanceof ContentSchemaRegistrationSet)) {
+    throw new TypeError("contentSchemas must be a ContentSchemaRegistrationSet");
+  }
+  if (!options.coreState.store.blocks.isContentSchemaRegistrationSetBoundTo(
+    options.contentSchemas,
+  )) {
+    throw new TypeError(
+      "Installed reactive Module host content schemas are not bound to its FileCore state",
+    );
+  }
+  const expectedContentSchemas = resolveInstalledContentSchemaRegistrationSet({
+    instanceConfiguration: options.configuration,
+    installations: options.installations,
+    reservedRegistrations: [],
+    maxRegisteredValueBytes: options.maxRegisteredContentValueBytes,
+  });
+  if (
+    canonicalJsonDigest(expectedContentSchemas.snapshot()) !==
+    canonicalJsonDigest(options.contentSchemas.snapshot())
+  ) {
+    throw new TypeError(
+      "Installed reactive Module host content schemas do not match its verified installations",
+    );
+  }
   if (options.configuration.modules.length === 0) {
     throw new TypeError(
       "Installed reactive Module host requires at least one configured Module",

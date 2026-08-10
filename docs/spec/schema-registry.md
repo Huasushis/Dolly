@@ -547,8 +547,10 @@ falsifiable and none asserts only that a status string was returned.
   can now be built from integrity-checked `dolly.extension-package/2`
   installations by `resolveInstalledContentSchemaRegistrationSet`, and a
   `FileCoreStateStore` can bind that exact frozen set to Block restore and
-  commit. The public runtime bootstrap still refuses every Module, and the
-  installed Scheduler composition does not yet require this binding, so this is
+  commit. The installed Scheduler composition refuses unless that exact object
+  is bound to its FileCore state and its public metadata can be rederived from
+  the current instance configuration and verified installations. The public
+  runtime bootstrap still refuses every Module, so this remains
   product-before-bootstrap evidence rather than a supported registry.
 
 ### 11.2 What this contract depends on that does not exist
@@ -561,10 +563,13 @@ falsifiable and none asserts only that a status string was returned.
 - **A name syntax for `data` items.** `block-content.ts` requires only a
   non-empty string, so Section 4.1 is a new constraint that
   `block-payload.md` must state.
-- **A startup phase that owns the registration set.** The pure installed-package
-  resolver and FileCore binding exist, but the installed Scheduler composition
-  has not yet made the exact same set a mandatory input and startup invariant.
-  Public Module execution remains disabled.
+- **A startup phase that owns the registration set.** The candidate installed
+  Scheduler composition now makes the exact FileCore-bound set a mandatory
+  invariant before consuming startup recovery or constructing any Module
+  runtime. Instance schema version 9 has no deployment field for reserved-name
+  producer grants, so this candidate path accepts only package-owned names and
+  rejects caller-injected `dolly.` grants. Public Module execution remains
+  disabled.
 - **Module execution.** Every enforcement path that depends on a Module
   starting is unreachable until Modules run at all.
 

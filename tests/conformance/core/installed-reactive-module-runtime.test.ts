@@ -13,6 +13,7 @@ import {
 } from "../../../src/adapters/installed-reactive-module-runtime.js";
 import type { BlockProposal } from "../../../src/core/block-store.js";
 import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
+import { ContentSchemaRegistrationSet } from "../../../src/core/content-schema-registry.js";
 import {
   CoreStartupRecovery,
   moduleProcessStopProofIdentityDigest,
@@ -21,6 +22,7 @@ import {
 import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
 import { ExtensionInstallationRegistry } from "../../../src/core/extension-installation-registry.js";
 import { createFileCoreStateStoreWithStoppedRecordWriter } from "../../../src/core/file-core-state-store.js";
+import { resolveInstalledContentSchemaRegistrationSet } from "../../../src/core/installed-extension-module.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
@@ -159,20 +161,39 @@ describe("installed reactive Module runtime composition", () => {
     rmSync(scratch, { recursive: true, force: true });
   });
 
-  function coreState(name: string) {
+  function coreState(
+    name: string,
+    configuration = instanceConfiguration,
+    suppliedContentSchemas?: ContentSchemaRegistrationSet,
+  ) {
     let blockId = 0;
     let deliveryId = 0;
+    const contentSchemas = suppliedContentSchemas ??
+      resolveInstalledContentSchemaRegistrationSet({
+        instanceConfiguration: configuration,
+        installations,
+        reservedRegistrations: [],
+        maxRegisteredValueBytes: 64 * 1024,
+      });
     const pair = createFileCoreStateStoreWithStoppedRecordWriter({
       path: resolve(scratch, `${name}-core.json`),
       maxFailedAttempts: 3,
       nextBlockId: () => `${name}-block-${++blockId}`,
       nextDeliveryId: (kind) => `${name}-${kind}-${++deliveryId}`,
       now: () => "2026-08-10T00:00:00.000Z",
+      contentSchemas,
     });
     pair.store.deliveries.createPage("input");
     pair.store.deliveries.createPage("output");
     pair.store.deliveries.registerConsumer("input", "worker", "from-now");
-    return pair;
+    return { ...pair, contentSchemas };
+  }
+
+  function contentSchemaOptions(pair: ReturnType<typeof coreState>) {
+    return {
+      contentSchemas: pair.contentSchemas,
+      maxRegisteredContentValueBytes: 64 * 1024,
+    } as const;
   }
 
   function options(pair: ReturnType<typeof coreState>) {
@@ -362,6 +383,7 @@ describe("installed reactive Module runtime composition", () => {
       installations,
       configurations,
       coreState: pair,
+      ...contentSchemaOptions(pair),
       mailboxes,
       startupRecoveryHandoff: report.handoff,
       clock: {
@@ -527,11 +549,77 @@ describe("installed reactive Module runtime composition", () => {
       retryJitterRatio: 0,
       lowWatermarkRatio: 1,
     };
+    const equivalentButUnboundContentSchemas =
+      resolveInstalledContentSchemaRegistrationSet({
+        instanceConfiguration,
+        installations,
+        reservedRegistrations: [],
+        maxRegisteredValueBytes: 64 * 1024,
+      });
     expect(() => composeInstalledReactiveModuleHost({
       configuration: instanceConfiguration,
       installations,
       configurations,
       coreState: pair,
+      contentSchemas: equivalentButUnboundContentSchemas,
+      maxRegisteredContentValueBytes: 64 * 1024,
+      mailboxes,
+      startupRecoveryHandoff: {
+        schemaVersion: "dolly.core-startup-recovery-handoff/1",
+      },
+      clock,
+      scheduling,
+      runtime,
+    })).toThrow(/content schemas are not bound to its FileCore state/u);
+    const configuredModule = instanceConfiguration.modules[0]!;
+    const injectedReservedSchemas = new ContentSchemaRegistrationSet({
+      modules: [{
+        moduleId: configuredModule.moduleId,
+        extensionId: configuredModule.extensionId,
+        packageVersion: configuredModule.packageVersion,
+        moduleKind: configuredModule.moduleKind,
+      }],
+      registrations: [{
+        source: "deployment",
+        schema: "dolly.fixture/1",
+        producer: {
+          extensionId: configuredModule.extensionId,
+          packageVersion: configuredModule.packageVersion,
+          moduleKind: configuredModule.moduleKind,
+        },
+        validator: SCHEMA,
+        validatorDigest: canonicalJsonDigest(SCHEMA),
+        maxValueBytes: 1024,
+        containsCoreReferences: false,
+      }],
+      maxRegisteredValueBytes: 64 * 1024,
+    });
+    const mismatchedPair = coreState(
+      "injected-schema",
+      instanceConfiguration,
+      injectedReservedSchemas,
+    );
+    expect(() => composeInstalledReactiveModuleHost({
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: mismatchedPair,
+      contentSchemas: injectedReservedSchemas,
+      maxRegisteredContentValueBytes: 64 * 1024,
+      mailboxes,
+      startupRecoveryHandoff: {
+        schemaVersion: "dolly.core-startup-recovery-handoff/1",
+      },
+      clock,
+      scheduling,
+      runtime,
+    })).toThrow(/content schemas do not match its verified installations/u);
+    expect(() => composeInstalledReactiveModuleHost({
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
+      ...contentSchemaOptions(pair),
       mailboxes,
       startupRecoveryHandoff: {
         schemaVersion: "dolly.core-startup-recovery-handoff/1",
@@ -550,6 +638,7 @@ describe("installed reactive Module runtime composition", () => {
       installations,
       configurations,
       coreState: pair,
+      ...contentSchemaOptions(pair),
       mailboxes,
       startupRecoveryHandoff: verifiedHandoff,
       clock,
@@ -566,6 +655,7 @@ describe("installed reactive Module runtime composition", () => {
       installations,
       configurations,
       coreState: pair,
+      ...contentSchemaOptions(pair),
       mailboxes,
       startupRecoveryHandoff: verifiedHandoff,
       clock,
@@ -583,6 +673,7 @@ describe("installed reactive Module runtime composition", () => {
       installations,
       configurations,
       coreState: pair,
+      ...contentSchemaOptions(pair),
       mailboxes,
       startupRecoveryHandoff: verifiedHandoff,
       clock,
@@ -599,6 +690,7 @@ describe("installed reactive Module runtime composition", () => {
       installations,
       configurations,
       coreState: pair,
+      ...contentSchemaOptions(pair),
       mailboxes: [{
         ...mailboxes[0]!,
         pageIds: ["output"],
@@ -612,7 +704,21 @@ describe("installed reactive Module runtime composition", () => {
   });
 
   it("composes every configured installed Module into one Scheduler host", async () => {
-    const pair = coreState("pipeline");
+    const first = instanceConfiguration.modules[0]!;
+    const pipelineConfiguration = validateDollyInstanceConfig({
+      ...instanceConfiguration,
+      pages: [{ pageId: "input" }, { pageId: "middle" }, { pageId: "output" }],
+      modules: [{
+        ...first,
+        outputPageIds: ["middle"],
+      }, {
+        ...first,
+        moduleId: "worker-two",
+        inputPageIds: ["middle"],
+        outputPageIds: ["output"],
+      }],
+    });
+    const pair = coreState("pipeline", pipelineConfiguration);
     pair.store.deliveries.createPage("middle");
     pair.store.deliveries.registerConsumer("middle", "worker-two", "from-now");
     const complete = options(pair);
@@ -636,20 +742,6 @@ describe("installed reactive Module runtime composition", () => {
       nextModuleGenerationIdFor: (moduleId: string) =>
         `${moduleId}-${nextModuleGenerationId()}`,
     };
-    const first = instanceConfiguration.modules[0]!;
-    const pipelineConfiguration = validateDollyInstanceConfig({
-      ...instanceConfiguration,
-      pages: [{ pageId: "input" }, { pageId: "middle" }, { pageId: "output" }],
-      modules: [{
-        ...first,
-        outputPageIds: ["middle"],
-      }, {
-        ...first,
-        moduleId: "worker-two",
-        inputPageIds: ["middle"],
-        outputPageIds: ["output"],
-      }],
-    });
     const mailboxes = [{
       consumerId: "worker",
       pageIds: ["input"],
@@ -667,6 +759,7 @@ describe("installed reactive Module runtime composition", () => {
       installations,
       configurations,
       coreState: pair,
+      ...contentSchemaOptions(pair),
       mailboxes,
       startupRecoveryHandoff: await startupHandoff(
         pair,
