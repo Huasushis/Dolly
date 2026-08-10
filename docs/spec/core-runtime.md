@@ -1915,7 +1915,9 @@ and `allowEmptyInput: false` uses the same runtime tick shape as a reactive
 registration. The verified Extension composition does not activate it, because
 package manifest version 1 can declare only reactive support and version 2 is
 reserved for the complete schema-registry contract. Periodic and source process
-activation remain future contract requirements.
+activation remain future product-composition requirements. At component level,
+the Scheduler also accepts the authenticated Delivery-backed source queue
+defined in Section 11.3; this does not alter the bootstrap refusal.
 
 ### 11.1 Reactive mode
 
@@ -1993,11 +1995,24 @@ claimed requests and measures the canonical bytes of the complete request
 envelopes. A private Page with another consumer, a foreign producer, another
 payload schema, or a missing Block fails closed.
 
-This candidate does not by itself support source execution. The Scheduler and
-installed runtime do not yet receive an unforgeable, store-bound private-route
-handoff, and no product coordinator owns request admission during startup or
-shutdown. Source and manual activation therefore remain rejected by Scheduler
-registration and by the configured-Module bootstrap as stated in Section 9.3.
+The Scheduler component accepts this queue only through an in-memory binding
+that cannot be reconstructed from its public fields. Registration verifies the
+exact Module, the identity of the FileCore Delivery view, empty public input
+routes, and private Page identity. It also rejects any public input or output
+route that names a registered private source Page. Queue admission enforces its
+canonical request count and byte bounds; Scheduler mailbox and Claim byte
+limits remain separate because they measure serialized Blocks rather than the
+request envelopes. The fixed policy treats the private queue's pending Delivery
+count as the source request count and never invents an empty request.
+
+This candidate still does not establish product source execution. The
+installed runtime composer does not construct the binding or prove that its
+`ReactiveModuleRuntime` uses that same private route, no product coordinator
+owns request admission during startup or shutdown, and completed idempotency
+history has no bounded retention policy yet. Source activation without an
+authentic binding remains rejected by Scheduler registration, and every
+configured Module remains rejected by product bootstrap as stated in Section
+9.3.
 
 A source MUST still obey actor serialization, mailbox bounds, generation
 fencing, output transactions, and backpressure. Downstream congestion may delay
@@ -2162,8 +2177,11 @@ The Scheduler component uses a simple fixed policy:
 - reactive Modules run when data is pending and the actor is idle;
 - non-empty periodic Modules run at most once per start-to-start period when
   input is pending; missed periods are counted and never replayed as a burst;
-- empty periodic and source Modules are rejected until their later Module job
-  and completion contracts are implemented;
+- source Modules run only when a pending request is visible through an
+  authentic FileCore-bound private queue; source registration without that
+  binding is rejected;
+- empty periodic Modules are rejected until their later Module job and
+  completion contracts are implemented;
 - bounded queues apply deterministic backpressure;
 - retries use bounded exponential backoff with documented limits.
 

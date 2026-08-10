@@ -16,7 +16,10 @@ import type {
   DeliveryRecord,
   DeliveryStoreSnapshot,
 } from "./delivery-store.js";
-import type { FileCoreStateStore } from "./file-core-state-store.js";
+import type {
+  FileCoreDeliveryOperations,
+  FileCoreStateStore,
+} from "./file-core-state-store.js";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SOURCE_ACTIVATION_SCHEMA = "dolly.source-activation/1";
@@ -67,6 +70,59 @@ export interface SourceActivationQueueStatus {
   readonly residentBytes: number;
   readonly maxResidentCount: number;
   readonly maxResidentBytes: number;
+}
+
+/**
+ * An in-memory proof that one private source Page came from the queue bound to
+ * the Scheduler's exact FileCore Delivery view. Copying these public fields
+ * does not copy the proof held in this module's WeakMap.
+ */
+export interface SourceActivationSchedulerBinding {
+  readonly schemaVersion: "dolly.source-activation-binding/1";
+  readonly moduleId: string;
+  readonly privatePageId: string;
+}
+
+interface SourceActivationSchedulerAuthority {
+  readonly moduleId: string;
+  readonly privatePageId: string;
+  readonly deliveries: FileCoreDeliveryOperations;
+}
+
+const schedulerBindings = new WeakMap<
+  SourceActivationSchedulerBinding,
+  SourceActivationSchedulerAuthority
+>();
+
+/** @internal Scheduler registration verifies the non-serializable binding here. */
+export function resolveSourceActivationSchedulerBinding(
+  candidate: unknown,
+  moduleId: string,
+  deliveries: unknown,
+): Pick<SourceActivationSchedulerBinding, "moduleId" | "privatePageId"> {
+  if (candidate === null || typeof candidate !== "object") {
+    throw new SourceActivationQueueError(
+      "SOURCE_ACTIVATION_ROUTE_INVALID",
+      "A source activation Scheduler binding is required",
+    );
+  }
+  const authority = schedulerBindings.get(
+    candidate as SourceActivationSchedulerBinding,
+  );
+  if (
+    authority === undefined ||
+    authority.moduleId !== moduleId ||
+    authority.deliveries !== deliveries
+  ) {
+    throw new SourceActivationQueueError(
+      "SOURCE_ACTIVATION_ROUTE_INVALID",
+      "The source activation binding does not belong to this Module and FileCore store",
+    );
+  }
+  return deepFreeze({
+    moduleId: authority.moduleId,
+    privatePageId: authority.privatePageId,
+  });
 }
 
 export type SourceActivationSubmission =
@@ -299,6 +355,23 @@ export class SourceActivationQueue {
       });
     }
     this.#assertPrivateRoute();
+  }
+
+  schedulerBinding(): SourceActivationSchedulerBinding {
+    // Validate route ownership and every retained private-page record before
+    // granting Scheduler access to the route identity.
+    this.inspect();
+    const binding: SourceActivationSchedulerBinding = deepFreeze({
+      schemaVersion: "dolly.source-activation-binding/1" as const,
+      moduleId: this.#moduleId,
+      privatePageId: this.privatePageId,
+    });
+    schedulerBindings.set(binding, {
+      moduleId: this.#moduleId,
+      privatePageId: this.privatePageId,
+      deliveries: this.#core.deliveries,
+    });
+    return binding;
   }
 
   inspect(): SourceActivationQueueStatus {

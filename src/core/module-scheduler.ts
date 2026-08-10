@@ -9,6 +9,10 @@ import type {
   ReactiveModuleClaimLimits,
   ReactiveModuleTickResult,
 } from "./reactive-module-runtime.js";
+import {
+  resolveSourceActivationSchedulerBinding,
+  type SourceActivationSchedulerBinding,
+} from "./source-activation-queue.js";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
@@ -196,8 +200,10 @@ export interface SchedulerModuleRegistration {
   readonly inputPageIds: readonly string[];
   readonly outputPageIds: readonly string[];
   readonly mailbox: SchedulerMailboxLimits;
-  /** Defaults to reactive. Empty periodic and source activation are rejected. */
+  /** Defaults to reactive. Empty periodic remains rejected. */
   readonly activation?: SchedulerActivationDescriptor;
+  /** Required only for a source registration; ordinary input Page IDs stay empty. */
+  readonly sourceActivationBinding?: SourceActivationSchedulerBinding;
 }
 
 export type SchedulerPolicyFailureAction = "fallback-baseline" | "quarantine";
@@ -381,7 +387,7 @@ export interface SchedulerModuleCounters {
 export interface SchedulerModuleStatus {
   readonly moduleId: string;
   readonly moduleGenerationId: string;
-  readonly activationMode: "reactive" | "periodic";
+  readonly activationMode: "reactive" | "periodic" | "source";
   readonly periodMs: number | null;
   readonly allowEmptyPeriodicInput: boolean | null;
   readonly schedulingState: SchedulerModuleState;
@@ -444,8 +450,8 @@ export interface SchedulerInstanceStatus {
  * next eligibility is `S_n + P_n` and the wait is `max(0, E_(n+1) - now)`.
  *
  * The delivery-backed periodic slice uses this formula only when empty input is
- * forbidden. Empty periodic and source activation remain rejected until their
- * own Module job and completion boundaries exist.
+ * forbidden. Empty periodic remains rejected until it has a durable Module job
+ * and completion boundary; authenticated source queues use Delivery Claims.
  */
 export function periodicEligibility(input: {
   readonly lastRunStartedAt: number;
@@ -505,7 +511,7 @@ interface MutableCounters {
 interface ModuleEntry {
   readonly moduleId: string;
   readonly runtime: SchedulableModuleRuntime;
-  readonly activation: Exclude<SchedulerActivationDescriptor, { readonly kind: "source" }>;
+  readonly activation: SchedulerActivationDescriptor;
   readonly inputPageIds: readonly string[];
   readonly outputPageIds: readonly string[];
   readonly maxResidentCount: number;
@@ -616,6 +622,8 @@ export class ModuleScheduler {
   readonly #onEvent: ((event: SchedulerEvent) => void) | undefined;
 
   readonly #entries = new Map<string, ModuleEntry>();
+  /** Private source Page ID -> owning Module ID. */
+  readonly #sourcePrivatePages = new Map<string, string>();
   #state: "created" | "running" | "stopping" | "stopped" = "created";
   #pollTimer: SchedulerTimer | null = null;
   #immediateTimer: SchedulerTimer | null = null;
@@ -738,9 +746,9 @@ export class ModuleScheduler {
   }
 
   /**
-   * Registers a Delivery-backed runtime. Reactive and non-empty periodic modes
-   * use the same Claim/commit boundary. Empty periodic and source modes remain
-   * rejected because they require a separately durable Module job trigger.
+   * Registers a Delivery-backed runtime. Reactive, non-empty periodic and an
+   * authenticated private source queue use the same Claim/commit boundary.
+   * Empty periodic remains rejected because it has no durable trigger.
    */
   register(registration: SchedulerModuleRegistration): void {
     if (this.#state === "stopping" || this.#state === "stopped") {
@@ -760,8 +768,8 @@ export class ModuleScheduler {
     }
     const activation = registration.activation ?? { kind: "reactive" as const };
     if (
-      activation.kind === "source" ||
-      (activation.kind === "periodic" && activation.allowEmptyInput)
+      activation.kind === "source" &&
+      registration.sourceActivationBinding === undefined
     ) {
       this.#emit({
         type: "scheduler.activation_rejected",
@@ -772,7 +780,20 @@ export class ModuleScheduler {
       });
       throw new ModuleSchedulerError(
         "SCHEDULER_ACTIVATION_UNSUPPORTED",
-        `${activation.kind} activation requires an unsupported empty or source completion boundary`,
+        "source activation requires a durable Core-private request binding",
+      );
+    }
+    if (activation.kind === "periodic" && activation.allowEmptyInput) {
+      this.#emit({
+        type: "scheduler.activation_rejected",
+        instanceId: this.#instanceId,
+        monotonicAt: this.#clock.monotonicNow(),
+        moduleId: registration.moduleId,
+        activationMode: activation.kind,
+      });
+      throw new ModuleSchedulerError(
+        "SCHEDULER_ACTIVATION_UNSUPPORTED",
+        "periodic activation with empty input requires a durable trigger",
       );
     }
     if (activation.kind === "periodic") {
@@ -784,14 +805,71 @@ export class ModuleScheduler {
         );
       }
     }
-    if (registration.inputPageIds.length === 0) {
+    assertPositiveInteger(registration.mailbox.maxResidentCount, "mailbox.maxResidentCount");
+    assertPositiveInteger(registration.mailbox.maxResidentBytes, "mailbox.maxResidentBytes");
+
+    let inputPageIds = [...registration.inputPageIds];
+    let sourcePrivatePageId: string | undefined;
+    if (activation.kind === "source") {
+      if (inputPageIds.length !== 0) {
+        throw new ModuleSchedulerError(
+          "SCHEDULER_CONFIGURATION_INVALID",
+          "A source Module cannot declare a public input Page",
+        );
+      }
+      let authority;
+      try {
+        authority = resolveSourceActivationSchedulerBinding(
+          registration.sourceActivationBinding,
+          registration.moduleId,
+          this.#deliveries,
+        );
+      } catch {
+        throw new ModuleSchedulerError(
+          "SCHEDULER_CONFIGURATION_INVALID",
+          "The source activation binding is not authentic for this Module and Core store",
+        );
+      }
+      sourcePrivatePageId = authority.privatePageId;
+      inputPageIds = [sourcePrivatePageId];
+    } else if (registration.sourceActivationBinding !== undefined) {
+      throw new ModuleSchedulerError(
+        "SCHEDULER_CONFIGURATION_INVALID",
+        "Only a source Module may receive a source activation binding",
+      );
+    }
+
+    if (inputPageIds.length === 0) {
       throw new ModuleSchedulerError(
         "SCHEDULER_CONFIGURATION_INVALID",
         "A Delivery-backed Module must consume at least one input Page",
       );
     }
-    assertPositiveInteger(registration.mailbox.maxResidentCount, "mailbox.maxResidentCount");
-    assertPositiveInteger(registration.mailbox.maxResidentBytes, "mailbox.maxResidentBytes");
+    const privateRouteConflict = [...this.#sourcePrivatePages.keys()].find(
+      (pageId) =>
+        inputPageIds.includes(pageId) || registration.outputPageIds.includes(pageId),
+    );
+    if (privateRouteConflict !== undefined) {
+      throw new ModuleSchedulerError(
+        "SCHEDULER_CONFIGURATION_INVALID",
+        "A Core-private source activation Page cannot be used as a public route",
+      );
+    }
+    if (
+      sourcePrivatePageId !== undefined &&
+      (
+        registration.outputPageIds.includes(sourcePrivatePageId) ||
+        [...this.#entries.values()].some((entry) =>
+          entry.inputPageIds.includes(sourcePrivatePageId!) ||
+          entry.outputPageIds.includes(sourcePrivatePageId!)
+        )
+      )
+    ) {
+      throw new ModuleSchedulerError(
+        "SCHEDULER_CONFIGURATION_INVALID",
+        "The source activation Page is already exposed by another Scheduler route",
+      );
+    }
     if (typeof registration.runtime?.tick !== "function") {
       throw new ModuleSchedulerError(
         "SCHEDULER_CONFIGURATION_INVALID",
@@ -803,7 +881,7 @@ export class ModuleScheduler {
       moduleId: registration.moduleId,
       runtime: registration.runtime,
       activation,
-      inputPageIds: [...registration.inputPageIds],
+      inputPageIds,
       outputPageIds: [...registration.outputPageIds],
       maxResidentCount: registration.mailbox.maxResidentCount,
       maxResidentBytes: registration.mailbox.maxResidentBytes,
@@ -847,6 +925,9 @@ export class ModuleScheduler {
       lastTickStatus: null,
       counters: newCounters(),
     });
+    if (sourcePrivatePageId !== undefined) {
+      this.#sourcePrivatePages.set(sourcePrivatePageId, registration.moduleId);
+    }
     this.#recomputeTopology();
   }
 
