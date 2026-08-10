@@ -715,12 +715,21 @@ observation rules.
 
 ### 6.4 Streaming
 
-Stream events carry broker `requestId`, a monotonic base-10 event sequence,
-channel kind, and bounded payload. The adapter preserves reasoning, final
-content, tool-call, usage, and terminal channels; tolerates arbitrary transport
-fragmentation; rejects duplicate, regressing, malformed, oversized, or
-post-terminal events; and produces one terminal result. Cancellation or
-disconnect cannot turn partial streamed text into a successful output.
+The installed `openai.chat.stream.sse.v1` strategy sends `stream: true` and
+`stream_options: {"include_usage": true}`, requires a
+`text/event-stream` response, and validates each transport chunk against the
+descriptor's event, buffer, response, and output limits. It preserves separate
+reasoning and final-content accumulation, requires one stable provider identity,
+one declared finish reason, a terminal `[DONE]`, and rejects malformed,
+oversized, incomplete, or post-terminal data. Arbitrary byte fragmentation,
+including a UTF-8 code point split across chunks, does not change the result.
+
+The current broker returns one Host-validated terminal `ChatOutput`; it does not
+expose provisional stream events to an Extension. A future progress channel
+must be separately authorized and bounded. Cancellation, disconnect, or a
+partial stream can never become a successful terminal output. Streaming tool
+call assembly remains unsupported and must fail visibly rather than downgrade
+to a non-stream request.
 
 ## 7. Embedding
 

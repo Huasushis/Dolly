@@ -11,6 +11,7 @@ import type {
 } from "./model-provider-binding.js";
 import {
   ModelChatError,
+  OpenAiCompatibleChatStreamDecoder,
   decodeOpenAiCompatibleChatResponse,
   encodeOpenAiCompatibleChatRequest,
   mapReasoningPolicy,
@@ -330,6 +331,7 @@ async function readBoundedBody(
   response: ModelHttpTransportResponse,
   maxBytes: number,
   signal: AbortSignal,
+  validateChunk?: (chunk: Uint8Array) => void,
 ): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -351,7 +353,18 @@ async function readBoundedBody(
           "Provider response exceeds its byte limit",
         );
       }
-      chunks.push(Uint8Array.from(item.value));
+      const chunk = Uint8Array.from(item.value);
+      if (validateChunk) {
+        try {
+          validateChunk(chunk);
+        } catch {
+          throw new ModelHttpBodyError(
+            "protocol",
+            "Provider response failed incremental validation",
+          );
+        }
+      }
+      chunks.push(chunk);
     }
   } catch (error) {
     abortResponseQuietly(response, error instanceof Error ? error : undefined);
@@ -393,6 +406,13 @@ export interface BoundModelHttpOptions {
   readonly deadline: string;
   readonly body: Uint8Array;
   readonly contentType: "application/json";
+  /** The exact response media type selected by the descriptor-bound codec. */
+  readonly responseKind?: "json" | "event-stream";
+  /**
+   * Optional bounded validator invoked for each transport chunk before it is
+   * retained. Throwing rejects the provider response as a protocol failure.
+   */
+  readonly validateResponseChunk?: (chunk: Uint8Array) => void;
   readonly secrets: ModelSecretResolver;
   readonly transport: ModelHttpTransport;
   readonly now: () => string;
@@ -474,8 +494,9 @@ export async function executeBoundModelHttp(
   let response: ModelHttpTransportResponse | undefined;
   let dispatched = false;
   try {
+    const responseKind = options.responseKind ?? "json";
     const headers: Record<string, string> = {
-      accept: "application/json",
+      accept: responseKind === "event-stream" ? "text/event-stream" : "application/json",
       "accept-encoding": "identity",
       "content-type": options.contentType,
     };
@@ -630,7 +651,10 @@ export async function executeBoundModelHttp(
       );
     }
     const contentType = header(response.headers, "content-type");
-    if (!contentType || !/^application\/json(?:\s*;|$)/iu.test(contentType)) {
+    const validContentType = responseKind === "event-stream"
+      ? /^text\/event-stream(?:\s*;|$)/iu
+      : /^application\/json(?:\s*;|$)/iu;
+    if (!contentType || !validContentType.test(contentType)) {
       abortResponseQuietly(response);
       return boundHttpFailure(
         immutableError(
@@ -658,7 +682,12 @@ export async function executeBoundModelHttp(
       );
     }
     try {
-      const responseBytes = await readBoundedBody(response, maxResponseBytes, controller.signal);
+      const responseBytes = await readBoundedBody(
+        response,
+        maxResponseBytes,
+        controller.signal,
+        options.validateResponseChunk,
+      );
       return Object.freeze({
         status: "succeeded",
         ...(providerRequestId === undefined ? {} : { providerRequestId }),
@@ -918,27 +947,14 @@ export class ChatModelBroker {
       );
     }
 
-    if (invocation.input.stream) {
-      return failedResult(
-        invocation,
-        descriptor,
-        immutableError(
-          "FEATURE_UNSUPPORTED",
-          "validation",
-          "never",
-          "Streaming transport is not implemented by this broker version",
-        ),
-        0,
-      );
-    }
-
     let plan;
     let decision;
+    let streamDecoder: OpenAiCompatibleChatStreamDecoder | undefined;
     try {
       decision = mapReasoningPolicy(
         descriptorSnapshot.document.features.reasoning,
         invocation.reasoningPolicy,
-        "non-stream",
+        invocation.input.stream ? "stream" : "non-stream",
       );
       plan = encodeOpenAiCompatibleChatRequest(
         descriptorSnapshot,
@@ -955,6 +971,12 @@ export class ChatModelBroker {
                 : invocation.budgets.maxOutputTokens,
         },
       );
+      if (invocation.input.stream) {
+        streamDecoder = new OpenAiCompatibleChatStreamDecoder(
+          descriptorSnapshot,
+          decision,
+        );
+      }
     } catch (error) {
       const code =
         error instanceof ModelChatError && error.code === "CHAT_LIMIT_EXCEEDED"
@@ -994,6 +1016,10 @@ export class ChatModelBroker {
       deadline: invocation.context.deadline,
       body: Buffer.from(canonicalizeJson(plan.body), "utf8"),
       contentType: plan.contentType,
+      responseKind: invocation.input.stream ? "event-stream" : "json",
+      ...(streamDecoder === undefined
+        ? {}
+        : { validateResponseChunk: (chunk: Uint8Array) => streamDecoder!.push(chunk) }),
       secrets: this.#secrets,
       transport: this.#transport,
       now: this.#now,
@@ -1010,11 +1036,13 @@ export class ChatModelBroker {
     }
 
     try {
-      const output = decodeOpenAiCompatibleChatResponse(
-        descriptorSnapshot,
-        transportResult.responseBytes,
-        decision,
-      );
+      const output = streamDecoder === undefined
+        ? decodeOpenAiCompatibleChatResponse(
+            descriptorSnapshot,
+            transportResult.responseBytes,
+            decision,
+          )
+        : streamDecoder.end();
       validateChatOutputContract(output, invocation.input.outputContract);
       if (canonicalJsonByteLength(output) > invocation.budgets.maxOutputBytes) {
         return failedResult(

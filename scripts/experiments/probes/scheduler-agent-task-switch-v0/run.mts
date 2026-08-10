@@ -98,6 +98,7 @@ const TASK_SEQUENCE = [
   { phase: "resume", taskId: TASK_ID, request: "Resume this task from memory and identify the next action." },
 ] as const;
 const IMPLEMENTATION_PATHS = [
+  "scripts/experiments/probes/general-agent-live-v0/run.mts",
   "scripts/experiments/probes/scheduler-agent-task-switch-v0/run.mts",
   "scripts/experiments/probes/scheduler-agent-task-switch-v0/extension.mjs",
   "scripts/experiments/probes/scheduler-agent-task-switch-v0/verify.mjs",
@@ -126,8 +127,10 @@ const PRODUCTION_PATHS = [
 const CHAT_STRATEGIES = new Set([
   "openai.chat.request.text-parts.v1",
   "aether.qwen.chat.response.v2",
+  "openai.chat.stream.sse.v1",
   "openai.chat.message-order.v1",
   "openai.reasoning-content.nonstream.v1",
+  "openai.reasoning-content.stream.v1",
   "thinking-object.enabled-disabled.v1",
   "openai.response-format.json-object.v1",
 ]);
@@ -186,7 +189,7 @@ function completionUrl(baseValue: string): URL {
 function descriptorDocument() {
   return {
     schemaVersion: "dolly.model-descriptor/4" as const,
-    descriptorVersion: "owner-aether-qwen3.6-27b-task-switch-v5",
+    descriptorVersion: "owner-aether-qwen3.6-27b-task-switch-v6",
     endpointId: "owner-aether-task-switch-fixture",
     operation: "chat-completion" as const,
     modelId: "qwen3.6-27b",
@@ -195,6 +198,7 @@ function descriptorDocument() {
       version: "v1",
       requestStrategyId: "openai.chat.request.text-parts.v1",
       responseStrategyId: "aether.qwen.chat.response.v2",
+      streamStrategyId: "openai.chat.stream.sse.v1",
     },
     limits: {
       maxRequestBytes: 128 * 1024,
@@ -204,7 +208,10 @@ function descriptorDocument() {
       maxOutputBytes: 256 * 1024,
       maxConcurrentRequests: 1,
       maxProviderTimeoutMs: 180_000,
-      streaming: { state: "unsupported" as const },
+      streaming: {
+        state: "supported" as const,
+        value: { maxEvents: 32_768, maxBufferedBytes: 128 * 1024 },
+      },
     },
     input: {
       modalities: ["text" as const],
@@ -235,7 +242,11 @@ function descriptorDocument() {
         requestControl: { kind: "enum-strategy" as const, strategyId: "thinking-object.enabled-disabled.v1" },
         observation: {
           state: "supported" as const,
-          value: { nonStreamStrategyId: "openai.reasoning-content.nonstream.v1", empty: "not-observed" as const },
+          value: {
+            nonStreamStrategyId: "openai.reasoning-content.nonstream.v1",
+            streamStrategyId: "openai.reasoning-content.stream.v1",
+            empty: "not-observed" as const,
+          },
         },
         replay: { requirement: "forbidden" as const },
       },
@@ -264,6 +275,59 @@ function safeModelCall(
       ? { status: result.status, output: result.output as unknown as JsonValue, usage: result.usage as unknown as JsonValue }
       : { status: result.status, error: result.error as unknown as JsonValue, usage: result.usage as unknown as JsonValue },
   };
+}
+
+function normalizeProviderEvidence(row: JsonValue): JsonValue {
+  if (row === null || Array.isArray(row) || typeof row !== "object") return row;
+  const requestBody = row.requestBody;
+  const response = row.response;
+  if (
+    requestBody !== null &&
+    !Array.isArray(requestBody) &&
+    typeof requestBody === "object" &&
+    requestBody.stream === true &&
+    response !== null &&
+    !Array.isArray(response) &&
+    typeof response === "object" &&
+    typeof response.invalidJsonUtf8 === "string"
+  ) {
+    return {
+      ...row,
+      response: { eventStreamUtf8: response.invalidJsonUtf8 },
+    } as JsonValue;
+  }
+  return row;
+}
+
+function providerStreamUsage(row: Record<string, unknown>): {
+  readonly promptTokens: number;
+  readonly completionTokens: number;
+} | undefined {
+  const response = row.response as { eventStreamUtf8?: unknown } | undefined;
+  if (typeof response?.eventStreamUtf8 !== "string") return undefined;
+  for (const event of response.eventStreamUtf8.split(/\r?\n\r?\n/u)) {
+    const line = event.split(/\r?\n/u).find((candidate) => candidate.startsWith("data:"));
+    if (!line) continue;
+    const payload = line.slice(5).replace(/^ /u, "");
+    if (payload === "[DONE]") continue;
+    let value: unknown;
+    try {
+      value = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    const usage = (value as { usage?: unknown })?.usage as Record<string, unknown> | undefined;
+    if (
+      Number.isSafeInteger(usage?.prompt_tokens) &&
+      Number.isSafeInteger(usage?.completion_tokens)
+    ) {
+      return {
+        promptTokens: usage.prompt_tokens as number,
+        completionTokens: usage.completion_tokens as number,
+      };
+    }
+  }
+  return undefined;
 }
 
 function checkpointSchema() {
@@ -701,6 +765,7 @@ async function runCondition(options: {
           chat: options.broker,
           operations: ["chat"],
           reasoningPolicies: ["require", "disable"],
+          allowStreaming: true,
           outputContracts: ["text", "json-object"],
           roles: ["system", "user"],
           limits: {
@@ -937,7 +1002,7 @@ async function main(): Promise<void> {
   };
   if (
     preregistration.experimentId !== "scheduler-agent-task-switch-v0" ||
-    preregistration.experimentVersion !== 5 ||
+    preregistration.experimentVersion !== 6 ||
     preregistration.status !== "frozen-before-first-run"
   ) {
     throw new Error("task-switch preregistration is not frozen");
@@ -1017,8 +1082,9 @@ async function main(): Promise<void> {
     bindings,
     secrets,
     transport: new ExperimentFetchTransport((row) => {
-      providerRows.push(row);
-      appendFileSync(providerPath, `${JSON.stringify(row)}\n`, "utf8");
+      const evidence = normalizeProviderEvidence(row);
+      providerRows.push(evidence);
+      appendFileSync(providerPath, `${JSON.stringify(evidence)}\n`, "utf8");
     }),
     now: () => new Date().toISOString(),
   });
@@ -1115,14 +1181,10 @@ async function main(): Promise<void> {
         }
       }
       for (const providerRow of conditionProviderRows) {
-        const response = providerRow.response as Record<string, unknown> | undefined;
-        const usage = response?.usage as Record<string, unknown> | undefined;
-        if (
-          typeof usage?.prompt_tokens === "number" &&
-          typeof usage?.completion_tokens === "number"
-        ) {
-          promptTokens += usage.prompt_tokens;
-          completionTokens += usage.completion_tokens;
+        const usage = providerStreamUsage(providerRow);
+        if (usage) {
+          promptTokens += usage.promptTokens;
+          completionTokens += usage.completionTokens;
           recordsWithTokenUsage += 1;
         }
       }
@@ -1145,7 +1207,7 @@ async function main(): Promise<void> {
   const manifest = {
     schemaVersion: "scheduler-agent-task-switch/run-manifest/1",
     experimentId: "scheduler-agent-task-switch-v0",
-    experimentVersion: 5,
+    experimentVersion: 6,
     runId,
     status,
     failure,

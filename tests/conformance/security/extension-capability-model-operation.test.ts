@@ -430,6 +430,19 @@ describe("Extension model operation capability", () => {
     expect(harness.chat.invoke).not.toHaveBeenCalled();
   });
 
+  it("forwards provider streaming only when the Host explicitly grants it", async () => {
+    const harness = createHarness({ overrides: { allowStreaming: true } });
+
+    await expect(
+      harness.invoke("chat", { ...ONE_MESSAGE, stream: true }),
+    ).resolves.toMatchObject({ status: "succeeded" });
+    expect(harness.grant.resourceScope).toMatchObject({ providerStreaming: true });
+    expect(harness.chat.invoke).toHaveBeenCalledWith(
+      expect.objectContaining({ input: expect.objectContaining({ stream: true }) }),
+      expect.any(Object),
+    );
+  });
+
   it("fails visibly when the granted modality has no installed broker", async () => {
     const rerank: DescriptorRef = {
       endpointId: "fixture-rerank-endpoint",

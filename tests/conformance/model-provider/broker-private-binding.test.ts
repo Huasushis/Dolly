@@ -48,16 +48,17 @@ class FakeResponse implements ModelHttpTransportResponse {
 
   constructor(
     readonly status: number,
-    bytes: Uint8Array,
+    bytes: Uint8Array | readonly Uint8Array[],
     readonly headers: Readonly<Record<string, string>> = {
       "content-type": "application/json; charset=utf-8",
     },
     providerRequestId: string | null = "provider-request-1",
   ) {
     if (providerRequestId !== null) this.providerRequestId = providerRequestId;
+    const chunks = bytes instanceof Uint8Array ? [bytes] : bytes;
     this.body = {
       async *[Symbol.asyncIterator]() {
-        yield bytes;
+        for (const chunk of chunks) yield chunk;
       },
     };
   }
@@ -113,6 +114,42 @@ function providerBody(
       usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
     }),
   );
+}
+
+function providerStream(options: { readonly done?: boolean } = {}): Buffer {
+  const events = [
+    {
+      id: "provider-request-1",
+      object: "chat.completion.chunk",
+      choices: [{
+        index: 0,
+        delta: { role: "assistant", reasoning_content: "2 + 2 equals " },
+        finish_reason: null,
+      }],
+    },
+    {
+      id: "provider-request-1",
+      object: "chat.completion.chunk",
+      choices: [{
+        index: 0,
+        delta: { reasoning_content: "4", content: "4" },
+        finish_reason: null,
+      }],
+    },
+    {
+      id: "provider-request-1",
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    },
+    {
+      id: "provider-request-1",
+      object: "chat.completion.chunk",
+      choices: [],
+      usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+    },
+  ].map((event) => `data: ${JSON.stringify(event)}\n\n`);
+  if (options.done !== false) events.push("data: [DONE]\n\n");
+  return Buffer.from(events.join(""));
 }
 
 function createDescriptor(options: { jsonObjectOutput?: "supported" | "unsupported" } = {}): {
@@ -400,6 +437,58 @@ describe("private endpoint binding and model provider broker", () => {
     expect(consumerVisible).not.toContain("provider.example.test");
     expect(consumerVisible).not.toContain("binding-private-rev-1");
     expect(consumerVisible).not.toContain("secret-rev-7");
+  });
+
+  it("validates a descriptor-bound provider stream while retaining one final result", async () => {
+    const { registry, snapshot } = createDescriptor();
+    const streamBytes = providerStream();
+    const chunks = Array.from(
+      { length: Math.ceil(streamBytes.length / 7) },
+      (_, index) => streamBytes.subarray(index * 7, Math.min((index + 1) * 7, streamBytes.length)),
+    );
+    const transport = new FakeTransport(async () =>
+      new FakeResponse(200, chunks, { "content-type": "text/event-stream" }),
+    );
+    const { broker } = brokerWith({
+      descriptors: registry,
+      descriptor: snapshot.ref,
+      transport,
+    });
+    const request: ChatBrokerInvocation = {
+      ...invocation(snapshot.ref),
+      input: { ...invocation(snapshot.ref).input, stream: true },
+    };
+
+    await expect(broker.invoke(request)).resolves.toMatchObject({
+      status: "succeeded",
+      output: {
+        finalContent: "4",
+        finishReason: "stop",
+        reasoning: { state: "observed", parts: ["2 + 2 equals 4"] },
+      },
+    });
+    expect(transport.requests).toHaveLength(1);
+    expect(transport.requests[0]!.headers.accept).toBe("text/event-stream");
+    expect(JSON.parse(Buffer.from(transport.requests[0]!.body).toString("utf8"))).toMatchObject({
+      stream: true,
+    });
+
+    const incomplete = new FakeTransport(async () =>
+      new FakeResponse(
+        200,
+        providerStream({ done: false }),
+        { "content-type": "text/event-stream; charset=utf-8" },
+      ),
+    );
+    const failed = brokerWith({
+      descriptors: registry,
+      descriptor: snapshot.ref,
+      transport: incomplete,
+    });
+    await expect(failed.broker.invoke(request)).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "PROVIDER_PROTOCOL_ERROR", phase: "response", retryClass: "never" },
+    });
   });
 
   it("emits result schema version 2 and omits a missing provider request ID", async () => {

@@ -422,6 +422,17 @@ export class ExperimentFetchTransport implements ModelHttpTransport {
         });
         throw error;
       } finally {
+        if (!responseRecorded) {
+          recordOnce({
+            schemaVersion: "general-agent-live/provider-response/1",
+            ...requestEvidence,
+            httpStatus: response.status,
+            failureKind: "response-consumer-stopped-before-end",
+            response: {
+              eventStreamUtf8: Buffer.concat(responseChunks).toString("utf8"),
+            },
+          });
+        }
         clearTimeout(timeout);
         input.signal.removeEventListener("abort", abortFromCaller);
       }

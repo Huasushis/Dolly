@@ -142,6 +142,8 @@ export interface ModelOperationCapabilityOptions {
   readonly operations?: readonly ModelOperationName[];
   /** Reasoning policies the extension may request; the host pins the set. */
   readonly reasoningPolicies?: readonly ReasoningPolicy[];
+  /** Allow descriptor-bound provider streaming with a Host-validated final result. */
+  readonly allowStreaming?: boolean;
   readonly roles?: readonly string[];
   readonly limits?: Partial<ModelOperationLimits>;
   readonly maxConcurrentInvocations?: number;
@@ -327,6 +329,7 @@ function buildModelOperationCapability(
       throw configError(`Reasoning policy ${String(policy)} is not a defined policy`);
     }
   }
+  const allowStreaming = options.allowStreaming === true;
   const roles = [...new Set(options.roles ?? ["system", "user", "assistant", "tool"])];
   for (const role of roles) assertHostIdentifier(role, "role");
 
@@ -362,6 +365,7 @@ function buildModelOperationCapability(
         ? { executionScope: "active-run" }
         : { moduleJobId: grantScope.moduleJobId }),
       reasoningPolicies: [...reasoningPolicies],
+      providerStreaming: allowStreaming,
       roles: [...roles],
       ...(capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V2
         ? { outputContracts: [...outputContracts] }
@@ -517,10 +521,10 @@ function buildModelOperationCapability(
       if (typeof stream !== "boolean") {
         throw capabilityArgumentError("model.chat.stream must be a boolean when present");
       }
-      if (stream) {
+      if (stream && !allowStreaming) {
         throw modelDenied(
           "MODEL_STREAMING_NOT_GRANTED",
-          "This model handle does not grant streaming delivery",
+          "This model handle does not grant provider streaming",
         );
       }
     }
@@ -596,7 +600,7 @@ function buildModelOperationCapability(
           : "dolly.model.chat-input/2",
       messages: normalizedMessages,
       outputContract: { kind: outputContract },
-      stream: false,
+      stream: stream === true,
     };
     const inputBytes = canonicalJsonByteLength(input as unknown as JsonValue);
     if (inputBytes > budgets.maxInputBytes || normalizedMessages.length > budgets.maxInputItems) {

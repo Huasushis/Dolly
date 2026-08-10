@@ -450,6 +450,12 @@ function normalizeInput(snapshot: ChatDescriptorSnapshot, input: ChatInput): Jso
     messages,
     stream: input.stream,
   };
+  if (input.stream) {
+    // This is part of the allowlisted OpenAI-compatible SSE strategy. It keeps
+    // token accounting in a terminal choice-less event instead of requiring a
+    // second non-stream request or provider-specific usage endpoint.
+    body.stream_options = { include_usage: true };
+  }
 
   if (input.tools !== undefined) {
     if (!Array.isArray(input.tools) || input.tools.length === 0) {

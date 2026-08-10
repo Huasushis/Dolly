@@ -171,6 +171,105 @@ function modelMessageText(row) {
     .join("\n");
 }
 
+function providerStreamEvidence(provider, index) {
+  const raw = provider.response?.eventStreamUtf8;
+  assert(typeof raw === "string" && raw.length > 0, `provider stream ${index} is absent`);
+  assert(/\r?\n\r?\n$/u.test(raw), `provider stream ${index} lacks a final SSE delimiter`);
+  const finalParts = [];
+  const reasoningParts = [];
+  let providerId;
+  let finishReason;
+  let usage;
+  let done = false;
+  let eventCount = 0;
+  for (const block of raw.split(/\r?\n\r?\n/u)) {
+    if (block.trim() === "") continue;
+    assert(!done, `provider stream ${index} emitted data after [DONE]`);
+    eventCount += 1;
+    const data = [];
+    for (const line of block.split(/\r?\n/u)) {
+      if (line.startsWith(":")) continue;
+      if (line === "event: message" || line === "event:message") continue;
+      assert(line.startsWith("data:"), `provider stream ${index} has an unsupported SSE field`);
+      data.push(line.slice(5).replace(/^ /u, ""));
+    }
+    assert(data.length > 0, `provider stream ${index} has an empty SSE event`);
+    const payload = data.join("\n");
+    if (payload === "[DONE]") {
+      assert(finishReason !== undefined, `provider stream ${index} ended before finish reason`);
+      done = true;
+      continue;
+    }
+    const envelope = JSON.parse(payload);
+    object(envelope, `provider stream envelope ${index}`);
+    const allowedEnvelope = new Set([
+      "id", "object", "created", "model", "system_fingerprint", "choices", "usage",
+    ]);
+    assert(
+      Object.keys(envelope).every((key) => allowedEnvelope.has(key)),
+      `provider stream ${index} has an unknown envelope field`,
+    );
+    assert(typeof envelope.id === "string" && envelope.id.length > 0, `provider stream ${index} lacks id`);
+    providerId ??= envelope.id;
+    assert(envelope.id === providerId, `provider stream ${index} changed id`);
+    assert(Array.isArray(envelope.choices), `provider stream ${index} lacks choices`);
+    if (envelope.usage !== undefined && envelope.usage !== null) {
+      object(envelope.usage, `provider usage ${index}`);
+      assert(Number.isSafeInteger(envelope.usage.prompt_tokens), `provider prompt usage ${index} is absent`);
+      assert(Number.isSafeInteger(envelope.usage.completion_tokens), `provider completion usage ${index} is absent`);
+      assert(Number.isSafeInteger(envelope.usage.total_tokens), `provider total usage ${index} is absent`);
+      assert(
+        envelope.usage.total_tokens === envelope.usage.prompt_tokens + envelope.usage.completion_tokens,
+        `provider total usage ${index} differs`,
+      );
+      assert(usage === undefined, `provider stream ${index} repeats usage`);
+      usage = envelope.usage;
+    }
+    if (envelope.choices.length === 0) {
+      assert(envelope.usage !== undefined, `provider stream ${index} has an empty non-usage event`);
+      continue;
+    }
+    assert(envelope.choices.length === 1, `provider stream ${index} choice count differs`);
+    const choice = envelope.choices[0];
+    object(choice, `provider stream choice ${index}`);
+    assert(choice.index === 0, `provider stream ${index} choice index differs`);
+    object(choice.delta, `provider stream delta ${index}`);
+    const allowedDelta = new Set(["role", "content", "reasoning_content", "tool_calls", "refusal"]);
+    assert(
+      Object.keys(choice.delta).every((key) => allowedDelta.has(key)),
+      `provider stream ${index} has an unknown delta field`,
+    );
+    if (choice.delta.role !== undefined) {
+      assert(choice.delta.role === "assistant", `provider stream ${index} role differs`);
+    }
+    for (const [field, destination] of [
+      ["content", finalParts],
+      ["reasoning_content", reasoningParts],
+    ]) {
+      const value = choice.delta[field];
+      if (value === undefined || value === null) continue;
+      assert(typeof value === "string", `provider stream ${index} ${field} is invalid`);
+      assert(finishReason === undefined || value.length === 0, `provider stream ${index} emits after finish`);
+      destination.push(value);
+    }
+    if (choice.finish_reason !== undefined && choice.finish_reason !== null) {
+      assert(typeof choice.finish_reason === "string", `provider stream ${index} finish is invalid`);
+      assert(finishReason === undefined || finishReason === choice.finish_reason, `provider stream ${index} finish changed`);
+      finishReason = choice.finish_reason;
+    }
+  }
+  assert(done, `provider stream ${index} lacks [DONE]`);
+  assert(eventCount <= 32_768, `provider stream ${index} exceeds its event budget`);
+  assert(usage !== undefined, `provider stream ${index} lacks terminal token usage`);
+  return {
+    eventCount,
+    finalContent: finalParts.join(""),
+    reasoningContent: reasoningParts.join(""),
+    finishReason,
+    usage,
+  };
+}
+
 function verifyModelAndWire(modelRows, providerRows) {
   assert(modelRows.length === 11, "model call count is not 11");
   assert(providerRows.length === 11, "provider response count is not 11");
@@ -195,7 +294,7 @@ function verifyModelAndWire(modelRows, providerRows) {
     assert(row.budgets?.maxOutputTokens === maximumTokens[index], `model max tokens ${index} differs`);
     assert(row.input?.schemaVersion === "dolly.model.chat-input/3", "chat input version differs");
     assert(row.input?.outputContract?.kind === outputKinds[index], `output kind ${index} differs`);
-    assert(row.input?.stream === false, "streaming was enabled");
+    assert(row.input?.stream === true, "provider streaming was not enabled");
     assert(row.result?.status === "succeeded", `model call ${index} failed`);
     assert(row.result?.output?.finishReason === "stop", `model call ${index} did not stop normally`);
     const content = row.result?.output?.finalContent;
@@ -222,7 +321,8 @@ function verifyModelAndWire(modelRows, providerRows) {
     exact(body.messages, providerMessages(row.input.messages), `provider messages ${index}`);
     assert(body.model === "qwen3.6-27b", "provider model differs");
     assert(body.max_tokens === maximumTokens[index], `provider max_tokens ${index} differs`);
-    assert(body.stream === false, "provider stream differs");
+    assert(body.stream === true, "provider stream differs");
+    exact(body.stream_options, { include_usage: true }, `provider stream options ${index}`);
     exact(body.thinking, { type: reasoning[index] === "require" ? "enabled" : "disabled" }, `provider thinking ${index}`);
     if (outputKinds[index] === "json-object") {
       exact(body.response_format, { type: "json_object" }, `provider response_format ${index}`);
@@ -230,6 +330,15 @@ function verifyModelAndWire(modelRows, providerRows) {
       assert(!Object.hasOwn(body, "response_format"), `text call ${index} sent response_format`);
     }
     assert(!Object.hasOwn(body, "temperature"), `provider call ${index} sent unregistered temperature`);
+    const stream = providerStreamEvidence(provider, index);
+    assert(stream.finalContent === content, `provider stream content ${index} differs`);
+    assert(stream.finishReason === row.result.output.finishReason, `provider stream finish ${index} differs`);
+    const modelReasoning = row.result.output.reasoning;
+    if (modelReasoning?.state === "observed") {
+      assert(stream.reasoningContent === modelReasoning.parts.join(""), `provider reasoning stream ${index} differs`);
+    } else {
+      assert(stream.reasoningContent === "", `provider reasoning stream ${index} was discarded`);
+    }
   });
 
   const taskBRows = [modelRows[1], modelRows[6]];
@@ -411,10 +520,8 @@ function verifyAccounting(manifest, providerRows) {
     assert(entry.latencyMs >= 0, "accounting latency is invalid");
     assert(entry.tokens.recordsMissingUsage === 0, "provider token usage is missing");
   }
-  const tokenTotals = providerRows.reduce((total, row) => {
-    const usage = row.response?.usage;
-    assert(Number.isSafeInteger(usage?.prompt_tokens), "provider prompt token count is absent");
-    assert(Number.isSafeInteger(usage?.completion_tokens), "provider completion token count is absent");
+  const tokenTotals = providerRows.reduce((total, row, index) => {
+    const usage = providerStreamEvidence(row, index).usage;
     return total + usage.prompt_tokens + usage.completion_tokens;
   }, 0);
   const recorded = Object.values(accounting).reduce((total, entry) => total + entry.tokens.total, 0);
@@ -441,7 +548,7 @@ function verifyRun(runDirectory, fixtureValues) {
   const preregistration = parseJson(join(runDirectory, "preregistration.json"));
   assert(manifest.schemaVersion === "scheduler-agent-task-switch/run-manifest/1", "manifest schema differs");
   assert(manifest.experimentId === "scheduler-agent-task-switch-v0", "manifest experiment differs");
-  assert(manifest.experimentVersion === 5, "manifest experiment version differs");
+  assert(manifest.experimentVersion === 6, "manifest experiment version differs");
   assert(manifest.status === "completed" && manifest.failure === null, "run did not complete");
   assert(manifest.providerCalls === 11 && manifest.maximumProviderCalls === 11, "provider call budget differs");
   assert(manifest.secretLeasesReleased === 11, "secret leases were not released");

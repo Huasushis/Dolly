@@ -133,7 +133,7 @@ async function modelCall(run, purpose, messages, reasoning, outputKind, maxOutpu
       messages,
       reasoning,
       maxOutputTokens,
-      stream: false,
+      stream: true,
       outputContract: { kind: outputKind },
     },
     run,
