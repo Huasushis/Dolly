@@ -224,14 +224,23 @@ describe("installed reactive Module runtime composition", () => {
     const {
       configurations: _configurations,
       core: _core,
+      initialModuleGenerationId,
       installations: _installations,
       instanceConfiguration: _instanceConfiguration,
       mailboxes,
       moduleId: _moduleId,
       monotonicNow: _monotonicNow,
+      nextModuleGenerationId,
       stoppedRecordWriter: _stoppedRecordWriter,
-      ...runtime
+      ...sharedRuntime
     } = complete;
+    const runtime = {
+      ...sharedRuntime,
+      initialModuleGenerationIdFor: (moduleId: string) =>
+        `${moduleId}-${initialModuleGenerationId}`,
+      nextModuleGenerationIdFor: (moduleId: string) =>
+        `${moduleId}-${nextModuleGenerationId()}`,
+    };
     const clock = {
       monotonicNow: () => 0,
       schedule: () => ({ cancel: () => undefined }),
@@ -258,8 +267,9 @@ describe("installed reactive Module runtime composition", () => {
     });
 
     expect(composed.host.state).toBe("created");
-    expect(composed.installedRuntime.runtime.moduleGenerationId)
-      .toBe("module-generation-a");
+    expect(composed.installedRuntimes).toHaveLength(1);
+    expect(composed.installedRuntimes[0]?.runtime.moduleGenerationId)
+      .toBe("worker-module-generation-a");
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
     expect(() => composeInstalledReactiveModuleHost({
       configuration: instanceConfiguration,
@@ -274,6 +284,91 @@ describe("installed reactive Module runtime composition", () => {
       scheduling,
       runtime,
     })).toThrow(/mailbox Pages do not match Module worker/u);
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
+  });
+
+  it("composes every configured installed Module into one Scheduler host", () => {
+    const pair = coreState("pipeline");
+    pair.store.deliveries.createPage("middle");
+    pair.store.deliveries.registerConsumer("middle", "worker-two", "from-now");
+    const complete = options(pair);
+    const {
+      configurations: _configurations,
+      core: _core,
+      initialModuleGenerationId,
+      installations: _installations,
+      instanceConfiguration: _instanceConfiguration,
+      mailboxes: _mailboxes,
+      moduleId: _moduleId,
+      monotonicNow: _monotonicNow,
+      nextModuleGenerationId,
+      stoppedRecordWriter: _stoppedRecordWriter,
+      ...sharedRuntime
+    } = complete;
+    const runtime = {
+      ...sharedRuntime,
+      initialModuleGenerationIdFor: (moduleId: string) =>
+        `${moduleId}-${initialModuleGenerationId}`,
+      nextModuleGenerationIdFor: (moduleId: string) =>
+        `${moduleId}-${nextModuleGenerationId()}`,
+    };
+    const first = instanceConfiguration.modules[0]!;
+    const pipelineConfiguration = validateDollyInstanceConfig({
+      ...instanceConfiguration,
+      pages: [{ pageId: "input" }, { pageId: "middle" }, { pageId: "output" }],
+      modules: [{
+        ...first,
+        outputPageIds: ["middle"],
+      }, {
+        ...first,
+        moduleId: "worker-two",
+        inputPageIds: ["middle"],
+        outputPageIds: ["output"],
+      }],
+    });
+    const mailboxes = [{
+      consumerId: "worker",
+      pageIds: ["input"],
+      maxResidentCount: 10,
+      maxResidentBytes: 64 * 1024,
+    }, {
+      consumerId: "worker-two",
+      pageIds: ["middle"],
+      maxResidentCount: 10,
+      maxResidentBytes: 64 * 1024,
+    }];
+
+    const composed = composeInstalledReactiveModuleHost({
+      configuration: pipelineConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
+      mailboxes,
+      clock: {
+        monotonicNow: () => 0,
+        schedule: () => ({ cancel: () => undefined }),
+      },
+      scheduling: {
+        maxConcurrentModules: 2,
+        backpressureAction: "pause-upstream",
+        downstreamRecheckMs: 100,
+        noProgressAfterMs: 5_000,
+        claimLimitCount: 1,
+        claimLimitBytes: 1024,
+        retryJitterRatio: 0,
+        lowWatermarkRatio: 1,
+      },
+      runtime,
+    });
+    expect(composed.installedRuntimes.map((installed) =>
+      installed.resolvedModule.module.moduleId
+    )).toEqual(["worker", "worker-two"]);
+    expect(composed.installedRuntimes.map((installed) =>
+      installed.runtime.moduleGenerationId
+    )).toEqual([
+      "worker-module-generation-a",
+      "worker-two-module-generation-a",
+    ]);
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
 });

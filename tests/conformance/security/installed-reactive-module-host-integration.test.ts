@@ -48,8 +48,9 @@ import {
 
 const PYTHON = "/usr/bin/python3";
 const INSTANCE_ID = "44444444-4444-4444-8444-444444444444";
-const MODULE_ID = "scheduler-worker";
-const MODULE_GENERATION_ID = "scheduler-module-generation-1";
+const FIRST_MODULE_ID = "scheduler-first";
+const SECOND_MODULE_ID = "scheduler-second";
+const MODULE_IDS = [FIRST_MODULE_ID, SECOND_MODULE_ID] as const;
 const LIMITS: ModuleCgroupLimits = {
   memoryMaxBytes: 268_435_456,
   maxProcesses: 64,
@@ -111,7 +112,7 @@ if (
 }
 
 describe.skipIf(!available)("installed reactive Module host in a real control group", () => {
-  it("auto-wakes one installed process Module and reopens its committed output", async () => {
+  it("auto-wakes two installed process Modules and reopens their committed pipeline", async () => {
     if (integrationUnitName === undefined) {
       throw new Error("The transient Core service unit name is unavailable");
     }
@@ -139,11 +140,19 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
     const scratch = mkdtempSync(join(scratchParent, "installed-reactive-host-integration-"));
     const statePath = join(scratch, "core-state.json");
     const commitPath = join(scratch, "module-result-commits.json");
-    const processGenerationId = `scheduler-process-${process.pid}-${Date.now()}`;
-    const moduleCgroupPath = deriveModuleCgroupPath(
-      inspectedBinding.binding.delegatedRootCgroupPath,
-      { instanceId: INSTANCE_ID, moduleId: MODULE_ID, processGenerationId },
-    ).filesystemPath;
+    const processGenerationIds = MODULE_IDS.map((moduleId) =>
+      `${moduleId}-process-${process.pid}-${Date.now()}`
+    );
+    const moduleCgroupPaths = MODULE_IDS.map((moduleId, index) =>
+      deriveModuleCgroupPath(
+        inspectedBinding.binding.delegatedRootCgroupPath,
+        {
+          instanceId: INSTANCE_ID,
+          moduleId,
+          processGenerationId: processGenerationIds[index]!,
+        },
+      ).filesystemPath
+    );
     let composed: InstalledReactiveModuleHost | undefined;
     let stopped = false;
     try {
@@ -184,13 +193,21 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       const configurations = new ModuleConfigurationStore({
         directory: join(scratch, "configurations"),
       });
-      const moduleConfiguration = configurations.create({
-        configId: "scheduler-installed-config",
+      const firstConfiguration = configurations.create({
+        configId: "scheduler-first-config",
         extensionId: "org.example.scheduler-installed",
         moduleKind: "transform",
         configVersion: 1,
         schema: configurationSchema,
-        configuration: { prefix: "scheduled" },
+        configuration: { prefix: "first" },
+      });
+      const secondConfiguration = configurations.create({
+        configId: "scheduler-second-config",
+        extensionId: "org.example.scheduler-installed",
+        moduleKind: "transform",
+        configVersion: 1,
+        schema: configurationSchema,
+        configuration: { prefix: "second" },
       });
       const defaults = createDefaultDollyInstanceConfig(INSTANCE_ID);
       const configuration = validateDollyInstanceConfig({
@@ -203,20 +220,50 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
             retryMaxMs: 250,
           },
         },
-        pages: [{ pageId: "input" }, { pageId: "output" }],
+        pages: [{ pageId: "input" }, { pageId: "middle" }, { pageId: "output" }],
         modules: [{
-          moduleId: MODULE_ID,
+          moduleId: FIRST_MODULE_ID,
           extensionId: "org.example.scheduler-installed",
           packageVersion: "1.0.0",
           moduleKind: "transform",
           isolation: "process",
           configurationReference: {
-            configId: moduleConfiguration.configId,
-            revision: moduleConfiguration.revision,
-            configVersion: moduleConfiguration.configVersion,
+            configId: firstConfiguration.configId,
+            revision: firstConfiguration.revision,
+            configVersion: firstConfiguration.configVersion,
           },
           permissionPolicyIds: [],
           inputPageIds: ["input"],
+          outputPageIds: ["middle"],
+          subscriptionStart: "from-now",
+          activation: { kind: "reactive" },
+          limits: {
+            claim: { maxCount: 1, maxBytes: 64 * 1_024 },
+            maxInputBytes: 64 * 1_024,
+            maxResultBytes: 64 * 1_024,
+            maxFrameBytes: 128 * 1_024,
+            maxRunsPerGeneration: 10,
+            maxGenerations: 2,
+          },
+          timeouts: {
+            initializationTimeoutMs: 10_000,
+            executionTimeoutMs: 5_000,
+            cancellationGraceMs: 1_000,
+            terminationTimeoutMs: 10_000,
+          },
+        }, {
+          moduleId: SECOND_MODULE_ID,
+          extensionId: "org.example.scheduler-installed",
+          packageVersion: "1.0.0",
+          moduleKind: "transform",
+          isolation: "process",
+          configurationReference: {
+            configId: secondConfiguration.configId,
+            revision: secondConfiguration.revision,
+            configVersion: secondConfiguration.configVersion,
+          },
+          permissionPolicyIds: [],
+          inputPageIds: ["middle"],
           outputPageIds: ["output"],
           subscriptionStart: "from-now",
           activation: { kind: "reactive" },
@@ -239,8 +286,8 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
 
       let blockId = 0;
       let deliveryId = 0;
-      let moduleGeneration = 1;
       let protocolIdentifier = 0;
+      let processGenerationIndex = 0;
       const now = (): string => new Date().toISOString();
       const coreState = createFileCoreStateStoreWithStoppedRecordWriter({
         path: statePath,
@@ -250,8 +297,10 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         now,
       });
       coreState.store.deliveries.createPage("input");
+      coreState.store.deliveries.createPage("middle");
       coreState.store.deliveries.createPage("output");
-      coreState.store.deliveries.registerConsumer("input", MODULE_ID, "from-now");
+      coreState.store.deliveries.registerConsumer("input", FIRST_MODULE_ID, "from-now");
+      coreState.store.deliveries.registerConsumer("middle", SECOND_MODULE_ID, "from-now");
       coreState.store.deliveries.registerConsumer("output", "sink", "from-now");
       const repository = new FileModuleResultCommitRepository({ path: commitPath });
       const events: SchedulerEvent[] = [];
@@ -261,8 +310,13 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         configurations,
         coreState,
         mailboxes: [{
-          consumerId: MODULE_ID,
+          consumerId: FIRST_MODULE_ID,
           pageIds: ["input"],
+          maxResidentCount: 10,
+          maxResidentBytes: 1024 * 1024,
+        }, {
+          consumerId: SECOND_MODULE_ID,
+          pageIds: ["middle"],
           maxResidentCount: 10,
           maxResidentBytes: 1024 * 1024,
         }, {
@@ -273,7 +327,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         }],
         clock: systemSchedulerClock(),
         scheduling: {
-          maxConcurrentModules: 1,
+          maxConcurrentModules: 2,
           backpressureAction: "pause-upstream",
           downstreamRecheckMs: 100,
           noProgressAfterMs: 5_000,
@@ -285,9 +339,8 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         runtime: {
           resultCommitRepository: repository,
           now,
-          initialModuleGenerationId: MODULE_GENERATION_ID,
-          nextModuleGenerationId: () =>
-            `scheduler-module-generation-${++moduleGeneration}`,
+          initialModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-1`,
+          nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
           binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
           declaredExternalEffects: "none",
@@ -307,7 +360,13 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
             forceKillDelayMs: 500,
           },
           channelCloseTimeoutMs: 5_000,
-          nextProcessGenerationId: () => processGenerationId,
+          nextProcessGenerationId: () => {
+            const next = processGenerationIds[processGenerationIndex++];
+            if (next === undefined) {
+              throw new Error("The integration attempted an unexpected process generation");
+            }
+            return next;
+          },
           nextProtocolIdentifier: (purpose) =>
             `${purpose}-scheduler-installed-${++protocolIdentifier}`,
           classifyFailure: (failure) => ({ code: failure.code, retryable: false }),
@@ -317,18 +376,22 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
 
       await composed.host.start();
       expect(await waitFor(
-        () => events.some((event) =>
-          event.type === "scheduler.decision" &&
-          event.moduleId === MODULE_ID &&
-          !event.eligible
-        ),
+        () => MODULE_IDS.every((moduleId) => events.some((event) =>
+          event.type === "scheduler.decision" && event.moduleId === moduleId && !event.eligible
+        )),
         2_000,
       )).toBe(true);
-      expect(coreState.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
-        state: "running",
-        packageDigest: installed.packageDigest,
+      expect(composed.installedRuntimes).toHaveLength(2);
+      MODULE_IDS.forEach((moduleId, index) => {
+        expect(
+          composed?.installedRuntimes[index]?.generations.processGenerationIdFor(
+            `${moduleId}-generation-1`,
+          ),
+        ).toBe(processGenerationIds[index]);
+        expect(coreState.store.getModuleProcessRecord(processGenerationIds[index]!))
+          .toMatchObject({ state: "running", packageDigest: installed.packageDigest });
+        expect(existsSync(moduleCgroupPaths[index]!)).toBe(true);
       });
-      expect(existsSync(moduleCgroupPath)).toBe(true);
 
       const input = coreState.store.blocks.commit(proposal("wake after the empty pass"), {
         kind: "external",
@@ -340,27 +403,35 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           coreState.store.deliveries.inspectPending("sink", ["output"]).pendingCount === 1,
         5_000,
       )).toBe(true);
-      expect(events).toContainEqual(expect.objectContaining({
-        type: "scheduler.dispatched",
-        moduleId: MODULE_ID,
-      }));
-      expect(events).toContainEqual(expect.objectContaining({
-        type: "scheduler.settled",
-        moduleId: MODULE_ID,
-        tickStatus: "committed",
-      }));
-      expect(repository.list()).toHaveLength(1);
-      expect(repository.list()[0]).toMatchObject({ state: "committed" });
+      for (const moduleId of MODULE_IDS) {
+        expect(events).toContainEqual(expect.objectContaining({
+          type: "scheduler.dispatched",
+          moduleId,
+        }));
+        expect(events).toContainEqual(expect.objectContaining({
+          type: "scheduler.settled",
+          moduleId,
+          tickStatus: "committed",
+        }));
+      }
+      expect(repository.list()).toHaveLength(2);
+      expect(repository.list()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ state: "committed", source: { kind: "module", id: FIRST_MODULE_ID } }),
+        expect.objectContaining({ state: "committed", source: { kind: "module", id: SECOND_MODULE_ID } }),
+      ]));
 
       await composed.host.stop();
       stopped = true;
       expect(composed.host.state).toBe("stopped");
-      expect(coreState.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
-        state: "stopped",
-        packageDigest: installed.packageDigest,
-        moduleCgroupPath,
+      MODULE_IDS.forEach((_moduleId, index) => {
+        expect(coreState.store.getModuleProcessRecord(processGenerationIds[index]!))
+          .toMatchObject({
+            state: "stopped",
+            packageDigest: installed.packageDigest,
+            moduleCgroupPath: moduleCgroupPaths[index],
+          });
+        expect(existsSync(moduleCgroupPaths[index]!)).toBe(false);
       });
-      expect(existsSync(moduleCgroupPath)).toBe(false);
 
       const reopened = new FileCoreStateStore({
         path: statePath,
@@ -370,10 +441,13 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         now,
       });
       const reopenedRepository = new FileModuleResultCommitRepository({ path: commitPath });
-      const committed = reopenedRepository.list()[0];
+      const committed = reopenedRepository.list().find((record) =>
+        record.source.id === SECOND_MODULE_ID
+      );
+      expect(reopenedRepository.list()).toHaveLength(2);
       expect(committed).toMatchObject({
         state: "committed",
-        source: { kind: "module", id: MODULE_ID },
+        source: { kind: "module", id: SECOND_MODULE_ID },
         outputDeliveries: [expect.objectContaining({ pageId: "output" })],
       });
       if (committed?.blockId === undefined) {
@@ -382,31 +456,41 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       expect(reopened.blocks.get(committed.blockId)).toMatchObject({
         payload: {
           value: {
-            items: [expect.objectContaining({ type: "text", text: "scheduled:1" })],
+            items: [expect.objectContaining({ type: "text", text: "second:1" })],
           },
         },
       });
       expect(reopened.deliveries.inspectPending("sink", ["output"]).pendingCount).toBe(1);
-      expect(reopened.getModuleProcessRecord(processGenerationId)?.state).toBe("stopped");
+      expect(reopened.deliveries.inspectPending(SECOND_MODULE_ID, ["middle"]).pendingCount)
+        .toBe(0);
+      expect(reopened.deliveries.inspectPending(FIRST_MODULE_ID, ["input"]).pendingCount)
+        .toBe(0);
+      for (const processGenerationId of processGenerationIds) {
+        expect(reopened.getModuleProcessRecord(processGenerationId)?.state).toBe("stopped");
+      }
 
       console.info(JSON.stringify({
         packageDigest: installed.packageDigest,
-        processGenerationId,
-        moduleCgroupPath,
-        initialEmptyDecisionObserved: true,
+        processGenerationIds,
+        moduleCgroupPaths,
+        initialEmptyDecisionsObserved: MODULE_IDS.length,
         configuredPollIntervalMs: 60_000,
         outputCommittedWithinMs: 5_000,
-        finalRecordState: reopened.getModuleProcessRecord(processGenerationId)?.state,
-        cgroupRemoved: !existsSync(moduleCgroupPath),
-        reopenedOutput: "scheduled:1",
+        committedModuleResults: reopenedRepository.list().length,
+        finalRecordStates: processGenerationIds.map((processGenerationId) =>
+          reopened.getModuleProcessRecord(processGenerationId)?.state
+        ),
+        cgroupsRemoved: moduleCgroupPaths.every((path) => !existsSync(path)),
+        reopenedOutput: "second:1",
       }));
     } finally {
       if (!stopped && composed !== undefined &&
         (composed.host.state === "running" || composed.host.state === "failed")) {
         await composed.host.stop().catch(() => undefined);
       }
-      if (existsSync(moduleCgroupPath)) {
-        throw new Error(`Exact Module control group remained after cleanup: ${moduleCgroupPath}`);
+      const remainingCgroup = moduleCgroupPaths.find((path) => existsSync(path));
+      if (remainingCgroup !== undefined) {
+        throw new Error(`Exact Module control group remained after cleanup: ${remainingCgroup}`);
       }
       rmSync(scratch, { recursive: true, force: true });
     }

@@ -256,13 +256,20 @@ type InstalledHostRuntimeOptions = Omit<
   InstalledReactiveModuleRuntimeOptions,
   | "configurations"
   | "core"
+  | "initialModuleGenerationId"
   | "installations"
   | "instanceConfiguration"
   | "mailboxes"
   | "moduleId"
   | "monotonicNow"
+  | "nextModuleGenerationId"
   | "stoppedRecordWriter"
->;
+> & {
+  /** Allocates the first non-reused generation identifier for each configured Module. */
+  readonly initialModuleGenerationIdFor: (moduleId: string) => string;
+  /** Allocates later non-reused generation identifiers in that same Module's actor. */
+  readonly nextModuleGenerationIdFor: (moduleId: string) => string;
+};
 
 export interface InstalledReactiveModuleHostOptions {
   readonly configuration: DollyInstanceConfig;
@@ -278,70 +285,83 @@ export interface InstalledReactiveModuleHostOptions {
 }
 
 export interface InstalledReactiveModuleHost {
-  readonly installedRuntime: InstalledReactiveModuleRuntime;
+  readonly installedRuntimes: readonly InstalledReactiveModuleRuntime[];
   readonly host: ReactiveModuleHost;
 }
 
 /**
- * Builds the current one-Module Scheduler vertical slice without accepting a
- * caller-supplied runtime or manifest. This remains a product-before-bootstrap
+ * Builds every configured reactive Module into one Scheduler without accepting
+ * caller-supplied runtimes or manifests. This remains a product-before-bootstrap
  * composition because instance schema 9 cannot persist its Linux settings.
  */
 export function composeInstalledReactiveModuleHost(
   options: InstalledReactiveModuleHostOptions,
 ): InstalledReactiveModuleHost {
-  if (options.configuration.modules.length !== 1) {
+  if (options.configuration.modules.length === 0) {
     throw new TypeError(
-      "Installed reactive Module host currently requires exactly one configured Module",
+      "Installed reactive Module host requires at least one configured Module",
     );
   }
-  const module = options.configuration.modules[0]!;
-  const matchingMailboxes = options.mailboxes.filter((mailbox) =>
-    mailbox.consumerId === module.moduleId
-  );
-  if (matchingMailboxes.length !== 1) {
-    throw new TypeError(
-      `Installed reactive Module host requires one mailbox for Module ${module.moduleId}`,
+  const moduleMailboxes = options.configuration.modules.map((module) => {
+    const matchingMailboxes = options.mailboxes.filter((mailbox) =>
+      mailbox.consumerId === module.moduleId
     );
-  }
-  const moduleMailbox = matchingMailboxes[0]!;
-  if (
-    moduleMailbox.pageIds.length !== module.inputPageIds.length ||
-    moduleMailbox.pageIds.some((pageId, index) => pageId !== module.inputPageIds[index])
-  ) {
-    throw new TypeError(
-      `Installed reactive Module mailbox Pages do not match Module ${module.moduleId}`,
-    );
-  }
-  const installedRuntime = createInstalledReactiveModuleRuntime({
-    ...options.runtime,
-    instanceConfiguration: options.configuration,
-    moduleId: module.moduleId,
-    installations: options.installations,
-    configurations: options.configurations,
-    core: options.coreState.store,
-    stoppedRecordWriter: options.coreState.stoppedRecordWriter,
-    mailboxes: options.mailboxes,
-    monotonicNow: options.clock.monotonicNow,
+    if (matchingMailboxes.length !== 1) {
+      throw new TypeError(
+        `Installed reactive Module host requires one mailbox for Module ${module.moduleId}`,
+      );
+    }
+    const mailbox = matchingMailboxes[0]!;
+    if (
+      mailbox.pageIds.length !== module.inputPageIds.length ||
+      mailbox.pageIds.some((pageId, index) => pageId !== module.inputPageIds[index])
+    ) {
+      throw new TypeError(
+        `Installed reactive Module mailbox Pages do not match Module ${module.moduleId}`,
+      );
+    }
+    return Object.freeze({ module, mailbox });
   });
+  const {
+    initialModuleGenerationIdFor,
+    nextModuleGenerationIdFor,
+    ...sharedRuntimeOptions
+  } = options.runtime;
+  const installedRuntimes = moduleMailboxes.map(({ module }) =>
+    createInstalledReactiveModuleRuntime({
+      ...sharedRuntimeOptions,
+      instanceConfiguration: options.configuration,
+      moduleId: module.moduleId,
+      installations: options.installations,
+      configurations: options.configurations,
+      core: options.coreState.store,
+      stoppedRecordWriter: options.coreState.stoppedRecordWriter,
+      mailboxes: options.mailboxes,
+      initialModuleGenerationId:
+        initialModuleGenerationIdFor(module.moduleId),
+      nextModuleGenerationId: () =>
+        nextModuleGenerationIdFor(module.moduleId),
+      monotonicNow: options.clock.monotonicNow,
+    })
+  );
   const host = composeReactiveModuleHost({
     configuration: options.configuration,
     deliveries: options.coreState.store.deliveries,
     clock: options.clock,
     scheduling: options.scheduling,
-    registrations: [{
+    registrations: moduleMailboxes.map(({ module, mailbox }, index) => ({
       moduleId: module.moduleId,
-      runtime: installedRuntime.runtime,
+      runtime: installedRuntimes[index]!.runtime,
       mailbox: {
-        maxPendingCount: moduleMailbox.maxResidentCount,
-        maxPendingBytes: moduleMailbox.maxResidentBytes,
+        maxPendingCount: mailbox.maxResidentCount,
+        maxPendingBytes: mailbox.maxResidentBytes,
       },
-      manifest: installedRuntime.resolvedModule.installation.manifest,
-    }],
+      manifest: installedRuntimes[index]!.resolvedModule.installation.manifest,
+    })),
     ...(options.random === undefined ? {} : { random: options.random }),
     ...(options.onSchedulerEvent === undefined
       ? {}
       : { onSchedulerEvent: options.onSchedulerEvent }),
   });
-  return Object.freeze({ installedRuntime, host });
+  return Object.freeze({ installedRuntimes: Object.freeze(installedRuntimes), host });
 }
