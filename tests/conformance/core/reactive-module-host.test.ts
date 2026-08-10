@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { JsonValue } from "../../../src/core/canonical-json.js";
+import type { ExtensionPackageManifest } from "../../../src/core/extension-installation-registry.js";
 import type { ReactiveModuleTickResult } from "../../../src/core/reactive-module-runtime.js";
 import {
   composeReactiveModuleHost,
@@ -104,6 +105,22 @@ function configuredInstance(
 function composition(
   config: DollyInstanceConfig,
   managed = runtime("worker", []),
+  manifest: ExtensionPackageManifest = {
+    schemaVersion: "dolly.extension-package/1",
+    extensionId: "org.example.worker",
+    packageVersion: "1.0.0",
+    displayName: "Worker",
+    description: "Test worker",
+    supportedProtocolVersions: ["3.0"],
+    entrypoint: "dist/worker.mjs",
+    modules: [{
+      moduleKind: "transform",
+      activation: "reactive",
+      configVersion: 1,
+      configurationSchema: { type: "object" },
+    }],
+    requestedCapabilities: [],
+  },
 ): ReactiveModuleHostComposition {
   return {
     configuration: config,
@@ -128,6 +145,7 @@ function composition(
       moduleId: "worker",
       runtime: managed,
       mailbox: { maxPendingCount: 10, maxPendingBytes: 8192 },
+      manifest,
     }],
   };
 }
@@ -192,9 +210,29 @@ describe("reactive Module host lifecycle", () => {
       configuration: { ...config, schemaVersion: "dolly.instance/8" } as never,
     })).toThrow(/schemaVersion is unsupported/u);
 
+    expect(() => composeReactiveModuleHost(composition(configuredInstance({
+      activation: { kind: "periodic", periodMs: 1000, allowEmptyInput: false },
+    })))).toThrow(/does not support periodic activation/u);
+
+    const periodicManifest = {
+      schemaVersion: "dolly.extension-package/2",
+      extensionId: "org.example.worker",
+      packageVersion: "1.0.0",
+      displayName: "Worker",
+      description: "Test worker",
+      supportedProtocolVersions: ["3.0"],
+      entrypoint: "dist/worker.mjs",
+      modules: [{
+        moduleKind: "transform",
+        supportedActivations: ["reactive", "periodic"],
+        configVersion: 1,
+        configurationSchema: { type: "object" },
+      }],
+      requestedCapabilities: [],
+    } satisfies ExtensionPackageManifest;
     expect(composeReactiveModuleHost(composition(configuredInstance({
       activation: { kind: "periodic", periodMs: 1000, allowEmptyInput: false },
-    })))).toBeInstanceOf(ReactiveModuleHost);
+    }), undefined, periodicManifest))).toBeInstanceOf(ReactiveModuleHost);
 
     expect(() => composeReactiveModuleHost(composition(configuredInstance({
       activation: { kind: "periodic", periodMs: 1000, allowEmptyInput: true },
@@ -222,9 +260,36 @@ describe("reactive Module host lifecycle", () => {
           moduleId: "unexpected",
           runtime: runtime("unexpected", []),
           mailbox: { maxPendingCount: 1, maxPendingBytes: 256 },
+          manifest: input.registrations[0]!.manifest,
         },
       ],
     })).toThrow(/unknown runtime registrations: unexpected/u);
+  });
+
+  it("binds each runtime to the exact package identity, Module kind, and configuration version", () => {
+    const config = configuredInstance();
+    const input = composition(config);
+    const manifest = input.registrations[0]!.manifest;
+
+    expect(() => composeReactiveModuleHost({
+      ...input,
+      registrations: [{
+        ...input.registrations[0]!,
+        manifest: { ...manifest, extensionId: "org.example.other" },
+      }],
+    })).toThrow(/package identity does not match/u);
+
+    expect(() => composeReactiveModuleHost(composition(configuredInstance({
+      moduleKind: "other-kind",
+    })))).toThrow(/does not declare Module kind other-kind/u);
+
+    expect(() => composeReactiveModuleHost(composition(configuredInstance({
+      configurationReference: {
+        configId: "worker-default",
+        revision: `sha256:${"1".repeat(64)}`,
+        configVersion: 2,
+      },
+    })))).toThrow(/does not support configuration version 2/u);
   });
 
   it("rejects a Scheduler batch that exceeds any Module claim maximum", () => {

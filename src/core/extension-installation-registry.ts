@@ -50,7 +50,8 @@ import {
 } from "./synchronous-cross-process-lock.js";
 
 const PACKAGE_MANIFEST_FILE = "dolly-extension.json";
-const PACKAGE_SCHEMA_VERSION = "dolly.extension-package/1";
+const PACKAGE_SCHEMA_VERSION_1 = "dolly.extension-package/1";
+const PACKAGE_SCHEMA_VERSION_2 = "dolly.extension-package/2";
 const INSTALLATION_RECORD_SCHEMA_VERSION = "dolly.extension-installation/1";
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
@@ -63,20 +64,31 @@ const MAX_RELATIVE_PATH_BYTES = 4_096;
 
 export type { ExtensionTrust } from "./extension-process-host.js";
 
-export interface ExtensionPackageModule extends Readonly<Record<string, JsonValue>> {
+export type ExtensionModuleActivation = "reactive" | "periodic";
+
+export interface ExtensionPackageModuleV1 extends Readonly<Record<string, JsonValue>> {
   readonly moduleKind: string;
   readonly activation: "reactive";
   readonly configVersion: number;
   readonly configurationSchema: JsonValue;
 }
 
+export interface ExtensionPackageModuleV2 extends Readonly<Record<string, JsonValue>> {
+  readonly moduleKind: string;
+  readonly supportedActivations: readonly ExtensionModuleActivation[];
+  readonly configVersion: number;
+  readonly configurationSchema: JsonValue;
+}
+
+export type ExtensionPackageModule = ExtensionPackageModuleV1 | ExtensionPackageModuleV2;
+
 /**
- * `dolly.extension-package/1` is the closed, static manifest read before any
- * Extension code runs. It relates a Node.js package to Dolly's Extension process
- * protocol and Module configuration; `package.json` has no standard fields for
- * those Dolly-specific declarations.
+ * Closed Extension package manifests are read before any Extension code runs.
+ * They relate a Node.js package to Dolly's Extension process protocol,
+ * supported Module activation modes, and Module configuration; `package.json`
+ * has no standard fields for those Dolly-specific declarations.
  */
-export interface ExtensionPackageManifest extends Readonly<Record<string, JsonValue>> {
+export interface ExtensionPackageManifestV1 extends Readonly<Record<string, JsonValue>> {
   readonly schemaVersion: "dolly.extension-package/1";
   readonly extensionId: string;
   readonly packageVersion: string;
@@ -84,8 +96,30 @@ export interface ExtensionPackageManifest extends Readonly<Record<string, JsonVa
   readonly description: string;
   readonly supportedProtocolVersions: readonly string[];
   readonly entrypoint: string;
-  readonly modules: readonly ExtensionPackageModule[];
+  readonly modules: readonly ExtensionPackageModuleV1[];
   readonly requestedCapabilities: readonly [];
+}
+
+export interface ExtensionPackageManifestV2 extends Readonly<Record<string, JsonValue>> {
+  readonly schemaVersion: "dolly.extension-package/2";
+  readonly extensionId: string;
+  readonly packageVersion: string;
+  readonly displayName: string;
+  readonly description: string;
+  readonly supportedProtocolVersions: readonly string[];
+  readonly entrypoint: string;
+  readonly modules: readonly ExtensionPackageModuleV2[];
+  readonly requestedCapabilities: readonly [];
+}
+
+export type ExtensionPackageManifest = ExtensionPackageManifestV1 | ExtensionPackageManifestV2;
+
+export interface ExtensionModuleCompatibility {
+  readonly extensionId: string;
+  readonly packageVersion: string;
+  readonly moduleKind: string;
+  readonly configVersion: number;
+  readonly activation: ExtensionModuleActivation;
 }
 
 export interface ResolvedExtensionInstallation {
@@ -360,12 +394,16 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     ],
     "Extension package manifest",
   );
-  if (value.schemaVersion !== PACKAGE_SCHEMA_VERSION) {
+  if (
+    value.schemaVersion !== PACKAGE_SCHEMA_VERSION_1 &&
+    value.schemaVersion !== PACKAGE_SCHEMA_VERSION_2
+  ) {
     throw new ExtensionInstallationError(
       "EXTENSION_PACKAGE_INVALID",
       "Extension package schema is unsupported",
     );
   }
+  const schemaVersion = value.schemaVersion;
   if (
     !Array.isArray(value.supportedProtocolVersions) ||
     value.supportedProtocolVersions.length === 0 ||
@@ -396,7 +434,9 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     const label = `modules[${index}]`;
     exactKeys(
       candidate,
-      ["moduleKind", "activation", "configVersion", "configurationSchema"],
+      schemaVersion === PACKAGE_SCHEMA_VERSION_1
+        ? ["moduleKind", "activation", "configVersion", "configurationSchema"]
+        : ["moduleKind", "supportedActivations", "configVersion", "configurationSchema"],
       label,
     );
     const moduleKind = identifier(candidate.moduleKind, `${label}.moduleKind`);
@@ -407,11 +447,44 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
       );
     }
     moduleKinds.add(moduleKind);
-    if (candidate.activation !== "reactive") {
-      throw new ExtensionInstallationError(
-        "EXTENSION_PACKAGE_INVALID",
-        `${label}.activation must be reactive`,
-      );
+    let activationDeclaration:
+      | { readonly activation: "reactive" }
+      | { readonly supportedActivations: readonly ExtensionModuleActivation[] };
+    if (schemaVersion === PACKAGE_SCHEMA_VERSION_1) {
+      if (candidate.activation !== "reactive") {
+        throw new ExtensionInstallationError(
+          "EXTENSION_PACKAGE_INVALID",
+          `${label}.activation must be reactive`,
+        );
+      }
+      activationDeclaration = { activation: "reactive" };
+    } else {
+      if (
+        !Array.isArray(candidate.supportedActivations) ||
+        candidate.supportedActivations.length === 0 ||
+        candidate.supportedActivations.length > 2
+      ) {
+        throw new ExtensionInstallationError(
+          "EXTENSION_PACKAGE_INVALID",
+          `${label}.supportedActivations must contain between 1 and 2 values`,
+        );
+      }
+      const supportedActivations = candidate.supportedActivations.map((activation) => {
+        if (activation !== "reactive" && activation !== "periodic") {
+          throw new ExtensionInstallationError(
+            "EXTENSION_PACKAGE_INVALID",
+            `${label}.supportedActivations contains an unsupported activation`,
+          );
+        }
+        return activation;
+      });
+      if (new Set(supportedActivations).size !== supportedActivations.length) {
+        throw new ExtensionInstallationError(
+          "EXTENSION_PACKAGE_INVALID",
+          `${label}.supportedActivations contains duplicates`,
+        );
+      }
+      activationDeclaration = { supportedActivations };
     }
     try {
       compileJsonSchema(candidate.configurationSchema as JsonValue);
@@ -424,10 +497,10 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     }
     return {
       moduleKind,
-      activation: "reactive",
+      ...activationDeclaration,
       configVersion: positiveInteger(candidate.configVersion, `${label}.configVersion`),
       configurationSchema: cloneJson(candidate.configurationSchema as JsonValue),
-    };
+    } as ExtensionPackageModule;
   });
   if (!Array.isArray(value.requestedCapabilities) || value.requestedCapabilities.length !== 0) {
     throw new ExtensionInstallationError(
@@ -436,7 +509,7 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     );
   }
   return deepFreeze({
-    schemaVersion: PACKAGE_SCHEMA_VERSION,
+    schemaVersion,
     extensionId: identifier(value.extensionId, "extensionId"),
     packageVersion: identifier(value.packageVersion, "packageVersion"),
     displayName: boundedText(value.displayName, "displayName", 256),
@@ -446,6 +519,52 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     modules,
     requestedCapabilities: [],
   }) as ExtensionPackageManifest;
+}
+
+function supportedActivations(
+  manifest: ExtensionPackageManifest,
+  module: ExtensionPackageModule,
+): readonly ExtensionModuleActivation[] {
+  return manifest.schemaVersion === PACKAGE_SCHEMA_VERSION_1
+    ? [(module as ExtensionPackageModuleV1).activation]
+    : (module as ExtensionPackageModuleV2).supportedActivations;
+}
+
+/**
+ * Verifies that one already-validated instance Module selects a capability
+ * declared by the exact installed package. This is a static compatibility
+ * check: it never executes Extension code and does not start a process.
+ */
+export function assertExtensionModuleCompatibility(
+  manifest: ExtensionPackageManifest,
+  expected: ExtensionModuleCompatibility,
+): void {
+  if (
+    manifest.extensionId !== expected.extensionId ||
+    manifest.packageVersion !== expected.packageVersion
+  ) {
+    throw new TypeError(
+      `Extension package identity does not match Module ${expected.moduleKind}`,
+    );
+  }
+  const module = manifest.modules.find((candidate) =>
+    candidate.moduleKind === expected.moduleKind
+  );
+  if (!module) {
+    throw new TypeError(
+      `Extension package does not declare Module kind ${expected.moduleKind}`,
+    );
+  }
+  if (module.configVersion !== expected.configVersion) {
+    throw new TypeError(
+      `Extension Module ${expected.moduleKind} does not support configuration version ${expected.configVersion}`,
+    );
+  }
+  if (!supportedActivations(manifest, module).includes(expected.activation)) {
+    throw new TypeError(
+      `Extension Module ${expected.moduleKind} does not support ${expected.activation} activation`,
+    );
+  }
 }
 
 function parseManifest(bytes: Uint8Array, limits: InstallationLimits): ExtensionPackageManifest {

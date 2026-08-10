@@ -10,6 +10,7 @@ import {
 } from "../../../src/core/extension-process-host.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
+import type { ExtensionPackageManifest } from "../../../src/core/extension-installation-registry.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import { systemSchedulerClock } from "../../../src/core/module-scheduler.js";
 import { createModuleResultCommitCoordinator } from "../../../src/core/module-result-commit-factory.js";
@@ -35,6 +36,22 @@ const scratchParent = resolve(repositoryRoot, "..", ".tmp");
 const FIXTURE = fileURLToPath(
   new URL("../security/fixtures/extension-process-fixture.mjs", import.meta.url),
 );
+const MANIFEST: ExtensionPackageManifest = {
+  schemaVersion: "dolly.extension-package/2",
+  extensionId: "com.example.fixture",
+  packageVersion: "1.0.0",
+  displayName: "Process test fixture",
+  description: "Runs one real child behind the Delivery-backed Module host.",
+  supportedProtocolVersions: ["3.0"],
+  entrypoint: "extension-process-fixture.mjs",
+  modules: [{
+    moduleKind: "fixture",
+    supportedActivations: ["periodic"],
+    configVersion: 1,
+    configurationSchema: { type: "object" },
+  }],
+  requestedCapabilities: [],
+};
 
 function proposal(text: string): BlockProposal {
   return {
@@ -54,10 +71,10 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-describe("reactive Module host with a real child process", () => {
-  it("auto-wakes from a durable input and commits the child result through FileCore", async () => {
+describe("Delivery-backed periodic Module host with a real child process", () => {
+  it("uses one durable input Claim and commits the child result through FileCore", async () => {
     mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
-    const root = mkdtempSync(join(scratchParent, "dolly-reactive-host-real-"));
+    const root = mkdtempSync(join(scratchParent, "dolly-periodic-host-real-"));
     const processGenerationId = "process-generation-host-real-1";
     const moduleGenerationId = "module-generation-host-real-1";
     const extensionHosts: ExtensionProcessHost[] = [];
@@ -106,7 +123,7 @@ describe("reactive Module host with a real child process", () => {
           inputPageIds: ["input"],
           outputPageIds: ["output"],
           subscriptionStart: "from-now",
-          activation: { kind: "reactive" },
+          activation: { kind: "periodic", periodMs: 250, allowEmptyInput: false },
           limits: {
             claim: { maxCount: 1, maxBytes: 64 * 1024 },
             maxInputBytes: 64 * 1024,
@@ -210,22 +227,7 @@ describe("reactive Module host with a real child process", () => {
             isolation: "process",
             trust: "trusted",
             isolationPolicy: new ExtensionIsolationPolicy(),
-            manifest: {
-              schemaVersion: "dolly.extension-package/1",
-              extensionId: "com.example.fixture",
-              packageVersion: "1.0.0",
-              displayName: "Process test fixture",
-              description: "Runs one real child behind the reactive Module host.",
-              supportedProtocolVersions: ["3.0"],
-              entrypoint: "extension-process-fixture.mjs",
-              modules: [{
-                moduleKind: "fixture",
-                activation: "reactive",
-                configVersion: 1,
-                configurationSchema: { type: "object" },
-              }],
-              requestedCapabilities: [],
-            },
+            manifest: MANIFEST,
             command: process.execPath,
             args: [FIXTURE, "module-result-then-cancel"],
             workingDirectory: root,
@@ -288,6 +290,7 @@ describe("reactive Module host with a real child process", () => {
           moduleId: "worker",
           runtime: managedRuntime,
           mailbox: { maxPendingCount: 10, maxPendingBytes: 1024 * 1024 },
+          manifest: MANIFEST,
         }],
       });
 

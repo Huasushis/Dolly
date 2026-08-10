@@ -95,11 +95,12 @@ success.
 
 ## 3. Package metadata and discovery
 
-The host MUST discover metadata without executing Extension code. Schema
-`dolly.extension-package/1` is the static manifest that connects an installed
-Node.js package to Dolly's Extension protocol, Module kinds, and configuration
-schemas. A separate manifest is necessary because the standard `package.json`
-format does not define those Dolly contracts.
+The host MUST discover metadata without executing Extension code. Schemas
+`dolly.extension-package/1` and `dolly.extension-package/2` are static manifests
+that connect an installed Node.js package to Dolly's Extension protocol, Module
+kinds, supported activation modes, and configuration schemas. A separate
+manifest is necessary because the standard `package.json` format does not
+define those Dolly contracts.
 
 ```typescript
 interface ExtensionPackageManifest {
@@ -136,11 +137,37 @@ only reactive Modules. `configurationSchema` MUST be a valid JSON Schema Draft
 it validates. `supportedProtocolVersions` is a non-empty exact list; protocol
 version ranges are not inferred.
 
-`requestedCapabilities` MUST be empty in package schema version 1. Capability
-requests, payload schema registration, renderer registration, configuration
-migrations, and package signatures require a later package schema with its own
-security review and conformance tests. A valid future signature may establish
-package provenance, but it will not grant capabilities or trust by itself.
+Package schema version 2 replaces the single `activation` field with an exact,
+non-empty `supportedActivations` list:
+
+```typescript
+interface ExtensionPackageManifestV2 {
+  schemaVersion: "dolly.extension-package/2";
+  // The other package identity and protocol fields are unchanged from version 1.
+  modules: readonly {
+    moduleKind: string;
+    supportedActivations: readonly ("reactive" | "periodic")[];
+    configVersion: number;
+    configurationSchema: JsonValue;
+  }[];
+}
+```
+
+Version 2 does not create a hybrid Module. An instance still selects exactly
+one primary activation mode. Before starting a process, Core MUST match the
+exact installed `extensionId`, `packageVersion`, `moduleKind`, `configVersion`,
+and selected activation against the static manifest. Version 2 currently
+allows `periodic` only for the delivery-backed, non-empty slice defined in
+`core-runtime.md` Section 11. Empty periodic and source activation are not
+declarable package capabilities because their durable job and completion
+boundaries are not implemented.
+
+`requestedCapabilities` MUST be empty in package schema versions 1 and 2.
+Capability requests, payload schema registration, renderer registration,
+configuration migrations, and package signatures require a later package schema
+with its own security review and conformance tests. A valid future signature may
+establish package provenance, but it will not grant capabilities or trust by
+itself.
 
 Installation recursively copies only ordinary files under finite file and byte
 limits. It rejects symbolic links, reparse points, path escapes, case-folding
@@ -448,12 +475,13 @@ not an omitted effect. This component path is not yet product startup wiring:
 `runtime-bootstrap.ts` still rejects configured Modules.
 
 No capability currently lets background code activate its own Module. Background
-code MUST NOT publish a Block or call `module.execute` on itself. The first
-runtime supports only reactive activation and MUST reject periodic, source, and
-manual Module jobs. In addition, the current Module result commit coordinator
-requires a Delivery Claim and input acknowledgement, so a host MUST NOT grant
-source or manual activation until a separate completion boundary is specified
-and implemented.
+code MUST NOT publish a Block or call `module.execute` on itself. The guarded
+pre-bootstrap runtime supports reactive activation and delivery-backed periodic
+activation with `allowEmptyInput: false`; both require a Delivery Claim and use
+the same input acknowledgement and result commit. A host MUST reject empty
+periodic, source, and manual activation until a separate durable job and
+completion boundary is specified and implemented. Product startup still
+rejects every configured Module.
 
 An extension that prepares durable work during `module.execute` MUST NOT treat
 the returned result as committed. The first Linux Module profile defers both

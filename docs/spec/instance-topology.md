@@ -387,13 +387,17 @@ as an error.
 - A Module whose activation is `source` MUST have no input connections.
 - A Module whose activation is not `source` MUST have at least one input
   connection.
-- Only reactive activation is currently accepted. `core-runtime.md` Section 11
-  requires periodic and source activation to be rejected until their scheduler
-  and completion boundaries exist, and `extension-process-protocol.md` Section 3
-  allows only `activation: "reactive"` in package manifest version 1. Both
-  editing interfaces MUST reject a candidate that declares another activation,
-  with an error that says the mode is not yet supported rather than that it is
-  invalid.
+- Instance schema version 9 can represent reactive, periodic, and source
+  declarations, but representation is not proof that a mode can start. Package
+  manifest version 1 supports only reactive activation. Package manifest version
+  2 can explicitly support reactive and/or periodic activation.
+- The guarded pre-bootstrap composition accepts periodic only when the instance
+  has input Pages, sets `allowEmptyInput: false`, and the exact installed package
+  version declares periodic support for the selected Module kind and
+  configuration version. It rejects a mismatch before starting Extension code.
+- Empty periodic and source activation remain unsupported. Product bootstrap
+  still rejects all configured Modules. Editing and startup surfaces MUST report
+  an unsupported implementation boundary, not call these declarations malformed.
 
 ### 6.6 Finite size limits
 

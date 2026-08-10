@@ -1,5 +1,9 @@
 import type { JsonValue } from "./canonical-json.js";
 import {
+  assertExtensionModuleCompatibility,
+  type ExtensionPackageManifest,
+} from "./extension-installation-registry.js";
+import {
   ModuleScheduler,
   type SchedulerBackpressureAction,
   type SchedulerClock,
@@ -61,6 +65,8 @@ export interface ReactiveModuleHostRuntimeRegistration {
   readonly moduleId: string;
   readonly runtime: ManagedReactiveModuleRuntime;
   readonly mailbox: SchedulerMailboxLimits;
+  /** Verified static manifest from the installation resolver; no Extension code has run. */
+  readonly manifest: ExtensionPackageManifest;
 }
 
 export interface ReactiveModuleHostComposition {
@@ -152,6 +158,13 @@ export function composeReactiveModuleHost(
       );
     }
     const registration = registrations.get(module.moduleId)!;
+    assertExtensionModuleCompatibility(registration.manifest, {
+      extensionId: module.extensionId,
+      packageVersion: module.packageVersion,
+      moduleKind: module.moduleKind,
+      configVersion: module.configurationReference.configVersion,
+      activation: module.activation.kind,
+    });
     const activation = module.activation.kind === "periodic"
       ? {
           kind: "periodic" as const,
