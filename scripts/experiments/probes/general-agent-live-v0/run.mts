@@ -44,6 +44,7 @@ import {
 import { createModuleResultCommitCoordinator } from "../../../../src/core/module-result-commit-factory.js";
 import {
   createModelOperationCapability,
+  createModelOperationCapabilityV2,
   type ChatModelBrokerPort,
 } from "../../../../src/core/provider-capabilities/model-operation-capability.js";
 import { createToolInvocationCapabilityV2 } from "../../../../src/core/provider-capabilities/tool-invocation-capability.js";
@@ -82,6 +83,7 @@ const CHAT_STRATEGIES = new Set([
   "openai.reasoning-content.nonstream.v1",
   "openai.reasoning-content.stream.v1",
   "thinking-object.enabled-disabled.v1",
+  "openai.response-format.json-object.v1",
 ]);
 const REGISTRY_EXPERIMENT_IMPLEMENTATION_PATHS = [
   "scripts/experiments/probes/general-agent-live-v0/run.mts",
@@ -95,8 +97,12 @@ type AgentConditionId =
   | "tool-registry-storage";
 
 interface AgentExperimentConfiguration {
-  readonly experimentId: "general-agent-live-v0" | "general-agent-tool-registry-v0";
+  readonly experimentId:
+    | "general-agent-live-v0"
+    | "general-agent-tool-registry-v0"
+    | "general-agent-tool-registry-v1";
   readonly experimentVersion: number;
+  readonly modelCapabilityVersion: 1 | 2;
   readonly runId: string;
   readonly artifactRoot: string;
   readonly preregistrationPath: string;
@@ -120,6 +126,19 @@ class ExperimentFetchTransport implements ModelHttpTransport {
   }
 
   async dispatch(input: ModelHttpTransportRequest): Promise<ModelHttpTransportResponse> {
+    let requestBody: JsonValue;
+    try {
+      requestBody = JSON.parse(Buffer.from(input.body).toString("utf8")) as JsonValue;
+    } catch {
+      throw new Error("experiment model request body is not JSON");
+    }
+    if (requestBody === null || Array.isArray(requestBody) || typeof requestBody !== "object") {
+      throw new Error("experiment model request body is not one JSON object");
+    }
+    const requestEvidence = {
+      requestBody,
+      requestBodySha256: sha256(input.body),
+    };
     const controller = new AbortController();
     const abortFromCaller = () => controller.abort(input.signal.reason);
     input.signal.addEventListener("abort", abortFromCaller, { once: true });
@@ -139,6 +158,7 @@ class ExperimentFetchTransport implements ModelHttpTransport {
     } catch (error) {
       this.#recordResponse({
         schemaVersion: "general-agent-live/provider-response/1",
+        ...requestEvidence,
         httpStatus: null,
         failureKind: "network-before-response-headers",
         response: null,
@@ -166,6 +186,7 @@ class ExperimentFetchTransport implements ModelHttpTransport {
         if (!reader) {
           recordOnce({
             schemaVersion: "general-agent-live/provider-response/1",
+            ...requestEvidence,
             httpStatus: response.status,
             response: null,
           });
@@ -183,6 +204,7 @@ class ExperimentFetchTransport implements ModelHttpTransport {
             }
             recordOnce({
               schemaVersion: "general-agent-live/provider-response/1",
+              ...requestEvidence,
               httpStatus: response.status,
               response: responseValue,
             });
@@ -200,6 +222,7 @@ class ExperimentFetchTransport implements ModelHttpTransport {
       } catch (error) {
         recordOnce({
           schemaVersion: "general-agent-live/provider-response/1",
+          ...requestEvidence,
           httpStatus: response.status,
           failureKind: "response-body-read-failed",
           response: null,
@@ -233,6 +256,7 @@ function parseArguments(argv: readonly string[]): AgentExperimentConfiguration {
     return {
       experimentId: "general-agent-live-v0",
       experimentVersion: 8,
+      modelCapabilityVersion: 1,
       runId,
       artifactRoot: join(
         repositoryRoot,
@@ -262,6 +286,7 @@ function parseArguments(argv: readonly string[]): AgentExperimentConfiguration {
     return {
       experimentId: "general-agent-tool-registry-v0",
       experimentVersion: 1,
+      modelCapabilityVersion: 1,
       runId,
       artifactRoot: join(
         repositoryRoot,
@@ -299,8 +324,50 @@ function parseArguments(argv: readonly string[]): AgentExperimentConfiguration {
       ],
     };
   }
+  if (/^registry-v2-[A-Za-z0-9._-]+$/u.test(runId)) {
+    return {
+      experimentId: "general-agent-tool-registry-v1",
+      experimentVersion: 2,
+      modelCapabilityVersion: 2,
+      runId,
+      artifactRoot: join(
+        repositoryRoot,
+        "artifacts/experiments/probes/general-agent-tool-registry-v1",
+      ),
+      preregistrationPath: join(
+        repositoryRoot,
+        "docs/experiments/preregistrations/general-agent-tool-registry-v1.json",
+      ),
+      executionOrder: [
+        {
+          evaluationSeed: 7421,
+          repetition: 1,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7421",
+        },
+        {
+          evaluationSeed: 7421,
+          repetition: 1,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7421",
+        },
+        {
+          evaluationSeed: 7422,
+          repetition: 2,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7422",
+        },
+        {
+          evaluationSeed: 7422,
+          repetition: 2,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7422",
+        },
+      ],
+    };
+  }
   throw new Error(
-    "usage: run.mts --run-id live-v8-<identifier>|registry-v1-<identifier>",
+    "usage: run.mts --run-id live-v8-<identifier>|registry-v1-<identifier>|registry-v2-<identifier>",
   );
 }
 
@@ -342,10 +409,14 @@ function completionUrl(baseValue: string): URL {
   return url;
 }
 
-function descriptorDocument() {
+function descriptorDocument(jsonObjectOutput: boolean) {
   return {
-    schemaVersion: "dolly.model-descriptor/3" as const,
-    descriptorVersion: "owner-aether-qwen3.6-27b-v1",
+    schemaVersion: jsonObjectOutput
+      ? "dolly.model-descriptor/4" as const
+      : "dolly.model-descriptor/3" as const,
+    descriptorVersion: jsonObjectOutput
+      ? "owner-aether-qwen3.6-27b-v2"
+      : "owner-aether-qwen3.6-27b-v1",
     endpointId: "owner-aether-live-fixture",
     operation: "chat-completion" as const,
     modelId: "qwen3.6-27b",
@@ -388,6 +459,14 @@ function descriptorDocument() {
       mediaRequirementIds: [],
       tools: { state: "unsupported" as const },
       structuredOutput: { state: "unsupported" as const },
+      ...(jsonObjectOutput
+        ? {
+            jsonObjectOutput: {
+              state: "supported" as const,
+              value: { strategyId: "openai.response-format.json-object.v1" },
+            },
+          }
+        : {}),
       reasoning: {
         support: "request-controlled" as const,
         requestControl: {
@@ -621,6 +700,7 @@ async function runCondition(options: {
   modelRequestIdBase: string;
   runDirectory: string;
   broker: ChatModelBrokerPort;
+  modelCapabilityVersion: 1 | 2;
 }): Promise<JsonValue> {
   const caseIdentity = `${options.conditionId}-seed-${options.evaluationSeed}`;
   const conditionRoot = mkdtempSync(
@@ -795,7 +875,7 @@ async function runCondition(options: {
           createdAt: NOW,
           updatedAt: NOW,
         });
-        const modelDefinition = createModelOperationCapability({
+        const modelOptions = {
           descriptor: descriptorRef,
           ownerScope: "owner-live-fixture",
           budgets: {
@@ -825,7 +905,13 @@ async function runCondition(options: {
           requireIdempotencyKey: true,
           nextRequestId: () =>
             `agent-${options.modelRequestIdBase}-model-request-${++modelRequestSequence}`,
-        });
+        } as const;
+        const modelDefinition = options.modelCapabilityVersion === 2
+          ? createModelOperationCapabilityV2({
+              ...modelOptions,
+              outputContracts: ["json-object"],
+            })
+          : createModelOperationCapability(modelOptions);
         extensionHost.grantCapability(modelDefinition.grant, modelDefinition.handler);
         if (options.conditionId === "private-storage-tool") {
           const storageDefinition = createModulePrivateStorageCapability({
@@ -1049,7 +1135,7 @@ async function main(): Promise<void> {
   const protocolBytes = readFileSync(join(repositoryRoot, "docs/experiments/protocol.md"));
   const protocolSha256 = sha256(protocolBytes);
   let implementationSha256: Readonly<Record<string, string>> = {};
-  if (experiment.experimentId === "general-agent-tool-registry-v0") {
+  if (experiment.experimentId.startsWith("general-agent-tool-registry-")) {
     const preregistration = JSON.parse(preregistrationBytes.toString("utf8")) as {
       protocol?: { sha256?: unknown };
       domainDesign?: { implementationFiles?: unknown };
@@ -1102,7 +1188,9 @@ async function main(): Promise<void> {
     schemaDigest: SCHEMA_DIGEST,
     allowedStrategyIds: CHAT_STRATEGIES,
   });
-  descriptorRef = descriptors.register(descriptorDocument());
+  descriptorRef = descriptors.register(
+    descriptorDocument(experiment.modelCapabilityVersion === 2),
+  );
   descriptors.setStatus(descriptorRef, "active");
   const bindings = new EndpointBindingRegistry();
   const bindingRef = bindings.register({
@@ -1198,6 +1286,7 @@ async function main(): Promise<void> {
         ...plannedCase,
         runDirectory,
         broker: observedBroker,
+        modelCapabilityVersion: experiment.modelCapabilityVersion,
       });
       caseRows.push(caseRow);
       perCaseAccounting.push({
@@ -1224,7 +1313,7 @@ async function main(): Promise<void> {
   const baselineRows = rows.filter((row) => row.conditionId === "no-storage-tool");
   const treatmentRows = rows.filter((row) => row.conditionId !== "no-storage-tool");
   const expectedTreatmentActions =
-    experiment.experimentId === "general-agent-tool-registry-v0"
+    experiment.experimentId.startsWith("general-agent-tool-registry-")
       ? ["storage_list", "storage_get", "answer"]
       : ["storage.list", "storage.get", "answer"];
   const baselineHiddenCodenameRate =
@@ -1309,11 +1398,12 @@ async function main(): Promise<void> {
     configuration: {
       conditionIds: [...new Set(experiment.executionOrder.map((entry) => entry.conditionId))],
       configuredStorageListLimit:
-        experiment.experimentId === "general-agent-tool-registry-v0"
+        experiment.experimentId.startsWith("general-agent-tool-registry-")
           ? STORAGE_TOOL_LIST_LIMIT
           : 8,
       productBootstrapComposition: false,
       implementationSha256,
+      modelCapabilityVersion: experiment.modelCapabilityVersion,
     },
     dataset: {
       id: "synthetic-private-memory-codename",
@@ -1325,6 +1415,9 @@ async function main(): Promise<void> {
       descriptorVersion: descriptorRef.descriptorVersion,
       operation: descriptorRef.operation,
       responseStrategyId: "aether.qwen.chat.response.v2",
+      ...(experiment.modelCapabilityVersion === 2
+        ? { jsonObjectOutputStrategyId: "openai.response-format.json-object.v1" }
+        : {}),
       endpointAndCredentialRedacted: true,
     },
     modelIdentifier: "qwen3.6-27b",
@@ -1350,7 +1443,9 @@ async function main(): Promise<void> {
     rawOutputs,
     validatorResults: {
       preregistrationStructure:
-        experiment.experimentId === "general-agent-tool-registry-v0" ? "valid-before-run" : "legacy",
+        experiment.experimentId.startsWith("general-agent-tool-registry-")
+          ? "valid-before-run"
+          : "legacy",
       independentValidation: "pending",
     },
     aggregateMetrics,

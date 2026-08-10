@@ -33,6 +33,22 @@ function capability(capabilityType) {
   return initialized.capabilities.find((entry) => entry.capabilityType === capabilityType);
 }
 
+function modelChatArguments(model, argumentsValue) {
+  if (model.capabilityVersion === "v2") {
+    return { ...argumentsValue, outputContract: { kind: "json-object" } };
+  }
+  return argumentsValue;
+}
+
+function capabilityContracts() {
+  return initialized.capabilities
+    .map((entry) => ({
+      capabilityType: entry.capabilityType,
+      capabilityVersion: entry.capabilityVersion,
+    }))
+    .sort((left, right) => left.capabilityType.localeCompare(right.capabilityType));
+}
+
 function invokeCapability(descriptor, operation, argumentsValue, run, idempotencyKey) {
   const id = `agent-capability-${++requestSequence}`;
   const operationPromise = new Promise((resolve, reject) => {
@@ -207,7 +223,7 @@ async function runAgent(params) {
     const result = await invokeCapability(
       model,
       "chat",
-      {
+      modelChatArguments(model, {
         messages: [
           {
             role: "system",
@@ -221,7 +237,7 @@ async function runAgent(params) {
         reasoning: "disable",
         maxOutputTokens: 800,
         stream: false,
-      },
+      }),
       params,
       `${params.moduleJobId}:model-baseline`,
     );
@@ -231,6 +247,7 @@ async function runAgent(params) {
       conditionId: "no-storage-tool",
       task,
       actions: ["answer"],
+      capabilityContracts: capabilityContracts(),
       answer,
       reasoningObserved: output.reasoning?.state === "observed",
       childCredentialEnvironmentPresent:
@@ -264,7 +281,7 @@ async function runAgent(params) {
       const result = await invokeCapability(
         model,
         "chat",
-        {
+        modelChatArguments(model, {
           messages: [
             { role: "system", parts: [{ kind: "text", text: system }] },
             {
@@ -275,7 +292,7 @@ async function runAgent(params) {
           reasoning: round === 1 ? "require" : "disable",
           maxOutputTokens: round === 1 ? 5200 : 800,
           stream: false,
-        },
+        }),
         params,
         `${params.moduleJobId}:model-round-${round}`,
       );
@@ -304,6 +321,7 @@ async function runAgent(params) {
           capabilityTypes: initialized.capabilities
             .map((entry) => entry.capabilityType)
             .sort(),
+          capabilityContracts: capabilityContracts(),
           answer: {
             answer: action.answer,
             grounded: action.grounded,
@@ -363,7 +381,7 @@ async function runAgent(params) {
     const result = await invokeCapability(
       model,
       "chat",
-      {
+      modelChatArguments(model, {
         messages: [
           { role: "system", parts: [{ kind: "text", text: system }] },
           {
@@ -377,7 +395,7 @@ async function runAgent(params) {
         reasoning: round === 1 ? "require" : "disable",
         maxOutputTokens: round === 1 ? 5200 : 800,
         stream: false,
-      },
+      }),
       params,
       `${params.moduleJobId}:model-round-${round}`,
     );
@@ -403,6 +421,7 @@ async function runAgent(params) {
         conditionId: "private-storage-tool",
         task,
         actions: [...observations.map((entry) => `storage.${entry.operation}`), "answer"],
+        capabilityContracts: capabilityContracts(),
         answer: {
           answer: action.answer,
           grounded: action.grounded,

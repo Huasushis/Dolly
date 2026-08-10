@@ -1,6 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
@@ -27,6 +26,8 @@ const EXTENSION = fileURLToPath(
     import.meta.url,
   ),
 );
+const REPOSITORY_ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
+const WORKSPACE_TMP = resolve(REPOSITORY_ROOT, "..", ".tmp");
 const MANIFEST: ExtensionPackageManifest = {
   schemaVersion: "dolly.extension-package/1",
   extensionId: "org.dolly.general-agent-registry-fixture",
@@ -74,7 +75,8 @@ function descriptor(options: {
 
 describe("general Agent tool-registry Extension", () => {
   it("uses Host-selected tool names and limits instead of storage-name constants", async () => {
-    const scratch = mkdtempSync(join(tmpdir(), "dolly-agent-tool-registry-extension-"));
+    mkdirSync(WORKSPACE_TMP, { recursive: true, mode: 0o700 });
+    const scratch = mkdtempSync(join(WORKSPACE_TMP, "dolly-agent-tool-registry-extension-"));
     let identifier = 0;
     let handle = 0;
     const host = new ExtensionProcessHost({
@@ -184,9 +186,13 @@ describe("general Agent tool-registry Extension", () => {
     host.grantCapability(
       {
         capabilityType: "model-operation",
-        capabilityVersion: "v1",
+        capabilityVersion: "v2",
         operations: ["chat"],
-        resourceScope: { executionScope: "active-run", model: "fake" },
+        resourceScope: {
+          executionScope: "active-run",
+          model: "fake",
+          outputContracts: ["json-object"],
+        },
         expiresAt: "2099-01-01T00:00:00.000Z",
         maxInvocations: 3,
         maxConcurrentInvocations: 1,
@@ -196,6 +202,7 @@ describe("general Agent tool-registry Extension", () => {
       },
       async (argumentsValue) => {
         if (!isJsonObject(argumentsValue)) throw new Error("model arguments are not an object");
+        expect(argumentsValue.outputContract).toEqual({ kind: "json-object" });
         const messages = argumentsValue.messages;
         if (!Array.isArray(messages) || !isJsonObject(messages[0])) {
           throw new Error("model messages are absent");
@@ -271,6 +278,10 @@ describe("general Agent tool-registry Extension", () => {
         conditionId: "tool-registry-storage",
         actions: ["alpha_discover", "beta_read", "answer"],
         capabilityTypes: ["model-operation", "tool-invocation"],
+        capabilityContracts: [
+          { capabilityType: "model-operation", capabilityVersion: "v2" },
+          { capabilityType: "tool-invocation", capabilityVersion: "v2" },
+        ],
         answer: { grounded: true, evidenceKeys: ["deployment-note"] },
       });
       expect(agentResult.answer.answer).toContain("EMBER-7421");

@@ -1,19 +1,22 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "../../../..");
+const workspaceTemporaryRoot = resolve(repositoryRoot, "..", ".tmp");
+const verifierPath = fileURLToPath(import.meta.url);
 const artifactRoot = join(
   repositoryRoot,
-  "artifacts/experiments/probes/general-agent-tool-registry-v0",
+  "artifacts/experiments/probes/general-agent-tool-registry-v1",
 );
 const sourcePreregistrationPath = join(
   repositoryRoot,
-  "docs/experiments/preregistrations/general-agent-tool-registry-v0.json",
+  "docs/experiments/preregistrations/general-agent-tool-registry-v1.json",
 );
 const extensionSourcePath = join(scriptDirectory, "extension.mjs");
 const HIDDEN_CODENAME = "EMBER-7421";
@@ -33,14 +36,27 @@ function sha256(bytes) {
 
 function parseArguments(argv) {
   if (
-    (argv.length !== 2 && argv.length !== 3) ||
+    (argv.length !== 2 && argv.length !== 3 && argv.length !== 5) ||
     argv[0] !== "--run-id" ||
-    !/^registry-v1-[A-Za-z0-9._-]+$/u.test(argv[1]) ||
-    (argv.length === 3 && argv[2] !== "--check-only")
+    !/^registry-v2-[A-Za-z0-9._-]+$/u.test(argv[1]) ||
+    (argv.length >= 3 && argv[2] !== "--check-only") ||
+    (argv.length === 5 && argv[3] !== "--run-directory")
   ) {
-    fail("usage: verify-tool-registry.mjs --run-id registry-v1-<identifier> [--check-only]");
+    fail("usage: verify-tool-registry.mjs --run-id registry-v2-<identifier> [--check-only [--run-directory <workspace-temp-run>]]");
   }
-  return { runId: argv[1], checkOnly: argv[2] === "--check-only" };
+  const runId = argv[1];
+  let runDirectory;
+  if (argv.length === 5) {
+    runDirectory = resolve(argv[4]);
+    if (
+      basename(runDirectory) !== runId ||
+      (runDirectory !== workspaceTemporaryRoot &&
+        !runDirectory.startsWith(`${workspaceTemporaryRoot}/`))
+    ) {
+      fail("override run directory is outside the workspace temporary root or has the wrong basename");
+    }
+  }
+  return { runId, checkOnly: argv[2] === "--check-only", runDirectory };
 }
 
 function json(path) {
@@ -116,6 +132,11 @@ function verifyBaseline(row, evaluationSeed, repetition) {
   const result = row.result;
   if (result?.conditionId !== "no-storage-tool") fail("baseline result condition is wrong");
   exactArray(result?.actions, ["answer"], "baseline actions");
+  exactArray(
+    result?.capabilityContracts,
+    [{ capabilityType: "model-operation", capabilityVersion: "v2" }],
+    "baseline capability contracts",
+  );
   if (result?.childCredentialEnvironmentPresent !== false) {
     fail("baseline child observed an Aether environment variable");
   }
@@ -185,6 +206,14 @@ function verifyTreatment(row, evaluationSeed, repetition) {
     result?.capabilityTypes,
     ["model-operation", "tool-invocation"],
     "treatment child capability types",
+  );
+  exactArray(
+    result?.capabilityContracts,
+    [
+      { capabilityType: "model-operation", capabilityVersion: "v2" },
+      { capabilityType: "tool-invocation", capabilityVersion: "v2" },
+    ],
+    "treatment capability contracts",
   );
   if (result.capabilityTypes.includes("module-private-storage")) {
     fail("treatment child received the forbidden raw storage capability");
@@ -259,6 +288,20 @@ function verifyModelCalls(rows) {
     ) {
       fail(`model call ${index + 1} identity, outcome, or attempt count is invalid`);
     }
+    if (
+      row.input?.schemaVersion !== "dolly.model.chat-input/3" ||
+      JSON.stringify(row.input?.outputContract) !== JSON.stringify({ kind: "json-object" })
+    ) {
+      fail(`model call ${index + 1} did not use the frozen JSON-object contract`);
+    }
+    try {
+      const parsed = JSON.parse(row.result.output.finalContent);
+      if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
+        fail(`model call ${index + 1} output is not one JSON object`);
+      }
+    } catch {
+      fail(`model call ${index + 1} output is not exact JSON`);
+    }
   }
   for (const planning of [rows[1], rows[4]]) {
     const reasoning = planning.result?.output?.reasoning;
@@ -331,9 +374,200 @@ function verifyNoPrivateLeak(runDirectory, fixtureValues) {
   }
 }
 
+function writeJson(path, value) {
+  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function writeJsonLines(path, rows) {
+  writeFileSync(path, rows.map((row) => JSON.stringify(row)).join("\n") + "\n", "utf8");
+}
+
+function refreshManifestArtifactDigests(runDirectory, names) {
+  const manifestPath = join(runDirectory, "run-manifest.json");
+  const manifest = json(manifestPath);
+  const rawFieldByName = {
+    "provider-responses.jsonl": "providerResponsesSha256",
+    "model-calls.jsonl": "modelCallsSha256",
+    "cases.jsonl": "casesSha256",
+    "analysis.json": "analysisSha256",
+  };
+  for (const name of names) {
+    const digest = sha256(readFileSync(join(runDirectory, name)));
+    manifest.artifacts[name] = digest;
+    manifest.rawOutputs[rawFieldByName[name]] = digest;
+  }
+  writeJson(manifestPath, manifest);
+}
+
+function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
+  mkdirSync(workspaceTemporaryRoot, { recursive: true, mode: 0o700 });
+  const mutationRoot = mkdtempSync(join(workspaceTemporaryRoot, "registry-v2-mutations-"));
+  const mutations = [
+    {
+      id: "capability-version-v1",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "cases.jsonl"));
+        rows[0].result.capabilityContracts[0].capabilityVersion = "v1";
+        writeJsonLines(join(runDirectory, "cases.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["cases.jsonl"]);
+      },
+    },
+    {
+      id: "chat-input-v2",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "model-calls.jsonl"));
+        rows[0].input.schemaVersion = "dolly.model.chat-input/2";
+        writeJsonLines(join(runDirectory, "model-calls.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["model-calls.jsonl"]);
+      },
+    },
+    {
+      id: "text-output-contract",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "model-calls.jsonl"));
+        rows[0].input.outputContract = { kind: "text" };
+        writeJsonLines(join(runDirectory, "model-calls.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["model-calls.jsonl"]);
+      },
+    },
+    {
+      id: "prose-wrapped-json",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "model-calls.jsonl"));
+        rows[0].result.output.finalContent = `prose before JSON\n${rows[0].result.output.finalContent}`;
+        writeJsonLines(join(runDirectory, "model-calls.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["model-calls.jsonl"]);
+      },
+    },
+    {
+      id: "provider-wire-response-format-drift",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "provider-responses.jsonl"));
+        rows[0].requestBody.response_format = { type: "text" };
+        rows[0].requestBodySha256 = sha256(
+          Buffer.from(JSON.stringify(rows[0].requestBody), "utf8"),
+        );
+        writeJsonLines(join(runDirectory, "provider-responses.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["provider-responses.jsonl"]);
+      },
+    },
+    {
+      id: "registry-digest-mismatch",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "cases.jsonl"));
+        rows[1].result.toolRoundRegistryDigests[0] = `sha256:${"0".repeat(64)}`;
+        writeJsonLines(join(runDirectory, "cases.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["cases.jsonl"]);
+      },
+    },
+    {
+      id: "list-schema-limit-four",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "cases.jsonl"));
+        const list = rows[1].result.toolRegistry.tools.find((tool) => tool.name === "storage_list");
+        list.argumentSchema.properties.limit.maximum = 4;
+        writeJsonLines(join(runDirectory, "cases.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["cases.jsonl"]);
+      },
+    },
+    {
+      id: "list-argument-four",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "cases.jsonl"));
+        rows[1].result.toolArguments[0].arguments.limit = 4;
+        writeJsonLines(join(runDirectory, "cases.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["cases.jsonl"]);
+      },
+    },
+    {
+      id: "provider-row-missing",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "provider-responses.jsonl"));
+        writeJsonLines(join(runDirectory, "provider-responses.jsonl"), rows.slice(0, -1));
+        refreshManifestArtifactDigests(runDirectory, ["provider-responses.jsonl"]);
+      },
+    },
+    {
+      id: "case-row-missing",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "cases.jsonl"));
+        writeJsonLines(join(runDirectory, "cases.jsonl"), rows.slice(0, -1));
+        refreshManifestArtifactDigests(runDirectory, ["cases.jsonl"]);
+      },
+    },
+    {
+      id: "reasoning-evidence-missing",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "model-calls.jsonl"));
+        rows[1].result.output.reasoning = { state: "not-observed" };
+        writeJsonLines(join(runDirectory, "model-calls.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["model-calls.jsonl"]);
+      },
+    },
+    {
+      id: "scheduler-completion-false",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "cases.jsonl"));
+        rows[0].schedulerCompletion = false;
+        writeJsonLines(join(runDirectory, "cases.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["cases.jsonl"]);
+      },
+    },
+    {
+      id: "child-stop-false",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "cases.jsonl"));
+        rows[0].childStopped = false;
+        writeJsonLines(join(runDirectory, "cases.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["cases.jsonl"]);
+      },
+    },
+    {
+      id: "capability-handle-field",
+      apply(runDirectory) {
+        const analysisPath = join(runDirectory, "analysis.json");
+        const analysis = json(analysisPath);
+        analysis.handle = "forbidden-test-handle";
+        writeJson(analysisPath, analysis);
+        refreshManifestArtifactDigests(runDirectory, ["analysis.json"]);
+      },
+    },
+  ];
+  const results = [];
+  try {
+    for (const mutation of mutations) {
+      const runDirectory = join(mutationRoot, mutation.id, runId);
+      cpSync(sourceRunDirectory, runDirectory, { recursive: true, errorOnExist: true });
+      mutation.apply(runDirectory);
+      let rejected = false;
+      try {
+        execFileSync(
+          process.execPath,
+          [verifierPath, "--run-id", runId, "--check-only", "--run-directory", runDirectory],
+          { cwd: repositoryRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+        );
+      } catch (error) {
+        rejected = true;
+        const output = `${error?.stdout ?? ""}${error?.stderr ?? ""}`;
+        for (const value of fixtureValues) {
+          if (value.length >= 8 && output.includes(value)) {
+            fail(`mutation ${mutation.id} leaked a configured private fixture value`);
+          }
+        }
+      }
+      if (!rejected) fail(`mutation ${mutation.id} was accepted`);
+      results.push({ id: mutation.id, rejected: true });
+    }
+    return results;
+  } finally {
+    rmSync(mutationRoot, { recursive: true, force: true });
+  }
+}
+
 function main() {
-  const { runId, checkOnly } = parseArguments(process.argv.slice(2));
-  const runDirectory = join(artifactRoot, "runs", runId);
+  const { runId, checkOnly, runDirectory: overrideRunDirectory } =
+    parseArguments(process.argv.slice(2));
+  const runDirectory = overrideRunDirectory ?? join(artifactRoot, "runs", runId);
   const preregistrationBytes = readFileSync(join(runDirectory, "preregistration.json"));
   if (!preregistrationBytes.equals(readFileSync(sourcePreregistrationPath))) {
     fail("run preregistration differs from the registered source bytes");
@@ -346,8 +580,8 @@ function main() {
   const manifest = json(manifestPath);
   if (
     manifest.schemaVersion !== "general-agent-live/run-manifest/1" ||
-    manifest.experimentId !== "general-agent-tool-registry-v0" ||
-    manifest.experimentVersion !== 1 ||
+    manifest.experimentId !== "general-agent-tool-registry-v1" ||
+    manifest.experimentVersion !== 2 ||
     manifest.runId !== runId ||
     manifest.status !== "completed"
   ) {
@@ -370,11 +604,16 @@ function main() {
     !/^[0-9a-f]{40}$/u.test(manifest.sourceCommit) ||
     typeof manifest.dirtyWorktree !== "boolean" ||
     manifest.configuration?.configuredStorageListLimit !== 3 ||
+    manifest.configuration?.modelCapabilityVersion !== 2 ||
     manifest.configuration?.productBootstrapComposition !== false ||
     manifest.modelIdentifier !== "qwen3.6-27b" ||
     manifest.backend?.kind !== "live" ||
     manifest.backend?.silentFallbackAllowed !== false ||
     manifest.modelEndpointCapabilityProfile?.endpointAndCredentialRedacted !== true ||
+    manifest.modelEndpointCapabilityProfile?.descriptorVersion !==
+      "owner-aether-qwen3.6-27b-v2" ||
+    manifest.modelEndpointCapabilityProfile?.jsonObjectOutputStrategyId !==
+      "openai.response-format.json-object.v1" ||
     Object.hasOwn(manifest.modelEndpointCapabilityProfile ?? {}, "exactUrl")
   ) {
     fail("run manifest source, configuration, backend, or redacted model profile is invalid");
@@ -442,6 +681,37 @@ function main() {
   ) {
     fail("provider raw response inventory is invalid");
   }
+  const reasoningTypeByCall = [
+    "disabled",
+    "enabled",
+    "disabled",
+    "disabled",
+    "enabled",
+    "disabled",
+    "disabled",
+    "disabled",
+  ];
+  for (const [index, row] of providerResponses.entries()) {
+    const requestBody = row.requestBody;
+    if (
+      requestBody === null ||
+      Array.isArray(requestBody) ||
+      typeof requestBody !== "object" ||
+      JSON.stringify(Object.keys(requestBody).sort()) !==
+        JSON.stringify(["max_tokens", "messages", "model", "response_format", "stream", "thinking"]) ||
+      requestBody.model !== "qwen3.6-27b" ||
+      requestBody.stream !== false ||
+      !Array.isArray(requestBody.messages) ||
+      requestBody.messages.length !== 2 ||
+      JSON.stringify(requestBody.response_format) !== JSON.stringify({ type: "json_object" }) ||
+      JSON.stringify(requestBody.thinking) !==
+        JSON.stringify({ type: reasoningTypeByCall[index] }) ||
+      row.requestBodySha256 !==
+        sha256(Buffer.from(JSON.stringify(requestBody), "utf8"))
+    ) {
+      fail(`provider request ${index + 1} lacks exact JSON-object wire evidence`);
+    }
+  }
   const analysis = json(analysisPath);
   if (
     analysis.schemaVersion !== "general-agent-tool-registry/analysis/1" ||
@@ -462,12 +732,15 @@ function main() {
     fail("analysis does not match independently recomputed complete-case metrics");
   }
   verifySourceIndependence(preregistration, manifest);
-  verifyNoPrivateLeak(runDirectory, loadFixtureValues());
+  const fixtureValues = loadFixtureValues();
+  verifyNoPrivateLeak(runDirectory, fixtureValues);
+
+  const mutationChecks = checkOnly ? [] : runMutationChecks(runDirectory, runId, fixtureValues);
 
   const verification = {
     schemaVersion: "general-agent-tool-registry/validation/1",
-    experimentId: "general-agent-tool-registry-v0",
-    experimentVersion: 1,
+    experimentId: "general-agent-tool-registry-v1",
+    experimentVersion: 2,
     runId,
     valid: true,
     checks: {
@@ -491,7 +764,9 @@ function main() {
       linuxControlGroupProof: false,
       durableToolJournalIncluded: false,
       nativeProviderToolCallingIncluded: false,
+      mutationChecksRejected: mutationChecks.length,
     },
+    mutationChecks,
   };
   if (!checkOnly) {
     writeFileSync(
