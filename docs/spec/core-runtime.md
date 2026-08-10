@@ -325,10 +325,13 @@ trusted host declares `isolation: "process"` and whose `terminate()` operation
 confirms process exit. The repository now contains a reusable adapter from that
 executor contract to `ExtensionProcessHost` and a real child-process test for
 result commit and orderly shutdown. Normal runtime startup continues to reject
-Modules because it does not yet resolve and revalidate installation and
-configuration records for each Module generation, and because nothing yet
-writes the durable child-process identity that Section 7.7 defines or proves an
-old Module control group empty after the Core process exits.
+Modules. A product-before-bootstrap resolver now revalidates an installed
+package and an immutable configuration record, but product startup does not call
+it, no generation-owning runtime factory yet consumes it, and version 9 lacks
+the Linux process and external-effect fields required by Section 5.2. Product
+startup also does not yet write the durable child-process identity that Section
+7.7 defines or prove an old Module control group empty after the Core process
+exits.
 
 For process isolation, `createExecutor` MUST synchronously return an executor
 handle with `start()` and `terminate()` operations. Returning a Promise or an
@@ -405,6 +408,23 @@ remain explicit trusted inputs. This function is not called by
 `openDollyRuntime`; its real-child-process test is evidence for the vertical
 slice only and does not satisfy Linux control-group ownership, durable external
 effect evidence, configuration resolution, or startup recovery.
+
+`resolveInstalledExtensionModule` and
+`deriveInstalledLinuxExtensionModuleExecutor` form a narrower installation
+derivation boundary: in ordinary terms, they ensure that the package digest,
+absolute entrypoint, manifest, trust classification, configuration schema,
+configuration bytes, and initial process record all come from the same
+integrity-checked installation and configuration records. Callers cannot
+separately substitute an executable, manifest, configuration, or package
+digest. Service invocation, boot, delegated control-group root, and derived
+Module control-group path come from one already verified Core service binding;
+neither the launcher nor the Extension inherits Core's environment. The
+derivation also rejects an untrusted package before a process-isolated launcher
+exists.
+It constructs no process and does not prove generation replacement, Scheduler
+integration, live Linux control-group ownership, restart recovery, or orderly
+product shutdown. `openDollyRuntime` does not call either function and retains
+the configured-Module refusal in Section 5.1.
 
 ### 5.2 Proposed Linux Module process limits
 

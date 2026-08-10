@@ -93,7 +93,7 @@ export interface ExtensionModuleCompatibility {
   readonly packageVersion: string;
   readonly moduleKind: string;
   readonly configVersion: number;
-  readonly activation: "reactive" | "periodic";
+  readonly activation: "reactive" | "periodic" | "source";
 }
 
 export interface ResolvedExtensionInstallation {

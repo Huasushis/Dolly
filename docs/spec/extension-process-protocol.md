@@ -263,6 +263,14 @@ field is `launcherProtocol`.
   uncertain, Core exits unsuccessfully so service cleanup removes the whole
   service cgroup.
 
+Launcher protocol version 1 has no working-directory field and does not change
+the inherited Core working directory. The Node package entrypoint is therefore
+an absolute path resolved from the verified installation, and package code MUST
+resolve its own resources relative to `import.meta.url` rather than depending on
+the process working directory. A future need for a package working directory
+requires a new, closed launcher contract; it MUST NOT be smuggled through an
+environment variable or inherited Core state.
+
 This control protocol and its launcher exist in the codebase, and their
 integration tests have been run inside a real delegated cgroup on a Linux
 server: the launcher joined the prepared cgroup and executed only after Core
