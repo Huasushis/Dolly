@@ -65,6 +65,7 @@ describe("file effect intent store", () => {
     const path = join(root, "effect-intents.json");
     const store = new FileEffectIntentStore({ path });
     const journal = new EffectIntentJournal({ store, now: () => NOW });
+    journal.openRun(claim());
     const first = journal.recordIntent(intent());
     journal.recordOutcome(claim(), first.idempotencyKey, {
       kind: "terminal",
@@ -76,6 +77,7 @@ describe("file effect intent store", () => {
       claimToken: "claim-file-effect-2",
       moduleGenerationId: "module-generation-file-effect-2",
     });
+    journal.openRun(retry);
     journal.recordIntent(intent(retry));
 
     const reopenedStore = new FileEffectIntentStore({ path });
@@ -87,7 +89,7 @@ describe("file effect intent store", () => {
     expect(reopened.evidenceForRun(claim())).toEqual({ kind: "terminal" });
     expect(reopened.evidenceForRun(retry)).toMatchObject({ kind: "unknown" });
     expect(readFileSync(path, "utf8")).toMatch(
-      /^\{"records":\[.*\],"revision":3,"schemaVersion":"dolly.effect-intent-store\/1"\}\n$/u,
+      /^\{"records":\[.*\],"revision":5,"runs":\[.*\],"schemaVersion":"dolly.effect-intent-store\/2"\}\n$/u,
     );
   }));
 
@@ -95,6 +97,7 @@ describe("file effect intent store", () => {
     const path = join(root, "effect-intents.json");
     const firstStore = new FileEffectIntentStore({ path });
     const journal = new EffectIntentJournal({ store: firstStore, now: () => NOW });
+    journal.openRun(claim());
     const original = journal.recordIntent(intent());
     const secondStore = new FileEffectIntentStore({ path });
     journal.recordOutcome(claim(), original.idempotencyKey, {
@@ -119,6 +122,7 @@ describe("file effect intent store", () => {
   it("refuses to insert a record that skipped the intended state", scratchTest((root) => {
     const store = new FileEffectIntentStore({ path: join(root, "effect-intents.json") });
     const journal = new EffectIntentJournal({ store, now: () => NOW });
+    journal.openRun(claim());
     const intended = journal.recordIntent(intent());
     const otherRun = claim({
       runId: "run-file-effect-skipped",
@@ -143,14 +147,19 @@ describe("file effect intent store", () => {
   it("refuses a different intent under one stable key across retry Runs", scratchTest((root) => {
     const store = new FileEffectIntentStore({ path: join(root, "effect-intents.json") });
     const journal = new EffectIntentJournal({ store, now: () => NOW });
+    journal.openRun(claim());
     const first = journal.recordIntent(intent());
-    const conflicting: EffectIntentRecord = {
-      ...first,
+    const conflictingRun = claim({
       runId: "run-file-effect-conflict",
       attempt: 2,
       claimToken: "claim-file-effect-conflict",
+    });
+    const conflicting: EffectIntentRecord = {
+      ...first,
+      ...conflictingRun,
       intentDigest: `sha256:${"f".repeat(64)}`,
     };
+    journal.openRun(conflictingRun);
     expect(() => store.compareAndSet(undefined, conflicting)).toThrowError(
       expect.objectContaining<Partial<EffectIntentError>>({
         code: "EFFECT_INTENT_CONFLICT",
@@ -163,7 +172,7 @@ describe("file effect intent store", () => {
     new FileEffectIntentStore({ path });
     writeFileSync(
       path,
-      '{"schemaVersion":"dolly.effect-intent-store/1","revision":0,"revision":1,"records":[]}\n',
+      '{"schemaVersion":"dolly.effect-intent-store/2","revision":0,"revision":1,"records":[],"runs":[]}\n',
       "utf8",
     );
     expect(() => new FileEffectIntentStore({ path })).toThrowError(
@@ -192,6 +201,100 @@ describe("file effect intent store", () => {
     expect(() => new FileEffectIntentStore({ path, maxBytes: 1_024 })).toThrowError(
       expect.objectContaining<Partial<EffectIntentError>>({
         code: "EFFECT_INTENT_LIMIT_EXCEEDED",
+      }),
+    );
+  }));
+
+  it("proves a zero-effect Run only after capability admission is durably closed", scratchTest((root) => {
+    const path = join(root, "effect-intents.json");
+    const journal = new EffectIntentJournal({
+      store: new FileEffectIntentStore({ path }),
+      now: () => NOW,
+    });
+    journal.openRun(claim());
+    expect(journal.evidenceForRun(claim()).kind).toBe("unknown");
+    const closed = journal.closeRun(claim());
+    expect(closed).toMatchObject({
+      state: "closed",
+      intentCount: 0,
+    });
+
+    const reopened = new EffectIntentJournal({
+      store: new FileEffectIntentStore({ path }),
+      now: () => LATER,
+    });
+    expect(reopened.evidenceForRun(claim())).toEqual({ kind: "no-effect" });
+    expect(() => reopened.openRun(claim())).toThrowError(
+      expect.objectContaining<Partial<EffectIntentError>>({
+        code: "EFFECT_INTENT_CONFLICT",
+      }),
+    );
+  }));
+
+  it("freezes the complete no-effect intent set and rejects a late effect", scratchTest((root) => {
+    const path = join(root, "effect-intents.json");
+    const journal = new EffectIntentJournal({
+      store: new FileEffectIntentStore({ path }),
+      now: () => NOW,
+    });
+    journal.openRun(claim());
+    journal.recordIntent(intent());
+    journal.recordOutcome(claim(), "module-job-file-effect:provider-call", {
+      kind: "no-effect",
+      detail: "the provider request was rejected before transmission",
+    });
+    journal.closeRun(claim());
+    expect(journal.evidenceForRun(claim())).toEqual({ kind: "no-effect" });
+    expect(() =>
+      journal.recordIntent({
+        ...intent(),
+        idempotencyKey: "module-job-file-effect:late-effect",
+      }),
+    ).toThrowError(
+      expect.objectContaining<Partial<EffectIntentError>>({
+        code: "EFFECT_INTENT_CONFLICT",
+      }),
+    );
+    expect(journal.evidenceForRun(claim())).toEqual({ kind: "no-effect" });
+  }));
+
+  it("rejects a document whose closed Run no longer matches its intent set", scratchTest((root) => {
+    const path = join(root, "effect-intents.json");
+    const journal = new EffectIntentJournal({
+      store: new FileEffectIntentStore({ path }),
+      now: () => NOW,
+    });
+    journal.openRun(claim());
+    journal.recordIntent(intent());
+    journal.recordOutcome(claim(), "module-job-file-effect:provider-call", {
+      kind: "no-effect",
+      detail: "the operation stopped before its effect boundary",
+    });
+    journal.closeRun(claim());
+
+    const document = JSON.parse(readFileSync(path, "utf8")) as {
+      runs: Array<{ intentCount: number }>;
+    };
+    document.runs[0]!.intentCount = 0;
+    writeFileSync(path, `${JSON.stringify(document)}\n`, "utf8");
+    expect(() => new FileEffectIntentStore({ path })).toThrowError(
+      expect.objectContaining<Partial<EffectIntentError>>({
+        code: "EFFECT_INTENT_DOCUMENT_INVALID",
+      }),
+    );
+  }));
+
+  it("refuses effects until the exact Run admission record exists", scratchTest((root) => {
+    const store = new FileEffectIntentStore({ path: join(root, "effect-intents.json") });
+    const journal = new EffectIntentJournal({ store, now: () => NOW });
+    expect(() => journal.recordIntent(intent())).toThrowError(
+      expect.objectContaining<Partial<EffectIntentError>>({
+        code: "EFFECT_INTENT_CONFLICT",
+      }),
+    );
+    expect(() => journal.closeRun(claim())).toThrowError(
+      expect.objectContaining<Partial<EffectIntentError>>({
+        code: "EFFECT_INTENT_NOT_FOUND",
       }),
     );
   }));

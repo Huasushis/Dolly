@@ -10,11 +10,11 @@
  *
  * `ExtensionCapabilityAuthority` deduplicates within one live session using an
  * in-memory map, which is correct for a repeated invocation inside that
- * session and useless after Core exits. This journal and its evidence adapter
- * define the record protocol, but the repository does not yet provide the
- * persistent store or integration with the only code path that can authorize
- * an external effect. Until both exist, the journal is not sufficient recovery
- * evidence for a complete Run.
+ * session and useless after Core exits. This journal defines the record
+ * protocol and the repository has a persistent file implementation. The
+ * product still does not bind it to the only code path that can authorize an
+ * external effect, so it is not yet evidence that every product effect was
+ * recorded.
  *
  * The journal deliberately stores no argument values, no response payload, and
  * no credential. It stores identities, a digest of the intended operation, and
@@ -74,6 +74,33 @@ export interface EffectIntentRecord {
   readonly createdAt: string;
   readonly updatedAt: string;
 }
+
+/** Durable proof that one exact Run no longer accepts new capability effects. */
+export type EffectRunRecord =
+  | {
+      readonly schemaVersion: "dolly.effect-run/1";
+      readonly moduleJobId: string;
+      readonly runId: string;
+      readonly attempt: number;
+      readonly claimToken: string;
+      readonly moduleGenerationId: string;
+      readonly state: "open";
+      readonly createdAt: string;
+      readonly updatedAt: string;
+    }
+  | {
+      readonly schemaVersion: "dolly.effect-run/1";
+      readonly moduleJobId: string;
+      readonly runId: string;
+      readonly attempt: number;
+      readonly claimToken: string;
+      readonly moduleGenerationId: string;
+      readonly state: "closed";
+      readonly intentCount: number;
+      readonly intentSetDigest: string;
+      readonly createdAt: string;
+      readonly updatedAt: string;
+    };
 
 export type EffectIntentErrorCode =
   | "EFFECT_INTENT_INVALID"
@@ -292,11 +319,127 @@ export function assertEffectIntentTransition(
   }
 }
 
+export function assertEffectRunRecord(
+  value: unknown,
+): asserts value is EffectRunRecord {
+  if (!isPlainObject(value)) {
+    throw new EffectIntentError("EFFECT_INTENT_INVALID", "Effect Run record must be an object");
+  }
+  const common = [
+    "schemaVersion",
+    "moduleJobId",
+    "runId",
+    "attempt",
+    "claimToken",
+    "moduleGenerationId",
+    "state",
+    "createdAt",
+    "updatedAt",
+  ];
+  if (value.state === "open") {
+    assertClosedKeys(value, common, "Open effect Run record");
+  } else if (value.state === "closed") {
+    assertClosedKeys(
+      value,
+      [...common, "intentCount", "intentSetDigest"],
+      "Closed effect Run record",
+    );
+    if (!Number.isSafeInteger(value.intentCount) || (value.intentCount as number) < 0) {
+      throw new EffectIntentError(
+        "EFFECT_INTENT_INVALID",
+        "Closed effect Run intentCount must be a non-negative integer",
+      );
+    }
+    if (
+      typeof value.intentSetDigest !== "string" ||
+      !DIGEST_PATTERN.test(value.intentSetDigest)
+    ) {
+      throw new EffectIntentError(
+        "EFFECT_INTENT_INVALID",
+        "Closed effect Run intentSetDigest must be a sha256 digest",
+      );
+    }
+  } else {
+    throw new EffectIntentError(
+      "EFFECT_INTENT_INVALID",
+      "Effect Run record state is not supported",
+    );
+  }
+  if (value.schemaVersion !== "dolly.effect-run/1") {
+    throw new EffectIntentError(
+      "EFFECT_INTENT_INVALID",
+      "Effect Run record schema version is not supported",
+    );
+  }
+  for (const field of [
+    "moduleJobId",
+    "runId",
+    "claimToken",
+    "moduleGenerationId",
+  ] as const) {
+    if (!isIdentifier(value[field])) {
+      throw new EffectIntentError(
+        "EFFECT_INTENT_INVALID",
+        `Effect Run field "${field}" must be an identifier`,
+      );
+    }
+  }
+  if (!Number.isSafeInteger(value.attempt) || (value.attempt as number) < 1) {
+    throw new EffectIntentError(
+      "EFFECT_INTENT_INVALID",
+      "Effect Run attempt must be a positive integer",
+    );
+  }
+  if (
+    !isCanonicalTimestamp(value.createdAt) ||
+    !isCanonicalTimestamp(value.updatedAt) ||
+    Date.parse(value.updatedAt) < Date.parse(value.createdAt)
+  ) {
+    throw new EffectIntentError(
+      "EFFECT_INTENT_INVALID",
+      "Effect Run timestamps must be canonical and ordered",
+    );
+  }
+}
+
+export function effectRunMatchesIdentity(
+  record: EffectRunRecord,
+  identity: DeliveryClaimIdentity,
+): boolean {
+  return (
+    record.moduleJobId === identity.moduleJobId &&
+    record.runId === identity.runId &&
+    record.attempt === identity.attempt &&
+    record.claimToken === identity.claimToken &&
+    record.moduleGenerationId === identity.moduleGenerationId
+  );
+}
+
+/** Digest frozen when capability admission closes for one exact Run. */
+export function effectIntentSetDigest(
+  records: readonly EffectIntentRecord[],
+): string {
+  return canonicalJsonDigest(
+    records
+      .map((record) => ({
+        idempotencyKey: record.idempotencyKey,
+        capabilityType: record.capabilityType,
+        operation: record.operation,
+        intentDigest: record.intentDigest,
+      }))
+      .sort((left, right) =>
+        left.idempotencyKey < right.idempotencyKey
+          ? -1
+          : left.idempotencyKey > right.idempotencyKey
+            ? 1
+            : 0),
+  );
+}
+
 /**
- * Storage boundary for intent records. The repository does not yet provide a
- * persistent product implementation or connect this boundary to capability
- * execution. Tests supply an in-memory store; it cannot prove that evidence
- * survived a Core process crash.
+ * Storage boundary for intent records. An in-memory implementation remains
+ * useful for conservative unit tests; the file implementation additionally
+ * persists exact Run admission state and survives Core restart.
  */
 export interface EffectIntentStore {
   list(): readonly EffectIntentRecord[];
@@ -310,6 +453,22 @@ export interface EffectIntentStore {
     expected: EffectIntentRecord | undefined,
     replacement: EffectIntentRecord,
   ): boolean;
+}
+
+/** Atomic Run-open/close operations implemented beside the intent records. */
+export interface EffectRunStore extends EffectIntentStore {
+  getRun(identity: DeliveryClaimIdentity): EffectRunRecord | undefined;
+  openRun(identity: DeliveryClaimIdentity, createdAt: string): EffectRunRecord;
+  closeRun(identity: DeliveryClaimIdentity, closedAt: string): EffectRunRecord;
+}
+
+function isEffectRunStore(store: EffectIntentStore): store is EffectRunStore {
+  const candidate = store as Partial<EffectRunStore>;
+  return (
+    typeof candidate.getRun === "function" &&
+    typeof candidate.openRun === "function" &&
+    typeof candidate.closeRun === "function"
+  );
 }
 
 function isIdentifier(value: unknown): value is string {
@@ -373,17 +532,40 @@ function assertOutcome(outcome: EffectOutcome): void {
 /**
  * Records intents before input/output and answers what recovery may conclude.
  *
- * Until a persistent product store is connected to the only code path that can
- * authorize an external effect, an absent record proves nothing and answers
- * `unknown`.
+ * Unless the store also proves that capability admission closed with the same
+ * exact intent set, an absent record proves nothing and answers `unknown`.
  */
 export class EffectIntentJournal {
   readonly #store: EffectIntentStore;
+  readonly #runStore: EffectRunStore | undefined;
   readonly #now: () => string;
 
   constructor(options: { readonly store: EffectIntentStore; readonly now: () => string }) {
     this.#store = options.store;
+    this.#runStore = isEffectRunStore(options.store) ? options.store : undefined;
     this.#now = options.now;
+  }
+
+  openRun(identity: DeliveryClaimIdentity): EffectRunRecord {
+    const store = this.#runStore;
+    if (!store) {
+      throw new EffectIntentError(
+        "EFFECT_INTENT_IO_FAILED",
+        "The configured effect intent store cannot persist Run admission state",
+      );
+    }
+    return store.openRun(identity, this.#now());
+  }
+
+  closeRun(identity: DeliveryClaimIdentity): EffectRunRecord {
+    const store = this.#runStore;
+    if (!store) {
+      throw new EffectIntentError(
+        "EFFECT_INTENT_IO_FAILED",
+        "The configured effect intent store cannot close Run admission state",
+      );
+    }
+    return store.closeRun(identity, this.#now());
   }
 
   /**
@@ -534,23 +716,30 @@ export class EffectIntentJournal {
   /**
    * What recovery may conclude about one Run's external effects.
    *
-   * No records answers `unknown`: this adapter is not yet connected to the only
-   * code path that can authorize an external effect and cannot prove that the
-   * journal is complete. Exact records that are all `no-effect` prove only that
-   * those recorded operations did not occur; another effect could be missing,
-   * so the whole Run remains unknown. A `terminal` record proves at least one
-   * final result exists; without a separate durable idempotency contract it
-   * does not permit retry or release. An intent still marked `intended` is the
-   * crash case: Core recorded the intent but never recorded an outcome.
+   * No records answers `unknown` unless one exact closed Run record freezes the
+   * empty set. Exact records that are all `no-effect` prove the whole Run safe
+   * only when the same closed record freezes their count and digest. A
+   * `terminal` record proves at least one final result exists; without a
+   * separate durable idempotency contract it does not permit retry or release.
+   * An intent still marked `intended` is the crash case: Core recorded the
+   * intent but never recorded an outcome.
    */
   evidenceForRun(identity: DeliveryClaimIdentity): ExternalEffectEvidence {
     const records = this.listForRun(identity);
-    if (records.length === 0) {
+    const run = this.#runStore?.getRun(identity);
+    const complete =
+      run?.state === "closed" &&
+      run.intentCount === records.length &&
+      run.intentSetDigest === effectIntentSetDigest(records);
+    if (!complete && records.length === 0) {
       return {
         kind: "unknown",
         reason:
-          "No exact effect intent is recorded, and this journal is not yet connected to the only code path that can authorize an external effect",
+          "No exact effect intent is recorded, and capability admission is not durably closed for this Run",
       };
+    }
+    if (records.length === 0) {
+      return { kind: "no-effect" };
     }
 
     const unresolved = records.filter(
@@ -570,11 +759,13 @@ export class EffectIntentJournal {
       };
     }
     if (records.every((record) => record.outcome.kind === "no-effect")) {
-      return {
-        kind: "unknown",
-        reason:
-          "Recorded effects are no-effect, but this journal is not yet connected to the only code path that can authorize an external effect",
-      };
+      return complete
+        ? { kind: "no-effect" }
+        : {
+            kind: "unknown",
+            reason:
+              "Recorded effects are no-effect, but capability admission is not durably closed with the same intent set",
+          };
     }
     return { kind: "terminal" };
   }

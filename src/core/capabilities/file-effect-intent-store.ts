@@ -30,16 +30,22 @@ import {
 import {
   assertEffectIntentRecord,
   assertEffectIntentTransition,
+  assertEffectRunRecord,
+  effectIntentSetDigest,
+  effectRunMatchesIdentity,
   EffectIntentError,
   sameEffectIntentRecordIdentity,
   type EffectIntentRecord,
-  type EffectIntentStore,
+  type EffectRunRecord,
+  type EffectRunStore,
 } from "./effect-intent-journal.js";
+import type { DeliveryClaimIdentity } from "../delivery-store.js";
 
 interface EffectIntentStoreDocument {
-  readonly schemaVersion: "dolly.effect-intent-store/1";
+  readonly schemaVersion: "dolly.effect-intent-store/2";
   readonly revision: number;
   readonly records: readonly EffectIntentRecord[];
+  readonly runs: readonly EffectRunRecord[];
 }
 
 export interface FileEffectIntentStoreOptions {
@@ -66,6 +72,13 @@ function immutableRecord(record: EffectIntentRecord): EffectIntentRecord {
   );
 }
 
+function immutableRun(record: EffectRunRecord): EffectRunRecord {
+  assertEffectRunRecord(record);
+  return deepFreeze(
+    cloneJson(record as unknown as JsonValue) as unknown as EffectRunRecord,
+  );
+}
+
 function compareRecordIdentity(
   left: EffectIntentRecord,
   right: EffectIntentRecord,
@@ -84,6 +97,24 @@ function compareRecordIdentity(
   return 0;
 }
 
+function compareRunIdentity(left: EffectRunRecord, right: EffectRunRecord): number {
+  for (const [leftValue, rightValue] of [
+    [left.moduleJobId, right.moduleJobId],
+    [left.runId, right.runId],
+    [String(left.attempt).padStart(16, "0"), String(right.attempt).padStart(16, "0")],
+    [left.claimToken, right.claimToken],
+    [left.moduleGenerationId, right.moduleGenerationId],
+  ] as const) {
+    if (leftValue < rightValue) return -1;
+    if (leftValue > rightValue) return 1;
+  }
+  return 0;
+}
+
+function sameRunIdentity(left: EffectRunRecord, right: EffectRunRecord): boolean {
+  return compareRunIdentity(left, right) === 0;
+}
+
 function nextRevision(revision: number): number {
   if (!Number.isSafeInteger(revision) || revision >= Number.MAX_SAFE_INTEGER) {
     throw new EffectIntentError(
@@ -97,11 +128,11 @@ function nextRevision(revision: number): number {
 /**
  * Crash-recoverable storage for effect intents.
  *
- * A successful `compareAndSet` is fsynced before it returns. This store proves
- * that individual records survive Core restart; it does not by itself prove
- * that every possible capability effect for a Run was recorded.
+ * A successful mutation is fsynced before it returns. The store keeps Run
+ * admission and its exact intent set in one document, so closing a Run can
+ * freeze a complete set without a gap for a late intent.
  */
-export class FileEffectIntentStore implements EffectIntentStore {
+export class FileEffectIntentStore implements EffectRunStore {
   readonly #path: string;
   readonly #lockPath: string;
   readonly #maxBytes: number;
@@ -126,9 +157,10 @@ export class FileEffectIntentStore implements EffectIntentStore {
         void this.#readDocument();
       } else {
         this.#writeDocument({
-          schemaVersion: "dolly.effect-intent-store/1",
+          schemaVersion: "dolly.effect-intent-store/2",
           revision: 0,
           records: [],
+          runs: [],
         });
       }
     });
@@ -136,6 +168,90 @@ export class FileEffectIntentStore implements EffectIntentStore {
 
   list(): readonly EffectIntentRecord[] {
     return this.#readDocument().records;
+  }
+
+  getRun(identity: DeliveryClaimIdentity): EffectRunRecord | undefined {
+    return this.#readDocument().runs.find((record) =>
+      effectRunMatchesIdentity(record, identity),
+    );
+  }
+
+  openRun(identity: DeliveryClaimIdentity, createdAt: string): EffectRunRecord {
+    const candidate = immutableRun({
+      schemaVersion: "dolly.effect-run/1",
+      ...identity,
+      state: "open",
+      createdAt,
+      updatedAt: createdAt,
+    });
+    return this.#withMutationLock(() => {
+      const document = this.#readDocument();
+      const exact = document.runs.find((record) => sameRunIdentity(record, candidate));
+      if (exact?.state === "open") return exact;
+      if (exact?.state === "closed") {
+        throw new EffectIntentError(
+          "EFFECT_INTENT_CONFLICT",
+          `Effect admission for Run "${identity.runId}" is already closed`,
+        );
+      }
+      if (
+        document.runs.some(
+          (record) =>
+            record.moduleJobId === identity.moduleJobId &&
+            record.runId === identity.runId,
+        )
+      ) {
+        throw new EffectIntentError(
+          "EFFECT_INTENT_CONFLICT",
+          `Run "${identity.runId}" already names a different Claim identity`,
+        );
+      }
+      this.#writeDocument({
+        ...document,
+        revision: nextRevision(document.revision),
+        runs: [...document.runs, candidate].sort(compareRunIdentity),
+      });
+      return candidate;
+    });
+  }
+
+  closeRun(identity: DeliveryClaimIdentity, closedAt: string): EffectRunRecord {
+    return this.#withMutationLock(() => {
+      const document = this.#readDocument();
+      const index = document.runs.findIndex((record) =>
+        effectRunMatchesIdentity(record, identity),
+      );
+      const current = document.runs[index];
+      if (current === undefined) {
+        throw new EffectIntentError(
+          "EFFECT_INTENT_NOT_FOUND",
+          `Effect admission for Run "${identity.runId}" was never opened`,
+        );
+      }
+      if (current.state === "closed") return current;
+      const records = document.records.filter((record) =>
+        record.moduleJobId === identity.moduleJobId &&
+        record.runId === identity.runId &&
+        record.attempt === identity.attempt &&
+        record.claimToken === identity.claimToken &&
+        record.moduleGenerationId === identity.moduleGenerationId,
+      );
+      const closed = immutableRun({
+        ...current,
+        state: "closed",
+        intentCount: records.length,
+        intentSetDigest: effectIntentSetDigest(records),
+        updatedAt: closedAt,
+      });
+      const runs = [...document.runs];
+      runs[index] = closed;
+      this.#writeDocument({
+        ...document,
+        revision: nextRevision(document.revision),
+        runs,
+      });
+      return closed;
+    });
   }
 
   compareAndSet(
@@ -162,6 +278,15 @@ export class FileEffectIntentStore implements EffectIntentStore {
         sameEffectIntentRecordIdentity(record, replacement));
       if (expected === undefined) {
         if (index >= 0) return false;
+        const run = document.runs.find((candidate) =>
+          effectRunMatchesIdentity(candidate, replacement),
+        );
+        if (run?.state !== "open") {
+          throw new EffectIntentError(
+            "EFFECT_INTENT_CONFLICT",
+            `Effect admission for Run "${replacement.runId}" is not open`,
+          );
+        }
         if (document.records.some(
           (record) =>
             record.moduleJobId === replacement.moduleJobId &&
@@ -236,12 +361,17 @@ export class FileEffectIntentStore implements EffectIntentStore {
     if (
       !isJsonObject(value) ||
       Object.keys(value).some(
-        (key) => key !== "schemaVersion" && key !== "revision" && key !== "records",
+        (key) =>
+          key !== "schemaVersion" &&
+          key !== "revision" &&
+          key !== "records" &&
+          key !== "runs",
       ) ||
-      value.schemaVersion !== "dolly.effect-intent-store/1" ||
+      value.schemaVersion !== "dolly.effect-intent-store/2" ||
       !Number.isSafeInteger(value.revision) ||
       (value.revision as number) < 0 ||
-      !Array.isArray(value.records)
+      !Array.isArray(value.records) ||
+      !Array.isArray(value.runs)
     ) {
       throw new EffectIntentError(
         "EFFECT_INTENT_DOCUMENT_INVALID",
@@ -249,9 +379,29 @@ export class FileEffectIntentStore implements EffectIntentStore {
       );
     }
     const records: EffectIntentRecord[] = [];
+    const runs: EffectRunRecord[] = [];
     const stableIntents = new Map<string, string>();
     let previous: EffectIntentRecord | undefined;
+    let previousRun: EffectRunRecord | undefined;
     try {
+      for (const candidate of value.runs) {
+        assertEffectRunRecord(candidate);
+        const run = immutableRun(candidate);
+        if (previousRun !== undefined && compareRunIdentity(previousRun, run) >= 0) {
+          throw new Error("Run records are duplicated or unsorted");
+        }
+        if (
+          runs.some(
+            (existing) =>
+              existing.moduleJobId === run.moduleJobId &&
+              existing.runId === run.runId,
+          )
+        ) {
+          throw new Error("one Run identifier names different Claim identities");
+        }
+        runs.push(run);
+        previousRun = run;
+      }
       for (const candidate of value.records) {
         assertEffectIntentRecord(candidate);
         const record = immutableRecord(candidate);
@@ -264,8 +414,23 @@ export class FileEffectIntentStore implements EffectIntentStore {
           throw new Error("one stable idempotency key names different intents");
         }
         stableIntents.set(stableKey, record.intentDigest);
+        if (!runs.some((run) => effectRunMatchesIdentity(run, record))) {
+          throw new Error("an effect intent has no exact Run admission record");
+        }
         records.push(record);
         previous = record;
+      }
+      for (const run of runs) {
+        if (run.state !== "closed") continue;
+        const runRecords = records.filter((record) =>
+          effectRunMatchesIdentity(run, record),
+        );
+        if (
+          run.intentCount !== runRecords.length ||
+          run.intentSetDigest !== effectIntentSetDigest(runRecords)
+        ) {
+          throw new Error("a closed Run does not match its frozen intent set");
+        }
       }
     } catch {
       throw new EffectIntentError(
@@ -274,9 +439,10 @@ export class FileEffectIntentStore implements EffectIntentStore {
       );
     }
     return deepFreeze({
-      schemaVersion: "dolly.effect-intent-store/1" as const,
+      schemaVersion: "dolly.effect-intent-store/2" as const,
       revision: value.revision as number,
       records,
+      runs,
     });
   }
 

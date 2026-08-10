@@ -818,14 +818,22 @@ queries its terminal outcome. An in-memory duplicate map, an Extension-declared
 
 The current `EffectIntentJournal`, `FileEffectIntentStore`, and
 `effectIntentEvidenceSource` implement the record rules, crash-recoverable
-individual-record storage, and the adapter consumed by startup and runtime
-recovery. No product capability execution path is yet required to write through
-this store before it authorizes an external effect, and the store has no durable
-Run-level record proving that capability admission closed after every possible
-effect was recorded. Consequently, both an empty journal and a set of records
-whose outcomes are all `no-effect` remain `unknown`: neither proves that every
-possible effect for the Run was recorded. A `terminal` record proves a durable
-final effect result, not retry safety.
+storage, and the adapter consumed by startup and runtime recovery. Before
+execution, the file store can durably open one exact Run. Closing that Run
+atomically freezes the count and digest of every intent accepted while it was
+open; a later new intent is refused. Only a matching closed record plus an empty
+intent set, or a matching closed record whose entire frozen set has `no-effect`
+outcomes, proves `no-effect` for that Run. A missing, open, mismatched, or
+unsettled set remains `unknown`. A `terminal` record proves a durable final
+effect result, not retry safety.
+
+This is still a component boundary, not a supported product path. No product
+capability execution path is yet required to open the Run before
+`module.execute`, write every effect intent before crossing its boundary, wait
+for all accepted capability handlers to settle, and close the Run after Host
+stops accepting new capability calls. Until that single authorization path is
+wired and tested, the persistent store's complete-set proof cannot be assumed
+for a live Module.
 
 The current `dolly.effect-intent/2` record carries both the stable idempotency
 key and one exact Claim/Run identity. A retry Run records a separate record with
