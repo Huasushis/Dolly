@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "../../../..");
@@ -58,7 +59,7 @@ function sha256(bytes) {
 }
 
 function exact(value, expected, label) {
-  assert(JSON.stringify(value) === JSON.stringify(expected), `${label} differs`);
+  assert(isDeepStrictEqual(value, expected), `${label} differs`);
 }
 
 function object(value, label) {
@@ -422,7 +423,7 @@ function verifyRun(runDirectory, fixtureValues) {
   const preregistration = parseJson(join(runDirectory, "preregistration.json"));
   assert(manifest.schemaVersion === "scheduler-agent-task-switch/run-manifest/1", "manifest schema differs");
   assert(manifest.experimentId === "scheduler-agent-task-switch-v0", "manifest experiment differs");
-  assert(manifest.experimentVersion === 3, "manifest experiment version differs");
+  assert(manifest.experimentVersion === 4, "manifest experiment version differs");
   assert(manifest.status === "completed" && manifest.failure === null, "run did not complete");
   assert(manifest.providerCalls === 11 && manifest.maximumProviderCalls === 11, "provider call budget differs");
   assert(manifest.secretLeasesReleased === 11, "secret leases were not released");

@@ -2,7 +2,7 @@
   "$schema": "./schema-v1.json",
   "schemaVersion": "dolly-experiment-preregistration/v1",
   "experimentId": "scheduler-agent-task-switch-v0",
-  "experimentVersion": 3,
+  "experimentVersion": 4,
   "title": "Scheduler-driven structured task checkpoint and task-switch effect canary",
   "status": "frozen-before-first-run",
   "scope": "live-canary",
@@ -53,7 +53,7 @@
     ]
   },
   "decision": {
-    "currentProductState": "Scheduler, process Host, active-Run model and tool capabilities, persistent tool/effect journals, and file Core are product components, but product bootstrap still refuses every configured Module. Version 1 exposed an invalid baseline field. Version 2 completed all eleven model calls and proved checkpoint storage, task-B isolation, and closed effect journals, but the resume Agent had to guess an internal storage-key prefix and therefore listed no checkpoint. Version 3 replaces that leaky storage abstraction with checkpoint tools that accept taskId while the Host derives keys. Memory v9 supports a sourced checkpoint candidate but does not establish association or a final Memory architecture.",
+    "currentProductState": "Scheduler, process Host, active-Run model and tool capabilities, persistent tool/effect journals, and file Core are product components, but product bootstrap still refuses every configured Module. Version 1 exposed an invalid baseline field. Version 2 completed all model calls but exposed a leaky storage-prefix abstraction. Version 3 completed the expected checkpoint, unrelated task, and resume effects, but its independent verifier incorrectly treated JSON object key order as semantic and therefore made the run inconclusive. Version 4 changes only that validator comparison to Node deep strict equality; it does not reuse version-3 outputs. Memory v9 supports a sourced checkpoint candidate but does not establish association or a final Memory architecture.",
     "changesIfSupported": [
       "Use the sourced structured checkpoint as the first simple task-resumption boundary behind the candidate Scheduler composition.",
       "Keep richer association, consolidation, retrieval composition, and scheduling policy as independent experiments rather than embedding them in this checkpoint format.",
@@ -127,7 +127,8 @@
       "caseFactors": [
         "Earlier registry canaries established the JSON-object contract, Host registry, live Aether reasoning observation, and strict response validation used unchanged here.",
         "Task-switch version 1 retained one HTTP-200 baseline checkpoint response and then stopped because its validator confused echoing an input checkpoint key with successful persistence; no treatment or resume response was observed.",
-        "Task-switch version 2 retained eleven successful model/provider calls, one complete baseline, a stored treatment checkpoint, a correct unrelated answer, and all three closed treatment effect Runs. Resume failed because storage_list exposed an internal prefix string and the model supplied release-aurora instead of task.release-aurora. The two legal empty list results and all tool rounds remain separate failure evidence."
+        "Task-switch version 2 retained eleven successful model/provider calls, one complete baseline, a stored treatment checkpoint, a correct unrelated answer, and all three closed treatment effect Runs. Resume failed because storage_list exposed an internal prefix string and the model supplied release-aurora instead of task.release-aurora. The two legal empty list results and all tool rounds remain separate failure evidence.",
+        "Task-switch version 3 retained eleven successful calls and the exact expected Agent effects, but its frozen validator rejected a semantically equal stored checkpoint because canonical storage reordered object keys. Version 3 remains inconclusive and is used only to identify this validator defect."
       ]
     },
     "evaluation": {
@@ -137,7 +138,7 @@
         "Seed labels identify the fixed task-A and unrelated task-B inputs inside one paired sequence; the owner Aether endpoint exposes no verified provider seed control."
       ]
     },
-    "splitIsolation": "No version-3 response exists before this version is frozen. Version-1 and version-2 raw artifacts remain separate failed runs and cannot be retried, merged, or scored as version 3. Historical Memory and registry runs may motivate the mechanism but are never merged with these case rows.",
+    "splitIsolation": "No version-4 response exists before this version is frozen. Version-1 through version-3 raw artifacts remain separate inconclusive runs and cannot be retried, merged, or scored as version 4. Historical Memory and registry runs may motivate the mechanism but are never merged with these case rows.",
     "tuningUsesTrainingAndDevelopmentOnly": true
   },
   "backend": {
@@ -378,9 +379,9 @@
       "associationOrConsolidationIncluded": false
     },
     "implementationSha256": {
-      "scripts/experiments/probes/scheduler-agent-task-switch-v0/run.mts": "217a9e128ed6d75973c9133177006745c692fc257df308052d2744ce532719e3",
+      "scripts/experiments/probes/scheduler-agent-task-switch-v0/run.mts": "b850d2d03d77e933c0bdf6ac68bc0d763e6b3e09b069f6176f2b67a31ff6173d",
       "scripts/experiments/probes/scheduler-agent-task-switch-v0/extension.mjs": "f9464908b9dd744a76d436fcf33032b7c381dea768406c147eb7bdd401c24f3d",
-      "scripts/experiments/probes/scheduler-agent-task-switch-v0/verify.mjs": "30f1ad0d445d23d5f032c45c41349a2148cfb812f4ab634acf67dfff66acfe62"
+      "scripts/experiments/probes/scheduler-agent-task-switch-v0/verify.mjs": "3771d56513a4fb781ac07075c9d220ae3a690e47bc0be591a777b6962fbc93db"
     },
     "productionSourceSha256": {
       "src/adapters/extension-effect-run-lifecycle.ts": "60cbab4e1968fedab658aeea5fd5a0fe1110a494842f9f0e2975898660ef3127",

@@ -186,7 +186,7 @@ function completionUrl(baseValue: string): URL {
 function descriptorDocument() {
   return {
     schemaVersion: "dolly.model-descriptor/4" as const,
-    descriptorVersion: "owner-aether-qwen3.6-27b-task-switch-v3",
+    descriptorVersion: "owner-aether-qwen3.6-27b-task-switch-v4",
     endpointId: "owner-aether-task-switch-fixture",
     operation: "chat-completion" as const,
     modelId: "qwen3.6-27b",
@@ -937,7 +937,7 @@ async function main(): Promise<void> {
   };
   if (
     preregistration.experimentId !== "scheduler-agent-task-switch-v0" ||
-    preregistration.experimentVersion !== 3 ||
+    preregistration.experimentVersion !== 4 ||
     preregistration.status !== "frozen-before-first-run"
   ) {
     throw new Error("task-switch preregistration is not frozen");
@@ -1145,7 +1145,7 @@ async function main(): Promise<void> {
   const manifest = {
     schemaVersion: "scheduler-agent-task-switch/run-manifest/1",
     experimentId: "scheduler-agent-task-switch-v0",
-    experimentVersion: 3,
+    experimentVersion: 4,
     runId,
     status,
     failure,
