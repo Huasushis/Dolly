@@ -10,9 +10,13 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { createExtensionProcessModuleExecutor } from "../../../src/adapters/extension-process-module-executor.js";
+import { createExtensionEffectJournalLifecycle } from "../../../src/adapters/extension-effect-run-lifecycle.js";
+import { EffectIntentJournal } from "../../../src/core/capabilities/effect-intent-journal.js";
+import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
 import {
   ExtensionIsolationPolicy,
   ExtensionProcessHost,
+  type ExtensionEffectRunLifecycle,
   type ExtensionIsolationGuarantees,
   type ExtensionProcessHostOptions,
 } from "../../../src/core/extension-process-host.js";
@@ -469,6 +473,157 @@ describe("Extension process isolation and capability checks", () => {
     }
   });
 
+  it("durably closes an exact zero-capability Run before returning its result", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-effect-empty-run-"));
+    const path = join(scratch, "effect-intents.json");
+    const identity = {
+      moduleJobId: "module-job-a",
+      runId: "run-a",
+      attempt: 1,
+      claimToken: "claim-token-a",
+      moduleGenerationId: "module-generation-a",
+    } as const;
+    const journal = new EffectIntentJournal({
+      store: new FileEffectIntentStore({ path }),
+      now: () => "2026-08-10T03:00:00.000Z",
+    });
+    const host = createHost("normal", scratch, {
+      effectRunLifecycle: createExtensionEffectJournalLifecycle({
+        journal,
+        getModuleSubmissionRecord: (runId) => {
+          expect(runId).toBe(identity.runId);
+          return {
+            schemaVersion: "dolly.module-submission-record/1",
+            ...identity,
+            processGenerationId: "process-generation-1",
+            inputDigest: `sha256:${"a".repeat(64)}`,
+            createdAt: "2026-08-10T03:00:00.000Z",
+          };
+        },
+      }),
+    });
+    try {
+      await host.start();
+      await expect(host.execute(execution())).resolves.toMatchObject({ ok: true });
+      expect(journal.evidenceForRun(identity)).toEqual({ kind: "no-effect" });
+      expect(
+        new EffectIntentJournal({
+          store: new FileEffectIntentStore({ path }),
+          now: () => "2026-08-10T03:00:01.000Z",
+        }).evidenceForRun(identity),
+      ).toEqual({ kind: "no-effect" });
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a submission that does not match the Host execution", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-effect-foreign-submission-"));
+    const path = join(scratch, "effect-intents.json");
+    const journal = new EffectIntentJournal({
+      store: new FileEffectIntentStore({ path }),
+      now: () => "2026-08-10T03:00:00.000Z",
+    });
+    const host = createHost("normal", scratch, {
+      effectRunLifecycle: createExtensionEffectJournalLifecycle({
+        journal,
+        getModuleSubmissionRecord: (runId) => {
+          expect(runId).toBe("run-a");
+          return {
+            schemaVersion: "dolly.module-submission-record/1",
+            moduleJobId: "foreign-module-job",
+            runId,
+            attempt: 1,
+            claimToken: "foreign-claim-token",
+            moduleGenerationId: "module-generation-a",
+            processGenerationId: "process-generation-1",
+            inputDigest: `sha256:${"b".repeat(64)}`,
+            createdAt: "2026-08-10T03:00:00.000Z",
+          };
+        },
+      }),
+    });
+    try {
+      await host.start();
+      await expect(host.execute(execution())).rejects.toThrow(
+        "Module submission does not match the Host execution identity",
+      );
+      expect(host.snapshot.state).toBe("ready");
+      expect(journal.evidenceForRun({
+        moduleJobId: "module-job-a",
+        runId: "run-a",
+        attempt: 1,
+        claimToken: "foreign-claim-token",
+        moduleGenerationId: "module-generation-a",
+      }).kind).toBe("unknown");
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("records a granted capability before exposing the later Module failure", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-effect-terminal-run-"));
+    const path = join(scratch, "effect-intents.json");
+    const identity = {
+      moduleJobId: "module-job-a",
+      runId: "run-a",
+      attempt: 1,
+      claimToken: "claim-token-a",
+      moduleGenerationId: "module-generation-a",
+    } as const;
+    const store = new FileEffectIntentStore({ path });
+    const journal = new EffectIntentJournal({
+      store,
+      now: () => "2026-08-10T03:00:00.000Z",
+    });
+    const handler = vi.fn(async () => ({ fromHost: true }));
+    const host = createHost("capability-then-business-error", scratch, {
+      effectRunLifecycle: createExtensionEffectJournalLifecycle({
+        journal,
+        getModuleSubmissionRecord: () => ({
+          schemaVersion: "dolly.module-submission-record/1",
+          ...identity,
+          processGenerationId: "process-generation-1",
+          inputDigest: `sha256:${"c".repeat(64)}`,
+          createdAt: "2026-08-10T03:00:00.000Z",
+        }),
+      }),
+    });
+    host.grantCapability(
+      {
+        capabilityType: "private-storage",
+        capabilityVersion: "v1",
+        operations: ["read"],
+        resourceScope: { descriptor: "fixture-storage", executionScope: "active-run" },
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        maxInvocations: 1,
+        maxConcurrentInvocations: 1,
+        maxArgumentBytes: 256,
+        maxResultBytes: 256,
+        requireIdempotencyKey: true,
+      },
+      handler,
+    );
+    try {
+      await host.start();
+      await expect(host.execute(execution())).rejects.toMatchObject({
+        code: "EXTENSION_INTERNAL",
+      });
+      expect(handler).toHaveBeenCalledOnce();
+      expect(store.list()).toHaveLength(1);
+      expect(journal.evidenceForRun(identity)).toEqual({ kind: "terminal" });
+      expect(host.snapshot.state).toBe("ready");
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("rejects an oversized frame before JSON parsing and terminates only that extension", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-process-protocol-frame-"));
     const host = createHost("oversized-frame", scratch);
@@ -729,8 +884,24 @@ describe("Extension process isolation and capability checks", () => {
   it("rejects a Module result while one of that Run's capabilities is still active", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-result-before-capability-"));
     const capabilityStartedMarkerPath = join(scratch, "capability-started");
+    const effectIdentity = {
+      moduleJobId: "module-job-a",
+      runId: "run-a",
+      attempt: 1,
+      claimToken: "claim-token-a",
+      moduleGenerationId: "module-generation-a",
+    } as const;
+    const openRun = vi.fn();
+    const closeRun = vi.fn();
+    const effectRunLifecycle: ExtensionEffectRunLifecycle = {
+      resolveRunIdentity: () => effectIdentity,
+      openRun,
+      invokeCapability: async (_invocation, execute) => await execute(),
+      closeRun,
+    };
     const host = createHost("capability-result-before-effect", scratch, {
       config: { capabilityStartedMarkerPath },
+      effectRunLifecycle,
     });
     let handlerStarted = false;
     let handlerAborted = false;
@@ -776,6 +947,8 @@ describe("Extension process isolation and capability checks", () => {
         timeout: 1_000,
         interval: 5,
       });
+      expect(openRun).toHaveBeenCalledOnce();
+      expect(closeRun).not.toHaveBeenCalled();
       finishHandler.resolve({ fromHost: true });
       const boundedResult = Promise.race([
         result,
@@ -790,6 +963,8 @@ describe("Extension process isolation and capability checks", () => {
         status: "failed",
         error: expect.any(ModuleExecutorTerminatedError),
       });
+      expect(closeRun).toHaveBeenCalledOnce();
+      expect(closeRun).toHaveBeenCalledWith(effectIdentity);
       expect(host.snapshot.state).toBe("stopped");
     } finally {
       finishHandler.resolve({ fromHost: true });

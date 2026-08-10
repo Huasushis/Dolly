@@ -2190,12 +2190,14 @@ through, the historical version 15 and version 16 ambiguity described in
 Section 7.7. Startup accepts Module-cgroup stop proof and external-effect evidence
 through injected interfaces. The Linux stop-proof implementation exists, but
 `runtime-bootstrap.ts` does not pass it to startup recovery. The effect-intent
-record protocol, file store, and recovery adapter
-(`effectIntentEvidenceSource`) also exist, but Dolly does not connect intent
-persistence to capability execution or persist the required Run-level
-completeness record. The adapter is therefore not an authoritative recovery
-source and remains unwired; `runtime-bootstrap.ts` passes no external-effect
-evidence source.
+record protocol, file store, recovery adapter (`effectIntentEvidenceSource`),
+and an Extension Host effect lifecycle also exist. When explicitly configured,
+that lifecycle resolves the already persisted Module submission, opens its
+exact Run, records every invocation of a granted handle, and closes the
+complete intent set after capability handlers settle. Dolly product startup
+does not construct that lifecycle or pass the recovery evidence source, so it
+remains a product-before-bootstrap component; `runtime-bootstrap.ts` still
+passes no external-effect evidence source.
 Consequently, any process record that is not already `stopped` fails product
 startup as unproven. With no Module records at all, which is every
 product-created deployment while Modules are rejected, behavior is unchanged.

@@ -4,8 +4,10 @@ import type { Readable, Writable } from "node:stream";
 import {
   cloneJson,
   deepFreeze,
+  isJsonObject,
   type JsonValue,
 } from "./canonical-json.js";
+import type { DeliveryClaimIdentity } from "./delivery-store.js";
 import {
   ExtensionCapabilityAuthority,
   ExtensionCapabilityError,
@@ -328,6 +330,43 @@ export interface ExtensionProcessHostOptions {
   readonly wallClockNow?: () => number;
   readonly nextIdentifier?: (purpose: "process-generation" | "session" | "request") => string;
   readonly nextCapabilityHandle?: () => string;
+  /**
+   * Host-owned durable accounting for every Core-mediated capability effect.
+   * When supplied, the Host will not send `module.execute` until the exact Run
+   * is open and will route every invocation of a granted handle through it.
+   */
+  readonly effectRunLifecycle?: ExtensionEffectRunLifecycle;
+}
+
+export interface ExtensionEffectRunRequest {
+  readonly moduleJobId: string;
+  readonly runId: string;
+  readonly attempt: number;
+  readonly moduleGenerationId: string;
+  readonly processGenerationId: string;
+}
+
+export interface ExtensionCapabilityEffectInvocation {
+  readonly identity: DeliveryClaimIdentity;
+  readonly capabilityType: string;
+  readonly capabilityVersion: string;
+  readonly operation: string;
+  readonly arguments: JsonValue;
+  readonly idempotencyKey?: string;
+}
+
+/**
+ * Trusted Core boundary that resolves a protocol Run to its exact Claim,
+ * persists Run admission, and records every granted capability invocation.
+ */
+export interface ExtensionEffectRunLifecycle {
+  resolveRunIdentity(request: ExtensionEffectRunRequest): DeliveryClaimIdentity;
+  openRun(identity: DeliveryClaimIdentity): void;
+  invokeCapability(
+    invocation: ExtensionCapabilityEffectInvocation,
+    execute: () => Promise<JsonValue>,
+  ): Promise<JsonValue>;
+  closeRun(identity: DeliveryClaimIdentity): void;
 }
 
 /**
@@ -402,8 +441,10 @@ interface ActiveRun {
   readonly attempt: number;
   readonly deadline: string;
   readonly requestId: string;
+  readonly effectIdentity?: DeliveryClaimIdentity;
   acceptingCapabilities: boolean;
   cancellationSent: boolean;
+  effectRunClosed: boolean;
 }
 
 interface GrantedCapabilityDescriptor {
@@ -735,6 +776,7 @@ export class ExtensionProcessHost {
   readonly #maxConcurrentCapabilityRequests: number;
   readonly #wallClockNow: () => number;
   readonly #nextIdentifier: NonNullable<ExtensionProcessHostOptions["nextIdentifier"]>;
+  readonly #effectRunLifecycle: ExtensionEffectRunLifecycle | undefined;
   readonly #processGenerationId: string;
   readonly #sessionId: string;
   readonly #capabilitySession: ExtensionCapabilitySession;
@@ -789,6 +831,7 @@ export class ExtensionProcessHost {
     this.#terminationTimeoutMs = options.terminationTimeoutMs ?? 10_000;
     this.#maxConcurrentCapabilityRequests = options.maxConcurrentCapabilityRequests ?? 8;
     this.#wallClockNow = options.wallClockNow ?? Date.now;
+    this.#effectRunLifecycle = options.effectRunLifecycle;
     let generatedId = 0;
     this.#nextIdentifier =
       options.nextIdentifier ??
@@ -995,6 +1038,13 @@ export class ExtensionProcessHost {
       throw new ExtensionProcessHostError("EXTENSION_INVOCATION_INVALID", "hasMore must be boolean");
     }
     const input = immutableJson(invocation.input);
+    const effectIdentity = this.#openEffectRun({
+      moduleJobId: invocation.moduleJobId,
+      runId: invocation.runId,
+      attempt: invocation.attempt,
+      moduleGenerationId: this.#moduleGenerationId,
+      processGenerationId: this.#processGenerationId,
+    });
     this.#state = "executing";
     let requestId: string | undefined;
     try {
@@ -1021,8 +1071,10 @@ export class ExtensionProcessHost {
             attempt: invocation.attempt,
             deadline: invocation.deadline,
             requestId: id,
+            ...(effectIdentity === undefined ? {} : { effectIdentity }),
             acceptingCapabilities: true,
             cancellationSent: false,
+            effectRunClosed: false,
           };
         },
       );
@@ -1063,6 +1115,14 @@ export class ExtensionProcessHost {
       }
       throw error;
     } finally {
+      if (requestId === undefined && effectIdentity !== undefined) {
+        try {
+          this.#effectRunLifecycle?.closeRun(effectIdentity);
+        } catch {
+          // No protocol request was issued. A failed close leaves conservative
+          // open evidence for recovery instead of changing the primary error.
+        }
+      }
       if (requestId && this.#activeRun?.requestId === requestId) {
         this.#activeRun = undefined;
       }
@@ -1121,8 +1181,14 @@ export class ExtensionProcessHost {
    */
   closeCapabilitySession(): Promise<void> {
     if (this.#capabilityClosePromise) return this.#capabilityClosePromise;
+    const active = this.#activeRun;
+    if (active) active.acceptingCapabilities = false;
     try {
-      this.#capabilityClosePromise = Promise.resolve(this.#capabilitySession.close());
+      this.#capabilityClosePromise = Promise.resolve(this.#capabilitySession.close()).then(
+        () => {
+          if (active) this.#closeEffectRun(active);
+        },
+      );
     } catch (error) {
       this.#capabilityClosePromise = Promise.reject(error);
     }
@@ -1412,6 +1478,7 @@ export class ExtensionProcessHost {
             "Extension returned a Module result before its capability requests settled",
           );
         }
+        this.#closeEffectRun(active);
       }
       if (message.error !== undefined) {
         clearTimeout(pending.timer);
@@ -1508,20 +1575,44 @@ export class ExtensionProcessHost {
           "Capability Module job or Run identifier does not match the active Run",
         );
       }
+      const argumentsValue = immutableJson(paramsValue.arguments);
+      const operation = paramsValue.operation as string;
+      const idempotencyKey =
+        paramsValue.idempotencyKey === undefined
+          ? undefined
+          : paramsValue.idempotencyKey as string;
+      const descriptor = this.#grantedCapability(
+        paramsValue.handle,
+        operation,
+      );
       // Only the host's own verified values reach the capability authority;
       // the Extension-provided fields are untrusted comparison inputs.
-      const result = await this.#capabilitySession.invoke({
-        handle: paramsValue.handle as unknown as ExtensionCapabilityHandle,
-        operation: paramsValue.operation as string,
-        arguments: paramsValue.arguments as JsonValue,
-        moduleJobId: active.moduleJobId,
-        runId: active.runId,
-        attempt: active.attempt,
-        deadline: active.deadline,
-        ...(paramsValue.idempotencyKey === undefined
-          ? {}
-          : { idempotencyKey: paramsValue.idempotencyKey as string }),
-      });
+      const invoke = () =>
+        this.#capabilitySession.invoke({
+          handle: paramsValue.handle as unknown as ExtensionCapabilityHandle,
+          operation,
+          arguments: argumentsValue,
+          moduleJobId: active.moduleJobId,
+          runId: active.runId,
+          attempt: active.attempt,
+          deadline: active.deadline,
+          ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+        });
+      const lifecycle = this.#effectRunLifecycle;
+      const result =
+        lifecycle && active.effectIdentity && descriptor
+          ? await lifecycle.invokeCapability(
+              {
+                identity: active.effectIdentity,
+                capabilityType: descriptor.capabilityType,
+                capabilityVersion: descriptor.capabilityVersion,
+                operation,
+                arguments: argumentsValue,
+                ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+              },
+              invoke,
+            )
+          : await invoke();
       await this.#channel?.send({
         jsonrpc: "2.0",
         id,
@@ -1555,6 +1646,54 @@ export class ExtensionProcessHost {
           data: { errorCode, retryable: false },
         },
       }) ?? Promise.resolve()
+    );
+  }
+
+  #openEffectRun(
+    request: ExtensionEffectRunRequest,
+  ): DeliveryClaimIdentity | undefined {
+    const lifecycle = this.#effectRunLifecycle;
+    if (!lifecycle) return undefined;
+    const identity = lifecycle.resolveRunIdentity(request);
+    if (
+      identity.moduleJobId !== request.moduleJobId ||
+      identity.runId !== request.runId ||
+      identity.attempt !== request.attempt ||
+      identity.moduleGenerationId !== request.moduleGenerationId
+    ) {
+      throw new ExtensionProcessHostError(
+        "EXTENSION_INVOCATION_INVALID",
+        "Effect Run resolver returned a foreign Claim identity",
+      );
+    }
+    assertIdentifier(identity.claimToken, "claimToken", "EXTENSION_INVOCATION_INVALID");
+    const immutableIdentity = deepFreeze({ ...identity });
+    lifecycle.openRun(immutableIdentity);
+    return immutableIdentity;
+  }
+
+  #closeEffectRun(active: ActiveRun): void {
+    if (active.effectRunClosed || active.effectIdentity === undefined) return;
+    this.#effectRunLifecycle!.closeRun(active.effectIdentity);
+    active.effectRunClosed = true;
+  }
+
+  #grantedCapability(
+    handleValue: JsonValue | undefined,
+    operation: string,
+  ): GrantedCapabilityDescriptor | undefined {
+    if (
+      handleValue === undefined ||
+      !isJsonObject(handleValue) ||
+      handleValue.schemaVersion !== "dolly.capability-handle/1" ||
+      typeof handleValue.handle !== "string"
+    ) {
+      return undefined;
+    }
+    return this.#grantedCapabilities.find(
+      (descriptor) =>
+        descriptor.handle.handle === handleValue.handle &&
+        descriptor.operations.includes(operation),
     );
   }
 

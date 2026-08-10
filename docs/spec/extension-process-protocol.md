@@ -435,6 +435,18 @@ both identifiers to be omitted together; that is removed, because an omitted
 Run identity would break the inference that a Run with no submission record
 received no Core-authorized external effect.
 
+When durable effect accounting is configured, the host additionally resolves
+the Run against Core's already-persisted Module submission record before it
+sends `module.execute`. It durably opens that exact Claim/Run, routes every
+invocation of a granted handle through one Host-owned effect recorder, and
+closes the Run only after new capability admission has stopped and every
+accepted handler has settled. The close freezes the count and digest of the
+complete intent set. A Module response that races an active handler is a
+protocol violation; the Run is not closed until termination cleanup drains the
+handler. A forged handle or operation never reaches a handler and therefore is
+not an omitted effect. This component path is not yet product startup wiring:
+`runtime-bootstrap.ts` still rejects configured Modules.
+
 No capability currently lets background code activate its own Module. Background
 code MUST NOT publish a Block or call `module.execute` on itself. The first
 runtime supports only reactive activation and MUST reject periodic, source, and
