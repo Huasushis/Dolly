@@ -14,10 +14,17 @@ import {
   deriveInstalledLinuxExtensionModuleExecutor,
   type InstalledLinuxExtensionModuleExecutorOptions,
 } from "../../../src/adapters/installed-linux-extension-module-executor.js";
-import type { JsonValue } from "../../../src/core/canonical-json.js";
+import {
+  canonicalJsonDigest,
+  type JsonValue,
+} from "../../../src/core/canonical-json.js";
 import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
 import { ExtensionInstallationRegistry } from "../../../src/core/extension-installation-registry.js";
-import { resolveInstalledExtensionModule } from "../../../src/core/installed-extension-module.js";
+import {
+  resolveInstalledContentSchemaRegistrationSet,
+  resolveInstalledExtensionModule,
+} from "../../../src/core/installed-extension-module.js";
+import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import type { ModuleProcessRecordStore } from "../../../src/core/linux-module-process-lifecycle.js";
@@ -59,6 +66,13 @@ const CONFIGURATION_SCHEMA = {
   required: ["prefix"],
   additionalProperties: false,
 } as const;
+const CONTENT_SCHEMA = {
+  $schema: JSON_SCHEMA_2020_12,
+  type: "object",
+  properties: { value: { type: "string", minLength: 1 } },
+  required: ["value"],
+  additionalProperties: false,
+} as const;
 
 function writePackage(
   directory: string,
@@ -84,6 +98,38 @@ function writePackage(
       activation: "reactive",
       configVersion: 1,
       configurationSchema,
+    }],
+    requestedCapabilities: [],
+  }), "utf8");
+}
+
+function writePackageV2(directory: string, packageVersion: string): void {
+  mkdirSync(resolve(directory, "dist"), { recursive: true, mode: 0o700 });
+  writeFileSync(
+    resolve(directory, "dist", "main.mjs"),
+    "export const installedFixture = true;\n",
+    "utf8",
+  );
+  writeFileSync(resolve(directory, "dolly-extension.json"), JSON.stringify({
+    schemaVersion: "dolly.extension-package/2",
+    extensionId: "org.example.installed",
+    packageVersion,
+    displayName: "Installed fixture",
+    description: "Exercises installation and content schema provenance.",
+    supportedProtocolVersions: ["3.0"],
+    entrypoint: "dist/main.mjs",
+    modules: [{
+      moduleKind: "transform",
+      activation: "reactive",
+      configVersion: 1,
+      configurationSchema: CONFIGURATION_SCHEMA,
+      producedContentSchemas: [{
+        schema: "org.example.installed.result/1",
+        validator: CONTENT_SCHEMA,
+        validatorDigest: canonicalJsonDigest(CONTENT_SCHEMA),
+        maxValueBytes: 256,
+        containsCoreReferences: false,
+      }],
     }],
     requestedCapabilities: [],
   }), "utf8");
@@ -206,6 +252,64 @@ describe("installed Extension Module resolution", () => {
     expect(resolved.configuration).toEqual(configuration);
     expect(resolved.packageModule.configurationSchema).toEqual(CONFIGURATION_SCHEMA);
     expect(Object.isFrozen(resolved)).toBe(true);
+  });
+
+  it("binds installed package schema producers to FileCore before Block allocation", () => {
+    const source = resolve(scratch, "source-v2");
+    writePackageV2(source, "2.0.0");
+    installations.installNodePackage({ sourceDirectory: source, trust: "trusted" });
+    const instance = instanceConfiguration("2.0.0", `sha256:${"0".repeat(64)}`);
+    const contentSchemas = resolveInstalledContentSchemaRegistrationSet({
+      instanceConfiguration: instance,
+      installations,
+      reservedRegistrations: [],
+      maxRegisteredValueBytes: 1024,
+    });
+    let nextBlock = 0;
+    let nextDelivery = 0;
+    const corePath = resolve(scratch, "core-state.json");
+    const openCore = () => new FileCoreStateStore({
+      path: corePath,
+      maxFailedAttempts: 3,
+      nextBlockId: () => `block-${(nextBlock += 1)}`,
+      nextDeliveryId: () => `delivery-${(nextDelivery += 1)}`,
+      now: () => "2026-08-10T12:00:00.000Z",
+      contentSchemas,
+    });
+    const core = openCore();
+    expect(core.blocks.isContentSchemaRegistrationSetBoundTo(contentSchemas)).toBe(true);
+    const proposal = (value: JsonValue) => ({
+      payload: {
+        schema: "dolly.content/1",
+        value: {
+          items: [{
+            type: "data",
+            schema: "org.example.installed.result/1",
+            value,
+          }],
+        },
+      },
+    } as const);
+
+    expect(core.blocks.commit(
+      proposal({ value: "verified" }),
+      { kind: "module", id: "worker" },
+    ).id).toBe("block-1");
+    expect(() => core.blocks.commit(
+      proposal({ value: "" }),
+      { kind: "module", id: "worker" },
+    )).toThrowError(expect.objectContaining({ code: "SCHEMA_VALUE_INVALID" }));
+    expect(() => core.blocks.commit(
+      proposal({ value: "forged" }),
+      { kind: "module", id: "another-worker" },
+    )).toThrowError(expect.objectContaining({ code: "BLOCK_RESERVED_SCHEMA_FORBIDDEN" }));
+    expect(nextBlock).toBe(1);
+
+    const reopened = openCore();
+    expect(reopened.blocks.isContentSchemaRegistrationSetBoundTo(contentSchemas)).toBe(true);
+    expect(reopened.blocks.get("block-1")?.payload).toEqual(
+      proposal({ value: "verified" }).payload,
+    );
   });
 
   it("rejects a package/configuration schema mismatch and unsupported activation", () => {

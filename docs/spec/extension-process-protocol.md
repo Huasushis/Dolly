@@ -136,18 +136,36 @@ only reactive Modules. `configurationSchema` MUST be a valid JSON Schema Draft
 it validates. `supportedProtocolVersions` is a non-empty exact list; protocol
 version ranges are not inferred.
 
-`dolly.extension-package/2` is reserved by `schema-registry.md` for the complete
-payload-schema registration contract. A partial activation-only use of that
-version is forbidden. Periodic process activation therefore remains unavailable
-until the full version 2 manifest is designed and implemented without weakening
-that registry contract.
+`dolly.extension-package/2` is the complete first producer-registration
+manifest required by `schema-registry.md`. It has the same closed root fields as
+version 1. Every Module declaration additionally has exactly one
+`producedContentSchemas` array whose entries have this closed form:
 
-`requestedCapabilities` MUST be empty in package schema version 1.
-Capability requests, payload schema registration, renderer registration,
-configuration migrations, and package signatures require a later package schema
-with its own security review and conformance tests. A valid future signature may
-establish package provenance, but it will not grant capabilities or trust by
-itself.
+```typescript
+interface ExtensionContentSchemaProducer {
+  schema: string;
+  validator: JsonValue;
+  validatorDigest: `sha256:${string}`;
+  maxValueBytes: number;
+  containsCoreReferences: false;
+}
+```
+
+The array contains at most 64 entries. Each name is unique within the Module,
+matches the content-name syntax, and is derived from the exact manifest
+`extensionId`; a package cannot claim a `dolly.` name. `validator` is valid JSON
+Schema Draft 2020-12, `validatorDigest` is its RFC 8785 canonical SHA-256 digest,
+and `maxValueBytes` is a positive safe integer. Core references remain forbidden
+until a reference extractor is separately specified and implemented. Version 2
+still supports only reactive Modules. It does not add renderer registration,
+capability requests, periodic activation, or source activation.
+
+`requestedCapabilities` MUST be empty in package schema versions 1 and 2.
+Capability requests, renderer registration, configuration migrations, package
+signatures, periodic activation, and source activation require a later package
+schema with their own security review and conformance tests. A valid future
+signature may establish package provenance, but it will not grant capabilities
+or trust by itself.
 
 Installation recursively copies only ordinary files under finite file and byte
 limits. It rejects symbolic links, reparse points, path escapes, case-folding

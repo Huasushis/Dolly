@@ -25,6 +25,7 @@ import {
   type BlockStoreLimits,
   type BlockStoreSnapshot,
 } from "./block-store.js";
+import type { ContentSchemaRegistrationSet } from "./content-schema-registry.js";
 import {
   DeliveryStore,
   type DeliveryClaimIdentity,
@@ -194,6 +195,8 @@ export interface FileCoreStateStoreOptions {
   readonly nextDeliveryId: DeliveryStoreOptions["nextId"];
   readonly now: () => string;
   readonly blockLimits?: Partial<BlockStoreLimits>;
+  /** Frozen package/deployment registrations used for every Block validation. */
+  readonly contentSchemas?: ContentSchemaRegistrationSet;
   readonly media?: FileCoreMediaOptions;
 }
 
@@ -560,6 +563,7 @@ const REFERENCE_GRAPH_PUBLIC_METHODS = [
 
 const BLOCK_STORE_PUBLIC_METHODS = [
   "isSameBlockStore",
+  "isContentSchemaRegistrationSetBoundTo",
   "get",
   "has",
   "inspectCommitEffect",
@@ -1047,6 +1051,7 @@ interface CoreStateComponentRestoreOptions {
   readonly nextDeliveryId: DeliveryStoreOptions["nextId"];
   readonly now: () => string;
   readonly blockLimits?: Partial<BlockStoreLimits>;
+  readonly contentSchemas?: ContentSchemaRegistrationSet;
   readonly media?: FileCoreMediaOptions;
 }
 
@@ -1100,6 +1105,9 @@ function restoreCoreStateComponents(
     snapshot: document.blocks,
     ...(media === undefined ? {} : { media }),
     ...(options.blockLimits === undefined ? {} : { limits: options.blockLimits }),
+    ...(options.contentSchemas === undefined
+      ? {}
+      : { contentSchemas: options.contentSchemas }),
   });
   const deliveries = new DeliveryStore({
     blocks,
@@ -1363,6 +1371,9 @@ export class FileCoreStateStore {
         referenceGraph,
         ...(media === undefined ? {} : { media }),
         ...(options.blockLimits === undefined ? {} : { limits: options.blockLimits }),
+        ...(options.contentSchemas === undefined
+          ? {}
+          : { contentSchemas: options.contentSchemas }),
       });
       const deliveries = new DeliveryStore({
         blocks,
@@ -1387,6 +1398,9 @@ export class FileCoreStateStore {
         ...(options.blockLimits === undefined
           ? {}
           : { blockLimits: options.blockLimits }),
+        ...(options.contentSchemas === undefined
+          ? {}
+          : { contentSchemas: options.contentSchemas }),
         ...(options.media === undefined ? {} : { media: options.media }),
       });
     } catch {

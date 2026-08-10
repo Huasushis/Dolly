@@ -19,6 +19,15 @@ import {
   type ExtensionInstallationRegistryOptions,
 } from "../../../src/core/extension-installation-registry.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
+import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
+
+const CONTENT_VALIDATOR = {
+  $schema: JSON_SCHEMA_2020_12,
+  type: "object",
+  required: ["value"],
+  properties: { value: { type: "string", maxLength: 64 } },
+  additionalProperties: false,
+} as const;
 
 function moduleDeclaration(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -35,6 +44,21 @@ function moduleDeclaration(overrides: Record<string, unknown> = {}): Record<stri
     },
     ...overrides,
   };
+}
+
+function moduleDeclarationV2(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return moduleDeclaration({
+    producedContentSchemas: [{
+      schema: "org.example.transform.result/1",
+      validator: CONTENT_VALIDATOR,
+      validatorDigest: canonicalJsonDigest(CONTENT_VALIDATOR),
+      maxValueBytes: 1024,
+      containsCoreReferences: false,
+    }],
+    ...overrides,
+  });
 }
 
 function packageManifest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -311,9 +335,151 @@ describe("static Extension installation registry", () => {
     );
   });
 
-  it("keeps reserved package schema version 2 unavailable until its full contract lands", () => {
+  it("installs and reopens the complete package schema version 2 declaration", () => {
     writePackage(sourceDirectory, {
       schemaVersion: "dolly.extension-package/2",
+      modules: [moduleDeclarationV2()],
+    });
+
+    const installed = registry().installNodePackage({
+      sourceDirectory,
+      trust: "trusted",
+    });
+    const reopened = registry().resolve({
+      extensionId: "org.example.transform",
+      packageVersion: "Release:2026_07",
+    });
+
+    expect(reopened).toEqual(installed);
+    expect(installed.manifest.schemaVersion).toBe("dolly.extension-package/2");
+    if (installed.manifest.schemaVersion !== "dolly.extension-package/2") {
+      throw new Error("Expected package schema version 2");
+    }
+    expect(installed.manifest.modules[0]?.producedContentSchemas).toEqual([
+      expect.objectContaining({
+        schema: "org.example.transform.result/1",
+        validatorDigest: canonicalJsonDigest(CONTENT_VALIDATOR),
+        maxValueBytes: 1024,
+        containsCoreReferences: false,
+      }),
+    ]);
+    expect(Object.isFrozen(
+      installed.manifest.modules[0]?.producedContentSchemas,
+    )).toBe(true);
+  });
+
+  it.each([
+    ["a version 1-only Module shape", moduleDeclaration()],
+    ["an invalid schema name", moduleDeclarationV2({
+      producedContentSchemas: [{
+        schema: "invalid",
+        validator: CONTENT_VALIDATOR,
+        validatorDigest: canonicalJsonDigest(CONTENT_VALIDATOR),
+        maxValueBytes: 1024,
+        containsCoreReferences: false,
+      }],
+    })],
+    ["a schema outside the package namespace", moduleDeclarationV2({
+      producedContentSchemas: [{
+        schema: "org.other.result/1",
+        validator: CONTENT_VALIDATOR,
+        validatorDigest: canonicalJsonDigest(CONTENT_VALIDATOR),
+        maxValueBytes: 1024,
+        containsCoreReferences: false,
+      }],
+    })],
+    ["a reserved schema", moduleDeclarationV2({
+      producedContentSchemas: [{
+        schema: "dolly.result/1",
+        validator: CONTENT_VALIDATOR,
+        validatorDigest: canonicalJsonDigest(CONTENT_VALIDATOR),
+        maxValueBytes: 1024,
+        containsCoreReferences: false,
+      }],
+    })],
+    ["duplicate schema names", moduleDeclarationV2({
+      producedContentSchemas: [
+        {
+          schema: "org.example.transform.result/1",
+          validator: CONTENT_VALIDATOR,
+          validatorDigest: canonicalJsonDigest(CONTENT_VALIDATOR),
+          maxValueBytes: 1024,
+          containsCoreReferences: false,
+        },
+        {
+          schema: "org.example.transform.result/1",
+          validator: CONTENT_VALIDATOR,
+          validatorDigest: canonicalJsonDigest(CONTENT_VALIDATOR),
+          maxValueBytes: 1024,
+          containsCoreReferences: false,
+        },
+      ],
+    })],
+    ["an invalid validator", moduleDeclarationV2({
+      producedContentSchemas: [{
+        schema: "org.example.transform.result/1",
+        validator: { $schema: JSON_SCHEMA_2020_12, type: "invalid" },
+        validatorDigest: canonicalJsonDigest({
+          $schema: JSON_SCHEMA_2020_12,
+          type: "invalid",
+        }),
+        maxValueBytes: 1024,
+        containsCoreReferences: false,
+      }],
+    })],
+    ["a changed validator digest", moduleDeclarationV2({
+      producedContentSchemas: [{
+        schema: "org.example.transform.result/1",
+        validator: CONTENT_VALIDATOR,
+        validatorDigest: `sha256:${"0".repeat(64)}`,
+        maxValueBytes: 1024,
+        containsCoreReferences: false,
+      }],
+    })],
+    ["a non-positive value limit", moduleDeclarationV2({
+      producedContentSchemas: [{
+        schema: "org.example.transform.result/1",
+        validator: CONTENT_VALIDATOR,
+        validatorDigest: canonicalJsonDigest(CONTENT_VALIDATOR),
+        maxValueBytes: 0,
+        containsCoreReferences: false,
+      }],
+    })],
+    ["an undeclared Core-reference extractor", moduleDeclarationV2({
+      producedContentSchemas: [{
+        schema: "org.example.transform.result/1",
+        validator: CONTENT_VALIDATOR,
+        validatorDigest: canonicalJsonDigest(CONTENT_VALIDATOR),
+        maxValueBytes: 1024,
+        containsCoreReferences: true,
+      }],
+    })],
+  ])("rejects package schema version 2 with %s", (_label, declaration) => {
+    writePackage(sourceDirectory, {
+      schemaVersion: "dolly.extension-package/2",
+      modules: [declaration],
+    });
+
+    expectInstallationError(
+      () => registry().installNodePackage({ sourceDirectory, trust: "trusted" }),
+      "EXTENSION_PACKAGE_INVALID",
+    );
+  });
+
+  it("does not accept package schema version 2 fields in version 1", () => {
+    writePackage(sourceDirectory, { modules: [moduleDeclarationV2()] });
+
+    expectInstallationError(
+      () => registry().installNodePackage({ sourceDirectory, trust: "trusted" }),
+      "EXTENSION_PACKAGE_INVALID",
+    );
+  });
+
+  it("keeps requested capabilities closed in package schema version 2", () => {
+    writePackage(sourceDirectory, {
+      schemaVersion: "dolly.extension-package/2",
+      modules: [moduleDeclarationV2()],
+      requestedCapabilities: ["network"],
     });
 
     expectInstallationError(

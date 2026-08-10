@@ -544,31 +544,27 @@ falsifiable and none asserts only that a status string was returned.
   publisher and Module-role identity, validator digests, conflicts, value byte
   limits, and pinned validators. `BlockStore.normalizeInput` can enforce that
   complete immutable set before allocating a Block identifier. It deliberately
-  cannot establish package provenance: no package manifest version or product
-  startup builder supplies its inputs yet, so its presence is component
-  evidence rather than a supported registry.
+  can now be built from integrity-checked `dolly.extension-package/2`
+  installations by `resolveInstalledContentSchemaRegistrationSet`, and a
+  `FileCoreStateStore` can bind that exact frozen set to Block restore and
+  commit. The public runtime bootstrap still refuses every Module, and the
+  installed Scheduler composition does not yet require this binding, so this is
+  product-before-bootstrap evidence rather than a supported registry.
 
 ### 11.2 What this contract depends on that does not exist
 
-- **A package manifest that can declare a registration.**
-  `extension-process-protocol.md` Section 3 requires `requestedCapabilities` to
-  be empty in package schema version 1 and explicitly defers payload schema
-  registration and renderer registration to a later package schema with its own
-  security review. This contract therefore requires
-  `dolly.extension-package/2`, and cannot be implemented against version 1.
-
-  This dependency is **hard and has been ruled on**: no partial registry may be
-  built on package schema version 1 in order to land sooner. A version covering
-  only the part version 1 can express would be exactly the object Section 1.1
-  warns about — a mechanism that reports success while governing nothing a
-  publisher declares — and its presence would be worse than its absence, because
-  the next reader would take the name governance for granted.
+- **A package manifest that can declare a registration now exists.**
+  `extension-process-protocol.md` Section 3 defines
+  `dolly.extension-package/2` as the complete first producer-registration
+  manifest. Version 1 remains unchanged and cannot declare a registration.
+  Version 2 does not silently acquire activation or capability fields.
 - **A name syntax for `data` items.** `block-content.ts` requires only a
   non-empty string, so Section 4.1 is a new constraint that
   `block-payload.md` must state.
-- **A startup phase that owns the registration set.** Nothing today builds a
-  cross-Module set of anything before Module start, because Module execution is
-  disabled.
+- **A startup phase that owns the registration set.** The pure installed-package
+  resolver and FileCore binding exist, but the installed Scheduler composition
+  has not yet made the exact same set a mandatory input and startup invariant.
+  Public Module execution remains disabled.
 - **Module execution.** Every enforcement path that depends on a Module
   starting is unreachable until Modules run at all.
 

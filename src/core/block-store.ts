@@ -315,6 +315,13 @@ export class BlockStore {
     return this.#storeIdentity === other.#storeIdentity;
   }
 
+  /** Returns whether this store uses this exact frozen registration set. */
+  isContentSchemaRegistrationSetBoundTo(
+    contentSchemas: ContentSchemaRegistrationSet,
+  ): boolean {
+    return this.#contentSchemas === contentSchemas;
+  }
+
   get size(): number {
     return this.#records.size;
   }

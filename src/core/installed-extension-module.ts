@@ -1,5 +1,10 @@
 import type { JsonValue } from "./canonical-json.js";
 import {
+  ContentSchemaRegistrationSet,
+  type ContentSchemaRegistrationInput,
+  type ContentSchemaModule,
+} from "./content-schema-registry.js";
+import {
   assertExtensionModuleCompatibility,
   ExtensionInstallationRegistry,
   type ExtensionPackageModule,
@@ -29,6 +34,18 @@ export interface ResolveInstalledExtensionModuleOptions {
   readonly moduleId: string;
   readonly installations: ExtensionInstallationRegistry;
   readonly configurations: ModuleConfigurationStore;
+}
+
+export interface ResolveInstalledContentSchemaRegistrationSetOptions {
+  /** The complete instance document is validated again before any lookup. */
+  readonly instanceConfiguration: DollyInstanceConfig;
+  readonly installations: ExtensionInstallationRegistry;
+  /** Host-owned registrations and producer grants for `dolly.` names. */
+  readonly reservedRegistrations: readonly Extract<
+    ContentSchemaRegistrationInput,
+    { readonly source: "deployment" }
+  >[];
+  readonly maxRegisteredValueBytes: number;
 }
 
 /**
@@ -91,5 +108,78 @@ export function resolveInstalledExtensionModule(
     installation,
     packageModule,
     configuration: resolvedConfiguration,
+  });
+}
+
+/**
+ * Resolves the complete content schema registration set from verified package
+ * installations before any Extension code runs. Package declarations and
+ * deployment-owned reserved-name grants enter through separate inputs, so a
+ * package cannot turn its own manifest into host authority.
+ */
+export function resolveInstalledContentSchemaRegistrationSet(
+  options: ResolveInstalledContentSchemaRegistrationSetOptions,
+): ContentSchemaRegistrationSet {
+  if (!(options.installations instanceof ExtensionInstallationRegistry)) {
+    throw new TypeError("installations must be an ExtensionInstallationRegistry");
+  }
+  if (!Array.isArray(options.reservedRegistrations)) {
+    throw new TypeError("reservedRegistrations must be an array");
+  }
+  const configuration = validateDollyInstanceConfig(
+    options.instanceConfiguration as unknown as JsonValue,
+  );
+  const modules: ContentSchemaModule[] = [];
+  const registrations: ContentSchemaRegistrationInput[] = [
+    ...options.reservedRegistrations,
+  ];
+  for (const module of configuration.modules) {
+    const installation = options.installations.resolve({
+      extensionId: module.extensionId,
+      packageVersion: module.packageVersion,
+    });
+    assertExtensionModuleCompatibility(installation.manifest, {
+      extensionId: module.extensionId,
+      packageVersion: module.packageVersion,
+      moduleKind: module.moduleKind,
+      configVersion: module.configurationReference.configVersion,
+      activation: module.activation.kind,
+    });
+    const packageModule = installation.manifest.modules.find((candidate) =>
+      candidate.moduleKind === module.moduleKind
+    );
+    if (packageModule === undefined) {
+      throw new TypeError(`Installed package does not contain Module ${module.moduleKind}`);
+    }
+    const producer = {
+      extensionId: installation.manifest.extensionId,
+      packageVersion: installation.manifest.packageVersion,
+      moduleKind: packageModule.moduleKind,
+    } as const;
+    modules.push({ moduleId: module.moduleId, ...producer });
+    if (installation.manifest.schemaVersion === "dolly.extension-package/2") {
+      const versionedModule = installation.manifest.modules.find((candidate) =>
+        candidate.moduleKind === module.moduleKind
+      );
+      if (versionedModule === undefined) {
+        throw new TypeError(`Installed package does not contain Module ${module.moduleKind}`);
+      }
+      for (const declaration of versionedModule.producedContentSchemas) {
+        registrations.push({
+          source: "extension-package",
+          schema: declaration.schema,
+          producer,
+          validator: declaration.validator,
+          validatorDigest: declaration.validatorDigest,
+          maxValueBytes: declaration.maxValueBytes,
+          containsCoreReferences: false,
+        });
+      }
+    }
+  }
+  return new ContentSchemaRegistrationSet({
+    modules,
+    registrations,
+    maxRegisteredValueBytes: options.maxRegisteredValueBytes,
   });
 }

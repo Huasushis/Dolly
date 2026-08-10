@@ -41,6 +41,7 @@ import {
   deepFreeze,
   type JsonValue,
 } from "./canonical-json.js";
+import { parseContentSchemaName } from "./block-content.js";
 import { compileJsonSchema } from "./json-schema.js";
 import { parseStrictJsonBytes } from "./strict-json.js";
 import type { ExtensionTrust } from "./extension-process-host.js";
@@ -50,7 +51,8 @@ import {
 } from "./synchronous-cross-process-lock.js";
 
 const PACKAGE_MANIFEST_FILE = "dolly-extension.json";
-const PACKAGE_SCHEMA_VERSION = "dolly.extension-package/1";
+const PACKAGE_SCHEMA_VERSION_V1 = "dolly.extension-package/1";
+const PACKAGE_SCHEMA_VERSION_V2 = "dolly.extension-package/2";
 const INSTALLATION_RECORD_SCHEMA_VERSION = "dolly.extension-installation/1";
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
@@ -63,12 +65,29 @@ const MAX_RELATIVE_PATH_BYTES = 4_096;
 
 export type { ExtensionTrust } from "./extension-process-host.js";
 
-export interface ExtensionPackageModule extends Readonly<Record<string, JsonValue>> {
+interface ExtensionPackageModuleCommon extends Readonly<Record<string, JsonValue>> {
   readonly moduleKind: string;
   readonly activation: "reactive";
   readonly configVersion: number;
   readonly configurationSchema: JsonValue;
 }
+
+/** One Extension-owned structured-data producer declaration. */
+export interface ExtensionContentSchemaProducer extends Readonly<Record<string, JsonValue>> {
+  readonly schema: string;
+  readonly validator: JsonValue;
+  readonly validatorDigest: string;
+  readonly maxValueBytes: number;
+  readonly containsCoreReferences: false;
+}
+
+export interface ExtensionPackageModuleV1 extends ExtensionPackageModuleCommon {}
+
+export interface ExtensionPackageModuleV2 extends ExtensionPackageModuleCommon {
+  readonly producedContentSchemas: readonly ExtensionContentSchemaProducer[];
+}
+
+export type ExtensionPackageModule = ExtensionPackageModuleV1 | ExtensionPackageModuleV2;
 
 /**
  * The closed Extension package manifest is read before any Extension code
@@ -76,17 +95,29 @@ export interface ExtensionPackageModule extends Readonly<Record<string, JsonValu
  * Module configuration; `package.json` has no standard fields for those
  * Dolly-specific declarations.
  */
-export interface ExtensionPackageManifest extends Readonly<Record<string, JsonValue>> {
-  readonly schemaVersion: "dolly.extension-package/1";
+interface ExtensionPackageManifestCommon extends Readonly<Record<string, JsonValue>> {
   readonly extensionId: string;
   readonly packageVersion: string;
   readonly displayName: string;
   readonly description: string;
   readonly supportedProtocolVersions: readonly string[];
   readonly entrypoint: string;
-  readonly modules: readonly ExtensionPackageModule[];
   readonly requestedCapabilities: readonly [];
 }
+
+export interface ExtensionPackageManifestV1 extends ExtensionPackageManifestCommon {
+  readonly schemaVersion: "dolly.extension-package/1";
+  readonly modules: readonly ExtensionPackageModuleV1[];
+}
+
+export interface ExtensionPackageManifestV2 extends ExtensionPackageManifestCommon {
+  readonly schemaVersion: "dolly.extension-package/2";
+  readonly modules: readonly ExtensionPackageModuleV2[];
+}
+
+export type ExtensionPackageManifest =
+  | ExtensionPackageManifestV1
+  | ExtensionPackageManifestV2;
 
 export interface ExtensionModuleCompatibility {
   readonly extensionId: string;
@@ -368,12 +399,17 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     ],
     "Extension package manifest",
   );
-  if (value.schemaVersion !== PACKAGE_SCHEMA_VERSION) {
+  if (
+    value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V1 &&
+    value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V2
+  ) {
     throw new ExtensionInstallationError(
       "EXTENSION_PACKAGE_INVALID",
       "Extension package schema is unsupported",
     );
   }
+  const schemaVersion = value.schemaVersion;
+  const extensionId = identifier(value.extensionId, "extensionId");
   if (
     !Array.isArray(value.supportedProtocolVersions) ||
     value.supportedProtocolVersions.length === 0 ||
@@ -404,7 +440,15 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     const label = `modules[${index}]`;
     exactKeys(
       candidate,
-      ["moduleKind", "activation", "configVersion", "configurationSchema"],
+      schemaVersion === PACKAGE_SCHEMA_VERSION_V1
+        ? ["moduleKind", "activation", "configVersion", "configurationSchema"]
+        : [
+            "moduleKind",
+            "activation",
+            "configVersion",
+            "configurationSchema",
+            "producedContentSchemas",
+          ],
       label,
     );
     const moduleKind = identifier(candidate.moduleKind, `${label}.moduleKind`);
@@ -430,22 +474,115 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
         { cause: error },
       );
     }
-    return {
+    const common = {
       moduleKind,
-      activation: "reactive",
+      activation: "reactive" as const,
       configVersion: positiveInteger(candidate.configVersion, `${label}.configVersion`),
       configurationSchema: cloneJson(candidate.configurationSchema as JsonValue),
     };
+    if (schemaVersion === PACKAGE_SCHEMA_VERSION_V1) return common;
+    if (
+      !Array.isArray(candidate.producedContentSchemas) ||
+      candidate.producedContentSchemas.length > 64
+    ) {
+      throw new ExtensionInstallationError(
+        "EXTENSION_PACKAGE_INVALID",
+        `${label}.producedContentSchemas must contain at most 64 entries`,
+      );
+    }
+    const names = new Set<string>();
+    const producedContentSchemas = candidate.producedContentSchemas.map(
+      (raw, registrationIndex): ExtensionContentSchemaProducer => {
+        const registrationLabel =
+          `${label}.producedContentSchemas[${registrationIndex}]`;
+        exactKeys(
+          raw,
+          [
+            "schema",
+            "validator",
+            "validatorDigest",
+            "maxValueBytes",
+            "containsCoreReferences",
+          ],
+          registrationLabel,
+        );
+        let schema: string;
+        try {
+          schema = parseContentSchemaName(raw.schema, `${registrationLabel}.schema`);
+        } catch (error) {
+          throw new ExtensionInstallationError(
+            "EXTENSION_PACKAGE_INVALID",
+            `${registrationLabel}.schema is not a valid content schema name`,
+            { cause: error },
+          );
+        }
+        const unversionedName = schema.slice(0, schema.lastIndexOf("/"));
+        if (
+          schema.startsWith("dolly.") ||
+          !unversionedName.startsWith(`${extensionId}.`)
+        ) {
+          throw new ExtensionInstallationError(
+            "EXTENSION_PACKAGE_INVALID",
+            `${registrationLabel}.schema is not owned by this Extension package`,
+          );
+        }
+        if (names.has(schema)) {
+          throw new ExtensionInstallationError(
+            "EXTENSION_PACKAGE_INVALID",
+            `${label}.producedContentSchemas contains a duplicate schema name`,
+          );
+        }
+        names.add(schema);
+        const validator = cloneJson(raw.validator as JsonValue);
+        try {
+          compileJsonSchema(validator);
+        } catch (error) {
+          throw new ExtensionInstallationError(
+            "EXTENSION_PACKAGE_INVALID",
+            `${registrationLabel}.validator is not valid Draft 2020-12 JSON Schema`,
+            { cause: error },
+          );
+        }
+        const validatorDigest = raw.validatorDigest;
+        if (
+          typeof validatorDigest !== "string" ||
+          !DIGEST_PATTERN.test(validatorDigest) ||
+          canonicalJsonDigest(validator) !== validatorDigest
+        ) {
+          throw new ExtensionInstallationError(
+            "EXTENSION_PACKAGE_INVALID",
+            `${registrationLabel}.validatorDigest does not match its validator`,
+          );
+        }
+        if (raw.containsCoreReferences !== false) {
+          throw new ExtensionInstallationError(
+            "EXTENSION_PACKAGE_INVALID",
+            `${registrationLabel}.containsCoreReferences must be false until a reference extractor is defined`,
+          );
+        }
+        return {
+          schema,
+          validator,
+          validatorDigest,
+          maxValueBytes: positiveInteger(
+            raw.maxValueBytes,
+            `${registrationLabel}.maxValueBytes`,
+          ),
+          containsCoreReferences: false,
+        };
+      },
+    );
+    return { ...common, producedContentSchemas };
   });
   if (!Array.isArray(value.requestedCapabilities) || value.requestedCapabilities.length !== 0) {
     throw new ExtensionInstallationError(
       "EXTENSION_PACKAGE_INVALID",
-      "requestedCapabilities must be empty in this package schema version",
+      "requestedCapabilities must be empty in package schema versions 1 and 2",
     );
   }
   return deepFreeze({
-    schemaVersion: PACKAGE_SCHEMA_VERSION,
-    extensionId: identifier(value.extensionId, "extensionId"),
+    schemaVersion,
+    extensionId,
     packageVersion: identifier(value.packageVersion, "packageVersion"),
     displayName: boundedText(value.displayName, "displayName", 256),
     description: boundedText(value.description, "description", 4_096),
