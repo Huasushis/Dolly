@@ -227,6 +227,7 @@ describe("Linux Module process lifecycle order", () => {
     // The launcher is created only after the group is prepared.
     expect(startLauncher).toHaveBeenCalledOnce();
     expect(control.log).toEqual(["configure", "authorize"]);
+    expect(result.launcher).toBe(control);
     expect(result.record.state).toBe("starting");
     expect(records.log).not.toContain("state:running");
   });

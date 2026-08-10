@@ -59,9 +59,10 @@ const DEFAULT_CORE_EXIT_CLEANUP_TIMEOUT_MS = 1_000;
  * `attachLinuxModuleProcess` turns a started launcher and its verified Module
  * control group into an `AttachedExtensionProcess`; it also owns whole-group
  * termination because the host cannot enforce how an attachment terminates.
- * This executor still receives `openProtocolSession` from its caller and does
- * not itself connect those exact launcher and control-group values. No runtime
- * startup caller currently assembles that path end to end.
+ * This executor passes the exact authorized launcher, control group, and
+ * durable starting record to `openProtocolSession`; the caller no longer has
+ * to reconstruct or guess any of those lifecycle identities. No runtime
+ * startup caller currently assembles the complete host path end to end.
  */
 export interface LinuxModuleProtocolSession {
   /** Completes the authenticated handshake and Module creation. */
@@ -85,6 +86,11 @@ export interface LinuxModuleProtocolSession {
   waitForChannelClosed(timeoutMs: number): Promise<boolean>;
 }
 
+export type LinuxModuleAuthorizedProcess = Extract<
+  ModuleProcessStartResult,
+  { readonly executionAuthorized: true }
+>;
+
 export interface LinuxModuleExecutorOptions {
   readonly moduleId: string;
   readonly moduleGenerationId: string;
@@ -98,7 +104,9 @@ export interface LinuxModuleExecutorOptions {
    * initialization belong to `initialize()`. If attachment fails, this call
    * must throw before it creates capability state that would need closing.
    */
-  readonly openProtocolSession: () => LinuxModuleProtocolSession;
+  readonly openProtocolSession: (
+    process: LinuxModuleAuthorizedProcess,
+  ) => LinuxModuleProtocolSession;
   /** Bound on the whole-group termination proof. */
   readonly terminationTimeoutMs: number;
   /** Bound on observing the protocol channel closed after termination. */
@@ -308,7 +316,7 @@ export function createLinuxModuleExecutor(
       }
       let opened: LinuxModuleProtocolSession;
       try {
-        opened = options.openProtocolSession();
+        opened = options.openProtocolSession(started);
       } catch (error) {
         protocolSessionOpenFailed = true;
         protocolSessionOpenError = error;

@@ -39,9 +39,12 @@ its Block, output Deliveries, and input acknowledgement; it remains the only
  result store. Each Module is a direct child of Core. Product code now contains
  `createModuleLauncherControl` for the ordered start and
  `attachLinuxModuleProcess` for presenting a started launcher and its verified
- Module control group to `ExtensionProcessHost`. No runtime startup caller has
- connected those exact values end to end, so the assembly remains unproved and
- the number of remaining gaps remains unknown. "Attaching the protocol
+ Module control group to `ExtensionProcessHost`. The ordered start result now
+ carries that exact launcher together with its verified control group and
+ durable starting record, and the Linux executor supplies all three to its
+ protocol-session factory. No runtime startup caller has used those values to
+ construct the real attached host end to end, so the assembly remains unproved
+ and the number of remaining gaps remains unknown. "Attaching the protocol
  transport to the launcher child" below states the resulting block on
  `Accepted`.
 
@@ -297,10 +300,12 @@ redirect that write outside the cgroup filesystem, and an adapter that quietly
 converts whatever it receives removes the protection that check provides.
 
 Individual implementations therefore exist, but that is not an assembled
-runtime. The executor still receives a no-argument protocol-session factory
-from its caller, and no startup caller connects the same started launcher and
-verified Module control group to `attachLinuxModuleProcess`. The assembly has
-never been run end to end. Focused Linux tests now show that whole-group
+runtime. The executor now passes the exact authorized launcher, verified Module
+control group, and durable starting record to its protocol-session factory;
+identity tests reject any design that would require reconstructing those
+values. No startup caller yet connects that input to
+`attachLinuxModuleProcess` and a real `ExtensionProcessHost`, so the assembly
+has never been run end to end. Focused Linux tests now show that whole-group
 termination reaches a descendant which left the process group and that the
 launcher's standard streams carry the Extension protocol after `exec`; those
 results do not replace the missing end-to-end runtime assembly.

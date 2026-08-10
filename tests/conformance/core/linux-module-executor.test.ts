@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   createLinuxModuleExecutor,
+  type LinuxModuleAuthorizedProcess,
   type LinuxModuleProtocolSession,
 } from "../../../src/adapters/linux-module-executor.js";
 import {
@@ -233,7 +234,9 @@ function executorFor(options: {
   readonly records?: TestRecordStore;
   readonly fileSystem?: ReturnType<typeof cgroupFileSystem>;
   readonly startLauncher?: () => Promise<ModuleLauncherControl>;
-  readonly openProtocolSession?: () => LinuxModuleProtocolSession;
+  readonly openProtocolSession?: (
+    process: LinuxModuleAuthorizedProcess,
+  ) => LinuxModuleProtocolSession;
   readonly terminationTimeoutMs?: number;
   readonly channelCloseTimeoutMs?: number;
   readonly coreExitCleanupTimeoutMs?: number;
@@ -310,6 +313,35 @@ function waitForChildExit(
 }
 
 describe("Linux Module executor termination proof", () => {
+  it("opens the protocol with the exact authorized launcher, control group, and record", async () => {
+    const records = recordStore();
+    const session = protocolSession();
+    const control: ModuleLauncherControl = {
+      processId: 4242,
+      configure: async () => undefined,
+      authorizeExecution: async () => confirmedExecutionAuthorization(),
+      requestExit: async () => true,
+    };
+    const openProtocolSession = vi.fn((started: LinuxModuleAuthorizedProcess) => {
+      expect(started.launcher).toBe(control);
+      expect(started.record).toBe(records.current);
+      expect(started.cgroup.identity).toEqual(IDENTITY);
+      expect(started.cgroup.membershipObserved).toBe(true);
+      return session;
+    });
+    const executor = executorFor({
+      populated: () => "populated 1\nfrozen 0\n",
+      session,
+      records,
+      startLauncher: async () => control,
+      openProtocolSession,
+    });
+
+    await expect(executor.start()).resolves.toBeUndefined();
+    expect(openProtocolSession).toHaveBeenCalledOnce();
+    expect(session.initialize).toHaveBeenCalledOnce();
+  });
+
   it.each([
     { optionName: "terminationTimeoutMs" as const, value: Number.NaN },
     { optionName: "terminationTimeoutMs" as const, value: Number.POSITIVE_INFINITY },

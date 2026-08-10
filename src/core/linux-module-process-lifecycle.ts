@@ -151,6 +151,8 @@ export type ModuleProcessStartResult =
       readonly executionAuthorized: true;
       readonly record: ModuleProcessRecord;
       readonly cgroup: ModuleCgroup;
+      /** The exact launcher whose membership and execution authorization were verified. */
+      readonly launcher: ModuleLauncherControl;
     }
   | {
       readonly executionAuthorized: false;
@@ -410,7 +412,7 @@ export async function startModuleProcess(
   // the durable record deliberately remains `starting` here. The executor
   // writes `running` only after its protocol session finishes initialization.
   cgroup.recordObservedProcessIds(verifiedProcessIds);
-  return { executionAuthorized: true, record, cgroup };
+  return { executionAuthorized: true, record, cgroup, launcher };
 }
 
 export type ModuleProcessStopResult =
