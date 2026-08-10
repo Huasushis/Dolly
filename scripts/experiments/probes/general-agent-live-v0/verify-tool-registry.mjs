@@ -465,7 +465,7 @@ function verifyModelCalls(rows) {
     if (
       row.input?.schemaVersion !== "dolly.model.chat-input/3" ||
       JSON.stringify(row.input?.outputContract) !== JSON.stringify({ kind: outputKind }) ||
-      row.input?.maxOutputTokens !== EXPECTED_MAX_TOKENS[index] ||
+      row.budgets?.maxOutputTokens !== EXPECTED_MAX_TOKENS[index] ||
       row.reasoningPolicy !== (EXPECTED_REASONING_TYPES[index] === "enabled" ? "require" : "disable")
     ) {
       fail(`model call ${index + 1} did not use the frozen input contract`);

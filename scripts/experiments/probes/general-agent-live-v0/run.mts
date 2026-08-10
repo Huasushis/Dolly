@@ -63,6 +63,7 @@ import {
   ToolRegistry,
   type ToolDescriptor,
   type ToolExecutor,
+  type ToolExecutionOutcome,
   type ToolTurnBudget,
 } from "../../../../src/core/tool-policy.js";
 import { waitForAgentCase } from "./wait-for-case.mjs";
@@ -243,7 +244,7 @@ function caseAccounting(options: {
   };
 }
 
-class ExperimentFetchTransport implements ModelHttpTransport {
+export class ExperimentFetchTransport implements ModelHttpTransport {
   readonly #recordResponse: (record: JsonValue) => void;
 
   constructor(recordResponse: (record: JsonValue) => void) {
@@ -305,6 +306,61 @@ class ExperimentFetchTransport implements ModelHttpTransport {
       responseRecorded = true;
       recordResponse(record);
     };
+    const providerRequestId =
+      headers["x-request-id"] ?? headers["request-id"] ?? headers["x-amzn-requestid"];
+    if (response.status < 200 || response.status >= 300) {
+      let observedBytes = 0;
+      try {
+        if (reader) {
+          while (true) {
+            const item = await reader.read();
+            if (item.done) break;
+            observedBytes += item.value.byteLength;
+            if (observedBytes > input.maxResponseBytes) {
+              controller.abort(new Error("experiment model response exceeded its byte budget"));
+              throw new Error("experiment model response exceeded its byte budget");
+            }
+            responseChunks.push(Buffer.from(item.value));
+          }
+        }
+        const responseText = Buffer.concat(responseChunks).toString("utf8");
+        let responseValue: JsonValue = null;
+        if (responseText !== "") {
+          try {
+            responseValue = JSON.parse(responseText) as JsonValue;
+          } catch {
+            responseValue = { invalidJsonUtf8: responseText };
+          }
+        }
+        recordOnce({
+          schemaVersion: "general-agent-live/provider-response/1",
+          ...requestEvidence,
+          httpStatus: response.status,
+          response: responseValue,
+        });
+      } catch (error) {
+        recordOnce({
+          schemaVersion: "general-agent-live/provider-response/1",
+          ...requestEvidence,
+          httpStatus: response.status,
+          failureKind: "response-body-read-failed",
+          response: null,
+        });
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+        input.signal.removeEventListener("abort", abortFromCaller);
+      }
+      return {
+        status: response.status,
+        headers,
+        ...(providerRequestId === undefined ? {} : { providerRequestId }),
+        body: (async function* () {
+          for (const chunk of responseChunks) yield Uint8Array.from(chunk);
+        })(),
+        abort: (reason) => controller.abort(reason),
+      };
+    }
     const body = (async function* () {
       let observedBytes = 0;
       try {
@@ -358,8 +414,6 @@ class ExperimentFetchTransport implements ModelHttpTransport {
         input.signal.removeEventListener("abort", abortFromCaller);
       }
     })();
-    const providerRequestId =
-      headers["x-request-id"] ?? headers["request-id"] ?? headers["x-amzn-requestid"];
     return {
       status: response.status,
       headers,
@@ -844,7 +898,7 @@ function createReadOnlyStorageToolExecutor(options: {
   const namespace = options.storage.namespaceFor(options.instanceId, options.moduleId);
   const binding = { namespace, instanceId: options.instanceId, moduleId: options.moduleId };
   return {
-    execute: async (request) => {
+    execute: async (request): Promise<ToolExecutionOutcome> => {
       if (request.toolId === "storage.list") {
         const prefix = request.arguments.prefix as string;
         const limit = request.arguments.limit as number;
@@ -1103,7 +1157,9 @@ async function runCondition(options: {
           expiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
           now: () => new Date().toISOString(),
           chat: options.broker,
-          operations: options.separatePlanningCall ? ["chat", "describe"] : ["chat"],
+          operations: options.separatePlanningCall
+            ? (["chat", "describe"] as const)
+            : (["chat"] as const),
           reasoningPolicies: ["require", "disable"],
           roles: ["system", "user"],
           limits: {
@@ -1320,7 +1376,7 @@ async function runCondition(options: {
         blockId: committed.blockId,
         outputDeliveries: committed.outputDeliveries,
       },
-    };
+    } as unknown as JsonValue;
   } finally {
     if (host?.state === "running") await host.stop().catch(() => undefined);
     for (const extensionHost of extensionHosts) {
@@ -1740,4 +1796,6 @@ async function main(): Promise<void> {
   if (status !== "completed") throw new Error(failure ?? "live run failed");
 }
 
-await main();
+if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
+}

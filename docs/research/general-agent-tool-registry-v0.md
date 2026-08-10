@@ -68,3 +68,14 @@ Changing its source after the run cannot retroactively make registry-v4 green.
 7. Do not remove the product Module startup refusal. The next Scheduler product
    boundary remains durable external-effect evidence and output-commit safety,
    not a bootstrap bypass.
+
+## Post-v4 hardening status
+
+After preserving the exact v4 implementation in commit `799de89`, the next
+engineering revision corrected the verifier to read the frozen token limit from
+`model-call.budgets.maxOutputTokens`. It also changed the bounded experiment
+transport to drain and retain a non-2xx response body before returning control
+to a broker that may reject solely from the status code. A local loopback test
+proves a 503 body is recorded even when the caller never consumes the returned
+body stream. These fixes do not retroactively validate registry-v4-b; a future
+confirmation must freeze their new source hashes before making provider calls.
