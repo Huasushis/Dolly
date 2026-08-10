@@ -510,6 +510,14 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       expect(actorRunCount(FIRST_MODULE_ID)).toBe(2);
       expect(actorRunCount(SECOND_MODULE_ID)).toBe(2);
       expect(actorRunCount(DRAINER_MODULE_ID)).toBe(2);
+      expect(await waitFor(
+        () =>
+          repository.list().length === 6 &&
+          repository.list().every((record) => record.state === "committed") &&
+          coreState.store.deliveries.inspectResident(DRAINER_MODULE_ID, ["output"])
+              .residentCount === 0,
+        5_000,
+      )).toBe(true);
 
       await composed.host.stop();
       stopped = true;
@@ -537,7 +545,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         record.blockId !== undefined &&
         JSON.stringify(reopened.blocks.get(record.blockId)).includes("second:1:run-2")
       );
-      expect(reopenedRepository.list()).toHaveLength(5);
+      expect(reopenedRepository.list()).toHaveLength(6);
       expect(committed).toMatchObject({
         state: "committed",
         source: { kind: "module", id: SECOND_MODULE_ID },
@@ -558,18 +566,14 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         ["output"],
       );
       const reopenedDeliverySnapshot = reopened.deliveries.snapshot();
-      console.info(JSON.stringify({
-        shutdownDrainerDiagnostic: {
-          resident: reopenedDrainerResident,
-          jobs: reopenedDeliverySnapshot.moduleJobs.filter((job) =>
-            job.consumerId === DRAINER_MODULE_ID
-          ),
-          claims: reopenedDeliverySnapshot.claims,
-          submissions: reopened.listModuleSubmissionRecords(),
-        },
-      }));
       expect(reopenedDrainerResident)
-        .toMatchObject({ residentCount: 1, pendingCount: 1, claimedCount: 0 });
+        .toMatchObject({ residentCount: 0, pendingCount: 0, claimedCount: 0 });
+      const reopenedDrainerJobs = reopenedDeliverySnapshot.moduleJobs.filter((job) =>
+        job.consumerId === DRAINER_MODULE_ID
+      );
+      expect(reopenedDrainerJobs).toHaveLength(2);
+      expect(reopenedDrainerJobs.every((job) => job.status === "committed")).toBe(true);
+      expect(reopened.deliveries.listDeadLetters()).toEqual([]);
       expect(reopened.deliveries.inspectPending(SECOND_MODULE_ID, ["middle"]).pendingCount)
         .toBe(0);
       expect(reopened.deliveries.inspectPending(FIRST_MODULE_ID, ["input"]).pendingCount)
