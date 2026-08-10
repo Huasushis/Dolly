@@ -1,0 +1,165 @@
+{
+  "preregistrationId": "camoufox-mcp-v2",
+  "version": 1,
+  "status": "frozen-before-confirmation",
+  "frozenAtUtc": "2026-08-10T11:05:00Z",
+  "scope": "A deterministic Linux confirmation for direct Camoufox control and a Model Context Protocol path, including MCP output containment. It is not product support, an arbitrary-site benchmark, an anti-detection claim, or permission to remove Dolly's Module startup refusal.",
+  "priorDevelopmentObservations": [
+    "The v0 preregistration mixed deterministic browser control with an optional model-driven condition and is retained only as history.",
+    "Development selected an exact protocol set: @playwright/mcp 0.0.74 with both Playwright dependencies overridden to stable 1.60.0, matching the Python Playwright server. HTTP 428, unsupported CLI option, absent remote context, alpha/stable Electron initializer, and result-parser failures were retained in separate run directories.",
+    "The v1 confirmation produced six independently valid browser cases, but Playwright MCP also wrote snapshots and duplicate screenshots to repository-root .playwright-mcp. That run proves the browser effect but is disqualified from the architecture decision because its artifact inventory and output boundary were incomplete.",
+    "The v2 candidate sets --snapshot-mode none, routes the two MCP-owned screenshot files for each repetition to that run's mcp-internal/r<repeat> directory, and requires repository-root .playwright-mcp to be absent before and after the matrix."
+  ],
+  "question": "With exact protocol versions and output containment frozen, can both the direct Camoufox Python API and a real MCP SDK client through Microsoft Playwright MCP control the same Camoufox browser on Linux for screenshots, text input, clicking, explicit scrolling, state inspection, a deliberate missing-target failure, and same-session recovery in three fresh repetitions?",
+  "hypotheses": {
+    "null": "At least one backend has fewer than three complete independently verified cases, the MCP path misses a required operation or same-session recovery, or MCP writes any file outside the run directory.",
+    "alternative": "Both backends have three of three complete independently verified cases; MCP exercises every required operation and recovers in the same page session; all runner, MCP, screenshot, metadata, and verification output stays in the frozen run locations."
+  },
+  "decisionBoundary": {
+    "ifAlternative": "Keep the exact-version MCP-to-Camoufox path as a candidate browser tool adapter on Linux and keep direct Camoufox as a deterministic baseline. Product work must still add host-owned authorization, network and filesystem scope, deadlines, byte limits, active-Run binding, durable effect handling, and installed Linux Module composition.",
+    "ifNullAndDirectPasses": "Do not call direct evidence MCP evidence. Reject the selected MCP path or its output boundary and isolate the failed layer before another versioned confirmation.",
+    "ifBothFail": "Do not retain either path as a Linux candidate from this experiment.",
+    "cannotDecide": [
+      "production support or removal of RUNTIME_MODULE_MIGRATION_REQUIRED",
+      "arbitrary-site reliability, model planning, model screenshot perception, credentials, login sessions, anti-detection quality, or cross-platform behavior",
+      "whether browser effects are safely authorized, idempotent, or crash-recoverable for a long-lived Module"
+    ]
+  },
+  "baseline": {
+    "id": "direct-camoufox-python",
+    "comparison": "mcp-playwright-remote-camoufox",
+    "reason": "The direct path separates browser/Camoufox feasibility from MCP transport, schemas, remote Playwright, and MCP-owned output."
+  },
+  "backends": [
+    {
+      "id": "direct-camoufox-python",
+      "path": "Python runner -> Camoufox Python API -> Camoufox browser"
+    },
+    {
+      "id": "mcp-playwright-remote-camoufox",
+      "path": "MCP SDK over stdio -> Microsoft Playwright MCP -> Playwright WebSocket -> Camoufox browser",
+      "requiredTools": [
+        "browser_navigate",
+        "browser_take_screenshot",
+        "browser_type",
+        "browser_click",
+        "browser_evaluate",
+        "browser_snapshot"
+      ]
+    }
+  ],
+  "data": {
+    "fixture": "scripts/experiments/probes/camoufox-mcp-v0/fixture/index.html",
+    "fixtureSha256": "91e7eb7181f722586c80e07374af481a245227e3814e16062d844b534fd7b827",
+    "description": "One repository-local deterministic HTML document with solid-color screenshot anchors, an input, three state-changing buttons, an off-screen action, and a page-instance timestamp.",
+    "externalWebsites": [],
+    "secretsOrPrivateServices": []
+  },
+  "randomization": {
+    "baseSeed": 2026080901,
+    "repetitionsPerBackend": 3,
+    "caseSeeds": [2026080901, 2026080902, 2026080903],
+    "fixedBackendOrder": ["direct-camoufox-python", "mcp-playwright-remote-camoufox"],
+    "interpretation": "The direct runner seeds Python and NumPy. The MCP runner records the seed as repetition identity but makes no random choice. Browser fingerprint internals are not assumed to obey these seeds. Latency is diagnostic, so order is fixed."
+  },
+  "caseProtocol": {
+    "viewportCssPixels": {"width": 800, "height": 600},
+    "inputText": "Dolly-Camoufox-20260809",
+    "steps": [
+      "start a fresh loopback fixture server and fresh Camoufox browser path",
+      "navigate and establish successful page readiness",
+      "capture the top screenshot",
+      "type the exact input, click Apply once, and inspect state",
+      "explicitly scroll to the bottom, click Bottom once, and inspect retained state",
+      "capture the bottom screenshot",
+      "attempt the deliberately missing target exactly once and require an error",
+      "click Recover once without replacing the page and verify all state plus the same pageTimeOrigin",
+      "close only exact process identities created and recorded by the case"
+    ],
+    "screenshotOracle": {
+      "format": "PNG",
+      "dimensions": [800, 600],
+      "topAnchors": [
+        {"xy": [10, 10], "rgb": [18, 52, 86]},
+        {"xy": [50, 50], "rgb": [255, 51, 102]},
+        {"xy": [760, 500], "rgb": [246, 240, 220]}
+      ],
+      "bottomAnchors": [
+        {"xy": [10, 10], "rgb": [32, 64, 96]},
+        {"xy": [50, 500], "rgb": [51, 204, 153]},
+        {"xy": [760, 300], "rgb": [32, 64, 96]}
+      ],
+      "tolerancePerChannel": 0,
+      "hashRule": "Record and check every PNG byte length and SHA-256. Cross-case hashes need not match because pageTimeOrigin is rendered; dimensions and exact anchor pixels decide visual correctness."
+    },
+    "outputBoundary": {
+      "repositoryRootMcpDirectory": ".playwright-mcp must be absent before and after the matrix",
+      "mcpInternalPerCase": "mcp-internal/r<repeat> must contain exactly two page-<UTC timestamp>.png regular files and no other files",
+      "byteIdentity": "The two MCP-owned PNG hashes for a repetition must exactly equal the two retained screenshot hashes for that repetition",
+      "otherArtifacts": "The independent verifier requires an exact closed inventory under the run directory."
+    }
+  },
+  "environment": {
+    "platform": "Ubuntu 24.04 Linux x86_64",
+    "exactVersions": {
+      "python": "3.12.3",
+      "node": "v20.20.2",
+      "camoufoxPython": "0.5.4",
+      "pythonPlaywright": "1.60.0",
+      "pillow": "12.0.0",
+      "numpy": "2.5.1",
+      "mcpSdk": "1.30.0",
+      "playwrightMcp": "0.0.74",
+      "mcpPlaywright": "1.60.0",
+      "mcpPlaywrightCore": "1.60.0"
+    },
+    "camoufoxBrowser": {
+      "version": "152.0.4",
+      "build": "beta.28",
+      "releaseArtifactSha256": "924f3109ccd6d47cd6a0384d67a345fadf975d48b6319f8dbbd5954c588982bd",
+      "executableSha256": "a532ce19bbefc07b62469c4c29e0a3bb05fad0de4947750824e420d050826938"
+    },
+    "dependencyRoot": "/home/ubuntu/codex-dolly/.tools/camoufox-mcp-v0",
+    "isolation": "HOME, XDG_CACHE_HOME, TMPDIR, npm_config_cache, PIP_CACHE_DIR, and Python bytecode cache are below /home/ubuntu/codex-dolly. Cases receive no HTTP or HTTPS proxy and set both NO_PROXY variants to 127.0.0.1,localhost.",
+    "network": "Cases use only an ephemeral 127.0.0.1 HTTP fixture and local stdio/WebSocket connections. This confirmation makes no LLM, provider, OSS, or external website request."
+  },
+  "implementationHashes": {
+    "common.py": "d711881265fa886a0bc485b871506be08a76fbb2341afa87836a0408b214139b",
+    "direct_case.py": "e14d83448bcc80c938d32cc56eb2f9080fe90d5dce8ef65326c3ecd7444f6167",
+    "camoufox_server.py": "91f21ce11014486068459aa99739b6443ab4dbdb78bc9e8b625f57d952de5529",
+    "mcp_case.mjs": "3b5a2885143f4d50fe41c2c7df837b19b823f174601fc8d1d03eb55e946737ce",
+    "run_experiment.py": "428c53febdaeeacca7dd8738fd5aab0aa3ba7adb1ce2b94e74c5f410e71d9c09",
+    "verify.py": "f009ebf90121b14378bc1857ee6d1391f26d25bc5e338bef3d1d11d73280b56f",
+    "fixture/index.html": "91e7eb7181f722586c80e07374af481a245227e3814e16062d844b534fd7b827"
+  },
+  "metrics": {
+    "primary": [
+      "complete independently verified cases out of three per backend",
+      "required MCP inventory and successful operation exercise per case",
+      "top and bottom PNG dimensions and exact anchor pixels per case",
+      "exact state transitions, deliberate error, and same pageTimeOrigin recovery",
+      "recorded process identities left at finalization",
+      "repository-root MCP output absent and MCP-owned output confined with byte identity"
+    ],
+    "diagnosticOnly": ["per-call monotonic duration", "PNG byte length and SHA-256", "protocol or browser error text"],
+    "minimumEffectiveDifference": "One complete case out of three, or 33.33 percentage points. Latency cannot change the v2 decision."
+  },
+  "stopRules": [
+    "Run exactly three fresh repetitions per backend unless that backend has two consecutive browser or protocol initialization failures.",
+    "After two consecutive initialization failures, retain both raw files, stop only that backend, and label it infrastructure-inconclusive.",
+    "Do not retry a failed action inside a case. Recover after the deliberate error is a planned action, not a retry.",
+    "Any repository-root .playwright-mcp output, unexpected run artifact, fixture drift, runner defect, dependency drift, or verifier defect invalidates the confirmation; preserve it and version the correction.",
+    "Never replace failed MCP operations with direct calls or simulated MCP results."
+  ],
+  "evidence": {
+    "runDirectory": "artifacts/experiments/probes/camoufox-mcp-v0/confirmation-v2-*",
+    "caseRaw": "raw/<backend>-r<repeat>.jsonl",
+    "screenshots": "screenshots/<backend>-r<repeat>-<top|bottom>.png",
+    "mcpInternal": "mcp-internal/r<repeat>/page-<timestamp>.png",
+    "metadata": "run.json",
+    "orchestration": "orchestration.jsonl",
+    "verification": "verification.json",
+    "integrity": "sha256sums.txt",
+    "independentVerification": "The verifier imports no runner code. It checks frozen source bytes, closed artifact inventory, JSON Lines sequences and semantic events, MCP operations, retained and MCP-owned PNG identity plus pixels, output containment, process finalization, and orchestration exits. Runner summary booleans are necessary but not sufficient."
+  }
+}

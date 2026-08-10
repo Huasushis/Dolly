@@ -1,0 +1,258 @@
+{
+  "preregistrationId": "camoufox-mcp-v0",
+  "version": 2,
+  "status": "frozen-before-browser-execution",
+  "frozenAtUtc": "2026-08-09T03:07:36Z",
+  "scope": "A bounded capability probe, not evidence that Dolly supports browser control in production.",
+  "question": "Can a real Model Context Protocol (MCP) client use Microsoft Playwright MCP connected through a Playwright WebSocket endpoint to Camoufox and complete the same deterministic local-page screenshot and interaction cases as the direct Camoufox Python API, including recovery after an intentional tool error, without restarting the browser session; and can the owner's optional Aether qwen3.6-27b fixture act as a general tool-calling decision core to reach a separately verified local-page goal through that MCP path?",
+  "hypotheses": {
+    "null": "The MCP-to-Camoufox path fails at least one mandatory capability or has a lower complete-case pass rate than the direct Camoufox API baseline.",
+    "alternative": "Both scripted paths pass every mandatory capability in all three repetitions, the MCP path recovers after an intentional missing-target error in the same browser session, and the general model-driven agent reaches the goal in all three repetitions without harness-authored action choices."
+  },
+  "decisionBoundary": {
+    "whatThisCanDecide": [
+      "whether to retain an MCP-to-Camoufox adapter as a candidate for a later Dolly browser extension",
+      "whether direct Camoufox control is a viable fallback candidate",
+      "whether the optional qwen3.6-27b fixture can select the exposed MCP browser tools for this synthetic goal",
+      "which failed capability needs a focused follow-up experiment"
+    ],
+    "whatThisCannotDecide": [
+      "production support, security, anti-detection quality, arbitrary-site reliability, accessibility, or cross-platform compatibility",
+      "whether an autonomous model can plan arbitrary browser tasks beyond this synthetic goal",
+      "whether browser control may bypass the Module startup refusal"
+    ],
+    "rules": [
+      "Retain the MCP adapter candidate only if its required tool inventory is present and all three MCP repetitions are complete-case passes.",
+      "Retain the direct API fallback candidate only if all three direct repetitions are complete-case passes.",
+      "Retain the model-driven agent path as a research candidate only if all three independently verified goal states pass; this does not make the owner endpoint a product dependency.",
+      "If the direct baseline passes but MCP fails, do not call the direct result MCP evidence; isolate the endpoint, protocol, or MCP tool failure before integration.",
+      "If either backend is stopped for infrastructure failure, make no product-support claim for that backend."
+    ]
+  },
+  "baseline": {
+    "id": "direct-camoufox-python",
+    "description": "The same browser is launched and controlled through Camoufox's Python Playwright-compatible API, with screenshots written directly by Playwright. This separates Camoufox/browser feasibility from the MCP transport and tool layer.",
+    "comparison": "mcp-playwright-remote-camoufox"
+  },
+  "backends": [
+    {
+      "id": "direct-camoufox-python",
+      "controlPath": "Python probe -> Camoufox Python API -> Camoufox browser"
+    },
+    {
+      "id": "mcp-playwright-remote-camoufox",
+      "controlPath": "MCP SDK client over stdio -> Microsoft Playwright MCP -> Playwright remote endpoint -> Camoufox browser",
+      "requiredMcpTools": [
+        "browser_navigate",
+        "browser_take_screenshot",
+        "browser_type",
+        "browser_click",
+        "browser_evaluate"
+      ]
+    },
+    {
+      "id": "aether-agent-mcp-camoufox",
+      "controlPath": "A general OpenAI-compatible tool loop using Aether qwen3.6-27b -> MCP SDK client over stdio -> Microsoft Playwright MCP -> Playwright remote endpoint -> Camoufox browser",
+      "baseline": "mcp-playwright-remote-camoufox",
+      "requiredMcpTools": [
+        "browser_snapshot",
+        "browser_take_screenshot",
+        "browser_type",
+        "browser_click"
+      ],
+      "actionSelectionRule": "The harness supplies the goal, initial screenshot and accessibility/DOM snapshot, exact MCP tool schemas, bounded execution policy, and tool results. It must not prescribe or synthesize the action sequence. Model tool calls are schema-validated, allowlisted, and then forwarded unchanged to MCP. Final goal state is read independently by the harness and verifier."
+    }
+  ],
+  "environment": {
+    "host": "Ubuntu 24.04 Linux x86_64",
+    "python": "3.12.3",
+    "node": "20.20.2",
+    "camoufoxPython": "0.5.4",
+    "camoufoxBrowser": "official/stable/152.0.4-beta.28",
+    "camoufoxBrowserExpectedSha256": "924f3109ccd6d47cd6a0384d67a345fadf975d48b6319f8dbbd5954c588982bd",
+    "pythonPlaywright": "1.60.0",
+    "playwrightMcp": "0.0.79",
+    "mcpSdk": "1.30.0",
+    "pillow": "12.0.0",
+    "dependencyRoot": "/home/ubuntu/codex-dolly/.tools/camoufox-mcp-v0",
+    "temporaryAndCachePolicy": "HOME, TMPDIR, XDG_CACHE_HOME, PIP_CACHE_DIR, and npm_config_cache must point below /home/ubuntu/codex-dolly/.tools/camoufox-mcp-v0. Experiment outputs must remain below /home/ubuntu/codex-dolly/Dolly/artifacts/experiments/probes/camoufox-mcp-v0.",
+    "networkPolicy": "Browser cases navigate only to an ephemeral 127.0.0.1 HTTP server. Dependency and browser installation may use the configured 127.0.0.1:10808 proxy. NO_PROXY and no_proxy must include 127.0.0.1 and localhost during cases.",
+    "privateServicePolicy": "The only private live fixture authorized for the model-driven cases is Aether qwen3.6-27b, using AETHER_BASE_URL and AETHER_API_KEY read from .env. The secret and endpoint URL must never be logged; only an endpoint SHA-256 identifier may be retained. No other provider, paid service, object storage, or Dolly Module may be used. The private fixture is optional evidence and cannot become a public dependency or replace deterministic tests."
+  },
+  "data": {
+    "fixture": "scripts/experiments/probes/camoufox-mcp-v0/fixture/index.html",
+    "description": "A repository-local deterministic HTML page with fixed solid-color screenshot anchors, a text input, state-changing buttons, a scroll target, and a visible JSON state element.",
+    "freezeRule": "The runner records the fixture SHA-256 before the first browser launch; every case and the independent verifier must report the same hash.",
+    "externalWebsites": []
+  },
+  "randomization": {
+    "baseSeed": 2026080901,
+    "repetitionsPerBackend": 3,
+    "caseSeeds": [
+      2026080901,
+      2026080902,
+      2026080903
+    ],
+    "backendOrder": [
+      "direct-camoufox-python",
+      "mcp-playwright-remote-camoufox",
+      "aether-agent-mcp-camoufox"
+    ],
+    "reason": "The order is fixed because the goal is a fast capability probe, not a latency comparison. Latency is diagnostic only. Python random and NumPy are seeded before each direct launch and before each remote server launch; the experiment does not assume that all Camoufox internals obey those seeds."
+  },
+  "modelDrivenAgent": {
+    "model": "qwen3.6-27b",
+    "endpointBinding": "AETHER_BASE_URL plus /v1 when absent; the URL is never persisted",
+    "requestEncoding": {
+      "api": "OpenAI-compatible POST /chat/completions",
+      "temperature": 0,
+      "maxTokensPerResponse": 4096,
+      "reasoningControl": {
+        "thinking": {
+          "type": "enabled"
+        }
+      },
+      "forbiddenFields": [
+        "enable_thinking"
+      ],
+      "reasoningEvidence": "Only a non-empty reasoning_content returned in that response proves reasoning for that response. The exact reasoning text remains in memory only while required for tool-call replay and is never written to artifacts."
+    },
+    "goal": "Use the available browser tools to set the page input to the target text shown by the page, apply it exactly once, activate the off-screen Bottom action exactly once, activate Recover exactly once, preserve all prior state, and then report completion.",
+    "generalAgentRule": "The same system prompt, tool allowlist, schema validator, stopping policy, and state verifier are used for all repetitions. No case-specific action hint, selector sequence, or post-hoc manual action may be added.",
+    "visionProbe": {
+      "input": "The first synthetic 800x600 PNG screenshot and a request to identify the large visual code rendered in it.",
+      "pass": "The endpoint accepts image_url input and the visible response contains the exact preregistered code VISUAL-CODE-7391.",
+      "failureBoundary": "Acceptance without the exact code does not prove vision. Rejection or an incorrect code labels native vision unproven for this run.",
+      "fallback": "Continue the agent case with the real MCP accessibility/DOM snapshot as the model observation, while a separate Pillow verifier reads the PNG file for dimensions and pixel anchors. Report this as text-based browser control plus auxiliary deterministic image validation, never as model screenshot perception."
+    },
+    "limits": {
+      "repetitions": 3,
+      "maximumProviderRequestsPerCaseIncludingVisionProbe": 9,
+      "maximumProviderRequestsAcrossAgentCases": 27,
+      "maximumCompletionTokensPerRequest": 4096,
+      "maximumRequestBodyBytes": 3000000,
+      "requestTimeoutSeconds": 120,
+      "caseWallTimeoutSeconds": 600,
+      "maximumMcpToolCallsPerCase": 16,
+      "declaredEgress": "Only the synthetic goal prompt, synthetic local-page DOM/accessibility text, synthetic screenshots, MCP tool schemas, and synthetic tool results may leave the server for the owner Aether endpoint. No repository source, user data, environment value, secret, or private URL is sent.",
+      "costBoundary": "The owner describes this as a self-deployed optional fixture. This probe assumes no metered monetary charge and caps requests and tokens regardless; if the endpoint is discovered to be billable, stop before further calls because no enforceable price table is available."
+    },
+    "toolResultReplay": "Every assistant message containing tool_calls is replayed with its original tool_calls and in-memory reasoning_content, followed by exactly one tool result per call identifier. Malformed or non-allowlisted calls fail the case and are not repaired by a second model.",
+    "successOracle": {
+      "targetText": "AGENT-TARGET-4821",
+      "appliedCount": 1,
+      "bottomCount": 1,
+      "recoveredCount": 1,
+      "samePageInstance": true,
+      "independentFromFinalAnswer": "The model's completion statement is neither necessary nor sufficient; the final DOM state and raw MCP call trace decide."
+    }
+  },
+  "caseProtocol": {
+    "viewportCssPixels": {
+      "width": 800,
+      "height": 600
+    },
+    "inputText": "Dolly-Camoufox-20260809",
+    "steps": [
+      "launch the selected control path and record every directly spawned process identifier",
+      "navigate to the local fixture and require HTTP status 200 or an equivalent successful navigation result",
+      "capture a top screenshot",
+      "type the fixed input text and click Apply",
+      "require the visible state to contain the exact input text and appliedCount=1",
+      "click the off-screen Bottom action, which must require downward scrolling, and require bottomCount=1 and scrollY>0",
+      "capture a bottom screenshot",
+      "attempt to click #deliberately-missing and require a tool or Playwright error",
+      "without restarting the browser, click Recover and require recoveredCount=1 with the previous state retained",
+      "close the page, browser connection, and every exact child process handle created by the case"
+    ],
+    "mandatoryCapabilities": [
+      "launch",
+      "local_navigation",
+      "top_screenshot",
+      "pixel_and_dimension_validation",
+      "click",
+      "text_input",
+      "downward_scroll",
+      "dom_state_change",
+      "expected_failure_observed",
+      "same_session_recovery",
+      "clean_close"
+    ],
+    "screenshotOracle": {
+      "format": "PNG",
+      "dimensions": [
+        800,
+        600
+      ],
+      "topAnchors": [
+        {
+          "xy": [10, 10],
+          "rgb": [18, 52, 86]
+        },
+        {
+          "xy": [50, 50],
+          "rgb": [255, 51, 102]
+        },
+        {
+          "xy": [760, 500],
+          "rgb": [246, 240, 220]
+        }
+      ],
+      "bottomAnchors": [
+        {
+          "xy": [10, 10],
+          "rgb": [32, 64, 96]
+        },
+        {
+          "xy": [50, 500],
+          "rgb": [51, 204, 153]
+        },
+        {
+          "xy": [760, 300],
+          "rgb": [32, 64, 96]
+        }
+      ],
+      "tolerancePerChannel": 0,
+      "hashRule": "Record file SHA-256 for integrity but do not require identical PNG hashes across backends; dimensions and solid-color pixel anchors are the correctness oracle."
+    }
+  },
+  "metrics": {
+    "primary": [
+      "complete-case pass count out of three for each backend",
+      "mandatory capability pass/fail for every case",
+      "MCP required-tool inventory present/absent",
+      "same-session recovery pass/fail",
+      "model-driven goal state pass count out of three",
+      "native screenshot vision observed/unproven per agent case",
+      "non-empty reasoning_content observed/unobserved per provider response"
+    ],
+    "secondaryDiagnosticOnly": [
+      "per-step monotonic duration in milliseconds",
+      "screenshot byte size and SHA-256",
+      "browser and protocol error class and message",
+      "spawned process identifiers and close outcome"
+    ],
+    "minimumEffectiveDifference": {
+      "completeCasePassRate": "One case out of three, or 33.33 percentage points. Any smaller difference is impossible to resolve with this design.",
+      "latency": "500 ms median end-to-end action difference is worth a later powered experiment, but latency cannot change the v0 architecture decision."
+    }
+  },
+  "stopRules": [
+    "Run exactly three scheduled repetitions per backend unless that backend has two consecutive unexpected launch or protocol-initialization failures.",
+    "After two consecutive unexpected launch or protocol-initialization failures, retain both raw failures, stop that backend, and label it infrastructure-inconclusive rather than unsupported.",
+    "The intentional #deliberately-missing error is part of every case and never triggers stopping.",
+    "Do not retry a failed action inside a repetition except for the preregistered Recover action after the intentional error.",
+    "For model-driven cases, stop after two consecutive provider initialization failures, after 27 total provider requests, or immediately if the endpoint is discovered to be billable; retain every prior sanitized request and response observation.",
+    "A failed native vision probe invokes the preregistered DOM plus independent PNG-verifier fallback and does not permit a claim that the model inspected the screenshot.",
+    "Do not substitute stock Firefox, Chromium, direct API calls, or simulated MCP results for a failed MCP-to-Camoufox path.",
+    "If any fixture, runner, or verifier defect is discovered after browser execution begins, preserve the failed run, version the correction, and execute a new run directory; never overwrite raw evidence."
+  ],
+  "evidence": {
+    "rawPerCase": "artifacts/experiments/probes/camoufox-mcp-v0/run-*/raw/<backend>-r<repeat>.jsonl",
+    "screenshots": "artifacts/experiments/probes/camoufox-mcp-v0/run-*/screenshots/*.png",
+    "runMetadata": "artifacts/experiments/probes/camoufox-mcp-v0/run-*/run.json",
+    "independentVerification": "artifacts/experiments/probes/camoufox-mcp-v0/run-*/verification.json",
+    "integrityManifest": "artifacts/experiments/probes/camoufox-mcp-v0/run-*/sha256sums.txt",
+    "independenceRule": "The verifier is a separate program that reads only frozen preregistration, fixture bytes, JSONL records, and PNG files. It must not import runner code or accept runner summary booleans as proof."
+  }
+}

@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dolly deterministic browser probe</title>
+    <style>
+      * { box-sizing: border-box; }
+      html, body { margin: 0; min-width: 800px; background: #f6f0dc; font-family: sans-serif; }
+      #top-zone { position: relative; height: 200px; background: #123456; color: white; }
+      #top-anchor { position: absolute; left: 40px; top: 40px; width: 100px; height: 100px; background: #ff3366; }
+      #visual-code { position: absolute; left: 200px; top: 42px; font-size: 36px; font-weight: 700; letter-spacing: 2px; }
+      #heading { position: absolute; left: 200px; top: 105px; font-size: 22px; }
+      #controls { height: 300px; padding: 28px 40px; color: #102030; background: #f6f0dc; }
+      #controls label, #instructions { display: block; margin-bottom: 12px; }
+      #target-text { font-weight: 700; }
+      input { width: 360px; padding: 10px; font-size: 18px; }
+      button { margin: 8px 8px 8px 0; padding: 10px 18px; font-size: 17px; }
+      #state { margin-top: 14px; padding: 8px; width: 680px; min-height: 42px; background: white; border: 2px solid #9a8f70; white-space: pre-wrap; }
+      #spacer { height: 700px; background: #f6f0dc; }
+      #bottom-zone { position: relative; height: 650px; background: #204060; color: white; }
+      #bottom-anchor { position: absolute; left: 40px; bottom: 40px; width: 100px; height: 100px; background: #33cc99; }
+      #bottom-action { position: absolute; left: 220px; top: 100px; }
+      #recover { position: absolute; left: 220px; bottom: 95px; }
+      #bottom-label { position: absolute; left: 220px; top: 35px; font-size: 22px; }
+    </style>
+  </head>
+  <body>
+    <section id="top-zone" aria-label="visual header">
+      <div id="top-anchor" aria-hidden="true"></div>
+      <div id="visual-code">VISUAL-CODE-7391</div>
+      <div id="heading">Dolly browser capability probe</div>
+    </section>
+    <main id="controls">
+      <p id="instructions">Agent goal: enter <span id="target-text">AGENT-TARGET-4821</span>, apply once, activate Bottom once, and activate Recover once.</p>
+      <label for="probe-input">Probe input</label>
+      <input id="probe-input" autocomplete="off" aria-label="Probe input">
+      <button id="apply" type="button">Apply</button>
+      <output id="state" aria-live="polite"></output>
+    </main>
+    <div id="spacer" aria-hidden="true"></div>
+    <section id="bottom-zone" aria-label="bottom actions">
+      <div id="bottom-label">Off-screen interaction area</div>
+      <button id="bottom-action" type="button">Bottom</button>
+      <button id="recover" type="button">Recover</button>
+      <div id="bottom-anchor" aria-hidden="true"></div>
+    </section>
+    <script>
+      "use strict";
+      const state = {
+        inputText: "",
+        appliedCount: 0,
+        bottomCount: 0,
+        recoveredCount: 0,
+        pageTimeOrigin: performance.timeOrigin
+      };
+      const stateElement = document.querySelector("#state");
+      const render = () => { stateElement.textContent = JSON.stringify(state); };
+      document.querySelector("#apply").addEventListener("click", () => {
+        state.inputText = document.querySelector("#probe-input").value;
+        state.appliedCount += 1;
+        render();
+      });
+      document.querySelector("#bottom-action").addEventListener("click", () => {
+        state.bottomCount += 1;
+        render();
+      });
+      document.querySelector("#recover").addEventListener("click", () => {
+        state.recoveredCount += 1;
+        render();
+      });
+      window.__probeRead = () => ({ ...state, scrollY: window.scrollY });
+      render();
+    </script>
+  </body>
+</html>
