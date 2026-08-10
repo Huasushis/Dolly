@@ -246,12 +246,12 @@ async function executeTool(run, registry, roundIndex, action) {
 function actionPrompt(phase, registry, task, planText, observations) {
   const phaseRule = phase === "checkpoint"
     ? [
-        "First call storage_set with the checkpointKey and exact checkpoint object from the task.",
+        "First call checkpoint_store with the exact taskId and checkpoint object from the task. The Host owns the storage key encoding.",
         "After a successful store, return exactly {action:'checkpointed',taskId,checkpointKey,stored:true}.",
       ]
     : [
-        "First call storage_list with the exact task prefix and limit 3.",
-        "Then call storage_get with the returned checkpoint key.",
+        "First call checkpoint_list with the exact taskId and limit 3.",
+        "Then call checkpoint_get with the exact taskId after the list result contains a checkpoint key.",
         "After a successful read, return exactly {action:'resumed',taskId,resumed:true,nextAction,evidenceKeys:[checkpointKey]} using nextAction verbatim from the checkpoint.",
       ];
   return [
@@ -325,7 +325,7 @@ async function runTreatment(run, task) {
         task.phase !== "checkpoint" ||
         observations.length !== 1 ||
         final.taskId !== task.taskId ||
-        final.checkpointKey !== task.checkpointKey ||
+        final.checkpointKey !== observations[0]?.result?.key ||
         final.stored !== true
       ) {
         throw new Error("checkpoint final action is invalid");

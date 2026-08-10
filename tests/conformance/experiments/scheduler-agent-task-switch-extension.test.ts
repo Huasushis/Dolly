@@ -268,8 +268,8 @@ describe("Scheduler Agent task-switch Extension", () => {
             reasoning = { state: "observed", parts: ["Persist only the provided task state."] };
           } else if (round === 2) {
             finalContent = JSON.stringify({
-              action: "storage_set",
-              arguments: { key: CHECKPOINT_KEY, value: CHECKPOINT },
+              action: "checkpoint_store",
+              arguments: { taskId: TASK_ID, checkpoint: CHECKPOINT },
             });
           } else {
             finalContent = JSON.stringify({
@@ -287,13 +287,13 @@ describe("Scheduler Agent task-switch Extension", () => {
             reasoning = { state: "observed", parts: ["Retrieve before reconstructing task state."] };
           } else if (round === 2) {
             finalContent = JSON.stringify({
-              action: "storage_list",
-              arguments: { prefix: `task.${TASK_ID}.`, limit: 3 },
+              action: "checkpoint_list",
+              arguments: { taskId: TASK_ID, limit: 3 },
             });
           } else if (round === 3) {
             finalContent = JSON.stringify({
-              action: "storage_get",
-              arguments: { key: CHECKPOINT_KEY },
+              action: "checkpoint_get",
+              arguments: { taskId: TASK_ID },
             });
           } else {
             finalContent = JSON.stringify({
@@ -342,14 +342,14 @@ describe("Scheduler Agent task-switch Extension", () => {
               maxApprovals: 1,
               maxCallBytes: 12 * 1024,
             },
-            tools: ["storage_get", "storage_list", "storage_set"].map((name) => ({
+            tools: ["checkpoint_get", "checkpoint_list", "checkpoint_store"].map((name) => ({
               name,
               description: `Fake ${name} contract`,
               schemaDialect: "dolly.tool-value-schema/1",
               argumentSchema: { type: "object" },
               successResultSchema: { type: "object" },
-              effectClass: name === "storage_set" ? "write" : "read",
-              approval: name === "storage_set" ? "required" : "never",
+              effectClass: name === "checkpoint_store" ? "write" : "read",
+              approval: name === "checkpoint_store" ? "required" : "never",
               idempotency: "effect-key",
               outcomeQuery: "supported",
               parallel: "serial",
@@ -367,10 +367,16 @@ describe("Scheduler Agent task-switch Extension", () => {
         const args = JSON.parse(String(call.argumentsJson)) as Record<string, JsonValue>;
         toolActions.push(call.name);
         let content: JsonValue;
-        if (call.name === "storage_set") {
-          storedCheckpoint = args.value;
-          content = { schemaVersion: "dolly.storage-set/1", stored: true, revision: 1, entryCount: 1 };
-        } else if (call.name === "storage_list") {
+        if (call.name === "checkpoint_store") {
+          storedCheckpoint = args.checkpoint;
+          content = {
+            schemaVersion: "dolly.storage-set/1",
+            stored: true,
+            key: CHECKPOINT_KEY,
+            revision: 1,
+            entryCount: 1,
+          };
+        } else if (call.name === "checkpoint_list") {
           content = { schemaVersion: "dolly.storage-list/1", keys: [CHECKPOINT_KEY], truncated: false };
         } else {
           if (storedCheckpoint === undefined) throw new Error("checkpoint was not stored");
@@ -452,7 +458,7 @@ describe("Scheduler Agent task-switch Extension", () => {
 
       expect(checkpointResult).toMatchObject({
         phase: "checkpoint",
-        actions: ["storage_set", "checkpointed"],
+        actions: ["checkpoint_store", "checkpointed"],
         final: { stored: true, checkpointKey: CHECKPOINT_KEY },
       });
       expect(unrelatedResult).toMatchObject({
@@ -462,7 +468,7 @@ describe("Scheduler Agent task-switch Extension", () => {
       });
       expect(resumeResult).toEqual({
         phase: "resume",
-        actions: ["storage_list", "storage_get", "resumed"],
+        actions: ["checkpoint_list", "checkpoint_get", "resumed"],
         final: {
           action: "resumed",
           taskId: TASK_ID,
@@ -474,7 +480,7 @@ describe("Scheduler Agent task-switch Extension", () => {
         registryDigest: `sha256:${"7".repeat(64)}`,
       });
       expect(storedCheckpoint).toEqual(CHECKPOINT);
-      expect(toolActions).toEqual(["storage_set", "storage_list", "storage_get"]);
+      expect(toolActions).toEqual(["checkpoint_store", "checkpoint_list", "checkpoint_get"]);
 
       const unrelatedMessages = modelMessages.get("job-unrelated")?.join("\n") ?? "";
       const firstResumeMessages = modelMessages.get("job-resume")?.[0] ?? "";

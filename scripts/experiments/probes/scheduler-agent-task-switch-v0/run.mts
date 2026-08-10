@@ -186,7 +186,7 @@ function completionUrl(baseValue: string): URL {
 function descriptorDocument() {
   return {
     schemaVersion: "dolly.model-descriptor/4" as const,
-    descriptorVersion: "owner-aether-qwen3.6-27b-task-switch-v2",
+    descriptorVersion: "owner-aether-qwen3.6-27b-task-switch-v3",
     endpointId: "owner-aether-task-switch-fixture",
     operation: "chat-completion" as const,
     modelId: "qwen3.6-27b",
@@ -305,16 +305,16 @@ function checkpointSchema() {
 
 function storageTools(): readonly ToolDescriptor[] {
   const list: ToolDescriptor = {
-    toolId: "storage.list",
-    wireName: "storage_list",
-    description: "List structured task-checkpoint keys under one exact task prefix.",
+    toolId: "checkpoint.list",
+    wireName: "checkpoint_list",
+    description: "List structured checkpoint keys for one exact task identifier without exposing the storage key encoding.",
     argumentSchema: {
       type: "object",
       properties: {
-        prefix: { type: "string", minBytes: 1, maxBytes: 256 },
+        taskId: { type: "string", minBytes: 1, maxBytes: 128 },
         limit: { type: "integer", minimum: 1, maximum: 3 },
       },
-      required: ["prefix", "limit"],
+      required: ["taskId", "limit"],
       additionalProperties: false,
       maxProperties: 2,
     },
@@ -340,13 +340,13 @@ function storageTools(): readonly ToolDescriptor[] {
     maxResultBytes: 4 * 1_024,
   };
   const get: ToolDescriptor = {
-    toolId: "storage.get",
-    wireName: "storage_get",
-    description: "Read one task checkpoint by a key returned from storage_list.",
+    toolId: "checkpoint.get",
+    wireName: "checkpoint_get",
+    description: "Read the structured checkpoint for one exact task identifier after checkpoint_list finds it.",
     argumentSchema: {
       type: "object",
-      properties: { key: { type: "string", minBytes: 1, maxBytes: 256 } },
-      required: ["key"],
+      properties: { taskId: { type: "string", minBytes: 1, maxBytes: 128 } },
+      required: ["taskId"],
       additionalProperties: false,
       maxProperties: 1,
     },
@@ -373,16 +373,16 @@ function storageTools(): readonly ToolDescriptor[] {
     maxResultBytes: 8 * 1_024,
   };
   const set: ToolDescriptor = {
-    toolId: "storage.set",
-    wireName: "storage_set",
-    description: "Store one sourced structured checkpoint for a paused task; Host approval is required.",
+    toolId: "checkpoint.store",
+    wireName: "checkpoint_store",
+    description: "Store one sourced structured checkpoint under its task identifier; Host approval is required and the Host owns key encoding.",
     argumentSchema: {
       type: "object",
       properties: {
-        key: { type: "string", minBytes: 1, maxBytes: 256 },
-        value: checkpointSchema(),
+        taskId: { type: "string", minBytes: 1, maxBytes: 128 },
+        checkpoint: checkpointSchema(),
       },
-      required: ["key", "value"],
+      required: ["taskId", "checkpoint"],
       additionalProperties: false,
       maxProperties: 2,
     },
@@ -391,12 +391,13 @@ function storageTools(): readonly ToolDescriptor[] {
       properties: {
         schemaVersion: { type: "string", maxBytes: 64, enum: ["dolly.storage-set/1"] },
         stored: { type: "enum", values: [true] },
+        key: { type: "string", minBytes: 1, maxBytes: 256 },
         revision: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
         entryCount: { type: "integer", minimum: 1, maximum: 128 },
       },
-      required: ["schemaVersion", "stored", "revision", "entryCount"],
+      required: ["schemaVersion", "stored", "key", "revision", "entryCount"],
       additionalProperties: false,
-      maxProperties: 4,
+      maxProperties: 5,
     },
     effectClass: "write",
     resourceScope: "task-checkpoints",
@@ -420,8 +421,9 @@ function storageExecutor(options: {
   const binding = { namespace, instanceId: options.instanceId, moduleId: options.moduleId };
   return {
     execute: async (request): Promise<ToolExecutionOutcome> => {
-      if (request.toolId === "storage.list") {
-        const prefix = request.arguments.prefix as string;
+      if (request.toolId === "checkpoint.list") {
+        const taskId = request.arguments.taskId as string;
+        const prefix = `task.${taskId}.`;
         const limit = request.arguments.limit as number;
         const matching = options.backend.read(binding).entries.filter((entry) => entry.key.startsWith(prefix));
         const page = matching.slice(0, limit);
@@ -434,8 +436,9 @@ function storageExecutor(options: {
           },
         };
       }
-      if (request.toolId === "storage.get") {
-        const key = request.arguments.key as string;
+      if (request.toolId === "checkpoint.get") {
+        const taskId = request.arguments.taskId as string;
+        const key = `task.${taskId}.checkpoint`;
         const entry = options.backend.read(binding).entries.find((candidate) => candidate.key === key);
         return entry
           ? {
@@ -449,9 +452,13 @@ function storageExecutor(options: {
             }
           : { status: "failed", code: "CHECKPOINT_NOT_FOUND" };
       }
-      if (request.toolId === "storage.set") {
-        const key = request.arguments.key as string;
-        const value = request.arguments.value as JsonValue;
+      if (request.toolId === "checkpoint.store") {
+        const taskId = request.arguments.taskId as string;
+        const value = request.arguments.checkpoint as JsonValue;
+        if ((value as { taskId?: unknown }).taskId !== taskId) {
+          return { status: "failed", code: "CHECKPOINT_TASK_ID_MISMATCH" };
+        }
+        const key = `task.${taskId}.checkpoint`;
         const current = options.backend.read(binding);
         const stored = options.backend.replace(binding, [
           ...current.entries.filter((entry) => entry.key !== key),
@@ -462,6 +469,7 @@ function storageExecutor(options: {
           content: {
             schemaVersion: "dolly.storage-set/1",
             stored: true,
+            key,
             revision: stored.revision,
             entryCount: stored.entries.length,
           },
@@ -729,8 +737,8 @@ async function runCondition(options: {
                 repository: toolJournal,
                 approval: {
                   decide: async (request) => ({
-                    decision: request.toolId === "storage.set" ? "approved" : "denied",
-                    code: request.toolId === "storage.set"
+                    decision: request.toolId === "checkpoint.store" ? "approved" : "denied",
+                    code: request.toolId === "checkpoint.store"
                       ? "CHECKPOINT_POLICY_APPROVED"
                       : "CHECKPOINT_POLICY_DENIED",
                   }),
@@ -929,7 +937,7 @@ async function main(): Promise<void> {
   };
   if (
     preregistration.experimentId !== "scheduler-agent-task-switch-v0" ||
-    preregistration.experimentVersion !== 2 ||
+    preregistration.experimentVersion !== 3 ||
     preregistration.status !== "frozen-before-first-run"
   ) {
     throw new Error("task-switch preregistration is not frozen");
@@ -1137,7 +1145,7 @@ async function main(): Promise<void> {
   const manifest = {
     schemaVersion: "scheduler-agent-task-switch/run-manifest/1",
     experimentId: "scheduler-agent-task-switch-v0",
-    experimentVersion: 2,
+    experimentVersion: 3,
     runId,
     status,
     failure,

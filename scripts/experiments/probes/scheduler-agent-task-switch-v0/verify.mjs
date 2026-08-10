@@ -305,7 +305,7 @@ function verifyTreatment(row) {
   assert(row.storageEntries[0].key === CHECKPOINT_KEY, "stored checkpoint key differs");
   exact(row.storageEntries[0].value, CHECKPOINT, "stored checkpoint value");
   const checkpoint = phase(row, "checkpoint").result;
-  exact(checkpoint.actions, ["storage_set", "checkpointed"], "treatment checkpoint actions");
+  exact(checkpoint.actions, ["checkpoint_store", "checkpointed"], "treatment checkpoint actions");
   exact(checkpoint.final, {
     action: "checkpointed",
     taskId: TASK_ID,
@@ -317,7 +317,7 @@ function verifyTreatment(row) {
   exact(unrelated.actions, ["answer"], "treatment unrelated actions");
   assert(unrelated.final?.answer === 17, "treatment unrelated answer differs");
   const resume = phase(row, "resume").result;
-  exact(resume.actions, ["storage_list", "storage_get", "resumed"], "treatment resume actions");
+  exact(resume.actions, ["checkpoint_list", "checkpoint_get", "resumed"], "treatment resume actions");
   exact(resume.final, {
     action: "resumed",
     taskId: TASK_ID,
@@ -358,10 +358,19 @@ function verifyToolJournal(caseRow, runDirectory) {
   assert(document.rounds.length === 3, "tool round count differs");
   const checkpointJob = phase(caseRow, "checkpoint").commit.moduleJobId;
   const resumeJob = phase(caseRow, "resume").commit.moduleJobId;
-  const expectedRounds = [[checkpointJob, 1, "complete"], [resumeJob, 1, "complete"], [resumeJob, 2, "complete"]]
+  const expectedRounds = [
+    [checkpointJob, 1, "complete", "checkpoint_store"],
+    [resumeJob, 1, "complete", "checkpoint_list"],
+    [resumeJob, 2, "complete", "checkpoint_get"],
+  ]
     .sort((left, right) => left[0].localeCompare(right[0]) || left[1] - right[1]);
   exact(
-    document.rounds.map((round) => [round.moduleJobId, round.roundIndex, round.state]),
+    document.rounds.map((round) => [
+      round.moduleJobId,
+      round.roundIndex,
+      round.state,
+      round.effects[0]?.wireName,
+    ]),
     expectedRounds,
     "tool journal round identity",
   );
@@ -413,7 +422,7 @@ function verifyRun(runDirectory, fixtureValues) {
   const preregistration = parseJson(join(runDirectory, "preregistration.json"));
   assert(manifest.schemaVersion === "scheduler-agent-task-switch/run-manifest/1", "manifest schema differs");
   assert(manifest.experimentId === "scheduler-agent-task-switch-v0", "manifest experiment differs");
-  assert(manifest.experimentVersion === 2, "manifest experiment version differs");
+  assert(manifest.experimentVersion === 3, "manifest experiment version differs");
   assert(manifest.status === "completed" && manifest.failure === null, "run did not complete");
   assert(manifest.providerCalls === 11 && manifest.maximumProviderCalls === 11, "provider call budget differs");
   assert(manifest.secretLeasesReleased === 11, "secret leases were not released");
