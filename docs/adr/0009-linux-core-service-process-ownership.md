@@ -303,9 +303,17 @@ Individual implementations therefore exist, but that is not an assembled
 runtime. The executor now passes the exact authorized launcher, verified Module
 control group, and durable starting record to its protocol-session factory;
 identity tests reject any design that would require reconstructing those
-values. No startup caller yet connects that input to
-`attachLinuxModuleProcess` and a real `ExtensionProcessHost`, so the assembly
-has never been run end to end. Focused Linux tests now show that whole-group
+values. `createExtensionProcessLinuxProtocolSession` now adapts a real
+`ExtensionProcessHost` to that factory surface only after its process identifier,
+instance, Module, Module generation, process generation, starting record, and
+live control-group identity all match. It exposes capability-session closure and
+protocol-channel observation to the Linux executor; it does not expose Host
+`stop()` or `terminate()` as lifecycle proof.
+
+No startup caller yet resolves the exact launcher control object back to its
+started child streams, calls `attachLinuxModuleProcess`, constructs that real
+Host, and hands it to this adapter, so the assembly has never been run end to
+end. Focused Linux tests now show that whole-group
 termination reaches a descendant which left the process group and that the
 launcher's standard streams carry the Extension protocol after `exec`; those
 results do not replace the missing end-to-end runtime assembly.

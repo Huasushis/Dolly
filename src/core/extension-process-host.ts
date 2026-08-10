@@ -741,6 +741,7 @@ export class ExtensionProcessHost {
   readonly #grantedCapabilities: GrantedCapabilityDescriptor[] = [];
   readonly #pending = new Map<string, PendingRequest>();
   readonly #exit = deferred<void>();
+  readonly #protocolChannelClosed = deferred<void>();
 
   #state: ExtensionProcessHostState = "created";
   #process?: AttachedExtensionProcess;
@@ -1112,6 +1113,42 @@ export class ExtensionProcessHost {
     }
   }
 
+  /**
+   * Revokes every issued capability handle and synchronously stops admission
+   * of new capability calls. The returned Promise waits for handlers that had
+   * already entered. Linux process ownership calls this before terminating the
+   * control group; it does not signal or stop the process itself.
+   */
+  closeCapabilitySession(): Promise<void> {
+    if (this.#capabilityClosePromise) return this.#capabilityClosePromise;
+    try {
+      this.#capabilityClosePromise = Promise.resolve(this.#capabilitySession.close());
+    } catch (error) {
+      this.#capabilityClosePromise = Promise.reject(error);
+    }
+    return this.#capabilityClosePromise;
+  }
+
+  /** Observes only the Extension protocol transport, never process exit. */
+  async waitForChannelClosed(timeoutMs: number): Promise<boolean> {
+    assertTimerDelay(timeoutMs, "channelCloseTimeoutMs");
+    if (this.#protocolChannelClosed.settled || this.#channel?.closed === true) {
+      return true;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+    });
+    try {
+      return await Promise.race([
+        this.#protocolChannelClosed.promise.then(() => true as const),
+        timedOut,
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   terminate(): Promise<ExtensionProcessHostSnapshot> {
     if (this.#terminatePromise) return this.#terminatePromise;
     const termination = this.#performTerminate();
@@ -1262,8 +1299,12 @@ export class ExtensionProcessHost {
     this.#channel = new FramedJsonChannel(attached.standardOutput, attached.standardInput, {
       maxFrameBytes: this.#maxFrameBytes,
       onMessage: (message) => this.#handleMessage(message),
-      onError: (error) => this.#handleProtocolFailure(error),
+      onError: (error) => {
+        this.#markProtocolChannelClosed();
+        this.#handleProtocolFailure(error);
+      },
       onEnd: () => {
+        this.#markProtocolChannelClosed();
         if (!attached.exited) {
           this.#handleProtocolFailure(
             new FramedJsonError("FRAME_TRANSPORT_FAILED", "Extension protocol ended early"),
@@ -1568,7 +1609,7 @@ export class ExtensionProcessHost {
   }
 
   #startForcedProcessTermination(): void {
-    void this.#closeCapabilitySession().catch(() => undefined);
+    void this.closeCapabilitySession().catch(() => undefined);
     const attached = this.#process;
     if (!attached) {
       // Only a host that starts its own child reaches this: either the child was
@@ -1628,6 +1669,7 @@ export class ExtensionProcessHost {
     if (this.#forceKillTimer) clearTimeout(this.#forceKillTimer);
     this.#forceKillTimer = undefined;
     this.#channel?.close();
+    this.#markProtocolChannelClosed();
     this.#rejectPending(
       new ExtensionProcessHostError(
         "EXTENSION_PROCESS_EXITED",
@@ -1635,7 +1677,7 @@ export class ExtensionProcessHost {
       ),
     );
     if (!this.#terminationRequested) this.#state = "failed";
-    const cleanup = this.#closeCapabilitySession().then(
+    const cleanup = this.closeCapabilitySession().then(
       () => this.#exit.resolve(),
       (error: unknown) => this.#exit.reject(error),
     );
@@ -1658,7 +1700,8 @@ export class ExtensionProcessHost {
       await Promise.race([this.#exit.promise, timeout]);
     } catch (error) {
       this.#channel?.close();
-      void this.#closeCapabilitySession().catch(() => undefined);
+      this.#markProtocolChannelClosed();
+      void this.closeCapabilitySession().catch(() => undefined);
       this.#rejectPending(
         new ExtensionProcessHostError(
           "EXTENSION_TERMINATION_UNCONFIRMED",
@@ -1681,14 +1724,8 @@ export class ExtensionProcessHost {
     }
   }
 
-  #closeCapabilitySession(): Promise<void> {
-    if (this.#capabilityClosePromise) return this.#capabilityClosePromise;
-    try {
-      this.#capabilityClosePromise = Promise.resolve(this.#capabilitySession.close());
-    } catch (error) {
-      this.#capabilityClosePromise = Promise.reject(error);
-    }
-    return this.#capabilityClosePromise;
+  #markProtocolChannelClosed(): void {
+    this.#protocolChannelClosed.resolve(undefined);
   }
 
   #rejectPending(error: ExtensionProcessHostError): void {

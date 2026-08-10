@@ -74,7 +74,7 @@ export interface LinuxModuleProtocolSession {
     readonly hasMore: boolean;
     readonly input: ReactiveModuleInput;
   }): Promise<ReactiveModuleResult>;
-  cancel(runId: string, reason: string): Promise<void>;
+  cancel(runId: string, reason: ModuleCancellationContext["reason"]): Promise<void>;
   /**
    * The call synchronously rejects new capability invocations, revokes every
    * handle, and delivers an abort signal. Its Promise resolves once every

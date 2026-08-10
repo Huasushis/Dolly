@@ -24,6 +24,8 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
+import { createExtensionProcessLinuxProtocolSession } from "../../../src/adapters/extension-process-module-executor.js";
+import type { LinuxModuleAuthorizedProcess } from "../../../src/adapters/linux-module-executor.js";
 import type { JsonValue } from "../../../src/core/canonical-json.js";
 import {
   ExtensionIsolationPolicy,
@@ -299,6 +301,108 @@ describe("Extension process host attached to a process Core already started", ()
     await extension.waitForRequest("dolly.shutdown");
     double.reportExit();
     await expect(stop).resolves.toMatchObject({ state: "stopped" });
+  });
+
+  it("lets the Linux owner close capabilities and observe the protocol channel separately", async () => {
+    const double = createAttachedProcessDouble();
+    const host = new ExtensionProcessHost({
+      ...hostOptions(),
+      attachedProcess: double.attachment,
+    });
+    startFakeExtension(double);
+    await host.start();
+
+    await expect(host.waitForChannelClosed(5)).resolves.toBe(false);
+    await expect(host.closeCapabilitySession()).resolves.toBeUndefined();
+    expect(double.terminationSteps).toEqual([]);
+
+    double.hostReads.end();
+    await expect(host.waitForChannelClosed(100)).resolves.toBe(true);
+    await vi.waitFor(() => expect(double.terminationSteps).toContain("request"));
+    double.reportExit();
+    await expect(host.terminate()).resolves.toMatchObject({ state: "stopped" });
+  });
+
+  it("runs one request through the identity-bound Linux protocol session adapter", async () => {
+    const wallClockNow = 1_700_000_000_000;
+    const double = createAttachedProcessDouble();
+    const host = new ExtensionProcessHost({
+      ...hostOptions({ wallClockNow: () => wallClockNow }),
+      attachedProcess: double.attachment,
+    });
+    const extension = startFakeExtension(double);
+    const snapshot = host.snapshot;
+    const processId = double.attachment.processId;
+    if (processId === undefined) throw new Error("attached process identifier is missing");
+    const process = {
+      executionAuthorized: true,
+      launcher: {
+        processId,
+        configure: async () => undefined,
+        authorizeExecution: async () => ({
+          executionAuthorized: true,
+          verifiedProcessIds: [processId],
+        } as const),
+        requestExit: async () => true,
+      },
+      record: {
+        schemaVersion: "dolly.module-process-record/1",
+        instanceId: snapshot.instanceId,
+        moduleId: snapshot.moduleId,
+        moduleGenerationId: snapshot.moduleGenerationId,
+        processGenerationId: snapshot.processGenerationId,
+        packageDigest: `sha256:${"a".repeat(64)}`,
+        configurationReference: {
+          configId: "config-attached",
+          revision: `sha256:${"b".repeat(64)}`,
+          configVersion: 1,
+        },
+        declaredExternalEffects: "none",
+        serviceInvocationId: "service-invocation-attached",
+        bootId: "11111111-1111-4111-8111-111111111111",
+        moduleCgroupPath: "/sys/fs/cgroup/core/attached",
+        state: "starting",
+        createdAt: "2026-08-10T00:00:00.000Z",
+        updatedAt: "2026-08-10T00:00:00.000Z",
+      },
+      cgroup: {
+        identity: {
+          instanceId: snapshot.instanceId,
+          moduleId: snapshot.moduleId,
+          processGenerationId: snapshot.processGenerationId,
+        },
+        path: "/sys/fs/cgroup/core/attached",
+        membershipObserved: true,
+        removed: false,
+      } as never,
+    } satisfies LinuxModuleAuthorizedProcess;
+    const session = createExtensionProcessLinuxProtocolSession(host, process, {
+      executionTimeoutMs: 1_000,
+      cancellationGraceMs: 250,
+      wallClockNow: () => wallClockNow,
+    });
+
+    await session.initialize();
+    const result = session.execute({
+      moduleJobId: "module-job-linux",
+      runId: "run-linux",
+      attempt: 1,
+      hasMore: false,
+      input: {
+        schemaVersion: "dolly.reactive-module-input/2",
+        claimedDeliveryIds: [],
+        blockGroups: [],
+        hasMore: false,
+      },
+    });
+    const request = await extension.waitForRequest("module.execute");
+    await extension.respond(request.id, executeResult(request, { ok: true }));
+    await expect(result).resolves.toEqual({ ok: true });
+
+    await session.closeCapabilitySession();
+    double.reportExit();
+    await expect(session.waitForChannelClosed(100)).resolves.toBe(true);
+    await expect(host.terminate()).resolves.toMatchObject({ state: "stopped" });
   });
 
   it("rejects options that both start a command and attach a process", () => {

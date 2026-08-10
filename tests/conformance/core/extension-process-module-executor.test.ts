@@ -7,7 +7,11 @@ import type {
 import {
   ModuleExecutorTerminationUnconfirmedError,
 } from "../../../src/core/module-actor.js";
-import { createExtensionProcessModuleExecutor } from "../../../src/adapters/extension-process-module-executor.js";
+import {
+  createExtensionProcessLinuxProtocolSession,
+  createExtensionProcessModuleExecutor,
+} from "../../../src/adapters/extension-process-module-executor.js";
+import type { LinuxModuleAuthorizedProcess } from "../../../src/adapters/linux-module-executor.js";
 import type {
   ModuleCancellationContext,
   ModuleRunContext,
@@ -73,16 +77,18 @@ function createHostSpies(
 ) {
   let currentSnapshot = initialSnapshot;
   const start = vi.fn(async () => {
-    currentSnapshot = processSnapshot("ready");
+    currentSnapshot = { ...currentSnapshot, state: "ready" };
     return currentSnapshot;
   });
   const execute = vi.fn(async () => result);
   const cancel = vi.fn(async () => "sent" as const);
   const terminate = vi.fn(async () => {
-    currentSnapshot = processSnapshot("stopped");
+    currentSnapshot = { ...currentSnapshot, state: "stopped" };
     return currentSnapshot;
   });
   const stop = vi.fn(async () => processSnapshot("stopped"));
+  const closeCapabilitySession = vi.fn(async () => undefined);
+  const waitForChannelClosed = vi.fn(async () => true);
   const host = {
     get snapshot() {
       return currentSnapshot;
@@ -92,11 +98,158 @@ function createHostSpies(
     cancel,
     terminate,
     stop,
+    closeCapabilitySession,
+    waitForChannelClosed,
   } as unknown as ExtensionProcessHost;
-  return { host, start, execute, cancel, terminate, stop };
+  return {
+    host,
+    start,
+    execute,
+    cancel,
+    terminate,
+    stop,
+    closeCapabilitySession,
+    waitForChannelClosed,
+  };
+}
+
+function authorizedProcess(): LinuxModuleAuthorizedProcess {
+  const launcher = {
+    processId: 4242,
+    configure: async () => undefined,
+    authorizeExecution: async () => ({
+      executionAuthorized: true,
+      verifiedProcessIds: [4242],
+    } as const),
+    requestExit: async () => true,
+  };
+  return {
+    executionAuthorized: true,
+    launcher,
+    record: {
+      schemaVersion: "dolly.module-process-record/1",
+      instanceId: "instance-1",
+      moduleId: "module-1",
+      moduleGenerationId: "generation-1",
+      processGenerationId: "process-generation-1",
+      packageDigest: `sha256:${"a".repeat(64)}`,
+      configurationReference: {
+        configId: "config-1",
+        revision: `sha256:${"b".repeat(64)}`,
+        configVersion: 1,
+      },
+      declaredExternalEffects: "none",
+      serviceInvocationId: "service-invocation-1",
+      bootId: "11111111-1111-4111-8111-111111111111",
+      moduleCgroupPath: "/sys/fs/cgroup/core/module-1",
+      state: "starting",
+      createdAt: "2026-08-10T00:00:00.000Z",
+      updatedAt: "2026-08-10T00:00:00.000Z",
+    },
+    cgroup: {
+      identity: {
+        instanceId: "instance-1",
+        moduleId: "module-1",
+        processGenerationId: "process-generation-1",
+      },
+      path: "/sys/fs/cgroup/core/module-1",
+      membershipObserved: true,
+      removed: false,
+    } as never,
+  };
 }
 
 describe("Extension process Module executor", () => {
+  it("adapts one exact authorized Linux process without exposing Host stop or terminate", async () => {
+    const calls = createHostSpies(
+      { schemaVersion: "dolly.module-result/1" },
+      processSnapshot("created", { pid: 4242 }),
+    );
+    const session = createExtensionProcessLinuxProtocolSession(
+      calls.host,
+      authorizedProcess(),
+      {
+        executionTimeoutMs: 1_000,
+        cancellationGraceMs: 250,
+        wallClockNow: () => WALL_CLOCK_NOW_MS,
+      },
+    );
+
+    await session.initialize();
+    await session.execute({
+      moduleJobId: "module-job-1",
+      runId: "run-1",
+      attempt: 3,
+      hasMore: true,
+      input: INPUT,
+    });
+    await session.cancel("run-1", "shutdown");
+    await session.closeCapabilitySession();
+    await expect(session.waitForChannelClosed(300)).resolves.toBe(true);
+
+    expect(calls.execute).toHaveBeenCalledWith({
+      moduleJobId: "module-job-1",
+      runId: "run-1",
+      attempt: 3,
+      deadline: new Date(WALL_CLOCK_NOW_MS + 1_000).toISOString(),
+      responseTimeoutMs: 1_251,
+      hasMore: true,
+      input: INPUT,
+    });
+    expect(calls.cancel).toHaveBeenCalledWith("run-1", "shutdown");
+    expect(calls.closeCapabilitySession).toHaveBeenCalledOnce();
+    expect(calls.waitForChannelClosed).toHaveBeenCalledWith(300);
+    expect(calls.terminate).not.toHaveBeenCalled();
+    expect(calls.stop).not.toHaveBeenCalled();
+  });
+
+  it("rejects a Linux protocol Host bound to another process before initialization", () => {
+    const calls = createHostSpies(
+      { schemaVersion: "dolly.module-result/1" },
+      processSnapshot("created", { pid: 9999 }),
+    );
+
+    expect(() => createExtensionProcessLinuxProtocolSession(
+      calls.host,
+      authorizedProcess(),
+      EXECUTOR_OPTIONS,
+    )).toThrow(/authorized Linux Module process/u);
+    expect(calls.start).not.toHaveBeenCalled();
+  });
+
+  it("rejects mismatched, unobserved, or already removed Linux control groups", () => {
+    const calls = createHostSpies(
+      { schemaVersion: "dolly.module-result/1" },
+      processSnapshot("created", { pid: 4242 }),
+    );
+    const pathMismatch = authorizedProcess();
+    const unobserved = authorizedProcess();
+    const removed = authorizedProcess();
+    const invalid = [
+      {
+        ...pathMismatch,
+        record: { ...pathMismatch.record, moduleCgroupPath: "/another/group" },
+      },
+      {
+        ...unobserved,
+        cgroup: { ...unobserved.cgroup, membershipObserved: false },
+      },
+      {
+        ...removed,
+        cgroup: { ...removed.cgroup, removed: true },
+      },
+    ];
+
+    for (const process of invalid) {
+      expect(() => createExtensionProcessLinuxProtocolSession(
+        calls.host,
+        process as LinuxModuleAuthorizedProcess,
+        EXECUTOR_OPTIONS,
+      )).toThrow(/authorized Linux Module process/u);
+    }
+    expect(calls.start).not.toHaveBeenCalled();
+  });
+
   it("forwards the exact Module job and Run identifiers, deadline, response timeout, and input", async () => {
     const hostResult = { unexpected: true };
     const calls = createHostSpies(hostResult);
