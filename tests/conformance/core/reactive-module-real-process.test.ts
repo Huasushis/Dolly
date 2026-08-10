@@ -145,7 +145,7 @@ describe("Reactive Module runtime with a real Extension process", () => {
         maxInputBytes: 64 * 1_024,
         maxResultBytes: 64 * 1_024,
         executionTimeoutMs: 10_000,
-        cancellationGraceMs: 1_000,
+        cancellationGraceMs: 25,
         initializationTimeoutMs: 3_000,
         terminationTimeoutMs: 3_000,
         maxRunsPerGeneration: 10,
@@ -190,7 +190,10 @@ describe("Reactive Module runtime with a real Extension process", () => {
               requestedCapabilities: [],
             },
             command: process.execPath,
-            args: [FIXTURE, "module-result-then-cancel"],
+            // The second Run ignores cooperative cancellation. Shutdown must
+            // prove process termination without reclassifying that Run as a
+            // failed attempt or dead letter.
+            args: [FIXTURE, "module-result-then-ignore-cancel"],
             workingDirectory: root,
             instanceId: "instance-real-process",
             moduleId: "worker",
@@ -209,7 +212,7 @@ describe("Reactive Module runtime with a real Extension process", () => {
             moduleId: "worker",
             moduleGenerationId,
             executionTimeoutMs: 10_000,
-            cancellationGraceMs: 1_000,
+            cancellationGraceMs: 25,
           });
         },
         classifyFailure,
@@ -325,6 +328,7 @@ describe("Reactive Module runtime with a real Extension process", () => {
         attempt: 1,
         failedAttemptCount: 0,
       });
+      expect(core.deliveries.listDeadLetters()).toEqual([]);
 
       const reopenedCore = new FileCoreStateStore({
         path: coreStatePath,
@@ -340,6 +344,7 @@ describe("Reactive Module runtime with a real Extension process", () => {
       expect(reopenedCore.deliveries.inspectClaim(cancelled).status).toBe("released");
       expect(reopenedCore.getModuleSubmissionRecord(committed.runId)).toBeUndefined();
       expect(reopenedCore.getModuleSubmissionRecord(cancelled.runId)).toBeUndefined();
+      expect(reopenedCore.deliveries.listDeadLetters()).toEqual([]);
       expect(
         reopenedCore.getModuleProcessRecord(processGenerationId)?.state,
       ).toBe("stopping");

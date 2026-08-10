@@ -983,6 +983,14 @@ export class ModuleActor<Input, Output> {
           active.completionWhileFencing = true;
           return;
         }
+        if (this.#state === "stopping") {
+          // Shutdown owns the termination proof and will still wait for the
+          // executor's terminate operation below. The execute rejection is not
+          // an independent crash and must not turn this Claim into a fenced
+          // failure merely because the process exited during that proof.
+          this.#settle(active, this.#outcome(active, "cancelled"));
+          return;
+        }
         active.hardTimeoutPending = true;
         try {
           await this.#startReplacement(active);

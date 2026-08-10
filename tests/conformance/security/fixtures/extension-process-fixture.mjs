@@ -121,7 +121,10 @@ async function handleHostRequest(message) {
     return;
   }
   if (method === "module.execute") {
-    if (mode === "module-result-then-cancel") {
+    if (
+      mode === "module-result-then-cancel" ||
+      mode === "module-result-then-ignore-cancel"
+    ) {
       moduleExecutionCount += 1;
       if (moduleExecutionCount === 1) {
         respond(id, {

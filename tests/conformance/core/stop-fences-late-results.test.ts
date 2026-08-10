@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ModuleActor,
   ModuleActorError,
+  ModuleExecutorTerminatedError,
   type ModuleExecutor,
 } from "../../../src/core/module-actor.js";
 
@@ -154,6 +155,61 @@ describe("CORE-005 stop fences late Module results", () => {
     await Promise.resolve();
     expect(acceptResult).not.toHaveBeenCalled();
     expect(events).toContain("run.stale_result");
+  });
+
+  it("classifies a process exit caused by shutdown termination as cancellation", async () => {
+    const execution = deferred<string>();
+    const started = deferred<void>();
+    const terminate = vi.fn(async () => {
+      execution.resolve("terminated-by-host");
+    });
+    const actor = new ModuleActor<string, string>({
+      moduleId: "module-a",
+      initialModuleGenerationId: "generation-1",
+      maxQueuedRuns: 2,
+      maxQueuedInputBytes: 1024,
+      maxInputBytes: 512,
+      maxRunsPerGeneration: 100,
+      maxGenerations: 8,
+      initializationTimeoutMs: 1_000,
+      terminationTimeoutMs: 1_000,
+      nextModuleGenerationId: () => "generation-2",
+      monotonicNow: () => 1,
+      snapshotInput: (input) => input,
+      measureInputBytes: (input) => Buffer.byteLength(input),
+      snapshotOutput: (output) => output,
+      createExecutor: () => ({
+        isolation: "process",
+        start: vi.fn().mockResolvedValue(undefined),
+        execute: async () => {
+          started.resolve();
+          await execution.promise;
+          throw new ModuleExecutorTerminatedError("process exited during shutdown");
+        },
+        cancel: vi.fn().mockResolvedValue(undefined),
+        terminate,
+      }),
+      acceptResult: vi.fn(),
+      requireProcessIsolation: true,
+    });
+    await actor.start();
+    const outcome = actor.submit({
+      moduleGenerationId: "generation-1",
+      moduleJobId: "module-job-1",
+      runId: "run-1",
+      attempt: 1,
+      input: "input",
+    });
+    await started.promise;
+
+    await expect(actor.stop({ cancellationGraceMs: 0 })).resolves.toBeUndefined();
+    await expect(outcome).resolves.toMatchObject({
+      status: "cancelled",
+      reason: "shutdown",
+    });
+    expect(terminate).toHaveBeenCalledOnce();
+    expect(actor.moduleGenerationId).toBe("generation-1");
+    expect(actor.state).toBe("stopped");
   });
 
   it("reports an incomplete stop when active execution has no termination operation", async () => {
