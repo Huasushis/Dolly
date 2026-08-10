@@ -1081,6 +1081,11 @@ secrets, grants, prompts, media, vectors, reasoning, or rerank documents.
    descriptor-bound, never inferred by name or dimension.
 6. Cancellation, generation fencing, AccessLease lifetime, process-protocol capability
    scope, and public security retain their owning specifications.
+7. A Host may require streaming for a descriptor-bound chat capability only
+   when the selected descriptor declares an installed stream codec. In that
+   mode, an omitted or false `stream` request is rejected before provider
+   dispatch. Embedding and reranking remain non-streaming until their own
+   versioned contracts explicitly define otherwise.
 
 A conformance claim records this specification revision, Extension process protocol/Core
 revisions, descriptor schema and digest, adapter implementation versions, and

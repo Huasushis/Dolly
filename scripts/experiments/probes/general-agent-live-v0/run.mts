@@ -1369,6 +1369,7 @@ async function runCondition(options: {
             : (["chat"] as const),
           reasoningPolicies: ["require", "disable"],
           allowStreaming: true,
+          requireStreaming: true,
           roles: ["system", "user"],
           limits: {
             maxInvocations: modelInvocationLimit,

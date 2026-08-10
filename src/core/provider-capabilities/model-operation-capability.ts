@@ -58,6 +58,7 @@ export type ModelOperationDenialReason =
   | "MODEL_OPERATION_UNAVAILABLE"
   | "MODEL_MEDIA_NOT_GRANTED"
   | "MODEL_STREAMING_NOT_GRANTED"
+  | "MODEL_STREAMING_REQUIRED"
   | "MODEL_TOOLS_NOT_GRANTED"
   | "MODEL_OUTPUT_CONTRACT_DENIED"
   | "MODEL_REASONING_POLICY_DENIED"
@@ -144,6 +145,8 @@ export interface ModelOperationCapabilityOptions {
   readonly reasoningPolicies?: readonly ReasoningPolicy[];
   /** Allow descriptor-bound provider streaming with a Host-validated final result. */
   readonly allowStreaming?: boolean;
+  /** Reject non-stream chat calls before broker dispatch; requires allowStreaming. */
+  readonly requireStreaming?: boolean;
   readonly roles?: readonly string[];
   readonly limits?: Partial<ModelOperationLimits>;
   readonly maxConcurrentInvocations?: number;
@@ -330,6 +333,13 @@ function buildModelOperationCapability(
     }
   }
   const allowStreaming = options.allowStreaming === true;
+  const requireStreaming = options.requireStreaming === true;
+  if (requireStreaming && !allowStreaming) {
+    throw configError("Required model streaming requires streaming to be allowed");
+  }
+  if (allowStreaming && modality !== "chat") {
+    throw configError("Provider streaming is available only for chat model operations");
+  }
   const roles = [...new Set(options.roles ?? ["system", "user", "assistant", "tool"])];
   for (const role of roles) assertHostIdentifier(role, "role");
 
@@ -528,6 +538,12 @@ function buildModelOperationCapability(
         );
       }
     }
+    if (requireStreaming && stream !== true) {
+      throw modelDenied(
+        "MODEL_STREAMING_REQUIRED",
+        "This model handle requires provider streaming",
+      );
+    }
     const requestedPolicy = optionalString(parsed, "reasoning", "model.chat") ?? "default";
     if (!reasoningPolicies.includes(requestedPolicy as ReasoningPolicy)) {
       throw modelDenied(
@@ -709,6 +725,11 @@ function buildModelOperationCapability(
         grantedOperations: [...operations].sort(),
         reasoningPolicies: [...reasoningPolicies].sort(),
         roles: [...roles].sort(),
+        streaming: requireStreaming
+          ? "required"
+          : allowStreaming
+            ? "optional"
+            : "forbidden",
         ...(capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V2
           ? { outputContracts: [...outputContracts].sort() }
           : {}),

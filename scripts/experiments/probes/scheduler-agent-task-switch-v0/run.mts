@@ -766,6 +766,7 @@ async function runCondition(options: {
           operations: ["chat"],
           reasoningPolicies: ["require", "disable"],
           allowStreaming: true,
+          requireStreaming: true,
           outputContracts: ["text", "json-object"],
           roles: ["system", "user"],
           limits: {

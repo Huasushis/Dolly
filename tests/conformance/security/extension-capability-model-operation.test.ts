@@ -433,6 +433,9 @@ describe("Extension model operation capability", () => {
   it("forwards provider streaming only when the Host explicitly grants it", async () => {
     const harness = createHarness({ overrides: { allowStreaming: true } });
 
+    await expect(harness.invoke("describe", {})).resolves.toMatchObject({
+      streaming: "optional",
+    });
     await expect(
       harness.invoke("chat", { ...ONE_MESSAGE, stream: true }),
     ).resolves.toMatchObject({ status: "succeeded" });
@@ -441,6 +444,49 @@ describe("Extension model operation capability", () => {
       expect.objectContaining({ input: expect.objectContaining({ stream: true }) }),
       expect.any(Object),
     );
+  });
+
+  it("requires provider streaming before broker dispatch when the Host pins it", async () => {
+    const harness = createHarness({
+      overrides: { allowStreaming: true, requireStreaming: true },
+    });
+
+    await expect(harness.invoke("describe", {})).resolves.toMatchObject({
+      streaming: "required",
+    });
+
+    await expect(harness.invoke("chat", ONE_MESSAGE)).rejects.toMatchObject({
+      code: "CAPABILITY_DENIED",
+      details: { reason: "MODEL_STREAMING_REQUIRED" },
+    });
+    await expect(
+      harness.invoke("chat", { ...ONE_MESSAGE, stream: false }),
+    ).rejects.toMatchObject({
+      code: "CAPABILITY_DENIED",
+      details: { reason: "MODEL_STREAMING_REQUIRED" },
+    });
+    expect(harness.chat.invoke).not.toHaveBeenCalled();
+
+    await expect(
+      harness.invoke("chat", { ...ONE_MESSAGE, stream: true }),
+    ).resolves.toMatchObject({ status: "succeeded" });
+    expect(harness.chat.invoke).toHaveBeenCalledTimes(1);
+    expect(harness.chat.invoke).toHaveBeenCalledWith(
+      expect.objectContaining({ input: expect.objectContaining({ stream: true }) }),
+      expect.any(Object),
+    );
+  });
+
+  it("rejects a contradictory required-without-allowed streaming grant", () => {
+    expect(() => createHarness({ overrides: { requireStreaming: true } }))
+      .toThrow(/requires streaming to be allowed/u);
+  });
+
+  it("does not offer chat streaming on embedding handles", () => {
+    expect(() => createHarness({
+      descriptor: embeddingRef(),
+      overrides: { allowStreaming: true },
+    })).toThrow(/only for chat model operations/u);
   });
 
   it("fails visibly when the granted modality has no installed broker", async () => {

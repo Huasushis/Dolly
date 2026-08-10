@@ -470,6 +470,13 @@ tool-argument, usage, and terminal channels. The LLM extension may forward
 bounded provisional user-interface events through an authorized progress facility, but
 those events are not Blocks or committed conversation state.
 
+When the Host-issued model operation description marks streaming `required`,
+every chat request MUST set `stream` to true. Missing or false values fail at
+the capability boundary before the broker runs. `optional` permits an explicit
+per-request choice and `forbidden` rejects true; the Extension MUST NOT infer
+these modes from a model name. A stream-required Agent cannot silently retry a
+failed stream as a non-stream request.
+
 Slow consumers receive bounded backpressure. Disconnect, malformed stream,
 timeout, or cancellation marks provisional output incomplete. Only a validated
 terminal response or complete tool round enters the turn journal and can later
