@@ -12,11 +12,11 @@ const workspaceTemporaryRoot = resolve(repositoryRoot, "..", ".tmp");
 const verifierPath = fileURLToPath(import.meta.url);
 const artifactRoot = join(
   repositoryRoot,
-  "artifacts/experiments/probes/general-agent-tool-registry-v4",
+  "artifacts/experiments/probes/general-agent-tool-registry-v5",
 );
 const sourcePreregistrationPath = join(
   repositoryRoot,
-  "docs/experiments/preregistrations/general-agent-tool-registry-v4.json",
+  "docs/experiments/preregistrations/general-agent-tool-registry-v5.json",
 );
 const extensionSourcePath = join(scriptDirectory, "extension.mjs");
 const HIDDEN_CODENAME = "EMBER-7421";
@@ -103,15 +103,28 @@ function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sameJsonValue(left, right) {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
 function parseArguments(argv) {
   if (
     (argv.length !== 2 && argv.length !== 3 && argv.length !== 5) ||
     argv[0] !== "--run-id" ||
-    !/^registry-v5-[A-Za-z0-9._-]+$/u.test(argv[1]) ||
+    !/^registry-v6-[A-Za-z0-9._-]+$/u.test(argv[1]) ||
     (argv.length >= 3 && argv[2] !== "--check-only") ||
     (argv.length === 5 && argv[3] !== "--run-directory")
   ) {
-    fail("usage: verify-tool-registry.mjs --run-id registry-v5-<identifier> [--check-only [--run-directory <workspace-temp-run>]]");
+    fail("usage: verify-tool-registry.mjs --run-id registry-v6-<identifier> [--check-only [--run-directory <workspace-temp-run>]]");
   }
   const runId = argv[1];
   let runDirectory;
@@ -237,10 +250,10 @@ function verifyPerCaseAccounting(accounting, modelRows, providerRows) {
   }
   const spans = [[0, 1], [1, 5], [5, 9], [9, 10]];
   const expectedConditions = [
-    [7425, 1, "no-storage-tool"],
-    [7425, 1, "tool-registry-storage"],
-    [7426, 2, "tool-registry-storage"],
-    [7426, 2, "no-storage-tool"],
+    [7427, 1, "no-storage-tool"],
+    [7427, 1, "tool-registry-storage"],
+    [7428, 2, "tool-registry-storage"],
+    [7428, 2, "no-storage-tool"],
   ];
   accounting.forEach((entry, index) => {
     const [start, end] = spans[index];
@@ -517,16 +530,16 @@ function verifyModelCalls(rows) {
   exactArray(
     rows.map((row) => row.requestId),
     [
-      "agent-no-storage-tool-seed-7425-model-request-1",
-      "agent-tool-registry-storage-seed-7425-model-request-1",
-      "agent-tool-registry-storage-seed-7425-model-request-2",
-      "agent-tool-registry-storage-seed-7425-model-request-3",
-      "agent-tool-registry-storage-seed-7425-model-request-4",
-      "agent-tool-registry-storage-seed-7426-model-request-1",
-      "agent-tool-registry-storage-seed-7426-model-request-2",
-      "agent-tool-registry-storage-seed-7426-model-request-3",
-      "agent-tool-registry-storage-seed-7426-model-request-4",
-      "agent-no-storage-tool-seed-7426-model-request-1",
+      "agent-no-storage-tool-seed-7427-model-request-1",
+      "agent-tool-registry-storage-seed-7427-model-request-1",
+      "agent-tool-registry-storage-seed-7427-model-request-2",
+      "agent-tool-registry-storage-seed-7427-model-request-3",
+      "agent-tool-registry-storage-seed-7427-model-request-4",
+      "agent-tool-registry-storage-seed-7428-model-request-1",
+      "agent-tool-registry-storage-seed-7428-model-request-2",
+      "agent-tool-registry-storage-seed-7428-model-request-3",
+      "agent-tool-registry-storage-seed-7428-model-request-4",
+      "agent-no-storage-tool-seed-7428-model-request-1",
     ],
     "model request ids",
   );
@@ -710,7 +723,7 @@ function refreshManifestArtifactDigests(runDirectory, names) {
 
 function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
   mkdirSync(workspaceTemporaryRoot, { recursive: true, mode: 0o700 });
-  const mutationRoot = mkdtempSync(join(workspaceTemporaryRoot, "registry-v5-mutations-"));
+  const mutationRoot = mkdtempSync(join(workspaceTemporaryRoot, "registry-v6-mutations-"));
   const mutations = [
     {
       id: "capability-type-raw-storage",
@@ -834,7 +847,7 @@ function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
     {
       id: "effect-outcome-unknown",
       apply(runDirectory) {
-        const name = "effect-intents-tool-registry-storage-seed-7425.json";
+        const name = "effect-intents-tool-registry-storage-seed-7427.json";
         const path = join(runDirectory, name);
         const document = json(path);
         document.records[0].outcome = {
@@ -959,8 +972,8 @@ function main() {
   const manifest = json(manifestPath);
   if (
     manifest.schemaVersion !== "general-agent-live/run-manifest/1" ||
-    manifest.experimentId !== "general-agent-tool-registry-v4" ||
-    manifest.experimentVersion !== 5 ||
+    manifest.experimentId !== "general-agent-tool-registry-v5" ||
+    manifest.experimentVersion !== 6 ||
     manifest.runId !== runId ||
     manifest.status !== "completed"
   ) {
@@ -1014,12 +1027,12 @@ function main() {
   ) {
     fail("preregistration validation inputs or dataset identity are invalid");
   }
-  exactArray(manifest.seeds, [7425, 7426], "manifest evaluation seeds");
+  exactArray(manifest.seeds, [7427, 7428], "manifest evaluation seeds");
   const expectedExecutionOrder = [
-    { evaluationSeed: 7425, repetition: 1, conditionId: "no-storage-tool" },
-    { evaluationSeed: 7425, repetition: 1, conditionId: "tool-registry-storage" },
-    { evaluationSeed: 7426, repetition: 2, conditionId: "tool-registry-storage" },
-    { evaluationSeed: 7426, repetition: 2, conditionId: "no-storage-tool" },
+    { evaluationSeed: 7427, repetition: 1, conditionId: "no-storage-tool" },
+    { evaluationSeed: 7427, repetition: 1, conditionId: "tool-registry-storage" },
+    { evaluationSeed: 7428, repetition: 2, conditionId: "tool-registry-storage" },
+    { evaluationSeed: 7428, repetition: 2, conditionId: "no-storage-tool" },
   ];
   if (JSON.stringify(manifest.executionOrder) !== JSON.stringify(expectedExecutionOrder)) {
     fail("manifest execution order differs from the preregistered order");
@@ -1059,18 +1072,18 @@ function main() {
 
   const cases = jsonLines(casesPath);
   if (cases.length !== 4) fail(`expected 4 cases, observed ${cases.length}`);
-  verifyBaseline(cases[0], 7425, 1);
-  verifyTreatment(cases[1], 7425, 1);
-  verifyTreatment(cases[2], 7426, 2);
-  verifyBaseline(cases[3], 7426, 2);
+  verifyBaseline(cases[0], 7427, 1);
+  verifyTreatment(cases[1], 7427, 1);
+  verifyTreatment(cases[2], 7428, 2);
+  verifyBaseline(cases[3], 7428, 2);
   for (const row of cases) verifyEffectJournal(row, runDirectory, manifest);
   const expectedArtifactNames = [
     "analysis.json",
     "cases.jsonl",
-    "effect-intents-no-storage-tool-seed-7425.json",
-    "effect-intents-no-storage-tool-seed-7426.json",
-    "effect-intents-tool-registry-storage-seed-7425.json",
-    "effect-intents-tool-registry-storage-seed-7426.json",
+    "effect-intents-no-storage-tool-seed-7427.json",
+    "effect-intents-no-storage-tool-seed-7428.json",
+    "effect-intents-tool-registry-storage-seed-7427.json",
+    "effect-intents-tool-registry-storage-seed-7428.json",
     "model-calls.jsonl",
     "provider-responses.jsonl",
   ];
@@ -1108,8 +1121,10 @@ function main() {
       requestBody.model !== "qwen3.6-27b" ||
       requestBody.stream !== false ||
       requestBody.max_tokens !== EXPECTED_MAX_TOKENS[index] ||
-      JSON.stringify(requestBody.messages) !==
-        JSON.stringify(expectedWireMessages(modelCalls[index]?.input?.messages, index)) ||
+      !sameJsonValue(
+        requestBody.messages,
+        expectedWireMessages(modelCalls[index]?.input?.messages, index),
+      ) ||
       (outputKind === "json-object" &&
         JSON.stringify(requestBody.response_format) !== JSON.stringify({ type: "json_object" })) ||
       (outputKind === "text" && Object.hasOwn(requestBody, "response_format")) ||
@@ -1149,8 +1164,8 @@ function main() {
 
   const verification = {
     schemaVersion: "general-agent-tool-registry/validation/1",
-    experimentId: "general-agent-tool-registry-v4",
-    experimentVersion: 5,
+    experimentId: "general-agent-tool-registry-v5",
+    experimentVersion: 6,
     runId,
     valid: true,
     checks: {
@@ -1172,7 +1187,9 @@ function main() {
       sourceIndependence: true,
       productBootstrapModulesRemainRejected: true,
       linuxControlGroupProof: false,
-      durableToolJournalIncluded: false,
+      durableToolJournalIncluded: true,
+      exactRunEffectJournalIncluded: true,
+      durableEffectfulToolRecoveryIncluded: false,
       nativeProviderToolCallingIncluded: false,
       mutationChecksRejected: mutationChecks.length,
     },
