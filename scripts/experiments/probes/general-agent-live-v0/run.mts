@@ -25,6 +25,7 @@ import {
 } from "../../../../src/core/extension-process-host.js";
 import { FileCoreStateStore } from "../../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../../src/core/file-module-result-commit-repository.js";
+import { FileToolJournalRepository } from "../../../../src/core/file-tool-journal-repository.js";
 import { deriveModuleCgroupPath } from "../../../../src/core/linux-module-cgroup.js";
 import { EndpointBindingRegistry } from "../../../../src/core/model-provider-binding.js";
 import {
@@ -58,7 +59,6 @@ import {
   type ReactiveModuleRuntimeOptions,
 } from "../../../../src/core/reactive-module-runtime.js";
 import {
-  InMemoryToolJournalRepository,
   ToolPolicySession,
   ToolRegistry,
   type ToolDescriptor,
@@ -1003,6 +1003,9 @@ async function runCondition(options: {
     const repository = new FileModuleResultCommitRepository({
       path: join(conditionRoot, "module-result-commits.json"),
     });
+    const toolJournalRepository = new FileToolJournalRepository({
+      path: join(conditionRoot, "tool-rounds.json"),
+    });
     const commits = createModuleResultCommitCoordinator({
       core,
       repository,
@@ -1221,7 +1224,7 @@ async function runCondition(options: {
               policy: new ToolPolicySession({
                 moduleJobId,
                 registry,
-                repository: new InMemoryToolJournalRepository(),
+                repository: toolJournalRepository,
                 approval: {
                   decide: async () => {
                     throw new Error("Read-only experiment tools must not request approval");

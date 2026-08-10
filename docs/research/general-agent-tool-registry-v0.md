@@ -79,3 +79,12 @@ to a broker that may reject solely from the status code. A local loopback test
 proves a 503 body is recorded even when the caller never consumes the returned
 body stream. These fixes do not retroactively validate registry-v4-b; a future
 confirmation must freeze their new source hashes before making provider calls.
+
+The next candidate also replaces the per-process in-memory tool-round journal
+with the strict, atomically replaced `FileToolJournalRepository`. A real child
+process conformance test completes both read rounds, reopens the file, and finds
+both rounds terminal without changing the two tool executions. The journal now
+binds each Module job to one registry digest and approval-policy revision. This
+is read-only crash-recovery infrastructure, not evidence that an effectful tool
+is safe after a crash between its external effect and terminal journal update;
+no new paid canary has been run for this candidate yet.

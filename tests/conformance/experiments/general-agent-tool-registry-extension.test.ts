@@ -9,9 +9,9 @@ import {
   ExtensionProcessHost,
 } from "../../../src/core/extension-process-host.js";
 import type { ExtensionPackageManifest } from "../../../src/core/extension-installation-registry.js";
+import { FileToolJournalRepository } from "../../../src/core/file-tool-journal-repository.js";
 import { createToolInvocationCapabilityV2 } from "../../../src/core/provider-capabilities/index.js";
 import {
-  InMemoryToolJournalRepository,
   ToolPolicySession,
   ToolRegistry,
   type ToolDescriptor,
@@ -247,6 +247,8 @@ describe("general Agent tool-registry Extension", () => {
       }),
     ] as const;
     const registry = new ToolRegistry(tools, tools.map((tool) => tool.toolId));
+    const toolJournalPath = join(scratch, "tool-rounds.json");
+    const toolJournalRepository = new FileToolJournalRepository({ path: toolJournalPath });
     const execute = vi.fn(
       async (request: ToolExecutionRequest): Promise<ToolExecutionOutcome> => {
         if (request.toolId === "synthetic.discover") {
@@ -268,7 +270,7 @@ describe("general Agent tool-registry Extension", () => {
         policy: new ToolPolicySession({
           moduleJobId,
           registry,
-          repository: new InMemoryToolJournalRepository(),
+          repository: toolJournalRepository,
           approval: { decide: vi.fn() },
           executor: { execute },
           budget: BUDGET,
@@ -409,6 +411,13 @@ describe("general Agent tool-registry Extension", () => {
         { kind: "json-object" },
       ]);
       expect(execute).toHaveBeenCalledTimes(2);
+      expect(
+        new FileToolJournalRepository({ path: toolJournalPath })
+          .listRounds("module-job-a"),
+      ).toEqual([
+        expect.objectContaining({ roundIndex: 1, state: "complete" }),
+        expect.objectContaining({ roundIndex: 2, state: "complete" }),
+      ]);
       expect(readFileSync(EXTENSION, "utf8")).not.toMatch(/storage_(?:list|get)/u);
       await host.stop();
     } finally {
