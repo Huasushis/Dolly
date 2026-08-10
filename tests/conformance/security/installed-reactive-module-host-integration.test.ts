@@ -558,9 +558,11 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         5_000,
       )).toBe(true);
 
-      await composed.host.stop();
+      await expect(composed.host.stop()).rejects.toMatchObject({
+        errors: [expect.objectContaining({ code: "RUNTIME_RECOVERY_REQUIRED" })],
+      });
       stopped = true;
-      expect(composed.host.state).toBe("stopped");
+      expect(composed.host.state).toBe("failed");
       MODULE_IDS.forEach((_moduleId, index) => {
         expect(coreState.store.getModuleProcessRecord(processGenerationIds[index]!))
           .toMatchObject({
@@ -606,22 +608,29 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       );
       const reopenedDeliverySnapshot = reopened.deliveries.snapshot();
       expect(reopenedDrainerResident)
-        .toMatchObject({ residentCount: 1, pendingCount: 1, claimedCount: 0 });
+        .toMatchObject({ residentCount: 1, pendingCount: 0, claimedCount: 1 });
       const reopenedDrainerJobs = reopenedDeliverySnapshot.moduleJobs.filter((job) =>
         job.consumerId === DRAINER_MODULE_ID
       );
       expect(reopenedDrainerJobs).toHaveLength(3);
       expect(reopenedDrainerJobs.filter((job) => job.status === "committed")).toHaveLength(2);
       expect(reopenedDrainerJobs).toContainEqual(expect.objectContaining({
-        status: "ready",
+        status: "claimed",
         attempt: 1,
         failedAttemptCount: 0,
+      }));
+      expect(reopenedDeliverySnapshot.claims).toContainEqual(expect.objectContaining({
+        status: "active",
+        moduleGenerationId: `${DRAINER_MODULE_ID}-generation-1`,
+      }));
+      expect(reopened.listModuleSubmissionRecords()).toContainEqual(expect.objectContaining({
+        moduleGenerationId: `${DRAINER_MODULE_ID}-generation-1`,
       }));
       expect(
         reopenedDeliverySnapshot.deliveries.find(
           (delivery) => delivery.record.deliveryId === shutdownProbeDelivery.deliveryId,
         )?.obligations,
-      ).toContainEqual({ consumerId: DRAINER_MODULE_ID, status: "pending" });
+      ).toContainEqual({ consumerId: DRAINER_MODULE_ID, status: "claimed" });
       expect(reopened.deliveries.listDeadLetters()).toEqual([]);
       expect(reopened.deliveries.inspectPending(SECOND_MODULE_ID, ["middle"]).pendingCount)
         .toBe(0);
@@ -645,9 +654,10 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           [DRAINER_MODULE_ID]: 1,
         },
         actorRunsAfterCapacityRelease,
-        shutdownCancellationObserved: true,
+        shutdownUnknownOutcomePreserved: true,
         shutdownCancelledModuleId: DRAINER_MODULE_ID,
         shutdownFailedAttemptCount: 0,
+        shutdownClaimStatus: "active",
         committedModuleResults: reopenedRepository.list().length,
         finalRecordStates: processGenerationIds.map((processGenerationId) =>
           reopened.getModuleProcessRecord(processGenerationId)?.state
