@@ -1,6 +1,14 @@
 import { assertJsonValue, type JsonValue } from "./canonical-json.js";
 
 /**
+ * A structured-data schema name has a lowercase dotted owner/name followed by
+ * an explicit decimal version. The whole-segment form lets Core derive an
+ * Extension publisher without normalizing or guessing an identifier.
+ */
+export const CONTENT_SCHEMA_NAME_PATTERN =
+  /^[a-z][a-z0-9]*(\.[a-z0-9-]+)+\/[1-9][0-9]{0,3}$/u;
+
+/**
  * A rectangle uses coordinates from 0 to 1 relative to the original image.
  * The media store converts it to pixels only when a provider needs bytes.
  */
@@ -84,6 +92,19 @@ function nonEmptyString(value: unknown, label: string): asserts value is string 
   if (typeof value !== "string" || value.length === 0) {
     throw new Error(`${label} must be a non-empty string`);
   }
+}
+
+/** Validate one structured-data schema name without changing its bytes. */
+export function parseContentSchemaName(
+  value: unknown,
+  label = "content schema name",
+): string {
+  if (typeof value !== "string" || !CONTENT_SCHEMA_NAME_PATTERN.test(value)) {
+    throw new Error(
+      `${label} must be a lowercase dotted name followed by a version from 1 to 9999`,
+    );
+  }
+  return value;
 }
 
 function optionalString(value: unknown, label: string): asserts value is string | undefined {
@@ -227,9 +248,9 @@ function parseItem(value: unknown, index: number): BlockContentItem {
     }
     case "data": {
       closedObject(value, ["type", "schema", "value"], label);
-      nonEmptyString(value.schema, `${label}.schema`);
+      const schema = parseContentSchemaName(value.schema, `${label}.schema`);
       assertJsonValue(value.value, `${label}.value`);
-      return { type: "data", schema: value.schema, value: value.value };
+      return { type: "data", schema, value: value.value };
     }
     default:
       throw new Error(`${label}.type is not supported`);

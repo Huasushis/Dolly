@@ -86,6 +86,14 @@ interface DataItemV1 {
 }
 ```
 
+A `data` schema name is an identity, not an arbitrary description. Its exact
+syntax is a lowercase dotted name followed by a solidus and a decimal version:
+`^[a-z][a-z0-9]*(\.[a-z0-9-]+)+/[1-9][0-9]{0,3}$`. The Core validates this
+syntax as part of the complete content item. It does not lowercase, trim, or
+otherwise normalize the name; invalid bytes are rejected before Block creation.
+The dotted prefix is what lets the content schema registry derive an
+Extension-owned namespace without trusting a publisher's own ownership claim.
+
 `block-reference` identifies one already committed earlier Block. It is not a
 copy of that Block and it does not grant access outside the normal Module
 permissions. The renderer decides whether to show a summary, link, or expanded
@@ -212,6 +220,8 @@ and are not silently loaded.
 Conformance tests must cover:
 
 - closed-object and unknown-item rejection;
+- valid and invalid structured-data schema names, including missing owner
+  segments, uppercase or punctuation aliases, and invalid version suffixes;
 - empty content, invalid text, invalid identifiers, and invalid crop bounds;
 - missing, self, future, and cyclic Block references;
 - missing media, non-image crop, zero-pixel crop, and repeated media items;

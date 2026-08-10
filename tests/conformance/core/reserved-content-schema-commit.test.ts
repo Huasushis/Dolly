@@ -165,7 +165,7 @@ describe("CORE-RESERVED-001 direct Block commit", () => {
     // A different name that merely looks similar is ordinary extension data.
     const lookalikes = [
       "dolly.console.message-boundary/10",
-      "dolly.console.message-boundary",
+      "dolly.console.other-boundary/1",
       "acme.dolly.console.message-boundary/1",
     ];
     for (const schema of lookalikes) {
