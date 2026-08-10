@@ -409,6 +409,15 @@ remain explicit trusted inputs. This function is not called by
 slice only and does not satisfy Linux control-group ownership, durable external
 effect evidence, configuration resolution, or startup recovery.
 
+Candidate-host shutdown first changes the Scheduler to its stopping state,
+which synchronously closes dispatch admission. It then invokes every started
+runtime's stop operation without waiting for the Scheduler's active ticks to
+drain; runtime cancellation and process termination are what allow those ticks
+to settle. Scheduler drain and runtime termination are awaited together. A
+runtime whose termination remains unconfirmed stays in the started set, the
+Host reports failure, and a later stop call retries that same proof instead of
+returning a permanently cached rejection.
+
 `resolveInstalledExtensionModule` and
 `deriveInstalledLinuxExtensionModuleExecutor` form a narrower installation
 derivation boundary: in ordinary terms, they ensure that the package digest,

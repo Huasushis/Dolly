@@ -175,6 +175,65 @@ describe("reactive Module host lifecycle", () => {
     ]);
   });
 
+  it("stops runtime work without waiting for the Scheduler tick drain first", async () => {
+    const events: string[] = [];
+    let finishSchedulerStop: (() => void) | undefined;
+    const fakeScheduler = scheduler(events);
+    fakeScheduler.stop.mockImplementation(() => {
+      events.push("scheduler:stop");
+      return new Promise<void>((resolve) => {
+        finishSchedulerStop = resolve;
+      });
+    });
+    const managed = runtime(
+      "worker",
+      events,
+      async () => undefined,
+      async () => finishSchedulerStop?.(),
+    );
+    const host = new ReactiveModuleHost(
+      fakeScheduler as never,
+      [registration("worker", managed)],
+    );
+    await host.start();
+
+    await expect(host.stop()).resolves.toBeUndefined();
+    expect(events).toEqual([
+      "register:worker",
+      "start:worker",
+      "scheduler:start",
+      "scheduler:stop",
+      "stop:worker",
+    ]);
+  });
+
+  it("retries a failed runtime termination instead of caching a rejected stop", async () => {
+    const events: string[] = [];
+    let stopAttempts = 0;
+    const managed = runtime(
+      "worker",
+      events,
+      async () => undefined,
+      async () => {
+        stopAttempts += 1;
+        if (stopAttempts === 1) throw new Error("termination unconfirmed");
+      },
+    );
+    const host = new ReactiveModuleHost(
+      scheduler(events) as never,
+      [registration("worker", managed)],
+    );
+    await host.start();
+
+    await expect(host.stop()).rejects.toMatchObject({
+      errors: [expect.objectContaining({ message: "termination unconfirmed" })],
+    });
+    expect(host.state).toBe("failed");
+    await expect(host.stop()).resolves.toBeUndefined();
+    expect(host.state).toBe("stopped");
+    expect(stopAttempts).toBe(2);
+  });
+
   it("preserves an explicit activation descriptor when it registers a runtime", () => {
     const events: string[] = [];
     const fakeScheduler = scheduler(events);

@@ -306,27 +306,53 @@ export class ReactiveModuleHost {
     this.#state = "stopping";
     const operation = this.#stopAll();
     this.#stopPromise = operation;
+    void operation.finally(() => {
+      if (this.#stopPromise === operation) this.#stopPromise = undefined;
+    }).catch(() => undefined);
     return operation;
   }
 
   async #stopAll(): Promise<void> {
     const errors: unknown[] = [];
+    const operations: Array<{
+      readonly kind: "scheduler" | "runtime";
+      readonly runtime?: ManagedReactiveModuleRuntime;
+      readonly operation: Promise<void>;
+    }> = [];
     if (this.#schedulerStarted) {
       try {
-        await this.#scheduler.stop();
-        this.#schedulerStarted = false;
+        // `stop()` changes Scheduler state to stopping synchronously, so no
+        // later dispatch can begin. Do not await its in-flight tick drain
+        // before asking runtimes to cancel and terminate those same ticks.
+        operations.push({ kind: "scheduler", operation: this.#scheduler.stop() });
       } catch (error) {
         errors.push(error);
       }
     }
     for (const runtime of [...this.#startedRuntimes].reverse()) {
       try {
-        await runtime.stop();
-        this.#startedRuntimes.splice(this.#startedRuntimes.indexOf(runtime), 1);
+        operations.push({ kind: "runtime", runtime, operation: runtime.stop() });
       } catch (error) {
         errors.push(error);
       }
     }
+    const results = await Promise.allSettled(
+      operations.map((entry) => entry.operation),
+    );
+    results.forEach((result, index) => {
+      const entry = operations[index]!;
+      if (result.status === "rejected") {
+        errors.push(result.reason);
+        return;
+      }
+      if (entry.kind === "scheduler") {
+        this.#schedulerStarted = false;
+        return;
+      }
+      const runtime = entry.runtime!;
+      const runtimeIndex = this.#startedRuntimes.indexOf(runtime);
+      if (runtimeIndex >= 0) this.#startedRuntimes.splice(runtimeIndex, 1);
+    });
     this.#state = errors.length === 0 ? "stopped" : "failed";
     if (errors.length > 0) {
       throw new AggregateError(errors, "Reactive Module host shutdown failed");
