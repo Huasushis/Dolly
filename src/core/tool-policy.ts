@@ -194,7 +194,7 @@ interface NormalizedToolCall {
   readonly initialResult?: Omit<ToolCallTerminalResult, "providerCallId">;
 }
 
-interface ToolEffectJournalRecord {
+export interface ToolEffectJournalRecord {
   readonly wireName: string;
   readonly effectSlot: string;
   readonly argumentDigest: string;
@@ -206,8 +206,10 @@ interface ToolEffectJournalRecord {
 }
 
 export interface ToolRoundJournalRecord {
-  readonly schemaVersion: "dolly.tool-round/2";
+  readonly schemaVersion: "dolly.tool-round/3";
   readonly moduleJobId: string;
+  readonly registryDigest: string;
+  readonly approvalPolicyRevision: string;
   readonly roundIndex: number;
   readonly roundDigest: string;
   readonly state: "reserved" | "complete" | "failed" | "cancelled" | "outcome-unknown";
@@ -232,7 +234,11 @@ export type ToolPolicyErrorCode =
   | "TOOL_ROUND_INVALID"
   | "TOOL_ROUND_CONFLICT"
   | "TOOL_BUDGET_EXHAUSTED"
-  | "TOOL_JOURNAL_CONFLICT";
+  | "TOOL_JOURNAL_CONFLICT"
+  | "TOOL_JOURNAL_DOCUMENT_INVALID"
+  | "TOOL_JOURNAL_IO_FAILED"
+  | "TOOL_JOURNAL_LIMIT_EXCEEDED"
+  | "TOOL_JOURNAL_LOCKED";
 
 export class ToolPolicyError extends Error {
   constructor(
@@ -435,7 +441,66 @@ function immutableRound(record: ToolRoundJournalRecord): ToolRoundJournalRecord 
   return frozenJson(record);
 }
 
-function assertToolRoundJournalRecord(record: ToolRoundJournalRecord): void {
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  return actual.length === allowed.length &&
+    actual.every((key, index) => key === [...allowed].sort()[index]);
+}
+
+function assertToolEffectResult(
+  value: unknown,
+  effect: Pick<ToolEffectJournalRecord, "wireName" | "effectSlot">,
+): void {
+  if (!isPlainRecord(value)) {
+    throw new ToolPolicyError("TOOL_ROUND_INVALID", "Tool effect result is invalid");
+  }
+  const required = ["code", "effectSlot", "status", "wireName"];
+  const allowed = value.content === undefined ? required : [...required, "content"];
+  if (
+    !exactKeys(value, allowed) ||
+    value.wireName !== effect.wireName ||
+    value.effectSlot !== effect.effectSlot ||
+    typeof value.code !== "string" ||
+    !ID_PATTERN.test(value.code) ||
+    (value.status !== "succeeded" &&
+      value.status !== "denied" &&
+      value.status !== "invalid-arguments" &&
+      value.status !== "failed" &&
+      value.status !== "cancelled" &&
+      value.status !== "outcome-unknown")
+  ) {
+    throw new ToolPolicyError("TOOL_ROUND_INVALID", "Tool effect result is invalid");
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "content")) {
+    assertJsonValue(value.content);
+  }
+  const hasContent = Object.prototype.hasOwnProperty.call(value, "content");
+  if ((value.status === "succeeded") !== hasContent) {
+    throw new ToolPolicyError("TOOL_ROUND_INVALID", "Tool effect result content is invalid");
+  }
+}
+
+function effectIdentity(effect: ToolEffectJournalRecord): JsonValue {
+  return {
+    wireName: effect.wireName,
+    effectSlot: effect.effectSlot,
+    argumentDigest: effect.argumentDigest,
+    ...(effect.toolId === undefined ? {} : { toolId: effect.toolId }),
+    ...(effect.arguments === undefined ? {} : { arguments: effect.arguments }),
+    providerCallId: effect.providerCallId,
+  };
+}
+
+/** Validates one complete journal record before it is trusted or persisted. */
+export function assertToolRoundJournalRecord(
+  record: unknown,
+): asserts record is ToolRoundJournalRecord {
   try {
     assertJsonValue(record);
   } catch {
@@ -443,7 +508,9 @@ function assertToolRoundJournalRecord(record: ToolRoundJournalRecord): void {
   }
   const expectedKeys = [
     "effects",
+    "approvalPolicyRevision",
     "moduleJobId",
+    "registryDigest",
     "revision",
     "roundDigest",
     "roundIndex",
@@ -451,16 +518,21 @@ function assertToolRoundJournalRecord(record: ToolRoundJournalRecord): void {
     "state",
   ];
   if (
-    record === null ||
-    typeof record !== "object" ||
-    Array.isArray(record) ||
-    Object.getPrototypeOf(record) !== Object.prototype ||
+    !isPlainRecord(record) ||
     Object.keys(record).sort().join(",") !== expectedKeys.sort().join(",") ||
-    record.schemaVersion !== "dolly.tool-round/2" ||
+    record.schemaVersion !== "dolly.tool-round/3" ||
+    typeof record.moduleJobId !== "string" ||
     !ID_PATTERN.test(record.moduleJobId) ||
+    typeof record.registryDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/.test(record.registryDigest) ||
+    typeof record.approvalPolicyRevision !== "string" ||
+    !ID_PATTERN.test(record.approvalPolicyRevision) ||
+    typeof record.roundIndex !== "number" ||
     !Number.isSafeInteger(record.roundIndex) ||
     record.roundIndex <= 0 ||
+    typeof record.roundDigest !== "string" ||
     !/^sha256:[0-9a-f]{64}$/.test(record.roundDigest) ||
+    typeof record.revision !== "number" ||
     !Number.isSafeInteger(record.revision) ||
     record.revision <= 0 ||
     !Array.isArray(record.effects) ||
@@ -471,6 +543,138 @@ function assertToolRoundJournalRecord(record: ToolRoundJournalRecord): void {
       record.state !== "outcome-unknown")
   ) {
     throw new ToolPolicyError("TOOL_ROUND_INVALID", "Tool round journal record is invalid");
+  }
+
+  const effects = record.effects as unknown[];
+  if (effects.length === 0) {
+    throw new ToolPolicyError("TOOL_ROUND_INVALID", "Tool round has no effects");
+  }
+  const providerCallIds = new Set<string>();
+  for (let index = 0; index < effects.length; index += 1) {
+    const candidate = effects[index];
+    if (!isPlainRecord(candidate)) {
+      throw new ToolPolicyError("TOOL_ROUND_INVALID", "Tool effect journal record is invalid");
+    }
+    const required = [
+      "argumentDigest",
+      "effectSlot",
+      "providerCallId",
+      "status",
+      "wireName",
+    ];
+    const allowed = [
+      ...required,
+      ...(candidate.toolId === undefined ? [] : ["toolId"]),
+      ...(candidate.arguments === undefined ? [] : ["arguments"]),
+      ...(candidate.result === undefined ? [] : ["result"]),
+    ];
+    const expectedSlot = `round-${record.roundIndex}-call-${index + 1}`;
+    if (
+      !exactKeys(candidate, allowed) ||
+      typeof candidate.wireName !== "string" ||
+      !WIRE_NAME_PATTERN.test(candidate.wireName) ||
+      candidate.effectSlot !== expectedSlot ||
+      typeof candidate.argumentDigest !== "string" ||
+      !/^sha256:[0-9a-f]{64}$/.test(candidate.argumentDigest) ||
+      typeof candidate.providerCallId !== "string" ||
+      !ID_PATTERN.test(candidate.providerCallId) ||
+      providerCallIds.has(candidate.providerCallId) ||
+      (candidate.toolId !== undefined &&
+        (typeof candidate.toolId !== "string" || !ID_PATTERN.test(candidate.toolId))) ||
+      (candidate.status !== "reserved" && candidate.status !== "terminal")
+    ) {
+      throw new ToolPolicyError("TOOL_ROUND_INVALID", "Tool effect journal record is invalid");
+    }
+    providerCallIds.add(candidate.providerCallId);
+    if (candidate.arguments !== undefined && !isPlainRecord(candidate.arguments)) {
+      throw new ToolPolicyError("TOOL_ROUND_INVALID", "Tool effect arguments are invalid");
+    }
+    if (
+      (candidate.toolId === undefined && candidate.arguments !== undefined) ||
+      (candidate.arguments !== undefined &&
+        canonicalJsonDigest(candidate.arguments) !== candidate.argumentDigest)
+    ) {
+      throw new ToolPolicyError("TOOL_ROUND_INVALID", "Tool effect argument identity is invalid");
+    }
+    if (candidate.status === "reserved") {
+      if (
+        candidate.toolId === undefined ||
+        candidate.arguments === undefined ||
+        candidate.result !== undefined
+      ) {
+        throw new ToolPolicyError("TOOL_ROUND_INVALID", "Reserved tool effect is invalid");
+      }
+    } else {
+      if (candidate.result === undefined) {
+        throw new ToolPolicyError("TOOL_ROUND_INVALID", "Terminal tool effect has no result");
+      }
+      assertToolEffectResult(candidate.result, candidate as unknown as ToolEffectJournalRecord);
+    }
+  }
+
+  const typedEffects = effects as unknown as readonly ToolEffectJournalRecord[];
+  const expectedRoundDigest = canonicalJsonDigest(
+    typedEffects.map((effect) => ({
+      wireName: effect.wireName,
+      argumentDigest: effect.argumentDigest,
+      effectSlot: effect.effectSlot,
+    })),
+  );
+  if (record.roundDigest !== expectedRoundDigest) {
+    throw new ToolPolicyError("TOOL_ROUND_INVALID", "Tool round digest does not match its effects");
+  }
+  const allTerminal = typedEffects.every((effect) => effect.status === "terminal");
+  if (record.state !== "reserved" && !allTerminal) {
+    throw new ToolPolicyError("TOOL_ROUND_INVALID", "A finished tool round has reserved effects");
+  }
+  if (record.state === "complete" && typedEffects.some(
+    (effect) => effect.result?.status === "cancelled" ||
+      effect.result?.status === "outcome-unknown",
+  )) {
+    throw new ToolPolicyError("TOOL_ROUND_INVALID", "Complete tool round has an unresolved result");
+  }
+  if (record.state === "cancelled" && !typedEffects.some(
+    (effect) => effect.result?.status === "cancelled",
+  )) {
+    throw new ToolPolicyError("TOOL_ROUND_INVALID", "Cancelled tool round has no cancellation");
+  }
+  if (record.state === "outcome-unknown" && !typedEffects.some(
+    (effect) => effect.result?.status === "outcome-unknown",
+  )) {
+    throw new ToolPolicyError("TOOL_ROUND_INVALID", "Unknown tool round has no unknown outcome");
+  }
+}
+
+/** Freezes every immutable call identity across one compare-and-set revision. */
+export function assertToolRoundJournalTransition(
+  current: ToolRoundJournalRecord,
+  next: ToolRoundJournalRecord,
+): void {
+  assertToolRoundJournalRecord(current);
+  assertToolRoundJournalRecord(next);
+  if (
+    next.moduleJobId !== current.moduleJobId ||
+    next.registryDigest !== current.registryDigest ||
+    next.approvalPolicyRevision !== current.approvalPolicyRevision ||
+    next.roundIndex !== current.roundIndex ||
+    next.roundDigest !== current.roundDigest ||
+    next.revision !== current.revision + 1 ||
+    current.state !== "reserved" ||
+    next.effects.length !== current.effects.length
+  ) {
+    throw new ToolPolicyError("TOOL_JOURNAL_CONFLICT", "Invalid tool journal transition");
+  }
+  for (let index = 0; index < current.effects.length; index += 1) {
+    const before = current.effects[index]!;
+    const after = next.effects[index]!;
+    if (
+      canonicalJsonDigest(effectIdentity(before)) !==
+        canonicalJsonDigest(effectIdentity(after)) ||
+      (before.status === "terminal" &&
+        canonicalJsonDigest(before) !== canonicalJsonDigest(after))
+    ) {
+      throw new ToolPolicyError("TOOL_JOURNAL_CONFLICT", "Tool effect identity changed");
+    }
   }
 }
 
@@ -502,29 +706,10 @@ export class InMemoryToolJournalRepository implements ToolJournalRepository {
     const key = this.#key(moduleJobId, roundIndex);
     const current = this.#rounds.get(key);
     if (!current || current.revision !== expectedRevision) return false;
-    if (
-      next.moduleJobId !== moduleJobId ||
-      next.roundIndex !== roundIndex ||
-      next.roundDigest !== current.roundDigest ||
-      next.revision !== expectedRevision + 1 ||
-      current.state !== "reserved" ||
-      next.effects.length !== current.effects.length
-    ) {
+    if (next.moduleJobId !== moduleJobId || next.roundIndex !== roundIndex) {
       throw new ToolPolicyError("TOOL_JOURNAL_CONFLICT", "Invalid tool journal transition");
     }
-    for (let index = 0; index < current.effects.length; index += 1) {
-      const before = current.effects[index]!;
-      const after = next.effects[index]!;
-      if (
-        before.effectSlot !== after.effectSlot ||
-        before.argumentDigest !== after.argumentDigest ||
-        before.wireName !== after.wireName ||
-        before.toolId !== after.toolId ||
-        (before.status === "terminal" && canonicalJsonDigest(before) !== canonicalJsonDigest(after))
-      ) {
-        throw new ToolPolicyError("TOOL_JOURNAL_CONFLICT", "Tool effect identity changed");
-      }
-    }
+    assertToolRoundJournalTransition(current, next);
     this.#rounds.set(key, immutableRound(next));
     return true;
   }
@@ -749,10 +934,21 @@ export class ToolPolicySession {
       ids.add(call.providerCallId);
     }
     const priorCalls = this.#repository
-      .listRounds(this.#moduleJobId)
+      .listRounds(this.#moduleJobId);
+    if (priorCalls.some(
+      (round) =>
+        round.registryDigest !== this.registryDigest ||
+        round.approvalPolicyRevision !== this.#approvalPolicyRevision,
+    )) {
+      throw new ToolPolicyError(
+        "TOOL_ROUND_CONFLICT",
+        "Tool registry or approval policy changed within one Module job",
+      );
+    }
+    const priorCallCount = priorCalls
       .reduce((count, round) => count + round.effects.length, 0);
     const existing = this.#repository.getRound(this.#moduleJobId, input.roundIndex);
-    if (!existing && priorCalls + input.calls.length > this.#budget.maxCalls) {
+    if (!existing && priorCallCount + input.calls.length > this.#budget.maxCalls) {
       throw new ToolPolicyError("TOOL_BUDGET_EXHAUSTED", "Total tool call budget is exhausted");
     }
 
@@ -766,7 +962,11 @@ export class ToolPolicySession {
     );
     let record = existing;
     if (record) {
-      if (record.roundDigest !== roundDigest) {
+      if (
+        record.roundDigest !== roundDigest ||
+        record.registryDigest !== this.registryDigest ||
+        record.approvalPolicyRevision !== this.#approvalPolicyRevision
+      ) {
         throw new ToolPolicyError("TOOL_ROUND_CONFLICT", "Tool round was replayed with other calls");
       }
     } else {
@@ -780,8 +980,10 @@ export class ToolPolicySession {
         };
       });
       const prepared = immutableRound({
-        schemaVersion: "dolly.tool-round/2",
+        schemaVersion: "dolly.tool-round/3",
         moduleJobId: this.#moduleJobId,
+        registryDigest: this.registryDigest,
+        approvalPolicyRevision: this.#approvalPolicyRevision,
         roundIndex: input.roundIndex,
         roundDigest,
         state: "reserved",

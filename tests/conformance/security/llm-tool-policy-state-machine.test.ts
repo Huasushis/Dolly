@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
 import {
   InMemoryToolJournalRepository,
   ToolPolicyError,
@@ -122,20 +123,41 @@ function session(options: {
 }
 
 describe("SEC-003 LLM tool policy state machine", () => {
-  it("rejects tool round version 1 and the processingId field", () => {
+  it("rejects old tool-round versions and the processingId field", () => {
     const repository = new InMemoryToolJournalRepository();
+    const effect = {
+      wireName: "read_note",
+      effectSlot: "round-1-call-1",
+      argumentDigest: canonicalJsonDigest({ key: "note" }),
+      toolId: "notes.read",
+      arguments: { key: "note" },
+      providerCallId: "call-1",
+      status: "reserved" as const,
+    };
     const current: ToolRoundJournalRecord = {
-      schemaVersion: "dolly.tool-round/2",
+      schemaVersion: "dolly.tool-round/3",
       moduleJobId: "module-job-1",
+      registryDigest: `sha256:${"2".repeat(64)}`,
+      approvalPolicyRevision: "policy-1",
       roundIndex: 1,
-      roundDigest: `sha256:${"1".repeat(64)}`,
+      roundDigest: canonicalJsonDigest([{
+        wireName: effect.wireName,
+        argumentDigest: effect.argumentDigest,
+        effectSlot: effect.effectSlot,
+      }]),
       state: "reserved",
       revision: 1,
-      effects: [],
+      effects: [effect],
     };
     expect(() => repository.reserveRound({
       ...current,
       schemaVersion: "dolly.tool-round/1",
+    } as unknown as ToolRoundJournalRecord)).toThrowError(
+      expect.objectContaining<Partial<ToolPolicyError>>({ code: "TOOL_ROUND_INVALID" }),
+    );
+    expect(() => repository.reserveRound({
+      ...current,
+      schemaVersion: "dolly.tool-round/2",
     } as unknown as ToolRoundJournalRecord)).toThrowError(
       expect.objectContaining<Partial<ToolPolicyError>>({ code: "TOOL_ROUND_INVALID" }),
     );

@@ -349,14 +349,23 @@ may change the `runId`, and MUST reuse the same binding and digest. Another
 Module job may resolve a different binding. A fixed-Run version 2 handle remains
 available for bounded tests and one-shot hosts.
 
-The current source has this versioned registry/capability boundary and the
-in-memory policy state machine, but no durable `ToolJournalRepository` product
-implementation or production Module composition. Consequently it does not yet
-support crash-safe effectful tools. The current chat request schema also cannot
-represent an assistant tool call followed by a typed tool-result unit, so a
-registry-derived, schema-checked JSON action is the honest interim Agent path;
-native provider function calling requires a separately versioned chat-round
-contract.
+The current source has this versioned registry/capability boundary and both an
+in-memory and a file-backed `ToolJournalRepository`. The file repository uses
+strict JSON, a finite byte limit, a cross-process mutation lock, same-directory
+atomic replacement, and owner-only file permissions on platforms that support
+POSIX modes. It can reopen a completed read-only round without executing the
+tool again. Tool arguments and successful results are local private state and
+therefore require the same retention, deletion, and access policy as the Module
+data they contain.
+
+There is still no production Module composition for this repository. More
+importantly, an effectful executor crash after crossing its external boundary
+but before recording the result still requires durable provider idempotency or
+an outcome query; the file repository alone does not make that effect safe to
+repeat. The current chat request schema also cannot represent an assistant tool
+call followed by a typed tool-result unit, so a registry-derived,
+schema-checked JSON action is the honest interim Agent path; native provider
+function calling requires a separately versioned chat-round contract.
 
 ### 8.2 Turn transitions
 
@@ -385,9 +394,12 @@ Effect idempotency uses `(moduleJobId, effectSlot)`. A provider call identifier 
 recorded for correlation but is not assumed stable after a provider retry. Lost
 responses are reconciled from the journal or the tool's outcome API; an unknown
 effect is never blindly repeated. The durable tool-round record uses
-`dolly.tool-round/2`; version 2 replaces the former Module job identity field,
-and readers MUST reject version 1 as `TOOL_ROUND_INVALID` rather than treating
-that field as an alias.
+`dolly.tool-round/3`. In addition to the exact Module job and deterministic
+effect slots, version 3 freezes the selected registry digest and approval policy
+revision. The original provider call identifier remains immutable inside the
+journal, while a replay may use a new provider call identifier solely to
+correlate the returned response. Readers MUST reject versions 1 and 2 as
+`TOOL_ROUND_INVALID`; they lack the complete current identity contract.
 
 Parallel calls are allowed only when the provider snapshot and every selected
 tool declare compatible parallel/effect semantics. Otherwise the extension uses
