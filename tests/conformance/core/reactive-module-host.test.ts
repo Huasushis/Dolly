@@ -181,7 +181,7 @@ describe("reactive Module host lifecycle", () => {
     ]);
   });
 
-  it("composes routes only from one validated reactive process Module configuration", () => {
+  it("composes routes only from one validated Delivery-backed process Module configuration", () => {
     const config = configuredInstance();
     const host = composeReactiveModuleHost(composition(config));
 
@@ -192,9 +192,13 @@ describe("reactive Module host lifecycle", () => {
       configuration: { ...config, schemaVersion: "dolly.instance/8" } as never,
     })).toThrow(/schemaVersion is unsupported/u);
 
-    expect(() => composeReactiveModuleHost(composition(configuredInstance({
+    expect(composeReactiveModuleHost(composition(configuredInstance({
       activation: { kind: "periodic", periodMs: 1000, allowEmptyInput: false },
-    })))).toThrow(/reactive activation/u);
+    })))).toBeInstanceOf(ReactiveModuleHost);
+
+    expect(() => composeReactiveModuleHost(composition(configuredInstance({
+      activation: { kind: "periodic", periodMs: 1000, allowEmptyInput: true },
+    })))).toThrow(/empty or source completion boundary/u);
 
     expect(() => composeReactiveModuleHost(composition(configuredInstance({
       isolation: "none",

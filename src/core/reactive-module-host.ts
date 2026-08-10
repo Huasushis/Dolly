@@ -32,6 +32,13 @@ export interface ReactiveModuleHostRegistration {
   readonly inputPageIds: readonly string[];
   readonly outputPageIds: readonly string[];
   readonly mailbox: SchedulerMailboxLimits;
+  readonly activation?:
+    | { readonly kind: "reactive" }
+    | {
+        readonly kind: "periodic";
+        readonly periodMs: number;
+        readonly allowEmptyInput: false;
+      };
 }
 
 /**
@@ -70,11 +77,13 @@ export interface ReactiveModuleHostComposition {
 }
 
 /**
- * Builds the product-before-startup reactive vertical slice from one validated
- * instance document. Page routes and the three released polling/retry values
- * come only from that document. The constraints absent from instance version 9
- * must be supplied explicitly and are checked against every Module's hard
- * Claim maxima before a runtime starts.
+ * Builds the product-before-startup Delivery-backed vertical slice from one
+ * validated instance document. It accepts reactive Modules and periodic
+ * Modules that forbid empty input; both use the same durable Claim boundary.
+ * Page routes and the three released polling/retry values come only from that
+ * document. The constraints absent from instance version 9 must be supplied
+ * explicitly and are checked against every Module's hard Claim maxima before a
+ * runtime starts.
  *
  * `openDollyRuntime` deliberately does not call this function. Linux process
  * ownership, durable external-effect evidence, and the next instance schema
@@ -113,9 +122,12 @@ export function composeReactiveModuleHost(
   }
 
   const hostRegistrations = configuration.modules.map((module) => {
-    if (module.activation.kind !== "reactive") {
+    if (
+      module.activation.kind === "source" ||
+      (module.activation.kind === "periodic" && module.activation.allowEmptyInput)
+    ) {
       throw new TypeError(
-        `Reactive Module composition requires reactive activation for Module ${module.moduleId}`,
+        `Reactive Module composition cannot provide an empty or source completion boundary for Module ${module.moduleId}`,
       );
     }
     if (module.isolation !== "process") {
@@ -140,12 +152,20 @@ export function composeReactiveModuleHost(
       );
     }
     const registration = registrations.get(module.moduleId)!;
+    const activation = module.activation.kind === "periodic"
+      ? {
+          kind: "periodic" as const,
+          periodMs: module.activation.periodMs,
+          allowEmptyInput: false as const,
+        }
+      : { kind: "reactive" as const };
     return {
       moduleId: module.moduleId,
       runtime: registration.runtime,
       inputPageIds: module.inputPageIds,
       outputPageIds: module.outputPageIds,
       mailbox: registration.mailbox,
+      activation,
     } satisfies ReactiveModuleHostRegistration;
   });
 
@@ -204,7 +224,6 @@ export class ReactiveModuleHost {
     for (const registration of this.#modules) {
       this.#scheduler.register({
         ...registration,
-        activation: { kind: "reactive" },
       });
     }
   }

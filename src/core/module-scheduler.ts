@@ -163,9 +163,14 @@ export interface SchedulerMailboxLimits {
   readonly maxPendingBytes: number;
 }
 
-export interface SchedulerActivationDescriptor {
-  readonly kind: "reactive" | "periodic" | "source";
-}
+export type SchedulerActivationDescriptor =
+  | { readonly kind: "reactive" }
+  | {
+      readonly kind: "periodic";
+      readonly periodMs: number;
+      readonly allowEmptyInput: boolean;
+    }
+  | { readonly kind: "source" };
 
 export interface SchedulerModuleRegistration {
   readonly moduleId: string;
@@ -258,6 +263,7 @@ export type SchedulerEvent =
       readonly reasonCode: string;
       readonly claimLimitCount: number;
       readonly claimLimitBytes: number;
+      readonly missedPeriods: number;
       readonly snapshot: SchedulerSnapshotSummary;
     })
   | (SchedulerModuleEventBase & {
@@ -332,6 +338,7 @@ export type SchedulerModuleState =
   | "eligible"
   | "running"
   | "backpressured"
+  | "period-wait"
   | "retry-backoff"
   | "quarantined";
 
@@ -348,12 +355,15 @@ export interface SchedulerModuleCounters {
   readonly backpressureRejected: number;
   readonly policyFailures: number;
   readonly invariantViolations: number;
+  readonly missedPeriods: number;
 }
 
 export interface SchedulerModuleStatus {
   readonly moduleId: string;
   readonly moduleGenerationId: string;
-  readonly activationMode: "reactive";
+  readonly activationMode: "reactive" | "periodic";
+  readonly periodMs: number | null;
+  readonly allowEmptyPeriodicInput: boolean | null;
   readonly schedulingState: SchedulerModuleState;
   readonly policyName: string | null;
   readonly policyVersion: string | null;
@@ -405,11 +415,9 @@ export interface SchedulerInstanceStatus {
  * Section 11.2 and OWNER-CORE-006: a period is start-to-start intent, so the
  * next eligibility is `S_n + P_n` and the wait is `max(0, E_(n+1) - now)`.
  *
- * Periodic activation is rejected by `register` until its completion boundary
- * exists (Section 11), but the formula is exported and tested now because it is
- * the one rule an owner requirement states exactly, and because an overrun must
- * be shown to produce a single immediate eligibility rather than a catch-up
- * burst of every missed period.
+ * The delivery-backed periodic slice uses this formula only when empty input is
+ * forbidden. Empty periodic and source activation remain rejected until their
+ * own Module job and completion boundaries exist.
  */
 export function periodicEligibility(input: {
   readonly lastRunStartedAt: number;
@@ -463,11 +471,13 @@ interface MutableCounters {
   backpressureRejected: number;
   policyFailures: number;
   invariantViolations: number;
+  missedPeriods: number;
 }
 
 interface ModuleEntry {
   readonly moduleId: string;
   readonly runtime: SchedulableModuleRuntime;
+  readonly activation: Exclude<SchedulerActivationDescriptor, { readonly kind: "source" }>;
   readonly inputPageIds: readonly string[];
   readonly outputPageIds: readonly string[];
   readonly maxPendingCount: number;
@@ -549,6 +559,7 @@ function newCounters(): MutableCounters {
     backpressureRejected: 0,
     policyFailures: 0,
     invariantViolations: 0,
+    missedPeriods: 0,
   };
 }
 
@@ -683,9 +694,9 @@ export class ModuleScheduler {
   }
 
   /**
-   * Registers a reactive Module runtime. Periodic and source activation are
-   * rejected: Section 11 states that the first runtime implements only reactive
-   * activation, and neither of the others has a completion boundary yet.
+   * Registers a Delivery-backed runtime. Reactive and non-empty periodic modes
+   * use the same Claim/commit boundary. Empty periodic and source modes remain
+   * rejected because they require a separately durable Module job trigger.
    */
   register(registration: SchedulerModuleRegistration): void {
     if (this.#state === "stopping" || this.#state === "stopped") {
@@ -703,24 +714,36 @@ export class ModuleScheduler {
         `Module ${registration.moduleId} is already registered`,
       );
     }
-    const activationMode = registration.activation?.kind ?? "reactive";
-    if (activationMode !== "reactive") {
+    const activation = registration.activation ?? { kind: "reactive" as const };
+    if (
+      activation.kind === "source" ||
+      (activation.kind === "periodic" && activation.allowEmptyInput)
+    ) {
       this.#emit({
         type: "scheduler.activation_rejected",
         instanceId: this.#instanceId,
         monotonicAt: this.#clock.monotonicNow(),
         moduleId: registration.moduleId,
-        activationMode,
+        activationMode: activation.kind,
       });
       throw new ModuleSchedulerError(
         "SCHEDULER_ACTIVATION_UNSUPPORTED",
-        `${activationMode} activation has no completion boundary and is rejected`,
+        `${activation.kind} activation requires an unsupported empty or source completion boundary`,
       );
+    }
+    if (activation.kind === "periodic") {
+      assertTimerDelay(activation.periodMs, "activation.periodMs");
+      if (typeof activation.allowEmptyInput !== "boolean") {
+        throw new ModuleSchedulerError(
+          "SCHEDULER_CONFIGURATION_INVALID",
+          "Periodic activation requires an explicit allowEmptyInput boolean",
+        );
+      }
     }
     if (registration.inputPageIds.length === 0) {
       throw new ModuleSchedulerError(
         "SCHEDULER_CONFIGURATION_INVALID",
-        "A reactive Module must consume at least one input Page",
+        "A Delivery-backed Module must consume at least one input Page",
       );
     }
     assertPositiveInteger(registration.mailbox.maxPendingCount, "mailbox.maxPendingCount");
@@ -735,6 +758,7 @@ export class ModuleScheduler {
     this.#entries.set(registration.moduleId, {
       moduleId: registration.moduleId,
       runtime: registration.runtime,
+      activation,
       inputPageIds: [...registration.inputPageIds],
       outputPageIds: [...registration.outputPageIds],
       maxPendingCount: registration.mailbox.maxPendingCount,
@@ -1055,7 +1079,7 @@ export class ModuleScheduler {
     return deepFreeze({
       moduleId: entry.moduleId,
       moduleGenerationId: entry.runtime.moduleGenerationId,
-      activationMode: "reactive" as const,
+      activationMode: entry.activation.kind,
       monotonicNow: now,
       actorBusy: entry.inFlight !== null,
       pendingCount: entry.pending.pendingCount,
@@ -1069,6 +1093,12 @@ export class ModuleScheduler {
       ...(entry.lastRunServiceTimeMs === null
         ? {}
         : { lastRunServiceTimeMs: entry.lastRunServiceTimeMs }),
+      ...(entry.activation.kind === "periodic"
+        ? {
+            periodMs: entry.activation.periodMs,
+            allowEmptyPeriodicInput: entry.activation.allowEmptyInput,
+          }
+        : {}),
       downstream: this.#downstreamPressure(entry),
     });
   }
@@ -1220,7 +1250,9 @@ export class ModuleScheduler {
       !Number.isSafeInteger(decision.claimLimitCount) ||
       decision.claimLimitCount <= 0 ||
       !Number.isSafeInteger(decision.claimLimitBytes) ||
-      decision.claimLimitBytes <= 0
+      decision.claimLimitBytes <= 0 ||
+      (decision.missedPeriods !== undefined &&
+        (!Number.isSafeInteger(decision.missedPeriods) || decision.missedPeriods < 0))
     ) {
       throw new TypeError("Scheduler policy returned an invalid decision");
     }
@@ -1275,6 +1307,8 @@ export class ModuleScheduler {
     now: number,
   ): void {
     entry.counters.dispatched += 1;
+    const missedPeriods = decision.missedPeriods ?? 0;
+    entry.counters.missedPeriods += missedPeriods;
     entry.lastRunStartedAt = now;
     entry.dispatchPending = entry.pending;
     entry.dispatchClaimLimitCount = decision.claimLimitCount;
@@ -1286,6 +1320,7 @@ export class ModuleScheduler {
       reasonCode: decision.reasonCode,
       claimLimitCount: decision.claimLimitCount,
       claimLimitBytes: decision.claimLimitBytes,
+      missedPeriods,
       snapshot: this.#summarize(snapshot),
     });
 
@@ -1521,8 +1556,16 @@ export class ModuleScheduler {
   #detectNoProgress(entries: readonly ModuleEntry[], now: number): void {
     const lastProgressAt = this.#lastProgressAt ?? now;
     const stalledForMs = now - lastProgressAt;
-    const workWaiting = entries.some(
-      (entry) => entry.pending.pendingCount > 0 && entry.quarantineReason === null,
+    const workWaiting = entries.some((entry) =>
+      entry.pending.pendingCount > 0 &&
+      entry.quarantineReason === null &&
+      !(
+        entry.activation.kind === "periodic" &&
+        !entry.backpressured &&
+        entry.retryCount === 0 &&
+        entry.nextEligibleAt !== null &&
+        entry.nextEligibleAt > now
+      )
     );
     if (this.#activeCount > 0 || !workWaiting || stalledForMs < this.#noProgressAfterMs) {
       return;
@@ -1585,13 +1628,20 @@ export class ModuleScheduler {
             ? "backpressured"
             : entry.retryCount > 0 && entry.nextEligibleAt !== null && now < entry.nextEligibleAt
               ? "retry-backoff"
+              : entry.activation.kind === "periodic" &&
+                  entry.nextEligibleAt !== null &&
+                  now < entry.nextEligibleAt
+                ? "period-wait"
               : entry.pending.pendingCount > 0
                 ? "eligible"
                 : "idle";
     return deepFreeze({
       moduleId: entry.moduleId,
       moduleGenerationId: entry.runtime.moduleGenerationId,
-      activationMode: "reactive" as const,
+      activationMode: entry.activation.kind,
+      periodMs: entry.activation.kind === "periodic" ? entry.activation.periodMs : null,
+      allowEmptyPeriodicInput:
+        entry.activation.kind === "periodic" ? entry.activation.allowEmptyInput : null,
       schedulingState,
       policyName: entry.lastPolicyName,
       policyVersion: entry.lastPolicyVersion,

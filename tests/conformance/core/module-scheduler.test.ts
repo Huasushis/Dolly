@@ -1319,22 +1319,91 @@ describe("CORE scheduler stop", () => {
 });
 
 describe("CORE scheduler activation modes", () => {
-  it("rejects periodic and source activation while their completion boundary is unimplemented", () => {
+  it("rejects empty periodic and source activation while their completion boundaries are unimplemented", () => {
     const { scheduler, events } = createScheduler();
-    for (const kind of ["periodic", "source"] as const) {
-      expect(() =>
-        scheduler.register({
-          moduleId: `module-${kind}`,
-          runtime: new FakeModuleRuntime(),
-          inputPageIds: ["input"],
-          outputPageIds: [],
-          mailbox: { maxPendingCount: 1, maxPendingBytes: 1 },
-          activation: { kind },
-        }),
-      ).toThrowError(expect.objectContaining({ code: "SCHEDULER_ACTIVATION_UNSUPPORTED" }));
-    }
+    expect(() => scheduler.register({
+      moduleId: "module-periodic-empty",
+      runtime: new FakeModuleRuntime(),
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxPendingCount: 1, maxPendingBytes: 1 },
+      activation: { kind: "periodic", periodMs: 100, allowEmptyInput: true },
+    })).toThrowError(expect.objectContaining({ code: "SCHEDULER_ACTIVATION_UNSUPPORTED" }));
+    expect(() => scheduler.register({
+      moduleId: "module-source",
+      runtime: new FakeModuleRuntime(),
+      inputPageIds: [],
+      outputPageIds: [],
+      mailbox: { maxPendingCount: 1, maxPendingBytes: 1 },
+      activation: { kind: "source" },
+    })).toThrowError(expect.objectContaining({ code: "SCHEDULER_ACTIVATION_UNSUPPORTED" }));
     expect(events.filter((event) => event.type === "scheduler.activation_rejected")).toHaveLength(2);
-    expect(() => scheduler.status("module-periodic")).toThrowError(ModuleSchedulerError);
+  });
+
+  it("drives non-empty periodic input start-to-start and never before its period", async () => {
+    const { clock, mailboxes, scheduler } = createScheduler();
+    const runtime = new FakeModuleRuntime();
+    mailboxes.set("periodic", 1, 10);
+    scheduler.register({
+      moduleId: "periodic",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxPendingCount: 10, maxPendingBytes: 1_000 },
+      activation: { kind: "periodic", periodMs: 2_000, allowEmptyInput: false },
+    });
+    scheduler.start();
+    await drain(clock);
+    expect(runtime.tickCount).toBe(1);
+
+    runtime.settle(committedResult(1));
+    await drain(clock);
+    await advance(clock, 1_500);
+    expect(runtime.tickCount).toBe(1);
+    expect(scheduler.instanceStatus().noProgressActive).toBe(false);
+
+    await advance(clock, 500);
+    expect(runtime.tickCount).toBe(2);
+    expect(runtime.maxConcurrent).toBe(1);
+    expect(scheduler.status("periodic")).toMatchObject({
+      activationMode: "periodic",
+      periodMs: 2_000,
+      allowEmptyPeriodicInput: false,
+    });
+    runtime.settle({ status: "idle" });
+    await drain(clock);
+    await scheduler.stop();
+  });
+
+  it("counts an overrun once and does not launch a missed-period catch-up burst", async () => {
+    const { clock, mailboxes, scheduler } = createScheduler();
+    const runtime = new FakeModuleRuntime();
+    mailboxes.set("periodic", 1, 10);
+    scheduler.register({
+      moduleId: "periodic",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxPendingCount: 10, maxPendingBytes: 1_000 },
+      activation: { kind: "periodic", periodMs: 100, allowEmptyInput: false },
+    });
+    scheduler.start();
+    await drain(clock);
+    expect(runtime.tickCount).toBe(1);
+
+    await advance(clock, 350);
+    expect(runtime.tickCount).toBe(1);
+    runtime.settle(committedResult(1));
+    await drain(clock);
+
+    expect(runtime.tickCount).toBe(2);
+    expect(runtime.maxConcurrent).toBe(1);
+    expect(scheduler.status("periodic").counters.missedPeriods).toBe(2);
+    await advance(clock, 500);
+    expect(runtime.tickCount).toBe(2);
+    runtime.settle({ status: "idle" });
+    await drain(clock);
+    await scheduler.stop();
   });
 
   it("computes start-to-start periodic timing from the monotonic clock (OWNER-CORE-006)", () => {

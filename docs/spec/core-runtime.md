@@ -1785,9 +1785,13 @@ reverse ownership order.
 Every Module MUST declare one primary activation mode. A future accepted Extension process protocol
 may define explicit combinations, but implicit hybrid behavior is forbidden.
 
-The first runtime implements only reactive activation. Periodic and source
-activation below are future contract requirements and MUST be rejected until
-their scheduler and completion boundaries are implemented and tested.
+The product bootstrap still rejects all configured Modules. The guarded
+pre-bootstrap composition implements reactive activation and one narrow
+delivery-backed periodic slice: a periodic Module with input Pages and
+`allowEmptyInput: false` uses the same durable Claim and result-commit boundary
+as a reactive Module. Empty periodic runs and all source activation remain
+future contract requirements and MUST be rejected until their Module job and
+completion boundaries are implemented and tested.
 
 ### 11.1 Reactive mode
 
@@ -1802,6 +1806,12 @@ Reactive mode is the recommended default for transformation and sink Modules.
 A periodic Module becomes eligible according to a configured target period. At
 eligibility it claims currently pending input. Configuration MUST state whether
 an empty-input run is allowed.
+
+The current pre-bootstrap slice permits only `allowEmptyInput: false`. Its first
+run becomes eligible when pending input is first observed. Every later
+eligibility is start-to-start as defined below. Waiting for a declared future
+period is not reported as no progress. Empty-input periodic execution needs a
+durable trigger identity independent of a Delivery Claim and remains rejected.
 
 The target period is defined as the desired interval between run **start
 times**, not the delay after a run finishes.
@@ -1969,11 +1979,13 @@ the policy MUST define damping, stability limits, and no-progress detection.
 
 ### 13.3 Baseline policy
 
-The first runtime uses a simple fixed policy:
+The guarded pre-bootstrap composition uses a simple fixed policy:
 
 - reactive Modules run when data is pending and the actor is idle;
-- periodic and source Modules are rejected until their later scheduler and
-  completion contracts are implemented;
+- non-empty periodic Modules run at most once per start-to-start period when
+  input is pending; missed periods are counted and never replayed as a burst;
+- empty periodic and source Modules are rejected until their later Module job
+  and completion contracts are implemented;
 - bounded queues apply deterministic backpressure;
 - retries use bounded exponential backoff with documented limits.
 
