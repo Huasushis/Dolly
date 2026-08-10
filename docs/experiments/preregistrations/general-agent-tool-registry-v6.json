@@ -431,7 +431,7 @@
   "domainDesign": {
     "implementationStatus": "Candidate integration only: real Core components and a real isolated child are assembled outside product bootstrap; product Module startup stays rejected. Registry-v7 combines strict SSE model calls, separate text planning, strict JSON actions, persistent read-only tool rounds, Host-owned exact-Run capability-effect evidence, and key-order-independent JSON-value verification.",
     "implementationFiles": {
-      "scripts/experiments/probes/general-agent-live-v0/run.mts": "136c5c18810c0c283b2e4e680320e192e8715562e26deced042a11ef1c493300",
+      "scripts/experiments/probes/general-agent-live-v0/run.mts": "90077d2093069dd91694f21c55fa3a7722222020ec2c64dbef886d95ea14c75f",
       "scripts/experiments/probes/general-agent-live-v0/extension.mjs": "153db4a73536ed8827b73123ffff7f6ea8fd1950638f4a8f0e261d60a314520a",
       "scripts/experiments/probes/general-agent-live-v0/verify-tool-registry.mjs": "1c0e212b950c56236994f8cbd3fa8d8d570e54a9f759ff6fb4f014172bb6180f"
     },
@@ -605,24 +605,24 @@
       "exactRunEffectJournal": true
     },
     "productionSourceFiles": {
-      "src/adapters/extension-effect-run-lifecycle.ts": "60cbab4e1968fedab658aeea5fd5a0fe1110a494842f9f0e2975898660ef3127",
+      "src/adapters/extension-effect-run-lifecycle.ts": "a5ee556cbfd3fe94ba849bdd3bd7df732e2a97fa1cd70bb062541e3db4599bb4",
       "src/adapters/extension-process-module-executor.ts": "3b86baf577ac568348cd84bd0cc4b29f7082969ae9263b66ad52429424d846be",
-      "src/core/capabilities/effect-intent-journal.ts": "09399323b661b327a69cc419f6ca21abfdf2dc3eecdbd020e6391d8c4c63a9e2",
-      "src/core/capabilities/file-effect-intent-store.ts": "33291636b4f81670179e82907a2ec088bc21967033e4288e46386440813ea1ec",
+      "src/core/capabilities/effect-intent-journal.ts": "c3f3b678dfe619d2ec26dafaaf028cf6a13f9aa4ea555a606781d7fa093166c1",
+      "src/core/capabilities/file-effect-intent-store.ts": "b9496e1ffcb259a72913f083d046f75034b1b8cd6e77c510fa1807da60cb1424",
       "src/core/delivery-store.ts": "eca73a86e20d1453eeb2a65580234070eb15bb97cb267744ede21bad18858468",
       "src/core/extension-process-host.ts": "84e7aa57ad5772c6af4c7054cd2b8a52118236d8912d489684e8aed1caf48722",
-      "src/core/file-core-state-store.ts": "04c9052981cc363dd929ebe037fb904b1d7e884968c6b50d9295f3596f08d30a",
+      "src/core/file-core-state-store.ts": "35fffea87a7ddcb9a1cc2383a2210218119f723b2540ba2ee77598d809a40be1",
       "src/core/file-tool-journal-repository.ts": "e0e5392235e06c9ed3797e8c5f10d304d8354af3c505274bc462a6675454d5ec",
       "src/core/model-provider-broker.ts": "a5882e49548321a8f547fb6d2c74e4189c9296ce29eed7120091d566064e0fbe",
       "src/core/model-provider-chat.ts": "4010715b9d5606ab4b26c5b67626db78440fe14e6403ab062ad2394478b4d010",
       "src/core/model-provider-descriptor.ts": "710d640db6c52d2f29f5a846a3312279da7d33d09f33c9838d80bb1762e4e42e",
       "src/core/module-result-commit-factory.ts": "a2a824bbf724235ea5658c9188784490fc4fc7c1606b45571de143bb0bc5cd39",
       "src/core/module-result-commit.ts": "918acb2c97ac04a1b00fc41f2ddec979647115e0d5ca3dfd6691d5007f25c301",
-      "src/core/module-scheduler.ts": "ced3f896b9efc7ff741daf0fffa5874d3c764f9c574d8215b0a2c9e322ca1403",
-      "src/core/provider-capabilities/model-operation-capability.ts": "77ef498dd667ed9d0d3e285a1513dadc7129e5c131f791cd47c860bdc70ad854",
+      "src/core/module-scheduler.ts": "4b437b1f72943687b9fdf26e0923b8be6e575563f5f2add62f5a277d36de8706",
+      "src/core/provider-capabilities/model-operation-capability.ts": "5f9da36b3c90cc88d0cd77f5d1fd2d6f5e95c0585e5a5f46a6b68203a675894e",
       "src/core/provider-capabilities/tool-invocation-capability.ts": "832345f2c8834269d2ae18a8277ea36db084910c6e18277ebd609901bce4c002",
-      "src/core/reactive-module-host.ts": "ea87ae7f4d2a323a685f21f04bdd2315908eebaae7394c0af5300a207767192e",
-      "src/core/reactive-module-runtime.ts": "cbb6ac34e29a83375f971d01d79e9aee670f7eda7b01cbb050717ad160fe257b",
+      "src/core/reactive-module-host.ts": "536c283994bb74f858ec6631138ca8a0c7f548ba325fb7cc22f81c3b5e7718c1",
+      "src/core/reactive-module-runtime.ts": "31d3fe366aae79be8662c8fe8da9c4090a4810046c92b41fcafa943b09bf8b99",
       "src/core/runtime-bootstrap.ts": "bb8a47b20a65664011fdeb459b4f2d4a11a506c66d19e1ba0d46a32cdf14afaf",
       "src/core/tool-policy.ts": "60d3d00ec93c28c402920fe4c0f0ad3e699d7a5b231a8b3d8a40b10674666d58"
     },
