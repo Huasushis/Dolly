@@ -61,6 +61,7 @@ const EXPECTED_MUTATION_IDS = [
   "provider-row-missing",
   "case-row-missing",
   "artifact-digest-missing",
+  "effect-outcome-unknown",
   "reasoning-evidence-missing",
   "scheduler-completion-false",
   "child-stop-false",
@@ -658,6 +659,7 @@ function verifyNoPrivateFields(value, location) {
 }
 
 function verifyNoPrivateLeak(runDirectory, fixtureValues) {
+  const manifest = json(join(runDirectory, "run-manifest.json"));
   const names = [
     "preregistration.json",
     "provider-responses.jsonl",
@@ -665,6 +667,9 @@ function verifyNoPrivateLeak(runDirectory, fixtureValues) {
     "cases.jsonl",
     "analysis.json",
     "run-manifest.json",
+    ...Object.keys(manifest.artifacts ?? {}).filter((name) =>
+      name.startsWith("effect-intents-") && name.endsWith(".json")
+    ),
   ];
   for (const name of names) {
     const bytes = readFileSync(join(runDirectory, name));
@@ -823,6 +828,28 @@ function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
         const manifestPath = join(runDirectory, "run-manifest.json");
         const manifest = json(manifestPath);
         delete manifest.artifacts["cases.jsonl"];
+        writeJson(manifestPath, manifest);
+      },
+    },
+    {
+      id: "effect-outcome-unknown",
+      apply(runDirectory) {
+        const name = "effect-intents-tool-registry-storage-seed-7425.json";
+        const path = join(runDirectory, name);
+        const document = json(path);
+        document.records[0].outcome = {
+          kind: "unknown",
+          reason: "mutation leaves the effect unsettled",
+        };
+        writeJson(path, document);
+        const digest = sha256(readFileSync(path));
+        const rows = jsonLines(join(runDirectory, "cases.jsonl"));
+        rows[1].effectJournal.sha256 = digest;
+        writeJsonLines(join(runDirectory, "cases.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["cases.jsonl"]);
+        const manifestPath = join(runDirectory, "run-manifest.json");
+        const manifest = json(manifestPath);
+        manifest.artifacts[name] = digest;
         writeJson(manifestPath, manifest);
       },
     },
