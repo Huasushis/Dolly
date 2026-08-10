@@ -11,13 +11,11 @@ import {
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
-import {
-  ModuleScheduler,
-  systemSchedulerClock,
-} from "../../../src/core/module-scheduler.js";
+import { systemSchedulerClock } from "../../../src/core/module-scheduler.js";
 import { createModuleResultCommitCoordinator } from "../../../src/core/module-result-commit-factory.js";
 import {
-  ReactiveModuleHost,
+  composeReactiveModuleHost,
+  type ReactiveModuleHost,
   type ManagedReactiveModuleRuntime,
 } from "../../../src/core/reactive-module-host.js";
 import {
@@ -25,8 +23,13 @@ import {
   type ReactiveModuleFailure,
   type ReactiveModuleRuntimeOptions,
 } from "../../../src/core/reactive-module-runtime.js";
+import {
+  createDefaultDollyInstanceConfig,
+  validateDollyInstanceConfig,
+} from "../../../src/core/runtime-config.js";
 
 const NOW = "2026-08-09T00:00:00.000Z";
+const INSTANCE_ID = "11111111-1111-4111-8111-111111111111";
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const scratchParent = resolve(repositoryRoot, "..", ".tmp");
 const FIXTURE = fileURLToPath(
@@ -76,9 +79,53 @@ describe("reactive Module host with a real child process", () => {
       core.deliveries.createPage("output");
       core.deliveries.registerConsumer("input", "worker", "from-now");
       core.deliveries.registerConsumer("output", "sink", "from-now");
+      const defaults = createDefaultDollyInstanceConfig(INSTANCE_ID);
+      const configuration = validateDollyInstanceConfig({
+        ...defaults,
+        core: {
+          ...defaults.core,
+          scheduler: {
+            pollIntervalMs: 100,
+            retryBaseMs: 25,
+            retryMaxMs: 250,
+          },
+        },
+        pages: [{ pageId: "input" }, { pageId: "output" }],
+        modules: [{
+          moduleId: "worker",
+          extensionId: "com.example.fixture",
+          packageVersion: "1.0.0",
+          moduleKind: "fixture",
+          isolation: "process",
+          configurationReference: {
+            configId: "config-host-real",
+            revision: `sha256:${"b".repeat(64)}`,
+            configVersion: 1,
+          },
+          permissionPolicyIds: [],
+          inputPageIds: ["input"],
+          outputPageIds: ["output"],
+          subscriptionStart: "from-now",
+          activation: { kind: "reactive" },
+          limits: {
+            claim: { maxCount: 1, maxBytes: 64 * 1024 },
+            maxInputBytes: 64 * 1024,
+            maxResultBytes: 64 * 1024,
+            maxFrameBytes: 128 * 1024,
+            maxRunsPerGeneration: 10,
+            maxGenerations: 2,
+          },
+          timeouts: {
+            initializationTimeoutMs: 3_000,
+            executionTimeoutMs: 10_000,
+            cancellationGraceMs: 1_000,
+            terminationTimeoutMs: 3_000,
+          },
+        }],
+      });
       core.appendModuleProcessRecord({
         schemaVersion: "dolly.module-process-record/1",
-        instanceId: "instance-host-real",
+        instanceId: INSTANCE_ID,
         moduleId: "worker",
         moduleGenerationId,
         processGenerationId,
@@ -94,7 +141,7 @@ describe("reactive Module host with a real child process", () => {
         moduleCgroupPath: deriveModuleCgroupPath(
           "/system.slice/dolly-core.service",
           {
-            instanceId: "instance-host-real",
+            instanceId: INSTANCE_ID,
             moduleId: "worker",
             processGenerationId,
           },
@@ -182,7 +229,7 @@ describe("reactive Module host with a real child process", () => {
             command: process.execPath,
             args: [FIXTURE, "module-result-then-cancel"],
             workingDirectory: root,
-            instanceId: "instance-host-real",
+            instanceId: INSTANCE_ID,
             moduleId: "worker",
             moduleGenerationId: generationId,
             moduleKind: "fixture",
@@ -223,28 +270,26 @@ describe("reactive Module host with a real child process", () => {
           await runtime.stop();
         },
       };
-      const scheduler = new ModuleScheduler({
-        instanceId: "instance-host-real",
+      host = composeReactiveModuleHost({
+        configuration,
         deliveries: core.deliveries,
         clock: systemSchedulerClock(),
-        pollIntervalMs: 100,
-        retryBaseMs: 25,
-        retryMaxMs: 250,
-        maxConcurrentModules: 1,
-        backpressureAction: "pause-upstream",
-        downstreamRecheckMs: 100,
-        noProgressAfterMs: 5_000,
-        claimLimitCount: 1,
-        claimLimitBytes: 64 * 1024,
-        retryJitterRatio: 0,
+        scheduling: {
+          maxConcurrentModules: 1,
+          backpressureAction: "pause-upstream",
+          downstreamRecheckMs: 100,
+          noProgressAfterMs: 5_000,
+          claimLimitCount: 1,
+          claimLimitBytes: 64 * 1024,
+          retryJitterRatio: 0,
+          lowWatermarkRatio: 1,
+        },
+        registrations: [{
+          moduleId: "worker",
+          runtime: managedRuntime,
+          mailbox: { maxPendingCount: 10, maxPendingBytes: 1024 * 1024 },
+        }],
       });
-      host = new ReactiveModuleHost(scheduler, [{
-        moduleId: "worker",
-        runtime: managedRuntime,
-        inputPageIds: ["input"],
-        outputPageIds: ["output"],
-        mailbox: { maxPendingCount: 10, maxPendingBytes: 1024 * 1024 },
-      }]);
 
       await host.start();
       childPid = extensionHosts[0]?.snapshot.pid;

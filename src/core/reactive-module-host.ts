@@ -1,8 +1,17 @@
+import type { JsonValue } from "./canonical-json.js";
 import {
   ModuleScheduler,
+  type SchedulerBackpressureAction,
+  type SchedulerClock,
+  type SchedulerEvent,
   type SchedulerMailboxLimits,
+  type SchedulerPendingReader,
   type SchedulableModuleRuntime,
 } from "./module-scheduler.js";
+import {
+  validateDollyInstanceConfig,
+  type DollyInstanceConfig,
+} from "./runtime-config.js";
 
 export type ReactiveModuleHostState =
   | "created"
@@ -23,6 +32,135 @@ export interface ReactiveModuleHostRegistration {
   readonly inputPageIds: readonly string[];
   readonly outputPageIds: readonly string[];
   readonly mailbox: SchedulerMailboxLimits;
+}
+
+/**
+ * Scheduler constraints that `dolly.instance/9` cannot yet persist. They stay
+ * explicit at this candidate composition boundary instead of being hidden as
+ * demo constants or silently added to the closed product schema.
+ */
+export interface ReactiveModuleSchedulingConstraints {
+  readonly maxConcurrentModules: number;
+  readonly backpressureAction: SchedulerBackpressureAction;
+  readonly downstreamRecheckMs: number;
+  readonly noProgressAfterMs: number;
+  readonly claimLimitCount: number;
+  readonly claimLimitBytes: number;
+  readonly retryJitterRatio: number;
+  readonly lowWatermarkRatio: number;
+}
+
+export interface ReactiveModuleHostRuntimeRegistration {
+  readonly moduleId: string;
+  readonly runtime: ManagedReactiveModuleRuntime;
+  readonly mailbox: SchedulerMailboxLimits;
+}
+
+export interface ReactiveModuleHostComposition {
+  /** The complete document is validated again; a structural cast is not trusted. */
+  readonly configuration: Readonly<DollyInstanceConfig>;
+  readonly deliveries: SchedulerPendingReader;
+  readonly clock: SchedulerClock;
+  readonly scheduling: ReactiveModuleSchedulingConstraints;
+  readonly registrations: readonly ReactiveModuleHostRuntimeRegistration[];
+  /** Test/host injection only; it is not Extension-controlled configuration. */
+  readonly random?: () => number;
+  /** Structured observation only; it cannot influence Scheduler decisions. */
+  readonly onSchedulerEvent?: (event: SchedulerEvent) => void;
+}
+
+/**
+ * Builds the product-before-startup reactive vertical slice from one validated
+ * instance document. Page routes and the three released polling/retry values
+ * come only from that document. The constraints absent from instance version 9
+ * must be supplied explicitly and are checked against every Module's hard
+ * Claim maxima before a runtime starts.
+ *
+ * `openDollyRuntime` deliberately does not call this function. Linux process
+ * ownership, durable external-effect evidence, and the next instance schema
+ * remain prerequisites for removing the product startup refusal.
+ */
+export function composeReactiveModuleHost(
+  input: ReactiveModuleHostComposition,
+): ReactiveModuleHost {
+  const configuration = validateDollyInstanceConfig(
+    input.configuration as unknown as JsonValue,
+  );
+  const registrations = new Map<string, ReactiveModuleHostRuntimeRegistration>();
+  for (const registration of input.registrations) {
+    if (registrations.has(registration.moduleId)) {
+      throw new TypeError(
+        `Reactive Module composition has duplicate runtime registration ${registration.moduleId}`,
+      );
+    }
+    registrations.set(registration.moduleId, registration);
+  }
+
+  const configuredIds = new Set(configuration.modules.map((module) => module.moduleId));
+  const missing = configuration.modules
+    .map((module) => module.moduleId)
+    .filter((moduleId) => !registrations.has(moduleId));
+  if (missing.length > 0) {
+    throw new TypeError(
+      `Reactive Module composition is missing runtime registrations: ${missing.sort().join(", ")}`,
+    );
+  }
+  const unknown = [...registrations.keys()].filter((moduleId) => !configuredIds.has(moduleId));
+  if (unknown.length > 0) {
+    throw new TypeError(
+      `Reactive Module composition has unknown runtime registrations: ${unknown.sort().join(", ")}`,
+    );
+  }
+
+  const hostRegistrations = configuration.modules.map((module) => {
+    if (module.activation.kind !== "reactive") {
+      throw new TypeError(
+        `Reactive Module composition requires reactive activation for Module ${module.moduleId}`,
+      );
+    }
+    if (module.isolation !== "process") {
+      throw new TypeError(
+        `Reactive Module composition requires process isolation for Module ${module.moduleId}`,
+      );
+    }
+    const claim = module.limits.claim;
+    if (claim === null) {
+      throw new TypeError(
+        `Reactive Module composition requires Claim limits for Module ${module.moduleId}`,
+      );
+    }
+    if (input.scheduling.claimLimitCount > claim.maxCount) {
+      throw new TypeError(
+        `Scheduler claimLimitCount ${input.scheduling.claimLimitCount} exceeds Module ${module.moduleId} maximum ${claim.maxCount}`,
+      );
+    }
+    if (input.scheduling.claimLimitBytes > claim.maxBytes) {
+      throw new TypeError(
+        `Scheduler claimLimitBytes ${input.scheduling.claimLimitBytes} exceeds Module ${module.moduleId} maximum ${claim.maxBytes}`,
+      );
+    }
+    const registration = registrations.get(module.moduleId)!;
+    return {
+      moduleId: module.moduleId,
+      runtime: registration.runtime,
+      inputPageIds: module.inputPageIds,
+      outputPageIds: module.outputPageIds,
+      mailbox: registration.mailbox,
+    } satisfies ReactiveModuleHostRegistration;
+  });
+
+  const scheduler = new ModuleScheduler({
+    instanceId: configuration.instanceId,
+    deliveries: input.deliveries,
+    clock: input.clock,
+    pollIntervalMs: configuration.core.scheduler.pollIntervalMs,
+    retryBaseMs: configuration.core.scheduler.retryBaseMs,
+    retryMaxMs: configuration.core.scheduler.retryMaxMs,
+    ...input.scheduling,
+    random: input.random,
+    onEvent: input.onSchedulerEvent,
+  });
+  return new ReactiveModuleHost(scheduler, hostRegistrations);
 }
 
 /**

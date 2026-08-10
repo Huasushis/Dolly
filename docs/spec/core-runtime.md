@@ -257,6 +257,17 @@ values are positive, finite milliseconds; `retryMaxMs` MUST be greater than or
 equal to `retryBaseMs`. These intervals affect scheduling only and MUST NOT
 weaken Module serialization, execution timeouts, or durable delivery recovery.
 
+Version 9 does not persist the remaining Scheduler correctness settings:
+instance-wide actor concurrency, downstream backpressure behavior and recheck
+interval, sustained-no-progress interval, baseline claim batch, retry jitter,
+low-watermark ratio, or per-consumer mailbox count and byte bounds. Code that
+constructs the product-before-startup reactive vertical slice must therefore
+receive those values through an explicit trusted input and must not invent
+defaults. They become product configuration only in a later closed instance
+schema that also resolves the Linux process and external-effect fields in
+Section 5.2. A test-only or candidate composition is not a migration of a
+version 9 document.
+
 `core.limits.maxModuleResultCommitJournalBytes` bounds the canonical bytes in
 the Module result commit repository. The name identifies the data whose journal
 is bounded; it is not a general Module job or Delivery-store size limit. The
@@ -383,6 +394,17 @@ Extension process and becomes invalid when that session ends.
 The current bootstrap validates this configuration but rejects every configured
 Module until the isolated Extension process runtime is connected. Parsing a
 Module does not imply that its execution path is available.
+
+`composeReactiveModuleHost` is the narrow candidate composition used before
+that product connection. It validates the complete version 9 document again,
+requires exactly one supplied runtime and mailbox record for every configured
+Module, accepts only reactive process-isolated Modules, takes Page routes only
+from the validated document, and rejects a Scheduler baseline claim batch above
+any Module's static Claim maximum. The Scheduler settings absent from version 9
+remain explicit trusted inputs. This function is not called by
+`openDollyRuntime`; its real-child-process test is evidence for the vertical
+slice only and does not satisfy Linux control-group ownership, durable external
+effect evidence, configuration resolution, or startup recovery.
 
 ### 5.2 Proposed Linux Module process limits
 

@@ -1,9 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
+import type { JsonValue } from "../../../src/core/canonical-json.js";
 import type { ReactiveModuleTickResult } from "../../../src/core/reactive-module-runtime.js";
 import {
+  composeReactiveModuleHost,
   ReactiveModuleHost,
   type ManagedReactiveModuleRuntime,
+  type ReactiveModuleHostComposition,
 } from "../../../src/core/reactive-module-host.js";
+import {
+  createDefaultDollyInstanceConfig,
+  validateDollyInstanceConfig,
+  type DollyInstanceConfig,
+} from "../../../src/core/runtime-config.js";
+
+const INSTANCE_ID = "11111111-1111-4111-8111-111111111111";
 
 function runtime(
   id: string,
@@ -46,6 +56,79 @@ function registration(id: string, managed: ManagedReactiveModuleRuntime) {
     inputPageIds: [`${id}-input`],
     outputPageIds: [`${id}-output`],
     mailbox: { maxPendingCount: 10, maxPendingBytes: 1024 },
+  };
+}
+
+function configuredInstance(
+  overrides: Readonly<Record<string, JsonValue>> = {},
+): DollyInstanceConfig {
+  const base = createDefaultDollyInstanceConfig(INSTANCE_ID);
+  return validateDollyInstanceConfig({
+    ...base,
+    pages: [{ pageId: "worker-input" }, { pageId: "worker-output" }],
+    modules: [{
+      moduleId: "worker",
+      extensionId: "org.example.worker",
+      packageVersion: "1.0.0",
+      moduleKind: "transform",
+      isolation: "process",
+      configurationReference: {
+        configId: "worker-default",
+        revision: `sha256:${"1".repeat(64)}`,
+        configVersion: 1,
+      },
+      permissionPolicyIds: [],
+      inputPageIds: ["worker-input"],
+      outputPageIds: ["worker-output"],
+      subscriptionStart: "from-now",
+      activation: { kind: "reactive" },
+      limits: {
+        claim: { maxCount: 4, maxBytes: 4096 },
+        maxInputBytes: 4096,
+        maxResultBytes: 4096,
+        maxFrameBytes: 8192,
+        maxRunsPerGeneration: 100,
+        maxGenerations: 10,
+      },
+      timeouts: {
+        initializationTimeoutMs: 1000,
+        executionTimeoutMs: 1000,
+        cancellationGraceMs: 100,
+        terminationTimeoutMs: 1000,
+      },
+      ...overrides,
+    }],
+  });
+}
+
+function composition(
+  config: DollyInstanceConfig,
+  managed = runtime("worker", []),
+): ReactiveModuleHostComposition {
+  return {
+    configuration: config,
+    deliveries: {
+      inspectPending: () => ({ pendingCount: 0, pendingBytes: 0 }),
+    },
+    clock: {
+      monotonicNow: () => 0,
+      schedule: () => ({ cancel: () => undefined }),
+    },
+    scheduling: {
+      maxConcurrentModules: 1,
+      backpressureAction: "pause-upstream",
+      downstreamRecheckMs: 100,
+      noProgressAfterMs: 5000,
+      claimLimitCount: 1,
+      claimLimitBytes: 1024,
+      retryJitterRatio: 0,
+      lowWatermarkRatio: 1,
+    },
+    registrations: [{
+      moduleId: "worker",
+      runtime: managed,
+      mailbox: { maxPendingCount: 10, maxPendingBytes: 8192 },
+    }],
   };
 }
 
@@ -96,5 +179,98 @@ describe("reactive Module host lifecycle", () => {
       "start:b",
       "stop:a",
     ]);
+  });
+
+  it("composes routes only from one validated reactive process Module configuration", () => {
+    const config = configuredInstance();
+    const host = composeReactiveModuleHost(composition(config));
+
+    expect(host).toBeInstanceOf(ReactiveModuleHost);
+
+    expect(() => composeReactiveModuleHost({
+      ...composition(config),
+      configuration: { ...config, schemaVersion: "dolly.instance/8" } as never,
+    })).toThrow(/schemaVersion is unsupported/u);
+
+    expect(() => composeReactiveModuleHost(composition(configuredInstance({
+      activation: { kind: "periodic", periodMs: 1000, allowEmptyInput: false },
+    })))).toThrow(/reactive activation/u);
+
+    expect(() => composeReactiveModuleHost(composition(configuredInstance({
+      isolation: "none",
+    })))).toThrow(/process isolation/u);
+  });
+
+  it("requires one exact runtime and mailbox registration per configured Module", () => {
+    const config = configuredInstance();
+    const input = composition(config);
+
+    expect(() => composeReactiveModuleHost({
+      ...input,
+      registrations: [],
+    })).toThrow(/missing runtime registrations: worker/u);
+
+    expect(() => composeReactiveModuleHost({
+      ...input,
+      registrations: [
+        ...input.registrations,
+        {
+          moduleId: "unexpected",
+          runtime: runtime("unexpected", []),
+          mailbox: { maxPendingCount: 1, maxPendingBytes: 256 },
+        },
+      ],
+    })).toThrow(/unknown runtime registrations: unexpected/u);
+  });
+
+  it("rejects a Scheduler batch that exceeds any Module claim maximum", () => {
+    const config = configuredInstance();
+    const input = composition(config);
+
+    expect(() => composeReactiveModuleHost({
+      ...input,
+      scheduling: { ...input.scheduling, claimLimitCount: 5 },
+    })).toThrow(/claimLimitCount 5 exceeds Module worker maximum 4/u);
+
+    expect(() => composeReactiveModuleHost({
+      ...input,
+      scheduling: { ...input.scheduling, claimLimitBytes: 4097 },
+    })).toThrow(/claimLimitBytes 4097 exceeds Module worker maximum 4096/u);
+  });
+
+  it("uses configured Page routes and passes the exact explicit batch to the runtime", async () => {
+    const config = configuredInstance();
+    const tick = vi.fn(async (): Promise<ReactiveModuleTickResult> => ({ status: "idle" }));
+    const managed: ManagedReactiveModuleRuntime = {
+      moduleGenerationId: "worker-generation",
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+      tick,
+    };
+    const inspectPending = vi.fn(() => ({ pendingCount: 1, pendingBytes: 64 }));
+    const scheduled: { delayMs: number; callback: () => void; cancelled: boolean }[] = [];
+    const input = composition(config, managed);
+    const host = composeReactiveModuleHost({
+      ...input,
+      deliveries: { inspectPending },
+      clock: {
+        monotonicNow: () => 10,
+        schedule: (delayMs, callback) => {
+          const timer = { delayMs, callback, cancelled: false };
+          scheduled.push(timer);
+          return { cancel: () => { timer.cancelled = true; } };
+        },
+      },
+    });
+
+    await host.start();
+    const immediate = scheduled.find((timer) => timer.delayMs === 0);
+    expect(immediate).toBeDefined();
+    immediate!.callback();
+    await vi.waitFor(() => expect(tick).toHaveBeenCalledTimes(1));
+
+    expect(inspectPending).toHaveBeenCalledWith("worker", ["worker-input"]);
+    expect(tick).toHaveBeenCalledWith({ claimLimitCount: 1, claimLimitBytes: 1024 });
+    await host.stop();
   });
 });
