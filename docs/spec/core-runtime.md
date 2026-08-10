@@ -1985,7 +1985,8 @@ able to inject a fake clock and deterministic random source.
 
 Every runtime configuration MUST set finite limits for:
 
-- pending delivery count and serialized bytes per consumer;
+- resident Delivery count and serialized bytes per consumer, where resident
+  means pending plus active Claims;
 - retained Page log count and bytes;
 - claim batch count and bytes;
 - pending source or manual activation requests per Module;
@@ -2045,10 +2046,14 @@ type DownstreamAvailability = "available" | "blocked" | "unknown";
 interface DownstreamPressure {
   moduleId: string;
   availability: DownstreamAvailability;
+  // Pending Deliveries remain eligible to be claimed.
   pendingCount: number;
   pendingBytes: number;
-  maxPendingCount: number;
-  maxPendingBytes: number;
+  // Resident Deliveries still occupy capacity: pending plus active Claims.
+  residentCount: number;
+  residentBytes: number;
+  maxResidentCount: number;
+  maxResidentBytes: number;
 }
 
 interface SchedulerSnapshot {
@@ -2099,11 +2104,15 @@ time is evidence of clock rollback or inconsistent storage and fails closed;
 the Scheduler does not hide it behind a zero-age clamp.
 
 **Downstream pressure** is the read-only count and byte report for one
-downstream Module in this snapshot. `available` means that the scheduler has
-confirmed capacity under its configured bounds, `blocked` means that it has
-confirmed no capacity, and `unknown` means that it cannot confirm either.
-This report is scheduler input only: it is not an authorization, capability,
-or control message.
+downstream Module in this snapshot. Pending count and bytes describe work still
+eligible to be claimed. Resident count and bytes describe occupied mailbox
+capacity and include both pending Deliveries and active Claims; claiming input
+MUST NOT manufacture free capacity. `available` means that the scheduler has
+confirmed capacity under its configured resident bounds, `blocked` means that
+it has confirmed no capacity, and `unknown` means that it cannot confirm
+either. This report is scheduler input only: it is not an authorization,
+capability, or control message. The output commit boundary remains the final
+atomic capacity authority because Scheduler observations can become stale.
 
 Snapshots MUST report per-consumer pending state. A Page's total retained record
 count is not a substitute for one consumer's lag.
@@ -2382,7 +2391,7 @@ Required per-Module status includes:
   byte size without description text by default;
 - active run ID, start time, cancellation state, and claim ID;
 - activation mode and scheduler policy/version;
-- pending count and bytes per input consumer;
+- pending, claimed, and resident count and bytes per input consumer;
 - current backpressure state;
 - retry and dead-letter counts;
 - retained strong-reference and access-lease count by kind;
@@ -2439,7 +2448,7 @@ A debug or audit mode SHOULD continuously check:
 7. every Module job ID maps to at most one committed output Block and Delivery
    set;
 8. every collected object is unreachable from all strong references and access leases;
-9. every pending mailbox and store remains within configured bounds;
+9. every resident mailbox and store remains within configured bounds;
 10. no STOPPED Module generation owns a run, background task, strong reference
      scoped to that generation, or live access lease.
 11. every visible ModuleDescription has one stable Module owner, a monotonic

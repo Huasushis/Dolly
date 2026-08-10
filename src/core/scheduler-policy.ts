@@ -20,8 +20,10 @@ export interface DownstreamPressure {
   readonly availability: DownstreamAvailability;
   readonly pendingCount: number;
   readonly pendingBytes: number;
-  readonly maxPendingCount: number;
-  readonly maxPendingBytes: number;
+  readonly residentCount: number;
+  readonly residentBytes: number;
+  readonly maxResidentCount: number;
+  readonly maxResidentBytes: number;
 }
 
 export interface FixedSchedulerSnapshot {
@@ -309,8 +311,8 @@ export class FixedSchedulerPolicy {
       .filter(
         (pressure) =>
           pressure.availability !== "available" ||
-          pressure.pendingCount >= pressure.maxPendingCount ||
-          pressure.pendingBytes >= pressure.maxPendingBytes,
+          pressure.residentCount >= pressure.maxResidentCount ||
+          pressure.residentBytes >= pressure.maxResidentBytes,
       )
       .map((pressure) => pressure.moduleId)
       .sort();
@@ -422,8 +424,19 @@ export class FixedSchedulerPolicy {
       }
       assertCount(pressure.pendingCount, "downstream.pendingCount");
       assertCount(pressure.pendingBytes, "downstream.pendingBytes");
-      assertCount(pressure.maxPendingCount, "downstream.maxPendingCount", false);
-      assertCount(pressure.maxPendingBytes, "downstream.maxPendingBytes", false);
+      assertCount(pressure.residentCount, "downstream.residentCount");
+      assertCount(pressure.residentBytes, "downstream.residentBytes");
+      assertCount(pressure.maxResidentCount, "downstream.maxResidentCount", false);
+      assertCount(pressure.maxResidentBytes, "downstream.maxResidentBytes", false);
+      if (
+        pressure.residentCount < pressure.pendingCount ||
+        pressure.residentBytes < pressure.pendingBytes
+      ) {
+        throw new SchedulerPolicyError(
+          "SCHEDULER_SNAPSHOT_INVALID",
+          "Downstream resident state cannot be smaller than pending state",
+        );
+      }
       downstreamIds.add(pressure.moduleId);
     }
   }

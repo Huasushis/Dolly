@@ -289,7 +289,7 @@ describe("reactive Module host with a real child process", () => {
         registrations: [{
           moduleId: "worker",
           runtime: managedRuntime,
-          mailbox: { maxPendingCount: 10, maxPendingBytes: 1024 * 1024 },
+          mailbox: { maxResidentCount: 10, maxResidentBytes: 1024 * 1024 },
           manifest: MANIFEST,
         }],
       });

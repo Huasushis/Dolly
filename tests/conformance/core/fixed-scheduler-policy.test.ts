@@ -148,24 +148,30 @@ describe("CORE deterministic fixed scheduler policy", () => {
         availability: "available" as const,
         pendingCount: 10,
         pendingBytes: 100,
-        maxPendingCount: 10,
-        maxPendingBytes: 1000,
+        residentCount: 10,
+        residentBytes: 100,
+        maxResidentCount: 10,
+        maxResidentBytes: 1000,
       },
       {
         moduleId: "sink-a",
         availability: "unknown" as const,
         pendingCount: 0,
         pendingBytes: 0,
-        maxPendingCount: 10,
-        maxPendingBytes: 1000,
+        residentCount: 0,
+        residentBytes: 0,
+        maxResidentCount: 10,
+        maxResidentBytes: 1000,
       },
       {
         moduleId: "sink-c",
         availability: "available" as const,
         pendingCount: 1,
         pendingBytes: 10,
-        maxPendingCount: 10,
-        maxPendingBytes: 1000,
+        residentCount: 1,
+        residentBytes: 10,
+        maxResidentCount: 10,
+        maxResidentBytes: 1000,
       },
     ];
     const first = policy().decide(snapshot({ downstream }));
@@ -176,6 +182,25 @@ describe("CORE deterministic fixed scheduler policy", () => {
       eligibleAt: 1_025,
       reasonCode: "DOWNSTREAM_BACKPRESSURE",
       blockingDownstreamIds: ["sink-a", "sink-b"],
+    });
+  });
+
+  it("treats active Claims as resident downstream pressure", () => {
+    expect(policy().decide(snapshot({
+      downstream: [{
+        moduleId: "sink",
+        availability: "available",
+        pendingCount: 0,
+        pendingBytes: 0,
+        residentCount: 1,
+        residentBytes: 64,
+        maxResidentCount: 1,
+        maxResidentBytes: 1_000,
+      }],
+    }))).toMatchObject({
+      eligible: false,
+      reasonCode: "DOWNSTREAM_BACKPRESSURE",
+      blockingDownstreamIds: ["sink"],
     });
   });
 
@@ -207,18 +232,36 @@ describe("CORE deterministic fixed scheduler policy", () => {
           availability: "available",
           pendingCount: 0,
           pendingBytes: 0,
-          maxPendingCount: 1,
-          maxPendingBytes: 1,
+          residentCount: 0,
+          residentBytes: 0,
+          maxResidentCount: 1,
+          maxResidentBytes: 1,
         },
         {
           moduleId: "sink",
           availability: "blocked",
           pendingCount: 0,
           pendingBytes: 0,
-          maxPendingCount: 1,
-          maxPendingBytes: 1,
+          residentCount: 0,
+          residentBytes: 0,
+          maxResidentCount: 1,
+          maxResidentBytes: 1,
         },
       ],
+    }))).toThrowError(expect.objectContaining<Partial<SchedulerPolicyError>>({
+      code: "SCHEDULER_SNAPSHOT_INVALID",
+    }));
+    expect(() => policy().decide(snapshot({
+      downstream: [{
+        moduleId: "sink",
+        availability: "available",
+        pendingCount: 2,
+        pendingBytes: 20,
+        residentCount: 1,
+        residentBytes: 10,
+        maxResidentCount: 10,
+        maxResidentBytes: 100,
+      }],
     }))).toThrowError(expect.objectContaining<Partial<SchedulerPolicyError>>({
       code: "SCHEDULER_SNAPSHOT_INVALID",
     }));
@@ -238,8 +281,10 @@ describe("CORE deterministic fixed scheduler policy", () => {
         availability: "available",
         pendingCount: 0,
         pendingBytes: 0,
-        maxPendingCount: 10,
-        maxPendingBytes: 100,
+        residentCount: 0,
+        residentBytes: 0,
+        maxResidentCount: 10,
+        maxResidentBytes: 100,
       }],
     });
     const before = JSON.stringify(input);

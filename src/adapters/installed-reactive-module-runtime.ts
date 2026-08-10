@@ -454,8 +454,8 @@ export function composeInstalledReactiveModuleHost(
       moduleId: module.moduleId,
       runtime: installedRuntimes[index]!.runtime,
       mailbox: {
-        maxPendingCount: mailbox.maxResidentCount,
-        maxPendingBytes: mailbox.maxResidentBytes,
+        maxResidentCount: mailbox.maxResidentCount,
+        maxResidentBytes: mailbox.maxResidentBytes,
       },
       manifest: installedRuntimes[index]!.resolvedModule.installation.manifest,
     })),

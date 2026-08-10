@@ -9,7 +9,7 @@ import {
   type SchedulerClock,
   type SchedulerEvent,
   type SchedulerMailboxLimits,
-  type SchedulerPendingReader,
+  type SchedulerMailboxReader,
   type SchedulableModuleRuntime,
 } from "./module-scheduler.js";
 import {
@@ -75,7 +75,7 @@ export interface ReactiveModuleHostRuntimeRegistration {
 export interface ReactiveModuleHostComposition {
   /** The complete document is validated again; a structural cast is not trusted. */
   readonly configuration: Readonly<DollyInstanceConfig>;
-  readonly deliveries: SchedulerPendingReader;
+  readonly deliveries: SchedulerMailboxReader;
   readonly clock: SchedulerClock;
   readonly scheduling: ReactiveModuleSchedulingConstraints;
   readonly registrations: readonly ReactiveModuleHostRuntimeRegistration[];

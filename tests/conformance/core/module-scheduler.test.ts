@@ -24,8 +24,9 @@ import {
   type SchedulerClock,
   type SchedulerDecision,
   type SchedulerEvent,
-  type SchedulerPendingReader,
+  type SchedulerMailboxReader,
   type SchedulerPendingSnapshot,
+  type SchedulerResidentSnapshot,
   type SchedulerPolicy,
   type SchedulerSnapshot,
   type SchedulerTimer,
@@ -252,8 +253,19 @@ class FakeModuleRuntime implements SchedulableModuleRuntime {
   }
 }
 
-class FakeMailboxes implements SchedulerPendingReader {
+class FakeMailboxes implements SchedulerMailboxReader {
   readonly #state = new Map<string, SchedulerPendingSnapshot>();
+  readonly #resident = new Map<
+    string,
+    {
+      readonly pendingCount: number;
+      readonly pendingBytes: number;
+      readonly claimedCount: number;
+      readonly claimedBytes: number;
+      readonly residentCount: number;
+      readonly residentBytes: number;
+    }
+  >();
   readonly reads: Array<{ consumerId: string; pageIds: readonly string[] }> = [];
   readonly failing = new Set<string>();
 
@@ -269,12 +281,55 @@ class FakeMailboxes implements SchedulerPendingReader {
       ...(oldestEnqueuedAt === undefined ? {} : { oldestEnqueuedAt }),
     };
     this.#state.set(consumerId, snapshot);
+    const existing = this.#resident.get(consumerId);
+    const claimedCount = existing?.claimedCount ?? 0;
+    const claimedBytes = existing?.claimedBytes ?? 0;
+    this.#resident.set(consumerId, {
+      pendingCount,
+      pendingBytes,
+      claimedCount,
+      claimedBytes,
+      residentCount: pendingCount + claimedCount,
+      residentBytes: pendingBytes + claimedBytes,
+    });
+  }
+
+  setResident(
+    consumerId: string,
+    pendingCount: number,
+    pendingBytes: number,
+    claimedCount: number,
+    claimedBytes: number,
+  ): void {
+    this.#resident.set(consumerId, {
+      pendingCount,
+      pendingBytes,
+      claimedCount,
+      claimedBytes,
+      residentCount: pendingCount + claimedCount,
+      residentBytes: pendingBytes + claimedBytes,
+    });
   }
 
   inspectPending(consumerId: string, pageIds: readonly string[]): SchedulerPendingSnapshot {
     this.reads.push({ consumerId, pageIds: [...pageIds] });
     if (this.failing.has(consumerId)) throw new Error(`pending state unavailable for ${consumerId}`);
     return this.#state.get(consumerId) ?? { pendingCount: 0, pendingBytes: 0 };
+  }
+
+  inspectResident(
+    consumerId: string,
+    _pageIds: readonly string[],
+  ): SchedulerResidentSnapshot {
+    const pending = this.#state.get(consumerId) ?? { pendingCount: 0, pendingBytes: 0 };
+    return this.#resident.get(consumerId) ?? {
+      pendingCount: pending.pendingCount,
+      pendingBytes: pending.pendingBytes,
+      claimedCount: 0,
+      claimedBytes: 0,
+      residentCount: pending.pendingCount,
+      residentBytes: pending.pendingBytes,
+    };
   }
 }
 
@@ -354,7 +409,7 @@ describe("CORE scheduler run loop serialization", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -392,7 +447,7 @@ describe("CORE scheduler run loop serialization", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -431,7 +486,7 @@ describe("CORE scheduler run loop serialization", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 10, maxPendingBytes: 1_000 },
+      mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
     });
     scheduler.start();
     await advance(clock, 500);
@@ -459,7 +514,7 @@ describe("CORE scheduler run loop serialization", () => {
         runtime: runtimes[index]!,
         inputPageIds: [`page-${moduleId}`],
         outputPageIds: [],
-        mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+        mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
       });
     });
     scheduler.start();
@@ -497,7 +552,7 @@ describe("CORE scheduler run loop serialization", () => {
         runtime,
         inputPageIds: [`page-${moduleId}`],
         outputPageIds: [],
-        mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+        mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
       });
     }
     scheduler.start();
@@ -533,21 +588,21 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
         runtime: harness.producer,
         inputPageIds: ["source"],
         outputPageIds: ["shared"],
-        mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+        mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
       },
       left: {
         moduleId: "left",
         runtime: harness.left,
         inputPageIds: ["shared"],
         outputPageIds: [],
-        mailbox: { maxPendingCount: 2, maxPendingBytes: 1_000 },
+        mailbox: { maxResidentCount: 2, maxResidentBytes: 1_000 },
       },
       right: {
         moduleId: "right",
         runtime: harness.right,
         inputPageIds: ["shared"],
         outputPageIds: [],
-        mailbox: { maxPendingCount: 2, maxPendingBytes: 1_000 },
+        mailbox: { maxResidentCount: 2, maxResidentBytes: 1_000 },
       },
     } as const;
     for (const moduleId of order) harness.scheduler.register(registrations[moduleId]);
@@ -561,7 +616,7 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
       runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 1, maxPendingBytes: 100 },
+      mailbox: { maxResidentCount: 1, maxResidentBytes: 100 },
     });
     scheduler.start();
     await drain(clock);
@@ -602,6 +657,39 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
     expect(eventTypes(harness.events, "producer")).toContain("scheduler.backpressure_exited");
     expect(harness.producer.tickCount).toBeGreaterThan(ticksWhileBlocked);
     await harness.scheduler.stop();
+  });
+
+  it("does not dispatch upstream work when a downstream Claim still occupies its only resident slot", async () => {
+    const { clock, mailboxes, scheduler } = createScheduler();
+    const producer = new FakeModuleRuntime(() => ({ status: "idle" }));
+    mailboxes.set("producer", 1, 32);
+    mailboxes.set("sink", 0, 0);
+    mailboxes.setResident("sink", 0, 0, 1, 64);
+    scheduler.register({
+      moduleId: "producer",
+      runtime: producer,
+      inputPageIds: ["source"],
+      outputPageIds: ["shared"],
+      mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
+    });
+    scheduler.register({
+      moduleId: "sink",
+      runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+      inputPageIds: ["shared"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 1, maxResidentBytes: 1_000 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(producer.tickCount).toBe(0);
+    expect(scheduler.status("producer")).toMatchObject({
+      backpressured: true,
+      blockingDownstreamIds: ["sink"],
+      lastDecisionReasonCode: "DOWNSTREAM_BACKPRESSURE",
+    });
+    await scheduler.stop();
   });
 
   it("measures each consumer separately in count and in bytes", async () => {
@@ -717,7 +805,7 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
       runtime,
       inputPageIds: ["shared"],
       outputPageIds: ["shared"],
-      mailbox: { maxPendingCount: 2, maxPendingBytes: 20 },
+      mailbox: { maxResidentCount: 2, maxResidentBytes: 20 },
     });
     scheduler.start();
     await drain(clock);
@@ -740,11 +828,11 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
     harness.mailboxes.failing.add("left");
     await advance(harness.clock, 100);
 
-    expect(harness.scheduler.status("left").pendingStateAvailable).toBe(false);
+    expect(harness.scheduler.status("left").mailboxStateAvailable).toBe(false);
     expect(harness.scheduler.status("producer").blockingDownstreamIds).toEqual(["left"]);
     expect(harness.producer.tickCount).toBe(before);
     expect(harness.scheduler.instanceStatus().invariantViolationCount).toBeGreaterThan(0);
-    expect(eventTypes(harness.events, "left")).toContain("scheduler.pending_unavailable");
+    expect(eventTypes(harness.events, "left")).toContain("scheduler.mailbox_state_unavailable");
     await harness.scheduler.stop();
   });
 
@@ -760,7 +848,7 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
         runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
         inputPageIds: [input],
         outputPageIds: [output],
-        mailbox: { maxPendingCount: 2, maxPendingBytes: 200 },
+        mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
       });
     }
     scheduler.start();
@@ -800,7 +888,7 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: ["output"],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -842,7 +930,7 @@ describe("CORE scheduler policy boundary", () => {
       runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 10, maxPendingBytes: 1_000 },
+      mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -873,7 +961,7 @@ describe("CORE scheduler policy boundary", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
 
     scheduler.start();
@@ -897,14 +985,14 @@ describe("CORE scheduler policy boundary", () => {
       runtime: producer,
       inputPageIds: ["source"],
       outputPageIds: ["shared"],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.register({
       moduleId: "consumer",
       runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
       inputPageIds: ["shared"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 2, maxPendingBytes: 20 },
+      mailbox: { maxResidentCount: 2, maxResidentBytes: 20 },
     });
     scheduler.start();
     await advance(clock, 400);
@@ -924,7 +1012,7 @@ describe("CORE scheduler policy boundary", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await advance(clock, 1_000);
@@ -949,7 +1037,7 @@ describe("CORE scheduler policy boundary", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -983,7 +1071,7 @@ describe("CORE scheduler policy boundary", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await advance(clock, 1_000);
@@ -1006,7 +1094,7 @@ describe("CORE scheduler policy boundary", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await advance(clock, 300);
@@ -1040,14 +1128,14 @@ describe("CORE scheduler policy boundary", () => {
       runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
       inputPageIds: ["source"],
       outputPageIds: ["shared"],
-      mailbox: { maxPendingCount: 50, maxPendingBytes: 5_000 },
+      mailbox: { maxResidentCount: 50, maxResidentBytes: 5_000 },
     });
     scheduler.register({
       moduleId: "consumer",
       runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
       inputPageIds: ["shared"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 7, maxPendingBytes: 700 },
+      mailbox: { maxResidentCount: 7, maxResidentBytes: 700 },
     });
     scheduler.start();
     await drain(clock);
@@ -1065,8 +1153,8 @@ describe("CORE scheduler policy boundary", () => {
           availability: "available",
           pendingCount: 1,
           pendingBytes: 111,
-          maxPendingCount: 7,
-          maxPendingBytes: 700,
+          maxResidentCount: 7,
+          maxResidentBytes: 700,
         },
       ],
     });
@@ -1102,7 +1190,7 @@ describe("CORE scheduler policy boundary", () => {
       runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 10, maxPendingBytes: 1_000 },
+      mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
     });
 
     scheduler.start();
@@ -1179,7 +1267,7 @@ describe("CORE scheduler policy boundary", () => {
         runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
         inputPageIds: ["input"],
         outputPageIds: [],
-        mailbox: { maxPendingCount: 10, maxPendingBytes: 10_000 },
+        mailbox: { maxResidentCount: 10, maxResidentBytes: 10_000 },
       });
 
       scheduler.start();
@@ -1209,17 +1297,39 @@ describe("CORE scheduler policy boundary", () => {
         runtime,
         inputPageIds: ["input"],
         outputPageIds: [],
-        mailbox: { maxPendingCount: 10, maxPendingBytes: 1_000 },
+        mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
       });
 
       scheduler.start();
       await drain(clock);
 
       expect(runtime.tickCount).toBe(0);
-      expect(scheduler.status("worker").pendingStateAvailable).toBe(false);
-      expect(eventTypes(events, "worker")).toContain("scheduler.pending_unavailable");
+      expect(scheduler.status("worker").mailboxStateAvailable).toBe(false);
+      expect(eventTypes(events, "worker")).toContain("scheduler.mailbox_state_unavailable");
       await scheduler.stop();
     }
+  });
+
+  it("fails closed when pending and resident mailbox reads disagree", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler();
+    const runtime = new FakeModuleRuntime(() => ({ status: "idle" }));
+    mailboxes.set("worker", 1, 64);
+    mailboxes.setResident("worker", 0, 0, 0, 0);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(runtime.tickCount).toBe(0);
+    expect(scheduler.status("worker").mailboxStateAvailable).toBe(false);
+    expect(eventTypes(events, "worker")).toContain("scheduler.mailbox_state_unavailable");
+    await scheduler.stop();
   });
 });
 
@@ -1237,7 +1347,7 @@ describe("CORE scheduler retry backoff", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -1278,7 +1388,7 @@ describe("CORE scheduler retry backoff", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: ["output"],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -1325,7 +1435,7 @@ describe("CORE scheduler retry backoff", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: ["output"],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -1355,7 +1465,7 @@ describe("CORE scheduler retry backoff", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -1389,7 +1499,7 @@ describe("CORE scheduler retry backoff", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -1419,7 +1529,7 @@ describe("CORE scheduler retry backoff", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -1447,7 +1557,7 @@ describe("CORE scheduler retry backoff", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -1474,7 +1584,7 @@ describe("CORE scheduler stop", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -1518,7 +1628,7 @@ describe("CORE scheduler stop", () => {
         runtime: new FakeModuleRuntime(),
         inputPageIds: ["input"],
         outputPageIds: [],
-        mailbox: { maxPendingCount: 1, maxPendingBytes: 1 },
+        mailbox: { maxResidentCount: 1, maxResidentBytes: 1 },
       }),
     ).toThrowError(expect.objectContaining({ code: "SCHEDULER_STOPPED" }));
     expect(() => scheduler.start()).toThrowError(
@@ -1535,7 +1645,7 @@ describe("CORE scheduler stop", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -1555,7 +1665,7 @@ describe("CORE scheduler activation modes", () => {
       runtime: new FakeModuleRuntime(),
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 1, maxPendingBytes: 1 },
+      mailbox: { maxResidentCount: 1, maxResidentBytes: 1 },
       activation: { kind: "periodic", periodMs: 100, allowEmptyInput: true },
     })).toThrowError(expect.objectContaining({ code: "SCHEDULER_ACTIVATION_UNSUPPORTED" }));
     expect(() => scheduler.register({
@@ -1563,7 +1673,7 @@ describe("CORE scheduler activation modes", () => {
       runtime: new FakeModuleRuntime(),
       inputPageIds: [],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 1, maxPendingBytes: 1 },
+      mailbox: { maxResidentCount: 1, maxResidentBytes: 1 },
       activation: { kind: "source" },
     })).toThrowError(expect.objectContaining({ code: "SCHEDULER_ACTIVATION_UNSUPPORTED" }));
     expect(events.filter((event) => event.type === "scheduler.activation_rejected")).toHaveLength(2);
@@ -1578,7 +1688,7 @@ describe("CORE scheduler activation modes", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 10, maxPendingBytes: 1_000 },
+      mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
       activation: { kind: "periodic", periodMs: 2_000, allowEmptyInput: false },
     });
     scheduler.start();
@@ -1613,7 +1723,7 @@ describe("CORE scheduler activation modes", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 10, maxPendingBytes: 1_000 },
+      mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
       activation: { kind: "periodic", periodMs: 100, allowEmptyInput: false },
     });
     scheduler.start();
@@ -1710,6 +1820,14 @@ describe("CORE scheduler configuration and observability", () => {
         expect.objectContaining({ code: "SCHEDULER_CONFIGURATION_INVALID" }),
       );
     }
+    expect(() => new ModuleScheduler({
+      ...base,
+      deliveries: {
+        inspectPending: () => ({ pendingCount: 0, pendingBytes: 0 }),
+      } as unknown as SchedulerMailboxReader,
+    })).toThrowError(expect.objectContaining({
+      code: "SCHEDULER_CONFIGURATION_INVALID",
+    }));
     expect(() => new ModuleScheduler(base)).not.toThrow();
   });
 
@@ -1720,7 +1838,7 @@ describe("CORE scheduler configuration and observability", () => {
       runtime: new FakeModuleRuntime(),
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 1, maxPendingBytes: 1 },
+      mailbox: { maxResidentCount: 1, maxResidentBytes: 1 },
     };
     scheduler.register(registration);
 
@@ -1743,7 +1861,7 @@ describe("CORE scheduler configuration and observability", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 20, maxPendingBytes: 2_000 },
+      mailbox: { maxResidentCount: 20, maxResidentBytes: 2_000 },
     });
     scheduler.start();
     await drain(clock);
@@ -1755,8 +1873,12 @@ describe("CORE scheduler configuration and observability", () => {
     expect(status.activationMode).toBe("reactive");
     expect(status.pendingCount).toBe(6);
     expect(status.pendingBytes).toBe(600);
-    expect(status.maxPendingCount).toBe(20);
-    expect(status.maxPendingBytes).toBe(2_000);
+    expect(status.claimedCount).toBe(0);
+    expect(status.claimedBytes).toBe(0);
+    expect(status.residentCount).toBe(6);
+    expect(status.residentBytes).toBe(600);
+    expect(status.maxResidentCount).toBe(20);
+    expect(status.maxResidentBytes).toBe(2_000);
     expect(status.lastSuccessAt).not.toBeNull();
     expect(status.lastFailureAt).not.toBeNull();
     expect(status.lastServiceTimeMs).not.toBeNull();
@@ -1771,6 +1893,10 @@ describe("CORE scheduler configuration and observability", () => {
     expect(instance.registeredModules).toBe(1);
     expect(instance.pendingCount).toBe(6);
     expect(instance.pendingBytes).toBe(600);
+    expect(instance.claimedCount).toBe(0);
+    expect(instance.claimedBytes).toBe(0);
+    expect(instance.residentCount).toBe(6);
+    expect(instance.residentBytes).toBe(600);
     expect(instance.maxConcurrentModules).toBe(4);
     expect(instance.state).toBe("running");
     await scheduler.stop();
@@ -1784,7 +1910,7 @@ describe("CORE scheduler configuration and observability", () => {
       runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 10, maxPendingBytes: 1_000 },
+      mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
     });
     scheduler.start();
     await advance(clock, 500);
@@ -1843,7 +1969,7 @@ describe("CORE scheduler configuration and observability", () => {
       runtime,
       inputPageIds: ["input"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 10, maxPendingBytes: 1_000 },
+      mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
     });
     scheduler.start();
     await advance(clock, 300);
@@ -2021,14 +2147,14 @@ describe("CORE scheduler over the real Delivery store", () => {
       runtime: pipeline.producer,
       inputPageIds: ["input"],
       outputPageIds: ["middle"],
-      mailbox: { maxPendingCount: 50, maxPendingBytes: 500_000 },
+      mailbox: { maxResidentCount: 50, maxResidentBytes: 500_000 },
     });
     scheduler.register({
       moduleId: "sink",
       runtime: sink,
       inputPageIds: ["middle"],
       outputPageIds: [],
-      mailbox: { maxPendingCount: 1, maxPendingBytes: 500_000 },
+      mailbox: { maxResidentCount: 1, maxResidentBytes: 500_000 },
     });
     scheduler.start();
     await advance(clock, 1_000);

@@ -93,13 +93,27 @@ export interface SchedulerPendingSnapshot {
 }
 
 /**
- * Read-only per-consumer mailbox state. `DeliveryStore.inspectPending`
- * satisfies it; a test may substitute a fake. Section 13.2 requires per-consumer
- * pending state, so this is deliberately keyed by consumer and Page set rather
- * than by Page alone.
+ * Deliveries that still occupy mailbox capacity. Moving a Delivery from
+ * pending to claimed does not free its count or Block bytes.
  */
-export interface SchedulerPendingReader {
+export interface SchedulerResidentSnapshot {
+  readonly pendingCount: number;
+  readonly pendingBytes: number;
+  readonly claimedCount: number;
+  readonly claimedBytes: number;
+  readonly residentCount: number;
+  readonly residentBytes: number;
+}
+
+/**
+ * Read-only per-consumer mailbox state. `DeliveryStore` satisfies it; a test
+ * may substitute a fake. Pending state drives input eligibility and arrival
+ * measurements. Resident state drives capacity decisions. Both are keyed by
+ * consumer and Page set rather than by Page alone.
+ */
+export interface SchedulerMailboxReader {
   inspectPending(consumerId: string, pageIds: readonly string[]): SchedulerPendingSnapshot;
+  inspectResident(consumerId: string, pageIds: readonly string[]): SchedulerResidentSnapshot;
   /**
    * Optional durable-change notification.  It is only a wake-up hint; the
    * scheduler re-reads every mailbox before deciding.  The returned function
@@ -163,8 +177,8 @@ export type SchedulerBackpressureAction =
   | "reject-upstream-run";
 
 export interface SchedulerMailboxLimits {
-  readonly maxPendingCount: number;
-  readonly maxPendingBytes: number;
+  readonly maxResidentCount: number;
+  readonly maxResidentBytes: number;
 }
 
 export type SchedulerActivationDescriptor =
@@ -190,7 +204,7 @@ export type SchedulerPolicyFailureAction = "fallback-baseline" | "quarantine";
 
 export interface ModuleSchedulerOptions {
   readonly instanceId: string;
-  readonly deliveries: SchedulerPendingReader;
+  readonly deliveries: SchedulerMailboxReader;
   readonly clock: SchedulerClock;
   /** Maps a durable enqueue timestamp onto this Scheduler's monotonic epoch. */
   readonly wallClockNow?: () => number;
@@ -305,7 +319,7 @@ export type SchedulerEvent =
       readonly reason: string;
     })
   | (SchedulerModuleEventBase & {
-      readonly type: "scheduler.pending_unavailable";
+      readonly type: "scheduler.mailbox_state_unavailable";
       readonly errorMessage: string;
     })
   | (SchedulerModuleEventBase & {
@@ -375,11 +389,15 @@ export interface SchedulerModuleStatus {
   readonly policyVersion: string | null;
   readonly pendingCount: number;
   readonly pendingBytes: number;
-  readonly maxPendingCount: number;
-  readonly maxPendingBytes: number;
+  readonly claimedCount: number;
+  readonly claimedBytes: number;
+  readonly residentCount: number;
+  readonly residentBytes: number;
+  readonly maxResidentCount: number;
+  readonly maxResidentBytes: number;
   readonly oldestPendingAgeMs: number;
   readonly mailboxFull: boolean;
-  readonly pendingStateAvailable: boolean;
+  readonly mailboxStateAvailable: boolean;
   readonly backpressured: boolean;
   readonly backpressureAction: SchedulerBackpressureAction | null;
   readonly blockingDownstreamIds: readonly string[];
@@ -411,6 +429,10 @@ export interface SchedulerInstanceStatus {
   readonly quarantinedModules: number;
   readonly pendingCount: number;
   readonly pendingBytes: number;
+  readonly claimedCount: number;
+  readonly claimedBytes: number;
+  readonly residentCount: number;
+  readonly residentBytes: number;
   readonly oldestPendingAgeMs: number;
   readonly invariantViolationCount: number;
   readonly noProgressActive: boolean;
@@ -486,11 +508,12 @@ interface ModuleEntry {
   readonly activation: Exclude<SchedulerActivationDescriptor, { readonly kind: "source" }>;
   readonly inputPageIds: readonly string[];
   readonly outputPageIds: readonly string[];
-  readonly maxPendingCount: number;
-  readonly maxPendingBytes: number;
+  readonly maxResidentCount: number;
+  readonly maxResidentBytes: number;
   downstreamIds: readonly string[];
   pending: SchedulerPendingSnapshot;
-  pendingAvailable: boolean;
+  resident: SchedulerResidentSnapshot;
+  mailboxStateAvailable: boolean;
   pendingSinceMonotonic: number | null;
   pendingOldestEnqueuedAt: string | null;
   mailboxFull: boolean;
@@ -572,7 +595,7 @@ function newCounters(): MutableCounters {
 
 export class ModuleScheduler {
   readonly #instanceId: string;
-  readonly #deliveries: SchedulerPendingReader;
+  readonly #deliveries: SchedulerMailboxReader;
   readonly #clock: SchedulerClock;
   readonly #wallClockNow: () => number;
   readonly #pollIntervalMs: number;
@@ -655,6 +678,12 @@ export class ModuleScheduler {
       throw new ModuleSchedulerError(
         "SCHEDULER_CONFIGURATION_INVALID",
         "deliveries must supply inspectPending",
+      );
+    }
+    if (typeof options.deliveries?.inspectResident !== "function") {
+      throw new ModuleSchedulerError(
+        "SCHEDULER_CONFIGURATION_INVALID",
+        "deliveries must supply inspectResident",
       );
     }
     if (
@@ -761,8 +790,8 @@ export class ModuleScheduler {
         "A Delivery-backed Module must consume at least one input Page",
       );
     }
-    assertPositiveInteger(registration.mailbox.maxPendingCount, "mailbox.maxPendingCount");
-    assertPositiveInteger(registration.mailbox.maxPendingBytes, "mailbox.maxPendingBytes");
+    assertPositiveInteger(registration.mailbox.maxResidentCount, "mailbox.maxResidentCount");
+    assertPositiveInteger(registration.mailbox.maxResidentBytes, "mailbox.maxResidentBytes");
     if (typeof registration.runtime?.tick !== "function") {
       throw new ModuleSchedulerError(
         "SCHEDULER_CONFIGURATION_INVALID",
@@ -776,11 +805,19 @@ export class ModuleScheduler {
       activation,
       inputPageIds: [...registration.inputPageIds],
       outputPageIds: [...registration.outputPageIds],
-      maxPendingCount: registration.mailbox.maxPendingCount,
-      maxPendingBytes: registration.mailbox.maxPendingBytes,
+      maxResidentCount: registration.mailbox.maxResidentCount,
+      maxResidentBytes: registration.mailbox.maxResidentBytes,
       downstreamIds: [],
       pending: { pendingCount: 0, pendingBytes: 0 },
-      pendingAvailable: true,
+      resident: {
+        pendingCount: 0,
+        pendingBytes: 0,
+        claimedCount: 0,
+        claimedBytes: 0,
+        residentCount: 0,
+        residentBytes: 0,
+      },
+      mailboxStateAvailable: true,
       pendingSinceMonotonic: null,
       pendingOldestEnqueuedAt: null,
       mailboxFull: false,
@@ -909,12 +946,20 @@ export class ModuleScheduler {
     const now = this.#clock.monotonicNow();
     let pendingCount = 0;
     let pendingBytes = 0;
+    let claimedCount = 0;
+    let claimedBytes = 0;
+    let residentCount = 0;
+    let residentBytes = 0;
     let oldestPendingAgeMs = 0;
     let backpressuredModules = 0;
     let quarantinedModules = 0;
     for (const entry of this.#entries.values()) {
       pendingCount += entry.pending.pendingCount;
       pendingBytes += entry.pending.pendingBytes;
+      claimedCount += entry.resident.claimedCount;
+      claimedBytes += entry.resident.claimedBytes;
+      residentCount += entry.resident.residentCount;
+      residentBytes += entry.resident.residentBytes;
       oldestPendingAgeMs = Math.max(oldestPendingAgeMs, this.#oldestPendingAgeMs(entry, now));
       if (entry.backpressured) backpressuredModules += 1;
       if (entry.quarantineReason !== null) quarantinedModules += 1;
@@ -930,6 +975,10 @@ export class ModuleScheduler {
       quarantinedModules,
       pendingCount,
       pendingBytes,
+      claimedCount,
+      claimedBytes,
+      residentCount,
+      residentBytes,
       oldestPendingAgeMs,
       invariantViolationCount: this.#invariantViolationCount,
       noProgressActive: this.#noProgressActive,
@@ -1004,7 +1053,7 @@ export class ModuleScheduler {
     );
     if (entries.length === 0) return;
 
-    for (const entry of entries) this.#refreshPending(entry, now);
+    for (const entry of entries) this.#refreshMailboxRead(entry, now);
     for (const entry of entries) this.#refreshMailboxState(entry);
 
     // Round-robin so an instance-wide concurrency cap cannot permanently starve
@@ -1018,11 +1067,16 @@ export class ModuleScheduler {
     this.#detectNoProgress(entries, now);
   }
 
-  #refreshPending(entry: ModuleEntry, now: number): void {
+  #refreshMailboxRead(entry: ModuleEntry, now: number): void {
     let pending: SchedulerPendingSnapshot;
+    let resident: SchedulerResidentSnapshot;
     let durablePendingSince: number | undefined;
     try {
       const read = this.#deliveries.inspectPending(entry.moduleId, entry.inputPageIds);
+      const residentRead = this.#deliveries.inspectResident(
+        entry.moduleId,
+        entry.inputPageIds,
+      );
       const hasOldestEnqueuedAt = read.oldestEnqueuedAt !== undefined;
       const oldestEnqueuedAt = read.oldestEnqueuedAt ?? null;
       const oldestEnqueuedAtMs = oldestEnqueuedAt === null
@@ -1053,6 +1107,38 @@ export class ModuleScheduler {
       ) {
         throw new TypeError("pending state is inconsistent");
       }
+      resident = {
+        pendingCount: residentRead.pendingCount,
+        pendingBytes: residentRead.pendingBytes,
+        claimedCount: residentRead.claimedCount,
+        claimedBytes: residentRead.claimedBytes,
+        residentCount: residentRead.residentCount,
+        residentBytes: residentRead.residentBytes,
+      };
+      const residentCountSum = resident.pendingCount + resident.claimedCount;
+      const residentBytesSum = resident.pendingBytes + resident.claimedBytes;
+      if (
+        !Number.isSafeInteger(resident.pendingCount) ||
+        resident.pendingCount < 0 ||
+        !Number.isSafeInteger(resident.pendingBytes) ||
+        resident.pendingBytes < 0 ||
+        !Number.isSafeInteger(resident.claimedCount) ||
+        resident.claimedCount < 0 ||
+        !Number.isSafeInteger(resident.claimedBytes) ||
+        resident.claimedBytes < 0 ||
+        !Number.isSafeInteger(resident.residentCount) ||
+        resident.residentCount < 0 ||
+        !Number.isSafeInteger(resident.residentBytes) ||
+        resident.residentBytes < 0 ||
+        !Number.isSafeInteger(residentCountSum) ||
+        !Number.isSafeInteger(residentBytesSum) ||
+        resident.pendingCount !== pending.pendingCount ||
+        resident.pendingBytes !== pending.pendingBytes ||
+        resident.residentCount !== residentCountSum ||
+        resident.residentBytes !== residentBytesSum
+      ) {
+        throw new TypeError("resident state is inconsistent with pending state");
+      }
       if (
         oldestEnqueuedAt !== null &&
         oldestEnqueuedAt !== entry.pendingOldestEnqueuedAt
@@ -1073,20 +1159,21 @@ export class ModuleScheduler {
         const ageAtObservation = wallClockNow - oldestEnqueuedAtMs!;
         durablePendingSince = now - ageAtObservation;
       }
-      entry.pendingAvailable = true;
+      entry.mailboxStateAvailable = true;
     } catch (error) {
       // An unreadable mailbox is reported as unknown capacity rather than as
       // zero pressure, so it can only make the scheduler more conservative.
-      entry.pendingAvailable = false;
+      entry.mailboxStateAvailable = false;
       entry.counters.invariantViolations += 1;
       this.#invariantViolationCount += 1;
       this.#emitModule(entry, {
-        type: "scheduler.pending_unavailable",
+        type: "scheduler.mailbox_state_unavailable",
         errorMessage: errorMessage(error),
       });
       return;
     }
     entry.pending = pending;
+    entry.resident = resident;
     if (pending.pendingCount === 0) {
       entry.pendingSinceMonotonic = null;
       entry.pendingOldestEnqueuedAt = null;
@@ -1100,24 +1187,24 @@ export class ModuleScheduler {
   }
 
   #refreshMailboxState(entry: ModuleEntry): void {
-    if (!entry.pendingAvailable) return;
-    const overCount = entry.pending.pendingCount >= entry.maxPendingCount;
-    const overBytes = entry.pending.pendingBytes >= entry.maxPendingBytes;
+    if (!entry.mailboxStateAvailable) return;
+    const overCount = entry.resident.residentCount >= entry.maxResidentCount;
+    const overBytes = entry.resident.residentBytes >= entry.maxResidentBytes;
     if (overCount || overBytes) {
       entry.mailboxFull = true;
       return;
     }
     if (!entry.mailboxFull) return;
-    const resumeCount = Math.floor(entry.maxPendingCount * this.#lowWatermarkRatio);
-    const resumeBytes = Math.floor(entry.maxPendingBytes * this.#lowWatermarkRatio);
+    const resumeCount = Math.floor(entry.maxResidentCount * this.#lowWatermarkRatio);
+    const resumeBytes = Math.floor(entry.maxResidentBytes * this.#lowWatermarkRatio);
     entry.mailboxFull =
-      entry.pending.pendingCount > resumeCount || entry.pending.pendingBytes > resumeBytes;
+      entry.resident.residentCount > resumeCount || entry.resident.residentBytes > resumeBytes;
   }
 
   #downstreamPressure(entry: ModuleEntry): readonly DownstreamPressure[] {
     return entry.downstreamIds.map((moduleId) => {
       const downstream = this.#entries.get(moduleId)!;
-      const availability: DownstreamAvailability = !downstream.pendingAvailable
+      const availability: DownstreamAvailability = !downstream.mailboxStateAvailable
         ? "unknown"
         : downstream.mailboxFull
           ? "blocked"
@@ -1127,8 +1214,10 @@ export class ModuleScheduler {
         availability,
         pendingCount: downstream.pending.pendingCount,
         pendingBytes: downstream.pending.pendingBytes,
-        maxPendingCount: downstream.maxPendingCount,
-        maxPendingBytes: downstream.maxPendingBytes,
+        residentCount: downstream.resident.residentCount,
+        residentBytes: downstream.resident.residentBytes,
+        maxResidentCount: downstream.maxResidentCount,
+        maxResidentBytes: downstream.maxResidentBytes,
       });
     });
   }
@@ -1191,8 +1280,8 @@ export class ModuleScheduler {
       this.#recordReason(entry, false, "ACTOR_BUSY", null);
       return;
     }
-    if (!entry.pendingAvailable) {
-      this.#recordReason(entry, false, "PENDING_STATE_UNAVAILABLE", null);
+    if (!entry.mailboxStateAvailable) {
+      this.#recordReason(entry, false, "MAILBOX_STATE_UNAVAILABLE", null);
       return;
     }
     if (entry.nextEligibleAt !== null && now < entry.nextEligibleAt) {
@@ -1565,7 +1654,7 @@ export class ModuleScheduler {
     entry.dispatchPending = null;
     entry.dispatchClaimLimitCount = null;
     entry.dispatchClaimLimitBytes = null;
-    if (!before || !entry.pendingAvailable) return;
+    if (!before || !entry.mailboxStateAvailable) return;
     let after: SchedulerPendingSnapshot;
     try {
       after = this.#deliveries.inspectPending(entry.moduleId, entry.inputPageIds);
@@ -1710,11 +1799,15 @@ export class ModuleScheduler {
       policyVersion: entry.lastPolicyVersion,
       pendingCount: entry.pending.pendingCount,
       pendingBytes: entry.pending.pendingBytes,
-      maxPendingCount: entry.maxPendingCount,
-      maxPendingBytes: entry.maxPendingBytes,
+      claimedCount: entry.resident.claimedCount,
+      claimedBytes: entry.resident.claimedBytes,
+      residentCount: entry.resident.residentCount,
+      residentBytes: entry.resident.residentBytes,
+      maxResidentCount: entry.maxResidentCount,
+      maxResidentBytes: entry.maxResidentBytes,
       oldestPendingAgeMs: this.#oldestPendingAgeMs(entry, now),
       mailboxFull: entry.mailboxFull,
-      pendingStateAvailable: entry.pendingAvailable,
+      mailboxStateAvailable: entry.mailboxStateAvailable,
       backpressured: entry.backpressured,
       backpressureAction: entry.backpressured ? this.#backpressureAction : null,
       blockingDownstreamIds: [...entry.blockingDownstreamIds],

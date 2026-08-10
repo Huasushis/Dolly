@@ -247,7 +247,7 @@ describe("general Agent waiter with a real quarantined Extension", () => {
         runtime: managedRuntime,
         inputPageIds: ["input"],
         outputPageIds: ["output"],
-        mailbox: { maxPendingCount: 4, maxPendingBytes: 1024 * 1024 },
+        mailbox: { maxResidentCount: 4, maxResidentBytes: 1024 * 1024 },
       }]);
 
       await reactiveHost.start();

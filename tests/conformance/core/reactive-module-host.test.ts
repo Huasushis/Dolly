@@ -56,7 +56,7 @@ function registration(id: string, managed: ManagedReactiveModuleRuntime) {
     runtime: managed,
     inputPageIds: [`${id}-input`],
     outputPageIds: [`${id}-output`],
-    mailbox: { maxPendingCount: 10, maxPendingBytes: 1024 },
+    mailbox: { maxResidentCount: 10, maxResidentBytes: 1024 },
   };
 }
 
@@ -126,6 +126,14 @@ function composition(
     configuration: config,
     deliveries: {
       inspectPending: () => ({ pendingCount: 0, pendingBytes: 0 }),
+      inspectResident: () => ({
+        pendingCount: 0,
+        pendingBytes: 0,
+        claimedCount: 0,
+        claimedBytes: 0,
+        residentCount: 0,
+        residentBytes: 0,
+      }),
     },
     clock: {
       monotonicNow: () => 0,
@@ -144,7 +152,7 @@ function composition(
     registrations: [{
       moduleId: "worker",
       runtime: managed,
-      mailbox: { maxPendingCount: 10, maxPendingBytes: 8192 },
+      mailbox: { maxResidentCount: 10, maxResidentBytes: 8192 },
       manifest,
     }],
   };
@@ -355,7 +363,7 @@ describe("reactive Module host lifecycle", () => {
         {
           moduleId: "unexpected",
           runtime: runtime("unexpected", []),
-          mailbox: { maxPendingCount: 1, maxPendingBytes: 256 },
+          mailbox: { maxResidentCount: 1, maxResidentBytes: 256 },
           manifest: input.registrations[0]!.manifest,
         },
       ],
@@ -413,11 +421,19 @@ describe("reactive Module host lifecycle", () => {
       tick,
     };
     const inspectPending = vi.fn(() => ({ pendingCount: 1, pendingBytes: 64 }));
+    const inspectResident = vi.fn(() => ({
+      pendingCount: 1,
+      pendingBytes: 64,
+      claimedCount: 0,
+      claimedBytes: 0,
+      residentCount: 1,
+      residentBytes: 64,
+    }));
     const scheduled: { delayMs: number; callback: () => void; cancelled: boolean }[] = [];
     const input = composition(config, managed);
     const host = composeReactiveModuleHost({
       ...input,
-      deliveries: { inspectPending },
+      deliveries: { inspectPending, inspectResident },
       clock: {
         monotonicNow: () => 10,
         schedule: (delayMs, callback) => {
