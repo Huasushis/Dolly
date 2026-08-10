@@ -552,10 +552,7 @@ function immutableJson(value: JsonValue): JsonValue {
 }
 
 function moduleKindsFromManifest(manifest: ExtensionPackageManifest): readonly string[] {
-  if (
-    manifest.schemaVersion !== "dolly.extension-package/1" &&
-    manifest.schemaVersion !== "dolly.extension-package/2"
-  ) {
+  if (manifest.schemaVersion !== "dolly.extension-package/1") {
     throw new ExtensionProcessHostError(
       "EXTENSION_PROCESS_PROTOCOL_INCOMPATIBLE",
       "Extension manifest version is unsupported",

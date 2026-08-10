@@ -1056,10 +1056,19 @@ export class ModuleScheduler {
         oldestEnqueuedAt !== entry.pendingOldestEnqueuedAt
       ) {
         const wallClockNow = this.#wallClockNow();
-        if (!Number.isSafeInteger(wallClockNow)) {
-          throw new TypeError("wallClockNow must return a safe integer millisecond timestamp");
+        if (
+          !Number.isSafeInteger(wallClockNow) ||
+          wallClockNow < 0 ||
+          !Number.isFinite(new Date(wallClockNow).getTime())
+        ) {
+          throw new TypeError(
+            "wallClockNow must return a non-negative representable integer millisecond timestamp",
+          );
         }
-        const ageAtObservation = Math.max(0, wallClockNow - oldestEnqueuedAtMs!);
+        if (oldestEnqueuedAtMs! > wallClockNow) {
+          throw new TypeError("oldestEnqueuedAt cannot be later than wallClockNow");
+        }
+        const ageAtObservation = wallClockNow - oldestEnqueuedAtMs!;
         durablePendingSince = now - ageAtObservation;
       }
       entry.pendingAvailable = true;

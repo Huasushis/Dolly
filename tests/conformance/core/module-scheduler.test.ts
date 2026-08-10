@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { BlockStore, type BlockProposal } from "../../../src/core/block-store.js";
 import {
@@ -5,6 +8,7 @@ import {
   type DeliveryClaim,
   type DeliveryClaimIdentity,
 } from "../../../src/core/delivery-store.js";
+import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import type { ModuleSubmissionRecord } from "../../../src/core/module-process-records.js";
 import {
   InMemoryModuleResultCommitRepository,
@@ -36,6 +40,8 @@ import {
 } from "../../../src/core/reactive-module-runtime.js";
 
 const NOW = "2026-07-26T00:00:00.000Z";
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const scratchParent = resolve(repositoryRoot, "..", ".tmp");
 
 function submissionForClaim(
   claim: DeliveryClaimIdentity & { readonly inputDigest: string },
@@ -1073,10 +1079,91 @@ describe("CORE scheduler policy boundary", () => {
     await scheduler.stop();
   });
 
+  it("reopens FileCore with a new monotonic epoch without resetting backlog age", async () => {
+    mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
+    const scratch = mkdtempSync(resolve(scratchParent, "scheduler-backlog-restart-"));
+    const statePath = resolve(scratch, "core-state.json");
+    let blockId = 0;
+    let deliveryId = 0;
+    const openCore = () => new FileCoreStateStore({
+      path: statePath,
+      maxFailedAttempts: 3,
+      nextBlockId: () => `restart-block-${++blockId}`,
+      nextDeliveryId: (kind) => `${kind}-restart-${++deliveryId}`,
+      now: () => NOW,
+    });
+    let scheduler: ModuleScheduler | undefined;
+    try {
+      const first = openCore();
+      first.deliveries.createPage("input");
+      first.deliveries.registerConsumer("input", "worker", "from-now");
+      const block = first.blocks.commit(
+        { payload: { schema: "test.content/1", value: { text: "persisted" } } },
+        { kind: "external", id: "console" },
+      );
+      first.deliveries.append("input", block.id);
+
+      const reopened = openCore();
+      expect(reopened.deliveries.inspectPending("worker", ["input"]).oldestEnqueuedAt)
+        .toBe(NOW);
+      const clock = new FakeSchedulerClock();
+      const seen: SchedulerSnapshot[] = [];
+      scheduler = new ModuleScheduler({
+        instanceId: "instance-restarted",
+        deliveries: reopened.deliveries,
+        clock,
+        wallClockNow: () => Date.parse(NOW) + 10_000,
+        pollIntervalMs: 100,
+        retryBaseMs: 250,
+        retryMaxMs: 2_000,
+        maxConcurrentModules: 1,
+        backpressureAction: "pause-upstream",
+        downstreamRecheckMs: 50,
+        noProgressAfterMs: 1_000,
+        claimLimitCount: 1,
+        claimLimitBytes: 1_024,
+        retryJitterRatio: 0,
+        policy: {
+          decide: (snapshot) => {
+            seen.push(snapshot);
+            return {
+              eligible: false,
+              eligibleAt: null,
+              claimLimitCount: 1,
+              claimLimitBytes: 1_024,
+              reasonCode: "OBSERVED",
+              policyName: "observer",
+              policyVersion: "1",
+            };
+          },
+        },
+      });
+      scheduler.register({
+        moduleId: "worker",
+        runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+        inputPageIds: ["input"],
+        outputPageIds: [],
+        mailbox: { maxPendingCount: 10, maxPendingBytes: 10_000 },
+      });
+
+      scheduler.start();
+      await drain(clock);
+
+      expect(seen.at(-1)?.oldestPendingAgeMs).toBe(10_000);
+      expect(scheduler.status("worker").oldestPendingAgeMs).toBe(10_000);
+    } finally {
+      await scheduler?.stop().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("treats malformed durable pending time or wall-clock mapping as unavailable input", async () => {
     for (const [oldestEnqueuedAt, wallClockNow] of [
       ["not-a-timestamp", () => Date.parse(NOW)],
       [NOW, () => Number.NaN],
+      [NOW, () => -1],
+      [NOW, () => 8_640_000_000_000_001],
+      [NOW, () => Date.parse(NOW) - 1],
     ] as const) {
       const { clock, mailboxes, scheduler, events } = createScheduler({ wallClockNow });
       const runtime = new FakeModuleRuntime(() => ({ status: "idle" }));

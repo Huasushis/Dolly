@@ -1785,13 +1785,14 @@ reverse ownership order.
 Every Module MUST declare one primary activation mode. A future accepted Extension process protocol
 may define explicit combinations, but implicit hybrid behavior is forbidden.
 
-The product bootstrap still rejects all configured Modules. The guarded
-pre-bootstrap composition implements reactive activation and one narrow
-delivery-backed periodic slice: a periodic Module with input Pages and
-`allowEmptyInput: false` uses the same durable Claim and result-commit boundary
-as a reactive Module. Empty periodic runs and all source activation remain
-future contract requirements and MUST be rejected until their Module job and
-completion boundaries are implemented and tested.
+The product bootstrap still rejects all configured Modules. The Scheduler
+component implements one narrow delivery-backed periodic policy for scientific
+and deterministic component testing: a periodic registration with input Pages
+and `allowEmptyInput: false` uses the same runtime tick shape as a reactive
+registration. The verified Extension composition does not activate it, because
+package manifest version 1 can declare only reactive support and version 2 is
+reserved for the complete schema-registry contract. Periodic and source process
+activation remain future contract requirements.
 
 ### 11.1 Reactive mode
 
@@ -1807,11 +1808,12 @@ A periodic Module becomes eligible according to a configured target period. At
 eligibility it claims currently pending input. Configuration MUST state whether
 an empty-input run is allowed.
 
-The current pre-bootstrap slice permits only `allowEmptyInput: false`. Its first
+The current Scheduler component permits only `allowEmptyInput: false`. Its first
 run becomes eligible when pending input is first observed. Every later
 eligibility is start-to-start as defined below. Waiting for a declared future
-period is not reported as no progress. Empty-input periodic execution needs a
-durable trigger identity independent of a Delivery Claim and remains rejected.
+period is not reported as no progress. This is Scheduler behavior, not process
+activation support. Empty-input periodic execution needs a durable trigger
+identity independent of a Delivery Claim and remains rejected.
 
 The target period is defined as the desired interval between run **start
 times**, not the delay after a run finishes.
@@ -1968,6 +1970,10 @@ then advances it only with the monotonic clock until the oldest Delivery
 changes. A reader that cannot supply the optional timestamp falls back to age
 since first observation. A malformed timestamp or invalid clock reading makes
 that mailbox unavailable; it MUST NOT be treated as zero-age or free capacity.
+The wall-clock reading MUST be a non-negative integer within the platform Date
+range, and it MUST be at or after the persisted enqueue time. A future enqueue
+time is evidence of clock rollback or inconsistent storage and fails closed;
+the Scheduler does not hide it behind a zero-age clamp.
 
 **Downstream pressure** is the read-only count and byte report for one
 downstream Module in this snapshot. `available` means that the scheduler has
@@ -1988,7 +1994,7 @@ the policy MUST define damping, stability limits, and no-progress detection.
 
 ### 13.3 Baseline policy
 
-The guarded pre-bootstrap composition uses a simple fixed policy:
+The Scheduler component uses a simple fixed policy:
 
 - reactive Modules run when data is pending and the actor is idle;
 - non-empty periodic Modules run at most once per start-to-start period when

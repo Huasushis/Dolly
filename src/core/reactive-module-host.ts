@@ -65,7 +65,7 @@ export interface ReactiveModuleHostRuntimeRegistration {
   readonly moduleId: string;
   readonly runtime: ManagedReactiveModuleRuntime;
   readonly mailbox: SchedulerMailboxLimits;
-  /** Verified static manifest from the installation resolver; no Extension code has run. */
+  /** Static compatibility input only; this candidate seam does not prove installation provenance. */
   readonly manifest: ExtensionPackageManifest;
 }
 
@@ -84,12 +84,13 @@ export interface ReactiveModuleHostComposition {
 
 /**
  * Builds the product-before-startup Delivery-backed vertical slice from one
- * validated instance document. It accepts reactive Modules and periodic
- * Modules that forbid empty input; both use the same durable Claim boundary.
- * Page routes and the three released polling/retry values come only from that
- * document. The constraints absent from instance version 9 must be supplied
- * explicitly and are checked against every Module's hard Claim maxima before a
- * runtime starts.
+ * validated instance document. The current verified package manifest supports
+ * only reactive Modules. The Scheduler itself can preserve a non-empty
+ * periodic descriptor, but composition rejects it until a later complete
+ * package schema can declare that support. Page routes and the three released
+ * polling/retry values come only from the instance document. The constraints
+ * absent from instance version 9 must be supplied explicitly and are checked
+ * against every Module's hard Claim maxima before a runtime starts.
  *
  * `openDollyRuntime` deliberately does not call this function. Linux process
  * ownership, durable external-effect evidence, and the next instance schema
@@ -230,6 +231,9 @@ export class ReactiveModuleHost {
         inputPageIds: Object.freeze([...registration.inputPageIds]),
         outputPageIds: Object.freeze([...registration.outputPageIds]),
         mailbox: Object.freeze({ ...registration.mailbox }),
+        ...(registration.activation === undefined
+          ? {}
+          : { activation: Object.freeze({ ...registration.activation }) }),
       });
     });
     this.#scheduler = scheduler;

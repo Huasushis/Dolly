@@ -311,44 +311,9 @@ describe("static Extension installation registry", () => {
     );
   });
 
-  it("adds delivery-backed periodic support without broadening package schema version 1", () => {
+  it("keeps reserved package schema version 2 unavailable until its full contract lands", () => {
     writePackage(sourceDirectory, {
       schemaVersion: "dolly.extension-package/2",
-      modules: [{
-        moduleKind: "transform",
-        supportedActivations: ["reactive", "periodic"],
-        configVersion: 1,
-        configurationSchema: moduleDeclaration().configurationSchema,
-      }],
-    });
-
-    const installed = registry().installNodePackage({
-      sourceDirectory,
-      trust: "trusted",
-    });
-
-    expect(installed.manifest).toMatchObject({
-      schemaVersion: "dolly.extension-package/2",
-      modules: [{
-        moduleKind: "transform",
-        supportedActivations: ["reactive", "periodic"],
-      }],
-    });
-  });
-
-  it.each([
-    ["an empty activation set", []],
-    ["duplicate activations", ["reactive", "reactive"]],
-    ["an unsupported source activation", ["source"]],
-  ])("rejects package schema version 2 with %s", (_label, supportedActivations) => {
-    writePackage(sourceDirectory, {
-      schemaVersion: "dolly.extension-package/2",
-      modules: [{
-        moduleKind: "transform",
-        supportedActivations,
-        configVersion: 1,
-        configurationSchema: moduleDeclaration().configurationSchema,
-      }],
     });
 
     expectInstallationError(

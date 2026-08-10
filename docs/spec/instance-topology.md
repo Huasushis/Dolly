@@ -389,13 +389,14 @@ as an error.
   connection.
 - Instance schema version 9 can represent reactive, periodic, and source
   declarations, but representation is not proof that a mode can start. Package
-  manifest version 1 supports only reactive activation. Package manifest version
-  2 can explicitly support reactive and/or periodic activation.
-- The guarded pre-bootstrap composition accepts periodic only when the instance
-  has input Pages, sets `allowEmptyInput: false`, and the exact installed package
-  version declares periodic support for the selected Module kind and
-  configuration version. It rejects a mismatch before starting Extension code.
-- Empty periodic and source activation remain unsupported. Product bootstrap
+  manifest version 1 supports only reactive activation.
+- `dolly.extension-package/2` is already reserved by `schema-registry.md` for
+  the complete payload-schema registration contract. It MUST NOT be introduced
+  as an activation-only partial schema. Until the full contract can also declare
+  periodic compatibility, verified Extension composition rejects periodic
+  before process start even though the Scheduler component can model its
+  delivery-backed timing policy.
+- Periodic and source process activation remain unsupported. Product bootstrap
   still rejects all configured Modules. Editing and startup surfaces MUST report
   an unsupported implementation boundary, not call these declarations malformed.
 

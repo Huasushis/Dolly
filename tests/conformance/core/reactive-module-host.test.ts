@@ -175,6 +175,24 @@ describe("reactive Module host lifecycle", () => {
     ]);
   });
 
+  it("preserves an explicit activation descriptor when it registers a runtime", () => {
+    const events: string[] = [];
+    const fakeScheduler = scheduler(events);
+
+    new ReactiveModuleHost(
+      fakeScheduler as never,
+      [{
+        ...registration("periodic", runtime("periodic", events)),
+        activation: { kind: "periodic", periodMs: 250, allowEmptyInput: false },
+      }],
+    );
+
+    expect(fakeScheduler.register).toHaveBeenCalledWith(expect.objectContaining({
+      moduleId: "periodic",
+      activation: { kind: "periodic", periodMs: 250, allowEmptyInput: false },
+    }));
+  });
+
   it("rolls already-started runtimes back in reverse order without starting Scheduler", async () => {
     const events: string[] = [];
     const fakeScheduler = scheduler(events);
@@ -213,26 +231,6 @@ describe("reactive Module host lifecycle", () => {
     expect(() => composeReactiveModuleHost(composition(configuredInstance({
       activation: { kind: "periodic", periodMs: 1000, allowEmptyInput: false },
     })))).toThrow(/does not support periodic activation/u);
-
-    const periodicManifest = {
-      schemaVersion: "dolly.extension-package/2",
-      extensionId: "org.example.worker",
-      packageVersion: "1.0.0",
-      displayName: "Worker",
-      description: "Test worker",
-      supportedProtocolVersions: ["3.0"],
-      entrypoint: "dist/worker.mjs",
-      modules: [{
-        moduleKind: "transform",
-        supportedActivations: ["reactive", "periodic"],
-        configVersion: 1,
-        configurationSchema: { type: "object" },
-      }],
-      requestedCapabilities: [],
-    } satisfies ExtensionPackageManifest;
-    expect(composeReactiveModuleHost(composition(configuredInstance({
-      activation: { kind: "periodic", periodMs: 1000, allowEmptyInput: false },
-    }), undefined, periodicManifest))).toBeInstanceOf(ReactiveModuleHost);
 
     expect(() => composeReactiveModuleHost(composition(configuredInstance({
       activation: { kind: "periodic", periodMs: 1000, allowEmptyInput: true },

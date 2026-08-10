@@ -37,16 +37,16 @@ const FIXTURE = fileURLToPath(
   new URL("../security/fixtures/extension-process-fixture.mjs", import.meta.url),
 );
 const MANIFEST: ExtensionPackageManifest = {
-  schemaVersion: "dolly.extension-package/2",
+  schemaVersion: "dolly.extension-package/1",
   extensionId: "com.example.fixture",
   packageVersion: "1.0.0",
   displayName: "Process test fixture",
-  description: "Runs one real child behind the Delivery-backed Module host.",
+  description: "Runs one real child behind the reactive Module host.",
   supportedProtocolVersions: ["3.0"],
   entrypoint: "extension-process-fixture.mjs",
   modules: [{
     moduleKind: "fixture",
-    supportedActivations: ["periodic"],
+    activation: "reactive",
     configVersion: 1,
     configurationSchema: { type: "object" },
   }],
@@ -71,10 +71,10 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-describe("Delivery-backed periodic Module host with a real child process", () => {
-  it("uses one durable input Claim and commits the child result through FileCore", async () => {
+describe("reactive Module host with a real child process", () => {
+  it("auto-wakes from a durable input and commits the child result through FileCore", async () => {
     mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
-    const root = mkdtempSync(join(scratchParent, "dolly-periodic-host-real-"));
+    const root = mkdtempSync(join(scratchParent, "dolly-reactive-host-real-"));
     const processGenerationId = "process-generation-host-real-1";
     const moduleGenerationId = "module-generation-host-real-1";
     const extensionHosts: ExtensionProcessHost[] = [];
@@ -123,7 +123,7 @@ describe("Delivery-backed periodic Module host with a real child process", () =>
           inputPageIds: ["input"],
           outputPageIds: ["output"],
           subscriptionStart: "from-now",
-          activation: { kind: "periodic", periodMs: 250, allowEmptyInput: false },
+          activation: { kind: "reactive" },
           limits: {
             claim: { maxCount: 1, maxBytes: 64 * 1024 },
             maxInputBytes: 64 * 1024,
