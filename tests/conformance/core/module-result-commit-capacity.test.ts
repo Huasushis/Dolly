@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { type BlockProposal } from "../../../src/core/block-store.js";
 import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
+import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import { createModuleResultCommitCoordinator } from "../../../src/core/module-result-commit-factory.js";
 import {
@@ -114,6 +115,152 @@ function prepareWorker(
 }
 
 describe("FileCore Module output capacity", () => {
+  it("recovers a later capacity-releasing result before retrying an earlier blocked result", async () => {
+    const root = scratch("capacity-restart-order");
+    const statePath = join(root, "core-state.json");
+    const journalPath = join(root, "module-result-commits.json");
+    const core = openCore(statePath, "initial");
+    core.deliveries.createPage("upstream-input");
+    core.deliveries.createPage("output");
+    core.deliveries.registerConsumer("upstream-input", "upstream", "from-now");
+    core.deliveries.registerConsumer("output", "sink", "from-now");
+
+    const resident = core.blocks.commit(proposal("sink input"), {
+      kind: "external",
+      id: "console",
+    });
+    core.deliveries.append("output", resident.id);
+    const upstream = prepareWorker(core, "upstream", "upstream-input");
+    const sinkClaim = core.deliveries.claim({
+      consumerId: "sink",
+      pageIds: ["output"],
+      moduleGenerationId: "sink-generation",
+      maxCount: 1,
+      maxBytes: 1024 * 1024,
+    })!;
+    const sinkProcessGenerationId = "sink-process-generation";
+    core.appendModuleProcessRecord({
+      schemaVersion: "dolly.module-process-record/1",
+      instanceId: "capacity-instance",
+      moduleId: "sink",
+      moduleGenerationId: sinkClaim.moduleGenerationId,
+      processGenerationId: sinkProcessGenerationId,
+      packageDigest: `sha256:${"a".repeat(64)}`,
+      configurationReference: {
+        configId: "sink-config",
+        revision: `sha256:${"b".repeat(64)}`,
+        configVersion: 1,
+      },
+      declaredExternalEffects: "core-capabilities-only",
+      serviceInvocationId: "2812432ad29e4d3bbd6776c62cafa929",
+      bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
+      moduleCgroupPath: deriveModuleCgroupPath(
+        "/system.slice/dolly-core.service",
+        {
+          instanceId: "capacity-instance",
+          moduleId: "sink",
+          processGenerationId: sinkProcessGenerationId,
+        },
+      ).filesystemPath,
+      state: "starting",
+      createdAt: NOW,
+      updatedAt: NOW,
+    });
+    core.updateModuleProcessRecordState(sinkProcessGenerationId, "running");
+    core.appendModuleSubmissionRecord({
+      schemaVersion: "dolly.module-submission-record/1",
+      moduleJobId: sinkClaim.moduleJobId,
+      claimToken: sinkClaim.claimToken,
+      runId: sinkClaim.runId,
+      attempt: sinkClaim.attempt,
+      moduleGenerationId: sinkClaim.moduleGenerationId,
+      processGenerationId: sinkProcessGenerationId,
+      inputDigest: canonicalJsonDigest(core.deliveries.inspectClaimInput(sinkClaim)),
+      createdAt: NOW,
+    });
+
+    const repository = new FileModuleResultCommitRepository({ path: journalPath });
+    const coordinator = createModuleResultCommitCoordinator({
+      core,
+      repository,
+      now: () => NOW,
+      mailboxes: [{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 1,
+        maxResidentBytes: 1024 * 1024,
+      }],
+    });
+    await expect(coordinator.commit(upstream)).rejects.toMatchObject({
+      code: "MODULE_RESULT_OUTPUT_BACKPRESSURED",
+      blockedConsumerIds: ["sink"],
+    });
+
+    const interruptedSink = createModuleResultCommitCoordinator({
+      core,
+      repository,
+      now: () => NOW,
+      mailboxes: [{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 1,
+        maxResidentBytes: 1024 * 1024,
+      }],
+      afterEffect: (event) => {
+        if (event.moduleJobId === sinkClaim.moduleJobId && event.phase === "after-block-effect") {
+          throw new Error("simulated restart before the sink releases capacity");
+        }
+      },
+    });
+    await expect(interruptedSink.commit({
+      ...sinkClaim,
+      source: { kind: "module", id: "sink" },
+      outputPageIds: [],
+      blockProposal: proposal("sink result without output"),
+    })).rejects.toThrow("simulated restart before the sink releases capacity");
+    expect(repository.list().map((record) => record.moduleJobId)).toEqual([
+      upstream.moduleJobId,
+      sinkClaim.moduleJobId,
+    ]);
+
+    const reopened = openCore(statePath, "reopened");
+    const reopenedRepository = new FileModuleResultCommitRepository({ path: journalPath });
+    const recovering = createModuleResultCommitCoordinator({
+      core: reopened,
+      repository: reopenedRepository,
+      now: () => NOW,
+      mailboxes: [{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 1,
+        maxResidentBytes: 1024 * 1024,
+      }],
+    });
+
+    await expect(recovering.recoverAll()).resolves.toHaveLength(2);
+    expect(reopened.deliveries.inspectClaim(upstream).status).toBe("committed");
+    expect(reopened.deliveries.inspectClaim(sinkClaim).status).toBe("committed");
+    expect(reopened.deliveries.inspectResident("sink", ["output"])).toMatchObject({
+      residentCount: 1,
+    });
+
+    const verifiedCore = openCore(statePath, "verified");
+    const verifiedRepository = new FileModuleResultCommitRepository({ path: journalPath });
+    expect(verifiedRepository.get(upstream.moduleJobId)).toMatchObject({
+      state: "committed",
+      outputDeliveries: [expect.objectContaining({ pageId: "output" })],
+    });
+    expect(verifiedRepository.get(sinkClaim.moduleJobId)).toMatchObject({
+      state: "committed",
+      outputDeliveries: [],
+    });
+    expect(verifiedCore.deliveries.inspectClaim(upstream).status).toBe("committed");
+    expect(verifiedCore.deliveries.inspectClaim(sinkClaim).status).toBe("committed");
+    expect(verifiedCore.deliveries.inspectResident("sink", ["output"])).toMatchObject({
+      residentCount: 1,
+    });
+  });
+
   it("keeps a blocked result prepared, then catches its journal up after one atomic commit", async () => {
     const root = scratch("capacity-recovery");
     const statePath = join(root, "core-state.json");
@@ -150,6 +297,10 @@ describe("FileCore Module output capacity", () => {
     expect(core.deliveries.inspectClaim(input).status).toBe("active");
     expect(core.getModuleSubmissionRecord(input.runId)).toBeDefined();
     expect(core.deliveries.inspectPending("sink", ["output"]).pendingCount).toBe(1);
+    await expect(limited.recoverAll()).rejects.toMatchObject({
+      code: "MODULE_RESULT_OUTPUT_BACKPRESSURED",
+      blockedConsumerIds: ["sink"],
+    });
 
     let interruptAfterAtomicCommit = true;
     const expanded = createModuleResultCommitCoordinator({

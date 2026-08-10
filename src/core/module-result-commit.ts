@@ -733,13 +733,38 @@ export class ModuleResultCommitCoordinator {
 
   async recoverAll(): Promise<readonly ModuleResultCommitRecord[]> {
     const recovered: ModuleResultCommitRecord[] = [];
+    const prepared: ModuleResultCommitRecord[] = [];
     for (const record of this.#repository.list()) {
       assertModuleResultCommitRecord(record);
       if (record.state === "prepared") {
-        recovered.push(await this.#runExclusive(record.moduleJobId));
+        prepared.push(record);
       } else if (record.state === "committed") {
         await this.#runExclusive(record.moduleJobId);
       }
+    }
+
+    // A prepared result can be waiting for capacity that a later prepared
+    // result will release when it acknowledges its own input Claim. Journal
+    // order is not a dependency order, so one blocked entry must not prevent
+    // independent entries from recovering. Each successful pass removes at
+    // least one entry; if a complete pass makes no progress, preserve the
+    // existing fail-closed backpressure result for the caller.
+    let pending = prepared;
+    while (pending.length > 0) {
+      const deferred: ModuleResultCommitRecord[] = [];
+      let firstBackpressure: ModuleResultCommitBackpressureError | undefined;
+      for (const record of pending) {
+        try {
+          recovered.push(await this.#runExclusive(record.moduleJobId));
+        } catch (error) {
+          if (!(error instanceof ModuleResultCommitBackpressureError)) throw error;
+          firstBackpressure ??= error;
+          deferred.push(record);
+        }
+      }
+      if (deferred.length === 0) break;
+      if (deferred.length === pending.length) throw firstBackpressure!;
+      pending = deferred;
     }
     return recovered;
   }
