@@ -1960,6 +1960,15 @@ maximum count and byte limits; a decision outside those maxima MUST fail before
 claiming input. Direct runtime callers that omit per-dispatch values use the
 configured maxima.
 
+`oldestPendingAgeMs` MUST NOT reset merely because the Scheduler process or its
+monotonic clock restarted. When the Delivery reader supplies the canonical
+persisted `oldestEnqueuedAt`, the Scheduler computes its age once against an
+injected wall-clock reading, maps that age onto the current monotonic epoch, and
+then advances it only with the monotonic clock until the oldest Delivery
+changes. A reader that cannot supply the optional timestamp falls back to age
+since first observation. A malformed timestamp or invalid clock reading makes
+that mailbox unavailable; it MUST NOT be treated as zero-age or free capacity.
+
 **Downstream pressure** is the read-only count and byte report for one
 downstream Module in this snapshot. `available` means that the scheduler has
 confirmed capacity under its configured bounds, `blocked` means that it has

@@ -86,6 +86,8 @@ export interface SchedulableModuleRuntime {
 export interface SchedulerPendingSnapshot {
   readonly pendingCount: number;
   readonly pendingBytes: number;
+  /** Canonical persisted enqueue time when the reader can provide it. */
+  readonly oldestEnqueuedAt?: string | null;
 }
 
 /**
@@ -178,7 +180,7 @@ export interface SchedulerModuleRegistration {
   readonly inputPageIds: readonly string[];
   readonly outputPageIds: readonly string[];
   readonly mailbox: SchedulerMailboxLimits;
-  /** Defaults to reactive. Periodic and source activation are rejected. */
+  /** Defaults to reactive. Empty periodic and source activation are rejected. */
   readonly activation?: SchedulerActivationDescriptor;
 }
 
@@ -188,6 +190,8 @@ export interface ModuleSchedulerOptions {
   readonly instanceId: string;
   readonly deliveries: SchedulerPendingReader;
   readonly clock: SchedulerClock;
+  /** Maps a durable enqueue timestamp onto this Scheduler's monotonic epoch. */
+  readonly wallClockNow?: () => number;
   /** `core.scheduler.pollIntervalMs`. */
   readonly pollIntervalMs: number;
   /** `core.scheduler.retryBaseMs`. */
@@ -486,6 +490,7 @@ interface ModuleEntry {
   pending: SchedulerPendingSnapshot;
   pendingAvailable: boolean;
   pendingSinceMonotonic: number | null;
+  pendingOldestEnqueuedAt: string | null;
   mailboxFull: boolean;
   inFlight: Promise<void> | null;
   outputCommitWaiting: boolean;
@@ -567,6 +572,7 @@ export class ModuleScheduler {
   readonly #instanceId: string;
   readonly #deliveries: SchedulerPendingReader;
   readonly #clock: SchedulerClock;
+  readonly #wallClockNow: () => number;
   readonly #pollIntervalMs: number;
   readonly #retryBaseMs: number;
   readonly #retryMaxMs: number;
@@ -637,6 +643,12 @@ export class ModuleScheduler {
         "clock must supply monotonicNow and schedule",
       );
     }
+    if (options.wallClockNow !== undefined && typeof options.wallClockNow !== "function") {
+      throw new ModuleSchedulerError(
+        "SCHEDULER_CONFIGURATION_INVALID",
+        "wallClockNow must be a function when present",
+      );
+    }
     if (typeof options.deliveries?.inspectPending !== "function") {
       throw new ModuleSchedulerError(
         "SCHEDULER_CONFIGURATION_INVALID",
@@ -662,6 +674,7 @@ export class ModuleScheduler {
     this.#instanceId = options.instanceId;
     this.#deliveries = options.deliveries;
     this.#clock = options.clock;
+    this.#wallClockNow = options.wallClockNow ?? Date.now;
     this.#pollIntervalMs = options.pollIntervalMs;
     this.#retryBaseMs = options.retryBaseMs;
     this.#retryMaxMs = options.retryMaxMs;
@@ -767,6 +780,7 @@ export class ModuleScheduler {
       pending: { pendingCount: 0, pendingBytes: 0 },
       pendingAvailable: true,
       pendingSinceMonotonic: null,
+      pendingOldestEnqueuedAt: null,
       mailboxFull: false,
       inFlight: null,
       outputCommitWaiting: false,
@@ -1004,16 +1018,49 @@ export class ModuleScheduler {
 
   #refreshPending(entry: ModuleEntry, now: number): void {
     let pending: SchedulerPendingSnapshot;
+    let durablePendingSince: number | undefined;
     try {
       const read = this.#deliveries.inspectPending(entry.moduleId, entry.inputPageIds);
-      pending = { pendingCount: read.pendingCount, pendingBytes: read.pendingBytes };
+      const hasOldestEnqueuedAt = read.oldestEnqueuedAt !== undefined;
+      const oldestEnqueuedAt = read.oldestEnqueuedAt ?? null;
+      const oldestEnqueuedAtMs = oldestEnqueuedAt === null
+        ? null
+        : Date.parse(oldestEnqueuedAt);
+      if (
+        oldestEnqueuedAt !== null &&
+        (
+          typeof oldestEnqueuedAt !== "string" ||
+          !Number.isFinite(oldestEnqueuedAtMs) ||
+          new Date(oldestEnqueuedAtMs!).toISOString() !== oldestEnqueuedAt
+        )
+      ) {
+        throw new TypeError("oldestEnqueuedAt must be a canonical timestamp or null");
+      }
+      pending = {
+        pendingCount: read.pendingCount,
+        pendingBytes: read.pendingBytes,
+        ...(read.oldestEnqueuedAt === undefined ? {} : { oldestEnqueuedAt }),
+      };
       if (
         !Number.isSafeInteger(pending.pendingCount) ||
         pending.pendingCount < 0 ||
         !Number.isSafeInteger(pending.pendingBytes) ||
-        pending.pendingBytes < 0
+        pending.pendingBytes < 0 ||
+        (pending.pendingCount === 0 && oldestEnqueuedAt !== null) ||
+        (pending.pendingCount > 0 && hasOldestEnqueuedAt && oldestEnqueuedAt === null)
       ) {
-        throw new TypeError("pending state must be non-negative safe integers");
+        throw new TypeError("pending state is inconsistent");
+      }
+      if (
+        oldestEnqueuedAt !== null &&
+        oldestEnqueuedAt !== entry.pendingOldestEnqueuedAt
+      ) {
+        const wallClockNow = this.#wallClockNow();
+        if (!Number.isSafeInteger(wallClockNow)) {
+          throw new TypeError("wallClockNow must return a safe integer millisecond timestamp");
+        }
+        const ageAtObservation = Math.max(0, wallClockNow - oldestEnqueuedAtMs!);
+        durablePendingSince = now - ageAtObservation;
       }
       entry.pendingAvailable = true;
     } catch (error) {
@@ -1031,8 +1078,13 @@ export class ModuleScheduler {
     entry.pending = pending;
     if (pending.pendingCount === 0) {
       entry.pendingSinceMonotonic = null;
+      entry.pendingOldestEnqueuedAt = null;
+    } else if (durablePendingSince !== undefined) {
+      entry.pendingSinceMonotonic = durablePendingSince;
+      entry.pendingOldestEnqueuedAt = pending.oldestEnqueuedAt!;
     } else if (entry.pendingSinceMonotonic === null) {
       entry.pendingSinceMonotonic = now;
+      entry.pendingOldestEnqueuedAt = null;
     }
   }
 

@@ -251,8 +251,18 @@ class FakeMailboxes implements SchedulerPendingReader {
   readonly reads: Array<{ consumerId: string; pageIds: readonly string[] }> = [];
   readonly failing = new Set<string>();
 
-  set(consumerId: string, pendingCount: number, pendingBytes: number): void {
-    this.#state.set(consumerId, { pendingCount, pendingBytes });
+  set(
+    consumerId: string,
+    pendingCount: number,
+    pendingBytes: number,
+    oldestEnqueuedAt?: string,
+  ): void {
+    const snapshot = {
+      pendingCount,
+      pendingBytes,
+      ...(oldestEnqueuedAt === undefined ? {} : { oldestEnqueuedAt }),
+    };
+    this.#state.set(consumerId, snapshot);
   }
 
   inspectPending(consumerId: string, pageIds: readonly string[]): SchedulerPendingSnapshot {
@@ -321,6 +331,7 @@ describe("CORE scheduler run loop serialization", () => {
       instanceId: "instance-1",
       deliveries,
       clock,
+      wallClockNow: () => Date.parse(NOW) + 10_000,
       pollIntervalMs: 60_000,
       retryBaseMs: 250,
       retryMaxMs: 2_000,
@@ -354,6 +365,7 @@ describe("CORE scheduler run loop serialization", () => {
 
     expect(clock.monotonicNow()).toBe(0);
     expect(runtime.tickCount).toBe(1);
+    expect(scheduler.status("worker").oldestPendingAgeMs).toBe(10_000);
     await scheduler.stop();
     expect(clock.liveTimerCount).toBe(0);
 
@@ -1019,6 +1031,72 @@ describe("CORE scheduler policy boundary", () => {
     expect(scheduler.status("producer").policyName).toBe("observer");
     expect(scheduler.status("producer").policyVersion).toBe("9");
     await scheduler.stop();
+  });
+
+  it("preserves the durable oldest pending age when the Scheduler monotonic clock restarts", async () => {
+    const seen: SchedulerSnapshot[] = [];
+    const policy: SchedulerPolicy = {
+      decide: (snapshot) => {
+        seen.push(snapshot);
+        return {
+          eligible: false,
+          eligibleAt: null,
+          claimLimitCount: 1,
+          claimLimitBytes: 100,
+          reasonCode: "OBSERVED",
+          policyName: "observer",
+          policyVersion: "1",
+        };
+      },
+    };
+    const wallClockNow = Date.parse("2026-07-26T00:00:10.000Z");
+    const { clock, mailboxes, scheduler } = createScheduler({
+      policy,
+      wallClockNow: () => wallClockNow,
+    });
+    mailboxes.set("worker", 1, 100, NOW);
+    scheduler.register({
+      moduleId: "worker",
+      runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxPendingCount: 10, maxPendingBytes: 1_000 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(seen.at(-1)?.oldestPendingAgeMs).toBe(10_000);
+    expect(scheduler.status("worker").oldestPendingAgeMs).toBe(10_000);
+    await advance(clock, 250);
+    expect(scheduler.status("worker").oldestPendingAgeMs).toBe(10_250);
+    await scheduler.stop();
+  });
+
+  it("treats malformed durable pending time or wall-clock mapping as unavailable input", async () => {
+    for (const [oldestEnqueuedAt, wallClockNow] of [
+      ["not-a-timestamp", () => Date.parse(NOW)],
+      [NOW, () => Number.NaN],
+    ] as const) {
+      const { clock, mailboxes, scheduler, events } = createScheduler({ wallClockNow });
+      const runtime = new FakeModuleRuntime(() => ({ status: "idle" }));
+      mailboxes.set("worker", 1, 100, oldestEnqueuedAt);
+      scheduler.register({
+        moduleId: "worker",
+        runtime,
+        inputPageIds: ["input"],
+        outputPageIds: [],
+        mailbox: { maxPendingCount: 10, maxPendingBytes: 1_000 },
+      });
+
+      scheduler.start();
+      await drain(clock);
+
+      expect(runtime.tickCount).toBe(0);
+      expect(scheduler.status("worker").pendingStateAvailable).toBe(false);
+      expect(eventTypes(events, "worker")).toContain("scheduler.pending_unavailable");
+      await scheduler.stop();
+    }
   });
 });
 
