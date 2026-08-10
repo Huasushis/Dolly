@@ -1436,6 +1436,12 @@ async function runCondition(options: {
     if (effectEvidence.kind !== "terminal" || reopenedEffectEvidence.kind !== "terminal") {
       throw new Error("Agent capability effects were not durably closed for the committed Run");
     }
+    const effectArtifact = `effect-intents-${caseIdentity}.json`;
+    const effectBytes = readFileSync(join(conditionRoot, "effect-intents.json"));
+    writeFileSync(join(options.runDirectory, effectArtifact), effectBytes, {
+      flag: "wx",
+      mode: 0o600,
+    });
 
     await host.stop();
     const childStopped = !processIsAlive(childPid);
@@ -1449,9 +1455,17 @@ async function runCondition(options: {
       childPidRecorded: true,
       childStopped,
       linuxControlGroupProof: false,
+      effectJournal: {
+        artifact: effectArtifact,
+        sha256: sha256(effectBytes),
+        evidence: "terminal",
+      },
       commit: {
         moduleJobId: committed.moduleJobId,
+        claimToken: committed.claimToken,
         runId: committed.runId,
+        attempt: committed.attempt,
+        moduleGenerationId: committed.moduleGenerationId,
         blockId: committed.blockId,
         outputDeliveries: committed.outputDeliveries,
       },
@@ -1693,6 +1707,7 @@ async function main(): Promise<void> {
   const completedAt = new Date().toISOString();
   const rows = caseRows as unknown as readonly {
     conditionId?: string;
+    effectJournal?: { artifact?: unknown; sha256?: unknown; evidence?: unknown };
     result?: {
       actions?: readonly string[];
       answer?: { answer?: unknown; grounded?: unknown; evidenceKeys?: unknown };
@@ -1764,6 +1779,20 @@ async function main(): Promise<void> {
   };
   const analysisPath = join(runDirectory, "analysis.json");
   writeFileSync(analysisPath, `${JSON.stringify(analysis, null, 2)}\n`, { flag: "wx" });
+  const effectArtifacts = Object.fromEntries(rows.map((row) => {
+    const artifact = row.effectJournal?.artifact;
+    const digest = row.effectJournal?.sha256;
+    if (
+      typeof artifact !== "string" ||
+      !/^effect-intents-[A-Za-z0-9._-]+\.json$/u.test(artifact) ||
+      typeof digest !== "string" ||
+      !/^[0-9a-f]{64}$/u.test(digest) ||
+      row.effectJournal?.evidence !== "terminal"
+    ) {
+      throw new Error("Completed Agent case has invalid effect-journal evidence");
+    }
+    return [artifact, digest];
+  }));
   const rawOutputs = {
     providerResponsesSha256: sha256(readFileSync(providerResponsesPath)),
     modelCallsSha256: sha256(readFileSync(modelCallsPath)),
@@ -1865,6 +1894,7 @@ async function main(): Promise<void> {
       "model-calls.jsonl": rawOutputs.modelCallsSha256,
       "cases.jsonl": rawOutputs.casesSha256,
       "analysis.json": rawOutputs.analysisSha256,
+      ...effectArtifacts,
     },
   };
   writeFileSync(

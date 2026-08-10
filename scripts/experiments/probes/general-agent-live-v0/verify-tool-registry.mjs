@@ -439,6 +439,78 @@ function verifyTreatment(row, evaluationSeed, repetition) {
   }
 }
 
+function verifyEffectJournal(row, runDirectory, manifest) {
+  const expectedArtifact =
+    `effect-intents-${row.conditionId}-seed-${row.evaluationSeed}.json`;
+  if (
+    row.effectJournal?.artifact !== expectedArtifact ||
+    row.effectJournal?.evidence !== "terminal" ||
+    !/^[0-9a-f]{64}$/u.test(row.effectJournal?.sha256 ?? "")
+  ) {
+    fail(`${row.conditionId} effect-journal reference is invalid`);
+  }
+  const path = join(runDirectory, expectedArtifact);
+  const bytes = readFileSync(path);
+  if (
+    row.effectJournal.sha256 !== sha256(bytes) ||
+    manifest.artifacts?.[expectedArtifact] !== sha256(bytes)
+  ) {
+    fail(`${row.conditionId} effect-journal digest is invalid`);
+  }
+  const document = JSON.parse(bytes.toString("utf8"));
+  if (
+    document?.schemaVersion !== "dolly.effect-intent-store/2" ||
+    !Number.isSafeInteger(document.revision) ||
+    document.revision <= 0 ||
+    !Array.isArray(document.records) ||
+    document.records.length === 0 ||
+    !Array.isArray(document.runs) ||
+    document.runs.length !== 1
+  ) {
+    fail(`${row.conditionId} effect-journal document is incomplete`);
+  }
+  const run = document.runs[0];
+  if (
+    run?.schemaVersion !== "dolly.effect-run/1" ||
+    run.state !== "closed" ||
+    run.moduleJobId !== row.commit?.moduleJobId ||
+    run.runId !== row.commit?.runId ||
+    run.attempt !== row.commit?.attempt ||
+    run.claimToken !== row.commit?.claimToken ||
+    run.moduleGenerationId !== row.commit?.moduleGenerationId ||
+    run.intentCount !== document.records.length ||
+    !/^sha256:[0-9a-f]{64}$/u.test(run.intentSetDigest ?? "")
+  ) {
+    fail(`${row.conditionId} closed effect Run does not match the committed Run`);
+  }
+  const capabilityTypes = new Set();
+  for (const record of document.records) {
+    if (
+      record?.schemaVersion !== "dolly.effect-intent/2" ||
+      record.moduleJobId !== run.moduleJobId ||
+      record.runId !== run.runId ||
+      record.attempt !== run.attempt ||
+      record.claimToken !== run.claimToken ||
+      record.moduleGenerationId !== run.moduleGenerationId ||
+      record.outcome?.kind !== "terminal" ||
+      !/^sha256:[0-9a-f]{64}$/u.test(record.intentDigest ?? "") ||
+      !/^sha256:[0-9a-f]{64}$/u.test(record.outcome?.resultDigest ?? "") ||
+      Object.hasOwn(record, "arguments") ||
+      Object.hasOwn(record, "result")
+    ) {
+      fail(`${row.conditionId} effect intent is invalid or contains private payloads`);
+    }
+    capabilityTypes.add(record.capabilityType);
+  }
+  exactArray(
+    [...capabilityTypes].sort(),
+    row.conditionId === "no-storage-tool"
+      ? ["model-operation"]
+      : ["model-operation", "tool-invocation"],
+    `${row.conditionId} effect capability types`,
+  );
+}
+
 function verifyModelCalls(rows) {
   if (rows.length !== 10) fail(`expected 10 provider calls, observed ${rows.length}`);
   exactArray(
@@ -861,7 +933,7 @@ function main() {
   if (
     manifest.schemaVersion !== "general-agent-live/run-manifest/1" ||
     manifest.experimentId !== "general-agent-tool-registry-v4" ||
-    manifest.experimentVersion !== 4 ||
+    manifest.experimentVersion !== 5 ||
     manifest.runId !== runId ||
     manifest.status !== "completed"
   ) {
@@ -964,6 +1036,22 @@ function main() {
   verifyTreatment(cases[1], 7425, 1);
   verifyTreatment(cases[2], 7426, 2);
   verifyBaseline(cases[3], 7426, 2);
+  for (const row of cases) verifyEffectJournal(row, runDirectory, manifest);
+  const expectedArtifactNames = [
+    "analysis.json",
+    "cases.jsonl",
+    "effect-intents-no-storage-tool-seed-7425.json",
+    "effect-intents-no-storage-tool-seed-7426.json",
+    "effect-intents-tool-registry-storage-seed-7425.json",
+    "effect-intents-tool-registry-storage-seed-7426.json",
+    "model-calls.jsonl",
+    "provider-responses.jsonl",
+  ];
+  exactArray(
+    Object.keys(manifest.artifacts ?? {}).sort(),
+    expectedArtifactNames,
+    "manifest artifact inventory",
+  );
   const modelCalls = jsonLines(modelCallsPath);
   verifyModelCalls(modelCalls);
   const providerResponses = jsonLines(providerResponsesPath);
@@ -1035,7 +1123,7 @@ function main() {
   const verification = {
     schemaVersion: "general-agent-tool-registry/validation/1",
     experimentId: "general-agent-tool-registry-v4",
-    experimentVersion: 4,
+    experimentVersion: 5,
     runId,
     valid: true,
     checks: {
