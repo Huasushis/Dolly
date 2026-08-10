@@ -281,7 +281,7 @@ function verifyBaseline(row) {
   exact(checkpoint.final, {
     action: "checkpointed",
     taskId: TASK_ID,
-    checkpointKey: null,
+    checkpointKey: CHECKPOINT_KEY,
     stored: false,
   }, "baseline checkpoint result");
   const unrelated = phase(row, "unrelated").result;
@@ -413,6 +413,7 @@ function verifyRun(runDirectory, fixtureValues) {
   const preregistration = parseJson(join(runDirectory, "preregistration.json"));
   assert(manifest.schemaVersion === "scheduler-agent-task-switch/run-manifest/1", "manifest schema differs");
   assert(manifest.experimentId === "scheduler-agent-task-switch-v0", "manifest experiment differs");
+  assert(manifest.experimentVersion === 2, "manifest experiment version differs");
   assert(manifest.status === "completed" && manifest.failure === null, "run did not complete");
   assert(manifest.providerCalls === 11 && manifest.maximumProviderCalls === 11, "provider call budget differs");
   assert(manifest.secretLeasesReleased === 11, "secret leases were not released");

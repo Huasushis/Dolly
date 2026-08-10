@@ -370,7 +370,7 @@ async function runTreatment(run, task) {
 
 async function runBaseline(run, task) {
   const contracts = task.phase === "checkpoint"
-    ? "Return exactly {\"action\":\"checkpointed\",\"taskId\":<taskId>,\"checkpointKey\":null,\"stored\":false}."
+    ? "Return exactly {\"action\":\"checkpointed\",\"taskId\":<taskId>,\"checkpointKey\":<the checkpointKey from this current input>,\"stored\":false}. Echoing the key is not evidence that it was stored."
     : task.phase === "unrelated"
       ? "Return exactly {\"action\":\"answered\",\"taskId\":<taskId>,\"answer\":17}."
       : "Return exactly {\"action\":\"resumed\",\"taskId\":<taskId>,\"resumed\":false,\"nextAction\":null,\"evidenceKeys\":[]}.";
@@ -399,7 +399,8 @@ async function runBaseline(run, task) {
   const final = parseJsonObject(output.finalContent, expectedKeys, "baseline final");
   if (
     final.taskId !== task.taskId ||
-    (task.phase === "checkpoint" && (final.stored !== false || final.checkpointKey !== null)) ||
+    (task.phase === "checkpoint" &&
+      (final.stored !== false || final.checkpointKey !== task.checkpointKey)) ||
     (task.phase === "unrelated" && final.answer !== 17) ||
     (task.phase === "resume" &&
       (final.resumed !== false || final.nextAction !== null || JSON.stringify(final.evidenceKeys) !== "[]"))

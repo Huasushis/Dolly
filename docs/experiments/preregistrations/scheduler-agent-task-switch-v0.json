@@ -2,7 +2,7 @@
   "$schema": "./schema-v1.json",
   "schemaVersion": "dolly-experiment-preregistration/v1",
   "experimentId": "scheduler-agent-task-switch-v0",
-  "experimentVersion": 1,
+  "experimentVersion": 2,
   "title": "Scheduler-driven structured task checkpoint and task-switch effect canary",
   "status": "frozen-before-first-run",
   "scope": "live-canary",
@@ -53,7 +53,7 @@
     ]
   },
   "decision": {
-    "currentProductState": "Scheduler, process Host, active-Run model and tool capabilities, persistent tool/effect journals, and file Core are product components, but product bootstrap still refuses every configured Module. Memory v9 supports a sourced checkpoint candidate but does not establish association or a final Memory architecture.",
+    "currentProductState": "Scheduler, process Host, active-Run model and tool capabilities, persistent tool/effect journals, and file Core are product components, but product bootstrap still refuses every configured Module. Version 1 stopped after one valid HTTP response because its baseline incorrectly required checkpointKey null even though that key was present in the current input; Runtime then conservatively quarantined the failed Run. Version 2 changes only that non-causal baseline field and failed-run evidence retention. Memory v9 supports a sourced checkpoint candidate but does not establish association or a final Memory architecture.",
     "changesIfSupported": [
       "Use the sourced structured checkpoint as the first simple task-resumption boundary behind the candidate Scheduler composition.",
       "Keep richer association, consolidation, retrieval composition, and scheduling policy as independent experiments rather than embedding them in this checkpoint format.",
@@ -82,7 +82,11 @@
           "phases": ["checkpoint", "unrelated", "resume"],
           "maximumModelCalls": 3,
           "reasoningPolicy": "disable",
-          "outputContract": "json-object"
+          "outputContract": "json-object",
+          "checkpointAttemptResult": {
+            "checkpointKey": "echo the key from the current input",
+            "stored": false
+          }
         }
       }
     ],
@@ -120,7 +124,8 @@
       "name": "agent-registry-historical",
       "seeds": [7427, 7428],
       "caseFactors": [
-        "Earlier registry canaries established the JSON-object contract, Host registry, live Aether reasoning observation, and strict response validation used unchanged here."
+        "Earlier registry canaries established the JSON-object contract, Host registry, live Aether reasoning observation, and strict response validation used unchanged here.",
+        "Task-switch version 1 retained one HTTP-200 baseline checkpoint response and then stopped because its validator confused echoing an input checkpoint key with successful persistence; no treatment or resume response was observed."
       ]
     },
     "evaluation": {
@@ -130,7 +135,7 @@
         "Seed labels identify the fixed task-A and unrelated task-B inputs inside one paired sequence; the owner Aether endpoint exposes no verified provider seed control."
       ]
     },
-    "splitIsolation": "No response from this experiment exists before this version is frozen. Historical Memory and registry runs may motivate the mechanism but are never merged with these case rows or scored as this experiment.",
+    "splitIsolation": "No version-2 response exists before this version is frozen. Version-1 raw artifacts remain a separate failed run and cannot be retried, merged, or scored as version 2. Historical Memory and registry runs may motivate the mechanism but are never merged with these case rows.",
     "tuningUsesTrainingAndDevelopmentOnly": true
   },
   "backend": {
@@ -370,9 +375,9 @@
       "associationOrConsolidationIncluded": false
     },
     "implementationSha256": {
-      "scripts/experiments/probes/scheduler-agent-task-switch-v0/run.mts": "c427ee119dc1118d341f1112bacb14053a6d03964da59d053432cfe8d61f47fc",
-      "scripts/experiments/probes/scheduler-agent-task-switch-v0/extension.mjs": "61cd7046f9bead8959c5e4d13fedf2acd9212db3d90ff61cb1ce4e91261d8594",
-      "scripts/experiments/probes/scheduler-agent-task-switch-v0/verify.mjs": "90da5addadc14de384df17d37a8c1154878b5d85c89f92c756011f44f75fe214"
+      "scripts/experiments/probes/scheduler-agent-task-switch-v0/run.mts": "b0ca6d7e2c9e37b0385950d70cc8b01756fcc1ff521c06a4c82839ab15d7577f",
+      "scripts/experiments/probes/scheduler-agent-task-switch-v0/extension.mjs": "e97fd6d3848636fcf55e33f29c656f768923187621924527e60b054f86de76d2",
+      "scripts/experiments/probes/scheduler-agent-task-switch-v0/verify.mjs": "b657573eb8f533383f4f7e130ec0f8d789284901c920c54229f30df84c54a167"
     },
     "productionSourceSha256": {
       "src/adapters/extension-effect-run-lifecycle.ts": "60cbab4e1968fedab658aeea5fd5a0fe1110a494842f9f0e2975898660ef3127",

@@ -4,9 +4,11 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -184,7 +186,7 @@ function completionUrl(baseValue: string): URL {
 function descriptorDocument() {
   return {
     schemaVersion: "dolly.model-descriptor/4" as const,
-    descriptorVersion: "owner-aether-qwen3.6-27b-task-switch-v1",
+    descriptorVersion: "owner-aether-qwen3.6-27b-task-switch-v2",
     endpointId: "owner-aether-task-switch-fixture",
     operation: "chat-completion" as const,
     modelId: "qwen3.6-27b",
@@ -517,6 +519,8 @@ async function runCondition(options: {
   let childPid: number | undefined;
   let host: ReactiveModuleHost | undefined;
   let extensionHost: ExtensionProcessHost | undefined;
+  const toolJournalPath = join(conditionRoot, "tool-rounds.json");
+  const effectPath = join(conditionRoot, "effect-intents.json");
   try {
     let blockSequence = 0;
     let deliverySequence = 0;
@@ -537,9 +541,7 @@ async function runCondition(options: {
     const repository = new FileModuleResultCommitRepository({
       path: join(conditionRoot, "module-result-commits.json"),
     });
-    const toolJournalPath = join(conditionRoot, "tool-rounds.json");
     const toolJournal = new FileToolJournalRepository({ path: toolJournalPath });
-    const effectPath = join(conditionRoot, "effect-intents.json");
     const effectJournal = new EffectIntentJournal({
       store: new FileEffectIntentStore({ path: effectPath }),
       now: () => NOW,
@@ -878,6 +880,19 @@ async function runCondition(options: {
       toolJournal: toolArtifact === null ? null : { artifact: toolArtifact, sha256: toolSha256 },
       linuxControlGroupProof: false,
     };
+  } catch (error) {
+    for (const [source, name] of [
+      [effectPath, `failed-evidence-effect-intents-${options.conditionId}.json`],
+      [toolJournalPath, `failed-evidence-tool-rounds-${options.conditionId}.json`],
+    ] as const) {
+      if (existsSync(source)) {
+        writeFileSync(join(options.runDirectory, name), readFileSync(source), {
+          flag: "wx",
+          mode: 0o600,
+        });
+      }
+    }
+    throw error;
   } finally {
     if (host?.state === "running") await host.stop().catch(() => undefined);
     if (extensionHost && extensionHost.snapshot.state !== "stopped") {
@@ -904,6 +919,7 @@ async function main(): Promise<void> {
   const preregistrationBytes = readFileSync(preregistrationPath);
   const preregistration = JSON.parse(preregistrationBytes.toString("utf8")) as {
     readonly experimentId?: unknown;
+    readonly experimentVersion?: unknown;
     readonly status?: unknown;
     readonly protocol?: { readonly sha256?: unknown };
     readonly domainDesign?: {
@@ -913,6 +929,7 @@ async function main(): Promise<void> {
   };
   if (
     preregistration.experimentId !== "scheduler-agent-task-switch-v0" ||
+    preregistration.experimentVersion !== 2 ||
     preregistration.status !== "frozen-before-first-run"
   ) {
     throw new Error("task-switch preregistration is not frozen");
@@ -1040,7 +1057,17 @@ async function main(): Promise<void> {
   };
   writeFileSync(join(runDirectory, "analysis.json"), `${JSON.stringify(analysis, null, 2)}\n`, { flag: "wx" });
   const artifactDigests: Record<string, string> = {};
-  for (const path of [providerPath, modelPath, casesPath, join(runDirectory, "analysis.json")]) {
+  const failedEvidencePaths = readdirSync(runDirectory)
+    .filter((name) => name.startsWith("failed-evidence-") && name.endsWith(".json"))
+    .sort()
+    .map((name) => join(runDirectory, name));
+  for (const path of [
+    providerPath,
+    modelPath,
+    casesPath,
+    join(runDirectory, "analysis.json"),
+    ...failedEvidencePaths,
+  ]) {
     artifactDigests[path.slice(runDirectory.length + 1)] = sha256(readFileSync(path));
   }
   for (const row of caseRows as Array<Record<string, any>>) {
@@ -1110,7 +1137,7 @@ async function main(): Promise<void> {
   const manifest = {
     schemaVersion: "scheduler-agent-task-switch/run-manifest/1",
     experimentId: "scheduler-agent-task-switch-v0",
-    experimentVersion: 1,
+    experimentVersion: 2,
     runId,
     status,
     failure,
@@ -1165,6 +1192,7 @@ async function main(): Promise<void> {
       "effect-intents-no-checkpoint.json",
       "effect-intents-structured-checkpoint.json",
       "tool-rounds-structured-checkpoint.json",
+      ...failedEvidencePaths.map((path) => path.slice(runDirectory.length + 1)),
     ],
     validatorResults: "pending-independent-validation",
     aggregateMetrics: {

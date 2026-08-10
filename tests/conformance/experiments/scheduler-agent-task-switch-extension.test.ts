@@ -90,6 +90,119 @@ function messageText(argumentsValue: JsonValue): string {
 }
 
 describe("Scheduler Agent task-switch Extension", () => {
+  it("keeps a no-tool baseline honest across three independent Runs", async () => {
+    mkdirSync(WORKSPACE_TMP, { recursive: true, mode: 0o700 });
+    const scratch = mkdtempSync(join(WORKSPACE_TMP, "dolly-task-switch-baseline-"));
+    let identifier = 0;
+    let handle = 0;
+    const host = new ExtensionProcessHost({
+      isolation: "process",
+      trust: "trusted",
+      isolationPolicy: new ExtensionIsolationPolicy(),
+      manifest: MANIFEST,
+      command: process.execPath,
+      args: [EXTENSION],
+      workingDirectory: scratch,
+      instanceId: "instance-task-switch-baseline",
+      moduleId: "task-switch-agent",
+      moduleGenerationId: "module-generation-task-switch-baseline",
+      moduleKind: "task-switch-agent",
+      config: {},
+      maxFrameBytes: 1024 * 1024,
+      maxConcurrentCapabilityRequests: 1,
+      initializationTimeoutMs: 5_000,
+      shutdownRequestTimeoutMs: 1_000,
+      forceKillDelayMs: 500,
+      terminationTimeoutMs: 2_000,
+      nextIdentifier: (purpose) => `${purpose}-${++identifier}`,
+      nextCapabilityHandle: () => Buffer.alloc(32, ++handle).toString("base64url"),
+    });
+    host.grantCapability(
+      {
+        capabilityType: "model-operation",
+        capabilityVersion: "v2",
+        operations: ["chat"],
+        resourceScope: {
+          executionScope: "active-run",
+          model: "fake-task-switch",
+          outputContracts: ["json-object"],
+        },
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        maxInvocations: 3,
+        maxConcurrentInvocations: 1,
+        maxArgumentBytes: 128 * 1024,
+        maxResultBytes: 128 * 1024,
+        requireIdempotencyKey: true,
+      },
+      async (_argumentsValue, context): Promise<JsonValue> => {
+        const finalContent = context.moduleJobId === "baseline-checkpoint"
+          ? JSON.stringify({
+              action: "checkpointed",
+              taskId: TASK_ID,
+              checkpointKey: CHECKPOINT_KEY,
+              stored: false,
+            })
+          : context.moduleJobId === "baseline-unrelated"
+            ? JSON.stringify({ action: "answered", taskId: "arithmetic-cobalt", answer: 17 })
+            : JSON.stringify({
+                action: "resumed",
+                taskId: TASK_ID,
+                resumed: false,
+                nextAction: null,
+                evidenceKeys: [],
+              });
+        return {
+          schemaVersion: "dolly.model-operation-result/1",
+          operation: "chat",
+          status: "succeeded",
+          output: {
+            finalContent,
+            finishReason: "stop",
+            reasoning: { state: "not-observed" },
+          },
+        };
+      },
+    );
+    try {
+      await host.start();
+      const checkpoint = resultValue(await host.execute(execution(
+        "baseline-checkpoint",
+        "baseline-run-checkpoint",
+        {
+          phase: "checkpoint",
+          taskId: TASK_ID,
+          checkpointKey: CHECKPOINT_KEY,
+          checkpoint: CHECKPOINT,
+        },
+      )));
+      const unrelated = resultValue(await host.execute(execution(
+        "baseline-unrelated",
+        "baseline-run-unrelated",
+        { phase: "unrelated", taskId: "arithmetic-cobalt", question: "What is 29 - 12?" },
+      )));
+      const resume = resultValue(await host.execute(execution(
+        "baseline-resume",
+        "baseline-run-resume",
+        {
+          phase: "resume",
+          taskId: TASK_ID,
+          request: "Resume this task from memory and identify the next action.",
+        },
+      )));
+      expect(checkpoint).toMatchObject({
+        final: { checkpointKey: CHECKPOINT_KEY, stored: false },
+      });
+      expect(unrelated).toMatchObject({ final: { answer: 17 } });
+      expect(resume).toMatchObject({
+        final: { resumed: false, nextAction: null, evidenceKeys: [] },
+      });
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("checkpoints task A, isolates task B, and resumes task A in one process", async () => {
     mkdirSync(WORKSPACE_TMP, { recursive: true, mode: 0o700 });
     const scratch = mkdtempSync(join(WORKSPACE_TMP, "dolly-task-switch-extension-"));
