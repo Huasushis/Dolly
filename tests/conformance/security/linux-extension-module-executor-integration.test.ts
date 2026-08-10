@@ -18,8 +18,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { createExtensionEffectJournalLifecycle } from "../../../src/adapters/extension-effect-run-lifecycle.js";
 import { createLinuxExtensionModuleExecutor } from "../../../src/adapters/linux-extension-module-executor.js";
 import { defaultLauncherScriptPath } from "../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
+import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
+import { EffectIntentJournal } from "../../../src/core/capabilities/effect-intent-journal.js";
+import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
 import {
   ExtensionIsolationPolicy,
   type ExtensionProcessHost,
@@ -139,6 +143,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
   }) => {
     const scratch = mkdtempSync(join(tmpdir(), "dolly-linux-extension-executor-"));
     const statePath = join(scratch, "core-state.json");
+    const effectPath = join(scratch, "effect-intents.json");
     const processGenerationId = `process-linux-extension-${process.pid}-${Date.now()}`;
     const identity = {
       instanceId: "instance-linux-extension",
@@ -160,6 +165,36 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
         nextDeliveryId: (kind) => `unused-linux-extension-${kind}`,
         now,
       });
+    store.deliveries.createPage("input");
+    store.deliveries.registerConsumer("input", identity.moduleId, "from-now");
+    const inputBlock = store.blocks.commit(
+      {
+        payload: {
+          schema: "dolly.content/1",
+          value: {
+            items: [{ type: "text", text: "Return the isolated process identity." }],
+          },
+        },
+      },
+      { kind: "external", id: "integration-test" },
+    );
+    store.deliveries.append("input", inputBlock.id);
+    const claim = store.deliveries.claim({
+      consumerId: identity.moduleId,
+      pageIds: ["input"],
+      moduleGenerationId: MODULE_GENERATION_ID,
+      maxCount: 1,
+      maxBytes: 64 * 1_024,
+    });
+    if (claim === null) throw new Error("The Linux integration input was not claimed");
+    const effectJournal = new EffectIntentJournal({
+      store: new FileEffectIntentStore({ path: effectPath }),
+      now,
+    });
+    const effectRunLifecycle = createExtensionEffectJournalLifecycle({
+      journal: effectJournal,
+      getModuleSubmissionRecord: (runId) => store.getModuleSubmissionRecord(runId),
+    });
     const createdAt = now();
     const processRecord: ModuleProcessRecord = {
       schemaVersion: "dolly.module-process-record/1",
@@ -230,6 +265,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
         shutdownRequestTimeoutMs: 2_000,
         forceKillDelayMs: 500,
         terminationTimeoutMs: 10_000,
+        effectRunLifecycle,
       },
       executionTimeoutMs: 5_000,
       cancellationGraceMs: 1_000,
@@ -272,24 +308,39 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     expect(launchedProcess).toBeDefined();
     expect(store.getModuleProcessRecord(processGenerationId)?.state).toBe("running");
 
+    const input = store.deliveries.inspectClaimInput(claim);
+    store.appendModuleSubmissionRecord({
+      schemaVersion: "dolly.module-submission-record/1",
+      moduleJobId: claim.moduleJobId,
+      claimToken: claim.claimToken,
+      runId: claim.runId,
+      attempt: claim.attempt,
+      moduleGenerationId: claim.moduleGenerationId,
+      processGenerationId,
+      inputDigest: canonicalJsonDigest(input),
+      createdAt: now(),
+    });
+
     const result = await executor.execute(
-      {
-        schemaVersion: "dolly.reactive-module-input/2",
-        claimedDeliveryIds: [],
-        blockGroups: [],
-        hasMore: false,
-      },
+      input,
       {
         moduleId: identity.moduleId,
         moduleGenerationId: MODULE_GENERATION_ID,
-        moduleJobId: "module-job-linux-extension",
-        runId: "run-linux-extension",
-        attempt: 1,
+        moduleJobId: claim.moduleJobId,
+        runId: claim.runId,
+        attempt: claim.attempt,
         startedAt: Date.now(),
         signal: new AbortController().signal,
       },
     );
     expect(result).toEqual({ processId: launchedProcess?.processId });
+    expect(effectJournal.evidenceForRun(claim)).toEqual({ kind: "no-effect" });
+    expect(
+      new EffectIntentJournal({
+        store: new FileEffectIntentStore({ path: effectPath }),
+        now,
+      }).evidenceForRun(claim),
+    ).toEqual({ kind: "no-effect" });
 
     await expect(executor.terminate(terminationContext)).resolves.toBeUndefined();
     expect(store.getModuleProcessRecord(processGenerationId)).toMatchObject({
@@ -313,6 +364,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       moduleCgroupPath,
       result,
       finalRecordState: store.getModuleProcessRecord(processGenerationId)?.state,
+      effectEvidence: effectJournal.evidenceForRun(claim).kind,
       cgroupRemoved: !existsSync(moduleCgroupPath),
       exactProcessIdentityGone:
         launchedProcess === undefined || !sameLiveProcess(launchedProcess),
