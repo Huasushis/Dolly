@@ -61,6 +61,60 @@ two real-Linux files exercise the executor and attached host in separate paths;
 no startup caller yet constructs a real `ExtensionProcessHost` from the exact
 authorized-process object.
 
+## 2026-08-10 identity-bound Extension execution
+
+At source commit `2b97b11b290f5e68f0cbc82a0722de4c19d6e017`, the
+product-before-bootstrap `createLinuxExtensionModuleExecutor` closed that
+specific assembly gap. It owns one reviewed launcher, retains the exact raw
+child beside the launcher control object returned to the ordered lifecycle,
+and constructs the attached `ExtensionProcessHost` only from the authorized
+launcher, control group, and durable starting record. The public runtime still
+does not call this factory and still rejects every configured Module.
+
+The platform-independent construction and existing lifecycle regression first
+passed 121 tests. The committed source was then archived into the uniquely
+named disposable systemd container `dolly-experiment-827134-32dfde11`. As the
+unprivileged `dolly` account, one real Linux test completed this exact chain:
+
+1. persist one `starting` process record;
+2. create one limited Module control group;
+3. start the reviewed Python launcher and verify its membership from kernel
+   files;
+4. authorize it to replace itself with the real Node Extension fixture;
+5. complete the Extension handshake and one `module.execute` over descriptors
+   0 and 1;
+6. receive `{ "processId": 327 }` from the same PID captured at authorization;
+7. revoke the capability session, terminate the whole control group, observe
+   the protocol channel close, remove the control-group directory, and write
+   the same process record as `stopped`; and
+8. prove that PID 327 with its captured process start time no longer existed.
+
+The test passed 1/1 in 218 ms. Its exact Module control-group path was reported
+as removed, and the result record was `stopped`. The runner then removed only
+the exact container above and its exact image
+`dolly-experiment-827134-32dfde11-image`; exact Docker inspection confirmed
+both were absent.
+
+Raw output remains under
+`artifacts/experiments/linux-core-service-ownership/container-827134-20260810T032009Z/`.
+Its key hashes are:
+
+- `linux-integration.log`:
+  `ba929672aa18d8a8a25388211d8de38e2b79980d2643aab02583389e787b3263`;
+- `source-commit.txt`:
+  `176c8524c3f113a0e01fe6f9498d967c6de371bcbcab89523fd1817fdf7fae4c`;
+- `environment.txt`:
+  `4c66ed875461b8796fc11fdb7f45f40d4d34a120b081b8afa1e6977bd942d3d5`;
+  and
+- `preflight.txt`:
+  `ecf7fce3780e2b756cfc847409343f9dc3196b8e6f9da072679da4c713411c36`.
+
+This closes the successful process-ownership and protocol assembly path, not
+the product boundary. Installation lookup, runtime configuration, Scheduler
+startup, capability budgets, durable external-effect outcomes, restart
+reconciliation, and failure-matrix coverage remain incomplete. Therefore the
+Module startup refusal is still required.
+
 ## Failure path exercised
 
 The launcher fixture deliberately does not write its process identifier to the
