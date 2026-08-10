@@ -518,6 +518,27 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
               .residentCount === 0,
         5_000,
       )).toBe(true);
+      const actorRunsAfterCapacityRelease = {
+        [FIRST_MODULE_ID]: actorRunCount(FIRST_MODULE_ID),
+        [SECOND_MODULE_ID]: actorRunCount(SECOND_MODULE_ID),
+        [DRAINER_MODULE_ID]: actorRunCount(DRAINER_MODULE_ID),
+      };
+
+      const shutdownProbe = coreState.store.blocks.commit(
+        proposal("cancel the active drainer during shutdown"),
+        { kind: "external", id: "scheduler-shutdown-probe" },
+      );
+      const shutdownProbeDelivery = coreState.store.deliveries.append(
+        "output",
+        shutdownProbe.id,
+      );
+      expect(await waitFor(
+        () =>
+          actorRunCount(DRAINER_MODULE_ID) === 3 &&
+          coreState.store.deliveries.inspectResident(DRAINER_MODULE_ID, ["output"])
+              .claimedCount === 1,
+        5_000,
+      )).toBe(true);
 
       await composed.host.stop();
       stopped = true;
@@ -567,12 +588,22 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       );
       const reopenedDeliverySnapshot = reopened.deliveries.snapshot();
       expect(reopenedDrainerResident)
-        .toMatchObject({ residentCount: 0, pendingCount: 0, claimedCount: 0 });
+        .toMatchObject({ residentCount: 1, pendingCount: 1, claimedCount: 0 });
       const reopenedDrainerJobs = reopenedDeliverySnapshot.moduleJobs.filter((job) =>
         job.consumerId === DRAINER_MODULE_ID
       );
-      expect(reopenedDrainerJobs).toHaveLength(2);
-      expect(reopenedDrainerJobs.every((job) => job.status === "committed")).toBe(true);
+      expect(reopenedDrainerJobs).toHaveLength(3);
+      expect(reopenedDrainerJobs.filter((job) => job.status === "committed")).toHaveLength(2);
+      expect(reopenedDrainerJobs).toContainEqual(expect.objectContaining({
+        status: "ready",
+        attempt: 1,
+        failedAttemptCount: 0,
+      }));
+      expect(
+        reopenedDeliverySnapshot.deliveries.find(
+          (delivery) => delivery.record.deliveryId === shutdownProbeDelivery.deliveryId,
+        )?.obligations,
+      ).toContainEqual({ consumerId: DRAINER_MODULE_ID, status: "pending" });
       expect(reopened.deliveries.listDeadLetters()).toEqual([]);
       expect(reopened.deliveries.inspectPending(SECOND_MODULE_ID, ["middle"]).pendingCount)
         .toBe(0);
@@ -595,11 +626,10 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           [SECOND_MODULE_ID]: 2,
           [DRAINER_MODULE_ID]: 1,
         },
-        actorRunsAfterCapacityRelease: {
-          [FIRST_MODULE_ID]: actorRunCount(FIRST_MODULE_ID),
-          [SECOND_MODULE_ID]: actorRunCount(SECOND_MODULE_ID),
-          [DRAINER_MODULE_ID]: actorRunCount(DRAINER_MODULE_ID),
-        },
+        actorRunsAfterCapacityRelease,
+        shutdownCancellationObserved: true,
+        shutdownCancelledModuleId: DRAINER_MODULE_ID,
+        shutdownFailedAttemptCount: 0,
         committedModuleResults: reopenedRepository.list().length,
         finalRecordStates: processGenerationIds.map((processGenerationId) =>
           reopened.getModuleProcessRecord(processGenerationId)?.state
