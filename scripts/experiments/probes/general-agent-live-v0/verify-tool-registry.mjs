@@ -12,11 +12,11 @@ const workspaceTemporaryRoot = resolve(repositoryRoot, "..", ".tmp");
 const verifierPath = fileURLToPath(import.meta.url);
 const artifactRoot = join(
   repositoryRoot,
-  "artifacts/experiments/probes/general-agent-tool-registry-v5",
+  "artifacts/experiments/probes/general-agent-tool-registry-v6",
 );
 const sourcePreregistrationPath = join(
   repositoryRoot,
-  "docs/experiments/preregistrations/general-agent-tool-registry-v5.json",
+  "docs/experiments/preregistrations/general-agent-tool-registry-v6.json",
 );
 const extensionSourcePath = join(scriptDirectory, "extension.mjs");
 const HIDDEN_CODENAME = "EMBER-7421";
@@ -68,6 +68,8 @@ const EXPECTED_MUTATION_IDS = [
   "fixture-secret-value",
   "authorization-field",
   "capability-handle-field",
+  "provider-stream-disabled",
+  "stream-done-missing",
 ];
 const EXPECTED_OUTPUT_KINDS = [
   "json-object",
@@ -120,11 +122,11 @@ function parseArguments(argv) {
   if (
     (argv.length !== 2 && argv.length !== 3 && argv.length !== 5) ||
     argv[0] !== "--run-id" ||
-    !/^registry-v6-[A-Za-z0-9._-]+$/u.test(argv[1]) ||
+    !/^registry-v7-[A-Za-z0-9._-]+$/u.test(argv[1]) ||
     (argv.length >= 3 && argv[2] !== "--check-only") ||
     (argv.length === 5 && argv[3] !== "--run-directory")
   ) {
-    fail("usage: verify-tool-registry.mjs --run-id registry-v6-<identifier> [--check-only [--run-directory <workspace-temp-run>]]");
+    fail("usage: verify-tool-registry.mjs --run-id registry-v7-<identifier> [--check-only [--run-directory <workspace-temp-run>]]");
   }
   const runId = argv[1];
   let runDirectory;
@@ -227,7 +229,10 @@ function tokenAccounting(rows) {
   let recordsWithUsage = 0;
   let recordsMissingUsage = 0;
   for (const row of rows) {
-    const usage = row?.response?.usage;
+    let usage = row?.response?.usage;
+    if (usage === undefined && typeof row?.response?.eventStreamUtf8 === "string") {
+      usage = providerStreamEvidence(row, "accounting").usage;
+    }
     if (
       !Number.isSafeInteger(usage?.prompt_tokens) || usage.prompt_tokens < 0 ||
       !Number.isSafeInteger(usage?.completion_tokens) || usage.completion_tokens < 0 ||
@@ -244,16 +249,134 @@ function tokenAccounting(rows) {
   return { prompt, completion, total, recordsWithUsage, recordsMissingUsage };
 }
 
+function providerStreamEvidence(provider, index) {
+  const raw = provider?.response?.eventStreamUtf8;
+  if (typeof raw !== "string" || raw.length === 0) {
+    fail(`provider stream ${index} is absent`);
+  }
+  if (!/\r?\n\r?\n$/u.test(raw)) fail(`provider stream ${index} lacks a final SSE delimiter`);
+  const finalParts = [];
+  const reasoningParts = [];
+  let providerId;
+  let finishReason;
+  let usage;
+  let done = false;
+  let eventCount = 0;
+  for (const block of raw.split(/\r?\n\r?\n/u)) {
+    if (block.trim() === "") continue;
+    if (done) fail(`provider stream ${index} emitted data after [DONE]`);
+    eventCount += 1;
+    const data = [];
+    for (const line of block.split(/\r?\n/u)) {
+      if (line.startsWith(":")) continue;
+      if (line === "event: message" || line === "event:message") continue;
+      if (!line.startsWith("data:")) fail(`provider stream ${index} has an unsupported SSE field`);
+      data.push(line.slice(5).replace(/^ /u, ""));
+    }
+    if (data.length === 0) fail(`provider stream ${index} has an empty SSE event`);
+    const payload = data.join("\n");
+    if (payload === "[DONE]") {
+      if (finishReason === undefined) fail(`provider stream ${index} ended before finish reason`);
+      done = true;
+      continue;
+    }
+    let envelope;
+    try {
+      envelope = JSON.parse(payload);
+    } catch {
+      fail(`provider stream ${index} contains invalid JSON`);
+    }
+    if (envelope === null || Array.isArray(envelope) || typeof envelope !== "object") {
+      fail(`provider stream envelope ${index} is invalid`);
+    }
+    const allowedEnvelope = new Set([
+      "id", "object", "created", "model", "system_fingerprint", "choices", "usage",
+    ]);
+    if (!Object.keys(envelope).every((key) => allowedEnvelope.has(key))) {
+      fail(`provider stream ${index} has an unknown envelope field`);
+    }
+    if (typeof envelope.id !== "string" || envelope.id.length === 0) {
+      fail(`provider stream ${index} lacks id`);
+    }
+    providerId ??= envelope.id;
+    if (envelope.id !== providerId) fail(`provider stream ${index} changed id`);
+    if (!Array.isArray(envelope.choices)) fail(`provider stream ${index} lacks choices`);
+    if (envelope.usage !== undefined && envelope.usage !== null) {
+      if (
+        !Number.isSafeInteger(envelope.usage.prompt_tokens) ||
+        !Number.isSafeInteger(envelope.usage.completion_tokens) ||
+        !Number.isSafeInteger(envelope.usage.total_tokens) ||
+        envelope.usage.total_tokens !==
+          envelope.usage.prompt_tokens + envelope.usage.completion_tokens ||
+        usage !== undefined
+      ) {
+        fail(`provider stream ${index} has invalid or repeated token usage`);
+      }
+      usage = envelope.usage;
+    }
+    if (envelope.choices.length === 0) {
+      if (envelope.usage === undefined) fail(`provider stream ${index} has an empty non-usage event`);
+      continue;
+    }
+    if (envelope.choices.length !== 1) fail(`provider stream ${index} choice count differs`);
+    const choice = envelope.choices[0];
+    if (
+      choice === null || Array.isArray(choice) || typeof choice !== "object" ||
+      choice.index !== 0 || choice.delta === null || Array.isArray(choice.delta) ||
+      typeof choice.delta !== "object"
+    ) {
+      fail(`provider stream choice ${index} is invalid`);
+    }
+    const allowedDelta = new Set(["role", "content", "reasoning_content", "tool_calls", "refusal"]);
+    if (!Object.keys(choice.delta).every((key) => allowedDelta.has(key))) {
+      fail(`provider stream ${index} has an unknown delta field`);
+    }
+    if (choice.delta.role !== undefined && choice.delta.role !== "assistant") {
+      fail(`provider stream ${index} role differs`);
+    }
+    for (const [field, destination] of [
+      ["content", finalParts],
+      ["reasoning_content", reasoningParts],
+    ]) {
+      const value = choice.delta[field];
+      if (value === undefined || value === null) continue;
+      if (typeof value !== "string" || (finishReason !== undefined && value.length !== 0)) {
+        fail(`provider stream ${index} ${field} is invalid`);
+      }
+      destination.push(value);
+    }
+    if (choice.finish_reason !== undefined && choice.finish_reason !== null) {
+      if (
+        typeof choice.finish_reason !== "string" ||
+        (finishReason !== undefined && finishReason !== choice.finish_reason)
+      ) {
+        fail(`provider stream ${index} finish changed`);
+      }
+      finishReason = choice.finish_reason;
+    }
+  }
+  if (!done) fail(`provider stream ${index} lacks [DONE]`);
+  if (eventCount > 32_768) fail(`provider stream ${index} exceeds its event budget`);
+  if (usage === undefined) fail(`provider stream ${index} lacks terminal token usage`);
+  return {
+    eventCount,
+    finalContent: finalParts.join(""),
+    reasoningContent: reasoningParts.join(""),
+    finishReason,
+    usage,
+  };
+}
+
 function verifyPerCaseAccounting(accounting, modelRows, providerRows) {
   if (!Array.isArray(accounting) || accounting.length !== 4) {
     fail("per-case accounting inventory is invalid");
   }
   const spans = [[0, 1], [1, 5], [5, 9], [9, 10]];
   const expectedConditions = [
-    [7427, 1, "no-storage-tool"],
-    [7427, 1, "tool-registry-storage"],
-    [7428, 2, "tool-registry-storage"],
-    [7428, 2, "no-storage-tool"],
+    [7429, 1, "no-storage-tool"],
+    [7429, 1, "tool-registry-storage"],
+    [7430, 2, "tool-registry-storage"],
+    [7430, 2, "no-storage-tool"],
   ];
   accounting.forEach((entry, index) => {
     const [start, end] = spans[index];
@@ -530,16 +653,16 @@ function verifyModelCalls(rows) {
   exactArray(
     rows.map((row) => row.requestId),
     [
-      "agent-no-storage-tool-seed-7427-model-request-1",
-      "agent-tool-registry-storage-seed-7427-model-request-1",
-      "agent-tool-registry-storage-seed-7427-model-request-2",
-      "agent-tool-registry-storage-seed-7427-model-request-3",
-      "agent-tool-registry-storage-seed-7427-model-request-4",
-      "agent-tool-registry-storage-seed-7428-model-request-1",
-      "agent-tool-registry-storage-seed-7428-model-request-2",
-      "agent-tool-registry-storage-seed-7428-model-request-3",
-      "agent-tool-registry-storage-seed-7428-model-request-4",
-      "agent-no-storage-tool-seed-7428-model-request-1",
+      "agent-no-storage-tool-seed-7429-model-request-1",
+      "agent-tool-registry-storage-seed-7429-model-request-1",
+      "agent-tool-registry-storage-seed-7429-model-request-2",
+      "agent-tool-registry-storage-seed-7429-model-request-3",
+      "agent-tool-registry-storage-seed-7429-model-request-4",
+      "agent-tool-registry-storage-seed-7430-model-request-1",
+      "agent-tool-registry-storage-seed-7430-model-request-2",
+      "agent-tool-registry-storage-seed-7430-model-request-3",
+      "agent-tool-registry-storage-seed-7430-model-request-4",
+      "agent-no-storage-tool-seed-7430-model-request-1",
     ],
     "model request ids",
   );
@@ -554,6 +677,7 @@ function verifyModelCalls(rows) {
     const outputKind = EXPECTED_OUTPUT_KINDS[index];
     if (
       row.input?.schemaVersion !== "dolly.model.chat-input/3" ||
+      row.input?.stream !== true ||
       JSON.stringify(row.input?.outputContract) !== JSON.stringify({ kind: outputKind }) ||
       row.budgets?.maxOutputTokens !== EXPECTED_MAX_TOKENS[index] ||
       row.reasoningPolicy !== (EXPECTED_REASONING_TYPES[index] === "enabled" ? "require" : "disable")
@@ -723,7 +847,7 @@ function refreshManifestArtifactDigests(runDirectory, names) {
 
 function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
   mkdirSync(workspaceTemporaryRoot, { recursive: true, mode: 0o700 });
-  const mutationRoot = mkdtempSync(join(workspaceTemporaryRoot, "registry-v6-mutations-"));
+  const mutationRoot = mkdtempSync(join(workspaceTemporaryRoot, "registry-v7-mutations-"));
   const mutations = [
     {
       id: "capability-type-raw-storage",
@@ -847,7 +971,7 @@ function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
     {
       id: "effect-outcome-unknown",
       apply(runDirectory) {
-        const name = "effect-intents-tool-registry-storage-seed-7427.json";
+        const name = "effect-intents-tool-registry-storage-seed-7429.json";
         const path = join(runDirectory, name);
         const document = json(path);
         document.records[0].outcome = {
@@ -923,6 +1047,29 @@ function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
         refreshManifestArtifactDigests(runDirectory, ["analysis.json"]);
       },
     },
+    {
+      id: "provider-stream-disabled",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "provider-responses.jsonl"));
+        rows[0].requestBody.stream = false;
+        delete rows[0].requestBody.stream_options;
+        rows[0].requestBodySha256 = sha256(Buffer.from(JSON.stringify(rows[0].requestBody), "utf8"));
+        writeJsonLines(join(runDirectory, "provider-responses.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["provider-responses.jsonl"]);
+      },
+    },
+    {
+      id: "stream-done-missing",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "provider-responses.jsonl"));
+        rows[0].response.eventStreamUtf8 = rows[0].response.eventStreamUtf8.replace(
+          /data: ?\[DONE\]\r?\n\r?\n$/u,
+          "",
+        );
+        writeJsonLines(join(runDirectory, "provider-responses.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["provider-responses.jsonl"]);
+      },
+    },
   ];
   exactArray(mutations.map((mutation) => mutation.id), EXPECTED_MUTATION_IDS, "mutation ids");
   const results = [];
@@ -972,8 +1119,8 @@ function main() {
   const manifest = json(manifestPath);
   if (
     manifest.schemaVersion !== "general-agent-live/run-manifest/1" ||
-    manifest.experimentId !== "general-agent-tool-registry-v5" ||
-    manifest.experimentVersion !== 6 ||
+    manifest.experimentId !== "general-agent-tool-registry-v6" ||
+    manifest.experimentVersion !== 7 ||
     manifest.runId !== runId ||
     manifest.status !== "completed"
   ) {
@@ -1027,12 +1174,12 @@ function main() {
   ) {
     fail("preregistration validation inputs or dataset identity are invalid");
   }
-  exactArray(manifest.seeds, [7427, 7428], "manifest evaluation seeds");
+  exactArray(manifest.seeds, [7429, 7430], "manifest evaluation seeds");
   const expectedExecutionOrder = [
-    { evaluationSeed: 7427, repetition: 1, conditionId: "no-storage-tool" },
-    { evaluationSeed: 7427, repetition: 1, conditionId: "tool-registry-storage" },
-    { evaluationSeed: 7428, repetition: 2, conditionId: "tool-registry-storage" },
-    { evaluationSeed: 7428, repetition: 2, conditionId: "no-storage-tool" },
+    { evaluationSeed: 7429, repetition: 1, conditionId: "no-storage-tool" },
+    { evaluationSeed: 7429, repetition: 1, conditionId: "tool-registry-storage" },
+    { evaluationSeed: 7430, repetition: 2, conditionId: "tool-registry-storage" },
+    { evaluationSeed: 7430, repetition: 2, conditionId: "no-storage-tool" },
   ];
   if (JSON.stringify(manifest.executionOrder) !== JSON.stringify(expectedExecutionOrder)) {
     fail("manifest execution order differs from the preregistered order");
@@ -1072,18 +1219,18 @@ function main() {
 
   const cases = jsonLines(casesPath);
   if (cases.length !== 4) fail(`expected 4 cases, observed ${cases.length}`);
-  verifyBaseline(cases[0], 7427, 1);
-  verifyTreatment(cases[1], 7427, 1);
-  verifyTreatment(cases[2], 7428, 2);
-  verifyBaseline(cases[3], 7428, 2);
+  verifyBaseline(cases[0], 7429, 1);
+  verifyTreatment(cases[1], 7429, 1);
+  verifyTreatment(cases[2], 7430, 2);
+  verifyBaseline(cases[3], 7430, 2);
   for (const row of cases) verifyEffectJournal(row, runDirectory, manifest);
   const expectedArtifactNames = [
     "analysis.json",
     "cases.jsonl",
-    "effect-intents-no-storage-tool-seed-7427.json",
-    "effect-intents-no-storage-tool-seed-7428.json",
-    "effect-intents-tool-registry-storage-seed-7427.json",
-    "effect-intents-tool-registry-storage-seed-7428.json",
+    "effect-intents-no-storage-tool-seed-7429.json",
+    "effect-intents-no-storage-tool-seed-7430.json",
+    "effect-intents-tool-registry-storage-seed-7429.json",
+    "effect-intents-tool-registry-storage-seed-7430.json",
     "model-calls.jsonl",
     "provider-responses.jsonl",
   ];
@@ -1101,6 +1248,7 @@ function main() {
       (row) =>
         row.schemaVersion !== "general-agent-live/provider-response/1" ||
         row.httpStatus !== 200 ||
+        !/^text\/event-stream(?:\s*;|$)/iu.test(row.responseContentType ?? "") ||
         row.response === null,
     )
   ) {
@@ -1110,8 +1258,8 @@ function main() {
     const requestBody = row.requestBody;
     const outputKind = EXPECTED_OUTPUT_KINDS[index];
     const expectedKeys = outputKind === "json-object"
-      ? ["max_tokens", "messages", "model", "response_format", "stream", "thinking"]
-      : ["max_tokens", "messages", "model", "stream", "thinking"];
+      ? ["max_tokens", "messages", "model", "response_format", "stream", "stream_options", "thinking"]
+      : ["max_tokens", "messages", "model", "stream", "stream_options", "thinking"];
     if (
       requestBody === null ||
       Array.isArray(requestBody) ||
@@ -1119,7 +1267,8 @@ function main() {
       JSON.stringify(Object.keys(requestBody).sort()) !==
         JSON.stringify(expectedKeys) ||
       requestBody.model !== "qwen3.6-27b" ||
-      requestBody.stream !== false ||
+      requestBody.stream !== true ||
+      JSON.stringify(requestBody.stream_options) !== JSON.stringify({ include_usage: true }) ||
       requestBody.max_tokens !== EXPECTED_MAX_TOKENS[index] ||
       !sameJsonValue(
         requestBody.messages,
@@ -1132,8 +1281,23 @@ function main() {
         JSON.stringify({ type: EXPECTED_REASONING_TYPES[index] }) ||
       row.requestBodySha256 !==
         sha256(Buffer.from(JSON.stringify(requestBody), "utf8"))
-    ) {
+  ) {
       fail(`provider request ${index + 1} differs from the frozen model-call wire`);
+    }
+    const stream = providerStreamEvidence(row, index + 1);
+    if (
+      stream.finalContent !== modelCalls[index]?.result?.output?.finalContent ||
+      stream.finishReason !== modelCalls[index]?.result?.output?.finishReason
+    ) {
+      fail(`provider stream ${index + 1} differs from the normalized model result`);
+    }
+    const normalizedReasoning = modelCalls[index]?.result?.output?.reasoning;
+    if (normalizedReasoning?.state === "observed") {
+      if (stream.reasoningContent !== normalizedReasoning.parts.join("")) {
+        fail(`provider stream reasoning ${index + 1} differs from the normalized model result`);
+      }
+    } else if (stream.reasoningContent !== "") {
+      fail(`provider stream reasoning ${index + 1} was silently discarded`);
     }
   }
   verifyPerCaseAccounting(manifest.perCaseAccounting, modelCalls, providerResponses);
@@ -1164,8 +1328,8 @@ function main() {
 
   const verification = {
     schemaVersion: "general-agent-tool-registry/validation/1",
-    experimentId: "general-agent-tool-registry-v5",
-    experimentVersion: 6,
+    experimentId: "general-agent-tool-registry-v6",
+    experimentVersion: 7,
     runId,
     valid: true,
     checks: {

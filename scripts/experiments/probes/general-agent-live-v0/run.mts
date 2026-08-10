@@ -150,7 +150,8 @@ interface AgentExperimentConfiguration {
     | "general-agent-tool-registry-v2"
     | "general-agent-tool-registry-v3"
     | "general-agent-tool-registry-v4"
-    | "general-agent-tool-registry-v5";
+    | "general-agent-tool-registry-v5"
+    | "general-agent-tool-registry-v6";
   readonly experimentVersion: number;
   readonly modelCapabilityVersion: 1 | 2;
   readonly separatePlanningCall: boolean;
@@ -189,9 +190,24 @@ function providerTokenAccounting(rows: readonly JsonValue[]): JsonValue {
     const response = isJsonRecord(row) && isJsonRecord(row.response)
       ? row.response
       : undefined;
-    const usage = response !== undefined && isJsonRecord(response.usage)
+    let usage = response !== undefined && isJsonRecord(response.usage)
       ? response.usage
       : undefined;
+    if (usage === undefined && typeof response?.eventStreamUtf8 === "string") {
+      for (const event of response.eventStreamUtf8.split(/\r?\n\r?\n/u)) {
+        const line = event.split(/\r?\n/u).find((candidate) => candidate.startsWith("data:"));
+        if (!line) continue;
+        const payload = line.slice(5).replace(/^ /u, "");
+        if (payload === "[DONE]") continue;
+        try {
+          const value = JSON.parse(payload) as JsonValue;
+          if (isJsonRecord(value) && isJsonRecord(value.usage)) usage = value.usage;
+        } catch {
+          // The strict Broker decoder owns SSE validity. Accounting does not
+          // repair malformed provider evidence after the fact.
+        }
+      }
+    }
     const promptTokens = nonNegativeInteger(usage?.prompt_tokens);
     const completionTokens = nonNegativeInteger(usage?.completion_tokens);
     const totalTokens = nonNegativeInteger(usage?.total_tokens);
@@ -348,6 +364,7 @@ export class ExperimentFetchTransport implements ModelHttpTransport {
           schemaVersion: "general-agent-live/provider-response/1",
           ...requestEvidence,
           httpStatus: response.status,
+          responseContentType: headers["content-type"] ?? null,
           response: responseValue,
         });
       } catch (error) {
@@ -355,6 +372,7 @@ export class ExperimentFetchTransport implements ModelHttpTransport {
           schemaVersion: "general-agent-live/provider-response/1",
           ...requestEvidence,
           httpStatus: response.status,
+          responseContentType: headers["content-type"] ?? null,
           failureKind: "response-body-read-failed",
           response: null,
         });
@@ -381,6 +399,7 @@ export class ExperimentFetchTransport implements ModelHttpTransport {
             schemaVersion: "general-agent-live/provider-response/1",
             ...requestEvidence,
             httpStatus: response.status,
+            responseContentType: headers["content-type"] ?? null,
             response: null,
           });
           return;
@@ -399,6 +418,7 @@ export class ExperimentFetchTransport implements ModelHttpTransport {
               schemaVersion: "general-agent-live/provider-response/1",
               ...requestEvidence,
               httpStatus: response.status,
+              responseContentType: headers["content-type"] ?? null,
               response: responseValue,
             });
             return;
@@ -417,6 +437,7 @@ export class ExperimentFetchTransport implements ModelHttpTransport {
           schemaVersion: "general-agent-live/provider-response/1",
           ...requestEvidence,
           httpStatus: response.status,
+          responseContentType: headers["content-type"] ?? null,
           failureKind: "response-body-read-failed",
           response: null,
         });
@@ -427,6 +448,7 @@ export class ExperimentFetchTransport implements ModelHttpTransport {
             schemaVersion: "general-agent-live/provider-response/1",
             ...requestEvidence,
             httpStatus: response.status,
+            responseContentType: headers["content-type"] ?? null,
             failureKind: "response-consumer-stopped-before-end",
             response: {
               eventStreamUtf8: Buffer.concat(responseChunks).toString("utf8"),
@@ -445,6 +467,19 @@ export class ExperimentFetchTransport implements ModelHttpTransport {
       abort: (reason) => controller.abort(reason),
     };
   }
+}
+
+function normalizeProviderEvidence(row: JsonValue): JsonValue {
+  if (!isJsonRecord(row) || !isJsonRecord(row.requestBody) || !isJsonRecord(row.response)) {
+    return row;
+  }
+  if (row.requestBody.stream !== true || typeof row.response.invalidJsonUtf8 !== "string") {
+    return row;
+  }
+  return {
+    ...row,
+    response: { eventStreamUtf8: row.response.invalidJsonUtf8 },
+  };
 }
 
 function parseArguments(argv: readonly string[]): AgentExperimentConfiguration {
@@ -743,8 +778,51 @@ function parseArguments(argv: readonly string[]): AgentExperimentConfiguration {
       ],
     };
   }
+  if (/^registry-v7-[A-Za-z0-9._-]+$/u.test(runId)) {
+    return {
+      experimentId: "general-agent-tool-registry-v6",
+      experimentVersion: 7,
+      modelCapabilityVersion: 2,
+      separatePlanningCall: true,
+      runId,
+      artifactRoot: join(
+        repositoryRoot,
+        "artifacts/experiments/probes/general-agent-tool-registry-v6",
+      ),
+      preregistrationPath: join(
+        repositoryRoot,
+        "docs/experiments/preregistrations/general-agent-tool-registry-v6.json",
+      ),
+      executionOrder: [
+        {
+          evaluationSeed: 7429,
+          repetition: 1,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7429",
+        },
+        {
+          evaluationSeed: 7429,
+          repetition: 1,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7429",
+        },
+        {
+          evaluationSeed: 7430,
+          repetition: 2,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7430",
+        },
+        {
+          evaluationSeed: 7430,
+          repetition: 2,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7430",
+        },
+      ],
+    };
+  }
   throw new Error(
-    "usage: run.mts --run-id live-v8-<identifier>|registry-v1-<identifier>|registry-v2-<identifier>|registry-v3-<identifier>|registry-v4-<identifier>|registry-v5-<identifier>|registry-v6-<identifier>",
+    "usage: run.mts --run-id live-v8-<identifier>|registry-v1-<identifier>|registry-v2-<identifier>|registry-v3-<identifier>|registry-v4-<identifier>|registry-v5-<identifier>|registry-v6-<identifier>|registry-v7-<identifier>",
   );
 }
 
@@ -802,6 +880,7 @@ function descriptorDocument(jsonObjectOutput: boolean) {
       version: "v1",
       requestStrategyId: "openai.chat.request.text-parts.v1",
       responseStrategyId: "aether.qwen.chat.response.v2",
+      streamStrategyId: "openai.chat.stream.sse.v1",
     },
     limits: {
       maxRequestBytes: 128 * 1024,
@@ -811,7 +890,10 @@ function descriptorDocument(jsonObjectOutput: boolean) {
       maxOutputBytes: 256 * 1024,
       maxConcurrentRequests: 1,
       maxProviderTimeoutMs: 180_000,
-      streaming: { state: "unsupported" as const },
+      streaming: {
+        state: "supported" as const,
+        value: { maxEvents: 32_768, maxBufferedBytes: 128 * 1024 },
+      },
     },
     input: {
       modalities: ["text" as const],
@@ -854,6 +936,7 @@ function descriptorDocument(jsonObjectOutput: boolean) {
           state: "supported" as const,
           value: {
             nonStreamStrategyId: "openai.reasoning-content.nonstream.v1",
+            streamStrategyId: "openai.reasoning-content.stream.v1",
             empty: "not-observed" as const,
           },
         },
@@ -1285,6 +1368,7 @@ async function runCondition(options: {
             ? (["chat", "describe"] as const)
             : (["chat"] as const),
           reasoningPolicies: ["require", "disable"],
+          allowStreaming: true,
           roles: ["system", "user"],
           limits: {
             maxInvocations: modelInvocationLimit,
@@ -1695,8 +1779,9 @@ async function main(): Promise<void> {
     bindings,
     secrets,
     transport: new ExperimentFetchTransport((record) => {
-      providerResponseRows.push(record);
-      appendFileSync(providerResponsesPath, `${JSON.stringify(record)}\n`, "utf8");
+      const evidence = normalizeProviderEvidence(record);
+      providerResponseRows.push(evidence);
+      appendFileSync(providerResponsesPath, `${JSON.stringify(evidence)}\n`, "utf8");
     }),
     now: () => new Date().toISOString(),
   });
