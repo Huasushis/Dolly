@@ -263,7 +263,7 @@ describe("general Agent tool-registry Extension", () => {
     const toolCapability = createToolInvocationCapabilityV2({
       executionScope: "active-run",
       expiresAt: "2099-01-01T00:00:00.000Z",
-      limits: { maxInvocations: 3, maxInvocationsPerRun: 3, maxCallsPerRound: 1 },
+      limits: { maxInvocations: 6, maxInvocationsPerRun: 3, maxCallsPerRound: 1 },
       resolveRun: ({ moduleJobId }) => ({
         registry,
         budget: BUDGET,
@@ -280,7 +280,7 @@ describe("general Agent tool-registry Extension", () => {
     });
     host.grantCapability(toolCapability.grant, toolCapability.handler);
 
-    let modelRound = 0;
+    const modelRounds = new Map<string, number>();
     const prompts: string[] = [];
     const outputContracts: unknown[] = [];
     host.grantCapability(
@@ -294,7 +294,7 @@ describe("general Agent tool-registry Extension", () => {
           outputContracts: ["text", "json-object"],
         },
         expiresAt: "2099-01-01T00:00:00.000Z",
-        maxInvocations: 5,
+        maxInvocations: 10,
         maxConcurrentInvocations: 1,
         maxArgumentBytes: 128 * 1024,
         maxResultBytes: 128 * 1024,
@@ -321,7 +321,9 @@ describe("general Agent tool-registry Extension", () => {
         const prompt = parts[0].text;
         if (typeof prompt !== "string") throw new Error("model prompt is absent");
         prompts.push(prompt);
-        modelRound += 1;
+        if (context.moduleJobId === undefined) throw new Error("active Module job is absent");
+        const modelRound = (modelRounds.get(context.moduleJobId) ?? 0) + 1;
+        modelRounds.set(context.moduleJobId, modelRound);
         const finalContent =
           modelRound === 1
             ? "Discover the available keys, read the active note, then answer with its source."
@@ -333,7 +335,9 @@ describe("general Agent tool-registry Extension", () => {
                   action: "answer",
                   answer: "The active deployment codename is EMBER-7421.",
                   grounded: true,
-                  evidenceKeys: ["deployment-note"],
+                  evidenceKeys: context.moduleJobId === "module-job-ungrounded"
+                    ? ["alpha_discover", "beta_read"]
+                    : ["deployment-note"],
                 });
         const reasoning: JsonValue =
           modelRound === 1
@@ -352,32 +356,40 @@ describe("general Agent tool-registry Extension", () => {
       },
     );
 
-    try {
-      await host.start();
-      const result = await host.execute({
-        moduleJobId: "module-job-a",
-        runId: "run-a",
-        attempt: 1,
-        deadline: new Date(Date.now() + 5_000).toISOString(),
-        responseTimeoutMs: 10_000,
-        hasMore: false,
-        input: {
-          blockGroups: [{
-            block: {
-              payload: {
-                schema: "dolly.content/1",
-                value: {
-                  items: [{
-                    type: "text",
-                    text: "Find the active deployment codename in private memory.",
-                    format: "plain",
-                  }],
-                },
+    const execution = (
+      moduleJobId: string,
+      runId: string,
+    ): Parameters<ExtensionProcessHost["execute"]>[0] => ({
+      moduleJobId,
+      runId,
+      attempt: 1,
+      deadline: new Date(Date.now() + 5_000).toISOString(),
+      responseTimeoutMs: 10_000,
+      hasMore: false,
+      input: {
+        blockGroups: [{
+          block: {
+            payload: {
+              schema: "dolly.content/1",
+              value: {
+                items: [{
+                  type: "text",
+                  text: "Find the active deployment codename in private memory.",
+                  format: "plain",
+                }],
               },
             },
-          }],
-        },
-      });
+          },
+        }],
+      },
+    });
+
+    try {
+      await host.start();
+      await expect(
+        host.execute(execution("module-job-ungrounded", "run-ungrounded")),
+      ).rejects.toThrow();
+      const result = await host.execute(execution("module-job-a", "run-a"));
       const text = (result as {
         blockProposal?: { payload?: { value?: { items?: { text?: string }[] } } };
       }).blockProposal?.payload?.value?.items?.[0]?.text;
@@ -400,7 +412,7 @@ describe("general Agent tool-registry Extension", () => {
         "alpha_discover",
         "beta_read",
       ]);
-      expect(prompts).toHaveLength(4);
+      expect(prompts).toHaveLength(8);
       expect(prompts[0]).toContain('"maximum":3');
       expect(prompts[0]).toContain("alpha_discover");
       expect(prompts[0]).toContain("successResultSchema");
@@ -409,8 +421,12 @@ describe("general Agent tool-registry Extension", () => {
         { kind: "json-object" },
         { kind: "json-object" },
         { kind: "json-object" },
+        { kind: "text" },
+        { kind: "json-object" },
+        { kind: "json-object" },
+        { kind: "json-object" },
       ]);
-      expect(execute).toHaveBeenCalledTimes(2);
+      expect(execute).toHaveBeenCalledTimes(4);
       expect(
         new FileToolJournalRepository({ path: toolJournalPath })
           .listRounds("module-job-a"),

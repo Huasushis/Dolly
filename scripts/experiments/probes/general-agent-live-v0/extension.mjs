@@ -119,6 +119,41 @@ function strictAnswer(text, includeAction, allowFenced) {
   return value;
 }
 
+function collectNonEmptyStringArguments(value, output) {
+  if (typeof value === "string") {
+    if (value !== "") output.add(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) collectNonEmptyStringArguments(entry, output);
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const entry of Object.values(value)) {
+      collectNonEmptyStringArguments(entry, output);
+    }
+  }
+}
+
+function assertGroundedToolAnswer(action, observations) {
+  const observedSourceArguments = new Set();
+  for (const observation of observations) {
+    collectNonEmptyStringArguments(observation.arguments, observedSourceArguments);
+  }
+  if (!action.grounded) {
+    throw new Error("a tool-backed final answer must set grounded true");
+  }
+  if (
+    action.evidenceKeys.length === 0 ||
+    new Set(action.evidenceKeys).size !== action.evidenceKeys.length ||
+    action.evidenceKeys.some((key) => !observedSourceArguments.has(key))
+  ) {
+    throw new Error(
+      "final evidenceKeys must name unique source arguments from successful tool observations",
+    );
+  }
+}
+
 function taskText(input) {
   for (const group of input?.blockGroups ?? []) {
     const items = group?.block?.payload?.value?.items;
@@ -356,6 +391,7 @@ async function runAgent(params) {
         "Return exactly one JSON object and no markdown.",
         "For a tool action use exactly keys action,arguments, where action is the selected tool name.",
         "For the final action use exactly keys action,answer,grounded,evidenceKeys; set action to answer and answer to one non-empty string, never an object.",
+        "For a grounded final answer, evidenceKeys must contain the exact source key passed to the successful read action; never put tool names in evidenceKeys.",
         "Keep internal reasoning under 120 words and reserve output budget for JSON.",
         `Registry: ${JSON.stringify(registry)}`,
       ].join(" ");
@@ -393,6 +429,7 @@ async function runAgent(params) {
       const rawAction = parseModelObject(output.finalContent, allowFencedModelJson);
       if (rawAction?.action === "answer") {
         const action = strictAnswer(output.finalContent, true, allowFencedModelJson);
+        assertGroundedToolAnswer(action, observations);
         return {
           conditionId: "tool-registry-storage",
           task,

@@ -406,6 +406,17 @@ tool declare compatible parallel/effect semantics. Otherwise the extension uses
 stable response order. A provider continuation contains all required matching
 terminal results and no orphan or duplicate.
 
+An evidence key is a stable source identifier used to justify a final claim,
+not a tool name, call identifier, or operation label. A tool whose result may
+ground a final answer MUST have a closed, host-selected rule that derives these
+identifiers from validated arguments and successful results. The Extension
+records the derived identifiers with the terminal tool observation and accepts
+only final evidence keys from that recorded set. It MUST NOT infer product
+provenance from arbitrary string fields merely because the model repeats them.
+The current registry canary has only an interim read-only check against the
+successful call's string arguments; it demonstrates rejection of tool names but
+does not yet supply the descriptor-level product rule.
+
 ### 8.3 Approval
 
 Approval binds trusted tool identity, validated argument digest, effect class,
@@ -425,6 +436,10 @@ result. Cancellation or transport loss that leaves an effect uncertain produces
 Provider output is untrusted. The extension validates the normalized envelope,
 channel sizes, finish reason, tool calls, output schema, item count, numeric
 ranges, and every requested Core/media reference before preparing a result.
+When an answer claims to be grounded, its evidence keys MUST resolve to source
+identifiers recorded by successful tool observations in the same Module job.
+An answer that names the correct value but cites an operation instead of its
+source fails before Module result preparation.
 
 A required structured output failure is not hidden by a plausible plain-text
 answer. An optional correction request is a separate budgeted model invocation
