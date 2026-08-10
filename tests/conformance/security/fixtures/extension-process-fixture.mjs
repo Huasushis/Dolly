@@ -194,6 +194,36 @@ async function handleHostRequest(message) {
       });
       return;
     }
+    if (mode === "capability-quota-then-business-error") {
+      await invokeCapability(
+        initialized.capabilities[0].handle,
+        "read",
+        {
+          moduleJobId: params.moduleJobId,
+          runId: params.runId,
+          idempotencyKey: `${params.moduleJobId}-fixture-effect-1`,
+        },
+      );
+      await invokeCapability(
+        initialized.capabilities[0].handle,
+        "read",
+        {
+          moduleJobId: params.moduleJobId,
+          runId: params.runId,
+          idempotencyKey: `${params.moduleJobId}-fixture-effect-2`,
+        },
+      );
+      send({
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: -32_000,
+          message: "fixture business error after capability quota refusal",
+          data: { errorCode: "FIXTURE_FAILURE", retryable: false },
+        },
+      });
+      return;
+    }
     if (mode === "cpu-loop") {
       while (true) {
         // Deliberately block this child process only.

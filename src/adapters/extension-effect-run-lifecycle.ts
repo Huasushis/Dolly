@@ -13,7 +13,10 @@ import {
   EffectIntentJournal,
   type EffectOutcome,
 } from "../core/capabilities/effect-intent-journal.js";
-import { ExtensionCapabilityError } from "../core/extension-capability.js";
+import {
+  ExtensionCapabilityError,
+  isExtensionCapabilityPreflightRefusal,
+} from "../core/extension-capability.js";
 import type {
   ExtensionCapabilityEffectInvocation,
   ExtensionEffectRunLifecycle,
@@ -37,6 +40,13 @@ function unknownFailure(): EffectOutcome {
   return {
     kind: "unknown",
     reason: "the capability invocation did not settle a durable result",
+  };
+}
+
+function provenNoEffect(): EffectOutcome {
+  return {
+    kind: "no-effect",
+    detail: "the capability authority refused the invocation before its handler started",
   };
 }
 
@@ -121,7 +131,7 @@ export function createExtensionEffectJournalLifecycle(
         options.journal.recordOutcome(
           invocation.identity,
           record.idempotencyKey,
-          unknownFailure(),
+          isExtensionCapabilityPreflightRefusal(error) ? provenNoEffect() : unknownFailure(),
         );
         throw error;
       }

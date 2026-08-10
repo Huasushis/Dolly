@@ -624,6 +624,68 @@ describe("Extension process isolation and capability checks", () => {
     }
   });
 
+  it("records a Host quota refusal as no-effect without hiding earlier terminal effects", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-effect-quota-refusal-"));
+    const path = join(scratch, "effect-intents.json");
+    const identity = {
+      moduleJobId: "module-job-a",
+      runId: "run-a",
+      attempt: 1,
+      claimToken: "claim-token-a",
+      moduleGenerationId: "module-generation-a",
+    } as const;
+    const store = new FileEffectIntentStore({ path });
+    const journal = new EffectIntentJournal({
+      store,
+      now: () => "2026-08-10T03:00:00.000Z",
+    });
+    const handler = vi.fn(async () => ({ fromHost: true }));
+    const host = createHost("capability-quota-then-business-error", scratch, {
+      effectRunLifecycle: createExtensionEffectJournalLifecycle({
+        journal,
+        getModuleSubmissionRecord: () => ({
+          schemaVersion: "dolly.module-submission-record/1",
+          ...identity,
+          processGenerationId: "process-generation-1",
+          inputDigest: `sha256:${"d".repeat(64)}`,
+          createdAt: "2026-08-10T03:00:00.000Z",
+        }),
+      }),
+    });
+    host.grantCapability(
+      {
+        capabilityType: "private-storage",
+        capabilityVersion: "v1",
+        operations: ["read"],
+        resourceScope: { descriptor: "fixture-storage", executionScope: "active-run" },
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        maxInvocations: 1,
+        maxConcurrentInvocations: 1,
+        maxArgumentBytes: 256,
+        maxResultBytes: 256,
+        requireIdempotencyKey: true,
+      },
+      handler,
+    );
+    try {
+      await host.start();
+      await expect(host.execute(execution())).rejects.toMatchObject({
+        code: "EXTENSION_INTERNAL",
+      });
+      expect(handler).toHaveBeenCalledOnce();
+      expect(store.list().map((record) => record.outcome.kind)).toEqual([
+        "terminal",
+        "no-effect",
+      ]);
+      expect(journal.evidenceForRun(identity)).toEqual({ kind: "terminal" });
+      expect(host.snapshot.state).toBe("ready");
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("rejects an oversized frame before JSON parsing and terminates only that extension", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-process-protocol-frame-"));
     const host = createHost("oversized-frame", scratch);

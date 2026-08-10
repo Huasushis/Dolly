@@ -102,6 +102,19 @@ export class ExtensionCapabilityError extends Error {
   }
 }
 
+const PREFLIGHT_REFUSALS = new WeakSet<ExtensionCapabilityError>();
+
+/**
+ * True only for an authority refusal raised before a capability handler was
+ * entered. The marker is process-local and cannot be forged by an Extension
+ * or by a handler constructing an error with the same public fields.
+ */
+export function isExtensionCapabilityPreflightRefusal(
+  error: unknown,
+): error is ExtensionCapabilityError {
+  return error instanceof ExtensionCapabilityError && PREFLIGHT_REFUSALS.has(error);
+}
+
 interface CapabilityRecord {
   readonly handle: string;
   readonly sessionId: string;
@@ -304,6 +317,18 @@ export class ExtensionCapabilityAuthority {
   }
 
   async invoke(
+    session: ExtensionCapabilitySession,
+    invocation: ExtensionCapabilityInvocation,
+  ): Promise<JsonValue> {
+    try {
+      return this.#prepareAndInvoke(session, invocation);
+    } catch (error) {
+      if (error instanceof ExtensionCapabilityError) PREFLIGHT_REFUSALS.add(error);
+      throw error;
+    }
+  }
+
+  #prepareAndInvoke(
     session: ExtensionCapabilitySession,
     invocation: ExtensionCapabilityInvocation,
   ): Promise<JsonValue> {
