@@ -206,7 +206,11 @@ handler only once. The targeted regression set passed 223 tests (47 focused
 and 176 broader; two additional tests were skipped by their existing platform
 conditions), and TypeScript checking passed.
 
-This does not solve the model's repeated-action behavior. The next Agent
-iteration should add a bounded no-progress rule for semantically identical
-read-only calls and test it with fresh seeds. It must not silently increase
-budgets or reinterpret this failed run after observing its outputs.
+Commit `38f4794` adds the first bounded no-progress candidate without
+reclassifying this failed run. A semantic duplicate of a successful read-only
+call reuses the prior observation without another tool execution; parameter
+object key order does not evade the comparison. One consecutive duplicate may
+be corrected within a bounded model-action loop, while a second consecutive
+duplicate fails. Non-read calls are never automatically reused. Real-child
+counterexamples cover both correction and bounded failure, but fresh live seeds
+are still required before this mechanism has model-level evidence.
