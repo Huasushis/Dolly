@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { type BlockProposal } from "../../../src/core/block-store.js";
 import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
@@ -10,8 +10,11 @@ import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js
 import { createModuleResultCommitCoordinator } from "../../../src/core/module-result-commit-factory.js";
 import {
   InMemoryModuleResultCommitRepository,
+  ModuleResultCommitBackpressureError,
   type ModuleResultCommitInput,
+  type ModuleResultCommitRepository,
 } from "../../../src/core/module-result-commit.js";
+import { ReactiveModuleRuntime } from "../../../src/core/reactive-module-runtime.js";
 
 const NOW = "2026-08-09T00:00:00.000Z";
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -58,7 +61,6 @@ function prepareWorker(
   inputPageId: string,
 ): ModuleResultCommitInput {
   const moduleGenerationId = `${moduleId}-generation`;
-  const processGenerationId = `${moduleId}-process-generation`;
   const inputBlock = core.blocks.commit(proposal(`${moduleId} input`), {
     kind: "external",
     id: "console",
@@ -71,6 +73,25 @@ function prepareWorker(
     maxCount: 1,
     maxBytes: 1024 * 1024,
   })!;
+  persistSubmittedClaim(core, moduleId, claim);
+  return {
+    ...claim,
+    source: { kind: "module", id: moduleId },
+    outputPageIds: ["output"],
+    blockProposal: proposal(`${moduleId} output`),
+  };
+}
+
+function persistSubmittedClaim(
+  core: FileCoreStateStore,
+  moduleId: string,
+  claim: Pick<
+    ModuleResultCommitInput,
+    "attempt" | "claimToken" | "moduleGenerationId" | "moduleJobId" | "runId"
+  >,
+): void {
+  const moduleGenerationId = claim.moduleGenerationId;
+  const processGenerationId = `${moduleId}-process-generation`;
   core.appendModuleProcessRecord({
     schemaVersion: "dolly.module-process-record/1",
     instanceId: "capacity-instance",
@@ -106,12 +127,6 @@ function prepareWorker(
     inputDigest: canonicalJsonDigest(core.deliveries.inspectClaimInput(claim)),
     createdAt: NOW,
   });
-  return {
-    ...claim,
-    source: { kind: "module", id: moduleId },
-    outputPageIds: ["output"],
-    blockProposal: proposal(`${moduleId} output`),
-  };
 }
 
 describe("FileCore Module output capacity", () => {
@@ -237,7 +252,13 @@ describe("FileCore Module output capacity", () => {
       }],
     });
 
-    await expect(recovering.recoverAll()).resolves.toHaveLength(2);
+    await expect(recovering.recoverAll()).resolves.toMatchObject({
+      recoveredCommits: [
+        expect.objectContaining({ moduleJobId: sinkClaim.moduleJobId, state: "committed" }),
+        expect.objectContaining({ moduleJobId: upstream.moduleJobId, state: "committed" }),
+      ],
+      deferredCommits: [],
+    });
     expect(reopened.deliveries.inspectClaim(upstream).status).toBe("committed");
     expect(reopened.deliveries.inspectClaim(sinkClaim).status).toBe("committed");
     expect(reopened.deliveries.inspectResident("sink", ["output"])).toMatchObject({
@@ -258,6 +279,248 @@ describe("FileCore Module output capacity", () => {
     expect(verifiedCore.deliveries.inspectClaim(sinkClaim).status).toBe("committed");
     expect(verifiedCore.deliveries.inspectResident("sink", ["output"])).toMatchObject({
       residentCount: 1,
+    });
+  });
+
+  it("restores a deferred output commit without executing the Module again", async () => {
+    const root = scratch("capacity-runtime-restart");
+    const statePath = join(root, "core-state.json");
+    const journalPath = join(root, "module-result-commits.json");
+    const first = openCore(statePath, "first");
+    first.deliveries.createPage("input");
+    first.deliveries.createPage("output");
+    first.deliveries.registerConsumer("input", "worker", "from-now");
+    first.deliveries.registerConsumer("output", "sink", "from-now");
+    const resident = first.blocks.commit(proposal("resident"), {
+      kind: "external",
+      id: "console",
+    });
+    first.deliveries.append("output", resident.id);
+    const input = prepareWorker(first, "worker", "input");
+    const repository = new FileModuleResultCommitRepository({ path: journalPath });
+    const limited = createModuleResultCommitCoordinator({
+      core: first,
+      repository,
+      now: () => NOW,
+      mailboxes: [{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 1,
+        maxResidentBytes: 1024 * 1024,
+      }],
+    });
+    await expect(limited.commit(input)).rejects.toMatchObject({
+      code: "MODULE_RESULT_OUTPUT_BACKPRESSURED",
+    });
+
+    const restarted = openCore(statePath, "restarted");
+    const restartedRepository = new FileModuleResultCommitRepository({ path: journalPath });
+    const commits = createModuleResultCommitCoordinator({
+      core: restarted,
+      repository: restartedRepository,
+      now: () => NOW,
+      mailboxes: [{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 1,
+        maxResidentBytes: 1024 * 1024,
+      }],
+    });
+    const recovery = await commits.recoverAll();
+    expect(recovery.deferredCommits).toHaveLength(1);
+
+    const sinkClaim = restarted.deliveries.claim({
+      consumerId: "sink",
+      pageIds: ["output"],
+      moduleGenerationId: "sink-generation",
+      maxCount: 1,
+      maxBytes: 1024 * 1024,
+    })!;
+    persistSubmittedClaim(restarted, "sink", sinkClaim);
+    expect(restarted.acknowledgeDeliveryClaim(sinkClaim)).toBe("committed");
+
+    const execute = vi.fn().mockResolvedValue({
+      schemaVersion: "dolly.module-result/1",
+    });
+    const startExecutor = vi.fn().mockResolvedValue(undefined);
+    const persistModuleSubmission = vi.fn(() => {
+      throw new Error("restored commit must not submit a new Module Run");
+    });
+    const runtime = new ReactiveModuleRuntime({
+      moduleId: "worker",
+      initialModuleGenerationId: "worker-restarted-generation",
+      inputPageIds: ["input"],
+      outputPageIds: ["output"],
+      claimMaxCount: 1,
+      claimMaxBytes: 1024 * 1024,
+      maxInputBytes: 2 * 1024 * 1024,
+      maxResultBytes: 2 * 1024 * 1024,
+      executionTimeoutMs: 60_000,
+      cancellationGraceMs: 1_000,
+      initializationTimeoutMs: 1_000,
+      terminationTimeoutMs: 1_000,
+      maxRunsPerGeneration: 100,
+      maxGenerations: 8,
+      deliveries: {
+        validateClaimPages: restarted.deliveries.validateClaimPages.bind(restarted.deliveries),
+        validateOutputPages: restarted.deliveries.validateOutputPages.bind(restarted.deliveries),
+        claim: restarted.deliveries.claim.bind(restarted.deliveries),
+        flushPersistence: restarted.deliveries.flushPersistence.bind(restarted.deliveries),
+        inspectClaim: restarted.deliveries.inspectClaim.bind(restarted.deliveries),
+        inspectClaimInput: restarted.deliveries.inspectClaimInput.bind(restarted.deliveries),
+      },
+      persistModuleSubmission,
+      releaseDeliveryClaim: () => {
+        throw new Error("restored commit must not release its Claim");
+      },
+      negativelyAcknowledgeDeliveryClaim: () => {
+        throw new Error("restored commit must not negatively acknowledge its Claim");
+      },
+      getModuleSubmissionRecord: (runId) => restarted.getModuleSubmissionRecord(runId),
+      commits,
+      initialDeferredCommit: recovery.deferredCommits[0],
+      nextModuleGenerationId: () => "worker-next-generation",
+      monotonicNow: () => 1,
+      declaredExternalEffects: "core-capabilities-only",
+      createExecutor: () => ({
+        isolation: "process",
+        start: startExecutor,
+        execute,
+        terminate: async () => undefined,
+      }),
+      classifyFailure: (failure) => ({ code: failure.code, retryable: false }),
+    });
+    expect(runtime.outputCommitWaiting).toBe(true);
+    await runtime.start();
+    expect(startExecutor).not.toHaveBeenCalled();
+    await expect(runtime.tick()).resolves.toMatchObject({
+      moduleJobId: input.moduleJobId,
+      status: "committed",
+      recovered: true,
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(startExecutor).not.toHaveBeenCalled();
+    expect(persistModuleSubmission).not.toHaveBeenCalled();
+    await runtime.stop();
+
+    const verifiedCore = openCore(statePath, "verified");
+    const verifiedRepository = new FileModuleResultCommitRepository({ path: journalPath });
+    expect(verifiedRepository.get(input.moduleJobId)).toMatchObject({
+      state: "committed",
+      outputDeliveries: [expect.objectContaining({ pageId: "output" })],
+    });
+    expect(verifiedCore.deliveries.inspectClaim(input).status).toBe("committed");
+    expect(verifiedCore.deliveries.inspectResident("sink", ["output"])).toMatchObject({
+      residentCount: 1,
+    });
+  });
+
+  it("never nacks a startup-verified result when its journal later disappears", async () => {
+    const root = scratch("capacity-runtime-missing-journal");
+    const statePath = join(root, "core-state.json");
+    const core = openCore(statePath, "missing");
+    core.deliveries.createPage("input");
+    core.deliveries.createPage("output");
+    core.deliveries.registerConsumer("input", "worker", "from-now");
+    core.deliveries.registerConsumer("output", "sink", "from-now");
+    const resident = core.blocks.commit(proposal("resident"), {
+      kind: "external",
+      id: "console",
+    });
+    core.deliveries.append("output", resident.id);
+    const input = prepareWorker(core, "worker", "input");
+    const stored = new InMemoryModuleResultCommitRepository();
+    let hideJournal = false;
+    const repository: ModuleResultCommitRepository = {
+      createPrepared: (record) => stored.createPrepared(record),
+      get: (moduleJobId) => hideJournal ? null : stored.get(moduleJobId),
+      compareAndSet: (moduleJobId, revision, next) =>
+        stored.compareAndSet(moduleJobId, revision, next),
+      list: () => hideJournal ? [] : stored.list(),
+    };
+    const commits = createModuleResultCommitCoordinator({
+      core,
+      repository,
+      now: () => NOW,
+      mailboxes: [{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 1,
+        maxResidentBytes: 1024 * 1024,
+      }],
+    });
+    await expect(commits.commit(input)).rejects.toMatchObject({
+      code: "MODULE_RESULT_OUTPUT_BACKPRESSURED",
+    });
+    const recovery = await commits.recoverAll();
+    expect(recovery.deferredCommits).toHaveLength(1);
+
+    const nack = vi.fn(() => "dead-lettered" as const);
+    const release = vi.fn(() => "released" as const);
+    const startExecutor = vi.fn().mockResolvedValue(undefined);
+    const execute = vi.fn().mockResolvedValue({ schemaVersion: "dolly.module-result/1" });
+    const runtime = new ReactiveModuleRuntime({
+      moduleId: "worker",
+      initialModuleGenerationId: "worker-restarted-generation",
+      inputPageIds: ["input"],
+      outputPageIds: ["output"],
+      claimMaxCount: 1,
+      claimMaxBytes: 1024 * 1024,
+      maxInputBytes: 2 * 1024 * 1024,
+      maxResultBytes: 2 * 1024 * 1024,
+      executionTimeoutMs: 60_000,
+      cancellationGraceMs: 1_000,
+      initializationTimeoutMs: 1_000,
+      terminationTimeoutMs: 1_000,
+      maxRunsPerGeneration: 100,
+      maxGenerations: 8,
+      deliveries: {
+        validateClaimPages: core.deliveries.validateClaimPages.bind(core.deliveries),
+        validateOutputPages: core.deliveries.validateOutputPages.bind(core.deliveries),
+        claim: core.deliveries.claim.bind(core.deliveries),
+        flushPersistence: core.deliveries.flushPersistence.bind(core.deliveries),
+        inspectClaim: core.deliveries.inspectClaim.bind(core.deliveries),
+        inspectClaimInput: core.deliveries.inspectClaimInput.bind(core.deliveries),
+      },
+      persistModuleSubmission: () => {
+        throw new Error("restored commit must not submit a new Module Run");
+      },
+      releaseDeliveryClaim: release,
+      negativelyAcknowledgeDeliveryClaim: nack,
+      getModuleSubmissionRecord: (runId) => core.getModuleSubmissionRecord(runId),
+      commits,
+      initialDeferredCommit: recovery.deferredCommits[0],
+      nextModuleGenerationId: () => "worker-next-generation",
+      monotonicNow: () => 1,
+      declaredExternalEffects: "none",
+      createExecutor: () => ({
+        isolation: "process",
+        start: startExecutor,
+        execute,
+        terminate: async () => undefined,
+      }),
+      classifyFailure: (failure) => ({ code: failure.code, retryable: false }),
+    });
+    await runtime.start();
+    hideJournal = true;
+    await expect(runtime.tick()).resolves.toMatchObject({
+      moduleJobId: input.moduleJobId,
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    });
+    await expect(runtime.recover()).resolves.toMatchObject({
+      moduleJobId: input.moduleJobId,
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    });
+    expect(nack).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
+    expect(startExecutor).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(core.deliveries.inspectClaim(input).status).toBe("active");
+    expect(core.getModuleSubmissionRecord(input.runId)).toBeDefined();
+    await expect(runtime.stop()).rejects.toMatchObject({
+      code: "RUNTIME_RECOVERY_REQUIRED",
     });
   });
 
@@ -297,9 +560,15 @@ describe("FileCore Module output capacity", () => {
     expect(core.deliveries.inspectClaim(input).status).toBe("active");
     expect(core.getModuleSubmissionRecord(input.runId)).toBeDefined();
     expect(core.deliveries.inspectPending("sink", ["output"]).pendingCount).toBe(1);
-    await expect(limited.recoverAll()).rejects.toMatchObject({
-      code: "MODULE_RESULT_OUTPUT_BACKPRESSURED",
-      blockedConsumerIds: ["sink"],
+    await expect(limited.recoverAll()).resolves.toMatchObject({
+      recoveredCommits: [],
+      deferredCommits: [{
+        record: expect.objectContaining({
+          moduleJobId: input.moduleJobId,
+          state: "prepared",
+        }),
+        blockedConsumerIds: ["sink"],
+      }],
     });
 
     let interruptAfterAtomicCommit = true;
@@ -349,6 +618,58 @@ describe("FileCore Module output capacity", () => {
     });
     expect(reopened.deliveries.inspectPending("worker", ["input"]).pendingCount).toBe(0);
     expect(reopened.deliveries.inspectPending("sink", ["output"]).pendingCount).toBe(2);
+  });
+
+  it("does not classify a hook-thrown backpressure lookalike as deferred capacity", async () => {
+    const root = scratch("capacity-hook-lookalike");
+    const core = openCore(join(root, "core-state.json"), "hook");
+    core.deliveries.createPage("input");
+    core.deliveries.createPage("output");
+    core.deliveries.registerConsumer("input", "worker", "from-now");
+    core.deliveries.registerConsumer("output", "sink", "from-now");
+    const resident = core.blocks.commit(proposal("resident"), {
+      kind: "external",
+      id: "console",
+    });
+    core.deliveries.append("output", resident.id);
+    const input = prepareWorker(core, "worker", "input");
+    const repository = new InMemoryModuleResultCommitRepository();
+    const limited = createModuleResultCommitCoordinator({
+      core,
+      repository,
+      now: () => NOW,
+      mailboxes: [{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 1,
+        maxResidentBytes: 1024 * 1024,
+      }],
+    });
+    await expect(limited.commit(input)).rejects.toMatchObject({
+      code: "MODULE_RESULT_OUTPUT_BACKPRESSURED",
+    });
+
+    const expanded = createModuleResultCommitCoordinator({
+      core,
+      repository,
+      now: () => NOW,
+      mailboxes: [{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 2,
+        maxResidentBytes: 1024 * 1024,
+      }],
+      afterEffect: (event) => {
+        if (event.phase === "after-ack-effect") {
+          throw new ModuleResultCommitBackpressureError(["sink"]);
+        }
+      },
+    });
+    await expect(expanded.recoverAll()).rejects.toBeInstanceOf(
+      ModuleResultCommitBackpressureError,
+    );
+    expect(core.deliveries.inspectClaim(input).status).toBe("committed");
+    expect(repository.get(input.moduleJobId)).toMatchObject({ state: "prepared" });
   });
 
   it("serializes two producers competing for the same final slot", async () => {

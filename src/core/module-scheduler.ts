@@ -80,6 +80,8 @@ export function systemSchedulerClock(): SchedulerClock {
  */
 export interface SchedulableModuleRuntime {
   readonly moduleGenerationId: string;
+  /** True when startup restored an accepted result that only needs output admission. */
+  readonly outputCommitWaiting?: boolean;
   tick(limits?: ReactiveModuleClaimLimits): Promise<ReactiveModuleTickResult>;
 }
 
@@ -783,7 +785,7 @@ export class ModuleScheduler {
       pendingOldestEnqueuedAt: null,
       mailboxFull: false,
       inFlight: null,
-      outputCommitWaiting: false,
+      outputCommitWaiting: registration.runtime.outputCommitWaiting === true,
       dispatchPending: null,
       dispatchClaimLimitCount: null,
       dispatchClaimLimitBytes: null,

@@ -1,4 +1,8 @@
-import type { ExternalEffectEvidenceSource } from "../core/core-startup-recovery.js";
+import {
+  consumeCoreStartupRecoveryHandoff,
+  type CoreStartupRecoveryHandoff,
+  type ExternalEffectEvidenceSource,
+} from "../core/core-startup-recovery.js";
 import type { DeliveryMailboxCapacity, FailureClassification } from "../core/delivery-store.js";
 import type { ExtensionInstallationRegistry } from "../core/extension-installation-registry.js";
 import { FileCoreStateStore } from "../core/file-core-state-store.js";
@@ -14,6 +18,7 @@ import type { ModuleConfigurationStore } from "../core/module-configuration-stor
 import type { ModuleProcessStoppedRecordWriter } from "../core/module-process-records.js";
 import { createModuleResultCommitCoordinator } from "../core/module-result-commit-factory.js";
 import type {
+  DeferredModuleResultCommit,
   ModuleResultCommitCoordinator,
   ModuleResultCommitHookEvent,
 } from "../core/module-result-commit.js";
@@ -108,6 +113,14 @@ function canonicalNow(now: () => string): string {
 export function createInstalledReactiveModuleRuntime(
   options: InstalledReactiveModuleRuntimeOptions,
 ): InstalledReactiveModuleRuntime {
+  return createInstalledReactiveModuleRuntimeInternal(options);
+}
+
+function createInstalledReactiveModuleRuntimeInternal(
+  options: InstalledReactiveModuleRuntimeOptions & {
+    readonly initialDeferredCommit?: DeferredModuleResultCommit;
+  },
+): InstalledReactiveModuleRuntime {
   if (Object.getPrototypeOf(options.core) !== FileCoreStateStore.prototype) {
     throw new TypeError("Installed Module runtime requires one direct FileCoreStateStore");
   }
@@ -141,6 +154,31 @@ export function createInstalledReactiveModuleRuntime(
     throw new TypeError(
       "Installed reactive runtime cannot consume permission policies before capability composition exists",
     );
+  }
+  if (options.initialDeferredCommit !== undefined) {
+    const record = options.initialDeferredCommit.record;
+    const submission = options.core.getModuleSubmissionRecord(record.runId);
+    const processRecord = submission === undefined
+      ? undefined
+      : options.core.getModuleProcessRecord(submission.processGenerationId);
+    const reference = module.configurationReference;
+    if (
+      submission === undefined ||
+      processRecord === undefined ||
+      processRecord.state !== "stopped" ||
+      processRecord.instanceId !== resolvedModule.instanceId ||
+      processRecord.moduleId !== module.moduleId ||
+      processRecord.moduleGenerationId !== record.moduleGenerationId ||
+      processRecord.packageDigest !== resolvedModule.installation.packageDigest ||
+      processRecord.configurationReference.configId !== reference.configId ||
+      processRecord.configurationReference.revision !== reference.revision ||
+      processRecord.configurationReference.configVersion !== reference.configVersion ||
+      processRecord.declaredExternalEffects !== options.declaredExternalEffects
+    ) {
+      throw new TypeError(
+        "Deferred Module result does not match its stopped installed process, package, configuration, and effect declaration",
+      );
+    }
   }
   const claim = module.limits.claim;
   if (claim === null) {
@@ -237,6 +275,9 @@ export function createInstalledReactiveModuleRuntime(
     getModuleSubmissionRecord: (runId) =>
       options.core.getModuleSubmissionRecord(runId),
     commits,
+    ...(options.initialDeferredCommit === undefined
+      ? {}
+      : { initialDeferredCommit: options.initialDeferredCommit }),
     nextModuleGenerationId: options.nextModuleGenerationId,
     monotonicNow: options.monotonicNow,
     declaredExternalEffects: options.declaredExternalEffects,
@@ -277,6 +318,8 @@ export interface InstalledReactiveModuleHostOptions {
   readonly configurations: ModuleConfigurationStore;
   readonly coreState: FileCoreStateStoreWithStoppedRecordWriter;
   readonly mailboxes: readonly DeliveryMailboxCapacity[];
+  /** One-use, store-bound proof produced only after startup stopped old processes. */
+  readonly startupRecoveryHandoff: CoreStartupRecoveryHandoff;
   readonly clock: SchedulerClock;
   readonly scheduling: ReactiveModuleSchedulingConstraints;
   readonly runtime: InstalledHostRuntimeOptions;
@@ -322,13 +365,36 @@ export function composeInstalledReactiveModuleHost(
     }
     return Object.freeze({ module, mailbox });
   });
+  const deferredCommits = consumeCoreStartupRecoveryHandoff({
+    handoff: options.startupRecoveryHandoff,
+    deliveries: options.coreState.store.deliveries,
+    repository: options.runtime.resultCommitRepository,
+  });
+  const deferredByModule = new Map<string, DeferredModuleResultCommit>();
+  for (const deferred of deferredCommits) {
+    const record = deferred.record;
+    if (
+      record.source.kind !== "module" ||
+      !options.configuration.modules.some((module) => module.moduleId === record.source.id)
+    ) {
+      throw new TypeError(
+        `Deferred Module result ${record.moduleJobId} does not belong to a configured Module`,
+      );
+    }
+    if (deferredByModule.has(record.source.id)) {
+      throw new TypeError(
+        `Configured Module ${record.source.id} has more than one deferred result commit`,
+      );
+    }
+    deferredByModule.set(record.source.id, deferred);
+  }
   const {
     initialModuleGenerationIdFor,
     nextModuleGenerationIdFor,
     ...sharedRuntimeOptions
   } = options.runtime;
   const installedRuntimes = moduleMailboxes.map(({ module }) =>
-    createInstalledReactiveModuleRuntime({
+    createInstalledReactiveModuleRuntimeInternal({
       ...sharedRuntimeOptions,
       instanceConfiguration: options.configuration,
       moduleId: module.moduleId,
@@ -342,6 +408,9 @@ export function composeInstalledReactiveModuleHost(
       nextModuleGenerationId: () =>
         nextModuleGenerationIdFor(module.moduleId),
       monotonicNow: options.clock.monotonicNow,
+      ...(deferredByModule.has(module.moduleId)
+        ? { initialDeferredCommit: deferredByModule.get(module.moduleId)! }
+        : {}),
     })
   );
   const host = composeReactiveModuleHost({

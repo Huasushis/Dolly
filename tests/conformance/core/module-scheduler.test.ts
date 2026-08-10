@@ -1311,6 +1311,34 @@ describe("CORE scheduler retry backoff", () => {
     await scheduler.stop();
   });
 
+  it("drives a startup-restored output commit even when the pending input queue is empty", async () => {
+    const { clock, mailboxes, scheduler } = createScheduler();
+    const runtime = new FakeModuleRuntime(() => committedResult(1));
+    Object.defineProperty(runtime, "outputCommitWaiting", {
+      configurable: false,
+      enumerable: true,
+      value: true,
+    });
+    mailboxes.set("worker", 0, 0);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: ["output"],
+      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+    });
+    scheduler.start();
+    await drain(clock);
+
+    expect(runtime.tickCount).toBe(1);
+    expect(scheduler.status("worker")).toMatchObject({
+      schedulingState: "idle",
+      lastTickStatus: "committed",
+      counters: { committed: 1 },
+    });
+    await scheduler.stop();
+  });
+
   it("adds bounded jitter from the injected random source", async () => {
     const samples = [0, 1, 0.5];
     let index = 0;

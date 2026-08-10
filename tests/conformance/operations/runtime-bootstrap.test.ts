@@ -129,13 +129,17 @@ describe("production runtime bootstrap", () => {
 
     expect(runtime.state).toBe("ready");
     expect(runtime.core.deliveries.snapshot().pages).toMatchObject([{ id: "main" }]);
-    expect(runtime.recovery).toEqual({
+    expect(runtime.recovery).toMatchObject({
       recoveredCommits: [],
+      deferredCommits: [],
       releasedClaims: [],
       unknownOutcomeClaims: [],
       stoppedProcessGenerationIds: [],
       collectedRecords: { processRecords: 0 },
     });
+    expect(runtime.recovery.handoff.schemaVersion).toBe(
+      "dolly.core-startup-recovery-handoff/1",
+    );
     expect(runtime.status()).toMatchObject({
       schemaVersion: "dolly.runtime-status/3",
       state: "ready",

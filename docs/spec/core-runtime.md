@@ -1224,6 +1224,44 @@ whose status is `committed`, with no submission record. Every other combination,
 including any terminal Claim beside a submission record, is a fail-closed
 consistency error.
 
+Configured mailbox capacity can postpone step 3 after the result is already
+`prepared`. This is a known output-admission wait, not an unknown Run outcome:
+Core preserves the exact active Claim, submission, result record, and blocked
+consumer identifiers. Recovery attempts every independent prepared result in a
+deterministic pass, repeats while another completed result released capacity,
+and reports any remaining records as deferred. It MUST NOT acknowledge,
+negatively acknowledge, release, or execute the producing Module again merely
+because output admission is still waiting.
+
+A runtime receiving such a startup-revalidated record enters commit-only
+recovery. It exposes output-commit waiting to the Scheduler and retries only
+the exact journal commit. It MUST NOT start the Extension process while that
+commit remains deferred; initialization itself is not assumed effect-free.
+The startup coordinator passes these records through an opaque, one-use
+handoff bound to the exact Delivery store and result-journal repository. It
+creates that handoff only after freshly proving the old process group stopped.
+Callers cannot replace it with a structurally similar object, omit a record, or
+reuse it for another store. Installed composition additionally requires the
+stopped process record to match the installed package digest, configuration
+reference, Module generation, instance, and declared effect class before it
+constructs the new runtime.
+
+Once startup has verified a prepared result, a later missing or unreadable
+journal entry is a consistency failure requiring recovery; it is never evidence
+that the Module produced no result and never permits negative acknowledgement
+or execution. Only the coordinator's own capacity decision can create the
+output-wait state. An exception with the same public error shape from a test or
+diagnostic hook is an unknown commit outcome, not capacity evidence.
+After the commit succeeds, a later real input may lazily start the new Module
+generation. A supported product startup must pass every reported deferred
+record to this path and must not report the instance READY while silently
+ignoring one. When capacity can be released only by a downstream Module, the
+startup coordinator may drive that consumer under its ordinary Claim, effect,
+and process-isolation boundaries while the instance remains RECOVERING; it
+must keep external ingress closed, must not execute the deferred producer, and
+must expose sustained no progress. The public Module bootstrap remains disabled
+until that recovery-mode handoff and its Linux process boundary are proven.
+
 For a negative acknowledgement, dead-letter disposition, or release of a
 submitted Claim, Core first requires the result and external-effect evidence
 specified in Sections 7.6 and 9.4 or an explicit audited operator disposition,
@@ -2192,6 +2230,9 @@ With `persistent` durability, before Modules enter READY, recovery MUST:
 - recover Module result journal records through the Section 7.7 boundaries,
   reread one complete Core-state update, and then interpret each active Claim
   with its matching process and submission records plus external-effect evidence;
+- distinguish a prepared result waiting only for mailbox capacity from an
+  unknown outcome, preserve its Claim and submission, and hand it to the
+  Scheduler's commit-only recovery path without starting its Extension;
 - release only a Claim with no submission record after every old Module process
   is proven stopped and version 17 also has no exact
   unknown submission history item; report that release as

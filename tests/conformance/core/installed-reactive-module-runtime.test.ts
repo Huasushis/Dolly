@@ -11,12 +11,23 @@ import {
   composeInstalledReactiveModuleHost,
   createInstalledReactiveModuleRuntime,
 } from "../../../src/adapters/installed-reactive-module-runtime.js";
+import type { BlockProposal } from "../../../src/core/block-store.js";
+import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
+import {
+  CoreStartupRecovery,
+  moduleProcessStopProofIdentityDigest,
+  type ModuleProcessStopProof,
+} from "../../../src/core/core-startup-recovery.js";
 import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
 import { ExtensionInstallationRegistry } from "../../../src/core/extension-installation-registry.js";
 import { createFileCoreStateStoreWithStoppedRecordWriter } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
+import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
+import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
 import { ModuleConfigurationStore } from "../../../src/core/module-configuration-store.js";
+import { createModuleResultCommitCoordinator } from "../../../src/core/module-result-commit-factory.js";
+import type { DeliveryMailboxCapacity } from "../../../src/core/delivery-store.js";
 import {
   createDefaultDollyInstanceConfig,
   validateDollyInstanceConfig,
@@ -43,6 +54,25 @@ const SCHEMA = {
 } as const;
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const scratchParent = resolve(repositoryRoot, "..", ".tmp");
+
+function proposal(text: string): BlockProposal {
+  return {
+    payload: {
+      schema: "dolly.content/1",
+      value: { items: [{ type: "text", text, format: "plain" }] },
+    },
+  };
+}
+
+const provenStopped = {
+  proveStopped: async (
+    record: ModuleProcessRecord,
+  ): Promise<ModuleProcessStopProof> => ({
+    proven: true,
+    evidence: "populated-zero",
+    recordIdentityDigest: moduleProcessStopProofIdentityDigest(record),
+  }),
+};
 
 describe("installed reactive Module runtime composition", () => {
   let scratch: string;
@@ -130,11 +160,13 @@ describe("installed reactive Module runtime composition", () => {
   });
 
   function coreState(name: string) {
+    let blockId = 0;
+    let deliveryId = 0;
     const pair = createFileCoreStateStoreWithStoppedRecordWriter({
       path: resolve(scratch, `${name}-core.json`),
       maxFailedAttempts: 3,
-      nextBlockId: () => `${name}-block`,
-      nextDeliveryId: (kind) => `${name}-${kind}`,
+      nextBlockId: () => `${name}-block-${++blockId}`,
+      nextDeliveryId: (kind) => `${name}-${kind}-${++deliveryId}`,
       now: () => "2026-08-10T00:00:00.000Z",
     });
     pair.store.deliveries.createPage("input");
@@ -190,6 +222,25 @@ describe("installed reactive Module runtime composition", () => {
     };
   }
 
+  async function startupHandoff(
+    pair: ReturnType<typeof coreState>,
+    repository: FileModuleResultCommitRepository,
+    mailboxes: readonly DeliveryMailboxCapacity[],
+  ) {
+    const recovery = new CoreStartupRecovery({
+      deliveries: pair.store.deliveries,
+      commits: createModuleResultCommitCoordinator({
+        core: pair.store,
+        repository,
+        now: () => "2026-08-10T00:00:00.000Z",
+        mailboxes,
+      }),
+      moduleRecords: pair.store,
+      stoppedRecordWriter: pair.stoppedRecordWriter,
+    });
+    return (await recovery.recover()).handoff;
+  }
+
   it("constructs one unstarted runtime whose process and commit paths use the same Core", async () => {
     const pair = coreState("first");
     const composed = createInstalledReactiveModuleRuntime(options(pair));
@@ -206,6 +257,146 @@ describe("installed reactive Module runtime composition", () => {
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
 
+  it("accepts a stopped-process handoff without starting a replacement Extension", async () => {
+    const pair = coreState("deferred-installed");
+    pair.store.deliveries.registerConsumer("output", "sink", "from-now");
+    const resident = pair.store.blocks.commit(proposal("resident"), {
+      kind: "external",
+      id: "console",
+    });
+    pair.store.deliveries.append("output", resident.id);
+    const input = pair.store.blocks.commit(proposal("input"), {
+      kind: "external",
+      id: "console",
+    });
+    pair.store.deliveries.append("input", input.id);
+    const claim = pair.store.deliveries.claim({
+      consumerId: "worker",
+      pageIds: ["input"],
+      moduleGenerationId: "worker-old-generation",
+      maxCount: 1,
+      maxBytes: 4096,
+    })!;
+    const installed = installations.resolve({
+      extensionId: "org.example.installed-runtime",
+      packageVersion: "1.0.0",
+    });
+    const reference = instanceConfiguration.modules[0]!.configurationReference;
+    const processGenerationId = "process-deferred-installed-1";
+    pair.store.appendModuleProcessRecord({
+      schemaVersion: "dolly.module-process-record/1",
+      instanceId: INSTANCE_ID,
+      moduleId: "worker",
+      moduleGenerationId: claim.moduleGenerationId,
+      processGenerationId,
+      packageDigest: installed.packageDigest,
+      configurationReference: reference,
+      declaredExternalEffects: "none",
+      serviceInvocationId: BINDING.serviceInvocationId,
+      bootId: BINDING.bootId,
+      moduleCgroupPath: deriveModuleCgroupPath(BINDING.delegatedRootCgroupPath, {
+        instanceId: INSTANCE_ID,
+        moduleId: "worker",
+        processGenerationId,
+      }).filesystemPath,
+      state: "starting",
+      createdAt: "2026-08-10T00:00:00.000Z",
+      updatedAt: "2026-08-10T00:00:00.000Z",
+    });
+    pair.store.updateModuleProcessRecordState(processGenerationId, "running");
+    pair.store.appendModuleSubmissionRecord({
+      schemaVersion: "dolly.module-submission-record/1",
+      moduleJobId: claim.moduleJobId,
+      claimToken: claim.claimToken,
+      runId: claim.runId,
+      attempt: claim.attempt,
+      moduleGenerationId: claim.moduleGenerationId,
+      processGenerationId,
+      inputDigest: canonicalJsonDigest(pair.store.deliveries.inspectClaimInput(claim)),
+      createdAt: "2026-08-10T00:00:00.000Z",
+    });
+    pair.stoppedRecordWriter.writeStopped(processGenerationId);
+    const complete = options(pair);
+    const mailboxes = [...complete.mailboxes, {
+      consumerId: "sink",
+      pageIds: ["output"],
+      maxResidentCount: 1,
+      maxResidentBytes: 64 * 1024,
+    }];
+    const commits = createModuleResultCommitCoordinator({
+      core: pair.store,
+      repository: complete.resultCommitRepository,
+      now: complete.now,
+      mailboxes,
+    });
+    await expect(commits.commit({
+      ...claim,
+      source: { kind: "module", id: "worker" },
+      outputPageIds: ["output"],
+      blockProposal: proposal("deferred"),
+    })).rejects.toMatchObject({ code: "MODULE_RESULT_OUTPUT_BACKPRESSURED" });
+    const report = await new CoreStartupRecovery({
+      deliveries: pair.store.deliveries,
+      commits,
+      moduleRecords: pair.store,
+      stoppedRecordWriter: pair.stoppedRecordWriter,
+      processStopProver: provenStopped,
+    }).recover();
+    expect(report.deferredCommits).toHaveLength(1);
+
+    const {
+      configurations: _configurations,
+      core: _core,
+      initialModuleGenerationId,
+      installations: _installations,
+      instanceConfiguration: _instanceConfiguration,
+      mailboxes: _mailboxes,
+      moduleId: _moduleId,
+      monotonicNow: _monotonicNow,
+      nextModuleGenerationId,
+      stoppedRecordWriter: _stoppedRecordWriter,
+      ...sharedRuntime
+    } = complete;
+    const composed = composeInstalledReactiveModuleHost({
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
+      mailboxes,
+      startupRecoveryHandoff: report.handoff,
+      clock: {
+        monotonicNow: () => 0,
+        schedule: () => ({ cancel: () => undefined }),
+      },
+      scheduling: {
+        maxConcurrentModules: 1,
+        backpressureAction: "pause-upstream",
+        downstreamRecheckMs: 100,
+        noProgressAfterMs: 5_000,
+        claimLimitCount: 1,
+        claimLimitBytes: 1024,
+        retryJitterRatio: 0,
+        lowWatermarkRatio: 1,
+      },
+      runtime: {
+        ...sharedRuntime,
+        initialModuleGenerationIdFor: (moduleId) =>
+          `${moduleId}-${initialModuleGenerationId}`,
+        nextModuleGenerationIdFor: (moduleId) =>
+          `${moduleId}-${nextModuleGenerationId()}`,
+      },
+    });
+    expect(composed.installedRuntimes[0]?.runtime.outputCommitWaiting).toBe(true);
+    expect(composed.installedRuntimes[0]?.generations.processGenerationIdFor)
+      .toBeDefined();
+    expect(() => composed.installedRuntimes[0]!.generations
+      .processGenerationIdFor("worker-module-generation-a"))
+      .toThrow(/does not have a process generation/u);
+    expect(pair.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
+      state: "stopped",
+    });
+  });
+
   it("rejects a stopped-record writer from another Core before executor creation", () => {
     const first = coreState("first");
     const second = coreState("second");
@@ -218,7 +409,7 @@ describe("installed reactive Module runtime composition", () => {
     expect(second.store.listModuleProcessRecords()).toEqual([]);
   });
 
-  it("builds one Scheduler host without accepting a supplied manifest or runtime", () => {
+  it("builds one Scheduler host without accepting a supplied manifest or runtime", async () => {
     const pair = coreState("first");
     const complete = options(pair);
     const {
@@ -255,12 +446,47 @@ describe("installed reactive Module runtime composition", () => {
       retryJitterRatio: 0,
       lowWatermarkRatio: 1,
     };
+    expect(() => composeInstalledReactiveModuleHost({
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
+      mailboxes,
+      startupRecoveryHandoff: {
+        schemaVersion: "dolly.core-startup-recovery-handoff/1",
+      },
+      clock,
+      scheduling,
+      runtime,
+    })).toThrow(/handoff is not authentic/u);
+    const verifiedHandoff = await startupHandoff(
+      pair,
+      runtime.resultCommitRepository,
+      mailboxes,
+    );
+    expect(() => composeInstalledReactiveModuleHost({
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
+      mailboxes,
+      startupRecoveryHandoff: verifiedHandoff,
+      clock,
+      scheduling,
+      runtime: {
+        ...runtime,
+        resultCommitRepository: new FileModuleResultCommitRepository({
+          path: resolve(scratch, "another-result-commits.json"),
+        }),
+      },
+    })).toThrow(/handoff is not bound to this Core store and result repository/u);
     const composed = composeInstalledReactiveModuleHost({
       configuration: instanceConfiguration,
       installations,
       configurations,
       coreState: pair,
       mailboxes,
+      startupRecoveryHandoff: verifiedHandoff,
       clock,
       scheduling,
       runtime,
@@ -276,10 +502,27 @@ describe("installed reactive Module runtime composition", () => {
       installations,
       configurations,
       coreState: pair,
+      mailboxes,
+      startupRecoveryHandoff: verifiedHandoff,
+      clock,
+      scheduling,
+      runtime,
+    })).toThrow(/handoff was already consumed/u);
+    const invalidMailboxHandoff = await startupHandoff(
+      pair,
+      runtime.resultCommitRepository,
+      mailboxes,
+    );
+    expect(() => composeInstalledReactiveModuleHost({
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
       mailboxes: [{
         ...mailboxes[0]!,
         pageIds: ["output"],
       }],
+      startupRecoveryHandoff: invalidMailboxHandoff,
       clock,
       scheduling,
       runtime,
@@ -287,7 +530,7 @@ describe("installed reactive Module runtime composition", () => {
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
 
-  it("composes every configured installed Module into one Scheduler host", () => {
+  it("composes every configured installed Module into one Scheduler host", async () => {
     const pair = coreState("pipeline");
     pair.store.deliveries.createPage("middle");
     pair.store.deliveries.registerConsumer("middle", "worker-two", "from-now");
@@ -344,6 +587,11 @@ describe("installed reactive Module runtime composition", () => {
       configurations,
       coreState: pair,
       mailboxes,
+      startupRecoveryHandoff: await startupHandoff(
+        pair,
+        runtime.resultCommitRepository,
+        mailboxes,
+      ),
       clock: {
         monotonicNow: () => 0,
         schedule: () => ({ cancel: () => undefined }),

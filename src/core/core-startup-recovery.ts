@@ -8,6 +8,8 @@ import {
   ModuleResultCommitError,
   type ModuleResultCommitCoordinator,
   type ModuleResultCommitRecord,
+  type ModuleResultCommitRepository,
+  type DeferredModuleResultCommit,
 } from "./module-result-commit.js";
 import {
   type ModuleProcessRecord,
@@ -120,6 +122,10 @@ export interface UnknownOutcomeClaimReport {
 
 export interface CoreStartupRecoveryReport {
   readonly recoveredCommits: readonly ModuleResultCommitRecord[];
+  /** Results are durable and known; only their output admission awaits capacity. */
+  readonly deferredCommits: readonly DeferredModuleResultCommit[];
+  /** One-use proof that deferred results passed old-process recovery for this store. */
+  readonly handoff: CoreStartupRecoveryHandoff;
   readonly releasedClaims: readonly ReleasedClaimReport[];
   readonly unknownOutcomeClaims: readonly UnknownOutcomeClaimReport[];
   readonly stoppedProcessGenerationIds: readonly string[];
@@ -127,6 +133,56 @@ export interface CoreStartupRecoveryReport {
   readonly collectedRecords: {
     readonly processRecords: number;
   };
+}
+
+export interface CoreStartupRecoveryHandoff {
+  readonly schemaVersion: "dolly.core-startup-recovery-handoff/1";
+}
+
+class VerifiedCoreStartupRecoveryHandoff implements CoreStartupRecoveryHandoff {
+  readonly schemaVersion = "dolly.core-startup-recovery-handoff/1" as const;
+  readonly #deliveries: CoreStartupRecoveryOptions["deliveries"];
+  readonly #commits: ModuleResultCommitCoordinator;
+  readonly #deferredCommits: readonly DeferredModuleResultCommit[];
+  #consumed = false;
+
+  constructor(
+    deliveries: CoreStartupRecoveryOptions["deliveries"],
+    commits: ModuleResultCommitCoordinator,
+    deferredCommits: readonly DeferredModuleResultCommit[],
+  ) {
+    this.#deliveries = deliveries;
+    this.#commits = commits;
+    this.#deferredCommits = deferredCommits;
+  }
+
+  consume(
+    deliveries: CoreStartupRecoveryOptions["deliveries"],
+    repository: ModuleResultCommitRepository,
+  ): readonly DeferredModuleResultCommit[] {
+    if (this.#consumed) {
+      throw new TypeError("Core startup recovery handoff was already consumed");
+    }
+    if (deliveries !== this.#deliveries || !this.#commits.usesRepository(repository)) {
+      throw new TypeError(
+        "Core startup recovery handoff is not bound to this Core store and result repository",
+      );
+    }
+    this.#consumed = true;
+    return this.#deferredCommits;
+  }
+}
+
+/** Consumes the one-use startup proof after exact Core/repository identity checks. */
+export function consumeCoreStartupRecoveryHandoff(input: {
+  readonly handoff: CoreStartupRecoveryHandoff;
+  readonly deliveries: CoreStartupRecoveryOptions["deliveries"];
+  readonly repository: ModuleResultCommitRepository;
+}): readonly DeferredModuleResultCommit[] {
+  if (!(input.handoff instanceof VerifiedCoreStartupRecoveryHandoff)) {
+    throw new TypeError("Core startup recovery handoff is not authentic");
+  }
+  return input.handoff.consume(input.deliveries, input.repository);
 }
 
 /**
@@ -366,8 +422,11 @@ export class CoreStartupRecovery {
     this.#assertRecordsLinkToClaims();
 
     let recoveredCommits: readonly ModuleResultCommitRecord[];
+    let deferredCommits: readonly DeferredModuleResultCommit[];
     try {
-      recoveredCommits = await this.#commits.recoverAll();
+      const resultRecovery = await this.#commits.recoverAll();
+      recoveredCommits = resultRecovery.recoveredCommits;
+      deferredCommits = resultRecovery.deferredCommits;
     } catch (error) {
       if (error instanceof ModuleResultCommitError) {
         switch (error.code) {
@@ -398,8 +457,16 @@ export class CoreStartupRecovery {
         readonly reason: string;
       }
     > = [];
+    const deferredModuleJobIds = new Set(
+      deferredCommits.map((entry) => entry.record.moduleJobId),
+    );
+    this.#assertDeferredCommitProcesses(
+      deferredCommits,
+      new Set(stoppedProcessGenerationIds),
+    );
     for (const claim of this.#deliveries.listActiveClaims()) {
       if (this.#commits.inspect(claim.moduleJobId) !== null) {
+        if (deferredModuleJobIds.has(claim.moduleJobId)) continue;
         throw new CoreStartupRecoveryError(
           "STARTUP_JOURNAL_CLAIM_INCONSISTENT",
           `Module job ${claim.moduleJobId} still has an active claim after journal recovery`,
@@ -451,11 +518,71 @@ export class CoreStartupRecovery {
 
     return deepFreeze({
       recoveredCommits: [...recoveredCommits],
+      deferredCommits: [...deferredCommits],
+      handoff: new VerifiedCoreStartupRecoveryHandoff(
+        this.#deliveries,
+        this.#commits,
+        deferredCommits,
+      ),
       releasedClaims,
       unknownOutcomeClaims,
       stoppedProcessGenerationIds,
       collectedRecords,
     });
+  }
+
+  #assertDeferredCommitProcesses(
+    deferredCommits: readonly DeferredModuleResultCommit[],
+    stoppedProcessGenerationIds: ReadonlySet<string>,
+  ): void {
+    if (deferredCommits.length === 0) return;
+    const records = this.#moduleRecords;
+    if (!records) {
+      throw new CoreStartupRecoveryError(
+        "STARTUP_MODULE_RECORD_INCONSISTENT",
+        "Deferred Module results require durable process and submission records",
+      );
+    }
+    const deferredModuleIds = new Set<string>();
+    for (const deferred of deferredCommits) {
+      const record = deferred.record;
+      if (
+        record.source.kind !== "module" ||
+        deferredModuleIds.has(record.source.id)
+      ) {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_RECORD_INCONSISTENT",
+          "A Module cannot have more than one deferred result during absolute-serial recovery",
+        );
+      }
+      deferredModuleIds.add(record.source.id);
+      const claim = this.#deliveries.inspectClaim({
+        moduleJobId: record.moduleJobId,
+        claimToken: record.claimToken,
+        runId: record.runId,
+        attempt: record.attempt,
+        moduleGenerationId: record.moduleGenerationId,
+      });
+      const submission = records.getModuleSubmissionRecord(record.runId);
+      const processRecord = submission === undefined
+        ? undefined
+        : records.getModuleProcessRecord(submission.processGenerationId);
+      if (
+        claim.status !== "active" ||
+        claim.consumerId !== record.source.id ||
+        submission === undefined ||
+        processRecord === undefined ||
+        processRecord.state !== "stopped" ||
+        !stoppedProcessGenerationIds.has(processRecord.processGenerationId) ||
+        processRecord.moduleId !== record.source.id ||
+        processRecord.moduleGenerationId !== record.moduleGenerationId
+      ) {
+        throw new CoreStartupRecoveryError(
+          "STARTUP_MODULE_RECORD_INCONSISTENT",
+          `Deferred Module result ${record.moduleJobId} is not bound to its stopped process`,
+        );
+      }
+    }
   }
 
   /**

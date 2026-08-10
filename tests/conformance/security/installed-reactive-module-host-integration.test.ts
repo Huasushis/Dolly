@@ -22,6 +22,7 @@ import {
 } from "../../../src/adapters/installed-reactive-module-runtime.js";
 import { defaultLauncherScriptPath } from "../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
 import type { BlockProposal } from "../../../src/core/block-store.js";
+import { CoreStartupRecovery } from "../../../src/core/core-startup-recovery.js";
 import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
 import { ExtensionInstallationRegistry } from "../../../src/core/extension-installation-registry.js";
 import {
@@ -42,6 +43,7 @@ import {
   type SchedulerEvent,
 } from "../../../src/core/module-scheduler.js";
 import { ModuleConfigurationStore } from "../../../src/core/module-configuration-store.js";
+import { createModuleResultCommitCoordinator } from "../../../src/core/module-result-commit-factory.js";
 import {
   createDefaultDollyInstanceConfig,
   validateDollyInstanceConfig,
@@ -349,27 +351,40 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       const repository = new FileModuleResultCommitRepository({ path: commitPath });
       const events: SchedulerEvent[] = [];
       const actorEvents: ModuleActorEvent[] = [];
+      const mailboxes = [{
+        consumerId: FIRST_MODULE_ID,
+        pageIds: ["input"],
+        maxResidentCount: 10,
+        maxResidentBytes: 1024 * 1024,
+      }, {
+        consumerId: SECOND_MODULE_ID,
+        pageIds: ["middle"],
+        maxResidentCount: 10,
+        maxResidentBytes: 1024 * 1024,
+      }, {
+        consumerId: DRAINER_MODULE_ID,
+        pageIds: ["output"],
+        maxResidentCount: 1,
+        maxResidentBytes: 1024 * 1024,
+      }];
+      const startupRecoveryHandoff = (await new CoreStartupRecovery({
+        deliveries: coreState.store.deliveries,
+        commits: createModuleResultCommitCoordinator({
+          core: coreState.store,
+          repository,
+          now,
+          mailboxes,
+        }),
+        moduleRecords: coreState.store,
+        stoppedRecordWriter: coreState.stoppedRecordWriter,
+      }).recover()).handoff;
       composed = composeInstalledReactiveModuleHost({
         configuration,
         installations,
         configurations,
         coreState,
-        mailboxes: [{
-          consumerId: FIRST_MODULE_ID,
-          pageIds: ["input"],
-          maxResidentCount: 10,
-          maxResidentBytes: 1024 * 1024,
-        }, {
-          consumerId: SECOND_MODULE_ID,
-          pageIds: ["middle"],
-          maxResidentCount: 10,
-          maxResidentBytes: 1024 * 1024,
-        }, {
-          consumerId: DRAINER_MODULE_ID,
-          pageIds: ["output"],
-          maxResidentCount: 1,
-          maxResidentBytes: 1024 * 1024,
-        }],
+        startupRecoveryHandoff,
+        mailboxes,
         clock: systemSchedulerClock(),
         scheduling: {
           maxConcurrentModules: 3,

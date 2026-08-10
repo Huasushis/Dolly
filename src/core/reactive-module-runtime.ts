@@ -37,7 +37,10 @@ import {
   type ReactiveModuleInput,
 } from "./reactive-module-input.js";
 import {
+  assertModuleResultCommitRecord,
+  isCoordinatorBackpressureError,
   ModuleResultCommitBackpressureError,
+  type DeferredModuleResultCommit,
   type ModuleResultCommitCoordinator,
   type ModuleResultCommitRecord,
   moduleJobResultDigest,
@@ -63,6 +66,7 @@ export type ReactiveModuleFailureStage =
   | "output-snapshot"
   | "soft-timeout"
   | "generation-fenced"
+  | "output-commit-recovery"
   | "result-rejected-before-prepare";
 
 export interface ReactiveModuleFailure {
@@ -201,6 +205,8 @@ export interface ReactiveModuleRuntimeOptions {
     runId: string,
   ) => ModuleSubmissionRecord | undefined;
   readonly commits: ModuleResultCommitCoordinator;
+  /** A startup-revalidated result that must resume without executing the Module again. */
+  readonly initialDeferredCommit?: DeferredModuleResultCommit;
   readonly nextModuleGenerationId: () => string;
   readonly monotonicNow: () => number;
   /**
@@ -242,6 +248,8 @@ interface UnresolvedRun {
   readonly kind: "commit" | "nack" | "executor-termination";
   readonly output?: ReactiveModuleResult;
   readonly failure: ReactiveModuleFailure;
+  /** Startup proved that this exact result journal existed before runtime construction. */
+  readonly knownPrepared?: boolean;
   readonly classification?: FailureClassification;
   readonly reason: Extract<
     ReactiveModuleTickResult,
@@ -254,6 +262,8 @@ interface DeferredOutputCommit {
   readonly output: ReactiveModuleResult;
   readonly failure: ReactiveModuleFailure;
   readonly blockedConsumerIds: readonly string[];
+  /** Distinguishes a startup-verified result from a result first observed in this process. */
+  readonly knownPrepared: boolean;
 }
 
 function assertPositiveLimit(value: number, label: string): void {
@@ -408,6 +418,7 @@ export class ReactiveModuleRuntime {
   #recoveryInFlight: Promise<ReactiveModuleRecoveryResult> | undefined;
   #unresolved: UnresolvedRun | undefined;
   #deferredOutputCommit: DeferredOutputCommit | undefined;
+  #startAuthorized = false;
   #acceptingOperations = true;
 
   constructor(options: ReactiveModuleRuntimeOptions) {
@@ -503,6 +514,13 @@ export class ReactiveModuleRuntime {
     this.#externalEffectEvidence = options.externalEffectEvidence;
     this.#classifyFailure = options.classifyFailure;
 
+    if (options.initialDeferredCommit !== undefined) {
+      this.#deferredOutputCommit = this.#restoreDeferredOutputCommit(
+        options.initialDeferredCommit,
+        options.maxResultBytes,
+      );
+    }
+
     const actorOptions: ModuleActorOptions<ReactiveModuleInput, ReactiveModuleResult> = {
       moduleId: options.moduleId,
       initialModuleGenerationId: options.initialModuleGenerationId,
@@ -538,12 +556,136 @@ export class ReactiveModuleRuntime {
     return this.#actor.activeRun;
   }
 
+  get outputCommitWaiting(): boolean {
+    return this.#deferredOutputCommit !== undefined;
+  }
+
+  #restoreDeferredOutputCommit(
+    deferred: DeferredModuleResultCommit,
+    maxResultBytes: number,
+  ): DeferredOutputCommit {
+    const invalid = (message: string): never => {
+      throw new ReactiveModuleRuntimeError(
+        "RUNTIME_CONFIGURATION_INVALID",
+        `Initial deferred result commit is invalid: ${message}`,
+      );
+    };
+    try {
+      assertModuleResultCommitRecord(deferred.record);
+    } catch {
+      return invalid("record schema is invalid");
+    }
+    const record = deferred.record;
+    if (
+      record.state !== "prepared" ||
+      record.source.kind !== "module" ||
+      record.source.id !== this.#moduleId
+    ) {
+      return invalid("record does not belong to this Module as a prepared result");
+    }
+    let blocked: readonly string[];
+    try {
+      blocked = new ModuleResultCommitBackpressureError(
+        deferred.blockedConsumerIds,
+      ).blockedConsumerIds;
+    } catch {
+      return invalid("blocked consumer identifiers are invalid");
+    }
+    const expectedOutputPageIds = record.blockProposal === undefined
+      ? []
+      : this.#outputPageIds;
+    if (
+      record.outputPageIds.length !== expectedOutputPageIds.length ||
+      record.outputPageIds.some((pageId, index) => pageId !== expectedOutputPageIds[index])
+    ) {
+      return invalid("record output Pages do not match the configured route");
+    }
+    const identity: DeliveryClaimIdentity = {
+      moduleJobId: record.moduleJobId,
+      claimToken: record.claimToken,
+      runId: record.runId,
+      attempt: record.attempt,
+      moduleGenerationId: record.moduleGenerationId,
+    };
+    let descriptor: ReturnType<DeliveryStore["inspectClaim"]>;
+    let input: ReactiveModuleInput;
+    let submission: ModuleSubmissionRecord | undefined;
+    try {
+      descriptor = this.#deliveries.inspectClaim(identity);
+      input = this.#deliveries.inspectClaimInput(identity);
+      submission = this.#getModuleSubmissionRecord(record.runId);
+      if (submission !== undefined) assertValidModuleSubmissionRecord(submission);
+    } catch {
+      return invalid("Claim, input, or submission cannot be revalidated");
+    }
+    if (
+      descriptor.status !== "active" ||
+      descriptor.consumerId !== this.#moduleId ||
+      descriptor.moduleJobId !== record.moduleJobId ||
+      descriptor.claimToken !== record.claimToken ||
+      descriptor.runId !== record.runId ||
+      descriptor.attempt !== record.attempt ||
+      descriptor.moduleGenerationId !== record.moduleGenerationId
+    ) {
+      return invalid("active Claim identity does not match the record");
+    }
+    if (
+      submission === undefined ||
+      submission.moduleJobId !== record.moduleJobId ||
+      submission.claimToken !== record.claimToken ||
+      submission.runId !== record.runId ||
+      submission.attempt !== record.attempt ||
+      submission.moduleGenerationId !== record.moduleGenerationId ||
+      submission.inputDigest !== canonicalJsonDigest(input)
+    ) {
+      return invalid("submission does not match the record and immutable input");
+    }
+    const output = snapshotResult({
+      schemaVersion: "dolly.module-result/1",
+      ...(record.blockProposal === undefined
+        ? {}
+        : { blockProposal: record.blockProposal }),
+    }, maxResultBytes);
+    if (
+      record.resultDigest !== moduleJobResultDigest({
+        source: this.#source,
+        outputPageIds: expectedOutputPageIds,
+        ...(output.blockProposal === undefined
+          ? {}
+          : { blockProposal: output.blockProposal }),
+      })
+    ) {
+      return invalid("result digest does not match the restored output");
+    }
+    return deepFreeze({
+      claim: {
+        ...identity,
+        deliveryIds: [...input.claimedDeliveryIds],
+        blockGroups: [...input.blockGroups],
+        hasMore: input.hasMore,
+      },
+      output,
+      failure: {
+        stage: "output-commit-recovery",
+        code: "MODULE_RESULT_OUTPUT_BACKPRESSURED",
+      },
+      blockedConsumerIds: [...blocked],
+      knownPrepared: true,
+    });
+  }
+
   start(): Promise<void> {
     if (!this.#acceptingOperations) {
       return Promise.reject(
         new ReactiveModuleRuntimeError("RUNTIME_STOPPING", "Reactive Module runtime is stopping"),
       );
     }
+    this.#startAuthorized = true;
+    // A restored result already contains the only authorized output. Starting
+    // Extension code before that output is admitted would introduce ambient
+    // initialization effects into a commit-only recovery path. The actor is
+    // started lazily only when later input actually needs execution.
+    if (this.#deferredOutputCommit !== undefined) return Promise.resolve();
     return this.#actor.start();
   }
 
@@ -553,7 +695,10 @@ export class ReactiveModuleRuntime {
         new ReactiveModuleRuntimeError("RUNTIME_STOPPING", "Reactive Module runtime is stopping"),
       );
     }
-    if (this.#actor.state === "created" || this.#actor.state === "starting") {
+    if (
+      this.#actor.state === "starting" ||
+      (this.#actor.state === "created" && !this.#startAuthorized)
+    ) {
       return Promise.reject(
         new ReactiveModuleRuntimeError(
           "RUNTIME_NOT_STARTED",
@@ -604,8 +749,17 @@ export class ReactiveModuleRuntime {
 
     const deferred = this.#deferredOutputCommit;
     const operation = deferred
-      ? this.#tryRecoverCommit(deferred.claim, deferred.output, deferred.failure)
-      : this.#performTick(claimLimitCount, claimLimitBytes);
+      ? this.#tryRecoverCommit(
+          deferred.claim,
+          deferred.output,
+          deferred.failure,
+          deferred.knownPrepared,
+        )
+      : this.#actor.state === "created"
+        ? this.#actor.start().then(() =>
+            this.#performTick(claimLimitCount, claimLimitBytes)
+          )
+        : this.#performTick(claimLimitCount, claimLimitBytes);
     this.#inFlight = operation;
     void operation.then(
       () => {
@@ -683,7 +837,12 @@ export class ReactiveModuleRuntime {
     if (!unresolved) {
       const deferred = this.#deferredOutputCommit;
       return deferred
-        ? this.#tryRecoverCommit(deferred.claim, deferred.output, deferred.failure)
+        ? this.#tryRecoverCommit(
+            deferred.claim,
+            deferred.output,
+            deferred.failure,
+            deferred.knownPrepared,
+          )
         : { status: "nothing-to-recover" };
     }
 
@@ -703,7 +862,12 @@ export class ReactiveModuleRuntime {
           reason: unresolved.reason,
         });
       }
-      return this.#tryRecoverCommit(unresolved.claim, unresolved.output, unresolved.failure);
+      return this.#tryRecoverCommit(
+        unresolved.claim,
+        unresolved.output,
+        unresolved.failure,
+        unresolved.knownPrepared ?? false,
+      );
     }
     return this.#nackAfterExternalEffectEvidence(
       unresolved.claim,
@@ -980,6 +1144,7 @@ export class ReactiveModuleRuntime {
     claim: DeliveryClaim,
     output: ReactiveModuleResult,
     noRecordFailure: ReactiveModuleFailure,
+    knownPrepared = false,
   ): Promise<Exclude<ReactiveModuleTickResult, { readonly status: "idle" }>> {
     try {
       const record = await this.#commits.recover(claim.moduleJobId);
@@ -1010,12 +1175,16 @@ export class ReactiveModuleRuntime {
         reason: "commit-result-conflict",
       });
     } catch (error) {
-      if (error instanceof ModuleResultCommitBackpressureError) {
+      if (isCoordinatorBackpressureError(error)) {
         this.#deferredOutputCommit = {
           claim,
           output,
           failure: noRecordFailure,
           blockedConsumerIds: error.blockedConsumerIds,
+          // This error can only come from the coordinator after its prepared
+          // journal has been validated. It remains known even when the Run
+          // began in this process rather than startup recovery.
+          knownPrepared: true,
         };
         this.#unresolved = undefined;
         this.#activeClaim = undefined;
@@ -1033,9 +1202,25 @@ export class ReactiveModuleRuntime {
         // Failure handling therefore needs either a declaration that effects
         // are impossible or persistent evidence that completion is safe.
         if (existing === null) {
+          if (knownPrepared) {
+            return this.#requireRecovery(claim, {
+              kind: "commit",
+              output,
+              failure: noRecordFailure,
+              knownPrepared: true,
+              reason: "commit-outcome-unknown",
+            });
+          }
           this.#deferredOutputCommit = undefined;
           return this.#nackAfterExternalEffectEvidence(claim, noRecordFailure);
         }
+        return this.#requireRecovery(claim, {
+          kind: "commit",
+          output,
+          failure: noRecordFailure,
+          knownPrepared: true,
+          reason: "commit-outcome-unknown",
+        });
       } catch {
         // A repository read failure is itself an unknown commit outcome.
       }
@@ -1043,6 +1228,7 @@ export class ReactiveModuleRuntime {
         kind: "commit",
         output,
         failure: noRecordFailure,
+        ...(knownPrepared ? { knownPrepared: true } : {}),
         reason: "commit-outcome-unknown",
       });
     }

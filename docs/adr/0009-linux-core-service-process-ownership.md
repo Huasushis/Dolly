@@ -495,7 +495,18 @@ The required startup reconciliation order is:
    absence never meets this condition directly.
 6. A valid `prepared` journal record with its active Claim and submission record
    resumes under step 3; it is not an unknown outcome merely because the journal
-   is not yet `committed`. When no valid recoverable result record exists,
+   is not yet `committed`. If configured mailbox capacity is the only remaining
+   obstacle, startup reports the record as deferred and hands it to a
+   commit-only Scheduler state. That state retries only the durable result and
+   does not start the producing Extension process; a later real input may start
+   the new generation after the commit succeeds. The handoff is opaque,
+   one-use, bound to the exact Core Delivery store and result repository, and
+   issued only after the old process group is freshly proven stopped. Installed
+   composition also rechecks the stopped record's package digest,
+   configuration reference, Module generation, instance, and effect class.
+   A verified journal that later disappears remains an unknown consistency
+   failure and never permits negative acknowledgement or re-execution. When no valid recoverable
+   result record exists,
    preserve a submitted Claim as an unknown outcome unless every possible effect
    has durable no-effect or retry-safe evidence, or an explicit audited operator
    disposition. A terminal effect outcome without a separate durable

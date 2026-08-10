@@ -15,6 +15,7 @@ import {
 } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
+import { createModuleResultCommitCoordinator } from "../../../src/core/module-result-commit-factory.js";
 import {
   ModuleResultCommitCoordinator,
   ModuleResultCommitError,
@@ -160,6 +161,88 @@ describe("CORE startup journal recovery", () => {
 
   afterEach(() => {
     rmSync(root, { recursive: true, force: true });
+  });
+
+  it("reports a known prepared result as deferred when only mailbox capacity is missing", async () => {
+    const {
+      store: first,
+      stoppedRecordWriter,
+    } = openCoreWithStoppedRecordWriter(statePath, "first");
+    first.deliveries.createPage("input");
+    first.deliveries.createPage("output");
+    first.deliveries.registerConsumer("input", "worker", "from-now");
+    first.deliveries.registerConsumer("output", "sink", "from-now");
+    const resident = first.blocks.commit(proposal("resident"), {
+      kind: "external",
+      id: "console",
+    });
+    first.deliveries.append("output", resident.id);
+    const input = first.blocks.commit(proposal("input"), {
+      kind: "external",
+      id: "console",
+    });
+    first.deliveries.append("input", input.id);
+    const claim = first.deliveries.claim({
+      consumerId: "worker",
+      pageIds: ["input"],
+      moduleGenerationId: "generation-1",
+      maxCount: 1,
+      maxBytes: 1024 * 1024,
+    })!;
+    appendStoppedProcessAndSubmission(first, stoppedRecordWriter, claim);
+    const repository = new FileModuleResultCommitRepository({ path: journalPath });
+    const limited = createModuleResultCommitCoordinator({
+      core: first,
+      repository,
+      now: () => NOW,
+      mailboxes: [{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 1,
+        maxResidentBytes: 1024 * 1024,
+      }],
+    });
+    await expect(limited.commit({
+      ...claim,
+      source: { kind: "module", id: "worker" },
+      outputPageIds: ["output"],
+      blockProposal: proposal("deferred output"),
+    })).rejects.toMatchObject({ code: "MODULE_RESULT_OUTPUT_BACKPRESSURED" });
+
+    const {
+      store: restarted,
+      stoppedRecordWriter: restartedStoppedRecordWriter,
+    } = openCoreWithStoppedRecordWriter(statePath, "restarted");
+    const restartedRepository = new FileModuleResultCommitRepository({ path: journalPath });
+    const recovery = new CoreStartupRecovery({
+      deliveries: restarted.deliveries,
+      commits: createModuleResultCommitCoordinator({
+        core: restarted,
+        repository: restartedRepository,
+        now: () => NOW,
+        mailboxes: [{
+          consumerId: "sink",
+          pageIds: ["output"],
+          maxResidentCount: 1,
+          maxResidentBytes: 1024 * 1024,
+        }],
+      }),
+      moduleRecords: restarted,
+      stoppedRecordWriter: restartedStoppedRecordWriter,
+      processStopProver: provenStopped,
+    });
+    const report = await recovery.recover();
+
+    expect(report.recoveredCommits).toEqual([]);
+    expect(report.deferredCommits).toEqual([{
+      record: expect.objectContaining({
+        moduleJobId: claim.moduleJobId,
+        state: "prepared",
+      }),
+      blockedConsumerIds: ["sink"],
+    }]);
+    expect(restarted.deliveries.inspectClaim(claim).status).toBe("active");
+    expect(restarted.getModuleSubmissionRecord(claim.runId)).toBeDefined();
   });
 
   it("recovers a prepared result for an active Claim with its exact submission", async () => {
@@ -359,16 +442,21 @@ describe("CORE startup journal recovery", () => {
 
     const restarted = openCore(statePath, "second");
     const repository = new FileModuleResultCommitRepository({ path: journalPath });
-    await expect(new CoreStartupRecovery({
+    const report = await new CoreStartupRecovery({
       deliveries: restarted.deliveries,
       commits: coordinator(restarted, repository),
-    }).recover()).resolves.toEqual({
+    }).recover();
+    expect(report).toMatchObject({
       recoveredCommits: [],
+      deferredCommits: [],
       releasedClaims: [],
       unknownOutcomeClaims: [],
       stoppedProcessGenerationIds: [],
       collectedRecords: { processRecords: 0 },
     });
+    expect(report.handoff.schemaVersion).toBe(
+      "dolly.core-startup-recovery-handoff/1",
+    );
     expect(restarted.deliveries.inspectClaim(request).status).toBe("released");
 
     const retry = restarted.deliveries.claim({

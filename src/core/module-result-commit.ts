@@ -161,6 +161,28 @@ export class ModuleResultCommitBackpressureError extends ModuleResultCommitError
   }
 }
 
+const coordinatorBackpressureErrors = new WeakSet<
+  ModuleResultCommitBackpressureError
+>();
+
+function coordinatorBackpressureError(
+  blockedConsumerIds: readonly string[],
+): ModuleResultCommitBackpressureError {
+  const error = new ModuleResultCommitBackpressureError(blockedConsumerIds);
+  coordinatorBackpressureErrors.add(error);
+  return error;
+}
+
+/** Rejects lookalike errors thrown by hooks or another caller. */
+export function isCoordinatorBackpressureError(
+  error: unknown,
+): error is ModuleResultCommitBackpressureError {
+  return (
+    error instanceof ModuleResultCommitBackpressureError &&
+    coordinatorBackpressureErrors.has(error)
+  );
+}
+
 function canonicalTime(now: () => string): string {
   const timestamp = Date.parse(now());
   if (!Number.isFinite(timestamp)) {
@@ -666,6 +688,16 @@ export interface ModuleResultCommitCoordinatorOptions
   ) => void | Promise<void>;
 }
 
+export interface DeferredModuleResultCommit {
+  readonly record: ModuleResultCommitRecord;
+  readonly blockedConsumerIds: readonly string[];
+}
+
+export interface ModuleResultCommitRecoveryReport {
+  readonly recoveredCommits: readonly ModuleResultCommitRecord[];
+  readonly deferredCommits: readonly DeferredModuleResultCommit[];
+}
+
 /**
  * @internal Product composition must use `createModuleResultCommitCoordinator`
  * so Block, Delivery, submission, and acknowledgement operations all come
@@ -719,6 +751,11 @@ export class ModuleResultCommitCoordinator {
     return record;
   }
 
+  /** Identity check used by the startup-to-runtime handoff; it grants no mutation access. */
+  usesRepository(repository: ModuleResultCommitRepository): boolean {
+    return this.#repository === repository;
+  }
+
   recover(moduleJobId: string): Promise<ModuleResultCommitRecord> {
     if (!ID_PATTERN.test(moduleJobId)) {
       return Promise.reject(
@@ -731,7 +768,7 @@ export class ModuleResultCommitCoordinator {
     return this.#runExclusive(moduleJobId);
   }
 
-  async recoverAll(): Promise<readonly ModuleResultCommitRecord[]> {
+  async recoverAll(): Promise<ModuleResultCommitRecoveryReport> {
     const recovered: ModuleResultCommitRecord[] = [];
     const prepared: ModuleResultCommitRecord[] = [];
     for (const record of this.#repository.list()) {
@@ -750,23 +787,45 @@ export class ModuleResultCommitCoordinator {
     // least one entry; if a complete pass makes no progress, preserve the
     // existing fail-closed backpressure result for the caller.
     let pending = prepared;
+    let blockedConsumers = new Map<string, readonly string[]>();
     while (pending.length > 0) {
       const deferred: ModuleResultCommitRecord[] = [];
-      let firstBackpressure: ModuleResultCommitBackpressureError | undefined;
+      const nextBlockedConsumers = new Map<string, readonly string[]>();
       for (const record of pending) {
         try {
           recovered.push(await this.#runExclusive(record.moduleJobId));
         } catch (error) {
-          if (!(error instanceof ModuleResultCommitBackpressureError)) throw error;
-          firstBackpressure ??= error;
-          deferred.push(record);
+          if (!isCoordinatorBackpressureError(error)) throw error;
+          const current = this.#repository.get(record.moduleJobId);
+          if (!current) {
+            throw new ModuleResultCommitError(
+              "MODULE_RESULT_COMMIT_RECORD_MISSING",
+              `Module result commit ${record.moduleJobId} disappeared during recovery`,
+            );
+          }
+          assertModuleResultCommitRecord(current);
+          deferred.push(current);
+          nextBlockedConsumers.set(current.moduleJobId, error.blockedConsumerIds);
         }
       }
-      if (deferred.length === 0) break;
-      if (deferred.length === pending.length) throw firstBackpressure!;
+      if (deferred.length === 0) {
+        pending = [];
+        break;
+      }
+      blockedConsumers = nextBlockedConsumers;
+      if (deferred.length === pending.length) {
+        pending = deferred;
+        break;
+      }
       pending = deferred;
     }
-    return recovered;
+    return deepFreeze({
+      recoveredCommits: [...recovered],
+      deferredCommits: pending.map((record) => ({
+        record,
+        blockedConsumerIds: [...(blockedConsumers.get(record.moduleJobId) ?? [])],
+      })),
+    });
   }
 
   #prepare(input: ModuleResultCommitInput): ModuleResultCommitRecord {
@@ -1355,7 +1414,7 @@ export class ModuleResultCommitCoordinator {
           })),
         });
         if (batch.status === "backpressured") {
-          throw new ModuleResultCommitBackpressureError(batch.blockedConsumerIds);
+          throw coordinatorBackpressureError(batch.blockedConsumerIds);
         }
         await this.#afterEffect?.({ phase: "after-ack-effect", moduleJobId });
         continue;

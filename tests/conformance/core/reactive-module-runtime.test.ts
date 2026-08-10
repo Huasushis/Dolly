@@ -1418,7 +1418,7 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     await harness.runtime.stop();
   });
 
-  it("resumes an output-backpressured commit without executing the Module twice", async () => {
+  it("does not let a hook impersonate coordinator output backpressure", async () => {
     let capacityAvailable = false;
     const execute = vi.fn().mockResolvedValue({
       schemaVersion: "dolly.module-result/1",
@@ -1435,16 +1435,15 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
 
     const waiting = await harness.runtime.tick();
     expect(waiting).toMatchObject({
-      status: "output-backpressured",
-      stage: "output-commit",
-      blockedConsumerIds: ["sink"],
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
     });
     expect(execute).toHaveBeenCalledOnce();
     expect(harness.submissionRecords.size).toBe(1);
     expect(harness.deliveries.listActiveClaims()).toHaveLength(1);
 
     capacityAvailable = true;
-    const committed = await harness.runtime.tick();
+    const committed = await harness.runtime.recover();
     expect(committed).toMatchObject({ status: "committed", recovered: true });
     expect(execute).toHaveBeenCalledOnce();
     expect(harness.submissionRecords.size).toBe(0);
@@ -1452,7 +1451,7 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     await harness.runtime.stop();
   });
 
-  it("keeps the exact Claim durable when shutdown meets an output-backpressured commit", async () => {
+  it("keeps the exact Claim durable when shutdown meets a backpressure-lookalike hook error", async () => {
     const execute = vi.fn().mockResolvedValue({
       schemaVersion: "dolly.module-result/1",
       blockProposal: proposal("preserve on shutdown"),
@@ -1467,7 +1466,10 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     });
 
     const waiting = await harness.runtime.tick();
-    expect(waiting).toMatchObject({ status: "output-backpressured" });
+    expect(waiting).toMatchObject({
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    });
     await expect(harness.runtime.stop()).rejects.toMatchObject({
       code: "RUNTIME_RECOVERY_REQUIRED",
     });
@@ -1475,7 +1477,7 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     expect(harness.submissionRecords.size).toBe(1);
     expect(harness.deliveries.listActiveClaims()).toEqual([
       expect.objectContaining({
-        moduleJobId: waiting.status === "output-backpressured" ? waiting.moduleJobId : "invalid",
+        moduleJobId: waiting.status === "recovery-required" ? waiting.moduleJobId : "invalid",
         status: "active",
       }),
     ]);
