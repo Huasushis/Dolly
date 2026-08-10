@@ -342,6 +342,10 @@ export class SourceActivationQueue {
     this.privatePageId = privatePageId(options.moduleId);
   }
 
+  get moduleId(): string {
+    return this.#moduleId;
+  }
+
   reconcile(): void {
     const pages = this.#core.deliveries.listPageIds();
     if (!pages.includes(this.privatePageId)) {

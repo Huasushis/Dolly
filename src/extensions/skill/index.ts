@@ -106,6 +106,14 @@ export type {
   SkillSourceActivationRequest,
 } from "./skill-refresh.js";
 
+export {
+  SkillSourceActivationSubmissionError,
+  createSkillSourceActivationSubmitter,
+} from "./source-activation-adapter.js";
+export type {
+  SkillSourceActivationSubmissionErrorCode,
+} from "./source-activation-adapter.js";
+
 export { watchSkillLibrary } from "./skill-library-watcher.js";
 export type {
   SkillLibraryWatcher,

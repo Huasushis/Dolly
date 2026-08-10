@@ -293,6 +293,21 @@ sections 9.2.1, 9.5, and 11.3 require. Scanning the library and proposing the
 replacement description happen only inside the serialized actor Run created from
 that request. `stop()` cancels the timers and permits no later request.
 
+`createSkillSourceActivationSubmitter` is the current component adapter to the
+Core queue in `core-runtime.md` Section 11.3. It stores the exact reason,
+monotonic request time, and coalesced signal count as canonical request data.
+An exact duplicate is accepted as the already-live job. If Core reports queue
+capacity pressure, the adapter throws before reporting success; the refresh
+scheduler restores its pending window and waits for a later filesystem hint or
+periodic verification instead of spinning or losing the change. The adapter
+also rejects a request whose Module ID differs from the bound queue.
+
+Conformance evidence covers the initial request, three filesystem hints
+coalesced into one later request, and a full-queue refusal followed by admission
+after capacity is released. The Scheduler and Reactive runtime component tests
+cover Claim and atomic completion of the same queue representation. This is not
+installed-process or product-bootstrap evidence.
+
 ### 13.4 Not implemented in this baseline
 
 These are decisions, not omissions:
