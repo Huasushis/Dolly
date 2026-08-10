@@ -427,7 +427,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         )),
         2_000,
       )).toBe(true);
-      expect(composed.installedRuntimes).toHaveLength(2);
+      expect(composed.installedRuntimes).toHaveLength(3);
       MODULE_IDS.forEach((moduleId, index) => {
         expect(
           composed?.installedRuntimes[index]?.generations.processGenerationIdFor(
