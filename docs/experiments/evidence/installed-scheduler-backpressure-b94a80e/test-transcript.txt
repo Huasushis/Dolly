@@ -1,0 +1,13 @@
+RUN v4.1.10 /dolly-run
+
+installed reactive Module host in a real control group
+
+recovers a full downstream mailbox without re-executing its producers
+{"packageDigest":"sha256:7ba66dae18f31866bcea955a07e7e38893f9281e198a83c2672ccc10a7c509dc","processGenerationIds":["scheduler-first-process-283-1786341706334","scheduler-second-process-283-1786341706334","scheduler-drainer-process-283-1786341706334"],"moduleCgroupPaths":["/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-launcher-integration-276.service/dolly-module-scheduler-first-process-283-1786341706334-cb36ec444ea1aa8af7ff31a7747c083a383428bcd2c4610cfd17f1ce8552ede7","/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-launcher-integration-276.service/dolly-module-scheduler-second-process-283-1786341706334-43601b5c80422529ac79a29f6aaf42f5500b07baeae0ade6e26149d6495e2ca5","/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-launcher-integration-276.service/dolly-module-scheduler-drainer-process-283-1786341706334-f81aa4900954601c5e0169f11060bcc030516564ad24aca46b255454813da522"],"initialEmptyDecisionsObserved":3,"configuredPollIntervalMs":60000,"outputCommittedWithinMs":5000,"outputBackpressureObserved":true,"actorRunsBeforeCapacityRelease":{"scheduler-first":2,"scheduler-second":2,"scheduler-drainer":1},"actorRunsAfterCapacityRelease":{"scheduler-first":2,"scheduler-second":2,"scheduler-drainer":2},"committedModuleResults":6,"finalRecordStates":["stopped","stopped","stopped"],"cgroupsRemoved":true,"reopenedOutput":"second:1:run-2"}
+
+Test Files  1 passed (1)
+Tests       1 passed (1)
+Duration    6.04s (transform 574ms, setup 0ms, import 724ms, tests 5.17s, environment 0ms)
+
+This is a normalized plain-text copy of the original ANSI-colored Vitest log.
+The SHA-256 of the original log is recorded in sha256sums.txt.
