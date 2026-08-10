@@ -172,3 +172,41 @@ This confirms the requested effect for one private Aether deployment and a
 read-only tool pair. It does not prove native provider tool calling, arbitrary
 tools, effectful crash-safe recovery, delegated Linux control-group ownership,
 cross-model generality, or supported product Module startup.
+
+## Post-confirmation current-Core diagnostic
+
+Run `registry-v7-20260810b` was a separate engineering diagnostic after the
+successful confirmation, not an additional confirmatory repetition. It bound
+the same strict-streaming design to current source commit `a889231` and retained
+the following counterexample:
+
+- All five attempted model calls returned HTTP 200 `text/event-stream`, reached
+  `finish_reason=stop`, included terminal usage, and were accepted by the strict
+  SSE decoder. The reasoning-enabled planning call lasted about 148 seconds,
+  directly crossing the former 120-second Nginx timeout without a gateway
+  failure. Dolly's own 180-second per-call deadline remained unchanged.
+- The baseline completed. In the first treatment the model selected
+  `storage_list`, repeated the same `storage_list`, and then selected
+  `storage_get`. Counting the initial `list-tools` operation, the attempted
+  `storage_get` exceeded the frozen three-invocation tool capability budget.
+- The generic effect adapter had persisted an intent before the capability
+  authority made that pre-handler quota decision. It therefore recorded the
+  refusal as unknown, and the Scheduler correctly quarantined the Run instead
+  of repeating a possibly effectful operation. The diagnostic stopped at one
+  of four cases and is `inconclusive`; it does not weaken the earlier v7
+  confirmation or qualify for a hidden retry.
+
+Commit `bb932b0` closes the classification defect exposed by this run. The
+capability authority now marks an unforgeable, process-local refusal only when
+it occurs before handler entry; the durable effect lifecycle records that
+specific refusal as `no-effect`, while arbitrary handler/provider rejection
+remains unknown. A real child-process counterexample proves that an earlier
+terminal effect plus a later Host quota refusal stays terminal and invokes the
+handler only once. The targeted regression set passed 223 tests (47 focused
+and 176 broader; two additional tests were skipped by their existing platform
+conditions), and TypeScript checking passed.
+
+This does not solve the model's repeated-action behavior. The next Agent
+iteration should add a bounded no-progress rule for semantically identical
+read-only calls and test it with fresh seeds. It must not silently increase
+budgets or reinterpret this failed run after observing its outputs.
