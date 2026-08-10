@@ -36,6 +36,7 @@ import {
   type ModuleCgroupLimits,
 } from "../../../src/core/linux-module-cgroup.js";
 import { inspectCoreServiceBinding } from "../../../src/core/linux-core-service-binding.js";
+import type { ModuleActorEvent } from "../../../src/core/module-actor.js";
 import {
   systemSchedulerClock,
   type SchedulerEvent,
@@ -304,6 +305,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       coreState.store.deliveries.registerConsumer("output", "sink", "from-now");
       const repository = new FileModuleResultCommitRepository({ path: commitPath });
       const events: SchedulerEvent[] = [];
+      const actorEvents: ModuleActorEvent[] = [];
       composed = composeInstalledReactiveModuleHost({
         configuration,
         installations,
@@ -322,7 +324,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         }, {
           consumerId: "sink",
           pageIds: ["output"],
-          maxResidentCount: 10,
+          maxResidentCount: 1,
           maxResidentBytes: 1024 * 1024,
         }],
         clock: systemSchedulerClock(),
@@ -370,6 +372,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           nextProtocolIdentifier: (purpose) =>
             `${purpose}-scheduler-installed-${++protocolIdentifier}`,
           classifyFailure: (failure) => ({ code: failure.code, retryable: false }),
+          onActorEvent: (event) => actorEvents.push(event),
         },
         onSchedulerEvent: (event) => events.push(event),
       });
@@ -419,6 +422,47 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         expect.objectContaining({ state: "committed", source: { kind: "module", id: FIRST_MODULE_ID } }),
         expect.objectContaining({ state: "committed", source: { kind: "module", id: SECOND_MODULE_ID } }),
       ]));
+      expect(actorEvents.filter((event) => event.type === "run.started")).toHaveLength(2);
+
+      const secondInput = coreState.store.blocks.commit(proposal("fill the sink boundary"), {
+        kind: "external",
+        id: "scheduler-integration",
+      });
+      coreState.store.deliveries.append("input", secondInput.id);
+      expect(await waitFor(
+        () => events.some((event) =>
+          event.type === "scheduler.settled" &&
+          event.moduleId === SECOND_MODULE_ID &&
+          event.tickStatus === "output-backpressured"
+        ),
+        5_000,
+      )).toBe(true);
+      expect(actorEvents.filter((event) => event.type === "run.started")).toHaveLength(4);
+      expect(repository.list()).toHaveLength(4);
+      expect(repository.list().filter((record) => record.state === "prepared"))
+        .toHaveLength(1);
+      expect(coreState.store.deliveries.inspectResident("sink", ["output"]))
+        .toMatchObject({ residentCount: 1, pendingCount: 1, claimedCount: 0 });
+
+      const sinkClaim = coreState.store.deliveries.claim({
+        consumerId: "sink",
+        pageIds: ["output"],
+        moduleGenerationId: "integration-sink-generation",
+        maxCount: 1,
+        maxBytes: 64 * 1_024,
+      });
+      if (sinkClaim === null) {
+        throw new Error("The full sink did not expose its existing Delivery");
+      }
+      expect(coreState.store.acknowledgeDeliveryClaim(sinkClaim)).toBe("committed");
+      expect(await waitFor(
+        () =>
+          repository.list().length === 4 &&
+          repository.list().every((record) => record.state === "committed") &&
+          coreState.store.deliveries.inspectPending("sink", ["output"]).pendingCount === 1,
+        5_000,
+      )).toBe(true);
+      expect(actorEvents.filter((event) => event.type === "run.started")).toHaveLength(4);
 
       await composed.host.stop();
       stopped = true;
@@ -442,9 +486,11 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       });
       const reopenedRepository = new FileModuleResultCommitRepository({ path: commitPath });
       const committed = reopenedRepository.list().find((record) =>
-        record.source.id === SECOND_MODULE_ID
+        record.source.id === SECOND_MODULE_ID &&
+        record.blockId !== undefined &&
+        JSON.stringify(reopened.blocks.get(record.blockId)).includes("second:1:run-2")
       );
-      expect(reopenedRepository.list()).toHaveLength(2);
+      expect(reopenedRepository.list()).toHaveLength(4);
       expect(committed).toMatchObject({
         state: "committed",
         source: { kind: "module", id: SECOND_MODULE_ID },
@@ -456,7 +502,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       expect(reopened.blocks.get(committed.blockId)).toMatchObject({
         payload: {
           value: {
-            items: [expect.objectContaining({ type: "text", text: "second:1" })],
+            items: [expect.objectContaining({ type: "text", text: "second:1:run-2" })],
           },
         },
       });
@@ -476,12 +522,17 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         initialEmptyDecisionsObserved: MODULE_IDS.length,
         configuredPollIntervalMs: 60_000,
         outputCommittedWithinMs: 5_000,
+        outputBackpressureObserved: true,
+        actorRunsBeforeCapacityRelease: 4,
+        actorRunsAfterCapacityRelease: actorEvents.filter((event) =>
+          event.type === "run.started"
+        ).length,
         committedModuleResults: reopenedRepository.list().length,
         finalRecordStates: processGenerationIds.map((processGenerationId) =>
           reopened.getModuleProcessRecord(processGenerationId)?.state
         ),
         cgroupsRemoved: moduleCgroupPaths.every((path) => !existsSync(path)),
-        reopenedOutput: "second:1",
+        reopenedOutput: "second:1:run-2",
       }));
     } finally {
       if (!stopped && composed !== undefined &&

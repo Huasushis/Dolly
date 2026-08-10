@@ -1,5 +1,6 @@
 let initialized;
 let inputBuffer = Buffer.alloc(0);
+let executionCount = 0;
 
 function send(message) {
   const payload = Buffer.from(JSON.stringify(message), "utf8");
@@ -35,6 +36,7 @@ function handle(message) {
     return;
   }
   if (method === "module.execute") {
+    executionCount += 1;
     respond(id, {
       protocolVersion: "3.0",
       sessionId: params.sessionId,
@@ -49,7 +51,7 @@ function handle(message) {
             value: {
               items: [{
                 type: "text",
-                text: `${initialized.config.prefix}:${params.input.blockGroups.length}`,
+                text: `${initialized.config.prefix}:${params.input.blockGroups.length}:run-${executionCount}`,
               }],
             },
           },
