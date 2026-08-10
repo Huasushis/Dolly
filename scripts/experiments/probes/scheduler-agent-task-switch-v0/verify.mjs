@@ -164,6 +164,13 @@ function providerMessages(inputMessages) {
   }));
 }
 
+function modelMessageText(row) {
+  return row.input.messages
+    .flatMap((message) => message.parts)
+    .map((part) => part.text)
+    .join("\n");
+}
+
 function verifyModelAndWire(modelRows, providerRows) {
   assert(modelRows.length === 11, "model call count is not 11");
   assert(providerRows.length === 11, "provider response count is not 11");
@@ -226,14 +233,25 @@ function verifyModelAndWire(modelRows, providerRows) {
   });
 
   const taskBRows = [modelRows[1], modelRows[6]];
+  const forbiddenCheckpointValues = [
+    CHECKPOINT_KEY,
+    CHECKPOINT.objective,
+    ...CHECKPOINT.completed,
+    '"channel":"canary"',
+    '"retentionHours":24',
+    `"kind":"${CHECKPOINT.nextAction.kind}"`,
+    `"target":"${CHECKPOINT.nextAction.target}"`,
+    `"reason":"${CHECKPOINT.nextAction.reason}"`,
+    CHECKPOINT.sourceId,
+  ];
   for (const row of taskBRows) {
-    const text = JSON.stringify(row.input.messages);
-    for (const forbidden of [CHECKPOINT_KEY, CHECKPOINT.objective, "unit-tests", "retentionHours", "request-approval"]) {
+    const text = modelMessageText(row);
+    for (const forbidden of forbiddenCheckpointValues) {
       assert(!text.includes(forbidden), `unrelated task model input leaked ${forbidden}`);
     }
   }
-  const firstResumePlan = JSON.stringify(modelRows[7].input.messages);
-  for (const forbidden of [CHECKPOINT_KEY, CHECKPOINT.objective, "unit-tests", "retentionHours", "request-approval"]) {
+  const firstResumePlan = modelMessageText(modelRows[7]);
+  for (const forbidden of forbiddenCheckpointValues) {
     assert(!firstResumePlan.includes(forbidden), `resume planning input leaked ${forbidden} before retrieval`);
   }
 }
@@ -423,7 +441,7 @@ function verifyRun(runDirectory, fixtureValues) {
   const preregistration = parseJson(join(runDirectory, "preregistration.json"));
   assert(manifest.schemaVersion === "scheduler-agent-task-switch/run-manifest/1", "manifest schema differs");
   assert(manifest.experimentId === "scheduler-agent-task-switch-v0", "manifest experiment differs");
-  assert(manifest.experimentVersion === 4, "manifest experiment version differs");
+  assert(manifest.experimentVersion === 5, "manifest experiment version differs");
   assert(manifest.status === "completed" && manifest.failure === null, "run did not complete");
   assert(manifest.providerCalls === 11 && manifest.maximumProviderCalls === 11, "provider call budget differs");
   assert(manifest.secretLeasesReleased === 11, "secret leases were not released");

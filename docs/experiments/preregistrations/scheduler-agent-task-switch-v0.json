@@ -2,7 +2,7 @@
   "$schema": "./schema-v1.json",
   "schemaVersion": "dolly-experiment-preregistration/v1",
   "experimentId": "scheduler-agent-task-switch-v0",
-  "experimentVersion": 4,
+  "experimentVersion": 5,
   "title": "Scheduler-driven structured task checkpoint and task-switch effect canary",
   "status": "frozen-before-first-run",
   "scope": "live-canary",
@@ -37,7 +37,7 @@
     "guardrails": [
       {
         "id": "g1-context-isolation",
-        "statement": "Neither task-B model input nor the first resume planning input contains task-A objective, completed steps, constraints, checkpoint key, or next action before retrieval.",
+        "statement": "Neither task-B model input nor the first resume planning input contains task-A objective value, completed-step values, constraint values, checkpoint key, source ID, or next-action values before retrieval; generic checkpoint schema field names are not treated as state values.",
         "outcomeMeasure": "active-context-leakage"
       },
       {
@@ -53,7 +53,7 @@
     ]
   },
   "decision": {
-    "currentProductState": "Scheduler, process Host, active-Run model and tool capabilities, persistent tool/effect journals, and file Core are product components, but product bootstrap still refuses every configured Module. Version 1 exposed an invalid baseline field. Version 2 completed all model calls but exposed a leaky storage-prefix abstraction. Version 3 completed the expected checkpoint, unrelated task, and resume effects, but its independent verifier incorrectly treated JSON object key order as semantic and therefore made the run inconclusive. Version 4 changes only that validator comparison to Node deep strict equality; it does not reuse version-3 outputs. Memory v9 supports a sourced checkpoint candidate but does not establish association or a final Memory architecture.",
+    "currentProductState": "Scheduler, process Host, active-Run model and tool capabilities, persistent tool/effect journals, and file Core are product components, but product bootstrap still refuses every configured Module. Version 1 exposed an invalid baseline field. Version 2 exposed a leaky storage-prefix abstraction. Version 3 completed the expected Agent effects but had an object-order-sensitive validator. Version 4 again completed the effects, but its leakage oracle mistook the generic checkpoint schema field name retentionHours for a task-A value. Version 5 changes only that oracle to inspect actual checkpoint values in model text; it does not reuse version-4 outputs. Memory v9 supports a sourced checkpoint candidate but does not establish association or a final Memory architecture.",
     "changesIfSupported": [
       "Use the sourced structured checkpoint as the first simple task-resumption boundary behind the candidate Scheduler composition.",
       "Keep richer association, consolidation, retrieval composition, and scheduling policy as independent experiments rather than embedding them in this checkpoint format.",
@@ -128,7 +128,8 @@
         "Earlier registry canaries established the JSON-object contract, Host registry, live Aether reasoning observation, and strict response validation used unchanged here.",
         "Task-switch version 1 retained one HTTP-200 baseline checkpoint response and then stopped because its validator confused echoing an input checkpoint key with successful persistence; no treatment or resume response was observed.",
         "Task-switch version 2 retained eleven successful model/provider calls, one complete baseline, a stored treatment checkpoint, a correct unrelated answer, and all three closed treatment effect Runs. Resume failed because storage_list exposed an internal prefix string and the model supplied release-aurora instead of task.release-aurora. The two legal empty list results and all tool rounds remain separate failure evidence.",
-        "Task-switch version 3 retained eleven successful calls and the exact expected Agent effects, but its frozen validator rejected a semantically equal stored checkpoint because canonical storage reordered object keys. Version 3 remains inconclusive and is used only to identify this validator defect."
+        "Task-switch version 3 retained eleven successful calls and the exact expected Agent effects, but its frozen validator rejected a semantically equal stored checkpoint because canonical storage reordered object keys. Version 3 remains inconclusive and is used only to identify this validator defect.",
+        "Task-switch version 4 again retained the exact expected effects and no actual task-A value appeared before retrieval; its frozen verifier produced a false leakage failure because the Host registry necessarily described the generic retentionHours schema field."
       ]
     },
     "evaluation": {
@@ -138,7 +139,7 @@
         "Seed labels identify the fixed task-A and unrelated task-B inputs inside one paired sequence; the owner Aether endpoint exposes no verified provider seed control."
       ]
     },
-    "splitIsolation": "No version-4 response exists before this version is frozen. Version-1 through version-3 raw artifacts remain separate inconclusive runs and cannot be retried, merged, or scored as version 4. Historical Memory and registry runs may motivate the mechanism but are never merged with these case rows.",
+    "splitIsolation": "No version-5 response exists before this version is frozen. Version-1 through version-4 raw artifacts remain separate inconclusive runs and cannot be retried, merged, or scored as version 5. Historical Memory and registry runs may motivate the mechanism but are never merged with these case rows.",
     "tuningUsesTrainingAndDevelopmentOnly": true
   },
   "backend": {
@@ -183,7 +184,7 @@
       {
         "name": "active-context-leakage",
         "unit": "count",
-        "aggregation": "count of forbidden task-A checkpoint fields in task-B model messages or in the first resume planning messages before storage retrieval",
+        "aggregation": "count of forbidden task-A checkpoint values in task-B model messages or in the first resume planning messages before storage retrieval; generic schema field names do not count",
         "direction": "zero",
         "population": "The two task-B calls and first treatment resume planning call."
       },
@@ -322,7 +323,7 @@
       "Read retained artifacts, the frozen preregistration and source bytes, plus configured fixture values only for exact leakage scanning; do not import the runner or Extension.",
       "Rebuild all eleven provider request messages, max_tokens, response_format, thinking object, model, streaming flag, and omitted temperature from the corresponding model-call inputs.",
       "Verify exact baseline and treatment phase inputs, actions, results, checkpoint bytes, three distinct Runs, one Module generation, Scheduler completion, exact child stop, terminal effect records, and complete persistent tool rounds.",
-      "Reject any task-A checkpoint field in task-B messages or the first resume planning messages before retrieval.",
+      "Reject any task-A checkpoint value in task-B messages or the first resume planning messages before retrieval while allowing generic checkpoint schema field names.",
       "Verify every artifact and frozen source digest, token and latency accounting, secret lease release, exact capability inventories, and absence of configured URL, key, authorization, handle, baseUrl, exactUrl, or apiKey fields."
     ],
     "mutationTests": [
@@ -379,9 +380,9 @@
       "associationOrConsolidationIncluded": false
     },
     "implementationSha256": {
-      "scripts/experiments/probes/scheduler-agent-task-switch-v0/run.mts": "b850d2d03d77e933c0bdf6ac68bc0d763e6b3e09b069f6176f2b67a31ff6173d",
+      "scripts/experiments/probes/scheduler-agent-task-switch-v0/run.mts": "38ef6646d69b1dff74e991044a7b03c9d3ea0f5779a897fa9f8349a7ae71e72e",
       "scripts/experiments/probes/scheduler-agent-task-switch-v0/extension.mjs": "f9464908b9dd744a76d436fcf33032b7c381dea768406c147eb7bdd401c24f3d",
-      "scripts/experiments/probes/scheduler-agent-task-switch-v0/verify.mjs": "3771d56513a4fb781ac07075c9d220ae3a690e47bc0be591a777b6962fbc93db"
+      "scripts/experiments/probes/scheduler-agent-task-switch-v0/verify.mjs": "d9beade013aa2c8b701c4a71a243b0109541411344628a7d1dd6c0a7520fb83b"
     },
     "productionSourceSha256": {
       "src/adapters/extension-effect-run-lifecycle.ts": "60cbab4e1968fedab658aeea5fd5a0fe1110a494842f9f0e2975898660ef3127",
