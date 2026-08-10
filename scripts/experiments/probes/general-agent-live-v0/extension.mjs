@@ -268,6 +268,27 @@ function successfulToolObservation(value, registry, callId, name, roundIndex) {
   return result.content;
 }
 
+const MAX_TOOL_ACTION_ROUNDS = 5;
+const MAX_CONSECUTIVE_NO_PROGRESS = 1;
+
+function canonicalJsonText(value) {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("tool arguments contain a non-finite number");
+    return Object.is(value, -0) ? "0" : JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJsonText(entry)).join(",")}]`;
+  }
+  if (typeof value !== "object") throw new Error("tool arguments are not closed JSON");
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJsonText(value[key])}`)
+    .join(",")}}`;
+}
+
 async function runAgent(params) {
   const model = capability("model-operation");
   if (!model) throw new Error("model-operation capability is absent");
@@ -292,6 +313,8 @@ async function runAgent(params) {
   const toolInvocation = capability("tool-invocation");
   const task = taskText(params.input);
   const observations = [];
+  const modelActions = [];
+  const noProgressEvents = [];
   const reasoningObserved = [];
   const allowFencedModelJson = model.capabilityVersion !== "v2";
 
@@ -383,7 +406,8 @@ async function runAgent(params) {
       if (planningNote === "") throw new Error("planning call returned no final plan text");
       reasoningObserved.push(true);
     }
-    for (let round = 1; round <= 3; round += 1) {
+    let consecutiveNoProgress = 0;
+    for (let round = 1; round <= MAX_TOOL_ACTION_ROUNDS; round += 1) {
       const system = [
         "You are a grounded task Agent. The Host supplied the exact read-only tool registry JSON below.",
         "Choose only a name present in registry.tools and obey its argumentSchema and limits exactly.",
@@ -392,6 +416,7 @@ async function runAgent(params) {
         "For a tool action use exactly keys action,arguments, where action is the selected tool name.",
         "For the final action use exactly keys action,answer,grounded,evidenceKeys; set action to answer and answer to one non-empty string, never an object.",
         "For a grounded final answer, evidenceKeys must contain the exact source key passed to the successful read action; never put tool names in evidenceKeys.",
+        "A repeated identical read-only action reuses its prior observation and counts as no progress; after such feedback choose a different action.",
         "Keep internal reasoning under 120 words and reserve output budget for JSON.",
         `Registry: ${JSON.stringify(registry)}`,
       ].join(" ");
@@ -405,7 +430,7 @@ async function runAgent(params) {
               role: "user",
               parts: [{
                 kind: "text",
-                text: JSON.stringify({ task, planningNote, observations }),
+                text: JSON.stringify({ task, planningNote, observations, noProgressEvents }),
               }],
             },
           ],
@@ -428,12 +453,15 @@ async function runAgent(params) {
       );
       const rawAction = parseModelObject(output.finalContent, allowFencedModelJson);
       if (rawAction?.action === "answer") {
+        modelActions.push("answer");
         const action = strictAnswer(output.finalContent, true, allowFencedModelJson);
         assertGroundedToolAnswer(action, observations);
         return {
           conditionId: "tool-registry-storage",
           task,
           actions: [...observations.map((entry) => entry.name), "answer"],
+          modelActions,
+          noProgressEvents,
           toolArguments: observations.map((entry) => ({
             name: entry.name,
             arguments: entry.arguments,
@@ -464,6 +492,27 @@ async function runAgent(params) {
       );
       const selected = registry.tools.find((tool) => tool.name === action.action);
       if (!selected) throw new Error("model selected a tool absent from the registry");
+      modelActions.push(selected.name);
+      const actionIdentity = `${selected.name}:${canonicalJsonText(action.arguments)}`;
+      const priorObservationIndex = observations.findIndex(
+        (entry) => entry.actionIdentity === actionIdentity,
+      );
+      if (priorObservationIndex >= 0) {
+        if (selected.effectClass !== "read") {
+          throw new Error("a repeated non-read tool action cannot reuse an earlier result");
+        }
+        consecutiveNoProgress += 1;
+        noProgressEvents.push({
+          kind: "duplicate-read-reused",
+          name: selected.name,
+          arguments: action.arguments,
+          priorObservationIndex,
+        });
+        if (consecutiveNoProgress > MAX_CONSECUTIVE_NO_PROGRESS) {
+          throw new Error("Agent repeated an identical read-only action without progress");
+        }
+        continue;
+      }
       const toolRound = observations.length + 1;
       const callId = `agent-tool-call-${toolRound}`;
       const toolResult = await invokeCapability(
@@ -483,6 +532,7 @@ async function runAgent(params) {
       observations.push({
         name: selected.name,
         arguments: action.arguments,
+        actionIdentity,
         registryDigest: toolResult.registryDigest,
         result: successfulToolObservation(
           toolResult,
@@ -492,6 +542,7 @@ async function runAgent(params) {
           toolRound,
         ),
       });
+      consecutiveNoProgress = 0;
     }
     throw new Error("Agent exhausted its registered round budget without answering");
   }

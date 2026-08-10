@@ -263,7 +263,7 @@ describe("general Agent tool-registry Extension", () => {
     const toolCapability = createToolInvocationCapabilityV2({
       executionScope: "active-run",
       expiresAt: "2099-01-01T00:00:00.000Z",
-      limits: { maxInvocations: 6, maxInvocationsPerRun: 3, maxCallsPerRound: 1 },
+      limits: { maxInvocations: 12, maxInvocationsPerRun: 3, maxCallsPerRound: 1 },
       resolveRun: ({ moduleJobId }) => ({
         registry,
         budget: BUDGET,
@@ -294,7 +294,7 @@ describe("general Agent tool-registry Extension", () => {
           outputContracts: ["text", "json-object"],
         },
         expiresAt: "2099-01-01T00:00:00.000Z",
-        maxInvocations: 10,
+        maxInvocations: 21,
         maxConcurrentInvocations: 1,
         maxArgumentBytes: 128 * 1024,
         maxResultBytes: 128 * 1024,
@@ -324,14 +324,22 @@ describe("general Agent tool-registry Extension", () => {
         if (context.moduleJobId === undefined) throw new Error("active Module job is absent");
         const modelRound = (modelRounds.get(context.moduleJobId) ?? 0) + 1;
         modelRounds.set(context.moduleJobId, modelRound);
+        const duplicateRead = context.moduleJobId === "module-job-duplicate";
+        const stuckRead = context.moduleJobId === "module-job-stuck";
         const finalContent =
           modelRound === 1
             ? "Discover the available keys, read the active note, then answer with its source."
             : modelRound === 2
             ? JSON.stringify({ action: "alpha_discover", arguments: { prefix: "", limit: 3 } })
             : modelRound === 3
-              ? JSON.stringify({ action: "beta_read", arguments: { key: "deployment-note" } })
-              : JSON.stringify({
+              ? JSON.stringify(duplicateRead || stuckRead
+                ? { action: "alpha_discover", arguments: { limit: 3, prefix: "" } }
+                : { action: "beta_read", arguments: { key: "deployment-note" } })
+              : modelRound === 4 && stuckRead
+                ? JSON.stringify({ action: "alpha_discover", arguments: { prefix: "", limit: 3 } })
+                : modelRound === 4 && duplicateRead
+                ? JSON.stringify({ action: "beta_read", arguments: { key: "deployment-note" } })
+                : JSON.stringify({
                   action: "answer",
                   answer: "The active deployment codename is EMBER-7421.",
                   grounded: true,
@@ -407,12 +415,37 @@ describe("general Agent tool-registry Extension", () => {
         answer: { grounded: true, evidenceKeys: ["deployment-note"] },
       });
       expect(agentResult.answer.answer).toContain("EMBER-7421");
+      const duplicateResult = await host.execute(
+        execution("module-job-duplicate", "run-duplicate"),
+      );
+      const duplicateText = (duplicateResult as {
+        blockProposal?: { payload?: { value?: { items?: { text?: string }[] } } };
+      }).blockProposal?.payload?.value?.items?.[0]?.text;
+      if (typeof duplicateText !== "string") {
+        throw new Error("Duplicate-action Agent result text is absent");
+      }
+      const duplicateAgentResult = JSON.parse(duplicateText);
+      expect(duplicateAgentResult).toMatchObject({
+        conditionId: "tool-registry-storage",
+        actions: ["alpha_discover", "beta_read", "answer"],
+        modelActions: ["alpha_discover", "alpha_discover", "beta_read", "answer"],
+        noProgressEvents: [{
+          kind: "duplicate-read-reused",
+          name: "alpha_discover",
+          priorObservationIndex: 0,
+        }],
+        answer: { grounded: true, evidenceKeys: ["deployment-note"] },
+      });
+      expect(duplicateAgentResult.answer.answer).toContain("EMBER-7421");
+      await expect(
+        host.execute(execution("module-job-stuck", "run-stuck")),
+      ).rejects.toThrow();
       expect(agentResult.planningNoteChars).toBeGreaterThan(0);
       expect(agentResult.toolRegistry.tools.map((tool: { name: string }) => tool.name)).toEqual([
         "alpha_discover",
         "beta_read",
       ]);
-      expect(prompts).toHaveLength(8);
+      expect(prompts).toHaveLength(17);
       expect(prompts[0]).toContain('"maximum":3');
       expect(prompts[0]).toContain("alpha_discover");
       expect(prompts[0]).toContain("successResultSchema");
@@ -425,11 +458,33 @@ describe("general Agent tool-registry Extension", () => {
         { kind: "json-object" },
         { kind: "json-object" },
         { kind: "json-object" },
+        { kind: "text" },
+        { kind: "json-object" },
+        { kind: "json-object" },
+        { kind: "json-object" },
+        { kind: "json-object" },
+        { kind: "text" },
+        { kind: "json-object" },
+        { kind: "json-object" },
+        { kind: "json-object" },
       ]);
-      expect(execute).toHaveBeenCalledTimes(4);
+      expect(execute).toHaveBeenCalledTimes(7);
       expect(
         new FileToolJournalRepository({ path: toolJournalPath })
           .listRounds("module-job-a"),
+      ).toEqual([
+        expect.objectContaining({ roundIndex: 1, state: "complete" }),
+        expect.objectContaining({ roundIndex: 2, state: "complete" }),
+      ]);
+      expect(
+        new FileToolJournalRepository({ path: toolJournalPath })
+          .listRounds("module-job-stuck"),
+      ).toEqual([
+        expect.objectContaining({ roundIndex: 1, state: "complete" }),
+      ]);
+      expect(
+        new FileToolJournalRepository({ path: toolJournalPath })
+          .listRounds("module-job-duplicate"),
       ).toEqual([
         expect.objectContaining({ roundIndex: 1, state: "complete" }),
         expect.objectContaining({ roundIndex: 2, state: "complete" }),
