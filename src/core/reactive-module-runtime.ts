@@ -418,6 +418,7 @@ export class ReactiveModuleRuntime {
   #recoveryInFlight: Promise<ReactiveModuleRecoveryResult> | undefined;
   #unresolved: UnresolvedRun | undefined;
   #deferredOutputCommit: DeferredOutputCommit | undefined;
+  #startupRecoveryPending = false;
   #startAuthorized = false;
   #acceptingOperations = true;
 
@@ -519,6 +520,7 @@ export class ReactiveModuleRuntime {
         options.initialDeferredCommit,
         options.maxResultBytes,
       );
+      this.#startupRecoveryPending = true;
     }
 
     const actorOptions: ModuleActorOptions<ReactiveModuleInput, ReactiveModuleResult> = {
@@ -558,6 +560,16 @@ export class ReactiveModuleRuntime {
 
   get outputCommitWaiting(): boolean {
     return this.#deferredOutputCommit !== undefined;
+  }
+
+  /**
+   * True until a result restored by startup recovery reaches its exact
+   * committed state. Unlike `outputCommitWaiting`, this remains true when the
+   * journal becomes missing, conflicting, or unreadable and the runtime must
+   * fail closed for operator recovery.
+   */
+  get startupRecoveryPending(): boolean {
+    return this.#startupRecoveryPending;
   }
 
   #restoreDeferredOutputCommit(
@@ -1152,6 +1164,7 @@ export class ReactiveModuleRuntime {
       if (sameCommittedResult(record, claim, this.#source, outputPageIds, output)) {
         if (this.#claimIsCommittedByRuntimeStore(claim)) {
           this.#deferredOutputCommit = undefined;
+          this.#startupRecoveryPending = false;
           this.#unresolved = undefined;
           this.#activeClaim = undefined;
           return deepFreeze({

@@ -175,6 +175,45 @@ describe("reactive Module host lifecycle", () => {
     ]);
   });
 
+  it("does not report running while a startup result still awaits output capacity", async () => {
+    const events: string[] = [];
+    let outputCommitWaiting = true;
+    let startupRecoveryPending = true;
+    const managed: ManagedReactiveModuleRuntime = {
+      moduleGenerationId: "worker-generation",
+      get outputCommitWaiting() {
+        return outputCommitWaiting;
+      },
+      get startupRecoveryPending() {
+        return startupRecoveryPending;
+      },
+      start: vi.fn(async () => {
+        events.push("start:worker");
+      }),
+      stop: vi.fn(async () => {
+        events.push("stop:worker");
+      }),
+      tick: vi.fn(async (): Promise<ReactiveModuleTickResult> => ({ status: "idle" })),
+    };
+    const host = new ReactiveModuleHost(
+      scheduler(events) as never,
+      [registration("worker", managed)],
+    );
+
+    await host.start();
+    expect(host.state).toBe("recovering");
+
+    outputCommitWaiting = false;
+    expect(host.state).toBe("recovering");
+
+    startupRecoveryPending = false;
+    expect(host.state).toBe("running");
+
+    outputCommitWaiting = true;
+    expect(host.state).toBe("running");
+    await expect(host.stop()).resolves.toBeUndefined();
+  });
+
   it("stops runtime work without waiting for the Scheduler tick drain first", async () => {
     const events: string[] = [];
     let finishSchedulerStop: (() => void) | undefined;

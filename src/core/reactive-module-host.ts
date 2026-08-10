@@ -20,12 +20,15 @@ import {
 export type ReactiveModuleHostState =
   | "created"
   | "starting"
+  | "recovering"
   | "running"
   | "stopping"
   | "stopped"
   | "failed";
 
 export interface ManagedReactiveModuleRuntime extends SchedulableModuleRuntime {
+  /** A startup-restored result has not yet reached its exact committed state. */
+  readonly startupRecoveryPending?: boolean;
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -210,6 +213,7 @@ export class ReactiveModuleHost {
   #startPromise: Promise<void> | undefined;
   #stopPromise: Promise<void> | undefined;
   readonly #startedRuntimes: ManagedReactiveModuleRuntime[] = [];
+  readonly #startupRecoveryRuntimes = new Set<ManagedReactiveModuleRuntime>();
   #schedulerStarted = false;
 
   constructor(
@@ -246,11 +250,23 @@ export class ReactiveModuleHost {
   }
 
   get state(): ReactiveModuleHostState {
+    if (this.#state === "recovering") {
+      for (const runtime of this.#startupRecoveryRuntimes) {
+        if (runtime.startupRecoveryPending !== true) {
+          this.#startupRecoveryRuntimes.delete(runtime);
+        }
+      }
+      if (this.#startupRecoveryRuntimes.size === 0) {
+        this.#state = "running";
+      }
+    }
     return this.#state;
   }
 
   start(): Promise<void> {
-    if (this.#state === "running") return Promise.resolve();
+    if (this.#state === "running" || this.#state === "recovering") {
+      return Promise.resolve();
+    }
     if (this.#startPromise) return this.#startPromise;
     if (this.#state !== "created") {
       return Promise.reject(
@@ -274,7 +290,19 @@ export class ReactiveModuleHost {
       }
       this.#scheduler.start();
       this.#schedulerStarted = true;
-      this.#state = "running";
+      for (const registration of this.#modules) {
+        if (registration.runtime.startupRecoveryPending === true) {
+          this.#startupRecoveryRuntimes.add(registration.runtime);
+        }
+      }
+      // A prepared result that still awaits downstream capacity is a known
+      // startup recovery operation, not a ready instance. The Scheduler may
+      // drive the exact commit and any downstream work needed to free space,
+      // but callers must continue to treat external ingress as closed until
+      // every such runtime reports that its commit-only recovery finished.
+      this.#state = this.#startupRecoveryRuntimes.size > 0
+        ? "recovering"
+        : "running";
     } catch (error) {
       const cleanupErrors: unknown[] = [];
       for (const runtime of [...this.#startedRuntimes].reverse()) {
@@ -298,7 +326,11 @@ export class ReactiveModuleHost {
 
   stop(): Promise<void> {
     if (this.#stopPromise) return this.#stopPromise;
-    if (this.#state !== "running" && this.#state !== "failed") {
+    if (
+      this.#state !== "running" &&
+      this.#state !== "recovering" &&
+      this.#state !== "failed"
+    ) {
       return Promise.reject(
         new Error(`Reactive Module host cannot stop from ${this.#state}`),
       );

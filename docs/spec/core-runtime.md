@@ -418,6 +418,19 @@ runtime whose termination remains unconfirmed stays in the started set, the
 Host reports failure, and a later stop call retries that same proof instead of
 returning a permanently cached rejection.
 
+Candidate-host startup does not report `running` while any runtime began with a
+startup-revalidated, capacity-blocked result that has not reached its exact
+committed state. It reports `recovering` until every one of those startup
+operations has succeeded, then reports `running`. A missing, conflicting, or
+unreadable journal that changes the runtime from output-commit waiting to
+recovery-required does not satisfy this boundary. Later output backpressure
+during an ordinary Run does not move an already ready Host back into startup
+recovery. This state is an observable readiness boundary only. The candidate
+Host does not own an external ingress, so the eventual product coordinator must
+keep that ingress closed while the state is `recovering`; the configured-Module
+bootstrap refusal remains in force until that ownership is connected and
+tested.
+
 `resolveInstalledExtensionModule` and
 `deriveInstalledLinuxExtensionModuleExecutor` form a narrower installation
 derivation boundary: in ordinary terms, they ensure that the package digest,

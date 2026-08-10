@@ -6,7 +6,7 @@ import {
 } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   composeInstalledReactiveModuleHost,
   createInstalledReactiveModuleRuntime,
@@ -356,6 +356,7 @@ describe("installed reactive Module runtime composition", () => {
       stoppedRecordWriter: _stoppedRecordWriter,
       ...sharedRuntime
     } = complete;
+    const scheduled: Array<{ readonly delayMs: number; readonly callback: () => void }> = [];
     const composed = composeInstalledReactiveModuleHost({
       configuration: instanceConfiguration,
       installations,
@@ -365,7 +366,10 @@ describe("installed reactive Module runtime composition", () => {
       startupRecoveryHandoff: report.handoff,
       clock: {
         monotonicNow: () => 0,
-        schedule: () => ({ cancel: () => undefined }),
+        schedule: (delayMs, callback) => {
+          scheduled.push({ delayMs, callback });
+          return { cancel: () => undefined };
+        },
       },
       scheduling: {
         maxConcurrentModules: 1,
@@ -394,6 +398,64 @@ describe("installed reactive Module runtime composition", () => {
     expect(pair.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
       state: "stopped",
     });
+
+    await composed.host.start();
+    expect(composed.host.state).toBe("recovering");
+    expect(() => composed.installedRuntimes[0]!.generations
+      .processGenerationIdFor("worker-module-generation-a"))
+      .toThrow(/does not have a process generation/u);
+
+    const sinkClaim = pair.store.deliveries.claim({
+      consumerId: "sink",
+      pageIds: ["output"],
+      moduleGenerationId: "sink-drain-generation",
+      maxCount: 1,
+      maxBytes: 64 * 1024,
+    })!;
+    const sinkProcessGenerationId = "sink-drain-process";
+    pair.store.appendModuleProcessRecord({
+      schemaVersion: "dolly.module-process-record/1",
+      instanceId: INSTANCE_ID,
+      moduleId: "sink",
+      moduleGenerationId: sinkClaim.moduleGenerationId,
+      processGenerationId: sinkProcessGenerationId,
+      packageDigest: installed.packageDigest,
+      configurationReference: reference,
+      declaredExternalEffects: "none",
+      serviceInvocationId: BINDING.serviceInvocationId,
+      bootId: BINDING.bootId,
+      moduleCgroupPath: deriveModuleCgroupPath(BINDING.delegatedRootCgroupPath, {
+        instanceId: INSTANCE_ID,
+        moduleId: "sink",
+        processGenerationId: sinkProcessGenerationId,
+      }).filesystemPath,
+      state: "starting",
+      createdAt: "2026-08-10T00:00:00.000Z",
+      updatedAt: "2026-08-10T00:00:00.000Z",
+    });
+    pair.store.updateModuleProcessRecordState(sinkProcessGenerationId, "running");
+    pair.store.appendModuleSubmissionRecord({
+      schemaVersion: "dolly.module-submission-record/1",
+      moduleJobId: sinkClaim.moduleJobId,
+      claimToken: sinkClaim.claimToken,
+      runId: sinkClaim.runId,
+      attempt: sinkClaim.attempt,
+      moduleGenerationId: sinkClaim.moduleGenerationId,
+      processGenerationId: sinkProcessGenerationId,
+      inputDigest: canonicalJsonDigest(pair.store.deliveries.inspectClaimInput(sinkClaim)),
+      createdAt: "2026-08-10T00:00:00.000Z",
+    });
+    expect(pair.store.acknowledgeDeliveryClaim(sinkClaim)).toBe("committed");
+    scheduled.find((timer) => timer.delayMs === 0)!.callback();
+    await vi.waitFor(() => {
+      expect(composed.installedRuntimes[0]!.runtime.outputCommitWaiting).toBe(false);
+      expect(composed.installedRuntimes[0]!.runtime.startupRecoveryPending).toBe(false);
+      expect(composed.host.state).toBe("running");
+    });
+    expect(() => composed.installedRuntimes[0]!.generations
+      .processGenerationIdFor("worker-module-generation-a"))
+      .toThrow(/does not have a process generation/u);
+    await expect(composed.host.stop()).resolves.toBeUndefined();
   });
 
   it("rejects a stopped-record writer from another Core before executor creation", () => {

@@ -502,6 +502,7 @@ describe("FileCore Module output capacity", () => {
       classifyFailure: (failure) => ({ code: failure.code, retryable: false }),
     });
     await runtime.start();
+    expect(runtime.startupRecoveryPending).toBe(true);
     hideJournal = true;
     await expect(runtime.tick()).resolves.toMatchObject({
       moduleJobId: input.moduleJobId,
@@ -517,6 +518,8 @@ describe("FileCore Module output capacity", () => {
     expect(release).not.toHaveBeenCalled();
     expect(startExecutor).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
+    expect(runtime.outputCommitWaiting).toBe(false);
+    expect(runtime.startupRecoveryPending).toBe(true);
     expect(core.deliveries.inspectClaim(input).status).toBe("active");
     expect(core.getModuleSubmissionRecord(input.runId)).toBeDefined();
     await expect(runtime.stop()).rejects.toMatchObject({
