@@ -298,6 +298,17 @@ export class FileEffectIntentStore implements EffectRunStore {
             "A stable effect idempotency key already names a different intent",
           );
         }
+        if (document.records.some(
+          (record) =>
+            record.moduleJobId === replacement.moduleJobId &&
+            record.idempotencyKey === replacement.idempotencyKey &&
+            record.outcome.kind !== "no-effect",
+        )) {
+          throw new EffectIntentError(
+            "EFFECT_INTENT_CONFLICT",
+            "A stable effect idempotency key has no proof that a retry is safe",
+          );
+        }
         this.#writeDocument({
           ...document,
           revision: nextRevision(document.revision),

@@ -9,6 +9,7 @@ import {
   type JsonValue,
 } from "../core/canonical-json.js";
 import {
+  EffectIntentError,
   EffectIntentJournal,
   type EffectOutcome,
 } from "../core/capabilities/effect-intent-journal.js";
@@ -68,9 +69,10 @@ function resolveSubmittedRun(
  *
  * Every invocation needs a stable idempotency key. A successful invocation is
  * recorded as terminal, which proves its result but deliberately does not make
- * a failed Module Run retry-safe. A rejected invocation remains unknown because
- * this generic adapter cannot infer where an arbitrary handler's effect
- * boundary lies.
+ * a failed Module Run retry-safe. Until a result journal or provider query can
+ * recover that result, a later Run is denied rather than repeating the same
+ * effect. A rejected invocation remains unknown because this generic adapter
+ * cannot infer where an arbitrary handler's effect boundary lies.
  */
 export function createExtensionEffectJournalLifecycle(
   options: ExtensionEffectJournalLifecycleOptions,
@@ -91,16 +93,27 @@ export function createExtensionEffectJournalLifecycle(
           "Durable capability effects require a stable idempotency key",
         );
       }
-      const record = options.journal.recordIntent({
-        ...invocation.identity,
-        idempotencyKey: invocation.idempotencyKey,
-        capabilityType: invocation.capabilityType,
-        operation: invocation.operation,
-        intent: {
-          capabilityVersion: invocation.capabilityVersion,
-          arguments: invocation.arguments,
-        },
-      });
+      let record;
+      try {
+        record = options.journal.recordNewIntent({
+          ...invocation.identity,
+          idempotencyKey: invocation.idempotencyKey,
+          capabilityType: invocation.capabilityType,
+          operation: invocation.operation,
+          intent: {
+            capabilityVersion: invocation.capabilityVersion,
+            arguments: invocation.arguments,
+          },
+        });
+      } catch (error) {
+        if (error instanceof EffectIntentError) {
+          throw new ExtensionCapabilityError(
+            "CAPABILITY_DENIED",
+            "Durable effect authorization was refused before input/output",
+          );
+        }
+        throw error;
+      }
       let result: Awaited<ReturnType<typeof execute>>;
       try {
         result = await execute();

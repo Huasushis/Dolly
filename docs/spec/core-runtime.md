@@ -915,12 +915,18 @@ wired and tested, the persistent store's complete-set proof cannot be assumed
 for a live Module.
 
 The current `dolly.effect-intent/2` record carries both the stable idempotency
-key and one exact Claim/Run identity. A retry Run records a separate record with
-the same `moduleJobId`, idempotency key, and intent digest, plus its own claim
-token, Run identifier, attempt, and Module generation. A different intent under
-that stable key is a conflict. Evidence inspection uses only the exact Run's
-record; it never treats another Claim's related record as authorization for the
-current Run.
+key and one exact Claim/Run identity. A later Run may record the same
+`moduleJobId`, idempotency key, and intent digest only when every earlier record
+under that stable key proves `no-effect`. An earlier `intended`, `unknown`, or
+`terminal` outcome refuses the new invocation before provider, storage, Media,
+or tool input/output; a different intent under that key is always a conflict.
+This conservative rule prevents the current generic capability adapter from
+repeating an effect, but it does not recover a result. Automatic progress after
+a terminal earlier effect still requires a separate persistent logical-effect
+record, a turn/tool journal carrying the validated result, or a trustworthy
+provider outcome query. Evidence inspection uses only the exact Run's records;
+it never treats another Claim's related record as authorization for the current
+Run.
 
 Positive acknowledgement operations MUST be idempotent for the same valid
 claim token. A repeated positive acknowledgement MAY report

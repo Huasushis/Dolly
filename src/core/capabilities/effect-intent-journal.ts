@@ -75,6 +75,19 @@ export interface EffectIntentRecord {
   readonly updatedAt: string;
 }
 
+/** Values persisted before one capability invocation may cross input/output. */
+export interface EffectIntentRequest {
+  readonly moduleJobId: string;
+  readonly runId: string;
+  readonly attempt: number;
+  readonly claimToken: string;
+  readonly moduleGenerationId: string;
+  readonly idempotencyKey: string;
+  readonly capabilityType: string;
+  readonly operation: string;
+  readonly intent: unknown;
+}
+
 /** Durable proof that one exact Run no longer accepts new capability effects. */
 export type EffectRunRecord =
   | {
@@ -446,8 +459,10 @@ export interface EffectIntentStore {
   /**
    * Inserts the replacement's complete Claim/Run identity when `expected` is
    * absent, or replaces only that exact current record when `expected` is
-   * supplied. More than one Run may carry the same stable idempotency key for
-   * the same Module job. `false` means another write won.
+   * supplied. A later Run may carry the same stable idempotency key only when
+   * every earlier record under that key proves `no-effect`; otherwise the
+   * store refuses the insert before an external operation can be repeated.
+   * `false` means another write won.
    */
   compareAndSet(
     expected: EffectIntentRecord | undefined,
@@ -573,17 +588,24 @@ export class EffectIntentJournal {
    * before the operation begins; a caller that starts the operation first has
    * defeated the whole mechanism.
    */
-  recordIntent(request: {
-    readonly moduleJobId: string;
-    readonly runId: string;
-    readonly attempt: number;
-    readonly claimToken: string;
-    readonly moduleGenerationId: string;
-    readonly idempotencyKey: string;
-    readonly capabilityType: string;
-    readonly operation: string;
-    readonly intent: unknown;
-  }): EffectIntentRecord {
+  recordIntent(request: EffectIntentRequest): EffectIntentRecord {
+    return this.#recordIntent(request, false);
+  }
+
+  /**
+   * Records a newly authorized invocation and refuses a duplicate exact
+   * record. Capability execution uses this stricter operation so a surviving
+   * intent cannot be mistaken for permission to repeat input/output after a
+   * restart.
+   */
+  recordNewIntent(request: EffectIntentRequest): EffectIntentRecord {
+    return this.#recordIntent(request, true);
+  }
+
+  #recordIntent(
+    request: EffectIntentRequest,
+    requireNew: boolean,
+  ): EffectIntentRecord {
     for (const [field, value] of Object.entries({
       moduleJobId: request.moduleJobId,
       runId: request.runId,
@@ -637,7 +659,19 @@ export class EffectIntentJournal {
         record.moduleGenerationId === request.moduleGenerationId,
     );
     if (existing) {
+      if (requireNew) {
+        throw new EffectIntentError(
+          "EFFECT_INTENT_CONFLICT",
+          `Effect intent "${request.idempotencyKey}" was already authorized for this Run`,
+        );
+      }
       return existing;
+    }
+    if (recordsForKey.some((record) => record.outcome.kind !== "no-effect")) {
+      throw new EffectIntentError(
+        "EFFECT_INTENT_CONFLICT",
+        `Effect intent "${request.idempotencyKey}" has no proof that a retry is safe`,
+      );
     }
     const now = this.#now();
     const record: EffectIntentRecord = deepFreeze({

@@ -241,7 +241,7 @@ describe("effect intent record protocol", () => {
     );
   });
 
-  it("records one stable effect separately for a retry Run", () => {
+  it("refuses a retry Run while the stable effect outcome is not no-effect", () => {
     const backing = store();
     const journal = new EffectIntentJournal({ store: backing, now: () => NOW });
     const first = journal.recordIntent(intent());
@@ -251,13 +251,15 @@ describe("effect intent record protocol", () => {
       claimToken: "claim-token-2",
       moduleGenerationId: "module-generation-2",
     });
-    const retry = journal.recordIntent(intent({ ...retryIdentity }));
+    expect(() => journal.recordIntent(intent({ ...retryIdentity }))).toThrowError(
+      expect.objectContaining<Partial<EffectIntentError>>({
+        code: "EFFECT_INTENT_CONFLICT",
+      }),
+    );
 
-    expect(backing.records).toHaveLength(2);
-    expect(first.idempotencyKey).toBe(retry.idempotencyKey);
-    expect(first.intentDigest).toBe(retry.intentDigest);
+    expect(backing.records).toHaveLength(1);
     expect(journal.listForRun(claim())).toEqual([first]);
-    expect(journal.listForRun(retryIdentity)).toEqual([retry]);
+    expect(journal.listForRun(retryIdentity)).toEqual([]);
 
     journal.recordOutcome(claim(), first.idempotencyKey, {
       kind: "terminal",
@@ -265,6 +267,28 @@ describe("effect intent record protocol", () => {
     });
     expect(journal.evidenceForRun(claim())).toEqual({ kind: "terminal" });
     expect(journal.evidenceForRun(retryIdentity).kind).toBe("unknown");
+  });
+
+  it("allows a retry Run after the earlier stable effect proves no-effect", () => {
+    const backing = store();
+    const journal = new EffectIntentJournal({ store: backing, now: () => NOW });
+    const first = journal.recordIntent(intent());
+    journal.recordOutcome(claim(), first.idempotencyKey, {
+      kind: "no-effect",
+      detail: "the request was rejected before transmission",
+    });
+    const retryIdentity = claim({
+      runId: "run-2",
+      attempt: 2,
+      claimToken: "claim-token-2",
+      moduleGenerationId: "module-generation-2",
+    });
+    const retry = journal.recordIntent(intent({ ...retryIdentity }));
+
+    expect(backing.records).toHaveLength(2);
+    expect(retry.idempotencyKey).toBe(first.idempotencyKey);
+    expect(retry.intentDigest).toBe(first.intentDigest);
+    expect(journal.listForRun(retryIdentity)).toEqual([retry]);
   });
 
   it("still refuses a different intent under a stable key in a retry Run", () => {

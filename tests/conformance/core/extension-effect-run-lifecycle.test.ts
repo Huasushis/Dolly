@@ -21,11 +21,31 @@ function claim(): DeliveryClaimIdentity {
   };
 }
 
+function retryClaim(): DeliveryClaimIdentity {
+  return {
+    moduleJobId: "module-job-effect-lifecycle",
+    runId: "run-effect-lifecycle-retry",
+    attempt: 2,
+    claimToken: "claim-effect-lifecycle-retry",
+    moduleGenerationId: "module-generation-effect-lifecycle-retry",
+  };
+}
+
 function submission(): ModuleSubmissionRecord {
   return {
     schemaVersion: "dolly.module-submission-record/1",
     ...claim(),
     processGenerationId: "process-generation-effect-lifecycle",
+    inputDigest: `sha256:${"a".repeat(64)}`,
+    createdAt: NOW,
+  };
+}
+
+function retrySubmission(): ModuleSubmissionRecord {
+  return {
+    schemaVersion: "dolly.module-submission-record/1",
+    ...retryClaim(),
+    processGenerationId: "process-generation-effect-lifecycle-retry",
     inputDigest: `sha256:${"a".repeat(64)}`,
     createdAt: NOW,
   };
@@ -129,5 +149,40 @@ describe("Extension effect Run lifecycle", () => {
     lifecycle.closeRun(claim());
 
     expect(journal.evidenceForRun(claim()).kind).toBe("unknown");
+  }));
+
+  it("does not repeat a terminal stable effect in a retry Run", scratchTest(async (root) => {
+    const journal = new EffectIntentJournal({
+      store: new FileEffectIntentStore({ path: join(root, "effect-intents.json") }),
+      now: () => NOW,
+    });
+    const submissions = new Map<string, ModuleSubmissionRecord>([
+      [claim().runId, submission()],
+      [retryClaim().runId, retrySubmission()],
+    ]);
+    const lifecycle = createExtensionEffectJournalLifecycle({
+      journal,
+      getModuleSubmissionRecord: (runId) => submissions.get(runId),
+    });
+
+    lifecycle.openRun(claim());
+    const firstExecute = vi.fn().mockResolvedValue({ providerResult: "accepted" });
+    await expect(lifecycle.invokeCapability(invocation(), firstExecute)).resolves.toEqual({
+      providerResult: "accepted",
+    });
+    lifecycle.closeRun(claim());
+
+    lifecycle.openRun(retryClaim());
+    const retryExecute = vi.fn().mockResolvedValue({ providerResult: "duplicated" });
+    await expect(lifecycle.invokeCapability(invocation({
+      identity: retryClaim(),
+    }), retryExecute)).rejects.toMatchObject({
+      code: "CAPABILITY_DENIED",
+    });
+    lifecycle.closeRun(retryClaim());
+
+    expect(firstExecute).toHaveBeenCalledOnce();
+    expect(retryExecute).not.toHaveBeenCalled();
+    expect(journal.evidenceForRun(retryClaim())).toEqual({ kind: "no-effect" });
   }));
 });

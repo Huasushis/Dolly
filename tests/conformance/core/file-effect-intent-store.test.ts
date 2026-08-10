@@ -61,16 +61,17 @@ function scratchTest(
 }
 
 describe("file effect intent store", () => {
-  it("survives restart with separate records for retry Runs", scratchTest((root) => {
+  it("survives restart when a no-effect record permits a retry Run", scratchTest((root) => {
     const path = join(root, "effect-intents.json");
     const store = new FileEffectIntentStore({ path });
     const journal = new EffectIntentJournal({ store, now: () => NOW });
     journal.openRun(claim());
     const first = journal.recordIntent(intent());
     journal.recordOutcome(claim(), first.idempotencyKey, {
-      kind: "terminal",
-      resultDigest: `sha256:${"c".repeat(64)}`,
+      kind: "no-effect",
+      detail: "the provider request was rejected before transmission",
     });
+    journal.closeRun(claim());
     const retry = claim({
       runId: "run-file-effect-2",
       attempt: 2,
@@ -86,11 +87,42 @@ describe("file effect intent store", () => {
       now: () => LATER,
     });
     expect(reopenedStore.list()).toHaveLength(2);
-    expect(reopened.evidenceForRun(claim())).toEqual({ kind: "terminal" });
+    expect(reopened.evidenceForRun(claim())).toEqual({ kind: "no-effect" });
     expect(reopened.evidenceForRun(retry)).toMatchObject({ kind: "unknown" });
     expect(readFileSync(path, "utf8")).toMatch(
-      /^\{"records":\[.*\],"revision":5,"runs":\[.*\],"schemaVersion":"dolly.effect-intent-store\/2"\}\n$/u,
+      /^\{"records":\[.*\],"revision":6,"runs":\[.*\],"schemaVersion":"dolly.effect-intent-store\/2"\}\n$/u,
     );
+  }));
+
+  it("atomically refuses a second unsettled stable effect in another Run", scratchTest((root) => {
+    const path = join(root, "effect-intents.json");
+    const firstStore = new FileEffectIntentStore({ path });
+    const firstJournal = new EffectIntentJournal({ store: firstStore, now: () => NOW });
+    firstJournal.openRun(claim());
+    const first = firstJournal.recordIntent(intent());
+    const retry = claim({
+      runId: "run-file-effect-2",
+      attempt: 2,
+      claimToken: "claim-file-effect-2",
+      moduleGenerationId: "module-generation-file-effect-2",
+    });
+    const secondStore = new FileEffectIntentStore({ path });
+    const secondJournal = new EffectIntentJournal({ store: secondStore, now: () => LATER });
+    secondJournal.openRun(retry);
+    const retryRecord: EffectIntentRecord = {
+      ...first,
+      ...retry,
+      outcome: { kind: "intended" },
+      createdAt: LATER,
+      updatedAt: LATER,
+    };
+
+    expect(() => secondStore.compareAndSet(undefined, retryRecord)).toThrowError(
+      expect.objectContaining<Partial<EffectIntentError>>({
+        code: "EFFECT_INTENT_CONFLICT",
+      }),
+    );
+    expect(new FileEffectIntentStore({ path }).list()).toHaveLength(1);
   }));
 
   it("rejects a stale compare-and-set after another writer settles the record", scratchTest((root) => {
