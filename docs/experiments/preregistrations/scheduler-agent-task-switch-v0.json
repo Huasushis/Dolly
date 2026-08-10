@@ -1,0 +1,399 @@
+{
+  "$schema": "./schema-v1.json",
+  "schemaVersion": "dolly-experiment-preregistration/v1",
+  "experimentId": "scheduler-agent-task-switch-v0",
+  "experimentVersion": 1,
+  "title": "Scheduler-driven structured task checkpoint and task-switch effect canary",
+  "status": "frozen-before-first-run",
+  "scope": "live-canary",
+  "protocol": {
+    "path": "docs/experiments/protocol.md",
+    "sha256": "1a2934531fbe052662464f6a0d3b2fd531b3d7904daa431810a1db979683fafe"
+  },
+  "authorityReferences": [
+    ".qoder/specs/dolly_new.txt",
+    ".qoder/specs/Dolly架构重构实施计划_ddb07167.md",
+    ".qoder/specs/Dolly_鲁棒性与功能完善_ddb07167.md",
+    "AGENTS.md",
+    "docs/spec/core-runtime.md",
+    "docs/spec/model-provider.md",
+    "docs/research/memory-association-task-switch-v0.md"
+  ],
+  "definitions": {
+    "structuredCheckpoint": "A source-citing, closed task-state record containing objective, completed work, constraints, and one normalized next action.",
+    "taskSwitch": "Three distinct Scheduler Runs in one Module process: checkpoint task A, complete unrelated task B without task A active context, then resume task A from stored evidence.",
+    "sameProcess": "All three Runs use one process-isolated Extension host and one Module generation; this does not claim Linux control-group ownership.",
+    "baseline": "The same Scheduler, child implementation, model descriptor, and three task messages without tool-invocation or storage access."
+  },
+  "question": "Can one Scheduler-driven process-isolated Agent store a sourced task checkpoint, finish an unrelated task with no task-A state in its active model context, and later resume the exact next action from that checkpoint, while the paired no-tool baseline cannot resume?",
+  "hypotheses": {
+    "primary": [
+      {
+        "id": "h1-task-switch-recovery",
+        "statement": "The structured-checkpoint condition completes storage_set, answers the unrelated task, then completes storage_list and storage_get before committing the exact sourced next action; the paired no-tool baseline reports that it cannot resume.",
+        "outcomeMeasure": "paired-task-recovery"
+      }
+    ],
+    "guardrails": [
+      {
+        "id": "g1-context-isolation",
+        "statement": "Neither task-B model input nor the first resume planning input contains task-A objective, completed steps, constraints, checkpoint key, or next action before retrieval.",
+        "outcomeMeasure": "active-context-leakage"
+      },
+      {
+        "id": "g2-scheduler-run-boundary",
+        "statement": "Each condition uses three distinct Runs in one Module generation, commits all three Scheduler jobs, closes every capability effect, and stops only its recorded child.",
+        "outcomeMeasure": "scheduler-boundary-violations"
+      },
+      {
+        "id": "g3-capability-boundary",
+        "statement": "The treatment child receives model-operation and tool-invocation only; it never receives raw storage, provider endpoint, credential, authorization, or another capability handle in model-visible data.",
+        "outcomeMeasure": "capability-boundary-violations"
+      }
+    ]
+  },
+  "decision": {
+    "currentProductState": "Scheduler, process Host, active-Run model and tool capabilities, persistent tool/effect journals, and file Core are product components, but product bootstrap still refuses every configured Module. Memory v9 supports a sourced checkpoint candidate but does not establish association or a final Memory architecture.",
+    "changesIfSupported": [
+      "Use the sourced structured checkpoint as the first simple task-resumption boundary behind the candidate Scheduler composition.",
+      "Keep richer association, consolidation, retrieval composition, and scheduling policy as independent experiments rather than embedding them in this checkpoint format.",
+      "Add deterministic duplicate, restart, malformed checkpoint, and installed-Linux composition tests before any product startup promotion."
+    ],
+    "changesIfRejected": [
+      "Retain the raw run as failed or inconclusive evidence and revise the Agent action protocol, checkpoint schema, or capability budget before another frozen version.",
+      "Do not compensate by injecting task-A state into task B or the resume prompt, and do not bypass the product Module startup refusal."
+    ],
+    "prohibitedClaims": [
+      "The final Memory architecture or associative recall mechanism is established.",
+      "The Agent learned or generalized from one synthetic sequence.",
+      "Product Module startup is supported.",
+      "Linux control-group ownership or installed-package provenance passed in this canary.",
+      "Effectful tools are automatically retry-safe after an unknown provider or process outcome.",
+      "One owner Aether fixture establishes cross-model or cross-provider support."
+    ]
+  },
+  "conditions": {
+    "baselines": [
+      {
+        "id": "no-checkpoint",
+        "description": "The same three-phase Agent and Scheduler path receive only model-operation/v2; no storage or tool-invocation handle exists, so resume must remain explicitly unsupported.",
+        "frozenParameters": {
+          "capabilityTypes": ["model-operation"],
+          "phases": ["checkpoint", "unrelated", "resume"],
+          "maximumModelCalls": 3,
+          "reasoningPolicy": "disable",
+          "outputContract": "json-object"
+        }
+      }
+    ],
+    "treatments": [
+      {
+        "id": "structured-checkpoint",
+        "description": "The Agent receives model-operation/v2 and tool-invocation/v2, stores one closed sourced checkpoint with Host approval, performs task B without tools, then lists and reads the checkpoint to resume.",
+        "frozenParameters": {
+          "capabilityTypes": ["model-operation", "tool-invocation"],
+          "forbiddenCapabilityType": "module-private-storage",
+          "checkpointSchemaVersion": "dolly.task-checkpoint/1",
+          "checkpointKey": "task.release-aurora.checkpoint",
+          "maximumModelCalls": 8,
+          "maximumToolCapabilityInvocations": 5,
+          "toolRounds": 3,
+          "writeApprovalPolicyRevision": "task-checkpoint-policy-v1"
+        }
+      }
+    ]
+  },
+  "data": {
+    "generatorOrDataset": {
+      "id": "synthetic-task-switch-aurora",
+      "version": "1",
+      "contentDefinition": "A fixed task-A checkpoint for release-aurora, an unrelated 29 minus 12 arithmetic task, and a resume request that contains only the task identifier and no task state."
+    },
+    "training": {
+      "name": "memory-v9-historical",
+      "seeds": [101, 302],
+      "caseFactors": [
+        "Historical Memory v9 showed that an explicit structured task checkpoint alone matched the combined candidate on its two exploratory task-resumption cases."
+      ]
+    },
+    "development": {
+      "name": "agent-registry-historical",
+      "seeds": [7427, 7428],
+      "caseFactors": [
+        "Earlier registry canaries established the JSON-object contract, Host registry, live Aether reasoning observation, and strict response validation used unchanged here."
+      ]
+    },
+    "evaluation": {
+      "name": "aurora-sequence",
+      "seeds": [81010, 81011],
+      "caseFactors": [
+        "Seed labels identify the fixed task-A and unrelated task-B inputs inside one paired sequence; the owner Aether endpoint exposes no verified provider seed control."
+      ]
+    },
+    "splitIsolation": "No response from this experiment exists before this version is frozen. Historical Memory and registry runs may motivate the mechanism but are never merged with these case rows or scored as this experiment.",
+    "tuningUsesTrainingAndDevelopmentOnly": true
+  },
+  "backend": {
+    "allowedKinds": ["live"],
+    "requiredKind": "live",
+    "silentFallbackAllowed": false,
+    "credentialsRequired": true,
+    "networkRequired": true
+  },
+  "randomness": {
+    "generator": "Owner self-deployed Aether qwen3.6-27b fixture; temperature is omitted and the provider default is unverified.",
+    "generatorVersion": "owner-aether-qwen3.6-27b-2026-08-10",
+    "streamSeparation": "Each condition receives fresh File Core, storage namespace, tool/effect journals, process/session identifiers, and model request identifiers. The data seed labels are not presented as provider pseudorandom seeds.",
+    "executionOrder": "The single exploratory pair runs no-checkpoint first and structured-checkpoint second so a treatment failure cannot hide the baseline; order effects remain unmeasured and block comparative promotion.",
+    "repetitionsPerCase": 1
+  },
+  "metrics": {
+    "primary": {
+      "name": "paired-task-recovery",
+      "unit": "paired success indicator difference",
+      "aggregation": "structured-checkpoint exact recovery indicator minus no-checkpoint exact recovery indicator for the one frozen task sequence",
+      "direction": "maximize",
+      "population": "The single preregistered synthetic Aurora task-switch pair using the owner Aether qwen3.6-27b live fixture."
+    },
+    "secondary": [
+      {
+        "name": "exact-action-sequence",
+        "unit": "binary indicator",
+        "aggregation": "one only when treatment phases are storage_set then checkpointed, answer, and storage_list then storage_get then resumed",
+        "direction": "maximize",
+        "population": "The treatment condition's three committed Scheduler Runs."
+      },
+      {
+        "name": "actual-reasoning-observation",
+        "unit": "binary indicator",
+        "aggregation": "one only when checkpoint and resume planning responses both contain non-empty reasoning_content decoded as observed reasoning",
+        "direction": "maximize",
+        "population": "The two reasoning-required treatment planning calls."
+      }
+    ],
+    "guardrails": [
+      {
+        "name": "active-context-leakage",
+        "unit": "count",
+        "aggregation": "count of forbidden task-A checkpoint fields in task-B model messages or in the first resume planning messages before storage retrieval",
+        "direction": "zero",
+        "population": "The two task-B calls and first treatment resume planning call."
+      },
+      {
+        "name": "scheduler-boundary-violations",
+        "unit": "count",
+        "aggregation": "count of missing commits, non-distinct Runs, Module generation changes, unsettled effects, journal failures, or recorded child processes still alive",
+        "direction": "zero",
+        "population": "Both conditions, six Scheduler Runs, and all retained effect and tool records."
+      },
+      {
+        "name": "capability-boundary-violations",
+        "unit": "count",
+        "aggregation": "count of raw storage handles, endpoint or credential values, authorization fields, capability handles, or treatment capability inventory drift",
+        "direction": "zero",
+        "population": "Every retained artifact and all model-visible messages."
+      }
+    ],
+    "minimumEffect": {
+      "metric": "paired-task-recovery",
+      "magnitude": 1,
+      "scale": "absolute",
+      "confidenceLevel": 0.8,
+      "intervalMethod": "Descriptive one-pair exploratory canary only; no inferential interval or product promotion.",
+      "comparison": "Treatment must recover the exact nextAction with the checkpoint key as evidence while baseline must return resumed false and no nextAction."
+    }
+  },
+  "execution": {
+    "factorialDesign": "One paired exploratory live sequence: no-checkpoint and structured-checkpoint, each containing checkpoint, unrelated, and resume Scheduler Runs in one process.",
+    "casePlan": [
+      {
+        "id": "evaluation-baseline",
+        "phase": "evaluation",
+        "maximumCount": 1,
+        "requiredWhen": "Always run the no-checkpoint condition first with all three phases.",
+        "formula": "1 condition"
+      },
+      {
+        "id": "evaluation-treatment",
+        "phase": "evaluation",
+        "maximumCount": 1,
+        "requiredWhen": "Run structured-checkpoint only after the baseline condition completes successfully.",
+        "formula": "1 condition"
+      }
+    ],
+    "plannedMaximumCases": 2,
+    "maxCases": 2,
+    "maxEventsPerCase": 3,
+    "maxRawRecordsPerCase": 64,
+    "maxVirtualTimeMsPerCase": 1,
+    "maxWallClockMs": 2100000,
+    "failurePolicy": "Any model, provider, protocol, Scheduler, journal, storage, child-stop, source-hash, artifact, or validation failure makes the whole run failed or inconclusive; no partial case becomes support.",
+    "retryPolicy": "No model-content or provider attempt retry. The descriptor allows one provider attempt."
+  },
+  "stoppingRules": {
+    "plannedCompletion": "Stop after both conditions and all six Scheduler Runs complete, exactly eleven provider calls are retained, and the independent verifier plus all five mutations pass.",
+    "earlyEfficacyStopAllowed": false,
+    "abortConditions": [
+      "Abort on the first non-HTTP-200, timeout, malformed response, exhausted output, Scheduler quarantine, dead letter, incomplete journal, source drift, secret leak, or recorded child that cannot be confirmed stopped.",
+      "Abort before network access unless RUN_LIVE_INTEGRATION=1 and RUN_PAID_INTEGRATION=1 are both explicitly set.",
+      "Abort before network access when the frozen preregistration, protocol, implementation, or production source digest differs."
+    ]
+  },
+  "decisionRules": {
+    "classificationOrder": "First classify any infrastructure, protocol, source, privacy, evidence, or guardrail failure as inconclusive. Otherwise apply the exact treatment and baseline success predicates; no aggregate can override a guardrail.",
+    "supported": [
+      "Candidate-supported only when treatment stores the exact checkpoint, task B answers 17 without context leakage, resume lists and gets the checkpoint, commits the exact nextAction and evidence key, both conditions use three distinct Runs in one process, baseline cannot resume, all effects are terminal, and five mutations are rejected."
+    ],
+    "rejected": [
+      "Rejected when all evidence is structurally valid but treatment does not achieve the exact action sequence or recovery advantage over baseline."
+    ],
+    "inconclusive": [
+      "Inconclusive for any endpoint, transport, timeout, provider finish, malformed output, Scheduler, process, source, journal, artifact, validation, privacy, or boundary failure, or when baseline completes but treatment is not run."
+    ]
+  },
+  "artifacts": {
+    "rootPattern": "artifacts/experiments/probes/scheduler-agent-task-switch-v0/runs/{runId}",
+    "requiredFiles": [
+      "preregistration.json",
+      "provider-responses.jsonl",
+      "model-calls.jsonl",
+      "cases.jsonl",
+      "effect-intents-no-checkpoint.json",
+      "effect-intents-structured-checkpoint.json",
+      "tool-rounds-structured-checkpoint.json",
+      "analysis.json",
+      "run-manifest.json",
+      "validation.json"
+    ],
+    "runManifestFields": [
+      "schemaVersion",
+      "experimentId",
+      "experimentVersion",
+      "runId",
+      "status",
+      "failure",
+      "startedAt",
+      "completedAt",
+      "finishedAt",
+      "sourceCommit",
+      "dirtyWorktree",
+      "preregistrationSha256",
+      "protocolSha256",
+      "implementationSha256",
+      "productionSourceSha256",
+      "dataset",
+      "configuration",
+      "modelEndpointCapabilityProfile",
+      "modelIdentifier",
+      "backend",
+      "seeds",
+      "executionOrder",
+      "conditionOrder",
+      "providerCalls",
+      "maximumProviderCalls",
+      "perCaseAccounting",
+      "resourceBudgets",
+      "rawOutputs",
+      "validatorResults",
+      "aggregateMetrics",
+      "model",
+      "temperatureWire",
+      "providerDefaultSampling",
+      "reasoningControl",
+      "secretLeasesReleased",
+      "productBootstrapModulesRemainRejected",
+      "linuxControlGroupProof",
+      "artifacts"
+    ]
+  },
+  "independentValidation": {
+    "analyzerPath": "scripts/experiments/probes/scheduler-agent-task-switch-v0/verify.mjs",
+    "readsOnlyArtifacts": false,
+    "importsTreatmentImplementation": false,
+    "requiredChecks": [
+      "Read retained artifacts, the frozen preregistration and source bytes, plus configured fixture values only for exact leakage scanning; do not import the runner or Extension.",
+      "Rebuild all eleven provider request messages, max_tokens, response_format, thinking object, model, streaming flag, and omitted temperature from the corresponding model-call inputs.",
+      "Verify exact baseline and treatment phase inputs, actions, results, checkpoint bytes, three distinct Runs, one Module generation, Scheduler completion, exact child stop, terminal effect records, and complete persistent tool rounds.",
+      "Reject any task-A checkpoint field in task-B messages or the first resume planning messages before retrieval.",
+      "Verify every artifact and frozen source digest, token and latency accounting, secret lease release, exact capability inventories, and absence of configured URL, key, authorization, handle, baseUrl, exactUrl, or apiKey fields."
+    ],
+    "mutationTests": [
+      "delete-checkpoint",
+      "leak-task-a-into-task-b",
+      "flip-resume-result",
+      "inject-capability-handle",
+      "remove-artifact-digest"
+    ]
+  },
+  "safetyBoundary": {
+    "productRuntimeUsed": false,
+    "moduleLaunchAllowed": true,
+    "networkAccessAllowed": true,
+    "privateDataAllowed": false,
+    "paidServicesAllowed": true,
+    "knownP0PathReachable": false,
+    "moduleStartupRefusalMustRemain": true
+  },
+  "domainDesign": {
+    "implementationStatus": "Exploratory candidate composition only; not a product Module startup path.",
+    "model": {
+      "endpoint": "Owner Aether fixture loaded only from .env and never retained.",
+      "modelId": "qwen3.6-27b",
+      "reasoningEncoding": "thinking.type enabled or disabled object according to each call",
+      "reasoningEvidence": "Only a non-empty decoded reasoning_content part proves actual reasoning.",
+      "temperature": "Omitted from the wire; provider default is unverified.",
+      "maximumProviderCalls": 11,
+      "maximumOutputTokensAcrossCalls": 19600,
+      "automaticProviderRetries": 0,
+      "maximumExternallyBilledSpendUsd": 0,
+      "spendBasis": "The owner described Aether as self-deployed with no per-call external bill; the runner still requires paid opt-in and enforces the call cap."
+    },
+    "taskSequence": {
+      "checkpointKey": "task.release-aurora.checkpoint",
+      "taskBAnswer": 17,
+      "resumeInputContains": ["phase", "taskId", "request"],
+      "resumeInputOmits": ["objective", "completed", "constraints", "nextAction", "checkpointKey"]
+    },
+    "scheduler": {
+      "singleModuleProcessPerCondition": true,
+      "runsPerCondition": 3,
+      "claimLimitCount": 1,
+      "maxConcurrentModules": 1,
+      "productBootstrapWiring": false,
+      "linuxControlGroupProof": false
+    },
+    "checkpointBoundary": {
+      "schemaVersion": "dolly.task-checkpoint/1",
+      "sourceRequired": true,
+      "writeApprovalRequired": true,
+      "rawStorageHandleVisibleToExtension": false,
+      "associationOrConsolidationIncluded": false
+    },
+    "implementationSha256": {
+      "scripts/experiments/probes/scheduler-agent-task-switch-v0/run.mts": "c427ee119dc1118d341f1112bacb14053a6d03964da59d053432cfe8d61f47fc",
+      "scripts/experiments/probes/scheduler-agent-task-switch-v0/extension.mjs": "61cd7046f9bead8959c5e4d13fedf2acd9212db3d90ff61cb1ce4e91261d8594",
+      "scripts/experiments/probes/scheduler-agent-task-switch-v0/verify.mjs": "90da5addadc14de384df17d37a8c1154878b5d85c89f92c756011f44f75fe214"
+    },
+    "productionSourceSha256": {
+      "src/adapters/extension-effect-run-lifecycle.ts": "60cbab4e1968fedab658aeea5fd5a0fe1110a494842f9f0e2975898660ef3127",
+      "src/adapters/extension-process-module-executor.ts": "3b86baf577ac568348cd84bd0cc4b29f7082969ae9263b66ad52429424d846be",
+      "src/core/capabilities/effect-intent-journal.ts": "09399323b661b327a69cc419f6ca21abfdf2dc3eecdbd020e6391d8c4c63a9e2",
+      "src/core/capabilities/file-effect-intent-store.ts": "33291636b4f81670179e82907a2ec088bc21967033e4288e46386440813ea1ec",
+      "src/core/capabilities/module-private-storage-capability.ts": "8ee39f95851979f7b32e328e8a6bc6220b8a90731beb320b87d54ef88b9b047b",
+      "src/core/extension-process-host.ts": "84e7aa57ad5772c6af4c7054cd2b8a52118236d8912d489684e8aed1caf48722",
+      "src/core/file-core-state-store.ts": "04c9052981cc363dd929ebe037fb904b1d7e884968c6b50d9295f3596f08d30a",
+      "src/core/file-tool-journal-repository.ts": "e0e5392235e06c9ed3797e8c5f10d304d8354af3c505274bc462a6675454d5ec",
+      "src/core/model-provider-broker.ts": "d29ae2a70189a77c9d9b2ab435b4375333795f957046a1c223886f0d634aa933",
+      "src/core/model-provider-chat.ts": "ac2fff57027e0d3088cb11eae9883ec3fce5065a3bba756de444317118f260c1",
+      "src/core/model-provider-descriptor.ts": "710d640db6c52d2f29f5a846a3312279da7d33d09f33c9838d80bb1762e4e42e",
+      "src/core/module-result-commit.ts": "ea08ce8bacb0427c3118743a06b63b55960a86b084245e567b69e836f30f8806",
+      "src/core/module-scheduler.ts": "b1d2691817a83e055ad55619cd3bafe48aabe5888e6e83a368d75ec7ceaf281b",
+      "src/core/provider-capabilities/model-operation-capability.ts": "618e418cc6f67ce24ee23b5f3502e9bbb5ffad0ae47a8ee8c3463d4e7a64cd7d",
+      "src/core/provider-capabilities/tool-invocation-capability.ts": "832345f2c8834269d2ae18a8277ea36db084910c6e18277ebd609901bce4c002",
+      "src/core/reactive-module-host.ts": "ea87ae7f4d2a323a685f21f04bdd2315908eebaae7394c0af5300a207767192e",
+      "src/core/reactive-module-runtime.ts": "5f62b69b7383949325ed56db0c470207031546cb3783a86c411c9b459ff38383",
+      "src/core/runtime-bootstrap.ts": "bb8a47b20a65664011fdeb459b4f2d4a11a506c66d19e1ba0d46a32cdf14afaf",
+      "src/core/tool-policy.ts": "60d3d00ec93c28c402920fe4c0f0ad3e699d7a5b231a8b3d8a40b10674666d58"
+    }
+  }
+}
