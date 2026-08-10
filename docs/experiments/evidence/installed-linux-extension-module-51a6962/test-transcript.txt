@@ -1,0 +1,16 @@
+RUN v4.1.10 /dolly-run
+
+Linux Extension Module executor in a real control group
+
+runs one request and closes the exact authorized process generation
+{"processGenerationId":"process-linux-extension-283-1786339662981","launcherProcessId":317,"moduleCgroupPath":"/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-launcher-integration-276.service/dolly-module-process-linux-extension-283-1786339662981-7d9ab608b3218aa9e4c04566e4c771f5ad0ad7e49a2e07faa5b1301e4f0736e5","result":{"processId":317},"finalRecordState":"stopped","effectEvidence":"no-effect","cgroupRemoved":true,"exactProcessIdentityGone":true}
+
+executes the exact installed package and submission process generation
+{"installedPackageDigest":"sha256:e5ab0e523283fc243a15ac9f7ad3730fe538ebefe60a1c87611fa43e97d2548a","installedEntrypoint":"/dolly-run/.tmp/installed-linux-extension-integration-BvuGxr/installations/packages/e5ab0e523283fc243a15ac9f7ad3730fe538ebefe60a1c87611fa43e97d2548a/extension-process-fixture.mjs","processGenerationId":"process-installed-linux-283-1786339663471","launcherProcessId":332,"moduleCgroupPath":"/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-launcher-integration-276.service/dolly-module-process-installed-linux-283-1786339663471-0fb000c9ae6c6b3971e617f395321573ae45f1a2e5fb273731dfb0a689b7ea7c","finalRecordState":"stopped","cgroupRemoved":true,"exactProcessIdentityGone":true}
+
+Test Files  1 passed (1)
+Tests       2 passed (2)
+Duration    1.50s (transform 512ms, setup 0ms, import 653ms, tests 704ms, environment 0ms)
+
+This is a normalized plain-text copy of the original ANSI-colored Vitest log.
+The SHA-256 of the original log is recorded in sha256sums.txt.
