@@ -535,6 +535,26 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
     for (const moduleId of order) harness.scheduler.register(registrations[moduleId]);
   }
 
+  it("resumes a one-slot mailbox after it drains below a fractional low watermark", async () => {
+    const { clock, mailboxes, scheduler } = createScheduler({ lowWatermarkRatio: 0.5 });
+    mailboxes.set("worker", 1, 10);
+    scheduler.register({
+      moduleId: "worker",
+      runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxPendingCount: 1, maxPendingBytes: 100 },
+    });
+    scheduler.start();
+    await drain(clock);
+    expect(scheduler.status("worker").mailboxFull).toBe(true);
+
+    mailboxes.set("worker", 0, 0);
+    await advance(clock, 100);
+    expect(scheduler.status("worker").mailboxFull).toBe(false);
+    await scheduler.stop();
+  });
+
   it("pauses an upstream Module while a downstream mailbox is at its bound and resumes after it drains", async () => {
     const harness = fanOut();
     registerFanOut(harness, ["producer", "left", "right"]);

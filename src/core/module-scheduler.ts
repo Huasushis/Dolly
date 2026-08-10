@@ -1016,14 +1016,15 @@ export class ModuleScheduler {
     if (!entry.pendingAvailable) return;
     const overCount = entry.pending.pendingCount >= entry.maxPendingCount;
     const overBytes = entry.pending.pendingBytes >= entry.maxPendingBytes;
-    if (!entry.mailboxFull) {
-      entry.mailboxFull = overCount || overBytes;
+    if (overCount || overBytes) {
+      entry.mailboxFull = true;
       return;
     }
+    if (!entry.mailboxFull) return;
     const resumeCount = Math.floor(entry.maxPendingCount * this.#lowWatermarkRatio);
     const resumeBytes = Math.floor(entry.maxPendingBytes * this.#lowWatermarkRatio);
     entry.mailboxFull =
-      entry.pending.pendingCount >= resumeCount || entry.pending.pendingBytes >= resumeBytes;
+      entry.pending.pendingCount > resumeCount || entry.pending.pendingBytes > resumeBytes;
   }
 
   #downstreamPressure(entry: ModuleEntry): readonly DownstreamPressure[] {
