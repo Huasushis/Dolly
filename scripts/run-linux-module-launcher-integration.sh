@@ -53,21 +53,37 @@ else
   TEST_FILES=("$@")
 fi
 
+# The installed-executor integration verifies that the running test process is
+# the service manager's exact MainPID. Worker threads preserve that process
+# identity; a forked Vitest worker would correctly fail the Core binding even
+# though its parent is the service main process.
+VITEST_POOL="forks"
+for test_file in "${TEST_FILES[@]}"; do
+  if [ "${test_file}" = "tests/conformance/security/linux-extension-module-executor-integration.test.ts" ]; then
+    VITEST_POOL="threads"
+  fi
+done
+
 exec systemd-run \
   --user \
   --quiet \
   --pipe \
   --wait \
   --collect \
+  --expand-environment=no \
   "--unit=${UNIT_NAME}" \
   -p Delegate=yes \
   -p DelegateSubgroup=core \
   -p Type=exec \
+  -p Restart=on-failure \
+  -p StartLimitBurst=1 \
+  -p StartLimitIntervalSec=60 \
   --setenv=DOLLY_LINUX_MODULE_INTEGRATION_REQUIRED=1 \
+  "--setenv=DOLLY_LINUX_MODULE_INTEGRATION_UNIT=${UNIT_NAME}.service" \
   "--working-directory=${REPOSITORY_ROOT}" \
   -- \
   "${NODE_PATH_RESOLVED}" "${VITEST_ENTRY}" run \
   --config vitest.config.ts \
-  --pool=forks \
+  "--pool=${VITEST_POOL}" \
   --maxWorkers=1 \
   "${TEST_FILES[@]}"

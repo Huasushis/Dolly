@@ -118,6 +118,11 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     installations: options.installations,
     configurations: options.configurations,
   });
+  if (resolvedModule.module.isolation !== "process") {
+    throw new TypeError(
+      "Installed Linux Extension executor requires process isolation in the instance configuration",
+    );
+  }
   const { identity } = options.lifecycle;
   if (
     identity.instanceId !== resolvedModule.instanceId ||

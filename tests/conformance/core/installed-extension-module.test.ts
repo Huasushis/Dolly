@@ -444,6 +444,17 @@ describe("installed Extension Module resolution", () => {
         serviceInvocationId: "not-a-systemd-invocation",
       },
     })).toThrow(/serviceInvocationId must be the 32 lower-case hexadecimal digits/u);
+    const sandboxConfiguration = validateDollyInstanceConfig({
+      ...base.instanceConfiguration,
+      modules: base.instanceConfiguration.modules.map((module) => ({
+        ...module,
+        isolation: "sandbox",
+      })),
+    });
+    expect(() => deriveInstalledLinuxExtensionModuleExecutor({
+      ...base,
+      instanceConfiguration: sandboxConfiguration,
+    })).toThrow(/requires process isolation in the instance configuration/u);
 
     const untrustedSource = resolve(scratch, "source-v2-untrusted");
     writePackage(untrustedSource, "2.0.0");
