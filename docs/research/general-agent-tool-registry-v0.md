@@ -29,6 +29,7 @@ fixture.
 | registry-v5-b | Effect complete; invalid confirmation | The single allowed replacement completed 4/4 cases and 10/10 calls; both treatments recovered `EMBER-7421`, both baselines withheld it, and all four exact-Run effect journals closed. The frozen verifier then incorrectly treated key-order-equivalent JSON objects as different. |
 | registry-v6-a | Inconclusive | Three cases completed and both treatments executed `storage_list -> storage_get -> answer`; the last baseline call returned HTTP 504. One treatment cited tool operation names instead of the retrieved source key, exposing a real grounding-contract weakness even before the infrastructure stop. |
 | registry-v6-b | Infrastructure-inconclusive | The only allowed replacement stopped on HTTP 504 in the first treatment action call. No third run was started. |
+| registry-v7 | Candidate-supported | After the owner raised the former Nginx 120-second gateway timeout to 24 hours, the fresh preregistered run completed 4/4 cases and 10/10 strict SSE calls. Both treatments recovered the value from `deployment-note`, both baselines withheld it, and the independent verifier rejected 22/22 mutations. Dolly retained its own 180-second call deadline. |
 
 No model-content failure was retried. Each version used at most its one
 separately identified whole-run replacement allowed by the frozen
@@ -90,7 +91,8 @@ schema alone.
 ## Engineering decisions
 
 1. Keep separate calls for text reasoning and JSON actions on this endpoint.
-   Non-empty `reasoning_content` is required only for the planning call.
+   Require strict SSE for every Agent chat call on this verified model profile;
+   non-empty `reasoning_content` is required only for the planning call.
 2. Treat planning text as untrusted context. Authority remains the Host registry,
    active-Run capability scope, ToolPolicySession, and closed action validator.
 3. Require final `answer` to be one non-empty string. Object-valued answers,
@@ -134,3 +136,39 @@ recovery evidence source, and requires the committed Run to reopen as
 then exercised fresh seeds 7427/7428 and exposed both endpoint 504 instability
 and the source-identity grounding counterexample. Neither version rewrites or
 reclassifies earlier evidence.
+
+## Registry-v7 streamed confirmation
+
+Run `registry-v7-20260810a`, frozen at source commit `af86487`, is the first
+complete independently validated confirmation for this narrow read-only Agent
+effect:
+
+- 4/4 Scheduler cases committed; 10/10 model calls and 10/10 secret leases
+  completed with no retry, model error, or provider error.
+- Every request sent `stream: true` and
+  `stream_options: {"include_usage":true}`. Every response had
+  `text/event-stream`, exactly one terminal `[DONE]`, one terminal usage event,
+  and `finish_reason=stop`; no non-stream fallback exists in this version.
+- The retained raw responses contain 603 SSE events and 125,971 UTF-8 bytes.
+  Independent reconstruction matched every normalized final answer and
+  reasoning response.
+- The two required-reasoning planning calls contained 4,105 and 1,006
+  characters of non-empty `reasoning_content`. Disabled-reasoning action and
+  answer calls contained none.
+- Both treatments used only `model-operation/v2` and `tool-invocation/v2`, ran
+  `storage_list -> storage_get -> answer`, returned the string `EMBER-7421`,
+  set `grounded=true`, and cited `deployment-note`. Both baselines omitted the
+  hidden value and set `grounded=false`.
+- Provider usage was present in 10/10 streams: 7,951 prompt tokens, 1,780
+  completion tokens, 9,731 total. Aggregate recorded model-call latency was
+  66,705 ms and the full run wall time was about 67.7 seconds. Currency cost
+  remains unmeasured.
+- Four file-backed tool/effect journals reopened with terminal exact-Run
+  evidence. The verifier rejected all 22 named mutations, including changing a
+  call to non-streaming and removing `[DONE]` after recomputing dependent
+  hashes.
+
+This confirms the requested effect for one private Aether deployment and a
+read-only tool pair. It does not prove native provider tool calling, arbitrary
+tools, effectful crash-safe recovery, delegated Linux control-group ownership,
+cross-model generality, or supported product Module startup.
