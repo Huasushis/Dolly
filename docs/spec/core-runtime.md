@@ -1964,9 +1964,40 @@ The protocol design maps that idempotency key to a `moduleJobId`; retries
 preserve it while individual Run identifiers change. Duplicate submission with
 the same live idempotency key MUST NOT create a second source Module job.
 
-This mapping is not implemented by the current Delivery-based result commit
-coordinator. Source and manual activation remain specified future behavior and
-MUST be rejected by the first runtime as stated in Section 9.3.
+`SourceActivationQueue` is the current pre-product persistence candidate. In
+ordinary terms, it stores a no-input request as one Core-owned Block and one
+Delivery on a private Page subscribed only by the exact Module. The Module still
+has no public input Page: instance configuration and Extension output routing
+cannot name this private Page. The representation deliberately reuses the
+existing Claim, retry, result-commit, resident-capacity, and restart rules
+instead of creating a second execution state machine.
+
+The private Block payload has schema `dolly.source-activation/1` and the closed
+shape below. `body` is bounded canonical JSON supplied by the trusted request
+producer, not an instruction interpreted by Core.
+
+```json
+{
+  "schemaVersion": "dolly.source-activation/1",
+  "moduleId": "the exact configured Module",
+  "idempotencyKey": "the stable producer key",
+  "body": {}
+}
+```
+
+Block commit and Delivery append use stable effects derived from `moduleId` and
+`idempotencyKey` and MUST become durable in one Core-state update. An exact
+duplicate returns the existing Delivery even when the queue is full. Reusing a
+key with different content is a conflict. Capacity counts both pending and
+claimed requests and measures the canonical bytes of the complete request
+envelopes. A private Page with another consumer, a foreign producer, another
+payload schema, or a missing Block fails closed.
+
+This candidate does not by itself support source execution. The Scheduler and
+installed runtime do not yet receive an unforgeable, store-bound private-route
+handoff, and no product coordinator owns request admission during startup or
+shutdown. Source and manual activation therefore remain rejected by Scheduler
+registration and by the configured-Module bootstrap as stated in Section 9.3.
 
 A source MUST still obey actor serialization, mailbox bounds, generation
 fencing, output transactions, and backpressure. Downstream congestion may delay
