@@ -553,8 +553,23 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           },
         },
       });
-      expect(reopened.deliveries.inspectPending(DRAINER_MODULE_ID, ["output"]).pendingCount)
-        .toBe(1);
+      const reopenedDrainerResident = reopened.deliveries.inspectResident(
+        DRAINER_MODULE_ID,
+        ["output"],
+      );
+      const reopenedDeliverySnapshot = reopened.deliveries.snapshot();
+      console.info(JSON.stringify({
+        shutdownDrainerDiagnostic: {
+          resident: reopenedDrainerResident,
+          jobs: reopenedDeliverySnapshot.moduleJobs.filter((job) =>
+            job.consumerId === DRAINER_MODULE_ID
+          ),
+          claims: reopenedDeliverySnapshot.claims,
+          submissions: reopened.listModuleSubmissionRecords(),
+        },
+      }));
+      expect(reopenedDrainerResident)
+        .toMatchObject({ residentCount: 1, pendingCount: 1, claimedCount: 0 });
       expect(reopened.deliveries.inspectPending(SECOND_MODULE_ID, ["middle"]).pendingCount)
         .toBe(0);
       expect(reopened.deliveries.inspectPending(FIRST_MODULE_ID, ["input"]).pendingCount)
