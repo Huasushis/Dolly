@@ -1618,7 +1618,7 @@ export class ModuleScheduler {
     const lastProgressAt = this.#lastProgressAt ?? now;
     const stalledForMs = now - lastProgressAt;
     const workWaiting = entries.some((entry) =>
-      entry.pending.pendingCount > 0 &&
+      (entry.pending.pendingCount > 0 || entry.outputCommitWaiting) &&
       entry.quarantineReason === null &&
       !(
         entry.activation.kind === "periodic" &&

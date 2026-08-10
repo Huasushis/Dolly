@@ -785,6 +785,42 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
     expect(events.filter((event) => event.type === "scheduler.no_progress")).toHaveLength(1);
     await scheduler.stop();
   });
+
+  it("detects no progress while an accepted result remains output-backpressured", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler({
+      noProgressAfterMs: 1_000,
+      retryBaseMs: 250,
+      retryMaxMs: 1_000,
+      retryJitterRatio: 0,
+    });
+    const runtime = new FakeModuleRuntime(() => outputBackpressuredResult(1));
+    mailboxes.set("worker", 1, 100);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: ["output"],
+      mailbox: { maxPendingCount: 100, maxPendingBytes: 100_000 },
+    });
+    scheduler.start();
+    await drain(clock);
+
+    expect(runtime.tickCount).toBe(1);
+    // The input is now held by the active Claim, so no pending Delivery is
+    // left even though the exact accepted output still needs capacity.
+    mailboxes.set("worker", 0, 0);
+    await advance(clock, 999);
+    expect(scheduler.instanceStatus().noProgressActive).toBe(false);
+    await advance(clock, 101);
+
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toEqual([
+      expect.objectContaining({
+        blockedEdges: [{ moduleId: "worker", blockedBy: ["sink"] }],
+      }),
+    ]);
+    expect(scheduler.instanceStatus().noProgressActive).toBe(true);
+    await scheduler.stop();
+  });
 });
 
 describe("CORE scheduler policy boundary", () => {
