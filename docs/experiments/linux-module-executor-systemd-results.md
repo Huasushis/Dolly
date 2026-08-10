@@ -21,6 +21,46 @@ Both passing runs used a clean checkout of the same commit. The retained
 environment record reports a cgroup version 2 filesystem, Python 3.12.3, and
 an enabled systemd user manager with lingering.
 
+## 2026-08-10 authorized-process identity regression
+
+At source commit `de25be0bdb5cff57f392b1c6d64c3ffe52bac1e5`, a new
+object-identity test required the ordered Linux start result to retain the exact
+launcher whose membership was verified. The Linux executor now passes that
+launcher, the same verified Module control group, and the same durable starting
+record to its protocol-session factory. The platform-independent Linux
+lifecycle regression passed 99 tests; two kernel-only tests were skipped in the
+ordinary host shell as required.
+
+The committed source was then archived into the uniquely named disposable
+systemd container `dolly-experiment-813305-36e03163`. Two exact Linux test files
+passed all 3 tests as the unprivileged `dolly` account:
+
+- `linux-module-attached-process-integration.test.ts` proved real control-group
+  descendant termination and the Extension protocol over the launcher's
+  standard streams; and
+- `linux-module-executor-systemd-integration.test.ts` proved the executor's
+  nonzero Core-exit path and systemd cleanup of the unowned launcher.
+
+The runner removed that exact container and its exact image. Raw output remains
+under
+`artifacts/experiments/linux-core-service-ownership/container-813305-20260810T025909Z/`
+in the controlled workspace. Its key hashes are:
+
+- `linux-integration.log`:
+  `430949acb965991bd4b0ff9b1ef3761971663b0040006b598a4db841bdcf6ed9`;
+- `source-commit.txt`:
+  `ec90926fe8357b442546f4d19276d2fae211367223c9d5222909496285e0f3d7`;
+- `environment.txt`:
+  `4c66ed875461b8796fc11fdb7f45f40d4d34a120b081b8afa1e6977bd942d3d5`;
+  and
+- `preflight.txt`:
+  `ecf7fce3780e2b756cfc847409343f9dc3196b8e6f9da072679da4c713411c36`.
+
+This is a regression result, not the missing end-to-end product assembly. The
+two real-Linux files exercise the executor and attached host in separate paths;
+no startup caller yet constructs a real `ExtensionProcessHost` from the exact
+authorized-process object.
+
 ## Failure path exercised
 
 The launcher fixture deliberately does not write its process identifier to the
