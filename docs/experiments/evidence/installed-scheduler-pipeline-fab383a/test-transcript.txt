@@ -1,0 +1,13 @@
+RUN v4.1.10 /dolly-run
+
+installed reactive Module host in a real control group
+
+auto-wakes two installed process Modules and reopens their committed pipeline
+{"packageDigest":"sha256:33baac74475b868d235f7d21c2a25b555f5ac3ebc2be1503b7f2cacf6b7b5e40","processGenerationIds":["scheduler-first-process-283-1786341017162","scheduler-second-process-283-1786341017162"],"moduleCgroupPaths":["/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-launcher-integration-276.service/dolly-module-scheduler-first-process-283-1786341017162-375e5eaf334e7860c6d9a98073462f327cacdf7687c2cfa34a1e730685d98c98","/sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/dolly-test-launcher-integration-276.service/dolly-module-scheduler-second-process-283-1786341017162-48536e513fb886bb7ad632b48edc8c94a282eee1030092cf37cafd8045fa00cb"],"initialEmptyDecisionsObserved":2,"configuredPollIntervalMs":60000,"outputCommittedWithinMs":5000,"committedModuleResults":2,"finalRecordStates":["stopped","stopped"],"cgroupsRemoved":true,"reopenedOutput":"second:1"}
+
+Test Files  1 passed (1)
+Tests       1 passed (1)
+Duration    1.75s (transform 554ms, setup 0ms, import 700ms, tests 903ms, environment 0ms)
+
+This is a normalized plain-text copy of the original ANSI-colored Vitest log.
+The SHA-256 of the original log is recorded in sha256sums.txt.
