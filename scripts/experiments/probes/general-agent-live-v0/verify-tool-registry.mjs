@@ -12,11 +12,11 @@ const workspaceTemporaryRoot = resolve(repositoryRoot, "..", ".tmp");
 const verifierPath = fileURLToPath(import.meta.url);
 const artifactRoot = join(
   repositoryRoot,
-  "artifacts/experiments/probes/general-agent-tool-registry-v3",
+  "artifacts/experiments/probes/general-agent-tool-registry-v4",
 );
 const sourcePreregistrationPath = join(
   repositoryRoot,
-  "docs/experiments/preregistrations/general-agent-tool-registry-v3.json",
+  "docs/experiments/preregistrations/general-agent-tool-registry-v4.json",
 );
 const extensionSourcePath = join(scriptDirectory, "extension.mjs");
 const HIDDEN_CODENAME = "EMBER-7421";
@@ -26,10 +26,14 @@ const IMPLEMENTATION_PATHS = [
   "scripts/experiments/probes/general-agent-live-v0/verify-tool-registry.mjs",
 ];
 const PRODUCTION_PATHS = [
+  "src/adapters/extension-effect-run-lifecycle.ts",
   "src/adapters/extension-process-module-executor.ts",
+  "src/core/capabilities/effect-intent-journal.ts",
+  "src/core/capabilities/file-effect-intent-store.ts",
   "src/core/delivery-store.ts",
   "src/core/extension-process-host.ts",
   "src/core/file-core-state-store.ts",
+  "src/core/file-tool-journal-repository.ts",
   "src/core/model-provider-broker.ts",
   "src/core/model-provider-chat.ts",
   "src/core/model-provider-descriptor.ts",
@@ -102,11 +106,11 @@ function parseArguments(argv) {
   if (
     (argv.length !== 2 && argv.length !== 3 && argv.length !== 5) ||
     argv[0] !== "--run-id" ||
-    !/^registry-v4-[A-Za-z0-9._-]+$/u.test(argv[1]) ||
+    !/^registry-v5-[A-Za-z0-9._-]+$/u.test(argv[1]) ||
     (argv.length >= 3 && argv[2] !== "--check-only") ||
     (argv.length === 5 && argv[3] !== "--run-directory")
   ) {
-    fail("usage: verify-tool-registry.mjs --run-id registry-v4-<identifier> [--check-only [--run-directory <workspace-temp-run>]]");
+    fail("usage: verify-tool-registry.mjs --run-id registry-v5-<identifier> [--check-only [--run-directory <workspace-temp-run>]]");
   }
   const runId = argv[1];
   let runDirectory;
@@ -232,10 +236,10 @@ function verifyPerCaseAccounting(accounting, modelRows, providerRows) {
   }
   const spans = [[0, 1], [1, 5], [5, 9], [9, 10]];
   const expectedConditions = [
-    [7423, 1, "no-storage-tool"],
-    [7423, 1, "tool-registry-storage"],
-    [7424, 2, "tool-registry-storage"],
-    [7424, 2, "no-storage-tool"],
+    [7425, 1, "no-storage-tool"],
+    [7425, 1, "tool-registry-storage"],
+    [7426, 2, "tool-registry-storage"],
+    [7426, 2, "no-storage-tool"],
   ];
   accounting.forEach((entry, index) => {
     const [start, end] = spans[index];
@@ -440,16 +444,16 @@ function verifyModelCalls(rows) {
   exactArray(
     rows.map((row) => row.requestId),
     [
-      "agent-no-storage-tool-seed-7423-model-request-1",
-      "agent-tool-registry-storage-seed-7423-model-request-1",
-      "agent-tool-registry-storage-seed-7423-model-request-2",
-      "agent-tool-registry-storage-seed-7423-model-request-3",
-      "agent-tool-registry-storage-seed-7423-model-request-4",
-      "agent-tool-registry-storage-seed-7424-model-request-1",
-      "agent-tool-registry-storage-seed-7424-model-request-2",
-      "agent-tool-registry-storage-seed-7424-model-request-3",
-      "agent-tool-registry-storage-seed-7424-model-request-4",
-      "agent-no-storage-tool-seed-7424-model-request-1",
+      "agent-no-storage-tool-seed-7425-model-request-1",
+      "agent-tool-registry-storage-seed-7425-model-request-1",
+      "agent-tool-registry-storage-seed-7425-model-request-2",
+      "agent-tool-registry-storage-seed-7425-model-request-3",
+      "agent-tool-registry-storage-seed-7425-model-request-4",
+      "agent-tool-registry-storage-seed-7426-model-request-1",
+      "agent-tool-registry-storage-seed-7426-model-request-2",
+      "agent-tool-registry-storage-seed-7426-model-request-3",
+      "agent-tool-registry-storage-seed-7426-model-request-4",
+      "agent-no-storage-tool-seed-7426-model-request-1",
     ],
     "model request ids",
   );
@@ -629,7 +633,7 @@ function refreshManifestArtifactDigests(runDirectory, names) {
 
 function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
   mkdirSync(workspaceTemporaryRoot, { recursive: true, mode: 0o700 });
-  const mutationRoot = mkdtempSync(join(workspaceTemporaryRoot, "registry-v4-mutations-"));
+  const mutationRoot = mkdtempSync(join(workspaceTemporaryRoot, "registry-v5-mutations-"));
   const mutations = [
     {
       id: "capability-type-raw-storage",
@@ -856,7 +860,7 @@ function main() {
   const manifest = json(manifestPath);
   if (
     manifest.schemaVersion !== "general-agent-live/run-manifest/1" ||
-    manifest.experimentId !== "general-agent-tool-registry-v3" ||
+    manifest.experimentId !== "general-agent-tool-registry-v4" ||
     manifest.experimentVersion !== 4 ||
     manifest.runId !== runId ||
     manifest.status !== "completed"
@@ -911,12 +915,12 @@ function main() {
   ) {
     fail("preregistration validation inputs or dataset identity are invalid");
   }
-  exactArray(manifest.seeds, [7423, 7424], "manifest evaluation seeds");
+  exactArray(manifest.seeds, [7425, 7426], "manifest evaluation seeds");
   const expectedExecutionOrder = [
-    { evaluationSeed: 7423, repetition: 1, conditionId: "no-storage-tool" },
-    { evaluationSeed: 7423, repetition: 1, conditionId: "tool-registry-storage" },
-    { evaluationSeed: 7424, repetition: 2, conditionId: "tool-registry-storage" },
-    { evaluationSeed: 7424, repetition: 2, conditionId: "no-storage-tool" },
+    { evaluationSeed: 7425, repetition: 1, conditionId: "no-storage-tool" },
+    { evaluationSeed: 7425, repetition: 1, conditionId: "tool-registry-storage" },
+    { evaluationSeed: 7426, repetition: 2, conditionId: "tool-registry-storage" },
+    { evaluationSeed: 7426, repetition: 2, conditionId: "no-storage-tool" },
   ];
   if (JSON.stringify(manifest.executionOrder) !== JSON.stringify(expectedExecutionOrder)) {
     fail("manifest execution order differs from the preregistered order");
@@ -956,10 +960,10 @@ function main() {
 
   const cases = jsonLines(casesPath);
   if (cases.length !== 4) fail(`expected 4 cases, observed ${cases.length}`);
-  verifyBaseline(cases[0], 7423, 1);
-  verifyTreatment(cases[1], 7423, 1);
-  verifyTreatment(cases[2], 7424, 2);
-  verifyBaseline(cases[3], 7424, 2);
+  verifyBaseline(cases[0], 7425, 1);
+  verifyTreatment(cases[1], 7425, 1);
+  verifyTreatment(cases[2], 7426, 2);
+  verifyBaseline(cases[3], 7426, 2);
   const modelCalls = jsonLines(modelCallsPath);
   verifyModelCalls(modelCalls);
   const providerResponses = jsonLines(providerResponsesPath);
@@ -1030,7 +1034,7 @@ function main() {
 
   const verification = {
     schemaVersion: "general-agent-tool-registry/validation/1",
-    experimentId: "general-agent-tool-registry-v3",
+    experimentId: "general-agent-tool-registry-v4",
     experimentVersion: 4,
     runId,
     valid: true,

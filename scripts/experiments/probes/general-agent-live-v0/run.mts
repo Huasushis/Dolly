@@ -13,7 +13,13 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createExtensionEffectJournalLifecycle } from "../../../../src/adapters/extension-effect-run-lifecycle.js";
 import { createExtensionProcessModuleExecutor } from "../../../../src/adapters/extension-process-module-executor.js";
+import {
+  EffectIntentJournal,
+  effectIntentEvidenceSource,
+} from "../../../../src/core/capabilities/effect-intent-journal.js";
+import { FileEffectIntentStore } from "../../../../src/core/capabilities/file-effect-intent-store.js";
 import {
   createModulePrivateStorageCapability,
   ModulePrivateStorageBackend,
@@ -92,10 +98,14 @@ const REGISTRY_EXPERIMENT_IMPLEMENTATION_PATHS = [
   "scripts/experiments/probes/general-agent-live-v0/verify-tool-registry.mjs",
 ] as const;
 const REGISTRY_EXPERIMENT_PRODUCTION_PATHS = [
+  "src/adapters/extension-effect-run-lifecycle.ts",
   "src/adapters/extension-process-module-executor.ts",
+  "src/core/capabilities/effect-intent-journal.ts",
+  "src/core/capabilities/file-effect-intent-store.ts",
   "src/core/delivery-store.ts",
   "src/core/extension-process-host.ts",
   "src/core/file-core-state-store.ts",
+  "src/core/file-tool-journal-repository.ts",
   "src/core/model-provider-broker.ts",
   "src/core/model-provider-chat.ts",
   "src/core/model-provider-descriptor.ts",
@@ -138,7 +148,8 @@ interface AgentExperimentConfiguration {
     | "general-agent-tool-registry-v0"
     | "general-agent-tool-registry-v1"
     | "general-agent-tool-registry-v2"
-    | "general-agent-tool-registry-v3";
+    | "general-agent-tool-registry-v3"
+    | "general-agent-tool-registry-v4";
   readonly experimentVersion: number;
   readonly modelCapabilityVersion: 1 | 2;
   readonly separatePlanningCall: boolean;
@@ -634,8 +645,51 @@ function parseArguments(argv: readonly string[]): AgentExperimentConfiguration {
       ],
     };
   }
+  if (/^registry-v5-[A-Za-z0-9._-]+$/u.test(runId)) {
+    return {
+      experimentId: "general-agent-tool-registry-v4",
+      experimentVersion: 5,
+      modelCapabilityVersion: 2,
+      separatePlanningCall: true,
+      runId,
+      artifactRoot: join(
+        repositoryRoot,
+        "artifacts/experiments/probes/general-agent-tool-registry-v4",
+      ),
+      preregistrationPath: join(
+        repositoryRoot,
+        "docs/experiments/preregistrations/general-agent-tool-registry-v4.json",
+      ),
+      executionOrder: [
+        {
+          evaluationSeed: 7425,
+          repetition: 1,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7425",
+        },
+        {
+          evaluationSeed: 7425,
+          repetition: 1,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7425",
+        },
+        {
+          evaluationSeed: 7426,
+          repetition: 2,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7426",
+        },
+        {
+          evaluationSeed: 7426,
+          repetition: 2,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7426",
+        },
+      ],
+    };
+  }
   throw new Error(
-    "usage: run.mts --run-id live-v8-<identifier>|registry-v1-<identifier>|registry-v2-<identifier>|registry-v3-<identifier>|registry-v4-<identifier>",
+    "usage: run.mts --run-id live-v8-<identifier>|registry-v1-<identifier>|registry-v2-<identifier>|registry-v3-<identifier>|registry-v4-<identifier>|registry-v5-<identifier>",
   );
 }
 
@@ -1006,6 +1060,16 @@ async function runCondition(options: {
     const toolJournalRepository = new FileToolJournalRepository({
       path: join(conditionRoot, "tool-rounds.json"),
     });
+    const effectJournal = new EffectIntentJournal({
+      store: new FileEffectIntentStore({
+        path: join(conditionRoot, "effect-intents.json"),
+      }),
+      now: () => NOW,
+    });
+    const effectRunLifecycle = createExtensionEffectJournalLifecycle({
+      journal: effectJournal,
+      getModuleSubmissionRecord: (runId) => core.getModuleSubmissionRecord(runId),
+    });
     const commits = createModuleResultCommitCoordinator({
       core,
       repository,
@@ -1050,6 +1114,7 @@ async function runCondition(options: {
       maxRunsPerGeneration: 2,
       maxGenerations: 1,
       declaredExternalEffects: "core-capabilities-only",
+      externalEffectEvidence: effectIntentEvidenceSource(effectJournal),
       deliveries: runtimeDeliveries,
       persistModuleSubmission: (request) => {
         if (!processGenerationId) throw new Error("process generation is not ready");
@@ -1104,6 +1169,7 @@ async function runCondition(options: {
           forceKillDelayMs: 500,
           terminationTimeoutMs: 5_000,
           nextIdentifier: (purpose) => `${purpose}-${caseIdentity}-${++identifierSequence}`,
+          effectRunLifecycle,
         });
         processGenerationId = extensionHost.snapshot.processGenerationId;
         core.appendModuleProcessRecord({
@@ -1360,6 +1426,16 @@ async function runCondition(options: {
       core.deliveries.inspectPending(moduleId, ["input"]).pendingCount === 0 &&
       core.deliveries.inspectPending("sink", ["output"]).pendingCount === 1 &&
       core.listModuleSubmissionRecords().length === 0;
+    const effectEvidence = effectJournal.evidenceForRun(committed);
+    const reopenedEffectEvidence = new EffectIntentJournal({
+      store: new FileEffectIntentStore({
+        path: join(conditionRoot, "effect-intents.json"),
+      }),
+      now: () => NOW,
+    }).evidenceForRun(committed);
+    if (effectEvidence.kind !== "terminal" || reopenedEffectEvidence.kind !== "terminal") {
+      throw new Error("Agent capability effects were not durably closed for the committed Run");
+    }
 
     await host.stop();
     const childStopped = !processIsAlive(childPid);

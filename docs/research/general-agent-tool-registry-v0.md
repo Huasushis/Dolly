@@ -87,4 +87,9 @@ both rounds terminal without changing the two tool executions. The journal now
 binds each Module job to one registry digest and approval-policy revision. This
 is read-only crash-recovery infrastructure, not evidence that an effectful tool
 is safe after a crash between its external effect and terminal journal update;
-no new paid canary has been run for this candidate yet.
+no new paid canary has been run for this candidate yet. The `registry-v5`
+runner additionally routes every model and tool capability invocation through
+the Host-owned persistent effect lifecycle, supplies the same journal as the
+Runtime recovery evidence source, and requires the committed Run to reopen as
+`terminal`. Fresh evaluation seeds 7425 and 7426 are reserved for that future
+run; they do not rewrite or reclassify registry-v4 evidence.
