@@ -33,9 +33,9 @@ function capability(capabilityType) {
   return initialized.capabilities.find((entry) => entry.capabilityType === capabilityType);
 }
 
-function modelChatArguments(model, argumentsValue) {
+function modelChatArguments(model, argumentsValue, outputKind = "json-object") {
   if (model.capabilityVersion === "v2") {
-    return { ...argumentsValue, outputContract: { kind: "json-object" } };
+    return { ...argumentsValue, outputContract: { kind: outputKind } };
   }
   return argumentsValue;
 }
@@ -72,11 +72,11 @@ function invokeCapability(descriptor, operation, argumentsValue, run, idempotenc
   return operationPromise;
 }
 
-function parseModelObject(text) {
+function parseModelObject(text, allowFenced) {
   if (typeof text !== "string" || text.trim() === "") throw new Error("empty model content");
   let normalized = text.trim();
   const fenced = /^```json[ \t]*\r?\n([\s\S]*?)\r?\n```$/u.exec(normalized);
-  if (fenced) normalized = fenced[1];
+  if (fenced && allowFenced) normalized = fenced[1];
   else if (normalized.startsWith("```") || normalized.endsWith("```")) {
     throw new Error("model content contains an unsupported code fence");
   }
@@ -87,11 +87,34 @@ function parseModelObject(text) {
   return value;
 }
 
-function strictObject(text, allowed) {
-  const value = parseModelObject(text);
+function strictObject(text, allowed, allowFenced) {
+  const value = parseModelObject(text, allowFenced);
   const keys = Object.keys(value).sort();
   if (JSON.stringify(keys) !== JSON.stringify([...allowed].sort())) {
     throw new Error("model content keys do not match the action contract");
+  }
+  return value;
+}
+
+function strictAnswer(text, includeAction, allowFenced) {
+  const allowed = includeAction
+    ? ["action", "answer", "grounded", "evidenceKeys"]
+    : ["answer", "grounded", "evidenceKeys"];
+  const value = strictObject(text, allowed, allowFenced);
+  if (includeAction && value.action !== "answer") {
+    throw new Error("final model action is not answer");
+  }
+  if (typeof value.answer !== "string" || value.answer.trim() === "") {
+    throw new Error("final model answer is not a non-empty string");
+  }
+  if (typeof value.grounded !== "boolean") {
+    throw new Error("final model grounded flag is not boolean");
+  }
+  if (
+    !Array.isArray(value.evidenceKeys) ||
+    value.evidenceKeys.some((key) => typeof key !== "string" || key === "")
+  ) {
+    throw new Error("final model evidenceKeys is not an array of non-empty strings");
   }
   return value;
 }
@@ -213,11 +236,29 @@ function successfulToolObservation(value, registry, callId, name, roundIndex) {
 async function runAgent(params) {
   const model = capability("model-operation");
   if (!model) throw new Error("model-operation capability is absent");
+  const modelDescription = model.operations.includes("describe")
+    ? await invokeCapability(
+        model,
+        "describe",
+        {},
+        params,
+        `${params.moduleJobId}:model-description`,
+      )
+    : null;
+  const modelOutputContracts = Array.isArray(modelDescription?.outputContracts)
+    ? [...modelDescription.outputContracts]
+    : model.capabilityVersion === "v1"
+      ? ["text"]
+      : [];
+  const separatePlanningCall =
+    modelOutputContracts.includes("text") &&
+    modelOutputContracts.includes("json-object");
   const storage = capability("module-private-storage");
   const toolInvocation = capability("tool-invocation");
   const task = taskText(params.input);
   const observations = [];
   const reasoningObserved = [];
+  const allowFencedModelJson = model.capabilityVersion !== "v2";
 
   if (!storage && !toolInvocation) {
     const result = await invokeCapability(
@@ -229,7 +270,7 @@ async function runAgent(params) {
             role: "system",
             parts: [{
               kind: "text",
-              text: "You are a grounded task Agent. No tools or evidence are available. Never guess hidden values. Return exactly JSON with keys answer, grounded, evidenceKeys. grounded must be false and evidenceKeys must be an empty array.",
+              text: "You are a grounded task Agent. No tools or evidence are available. Never guess hidden values. Return exactly JSON with keys answer, grounded, evidenceKeys. answer must be one non-empty string, grounded must be false, and evidenceKeys must be an empty array.",
             }],
           },
           { role: "user", parts: [{ kind: "text", text: task }] },
@@ -242,12 +283,13 @@ async function runAgent(params) {
       `${params.moduleJobId}:model-baseline`,
     );
     const output = modelOutput(result);
-    const answer = strictObject(output.finalContent, ["answer", "grounded", "evidenceKeys"]);
+    const answer = strictAnswer(output.finalContent, false, allowFencedModelJson);
     return {
       conditionId: "no-storage-tool",
       task,
       actions: ["answer"],
       capabilityContracts: capabilityContracts(),
+      modelOutputContracts,
       answer,
       reasoningObserved: output.reasoning?.state === "observed",
       childCredentialEnvironmentPresent:
@@ -267,6 +309,45 @@ async function runAgent(params) {
       ),
       params.moduleJobId,
     );
+    let planningNote = "";
+    if (separatePlanningCall) {
+      const planningResult = await invokeCapability(
+        model,
+        "chat",
+        modelChatArguments(model, {
+          messages: [
+            {
+              role: "system",
+              parts: [{
+                kind: "text",
+                text: [
+                  "Plan a grounded tool-use sequence for the task using only the Host registry.",
+                  "Return one short plain-text plan. Do not guess hidden values.",
+                  `Registry: ${JSON.stringify(registry)}`,
+                ].join(" "),
+              }],
+            },
+            { role: "user", parts: [{ kind: "text", text: task }] },
+          ],
+          reasoning: "require",
+          maxOutputTokens: 5200,
+          stream: false,
+        }, "text"),
+        params,
+        `${params.moduleJobId}:model-planning`,
+      );
+      const planningOutput = modelOutput(planningResult);
+      const planningObserved =
+        planningOutput.reasoning?.state === "observed" &&
+        Array.isArray(planningOutput.reasoning.parts) &&
+        planningOutput.reasoning.parts.some(
+          (part) => typeof part === "string" && part.length > 0,
+        );
+      if (!planningObserved) throw new Error("planning call returned no observed reasoning");
+      planningNote = planningOutput.finalContent.trim();
+      if (planningNote === "") throw new Error("planning call returned no final plan text");
+      reasoningObserved.push(true);
+    }
     for (let round = 1; round <= 3; round += 1) {
       const system = [
         "You are a grounded task Agent. The Host supplied the exact read-only tool registry JSON below.",
@@ -274,7 +355,7 @@ async function runAgent(params) {
         "For this task, discover the available memory keys before reading the relevant item. Never guess hidden values.",
         "Return exactly one JSON object and no markdown.",
         "For a tool action use exactly keys action,arguments, where action is the selected tool name.",
-        "For the final action use exactly keys action,answer,grounded,evidenceKeys and set action to answer.",
+        "For the final action use exactly keys action,answer,grounded,evidenceKeys; set action to answer and answer to one non-empty string, never an object.",
         "Keep internal reasoning under 120 words and reserve output budget for JSON.",
         `Registry: ${JSON.stringify(registry)}`,
       ].join(" ");
@@ -286,11 +367,18 @@ async function runAgent(params) {
             { role: "system", parts: [{ kind: "text", text: system }] },
             {
               role: "user",
-              parts: [{ kind: "text", text: JSON.stringify({ task, observations }) }],
+              parts: [{
+                kind: "text",
+                text: JSON.stringify({ task, planningNote, observations }),
+              }],
             },
           ],
-          reasoning: round === 1 ? "require" : "disable",
-          maxOutputTokens: round === 1 ? 5200 : 800,
+          reasoning: separatePlanningCall
+            ? "disable"
+            : round === 1
+              ? "require"
+              : "disable",
+          maxOutputTokens: separatePlanningCall || round !== 1 ? 800 : 5200,
           stream: false,
         }),
         params,
@@ -302,12 +390,9 @@ async function runAgent(params) {
         Array.isArray(output.reasoning.parts) &&
         output.reasoning.parts.some((part) => typeof part === "string" && part.length > 0),
       );
-      const rawAction = parseModelObject(output.finalContent);
+      const rawAction = parseModelObject(output.finalContent, allowFencedModelJson);
       if (rawAction?.action === "answer") {
-        const action = strictObject(
-          output.finalContent,
-          ["action", "answer", "grounded", "evidenceKeys"],
-        );
+        const action = strictAnswer(output.finalContent, true, allowFencedModelJson);
         return {
           conditionId: "tool-registry-storage",
           task,
@@ -322,6 +407,8 @@ async function runAgent(params) {
             .map((entry) => entry.capabilityType)
             .sort(),
           capabilityContracts: capabilityContracts(),
+          modelOutputContracts,
+          planningNoteChars: planningNote.length,
           answer: {
             answer: action.answer,
             grounded: action.grounded,
@@ -333,7 +420,11 @@ async function runAgent(params) {
             Object.hasOwn(process.env, "AETHER_BASE_URL"),
         };
       }
-      const action = strictObject(output.finalContent, ["action", "arguments"]);
+      const action = strictObject(
+        output.finalContent,
+        ["action", "arguments"],
+        allowFencedModelJson,
+      );
       const selected = registry.tools.find((tool) => tool.name === action.action);
       if (!selected) throw new Error("model selected a tool absent from the registry");
       const toolRound = observations.length + 1;
@@ -405,12 +496,9 @@ async function runAgent(params) {
       Array.isArray(output.reasoning.parts) &&
       output.reasoning.parts.some((part) => typeof part === "string" && part.length > 0),
     );
-    const rawAction = parseModelObject(output.finalContent);
+    const rawAction = parseModelObject(output.finalContent, allowFencedModelJson);
     if (rawAction?.action === "answer") {
-      const action = strictObject(
-        output.finalContent,
-        ["action", "answer", "grounded", "evidenceKeys"],
-      );
+      const action = strictAnswer(output.finalContent, true, allowFencedModelJson);
       if (!observations.some((entry) => entry.operation === "list")) {
         throw new Error("Agent answered before listing private memory");
       }
@@ -433,7 +521,11 @@ async function runAgent(params) {
           Object.hasOwn(process.env, "AETHER_BASE_URL"),
       };
     }
-    const action = strictObject(output.finalContent, ["action", "arguments"]);
+    const action = strictObject(
+      output.finalContent,
+      ["action", "arguments"],
+      allowFencedModelJson,
+    );
     if (action.action === "storage.list") {
       const toolResult = await invokeCapability(
         storage,

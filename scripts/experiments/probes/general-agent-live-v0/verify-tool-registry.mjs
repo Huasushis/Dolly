@@ -12,11 +12,11 @@ const workspaceTemporaryRoot = resolve(repositoryRoot, "..", ".tmp");
 const verifierPath = fileURLToPath(import.meta.url);
 const artifactRoot = join(
   repositoryRoot,
-  "artifacts/experiments/probes/general-agent-tool-registry-v1",
+  "artifacts/experiments/probes/general-agent-tool-registry-v3",
 );
 const sourcePreregistrationPath = join(
   repositoryRoot,
-  "docs/experiments/preregistrations/general-agent-tool-registry-v1.json",
+  "docs/experiments/preregistrations/general-agent-tool-registry-v3.json",
 );
 const extensionSourcePath = join(scriptDirectory, "extension.mjs");
 const HIDDEN_CODENAME = "EMBER-7421";
@@ -24,6 +24,70 @@ const IMPLEMENTATION_PATHS = [
   "scripts/experiments/probes/general-agent-live-v0/run.mts",
   "scripts/experiments/probes/general-agent-live-v0/extension.mjs",
   "scripts/experiments/probes/general-agent-live-v0/verify-tool-registry.mjs",
+];
+const PRODUCTION_PATHS = [
+  "src/adapters/extension-process-module-executor.ts",
+  "src/core/delivery-store.ts",
+  "src/core/extension-process-host.ts",
+  "src/core/file-core-state-store.ts",
+  "src/core/model-provider-broker.ts",
+  "src/core/model-provider-chat.ts",
+  "src/core/model-provider-descriptor.ts",
+  "src/core/module-result-commit-factory.ts",
+  "src/core/module-result-commit.ts",
+  "src/core/module-scheduler.ts",
+  "src/core/provider-capabilities/model-operation-capability.ts",
+  "src/core/provider-capabilities/tool-invocation-capability.ts",
+  "src/core/reactive-module-host.ts",
+  "src/core/reactive-module-runtime.ts",
+  "src/core/runtime-bootstrap.ts",
+  "src/core/tool-policy.ts",
+];
+const EXPECTED_MUTATION_IDS = [
+  "capability-type-raw-storage",
+  "capability-version-v1",
+  "chat-input-v2",
+  "json-call-text-output-contract",
+  "prose-wrapped-json",
+  "answer-object",
+  "planner-response-format-present",
+  "registry-digest-mismatch",
+  "list-schema-limit-four",
+  "list-argument-four",
+  "provider-row-missing",
+  "case-row-missing",
+  "artifact-digest-missing",
+  "reasoning-evidence-missing",
+  "scheduler-completion-false",
+  "child-stop-false",
+  "fixture-secret-value",
+  "authorization-field",
+  "capability-handle-field",
+];
+const EXPECTED_OUTPUT_KINDS = [
+  "json-object",
+  "text",
+  "json-object",
+  "json-object",
+  "json-object",
+  "text",
+  "json-object",
+  "json-object",
+  "json-object",
+  "json-object",
+];
+const EXPECTED_MAX_TOKENS = [800, 5200, 800, 800, 800, 5200, 800, 800, 800, 800];
+const EXPECTED_REASONING_TYPES = [
+  "disabled",
+  "enabled",
+  "disabled",
+  "disabled",
+  "disabled",
+  "enabled",
+  "disabled",
+  "disabled",
+  "disabled",
+  "disabled",
 ];
 
 function fail(message) {
@@ -38,11 +102,11 @@ function parseArguments(argv) {
   if (
     (argv.length !== 2 && argv.length !== 3 && argv.length !== 5) ||
     argv[0] !== "--run-id" ||
-    !/^registry-v2-[A-Za-z0-9._-]+$/u.test(argv[1]) ||
+    !/^registry-v4-[A-Za-z0-9._-]+$/u.test(argv[1]) ||
     (argv.length >= 3 && argv[2] !== "--check-only") ||
     (argv.length === 5 && argv[3] !== "--run-directory")
   ) {
-    fail("usage: verify-tool-registry.mjs --run-id registry-v2-<identifier> [--check-only [--run-directory <workspace-temp-run>]]");
+    fail("usage: verify-tool-registry.mjs --run-id registry-v4-<identifier> [--check-only [--run-directory <workspace-temp-run>]]");
   }
   const runId = argv[1];
   let runDirectory;
@@ -108,6 +172,108 @@ function exactArray(value, expected, label) {
   }
 }
 
+function expectedWireMessages(inputMessages, callIndex) {
+  if (!Array.isArray(inputMessages)) fail(`model call ${callIndex + 1} messages are absent`);
+  return inputMessages.map((message, messageIndex) => {
+    if (
+      message === null ||
+      Array.isArray(message) ||
+      typeof message !== "object" ||
+      typeof message.role !== "string" ||
+      !Array.isArray(message.parts)
+    ) {
+      fail(`model call ${callIndex + 1} message ${messageIndex + 1} is invalid`);
+    }
+    return {
+      role: message.role,
+      content: message.parts.map((part, partIndex) => {
+        if (
+          part === null ||
+          Array.isArray(part) ||
+          typeof part !== "object" ||
+          part.kind !== "text" ||
+          typeof part.text !== "string"
+        ) {
+          fail(`model call ${callIndex + 1} message part ${partIndex + 1} is not text`);
+        }
+        return { type: "text", text: part.text };
+      }),
+    };
+  });
+}
+
+function tokenAccounting(rows) {
+  let prompt = 0;
+  let completion = 0;
+  let total = 0;
+  let recordsWithUsage = 0;
+  let recordsMissingUsage = 0;
+  for (const row of rows) {
+    const usage = row?.response?.usage;
+    if (
+      !Number.isSafeInteger(usage?.prompt_tokens) || usage.prompt_tokens < 0 ||
+      !Number.isSafeInteger(usage?.completion_tokens) || usage.completion_tokens < 0 ||
+      !Number.isSafeInteger(usage?.total_tokens) || usage.total_tokens < 0
+    ) {
+      recordsMissingUsage += 1;
+      continue;
+    }
+    prompt += usage.prompt_tokens;
+    completion += usage.completion_tokens;
+    total += usage.total_tokens;
+    recordsWithUsage += 1;
+  }
+  return { prompt, completion, total, recordsWithUsage, recordsMissingUsage };
+}
+
+function verifyPerCaseAccounting(accounting, modelRows, providerRows) {
+  if (!Array.isArray(accounting) || accounting.length !== 4) {
+    fail("per-case accounting inventory is invalid");
+  }
+  const spans = [[0, 1], [1, 5], [5, 9], [9, 10]];
+  const expectedConditions = [
+    [7423, 1, "no-storage-tool"],
+    [7423, 1, "tool-registry-storage"],
+    [7424, 2, "tool-registry-storage"],
+    [7424, 2, "no-storage-tool"],
+  ];
+  accounting.forEach((entry, index) => {
+    const [start, end] = spans[index];
+    const [seed, repetition, conditionId] = expectedConditions[index];
+    const calls = modelRows.slice(start, end);
+    const responses = providerRows.slice(start, end);
+    const latency = calls.reduce((sum, row) => {
+      const startMs = Date.parse(row.startedAt);
+      const endMs = Date.parse(row.completedAt);
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) {
+        fail(`per-case accounting call ${start + 1} has invalid timestamps`);
+      }
+      return sum + endMs - startMs;
+    }, 0);
+    const expectedTokens = tokenAccounting(responses);
+    if (
+      entry?.evaluationSeed !== seed ||
+      entry?.repetition !== repetition ||
+      entry?.conditionId !== conditionId ||
+      entry?.providerCalls !== end - start ||
+      entry?.providerAttempts !== end - start ||
+      entry?.retries !== 0 ||
+      entry?.modelErrors !== 0 ||
+      entry?.providerErrors !== 0 ||
+      entry?.aggregateLatencyMs !== latency ||
+      JSON.stringify(entry?.tokens) !== JSON.stringify(expectedTokens) ||
+      JSON.stringify(entry?.monetaryCost) !== JSON.stringify({
+        measured: false,
+        currency: null,
+        amount: null,
+        enforcedBudget: false,
+      })
+    ) {
+      fail(`per-case accounting ${index + 1} is invalid`);
+    }
+  });
+}
+
 function verifyCaseEnvelope(row, conditionId, evaluationSeed, repetition) {
   if (row?.schemaVersion !== "general-agent-live/case/1" || row.conditionId !== conditionId) {
     fail(`${conditionId} case identity is invalid`);
@@ -137,6 +303,7 @@ function verifyBaseline(row, evaluationSeed, repetition) {
     [{ capabilityType: "model-operation", capabilityVersion: "v2" }],
     "baseline capability contracts",
   );
+  exactArray(result?.modelOutputContracts, ["json-object", "text"], "baseline model output contracts");
   if (result?.childCredentialEnvironmentPresent !== false) {
     fail("baseline child observed an Aether environment variable");
   }
@@ -215,6 +382,10 @@ function verifyTreatment(row, evaluationSeed, repetition) {
     ],
     "treatment capability contracts",
   );
+  exactArray(result?.modelOutputContracts, ["json-object", "text"], "treatment model output contracts");
+  if (!Number.isSafeInteger(result?.planningNoteChars) || result.planningNoteChars <= 0) {
+    fail("treatment planning note is absent");
+  }
   if (result.capabilityTypes.includes("module-private-storage")) {
     fail("treatment child received the forbidden raw storage capability");
   }
@@ -265,18 +436,20 @@ function verifyTreatment(row, evaluationSeed, repetition) {
 }
 
 function verifyModelCalls(rows) {
-  if (rows.length !== 8) fail(`expected 8 provider calls, observed ${rows.length}`);
+  if (rows.length !== 10) fail(`expected 10 provider calls, observed ${rows.length}`);
   exactArray(
     rows.map((row) => row.requestId),
     [
-      "agent-no-storage-tool-seed-7421-model-request-1",
-      "agent-tool-registry-storage-seed-7421-model-request-1",
-      "agent-tool-registry-storage-seed-7421-model-request-2",
-      "agent-tool-registry-storage-seed-7421-model-request-3",
-      "agent-tool-registry-storage-seed-7422-model-request-1",
-      "agent-tool-registry-storage-seed-7422-model-request-2",
-      "agent-tool-registry-storage-seed-7422-model-request-3",
-      "agent-no-storage-tool-seed-7422-model-request-1",
+      "agent-no-storage-tool-seed-7423-model-request-1",
+      "agent-tool-registry-storage-seed-7423-model-request-1",
+      "agent-tool-registry-storage-seed-7423-model-request-2",
+      "agent-tool-registry-storage-seed-7423-model-request-3",
+      "agent-tool-registry-storage-seed-7423-model-request-4",
+      "agent-tool-registry-storage-seed-7424-model-request-1",
+      "agent-tool-registry-storage-seed-7424-model-request-2",
+      "agent-tool-registry-storage-seed-7424-model-request-3",
+      "agent-tool-registry-storage-seed-7424-model-request-4",
+      "agent-no-storage-tool-seed-7424-model-request-1",
     ],
     "model request ids",
   );
@@ -288,22 +461,31 @@ function verifyModelCalls(rows) {
     ) {
       fail(`model call ${index + 1} identity, outcome, or attempt count is invalid`);
     }
+    const outputKind = EXPECTED_OUTPUT_KINDS[index];
     if (
       row.input?.schemaVersion !== "dolly.model.chat-input/3" ||
-      JSON.stringify(row.input?.outputContract) !== JSON.stringify({ kind: "json-object" })
+      JSON.stringify(row.input?.outputContract) !== JSON.stringify({ kind: outputKind }) ||
+      row.input?.maxOutputTokens !== EXPECTED_MAX_TOKENS[index] ||
+      row.reasoningPolicy !== (EXPECTED_REASONING_TYPES[index] === "enabled" ? "require" : "disable")
     ) {
-      fail(`model call ${index + 1} did not use the frozen JSON-object contract`);
+      fail(`model call ${index + 1} did not use the frozen input contract`);
     }
-    try {
-      const parsed = JSON.parse(row.result.output.finalContent);
-      if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
-        fail(`model call ${index + 1} output is not one JSON object`);
+    const finalContent = row.result?.output?.finalContent;
+    if (typeof finalContent !== "string" || finalContent.trim() === "") {
+      fail(`model call ${index + 1} returned no final content`);
+    }
+    if (outputKind === "json-object") {
+      try {
+        const parsed = JSON.parse(finalContent);
+        if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
+          fail(`model call ${index + 1} output is not one JSON object`);
+        }
+      } catch {
+        fail(`model call ${index + 1} output is not exact JSON`);
       }
-    } catch {
-      fail(`model call ${index + 1} output is not exact JSON`);
     }
   }
-  for (const planning of [rows[1], rows[4]]) {
+  for (const planning of [rows[1], rows[5]]) {
     const reasoning = planning.result?.output?.reasoning;
     if (
       reasoning?.state !== "observed" ||
@@ -350,6 +532,53 @@ function verifySourceIndependence(preregistration, manifest) {
       fail(`implementation bytes differ from the frozen digest for ${path}`);
     }
   }
+  const production = preregistration.domainDesign?.productionSourceFiles;
+  if (
+    production === null ||
+    Array.isArray(production) ||
+    typeof production !== "object" ||
+    JSON.stringify(Object.keys(production).sort()) !== JSON.stringify([...PRODUCTION_PATHS].sort())
+  ) {
+    fail("preregistration production source inventory is invalid");
+  }
+  for (const path of PRODUCTION_PATHS) {
+    const actual = sha256(readFileSync(join(repositoryRoot, path)));
+    if (
+      production[path] !== actual ||
+      manifest.configuration?.productionSourceSha256?.[path] !== actual
+    ) {
+      fail(`production source bytes differ from the frozen digest for ${path}`);
+    }
+  }
+  const bootstrapSource = readFileSync(join(repositoryRoot, "src/core/runtime-bootstrap.ts"), "utf8");
+  if (!bootstrapSource.includes("RUNTIME_MODULE_MIGRATION_REQUIRED")) {
+    fail("the frozen product bootstrap source lacks the Module migration refusal");
+  }
+}
+
+const FORBIDDEN_PRIVATE_FIELD_KEYS = new Set([
+  "handle",
+  "capabilityhandle",
+  "authorization",
+  "authorizationheader",
+  "apikey",
+  "baseurl",
+  "exacturl",
+]);
+
+function verifyNoPrivateFields(value, location) {
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => verifyNoPrivateFields(entry, `${location}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    const normalized = key.toLowerCase().replace(/[^a-z0-9]/gu, "");
+    if (FORBIDDEN_PRIVATE_FIELD_KEYS.has(normalized)) {
+      fail(`${location} contains forbidden private field ${key}`);
+    }
+    verifyNoPrivateFields(child, `${location}.${key}`);
+  }
 }
 
 function verifyNoPrivateLeak(runDirectory, fixtureValues) {
@@ -368,9 +597,8 @@ function verifyNoPrivateLeak(runDirectory, fixtureValues) {
         fail(`${name} contains a configured private fixture value`);
       }
     }
-    if (/"handle"\s*:/u.test(bytes.toString("utf8"))) {
-      fail(`${name} contains a capability handle field`);
-    }
+    const values = name.endsWith(".jsonl") ? jsonLines(join(runDirectory, name)) : [json(join(runDirectory, name))];
+    values.forEach((value, index) => verifyNoPrivateFields(value, `${name}:${index + 1}`));
   }
 }
 
@@ -401,8 +629,17 @@ function refreshManifestArtifactDigests(runDirectory, names) {
 
 function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
   mkdirSync(workspaceTemporaryRoot, { recursive: true, mode: 0o700 });
-  const mutationRoot = mkdtempSync(join(workspaceTemporaryRoot, "registry-v2-mutations-"));
+  const mutationRoot = mkdtempSync(join(workspaceTemporaryRoot, "registry-v4-mutations-"));
   const mutations = [
+    {
+      id: "capability-type-raw-storage",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "cases.jsonl"));
+        rows[1].result.capabilityContracts[1].capabilityType = "module-private-storage";
+        writeJsonLines(join(runDirectory, "cases.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["cases.jsonl"]);
+      },
+    },
     {
       id: "capability-version-v1",
       apply(runDirectory) {
@@ -422,7 +659,7 @@ function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
       },
     },
     {
-      id: "text-output-contract",
+      id: "json-call-text-output-contract",
       apply(runDirectory) {
         const rows = jsonLines(join(runDirectory, "model-calls.jsonl"));
         rows[0].input.outputContract = { kind: "text" };
@@ -440,12 +677,21 @@ function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
       },
     },
     {
-      id: "provider-wire-response-format-drift",
+      id: "answer-object",
+      apply(runDirectory) {
+        const rows = jsonLines(join(runDirectory, "cases.jsonl"));
+        rows[1].result.answer.answer = { codename: HIDDEN_CODENAME };
+        writeJsonLines(join(runDirectory, "cases.jsonl"), rows);
+        refreshManifestArtifactDigests(runDirectory, ["cases.jsonl"]);
+      },
+    },
+    {
+      id: "planner-response-format-present",
       apply(runDirectory) {
         const rows = jsonLines(join(runDirectory, "provider-responses.jsonl"));
-        rows[0].requestBody.response_format = { type: "text" };
-        rows[0].requestBodySha256 = sha256(
-          Buffer.from(JSON.stringify(rows[0].requestBody), "utf8"),
+        rows[1].requestBody.response_format = { type: "json_object" };
+        rows[1].requestBodySha256 = sha256(
+          Buffer.from(JSON.stringify(rows[1].requestBody), "utf8"),
         );
         writeJsonLines(join(runDirectory, "provider-responses.jsonl"), rows);
         refreshManifestArtifactDigests(runDirectory, ["provider-responses.jsonl"]);
@@ -496,6 +742,15 @@ function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
       },
     },
     {
+      id: "artifact-digest-missing",
+      apply(runDirectory) {
+        const manifestPath = join(runDirectory, "run-manifest.json");
+        const manifest = json(manifestPath);
+        delete manifest.artifacts["cases.jsonl"];
+        writeJson(manifestPath, manifest);
+      },
+    },
+    {
       id: "reasoning-evidence-missing",
       apply(runDirectory) {
         const rows = jsonLines(join(runDirectory, "model-calls.jsonl"));
@@ -523,16 +778,37 @@ function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
       },
     },
     {
+      id: "fixture-secret-value",
+      apply(runDirectory) {
+        const analysisPath = join(runDirectory, "analysis.json");
+        const analysis = json(analysisPath);
+        analysis.fixtureValue = fixtureValues[0];
+        writeJson(analysisPath, analysis);
+        refreshManifestArtifactDigests(runDirectory, ["analysis.json"]);
+      },
+    },
+    {
+      id: "authorization-field",
+      apply(runDirectory) {
+        const analysisPath = join(runDirectory, "analysis.json");
+        const analysis = json(analysisPath);
+        analysis.authorization = "redacted-test-authorization";
+        writeJson(analysisPath, analysis);
+        refreshManifestArtifactDigests(runDirectory, ["analysis.json"]);
+      },
+    },
+    {
       id: "capability-handle-field",
       apply(runDirectory) {
         const analysisPath = join(runDirectory, "analysis.json");
         const analysis = json(analysisPath);
-        analysis.handle = "forbidden-test-handle";
+        analysis.capabilityHandle = "forbidden-test-handle";
         writeJson(analysisPath, analysis);
         refreshManifestArtifactDigests(runDirectory, ["analysis.json"]);
       },
     },
   ];
+  exactArray(mutations.map((mutation) => mutation.id), EXPECTED_MUTATION_IDS, "mutation ids");
   const results = [];
   try {
     for (const mutation of mutations) {
@@ -580,16 +856,16 @@ function main() {
   const manifest = json(manifestPath);
   if (
     manifest.schemaVersion !== "general-agent-live/run-manifest/1" ||
-    manifest.experimentId !== "general-agent-tool-registry-v1" ||
-    manifest.experimentVersion !== 2 ||
+    manifest.experimentId !== "general-agent-tool-registry-v3" ||
+    manifest.experimentVersion !== 4 ||
     manifest.runId !== runId ||
     manifest.status !== "completed"
   ) {
     fail("run manifest identity or status is invalid");
   }
   if (
-    manifest.providerCalls !== 8 ||
-    manifest.secretLeasesReleased !== 8 ||
+    manifest.providerCalls !== 10 ||
+    manifest.secretLeasesReleased !== 10 ||
     manifest.productBootstrapModulesRemainRejected !== true ||
     manifest.linuxControlGroupProof !== false
   ) {
@@ -605,10 +881,15 @@ function main() {
     typeof manifest.dirtyWorktree !== "boolean" ||
     manifest.configuration?.configuredStorageListLimit !== 3 ||
     manifest.configuration?.modelCapabilityVersion !== 2 ||
+    manifest.configuration?.separatePlanningCall !== true ||
+    JSON.stringify(manifest.configuration?.modelOutputContracts) !==
+      JSON.stringify(["text", "json-object"]) ||
     manifest.configuration?.productBootstrapComposition !== false ||
     manifest.modelIdentifier !== "qwen3.6-27b" ||
     manifest.backend?.kind !== "live" ||
     manifest.backend?.silentFallbackAllowed !== false ||
+    manifest.sampling?.temperatureWire !== "omitted" ||
+    manifest.sampling?.providerDefault !== "unverified" ||
     manifest.modelEndpointCapabilityProfile?.endpointAndCredentialRedacted !== true ||
     manifest.modelEndpointCapabilityProfile?.descriptorVersion !==
       "owner-aether-qwen3.6-27b-v2" ||
@@ -618,23 +899,34 @@ function main() {
   ) {
     fail("run manifest source, configuration, backend, or redacted model profile is invalid");
   }
-  exactArray(manifest.seeds, [7421, 7422], "manifest evaluation seeds");
+  if (
+    preregistration.independentValidation?.readsOnlyArtifacts !== false ||
+    JSON.stringify(preregistration.independentValidation?.mutationTests) !==
+      JSON.stringify(EXPECTED_MUTATION_IDS) ||
+    manifest.dataset?.id !== "synthetic-private-memory-codename" ||
+    manifest.dataset?.version !== "1" ||
+    manifest.dataset?.entriesPerCase !== 2 ||
+    manifest.dataset?.contentSha256 !== preregistration.domainDesign?.dataset?.contentSha256 ||
+    !/^[0-9a-f]{64}$/u.test(manifest.dataset?.contentSha256 ?? "")
+  ) {
+    fail("preregistration validation inputs or dataset identity are invalid");
+  }
+  exactArray(manifest.seeds, [7423, 7424], "manifest evaluation seeds");
   const expectedExecutionOrder = [
-    { evaluationSeed: 7421, repetition: 1, conditionId: "no-storage-tool" },
-    { evaluationSeed: 7421, repetition: 1, conditionId: "tool-registry-storage" },
-    { evaluationSeed: 7422, repetition: 2, conditionId: "tool-registry-storage" },
-    { evaluationSeed: 7422, repetition: 2, conditionId: "no-storage-tool" },
+    { evaluationSeed: 7423, repetition: 1, conditionId: "no-storage-tool" },
+    { evaluationSeed: 7423, repetition: 1, conditionId: "tool-registry-storage" },
+    { evaluationSeed: 7424, repetition: 2, conditionId: "tool-registry-storage" },
+    { evaluationSeed: 7424, repetition: 2, conditionId: "no-storage-tool" },
   ];
   if (JSON.stringify(manifest.executionOrder) !== JSON.stringify(expectedExecutionOrder)) {
     fail("manifest execution order differs from the preregistered order");
   }
   if (
     manifest.resourceBudgets?.maximumCases !== 4 ||
-    manifest.resourceBudgets?.maximumProviderCalls !== 8 ||
+    manifest.resourceBudgets?.maximumProviderCalls !== 10 ||
     manifest.resourceBudgets?.maximumToolCapabilityInvocationsPerTreatment !== 3 ||
-    !Array.isArray(manifest.perCaseAccounting) ||
-    JSON.stringify(manifest.perCaseAccounting.map((entry) => entry.providerCalls)) !==
-      JSON.stringify([1, 3, 3, 1]) ||
+    manifest.resourceBudgets?.monetaryCostMeasured !== false ||
+    manifest.resourceBudgets?.monetaryBudgetEnforced !== false ||
     manifest.validatorResults?.preregistrationStructure !== "valid-before-run" ||
     manifest.validatorResults?.independentValidation !== "pending" ||
     manifest.failure !== null ||
@@ -664,14 +956,15 @@ function main() {
 
   const cases = jsonLines(casesPath);
   if (cases.length !== 4) fail(`expected 4 cases, observed ${cases.length}`);
-  verifyBaseline(cases[0], 7421, 1);
-  verifyTreatment(cases[1], 7421, 1);
-  verifyTreatment(cases[2], 7422, 2);
-  verifyBaseline(cases[3], 7422, 2);
-  verifyModelCalls(jsonLines(modelCallsPath));
+  verifyBaseline(cases[0], 7423, 1);
+  verifyTreatment(cases[1], 7423, 1);
+  verifyTreatment(cases[2], 7424, 2);
+  verifyBaseline(cases[3], 7424, 2);
+  const modelCalls = jsonLines(modelCallsPath);
+  verifyModelCalls(modelCalls);
   const providerResponses = jsonLines(providerResponsesPath);
   if (
-    providerResponses.length !== 8 ||
+    providerResponses.length !== 10 ||
     providerResponses.some(
       (row) =>
         row.schemaVersion !== "general-agent-live/provider-response/1" ||
@@ -681,37 +974,35 @@ function main() {
   ) {
     fail("provider raw response inventory is invalid");
   }
-  const reasoningTypeByCall = [
-    "disabled",
-    "enabled",
-    "disabled",
-    "disabled",
-    "enabled",
-    "disabled",
-    "disabled",
-    "disabled",
-  ];
   for (const [index, row] of providerResponses.entries()) {
     const requestBody = row.requestBody;
+    const outputKind = EXPECTED_OUTPUT_KINDS[index];
+    const expectedKeys = outputKind === "json-object"
+      ? ["max_tokens", "messages", "model", "response_format", "stream", "thinking"]
+      : ["max_tokens", "messages", "model", "stream", "thinking"];
     if (
       requestBody === null ||
       Array.isArray(requestBody) ||
       typeof requestBody !== "object" ||
       JSON.stringify(Object.keys(requestBody).sort()) !==
-        JSON.stringify(["max_tokens", "messages", "model", "response_format", "stream", "thinking"]) ||
+        JSON.stringify(expectedKeys) ||
       requestBody.model !== "qwen3.6-27b" ||
       requestBody.stream !== false ||
-      !Array.isArray(requestBody.messages) ||
-      requestBody.messages.length !== 2 ||
-      JSON.stringify(requestBody.response_format) !== JSON.stringify({ type: "json_object" }) ||
+      requestBody.max_tokens !== EXPECTED_MAX_TOKENS[index] ||
+      JSON.stringify(requestBody.messages) !==
+        JSON.stringify(expectedWireMessages(modelCalls[index]?.input?.messages, index)) ||
+      (outputKind === "json-object" &&
+        JSON.stringify(requestBody.response_format) !== JSON.stringify({ type: "json_object" })) ||
+      (outputKind === "text" && Object.hasOwn(requestBody, "response_format")) ||
       JSON.stringify(requestBody.thinking) !==
-        JSON.stringify({ type: reasoningTypeByCall[index] }) ||
+        JSON.stringify({ type: EXPECTED_REASONING_TYPES[index] }) ||
       row.requestBodySha256 !==
         sha256(Buffer.from(JSON.stringify(requestBody), "utf8"))
     ) {
-      fail(`provider request ${index + 1} lacks exact JSON-object wire evidence`);
+      fail(`provider request ${index + 1} differs from the frozen model-call wire`);
     }
   }
+  verifyPerCaseAccounting(manifest.perCaseAccounting, modelCalls, providerResponses);
   const analysis = json(analysisPath);
   if (
     analysis.schemaVersion !== "general-agent-tool-registry/analysis/1" ||
@@ -719,7 +1010,7 @@ function main() {
     analysis.status !== "completed" ||
     analysis.observedCases !== 4 ||
     analysis.plannedCases !== 4 ||
-    analysis.providerCalls !== 8 ||
+    analysis.providerCalls !== 10 ||
     analysis.aggregateMetrics?.pairedGroundedRecovery !== 1 ||
     analysis.aggregateMetrics?.treatmentGroundedRecoveryRate !== 1 ||
     analysis.aggregateMetrics?.baselineHiddenCodenameRate !== 0 ||
@@ -739,15 +1030,15 @@ function main() {
 
   const verification = {
     schemaVersion: "general-agent-tool-registry/validation/1",
-    experimentId: "general-agent-tool-registry-v1",
-    experimentVersion: 2,
+    experimentId: "general-agent-tool-registry-v3",
+    experimentVersion: 4,
     runId,
     valid: true,
     checks: {
       preregistrationByteIdentity: true,
       manifestAndArtifactDigests: true,
       exactCaseCount: 4,
-      exactProviderCallCount: 8,
+      exactProviderCallCount: 10,
       baselineNoSecretGuess: true,
       treatmentCapabilityBoundary: true,
       registryIdentity: true,
@@ -768,6 +1059,13 @@ function main() {
     },
     mutationChecks,
   };
+  if (!checkOnly) {
+    exactArray(
+      mutationChecks.map((entry) => entry.id),
+      EXPECTED_MUTATION_IDS,
+      "completed mutation checks",
+    );
+  }
   if (!checkOnly) {
     writeFileSync(
       join(runDirectory, "validation.json"),

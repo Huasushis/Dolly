@@ -1,0 +1,616 @@
+{
+  "$schema": "./schema-v1.json",
+  "schemaVersion": "dolly-experiment-preregistration/v1",
+  "experimentId": "general-agent-tool-registry-v2",
+  "experimentVersion": 3,
+  "title": "Host registry Agent with separate reasoning plan and strict JSON actions",
+  "status": "frozen-before-first-run",
+  "scope": "live-canary",
+  "protocol": {
+    "path": "docs/experiments/protocol.md",
+    "sha256": "1a2934531fbe052662464f6a0d3b2fd531b3d7904daa431810a1db979683fafe"
+  },
+  "authorityReferences": [
+    ".qoder/specs/dolly_new.txt",
+    "AGENTS.md",
+    "docs/spec/core-runtime.md",
+    "docs/spec/extension-process-protocol.md",
+    "docs/spec/llm-extension.md",
+    "docs/spec/model-provider.md"
+  ],
+  "definitions": {
+    "agent": "The process-isolated reactive Module candidate driven by ModuleScheduler for one exact Delivery Claim.",
+    "toolRegistryView": "The host-issued dolly.tool-registry-view/2 response containing only selected tool contracts and their binding digest.",
+    "rawStorageCapability": "A module-private-storage capability handle exposed directly to Extension code; the treatment forbids this handle.",
+    "groundedRecovery": "The committed answer contains EMBER-7421, sets grounded true, and cites deployment-note after successful registered tool observations.",
+    "evaluationSeed": "A preregistered repetition identity and execution-order key; the owner Aether deployment exposes no verified provider seed control.",
+    "planningCall": "A text-output model call with reasoning required; its final text is untrusted planning context and grants no tool authority.",
+    "actionCall": "A JSON-object model call with reasoning disabled; the Extension validates its closed action keys and the Host separately enforces the selected registry."
+  },
+  "question": "Can the Scheduler-driven process-isolated Agent use one separately measured text reasoning call and three strict JSON-object action calls to recover the hidden synthetic deployment codename through the Host tool registry, without raw storage authority or prose extraction?",
+  "hypotheses": {
+    "primary": [
+      {
+        "id": "h1-registry-grounded-recovery",
+        "statement": "For both evaluation repetitions, the registry treatment completes storage_list then storage_get and commits a grounded answer while its paired no-tool baseline does not contain the hidden codename.",
+        "outcomeMeasure": "paired-grounded-recovery"
+      }
+    ],
+    "guardrails": [
+      {
+        "id": "g1-capability-boundary",
+        "statement": "The treatment child receives only model-operation and tool-invocation handles and never receives module-private-storage, an endpoint, a credential, or a capability handle in model context.",
+        "outcomeMeasure": "capability-boundary-violations"
+      },
+      {
+        "id": "g2-contract-identity",
+        "statement": "Every tool round uses the exact registry digest shown to the model, and the selected list limit never exceeds the schema maximum of three.",
+        "outcomeMeasure": "registry-contract-violations"
+      },
+      {
+        "id": "g3-runtime-boundary",
+        "statement": "Every case reaches one Scheduler commit, stops its exact child process, and leaves product Module startup refusal and the missing Linux control-group proof explicit.",
+        "outcomeMeasure": "runtime-boundary-violations"
+      },
+      {
+        "id": "g4-output-contract",
+        "statement": "Both planning calls use Host-granted text output with reasoning required; all eight action/answer calls use Host-granted JSON-object output with reasoning disabled, exact request wire, and no prose or Markdown fence.",
+        "outcomeMeasure": "output-contract-violations"
+      }
+    ]
+  },
+  "decision": {
+    "currentProductState": "Registry-v2 is retained as inconclusive evidence: the endpoint returned non-empty reasoning but null final content when reasoning and JSON-object output were requested together. This v3 canary separates an untrusted text reasoning plan from strict JSON action calls. Product Module startup remains rejected and no durable tool journal is installed.",
+    "changesIfSupported": [
+      "Use a separately measured text planning call followed by registry-derived JSON actions as the temporary Aether read-only Agent path.",
+      "Keep the planning text untrusted: only the frozen Host registry, ToolPolicySession, and closed JSON action contract grant authority.",
+      "Proceed to source-citing task-checkpoint and benchmark demos on the same Scheduler and active-Run capability boundary."
+    ],
+    "changesIfRejected": [
+      "Retain registry-v1, registry-v2, and registry-v3 as distinct failure evidence and revise the endpoint capability descriptor or Agent protocol before another frozen version.",
+      "Do not add JSON extraction, silent output-contract fallback, raw storage authority, or product Module composition."
+    ],
+    "prohibitedClaims": [
+      "The product Module startup path is supported.",
+      "Effectful tools are crash safe or have a durable journal.",
+      "The provider supports native function calling or complete tool-round replay.",
+      "Linux control-group ownership and termination proof passed.",
+      "One private Aether fixture establishes cross-model or cross-provider generality.",
+      "JSON-object syntax proves application-schema compliance or native provider function calling."
+    ]
+  },
+  "conditions": {
+    "baselines": [
+      {
+        "id": "no-storage-tool",
+        "description": "The same child, task, Scheduler path, and model descriptor receive no tool-invocation or storage handle; model-operation/v2 describes both output contracts but the single provider call is a strict JSON-object answer with reasoning disabled.",
+        "frozenParameters": {
+          "capabilityTypes": [
+            "model-operation"
+          ],
+          "reasoningPolicy": "disable",
+          "maximumModelCalls": 1,
+          "modelCapabilityVersion": "v2",
+          "outputContract": {
+            "kind": "json-object"
+          },
+          "modelCapabilityOperations": [
+            "chat",
+            "describe"
+          ],
+          "hostGrantedOutputContracts": [
+            "text",
+            "json-object"
+          ],
+          "maximumCapabilityInvocations": 2
+        }
+      }
+    ],
+    "treatments": [
+      {
+        "id": "tool-registry-storage",
+        "description": "The child receives model-operation and tool-invocation/v2 only, obtains the Host registry, runs one text reasoning plan, then performs three strict JSON-object action calls and bounded read-only tool rounds.",
+        "frozenParameters": {
+          "capabilityTypes": [
+            "model-operation",
+            "tool-invocation"
+          ],
+          "forbiddenCapabilityType": "module-private-storage",
+          "registrySchemaVersion": "dolly.tool-registry-view/2",
+          "configuredListLimit": 3,
+          "toolBudget": {
+            "maxRounds": 2,
+            "maxCalls": 2,
+            "maxCallsPerRound": 1,
+            "maxApprovals": 0,
+            "maxCallBytes": 2048
+          },
+          "maximumModelCalls": 4,
+          "modelCapabilityVersion": "v2",
+          "maximumCapabilityInvocations": 5,
+          "modelCapabilityOperations": [
+            "chat",
+            "describe"
+          ],
+          "hostGrantedOutputContracts": [
+            "text",
+            "json-object"
+          ],
+          "planningOutputContract": {
+            "kind": "text"
+          },
+          "actionOutputContract": {
+            "kind": "json-object"
+          }
+        }
+      }
+    ]
+  },
+  "data": {
+    "generatorOrDataset": {
+      "id": "synthetic-private-memory-codename",
+      "version": "1",
+      "contentDefinition": "Each evaluation case stores archived-note with ASH-0000 and deployment-note with active codename EMBER-7421 in a fresh Module-private namespace."
+    },
+    "training": {
+      "name": "historical-design",
+      "seeds": [
+        6,
+        7
+      ],
+      "caseFactors": [
+        "Retained live-v6 and live-v7 failures informed the need for an exact argument contract and bounded model continuation."
+      ]
+    },
+    "development": {
+      "name": "historical-vertical-chain",
+      "seeds": [
+        8,
+        9
+      ],
+      "caseFactors": [
+        "Retained live-v8 runs established the raw private-storage effect and transport failure categories before this registry treatment was frozen.",
+        "The frozen registry-v1 run completed the baseline and all three treatment provider calls, but the provider wrapped the final JSON in prose and a Markdown fence; strict parsing safely quarantined the Module and exposed the missing output-contract capability.",
+        "The frozen registry-v2 run showed that the endpoint may return non-empty reasoning_content with null final content when reasoning and JSON-object output are combined; v3 changes only the call decomposition and evidence contract."
+      ]
+    },
+    "evaluation": {
+      "name": "registry-canary",
+      "seeds": [
+        7421,
+        7422
+      ],
+      "caseFactors": [
+        "no-storage-tool and tool-registry-storage are paired once for each evaluation seed with counterbalanced condition order."
+      ]
+    },
+    "splitIsolation": "Historical runs through registry-v2 may motivate this frozen design, but no registry-v3 evaluation response or aggregate may be inspected before this file is frozen. Evaluation artifacts never replace or merge historical rows.",
+    "tuningUsesTrainingAndDevelopmentOnly": true
+  },
+  "backend": {
+    "allowedKinds": [
+      "live"
+    ],
+    "requiredKind": "live",
+    "silentFallbackAllowed": false,
+    "credentialsRequired": true,
+    "networkRequired": true
+  },
+  "randomness": {
+    "generator": "Owner Aether qwen3.6-27b deployment; temperature is omitted from the wire, the provider default is unverified, and no provider seed parameter is verified.",
+    "generatorVersion": "qwen3.6-27b-owner-fixture-2026-08-09",
+    "streamSeparation": "Evaluation seeds identify independent fresh Core state, Extension process, tool journal, storage namespace, and model request identifiers; they are not misreported as provider pseudorandom seeds.",
+    "executionOrder": "Seed 7421 runs baseline then treatment; seed 7422 runs treatment then baseline to expose simple order or endpoint-drift sensitivity.",
+    "repetitionsPerCase": 2
+  },
+  "metrics": {
+    "primary": {
+      "name": "paired-grounded-recovery",
+      "unit": "paired success-rate difference",
+      "aggregation": "mean over the two evaluation-seed treatment indicators minus their paired baseline hidden-codename indicators",
+      "direction": "maximize",
+      "population": "The two preregistered evaluation seed pairs using the owner Aether qwen3.6-27b live fixture."
+    },
+    "secondary": [
+      {
+        "name": "exact-tool-sequence-rate",
+        "unit": "proportion",
+        "aggregation": "fraction of treatment cases with storage_list then storage_get then answer",
+        "direction": "maximize",
+        "population": "All preregistered treatment cases with structurally valid artifacts."
+      },
+      {
+        "name": "reasoning-observation-rate",
+        "unit": "proportion",
+        "aggregation": "fraction of treatment planning calls with at least one non-empty reasoning part",
+        "direction": "maximize",
+        "population": "The separate text planning call in each preregistered treatment case."
+      }
+    ],
+    "guardrails": [
+      {
+        "name": "capability-boundary-violations",
+        "unit": "count",
+        "aggregation": "sum of forbidden child capability, endpoint, credential, or handle observations",
+        "direction": "zero",
+        "population": "All case rows, model calls, provider raws, manifests, and retained Extension result fields."
+      },
+      {
+        "name": "registry-contract-violations",
+        "unit": "count",
+        "aggregation": "sum of registry digest mismatches, missing schemas, internal-field exposure, and model arguments beyond the list maximum",
+        "direction": "zero",
+        "population": "Every list-tools response and execute-round result in both treatment cases."
+      },
+      {
+        "name": "runtime-boundary-violations",
+        "unit": "count",
+        "aggregation": "sum of incomplete Scheduler commits, live recorded child processes, product guard changes, and falsely claimed Linux group proof",
+        "direction": "zero",
+        "population": "All four preregistered cases and the final run manifest."
+      },
+      {
+        "name": "output-contract-violations",
+        "unit": "count",
+        "aggregation": "sum of wrong capability version, wrong ChatInput version, output-kind or request-wire drift, missing planning reasoning, or non-JSON action finalContent observations",
+        "direction": "zero",
+        "population": "All ten preregistered model calls, their exact provider request bodies, and all four case capability inventories."
+      }
+    ],
+    "minimumEffect": {
+      "metric": "paired-grounded-recovery",
+      "magnitude": 1,
+      "scale": "absolute",
+      "confidenceLevel": 0.8,
+      "intervalMethod": "descriptive paired two-repetition canary interval; no inferential product promotion",
+      "comparison": "Both treatment repetitions must recover the hidden codename through the exact tool sequence, and neither paired baseline may contain it."
+    }
+  },
+  "execution": {
+    "factorialDesign": "Two conditions crossed with two evaluation seeds; each case creates fresh Core state, storage, process, model capability, and Scheduler runtime. Treatment uses one text planning provider call and three JSON-object provider calls; baseline uses one JSON-object provider call.",
+    "casePlan": [
+      {
+        "id": "evaluation-baseline",
+        "phase": "evaluation",
+        "maximumCount": 2,
+        "requiredWhen": "Always run one no-storage-tool baseline for each of the two evaluation seeds.",
+        "formula": "2 seeds * 1 baseline"
+      },
+      {
+        "id": "evaluation-treatment",
+        "phase": "evaluation",
+        "maximumCount": 2,
+        "requiredWhen": "Always run one tool-registry-storage treatment for each of the two evaluation seeds.",
+        "formula": "2 seeds * 1 treatment"
+      }
+    ],
+    "plannedMaximumCases": 4,
+    "maxCases": 4,
+    "maxEventsPerCase": 100000,
+    "maxRawRecordsPerCase": 100000,
+    "maxVirtualTimeMsPerCase": 420000,
+    "maxWallClockMs": 1800000,
+    "failurePolicy": "Record the current case and raw provider response when possible, stop the entire run on the first infrastructure, protocol, model-content, capability, Scheduler, verifier, or process-lifecycle failure, and classify the run inconclusive.",
+    "retryPolicy": "No provider or case retry. At most one separately identified whole-run replacement is allowed only after infrastructure failure; model-content or output-contract failure never qualifies."
+  },
+  "stoppingRules": {
+    "plannedCompletion": "Complete all four cases, exactly ten logical provider calls, all artifact digests, and independent verification before evaluating support.",
+    "earlyEfficacyStopAllowed": false,
+    "abortConditions": [
+      "Any provider call exceeds 180000 milliseconds, returns transport failure, or produces a malformed registered response envelope.",
+      "Any case exceeds 420000 milliseconds or the run exceeds 1800000 milliseconds.",
+      "Any capability, tool policy, Scheduler, process, artifact, secret-isolation, or product-refusal invariant fails.",
+      "Any run would exceed four cases, ten provider calls, or six treatment tool capability invocations."
+    ]
+  },
+  "decisionRules": {
+    "classificationOrder": "First classify any infrastructure, protocol, artifact, verifier, secret, capability, runtime, or model-content failure as inconclusive; otherwise apply every guardrail; only then evaluate the primary and secondary effects.",
+    "supported": [
+      "All four cases and exactly ten provider calls complete with valid artifacts and independent verification; every call uses model-operation/v2 and ChatInput/v3; treatment planning uses text with reasoning required while all action calls use strict json-object with reasoning disabled.",
+      "Both baselines omit EMBER-7421 with grounded false, while both treatments perform storage_list then storage_get then answer, recover EMBER-7421 with grounded true, and cite deployment-note.",
+      "All capability, registry-contract, source-independence, Scheduler, child-stop, secret, product-refusal, and support-boundary guardrails equal zero violations."
+    ],
+    "rejected": [
+      "With structurally valid provider, capability, process, and artifact evidence, either treatment fails the exact sequence or grounded recovery while its paired baseline remains valid.",
+      "With otherwise valid evidence, a treatment requires a handwritten tool name or configured list-limit literal in Extension source."
+    ],
+    "inconclusive": [
+      "Any planned case or provider raw is absent, malformed, timed out, transport-failed, or belongs to another run or preregistration digest.",
+      "Any capability, registry, request-wire, output-contract, secret-leak, Scheduler quarantine, unconfirmed process termination, artifact hash, frozen-source hash, or independent-verifier failure occurs.",
+      "The baseline guesses the hidden codename, because that removes the intended no-evidence contrast rather than supporting the treatment."
+    ]
+  },
+  "artifacts": {
+    "rootPattern": "artifacts/experiments/probes/general-agent-tool-registry-v2/runs/{runId}",
+    "requiredFiles": [
+      "preregistration.json",
+      "provider-responses.jsonl",
+      "model-calls.jsonl",
+      "cases.jsonl",
+      "analysis.json",
+      "run-manifest.json",
+      "validation.json"
+    ],
+    "runManifestFields": [
+      "schemaVersion",
+      "experimentId",
+      "experimentVersion",
+      "protocolSha256",
+      "runId",
+      "status",
+      "startedAt",
+      "finishedAt",
+      "completedAt",
+      "preregistrationSha256",
+      "sourceCommit",
+      "dirtyWorktree",
+      "configuration",
+      "dataset",
+      "modelEndpointCapabilityProfile",
+      "modelIdentifier",
+      "backend",
+      "sampling",
+      "seeds",
+      "executionOrder",
+      "resourceBudgets",
+      "perCaseAccounting",
+      "rawOutputs",
+      "validatorResults",
+      "aggregateMetrics",
+      "providerCalls",
+      "secretLeasesReleased",
+      "model",
+      "reasoningControl",
+      "modelTransport",
+      "productBootstrapModulesRemainRejected",
+      "linuxControlGroupProof",
+      "failure",
+      "artifacts"
+    ]
+  },
+  "independentValidation": {
+    "analyzerPath": "scripts/experiments/probes/general-agent-live-v0/verify-tool-registry.mjs",
+    "readsOnlyArtifacts": false,
+    "importsTreatmentImplementation": false,
+    "requiredChecks": [
+      "Byte-identical preregistration, exact manifest identity, all required artifact digests, four case rows, ten model calls, and ten raw provider responses.",
+      "Each provider request body is derived exactly from its corresponding Core model-call input, including messages, output contract, thinking.type, max_tokens, and absence or presence of response_format.",
+      "Exact paired outcomes, tool sequence, tool arguments, registry schemas and digest identity, capability inventory, observed planning reasoning, Scheduler completion, and exact child stop.",
+      "Per-case logical calls, attempts, retries, errors, elapsed milliseconds, and provider token usage are independently recomputed; monetary cost is explicitly unmeasured and no currency budget is claimed.",
+      "The verifier reads retained artifacts, frozen current source bytes, the source preregistration, and configured fixture values from .env solely for byte-level source and private-value leakage checks.",
+      "No configured endpoint, API key, authorization field, capability handle field, raw storage capability, or product/Linux support overclaim appears in retained artifacts.",
+      "All implementation and relevant production source paths match frozen SHA-256 values; runtime-bootstrap still contains the Module migration refusal.",
+      "The independent verifier rejects exactly the eighteen named mutations after dependent hashes are recomputed."
+    ],
+    "mutationTests": [
+      "capability-type-raw-storage",
+      "capability-version-v1",
+      "chat-input-v2",
+      "json-call-text-output-contract",
+      "prose-wrapped-json",
+      "planner-response-format-present",
+      "registry-digest-mismatch",
+      "list-schema-limit-four",
+      "list-argument-four",
+      "provider-row-missing",
+      "case-row-missing",
+      "artifact-digest-missing",
+      "reasoning-evidence-missing",
+      "scheduler-completion-false",
+      "child-stop-false",
+      "fixture-secret-value",
+      "authorization-field",
+      "capability-handle-field"
+    ]
+  },
+  "safetyBoundary": {
+    "productRuntimeUsed": true,
+    "moduleLaunchAllowed": true,
+    "networkAccessAllowed": true,
+    "privateDataAllowed": true,
+    "paidServicesAllowed": true,
+    "knownP0PathReachable": false,
+    "moduleStartupRefusalMustRemain": true
+  },
+  "domainDesign": {
+    "implementationStatus": "Candidate integration only: real Core components and a real isolated child are assembled outside product bootstrap; product Module startup stays rejected. v3 separates untrusted text planning from strict JSON actions.",
+    "implementationFiles": {
+      "scripts/experiments/probes/general-agent-live-v0/run.mts": "75774c8579fbe1f65ee336c81acdaee8a97a3b35597c51f219df9d19b3e19ca0",
+      "scripts/experiments/probes/general-agent-live-v0/extension.mjs": "f1f949ba0bc4d7009278685651512061a6cc4b443e7a68e0cb2a8bf4f5a7d988",
+      "scripts/experiments/probes/general-agent-live-v0/verify-tool-registry.mjs": "93e217010c00954170ba67163b4711bb8e8202f6724783c062251535813c9298"
+    },
+    "model": {
+      "endpointFixture": "owner Aether OpenAI-compatible deployment",
+      "modelId": "qwen3.6-27b",
+      "planningReasoningPolicy": "require",
+      "continuationReasoningPolicy": "disable",
+      "planningMaxOutputTokens": 5200,
+      "continuationMaxOutputTokens": 800,
+      "responseStrategyId": "aether.qwen.chat.response.v2",
+      "automaticProviderRetries": 0,
+      "descriptorSchemaVersion": "dolly.model-descriptor/4",
+      "descriptorVersion": "owner-aether-qwen3.6-27b-v2",
+      "jsonObjectOutputStrategyId": "openai.response-format.json-object.v1",
+      "modelCapabilityVersion": "v2",
+      "chatInputSchemaVersion": "dolly.model.chat-input/3",
+      "proseExtractionFallbackAllowed": false,
+      "temperatureWire": "omitted",
+      "providerTemperatureDefault": "unverified",
+      "planningOutputContract": {
+        "kind": "text"
+      },
+      "actionOutputContract": {
+        "kind": "json-object"
+      },
+      "hostGrantedOutputContracts": [
+        "text",
+        "json-object"
+      ],
+      "providerCallPlan": [
+        {
+          "callIndex": 1,
+          "conditionId": "no-storage-tool",
+          "seed": 7421,
+          "outputKind": "json-object",
+          "thinkingType": "disabled",
+          "maxOutputTokens": 800
+        },
+        {
+          "callIndex": 2,
+          "conditionId": "tool-registry-storage",
+          "seed": 7421,
+          "outputKind": "text",
+          "thinkingType": "enabled",
+          "maxOutputTokens": 5200
+        },
+        {
+          "callIndex": 3,
+          "conditionId": "tool-registry-storage",
+          "seed": 7421,
+          "outputKind": "json-object",
+          "thinkingType": "disabled",
+          "maxOutputTokens": 800
+        },
+        {
+          "callIndex": 4,
+          "conditionId": "tool-registry-storage",
+          "seed": 7421,
+          "outputKind": "json-object",
+          "thinkingType": "disabled",
+          "maxOutputTokens": 800
+        },
+        {
+          "callIndex": 5,
+          "conditionId": "tool-registry-storage",
+          "seed": 7421,
+          "outputKind": "json-object",
+          "thinkingType": "disabled",
+          "maxOutputTokens": 800
+        },
+        {
+          "callIndex": 6,
+          "conditionId": "tool-registry-storage",
+          "seed": 7422,
+          "outputKind": "text",
+          "thinkingType": "enabled",
+          "maxOutputTokens": 5200
+        },
+        {
+          "callIndex": 7,
+          "conditionId": "tool-registry-storage",
+          "seed": 7422,
+          "outputKind": "json-object",
+          "thinkingType": "disabled",
+          "maxOutputTokens": 800
+        },
+        {
+          "callIndex": 8,
+          "conditionId": "tool-registry-storage",
+          "seed": 7422,
+          "outputKind": "json-object",
+          "thinkingType": "disabled",
+          "maxOutputTokens": 800
+        },
+        {
+          "callIndex": 9,
+          "conditionId": "tool-registry-storage",
+          "seed": 7422,
+          "outputKind": "json-object",
+          "thinkingType": "disabled",
+          "maxOutputTokens": 800
+        },
+        {
+          "callIndex": 10,
+          "conditionId": "no-storage-tool",
+          "seed": 7422,
+          "outputKind": "json-object",
+          "thinkingType": "disabled",
+          "maxOutputTokens": 800
+        }
+      ]
+    },
+    "toolPath": {
+      "childCapabilityTypes": [
+        "model-operation",
+        "tool-invocation"
+      ],
+      "registryVersion": "dolly.tool-registry-view/2",
+      "roundResultVersion": "dolly.tool-round-result/2",
+      "schemaDialect": "dolly.tool-value-schema/1",
+      "configuredListLimit": 3,
+      "rawStorageHandleToChild": false,
+      "journal": "InMemoryToolJournalRepository is acceptable only because both tools are read-only and this canary makes no crash-recovery claim.",
+      "modelCapabilityVersion": "v2"
+    },
+    "executionOrder": [
+      {
+        "evaluationSeed": 7421,
+        "conditionId": "no-storage-tool",
+        "repetition": 1
+      },
+      {
+        "evaluationSeed": 7421,
+        "conditionId": "tool-registry-storage",
+        "repetition": 1
+      },
+      {
+        "evaluationSeed": 7422,
+        "conditionId": "tool-registry-storage",
+        "repetition": 2
+      },
+      {
+        "evaluationSeed": 7422,
+        "conditionId": "no-storage-tool",
+        "repetition": 2
+      }
+    ],
+    "supportBoundary": {
+      "durableToolJournal": false,
+      "nativeProviderToolCalling": false,
+      "linuxControlGroupProof": false,
+      "productBootstrapModulesRemainRejected": true
+    },
+    "productionSourceFiles": {
+      "src/adapters/extension-process-module-executor.ts": "9ddd4cb53d9e7c979a6e94ae1f728a9899ca42b9774104271daf35afd35b0a36",
+      "src/core/delivery-store.ts": "eca73a86e20d1453eeb2a65580234070eb15bb97cb267744ede21bad18858468",
+      "src/core/extension-process-host.ts": "fe3901427a3ceff3a95fdae7226c4f35a6c81f5437b32e1231c54680c435eab5",
+      "src/core/file-core-state-store.ts": "1759840f7c7599fa6a78ce691e58c0835597914cc0d84e7509b8ea5553a59777",
+      "src/core/model-provider-broker.ts": "d29ae2a70189a77c9d9b2ab435b4375333795f957046a1c223886f0d634aa933",
+      "src/core/model-provider-chat.ts": "ac2fff57027e0d3088cb11eae9883ec3fce5065a3bba756de444317118f260c1",
+      "src/core/model-provider-descriptor.ts": "710d640db6c52d2f29f5a846a3312279da7d33d09f33c9838d80bb1762e4e42e",
+      "src/core/module-result-commit-factory.ts": "a2a824bbf724235ea5658c9188784490fc4fc7c1606b45571de143bb0bc5cd39",
+      "src/core/module-result-commit.ts": "ea08ce8bacb0427c3118743a06b63b55960a86b084245e567b69e836f30f8806",
+      "src/core/module-scheduler.ts": "21de74e45e0c679c07a9a447fb47ee64f78699f1106dbe79c9df91fc160cdfda",
+      "src/core/provider-capabilities/model-operation-capability.ts": "618e418cc6f67ce24ee23b5f3502e9bbb5ffad0ae47a8ee8c3463d4e7a64cd7d",
+      "src/core/provider-capabilities/tool-invocation-capability.ts": "832345f2c8834269d2ae18a8277ea36db084910c6e18277ebd609901bce4c002",
+      "src/core/reactive-module-host.ts": "360bb3f5ec3edc5b146dd849aeb095f9f6646c1a75b1ca89a445b1ddd4ea1c0d",
+      "src/core/reactive-module-runtime.ts": "2b5259f5774194ae35fc273c74547eabb08ee996673d84d4353a94fcbd82e9e9",
+      "src/core/runtime-bootstrap.ts": "bb8a47b20a65664011fdeb459b4f2d4a11a506c66d19e1ba0d46a32cdf14afaf",
+      "src/core/tool-policy.ts": "6097043ef7aa059924ef1b644c847dbf0e9296a255f5d0786dbb4025328dcbf9"
+    },
+    "dataset": {
+      "schemaVersion": "general-agent-tool-registry/dataset/1",
+      "contentSha256": "d9d2f4005beff10e65f2dba7ca097fec271179310a402e10a63156bb17831057"
+    },
+    "resourceAccounting": {
+      "maximumLogicalProviderCalls": 10,
+      "maximumProviderAttempts": 10,
+      "automaticRetries": 0,
+      "perCaseProviderCalls": [
+        1,
+        4,
+        4,
+        1
+      ],
+      "currencyCostMeasured": false,
+      "monetaryBudgetEnforced": false,
+      "finiteCostProxies": [
+        "logical provider calls",
+        "max output tokens",
+        "per-call timeout",
+        "per-case timeout",
+        "run wall clock"
+      ]
+    }
+  }
+}

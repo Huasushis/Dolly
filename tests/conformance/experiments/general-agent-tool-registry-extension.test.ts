@@ -74,6 +74,103 @@ function descriptor(options: {
 }
 
 describe("general Agent tool-registry Extension", () => {
+  it.each([
+    [
+      "a Markdown-fenced object",
+      '```json\n{"answer":"unknown","grounded":false,"evidenceKeys":[]}\n```',
+    ],
+    [
+      "an object-valued answer",
+      '{"answer":{"value":"unknown"},"grounded":false,"evidenceKeys":[]}',
+    ],
+  ])("rejects %s from a v2 model capability", async (_label, invalidContent) => {
+    mkdirSync(WORKSPACE_TMP, { recursive: true, mode: 0o700 });
+    const scratch = mkdtempSync(join(WORKSPACE_TMP, "dolly-agent-json-fence-"));
+    let identifier = 0;
+    const host = new ExtensionProcessHost({
+      isolation: "process",
+      trust: "trusted",
+      isolationPolicy: new ExtensionIsolationPolicy(),
+      manifest: MANIFEST,
+      command: process.execPath,
+      args: [EXTENSION],
+      workingDirectory: scratch,
+      instanceId: "instance-fence",
+      moduleId: "module-fence",
+      moduleGenerationId: "module-generation-fence",
+      moduleKind: "general-agent",
+      config: {},
+      maxFrameBytes: 1024 * 1024,
+      maxConcurrentCapabilityRequests: 1,
+      initializationTimeoutMs: 5_000,
+      shutdownRequestTimeoutMs: 1_000,
+      forceKillDelayMs: 500,
+      terminationTimeoutMs: 2_000,
+      nextIdentifier: (purpose) => `${purpose}-${++identifier}`,
+    });
+    host.grantCapability(
+      {
+        capabilityType: "model-operation",
+        capabilityVersion: "v2",
+        operations: ["chat", "describe"],
+        resourceScope: {
+          executionScope: "active-run",
+          model: "fake",
+          outputContracts: ["text", "json-object"],
+        },
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        maxInvocations: 2,
+        maxConcurrentInvocations: 1,
+        maxArgumentBytes: 128 * 1024,
+        maxResultBytes: 128 * 1024,
+        requireIdempotencyKey: true,
+      },
+      async (_argumentsValue, context): Promise<JsonValue> =>
+        context.operation === "describe"
+          ? {
+              schemaVersion: "dolly.model-operation-description/2",
+              modality: "chat",
+              outputContracts: ["json-object", "text"],
+            }
+          : {
+              schemaVersion: "dolly.model-operation-result/1",
+              operation: "chat",
+              status: "succeeded",
+              output: {
+                finalContent: invalidContent,
+                finishReason: "stop",
+                reasoning: { state: "not-observed" },
+              },
+            },
+    );
+    try {
+      await host.start();
+      await expect(host.execute({
+        moduleJobId: "module-job-fence",
+        runId: "run-fence",
+        attempt: 1,
+        deadline: new Date(Date.now() + 5_000).toISOString(),
+        responseTimeoutMs: 10_000,
+        hasMore: false,
+        input: {
+          blockGroups: [{
+            block: {
+              payload: {
+                schema: "dolly.content/1",
+                value: {
+                  items: [{ type: "text", text: "Answer without guessing.", format: "plain" }],
+                },
+              },
+            },
+          }],
+        },
+      })).rejects.toThrow();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("uses Host-selected tool names and limits instead of storage-name constants", async () => {
     mkdirSync(WORKSPACE_TMP, { recursive: true, mode: 0o700 });
     const scratch = mkdtempSync(join(WORKSPACE_TMP, "dolly-agent-tool-registry-extension-"));
@@ -183,26 +280,34 @@ describe("general Agent tool-registry Extension", () => {
 
     let modelRound = 0;
     const prompts: string[] = [];
+    const outputContracts: unknown[] = [];
     host.grantCapability(
       {
         capabilityType: "model-operation",
         capabilityVersion: "v2",
-        operations: ["chat"],
+        operations: ["chat", "describe"],
         resourceScope: {
           executionScope: "active-run",
           model: "fake",
-          outputContracts: ["json-object"],
+          outputContracts: ["text", "json-object"],
         },
         expiresAt: "2099-01-01T00:00:00.000Z",
-        maxInvocations: 3,
+        maxInvocations: 5,
         maxConcurrentInvocations: 1,
         maxArgumentBytes: 128 * 1024,
         maxResultBytes: 128 * 1024,
         requireIdempotencyKey: true,
       },
-      async (argumentsValue) => {
+      async (argumentsValue, context): Promise<JsonValue> => {
+        if (context.operation === "describe") {
+          return {
+            schemaVersion: "dolly.model-operation-description/2",
+            modality: "chat",
+            outputContracts: ["json-object", "text"],
+          };
+        }
         if (!isJsonObject(argumentsValue)) throw new Error("model arguments are not an object");
-        expect(argumentsValue.outputContract).toEqual({ kind: "json-object" });
+        outputContracts.push(argumentsValue.outputContract);
         const messages = argumentsValue.messages;
         if (!Array.isArray(messages) || !isJsonObject(messages[0])) {
           throw new Error("model messages are absent");
@@ -217,8 +322,10 @@ describe("general Agent tool-registry Extension", () => {
         modelRound += 1;
         const finalContent =
           modelRound === 1
-            ? JSON.stringify({ action: "alpha_discover", arguments: { prefix: "", limit: 3 } })
+            ? "Discover the available keys, read the active note, then answer with its source."
             : modelRound === 2
+            ? JSON.stringify({ action: "alpha_discover", arguments: { prefix: "", limit: 3 } })
+            : modelRound === 3
               ? JSON.stringify({ action: "beta_read", arguments: { key: "deployment-note" } })
               : JSON.stringify({
                   action: "answer",
@@ -282,17 +389,25 @@ describe("general Agent tool-registry Extension", () => {
           { capabilityType: "model-operation", capabilityVersion: "v2" },
           { capabilityType: "tool-invocation", capabilityVersion: "v2" },
         ],
+        modelOutputContracts: ["json-object", "text"],
         answer: { grounded: true, evidenceKeys: ["deployment-note"] },
       });
       expect(agentResult.answer.answer).toContain("EMBER-7421");
+      expect(agentResult.planningNoteChars).toBeGreaterThan(0);
       expect(agentResult.toolRegistry.tools.map((tool: { name: string }) => tool.name)).toEqual([
         "alpha_discover",
         "beta_read",
       ]);
-      expect(prompts).toHaveLength(3);
+      expect(prompts).toHaveLength(4);
       expect(prompts[0]).toContain('"maximum":3');
       expect(prompts[0]).toContain("alpha_discover");
       expect(prompts[0]).toContain("successResultSchema");
+      expect(outputContracts).toEqual([
+        { kind: "text" },
+        { kind: "json-object" },
+        { kind: "json-object" },
+        { kind: "json-object" },
+      ]);
       expect(execute).toHaveBeenCalledTimes(2);
       expect(readFileSync(EXTENSION, "utf8")).not.toMatch(/storage_(?:list|get)/u);
       await host.stop();

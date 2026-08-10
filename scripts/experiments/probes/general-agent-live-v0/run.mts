@@ -90,6 +90,41 @@ const REGISTRY_EXPERIMENT_IMPLEMENTATION_PATHS = [
   "scripts/experiments/probes/general-agent-live-v0/extension.mjs",
   "scripts/experiments/probes/general-agent-live-v0/verify-tool-registry.mjs",
 ] as const;
+const REGISTRY_EXPERIMENT_PRODUCTION_PATHS = [
+  "src/adapters/extension-process-module-executor.ts",
+  "src/core/delivery-store.ts",
+  "src/core/extension-process-host.ts",
+  "src/core/file-core-state-store.ts",
+  "src/core/model-provider-broker.ts",
+  "src/core/model-provider-chat.ts",
+  "src/core/model-provider-descriptor.ts",
+  "src/core/module-result-commit-factory.ts",
+  "src/core/module-result-commit.ts",
+  "src/core/module-scheduler.ts",
+  "src/core/provider-capabilities/model-operation-capability.ts",
+  "src/core/provider-capabilities/tool-invocation-capability.ts",
+  "src/core/reactive-module-host.ts",
+  "src/core/reactive-module-runtime.ts",
+  "src/core/runtime-bootstrap.ts",
+  "src/core/tool-policy.ts",
+] as const;
+const DATASET_DEFINITION = {
+  schemaVersion: "general-agent-tool-registry/dataset/1",
+  task:
+    "Find the active deployment codename in private memory. Use available tools and do not guess.",
+  entries: [
+    {
+      key: "archived-note",
+      value: { status: "archived", codename: "ASH-0000" },
+      updatedAt: NOW,
+    },
+    {
+      key: "deployment-note",
+      value: { status: "active", codename: HIDDEN_CODENAME },
+      updatedAt: NOW,
+    },
+  ],
+} as const;
 
 type AgentConditionId =
   | "no-storage-tool"
@@ -100,9 +135,12 @@ interface AgentExperimentConfiguration {
   readonly experimentId:
     | "general-agent-live-v0"
     | "general-agent-tool-registry-v0"
-    | "general-agent-tool-registry-v1";
+    | "general-agent-tool-registry-v1"
+    | "general-agent-tool-registry-v2"
+    | "general-agent-tool-registry-v3";
   readonly experimentVersion: number;
   readonly modelCapabilityVersion: 1 | 2;
+  readonly separatePlanningCall: boolean;
   readonly runId: string;
   readonly artifactRoot: string;
   readonly preregistrationPath: string;
@@ -116,6 +154,93 @@ interface AgentExperimentConfiguration {
 
 function sha256(bytes: string | Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function isJsonRecord(value: unknown): value is Record<string, JsonValue> {
+  return value !== null && !Array.isArray(value) && typeof value === "object";
+}
+
+function nonNegativeInteger(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) && (value as number) >= 0
+    ? value as number
+    : undefined;
+}
+
+function providerTokenAccounting(rows: readonly JsonValue[]): JsonValue {
+  let prompt = 0;
+  let completion = 0;
+  let total = 0;
+  let recordsWithUsage = 0;
+  let recordsMissingUsage = 0;
+  for (const row of rows) {
+    const response = isJsonRecord(row) && isJsonRecord(row.response)
+      ? row.response
+      : undefined;
+    const usage = response !== undefined && isJsonRecord(response.usage)
+      ? response.usage
+      : undefined;
+    const promptTokens = nonNegativeInteger(usage?.prompt_tokens);
+    const completionTokens = nonNegativeInteger(usage?.completion_tokens);
+    const totalTokens = nonNegativeInteger(usage?.total_tokens);
+    if (promptTokens === undefined || completionTokens === undefined || totalTokens === undefined) {
+      recordsMissingUsage += 1;
+      continue;
+    }
+    prompt += promptTokens;
+    completion += completionTokens;
+    total += totalTokens;
+    recordsWithUsage += 1;
+  }
+  return { prompt, completion, total, recordsWithUsage, recordsMissingUsage };
+}
+
+function caseAccounting(options: {
+  readonly plannedCase: AgentExperimentConfiguration["executionOrder"][number];
+  readonly modelRows: readonly JsonValue[];
+  readonly providerRows: readonly JsonValue[];
+}): JsonValue {
+  let providerAttempts = 0;
+  let retries = 0;
+  let modelErrors = 0;
+  let aggregateLatencyMs = 0;
+  for (const row of options.modelRows) {
+    if (!isJsonRecord(row)) continue;
+    const result = isJsonRecord(row.result) ? row.result : undefined;
+    const usage = result !== undefined && isJsonRecord(result.usage) ? result.usage : undefined;
+    const attempts = nonNegativeInteger(usage?.providerAttempts) ?? 0;
+    providerAttempts += attempts;
+    retries += Math.max(0, attempts - 1);
+    if (result?.status !== "succeeded") modelErrors += 1;
+    const started = typeof row.startedAt === "string" ? Date.parse(row.startedAt) : Number.NaN;
+    const completed = typeof row.completedAt === "string" ? Date.parse(row.completedAt) : Number.NaN;
+    if (Number.isFinite(started) && Number.isFinite(completed) && completed >= started) {
+      aggregateLatencyMs += completed - started;
+    }
+  }
+  const providerErrors = options.providerRows.filter(
+    (row) =>
+      !isJsonRecord(row) ||
+      row.httpStatus !== 200 ||
+      Object.hasOwn(row, "failureKind"),
+  ).length;
+  return {
+    evaluationSeed: options.plannedCase.evaluationSeed,
+    repetition: options.plannedCase.repetition,
+    conditionId: options.plannedCase.conditionId,
+    providerCalls: options.modelRows.length,
+    providerAttempts,
+    retries,
+    modelErrors,
+    providerErrors,
+    aggregateLatencyMs,
+    tokens: providerTokenAccounting(options.providerRows),
+    monetaryCost: {
+      measured: false,
+      currency: null,
+      amount: null,
+      enforcedBudget: false,
+    },
+  };
 }
 
 class ExperimentFetchTransport implements ModelHttpTransport {
@@ -257,6 +382,7 @@ function parseArguments(argv: readonly string[]): AgentExperimentConfiguration {
       experimentId: "general-agent-live-v0",
       experimentVersion: 8,
       modelCapabilityVersion: 1,
+      separatePlanningCall: false,
       runId,
       artifactRoot: join(
         repositoryRoot,
@@ -287,6 +413,7 @@ function parseArguments(argv: readonly string[]): AgentExperimentConfiguration {
       experimentId: "general-agent-tool-registry-v0",
       experimentVersion: 1,
       modelCapabilityVersion: 1,
+      separatePlanningCall: false,
       runId,
       artifactRoot: join(
         repositoryRoot,
@@ -329,6 +456,7 @@ function parseArguments(argv: readonly string[]): AgentExperimentConfiguration {
       experimentId: "general-agent-tool-registry-v1",
       experimentVersion: 2,
       modelCapabilityVersion: 2,
+      separatePlanningCall: false,
       runId,
       artifactRoot: join(
         repositoryRoot,
@@ -366,8 +494,94 @@ function parseArguments(argv: readonly string[]): AgentExperimentConfiguration {
       ],
     };
   }
+  if (/^registry-v3-[A-Za-z0-9._-]+$/u.test(runId)) {
+    return {
+      experimentId: "general-agent-tool-registry-v2",
+      experimentVersion: 3,
+      modelCapabilityVersion: 2,
+      separatePlanningCall: true,
+      runId,
+      artifactRoot: join(
+        repositoryRoot,
+        "artifacts/experiments/probes/general-agent-tool-registry-v2",
+      ),
+      preregistrationPath: join(
+        repositoryRoot,
+        "docs/experiments/preregistrations/general-agent-tool-registry-v2.json",
+      ),
+      executionOrder: [
+        {
+          evaluationSeed: 7421,
+          repetition: 1,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7421",
+        },
+        {
+          evaluationSeed: 7421,
+          repetition: 1,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7421",
+        },
+        {
+          evaluationSeed: 7422,
+          repetition: 2,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7422",
+        },
+        {
+          evaluationSeed: 7422,
+          repetition: 2,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7422",
+        },
+      ],
+    };
+  }
+  if (/^registry-v4-[A-Za-z0-9._-]+$/u.test(runId)) {
+    return {
+      experimentId: "general-agent-tool-registry-v3",
+      experimentVersion: 4,
+      modelCapabilityVersion: 2,
+      separatePlanningCall: true,
+      runId,
+      artifactRoot: join(
+        repositoryRoot,
+        "artifacts/experiments/probes/general-agent-tool-registry-v3",
+      ),
+      preregistrationPath: join(
+        repositoryRoot,
+        "docs/experiments/preregistrations/general-agent-tool-registry-v3.json",
+      ),
+      executionOrder: [
+        {
+          evaluationSeed: 7423,
+          repetition: 1,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7423",
+        },
+        {
+          evaluationSeed: 7423,
+          repetition: 1,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7423",
+        },
+        {
+          evaluationSeed: 7424,
+          repetition: 2,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7424",
+        },
+        {
+          evaluationSeed: 7424,
+          repetition: 2,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7424",
+        },
+      ],
+    };
+  }
   throw new Error(
-    "usage: run.mts --run-id live-v8-<identifier>|registry-v1-<identifier>|registry-v2-<identifier>",
+    "usage: run.mts --run-id live-v8-<identifier>|registry-v1-<identifier>|registry-v2-<identifier>|registry-v3-<identifier>|registry-v4-<identifier>",
   );
 }
 
@@ -701,6 +915,7 @@ async function runCondition(options: {
   runDirectory: string;
   broker: ChatModelBrokerPort;
   modelCapabilityVersion: 1 | 2;
+  separatePlanningCall: boolean;
 }): Promise<JsonValue> {
   const caseIdentity = `${options.conditionId}-seed-${options.evaluationSeed}`;
   const conditionRoot = mkdtempSync(
@@ -752,18 +967,7 @@ async function runCondition(options: {
     const namespace = storage.namespaceFor(instanceId, moduleId);
     storage.replace(
       { namespace, instanceId, moduleId },
-      [
-        {
-          key: "archived-note",
-          value: { status: "archived", codename: "ASH-0000" },
-          updatedAt: NOW,
-        },
-        {
-          key: "deployment-note",
-          value: { status: "active", codename: HIDDEN_CODENAME },
-          updatedAt: NOW,
-        },
-      ],
+      DATASET_DEFINITION.entries,
     );
     const runtimeDeliveries: ReactiveModuleRuntimeOptions["deliveries"] = {
       validateClaimPages: core.deliveries.validateClaimPages.bind(core.deliveries),
@@ -875,6 +1079,13 @@ async function runCondition(options: {
           createdAt: NOW,
           updatedAt: NOW,
         });
+        const modelInvocationLimit = options.separatePlanningCall
+          ? options.conditionId === "no-storage-tool"
+            ? 2
+            : 5
+          : options.conditionId === "no-storage-tool"
+            ? 1
+            : 3;
         const modelOptions = {
           descriptor: descriptorRef,
           ownerScope: "owner-live-fixture",
@@ -892,13 +1103,13 @@ async function runCondition(options: {
           expiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
           now: () => new Date().toISOString(),
           chat: options.broker,
-          operations: ["chat"],
+          operations: options.separatePlanningCall ? ["chat", "describe"] : ["chat"],
           reasoningPolicies: ["require", "disable"],
           roles: ["system", "user"],
           limits: {
-            maxInvocations: options.conditionId === "no-storage-tool" ? 1 : 3,
-            maxInvocationsPerRun: options.conditionId === "no-storage-tool" ? 1 : 3,
-            maxInvocationsPerWindow: options.conditionId === "no-storage-tool" ? 1 : 3,
+            maxInvocations: modelInvocationLimit,
+            maxInvocationsPerRun: modelInvocationLimit,
+            maxInvocationsPerWindow: modelInvocationLimit,
             rateWindowMs: 60_000,
           },
           maxConcurrentInvocations: 1,
@@ -909,7 +1120,9 @@ async function runCondition(options: {
         const modelDefinition = options.modelCapabilityVersion === 2
           ? createModelOperationCapabilityV2({
               ...modelOptions,
-              outputContracts: ["json-object"],
+              outputContracts: options.separatePlanningCall
+                ? ["text", "json-object"]
+                : ["json-object"],
             })
           : createModelOperationCapability(modelOptions);
         extensionHost.grantCapability(modelDefinition.grant, modelDefinition.handler);
@@ -1065,7 +1278,7 @@ async function runCondition(options: {
           value: {
             items: [{
               type: "text",
-              text: "Find the active deployment codename in private memory. Use available tools and do not guess.",
+              text: DATASET_DEFINITION.task,
               format: "plain",
             }],
           },
@@ -1135,10 +1348,11 @@ async function main(): Promise<void> {
   const protocolBytes = readFileSync(join(repositoryRoot, "docs/experiments/protocol.md"));
   const protocolSha256 = sha256(protocolBytes);
   let implementationSha256: Readonly<Record<string, string>> = {};
+  let productionSourceSha256: Readonly<Record<string, string>> = {};
   if (experiment.experimentId.startsWith("general-agent-tool-registry-")) {
     const preregistration = JSON.parse(preregistrationBytes.toString("utf8")) as {
       protocol?: { sha256?: unknown };
-      domainDesign?: { implementationFiles?: unknown };
+      domainDesign?: { implementationFiles?: unknown; productionSourceFiles?: unknown };
     };
     if (preregistration.protocol?.sha256 !== protocolSha256) {
       throw new Error("experiment protocol bytes differ from the frozen preregistration");
@@ -1170,6 +1384,35 @@ async function main(): Promise<void> {
         return [path, actual];
       }),
     );
+    if (experiment.separatePlanningCall) {
+      const productionFiles = preregistration.domainDesign?.productionSourceFiles;
+      if (
+        productionFiles === null ||
+        Array.isArray(productionFiles) ||
+        typeof productionFiles !== "object"
+      ) {
+        throw new Error("experiment production source digests are absent");
+      }
+      const registeredProductionPaths = Object.keys(productionFiles).sort();
+      if (
+        JSON.stringify(registeredProductionPaths) !==
+        JSON.stringify([...REGISTRY_EXPERIMENT_PRODUCTION_PATHS].sort())
+      ) {
+        throw new Error("experiment production source inventory is invalid");
+      }
+      productionSourceSha256 = Object.fromEntries(
+        Object.entries(productionFiles as Record<string, unknown>).map(([path, expected]) => {
+          if (typeof expected !== "string" || !/^[0-9a-f]{64}$/u.test(expected)) {
+            throw new Error(`experiment production source digest is invalid for ${path}`);
+          }
+          const actual = sha256(readFileSync(join(repositoryRoot, path)));
+          if (actual !== expected) {
+            throw new Error(`experiment production source bytes differ for ${path}`);
+          }
+          return [path, actual];
+        }),
+      );
+    }
   }
   const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], {
     cwd: repositoryRoot,
@@ -1226,6 +1469,8 @@ async function main(): Promise<void> {
   writeFileSync(modelCallsPath, "", { flag: "wx" });
   writeFileSync(providerResponsesPath, "", { flag: "wx" });
   writeFileSync(casesPath, "", { flag: "wx" });
+  const providerResponseRows: JsonValue[] = [];
+  const modelCallRows: JsonValue[] = [];
 
   let secretReleases = 0;
   const secrets: ModelSecretResolver = {
@@ -1246,13 +1491,19 @@ async function main(): Promise<void> {
     bindings,
     secrets,
     transport: new ExperimentFetchTransport((record) => {
+      providerResponseRows.push(record);
       appendFileSync(providerResponsesPath, `${JSON.stringify(record)}\n`, "utf8");
     }),
     now: () => new Date().toISOString(),
   });
   const maximumProviderCalls = experiment.executionOrder.reduce(
     (total, plannedCase) =>
-      total + (plannedCase.conditionId === "no-storage-tool" ? 1 : 3),
+      total +
+        (plannedCase.conditionId === "no-storage-tool"
+          ? 1
+          : experiment.separatePlanningCall
+            ? 4
+            : 3),
     0,
   );
   let providerCalls = 0;
@@ -1265,9 +1516,11 @@ async function main(): Promise<void> {
       const startedAt = new Date().toISOString();
       const result = await broker.invoke(invocation, options);
       const completedAt = new Date().toISOString();
+      const modelCall = safeModelCall(invocation, result, startedAt, completedAt);
+      modelCallRows.push(modelCall);
       appendFileSync(
         modelCallsPath,
-        `${JSON.stringify(safeModelCall(invocation, result, startedAt, completedAt))}\n`,
+        `${JSON.stringify(modelCall)}\n`,
         "utf8",
       );
       return result;
@@ -1281,20 +1534,21 @@ async function main(): Promise<void> {
   const perCaseAccounting: JsonValue[] = [];
   try {
     for (const plannedCase of experiment.executionOrder) {
-      const providerCallsBeforeCase = providerCalls;
+      const modelCallsBeforeCase = modelCallRows.length;
+      const providerResponsesBeforeCase = providerResponseRows.length;
       const caseRow = await runCondition({
         ...plannedCase,
         runDirectory,
         broker: observedBroker,
         modelCapabilityVersion: experiment.modelCapabilityVersion,
+        separatePlanningCall: experiment.separatePlanningCall,
       });
       caseRows.push(caseRow);
-      perCaseAccounting.push({
-        evaluationSeed: plannedCase.evaluationSeed,
-        repetition: plannedCase.repetition,
-        conditionId: plannedCase.conditionId,
-        providerCalls: providerCalls - providerCallsBeforeCase,
-      });
+      perCaseAccounting.push(caseAccounting({
+        plannedCase,
+        modelRows: modelCallRows.slice(modelCallsBeforeCase),
+        providerRows: providerResponseRows.slice(providerResponsesBeforeCase),
+      }));
       appendFileSync(casesPath, `${JSON.stringify(caseRow)}\n`, "utf8");
     }
   } catch (error) {
@@ -1403,12 +1657,20 @@ async function main(): Promise<void> {
           : 8,
       productBootstrapComposition: false,
       implementationSha256,
+      productionSourceSha256,
       modelCapabilityVersion: experiment.modelCapabilityVersion,
+      separatePlanningCall: experiment.separatePlanningCall,
+      modelOutputContracts: experiment.separatePlanningCall
+        ? ["text", "json-object"]
+        : experiment.modelCapabilityVersion === 2
+          ? ["json-object"]
+          : ["text"],
     },
     dataset: {
       id: "synthetic-private-memory-codename",
       version: "1",
       entriesPerCase: 2,
+      contentSha256: sha256(JSON.stringify(DATASET_DEFINITION)),
     },
     modelEndpointCapabilityProfile: {
       networkScope,
@@ -1426,6 +1688,10 @@ async function main(): Promise<void> {
       adapter: "openai-compatible-chat",
       silentFallbackAllowed: false,
     },
+    sampling: {
+      temperatureWire: "omitted",
+      providerDefault: "unverified",
+    },
     seeds: [...new Set(experiment.executionOrder.map((entry) => entry.evaluationSeed))],
     executionOrder: experiment.executionOrder.map((entry) => ({
       evaluationSeed: entry.evaluationSeed,
@@ -1438,6 +1704,8 @@ async function main(): Promise<void> {
       perModelCallTimeoutMs: 180_000,
       perCaseTimeoutMs: 420_000,
       maximumToolCapabilityInvocationsPerTreatment: 3,
+      monetaryCostMeasured: false,
+      monetaryBudgetEnforced: false,
     },
     perCaseAccounting,
     rawOutputs,

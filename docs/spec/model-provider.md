@@ -107,8 +107,10 @@ interface DescriptorRef {
 The common conceptual shape is:
 
 ~~~typescript
-interface DescriptorDocument<TFeatures> {
-  schemaVersion: "dolly.model-descriptor/3";
+interface DescriptorDocument<TFeatures, TSchemaVersion extends
+  "dolly.model-descriptor/3" | "dolly.model-descriptor/4" =
+  "dolly.model-descriptor/3"> {
+  schemaVersion: TSchemaVersion;
   descriptorVersion: string;
   endpointId: string;
   operation: ModelOperationKind;
@@ -127,7 +129,8 @@ interface DescriptorDocument<TFeatures> {
 }
 
 type AnyDescriptor =
-  | (DescriptorDocument<ChatFeatures> & {
+  | (DescriptorDocument<ChatFeatures,
+      "dolly.model-descriptor/3" | "dolly.model-descriptor/4"> & {
       operation: "chat-completion";
     })
   | (DescriptorDocument<EmbeddingFeatures> & {
@@ -652,6 +655,12 @@ the returned object against an application schema; the consumer still validates
 its closed result contract. Plain text, JSON-object syntax, and JSON Schema are
 three different contracts and failures MUST remain visible rather than silently
 downgrading between them.
+
+The current broker enforces exact JSON-object syntax locally. Its
+`json-schema` response check currently proves only that the response is JSON;
+it does not yet evaluate the application schema. Product configuration MUST
+therefore treat JSON Schema output as unsupported until a locally tested schema
+validator is added. Provider-side claims alone are not sufficient evidence.
 
 The normative schema is closed and validates roles, schema dialect, limits,
 tool names, finish reasons, and media requirement identifiers against the frozen
