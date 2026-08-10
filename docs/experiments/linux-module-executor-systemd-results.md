@@ -115,6 +115,61 @@ startup, capability budgets, durable external-effect outcomes, restart
 reconciliation, and failure-matrix coverage remain incomplete. Therefore the
 Module startup refusal is still required.
 
+## 2026-08-10 identity-bound effect closure in the Linux process
+
+At source commit `0d3bfd32461edf906d70167e977bfc22ee7a6cde`, the
+same real-Linux chain was extended with persisted Core input and external-effect
+state. Before execution, the test created one Page subscription, Block,
+Delivery, and active Claim. After the reviewed launcher had become the durable
+`running` process generation, it persisted the exact Module submission record:
+Claim identity, attempt, Module and process generations, and canonical input
+digest. The Host was therefore unable to authorize a different or invented
+Run.
+
+The committed source was archived into the uniquely named disposable systemd
+container `dolly-experiment-855607-0702b18f`. As the unprivileged `dolly`
+account, the test passed 1/1 and reported this sequence:
+
+1. the Extension process with PID 327 executed the exact claimed input in its
+   verified Module control group;
+2. the Host stopped capability admission when the Module result arrived;
+3. the durable effect journal atomically closed that exact Run with an empty
+   effect set;
+4. reopening the journal independently returned `no-effect` for the same
+   Claim and no other Run;
+5. ordered termination wrote the process record as `stopped`, removed the
+   exact Module control group, and proved that PID 327 with its captured start
+   identity no longer existed.
+
+The exact container and image
+`dolly-experiment-855607-0702b18f-image:latest` were then both absent on exact
+Docker inspection. Raw output remains under
+`artifacts/experiments/linux-core-service-ownership/container-855607-20260810T035723Z/`.
+Its retained hashes are:
+
+- `linux-integration.log`:
+  `217eb65ae8979f34bbd54639a3781b2bf4764dd39de29de57d581b8c9e033295`;
+- `source-commit.txt`:
+  `f245406359adc7662ddd588104f0aeed9cdc5ef02edaeda673518d584918dbcb`;
+- `source-snapshot.txt`:
+  `f29a8edfeb13a57a80083bc82a8adf793bef64fb77af5d5a1818d6cdad3e8770`;
+- `environment.txt`:
+  `4c66ed875461b8796fc11fdb7f45f40d4d34a120b081b8afa1e6977bd942d3d5`;
+- `preflight.txt`:
+  `ecf7fce3780e2b756cfc847409343f9dc3196b8e6f9da072679da4c713411c36`;
+- `command.txt`:
+  `be5ccb2bfdafa1d78b1244571c0f62c3f6bc230e1e5ea735340c064b315c8b7b`;
+  and
+- `source-status.txt`:
+  `3827ed29685b1d64326d4f3b1c120d18db18c96a9b08437e04efa3a6464711fd`.
+
+This result combines the real Linux process boundary with a persisted,
+identity-bound empty effect set. It still does not run the Scheduler or
+`ReactiveModuleRuntime`, commit the Module result, exercise a nonempty
+capability effect, or recover the same Run after a Core-process crash. It is a
+product-before-bootstrap integration proof, not permission to remove
+`RUNTIME_MODULE_MIGRATION_REQUIRED`.
+
 ## Failure path exercised
 
 The launcher fixture deliberately does not write its process identifier to the
