@@ -92,6 +92,7 @@ function recordStore(): ModuleProcessRecordStore & {
   return {
     log,
     stoppedRecordWriter: {
+      isStoreBoundTo: () => true,
       isBoundTo(record) {
         return current === record;
       },
@@ -465,6 +466,7 @@ describe("Linux Module process lifecycle order", () => {
     const records = recordStore();
     const fileSystem = fakeCgroupFileSystem();
     const noOpWriter: ModuleProcessStoppedRecordWriter = {
+      isStoreBoundTo: () => true,
       isBoundTo: () => true,
       writeStopped() {
         return { ...processRecord(), state: "stopped" };
@@ -630,6 +632,7 @@ describe("Linux Module process lifecycle order", () => {
       ...NO_PROTOCOL_SESSION,
       records,
       stoppedRecordWriter: {
+        isStoreBoundTo: () => true,
         isBoundTo: () => true,
         writeStopped() {
           return { ...processRecord(), state: "stopped" };

@@ -146,6 +146,7 @@ function recordStore(): ModuleProcessRecordStore {
 
 function stoppedRecordWriter(): ModuleProcessStoppedRecordWriter {
   return {
+    isStoreBoundTo: vi.fn(() => true),
     isBoundTo: vi.fn(() => true),
     writeStopped: vi.fn(() => {
       throw new Error("the derivation must not write process records");

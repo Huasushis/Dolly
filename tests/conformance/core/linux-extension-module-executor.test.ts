@@ -74,6 +74,7 @@ function options(
     ) => processRecord()),
   };
   const stoppedRecordWriter: ModuleProcessStoppedRecordWriter = {
+    isStoreBoundTo: vi.fn(() => true),
     isBoundTo: vi.fn(() => true),
     writeStopped: vi.fn(() => processRecord({ state: "stopped" })),
   };

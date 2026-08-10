@@ -67,6 +67,8 @@ export interface ModuleProcessRecord {
  * process group has stopped.
  */
 export interface ModuleProcessStoppedRecordWriter {
+  /** Rejects product composition that pairs this authority with another Core store. */
+  isStoreBoundTo(store: unknown): boolean;
   /** Uses the store's stable current-record identity to reject another store. */
   isBoundTo(record: ModuleProcessRecord): boolean;
   writeStopped(

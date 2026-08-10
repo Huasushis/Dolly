@@ -310,6 +310,7 @@ function recordStore(): ModuleProcessRecordStore & {
       return records.get(IDENTITY.processGenerationId);
     },
     stoppedRecordWriter: {
+      isStoreBoundTo: () => true,
       isBoundTo(record) {
         return records.get(record.processGenerationId) === record;
       },

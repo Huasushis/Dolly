@@ -94,6 +94,7 @@ function recordStore(
   const log: string[] = [];
   let current = processRecord();
   const stoppedRecordWriter: ModuleProcessStoppedRecordWriter = {
+    isStoreBoundTo: () => true,
     isBoundTo(record) {
       return current === record;
     },

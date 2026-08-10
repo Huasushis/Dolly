@@ -445,6 +445,19 @@ identities. This factory still does not persist or start the process by itself;
 `ModuleActor` and the Linux lifecycle remain the only owners of those actions.
 The current product bootstrap does not construct the factory.
 
+`createInstalledReactiveModuleRuntime` consumes that generation factory and
+binds it to one direct `FileCoreStateStore`: input Claims, process records, Run
+submissions, Claim terminal transitions, and result effects therefore cannot be
+supplied from different Core stores. The restricted stopped-record writer must
+prove that it came from the same store, and result commits require the durable
+file repository rather than an in-memory test repository. Runtime limits,
+routes, timeouts, and configuration come from the resolved Module record. This
+first boundary accepts only `declaredExternalEffects: "none"` and no permission
+policy identifiers; it grants no effect capability. A capability-bearing Agent
+requires a later host-owned permission and durable-effect composition instead
+of an arbitrary setup callback. The runtime is returned unstarted and product
+bootstrap still does not consume it.
+
 ### 5.2 Proposed Linux Module process limits
 
 This section defines the configuration required before the first Linux Module

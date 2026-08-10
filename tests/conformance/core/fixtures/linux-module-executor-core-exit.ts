@@ -55,6 +55,9 @@ const executor = createLinuxModuleExecutor({
       },
     },
     stoppedRecordWriter: {
+      isStoreBoundTo() {
+        return true;
+      },
       isBoundTo(record) {
         return currentRecord === record;
       },

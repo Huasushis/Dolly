@@ -607,6 +607,7 @@ describe("CORE startup reconciliation with Module records", () => {
         commits: openCommits(store),
         moduleRecords: store,
         stoppedRecordWriter: {
+          isStoreBoundTo: () => true,
           isBoundTo: () => true,
           writeStopped: () => processRecord({ state: "stopped" }),
         },

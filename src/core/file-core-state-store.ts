@@ -1525,6 +1525,10 @@ export class FileCoreStateStore {
     pendingStoppedRecordWriters.set(
       this,
       Object.freeze({
+        isStoreBoundTo: (candidate: unknown) => {
+          this.#assertUsable();
+          return candidate === this;
+        },
         isBoundTo: (record: ModuleProcessRecord) => {
           this.#assertUsable();
           return this.#moduleProcessRecords.get(record.processGenerationId) === record;
