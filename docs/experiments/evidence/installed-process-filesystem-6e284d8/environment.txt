@@ -1,0 +1,17 @@
+Date: 2026-08-12 UTC
+Base image: docker.m.daocloud.io/library/ubuntu:24.04
+systemd: 255 (255.4-1ubuntu8.17)
+Node.js: v20.20.2
+Python: 3.12.3
+Control-group filesystem: cgroup2fs
+Root controllers: cpuset cpu io memory hugetlb pids rdma misc
+Unprivileged test identity: uid=1001 gid=997 groups=997
+User lingering: enabled inside the disposable validation container
+
+Focused container: dolly-experiment-3526362-21539458
+Focused local artifacts: artifacts/experiments/linux-core-service-ownership/container-3526362-20260812T192702Z
+Wider container: dolly-experiment-3527871-f12f5aa0
+Wider local artifacts: artifacts/experiments/linux-core-service-ownership/container-3527871-20260812T192857Z
+
+Both exact container names returned absent from docker inspect after their
+runner completed.

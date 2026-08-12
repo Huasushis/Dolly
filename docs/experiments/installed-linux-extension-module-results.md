@@ -80,6 +80,42 @@ which the runner removed by exact name. Its raw local log SHA-256 was
 the portable summary is in
 `docs/experiments/evidence/installed-active-run-media-96a52ce/`.
 
+## Host filesystem allowlist follow-up
+
+On 2026-08-12 UTC, source
+`6e284d80caff631702b8be90ea97132b546c6dc6` replaced the installed process's
+read-only bind of the entire Host root with a minimal guest filesystem. The
+candidate now exposes read-only `/usr`, private runtime directories, the exact
+selected Node.js executable, and the exact installed package; it does not mount
+Host `/etc`, `/home`, `/var`, Core state, configuration stores, or other
+instance data.
+
+The counterexample used a mode-0600 file in a sibling private directory rather
+than under the active Core-state directory. The old implementation could read
+that file because it mounted `/`; the corrected real installed process received
+`ENOENT`. In the first uniquely named Ubuntu 24.04 systemd container,
+`dolly-experiment-3526362-21539458`, the exact Linux executor file passed 2/2
+tests. In a separate container, `dolly-experiment-3527871-f12f5aa0`, the wider
+installed Scheduler and inline-Media Agent files passed 7/7 tests. Those cases
+covered output-capacity recovery, startup recovery without producer
+re-execution, a strict-streaming registered-tool Agent, task switching and
+checkpoint reload, source and periodic activations, and a strict-streaming
+inline-image Agent. Every reported process record reached `stopped`, every
+reported Module control group was removed, and post-run inspection found both
+exact containers absent.
+
+Portable commands, environment, results, and raw-artifact hashes are in
+`docs/experiments/evidence/installed-process-filesystem-6e284d8/`. The local raw
+logs remain under the two recorded artifact directories.
+
+This closes the independent Host-private-file read counterexample; it does not
+promote the boundary to a complete sandbox. In particular, the installation
+registry currently returns a verified path rather than an immutable file-tree
+snapshot, so another same-user Host writer could change managed package bytes
+between validation and the later read-only bind. That time-of-check/time-of-use
+boundary remains open and must not be papered over by a second path hash with
+another race window.
+
 ## What this does not prove
 
 This result does not prove that configured Modules are product-supported.

@@ -573,6 +573,20 @@ refused, and the installed package format still requires an empty
 requested-capability list so package content cannot enlarge authority. The
 runtime is returned unstarted and product bootstrap still does not consume it.
 
+The current Linux candidate does not expose the Host root filesystem inside an
+installed process. Its mount namespace contains a read-only `/usr`, private
+`/dev`, `/proc`, `/run`, and `/tmp`, the exact selected Node.js executable at a
+fixed guest path, and the exact installed package at another fixed read-only
+guest path. Host `/etc`, `/home`, `/var`, Core state, configuration stores, and
+other instance data are absent. A real control-group regression places a
+mode-0600 file outside the active Core-state directory and verifies that the
+installed process receives `ENOENT`; this specifically prevents the previous
+read-only-root false boundary, in which same-user private data remained
+readable. This is still recorded as the conservative `unrestricted` external-
+effect boundary: the allowlist has not established a complete security-sandbox
+contract, and package bytes are not yet bound to an immutable mount snapshot
+between installation-registry validation and process start.
+
 ### 5.2 Proposed Linux Module process limits
 
 This section defines the configuration required before the first Linux Module

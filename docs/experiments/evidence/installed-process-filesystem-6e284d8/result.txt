@@ -1,0 +1,27 @@
+Result: PASS, limited to the internal product-before-bootstrap Linux candidate.
+
+Focused validation:
+- 1 test file passed; 2/2 tests passed in 1.59 seconds.
+- The installed process could execute the exact selected Node.js program and
+  installed package from the guest allowlist.
+- A mode-0600 file in a sibling Host-private directory was absent inside the
+  installed process (`ENOENT`).
+- Process records reached stopped, Module control groups were removed, and
+  exact process identities were gone.
+
+Wider validation:
+- 2 test files passed; 7/7 tests passed in 14.47 seconds.
+- Covered output-capacity recovery, startup recovery without producer
+  re-execution, strict-streaming registered-tool Agent execution, task switch
+  and checkpoint reload, source activation, periodic activation, and a
+  strict-streaming inline-image Agent.
+- The image case made one strict-SSE provider request, committed one result,
+  left zero Media leases, reached a stopped process record, and removed its
+  Module control group.
+- The Scheduler cases reported stopped final records and removed control
+  groups; the intentionally unresolved shutdown Claim remained fail-closed.
+
+This evidence does not show public Module support, a complete sandbox, Windows
+or macOS equivalence, real-provider intelligence in the deterministic installed
+fixtures, or immutable installed-package bytes. `openDollyRuntime` still
+rejects configured Modules with `RUNTIME_MODULE_MIGRATION_REQUIRED`.
