@@ -65,8 +65,8 @@ async function main() {
       id: 'alter-agent-action',
       apply: async (directory) => {
         const rows = parseJsonl(await readFile(path.join(directory, 'cases.jsonl')));
-        const row = rows.find((candidate) => candidate.output !== null);
-        if (!row) throw new Error('no Agent output available for mutation');
+        const row = rows.find((candidate) => candidate.output !== null && candidate.metrics.groundedResumeSuccess === 1);
+        if (!row) throw new Error('no successful Agent output available for mutation');
         row.output.action = 'perform a different action';
         await refreshIntegrity(directory, 'cases.jsonl', jsonLines(rows));
       },
@@ -75,8 +75,8 @@ async function main() {
       id: 'inject-ineligible-citation',
       apply: async (directory) => {
         const rows = parseJsonl(await readFile(path.join(directory, 'cases.jsonl')));
-        const row = rows.find((candidate) => candidate.output !== null);
-        if (!row) throw new Error('no Agent output available for mutation');
+        const row = rows.find((candidate) => candidate.output !== null && candidate.metrics.groundedResumeSuccess === 1);
+        if (!row) throw new Error('no successful Agent output available for mutation');
         row.output.usedEvidenceIds.push(forbiddenBySeed.get(row.seed));
         await refreshIntegrity(directory, 'cases.jsonl', jsonLines(rows));
       },

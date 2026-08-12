@@ -404,6 +404,8 @@ async function main() {
   const checkpointRows = parseJsonl(bytes['checkpoints.jsonl'], 'checkpoints.jsonl');
   const caseRows = parseJsonl(bytes['cases.jsonl'], 'cases.jsonl');
   const rawRows = parseJsonl(bytes['model-raw.jsonl'], 'model-raw.jsonl');
+  const rawByIndex = new Map(rawRows.map((row) => [row.callIndex, row]));
+  if (rawByIndex.size !== rawRows.length) fail('duplicate model call index');
   if (datasetRows.length !== 8 || checkpointRows.length !== 32 || caseRows.length !== 48) fail('row coverage mismatch');
   if (!same(datasetRows.map((row) => row.seed).sort((a, b) => a - b), seeds)) fail('dataset seed coverage mismatch');
   const datasets = new Map(datasetRows.map((row) => [row.seed, row]));
@@ -427,10 +429,19 @@ async function main() {
     if (!same(row.evidenceRecordIds, expectedIds)) fail(`checkpoint ${key} evidence mismatch`);
     const expectedMetrics = scoreCheckpoint(row.checkpoint, dataset);
     if (!same(row.metrics, expectedMetrics)) fail(`checkpoint ${key} metric mismatch`);
+    if (row.checkpointType === 'extractive') {
+      if (row.modelCallIndex !== null) fail(`extractive checkpoint ${key} unexpectedly links a model call`);
+    } else {
+      const raw = rawByIndex.get(row.modelCallIndex);
+      if (!raw || raw.kind !== 'checkpoint' || raw.callId !== `checkpoint-${row.seed}-${row.association}-generated`) {
+        fail(`generated checkpoint ${key} model link mismatch`);
+      }
+      if (!Array.isArray(raw.request.messages) || raw.request.messages.length !== 2) fail(`generated checkpoint ${key} prompt shape mismatch`);
+      const prompt = JSON.parse(raw.request.messages[1].content);
+      if (!same(prompt.records?.map((record) => record.id), expectedIds)) fail(`generated checkpoint ${key} prompt records mismatch`);
+    }
   }
 
-  const rawByIndex = new Map(rawRows.map((row) => [row.callIndex, row]));
-  if (rawByIndex.size !== rawRows.length) fail('duplicate model call index');
   const logicalGroups = new Map();
   for (const row of rawRows) {
     if (!Number.isSafeInteger(row.logicalCallIndex) || row.logicalCallIndex < 0 || row.logicalCallIndex >= 64) fail('logical call index invalid');
@@ -485,6 +496,12 @@ async function main() {
     if (!same(row.metrics, expectedMetrics)) fail(`case ${key} metric mismatch`);
     const raw = rawByIndex.get(row.modelCallIndex);
     if (!raw || raw.kind !== 'agent' || raw.callId !== `agent-${row.seed}-${row.cellId}`) fail(`case ${key} model link mismatch`);
+    if (!Array.isArray(raw.request.messages) || raw.request.messages.length !== 5) fail(`case ${key} prompt shape mismatch`);
+    const promptContext = raw.request.messages.slice(1, 4).map((message) => ({ role: message.role, content: message.content }));
+    const expectedContext = dataset.activeContext.map((message) => ({ role: message.role, content: message.text }));
+    if (!same(promptContext, expectedContext)) fail(`case ${key} active prompt context mismatch`);
+    const prompt = JSON.parse(raw.request.messages[4].content);
+    if (!same(prompt.memoryEvidence, row.evidence)) fail(`case ${key} prompt evidence mismatch`);
   }
   if (caseKeys.size !== 48) fail('factorial case coverage mismatch');
 
