@@ -671,6 +671,29 @@ Version 2 replaces the former arbitrary `mediaRef` value with the strict
 `mediaReference` Block item and removes `attachmentSlot`. Version 1 and either
 removed field MUST be rejected; there is no implicit compatibility conversion.
 
+The installed `openai.chat.request.text-parts.v1` request strategy remains
+text-only. It MUST continue to reject every Media part. The separate
+`openai.chat.request.content-parts.v1` strategy currently has one deliberately
+narrow Media mapping:
+
+- the enabled requirement is `image`, accepts exactly `image/png`, and permits
+  only `inline` delivery;
+- `providerFetchesAfterAcceptance` is `false`;
+- its lifetime strategy is `media.inline-copy.v1` and its placement strategy is
+  `openai.chat.media.inline-image-url.v1`;
+- the reference is uncropped; and
+- the provider content part is exactly an OpenAI-compatible `image_url` whose
+  URL is a data URL constructed from a Host-resolved inline copy.
+
+The descriptor registry rejects an active combination that mixes this request
+strategy with another MIME type, delivery mode, lifetime, placement strategy,
+or remote-fetch claim. Adding JPEG, a URL, a crop, provider upload, or another
+provider body shape requires a separately versioned and tested strategy. The
+current descriptor has no endpoint-specific image-dimension fields; the
+bounded image inspector's global decoded-pixel limit is therefore the only
+dimension bound, and this strategy MUST NOT be described as enforcing a model
+endpoint's width or height limits.
+
 ### 6.3 Reasoning wire contract
 
 ~~~typescript
@@ -961,6 +984,38 @@ provider request. It receives no Media access permission or lease and cannot
 resolve, refresh, publish, retain, or independently use the grant. Consumer
 state, model descriptions, cache keys, provenance, and normal logs contain only
 Media references, never the temporary provider input.
+
+The current internal inline-PNG path represents this boundary with
+`ModelMediaResolver`. The broker creates a closed
+`dolly.model.media-resolution-request/1` only after it has frozen the exact
+descriptor and endpoint-binding snapshots. That request binds the model request,
+descriptor digest, binding revision, complete Module Run identity, message and
+part positions, full Media reference, requirement, deadline, recipient, and
+remaining item/raw-byte budgets. A closed `dolly.model.resolved-media/1` must
+echo those identities and supplies inspected metadata, an immutable-content
+digest, and one canonical Base64 copy. The broker independently recomputes the
+digest and length, charges `maxMediaItems` and `maxResolvedMediaBytes`, and then
+checks the Base64-expanded final request-body limit before it reads a provider
+secret or opens a network connection. The broker freezes one effective deadline
+at invocation entry; Media authorization/copy, secret resolution, dispatch, and
+stream reading all consume the same `maxWallTimeMs` budget and share one
+cancellation signal. Provider dispatch MUST NOT restart that budget.
+
+`createDeliveredModelMediaResolver` is the reviewed Core-side composition for
+one authenticated Delivery Claim. It checks the exact instance, session,
+Module generation, Module job, Run, active-Run marker, deadline, and an
+uncropped Media reference actually present in a delivered Block before it asks
+`MediaStore` for a verified inline copy. The copy uses only the transient
+`media-read` lease and leaves no provider-access record. This resolver is a
+Host-only port, not an Extension capability and not an arbitrary callback
+accepted from an Extension.
+
+This internal path does not expose Media through `model-operation` version 1 or
+version 2; both remain text-only and visibly return `MODEL_MEDIA_NOT_GRANTED`.
+It also does not enable configured Modules in the public runtime. A future
+model-operation version must bind the delivered-Media authority to its active
+Run without allowing the Extension to submit a path, URL, Base64 value, access
+mode, strategy, or resolver result.
 
 The model provider broker MUST NOT construct object-store or crop URLs,
 change a private object to public, or substitute the original Media when a crop

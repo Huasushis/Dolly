@@ -49,6 +49,26 @@ function textInput(
   };
 }
 
+function inlinePngInput(): ChatInput {
+  return {
+    schemaVersion: "dolly.model.chat-input/2",
+    messages: [{
+      role: "user",
+      parts: [
+        { kind: "text", text: "Read the image." },
+        {
+          kind: "media",
+          mediaReference: { type: "media-reference", mediaId: "media-1" },
+          requirementId: "inline-png-v1",
+        },
+      ],
+    }],
+    outputContract: { kind: "text" },
+    reasoning: "omit",
+    stream: true,
+  };
+}
+
 function nonStreamResponse(options: {
   content?: string | null;
   reasoningContent?: string | null;
@@ -131,6 +151,90 @@ function decodeStream(
 }
 
 describe("descriptor-bound chat reasoning wire behavior", () => {
+  it("encodes only an exact broker-resolved inline PNG through the versioned content strategy", () => {
+    const snapshot = activeSnapshot({ inlinePng: true });
+    const bytes = Buffer.from("verified-png-bytes", "utf8");
+    const input = inlinePngInput();
+
+    expect(() => encodeOpenAiCompatibleChatRequest(snapshot, input)).toThrowError(
+      expect.objectContaining<Partial<ModelChatError>>({ code: "CHAT_FEATURE_UNSUPPORTED" }),
+    );
+
+    const plan = encodeOpenAiCompatibleChatRequest(snapshot, input, {
+      resolvedMedia: [{
+        messageIndex: 0,
+        partIndex: 1,
+        mediaId: "media-1",
+        inline: {
+          encoding: "base64",
+          data: bytes.toString("base64"),
+          byteLength: bytes.byteLength,
+          mimeType: "image/png",
+        },
+      }],
+    });
+
+    expect(plan).toMatchObject({
+      resolvedMediaItems: 1,
+      resolvedMediaBytes: bytes.byteLength,
+      body: {
+        stream: true,
+        stream_options: { include_usage: true },
+        messages: [{
+          content: [
+            { type: "text", text: "Read the image." },
+            {
+              type: "image_url",
+              image_url: {
+                url: `data:image/png;base64,${bytes.toString("base64")}`,
+              },
+            },
+          ],
+        }],
+      },
+    });
+    expect(JSON.stringify(plan.body)).not.toContain("media-1");
+
+    for (const resolvedMedia of [
+      [{
+        messageIndex: 0,
+        partIndex: 0,
+        mediaId: "media-1",
+        inline: {
+          encoding: "base64" as const,
+          data: bytes.toString("base64"),
+          byteLength: bytes.byteLength,
+          mimeType: "image/png",
+        },
+      }],
+      [{
+        messageIndex: 0,
+        partIndex: 1,
+        mediaId: "media-other",
+        inline: {
+          encoding: "base64" as const,
+          data: bytes.toString("base64"),
+          byteLength: bytes.byteLength,
+          mimeType: "image/png",
+        },
+      }],
+      [{
+        messageIndex: 0,
+        partIndex: 1,
+        mediaId: "media-1",
+        inline: {
+          encoding: "base64" as const,
+          data: `${bytes.toString("base64")}=`,
+          byteLength: bytes.byteLength,
+          mimeType: "image/png",
+        },
+      }],
+    ]) {
+      expect(() => encodeOpenAiCompatibleChatRequest(snapshot, input, { resolvedMedia }))
+        .toThrowError(ModelChatError);
+    }
+  });
+
   it("decodes only the measured closed Aether Qwen response envelope", () => {
     const document = chatDescriptor({
       endpointId: "owner-aether-fixture",

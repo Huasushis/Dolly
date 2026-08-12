@@ -18,6 +18,12 @@ export {
   type MediaReadRepresentation,
 } from "./delivered-media-read-capability.js";
 export {
+  createDeliveredModelMediaResolver,
+  DeliveredModelMediaResolverError,
+  type DeliveredModelMediaResolverOptions,
+  type InlineModelMediaSource,
+} from "./delivered-model-media-resolver.js";
+export {
   createFfmpegDerivationToolchain,
   createUnavailableDerivationToolchain,
   DEFAULT_MEDIA_DERIVATION_LIMITS,

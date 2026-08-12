@@ -793,7 +793,7 @@ export function validateChatDescriptor(value: unknown): ChatDescriptorDocument {
     );
   }
 
-  return deepFreeze({
+  const normalized = deepFreeze({
     schemaVersion,
     descriptorVersion: name(value.descriptorVersion, "descriptorVersion"),
     endpointId: logicalEndpointId(value.endpointId),
@@ -805,6 +805,47 @@ export function validateChatDescriptor(value: unknown): ChatDescriptorDocument {
     retry: normalizeRetry(value.retry),
     features,
   }) as ChatDescriptorDocument;
+  const inlineImageRequest = normalized.adapter.requestStrategyId ===
+    "openai.chat.request.content-parts.v1";
+  const inlineImageRequirements = normalized.input.media.filter((requirement) =>
+    normalized.features.mediaRequirementIds.includes(requirement.requirementId)
+  );
+  if (inlineImageRequest) {
+    if (inlineImageRequirements.length === 0) {
+      throw new ModelDescriptorError(
+        "DESCRIPTOR_INVALID",
+        "The content-parts chat strategy requires an enabled inline image requirement",
+      );
+    }
+    for (const requirement of inlineImageRequirements) {
+      if (
+        requirement.modality !== "image" ||
+        requirement.mimeTypes.length !== 1 ||
+        requirement.mimeTypes[0] !== "image/png" ||
+        requirement.deliveryModes.length !== 1 ||
+        requirement.deliveryModes[0] !== "inline" ||
+        requirement.providerFetchesAfterAcceptance ||
+        requirement.lifetimeStrategyId !== "media.inline-copy.v1" ||
+        requirement.placementStrategyId !== "openai.chat.media.inline-image-url.v1"
+      ) {
+        throw new ModelDescriptorError(
+          "DESCRIPTOR_INVALID",
+          "The installed content-parts strategy supports only exact inline PNG requirements",
+        );
+      }
+    }
+  } else if (
+    inlineImageRequirements.some(
+      (requirement) =>
+        requirement.placementStrategyId === "openai.chat.media.inline-image-url.v1",
+    )
+  ) {
+    throw new ModelDescriptorError(
+      "DESCRIPTOR_INVALID",
+      "The inline image placement strategy requires the content-parts chat strategy",
+    );
+  }
+  return normalized;
 }
 
 function descriptorRef(document: ChatDescriptorDocument): DescriptorRef {

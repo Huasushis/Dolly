@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   canonicalJsonByteLength,
   canonicalJsonDigest,
@@ -14,20 +15,34 @@ import {
   OpenAiCompatibleChatStreamDecoder,
   decodeOpenAiCompatibleChatResponse,
   encodeOpenAiCompatibleChatRequest,
+  inspectOpenAiCompatibleChatMedia,
   mapReasoningPolicy,
   validateChatOutputContract,
   type ChatInput,
+  type ChatMediaPartLocation,
   type ChatOutput,
   type ReasoningPolicy,
+  type ResolvedChatMediaPart,
 } from "./model-provider-chat.js";
 import {
   ModelDescriptorError,
   type DescriptorLimits,
   type DescriptorRef,
+  type MediaRequirement,
   type ModelDescriptorRegistry,
 } from "./model-provider-descriptor.js";
+import type { EndpointBindingRef } from "./model-provider-binding.js";
+import type { MediaReferenceItem } from "./block-content.js";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
+
+class ModelInvocationDeadlineAbort extends Error {
+  constructor() {
+    super("invocation deadline elapsed");
+    this.name = "ModelInvocationDeadlineAbort";
+  }
+}
 
 export interface ModelInvocationContext {
   /** Stable upper-level operation identity that may span service calls and retries. */
@@ -194,7 +209,67 @@ export interface ChatModelBrokerOptions {
   readonly bindings: EndpointBindingRegistry;
   readonly secrets: ModelSecretResolver;
   readonly transport: ModelHttpTransport;
+  /**
+   * Trusted host authorization and byte-resolution boundary for chat Media.
+   * An invocation cannot supply or replace this port.
+   */
+  readonly media?: ModelMediaResolver;
   readonly now?: () => string;
+}
+
+export interface ModelMediaResolutionRequest {
+  readonly schemaVersion: "dolly.model.media-resolution-request/1";
+  readonly modelRequestId: string;
+  readonly mediaRequestId: string;
+  readonly recipientId: string;
+  readonly descriptor: DescriptorRef;
+  readonly binding: EndpointBindingRef;
+  readonly context: ModelInvocationContext;
+  readonly messageIndex: number;
+  readonly partIndex: number;
+  readonly mediaReference: MediaReferenceItem;
+  readonly requirement: MediaRequirement;
+  readonly acceptedAccessModes: readonly ["inline"];
+  readonly deadline: string;
+  readonly limits: {
+    readonly maxItemsRemaining: number;
+    readonly maxBytesForItem: number;
+    readonly maxResolvedBytesRemaining: number;
+  };
+}
+
+/**
+ * Host-only result. It is never accepted from an Extension or persisted in
+ * model conversation state.
+ */
+export interface ModelResolvedMedia {
+  readonly schemaVersion: "dolly.model.resolved-media/1";
+  readonly modelRequestId: string;
+  readonly mediaRequestId: string;
+  readonly recipientId: string;
+  readonly descriptorDigest: string;
+  readonly bindingRevision: string;
+  readonly messageIndex: number;
+  readonly partIndex: number;
+  readonly requirementId: string;
+  readonly mediaId: string;
+  readonly digest: string;
+  readonly mimeType: "image/png";
+  readonly byteLength: number;
+  readonly width: number;
+  readonly height: number;
+  readonly accessMode: "inline";
+  readonly inline: {
+    readonly encoding: "base64";
+    readonly data: string;
+  };
+}
+
+export interface ModelMediaResolver {
+  resolve(
+    request: ModelMediaResolutionRequest,
+    options: { readonly signal?: AbortSignal },
+  ): Promise<ModelResolvedMedia>;
 }
 
 export class ModelBrokerError extends Error {
@@ -481,8 +556,12 @@ export async function executeBoundModelHttp(
 
   const controller = new AbortController();
   let deadlineElapsed = false;
-  const onParentAbort = () =>
+  const onParentAbort = () => {
+    if (options.signal?.reason instanceof ModelInvocationDeadlineAbort) {
+      deadlineElapsed = true;
+    }
     controller.abort(options.signal?.reason ?? new Error("cancelled"));
+  };
   options.signal?.addEventListener("abort", onParentAbort, { once: true });
   if (options.signal?.aborted) onParentAbort();
   const timer = setTimeout(() => {
@@ -892,11 +971,130 @@ function validateInvocation(invocation: ChatBrokerInvocation): void {
   }
 }
 
+function immutableCopy<T>(value: T): T {
+  return deepFreeze(structuredClone(value));
+}
+
+function mediaRequestId(
+  modelRequestId: string,
+  messageIndex: number,
+  partIndex: number,
+): string {
+  return `media:${canonicalJsonDigest({ modelRequestId, messageIndex, partIndex }).slice(7)}`;
+}
+
+function mediaRequirement(
+  requirements: readonly MediaRequirement[],
+  part: ChatMediaPartLocation,
+): MediaRequirement {
+  const requirement = requirements.find(
+    (candidate) => candidate.requirementId === part.requirementId,
+  );
+  if (!requirement) {
+    throw new ModelBrokerError(
+      "BROKER_REQUEST_INVALID",
+      "Chat Media requirement is absent from the frozen descriptor",
+    );
+  }
+  return requirement;
+}
+
+function validateResolvedMedia(
+  value: ModelResolvedMedia,
+  request: ModelMediaResolutionRequest,
+): ResolvedChatMediaPart {
+  closed(
+    value,
+    [
+      "schemaVersion",
+      "modelRequestId",
+      "mediaRequestId",
+      "recipientId",
+      "descriptorDigest",
+      "bindingRevision",
+      "messageIndex",
+      "partIndex",
+      "requirementId",
+      "mediaId",
+      "digest",
+      "mimeType",
+      "byteLength",
+      "width",
+      "height",
+      "accessMode",
+      "inline",
+    ],
+    "resolved Media",
+  );
+  if (
+    value.schemaVersion !== "dolly.model.resolved-media/1" ||
+    value.modelRequestId !== request.modelRequestId ||
+    value.mediaRequestId !== request.mediaRequestId ||
+    value.recipientId !== request.recipientId ||
+    value.descriptorDigest !== request.descriptor.descriptorDigest ||
+    value.bindingRevision !== request.binding.bindingRevision ||
+    value.messageIndex !== request.messageIndex ||
+    value.partIndex !== request.partIndex ||
+    value.requirementId !== request.requirement.requirementId ||
+    value.mediaId !== request.mediaReference.mediaId ||
+    !DIGEST_PATTERN.test(value.digest) ||
+    value.mimeType !== "image/png" ||
+    value.accessMode !== "inline" ||
+    !Number.isSafeInteger(value.byteLength) ||
+    value.byteLength <= 0 ||
+    !Number.isSafeInteger(value.width) ||
+    value.width <= 0 ||
+    !Number.isSafeInteger(value.height) ||
+    value.height <= 0
+  ) {
+    throw new ModelBrokerError(
+      "BROKER_REQUEST_INVALID",
+      "Resolved Media does not match the authorized model request",
+    );
+  }
+  if (
+    value.byteLength > request.limits.maxBytesForItem ||
+    value.byteLength > request.limits.maxResolvedBytesRemaining
+  ) {
+    throw new ModelChatError(
+      "CHAT_LIMIT_EXCEEDED",
+      "Resolved Media exceeds its authorized byte budget",
+    );
+  }
+  closed(value.inline, ["encoding", "data"], "resolved Media inline");
+  if (value.inline.encoding !== "base64" || typeof value.inline.data !== "string") {
+    throw new ModelBrokerError("BROKER_REQUEST_INVALID", "Resolved Media bytes are invalid");
+  }
+  const decoded = Buffer.from(value.inline.data, "base64");
+  if (
+    decoded.byteLength !== value.byteLength ||
+    decoded.toString("base64") !== value.inline.data ||
+    `sha256:${createHash("sha256").update(decoded).digest("hex")}` !== value.digest
+  ) {
+    throw new ModelBrokerError(
+      "BROKER_REQUEST_INVALID",
+      "Resolved Media bytes do not match their declared length",
+    );
+  }
+  return deepFreeze({
+    messageIndex: request.messageIndex,
+    partIndex: request.partIndex,
+    mediaId: value.mediaId,
+    inline: {
+      encoding: "base64",
+      data: value.inline.data,
+      byteLength: value.byteLength,
+      mimeType: value.mimeType,
+    },
+  });
+}
+
 export class ChatModelBroker {
   readonly #descriptors: ModelDescriptorRegistry;
   readonly #bindings: EndpointBindingRegistry;
   readonly #secrets: ModelSecretResolver;
   readonly #transport: ModelHttpTransport;
+  readonly #media: ModelMediaResolver | undefined;
   readonly #now: () => string;
 
   constructor(options: ChatModelBrokerOptions) {
@@ -904,6 +1102,7 @@ export class ChatModelBroker {
     this.#bindings = options.bindings;
     this.#secrets = options.secrets;
     this.#transport = options.transport;
+    this.#media = options.media;
     this.#now = options.now ?? (() => new Date().toISOString());
   }
 
@@ -912,6 +1111,66 @@ export class ChatModelBroker {
     options: { readonly signal?: AbortSignal } = {},
   ): Promise<ChatBrokerResult> {
     validateInvocation(invocation);
+    const invocationStartedAtMs = Date.parse(this.#now());
+    const contextDeadlineMs = Date.parse(invocation.context.deadline);
+    const invocationTimeoutMs = Math.floor(
+      Math.min(
+        invocation.budgets.maxWallTimeMs,
+        contextDeadlineMs - invocationStartedAtMs,
+        2_147_483_647,
+      ),
+    );
+    if (
+      !Number.isFinite(invocationStartedAtMs) ||
+      !Number.isFinite(contextDeadlineMs) ||
+      invocationTimeoutMs <= 0
+    ) {
+      return failedResult(
+        invocation,
+        invocation.descriptor,
+        immutableError(
+          "DEADLINE_EXCEEDED",
+          "validation",
+          "never",
+          "Invocation deadline elapsed",
+        ),
+        0,
+      );
+    }
+    const effectiveDeadline = new Date(
+      invocationStartedAtMs + invocationTimeoutMs,
+    ).toISOString();
+    const controller = new AbortController();
+    let deadlineElapsed = false;
+    const onParentAbort = () =>
+      controller.abort(options.signal?.reason ?? new Error("cancelled"));
+    options.signal?.addEventListener("abort", onParentAbort, { once: true });
+    if (options.signal?.aborted) onParentAbort();
+    const timer = setTimeout(() => {
+      deadlineElapsed = true;
+      controller.abort(new ModelInvocationDeadlineAbort());
+    }, invocationTimeoutMs);
+
+    try {
+      return await this.#invokeWithinDeadline(invocation, {
+        signal: controller.signal,
+        effectiveDeadline,
+        deadlineElapsed: () => deadlineElapsed,
+      });
+    } finally {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onParentAbort);
+    }
+  }
+
+  async #invokeWithinDeadline(
+    invocation: ChatBrokerInvocation,
+    options: {
+      readonly signal: AbortSignal;
+      readonly effectiveDeadline: string;
+      readonly deadlineElapsed: () => boolean;
+    },
+  ): Promise<ChatBrokerResult> {
     let descriptorSnapshot;
     try {
       descriptorSnapshot = this.#descriptors.snapshot(invocation.descriptor);
@@ -956,6 +1215,160 @@ export class ChatModelBroker {
         invocation.reasoningPolicy,
         invocation.input.stream ? "stream" : "non-stream",
       );
+      const unresolvedMedia = inspectOpenAiCompatibleChatMedia(
+        descriptorSnapshot,
+        { ...invocation.input, reasoning: decision.directive },
+      );
+      const resolvedMedia: ResolvedChatMediaPart[] = [];
+      if (unresolvedMedia.length > 0) {
+        if (options.signal.aborted) {
+          return failedResult(
+            invocation,
+            descriptor,
+            immutableError(
+              options.deadlineElapsed() ? "DEADLINE_EXCEEDED" : "CANCELLED",
+              "validation",
+              "never",
+              options.deadlineElapsed()
+                ? "Invocation deadline elapsed before Media resolution"
+                : "Model request was cancelled",
+            ),
+            0,
+          );
+        }
+        if (!this.#media) {
+          return failedResult(
+            invocation,
+            descriptor,
+            immutableError(
+              "FEATURE_UNSUPPORTED",
+              "validation",
+              "never",
+              "No trusted Media resolver is installed for this model request",
+            ),
+            0,
+          );
+        }
+        if (
+          invocation.context.moduleId === undefined ||
+          invocation.context.moduleGenerationId === undefined ||
+          invocation.context.moduleJobId === undefined ||
+          invocation.context.runId === undefined ||
+          invocation.context.attempt === undefined ||
+          invocation.context.sessionId === undefined
+        ) {
+          return failedResult(
+            invocation,
+            descriptor,
+            immutableError(
+              "INVALID_REQUEST",
+              "validation",
+              "never",
+              "Chat Media requires a complete authenticated Module Run identity",
+            ),
+            0,
+          );
+        }
+        const itemBudget = invocation.budgets.maxMediaItems;
+        const byteBudget = invocation.budgets.maxResolvedMediaBytes;
+        if (
+          itemBudget === undefined ||
+          byteBudget === undefined ||
+          unresolvedMedia.length > itemBudget
+        ) {
+          return failedResult(
+            invocation,
+            descriptor,
+            immutableError(
+              "BUDGET_EXCEEDED",
+              "validation",
+              "never",
+              "Chat Media exceeds or lacks an explicit invocation budget",
+            ),
+            0,
+          );
+        }
+      const canonicalInputBytes = canonicalJsonByteLength(invocation.input);
+      const resolvedBytesByRequirement = new Map<string, number>();
+      let resolvedBytes = 0;
+      for (const [index, part] of unresolvedMedia.entries()) {
+          if (part.mediaReference.crop !== undefined) {
+            return failedResult(
+              invocation,
+              descriptor,
+              immutableError(
+                "FEATURE_UNSUPPORTED",
+                "validation",
+                "never",
+                "Cropped inline Media is unsupported",
+              ),
+              0,
+            );
+        }
+        const requirement = mediaRequirement(descriptorSnapshot.document.input.media, part);
+        const requirementBytes = resolvedBytesByRequirement.get(requirement.requirementId) ?? 0;
+        const maxRequirementBytesRemaining = requirement.maxAggregateBytes - requirementBytes;
+        const maxResolvedBytesRemaining = Math.min(
+          byteBudget - resolvedBytes,
+          invocation.budgets.maxInputBytes - canonicalInputBytes - resolvedBytes,
+        );
+        if (maxResolvedBytesRemaining <= 0 || maxRequirementBytesRemaining <= 0) {
+            return failedResult(
+              invocation,
+              descriptor,
+              immutableError(
+                "BUDGET_EXCEEDED",
+                "validation",
+                "never",
+                "Chat Media exceeds its resolved-byte budget",
+              ),
+              0,
+            );
+          }
+          const request: ModelMediaResolutionRequest = immutableCopy({
+            schemaVersion: "dolly.model.media-resolution-request/1" as const,
+            modelRequestId: invocation.requestId,
+            mediaRequestId: mediaRequestId(
+              invocation.requestId,
+              part.messageIndex,
+              part.partIndex,
+            ),
+            recipientId: `model:${canonicalJsonDigest({
+              descriptorDigest: descriptor.descriptorDigest,
+              bindingRevision: bindingSnapshot.ref.bindingRevision,
+            }).slice(7)}`,
+            descriptor: descriptorSnapshot.ref,
+            binding: bindingSnapshot.ref,
+            context: invocation.context,
+            messageIndex: part.messageIndex,
+            partIndex: part.partIndex,
+            mediaReference: part.mediaReference,
+            requirement,
+            acceptedAccessModes: ["inline"] as const,
+            deadline: options.effectiveDeadline,
+            limits: {
+              maxItemsRemaining: itemBudget - index,
+            maxBytesForItem: Math.min(
+              requirement.maxBytesPerItem,
+              maxResolvedBytesRemaining,
+              maxRequirementBytesRemaining,
+            ),
+              maxResolvedBytesRemaining,
+            },
+          });
+          const resolutionOperation = this.#media.resolve(request, {
+            signal: options.signal,
+          });
+          const resolution = await awaitWithSignal(resolutionOperation, options.signal);
+        const normalized = validateResolvedMedia(resolution, request);
+        resolvedBytes += normalized.inline.byteLength;
+        resolvedBytesByRequirement.set(
+          requirement.requirementId,
+          requirementBytes + normalized.inline.byteLength,
+        );
+        resolvedMedia.push(normalized);
+        }
+      }
       plan = encodeOpenAiCompatibleChatRequest(
         descriptorSnapshot,
         { ...invocation.input, reasoning: decision.directive },
@@ -969,6 +1382,7 @@ export class ChatModelBroker {
                     descriptorSnapshot.document.features.maxOutputTokens.value.maximum,
                   )
                 : invocation.budgets.maxOutputTokens,
+          resolvedMedia,
         },
       );
       if (invocation.input.stream) {
@@ -978,6 +1392,21 @@ export class ChatModelBroker {
         );
       }
     } catch (error) {
+      if (options.signal.aborted) {
+        return failedResult(
+          invocation,
+          descriptor,
+          immutableError(
+            options.deadlineElapsed() ? "DEADLINE_EXCEEDED" : "CANCELLED",
+            "validation",
+            "never",
+            options.deadlineElapsed()
+              ? "Invocation deadline elapsed"
+              : "Model request was cancelled",
+          ),
+          0,
+        );
+      }
       const code =
         error instanceof ModelChatError && error.code === "CHAT_LIMIT_EXCEEDED"
           ? "BUDGET_EXCEEDED"
@@ -999,7 +1428,13 @@ export class ChatModelBroker {
       invocation.budgets.maxProviderAttempts < 1 ||
       plan.bodyBytes > invocation.budgets.maxRequestBytes ||
       plan.bodyBytes > binding.limits.maxRequestBytes ||
-      inputBytes > invocation.budgets.maxInputBytes ||
+      inputBytes + plan.resolvedMediaBytes > invocation.budgets.maxInputBytes ||
+      (plan.resolvedMediaItems > 0 &&
+        (invocation.budgets.maxMediaItems === undefined ||
+          plan.resolvedMediaItems > invocation.budgets.maxMediaItems)) ||
+      (plan.resolvedMediaBytes > 0 &&
+        (invocation.budgets.maxResolvedMediaBytes === undefined ||
+          plan.resolvedMediaBytes > invocation.budgets.maxResolvedMediaBytes)) ||
       inputItems > invocation.budgets.maxInputItems
     ) {
       return failedResult(
@@ -1013,7 +1448,7 @@ export class ChatModelBroker {
       binding,
       descriptorLimits: descriptorSnapshot.document.limits,
       budgets: invocation.budgets,
-      deadline: invocation.context.deadline,
+      deadline: options.effectiveDeadline,
       body: Buffer.from(canonicalizeJson(plan.body), "utf8"),
       contentType: plan.contentType,
       responseKind: invocation.input.stream ? "event-stream" : "json",
@@ -1023,7 +1458,7 @@ export class ChatModelBroker {
       secrets: this.#secrets,
       transport: this.#transport,
       now: this.#now,
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      signal: options.signal,
     });
     if (transportResult.status !== "succeeded") {
       return failedResult(

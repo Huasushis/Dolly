@@ -183,6 +183,52 @@ describe("model descriptor registry", () => {
     );
   });
 
+  it("rejects internally inconsistent declarations of the installed inline PNG chat strategy", () => {
+    const valid = chatDescriptor({ inlinePng: true });
+    expect(() => registry().register(valid)).not.toThrow();
+    const requirement = valid.input.media[0]!;
+    const mutations = [
+      {
+        ...valid,
+        adapter: { ...valid.adapter, requestStrategyId: "openai.chat.request.text-parts.v1" },
+      },
+      {
+        ...valid,
+        input: {
+          ...valid.input,
+          media: [{ ...requirement, mimeTypes: ["image/jpeg"] }],
+        },
+      },
+      {
+        ...valid,
+        input: {
+          ...valid.input,
+          media: [{ ...requirement, deliveryModes: ["inline", "private-signed"] }],
+        },
+      },
+      {
+        ...valid,
+        input: {
+          ...valid.input,
+          media: [{ ...requirement, providerFetchesAfterAcceptance: true }],
+        },
+      },
+      {
+        ...valid,
+        input: {
+          ...valid.input,
+          media: [{ ...requirement, lifetimeStrategyId: "media.provider-access-lease.v1" }],
+        },
+      },
+    ];
+
+    for (const mutation of mutations) {
+      expect(() => registry().register(mutation)).toThrowError(
+        expect.objectContaining<Partial<ModelDescriptorError>>({ code: "DESCRIPTOR_INVALID" }),
+      );
+    }
+  });
+
   it("rejects forged digests and invalid reasoning feature combinations", () => {
     const descriptors = registry();
     const ref = descriptors.register(chatDescriptor());

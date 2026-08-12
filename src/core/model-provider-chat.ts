@@ -113,6 +113,37 @@ export interface ChatWirePlan {
   readonly contentType: "application/json";
   readonly body: JsonValue;
   readonly bodyBytes: number;
+  /** Raw decoded Media bytes placed in this provider request. */
+  readonly resolvedMediaBytes: number;
+  readonly resolvedMediaItems: number;
+}
+
+/**
+ * One temporary provider-facing Media value resolved by trusted host code.
+ *
+ * The untrusted chat input still contains only a `media-reference`. The
+ * position fields bind this grant to that exact part so an adapter cannot
+ * substitute bytes from another reference or reuse an extra grant.
+ */
+export interface ResolvedChatMediaPart {
+  readonly messageIndex: number;
+  readonly partIndex: number;
+  readonly mediaId: string;
+  readonly crop?: MediaReferenceItem["crop"];
+  readonly inline: {
+    readonly encoding: "base64";
+    readonly data: string;
+    readonly byteLength: number;
+    readonly mimeType: string;
+  };
+}
+
+/** A validated unresolved Media part that the broker must authorize. */
+export interface ChatMediaPartLocation {
+  readonly messageIndex: number;
+  readonly partIndex: number;
+  readonly mediaReference: MediaReferenceItem;
+  readonly requirementId: string;
 }
 
 export type ModelChatErrorCode =
@@ -322,7 +353,111 @@ function applyReasoningWireField(
   );
 }
 
-function normalizeInput(snapshot: ChatDescriptorSnapshot, input: ChatInput): JsonValue {
+interface NormalizeInputOptions {
+  readonly resolvedMedia?: readonly ResolvedChatMediaPart[];
+  readonly allowUnresolvedMedia?: boolean;
+}
+
+interface NormalizedChatInput {
+  readonly body: Record<string, JsonValue>;
+  readonly mediaParts: readonly ChatMediaPartLocation[];
+  readonly resolvedMediaBytes: number;
+}
+
+function mediaPosition(messageIndex: number, partIndex: number): string {
+  return `${messageIndex}:${partIndex}`;
+}
+
+function sameCrop(left: MediaReferenceItem["crop"], right: MediaReferenceItem["crop"]): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return (
+    left.topLeft.x === right.topLeft.x &&
+    left.topLeft.y === right.topLeft.y &&
+    left.bottomRight.x === right.bottomRight.x &&
+    left.bottomRight.y === right.bottomRight.y
+  );
+}
+
+function inlineImageUrl(
+  resolved: ResolvedChatMediaPart,
+  reference: MediaReferenceItem,
+  requirement: ChatDescriptorSnapshot["document"]["input"]["media"][number],
+  label: string,
+): { readonly wire: JsonValue; readonly byteLength: number } {
+  if (reference.crop !== undefined) {
+    throw new ModelChatError(
+      "CHAT_FEATURE_UNSUPPORTED",
+      "Cropped inline Media is unsupported",
+    );
+  }
+  if (requirement.placementStrategyId !== "openai.chat.media.inline-image-url.v1") {
+    throw new ModelChatError(
+      "CHAT_STRATEGY_UNSUPPORTED",
+      "The selected Media placement strategy has no installed chat codec",
+    );
+  }
+  if (!requirement.deliveryModes.includes("inline")) {
+    throw new ModelChatError(
+      "CHAT_FEATURE_UNSUPPORTED",
+      "The selected Media requirement does not allow inline delivery",
+    );
+  }
+  if (resolved.mediaId !== reference.mediaId) {
+    throw new ModelChatError(
+      "CHAT_INPUT_INVALID",
+      "Resolved Media does not match its chat reference",
+    );
+  }
+  if (!sameCrop(reference.crop, resolved.crop)) {
+    throw new ModelChatError(
+      "CHAT_INPUT_INVALID",
+      "Resolved Media grant changed the requested crop",
+    );
+  }
+  closed(
+    resolved.inline,
+    ["encoding", "data", "byteLength", "mimeType"],
+    `${label}.grant.inline`,
+    "CHAT_INPUT_INVALID",
+  );
+  const inline = resolved.inline;
+  if (
+    inline.encoding !== "base64" ||
+    typeof inline.data !== "string" ||
+    !Number.isSafeInteger(inline.byteLength) ||
+    inline.byteLength <= 0 ||
+    typeof inline.mimeType !== "string" ||
+    !requirement.mimeTypes.includes(inline.mimeType)
+  ) {
+    throw new ModelChatError("CHAT_INPUT_INVALID", "Resolved inline Media is invalid");
+  }
+  const decoded = Buffer.from(inline.data, "base64");
+  if (
+    decoded.byteLength !== inline.byteLength ||
+    decoded.toString("base64") !== inline.data
+  ) {
+    throw new ModelChatError(
+      "CHAT_INPUT_INVALID",
+      "Resolved inline Media Base64 is not canonical or has the wrong length",
+    );
+  }
+  if (inline.byteLength > requirement.maxBytesPerItem) {
+    throw new ModelChatError("CHAT_LIMIT_EXCEEDED", "Media item exceeds its descriptor limit");
+  }
+  return {
+    wire: {
+      type: "image_url",
+      image_url: { url: `data:${inline.mimeType};base64,${inline.data}` },
+    },
+    byteLength: inline.byteLength,
+  };
+}
+
+function normalizeInput(
+  snapshot: ChatDescriptorSnapshot,
+  input: ChatInput,
+  options: NormalizeInputOptions = {},
+): NormalizedChatInput {
   const descriptor = snapshot.document;
   closed(
     input,
@@ -357,7 +492,8 @@ function normalizeInput(snapshot: ChatDescriptorSnapshot, input: ChatInput): Jso
     throw new ModelChatError("CHAT_FEATURE_UNSUPPORTED", "Streaming is not supported");
   }
   if (
-    descriptor.adapter.requestStrategyId !== "openai.chat.request.text-parts.v1" ||
+    (descriptor.adapter.requestStrategyId !== "openai.chat.request.text-parts.v1" &&
+      descriptor.adapter.requestStrategyId !== "openai.chat.request.content-parts.v1") ||
     descriptor.features.messageOrderStrategyId !== "openai.chat.message-order.v1"
   ) {
     throw new ModelChatError(
@@ -366,7 +502,37 @@ function normalizeInput(snapshot: ChatDescriptorSnapshot, input: ChatInput): Jso
     );
   }
 
+  const resolvedMedia = new Map<string, ResolvedChatMediaPart>();
+  for (const [index, resolved] of (options.resolvedMedia ?? []).entries()) {
+    closed(
+      resolved,
+      ["messageIndex", "partIndex", "mediaId", "crop", "inline"],
+      `resolvedMedia[${index}]`,
+      "CHAT_INPUT_INVALID",
+    );
+    if (
+      !Number.isSafeInteger(resolved.messageIndex) ||
+      resolved.messageIndex < 0 ||
+      !Number.isSafeInteger(resolved.partIndex) ||
+      resolved.partIndex < 0
+    ) {
+      throw new ModelChatError(
+        "CHAT_INPUT_INVALID",
+        `resolvedMedia[${index}] has an invalid position`,
+      );
+    }
+    const key = mediaPosition(resolved.messageIndex, resolved.partIndex);
+    if (resolvedMedia.has(key)) {
+      throw new ModelChatError("CHAT_INPUT_INVALID", "Resolved Media positions are duplicated");
+    }
+    resolvedMedia.set(key, resolved);
+  }
+  const usedResolvedMedia = new Set<string>();
+  const mediaParts: ChatMediaPartLocation[] = [];
+  const requirementCounts = new Map<string, number>();
+  const requirementBytes = new Map<string, number>();
   let inputBytes = 0;
+  let resolvedMediaBytes = 0;
   const messages = input.messages.map((message, messageIndex): JsonValue => {
     closed(message, ["role", "parts"], `messages[${messageIndex}]`, "CHAT_INPUT_INVALID");
     if (
@@ -400,8 +566,12 @@ function normalizeInput(snapshot: ChatDescriptorSnapshot, input: ChatInput): Jso
             `${label}.requirementId must be a string`,
           );
         }
+        let mediaReference: MediaReferenceItem;
         try {
-          parseMediaReferenceItem(part.mediaReference, `${label}.mediaReference`);
+          mediaReference = parseMediaReferenceItem(
+            part.mediaReference,
+            `${label}.mediaReference`,
+          );
         } catch {
           throw new ModelChatError(
             "CHAT_INPUT_INVALID",
@@ -414,10 +584,70 @@ function normalizeInput(snapshot: ChatDescriptorSnapshot, input: ChatInput): Jso
             "Media requirement is not enabled for this chat operation",
           );
         }
-        throw new ModelChatError(
-          "CHAT_FEATURE_UNSUPPORTED",
-          "Media must be resolved by the broker before this text-only wire strategy",
+        const requirement = descriptor.input.media.find(
+          (candidate) => candidate.requirementId === part.requirementId,
         );
+        if (!requirement) {
+          throw new ModelChatError(
+            "CHAT_FEATURE_UNSUPPORTED",
+            "Media requirement is absent from the selected descriptor",
+          );
+        }
+        if (descriptor.adapter.requestStrategyId === "openai.chat.request.text-parts.v1") {
+          throw new ModelChatError(
+            "CHAT_FEATURE_UNSUPPORTED",
+            "Media must be resolved by the broker before this text-only wire strategy",
+          );
+        }
+        if (descriptor.adapter.requestStrategyId !== "openai.chat.request.content-parts.v1") {
+          throw new ModelChatError(
+            "CHAT_STRATEGY_UNSUPPORTED",
+            "The selected chat request strategy cannot place Media parts",
+          );
+        }
+        const nextCount = (requirementCounts.get(requirement.requirementId) ?? 0) + 1;
+        if (nextCount > requirement.maxItems) {
+          throw new ModelChatError(
+            "CHAT_LIMIT_EXCEEDED",
+            "Media item count exceeds its requirement",
+          );
+        }
+        requirementCounts.set(requirement.requirementId, nextCount);
+        mediaParts.push({
+          messageIndex,
+          partIndex,
+          mediaReference,
+          requirementId: requirement.requirementId,
+        });
+        const key = mediaPosition(messageIndex, partIndex);
+        const resolved = resolvedMedia.get(key);
+        if (!resolved) {
+          if (options.allowUnresolvedMedia === true) {
+            return {
+              type: "media_reference",
+              media_id: mediaReference.mediaId,
+              requirement_id: requirement.requirementId,
+            };
+          }
+          throw new ModelChatError(
+            "CHAT_FEATURE_UNSUPPORTED",
+            "Media must be resolved by the broker before provider encoding",
+          );
+        }
+        usedResolvedMedia.add(key);
+        const encoded = inlineImageUrl(resolved, mediaReference, requirement, label);
+        const nextBytes =
+          (requirementBytes.get(requirement.requirementId) ?? 0) + encoded.byteLength;
+        if (nextBytes > requirement.maxAggregateBytes) {
+          throw new ModelChatError(
+            "CHAT_LIMIT_EXCEEDED",
+            "Media bytes exceed their aggregate requirement limit",
+          );
+        }
+        requirementBytes.set(requirement.requirementId, nextBytes);
+        resolvedMediaBytes += encoded.byteLength;
+        inputBytes += encoded.byteLength;
+        return encoded.wire;
       }
       if (part.kind !== "text") {
         throw new ModelChatError("CHAT_INPUT_INVALID", `${label}.kind is unsupported`);
@@ -443,6 +673,12 @@ function normalizeInput(snapshot: ChatDescriptorSnapshot, input: ChatInput): Jso
   });
   if (inputBytes > descriptor.limits.maxInputBytes) {
     throw new ModelChatError("CHAT_LIMIT_EXCEEDED", "Chat input bytes exceed the descriptor");
+  }
+  if (usedResolvedMedia.size !== resolvedMedia.size) {
+    throw new ModelChatError(
+      "CHAT_INPUT_INVALID",
+      "Resolved Media contains a value not used by the chat input",
+    );
   }
 
   const body: Record<string, JsonValue> = {
@@ -569,15 +805,35 @@ function normalizeInput(snapshot: ChatDescriptorSnapshot, input: ChatInput): Jso
   }
 
   applyReasoningWireField(body, descriptor.features.reasoning, input.reasoning);
-  return body;
+  return { body, mediaParts, resolvedMediaBytes };
+}
+
+/**
+ * Validates a chat input and returns the exact Media references the trusted
+ * broker must authorize before provider encoding. No provider value is
+ * accepted from the chat input itself.
+ */
+export function inspectOpenAiCompatibleChatMedia(
+  snapshot: ChatDescriptorSnapshot,
+  input: ChatInput,
+): readonly ChatMediaPartLocation[] {
+  return deepFreeze(
+    normalizeInput(snapshot, input, { allowUnresolvedMedia: true }).mediaParts,
+  );
 }
 
 export function encodeOpenAiCompatibleChatRequest(
   snapshot: ChatDescriptorSnapshot,
   input: ChatInput,
-  options: { readonly maxOutputTokens?: number } = {},
+  options: {
+    readonly maxOutputTokens?: number;
+    readonly resolvedMedia?: readonly ResolvedChatMediaPart[];
+  } = {},
 ): ChatWirePlan {
-  const body = normalizeInput(snapshot, input) as Record<string, JsonValue>;
+  const normalized = normalizeInput(snapshot, input, {
+    resolvedMedia: options.resolvedMedia,
+  });
+  const body = normalized.body;
   if (options.maxOutputTokens !== undefined) {
     if (!Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens <= 0) {
       throw new ModelChatError("CHAT_INPUT_INVALID", "maxOutputTokens is invalid");
@@ -604,6 +860,8 @@ export function encodeOpenAiCompatibleChatRequest(
     contentType: "application/json",
     body: cloneJson(body),
     bodyBytes,
+    resolvedMediaBytes: normalized.resolvedMediaBytes,
+    resolvedMediaItems: normalized.mediaParts.length,
   });
 }
 

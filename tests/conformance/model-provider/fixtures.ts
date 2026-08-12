@@ -9,6 +9,7 @@ import type {
 
 export const CHAT_STRATEGIES = new Set([
   "openai.chat.request.text-parts.v1",
+  "openai.chat.request.content-parts.v1",
   "openai.chat.response.v1",
   "openai.chat.stream.sse.v1",
   "openai.chat.message-order.v1",
@@ -17,6 +18,8 @@ export const CHAT_STRATEGIES = new Set([
   "openai.enable-thinking.boolean.v1",
   "thinking-object.enabled-disabled.v1",
   "openai.response-format.json-object.v1",
+  "media.inline-copy.v1",
+  "openai.chat.media.inline-image-url.v1",
 ]);
 
 export const EMBEDDING_STRATEGIES = new Set([
@@ -96,6 +99,7 @@ export function chatDescriptor(options: {
   reasoning?: ReasoningWireFeatures;
   maxRequestBytes?: number;
   jsonObjectOutput?: "supported" | "unsupported";
+  inlinePng?: boolean;
 } = {}): ChatDescriptorDocument {
   const schemaVersion =
     options.jsonObjectOutput === undefined
@@ -110,7 +114,9 @@ export function chatDescriptor(options: {
     adapter: {
       id: "openai-compatible-chat",
       version: "v1",
-      requestStrategyId: "openai.chat.request.text-parts.v1",
+      requestStrategyId: options.inlinePng
+        ? "openai.chat.request.content-parts.v1"
+        : "openai.chat.request.text-parts.v1",
       responseStrategyId: "openai.chat.response.v1",
       streamStrategyId: "openai.chat.stream.sse.v1",
     },
@@ -128,12 +134,25 @@ export function chatDescriptor(options: {
       },
     },
     input: {
-      modalities: ["text"],
+      modalities: options.inlinePng ? ["text", "image"] : ["text"],
       text: {
         state: "supported",
         value: { maxBytesPerItem: 16 * 1024, empty: "forbidden" },
       },
-      media: [],
+      media: options.inlinePng
+        ? [{
+            requirementId: "inline-png-v1",
+            modality: "image",
+            mimeTypes: ["image/png"],
+            deliveryModes: ["inline"],
+            maxItems: 2,
+            maxBytesPerItem: 16 * 1024,
+            maxAggregateBytes: 24 * 1024,
+            providerFetchesAfterAcceptance: false,
+            lifetimeStrategyId: "media.inline-copy.v1",
+            placementStrategyId: "openai.chat.media.inline-image-url.v1",
+          }]
+        : [],
     },
     retry: {
       maxProviderAttempts: 1,
@@ -147,7 +166,7 @@ export function chatDescriptor(options: {
       maxPartsPerMessage: 16,
       contextWindowTokens: { state: "supported", value: { maximum: 32_768 } },
       maxOutputTokens: { state: "supported", value: { maximum: 4096 } },
-      mediaRequirementIds: [],
+      mediaRequirementIds: options.inlinePng ? ["inline-png-v1"] : [],
       tools: { state: "unsupported" },
       structuredOutput: { state: "unsupported" },
       ...(options.jsonObjectOutput === undefined

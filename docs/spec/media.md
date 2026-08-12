@@ -645,6 +645,15 @@ does not persist a provider access record or expose a grant lease. Public
 provider URLs remain disabled unless the host explicitly enables
 `allowPublicProviderUrls`.
 
+An internal model-broker candidate now composes that verified inline copy with
+the exact delivered Block and authenticated Module Run. Its only installed
+mapping is an uncropped `image/png` copied into the separately versioned
+OpenAI-compatible inline-image strategy. It does not expose `MediaStore` or the
+copy to an Extension, and the current model-operation capabilities continue to
+reject Media. Consequently this composition is deterministic evidence for the
+Host boundary, not evidence that configured Modules or isolated Extensions can
+yet ask a model to inspect Media.
+
 The product configuration schema is `dolly.instance/9`. When Media is enabled,
 it requires limits for individual and total bytes, registration records,
 storage records, provider access records, compact deleted-registration

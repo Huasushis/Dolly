@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { setImmediate as waitImmediate } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
 import type { JsonValue } from "../../../src/core/canonical-json.js";
@@ -17,6 +18,8 @@ import {
   type ModelHttpTransport,
   type ModelHttpTransportRequest,
   type ModelHttpTransportResponse,
+  type ModelMediaResolver,
+  type ModelResolvedMedia,
   type ModelSecretLease,
   type ModelSecretResolver,
 } from "../../../src/core/model-provider-broker.js";
@@ -152,7 +155,10 @@ function providerStream(options: { readonly done?: boolean } = {}): Buffer {
   return Buffer.from(events.join(""));
 }
 
-function createDescriptor(options: { jsonObjectOutput?: "supported" | "unsupported" } = {}): {
+function createDescriptor(options: {
+  jsonObjectOutput?: "supported" | "unsupported";
+  inlinePng?: boolean;
+} = {}): {
   registry: ModelDescriptorRegistry;
   snapshot: ChatDescriptorSnapshot;
 } {
@@ -243,6 +249,7 @@ function brokerWith(options: {
   secrets?: ModelSecretResolver;
   transport?: ModelHttpTransport;
   bindings?: EndpointBindingRegistry;
+  media?: ModelMediaResolver;
 }) {
   const secrets = options.secrets ?? new FakeSecretResolver();
   const transport =
@@ -255,11 +262,64 @@ function brokerWith(options: {
       bindings,
       secrets,
       transport,
+      ...(options.media === undefined ? {} : { media: options.media }),
       now: () => NOW,
     }),
     secrets,
     transport,
     bindings,
+  };
+}
+
+function mediaInvocation(descriptor: DescriptorRef): ChatBrokerInvocation {
+  const base = invocation(descriptor);
+  return {
+    ...base,
+    context: { ...base.context, sessionId: "session-1" },
+    budgets: {
+      ...base.budgets,
+      maxMediaItems: 1,
+      maxResolvedMediaBytes: 16 * 1024,
+    },
+    input: {
+      ...base.input,
+      messages: [{
+        role: "user",
+        parts: [
+          { kind: "text", text: "Read the attached image." },
+          {
+            kind: "media",
+            mediaReference: { type: "media-reference", mediaId: "media-1" },
+            requirementId: "inline-png-v1",
+          },
+        ],
+      }],
+    },
+  };
+}
+
+function resolvedMedia(
+  request: Parameters<ModelMediaResolver["resolve"]>[0],
+  bytes = Buffer.from("inspected-png-bytes", "utf8"),
+): ModelResolvedMedia {
+  return {
+    schemaVersion: "dolly.model.resolved-media/1",
+    modelRequestId: request.modelRequestId,
+    mediaRequestId: request.mediaRequestId,
+    recipientId: request.recipientId,
+    descriptorDigest: request.descriptor.descriptorDigest,
+    bindingRevision: request.binding.bindingRevision,
+    messageIndex: request.messageIndex,
+    partIndex: request.partIndex,
+    requirementId: request.requirement.requirementId,
+    mediaId: request.mediaReference.mediaId,
+    digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+    mimeType: "image/png",
+    byteLength: bytes.byteLength,
+    width: 64,
+    height: 32,
+    accessMode: "inline",
+    inline: { encoding: "base64", data: bytes.toString("base64") },
   };
 }
 
@@ -437,6 +497,300 @@ describe("private endpoint binding and model provider broker", () => {
     expect(consumerVisible).not.toContain("provider.example.test");
     expect(consumerVisible).not.toContain("binding-private-rev-1");
     expect(consumerVisible).not.toContain("secret-rev-7");
+  });
+
+  it("resolves a delivered inline PNG through the frozen descriptor and binding before dispatch", async () => {
+    const { registry, snapshot } = createDescriptor({ inlinePng: true });
+    const bytes = Buffer.from("inspected-png-bytes", "utf8");
+    const resolve = vi.fn<ModelMediaResolver["resolve"]>(async (request) => {
+      expect(Object.isFrozen(request)).toBe(true);
+      expect(Object.isFrozen(request.context)).toBe(true);
+      expect(request).toMatchObject({
+        schemaVersion: "dolly.model.media-resolution-request/1",
+        modelRequestId: "request-1",
+        recipientId: expect.stringMatching(/^model:[0-9a-f]{64}$/u),
+        descriptor: snapshot.ref,
+        binding: {
+          endpointId: snapshot.ref.endpointId,
+          bindingRevision: "binding-private-rev-1",
+        },
+        context: {
+          moduleId: "brain-1",
+          moduleGenerationId: "generation-1",
+          moduleJobId: "module-job-1",
+          runId: "run-1",
+          attempt: 1,
+          sessionId: "session-1",
+        },
+        messageIndex: 0,
+        partIndex: 1,
+        mediaReference: { type: "media-reference", mediaId: "media-1" },
+        requirement: {
+          requirementId: "inline-png-v1",
+          modality: "image",
+          mimeTypes: ["image/png"],
+          deliveryModes: ["inline"],
+          providerFetchesAfterAcceptance: false,
+          lifetimeStrategyId: "media.inline-copy.v1",
+          placementStrategyId: "openai.chat.media.inline-image-url.v1",
+        },
+        acceptedAccessModes: ["inline"],
+        limits: {
+          maxItemsRemaining: 1,
+          maxBytesForItem: 16 * 1024,
+          maxResolvedBytesRemaining: 16 * 1024,
+        },
+      });
+      return resolvedMedia(request, bytes);
+    });
+    const transport = new FakeTransport(async () => new FakeResponse(200, providerBody()));
+    const secrets = new FakeSecretResolver();
+    const { broker } = brokerWith({
+      descriptors: registry,
+      descriptor: snapshot.ref,
+      media: { resolve },
+      transport,
+      secrets,
+    });
+
+    await expect(broker.invoke(mediaInvocation(snapshot.ref))).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(secrets.calls).toHaveLength(1);
+    expect(transport.requests).toHaveLength(1);
+    const wire = JSON.parse(Buffer.from(transport.requests[0]!.body).toString("utf8"));
+    expect(wire.messages[0].content).toEqual([
+      { type: "text", text: "Read the attached image." },
+      {
+        type: "image_url",
+        image_url: { url: `data:image/png;base64,${bytes.toString("base64")}` },
+      },
+    ]);
+    expect(JSON.stringify(wire)).not.toContain("media-1");
+  });
+
+  it("fails unresolved, foreign, corrupted, and over-budget Media before secret or network access", async () => {
+    const { registry, snapshot } = createDescriptor({ inlinePng: true });
+    const request = mediaInvocation(snapshot.ref);
+
+    const noResolverSecrets = new FakeSecretResolver();
+    const noResolverTransport = new FakeTransport(
+      async () => new FakeResponse(200, providerBody()),
+    );
+    const noResolver = brokerWith({
+      descriptors: registry,
+      descriptor: snapshot.ref,
+      secrets: noResolverSecrets,
+      transport: noResolverTransport,
+    });
+    await expect(noResolver.broker.invoke(request)).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "FEATURE_UNSUPPORTED", phase: "validation" },
+    });
+    expect(noResolverSecrets.calls).toHaveLength(0);
+    expect(noResolverTransport.requests).toHaveLength(0);
+
+    const mutations: Array<(value: ModelResolvedMedia) => ModelResolvedMedia> = [
+      (value) => ({ ...value, mediaId: "media-other" }),
+      (value) => ({ ...value, descriptorDigest: `sha256:${"a".repeat(64)}` }),
+      (value) => ({ ...value, bindingRevision: "binding-other" }),
+      (value) => ({ ...value, requirementId: "inline-other" }),
+      (value) => ({ ...value, mimeType: "image/jpeg" as "image/png" }),
+      (value) => ({ ...value, byteLength: value.byteLength + 1 }),
+      (value) => ({ ...value, digest: `sha256:${"b".repeat(64)}` }),
+      (value) => ({
+        ...value,
+        inline: {
+          ...value.inline,
+          data: Buffer.alloc(value.byteLength, 0x62).toString("base64"),
+        },
+      }),
+    ];
+    for (const mutate of mutations) {
+      const secrets = new FakeSecretResolver();
+      const transport = new FakeTransport(async () => new FakeResponse(200, providerBody()));
+      const resolver: ModelMediaResolver = {
+        resolve: async (mediaRequest) => mutate(resolvedMedia(mediaRequest)),
+      };
+      const { broker } = brokerWith({
+        descriptors: registry,
+        descriptor: snapshot.ref,
+        media: resolver,
+        secrets,
+        transport,
+      });
+      await expect(broker.invoke(request)).resolves.toMatchObject({
+        status: "failed",
+        error: { code: "INVALID_REQUEST", phase: "validation" },
+      });
+      expect(secrets.calls).toHaveLength(0);
+      expect(transport.requests).toHaveLength(0);
+    }
+
+    const budgetSecrets = new FakeSecretResolver();
+    const budgetTransport = new FakeTransport(async () => new FakeResponse(200, providerBody()));
+    const budgetResolver = vi.fn<ModelMediaResolver["resolve"]>(async (mediaRequest) =>
+      resolvedMedia(mediaRequest));
+    const budget = brokerWith({
+      descriptors: registry,
+      descriptor: snapshot.ref,
+      media: { resolve: budgetResolver },
+      secrets: budgetSecrets,
+      transport: budgetTransport,
+    });
+    await expect(budget.broker.invoke({
+      ...request,
+      budgets: { ...request.budgets, maxResolvedMediaBytes: 1 },
+    })).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "BUDGET_EXCEEDED", phase: "validation" },
+    });
+    expect(budgetSecrets.calls).toHaveLength(0);
+    expect(budgetTransport.requests).toHaveLength(0);
+
+    const aggregateLimits: number[] = [];
+    const aggregateTransport = new FakeTransport(
+      async () => new FakeResponse(200, providerBody()),
+    );
+    const aggregate = brokerWith({
+      descriptors: registry,
+      descriptor: snapshot.ref,
+      media: {
+        resolve: async (mediaRequest) => {
+          aggregateLimits.push(mediaRequest.limits.maxBytesForItem);
+          return resolvedMedia(
+            mediaRequest,
+            Buffer.alloc(mediaRequest.limits.maxBytesForItem, 0x61),
+          );
+        },
+      },
+      transport: aggregateTransport,
+    });
+    await expect(aggregate.broker.invoke({
+      ...request,
+      budgets: {
+        ...request.budgets,
+        maxMediaItems: 2,
+        maxResolvedMediaBytes: 32 * 1024,
+        maxInputBytes: 64 * 1024,
+      },
+      input: {
+        ...request.input,
+        messages: [{
+          role: "user",
+          parts: [
+            ...request.input.messages[0]!.parts,
+            {
+              kind: "media",
+              mediaReference: { type: "media-reference", mediaId: "media-2" },
+              requirementId: "inline-png-v1",
+            },
+          ],
+        }],
+      },
+    })).resolves.toMatchObject({ status: "succeeded" });
+    expect(aggregateLimits).toEqual([16 * 1024, 8 * 1024]);
+    expect(aggregateTransport.requests).toHaveLength(1);
+  });
+
+  it("cancels a pending Media resolution without reading a secret or dispatching", async () => {
+    const { registry, snapshot } = createDescriptor({ inlinePng: true });
+    const pending = deferred<ModelResolvedMedia>();
+    const secrets = new FakeSecretResolver();
+    const transport = new FakeTransport(async () => new FakeResponse(200, providerBody()));
+    const { broker } = brokerWith({
+      descriptors: registry,
+      descriptor: snapshot.ref,
+      media: { resolve: () => pending.promise },
+      secrets,
+      transport,
+    });
+    const controller = new AbortController();
+    const operation = broker.invoke(mediaInvocation(snapshot.ref), { signal: controller.signal });
+    await Promise.resolve();
+    controller.abort(new Error("cancel media resolution"));
+
+    await expect(operation).resolves.toMatchObject({
+      status: "cancelled",
+      error: { code: "CANCELLED", phase: "validation" },
+    });
+    expect(secrets.calls).toHaveLength(0);
+    expect(transport.requests).toHaveLength(0);
+  });
+
+  it("charges pending Media resolution to the invocation wall-time budget", async () => {
+    const { registry, snapshot } = createDescriptor({ inlinePng: true });
+    const pending = deferred<ModelResolvedMedia>();
+    const deadlines: string[] = [];
+    let capturedRequest: Parameters<ModelMediaResolver["resolve"]>[0] | undefined;
+    const secrets = new FakeSecretResolver();
+    const transport = new FakeTransport(async () => new FakeResponse(200, providerBody()));
+    const { broker } = brokerWith({
+      descriptors: registry,
+      descriptor: snapshot.ref,
+      media: {
+        resolve: (request) => {
+          capturedRequest = request;
+          deadlines.push(request.deadline);
+          return pending.promise;
+        },
+      },
+      secrets,
+      transport,
+    });
+    const request = mediaInvocation(snapshot.ref);
+
+    const operation = broker.invoke({
+      ...request,
+      budgets: { ...request.budgets, maxWallTimeMs: 20 },
+    });
+
+    await expect(operation).resolves.toMatchObject({
+      status: "cancelled",
+      error: { code: "DEADLINE_EXCEEDED", phase: "validation" },
+    });
+    expect(deadlines).toEqual(["2026-07-24T08:00:00.020Z"]);
+    expect(secrets.calls).toHaveLength(0);
+    expect(transport.requests).toHaveLength(0);
+
+    expect(capturedRequest).toBeDefined();
+    pending.resolve(resolvedMedia(capturedRequest!));
+    await waitImmediate();
+    expect(secrets.calls).toHaveLength(0);
+    expect(transport.requests).toHaveLength(0);
+  });
+
+  it("preserves deadline classification when the shared budget expires during dispatch", async () => {
+    const { registry, snapshot } = createDescriptor({ inlinePng: true });
+    const pendingResponse = deferred<ModelHttpTransportResponse>();
+    const lateResponse = new FakeResponse(200, providerBody());
+    const secrets = new FakeSecretResolver();
+    const transport = new FakeTransport(() => pendingResponse.promise);
+    const { broker } = brokerWith({
+      descriptors: registry,
+      descriptor: snapshot.ref,
+      media: { resolve: async (request) => resolvedMedia(request) },
+      secrets,
+      transport,
+    });
+    const request = mediaInvocation(snapshot.ref);
+
+    const operation = broker.invoke({
+      ...request,
+      budgets: { ...request.budgets, maxWallTimeMs: 20 },
+    });
+
+    await expect(operation).resolves.toMatchObject({
+      status: "cancelled",
+      error: { code: "DEADLINE_EXCEEDED", phase: "dispatch" },
+    });
+    expect(secrets.calls).toHaveLength(1);
+    expect(transport.requests).toHaveLength(1);
+
+    pendingResponse.resolve(lateResponse);
+    await waitImmediate();
+    expect(lateResponse.abort).toHaveBeenCalledOnce();
   });
 
   it("validates a descriptor-bound provider stream while retaining one final result", async () => {
