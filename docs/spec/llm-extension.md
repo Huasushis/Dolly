@@ -545,7 +545,10 @@ credentials, provider-specific request fields, and host paths are deliberately
 absent. The default is tool-free and requires streaming.
 
 Before provider I/O, the configuration resolver binds the configuration to the
-exact active descriptor snapshot. It rejects a descriptor mismatch, an
+exact active descriptor snapshot. The installed candidate additionally binds
+the configured model permission-policy identifier to the one Host-issued model
+capability; a configuration cannot select one descriptor while receiving a
+different descriptor or larger Host budget. It rejects a descriptor mismatch, an
 unsupported streaming/reasoning/JSON-object policy, unknown context or output
 token maxima, an output limit larger than the descriptor limit, and any
 configuration whose maximum input plus maximum output tokens exceed the model

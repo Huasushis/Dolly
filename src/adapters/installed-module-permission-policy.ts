@@ -23,11 +23,16 @@ import {
   createModelOperationCapabilityV2,
   createModelOperationCapabilityV3,
   createToolInvocationCapabilityV2,
+  DEFAULT_MODEL_OPERATION_LIMITS,
   type ChatModelBrokerPort,
   type ModelOperationLimits,
   type ModelOutputContractKind,
   type ToolInvocationV2Limits,
 } from "../core/provider-capabilities/index.js";
+import {
+  resolveLlmModuleConfiguration,
+  validateLlmModuleConfiguration,
+} from "../extensions/llm/module-configuration.js";
 import {
   ToolPolicySession,
   ToolRegistry,
@@ -408,6 +413,130 @@ function immutablePolicy(
       : immutableStoragePolicy(policy);
 }
 
+function assertInstalledLlmConfigurationPolicyBinding(
+  resolved: InstalledExtensionModule,
+  policies: readonly InstalledModulePermissionPolicy[],
+): void {
+  const raw = resolved.configuration.configuration;
+  const declaresLlmConfiguration =
+    raw !== null &&
+    typeof raw === "object" &&
+    !Array.isArray(raw) &&
+    Reflect.get(raw, "schemaVersion") === "dolly.llm.module-configuration/1";
+  const isLlmModule =
+    resolved.module.extensionId === "dolly.llm" &&
+    resolved.module.moduleKind === "conversation";
+  if (!isLlmModule) {
+    if (declaresLlmConfiguration) {
+      throw new TypeError(
+        "The reserved LLM configuration schema requires the dolly.llm conversation Module",
+      );
+    }
+    return;
+  }
+  if (
+    raw === null ||
+    typeof raw !== "object" ||
+    Array.isArray(raw)
+  ) {
+    throw new TypeError(
+      "The dolly.llm conversation Module requires its closed LLM configuration",
+    );
+  }
+  const configuration = validateLlmModuleConfiguration(raw as JsonValue);
+  if (configuration.model.streamingPolicy !== "required") {
+    throw new TypeError(
+      "The installed LLM candidate currently requires strict streaming configuration",
+    );
+  }
+  const modelPolicies = policies.filter(
+    (policy): policy is InstalledStrictStreamingChatPolicy =>
+      policy.kind === "strict-streaming-chat",
+  );
+  if (
+    modelPolicies.length !== 1 ||
+    modelPolicies[0]!.policyId !== configuration.model.permissionPolicyId
+  ) {
+    throw new TypeError(
+      "Installed LLM configuration must select exactly its one Host model permission policy",
+    );
+  }
+  const modelPolicy = modelPolicies[0]!;
+  if (modelPolicy.brokerOptions === undefined) {
+    throw new TypeError(
+      "Installed LLM configuration requires a Host descriptor registry, not a prebuilt chat port",
+    );
+  }
+  const descriptor = modelPolicy.brokerOptions.descriptors.snapshot(modelPolicy.descriptor);
+  resolveLlmModuleConfiguration(configuration, descriptor);
+  if (!modelPolicy.reasoningPolicies.includes(configuration.model.reasoningPolicy)) {
+    throw new TypeError(
+      "Installed LLM configuration reasoning policy exceeds its Host permission policy",
+    );
+  }
+  if (!modelPolicy.outputContracts.includes(configuration.model.outputContract)) {
+    throw new TypeError(
+      "Installed LLM configuration output contract exceeds its Host permission policy",
+    );
+  }
+  const budgets = modelPolicy.budgets;
+  if (
+    budgets.maxInputTokens === undefined ||
+    configuration.context.tokenBudget.maxInputTokens > budgets.maxInputTokens ||
+    budgets.maxOutputTokens === undefined ||
+    configuration.turn.maxOutputTokens > budgets.maxOutputTokens ||
+    configuration.context.limits.maxTotalBytes > budgets.maxInputBytes ||
+    configuration.turn.maxOutputBytes > budgets.maxOutputBytes ||
+    configuration.turn.maxWallTimeMs > budgets.maxWallTimeMs
+  ) {
+    throw new TypeError(
+      "Installed LLM configuration exceeds its Host model invocation budgets",
+    );
+  }
+  const limits = { ...DEFAULT_MODEL_OPERATION_LIMITS, ...modelPolicy.limits };
+  if (
+    configuration.context.limits.maxMessages > limits.maxMessages ||
+    configuration.context.limits.maxTextItemBytes > limits.maxPartBytes ||
+    configuration.turn.maxOutputBytes > limits.maxResultBytes ||
+    configuration.turn.maxProviderCalls > limits.maxInvocationsPerRun
+  ) {
+    throw new TypeError(
+      "Installed LLM configuration exceeds its Host model capability limits",
+    );
+  }
+  const toolPolicies = policies.filter(
+    (policy): policy is InstalledRegisteredToolPolicy => policy.kind === "registered-tools",
+  );
+  const configuredToolPolicyIds = [...configuration.tools.policyIds].sort();
+  const selectedToolPolicyIds = toolPolicies.map((policy) => policy.policyId).sort();
+  if (
+    configuredToolPolicyIds.length !== selectedToolPolicyIds.length ||
+    configuredToolPolicyIds.some((policyId, index) => policyId !== selectedToolPolicyIds[index])
+  ) {
+    throw new TypeError(
+      "Installed LLM configuration tool policies do not match its Host tool grants",
+    );
+  }
+  if (toolPolicies.length > 1) {
+    throw new TypeError(
+      "Installed LLM configuration version 1 supports at most one aggregate tool policy",
+    );
+  }
+  const toolPolicy = toolPolicies[0];
+  if (
+    toolPolicy !== undefined &&
+    (configuration.tools.limits.maxRounds > toolPolicy.budget.maxRounds ||
+      configuration.tools.limits.maxCalls > toolPolicy.budget.maxCalls ||
+      configuration.tools.limits.maxCallsPerRound > toolPolicy.budget.maxCallsPerRound ||
+      configuration.tools.limits.maxApprovals > toolPolicy.budget.maxApprovals ||
+      configuration.tools.limits.maxCallBytes > toolPolicy.budget.maxCallBytes)
+  ) {
+    throw new TypeError(
+      "Installed LLM configuration exceeds its Host tool policy budget",
+    );
+  }
+}
+
 function sameSelection(
   setup: InstalledModulePermissionPolicySetup,
   resolved: InstalledExtensionModule,
@@ -631,6 +760,7 @@ export class InstalledModulePermissionPolicyRegistry {
       }
       return policy;
     });
+    assertInstalledLlmConfigurationPolicyBinding(resolved, policies);
     const reference = resolved.module.configurationReference;
     if (
       policies.some(

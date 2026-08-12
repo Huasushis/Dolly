@@ -164,9 +164,10 @@ function moduleEntry(revision: string): JsonValue {
 describe("LLM Module configuration", () => {
   it("materializes a closed, immutable, descriptor-bound streaming default", () => {
     const selected = snapshot("qwen3.6-27b", 8192, 2048);
-    const configuration = createDefaultLlmModuleConfiguration(selected);
+    const configuration = createDefaultLlmModuleConfiguration(selected, "model.owner-primary");
 
     expect(configuration.schemaVersion).toBe("dolly.llm.module-configuration/1");
+    expect(configuration.model.permissionPolicyId).toBe("model.owner-primary");
     expect(configuration.model.descriptor).toEqual(selected.ref);
     expect(configuration.model.streamingPolicy).toBe("required");
     expect(configuration.tools.policyIds).toEqual([]);
@@ -179,7 +180,7 @@ describe("LLM Module configuration", () => {
 
   it("rejects provider fields, malformed tool budgets, and an impossible smaller context", () => {
     const selected = snapshot("deepseek-v4-flash", 1024, 512);
-    const valid = createDefaultLlmModuleConfiguration(selected);
+    const valid = createDefaultLlmModuleConfiguration(selected, "model.owner-primary");
 
     const copy = (value: unknown): Record<string, JsonValue> =>
       cloneJson(value as JsonValue) as Record<string, JsonValue>;
@@ -212,8 +213,14 @@ describe("LLM Module configuration", () => {
   it("stores model changes as immutable revisions and classifies their reference change as a generation restart", () => {
     const directory = temporaryDirectory();
     const store = new ModuleConfigurationStore({ directory });
-    const source = createDefaultLlmModuleConfiguration(snapshot("qwen3.6-27b", 8192, 2048));
-    const target = createDefaultLlmModuleConfiguration(snapshot("deepseek-v4-flash", 4096, 1024));
+    const source = createDefaultLlmModuleConfiguration(
+      snapshot("qwen3.6-27b", 8192, 2048),
+      "model.owner-primary",
+    );
+    const target = createDefaultLlmModuleConfiguration(
+      snapshot("deepseek-v4-flash", 4096, 1024),
+      "model.owner-primary",
+    );
     const first = store.create({
       configId: "agent-config",
       extensionId: "dolly.llm",

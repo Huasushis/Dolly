@@ -49,6 +49,7 @@ export interface LlmToolLimits {
 export interface LlmModuleConfiguration {
   readonly schemaVersion: "dolly.llm.module-configuration/1";
   readonly model: {
+    readonly permissionPolicyId: string;
     readonly descriptor: DescriptorRef;
     readonly reasoningPolicy: LlmReasoningPolicy;
     readonly streamingPolicy: LlmStreamingPolicy;
@@ -149,8 +150,9 @@ export const LLM_MODULE_CONFIGURATION_SCHEMA: JsonValue = deepFreeze({
     model: {
       type: "object",
       additionalProperties: false,
-      required: ["descriptor", "reasoningPolicy", "streamingPolicy", "outputContract"],
+      required: ["permissionPolicyId", "descriptor", "reasoningPolicy", "streamingPolicy", "outputContract"],
       properties: {
+        permissionPolicyId: { type: "string", pattern: IDENTIFIER_PATTERN },
         descriptor: descriptorReferenceSchema,
         reasoningPolicy: { enum: ["default", "prefer", "require", "disable"] },
         streamingPolicy: { enum: ["required", "optional", "forbidden"] },
@@ -461,6 +463,7 @@ export function resolveLlmModuleConfiguration(
  */
 export function createDefaultLlmModuleConfiguration(
   descriptor: ChatDescriptorSnapshot,
+  permissionPolicyId: string,
 ): LlmModuleConfiguration {
   const contextFeature = descriptor.document.features.contextWindowTokens;
   const outputFeature = descriptor.document.features.maxOutputTokens;
@@ -487,6 +490,7 @@ export function createDefaultLlmModuleConfiguration(
   const configuration = validateLlmModuleConfiguration({
     schemaVersion: "dolly.llm.module-configuration/1",
     model: {
+      permissionPolicyId,
       descriptor: descriptor.ref,
       reasoningPolicy: "default",
       streamingPolicy: "required",
