@@ -128,7 +128,6 @@ async function waitFor(
 }
 
 const INSTALLED_AGENT_MODEL_CONTENT = Object.freeze([
-  "Discover the available keys, read the active note, then cite its source.",
   JSON.stringify({ action: "alpha_discover", arguments: { prefix: "", limit: 3 } }),
   JSON.stringify({ action: "beta_read", arguments: { key: "deployment-note" } }),
   JSON.stringify({
@@ -1582,7 +1581,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
             },
             transport: modelTransport,
           },
-          outputContracts: ["text", "json-object"],
+          outputContracts: ["json-object"],
           reasoningPolicies: ["require", "disable"],
           roles: ["system", "user"],
           limits: {
@@ -1825,8 +1824,10 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       expect(providerBodies.every((body) =>
         JSON.stringify(body.stream_options) === JSON.stringify({ include_usage: true })
       )).toBe(true);
-      expect(providerBodies[0]).toMatchObject({ thinking: { type: "enabled" } });
-      expect(providerBodies[0]).not.toHaveProperty("response_format");
+      expect(providerBodies[0]).toMatchObject({
+        thinking: { type: "enabled" },
+        response_format: { type: "json_object" },
+      });
       for (const body of providerBodies.slice(1)) {
         expect(body).toMatchObject({
           thinking: { type: "disabled" },
