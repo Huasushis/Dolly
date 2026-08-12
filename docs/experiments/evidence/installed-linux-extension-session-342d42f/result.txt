@@ -1,0 +1,16 @@
+source_commit=342d42f3c795fa9dec0635554d3df27377ad16bd
+source_snapshot=git archive HEAD
+container=dolly-experiment-3472093-63cc83b2
+container_removed=true
+test_file=tests/conformance/security/linux-extension-module-executor-integration.test.ts
+test_files_passed=1
+tests_passed=2
+tests_failed=0
+installed_package_digest=sha256:2367724a346cc976987290cbce2aeb9d3cc0a82a3c1ff0ab7a1ff1cc239adff9
+installed_process_final_record_state=stopped
+installed_process_cgroup_removed=true
+installed_exact_process_identity_gone=true
+live_session_identity_match=true
+unknown_process_session_absent=true
+stopped_process_session_absent=true
+raw_local_log_sha256=44791448f18ff3af2cafc99c1cc60c68a82c00a338da244812ca530eb3710813

@@ -1,0 +1,7 @@
+cgroup filesystem: cgroup2fs
+root controllers: cpuset cpu io memory hugetlb pids rdma misc
+lingering: Linger=yes
+systemd: systemd 255 (255.4-1ubuntu8.17)
+node: v20.20.2
+dolly identity: uid=1001 gid=997 groups=997
+python3: Python 3.12.3

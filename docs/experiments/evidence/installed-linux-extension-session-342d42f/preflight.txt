@@ -1,0 +1,8 @@
+tracked_commit_source=true
+source_readable=true
+source_writable=false
+private_env_present=false
+git_directory_present=false
+dependencies_writable=false
+vite_temp_writable=true
+artifacts_writable=true

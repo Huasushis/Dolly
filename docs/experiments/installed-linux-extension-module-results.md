@@ -42,6 +42,31 @@ checkout files were absent. The runner removed only its exact container
 Evidence is in
 `docs/experiments/evidence/installed-linux-extension-module-51a6962/`.
 
+## Extension process session follow-up
+
+On 2026-08-12 UTC, source
+`342d42f3c795fa9dec0635554d3df27377ad16bd` added a read-only lookup from the
+installed generation factory to the exact `ExtensionProcessHost` session it
+created. The focused Linux integration again passed 2/2 tests in the uniquely
+named disposable container `dolly-experiment-3472093-63cc83b2`.
+
+The new assertions established that:
+
+- a process generation has no session before its executor starts;
+- after the exact installed process is ready, the returned identity matches
+  the installed extension, instance, Module, Module generation, and process
+  generation;
+- an unknown process generation returns no session; and
+- after whole-group stop, durable `stopped`, control-group removal, and exact
+  process disappearance, the former process generation again returns no
+  session.
+
+The runner removed only that exact container; a post-run inspect found it
+absent. Reproducible metadata and a plain result summary are in
+`docs/experiments/evidence/installed-linux-extension-session-342d42f/`. The
+raw local runner log SHA-256 was
+`44791448f18ff3af2cafc99c1cc60c68a82c00a338da244812ca530eb3710813`.
+
 ## What this does not prove
 
 This result does not prove that configured Modules are product-supported.
