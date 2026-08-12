@@ -453,6 +453,14 @@ keep that ingress closed while the state is `recovering`; the configured-Module
 bootstrap refusal remains in force until that ownership is connected and
 tested.
 
+A disposable Linux integration now covers the capacity-dependent form of that
+boundary: startup freshly proves the old producer control group empty, restores
+its prepared result without creating a producer executor, starts only a real
+downstream drainer, and lets the shared Scheduler commit the restored result
+after the drainer releases capacity. Reopening both stores verifies the Claim,
+journal, output effect, and stopped process records. This remains candidate-host
+evidence because public ingress ownership is not connected.
+
 `resolveInstalledExtensionModule` and
 `deriveInstalledLinuxExtensionModuleExecutor` form a narrower installation
 derivation boundary: in ordinary terms, they ensure that the package digest,
