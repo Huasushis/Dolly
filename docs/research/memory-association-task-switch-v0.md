@@ -4,7 +4,7 @@
 
 The completed live pilot supports an explicit learned task checkpoint as a candidate mechanism for interrupted-task recovery. It does **not** yet support a general Memory design, automatic task switching in Dolly, or repeated position-aware association as a product default.
 
-The preregistered version-9 run completed 1,908 case rows: 1,872 deterministic mechanism rows and 36 live Agent rows. The 38 logical Aether calls required 41 request attempts. The independent artifact verifier passed, and all five declared mutation checks made the verifier fail for the intended reason.
+The preregistered version-11 run completed 1,908 case rows: 1,872 deterministic mechanism rows and 36 live Agent rows. All generation calls used strict server-sent event (SSE) streaming with no non-stream fallback. The 38 logical Aether calls required 40 request attempts. The independent artifact verifier passed. The earlier version-9 mutation campaign remains the current verifier-mutation evidence; it is not silently attributed to version 11.
 
 The strict primary metric passed:
 
@@ -28,11 +28,14 @@ The live endpoint profile reflects observed Aether/qwen3.6-27b behavior:
 
 - learner: `thinking.type=enabled`, 5,200 completion tokens, 180-second timeout;
 - scored Agent: `thinking.type=disabled`, 800 completion tokens, 90-second timeout;
+- both generation roles: `stream=true`, `stream_options.include_usage=true`, strict `text/event-stream`, one usage event, one `[DONE]`, and no non-stream fallback;
 - no `enable_thinking` field;
 - no local model, DashScope, object storage, Dolly runtime, or Module launch path;
 - a response proves reasoning only when `reasoning_content` is non-empty.
 
 All scored treatment and baseline Agent calls use the same disabled-thinking profile. Therefore this run says nothing about reasoning-enabled Agent efficacy.
+
+The owner's reverse proxy timeout was raised from 120 seconds to 24 hours before the completed version-11 run. The harness still applied its own per-call deadlines above. These are separate controls: the gateway no longer imposed the earlier short ceiling, while the experiment retained bounded stopping behavior.
 
 ## Frozen run lineage
 
@@ -49,8 +52,14 @@ Every stopped or interrupted run remains under the artifact root; none was overw
 | full-v7 | 7 | learner completed; one Agent exhausted 5,200 tokens; a later Agent timed out at 180 seconds |
 | full-v8 | 5 | learner and three disabled-thinking Agents completed; the next Agent timed out at 90 seconds |
 | full-v9 | 41 attempts for 38 logical calls | complete |
+| full-v10 | 1 | HTTP 200 SSE; rejected because the first strict parser incorrectly required the usage event to have no choice entry |
+| full-v11 | 40 attempts for 38 logical calls | complete; all 38 successful responses passed the corrected strict SSE contract |
 
 Version 9 preregistered up to four attempts only for timeout, network/JSON transport failure, HTTP 408/425/429, or HTTP 5xx. HTTP 200 content failures were never retried. Two seed-302 learner attempts ended in `network-or-json` before attempt 3 succeeded; one disabled-thinking Agent attempt timed out before attempt 2 succeeded. All three failed attempts are retained.
+
+Version 10 deliberately failed closed on the first HTTP 200 stream. The Aether usage event contained one choice with an empty delta, whereas the preregistered parser allowed only a choice-less usage event. Existing successful general-Agent stream evidence showed that the empty-delta form was the measured endpoint behavior. Version 11 therefore changed only that falsified wire-shape assumption: it accepts either zero choices or exactly one empty-delta choice on the unique usage event. It did not change the Memory data, conditions, seeds, metrics, or thresholds.
+
+Version 11 retained the same bounded retry classes and never retried an HTTP 200 content or protocol failure. Logical Agent calls 2 and 21 each reached the 90-second harness deadline on attempt 1 and succeeded on attempt 2. Both timeout rows and all successful rows are retained.
 
 ## Results
 
@@ -89,23 +98,26 @@ That diagnostic is post hoc and cannot change the registered score. It exposes a
 
 ### Reasoning evidence and endpoint reliability
 
-Only the two successful learner responses used enabled thinking. Their non-empty `reasoning_content` lengths were 10,583 and 12,113 characters, so those two calls have direct reasoning evidence. Disabled-thinking Agent calls correctly recorded empty reasoning. Across all 41 attempts, reasoning observation coverage was `1.00`; reasoning was non-empty on 2 attempts.
+Only the two successful learner responses used enabled thinking. Both had non-empty `reasoning_content`, so those two calls have direct reasoning evidence. Disabled-thinking Agent calls correctly recorded empty reasoning. Across all 40 attempts, reasoning observation coverage was `1.00`; reasoning was non-empty on 2 attempts.
 
-The complete run needed three transport retries. This is evidence that a public adapter needs bounded, persisted, status-specific retries. It is not evidence that arbitrary model/content retries are safe.
+The complete version-11 run needed two timeout retries. This is evidence that a public adapter needs bounded, persisted, status-specific retries. It is not evidence that arbitrary model/content retries are safe.
+
+All 38 successful version-11 responses were HTTP 200 `text/event-stream` streams with exactly one usage event, exactly one `[DONE]`, and an observed provider response identifier. The strict reader also required valid UTF-8, bounded bytes/events/buffer size, a stable provider identity, a terminal finish reason, and no data after `[DONE]`. Embedding calls are outside this generation experiment and are not converted to SSE.
 
 ## Independent validation
 
-The independent verifier reads only frozen artifacts and does not import generation, retrieval, learning, or model-request functions. It reported:
+The independent verifier reads the frozen artifact snapshot and separately frozen implementation bytes; it does not import generation, retrieval, learning, or model-request functions. For version 11 it reported:
 
 - valid artifact checksums;
 - 1,908 total and 1,872 local rows;
-- 41 retained request attempts covering 38 contiguous logical calls;
+- 40 retained request attempts covering 38 contiguous logical calls;
 - valid attempt numbering and only preregistered retry causes;
+- 38 successful strict streams, each with the required content type, one usage event, one `[DONE]`, and a provider identifier;
 - deterministic repeat agreement `1.00`;
 - active-context leakage maximum `0`;
 - no configured endpoint or credential value in checked artifacts.
 
-Five mutation copies were also checked. Removing an expected constraint, inserting forbidden evidence, altering an aggregate, changing an unchecked JSONL byte, and contradicting the reasoning observation each caused the verifier to exit non-zero for the intended reason. The first mutation harness invocation is retained: restricted sandboxing denied its Node child-process launches with `EPERM`. The same prepared copies were then verified through five separate repository-scoped commands, recorded in `mutation-validation-v2.json`.
+Five mutation copies were checked against version 9. Removing an expected constraint, inserting forbidden evidence, altering an aggregate, changing an unchecked JSONL byte, and contradicting the reasoning observation each caused the verifier to exit non-zero for the intended reason. The first mutation harness invocation is retained: restricted sandboxing denied its Node child-process launches with `EPERM`. The same prepared copies were then verified through five separate repository-scoped commands, recorded in `mutation-validation-v2.json`. Version 11 was independently validated, but its strict-stream-specific mutation matrix remains future work.
 
 ## Engineering decision
 
@@ -126,6 +138,7 @@ Automatic task switching, persistence across restart, safe deletion, learned adm
 
 - preregistration: `docs/experiments/preregistrations/memory-association-task-switch-v0.json`
 - harness and verifier: `scripts/experiments/probes/memory-association-task-switch-v0/`
-- complete run: `artifacts/experiments/probes/memory-association-task-switch-v0/runs/full-v9-20260809a/`
-- failed and interrupted lineage: `artifacts/experiments/probes/memory-association-task-switch-v0/runs/full-v2-20260809a/` through `full-v8-20260809a/`
+- current complete strict-stream run: `artifacts/experiments/probes/memory-association-task-switch-v0/runs/full-v11-20260812a/`
+- earlier complete non-stream run: `artifacts/experiments/probes/memory-association-task-switch-v0/runs/full-v9-20260809a/`
+- failed and interrupted lineage: versioned run directories under `artifacts/experiments/probes/memory-association-task-switch-v0/runs/`, including the falsified `full-v10-20260812a/`
 - mutation copies: `artifacts/experiments/probes/memory-association-task-switch-v0/verification-mutations/full-v9-20260809a/`
