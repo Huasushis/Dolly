@@ -130,6 +130,57 @@ function persistSubmittedClaim(
 }
 
 describe("FileCore Module output capacity", () => {
+  it("identifies the owning consumer when a self-loop output cannot fit", async () => {
+    const root = scratch("capacity-self-loop");
+    const core = openCore(join(root, "core-state.json"), "self-loop");
+    for (const pageId of ["loop-a", "loop-b"]) {
+      core.deliveries.createPage(pageId);
+      core.deliveries.registerConsumer(pageId, "loop", "from-now");
+    }
+    const inputBlock = core.blocks.commit(proposal("self-loop input"), {
+      kind: "external",
+      id: "console",
+    });
+    core.deliveries.append("loop-a", inputBlock.id);
+    const claim = core.deliveries.claim({
+      consumerId: "loop",
+      pageIds: ["loop-a", "loop-b"],
+      moduleGenerationId: "loop-generation",
+      maxCount: 1,
+      maxBytes: 1024 * 1024,
+    })!;
+    persistSubmittedClaim(core, "loop", claim);
+    const repository = new InMemoryModuleResultCommitRepository();
+    const commits = createModuleResultCommitCoordinator({
+      core,
+      repository,
+      now: () => NOW,
+      mailboxes: [{
+        consumerId: "loop",
+        pageIds: ["loop-a", "loop-b"],
+        maxResidentCount: 1,
+        maxResidentBytes: 1024 * 1024,
+      }],
+    });
+
+    await expect(commits.commit({
+      ...claim,
+      source: { kind: "module", id: "loop" },
+      outputPageIds: ["loop-a", "loop-b"],
+      blockProposal: proposal("self-loop output"),
+    })).rejects.toMatchObject({
+      code: "MODULE_RESULT_OUTPUT_BACKPRESSURED",
+      blockedConsumerIds: ["loop"],
+    });
+    expect(core.deliveries.inspectClaim(claim).status).toBe("active");
+    expect(repository.get(claim.moduleJobId)).toMatchObject({
+      state: "prepared",
+      outputDeliveries: [],
+    });
+    expect(core.deliveries.inspectResident("loop", ["loop-a", "loop-b"]))
+      .toMatchObject({ residentCount: 1, claimedCount: 1 });
+  });
+
   it("recovers a later capacity-releasing result before retrying an earlier blocked result", async () => {
     const root = scratch("capacity-restart-order");
     const statePath = join(root, "core-state.json");

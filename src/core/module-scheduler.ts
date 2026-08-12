@@ -1681,6 +1681,18 @@ export class ModuleScheduler {
         entry.backpressured = true;
         entry.blockingDownstreamIds = [...result.blockedConsumerIds];
         entry.lastFailureAt = now;
+        if (result.blockedConsumerIds.includes(entry.moduleId)) {
+          // The accepted result is already bound to this Module's active
+          // Claim. Absolute serialization prevents a second Run from draining
+          // the same consumer, so retrying the exact commit cannot create the
+          // capacity it needs. Preserve the Claim/result and surface the
+          // required configuration or operator recovery instead of spinning.
+          entry.retryCount = 0;
+          entry.retryDelayMs = 0;
+          entry.retryJitterMs = 0;
+          this.#quarantine(entry, "OUTPUT_COMMIT_SELF_BACKPRESSURE");
+          return;
+        }
         entry.retryCount += 1;
         this.#scheduleRetry(entry, now);
         return;

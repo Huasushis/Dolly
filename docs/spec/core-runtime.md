@@ -2155,6 +2155,17 @@ If output backpressure prevents transaction completion, input MUST remain
 unacknowledged. Retried output commit MUST use the stable Module job
 idempotency scope.
 
+A self-loop is special only after the exact output commit has been rejected:
+if its `blockedConsumerIds` includes the producing Module itself, the accepted
+result already holds that consumer's sole active Claim. Absolute serialization
+therefore forbids the second Run that would be needed to drain more of the same
+consumer, and retrying the unchanged commit cannot create capacity. Scheduler
+MUST preserve the prepared result and Claim, quarantine that Module with a
+visible self-backpressure reason, and require a configuration or operator
+recovery. It MUST NOT re-execute the Extension or spin on commit retries. A
+self-loop that has not reached this exact rejection remains eligible to run so
+it can consume its ordinary backlog.
+
 Cycles are allowed in the Page graph, but bounded mailboxes can create cyclic
 wait. A scheduler or operator policy MUST detect sustained no-progress states
 and expose the blocked dependency cycle. Correctness MUST not depend on

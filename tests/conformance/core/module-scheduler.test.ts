@@ -818,6 +818,47 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
     await scheduler.stop();
   });
 
+  it("quarantines a prepared self-loop output that cannot fit without rerunning it", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler({
+      retryBaseMs: 250,
+      retryMaxMs: 1_000,
+      retryJitterRatio: 0,
+    });
+    const runtime = new FakeModuleRuntime(() => ({
+      ...outputBackpressuredResult(1),
+      blockedConsumerIds: ["loop"],
+    }));
+    mailboxes.set("loop", 1, 100);
+    scheduler.register({
+      moduleId: "loop",
+      runtime,
+      inputPageIds: ["shared"],
+      outputPageIds: ["shared"],
+      mailbox: { maxResidentCount: 1, maxResidentBytes: 100 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(runtime.tickCount).toBe(1);
+    expect(scheduler.status("loop")).toMatchObject({
+      schedulingState: "quarantined",
+      quarantineReason: "OUTPUT_COMMIT_SELF_BACKPRESSURE",
+      lastTickStatus: "output-backpressured",
+      retryCount: 0,
+      blockingDownstreamIds: ["loop"],
+    });
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "scheduler.quarantined",
+      moduleId: "loop",
+      reason: "OUTPUT_COMMIT_SELF_BACKPRESSURE",
+    }));
+
+    await advance(clock, 5_000);
+    expect(runtime.tickCount).toBe(1);
+    await scheduler.stop();
+  });
+
   it("treats an unreadable mailbox as unknown capacity instead of as free capacity", async () => {
     const harness = fanOut();
     registerFanOut(harness, ["producer", "left", "right"]);
