@@ -151,7 +151,8 @@ interface AgentExperimentConfiguration {
     | "general-agent-tool-registry-v3"
     | "general-agent-tool-registry-v4"
     | "general-agent-tool-registry-v5"
-    | "general-agent-tool-registry-v6";
+    | "general-agent-tool-registry-v6"
+    | "general-agent-tool-registry-v7";
   readonly experimentVersion: number;
   readonly modelCapabilityVersion: 1 | 2;
   readonly separatePlanningCall: boolean;
@@ -821,8 +822,51 @@ function parseArguments(argv: readonly string[]): AgentExperimentConfiguration {
       ],
     };
   }
+  if (/^registry-v8-[A-Za-z0-9._-]+$/u.test(runId)) {
+    return {
+      experimentId: "general-agent-tool-registry-v7",
+      experimentVersion: 8,
+      modelCapabilityVersion: 2,
+      separatePlanningCall: true,
+      runId,
+      artifactRoot: join(
+        repositoryRoot,
+        "artifacts/experiments/probes/general-agent-tool-registry-v7",
+      ),
+      preregistrationPath: join(
+        repositoryRoot,
+        "docs/experiments/preregistrations/general-agent-tool-registry-v7.json",
+      ),
+      executionOrder: [
+        {
+          evaluationSeed: 7431,
+          repetition: 1,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7431",
+        },
+        {
+          evaluationSeed: 7431,
+          repetition: 1,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7431",
+        },
+        {
+          evaluationSeed: 7432,
+          repetition: 2,
+          conditionId: "tool-registry-storage",
+          modelRequestIdBase: "tool-registry-storage-seed-7432",
+        },
+        {
+          evaluationSeed: 7432,
+          repetition: 2,
+          conditionId: "no-storage-tool",
+          modelRequestIdBase: "no-storage-tool-seed-7432",
+        },
+      ],
+    };
+  }
   throw new Error(
-    "usage: run.mts --run-id live-v8-<identifier>|registry-v1-<identifier>|registry-v2-<identifier>|registry-v3-<identifier>|registry-v4-<identifier>|registry-v5-<identifier>|registry-v6-<identifier>|registry-v7-<identifier>",
+    "usage: run.mts --run-id live-v8-<identifier>|registry-v1-<identifier>|registry-v2-<identifier>|registry-v3-<identifier>|registry-v4-<identifier>|registry-v5-<identifier>|registry-v6-<identifier>|registry-v7-<identifier>|registry-v8-<identifier>",
   );
 }
 

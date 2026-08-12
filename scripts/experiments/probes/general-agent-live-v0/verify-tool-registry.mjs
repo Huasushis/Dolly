@@ -10,14 +10,6 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "../../../..");
 const workspaceTemporaryRoot = resolve(repositoryRoot, "..", ".tmp");
 const verifierPath = fileURLToPath(import.meta.url);
-const artifactRoot = join(
-  repositoryRoot,
-  "artifacts/experiments/probes/general-agent-tool-registry-v6",
-);
-const sourcePreregistrationPath = join(
-  repositoryRoot,
-  "docs/experiments/preregistrations/general-agent-tool-registry-v6.json",
-);
 const extensionSourcePath = join(scriptDirectory, "extension.mjs");
 const HIDDEN_CODENAME = "EMBER-7421";
 const IMPLEMENTATION_PATHS = [
@@ -119,16 +111,22 @@ function sameJsonValue(left, right) {
 }
 
 function parseArguments(argv) {
+  const match = typeof argv[1] === "string"
+    ? /^(registry-v(7|8))-[A-Za-z0-9._-]+$/u.exec(argv[1])
+    : null;
   if (
     (argv.length !== 2 && argv.length !== 3 && argv.length !== 5) ||
     argv[0] !== "--run-id" ||
-    !/^registry-v7-[A-Za-z0-9._-]+$/u.test(argv[1]) ||
+    match === null ||
     (argv.length >= 3 && argv[2] !== "--check-only") ||
     (argv.length === 5 && argv[3] !== "--run-directory")
   ) {
-    fail("usage: verify-tool-registry.mjs --run-id registry-v7-<identifier> [--check-only [--run-directory <workspace-temp-run>]]");
+    fail("usage: verify-tool-registry.mjs --run-id registry-v7-<identifier>|registry-v8-<identifier> [--check-only [--run-directory <workspace-temp-run>]]");
   }
   const runId = argv[1];
+  const experimentVersion = Number(match[2]);
+  const experimentId = `general-agent-tool-registry-v${experimentVersion - 1}`;
+  const evaluationSeeds = experimentVersion === 7 ? [7429, 7430] : [7431, 7432];
   let runDirectory;
   if (argv.length === 5) {
     runDirectory = resolve(argv[4]);
@@ -140,7 +138,14 @@ function parseArguments(argv) {
       fail("override run directory is outside the workspace temporary root or has the wrong basename");
     }
   }
-  return { runId, checkOnly: argv[2] === "--check-only", runDirectory };
+  return {
+    runId,
+    checkOnly: argv[2] === "--check-only",
+    runDirectory,
+    experimentId,
+    experimentVersion,
+    evaluationSeeds,
+  };
 }
 
 function json(path) {
@@ -367,16 +372,16 @@ function providerStreamEvidence(provider, index) {
   };
 }
 
-function verifyPerCaseAccounting(accounting, modelRows, providerRows) {
+function verifyPerCaseAccounting(accounting, modelRows, providerRows, evaluationSeeds) {
   if (!Array.isArray(accounting) || accounting.length !== 4) {
     fail("per-case accounting inventory is invalid");
   }
   const spans = [[0, 1], [1, 5], [5, 9], [9, 10]];
   const expectedConditions = [
-    [7429, 1, "no-storage-tool"],
-    [7429, 1, "tool-registry-storage"],
-    [7430, 2, "tool-registry-storage"],
-    [7430, 2, "no-storage-tool"],
+    [evaluationSeeds[0], 1, "no-storage-tool"],
+    [evaluationSeeds[0], 1, "tool-registry-storage"],
+    [evaluationSeeds[1], 2, "tool-registry-storage"],
+    [evaluationSeeds[1], 2, "no-storage-tool"],
   ];
   accounting.forEach((entry, index) => {
     const [start, end] = spans[index];
@@ -648,21 +653,21 @@ function verifyEffectJournal(row, runDirectory, manifest) {
   );
 }
 
-function verifyModelCalls(rows) {
+function verifyModelCalls(rows, evaluationSeeds) {
   if (rows.length !== 10) fail(`expected 10 provider calls, observed ${rows.length}`);
   exactArray(
     rows.map((row) => row.requestId),
     [
-      "agent-no-storage-tool-seed-7429-model-request-1",
-      "agent-tool-registry-storage-seed-7429-model-request-1",
-      "agent-tool-registry-storage-seed-7429-model-request-2",
-      "agent-tool-registry-storage-seed-7429-model-request-3",
-      "agent-tool-registry-storage-seed-7429-model-request-4",
-      "agent-tool-registry-storage-seed-7430-model-request-1",
-      "agent-tool-registry-storage-seed-7430-model-request-2",
-      "agent-tool-registry-storage-seed-7430-model-request-3",
-      "agent-tool-registry-storage-seed-7430-model-request-4",
-      "agent-no-storage-tool-seed-7430-model-request-1",
+      `agent-no-storage-tool-seed-${evaluationSeeds[0]}-model-request-1`,
+      `agent-tool-registry-storage-seed-${evaluationSeeds[0]}-model-request-1`,
+      `agent-tool-registry-storage-seed-${evaluationSeeds[0]}-model-request-2`,
+      `agent-tool-registry-storage-seed-${evaluationSeeds[0]}-model-request-3`,
+      `agent-tool-registry-storage-seed-${evaluationSeeds[0]}-model-request-4`,
+      `agent-tool-registry-storage-seed-${evaluationSeeds[1]}-model-request-1`,
+      `agent-tool-registry-storage-seed-${evaluationSeeds[1]}-model-request-2`,
+      `agent-tool-registry-storage-seed-${evaluationSeeds[1]}-model-request-3`,
+      `agent-tool-registry-storage-seed-${evaluationSeeds[1]}-model-request-4`,
+      `agent-no-storage-tool-seed-${evaluationSeeds[1]}-model-request-1`,
     ],
     "model request ids",
   );
@@ -845,9 +850,9 @@ function refreshManifestArtifactDigests(runDirectory, names) {
   writeJson(manifestPath, manifest);
 }
 
-function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
+function runMutationChecks(sourceRunDirectory, runId, fixtureValues, evaluationSeeds) {
   mkdirSync(workspaceTemporaryRoot, { recursive: true, mode: 0o700 });
-  const mutationRoot = mkdtempSync(join(workspaceTemporaryRoot, "registry-v7-mutations-"));
+  const mutationRoot = mkdtempSync(join(workspaceTemporaryRoot, "registry-mutations-"));
   const mutations = [
     {
       id: "capability-type-raw-storage",
@@ -971,7 +976,7 @@ function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
     {
       id: "effect-outcome-unknown",
       apply(runDirectory) {
-        const name = "effect-intents-tool-registry-storage-seed-7429.json";
+        const name = `effect-intents-tool-registry-storage-seed-${evaluationSeeds[0]}.json`;
         const path = join(runDirectory, name);
         const document = json(path);
         document.records[0].outcome = {
@@ -1104,8 +1109,23 @@ function runMutationChecks(sourceRunDirectory, runId, fixtureValues) {
 }
 
 function main() {
-  const { runId, checkOnly, runDirectory: overrideRunDirectory } =
+  const {
+    runId,
+    checkOnly,
+    runDirectory: overrideRunDirectory,
+    experimentId,
+    experimentVersion,
+    evaluationSeeds,
+  } =
     parseArguments(process.argv.slice(2));
+  const artifactRoot = join(
+    repositoryRoot,
+    `artifacts/experiments/probes/${experimentId}`,
+  );
+  const sourcePreregistrationPath = join(
+    repositoryRoot,
+    `docs/experiments/preregistrations/${experimentId}.json`,
+  );
   const runDirectory = overrideRunDirectory ?? join(artifactRoot, "runs", runId);
   const preregistrationBytes = readFileSync(join(runDirectory, "preregistration.json"));
   if (!preregistrationBytes.equals(readFileSync(sourcePreregistrationPath))) {
@@ -1119,8 +1139,8 @@ function main() {
   const manifest = json(manifestPath);
   if (
     manifest.schemaVersion !== "general-agent-live/run-manifest/1" ||
-    manifest.experimentId !== "general-agent-tool-registry-v6" ||
-    manifest.experimentVersion !== 7 ||
+    manifest.experimentId !== experimentId ||
+    manifest.experimentVersion !== experimentVersion ||
     manifest.runId !== runId ||
     manifest.status !== "completed"
   ) {
@@ -1174,12 +1194,12 @@ function main() {
   ) {
     fail("preregistration validation inputs or dataset identity are invalid");
   }
-  exactArray(manifest.seeds, [7429, 7430], "manifest evaluation seeds");
+  exactArray(manifest.seeds, evaluationSeeds, "manifest evaluation seeds");
   const expectedExecutionOrder = [
-    { evaluationSeed: 7429, repetition: 1, conditionId: "no-storage-tool" },
-    { evaluationSeed: 7429, repetition: 1, conditionId: "tool-registry-storage" },
-    { evaluationSeed: 7430, repetition: 2, conditionId: "tool-registry-storage" },
-    { evaluationSeed: 7430, repetition: 2, conditionId: "no-storage-tool" },
+    { evaluationSeed: evaluationSeeds[0], repetition: 1, conditionId: "no-storage-tool" },
+    { evaluationSeed: evaluationSeeds[0], repetition: 1, conditionId: "tool-registry-storage" },
+    { evaluationSeed: evaluationSeeds[1], repetition: 2, conditionId: "tool-registry-storage" },
+    { evaluationSeed: evaluationSeeds[1], repetition: 2, conditionId: "no-storage-tool" },
   ];
   if (JSON.stringify(manifest.executionOrder) !== JSON.stringify(expectedExecutionOrder)) {
     fail("manifest execution order differs from the preregistered order");
@@ -1219,18 +1239,18 @@ function main() {
 
   const cases = jsonLines(casesPath);
   if (cases.length !== 4) fail(`expected 4 cases, observed ${cases.length}`);
-  verifyBaseline(cases[0], 7429, 1);
-  verifyTreatment(cases[1], 7429, 1);
-  verifyTreatment(cases[2], 7430, 2);
-  verifyBaseline(cases[3], 7430, 2);
+  verifyBaseline(cases[0], evaluationSeeds[0], 1);
+  verifyTreatment(cases[1], evaluationSeeds[0], 1);
+  verifyTreatment(cases[2], evaluationSeeds[1], 2);
+  verifyBaseline(cases[3], evaluationSeeds[1], 2);
   for (const row of cases) verifyEffectJournal(row, runDirectory, manifest);
   const expectedArtifactNames = [
     "analysis.json",
     "cases.jsonl",
-    "effect-intents-no-storage-tool-seed-7429.json",
-    "effect-intents-no-storage-tool-seed-7430.json",
-    "effect-intents-tool-registry-storage-seed-7429.json",
-    "effect-intents-tool-registry-storage-seed-7430.json",
+    `effect-intents-no-storage-tool-seed-${evaluationSeeds[0]}.json`,
+    `effect-intents-no-storage-tool-seed-${evaluationSeeds[1]}.json`,
+    `effect-intents-tool-registry-storage-seed-${evaluationSeeds[0]}.json`,
+    `effect-intents-tool-registry-storage-seed-${evaluationSeeds[1]}.json`,
     "model-calls.jsonl",
     "provider-responses.jsonl",
   ];
@@ -1240,7 +1260,7 @@ function main() {
     "manifest artifact inventory",
   );
   const modelCalls = jsonLines(modelCallsPath);
-  verifyModelCalls(modelCalls);
+  verifyModelCalls(modelCalls, evaluationSeeds);
   const providerResponses = jsonLines(providerResponsesPath);
   if (
     providerResponses.length !== 10 ||
@@ -1300,7 +1320,12 @@ function main() {
       fail(`provider stream reasoning ${index + 1} was silently discarded`);
     }
   }
-  verifyPerCaseAccounting(manifest.perCaseAccounting, modelCalls, providerResponses);
+  verifyPerCaseAccounting(
+    manifest.perCaseAccounting,
+    modelCalls,
+    providerResponses,
+    evaluationSeeds,
+  );
   const analysis = json(analysisPath);
   if (
     analysis.schemaVersion !== "general-agent-tool-registry/analysis/1" ||
@@ -1324,12 +1349,14 @@ function main() {
   const fixtureValues = loadFixtureValues();
   verifyNoPrivateLeak(runDirectory, fixtureValues);
 
-  const mutationChecks = checkOnly ? [] : runMutationChecks(runDirectory, runId, fixtureValues);
+  const mutationChecks = checkOnly
+    ? []
+    : runMutationChecks(runDirectory, runId, fixtureValues, evaluationSeeds);
 
   const verification = {
     schemaVersion: "general-agent-tool-registry/validation/1",
-    experimentId: "general-agent-tool-registry-v6",
-    experimentVersion: 7,
+    experimentId,
+    experimentVersion,
     runId,
     valid: true,
     checks: {
