@@ -579,6 +579,11 @@ describe("installed Extension Module resolution", () => {
     )).toThrow(/cannot accept a caller-supplied external-effect declaration/u);
     expect(() => deriveInstalledLinuxExtensionModuleExecutor({
       ...base,
+      configureHost: () => undefined,
+    } as unknown as InstalledLinuxExtensionModuleExecutorOptions))
+      .toThrow(/cannot accept an arbitrary Host setup callback/u);
+    expect(() => deriveInstalledLinuxExtensionModuleExecutor({
+      ...base,
       lifecycle: {
         ...base.lifecycle,
         execution: { program: "/tmp/b", argumentVector: [], environment: {} },

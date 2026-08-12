@@ -537,7 +537,6 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     }
 
     const processGenerationId = `process-installed-linux-${process.pid}-${Date.now()}`;
-    let configuredHost: ExtensionProcessHost | undefined;
     let launchedProcess: ProcessIdentity | undefined;
     let protocolIdentifier = 0;
     const factory = createInstalledLinuxExtensionModuleGenerationFactory({
@@ -578,9 +577,8 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       wallClockNow: Date.now,
       nextProtocolIdentifier: (purpose) =>
         `${purpose}-installed-linux-${++protocolIdentifier}`,
-      configureHost: (host, authorized) => {
-        configuredHost = host;
-        launchedProcess = readProcessIdentity(authorized.launcher.processId);
+      onAuthorizedProcessId: (authorizedProcessId) => {
+        launchedProcess = readProcessIdentity(authorizedProcessId);
       },
     });
     const executor = factory.createExecutor(MODULE_GENERATION_ID);
@@ -600,14 +598,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     expect(factory.processGenerationIdFor(MODULE_GENERATION_ID)).toBe(processGenerationId);
     expect(store.getModuleProcessRecord(processGenerationId)).toBeUndefined();
     await expect(executor.start()).resolves.toBeUndefined();
-    expect(configuredHost?.snapshot).toMatchObject({
-      state: "ready",
-      instanceId,
-      moduleId: "installed-worker",
-      moduleGenerationId: MODULE_GENERATION_ID,
-      processGenerationId,
-      pid: launchedProcess?.processId,
-    });
+    expect(launchedProcess).toBeDefined();
     expect(store.getModuleProcessRecord(processGenerationId)).toMatchObject({
       state: "running",
       packageDigest: installed.packageDigest,

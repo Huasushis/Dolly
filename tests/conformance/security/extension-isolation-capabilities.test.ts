@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { createExtensionProcessModuleExecutor } from "../../../src/adapters/extension-process-module-executor.js";
 import { createExtensionEffectJournalLifecycle } from "../../../src/adapters/extension-effect-run-lifecycle.js";
+import { InstalledModulePermissionPolicyRegistry } from "../../../src/adapters/installed-module-permission-policy.js";
 import { EffectIntentJournal } from "../../../src/core/capabilities/effect-intent-journal.js";
 import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
 import {
@@ -22,6 +23,9 @@ import {
 } from "../../../src/core/extension-process-host.js";
 import type { JsonValue } from "../../../src/core/canonical-json.js";
 import type { ExtensionPackageManifest } from "../../../src/core/extension-installation-registry.js";
+import type { InstalledExtensionModule } from "../../../src/core/installed-extension-module.js";
+import type { ChatBrokerInvocation } from "../../../src/core/model-provider-broker.js";
+import { ModelDescriptorRegistry } from "../../../src/core/model-provider-descriptor.js";
 import { createToolInvocationCapabilityV2 } from "../../../src/core/provider-capabilities/index.js";
 import {
   ModuleActor,
@@ -37,6 +41,10 @@ import {
   type ToolDescriptor,
   type ToolTurnBudget,
 } from "../../../src/core/tool-policy.js";
+import {
+  CHAT_STRATEGIES,
+  chatDescriptor,
+} from "../model-provider/fixtures.js";
 
 const FIXTURE = fileURLToPath(
   new URL("./fixtures/extension-process-fixture.mjs", import.meta.url),
@@ -119,6 +127,132 @@ function execution(input = {}) {
 }
 
 describe("Extension process isolation and capability checks", () => {
+  it("enforces a registry-selected strict streaming model policy in a real child", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-installed-model-policy-"));
+    const claim = {
+      moduleJobId: "module-job-a",
+      runId: "run-a",
+      attempt: 1,
+      claimToken: "claim-token-a",
+      moduleGenerationId: "module-generation-a",
+    } as const;
+    const effectStorePath = join(scratch, "effect-intents.json");
+    const effectJournal = new EffectIntentJournal({
+      store: new FileEffectIntentStore({ path: effectStorePath }),
+      now: () => "2026-08-12T00:00:00.000Z",
+    });
+    const effectRunLifecycle = createExtensionEffectJournalLifecycle({
+      journal: effectJournal,
+      getModuleSubmissionRecord: (runId) =>
+        runId === claim.runId
+          ? {
+              schemaVersion: "dolly.module-submission-record/1",
+              ...claim,
+              processGenerationId: "process-generation-1",
+              inputDigest: `sha256:${"c".repeat(64)}`,
+              createdAt: "2026-08-12T00:00:00.000Z",
+            }
+          : undefined,
+    });
+    const host = createHost("model-stream-required", scratch, { effectRunLifecycle });
+    const descriptors = new ModelDescriptorRegistry({
+      schemaDigest: `sha256:${"7".repeat(64)}`,
+      allowedStrategyIds: CHAT_STRATEGIES,
+    });
+    const descriptor = descriptors.register(chatDescriptor());
+    descriptors.setStatus(descriptor, "active");
+    const invoke = vi.fn(async (invocation: ChatBrokerInvocation) => ({
+      schemaVersion: "dolly.model-result/2" as const,
+      requestId: invocation.requestId,
+      operationId: invocation.context.operationId,
+      descriptor: invocation.descriptor,
+      status: "succeeded" as const,
+      output: {
+        schemaVersion: "dolly.model.chat-output/1" as const,
+        finalContent: "streamed",
+        reasoning: { state: "not-observed" as const },
+        toolCalls: [],
+        finishReason: "stop",
+      },
+      usage: { providerAttempts: 1, observations: [] },
+    }));
+    const registry = new InstalledModulePermissionPolicyRegistry({
+      policies: [{
+        kind: "strict-streaming-chat",
+        policyId: "model.owner-primary",
+        descriptor,
+        ownerScope: "owner-1",
+        budgets: {
+          maxProviderAttempts: 1,
+          maxWallTimeMs: 1_000,
+          maxRequestBytes: 16 * 1_024,
+          maxResponseBytes: 16 * 1_024,
+          maxInputItems: 8,
+          maxInputBytes: 8 * 1_024,
+          maxOutputBytes: 8 * 1_024,
+          maxOutputTokens: 128,
+        },
+        chat: { invoke },
+        outputContracts: ["text"],
+        reasoningPolicies: ["disable"],
+        roles: ["user"],
+        limits: {
+          maxInvocations: 2,
+          maxInvocationsPerRun: 2,
+          maxInvocationsPerWindow: 2,
+          rateWindowMs: 60_000,
+        },
+        capabilityLifetimeMs: 60_000,
+      }],
+    });
+    const resolved = {
+      instanceId: "instance-a",
+      installation: {
+        manifest: FIXTURE_PACKAGE_MANIFEST,
+        packageDigest: `sha256:${"a".repeat(64)}`,
+      },
+      module: {
+        moduleId: "module-a",
+        permissionPolicyIds: ["model.owner-primary"],
+        configurationReference: {
+          configId: "fixture-config",
+          revision: `sha256:${"b".repeat(64)}`,
+          configVersion: 1,
+        },
+      },
+    } as unknown as InstalledExtensionModule;
+    registry.setupFor(resolved).configureHost(host);
+
+    try {
+      await host.start();
+      await expect(host.execute({
+        ...execution(),
+        deadline: new Date(Date.now() + 5_000).toISOString(),
+        responseTimeoutMs: 6_000,
+      })).resolves.toMatchObject({
+        nonStreaming: { capabilityErrorCode: "CAPABILITY_DENIED" },
+        streaming: {
+          schemaVersion: "dolly.model-operation-result/1",
+          operation: "chat",
+          status: "succeeded",
+          output: { finalContent: "streamed" },
+        },
+      });
+      expect(invoke).toHaveBeenCalledTimes(1);
+      expect(invoke.mock.calls[0]![0].input.stream).toBe(true);
+      expect(effectJournal.listForRun(claim).map((record) => record.outcome.kind))
+        .toEqual(["unknown", "terminal"]);
+      expect(new EffectIntentJournal({
+        store: new FileEffectIntentStore({ path: effectStorePath }),
+        now: () => "2026-08-12T00:00:00.000Z",
+      }).evidenceForRun(claim)).toMatchObject({ kind: "unknown" });
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("refuses public untrusted code without a passing operating-system sandbox", () => {
     const policy = new ExtensionIsolationPolicy();
     expect(() => policy.resolve("process", "untrusted")).toThrowError(

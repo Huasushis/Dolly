@@ -3,6 +3,8 @@ import {
   type CoreStartupRecoveryHandoff,
 } from "../core/core-startup-recovery.js";
 import { canonicalJsonDigest } from "../core/canonical-json.js";
+import { EffectIntentJournal } from "../core/capabilities/effect-intent-journal.js";
+import { FileEffectIntentStore } from "../core/capabilities/file-effect-intent-store.js";
 import { ContentSchemaRegistrationSet } from "../core/content-schema-registry.js";
 import type { DeliveryMailboxCapacity, FailureClassification } from "../core/delivery-store.js";
 import type { ExtensionInstallationRegistry } from "../core/extension-installation-registry.js";
@@ -42,12 +44,17 @@ import {
   type SourceActivationSchedulerBinding,
 } from "../core/source-activation-queue.js";
 import type { DollyInstanceConfig } from "../core/runtime-config.js";
+import { createExtensionEffectJournalLifecycle } from "./extension-effect-run-lifecycle.js";
 import {
   createInstalledLinuxExtensionModuleGenerationFactory,
   INSTALLED_PROCESS_EFFECT_DECLARATION,
   type InstalledLinuxExtensionModuleGenerationFactory,
   type InstalledLinuxExtensionModuleGenerationFactoryOptions,
 } from "./installed-linux-extension-module-executor.js";
+import {
+  InstalledModulePermissionPolicyRegistry,
+  type InstalledModulePermissionPolicySetup,
+} from "./installed-module-permission-policy.js";
 
 type InstalledRuntimeLifecycleOptions = Omit<
   InstalledLinuxExtensionModuleGenerationFactoryOptions["lifecycle"],
@@ -55,13 +62,15 @@ type InstalledRuntimeLifecycleOptions = Omit<
 >;
 type InstalledRuntimeHostOptions = Omit<
   InstalledLinuxExtensionModuleGenerationFactoryOptions["host"],
-  "initializationTimeoutMs" | "maxFrameBytes" | "terminationTimeoutMs"
+  | "effectRunLifecycle"
+  | "initializationTimeoutMs"
+  | "maxFrameBytes"
+  | "terminationTimeoutMs"
 >;
 
 export interface InstalledReactiveModuleRuntimeOptions extends Omit<
   InstalledLinuxExtensionModuleGenerationFactoryOptions,
   | "cancellationGraceMs"
-  | "configureHost"
   | "configurations"
   | "executionTimeoutMs"
   | "host"
@@ -69,6 +78,7 @@ export interface InstalledReactiveModuleRuntimeOptions extends Omit<
   | "instanceConfiguration"
   | "lifecycle"
   | "moduleId"
+  | "permissionPolicySetup"
   | "terminationTimeoutMs"
   | "wallClockNow"
 > {
@@ -80,6 +90,10 @@ export interface InstalledReactiveModuleRuntimeOptions extends Omit<
   readonly core: FileCoreStateStore;
   readonly stoppedRecordWriter: ModuleProcessStoppedRecordWriter;
   readonly resultCommitRepository: FileModuleResultCommitRepository;
+  /** Host-owned implementations for the policy identifiers selected by the Module. */
+  readonly permissionPolicies?: InstalledModulePermissionPolicyRegistry;
+  /** Durable intent records for every Core-mediated capability invocation. */
+  readonly effectIntentStore?: FileEffectIntentStore;
   readonly mailboxes: readonly DeliveryMailboxCapacity[];
   readonly now: () => string;
   readonly initialModuleGenerationId: string;
@@ -100,6 +114,7 @@ export interface InstalledReactiveModuleRuntimeOptions extends Omit<
 
 export interface InstalledReactiveModuleRuntime {
   readonly resolvedModule: InstalledExtensionModule;
+  readonly permissionPolicySetup?: InstalledModulePermissionPolicySetup;
   readonly generations: InstalledLinuxExtensionModuleGenerationFactory;
   readonly commits: ModuleResultCommitCoordinator;
   readonly runtime: ReactiveModuleRuntime;
@@ -139,6 +154,11 @@ function createInstalledReactiveModuleRuntimeInternal(
       "Installed Module runtime cannot accept caller-supplied external-effect recovery inputs",
     );
   }
+  if (Object.hasOwn(options.host, "effectRunLifecycle")) {
+    throw new TypeError(
+      "Installed Module runtime cannot accept a caller-supplied capability effect lifecycle",
+    );
+  }
   if (Object.getPrototypeOf(options.core) !== FileCoreStateStore.prototype) {
     throw new TypeError("Installed Module runtime requires one direct FileCoreStateStore");
   }
@@ -173,10 +193,36 @@ function createInstalledReactiveModuleRuntimeInternal(
   if (module.isolation !== "process") {
     throw new TypeError("Installed reactive runtime requires process isolation");
   }
+  let permissionPolicySetup;
+  let effectRunLifecycle;
   if (module.permissionPolicyIds.length !== 0) {
-    throw new TypeError(
-      "Installed reactive runtime cannot consume permission policies before capability composition exists",
-    );
+    if (
+      options.permissionPolicies === undefined ||
+      Object.getPrototypeOf(options.permissionPolicies) !==
+        InstalledModulePermissionPolicyRegistry.prototype
+    ) {
+      throw new TypeError(
+        "Installed Module permission policies require one direct Host policy registry",
+      );
+    }
+    if (
+      options.effectIntentStore === undefined ||
+      Object.getPrototypeOf(options.effectIntentStore) !== FileEffectIntentStore.prototype
+    ) {
+      throw new TypeError(
+        "Installed Module permission policies require one direct durable effect intent store",
+      );
+    }
+    permissionPolicySetup = options.permissionPolicies.setupFor(resolvedModule);
+    const effectJournal = new EffectIntentJournal({
+      store: options.effectIntentStore,
+      now: () => canonicalNow(options.now),
+    });
+    effectRunLifecycle = createExtensionEffectJournalLifecycle({
+      journal: effectJournal,
+      getModuleSubmissionRecord: (runId) =>
+        options.core.getModuleSubmissionRecord(runId),
+    });
   }
   if (options.initialDeferredCommit !== undefined) {
     const record = options.initialDeferredCommit.record;
@@ -264,6 +310,7 @@ function createInstalledReactiveModuleRuntimeInternal(
       maxFrameBytes: module.limits.maxFrameBytes,
       initializationTimeoutMs: module.timeouts.initializationTimeoutMs,
       terminationTimeoutMs: module.timeouts.terminationTimeoutMs,
+      ...(effectRunLifecycle === undefined ? {} : { effectRunLifecycle }),
     },
     executionTimeoutMs: module.timeouts.executionTimeoutMs,
     cancellationGraceMs: module.timeouts.cancellationGraceMs,
@@ -278,6 +325,9 @@ function createInstalledReactiveModuleRuntimeInternal(
     ...(options.nextProtocolIdentifier === undefined
       ? {}
       : { nextProtocolIdentifier: options.nextProtocolIdentifier }),
+    ...(permissionPolicySetup === undefined
+      ? {}
+      : { permissionPolicySetup }),
     ...(options.onStandardErrorChunk === undefined
       ? {}
       : { onStandardErrorChunk: options.onStandardErrorChunk }),
@@ -341,6 +391,7 @@ function createInstalledReactiveModuleRuntimeInternal(
   });
   return Object.freeze({
     resolvedModule,
+    ...(permissionPolicySetup === undefined ? {} : { permissionPolicySetup }),
     generations,
     commits,
     runtime,

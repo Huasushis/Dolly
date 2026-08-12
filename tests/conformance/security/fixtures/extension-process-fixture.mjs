@@ -121,6 +121,47 @@ async function handleHostRequest(message) {
     return;
   }
   if (method === "module.execute") {
+    if (mode === "model-stream-required") {
+      const handle = initialized.capabilities[0].handle;
+      const common = {
+        messages: [{ role: "user", parts: [{ kind: "text", text: "hello" }] }],
+        outputContract: { kind: "text" },
+        reasoning: "disable",
+      };
+      const nonStreaming = capabilityErrorCodeOf(
+        await invokeCapability(
+          handle,
+          "chat",
+          {
+            moduleJobId: params.moduleJobId,
+            runId: params.runId,
+            idempotencyKey: `${params.moduleJobId}-non-streaming`,
+          },
+          { ...common, stream: false },
+        ),
+      );
+      const streaming = capabilityErrorCodeOf(
+        await invokeCapability(
+          handle,
+          "chat",
+          {
+            moduleJobId: params.moduleJobId,
+            runId: params.runId,
+            idempotencyKey: `${params.moduleJobId}-streaming`,
+          },
+          { ...common, stream: true },
+        ),
+      );
+      respond(id, {
+        protocolVersion,
+        sessionId: params.sessionId,
+        moduleId: params.moduleId,
+        moduleGenerationId: params.moduleGenerationId,
+        runId: params.runId,
+        result: { nonStreaming, streaming },
+      });
+      return;
+    }
     if (
       mode === "module-result-then-cancel" ||
       mode === "module-result-then-ignore-cancel"

@@ -11,8 +11,10 @@ import {
   composeInstalledReactiveModuleHost,
   createInstalledReactiveModuleRuntime,
 } from "../../../src/adapters/installed-reactive-module-runtime.js";
+import { InstalledModulePermissionPolicyRegistry } from "../../../src/adapters/installed-module-permission-policy.js";
 import type { BlockProposal } from "../../../src/core/block-store.js";
 import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
+import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
 import { ContentSchemaRegistrationSet } from "../../../src/core/content-schema-registry.js";
 import {
   CoreStartupRecovery,
@@ -25,6 +27,8 @@ import { createFileCoreStateStoreWithStoppedRecordWriter } from "../../../src/co
 import { resolveInstalledContentSchemaRegistrationSet } from "../../../src/core/installed-extension-module.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
+import type { ChatBrokerInvocation } from "../../../src/core/model-provider-broker.js";
+import { ModelDescriptorRegistry } from "../../../src/core/model-provider-descriptor.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
 import { ModuleConfigurationStore } from "../../../src/core/module-configuration-store.js";
@@ -34,6 +38,10 @@ import {
   createDefaultDollyInstanceConfig,
   validateDollyInstanceConfig,
 } from "../../../src/core/runtime-config.js";
+import {
+  CHAT_STRATEGIES,
+  chatDescriptor,
+} from "../model-provider/fixtures.js";
 
 const INSTANCE_ID = "33333333-3333-4333-8333-333333333333";
 const DELEGATED_ROOT = "/system.slice/dolly-core.service";
@@ -56,6 +64,7 @@ const SCHEMA = {
 } as const;
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const scratchParent = resolve(repositoryRoot, "..", ".tmp");
+const MODEL_SCHEMA_DIGEST = `sha256:${"7".repeat(64)}`;
 
 function proposal(text: string): BlockProposal {
   return {
@@ -248,6 +257,74 @@ describe("installed reactive Module runtime composition", () => {
       channelCloseTimeoutMs: 500,
       nextProcessGenerationId: () => "process-installed-runtime-a",
       classifyFailure: () => ({ code: "FIXTURE_FAILURE", retryable: false }),
+    };
+  }
+
+  function configurationWithModelPolicy() {
+    return validateDollyInstanceConfig({
+      ...instanceConfiguration,
+      modules: instanceConfiguration.modules.map((module) => ({
+        ...module,
+        permissionPolicyIds: ["model.owner-primary"],
+      })),
+    });
+  }
+
+  function modelPolicies() {
+    const descriptors = new ModelDescriptorRegistry({
+      schemaDigest: MODEL_SCHEMA_DIGEST,
+      allowedStrategyIds: CHAT_STRATEGIES,
+    });
+    const descriptor = descriptors.register(chatDescriptor());
+    descriptors.setStatus(descriptor, "active");
+    const invoke = vi.fn(async (invocation: ChatBrokerInvocation) => ({
+      schemaVersion: "dolly.model-result/2" as const,
+      requestId: invocation.requestId,
+      operationId: invocation.context.operationId,
+      descriptor: invocation.descriptor,
+      status: "succeeded" as const,
+      output: {
+        schemaVersion: "dolly.model.chat-output/1" as const,
+        finalContent: "ok",
+        reasoning: { state: "not-observed" as const },
+        toolCalls: [],
+        finishReason: "stop",
+      },
+      usage: { providerAttempts: 1, observations: [] },
+    }));
+    return {
+      invoke,
+      registry: new InstalledModulePermissionPolicyRegistry({
+        now: () => Date.parse("2026-08-10T00:00:00.000Z"),
+        nextRequestId: () => "installed-model-request-1",
+        policies: [{
+          kind: "strict-streaming-chat",
+          policyId: "model.owner-primary",
+          descriptor,
+          ownerScope: "owner-1",
+          budgets: {
+            maxProviderAttempts: 1,
+            maxWallTimeMs: 180_000,
+            maxRequestBytes: 64 * 1024,
+            maxResponseBytes: 256 * 1024,
+            maxInputItems: 32,
+            maxInputBytes: 48 * 1024,
+            maxOutputBytes: 128 * 1024,
+            maxOutputTokens: 5_200,
+          },
+          chat: { invoke },
+          outputContracts: ["text"],
+          reasoningPolicies: ["require", "disable"],
+          roles: ["system", "user"],
+          limits: {
+            maxInvocations: 4,
+            maxInvocationsPerRun: 2,
+            maxInvocationsPerWindow: 4,
+            rateWindowMs: 60_000,
+          },
+          capabilityLifetimeMs: 30 * 60_000,
+        }],
+      }),
     };
   }
 
@@ -518,6 +595,71 @@ describe("installed reactive Module runtime composition", () => {
       .toThrow(/cannot accept caller-supplied external-effect recovery inputs/u);
     expect(() => createInstalledReactiveModuleRuntime(callerEvidence))
       .toThrow(/cannot accept caller-supplied external-effect recovery inputs/u);
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
+  });
+
+  it("derives strict-streaming model authority only from selected Host policies", () => {
+    const configuration = configurationWithModelPolicy();
+    const pair = coreState("model-policy", configuration);
+    const selected = modelPolicies();
+    const base = {
+      ...options(pair),
+      instanceConfiguration: configuration,
+    };
+
+    expect(() => createInstalledReactiveModuleRuntime(base))
+      .toThrow(/require one direct Host policy registry/u);
+    expect(() => createInstalledReactiveModuleRuntime({
+      ...base,
+      permissionPolicies: selected.registry,
+    })).toThrow(/require one direct durable effect intent store/u);
+
+    const effectIntentStore = new FileEffectIntentStore({
+      path: resolve(scratch, "model-policy-effect-intents.json"),
+    });
+    expect(() => createInstalledReactiveModuleRuntime({
+      ...base,
+      permissionPolicies: new InstalledModulePermissionPolicyRegistry({ policies: [] }),
+      effectIntentStore,
+    })).toThrow(/model\.owner-primary is not registered/u);
+    const composed = createInstalledReactiveModuleRuntime({
+      ...base,
+      permissionPolicies: selected.registry,
+      effectIntentStore,
+    });
+
+    expect(composed.permissionPolicySetup?.snapshot).toMatchObject({
+      instanceId: INSTANCE_ID,
+      moduleId: "worker",
+      extensionId: "org.example.installed-runtime",
+      configurationRevision: configuration.modules[0]!.configurationReference.revision,
+      policyIds: ["model.owner-primary"],
+      capabilities: [{
+        capabilityType: "model-operation",
+        capabilityVersion: "v2",
+        policyId: "model.owner-primary",
+        streaming: "required",
+      }],
+    });
+    expect(composed.permissionPolicySetup?.snapshot.packageDigest)
+      .toBe(composed.resolvedModule.installation.packageDigest);
+    expect(selected.invoke).not.toHaveBeenCalled();
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
+  });
+
+  it("rejects a caller-supplied Host effect lifecycle before executor creation", () => {
+    const pair = coreState("host-effect-lifecycle");
+    const supplied = options(pair);
+    const forged = {
+      ...supplied,
+      host: {
+        ...supplied.host,
+        effectRunLifecycle: {},
+      },
+    };
+
+    expect(() => createInstalledReactiveModuleRuntime(forged))
+      .toThrow(/cannot accept a caller-supplied capability effect lifecycle/u);
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
 

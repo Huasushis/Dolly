@@ -15,6 +15,7 @@ import {
 import type { ReactiveModuleInput } from "../core/reactive-module-input.js";
 import type { ReactiveModuleResult } from "../core/reactive-module-runtime.js";
 import type { DollyInstanceConfig } from "../core/runtime-config.js";
+import type { InstalledModulePermissionPolicySetup } from "./installed-module-permission-policy.js";
 import {
   createLinuxExtensionModuleExecutor,
   type LinuxExtensionModuleExecutorOptions,
@@ -53,7 +54,10 @@ export interface InstalledLinuxExtensionModuleExecutorOptions {
   readonly coreExitCleanupTimeoutMs?: number;
   readonly exitCoreProcess?: (status: number) => void;
   readonly nextProtocolIdentifier?: (purpose: "session" | "request") => string;
-  readonly configureHost?: LinuxExtensionModuleExecutorOptions["configureHost"];
+  /** Host grants derived from the exact installed Module's selected policies. */
+  readonly permissionPolicySetup?: InstalledModulePermissionPolicySetup;
+  /** Finite diagnostic observer; it receives no Host or capability authority. */
+  readonly onAuthorizedProcessId?: (processId: number) => void;
   readonly onStandardErrorChunk?: LinuxExtensionModuleExecutorOptions["onStandardErrorChunk"];
 }
 
@@ -90,6 +94,11 @@ function assertNoDerivedFields(
 export function deriveInstalledLinuxExtensionModuleExecutor(
   options: InstalledLinuxExtensionModuleExecutorOptions,
 ): InstalledLinuxExtensionModuleExecutorDerivation {
+  if (Object.hasOwn(options, "configureHost")) {
+    throw new TypeError(
+      "Installed Linux Extension executor cannot accept an arbitrary Host setup callback",
+    );
+  }
   if (Object.hasOwn(options, "declaredExternalEffects")) {
     throw new TypeError(
       "Installed Linux Extension executor cannot accept a caller-supplied external-effect declaration",
@@ -130,6 +139,20 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     installations: options.installations,
     configurations: options.configurations,
   });
+  if (resolvedModule.module.permissionPolicyIds.length === 0) {
+    if (options.permissionPolicySetup !== undefined) {
+      throw new TypeError(
+        "Installed Module without permission policies cannot receive a Host permission setup",
+      );
+    }
+  } else {
+    if (options.permissionPolicySetup === undefined) {
+      throw new TypeError(
+        "Installed Module permission policies require a registry-derived Host setup",
+      );
+    }
+    options.permissionPolicySetup.assertMatches(resolvedModule);
+  }
   if (resolvedModule.module.isolation !== "process") {
     throw new TypeError(
       "Installed Linux Extension executor requires process isolation in the instance configuration",
@@ -209,9 +232,15 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     ...(options.nextProtocolIdentifier === undefined
       ? {}
       : { nextProtocolIdentifier: options.nextProtocolIdentifier }),
-    ...(options.configureHost === undefined
+    ...(options.permissionPolicySetup === undefined &&
+      options.onAuthorizedProcessId === undefined
       ? {}
-      : { configureHost: options.configureHost }),
+      : {
+          configureHost: (host, process) => {
+            options.permissionPolicySetup?.configureHost(host);
+            options.onAuthorizedProcessId?.(process.launcher.processId);
+          },
+        }),
     ...(options.onStandardErrorChunk === undefined
       ? {}
       : { onStandardErrorChunk: options.onStandardErrorChunk }),
