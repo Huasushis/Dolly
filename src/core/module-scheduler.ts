@@ -627,6 +627,8 @@ export class ModuleScheduler {
   #state: "created" | "running" | "stopping" | "stopped" = "created";
   #pollTimer: SchedulerTimer | null = null;
   #immediateTimer: SchedulerTimer | null = null;
+  #eligibilityTimer: SchedulerTimer | null = null;
+  #eligibilityTimerDueAt: number | null = null;
   #activeCount = 0;
   #cursor = 0;
   #invariantViolationCount = 0;
@@ -1125,6 +1127,52 @@ export class ModuleScheduler {
     this.#pollTimer = null;
     this.#immediateTimer?.cancel();
     this.#immediateTimer = null;
+    this.#eligibilityTimer?.cancel();
+    this.#eligibilityTimer = null;
+    this.#eligibilityTimerDueAt = null;
+  }
+
+  /**
+   * Arms one shared timer for the earliest policy, retry, or period deadline.
+   * The ordinary poll remains a liveness fallback; it must not determine the
+   * latency of an already-known eligibility time.
+   */
+  #armEligibilityTimer(now = this.#clock.monotonicNow()): void {
+    if (this.#state !== "running") return;
+    const earliest = [...this.#entries.values()].reduce<number | null>(
+      (candidate, entry) => {
+        const dueAt = entry.nextEligibleAt;
+        if (dueAt === null || dueAt <= now || entry.quarantineReason !== null) {
+          return candidate;
+        }
+        return candidate === null ? dueAt : Math.min(candidate, dueAt);
+      },
+      null,
+    );
+    if (earliest === null) {
+      this.#eligibilityTimer?.cancel();
+      this.#eligibilityTimer = null;
+      this.#eligibilityTimerDueAt = null;
+      return;
+    }
+    const scheduledAt = Math.min(earliest, now + MAX_TIMER_DELAY_MS);
+    if (
+      this.#eligibilityTimer !== null &&
+      this.#eligibilityTimerDueAt === scheduledAt
+    ) {
+      return;
+    }
+    this.#eligibilityTimer?.cancel();
+    this.#eligibilityTimerDueAt = scheduledAt;
+    this.#eligibilityTimer = this.#clock.schedule(
+      Math.max(0, scheduledAt - now),
+      () => {
+        this.#eligibilityTimer = null;
+        this.#eligibilityTimerDueAt = null;
+        if (this.#state !== "running") return;
+        this.#runPass();
+      },
+    );
   }
 
   #runPass(): void {
@@ -1146,6 +1194,7 @@ export class ModuleScheduler {
     }
 
     this.#detectNoProgress(entries, now);
+    this.#armEligibilityTimer(now);
   }
 
   #refreshMailboxRead(entry: ModuleEntry, now: number): void {
@@ -1600,6 +1649,7 @@ export class ModuleScheduler {
       tickStatus: status,
       serviceTimeMs: entry.lastRunServiceTimeMs,
     });
+    this.#armEligibilityTimer(now);
     // Only a run that advanced the backlog earns an immediate re-evaluation.
     // Re-dispatching after an idle tick would spin: an idle result means the
     // claim found nothing, and nothing has changed since.

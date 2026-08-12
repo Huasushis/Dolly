@@ -1373,7 +1373,7 @@ describe("CORE scheduler retry backoff", () => {
     await scheduler.stop();
   });
 
-  it("resumes an output commit on the first pass after backoff even when no input remains", async () => {
+  it("resumes an output commit at its backoff deadline even when no input remains", async () => {
     const { clock, mailboxes, scheduler } = createScheduler({
       retryBaseMs: 250,
       retryMaxMs: 1_000,
@@ -1405,10 +1405,6 @@ describe("CORE scheduler retry backoff", () => {
     // pending queue is empty. Recovery must still resume the prepared commit.
     mailboxes.set("worker", 0, 0);
     await advance(clock, 249);
-    expect(runtime.tickCount).toBe(1);
-    // The retry deadline is a lower bound. The fixed baseline observes it on
-    // the next poll (300 ms here); no dedicated per-Module retry timer exists.
-    await advance(clock, 50);
     expect(runtime.tickCount).toBe(1);
     await advance(clock, 1);
 
@@ -1680,7 +1676,8 @@ describe("CORE scheduler activation modes", () => {
   });
 
   it("drives non-empty periodic input start-to-start and never before its period", async () => {
-    const { clock, mailboxes, scheduler } = createScheduler();
+    // A known period deadline must not depend on the coarse liveness poll.
+    const { clock, mailboxes, scheduler } = createScheduler({ pollIntervalMs: 60_000 });
     const runtime = new FakeModuleRuntime();
     mailboxes.set("periodic", 1, 10);
     scheduler.register({
