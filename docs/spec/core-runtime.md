@@ -626,13 +626,14 @@ reject every configured Module.
 
 The two halves of this declaration have different implementation status. The
 field exists in `dolly.module-process-record/1`, but that record version does
-not distinguish a future configured `core-capabilities-only` assertion from a
-historical candidate value that meant only “preserve this outcome” and carried
-no matching execution-boundary provenance. Startup therefore treats that
-particular version/value pair as an unknown outcome and does not inspect an
-otherwise complete capability journal. A later record version must bind the
-declaration to the accepted instance schema and enforcement boundary before
-capability evidence can authorize recovery. The configuration half does not
+not distinguish future configured `none` or `core-capabilities-only`
+assertions from historical candidate values that carried no matching
+configuration or execution-boundary provenance. Startup therefore treats both
+version/value pairs as unknown outcomes; it neither releases the `none` Run nor
+inspects an otherwise complete capability journal for the
+`core-capabilities-only` Run. A later record version must bind the declaration
+to the accepted instance schema and enforcement boundary before either form of
+automatic recovery is allowed. The configuration half does not
 exist yet: no released instance schema accepts `linuxProcessLimits` or
 `declaredExternalEffects`, so today no product Module can produce the future
 configured record. The candidate installed-process factory uses the
