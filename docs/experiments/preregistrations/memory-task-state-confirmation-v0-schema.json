@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.local/schemas/memory-task-state-confirmation-v0-schema.json",
+  "title": "Memory task-state confirmation preregistration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "experimentId",
+    "experimentVersion",
+    "title",
+    "status",
+    "scope",
+    "protocol",
+    "authorityReferences",
+    "definitions",
+    "question",
+    "hypotheses",
+    "conditions",
+    "data",
+    "backend",
+    "randomness",
+    "outputContract",
+    "metrics",
+    "minimumEffectiveDifference",
+    "requestProfile",
+    "retryPolicy",
+    "execution",
+    "stoppingRules",
+    "decisionRules",
+    "artifacts",
+    "independentValidation",
+    "safetyBoundary",
+    "domainDesign"
+  ],
+  "properties": {
+    "$schema": { "const": "./memory-task-state-confirmation-v0-schema.json" },
+    "schemaVersion": { "const": "dolly-experiment-preregistration/v1" },
+    "experimentId": { "const": "memory-task-state-confirmation-v0" },
+    "experimentVersion": { "const": 1 },
+    "title": { "$ref": "#/$defs/nonEmptyString" },
+    "status": { "const": "frozen-before-first-run" },
+    "scope": { "const": "exploratory-component" },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "const": "docs/experiments/preregistrations/memory-task-state-confirmation-v0-protocol.md" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "authorityReferences": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/nonEmptyString" }
+    },
+    "definitions": { "$ref": "#/$defs/nonEmptyObject" },
+    "question": { "$ref": "#/$defs/nonEmptyString" },
+    "hypotheses": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "guardrails"],
+      "properties": {
+        "primary": { "$ref": "#/$defs/hypothesisArray" },
+        "guardrails": { "$ref": "#/$defs/hypothesisArray" }
+      }
+    },
+    "conditions": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "description", "evidence"],
+        "properties": {
+          "id": { "$ref": "#/$defs/nonEmptyString" },
+          "description": { "$ref": "#/$defs/nonEmptyString" },
+          "evidence": { "$ref": "#/$defs/nonEmptyString" }
+        }
+      }
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generatorId",
+        "scenarioCount",
+        "baseTaskCount",
+        "cueStates",
+        "interruptionRecordCount",
+        "baseTasks",
+        "splitIsolation"
+      ],
+      "properties": {
+        "generatorId": { "const": "memory-task-state-confirmation/static-v1" },
+        "scenarioCount": { "const": 16 },
+        "baseTaskCount": { "const": 4 },
+        "cueStates": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [
+            { "const": "positive" },
+            { "const": "do-not-resume" },
+            { "const": "cancelled" },
+            { "const": "superseded" }
+          ],
+          "items": false
+        },
+        "interruptionRecordCount": { "const": 64 },
+        "baseTasks": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/baseTask" }
+        },
+        "splitIsolation": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "backend": { "$ref": "#/$defs/nonEmptyObject" },
+    "randomness": { "$ref": "#/$defs/nonEmptyObject" },
+    "outputContract": { "$ref": "#/$defs/nonEmptyObject" },
+    "metrics": { "$ref": "#/$defs/nonEmptyObject" },
+    "minimumEffectiveDifference": { "$ref": "#/$defs/nonEmptyObject" },
+    "requestProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stream",
+        "stream_options",
+        "thinking",
+        "forbiddenRequestField",
+        "max_tokens",
+        "timeout_ms",
+        "temperature",
+        "nonStreamFallbackAllowed"
+      ],
+      "properties": {
+        "stream": { "const": true },
+        "stream_options": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["include_usage"],
+          "properties": { "include_usage": { "const": true } }
+        },
+        "thinking": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": { "type": { "const": "disabled" } }
+        },
+        "forbiddenRequestField": { "const": "enable_thinking" },
+        "max_tokens": { "const": 1200 },
+        "timeout_ms": { "const": 900000 },
+        "temperature": { "const": 0 },
+        "nonStreamFallbackAllowed": { "const": false }
+      }
+    },
+    "retryPolicy": { "$ref": "#/$defs/nonEmptyObject" },
+    "execution": { "$ref": "#/$defs/nonEmptyObject" },
+    "stoppingRules": { "$ref": "#/$defs/nonEmptyObject" },
+    "decisionRules": { "$ref": "#/$defs/nonEmptyObject" },
+    "artifacts": { "$ref": "#/$defs/nonEmptyObject" },
+    "independentValidation": { "$ref": "#/$defs/nonEmptyObject" },
+    "safetyBoundary": { "$ref": "#/$defs/nonEmptyObject" },
+    "domainDesign": { "$ref": "#/$defs/nonEmptyObject" }
+  },
+  "$defs": {
+    "nonEmptyString": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nonEmptyObject": { "type": "object", "minProperties": 1 },
+    "hypothesisArray": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "statement", "outcomeMeasure"],
+        "properties": {
+          "id": { "$ref": "#/$defs/nonEmptyString" },
+          "statement": { "$ref": "#/$defs/nonEmptyString" },
+          "outcomeMeasure": { "$ref": "#/$defs/nonEmptyString" }
+        }
+      }
+    },
+    "operationArguments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "parameter"],
+      "properties": {
+        "target": { "$ref": "#/$defs/nonEmptyString" },
+        "parameter": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "arguments"],
+      "properties": {
+        "operation": { "$ref": "#/$defs/nonEmptyString" },
+        "arguments": { "$ref": "#/$defs/operationArguments" }
+      }
+    },
+    "baseTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "family",
+        "taskId",
+        "operation",
+        "arguments",
+        "constraint",
+        "replacement"
+      ],
+      "properties": {
+        "family": { "$ref": "#/$defs/nonEmptyString" },
+        "taskId": { "$ref": "#/$defs/nonEmptyString" },
+        "operation": { "$ref": "#/$defs/nonEmptyString" },
+        "arguments": { "$ref": "#/$defs/operationArguments" },
+        "constraint": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "value"],
+          "properties": {
+            "name": { "$ref": "#/$defs/nonEmptyString" },
+            "value": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        },
+        "replacement": { "$ref": "#/$defs/operation" }
+      }
+    }
+  }
+}

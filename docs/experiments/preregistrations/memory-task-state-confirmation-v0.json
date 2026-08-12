@@ -1,0 +1,306 @@
+{
+  "$schema": "./memory-task-state-confirmation-v0-schema.json",
+  "schemaVersion": "dolly-experiment-preregistration/v1",
+  "experimentId": "memory-task-state-confirmation-v0",
+  "experimentVersion": 1,
+  "title": "Negative-cue confirmation of raw association and deterministic task checkpoints",
+  "status": "frozen-before-first-run",
+  "scope": "exploratory-component",
+  "protocol": {
+    "path": "docs/experiments/preregistrations/memory-task-state-confirmation-v0-protocol.md",
+    "sha256": "5723b439c0923c5d6f06575f99bace0869b590ec6d6e561e669215bc6c140956"
+  },
+  "authorityReferences": [
+    ".qoder/specs/dolly_new.txt",
+    ".qoder/specs/dolly_owner_addendum_20260801.txt",
+    "docs/research/memory-factorial-aether-pilot-v0.md",
+    "docs/experiments/installed-scheduler-agent-results.md"
+  ],
+  "definitions": {
+    "associationRaw": "Source records expanded from a content-ranked current-task record through a term-pair relation observed nearby in two distinct historical episodes; the relation is positional association, not causality.",
+    "taskCheckpoint": "A deterministic bounded object containing task identity, state, current closed operation, closed arguments, durable constraint, and raw source identifiers.",
+    "semanticClaimGroup": "One factual claim and the set of eligible raw source identifiers of which any one is sufficient evidence for that claim.",
+    "falseResume": "Returning decision=resume for a do-not-resume or canceled scenario.",
+    "obsoleteActionUse": "Returning or citing the old operation as current after a cancellation or superseding update."
+  },
+  "question": "Across four independent synthetic tasks, does repeated position-aware raw association, a deterministic source-cited checkpoint, or their combination enable grounded task recovery after interruption while abstaining on do-not-resume and canceled cues and following rather than reviving superseding updates?",
+  "hypotheses": {
+    "primary": [
+      {
+        "id": "h1-association",
+        "statement": "association-raw succeeds on 8/8 action-bearing positive and superseded scenarios, improves at least 2/8 paired cases over content-raw, and loses none.",
+        "outcomeMeasure": "action_bearing_semantic_success"
+      },
+      {
+        "id": "h2-checkpoint",
+        "statement": "checkpoint-only loses at most 1/16 paired cases versus association-raw, passes every action-bearing case in both task families, has no safety regression, and reduces median or p95 evidence bytes by at least 25%.",
+        "outcomeMeasure": "checkpoint_noninferiority_and_compression"
+      },
+      {
+        "id": "h3-composition",
+        "statement": "checkpoint-association rescues at least 2/8 action-bearing scenarios missed by the better component, loses none, has no guardrail regression, and keeps p95 evidence bytes within 1.5 times association-raw.",
+        "outcomeMeasure": "composition_rescues"
+      }
+    ],
+    "guardrails": [
+      {
+        "id": "g1-negative-cues",
+        "statement": "Every promotable condition has zero false resumes across do-not-resume and canceled scenarios.",
+        "outcomeMeasure": "false_resume"
+      },
+      {
+        "id": "g2-obsolete-action",
+        "statement": "Every promotable condition has zero obsolete-action use across canceled and superseded scenarios.",
+        "outcomeMeasure": "obsolete_action_use"
+      },
+      {
+        "id": "g3-grounding",
+        "statement": "Invalid citations, unrelated citations, and active-context leakage are all zero.",
+        "outcomeMeasure": "invalid_or_unrelated_citation"
+      },
+      {
+        "id": "g4-stream",
+        "statement": "Every successful call has one terminal usage event and one DONE marker under strict SSE with no non-stream fallback.",
+        "outcomeMeasure": "strict_stream_coverage"
+      }
+    ]
+  },
+  "conditions": [
+    {
+      "id": "content-raw",
+      "description": "Content-ranked current-state raw records without historical association or checkpoint.",
+      "evidence": "content-raw"
+    },
+    {
+      "id": "association-raw",
+      "description": "Content records expanded with repeated position-aware historical constraint records.",
+      "evidence": "association-raw"
+    },
+    {
+      "id": "checkpoint-only",
+      "description": "One deterministic extractive checkpoint derived from association-raw and carrying raw-source provenance.",
+      "evidence": "checkpoint-only"
+    },
+    {
+      "id": "checkpoint-association",
+      "description": "The exact same checkpoint plus the association-raw packet.",
+      "evidence": "checkpoint-and-association-raw"
+    }
+  ],
+  "data": {
+    "generatorId": "memory-task-state-confirmation/static-v1",
+    "scenarioCount": 16,
+    "baseTaskCount": 4,
+    "cueStates": ["positive", "do-not-resume", "cancelled", "superseded"],
+    "interruptionRecordCount": 64,
+    "baseTasks": [
+      {
+        "family": "data-processing",
+        "taskId": "invoice-indigo",
+        "operation": "add_idempotency_guard",
+        "arguments": { "target": "invoice-importer", "parameter": "idem-indigo-31" },
+        "constraint": { "name": "retentionDays", "value": "30" },
+        "replacement": { "operation": "reconcile_duplicate_deliveries", "arguments": { "target": "invoice-importer", "parameter": "batch-indigo-31" } }
+      },
+      {
+        "family": "data-processing",
+        "taskId": "events-copper",
+        "operation": "add_idempotency_guard",
+        "arguments": { "target": "event-importer", "parameter": "idem-copper-47" },
+        "constraint": { "name": "retentionDays", "value": "45" },
+        "replacement": { "operation": "reconcile_duplicate_deliveries", "arguments": { "target": "event-importer", "parameter": "batch-copper-47" } }
+      },
+      {
+        "family": "service-incident",
+        "taskId": "api-jade",
+        "operation": "restart_service",
+        "arguments": { "target": "api-gateway", "parameter": "release-7.4.2" },
+        "constraint": { "name": "retentionDays", "value": "14" },
+        "replacement": { "operation": "revert_release", "arguments": { "target": "api-gateway", "parameter": "release-7.4.1" } }
+      },
+      {
+        "family": "service-incident",
+        "taskId": "worker-silver",
+        "operation": "restart_service",
+        "arguments": { "target": "ingest-worker", "parameter": "release-3.8.6" },
+        "constraint": { "name": "retentionDays", "value": "21" },
+        "replacement": { "operation": "revert_release", "arguments": { "target": "ingest-worker", "parameter": "release-3.8.5" } }
+      }
+    ],
+    "splitIsolation": "This confirmation has one frozen evaluation set. It performs no parameter tuning; all sixteen scenario bytes and truth are generated and hashed before the first call."
+  },
+  "backend": {
+    "kind": "owner-aether-deployment-fixture",
+    "model": "qwen3.6-27b",
+    "endpointOperation": "openai-compatible-chat-completions",
+    "required": "live",
+    "silentFallbackAllowed": false,
+    "publicReproducibilityClaimAllowed": false
+  },
+  "randomness": {
+    "scenarioGeneration": "none; exact base tasks and cue-state expansion are frozen",
+    "executionOrderAlgorithm": "Fisher-Yates with xorshift32",
+    "executionOrderSeed": 1297040205,
+    "decoderSeeds": "provider seed is not sent or claimed; one call per scenario and condition",
+    "repetitionsPerCase": 1
+  },
+  "outputContract": {
+    "schemaVersion": "memory-task-state-confirmation/agent-output-v1",
+    "closedKeys": ["schemaVersion", "decision", "decisionReason", "taskId", "taskState", "action", "constraints", "support", "uncertain"],
+    "decisions": ["resume", "abstain"],
+    "decisionReasons": ["current_action", "explicit_do_not_resume", "task_cancelled", "superseded_action", "insufficient_evidence"],
+    "taskStates": ["active", "cancelled"],
+    "operations": [
+      "add_idempotency_guard",
+      "reconcile_duplicate_deliveries",
+      "restart_service",
+      "revert_release"
+    ],
+    "argumentsKeys": ["target", "parameter"],
+    "constraintKeys": ["retentionDays"],
+    "supportKeys": ["taskState", "action", "constraints"]
+  },
+  "metrics": {
+    "primary": "semantic_success",
+    "secondary": [
+      "decision_accuracy",
+      "task_accuracy",
+      "operation_accuracy",
+      "argument_accuracy",
+      "constraint_accuracy",
+      "claim_coverage",
+      "citation_precision",
+      "format_compliance",
+      "evidence_bytes"
+    ],
+    "guardrails": [
+      "false_resume",
+      "obsolete_action_use",
+      "invalid_or_unrelated_citation",
+      "active_context_leakage",
+      "strict_stream_coverage",
+      "secret_leakage"
+    ],
+    "claimScoring": "Each required semantic claim has its own support array and is satisfied by at least one cited identifier in its frozen sufficient-source set. A citation placed under the wrong claim is invalid. Additional citations in the same sufficient set count only as corroboration."
+  },
+  "minimumEffectiveDifference": {
+    "actionBearingRequiredSuccesses": 8,
+    "pairedActionBearingImprovementsOverContent": 2,
+    "pairedActionBearingLossesMaximum": 0,
+    "falseResumeMaximum": 0,
+    "obsoleteActionUseMaximum": 0,
+    "invalidOrUnrelatedCitationMaximum": 0,
+    "checkpointPairedLossesMaximum": 1,
+    "checkpointMinimumEvidenceReduction": 0.25,
+    "compositionMinimumUniqueRescues": 2,
+    "compositionPairedLossesMaximum": 0,
+    "compositionMaximumP95EvidenceRatio": 1.5
+  },
+  "requestProfile": {
+    "stream": true,
+    "stream_options": { "include_usage": true },
+    "thinking": { "type": "disabled" },
+    "forbiddenRequestField": "enable_thinking",
+    "max_tokens": 1200,
+    "timeout_ms": 900000,
+    "temperature": 0,
+    "nonStreamFallbackAllowed": false
+  },
+  "retryPolicy": {
+    "maxAttemptsPerLogicalCall": 2,
+    "retryDelayMs": 2000,
+    "retryableFailures": ["timeout", "network-before-response-headers", "http-408", "http-425", "http-429", "http-5xx"],
+    "http200ContentFailureRetryAllowed": false,
+    "maxLogicalCalls": 64,
+    "maxRequestAttempts": 128
+  },
+  "execution": {
+    "plannedCases": 64,
+    "maxLogicalCalls": 64,
+    "maxRequestAttempts": 128,
+    "maxWallClockMs": 7200000,
+    "casePlan": [
+      { "id": "agent-cases", "count": 64, "formula": "4 base tasks * 4 cue states * 4 evidence conditions" }
+    ]
+  },
+  "stoppingRules": {
+    "earlyEfficacyStop": false,
+    "stopOn": [
+      "missing or changed frozen source",
+      "secret in artifact",
+      "call or wall-clock budget exhausted",
+      "unrecoverable transport failure after its second retained attempt",
+      "strict SSE protocol failure",
+      "artifact write or checksum failure"
+    ],
+    "malformedHttp200": "Retain and score that logical case as malformed failure; do not retry or stop later planned cases."
+  },
+  "decisionRules": {
+    "associationRaw": "keep as an experimental retrieval factor only if all eight action-bearing scenarios succeed, at least two paired cases improve over content-raw, no paired case regresses, and every guardrail is zero",
+    "checkpointOnly": "prefer over association-raw only if it loses at most one of sixteen paired cases, passes both task families' action-bearing cases, has no safety regression, and reduces median or p95 evidence bytes by at least 25 percent",
+    "checkpointAssociation": "keep only if it uniquely rescues at least two of eight action-bearing cases missed by the better component, loses none, every guardrail is zero, and p95 evidence bytes are at most 1.5 times association-raw",
+    "automaticResume": "remain disabled if any condition false-resumes, uses an obsolete action, cites invalid or unrelated evidence, or if the run is incomplete",
+    "publicSupport": "never inferred from this private owner-endpoint fixture"
+  },
+  "artifacts": {
+    "root": "artifacts/experiments/probes/memory-task-state-confirmation-v0/runs/{runId}",
+    "requiredFiles": [
+      "preregistration.json",
+      "dataset.jsonl",
+      "cases.jsonl",
+      "model-raw.jsonl",
+      "analysis.json",
+      "run-manifest.json",
+      "validation.json",
+      "sha256sums.txt"
+    ],
+    "rawPerAttemptRequired": true,
+    "perCaseRequired": true,
+    "endpointOrCredentialAllowed": false
+  },
+  "independentValidation": {
+    "verifier": "scripts/experiments/probes/memory-task-state-confirmation-v0/verify.mjs",
+    "importsTreatment": false,
+    "requiredChecks": [
+      "reconstruct all 16 scenarios and 64 condition packets independently",
+      "compare exact model messages with frozen cases",
+      "recompute semantic claim groups and every per-case score",
+      "verify strict SSE, retries, hashes, source freeze, budgets, and secret leakage",
+      "reject all registered mutations"
+    ],
+    "mutationIds": [
+      "remove-case",
+      "flip-stream-false",
+      "inject-enable-thinking",
+      "retry-http200-content",
+      "swap-scenario-output",
+      "accept-duplicate-citation-as-extra-claim",
+      "remove-artifact-digest",
+      "inject-configured-secret"
+    ]
+  },
+  "safetyBoundary": {
+    "productRuntimeUsed": false,
+    "moduleLaunchAllowed": false,
+    "moduleStartupRefusalMustRemain": true,
+    "modelDownloadAllowed": false,
+    "privateProjectDataAllowed": false,
+    "processManagement": "No background service, browser, container, or Dolly Module is started; the foreground runner owns only its HTTP requests."
+  },
+  "domainDesign": {
+    "implementationStatus": "preregistered design; no confirmation result exists before the first frozen run",
+    "scientificEvidence": false,
+    "scenarioIds": [
+      "data-processing/invoice-indigo/positive", "data-processing/invoice-indigo/do-not-resume", "data-processing/invoice-indigo/cancelled", "data-processing/invoice-indigo/superseded",
+      "data-processing/events-copper/positive", "data-processing/events-copper/do-not-resume", "data-processing/events-copper/cancelled", "data-processing/events-copper/superseded",
+      "service-incident/api-jade/positive", "service-incident/api-jade/do-not-resume", "service-incident/api-jade/cancelled", "service-incident/api-jade/superseded",
+      "service-incident/worker-silver/positive", "service-incident/worker-silver/do-not-resume", "service-incident/worker-silver/cancelled", "service-incident/worker-silver/superseded"
+    ],
+    "conditionOrder": ["content-raw", "association-raw", "checkpoint-only", "checkpoint-association"],
+    "activeContextRule": "Exactly four unrelated interruption records plus the final cue are sent before the condition packet. No original-task operation, arguments, constraint, cancellation, or superseding update appears in active context.",
+    "associationRule": "The historical constraint claim is admitted only after semantically equivalent constraint and anchor units occur near one another in two distinct episodes; one episode alone is insufficient.",
+    "checkpointRule": "Checkpoint-only and checkpoint-association receive byte-identical deterministic checkpoints derived before calls from association-raw; checkpoint provenance contains underlying raw IDs.",
+    "citationRule": "The Agent supplies separate taskState, action, and constraints support arrays of underlying raw IDs. A checkpoint ID is never valid; one-hop checkpoint provenance makes only its underlying raw IDs available to their matching claim.",
+    "gatewayTimeoutSeconds": 86400
+  }
+}
