@@ -168,6 +168,7 @@ export type ModuleActorErrorCode =
   | "ACTOR_STOPPING"
   | "ACTOR_STOPPED"
   | "ACTOR_FAILED"
+  | "ACTOR_BUSY"
   | "MODULE_JOB_ALREADY_ACTIVE"
   | "RUN_NOT_ACTIVE"
   | "RUN_NOT_EXECUTING"
@@ -363,6 +364,10 @@ export class ModuleActor<Input, Output> {
     ModuleExecutor<Input, Output>,
     Promise<void>
   >();
+  readonly #executorStartControllers = new WeakMap<
+    ModuleExecutor<Input, Output>,
+    AbortController
+  >();
   #executorStopPromise: Promise<void> | undefined;
   #startPromise: Promise<void> | undefined;
   #startingExecutor: ModuleExecutor<Input, Output> | undefined;
@@ -375,6 +380,7 @@ export class ModuleActor<Input, Output> {
   #shutdownPromise: Promise<void> | undefined;
   #hardTimeoutPromise: Promise<"module-generation-fenced"> | undefined;
   #replacementPromise: Promise<"module-generation-fenced"> | undefined;
+  #idleRotationPromise: Promise<string> | undefined;
   #pendingBytes = 0;
   #runsInModuleGeneration = 0;
   #pumping = false;
@@ -512,6 +518,35 @@ export class ModuleActor<Input, Output> {
       },
     );
     return start;
+  }
+
+  /**
+   * Ensures the next Run has a live generation before its caller acquires
+   * durable input. Reaching the configured per-generation Run limit is normal
+   * lifecycle rotation, not a reason to claim work that this actor cannot run.
+   */
+  prepareNextRun(): Promise<string> {
+    if (this.#idleRotationPromise) return this.#idleRotationPromise;
+    try {
+      this.#assertCanSubmit();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (this.#active || this.#pending.length > 0 || this.#starting || this.#pumping) {
+      return Promise.reject(
+        new ModuleActorError("ACTOR_BUSY", "Module actor is not idle for generation admission"),
+      );
+    }
+    if (this.#runsInModuleGeneration < this.#maxRunsPerGeneration) {
+      return Promise.resolve(this.#moduleGenerationId);
+    }
+    const rotation = Promise.resolve()
+      .then(() => this.#rotateIdleExecutor())
+      .finally(() => {
+        if (this.#idleRotationPromise === rotation) this.#idleRotationPromise = undefined;
+      });
+    this.#idleRotationPromise = rotation;
+    return rotation;
   }
 
   submit(request: ModuleRunRequest<Input>): Promise<ModuleRunOutcome<Output>> {
@@ -818,6 +853,153 @@ export class ModuleActor<Input, Output> {
     if (this.#state === "failed") {
       throw new ModuleActorError("ACTOR_FAILED", "Module actor is failed");
     }
+    if (this.#idleRotationPromise) {
+      throw new ModuleActorError("ACTOR_BUSY", "Module generation rotation is in progress");
+    }
+  }
+
+  async #rotateIdleExecutor(): Promise<string> {
+    if (
+      this.#state !== "running" ||
+      this.#active !== undefined ||
+      this.#pending.length !== 0 ||
+      this.#starting !== undefined ||
+      this.#pumping
+    ) {
+      throw new ModuleActorError("ACTOR_BUSY", "Module actor is not idle for generation rotation");
+    }
+    if (this.#runsInModuleGeneration < this.#maxRunsPerGeneration) {
+      return this.#moduleGenerationId;
+    }
+    const previousExecutor = this.#executor;
+    if (previousExecutor === undefined) {
+      this.#state = "failed";
+      throw new ModuleActorError("ACTOR_FAILED", "Module actor has no executor to rotate");
+    }
+    const previousGenerationId = this.#moduleGenerationId;
+    try {
+      await this.#terminateExecutor(previousExecutor, {
+        moduleId: this.#moduleId,
+        moduleGenerationId: previousGenerationId,
+      });
+    } catch {
+      this.#setUnconfirmedExecutor(previousExecutor, {
+        moduleId: this.#moduleId,
+        moduleGenerationId: previousGenerationId,
+      });
+      this.#state = "failed";
+      throw new ModuleActorError(
+        "ACTOR_FAILED",
+        "Idle Module executor termination could not be confirmed",
+      );
+    }
+    this.#executorTerminated = true;
+    this.#executorTerminationUnconfirmed = false;
+    if (this.#state !== "running") {
+      throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+    }
+    if (this.#usedModuleGenerationIds.size >= this.#maxGenerations) {
+      this.#state = "failed";
+      throw new ModuleActorError(
+        "MODULE_GENERATION_LIMIT_REACHED",
+        "Module actor reached its configured generation limit",
+      );
+    }
+
+    let nextModuleGenerationId: string;
+    try {
+      nextModuleGenerationId = this.#nextModuleGenerationId();
+      if (this.#state !== "running") {
+        throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+      }
+      assertId(nextModuleGenerationId, "nextModuleGenerationId");
+    } catch (error) {
+      const actorState: ModuleActorState = this.state;
+      if (actorState === "stopping" || actorState === "stopped") {
+        throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+      }
+      this.#state = "failed";
+      if (error instanceof ModuleActorError) throw error;
+      throw new ModuleActorError("ACTOR_ID_INVALID", "nextModuleGenerationId is invalid");
+    }
+    if (this.#usedModuleGenerationIds.has(nextModuleGenerationId)) {
+      this.#state = "failed";
+      throw new ModuleActorError(
+        "MODULE_GENERATION_CONFLICT",
+        `Module generation ID ${nextModuleGenerationId} has already been used`,
+      );
+    }
+    this.#usedModuleGenerationIds.add(nextModuleGenerationId);
+
+    let nextExecutor: ModuleExecutor<Input, Output> | undefined;
+    let startAttempted = false;
+    try {
+      const created = this.#createExecutor(nextModuleGenerationId);
+      if (this.#requireProcessIsolation && isPromiseLike(created)) {
+        void Promise.resolve(created).then(
+          () => undefined,
+          () => undefined,
+        );
+        throw new ModuleActorError(
+          "ACTOR_FAILED",
+          "Process isolation requires createExecutor to return a handle synchronously",
+        );
+      }
+      const candidate = this.#requireProcessIsolation
+        ? created as ModuleExecutor<Input, Output>
+        : await created;
+      nextExecutor = candidate;
+      this.#startingExecutor = nextExecutor;
+      this.#startingExecutorModuleGenerationId = nextModuleGenerationId;
+      nextExecutor = validateExecutor(
+        candidate,
+        this.#requireProcessIsolation,
+        this.#initializationTimeoutMs,
+        this.#terminationTimeoutMs,
+      );
+      if (this.#state !== "running") {
+        throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+      }
+      if (nextExecutor.start) {
+        startAttempted = true;
+        this.#startingExecutorStartAttempted = true;
+        await this.#startExecutor(nextExecutor);
+      }
+      if (this.#state !== "running") {
+        throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+      }
+    } catch (error) {
+      const cleanupConfirmed =
+        nextExecutor === undefined
+          ? true
+          : await this.#cleanupStartingExecutor(nextExecutor, startAttempted);
+      this.#clearStartingExecutor(nextExecutor);
+      if (!cleanupConfirmed) {
+        this.#state = "failed";
+        throw new ModuleActorError(
+          "ACTOR_FAILED",
+          "Replacement Module executor cleanup could not be confirmed",
+        );
+      }
+      const actorState: ModuleActorState = this.state;
+      if (actorState === "stopping" || actorState === "stopped") {
+        throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+      }
+      this.#state = "failed";
+      throw error instanceof ModuleActorError
+        ? error
+        : new ModuleActorError("ACTOR_FAILED", "Failed to start a replacement executor");
+    }
+
+    this.#clearStartingExecutor(nextExecutor);
+    this.#moduleGenerationId = nextModuleGenerationId;
+    this.#executor = nextExecutor;
+    this.#executorTerminated = false;
+    this.#executorTerminationUnconfirmed = false;
+    this.#executorTerminatePromise = undefined;
+    this.#executorStopPromise = undefined;
+    this.#runsInModuleGeneration = 0;
+    return nextModuleGenerationId;
   }
 
   #requireActiveRun(runId: string): ActiveRun<Input, Output> {
@@ -1523,7 +1705,8 @@ export class ModuleActor<Input, Output> {
     }
     const waitForTerminationOrReplacement = async () => {
       while (true) {
-        const operation = this.#hardTimeoutPromise ?? this.#replacementPromise;
+        const operation =
+          this.#hardTimeoutPromise ?? this.#replacementPromise ?? this.#idleRotationPromise;
         if (!operation) return;
         const completed = await this.#waitForCompletionWithinGrace(
           operation,
@@ -1694,12 +1877,17 @@ export class ModuleActor<Input, Output> {
     }
 
     const operation = Promise.resolve().then(() => executor.start!());
+    const controller = new AbortController();
+    this.#executorStartControllers.set(executor, controller);
     return new Promise<void>((resolve, reject) => {
       let finished = false;
       const finish = (error?: ModuleActorError) => {
         if (finished) return;
         finished = true;
         clearTimeout(timer);
+        if (this.#executorStartControllers.get(executor) === controller) {
+          this.#executorStartControllers.delete(executor);
+        }
         if (error) reject(error);
         else resolve();
       };
@@ -1712,6 +1900,11 @@ export class ModuleActor<Input, Output> {
             ),
           ),
         initializationTimeoutMs,
+      );
+      controller.signal.addEventListener(
+        "abort",
+        () => finish(new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping")),
+        { once: true },
       );
       void operation.then(
         () => finish(),
@@ -1819,6 +2012,7 @@ export class ModuleActor<Input, Output> {
     executor: ModuleExecutor<Input, Output>,
     startAttempted: boolean,
   ): Promise<boolean> {
+    this.#executorStartControllers.get(executor)?.abort();
     if (this.#startingExecutor === executor && this.#startingExecutorCleanupPromise) {
       return this.#startingExecutorCleanupPromise;
     }

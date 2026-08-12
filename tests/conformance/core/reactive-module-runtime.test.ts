@@ -79,6 +79,8 @@ interface HarnessOptions {
   readonly cancellationGraceMs?: number;
   readonly initializationTimeoutMs?: number;
   readonly terminationTimeoutMs?: number;
+  readonly maxRunsPerGeneration?: number;
+  readonly maxGenerations?: number;
   /** Unit-test executors simulate the process-isolation contract by default. */
   readonly simulateProcessIsolation?: boolean;
   readonly declaredExternalEffects?:
@@ -257,8 +259,8 @@ function createHarness(options: HarnessOptions) {
     cancellationGraceMs: options.cancellationGraceMs ?? 1_000,
     initializationTimeoutMs: options.initializationTimeoutMs ?? 1_000,
     terminationTimeoutMs: options.terminationTimeoutMs ?? 1_000,
-    maxRunsPerGeneration: 100,
-    maxGenerations: 8,
+    maxRunsPerGeneration: options.maxRunsPerGeneration ?? 100,
+    maxGenerations: options.maxGenerations ?? 8,
     deliveries: runtimeDeliveries,
     persistModuleSubmission: persistSubmission,
     releaseDeliveryClaim,
@@ -315,6 +317,158 @@ async function startedHarness(options: HarnessOptions) {
 }
 
 describe("CORE-004 reactive Module claim/run/commit coordination", () => {
+  it("rotates the process generation before claiming input past its Run limit", async () => {
+    const events: string[] = [];
+    const harness = await startedHarness({
+      maxRunsPerGeneration: 1,
+      createExecutor: (moduleGenerationId) => {
+        events.push(`create:${moduleGenerationId}`);
+        return {
+          start: async () => {
+            events.push(`start:${moduleGenerationId}`);
+          },
+          execute: async () => ({ schemaVersion: "dolly.module-result/1" }),
+          terminate: async () => {
+            events.push(`terminate:${moduleGenerationId}`);
+          },
+        };
+      },
+      wrapDeliveries: (deliveries) => ({
+        ...readAndClaimDeliveries(deliveries),
+        claim: (request) => {
+          events.push(`claim:${request.moduleGenerationId}`);
+          return deliveries.claim(request);
+        },
+      }),
+    });
+
+    await expect(harness.runtime.tick()).resolves.toMatchObject({
+      status: "committed",
+      moduleGenerationId: "generation-1",
+    });
+    const nextInput = harness.blocks.commit(proposal("second"), {
+      kind: "external",
+      id: "console",
+    });
+    harness.deliveries.append("input", nextInput.id);
+
+    await expect(harness.runtime.tick()).resolves.toMatchObject({
+      status: "committed",
+      moduleGenerationId: "generation-2",
+    });
+    expect(events).toEqual([
+      "create:generation-1",
+      "start:generation-1",
+      "claim:generation-1",
+      "terminate:generation-1",
+      "create:generation-2",
+      "start:generation-2",
+      "claim:generation-2",
+    ]);
+    await harness.runtime.stop();
+  });
+
+  it("does not acquire a Claim after shutdown begins during generation admission", async () => {
+    const claim = vi.fn<DeliveryStore["claim"]>();
+    const harness = await startedHarness({
+      wrapDeliveries: (deliveries) => ({
+        ...readAndClaimDeliveries(deliveries),
+        claim: (request) => {
+          claim(request);
+          return deliveries.claim(request);
+        },
+      }),
+      createExecutor: () => ({
+        execute: async () => ({ schemaVersion: "dolly.module-result/1" }),
+      }),
+    });
+
+    const tick = harness.runtime.tick();
+    const stop = harness.runtime.stop();
+
+    await expect(tick).resolves.toEqual({ status: "idle" });
+    await expect(stop).resolves.toBeUndefined();
+    expect(claim).not.toHaveBeenCalled();
+    expect(harness.deliveries.listActiveClaims()).toEqual([]);
+  });
+
+  it("stops within the shutdown grace while a replacement process is still initializing", async () => {
+    const replacementStart = deferred<void>();
+    const replacementStartCalled = deferred<void>();
+    const harness = await startedHarness({
+      maxRunsPerGeneration: 1,
+      initializationTimeoutMs: 60_000,
+      cancellationGraceMs: 10,
+      createExecutor: (moduleGenerationId) => ({
+        start: async () => {
+          if (moduleGenerationId !== "generation-2") return;
+          replacementStartCalled.resolve();
+          await replacementStart.promise;
+        },
+        execute: async () => ({ schemaVersion: "dolly.module-result/1" }),
+      }),
+    });
+    await expect(harness.runtime.tick()).resolves.toMatchObject({ status: "committed" });
+    const nextInput = harness.blocks.commit(proposal("second"), {
+      kind: "external",
+      id: "console",
+    });
+    harness.deliveries.append("input", nextInput.id);
+
+    const tick = harness.runtime.tick();
+    await replacementStartCalled.promise;
+    const stop = harness.runtime.stop({ cancellationGraceMs: 10 });
+    let stopOutcome: "stopped" | "timed-out";
+    try {
+      stopOutcome = await Promise.race([
+        stop.then(() => "stopped" as const),
+        new Promise<"timed-out">((resolve) => {
+          setTimeout(() => resolve("timed-out"), 200);
+        }),
+      ]);
+    } finally {
+      replacementStart.resolve();
+      await Promise.allSettled([tick, stop]);
+    }
+
+    expect(stopOutcome).toBe("stopped");
+    await expect(tick).resolves.toEqual({ status: "idle" });
+    expect(harness.deliveries.listActiveClaims()).toEqual([]);
+  });
+
+  it("terminates the exhausted final process generation before refusing more input", async () => {
+    const terminate = vi.fn().mockResolvedValue(undefined);
+    const claim = vi.fn<DeliveryStore["claim"]>();
+    const harness = await startedHarness({
+      maxRunsPerGeneration: 1,
+      maxGenerations: 1,
+      wrapDeliveries: (deliveries) => ({
+        ...readAndClaimDeliveries(deliveries),
+        claim: (request) => {
+          claim(request);
+          return deliveries.claim(request);
+        },
+      }),
+      createExecutor: () => ({
+        execute: async () => ({ schemaVersion: "dolly.module-result/1" }),
+        terminate,
+      }),
+    });
+    await expect(harness.runtime.tick()).resolves.toMatchObject({ status: "committed" });
+    const nextInput = harness.blocks.commit(proposal("second"), {
+      kind: "external",
+      id: "console",
+    });
+    harness.deliveries.append("input", nextInput.id);
+
+    await expect(harness.runtime.tick()).rejects.toMatchObject({ code: "RUNTIME_FAILED" });
+    expect(terminate).toHaveBeenCalledOnce();
+    expect(claim).toHaveBeenCalledOnce();
+    expect(harness.deliveries.listActiveClaims()).toEqual([]);
+    await expect(harness.runtime.stop()).resolves.toBeUndefined();
+    expect(terminate).toHaveBeenCalledOnce();
+  });
+
   it("uses per-dispatch Claim limits without exceeding the runtime maximum", async () => {
     let observedInput: ReactiveModuleInput | undefined;
     const harness = await startedHarness({

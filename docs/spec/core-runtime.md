@@ -1741,6 +1741,12 @@ every member before changing state.
 Pending work already bound to a generation is rejected when hard isolation
 fences that generation. It may run later only after a fresh claim binds a new
 run and generation; the actor MUST NOT silently relabel an old queued claim.
+Likewise, normal rotation at a configured per-generation Run limit MUST finish
+the old process termination proof and initialize the new non-reused generation
+before the runtime acquires the next Claim. No Delivery may be claimed with the
+exhausted generation merely to discover the limit during actor submission.
+This Run-count trigger does not replace the separate pre-Claim admission check
+for capability expiry, remaining invocation quota, or the fixed Run deadline.
 
 ### 9.2.1 Module descriptions
 

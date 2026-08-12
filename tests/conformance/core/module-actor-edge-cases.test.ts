@@ -1092,6 +1092,100 @@ describe("ModuleActor phase, mailbox, and lifecycle edge cases", () => {
     await generationLimited.stop();
   });
 
+  it("rotates an idle process generation before admitting the next bounded Run", async () => {
+    const events: string[] = [];
+    const actor = await startedActor(options<string, string>({
+      maxRunsPerGeneration: 1,
+      requireProcessIsolation: true,
+      initializationTimeoutMs: 1_000,
+      terminationTimeoutMs: 1_000,
+      createExecutor: (moduleGenerationId) => {
+        events.push(`create:${moduleGenerationId}`);
+        return {
+          isolation: "process",
+          start: async () => {
+            events.push(`start:${moduleGenerationId}`);
+          },
+          execute: async (input) => input,
+          terminate: async () => {
+            events.push(`terminate:${moduleGenerationId}`);
+          },
+        };
+      },
+      acceptResult: () => undefined,
+    }));
+    await expect(actor.prepareNextRun()).resolves.toBe("generation-1");
+    await expect(actor.submit({
+      moduleGenerationId: "generation-1",
+      moduleJobId: "module-job-1",
+      runId: "run-1",
+      attempt: 1,
+      input: "first",
+    })).resolves.toMatchObject({ status: "succeeded", output: "first" });
+
+    await expect(actor.prepareNextRun()).resolves.toBe("generation-2");
+    expect(events).toEqual([
+      "create:generation-1",
+      "start:generation-1",
+      "terminate:generation-1",
+      "create:generation-2",
+      "start:generation-2",
+    ]);
+    await expect(actor.submit({
+      moduleGenerationId: "generation-2",
+      moduleJobId: "module-job-2",
+      runId: "run-2",
+      attempt: 1,
+      input: "second",
+    })).resolves.toMatchObject({ status: "succeeded", output: "second" });
+    await actor.stop();
+    expect(events.at(-1)).toBe("terminate:generation-2");
+  });
+
+  it.each(["return", "throw"] as const)(
+    "does not create a replacement when shutdown starts inside generation allocation (%s)",
+    async (allocationOutcome) => {
+      const events: string[] = [];
+      let actor!: ModuleActor<string, string>;
+      let stop: Promise<void> | undefined;
+      actor = await startedActor(options<string, string>({
+        maxRunsPerGeneration: 1,
+        requireProcessIsolation: true,
+        initializationTimeoutMs: 1_000,
+        terminationTimeoutMs: 1_000,
+        nextModuleGenerationId: () => {
+          stop = actor.stop({ cancellationGraceMs: 100 });
+          if (allocationOutcome === "throw") throw new Error("allocation stopped");
+          return "generation-2";
+        },
+        createExecutor: (moduleGenerationId) => {
+          events.push(`create:${moduleGenerationId}`);
+          return {
+            isolation: "process",
+            start: async () => undefined,
+            execute: async (input) => input,
+            terminate: async () => {
+              events.push(`terminate:${moduleGenerationId}`);
+            },
+          };
+        },
+        acceptResult: () => undefined,
+      }));
+      await expect(actor.submit({
+        moduleGenerationId: "generation-1",
+        moduleJobId: "module-job-1",
+        runId: "run-1",
+        attempt: 1,
+        input: "first",
+      })).resolves.toMatchObject({ status: "succeeded" });
+
+      await expect(actor.prepareNextRun()).rejects.toMatchObject({ code: "ACTOR_STOPPING" });
+      await expect(stop).resolves.toBeUndefined();
+      expect(events).toEqual(["create:generation-1", "terminate:generation-1"]);
+      expect(actor.state).toBe("stopped");
+    },
+  );
+
   it("isolates observer failures and sanitizes execution and acceptance failures", async () => {
     let executeFailure = true;
     const actor = await startedActor(options<string, string>({

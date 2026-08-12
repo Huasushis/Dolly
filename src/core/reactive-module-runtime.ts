@@ -977,12 +977,29 @@ export class ReactiveModuleRuntime {
     claimLimitCount: number,
     claimLimitBytes: number,
   ): Promise<ReactiveModuleTickResult> {
+    let moduleGenerationId: string;
+    try {
+      moduleGenerationId = await this.#actor.prepareNextRun();
+    } catch (error) {
+      if (
+        !this.#acceptingOperations &&
+        error instanceof ModuleActorError &&
+        (error.code === "ACTOR_STOPPING" || error.code === "ACTOR_STOPPED")
+      ) {
+        return { status: "idle" };
+      }
+      throw new ReactiveModuleRuntimeError(
+        "RUNTIME_FAILED",
+        "Reactive Module could not prepare a generation before claiming input",
+      );
+    }
+    if (!this.#acceptingOperations) return { status: "idle" };
     let claim: DeliveryClaim | null;
     try {
       claim = this.#deliveries.claim({
         consumerId: this.#moduleId,
         pageIds: this.#inputPageIds,
-        moduleGenerationId: this.#actor.moduleGenerationId,
+        moduleGenerationId,
         maxCount: claimLimitCount,
         maxBytes: claimLimitBytes,
         maxInputBytes: this.#maxInputBytes,
