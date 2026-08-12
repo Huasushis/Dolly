@@ -1,0 +1,13 @@
+run=container-3481628-20260812T183140Z
+source_commit=6a7af20599ebe61ef84ea900c85842ea7684f196
+container=dolly-experiment-3481628-6c715cbf
+result=failed-before-module-start
+failure=CORE_SERVICE_MAIN_PID_MISMATCH
+raw_local_log_sha256=a334365bbb764c8376e98e42b671df8fad08777ac0c1bb656eda5abd9a0175f9
+
+run=container-3482843-20260812T183218Z
+source_commit=0dc787e3842e1e50f67d05670b24b00a88fbd5e2
+container=dolly-experiment-3482843-6f01dfdc
+result=functional-chain-completed-test-oracle-failed
+failure=terminal-effect-outcome-oracle-rejected-required-resultDigest
+raw_local_log_sha256=6b58364f7f65fa6fd63774b1e515459ce61e7d6eda8545452103762ee75e4c6a

@@ -1,0 +1,13 @@
+container_os=Ubuntu 24.04
+container_systemd=255.4-1ubuntu8.17
+container_node=v20.20.2
+container_python=3.12.3
+cgroup_filesystem=cgroup2fs
+cgroup_controllers=cpuset,cpu,io,memory,hugetlb,pids,rdma,misc
+service_user_uid=1001
+service_user_gid=997
+linger=yes
+tracked_source_read_only=true
+dependencies_read_only=true
+private_env_present=false
+git_directory_present=false

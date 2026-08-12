@@ -1,0 +1,1 @@
+./scripts/run-linux-module-launcher-integration.sh tests/conformance/security/installed-inline-media-agent-integration.test.ts
