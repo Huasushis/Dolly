@@ -446,7 +446,7 @@ describe("reactive Module host lifecycle", () => {
     }));
   });
 
-  it("rolls already-started runtimes back in reverse order without starting Scheduler", async () => {
+  it("rolls every owned runtime back in reverse order without starting Scheduler", async () => {
     const events: string[] = [];
     const fakeScheduler = scheduler(events);
     const failure = new Error("second runtime failed");
@@ -466,8 +466,59 @@ describe("reactive Module host lifecycle", () => {
       "register:b",
       "start:a",
       "start:b",
+      "stop:b",
       "stop:a",
     ]);
+  });
+
+  it("retains a runtime whose startup rollback is unconfirmed so failed-state stop can retry it", async () => {
+    const events: string[] = [];
+    const fakeScheduler = scheduler(events);
+    const startupFailure = new Error("second runtime failed");
+    const firstStopFailure = new Error("second runtime termination unconfirmed");
+    let secondRuntimeStopAttempts = 0;
+    const host = new ReactiveModuleHost(
+      fakeScheduler as never,
+      [
+        registration("a", runtime("a", events)),
+        registration("b", runtime(
+          "b",
+          events,
+          async () => { throw startupFailure; },
+          async () => {
+            secondRuntimeStopAttempts += 1;
+            if (secondRuntimeStopAttempts === 1) throw firstStopFailure;
+          },
+        )),
+      ],
+    );
+
+    await expect(host.start()).rejects.toEqual(new AggregateError(
+      [startupFailure, firstStopFailure],
+      "Reactive Module host startup and rollback failed",
+    ));
+    expect(host.state).toBe("failed");
+    expect(events).toEqual([
+      "register:a",
+      "register:b",
+      "start:a",
+      "start:b",
+      "stop:b",
+      "stop:a",
+    ]);
+
+    await expect(host.stop()).resolves.toBeUndefined();
+    expect(host.state).toBe("stopped");
+    expect(events).toEqual([
+      "register:a",
+      "register:b",
+      "start:a",
+      "start:b",
+      "stop:b",
+      "stop:a",
+      "stop:b",
+    ]);
+    expect(fakeScheduler.start).not.toHaveBeenCalled();
   });
 
   it("composes routes only from one validated Delivery-backed process Module configuration", () => {

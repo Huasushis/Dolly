@@ -235,7 +235,7 @@ export class ReactiveModuleHost {
   #state: ReactiveModuleHostState = "created";
   #startPromise: Promise<void> | undefined;
   #stopPromise: Promise<void> | undefined;
-  readonly #startedRuntimes: ManagedReactiveModuleRuntime[] = [];
+  readonly #ownedRuntimes: ManagedReactiveModuleRuntime[] = [];
   readonly #startupRecoveryModuleIds = new Set<string>();
   #schedulerStarted = false;
 
@@ -335,8 +335,11 @@ export class ReactiveModuleHost {
   async #startAll(): Promise<void> {
     try {
       for (const registration of this.#modules) {
+        // Lifecycle ownership begins before start: a runtime may create an
+        // executor and then reject while retaining an unconfirmed termination
+        // that only a later stop() call can retry.
+        this.#ownedRuntimes.push(registration.runtime);
         await registration.runtime.start();
-        this.#startedRuntimes.push(registration.runtime);
       }
       this.#scheduler.start();
       this.#schedulerStarted = true;
@@ -355,10 +358,10 @@ export class ReactiveModuleHost {
         : "running";
     } catch (error) {
       const cleanupErrors: unknown[] = [];
-      for (const runtime of [...this.#startedRuntimes].reverse()) {
+      for (const runtime of [...this.#ownedRuntimes].reverse()) {
         try {
           await runtime.stop();
-          this.#startedRuntimes.splice(this.#startedRuntimes.indexOf(runtime), 1);
+          this.#ownedRuntimes.splice(this.#ownedRuntimes.indexOf(runtime), 1);
         } catch (cleanupError) {
           cleanupErrors.push(cleanupError);
         }
@@ -411,7 +414,7 @@ export class ReactiveModuleHost {
         errors.push(error);
       }
     }
-    for (const runtime of [...this.#startedRuntimes].reverse()) {
+    for (const runtime of [...this.#ownedRuntimes].reverse()) {
       try {
         operations.push({ kind: "runtime", runtime, operation: runtime.stop() });
       } catch (error) {
@@ -432,8 +435,8 @@ export class ReactiveModuleHost {
         return;
       }
       const runtime = entry.runtime!;
-      const runtimeIndex = this.#startedRuntimes.indexOf(runtime);
-      if (runtimeIndex >= 0) this.#startedRuntimes.splice(runtimeIndex, 1);
+      const runtimeIndex = this.#ownedRuntimes.indexOf(runtime);
+      if (runtimeIndex >= 0) this.#ownedRuntimes.splice(runtimeIndex, 1);
     });
     this.#state = errors.length === 0 ? "stopped" : "failed";
     if (errors.length > 0) {
