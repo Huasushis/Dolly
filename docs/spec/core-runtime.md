@@ -507,20 +507,32 @@ for recovery rather than automatically retried or dead-lettered. This remains
 true even when the Host has a complete journal of Core-mediated model calls:
 that journal cannot prove that ordinary process code caused no ambient effect.
 
-The candidate boundary now has two deliberately narrow non-empty permission
+The candidate boundary now has three deliberately narrow non-empty permission
 paths. An immutable in-process permission-policy registry maps the exact
-identifiers selected by the validated Module configuration either to a
-reviewed chat descriptor and broker or to a reviewed read-only `ToolRegistry`.
-Its ordinary meaning is a Host-owned table of approved operations; it is not
-Extension configuration. The chat policy grants `model-operation/v2` for the
-Host-verified active Run, requires a stable idempotency key, and requires
-provider streaming on every chat invocation. Non-stream chat is rejected
-before broker dispatch. Embedding is not included in this generation policy
-and remains a separately measured non-stream operation. The tool policy grants
-`tool-invocation/v2` from the exact executable registry used for Host-side
-argument and result checking, requires a file-backed round journal, and accepts
-only read operations that never request approval. Effectful tools remain
-refused.
+identifiers selected by the validated Module configuration to a reviewed chat
+descriptor and broker, a reviewed read-only `ToolRegistry`, or bounded
+Module-private checkpoint storage. Its ordinary meaning is a Host-owned table
+of approved operations; it is not Extension configuration. The chat policy
+grants `model-operation/v2` for the Host-verified active Run, requires a stable
+idempotency key, and requires provider streaming on every chat invocation.
+Non-stream chat is rejected before broker dispatch. Embedding is not included
+in this generation policy and remains a separately measured non-stream
+operation. The tool policy grants `tool-invocation/v2` from the exact executable
+registry used for Host-side argument and result checking, requires a
+file-backed round journal, and accepts only read operations that never request
+approval. Effectful general tools remain refused.
+
+The checkpoint-storage policy grants only an explicit subset of `get`, `list`,
+and `set`; it never grants delete. It freezes key, value, entry, total-byte,
+list, argument, result, process-session, and per-Run invocation limits in the
+Host audit snapshot, requires an idempotency key, and derives its namespace
+only from the authenticated instance and Module identifiers. A real child
+process conformance case writes one source-citing task checkpoint and reads it
+back through the active-Run handle. This proves the small storage mechanism,
+not a final Memory representation, retrieval policy, or automatic task-resume
+decision. A lost response after a write remains subject to the conservative
+unrestricted-process recovery rule; this permission does not authorize blind
+re-execution.
 
 A non-empty policy selection additionally requires a direct file-backed effect
 intent store. The installed runtime derives the Host lifecycle from that store

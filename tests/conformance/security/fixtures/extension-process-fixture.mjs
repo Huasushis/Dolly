@@ -162,6 +162,53 @@ async function handleHostRequest(message) {
       });
       return;
     }
+    if (mode === "private-storage-checkpoint-active-run") {
+      const handle = initialized.capabilities[0].handle;
+      const scope = (suffix) => ({
+        moduleJobId: params.moduleJobId,
+        runId: params.runId,
+        idempotencyKey: `${params.moduleJobId}-${suffix}`,
+      });
+      const stored = await invokeCapability(
+        handle,
+        "set",
+        scope("checkpoint-set"),
+        {
+          key: "task-checkpoint",
+          value: {
+            schemaVersion: "dolly.task-checkpoint/1",
+            taskId: "task-a",
+            nextAction: "resume-step-2",
+            evidenceKeys: ["source-a"],
+          },
+        },
+      );
+      const listed = await invokeCapability(
+        handle,
+        "list",
+        scope("checkpoint-list"),
+        { prefix: "task-", limit: 8 },
+      );
+      const loaded = await invokeCapability(
+        handle,
+        "get",
+        scope("checkpoint-get"),
+        { key: "task-checkpoint" },
+      );
+      respond(id, {
+        protocolVersion,
+        sessionId: params.sessionId,
+        moduleId: params.moduleId,
+        moduleGenerationId: params.moduleGenerationId,
+        runId: params.runId,
+        result: {
+          stored: capabilityErrorCodeOf(stored),
+          listed: capabilityErrorCodeOf(listed),
+          loaded: capabilityErrorCodeOf(loaded),
+        },
+      });
+      return;
+    }
     if (
       mode === "module-result-then-cancel" ||
       mode === "module-result-then-ignore-cancel"

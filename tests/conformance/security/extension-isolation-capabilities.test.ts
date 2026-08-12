@@ -14,6 +14,7 @@ import { createExtensionEffectJournalLifecycle } from "../../../src/adapters/ext
 import { InstalledModulePermissionPolicyRegistry } from "../../../src/adapters/installed-module-permission-policy.js";
 import { EffectIntentJournal } from "../../../src/core/capabilities/effect-intent-journal.js";
 import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
+import { ModulePrivateStorageBackend } from "../../../src/core/capabilities/module-private-storage-capability.js";
 import {
   ExtensionIsolationPolicy,
   ExtensionProcessHost,
@@ -247,6 +248,140 @@ describe("Extension process isolation and capability checks", () => {
         store: new FileEffectIntentStore({ path: effectStorePath }),
         now: () => "2026-08-12T00:00:00.000Z",
       }).evidenceForRun(claim)).toMatchObject({ kind: "unknown" });
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("persists and reloads a bounded task checkpoint through an installed Host policy", async () => {
+    const workspaceTmp = fileURLToPath(new URL("../../../../.tmp/", import.meta.url));
+    mkdirSync(workspaceTmp, { recursive: true, mode: 0o700 });
+    const scratch = mkdtempSync(join(workspaceTmp, "dolly-extension-checkpoint-policy-"));
+    const claim = {
+      moduleJobId: "module-job-a",
+      runId: "run-a",
+      attempt: 1,
+      claimToken: "claim-token-a",
+      moduleGenerationId: "module-generation-a",
+    } as const;
+    const effectStorePath = join(scratch, "effect-intents.json");
+    const effectJournal = new EffectIntentJournal({
+      store: new FileEffectIntentStore({ path: effectStorePath }),
+      now: () => "2026-08-12T00:00:00.000Z",
+    });
+    const effectRunLifecycle = createExtensionEffectJournalLifecycle({
+      journal: effectJournal,
+      getModuleSubmissionRecord: (runId) =>
+        runId === claim.runId
+          ? {
+              schemaVersion: "dolly.module-submission-record/1",
+              ...claim,
+              processGenerationId: "process-generation-1",
+              inputDigest: `sha256:${"c".repeat(64)}`,
+              createdAt: "2026-08-12T00:00:00.000Z",
+            }
+          : undefined,
+    });
+    const host = createHost("private-storage-checkpoint-active-run", scratch, {
+      effectRunLifecycle,
+    });
+    const backend = new ModulePrivateStorageBackend({
+      root: join(scratch, "module-private-storage"),
+      now: () => "2026-08-12T00:00:00.000Z",
+    });
+    const registry = new InstalledModulePermissionPolicyRegistry({
+      policies: [{
+        kind: "module-private-storage",
+        policyId: "memory.owner-checkpoints",
+        backend,
+        operations: ["get", "list", "set"],
+        limits: {
+          maxKeyBytes: 128,
+          maxValueBytes: 16 * 1_024,
+          maxEntries: 64,
+          maxTotalBytes: 256 * 1_024,
+          maxListResults: 32,
+          maxArgumentBytes: 32 * 1_024,
+          maxResultBytes: 32 * 1_024,
+          maxInvocations: 16,
+          maxInvocationsPerRun: 4,
+        },
+        capabilityLifetimeMs: 60_000,
+      }],
+    });
+    const resolved = {
+      instanceId: "instance-a",
+      installation: {
+        manifest: FIXTURE_PACKAGE_MANIFEST,
+        packageDigest: `sha256:${"a".repeat(64)}`,
+      },
+      module: {
+        moduleId: "module-a",
+        permissionPolicyIds: ["memory.owner-checkpoints"],
+        configurationReference: {
+          configId: "fixture-config",
+          revision: `sha256:${"b".repeat(64)}`,
+          configVersion: 1,
+        },
+      },
+    } as unknown as InstalledExtensionModule;
+    const setup = registry.setupFor(resolved);
+    expect(setup.snapshot.capabilities).toEqual([{
+      capabilityType: "module-private-storage",
+      capabilityVersion: "v2",
+      policyId: "memory.owner-checkpoints",
+      operations: ["get", "list", "set"],
+      limits: {
+        maxKeyBytes: 128,
+        maxValueBytes: 16 * 1_024,
+        maxEntries: 64,
+        maxTotalBytes: 256 * 1_024,
+        maxListResults: 32,
+        maxArgumentBytes: 32 * 1_024,
+        maxResultBytes: 32 * 1_024,
+        maxInvocations: 16,
+        maxInvocationsPerRun: 4,
+      },
+      effectPolicy: "persistent-storage",
+    }]);
+    setup.configureHost(host);
+
+    try {
+      await host.start();
+      await expect(host.execute(execution())).resolves.toMatchObject({
+        stored: {
+          schemaVersion: "dolly.storage-set/1",
+          stored: true,
+          entryCount: 1,
+        },
+        listed: {
+          schemaVersion: "dolly.storage-list/1",
+          keys: ["task-checkpoint"],
+          truncated: false,
+        },
+        loaded: {
+          schemaVersion: "dolly.storage-get/1",
+          found: true,
+          value: {
+            schemaVersion: "dolly.task-checkpoint/1",
+            taskId: "task-a",
+            nextAction: "resume-step-2",
+            evidenceKeys: ["source-a"],
+          },
+        },
+      });
+      const namespace = backend.namespaceFor("instance-a", "module-a");
+      expect(backend.read({
+        namespace,
+        instanceId: "instance-a",
+        moduleId: "module-a",
+      }).entries).toEqual([
+        expect.objectContaining({ key: "task-checkpoint" }),
+      ]);
+      expect(effectJournal.listForRun(claim).map((record) => record.outcome.kind))
+        .toEqual(["terminal", "terminal", "terminal"]);
       await host.stop();
     } finally {
       if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);

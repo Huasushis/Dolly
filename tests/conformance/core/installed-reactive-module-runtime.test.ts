@@ -15,6 +15,7 @@ import { InstalledModulePermissionPolicyRegistry } from "../../../src/adapters/i
 import type { BlockProposal } from "../../../src/core/block-store.js";
 import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
 import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
+import { ModulePrivateStorageBackend } from "../../../src/core/capabilities/module-private-storage-capability.js";
 import { ContentSchemaRegistrationSet } from "../../../src/core/content-schema-registry.js";
 import {
   CoreStartupRecovery,
@@ -746,6 +747,82 @@ describe("installed reactive Module runtime composition", () => {
         registryDigest: tools.snapshot().registryDigest,
         toolWireNames: ["read_note"],
         effectPolicy: "read-only",
+      }],
+    });
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
+  });
+
+  it("binds bounded private checkpoint storage without granting deletion", () => {
+    const configuration = validateDollyInstanceConfig({
+      ...instanceConfiguration,
+      modules: instanceConfiguration.modules.map((module) => ({
+        ...module,
+        permissionPolicyIds: ["memory.owner-checkpoints"],
+      })),
+    });
+    const pair = coreState("checkpoint-storage-policy", configuration);
+    const backend = new ModulePrivateStorageBackend({
+      root: resolve(scratch, "module-private-storage"),
+      now: () => "2026-08-12T00:00:00.000Z",
+    });
+    const policy = {
+      kind: "module-private-storage" as const,
+      policyId: "memory.owner-checkpoints",
+      backend,
+      operations: ["get", "list", "set"] as const,
+      limits: {
+        maxKeyBytes: 128,
+        maxValueBytes: 16 * 1_024,
+        maxEntries: 64,
+        maxTotalBytes: 256 * 1_024,
+        maxListResults: 32,
+        maxArgumentBytes: 32 * 1_024,
+        maxResultBytes: 32 * 1_024,
+        maxInvocations: 256,
+        maxInvocationsPerRun: 8,
+      },
+      capabilityLifetimeMs: 60_000,
+    };
+    const deletePolicy = {
+      ...policy,
+      operations: ["get", "delete"],
+    } as unknown as typeof policy;
+    expect(() => new InstalledModulePermissionPolicyRegistry({
+      policies: [deletePolicy],
+    })).toThrow(/permits only get, list, and set/u);
+    const { maxTotalBytes: _maxTotalBytes, ...incompleteLimits } = policy.limits;
+    const incompletePolicy = {
+      ...policy,
+      limits: incompleteLimits,
+    } as unknown as typeof policy;
+    expect(() => new InstalledModulePermissionPolicyRegistry({
+      policies: [incompletePolicy],
+    })).toThrow(/limits are incomplete or open/u);
+
+    const composed = createInstalledReactiveModuleRuntime({
+      ...options(pair),
+      instanceConfiguration: configuration,
+      permissionPolicies: new InstalledModulePermissionPolicyRegistry({
+        policies: [policy],
+      }),
+      effectIntentStore: new FileEffectIntentStore({
+        path: resolve(scratch, "checkpoint-policy-effect-intents.json"),
+      }),
+    });
+
+    expect(composed.permissionPolicySetup?.snapshot).toMatchObject({
+      instanceId: INSTANCE_ID,
+      moduleId: "worker",
+      packageDigest: composed.resolvedModule.installation.packageDigest,
+      configurationRevision: configuration.modules[0]!.configurationReference.revision,
+      policyIds: ["memory.owner-checkpoints"],
+      capabilities: [{
+        capabilityType: "module-private-storage",
+        capabilityVersion: "v2",
+        policyId: "memory.owner-checkpoints",
+        operations: ["get", "list", "set"],
+        limits: policy.limits,
+        effectPolicy: "persistent-storage",
       }],
     });
     expect(pair.store.listModuleProcessRecords()).toEqual([]);

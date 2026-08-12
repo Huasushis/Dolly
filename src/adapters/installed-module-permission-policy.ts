@@ -1,4 +1,10 @@
 import type { JsonValue } from "../core/canonical-json.js";
+import {
+  createModulePrivateStorageCapabilityV2,
+  ModulePrivateStorageBackend,
+  type ModulePrivateStorageLimitsV2,
+  type ModulePrivateStorageOperation,
+} from "../core/capabilities/module-private-storage-capability.js";
 import type { ExtensionProcessHost } from "../core/extension-process-host.js";
 import { FileToolJournalRepository } from "../core/file-tool-journal-repository.js";
 import type { InstalledExtensionModule } from "../core/installed-extension-module.js";
@@ -71,9 +77,25 @@ export interface InstalledRegisteredToolPolicy {
   readonly maxConcurrentInvocations?: number;
 }
 
+/**
+ * One Host-owned private-storage policy for a simple sourced task checkpoint.
+ * The first candidate deliberately omits delete so an Agent cannot erase its
+ * own recovery evidence through this permission.
+ */
+export interface InstalledModulePrivateStoragePolicy {
+  readonly kind: "module-private-storage";
+  readonly policyId: string;
+  readonly backend: ModulePrivateStorageBackend;
+  readonly operations: readonly Exclude<ModulePrivateStorageOperation, "delete">[];
+  readonly limits: ModulePrivateStorageLimitsV2;
+  readonly capabilityLifetimeMs: number;
+  readonly maxConcurrentInvocations?: number;
+}
+
 export type InstalledModulePermissionPolicy =
   | InstalledStrictStreamingChatPolicy
-  | InstalledRegisteredToolPolicy;
+  | InstalledRegisteredToolPolicy
+  | InstalledModulePrivateStoragePolicy;
 
 export interface InstalledModulePermissionPolicyRegistryOptions {
   readonly policies: readonly InstalledModulePermissionPolicy[];
@@ -102,6 +124,14 @@ export interface InstalledModulePermissionPolicySetupSnapshot {
         readonly registryDigest: string;
         readonly toolWireNames: readonly string[];
         readonly effectPolicy: "read-only";
+      }
+    | {
+        readonly capabilityType: "module-private-storage";
+        readonly capabilityVersion: "v2";
+        readonly policyId: string;
+        readonly operations: readonly Exclude<ModulePrivateStorageOperation, "delete">[];
+        readonly limits: Readonly<ModulePrivateStorageLimitsV2>;
+        readonly effectPolicy: "persistent-storage";
       }
   )[];
 }
@@ -240,12 +270,73 @@ function immutableToolPolicy(
   });
 }
 
+function immutableStoragePolicy(
+  policy: InstalledModulePrivateStoragePolicy,
+): InstalledModulePrivateStoragePolicy {
+  if (policy.kind !== "module-private-storage") {
+    throw new TypeError("Installed private-storage permission policy kind is unsupported");
+  }
+  assertIdentifier(policy.policyId, "policyId");
+  if (!(policy.backend instanceof ModulePrivateStorageBackend)) {
+    throw new TypeError("Installed private-storage policy requires one Host-owned backend");
+  }
+  if (!Array.isArray(policy.operations) || policy.operations.length === 0) {
+    throw new TypeError("Installed private-storage policy requires at least one operation");
+  }
+  const operations = [...new Set(policy.operations)];
+  if (
+    operations.some(
+      (operation) => operation !== "get" && operation !== "list" && operation !== "set",
+    )
+  ) {
+    throw new TypeError(
+      "Installed private-storage policy currently permits only get, list, and set",
+    );
+  }
+  const requiredLimitFields = [
+    "maxKeyBytes",
+    "maxValueBytes",
+    "maxEntries",
+    "maxTotalBytes",
+    "maxListResults",
+    "maxArgumentBytes",
+    "maxResultBytes",
+    "maxInvocations",
+    "maxInvocationsPerRun",
+  ] as const;
+  if (
+    Object.keys(policy.limits).length !== requiredLimitFields.length ||
+    requiredLimitFields.some((field) => !Object.hasOwn(policy.limits, field))
+  ) {
+    throw new TypeError("Installed private-storage policy limits are incomplete or open");
+  }
+  for (const [label, value] of Object.entries(policy.limits)) {
+    assertPositiveInteger(value, `limits.${label}`);
+  }
+  assertPositiveInteger(policy.capabilityLifetimeMs, "capabilityLifetimeMs");
+  if (policy.maxConcurrentInvocations !== undefined) {
+    assertPositiveInteger(policy.maxConcurrentInvocations, "maxConcurrentInvocations");
+  }
+  if (policy.limits.maxInvocationsPerRun > policy.limits.maxInvocations) {
+    throw new TypeError(
+      "Installed private-storage Run limit exceeds its process-session limit",
+    );
+  }
+  return Object.freeze({
+    ...policy,
+    operations: Object.freeze(operations),
+    limits: Object.freeze({ ...policy.limits }),
+  });
+}
+
 function immutablePolicy(
   policy: InstalledModulePermissionPolicy,
 ): InstalledModulePermissionPolicy {
   return policy.kind === "strict-streaming-chat"
     ? immutableChatPolicy(policy)
-    : immutableToolPolicy(policy);
+    : policy.kind === "registered-tools"
+      ? immutableToolPolicy(policy)
+      : immutableStoragePolicy(policy);
 }
 
 function sameSelection(
@@ -290,7 +381,17 @@ export class InstalledModulePermissionPolicySetup {
     this.snapshot = Object.freeze({
       ...snapshot,
       policyIds: Object.freeze([...snapshot.policyIds]),
-      capabilities: Object.freeze(snapshot.capabilities.map((entry) => Object.freeze({ ...entry }))),
+      capabilities: Object.freeze(snapshot.capabilities.map((entry) => Object.freeze({
+        ...entry,
+        ...(entry.capabilityType === "tool-invocation"
+          ? { toolWireNames: Object.freeze([...entry.toolWireNames]) }
+          : entry.capabilityType === "module-private-storage"
+            ? {
+                operations: Object.freeze([...entry.operations]),
+                limits: Object.freeze({ ...entry.limits }),
+              }
+            : {}),
+      }))),
     });
     this.#policies = Object.freeze([...policies]);
     this.#now = now;
@@ -359,6 +460,19 @@ export class InstalledModulePermissionPolicySetup {
               approvalPolicyRevision: policy.approvalPolicyRevision,
             }),
           }),
+        });
+      }
+      if (policy.kind === "module-private-storage") {
+        return createModulePrivateStorageCapabilityV2({
+          backend: policy.backend,
+          instanceId: this.snapshot.instanceId,
+          moduleId: this.snapshot.moduleId,
+          operations: policy.operations,
+          executionScope: "active-run",
+          expiresAt,
+          limits: policy.limits,
+          maxConcurrentInvocations: policy.maxConcurrentInvocations ?? 1,
+          requireIdempotencyKey: true,
         });
       }
       return createModelOperationCapabilityV2({
@@ -431,23 +545,34 @@ export class InstalledModulePermissionPolicyRegistry {
         packageDigest: resolved.installation.packageDigest,
         configurationRevision: reference.revision,
         policyIds,
-        capabilities: policies.map((policy) =>
-          policy.kind === "registered-tools"
-            ? {
-                capabilityType: "tool-invocation" as const,
-                capabilityVersion: "v2" as const,
-                policyId: policy.policyId,
-                registryDigest: policy.registry.snapshot().registryDigest,
-                toolWireNames: policy.registry.snapshot().tools.map((tool) => tool.name),
-                effectPolicy: "read-only" as const,
-              }
-            : {
-                capabilityType: "model-operation" as const,
-                capabilityVersion: "v2" as const,
-                policyId: policy.policyId,
-                streaming: "required" as const,
-              },
-        ),
+        capabilities: policies.map((policy) => {
+          if (policy.kind === "registered-tools") {
+            return {
+              capabilityType: "tool-invocation" as const,
+              capabilityVersion: "v2" as const,
+              policyId: policy.policyId,
+              registryDigest: policy.registry.snapshot().registryDigest,
+              toolWireNames: policy.registry.snapshot().tools.map((tool) => tool.name),
+              effectPolicy: "read-only" as const,
+            };
+          }
+          if (policy.kind === "module-private-storage") {
+            return {
+              capabilityType: "module-private-storage" as const,
+              capabilityVersion: "v2" as const,
+              policyId: policy.policyId,
+              operations: [...policy.operations],
+              limits: { ...policy.limits },
+              effectPolicy: "persistent-storage" as const,
+            };
+          }
+          return {
+            capabilityType: "model-operation" as const,
+            capabilityVersion: "v2" as const,
+            policyId: policy.policyId,
+            streaming: "required" as const,
+          };
+        }),
       },
       policies,
       this.#now,
