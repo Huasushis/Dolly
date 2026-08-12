@@ -584,9 +584,16 @@ describe.skipIf(!available)("installed inline Media Agent in a real control grou
         id: registeredMedia.mediaId,
       })).toBe(0);
       expect(coreState.store.media.listProviderAccessRecords()).toEqual([]);
-      expect(new FileEffectIntentStore({ path: effectPath }).list()).toEqual([
-        expect.objectContaining({ outcome: { kind: "terminal" } }),
-      ]);
+      const effectRecords = new FileEffectIntentStore({ path: effectPath }).list();
+      expect(effectRecords).toHaveLength(1);
+      expect(effectRecords[0]).toMatchObject({
+        capabilityType: "model-operation",
+        operation: "chat",
+        outcome: {
+          kind: "terminal",
+          resultDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        },
+      });
       expect(schedulerEvents).toContainEqual(expect.objectContaining({
         type: "scheduler.settled",
         moduleId: MODULE_ID,
