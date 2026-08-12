@@ -9,9 +9,16 @@ import type { ExtensionProcessHost } from "../core/extension-process-host.js";
 import { FileToolJournalRepository } from "../core/file-tool-journal-repository.js";
 import type { InstalledExtensionModule } from "../core/installed-extension-module.js";
 import type {
+  ChatModelBrokerOptions,
   ModelInvocationBudgets,
+  ModelMediaResolver,
 } from "../core/model-provider-broker.js";
-import type { DescriptorRef } from "../core/model-provider-descriptor.js";
+import { ChatModelBroker } from "../core/model-provider-broker.js";
+import {
+  ModelDescriptorRegistry,
+  type DescriptorRef,
+} from "../core/model-provider-descriptor.js";
+import { EndpointBindingRegistry } from "../core/model-provider-binding.js";
 import {
   createModelOperationCapabilityV2,
   createModelOperationCapabilityV3,
@@ -44,7 +51,14 @@ export interface InstalledStrictStreamingChatPolicy {
   readonly descriptor: DescriptorRef;
   readonly ownerScope: string;
   readonly budgets: ModelInvocationBudgets;
-  readonly chat: ChatModelBrokerPort;
+  /** Text-only policies use an already reviewed Host broker port. */
+  readonly chat?: ChatModelBrokerPort;
+  /**
+   * Media policies supply product Broker dependencies without a resolver.
+   * The installed runtime injects its FileCore active-Run resolver and creates
+   * the broker; an operator cannot substitute Extension-provided Media bytes.
+   */
+  readonly mediaBrokerOptions?: Omit<ChatModelBrokerOptions, "media">;
   readonly outputContracts: readonly ModelOutputContractKind[];
   /** Omitted for text-only v2; non-empty selects delivered-Media v3. */
   readonly mediaRequirementIds?: readonly string[];
@@ -216,6 +230,31 @@ function immutableChatPolicy(
       "Installed model Media policy requires finite item and resolved-byte budgets",
     );
   }
+  if (mediaRequirementIds.length === 0) {
+    if (typeof policy.chat?.invoke !== "function" || policy.mediaBrokerOptions !== undefined) {
+      throw new TypeError(
+        "Installed text model policy requires one direct chat broker and no Media broker options",
+      );
+    }
+  } else if (policy.chat !== undefined || policy.mediaBrokerOptions === undefined) {
+    throw new TypeError(
+      "Installed model Media policy requires product Broker options and cannot accept a prebuilt chat port",
+    );
+  }
+  if (policy.mediaBrokerOptions !== undefined) {
+    if (
+      Object.getPrototypeOf(policy.mediaBrokerOptions.descriptors) !==
+        ModelDescriptorRegistry.prototype ||
+      Object.getPrototypeOf(policy.mediaBrokerOptions.bindings) !==
+        EndpointBindingRegistry.prototype
+    ) {
+      throw new TypeError(
+        "Installed model Media policy requires direct descriptor and endpoint-binding registries",
+      );
+    }
+    policy.mediaBrokerOptions.descriptors.snapshot(policy.descriptor);
+    policy.mediaBrokerOptions.bindings.snapshot(policy.descriptor);
+  }
   if (policy.roles.length === 0) {
     throw new TypeError("Installed model policy requires at least one message role");
   }
@@ -239,6 +278,9 @@ function immutableChatPolicy(
     ...(mediaRequirementIds.length === 0
       ? {}
       : { mediaRequirementIds: Object.freeze(mediaRequirementIds) }),
+    ...(policy.mediaBrokerOptions === undefined
+      ? {}
+      : { mediaBrokerOptions: Object.freeze({ ...policy.mediaBrokerOptions }) }),
     reasoningPolicies: Object.freeze([...new Set(policy.reasoningPolicies)]),
     roles: Object.freeze([...new Set(policy.roles)]),
     limits: Object.freeze({ ...policy.limits }),
@@ -391,6 +433,7 @@ export class InstalledModulePermissionPolicySetup {
   readonly #policies: readonly InstalledModulePermissionPolicy[];
   readonly #now: () => number;
   readonly #nextRequestId: (() => string) | undefined;
+  readonly #modelMediaResolver: ModelMediaResolver | undefined;
   readonly #configuredHosts = new WeakSet<ExtensionProcessHost>();
 
   constructor(
@@ -399,6 +442,7 @@ export class InstalledModulePermissionPolicySetup {
     policies: readonly InstalledModulePermissionPolicy[],
     now: () => number,
     nextRequestId: (() => string) | undefined,
+    modelMediaResolver: ModelMediaResolver | undefined,
   ) {
     if (token !== SETUP_TOKEN) {
       throw new TypeError("Installed Module permission setup must come from its Host registry");
@@ -428,6 +472,7 @@ export class InstalledModulePermissionPolicySetup {
     this.#policies = Object.freeze([...policies]);
     this.#now = now;
     this.#nextRequestId = nextRequestId;
+    this.#modelMediaResolver = modelMediaResolver;
     setups.add(this);
   }
 
@@ -507,6 +552,12 @@ export class InstalledModulePermissionPolicySetup {
           requireIdempotencyKey: true,
         });
       }
+      const chat = policy.mediaRequirementIds === undefined
+        ? policy.chat!
+        : new ChatModelBroker({
+            ...policy.mediaBrokerOptions!,
+            media: this.#modelMediaResolver!,
+          });
       const modelOptions = {
         descriptor: policy.descriptor,
         ownerScope: policy.ownerScope,
@@ -514,7 +565,7 @@ export class InstalledModulePermissionPolicySetup {
         executionScope: "active-run" as const,
         expiresAt,
         now: () => new Date(this.#now()).toISOString(),
-        chat: policy.chat,
+        chat: { invoke: chat.invoke.bind(chat) },
         operations: ["chat", "describe"] as const,
         reasoningPolicies: policy.reasoningPolicies,
         allowStreaming: true,
@@ -564,7 +615,10 @@ export class InstalledModulePermissionPolicyRegistry {
     }
   }
 
-  setupFor(resolved: InstalledExtensionModule): InstalledModulePermissionPolicySetup {
+  setupFor(
+    resolved: InstalledExtensionModule,
+    options: { readonly modelMediaResolver?: ModelMediaResolver } = {},
+  ): InstalledModulePermissionPolicySetup {
     const policyIds = [...resolved.module.permissionPolicyIds].sort();
     const policies = policyIds.map((policyId) => {
       const policy = this.#policies.get(policyId);
@@ -574,6 +628,18 @@ export class InstalledModulePermissionPolicyRegistry {
       return policy;
     });
     const reference = resolved.module.configurationReference;
+    if (
+      policies.some(
+        (policy) =>
+          policy.kind === "strict-streaming-chat" &&
+          policy.mediaRequirementIds !== undefined,
+      ) &&
+      options.modelMediaResolver === undefined
+    ) {
+      throw new TypeError(
+        "Installed model Media policy requires the FileCore active-Run Media resolver",
+      );
+    }
     return new InstalledModulePermissionPolicySetup(
       SETUP_TOKEN,
       {
@@ -620,6 +686,7 @@ export class InstalledModulePermissionPolicyRegistry {
       policies,
       this.#now,
       this.#nextRequestId,
+      options.modelMediaResolver,
     );
   }
 }

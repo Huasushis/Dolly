@@ -23,6 +23,8 @@ import type {
 } from "../core/module-scheduler.js";
 import type { ModuleConfigurationStore } from "../core/module-configuration-store.js";
 import type { ModuleProcessStoppedRecordWriter } from "../core/module-process-records.js";
+import { createFileCoreActiveRunModelMediaResolver } from "../core/media-capability/index.js";
+import type { ModelMediaResolver } from "../core/model-provider-broker.js";
 import { createModuleResultCommitCoordinator } from "../core/module-result-commit-factory.js";
 import type {
   DeferredModuleResultCommit,
@@ -218,7 +220,6 @@ function createInstalledReactiveModuleRuntimeInternal(
         "Installed Module permission policies require one direct durable effect intent store",
       );
     }
-    permissionPolicySetup = options.permissionPolicies.setupFor(resolvedModule);
     const effectJournal = new EffectIntentJournal({
       store: options.effectIntentStore,
       now: () => canonicalNow(options.now),
@@ -298,7 +299,25 @@ function createInstalledReactiveModuleRuntimeInternal(
       ? {}
       : { afterEffect: options.afterCommitEffect }),
   });
-  const generations = createInstalledLinuxExtensionModuleGenerationFactory({
+  let generations: InstalledLinuxExtensionModuleGenerationFactory | undefined;
+  let modelMediaResolver: ModelMediaResolver | undefined;
+  if (options.core.media !== undefined) {
+    modelMediaResolver = createFileCoreActiveRunModelMediaResolver({
+      core: options.core,
+      extensionId: resolvedModule.installation.manifest.extensionId,
+      instanceId: resolvedModule.instanceId,
+      moduleId: module.moduleId,
+      sessionForProcess: (processGenerationId) =>
+        generations?.sessionForProcess(processGenerationId) ?? null,
+      now,
+    });
+  }
+  if (module.permissionPolicyIds.length !== 0) {
+    permissionPolicySetup = options.permissionPolicies!.setupFor(resolvedModule, {
+      ...(modelMediaResolver === undefined ? {} : { modelMediaResolver }),
+    });
+  }
+  generations = createInstalledLinuxExtensionModuleGenerationFactory({
     instanceConfiguration: options.instanceConfiguration,
     moduleId: options.moduleId,
     installations: options.installations,

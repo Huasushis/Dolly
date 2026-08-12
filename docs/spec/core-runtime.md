@@ -516,15 +516,23 @@ paths. An immutable in-process permission-policy registry maps the exact
 identifiers selected by the validated Module configuration to a reviewed chat
 descriptor and broker, a reviewed read-only `ToolRegistry`, or bounded
 Module-private checkpoint storage. Its ordinary meaning is a Host-owned table
-of approved operations; it is not Extension configuration. The chat policy
-grants text-only `model-operation/v2` for the Host-verified active Run. A policy
-with a non-empty frozen media-requirement set and finite media item and byte
-budgets instead grants `model-operation/v3`; that version accepts only a
-delivered Block media reference and relies on the broker's Host-only active-Run
-resolver for authorization. Both versions require a stable idempotency key and
-provider streaming on every chat invocation. Non-stream chat is rejected before
-broker dispatch. Embedding is not included in this generation policy and
-remains a separately measured non-stream operation. The tool policy grants
+of approved operations; it is not Extension configuration. The text chat
+policy grants `model-operation/v2` for the Host-verified active Run and uses a
+reviewed Host broker port. A policy with a non-empty frozen media-requirement
+set and finite media item and byte budgets instead grants
+`model-operation/v3`. That media path cannot accept a preconstructed chat
+port. It must provide direct descriptor and endpoint-binding registries plus
+the remaining product `ChatModelBroker` dependencies; the installed runtime
+constructs the broker with its own FileCore active-Run Media resolver. Missing
+Media-enabled FileCore state, a missing exact descriptor or active binding, or
+an attempt to substitute a prebuilt port is rejected before an executor or
+process record exists. Version 3 accepts only a delivered Block media
+reference, while the resulting broker resolver independently requires the
+matching Claim, submission, running process, and live Host session. Both model
+versions require a stable idempotency key and provider streaming on every chat
+invocation. Non-stream chat is rejected before broker dispatch. Embedding is
+not included in this generation policy and remains a separately measured
+non-stream operation. The tool policy grants
 `tool-invocation/v2` from the exact executable
 registry used for Host-side argument and result checking, requires a
 file-backed round journal, and accepts only read operations that never request

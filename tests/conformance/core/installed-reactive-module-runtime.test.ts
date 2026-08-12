@@ -25,12 +25,14 @@ import {
 import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
 import { ExtensionInstallationRegistry } from "../../../src/core/extension-installation-registry.js";
 import { createFileCoreStateStoreWithStoppedRecordWriter } from "../../../src/core/file-core-state-store.js";
+import { FileMediaByteStore } from "../../../src/core/file-media-byte-store.js";
 import { resolveInstalledContentSchemaRegistrationSet } from "../../../src/core/installed-extension-module.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { FileToolJournalRepository } from "../../../src/core/file-tool-journal-repository.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
 import type { ChatBrokerInvocation } from "../../../src/core/model-provider-broker.js";
 import { ModelDescriptorRegistry } from "../../../src/core/model-provider-descriptor.js";
+import { EndpointBindingRegistry } from "../../../src/core/model-provider-binding.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
 import { ModuleConfigurationStore } from "../../../src/core/module-configuration-store.js";
@@ -177,6 +179,7 @@ describe("installed reactive Module runtime composition", () => {
     name: string,
     configuration = instanceConfiguration,
     suppliedContentSchemas?: ContentSchemaRegistrationSet,
+    media = false,
   ) {
     let blockId = 0;
     let deliveryId = 0;
@@ -194,6 +197,22 @@ describe("installed reactive Module runtime composition", () => {
       nextDeliveryId: (kind) => `${name}-${kind}-${++deliveryId}`,
       now: () => "2026-08-10T00:00:00.000Z",
       contentSchemas,
+      ...(media
+        ? {
+            media: {
+              durability: "persistent" as const,
+              bytes: new FileMediaByteStore({
+                directory: resolve(scratch, `${name}-media`),
+                maxMediaBytes: 64 * 1024,
+              }),
+              inspector: {
+                inspect: async () => ({ mimeType: "image/png", width: 2, height: 1 }),
+              },
+              maxMediaBytes: 64 * 1024,
+              idNamespace: `${name}-media`,
+            },
+          }
+        : {}),
     });
     for (const page of configuration.pages) {
       pair.store.deliveries.createPage(page.pageId);
@@ -273,13 +292,31 @@ describe("installed reactive Module runtime composition", () => {
     });
   }
 
-  function modelPolicies(media = false) {
+  function modelPolicies(media = false, prebuiltMediaChat = false) {
     const descriptors = new ModelDescriptorRegistry({
       schemaDigest: MODEL_SCHEMA_DIGEST,
       allowedStrategyIds: CHAT_STRATEGIES,
     });
-    const descriptor = descriptors.register(chatDescriptor());
+    const descriptor = descriptors.register(chatDescriptor({ inlinePng: media }));
     descriptors.setStatus(descriptor, "active");
+    const bindings = new EndpointBindingRegistry();
+    if (media) {
+      const binding = bindings.register({
+        schemaVersion: "dolly.endpoint-binding/2",
+        endpointId: descriptor.endpointId,
+        bindingRevision: "installed-media-binding-v1",
+        descriptorRefs: [descriptor],
+        exactUrl: "https://provider.example.test/v1/chat/completions",
+        networkScope: "public",
+        authentication: { kind: "none" },
+        limits: {
+          maxRequestBytes: 64 * 1024,
+          maxResponseBytes: 256 * 1024,
+          maxTimeoutMs: 180_000,
+        },
+      });
+      bindings.setStatus(binding, "active");
+    }
     const invoke = vi.fn(async (invocation: ChatBrokerInvocation) => ({
       schemaVersion: "dolly.model-result/2" as const,
       requestId: invocation.requestId,
@@ -318,7 +355,24 @@ describe("installed reactive Module runtime composition", () => {
               ? { maxMediaItems: 1, maxResolvedMediaBytes: 32 * 1024 }
               : {}),
           },
-          chat: { invoke },
+          ...(media && !prebuiltMediaChat
+            ? {
+                mediaBrokerOptions: {
+                  descriptors,
+                  bindings,
+                  secrets: {
+                    resolve: async () => {
+                      throw new Error("The construction test cannot read a provider secret");
+                    },
+                  },
+                  transport: {
+                    dispatch: async () => {
+                      throw new Error("The construction test cannot dispatch a provider request");
+                    },
+                  },
+                },
+              }
+            : { chat: { invoke } }),
           outputContracts: ["text"],
           ...(media ? { mediaRequirementIds: ["inline-png-v1"] } : {}),
           reasoningPolicies: ["require", "disable"],
@@ -654,7 +708,7 @@ describe("installed reactive Module runtime composition", () => {
         permissionPolicyIds: ["model.owner-primary"],
       })),
     });
-    const pair = coreState("model-media-policy", configuration);
+    const pair = coreState("model-media-policy", configuration, undefined, true);
     const selected = modelPolicies(true);
     const composed = createInstalledReactiveModuleRuntime({
       ...options(pair),
@@ -678,6 +732,22 @@ describe("installed reactive Module runtime composition", () => {
     }
     expect(Object.isFrozen(capability.mediaRequirementIds)).toBe(true);
     expect(selected.invoke).not.toHaveBeenCalled();
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
+  });
+
+  it("rejects a prebuilt chat port and a Media-disabled Core for a v3 policy", () => {
+    expect(() => modelPolicies(true, true)).toThrow(/cannot accept a prebuilt chat port/u);
+    const configuration = configurationWithModelPolicy();
+    const pair = coreState("model-media-policy-disabled", configuration);
+    const selected = modelPolicies(true);
+    expect(() => createInstalledReactiveModuleRuntime({
+      ...options(pair),
+      instanceConfiguration: configuration,
+      permissionPolicies: selected.registry,
+      effectIntentStore: new FileEffectIntentStore({
+        path: resolve(scratch, "model-media-policy-disabled-effect-intents.json"),
+      }),
+    })).toThrow(/requires the FileCore active-Run Media resolver/u);
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
 
