@@ -520,27 +520,31 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       coreState.store.deliveries.append("input", secondInput.id);
       expect(await waitFor(
         () => events.some((event) =>
-          event.type === "scheduler.settled" &&
-          event.moduleId === SECOND_MODULE_ID &&
-          event.tickStatus === "output-backpressured"
+          event.type === "scheduler.backpressure_entered" &&
+          event.moduleId === SECOND_MODULE_ID
         ),
         5_000,
       )).toBe(true);
       expect(actorRunCount(FIRST_MODULE_ID)).toBe(2);
-      expect(actorRunCount(SECOND_MODULE_ID)).toBe(2);
+      expect(actorRunCount(SECOND_MODULE_ID)).toBe(1);
       expect(actorRunCount(DRAINER_MODULE_ID)).toBe(1);
-      expect(repository.list()).toHaveLength(4);
+      expect(repository.list()).toHaveLength(3);
       expect(repository.list().filter((record) => record.state === "prepared"))
-        .toHaveLength(1);
+        .toHaveLength(0);
       expect(coreState.store.deliveries.inspectResident(DRAINER_MODULE_ID, ["output"]))
         .toMatchObject({ residentCount: 1, pendingCount: 0, claimedCount: 1 });
       expect(await waitFor(
         () =>
           repository.list().length === 5 &&
           repository.list().every((record) => record.state === "committed") &&
+          actorRunCount(SECOND_MODULE_ID) === 2 &&
           actorRunCount(DRAINER_MODULE_ID) === 2,
         15_000,
       )).toBe(true);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "scheduler.backpressure_exited",
+        moduleId: SECOND_MODULE_ID,
+      }));
       expect(actorRunCount(FIRST_MODULE_ID)).toBe(2);
       expect(actorRunCount(SECOND_MODULE_ID)).toBe(2);
       expect(actorRunCount(DRAINER_MODULE_ID)).toBe(2);
@@ -664,10 +668,11 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         initialEmptyDecisionsObserved: MODULE_IDS.length,
         configuredPollIntervalMs: 60_000,
         outputRecoveryWithinMs: 15_000,
-        outputBackpressureObserved: true,
+        schedulerBackpressureObserved: true,
+        outputCommitBackpressureObserved: false,
         actorRunsBeforeCapacityRelease: {
           [FIRST_MODULE_ID]: 2,
-          [SECOND_MODULE_ID]: 2,
+          [SECOND_MODULE_ID]: 1,
           [DRAINER_MODULE_ID]: 1,
         },
         actorRunsAfterCapacityRelease,
@@ -730,6 +735,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
     ).filesystemPath;
     let composed: InstalledReactiveModuleHost | undefined;
     let stopped = false;
+    let primaryFailure: unknown;
     try {
       const packageSource = join(scratch, "package-source");
       mkdirSync(packageSource, { recursive: true, mode: 0o700 });
@@ -1017,15 +1023,27 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         cgroupRemoved: !existsSync(moduleCgroupPath),
         reopenedOutput: "source:1:run-1",
       }));
+    } catch (error) {
+      primaryFailure = error;
     } finally {
+      const cleanupFailures: unknown[] = [];
       if (!stopped && composed !== undefined &&
         (composed.host.state === "running" || composed.host.state === "failed")) {
-        await composed.host.stop().catch(() => undefined);
+        await composed.host.stop().catch((error) => cleanupFailures.push(error));
       }
       if (existsSync(moduleCgroupPath)) {
-        throw new Error(`Exact Source Module control group remained after cleanup: ${moduleCgroupPath}`);
+        cleanupFailures.push(
+          new Error(`Exact Source Module control group remained after cleanup: ${moduleCgroupPath}`),
+        );
       }
       rmSync(scratch, { recursive: true, force: true });
+      const failures = [
+        ...(primaryFailure === undefined ? [] : [primaryFailure]),
+        ...cleanupFailures,
+      ];
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "Installed Source Module integration failed");
+      }
     }
   }, 60_000);
 });
