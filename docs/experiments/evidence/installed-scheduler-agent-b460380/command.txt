@@ -1,0 +1,1 @@
+./scripts/experiments/linux-core-service-ownership/run-disposable-container.sh --base docker.m.daocloud.io/library/ubuntu:24.04 --test-file tests/conformance/security/installed-reactive-module-host-integration.test.ts

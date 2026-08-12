@@ -1,0 +1,76 @@
+run=container-3492251-20260812T184708Z
+source_commit=not-captured
+container=not-created
+result=preflight-failed
+failure=default Docker Hub base image lookup failed before the source/test run
+raw_local_log_sha256=none
+
+run=container-3492525-20260812T184727Z
+source_commit=a16756b16685a42e9c9eee2fe2fe9240b6c2324c
+container=dolly-experiment-3492525-6a54e72b
+result=failed
+failure=observer timed out without reading Scheduler quarantine
+raw_local_log_sha256=03147e118a923b53a1e6451a6fbb396797f1cf0428cb86c82faeeeb3afce8a99
+
+run=container-3494610-20260812T184933Z
+source_commit=ad58c63c7b4c55fc9b9625496f1fb8fc0fd1b1b3
+container=dolly-experiment-3494610-2b0ebe57
+result=failed-closed
+failure=RECOVERY_REQUIRED:external-effect-outcome-unknown after one provider request
+raw_local_log_sha256=9386006831bd8ca34f8e3a3c6d3a09877d7ddb9246bad207d00d52fece2fe923
+
+run=container-3496669-20260812T185114Z
+source_commit=44b75bc2035b3d8c7e3314bc913b67637366768c
+container=dolly-experiment-3496669-cc9b6f43
+result=failed-closed
+failure=first provider request streamed with reasoning enabled but without the intended JSON-object response contract
+raw_local_log_sha256=811b7c77b3c3dc94f39ada2163853d4f149a3a9cb08eca349ce0a76cc9393108
+
+run=container-3498208-20260812T185225Z
+source_commit=b9a2409b8a3136743c95de1d31aa3d76111e1df9
+container=dolly-experiment-3498208-c368fb54
+result=failed-closed
+failure=one malformed strict-SSE fixture event; later diagnostics identified choices as an object instead of an array
+raw_local_log_sha256=7903cefa14d1959bbf6f7db4c41a44068ef095b0270486cca8ff05d8e90b041b
+
+run=container-3503533-20260812T185918Z
+source_commit=ea2f6d05e112d5666060c5e56957bff7dfa7b65c
+container=dolly-experiment-3503533-1b000761
+result=failed-closed-diagnostic
+failure=the Agent exposed only a generic unsuccessful model-result diagnostic
+raw_local_log_sha256=eebd51cd8413dc84cd39120c9015939b946bfe13fb754c35b609508846d6aa28
+
+run=container-3505304-20260812T190033Z
+source_commit=d3737d2c5f2f46a0e69f8a48377df5b034ac3729
+container=dolly-experiment-3505304-4a758e0a
+result=failed-closed-diagnostic
+failure=the public result narrowed the failure to PROVIDER_PROTOCOL_ERROR/response
+raw_local_log_sha256=17ff6c57b48b83457ac9ca75d71734d561680f23b94dddf35c8c1d79bef65581
+
+run=container-3506889-20260812T190203Z
+source_commit=21eff22fb9f6c652dd9b66d472b168a898e3a75e
+container=dolly-experiment-3506889-61377716
+result=failed-closed-diagnostic
+failure=temporary final-output validation diagnostic did not fire because incremental SSE validation rejected first
+raw_local_log_sha256=6e0c073d954e20135f6c9ac59afbe60d6191dcadc912f4724b55d983c11da69c
+
+run=container-3508499-20260812T190309Z
+source_commit=a5792b69bd5ceec62f58c850d31aff45ed0724f8
+container=dolly-experiment-3508499-e2cacd51
+result=failed-closed-diagnostic
+failure=strict decoder proved the malformed event with Provider response identity or choices are invalid
+raw_local_log_sha256=84a3cb8d3316bf7cd7bff596f0957b9ed076e8dba714a3fe26a7a0755709e7c5
+
+run=container-3510412-20260812T190445Z
+source_commit=2a0a5b1e03c3cd525c59024f59feefdbb5913c17
+container=dolly-experiment-3510412-675e2b04
+result=functional-chain-completed-test-oracle-failed
+failure=old oracle still expected the removed text output contract
+raw_local_log_sha256=71d0be61eb47e20eee8788f5e0a16de6d31fcab89fbbe3a20eda6ace9a4f4fa4
+
+run=container-3511871-20260812T190542Z
+source_commit=9943f97765a18c9d9db49b84af53ccf49382a87e
+container=dolly-experiment-3511871-09a6a64d
+result=functional-chain-completed-test-oracle-failed
+failure=old oracle still expected four model calls instead of the closed three-call path
+raw_local_log_sha256=e7de020ff90f65bd0d5291791c6c33886960e1290b9ea71b71f9899f868e08b1

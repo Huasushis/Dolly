@@ -61,6 +61,45 @@ The environment and preflight files have SHA-256
 and
 `ecf7fce3780e2b756cfc847409343f9dc3196b8e6f9da072679da4c713411c36`.
 
+## Product Broker strict-streaming follow-up
+
+The original installed Agent used a deterministic implementation of the
+broker interface. Source `b460380c491fed04d9013387d46aae1a5d110710`
+replaced that fixture at the installed permission boundary with the product
+`ChatModelBroker`, an actual descriptor registry, an actual endpoint-binding
+registry, and the strict OpenAI-compatible SSE decoder. The provider transport
+remained deterministic so this is still an engineering integration test, not
+a model-efficacy result or a network-provider result.
+
+The final disposable Ubuntu 24.04 systemd run passed all 6 cases in 13.52
+seconds. The exact container was
+`dolly-experiment-3513356-d9bc599c`; the runner removed only that container,
+and exact post-run inspection returned absent. The Agent made three closed
+JSON-object model calls through the product Broker: the first required and
+observed non-empty reasoning, while the next two disabled reasoning. All three
+requests carried `stream=true`, `stream_options.include_usage=true`, and
+`response_format.type=json_object`; none carried `enable_thinking`. The Agent
+then made two registered read-only tool calls, committed one grounded result,
+and cited `deployment-note` for `EMBER-7421`.
+
+The run recorded seven terminal capability effects, one Actor Run, one durable
+Module result, a durably stopped process record, and removal of the exact
+Module control group. The raw local log is retained at
+`artifacts/experiments/linux-core-service-ownership/container-3513356-20260812T190637Z/linux-integration.log`
+with SHA-256
+`39bb392417f3cdf3fcb706fcb59dcb34a8e0506688a2d86ef1046ded960712f1`.
+Portable observations and the retained failure inventory are under
+`docs/experiments/evidence/installed-scheduler-agent-b460380/`.
+
+The counterexample sequence was not overwritten. In particular, the malformed
+fixture first emitted `choices` as an object rather than an array. The product
+strict decoder rejected it, Core observed the exact
+`PROVIDER_PROTOCOL_ERROR/response`, and Scheduler preserved the active Claim
+under `RECOVERY_REQUIRED:external-effect-outcome-unknown`. After the SSE bytes
+were fixed, two later runs completed the functional chain but failed stale
+test oracles that still expected the removed text contract and fourth planning
+call. Only the final 6/6 run is passing evidence.
+
 ## Task switching with one simple checkpoint
 
 The second question was whether the same installed Linux Scheduler chain could
@@ -132,9 +171,10 @@ and
 
 ## What this does not prove
 
-The model broker in this Linux lifecycle case is a deterministic Host fixture;
-it verifies Dolly's streaming requirement and composition, not network SSE.
-The separate owner-Aether Memory run supplies the real strict-SSE evidence.
+The latest installed Linux lifecycle case uses the product `ChatModelBroker`
+and strict decoder, but its provider transport and responses are deterministic;
+it does not prove real provider networking or model intelligence. Separate
+owner-Aether runs supply real strict-SSE behavior evidence.
 These fixtures are not a broad Agent or Memory benchmark. The simple checkpoint
 test demonstrates an explicit, sourced representation and cue-driven reload;
 it does not identify the right retrieval, association, consolidation, or
