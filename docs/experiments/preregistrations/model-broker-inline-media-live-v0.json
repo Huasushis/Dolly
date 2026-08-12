@@ -1,0 +1,169 @@
+{
+  "schemaVersion": "dolly.experiment-preregistration/1",
+  "experimentId": "model-broker-inline-media-live-v0",
+  "experimentVersion": 1,
+  "status": "preregistered-before-execution",
+  "registeredAt": "2026-08-12T16:47:03.000Z",
+  "sourceRevision": "The implementationSha256 list is authoritative and this preregistration must be committed before execution.",
+  "question": "Can Dolly's production ChatModelBroker, rather than a probe-specific HTTP client, authorize one delivered local PNG and obtain the exact fixed answer from the owner's configured Aether qwen3.6-27b deployment through strict streaming without exposing Module startup or private endpoint data?",
+  "definitions": {
+    "strict streaming": "One OpenAI-compatible SSE response with stream=true, stream_options.include_usage=true, bounded events and bytes, one terminal usage observation, one DONE marker, and no non-stream fallback.",
+    "host-authorized media": "The host verifies that the immutable MediaReference was delivered in the active Claim, resolves copied MediaStore bytes, and constructs provider placement without accepting a path, URL, data URL, or access grant from the Extension.",
+    "exact answer": "The parsed JSON exactly matches the frozen title, nonce, three ordered boxes, checksum, and answer token generated in the fixed image."
+  },
+  "scope": {
+    "provesIfSuccessful": [
+      "One exact endpoint/model binding accepted the product broker's strict-streaming JSON-object request.",
+      "One host-authorized local PNG traversed MediaStore, the delivered-reference resolver, ChatModelBroker, the inline-PNG codec, and the real provider transport.",
+      "The fixed image-grounded answer was exact and the disabled-thinking request produced no observed reasoning content.",
+      "The provider request completed within Dolly's own 1800000 millisecond bound after the owner changed the separate gateway timeout."
+    ],
+    "doesNotProve": [
+      "Public Module startup, because the RUNTIME_MODULE_MIGRATION_REQUIRED refusal remains unchanged and this experiment starts zero Module processes.",
+      "Generic visual understanding, other images, other prompts, another endpoint/model revision, tool use, Memory, Scheduler integration, or a multi-turn Agent loop.",
+      "URL, object-storage, crop, JPEG, WebP, provider-upload, public-read, or private signed-URL media support.",
+      "A supported product dependency on the owner's endpoint or credential; this is an optional deployment fixture.",
+      "A sampling-temperature guarantee, because this product request does not send a temperature field."
+    ]
+  },
+  "baselines": [
+    {
+      "id": "probe-specific-strict-streaming",
+      "source": "docs/experiments/multimodal-input-v0-results.md",
+      "result": "The earlier version-one probe completed five of five fixed Aether calls with strict SSE and exact registered outcomes, but it used a probe-specific client and therefore did not test ChatModelBroker or host media authorization."
+    },
+    {
+      "id": "local-product-boundary",
+      "source": "commit 4f5bf67",
+      "result": "The local product slice passed deterministic authorization, codec, budget, deadline, secret, transport, and refusal counterexamples, but did not call a real provider."
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": "H1",
+      "statement": "The single registered invocation returns status=succeeded, finishReason=stop, strict streaming wire evidence, no observed reasoning content, and the exact fixed image answer."
+    }
+  ],
+  "data": {
+    "generator": "scripts/experiments/probes/multimodal-input-v0/common.mjs generateFixtures().agentTaskPng",
+    "seed": 20260809,
+    "image": {
+      "format": "image/png",
+      "width": 640,
+      "height": 360,
+      "expected": {
+        "title": "DOLLY VISUAL CHECK",
+        "visualNonce": "K8M2",
+        "boxes": [
+          { "color": "red", "label": "ALPHA", "number": 7 },
+          { "color": "blue", "label": "BETA", "number": 4 },
+          { "color": "green", "label": "GAMMA", "number": 9 }
+        ],
+        "checksum": 20,
+        "answerToken": 12
+      }
+    },
+    "split": "A one-case canary has no training, development, tuning, or hidden evaluation split. It is deployment compatibility evidence only."
+  },
+  "backend": {
+    "endpoint": "AETHER_BASE_URL loaded privately at execution; only an HTTPS URL is accepted and it is never recorded.",
+    "model": "qwen3.6-27b",
+    "credential": "AETHER_API_KEY loaded privately at execution, leased once, released, and never recorded.",
+    "reasoning": "thinking.type=disabled; enable_thinking is forbidden; a successful run requires reasoning state not-observed.",
+    "output": "response_format.type=json_object",
+    "sampling": "No temperature field is sent; provider default is unverified.",
+    "dependency": "Optional owner fixture only; Dolly must remain functional without it."
+  },
+  "execution": {
+    "cases": 1,
+    "logicalCalls": 1,
+    "maximumAttempts": 1,
+    "retries": "None. A transport, HTTP, SSE, protocol, content, timeout, or exact-answer failure is retained as the only result for this version.",
+    "streaming": {
+      "stream": true,
+      "includeUsage": true,
+      "nonStreamFallbackAllowed": false
+    },
+    "applicationDeadlineMs": 1800000,
+    "gatewayObservation": "The owner reports changing the Nginx timeout from 120 seconds to 24 hours. The experiment neither verifies nor relies on that exact gateway value and retains its shorter application deadline.",
+    "moduleProcesses": 0,
+    "oss": false,
+    "order": ["register fixed image", "authorize delivered reference", "dispatch exactly one strict-streaming request", "persist sanitized result", "independently verify"]
+  },
+  "metrics": {
+    "primary": "exactImageAnswer",
+    "secondary": [
+      "status",
+      "finishReason",
+      "reasoningState",
+      "request wire flags",
+      "terminal usage",
+      "Media lease count",
+      "secret release count"
+    ],
+    "minimumEffectiveDifference": "One of one case must be exact; zero of one does not support the compatibility slice.",
+    "aggregation": "No aggregate rate or confidence interval is reported for one case."
+  },
+  "stoppingRules": [
+    "Stop after the one logical request returns or Dolly's 1800000 millisecond deadline expires.",
+    "Do not retry a failed, cancelled, malformed, truncated, non-exact, or infrastructure result under this version.",
+    "Do not replace strict streaming with a non-stream request.",
+    "Do not start a Module, browser, container, object-storage adapter, or second provider call."
+  ],
+  "decision": {
+    "ifSupported": "Retain inline PNG as a candidate endpoint/model-specific broker placement and proceed to a separately preregistered multi-turn Agent demo. Do not remove the Module startup refusal.",
+    "ifRejected": "Classify the exact failing boundary from sanitized evidence, revise the descriptor, transport, gateway assumptions, or broker design, and preregister a new version before another call.",
+    "prohibitedClaims": [
+      "Do not call this a general vision benchmark or a supported Module capability.",
+      "Do not infer compatibility for text-only deployments or any untested model.",
+      "Do not treat request acceptance without the exact answer as image understanding.",
+      "Do not expose or depend on the owner endpoint, key, OSS, DashScope, or private artifacts."
+    ]
+  },
+  "artifacts": {
+    "root": "artifacts/experiments/probes/model-broker-inline-media-live-v0/<run-id>",
+    "required": ["manifest.json", "result.json", "validation.json"],
+    "privacy": "Artifacts contain hashes, sizes, public fixture answers, usage, wire booleans, and error enums only; they omit endpoint, credential, headers, data URL, image bytes, provider reasoning text, and provider response content."
+  },
+  "independentValidation": {
+    "path": "scripts/experiments/probes/model-broker-inline-media-live-v0/verify.mjs",
+    "checks": [
+      "Recompute preregistration and implementation hashes.",
+      "Require the exact answer, stop finish reason, strict streaming flags, disabled thinking object, no enable_thinking field, and no observed reasoning.",
+      "Require zero provider access records, zero remaining Media leases, one secret release, and zero Module processes.",
+      "Reject any exact private endpoint or key value found in sanitized artifacts."
+    ]
+  },
+  "implementationFiles": [
+    "scripts/experiments/probes/model-broker-inline-media-live-v0/run.mts",
+    "scripts/experiments/probes/model-broker-inline-media-live-v0/verify.mjs",
+    "scripts/experiments/probes/multimodal-input-v0/common.mjs",
+    "scripts/experiments/probes/multimodal-input-v0/aether-client.mjs",
+    "scripts/experiments/probes/memory-association-task-switch-v0/strict-chat-sse.mjs",
+    "src/adapters/sharp-media-inspector.ts",
+    "src/core/media-capability/delivered-model-media-resolver.ts",
+    "src/core/media-store.ts",
+    "src/core/model-provider-binding.ts",
+    "src/core/model-provider-broker.ts",
+    "src/core/model-provider-chat.ts",
+    "src/core/model-provider-descriptor.ts",
+    "src/core/model-provider-node-http.ts",
+    "src/core/reference-graph.ts"
+  ],
+  "implementationSha256": [
+    { "path": "scripts/experiments/probes/model-broker-inline-media-live-v0/run.mts", "sha256": "500092c2afa97550d858c35caacc0494ab9f2e5399b9aa5260a6e4ad58a78960" },
+    { "path": "scripts/experiments/probes/model-broker-inline-media-live-v0/verify.mjs", "sha256": "6e956fee8d5756733a6dcd088625f0f8fb3df4e3ac3758d09762569f8bbfeba5" },
+    { "path": "scripts/experiments/probes/multimodal-input-v0/common.mjs", "sha256": "54e84c9242f79706d9f158a8103a70c2901cab3b6f9be6436e0ebb5b0b04d2b8" },
+    { "path": "scripts/experiments/probes/multimodal-input-v0/aether-client.mjs", "sha256": "6b32b7ca4d20cfa6d1939a25829e191548d7d9424b1df677c98f0592ab9f7240" },
+    { "path": "scripts/experiments/probes/memory-association-task-switch-v0/strict-chat-sse.mjs", "sha256": "d67ef50efac2fa7a32daaa4dc8b57c790afccbe6ef2123bc974af47f14d2999b" },
+    { "path": "src/adapters/sharp-media-inspector.ts", "sha256": "93dd62d129b14de0a44ec91751fb35a9d1ea2c62bd3ca6b986ec48e49b58f857" },
+    { "path": "src/core/media-capability/delivered-model-media-resolver.ts", "sha256": "951095831a3e9ed20d55d6c2eadfcdc57be5fbb795fd91c1f6da57f4861ab4d4" },
+    { "path": "src/core/media-store.ts", "sha256": "8db15c86b626da3c79ef179088e829752faa49d45133a9faa1583beaf4cb844f" },
+    { "path": "src/core/model-provider-binding.ts", "sha256": "39d1173636c216e5f3f2cd822838d8a1a8a834de2545596401c887b961a1261c" },
+    { "path": "src/core/model-provider-broker.ts", "sha256": "e0df0b226c306b4bcd0a67fd8a2e08a167d929bd878635beed3c98f1b505e83d" },
+    { "path": "src/core/model-provider-chat.ts", "sha256": "258a7cb4866990eebb538be85d88524bc2ec7352312f7f424d663fc881076bb3" },
+    { "path": "src/core/model-provider-descriptor.ts", "sha256": "ec454233701a1b2f8fe5fb7b6d7c3d24cfef2014ec2a8f2f332c3221b79577c1" },
+    { "path": "src/core/model-provider-node-http.ts", "sha256": "6c2c7e988289fa796a7cbb3dc999358979b272acd0a4fba1dff964a58432f30a" },
+    { "path": "src/core/reference-graph.ts", "sha256": "2cb2785d8de1f4cfc7a81d559e86efb9a6f862e3ec99b2488a42a95206108da8" }
+  ]
+}
