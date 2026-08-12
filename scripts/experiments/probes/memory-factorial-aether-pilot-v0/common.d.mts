@@ -1,0 +1,24 @@
+export const EXPERIMENT_ID: string;
+export const EXPERIMENT_VERSION: number;
+export const ALGORITHM_VERSION: string;
+export const SEEDS: readonly number[];
+export const CELL_IDS: readonly string[];
+export const CELL_FACTORS: Readonly<Record<string, Readonly<{ association: string; checkpoint: string }>>>;
+
+export function sha256(bytes: string | Uint8Array): string;
+export function stableJson(value: unknown): string;
+export function fisherYates<T>(values: readonly T[], seed: number): T[];
+export function makeScenario(seed: number): any;
+export function datasetRow(scenario: any): any;
+export function evidencePacket(scenario: any, association: string): any[];
+export function extractCheckpoint(packet: any[]): any;
+export function parseStrictObject(content: unknown): Record<string, unknown>;
+export function validateCheckpoint(value: any, packet: any[]): any;
+export function checkpointMessages(packet: any[]): any[];
+export function evidenceForCell(scenario: any, cellId: string, checkpoints: Record<string, any>): any[];
+export function agentMessages(scenario: any, evidence: any[]): any[];
+export function validateAgentOutput(value: any): any;
+export function scoreCheckpoint(checkpoint: any, scenario: any): any;
+export function scoreAgent(output: any, scenario: any, evidence: any[]): any;
+export function analyzeCases(rows: any[], checkpointRows: any[], rawRows: any[]): any;
+export function executionPlan(): { checkpointCalls: any[]; agentCalls: any[] };

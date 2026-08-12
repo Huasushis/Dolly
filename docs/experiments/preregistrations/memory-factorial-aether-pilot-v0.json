@@ -1,0 +1,321 @@
+{
+  "$schema": "./memory-factorial-aether-pilot-v0-schema.json",
+  "schemaVersion": "dolly-experiment-preregistration/v1",
+  "experimentId": "memory-factorial-aether-pilot-v0",
+  "experimentVersion": 1,
+  "title": "Aether pilot separating repeated position-aware association from task checkpoints",
+  "status": "frozen-before-first-run",
+  "scope": "exploratory-component",
+  "protocol": {
+    "path": "docs/experiments/preregistrations/memory-factorial-aether-pilot-v0-protocol.md",
+    "sha256": "07eeafeee9bd965b0c58219742303d26cdf612022e9b9909c2f5e280bed96c8d"
+  },
+  "authorityReferences": [
+    ".qoder/specs/dolly_new.txt",
+    "docs/research/memory-association-task-switch-v0.md",
+    "docs/experiments/preregistrations/memory-factorial-v0.json",
+    "docs/research/memory-factorial-v0-design.md"
+  ],
+  "definitions": {
+    "association": "A deterministic expansion from content-retrieved records through term pairs observed near one another in at least two distinct historical episodes; this is association evidence, not causal inference.",
+    "task checkpoint": "A bounded source-cited object containing task identity, completed step, canonical action, required arguments, constraints, status, and source record identifiers.",
+    "learning": "Construction of association statistics or a task checkpoint from records available before the resume cue; model weights are not changed.",
+    "grounded resume": "The Agent returns the exact structured task, action, arguments, and constraint while citing the required eligible source records and no ineligible record."
+  },
+  "question": "On eight unseen positive task-resume scenarios, what are the separate and interacting effects of repeated position-aware association and checkpoint representation (none, deterministic extractive, or Aether-generated) on grounded task resumption, and is the extractive checkpoint no worse than the generated checkpoint by more than one case?",
+  "hypotheses": {
+    "primary": [
+      {
+        "id": "h1-checkpoint-main-effect",
+        "statement": "Averaged over association levels, checkpoint conditions improve grounded resume by at least 0.125 absolute over no-checkpoint conditions.",
+        "outcomeMeasure": "checkpoint_main_effect"
+      },
+      {
+        "id": "h2-association-main-effect",
+        "statement": "Averaged over checkpoint levels, association-on improves grounded resume by at least 0.125 absolute over association-off.",
+        "outcomeMeasure": "association_main_effect"
+      },
+      {
+        "id": "h3-composition-interaction",
+        "statement": "The mean association effect with a checkpoint exceeds the association effect without a checkpoint by at least 0.125 absolute.",
+        "outcomeMeasure": "checkpoint_association_interaction"
+      },
+      {
+        "id": "h4-extractive-noninferiority",
+        "statement": "The extractive checkpoint marginal grounded-resume rate is no more than 0.125 below the generated checkpoint marginal rate.",
+        "outcomeMeasure": "extractive_minus_generated"
+      }
+    ],
+    "guardrails": [
+      {
+        "id": "g1-source-grounding",
+        "statement": "Every cited source identifier exists in the same scenario and every exact answer field is supported by its cited eligible records.",
+        "outcomeMeasure": "invalid_citation_rate"
+      },
+      {
+        "id": "g2-no-unrelated-use",
+        "statement": "No successful answer cites an ineligible distractor record.",
+        "outcomeMeasure": "unrelated_record_use"
+      },
+      {
+        "id": "g3-stream-integrity",
+        "statement": "Every successful Aether response is a complete strict SSE stream with one terminal usage event and one DONE marker; there is no non-stream fallback.",
+        "outcomeMeasure": "strict_stream_coverage"
+      },
+      {
+        "id": "g4-product-boundary",
+        "statement": "The experiment never launches a Dolly Module and does not alter or bypass RUNTIME_MODULE_MIGRATION_REQUIRED.",
+        "outcomeMeasure": "product_runtime_used"
+      }
+    ]
+  },
+  "decision": {
+    "currentProductState": "Memory v11 is a complete strict-stream two-seed pilot. It favors a source-cited task checkpoint but confounds retrieval with canonical representation; no factorial attribution or supported automatic task switching exists.",
+    "changesIfSupported": [
+      "Carry only the supported factor or simplest non-inferior checkpoint into a later negative-cue and multi-task-family confirmation.",
+      "If extractive is non-inferior, prefer it over generated checkpoint construction for the next reversible product candidate.",
+      "Keep raw records, association edges, and checkpoints separately versioned and deletable."
+    ],
+    "changesIfRejected": [
+      "Do not add the rejected association or checkpoint factor because it sounds cognitively plausible.",
+      "Retain raw content retrieval and redesign the failed factor under a new preregistration."
+    ],
+    "prohibitedClaims": [
+      "This positive-only owner-endpoint pilot cannot support automatic task resumption, negative-cue safety, general Memory, public-model reproducibility, or product integration.",
+      "A nonempty reasoning_content only proves reasoning was returned for that call; it does not prove answer quality.",
+      "Association scores are not causal relations."
+    ]
+  },
+  "conditions": {
+    "baselines": [
+      {
+        "id": "content-none",
+        "description": "Top-four normalized content retrieval records, with no learned checkpoint.",
+        "frozenParameters": { "association": "off", "checkpoint": "none" }
+      }
+    ],
+    "treatments": [
+      { "id": "association-none", "description": "Position-aware repeated association evidence with no checkpoint.", "frozenParameters": { "association": "on", "checkpoint": "none" } },
+      { "id": "content-extractive", "description": "Content evidence represented by a deterministic extractive checkpoint.", "frozenParameters": { "association": "off", "checkpoint": "extractive" } },
+      { "id": "association-extractive", "description": "Association evidence plus a deterministic extractive checkpoint.", "frozenParameters": { "association": "on", "checkpoint": "extractive" } },
+      { "id": "content-generated", "description": "Content evidence represented by an Aether-generated checkpoint.", "frozenParameters": { "association": "off", "checkpoint": "generated" } },
+      { "id": "association-generated", "description": "Association evidence plus an Aether-generated checkpoint.", "frozenParameters": { "association": "on", "checkpoint": "generated" } }
+    ]
+  },
+  "data": {
+    "generatorOrDataset": {
+      "id": "memory-association-task-switch-v0-positive-generator",
+      "version": "v3-seeds-401-through-408",
+      "contentDefinition": "Reuse the frozen deterministic v11 positive task-switch generator with eight previously unqueried evaluation seeds 401-408. Each scenario has two historical episodes, a current checkpoint, an unrelated completed interrupting task, eligible constraints, and ineligible distractors. Ground truth and record eligibility are generated before retrieval or any model call."
+    },
+    "training": { "name": "training-unused", "seeds": [101, 102], "caseFactors": ["No tuning; reserved only to satisfy explicit split identity."] },
+    "development": { "name": "development-unused", "seeds": [201, 202], "caseFactors": ["No tuning or candidate selection; reserved only to satisfy explicit split identity."] },
+    "evaluation": { "name": "evaluation", "seeds": [401, 402, 403, 404, 405, 406, 407, 408], "caseFactors": ["Eight unseen positive task-resume scenarios", "Six association-by-checkpoint factorial cells", "One decoder repetition"] },
+    "splitIsolation": "The eight evaluation seeds were not used by Memory v11; prompts, retrieval rules, checkpoint schemas, scores, thresholds, and call budgets are frozen before their outputs are observed.",
+    "tuningUsesTrainingAndDevelopmentOnly": true
+  },
+  "backend": {
+    "allowedKinds": ["live"],
+    "requiredKind": "live",
+    "silentFallbackAllowed": false,
+    "credentialsRequired": true,
+    "networkRequired": true
+  },
+  "randomness": {
+    "generator": "xorshift32",
+    "generatorVersion": "memory-factorial-aether-pilot/order-v1",
+    "streamSeparation": "Scenario values are fixed by the inherited generator seed. Generated-checkpoint order and Agent case order use separately derived deterministic streams and do not consume one another.",
+    "executionOrder": "Complete and persist all sixteen generated checkpoints first, then Fisher-Yates shuffle all forty-eight Agent cases with a separately frozen seed.",
+    "repetitionsPerCase": 1
+  },
+  "metrics": {
+    "primary": {
+      "name": "grounded_resume_success",
+      "unit": "binary per Agent case",
+      "aggregation": "Macro mean over eight scenario seeds, reported for every factorial cell before marginal effects.",
+      "direction": "maximize",
+      "population": "All forty-eight Aether Agent cases."
+    },
+    "secondary": [
+      { "name": "field_accuracy", "unit": "proportion", "aggregation": "Exact accuracy separately for task, action, arguments, constraint, and decision by condition.", "direction": "maximize", "population": "All forty-eight Agent cases." },
+      { "name": "checkpoint_field_accuracy", "unit": "proportion", "aggregation": "Exact field and citation support by checkpoint type and association level.", "direction": "maximize", "population": "All extractive and generated checkpoints." },
+      { "name": "checkpoint_main_effect", "unit": "absolute paired proportion", "aggregation": "Checkpoint conditions minus no-checkpoint conditions, averaged over association levels and paired by scenario.", "direction": "maximize", "population": "All factorial Agent cases." },
+      { "name": "association_main_effect", "unit": "absolute paired proportion", "aggregation": "Association-on minus association-off, averaged over checkpoint levels and paired by scenario.", "direction": "maximize", "population": "All factorial Agent cases." },
+      { "name": "checkpoint_association_interaction", "unit": "difference in differences", "aggregation": "Mean association effect for extractive and generated checkpoint cells minus the association effect for no-checkpoint cells.", "direction": "maximize", "population": "All factorial Agent cases." },
+      { "name": "extractive_minus_generated", "unit": "absolute paired proportion", "aggregation": "Extractive checkpoint marginal grounded success minus generated checkpoint marginal grounded success.", "direction": "maximize", "population": "All checkpoint Agent cases." },
+      { "name": "reasoning_present", "unit": "binary per call", "aggregation": "Rate and counts separately for checkpoint and Agent roles.", "direction": "maximize", "population": "All successful model calls." },
+      { "name": "evidence_bytes", "unit": "UTF-8 bytes", "aggregation": "Median, maximum, and per-condition values.", "direction": "minimize", "population": "All Agent evidence packets." }
+    ],
+    "guardrails": [
+      { "name": "invalid_citation_rate", "unit": "proportion", "aggregation": "Total invalid citations divided by total citations, plus exact count.", "direction": "zero", "population": "All checkpoints and Agent outputs." },
+      { "name": "unrelated_record_use", "unit": "binary per case", "aggregation": "Macro mean and exact case identifiers.", "direction": "zero", "population": "All successful Agent cases." },
+      { "name": "malformed_response_rate", "unit": "proportion", "aggregation": "Malformed terminal HTTP 200 outputs divided by logical calls, by role.", "direction": "minimize", "population": "All logical model calls." },
+      { "name": "active_context_leakage", "unit": "record count", "aggregation": "Maximum original-task record count in active context before evidence attachment.", "direction": "zero", "population": "All forty-eight Agent cases." },
+      { "name": "strict_stream_coverage", "unit": "proportion", "aggregation": "Successful strict SSE calls with one usage event and one DONE marker divided by successful calls.", "direction": "maximize", "population": "All successful model calls." },
+      { "name": "product_runtime_used", "unit": "boolean", "aggregation": "Must remain false for the entire experimental run.", "direction": "zero", "population": "The complete experiment run." }
+    ],
+    "minimumEffect": {
+      "metric": "grounded_resume_success",
+      "magnitude": 0.125,
+      "scale": "absolute",
+      "confidenceLevel": 0.95,
+      "intervalMethod": "exact eight-pair outcomes and paired bootstrap reported descriptively; no interval can promote this pilot",
+      "comparison": "Each factorial marginal effect is paired by the same scenario seed."
+    }
+  },
+  "execution": {
+    "factorialDesign": "Cross association off/on with checkpoint none/extractive/generated for six Agent cells on each of eight scenarios; generated checkpoints are constructed once per scenario and association level.",
+    "casePlan": [
+      { "id": "generated-checkpoints", "phase": "evaluation", "maximumCount": 16, "requiredWhen": "Always before any dependent generated-checkpoint Agent case.", "formula": "8 scenarios * 2 association levels" },
+      { "id": "factorial-agent", "phase": "evaluation", "maximumCount": 48, "requiredWhen": "Always after the generated checkpoint inventory is frozen.", "formula": "8 scenarios * 6 factorial cells" }
+    ],
+    "plannedMaximumCases": 64,
+    "maxCases": 64,
+    "maxEventsPerCase": 20000,
+    "maxRawRecordsPerCase": 32,
+    "maxVirtualTimeMsPerCase": 1,
+    "maxWallClockMs": 14400000,
+    "failurePolicy": "Persist every attempt before parsing. HTTP 200 content or protocol failures are terminal scored failures and are never retried. Any missing planned case, source mismatch, secret leak, checksum error, or independent-validation failure makes the run inconclusive.",
+    "retryPolicy": "At most four attempts per logical call, only for timeout, connection failure before response headers, HTTP 408/425/429, or 5xx. Every attempt is retained; no non-stream fallback is allowed."
+  },
+  "stoppingRules": {
+    "plannedCompletion": "Stop after exactly 64 logical model calls, 48 Agent case rows, all artifacts, independent validation, and mutation checks are complete.",
+    "earlyEfficacyStopAllowed": false,
+    "abortConditions": [
+      "The logical-call count would exceed 64 or request attempts would exceed 256.",
+      "Wall clock would exceed four hours or an individual request would exceed 900000 ms.",
+      "A request would leave the configured Aether origin, use non-stream mode, use enable_thinking, or omit terminal usage.",
+      "The dataset, source, protocol, or preregistration hash differs from its pre-run value."
+    ]
+  },
+  "decisionRules": {
+    "classificationOrder": "First classify any integrity, coverage, source, stream, secret, or independent-validation failure as inconclusive. Then enforce guardrails. Only then report each factorial effect independently; do not require one factor to validate another.",
+    "supported": [
+      "A factor is pilot-supported only when its paired mean effect is at least 0.125, all eight paired directions are reported, malformed response rate is at most 0.05, and every source and unrelated-record guardrail passes.",
+      "Extractive is pilot-noninferior when extractiveMinusGenerated is at least -0.125 and its unsupported-field rate is no higher than generated."
+    ],
+    "rejected": [
+      "A complete valid factor misses its minimum effect or violates a source/response guardrail.",
+      "Composition is rejected when its interaction is below 0.125 even if one main effect passes."
+    ],
+    "inconclusive": [
+      "Any planned model call or Agent case is missing, a retry is not authorized, strict SSE validation fails without a complete scored response, or independent validation fails.",
+      "Endpoint credentials or the frozen qwen3.6-27b capability are unavailable."
+    ]
+  },
+  "artifacts": {
+    "rootPattern": "artifacts/experiments/probes/memory-factorial-aether-pilot-v0/runs/{runId}",
+    "requiredFiles": [
+      "preregistration.json",
+      "dataset.jsonl",
+      "checkpoints.jsonl",
+      "cases.jsonl",
+      "model-raw.jsonl",
+      "analysis.json",
+      "run-manifest.json",
+      "validation.json",
+      "sha256sums.txt"
+    ],
+    "runManifestFields": [
+      "experimentId",
+      "experimentVersion",
+      "runId",
+      "protocolSha256",
+      "preregistrationSha256",
+      "sourceCommit",
+      "dirtyWorktree",
+      "configuration",
+      "dataset",
+      "modelEndpointCapabilityProfile",
+      "modelIdentifier",
+      "backend",
+      "seeds",
+      "executionOrder",
+      "resourceBudgets",
+      "perCaseAccounting",
+      "rawOutputs",
+      "validatorResults",
+      "aggregateMetrics",
+      "startedAt",
+      "finishedAt",
+      "failure",
+      "nodeVersion",
+      "platform"
+    ]
+  },
+  "independentValidation": {
+    "analyzerPath": "scripts/experiments/probes/memory-factorial-aether-pilot-v0/verify.mjs",
+    "readsOnlyArtifacts": false,
+    "importsTreatmentImplementation": false,
+    "requiredChecks": [
+      "Verify exact dataset, checkpoint, factorial cell, logical-call, attempt, and source coverage.",
+      "Recompute every field score, citation guardrail, marginal effect, interaction, and classification from artifacts.",
+      "Verify strict SSE evidence, retry eligibility, backend separation, file hashes, and absence of configured secret or endpoint values."
+    ],
+    "mutationTests": [
+      "Alter one Agent action field and require metrics or classification to change.",
+      "Inject one ineligible citation and require guardrail failure.",
+      "Remove one factorial case and require coverage failure.",
+      "Change one successful request to stream=false and require stream-contract failure.",
+      "Alter one required artifact byte and require checksum failure."
+    ]
+  },
+  "safetyBoundary": {
+    "productRuntimeUsed": false,
+    "moduleLaunchAllowed": false,
+    "networkAccessAllowed": true,
+    "privateDataAllowed": false,
+    "paidServicesAllowed": true,
+    "knownP0PathReachable": false,
+    "moduleStartupRefusalMustRemain": true
+  },
+  "domainDesign": {
+    "scenarioSeeds": [401, 402, 403, 404, 405, 406, 407, 408],
+    "factorialCells": [
+      "content-none",
+      "association-none",
+      "content-extractive",
+      "association-extractive",
+      "content-generated",
+      "association-generated"
+    ],
+    "retrieval": {
+      "associationOff": "normalized-content top four from the frozen v11 implementation",
+      "associationOn": "normalized-content plus position-aware term-pair recurrence with maximum distance 2, at least 2 distinct episodes, top four"
+    },
+    "checkpoint": {
+      "fields": ["taskId", "status", "completedStep", "action", "actionArguments", "constraints", "sourceRecordIds"],
+      "extractive": "Deterministic regex extraction from only the condition evidence; missing unsupported fields are null.",
+      "generated": "qwen3.6-27b constructs the same closed object from only the condition evidence and must cite source IDs; unsupported values must be null."
+    },
+    "liveEndpointProfile": {
+      "model": "qwen3.6-27b",
+      "checkpointRequest": {
+        "thinking": { "type": "enabled" },
+        "temperature": 0,
+        "max_tokens": 5200,
+        "timeout_ms": 900000,
+        "stream": true,
+        "stream_options": { "include_usage": true }
+      },
+      "agentRequest": {
+        "thinking": { "type": "disabled" },
+        "temperature": 0,
+        "max_tokens": 1000,
+        "timeout_ms": 900000,
+        "stream": true,
+        "stream_options": { "include_usage": true }
+      },
+      "retryPolicy": {
+        "maxAttemptsPerLogicalCall": 4,
+        "retryDelayMs": 2000,
+        "maxLogicalCalls": 64,
+        "maxRequestAttempts": 256
+      },
+      "forbiddenRequestField": "enable_thinking",
+      "nonStreamFallbackAllowed": false
+    },
+    "implementationStatus": "Runner, strict SSE parser integration, scoring, independent verifier, mutation runner, schema, and local mechanism tests exist; no Aether call for this version has run.",
+    "scientificEvidence": false
+  }
+}
