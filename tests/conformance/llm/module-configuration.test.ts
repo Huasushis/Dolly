@@ -178,6 +178,23 @@ describe("LLM Module configuration", () => {
     expect(JSON.stringify(configuration)).not.toMatch(/api[_-]?key|base[_-]?url|credential|https?:\/\//iu);
   });
 
+  it("rejects every non-streaming LLM Module configuration at the schema boundary", () => {
+    const selected = snapshot("qwen3.6-27b", 8192, 2048);
+    const valid = createDefaultLlmModuleConfiguration(selected, "model.owner-primary");
+
+    for (const streamingPolicy of ["optional", "forbidden"]) {
+      expect(() => validateLlmModuleConfiguration({
+        ...cloneJson(valid as unknown as JsonValue) as Record<string, JsonValue>,
+        model: {
+          ...cloneJson(valid.model as unknown as JsonValue) as Record<string, JsonValue>,
+          streamingPolicy,
+        },
+      } as JsonValue)).toThrowError(expect.objectContaining({
+        code: "LLM_CONFIGURATION_INVALID",
+      }));
+    }
+  });
+
   it("rejects provider fields, malformed tool budgets, and an impossible smaller context", () => {
     const selected = snapshot("deepseek-v4-flash", 1024, 512);
     const valid = createDefaultLlmModuleConfiguration(selected, "model.owner-primary");

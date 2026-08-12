@@ -475,12 +475,13 @@ tool-argument, usage, and terminal channels. The LLM extension may forward
 bounded provisional user-interface events through an authorized progress facility, but
 those events are not Blocks or committed conversation state.
 
-When the Host-issued model operation description marks streaming `required`,
-every chat request MUST set `stream` to true. Missing or false values fail at
-the capability boundary before the broker runs. `optional` permits an explicit
-per-request choice and `forbidden` rejects true; the Extension MUST NOT infer
-these modes from a model name. A stream-required Agent cannot silently retry a
-failed stream as a non-stream request.
+Every `dolly.llm.module-configuration/1` record requires streaming, and every
+chat request made by that Module MUST set `stream` to true. Missing or false
+values fail at the capability boundary before the broker runs. The lower-level
+model-operation capability retains explicit optional and forbidden modes for
+provider components that are not the LLM Module, but the version 1 LLM Module
+cannot select them. It also cannot silently retry a failed stream as a
+non-stream request.
 
 The current installed-Module candidate composes only this required mode. The
 validated Module selects an operator-owned policy identifier; the Host maps it
@@ -538,11 +539,12 @@ local/fake operation handles for tests.
 
 The current product-before-startup configuration slice is
 `dolly.llm.module-configuration/1`. Its JSON Schema is closed and contains an
-exact model descriptor reference, reasoning and streaming policies, context
+exact model descriptor reference, reasoning policy, required streaming, context
 and turn limits, accepted payload schemas, tool policy identifiers and finite
 tool limits, retention rules, and output/error rules. Endpoint routes,
 credentials, provider-specific request fields, and host paths are deliberately
-absent. The default is tool-free and requires streaming.
+absent. Every valid version 1 record is tool-free by default and requires
+streaming; this is not merely a default that configuration may disable.
 
 Before provider I/O, the configuration resolver binds the configuration to the
 exact active descriptor snapshot. The installed candidate additionally binds

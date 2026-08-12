@@ -35,7 +35,8 @@ const DESCRIPTOR_NAME_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$";
 const DIGEST_PATTERN = "^sha256:[0-9a-f]{64}$";
 
 export type LlmReasoningPolicy = "default" | "prefer" | "require" | "disable";
-export type LlmStreamingPolicy = "required" | "optional" | "forbidden";
+/** Every chat generation made by the version 1 LLM Module uses strict streaming. */
+export type LlmStreamingPolicy = "required";
 export type LlmOutputContract = "text" | "json-object";
 
 export interface LlmToolLimits {
@@ -155,7 +156,7 @@ export const LLM_MODULE_CONFIGURATION_SCHEMA: JsonValue = deepFreeze({
         permissionPolicyId: { type: "string", pattern: IDENTIFIER_PATTERN },
         descriptor: descriptorReferenceSchema,
         reasoningPolicy: { enum: ["default", "prefer", "require", "disable"] },
-        streamingPolicy: { enum: ["required", "optional", "forbidden"] },
+        streamingPolicy: { const: "required" },
         outputContract: { enum: ["text", "json-object"] },
       },
     },
