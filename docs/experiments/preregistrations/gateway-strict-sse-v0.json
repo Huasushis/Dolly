@@ -1,16 +1,16 @@
 {
   "schemaVersion": "dolly.gateway-sse-canary-preregistration/1",
   "experimentId": "gateway-strict-sse-v0",
-  "experimentVersion": 0,
+  "experimentVersion": 1,
   "status": "frozen-before-first-run",
-  "question": "Does the owner's configured Aether qwen3.6-27b deployment complete one bounded strict streaming request after the gateway timeout change, without a non-stream fallback or retry?",
+  "question": "Does the owner's configured Aether qwen3.6-27b deployment complete one bounded strict streaming request after the gateway timeout change, and can a versioned increase in completion budget preserve final JSON content, without a non-stream fallback or retry?",
   "baseline": {
-    "kind": "historical-only",
-    "description": "Earlier Memory runs recorded timeout or cancellation under the old 120-second gateway, but those runs used different prompts and budgets and are not a paired performance baseline. No new non-stream request is permitted."
+    "kind": "frozen-v0-run",
+    "description": "gateway-strict-sse-v0 run-20260812a used the same model, prompt, seed, thinking policy, and strict stream but max_tokens=5200. Its raw stream ended cleanly after 143.194 seconds with one usage event and DONE, while the model exhausted its budget with finish_reason=length and empty final content. No new non-stream request is permitted."
   },
   "data": {
     "promptId": "gateway-canary-arithmetic-v0",
-    "system": "You are a bounded transport canary. Reason carefully, then return exactly one JSON object and no Markdown.",
+    "system": "You are a bounded transport canary. Keep internal analysis concise and reserve at least 256 output tokens for the final answer. Reason carefully, then return exactly one JSON object and no Markdown.",
     "user": "Find the least nonnegative integer x satisfying x mod 97 = 11, x mod 101 = 37, and x mod 103 = 73. Verify all three congruences internally. Return exactly {\"canary\":\"DOLLY_STREAM_OK\",\"x\":integer}.",
     "expectedCanary": "DOLLY_STREAM_OK"
   },
@@ -29,7 +29,7 @@
     "streamOptions": { "includeUsage": true },
     "thinking": { "type": "enabled" },
     "temperature": 0,
-    "maximumOutputTokens": 5200,
+    "maximumOutputTokens": 6400,
     "maximumResponseBytes": 2097152,
     "maximumBufferedEventBytes": 262144,
     "maximumReconstructedOutputBytes": 524288,
@@ -46,9 +46,10 @@
     "whether total duration crossed the historical 120-second boundary"
   ],
   "minimumEffectiveDifference": {
-    "transportGate": "One HTTP 200 text/event-stream response with one stable provider identity, one finish reason, exactly one usage event, one DONE marker, no bytes after DONE, and no fallback or retry.",
+    "transportGate": "One HTTP 200 text/event-stream response with one stable provider identity, one finish reason, exactly one usage event, one DONE marker, no bytes after DONE, and no fallback or retry. This gate is independent of final content validity.",
     "reasoningGate": "Non-empty reasoning_content is required to claim reasoning occurred.",
-    "gatewayBoundaryClaim": "Only a valid stream whose terminal completion occurs after 120 seconds can directly falsify the old 120-second end-to-end cancellation boundary; a faster valid stream proves current strict streaming connectivity only."
+    "contentGate": "Final content must be one strict JSON object containing canary=DOLLY_STREAM_OK and finish_reason must not be length.",
+    "gatewayBoundaryClaim": "A transportGate pass whose last raw network chunk occurs after 120 seconds directly falsifies the old 120-second end-to-end cancellation boundary even if the independent contentGate fails; a faster transport pass proves current strict streaming connectivity only."
   },
   "stoppingRules": [
     "Make exactly one chat-completion request and never retry it.",
@@ -57,8 +58,9 @@
     "Do not change the prompt, model, thinking mode, token budget, or parser after observing the result."
   ],
   "decisionRules": [
-    "Pass strict-stream-connectivity only when the complete transportGate and reasoningGate hold and the final JSON object contains the expected canary marker.",
-    "Record gateway-over-120s evidence only when strict-stream-connectivity passes and terminal duration is greater than 120000 milliseconds.",
+    "Pass strict-stream-transport only when the complete transportGate and reasoningGate hold.",
+    "Pass model-content separately only when contentGate holds; do not rewrite a transport pass as an overall semantic pass.",
+    "Record gateway-over-120s evidence when strict-stream-transport passes and the last raw network chunk arrives after 120000 milliseconds, regardless of the separate content result.",
     "A faster pass is not evidence about the former 120-second boundary.",
     "Any missing credential, HTTP failure, timeout, invalid SSE, missing usage, missing DONE, empty reasoning, invalid JSON, secret leak, or artifact-write failure is inconclusive or failed as explicitly recorded; there is no fallback."
   ],

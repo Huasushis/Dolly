@@ -121,6 +121,7 @@ const preregistration = JSON.parse(preregistrationBytes.toString("utf8"));
 if (
   preregistration.schemaVersion !== "dolly.gateway-sse-canary-preregistration/1" ||
   preregistration.experimentId !== "gateway-strict-sse-v0" ||
+  preregistration.experimentVersion !== 1 ||
   preregistration.status !== "frozen-before-first-run" ||
   preregistration.request.stream !== true ||
   preregistration.request.nonStreamFallbackAllowed !== false ||
@@ -174,7 +175,7 @@ const startedNs = process.hrtime.bigint();
 let response;
 let rawResult = { bytes: Buffer.alloc(0), timings: [] };
 let decoded;
-let failure = null;
+let transportFailure = null;
 let headersElapsedMs = null;
 try {
   response = await fetch(requestUrl, {
@@ -212,7 +213,7 @@ try {
   if (parserSettled.status === "rejected") throw parserSettled.reason;
   decoded = parserSettled.value;
 } catch (error) {
-  failure = {
+  transportFailure = {
     code: error?.name === "AbortError" ? "CLIENT_DEADLINE_EXCEEDED" : "STREAM_CANARY_FAILED",
     name: error instanceof Error ? error.name : "unknown",
     message: error instanceof Error ? error.message : String(error),
@@ -232,27 +233,45 @@ const timingsBytes = Buffer.from(
 artifacts.push(writeExclusive(join(artifactRoot, "chunk-timings.jsonl"), timingsBytes));
 
 let parsedContent = null;
+let contentFailure = null;
 if (decoded !== undefined) {
   const content = decoded.body.choices[0].message.content;
   try {
     parsedContent = JSON.parse(content);
   } catch {
-    failure ??= { code: "MODEL_CONTENT_INVALID", name: "SyntaxError", message: "Model content is not strict JSON" };
+    contentFailure = {
+      code: "MODEL_CONTENT_INVALID",
+      name: "SyntaxError",
+      message: "Model content is not strict JSON",
+    };
   }
 }
 const reasoningContent = decoded?.body.choices[0].message.reasoning_content ?? "";
-const strictStreamConnectivity =
-  failure === null &&
+const strictStreamTransport =
+  transportFailure === null &&
   response?.status === 200 &&
   decoded?.evidence.doneCount === 1 &&
   decoded?.evidence.usageEventCount === 1 &&
-  reasoningContent.trim().length > 0 &&
+  reasoningContent.trim().length > 0;
+const modelContentComplete =
+  strictStreamTransport &&
+  contentFailure === null &&
+  decoded?.body.choices[0].finish_reason !== "length" &&
   parsedContent?.canary === preregistration.data.expectedCanary;
+if (strictStreamTransport && !modelContentComplete && contentFailure === null) {
+  contentFailure = {
+    code: decoded?.body.choices[0].finish_reason === "length"
+      ? "MODEL_OUTPUT_BUDGET_EXHAUSTED"
+      : "MODEL_CONTENT_CONTRACT_FAILED",
+    name: "ModelContentError",
+    message: "Model final content did not satisfy the frozen canary contract",
+  };
+}
 const result = {
   schemaVersion: "dolly.gateway-sse-canary-result/1",
   experimentId: preregistration.experimentId,
   runId: options.runId,
-  status: strictStreamConnectivity ? "passed" : "failed",
+  status: strictStreamTransport && modelContentComplete ? "passed" : "failed",
   startedAt,
   finishedAt,
   request: {
@@ -285,10 +304,13 @@ const result = {
     usage: decoded?.body.usage ?? null,
     canaryMarkerMatched: parsedContent?.canary === preregistration.data.expectedCanary,
   },
-  strictStreamConnectivity,
+  strictStreamTransport,
+  modelContentComplete,
   gatewayOver120SecondsProven:
-    strictStreamConnectivity && terminalElapsedMs > 120_000,
-  failure,
+    strictStreamTransport && (rawResult.timings.at(-1)?.elapsedMs ?? 0) > 120_000,
+  transportFailure,
+  contentFailure,
+  failure: transportFailure ?? contentFailure,
 };
 const resultBytes = Buffer.from(`${canonical(result)}\n`, "utf8");
 assertNoSecret(resultBytes, [apiKey, configuredBase], "result artifact");
@@ -313,4 +335,4 @@ const manifestBytes = Buffer.from(`${canonical(manifest)}\n`, "utf8");
 assertNoSecret(manifestBytes, [apiKey, configuredBase], "manifest artifact");
 writeExclusive(join(artifactRoot, "manifest.json"), manifestBytes);
 process.stdout.write(`${canonical({ artifactRoot, status: result.status, terminalElapsedMs })}\n`);
-if (!strictStreamConnectivity) process.exitCode = 1;
+if (!strictStreamTransport || !modelContentComplete) process.exitCode = 1;

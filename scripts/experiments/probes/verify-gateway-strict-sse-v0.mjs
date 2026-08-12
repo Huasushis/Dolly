@@ -138,16 +138,43 @@ if (decoded !== undefined) {
 }
 
 const lastChunkElapsedMs = timings.at(-1)?.elapsedMs ?? null;
-if (!(lastChunkElapsedMs > 120_000) || result.response.crossedHistorical120SecondBoundary !== true) {
-  failures.push("raw chunk timings do not cross the historical 120-second boundary");
+const rawCrossed120Seconds = lastChunkElapsedMs > 120_000;
+if (result.response.crossedHistorical120SecondBoundary !== rawCrossed120Seconds) {
+  failures.push("raw chunk timing boundary differs from result.json");
 }
-if (
-  result.status !== "failed" ||
-  result.failure?.code !== "MODEL_CONTENT_INVALID" ||
-  result.response.finishReason !== "length" ||
-  result.response.contentCharacterCount !== 0 ||
-  result.response.reasoningObserved !== true
-) failures.push("frozen failed semantic classification was not preserved");
+if (preregistration.experimentVersion === 0) {
+  if (
+    !rawCrossed120Seconds ||
+    result.status !== "failed" ||
+    result.failure?.code !== "MODEL_CONTENT_INVALID" ||
+    result.response.finishReason !== "length" ||
+    result.response.contentCharacterCount !== 0 ||
+    result.response.reasoningObserved !== true
+  ) failures.push("frozen v0 failed semantic classification was not preserved");
+} else if (preregistration.experimentVersion === 1) {
+  let contentObject = null;
+  try {
+    contentObject = JSON.parse(decoded?.body.choices[0].message.content ?? "");
+  } catch {
+    // A malformed final object is a content failure, not a transport failure.
+  }
+  const expectedTransport =
+    decoded?.evidence.doneCount === 1 &&
+    decoded?.evidence.usageEventCount === 1 &&
+    (decoded?.body.choices[0].message.reasoning_content.trim().length ?? 0) > 0;
+  const expectedContent =
+    expectedTransport &&
+    decoded?.body.choices[0].finish_reason !== "length" &&
+    contentObject?.canary === preregistration.data.expectedCanary;
+  if (
+    result.strictStreamTransport !== expectedTransport ||
+    result.modelContentComplete !== expectedContent ||
+    result.gatewayOver120SecondsProven !== (expectedTransport && rawCrossed120Seconds) ||
+    result.status !== (expectedTransport && expectedContent ? "passed" : "failed")
+  ) failures.push("v1 transport/content classification differs from raw artifacts");
+} else {
+  failures.push("unsupported preregistration experimentVersion");
+}
 
 const environment = loadEnv(readFileSync(join(repositoryRoot, ".env")));
 for (const [label, value] of [
@@ -176,9 +203,9 @@ const validation = {
   failures,
   strictTransportComplete:
     decoded?.evidence.doneCount === 1 && decoded?.evidence.usageEventCount === 1,
-  rawTerminalCrossed120Seconds: lastChunkElapsedMs > 120_000,
+  rawTerminalCrossed120Seconds: rawCrossed120Seconds,
   frozenOverallClassification: result.status,
-  semanticFailurePreserved: result.failure?.code === "MODEL_CONTENT_INVALID",
+  semanticFailurePreserved: result.status === "failed" && result.failure !== null,
   sourceFilesRead: [
     "manifest.json",
     "preregistration.json",
