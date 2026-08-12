@@ -13,6 +13,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readlinkSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -423,6 +424,18 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     const configurationSchema = {
       $schema: JSON_SCHEMA_2020_12,
       type: "object",
+      properties: {
+        confinementProbe: { const: true },
+        coreProcessId: { type: "integer", minimum: 1 },
+        coreStatePath: { type: "string", minLength: 1 },
+        userManagerPath: { type: "string", minLength: 1 },
+      },
+      required: [
+        "confinementProbe",
+        "coreProcessId",
+        "coreStatePath",
+        "userManagerPath",
+      ],
       additionalProperties: false,
     } as const;
     writeFileSync(join(packageSource, "dolly-extension.json"), JSON.stringify({
@@ -460,7 +473,12 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       moduleKind: "fixture",
       configVersion: 1,
       schema: configurationSchema,
-      configuration: {},
+      configuration: {
+        confinementProbe: true,
+        coreProcessId: process.pid,
+        coreStatePath: statePath,
+        userManagerPath: process.env.XDG_RUNTIME_DIR ?? "/run/user/1001",
+      },
     });
     const instanceId = "22222222-2222-4222-8222-222222222222";
     const defaults = createDefaultDollyInstanceConfig(instanceId);
@@ -604,7 +622,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       state: "running",
       packageDigest: installed.packageDigest,
       configurationReference: instanceConfiguration.modules[0]?.configurationReference,
-      declaredExternalEffects: "core-capabilities-only",
+      declaredExternalEffects: "unrestricted",
       serviceInvocationId: inspectedBinding.binding.serviceInvocationId,
       bootId: inspectedBinding.binding.bootId,
     });
@@ -630,7 +648,32 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       startedAt: Date.now(),
       signal: new AbortController().signal,
     });
-    expect(result).toEqual({ ok: true, input });
+    expect(result).toMatchObject({
+      ok: true,
+      input,
+      confinement: {
+        processId: 2,
+        userId: 0,
+        currentDirectory: "/run/dolly/extension",
+        entrypointPath: "/run/dolly/extension/extension-process-fixture.mjs",
+        cgroup: "0::/",
+        networkRouteRows: 0,
+        environmentKeys: ["PWD"],
+        cgroupWrite: { outcome: "denied" },
+        coreSignal: { outcome: "denied", code: "ESRCH" },
+        coreProcessRead: { outcome: "denied", code: "ENOENT" },
+        coreStateRead: { outcome: "denied", code: "ENOENT" },
+        userManagerVisible: false,
+      },
+    });
+    const confinement = (result as unknown as {
+      confinement: {
+        cgroupNamespace: string;
+        networkNamespace: string;
+      };
+    }).confinement;
+    expect(confinement.cgroupNamespace).not.toBe(readlinkSync("/proc/self/ns/cgroup"));
+    expect(confinement.networkNamespace).not.toBe(readlinkSync("/proc/self/ns/net"));
     expect(store.releaseDeliveryClaim(claim)).toBe("released");
     expect(store.getModuleSubmissionRecord(claim.runId)).toBeUndefined();
 

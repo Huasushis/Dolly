@@ -1,6 +1,7 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const mode = process.argv[2] ?? "normal";
 const protocolVersion = mode === "old-protocol" ? "2.0" : "3.0";
@@ -77,6 +78,51 @@ async function invokeCapability(
 function capabilityErrorCodeOf(response) {
   return response.result?.value ?? {
     capabilityErrorCode: response.error?.data?.errorCode ?? "unknown",
+  };
+}
+
+function deniedOperation(operation) {
+  try {
+    operation();
+    return { outcome: "allowed" };
+  } catch (error) {
+    return {
+      outcome: "denied",
+      code: typeof error === "object" && error !== null && "code" in error
+        ? String(error.code)
+        : "unknown",
+    };
+  }
+}
+
+function confinementReport() {
+  const corePid = initialized.config.coreProcessId;
+  return {
+    processId: process.pid,
+    userId: process.getuid?.() ?? null,
+    currentDirectory: process.cwd(),
+    entrypointPath: fileURLToPath(import.meta.url),
+    cgroup: readFileSync("/proc/self/cgroup", "utf8").trim(),
+    cgroupNamespace: readlinkSync("/proc/self/ns/cgroup"),
+    networkNamespace: readlinkSync("/proc/self/ns/net"),
+    networkRouteRows: readFileSync("/proc/net/route", "utf8")
+      .trim()
+      .split("\n")
+      .slice(1)
+      .filter((line) => line.trim().length > 0)
+      .length,
+    environmentKeys: Object.keys(process.env).sort(),
+    cgroupWrite: deniedOperation(() =>
+      writeFileSync("/sys/fs/cgroup/cgroup.procs", String(process.pid), "utf8")
+    ),
+    coreSignal: deniedOperation(() => process.kill(corePid, 0)),
+    coreProcessRead: deniedOperation(() =>
+      readFileSync(`/proc/${corePid}/status`, "utf8")
+    ),
+    coreStateRead: deniedOperation(() =>
+      readFileSync(initialized.config.coreStatePath, "utf8")
+    ),
+    userManagerVisible: existsSync(initialized.config.userManagerPath),
   };
 }
 
@@ -509,7 +555,9 @@ async function handleHostRequest(message) {
       moduleId: params.moduleId,
       moduleGenerationId: params.moduleGenerationId,
       runId: mode === "stale-result" ? "stale-run" : params.runId,
-      result: { ok: true, input: params.input },
+      result: initialized.config.confinementProbe === true
+        ? { ok: true, input: params.input, confinement: confinementReport() }
+        : { ok: true, input: params.input },
     });
     return;
   }
