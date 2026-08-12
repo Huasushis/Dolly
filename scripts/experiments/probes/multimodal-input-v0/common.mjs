@@ -120,7 +120,7 @@ export async function generateFixtures() {
       <text x="320" y="307" text-anchor="middle" font-family="DejaVu Sans" font-size="19" font-weight="bold" fill="#111827">Answer token = number in BLUE box × 3</text>
     </svg>
   `, "utf8");
-  const agentTaskPng = await sharp(agentTaskSvg, { density: 96 })
+  const agentTaskPng = await sharp(agentTaskSvg, { density: 72 })
     .png({ compressionLevel: 9, adaptiveFiltering: false })
     .toBuffer();
   return {

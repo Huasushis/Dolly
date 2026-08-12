@@ -13,7 +13,20 @@ import { fileURLToPath } from "node:url";
 import sharp from "sharp";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
-const artifactRoot = join(repositoryRoot, "artifacts/experiments/probes/multimodal-input-v0");
+const runIdIndex = process.argv.indexOf("--run-id");
+const runId = runIdIndex < 0 ? undefined : process.argv[runIdIndex + 1];
+if (
+  process.argv.length !== 4 ||
+  runIdIndex !== 2 ||
+  !/^v1-[a-z0-9][a-z0-9-]{0,63}$/u.test(runId ?? "")
+) {
+  throw new Error("usage: verify.mjs --run-id v1-<unique-suffix>");
+}
+const artifactRoot = join(
+  repositoryRoot,
+  "artifacts/experiments/probes/multimodal-input-v0/runs",
+  runId,
+);
 const preregistrationPath = join(
   repositoryRoot,
   "docs/experiments/preregistrations/multimodal-input-v0.json",
@@ -121,6 +134,7 @@ const rawText = readFileSync(join(artifactRoot, "raw-cases.jsonl"), "utf8");
 const rows = rawText.trimEnd().split("\n").filter(Boolean).map(JSON.parse);
 
 check(manifest.preregistration?.digest === sha256(preregistrationBytes), "preregistration digest differs");
+check(manifest.runId === runId, "manifest run ID differs");
 check(manifest.preregistration?.status === "preregistered-before-execution", "preregistration was not frozen before execution");
 for (const source of manifest.sourceConsumers ?? []) {
   const path = join(repositoryRoot, source.path ?? "");
@@ -164,6 +178,7 @@ for (const row of rows) {
   const definition = planned.get(key);
   check(definition !== undefined, `unplanned case row: ${key}`);
   check(!seen.has(key), `duplicate case row: ${key}`);
+  check(row.runId === runId, `case run ID differs: ${key}`);
   seen.add(key);
   if (definition !== undefined) {
     check(row.expectedCode === definition.expectedCode, `expected code drift: ${key}`);
@@ -252,6 +267,7 @@ if (existsSync(envPath)) {
 const validation = {
   schemaVersion: "dolly.multimodal-input-probe-validation/1",
   experimentId: preregistration.experimentId,
+  runId,
   valid: failures.length === 0,
   failures,
   verifiedCases: rows.length,

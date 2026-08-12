@@ -1,8 +1,9 @@
 {
   "schemaVersion": "dolly.experiment-preregistration/1",
   "experimentId": "multimodal-input-v0",
+  "experimentVersion": 1,
   "status": "preregistered-before-execution",
-  "registeredAt": "2026-08-09T03:08:16.303Z",
+  "registeredAt": "2026-08-12T15:49:00.000Z",
   "sourceRevision": "implementation and consumer SHA-256 values recorded in the run manifest",
   "question": "Which local image delivery contracts are sufficiently bounded and falsifiable to guide Dolly's endpoint/model-specific multimodal adapter design without relying on owner infrastructure?",
   "scope": {
@@ -46,6 +47,10 @@
   ],
   "baselines": [
     {
+      "id": "invalid-version-0-run",
+      "description": "The first execution produced 34 runner passes and 5/5 exact Aether outcomes, but independent validation rejected it because the preregistered 640x360 SVG was rasterized at density 96 into 853x480 pixels. Version 1 changes only the rasterizer density to 72 and adds immutable run IDs; the invalid artifact and failed verification are retained at the legacy artifact root. No version-0 result counts as registered evidence."
+    },
+    {
       "id": "text-only-control",
       "description": "A text-only request to the text-only mock profile succeeds, proving the local endpoint is live without implying media support."
     },
@@ -55,7 +60,7 @@
     }
   ],
   "fixtures": {
-    "generator": "sharp 0.35.x from deterministic raw RGB pixels",
+    "generator": "sharp 0.35.x from deterministic raw RGB pixels; the 640x360 Agent SVG is rasterized at density 72 so SVG CSS pixels equal output pixels",
     "seed": 20260809,
     "images": [
       {
@@ -235,7 +240,8 @@
   },
   "stoppingRules": [
     "Run the fixed matrix once; deterministic success cases have three repetitions and counterexamples have one.",
-    "Do not add, remove, or reinterpret cases after seeing results. Any change requires a new preregistration version and fresh artifact directory.",
+    "Do not add, remove, or reinterpret cases after seeing results. Any change requires a new preregistration version and fresh immutable run ID.",
+    "Retain the invalid version-0 artifact and its failed independent verification; never overwrite or promote it.",
     "Abort and mark infrastructure-inconclusive if loopback binding, sharp decoding, or artifact writes fail for reasons outside a registered case.",
     "Do not download a model or use more than the already installed dependencies for v0.",
     "Make exactly five strict-streaming Aether chat-completion calls: one text-only control, three identical image-task repetitions, and one follow-up. Do not retry, use a non-stream fallback, or change the prompt after observing a failure. Both RUN_LIVE_INTEGRATION=1 and RUN_PAID_INTEGRATION=1 are required before reading credentials or sending the first call."
@@ -251,14 +257,14 @@
     "Do not make Dolly depend on Aether, its key, or this model. Treat the result as optional deployment evidence and retain a text-only-capable path."
   ],
   "artifacts": [
-    "artifacts/experiments/probes/multimodal-input-v0/manifest.json",
-    "artifacts/experiments/probes/multimodal-input-v0/aether-model-probe.json",
-    "artifacts/experiments/probes/multimodal-input-v0/raw-cases.jsonl",
-    "artifacts/experiments/probes/multimodal-input-v0/requests/*.json",
-    "artifacts/experiments/probes/multimodal-input-v0/fixtures/*",
-    "artifacts/experiments/probes/multimodal-input-v0/summary.json",
-    "artifacts/experiments/probes/multimodal-input-v0/server-events.json",
-    "artifacts/experiments/probes/multimodal-input-v0/sha256sums.json",
-    "artifacts/experiments/probes/multimodal-input-v0/verification.json"
+    "artifacts/experiments/probes/multimodal-input-v0/runs/<run-id>/manifest.json",
+    "artifacts/experiments/probes/multimodal-input-v0/runs/<run-id>/aether-model-probe.json",
+    "artifacts/experiments/probes/multimodal-input-v0/runs/<run-id>/raw-cases.jsonl",
+    "artifacts/experiments/probes/multimodal-input-v0/runs/<run-id>/requests/*.json",
+    "artifacts/experiments/probes/multimodal-input-v0/runs/<run-id>/fixtures/*",
+    "artifacts/experiments/probes/multimodal-input-v0/runs/<run-id>/summary.json",
+    "artifacts/experiments/probes/multimodal-input-v0/runs/<run-id>/server-events.json",
+    "artifacts/experiments/probes/multimodal-input-v0/runs/<run-id>/sha256sums.json",
+    "artifacts/experiments/probes/multimodal-input-v0/runs/<run-id>/verification.json"
   ]
 }

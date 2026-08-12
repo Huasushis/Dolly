@@ -6,7 +6,6 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
-  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -48,13 +47,24 @@ import {
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "../../../..");
+const runIdIndex = process.argv.indexOf("--run-id");
+const runId = runIdIndex < 0 ? undefined : process.argv[runIdIndex + 1];
+if (
+  process.argv.length !== 4 ||
+  runIdIndex !== 2 ||
+  !/^v1-[a-z0-9][a-z0-9-]{0,63}$/u.test(runId ?? "")
+) {
+  throw new Error("usage: run.mjs --run-id v1-<unique-suffix>");
+}
 const artifactRoot = resolve(
   repositoryRoot,
-  "artifacts/experiments/probes/multimodal-input-v0",
+  "artifacts/experiments/probes/multimodal-input-v0/runs",
+  runId,
 );
 const expectedArtifactRoot = join(
   repositoryRoot,
-  "artifacts/experiments/probes/multimodal-input-v0",
+  "artifacts/experiments/probes/multimodal-input-v0/runs",
+  runId,
 );
 const preregistrationPath = join(
   repositoryRoot,
@@ -65,12 +75,7 @@ if (artifactRoot !== expectedArtifactRoot) {
   throw new Error("Resolved artifact root does not match the probe-owned path");
 }
 if (existsSync(artifactRoot)) {
-  if (!process.argv.includes("--replace-own-output")) {
-    throw new Error(
-      `Artifact directory already exists: ${artifactRoot}; pass --replace-own-output to replace only this probe output`,
-    );
-  }
-  rmSync(artifactRoot, { recursive: true, force: false });
+  throw new Error(`Artifact directory already exists: ${artifactRoot}`);
 }
 
 mkdirSync(join(artifactRoot, "fixtures"), { recursive: true, mode: 0o700 });
@@ -111,6 +116,7 @@ async function runCase(definition, repetition, operation) {
   rawCases.push({
     schemaVersion: "dolly.multimodal-input-probe-case/1",
     experimentId: EXPERIMENT_ID,
+    runId,
     caseId: definition.id,
     family: definition.family,
     repetition,
@@ -253,6 +259,7 @@ const sourceConsumers = [
 writeJson(join(artifactRoot, "manifest.json"), {
   schemaVersion: "dolly.multimodal-input-probe-manifest/1",
   experimentId: EXPERIMENT_ID,
+  runId,
   preregistration: {
     path: relative(repositoryRoot, preregistrationPath),
     digest: sha256(preregistrationBytes),
@@ -798,6 +805,7 @@ const familyCounts = Object.fromEntries(
 writeJson(join(artifactRoot, "summary.json"), {
   schemaVersion: "dolly.multimodal-input-probe-summary/1",
   experimentId: EXPERIMENT_ID,
+  runId,
   registeredCases: preregistration.cases.length,
   executions: rawCases.length,
   passed,
@@ -840,6 +848,6 @@ writeJson(join(artifactRoot, "sha256sums.json"), {
 });
 
 process.stdout.write(
-  `${canonicalJson({ experimentId: EXPERIMENT_ID, executions: rawCases.length, passed, failed, artifactRoot })}\n`,
+  `${canonicalJson({ experimentId: EXPERIMENT_ID, runId, executions: rawCases.length, passed, failed, artifactRoot })}\n`,
 );
 if (failed > 0) process.exitCode = 1;

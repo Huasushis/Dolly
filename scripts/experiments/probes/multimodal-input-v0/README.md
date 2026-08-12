@@ -9,8 +9,10 @@ From the repository root:
 
 ```sh
 RUN_LIVE_INTEGRATION=1 RUN_PAID_INTEGRATION=1 \
-  node --env-file=.env scripts/experiments/probes/multimodal-input-v0/run.mjs
-node scripts/experiments/probes/multimodal-input-v0/verify.mjs
+  node --env-file=.env scripts/experiments/probes/multimodal-input-v0/run.mjs \
+  --run-id v1-<unique-suffix>
+node scripts/experiments/probes/multimodal-input-v0/verify.mjs \
+  --run-id v1-<same-suffix>
 ```
 
 Every generation request uses strict SSE with `stream=true`, terminal usage,
@@ -18,7 +20,6 @@ Every generation request uses strict SSE with `stream=true`, terminal usage,
 bounded JSON metadata and is not a generation request. Neither the configured
 origin nor the credential is written to artifacts.
 
-The runner refuses to overwrite an existing artifact directory. Pass
-`--replace-own-output` only to replace the exact
-`artifacts/experiments/probes/multimodal-input-v0` directory created by this
-probe.
+The runner refuses to overwrite an existing run directory. Each run is stored
+under `artifacts/experiments/probes/multimodal-input-v0/runs/<run-id>`; failed
+or interrupted runs remain immutable evidence.
