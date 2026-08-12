@@ -30,6 +30,7 @@ fixture.
 | registry-v6-a | Inconclusive | Three cases completed and both treatments executed `storage_list -> storage_get -> answer`; the last baseline call returned HTTP 504. One treatment cited tool operation names instead of the retrieved source key, exposing a real grounding-contract weakness even before the infrastructure stop. |
 | registry-v6-b | Infrastructure-inconclusive | The only allowed replacement stopped on HTTP 504 in the first treatment action call. No third run was started. |
 | registry-v7 | Candidate-supported | After the owner raised the former Nginx 120-second gateway timeout to 24 hours, the fresh preregistered run completed 4/4 cases and 10/10 strict SSE calls. Both treatments recovered the value from `deployment-note`, both baselines withheld it, and the independent verifier rejected 22/22 mutations. Dolly retained its own 180-second call deadline. |
+| registry-v8 | Candidate-supported | Fresh identities on current Core completed 4/4 cases and 10/10 strict SSE calls after the bounded duplicate-read correction. Both treatments executed the exact registered read sequence and recovered the grounded value; both baselines withheld it; independent validation rejected 22/22 mutations. |
 
 No model-content failure was retried. Each version used at most its one
 separately identified whole-run replacement allowed by the frozen
@@ -213,4 +214,30 @@ object key order does not evade the comparison. One consecutive duplicate may
 be corrected within a bounded model-action loop, while a second consecutive
 duplicate fails. Non-read calls are never automatically reused. Real-child
 counterexamples cover both correction and bounded failure, but fresh live seeds
-are still required before this mechanism has model-level evidence.
+were still required before this mechanism had model-level evidence.
+
+## Registry-v8 current-Core streamed result
+
+Run `registry-v8-20260812a`, frozen at source commit `83db703`, supplied that
+fresh evidence without changing any earlier classification:
+
+- 4/4 Scheduler cases and 10/10 provider calls completed. Both treatments ran
+  `storage_list -> storage_get -> answer`, returned the string `EMBER-7421`, and
+  cited `deployment-note`; both baselines withheld the hidden value.
+- Every provider request used strict SSE with terminal usage and no non-stream
+  fallback. The retained responses contain 858 events and 180,476 UTF-8 bytes.
+  The two required-reasoning plans contain 3,865 and 4,703 characters of
+  observed reasoning; disabled-reasoning calls contain none.
+- Provider usage totals 8,151 prompt tokens, 2,604 completion tokens, and
+  10,755 tokens. Aggregate recorded call latency is 293,911 ms and run wall
+  time is about 295 seconds. Currency cost remains unmeasured.
+- All four exact-Run effect journals are terminal. Independent verification
+  accepted the frozen artifact set and rejected all 22 registered mutations,
+  including disabling streaming and removing `[DONE]`.
+
+The worktree was dirty only in unrelated, retained project work; the runner
+and all twenty registered production source files matched their frozen hashes.
+This is current-model evidence for the bounded read-only Agent path. It still
+does not prove effectful tool recovery, native function calling, Linux
+control-group ownership for each case, cross-provider generality, or product
+Module startup.
