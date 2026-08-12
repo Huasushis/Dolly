@@ -251,7 +251,7 @@ interface UnresolvedRun {
   readonly kind: "commit" | "nack" | "executor-termination";
   readonly output?: ReactiveModuleResult;
   readonly failure: ReactiveModuleFailure;
-  /** Startup proved that this exact result journal existed before runtime construction. */
+  /** Core has observed a durable result journal for this exact Module job. */
   readonly knownPrepared?: boolean;
   readonly classification?: FailureClassification;
   readonly reason: Extract<
@@ -265,7 +265,7 @@ interface DeferredOutputCommit {
   readonly output: ReactiveModuleResult;
   readonly failure: ReactiveModuleFailure;
   readonly blockedConsumerIds: readonly string[];
-  /** Distinguishes a startup-verified result from a result first observed in this process. */
+  /** Core has observed a durable result journal for this exact Module job. */
   readonly knownPrepared: boolean;
 }
 
@@ -1081,6 +1081,7 @@ export class ReactiveModuleRuntime {
         kind: "commit",
         output: outcome.output,
         failure: { stage: "result-rejected-before-prepare", code: "COMMIT_CONFIRMATION_MISSING" },
+        knownPrepared: record !== undefined,
         reason: "commit-outcome-unknown",
       });
     }
@@ -1184,6 +1185,7 @@ export class ReactiveModuleRuntime {
           kind: "commit",
           output,
           failure: noRecordFailure,
+          knownPrepared: true,
           reason: "commit-outcome-unknown",
         });
       }
@@ -1191,6 +1193,7 @@ export class ReactiveModuleRuntime {
         kind: "commit",
         output,
         failure: noRecordFailure,
+        knownPrepared: true,
         reason: "commit-result-conflict",
       });
     } catch (error) {

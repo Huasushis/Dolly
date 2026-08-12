@@ -1360,12 +1360,14 @@ stopped process record to match the installed package digest, configuration
 reference, Module generation, instance, and declared effect class before it
 constructs the new runtime.
 
-Once startup has verified a prepared result, a later missing or unreadable
-journal entry is a consistency failure requiring recovery; it is never evidence
-that the Module produced no result and never permits negative acknowledgement
-or execution. Only the coordinator's own capacity decision can create the
-output-wait state. An exception with the same public error shape from a test or
-diagnostic hook is an unknown commit outcome, not capacity evidence.
+Once startup or the live runtime has observed a durable result-journal record
+for a Module job, a later missing or unreadable journal entry is a consistency
+failure requiring recovery. A temporarily stale Claim or submission view does
+not erase that observation. The missing read is never evidence that the Module
+produced no result and never permits negative acknowledgement or execution.
+Only the coordinator's own capacity decision can create the output-wait state.
+An exception with the same public error shape from a test or diagnostic hook is
+an unknown commit outcome, not capacity evidence.
 After the commit succeeds, a later real input may lazily start the new Module
 generation. A supported product startup must pass every reported deferred
 record to this path and must not report the instance READY while silently
@@ -2747,6 +2749,9 @@ following cases.
   collecting that record, and injected crashes cover each boundary from a
   `prepared` result journal record through atomic positive acknowledgement and
   submission-record removal to a `committed` journal record;
+- after recovery observes that exact journal record but cannot yet confirm the
+  matching Claim and submission terminal state, a later missing journal read
+  preserves the recovery requirement and issues no negative acknowledgement;
 - a submitted Run whose provider/storage/tool accepts an effect and loses its
   response remains an unknown outcome, with zero negative acknowledgements,
   releases, retries, or replacement effects unless a durable query supplies

@@ -804,38 +804,49 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     await harness.runtime.stop();
   });
 
-  it("does not report a commit while its submission reader still reports the deleted record", async () => {
-    const harness = await startedHarness({
-      reportDeletedSubmissionAsPresent: true,
-      createExecutor: () => ({
-        execute: async () => ({
-          schemaVersion: "dolly.module-result/1",
-          blockProposal: proposal("committed with stale submission reader"),
+  it("retains observed commit proof when later journal reads fail", async () => {
+    for (const successfulRecoveryReads of [0, 1]) {
+      const harness = await startedHarness({
+        reportDeletedSubmissionAsPresent: true,
+        createExecutor: () => ({
+          execute: async () => ({
+            schemaVersion: "dolly.module-result/1",
+            blockProposal: proposal("committed with stale submission reader"),
+          }),
         }),
-      }),
-    });
+      });
 
-    const result = await harness.runtime.tick();
-    expect(result).toMatchObject({
-      status: "recovery-required",
-      reason: "commit-outcome-unknown",
-    });
-    if (result.status !== "recovery-required") {
-      throw new Error("expected commit recovery");
+      const result = await harness.runtime.tick();
+      expect(result).toMatchObject({
+        status: "recovery-required",
+        reason: "commit-outcome-unknown",
+      });
+      if (result.status !== "recovery-required") {
+        throw new Error("expected commit recovery");
+      }
+      expect(harness.repository.get(result.moduleJobId)).toMatchObject({
+        state: "committed",
+      });
+      expect(harness.deliveries.inspectClaim(result).status).toBe("committed");
+      expect(harness.submissionRecords.get(result.runId)).toBeUndefined();
+
+      for (let index = 0; index < successfulRecoveryReads; index += 1) {
+        await expect(harness.runtime.recover()).resolves.toMatchObject({
+          status: "recovery-required",
+          reason: "commit-outcome-unknown",
+        });
+      }
+      vi.spyOn(harness.repository, "get").mockReturnValue(null);
+      await expect(harness.runtime.recover()).resolves.toMatchObject({
+        status: "recovery-required",
+        reason: "commit-outcome-unknown",
+      });
+      expect(harness.negativelyAcknowledgeDeliveryClaim).not.toHaveBeenCalled();
+      expect(harness.releaseDeliveryClaim).not.toHaveBeenCalled();
+      await expect(harness.runtime.stop()).rejects.toMatchObject({
+        code: "RUNTIME_RECOVERY_REQUIRED",
+      });
     }
-    expect(harness.repository.get(result.moduleJobId)).toMatchObject({
-      state: "committed",
-    });
-    expect(harness.deliveries.inspectClaim(result).status).toBe("committed");
-    expect(harness.submissionRecords.get(result.runId)).toBeUndefined();
-
-    await expect(harness.runtime.recover()).resolves.toMatchObject({
-      status: "recovery-required",
-      reason: "commit-outcome-unknown",
-    });
-    await expect(harness.runtime.stop()).rejects.toMatchObject({
-      code: "RUNTIME_RECOVERY_REQUIRED",
-    });
   });
 
   it("does not trust a matching result journal when its own Delivery store still reports an active Claim", async () => {
