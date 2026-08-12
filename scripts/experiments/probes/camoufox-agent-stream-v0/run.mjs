@@ -296,8 +296,14 @@ function agentToolDefinitions() {
         parameters: {
           type: "object",
           properties: {
-            element: { type: "string" },
-            target: { type: "string" },
+            element: {
+              type: "string",
+              description: "Human-readable element description, such as Probe input. Never put a snapshot ref here.",
+            },
+            target: {
+              type: "string",
+              description: "Exact element reference returned by browser_snapshot, such as e9. Never put a human-readable description here.",
+            },
             text: { type: "string" },
           },
           required: ["target", "text"],
@@ -313,8 +319,14 @@ function agentToolDefinitions() {
         parameters: {
           type: "object",
           properties: {
-            element: { type: "string" },
-            target: { type: "string" },
+            element: {
+              type: "string",
+              description: "Human-readable element description, such as Apply. Never put a snapshot ref here.",
+            },
+            target: {
+              type: "string",
+              description: "Exact element reference returned by browser_snapshot, such as e10. Never put a human-readable description here.",
+            },
           },
           required: ["target"],
           additionalProperties: false,
@@ -513,7 +525,7 @@ async function runCase({ caseIndex, caseDirectory, preregistration, requestUrl, 
           "You are a browser Agent operating a synthetic local page through host-selected tools.",
           "Choose every action yourself from the supplied tool results; never invent element references.",
           "Take a PNG screenshot before changing page state and another after the goal is complete.",
-          "Use snapshot references for type and click. Perform Apply, Bottom, and Recover exactly once each.",
+          "For type and click, put the snapshot's exact e<number> reference in target and a human-readable label in element. Perform Apply, Bottom, and Recover exactly once each.",
           "After the exact goal is complete, stop calling tools and briefly report completion.",
           "Keep internal analysis under 300 words per round and preserve output budget for tool calls.",
         ].join(" "),
