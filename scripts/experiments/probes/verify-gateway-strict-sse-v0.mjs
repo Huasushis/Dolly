@@ -191,7 +191,10 @@ if (preregistration.experimentVersion === 0) {
     result.gatewayOver120SecondsProven !== (expectedTransport && rawCrossed120Seconds) ||
     result.status !== (expectedTransport && expectedContent ? "passed" : "failed")
   ) failures.push("v1 transport/content classification differs from raw artifacts");
-} else if (preregistration.experimentVersion === 2) {
+} else if (
+  preregistration.experimentVersion === 2 ||
+  preregistration.experimentVersion === 3
+) {
   let contentObject = null;
   try {
     contentObject = JSON.parse(decoded?.body.choices[0].message.content ?? "");
@@ -212,6 +215,14 @@ if (preregistration.experimentVersion === 0) {
     decoded?.body.choices[0].finish_reason !== "length" &&
     contentObject?.canary === preregistration.data.expectedCanary &&
     semanticAnswerExact;
+  if (
+    preregistration.experimentVersion === 3 &&
+    (
+      result.response.semanticExpectedX !== semanticExpectedX ||
+      result.response.semanticActualX !== semanticActualX ||
+      result.response.semanticAnswerExact !== semanticAnswerExact
+    )
+  ) failures.push("v3 semantic oracle differs from raw artifacts");
   if (
     result.strictStreamTransport !== expectedTransport ||
     result.reasoningPolicySatisfied !== expectedReasoningPolicy ||

@@ -1,12 +1,12 @@
 {
   "schemaVersion": "dolly.gateway-sse-canary-preregistration/1",
   "experimentId": "gateway-strict-sse-v0",
-  "experimentVersion": 2,
+  "experimentVersion": 3,
   "status": "frozen-before-first-run",
-  "question": "Does the owner's configured Aether qwen3.6-27b deployment complete a short structured request with final content when the endpoint-measured thinking policy is disabled for that role, while retaining strict streaming and no fallback or retry?",
+  "question": "Does the owner's configured Aether qwen3.6-27b deployment complete a short structured request with the exact independently computed answer when the endpoint-measured thinking policy is disabled for that role, while retaining strict streaming and no fallback or retry?",
   "baseline": {
     "kind": "frozen-v0-run",
-    "description": "Version 0 and version 1 both used thinking.type=enabled. Their strict streams crossed 120 seconds and ended with usage and DONE, but the model exhausted 5200 and then 6400 tokens with empty final content. Version 1 shows that a budget-only increase is ineffective. Version 2 changes only the role-specific thinking policy and restores a bounded output budget; no new non-stream request is permitted."
+    "description": "Version 0 and version 1 both used thinking.type=enabled. Their strict streams crossed 120 seconds and ended with usage and DONE, but the model exhausted 5200 and then 6400 tokens with empty final content. Version 2 changed only the role-specific thinking policy and completed strict transport after the gateway change, but returned x=10011 instead of the independently computed x=102249; its runner checked only the canary marker and therefore produced a false pass that the independent verifier rejected. Version 3 keeps the request byte-for-byte equivalent and closes the runner's semantic gate; no non-stream request is permitted."
   },
   "data": {
     "promptId": "gateway-canary-arithmetic-v0",
@@ -48,7 +48,7 @@
   "minimumEffectiveDifference": {
     "transportGate": "One HTTP 200 text/event-stream response with one stable provider identity, one finish reason, exactly one usage event, one DONE marker, no bytes after DONE, and no fallback or retry. This gate is independent of final content validity.",
     "reasoningGate": "Because this version explicitly uses thinking.type=disabled, reasoning_content must be empty and this run makes no reasoning claim.",
-    "contentGate": "Final content must be one strict JSON object containing canary=DOLLY_STREAM_OK and finish_reason must not be length.",
+    "contentGate": "Final content must be one strict JSON object containing canary=DOLLY_STREAM_OK and the exact least nonnegative solution independently computed from the three prompt congruences, and finish_reason must not be length.",
     "gatewayBoundaryClaim": "A transportGate pass whose last raw network chunk occurs after 120 seconds directly falsifies the old 120-second end-to-end cancellation boundary even if the independent contentGate fails; a faster transport pass proves current strict streaming connectivity only."
   },
   "stoppingRules": [
@@ -59,7 +59,7 @@
   ],
   "decisionRules": [
     "Pass strict-stream-transport only when the complete transportGate holds.",
-    "Pass the role-specific thinking policy only when reasoningGate holds, and pass model-content separately only when both that policy and contentGate hold.",
+    "Pass the role-specific thinking policy only when reasoningGate holds, and pass model-content separately only when both that policy and the exact semantic contentGate hold.",
     "Record gateway-over-120s evidence when strict-stream-transport passes and the last raw network chunk arrives after 120000 milliseconds, regardless of the separate content result.",
     "A faster pass is not evidence about the former 120-second boundary.",
     "Any missing credential, HTTP failure, timeout, invalid SSE, missing usage, missing DONE, empty reasoning, invalid JSON, secret leak, or artifact-write failure is inconclusive or failed as explicitly recorded; there is no fallback."

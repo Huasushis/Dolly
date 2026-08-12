@@ -70,6 +70,22 @@ function completionUrl(baseValue) {
   return parsed;
 }
 
+function leastCongruenceSolution(prompt) {
+  const congruences = [...prompt.matchAll(/x mod ([0-9]+) = ([0-9]+)/gu)]
+    .map((match) => ({ modulus: Number(match[1]), remainder: Number(match[2]) }));
+  if (congruences.length !== 3) throw new Error("Canary congruences are not closed");
+  const limit = congruences.reduce((product, entry) => product * entry.modulus, 1);
+  if (!Number.isSafeInteger(limit) || limit > 10_000_000) {
+    throw new Error("Canary congruence search bound is invalid");
+  }
+  for (let candidate = 0; candidate < limit; candidate += 1) {
+    if (congruences.every((entry) => candidate % entry.modulus === entry.remainder)) {
+      return candidate;
+    }
+  }
+  throw new Error("Canary congruences have no solution inside their product bound");
+}
+
 function parseArguments(argumentsValue) {
   const index = argumentsValue.indexOf("--run-id");
   const runId = index < 0 ? undefined : argumentsValue[index + 1];
@@ -121,7 +137,7 @@ const preregistration = JSON.parse(preregistrationBytes.toString("utf8"));
 if (
   preregistration.schemaVersion !== "dolly.gateway-sse-canary-preregistration/1" ||
   preregistration.experimentId !== "gateway-strict-sse-v0" ||
-  preregistration.experimentVersion !== 2 ||
+  preregistration.experimentVersion !== 3 ||
   preregistration.status !== "frozen-before-first-run" ||
   preregistration.request.stream !== true ||
   preregistration.request.nonStreamFallbackAllowed !== false ||
@@ -247,6 +263,9 @@ if (decoded !== undefined) {
   }
 }
 const reasoningContent = decoded?.body.choices[0].message.reasoning_content ?? "";
+const semanticExpectedX = leastCongruenceSolution(preregistration.data.user);
+const semanticActualX = parsedContent?.x ?? null;
+const semanticAnswerExact = semanticActualX === semanticExpectedX;
 const strictStreamTransport =
   transportFailure === null &&
   response?.status === 200 &&
@@ -262,7 +281,8 @@ const modelContentComplete =
   reasoningPolicySatisfied &&
   contentFailure === null &&
   decoded?.body.choices[0].finish_reason !== "length" &&
-  parsedContent?.canary === preregistration.data.expectedCanary;
+  parsedContent?.canary === preregistration.data.expectedCanary &&
+  semanticAnswerExact;
 if (strictStreamTransport && !modelContentComplete && contentFailure === null) {
   contentFailure = {
     code: decoded?.body.choices[0].finish_reason === "length"
@@ -310,6 +330,9 @@ const result = {
     reasoningCharacterCount: reasoningContent.length,
     usage: decoded?.body.usage ?? null,
     canaryMarkerMatched: parsedContent?.canary === preregistration.data.expectedCanary,
+    semanticExpectedX,
+    semanticActualX,
+    semanticAnswerExact,
   },
   strictStreamTransport,
   reasoningPolicySatisfied,
