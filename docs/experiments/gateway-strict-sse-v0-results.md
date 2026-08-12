@@ -115,3 +115,41 @@ Version 2 evidence root:
 - runner `result.json`: `4921bb3c7bfa8fabce8abda0086ed1080bd93d1b8c2ca9186fef7d40ccdbe8f5`
 - original false-green `validation.json`: `e76abc216d49453960f6359f6ab9bf2dffd36e81ecd93475792fbae03ad6aff0`
 - strengthened failed `validation-3.json`: `52b47d3ee414c57fc96fb22c5d4de4ab37354100cf5fe7882aed147222041ff7`
+
+## Current gateway confirmation and version 3 semantic gate
+
+After the owner confirmed that the Nginx timeout is now 24 hours, run
+`run-20260812d` made one fresh version-2 request from commit `492ab9a`. The
+strict stream completed in 3.334 seconds with HTTP 200, eight network chunks,
+ten SSE events, one usage event, one `[DONE]`, and no retry or non-stream
+fallback. The model again returned `x=10011`. The unchanged version-2 runner
+again wrote a false `passed` status, while the independent verifier recomputed
+`x=102249` and correctly returned `valid=false`. This run is retained rather
+than relabelled or overwritten.
+
+Version 3 changed no request field. It added the independent congruence solver
+to the runner and required its exact answer in both the runner and verifier.
+Run `run-20260812e` made the one frozen request from commit `96c54ac`. It again
+completed strict transport without cancellation, this time in 3.046 seconds:
+HTTP 200 `text/event-stream`, eight network chunks, ten SSE events, one usage
+event, one `[DONE]`, `finish_reason=stop`, empty `reasoning_content`, and 19
+completion tokens. The model again returned `x=10011`; the corrected runner
+classified `MODEL_CONTENT_CONTRACT_FAILED`, and the independent verifier
+returned `valid=true` with no verification failures while preserving that
+semantic failure.
+
+These two short confirmations do not add evidence about a 120-second boundary;
+the earlier version-0, version-1, and version-2 runs already provide that
+evidence. They do show that the current gateway accepts Dolly's strict-SSE
+request and that a semantic failure is no longer hidden by the canary marker.
+The engineering consequence is unchanged: deterministic arithmetic belongs in
+a registered calculation tool with independent result checking, not in an
+ungrounded formatting-only model call.
+
+Version 3 evidence root:
+`artifacts/experiments/probes/gateway-strict-sse-v0/run-20260812e`
+
+- `response.sse`: `5eda18ed1636aaa24510354f337d040d2058d1e0f7a4b97252b74a1cf82794b4`
+- `chunk-timings.jsonl`: `5c4f397ec42484f27b87c335090a85bb8f510bc61ade44a39d47c1320b54f5e4`
+- correctly failed `result.json`: `5095ef328d39fa8d2ff9db0305e597b84a8b21bcb80778f35fb12aa66a2e7f0e`
+- passing `validation.json`: `0429b7489c05402b37eb9b5605aa939f72710ec5312eb4da01f508458a02a7ea`
