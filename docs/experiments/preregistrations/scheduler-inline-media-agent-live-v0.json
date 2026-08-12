@@ -1,0 +1,198 @@
+{
+  "schemaVersion": "dolly.experiment-preregistration/1",
+  "experimentId": "scheduler-inline-media-agent-live-v0",
+  "experimentVersion": 1,
+  "registeredAt": "2026-08-12T17:50:00.000Z",
+  "sourceRevision": "3ed839611840e4f76ec08e4969fe69a78f5294da",
+  "implementationStatus": "The candidate components exist, but no Scheduler-driven Extension has yet exercised model-operation/v3, host-authorized delivered Media, the production ChatModelBroker, the production Node transport, strict SSE, and atomic Module-result commit in one live run. Public Module startup remains refused.",
+  "question": "Can one Scheduler-claimed Block containing text and one local PNG Media reference drive a real isolated Extension through model-operation/v3 and Dolly's production ChatModelBroker to the owner's Aether qwen3.6-27b deployment using one strict streaming request, return the exact fixed image answer, atomically commit one output Block, close the Claim, Media lease, model-effect journal, secret lease, and child process, while keeping the public Module startup refusal intact?",
+  "hypotheses": {
+    "candidate": "All registered gates pass in one run.",
+    "alternative": "At least one gate fails or cannot be independently reconstructed; the composition remains inconclusive or rejected at that exact boundary."
+  },
+  "baselines": [
+    {
+      "id": "product-broker-inline-image",
+      "evidence": "model-broker-inline-media-live-v0 version 2 obtained the exact answer through ChatModelBroker and NodeModelHttpTransport, but started zero Module processes and did not test Scheduler, model-operation, or atomic result commit."
+    },
+    {
+      "id": "installed-scheduler-agent",
+      "evidence": "The installed Linux integration drives real Extension processes through Scheduler and model-operation, but its model broker is deterministic and text-only; it is not live provider or image evidence."
+    },
+    {
+      "id": "silent-downgrade",
+      "evidence": "A request that drops the image, becomes non-streaming, adds enable_thinking, retries, or reaches the provider outside model-operation/v3 is a failing baseline, not a partial success."
+    }
+  ],
+  "data": {
+    "fixture": "One deterministic locally generated 640x360 PNG with a public exact answer key, plus the fixed IMAGE_TASK_PROMPT in the same immutable dolly.content/1 Block.",
+    "seed": 28082026,
+    "repetitions": 1,
+    "reasonForOneRepetition": "This is a paid vertical integration canary, not an efficacy or reliability estimate. One pass can prove reachability and falsify boundary claims but cannot support generalization.",
+    "privateData": false,
+    "ossUsed": false
+  },
+  "modelAndBackend": {
+    "endpoint": "Owner-configured AETHER_BASE_URL, omitted from every artifact.",
+    "credential": "Owner-configured AETHER_API_KEY, retained only in the parent process and omitted from every artifact and Extension environment.",
+    "model": "qwen3.6-27b",
+    "descriptor": "dolly.model-descriptor/4 with exact inline PNG, json_object, request-controlled thinking-object, and strict SSE strategies.",
+    "thinking": "thinking.type is disabled; enable_thinking is forbidden. Non-empty reasoning_content would contradict this fixture profile and fail the gate.",
+    "stream": true,
+    "includeUsage": true,
+    "nonStreamFallback": false,
+    "providerAttempts": 1,
+    "retry": false,
+    "maximumOutputTokens": 1200,
+    "maximumWallTimeMs": 1800000,
+    "gatewayContext": "The owner reports that the former Nginx 120-second timeout was corrected to 24 hours before this registration. Dolly still enforces its independent 30-minute per-call bound."
+  },
+  "execution": {
+    "order": [
+      "freeze source and preregistration hashes",
+      "register the exact PNG in persistent FileCore Media",
+      "start Scheduler and one isolated Extension process",
+      "append one input Block and let Scheduler create the active Claim",
+      "let model-operation/v3 forward only the delivered Media reference",
+      "let the Host-only resolver re-authorize the same active Claim and copy the PNG",
+      "dispatch one production Node transport strict-SSE request",
+      "atomically commit one Module output and acknowledge the input Claim",
+      "stop the exact recorded child and persist its stopped record",
+      "write sanitized artifacts and run the independent verifier"
+    ],
+    "logicalModelCalls": 1,
+    "maximumProviderAttempts": 1,
+    "moduleProcesses": 1,
+    "parallelism": 1,
+    "publicBootstrap": false,
+    "linuxControlGroupProof": false,
+    "scopeNote": "The live canary uses the candidate Scheduler/Extension-process composition. Separate systemd-container evidence proves the installed Linux cgroup path; this run must not merge those two evidence claims."
+  },
+  "metrics": [
+    "exactImageAnswer",
+    "providerDispatchCount",
+    "strictStreamingWire",
+    "modelOperationCapabilityVersion",
+    "atomicCommittedResultCount",
+    "activeClaimCountAfterCommit",
+    "deadLetterCount",
+    "MediaLeaseCountAfterCompletion",
+    "providerAccessRecordCount",
+    "effectJournalStateAfterReopen",
+    "secretReleaseCount",
+    "childAliveAfterStop",
+    "privateValueLeakCount"
+  ],
+  "minimumEffectiveDifference": "The candidate differs materially from both baselines only if every gate is exact: one and only one strict-SSE provider dispatch, capability version v3, exact fixed image answer, one committed Module result, zero active Claims and dead letters, zero Media leases and provider-access records, terminal effect evidence after reopening, one secret release, no credential in the child, and no live child after stop. There is no partial percentage threshold.",
+  "gates": [
+    "The product request has stream=true, stream_options.include_usage=true, thinking.type=disabled, no enable_thinking, response_format=json_object, and one inline PNG data URL constructed by the Host.",
+    "The Extension sees model-operation/v3 and never sees endpoint, key, local path, URL, Base64 image bytes, access mode, placement strategy, or resolver result.",
+    "The strict SSE decoder receives HTTP 200 text/event-stream, at least one bounded chunk, one terminal completion, and finish_reason=stop.",
+    "The public answer equals the deterministic image answer key exactly and reasoning state is not-observed.",
+    "FileCore records one committed result, zero pending input, one pending sink output, zero active Claims, and zero dead letters.",
+    "Media has zero provider-access records and zero remaining leases after the broker returns.",
+    "The model effect is terminal both before and after reopening the file journal; the secret lease releases exactly once.",
+    "The exact recorded child is alive before orderly stop, absent after stop, and its process record is stopped.",
+    "The artifacts contain neither the private endpoint nor credential, and runtime-bootstrap still contains RUNTIME_MODULE_MIGRATION_REQUIRED."
+  ],
+  "stoppingRules": {
+    "beforeNetwork": "Abort before dispatch on any source hash mismatch, missing opt-in, invalid endpoint, missing credential, Media inspection failure, capability construction failure, or Extension startup failure.",
+    "duringRun": "Make no retry. Any provider, SSE, model, capability, Scheduler, result-commit, Media, effect, or process-lifecycle failure stops the run and retains its exact scratch directory when termination is not confirmed.",
+    "efficacy": "Do not stop based on a partial answer. Evaluate only the one complete terminal call.",
+    "budget": "Stop at one logical call, one provider attempt, or the 1800000 millisecond model wall-time bound. The case observer allows an additional 30000 milliseconds for cancellation and terminal propagation."
+  },
+  "decisionRules": {
+    "ifPassed": "Keep model-operation/v3 plus the Host-only delivered-reference resolver as the next reversible general-Agent image input slice. This is component integration evidence, not public Module support, broad model compatibility, or a vision benchmark.",
+    "ifRejected": "Classify the first exact failing boundary, change that boundary only, increment the preregistration version, and repeat no call under this frozen version.",
+    "prohibitedClaims": [
+      "Do not claim Linux cgroup ownership from this run; that has separate systemd-container evidence.",
+      "Do not claim URL, OSS, crop, JPEG, provider upload, native tool calling, automatic retry, or public Module activation.",
+      "Do not generalize from one deterministic image or from the owner's private deployment.",
+      "Do not treat HTTP acceptance, model text without the exact answer, or a committed Block without closed effects and leases as success."
+    ]
+  },
+  "artifacts": {
+    "root": "artifacts/experiments/probes/scheduler-inline-media-agent-live-v0/<run-id>",
+    "required": [
+      "preregistration.json",
+      "manifest.json",
+      "result.json",
+      "effect-intents.json",
+      "validation.json"
+    ],
+    "privacy": "Artifacts contain public fixture output, hashes, sizes, status enums, usage-independent wire booleans, and journal metadata. They omit endpoint, credential, authorization header, image bytes, data URL, raw provider stream, and provider reasoning text."
+  },
+  "independentValidation": {
+    "path": "scripts/experiments/probes/scheduler-inline-media-agent-live-v0/verify.mjs",
+    "readsOnlyArtifactsAndFrozenSource": true,
+    "checks": [
+      "Recompute preregistration, implementation, result, and effect-journal hashes.",
+      "Require exact answer, capability v3, strict SSE, disabled thinking, no reasoning, and exactly one provider dispatch.",
+      "Require committed Scheduler, Claim, Media, effect, secret, and process terminal states.",
+      "Read runtime-bootstrap source and require the Module startup refusal marker.",
+      "Reject either exact private endpoint or key value in any recorded artifact."
+    ]
+  },
+  "implementationFiles": [
+    "scripts/experiments/probes/scheduler-inline-media-agent-live-v0/run.mts",
+    "scripts/experiments/probes/scheduler-inline-media-agent-live-v0/extension.mjs",
+    "scripts/experiments/probes/scheduler-inline-media-agent-live-v0/verify.mjs",
+    "scripts/experiments/probes/general-agent-live-v0/wait-for-case.mts",
+    "scripts/experiments/probes/multimodal-input-v0/common.mjs",
+    "scripts/experiments/probes/multimodal-input-v0/aether-client.mjs",
+    "src/adapters/extension-effect-run-lifecycle.ts",
+    "src/adapters/extension-process-module-executor.ts",
+    "src/adapters/sharp-media-inspector.ts",
+    "src/core/capabilities/effect-intent-journal.ts",
+    "src/core/capabilities/file-effect-intent-store.ts",
+    "src/core/extension-process-host.ts",
+    "src/core/file-core-state-store.ts",
+    "src/core/file-media-byte-store.ts",
+    "src/core/file-module-result-commit-repository.ts",
+    "src/core/media-capability/delivered-model-media-resolver.ts",
+    "src/core/media-store.ts",
+    "src/core/model-provider-binding.ts",
+    "src/core/model-provider-broker.ts",
+    "src/core/model-provider-chat.ts",
+    "src/core/model-provider-descriptor.ts",
+    "src/core/model-provider-node-http.ts",
+    "src/core/module-result-commit-factory.ts",
+    "src/core/module-result-commit.ts",
+    "src/core/module-scheduler.ts",
+    "src/core/provider-capabilities/model-operation-capability.ts",
+    "src/core/reactive-module-host.ts",
+    "src/core/reactive-module-runtime.ts",
+    "src/core/runtime-bootstrap.ts"
+  ],
+  "implementationSha256": [
+    { "path": "scripts/experiments/probes/scheduler-inline-media-agent-live-v0/run.mts", "sha256": "edd14ec530b6f099cd58575d45259ae0f7129e6ad4305bc8c691ae09a94491e3" },
+    { "path": "scripts/experiments/probes/scheduler-inline-media-agent-live-v0/extension.mjs", "sha256": "5756db78581f64986a0d53fdad874d6f2c9f13e05b206884fc8a5a629f1ce1dc" },
+    { "path": "scripts/experiments/probes/scheduler-inline-media-agent-live-v0/verify.mjs", "sha256": "52fed41983208b2f49f588e578c306c862ba296983bf1bb5b50590ceceffa588" },
+    { "path": "scripts/experiments/probes/general-agent-live-v0/wait-for-case.mts", "sha256": "48238a274ff2fdb361eefd3d65aabb6896623f1911ce394f43ae52f21a84d379" },
+    { "path": "scripts/experiments/probes/multimodal-input-v0/common.mjs", "sha256": "54e84c9242f79706d9f158a8103a70c2901cab3b6f9be6436e0ebb5b0b04d2b8" },
+    { "path": "scripts/experiments/probes/multimodal-input-v0/aether-client.mjs", "sha256": "6b32b7ca4d20cfa6d1939a25829e191548d7d9424b1df677c98f0592ab9f7240" },
+    { "path": "src/adapters/extension-effect-run-lifecycle.ts", "sha256": "6fba34150a70445d9453d9a6fd5be2965ab164310efd582f30659aae323ece2d" },
+    { "path": "src/adapters/extension-process-module-executor.ts", "sha256": "3b86baf577ac568348cd84bd0cc4b29f7082969ae9263b66ad52429424d846be" },
+    { "path": "src/adapters/sharp-media-inspector.ts", "sha256": "93dd62d129b14de0a44ec91751fb35a9d1ea2c62bd3ca6b986ec48e49b58f857" },
+    { "path": "src/core/capabilities/effect-intent-journal.ts", "sha256": "c3f3b678dfe619d2ec26dafaaf028cf6a13f9aa4ea555a606781d7fa093166c1" },
+    { "path": "src/core/capabilities/file-effect-intent-store.ts", "sha256": "b9496e1ffcb259a72913f083d046f75034b1b8cd6e77c510fa1807da60cb1424" },
+    { "path": "src/core/extension-process-host.ts", "sha256": "4c58577f0f59514dc73169a8b7b6686cec64f1b8c8e84bda738c28efdc456e76" },
+    { "path": "src/core/file-core-state-store.ts", "sha256": "66c77bf963b2d6c5045afa09c18d70fa7f1b90f9a6330db977ff47ef091c807f" },
+    { "path": "src/core/file-media-byte-store.ts", "sha256": "4c6a8455b6f6c59da69d784507f9ae767aaff7e5e7b1df0fd5c4414627866909" },
+    { "path": "src/core/file-module-result-commit-repository.ts", "sha256": "9bdd5da3e390ea6a2030ff62ce3db313b0ab81ff43a9a7ec60023d0fdae26bb9" },
+    { "path": "src/core/media-capability/delivered-model-media-resolver.ts", "sha256": "951095831a3e9ed20d55d6c2eadfcdc57be5fbb795fd91c1f6da57f4861ab4d4" },
+    { "path": "src/core/media-store.ts", "sha256": "8db15c86b626da3c79ef179088e829752faa49d45133a9faa1583beaf4cb844f" },
+    { "path": "src/core/model-provider-binding.ts", "sha256": "39d1173636c216e5f3f2cd822838d8a1a8a834de2545596401c887b961a1261c" },
+    { "path": "src/core/model-provider-broker.ts", "sha256": "e0df0b226c306b4bcd0a67fd8a2e08a167d929bd878635beed3c98f1b505e83d" },
+    { "path": "src/core/model-provider-chat.ts", "sha256": "258a7cb4866990eebb538be85d88524bc2ec7352312f7f424d663fc881076bb3" },
+    { "path": "src/core/model-provider-descriptor.ts", "sha256": "ec454233701a1b2f8fe5fb7b6d7c3d24cfef2014ec2a8f2f332c3221b79577c1" },
+    { "path": "src/core/model-provider-node-http.ts", "sha256": "6c2c7e988289fa796a7cbb3dc999358979b272acd0a4fba1dff964a58432f30a" },
+    { "path": "src/core/module-result-commit-factory.ts", "sha256": "a2a824bbf724235ea5658c9188784490fc4fc7c1606b45571de143bb0bc5cd39" },
+    { "path": "src/core/module-result-commit.ts", "sha256": "0dcaf2b9af8e5994864cb5f80a7457b15031a8b113e200727f9e40c0d06d2b0f" },
+    { "path": "src/core/module-scheduler.ts", "sha256": "4eed90a515723009aba4b5af55325d9da9961a93abd1f491f0e9c7c126c2c8bb" },
+    { "path": "src/core/provider-capabilities/model-operation-capability.ts", "sha256": "9a0fa1dac321f4e520f96febc3345a6661e6649fb9211ad0f9d7f82c2935fa66" },
+    { "path": "src/core/reactive-module-host.ts", "sha256": "3b22cab4e1338fee78b528bf4cd4992067957642e3c111a20aab8e5cae367e5b" },
+    { "path": "src/core/reactive-module-runtime.ts", "sha256": "9ab43cd4aca47022795054a4fdfb118ad6d4d16d054394d17ff3ed1dbcb1955f" },
+    { "path": "src/core/runtime-bootstrap.ts", "sha256": "bb8a47b20a65664011fdeb459b4f2d4a11a506c66d19e1ba0d46a32cdf14afaf" }
+  ]
+}
