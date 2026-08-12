@@ -226,11 +226,11 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         configVersion: 1,
         schema: configurationSchema,
         // Keep the first sink Run active long enough for both upstream
-        // processes to reach the output-commit boundary on a loaded runner.
-        // The assertion below observes backpressure before allowing this
-        // finite delay to release capacity; it does not use the delay as the
-        // backpressure oracle.
-        configuration: { prefix: "drainer", delayMs: 10_000, emitOutput: false },
+        // processes to reach the output-commit boundary on a loaded runner,
+        // while remaining below the configured 5 s execution deadline. The
+        // assertion below observes backpressure before this finite delay
+        // releases capacity; it does not use the delay as the oracle.
+        configuration: { prefix: "drainer", delayMs: 3_000, emitOutput: false },
       });
       const defaults = createDefaultDollyInstanceConfig(INSTANCE_ID);
       const configuration = validateDollyInstanceConfig({
