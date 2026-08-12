@@ -82,3 +82,27 @@ call.
 `RUNTIME_MODULE_MIGRATION_REQUIRED`. This result closes one product-before-
 bootstrap restart counterexample; it is not authorization to remove that
 safety condition.
+
+## Unrestricted-process effect-boundary regression
+
+Commit `7f07535` records the current ordinary installed process as
+`unrestricted`: its process boundary does not exclude ambient filesystem,
+network, or subprocess effects. An empty Core capability journal therefore
+cannot make an uncommitted Run safe to retry. The focused component suite first
+demonstrated the old false release, then passed with the Claim and submission
+preserved as an unresolved outcome.
+
+The Linux integration was rerun in the uniquely named disposable container
+`dolly-experiment-2802912-75a88258`; the runner removed that exact container and
+image at completion. All five cases passed. In particular, startup output
+recovery still committed the durable producer result with zero producer
+executor runs, and the registered-tool Agent made four model calls with
+`stream=true` for all four calls.
+
+Evidence is stored under
+`artifacts/experiments/linux-core-service-ownership/container-2802912-20260812T105835Z`:
+
+- `linux-integration.log`: `9ad2795c5346f096a6f63d379ab0155462cc56edb09af61c894cedb99c1a6159`
+- `environment.txt`: `4c66ed875461b8796fc11fdb7f45f40d4d34a120b081b8afa1e6977bd942d3d5`
+- `preflight.txt`: `ecf7fce3780e2b756cfc847409343f9dc3196b8e6f9da072679da4c713411c36`
+- `source-snapshot.txt`: `f29a8edfeb13a57a80083bc82a8adf793bef64fb77af5d5a1818d6cdad3e8770`
