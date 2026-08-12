@@ -1737,10 +1737,36 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         { kind: "external", id: "agent-integration" },
       );
       coreState.store.deliveries.append("agent-input", input.id);
-      expect(await waitFor(
-        () => repository.list().length === 1 && repository.list()[0]?.state === "committed",
+      const terminalObserved = await waitFor(
+        () =>
+          (repository.list().length === 1 && repository.list()[0]?.state === "committed") ||
+          schedulerEvents.some((event) =>
+            event.type === "scheduler.quarantined" && event.moduleId === AGENT_MODULE_ID
+          ),
         15_000,
-      )).toBe(true);
+      );
+      const quarantine = schedulerEvents.find((event) =>
+        event.type === "scheduler.quarantined" && event.moduleId === AGENT_MODULE_ID
+      );
+      if (!terminalObserved || quarantine?.type === "scheduler.quarantined") {
+        const terminalDiagnostic = {
+          terminalObserved,
+          quarantineReason: quarantine?.type === "scheduler.quarantined"
+            ? quarantine.reason
+            : null,
+          providerRequests: modelTransport.requests.length,
+          activeClaims: coreState.store.deliveries.listActiveClaims().map((claim) => ({
+            moduleJobId: claim.moduleJobId,
+            runId: claim.runId,
+            attempt: claim.attempt,
+          })),
+          effectOutcomes: new FileEffectIntentStore({ path: effectIntentPath })
+            .list()
+            .map((record) => record.outcome.kind),
+        };
+        console.info(JSON.stringify({ installedAgentTerminalFailure: terminalDiagnostic }));
+        throw new Error(`Installed Agent terminal failure: ${JSON.stringify(terminalDiagnostic)}`);
+      }
       const result = repository.list()[0]!;
       if (result.blockId === undefined) {
         throw new Error("The Agent result does not reference its output Block");
