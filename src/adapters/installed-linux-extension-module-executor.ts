@@ -26,6 +26,9 @@ import {
   createLinuxExtensionModuleExecutor,
   type LinuxExtensionModuleExecutorOptions,
 } from "./linux-extension-module-executor.js";
+import {
+  defaultLauncherScriptPath,
+} from "./linux-module-launcher/linux-module-launcher-process.js";
 
 type InstalledLifecycleOptions = Omit<
   LinuxExtensionModuleExecutorOptions["lifecycle"],
@@ -36,11 +39,6 @@ type InstalledHostOptions = Omit<
   "config" | "manifest" | "moduleKind" | "trust"
 >;
 type ProcessRecordDetails = Pick<ModuleProcessRecord, "createdAt" | "updatedAt">;
-type InstalledLauncherOptions = Omit<
-  LinuxExtensionModuleExecutorOptions["launcher"],
-  "launcherEnvironment"
->;
-
 export interface InstalledLinuxExtensionModuleExecutorOptions {
   readonly instanceConfiguration: DollyInstanceConfig;
   readonly moduleId: string;
@@ -53,7 +51,6 @@ export interface InstalledLinuxExtensionModuleExecutorOptions {
   readonly binding: VerifiedCoreServiceBinding;
   readonly lifecycle: InstalledLifecycleOptions;
   readonly processRecord: ProcessRecordDetails;
-  readonly launcher: InstalledLauncherOptions;
   readonly host: InstalledHostOptions;
   readonly executionTimeoutMs: number;
   readonly cancellationGraceMs: number;
@@ -77,6 +74,8 @@ export interface InstalledLinuxExtensionModuleExecutorOptions {
  */
 export const INSTALLED_PROCESS_EFFECT_DECLARATION =
   "unrestricted" as const;
+
+const INSTALLED_LINUX_LAUNCHER_INTERPRETER = "/usr/bin/python3";
 
 export interface InstalledLinuxExtensionModuleExecutorDerivation {
   readonly resolvedModule: InstalledExtensionModule;
@@ -102,6 +101,15 @@ function assertNoDerivedFields(
 export function deriveInstalledLinuxExtensionModuleExecutor(
   options: InstalledLinuxExtensionModuleExecutorOptions,
 ): InstalledLinuxExtensionModuleExecutorDerivation {
+  if (
+    Object.hasOwn(options, "launcher") ||
+    Object.hasOwn(options, "interpreterProgram") ||
+    Object.hasOwn(options, "launcherScriptPath")
+  ) {
+    throw new TypeError(
+      "Installed Linux Extension executor cannot accept caller-supplied launcher paths",
+    );
+  }
   if (Object.hasOwn(options, "configureHost")) {
     throw new TypeError(
       "Installed Linux Extension executor cannot accept an arbitrary Host setup callback",
@@ -117,7 +125,6 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     ["delegatedRootCgroupPath", "execution", "processRecord"],
     "lifecycle",
   );
-  assertNoDerivedFields(options.launcher, ["launcherEnvironment"], "launcher");
   assertNoDerivedFields(
     options.host,
     ["config", "manifest", "moduleKind", "trust"],
@@ -223,7 +230,8 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
       },
     },
     launcher: {
-      ...options.launcher,
+      interpreterProgram: INSTALLED_LINUX_LAUNCHER_INTERPRETER,
+      launcherScriptPath: defaultLauncherScriptPath(),
       launcherEnvironment: Object.freeze({}),
     },
     host: {

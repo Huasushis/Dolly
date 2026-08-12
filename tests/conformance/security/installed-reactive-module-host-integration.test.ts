@@ -21,7 +21,6 @@ import {
   composeInstalledReactiveModuleHost,
   type InstalledReactiveModuleHost,
 } from "../../../src/adapters/installed-reactive-module-runtime.js";
-import { defaultLauncherScriptPath } from "../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
 import type { BlockProposal } from "../../../src/core/block-store.js";
 import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
 import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
@@ -551,16 +550,6 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
           binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
-          launcher: {
-            interpreterProgram: PYTHON,
-            launcherScriptPath: defaultLauncherScriptPath(),
-            controllerTimeouts: {
-              configureTimeoutMs: 5_000,
-              inCgroupTimeoutMs: 5_000,
-              membershipTimeoutMs: 5_000,
-              exitObservationTimeoutMs: 5_000,
-            },
-          },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),
             shutdownRequestTimeoutMs: 2_000,
@@ -1180,16 +1169,6 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
           binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
-          launcher: {
-            interpreterProgram: PYTHON,
-            launcherScriptPath: defaultLauncherScriptPath(),
-            controllerTimeouts: {
-              configureTimeoutMs: 5_000,
-              inCgroupTimeoutMs: 5_000,
-              membershipTimeoutMs: 5_000,
-              exitObservationTimeoutMs: 5_000,
-            },
-          },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),
             shutdownRequestTimeoutMs: 2_000,
@@ -1694,16 +1673,6 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
           binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
-          launcher: {
-            interpreterProgram: PYTHON,
-            launcherScriptPath: defaultLauncherScriptPath(),
-            controllerTimeouts: {
-              configureTimeoutMs: 5_000,
-              inCgroupTimeoutMs: 5_000,
-              membershipTimeoutMs: 5_000,
-              exitObservationTimeoutMs: 5_000,
-            },
-          },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),
             shutdownRequestTimeoutMs: 2_000,
@@ -2277,16 +2246,6 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
           binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
-          launcher: {
-            interpreterProgram: PYTHON,
-            launcherScriptPath: defaultLauncherScriptPath(),
-            controllerTimeouts: {
-              configureTimeoutMs: 5_000,
-              inCgroupTimeoutMs: 5_000,
-              membershipTimeoutMs: 5_000,
-              exitObservationTimeoutMs: 5_000,
-            },
-          },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),
             shutdownRequestTimeoutMs: 2_000,
@@ -2669,16 +2628,6 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
           binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
-          launcher: {
-            interpreterProgram: PYTHON,
-            launcherScriptPath: defaultLauncherScriptPath(),
-            controllerTimeouts: {
-              configureTimeoutMs: 5_000,
-              inCgroupTimeoutMs: 5_000,
-              membershipTimeoutMs: 5_000,
-              exitObservationTimeoutMs: 5_000,
-            },
-          },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),
             shutdownRequestTimeoutMs: 2_000,
@@ -3030,16 +2979,6 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
           binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
-          launcher: {
-            interpreterProgram: PYTHON,
-            launcherScriptPath: defaultLauncherScriptPath(),
-            controllerTimeouts: {
-              configureTimeoutMs: 5_000,
-              inCgroupTimeoutMs: 5_000,
-              membershipTimeoutMs: 5_000,
-              exitObservationTimeoutMs: 5_000,
-            },
-          },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),
             shutdownRequestTimeoutMs: 2_000,

@@ -603,16 +603,6 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
         limits: LIMITS,
         maxOpenFiles: 64,
       },
-      launcher: {
-        interpreterProgram: PYTHON,
-        launcherScriptPath: defaultLauncherScriptPath(),
-        controllerTimeouts: {
-          configureTimeoutMs: 5_000,
-          inCgroupTimeoutMs: 5_000,
-          membershipTimeoutMs: 5_000,
-          exitObservationTimeoutMs: 5_000,
-        },
-      },
       host: {
         isolationPolicy: new ExtensionIsolationPolicy(),
         maxFrameBytes: 128 * 1_024,

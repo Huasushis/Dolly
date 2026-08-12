@@ -19,6 +19,9 @@ import {
   LINUX_PROCESS_CONFINEMENT_PROGRAM,
 } from "../../../src/adapters/linux-process-confinement.js";
 import {
+  defaultLauncherScriptPath,
+} from "../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
+import {
   canonicalJsonDigest,
   type JsonValue,
 } from "../../../src/core/canonical-json.js";
@@ -482,10 +485,6 @@ describe("installed Extension Module resolution", () => {
         createdAt: "2026-08-10T00:00:00.000Z",
         updatedAt: "2026-08-10T00:00:00.000Z",
       },
-      launcher: {
-        interpreterProgram: "/usr/bin/python3",
-        launcherScriptPath: "/opt/dolly/launcher.py",
-      },
       host: {
         isolationPolicy: new ExtensionIsolationPolicy(),
       },
@@ -555,7 +554,11 @@ describe("installed Extension Module resolution", () => {
     });
     expect(derived.executorOptions.packageSnapshot?.bytes)
       .toEqual(installed.packageSnapshot.copyBytes());
-    expect(derived.executorOptions.launcher.launcherEnvironment).toEqual({});
+    expect(derived.executorOptions.launcher).toEqual({
+      interpreterProgram: "/usr/bin/python3",
+      launcherScriptPath: defaultLauncherScriptPath(),
+      launcherEnvironment: {},
+    });
     expect(processRecord.serviceInvocationId).toBe(CORE_BINDING.serviceInvocationId);
     expect(processRecord.bootId).toBe(CORE_BINDING.bootId);
     expect(processRecord.moduleCgroupPath).toBe(
@@ -605,10 +608,6 @@ describe("installed Extension Module resolution", () => {
       processRecord: {
         createdAt: "2026-08-10T00:00:00.000Z",
         updatedAt: "2026-08-10T00:00:00.000Z",
-      },
-      launcher: {
-        interpreterProgram: "/usr/bin/python3",
-        launcherScriptPath: "/opt/dolly/launcher.py",
       },
       host: {
         isolationPolicy: new ExtensionIsolationPolicy(),
@@ -670,10 +669,13 @@ describe("installed Extension Module resolution", () => {
     expect(() => deriveInstalledLinuxExtensionModuleExecutor({
       ...base,
       launcher: {
-        ...base.launcher,
+        interpreterProgram: "/tmp/unreviewed-python",
+        launcherScriptPath: "/tmp/unreviewed-launcher.py",
         launcherEnvironment: { SECRET: "forged" },
-      } as unknown as typeof base.launcher,
-    })).toThrow(/launcher cannot supply derived fields: launcherEnvironment/u);
+      },
+    } as unknown as InstalledLinuxExtensionModuleExecutorOptions)).toThrow(
+      /cannot accept caller-supplied launcher paths/u,
+    );
     expect(() => deriveInstalledLinuxExtensionModuleExecutor({
       ...base,
       binding: {
@@ -748,10 +750,6 @@ describe("installed Extension Module resolution", () => {
           cpuPeriodMicros: 100_000,
         },
         maxOpenFiles: 64,
-      },
-      launcher: {
-        interpreterProgram: "/usr/bin/python3",
-        launcherScriptPath: "/opt/dolly/launcher.py",
       },
       host: {
         isolationPolicy: new ExtensionIsolationPolicy(),

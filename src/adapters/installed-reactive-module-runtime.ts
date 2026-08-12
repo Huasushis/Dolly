@@ -329,7 +329,6 @@ function createInstalledReactiveModuleRuntimeInternal(
       records: options.core,
       stoppedRecordWriter: options.stoppedRecordWriter,
     },
-    launcher: options.launcher,
     host: {
       ...options.host,
       maxFrameBytes: module.limits.maxFrameBytes,

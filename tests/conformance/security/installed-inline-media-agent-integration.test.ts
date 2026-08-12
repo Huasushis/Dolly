@@ -22,7 +22,6 @@ import {
   composeInstalledReactiveModuleHost,
   type InstalledReactiveModuleHost,
 } from "../../../src/adapters/installed-reactive-module-runtime.js";
-import { defaultLauncherScriptPath } from "../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
 import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
 import { CoreStartupRecovery } from "../../../src/core/core-startup-recovery.js";
 import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
@@ -481,16 +480,6 @@ describe.skipIf(!available)("installed inline Media Agent in a real control grou
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
           binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
-          launcher: {
-            interpreterProgram: PYTHON,
-            launcherScriptPath: defaultLauncherScriptPath(),
-            controllerTimeouts: {
-              configureTimeoutMs: 5_000,
-              inCgroupTimeoutMs: 5_000,
-              membershipTimeoutMs: 5_000,
-              exitObservationTimeoutMs: 5_000,
-            },
-          },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),
             shutdownRequestTimeoutMs: 2_000,

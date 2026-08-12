@@ -267,10 +267,6 @@ describe("installed reactive Module runtime composition", () => {
         },
         maxOpenFiles: 64,
       },
-      launcher: {
-        interpreterProgram: "/usr/bin/python3",
-        launcherScriptPath: "/opt/dolly/launcher.py",
-      },
       host: {
         isolationPolicy: new ExtensionIsolationPolicy(),
         shutdownRequestTimeoutMs: 250,
