@@ -618,6 +618,16 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     expect(store.getModuleProcessRecord(processGenerationId)).toBeUndefined();
     await expect(executor.start()).resolves.toBeUndefined();
     expect(launchedProcess).toBeDefined();
+    const liveSession = factory.sessionForProcess(processGenerationId);
+    expect(liveSession).toMatchObject({
+      extensionId: installed.manifest.extensionId,
+      instanceId,
+      moduleId: "installed-worker",
+      moduleGenerationId: MODULE_GENERATION_ID,
+      processGenerationId,
+    });
+    expect(liveSession?.sessionId).toMatch(/^session-/u);
+    expect(factory.sessionForProcess("process-installed-linux-foreign")).toBeNull();
     expect(store.getModuleProcessRecord(processGenerationId)).toMatchObject({
       state: "running",
       packageDigest: installed.packageDigest,
@@ -678,6 +688,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     expect(store.getModuleSubmissionRecord(claim.runId)).toBeUndefined();
 
     await expect(executor.terminate(terminationContext)).resolves.toBeUndefined();
+    expect(factory.sessionForProcess(processGenerationId)).toBeNull();
     const moduleCgroupPath = deriveModuleCgroupPath(
       inspectedBinding.binding.delegatedRootCgroupPath,
       { instanceId, moduleId: "installed-worker", processGenerationId },

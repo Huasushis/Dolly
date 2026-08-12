@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionInstallationRegistry } from "../core/extension-installation-registry.js";
+import type { ExtensionSessionIdentity } from "../core/extension-capability.js";
+import type { ExtensionProcessHost } from "../core/extension-process-host.js";
 import {
   resolveInstalledExtensionModule,
   type InstalledExtensionModule,
@@ -288,6 +290,14 @@ export interface InstalledLinuxExtensionModuleGenerationFactory {
    * Module generation. It is unavailable until `createExecutor` succeeds.
    */
   readonly processGenerationIdFor: (moduleGenerationId: string) => string;
+  /**
+   * Returns the live protocol identity minted by the exact Host that owns this
+   * process generation. Created, stopping, stopped, and failed Hosts are not
+   * active sessions and therefore return null.
+   */
+  readonly sessionForProcess: (
+    processGenerationId: string,
+  ) => ExtensionSessionIdentity | null;
 }
 
 function processGenerationTimestamp(wallClockNow: () => number): string {
@@ -327,6 +337,7 @@ export function createInstalledLinuxExtensionModuleGenerationFactory(
   const wallClockNow = wallClockNowOption ?? Date.now;
   const processByModuleGeneration = new Map<string, string>();
   const usedProcessGenerations = new Set<string>();
+  const hostByProcessGeneration = new Map<string, ExtensionProcessHost>();
 
   const createExecutor = (
     moduleGenerationId: string,
@@ -366,7 +377,32 @@ export function createInstalledLinuxExtensionModuleGenerationFactory(
         updatedAt: timestamp,
       },
     });
-    const executor = createLinuxExtensionModuleExecutor(derived.executorOptions);
+    const configuredHost = derived.executorOptions.configureHost;
+    const executor = createLinuxExtensionModuleExecutor({
+      ...derived.executorOptions,
+      configureHost: (host, process) => {
+        configuredHost?.(host, process);
+        const snapshot = host.snapshot;
+        if (
+          snapshot.state !== "created" ||
+          snapshot.instanceId !== process.record.instanceId ||
+          snapshot.moduleId !== process.record.moduleId ||
+          snapshot.moduleGenerationId !== process.record.moduleGenerationId ||
+          snapshot.processGenerationId !== process.record.processGenerationId ||
+          snapshot.processGenerationId !== processGenerationId
+        ) {
+          throw new TypeError(
+            "Installed Extension Host session does not match its authorized process generation",
+          );
+        }
+        if (hostByProcessGeneration.has(processGenerationId)) {
+          throw new TypeError(
+            `Process generation ${processGenerationId} already has an Extension Host session`,
+          );
+        }
+        hostByProcessGeneration.set(processGenerationId, host);
+      },
+    });
     processByModuleGeneration.set(moduleGenerationId, processGenerationId);
     return executor;
   };
@@ -381,6 +417,25 @@ export function createInstalledLinuxExtensionModuleGenerationFactory(
         );
       }
       return processGenerationId;
+    },
+    sessionForProcess: (processGenerationId: string): ExtensionSessionIdentity | null => {
+      const host = hostByProcessGeneration.get(processGenerationId);
+      if (host === undefined) return null;
+      const snapshot = host.snapshot;
+      if (
+        snapshot.processGenerationId !== processGenerationId ||
+        (snapshot.state !== "ready" && snapshot.state !== "executing")
+      ) {
+        return null;
+      }
+      return Object.freeze({
+        extensionId: snapshot.extensionId,
+        instanceId: snapshot.instanceId,
+        processGenerationId: snapshot.processGenerationId,
+        sessionId: snapshot.sessionId,
+        moduleId: snapshot.moduleId,
+        moduleGenerationId: snapshot.moduleGenerationId,
+      });
     },
   });
 }

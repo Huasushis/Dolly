@@ -482,11 +482,15 @@ the configured-Module refusal in Section 5.1.
 identity rule. It creates at most one executor for each non-reused Module
 generation, gives each one a distinct process generation absent from the
 durable process-record store, and exposes the exact mapping that a future
-product composer must use when persisting a Run submission. Thus executor
-creation and submission authorization cannot capture two different process
-identities. This factory still does not persist or start the process by itself;
-`ModuleActor` and the Linux lifecycle remain the only owners of those actions.
-The current product bootstrap does not construct the factory.
+product composer must use when persisting a Run submission. It also retains the
+exact `ExtensionProcessHost` created for that process generation and exposes
+only a read-only session-identity lookup while that Host is ready or executing.
+Callers cannot insert a session, and stopping, stopped, failed, unknown, or
+not-yet-started generations resolve to no session. Thus executor creation,
+submission authorization, and the active model-Media lookup cannot capture
+different process identities. This factory still does not persist or start the
+process by itself; `ModuleActor` and the Linux lifecycle remain the only owners
+of those actions. The current product bootstrap does not construct the factory.
 
 `createInstalledReactiveModuleRuntime` consumes that generation factory and
 binds it to one direct `FileCoreStateStore`: input Claims, process records, Run

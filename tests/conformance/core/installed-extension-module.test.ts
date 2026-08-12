@@ -749,12 +749,15 @@ describe("installed Extension Module resolution", () => {
 
     expect(() => factory.processGenerationIdFor("module-generation-a"))
       .toThrow(/does not have a process generation/u);
+    expect(factory.sessionForProcess("process-installed-a")).toBeNull();
     expect(factory.createExecutor("module-generation-a").isolation).toBe("process");
     expect(factory.createExecutor("module-generation-b").isolation).toBe("process");
     expect(factory.processGenerationIdFor("module-generation-a"))
       .toBe("process-installed-a");
     expect(factory.processGenerationIdFor("module-generation-b"))
       .toBe("process-installed-b");
+    expect(factory.sessionForProcess("process-installed-a")).toBeNull();
+    expect(factory.sessionForProcess("process-installed-b")).toBeNull();
     expect(() => factory.createExecutor("module-generation-a"))
       .toThrow(/already has an installed Linux executor/u);
     expect(() => factory.createExecutor("module-generation-c"))
