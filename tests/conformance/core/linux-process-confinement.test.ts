@@ -24,13 +24,17 @@ describe("Linux process confinement derivation", () => {
       program: BUBBLEWRAP,
       argumentVector: [
         BUBBLEWRAP,
-        "--ro-bind", "/", "/",
+        "--ro-bind", "/usr", "/usr",
+        "--symlink", "usr/bin", "/bin",
+        "--symlink", "usr/sbin", "/sbin",
+        "--symlink", "usr/lib", "/lib",
+        "--symlink", "usr/lib64", "/lib64",
         "--dev", "/dev",
         "--proc", "/proc",
         "--tmpfs", "/run",
         "--tmpfs", "/tmp",
-        "--tmpfs", STATE,
         "--dir", "/run/dolly",
+        "--ro-bind", NODE, "/run/dolly/node",
         "--ro-bind", INSTALLATION, "/run/dolly/extension",
         "--unshare-user",
         "--unshare-pid",
@@ -45,7 +49,7 @@ describe("Linux process confinement derivation", () => {
         "--cap-drop", "ALL",
         "--chdir", "/run/dolly/extension",
         "--",
-        NODE,
+        "/run/dolly/node",
         "/run/dolly/extension/dist/main.mjs",
       ],
       environment: {},
@@ -53,6 +57,8 @@ describe("Linux process confinement derivation", () => {
     expect(Object.isFrozen(execution)).toBe(true);
     expect(Object.isFrozen(execution.argumentVector)).toBe(true);
     expect(Object.isFrozen(execution.environment)).toBe(true);
+    expect(execution.argumentVector).not.toContain(STATE);
+    expect(execution.argumentVector).not.toEqual(expect.arrayContaining(["--ro-bind", "/", "/"]));
   });
 
   it("rejects path substitution and overlap before a launcher exists", () => {
@@ -85,9 +91,8 @@ describe("Linux process confinement derivation", () => {
       installationDirectory: `${STATE}/packages/package-a`,
       entrypointPath: `${STATE}/packages/package-a/main.mjs`,
     });
-    expect(installationInsideState.argumentVector.indexOf(STATE)).toBeLessThan(
-      installationInsideState.argumentVector.indexOf(`${STATE}/packages/package-a`),
-    );
+    expect(installationInsideState.argumentVector).not.toContain(STATE);
+    expect(installationInsideState.argumentVector).toContain(`${STATE}/packages/package-a`);
     expect(() => deriveLinuxProcessConfinementExecution({
       ...base,
       coreStateDirectory: "/run/dolly-state",
@@ -111,7 +116,7 @@ describe("Linux process confinement derivation", () => {
     const separator = execution.argumentVector.indexOf("--");
     expect(separator).toBeGreaterThan(0);
     expect(execution.argumentVector.slice(separator + 1)).toEqual([
-      NODE,
+      "/run/dolly/node",
       "/run/dolly/extension/dist/--unshare-all",
     ]);
   });

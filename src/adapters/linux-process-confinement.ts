@@ -1,6 +1,7 @@
 import { posix } from "node:path";
 
 const GUEST_PACKAGE_DIRECTORY = "/run/dolly/extension";
+const GUEST_NODE_PROGRAM = "/run/dolly/node";
 const RUNTIME_MOUNT_ROOTS = ["/run", "/tmp"] as const;
 
 /** Exact backend exercised by the Ubuntu 24.04 acceptance environment. */
@@ -86,11 +87,14 @@ function assertSafeStateDirectory(
  *
  * This is a process ownership boundary, not a claim that arbitrary Extension
  * code is fully sandboxed. The command gives the child fresh user, process,
- * cgroup, mount, IPC, UTS, and network namespaces; makes the Host filesystem
- * read-only; hides Core state and service-manager sockets; drops capabilities;
- * and prevents nested user namespaces. The installed package is then mounted
- * read-only at one fixed guest path. All arguments come from Host-validated
- * installation and instance state, never from an Extension request.
+ * cgroup, mount, IPC, UTS, and network namespaces. The guest starts without a
+ * Host root mount: it sees only the read-only system runtime tree, the exact
+ * Core-selected Node executable and installed package, plus private `/dev`,
+ * `/proc`, `/run`, and `/tmp` mounts. This default-deny view keeps unrelated
+ * instance, configuration, Media, home, and service-manager files absent. The
+ * process also loses every capability and cannot create another user
+ * namespace. All arguments come from Host-validated installation and instance
+ * state, never from an Extension request.
  */
 export function deriveLinuxProcessConfinementExecution(
   options: LinuxProcessConfinementOptions,
@@ -131,13 +135,20 @@ export function deriveLinuxProcessConfinementExecution(
   );
   const argumentVector = Object.freeze([
     options.bubblewrapProgram,
-    "--ro-bind", "/", "/",
+    // `/usr` supplies the reviewed system runtime and native libraries. FHS
+    // compatibility paths are recreated inside the otherwise empty guest;
+    // none of `/etc`, `/home`, `/var`, or the Host root becomes visible.
+    "--ro-bind", "/usr", "/usr",
+    "--symlink", "usr/bin", "/bin",
+    "--symlink", "usr/sbin", "/sbin",
+    "--symlink", "usr/lib", "/lib",
+    "--symlink", "usr/lib64", "/lib64",
     "--dev", "/dev",
     "--proc", "/proc",
     "--tmpfs", "/run",
     "--tmpfs", "/tmp",
-    "--tmpfs", options.coreStateDirectory,
     "--dir", "/run/dolly",
+    "--ro-bind", options.nodeProgram, GUEST_NODE_PROGRAM,
     "--ro-bind", options.installationDirectory, GUEST_PACKAGE_DIRECTORY,
     "--unshare-user",
     "--unshare-pid",
@@ -152,7 +163,7 @@ export function deriveLinuxProcessConfinementExecution(
     "--cap-drop", "ALL",
     "--chdir", GUEST_PACKAGE_DIRECTORY,
     "--",
-    options.nodeProgram,
+    GUEST_NODE_PROGRAM,
     guestEntrypoint,
   ]);
   return Object.freeze({

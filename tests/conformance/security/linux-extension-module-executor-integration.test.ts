@@ -420,7 +420,11 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     const scratchParent = resolve(process.cwd(), ".tmp");
     mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
     const scratch = mkdtempSync(join(scratchParent, "installed-linux-extension-integration-"));
-    const statePath = join(scratch, "core-state.json");
+    const statePath = join(scratch, "instance-state", "core-state.json");
+    const siblingPrivateDirectory = join(scratch, "sibling-private-state");
+    const siblingPrivatePath = join(siblingPrivateDirectory, "private.txt");
+    mkdirSync(siblingPrivateDirectory, { recursive: true, mode: 0o700 });
+    writeFileSync(siblingPrivatePath, "another-instance-secret\n", { mode: 0o600 });
     const packageSource = join(scratch, "package-source");
     mkdirSync(packageSource, { recursive: true, mode: 0o700 });
     copyFileSync(FIXTURE_PATH, join(packageSource, "extension-process-fixture.mjs"));
@@ -431,12 +435,14 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
         confinementProbe: { const: true },
         coreProcessId: { type: "integer", minimum: 1 },
         coreStatePath: { type: "string", minLength: 1 },
+        siblingPrivatePath: { type: "string", minLength: 1 },
         userManagerPath: { type: "string", minLength: 1 },
       },
       required: [
         "confinementProbe",
         "coreProcessId",
         "coreStatePath",
+        "siblingPrivatePath",
         "userManagerPath",
       ],
       additionalProperties: false,
@@ -480,6 +486,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
         confinementProbe: true,
         coreProcessId: process.pid,
         coreStatePath: statePath,
+        siblingPrivatePath,
         userManagerPath: process.env.XDG_RUNTIME_DIR ?? "/run/user/1001",
       },
     });
@@ -774,6 +781,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
         coreSignal: { outcome: "denied", code: "ESRCH" },
         coreProcessRead: { outcome: "denied", code: "ENOENT" },
         coreStateRead: { outcome: "denied", code: "ENOENT" },
+        siblingPrivateRead: { outcome: "denied", code: "ENOENT" },
         userManagerVisible: false,
       },
     });

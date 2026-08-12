@@ -122,6 +122,9 @@ function confinementReport() {
     coreStateRead: deniedOperation(() =>
       readFileSync(initialized.config.coreStatePath, "utf8")
     ),
+    siblingPrivateRead: deniedOperation(() =>
+      readFileSync(initialized.config.siblingPrivatePath, "utf8")
+    ),
     userManagerVisible: existsSync(initialized.config.userManagerPath),
   };
 }
