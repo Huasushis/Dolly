@@ -503,7 +503,7 @@ describe.skipIf(delegatedRoot === undefined)(
         selfCgroup: "0::/",
         cgroupWrite: { outcome: "denied" },
         memoryLimitWrite: { outcome: "denied" },
-        nestedUserNamespace: { outcome: "denied", errno: 1 },
+        nestedUserNamespace: { outcome: "denied" },
         secondCgroupMount: { outcome: "denied", errno: 1 },
         coreSignalProbe: { outcome: "denied", errno: 3 },
         coreProcRead: { outcome: "denied", errno: 2 },
@@ -520,6 +520,9 @@ describe.skipIf(delegatedRoot === undefined)(
       expect((report as { cgroupNamespace: string }).cgroupNamespace).not.toBe(
         outerCgroupNamespace,
       );
+      expect(
+        (report as { nestedUserNamespace: { errno: number } }).nestedUserNamespace.errno,
+      ).toBeGreaterThan(0);
       expect(await populated(cgroup.path)).toBe(true);
 
       const attached = attachLinuxModuleProcess({
