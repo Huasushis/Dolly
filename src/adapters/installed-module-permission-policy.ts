@@ -14,6 +14,7 @@ import type {
 import type { DescriptorRef } from "../core/model-provider-descriptor.js";
 import {
   createModelOperationCapabilityV2,
+  createModelOperationCapabilityV3,
   createToolInvocationCapabilityV2,
   type ChatModelBrokerPort,
   type ModelOperationLimits,
@@ -45,6 +46,8 @@ export interface InstalledStrictStreamingChatPolicy {
   readonly budgets: ModelInvocationBudgets;
   readonly chat: ChatModelBrokerPort;
   readonly outputContracts: readonly ModelOutputContractKind[];
+  /** Omitted for text-only v2; non-empty selects delivered-Media v3. */
+  readonly mediaRequirementIds?: readonly string[];
   readonly reasoningPolicies: readonly ("default" | "prefer" | "require" | "disable")[];
   readonly roles: readonly string[];
   readonly limits: Partial<ModelOperationLimits> & {
@@ -113,9 +116,10 @@ export interface InstalledModulePermissionPolicySetupSnapshot {
   readonly capabilities: readonly (
     | {
         readonly capabilityType: "model-operation";
-        readonly capabilityVersion: "v2";
+        readonly capabilityVersion: "v2" | "v3";
         readonly policyId: string;
         readonly streaming: "required";
+        readonly mediaRequirementIds?: readonly string[];
       }
     | {
         readonly capabilityType: "tool-invocation";
@@ -194,6 +198,24 @@ function immutableChatPolicy(
   if (policy.reasoningPolicies.length === 0) {
     throw new TypeError("Installed model policy requires at least one reasoning policy");
   }
+  const mediaRequirementIds = policy.mediaRequirementIds === undefined
+    ? []
+    : [...new Set(policy.mediaRequirementIds)];
+  if (policy.mediaRequirementIds !== undefined && mediaRequirementIds.length === 0) {
+    throw new TypeError("Installed model Media policy requires a non-empty requirement list");
+  }
+  for (const requirementId of mediaRequirementIds) {
+    assertIdentifier(requirementId, "mediaRequirementId");
+  }
+  if (
+    mediaRequirementIds.length > 0 &&
+    (policy.budgets.maxMediaItems === undefined ||
+      policy.budgets.maxResolvedMediaBytes === undefined)
+  ) {
+    throw new TypeError(
+      "Installed model Media policy requires finite item and resolved-byte budgets",
+    );
+  }
   if (policy.roles.length === 0) {
     throw new TypeError("Installed model policy requires at least one message role");
   }
@@ -214,6 +236,9 @@ function immutableChatPolicy(
     ...policy,
     budgets: Object.freeze({ ...policy.budgets }),
     outputContracts: Object.freeze([...new Set(policy.outputContracts)]),
+    ...(mediaRequirementIds.length === 0
+      ? {}
+      : { mediaRequirementIds: Object.freeze(mediaRequirementIds) }),
     reasoningPolicies: Object.freeze([...new Set(policy.reasoningPolicies)]),
     roles: Object.freeze([...new Set(policy.roles)]),
     limits: Object.freeze({ ...policy.limits }),
@@ -390,7 +415,14 @@ export class InstalledModulePermissionPolicySetup {
                 operations: Object.freeze([...entry.operations]),
                 limits: Object.freeze({ ...entry.limits }),
               }
-            : {}),
+            : entry.mediaRequirementIds === undefined
+              ? {}
+              : {
+                  mediaRequirementIds: Object.freeze([
+                    ...entry.mediaRequirementIds,
+                  ]),
+                }
+        ),
       }))),
     });
     this.#policies = Object.freeze([...policies]);
@@ -475,15 +507,15 @@ export class InstalledModulePermissionPolicySetup {
           requireIdempotencyKey: true,
         });
       }
-      return createModelOperationCapabilityV2({
+      const modelOptions = {
         descriptor: policy.descriptor,
         ownerScope: policy.ownerScope,
         budgets: policy.budgets,
-        executionScope: "active-run",
+        executionScope: "active-run" as const,
         expiresAt,
         now: () => new Date(this.#now()).toISOString(),
         chat: policy.chat,
-        operations: ["chat", "describe"],
+        operations: ["chat", "describe"] as const,
         reasoningPolicies: policy.reasoningPolicies,
         allowStreaming: true,
         requireStreaming: true,
@@ -495,7 +527,13 @@ export class InstalledModulePermissionPolicySetup {
           ? {}
           : { nextRequestId: this.#nextRequestId }),
         outputContracts: policy.outputContracts,
-      });
+      };
+      return policy.mediaRequirementIds === undefined
+        ? createModelOperationCapabilityV2(modelOptions)
+        : createModelOperationCapabilityV3({
+            ...modelOptions,
+            mediaRequirementIds: policy.mediaRequirementIds,
+          });
     });
     this.#configuredHosts.add(host);
     for (const definition of definitions) {
@@ -568,9 +606,14 @@ export class InstalledModulePermissionPolicyRegistry {
           }
           return {
             capabilityType: "model-operation" as const,
-            capabilityVersion: "v2" as const,
+            capabilityVersion: policy.mediaRequirementIds === undefined
+              ? "v2" as const
+              : "v3" as const,
             policyId: policy.policyId,
             streaming: "required" as const,
+            ...(policy.mediaRequirementIds === undefined
+              ? {}
+              : { mediaRequirementIds: [...policy.mediaRequirementIds] }),
           };
         }),
       },

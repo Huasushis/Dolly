@@ -513,11 +513,15 @@ identifiers selected by the validated Module configuration to a reviewed chat
 descriptor and broker, a reviewed read-only `ToolRegistry`, or bounded
 Module-private checkpoint storage. Its ordinary meaning is a Host-owned table
 of approved operations; it is not Extension configuration. The chat policy
-grants `model-operation/v2` for the Host-verified active Run, requires a stable
-idempotency key, and requires provider streaming on every chat invocation.
-Non-stream chat is rejected before broker dispatch. Embedding is not included
-in this generation policy and remains a separately measured non-stream
-operation. The tool policy grants `tool-invocation/v2` from the exact executable
+grants text-only `model-operation/v2` for the Host-verified active Run. A policy
+with a non-empty frozen media-requirement set and finite media item and byte
+budgets instead grants `model-operation/v3`; that version accepts only a
+delivered Block media reference and relies on the broker's Host-only active-Run
+resolver for authorization. Both versions require a stable idempotency key and
+provider streaming on every chat invocation. Non-stream chat is rejected before
+broker dispatch. Embedding is not included in this generation policy and
+remains a separately measured non-stream operation. The tool policy grants
+`tool-invocation/v2` from the exact executable
 registry used for Host-side argument and result checking, requires a
 file-backed round journal, and accepts only read operations that never request
 approval. Effectful general tools remain refused.

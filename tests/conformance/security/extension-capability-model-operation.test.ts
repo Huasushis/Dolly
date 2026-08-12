@@ -25,10 +25,12 @@ import { EmbeddingDescriptorRegistry } from "../../../src/core/model-provider-em
 import {
   createModelOperationCapability,
   createModelOperationCapabilityV2,
+  createModelOperationCapabilityV3,
   type ChatModelBrokerPort,
   type EmbeddingModelBrokerPort,
   type ModelOperationCapabilityOptions,
   type ModelOperationCapabilityV2Options,
+  type ModelOperationCapabilityV3Options,
 } from "../../../src/core/provider-capabilities/index.js";
 import {
   CHAT_STRATEGIES,
@@ -343,6 +345,121 @@ describe("Extension model operation capability", () => {
     expect(() =>
       createModelOperationCapabilityV2({ ...options, outputContracts: [] }),
     ).toThrowError(expect.objectContaining({ code: "CAPABILITY_CONFIG_INVALID" }));
+  });
+
+  it("lets v3 forward only a Host-granted delivered Media reference", async () => {
+    let handleSeed = 0;
+    const authority = new ExtensionCapabilityAuthority({
+      now: () => NOW,
+      nextHandle: () => Buffer.alloc(32, (handleSeed += 1)).toString("base64url"),
+    });
+    const session = authority.openSession(IDENTITY);
+    const invoke = vi.fn(async (invocation: ChatBrokerInvocation) => succeededChat(invocation));
+    const options: ModelOperationCapabilityV3Options = {
+      descriptor: chatRef({ jsonObjectOutput: "supported" }),
+      ownerScope: "owner-1",
+      budgets: {
+        ...BUDGETS,
+        maxMediaItems: 1,
+        maxResolvedMediaBytes: 32 * 1024,
+      },
+      executionScope: EXECUTION_SCOPE,
+      expiresAt: EXPIRES_AT,
+      now: () => NOW,
+      chat: { invoke },
+      outputContracts: ["json-object"],
+      mediaRequirementIds: ["inline-png-v1"],
+    };
+    const definition = createModelOperationCapabilityV3(options);
+    const handle = session.issue(definition.grant, definition.handler);
+    const call = (argumentsValue: JsonValue) => session.invoke({
+      handle,
+      operation: "chat",
+      arguments: argumentsValue,
+      moduleJobId: EXECUTION_SCOPE.moduleJobId,
+      runId: EXECUTION_SCOPE.runId,
+    });
+    const request = {
+      messages: [{
+        role: "user",
+        parts: [
+          { kind: "text", text: "Read the delivered image." },
+          {
+            kind: "media",
+            mediaReference: { type: "media-reference", mediaId: "media-delivered-1" },
+            requirementId: "inline-png-v1",
+          },
+        ],
+      }],
+      outputContract: { kind: "json-object" },
+    } as const;
+
+    expect(definition.grant).toMatchObject({
+      capabilityVersion: "v3",
+      resourceScope: {
+        outputContracts: ["json-object"],
+        mediaRequirementIds: ["inline-png-v1"],
+      },
+    });
+    await expect(call({})).rejects.toMatchObject({ code: "CAPABILITY_ARGUMENT_INVALID" });
+    await expect(call(request as unknown as JsonValue)).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke.mock.calls[0]![0]).toMatchObject({
+      budgets: { maxMediaItems: 1, maxResolvedMediaBytes: 32 * 1024 },
+      input: {
+        schemaVersion: "dolly.model.chat-input/3",
+        messages: request.messages,
+      },
+    });
+
+    for (const mediaPart of [
+      { kind: "media", mediaId: "media-delivered-1", requirementId: "inline-png-v1" },
+      {
+        kind: "media",
+        mediaReference: {
+          type: "media-reference",
+          mediaId: "media-delivered-1",
+          url: "https://attacker.invalid/image.png",
+        },
+        requirementId: "inline-png-v1",
+      },
+      {
+        kind: "media",
+        mediaReference: { type: "media-reference", mediaId: "media-delivered-1" },
+        requirementId: "another-profile",
+      },
+    ]) {
+      await expect(call({
+        ...request,
+        messages: [{ role: "user", parts: [mediaPart] }],
+      } as unknown as JsonValue)).rejects.toMatchObject({
+        code: expect.stringMatching(/^CAPABILITY_(?:ARGUMENT_INVALID|DENIED)$/u),
+      });
+    }
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    await expect(call({
+      ...request,
+      messages: [{
+        role: "user",
+        parts: [request.messages[0].parts[1], request.messages[0].parts[1]],
+      }],
+    } as unknown as JsonValue)).rejects.toMatchObject({
+      code: "CAPABILITY_QUOTA_EXCEEDED",
+      details: { reason: "MODEL_INPUT_LIMIT", mediaItems: 2, maxMediaItems: 1 },
+    });
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    expect(() => createModelOperationCapabilityV3({
+      ...options,
+      budgets: BUDGETS,
+    })).toThrowError(expect.objectContaining({ code: "CAPABILITY_CONFIG_INVALID" }));
+    expect(() => createModelOperationCapabilityV3({
+      ...options,
+      budgets: { ...options.budgets, maxMediaItems: 0 },
+    })).toThrowError(expect.objectContaining({ code: "CAPABILITY_CONFIG_INVALID" }));
   });
 
   it("refuses every attempt to name the model, endpoint, budget, or context", async () => {

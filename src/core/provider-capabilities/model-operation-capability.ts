@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import {
+  parseMediaReferenceItem,
+  type MediaReferenceItem,
+} from "../block-content.js";
 import { canonicalJsonByteLength, deepFreeze, type JsonValue } from "../canonical-json.js";
 import {
   assertClosedArguments,
@@ -41,6 +45,7 @@ import {
 export const MODEL_OPERATION_CAPABILITY_TYPE = "model-operation";
 export const MODEL_OPERATION_CAPABILITY_VERSION = "v1";
 export const MODEL_OPERATION_CAPABILITY_VERSION_V2 = "v2";
+export const MODEL_OPERATION_CAPABILITY_VERSION_V3 = "v3";
 
 /** The modality an extension may ask for; one handle carries exactly one. */
 export type ModelModality = "chat" | "embedding" | "rerank";
@@ -163,6 +168,11 @@ export interface ModelOperationCapabilityV2Options extends ModelOperationCapabil
   readonly outputContracts: readonly ModelOutputContractKind[];
 }
 
+export interface ModelOperationCapabilityV3Options extends ModelOperationCapabilityV2Options {
+  /** Media requirement identities the Host-selected descriptor and resolver grant. */
+  readonly mediaRequirementIds: readonly string[];
+}
+
 function modelDenied(
   reason: ModelOperationDenialReason,
   message: string,
@@ -203,15 +213,19 @@ const CHAT_ARGUMENT_FIELDS = ["messages", "reasoning", "maxOutputTokens", "strea
 const CHAT_ARGUMENT_FIELDS_V2 = [...CHAT_ARGUMENT_FIELDS, "outputContract"] as const;
 const EMBEDDING_ARGUMENT_FIELDS = ["items", "outputDimension"] as const;
 
-interface RequestedChatPart {
-  readonly kind: "text";
-  readonly text: string;
-}
+type RequestedChatPart =
+  | { readonly kind: "text"; readonly text: string }
+  | {
+      readonly kind: "media";
+      readonly mediaReference: MediaReferenceItem;
+      readonly requirementId: string;
+    };
 
 function readChatParts(
   value: JsonValue,
   limits: ModelOperationLimits,
   label: string,
+  mediaRequirementIds: ReadonlySet<string>,
 ): readonly RequestedChatPart[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw capabilityArgumentError(`${label} must be a non-empty array`);
@@ -222,24 +236,61 @@ function readChatParts(
   return value.map((part, index) => {
     const parsed = assertClosedArguments(
       part as JsonValue,
-      ["kind", "text", "mediaId", "requirementId"],
+      ["kind", "text", "mediaId", "mediaReference", "requirementId"],
       `${label}[${index}]`,
     );
     const kind = requireString(parsed, "kind", `${label}[${index}]`);
     if (kind === "media") {
-      // A model handle is not a Media grant. Dropping the media part and
-      // sending the remaining text would be a silent downgrade, so the whole
-      // request fails and the extension can see exactly why.
-      throw modelDenied(
-        "MODEL_MEDIA_NOT_GRANTED",
-        "This model handle carries no Media permission for a media part",
-        { partIndex: index },
+      if (mediaRequirementIds.size === 0) {
+        // A text-only model handle is not a Media grant. Dropping the media
+        // part would be a silent downgrade, so the complete request fails.
+        throw modelDenied(
+          "MODEL_MEDIA_NOT_GRANTED",
+          "This model handle carries no Media permission for a media part",
+          { partIndex: index },
+        );
+      }
+      if (readField(parsed, "mediaId") !== undefined) {
+        throw capabilityArgumentError(
+          `${label}[${index}] must carry mediaReference instead of mediaId`,
+        );
+      }
+      if (readField(parsed, "text") !== undefined) {
+        throw capabilityArgumentError(`${label}[${index}] media part cannot carry text`);
+      }
+      const requirementId = requireString(
+        parsed,
+        "requirementId",
+        `${label}[${index}]`,
       );
+      if (!mediaRequirementIds.has(requirementId)) {
+        throw modelDenied(
+          "MODEL_MEDIA_NOT_GRANTED",
+          "This model handle does not grant the requested Media requirement",
+          { partIndex: index, requirementId },
+        );
+      }
+      let mediaReference: MediaReferenceItem;
+      try {
+        mediaReference = parseMediaReferenceItem(
+          readField(parsed, "mediaReference"),
+          `${label}[${index}].mediaReference`,
+        );
+      } catch {
+        throw capabilityArgumentError(
+          `${label}[${index}].mediaReference is not a valid Media reference`,
+        );
+      }
+      return { kind: "media" as const, mediaReference, requirementId };
     }
     if (kind !== "text") {
       throw capabilityArgumentError(`${label}[${index}].kind is not a supported part kind`);
     }
-    if (readField(parsed, "mediaId") !== undefined || readField(parsed, "requirementId") !== undefined) {
+    if (
+      readField(parsed, "mediaId") !== undefined ||
+      readField(parsed, "mediaReference") !== undefined ||
+      readField(parsed, "requirementId") !== undefined
+    ) {
       throw capabilityArgumentError(`${label}[${index}] text part cannot carry Media fields`);
     }
     const text = requireString(parsed, "text", `${label}[${index}]`);
@@ -264,8 +315,12 @@ function readChatParts(
  */
 function buildModelOperationCapability(
   options: ModelOperationCapabilityOptions,
-  capabilityVersion: typeof MODEL_OPERATION_CAPABILITY_VERSION | typeof MODEL_OPERATION_CAPABILITY_VERSION_V2,
+  capabilityVersion:
+    | typeof MODEL_OPERATION_CAPABILITY_VERSION
+    | typeof MODEL_OPERATION_CAPABILITY_VERSION_V2
+    | typeof MODEL_OPERATION_CAPABILITY_VERSION_V3,
   configuredOutputContracts: readonly ModelOutputContractKind[],
+  configuredMediaRequirementIds: readonly string[] = [],
 ): ExtensionCapabilityDefinition {
   const limits = resolveLimits(options.limits);
   try {
@@ -321,6 +376,34 @@ function buildModelOperationCapability(
   if (outputContracts.length === 0) {
     throw configError("A model operation capability requires an output contract");
   }
+
+  const mediaRequirementIds = [...new Set(configuredMediaRequirementIds)];
+  if (capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V3) {
+    if (modality !== "chat" || mediaRequirementIds.length === 0) {
+      throw configError("Model operation v3 requires at least one chat Media requirement");
+    }
+    for (const requirementId of mediaRequirementIds) {
+      assertHostIdentifier(requirementId, "mediaRequirementId");
+    }
+    if (
+      options.budgets.maxMediaItems === undefined ||
+      options.budgets.maxResolvedMediaBytes === undefined
+    ) {
+      throw configError("Model operation v3 requires finite Media item and byte budgets");
+    }
+    try {
+      assertPositiveLimit(options.budgets.maxMediaItems, "model Media maxMediaItems");
+      assertPositiveLimit(
+        options.budgets.maxResolvedMediaBytes,
+        "model Media maxResolvedMediaBytes",
+      );
+    } catch {
+      throw configError("Model operation v3 Media budgets must be positive safe integers");
+    }
+  } else if (mediaRequirementIds.length !== 0) {
+    throw configError("Only model operation v3 can grant Media requirements");
+  }
+  const mediaRequirements = new Set(mediaRequirementIds);
   for (const outputContract of outputContracts) {
     if (outputContract !== "text" && outputContract !== "json-object") {
       throw configError(`Model output contract ${String(outputContract)} is not defined`);
@@ -376,8 +459,11 @@ function buildModelOperationCapability(
       reasoningPolicies: [...reasoningPolicies],
       providerStreaming: allowStreaming,
       roles: [...roles],
-      ...(capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V2
+      ...(capabilityVersion !== MODEL_OPERATION_CAPABILITY_VERSION
         ? { outputContracts: [...outputContracts] }
+        : {}),
+      ...(capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V3
+        ? { mediaRequirementIds: [...mediaRequirementIds] }
         : {}),
       limits: { ...limits },
     },
@@ -520,7 +606,7 @@ function buildModelOperationCapability(
   } => {
     const parsed = assertClosedArguments(
       argumentsValue,
-      capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V2
+      capabilityVersion !== MODEL_OPERATION_CAPABILITY_VERSION
         ? [...CHAT_ARGUMENT_FIELDS_V2]
         : [...CHAT_ARGUMENT_FIELDS],
       "model.chat",
@@ -574,6 +660,7 @@ function buildModelOperationCapability(
         readField(entry, "parts") ?? null,
         limits,
         `model.chat.messages[${index}].parts`,
+        mediaRequirements,
       );
       return { role, parts };
     });
@@ -610,7 +697,7 @@ function buildModelOperationCapability(
     }
     const input: ChatBrokerInvocation["input"] = {
       schemaVersion:
-        capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V2
+        capabilityVersion !== MODEL_OPERATION_CAPABILITY_VERSION
           ? "dolly.model.chat-input/3"
           : "dolly.model.chat-input/2",
       messages: normalizedMessages,
@@ -623,6 +710,20 @@ function buildModelOperationCapability(
         inputBytes,
         maxInputBytes: budgets.maxInputBytes,
       });
+    }
+    const mediaItems = normalizedMessages.reduce(
+      (count, message) => count + message.parts.filter((part) => part.kind === "media").length,
+      0,
+    );
+    if (
+      mediaItems > 0 &&
+      (budgets.maxMediaItems === undefined || mediaItems > budgets.maxMediaItems)
+    ) {
+      throw modelQuota(
+        "MODEL_INPUT_LIMIT",
+        "Model request exceeds the granted Media item budget",
+        { mediaItems, maxMediaItems: budgets.maxMediaItems ?? 0 },
+      );
     }
     return {
       input,
@@ -716,8 +817,10 @@ function buildModelOperationCapability(
       assertClosedArguments(argumentsValue, [], "model.describe");
       return {
         schemaVersion:
-          capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V2
-            ? "dolly.model-operation-description/2"
+          capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V3
+            ? "dolly.model-operation-description/3"
+            : capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V2
+              ? "dolly.model-operation-description/2"
             : "dolly.model-operation-description/1",
         modality,
         model: modelProjection(),
@@ -729,8 +832,11 @@ function buildModelOperationCapability(
           : allowStreaming
             ? "optional"
             : "forbidden",
-        ...(capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V2
+        ...(capabilityVersion !== MODEL_OPERATION_CAPABILITY_VERSION
           ? { outputContracts: [...outputContracts].sort() }
+          : {}),
+        ...(capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V3
+          ? { mediaRequirementIds: [...mediaRequirementIds].sort() }
           : {}),
         limits: {
           maxMessages: limits.maxMessages,
@@ -746,6 +852,12 @@ function buildModelOperationCapability(
           ...(grantedMaxOutputTokens === undefined
             ? {}
             : { maxOutputTokens: grantedMaxOutputTokens }),
+          ...(capabilityVersion === MODEL_OPERATION_CAPABILITY_VERSION_V3
+            ? {
+                maxMediaItems: budgets.maxMediaItems!,
+                maxResolvedMediaBytes: budgets.maxResolvedMediaBytes!,
+              }
+            : {}),
         },
       };
     }
@@ -896,6 +1008,23 @@ export function createModelOperationCapabilityV2(
     options,
     MODEL_OPERATION_CAPABILITY_VERSION_V2,
     options.outputContracts,
+  );
+}
+
+/**
+ * Version three permits only strict Block Media references selected by a
+ * Host-granted requirement. Paths, URLs, Base64 bytes, access modes, and
+ * resolver results are not part of its closed argument contract; the broker's
+ * Host-only resolver remains the authority for the active delivered Run.
+ */
+export function createModelOperationCapabilityV3(
+  options: ModelOperationCapabilityV3Options,
+): ExtensionCapabilityDefinition {
+  return buildModelOperationCapability(
+    options,
+    MODEL_OPERATION_CAPABILITY_VERSION_V3,
+    options.outputContracts,
+    options.mediaRequirementIds,
   );
 }
 

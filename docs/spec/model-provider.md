@@ -1010,12 +1010,19 @@ uncropped Media reference actually present in a delivered Block before it asks
 Host-only port, not an Extension capability and not an arbitrary callback
 accepted from an Extension.
 
-This internal path does not expose Media through `model-operation` version 1 or
-version 2; both remain text-only and visibly return `MODEL_MEDIA_NOT_GRANTED`.
-It also does not enable configured Modules in the public runtime. A future
-model-operation version must bind the delivered-Media authority to its active
-Run without allowing the Extension to submit a path, URL, Base64 value, access
-mode, strategy, or resolver result.
+`model-operation` versions 1 and 2 remain text-only and visibly return
+`MODEL_MEDIA_NOT_GRANTED`. Version 3 is the narrow candidate bridge to this
+internal path: its closed argument accepts only the exact
+`MediaReferenceItem`, a Host-granted requirement identifier, and finite media
+item and resolved-byte budgets for the Host-verified active Run. It does not
+resolve or authorize the bytes. The broker's Host-only resolver still proves
+that the reference belongs to that Run's delivered Claim before any secret or
+network access. A path, Uniform Resource Locator (URL), Base64 value, access
+mode, placement strategy, or resolver result is not a version 3 argument.
+
+This candidate does not enable configured Modules in the public runtime. The
+Module startup refusal remains in force until the complete runtime boundary is
+supported and independently verified.
 
 The model provider broker MUST NOT construct object-store or crop URLs,
 change a private object to public, or substitute the original Media when a crop

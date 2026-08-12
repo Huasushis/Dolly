@@ -484,11 +484,16 @@ failed stream as a non-stream request.
 
 The current installed-Module candidate composes only this required mode. The
 validated Module selects an operator-owned policy identifier; the Host maps it
-to one descriptor and finite budgets, issues an active-Run
+to one descriptor and finite budgets, issues an active-Run text-only
 `model-operation/v2` handle, requires idempotency, and records each invocation
-in a file-backed effect journal. This candidate does not yet persist the policy
-table and does not enable the public Module bootstrap. Embedding is outside the
-chat-generation handle and remains non-streaming.
+in a file-backed effect journal. A separately selected candidate policy may
+issue `model-operation/v3` only when it freezes a non-empty media-requirement
+set and finite media item and resolved-byte budgets. Version 3 accepts a strict
+delivered Block media reference; the Host-only broker resolver, not the
+Extension, authorizes and copies its bytes for the active Run. The generic LLM
+extension has not yet adopted this media path. Neither candidate enables the
+public Module bootstrap, and the policy table is not yet persistent. Embedding
+is outside the chat-generation handle and remains non-streaming.
 
 Slow consumers receive bounded backpressure. Disconnect, malformed stream,
 timeout, or cancellation marks provisional output incomplete. Only a validated

@@ -273,7 +273,7 @@ describe("installed reactive Module runtime composition", () => {
     });
   }
 
-  function modelPolicies() {
+  function modelPolicies(media = false) {
     const descriptors = new ModelDescriptorRegistry({
       schemaDigest: MODEL_SCHEMA_DIGEST,
       allowedStrategyIds: CHAT_STRATEGIES,
@@ -314,9 +314,13 @@ describe("installed reactive Module runtime composition", () => {
             maxInputBytes: 48 * 1024,
             maxOutputBytes: 128 * 1024,
             maxOutputTokens: 5_200,
+            ...(media
+              ? { maxMediaItems: 1, maxResolvedMediaBytes: 32 * 1024 }
+              : {}),
           },
           chat: { invoke },
           outputContracts: ["text"],
+          ...(media ? { mediaRequirementIds: ["inline-png-v1"] } : {}),
           reasoningPolicies: ["require", "disable"],
           roles: ["system", "user"],
           limits: {
@@ -638,6 +642,41 @@ describe("installed reactive Module runtime composition", () => {
     });
     expect(composed.permissionPolicySetup?.snapshot.packageDigest)
       .toBe(composed.resolvedModule.installation.packageDigest);
+    expect(selected.invoke).not.toHaveBeenCalled();
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
+  });
+
+  it("selects model-operation v3 only for a finite delivered-Media policy", () => {
+    const configuration = validateDollyInstanceConfig({
+      ...instanceConfiguration,
+      modules: instanceConfiguration.modules.map((module) => ({
+        ...module,
+        permissionPolicyIds: ["model.owner-primary"],
+      })),
+    });
+    const pair = coreState("model-media-policy", configuration);
+    const selected = modelPolicies(true);
+    const composed = createInstalledReactiveModuleRuntime({
+      ...options(pair),
+      instanceConfiguration: configuration,
+      permissionPolicies: selected.registry,
+      effectIntentStore: new FileEffectIntentStore({
+        path: resolve(scratch, "model-media-policy-effect-intents.json"),
+      }),
+    });
+
+    expect(composed.permissionPolicySetup?.snapshot.capabilities).toEqual([{
+      capabilityType: "model-operation",
+      capabilityVersion: "v3",
+      policyId: "model.owner-primary",
+      streaming: "required",
+      mediaRequirementIds: ["inline-png-v1"],
+    }]);
+    const capability = composed.permissionPolicySetup?.snapshot.capabilities[0];
+    if (capability?.capabilityType !== "model-operation") {
+      throw new Error("Expected the installed model capability");
+    }
+    expect(Object.isFrozen(capability.mediaRequirementIds)).toBe(true);
     expect(selected.invoke).not.toHaveBeenCalled();
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
