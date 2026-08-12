@@ -1,0 +1,264 @@
+{
+  "schemaVersion": "dolly.experiment-preregistration/1",
+  "experimentId": "multimodal-input-v0",
+  "status": "preregistered-before-execution",
+  "registeredAt": "2026-08-09T03:08:16.303Z",
+  "sourceRevision": "implementation and consumer SHA-256 values recorded in the run manifest",
+  "question": "Which local image delivery contracts are sufficiently bounded and falsifiable to guide Dolly's endpoint/model-specific multimodal adapter design without relying on owner infrastructure?",
+  "scope": {
+    "proves": [
+      "OpenAI-compatible request transport to an independently parsing local mock endpoint",
+      "bounded local-file inspection and chunk reads",
+      "private signed URL fetch, exact signed crop, pinned object version, expiry, and recoverable deletion semantics in a local object-store simulation",
+      "endpoint/model capability profiles deterministically select or reject a delivery mode"
+      ,
+      "whether the owner's configured Aether qwen3.6-27b endpoint completes one fixed image-grounded task through the standard OpenAI-compatible inline data URL shape"
+    ],
+    "doesNotProve": [
+      "semantic image understanding beyond the fixed image, prompt, endpoint/model, and run recorded here",
+      "compatibility with any endpoint other than the exact configured Aether endpoint/model observed during this run",
+      "Aliyun Object Storage Service behavior or permissions",
+      "Dolly product support, because the current chat codec rejects unresolved media references",
+      "Module startup safety or runtime service behavior"
+    ]
+  },
+  "hypotheses": [
+    {
+      "id": "H1",
+      "statement": "For a profile that explicitly supports inline PNG input, a canonical base64 data URL transfers exact bytes and all registered size, type, request-size, truncation, and text-only counterexamples are rejected at the registered boundary."
+    },
+    {
+      "id": "H2",
+      "statement": "A stat-first, digest-bound, maximum-64-byte chunk reader reconstructs the exact local image while refusing oversized chunks and refusing reads after the file changes."
+    },
+    {
+      "id": "H3",
+      "statement": "For a URL-only profile, a version-pinned private signed URL lets the mock model fetch exact full and cropped image bytes, while crop tampering, expiry, omitted version, and a recovered deletion fail closed."
+    },
+    {
+      "id": "H4",
+      "statement": "The same local image yields different, deterministic delivery decisions for inline-capable, URL-only, and text-only endpoint/model profiles; no provider name heuristic or public URL is needed."
+    },
+    {
+      "id": "H5",
+      "statement": "The exact configured Aether qwen3.6-27b endpoint, with strict SSE, terminal usage, thinking.type=disabled, and no enable_thinking field, completes the fixed image-grounded extraction task in all three repetitions and completes one follow-up calculation grounded in the same image context, while a text-only control does not produce the exact hidden visual values."
+    }
+  ],
+  "baselines": [
+    {
+      "id": "text-only-control",
+      "description": "A text-only request to the text-only mock profile succeeds, proving the local endpoint is live without implying media support."
+    },
+    {
+      "id": "unresolved-current-chat-codec",
+      "description": "At the registered source revision, src/core/model-provider-chat.ts always rejects a validated media part with CHAT_FEATURE_UNSUPPORTED before its text-only wire strategy is encoded."
+    }
+  ],
+  "fixtures": {
+    "generator": "sharp 0.35.x from deterministic raw RGB pixels",
+    "seed": 20260809,
+    "images": [
+      {
+        "id": "png-v1",
+        "format": "image/png",
+        "width": 8,
+        "height": 6
+      },
+      {
+        "id": "png-v2",
+        "format": "image/png",
+        "width": 8,
+        "height": 6
+      },
+      {
+        "id": "webp-v1",
+        "format": "image/webp",
+        "width": 8,
+        "height": 6
+      },
+      {
+        "id": "large-png",
+        "format": "image/png",
+        "width": 48,
+        "height": 48,
+        "purpose": "exceed the per-image byte limit while remaining within the dimension limit"
+      },
+      {
+        "id": "agent-task-png",
+        "format": "image/png",
+        "width": 640,
+        "height": 360,
+        "purpose": "fixed real-model image-grounded extraction and calculation task",
+        "expected": {
+          "title": "DOLLY VISUAL CHECK",
+          "visualNonce": "K8M2",
+          "boxes": [
+            { "color": "red", "label": "ALPHA", "number": 7 },
+            { "color": "blue", "label": "BETA", "number": 4 },
+            { "color": "green", "label": "GAMMA", "number": 9 }
+          ],
+          "checksum": 20,
+          "answerToken": 12,
+          "followup": 59
+        }
+      }
+    ],
+    "signedCrop": {
+      "left": 2,
+      "top": 1,
+      "width": 3,
+      "height": 2
+    },
+    "localSigningKey": "multimodal-input-v0-public-test-key-not-a-secret"
+  },
+  "backends": [
+    {
+      "endpointId": "local-openai-compatible-mock",
+      "modelId": "inline-vision-v0",
+      "media": {
+        "mimeTypes": [
+          "image/png"
+        ],
+        "deliveryModes": [
+          "inline-data-url"
+        ],
+        "maxItems": 1,
+        "maxBytesPerItem": 4096,
+        "maxAggregateBytes": 4096,
+        "maxWidth": 64,
+        "maxHeight": 64
+      },
+      "maxRequestBytes": 16384,
+      "fetchesAfterAcceptance": false
+    },
+    {
+      "endpointId": "owner-aether-configured-private-endpoint",
+      "modelId": "qwen3.6-27b",
+      "media": {
+        "probeDeliveryMode": "inline-data-url",
+        "probeMimeType": "image/png",
+        "capabilityBeforeRun": "unknown",
+        "capabilityEvidence": "three exact image-task outcomes, not request acceptance alone"
+      },
+      "reasoningControl": "send thinking.type=disabled, forbid enable_thinking, and require empty reasoning_content for this bounded extraction role",
+      "generationWire": "stream=true, stream_options.include_usage=true, response_format.type=json_object, temperature=0, 1200 max tokens for extraction and 800 for follow-up",
+      "secrets": "read AETHER_BASE_URL and AETHER_API_KEY from repository .env at execution time; never write either value, request headers, or response headers",
+      "dependencyStatus": "optional owner deployment evidence; Dolly must remain functional without it"
+    },
+    {
+      "endpointId": "local-openai-compatible-mock",
+      "modelId": "url-only-vision-v0",
+      "media": {
+        "mimeTypes": [
+          "image/png"
+        ],
+        "deliveryModes": [
+          "private-signed-url"
+        ],
+        "maxItems": 1,
+        "maxBytesPerItem": 4096,
+        "maxAggregateBytes": 4096,
+        "maxWidth": 64,
+        "maxHeight": 64,
+        "maxSignedUrlLifetimeSeconds": 60
+      },
+      "maxRequestBytes": 16384,
+      "fetchesAfterAcceptance": true
+    },
+    {
+      "endpointId": "local-openai-compatible-mock",
+      "modelId": "text-only-v0",
+      "media": null,
+      "maxRequestBytes": 16384,
+      "fetchesAfterAcceptance": false
+    }
+  ],
+  "deliverySelectionRule": [
+    "Look up the exact endpointId/modelId capability profile; never infer capability from a provider or model name family.",
+    "Reject unsupported MIME type, dimensions, item count, per-item bytes, aggregate bytes, and request bytes before dispatch when known.",
+    "For local immutable bytes, choose an inline data URL when the exact profile supports it.",
+    "Otherwise choose a private version-pinned signed URL only when the exact profile is URL-only and all URL lifecycle requirements are available.",
+    "Never choose a public URL in this experiment.",
+    "A local chunk reader is a file-inspection tool contract, not a substitute for semantic visual input."
+  ],
+  "cases": [
+    { "id": "text-only-control", "family": "control", "repetitions": 1, "expectedCode": "MODEL_OK" },
+    { "id": "inline-valid", "family": "inline", "repetitions": 3, "expectedCode": "MODEL_IMAGE_OK" },
+    { "id": "inline-text-only-profile", "family": "capability", "repetitions": 1, "expectedCode": "CAPABILITY_MEDIA_UNSUPPORTED" },
+    { "id": "inline-unsupported-mime-preflight", "family": "type", "repetitions": 1, "expectedCode": "CAPABILITY_MIME_UNSUPPORTED" },
+    { "id": "inline-unsupported-mime-provider", "family": "type", "repetitions": 1, "expectedCode": "MODEL_MIME_UNSUPPORTED" },
+    { "id": "inline-mime-mismatch-provider", "family": "type", "repetitions": 1, "expectedCode": "MODEL_MIME_MISMATCH" },
+    { "id": "inline-item-over-limit", "family": "limit", "repetitions": 1, "expectedCode": "CAPABILITY_MEDIA_BYTES_EXCEEDED" },
+    { "id": "inline-request-over-limit", "family": "limit", "repetitions": 1, "expectedCode": "CAPABILITY_REQUEST_BYTES_EXCEEDED" },
+    { "id": "inline-truncated-preflight", "family": "truncation", "repetitions": 1, "expectedCode": "LOCAL_IMAGE_DECODE_FAILED" },
+    { "id": "inline-truncated-provider", "family": "truncation", "repetitions": 1, "expectedCode": "MODEL_IMAGE_DECODE_FAILED" },
+    { "id": "tool-chunk-reconstruct", "family": "local-tool", "repetitions": 3, "expectedCode": "TOOL_RECONSTRUCTION_OK" },
+    { "id": "tool-chunk-over-limit", "family": "local-tool", "repetitions": 1, "expectedCode": "TOOL_CHUNK_LIMIT_EXCEEDED" },
+    { "id": "tool-file-changed", "family": "local-tool", "repetitions": 1, "expectedCode": "TOOL_FILE_CHANGED" },
+    { "id": "url-valid-full", "family": "private-url", "repetitions": 3, "expectedCode": "MODEL_IMAGE_OK" },
+    { "id": "url-valid-signed-crop", "family": "private-url", "repetitions": 3, "expectedCode": "MODEL_IMAGE_OK" },
+    { "id": "url-crop-tampered", "family": "private-url", "repetitions": 1, "expectedCode": "MODEL_FETCH_FORBIDDEN" },
+    { "id": "url-expired", "family": "private-url", "repetitions": 1, "expectedCode": "MODEL_FETCH_FORBIDDEN" },
+    { "id": "url-version-required", "family": "version", "repetitions": 1, "expectedCode": "PRIVATE_URL_VERSION_REQUIRED" },
+    { "id": "url-version-pinned-after-update", "family": "version", "repetitions": 1, "expectedCode": "MODEL_IMAGE_OK" },
+    { "id": "url-lifetime-clamped", "family": "private-url", "repetitions": 1, "expectedCode": "SIGNED_URL_LIFETIME_CLAMPED" },
+    { "id": "url-delete-recovery", "family": "deletion", "repetitions": 1, "expectedCode": "MODEL_FETCH_NOT_FOUND_AFTER_RECOVERY" }
+    ,
+    { "id": "aether-text-only-control", "family": "real-model", "repetitions": 1, "expectedCode": "AETHER_TEXT_CONTROL_NO_EXACT_VISUAL_ANSWER" },
+    { "id": "aether-inline-image-understanding", "family": "real-model", "repetitions": 3, "expectedCode": "AETHER_IMAGE_TASK_PASS" },
+    { "id": "aether-followup-image-use", "family": "real-model", "repetitions": 1, "expectedCode": "AETHER_FOLLOWUP_TASK_PASS" }
+  ],
+  "execution": {
+    "platform": "Linux preferred; portable Node.js 20 and sharp APIs only",
+    "servers": "Two in-process servers bind to 127.0.0.1 on kernel-assigned ports and are closed in finally blocks; no Module or child service is started.",
+    "network": "Mock cases permit loopback only. The five preregistered real-model calls permit only the exact AETHER_BASE_URL loaded from repository .env; every generation uses stream=true, stream_options.include_usage=true, thinking.type=disabled, a bounded strict SSE parser, one usage event and one DONE marker, with no non-stream fallback. No other non-loopback destination is permitted.",
+    "credentials": "Real-model calls use AETHER_API_KEY in the Authorization header in memory. Artifacts omit the endpoint, key, request headers, and response headers. OSS and DashScope credentials are never read.",
+    "repetitionOrder": "case list order, then increasing repetition; no adaptive stopping",
+    "rawData": "One canonical JSON object per line with expected and observed codes, exact request artifact references, fixture digests, and per-case observations.",
+    "independentValidation": "A separate Node.js process reparses every mock request, decodes inline bytes, verifies URL signatures and crop/version fields, reconstructs tool chunks, reparses sanitized real-model public content against the fixed answer key, derives registered checks without trusting pass fields, and writes verification.json."
+  },
+  "metrics": [
+    "registered-case checks passed and failed",
+    "exact transferred SHA-256 digest, decoded MIME type, width, and height",
+    "canonical request bytes",
+    "inline data URL bytes divided by source bytes",
+    "chunk count and total encoded chunk bytes",
+    "signed URL lifetime, fetch status, pinned version, crop output digest and dimensions",
+    "deletion journal transition sequence"
+    ,
+    "real-model HTTP status, strict SSE event/usage/DONE counts, finish reason, content, reasoning_content presence and length, usage, and exact answer-key fields; never reasoning text, endpoint, authorization, or headers"
+  ],
+  "minimumEffectiveDifference": {
+    "contractGate": "All repetitions of every registered case must independently satisfy its case-specific assertion; one failure blocks that delivery path.",
+    "inlineOverhead": "Report but do not gate on an inline request/source byte ratio; it is an engineering cost, not evidence of correctness.",
+    "modelSemantics": "The image arm must pass the exact answer key in 3 of 3 repetitions, the text-only control must not pass the exact hidden answer, and the follow-up must equal 59. Anything weaker does not establish this endpoint/model profile as image-capable."
+  },
+  "stoppingRules": [
+    "Run the fixed matrix once; deterministic success cases have three repetitions and counterexamples have one.",
+    "Do not add, remove, or reinterpret cases after seeing results. Any change requires a new preregistration version and fresh artifact directory.",
+    "Abort and mark infrastructure-inconclusive if loopback binding, sharp decoding, or artifact writes fail for reasons outside a registered case.",
+    "Do not download a model or use more than the already installed dependencies for v0.",
+    "Make exactly five strict-streaming Aether chat-completion calls: one text-only control, three identical image-task repetitions, and one follow-up. Do not retry, use a non-stream fallback, or change the prompt after observing a failure. Both RUN_LIVE_INTEGRATION=1 and RUN_PAID_INTEGRATION=1 are required before reading credentials or sending the first call."
+  ],
+  "decisionRules": [
+    "Recommend inline base64/local bytes as the default only for exact endpoint/model profiles whose inline path passes every H1 case.",
+    "Keep private signed URL as an optional URL-only adapter only if every H3 case passes; otherwise URL-only models remain unsupported.",
+    "Recommend a stat-first bounded chunk tool only if every H2 case passes, and label it file inspection rather than vision.",
+    "Represent delivery mode, MIME types, limits, post-acceptance fetch behavior, signed lifetime, placement, and response evidence in the endpoint/model profile; never use one global model switch.",
+    "Regardless of mock results, current Dolly remains unsupported for chat media until broker resolution, a profile-selected media wire codec, lifecycle cleanup, and real endpoint tests exist."
+    ,
+    "Mark the exact Aether endpoint/model profile provisionally inline-image-capable only if H5 meets its 3/3 plus control plus follow-up rule; request acceptance or a plausible free-form description is insufficient.",
+    "Do not make Dolly depend on Aether, its key, or this model. Treat the result as optional deployment evidence and retain a text-only-capable path."
+  ],
+  "artifacts": [
+    "artifacts/experiments/probes/multimodal-input-v0/manifest.json",
+    "artifacts/experiments/probes/multimodal-input-v0/aether-model-probe.json",
+    "artifacts/experiments/probes/multimodal-input-v0/raw-cases.jsonl",
+    "artifacts/experiments/probes/multimodal-input-v0/requests/*.json",
+    "artifacts/experiments/probes/multimodal-input-v0/fixtures/*",
+    "artifacts/experiments/probes/multimodal-input-v0/summary.json",
+    "artifacts/experiments/probes/multimodal-input-v0/server-events.json",
+    "artifacts/experiments/probes/multimodal-input-v0/sha256sums.json",
+    "artifacts/experiments/probes/multimodal-input-v0/verification.json"
+  ]
+}
