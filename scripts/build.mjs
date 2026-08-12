@@ -2,6 +2,7 @@ import { rmSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { copyRuntimeAssets } from "./copy-runtime-assets.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const distDirectory = resolve(repositoryRoot, "dist");
@@ -25,3 +26,8 @@ if (compileResult.error) {
 if (compileResult.status !== 0) {
   process.exit(compileResult.status ?? 1);
 }
+
+copyRuntimeAssets({
+  repositoryRoot,
+  outputDirectory: distDirectory,
+});

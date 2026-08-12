@@ -1,0 +1,61 @@
+import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { copyRuntimeAssets } from "../../../scripts/copy-runtime-assets.mjs";
+
+const LAUNCHER_PATH = "src/adapters/linux-module-launcher/launcher.py";
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((path) =>
+    rm(path, { recursive: true, force: true })
+  ));
+});
+
+async function fixture() {
+  const root = await mkdtemp(join(tmpdir(), "dolly-build-assets-"));
+  temporaryDirectories.push(root);
+  const repositoryRoot = join(root, "repository");
+  const outputDirectory = join(root, "dist");
+  const source = join(repositoryRoot, LAUNCHER_PATH);
+  mkdirSync(dirname(source), { recursive: true });
+  writeFileSync(source, "#!/usr/bin/python3\nprint('Dolly launcher')\n", { mode: 0o755 });
+  return { repositoryRoot, outputDirectory, source };
+}
+
+describe("runtime build assets", () => {
+  it("copies the Linux launcher beside its compiled module with exact bytes", async () => {
+    const { repositoryRoot, outputDirectory, source } = await fixture();
+
+    expect(copyRuntimeAssets({ repositoryRoot, outputDirectory })).toEqual([LAUNCHER_PATH]);
+
+    const target = join(outputDirectory, LAUNCHER_PATH);
+    expect(readFileSync(target)).toEqual(readFileSync(source));
+    if (process.platform !== "win32") {
+      expect(statSync(target).mode & 0o777).toBe(0o644);
+    }
+  });
+
+  it("fails instead of replacing an unexpected pre-existing output asset", async () => {
+    const { repositoryRoot, outputDirectory } = await fixture();
+    const target = join(outputDirectory, LAUNCHER_PATH);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, "unreviewed launcher\n");
+
+    expect(() => copyRuntimeAssets({ repositoryRoot, outputDirectory })).toThrow();
+    expect(readFileSync(target, "utf8")).toBe("unreviewed launcher\n");
+  });
+
+  it("rejects a directory in place of the reviewed launcher file", async () => {
+    const { repositoryRoot, outputDirectory, source } = await fixture();
+    chmodSync(source, 0o644);
+    await rm(source);
+    mkdirSync(source);
+
+    expect(() => copyRuntimeAssets({ repositoryRoot, outputDirectory })).toThrow(
+      /must be an ordinary file/u,
+    );
+  });
+});
