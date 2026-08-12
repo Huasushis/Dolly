@@ -1,0 +1,89 @@
+{
+  "schemaVersion": "dolly.gateway-sse-canary-preregistration/1",
+  "experimentId": "gateway-strict-sse-v0",
+  "experimentVersion": 0,
+  "status": "frozen-before-first-run",
+  "question": "Does the owner's configured Aether qwen3.6-27b deployment complete one bounded strict streaming request after the gateway timeout change, without a non-stream fallback or retry?",
+  "baseline": {
+    "kind": "historical-only",
+    "description": "Earlier Memory runs recorded timeout or cancellation under the old 120-second gateway, but those runs used different prompts and budgets and are not a paired performance baseline. No new non-stream request is permitted."
+  },
+  "data": {
+    "promptId": "gateway-canary-arithmetic-v0",
+    "system": "You are a bounded transport canary. Reason carefully, then return exactly one JSON object and no Markdown.",
+    "user": "Find the least nonnegative integer x satisfying x mod 97 = 11, x mod 101 = 37, and x mod 103 = 73. Verify all three congruences internally. Return exactly {\"canary\":\"DOLLY_STREAM_OK\",\"x\":integer}.",
+    "expectedCanary": "DOLLY_STREAM_OK"
+  },
+  "backend": {
+    "kind": "owner-aether-openai-compatible-live",
+    "model": "qwen3.6-27b",
+    "modelEndpointCapability": "thinking.type object accepted; enable_thinking forbidden",
+    "credentials": "AETHER_BASE_URL and AETHER_API_KEY from repository .env; neither value may enter artifacts"
+  },
+  "randomness": {
+    "seed": 20260812,
+    "repetitions": 1
+  },
+  "request": {
+    "stream": true,
+    "streamOptions": { "includeUsage": true },
+    "thinking": { "type": "enabled" },
+    "temperature": 0,
+    "maximumOutputTokens": 5200,
+    "maximumResponseBytes": 2097152,
+    "maximumBufferedEventBytes": 262144,
+    "maximumReconstructedOutputBytes": 524288,
+    "maximumEvents": 20000,
+    "timeoutMs": 1800000,
+    "retryCount": 0,
+    "nonStreamFallbackAllowed": false
+  },
+  "metrics": [
+    "HTTP status and response content type",
+    "time to response headers, first body chunk, and terminal DONE",
+    "total response bytes, chunk count, maximum inter-chunk gap, event count, and usage-event count",
+    "finish reason, content character count, non-empty reasoning_content, and token usage",
+    "whether total duration crossed the historical 120-second boundary"
+  ],
+  "minimumEffectiveDifference": {
+    "transportGate": "One HTTP 200 text/event-stream response with one stable provider identity, one finish reason, exactly one usage event, one DONE marker, no bytes after DONE, and no fallback or retry.",
+    "reasoningGate": "Non-empty reasoning_content is required to claim reasoning occurred.",
+    "gatewayBoundaryClaim": "Only a valid stream whose terminal completion occurs after 120 seconds can directly falsify the old 120-second end-to-end cancellation boundary; a faster valid stream proves current strict streaming connectivity only."
+  },
+  "stoppingRules": [
+    "Make exactly one chat-completion request and never retry it.",
+    "Stop after strict terminal completion, the 30-minute client deadline, a transport failure, a non-200 response, or a stream-contract failure.",
+    "Persist partial bounded response bytes and the failure classification before exiting nonzero when possible.",
+    "Do not change the prompt, model, thinking mode, token budget, or parser after observing the result."
+  ],
+  "decisionRules": [
+    "Pass strict-stream-connectivity only when the complete transportGate and reasoningGate hold and the final JSON object contains the expected canary marker.",
+    "Record gateway-over-120s evidence only when strict-stream-connectivity passes and terminal duration is greater than 120000 milliseconds.",
+    "A faster pass is not evidence about the former 120-second boundary.",
+    "Any missing credential, HTTP failure, timeout, invalid SSE, missing usage, missing DONE, empty reasoning, invalid JSON, secret leak, or artifact-write failure is inconclusive or failed as explicitly recorded; there is no fallback."
+  ],
+  "artifacts": [
+    "preregistration.json",
+    "request.json",
+    "response.sse",
+    "chunk-timings.jsonl",
+    "result.json",
+    "manifest.json"
+  ],
+  "independentValidation": {
+    "parser": "scripts/experiments/probes/memory-association-task-switch-v0/strict-chat-sse.mjs",
+    "parserSha256": "d67ef50efac2fa7a32daaa4dc8b57c790afccbe6ef2123bc974af47f14d2999b",
+    "mutationRequirements": [
+      "stream=false must be rejected before network",
+      "missing usage or DONE must fail parsing",
+      "bytes after DONE must fail parsing",
+      "endpoint and credential bytes must be absent from every artifact"
+    ]
+  },
+  "safetyBoundary": {
+    "productRuntimeUsed": false,
+    "moduleLaunchAllowed": false,
+    "moduleStartupRefusalMustRemain": true,
+    "paidCallMaximum": 1
+  }
+}
