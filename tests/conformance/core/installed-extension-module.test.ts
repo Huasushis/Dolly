@@ -135,6 +135,38 @@ function writePackageV2(directory: string, packageVersion: string): void {
   }), "utf8");
 }
 
+function writePackageV3(directory: string, packageVersion: string): void {
+  mkdirSync(resolve(directory, "dist"), { recursive: true, mode: 0o700 });
+  writeFileSync(
+    resolve(directory, "dist", "main.mjs"),
+    "export const installedSourceFixture = true;\n",
+    "utf8",
+  );
+  writeFileSync(resolve(directory, "dolly-extension.json"), JSON.stringify({
+    schemaVersion: "dolly.extension-package/3",
+    extensionId: "org.example.installed",
+    packageVersion,
+    displayName: "Installed source fixture",
+    description: "Exercises source activation and content schema provenance.",
+    supportedProtocolVersions: ["3.0"],
+    entrypoint: "dist/main.mjs",
+    modules: [{
+      moduleKind: "transform",
+      activation: "source",
+      configVersion: 1,
+      configurationSchema: CONFIGURATION_SCHEMA,
+      producedContentSchemas: [{
+        schema: "org.example.installed.result/1",
+        validator: CONTENT_SCHEMA,
+        validatorDigest: canonicalJsonDigest(CONTENT_SCHEMA),
+        maxValueBytes: 256,
+        containsCoreReferences: false,
+      }],
+    }],
+    requestedCapabilities: [],
+  }), "utf8");
+}
+
 function instanceConfiguration(
   packageVersion: string,
   revision: string,
@@ -160,7 +192,7 @@ function instanceConfiguration(
       permissionPolicyIds: [],
       inputPageIds: source ? [] : ["input"],
       outputPageIds: ["output"],
-      subscriptionStart: "from-now",
+      subscriptionStart: source ? "from-head" : "from-now",
       activation,
       limits: {
         claim: source ? null : { maxCount: 1, maxBytes: 4096 },
@@ -310,6 +342,46 @@ describe("installed Extension Module resolution", () => {
     expect(reopened.blocks.get("block-1")?.payload).toEqual(
       proposal({ value: "verified" }).payload,
     );
+  });
+
+  it("retains version 2 producer registrations in a version 3 source package", () => {
+    const source = resolve(scratch, "source-v3");
+    writePackageV3(source, "3.0.0");
+    installations.installNodePackage({ sourceDirectory: source, trust: "trusted" });
+    const configuration = configurations.create({
+      configId: "worker-config",
+      extensionId: "org.example.installed",
+      moduleKind: "transform",
+      configVersion: 1,
+      schema: CONFIGURATION_SCHEMA,
+      configuration: { prefix: "source" },
+    });
+    const instance = instanceConfiguration(
+      "3.0.0",
+      configuration.revision,
+      { kind: "source", trigger: "manual" },
+    );
+
+    const resolved = resolveInstalledExtensionModule({
+      instanceConfiguration: instance,
+      moduleId: "worker",
+      installations,
+      configurations,
+    });
+    const schemas = resolveInstalledContentSchemaRegistrationSet({
+      instanceConfiguration: instance,
+      installations,
+      reservedRegistrations: [],
+      maxRegisteredValueBytes: 1024,
+    });
+
+    expect(resolved.packageModule.activation).toBe("source");
+    expect(schemas.snapshot()).toEqual([
+      expect.objectContaining({
+        schema: "org.example.installed.result/1",
+        producer: expect.objectContaining({ moduleKind: "transform" }),
+      }),
+    ]);
   });
 
   it("rejects a package/configuration schema mismatch and unsupported activation", () => {

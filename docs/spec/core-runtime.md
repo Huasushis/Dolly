@@ -1912,12 +1912,12 @@ The product bootstrap still rejects all configured Modules. The Scheduler
 component implements one narrow delivery-backed periodic policy for scientific
 and deterministic component testing: a periodic registration with input Pages
 and `allowEmptyInput: false` uses the same runtime tick shape as a reactive
-registration. The verified Extension composition does not activate it, because
-package manifest version 1 can declare only reactive support and version 2 is
-reserved for the complete schema-registry contract. Periodic and source process
-activation remain future product-composition requirements. At component level,
-the Scheduler also accepts the authenticated Delivery-backed source queue
-defined in Section 11.3; this does not alter the bootstrap refusal.
+registration. The verified Extension composition does not activate that mode:
+package versions 1 and 2 declare only reactive activation, while version 3 adds
+only the source declaration defined in Section 11.3. At component level, the
+Scheduler also accepts the authenticated Delivery-backed source queue; the
+candidate installed composition can bind manual or external source requests to
+it. Neither fact alters the bootstrap refusal.
 
 ### 11.1 Reactive mode
 
@@ -2005,12 +2005,22 @@ limits remain separate because they measure serialized Blocks rather than the
 request envelopes. The fixed policy treats the private queue's pending Delivery
 count as the source request count and never invents an empty request.
 
-This candidate still does not establish product source execution. The
-installed runtime composer does not construct the binding or prove that its
-`ReactiveModuleRuntime` uses that same private route, no product coordinator
-owns request admission during startup or shutdown, and completed idempotency
-history has no bounded retention policy yet. Source activation without an
-authentic binding remains rejected by Scheduler registration, and every
+The product-before-bootstrap installed composition now accepts only a verified
+`dolly.extension-package/3` source declaration, constructs the queue from the
+same FileCore store, and passes its private Page to both
+`ReactiveModuleRuntime` and Scheduler through the authenticated binding. Source
+queue limits remain explicit composition inputs because instance schema version
+9 cannot persist them. The composition exposes the queue for a future trusted
+ingress owner; it does not itself open manual or external ingress. A configured
+periodic source is rejected before queue reconciliation because no automatic
+producer yet turns clock eligibility into a durable request.
+
+This still does not establish product source execution. No product coordinator
+owns request admission across startup and shutdown, completed idempotency
+history has no bounded retention policy, and the installed source path has not
+yet passed the one-use systemd-container Linux process/cgroup test. Source
+activation without an authentic binding remains rejected by Scheduler
+registration, package versions 1 and 2 remain reactive-only, and every
 configured Module remains rejected by product bootstrap as stated in Section
 9.3.
 

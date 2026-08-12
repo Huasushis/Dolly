@@ -299,6 +299,32 @@ describe("reactive Module host lifecycle", () => {
     }));
   });
 
+  it("preserves a source activation binding when it registers a runtime", () => {
+    const events: string[] = [];
+    const fakeScheduler = scheduler(events);
+    const sourceActivationBinding = {
+      schemaVersion: "dolly.source-activation-binding/1" as const,
+      moduleId: "source",
+      privatePageId: "private-source-page",
+    };
+
+    new ReactiveModuleHost(
+      fakeScheduler as never,
+      [{
+        ...registration("source", runtime("source", events)),
+        inputPageIds: [],
+        activation: { kind: "source" },
+        sourceActivationBinding,
+      }],
+    );
+
+    expect(fakeScheduler.register).toHaveBeenCalledWith(expect.objectContaining({
+      moduleId: "source",
+      activation: { kind: "source" },
+      sourceActivationBinding,
+    }));
+  });
+
   it("rolls already-started runtimes back in reverse order without starting Scheduler", async () => {
     const events: string[] = [];
     const fakeScheduler = scheduler(events);
@@ -340,7 +366,7 @@ describe("reactive Module host lifecycle", () => {
 
     expect(() => composeReactiveModuleHost(composition(configuredInstance({
       activation: { kind: "periodic", periodMs: 1000, allowEmptyInput: true },
-    })))).toThrow(/empty or source completion boundary/u);
+    })))).toThrow(/empty periodic completion boundary/u);
 
     expect(() => composeReactiveModuleHost(composition(configuredInstance({
       isolation: "none",

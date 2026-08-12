@@ -785,6 +785,15 @@ export function validateDollyInstanceConfig(value: JsonValue): DollyInstanceConf
         `Source Module ${module.moduleId} cannot have input Pages`,
       );
     }
+    if (
+      module.activation.kind === "source" &&
+      module.subscriptionStart !== "from-head"
+    ) {
+      throw new RuntimeConfigError(
+        "RUNTIME_CONFIG_TOPOLOGY_INVALID",
+        `Source Module ${module.moduleId} must retain source requests from head`,
+      );
+    }
     if (module.activation.kind !== "source" && module.inputPageIds.length === 0) {
       throw new RuntimeConfigError(
         "RUNTIME_CONFIG_TOPOLOGY_INVALID",

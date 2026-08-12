@@ -544,8 +544,9 @@ falsifiable and none asserts only that a status string was returned.
   publisher and Module-role identity, validator digests, conflicts, value byte
   limits, and pinned validators. `BlockStore.normalizeInput` can enforce that
   complete immutable set before allocating a Block identifier. It deliberately
-  can now be built from integrity-checked `dolly.extension-package/2`
-  installations by `resolveInstalledContentSchemaRegistrationSet`, and a
+  can now be built from integrity-checked `dolly.extension-package/2` or
+  `dolly.extension-package/3` installations by
+  `resolveInstalledContentSchemaRegistrationSet`, and a
   `FileCoreStateStore` can bind that exact frozen set to Block restore and
   commit. The installed Scheduler composition refuses unless that exact object
   is bound to its FileCore state and its public metadata can be rederived from
@@ -559,7 +560,9 @@ falsifiable and none asserts only that a status string was returned.
   `extension-process-protocol.md` Section 3 defines
   `dolly.extension-package/2` as the complete first producer-registration
   manifest. Version 1 remains unchanged and cannot declare a registration.
-  Version 2 does not silently acquire activation or capability fields.
+  Version 2 does not silently acquire activation or capability fields. Version
+  3 retains the same registration entries while adding the narrow source
+  activation declaration; it does not change schema ownership or grants.
 - **A name syntax for `data` items.** `block-content.ts` requires only a
   non-empty string, so Section 4.1 is a new constraint that
   `block-payload.md` must state.

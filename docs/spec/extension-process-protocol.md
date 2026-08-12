@@ -160,12 +160,22 @@ until a reference extractor is separately specified and implemented. Version 2
 still supports only reactive Modules. It does not add renderer registration,
 capability requests, periodic activation, or source activation.
 
-`requestedCapabilities` MUST be empty in package schema versions 1 and 2.
+`dolly.extension-package/3` retains the complete version-2 producer registration
+shape and permits a Module declaration's existing `activation` field to be
+either `reactive` or `source`. It does not add a second activation list or a
+background protocol. A source declaration means only that the Extension can
+consume one ordinary `dolly.reactive-module-input/2` whose sole input came from
+the Core-private, durable source activation queue. It does not let Extension
+code enqueue work, publish Blocks outside a Run, or invoke itself. Periodic
+activation remains unsupported.
+
+`requestedCapabilities` MUST be empty in package schema versions 1 through 3.
 Capability requests, renderer registration, configuration migrations, package
-signatures, periodic activation, and source activation require a later package
-schema with their own security review and conformance tests. A valid future
-signature may establish package provenance, but it will not grant capabilities
-or trust by itself.
+signatures, and periodic activation require a later package schema with their
+own security review and conformance tests. Source activation in version 3
+grants no capability and no ambient authority. A valid future signature may
+establish package provenance, but it will not grant capabilities or trust by
+itself.
 
 Installation recursively copies only ordinary files under finite file and byte
 limits. It rejects symbolic links, reparse points, path escapes, case-folding
@@ -481,13 +491,16 @@ not an omitted effect. This component path is not yet product startup wiring:
 `runtime-bootstrap.ts` still rejects configured Modules.
 
 No capability currently lets background code activate its own Module. Background
-code MUST NOT publish a Block or call `module.execute` on itself. The current
-verified Extension composition supports only reactive activation. The Scheduler
-component can model a delivery-backed periodic policy, but package schema version
-1 cannot declare that support and Core MUST reject it before process start. A
-host MUST also reject empty periodic, source, and manual activation until their
-durable job and completion boundaries are specified and implemented. Product
-startup still rejects every configured Module.
+code MUST NOT publish a Block or call `module.execute` on itself. The candidate
+installed composition accepts source activation only from package schema
+version 3 and only through an authentic, store-bound Core queue. The Scheduler
+component can model a delivery-backed periodic policy, but package schema
+versions 1 through 3 cannot declare periodic support and Core MUST reject it
+before process start. A version-3 source declaration whose instance trigger is
+periodic is also rejected until a Core-owned producer can persist each timed
+request. Product startup still rejects every configured Module; manual and
+external product ingress, queue-retention policy, and Linux end-to-end
+source-process evidence remain prerequisites.
 
 An extension that prepares durable work during `module.execute` MUST NOT treat
 the returned result as committed. The first Linux Module profile defers both

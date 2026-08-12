@@ -563,11 +563,25 @@ describe("Dolly runtime configuration schema", () => {
         ...source,
         inputPageIds: [],
         outputPageIds: ["output"],
+        subscriptionStart: "from-head",
         activation: { kind: "source", trigger: "manual" },
         limits: { ...limits, claim: null },
       }],
     });
     expect(validated.modules[0]?.limits.claim).toBeNull();
+
+    expect(() => validateDollyInstanceConfig({
+      ...base,
+      pages: [{ pageId: "output" }],
+      modules: [{
+        ...source,
+        inputPageIds: [],
+        outputPageIds: ["output"],
+        subscriptionStart: "from-now",
+        activation: { kind: "source", trigger: "manual" },
+        limits: { ...limits, claim: null },
+      }],
+    })).toThrowError(/retain source requests from head/u);
 
     expect(() => validateDollyInstanceConfig({
       ...base,

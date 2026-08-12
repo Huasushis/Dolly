@@ -183,9 +183,18 @@ describe("installed reactive Module runtime composition", () => {
       now: () => "2026-08-10T00:00:00.000Z",
       contentSchemas,
     });
-    pair.store.deliveries.createPage("input");
-    pair.store.deliveries.createPage("output");
-    pair.store.deliveries.registerConsumer("input", "worker", "from-now");
+    for (const page of configuration.pages) {
+      pair.store.deliveries.createPage(page.pageId);
+    }
+    for (const module of configuration.modules) {
+      for (const pageId of module.inputPageIds) {
+        pair.store.deliveries.registerConsumer(
+          pageId,
+          module.moduleId,
+          module.subscriptionStart,
+        );
+      }
+    }
     return { ...pair, contentSchemas };
   }
 
@@ -703,6 +712,199 @@ describe("installed reactive Module runtime composition", () => {
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
 
+  it("binds a package-version-3 source Module to one Core-private activation queue", async () => {
+    const sourcePackage = resolve(scratch, "source-package");
+    mkdirSync(sourcePackage, { recursive: true, mode: 0o700 });
+    writeFileSync(resolve(sourcePackage, "main.mjs"), "export const source = true;\n", "utf8");
+    writeFileSync(resolve(sourcePackage, "dolly-extension.json"), JSON.stringify({
+      schemaVersion: "dolly.extension-package/3",
+      extensionId: "org.example.source-runtime",
+      packageVersion: "1.0.0",
+      displayName: "Installed source fixture",
+      description: "Consumes bounded Core-private source activation requests.",
+      supportedProtocolVersions: ["3.0"],
+      entrypoint: "main.mjs",
+      modules: [{
+        moduleKind: "refresh",
+        activation: "source",
+        configVersion: 1,
+        configurationSchema: SCHEMA,
+        producedContentSchemas: [],
+      }],
+      requestedCapabilities: [],
+    }), "utf8");
+    installations.installNodePackage({ sourceDirectory: sourcePackage, trust: "trusted" });
+    const sourceConfiguration = configurations.create({
+      configId: "source-config",
+      extensionId: "org.example.source-runtime",
+      moduleKind: "refresh",
+      configVersion: 1,
+      schema: SCHEMA,
+      configuration: { prefix: "source" },
+    });
+    const sourceInstance = validateDollyInstanceConfig({
+      ...createDefaultDollyInstanceConfig(INSTANCE_ID),
+      pages: [{ pageId: "source-output" }],
+      modules: [{
+        moduleId: "source-worker",
+        extensionId: "org.example.source-runtime",
+        packageVersion: "1.0.0",
+        moduleKind: "refresh",
+        isolation: "process",
+        configurationReference: {
+          configId: sourceConfiguration.configId,
+          revision: sourceConfiguration.revision,
+          configVersion: sourceConfiguration.configVersion,
+        },
+        permissionPolicyIds: [],
+        inputPageIds: [],
+        outputPageIds: ["source-output"],
+        subscriptionStart: "from-head",
+        activation: { kind: "source", trigger: "manual" },
+        limits: {
+          claim: null,
+          maxInputBytes: 4096,
+          maxResultBytes: 4096,
+          maxFrameBytes: 8192,
+          maxRunsPerGeneration: 10,
+          maxGenerations: 2,
+        },
+        timeouts: {
+          initializationTimeoutMs: 1000,
+          executionTimeoutMs: 1000,
+          cancellationGraceMs: 100,
+          terminationTimeoutMs: 1000,
+        },
+      }],
+    });
+    const pair = coreState("source", sourceInstance);
+    const complete = options(pair);
+    const {
+      configurations: _configurations,
+      core: _core,
+      initialModuleGenerationId,
+      installations: _installations,
+      instanceConfiguration: _instanceConfiguration,
+      mailboxes: _mailboxes,
+      moduleId: _moduleId,
+      monotonicNow: _monotonicNow,
+      nextModuleGenerationId,
+      stoppedRecordWriter: _stoppedRecordWriter,
+      ...sharedRuntime
+    } = complete;
+    const runtime = {
+      ...sharedRuntime,
+      initialModuleGenerationIdFor: (moduleId: string) =>
+        `${moduleId}-${initialModuleGenerationId}`,
+      nextModuleGenerationIdFor: (moduleId: string) =>
+        `${moduleId}-${nextModuleGenerationId()}`,
+    };
+    const handoff = await startupHandoff(
+      pair,
+      runtime.resultCommitRepository,
+      [],
+    );
+    const common = {
+      configuration: sourceInstance,
+      installations,
+      configurations,
+      coreState: pair,
+      ...contentSchemaOptions(pair),
+      mailboxes: [],
+      startupRecoveryHandoff: handoff,
+      clock: {
+        monotonicNow: () => 0,
+        schedule: () => ({ cancel: () => undefined }),
+      },
+      scheduling: {
+        maxConcurrentModules: 1,
+        backpressureAction: "pause-upstream" as const,
+        downstreamRecheckMs: 100,
+        noProgressAfterMs: 5_000,
+        claimLimitCount: 1,
+        claimLimitBytes: 1024,
+        retryJitterRatio: 0,
+        lowWatermarkRatio: 1,
+      },
+      runtime,
+    };
+
+    const pagesBeforeRejectedPeriodicSource = pair.store.deliveries.listPageIds();
+    const periodicSourceInstance = validateDollyInstanceConfig({
+      ...sourceInstance,
+      modules: [{
+        ...sourceInstance.modules[0]!,
+        activation: { kind: "source", trigger: "periodic", periodMs: 1_000 },
+      }],
+    });
+    expect(() => composeInstalledReactiveModuleHost({
+      ...common,
+      configuration: periodicSourceInstance,
+      sourceActivationLimits: [{
+        moduleId: "source-worker",
+        maxResidentCount: 2,
+        maxResidentBytes: 4096,
+        maxRequestBytes: 2048,
+      }],
+    })).toThrow(/automatic periodic request producer/u);
+    expect(pair.store.deliveries.listPageIds()).toEqual(
+      pagesBeforeRejectedPeriodicSource,
+    );
+
+    expect(() => composeInstalledReactiveModuleHost({
+      ...common,
+      mailboxes: [{
+        consumerId: "source-worker",
+        pageIds: [],
+        maxResidentCount: 2,
+        maxResidentBytes: 4096,
+      }],
+      sourceActivationLimits: [{
+        moduleId: "source-worker",
+        maxResidentCount: 2,
+        maxResidentBytes: 4096,
+        maxRequestBytes: 2048,
+      }],
+    })).toThrow(/cannot have a public mailbox/u);
+    expect(pair.store.deliveries.listPageIds()).toEqual(
+      pagesBeforeRejectedPeriodicSource,
+    );
+
+    expect(() => composeInstalledReactiveModuleHost(common))
+      .toThrow(/require activation limits/u);
+    const composed = composeInstalledReactiveModuleHost({
+      ...common,
+      sourceActivationLimits: [{
+        moduleId: "source-worker",
+        maxResidentCount: 2,
+        maxResidentBytes: 4096,
+        maxRequestBytes: 2048,
+      }],
+    });
+
+    expect(composed.host.state).toBe("created");
+    expect(composed.sourceActivationQueues).toHaveLength(1);
+    expect(composed.installedRuntimes[0]).toMatchObject({
+      resolvedModule: { module: { moduleId: "source-worker", activation: { kind: "source" } } },
+      sourceActivationBinding: {
+        schemaVersion: "dolly.source-activation-binding/1",
+        moduleId: "source-worker",
+      },
+    });
+    const queue = composed.sourceActivationQueues[0]!;
+    expect(queue.limits).toEqual({
+      maxResidentCount: 2,
+      maxResidentBytes: 4096,
+      maxRequestBytes: 2048,
+    });
+    expect(queue.submit({
+      idempotencyKey: "manual:source-worker:1",
+      body: { kind: "manual/1", instruction: "refresh" },
+    })).toMatchObject({ status: "enqueued" });
+    expect(queue.inspect()).toMatchObject({ pendingCount: 1, residentCount: 1 });
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
+  });
+
   it("composes every configured installed Module into one Scheduler host", async () => {
     const first = instanceConfiguration.modules[0]!;
     const pipelineConfiguration = validateDollyInstanceConfig({
@@ -719,8 +921,6 @@ describe("installed reactive Module runtime composition", () => {
       }],
     });
     const pair = coreState("pipeline", pipelineConfiguration);
-    pair.store.deliveries.createPage("middle");
-    pair.store.deliveries.registerConsumer("middle", "worker-two", "from-now");
     const complete = options(pair);
     const {
       configurations: _configurations,

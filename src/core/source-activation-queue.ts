@@ -297,8 +297,8 @@ function parseEnvelope(block: Block, moduleId: string): SourceActivationEnvelope
  * The queue reuses the existing Block, Delivery, Claim, retry and result-commit
  * boundary. The private Page is an implementation detail and is never a route
  * supplied by an Extension or instance configuration. This class only creates
- * and admits requests; Scheduler registration remains deliberately unsupported
- * until product composition can prove that private route provenance.
+ * and admits requests. The candidate installed composition can bind it to the
+ * same Runtime and Scheduler; product bootstrap remains disabled.
  */
 export class SourceActivationQueue {
   readonly #core: FileCoreStateStore;
@@ -344,6 +344,18 @@ export class SourceActivationQueue {
 
   get moduleId(): string {
     return this.#moduleId;
+  }
+
+  get limits(): Readonly<{
+    maxResidentCount: number;
+    maxResidentBytes: number;
+    maxRequestBytes: number;
+  }> {
+    return Object.freeze({
+      maxResidentCount: this.#maxResidentCount,
+      maxResidentBytes: this.#maxResidentBytes,
+      maxRequestBytes: this.#maxRequestBytes,
+    });
   }
 
   reconcile(): void {

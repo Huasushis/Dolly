@@ -15,7 +15,10 @@ import {
   type InstalledExtensionModule,
 } from "../core/installed-extension-module.js";
 import type { ModuleActorEvent } from "../core/module-actor.js";
-import type { SchedulerClock, SchedulerEvent } from "../core/module-scheduler.js";
+import type {
+  SchedulerClock,
+  SchedulerEvent,
+} from "../core/module-scheduler.js";
 import type { ModuleConfigurationStore } from "../core/module-configuration-store.js";
 import type { ModuleProcessStoppedRecordWriter } from "../core/module-process-records.js";
 import { createModuleResultCommitCoordinator } from "../core/module-result-commit-factory.js";
@@ -33,6 +36,11 @@ import {
   type ReactiveModuleHost,
   type ReactiveModuleSchedulingConstraints,
 } from "../core/reactive-module-host.js";
+import {
+  resolveSourceActivationSchedulerBinding,
+  SourceActivationQueue,
+  type SourceActivationSchedulerBinding,
+} from "../core/source-activation-queue.js";
 import type { DollyInstanceConfig } from "../core/runtime-config.js";
 import {
   createInstalledLinuxExtensionModuleGenerationFactory,
@@ -77,6 +85,8 @@ export interface InstalledReactiveModuleRuntimeOptions extends Omit<
   readonly initialModuleGenerationId: string;
   readonly nextModuleGenerationId: () => string;
   readonly monotonicNow: () => number;
+  /** Required only for a package-version-3 source Module. */
+  readonly sourceActivationQueue?: SourceActivationQueue;
   readonly lifecycle: InstalledRuntimeLifecycleOptions;
   readonly host: InstalledRuntimeHostOptions;
   readonly classifyFailure: (
@@ -93,6 +103,7 @@ export interface InstalledReactiveModuleRuntime {
   readonly generations: InstalledLinuxExtensionModuleGenerationFactory;
   readonly commits: ModuleResultCommitCoordinator;
   readonly runtime: ReactiveModuleRuntime;
+  readonly sourceActivationBinding?: SourceActivationSchedulerBinding;
 }
 
 function canonicalNow(now: () => string): string {
@@ -151,8 +162,16 @@ function createInstalledReactiveModuleRuntimeInternal(
     configurations: options.configurations,
   });
   const module = resolvedModule.module;
-  if (module.activation.kind !== "reactive") {
-    throw new TypeError("Installed reactive runtime requires reactive activation");
+  if (module.activation.kind === "periodic") {
+    throw new TypeError("Installed Module runtime does not support periodic activation");
+  }
+  if (
+    module.activation.kind === "source" &&
+    module.activation.trigger === "periodic"
+  ) {
+    throw new TypeError(
+      "Installed source Module runtime does not yet provide an automatic periodic request producer",
+    );
   }
   if (module.isolation !== "process") {
     throw new TypeError("Installed reactive runtime requires process isolation");
@@ -188,9 +207,38 @@ function createInstalledReactiveModuleRuntimeInternal(
       );
     }
   }
-  const claim = module.limits.claim;
-  if (claim === null) {
-    throw new TypeError("Installed reactive runtime requires finite Claim limits");
+  const sourceActivationQueue = options.sourceActivationQueue;
+  let sourceActivationBinding: SourceActivationSchedulerBinding | undefined;
+  let inputPageIds: readonly string[];
+  let claimMaxCount: number;
+  let claimMaxBytes: number;
+  if (module.activation.kind === "source") {
+    if (!(sourceActivationQueue instanceof SourceActivationQueue)) {
+      throw new TypeError("Installed source Module runtime requires a source activation queue");
+    }
+    sourceActivationQueue.reconcile();
+    sourceActivationBinding = sourceActivationQueue.schedulerBinding();
+    const route = resolveSourceActivationSchedulerBinding(
+      sourceActivationBinding,
+      module.moduleId,
+      options.core.deliveries,
+    );
+    inputPageIds = [route.privatePageId];
+    // One durable source request is one Module job. The complete serialized
+    // input remains bounded independently by maxInputBytes.
+    claimMaxCount = 1;
+    claimMaxBytes = module.limits.maxInputBytes;
+  } else {
+    if (sourceActivationQueue !== undefined) {
+      throw new TypeError("A reactive Module cannot receive a source activation queue");
+    }
+    const claim = module.limits.claim;
+    if (claim === null) {
+      throw new TypeError("Installed reactive runtime requires finite Claim limits");
+    }
+    inputPageIds = module.inputPageIds;
+    claimMaxCount = claim.maxCount;
+    claimMaxBytes = claim.maxBytes;
   }
   const now = () => canonicalNow(options.now);
   const commits = createModuleResultCommitCoordinator({
@@ -245,10 +293,10 @@ function createInstalledReactiveModuleRuntimeInternal(
   const runtime = new ReactiveModuleRuntime({
     moduleId: module.moduleId,
     initialModuleGenerationId: options.initialModuleGenerationId,
-    inputPageIds: module.inputPageIds,
+    inputPageIds,
     outputPageIds: module.outputPageIds,
-    claimMaxCount: claim.maxCount,
-    claimMaxBytes: claim.maxBytes,
+    claimMaxCount,
+    claimMaxBytes,
     maxInputBytes: module.limits.maxInputBytes,
     maxResultBytes: module.limits.maxResultBytes,
     executionTimeoutMs: module.timeouts.executionTimeoutMs,
@@ -294,7 +342,13 @@ function createInstalledReactiveModuleRuntimeInternal(
       ? {}
       : { onActorEvent: options.onActorEvent }),
   });
-  return Object.freeze({ resolvedModule, generations, commits, runtime });
+  return Object.freeze({
+    resolvedModule,
+    generations,
+    commits,
+    runtime,
+    ...(sourceActivationBinding === undefined ? {} : { sourceActivationBinding }),
+  });
 }
 
 type InstalledHostRuntimeOptions = Omit<
@@ -316,6 +370,13 @@ type InstalledHostRuntimeOptions = Omit<
   readonly nextModuleGenerationIdFor: (moduleId: string) => string;
 };
 
+export interface InstalledSourceActivationLimits {
+  readonly moduleId: string;
+  readonly maxResidentCount: number;
+  readonly maxResidentBytes: number;
+  readonly maxRequestBytes: number;
+}
+
 export interface InstalledReactiveModuleHostOptions {
   readonly configuration: DollyInstanceConfig;
   readonly installations: ExtensionInstallationRegistry;
@@ -326,6 +387,8 @@ export interface InstalledReactiveModuleHostOptions {
   /** Product-before-bootstrap resource ceiling used to rederive the set. */
   readonly maxRegisteredContentValueBytes: number;
   readonly mailboxes: readonly DeliveryMailboxCapacity[];
+  /** Explicit until a later instance schema persists source queue limits. */
+  readonly sourceActivationLimits?: readonly InstalledSourceActivationLimits[];
   /** One-use, store-bound proof produced only after startup stopped old processes. */
   readonly startupRecoveryHandoff: CoreStartupRecoveryHandoff;
   readonly clock: SchedulerClock;
@@ -337,6 +400,7 @@ export interface InstalledReactiveModuleHostOptions {
 
 export interface InstalledReactiveModuleHost {
   readonly installedRuntimes: readonly InstalledReactiveModuleRuntime[];
+  readonly sourceActivationQueues: readonly SourceActivationQueue[];
   readonly host: ReactiveModuleHost;
 }
 
@@ -377,10 +441,73 @@ export function composeInstalledReactiveModuleHost(
       "Installed reactive Module host requires at least one configured Module",
     );
   }
+  // Resolve every package and configuration before source reconciliation is
+  // allowed to mutate Core state. Runtime construction repeats this lookup so
+  // a changed installation cannot pass on a stale preflight object.
+  for (const module of options.configuration.modules) {
+    resolveInstalledExtensionModule({
+      instanceConfiguration: options.configuration,
+      moduleId: module.moduleId,
+      installations: options.installations,
+      configurations: options.configurations,
+    });
+    if (
+      module.activation.kind === "source" &&
+      module.activation.trigger === "periodic"
+    ) {
+      throw new TypeError(
+        `Installed source Module ${module.moduleId} does not yet have an automatic periodic request producer`,
+      );
+    }
+  }
+  const configuredSourceIds = new Set(
+    options.configuration.modules
+      .filter((module) => module.activation.kind === "source")
+      .map((module) => module.moduleId),
+  );
+  const sourceActivationQueues = new Map<string, SourceActivationQueue>();
+  for (const limits of options.sourceActivationLimits ?? []) {
+    if (!configuredSourceIds.has(limits.moduleId)) {
+      throw new TypeError(
+        `Source activation limits name non-source Module ${limits.moduleId}`,
+      );
+    }
+    if (sourceActivationQueues.has(limits.moduleId)) {
+      throw new TypeError(
+        `Source activation limits contain duplicate Module ${limits.moduleId}`,
+      );
+    }
+    const queue = new SourceActivationQueue({
+      core: options.coreState.store,
+      moduleId: limits.moduleId,
+      maxResidentCount: limits.maxResidentCount,
+      maxResidentBytes: limits.maxResidentBytes,
+      maxRequestBytes: limits.maxRequestBytes,
+    });
+    sourceActivationQueues.set(limits.moduleId, queue);
+  }
+  const missingSourceLimits = [...configuredSourceIds]
+    .filter((moduleId) => !sourceActivationQueues.has(moduleId));
+  if (missingSourceLimits.length > 0) {
+    throw new TypeError(
+      `Installed source Modules require activation limits: ${missingSourceLimits.sort().join(", ")}`,
+    );
+  }
+  const orderedSourceActivationQueues = options.configuration.modules
+    .filter((module) => module.activation.kind === "source")
+    .map((module) => sourceActivationQueues.get(module.moduleId)!);
   const moduleMailboxes = options.configuration.modules.map((module) => {
     const matchingMailboxes = options.mailboxes.filter((mailbox) =>
       mailbox.consumerId === module.moduleId
     );
+    if (module.activation.kind === "source") {
+      if (matchingMailboxes.length !== 0) {
+        throw new TypeError(
+          `Installed source Module ${module.moduleId} cannot have a public mailbox`,
+        );
+      }
+      return Object.freeze({ module, mailbox: undefined });
+    }
     if (matchingMailboxes.length !== 1) {
       throw new TypeError(
         `Installed reactive Module host requires one mailbox for Module ${module.moduleId}`,
@@ -397,6 +524,9 @@ export function composeInstalledReactiveModuleHost(
     }
     return Object.freeze({ module, mailbox });
   });
+  // Do not create the private Page until every caller-supplied mailbox and
+  // source limit has passed the non-mutating composition checks above.
+  for (const queue of orderedSourceActivationQueues) queue.reconcile();
   const deferredCommits = consumeCoreStartupRecoveryHandoff({
     handoff: options.startupRecoveryHandoff,
     deliveries: options.coreState.store.deliveries,
@@ -440,6 +570,9 @@ export function composeInstalledReactiveModuleHost(
       nextModuleGenerationId: () =>
         nextModuleGenerationIdFor(module.moduleId),
       monotonicNow: options.clock.monotonicNow,
+      ...(sourceActivationQueues.has(module.moduleId)
+        ? { sourceActivationQueue: sourceActivationQueues.get(module.moduleId)! }
+        : {}),
       ...(deferredByModule.has(module.moduleId)
         ? { initialDeferredCommit: deferredByModule.get(module.moduleId)! }
         : {}),
@@ -450,19 +583,35 @@ export function composeInstalledReactiveModuleHost(
     deliveries: options.coreState.store.deliveries,
     clock: options.clock,
     scheduling: options.scheduling,
-    registrations: moduleMailboxes.map(({ module, mailbox }, index) => ({
-      moduleId: module.moduleId,
-      runtime: installedRuntimes[index]!.runtime,
-      mailbox: {
-        maxResidentCount: mailbox.maxResidentCount,
-        maxResidentBytes: mailbox.maxResidentBytes,
-      },
-      manifest: installedRuntimes[index]!.resolvedModule.installation.manifest,
-    })),
+    registrations: moduleMailboxes.map(({ module, mailbox }, index) => {
+      const installed = installedRuntimes[index]!;
+      const sourceQueue = sourceActivationQueues.get(module.moduleId);
+      return {
+        moduleId: module.moduleId,
+        runtime: installed.runtime,
+        mailbox: sourceQueue === undefined
+          ? {
+              maxResidentCount: mailbox!.maxResidentCount,
+              maxResidentBytes: mailbox!.maxResidentBytes,
+            }
+          : {
+              maxResidentCount: sourceQueue.limits.maxResidentCount,
+              maxResidentBytes: sourceQueue.limits.maxResidentBytes,
+            },
+        manifest: installed.resolvedModule.installation.manifest,
+        ...(installed.sourceActivationBinding === undefined
+          ? {}
+          : { sourceActivationBinding: installed.sourceActivationBinding }),
+      };
+    }),
     ...(options.random === undefined ? {} : { random: options.random }),
     ...(options.onSchedulerEvent === undefined
       ? {}
       : { onSchedulerEvent: options.onSchedulerEvent }),
   });
-  return Object.freeze({ installedRuntimes: Object.freeze(installedRuntimes), host });
+  return Object.freeze({
+    installedRuntimes: Object.freeze(installedRuntimes),
+    sourceActivationQueues: Object.freeze(orderedSourceActivationQueues),
+    host,
+  });
 }

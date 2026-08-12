@@ -385,6 +385,9 @@ as an error.
 ### 6.5 Activation constraints
 
 - A Module whose activation is `source` MUST have no input connections.
+- A source Module's `subscriptionStart` MUST be `from-head`; the field applies
+  to its Core-private queue, and accepting `from-now` would make retained
+  activation requests depend on when composition happened to reconcile it.
 - A Module whose activation is not `source` MUST have at least one input
   connection.
 - Instance schema version 9 can represent reactive, periodic, and source
@@ -396,9 +399,17 @@ as an error.
   periodic compatibility, verified Extension composition rejects periodic
   before process start even though the Scheduler component can model its
   delivery-backed timing policy.
-- Periodic and source process activation remain unsupported. Product bootstrap
-  still rejects all configured Modules. Editing and startup surfaces MUST report
-  an unsupported implementation boundary, not call these declarations malformed.
+- `dolly.extension-package/3` retains the complete version-2 producer schema
+  and may declare one Module kind as `source`. The candidate installed
+  composition then derives the same private queue for Runtime and Scheduler;
+  package versions 1 and 2 remain reactive-only. It can accept requests from a
+  future trusted manual or external ingress owner. A periodic source remains
+  rejected until an automatic producer durably records each clock activation.
+- Periodic process activation remains unsupported. Source has component and
+  product-before-bootstrap composition evidence, but product ingress and Linux
+  execution evidence remain incomplete. Product bootstrap still rejects all
+  configured Modules. Editing and startup surfaces MUST report the unsupported
+  implementation boundary, not call these declarations malformed.
 
 ### 6.6 Finite size limits
 

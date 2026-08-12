@@ -16,6 +16,7 @@ import {
   validateDollyInstanceConfig,
   type DollyInstanceConfig,
 } from "./runtime-config.js";
+import type { SourceActivationSchedulerBinding } from "./source-activation-queue.js";
 
 export type ReactiveModuleHostState =
   | "created"
@@ -41,11 +42,13 @@ export interface ReactiveModuleHostRegistration {
   readonly mailbox: SchedulerMailboxLimits;
   readonly activation?:
     | { readonly kind: "reactive" }
+    | { readonly kind: "source" }
     | {
         readonly kind: "periodic";
         readonly periodMs: number;
         readonly allowEmptyInput: false;
       };
+  readonly sourceActivationBinding?: SourceActivationSchedulerBinding;
 }
 
 /**
@@ -70,6 +73,8 @@ export interface ReactiveModuleHostRuntimeRegistration {
   readonly mailbox: SchedulerMailboxLimits;
   /** Static compatibility input only; this candidate seam does not prove installation provenance. */
   readonly manifest: ExtensionPackageManifest;
+  /** Required for source activation and authenticated against the same Delivery view. */
+  readonly sourceActivationBinding?: SourceActivationSchedulerBinding;
 }
 
 export interface ReactiveModuleHostComposition {
@@ -87,10 +92,11 @@ export interface ReactiveModuleHostComposition {
 
 /**
  * Builds the product-before-startup Delivery-backed vertical slice from one
- * validated instance document. The current verified package manifest supports
- * only reactive Modules. The Scheduler itself can preserve a non-empty
- * periodic descriptor, but composition rejects it until a later complete
- * package schema can declare that support. Page routes and the three released
+ * validated instance document. Package versions 1 and 2 support reactive
+ * Modules; version 3 can additionally declare the durable source mode. The
+ * Scheduler itself can preserve a non-empty periodic descriptor, but
+ * composition rejects it until a later complete package schema can declare
+ * that support. Page routes and the three released
  * polling/retry values come only from the instance document. The constraints
  * absent from instance version 9 must be supplied explicitly and are checked
  * against every Module's hard Claim maxima before a runtime starts.
@@ -132,12 +138,9 @@ export function composeReactiveModuleHost(
   }
 
   const hostRegistrations = configuration.modules.map((module) => {
-    if (
-      module.activation.kind === "source" ||
-      (module.activation.kind === "periodic" && module.activation.allowEmptyInput)
-    ) {
+    if (module.activation.kind === "periodic" && module.activation.allowEmptyInput) {
       throw new TypeError(
-        `Reactive Module composition cannot provide an empty or source completion boundary for Module ${module.moduleId}`,
+        `Reactive Module composition cannot provide an empty periodic completion boundary for Module ${module.moduleId}`,
       );
     }
     if (module.isolation !== "process") {
@@ -146,17 +149,23 @@ export function composeReactiveModuleHost(
       );
     }
     const claim = module.limits.claim;
-    if (claim === null) {
+    if (module.activation.kind !== "source" && claim === null) {
       throw new TypeError(
         `Reactive Module composition requires Claim limits for Module ${module.moduleId}`,
       );
     }
-    if (input.scheduling.claimLimitCount > claim.maxCount) {
+    if (
+      claim !== null &&
+      input.scheduling.claimLimitCount > claim.maxCount
+    ) {
       throw new TypeError(
         `Scheduler claimLimitCount ${input.scheduling.claimLimitCount} exceeds Module ${module.moduleId} maximum ${claim.maxCount}`,
       );
     }
-    if (input.scheduling.claimLimitBytes > claim.maxBytes) {
+    if (
+      claim !== null &&
+      input.scheduling.claimLimitBytes > claim.maxBytes
+    ) {
       throw new TypeError(
         `Scheduler claimLimitBytes ${input.scheduling.claimLimitBytes} exceeds Module ${module.moduleId} maximum ${claim.maxBytes}`,
       );
@@ -175,7 +184,17 @@ export function composeReactiveModuleHost(
           periodMs: module.activation.periodMs,
           allowEmptyInput: false as const,
         }
-      : { kind: "reactive" as const };
+      : module.activation.kind === "source"
+        ? { kind: "source" as const }
+        : { kind: "reactive" as const };
+    if (
+      (activation.kind === "source") !==
+        (registration.sourceActivationBinding !== undefined)
+    ) {
+      throw new TypeError(
+        `Module ${module.moduleId} source activation binding does not match its configured activation`,
+      );
+    }
     return {
       moduleId: module.moduleId,
       runtime: registration.runtime,
@@ -183,6 +202,9 @@ export function composeReactiveModuleHost(
       outputPageIds: module.outputPageIds,
       mailbox: registration.mailbox,
       activation,
+      ...(registration.sourceActivationBinding === undefined
+        ? {}
+        : { sourceActivationBinding: registration.sourceActivationBinding }),
     } satisfies ReactiveModuleHostRegistration;
   });
 
@@ -238,6 +260,9 @@ export class ReactiveModuleHost {
         ...(registration.activation === undefined
           ? {}
           : { activation: Object.freeze({ ...registration.activation }) }),
+        ...(registration.sourceActivationBinding === undefined
+          ? {}
+          : { sourceActivationBinding: registration.sourceActivationBinding }),
       });
     });
     this.#scheduler = scheduler;

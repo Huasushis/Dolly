@@ -157,7 +157,10 @@ export function resolveInstalledContentSchemaRegistrationSet(
       moduleKind: packageModule.moduleKind,
     } as const;
     modules.push({ moduleId: module.moduleId, ...producer });
-    if (installation.manifest.schemaVersion === "dolly.extension-package/2") {
+    if (
+      installation.manifest.schemaVersion === "dolly.extension-package/2" ||
+      installation.manifest.schemaVersion === "dolly.extension-package/3"
+    ) {
       const versionedModule = installation.manifest.modules.find((candidate) =>
         candidate.moduleKind === module.moduleKind
       );

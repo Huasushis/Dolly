@@ -53,6 +53,7 @@ import {
 const PACKAGE_MANIFEST_FILE = "dolly-extension.json";
 const PACKAGE_SCHEMA_VERSION_V1 = "dolly.extension-package/1";
 const PACKAGE_SCHEMA_VERSION_V2 = "dolly.extension-package/2";
+const PACKAGE_SCHEMA_VERSION_V3 = "dolly.extension-package/3";
 const INSTALLATION_RECORD_SCHEMA_VERSION = "dolly.extension-installation/1";
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
@@ -67,7 +68,6 @@ export type { ExtensionTrust } from "./extension-process-host.js";
 
 interface ExtensionPackageModuleCommon extends Readonly<Record<string, JsonValue>> {
   readonly moduleKind: string;
-  readonly activation: "reactive";
   readonly configVersion: number;
   readonly configurationSchema: JsonValue;
 }
@@ -81,13 +81,25 @@ export interface ExtensionContentSchemaProducer extends Readonly<Record<string, 
   readonly containsCoreReferences: false;
 }
 
-export interface ExtensionPackageModuleV1 extends ExtensionPackageModuleCommon {}
+export interface ExtensionPackageModuleV1 extends ExtensionPackageModuleCommon {
+  readonly activation: "reactive";
+}
 
 export interface ExtensionPackageModuleV2 extends ExtensionPackageModuleCommon {
+  readonly activation: "reactive";
   readonly producedContentSchemas: readonly ExtensionContentSchemaProducer[];
 }
 
-export type ExtensionPackageModule = ExtensionPackageModuleV1 | ExtensionPackageModuleV2;
+export interface ExtensionPackageModuleV3 extends ExtensionPackageModuleCommon {
+  /** Version 3 adds only the already-durable source activation contract. */
+  readonly activation: "reactive" | "source";
+  readonly producedContentSchemas: readonly ExtensionContentSchemaProducer[];
+}
+
+export type ExtensionPackageModule =
+  | ExtensionPackageModuleV1
+  | ExtensionPackageModuleV2
+  | ExtensionPackageModuleV3;
 
 /**
  * The closed Extension package manifest is read before any Extension code
@@ -115,9 +127,15 @@ export interface ExtensionPackageManifestV2 extends ExtensionPackageManifestComm
   readonly modules: readonly ExtensionPackageModuleV2[];
 }
 
+export interface ExtensionPackageManifestV3 extends ExtensionPackageManifestCommon {
+  readonly schemaVersion: "dolly.extension-package/3";
+  readonly modules: readonly ExtensionPackageModuleV3[];
+}
+
 export type ExtensionPackageManifest =
   | ExtensionPackageManifestV1
-  | ExtensionPackageManifestV2;
+  | ExtensionPackageManifestV2
+  | ExtensionPackageManifestV3;
 
 export interface ExtensionModuleCompatibility {
   readonly extensionId: string;
@@ -401,7 +419,8 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
   );
   if (
     value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V1 &&
-    value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V2
+    value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V2 &&
+    value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V3
   ) {
     throw new ExtensionInstallationError(
       "EXTENSION_PACKAGE_INVALID",
@@ -459,10 +478,13 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
       );
     }
     moduleKinds.add(moduleKind);
-    if (candidate.activation !== "reactive") {
+    if (
+      candidate.activation !== "reactive" &&
+      !(schemaVersion === PACKAGE_SCHEMA_VERSION_V3 && candidate.activation === "source")
+    ) {
       throw new ExtensionInstallationError(
         "EXTENSION_PACKAGE_INVALID",
-        `${label}.activation must be reactive`,
+        `${label}.activation is unsupported by package schema ${schemaVersion}`,
       );
     }
     try {
@@ -476,11 +498,13 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     }
     const common = {
       moduleKind,
-      activation: "reactive" as const,
+      activation: candidate.activation as "reactive" | "source",
       configVersion: positiveInteger(candidate.configVersion, `${label}.configVersion`),
       configurationSchema: cloneJson(candidate.configurationSchema as JsonValue),
     };
-    if (schemaVersion === PACKAGE_SCHEMA_VERSION_V1) return common;
+    if (schemaVersion === PACKAGE_SCHEMA_VERSION_V1) {
+      return { ...common, activation: "reactive" as const };
+    }
     if (
       !Array.isArray(candidate.producedContentSchemas) ||
       candidate.producedContentSchemas.length > 64
@@ -572,12 +596,15 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
         };
       },
     );
+    if (schemaVersion === PACKAGE_SCHEMA_VERSION_V2) {
+      return { ...common, activation: "reactive" as const, producedContentSchemas };
+    }
     return { ...common, producedContentSchemas };
   });
   if (!Array.isArray(value.requestedCapabilities) || value.requestedCapabilities.length !== 0) {
     throw new ExtensionInstallationError(
       "EXTENSION_PACKAGE_INVALID",
-      "requestedCapabilities must be empty in package schema versions 1 and 2",
+      "requestedCapabilities must be empty in package schema versions 1 through 3",
     );
   }
   return deepFreeze({

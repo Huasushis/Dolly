@@ -61,6 +61,12 @@ function moduleDeclarationV2(
   });
 }
 
+function moduleDeclarationV3(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return moduleDeclarationV2({ activation: "source", ...overrides });
+}
+
 function packageManifest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     schemaVersion: "dolly.extension-package/1",
@@ -480,6 +486,52 @@ describe("static Extension installation registry", () => {
       schemaVersion: "dolly.extension-package/2",
       modules: [moduleDeclarationV2()],
       requestedCapabilities: ["network"],
+    });
+
+    expectInstallationError(
+      () => registry().installNodePackage({ sourceDirectory, trust: "trusted" }),
+      "EXTENSION_PACKAGE_INVALID",
+    );
+  });
+
+  it("installs a version 3 package that explicitly declares source activation", () => {
+    writePackage(sourceDirectory, {
+      schemaVersion: "dolly.extension-package/3",
+      modules: [moduleDeclarationV3()],
+    });
+
+    const installed = registry().installNodePackage({
+      sourceDirectory,
+      trust: "trusted",
+    });
+    const reopened = registry().resolve({
+      extensionId: "org.example.transform",
+      packageVersion: "Release:2026_07",
+    });
+
+    expect(reopened).toEqual(installed);
+    expect(installed.manifest.schemaVersion).toBe("dolly.extension-package/3");
+    if (installed.manifest.schemaVersion !== "dolly.extension-package/3") {
+      throw new Error("Expected package schema version 3");
+    }
+    expect(installed.manifest.modules[0]).toMatchObject({
+      moduleKind: "transform",
+      activation: "source",
+      producedContentSchemas: [
+        expect.objectContaining({ schema: "org.example.transform.result/1" }),
+      ],
+    });
+  });
+
+  it.each([
+    ["periodic activation", moduleDeclarationV3({ activation: "periodic" }), []],
+    ["missing producer registrations", moduleDeclaration({ activation: "source" }), []],
+    ["a requested capability", moduleDeclarationV3(), ["network"]],
+  ])("rejects package schema version 3 with %s", (_label, declaration, capabilities) => {
+    writePackage(sourceDirectory, {
+      schemaVersion: "dolly.extension-package/3",
+      modules: [declaration],
+      requestedCapabilities: capabilities,
     });
 
     expectInstallationError(
