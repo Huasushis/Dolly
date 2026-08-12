@@ -144,6 +144,18 @@ export function validateMemoryConfig(value: JsonValue): MemoryBaselineConfig {
   if (value.schemaVersion !== "dolly.memory-config/1") {
     throw memoryError("MEMORY_CONFIG_INVALID", "Unsupported Memory configuration version");
   }
+  if (value.automaticRecall !== undefined) {
+    if (
+      !isJsonObject(value.automaticRecall) ||
+      Object.keys(value.automaticRecall).length !== 1 ||
+      value.automaticRecall.enabled !== false
+    ) {
+      throw memoryError(
+        "MEMORY_CONFIG_INVALID",
+        "Automatic Memory recall is not implemented and must remain disabled",
+      );
+    }
+  }
   const merged: MemoryBaselineConfig = {
     ...PROVIDER_INDEPENDENT_DEFAULTS,
     ...(value as unknown as Partial<MemoryBaselineConfig>),

@@ -266,6 +266,23 @@ describe("research classification", () => {
       ),
     ).toBe("MEMORY_CONFIG_INVALID");
   });
+
+  it("rejects automatic recall instead of accepting an inoperative setting", () => {
+    expect(
+      codeOf(() =>
+        validateMemoryConfig({
+          schemaVersion: "dolly.memory-config/1",
+          automaticRecall: { enabled: true },
+        }),
+      ),
+    ).toBe("MEMORY_CONFIG_INVALID");
+    expect(
+      validateMemoryConfig({
+        schemaVersion: "dolly.memory-config/1",
+        automaticRecall: { enabled: false },
+      }).automaticRecall.enabled,
+    ).toBe(false);
+  });
 });
 
 /** §5.1: a version 1 record is rejected rather than aliased. */
