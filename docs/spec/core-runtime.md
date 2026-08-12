@@ -424,9 +424,9 @@ Module does not imply that its execution path is available.
 that product connection. It validates the complete version 9 document again,
 requires exactly one supplied runtime and mailbox record for every configured
 Module, accepts only reactive process-isolated Modules, takes Page routes only
-from the validated document, and rejects a Scheduler baseline claim batch above
-any Module's static Claim maximum. The Scheduler settings absent from version 9
-remain explicit trusted inputs. This function is not called by
+from the validated document, and narrows the explicit version-9 candidate Claim
+baseline independently to each Module's static maximum. The Scheduler settings
+absent from version 9 remain explicit trusted inputs. This function is not called by
 `openDollyRuntime`; its real-child-process test is evidence for the vertical
 slice only and does not satisfy Linux control-group ownership, durable external
 effect evidence, configuration resolution, or startup recovery.
@@ -619,20 +619,16 @@ equivalent enforcement on another operating system.
 ```typescript
 interface LinuxModuleProcessLimits {
   memoryMaxBytes: number;
-  maxProcesses: number;
+  maxTasks: number;
   cpuQuotaMicros: number;
   cpuPeriodMicros: number;
   maxOpenFiles: number;
 }
-
-interface LinuxModuleConfiguration extends ModuleConfiguration {
-  linuxProcessLimits: LinuxModuleProcessLimits;
-  declaredExternalEffects: "none" | "core-capabilities-only";
-}
 ```
 
-All values are positive safe integers. `memoryMaxBytes` maps to cgroup
-`memory.max`; `maxProcesses` maps to `pids.max`; `cpuQuotaMicros` and
+All values are safe integers satisfying the exact ranges in Section 5.3.
+`memoryMaxBytes` maps to cgroup `memory.max`; `maxTasks` maps to `pids.max` and
+counts Linux tasks, including threads; `cpuQuotaMicros` and
 `cpuPeriodMicros` are the quota and period written to `cpu.max`; and
 `maxOpenFiles` is applied by the reviewed child launcher as both the soft and
 hard `RLIMIT_NOFILE` limit before Extension code executes. The existing
@@ -641,15 +637,17 @@ cgroup-level termination and empty-cgroup proof. Core writes each limit, reads
 it back, and refuses activation if the expected cgroup version 2 controller or
 operation is unavailable.
 
-`linuxProcessLimits` is required for every executable Module on Linux and is
-not portable configuration. Windows and other platforms continue to reject
-Module activation until a separately reviewed design defines equivalent process
-ownership and resource enforcement. The exact installed package digest and
+The Linux process limits are required for every Module using the
+`linux-process` execution backend and are not portable configuration. Windows
+and other platforms continue to reject that backend until a separately
+reviewed design defines equivalent process ownership and resource enforcement.
+The exact installed package digest and
 configuration revision are persisted before the child launcher starts and remain
 pinned until the associated process record and any unresolved Run are terminal.
 
-`declaredExternalEffects` is the required external-effect declaration for a
-Linux executable Module. It states which effect channels the Module uses, and
+`declaredExternalEffects` is the required cross-platform external-effect
+declaration for an executable Module. It states which effect channels the
+Module uses, and
 it is configuration reviewed by the operator, not a runtime measurement:
 
 - `"none"` declares that the Module makes no external or persistent effect at
@@ -661,15 +659,18 @@ it is configuration reviewed by the operator, not a runtime measurement:
   depends on the capability intent and outcome records defined in Section 7.5.
 
 A Module that uses direct ambient filesystem, network, or subprocess effects
-has no valid value and cannot be configured for automatic activation. The
-first Linux Module runner automatically activates only a Module carrying one
-of these two values, and Core copies the declaration into the Module process
-record. A sandbox backend enforces the declaration for untrusted code; for
-trusted code under ordinary `process` isolation it is an audited operator
-assertion that Core cannot verify, and documentation must state that limit.
-The proposed instance schema version that carries `linuxProcessLimits` and
-`declaredExternalEffects` is `dolly.instance/10`; version 9 continues to
-reject every configured Module.
+has no valid value and cannot be configured for automatic activation. Core
+copies one of these two accepted declarations into the Module process record.
+A backend that proves ambient effects are denied may use the declaration and
+durable capability outcomes when deciding whether a Run is retry-safe. For
+trusted code under ordinary `process` isolation it remains an audited operator
+assertion that Core cannot verify: failure recovery preserves the Claim as an
+unknown outcome and MUST NOT turn an empty capability journal into proof of no
+effect.
+The proposed instance schema version that carries the Linux execution record
+and `declaredExternalEffects` is `dolly.instance/10`; these two fields alone do
+not define that version. Section 5.3 lists the complete version-10 boundary.
+Version 9 continues to reject every configured Module.
 
 The two halves of this declaration have different implementation status. The
 field exists in `dolly.module-process-record/1`, but that record version does
@@ -680,13 +681,265 @@ version/value pairs as unknown outcomes; it neither releases the `none` Run nor
 inspects an otherwise complete capability journal for the
 `core-capabilities-only` Run. A later record version must bind the declaration
 to the accepted instance schema and enforcement boundary before either form of
-automatic recovery is allowed. The configuration half does not
-exist yet: no released instance schema accepts `linuxProcessLimits` or
+automatic recovery is allowed. The configuration half does not exist yet: no
+released instance schema accepts the version-10 execution record or
 `declaredExternalEffects`, so today no product Module can produce the future
 configured record. The candidate installed-process factory uses the
 preserve-only interim behavior described in Section 5.1 and refuses
 caller-supplied declarations and evidence. This is a fail-closed bridge, not an
 implementation of `dolly.instance/10`.
+
+### 5.3 Complete version-10 configuration boundary
+
+`dolly.instance/10` is reserved for the first product Module configuration. It
+MUST NOT be released as a partial schema that merely adds Linux process limits.
+The same version must also remove the trusted out-of-document values currently
+needed by Scheduler composition, persist exact permission policy revisions,
+and represent each input connection's start position. Until every field and
+migration rule in this section is implemented, the runtime validator continues
+to accept only `dolly.instance/9` and product startup continues to reject every
+configured Module.
+
+The following types define the complete proposed change. Fields inherited from
+version 9 and not shown keep their version-9 meaning.
+
+```typescript
+interface SchedulerConfigurationV10 {
+  pollIntervalMs: number;
+  retryBaseMs: number;
+  retryMaxMs: number;
+  maxConcurrentModules: number;
+  backpressureAction:
+    | "pause-upstream"
+    | "delay-upstream"
+    | "reject-upstream-run";
+  downstreamRecheckMs: number;
+  noProgressAfterMs: number;
+  retryJitterBasisPoints: number;
+  lowWatermarkBasisPoints: number;
+  policy: { kind: "fixed" };
+  policyFailureAction: "quarantine";
+}
+
+type InputConnectionStart =
+  | "from-head"
+  | "from-now"
+  | { checkpoint: DecimalSequence };
+
+interface InputConnectionConfiguration {
+  pageId: string;
+  start: InputConnectionStart;
+}
+
+interface ModuleClaimConfiguration {
+  baselineCount: number;
+  baselineBytes: number;
+  maxCount: number;
+  maxBytes: number;
+}
+
+interface ModuleMailboxConfiguration {
+  maxResidentCount: number;
+  maxResidentBytes: number;
+}
+
+interface LinuxProcessExecutionConfiguration {
+  kind: "linux-process";
+  isolation: "process" | "sandbox";
+  limits: {
+    memoryMaxBytes: number;
+    maxTasks: number;
+    cpuQuotaMicros: number;
+    cpuPeriodMicros: number;
+    maxOpenFiles: number;
+  };
+}
+
+interface PermissionPolicyReference {
+  policyId: string;
+  revision: string;
+}
+
+interface ModuleConfigurationV10 {
+  moduleId: string;
+  extensionId: string;
+  packageVersion: string;
+  moduleKind: string;
+  configurationReference: {
+    configId: string;
+    revision: string;
+    configVersion: number;
+  };
+  permissionPolicyReferences: readonly PermissionPolicyReference[];
+  inputConnections: readonly InputConnectionConfiguration[];
+  outputPageIds: readonly string[];
+  activation: ModuleActivation;
+  declaredExternalEffects: "none" | "core-capabilities-only";
+  execution: LinuxProcessExecutionConfiguration;
+  limits: {
+    claim: ModuleClaimConfiguration;
+    mailbox: ModuleMailboxConfiguration;
+    sourceRequestMaxBytes: number | null;
+    maxInputBytes: number;
+    maxResultBytes: number;
+    maxFrameBytes: number;
+    maxRunsPerGeneration: number;
+    maxGenerations: number;
+  };
+  timeouts: ModuleTimeouts;
+}
+```
+
+Version 10 extends `core.limits` with
+`maxRegisteredContentValueBytes`. Product composition currently receives that
+limit as a trusted function argument; version 10 MUST derive it only from the
+validated instance document. The version-10 `core.scheduler` value has the
+exact `SchedulerConfigurationV10` shape above. Ratios are non-negative integer
+basis points, where 10,000 means one, so their persisted and compared values do
+not depend on a binary floating-point spelling. The first product policy is
+explicitly `fixed`, requires `retryJitterBasisPoints: 0`, and uses
+`policyFailureAction: "quarantine"`; it therefore does not depend on ambient
+randomness or pretend that a failed baseline has a second safe policy.
+`lowWatermarkBasisPoints` is in the closed range 1 through 10,000. A mailbox's
+resume threshold is the exact integer
+`floor(maximum * lowWatermarkBasisPoints / 10_000)`, without a binary
+floating-point intermediate.
+Experimental policies do not become product configuration merely because the
+Scheduler accepts an injected policy in a test or research runner.
+
+The three version-9 Scheduler intervals keep their existing bounds:
+`pollIntervalMs` is at most 60,000, `retryBaseMs` is at most 3,600,000, and
+`retryMaxMs` is at most 86,400,000, with retry maximum no smaller than retry
+base. `downstreamRecheckMs` and `noProgressAfterMs` are positive integers no
+greater than 2,147,483,647, the largest delay the Scheduler timer contract
+accepts. `maxConcurrentModules` is from one through 1,024; an instance with
+fewer Modules may retain a higher ceiling without inventing work.
+
+Every Module carries its own Claim baseline and hard ceiling. Baseline count
+and bytes MUST be positive safe integers no greater than their corresponding
+maxima. Hard count is at most 10,000 and hard bytes is from 256 through
+1,073,741,824; baseline count and bytes may be smaller but remain positive. The
+aggregate mailbox applies to that Module as a consumer across all of its input
+Pages. Mailbox count is a positive safe integer and mailbox bytes is from one
+through 1,073,741,824. They are enforced against pending plus claimed resident
+Deliveries at the atomic result-commit boundary, not only by a Scheduler
+pre-check. Scheduler status reports all four Claim values and both mailbox
+bounds.
+
+A source Module has no public `inputConnections`. Its Claim baseline count and
+hard count MUST both equal one because one durable source request is one Module
+job. `sourceRequestMaxBytes` is a positive safe integer for a source Module and
+is no greater than both `maxInputBytes` and the mailbox byte limit; it is
+`null` for every other Module. The same `mailbox` record bounds the private
+source request queue; a second, unrelated source-mailbox default is forbidden.
+A non-source Module has at least one `inputConnections` entry and
+`sourceRequestMaxBytes: null`.
+
+Each input Page appears at most once in `inputConnections`. The `start` value
+is the exact `SubscriptionStart` value used when that Page registers the Module
+consumer. A decimal checkpoint is canonical, refers to the Page frontier
+defined in Section 7.2, and is never silently changed to `from-head` or
+`from-now`. `outputPageIds` remains an ordered list of unique Page identifiers.
+The version-9 fields `inputPageIds` and `subscriptionStart` are absent from a
+version-10 Module and are not accepted as aliases.
+
+`declaredExternalEffects` is a cross-platform Run and recovery property, so it
+is not nested inside the Linux execution record. `execution` is a closed,
+discriminated operating-system backend. Version 10 defines only
+`kind: "linux-process"`; another operating system adds a different reviewed
+kind in a later schema version rather than nullable Linux fields. A host may
+parse and inspect the document on another platform, but activation fails with
+a typed platform-unsupported result before it creates a controller lock,
+Core-state file, consumer subscription, source queue, process record, or child
+process.
+
+`maxTasks` maps to `pids.max` and counts Linux tasks, including threads; the
+older proposed name `maxProcesses` is not accepted. `memoryMaxBytes` is a
+positive safe integer aligned to 4,096 bytes. `cpuPeriodMicros` is an integer
+from 1,000 through 1,000,000. `cpuQuotaMicros` and `maxTasks` are positive safe
+integers. `maxOpenFiles` is an integer from 16 through 1,048,576. Static schema
+validation checks these ranges. Host activation separately checks that the
+selected backend and controller operations are available and can enforce the
+exact values; a valid document is not a promise that the current host can run
+it.
+
+Permission policy identifiers become immutable references. Each referenced
+record must exist in a persistent Host-owned policy store, match the exact
+revision, and be compatible with the resolved package and Module before any
+capability handle is issued. An in-memory registry supplied by a caller is not
+product composition. Policy references are unique by `policyId`; changing a
+revision is a generation-restart configuration change.
+
+A Module declaring `none` has an empty permission-policy reference list and
+its resolved package manifest requests no capability. A Module declaring
+`core-capabilities-only` may reference only persistent policies that the Host
+can resolve and bind to a requested capability. A mismatch is a configuration
+or installation error before process start; Core does not silently discard an
+unused reference or add a manifest request that configuration omitted.
+
+#### 5.3.1 Explicit migration from version 9
+
+Migration is a separate operation, not an alias in the version-10 validator.
+It receives one validated version-9 document plus an explicit migration input
+containing the complete version-10 Scheduler record and, for every configured
+Module, its Claim baseline, mailbox bounds, source request byte limit when
+applicable, Linux execution record, external-effect declaration, and exact
+permission policy revisions. Missing or extra per-Module migration entries are
+an error. Migration input also supplies the new
+`core.limits.maxRegisteredContentValueBytes`; it is not inferred from the
+currently installed schemas. The migration MUST NOT infer these values from
+machine capacity, current queue contents, experiment defaults, or an in-memory
+registry.
+
+For each existing non-source Module, migration copies the version-9 Claim
+maxima and refuses a supplied baseline above them. For a source Module it sets
+both Claim counts to one and the hard Claim byte limit to its existing
+`maxInputBytes`; the source baseline bytes remain explicit migration input.
+Every version-9 `inputPageIds` entry becomes one `inputConnections` entry in
+the same order with the Module's exact version-9 `subscriptionStart` value.
+Output Page order, package identity, immutable configuration reference,
+activation, input/result/frame limits, generation limits, and timeouts are
+copied exactly. Each version-9 permission policy identifier must resolve to the
+explicitly supplied persistent revision; unresolved or additional references
+fail migration.
+
+Migration first constructs and validates the complete version-10 document and
+an auditable change plan without changing external state. It then rechecks the
+source revision and writes one new configuration revision atomically. It does
+not create subscriptions, source queues, process records, or child processes,
+and it does not remove or weaken the version-9 Module startup refusal. Applying
+the migrated document is a later recovery and activation operation.
+
+#### 5.3.2 Release gate
+
+The version-10 validator and migration may be released only with conformance
+tests that independently reject unknown, missing, duplicated, stale, and
+cross-Module fields and that prove the migration mapping above. Product Module
+startup remains refused until all of the following are connected in one
+composition and tested across restart:
+
+1. every Scheduler, Claim, mailbox, source request, content-schema, execution,
+   timeout, and permission value is derived from the same validated document;
+2. installed package bytes, configuration revision, permission policy
+   revisions, Module generation, process generation, and process record are
+   created by one factory and cannot be substituted independently;
+3. the Linux backend enforces its filesystem, namespace, control-group, file
+   descriptor, and descendant-ownership boundary and confirms whole-group
+   termination before replacement;
+4. a new process-record schema binds the external-effect declaration to the
+   accepted instance revision and execution boundary; historical version-1
+   declarations remain preserve-only;
+5. startup recovery produces one store-bound handoff only after old-process
+   stop proof, result-commit recovery, and unresolved-Claim classification;
+6. persistent permission policy and effect-intent records survive restart and
+   keep unknown outcomes quarantined rather than retried; and
+7. a Linux installed-Module test exercises configuration through Claim,
+   process, capability, atomic result commit, shutdown, and reopen while the
+   public bootstrap refusal test remains green until the final gate is met.
+
+Passing the version-10 JSON validator alone does not meet this release gate.
+No implementation may remove `RUNTIME_MODULE_MIGRATION_REQUIRED` one item at a
+time or route product startup through a candidate composition to avoid it.
 
 ## 6. Block model
 

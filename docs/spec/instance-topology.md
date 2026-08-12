@@ -696,7 +696,10 @@ MUST surface that confirmation rather than answering it.
   `security-operations.md` Section 10.
 - `permissionPolicyIds`: classification `generation-restart`. Capability grants
   are established when the Extension process session starts and are not
-  editable within a session. Broadening them is `breaking`.
+  editable within a session. Broadening them is `breaking`. In the reserved
+  version-10 schema, the corresponding field is
+  `permissionPolicyReferences`; changing either the identifier or immutable
+  revision has the same classification.
 - `limits` and `timeouts`: classification `generation-restart` by default.
   Reducing a limit while work is in flight MUST NOT invalidate an existing
   Claim retroactively; the existing Module job keeps the bounds it was created
@@ -1280,7 +1283,8 @@ the owning document, not only here.
    input. Section 7.6 proposes the missing detail. **This is the most important
    gap in this document's area, and I do not consider the existing rule
    sufficient.**
-3. **The instance schema cannot express a per-connection start position.**
+3. **The released instance schema cannot express a per-connection start
+   position.**
    `core-runtime.md` Section 7.2 requires each consumer subscription to choose
    `from-head`, `from-now`, or an exact checkpoint. The instance configuration
    in the repository carries one `subscriptionStart` per Module, restricted to
@@ -1288,10 +1292,13 @@ the owning document, not only here.
    once, and `core-runtime.md` Section 5.1 does not show the route fields at
    all. Adding one connection to an existing Module therefore cannot express
    its own start position, and no checkpoint can be configured. Making
-   Section 7.7 implementable requires a new instance schema version, for
-   example `dolly.instance/10`, in which each input connection is an object
-   carrying its own start position, plus a migration that maps the current
-   per-Module value onto every existing connection.
+   Section 7.7 implementable requires a new instance schema version.
+   `core-runtime.md` Section 5.3 reserves `dolly.instance/10`, in which each
+   input connection is an object carrying its own start position. Its explicit
+   migration maps the current per-Module value onto every existing connection
+   without changing Page order. Version 10 remains unreleased until its
+   Scheduler, mailbox, permission, Linux execution, and recovery gates are also
+   complete; the connection change must not ship as a partial version 10.
 4. **`core-runtime.md` Section 5.1 does not document the connection fields.**
    It refers to "Page routes" in prose while the code uses `inputPageIds`,
    `outputPageIds`, and `subscriptionStart`. The authoritative field names and
