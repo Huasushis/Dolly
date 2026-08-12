@@ -24,6 +24,10 @@ export {
   type InlineModelMediaSource,
 } from "./delivered-model-media-resolver.js";
 export {
+  createFileCoreActiveRunModelMediaResolver,
+  type FileCoreActiveRunModelMediaResolverOptions,
+} from "./file-core-active-run-model-media-resolver.js";
+export {
   createFfmpegDerivationToolchain,
   createUnavailableDerivationToolchain,
   DEFAULT_MEDIA_DERIVATION_LIMITS,

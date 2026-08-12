@@ -1010,6 +1010,16 @@ uncropped Media reference actually present in a delivered Block before it asks
 Host-only port, not an Extension capability and not an arbitrary callback
 accepted from an Extension.
 
+`createFileCoreActiveRunModelMediaResolver` derives that one-Claim resolver
+from the exact FileCore store used by Scheduler. Before every copy and again at
+the active-Run checks around the copy, it requires a matching active Claim,
+Module submission, running process record, and current Extension-process
+session. FileCore does not persist the process `sessionId`, so the composition
+must supply a Host-owned lookup keyed by the persisted process-generation ID;
+copying the request's session value into an expected value is not
+authentication. A missing, replaced, stopped, cross-Run, cross-generation, or
+cross-session identity is refused before provider secret or network access.
+
 `model-operation` versions 1 and 2 remain text-only and visibly return
 `MODEL_MEDIA_NOT_GRANTED`. Version 3 is the narrow candidate bridge to this
 internal path: its closed argument accepts only the exact
