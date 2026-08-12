@@ -23,6 +23,7 @@ import {
 } from "../../../src/adapters/installed-reactive-module-runtime.js";
 import { defaultLauncherScriptPath } from "../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
 import type { BlockProposal } from "../../../src/core/block-store.js";
+import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
 import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
 import { CoreStartupRecovery } from "../../../src/core/core-startup-recovery.js";
 import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
@@ -769,6 +770,452 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       rmSync(scratch, { recursive: true, force: true });
     }
   }, 90_000);
+
+  it("lets a downstream installed Module release startup recovery capacity without rerunning the producer", async () => {
+    if (integrationUnitName === undefined) {
+      throw new Error("The transient Core service unit name is unavailable");
+    }
+    const inspectedBinding = await inspectCoreServiceBinding({
+      unitName: integrationUnitName,
+      mode: "user",
+      queryTimeoutMs: 5_000,
+      overallTimeoutMs: 15_000,
+    });
+    if (!inspectedBinding.verified) {
+      throw new Error(inspectedBinding.failures
+        .map((failure) => `${failure.code}: ${failure.detail}`)
+        .join("; "));
+    }
+    const preparedRoot = await prepareDelegatedCgroupRoot({
+      delegatedRootCgroupPath: inspectedBinding.binding.delegatedRootCgroupPath,
+    });
+    if (!preparedRoot.prepared) {
+      throw new Error(`${preparedRoot.failure.code}: ${preparedRoot.failure.detail}`);
+    }
+
+    const producerId = "scheduler-recovery-producer";
+    const drainerId = "scheduler-recovery-drainer";
+    const oldProducerGenerationId = `${producerId}-generation-old`;
+    const oldProducerProcessId = `${producerId}-process-old-${process.pid}-${Date.now()}`;
+    const drainerProcessId = `${drainerId}-process-${process.pid}-${Date.now()}`;
+    const scratchParent = resolve(process.cwd(), ".tmp");
+    mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
+    const scratch = mkdtempSync(join(scratchParent, "installed-recovery-host-integration-"));
+    const statePath = join(scratch, "core-state.json");
+    const commitPath = join(scratch, "module-result-commits.json");
+    const drainerCgroupPath = deriveModuleCgroupPath(
+      inspectedBinding.binding.delegatedRootCgroupPath,
+      { instanceId: INSTANCE_ID, moduleId: drainerId, processGenerationId: drainerProcessId },
+    ).filesystemPath;
+    let composed: InstalledReactiveModuleHost | undefined;
+    let stopped = false;
+    let primaryFailure: unknown;
+    try {
+      const packageSource = join(scratch, "package-source");
+      mkdirSync(packageSource, { recursive: true, mode: 0o700 });
+      copyFileSync(FIXTURE_PATH, join(packageSource, "extension.mjs"));
+      const configurationSchema = {
+        $schema: JSON_SCHEMA_2020_12,
+        type: "object",
+        properties: {
+          prefix: { type: "string" },
+          emitOutput: { type: "boolean" },
+        },
+        required: ["prefix"],
+        additionalProperties: false,
+      } as const;
+      writeFileSync(join(packageSource, "dolly-extension.json"), JSON.stringify({
+        schemaVersion: "dolly.extension-package/1",
+        extensionId: "org.example.scheduler-recovery",
+        packageVersion: "1.0.0",
+        displayName: "Installed Scheduler recovery integration fixture",
+        description: "Drains capacity while an earlier result waits for commit-only recovery.",
+        supportedProtocolVersions: ["3.0"],
+        entrypoint: "extension.mjs",
+        modules: [{
+          moduleKind: "transform",
+          activation: "reactive",
+          configVersion: 1,
+          configurationSchema,
+        }],
+        requestedCapabilities: [],
+      }), "utf8");
+      const installations = new ExtensionInstallationRegistry({
+        directory: join(scratch, "installations"),
+      });
+      const installed = installations.installNodePackage({
+        sourceDirectory: packageSource,
+        trust: "trusted",
+      });
+      rmSync(packageSource, { recursive: true, force: true });
+      const configurations = new ModuleConfigurationStore({
+        directory: join(scratch, "configurations"),
+      });
+      const producerConfiguration = configurations.create({
+        configId: "scheduler-recovery-producer-config",
+        extensionId: "org.example.scheduler-recovery",
+        moduleKind: "transform",
+        configVersion: 1,
+        schema: configurationSchema,
+        configuration: { prefix: "producer" },
+      });
+      const drainerConfiguration = configurations.create({
+        configId: "scheduler-recovery-drainer-config",
+        extensionId: "org.example.scheduler-recovery",
+        moduleKind: "transform",
+        configVersion: 1,
+        schema: configurationSchema,
+        configuration: { prefix: "drainer", emitOutput: false },
+      });
+      const defaults = createDefaultDollyInstanceConfig(INSTANCE_ID);
+      const moduleLimits = {
+        claim: { maxCount: 1, maxBytes: 64 * 1_024 },
+        maxInputBytes: 64 * 1_024,
+        maxResultBytes: 64 * 1_024,
+        maxFrameBytes: 128 * 1_024,
+        maxRunsPerGeneration: 10,
+        maxGenerations: 2,
+      } as const;
+      const moduleTimeouts = {
+        initializationTimeoutMs: 10_000,
+        executionTimeoutMs: 5_000,
+        cancellationGraceMs: 1_000,
+        terminationTimeoutMs: 10_000,
+      } as const;
+      const configuration = validateDollyInstanceConfig({
+        ...defaults,
+        core: {
+          ...defaults.core,
+          scheduler: {
+            pollIntervalMs: 60_000,
+            retryBaseMs: 25,
+            retryMaxMs: 250,
+          },
+        },
+        pages: [{ pageId: "producer-input" }, { pageId: "recovery-output" }],
+        modules: [{
+          moduleId: producerId,
+          extensionId: "org.example.scheduler-recovery",
+          packageVersion: "1.0.0",
+          moduleKind: "transform",
+          isolation: "process",
+          configurationReference: {
+            configId: producerConfiguration.configId,
+            revision: producerConfiguration.revision,
+            configVersion: producerConfiguration.configVersion,
+          },
+          permissionPolicyIds: [],
+          inputPageIds: ["producer-input"],
+          outputPageIds: ["recovery-output"],
+          subscriptionStart: "from-now",
+          activation: { kind: "reactive" },
+          limits: moduleLimits,
+          timeouts: moduleTimeouts,
+        }, {
+          moduleId: drainerId,
+          extensionId: "org.example.scheduler-recovery",
+          packageVersion: "1.0.0",
+          moduleKind: "transform",
+          isolation: "process",
+          configurationReference: {
+            configId: drainerConfiguration.configId,
+            revision: drainerConfiguration.revision,
+            configVersion: drainerConfiguration.configVersion,
+          },
+          permissionPolicyIds: [],
+          inputPageIds: ["recovery-output"],
+          outputPageIds: [],
+          subscriptionStart: "from-now",
+          activation: { kind: "reactive" },
+          limits: moduleLimits,
+          timeouts: moduleTimeouts,
+        }],
+      });
+
+      let blockId = 0;
+      let deliveryId = 0;
+      let protocolIdentifier = 0;
+      let processIdentifierAllocated = false;
+      const now = (): string => new Date().toISOString();
+      const contentSchemas = resolveInstalledContentSchemaRegistrationSet({
+        instanceConfiguration: configuration,
+        installations,
+        reservedRegistrations: [],
+        maxRegisteredValueBytes: 64 * 1_024,
+      });
+      const coreState = createFileCoreStateStoreWithStoppedRecordWriter({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `recovery-block-${++blockId}`,
+        nextDeliveryId: (kind) => `recovery-${kind}-${++deliveryId}`,
+        now,
+        contentSchemas,
+      });
+      coreState.store.deliveries.createPage("producer-input");
+      coreState.store.deliveries.createPage("recovery-output");
+      coreState.store.deliveries.registerConsumer("producer-input", producerId, "from-now");
+      coreState.store.deliveries.registerConsumer("recovery-output", drainerId, "from-now");
+      const resident = coreState.store.blocks.commit(proposal("capacity resident"), {
+        kind: "external",
+        id: "recovery-integration",
+      });
+      coreState.store.deliveries.append("recovery-output", resident.id);
+      const producerInput = coreState.store.blocks.commit(proposal("old producer input"), {
+        kind: "external",
+        id: "recovery-integration",
+      });
+      coreState.store.deliveries.append("producer-input", producerInput.id);
+      const oldClaim = coreState.store.deliveries.claim({
+        consumerId: producerId,
+        pageIds: ["producer-input"],
+        moduleGenerationId: oldProducerGenerationId,
+        maxCount: 1,
+        maxBytes: 64 * 1_024,
+      });
+      if (oldClaim === null) throw new Error("The old producer Claim was not created");
+      const oldProducerCgroupPath = deriveModuleCgroupPath(
+        inspectedBinding.binding.delegatedRootCgroupPath,
+        {
+          instanceId: INSTANCE_ID,
+          moduleId: producerId,
+          processGenerationId: oldProducerProcessId,
+        },
+      ).filesystemPath;
+      coreState.store.appendModuleProcessRecord({
+        schemaVersion: "dolly.module-process-record/1",
+        instanceId: INSTANCE_ID,
+        moduleId: producerId,
+        moduleGenerationId: oldProducerGenerationId,
+        processGenerationId: oldProducerProcessId,
+        packageDigest: installed.packageDigest,
+        configurationReference: configuration.modules[0]!.configurationReference,
+        declaredExternalEffects: "core-capabilities-only",
+        serviceInvocationId: inspectedBinding.binding.serviceInvocationId,
+        bootId: inspectedBinding.binding.bootId,
+        moduleCgroupPath: oldProducerCgroupPath,
+        state: "starting",
+        createdAt: now(),
+        updatedAt: now(),
+      });
+      coreState.store.updateModuleProcessRecordState(oldProducerProcessId, "running");
+      coreState.store.appendModuleSubmissionRecord({
+        schemaVersion: "dolly.module-submission-record/1",
+        moduleJobId: oldClaim.moduleJobId,
+        claimToken: oldClaim.claimToken,
+        runId: oldClaim.runId,
+        attempt: oldClaim.attempt,
+        moduleGenerationId: oldClaim.moduleGenerationId,
+        processGenerationId: oldProducerProcessId,
+        inputDigest: canonicalJsonDigest(
+          coreState.store.deliveries.inspectClaimInput(oldClaim),
+        ),
+        createdAt: now(),
+      });
+      coreState.stoppedRecordWriter.writeStopped(oldProducerProcessId);
+      const repository = new FileModuleResultCommitRepository({ path: commitPath });
+      const mailboxes = [{
+        consumerId: producerId,
+        pageIds: ["producer-input"],
+        maxResidentCount: 4,
+        maxResidentBytes: 64 * 1_024,
+      }, {
+        consumerId: drainerId,
+        pageIds: ["recovery-output"],
+        maxResidentCount: 1,
+        maxResidentBytes: 64 * 1_024,
+      }];
+      const commits = createModuleResultCommitCoordinator({
+        core: coreState.store,
+        repository,
+        now,
+        mailboxes,
+      });
+      await expect(commits.commit({
+        ...oldClaim,
+        source: { kind: "module", id: producerId },
+        outputPageIds: ["recovery-output"],
+        blockProposal: proposal("restored producer output"),
+      })).rejects.toMatchObject({
+        code: "MODULE_RESULT_OUTPUT_BACKPRESSURED",
+        blockedConsumerIds: [drainerId],
+      });
+      expect(repository.get(oldClaim.moduleJobId)).toMatchObject({ state: "prepared" });
+      const recovery = await new CoreStartupRecovery({
+        deliveries: coreState.store.deliveries,
+        commits,
+        moduleRecords: coreState.store,
+        stoppedRecordWriter: coreState.stoppedRecordWriter,
+      }).recover();
+      expect(recovery.deferredCommits).toEqual([
+        expect.objectContaining({
+          record: expect.objectContaining({
+            moduleJobId: oldClaim.moduleJobId,
+            state: "prepared",
+          }),
+          blockedConsumerIds: [drainerId],
+        }),
+      ]);
+
+      const schedulerEvents: SchedulerEvent[] = [];
+      const actorEvents: ModuleActorEvent[] = [];
+      composed = composeInstalledReactiveModuleHost({
+        configuration,
+        installations,
+        configurations,
+        coreState,
+        contentSchemas,
+        maxRegisteredContentValueBytes: 64 * 1_024,
+        mailboxes,
+        startupRecoveryHandoff: recovery.handoff,
+        clock: systemSchedulerClock(),
+        scheduling: {
+          maxConcurrentModules: 2,
+          backpressureAction: "pause-upstream",
+          downstreamRecheckMs: 100,
+          noProgressAfterMs: 5_000,
+          claimLimitCount: 1,
+          claimLimitBytes: 64 * 1_024,
+          retryJitterRatio: 0,
+          lowWatermarkRatio: 1,
+        },
+        runtime: {
+          resultCommitRepository: repository,
+          now,
+          initialModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-1`,
+          nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
+          binding: inspectedBinding.binding,
+          lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
+          launcher: {
+            interpreterProgram: PYTHON,
+            launcherScriptPath: defaultLauncherScriptPath(),
+            controllerTimeouts: {
+              configureTimeoutMs: 5_000,
+              inCgroupTimeoutMs: 5_000,
+              membershipTimeoutMs: 5_000,
+              exitObservationTimeoutMs: 5_000,
+            },
+          },
+          host: {
+            isolationPolicy: new ExtensionIsolationPolicy(),
+            shutdownRequestTimeoutMs: 2_000,
+            forceKillDelayMs: 500,
+          },
+          channelCloseTimeoutMs: 5_000,
+          nextProcessGenerationId: () => {
+            if (processIdentifierAllocated) {
+              throw new Error("Startup recovery attempted to create a producer process");
+            }
+            processIdentifierAllocated = true;
+            return drainerProcessId;
+          },
+          nextProtocolIdentifier: (purpose) =>
+            `${purpose}-scheduler-recovery-${++protocolIdentifier}`,
+          classifyFailure: (failure) => ({ code: failure.code, retryable: false }),
+          onActorEvent: (event) => actorEvents.push(event),
+        },
+        onSchedulerEvent: (event) => schedulerEvents.push(event),
+      });
+      await composed.host.start();
+      expect(composed.host.state).toBe("recovering");
+      expect(() => composed?.installedRuntimes[0]?.generations.processGenerationIdFor(
+        `${producerId}-generation-1`,
+      )).toThrow(/does not have a process generation/u);
+      expect(coreState.store.getModuleProcessRecord(drainerProcessId)).toMatchObject({
+        state: "running",
+        moduleId: drainerId,
+        packageDigest: installed.packageDigest,
+      });
+      expect(existsSync(drainerCgroupPath)).toBe(true);
+
+      expect(await waitFor(
+        () =>
+          composed?.host.state === "running" &&
+          repository.list().length === 3 &&
+          repository.list().every((record) => record.state === "committed") &&
+          coreState.store.deliveries.inspectResident(drainerId, ["recovery-output"])
+              .residentCount === 0,
+        10_000,
+      )).toBe(true);
+      expect(repository.get(oldClaim.moduleJobId)).toMatchObject({
+        state: "committed",
+        source: { kind: "module", id: producerId },
+        outputDeliveries: [expect.objectContaining({ pageId: "recovery-output" })],
+      });
+      expect(actorEvents.filter((event) => event.type === "run.started")).toHaveLength(2);
+      expect(actorEvents.filter((event) =>
+        event.type === "run.started" && event.moduleJobId === oldClaim.moduleJobId
+      )).toHaveLength(0);
+      expect(schedulerEvents).toContainEqual(expect.objectContaining({
+        type: "scheduler.settled",
+        moduleId: producerId,
+        tickStatus: "committed",
+      }));
+      expect(() => composed!.installedRuntimes[0]!.generations.processGenerationIdFor(
+        `${producerId}-generation-1`,
+      )).toThrow(/does not have a process generation/u);
+      expect(processIdentifierAllocated).toBe(true);
+
+      await composed.host.stop();
+      stopped = true;
+      expect(composed.host.state).toBe("stopped");
+      expect(coreState.store.getModuleProcessRecord(oldProducerProcessId)?.state).toBe("stopped");
+      expect(coreState.store.getModuleProcessRecord(drainerProcessId)).toMatchObject({
+        state: "stopped",
+        moduleCgroupPath: drainerCgroupPath,
+      });
+      expect(existsSync(drainerCgroupPath)).toBe(false);
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `reopened-recovery-block-${++blockId}`,
+        nextDeliveryId: (kind) => `reopened-recovery-${kind}-${++deliveryId}`,
+        now,
+        contentSchemas,
+      });
+      const reopenedRepository = new FileModuleResultCommitRepository({ path: commitPath });
+      expect(reopenedRepository.get(oldClaim.moduleJobId)).toMatchObject({ state: "committed" });
+      expect(reopened.deliveries.inspectClaim(oldClaim).status).toBe("committed");
+      expect(reopened.getModuleProcessRecord(oldProducerProcessId)?.state).toBe("stopped");
+      expect(reopened.getModuleProcessRecord(drainerProcessId)?.state).toBe("stopped");
+
+      console.info(JSON.stringify({
+        packageDigest: installed.packageDigest,
+        producerId,
+        drainerId,
+        restoredModuleJobId: oldClaim.moduleJobId,
+        producerExecutorRuns: 0,
+        drainerActorRuns: 2,
+        committedModuleResults: reopenedRepository.list().length,
+        initialHostState: "recovering",
+        finalHostState: composed.host.state,
+        oldProducerRecordState: reopened.getModuleProcessRecord(oldProducerProcessId)?.state,
+        drainerRecordState: reopened.getModuleProcessRecord(drainerProcessId)?.state,
+        drainerCgroupRemoved: !existsSync(drainerCgroupPath),
+      }));
+    } catch (error) {
+      primaryFailure = error;
+    } finally {
+      const cleanupFailures: unknown[] = [];
+      if (!stopped && composed !== undefined &&
+        (composed.host.state === "running" || composed.host.state === "recovering" ||
+          composed.host.state === "failed")) {
+        await composed.host.stop().catch((error) => cleanupFailures.push(error));
+      }
+      if (existsSync(drainerCgroupPath)) {
+        cleanupFailures.push(
+          new Error(`Exact recovery drainer control group remained: ${drainerCgroupPath}`),
+        );
+      }
+      rmSync(scratch, { recursive: true, force: true });
+      const failures = [
+        ...(primaryFailure === undefined ? [] : [primaryFailure]),
+        ...cleanupFailures,
+      ];
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "Installed startup-capacity recovery failed");
+      }
+    }
+  }, 60_000);
 
   it("runs a strict-streaming registered-tool Agent through the installed Scheduler", async () => {
     if (integrationUnitName === undefined) {
