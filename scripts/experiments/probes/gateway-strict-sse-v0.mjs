@@ -12,7 +12,7 @@ import process from "node:process";
 import { readStrictChatCompletionSse } from "./memory-association-task-switch-v0/strict-chat-sse.mjs";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
-const repositoryRoot = resolve(scriptDirectory, "../../../..");
+const repositoryRoot = resolve(scriptDirectory, "../../..");
 const preregistrationPath = join(
   repositoryRoot,
   "docs/experiments/preregistrations/gateway-strict-sse-v0.json",
