@@ -974,6 +974,55 @@ describe("CORE scheduler policy boundary", () => {
     await scheduler.stop();
   });
 
+  it.each([
+    { label: "count", claimLimitCount: 9, claimLimitBytes: 4_096 },
+    { label: "bytes", claimLimitCount: 8, claimLimitBytes: 4_097 },
+  ])("rejects a policy $label limit above the trusted Scheduler ceiling", async ({
+    claimLimitCount,
+    claimLimitBytes,
+  }) => {
+    const policy: SchedulerPolicy = {
+      decide: () => ({
+        eligible: true,
+        eligibleAt: 0,
+        claimLimitCount,
+        claimLimitBytes,
+        reasonCode: "OVERSIZED_BATCH",
+        policyName: "oversized-batch",
+        policyVersion: "1",
+      }),
+    };
+    const { clock, mailboxes, scheduler, events } = createScheduler({ policy });
+    const runtime = new FakeModuleRuntime();
+    mailboxes.set("worker", 5, 500);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(runtime.receivedClaimLimits).toEqual([{
+      claimLimitCount: 8,
+      claimLimitBytes: 4_096,
+    }]);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "scheduler.policy_failed",
+      action: "fallback-baseline",
+    }));
+    expect(scheduler.status("worker")).toMatchObject({
+      policyName: "fixed-baseline",
+      policyVersion: "1",
+    });
+    const stopping = scheduler.stop();
+    runtime.settle({ status: "idle" });
+    await stopping;
+  });
+
   it("refuses a policy decision that would bypass a downstream mailbox bound", async () => {
     const policy: SchedulerPolicy = { decide: () => rogueDecision };
     const { clock, mailboxes, scheduler } = createScheduler({ policy });

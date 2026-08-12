@@ -2228,9 +2228,14 @@ interface SchedulerDecision {
 observability fields. The scheduler MUST pass the exact validated decision
 values to the runtime tick that it dispatches, and the runtime MUST use them for
 that tick's Delivery Claim. Per-Module runtime configuration supplies hard
-maximum count and byte limits; a decision outside those maxima MUST fail before
-claiming input. Direct runtime callers that omit per-dispatch values use the
-configured maxima.
+maximum count and byte limits. Product composition sets the Scheduler's trusted
+count and byte ceilings no higher than any registered runtime maximum. A
+selected policy may reduce those values but MUST NOT exceed either Scheduler
+ceiling; an oversized decision is a policy failure and is rejected before the
+runtime is dispatched, after which the declared safe fallback or visible
+failure action applies. The runtime independently rejects a direct decision
+outside its own maxima before claiming input. Direct runtime callers that omit
+per-dispatch values use the configured maxima.
 
 `oldestPendingAgeMs` MUST NOT reset merely because the Scheduler process or its
 monotonic clock restarted. When the Delivery reader supplies the canonical

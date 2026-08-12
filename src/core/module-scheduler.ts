@@ -1531,8 +1531,10 @@ export class ModuleScheduler {
       (decision.eligibleAt !== null && !Number.isFinite(decision.eligibleAt)) ||
       !Number.isSafeInteger(decision.claimLimitCount) ||
       decision.claimLimitCount <= 0 ||
+      decision.claimLimitCount > this.#claimLimitCount ||
       !Number.isSafeInteger(decision.claimLimitBytes) ||
       decision.claimLimitBytes <= 0 ||
+      decision.claimLimitBytes > this.#claimLimitBytes ||
       (decision.missedPeriods !== undefined &&
         (!Number.isSafeInteger(decision.missedPeriods) || decision.missedPeriods < 0))
     ) {
