@@ -138,6 +138,24 @@ describe("extension capability session authority", () => {
     ).resolves.toEqual({ ok: true });
   });
 
+  it("rejects an active-Run invocation after its Host deadline", async () => {
+    const broker = authority();
+    const session = broker.openSession(identity("session-a"));
+    const handler = vi.fn(async () => ({ ok: true }));
+    const handle = session.issue(grant(), handler);
+
+    await expect(session.invoke({
+      handle,
+      operation: "read",
+      arguments: {},
+      moduleJobId: "module-job-a",
+      runId: "run-a",
+      attempt: 1,
+      deadline: "2026-07-23T23:59:59.999Z",
+    })).rejects.toMatchObject({ code: "CAPABILITY_EXPIRED" });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
   it("aborts every in-flight handler and drains them before idempotent close completes", async () => {
     const broker = authority();
     const session = broker.openSession(identity("session-a"));

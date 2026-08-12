@@ -397,6 +397,12 @@ describe("general Agent tool-registry Extension", () => {
         moduleId: "module-a",
         extensionId: MANIFEST.extensionId,
         moduleKind: "general-agent",
+        timeouts: {
+          initializationTimeoutMs: 5_000,
+          executionTimeoutMs: 5_000,
+          cancellationGraceMs: 1_000,
+          terminationTimeoutMs: 2_000,
+        },
         permissionPolicyIds: ["model.owner-primary", "tools.owner-memory"],
         configurationReference: {
           configId: "agent-config",

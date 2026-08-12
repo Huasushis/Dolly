@@ -835,6 +835,16 @@ describe("installed reactive Module runtime composition", () => {
     const permissionPolicies = new InstalledModulePermissionPolicyRegistry({
       policies: [toolPolicy],
     });
+    expect(() => new InstalledModulePermissionPolicyRegistry({
+      policies: [{
+        ...toolPolicy,
+        limits: {
+          ...toolPolicy.limits,
+          maxInvocations: 1,
+          maxInvocationsPerRun: 2,
+        },
+      }],
+    })).toThrow(/Run limit exceeds.*process-session limit/iu);
     const writeTool = {
       ...descriptor,
       effectClass: "write" as const,

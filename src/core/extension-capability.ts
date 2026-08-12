@@ -340,7 +340,8 @@ export class ExtensionCapabilityAuthority {
         "Capability has been revoked",
       );
     }
-    if (Date.parse(canonicalTime(this.#now(), "clock")) >= Date.parse(record.grant.expiresAt)) {
+    const invocationNowMs = Date.parse(canonicalTime(this.#now(), "clock"));
+    if (invocationNowMs >= Date.parse(record.grant.expiresAt)) {
       throw new ExtensionCapabilityError(
         "CAPABILITY_EXPIRED",
         "Capability has expired",
@@ -391,7 +392,13 @@ export class ExtensionCapabilityAuthority {
           "Capability deadline does not identify a complete active Run",
         );
       }
-      canonicalTime(invocation.deadline, "deadline");
+      const deadline = canonicalTime(invocation.deadline, "deadline");
+      if (invocationNowMs >= Date.parse(deadline)) {
+        throw new ExtensionCapabilityError(
+          "CAPABILITY_EXPIRED",
+          "Capability active Run deadline has expired",
+        );
+      }
     }
     if (record.grant.requireIdempotencyKey === true) {
       assertId(invocation.idempotencyKey, "idempotencyKey");

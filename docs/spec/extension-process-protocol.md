@@ -616,6 +616,10 @@ version 2 enforces `maxInvocationsPerRun` independently for each exact
 Run's per-Run allowance. The process-session expiry and total invocation limit
 remain finite, so a product host must rotate the handle or restart the process
 through its normal generation lifecycle before either is exhausted.
+An installed process MUST NOT start when a newly issued handle cannot remain
+valid through its bounded initialization protocol and one complete configured
+Run. This construction check does not replace the later per-Run admission and
+normal generation rotation required for a long-lived process.
 
 Model-operation and generic outbound-network capabilities are distinct. A large
 language model (LLM), Memory, or other ordinary model consumer receives only a

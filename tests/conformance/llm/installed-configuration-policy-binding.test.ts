@@ -99,6 +99,7 @@ function resolved(configuration: JsonValue): InstalledExtensionModule {
 function policies(
   selected: ReturnType<typeof model>,
   budgetOverrides: Partial<ModelInvocationBudgets> = {},
+  capabilityLifetimeMs = 660_001,
 ): InstalledModulePermissionPolicyRegistry {
   return new InstalledModulePermissionPolicyRegistry({
     policies: [{
@@ -136,7 +137,7 @@ function policies(
         maxInvocationsPerWindow: 4,
         rateWindowMs: 60_000,
       },
-      capabilityLifetimeMs: 60_000,
+      capabilityLifetimeMs,
     }],
   });
 }
@@ -176,6 +177,14 @@ describe("installed LLM configuration and Host policy binding", () => {
     expect(() => policies(selected, { maxInputTokens: 30_719 }).setupFor(resolved(
       configuredFor(selected.descriptor, "model.owner-primary"),
     ))).toThrow(/configuration exceeds.*Host model invocation budgets/iu);
+  });
+
+  it("rejects a capability lifetime that cannot cover initialization and one full Run", () => {
+    const selected = model("owner-qwen");
+
+    expect(() => policies(selected, {}, 660_000).setupFor(resolved(
+      configuredFor(selected.descriptor, "model.owner-primary"),
+    ))).toThrow(/capability lifetime.*initialization.*execution/iu);
   });
 
   it("rejects a configuration that names a model policy the instance did not select", () => {

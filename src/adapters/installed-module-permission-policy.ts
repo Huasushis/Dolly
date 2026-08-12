@@ -337,6 +337,9 @@ function immutableToolPolicy(
   if (policy.budget.maxCallsPerRound > policy.limits.maxCallsPerRound) {
     throw new TypeError("Installed tool policy Run budget exceeds its calls-per-round limit");
   }
+  if (policy.limits.maxInvocationsPerRun > policy.limits.maxInvocations) {
+    throw new TypeError("Installed tool policy Run limit exceeds its process-session limit");
+  }
   return Object.freeze({
     ...policy,
     budget: Object.freeze({ ...policy.budget }),
@@ -760,6 +763,24 @@ export class InstalledModulePermissionPolicyRegistry {
       }
       return policy;
     });
+    const minimumCapabilityLifetimeMs =
+      resolved.module.timeouts.initializationTimeoutMs * 2 +
+      resolved.module.timeouts.executionTimeoutMs +
+      1;
+    if (!Number.isSafeInteger(minimumCapabilityLifetimeMs)) {
+      throw new TypeError(
+        "Installed Module initialization and execution timeouts exceed the capability time range",
+      );
+    }
+    if (
+      policies.some(
+        (policy) => policy.capabilityLifetimeMs < minimumCapabilityLifetimeMs,
+      )
+    ) {
+      throw new TypeError(
+        "Installed Module capability lifetime must cover initialization and one full execution",
+      );
+    }
     assertInstalledLlmConfigurationPolicyBinding(resolved, policies);
     const reference = resolved.module.configurationReference;
     if (

@@ -217,6 +217,12 @@ describe("Extension process isolation and capability checks", () => {
         moduleId: "module-a",
         extensionId: FIXTURE_PACKAGE_MANIFEST.extensionId,
         moduleKind: "fixture",
+        timeouts: {
+          initializationTimeoutMs: 5_000,
+          executionTimeoutMs: 1_000,
+          cancellationGraceMs: 1_000,
+          terminationTimeoutMs: 2_000,
+        },
         permissionPolicyIds: ["model.owner-primary"],
         configurationReference: {
           configId: "fixture-config",
@@ -333,6 +339,12 @@ describe("Extension process isolation and capability checks", () => {
         moduleId: "module-a",
         extensionId: FIXTURE_PACKAGE_MANIFEST.extensionId,
         moduleKind: "fixture",
+        timeouts: {
+          initializationTimeoutMs: 5_000,
+          executionTimeoutMs: 1_000,
+          cancellationGraceMs: 1_000,
+          terminationTimeoutMs: 2_000,
+        },
         permissionPolicyIds: ["memory.owner-checkpoints"],
         configurationReference: {
           configId: "fixture-config",
@@ -508,6 +520,12 @@ describe("Extension process isolation and capability checks", () => {
         moduleId: "module-a",
         extensionId: FIXTURE_PACKAGE_MANIFEST.extensionId,
         moduleKind: "fixture",
+        timeouts: {
+          initializationTimeoutMs: 5_000,
+          executionTimeoutMs: 1_000,
+          cancellationGraceMs: 1_000,
+          terminationTimeoutMs: 2_000,
+        },
         permissionPolicyIds: ["tools.owner-notes"],
         configurationReference: {
           configId: "fixture-config",
