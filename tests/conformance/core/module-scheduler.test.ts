@@ -942,6 +942,50 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
     await scheduler.stop();
   });
 
+  it("ends a no-progress episode after external drain and times a later episode from its own start", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler({ noProgressAfterMs: 1_000 });
+    for (const [moduleId, input, output] of [
+      ["alpha", "page-a", "page-b"],
+      ["beta", "page-b", "page-a"],
+    ] as const) {
+      mailboxes.set(moduleId, 4, 400);
+      scheduler.register({
+        moduleId,
+        runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+        inputPageIds: [input],
+        outputPageIds: [output],
+        mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+      });
+    }
+    scheduler.start();
+    await advance(clock, 1_100);
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toHaveLength(1);
+    expect(scheduler.instanceStatus().noProgressActive).toBe(true);
+
+    // Capacity changed outside a Module result. The old blocked episode no
+    // longer exists, so it must not remain latched indefinitely.
+    mailboxes.set("alpha", 0, 0);
+    mailboxes.set("beta", 0, 0);
+    scheduler.wake();
+    await drain(clock);
+    expect(scheduler.instanceStatus().noProgressActive).toBe(false);
+    expect(events.filter((event) => event.type === "scheduler.no_progress_cleared")).toHaveLength(1);
+
+    // A long idle interval is not a stalled interval. A later independent
+    // cycle starts a fresh threshold instead of inheriting Scheduler age.
+    await advance(clock, 5_000);
+    mailboxes.set("alpha", 4, 400);
+    mailboxes.set("beta", 4, 400);
+    scheduler.wake();
+    await drain(clock);
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toHaveLength(1);
+    await advance(clock, 999);
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toHaveLength(1);
+    await advance(clock, 101);
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toHaveLength(2);
+    await scheduler.stop();
+  });
+
   it("detects no progress while an accepted result remains output-backpressured", async () => {
     const { clock, mailboxes, scheduler, events } = createScheduler({
       noProgressAfterMs: 1_000,

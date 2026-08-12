@@ -2213,7 +2213,12 @@ it can consume its ordinary backlog.
 Cycles are allowed in the Page graph, but bounded mailboxes can create cyclic
 wait. A scheduler or operator policy MUST detect sustained no-progress states
 and expose the blocked dependency cycle. Correctness MUST not depend on
-unbounded buffering.
+unbounded buffering. The threshold applies to one continuous interval in which
+work remains waiting without a durable result. External drain, disappearance
+of all waiting work, or a committed/dead-lettered result ends that interval and
+clears an active no-progress report. Merely retrying the same blocked output
+commit does not reset it. A later independent blocked interval starts a new
+timer; it MUST NOT inherit Scheduler uptime or an earlier episode's duration.
 
 ## 13. Scheduler policy boundary
 

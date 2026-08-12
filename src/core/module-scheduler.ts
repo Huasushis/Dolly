@@ -794,6 +794,7 @@ export class ModuleScheduler {
   #cursor = 0;
   #invariantViolationCount = 0;
   #lastProgressAt: number | null = null;
+  #waitingWithoutProgressSince: number | null = null;
   #noProgressActive = false;
   #stopPromise: Promise<void> | null = null;
   #unsubscribeDeliveryChanges: (() => void) | null = null;
@@ -2210,6 +2211,11 @@ export class ModuleScheduler {
 
   #recordProgress(now: number): void {
     this.#lastProgressAt = now;
+    this.#waitingWithoutProgressSince = null;
+    this.#clearNoProgress(now);
+  }
+
+  #clearNoProgress(now: number): void {
     if (!this.#noProgressActive) return;
     this.#noProgressActive = false;
     this.#emit({
@@ -2227,8 +2233,6 @@ export class ModuleScheduler {
    * cycle appears in them directly.
    */
   #detectNoProgress(entries: readonly ModuleEntry[], now: number): void {
-    const lastProgressAt = this.#lastProgressAt ?? now;
-    const stalledForMs = now - lastProgressAt;
     const workWaiting = entries.some((entry) =>
       (entry.pending.pendingCount > 0 || entry.outputCommitWaiting) &&
       entry.quarantineReason === null &&
@@ -2240,7 +2244,15 @@ export class ModuleScheduler {
         entry.nextEligibleAt > now
       )
     );
-    if (this.#activeCount > 0 || !workWaiting || stalledForMs < this.#noProgressAfterMs) {
+    if (!workWaiting) {
+      this.#waitingWithoutProgressSince = null;
+      this.#clearNoProgress(now);
+      return;
+    }
+    if (this.#activeCount > 0) return;
+    this.#waitingWithoutProgressSince ??= now;
+    const stalledForMs = now - this.#waitingWithoutProgressSince;
+    if (stalledForMs < this.#noProgressAfterMs) {
       return;
     }
     if (this.#noProgressActive) return;
