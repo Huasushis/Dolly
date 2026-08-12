@@ -183,15 +183,28 @@ function reconstructScenario(task, cueState) {
   const claimGroups = {
     taskState: cueState === "do-not-resume"
       ? []
-      : [{ sufficientSourceIds: [cueState === "cancelled" || cueState === "superseded"
-          ? updateId
-          : actionId] }],
+      : [{
+          claimId: cueState === "cancelled"
+            ? "cancellation"
+            : cueState === "superseded"
+              ? "supersession-state"
+              : "active-state",
+          sufficientSourceIds: [cueState === "cancelled" || cueState === "superseded"
+            ? updateId
+            : actionId],
+        }],
     action: decision !== "resume"
       ? []
-      : [{ sufficientSourceIds: [cueState === "superseded" ? updateId : actionId] }],
+      : [{
+          claimId: cueState === "superseded" ? "supersession-action" : "current-action",
+          sufficientSourceIds: [cueState === "superseded" ? updateId : actionId],
+        }],
     constraints: decision !== "resume"
       ? []
-      : [{ sufficientSourceIds: [constraintAId, constraintBId] }],
+      : [{
+          claimId: "retention-constraint",
+          sufficientSourceIds: [constraintAId, constraintBId],
+        }],
   };
   return {
     scenarioId: `${task.family}/${task.taskId}/${cueState}`,
