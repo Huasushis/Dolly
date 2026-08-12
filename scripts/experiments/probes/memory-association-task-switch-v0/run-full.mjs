@@ -16,6 +16,10 @@ import {
   summarizeLocalRows,
   xorshift32,
 } from './common.mjs';
+import {
+  readBoundedResponseText,
+  readStrictChatCompletionSse,
+} from './strict-chat-sse.mjs';
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, '../../../..');
@@ -261,7 +265,15 @@ async function main() {
     const thinkingType = requestProfile.thinking?.type;
     if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) throw new Error('A positive preregistered request timeout is required');
     if (!['enabled', 'disabled'].includes(thinkingType)) throw new Error('A measured preregistered thinking type is required');
-    const requestBody = { model: 'qwen3.6-27b', messages, thinking: { type: thinkingType }, temperature: 0, max_tokens: maximumTokens };
+    const requestBody = {
+      model: 'qwen3.6-27b',
+      messages,
+      thinking: { type: thinkingType },
+      temperature: 0,
+      max_tokens: maximumTokens,
+      stream: true,
+      stream_options: { include_usage: true },
+    };
     if ('enable_thinking' in requestBody) throw new Error('enable_thinking is forbidden');
     const currentLogicalCallIndex = logicalCallIndex;
     logicalCallIndex += 1;
@@ -278,6 +290,7 @@ async function main() {
       const requestStartedAt = new Date().toISOString();
       let response;
       let body;
+      let streamEvidence = null;
       try {
         response = await fetch(requestUrl, {
           method: 'POST',
@@ -285,8 +298,8 @@ async function main() {
           body: JSON.stringify(requestBody),
           signal: controller.signal,
         });
-        body = await response.json();
       } catch (error) {
+        clearTimeout(timer);
         const failureRow = {
           schemaVersion: `memory-association-task-switch/model-raw-v${experimentVersion}`,
           callIndex: currentIndex,
@@ -297,14 +310,14 @@ async function main() {
           seed,
           phase,
           conditionId,
-          request: { model: requestBody.model, messages, thinking: requestBody.thinking, temperature: 0, max_tokens: maximumTokens, timeout_ms: timeoutMs },
+          request: { model: requestBody.model, messages, thinking: requestBody.thinking, temperature: 0, max_tokens: maximumTokens, timeout_ms: timeoutMs, stream: true, stream_options: { include_usage: true } },
           httpStatus: null,
           response: null,
           reasoningPresent: false,
           reasoningCharacterCount: 0,
           requestStartedAt,
           responseFinishedAt: new Date().toISOString(),
-          failureKind: error?.name === 'AbortError' ? 'timeout' : 'network-or-json',
+          failureKind: error?.name === 'AbortError' ? 'timeout' : 'network-before-response-headers',
         };
         rawRows.push(failureRow);
         await appendFile(modelRawPath, `${JSON.stringify(failureRow)}\n`);
@@ -313,6 +326,55 @@ async function main() {
         }
         await new Promise((resolve) => setTimeout(resolve, retryPolicy.retryDelayMs));
         continue;
+      }
+      try {
+        if (response.ok) {
+          const parsedStream = await readStrictChatCompletionSse(response, {
+            maximumResponseBytes: 2 * 1024 * 1024,
+            maximumBufferedBytes: 256 * 1024,
+            maximumOutputBytes: 512 * 1024,
+            maximumEvents: 20_000,
+          });
+          body = parsedStream.body;
+          streamEvidence = parsedStream.evidence;
+        } else {
+          const text = await readBoundedResponseText(response, 2 * 1024 * 1024);
+          try {
+            body = JSON.parse(text);
+          } catch {
+            body = { error: { message: 'non-JSON provider error response' } };
+          }
+        }
+      } catch (error) {
+        const failureKind = error?.name === 'AbortError' ? 'timeout' : 'stream-protocol';
+        const failureRow = {
+          schemaVersion: `memory-association-task-switch/model-raw-v${experimentVersion}`,
+          callIndex: currentIndex,
+          logicalCallIndex: currentLogicalCallIndex,
+          attemptIndex,
+          callId: `${kind}-${seed}-${phase ?? 'none'}-${conditionId ?? 'none'}`,
+          kind,
+          seed,
+          phase,
+          conditionId,
+          request: { model: requestBody.model, messages, thinking: requestBody.thinking, temperature: 0, max_tokens: maximumTokens, timeout_ms: timeoutMs, stream: true, stream_options: { include_usage: true } },
+          httpStatus: response.status,
+          response: null,
+          streamEvidence: null,
+          reasoningPresent: false,
+          reasoningCharacterCount: 0,
+          requestStartedAt,
+          responseFinishedAt: new Date().toISOString(),
+          failureKind,
+        };
+        rawRows.push(failureRow);
+        await appendFile(modelRawPath, `${JSON.stringify(failureRow)}\n`);
+        if (failureKind === 'timeout' && attemptIndex < retryPolicy.maxAttemptsPerLogicalCall) {
+          clearTimeout(timer);
+          await new Promise((resolve) => setTimeout(resolve, retryPolicy.retryDelayMs));
+          continue;
+        }
+        throw new Error(`Aether logical call ${currentLogicalCallIndex} returned an invalid strict stream`);
       } finally {
         clearTimeout(timer);
       }
@@ -328,9 +390,10 @@ async function main() {
         seed,
         phase,
         conditionId,
-        request: { model: requestBody.model, messages, thinking: requestBody.thinking, temperature: 0, max_tokens: maximumTokens, timeout_ms: timeoutMs },
+        request: { model: requestBody.model, messages, thinking: requestBody.thinking, temperature: 0, max_tokens: maximumTokens, timeout_ms: timeoutMs, stream: true, stream_options: { include_usage: true } },
         httpStatus: response.status,
         response: { model: body?.model ?? null, choices: body?.choices ?? null, usage: body?.usage ?? null, error: body?.error ?? null },
+        streamEvidence,
         reasoningPresent: reasoningContent.trim().length > 0,
         reasoningCharacterCount: reasoningContent.length,
         requestStartedAt,

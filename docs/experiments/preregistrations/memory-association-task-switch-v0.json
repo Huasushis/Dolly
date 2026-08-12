@@ -2,7 +2,7 @@
   "$schema": "./schema-v1.json",
   "schemaVersion": "dolly-experiment-preregistration/v1",
   "experimentId": "memory-association-task-switch-v0",
-  "experimentVersion": 9,
+  "experimentVersion": 10,
   "title": "Memory representations and repeated positional association in an interrupted-task Agent pilot",
   "status": "frozen-before-first-run",
   "scope": "exploratory-component",
@@ -460,7 +460,7 @@
     "maxVirtualTimeMsPerCase": 10000,
     "maxWallClockMs": 7200000,
     "failurePolicy": "Any missing planned case row, malformed terminal model response, non-finite score, duplicate identity, context leak, artifact failure, checksum mismatch, secret or endpoint leakage, unplanned network request, more than 38 logical live calls or 152 transport attempts, or validation failure makes the run inconclusive. A live error cannot fall back to local output.",
-    "retryPolicy": "Local cases and completed model responses are never retried. A logical live call may make at most four request attempts only after a timeout, network or JSON transport failure, HTTP 408, HTTP 425, HTTP 429, or HTTP 5xx. Every failed attempt remains in model-raw.jsonl; malformed, truncated, empty, or otherwise usable HTTP 200 responses are not retried. Machine-readable limits are in domainDesign.liveEndpointProfile.retryPolicy."
+    "retryPolicy": "Local cases and completed model responses are never retried. A logical live call may make at most four request attempts only after a timeout, network failure before response headers, HTTP 408, HTTP 425, HTTP 429, or HTTP 5xx. Every failed attempt remains in model-raw.jsonl; wrong content type, malformed SSE, missing usage, missing [DONE], truncated, empty, or otherwise unusable HTTP 200 responses are not retried. Machine-readable limits are in domainDesign.liveEndpointProfile.retryPolicy."
   },
   "stoppingRules": {
     "plannedCompletion": "Write all 1872 deterministic case rows, then run exactly two logical learning calls and 36 paired logical Agent calls if live opt-ins and credentials are present. Persist one raw row for every request attempt before using its result, with 38 to 152 raw rows for the 38 logical calls, then write aggregates and run independent validation. No attempt or case row is removed after results are read.",
@@ -468,7 +468,7 @@
     "abortConditions": [
       "The preregistration or protocol hash differs from the bytes recorded in the manifest.",
       "Active context contains an original-task record, an expected identifier is absent from retained memory, or ground truth is constructed after retrieval.",
-      "A request contains enable_thinking, a learner request omits thinking.type=enabled, an Agent request omits thinking.type=disabled, a request names a model other than qwen3.6-27b, or a response lacks an explicit reasoning_content observation.",
+      "A request contains enable_thinking, a learner request omits thinking.type=enabled, an Agent request omits thinking.type=disabled, a request names a model other than qwen3.6-27b, omits stream=true or stream_options.include_usage=true, accepts a non-SSE success response, lacks exactly one terminal usage event or [DONE], or lacks an explicit reasoning_content observation.",
       "The program exposes the API key or endpoint URL in console output or stored artifacts.",
       "The run reaches Dolly runtime or Module launch code, private user data, DashScope, OSS, or any network destination other than the configured Aether origin.",
       "The run exceeds 38 logical live model calls, 152 request attempts, 7200 seconds, 1908 case rows, or an artifact/resource bound."
@@ -532,12 +532,12 @@
   },
   "independentValidation": {
     "analyzerPath": "scripts/experiments/probes/memory-association-task-switch-v0/verify.mjs",
-    "readsOnlyArtifacts": true,
+    "readsOnlyArtifacts": false,
     "importsTreatmentImplementation": false,
     "requiredChecks": [
-      "The verify entry path reads only preregistration and artifacts and never calls generation, retrieval, learning, or model-request functions.",
+      "The verify entry path reads the artifact snapshot, the five frozen implementation source files, and configured fixture values only for leakage scanning; it never calls generation, retrieval, learning, or model-request functions.",
       "Recompute every row metric from preregistered ground-truth fields, active-context identifiers, retrieved or cited evidence identifiers, and structured Agent output.",
-      "Verify factorial coverage, exact identities, three-repeat local equality, live call count and order, finite scores, model/thinking metadata, reasoning observation coverage, aggregates, decision classification, and checksums.",
+      "Verify factorial coverage, exact identities, three-repeat local equality, live call count and order, finite scores, model/thinking/strict-SSE metadata, one usage event and one [DONE] for every successful live attempt, reasoning observation coverage, aggregates, decision classification, and checksums.",
       "Scan every stored and console-safe field for the configured endpoint or API-key values without writing those values into the validation report."
     ],
     "mutationTests": [
@@ -558,7 +558,29 @@
     "moduleStartupRefusalMustRemain": true
   },
   "domainDesign": {
-    "implementationStatus": "Versions 2 through 6 established that this Aether route can spend 700 to 3600 completion tokens entirely in non-empty reasoning_content and return no content, and version 5 also exposed an undeclared 90-second harness timeout. Version 7 raised max_tokens to 5200 and asked for internal analysis under 200 words: its learner completed, but one Agent exhausted 5200 tokens and a later call timed out at 180 seconds. Version 8 used the route's measured thinking.type=disabled mode for scored Agent calls; its learner and first three Agent calls completed, then a disabled Agent request timed out after 90 seconds. Repository capability research confirms this relay accepts thinking.type enabled or disabled and has no measured reasoning-budget request field, so inventing one is prohibited. Version 9 retains version 8's paired request profiles and preregisters up to four attempts only for enumerated transport failures or retryable HTTP status codes. Every attempt is retained; HTTP 200 content failures are never retried. Data, prompts, splits, conditions, 38 logical calls, metrics, and effect thresholds are otherwise unchanged. Reasoning-enabled Agent efficacy remains outside this run's support. Earlier failures and frozen preregistration bytes remain retained under the experiment artifact root. The harness remains standalone and may not import Dolly runtime or current Memory implementation.",
+    "implementationStatus": "Versions 2 through 6 established that this Aether route can spend 700 to 3600 completion tokens entirely in non-empty reasoning_content and return no content, and version 5 also exposed an undeclared 90-second harness timeout. Version 7 raised max_tokens to 5200 and asked for internal analysis under 200 words: its learner completed, but one Agent exhausted 5200 tokens and a later call timed out at 180 seconds. Version 8 used the route's measured thinking.type=disabled mode for scored Agent calls; its learner and first three Agent calls completed, then a disabled Agent request timed out after 90 seconds. Version 9 completed the 38 logical calls with transport-only retries and remains the non-stream historical result. Version 10 changes only the Aether response transport contract: every generation request sends stream=true and stream_options.include_usage=true; a successful attempt requires text/event-stream, one stable provider identity, a finish reason, exactly one choice-less usage event, and exactly one [DONE]. There is no non-stream fallback and malformed HTTP 200 streams are never retried. Data, prompts, thinking modes, splits, conditions, 38 logical calls, metrics, retryable transport categories, and effect thresholds are otherwise unchanged. Reasoning-enabled Agent efficacy remains outside this run's support. Earlier failures and frozen preregistration bytes remain retained under the experiment artifact root. The harness remains standalone and may not import Dolly runtime or current Memory implementation.",
+    "implementationFiles": [
+      {
+        "path": "scripts/experiments/probes/memory-association-task-switch-v0/common.mjs",
+        "sha256": "43d8e4f7d34c9e8d5e1dd3586228f1bf004169c0725bd4b61259ffef4640f640"
+      },
+      {
+        "path": "scripts/experiments/probes/memory-association-task-switch-v0/run-local.mjs",
+        "sha256": "de21784d14a2b1b12450b71f6bafba35d96352f0b8fd055dcb67c6d9e6bfabe4"
+      },
+      {
+        "path": "scripts/experiments/probes/memory-association-task-switch-v0/run-full.mjs",
+        "sha256": "d2ab7abf634c6ec685b5378034fab9f5741799ae3ed134c90cf1737aabf774e5"
+      },
+      {
+        "path": "scripts/experiments/probes/memory-association-task-switch-v0/strict-chat-sse.mjs",
+        "sha256": "fb90bae0d5bf5aa8bd874fac099364ee304a746805f08e4c9335f2afb1ceae51"
+      },
+      {
+        "path": "scripts/experiments/probes/memory-association-task-switch-v0/verify.mjs",
+        "sha256": "afe9edb35c3642eebe8213aada89e9df8bc5135199d1bfe229b873d0902a4a93"
+      }
+    ],
     "rowAccounting": "cases.jsonl contains 1872 deterministic case rows and, when live execution is opted in, 36 Agent case rows. model-raw.jsonl separately contains one row per request attempt: 38 rows when no retry is needed and at most 152 rows. Exactly two logical calls are learners and 36 are Agent calls; learner responses are not case rows.",
     "currentConsumerAudit": {
       "lexical": "Current Memory uses Unicode tokens and BM25 but is not wired into the supported runtime.",
@@ -617,7 +639,11 @@
         "enable_thinking": "forbidden",
         "temperature": 0,
         "max_tokens": 5200,
-        "timeout_ms": 180000
+        "timeout_ms": 180000,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
       },
       "agentRequest": {
         "thinking": {
@@ -626,8 +652,13 @@
         "enable_thinking": "forbidden",
         "temperature": 0,
         "max_tokens": 800,
-        "timeout_ms": 90000
+        "timeout_ms": 90000,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
       },
+      "streamContract": "Every HTTP 200 attempt must have content type text/event-stream, stable id/model, one finish reason, one choice-less usage event, exactly one [DONE], no bytes after [DONE], bounded valid UTF-8 events, and no non-stream fallback.",
       "reasoningEvidence": "Only a non-empty response message reasoning_content proves reasoning for that call. Content and reasoning remain separate in raw artifacts.",
       "secretHandling": "Load .env without printing values; never store the API key, configured origin, authorization header, or unredacted request URL. Artifacts use the label owner-aether-qwen36 only.",
       "logicalCallBudget": 38,

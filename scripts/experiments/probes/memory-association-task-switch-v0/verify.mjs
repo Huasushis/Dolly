@@ -213,10 +213,61 @@ async function main() {
     preregistrationSource = 'working-tree';
   }
   const preregistration = JSON.parse(preregistrationBytes);
+  const strictStreamRequired = preregistration.experimentVersion >= 10;
+  if (strictStreamRequired) {
+    const implementationFiles = preregistration.domainDesign.implementationFiles;
+    if (!Array.isArray(implementationFiles) || implementationFiles.length < 5) {
+      errors.push('version 10 requires frozen implementation file hashes');
+    } else {
+      for (const entry of implementationFiles) {
+        try {
+          const sourceBytes = await readFile(path.join(repositoryRoot, entry.path));
+          if (sha256(sourceBytes) !== entry.sha256) {
+            errors.push(`implementation source hash mismatch for ${entry.path}`);
+          }
+        } catch {
+          errors.push(`implementation source is unavailable for ${entry.path}`);
+        }
+      }
+    }
+  }
   function expectedRequest(row) {
     return row.kind === 'agent'
       ? (preregistration.domainDesign.liveEndpointProfile.agentRequest ?? preregistration.domainDesign.liveEndpointProfile.request)
       : preregistration.domainDesign.liveEndpointProfile.request;
+  }
+  function requestMetadataMatches(row, expected) {
+    return row.request?.model === 'qwen3.6-27b'
+      && row.request?.thinking?.type === expected.thinking.type
+      && row.request?.temperature === 0
+      && row.request?.max_tokens === expected.max_tokens
+      && (expected.timeout_ms === undefined || row.request?.timeout_ms === expected.timeout_ms)
+      && (!strictStreamRequired || (
+        row.request?.stream === true
+        && stableJson(row.request?.stream_options) === stableJson({ include_usage: true })
+      ));
+  }
+  function validateStrictStreamRow(row, index) {
+    if (!strictStreamRequired || row.httpStatus !== 200) return;
+    if (!Array.isArray(row.response?.choices)) {
+      if (row.failureKind !== 'stream-protocol' && row.failureKind !== 'timeout') {
+        errors.push(`HTTP 200 failure lacks a strict-stream failure kind at ${index}`);
+      }
+      if (row.streamEvidence !== null) errors.push(`failed strict stream carries success evidence at ${index}`);
+      return;
+    }
+    const evidence = row.streamEvidence;
+    if (
+      !evidence
+      || !/^text\/event-stream(?:\s*;|$)/iu.test(evidence.contentType ?? '')
+      || !Number.isSafeInteger(evidence.responseBytes) || evidence.responseBytes <= 0
+      || !Number.isSafeInteger(evidence.eventCount) || evidence.eventCount < 3
+      || evidence.usageEventCount !== 1
+      || evidence.doneCount !== 1
+      || evidence.providerIdObserved !== true
+    ) {
+      errors.push(`strict stream evidence mismatch at ${index}`);
+    }
   }
   const filenames = ['run-manifest.json', 'cases.jsonl', 'model-raw.jsonl', 'analysis.json', 'sha256sums.txt'];
   if (preregistrationSource === 'artifact-snapshot') filenames.push('preregistration.json');
@@ -289,7 +340,9 @@ async function main() {
   const terminalAttemptIndexes = new Set();
   function isRetryableAttempt(row) {
     return row.httpStatus === null
-      ? ['timeout', 'network-or-json'].includes(row.failureKind)
+      ? (strictStreamRequired
+          ? ['timeout', 'network-before-response-headers'].includes(row.failureKind)
+          : ['timeout', 'network-or-json'].includes(row.failureKind))
       : [408, 425, 429].includes(row.httpStatus) || row.httpStatus >= 500;
   }
   if (retryDetails) {
@@ -351,8 +404,9 @@ async function main() {
       const row = modelRows[index];
       if (row.callIndex !== index) errors.push(`aborted model raw call index mismatch at ${index}`);
       const expected = expectedRequest(row);
-      if (row.request?.model !== 'qwen3.6-27b' || row.request?.thinking?.type !== expected.thinking.type || row.request?.temperature !== 0 || row.request?.max_tokens !== expected.max_tokens || (expected.timeout_ms !== undefined && row.request?.timeout_ms !== expected.timeout_ms)) errors.push(`aborted model request metadata mismatch at ${index}`);
+      if (!requestMetadataMatches(row, expected)) errors.push(`aborted model request metadata mismatch at ${index}`);
       if ('enable_thinking' in (row.request ?? {})) errors.push(`forbidden enable_thinking at aborted call ${index}`);
+      validateStrictStreamRow(row, index);
       const reasoning = row.response?.choices?.[0]?.message?.reasoning_content;
       const reasoningText = typeof reasoning === 'string' ? reasoning : '';
       if (row.reasoningPresent !== (reasoningText.trim().length > 0) || row.reasoningCharacterCount !== reasoningText.length) errors.push(`aborted reasoning observation mismatch at ${index}`);
@@ -396,8 +450,9 @@ async function main() {
       const row = modelRows[index];
       if (row.callIndex !== index) errors.push(`model raw call index mismatch at ${index}`);
       const expected = expectedRequest(row);
-      if (row.request?.model !== 'qwen3.6-27b' || row.request?.thinking?.type !== expected.thinking.type || row.request?.temperature !== 0 || row.request?.max_tokens !== expected.max_tokens || (expected.timeout_ms !== undefined && row.request?.timeout_ms !== expected.timeout_ms)) errors.push(`model request metadata mismatch at ${index}`);
+      if (!requestMetadataMatches(row, expected)) errors.push(`model request metadata mismatch at ${index}`);
       if ('enable_thinking' in (row.request ?? {})) errors.push(`forbidden enable_thinking at ${index}`);
+      validateStrictStreamRow(row, index);
       if (terminalAttemptIndexes.has(row.callIndex) && (row.httpStatus !== 200 || !Array.isArray(row.response?.choices))) errors.push(`terminal model response failure at ${index}`);
       if (!terminalAttemptIndexes.has(row.callIndex) && !isRetryableAttempt(row)) errors.push(`unapproved retry source at ${index}`);
       const reasoning = row.response?.choices?.[0]?.message?.reasoning_content;
