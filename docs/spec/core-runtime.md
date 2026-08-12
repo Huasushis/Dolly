@@ -2182,11 +2182,23 @@ or when an upstream actor should be throttled.
 No policy decision may:
 
 - start a second run for a busy actor;
+- invent reactive or source work when the fixed baseline sees no pending
+  durable request;
+- run a periodic Module earlier than its configured start-to-start period;
 - positively acknowledge, negatively acknowledge, prune, or mutate Deliveries;
 - release a strong reference or access lease;
 - bypass mailbox limits;
 - accept a stale run report;
 - change a Module generation.
+
+The fixed baseline is both the fallback and the eligibility ceiling for a
+selected policy. Core evaluates both decisions from the same immutable
+snapshot. A selected policy may make an eligible baseline later or ineligible,
+but if it returns `eligible` while the baseline is ineligible, Core treats that
+as policy failure before dispatch and applies the configured fallback or
+visible-failure action. This keeps pending-input and minimum-period semantics
+in Core while still allowing research policies to delay work and reduce batch
+size.
 
 ### 13.2 Policy interface
 

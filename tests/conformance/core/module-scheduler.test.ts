@@ -1064,6 +1064,93 @@ describe("CORE scheduler policy boundary", () => {
     await stopping;
   });
 
+  it("does not let a selected policy invent reactive work with no pending input", async () => {
+    const policy: SchedulerPolicy = {
+      decide: () => ({
+        eligible: true,
+        eligibleAt: 0,
+        claimLimitCount: 1,
+        claimLimitBytes: 1_024,
+        reasonCode: "INVENTED_WORK",
+        policyName: "invented-work",
+        policyVersion: "1",
+      }),
+    };
+    const { clock, mailboxes, scheduler, events } = createScheduler({ policy });
+    const runtime = new FakeModuleRuntime(() => ({ status: "idle" }));
+    mailboxes.set("worker", 0, 0);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(runtime.tickCount).toBe(0);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "scheduler.policy_failed",
+      action: "fallback-baseline",
+    }));
+    expect(scheduler.status("worker")).toMatchObject({
+      lastDecisionReasonCode: "NO_PENDING_INPUT",
+      policyName: "fixed-baseline",
+    });
+    await scheduler.stop();
+  });
+
+  it("does not let a selected policy run a periodic Module before its baseline period", async () => {
+    const policy: SchedulerPolicy = {
+      decide: () => ({
+        eligible: true,
+        eligibleAt: 0,
+        claimLimitCount: 1,
+        claimLimitBytes: 1_024,
+        reasonCode: "IGNORE_PERIOD",
+        policyName: "ignore-period",
+        policyVersion: "1",
+      }),
+    };
+    const { clock, mailboxes, scheduler, events } = createScheduler({
+      policy,
+      pollIntervalMs: 100,
+    });
+    const runtime = new FakeModuleRuntime(() => ({ status: "idle" }));
+    mailboxes.set("periodic", 1, 100);
+    scheduler.register({
+      moduleId: "periodic",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+      activation: { kind: "periodic", periodMs: 1_000, allowEmptyInput: false },
+    });
+
+    scheduler.start();
+    await drain(clock);
+    expect(runtime.tickCount).toBe(1);
+
+    await advance(clock, 999);
+    expect(runtime.tickCount).toBe(1);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "scheduler.policy_failed",
+      action: "fallback-baseline",
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "scheduler.decision",
+      moduleId: "periodic",
+      reasonCode: "PERIOD_NOT_DUE",
+      eligible: false,
+    }));
+
+    await advance(clock, 1);
+    expect(runtime.tickCount).toBe(2);
+    await scheduler.stop();
+  });
+
   it("refuses a policy decision that would bypass a downstream mailbox bound", async () => {
     const policy: SchedulerPolicy = { decide: () => rogueDecision };
     const { clock, mailboxes, scheduler } = createScheduler({ policy });

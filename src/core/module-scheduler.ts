@@ -1487,7 +1487,16 @@ export class ModuleScheduler {
   /** Returns null when the Module must not be scheduled at all this pass. */
   #decide(entry: ModuleEntry, snapshot: SchedulerSnapshot): SchedulerDecision | null {
     try {
-      return this.#validateDecision(this.#policy.decide(snapshot));
+      const decision = this.#validateDecision(this.#policy.decide(snapshot));
+      if (this.#policy !== this.#fallbackPolicy) {
+        const baseline = this.#validateDecision(this.#fallbackPolicy.decide(snapshot));
+        if (decision.eligible && !baseline.eligible) {
+          throw new TypeError(
+            "Scheduler policy expanded eligibility beyond the fixed baseline",
+          );
+        }
+      }
+      return decision;
     } catch (error) {
       entry.counters.policyFailures += 1;
       this.#emitModule(entry, {
