@@ -67,6 +67,19 @@ absent. Reproducible metadata and a plain result summary are in
 raw local runner log SHA-256 was
 `44791448f18ff3af2cafc99c1cc60c68a82c00a338da244812ca530eb3710813`.
 
+Source `96a52ce04e67f17dd9267f86e6c13060375c2aaa` then composed that
+lookup with `createFileCoreActiveRunModelMediaResolver` in the same real Linux
+test. Before executing the installed fixture, the resolver required the exact
+active Claim, matching durable submission, running process record, live Host
+session, and a Media reference delivered in that Claim. It returned the
+verified inline PNG copy and left zero Media leases. After whole-group stop,
+the identical request was refused. The focused file again passed 2/2 tests in
+the uniquely named disposable container `dolly-experiment-3474702-98964c3b`,
+which the runner removed by exact name. Its raw local log SHA-256 was
+`5e3e32e04d2f218f643d7124a801a206c083b8bde1b23d4d34a62a33a62417e4`;
+the portable summary is in
+`docs/experiments/evidence/installed-active-run-media-96a52ce/`.
+
 ## What this does not prove
 
 This result does not prove that configured Modules are product-supported.
