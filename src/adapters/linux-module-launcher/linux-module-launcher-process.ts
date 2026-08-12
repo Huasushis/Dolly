@@ -56,6 +56,12 @@ export interface StartLinuxModuleLauncherOptions {
   /** Explicit minimal environment for the launcher process itself. */
   readonly launcherEnvironment?: Readonly<Record<string, string>>;
   /**
+   * Read-only regular file containing Host-frozen package bytes. It is mapped
+   * to child descriptor 4; the reviewed launcher preserves only that exact
+   * regular/read-only shape, and only the confinement command may consume it.
+   */
+  readonly immutableInputDescriptor?: number;
+  /**
    * Extra descriptors inherited above the control descriptor. A real launch
    * passes none; tests use them to prove that the launcher closes every
    * inherited descriptor it must not keep.
@@ -110,13 +116,27 @@ export function startLinuxModuleLauncher(
     throw new TypeError("The launcher interpreter and script paths must be absolute");
   }
   const [stdin, stdout, stderr] = options.protocolStdio ?? ["pipe", "pipe", "pipe"];
+  if (
+    options.immutableInputDescriptor !== undefined &&
+    (!Number.isSafeInteger(options.immutableInputDescriptor) ||
+      options.immutableInputDescriptor < 0)
+  ) {
+    throw new TypeError("immutableInputDescriptor must be a non-negative file descriptor");
+  }
   const child = spawn(
     options.interpreterProgram,
     // Isolated mode ignores PYTHON* environment variables and the user site
     // directory; -B keeps the installed launcher directory free of cache files.
     ["-I", "-B", options.launcherScriptPath],
     {
-      stdio: [stdin, stdout, stderr, "pipe", ...(options.additionalInheritedStdio ?? [])],
+      stdio: [
+        stdin,
+        stdout,
+        stderr,
+        "pipe",
+        options.immutableInputDescriptor ?? "ignore",
+        ...(options.additionalInheritedStdio ?? []),
+      ],
       env: { ...(options.launcherEnvironment ?? {}) },
       detached: false,
     },

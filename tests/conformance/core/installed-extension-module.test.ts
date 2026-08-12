@@ -14,7 +14,10 @@ import {
   deriveInstalledLinuxExtensionModuleExecutor,
   type InstalledLinuxExtensionModuleExecutorOptions,
 } from "../../../src/adapters/installed-linux-extension-module-executor.js";
-import { LINUX_PROCESS_CONFINEMENT_PROGRAM } from "../../../src/adapters/linux-process-confinement.js";
+import {
+  LINUX_PACKAGE_SNAPSHOT_BOOTSTRAP,
+  LINUX_PROCESS_CONFINEMENT_PROGRAM,
+} from "../../../src/adapters/linux-process-confinement.js";
 import {
   canonicalJsonDigest,
   type JsonValue,
@@ -518,8 +521,8 @@ describe("installed Extension Module resolution", () => {
         "--tmpfs", "/run",
         "--tmpfs", "/tmp",
         "--dir", "/run/dolly",
+        "--file", "4", "/run/dolly/package.snapshot",
         "--ro-bind", process.execPath, "/run/dolly/node",
-        "--ro-bind", installed.workingDirectory, "/run/dolly/extension",
         "--unshare-user",
         "--unshare-pid",
         "--unshare-cgroup",
@@ -531,13 +534,27 @@ describe("installed Extension Module resolution", () => {
         "--new-session",
         "--clearenv",
         "--cap-drop", "ALL",
-        "--chdir", "/run/dolly/extension",
+        "--chdir", "/run/dolly",
         "--",
-        "/run/dolly/node",
-        "/run/dolly/extension/dist/main.mjs",
+        "/usr/bin/python3",
+        "-I",
+        "-B",
+        "-c",
+        LINUX_PACKAGE_SNAPSHOT_BOOTSTRAP,
+        installed.packageSnapshot.digest,
+        String(installed.packageSnapshot.byteLength),
+        String(installed.packageSnapshot.fileCount),
+        String(installed.packageSnapshot.totalFileBytes),
+        "dist/main.mjs",
       ],
       environment: {},
     });
+    expect(derived.executorOptions.packageSnapshot).toMatchObject({
+      digest: installed.packageSnapshot.digest,
+      stagingDirectory: resolve(scratch, "instance-state"),
+    });
+    expect(derived.executorOptions.packageSnapshot?.bytes)
+      .toEqual(installed.packageSnapshot.copyBytes());
     expect(derived.executorOptions.launcher.launcherEnvironment).toEqual({});
     expect(processRecord.serviceInvocationId).toBe(CORE_BINDING.serviceInvocationId);
     expect(processRecord.bootId).toBe(CORE_BINDING.bootId);

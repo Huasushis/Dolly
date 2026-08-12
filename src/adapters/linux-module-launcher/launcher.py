@@ -9,7 +9,10 @@ creation cannot place a new process atomically into a different control group
 (cgroup). The launcher joins the prepared Module cgroup itself, applies its
 open-file limit, closes every other inherited descriptor, and waits for Core to
 verify its kernel membership before it replaces itself with the installed
-Extension runtime.
+Extension runtime. An installed launch may additionally carry one read-only
+regular descriptor containing the already-verified package snapshot. The
+launcher preserves only that exact descriptor shape, and only the reviewed
+bubblewrap command may consume it.
 
 Why this program is Python and not Node.js
 ------------------------------------------
@@ -46,6 +49,7 @@ import os
 import resource
 import select
 import signal
+import stat
 import sys
 import time
 
@@ -55,6 +59,7 @@ LAUNCHER_PROTOCOL_VERSION = 1
 # and 1 carry the Extension protocol transport and 2 carries bounded diagnostic
 # standard-error text.
 CONTROL_DESCRIPTOR = 3
+PACKAGE_SNAPSHOT_DESCRIPTOR = 4
 KEPT_DESCRIPTORS = frozenset((0, 1, 2, CONTROL_DESCRIPTOR))
 
 MAX_FRAME_BYTES = 4096
@@ -264,14 +269,26 @@ def apply_open_file_limit(max_open_files):
         fail(EXIT_PROCESS_LIMIT_FAILED, "cannot apply RLIMIT_NOFILE: " + str(error))
 
 
-def close_other_inherited_descriptors():
-    """Closes every inherited descriptor except the protocol transport and control descriptor."""
+def inherited_package_snapshot_descriptor():
+    """Accepts only the adapter-owned read-only regular file at descriptor 4."""
+    try:
+        metadata = os.fstat(PACKAGE_SNAPSHOT_DESCRIPTOR)
+        flags = fcntl.fcntl(PACKAGE_SNAPSHOT_DESCRIPTOR, fcntl.F_GETFL)
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode) or (flags & os.O_ACCMODE) != os.O_RDONLY:
+        return None
+    return PACKAGE_SNAPSHOT_DESCRIPTOR
+
+
+def close_other_inherited_descriptors(package_snapshot_descriptor):
+    """Closes every descriptor except protocol, control, and an exact package snapshot."""
     try:
         open_descriptors = [int(name) for name in os.listdir("/proc/self/fd")]
     except (OSError, ValueError) as error:
         fail(EXIT_PROCESS_LIMIT_FAILED, "cannot list open descriptors: " + str(error))
     for descriptor in open_descriptors:
-        if descriptor in KEPT_DESCRIPTORS:
+        if descriptor in KEPT_DESCRIPTORS or descriptor == package_snapshot_descriptor:
             continue
         try:
             os.close(descriptor)
@@ -297,7 +314,8 @@ def main():
 
     join_module_cgroup(module_cgroup_path)
     apply_open_file_limit(max_open_files)
-    close_other_inherited_descriptors()
+    package_snapshot_descriptor = inherited_package_snapshot_descriptor()
+    close_other_inherited_descriptors(package_snapshot_descriptor)
 
     write_frame({"launcherProtocol": LAUNCHER_PROTOCOL_VERSION, "event": "in-cgroup"})
 
@@ -306,6 +324,19 @@ def main():
     if authorization_frame.get("command") != "execute":
         fail(EXIT_FRAME_INVALID, "second control frame is not the execute or exit command")
     program, argument_vector, environment = parse_execute(authorization_frame)
+
+    if package_snapshot_descriptor is not None:
+        snapshot_argument = ["--file", "4", "/run/dolly/package.snapshot"]
+        consumes_snapshot = any(
+            argument_vector[index:index + len(snapshot_argument)] == snapshot_argument
+            for index in range(len(argument_vector) - len(snapshot_argument) + 1)
+        )
+        if program != "/usr/bin/bwrap" or not consumes_snapshot:
+            try:
+                os.close(package_snapshot_descriptor)
+            except OSError:
+                pass
+            package_snapshot_descriptor = None
 
     # The control descriptor must not survive exec, so the Extension retains no
     # Core management descriptor.

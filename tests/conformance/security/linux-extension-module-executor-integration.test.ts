@@ -635,6 +635,17 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     });
     const executor = factory.createExecutor(MODULE_GENERATION_ID);
     requireLifecycleOperations(executor);
+    const verifiedEntrypoint = readFileSync(installed.entrypointPath, "utf8");
+    const changedEntrypoint = verifiedEntrypoint.replace(
+      "? { ok: true, input: params.input, confinement: confinementReport() }",
+      "? { ok: \"tampered-after-resolution\", input: params.input, confinement: confinementReport() }",
+    );
+    expect(changedEntrypoint).not.toBe(verifiedEntrypoint);
+    // The execution handle must own the bytes validated while it was created.
+    // Mutating the managed path afterwards is the time-of-check/time-of-use
+    // counterexample: a path-only launcher will run this changed response while
+    // persisting the digest of the earlier package.
+    writeFileSync(installed.entrypointPath, changedEntrypoint, "utf8");
     const terminationContext = {
       moduleId: "installed-worker",
       moduleGenerationId: MODULE_GENERATION_ID,

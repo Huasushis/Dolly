@@ -7,7 +7,21 @@
  * and durable-effect boundaries have independent end-to-end evidence.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { isAbsolute, join } from "node:path";
 import type { ModuleExecutor } from "../core/module-actor.js";
 import type { ReactiveModuleInput } from "../core/reactive-module-input.js";
 import type { ReactiveModuleResult } from "../core/reactive-module-runtime.js";
@@ -43,8 +57,14 @@ type LinuxExtensionHostOptions = Omit<
 
 type LinuxLauncherOptions = Omit<
   StartLinuxModuleLauncherOptions,
-  "additionalInheritedStdio" | "protocolStdio"
+  "additionalInheritedStdio" | "immutableInputDescriptor" | "protocolStdio"
 >;
+
+export interface LinuxExtensionPackageSnapshotInput {
+  readonly bytes: Uint8Array;
+  readonly digest: string;
+  readonly stagingDirectory: string;
+}
 
 export interface LinuxExtensionModuleExecutorOptions {
   readonly moduleId: string;
@@ -61,6 +81,8 @@ export interface LinuxExtensionModuleExecutorOptions {
    * Module, and process-generation identifiers come from the durable record.
    */
   readonly host: LinuxExtensionHostOptions;
+  /** Registry-captured package bytes; absent only for lower-level non-installed tests. */
+  readonly packageSnapshot?: LinuxExtensionPackageSnapshotInput;
   readonly executionTimeoutMs: number;
   readonly cancellationGraceMs: number;
   readonly terminationTimeoutMs: number;
@@ -107,11 +129,104 @@ function assertClosedLauncherOptions(options: LinuxLauncherOptions): void {
   const supplied = options as LinuxLauncherOptions & Record<string, unknown>;
   if (
     Object.hasOwn(supplied, "protocolStdio") ||
-    Object.hasOwn(supplied, "additionalInheritedStdio")
+    Object.hasOwn(supplied, "additionalInheritedStdio") ||
+    Object.hasOwn(supplied, "immutableInputDescriptor")
   ) {
     throw new TypeError(
       "Linux Extension launchers must use the adapter-owned protocol pipes and may not inherit extra descriptors",
     );
+  }
+}
+
+function digestBytes(bytes: Uint8Array): string {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function openAnonymousPackageSnapshot(
+  snapshot: LinuxExtensionPackageSnapshotInput,
+): number {
+  if (
+    !/^sha256:[0-9a-f]{64}$/u.test(snapshot.digest) ||
+    digestBytes(snapshot.bytes) !== snapshot.digest ||
+    !isAbsolute(snapshot.stagingDirectory)
+  ) {
+    throw new TypeError("Installed package snapshot input is invalid");
+  }
+  const directoryMetadata = lstatSync(snapshot.stagingDirectory);
+  const canonicalDirectory = realpathSync.native(snapshot.stagingDirectory);
+  if (directoryMetadata.isSymbolicLink() || !directoryMetadata.isDirectory()) {
+    throw new TypeError("Installed package snapshot staging directory is unsafe");
+  }
+  const path = join(
+    canonicalDirectory,
+    `.dolly-package-snapshot-${randomBytes(24).toString("hex")}.tmp`,
+  );
+  let writeDescriptor: number | undefined;
+  let readDescriptor: number | undefined;
+  let pathExists = false;
+  try {
+    const noFollow = (constants as Readonly<Record<string, number>>).O_NOFOLLOW ?? 0;
+    writeDescriptor = openSync(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow,
+      0o600,
+    );
+    pathExists = true;
+    writeFileSync(writeDescriptor, snapshot.bytes);
+    fsyncSync(writeDescriptor);
+    closeSync(writeDescriptor);
+    writeDescriptor = undefined;
+    chmodSync(path, 0o400);
+    readDescriptor = openSync(path, constants.O_RDONLY | noFollow);
+    const descriptorMetadata = fstatSync(readDescriptor);
+    const pathMetadata = lstatSync(path);
+    if (
+      !descriptorMetadata.isFile() ||
+      pathMetadata.isSymbolicLink() ||
+      !pathMetadata.isFile() ||
+      descriptorMetadata.dev !== pathMetadata.dev ||
+      descriptorMetadata.ino !== pathMetadata.ino ||
+      descriptorMetadata.size !== snapshot.bytes.byteLength ||
+      pathMetadata.size !== snapshot.bytes.byteLength
+    ) {
+      throw new Error("Installed package snapshot staging file changed identity");
+    }
+    const digest = createHash("sha256");
+    let position = 0;
+    while (position < descriptorMetadata.size) {
+      const buffer = Buffer.allocUnsafe(
+        Math.min(64 * 1024, descriptorMetadata.size - position),
+      );
+      const bytesRead = readSync(
+        readDescriptor,
+        buffer,
+        0,
+        buffer.byteLength,
+        position,
+      );
+      if (bytesRead < 1) throw new Error("Installed package snapshot staging read ended early");
+      digest.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    if (`sha256:${digest.digest("hex")}` !== snapshot.digest) {
+      throw new Error("Installed package snapshot staging bytes changed");
+    }
+    unlinkSync(path);
+    pathExists = false;
+    const result = readDescriptor;
+    readDescriptor = undefined;
+    return result;
+  } finally {
+    if (writeDescriptor !== undefined) closeSync(writeDescriptor);
+    if (readDescriptor !== undefined) closeSync(readDescriptor);
+    if (pathExists) {
+      try {
+        unlinkSync(path);
+      } catch {
+        // The exact private path is best-effort cleanup after a fail-closed
+        // staging error. The launcher has not been created yet.
+      }
+    }
   }
 }
 
@@ -164,12 +279,24 @@ export function createLinuxExtensionModuleExecutor(
     if (startedLauncher !== undefined || launcherControl !== undefined) {
       throw new Error("A Linux Extension executor cannot create more than one launcher");
     }
-    const started = startLinuxModuleLauncher({
-      ...options.launcher,
-      protocolStdio: ["pipe", "pipe", "pipe"],
-      additionalInheritedStdio: [],
-    });
-    startedLauncher = started;
+    let snapshotDescriptor: number | undefined;
+    try {
+      if (options.packageSnapshot !== undefined) {
+        snapshotDescriptor = openAnonymousPackageSnapshot(options.packageSnapshot);
+      }
+      const started = startLinuxModuleLauncher({
+        ...options.launcher,
+        protocolStdio: ["pipe", "pipe", "pipe"],
+        additionalInheritedStdio: [],
+        ...(snapshotDescriptor === undefined
+          ? {}
+          : { immutableInputDescriptor: snapshotDescriptor }),
+      });
+      startedLauncher = started;
+    } finally {
+      if (snapshotDescriptor !== undefined) closeSync(snapshotDescriptor);
+    }
+    const started = startedLauncher!;
     started.child.stderr?.on("data", (chunk: Buffer) => {
       try {
         options.onStandardErrorChunk?.(new Uint8Array(chunk));

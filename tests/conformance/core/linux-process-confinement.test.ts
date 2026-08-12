@@ -2,13 +2,23 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   deriveLinuxProcessConfinementExecution,
+  LINUX_PACKAGE_SNAPSHOT_BOOTSTRAP,
 } from "../../../src/adapters/linux-process-confinement.js";
+import {
+  createLauncherExecuteCommand,
+  LAUNCHER_CONTROL_MAX_FRAME_BYTES,
+} from "../../../src/adapters/linux-module-launcher/launcher-control-protocol.js";
+import { canonicalJsonByteLength } from "../../../src/core/canonical-json.js";
+import { createExtensionPackageSnapshot } from "../../../src/core/extension-package-snapshot.js";
 
 const BUBBLEWRAP = "/usr/bin/bwrap";
 const NODE = "/usr/bin/node";
 const INSTALLATION = "/var/lib/dolly/extensions/package-a";
 const ENTRYPOINT = `${INSTALLATION}/dist/main.mjs`;
 const STATE = "/var/lib/dolly/instances/instance-a";
+const SNAPSHOT = createExtensionPackageSnapshot([
+  { path: "dist/main.mjs", bytes: Buffer.from("export {};\n", "utf8") },
+]);
 
 describe("Linux process confinement derivation", () => {
   it("derives one closed namespace command from host-owned paths", () => {
@@ -17,6 +27,7 @@ describe("Linux process confinement derivation", () => {
       nodeProgram: NODE,
       installationDirectory: INSTALLATION,
       entrypointPath: ENTRYPOINT,
+      packageSnapshot: SNAPSHOT,
       coreStateDirectory: STATE,
     });
 
@@ -34,8 +45,8 @@ describe("Linux process confinement derivation", () => {
         "--tmpfs", "/run",
         "--tmpfs", "/tmp",
         "--dir", "/run/dolly",
+        "--file", "4", "/run/dolly/package.snapshot",
         "--ro-bind", NODE, "/run/dolly/node",
-        "--ro-bind", INSTALLATION, "/run/dolly/extension",
         "--unshare-user",
         "--unshare-pid",
         "--unshare-cgroup",
@@ -47,18 +58,36 @@ describe("Linux process confinement derivation", () => {
         "--new-session",
         "--clearenv",
         "--cap-drop", "ALL",
-        "--chdir", "/run/dolly/extension",
+        "--chdir", "/run/dolly",
         "--",
-        "/run/dolly/node",
-        "/run/dolly/extension/dist/main.mjs",
+        "/usr/bin/python3",
+        "-I",
+        "-B",
+        "-c",
+        LINUX_PACKAGE_SNAPSHOT_BOOTSTRAP,
+        SNAPSHOT.digest,
+        String(SNAPSHOT.byteLength),
+        String(SNAPSHOT.fileCount),
+        String(SNAPSHOT.totalFileBytes),
+        "dist/main.mjs",
       ],
       environment: {},
+      packageSnapshot: SNAPSHOT,
     });
     expect(Object.isFrozen(execution)).toBe(true);
     expect(Object.isFrozen(execution.argumentVector)).toBe(true);
     expect(Object.isFrozen(execution.environment)).toBe(true);
     expect(execution.argumentVector).not.toContain(STATE);
     expect(execution.argumentVector).not.toEqual(expect.arrayContaining(["--ro-bind", "/", "/"]));
+
+    const executeCommand = createLauncherExecuteCommand(
+      execution.program,
+      execution.argumentVector,
+      execution.environment,
+    );
+    expect(canonicalJsonByteLength(executeCommand)).toBeLessThanOrEqual(
+      LAUNCHER_CONTROL_MAX_FRAME_BYTES,
+    );
   });
 
   it("rejects path substitution and overlap before a launcher exists", () => {
@@ -67,6 +96,7 @@ describe("Linux process confinement derivation", () => {
       nodeProgram: NODE,
       installationDirectory: INSTALLATION,
       entrypointPath: ENTRYPOINT,
+      packageSnapshot: SNAPSHOT,
       coreStateDirectory: STATE,
     } as const;
 
@@ -92,7 +122,7 @@ describe("Linux process confinement derivation", () => {
       entrypointPath: `${STATE}/packages/package-a/main.mjs`,
     });
     expect(installationInsideState.argumentVector).not.toContain(STATE);
-    expect(installationInsideState.argumentVector).toContain(`${STATE}/packages/package-a`);
+    expect(installationInsideState.argumentVector).not.toContain(`${STATE}/packages/package-a`);
     expect(() => deriveLinuxProcessConfinementExecution({
       ...base,
       coreStateDirectory: "/run/dolly-state",
@@ -110,14 +140,23 @@ describe("Linux process confinement derivation", () => {
       nodeProgram: NODE,
       installationDirectory: INSTALLATION,
       entrypointPath: injection,
+      packageSnapshot: SNAPSHOT,
       coreStateDirectory: STATE,
     });
 
     const separator = execution.argumentVector.indexOf("--");
     expect(separator).toBeGreaterThan(0);
     expect(execution.argumentVector.slice(separator + 1)).toEqual([
-      "/run/dolly/node",
-      "/run/dolly/extension/dist/--unshare-all",
+      "/usr/bin/python3",
+      "-I",
+      "-B",
+      "-c",
+      LINUX_PACKAGE_SNAPSHOT_BOOTSTRAP,
+      SNAPSHOT.digest,
+      String(SNAPSHOT.byteLength),
+      String(SNAPSHOT.fileCount),
+      String(SNAPSHOT.totalFileBytes),
+      "dist/--unshare-all",
     ]);
   });
 });

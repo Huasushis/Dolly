@@ -42,6 +42,11 @@ import {
   type JsonValue,
 } from "./canonical-json.js";
 import { parseContentSchemaName } from "./block-content.js";
+import {
+  createExtensionPackageSnapshot,
+  type ExtensionPackageSnapshot,
+  type ExtensionPackageSnapshotSourceFile,
+} from "./extension-package-snapshot.js";
 import { compileJsonSchema } from "./json-schema.js";
 import { parseStrictJsonBytes } from "./strict-json.js";
 import type { ExtensionTrust } from "./extension-process-host.js";
@@ -165,6 +170,8 @@ export interface ResolvedExtensionInstallation {
   readonly packageDigest: string;
   readonly workingDirectory: string;
   readonly entrypointPath: string;
+  /** Exact bytes read in the same scan that produced packageDigest. */
+  readonly packageSnapshot: ExtensionPackageSnapshot;
 }
 
 export interface ExtensionInstallationRegistryOptions {
@@ -238,6 +245,7 @@ interface ScannedPackage {
   readonly manifest: ExtensionPackageManifest;
   readonly files: readonly InstalledFile[];
   readonly packageDigest: string;
+  readonly packageSnapshot: ExtensionPackageSnapshot;
 }
 
 interface InstallationLimits {
@@ -990,6 +998,7 @@ export class ExtensionInstallationRegistry {
       packageDigest: record.packageDigest,
       workingDirectory,
       entrypointPath,
+      packageSnapshot: scanned.packageSnapshot,
     }) as ResolvedExtensionInstallation;
   }
 
@@ -1045,6 +1054,7 @@ export class ExtensionInstallationRegistry {
         );
       }
       const files: InstalledFile[] = [];
+      const snapshotFiles: ExtensionPackageSnapshotSourceFile[] = [];
       const casePaths = new Map<string, string>();
       const pending: Array<{
         readonly source: string;
@@ -1148,6 +1158,7 @@ export class ExtensionInstallationRegistry {
             byteLength: bytes.byteLength,
           };
           files.push(file);
+          snapshotFiles.push({ path: relativePath, bytes: Buffer.from(bytes) });
           if (relativePath === PACKAGE_MANIFEST_FILE) manifestBytes = bytes;
         }
       }
@@ -1179,6 +1190,7 @@ export class ExtensionInstallationRegistry {
         manifest,
         files: deepFreeze(files.map((file) => ({ ...file }))) as readonly InstalledFile[],
         packageDigest: packageDigest(manifest, files),
+        packageSnapshot: createExtensionPackageSnapshot(snapshotFiles),
       };
     } catch (error) {
       if (error instanceof ExtensionInstallationError) throw error;

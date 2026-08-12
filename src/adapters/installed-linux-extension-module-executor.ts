@@ -201,6 +201,14 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
   // Reuse the durable-store validator so malformed binding identifiers or
   // timestamps cannot be deferred until after process creation.
   assertValidModuleProcessRecord(processRecord);
+  const confinementExecution = deriveLinuxProcessConfinementExecution({
+    bubblewrapProgram: LINUX_PROCESS_CONFINEMENT_PROGRAM,
+    nodeProgram: process.execPath,
+    installationDirectory: resolvedModule.installation.workingDirectory,
+    entrypointPath: resolvedModule.installation.entrypointPath,
+    packageSnapshot: resolvedModule.installation.packageSnapshot,
+    coreStateDirectory: options.coreStateDirectory,
+  });
   const executorOptions: LinuxExtensionModuleExecutorOptions = {
     moduleId: resolvedModule.module.moduleId,
     moduleGenerationId: options.moduleGenerationId,
@@ -208,13 +216,11 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
       ...options.lifecycle,
       delegatedRootCgroupPath: options.binding.delegatedRootCgroupPath,
       processRecord,
-      execution: deriveLinuxProcessConfinementExecution({
-        bubblewrapProgram: LINUX_PROCESS_CONFINEMENT_PROGRAM,
-        nodeProgram: process.execPath,
-        installationDirectory: resolvedModule.installation.workingDirectory,
-        entrypointPath: resolvedModule.installation.entrypointPath,
-        coreStateDirectory: options.coreStateDirectory,
-      }),
+      execution: {
+        program: confinementExecution.program,
+        argumentVector: confinementExecution.argumentVector,
+        environment: confinementExecution.environment,
+      },
     },
     launcher: {
       ...options.launcher,
@@ -226,6 +232,11 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
       manifest: resolvedModule.installation.manifest,
       moduleKind: resolvedModule.module.moduleKind,
       config: resolvedModule.configuration.configuration,
+    },
+    packageSnapshot: {
+      bytes: resolvedModule.installation.packageSnapshot.copyBytes(),
+      digest: resolvedModule.installation.packageSnapshot.digest,
+      stagingDirectory: options.coreStateDirectory,
     },
     executionTimeoutMs: options.executionTimeoutMs,
     cancellationGraceMs: options.cancellationGraceMs,
