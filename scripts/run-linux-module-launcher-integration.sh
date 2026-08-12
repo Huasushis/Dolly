@@ -60,7 +60,8 @@ fi
 VITEST_POOL="forks"
 for test_file in "${TEST_FILES[@]}"; do
   if [ "${test_file}" = "tests/conformance/security/linux-extension-module-executor-integration.test.ts" ] ||
-     [ "${test_file}" = "tests/conformance/security/installed-reactive-module-host-integration.test.ts" ]; then
+     [ "${test_file}" = "tests/conformance/security/installed-reactive-module-host-integration.test.ts" ] ||
+     [ "${test_file}" = "tests/conformance/security/installed-inline-media-agent-integration.test.ts" ]; then
     VITEST_POOL="threads"
   fi
 done
