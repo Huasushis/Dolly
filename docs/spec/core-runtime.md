@@ -2774,6 +2774,11 @@ following cases.
 - after recovery observes that exact journal record but cannot yet confirm the
   matching Claim and submission terminal state, a later missing journal read
   preserves the recovery requirement and issues no negative acknowledgement;
+- when a runtime recovery completes outside the Scheduler while its Module is
+  quarantined, releasing that quarantine rereads whether the runtime still has
+  a result waiting for output admission; a stale cached value cannot drive the
+  Module without new input, and an unreadable runtime state keeps the Module
+  quarantined;
 - a submitted Run whose provider/storage/tool accepts an effect and loses its
   response remains an unknown outcome, with zero negative acknowledgements,
   releases, retries, or replacement effects unless a durable query supplies

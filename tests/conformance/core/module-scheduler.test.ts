@@ -1766,6 +1766,93 @@ describe("CORE scheduler retry backoff", () => {
     await scheduler.stop();
   });
 
+  it("does not re-drive a recovered output commit after quarantine release without new input", async () => {
+    const { clock, mailboxes, scheduler } = createScheduler();
+    let outputCommitWaiting = true;
+    const runtime = new FakeModuleRuntime(() => ({
+      ...claimIdentity(1),
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    }));
+    Object.defineProperty(runtime, "outputCommitWaiting", {
+      configurable: false,
+      enumerable: true,
+      get: () => outputCommitWaiting,
+    });
+    mailboxes.set("worker", 0, 0);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: ["output"],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+    scheduler.start();
+    await drain(clock);
+
+    expect(runtime.tickCount).toBe(1);
+    expect(scheduler.status("worker")).toMatchObject({
+      schedulingState: "quarantined",
+      quarantineReason: "RECOVERY_REQUIRED:commit-outcome-unknown",
+    });
+
+    // An operator completed the exact runtime recovery outside the Scheduler.
+    // With no pending input, releasing quarantine must not reuse the stale
+    // output-commit-waiting snapshot and start another Extension generation.
+    outputCommitWaiting = false;
+    scheduler.release("worker");
+    await drain(clock);
+
+    expect(runtime.tickCount).toBe(1);
+    expect(scheduler.status("worker")).toMatchObject({
+      schedulingState: "idle",
+      quarantineReason: null,
+    });
+    await scheduler.stop();
+  });
+
+  it("keeps quarantine when the runtime recovery state cannot be read during release", async () => {
+    const { clock, mailboxes, scheduler } = createScheduler();
+    let stateReadable = true;
+    const runtime = new FakeModuleRuntime(() => ({
+      ...claimIdentity(1),
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    }));
+    Object.defineProperty(runtime, "outputCommitWaiting", {
+      configurable: false,
+      enumerable: true,
+      get: () => {
+        if (!stateReadable) throw new Error("runtime recovery store unavailable");
+        return true;
+      },
+    });
+    mailboxes.set("worker", 0, 0);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: ["output"],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+    scheduler.start();
+    await drain(clock);
+
+    expect(runtime.tickCount).toBe(1);
+    stateReadable = false;
+    expect(() => scheduler.release("worker")).toThrowError(expect.objectContaining({
+      code: "SCHEDULER_RUNTIME_STATE_UNAVAILABLE",
+    }));
+    await drain(clock);
+
+    expect(runtime.tickCount).toBe(1);
+    expect(scheduler.status("worker")).toMatchObject({
+      schedulingState: "quarantined",
+      quarantineReason: "RECOVERY_REQUIRED:commit-outcome-unknown",
+    });
+    await scheduler.stop();
+  });
+
   it("records a concurrent tick from another caller as an invariant violation", async () => {
     const { clock, mailboxes, scheduler, events } = createScheduler();
     const runtime = new FakeModuleRuntime();

@@ -35,6 +35,7 @@ export type ModuleSchedulerErrorCode =
   | "SCHEDULER_MODULE_DUPLICATE"
   | "SCHEDULER_MODULE_UNKNOWN"
   | "SCHEDULER_ACTIVATION_UNSUPPORTED"
+  | "SCHEDULER_RUNTIME_STATE_UNAVAILABLE"
   | "SCHEDULER_STOPPED";
 
 export class ModuleSchedulerError extends Error {
@@ -940,6 +941,20 @@ export class ModuleScheduler {
    */
   release(moduleId: string): void {
     const entry = this.#requireEntry(moduleId);
+    let outputCommitWaiting: boolean;
+    try {
+      outputCommitWaiting = entry.runtime.outputCommitWaiting === true;
+    } catch {
+      throw new ModuleSchedulerError(
+        "SCHEDULER_RUNTIME_STATE_UNAVAILABLE",
+        `Module ${moduleId} output-commit recovery state is unavailable`,
+      );
+    }
+    // Recovery may be performed through the runtime while Scheduler dispatch
+    // is quarantined. Re-read that live state before admission reopens: the
+    // cached value belongs to the tick that caused quarantine and may no
+    // longer describe a result awaiting output admission.
+    entry.outputCommitWaiting = outputCommitWaiting;
     entry.quarantineReason = null;
     entry.nextEligibleAt = null;
     this.#requestPass();
