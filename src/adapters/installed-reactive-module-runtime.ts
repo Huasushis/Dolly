@@ -622,6 +622,7 @@ export function composeInstalledReactiveModuleHost(
     handoff: options.startupRecoveryHandoff,
     deliveries: options.coreState.store.deliveries,
     repository: options.runtime.resultCommitRepository,
+    moduleRecords: options.coreState.store,
   });
   const deferredByModule = new Map<string, DeferredModuleResultCommit>();
   for (const deferred of deferredCommits) {

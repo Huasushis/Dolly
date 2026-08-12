@@ -960,6 +960,60 @@ describe("installed reactive Module runtime composition", () => {
       scheduling,
       runtime,
     })).toThrow(/handoff is not authentic/u);
+    const unverifiedProcessPair = coreState("unverified-old-process");
+    const unverifiedProcessOptions = options(unverifiedProcessPair);
+    const installed = installations.resolve({
+      extensionId: "org.example.installed-runtime",
+      packageVersion: "1.0.0",
+    });
+    const processGenerationId = "unverified-old-process-generation";
+    unverifiedProcessPair.store.appendModuleProcessRecord({
+      schemaVersion: "dolly.module-process-record/1",
+      instanceId: INSTANCE_ID,
+      moduleId: "worker",
+      moduleGenerationId: "unverified-old-module-generation",
+      processGenerationId,
+      packageDigest: installed.packageDigest,
+      configurationReference: instanceConfiguration.modules[0]!.configurationReference,
+      declaredExternalEffects: "unrestricted",
+      serviceInvocationId: BINDING.serviceInvocationId,
+      bootId: BINDING.bootId,
+      moduleCgroupPath: deriveModuleCgroupPath(BINDING.delegatedRootCgroupPath, {
+        instanceId: INSTANCE_ID,
+        moduleId: "worker",
+        processGenerationId,
+      }).filesystemPath,
+      state: "starting",
+      createdAt: "2026-08-10T00:00:00.000Z",
+      updatedAt: "2026-08-10T00:00:00.000Z",
+    });
+    unverifiedProcessPair.store.updateModuleProcessRecordState(processGenerationId, "running");
+    const unverifiedProcessHandoff = (await new CoreStartupRecovery({
+      deliveries: unverifiedProcessPair.store.deliveries,
+      commits: createModuleResultCommitCoordinator({
+        core: unverifiedProcessPair.store,
+        repository: unverifiedProcessOptions.resultCommitRepository,
+        now: unverifiedProcessOptions.now,
+        mailboxes,
+      }),
+    }).recover()).handoff;
+    expect(() => composeInstalledReactiveModuleHost({
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: unverifiedProcessPair,
+      ...contentSchemaOptions(unverifiedProcessPair),
+      mailboxes,
+      startupRecoveryHandoff: unverifiedProcessHandoff,
+      clock,
+      scheduling,
+      runtime: {
+        ...runtime,
+        resultCommitRepository: unverifiedProcessOptions.resultCommitRepository,
+      },
+    })).toThrow(/Module record store/u);
+    expect(unverifiedProcessPair.store.getModuleProcessRecord(processGenerationId))
+      .toMatchObject({ state: "running" });
     const verifiedHandoff = await startupHandoff(
       pair,
       runtime.resultCommitRepository,

@@ -143,29 +143,37 @@ class VerifiedCoreStartupRecoveryHandoff implements CoreStartupRecoveryHandoff {
   readonly schemaVersion = "dolly.core-startup-recovery-handoff/1" as const;
   readonly #deliveries: CoreStartupRecoveryOptions["deliveries"];
   readonly #commits: ModuleResultCommitCoordinator;
+  readonly #moduleRecords: CoreStartupStateStore | undefined;
   readonly #deferredCommits: readonly DeferredModuleResultCommit[];
   #consumed = false;
 
   constructor(
     deliveries: CoreStartupRecoveryOptions["deliveries"],
     commits: ModuleResultCommitCoordinator,
+    moduleRecords: CoreStartupStateStore | undefined,
     deferredCommits: readonly DeferredModuleResultCommit[],
   ) {
     this.#deliveries = deliveries;
     this.#commits = commits;
+    this.#moduleRecords = moduleRecords;
     this.#deferredCommits = deferredCommits;
   }
 
   consume(
     deliveries: CoreStartupRecoveryOptions["deliveries"],
     repository: ModuleResultCommitRepository,
+    moduleRecords: CoreStartupStateStore,
   ): readonly DeferredModuleResultCommit[] {
     if (this.#consumed) {
       throw new TypeError("Core startup recovery handoff was already consumed");
     }
-    if (deliveries !== this.#deliveries || !this.#commits.usesRepository(repository)) {
+    if (
+      deliveries !== this.#deliveries ||
+      !this.#commits.usesRepository(repository) ||
+      moduleRecords !== this.#moduleRecords
+    ) {
       throw new TypeError(
-        "Core startup recovery handoff is not bound to this Core store and result repository",
+        "Core startup recovery handoff is not bound to this Core store and result repository or its Module record store",
       );
     }
     this.#consumed = true;
@@ -178,11 +186,16 @@ export function consumeCoreStartupRecoveryHandoff(input: {
   readonly handoff: CoreStartupRecoveryHandoff;
   readonly deliveries: CoreStartupRecoveryOptions["deliveries"];
   readonly repository: ModuleResultCommitRepository;
+  readonly moduleRecords: CoreStartupStateStore;
 }): readonly DeferredModuleResultCommit[] {
   if (!(input.handoff instanceof VerifiedCoreStartupRecoveryHandoff)) {
     throw new TypeError("Core startup recovery handoff is not authentic");
   }
-  return input.handoff.consume(input.deliveries, input.repository);
+  return input.handoff.consume(
+    input.deliveries,
+    input.repository,
+    input.moduleRecords,
+  );
 }
 
 /**
@@ -527,6 +540,7 @@ export class CoreStartupRecovery {
       handoff: new VerifiedCoreStartupRecoveryHandoff(
         this.#deliveries,
         this.#commits,
+        this.#moduleRecords,
         deferredCommits,
       ),
       releasedClaims,
