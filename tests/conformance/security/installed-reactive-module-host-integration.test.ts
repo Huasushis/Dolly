@@ -1755,6 +1755,21 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
             ? quarantine.reason
             : null,
           providerRequests: modelTransport.requests.length,
+          providerProfiles: modelTransport.requests.map((request) => {
+            const body = JSON.parse(Buffer.from(request.body).toString("utf8")) as {
+              readonly thinking?: unknown;
+              readonly response_format?: unknown;
+              readonly stream?: unknown;
+            };
+            return {
+              thinking: body.thinking ?? null,
+              responseFormat: body.response_format ?? null,
+              stream: body.stream ?? null,
+            };
+          }),
+          actorCompletions: actorEvents
+            .filter((event) => event.type === "run.completed")
+            .map((event) => event.status),
           activeClaims: coreState.store.deliveries.listActiveClaims().map((claim) => ({
             moduleJobId: claim.moduleJobId,
             runId: claim.runId,
