@@ -51,14 +51,14 @@ export interface InstalledStrictStreamingChatPolicy {
   readonly descriptor: DescriptorRef;
   readonly ownerScope: string;
   readonly budgets: ModelInvocationBudgets;
-  /** Text-only policies use an already reviewed Host broker port. */
+  /** Text-only test policies may use an already reviewed Host broker port. */
   readonly chat?: ChatModelBrokerPort;
   /**
-   * Media policies supply product Broker dependencies without a resolver.
-   * The installed runtime injects its FileCore active-Run resolver and creates
-   * the broker; an operator cannot substitute Extension-provided Media bytes.
+   * Product Broker dependencies. A Media policy omits the resolver: the
+   * installed runtime injects its FileCore active-Run resolver when it creates
+   * the broker, so an operator cannot substitute Extension-provided bytes.
    */
-  readonly mediaBrokerOptions?: Omit<ChatModelBrokerOptions, "media">;
+  readonly brokerOptions?: Omit<ChatModelBrokerOptions, "media">;
   readonly outputContracts: readonly ModelOutputContractKind[];
   /** Omitted for text-only v2; non-empty selects delivered-Media v3. */
   readonly mediaRequirementIds?: readonly string[];
@@ -230,30 +230,32 @@ function immutableChatPolicy(
       "Installed model Media policy requires finite item and resolved-byte budgets",
     );
   }
+  const hasDirectChat = typeof policy.chat?.invoke === "function";
+  const hasBrokerOptions = policy.brokerOptions !== undefined;
   if (mediaRequirementIds.length === 0) {
-    if (typeof policy.chat?.invoke !== "function" || policy.mediaBrokerOptions !== undefined) {
+    if (hasDirectChat === hasBrokerOptions) {
       throw new TypeError(
-        "Installed text model policy requires one direct chat broker and no Media broker options",
+        "Installed text model policy requires exactly one direct chat port or product Broker options",
       );
     }
-  } else if (policy.chat !== undefined || policy.mediaBrokerOptions === undefined) {
+  } else if (policy.chat !== undefined || !hasBrokerOptions) {
     throw new TypeError(
       "Installed model Media policy requires product Broker options and cannot accept a prebuilt chat port",
     );
   }
-  if (policy.mediaBrokerOptions !== undefined) {
+  if (policy.brokerOptions !== undefined) {
     if (
-      Object.getPrototypeOf(policy.mediaBrokerOptions.descriptors) !==
+      Object.getPrototypeOf(policy.brokerOptions.descriptors) !==
         ModelDescriptorRegistry.prototype ||
-      Object.getPrototypeOf(policy.mediaBrokerOptions.bindings) !==
+      Object.getPrototypeOf(policy.brokerOptions.bindings) !==
         EndpointBindingRegistry.prototype
     ) {
       throw new TypeError(
-        "Installed model Media policy requires direct descriptor and endpoint-binding registries",
+        "Installed model policy requires direct descriptor and endpoint-binding registries",
       );
     }
-    policy.mediaBrokerOptions.descriptors.snapshot(policy.descriptor);
-    policy.mediaBrokerOptions.bindings.snapshot(policy.descriptor);
+    policy.brokerOptions.descriptors.snapshot(policy.descriptor);
+    policy.brokerOptions.bindings.snapshot(policy.descriptor);
   }
   if (policy.roles.length === 0) {
     throw new TypeError("Installed model policy requires at least one message role");
@@ -278,9 +280,9 @@ function immutableChatPolicy(
     ...(mediaRequirementIds.length === 0
       ? {}
       : { mediaRequirementIds: Object.freeze(mediaRequirementIds) }),
-    ...(policy.mediaBrokerOptions === undefined
+    ...(policy.brokerOptions === undefined
       ? {}
-      : { mediaBrokerOptions: Object.freeze({ ...policy.mediaBrokerOptions }) }),
+      : { brokerOptions: Object.freeze({ ...policy.brokerOptions }) }),
     reasoningPolicies: Object.freeze([...new Set(policy.reasoningPolicies)]),
     roles: Object.freeze([...new Set(policy.roles)]),
     limits: Object.freeze({ ...policy.limits }),
@@ -552,11 +554,13 @@ export class InstalledModulePermissionPolicySetup {
           requireIdempotencyKey: true,
         });
       }
-      const chat = policy.mediaRequirementIds === undefined
+      const chat = policy.brokerOptions === undefined
         ? policy.chat!
         : new ChatModelBroker({
-            ...policy.mediaBrokerOptions!,
-            media: this.#modelMediaResolver!,
+            ...policy.brokerOptions,
+            ...(policy.mediaRequirementIds === undefined
+              ? {}
+              : { media: this.#modelMediaResolver! }),
           });
       const modelOptions = {
         descriptor: policy.descriptor,

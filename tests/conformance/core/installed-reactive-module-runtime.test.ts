@@ -292,7 +292,11 @@ describe("installed reactive Module runtime composition", () => {
     });
   }
 
-  function modelPolicies(media = false, prebuiltMediaChat = false) {
+  function modelPolicies(
+    media = false,
+    prebuiltMediaChat = false,
+    productTextBroker = false,
+  ) {
     const descriptors = new ModelDescriptorRegistry({
       schemaDigest: MODEL_SCHEMA_DIGEST,
       allowedStrategyIds: CHAT_STRATEGIES,
@@ -300,7 +304,7 @@ describe("installed reactive Module runtime composition", () => {
     const descriptor = descriptors.register(chatDescriptor({ inlinePng: media }));
     descriptors.setStatus(descriptor, "active");
     const bindings = new EndpointBindingRegistry();
-    if (media) {
+    if (media || productTextBroker) {
       const binding = bindings.register({
         schemaVersion: "dolly.endpoint-binding/2",
         endpointId: descriptor.endpointId,
@@ -355,9 +359,9 @@ describe("installed reactive Module runtime composition", () => {
               ? { maxMediaItems: 1, maxResolvedMediaBytes: 32 * 1024 }
               : {}),
           },
-          ...(media && !prebuiltMediaChat
+          ...((media && !prebuiltMediaChat) || (!media && productTextBroker)
             ? {
-                mediaBrokerOptions: {
+                brokerOptions: {
                   descriptors,
                   bindings,
                   secrets: {
@@ -698,6 +702,26 @@ describe("installed reactive Module runtime composition", () => {
       .toBe(composed.resolvedModule.installation.packageDigest);
     expect(selected.invoke).not.toHaveBeenCalled();
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
+
+    const productPair = coreState("model-product-broker-policy", configuration);
+    const productSelected = modelPolicies(false, false, true);
+    const productComposed = createInstalledReactiveModuleRuntime({
+      ...options(productPair),
+      instanceConfiguration: configuration,
+      permissionPolicies: productSelected.registry,
+      effectIntentStore: new FileEffectIntentStore({
+        path: resolve(scratch, "model-product-broker-effect-intents.json"),
+      }),
+    });
+    expect(productComposed.permissionPolicySetup?.snapshot.capabilities).toEqual([
+      expect.objectContaining({
+        capabilityType: "model-operation",
+        capabilityVersion: "v2",
+        streaming: "required",
+      }),
+    ]);
+    expect(productSelected.invoke).not.toHaveBeenCalled();
+    expect(productPair.store.listModuleProcessRecords()).toEqual([]);
   });
 
   it("selects model-operation v3 only for a finite delivered-Media policy", () => {

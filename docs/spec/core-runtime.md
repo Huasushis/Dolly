@@ -517,13 +517,15 @@ identifiers selected by the validated Module configuration to a reviewed chat
 descriptor and broker, a reviewed read-only `ToolRegistry`, or bounded
 Module-private checkpoint storage. Its ordinary meaning is a Host-owned table
 of approved operations; it is not Extension configuration. The text chat
-policy grants `model-operation/v2` for the Host-verified active Run and uses a
-reviewed Host broker port. A policy with a non-empty frozen media-requirement
-set and finite media item and byte budgets instead grants
-`model-operation/v3`. That media path cannot accept a preconstructed chat
-port. It must provide direct descriptor and endpoint-binding registries plus
-the remaining product `ChatModelBroker` dependencies; the installed runtime
-constructs the broker with its own FileCore active-Run Media resolver. Missing
+policy grants `model-operation/v2` for the Host-verified active Run. A
+component-test policy may supply one reviewed Host broker port; the integrated
+path supplies direct descriptor and endpoint-binding registries plus the
+remaining product `ChatModelBroker` dependencies, and the installed runtime
+constructs that broker. Supplying both or neither is rejected. A policy with a
+non-empty frozen media-requirement set and finite media item and byte budgets
+instead grants `model-operation/v3`. That media path cannot accept a
+preconstructed chat port; the installed runtime constructs the product broker
+with its own FileCore active-Run Media resolver. Missing
 Media-enabled FileCore state, a missing exact descriptor or active binding, or
 an attempt to substitute a prebuilt port is rejected before an executor or
 process record exists. Version 3 accepts only a delivered Block media

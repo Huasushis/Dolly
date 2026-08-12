@@ -366,7 +366,7 @@ describe.skipIf(!available)("installed inline Media Agent in a real control grou
             maxMediaItems: 1,
             maxResolvedMediaBytes: 64 * 1024,
           },
-          mediaBrokerOptions: {
+          brokerOptions: {
             descriptors,
             bindings,
             secrets: {

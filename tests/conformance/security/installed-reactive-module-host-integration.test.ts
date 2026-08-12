@@ -45,7 +45,13 @@ import {
 } from "../../../src/core/linux-module-cgroup.js";
 import { inspectCoreServiceBinding } from "../../../src/core/linux-core-service-binding.js";
 import type { ModuleActorEvent } from "../../../src/core/module-actor.js";
-import type { ChatBrokerInvocation } from "../../../src/core/model-provider-broker.js";
+import { EndpointBindingRegistry } from "../../../src/core/model-provider-binding.js";
+import type {
+  ChatBrokerInvocation,
+  ModelHttpTransport,
+  ModelHttpTransportRequest,
+  ModelHttpTransportResponse,
+} from "../../../src/core/model-provider-broker.js";
 import { ModelDescriptorRegistry } from "../../../src/core/model-provider-descriptor.js";
 import {
   systemSchedulerClock,
@@ -118,6 +124,66 @@ async function waitFor(
     if (predicate()) return true;
     if (Date.now() >= deadline) return false;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+  }
+}
+
+const INSTALLED_AGENT_MODEL_CONTENT = Object.freeze([
+  "Discover the available keys, read the active note, then cite its source.",
+  JSON.stringify({ action: "alpha_discover", arguments: { prefix: "", limit: 3 } }),
+  JSON.stringify({ action: "beta_read", arguments: { key: "deployment-note" } }),
+  JSON.stringify({
+    action: "answer",
+    answer: "The active deployment codename is EMBER-7421.",
+    grounded: true,
+    evidenceKeys: ["deployment-note"],
+  }),
+]);
+
+class InstalledAgentStrictSseResponse implements ModelHttpTransportResponse {
+  readonly status = 200;
+  readonly headers = { "content-type": "text/event-stream" };
+  readonly providerRequestId: string;
+  readonly abort = () => undefined;
+  readonly body: AsyncIterable<Uint8Array>;
+
+  constructor(index: number) {
+    this.providerRequestId = `provider-installed-agent-${index + 1}`;
+    const content = INSTALLED_AGENT_MODEL_CONTENT[index];
+    if (content === undefined) throw new Error("Installed Agent response index is out of range");
+    const chunks = [
+      ...(index === 0
+        ? [{ index: 0, delta: { reasoning_content: "Inspect the registry before acting." }, finish_reason: null }]
+        : []),
+      [{ index: 0, delta: { role: "assistant", content }, finish_reason: null }],
+      [{ index: 0, delta: {}, finish_reason: "stop" }],
+    ].map((choices) => `data: ${JSON.stringify({ id: this.providerRequestId, choices })}\n\n`);
+    const bytes = Buffer.from([
+      ...chunks,
+      `data: ${JSON.stringify({
+        id: this.providerRequestId,
+        choices: [],
+        usage: { prompt_tokens: 32, completion_tokens: 20, total_tokens: 52 },
+      })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join(""), "utf8");
+    this.body = {
+      async *[Symbol.asyncIterator]() {
+        yield bytes;
+      },
+    };
+  }
+}
+
+class InstalledAgentStrictSseTransport implements ModelHttpTransport {
+  readonly requests: ModelHttpTransportRequest[] = [];
+
+  async dispatch(request: ModelHttpTransportRequest): Promise<ModelHttpTransportResponse> {
+    const index = this.requests.length;
+    if (index >= INSTALLED_AGENT_MODEL_CONTENT.length) {
+      throw new Error("Installed Agent made an unexpected provider request");
+    }
+    this.requests.push(request);
+    return new InstalledAgentStrictSseResponse(index);
   }
 }
 
@@ -1471,40 +1537,23 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         },
       });
       descriptors.setStatus(modelDescriptor, "active");
-      const modelCalls: ChatBrokerInvocation[] = [];
-      const invokeModel = async (invocation: ChatBrokerInvocation) => {
-        modelCalls.push(invocation);
-        const round = modelCalls.length;
-        const finalContent = round === 1
-          ? "Discover the available keys, read the active note, then cite its source."
-          : round === 2
-            ? JSON.stringify({ action: "alpha_discover", arguments: { prefix: "", limit: 3 } })
-            : round === 3
-              ? JSON.stringify({ action: "beta_read", arguments: { key: "deployment-note" } })
-              : JSON.stringify({
-                  action: "answer",
-                  answer: "The active deployment codename is EMBER-7421.",
-                  grounded: true,
-                  evidenceKeys: ["deployment-note"],
-                });
-        return {
-          schemaVersion: "dolly.model-result/2" as const,
-          requestId: invocation.requestId,
-          operationId: invocation.context.operationId,
-          descriptor: invocation.descriptor,
-          status: "succeeded" as const,
-          output: {
-            schemaVersion: "dolly.model.chat-output/1" as const,
-            finalContent,
-            reasoning: round === 1
-              ? { state: "observed" as const, parts: ["Inspect the registry before acting."] }
-              : { state: "not-observed" as const },
-            toolCalls: [],
-            finishReason: "stop",
-          },
-          usage: { providerAttempts: 1, observations: [] },
-        };
-      };
+      const bindings = new EndpointBindingRegistry();
+      const binding = bindings.register({
+        schemaVersion: "dolly.endpoint-binding/2",
+        endpointId: modelDescriptor.endpointId,
+        bindingRevision: "installed-agent-binding-v1",
+        descriptorRefs: [modelDescriptor],
+        exactUrl: "https://provider.example.test/v1/chat/completions",
+        networkScope: "public",
+        authentication: { kind: "none" },
+        limits: {
+          maxRequestBytes: 128 * 1_024,
+          maxResponseBytes: 128 * 1_024,
+          maxTimeoutMs: 30_000,
+        },
+      });
+      bindings.setStatus(binding, "active");
+      const modelTransport = new InstalledAgentStrictSseTransport();
       let modelRequest = 0;
       const permissionPolicies = new InstalledModulePermissionPolicyRegistry({
         nextRequestId: () => `installed-agent-model-request-${++modelRequest}`,
@@ -1523,7 +1572,16 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
             maxOutputBytes: 64 * 1_024,
             maxOutputTokens: 5_200,
           },
-          chat: { invoke: invokeModel },
+          brokerOptions: {
+            descriptors,
+            bindings,
+            secrets: {
+              resolve: async () => {
+                throw new Error("An unauthenticated binding cannot request a secret");
+              },
+            },
+            transport: modelTransport,
+          },
           outputContracts: ["text", "json-object"],
           reasoningPolicies: ["require", "disable"],
           roles: ["system", "user"],
@@ -1718,8 +1776,23 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         childCredentialEnvironmentPresent: false,
       });
       expect(agentResult.answer.answer).toContain("EMBER-7421");
-      expect(modelCalls).toHaveLength(4);
-      expect(modelCalls.every((call) => call.input.stream)).toBe(true);
+      expect(modelTransport.requests).toHaveLength(4);
+      const providerBodies = modelTransport.requests.map((request) =>
+        JSON.parse(Buffer.from(request.body).toString("utf8")) as Record<string, unknown>
+      );
+      expect(providerBodies.every((body) => body.stream === true)).toBe(true);
+      expect(providerBodies.every((body) =>
+        JSON.stringify(body.stream_options) === JSON.stringify({ include_usage: true })
+      )).toBe(true);
+      expect(providerBodies[0]).toMatchObject({ thinking: { type: "enabled" } });
+      expect(providerBodies[0]).not.toHaveProperty("response_format");
+      for (const body of providerBodies.slice(1)) {
+        expect(body).toMatchObject({
+          thinking: { type: "disabled" },
+          response_format: { type: "json_object" },
+        });
+      }
+      expect(providerBodies.every((body) => !Object.hasOwn(body, "enable_thinking"))).toBe(true);
       expect(toolCalls.map((call) => call.toolId)).toEqual([
         "synthetic.discover",
         "synthetic.read",
@@ -1775,8 +1848,10 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         moduleId: AGENT_MODULE_ID,
         processGenerationId,
         moduleCgroupPath,
-        modelCalls: modelCalls.length,
-        allModelCallsStreaming: modelCalls.every((call) => call.input.stream),
+        modelCalls: modelTransport.requests.length,
+        allModelCallsStreaming: providerBodies.every((body) => body.stream === true),
+        productChatModelBroker: true,
+        strictSseTerminalResponses: modelTransport.requests.length,
         toolCalls: toolCalls.length,
         durableCapabilityEffects: effects.length,
         actorRuns: 1,
