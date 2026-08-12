@@ -1,0 +1,4 @@
+RUN_LIVE_INTEGRATION=1 RUN_PAID_INTEGRATION=1 node scripts/experiments/probes/dynamic-config-agent-live-v0/run.mjs --run-id live-v1-20260812a
+node scripts/experiments/probes/dynamic-config-agent-live-v0/verify.mjs --run-id live-v1-20260812a
+node scripts/experiments/probes/dynamic-config-agent-live-v0/verify-v2.mjs --run-id live-v1-20260812a
+node scripts/experiments/probes/dynamic-config-agent-live-v0/run-mutation-tests.mjs

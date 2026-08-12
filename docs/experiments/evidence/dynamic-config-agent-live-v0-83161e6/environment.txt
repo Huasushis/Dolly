@@ -1,0 +1,13 @@
+source_commit=83161e666feee41697f50f2aadfafc73c9c27fd6
+os=Ubuntu 24.04
+node=v20.20.2
+pnpm=9.15.9
+http_proxy=set
+https_proxy=set
+HTTP_PROXY=unset
+HTTPS_PROXY=unset
+endpoint_value_recorded=false
+credential_value_recorded=false
+module_processes_started=0
+containers_started=0
+product_configuration_writes=0
