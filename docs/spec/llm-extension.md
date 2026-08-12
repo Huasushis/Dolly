@@ -536,6 +536,38 @@ or private owner environment detail. The provider-independent default exposes no
 tools, hides reasoning, accepts bounded text content, and uses deterministic
 local/fake operation handles for tests.
 
+The current product-before-startup configuration slice is
+`dolly.llm.module-configuration/1`. Its JSON Schema is closed and contains an
+exact model descriptor reference, reasoning and streaming policies, context
+and turn limits, accepted payload schemas, tool policy identifiers and finite
+tool limits, retention rules, and output/error rules. Endpoint routes,
+credentials, provider-specific request fields, and host paths are deliberately
+absent. The default is tool-free and requires streaming.
+
+Before provider I/O, the configuration resolver binds the configuration to the
+exact active descriptor snapshot. It rejects a descriptor mismatch, an
+unsupported streaming/reasoning/JSON-object policy, unknown context or output
+token maxima, an output limit larger than the descriptor limit, and any
+configuration whose maximum input plus maximum output tokens exceed the model
+context window. A deployment may obtain the token maxima from a provider,
+maintain a reviewed local descriptor, or require an operator to configure them;
+it MUST NOT silently invent a context length when discovery omits it.
+
+Configuration records are immutable and content addressed. Changing the model
+descriptor, context limits, or any other configuration field creates a new
+configuration revision. The instance topology planner treats switching the
+Module's `configurationReference` as a generation restart, and rejects the
+change while Module execution remains disabled. The public runtime startup
+refusal is unchanged.
+
+This slice is not hot reload and is not yet a running LLM Module. Byte limits
+are already enforced by context assembly and the model broker, but
+`utf8-byte-upper-bound.v1` is currently only an explicit conservative token
+budget declaration checked against descriptor maxima; it has not yet been
+wired into context selection. Product support additionally requires the
+installed Module composition, request-snapshot handoff, conversation/turn
+journal, and restart/cancellation evidence defined elsewhere in this document.
+
 Routine logs, metrics, errors, traces, and snapshots omit prompt/final content,
 reasoning, tool arguments/results, media, signed URLs, credentials, and
 capability handles. Safe metrics include counts, sizes, latency, reasoning

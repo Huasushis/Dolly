@@ -93,3 +93,18 @@ export {
   type ContextAssemblyRequest,
   type SystemPromptConfiguration,
 } from "./context-assembly.js";
+
+export {
+  LLM_MODULE_CONFIGURATION_SCHEMA,
+  LlmModuleConfigurationError,
+  createDefaultLlmModuleConfiguration,
+  resolveLlmModuleConfiguration,
+  validateLlmModuleConfiguration,
+  type LlmModuleConfiguration,
+  type LlmModuleConfigurationErrorCode,
+  type LlmOutputContract,
+  type LlmReasoningPolicy,
+  type LlmStreamingPolicy,
+  type LlmToolLimits,
+  type ResolvedLlmModuleConfiguration,
+} from "./module-configuration.js";
