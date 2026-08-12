@@ -55,6 +55,7 @@ const INSTANCE_ID = "44444444-4444-4444-8444-444444444444";
 const FIRST_MODULE_ID = "scheduler-first";
 const SECOND_MODULE_ID = "scheduler-second";
 const DRAINER_MODULE_ID = "scheduler-drainer";
+const SOURCE_MODULE_ID = "scheduler-source";
 const MODULE_IDS = [FIRST_MODULE_ID, SECOND_MODULE_ID, DRAINER_MODULE_ID] as const;
 const LIMITS: ModuleCgroupLimits = {
   memoryMaxBytes: 268_435_456,
@@ -224,7 +225,12 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         moduleKind: "transform",
         configVersion: 1,
         schema: configurationSchema,
-        configuration: { prefix: "drainer", delayMs: 2_000, emitOutput: false },
+        // Keep the first sink Run active long enough for both upstream
+        // processes to reach the output-commit boundary on a loaded runner.
+        // The assertion below observes backpressure before allowing this
+        // finite delay to release capacity; it does not use the delay as the
+        // backpressure oracle.
+        configuration: { prefix: "drainer", delayMs: 10_000, emitOutput: false },
       });
       const defaults = createDefaultDollyInstanceConfig(INSTANCE_ID);
       const configuration = validateDollyInstanceConfig({
@@ -533,7 +539,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           repository.list().length === 5 &&
           repository.list().every((record) => record.state === "committed") &&
           actorRunCount(DRAINER_MODULE_ID) === 2,
-        5_000,
+        15_000,
       )).toBe(true);
       expect(actorRunCount(FIRST_MODULE_ID)).toBe(2);
       expect(actorRunCount(SECOND_MODULE_ID)).toBe(2);
@@ -544,7 +550,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           repository.list().every((record) => record.state === "committed") &&
           coreState.store.deliveries.inspectResident(DRAINER_MODULE_ID, ["output"])
               .residentCount === 0,
-        5_000,
+        15_000,
       )).toBe(true);
       const actorRunsAfterCapacityRelease = {
         [FIRST_MODULE_ID]: actorRunCount(FIRST_MODULE_ID),
@@ -657,7 +663,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         moduleCgroupPaths,
         initialEmptyDecisionsObserved: MODULE_IDS.length,
         configuredPollIntervalMs: 60_000,
-        outputCommittedWithinMs: 5_000,
+        outputRecoveryWithinMs: 15_000,
         outputBackpressureObserved: true,
         actorRunsBeforeCapacityRelease: {
           [FIRST_MODULE_ID]: 2,
@@ -688,4 +694,338 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       rmSync(scratch, { recursive: true, force: true });
     }
   }, 90_000);
+
+  it("executes one durable source request in the installed Linux host", async () => {
+    if (integrationUnitName === undefined) {
+      throw new Error("The transient Core service unit name is unavailable");
+    }
+    const inspectedBinding = await inspectCoreServiceBinding({
+      unitName: integrationUnitName,
+      mode: "user",
+      queryTimeoutMs: 5_000,
+      overallTimeoutMs: 15_000,
+    });
+    if (!inspectedBinding.verified) {
+      throw new Error(inspectedBinding.failures
+        .map((failure) => `${failure.code}: ${failure.detail}`)
+        .join("; "));
+    }
+    const preparedRoot = await prepareDelegatedCgroupRoot({
+      delegatedRootCgroupPath: inspectedBinding.binding.delegatedRootCgroupPath,
+    });
+    if (!preparedRoot.prepared) {
+      throw new Error(`${preparedRoot.failure.code}: ${preparedRoot.failure.detail}`);
+    }
+
+    const scratchParent = resolve(process.cwd(), ".tmp");
+    mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
+    const scratch = mkdtempSync(join(scratchParent, "installed-source-host-integration-"));
+    const statePath = join(scratch, "core-state.json");
+    const commitPath = join(scratch, "module-result-commits.json");
+    const processGenerationId =
+      `${SOURCE_MODULE_ID}-process-${process.pid}-${Date.now()}`;
+    const moduleCgroupPath = deriveModuleCgroupPath(
+      inspectedBinding.binding.delegatedRootCgroupPath,
+      { instanceId: INSTANCE_ID, moduleId: SOURCE_MODULE_ID, processGenerationId },
+    ).filesystemPath;
+    let composed: InstalledReactiveModuleHost | undefined;
+    let stopped = false;
+    try {
+      const packageSource = join(scratch, "package-source");
+      mkdirSync(packageSource, { recursive: true, mode: 0o700 });
+      copyFileSync(FIXTURE_PATH, join(packageSource, "extension.mjs"));
+      const configurationSchema = {
+        $schema: JSON_SCHEMA_2020_12,
+        type: "object",
+        properties: { prefix: { type: "string" } },
+        required: ["prefix"],
+        additionalProperties: false,
+      } as const;
+      writeFileSync(join(packageSource, "dolly-extension.json"), JSON.stringify({
+        schemaVersion: "dolly.extension-package/3",
+        extensionId: "org.example.scheduler-installed",
+        packageVersion: "1.0.0",
+        displayName: "Installed Source Scheduler integration fixture",
+        description: "Consumes one durable Core-private source request.",
+        supportedProtocolVersions: ["3.0"],
+        entrypoint: "extension.mjs",
+        modules: [{
+          moduleKind: "transform",
+          activation: "source",
+          configVersion: 1,
+          configurationSchema,
+          producedContentSchemas: [],
+        }],
+        requestedCapabilities: [],
+      }), "utf8");
+      const installations = new ExtensionInstallationRegistry({
+        directory: join(scratch, "installations"),
+      });
+      const installed = installations.installNodePackage({
+        sourceDirectory: packageSource,
+        trust: "trusted",
+      });
+      rmSync(packageSource, { recursive: true, force: true });
+      const configurations = new ModuleConfigurationStore({
+        directory: join(scratch, "configurations"),
+      });
+      const sourceConfiguration = configurations.create({
+        configId: "scheduler-source-config",
+        extensionId: "org.example.scheduler-installed",
+        moduleKind: "transform",
+        configVersion: 1,
+        schema: configurationSchema,
+        configuration: { prefix: "source" },
+      });
+      const defaults = createDefaultDollyInstanceConfig(INSTANCE_ID);
+      const configuration = validateDollyInstanceConfig({
+        ...defaults,
+        core: {
+          ...defaults.core,
+          scheduler: {
+            pollIntervalMs: 60_000,
+            retryBaseMs: 25,
+            retryMaxMs: 250,
+          },
+        },
+        pages: [{ pageId: "source-output" }],
+        modules: [{
+          moduleId: SOURCE_MODULE_ID,
+          extensionId: "org.example.scheduler-installed",
+          packageVersion: "1.0.0",
+          moduleKind: "transform",
+          isolation: "process",
+          configurationReference: {
+            configId: sourceConfiguration.configId,
+            revision: sourceConfiguration.revision,
+            configVersion: sourceConfiguration.configVersion,
+          },
+          permissionPolicyIds: [],
+          inputPageIds: [],
+          outputPageIds: ["source-output"],
+          subscriptionStart: "from-head",
+          activation: { kind: "source", trigger: "manual" },
+          limits: {
+            claim: null,
+            maxInputBytes: 64 * 1_024,
+            maxResultBytes: 64 * 1_024,
+            maxFrameBytes: 128 * 1_024,
+            maxRunsPerGeneration: 10,
+            maxGenerations: 2,
+          },
+          timeouts: {
+            initializationTimeoutMs: 10_000,
+            executionTimeoutMs: 5_000,
+            cancellationGraceMs: 1_000,
+            terminationTimeoutMs: 10_000,
+          },
+        }],
+      });
+
+      let blockId = 0;
+      let deliveryId = 0;
+      let protocolIdentifier = 0;
+      let processIdentifierAllocated = false;
+      const now = (): string => new Date().toISOString();
+      const contentSchemas = resolveInstalledContentSchemaRegistrationSet({
+        instanceConfiguration: configuration,
+        installations,
+        reservedRegistrations: [],
+        maxRegisteredValueBytes: 64 * 1_024,
+      });
+      const coreState = createFileCoreStateStoreWithStoppedRecordWriter({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `source-block-${++blockId}`,
+        nextDeliveryId: (kind) => `source-${kind}-${++deliveryId}`,
+        now,
+        contentSchemas,
+      });
+      coreState.store.deliveries.createPage("source-output");
+      const repository = new FileModuleResultCommitRepository({ path: commitPath });
+      const startupRecoveryHandoff = (await new CoreStartupRecovery({
+        deliveries: coreState.store.deliveries,
+        commits: createModuleResultCommitCoordinator({
+          core: coreState.store,
+          repository,
+          now,
+          mailboxes: [],
+        }),
+        moduleRecords: coreState.store,
+        stoppedRecordWriter: coreState.stoppedRecordWriter,
+      }).recover()).handoff;
+      const schedulerEvents: SchedulerEvent[] = [];
+      const actorEvents: ModuleActorEvent[] = [];
+      composed = composeInstalledReactiveModuleHost({
+        configuration,
+        installations,
+        configurations,
+        coreState,
+        contentSchemas,
+        maxRegisteredContentValueBytes: 64 * 1_024,
+        mailboxes: [],
+        sourceActivationLimits: [{
+          moduleId: SOURCE_MODULE_ID,
+          maxResidentCount: 4,
+          maxResidentBytes: 64 * 1_024,
+          maxRequestBytes: 8 * 1_024,
+        }],
+        startupRecoveryHandoff,
+        clock: systemSchedulerClock(),
+        scheduling: {
+          maxConcurrentModules: 1,
+          backpressureAction: "pause-upstream",
+          downstreamRecheckMs: 100,
+          noProgressAfterMs: 5_000,
+          claimLimitCount: 1,
+          claimLimitBytes: 64 * 1_024,
+          retryJitterRatio: 0,
+          lowWatermarkRatio: 1,
+        },
+        runtime: {
+          resultCommitRepository: repository,
+          now,
+          initialModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-1`,
+          nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
+          binding: inspectedBinding.binding,
+          lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
+          launcher: {
+            interpreterProgram: PYTHON,
+            launcherScriptPath: defaultLauncherScriptPath(),
+            controllerTimeouts: {
+              configureTimeoutMs: 5_000,
+              inCgroupTimeoutMs: 5_000,
+              membershipTimeoutMs: 5_000,
+              exitObservationTimeoutMs: 5_000,
+            },
+          },
+          host: {
+            isolationPolicy: new ExtensionIsolationPolicy(),
+            shutdownRequestTimeoutMs: 2_000,
+            forceKillDelayMs: 500,
+          },
+          channelCloseTimeoutMs: 5_000,
+          nextProcessGenerationId: () => {
+            if (processIdentifierAllocated) {
+              throw new Error("The source integration attempted another process generation");
+            }
+            processIdentifierAllocated = true;
+            return processGenerationId;
+          },
+          nextProtocolIdentifier: (purpose) =>
+            `${purpose}-scheduler-source-${++protocolIdentifier}`,
+          classifyFailure: (failure) => ({ code: failure.code, retryable: false }),
+          onActorEvent: (event) => actorEvents.push(event),
+        },
+        onSchedulerEvent: (event) => schedulerEvents.push(event),
+      });
+      expect(composed.sourceActivationQueues).toHaveLength(1);
+      await composed.host.start();
+      expect(composed.host.state).toBe("running");
+      expect(composed.installedRuntimes[0]?.generations.processGenerationIdFor(
+        `${SOURCE_MODULE_ID}-generation-1`,
+      )).toBe(processGenerationId);
+      expect(coreState.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
+        state: "running",
+        packageDigest: installed.packageDigest,
+        declaredExternalEffects: "core-capabilities-only",
+      });
+      expect(existsSync(moduleCgroupPath)).toBe(true);
+
+      const submission = composed.sourceActivationQueues[0]!.submit({
+        idempotencyKey: "manual:source:integration:1",
+        body: { kind: "manual/1", instruction: "refresh installed source" },
+      });
+      expect(submission).toMatchObject({ status: "enqueued" });
+      expect(await waitFor(
+        () =>
+          repository.list().length === 1 &&
+          repository.list()[0]?.state === "committed" &&
+          composed?.sourceActivationQueues[0]?.inspect().residentCount === 0,
+        5_000,
+      )).toBe(true);
+      expect(actorEvents.filter((event) => event.type === "run.started")).toHaveLength(1);
+      expect(schedulerEvents).toContainEqual(expect.objectContaining({
+        type: "scheduler.dispatched",
+        moduleId: SOURCE_MODULE_ID,
+        reasonCode: "READY_SOURCE",
+      }));
+      expect(schedulerEvents).toContainEqual(expect.objectContaining({
+        type: "scheduler.settled",
+        moduleId: SOURCE_MODULE_ID,
+        tickStatus: "committed",
+      }));
+      const result = repository.list()[0]!;
+      expect(result).toMatchObject({
+        state: "committed",
+        source: { kind: "module", id: SOURCE_MODULE_ID },
+        outputDeliveries: [expect.objectContaining({ pageId: "source-output" })],
+      });
+      if (result.blockId === undefined) {
+        throw new Error("The source result does not reference its output Block");
+      }
+      expect(coreState.store.blocks.get(result.blockId)).toMatchObject({
+        payload: {
+          value: {
+            items: [expect.objectContaining({ type: "text", text: "source:1:run-1" })],
+          },
+        },
+      });
+
+      await composed.host.stop();
+      stopped = true;
+      expect(composed.host.state).toBe("stopped");
+      expect(coreState.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
+        state: "stopped",
+        moduleCgroupPath,
+      });
+      expect(existsSync(moduleCgroupPath)).toBe(false);
+
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `reopened-source-block-${++blockId}`,
+        nextDeliveryId: (kind) => `reopened-source-${kind}-${++deliveryId}`,
+        now,
+        contentSchemas,
+      });
+      const reopenedRepository = new FileModuleResultCommitRepository({ path: commitPath });
+      expect(reopenedRepository.list()).toEqual([
+        expect.objectContaining({
+          state: "committed",
+          source: { kind: "module", id: SOURCE_MODULE_ID },
+        }),
+      ]);
+      expect(reopened.getModuleProcessRecord(processGenerationId)).toMatchObject({
+        state: "stopped",
+      });
+      expect(reopened.deliveries.inspectPending(SOURCE_MODULE_ID, [
+        composed.sourceActivationQueues[0]!.privatePageId,
+      ]).pendingCount).toBe(0);
+
+      console.info(JSON.stringify({
+        packageSchemaVersion: installed.manifest.schemaVersion,
+        packageDigest: installed.packageDigest,
+        moduleId: SOURCE_MODULE_ID,
+        processGenerationId,
+        moduleCgroupPath,
+        requestStatus: submission.status,
+        schedulerReasonCode: "READY_SOURCE",
+        actorRuns: 1,
+        committedModuleResults: reopenedRepository.list().length,
+        finalRecordState: reopened.getModuleProcessRecord(processGenerationId)?.state,
+        cgroupRemoved: !existsSync(moduleCgroupPath),
+        reopenedOutput: "source:1:run-1",
+      }));
+    } finally {
+      if (!stopped && composed !== undefined &&
+        (composed.host.state === "running" || composed.host.state === "failed")) {
+        await composed.host.stop().catch(() => undefined);
+      }
+      if (existsSync(moduleCgroupPath)) {
+        throw new Error(`Exact Source Module control group remained after cleanup: ${moduleCgroupPath}`);
+      }
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
