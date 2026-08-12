@@ -215,12 +215,24 @@ describe("Extension process isolation and capability checks", () => {
       },
       module: {
         moduleId: "module-a",
+        extensionId: FIXTURE_PACKAGE_MANIFEST.extensionId,
+        moduleKind: "fixture",
         permissionPolicyIds: ["model.owner-primary"],
         configurationReference: {
           configId: "fixture-config",
           revision: `sha256:${"b".repeat(64)}`,
           configVersion: 1,
         },
+      },
+      packageModule: FIXTURE_PACKAGE_MANIFEST.modules[0],
+      configuration: {
+        schemaVersion: "dolly.module-configuration/1",
+        configId: "fixture-config",
+        revision: `sha256:${"b".repeat(64)}`,
+        extensionId: FIXTURE_PACKAGE_MANIFEST.extensionId,
+        moduleKind: "fixture",
+        configVersion: 1,
+        configuration: {},
       },
     } as unknown as InstalledExtensionModule;
     registry.setupFor(resolved).configureHost(host);
@@ -319,12 +331,24 @@ describe("Extension process isolation and capability checks", () => {
       },
       module: {
         moduleId: "module-a",
+        extensionId: FIXTURE_PACKAGE_MANIFEST.extensionId,
+        moduleKind: "fixture",
         permissionPolicyIds: ["memory.owner-checkpoints"],
         configurationReference: {
           configId: "fixture-config",
           revision: `sha256:${"b".repeat(64)}`,
           configVersion: 1,
         },
+      },
+      packageModule: FIXTURE_PACKAGE_MANIFEST.modules[0],
+      configuration: {
+        schemaVersion: "dolly.module-configuration/1",
+        configId: "fixture-config",
+        revision: `sha256:${"b".repeat(64)}`,
+        extensionId: FIXTURE_PACKAGE_MANIFEST.extensionId,
+        moduleKind: "fixture",
+        configVersion: 1,
+        configuration: {},
       },
     } as unknown as InstalledExtensionModule;
     const setup = registry.setupFor(resolved);
@@ -482,12 +506,24 @@ describe("Extension process isolation and capability checks", () => {
       },
       module: {
         moduleId: "module-a",
+        extensionId: FIXTURE_PACKAGE_MANIFEST.extensionId,
+        moduleKind: "fixture",
         permissionPolicyIds: ["tools.owner-notes"],
         configurationReference: {
           configId: "fixture-config",
           revision: `sha256:${"b".repeat(64)}`,
           configVersion: 1,
         },
+      },
+      packageModule: FIXTURE_PACKAGE_MANIFEST.modules[0],
+      configuration: {
+        schemaVersion: "dolly.module-configuration/1",
+        configId: "fixture-config",
+        revision: `sha256:${"b".repeat(64)}`,
+        extensionId: FIXTURE_PACKAGE_MANIFEST.extensionId,
+        moduleKind: "fixture",
+        configVersion: 1,
+        configuration: {},
       },
     } as unknown as InstalledExtensionModule;
     const setup = registry.setupFor(resolved);

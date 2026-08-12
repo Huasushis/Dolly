@@ -395,12 +395,24 @@ describe("general Agent tool-registry Extension", () => {
       },
       module: {
         moduleId: "module-a",
+        extensionId: MANIFEST.extensionId,
+        moduleKind: "general-agent",
         permissionPolicyIds: ["model.owner-primary", "tools.owner-memory"],
         configurationReference: {
           configId: "agent-config",
           revision: `sha256:${"b".repeat(64)}`,
           configVersion: 1,
         },
+      },
+      packageModule: MANIFEST.modules[0],
+      configuration: {
+        schemaVersion: "dolly.module-configuration/1",
+        configId: "agent-config",
+        revision: `sha256:${"b".repeat(64)}`,
+        extensionId: MANIFEST.extensionId,
+        moduleKind: "general-agent",
+        configVersion: 1,
+        configuration: {},
       },
     } as unknown as InstalledExtensionModule).configureHost(host);
 
