@@ -171,7 +171,12 @@ function modelOutput(result) {
     result.status !== "succeeded" ||
     typeof result.output?.finalContent !== "string"
   ) {
-    throw new Error("model capability did not return a successful text result");
+    const status = typeof result?.status === "string" ? result.status : "invalid";
+    const code = typeof result?.error?.code === "string" ? result.error.code : "none";
+    const phase = typeof result?.error?.phase === "string" ? result.error.phase : "none";
+    throw new Error(
+      `model capability did not return a successful text result (${status}/${code}/${phase})`,
+    );
   }
   return result.output;
 }
@@ -695,6 +700,11 @@ async function handleRequest(message) {
   }
 }
 
+function reportAgentError(error) {
+  const message = error instanceof Error ? error.message : "unknown Agent error";
+  process.stderr.write(`${JSON.stringify({ dollyAgentError: message.slice(0, 512) })}\n`);
+}
+
 function receive(message) {
   if (typeof message.id === "string" && (message.result !== undefined || message.error !== undefined)) {
     const entry = pending.get(message.id);
@@ -705,7 +715,8 @@ function receive(message) {
     return;
   }
   if (typeof message.method === "string") {
-    void handleRequest(message).catch(() => {
+    void handleRequest(message).catch((error) => {
+      reportAgentError(error);
       if (typeof message.id === "string") respondError(message.id);
       else process.exit(31);
     });

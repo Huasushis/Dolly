@@ -151,7 +151,7 @@ class InstalledAgentStrictSseResponse implements ModelHttpTransportResponse {
     if (content === undefined) throw new Error("Installed Agent response index is out of range");
     const chunks = [
       ...(index === 0
-        ? [{ index: 0, delta: { reasoning_content: "Inspect the registry before acting." }, finish_reason: null }]
+        ? [[{ index: 0, delta: { reasoning_content: "Inspect the registry before acting." }, finish_reason: null }]]
         : []),
       [{ index: 0, delta: { role: "assistant", content }, finish_reason: null }],
       [{ index: 0, delta: {}, finish_reason: "stop" }],
@@ -1663,6 +1663,8 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       }).recover()).handoff;
       const schedulerEvents: SchedulerEvent[] = [];
       const actorEvents: ModuleActorEvent[] = [];
+      const standardErrorChunks: Uint8Array[] = [];
+      const classifiedFailures: { readonly stage: string; readonly code: string }[] = [];
       composed = composeInstalledReactiveModuleHost({
         configuration,
         installations,
@@ -1717,8 +1719,14 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           },
           nextProtocolIdentifier: (purpose) =>
             `${purpose}-scheduler-agent-${++protocolIdentifier}`,
-          classifyFailure: (failure) => ({ code: failure.code, retryable: false }),
+          classifyFailure: (failure) => {
+            classifiedFailures.push({ stage: failure.stage, code: failure.code });
+            return { code: failure.code, retryable: false };
+          },
           onActorEvent: (event) => actorEvents.push(event),
+          onStandardErrorChunk: (chunk) => {
+            if (standardErrorChunks.length < 8) standardErrorChunks.push(chunk);
+          },
         },
         onSchedulerEvent: (event) => schedulerEvents.push(event),
       });
@@ -1769,6 +1777,9 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           actorCompletions: actorEvents
             .filter((event) => event.type === "run.completed")
             .map((event) => event.status),
+          classifiedFailures,
+          standardError: Buffer.concat(standardErrorChunks.map((chunk) => Buffer.from(chunk)))
+            .toString("utf8"),
           activeClaims: coreState.store.deliveries.listActiveClaims().map((claim) => ({
             moduleJobId: claim.moduleJobId,
             runId: claim.runId,
@@ -1808,7 +1819,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       expect(agentResult).toMatchObject({
         actions: ["alpha_discover", "beta_read", "answer"],
         capabilityTypes: ["model-operation", "tool-invocation"],
-        modelOutputContracts: ["json-object", "text"],
+        modelOutputContracts: ["json-object"],
         answer: {
           grounded: true,
           evidenceKeys: ["deployment-note"],
@@ -1816,7 +1827,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         childCredentialEnvironmentPresent: false,
       });
       expect(agentResult.answer.answer).toContain("EMBER-7421");
-      expect(modelTransport.requests).toHaveLength(4);
+      expect(modelTransport.requests).toHaveLength(3);
       const providerBodies = modelTransport.requests.map((request) =>
         JSON.parse(Buffer.from(request.body).toString("utf8")) as Record<string, unknown>
       );
@@ -1856,7 +1867,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           expect.objectContaining({ roundIndex: 2, state: "complete" }),
         ]);
       const effects = new FileEffectIntentStore({ path: effectIntentPath }).list();
-      expect(effects).toHaveLength(8);
+      expect(effects).toHaveLength(7);
       expect(effects.every((record) => record.outcome.kind === "terminal")).toBe(true);
 
       await composed.host.stop();
