@@ -1124,11 +1124,21 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
       inputPageIds: ["input"],
       outputPageIds: ["output"],
       mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+      claimLimits: {
+        baselineCount: 1,
+        baselineBytes: 128,
+        maxCount: 2,
+        maxBytes: 256,
+      },
     });
     scheduler.start();
     await drain(clock);
 
     expect(runtime.tickCount).toBe(1);
+    expect(runtime.receivedClaimLimits).toEqual([{
+      claimLimitCount: 1,
+      claimLimitBytes: 128,
+    }]);
     // The input is now held by the active Claim, so no pending Delivery is
     // left even though the exact accepted output still needs capacity.
     mailboxes.set("worker", 0, 0);
@@ -1174,6 +1184,82 @@ describe("CORE scheduler policy boundary", () => {
     expect(scheduler.status("worker").policyVersion).toBe("1");
     expect(scheduler.instanceStatus().policyName).toBe("fixed-baseline");
     await scheduler.stop();
+  });
+
+  it("uses each Module's own Claim baseline and exposes its hard ceiling", async () => {
+    const { clock, mailboxes, scheduler } = createScheduler();
+    const small = new FakeModuleRuntime(() => ({ status: "idle" }));
+    const large = new FakeModuleRuntime(() => ({ status: "idle" }));
+    mailboxes.set("small", 5, 500);
+    mailboxes.set("large", 5, 500);
+    scheduler.register({
+      moduleId: "small",
+      runtime: small,
+      inputPageIds: ["small-input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+      claimLimits: {
+        baselineCount: 1,
+        baselineBytes: 100,
+        maxCount: 1,
+        maxBytes: 128,
+      },
+    });
+    scheduler.register({
+      moduleId: "large",
+      runtime: large,
+      inputPageIds: ["large-input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+      claimLimits: {
+        baselineCount: 4,
+        baselineBytes: 400,
+        maxCount: 6,
+        maxBytes: 600,
+      },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(small.receivedClaimLimits).toEqual([{
+      claimLimitCount: 1,
+      claimLimitBytes: 100,
+    }]);
+    expect(large.receivedClaimLimits).toEqual([{
+      claimLimitCount: 4,
+      claimLimitBytes: 400,
+    }]);
+    expect(scheduler.status("small")).toMatchObject({
+      baselineClaimLimitCount: 1,
+      baselineClaimLimitBytes: 100,
+      maxClaimLimitCount: 1,
+      maxClaimLimitBytes: 128,
+    });
+    expect(scheduler.status("large")).toMatchObject({
+      baselineClaimLimitCount: 4,
+      baselineClaimLimitBytes: 400,
+      maxClaimLimitCount: 6,
+      maxClaimLimitBytes: 600,
+    });
+    await scheduler.stop();
+  });
+
+  it("rejects a Module Claim baseline above its own hard ceiling", () => {
+    const { scheduler } = createScheduler();
+    expect(() => scheduler.register({
+      moduleId: "worker",
+      runtime: new FakeModuleRuntime(),
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+      claimLimits: {
+        baselineCount: 2,
+        baselineBytes: 257,
+        maxCount: 1,
+        maxBytes: 256,
+      },
+    })).toThrow(/Claim baseline must not exceed its hard maximum/u);
   });
 
   it("passes the policy-selected Claim limits to the Module runtime", async () => {
@@ -1256,6 +1342,50 @@ describe("CORE scheduler policy boundary", () => {
     const stopping = scheduler.stop();
     runtime.settle({ status: "idle" });
     await stopping;
+  });
+
+  it("falls back before a custom policy can exceed one Module's Claim ceiling", async () => {
+    const policy: SchedulerPolicy = {
+      decide: () => ({
+        eligible: true,
+        eligibleAt: 0,
+        claimLimitCount: 3,
+        claimLimitBytes: 300,
+        reasonCode: "TOO_LARGE_FOR_SMALL_MODULE",
+        policyName: "adaptive",
+        policyVersion: "1",
+      }),
+    };
+    const { clock, mailboxes, scheduler, events } = createScheduler({ policy });
+    const runtime = new FakeModuleRuntime(() => ({ status: "idle" }));
+    mailboxes.set("worker", 5, 500);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+      claimLimits: {
+        baselineCount: 1,
+        baselineBytes: 100,
+        maxCount: 2,
+        maxBytes: 256,
+      },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(runtime.receivedClaimLimits).toEqual([{
+      claimLimitCount: 1,
+      claimLimitBytes: 100,
+    }]);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "scheduler.policy_failed",
+      moduleId: "worker",
+      action: "fallback-baseline",
+    }));
+    await scheduler.stop();
   });
 
   it("dispatches the immutable decision value even when an observer mutates the policy object", async () => {
@@ -1896,6 +2026,12 @@ describe("CORE scheduler retry backoff", () => {
       inputPageIds: ["input"],
       outputPageIds: ["output"],
       mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+      claimLimits: {
+        baselineCount: 1,
+        baselineBytes: 128,
+        maxCount: 2,
+        maxBytes: 256,
+      },
     });
     scheduler.start();
     await drain(clock);
@@ -1921,6 +2057,10 @@ describe("CORE scheduler retry backoff", () => {
       retryCount: 0,
       counters: { committed: 1, outputBackpressured: 1 },
     });
+    expect(runtime.receivedClaimLimits).toEqual([
+      { claimLimitCount: 1, claimLimitBytes: 128 },
+      { claimLimitCount: 1, claimLimitBytes: 128 },
+    ]);
     await scheduler.stop();
   });
 

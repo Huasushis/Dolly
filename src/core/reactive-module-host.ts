@@ -10,6 +10,7 @@ import {
   type SchedulerEvent,
   type SchedulerMailboxLimits,
   type SchedulerMailboxReader,
+  type SchedulerModuleClaimLimits,
   type SchedulableModuleRuntime,
 } from "./module-scheduler.js";
 import {
@@ -41,6 +42,8 @@ export interface ReactiveModuleHostRegistration {
   readonly inputPageIds: readonly string[];
   readonly outputPageIds: readonly string[];
   readonly mailbox: SchedulerMailboxLimits;
+  /** Product composition supplies this; direct legacy harnesses may omit it. */
+  readonly claimLimits?: SchedulerModuleClaimLimits;
   readonly activation?:
     | { readonly kind: "reactive" }
     | { readonly kind: "source" }
@@ -100,8 +103,9 @@ export interface ReactiveModuleHostComposition {
  * composition rejects it until a later complete package schema can declare
  * that support. Page routes and the three released
  * polling/retry values come only from the instance document. The constraints
- * absent from instance version 9 must be supplied explicitly and are checked
- * against every Module's hard Claim maxima before a runtime starts.
+ * absent from instance version 9 must be supplied explicitly. Its Claim
+ * values are a default baseline target; composition derives an exact
+ * per-Module baseline and hard ceiling before any runtime starts.
  *
  * `openDollyRuntime` deliberately does not call this function. Linux process
  * ownership, durable external-effect evidence, and the next instance schema
@@ -156,22 +160,16 @@ export function composeReactiveModuleHost(
         `Reactive Module composition requires Claim limits for Module ${module.moduleId}`,
       );
     }
-    if (
-      claim !== null &&
-      input.scheduling.claimLimitCount > claim.maxCount
-    ) {
-      throw new TypeError(
-        `Scheduler claimLimitCount ${input.scheduling.claimLimitCount} exceeds Module ${module.moduleId} maximum ${claim.maxCount}`,
-      );
-    }
-    if (
-      claim !== null &&
-      input.scheduling.claimLimitBytes > claim.maxBytes
-    ) {
-      throw new TypeError(
-        `Scheduler claimLimitBytes ${input.scheduling.claimLimitBytes} exceeds Module ${module.moduleId} maximum ${claim.maxBytes}`,
-      );
-    }
+    const maxClaimCount = module.activation.kind === "source" ? 1 : claim!.maxCount;
+    const maxClaimBytes = module.activation.kind === "source"
+      ? module.limits.maxInputBytes
+      : claim!.maxBytes;
+    const claimLimits: SchedulerModuleClaimLimits = {
+      baselineCount: Math.min(input.scheduling.claimLimitCount, maxClaimCount),
+      baselineBytes: Math.min(input.scheduling.claimLimitBytes, maxClaimBytes),
+      maxCount: maxClaimCount,
+      maxBytes: maxClaimBytes,
+    };
     const registration = registrations.get(module.moduleId)!;
     assertExtensionModuleCompatibility(registration.manifest, {
       extensionId: module.extensionId,
@@ -203,6 +201,7 @@ export function composeReactiveModuleHost(
       inputPageIds: module.inputPageIds,
       outputPageIds: module.outputPageIds,
       mailbox: registration.mailbox,
+      claimLimits,
       activation,
       ...(registration.sourceActivationBinding === undefined
         ? {}
@@ -259,6 +258,9 @@ export class ReactiveModuleHost {
         inputPageIds: Object.freeze([...registration.inputPageIds]),
         outputPageIds: Object.freeze([...registration.outputPageIds]),
         mailbox: Object.freeze({ ...registration.mailbox }),
+        ...(registration.claimLimits === undefined
+          ? {}
+          : { claimLimits: Object.freeze({ ...registration.claimLimits }) }),
         ...(registration.activation === undefined
           ? {}
           : { activation: Object.freeze({ ...registration.activation }) }),

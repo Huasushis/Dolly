@@ -66,6 +66,12 @@ function registration(id: string, managed: ManagedReactiveModuleRuntime) {
     inputPageIds: [`${id}-input`],
     outputPageIds: [`${id}-output`],
     mailbox: { maxResidentCount: 10, maxResidentBytes: 1024 },
+    claimLimits: {
+      baselineCount: 1,
+      baselineBytes: 1024,
+      maxCount: 1,
+      maxBytes: 1024,
+    },
   };
 }
 
@@ -399,6 +405,12 @@ describe("reactive Module host lifecycle", () => {
     expect(fakeScheduler.register).toHaveBeenCalledWith(expect.objectContaining({
       moduleId: "periodic",
       activation: { kind: "periodic", periodMs: 250, allowEmptyInput: false },
+      claimLimits: {
+        baselineCount: 1,
+        baselineBytes: 1024,
+        maxCount: 1,
+        maxBytes: 1024,
+      },
     }));
   });
 
@@ -425,6 +437,12 @@ describe("reactive Module host lifecycle", () => {
       moduleId: "source",
       activation: { kind: "source" },
       sourceActivationBinding,
+      claimLimits: {
+        baselineCount: 1,
+        baselineBytes: 1024,
+        maxCount: 1,
+        maxBytes: 1024,
+      },
     }));
   });
 
@@ -525,19 +543,52 @@ describe("reactive Module host lifecycle", () => {
     })))).toThrow(/does not support configuration version 2/u);
   });
 
-  it("rejects a Scheduler batch that exceeds any Module claim maximum", () => {
+  it("narrows the candidate default batch to each Module's hard Claim maximum", async () => {
     const config = configuredInstance();
     const input = composition(config);
-
-    expect(() => composeReactiveModuleHost({
+    const tick = vi.fn(async (): Promise<ReactiveModuleTickResult> => ({ status: "idle" }));
+    const managed: ManagedReactiveModuleRuntime = {
+      moduleGenerationId: "worker-generation",
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+      tick,
+    };
+    const scheduled: { delayMs: number; callback: () => void }[] = [];
+    const host = composeReactiveModuleHost({
       ...input,
-      scheduling: { ...input.scheduling, claimLimitCount: 5 },
-    })).toThrow(/claimLimitCount 5 exceeds Module worker maximum 4/u);
-
-    expect(() => composeReactiveModuleHost({
-      ...input,
-      scheduling: { ...input.scheduling, claimLimitBytes: 4097 },
-    })).toThrow(/claimLimitBytes 4097 exceeds Module worker maximum 4096/u);
+      scheduling: {
+        ...input.scheduling,
+        claimLimitCount: 5,
+        claimLimitBytes: 4097,
+      },
+      registrations: [{ ...input.registrations[0]!, runtime: managed }],
+      deliveries: {
+        inspectPending: () => ({ pendingCount: 5, pendingBytes: 5000 }),
+        inspectResident: () => ({
+          pendingCount: 5,
+          pendingBytes: 5000,
+          claimedCount: 0,
+          claimedBytes: 0,
+          residentCount: 5,
+          residentBytes: 5000,
+        }),
+      },
+      clock: {
+        monotonicNow: () => 0,
+        schedule: (delayMs, callback) => {
+          scheduled.push({ delayMs, callback });
+          return { cancel: () => undefined };
+        },
+      },
+    });
+    await host.start();
+    scheduled.find((timer) => timer.delayMs === 0)!.callback();
+    await vi.waitFor(() => expect(tick).toHaveBeenCalledTimes(1));
+    expect(tick).toHaveBeenCalledWith({
+      claimLimitCount: 4,
+      claimLimitBytes: 4096,
+    });
+    await host.stop();
   });
 
   it("uses configured Page routes and passes the exact explicit batch to the runtime", async () => {

@@ -2655,7 +2655,9 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           backpressureAction: "pause-upstream",
           downstreamRecheckMs: 100,
           noProgressAfterMs: 5_000,
-          claimLimitCount: 1,
+          // The source runtime is still registered with its exact per-Module
+          // hard count of one; this larger candidate default must be narrowed.
+          claimLimitCount: 8,
           claimLimitBytes: 64 * 1_024,
           retryJitterRatio: 0,
           lowWatermarkRatio: 1,

@@ -2377,15 +2377,23 @@ MUST copy every supported decision field exactly once into a Core-owned,
 immutable value and validate that copy. The policy and event observers may
 retain references to their own objects, but later mutation of those objects
 MUST NOT change the decision used for dispatch. Per-Module runtime configuration
-supplies hard maximum count and byte limits. Product composition sets the
-Scheduler's trusted count and byte ceilings no higher than any registered
-runtime maximum. A
-selected policy may reduce those values but MUST NOT exceed either Scheduler
-ceiling; an oversized decision is a policy failure and is rejected before the
-runtime is dispatched, after which the declared safe fallback or visible
-failure action applies. The runtime independently rejects a direct decision
-outside its own maxima before claiming input. Direct runtime callers that omit
-per-dispatch values use the configured maxima.
+supplies hard maximum count and byte limits. Scheduler registration binds each
+Module to its own fixed baseline and its own hard count and byte ceilings. A
+source Module's durable request queue has the exact hard count ceiling `1`; it
+MUST NOT inherit a larger instance-wide batch merely because an ordinary
+reactive Module can consume one. Until a released instance schema persists
+per-Module baselines, product-before-startup composition may treat an explicit
+instance-wide value only as a baseline target and MUST narrow it to each
+Module's hard maximum before registration.
+
+A selected policy may reduce a Module's baseline values or raise them only up
+to that Module's hard ceilings. It MUST NOT exceed either per-Module ceiling;
+an oversized decision is a policy failure and is rejected before the runtime is
+dispatched, after which the same Module's declared safe baseline or visible
+failure action applies. Output-commit recovery uses that same per-Module
+baseline rather than an instance-global batch. The runtime independently
+rejects a direct decision outside its own maxima before claiming input. Direct
+runtime callers that omit per-dispatch values use the configured maxima.
 
 `oldestPendingAgeMs` MUST NOT reset merely because the Scheduler process or its
 monotonic clock restarted. When the Delivery reader supplies the canonical

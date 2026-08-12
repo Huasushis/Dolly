@@ -16,6 +16,7 @@ import {
 } from "../../../src/core/module-scheduler.js";
 import {
   ReactiveModuleRuntime,
+  type ReactiveModuleClaimLimits,
   type ReactiveModuleInput,
   type ReactiveModuleTickResult,
 } from "../../../src/core/reactive-module-runtime.js";
@@ -71,6 +72,7 @@ function createScheduler(
   core: FileCoreStateStore,
   clock: FakeClock,
   events: SchedulerEvent[] = [],
+  defaultClaimLimitCount = 1,
 ): ModuleScheduler {
   return new ModuleScheduler({
     instanceId: "source-instance",
@@ -84,7 +86,7 @@ function createScheduler(
     backpressureAction: "pause-upstream",
     downstreamRecheckMs: 50,
     noProgressAfterMs: 1_000,
-    claimLimitCount: 1,
+    claimLimitCount: defaultClaimLimitCount,
     claimLimitBytes: 4_096,
     retryJitterRatio: 0,
     onEvent: (event) => events.push(event),
@@ -94,13 +96,15 @@ function createScheduler(
 class ConsumingSourceRuntime implements SchedulableModuleRuntime {
   readonly moduleGenerationId = "source-generation-1";
   tickCount = 0;
+  readonly receivedClaimLimits: ReactiveModuleClaimLimits[] = [];
 
   constructor(
     readonly core: FileCoreStateStore,
     readonly queue: SourceActivationQueue,
   ) {}
 
-  async tick(): Promise<ReactiveModuleTickResult> {
+  async tick(limits?: ReactiveModuleClaimLimits): Promise<ReactiveModuleTickResult> {
+    if (limits !== undefined) this.receivedClaimLimits.push({ ...limits });
     this.tickCount += 1;
     const claim = this.core.deliveries.claim({
       consumerId: "source-module",
@@ -370,13 +374,28 @@ describe("Core-private source activation queue", () => {
     const runtime = new ConsumingSourceRuntime(core, queue);
     const clock = new FakeClock();
     const events: SchedulerEvent[] = [];
-    const scheduler = createScheduler(core, clock, events);
+    const scheduler = createScheduler(core, clock, events, 8);
+    expect(() => scheduler.register({
+      moduleId: "source-module",
+      runtime,
+      inputPageIds: [],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 2, maxResidentBytes: 4096 },
+      activation: { kind: "source" },
+      sourceActivationBinding: binding,
+    })).toThrow(/source Module Claim baseline and hard count must both equal one/u);
     scheduler.register({
       moduleId: "source-module",
       runtime,
       inputPageIds: [],
       outputPageIds: [],
       mailbox: { maxResidentCount: 2, maxResidentBytes: 4096 },
+      claimLimits: {
+        baselineCount: 1,
+        baselineBytes: 2048,
+        maxCount: 1,
+        maxBytes: 4096,
+      },
       activation: { kind: "source" },
       sourceActivationBinding: binding,
     });
@@ -387,6 +406,14 @@ describe("Core-private source activation queue", () => {
     await drain(clock);
 
     expect(runtime.tickCount).toBe(1);
+    expect(runtime.receivedClaimLimits).toEqual([{
+      claimLimitCount: 1,
+      claimLimitBytes: 2048,
+    }]);
+    expect(scheduler.status("source-module")).toMatchObject({
+      baselineClaimLimitCount: 1,
+      maxClaimLimitCount: 1,
+    });
     expect(queue.inspect().residentCount).toBe(0);
     expect(events).toContainEqual(expect.objectContaining({
       type: "scheduler.dispatched",

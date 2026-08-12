@@ -200,6 +200,17 @@ export interface SchedulerMailboxLimits {
   readonly maxResidentBytes: number;
 }
 
+/**
+ * Claim policy for one Module. The baseline is what the fixed policy asks for;
+ * the maxima are the runtime's non-negotiable per-dispatch ceilings.
+ */
+export interface SchedulerModuleClaimLimits {
+  readonly baselineCount: number;
+  readonly baselineBytes: number;
+  readonly maxCount: number;
+  readonly maxBytes: number;
+}
+
 export type SchedulerActivationDescriptor =
   | { readonly kind: "reactive" }
   | {
@@ -215,6 +226,12 @@ export interface SchedulerModuleRegistration {
   readonly inputPageIds: readonly string[];
   readonly outputPageIds: readonly string[];
   readonly mailbox: SchedulerMailboxLimits;
+  /**
+   * Per-Module Claim contract. Omission keeps the legacy direct-Scheduler
+   * default from `ModuleSchedulerOptions`; product composition supplies it
+   * explicitly for every Module.
+   */
+  readonly claimLimits?: SchedulerModuleClaimLimits;
   /** Defaults to reactive. Empty periodic remains rejected. */
   readonly activation?: SchedulerActivationDescriptor;
   /** Required only for a source registration; ordinary input Page IDs stay empty. */
@@ -242,7 +259,10 @@ export interface ModuleSchedulerOptions {
   readonly downstreamRecheckMs: number;
   /** Sustained-no-progress detection window (Section 12). */
   readonly noProgressAfterMs: number;
-  /** Claim limits reported by the baseline policy. See the note on `SchedulerDecision`. */
+  /**
+   * Legacy defaults for direct registrations that omit `claimLimits`.
+   * Product composition supplies a closed per-Module contract instead.
+   */
   readonly claimLimitCount: number;
   readonly claimLimitBytes: number;
   /** Defaults to the Section 13.3 fixed baseline. */
@@ -417,6 +437,10 @@ export interface SchedulerModuleStatus {
   readonly residentBytes: number;
   readonly maxResidentCount: number;
   readonly maxResidentBytes: number;
+  readonly baselineClaimLimitCount: number;
+  readonly baselineClaimLimitBytes: number;
+  readonly maxClaimLimitCount: number;
+  readonly maxClaimLimitBytes: number;
   readonly oldestPendingAgeMs: number;
   readonly mailboxFull: boolean;
   readonly mailboxStateAvailable: boolean;
@@ -534,6 +558,11 @@ interface ModuleEntry {
   readonly outputPageIds: readonly string[];
   readonly maxResidentCount: number;
   readonly maxResidentBytes: number;
+  readonly baselineClaimLimitCount: number;
+  readonly baselineClaimLimitBytes: number;
+  readonly maxClaimLimitCount: number;
+  readonly maxClaimLimitBytes: number;
+  readonly baselinePolicy: SchedulerPolicy;
   downstreamIds: readonly string[];
   pending: SchedulerPendingSnapshot;
   resident: SchedulerResidentSnapshot;
@@ -787,10 +816,9 @@ export class ModuleScheduler {
   readonly #backpressureAction: SchedulerBackpressureAction;
   readonly #downstreamRecheckMs: number;
   readonly #noProgressAfterMs: number;
-  readonly #claimLimitCount: number;
-  readonly #claimLimitBytes: number;
-  readonly #policy: SchedulerPolicy;
-  readonly #fallbackPolicy: SchedulerPolicy;
+  readonly #defaultClaimLimitCount: number;
+  readonly #defaultClaimLimitBytes: number;
+  readonly #policy: SchedulerPolicy | undefined;
   readonly #onPolicyFailure: SchedulerPolicyFailureAction;
   readonly #retryJitterRatio: number;
   readonly #random: () => number;
@@ -900,24 +928,14 @@ export class ModuleScheduler {
     this.#backpressureAction = options.backpressureAction;
     this.#downstreamRecheckMs = options.downstreamRecheckMs;
     this.#noProgressAfterMs = options.noProgressAfterMs;
-    this.#claimLimitCount = options.claimLimitCount;
-    this.#claimLimitBytes = options.claimLimitBytes;
+    this.#defaultClaimLimitCount = options.claimLimitCount;
+    this.#defaultClaimLimitBytes = options.claimLimitBytes;
     this.#retryJitterRatio = jitterRatio;
     this.#random = options.random ?? Math.random;
     this.#lowWatermarkRatio = lowWatermarkRatio;
     this.#onPolicyFailure = options.onPolicyFailure ?? "fallback-baseline";
     this.#onEvent = options.onEvent;
-    // The declared safe fixed policy of Section 14. It is constructed even when
-    // an alternative policy is selected, so a policy crash always has somewhere
-    // safe to fall back to without allocating during the failure path.
-    this.#fallbackPolicy = new FixedSchedulerPolicy({
-      claimLimitCount: options.claimLimitCount,
-      claimLimitBytes: options.claimLimitBytes,
-      retryBaseMs: options.retryBaseMs,
-      retryMaxMs: options.retryMaxMs,
-      downstreamRecheckMs: options.downstreamRecheckMs,
-    });
-    this.#policy = options.policy ?? this.#fallbackPolicy;
+    this.#policy = options.policy;
   }
 
   get state(): "created" | "running" | "stopping" | "stopped" {
@@ -986,6 +1004,45 @@ export class ModuleScheduler {
     }
     assertPositiveInteger(registration.mailbox.maxResidentCount, "mailbox.maxResidentCount");
     assertPositiveInteger(registration.mailbox.maxResidentBytes, "mailbox.maxResidentBytes");
+    const claimLimits = registration.claimLimits ?? {
+      baselineCount: this.#defaultClaimLimitCount,
+      baselineBytes: this.#defaultClaimLimitBytes,
+      maxCount: this.#defaultClaimLimitCount,
+      maxBytes: this.#defaultClaimLimitBytes,
+    };
+    const baselineClaimLimitCount = claimLimits.baselineCount;
+    const baselineClaimLimitBytes = claimLimits.baselineBytes;
+    const maxClaimLimitCount = claimLimits.maxCount;
+    const maxClaimLimitBytes = claimLimits.maxBytes;
+    assertPositiveInteger(baselineClaimLimitCount, "claimLimits.baselineCount");
+    assertPositiveInteger(baselineClaimLimitBytes, "claimLimits.baselineBytes");
+    assertPositiveInteger(maxClaimLimitCount, "claimLimits.maxCount");
+    assertPositiveInteger(maxClaimLimitBytes, "claimLimits.maxBytes");
+    if (
+      baselineClaimLimitCount > maxClaimLimitCount ||
+      baselineClaimLimitBytes > maxClaimLimitBytes
+    ) {
+      throw new ModuleSchedulerError(
+        "SCHEDULER_CONFIGURATION_INVALID",
+        "Module Claim baseline must not exceed its hard maximum",
+      );
+    }
+    if (
+      activation.kind === "source" &&
+      (baselineClaimLimitCount !== 1 || maxClaimLimitCount !== 1)
+    ) {
+      throw new ModuleSchedulerError(
+        "SCHEDULER_CONFIGURATION_INVALID",
+        "A source Module Claim baseline and hard count must both equal one",
+      );
+    }
+    const baselinePolicy = new FixedSchedulerPolicy({
+      claimLimitCount: baselineClaimLimitCount,
+      claimLimitBytes: baselineClaimLimitBytes,
+      retryBaseMs: this.#retryBaseMs,
+      retryMaxMs: this.#retryMaxMs,
+      downstreamRecheckMs: this.#downstreamRecheckMs,
+    });
 
     let inputPageIds = [...registration.inputPageIds];
     let sourcePrivatePageId: string | undefined;
@@ -1064,6 +1121,11 @@ export class ModuleScheduler {
       outputPageIds: [...registration.outputPageIds],
       maxResidentCount: registration.mailbox.maxResidentCount,
       maxResidentBytes: registration.mailbox.maxResidentBytes,
+      baselineClaimLimitCount,
+      baselineClaimLimitBytes,
+      maxClaimLimitCount,
+      maxClaimLimitBytes,
+      baselinePolicy,
       downstreamIds: [],
       pending: { pendingCount: 0, pendingBytes: 0 },
       resident: {
@@ -1322,7 +1384,7 @@ export class ModuleScheduler {
     return deepFreeze({
       instanceId: this.#instanceId,
       state: this.#state,
-      policyName: this.#policy === this.#fallbackPolicy ? "fixed-baseline" : "custom",
+      policyName: this.#policy === undefined ? "fixed-baseline" : "custom",
       registeredModules: this.#entries.size,
       activeModules: this.#activeCount,
       maxConcurrentModules: this.#maxConcurrentModules,
@@ -1716,8 +1778,8 @@ export class ModuleScheduler {
       const decision: SchedulerDecision = deepFreeze({
         eligible: blockedBy.length === 0,
         eligibleAt: blockedBy.length === 0 ? now : null,
-        claimLimitCount: this.#claimLimitCount,
-        claimLimitBytes: this.#claimLimitBytes,
+        claimLimitCount: entry.baselineClaimLimitCount,
+        claimLimitBytes: entry.baselineClaimLimitBytes,
         reasonCode:
           blockedBy.length === 0 ? "OUTPUT_COMMIT_RESUME" : "DOWNSTREAM_BACKPRESSURE",
         policyName: "scheduler-output-commit",
@@ -1766,9 +1828,10 @@ export class ModuleScheduler {
   /** Returns null when the Module must not be scheduled at all this pass. */
   #decide(entry: ModuleEntry, snapshot: SchedulerSnapshot): SchedulerDecision | null {
     try {
-      const decision = this.#validateDecision(this.#policy.decide(snapshot));
-      if (this.#policy !== this.#fallbackPolicy) {
-        const baseline = this.#validateDecision(this.#fallbackPolicy.decide(snapshot));
+      const selectedPolicy = this.#policy ?? entry.baselinePolicy;
+      const decision = this.#validateDecision(entry, selectedPolicy.decide(snapshot));
+      if (this.#policy !== undefined) {
+        const baseline = this.#validateDecision(entry, entry.baselinePolicy.decide(snapshot));
         if (decision.eligible && !baseline.eligible) {
           throw new TypeError(
             "Scheduler policy expanded eligibility beyond the fixed baseline",
@@ -1787,14 +1850,14 @@ export class ModuleScheduler {
         this.#quarantine(entry, "SCHEDULER_POLICY_FAILED");
         return null;
       }
-      if (this.#policy === this.#fallbackPolicy) {
+      if (this.#policy === undefined) {
         // The declared safe policy is the one that failed; fail visibly rather
         // than dispatch on an unknown decision.
         this.#recordReason(entry, false, "POLICY_UNAVAILABLE", snapshot);
         return null;
       }
       try {
-        return this.#validateDecision(this.#fallbackPolicy.decide(snapshot));
+        return this.#validateDecision(entry, entry.baselinePolicy.decide(snapshot));
       } catch (fallbackError) {
         entry.counters.policyFailures += 1;
         this.#emitModule(entry, {
@@ -1808,7 +1871,7 @@ export class ModuleScheduler {
     }
   }
 
-  #validateDecision(candidate: SchedulerDecision): SchedulerDecision {
+  #validateDecision(entry: ModuleEntry, candidate: SchedulerDecision): SchedulerDecision {
     if (candidate === null || typeof candidate !== "object") {
       throw new TypeError("Scheduler policy returned an invalid decision");
     }
@@ -1833,10 +1896,10 @@ export class ModuleScheduler {
       (eligibleAt !== null && !Number.isFinite(eligibleAt)) ||
       !Number.isSafeInteger(claimLimitCount) ||
       claimLimitCount <= 0 ||
-      claimLimitCount > this.#claimLimitCount ||
+      claimLimitCount > entry.maxClaimLimitCount ||
       !Number.isSafeInteger(claimLimitBytes) ||
       claimLimitBytes <= 0 ||
-      claimLimitBytes > this.#claimLimitBytes ||
+      claimLimitBytes > entry.maxClaimLimitBytes ||
       (missedPeriods !== undefined &&
         (!Number.isSafeInteger(missedPeriods) || missedPeriods < 0)) ||
       (retryDelayMs !== undefined &&
@@ -2373,6 +2436,10 @@ export class ModuleScheduler {
       residentBytes: entry.resident.residentBytes,
       maxResidentCount: entry.maxResidentCount,
       maxResidentBytes: entry.maxResidentBytes,
+      baselineClaimLimitCount: entry.baselineClaimLimitCount,
+      baselineClaimLimitBytes: entry.baselineClaimLimitBytes,
+      maxClaimLimitCount: entry.maxClaimLimitCount,
+      maxClaimLimitBytes: entry.maxClaimLimitBytes,
       oldestPendingAgeMs: this.#oldestPendingAgeMs(entry, now),
       mailboxFull: entry.mailboxFull,
       mailboxStateAvailable: entry.mailboxStateAvailable,
