@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { copyRuntimeAssets } from "../../../scripts/copy-runtime-assets.mjs";
 
 const LAUNCHER_PATH = "src/adapters/linux-module-launcher/launcher.py";
+const LAUNCHER_CONSUMER_PATH =
+  "src/adapters/linux-module-launcher/linux-module-launcher-process.js";
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -22,6 +24,9 @@ async function fixture() {
   const source = join(repositoryRoot, LAUNCHER_PATH);
   mkdirSync(dirname(source), { recursive: true });
   writeFileSync(source, "#!/usr/bin/python3\nprint('Dolly launcher')\n", { mode: 0o755 });
+  const compiledConsumer = join(outputDirectory, LAUNCHER_CONSUMER_PATH);
+  mkdirSync(dirname(compiledConsumer), { recursive: true });
+  writeFileSync(compiledConsumer, "export const compiled = true;\n");
   return { repositoryRoot, outputDirectory, source };
 }
 
@@ -56,6 +61,15 @@ describe("runtime build assets", () => {
 
     expect(() => copyRuntimeAssets({ repositoryRoot, outputDirectory })).toThrow(
       /must be an ordinary file/u,
+    );
+  });
+
+  it("rejects a launcher asset whose runtime consumer was not compiled", async () => {
+    const { repositoryRoot, outputDirectory } = await fixture();
+    await rm(join(outputDirectory, LAUNCHER_CONSUMER_PATH));
+
+    expect(() => copyRuntimeAssets({ repositoryRoot, outputDirectory })).toThrow(
+      /Compiled runtime asset consumer/u,
     );
   });
 });

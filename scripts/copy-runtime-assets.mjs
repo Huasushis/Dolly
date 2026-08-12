@@ -9,11 +9,19 @@ import {
 import { dirname, resolve } from "node:path";
 
 const RUNTIME_ASSETS = [
-  "src/adapters/linux-module-launcher/launcher.py",
+  {
+    path: "src/adapters/linux-module-launcher/launcher.py",
+    compiledConsumer: "src/adapters/linux-module-launcher/linux-module-launcher-process.js",
+  },
 ];
 
 function requireOrdinaryFile(path, label) {
-  const metadata = lstatSync(path);
+  let metadata;
+  try {
+    metadata = lstatSync(path);
+  } catch (cause) {
+    throw new Error(`${label} must be an ordinary file`, { cause });
+  }
   if (!metadata.isFile() || metadata.isSymbolicLink()) {
     throw new Error(`${label} must be an ordinary file`);
   }
@@ -26,9 +34,14 @@ function requireOrdinaryFile(path, label) {
  */
 export function copyRuntimeAssets({ repositoryRoot, outputDirectory }) {
   const copied = [];
-  for (const relativePath of RUNTIME_ASSETS) {
+  for (const asset of RUNTIME_ASSETS) {
+    const relativePath = asset.path;
     const source = resolve(repositoryRoot, relativePath);
     const target = resolve(outputDirectory, relativePath);
+    requireOrdinaryFile(
+      resolve(outputDirectory, asset.compiledConsumer),
+      `Compiled runtime asset consumer ${asset.compiledConsumer}`,
+    );
     requireOrdinaryFile(source, `Runtime asset ${relativePath}`);
     mkdirSync(dirname(target), { recursive: true });
     copyFileSync(source, target, constants.COPYFILE_EXCL);
