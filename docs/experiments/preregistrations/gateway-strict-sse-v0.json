@@ -1,16 +1,16 @@
 {
   "schemaVersion": "dolly.gateway-sse-canary-preregistration/1",
   "experimentId": "gateway-strict-sse-v0",
-  "experimentVersion": 1,
+  "experimentVersion": 2,
   "status": "frozen-before-first-run",
-  "question": "Does the owner's configured Aether qwen3.6-27b deployment complete one bounded strict streaming request after the gateway timeout change, and can a versioned increase in completion budget preserve final JSON content, without a non-stream fallback or retry?",
+  "question": "Does the owner's configured Aether qwen3.6-27b deployment complete a short structured request with final content when the endpoint-measured thinking policy is disabled for that role, while retaining strict streaming and no fallback or retry?",
   "baseline": {
     "kind": "frozen-v0-run",
-    "description": "gateway-strict-sse-v0 run-20260812a used the same model, prompt, seed, thinking policy, and strict stream but max_tokens=5200. Its raw stream ended cleanly after 143.194 seconds with one usage event and DONE, while the model exhausted its budget with finish_reason=length and empty final content. No new non-stream request is permitted."
+    "description": "Version 0 and version 1 both used thinking.type=enabled. Their strict streams crossed 120 seconds and ended with usage and DONE, but the model exhausted 5200 and then 6400 tokens with empty final content. Version 1 shows that a budget-only increase is ineffective. Version 2 changes only the role-specific thinking policy and restores a bounded output budget; no new non-stream request is permitted."
   },
   "data": {
     "promptId": "gateway-canary-arithmetic-v0",
-    "system": "You are a bounded transport canary. Keep internal analysis concise and reserve at least 256 output tokens for the final answer. Reason carefully, then return exactly one JSON object and no Markdown.",
+    "system": "You are a bounded transport canary. Return exactly one JSON object and no Markdown.",
     "user": "Find the least nonnegative integer x satisfying x mod 97 = 11, x mod 101 = 37, and x mod 103 = 73. Verify all three congruences internally. Return exactly {\"canary\":\"DOLLY_STREAM_OK\",\"x\":integer}.",
     "expectedCanary": "DOLLY_STREAM_OK"
   },
@@ -27,9 +27,9 @@
   "request": {
     "stream": true,
     "streamOptions": { "includeUsage": true },
-    "thinking": { "type": "enabled" },
+    "thinking": { "type": "disabled" },
     "temperature": 0,
-    "maximumOutputTokens": 6400,
+    "maximumOutputTokens": 800,
     "maximumResponseBytes": 2097152,
     "maximumBufferedEventBytes": 262144,
     "maximumReconstructedOutputBytes": 524288,
@@ -47,7 +47,7 @@
   ],
   "minimumEffectiveDifference": {
     "transportGate": "One HTTP 200 text/event-stream response with one stable provider identity, one finish reason, exactly one usage event, one DONE marker, no bytes after DONE, and no fallback or retry. This gate is independent of final content validity.",
-    "reasoningGate": "Non-empty reasoning_content is required to claim reasoning occurred.",
+    "reasoningGate": "Because this version explicitly uses thinking.type=disabled, reasoning_content must be empty and this run makes no reasoning claim.",
     "contentGate": "Final content must be one strict JSON object containing canary=DOLLY_STREAM_OK and finish_reason must not be length.",
     "gatewayBoundaryClaim": "A transportGate pass whose last raw network chunk occurs after 120 seconds directly falsifies the old 120-second end-to-end cancellation boundary even if the independent contentGate fails; a faster transport pass proves current strict streaming connectivity only."
   },
@@ -58,8 +58,8 @@
     "Do not change the prompt, model, thinking mode, token budget, or parser after observing the result."
   ],
   "decisionRules": [
-    "Pass strict-stream-transport only when the complete transportGate and reasoningGate hold.",
-    "Pass model-content separately only when contentGate holds; do not rewrite a transport pass as an overall semantic pass.",
+    "Pass strict-stream-transport only when the complete transportGate holds.",
+    "Pass the role-specific thinking policy only when reasoningGate holds, and pass model-content separately only when both that policy and contentGate hold.",
     "Record gateway-over-120s evidence when strict-stream-transport passes and the last raw network chunk arrives after 120000 milliseconds, regardless of the separate content result.",
     "A faster pass is not evidence about the former 120-second boundary.",
     "Any missing credential, HTTP failure, timeout, invalid SSE, missing usage, missing DONE, empty reasoning, invalid JSON, secret leak, or artifact-write failure is inconclusive or failed as explicitly recorded; there is no fallback."

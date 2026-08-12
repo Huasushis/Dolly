@@ -172,6 +172,30 @@ if (preregistration.experimentVersion === 0) {
     result.gatewayOver120SecondsProven !== (expectedTransport && rawCrossed120Seconds) ||
     result.status !== (expectedTransport && expectedContent ? "passed" : "failed")
   ) failures.push("v1 transport/content classification differs from raw artifacts");
+} else if (preregistration.experimentVersion === 2) {
+  let contentObject = null;
+  try {
+    contentObject = JSON.parse(decoded?.body.choices[0].message.content ?? "");
+  } catch {
+    // A malformed final object is a content failure, not a transport failure.
+  }
+  const expectedTransport =
+    decoded?.evidence.doneCount === 1 && decoded?.evidence.usageEventCount === 1;
+  const expectedReasoningPolicy =
+    preregistration.request.thinking.type === "disabled" &&
+    decoded?.body.choices[0].message.reasoning_content.length === 0;
+  const expectedContent =
+    expectedTransport &&
+    expectedReasoningPolicy &&
+    decoded?.body.choices[0].finish_reason !== "length" &&
+    contentObject?.canary === preregistration.data.expectedCanary;
+  if (
+    result.strictStreamTransport !== expectedTransport ||
+    result.reasoningPolicySatisfied !== expectedReasoningPolicy ||
+    result.modelContentComplete !== expectedContent ||
+    result.gatewayOver120SecondsProven !== (expectedTransport && rawCrossed120Seconds) ||
+    result.status !== (expectedTransport && expectedReasoningPolicy && expectedContent ? "passed" : "failed")
+  ) failures.push("v2 transport/thinking/content classification differs from raw artifacts");
 } else {
   failures.push("unsupported preregistration experimentVersion");
 }

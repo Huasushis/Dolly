@@ -121,7 +121,7 @@ const preregistration = JSON.parse(preregistrationBytes.toString("utf8"));
 if (
   preregistration.schemaVersion !== "dolly.gateway-sse-canary-preregistration/1" ||
   preregistration.experimentId !== "gateway-strict-sse-v0" ||
-  preregistration.experimentVersion !== 1 ||
+  preregistration.experimentVersion !== 2 ||
   preregistration.status !== "frozen-before-first-run" ||
   preregistration.request.stream !== true ||
   preregistration.request.nonStreamFallbackAllowed !== false ||
@@ -251,10 +251,15 @@ const strictStreamTransport =
   transportFailure === null &&
   response?.status === 200 &&
   decoded?.evidence.doneCount === 1 &&
-  decoded?.evidence.usageEventCount === 1 &&
-  reasoningContent.trim().length > 0;
+  decoded?.evidence.usageEventCount === 1;
+const reasoningPolicySatisfied = preregistration.request.thinking.type === "enabled"
+  ? reasoningContent.trim().length > 0
+  : preregistration.request.thinking.type === "disabled"
+    ? reasoningContent.length === 0
+    : false;
 const modelContentComplete =
   strictStreamTransport &&
+  reasoningPolicySatisfied &&
   contentFailure === null &&
   decoded?.body.choices[0].finish_reason !== "length" &&
   parsedContent?.canary === preregistration.data.expectedCanary;
@@ -271,7 +276,9 @@ const result = {
   schemaVersion: "dolly.gateway-sse-canary-result/1",
   experimentId: preregistration.experimentId,
   runId: options.runId,
-  status: strictStreamTransport && modelContentComplete ? "passed" : "failed",
+  status: strictStreamTransport && reasoningPolicySatisfied && modelContentComplete
+    ? "passed"
+    : "failed",
   startedAt,
   finishedAt,
   request: {
@@ -305,6 +312,7 @@ const result = {
     canaryMarkerMatched: parsedContent?.canary === preregistration.data.expectedCanary,
   },
   strictStreamTransport,
+  reasoningPolicySatisfied,
   modelContentComplete,
   gatewayOver120SecondsProven:
     strictStreamTransport && (rawResult.timings.at(-1)?.elapsedMs ?? 0) > 120_000,
