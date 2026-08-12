@@ -1129,7 +1129,7 @@ describe("installed reactive Module runtime composition", () => {
     });
 
     expect(composed.host.state).toBe("created");
-    expect(composed.sourceActivationQueues).toHaveLength(1);
+    expect(composed.sourceActivations).toHaveLength(1);
     expect(composed.installedRuntimes[0]).toMatchObject({
       resolvedModule: { module: { moduleId: "source-worker", activation: { kind: "source" } } },
       sourceActivationBinding: {
@@ -1137,17 +1137,27 @@ describe("installed reactive Module runtime composition", () => {
         moduleId: "source-worker",
       },
     });
-    const queue = composed.sourceActivationQueues[0]!;
-    expect(queue.limits).toEqual({
+    const activation = composed.sourceActivations[0]!;
+    expect(activation.limits).toEqual({
       maxResidentCount: 2,
       maxResidentBytes: 4096,
       maxRequestBytes: 2048,
     });
-    expect(queue.submit({
+    const firstRequest = {
       idempotencyKey: "manual:source-worker:1",
       body: { kind: "manual/1", instruction: "refresh" },
-    })).toMatchObject({ status: "enqueued" });
-    expect(queue.inspect()).toMatchObject({ pendingCount: 1, residentCount: 1 });
+    } as const;
+    let admissionFailure: unknown;
+    try {
+      activation.submit(firstRequest);
+    } catch (error) {
+      admissionFailure = error;
+    }
+    expect(admissionFailure).toMatchObject({
+      code: "SOURCE_ACTIVATION_ADMISSION_CLOSED",
+      message: expect.stringMatching(/not running/u),
+    });
+    expect(activation.inspect()).toMatchObject({ pendingCount: 0, residentCount: 0 });
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
 
@@ -1240,7 +1250,7 @@ describe("installed reactive Module runtime composition", () => {
       periodMs: 250,
       allowEmptyInput: false,
     });
-    expect(composed.sourceActivationQueues).toEqual([]);
+    expect(composed.sourceActivations).toEqual([]);
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
 

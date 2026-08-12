@@ -2026,7 +2026,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         },
         onSchedulerEvent: (event) => schedulerEvents.push(event),
       });
-      expect(composed.sourceActivationQueues).toHaveLength(1);
+      expect(composed.sourceActivations).toHaveLength(1);
       await composed.host.start();
       expect(composed.host.state).toBe("running");
       expect(composed.installedRuntimes[0]?.generations.processGenerationIdFor(
@@ -2039,7 +2039,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       });
       expect(existsSync(moduleCgroupPath)).toBe(true);
 
-      const submission = composed.sourceActivationQueues[0]!.submit({
+      const submission = composed.sourceActivations[0]!.submit({
         idempotencyKey: "manual:source:integration:1",
         body: { kind: "manual/1", instruction: "refresh installed source" },
       });
@@ -2048,7 +2048,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         () =>
           repository.list().length === 1 &&
           repository.list()[0]?.state === "committed" &&
-          composed?.sourceActivationQueues[0]?.inspect().residentCount === 0,
+          composed?.sourceActivations[0]?.inspect().residentCount === 0,
         5_000,
       )).toBe(true);
       expect(actorEvents.filter((event) => event.type === "run.started")).toHaveLength(1);
@@ -2082,6 +2082,10 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       await composed.host.stop();
       stopped = true;
       expect(composed.host.state).toBe("stopped");
+      expect(() => composed!.sourceActivations[0]!.submit({
+        idempotencyKey: "manual:source:integration:after-stop",
+        body: { kind: "manual/1", instruction: "must remain closed" },
+      })).toThrow(/not running/u);
       expect(coreState.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
         state: "stopped",
         moduleCgroupPath,
@@ -2107,7 +2111,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         state: "stopped",
       });
       expect(reopened.deliveries.inspectPending(SOURCE_MODULE_ID, [
-        composed.sourceActivationQueues[0]!.privatePageId,
+        composed.sourceActivations[0]!.privatePageId,
       ]).pendingCount).toBe(0);
 
       console.info(JSON.stringify({

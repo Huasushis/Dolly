@@ -34,6 +34,7 @@ export type SourceActivationQueueErrorCode =
   | "SOURCE_ACTIVATION_REQUEST_INVALID"
   | "SOURCE_ACTIVATION_REQUEST_TOO_LARGE"
   | "SOURCE_ACTIVATION_CONFLICT"
+  | "SOURCE_ACTIVATION_ADMISSION_CLOSED"
   | "SOURCE_ACTIVATION_STATE_INVALID";
 
 export class SourceActivationQueueError extends Error {

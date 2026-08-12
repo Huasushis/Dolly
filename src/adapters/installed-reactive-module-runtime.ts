@@ -41,7 +41,11 @@ import {
 import {
   resolveSourceActivationSchedulerBinding,
   SourceActivationQueue,
+  SourceActivationQueueError,
+  type SourceActivationQueueStatus,
+  type SourceActivationRequest,
   type SourceActivationSchedulerBinding,
+  type SourceActivationSubmission,
 } from "../core/source-activation-queue.js";
 import type { DollyInstanceConfig } from "../core/runtime-config.js";
 import { createExtensionEffectJournalLifecycle } from "./extension-effect-run-lifecycle.js";
@@ -448,8 +452,47 @@ export interface InstalledReactiveModuleHostOptions {
 
 export interface InstalledReactiveModuleHost {
   readonly installedRuntimes: readonly InstalledReactiveModuleRuntime[];
-  readonly sourceActivationQueues: readonly SourceActivationQueue[];
+  /**
+   * The only source/manual request surface returned by installed composition.
+   * It keeps the owning queue private and admits writes only after startup
+   * recovery has reached the Host's running state.
+   */
+  readonly sourceActivations: readonly InstalledSourceActivation[];
   readonly host: ReactiveModuleHost;
+}
+
+/** A read/submit view over one private source queue, gated by Host readiness. */
+export interface InstalledSourceActivation {
+  readonly moduleId: string;
+  readonly privatePageId: string;
+  readonly limits: Readonly<{
+    readonly maxResidentCount: number;
+    readonly maxResidentBytes: number;
+    readonly maxRequestBytes: number;
+  }>;
+  inspect(): SourceActivationQueueStatus;
+  submit(input: SourceActivationRequest): SourceActivationSubmission;
+}
+
+function sourceActivationAdmission(
+  queue: SourceActivationQueue,
+  host: ReactiveModuleHost,
+): InstalledSourceActivation {
+  return Object.freeze({
+    moduleId: queue.moduleId,
+    privatePageId: queue.privatePageId,
+    limits: queue.limits,
+    inspect: () => queue.inspect(),
+    submit: (input: SourceActivationRequest) => {
+      if (host.state !== "running") {
+        throw new SourceActivationQueueError(
+          "SOURCE_ACTIVATION_ADMISSION_CLOSED",
+          `Source activation Module ${queue.moduleId} is not running`,
+        );
+      }
+      return queue.submit(input);
+    },
+  });
 }
 
 /**
@@ -659,7 +702,9 @@ export function composeInstalledReactiveModuleHost(
   });
   return Object.freeze({
     installedRuntimes: Object.freeze(installedRuntimes),
-    sourceActivationQueues: Object.freeze(orderedSourceActivationQueues),
+    sourceActivations: Object.freeze(
+      orderedSourceActivationQueues.map((queue) => sourceActivationAdmission(queue, host)),
+    ),
     host,
   });
 }

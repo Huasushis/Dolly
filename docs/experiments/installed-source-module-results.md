@@ -62,3 +62,37 @@ schema.
 `RUNTIME_MODULE_MIGRATION_REQUIRED`. This evidence supports the Source
 composition and Scheduler path; it is not authorization to remove that safety
 condition.
+
+## Startup and shutdown admission regression
+
+The first candidate composition returned the owning `SourceActivationQueue`
+directly. A caller could therefore persist a manual or external request while
+the Host was still `created` or `recovering`, even though the readiness
+contract requires ingress to remain closed. The regression test first failed
+because no guarded submission surface existed.
+
+Installed composition now keeps the queue private. It returns a bounded
+read/submit view that checks the Host's actual state and accepts only
+`running`; all other lifecycle states reject before the queue can mutate Core
+state. The component counterexample proves that `created` rejects without
+adding a resident request. The Linux Source case proves that `running` admits
+and executes one request, and that the same view rejects a new request after
+the Host reaches `stopped`.
+
+The exact regression run used container
+`dolly-experiment-2872890-4a2ae6aa`; the runner removed that container and its
+exact image, and post-run inspection found both absent. All five installed-host
+cases passed, including startup capacity recovery and the registered-tool Agent
+whose four model calls all used strict provider streaming.
+
+Evidence is stored under
+`artifacts/experiments/linux-core-service-ownership/container-2872890-20260812T113535Z`:
+
+- `linux-integration.log`: `4d9b92834f40f3c1eba63e0f368f7075073bb4fb87f9fb40cb969b335fe1dafb`
+- `environment.txt`: `4c66ed875461b8796fc11fdb7f45f40d4d34a120b081b8afa1e6977bd942d3d5`
+- `preflight.txt`: `ecf7fce3780e2b756cfc847409343f9dc3196b8e6f9da072679da4c713411c36`
+- `source-snapshot.txt`: `f29a8edfeb13a57a80083bc82a8adf793bef64fb77af5d5a1818d6cdad3e8770`
+
+This closes the candidate Source submission bypass, but it still does not add
+authentication, a network listener, persistent source limits, or bounded
+idempotency retention. Those remain prerequisites for public Source ingress.

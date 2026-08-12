@@ -2090,8 +2090,12 @@ constructs the queue from the
 same FileCore store, and passes its private Page to both
 `ReactiveModuleRuntime` and Scheduler through the authenticated binding. Source
 queue limits remain explicit composition inputs because instance schema version
-9 cannot persist them. The composition exposes the queue for a future trusted
-ingress owner; it does not itself open manual or external ingress. A configured
+9 cannot persist them. The composition keeps the owning queue private and
+exposes only a source activation submission boundary for a future trusted
+ingress owner. That boundary accepts a request only while the candidate Host
+reports `running`; `created`, `starting`, `recovering`, `stopping`, `stopped`,
+and `failed` all reject before any Core-state mutation. It does not itself
+authenticate or open manual or external ingress. A configured
 periodic source is rejected before queue reconciliation because no automatic
 producer yet turns clock eligibility into a durable request.
 
