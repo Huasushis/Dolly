@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
+import { InstalledModulePermissionPolicyRegistry } from "../../../src/adapters/installed-module-permission-policy.js";
 import { isJsonObject, type JsonValue } from "../../../src/core/canonical-json.js";
 import {
   ExtensionIsolationPolicy,
@@ -10,15 +11,21 @@ import {
 } from "../../../src/core/extension-process-host.js";
 import type { ExtensionPackageManifest } from "../../../src/core/extension-installation-registry.js";
 import { FileToolJournalRepository } from "../../../src/core/file-tool-journal-repository.js";
-import { createToolInvocationCapabilityV2 } from "../../../src/core/provider-capabilities/index.js";
+import type { InstalledExtensionModule } from "../../../src/core/installed-extension-module.js";
+import type { ChatBrokerInvocation } from "../../../src/core/model-provider-broker.js";
+import { ModelDescriptorRegistry } from "../../../src/core/model-provider-descriptor.js";
 import {
-  ToolPolicySession,
   ToolRegistry,
   type ToolDescriptor,
   type ToolExecutionOutcome,
   type ToolExecutionRequest,
   type ToolTurnBudget,
 } from "../../../src/core/tool-policy.js";
+import {
+  CHAT_STRATEGIES,
+  chatDescriptor,
+  objectFormReasoning,
+} from "../model-provider/fixtures.js";
 
 const EXTENSION = fileURLToPath(
   new URL(
@@ -260,76 +267,43 @@ describe("general Agent tool-registry Extension", () => {
         };
       },
     );
-    const toolCapability = createToolInvocationCapabilityV2({
-      executionScope: "active-run",
-      expiresAt: "2099-01-01T00:00:00.000Z",
-      limits: { maxInvocations: 12, maxInvocationsPerRun: 3, maxCallsPerRound: 1 },
-      resolveRun: ({ moduleJobId }) => ({
-        registry,
-        budget: BUDGET,
-        policy: new ToolPolicySession({
-          moduleJobId,
-          registry,
-          repository: toolJournalRepository,
-          approval: { decide: vi.fn() },
-          executor: { execute },
-          budget: BUDGET,
-          approvalPolicyRevision: "policy-1",
-        }),
-      }),
-    });
-    host.grantCapability(toolCapability.grant, toolCapability.handler);
-
     const modelRounds = new Map<string, number>();
     const prompts: string[] = [];
     const outputContracts: unknown[] = [];
-    host.grantCapability(
-      {
-        capabilityType: "model-operation",
-        capabilityVersion: "v2",
-        operations: ["chat", "describe"],
-        resourceScope: {
-          executionScope: "active-run",
-          model: "fake",
-          outputContracts: ["text", "json-object"],
-        },
-        expiresAt: "2099-01-01T00:00:00.000Z",
-        maxInvocations: 21,
-        maxConcurrentInvocations: 1,
-        maxArgumentBytes: 128 * 1024,
-        maxResultBytes: 128 * 1024,
-        requireIdempotencyKey: true,
+    const streams: boolean[] = [];
+    const descriptors = new ModelDescriptorRegistry({
+      schemaDigest: `sha256:${"7".repeat(64)}`,
+      allowedStrategyIds: CHAT_STRATEGIES,
+    });
+    const baseDescriptor = chatDescriptor({
+      jsonObjectOutput: "supported",
+      reasoning: objectFormReasoning(),
+    });
+    const modelDescriptor = descriptors.register({
+      ...baseDescriptor,
+      features: {
+        ...baseDescriptor.features,
+        maxOutputTokens: { state: "supported", value: { maximum: 8_192 } },
       },
-      async (argumentsValue, context): Promise<JsonValue> => {
-        if (context.operation === "describe") {
-          return {
-            schemaVersion: "dolly.model-operation-description/2",
-            modality: "chat",
-            outputContracts: ["json-object", "text"],
-          };
-        }
-        if (!isJsonObject(argumentsValue)) throw new Error("model arguments are not an object");
-        outputContracts.push(argumentsValue.outputContract);
-        const messages = argumentsValue.messages;
-        if (!Array.isArray(messages) || !isJsonObject(messages[0])) {
-          throw new Error("model messages are absent");
-        }
-        const parts = messages[0].parts;
-        if (!Array.isArray(parts) || !isJsonObject(parts[0])) {
-          throw new Error("model message parts are absent");
-        }
-        const prompt = parts[0].text;
-        if (typeof prompt !== "string") throw new Error("model prompt is absent");
-        prompts.push(prompt);
-        if (context.moduleJobId === undefined) throw new Error("active Module job is absent");
-        const modelRound = (modelRounds.get(context.moduleJobId) ?? 0) + 1;
-        modelRounds.set(context.moduleJobId, modelRound);
-        const duplicateRead = context.moduleJobId === "module-job-duplicate";
-        const stuckRead = context.moduleJobId === "module-job-stuck";
-        const finalContent =
-          modelRound === 1
-            ? "Discover the available keys, read the active note, then answer with its source."
-            : modelRound === 2
+    });
+    descriptors.setStatus(modelDescriptor, "active");
+    let modelRequest = 0;
+    const invokeModel = vi.fn(async (invocation: ChatBrokerInvocation) => {
+      outputContracts.push(invocation.input.outputContract);
+      streams.push(invocation.input.stream);
+      const firstPart = invocation.input.messages[0]?.parts[0];
+      if (firstPart?.kind !== "text") throw new Error("model prompt is absent");
+      prompts.push(firstPart.text);
+      const moduleJobId = invocation.context.moduleJobId;
+      if (moduleJobId === undefined) throw new Error("active Module job is absent");
+      const modelRound = (modelRounds.get(moduleJobId) ?? 0) + 1;
+      modelRounds.set(moduleJobId, modelRound);
+      const duplicateRead = moduleJobId === "module-job-duplicate";
+      const stuckRead = moduleJobId === "module-job-stuck";
+      const finalContent =
+        modelRound === 1
+          ? "Discover the available keys, read the active note, then answer with its source."
+          : modelRound === 2
             ? JSON.stringify({ action: "alpha_discover", arguments: { prefix: "", limit: 3 } })
             : modelRound === 3
               ? JSON.stringify(duplicateRead || stuckRead
@@ -343,26 +317,92 @@ describe("general Agent tool-registry Extension", () => {
                   action: "answer",
                   answer: "The active deployment codename is EMBER-7421.",
                   grounded: true,
-                  evidenceKeys: context.moduleJobId === "module-job-ungrounded"
+                  evidenceKeys: moduleJobId === "module-job-ungrounded"
                     ? ["alpha_discover", "beta_read"]
                     : ["deployment-note"],
-                });
-        const reasoning: JsonValue =
-          modelRound === 1
-            ? { state: "observed", parts: ["Inspect the registry before acting."] }
-            : { state: "not-observed" };
-        return {
-          schemaVersion: "dolly.model-operation-result/1",
-          operation: "chat",
-          status: "succeeded",
-          output: {
-            finalContent,
-            finishReason: "stop",
-            reasoning,
-          },
-        };
+              });
+      const reasoning =
+        modelRound === 1
+          ? { state: "observed" as const, parts: ["Inspect the registry before acting."] }
+          : { state: "not-observed" as const };
+      return {
+        schemaVersion: "dolly.model-result/2" as const,
+        requestId: invocation.requestId,
+        operationId: invocation.context.operationId,
+        descriptor: invocation.descriptor,
+        status: "succeeded" as const,
+        output: {
+          schemaVersion: "dolly.model.chat-output/1" as const,
+          finalContent,
+          reasoning,
+          toolCalls: [],
+          finishReason: "stop",
+        },
+        usage: { providerAttempts: 1, observations: [] },
+      };
+    });
+    const policies = new InstalledModulePermissionPolicyRegistry({
+      nextRequestId: () => `installed-agent-model-request-${++modelRequest}`,
+      policies: [{
+        kind: "strict-streaming-chat",
+        policyId: "model.owner-primary",
+        descriptor: modelDescriptor,
+        ownerScope: "owner-1",
+        budgets: {
+          maxProviderAttempts: 1,
+          maxWallTimeMs: 30_000,
+          maxRequestBytes: 128 * 1024,
+          maxResponseBytes: 128 * 1024,
+          maxInputItems: 64,
+          maxInputBytes: 64 * 1024,
+          maxOutputBytes: 64 * 1024,
+          maxOutputTokens: 5_200,
+        },
+        chat: { invoke: invokeModel },
+        outputContracts: ["text", "json-object"],
+        reasoningPolicies: ["require", "disable"],
+        roles: ["system", "user"],
+        limits: {
+          maxInvocations: 32,
+          maxInvocationsPerRun: 8,
+          maxInvocationsPerWindow: 32,
+          rateWindowMs: 60_000,
+        },
+        capabilityLifetimeMs: 60_000,
+      }, {
+        kind: "registered-tools",
+        policyId: "tools.owner-memory",
+        registry,
+        repository: toolJournalRepository,
+        executor: { execute },
+        budget: BUDGET,
+        approvalPolicyRevision: "policy-1",
+        limits: {
+          maxInvocations: 16,
+          maxInvocationsPerRun: 4,
+          maxCallsPerRound: 1,
+          maxArgumentBytes: 8 * 1024,
+          maxResultBytes: 16 * 1024,
+        },
+        capabilityLifetimeMs: 60_000,
+      }],
+    });
+    policies.setupFor({
+      instanceId: "instance-a",
+      installation: {
+        manifest: MANIFEST,
+        packageDigest: `sha256:${"a".repeat(64)}`,
       },
-    );
+      module: {
+        moduleId: "module-a",
+        permissionPolicyIds: ["model.owner-primary", "tools.owner-memory"],
+        configurationReference: {
+          configId: "agent-config",
+          revision: `sha256:${"b".repeat(64)}`,
+          configVersion: 1,
+        },
+      },
+    } as unknown as InstalledExtensionModule).configureHost(host);
 
     const execution = (
       moduleJobId: string,
@@ -449,6 +489,8 @@ describe("general Agent tool-registry Extension", () => {
       expect(prompts[0]).toContain('"maximum":3');
       expect(prompts[0]).toContain("alpha_discover");
       expect(prompts[0]).toContain("successResultSchema");
+      expect(invokeModel).toHaveBeenCalledTimes(17);
+      expect(streams).toEqual(Array.from({ length: 17 }, () => true));
       expect(outputContracts).toEqual([
         { kind: "text" },
         { kind: "json-object" },

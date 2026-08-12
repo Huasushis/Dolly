@@ -369,7 +369,7 @@ export class InstalledModulePermissionPolicySetup {
         expiresAt,
         now: () => new Date(this.#now()).toISOString(),
         chat: policy.chat,
-        operations: ["chat"],
+        operations: ["chat", "describe"],
         reasoningPolicies: policy.reasoningPolicies,
         allowStreaming: true,
         requireStreaming: true,
