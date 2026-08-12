@@ -535,14 +535,39 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         .toHaveLength(0);
       expect(coreState.store.deliveries.inspectResident(DRAINER_MODULE_ID, ["output"]))
         .toMatchObject({ residentCount: 1, pendingCount: 0, claimedCount: 1 });
-      expect(await waitFor(
+      const capacityReleased = await waitFor(
         () =>
           repository.list().length === 5 &&
           repository.list().every((record) => record.state === "committed") &&
           actorRunCount(SECOND_MODULE_ID) === 2 &&
           actorRunCount(DRAINER_MODULE_ID) === 2,
         15_000,
-      )).toBe(true);
+      );
+      if (!capacityReleased) {
+        console.info(JSON.stringify({
+          diagnostic: "scheduler-capacity-release-timeout",
+          actorRuns: {
+            [FIRST_MODULE_ID]: actorRunCount(FIRST_MODULE_ID),
+            [SECOND_MODULE_ID]: actorRunCount(SECOND_MODULE_ID),
+            [DRAINER_MODULE_ID]: actorRunCount(DRAINER_MODULE_ID),
+          },
+          resultCommits: repository.list().map((record) => ({
+            source: record.source,
+            state: record.state,
+            outputPageIds: record.outputPageIds,
+          })),
+          middle: coreState.store.deliveries.inspectResident(
+            SECOND_MODULE_ID,
+            ["middle"],
+          ),
+          output: coreState.store.deliveries.inspectResident(
+            DRAINER_MODULE_ID,
+            ["output"],
+          ),
+          schedulerEvents: events.slice(-30),
+        }));
+      }
+      expect(capacityReleased).toBe(true);
       expect(events).toContainEqual(expect.objectContaining({
         type: "scheduler.backpressure_exited",
         moduleId: SECOND_MODULE_ID,
