@@ -23,6 +23,7 @@ import { ExtensionIsolationPolicy, ExtensionProcessHost } from "../../../../src/
 import { FileCoreStateStore, createFileCoreStateStoreWithStoppedRecordWriter } from "../../../../src/core/file-core-state-store.js";
 import { FileMediaByteStore } from "../../../../src/core/file-media-byte-store.js";
 import { FileModuleResultCommitRepository } from "../../../../src/core/file-module-result-commit-repository.js";
+import { deriveModuleCgroupPath } from "../../../../src/core/linux-module-cgroup.js";
 import { createDeliveredModelMediaResolver } from "../../../../src/core/media-capability/index.js";
 import { EndpointBindingRegistry } from "../../../../src/core/model-provider-binding.js";
 import {
@@ -284,9 +285,9 @@ if (
   process.env.RUN_PAID_INTEGRATION !== "1" ||
   process.argv.length !== 4 ||
   runIdIndex !== 2 ||
-  !/^live-v1-[a-z0-9][a-z0-9-]{0,63}$/u.test(runId ?? "")
+  !/^live-v2-[a-z0-9][a-z0-9-]{0,63}$/u.test(runId ?? "")
 ) {
-  throw new Error("usage requires live/paid opt-in and --run-id live-v1-<unique-suffix>");
+  throw new Error("usage requires live/paid opt-in and --run-id live-v2-<unique-suffix>");
 }
 
 const artifactDirectory = join(ARTIFACT_ROOT, runId!);
@@ -319,10 +320,12 @@ let processGenerationId: string | undefined;
 let extensionHost: ExtensionProcessHost | undefined;
 let host: ReactiveModuleHost | undefined;
 let childPid: number | undefined;
+let executorStartFailure: string | undefined;
 let apiKey = "";
 let secretReleases = 0;
 let stopped = false;
 let completed = false;
+let transportObservation: Record<string, unknown> | undefined;
 
 try {
   const now = () => new Date().toISOString();
@@ -411,6 +414,7 @@ try {
   bindings.setStatus(bindingRef, "active");
   apiKey = readPrivateEnvironment("AETHER_API_KEY");
   const transport = new ObservedStreamingTransport(new NodeModelHttpTransport());
+  transportObservation = transport.observation;
   const mediaResolver: ModelMediaResolver = {
     resolve: async (request, options) => {
       const snapshot = extensionHost?.snapshot;
@@ -509,109 +513,119 @@ try {
     nextModuleGenerationId: () => `${moduleGenerationId}-unused`,
     monotonicNow: () => ++monotonic,
     createExecutor: (generationId) => {
-      extensionHost = new ExtensionProcessHost({
-        isolation: "process",
-        trust: "trusted",
-        isolationPolicy: new ExtensionIsolationPolicy(),
-        manifest: {
-          schemaVersion: "dolly.extension-package/1",
-          extensionId: "org.dolly.scheduler-inline-media-agent-live",
-          packageVersion: "1.0.0",
-          displayName: "Scheduler inline Media Agent live fixture",
-          description: "Uses only a Host-selected model-operation/v3 capability.",
-          supportedProtocolVersions: ["3.0"],
-          entrypoint: "extension.mjs",
-          modules: [{
-            moduleKind: "general-agent",
-            activation: "reactive",
+      try {
+        extensionHost = new ExtensionProcessHost({
+          isolation: "process",
+          trust: "trusted",
+          isolationPolicy: new ExtensionIsolationPolicy(),
+          manifest: {
+            schemaVersion: "dolly.extension-package/1",
+            extensionId: "org.dolly.scheduler-inline-media-agent-live",
+            packageVersion: "1.0.0",
+            displayName: "Scheduler inline Media Agent live fixture",
+            description: "Uses only a Host-selected model-operation/v3 capability.",
+            supportedProtocolVersions: ["3.0"],
+            entrypoint: "extension.mjs",
+            modules: [{
+              moduleKind: "general-agent",
+              activation: "reactive",
+              configVersion: 1,
+              configurationSchema: { type: "object" },
+            }],
+            requestedCapabilities: [],
+          },
+          command: process.execPath,
+          args: [EXTENSION_PATH],
+          workingDirectory: conditionRoot,
+          instanceId,
+          moduleId,
+          moduleGenerationId: generationId,
+          moduleKind: "general-agent",
+          config: {},
+          maxFrameBytes: 1024 * 1024,
+          maxConcurrentCapabilityRequests: 1,
+          initializationTimeoutMs: 10_000,
+          shutdownRequestTimeoutMs: 2_000,
+          forceKillDelayMs: 500,
+          terminationTimeoutMs: 10_000,
+          nextIdentifier: (purpose) => `${purpose}-scheduler-media-${++identifierSequence}`,
+          effectRunLifecycle,
+        });
+        const snapshot = extensionHost.snapshot;
+        processGenerationId = snapshot.processGenerationId;
+        core.appendModuleProcessRecord({
+          schemaVersion: "dolly.module-process-record/1",
+          instanceId,
+          moduleId,
+          moduleGenerationId: generationId,
+          processGenerationId,
+          packageDigest: `sha256:${"a".repeat(64)}`,
+          configurationReference: {
+            configId: "scheduler-media-live-config",
+            revision: `sha256:${"b".repeat(64)}`,
             configVersion: 1,
-            configurationSchema: { type: "object" },
-          }],
-          requestedCapabilities: [],
-        },
-        command: process.execPath,
-        args: [EXTENSION_PATH],
-        workingDirectory: conditionRoot,
-        instanceId,
-        moduleId,
-        moduleGenerationId: generationId,
-        moduleKind: "general-agent",
-        config: {},
-        maxFrameBytes: 1024 * 1024,
-        maxConcurrentCapabilityRequests: 1,
-        initializationTimeoutMs: 10_000,
-        shutdownRequestTimeoutMs: 2_000,
-        forceKillDelayMs: 500,
-        terminationTimeoutMs: 10_000,
-        nextIdentifier: (purpose) => `${purpose}-scheduler-media-${++identifierSequence}`,
-        effectRunLifecycle,
-      });
-      const snapshot = extensionHost.snapshot;
-      processGenerationId = snapshot.processGenerationId;
-      core.appendModuleProcessRecord({
-        schemaVersion: "dolly.module-process-record/1",
-        instanceId,
-        moduleId,
-        moduleGenerationId: generationId,
-        processGenerationId,
-        packageDigest: `sha256:${"a".repeat(64)}`,
-        configurationReference: {
-          configId: "scheduler-media-live-config",
-          revision: `sha256:${"b".repeat(64)}`,
-          configVersion: 1,
-        },
-        declaredExternalEffects: "unrestricted",
-        serviceInvocationId: "4".repeat(32),
-        bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
-        moduleCgroupPath: "/candidate/no-cgroup-proof",
-        state: "starting",
-        createdAt: now(),
-        updatedAt: now(),
-      });
-      const capability = createModelOperationCapabilityV3({
-        descriptor: descriptorRef,
-        ownerScope: "owner-live-fixture",
-        budgets: {
-          maxProviderAttempts: 1,
-          maxWallTimeMs: 1_800_000,
-          maxRequestBytes: 2_000_000,
-          maxResponseBytes: 2_000_000,
-          maxInputItems: 16,
-          maxInputBytes: 1_500_000,
-          maxOutputBytes: 512_000,
-          maxOutputTokens: 1_200,
-          maxMediaItems: 1,
-          maxResolvedMediaBytes: image.byteLength,
-        },
-        executionScope: "active-run",
-        expiresAt: new Date(Date.now() + 2 * 60 * 60_000).toISOString(),
-        now,
-        chat: { invoke: (invocation, options) => broker.invoke(invocation, options) },
-        operations: ["chat", "describe"],
-        reasoningPolicies: ["disable"],
-        allowStreaming: true,
-        requireStreaming: true,
-        roles: ["user"],
-        limits: {
-          maxInvocations: 1,
-          maxInvocationsPerRun: 1,
-          maxInvocationsPerWindow: 1,
-          rateWindowMs: 60_000,
-        },
-        maxConcurrentInvocations: 1,
-        requireIdempotencyKey: true,
-        nextRequestId: () => `scheduler-media-model-request-${++modelRequestSequence}`,
-        outputContracts: ["json-object"],
-        mediaRequirementIds: ["aether-inline-png-v0"],
-      });
-      extensionHost.grantCapability(capability.grant, capability.handler);
-      const executor = createExtensionProcessModuleExecutor(extensionHost, {
-        moduleId,
-        moduleGenerationId: generationId,
-        executionTimeoutMs: 1_800_000,
-        cancellationGraceMs: 5_000,
-      });
-      return executor;
+          },
+          declaredExternalEffects: "unrestricted",
+          serviceInvocationId: "4".repeat(32),
+          bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
+          moduleCgroupPath: deriveModuleCgroupPath(
+            "/sys/fs/cgroup/system.slice/dolly-core.service",
+            { instanceId, moduleId, processGenerationId },
+          ).filesystemPath,
+          state: "starting",
+          createdAt: now(),
+          updatedAt: now(),
+        });
+        const capability = createModelOperationCapabilityV3({
+          descriptor: descriptorRef,
+          ownerScope: "owner-live-fixture",
+          budgets: {
+            maxProviderAttempts: 1,
+            maxWallTimeMs: 1_800_000,
+            maxRequestBytes: 2_000_000,
+            maxResponseBytes: 2_000_000,
+            maxInputItems: 16,
+            maxInputBytes: 1_500_000,
+            maxOutputBytes: 512_000,
+            maxOutputTokens: 1_200,
+            maxMediaItems: 1,
+            maxResolvedMediaBytes: image.byteLength,
+          },
+          executionScope: "active-run",
+          expiresAt: new Date(Date.now() + 2 * 60 * 60_000).toISOString(),
+          now,
+          chat: { invoke: (invocation, options) => broker.invoke(invocation, options) },
+          operations: ["chat", "describe"],
+          reasoningPolicies: ["disable"],
+          allowStreaming: true,
+          requireStreaming: true,
+          roles: ["user"],
+          limits: {
+            maxInvocations: 1,
+            maxInvocationsPerRun: 1,
+            maxInvocationsPerWindow: 1,
+            rateWindowMs: 60_000,
+          },
+          maxConcurrentInvocations: 1,
+          requireIdempotencyKey: true,
+          nextRequestId: () => `scheduler-media-model-request-${++modelRequestSequence}`,
+          outputContracts: ["json-object"],
+          mediaRequirementIds: ["aether-inline-png-v0"],
+        });
+        extensionHost.grantCapability(capability.grant, capability.handler);
+        const executor = createExtensionProcessModuleExecutor(extensionHost, {
+          moduleId,
+          moduleGenerationId: generationId,
+          executionTimeoutMs: 1_800_000,
+          cancellationGraceMs: 5_000,
+        });
+        return executor;
+      } catch (error) {
+        executorStartFailure = error instanceof Error
+          ? `${error.name}: ${error.message}`
+          : "non-Error executor construction failure";
+        throw error;
+      }
     },
     classifyFailure: (failure: ReactiveModuleFailure) => ({ code: failure.code, retryable: false }),
   });
@@ -621,7 +635,16 @@ try {
     },
     tick: (limits) => runtime.tick(limits),
     start: async () => {
-      await runtime.start();
+      try {
+        await runtime.start();
+      } catch (error) {
+        const actorFailure = error instanceof Error ? error.message : "unknown actor failure";
+        throw new Error(
+          executorStartFailure === undefined
+            ? actorFailure
+            : `${actorFailure}; executor cause: ${executorStartFailure}`,
+        );
+      }
       if (!processGenerationId) throw new Error("process generation was not recorded");
       core.updateModuleProcessRecordState(processGenerationId, "running");
       childPid = extensionHost?.snapshot.pid;
@@ -784,6 +807,25 @@ try {
     status: "succeeded",
     exactImageAnswer: true,
   })}\n`);
+} catch (error) {
+  apiKey = "";
+  writeJson(join(artifactDirectory, "failure.json"), {
+    schemaVersion: "dolly.scheduler-inline-media-agent-live-failure/1",
+    experimentId: preregistration.experimentId,
+    experimentVersion: preregistration.experimentVersion,
+    runId,
+    status: "failed",
+    errorName: error instanceof Error ? error.name : "unknown",
+    errorMessage: error instanceof Error ? error.message : "non-Error failure",
+    executorStartFailure: executorStartFailure ?? null,
+    requestWire: transportObservation ?? null,
+    childPidRecorded: childPid !== undefined,
+    childAliveAtFailure: childPid !== undefined && processIsAlive(childPid),
+    scratchRetained: relative(WORKSPACE_ROOT, conditionRoot),
+    endpointRecorded: false,
+    credentialRecorded: false,
+  });
+  throw error;
 } finally {
   apiKey = "";
   if (!stopped && host !== undefined && host.state !== "stopped") {
