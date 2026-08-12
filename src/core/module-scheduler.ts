@@ -22,6 +22,11 @@ import {
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
+/** Module identifiers are restricted to ASCII; never let host ICU choose execution order. */
+function compareModuleIds(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 /**
  * The scheduler run loop. Section 13.1 of the Core runtime contract splits
  * correctness from policy: the Module actor owns serialization, claims, run
@@ -1278,7 +1283,7 @@ export class ModuleScheduler {
     const now = this.#clock.monotonicNow();
     return deepFreeze(
       [...this.#entries.values()]
-        .sort((left, right) => left.moduleId.localeCompare(right.moduleId))
+        .sort((left, right) => compareModuleIds(left.moduleId, right.moduleId))
         .map((entry) => this.#statusOf(entry, now)),
     );
   }
@@ -1357,7 +1362,7 @@ export class ModuleScheduler {
             candidate.inputPageIds.some((pageId) => outputs.has(pageId)),
         )
         .map((candidate) => candidate.moduleId)
-        .sort();
+        .sort(compareModuleIds);
     }
   }
 
@@ -1436,7 +1441,7 @@ export class ModuleScheduler {
   #runPass(): void {
     const now = this.#clock.monotonicNow();
     const entries = [...this.#entries.values()].sort((left, right) =>
-      left.moduleId.localeCompare(right.moduleId),
+      compareModuleIds(left.moduleId, right.moduleId),
     );
     if (entries.length === 0) return;
 

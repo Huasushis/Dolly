@@ -567,6 +567,44 @@ describe("CORE scheduler run loop serialization", () => {
     await scheduler.stop();
   });
 
+  it.each([
+    ["uppercase-first", ["A", "a"]],
+    ["lowercase-first", ["a", "A"]],
+  ] as const)(
+    "uses one registration-independent code-unit order for the first concurrency slot (%s)",
+    async (_name, registrationOrder) => {
+      const { clock, mailboxes, scheduler } = createScheduler({ maxConcurrentModules: 1 });
+      const runtimes = new Map([
+        ["A", new FakeModuleRuntime()],
+        ["a", new FakeModuleRuntime()],
+      ]);
+      for (const moduleId of registrationOrder) {
+        mailboxes.set(moduleId, 1, 100);
+        scheduler.register({
+          moduleId,
+          runtime: runtimes.get(moduleId)!,
+          inputPageIds: [`page-${moduleId}`],
+          outputPageIds: [],
+          mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
+        });
+      }
+
+      scheduler.start();
+      await drain(clock);
+      try {
+        expect(runtimes.get("A")!.tickCount).toBe(1);
+        expect(runtimes.get("a")!.tickCount).toBe(0);
+        expect(scheduler.statuses().map((status) => status.moduleId)).toEqual(["A", "a"]);
+      } finally {
+        const stopping = scheduler.stop();
+        for (const runtime of runtimes.values()) {
+          while (runtime.waiting.length > 0) runtime.settle({ status: "idle" });
+        }
+        await stopping;
+      }
+    },
+  );
+
   it("rotates dispatch order so a concurrency cap cannot starve one Module", async () => {
     const { clock, mailboxes, scheduler } = createScheduler({ maxConcurrentModules: 1 });
     const runtimes = new Map<string, FakeModuleRuntime>();
