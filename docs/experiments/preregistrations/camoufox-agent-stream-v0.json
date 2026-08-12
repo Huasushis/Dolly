@@ -1,0 +1,119 @@
+{
+  "experimentId": "camoufox-agent-stream-v0",
+  "version": 1,
+  "status": "frozen-before-live-model-and-browser-execution",
+  "frozenAtUtc": "2026-08-12T14:45:00Z",
+  "scope": "A bounded Linux effect demonstration using the owner's optional Aether model fixture, a real Model Context Protocol client, Microsoft Playwright MCP, and Camoufox. It is not product support and does not authorize removing Dolly's Module startup refusal.",
+  "question": "Can qwen3.6-27b, using only a goal and host-selected browser tool descriptions, choose streamed tool calls that drive a fresh local Camoufox page to the exact target state and take screenshots in three independent sessions?",
+  "hypotheses": {
+    "null": "Fewer than three of three sessions reach the independently read exact state, use the required browser operations, take at least two valid screenshots, satisfy the strict streaming contract, or leave no recorded child process alive.",
+    "alternative": "All three sessions independently reach the exact state, use every required browser operation, take at least two valid screenshots, satisfy the strict streaming contract on every model response, and leave no recorded child process alive."
+  },
+  "baselineEvidence": {
+    "run": "artifacts/experiments/probes/camoufox-mcp-v0/confirmation-v2-20260810a",
+    "finding": "The same local page and exact browser stack already passed three scripted MCP repetitions and three direct Camoufox repetitions. This experiment tests only the missing model-selected action layer.",
+    "notReusedAsAgentEvidence": "Scripted action traces and their pass booleans do not count as model-selected action evidence."
+  },
+  "data": {
+    "fixture": "scripts/experiments/probes/camoufox-mcp-v0/fixture/index.html",
+    "fixtureSha256": "91e7eb7181f722586c80e07374af481a245227e3814e16062d844b534fd7b827",
+    "externalWebsites": [],
+    "targetState": {
+      "inputText": "AGENT-TARGET-4821",
+      "appliedCount": 1,
+      "bottomCount": 1,
+      "recoveredCount": 1
+    }
+  },
+  "backend": {
+    "endpoint": "AETHER_BASE_URL from repository .env; the URL and credential are never persisted",
+    "model": "qwen3.6-27b",
+    "reasoning": {
+      "request": {"thinking": {"type": "enabled"}},
+      "forbidden": ["enable_thinking"],
+      "evidence": "Only a non-empty reasoning_content in that response proves reasoning for that response. The exact synthetic-task reasoning is retained so an independent verifier can check that claim."
+    }
+  },
+  "generationTransport": {
+    "route": "OpenAI-compatible /v1/chat/completions",
+    "request": {
+      "stream": true,
+      "stream_options": {"include_usage": true},
+      "max_tokens": 8192,
+      "temperature": "omitted; provider default is not claimed",
+      "timeoutMs": 1200000
+    },
+    "strictSuccess": "HTTP 200 text/event-stream, bounded valid UTF-8, stable response id and model, one finish reason, exactly one terminal usage event, exactly one [DONE], and no bytes after [DONE]. There is no non-stream fallback.",
+    "retry": "At most two attempts per logical call. Only failure before response headers, HTTP 408/425/429/5xx, or the local 20-minute timeout may retry. Any HTTP 200 stream, content, or tool-call error is retained and never retried.",
+    "gatewayObservation": "The owner reported on 2026-08-12 that the prior nginx 120-second gateway timeout was replaced by 24 hours. The experiment still enforces its independent 20-minute per-request bound."
+  },
+  "agent": {
+    "goal": "Navigate to the supplied local page. Use the page to discover the target text. Take a screenshot before changing state and another after completing it. Enter the target exactly, apply exactly once, activate Bottom exactly once, activate Recover exactly once, preserve the page, and then report completion.",
+    "actionSelection": "The harness supplies the goal, fresh loopback URL, selected tool descriptions, and actual tool results. It supplies no selector, target reference, action order, or hidden state. Model tool calls are validated and forwarded unchanged after validation.",
+    "allowedTools": [
+      "browser_navigate",
+      "browser_snapshot",
+      "browser_take_screenshot",
+      "browser_type",
+      "browser_click"
+    ],
+    "requiredToolsPerCase": [
+      "browser_navigate",
+      "browser_snapshot",
+      "browser_take_screenshot",
+      "browser_type",
+      "browser_click"
+    ],
+    "hostOnlyOracle": "After the model stops, the harness calls browser_evaluate only to read window.__probeRead(). That call is not exposed to the model and cannot change state.",
+    "screenshotMinimum": 2,
+    "maximumRounds": 8,
+    "maximumToolCalls": 16
+  },
+  "execution": {
+    "platform": "Ubuntu 24.04 Linux x86_64",
+    "dependencyRoot": "/home/ubuntu/codex-dolly/.tools/camoufox-mcp-v0",
+    "repetitions": 3,
+    "caseIds": ["agent-r1", "agent-r2", "agent-r3"],
+    "fixedOrder": [1, 2, 3],
+    "maximumLogicalModelCalls": 24,
+    "maximumRequestAttempts": 48,
+    "maximumWallClockMs": 10800000,
+    "network": "The browser uses only an ephemeral 127.0.0.1 page. The only non-loopback request is the configured Aether origin. No object storage, public website, or other provider is used.",
+    "processRule": "Record exact process id plus Linux start ticks for every child. Stop only those identities; never scan by name or prefix."
+  },
+  "metrics": {
+    "primary": [
+      "independently valid complete cases out of three",
+      "exact page state per case",
+      "required tool inventory and required model-selected operations per case",
+      "valid model-selected PNG screenshots per case",
+      "strict streamed model responses out of all logical calls",
+      "recorded child process identities left alive at finalization"
+    ],
+    "diagnostic": [
+      "model requests, attempts, prompt/completion tokens, reasoning_content presence, tool calls, wall time, and provider finish reasons per case"
+    ],
+    "minimumEffectiveDifference": "One complete case out of three. Anything smaller cannot change this demonstration's decision."
+  },
+  "stopRules": [
+    "Run all three cases unless two consecutive browser/MCP initialization failures occur, the global model-call or wall-clock budget is exhausted, a secret would be persisted, or an unplanned network origin is requested.",
+    "Do not repair a model action, synthesize a missing call, or replace MCP with direct browser control.",
+    "Do not retry an HTTP 200 malformed stream, malformed model tool call, denied tool argument, MCP tool error, or wrong final state.",
+    "Preserve every failed run directory; after discovering a runner or verifier defect, version the correction and use a new run id."
+  ],
+  "decision": {
+    "ifAlternative": "Keep the strict-streaming model-to-MCP-to-Camoufox path as a general-Agent research candidate and next connect the same host-owned tool contract to the installed Linux candidate runtime without changing the public Module refusal.",
+    "ifNull": "Do not hand-author the missing action sequence. Classify the failed layer from raw provider, tool, browser, state, and process evidence, then version the smallest changed protocol.",
+    "cannotClaim": [
+      "arbitrary-site reliability, native image understanding, anti-detection quality, browser effect recovery, product support, or cross-platform support",
+      "that Aether or the owner's model is a required Dolly dependency",
+      "that the public Module startup refusal may be removed"
+    ]
+  },
+  "evidence": {
+    "artifactRoot": "artifacts/experiments/probes/camoufox-agent-stream-v0",
+    "requiredPerCase": ["events.jsonl", "model-calls.jsonl", "screenshots/*.png", "case.json"],
+    "runFiles": ["preregistration.json", "run.json", "verification.json", "sha256sums.txt"],
+    "independentValidation": "A separate verifier reads the frozen preregistration, fixture, relevant source bytes, artifacts, PNG bytes, and configured Aether values only for an exact leakage scan. It does not import the runner and does not accept the model's final statement as success."
+  }
+}
