@@ -499,17 +499,20 @@ for recovery rather than automatically retried or dead-lettered. This remains
 true even when the Host has a complete journal of Core-mediated model calls:
 that journal cannot prove that ordinary process code caused no ambient effect.
 
-The candidate boundary now has one deliberately narrow non-empty permission
-path. An immutable in-process permission-policy registry maps the exact
-identifiers selected by the validated Module configuration to a reviewed chat
-descriptor, broker, finite budgets, allowed reasoning modes, roles, and output
-syntax. Its ordinary meaning is a Host-owned table of approved operations; it
-is not Extension configuration. The only accepted policy kind grants
-`model-operation/v2` for the Host-verified active Run, requires a stable
-idempotency key, and requires provider streaming on every chat invocation.
-Non-stream chat is rejected before broker dispatch. Embedding is not included
-in this generation policy and remains a separately measured non-stream
-operation.
+The candidate boundary now has two deliberately narrow non-empty permission
+paths. An immutable in-process permission-policy registry maps the exact
+identifiers selected by the validated Module configuration either to a
+reviewed chat descriptor and broker or to a reviewed read-only `ToolRegistry`.
+Its ordinary meaning is a Host-owned table of approved operations; it is not
+Extension configuration. The chat policy grants `model-operation/v2` for the
+Host-verified active Run, requires a stable idempotency key, and requires
+provider streaming on every chat invocation. Non-stream chat is rejected
+before broker dispatch. Embedding is not included in this generation policy
+and remains a separately measured non-stream operation. The tool policy grants
+`tool-invocation/v2` from the exact executable registry used for Host-side
+argument and result checking, requires a file-backed round journal, and accepts
+only read operations that never request approval. Effectful tools remain
+refused.
 
 A non-empty policy selection additionally requires a direct file-backed effect
 intent store. The installed runtime derives the Host lifecycle from that store
@@ -521,12 +524,16 @@ instance, Module, extension, package digest, configuration revision, and exact
 sorted policy identifiers; replacement process generations receive fresh
 capability definitions and per-Run counters.
 
-This is still a product-before-bootstrap candidate. The approved policy table
-itself is not yet persisted or revisioned, process isolation still permits
-ambient effects, only chat generation is composed, and the installed package
-format still requires an empty requested-capability list so package content
-cannot enlarge authority. The runtime is returned unstarted and product
-bootstrap still does not consume it.
+The disposable Linux integration now proves the combined installed package,
+FileCore, Scheduler, strict-streaming model, registered read-only tool, result
+commit, process record, and whole-control-group stop path for one grounded
+Agent task. Its model broker is deterministic; network SSE is separately
+measured against the owner fixture. This remains a product-before-bootstrap
+candidate. The approved policy table itself is not yet persisted or revisioned,
+process isolation still permits ambient effects, effectful tools remain
+refused, and the installed package format still requires an empty
+requested-capability list so package content cannot enlarge authority. The
+runtime is returned unstarted and product bootstrap still does not consume it.
 
 ### 5.2 Proposed Linux Module process limits
 
