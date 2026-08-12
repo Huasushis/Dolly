@@ -576,16 +576,31 @@ runtime is returned unstarted and product bootstrap still does not consume it.
 The current Linux candidate does not expose the Host root filesystem inside an
 installed process. Its mount namespace contains a read-only `/usr`, private
 `/dev`, `/proc`, `/run`, and `/tmp`, the exact selected Node.js executable at a
-fixed guest path, and the exact installed package at another fixed read-only
-guest path. Host `/etc`, `/home`, `/var`, Core state, configuration stores, and
-other instance data are absent. A real control-group regression places a
-mode-0600 file outside the active Core-state directory and verifies that the
-installed process receives `ENOENT`; this specifically prevents the previous
-read-only-root false boundary, in which same-user private data remained
-readable. This is still recorded as the conservative `unrestricted` external-
-effect boundary: the allowlist has not established a complete security-sandbox
-contract, and package bytes are not yet bound to an immutable mount snapshot
-between installation-registry validation and process start.
+fixed guest path, and a private reconstruction of the package bytes captured
+during installation-registry verification. Host `/etc`, `/home`, `/var`, Core
+state, configuration stores, managed package paths, and other instance data are
+absent. A real control-group regression places a mode-0600 file outside the
+active Core-state directory and verifies that the installed process receives
+`ENOENT`; this specifically prevents the previous read-only-root false
+boundary, in which same-user private data remained readable.
+
+The registry calculates the accepted package digest from the same byte copies
+it places in a closed, deterministic snapshot. Process start writes that
+snapshot below the exact Core-state directory, verifies its identity and digest,
+unlinks the staging name, and passes only the read descriptor to the reviewed
+launcher. The isolated bootstrap verifies the whole snapshot and every file,
+reconstructs a private read-only package tree, removes the snapshot guest path,
+and then executes the exact captured entrypoint. A real regression changes the
+managed entrypoint after registry resolution and proves that the process still
+runs the previously captured bytes. The complete launcher command is also
+required to fit the existing 4,096-byte control frame; the frame limit was not
+raised to accommodate this mechanism.
+
+This is still recorded as the conservative `unrestricted` external-effect
+boundary. The allowlist and captured package stream close the tested managed-
+path substitution, but do not establish a complete security-sandbox contract
+or isolation from an arbitrary malicious process already running as the same
+Host service identity.
 
 ### 5.2 Proposed Linux Module process limits
 

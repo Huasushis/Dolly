@@ -1,0 +1,7 @@
+# Raw local artifact hashes. Paths are relative to the repository except for
+# the deliberately isolated red worktree artifact, whose absolute path is shown.
+0316019b13d8d9e08079e2ed6fb3b92e291cbc9f180fd0df2d976010fa311174  /home/ubuntu/codex-dolly/.tmp/dolly-toctou-red-icKq5h/artifacts/experiments/linux-core-service-ownership/container-3533165-20260812T193712Z/linux-integration.log
+090742a837de8c3660c22204fea1b7e8be47f0916c7964c7ec39e2f5d135c962  artifacts/experiments/linux-core-service-ownership/container-3537553-20260812T194536Z/linux-integration.log
+7344425d33ff3d91e2717ef7976ec5a668d92e03fd165d6bc73588b54894467a  artifacts/experiments/linux-core-service-ownership/container-3540140-20260812T194929Z/linux-integration.log
+afb9635220342bb64cee1653dc4761bdbdbdb70fa9ee6fa8a74bb5be35cabdaf  artifacts/experiments/linux-core-service-ownership/container-3541571-20260812T195025Z/linux-integration.log
+0d0ce454558ce6c40d8f3c067dd91a9535411961b7d75eea871204e6dc57f630  artifacts/experiments/linux-core-service-ownership/container-3542544-20260812T195039Z/linux-integration.log

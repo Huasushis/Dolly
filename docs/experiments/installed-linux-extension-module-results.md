@@ -116,6 +116,39 @@ between validation and the later read-only bind. That time-of-check/time-of-use
 boundary remains open and must not be papered over by a second path hash with
 another race window.
 
+## Verified package snapshot follow-up
+
+Source `5b5d588cdad466a46405e6ad43070ec7aa4bf832` closes that specific
+managed-path substitution. The installation registry now hashes and retains the
+same copied bytes. The Linux executor stages the closed snapshot below the exact
+Core-state directory, verifies it, unlinks its name, and passes only a read
+descriptor to the launcher. Inside the private mount namespace, a bounded
+bootstrap independently verifies the envelope and every file before it
+reconstructs the package and executes the captured entrypoint. It never reopens
+the managed installation path.
+
+The counterexample was run first against the old implementation: after registry
+resolution, the test changed the managed entrypoint from `ok: true` to
+`ok: "tampered-after-resolution"`; the child returned the changed value and the
+run failed 1/2. Two subsequent implementation attempts were also retained as
+failures: the first exceeded the existing 4,096-byte launcher frame, and the
+second leaked Python's injected `LC_CTYPE` into the child environment. The final
+source kept the frame bound unchanged, passed the complete derived command
+through the protocol validator, and gave the Node process only its fixed guest
+working directory.
+
+The final focused Ubuntu 24.04 systemd container passed 2/2 tests; mutation of
+the managed path no longer changed the executed result. A separate wider
+container passed 7/7 installed Scheduler, strict-streaming tool Agent, task
+switch, source, periodic, recovery, and inline-image Agent cases. All exact
+container identifiers were absent after their runners completed. Commands,
+environment, red/green result summaries, and raw-log hashes are in
+`docs/experiments/evidence/installed-package-snapshot-5b5d588/`.
+
+This closes the tested re-open-by-path race, not arbitrary same-UID Host process
+isolation or a complete sandbox. The public Module startup refusal remains in
+force.
+
 ## What this does not prove
 
 This result does not prove that configured Modules are product-supported.

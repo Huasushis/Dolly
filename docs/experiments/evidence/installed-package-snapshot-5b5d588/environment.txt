@@ -1,0 +1,23 @@
+Date: 2026-08-12 UTC
+Base image: docker.m.daocloud.io/library/ubuntu:24.04
+systemd: 255 (255.4-1ubuntu8.17)
+Node.js: v20.20.2
+Python: 3.12.3
+Control-group filesystem: cgroup2fs
+Root controllers: cpuset cpu io memory hugetlb pids rdma misc
+Unprivileged test identity: uid=1001 gid=997 groups=997
+User lingering: enabled only inside each disposable validation container
+
+Red package-path counterexample container: dolly-experiment-3533165-9fc7db43
+Red package-path local artifacts: /home/ubuntu/codex-dolly/.tmp/dolly-toctou-red-icKq5h/artifacts/experiments/linux-core-service-ownership/container-3533165-20260812T193712Z
+Oversized-frame counterexample container: dolly-experiment-3537553-c9d1ec4b
+Oversized-frame local artifacts: artifacts/experiments/linux-core-service-ownership/container-3537553-20260812T194536Z
+Environment-closure counterexample container: dolly-experiment-3540140-b597de00
+Environment-closure local artifacts: artifacts/experiments/linux-core-service-ownership/container-3540140-20260812T194929Z
+Focused passing container: dolly-experiment-3541571-726e06c4
+Focused passing local artifacts: artifacts/experiments/linux-core-service-ownership/container-3541571-20260812T195025Z
+Wider passing container: dolly-experiment-3542544-d68a10aa
+Wider passing local artifacts: artifacts/experiments/linux-core-service-ownership/container-3542544-20260812T195039Z
+
+All five exact container names returned absent from docker inspect after their
+runner completed.

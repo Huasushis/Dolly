@@ -1,0 +1,8 @@
+Source commit:
+5b5d588cdad466a46405e6ad43070ec7aa4bf832
+
+Focused verified-package mutation and Linux executor:
+./scripts/experiments/linux-core-service-ownership/run-disposable-container.sh --base docker.m.daocloud.io/library/ubuntu:24.04 --test-file tests/conformance/security/linux-extension-module-executor-integration.test.ts
+
+Wider installed Scheduler and inline-Media Agent regression:
+./scripts/experiments/linux-core-service-ownership/run-disposable-container.sh --base docker.m.daocloud.io/library/ubuntu:24.04 --test-file tests/conformance/security/installed-reactive-module-host-integration.test.ts --test-file tests/conformance/security/installed-inline-media-agent-integration.test.ts

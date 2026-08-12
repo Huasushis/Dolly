@@ -1,0 +1,45 @@
+Result: PASS, limited to the internal product-before-bootstrap Linux candidate.
+
+Counterexample chain:
+
+- A test-only commit added a mutation after installation-registry resolution
+  and before executor start. The old implementation ran the changed entrypoint:
+  expected `ok: true`, received `ok: "tampered-after-resolution"`. This was a
+  1-pass/1-fail run, not a retrospective inference from the repaired code.
+- The first snapshot implementation failed closed because its launcher execute
+  frame was 5,818 bytes, above the frozen 4,096-byte control-frame limit.
+- After reducing that frame without raising the limit, the real guest exposed
+  Python's injected `LC_CTYPE`; the environment-closure assertion failed.
+- The final implementation uses a bounded snapshot bootstrap and gives Node
+  only `PWD=/run/dolly/extension`. A unit assertion now sends the complete
+  derived command through the real launcher-protocol constructor.
+
+Focused passing validation:
+
+- 1 test file passed; 2/2 tests passed in 1.69 seconds.
+- The test changed the managed entrypoint after the installation registry had
+  captured and verified it. The Extension still returned `ok: true`, proving
+  that launch consumed the captured bytes rather than reopening the changed
+  managed path.
+- The process record retained the accepted package digest, reached `stopped`,
+  its Module control group was removed, and its exact process identity was gone.
+
+Wider passing validation:
+
+- 2 test files passed; 7/7 tests passed in 14.59 seconds.
+- Covered output-capacity recovery, startup recovery without producer
+  re-execution, strict-streaming registered-tool Agent execution, task switch
+  and sourced checkpoint reload, source activation, periodic activation, and a
+  strict-streaming inline-image Agent.
+- The registered-tool Agent reported 3/3 strict-SSE terminal responses and two
+  tool calls. The inline-image Agent reported one strict-SSE request and zero
+  remaining Media leases. Every reported process record reached `stopped` and
+  every reported Module control group was removed.
+
+Component evidence at the final source was 4 test files / 38 tests passing plus
+`pnpm typecheck`. This evidence closes the verified-managed-path substitution
+counterexample. It does not prove a complete sandbox, arbitrary same-UID Host
+process isolation, Windows or macOS equivalence, real-provider intelligence in
+the deterministic installed fixtures, or public Module support.
+`openDollyRuntime` still rejects configured Modules with
+`RUNTIME_MODULE_MIGRATION_REQUIRED`.
