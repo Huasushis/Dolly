@@ -54,6 +54,22 @@ function outputName(argumentsValue) {
   return value;
 }
 
+function leastCongruenceSolution(prompt) {
+  const congruences = [...prompt.matchAll(/x mod ([0-9]+) = ([0-9]+)/gu)]
+    .map((match) => ({ modulus: Number(match[1]), remainder: Number(match[2]) }));
+  if (congruences.length !== 3) throw new Error("Canary congruences are not closed");
+  const limit = congruences.reduce((product, entry) => product * entry.modulus, 1);
+  if (!Number.isSafeInteger(limit) || limit > 10_000_000) {
+    throw new Error("Canary congruence search bound is invalid");
+  }
+  for (let candidate = 0; candidate < limit; candidate += 1) {
+    if (congruences.every((entry) => candidate % entry.modulus === entry.remainder)) {
+      return candidate;
+    }
+  }
+  throw new Error("Canary congruences have no solution inside their product bound");
+}
+
 const selectedRunId = runId(process.argv.slice(2));
 const selectedOutputName = outputName(process.argv.slice(2));
 const root = join(
@@ -139,6 +155,9 @@ if (decoded !== undefined) {
 
 const lastChunkElapsedMs = timings.at(-1)?.elapsedMs ?? null;
 const rawCrossed120Seconds = lastChunkElapsedMs > 120_000;
+let semanticExpectedX = null;
+let semanticActualX = null;
+let semanticAnswerExact = null;
 if (result.response.crossedHistorical120SecondBoundary !== rawCrossed120Seconds) {
   failures.push("raw chunk timing boundary differs from result.json");
 }
@@ -184,11 +203,15 @@ if (preregistration.experimentVersion === 0) {
   const expectedReasoningPolicy =
     preregistration.request.thinking.type === "disabled" &&
     decoded?.body.choices[0].message.reasoning_content.length === 0;
+  semanticExpectedX = leastCongruenceSolution(preregistration.data.user);
+  semanticActualX = contentObject?.x ?? null;
+  semanticAnswerExact = semanticActualX === semanticExpectedX;
   const expectedContent =
     expectedTransport &&
     expectedReasoningPolicy &&
     decoded?.body.choices[0].finish_reason !== "length" &&
-    contentObject?.canary === preregistration.data.expectedCanary;
+    contentObject?.canary === preregistration.data.expectedCanary &&
+    semanticAnswerExact;
   if (
     result.strictStreamTransport !== expectedTransport ||
     result.reasoningPolicySatisfied !== expectedReasoningPolicy ||
@@ -230,6 +253,11 @@ const validation = {
   rawTerminalCrossed120Seconds: rawCrossed120Seconds,
   frozenOverallClassification: result.status,
   semanticFailurePreserved: result.status === "failed" && result.failure !== null,
+  semanticCheck: {
+    expectedX: semanticExpectedX,
+    actualX: semanticActualX,
+    exact: semanticAnswerExact,
+  },
   sourceFilesRead: [
     "manifest.json",
     "preregistration.json",

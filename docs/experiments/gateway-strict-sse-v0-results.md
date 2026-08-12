@@ -81,3 +81,37 @@ Version 1 evidence root:
 - `chunk-timings.jsonl`: `48a99601b624e0cc7b42ef1cf8129858477a688e44aac0064956cc5374e52e54`
 - `result.json`: `e89f75705060531d383880211c1bb669f91cde64d4e14932a18b49b46678704c`
 - passing `validation.json`: `836566d6cc84eb080e87ae78f7d0d80de73222d72ea90d4421b40fc9920b3efb`
+
+## Version 2: role-specific non-thinking stream
+
+Version 2 used `thinking.type=disabled` and an 800-token bound for the same
+short structured task. Its transport and output framing behaved as intended:
+HTTP 200, strict SSE, unique usage and `[DONE]`, `finish_reason=stop`, empty
+`reasoning_content`, 19 completion tokens, and a complete JSON object. The
+request spent about 138.1 seconds waiting for response headers, so the gateway
+held an idle upstream response beyond the former 120-second boundary; this is
+stronger gateway evidence than a stream kept alive by frequent chunks.
+
+The original runner and first independent validation nevertheless produced a
+false green because the frozen content gate checked the marker and JSON shape
+but not the arithmetic answer. A separate calculation found that the model
+returned `x=10011`; the least solution is `x=102249`. The strengthened
+validator preserves the initial green record and writes a new failed validation
+with both values. Version 2 therefore supports the transport and disabled-
+thinking wire behavior, but not task correctness.
+
+This changes the engineering decision. `thinking.type=disabled` is suitable
+for short formatting calls only when the value is already grounded. It is not
+evidence that a reasoning task is safe. Exact arithmetic should be executed by
+a registered, schema-checked calculation tool and independently verified;
+complex model planning may use `thinking.type=enabled`, but only non-empty
+`reasoning_content` proves that a particular call actually reasoned.
+
+Version 2 evidence root:
+`artifacts/experiments/probes/gateway-strict-sse-v0/run-20260812c`
+
+- `response.sse`: `53534b2c2d23b4d64cb2ee7241c13433f7258e92d815b620f253c5181e9ef514`
+- `chunk-timings.jsonl`: `160dca9efc9baf8ad919099d8dfce7121c3e320b3bd393a2c21387ea6329f690`
+- runner `result.json`: `4921bb3c7bfa8fabce8abda0086ed1080bd93d1b8c2ca9186fef7d40ccdbe8f5`
+- original false-green `validation.json`: `e76abc216d49453960f6359f6ab9bf2dffd36e81ecd93475792fbae03ad6aff0`
+- strengthened failed `validation-3.json`: `52b47d3ee414c57fc96fb22c5d4de4ab37354100cf5fe7882aed147222041ff7`
