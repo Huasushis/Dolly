@@ -435,6 +435,7 @@ export interface SchedulerModuleStatus {
   readonly lastServiceTimeMs: number | null;
   readonly arrivalsDuringLastRunCount: number;
   readonly arrivalsDuringLastRunBytes: number;
+  readonly arrivalsDuringLastRunObservation: "observed" | "unavailable";
   readonly quarantineReason: string | null;
   readonly counters: SchedulerModuleCounters;
 }
@@ -540,11 +541,10 @@ interface ModuleEntry {
   mailboxFull: boolean;
   inFlight: Promise<void> | null;
   outputCommitWaiting: boolean;
-  dispatchPending: SchedulerPendingSnapshot | null;
-  dispatchClaimLimitCount: number | null;
-  dispatchClaimLimitBytes: number | null;
+  dispatchResident: SchedulerResidentSnapshot | null;
   arrivalsDuringLastRunCount: number;
   arrivalsDuringLastRunBytes: number;
+  arrivalsDuringLastRunObservation: "observed" | "unavailable";
   lastRunStartedAt: number | null;
   lastRunServiceTimeMs: number | null;
   retryCount: number;
@@ -1070,11 +1070,10 @@ export class ModuleScheduler {
       mailboxFull: false,
       inFlight: null,
       outputCommitWaiting: registration.runtime.outputCommitWaiting === true,
-      dispatchPending: null,
-      dispatchClaimLimitCount: null,
-      dispatchClaimLimitBytes: null,
+      dispatchResident: null,
       arrivalsDuringLastRunCount: 0,
       arrivalsDuringLastRunBytes: 0,
+      arrivalsDuringLastRunObservation: "unavailable",
       lastRunStartedAt: null,
       lastRunServiceTimeMs: null,
       retryCount: 0,
@@ -1634,6 +1633,7 @@ export class ModuleScheduler {
       oldestPendingAgeMs: this.#oldestPendingAgeMs(entry, now),
       arrivalsDuringLastRunCount: entry.arrivalsDuringLastRunCount,
       arrivalsDuringLastRunBytes: entry.arrivalsDuringLastRunBytes,
+      arrivalsDuringLastRunObservation: entry.arrivalsDuringLastRunObservation,
       retryCount: entry.retryCount,
       ...(entry.lastFailureAt === null ? {} : { lastFailureAt: entry.lastFailureAt }),
       ...(entry.lastRunStartedAt === null ? {} : { lastRunStartedAt: entry.lastRunStartedAt }),
@@ -1908,9 +1908,7 @@ export class ModuleScheduler {
     const missedPeriods = decision.missedPeriods ?? 0;
     entry.counters.missedPeriods += missedPeriods;
     entry.lastRunStartedAt = now;
-    entry.dispatchPending = entry.pending;
-    entry.dispatchClaimLimitCount = decision.claimLimitCount;
-    entry.dispatchClaimLimitBytes = decision.claimLimitBytes;
+    entry.dispatchResident = entry.resident;
     entry.nextEligibleAt = null;
     this.#activeCount += 1;
 
@@ -2161,43 +2159,51 @@ export class ModuleScheduler {
   }
 
   /**
-   * Arrivals during the last run, used only as adaptive-policy input. When the
-   * run acknowledged nothing the difference is exact; when it consumed a batch
-   * the scheduler cannot see the claimed count, so it subtracts the largest
-   * batch the policy could have claimed and reports a lower bound. The fixed
-   * baseline never reads these fields.
+   * Exact arrivals during the last ordinary tick, used only as adaptive-policy
+   * input. Moving pending input into a Claim does not change resident capacity,
+   * so non-terminal results use the resident delta directly. A committed or
+   * dead-lettered Claim additionally reports the exact count and canonical
+   * Block bytes it removed. Missing or inconsistent evidence is explicit;
+   * guessed counts are never exposed as observations.
    */
   #measureArrivals(entry: ModuleEntry, result: ReactiveModuleTickResult | null): void {
-    const before = entry.dispatchPending;
-    const claimLimitCount = entry.dispatchClaimLimitCount;
-    const claimLimitBytes = entry.dispatchClaimLimitBytes;
-    entry.dispatchPending = null;
-    entry.dispatchClaimLimitCount = null;
-    entry.dispatchClaimLimitBytes = null;
-    if (!before || !entry.mailboxStateAvailable) return;
-    let after: SchedulerPendingSnapshot;
+    const before = entry.dispatchResident;
+    entry.dispatchResident = null;
+    entry.arrivalsDuringLastRunCount = 0;
+    entry.arrivalsDuringLastRunBytes = 0;
+    entry.arrivalsDuringLastRunObservation = "unavailable";
+    if (!before || !entry.mailboxStateAvailable || result === null) return;
+    let after: SchedulerResidentSnapshot;
     try {
-      after = this.#deliveries.inspectPending(entry.moduleId, entry.inputPageIds);
+      after = this.#deliveries.inspectResident(entry.moduleId, entry.inputPageIds);
     } catch {
       return;
     }
-    const consumed =
-      result !== null && (result.status === "committed" || result.status === "dead-lettered");
-    if (!consumed) {
-      entry.arrivalsDuringLastRunCount = Math.max(0, after.pendingCount - before.pendingCount);
-      entry.arrivalsDuringLastRunBytes = Math.max(0, after.pendingBytes - before.pendingBytes);
-      return;
+    let removedCount = 0;
+    let removedBytes = 0;
+    if (result.status === "committed" || result.status === "dead-lettered") {
+      if (
+        !Number.isSafeInteger(result.claimedInputCount) ||
+        (result.claimedInputCount ?? 0) <= 0 ||
+        !Number.isSafeInteger(result.claimedInputBytes) ||
+        (result.claimedInputBytes ?? -1) < 0
+      ) return;
+      removedCount = result.claimedInputCount!;
+      removedBytes = result.claimedInputBytes!;
     }
-    const retainedCount = Math.max(
-      0,
-      before.pendingCount - (claimLimitCount ?? this.#claimLimitCount),
-    );
-    const retainedBytes = Math.max(
-      0,
-      before.pendingBytes - (claimLimitBytes ?? this.#claimLimitBytes),
-    );
-    entry.arrivalsDuringLastRunCount = Math.max(0, after.pendingCount - retainedCount);
-    entry.arrivalsDuringLastRunBytes = Math.max(0, after.pendingBytes - retainedBytes);
+    const retainedCount = before.residentCount - removedCount;
+    const retainedBytes = before.residentBytes - removedBytes;
+    const arrivalsCount = after.residentCount - retainedCount;
+    const arrivalsBytes = after.residentBytes - retainedBytes;
+    if (
+      !Number.isSafeInteger(retainedCount) || retainedCount < 0 ||
+      !Number.isSafeInteger(retainedBytes) || retainedBytes < 0 ||
+      !Number.isSafeInteger(arrivalsCount) || arrivalsCount < 0 ||
+      !Number.isSafeInteger(arrivalsBytes) || arrivalsBytes < 0
+    ) return;
+    entry.arrivalsDuringLastRunCount = arrivalsCount;
+    entry.arrivalsDuringLastRunBytes = arrivalsBytes;
+    entry.arrivalsDuringLastRunObservation = "observed";
   }
 
   #quarantine(
@@ -2362,6 +2368,7 @@ export class ModuleScheduler {
       lastServiceTimeMs: entry.lastRunServiceTimeMs,
       arrivalsDuringLastRunCount: entry.arrivalsDuringLastRunCount,
       arrivalsDuringLastRunBytes: entry.arrivalsDuringLastRunBytes,
+      arrivalsDuringLastRunObservation: entry.arrivalsDuringLastRunObservation,
       quarantineReason: entry.quarantineReason,
       counters: { ...entry.counters },
     });

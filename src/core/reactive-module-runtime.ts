@@ -74,27 +74,36 @@ export interface ReactiveModuleFailure {
   readonly code: string;
 }
 
+export interface ReactiveModuleClaimMeasurement {
+  /** Exact Delivery occurrences held by this tick's Claim. */
+  readonly claimedInputCount?: number;
+  /** Exact canonical Block bytes charged for those Delivery occurrences. */
+  readonly claimedInputBytes?: number;
+}
+
+type MeasuredClaimResult<T> = DeliveryClaimIdentity & ReactiveModuleClaimMeasurement & T;
+
 export type ReactiveModuleTickResult =
   | { readonly status: "idle" }
-  | (DeliveryClaimIdentity & {
+  | MeasuredClaimResult<{
       readonly status: "committed";
       readonly recovered: boolean;
       readonly record: ModuleResultCommitRecord;
-    })
-  | (DeliveryClaimIdentity & {
+    }>
+  | MeasuredClaimResult<{
       readonly status: "retry-scheduled" | "dead-lettered";
       readonly failure: FailureClassification;
-    })
-  | (DeliveryClaimIdentity & {
+    }>
+  | MeasuredClaimResult<{
       readonly status: "cancelled";
       readonly reason: "shutdown";
-    })
-  | (DeliveryClaimIdentity & {
+    }>
+  | MeasuredClaimResult<{
       readonly status: "output-backpressured";
       readonly stage: "output-commit";
       readonly blockedConsumerIds: readonly string[];
-    })
-  | (DeliveryClaimIdentity & {
+    }>
+  | MeasuredClaimResult<{
       readonly status: "recovery-required";
       readonly reason:
         | "claim-persistence-unconfirmed"
@@ -106,7 +115,7 @@ export type ReactiveModuleTickResult =
         | "failure-policy-unavailable"
         | "nack-outcome-unknown"
         | "submission-persistence-unconfirmed";
-    });
+    }>;
 
 // `executor-termination-unconfirmed` means Core could not prove that the
 // process and its result channel stopped. Recovery preserves the active Claim;
@@ -325,6 +334,28 @@ function claimIdentity(claim: DeliveryClaim): DeliveryClaimIdentity {
     attempt: claim.attempt,
     moduleGenerationId: claim.moduleGenerationId,
   };
+}
+
+function claimMeasurement(
+  claim: DeliveryClaim,
+): Required<ReactiveModuleClaimMeasurement> | null {
+  let groupedCount = 0;
+  let claimedInputBytes = 0;
+  for (const group of claim.blockGroups) {
+    if (
+      !Number.isSafeInteger(group.occurrenceCount) ||
+      group.occurrenceCount <= 0 ||
+      group.occurrenceCount !== group.deliveryIds.length
+    ) return null;
+    const contribution = canonicalJsonByteLength(group.block) * group.occurrenceCount;
+    groupedCount += group.occurrenceCount;
+    claimedInputBytes += contribution;
+    if (!Number.isSafeInteger(groupedCount) || !Number.isSafeInteger(claimedInputBytes)) {
+      return null;
+    }
+  }
+  if (groupedCount !== claim.deliveryIds.length || groupedCount <= 0) return null;
+  return { claimedInputCount: groupedCount, claimedInputBytes };
 }
 
 function sameCommittedResult(
@@ -767,11 +798,14 @@ export class ReactiveModuleRuntime {
 
     const deferred = this.#deferredOutputCommit;
     const operation = deferred
-      ? this.#tryRecoverCommit(
+      ? this.#withClaimMeasurement(
+          this.#tryRecoverCommit(
+            deferred.claim,
+            deferred.output,
+            deferred.failure,
+            deferred.knownPrepared,
+          ),
           deferred.claim,
-          deferred.output,
-          deferred.failure,
-          deferred.knownPrepared,
         )
       : this.#actor.state === "created"
         ? this.#actor.start().then(() =>
@@ -964,7 +998,7 @@ export class ReactiveModuleRuntime {
     }
     if (!claim) return { status: "idle" };
 
-    return this.#executeClaim(claim);
+    return this.#executeClaim(claim, true);
   }
 
   async #recoverClaimAfterPersistenceConfirmation(
@@ -990,6 +1024,29 @@ export class ReactiveModuleRuntime {
   }
 
   async #executeClaim(
+    claim: DeliveryClaim,
+    reportMeasurement = false,
+  ): Promise<Exclude<ReactiveModuleTickResult, { readonly status: "idle" }>> {
+    const result = await this.#executeClaimWithoutMeasurement(claim);
+    if (!reportMeasurement) return result;
+    const measurement = claimMeasurement(claim);
+    return measurement === null
+      ? result
+      : deepFreeze({ ...result, ...measurement });
+  }
+
+  async #withClaimMeasurement(
+    operation: Promise<Exclude<ReactiveModuleTickResult, { readonly status: "idle" }>>,
+    claim: DeliveryClaim,
+  ): Promise<Exclude<ReactiveModuleTickResult, { readonly status: "idle" }>> {
+    const result = await operation;
+    const measurement = claimMeasurement(claim);
+    return measurement === null
+      ? result
+      : deepFreeze({ ...result, ...measurement });
+  }
+
+  async #executeClaimWithoutMeasurement(
     claim: DeliveryClaim,
   ): Promise<Exclude<ReactiveModuleTickResult, { readonly status: "idle" }>> {
     this.#activeClaim = claim;

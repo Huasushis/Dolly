@@ -2327,6 +2327,7 @@ interface SchedulerSnapshot {
   oldestPendingAgeMs: number;
   arrivalsDuringLastRunCount: number;
   arrivalsDuringLastRunBytes: number;
+  arrivalsDuringLastRunObservation: "observed" | "unavailable";
   lastRunServiceTimeMs?: number;
   retryCount: number;
   downstream: readonly DownstreamPressure[];
@@ -2389,6 +2390,22 @@ count is not a substitute for one consumer's lag.
 
 Service time MUST include all work inside the run transaction boundary or name
 separate Module, media, output commit, and total latencies explicitly.
+
+Arrival telemetry MUST be derived from resident Delivery state, not inferred
+from a policy claim limit. Moving pending input into an active Claim does not
+change resident capacity. For an ordinary tick that commits or enters its exact
+Claim in dead letter, the runtime reports the exact Delivery occurrence count
+and canonical Block bytes removed by that Claim; the Scheduler subtracts those
+values from the pre-dispatch resident snapshot before comparing it with the
+post-settlement resident snapshot. For other ordinary tick outcomes, no input
+is removed and the resident delta is already exact. If the runtime omits this
+measurement, the resident reader fails, or the two observations are
+inconsistent, the Scheduler MUST publish `unavailable` with zero count and
+bytes. A policy MUST distinguish that state from an observed zero and MUST NOT
+reconstruct a value from batch limits. These measurements are telemetry only:
+they grant no Delivery, Module, provider, or capability authority. Operator
+recovery results remain a separate closed contract and do not acquire these
+ordinary-tick fields.
 
 For fan-out graphs, a policy MUST define how all downstream pressure signals are
 aggregated. Results MUST NOT depend on callback completion order. For cycles,

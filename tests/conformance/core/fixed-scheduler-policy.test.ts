@@ -19,6 +19,7 @@ function snapshot(
     oldestPendingAgeMs: 20,
     arrivalsDuringLastRunCount: 0,
     arrivalsDuringLastRunBytes: 0,
+    arrivalsDuringLastRunObservation: "unavailable",
     retryCount: 0,
     downstream: [],
     ...overrides,
@@ -220,6 +221,12 @@ describe("CORE deterministic fixed scheduler policy", () => {
   });
 
   it("rejects malformed or ambiguous snapshots instead of guessing", () => {
+    expect(() => policy().decide(snapshot({
+      arrivalsDuringLastRunObservation: "unavailable",
+      arrivalsDuringLastRunCount: 1,
+    }))).toThrowError(expect.objectContaining<Partial<SchedulerPolicyError>>({
+      code: "SCHEDULER_SNAPSHOT_INVALID",
+    }));
     expect(() => policy().decide(snapshot({ retryCount: 1 }))).toThrowError(
       expect.objectContaining<Partial<SchedulerPolicyError>>({
         code: "SCHEDULER_SNAPSHOT_INVALID",

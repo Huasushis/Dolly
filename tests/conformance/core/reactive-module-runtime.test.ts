@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { BlockStore, type BlockProposal } from "../../../src/core/block-store.js";
+import { canonicalJsonByteLength } from "../../../src/core/canonical-json.js";
 import type {
   ExternalEffectEvidence,
   ExternalEffectEvidenceSource,
@@ -758,6 +759,12 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
       schemaVersion: "dolly.reactive-module-input/2",
       hasMore: false,
       blockGroups: [{ occurrenceCount: 1, block: { id: "block-1" } }],
+    });
+    const observedBlock = observedInput?.blockGroups[0]?.block;
+    expect(observedBlock).toBeDefined();
+    expect(result).toMatchObject({
+      claimedInputCount: 1,
+      claimedInputBytes: canonicalJsonByteLength(observedBlock),
     });
     expect(
       harness.deliveries.inspectClaim({

@@ -37,6 +37,7 @@ export interface FixedSchedulerSnapshot {
   readonly oldestPendingAgeMs: number;
   readonly arrivalsDuringLastRunCount: number;
   readonly arrivalsDuringLastRunBytes: number;
+  readonly arrivalsDuringLastRunObservation: "observed" | "unavailable";
   readonly retryCount: number;
   readonly lastFailureAt?: number;
   readonly lastRunStartedAt?: number;
@@ -350,6 +351,24 @@ export class FixedSchedulerPolicy {
       ["retryCount", snapshot.retryCount],
     ] as const) {
       assertCount(value, label);
+    }
+    if (
+      snapshot.arrivalsDuringLastRunObservation !== "observed" &&
+      snapshot.arrivalsDuringLastRunObservation !== "unavailable"
+    ) {
+      throw new SchedulerPolicyError(
+        "SCHEDULER_SNAPSHOT_INVALID",
+        "arrivalsDuringLastRunObservation is invalid",
+      );
+    }
+    if (
+      snapshot.arrivalsDuringLastRunObservation === "unavailable" &&
+      (snapshot.arrivalsDuringLastRunCount !== 0 || snapshot.arrivalsDuringLastRunBytes !== 0)
+    ) {
+      throw new SchedulerPolicyError(
+        "SCHEDULER_SNAPSHOT_INVALID",
+        "Unavailable arrival observations must carry zero counts and bytes",
+      );
     }
     assertFiniteNonNegative(snapshot.oldestPendingAgeMs, "oldestPendingAgeMs");
     if (snapshot.lastFailureAt !== undefined) {

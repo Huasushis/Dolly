@@ -1494,6 +1494,97 @@ describe("CORE scheduler policy boundary", () => {
     await scheduler.stop();
   });
 
+  it("does not report an unclaimed large Block as an arrival during a smaller committed Claim", async () => {
+    const seen: SchedulerSnapshot[] = [];
+    const policy: SchedulerPolicy = {
+      decide: (snapshot) => {
+        seen.push(snapshot);
+        return {
+          eligible: seen.length === 1,
+          eligibleAt: null,
+          claimLimitCount: 1,
+          claimLimitBytes: 4_096,
+          reasonCode: seen.length === 1 ? "FIRST_BATCH" : "OBSERVED_AFTER_COMMIT",
+          policyName: "arrival-observer",
+          policyVersion: "1",
+        };
+      },
+    };
+    const { clock, mailboxes, scheduler } = createScheduler({ policy });
+    const runtime = new FakeModuleRuntime(() => {
+      // The 1-byte first Delivery was committed. The untouched 1000-byte
+      // second Delivery is still pending; nothing arrived while the Run was
+      // active.
+      mailboxes.set("worker", 1, 1_000);
+      return {
+        ...committedResult(1),
+        claimedInputCount: 1,
+        claimedInputBytes: 1,
+      } as ReactiveModuleTickResult;
+    });
+    mailboxes.set("worker", 2, 1_001);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toMatchObject({
+      arrivalsDuringLastRunCount: 0,
+      arrivalsDuringLastRunBytes: 0,
+      arrivalsDuringLastRunObservation: "observed",
+    });
+    await scheduler.stop();
+  });
+
+  it("marks arrival telemetry unavailable instead of guessing without an exact Claim measurement", async () => {
+    const seen: SchedulerSnapshot[] = [];
+    const policy: SchedulerPolicy = {
+      decide: (snapshot) => {
+        seen.push(snapshot);
+        return {
+          eligible: seen.length === 1,
+          eligibleAt: null,
+          claimLimitCount: 1,
+          claimLimitBytes: 4_096,
+          reasonCode: seen.length === 1 ? "FIRST_BATCH" : "OBSERVED_AFTER_COMMIT",
+          policyName: "arrival-observer",
+          policyVersion: "1",
+        };
+      },
+    };
+    const { clock, mailboxes, scheduler } = createScheduler({ policy });
+    const runtime = new FakeModuleRuntime(() => {
+      mailboxes.set("worker", 1, 1_000);
+      return committedResult(1);
+    });
+    mailboxes.set("worker", 2, 1_001);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toMatchObject({
+      arrivalsDuringLastRunCount: 0,
+      arrivalsDuringLastRunBytes: 0,
+      arrivalsDuringLastRunObservation: "unavailable",
+    });
+    await scheduler.stop();
+  });
+
   it("preserves the durable oldest pending age when the Scheduler monotonic clock restarts", async () => {
     const seen: SchedulerSnapshot[] = [];
     const policy: SchedulerPolicy = {
@@ -3008,6 +3099,11 @@ describe("CORE scheduler over the real Delivery store", () => {
     expect(pipeline.deliveries.inspectPending("producer", ["input"]).pendingCount).toBe(2);
     expect(scheduler.status("producer").backpressured).toBe(true);
     expect(scheduler.status("producer").blockingDownstreamIds).toEqual(["sink"]);
+    expect(scheduler.status("producer")).toMatchObject({
+      arrivalsDuringLastRunCount: 0,
+      arrivalsDuringLastRunBytes: 0,
+      arrivalsDuringLastRunObservation: "observed",
+    });
     expect(eventTypes(events, "producer")).toContain("scheduler.backpressure_entered");
     expect(pipeline.deliveries.snapshot().deadLetters).toEqual([]);
 
