@@ -1,9 +1,9 @@
 {
   "schemaVersion": "dolly.experiment-preregistration/1",
   "experimentId": "model-broker-inline-media-live-v0",
-  "experimentVersion": 1,
+  "experimentVersion": 2,
   "status": "preregistered-before-execution",
-  "registeredAt": "2026-08-12T16:47:03.000Z",
+  "registeredAt": "2026-08-12T16:50:21.000Z",
   "sourceRevision": "The implementationSha256 list is authoritative and this preregistration must be committed before execution.",
   "question": "Can Dolly's production ChatModelBroker, rather than a probe-specific HTTP client, authorize one delivered local PNG and obtain the exact fixed answer from the owner's configured Aether qwen3.6-27b deployment through strict streaming without exposing Module startup or private endpoint data?",
   "definitions": {
@@ -27,6 +27,11 @@
     ]
   },
   "baselines": [
+    {
+      "id": "version-one-runner-failure",
+      "source": "artifacts/experiments/probes/model-broker-inline-media-live-v0/live-v0-20260812a",
+      "result": "Version one stopped before provider dispatch because the experiment runner omitted MediaStore.now. The preserved manifest, failure result, and invalid validation record providerDispatches=0. Version two changes only the runner clock injection, defers private configuration loading until local media setup succeeds, and requires a fresh run identifier."
+    },
     {
       "id": "probe-specific-strict-streaming",
       "source": "docs/experiments/multimodal-input-v0-results.md",
@@ -151,7 +156,7 @@
     "src/core/reference-graph.ts"
   ],
   "implementationSha256": [
-    { "path": "scripts/experiments/probes/model-broker-inline-media-live-v0/run.mts", "sha256": "500092c2afa97550d858c35caacc0494ab9f2e5399b9aa5260a6e4ad58a78960" },
+    { "path": "scripts/experiments/probes/model-broker-inline-media-live-v0/run.mts", "sha256": "928da0ae7b0522740c6bd91b4148f6cd36711ca77e088f490084f75105c5601d" },
     { "path": "scripts/experiments/probes/model-broker-inline-media-live-v0/verify.mjs", "sha256": "6e956fee8d5756733a6dcd088625f0f8fb3df4e3ac3758d09762569f8bbfeba5" },
     { "path": "scripts/experiments/probes/multimodal-input-v0/common.mjs", "sha256": "54e84c9242f79706d9f158a8103a70c2901cab3b6f9be6436e0ebb5b0b04d2b8" },
     { "path": "scripts/experiments/probes/multimodal-input-v0/aether-client.mjs", "sha256": "6b32b7ca4d20cfa6d1939a25829e191548d7d9424b1df677c98f0592ab9f7240" },

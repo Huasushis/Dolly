@@ -212,9 +212,9 @@ if (
   process.env.RUN_PAID_INTEGRATION !== "1" ||
   process.argv.length !== 4 ||
   runIdIndex !== 2 ||
-  !/^live-v0-[a-z0-9][a-z0-9-]{0,63}$/u.test(runId ?? "")
+  !/^live-v1-[a-z0-9][a-z0-9-]{0,63}$/u.test(runId ?? "")
 ) {
-  throw new Error("usage requires live/paid opt-in and --run-id live-v0-<unique-suffix>");
+  throw new Error("usage requires live/paid opt-in and --run-id live-v1-<unique-suffix>");
 }
 
 const artifactDirectory = join(
@@ -256,8 +256,6 @@ writeJson(join(artifactDirectory, "manifest.json"), {
   nonStreamFallbackAllowed: false,
 });
 
-let apiKey = readPrivateEnvironment("AETHER_API_KEY");
-const exactUrl = exactChatUrl(readPrivateEnvironment("AETHER_BASE_URL"));
 const image = (await generateFixtures()).agentTaskPng;
 const media = new MediaStore({
   durability: "volatile",
@@ -266,6 +264,7 @@ const media = new MediaStore({
   inspector: new SharpMediaInspector({ maxInputPixels: 1_000_000 }),
   maxMediaBytes: 1_000_000,
   idNamespace: `broker-live-${runId}`,
+  now: () => new Date().toISOString(),
 });
 const registered = await media.registerMedia({
   registrationId: "registration-live-image-1",
@@ -306,6 +305,9 @@ const mediaResolver = createDeliveredModelMediaResolver({
     context.moduleJobId === claim.moduleJobId && context.runId === claim.runId,
   now: () => new Date().toISOString(),
 });
+
+let apiKey = readPrivateEnvironment("AETHER_API_KEY");
+const exactUrl = exactChatUrl(readPrivateEnvironment("AETHER_BASE_URL"));
 
 const descriptors = new ModelDescriptorRegistry({
   schemaDigest: `sha256:${"6".repeat(64)}`,
