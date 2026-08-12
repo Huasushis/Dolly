@@ -358,14 +358,19 @@ tool again. Tool arguments and successful results are local private state and
 therefore require the same retention, deletion, and access policy as the Module
 data they contain.
 
-There is still no production Module composition for this repository. More
-importantly, an effectful executor crash after crossing its external boundary
-but before recording the result still requires durable provider idempotency or
-an outcome query; the file repository alone does not make that effect safe to
-repeat. The current chat request schema also cannot represent an assistant tool
-call followed by a typed tool-result unit, so a registry-derived,
-schema-checked JSON action is the honest interim Agent path; native provider
-function calling requires a separately versioned chat-round contract.
+The candidate installed-Module composition can now select a read-only registry
+through an operator policy identifier, issue its active-Run handle, and bind it
+to a file-backed journal. This is product-frontier evidence, not a supported
+public Module path: the policy source is not yet persistent or revisioned and
+the public bootstrap still rejects every configured Module. Effectful tools are
+also refused by this installed policy. An effectful executor crash after
+crossing its external boundary but before recording the result still requires
+durable provider idempotency or an outcome query; the file repository alone
+does not make that effect safe to repeat. The current chat request schema also
+cannot represent an assistant tool call followed by a typed tool-result unit,
+so a registry-derived, schema-checked JSON action is the honest interim Agent
+path; native provider function calling requires a separately versioned
+chat-round contract.
 
 ### 8.2 Turn transitions
 

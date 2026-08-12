@@ -394,6 +394,28 @@ stores identifiers of those rules. It MUST NOT store capability handles: a
 capability handle is temporary session authority created for one authenticated
 Extension process and becomes invalid when that session ends.
 
+The candidate installed-Module composition now resolves two Host-owned policy
+kinds from those identifiers: strict-streaming chat generation and registered
+read-only tools. Both setups are bound to the exact instance, Module,
+Extension, installed package digest, configuration revision, and sorted policy
+identifiers before any process starts. The tool setup issues an active-Run
+`tool-invocation/v2` handle from the same executable `ToolRegistry` used for
+Host-side schema checking, requires a `FileToolJournalRepository`, and records
+the registry digest and public wire names in its audit projection. A real-child
+conformance case obtains that registry view, executes one read, and reopens the
+completed journal without receiving endpoint, filesystem-path, internal tool
+identifier, or capability-handle authority.
+
+This candidate tool policy deliberately accepts only descriptors whose effect
+class is `read` and whose approval policy is `never`; its approval budget must
+be zero. Write, external-communication, destructive, and administrative tools
+remain refused before Host startup. The current tool journal does not persist a
+separate cumulative approval counter, and an ordinary process boundary cannot
+prove that an executor implementation has no ambient effects, so broadening
+this policy would be an unsupported safety claim. The policy registry itself is
+also still an in-process operator input rather than the persistent,
+revision-controlled policy store required for public configuration.
+
 The current bootstrap validates this configuration but rejects every configured
 Module until the isolated Extension process runtime is connected. Parsing a
 Module does not imply that its execution path is available.
