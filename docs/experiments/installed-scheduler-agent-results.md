@@ -1,8 +1,11 @@
-# Installed Scheduler general Agent vertical-slice result
+# Installed Scheduler Agent vertical-slice results
 
 Date: 2026-08-12 UTC
 
-Source: `43e4f6155b6b04c385e876a3992d8b13b2da7b4a`
+Sources:
+
+- registered read-tool Agent: `43e4f6155b6b04c385e876a3992d8b13b2da7b4a`;
+- task-switch/checkpoint Agent: `d51fc593d1681053ef67628aeec2d92c2b57ee8d`.
 
 Environment: uniquely named disposable Ubuntu 24.04 systemd container
 
@@ -44,7 +47,7 @@ controllers, systemd 255, Node 20.20.2, Python 3.12.3, and an unprivileged
 account with `Linger=yes`. The tracked source and dependencies were read-only;
 `.env`, Git metadata, and owner checkout state were absent.
 
-The same run revalidated downstream capacity recovery, manual Source
+That first run revalidated downstream capacity recovery, manual Source
 activation, and non-empty periodic activation, for 4/4 passing tests. The
 runner created only the recorded container
 `dolly-experiment-2721734-03d89d92`; exact post-run inspection returned absent.
@@ -58,13 +61,51 @@ The environment and preflight files have SHA-256
 and
 `ecf7fce3780e2b756cfc847409343f9dc3196b8e6f9da072679da4c713411c36`.
 
+## Task switching with one simple checkpoint
+
+The second question was whether the same installed Linux Scheduler chain could
+stop relying on an Agent's active context for an interrupted task. One
+installed child therefore processed three separate Scheduler Runs in order:
+
+1. task A supplied a sourced `dolly.task-checkpoint/1`; the model returned a
+   closed `store_checkpoint` action and the Host wrote exactly one private
+   storage entry;
+2. unrelated task B asked for `29 - 12`; it completed with answer `17` without
+   any storage call, and the exact model messages contained neither task A's
+   identifier nor its `canary-91` next-action target;
+3. a later cue named task A but did not contain its checkpoint; the child used
+   Host `list` and `get` operations, then the model returned the stored
+   `{kind:"verify", target:"canary-91", reason:"check rollout health"}` action
+   with the checkpoint key as its evidence.
+
+All three model invocations had `stream=true`. The three Runs produced three
+durable result commits and six terminal capability-effect records: three model
+calls plus storage `set`, `list`, and `get`. After orderly stop, the exact
+control group was absent; reopening the Core state, result repository, and
+private store retained all three commits, the stopped process record, and the
+single checkpoint entry.
+
+The focused disposable-container run passed 6/6 cases in 13.17 seconds,
+including the earlier capacity-recovery, registered-tool Agent, Source, and
+periodic cases. It created only
+`dolly-experiment-3008740-03cf7b06`; exact post-run inspection returned absent,
+and its tracked-source snapshot was removed. The retained transcript is
+`artifacts/experiments/linux-core-service-ownership/container-3008740-20260812T132623Z/linux-integration.log`
+with SHA-256
+`0b3cf6dc13f5d6f7aaab0d57257f1955daa530370de8201c09e18f240d00192f`.
+Its environment and preflight hashes equal the first run's hashes above.
+
 ## What this does not prove
 
 The model broker in this Linux lifecycle case is a deterministic Host fixture;
 it verifies Dolly's streaming requirement and composition, not network SSE.
 The separate owner-Aether Memory run supplies the real strict-SSE evidence.
-This single task is not a broad Agent benchmark, and it does not support
-write, network, destructive, or approval-requiring tools.
+These fixtures are not a broad Agent or Memory benchmark. The simple checkpoint
+test demonstrates an explicit, sourced representation and cue-driven reload;
+it does not identify the right retrieval, association, consolidation, or
+automatic-resume design. The registered tool set remains read-only. The private
+checkpoint policy permits bounded `set`, `list`, and `get`, but not delete,
+ambient network, destructive operations, or approval-requiring tools.
 
 The permission-policy registry is still an in-process operator input rather
 than a persistent, revision-controlled product configuration. Ordinary process
