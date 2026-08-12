@@ -1064,6 +1064,51 @@ describe("CORE scheduler policy boundary", () => {
     await stopping;
   });
 
+  it("dispatches the immutable decision value even when an observer mutates the policy object", async () => {
+    const mutableDecision = {
+      eligible: true,
+      eligibleAt: 0,
+      claimLimitCount: 1,
+      claimLimitBytes: 1_024,
+      reasonCode: "MUTABLE_POLICY",
+      policyName: "mutable-policy",
+      policyVersion: "1",
+    };
+    const policy: SchedulerPolicy = { decide: () => mutableDecision };
+    let observerMutatedDecision = false;
+    const { clock, mailboxes, scheduler } = createScheduler({
+      policy,
+      onEvent: (event) => {
+        if (event.type === "scheduler.decision" && event.eligible) {
+          mutableDecision.claimLimitCount = 1_000;
+          mutableDecision.claimLimitBytes = 1_000_000;
+          observerMutatedDecision = true;
+        }
+      },
+    });
+    const runtime = new FakeModuleRuntime();
+    mailboxes.set("worker", 1, 100);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(observerMutatedDecision).toBe(true);
+    expect(runtime.receivedClaimLimits).toEqual([{
+      claimLimitCount: 1,
+      claimLimitBytes: 1_024,
+    }]);
+    const stopping = scheduler.stop();
+    runtime.settle({ status: "idle" });
+    await stopping;
+  });
+
   it("does not let a selected policy invent reactive work with no pending input", async () => {
     const policy: SchedulerPolicy = {
       decide: () => ({

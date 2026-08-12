@@ -1529,27 +1529,62 @@ export class ModuleScheduler {
     }
   }
 
-  #validateDecision(decision: SchedulerDecision): SchedulerDecision {
+  #validateDecision(candidate: SchedulerDecision): SchedulerDecision {
+    if (candidate === null || typeof candidate !== "object") {
+      throw new TypeError("Scheduler policy returned an invalid decision");
+    }
+    // Snapshot every field exactly once. A policy retains its own object and
+    // an observer runs synchronously before dispatch, so continuing to read
+    // the caller-owned object after validation would create a reentrancy gap.
+    const eligible = candidate.eligible;
+    const eligibleAt = candidate.eligibleAt;
+    const claimLimitCount = candidate.claimLimitCount;
+    const claimLimitBytes = candidate.claimLimitBytes;
+    const reasonCode = candidate.reasonCode;
+    const policyName = candidate.policyName;
+    const policyVersion = candidate.policyVersion;
+    const missedPeriods = candidate.missedPeriods;
+    const retryDelayMs = candidate.retryDelayMs;
+    const blockingDownstreamIds = candidate.blockingDownstreamIds;
     if (
-      decision === null ||
-      typeof decision !== "object" ||
-      typeof decision.eligible !== "boolean" ||
-      typeof decision.reasonCode !== "string" ||
-      typeof decision.policyName !== "string" ||
-      typeof decision.policyVersion !== "string" ||
-      (decision.eligibleAt !== null && !Number.isFinite(decision.eligibleAt)) ||
-      !Number.isSafeInteger(decision.claimLimitCount) ||
-      decision.claimLimitCount <= 0 ||
-      decision.claimLimitCount > this.#claimLimitCount ||
-      !Number.isSafeInteger(decision.claimLimitBytes) ||
-      decision.claimLimitBytes <= 0 ||
-      decision.claimLimitBytes > this.#claimLimitBytes ||
-      (decision.missedPeriods !== undefined &&
-        (!Number.isSafeInteger(decision.missedPeriods) || decision.missedPeriods < 0))
+      typeof eligible !== "boolean" ||
+      typeof reasonCode !== "string" ||
+      typeof policyName !== "string" ||
+      typeof policyVersion !== "string" ||
+      (eligibleAt !== null && !Number.isFinite(eligibleAt)) ||
+      !Number.isSafeInteger(claimLimitCount) ||
+      claimLimitCount <= 0 ||
+      claimLimitCount > this.#claimLimitCount ||
+      !Number.isSafeInteger(claimLimitBytes) ||
+      claimLimitBytes <= 0 ||
+      claimLimitBytes > this.#claimLimitBytes ||
+      (missedPeriods !== undefined &&
+        (!Number.isSafeInteger(missedPeriods) || missedPeriods < 0)) ||
+      (retryDelayMs !== undefined &&
+        (!Number.isSafeInteger(retryDelayMs) || retryDelayMs < 0)) ||
+      (blockingDownstreamIds !== undefined &&
+        (!Array.isArray(blockingDownstreamIds) ||
+          blockingDownstreamIds.some((moduleId) =>
+            typeof moduleId !== "string" || !ID_PATTERN.test(moduleId)
+          ) ||
+          new Set(blockingDownstreamIds).size !== blockingDownstreamIds.length))
     ) {
       throw new TypeError("Scheduler policy returned an invalid decision");
     }
-    return decision;
+    return deepFreeze({
+      eligible,
+      eligibleAt,
+      claimLimitCount,
+      claimLimitBytes,
+      reasonCode,
+      policyName,
+      policyVersion,
+      ...(missedPeriods === undefined ? {} : { missedPeriods }),
+      ...(retryDelayMs === undefined ? {} : { retryDelayMs }),
+      ...(blockingDownstreamIds === undefined
+        ? {}
+        : { blockingDownstreamIds: [...blockingDownstreamIds] }),
+    });
   }
 
   #applyBackpressure(

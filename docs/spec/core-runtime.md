@@ -2250,9 +2250,14 @@ interface SchedulerDecision {
 `claimLimitCount` and `claimLimitBytes` are executable batch parameters, not
 observability fields. The scheduler MUST pass the exact validated decision
 values to the runtime tick that it dispatches, and the runtime MUST use them for
-that tick's Delivery Claim. Per-Module runtime configuration supplies hard
-maximum count and byte limits. Product composition sets the Scheduler's trusted
-count and byte ceilings no higher than any registered runtime maximum. A
+that tick's Delivery Claim. Before emitting an event or dispatching work, Core
+MUST copy every supported decision field exactly once into a Core-owned,
+immutable value and validate that copy. The policy and event observers may
+retain references to their own objects, but later mutation of those objects
+MUST NOT change the decision used for dispatch. Per-Module runtime configuration
+supplies hard maximum count and byte limits. Product composition sets the
+Scheduler's trusted count and byte ceilings no higher than any registered
+runtime maximum. A
 selected policy may reduce those values but MUST NOT exceed either Scheduler
 ceiling; an oversized decision is a policy failure and is rejected before the
 runtime is dispatched, after which the declared safe fallback or visible
