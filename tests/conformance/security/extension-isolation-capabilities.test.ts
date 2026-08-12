@@ -202,6 +202,15 @@ describe("Extension process isolation and capability checks", () => {
         producedContentSchemas: [],
       }],
     } satisfies ExtensionPackageManifest],
+    ["dolly.extension-package/4", {
+      ...FIXTURE_PACKAGE_MANIFEST,
+      schemaVersion: "dolly.extension-package/4",
+      modules: [{
+        ...FIXTURE_PACKAGE_MANIFEST.modules[0]!,
+        activation: "periodic",
+        producedContentSchemas: [],
+      }],
+    } satisfies ExtensionPackageManifest],
   ] as const)("negotiates the common process contract for %s", async (
     _schemaVersion,
     manifest,

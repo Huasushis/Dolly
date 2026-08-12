@@ -56,6 +56,7 @@ const FIRST_MODULE_ID = "scheduler-first";
 const SECOND_MODULE_ID = "scheduler-second";
 const DRAINER_MODULE_ID = "scheduler-drainer";
 const SOURCE_MODULE_ID = "scheduler-source";
+const PERIODIC_MODULE_ID = "scheduler-periodic";
 const MODULE_IDS = [FIRST_MODULE_ID, SECOND_MODULE_ID, DRAINER_MODULE_ID] as const;
 const LIMITS: ModuleCgroupLimits = {
   memoryMaxBytes: 268_435_456,
@@ -1070,6 +1071,349 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       ];
       if (failures.length > 0) {
         throw new AggregateError(failures, "Installed Source Module integration failed");
+      }
+    }
+  }, 60_000);
+
+  it("runs an installed non-empty periodic Module no earlier than its start-to-start period", async () => {
+    if (integrationUnitName === undefined) {
+      throw new Error("The transient Core service unit name is unavailable");
+    }
+    const inspectedBinding = await inspectCoreServiceBinding({
+      unitName: integrationUnitName,
+      mode: "user",
+      queryTimeoutMs: 5_000,
+      overallTimeoutMs: 15_000,
+    });
+    if (!inspectedBinding.verified) {
+      throw new Error(inspectedBinding.failures
+        .map((failure) => `${failure.code}: ${failure.detail}`)
+        .join("; "));
+    }
+    const preparedRoot = await prepareDelegatedCgroupRoot({
+      delegatedRootCgroupPath: inspectedBinding.binding.delegatedRootCgroupPath,
+    });
+    if (!preparedRoot.prepared) {
+      throw new Error(`${preparedRoot.failure.code}: ${preparedRoot.failure.detail}`);
+    }
+
+    const scratchParent = resolve(process.cwd(), ".tmp");
+    mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
+    const scratch = mkdtempSync(join(scratchParent, "installed-periodic-host-integration-"));
+    const statePath = join(scratch, "core-state.json");
+    const commitPath = join(scratch, "module-result-commits.json");
+    const processGenerationId =
+      `${PERIODIC_MODULE_ID}-process-${process.pid}-${Date.now()}`;
+    const moduleCgroupPath = deriveModuleCgroupPath(
+      inspectedBinding.binding.delegatedRootCgroupPath,
+      { instanceId: INSTANCE_ID, moduleId: PERIODIC_MODULE_ID, processGenerationId },
+    ).filesystemPath;
+    const periodMs = 750;
+    let composed: InstalledReactiveModuleHost | undefined;
+    let stopped = false;
+    let primaryFailure: unknown;
+    try {
+      const packageSource = join(scratch, "package-source");
+      mkdirSync(packageSource, { recursive: true, mode: 0o700 });
+      copyFileSync(FIXTURE_PATH, join(packageSource, "extension.mjs"));
+      const configurationSchema = {
+        $schema: JSON_SCHEMA_2020_12,
+        type: "object",
+        properties: { prefix: { type: "string" } },
+        required: ["prefix"],
+        additionalProperties: false,
+      } as const;
+      writeFileSync(join(packageSource, "dolly-extension.json"), JSON.stringify({
+        schemaVersion: "dolly.extension-package/4",
+        extensionId: "org.example.scheduler-installed",
+        packageVersion: "1.0.0",
+        displayName: "Installed periodic Scheduler integration fixture",
+        description: "Consumes pending input no earlier than its configured period.",
+        supportedProtocolVersions: ["3.0"],
+        entrypoint: "extension.mjs",
+        modules: [{
+          moduleKind: "transform",
+          activation: "periodic",
+          configVersion: 1,
+          configurationSchema,
+          producedContentSchemas: [],
+        }],
+        requestedCapabilities: [],
+      }), "utf8");
+      const installations = new ExtensionInstallationRegistry({
+        directory: join(scratch, "installations"),
+      });
+      const installed = installations.installNodePackage({
+        sourceDirectory: packageSource,
+        trust: "trusted",
+      });
+      rmSync(packageSource, { recursive: true, force: true });
+      const configurations = new ModuleConfigurationStore({
+        directory: join(scratch, "configurations"),
+      });
+      const periodicConfiguration = configurations.create({
+        configId: "scheduler-periodic-config",
+        extensionId: "org.example.scheduler-installed",
+        moduleKind: "transform",
+        configVersion: 1,
+        schema: configurationSchema,
+        configuration: { prefix: "periodic" },
+      });
+      const defaults = createDefaultDollyInstanceConfig(INSTANCE_ID);
+      const configuration = validateDollyInstanceConfig({
+        ...defaults,
+        core: {
+          ...defaults.core,
+          scheduler: {
+            pollIntervalMs: 60_000,
+            retryBaseMs: 25,
+            retryMaxMs: 250,
+          },
+        },
+        pages: [{ pageId: "periodic-input" }, { pageId: "periodic-output" }],
+        modules: [{
+          moduleId: PERIODIC_MODULE_ID,
+          extensionId: "org.example.scheduler-installed",
+          packageVersion: "1.0.0",
+          moduleKind: "transform",
+          isolation: "process",
+          configurationReference: {
+            configId: periodicConfiguration.configId,
+            revision: periodicConfiguration.revision,
+            configVersion: periodicConfiguration.configVersion,
+          },
+          permissionPolicyIds: [],
+          inputPageIds: ["periodic-input"],
+          outputPageIds: ["periodic-output"],
+          subscriptionStart: "from-now",
+          activation: { kind: "periodic", periodMs, allowEmptyInput: false },
+          limits: {
+            claim: { maxCount: 1, maxBytes: 64 * 1_024 },
+            maxInputBytes: 64 * 1_024,
+            maxResultBytes: 64 * 1_024,
+            maxFrameBytes: 128 * 1_024,
+            maxRunsPerGeneration: 10,
+            maxGenerations: 2,
+          },
+          timeouts: {
+            initializationTimeoutMs: 10_000,
+            executionTimeoutMs: 5_000,
+            cancellationGraceMs: 1_000,
+            terminationTimeoutMs: 10_000,
+          },
+        }],
+      });
+
+      let blockId = 0;
+      let deliveryId = 0;
+      let protocolIdentifier = 0;
+      let processIdentifierAllocated = false;
+      const now = (): string => new Date().toISOString();
+      const contentSchemas = resolveInstalledContentSchemaRegistrationSet({
+        instanceConfiguration: configuration,
+        installations,
+        reservedRegistrations: [],
+        maxRegisteredValueBytes: 64 * 1_024,
+      });
+      const coreState = createFileCoreStateStoreWithStoppedRecordWriter({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `periodic-block-${++blockId}`,
+        nextDeliveryId: (kind) => `periodic-${kind}-${++deliveryId}`,
+        now,
+        contentSchemas,
+      });
+      coreState.store.deliveries.createPage("periodic-input");
+      coreState.store.deliveries.createPage("periodic-output");
+      coreState.store.deliveries.registerConsumer(
+        "periodic-input",
+        PERIODIC_MODULE_ID,
+        "from-now",
+      );
+      const repository = new FileModuleResultCommitRepository({ path: commitPath });
+      const mailboxes = [{
+        consumerId: PERIODIC_MODULE_ID,
+        pageIds: ["periodic-input"],
+        maxResidentCount: 4,
+        maxResidentBytes: 64 * 1_024,
+      }];
+      const startupRecoveryHandoff = (await new CoreStartupRecovery({
+        deliveries: coreState.store.deliveries,
+        commits: createModuleResultCommitCoordinator({
+          core: coreState.store,
+          repository,
+          now,
+          mailboxes,
+        }),
+        moduleRecords: coreState.store,
+        stoppedRecordWriter: coreState.stoppedRecordWriter,
+      }).recover()).handoff;
+      const schedulerEvents: SchedulerEvent[] = [];
+      const actorEvents: ModuleActorEvent[] = [];
+      composed = composeInstalledReactiveModuleHost({
+        configuration,
+        installations,
+        configurations,
+        coreState,
+        contentSchemas,
+        maxRegisteredContentValueBytes: 64 * 1_024,
+        mailboxes,
+        startupRecoveryHandoff,
+        clock: systemSchedulerClock(),
+        scheduling: {
+          maxConcurrentModules: 1,
+          backpressureAction: "pause-upstream",
+          downstreamRecheckMs: 100,
+          noProgressAfterMs: 5_000,
+          claimLimitCount: 1,
+          claimLimitBytes: 64 * 1_024,
+          retryJitterRatio: 0,
+          lowWatermarkRatio: 1,
+        },
+        runtime: {
+          resultCommitRepository: repository,
+          now,
+          initialModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-1`,
+          nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
+          binding: inspectedBinding.binding,
+          lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
+          launcher: {
+            interpreterProgram: PYTHON,
+            launcherScriptPath: defaultLauncherScriptPath(),
+            controllerTimeouts: {
+              configureTimeoutMs: 5_000,
+              inCgroupTimeoutMs: 5_000,
+              membershipTimeoutMs: 5_000,
+              exitObservationTimeoutMs: 5_000,
+            },
+          },
+          host: {
+            isolationPolicy: new ExtensionIsolationPolicy(),
+            shutdownRequestTimeoutMs: 2_000,
+            forceKillDelayMs: 500,
+          },
+          channelCloseTimeoutMs: 5_000,
+          nextProcessGenerationId: () => {
+            if (processIdentifierAllocated) {
+              throw new Error("The periodic integration attempted another process generation");
+            }
+            processIdentifierAllocated = true;
+            return processGenerationId;
+          },
+          nextProtocolIdentifier: (purpose) =>
+            `${purpose}-scheduler-periodic-${++protocolIdentifier}`,
+          classifyFailure: (failure) => ({ code: failure.code, retryable: false }),
+          onActorEvent: (event) => actorEvents.push(event),
+        },
+        onSchedulerEvent: (event) => schedulerEvents.push(event),
+      });
+      await composed.host.start();
+      expect(composed.host.state).toBe("running");
+      expect(await waitFor(
+        () => schedulerEvents.some((event) =>
+          event.type === "scheduler.decision" &&
+          event.moduleId === PERIODIC_MODULE_ID &&
+          event.reasonCode === "NO_PENDING_INPUT"
+        ),
+        2_000,
+      )).toBe(true);
+      expect(actorEvents.filter((event) => event.type === "run.started")).toHaveLength(0);
+
+      const firstInput = coreState.store.blocks.commit(proposal("periodic first"), {
+        kind: "external",
+        id: "periodic-integration",
+      });
+      coreState.store.deliveries.append("periodic-input", firstInput.id);
+      expect(await waitFor(
+        () => repository.list().length === 1 && repository.list()[0]?.state === "committed",
+        5_000,
+      )).toBe(true);
+      const secondInput = coreState.store.blocks.commit(proposal("periodic second"), {
+        kind: "external",
+        id: "periodic-integration",
+      });
+      coreState.store.deliveries.append("periodic-input", secondInput.id);
+      expect(await waitFor(
+        () => schedulerEvents.some((event) =>
+          event.type === "scheduler.decision" &&
+          event.moduleId === PERIODIC_MODULE_ID &&
+          event.reasonCode === "PERIOD_NOT_DUE"
+        ),
+        2_000,
+      )).toBe(true);
+      expect(await waitFor(
+        () => repository.list().length === 2 &&
+          repository.list().every((record) => record.state === "committed"),
+        5_000,
+      )).toBe(true);
+      const dispatches = schedulerEvents.filter(
+        (event): event is Extract<SchedulerEvent, { type: "scheduler.dispatched" }> =>
+          event.type === "scheduler.dispatched" && event.moduleId === PERIODIC_MODULE_ID,
+      );
+      expect(dispatches).toHaveLength(2);
+      expect(dispatches[0]?.reasonCode).toBe("READY_PERIODIC");
+      expect(dispatches[1]?.reasonCode).toBe("READY_PERIODIC");
+      const startDeltaMs = dispatches[1]!.monotonicAt - dispatches[0]!.monotonicAt;
+      expect(startDeltaMs).toBeGreaterThanOrEqual(periodMs);
+      expect(actorEvents.filter((event) => event.type === "run.started")).toHaveLength(2);
+      expect(coreState.store.deliveries.inspectPending(
+        PERIODIC_MODULE_ID,
+        ["periodic-input"],
+      ).pendingCount).toBe(0);
+
+      await composed.host.stop();
+      stopped = true;
+      expect(coreState.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
+        state: "stopped",
+        moduleCgroupPath,
+      });
+      expect(existsSync(moduleCgroupPath)).toBe(false);
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `reopened-periodic-block-${++blockId}`,
+        nextDeliveryId: (kind) => `reopened-periodic-${kind}-${++deliveryId}`,
+        now,
+        contentSchemas,
+      });
+      const reopenedRepository = new FileModuleResultCommitRepository({ path: commitPath });
+      expect(reopenedRepository.list()).toHaveLength(2);
+      expect(reopenedRepository.list().every((record) => record.state === "committed")).toBe(true);
+      expect(reopened.getModuleProcessRecord(processGenerationId)?.state).toBe("stopped");
+
+      console.info(JSON.stringify({
+        packageSchemaVersion: installed.manifest.schemaVersion,
+        packageDigest: installed.packageDigest,
+        moduleId: PERIODIC_MODULE_ID,
+        periodMs,
+        startDeltaMs,
+        waitingReasonCode: "PERIOD_NOT_DUE",
+        dispatchReasonCode: "READY_PERIODIC",
+        actorRuns: 2,
+        committedModuleResults: reopenedRepository.list().length,
+        finalRecordState: reopened.getModuleProcessRecord(processGenerationId)?.state,
+        cgroupRemoved: !existsSync(moduleCgroupPath),
+      }));
+    } catch (error) {
+      primaryFailure = error;
+    } finally {
+      const cleanupFailures: unknown[] = [];
+      if (!stopped && composed !== undefined &&
+        (composed.host.state === "running" || composed.host.state === "failed")) {
+        await composed.host.stop().catch((error) => cleanupFailures.push(error));
+      }
+      if (existsSync(moduleCgroupPath)) {
+        cleanupFailures.push(
+          new Error(`Exact periodic Module control group remained after cleanup: ${moduleCgroupPath}`),
+        );
+      }
+      rmSync(scratch, { recursive: true, force: true });
+      const failures = [
+        ...(primaryFailure === undefined ? [] : [primaryFailure]),
+        ...cleanupFailures,
+      ];
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "Installed periodic Module integration failed");
       }
     }
   }, 60_000);

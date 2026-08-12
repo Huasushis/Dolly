@@ -540,6 +540,35 @@ describe("static Extension installation registry", () => {
     );
   });
 
+  it("installs a version 4 package that explicitly declares periodic activation", () => {
+    writePackage(sourceDirectory, {
+      schemaVersion: "dolly.extension-package/4",
+      modules: [moduleDeclarationV2({ activation: "periodic" })],
+    });
+
+    const installed = registry().installNodePackage({
+      sourceDirectory,
+      trust: "trusted",
+    });
+    const reopened = registry().resolve({
+      extensionId: "org.example.transform",
+      packageVersion: "Release:2026_07",
+    });
+
+    expect(reopened).toEqual(installed);
+    expect(installed.manifest.schemaVersion).toBe("dolly.extension-package/4");
+    if (installed.manifest.schemaVersion !== "dolly.extension-package/4") {
+      throw new Error("Expected package schema version 4");
+    }
+    expect(installed.manifest.modules[0]).toMatchObject({
+      moduleKind: "transform",
+      activation: "periodic",
+      producedContentSchemas: [
+        expect.objectContaining({ schema: "org.example.transform.result/1" }),
+      ],
+    });
+  });
+
   it.each([
     "../outside.mjs",
     "/outside.mjs",

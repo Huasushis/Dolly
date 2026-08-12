@@ -54,6 +54,7 @@ const PACKAGE_MANIFEST_FILE = "dolly-extension.json";
 const PACKAGE_SCHEMA_VERSION_V1 = "dolly.extension-package/1";
 const PACKAGE_SCHEMA_VERSION_V2 = "dolly.extension-package/2";
 const PACKAGE_SCHEMA_VERSION_V3 = "dolly.extension-package/3";
+const PACKAGE_SCHEMA_VERSION_V4 = "dolly.extension-package/4";
 const INSTALLATION_RECORD_SCHEMA_VERSION = "dolly.extension-installation/1";
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
@@ -96,10 +97,17 @@ export interface ExtensionPackageModuleV3 extends ExtensionPackageModuleCommon {
   readonly producedContentSchemas: readonly ExtensionContentSchemaProducer[];
 }
 
+export interface ExtensionPackageModuleV4 extends ExtensionPackageModuleCommon {
+  /** Version 4 also permits the Scheduler's non-empty periodic activation. */
+  readonly activation: "reactive" | "periodic" | "source";
+  readonly producedContentSchemas: readonly ExtensionContentSchemaProducer[];
+}
+
 export type ExtensionPackageModule =
   | ExtensionPackageModuleV1
   | ExtensionPackageModuleV2
-  | ExtensionPackageModuleV3;
+  | ExtensionPackageModuleV3
+  | ExtensionPackageModuleV4;
 
 /**
  * The closed Extension package manifest is read before any Extension code
@@ -132,10 +140,16 @@ export interface ExtensionPackageManifestV3 extends ExtensionPackageManifestComm
   readonly modules: readonly ExtensionPackageModuleV3[];
 }
 
+export interface ExtensionPackageManifestV4 extends ExtensionPackageManifestCommon {
+  readonly schemaVersion: "dolly.extension-package/4";
+  readonly modules: readonly ExtensionPackageModuleV4[];
+}
+
 export type ExtensionPackageManifest =
   | ExtensionPackageManifestV1
   | ExtensionPackageManifestV2
-  | ExtensionPackageManifestV3;
+  | ExtensionPackageManifestV3
+  | ExtensionPackageManifestV4;
 
 export interface ExtensionModuleCompatibility {
   readonly extensionId: string;
@@ -420,7 +434,8 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
   if (
     value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V1 &&
     value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V2 &&
-    value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V3
+    value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V3 &&
+    value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V4
   ) {
     throw new ExtensionInstallationError(
       "EXTENSION_PACKAGE_INVALID",
@@ -478,10 +493,13 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
       );
     }
     moduleKinds.add(moduleKind);
-    if (
-      candidate.activation !== "reactive" &&
-      !(schemaVersion === PACKAGE_SCHEMA_VERSION_V3 && candidate.activation === "source")
-    ) {
+    const activationSupported = candidate.activation === "reactive" ||
+      ((schemaVersion === PACKAGE_SCHEMA_VERSION_V3 ||
+        schemaVersion === PACKAGE_SCHEMA_VERSION_V4) &&
+        candidate.activation === "source") ||
+      (schemaVersion === PACKAGE_SCHEMA_VERSION_V4 &&
+        candidate.activation === "periodic");
+    if (!activationSupported) {
       throw new ExtensionInstallationError(
         "EXTENSION_PACKAGE_INVALID",
         `${label}.activation is unsupported by package schema ${schemaVersion}`,
@@ -498,7 +516,7 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     }
     const common = {
       moduleKind,
-      activation: candidate.activation as "reactive" | "source",
+      activation: candidate.activation as "reactive" | "periodic" | "source",
       configVersion: positiveInteger(candidate.configVersion, `${label}.configVersion`),
       configurationSchema: cloneJson(candidate.configurationSchema as JsonValue),
     };
@@ -604,7 +622,7 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
   if (!Array.isArray(value.requestedCapabilities) || value.requestedCapabilities.length !== 0) {
     throw new ExtensionInstallationError(
       "EXTENSION_PACKAGE_INVALID",
-      "requestedCapabilities must be empty in package schema versions 1 through 3",
+      "requestedCapabilities must be empty in package schema versions 1 through 4",
     );
   }
   return deepFreeze({

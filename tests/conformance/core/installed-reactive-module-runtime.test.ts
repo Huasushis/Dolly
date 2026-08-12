@@ -905,6 +905,99 @@ describe("installed reactive Module runtime composition", () => {
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
 
+  it("binds a package-version-4 non-empty periodic Module to the installed Scheduler", async () => {
+    const periodicPackage = resolve(scratch, "periodic-package");
+    mkdirSync(periodicPackage, { recursive: true, mode: 0o700 });
+    writeFileSync(resolve(periodicPackage, "main.mjs"), "export const periodic = true;\n", "utf8");
+    writeFileSync(resolve(periodicPackage, "dolly-extension.json"), JSON.stringify({
+      schemaVersion: "dolly.extension-package/4",
+      extensionId: "org.example.installed-runtime",
+      packageVersion: "4.0.0",
+      displayName: "Installed periodic fixture",
+      description: "Exercises non-empty periodic Scheduler composition.",
+      supportedProtocolVersions: ["3.0"],
+      entrypoint: "main.mjs",
+      modules: [{
+        moduleKind: "transform",
+        activation: "periodic",
+        configVersion: 1,
+        configurationSchema: SCHEMA,
+        producedContentSchemas: [],
+      }],
+      requestedCapabilities: [],
+    }), "utf8");
+    installations.installNodePackage({ sourceDirectory: periodicPackage, trust: "trusted" });
+    const periodicInstance = validateDollyInstanceConfig({
+      ...instanceConfiguration,
+      modules: [{
+        ...instanceConfiguration.modules[0]!,
+        packageVersion: "4.0.0",
+        activation: { kind: "periodic", periodMs: 250, allowEmptyInput: false },
+      }],
+    });
+    const pair = coreState("periodic", periodicInstance);
+    const complete = options(pair);
+    const {
+      configurations: _configurations,
+      core: _core,
+      initialModuleGenerationId,
+      installations: _installations,
+      instanceConfiguration: _instanceConfiguration,
+      mailboxes,
+      moduleId: _moduleId,
+      monotonicNow: _monotonicNow,
+      nextModuleGenerationId,
+      stoppedRecordWriter: _stoppedRecordWriter,
+      ...sharedRuntime
+    } = complete;
+    const runtime = {
+      ...sharedRuntime,
+      initialModuleGenerationIdFor: (moduleId: string) =>
+        `${moduleId}-${initialModuleGenerationId}`,
+      nextModuleGenerationIdFor: (moduleId: string) =>
+        `${moduleId}-${nextModuleGenerationId()}`,
+    };
+    const handoff = await startupHandoff(
+      pair,
+      runtime.resultCommitRepository,
+      mailboxes,
+    );
+    const composed = composeInstalledReactiveModuleHost({
+      configuration: periodicInstance,
+      installations,
+      configurations,
+      coreState: pair,
+      ...contentSchemaOptions(pair),
+      mailboxes,
+      startupRecoveryHandoff: handoff,
+      clock: {
+        monotonicNow: () => 0,
+        schedule: () => ({ cancel: () => undefined }),
+      },
+      scheduling: {
+        maxConcurrentModules: 1,
+        backpressureAction: "pause-upstream",
+        downstreamRecheckMs: 100,
+        noProgressAfterMs: 5_000,
+        claimLimitCount: 1,
+        claimLimitBytes: 1024,
+        retryJitterRatio: 0,
+        lowWatermarkRatio: 1,
+      },
+      runtime,
+    });
+
+    expect(composed.host.state).toBe("created");
+    expect(composed.installedRuntimes).toHaveLength(1);
+    expect(composed.installedRuntimes[0]?.resolvedModule.module.activation).toEqual({
+      kind: "periodic",
+      periodMs: 250,
+      allowEmptyInput: false,
+    });
+    expect(composed.sourceActivationQueues).toEqual([]);
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
+  });
+
   it("composes every configured installed Module into one Scheduler host", async () => {
     const first = instanceConfiguration.modules[0]!;
     const pipelineConfiguration = validateDollyInstanceConfig({

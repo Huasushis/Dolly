@@ -93,7 +93,8 @@ export interface ReactiveModuleHostComposition {
 /**
  * Builds the product-before-startup Delivery-backed vertical slice from one
  * validated instance document. Package versions 1 and 2 support reactive
- * Modules; version 3 can additionally declare the durable source mode. The
+ * Modules; version 3 can additionally declare the durable source mode, and
+ * version 4 can declare the non-empty periodic mode. The
  * Scheduler itself can preserve a non-empty periodic descriptor, but
  * composition rejects it until a later complete package schema can declare
  * that support. Page routes and the three released

@@ -162,9 +162,6 @@ function createInstalledReactiveModuleRuntimeInternal(
     configurations: options.configurations,
   });
   const module = resolvedModule.module;
-  if (module.activation.kind === "periodic") {
-    throw new TypeError("Installed Module runtime does not support periodic activation");
-  }
   if (
     module.activation.kind === "source" &&
     module.activation.trigger === "periodic"

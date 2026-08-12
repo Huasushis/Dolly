@@ -555,16 +555,18 @@ function moduleKindsFromManifest(manifest: ExtensionPackageManifest): readonly s
   if (
     manifest.schemaVersion !== "dolly.extension-package/1" &&
     manifest.schemaVersion !== "dolly.extension-package/2" &&
-    manifest.schemaVersion !== "dolly.extension-package/3"
+    manifest.schemaVersion !== "dolly.extension-package/3" &&
+    manifest.schemaVersion !== "dolly.extension-package/4"
   ) {
     throw new ExtensionProcessHostError(
       "EXTENSION_PROCESS_PROTOCOL_INCOMPATIBLE",
       "Extension manifest version is unsupported",
     );
   }
-  // Versions 2 and 3 add static Core-owned schema/source declarations. They
-  // do not change process negotiation and grant no process capability. Keep
-  // this boundary closed even if a caller forges the TypeScript manifest type.
+  // Versions 2 through 4 add static Core-owned schema and activation
+  // declarations. They do not change process negotiation and grant no process
+  // capability. Keep this boundary closed even if a caller forges the
+  // TypeScript manifest type.
   if (
     !Array.isArray(manifest.requestedCapabilities) ||
     manifest.requestedCapabilities.length !== 0
