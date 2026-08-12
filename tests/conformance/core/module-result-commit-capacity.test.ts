@@ -769,4 +769,83 @@ describe("FileCore Module output capacity", () => {
     expect(core.listModuleSubmissionRecords()).toHaveLength(1);
     expect(core.deliveries.listActiveClaims()).toHaveLength(1);
   });
+
+  it("recovers the same prepared result regardless of repository enumeration order", async () => {
+    async function recoverOne(reverseList: boolean): Promise<{
+      readonly recoveredModuleJobId: string;
+      readonly sortedModuleJobIds: readonly string[];
+    }> {
+      const root = scratch(reverseList ? "capacity-order-reverse" : "capacity-order-forward");
+      const core = openCore(join(root, "core-state.json"), "order");
+      for (const pageId of ["input-a", "input-b", "output"]) {
+        core.deliveries.createPage(pageId);
+      }
+      core.deliveries.registerConsumer("input-a", "worker-a", "from-now");
+      core.deliveries.registerConsumer("input-b", "worker-b", "from-now");
+      core.deliveries.registerConsumer("output", "sink", "from-now");
+
+      const resident = core.blocks.commit(proposal("resident"), {
+        kind: "external",
+        id: "console",
+      });
+      core.deliveries.append("output", resident.id);
+      const left = prepareWorker(core, "worker-a", "input-a");
+      const right = prepareWorker(core, "worker-b", "input-b");
+      const stored = new InMemoryModuleResultCommitRepository();
+      const repository: ModuleResultCommitRepository = {
+        createPrepared: (record) => stored.createPrepared(record),
+        get: (moduleJobId) => stored.get(moduleJobId),
+        compareAndSet: (moduleJobId, revision, next) =>
+          stored.compareAndSet(moduleJobId, revision, next),
+        list: () => {
+          const records = [...stored.list()];
+          return reverseList ? records.reverse() : records;
+        },
+      };
+      const commits = createModuleResultCommitCoordinator({
+        core,
+        repository,
+        now: () => NOW,
+        mailboxes: [{
+          consumerId: "sink",
+          pageIds: ["output"],
+          maxResidentCount: 1,
+          maxResidentBytes: 1024 * 1024,
+        }],
+      });
+
+      for (const input of [left, right]) {
+        await expect(commits.commit(input)).rejects.toMatchObject({
+          code: "MODULE_RESULT_OUTPUT_BACKPRESSURED",
+          blockedConsumerIds: ["sink"],
+        });
+      }
+
+      const sinkClaim = core.deliveries.claim({
+        consumerId: "sink",
+        pageIds: ["output"],
+        moduleGenerationId: "sink-generation",
+        maxCount: 1,
+        maxBytes: 1024 * 1024,
+      })!;
+      persistSubmittedClaim(core, "sink", sinkClaim);
+      expect(core.acknowledgeDeliveryClaim(sinkClaim)).toBe("committed");
+
+      const recovery = await commits.recoverAll();
+      expect(recovery.recoveredCommits).toHaveLength(1);
+      expect(recovery.deferredCommits).toHaveLength(1);
+      return {
+        recoveredModuleJobId: recovery.recoveredCommits[0]!.moduleJobId,
+        sortedModuleJobIds: [left.moduleJobId, right.moduleJobId].sort((first, second) =>
+          first < second ? -1 : first > second ? 1 : 0,
+        ),
+      };
+    }
+
+    const forward = await recoverOne(false);
+    const reverse = await recoverOne(true);
+    expect(forward.recoveredModuleJobId).toBe(forward.sortedModuleJobIds[0]);
+    expect(reverse.recoveredModuleJobId).toBe(reverse.sortedModuleJobIds[0]);
+    expect(reverse.recoveredModuleJobId).toBe(forward.recoveredModuleJobId);
+  });
 });

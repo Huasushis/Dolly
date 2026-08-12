@@ -771,8 +771,14 @@ export class ModuleResultCommitCoordinator {
   async recoverAll(): Promise<ModuleResultCommitRecoveryReport> {
     const recovered: ModuleResultCommitRecord[] = [];
     const prepared: ModuleResultCommitRecord[] = [];
-    for (const record of this.#repository.list()) {
+    const records = [...this.#repository.list()];
+    for (const record of records) {
       assertModuleResultCommitRecord(record);
+    }
+    records.sort((left, right) =>
+      left.moduleJobId < right.moduleJobId ? -1 : left.moduleJobId > right.moduleJobId ? 1 : 0,
+    );
+    for (const record of records) {
       if (record.state === "prepared") {
         prepared.push(record);
       } else if (record.state === "committed") {
@@ -781,11 +787,13 @@ export class ModuleResultCommitCoordinator {
     }
 
     // A prepared result can be waiting for capacity that a later prepared
-    // result will release when it acknowledges its own input Claim. Journal
-    // order is not a dependency order, so one blocked entry must not prevent
-    // independent entries from recovering. Each successful pass removes at
-    // least one entry; if a complete pass makes no progress, preserve the
-    // existing fail-closed backpressure result for the caller.
+    // result will release when it acknowledges its own input Claim. Repository
+    // enumeration order is not a dependency order or a selection policy, so a
+    // validated snapshot is ordered canonically above and every later pass
+    // preserves that order. One blocked entry must not prevent independent
+    // entries from recovering. Each successful pass removes at least one
+    // entry; if a complete pass makes no progress, preserve the existing
+    // fail-closed backpressure result for the caller.
     let pending = prepared;
     let blockedConsumers = new Map<string, readonly string[]>();
     while (pending.length > 0) {
