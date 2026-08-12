@@ -653,7 +653,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       input,
       confinement: {
         processId: 2,
-        userId: 0,
+        userId: process.getuid?.(),
         currentDirectory: "/run/dolly/extension",
         entrypointPath: "/run/dolly/extension/extension-process-fixture.mjs",
         cgroup: "0::/",
