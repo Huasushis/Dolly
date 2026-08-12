@@ -25,6 +25,7 @@ import { defaultLauncherScriptPath } from "../../../src/adapters/linux-module-la
 import type { BlockProposal } from "../../../src/core/block-store.js";
 import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
 import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
+import { ModulePrivateStorageBackend } from "../../../src/core/capabilities/module-private-storage-capability.js";
 import { CoreStartupRecovery } from "../../../src/core/core-startup-recovery.js";
 import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
 import { ExtensionInstallationRegistry } from "../../../src/core/extension-installation-registry.js";
@@ -76,6 +77,7 @@ const DRAINER_MODULE_ID = "scheduler-drainer";
 const SOURCE_MODULE_ID = "scheduler-source";
 const PERIODIC_MODULE_ID = "scheduler-periodic";
 const AGENT_MODULE_ID = "scheduler-agent";
+const TASK_SWITCH_AGENT_MODULE_ID = "scheduler-task-switch-agent";
 const MODULE_IDS = [FIRST_MODULE_ID, SECOND_MODULE_ID, DRAINER_MODULE_ID] as const;
 const LIMITS: ModuleCgroupLimits = {
   memoryMaxBytes: 268_435_456,
@@ -88,6 +90,9 @@ const FIXTURE_PATH = fileURLToPath(
 );
 const AGENT_FIXTURE_PATH = fileURLToPath(
   new URL("../../../scripts/experiments/probes/general-agent-live-v0/extension.mjs", import.meta.url),
+);
+const TASK_SWITCH_AGENT_FIXTURE_PATH = fileURLToPath(
+  new URL("./fixtures/installed-task-switch-agent-extension.mjs", import.meta.url),
 );
 
 function delegatedRootCgroupPath(): string | undefined {
@@ -1797,6 +1802,541 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       ];
       if (failures.length > 0) {
         throw new AggregateError(failures, "Installed Scheduler Agent integration failed");
+      }
+    }
+  }, 60_000);
+
+  it("switches tasks and resumes a sourced checkpoint through one installed Scheduler Agent", async () => {
+    if (integrationUnitName === undefined) {
+      throw new Error("The transient Core service unit name is unavailable");
+    }
+    const inspectedBinding = await inspectCoreServiceBinding({
+      unitName: integrationUnitName,
+      mode: "user",
+      queryTimeoutMs: 5_000,
+      overallTimeoutMs: 15_000,
+    });
+    if (!inspectedBinding.verified) {
+      throw new Error(inspectedBinding.failures
+        .map((failure) => `${failure.code}: ${failure.detail}`)
+        .join("; "));
+    }
+    const preparedRoot = await prepareDelegatedCgroupRoot({
+      delegatedRootCgroupPath: inspectedBinding.binding.delegatedRootCgroupPath,
+    });
+    if (!preparedRoot.prepared) {
+      throw new Error(`${preparedRoot.failure.code}: ${preparedRoot.failure.detail}`);
+    }
+
+    const scratchParent = resolve(process.cwd(), ".tmp");
+    mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
+    const scratch = mkdtempSync(join(scratchParent, "installed-task-switch-agent-"));
+    const statePath = join(scratch, "core-state.json");
+    const commitPath = join(scratch, "module-result-commits.json");
+    const effectIntentPath = join(scratch, "effect-intents.json");
+    const storageRoot = join(scratch, "module-private-storage");
+    const processGenerationId =
+      `${TASK_SWITCH_AGENT_MODULE_ID}-process-${process.pid}-${Date.now()}`;
+    const moduleCgroupPath = deriveModuleCgroupPath(
+      inspectedBinding.binding.delegatedRootCgroupPath,
+      {
+        instanceId: INSTANCE_ID,
+        moduleId: TASK_SWITCH_AGENT_MODULE_ID,
+        processGenerationId,
+      },
+    ).filesystemPath;
+    const checkpointKey = "task.release-amber.checkpoint";
+    const checkpoint = {
+      schemaVersion: "dolly.task-checkpoint/1",
+      taskId: "release-amber",
+      objective: "Publish the staged release",
+      completed: ["built artifact"],
+      constraints: { channel: "canary", retentionHours: 24 },
+      nextAction: {
+        kind: "verify",
+        target: "canary-91",
+        reason: "check rollout health",
+      },
+      sourceId: "task-a-input",
+    } as const;
+    const tasks = [{
+      phase: "checkpoint",
+      taskId: checkpoint.taskId,
+      checkpointKey,
+      checkpoint,
+    }, {
+      phase: "unrelated",
+      taskId: "arithmetic-cobalt",
+      question: "What is 29 - 12?",
+    }, {
+      phase: "resume",
+      taskId: checkpoint.taskId,
+      request: "Resume this task from the stored checkpoint and identify the next action.",
+    }] as const;
+    let composed: InstalledReactiveModuleHost | undefined;
+    let stopped = false;
+    let primaryFailure: unknown;
+    try {
+      const packageSource = join(scratch, "package-source");
+      mkdirSync(packageSource, { recursive: true, mode: 0o700 });
+      copyFileSync(TASK_SWITCH_AGENT_FIXTURE_PATH, join(packageSource, "extension.mjs"));
+      const configurationSchema = {
+        $schema: JSON_SCHEMA_2020_12,
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      } as const;
+      writeFileSync(join(packageSource, "dolly-extension.json"), JSON.stringify({
+        schemaVersion: "dolly.extension-package/1",
+        extensionId: "org.example.scheduler-task-switch-agent",
+        packageVersion: "1.0.0",
+        displayName: "Installed task-switch Scheduler Agent fixture",
+        description: "Uses a Host-selected streaming model and one bounded task checkpoint store.",
+        supportedProtocolVersions: ["3.0"],
+        entrypoint: "extension.mjs",
+        modules: [{
+          moduleKind: "task-switch-agent",
+          activation: "reactive",
+          configVersion: 1,
+          configurationSchema,
+        }],
+        requestedCapabilities: [],
+      }), "utf8");
+      const installations = new ExtensionInstallationRegistry({
+        directory: join(scratch, "installations"),
+      });
+      const installed = installations.installNodePackage({
+        sourceDirectory: packageSource,
+        trust: "trusted",
+      });
+      rmSync(packageSource, { recursive: true, force: true });
+      const configurations = new ModuleConfigurationStore({
+        directory: join(scratch, "configurations"),
+      });
+      const agentConfiguration = configurations.create({
+        configId: "scheduler-task-switch-agent-config",
+        extensionId: "org.example.scheduler-task-switch-agent",
+        moduleKind: "task-switch-agent",
+        configVersion: 1,
+        schema: configurationSchema,
+        configuration: {},
+      });
+      const defaults = createDefaultDollyInstanceConfig(INSTANCE_ID);
+      const configuration = validateDollyInstanceConfig({
+        ...defaults,
+        core: {
+          ...defaults.core,
+          scheduler: {
+            pollIntervalMs: 60_000,
+            retryBaseMs: 25,
+            retryMaxMs: 250,
+          },
+        },
+        pages: [{ pageId: "task-switch-input" }, { pageId: "task-switch-output" }],
+        modules: [{
+          moduleId: TASK_SWITCH_AGENT_MODULE_ID,
+          extensionId: "org.example.scheduler-task-switch-agent",
+          packageVersion: "1.0.0",
+          moduleKind: "task-switch-agent",
+          isolation: "process",
+          configurationReference: {
+            configId: agentConfiguration.configId,
+            revision: agentConfiguration.revision,
+            configVersion: agentConfiguration.configVersion,
+          },
+          permissionPolicyIds: ["memory.owner-checkpoints", "model.owner-primary"],
+          inputPageIds: ["task-switch-input"],
+          outputPageIds: ["task-switch-output"],
+          subscriptionStart: "from-now",
+          activation: { kind: "reactive" },
+          limits: {
+            claim: { maxCount: 1, maxBytes: 64 * 1_024 },
+            maxInputBytes: 64 * 1_024,
+            maxResultBytes: 256 * 1_024,
+            maxFrameBytes: 512 * 1_024,
+            maxRunsPerGeneration: 10,
+            maxGenerations: 2,
+          },
+          timeouts: {
+            initializationTimeoutMs: 10_000,
+            executionTimeoutMs: 15_000,
+            cancellationGraceMs: 1_000,
+            terminationTimeoutMs: 10_000,
+          },
+        }],
+      });
+
+      const descriptors = new ModelDescriptorRegistry({
+        schemaDigest: `sha256:${"8".repeat(64)}`,
+        allowedStrategyIds: CHAT_STRATEGIES,
+      });
+      const baseDescriptor = chatDescriptor({
+        jsonObjectOutput: "supported",
+        reasoning: objectFormReasoning(),
+      });
+      const modelDescriptor = descriptors.register({
+        ...baseDescriptor,
+        features: {
+          ...baseDescriptor.features,
+          maxOutputTokens: { state: "supported", value: { maximum: 8_192 } },
+        },
+      });
+      descriptors.setStatus(modelDescriptor, "active");
+      const modelCalls: ChatBrokerInvocation[] = [];
+      const invokeModel = async (invocation: ChatBrokerInvocation) => {
+        modelCalls.push(invocation);
+        const messages = JSON.stringify(invocation.input.messages);
+        const finalContent = messages.includes("checkpointKey")
+          ? JSON.stringify({
+              action: "store_checkpoint",
+              taskId: checkpoint.taskId,
+              checkpointKey,
+              checkpoint,
+            })
+          : messages.includes("arithmetic-cobalt")
+            ? JSON.stringify({ action: "answer", taskId: "arithmetic-cobalt", answer: 17 })
+            : JSON.stringify({
+                action: "resume",
+                taskId: checkpoint.taskId,
+                nextAction: checkpoint.nextAction,
+                evidenceKeys: [checkpointKey],
+              });
+        return {
+          schemaVersion: "dolly.model-result/2" as const,
+          requestId: invocation.requestId,
+          operationId: invocation.context.operationId,
+          descriptor: invocation.descriptor,
+          status: "succeeded" as const,
+          output: {
+            schemaVersion: "dolly.model.chat-output/1" as const,
+            finalContent,
+            reasoning: { state: "not-observed" as const },
+            toolCalls: [],
+            finishReason: "stop",
+          },
+          usage: { providerAttempts: 1, observations: [] },
+        };
+      };
+      const storage = new ModulePrivateStorageBackend({
+        root: storageRoot,
+        now: () => new Date().toISOString(),
+      });
+      let modelRequest = 0;
+      const permissionPolicies = new InstalledModulePermissionPolicyRegistry({
+        nextRequestId: () => `installed-task-switch-model-${++modelRequest}`,
+        policies: [{
+          kind: "strict-streaming-chat",
+          policyId: "model.owner-primary",
+          descriptor: modelDescriptor,
+          ownerScope: "owner-1",
+          budgets: {
+            maxProviderAttempts: 1,
+            maxWallTimeMs: 30_000,
+            maxRequestBytes: 128 * 1_024,
+            maxResponseBytes: 128 * 1_024,
+            maxInputItems: 64,
+            maxInputBytes: 64 * 1_024,
+            maxOutputBytes: 64 * 1_024,
+            maxOutputTokens: 800,
+          },
+          chat: { invoke: invokeModel },
+          outputContracts: ["json-object"],
+          reasoningPolicies: ["disable"],
+          roles: ["system", "user"],
+          limits: {
+            maxInvocations: 3,
+            maxInvocationsPerRun: 1,
+            maxInvocationsPerWindow: 3,
+            rateWindowMs: 60_000,
+          },
+          capabilityLifetimeMs: 120_000,
+        }, {
+          kind: "module-private-storage",
+          policyId: "memory.owner-checkpoints",
+          backend: storage,
+          operations: ["get", "list", "set"],
+          limits: {
+            maxKeyBytes: 128,
+            maxValueBytes: 16 * 1_024,
+            maxEntries: 8,
+            maxTotalBytes: 64 * 1_024,
+            maxListResults: 4,
+            maxArgumentBytes: 32 * 1_024,
+            maxResultBytes: 32 * 1_024,
+            maxInvocations: 3,
+            maxInvocationsPerRun: 2,
+          },
+          capabilityLifetimeMs: 120_000,
+        }],
+      });
+      const effectIntentStore = new FileEffectIntentStore({ path: effectIntentPath });
+
+      let blockId = 0;
+      let deliveryId = 0;
+      let protocolIdentifier = 0;
+      let processIdentifierAllocated = false;
+      const now = (): string => new Date().toISOString();
+      const contentSchemas = resolveInstalledContentSchemaRegistrationSet({
+        instanceConfiguration: configuration,
+        installations,
+        reservedRegistrations: [],
+        maxRegisteredValueBytes: 256 * 1_024,
+      });
+      const coreState = createFileCoreStateStoreWithStoppedRecordWriter({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `task-switch-block-${++blockId}`,
+        nextDeliveryId: (kind) => `task-switch-${kind}-${++deliveryId}`,
+        now,
+        contentSchemas,
+      });
+      coreState.store.deliveries.createPage("task-switch-input");
+      coreState.store.deliveries.createPage("task-switch-output");
+      coreState.store.deliveries.registerConsumer(
+        "task-switch-input",
+        TASK_SWITCH_AGENT_MODULE_ID,
+        "from-now",
+      );
+      const repository = new FileModuleResultCommitRepository({ path: commitPath });
+      const mailboxes = [{
+        consumerId: TASK_SWITCH_AGENT_MODULE_ID,
+        pageIds: ["task-switch-input"],
+        maxResidentCount: 4,
+        maxResidentBytes: 256 * 1_024,
+      }];
+      const startupRecoveryHandoff = (await new CoreStartupRecovery({
+        deliveries: coreState.store.deliveries,
+        commits: createModuleResultCommitCoordinator({
+          core: coreState.store,
+          repository,
+          now,
+          mailboxes,
+        }),
+        moduleRecords: coreState.store,
+        stoppedRecordWriter: coreState.stoppedRecordWriter,
+      }).recover()).handoff;
+      const schedulerEvents: SchedulerEvent[] = [];
+      const actorEvents: ModuleActorEvent[] = [];
+      composed = composeInstalledReactiveModuleHost({
+        configuration,
+        installations,
+        configurations,
+        coreState,
+        contentSchemas,
+        maxRegisteredContentValueBytes: 256 * 1_024,
+        mailboxes,
+        startupRecoveryHandoff,
+        clock: systemSchedulerClock(),
+        scheduling: {
+          maxConcurrentModules: 1,
+          backpressureAction: "pause-upstream",
+          downstreamRecheckMs: 100,
+          noProgressAfterMs: 5_000,
+          claimLimitCount: 1,
+          claimLimitBytes: 64 * 1_024,
+          retryJitterRatio: 0,
+          lowWatermarkRatio: 1,
+        },
+        runtime: {
+          resultCommitRepository: repository,
+          permissionPolicies,
+          effectIntentStore,
+          now,
+          initialModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-1`,
+          nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
+          binding: inspectedBinding.binding,
+          lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
+          launcher: {
+            interpreterProgram: PYTHON,
+            launcherScriptPath: defaultLauncherScriptPath(),
+            controllerTimeouts: {
+              configureTimeoutMs: 5_000,
+              inCgroupTimeoutMs: 5_000,
+              membershipTimeoutMs: 5_000,
+              exitObservationTimeoutMs: 5_000,
+            },
+          },
+          host: {
+            isolationPolicy: new ExtensionIsolationPolicy(),
+            shutdownRequestTimeoutMs: 2_000,
+            forceKillDelayMs: 500,
+          },
+          channelCloseTimeoutMs: 5_000,
+          nextProcessGenerationId: () => {
+            if (processIdentifierAllocated) {
+              throw new Error("The task-switch Agent attempted another process generation");
+            }
+            processIdentifierAllocated = true;
+            return processGenerationId;
+          },
+          nextProtocolIdentifier: (purpose) =>
+            `${purpose}-task-switch-agent-${++protocolIdentifier}`,
+          classifyFailure: (failure) => ({ code: failure.code, retryable: false }),
+          onActorEvent: (event) => actorEvents.push(event),
+        },
+        onSchedulerEvent: (event) => schedulerEvents.push(event),
+      });
+      await composed.host.start();
+      expect(composed.host.state).toBe("running");
+      expect(coreState.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
+        state: "running",
+        packageDigest: installed.packageDigest,
+        declaredExternalEffects: "unrestricted",
+      });
+      expect(existsSync(moduleCgroupPath)).toBe(true);
+
+      const outputs: unknown[] = [];
+      const seenModuleJobs = new Set<string>();
+      for (const task of tasks) {
+        const input = coreState.store.blocks.commit(
+          proposal(JSON.stringify(task)),
+          { kind: "external", id: `task-switch-${task.phase}` },
+        );
+        coreState.store.deliveries.append("task-switch-input", input.id);
+        expect(await waitFor(
+          () => repository.list().filter((record) => record.state === "committed").length ===
+            seenModuleJobs.size + 1,
+          15_000,
+        )).toBe(true);
+        const record = repository.list().find((candidate) =>
+          candidate.state === "committed" && !seenModuleJobs.has(candidate.moduleJobId)
+        );
+        if (record === undefined || record.blockId === undefined) {
+          throw new Error(`The ${task.phase} Run did not commit an output Block`);
+        }
+        seenModuleJobs.add(record.moduleJobId);
+        const storedBlock = coreState.store.blocks.get(record.blockId);
+        if (storedBlock === null) throw new Error(`The ${task.phase} output Block is absent`);
+        const value = storedBlock.payload.value as {
+          readonly items: readonly { readonly text?: string }[];
+        };
+        const text = value.items[0]?.text;
+        if (text === undefined) throw new Error(`The ${task.phase} output text is absent`);
+        outputs.push(JSON.parse(text));
+      }
+
+      expect(outputs).toEqual([{
+        phase: "checkpoint",
+        actions: ["model", "storage.set"],
+        final: {
+          action: "checkpointed",
+          taskId: checkpoint.taskId,
+          checkpointKey,
+          stored: true,
+        },
+      }, {
+        phase: "unrelated",
+        actions: ["model"],
+        final: { action: "answer", taskId: "arithmetic-cobalt", answer: 17 },
+      }, {
+        phase: "resume",
+        actions: ["storage.list", "storage.get", "model"],
+        final: {
+          action: "resume",
+          taskId: checkpoint.taskId,
+          nextAction: checkpoint.nextAction,
+          evidenceKeys: [checkpointKey],
+        },
+      }]);
+      expect(modelCalls).toHaveLength(3);
+      expect(modelCalls.every((call) => call.input.stream)).toBe(true);
+      const unrelatedMessages = JSON.stringify(modelCalls[1]!.input.messages);
+      expect(unrelatedMessages).toContain("arithmetic-cobalt");
+      expect(unrelatedMessages).not.toContain(checkpoint.taskId);
+      expect(unrelatedMessages).not.toContain(checkpoint.nextAction.target);
+      const resumeMessages = JSON.stringify(modelCalls[2]!.input.messages);
+      expect(resumeMessages).toContain(checkpoint.nextAction.target);
+      expect(resumeMessages).toContain(checkpoint.sourceId);
+      expect(actorEvents.filter((event) => event.type === "run.started")).toHaveLength(3);
+      expect(schedulerEvents.filter((event) =>
+        event.type === "scheduler.dispatched" &&
+        event.moduleId === TASK_SWITCH_AGENT_MODULE_ID &&
+        event.reasonCode === "READY_REACTIVE"
+      )).toHaveLength(3);
+      expect(schedulerEvents.filter((event) =>
+        event.type === "scheduler.settled" &&
+        event.moduleId === TASK_SWITCH_AGENT_MODULE_ID &&
+        event.tickStatus === "committed"
+      )).toHaveLength(3);
+      const effects = new FileEffectIntentStore({ path: effectIntentPath }).list();
+      expect(effects).toHaveLength(6);
+      expect(effects.every((record) => record.outcome.kind === "terminal")).toBe(true);
+      const namespace = storage.namespaceFor(INSTANCE_ID, TASK_SWITCH_AGENT_MODULE_ID);
+      expect(storage.read({
+        namespace,
+        instanceId: INSTANCE_ID,
+        moduleId: TASK_SWITCH_AGENT_MODULE_ID,
+      }).entries).toEqual([
+        expect.objectContaining({ key: checkpointKey, value: checkpoint }),
+      ]);
+
+      await composed.host.stop();
+      stopped = true;
+      expect(composed.host.state).toBe("stopped");
+      expect(coreState.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
+        state: "stopped",
+        moduleCgroupPath,
+      });
+      expect(existsSync(moduleCgroupPath)).toBe(false);
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `reopened-task-switch-block-${++blockId}`,
+        nextDeliveryId: (kind) => `reopened-task-switch-${kind}-${++deliveryId}`,
+        now,
+        contentSchemas,
+      });
+      const reopenedRepository = new FileModuleResultCommitRepository({ path: commitPath });
+      const reopenedStorage = new ModulePrivateStorageBackend({ root: storageRoot, now });
+      expect(reopenedRepository.list().filter((record) => record.state === "committed"))
+        .toHaveLength(3);
+      expect(reopened.getModuleProcessRecord(processGenerationId)?.state).toBe("stopped");
+      expect(reopenedStorage.read({
+        namespace,
+        instanceId: INSTANCE_ID,
+        moduleId: TASK_SWITCH_AGENT_MODULE_ID,
+      }).entries).toEqual([
+        expect.objectContaining({ key: checkpointKey, value: checkpoint }),
+      ]);
+
+      console.info(JSON.stringify({
+        packageSchemaVersion: installed.manifest.schemaVersion,
+        packageDigest: installed.packageDigest,
+        moduleId: TASK_SWITCH_AGENT_MODULE_ID,
+        processGenerationId,
+        moduleCgroupPath,
+        phases: tasks.map((task) => task.phase),
+        modelCalls: modelCalls.length,
+        allModelCallsStreaming: modelCalls.every((call) => call.input.stream),
+        unrelatedContextExcludedCheckpoint: true,
+        checkpointEntries: 1,
+        durableCapabilityEffects: effects.length,
+        actorRuns: 3,
+        committedModuleResults: reopenedRepository.list().length,
+        finalRecordState: reopened.getModuleProcessRecord(processGenerationId)?.state,
+        cgroupRemoved: !existsSync(moduleCgroupPath),
+        resumedNextAction: checkpoint.nextAction,
+      }));
+    } catch (error) {
+      primaryFailure = error;
+    } finally {
+      const cleanupFailures: unknown[] = [];
+      if (!stopped && composed !== undefined &&
+        (composed.host.state === "running" || composed.host.state === "failed")) {
+        await composed.host.stop().catch((error) => cleanupFailures.push(error));
+      }
+      if (existsSync(moduleCgroupPath)) {
+        cleanupFailures.push(
+          new Error(`Exact task-switch Agent control group remained: ${moduleCgroupPath}`),
+        );
+      }
+      rmSync(scratch, { recursive: true, force: true });
+      const failures = [
+        ...(primaryFailure === undefined ? [] : [primaryFailure]),
+        ...cleanupFailures,
+      ];
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "Installed task-switch Scheduler Agent failed");
       }
     }
   }, 60_000);
