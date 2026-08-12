@@ -96,6 +96,7 @@ async function main() {
   const protocolBytes = await readFile(path.join(repositoryRoot, protocolRelativePath));
   const preregistration = JSON.parse(preregistrationBytes);
   const runDirectory = path.join(artifactRoot, runId);
+  await mkdir(artifactRoot, { recursive: true });
   await mkdir(runDirectory, { recursive: false });
 
   const dataset = buildDataset(preregistration);
