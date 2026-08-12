@@ -483,9 +483,13 @@ durable no-effect or retry-safe evidence. A `terminal` outcome proves that an
 effect completed; without a separate durable idempotency or replay contract, it
 does not authorize Core to repeat the Run automatically. A trusted Extension
 with direct ambient effect authority is never automatically retried after such
-a submission, and the first Linux Module profile automatically activates only
-a Module whose configuration declares Core-capability-only external effects.
-Unknown outcomes are preserved for the audited operator flow below.
+a submission. The proposed first Linux Module profile will require a
+configuration that declares Core-capability-only external effects, but the
+existing version 1 process record is not proof that the declaration came from
+that configuration: historical candidate code wrote the same value. Recovery
+therefore preserves such records as unknown until a new record format binds the
+declaration to the accepted configuration and execution boundary. Unknown
+outcomes are preserved for the audited operator flow below.
 
 Prompt text, model responses, tool arguments, generated blocks, and extension
 payloads are untrusted data. They MUST NOT directly choose host paths, network

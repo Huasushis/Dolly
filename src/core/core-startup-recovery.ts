@@ -242,6 +242,11 @@ export interface CoreStartupRecoveryOptions {
   /** Store-bound capability held only by this stop-proof coordinator. */
   readonly stoppedRecordWriter?: ModuleProcessStoppedRecordWriter;
   readonly processStopProver?: ModuleProcessStopProver;
+  /**
+   * Evidence for a future process-record version that proves the external-
+   * effect declaration's configuration provenance. Version 1 capability-only
+   * records are rejected before this source is consulted.
+   */
   readonly externalEffectEvidence?: ExternalEffectEvidenceSource;
 }
 
@@ -993,6 +998,15 @@ export class CoreStartupRecovery {
         kind: "outcome-unknown",
         reason:
           "the process boundary is unrestricted, so ambient effects are not excluded",
+      };
+    }
+    if (
+      processRecord.schemaVersion === "dolly.module-process-record/1"
+    ) {
+      return {
+        kind: "outcome-unknown",
+        reason:
+          `the version 1 process record has no configuration provenance for its ${processRecord.declaredExternalEffects} external-effect declaration`,
       };
     }
     if (!this.#externalEffectEvidence) {

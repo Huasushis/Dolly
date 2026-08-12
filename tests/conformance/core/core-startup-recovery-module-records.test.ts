@@ -1,14 +1,13 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CoreStartupRecovery,
   CoreStartupRecoveryError,
   moduleProcessStopProofIdentityDigest,
   type CoreStartupStateStore,
   type ExternalEffectEvidence,
-  type ExternalEffectEvidenceSource,
   type ModuleProcessStopProver,
   type ModuleProcessStopProof,
 } from "../../../src/core/core-startup-recovery.js";
@@ -267,28 +266,6 @@ describe("CORE startup reconciliation with Module records", () => {
     ],
     ["null", null],
   ];
-  const invalidExternalEffectEvidenceResults: readonly (
-    readonly [string, () => unknown]
-  )[] = [
-    ["null", () => Promise.resolve(null)],
-    [
-      "an unknown kind",
-      () => Promise.resolve({ kind: "provider-finished" }),
-    ],
-    [
-      "an unknown decision without a reason",
-      () => Promise.resolve({ kind: "unknown" }),
-    ],
-    [
-      "a non-Promise thenable",
-      () => ({
-        then(resolve: (value: ExternalEffectEvidence) => void): void {
-          resolve({ kind: "no-effect" });
-        },
-      }),
-    ],
-  ];
-
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "dolly-startup-recovery-"));
     statePath = join(root, "core-state.json");
@@ -721,13 +698,17 @@ describe("CORE startup reconciliation with Module records", () => {
     });
   });
 
-  it("preserves a submitted Run with no committed result as an unknown outcome", async () => {
+  it("does not inspect effect evidence for an unproven version 1 declaration", async () => {
     const store = openStore("first");
     const claim = seedActiveClaim(store);
     store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionFor(claim));
 
+    const inspectRunEffects = vi.fn(async (): Promise<ExternalEffectEvidence> => ({
+      kind: "unknown",
+      reason: "the provider response was lost",
+    }));
     await expect(
       new CoreStartupRecovery({
         deliveries: store.deliveries,
@@ -735,18 +716,14 @@ describe("CORE startup reconciliation with Module records", () => {
         moduleRecords: store,
         stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
-        externalEffectEvidence: {
-          inspectRunEffects: async (): Promise<ExternalEffectEvidence> => ({
-            kind: "unknown",
-            reason: "the provider response was lost",
-          }),
-        },
+        externalEffectEvidence: { inspectRunEffects },
       }).recover(),
     ).rejects.toThrowError(
       expect.objectContaining<Partial<CoreStartupRecoveryError>>({
         code: "STARTUP_ACTIVE_CLAIM_UNRESOLVED",
       }),
     );
+    expect(inspectRunEffects).not.toHaveBeenCalled();
 
     const reopened = openStore("second");
     expect(reopened.deliveries.listActiveClaims()).toEqual([
@@ -804,7 +781,7 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it.each(["no-effect", "retry-safe"] as const)(
-    "releases a submitted Run whose effects have persistent %s evidence",
+    "does not consult persistent %s evidence for a version 1 capability-only declaration",
     async (kind) => {
       const store = openStore("first");
       const claim = seedActiveClaim(store);
@@ -812,23 +789,22 @@ describe("CORE startup reconciliation with Module records", () => {
       store.updateModuleProcessRecordState("process-generation-1", "running");
       store.appendModuleSubmissionRecord(submissionFor(claim));
 
-      const report = await new CoreStartupRecovery({
+      const inspectRunEffects = vi.fn(async (): Promise<ExternalEffectEvidence> => ({ kind }));
+      await expect(new CoreStartupRecovery({
         deliveries: store.deliveries,
         commits: openCommits(store),
         moduleRecords: store,
         stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
-        externalEffectEvidence: {
-          inspectRunEffects: async (): Promise<ExternalEffectEvidence> => ({
-            kind,
-          }),
-        },
-      }).recover();
+        externalEffectEvidence: { inspectRunEffects },
+      }).recover()).rejects.toMatchObject({
+        code: "STARTUP_ACTIVE_CLAIM_UNRESOLVED",
+        message: expect.stringContaining("configuration provenance"),
+      });
 
-      expect(report.releasedClaims).toEqual([
-        expect.objectContaining({ reason: "external-effects-safe-to-retry" }),
-      ]);
-      expect(store.getModuleSubmissionRecord(claim.runId)).toBeUndefined();
+      expect(inspectRunEffects).not.toHaveBeenCalled();
+      expect(store.deliveries.inspectClaim(claim).status).toBe("active");
+      expect(store.getModuleSubmissionRecord(claim.runId)).toBeDefined();
     },
   );
 
@@ -865,13 +841,49 @@ describe("CORE startup reconciliation with Module records", () => {
     expect(store.getModuleSubmissionRecord(claim.runId)).toBeDefined();
   });
 
-  it("preserves a submitted Run with terminal evidence because it does not prove retry safety", async () => {
+  it("does not trust a legacy capability-only process record without configuration provenance", async () => {
+    const store = openStore("legacy-capability-only");
+    const claim = seedActiveClaim(store);
+    store.appendModuleProcessRecord(processRecord({
+      declaredExternalEffects: "core-capabilities-only",
+    }));
+    store.updateModuleProcessRecordState("process-generation-1", "running");
+    store.appendModuleSubmissionRecord(submissionFor(claim));
+    const journal = new EffectIntentJournal({
+      store: new FileEffectIntentStore({ path: join(root, "legacy-effect-intents.json") }),
+      now: () => NOW,
+    });
+    const identity = exactIdentity(claim);
+    journal.openRun(identity);
+    journal.closeRun(identity);
+    expect(journal.evidenceForRun(identity)).toEqual({ kind: "no-effect" });
+
+    await expect(new CoreStartupRecovery({
+      deliveries: store.deliveries,
+      commits: openCommits(store),
+      moduleRecords: store,
+      stoppedRecordWriter: stoppedRecordWriterFor(store),
+      processStopProver: provenStopped,
+      externalEffectEvidence: effectIntentEvidenceSource(journal),
+    }).recover()).rejects.toMatchObject({
+      code: "STARTUP_ACTIVE_CLAIM_UNRESOLVED",
+      message: expect.stringContaining("configuration provenance"),
+    });
+
+    expect(store.deliveries.inspectClaim(claim).status).toBe("active");
+    expect(store.getModuleSubmissionRecord(claim.runId)).toBeDefined();
+  });
+
+  it("does not inspect terminal evidence for a version 1 capability-only declaration", async () => {
     const store = openStore("first");
     const claim = seedActiveClaim(store);
     store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionFor(claim));
 
+    const inspectRunEffects = vi.fn(async (): Promise<ExternalEffectEvidence> => ({
+      kind: "terminal",
+    }));
     await expect(
       new CoreStartupRecovery({
         deliveries: store.deliveries,
@@ -879,56 +891,17 @@ describe("CORE startup reconciliation with Module records", () => {
         moduleRecords: store,
         stoppedRecordWriter: stoppedRecordWriterFor(store),
         processStopProver: provenStopped,
-        externalEffectEvidence: {
-          inspectRunEffects: async (): Promise<ExternalEffectEvidence> => ({
-            kind: "terminal",
-          }),
-        },
+        externalEffectEvidence: { inspectRunEffects },
       }).recover(),
     ).rejects.toMatchObject({
       code: "STARTUP_ACTIVE_CLAIM_UNRESOLVED",
-      message: expect.stringContaining(
-        "no durable idempotency contract proves that repeating the Run is safe",
-      ),
+      message: expect.stringContaining("configuration provenance"),
     });
 
+    expect(inspectRunEffects).not.toHaveBeenCalled();
     expect(store.deliveries.inspectClaim(claim).status).toBe("active");
     expect(store.getModuleSubmissionRecord(claim.runId)).toBeDefined();
   });
-
-  it.each(invalidExternalEffectEvidenceResults)(
-    "keeps the Claim active when external-effect evidence returns %s",
-    async (_description, inspectRunEffectsResult) => {
-      const store = openStore("first");
-      const claim = seedActiveClaim(store);
-      store.appendModuleProcessRecord(processRecord());
-      store.updateModuleProcessRecordState("process-generation-1", "running");
-      store.appendModuleSubmissionRecord(submissionFor(claim));
-      const externalEffectEvidence = {
-        inspectRunEffects: inspectRunEffectsResult as unknown as
-          ExternalEffectEvidenceSource["inspectRunEffects"],
-      };
-
-      await expect(
-        new CoreStartupRecovery({
-          deliveries: store.deliveries,
-          commits: openCommits(store),
-          moduleRecords: store,
-          stoppedRecordWriter: stoppedRecordWriterFor(store),
-          processStopProver: provenStopped,
-          externalEffectEvidence,
-        }).recover(),
-      ).rejects.toMatchObject({
-        code: "STARTUP_ACTIVE_CLAIM_UNRESOLVED",
-      });
-
-      expect(store.deliveries.inspectClaim(claim)).toMatchObject({
-        runId: claim.runId,
-        status: "active",
-      });
-      expect(store.getModuleSubmissionRecord(claim.runId)).toBeDefined();
-    },
-  );
 
   it("fails closed when Claim release reports success without changing Core state", async () => {
     const store = openStore("first");

@@ -613,16 +613,20 @@ The proposed instance schema version that carries `linuxProcessLimits` and
 reject every configured Module.
 
 The two halves of this declaration have different implementation status. The
-persisted half exists: `dolly.module-process-record/1` in Section 7.7 carries
-`declaredExternalEffects`, the Core-state store rejects any other value, and
-startup recovery already applies the disposition rules that depend on it. The
-configuration half does not exist yet: no released instance schema accepts
-`linuxProcessLimits` or `declaredExternalEffects`, so today no operator can
-supply the declaration and no Module can be activated to produce a record.
-The candidate installed-process factory therefore cannot select either
-operator assertion. It uses the preserve-only interim behavior described in
-Section 5.1 and refuses caller-supplied declarations and evidence. This is a
-fail-closed bridge, not an implementation of `dolly.instance/10`.
+field exists in `dolly.module-process-record/1`, but that record version does
+not distinguish a future configured `core-capabilities-only` assertion from a
+historical candidate value that meant only “preserve this outcome” and carried
+no matching execution-boundary provenance. Startup therefore treats that
+particular version/value pair as an unknown outcome and does not inspect an
+otherwise complete capability journal. A later record version must bind the
+declaration to the accepted instance schema and enforcement boundary before
+capability evidence can authorize recovery. The configuration half does not
+exist yet: no released instance schema accepts `linuxProcessLimits` or
+`declaredExternalEffects`, so today no product Module can produce the future
+configured record. The candidate installed-process factory uses the
+preserve-only interim behavior described in Section 5.1 and refuses
+caller-supplied declarations and evidence. This is a fail-closed bridge, not an
+implementation of `dolly.instance/10`.
 
 ## 6. Block model
 
@@ -1241,7 +1245,11 @@ effect. Startup recovery therefore preserves its submitted Run as unresolved.
 The stronger `none` and `core-capabilities-only` values are operator assertions
 for a future closed configuration and enforcement boundary; the current
 installed-process candidate never infers either value from an empty capability
-journal.
+journal. A version 1 record carrying `core-capabilities-only` is historically
+ambiguous and is never sufficient provenance for automatic Claim disposition,
+even when an associated capability journal reports no effect. A future record
+version must bind the assertion to the validated instance configuration and
+execution boundary before recovery consults that journal.
 
 The process-record lifecycle is:
 
@@ -1923,7 +1931,9 @@ and background-free idle time, the Extension has no authority to make an externa
 or persistent effect. Every effect in the first path occurs through a durable
 Core capability while an exact active Claim and Run exist, and the runner
 automatically activates only a Module whose configuration declares
-Core-capability-only external effects as required by Section 5.2.
+Core-capability-only external effects as required by Section 5.2. The existing
+version 1 process record cannot prove that prerequisite and is not an accepted
+activation or recovery credential for this future path.
 
 ### 9.5 Background activity
 

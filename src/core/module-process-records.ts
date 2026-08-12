@@ -38,7 +38,9 @@ export type ModuleProcessRecordState =
 /**
  * Describes which external-effect channels Core may rely on during recovery.
  * `unrestricted` means the process boundary does not prevent ambient file,
- * network, or subprocess effects, so no automatic retry is safe.
+ * network, or subprocess effects, so no automatic retry is safe. Version 1
+ * records do not bind `core-capabilities-only` to a validated configuration or
+ * enforcement boundary, so startup also preserves that value as unknown.
  */
 export type DeclaredExternalEffects =
   | "unrestricted"
