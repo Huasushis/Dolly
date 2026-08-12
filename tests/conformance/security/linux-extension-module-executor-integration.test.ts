@@ -38,11 +38,14 @@ import {
   type ExtensionPackageManifest,
 } from "../../../src/core/extension-installation-registry.js";
 import { createFileCoreStateStoreWithStoppedRecordWriter } from "../../../src/core/file-core-state-store.js";
+import { FileMediaByteStore } from "../../../src/core/file-media-byte-store.js";
 import {
   deriveModuleCgroupPath,
   prepareDelegatedCgroupRoot,
   type ModuleCgroupLimits,
 } from "../../../src/core/linux-module-cgroup.js";
+import { createFileCoreActiveRunModelMediaResolver } from "../../../src/core/media-capability/index.js";
+import type { ModelMediaResolutionRequest } from "../../../src/core/model-provider-broker.js";
 import { inspectCoreServiceBinding } from "../../../src/core/linux-core-service-binding.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
 import type { ModuleExecutor } from "../../../src/core/module-actor.js";
@@ -518,6 +521,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       }],
     });
     const now = (): string => new Date().toISOString();
+    const mediaBytes = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4);
     const { store, stoppedRecordWriter } =
       createFileCoreStateStoreWithStoppedRecordWriter({
         path: statePath,
@@ -525,14 +529,36 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
         nextBlockId: () => "unused-installed-linux-block",
         nextDeliveryId: (kind) => `unused-installed-linux-${kind}`,
         now,
+        media: {
+          durability: "persistent",
+          bytes: new FileMediaByteStore({
+            directory: resolve(scratch, "media"),
+            maxMediaBytes: 1_024,
+          }),
+          inspector: {
+            inspect: async () => ({ mimeType: "image/png", width: 2, height: 1 }),
+          },
+          maxMediaBytes: 1_024,
+          idNamespace: "installed-linux-active-run",
+        },
       });
+    if (!store.media) throw new Error("The installed integration Media store is absent");
     store.deliveries.createPage("input");
     store.deliveries.registerConsumer("input", "installed-worker", "from-now");
+    const registeredMedia = await store.media.registerMedia({
+      registrationId: "installed-linux-active-run-media",
+      bytes: mediaBytes,
+      declaredMimeType: "image/png",
+      provenance: { sourceClass: "streamed-upload" },
+    });
     const inputBlock = store.blocks.commit(
       {
         payload: {
           schema: "dolly.content/1",
-          value: { items: [{ type: "text", text: "Use the installed fixture." }] },
+          value: { items: [
+            { type: "text", text: "Use the installed fixture." },
+            { type: "media-reference", mediaId: registeredMedia.mediaId },
+          ] },
         },
       },
       { kind: "external", id: "installed-integration-test" },
@@ -649,6 +675,81 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       inputDigest: canonicalJsonDigest(input),
       createdAt: now(),
     });
+    const mediaResolver = createFileCoreActiveRunModelMediaResolver({
+      core: store,
+      extensionId: installed.manifest.extensionId,
+      instanceId,
+      moduleId: "installed-worker",
+      sessionForProcess: factory.sessionForProcess,
+      now,
+    });
+    const deadline = new Date(Date.now() + 60_000).toISOString();
+    const mediaRequest: ModelMediaResolutionRequest = {
+      schemaVersion: "dolly.model.media-resolution-request/1",
+      modelRequestId: "installed-linux-model-request",
+      mediaRequestId: "installed-linux-media-request",
+      recipientId: "installed-linux-recipient",
+      descriptor: {
+        endpointId: "installed-linux-endpoint",
+        operation: "chat-completion",
+        modelId: "installed-linux-model",
+        adapterId: "openai-compatible-chat",
+        adapterVersion: "v1",
+        descriptorVersion: "installed-linux-descriptor",
+        descriptorDigest: `sha256:${"c".repeat(64)}`,
+      },
+      binding: {
+        endpointId: "installed-linux-endpoint",
+        bindingRevision: "installed-linux-binding",
+      },
+      context: {
+        operationId: "installed-linux-operation",
+        instanceId,
+        ownerScope: "installed-linux-owner",
+        moduleId: "installed-worker",
+        moduleGenerationId: claim.moduleGenerationId,
+        moduleJobId: claim.moduleJobId,
+        runId: claim.runId,
+        attempt: claim.attempt,
+        sessionId: liveSession!.sessionId,
+        deadline,
+      },
+      messageIndex: 0,
+      partIndex: 1,
+      mediaReference: { type: "media-reference", mediaId: registeredMedia.mediaId },
+      requirement: {
+        requirementId: "installed-inline-png-v1",
+        modality: "image",
+        mimeTypes: ["image/png"],
+        deliveryModes: ["inline"],
+        maxItems: 1,
+        maxBytesPerItem: 1_024,
+        maxAggregateBytes: 1_024,
+        providerFetchesAfterAcceptance: false,
+        lifetimeStrategyId: "media.inline-copy.v1",
+        placementStrategyId: "openai.chat.media.inline-image-url.v1",
+      },
+      acceptedAccessModes: ["inline"],
+      deadline,
+      limits: {
+        maxItemsRemaining: 1,
+        maxBytesForItem: 1_024,
+        maxResolvedBytesRemaining: 1_024,
+      },
+    };
+    await expect(mediaResolver.resolve(mediaRequest, {})).resolves.toMatchObject({
+      mediaId: registeredMedia.mediaId,
+      digest: registeredMedia.digest,
+      byteLength: mediaBytes.byteLength,
+      width: 2,
+      height: 1,
+      accessMode: "inline",
+      inline: { data: Buffer.from(mediaBytes).toString("base64") },
+    });
+    expect(store.media.referenceGraph.leaseCountFor({
+      kind: "media",
+      id: registeredMedia.mediaId,
+    })).toBe(0);
     const result = await executor.execute(input, {
       moduleId: "installed-worker",
       moduleGenerationId: MODULE_GENERATION_ID,
@@ -689,6 +790,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
 
     await expect(executor.terminate(terminationContext)).resolves.toBeUndefined();
     expect(factory.sessionForProcess(processGenerationId)).toBeNull();
+    await expect(mediaResolver.resolve(mediaRequest, {})).rejects.toThrow("not authorized");
     const moduleCgroupPath = deriveModuleCgroupPath(
       inspectedBinding.binding.delegatedRootCgroupPath,
       { instanceId, moduleId: "installed-worker", processGenerationId },
