@@ -388,6 +388,48 @@ async function handleHostRequest(message) {
       });
       return;
     }
+    if (mode === "tool-registry-execute-active-run") {
+      const handle = initialized.capabilities[0].handle;
+      const view = await invokeCapability(
+        handle,
+        "list-tools",
+        {
+          moduleJobId: params.moduleJobId,
+          runId: params.runId,
+          idempotencyKey: `${params.moduleJobId}-tool-registry`,
+        },
+        {},
+      );
+      const round = await invokeCapability(
+        handle,
+        "execute-round",
+        {
+          moduleJobId: params.moduleJobId,
+          runId: params.runId,
+          idempotencyKey: `${params.moduleJobId}-tool-round-1`,
+        },
+        {
+          roundIndex: 1,
+          calls: [{
+            callId: "call-read-note",
+            name: "read_note",
+            argumentsJson: '{"key":"deployment-note"}',
+          }],
+        },
+      );
+      respond(id, {
+        protocolVersion,
+        sessionId: params.sessionId,
+        moduleId: params.moduleId,
+        moduleGenerationId: params.moduleGenerationId,
+        runId: params.runId,
+        result: {
+          view: capabilityErrorCodeOf(view),
+          round: capabilityErrorCodeOf(round),
+        },
+      });
+      return;
+    }
     if (mode === "capability-result-before-effect") {
       const capabilityResponse = invokeCapability(
         initialized.capabilities[0].handle,

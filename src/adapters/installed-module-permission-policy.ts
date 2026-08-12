@@ -1,5 +1,6 @@
 import type { JsonValue } from "../core/canonical-json.js";
 import type { ExtensionProcessHost } from "../core/extension-process-host.js";
+import { FileToolJournalRepository } from "../core/file-tool-journal-repository.js";
 import type { InstalledExtensionModule } from "../core/installed-extension-module.js";
 import type {
   ModelInvocationBudgets,
@@ -7,10 +8,18 @@ import type {
 import type { DescriptorRef } from "../core/model-provider-descriptor.js";
 import {
   createModelOperationCapabilityV2,
+  createToolInvocationCapabilityV2,
   type ChatModelBrokerPort,
   type ModelOperationLimits,
   type ModelOutputContractKind,
+  type ToolInvocationV2Limits,
 } from "../core/provider-capabilities/index.js";
+import {
+  ToolPolicySession,
+  ToolRegistry,
+  type ToolExecutor,
+  type ToolTurnBudget,
+} from "../core/tool-policy.js";
 
 const POLICY_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,254}[A-Za-z0-9])?$/u;
 const setups = new WeakSet<InstalledModulePermissionPolicySetup>();
@@ -42,8 +51,32 @@ export interface InstalledStrictStreamingChatPolicy {
   readonly maxConcurrentInvocations?: number;
 }
 
+/**
+ * One operator-selected read-only tool set. The registry is the executable
+ * source of truth for both the Extension-visible contract and Host-side
+ * validation; the crash-recoverable journal keeps a Module job on the same
+ * round history across process replacement. Effectful tools remain refused
+ * until approval accounting and external-effect recovery are closed together.
+ */
+export interface InstalledRegisteredToolPolicy {
+  readonly kind: "registered-tools";
+  readonly policyId: string;
+  readonly registry: ToolRegistry;
+  readonly repository: FileToolJournalRepository;
+  readonly executor: ToolExecutor;
+  readonly budget: ToolTurnBudget;
+  readonly approvalPolicyRevision: string;
+  readonly limits: ToolInvocationV2Limits;
+  readonly capabilityLifetimeMs: number;
+  readonly maxConcurrentInvocations?: number;
+}
+
+export type InstalledModulePermissionPolicy =
+  | InstalledStrictStreamingChatPolicy
+  | InstalledRegisteredToolPolicy;
+
 export interface InstalledModulePermissionPolicyRegistryOptions {
-  readonly policies: readonly InstalledStrictStreamingChatPolicy[];
+  readonly policies: readonly InstalledModulePermissionPolicy[];
   readonly now?: () => number;
   readonly nextRequestId?: () => string;
 }
@@ -55,12 +88,22 @@ export interface InstalledModulePermissionPolicySetupSnapshot {
   readonly packageDigest: string;
   readonly configurationRevision: string;
   readonly policyIds: readonly string[];
-  readonly capabilities: readonly {
-    readonly capabilityType: "model-operation";
-    readonly capabilityVersion: "v2";
-    readonly policyId: string;
-    readonly streaming: "required";
-  }[];
+  readonly capabilities: readonly (
+    | {
+        readonly capabilityType: "model-operation";
+        readonly capabilityVersion: "v2";
+        readonly policyId: string;
+        readonly streaming: "required";
+      }
+    | {
+        readonly capabilityType: "tool-invocation";
+        readonly capabilityVersion: "v2";
+        readonly policyId: string;
+        readonly registryDigest: string;
+        readonly toolWireNames: readonly string[];
+        readonly effectPolicy: "read-only";
+      }
+  )[];
 }
 
 function assertIdentifier(value: string, label: string): void {
@@ -72,6 +115,12 @@ function assertIdentifier(value: string, label: string): void {
 function assertPositiveInteger(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new TypeError(`${label} must be a positive safe integer`);
+  }
+}
+
+function assertNonNegativeInteger(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${label} must be a non-negative safe integer`);
   }
 }
 
@@ -96,7 +145,7 @@ function assertFiniteBudgets(budgets: ModelInvocationBudgets): void {
   }
 }
 
-function immutablePolicy(
+function immutableChatPolicy(
   policy: InstalledStrictStreamingChatPolicy,
 ): InstalledStrictStreamingChatPolicy {
   if (policy.kind !== "strict-streaming-chat") {
@@ -141,6 +190,64 @@ function immutablePolicy(
   });
 }
 
+function immutableToolPolicy(
+  policy: InstalledRegisteredToolPolicy,
+): InstalledRegisteredToolPolicy {
+  if (policy.kind !== "registered-tools") {
+    throw new TypeError("Installed tool permission policy kind is unsupported");
+  }
+  assertIdentifier(policy.policyId, "policyId");
+  if (!(policy.registry instanceof ToolRegistry)) {
+    throw new TypeError("Installed tool policy requires one Host-owned ToolRegistry");
+  }
+  if (!(policy.repository instanceof FileToolJournalRepository)) {
+    throw new TypeError("Installed tool policy requires one FileToolJournalRepository");
+  }
+  if (typeof policy.executor?.execute !== "function") {
+    throw new TypeError("Installed tool policy executor is invalid");
+  }
+  assertIdentifier(policy.approvalPolicyRevision, "approvalPolicyRevision");
+  for (const field of ["maxRounds", "maxCalls", "maxCallsPerRound", "maxCallBytes"] as const) {
+    assertPositiveInteger(policy.budget[field], `budget.${field}`);
+  }
+  assertNonNegativeInteger(policy.budget.maxApprovals, "budget.maxApprovals");
+  for (const [label, value] of Object.entries(policy.limits)) {
+    assertPositiveInteger(value, `limits.${label}`);
+  }
+  assertPositiveInteger(policy.capabilityLifetimeMs, "capabilityLifetimeMs");
+  if (policy.maxConcurrentInvocations !== undefined) {
+    assertPositiveInteger(policy.maxConcurrentInvocations, "maxConcurrentInvocations");
+  }
+  const snapshot = policy.registry.snapshot();
+  if (snapshot.tools.length === 0) {
+    throw new TypeError("Installed tool policy requires at least one selected tool");
+  }
+  if (
+    snapshot.tools.some((tool) => tool.effectClass !== "read" || tool.approval !== "never") ||
+    policy.budget.maxApprovals !== 0
+  ) {
+    throw new TypeError(
+      "Installed tool policy currently permits only read tools that never request approval",
+    );
+  }
+  if (policy.budget.maxCallsPerRound > policy.limits.maxCallsPerRound) {
+    throw new TypeError("Installed tool policy Run budget exceeds its calls-per-round limit");
+  }
+  return Object.freeze({
+    ...policy,
+    budget: Object.freeze({ ...policy.budget }),
+    limits: Object.freeze({ ...policy.limits }),
+  });
+}
+
+function immutablePolicy(
+  policy: InstalledModulePermissionPolicy,
+): InstalledModulePermissionPolicy {
+  return policy.kind === "strict-streaming-chat"
+    ? immutableChatPolicy(policy)
+    : immutableToolPolicy(policy);
+}
+
 function sameSelection(
   setup: InstalledModulePermissionPolicySetup,
   resolved: InstalledExtensionModule,
@@ -165,7 +272,7 @@ function sameSelection(
  */
 export class InstalledModulePermissionPolicySetup {
   readonly snapshot: InstalledModulePermissionPolicySetupSnapshot;
-  readonly #policies: readonly InstalledStrictStreamingChatPolicy[];
+  readonly #policies: readonly InstalledModulePermissionPolicy[];
   readonly #now: () => number;
   readonly #nextRequestId: (() => string) | undefined;
   readonly #configuredHosts = new WeakSet<ExtensionProcessHost>();
@@ -173,7 +280,7 @@ export class InstalledModulePermissionPolicySetup {
   constructor(
     token: symbol,
     snapshot: InstalledModulePermissionPolicySetupSnapshot,
-    policies: readonly InstalledStrictStreamingChatPolicy[],
+    policies: readonly InstalledModulePermissionPolicy[],
     now: () => number,
     nextRequestId: (() => string) | undefined,
   ) {
@@ -217,8 +324,7 @@ export class InstalledModulePermissionPolicySetup {
         "Installed Module permission setup does not match the created Extension Host",
       );
     }
-    this.#configuredHosts.add(host);
-    for (const policy of this.#policies) {
+    const definitions = this.#policies.map((policy) => {
       const nowMs = this.#now();
       if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
         throw new TypeError("Installed model policy clock is invalid");
@@ -227,12 +333,40 @@ export class InstalledModulePermissionPolicySetup {
       if (!Number.isSafeInteger(expiresMs) || expiresMs > 8_640_000_000_000_000) {
         throw new TypeError("Installed model capability expiry is outside the safe time range");
       }
-      const definition = createModelOperationCapabilityV2({
+      const expiresAt = new Date(expiresMs).toISOString();
+      if (policy.kind === "registered-tools") {
+        return createToolInvocationCapabilityV2({
+          executionScope: "active-run",
+          expiresAt,
+          operations: ["list-tools", "execute-round"],
+          limits: policy.limits,
+          maxConcurrentInvocations: policy.maxConcurrentInvocations ?? 1,
+          resolveRun: ({ moduleJobId }) => ({
+            registry: policy.registry,
+            budget: policy.budget,
+            policy: new ToolPolicySession({
+              moduleJobId,
+              registry: policy.registry,
+              repository: policy.repository,
+              approval: {
+                decide: async () => ({
+                  decision: "denied" as const,
+                  code: "read-only-policy",
+                }),
+              },
+              executor: policy.executor,
+              budget: policy.budget,
+              approvalPolicyRevision: policy.approvalPolicyRevision,
+            }),
+          }),
+        });
+      }
+      return createModelOperationCapabilityV2({
         descriptor: policy.descriptor,
         ownerScope: policy.ownerScope,
         budgets: policy.budgets,
         executionScope: "active-run",
-        expiresAt: new Date(expiresMs).toISOString(),
+        expiresAt,
         now: () => new Date(this.#now()).toISOString(),
         chat: policy.chat,
         operations: ["chat"],
@@ -248,6 +382,9 @@ export class InstalledModulePermissionPolicySetup {
           : { nextRequestId: this.#nextRequestId }),
         outputContracts: policy.outputContracts,
       });
+    });
+    this.#configuredHosts.add(host);
+    for (const definition of definitions) {
       host.grantCapability(definition.grant, definition.handler);
     }
   }
@@ -259,7 +396,7 @@ export class InstalledModulePermissionPolicySetup {
  * candidate boundary; public Module bootstrap therefore remains refused.
  */
 export class InstalledModulePermissionPolicyRegistry {
-  readonly #policies = new Map<string, InstalledStrictStreamingChatPolicy>();
+  readonly #policies = new Map<string, InstalledModulePermissionPolicy>();
   readonly #now: () => number;
   readonly #nextRequestId: (() => string) | undefined;
 
@@ -294,12 +431,23 @@ export class InstalledModulePermissionPolicyRegistry {
         packageDigest: resolved.installation.packageDigest,
         configurationRevision: reference.revision,
         policyIds,
-        capabilities: policies.map((policy) => ({
-          capabilityType: "model-operation",
-          capabilityVersion: "v2",
-          policyId: policy.policyId,
-          streaming: "required",
-        })),
+        capabilities: policies.map((policy) =>
+          policy.kind === "registered-tools"
+            ? {
+                capabilityType: "tool-invocation" as const,
+                capabilityVersion: "v2" as const,
+                policyId: policy.policyId,
+                registryDigest: policy.registry.snapshot().registryDigest,
+                toolWireNames: policy.registry.snapshot().tools.map((tool) => tool.name),
+                effectPolicy: "read-only" as const,
+              }
+            : {
+                capabilityType: "model-operation" as const,
+                capabilityVersion: "v2" as const,
+                policyId: policy.policyId,
+                streaming: "required" as const,
+              },
+        ),
       },
       policies,
       this.#now,

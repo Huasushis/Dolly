@@ -24,6 +24,7 @@ import {
 import type { JsonValue } from "../../../src/core/canonical-json.js";
 import type { ExtensionPackageManifest } from "../../../src/core/extension-installation-registry.js";
 import type { InstalledExtensionModule } from "../../../src/core/installed-extension-module.js";
+import { FileToolJournalRepository } from "../../../src/core/file-tool-journal-repository.js";
 import type { ChatBrokerInvocation } from "../../../src/core/model-provider-broker.js";
 import { ModelDescriptorRegistry } from "../../../src/core/model-provider-descriptor.js";
 import { createToolInvocationCapabilityV2 } from "../../../src/core/provider-capabilities/index.js";
@@ -246,6 +247,168 @@ describe("Extension process isolation and capability checks", () => {
         store: new FileEffectIntentStore({ path: effectStorePath }),
         now: () => "2026-08-12T00:00:00.000Z",
       }).evidenceForRun(claim)).toMatchObject({ kind: "unknown" });
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("derives an active-Run registered-tool view from the installed Host policy", async () => {
+    const workspaceTmp = fileURLToPath(new URL("../../../../.tmp/", import.meta.url));
+    mkdirSync(workspaceTmp, { recursive: true, mode: 0o700 });
+    const scratch = mkdtempSync(join(workspaceTmp, "dolly-extension-installed-tool-policy-"));
+    const claim = {
+      moduleJobId: "module-job-a",
+      runId: "run-a",
+      attempt: 1,
+      claimToken: "claim-token-a",
+      moduleGenerationId: "module-generation-a",
+    } as const;
+    const effectStorePath = join(scratch, "effect-intents.json");
+    const effectJournal = new EffectIntentJournal({
+      store: new FileEffectIntentStore({ path: effectStorePath }),
+      now: () => "2026-08-12T00:00:00.000Z",
+    });
+    const effectRunLifecycle = createExtensionEffectJournalLifecycle({
+      journal: effectJournal,
+      getModuleSubmissionRecord: (runId) =>
+        runId === claim.runId
+          ? {
+              schemaVersion: "dolly.module-submission-record/1",
+              ...claim,
+              processGenerationId: "process-generation-1",
+              inputDigest: `sha256:${"c".repeat(64)}`,
+              createdAt: "2026-08-12T00:00:00.000Z",
+            }
+          : undefined,
+    });
+    const host = createHost("tool-registry-execute-active-run", scratch, {
+      effectRunLifecycle,
+    });
+    const readTool: ToolDescriptor = {
+      toolId: "notes.read",
+      wireName: "read_note",
+      description: "Read one Host-owned note",
+      argumentSchema: {
+        type: "object",
+        properties: { key: { type: "string", maxBytes: 32 } },
+        required: ["key"],
+        additionalProperties: false,
+        maxProperties: 1,
+      },
+      resultSchema: { type: "string", maxBytes: 128 },
+      effectClass: "read",
+      resourceScope: "notes.owner",
+      approval: "never",
+      idempotency: "effect-key",
+      outcomeQuery: "supported",
+      parallel: "safe",
+      deadlineMs: 1_000,
+      maxArgumentBytes: 128,
+      maxResultBytes: 256,
+    };
+    const tools = new ToolRegistry([readTool], [readTool.toolId]);
+    const execute = vi.fn().mockResolvedValue({
+      status: "succeeded" as const,
+      content: "value",
+    });
+    const toolJournalPath = join(scratch, "tool-rounds.json");
+    const registry = new InstalledModulePermissionPolicyRegistry({
+      policies: [{
+        kind: "registered-tools",
+        policyId: "tools.owner-notes",
+        registry: tools,
+        repository: new FileToolJournalRepository({ path: toolJournalPath }),
+        executor: { execute },
+        budget: {
+          maxRounds: 2,
+          maxCalls: 2,
+          maxCallsPerRound: 1,
+          maxApprovals: 0,
+          maxCallBytes: 512,
+        },
+        approvalPolicyRevision: "approval-policy-1",
+        limits: {
+          maxCallsPerRound: 1,
+          maxArgumentBytes: 1_024,
+          maxResultBytes: 4_096,
+          maxInvocations: 4,
+          maxInvocationsPerRun: 2,
+        },
+        capabilityLifetimeMs: 60_000,
+      }],
+    });
+    const resolved = {
+      instanceId: "instance-a",
+      installation: {
+        manifest: FIXTURE_PACKAGE_MANIFEST,
+        packageDigest: `sha256:${"a".repeat(64)}`,
+      },
+      module: {
+        moduleId: "module-a",
+        permissionPolicyIds: ["tools.owner-notes"],
+        configurationReference: {
+          configId: "fixture-config",
+          revision: `sha256:${"b".repeat(64)}`,
+          configVersion: 1,
+        },
+      },
+    } as unknown as InstalledExtensionModule;
+    const setup = registry.setupFor(resolved);
+    expect(setup.snapshot.capabilities).toEqual([{
+      capabilityType: "tool-invocation",
+      capabilityVersion: "v2",
+      policyId: "tools.owner-notes",
+      registryDigest: tools.snapshot().registryDigest,
+      toolWireNames: ["read_note"],
+      effectPolicy: "read-only",
+    }]);
+    setup.configureHost(host);
+
+    try {
+      await host.start();
+      await expect(host.execute(execution())).resolves.toMatchObject({
+        view: {
+          schemaVersion: "dolly.tool-registry-view/2",
+          moduleJobId: "module-job-a",
+          registryDigest: tools.snapshot().registryDigest,
+          tools: [{
+            name: "read_note",
+            schemaDialect: "dolly.tool-value-schema/1",
+            effectClass: "read",
+          }],
+        },
+        round: {
+          schemaVersion: "dolly.tool-round-result/2",
+          moduleJobId: "module-job-a",
+          roundIndex: 1,
+          state: "complete",
+          canContinue: true,
+          results: [{
+            callId: "call-read-note",
+            name: "read_note",
+            status: "succeeded",
+            content: "value",
+          }],
+        },
+      });
+      expect(execute).toHaveBeenCalledOnce();
+      expect(execute).toHaveBeenCalledWith(expect.objectContaining({
+        moduleJobId: "module-job-a",
+        toolId: "notes.read",
+        arguments: { key: "deployment-note" },
+      }));
+      expect(new FileToolJournalRepository({ path: toolJournalPath })
+        .getRound("module-job-a", 1)).toMatchObject({
+          state: "complete",
+          effects: [{
+            status: "terminal",
+            result: { status: "succeeded", content: "value" },
+          }],
+        });
+      expect(effectJournal.listForRun(claim).map((record) => record.outcome.kind))
+        .toEqual(["terminal", "terminal"]);
       await host.stop();
     } finally {
       if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);

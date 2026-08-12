@@ -26,6 +26,7 @@ import { ExtensionInstallationRegistry } from "../../../src/core/extension-insta
 import { createFileCoreStateStoreWithStoppedRecordWriter } from "../../../src/core/file-core-state-store.js";
 import { resolveInstalledContentSchemaRegistrationSet } from "../../../src/core/installed-extension-module.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
+import { FileToolJournalRepository } from "../../../src/core/file-tool-journal-repository.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
 import type { ChatBrokerInvocation } from "../../../src/core/model-provider-broker.js";
 import { ModelDescriptorRegistry } from "../../../src/core/model-provider-descriptor.js";
@@ -38,6 +39,7 @@ import {
   createDefaultDollyInstanceConfig,
   validateDollyInstanceConfig,
 } from "../../../src/core/runtime-config.js";
+import { ToolRegistry, type ToolDescriptor } from "../../../src/core/tool-policy.js";
 import {
   CHAT_STRATEGIES,
   chatDescriptor,
@@ -644,6 +646,108 @@ describe("installed reactive Module runtime composition", () => {
     expect(composed.permissionPolicySetup?.snapshot.packageDigest)
       .toBe(composed.resolvedModule.installation.packageDigest);
     expect(selected.invoke).not.toHaveBeenCalled();
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
+  });
+
+  it("binds an installed tool policy to the selected package and configuration", () => {
+    const configuration = validateDollyInstanceConfig({
+      ...instanceConfiguration,
+      modules: instanceConfiguration.modules.map((module) => ({
+        ...module,
+        permissionPolicyIds: ["tools.owner-notes"],
+      })),
+    });
+    const pair = coreState("tool-policy", configuration);
+    const descriptor: ToolDescriptor = {
+      toolId: "notes.read",
+      wireName: "read_note",
+      description: "Read one Host-owned note",
+      argumentSchema: {
+        type: "object",
+        properties: { key: { type: "string", maxBytes: 32 } },
+        required: ["key"],
+        additionalProperties: false,
+        maxProperties: 1,
+      },
+      resultSchema: { type: "string", maxBytes: 128 },
+      effectClass: "read",
+      resourceScope: "notes.owner",
+      approval: "never",
+      idempotency: "effect-key",
+      outcomeQuery: "supported",
+      parallel: "safe",
+      deadlineMs: 1_000,
+      maxArgumentBytes: 128,
+      maxResultBytes: 256,
+    };
+    const tools = new ToolRegistry([descriptor], [descriptor.toolId]);
+    const toolPolicy = {
+      kind: "registered-tools" as const,
+      policyId: "tools.owner-notes",
+      registry: tools,
+      repository: new FileToolJournalRepository({
+        path: resolve(scratch, "tool-policy-rounds.json"),
+      }),
+      executor: { execute: vi.fn() },
+      budget: {
+        maxRounds: 2,
+        maxCalls: 2,
+        maxCallsPerRound: 1,
+        maxApprovals: 0,
+        maxCallBytes: 512,
+      },
+      approvalPolicyRevision: "approval-policy-1",
+      limits: {
+        maxCallsPerRound: 1,
+        maxArgumentBytes: 1_024,
+        maxResultBytes: 4_096,
+        maxInvocations: 4,
+        maxInvocationsPerRun: 2,
+      },
+      capabilityLifetimeMs: 60_000,
+    };
+    const permissionPolicies = new InstalledModulePermissionPolicyRegistry({
+      policies: [toolPolicy],
+    });
+    const writeTool = {
+      ...descriptor,
+      effectClass: "write" as const,
+      approval: "required" as const,
+    };
+    expect(() => new InstalledModulePermissionPolicyRegistry({
+      policies: [{
+        ...toolPolicy,
+        registry: new ToolRegistry([writeTool], [writeTool.toolId]),
+        repository: new FileToolJournalRepository({
+          path: resolve(scratch, "effectful-tool-policy-rounds.json"),
+        }),
+        budget: { ...toolPolicy.budget, maxApprovals: 1 },
+      }],
+    })).toThrow(/currently permits only read tools/u);
+    const composed = createInstalledReactiveModuleRuntime({
+      ...options(pair),
+      instanceConfiguration: configuration,
+      permissionPolicies,
+      effectIntentStore: new FileEffectIntentStore({
+        path: resolve(scratch, "tool-policy-effect-intents.json"),
+      }),
+    });
+
+    expect(composed.permissionPolicySetup?.snapshot).toMatchObject({
+      instanceId: INSTANCE_ID,
+      moduleId: "worker",
+      packageDigest: composed.resolvedModule.installation.packageDigest,
+      configurationRevision: configuration.modules[0]!.configurationReference.revision,
+      policyIds: ["tools.owner-notes"],
+      capabilities: [{
+        capabilityType: "tool-invocation",
+        capabilityVersion: "v2",
+        policyId: "tools.owner-notes",
+        registryDigest: tools.snapshot().registryDigest,
+        toolWireNames: ["read_note"],
+        effectPolicy: "read-only",
+      }],
+    });
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
 
