@@ -95,6 +95,41 @@ with SHA-256
 `0b3cf6dc13f5d6f7aaab0d57257f1955daa530370de8201c09e18f240d00192f`.
 Its environment and preflight hashes equal the first run's hashes above.
 
+## Scheduler shutdown and recovery-handoff hardening
+
+A later review found two current, independently reproducible composition
+defects and fixed them without changing the public startup refusal.
+
+First, `scheduler.dispatched` was delivered to a synchronous observer before
+the corresponding tick Promise was registered as in flight. An observer could
+call `stop()` from that event, observe shutdown complete, and then return to a
+tick that had not settled. The regression now calls `stop()` reentrantly from
+that observer and proves it remains `stopping` until the hand-controlled tick
+settles.
+
+Second, startup recovery could issue an authentic one-use handoff without
+having received the FileCore Module process-record store. Installed composition
+verified only the DeliveryStore and result repository, so that handoff could
+authorize a new generation while an unexamined old process record remained
+`running`. The handoff now also binds the exact Module record store used during
+recovery, and the installed composer must consume it with its own exact
+`FileCoreStateStore`. A cross-layer regression persists a running old record,
+omits Module records from recovery, and proves composition rejects the handoff
+without launching a process.
+
+After both changes, source commit
+`935aef549574bd0240a84678c5c21b9617188d99` passed the full installed Linux
+systemd-container file: 6/6 tests in 13.63 seconds. The exact container was
+`dolly-experiment-3081428-65c9a7d4`; post-run inspection returned absent. The
+retained transcript is
+`artifacts/experiments/linux-core-service-ownership/container-3081428-20260812T141622Z/linux-integration.log`
+with SHA-256
+`2da0ba848dea7a6f40c3cdd8bf0ecd3655abdd12fbc9ef0970d5afd241884067`.
+The environment and preflight hashes remained
+`4c66ed875461b8796fc11fdb7f45f40d4d34a120b081b8afa1e6977bd942d3d5`
+and
+`ecf7fce3780e2b756cfc847409343f9dc3196b8e6f9da072679da4c713411c36`.
+
 ## What this does not prove
 
 The model broker in this Linux lifecycle case is a deterministic Host fixture;
