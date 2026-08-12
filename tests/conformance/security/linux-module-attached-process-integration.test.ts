@@ -29,11 +29,19 @@
  *       tests/conformance/security/linux-module-attached-process-integration.test.ts
  */
 
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  readlinkSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { readFile as readFileAsync, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { attachLinuxModuleProcess } from "../../../src/adapters/linux-module-attached-process.js";
 import {
@@ -54,6 +62,7 @@ import {
 } from "../../../src/core/linux-module-cgroup.js";
 
 const INTERPRETER = "/usr/bin/python3";
+const BUBBLEWRAP = "/usr/bin/bwrap";
 const LIMITS: ModuleCgroupLimits = {
   // These limits should never be the reason the test group exits. In
   // particular, pids.max counts threads as well as processes.
@@ -191,6 +200,45 @@ function waitFor(
     }
   };
   return attempt();
+}
+
+function readJsonLine(stream: Readable, timeoutMs: number): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let buffer = "";
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      stream.off("data", onData);
+      stream.off("error", onError);
+      stream.off("end", onEnd);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      buffer += chunk.toString();
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      cleanup();
+      try {
+        resolve(JSON.parse(buffer.slice(0, newline)));
+      } catch (error) {
+        reject(error);
+      }
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    const onEnd = (): void => {
+      cleanup();
+      reject(new Error("Linux confinement probe ended before reporting"));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Linux confinement probe did not report before its deadline"));
+    }, timeoutMs);
+    timer.unref?.();
+    stream.on("data", onData);
+    stream.once("error", onError);
+    stream.once("end", onEnd);
+  });
 }
 
 let generation = 0;
@@ -401,6 +449,93 @@ async function startModule(
 describe.skipIf(delegatedRoot === undefined)(
   "Linux Module attached process in a real control group",
   () => {
+    it("contains a process tree behind user, PID, cgroup, and mount namespaces", async ({
+      onTestFinished,
+    }) => {
+      if (!existsSync(BUBBLEWRAP)) {
+        throw new Error(`${BUBBLEWRAP} is required for the Linux process confinement boundary`);
+      }
+      const scratch = mkdtempSync(join(tmpdir(), "dolly-process-confinement-"));
+      const coreStateMarker = join(scratch, "core-state.json");
+      writeFileSync(coreStateMarker, "core-state-must-not-be-readable\n", { mode: 0o600 });
+      const resources: TestResources = {};
+      onTestFinished(async () => {
+        try {
+          await cleanupTestResources(resources);
+        } finally {
+          rmSync(scratch, { recursive: true, force: true });
+        }
+      }, 35_000);
+
+      const outerCgroupNamespace = readlinkSync("/proc/self/ns/cgroup");
+      const execution = {
+        program: BUBBLEWRAP,
+        argumentVector: [
+          BUBBLEWRAP,
+          "--ro-bind", "/", "/",
+          "--dev", "/dev",
+          "--proc", "/proc",
+          "--tmpfs", "/run",
+          "--tmpfs", scratch,
+          "--unshare-user",
+          "--unshare-pid",
+          "--unshare-cgroup",
+          "--unshare-ipc",
+          "--unshare-uts",
+          "--disable-userns",
+          "--die-with-parent",
+          "--new-session",
+          "--setenv", "DOLLY_TEST_CORE_PID", String(process.pid),
+          "--setenv", "DOLLY_TEST_CORE_STATE_MARKER", coreStateMarker,
+          "--",
+          INTERPRETER,
+          "-I",
+          "-B",
+          fixturePath("linux-process-confinement-probe.py"),
+        ],
+      };
+      const { launcher, cgroup } = await startModule(execution, resources);
+      if (!launcher.child.stdout) throw new Error("confinement probe stdout is unavailable");
+      const report = await readJsonLine(launcher.child.stdout, 10_000);
+
+      expect(report).toMatchObject({
+        schemaVersion: "dolly.linux-process-confinement-probe/1",
+        selfCgroup: "0::/",
+        cgroupWrite: { outcome: "denied" },
+        memoryLimitWrite: { outcome: "denied" },
+        nestedUserNamespace: { outcome: "denied", errno: 1 },
+        secondCgroupMount: { outcome: "denied", errno: 1 },
+        coreSignalProbe: { outcome: "denied", errno: 3 },
+        coreProcRead: { outcome: "denied", errno: 2 },
+        coreStateRead: { outcome: "denied", errno: 2 },
+        userManagerConnect: { outcome: "denied", errno: 2 },
+        descendant: {
+          status: 0,
+          report: {
+            cgroup: "0::/",
+            cgroupWrite: { outcome: "denied" },
+          },
+        },
+      });
+      expect((report as { cgroupNamespace: string }).cgroupNamespace).not.toBe(
+        outerCgroupNamespace,
+      );
+      expect(await populated(cgroup.path)).toBe(true);
+
+      const attached = attachLinuxModuleProcess({
+        launcher,
+        cgroup,
+        terminationTimeoutMs: 5_000,
+      });
+      attached.requestTermination();
+      expect(await waitFor(async () => attached.exited, 10_000)).toBe(true);
+      expect(await populated(cgroup.path)).toBe(false);
+      expect(attached.terminationAttempts.at(-1)).toMatchObject({
+        terminated: true,
+        evidence: "populated-zero",
+      });
+    }, 90_000);
+
     it("terminates a descendant that left the process group", async ({ onTestFinished }) => {
       const scratch = mkdtempSync(join(tmpdir(), "dolly-attached-escape-"));
       const descendantPidPath = join(scratch, "descendant-pid.txt");
