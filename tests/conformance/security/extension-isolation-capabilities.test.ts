@@ -183,6 +183,57 @@ describe("Extension process isolation and capability checks", () => {
     );
   });
 
+  it.each([
+    ["dolly.extension-package/2", {
+      ...FIXTURE_PACKAGE_MANIFEST,
+      schemaVersion: "dolly.extension-package/2",
+      modules: [{
+        ...FIXTURE_PACKAGE_MANIFEST.modules[0]!,
+        activation: "reactive",
+        producedContentSchemas: [],
+      }],
+    } satisfies ExtensionPackageManifest],
+    ["dolly.extension-package/3", {
+      ...FIXTURE_PACKAGE_MANIFEST,
+      schemaVersion: "dolly.extension-package/3",
+      modules: [{
+        ...FIXTURE_PACKAGE_MANIFEST.modules[0]!,
+        activation: "source",
+        producedContentSchemas: [],
+      }],
+    } satisfies ExtensionPackageManifest],
+  ] as const)("negotiates the common process contract for %s", async (
+    _schemaVersion,
+    manifest,
+  ) => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-versioned-process-"));
+    const host = createHost("normal", scratch, {
+      manifest,
+    });
+    try {
+      await expect(host.start()).resolves.toMatchObject({
+        state: "ready",
+        extensionId: "com.example.fixture",
+        moduleId: "module-a",
+      });
+      await host.stop();
+      expect(host.snapshot.state).toBe("stopped");
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.stop().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a forged requested capability before process creation", () => {
+    const manifest = {
+      ...FIXTURE_PACKAGE_MANIFEST,
+      requestedCapabilities: ["network"],
+    } as unknown as ExtensionPackageManifest;
+    expect(() => createHost("normal", tmpdir(), { manifest })).toThrowError(
+      expect.objectContaining({ code: "EXTENSION_HOST_OPTIONS_INVALID" }),
+    );
+  });
+
   it("rejects a process that responds with Extension process protocol 2.0", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-old-protocol-"));
     const host = createHost("old-protocol", scratch);
