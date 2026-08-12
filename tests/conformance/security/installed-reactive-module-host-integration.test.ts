@@ -519,10 +519,12 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       });
       coreState.store.deliveries.append("input", secondInput.id);
       expect(await waitFor(
-        () => events.some((event) =>
-          event.type === "scheduler.backpressure_entered" &&
-          event.moduleId === SECOND_MODULE_ID
-        ),
+        () =>
+          actorRunCount(FIRST_MODULE_ID) === 2 &&
+          events.some((event) =>
+            event.type === "scheduler.backpressure_entered" &&
+            event.moduleId === SECOND_MODULE_ID
+          ),
         5_000,
       )).toBe(true);
       expect(actorRunCount(FIRST_MODULE_ID)).toBe(2);
