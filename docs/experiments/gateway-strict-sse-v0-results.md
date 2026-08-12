@@ -51,3 +51,33 @@ Evidence root:
 
 This canary did not start Dolly, a Module, a browser, a server, a container, or
 a background process. `RUNTIME_MODULE_MIGRATION_REQUIRED` remains unchanged.
+
+## Version 1: completion-budget ablation
+
+Version 1 changed only the completion budget from 5,200 to 6,400 tokens and
+added an explicit instruction to reserve final-answer capacity. It retained
+the model, task, seed, `thinking.type=enabled`, strict SSE contract, one-call
+limit, and no-retry rule.
+
+Run `run-20260812b` again passed the independently reconstructed transport
+boundary: HTTP 200, 1,805 network chunks, 1,834 SSE events, unique usage and
+`[DONE]`, a last chunk after 149 seconds, and a maximum inter-chunk gap of
+749.821 milliseconds. Its raw stream therefore supplies a second direct
+gateway-over-120-seconds observation.
+
+The model-content gate failed again. It used all 6,400 completion tokens,
+reported 5,049 reasoning tokens and 14,683 reasoning characters, ended with
+`finish_reason=length`, and emitted no final content. Increasing the budget did
+not resolve the problem and is rejected as the next engineering step. The next
+version must instead test the already measured role-specific thinking policy:
+strict streaming with `thinking.type=disabled` for a short structured response,
+while retaining `enabled` plus non-empty reasoning evidence for calls that
+actually require planning.
+
+Version 1 evidence root:
+`artifacts/experiments/probes/gateway-strict-sse-v0/run-20260812b`
+
+- `response.sse`: `b3c2f0a0c9310c4d961ca776c704f36989eb29c003afc38b3b194180b4404c44`
+- `chunk-timings.jsonl`: `48a99601b624e0cc7b42ef1cf8129858477a688e44aac0064956cc5374e52e54`
+- `result.json`: `e89f75705060531d383880211c1bb669f91cde64d4e14932a18b49b46678704c`
+- passing `validation.json`: `836566d6cc84eb080e87ae78f7d0d80de73222d72ea90d4421b40fc9920b3efb`
