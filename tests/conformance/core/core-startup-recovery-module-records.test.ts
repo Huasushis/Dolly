@@ -755,7 +755,7 @@ describe("CORE startup reconciliation with Module records", () => {
     expect(store.deliveries.listActiveClaims()).toHaveLength(1);
   });
 
-  it("releases a submitted Run that declared no external effect", async () => {
+  it("does not trust a reopened version 1 no-effect declaration without configuration provenance", async () => {
     const store = openStore("first");
     const claim = seedActiveClaim(store);
     store.appendModuleProcessRecord(
@@ -763,21 +763,26 @@ describe("CORE startup reconciliation with Module records", () => {
     );
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionFor(claim));
+    const reopened = openStore("legacy-none-reopened");
+    const inspectRunEffects = vi.fn(async (): Promise<ExternalEffectEvidence> => ({
+      kind: "no-effect",
+    }));
 
-    const report = await new CoreStartupRecovery({
-      deliveries: store.deliveries,
-      commits: openCommits(store),
-      moduleRecords: store,
-      stoppedRecordWriter: stoppedRecordWriterFor(store),
+    await expect(new CoreStartupRecovery({
+      deliveries: reopened.deliveries,
+      commits: openCommits(reopened),
+      moduleRecords: reopened,
+      stoppedRecordWriter: stoppedRecordWriterFor(reopened),
       processStopProver: provenStopped,
-    }).recover();
+      externalEffectEvidence: { inspectRunEffects },
+    }).recover()).rejects.toMatchObject({
+      code: "STARTUP_ACTIVE_CLAIM_UNRESOLVED",
+      message: expect.stringContaining("configuration provenance"),
+    });
 
-    expect(report.releasedClaims).toEqual([
-      expect.objectContaining({ runId: claim.runId, reason: "no-external-effect" }),
-    ]);
-    const reopened = openStore("second");
-    expect(reopened.deliveries.listActiveClaims()).toEqual([]);
-    expect(reopened.getModuleSubmissionRecord(claim.runId)).toBeUndefined();
+    expect(inspectRunEffects).not.toHaveBeenCalled();
+    expect(reopened.deliveries.inspectClaim(claim).status).toBe("active");
+    expect(reopened.getModuleSubmissionRecord(claim.runId)).toBeDefined();
   });
 
   it.each(["no-effect", "retry-safe"] as const)(
@@ -906,11 +911,6 @@ describe("CORE startup reconciliation with Module records", () => {
   it("fails closed when Claim release reports success without changing Core state", async () => {
     const store = openStore("first");
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(
-      processRecord({ declaredExternalEffects: "none" }),
-    );
-    store.updateModuleProcessRecordState("process-generation-1", "running");
-    const submission = store.appendModuleSubmissionRecord(submissionFor(claim));
 
     await expect(
       new CoreStartupRecovery({
@@ -918,28 +918,23 @@ describe("CORE startup reconciliation with Module records", () => {
         commits: openCommits(store),
         moduleRecords: withSubmissionRecords(
           store,
-          [submission],
+          [],
           () => "released",
         ),
-        stoppedRecordWriter: stoppedRecordWriterFor(store),
-        processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
       code: "STARTUP_CLAIM_RELEASE_UNCONFIRMED",
     });
 
     expect(store.deliveries.inspectClaim(claim).status).toBe("active");
-    expect(store.getModuleSubmissionRecord(claim.runId)).toBeDefined();
+    expect(store.getModuleSubmissionRecord(claim.runId)).toBeUndefined();
   });
 
   it("does not report release while the submission-record view still contains the Run", async () => {
     const store = openStore("first");
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(
-      processRecord({ declaredExternalEffects: "none" }),
-    );
-    store.updateModuleProcessRecordState("process-generation-1", "running");
-    const submission = store.appendModuleSubmissionRecord(submissionFor(claim));
+    const staleSubmission = submissionFor(claim);
+    let submissionReads = 0;
 
     await expect(
       new CoreStartupRecovery({
@@ -947,11 +942,10 @@ describe("CORE startup reconciliation with Module records", () => {
         commits: openCommits(store),
         moduleRecords: withSubmissionRecords(
           store,
-          [submission],
+          [],
           (identity) => store.releaseDeliveryClaim(identity),
+          () => (++submissionReads === 1 ? undefined : staleSubmission),
         ),
-        stoppedRecordWriter: stoppedRecordWriterFor(store),
-        processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
       code: "STARTUP_CLAIM_RELEASE_UNCONFIRMED",
@@ -964,30 +958,26 @@ describe("CORE startup reconciliation with Module records", () => {
   it("accepts a callback error only after both release effects are confirmed", async () => {
     const store = openStore("first");
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(
-      processRecord({ declaredExternalEffects: "none" }),
-    );
-    store.updateModuleProcessRecordState("process-generation-1", "running");
-    const submission = store.appendModuleSubmissionRecord(submissionFor(claim));
 
     const report = await new CoreStartupRecovery({
       deliveries: store.deliveries,
       commits: openCommits(store),
       moduleRecords: withSubmissionRecords(
         store,
-        [submission],
+        [],
         (identity) => {
           store.releaseDeliveryClaim(identity);
           throw new Error("simulated error after persistence");
         },
         (runId) => store.getModuleSubmissionRecord(runId),
       ),
-      stoppedRecordWriter: stoppedRecordWriterFor(store),
-      processStopProver: provenStopped,
     }).recover();
 
     expect(report.releasedClaims).toEqual([
-      expect.objectContaining({ runId: claim.runId, reason: "no-external-effect" }),
+      expect.objectContaining({
+        runId: claim.runId,
+        reason: "never-authorized-to-send",
+      }),
     ]);
     expect(store.deliveries.inspectClaim(claim).status).toBe("released");
     expect(store.getModuleSubmissionRecord(claim.runId)).toBeUndefined();
@@ -996,19 +986,9 @@ describe("CORE startup reconciliation with Module records", () => {
   it("fails closed when Claim release changes a different Core-state file", async () => {
     const store = openStore("first");
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(
-      processRecord({ declaredExternalEffects: "none" }),
-    );
-    store.updateModuleProcessRecordState("process-generation-1", "running");
-    const submission = store.appendModuleSubmissionRecord(submissionFor(claim));
 
     const otherStore = openStore("first", join(root, "other-core-state.json"));
     const otherClaim = seedActiveClaim(otherStore);
-    otherStore.appendModuleProcessRecord(
-      processRecord({ declaredExternalEffects: "none" }),
-    );
-    otherStore.updateModuleProcessRecordState("process-generation-1", "running");
-    otherStore.appendModuleSubmissionRecord(submissionFor(otherClaim));
 
     await expect(
       new CoreStartupRecovery({
@@ -1016,29 +996,22 @@ describe("CORE startup reconciliation with Module records", () => {
         commits: openCommits(store),
         moduleRecords: withSubmissionRecords(
           store,
-          [submission],
+          [],
           (identity) => otherStore.releaseDeliveryClaim(identity),
         ),
-        stoppedRecordWriter: stoppedRecordWriterFor(store),
-        processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
       code: "STARTUP_CLAIM_RELEASE_UNCONFIRMED",
     });
 
     expect(store.deliveries.inspectClaim(claim).status).toBe("active");
-    expect(store.getModuleSubmissionRecord(claim.runId)).toBeDefined();
+    expect(store.getModuleSubmissionRecord(claim.runId)).toBeUndefined();
     expect(otherStore.deliveries.inspectClaim(otherClaim).status).toBe("released");
   });
 
   it("fails closed when Claim release returns a Promise", async () => {
     const store = openStore("first");
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(
-      processRecord({ declaredExternalEffects: "none" }),
-    );
-    store.updateModuleProcessRecordState("process-generation-1", "running");
-    const submission = store.appendModuleSubmissionRecord(submissionFor(claim));
     const asynchronousRelease = (() =>
       Promise.resolve("released")) as unknown as CoreStartupStateStore["releaseDeliveryClaim"];
 
@@ -1048,28 +1021,21 @@ describe("CORE startup reconciliation with Module records", () => {
         commits: openCommits(store),
         moduleRecords: withSubmissionRecords(
           store,
-          [submission],
+          [],
           asynchronousRelease,
         ),
-        stoppedRecordWriter: stoppedRecordWriterFor(store),
-        processStopProver: provenStopped,
       }).recover(),
     ).rejects.toMatchObject({
       code: "STARTUP_CLAIM_RELEASE_UNCONFIRMED",
     });
 
     expect(store.deliveries.inspectClaim(claim).status).toBe("active");
-    expect(store.getModuleSubmissionRecord(claim.runId)).toBeDefined();
+    expect(store.getModuleSubmissionRecord(claim.runId)).toBeUndefined();
   });
 
-  it("makes the Claim release and its submission removal one Core-state revision", async () => {
+  it("makes the never-authorized Claim release one Core-state revision", async () => {
     const store = openStore("first");
-    const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(
-      processRecord({ declaredExternalEffects: "none" }),
-    );
-    store.updateModuleProcessRecordState("process-generation-1", "running");
-    store.appendModuleSubmissionRecord(submissionFor(claim));
+    seedActiveClaim(store);
     const commits = openCommits(store);
     const before = store.revision;
 
@@ -1077,17 +1043,9 @@ describe("CORE startup reconciliation with Module records", () => {
       deliveries: store.deliveries,
       commits,
       moduleRecords: store,
-      stoppedRecordWriter: stoppedRecordWriterFor(store),
-      processStopProver: provenStopped,
     }).recover();
 
-    // Recovery makes exactly three Core-state updates here:
-    //   1. mark the old process record stopped after its stop proof;
-    //   2. release the Claim and remove its submission record together; and
-    //   3. collect the records nothing references any more.
-    // Step 2 is the one Architecture Decision Record 0009 requires to be
-    // atomic, so splitting it would raise this count and fail this test.
-    expect(store.revision - before).toBe(3);
+    expect(store.revision - before).toBe(1);
     const reopened = openStore("second");
     expect(reopened.deliveries.listActiveClaims()).toEqual([]);
     expect(reopened.listModuleSubmissionRecords()).toEqual([]);

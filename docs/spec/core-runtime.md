@@ -1257,11 +1257,14 @@ effect. Startup recovery therefore preserves its submitted Run as unresolved.
 The stronger `none` and `core-capabilities-only` values are operator assertions
 for a future closed configuration and enforcement boundary; the current
 installed-process candidate never infers either value from an empty capability
-journal. A version 1 record carrying `core-capabilities-only` is historically
-ambiguous and is never sufficient provenance for automatic Claim disposition,
-even when an associated capability journal reports no effect. A future record
-version must bind the assertion to the validated instance configuration and
-execution boundary before recovery consults that journal.
+journal. Version 1 records carrying either value are historically ambiguous:
+the schema does not bind the assertion to a validated instance configuration
+or enforcement boundary. Neither value is sufficient provenance for automatic
+Claim disposition, even when an associated capability journal reports no
+effect. A future record version must bind the assertion to the validated
+instance configuration and execution boundary before recovery releases a
+`none` Run or consults the capability journal for a `core-capabilities-only`
+Run.
 
 The process-record lifecycle is:
 

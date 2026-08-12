@@ -101,7 +101,9 @@ export interface ReleasedClaimReport {
    * history. Under that format's invariant, no Extension process-protocol send
    * was durably authorized for the Run.
    *
-   * `no-external-effect` follows the Module process declaration.
+   * `no-external-effect` is reserved for a future process-record version that
+   * binds the declaration to its validated configuration and enforcement
+   * boundary. Version 1 declarations never authorize this disposition.
    * `external-effects-safe-to-retry` follows persistent evidence that the
    * submitted Run caused no effect or that retrying cannot add another effect.
    */
@@ -257,8 +259,9 @@ export interface CoreStartupRecoveryOptions {
   readonly processStopProver?: ModuleProcessStopProver;
   /**
    * Evidence for a future process-record version that proves the external-
-   * effect declaration's configuration provenance. Version 1 capability-only
-   * records are rejected before this source is consulted.
+   * effect declaration's configuration provenance. Version 1 `none` and
+   * `core-capabilities-only` records are rejected before this source is
+   * consulted.
    */
   readonly externalEffectEvidence?: ExternalEffectEvidenceSource;
 }
@@ -1004,9 +1007,6 @@ export class CoreStartupRecovery {
         reason: `matching Module process record is ${processRecord.state}`,
       };
     }
-    if (processRecord.declaredExternalEffects === "none") {
-      return { kind: "release", reason: "no-external-effect" };
-    }
     if (processRecord.declaredExternalEffects === "unrestricted") {
       return {
         kind: "outcome-unknown",
@@ -1022,6 +1022,9 @@ export class CoreStartupRecovery {
         reason:
           `the version 1 process record has no configuration provenance for its ${processRecord.declaredExternalEffects} external-effect declaration`,
       };
+    }
+    if (processRecord.declaredExternalEffects === "none") {
+      return { kind: "release", reason: "no-external-effect" };
     }
     if (!this.#externalEffectEvidence) {
       return {
