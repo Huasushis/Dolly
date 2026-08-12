@@ -826,6 +826,15 @@ Deliveries at the atomic result-commit boundary, not only by a Scheduler
 pre-check. Scheduler status reports all four Claim values and both mailbox
 bounds.
 
+Configuration validation also proves that an empty consumer mailbox can hold
+one maximum result from every directly connected producer considered one at a
+time. If one producer output reaches the same consumer through `N` output
+Pages, the projection is `N` resident Deliveries and
+`N * producer.maxResultBytes`; both values must fit that consumer's mailbox and
+the byte multiplication must remain a safe integer. This static condition does
+not replace the atomic exact-byte check for a real result or reserve capacity
+across concurrent producers.
+
 A source Module has no public `inputConnections`. Its Claim baseline count and
 hard count MUST both equal one because one durable source request is one Module
 job. `sourceRequestMaxBytes` is a positive safe integer for a source Module and
@@ -880,7 +889,8 @@ unused reference or add a manifest request that configuration omitted.
 #### 5.3.1 Explicit migration from version 9
 
 Migration is a separate operation, not an alias in the version-10 validator.
-It receives one validated version-9 document plus an explicit migration input
+It receives one validated version-9 document and configuration revision from
+the same configuration-store read, plus an explicit migration input
 containing the complete version-10 Scheduler record and, for every configured
 Module, its Claim baseline, mailbox bounds, source request byte limit when
 applicable, Linux execution record, external-effect declaration, and exact
@@ -903,9 +913,11 @@ copied exactly. Each version-9 permission policy identifier must resolve to the
 explicitly supplied persistent revision; unresolved or additional references
 fail migration.
 
-Migration first constructs and validates the complete version-10 document and
-an auditable change plan without changing external state. It then rechecks the
-source revision and writes one new configuration revision atomically. It does
+Migration first requires the revision in that source snapshot to equal the
+explicit expected source revision, then constructs and validates the complete
+version-10 document and an auditable change plan without changing external
+state. Applying the plan rechecks the same source revision and writes one new
+configuration revision atomically. It does
 not create subscriptions, source queues, process records, or child processes,
 and it does not remove or weaken the version-9 Module startup refusal. Applying
 the migrated document is a later recovery and activation operation.
