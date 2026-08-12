@@ -39,6 +39,44 @@ function createHarness(maxFailedAttempts = 3) {
 }
 
 describe("CORE-004 per-consumer claim/ack recovery", () => {
+  it("keeps one active Module job per consumer while later input remains pending", () => {
+    const { blocks, deliveries } = createHarness();
+    deliveries.createPage("page");
+    deliveries.registerConsumer("page", "consumer", "from-now");
+    const firstBlock = blocks.commit(proposal("first"), source);
+    const secondBlock = blocks.commit(proposal("second"), source);
+    deliveries.append("page", firstBlock.id);
+    deliveries.append("page", secondBlock.id);
+    const first = deliveries.claim({
+      consumerId: "consumer",
+      pageIds: ["page"],
+      moduleGenerationId: "generation-1",
+      maxCount: 1,
+      maxBytes: 1024 * 1024,
+    })!;
+    const before = deliveries.snapshot();
+
+    expect(() => deliveries.claim({
+      consumerId: "consumer",
+      pageIds: ["page"],
+      moduleGenerationId: "generation-2",
+      maxCount: 1,
+      maxBytes: 1024 * 1024,
+    })).toThrowError(expect.objectContaining<Partial<DeliveryStoreError>>({
+      code: "CLAIM_ACTIVE",
+    }));
+
+    expect(deliveries.snapshot()).toEqual(before);
+    expect(deliveries.listActiveClaims()).toEqual([
+      expect.objectContaining({
+        moduleJobId: first.moduleJobId,
+        consumerId: "consumer",
+        status: "active",
+      }),
+    ]);
+    expect(deliveries.inspectPending("consumer", ["page"]).pendingCount).toBe(1);
+  });
+
   it("projects fan-out capacity per subscribed occurrence before any mutation", () => {
     const { blocks, deliveries } = createHarness();
     for (const pageId of ["input", "output-a", "output-b"]) {

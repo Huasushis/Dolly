@@ -501,7 +501,7 @@ accept an external-effect declaration, effect evidence source, arbitrary Host
 setup callback, or capability-effect lifecycle from its caller. It rejects
 those substitutions before executor construction. Until the closed instance
 configuration in Section 5.2 exists, it records the conservative
-`"core-capabilities-only"` disposition and supplies no evidence source to the
+`"unrestricted"` disposition and supplies no evidence source to the
 retry decision, so any submitted Run without a committed result is preserved
 for recovery rather than automatically retried or dead-lettered. This remains
 true even when the Host has a complete journal of Core-mediated model calls:
@@ -1196,7 +1196,7 @@ interface ModuleProcessRecord {
     revision: string;
     configVersion: number;
   };
-  declaredExternalEffects: "none" | "core-capabilities-only";
+  declaredExternalEffects: "unrestricted" | "none" | "core-capabilities-only";
   serviceInvocationId: string;
   bootId: string;
   moduleCgroupPath: string;
@@ -1232,6 +1232,16 @@ machine-readable code; free-form failure text belongs in logs. `inputDigest`
 is the digest of the canonical `dolly.reactive-module-input/2` document for
 the Run; the existence of the submission record is itself the durable
 authority to send, so the record has no separate authorization flag.
+
+`unrestricted` records that the process boundary does not exclude direct
+filesystem, network, or subprocess effects. It is the conservative value for
+the current ordinary installed-process candidate: even an empty and complete
+Core capability journal cannot prove that such a Run produced no external
+effect. Startup recovery therefore preserves its submitted Run as unresolved.
+The stronger `none` and `core-capabilities-only` values are operator assertions
+for a future closed configuration and enforcement boundary; the current
+installed-process candidate never infers either value from an empty capability
+journal.
 
 The process-record lifecycle is:
 
@@ -1327,6 +1337,15 @@ deterministic pass, repeats while another completed result released capacity,
 and reports any remaining records as deferred. It MUST NOT acknowledge,
 negatively acknowledge, release, or execute the producing Module again merely
 because output admission is still waiting.
+
+One consumer can have at most one active Module job. A Module uses its unique
+Module identifier as that consumer identity, so a valid persisted state can
+contain at most one deferred prepared result for each Module. Claim creation
+rejects a second active job without allocating another Run, and snapshot
+loading rejects two active jobs for the same consumer. A second deferred result
+for one Module is therefore a consistency error, not a queue that startup may
+silently order or discard. Different Modules may each have one deferred result
+and remain independent recovery work.
 
 A runtime receiving such a startup-revalidated record enters commit-only
 recovery. It exposes output-commit waiting to the Scheduler and retries only

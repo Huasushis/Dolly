@@ -506,6 +506,46 @@ describe("CORE DeliveryStore restart snapshot", () => {
     );
   });
 
+  it("rejects a restarted snapshot with two active Module jobs for one consumer", () => {
+    const original = createHarness();
+    original.deliveries.createPage("page");
+    original.deliveries.registerConsumer("page", "consumer", "from-now");
+    const block = original.blocks.commit(proposal("active"), source);
+    original.deliveries.append("page", block.id);
+    original.deliveries.claim({
+      consumerId: "consumer",
+      pageIds: ["page"],
+      moduleGenerationId: "generation-1",
+      maxCount: 1,
+      maxBytes: 1024 * 1024,
+    });
+    const state = structuredClone(snapshots(original.blocks, original.deliveries));
+    const existing = state.deliveries.moduleJobs[0]!;
+    const duplicateId = "module-job-forged-duplicate";
+    const duplicate = {
+      ...existing,
+      moduleJobId: duplicateId,
+      status: "ready" as const,
+      activeLeaseIds: [],
+    };
+    const forged: Snapshots = {
+      ...state,
+      deliveries: {
+        ...state.deliveries,
+        moduleJobs: [...state.deliveries.moduleJobs, duplicate],
+        usedIds: [...state.deliveries.usedIds, duplicateId].sort((left, right) =>
+          left.localeCompare(right)),
+      },
+    };
+
+    expect(() => restore(forged)).toThrowError(
+      expect.objectContaining<Partial<DeliveryStoreError>>({
+        code: "DELIVERY_SNAPSHOT_INVALID",
+        message: "A consumer has more than one active Module job",
+      }),
+    );
+  });
+
   it("returns the immutable Claim when its final persistence write is unconfirmed", () => {
     const harness = createHarness();
     harness.deliveries.createPage("page");

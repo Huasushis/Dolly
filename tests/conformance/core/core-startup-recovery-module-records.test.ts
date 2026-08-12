@@ -14,6 +14,11 @@ import {
 } from "../../../src/core/core-startup-recovery.js";
 import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
 import {
+  EffectIntentJournal,
+  effectIntentEvidenceSource,
+} from "../../../src/core/capabilities/effect-intent-journal.js";
+import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
+import {
   createFileCoreStateStoreWithStoppedRecordWriter,
   FileCoreStateStore,
 } from "../../../src/core/file-core-state-store.js";
@@ -826,6 +831,39 @@ describe("CORE startup reconciliation with Module records", () => {
       expect(store.getModuleSubmissionRecord(claim.runId)).toBeUndefined();
     },
   );
+
+  it("does not treat an empty capability journal as proof that an ordinary process made no ambient effect", async () => {
+    const store = openStore("first");
+    const claim = seedActiveClaim(store);
+    store.appendModuleProcessRecord(processRecord({
+      declaredExternalEffects: "unrestricted",
+    }));
+    store.updateModuleProcessRecordState("process-generation-1", "running");
+    store.appendModuleSubmissionRecord(submissionFor(claim));
+    const journal = new EffectIntentJournal({
+      store: new FileEffectIntentStore({ path: join(root, "effect-intents.json") }),
+      now: () => NOW,
+    });
+    const identity = exactIdentity(claim);
+    journal.openRun(identity);
+    journal.closeRun(identity);
+    expect(journal.evidenceForRun(identity)).toEqual({ kind: "no-effect" });
+
+    await expect(new CoreStartupRecovery({
+      deliveries: store.deliveries,
+      commits: openCommits(store),
+      moduleRecords: store,
+      stoppedRecordWriter: stoppedRecordWriterFor(store),
+      processStopProver: provenStopped,
+      externalEffectEvidence: effectIntentEvidenceSource(journal),
+    }).recover()).rejects.toMatchObject({
+      code: "STARTUP_ACTIVE_CLAIM_UNRESOLVED",
+      message: expect.stringContaining("ambient effects are not excluded"),
+    });
+
+    expect(store.deliveries.inspectClaim(claim).status).toBe("active");
+    expect(store.getModuleSubmissionRecord(claim.runId)).toBeDefined();
+  });
 
   it("preserves a submitted Run with terminal evidence because it does not prove retry safety", async () => {
     const store = openStore("first");

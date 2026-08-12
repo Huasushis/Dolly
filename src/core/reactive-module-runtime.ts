@@ -219,7 +219,10 @@ export interface ReactiveModuleRuntimeOptions {
    * unknown outcome for audited operator action, as Architecture Decision
    * Record 0009 requires.
    */
-  readonly declaredExternalEffects?: "none" | "core-capabilities-only";
+  readonly declaredExternalEffects?:
+    | "unrestricted"
+    | "none"
+    | "core-capabilities-only";
   /**
    * Reads persistent evidence for every external effect authorized for one
    * exact submitted Run. A missing or invalid source never permits Core to
@@ -402,7 +405,10 @@ export class ReactiveModuleRuntime {
   readonly #persistModuleSubmission:
     ReactiveModuleRuntimeOptions["persistModuleSubmission"];
   readonly #commits: ModuleResultCommitCoordinator;
-  readonly #declaredExternalEffects: "none" | "core-capabilities-only";
+  readonly #declaredExternalEffects:
+    | "unrestricted"
+    | "none"
+    | "core-capabilities-only";
   readonly #externalEffectEvidence: ExternalEffectEvidenceSource | undefined;
   readonly #source: SourceIdentity;
   readonly #classifyFailure: ReactiveModuleRuntimeOptions["classifyFailure"];
@@ -508,10 +514,10 @@ export class ReactiveModuleRuntime {
     this.#persistModuleSubmission = options.persistModuleSubmission;
     this.#commits = options.commits;
     this.#source = deepFreeze({ kind: "module", id: options.moduleId });
-    // Defaulting to the stricter value keeps an unconfigured Module from being
-    // classified as failed after a Run whose result never reached the journal.
+    // An omitted declaration cannot exclude ambient effects, so it must never
+    // make an uncommitted Run eligible for automatic negative acknowledgement.
     this.#declaredExternalEffects =
-      options.declaredExternalEffects ?? "core-capabilities-only";
+      options.declaredExternalEffects ?? "unrestricted";
     this.#externalEffectEvidence = options.externalEffectEvidence;
     this.#classifyFailure = options.classifyFailure;
 
@@ -1370,6 +1376,9 @@ export class ReactiveModuleRuntime {
     | undefined
   > {
     if (this.#declaredExternalEffects === "none") return undefined;
+    if (this.#declaredExternalEffects === "unrestricted") {
+      return "external-effect-outcome-unknown";
+    }
     const source = this.#externalEffectEvidence;
     const submission = this.#matchingSubmission(claim);
     if (!source || !submission) return "external-effect-outcome-unknown";

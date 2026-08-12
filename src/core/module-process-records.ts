@@ -35,7 +35,15 @@ export type ModuleProcessRecordState =
   | "stopping"
   | "stopped";
 
-export type DeclaredExternalEffects = "none" | "core-capabilities-only";
+/**
+ * Describes which external-effect channels Core may rely on during recovery.
+ * `unrestricted` means the process boundary does not prevent ambient file,
+ * network, or subprocess effects, so no automatic retry is safe.
+ */
+export type DeclaredExternalEffects =
+  | "unrestricted"
+  | "none"
+  | "core-capabilities-only";
 
 export interface ModuleProcessRecord {
   readonly schemaVersion: "dolly.module-process-record/1";
@@ -228,7 +236,11 @@ export function assertValidModuleProcessRecord(
   if (!Number.isSafeInteger(reference.configVersion) || (reference.configVersion as number) < 1) {
     fail(code, "Module process record configVersion must be a positive integer");
   }
-  if (value.declaredExternalEffects !== "none" && value.declaredExternalEffects !== "core-capabilities-only") {
+  if (
+    value.declaredExternalEffects !== "unrestricted" &&
+    value.declaredExternalEffects !== "none" &&
+    value.declaredExternalEffects !== "core-capabilities-only"
+  ) {
     fail(code, "Module process record declaredExternalEffects value is not supported");
   }
   if (!isDerivedModuleCgroupPath(value.moduleCgroupPath, value.processGenerationId)) {

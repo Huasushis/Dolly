@@ -969,6 +969,15 @@ describe("CORE Module process and submission records", () => {
     });
   });
 
+  it("persists an unrestricted effect boundary without treating it as retry evidence", () => {
+    const store = openStore("first");
+    expect(store.appendModuleProcessRecord(processRecord({
+      declaredExternalEffects: "unrestricted",
+    }))).toMatchObject({
+      declaredExternalEffects: "unrestricted",
+    });
+  });
+
   it("rejects records carrying unknown fields or unsupported declarations", () => {
     const store = openStore("first");
     expect(() =>

@@ -70,10 +70,13 @@ the Host check was not weakened.
 ## What this does not prove
 
 The candidate host still does not own public ingress while it is `recovering`.
-It does not prove multiple deferred results for one Module, dynamic mailbox
+A valid Delivery state permits at most one active job, and therefore at most
+one deferred prepared result, for each Module; separate conformance mutations
+cover rejection of a second live Claim and a restarted snapshot with two active
+jobs for the same consumer. This Linux case does not prove dynamic mailbox
 limit changes, recovery of unknown external effects, or Windows/macOS process
-ownership. The Linux case uses the installed process boundary but no paid or
-network model call.
+ownership. It uses the installed process boundary but no paid or network model
+call.
 
 `openDollyRuntime` continues to reject every configured Module with
 `RUNTIME_MODULE_MIGRATION_REQUIRED`. This result closes one product-before-

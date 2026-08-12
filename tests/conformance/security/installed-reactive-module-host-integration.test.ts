@@ -530,7 +530,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           .toMatchObject({
             state: "running",
             packageDigest: installed.packageDigest,
-            declaredExternalEffects: "core-capabilities-only",
+            declaredExternalEffects: "unrestricted",
           });
         expect(existsSync(moduleCgroupPaths[index]!)).toBe(true);
       });
@@ -1008,7 +1008,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         processGenerationId: oldProducerProcessId,
         packageDigest: installed.packageDigest,
         configurationReference: configuration.modules[0]!.configurationReference,
-        declaredExternalEffects: "core-capabilities-only",
+        declaredExternalEffects: "unrestricted",
         serviceInvocationId: inspectedBinding.binding.serviceInvocationId,
         bootId: inspectedBinding.binding.bootId,
         moduleCgroupPath: oldProducerCgroupPath,
@@ -1662,7 +1662,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       expect(coreState.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
         state: "running",
         packageDigest: installed.packageDigest,
-        declaredExternalEffects: "core-capabilities-only",
+        declaredExternalEffects: "unrestricted",
       });
       expect(existsSync(moduleCgroupPath)).toBe(true);
 
@@ -2035,7 +2035,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       expect(coreState.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
         state: "running",
         packageDigest: installed.packageDigest,
-        declaredExternalEffects: "core-capabilities-only",
+        declaredExternalEffects: "unrestricted",
       });
       expect(existsSync(moduleCgroupPath)).toBe(true);
 

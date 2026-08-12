@@ -552,7 +552,7 @@ export class CoreStartupRecovery {
       ) {
         throw new CoreStartupRecoveryError(
           "STARTUP_MODULE_RECORD_INCONSISTENT",
-          "A Module cannot have more than one deferred result during absolute-serial recovery",
+          "A Module cannot have more than one active result awaiting output capacity during startup recovery",
         );
       }
       deferredModuleIds.add(record.source.id);
@@ -987,6 +987,13 @@ export class CoreStartupRecovery {
     }
     if (processRecord.declaredExternalEffects === "none") {
       return { kind: "release", reason: "no-external-effect" };
+    }
+    if (processRecord.declaredExternalEffects === "unrestricted") {
+      return {
+        kind: "outcome-unknown",
+        reason:
+          "the process boundary is unrestricted, so ambient effects are not excluded",
+      };
     }
     if (!this.#externalEffectEvidence) {
       return {

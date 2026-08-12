@@ -399,7 +399,7 @@ describe("installed reactive Module runtime composition", () => {
       processGenerationId,
       packageDigest: installed.packageDigest,
       configurationReference: reference,
-      declaredExternalEffects: "core-capabilities-only",
+      declaredExternalEffects: "unrestricted",
       serviceInvocationId: BINDING.serviceInvocationId,
       bootId: BINDING.bootId,
       moduleCgroupPath: deriveModuleCgroupPath(BINDING.delegatedRootCgroupPath, {

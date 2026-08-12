@@ -501,7 +501,7 @@ describe("installed Extension Module resolution", () => {
     });
     expect(processRecord.processGenerationId).toBe(PROCESS_IDENTITY.processGenerationId);
     expect(processRecord.moduleGenerationId).toBe(MODULE_GENERATION_ID);
-    expect(processRecord.declaredExternalEffects).toBe("core-capabilities-only");
+    expect(processRecord.declaredExternalEffects).toBe("unrestricted");
     expect(derived.executorOptions.lifecycle.execution).toEqual({
       program: process.execPath,
       argumentVector: [process.execPath, installed.entrypointPath],

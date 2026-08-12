@@ -80,7 +80,11 @@ interface HarnessOptions {
   readonly terminationTimeoutMs?: number;
   /** Unit-test executors simulate the process-isolation contract by default. */
   readonly simulateProcessIsolation?: boolean;
-  readonly declaredExternalEffects?: "none" | "core-capabilities-only";
+  readonly declaredExternalEffects?:
+    | "unrestricted"
+    | "none"
+    | "core-capabilities-only"
+    | null;
   /** `null` deliberately leaves the product evidence source unconfigured. */
   readonly externalEffectEvidence?: ExternalEffectEvidenceSource | null;
 }
@@ -267,9 +271,12 @@ function createHarness(options: HarnessOptions) {
     monotonicNow: () => 1,
     createExecutor,
     classifyFailure,
-    ...(options.declaredExternalEffects === undefined
+    ...(options.declaredExternalEffects === null
       ? {}
-      : { declaredExternalEffects: options.declaredExternalEffects }),
+      : {
+          declaredExternalEffects:
+            options.declaredExternalEffects ?? "core-capabilities-only",
+        }),
     ...(externalEffectEvidence === null ? {} : { externalEffectEvidence }),
   });
   return {
@@ -1577,6 +1584,33 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
       status: "recovery-required",
       reason: "external-effect-outcome-unknown",
     });
+    await expect(harness.runtime.stop()).rejects.toMatchObject({
+      code: "RUNTIME_RECOVERY_REQUIRED",
+    });
+  });
+
+  it("defaults to an unrestricted process boundary and ignores an empty capability-only journal", async () => {
+    const inspectRunEffects = vi.fn(
+      async (): Promise<ExternalEffectEvidence> => ({ kind: "no-effect" }),
+    );
+    const harness = await startedHarness({
+      declaredExternalEffects: null,
+      externalEffectEvidence: { inspectRunEffects },
+      createExecutor: () => ({
+        execute: async () => Promise.reject(new Error("ambient effect may have occurred")),
+      }),
+    });
+
+    const result = await harness.runtime.tick();
+    expect(result).toMatchObject({
+      status: "recovery-required",
+      reason: "external-effect-outcome-unknown",
+    });
+    expect(inspectRunEffects).not.toHaveBeenCalled();
+    expect(harness.negativelyAcknowledgeDeliveryClaim).not.toHaveBeenCalled();
+    if (result.status !== "recovery-required") throw new Error("expected recovery");
+    expect(harness.deliveries.inspectClaim(result).status).toBe("active");
+    expect(harness.submissionRecords.get(result.runId)).toBeDefined();
     await expect(harness.runtime.stop()).rejects.toMatchObject({
       code: "RUNTIME_RECOVERY_REQUIRED",
     });

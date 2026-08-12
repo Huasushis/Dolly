@@ -68,7 +68,7 @@ export interface InstalledLinuxExtensionModuleExecutorOptions {
  * failures instead of treating them as safe to retry.
  */
 export const INSTALLED_PROCESS_EFFECT_DECLARATION =
-  "core-capabilities-only" as const;
+  "unrestricted" as const;
 
 export interface InstalledLinuxExtensionModuleExecutorDerivation {
   readonly resolvedModule: InstalledExtensionModule;
