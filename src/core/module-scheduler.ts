@@ -1447,9 +1447,11 @@ export class ModuleScheduler {
     const start = this.#cursor % entries.length;
     this.#cursor = (this.#cursor + 1) % entries.length;
     for (let offset = 0; offset < entries.length; offset += 1) {
+      if (this.#state !== "running") break;
       this.#evaluate(entries[(start + offset) % entries.length]!, now);
     }
 
+    if (this.#state !== "running") return;
     this.#detectNoProgress(entries, now);
     this.#armEligibilityTimer(now);
   }
@@ -1891,6 +1893,11 @@ export class ModuleScheduler {
     snapshot: SchedulerSnapshot,
     now: number,
   ): void {
+    // Scheduler observers are synchronous and may stop the instance while an
+    // eligibility decision is being reported. Recheck admission at the last
+    // possible point so that a decision made while running cannot start work
+    // after shutdown has already closed dispatch.
+    if (this.#state !== "running") return;
     entry.counters.dispatched += 1;
     const missedPeriods = decision.missedPeriods ?? 0;
     entry.counters.missedPeriods += missedPeriods;
@@ -1901,17 +1908,18 @@ export class ModuleScheduler {
     entry.nextEligibleAt = null;
     this.#activeCount += 1;
 
-    let tick: Promise<ReactiveModuleTickResult>;
-    try {
-      tick = entry.runtime.tick({
+    // Install a Promise fence before invoking runtime-owned code. A runtime's
+    // synchronous tick prefix is allowed to call back into Host shutdown; in
+    // that case stop() must already have an in-flight operation to await.
+    const tick = Promise.resolve().then(() =>
+      entry.runtime.tick({
         claimLimitCount: decision.claimLimitCount,
         claimLimitBytes: decision.claimLimitBytes,
-      });
-    } catch (error) {
-      tick = Promise.reject(error);
-    }
-    // `entry.inFlight` is assigned before the first await resumes, so the next
-    // pass always observes a busy actor. It is cleared only inside settle.
+      }),
+    );
+    // `entry.inFlight` is assigned before runtime.tick runs, so both the next
+    // pass and a synchronous tick-prefix stop observe a busy actor. It is
+    // cleared only inside settle.
     entry.inFlight = tick.then(
       (result) => {
         this.#settle(entry, result, null);

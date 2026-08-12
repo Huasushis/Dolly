@@ -2229,6 +2229,75 @@ describe("CORE scheduler retry backoff", () => {
 });
 
 describe("CORE scheduler stop", () => {
+  it("does not dispatch after an eligible decision observer stops the Scheduler", async () => {
+    let stopping: Promise<void> | undefined;
+    const { clock, mailboxes, scheduler } = createScheduler({
+      onEvent: (event) => {
+        if (
+          event.type !== "scheduler.decision" ||
+          !event.eligible ||
+          stopping !== undefined
+        ) return;
+        stopping = scheduler.stop();
+      },
+    });
+    const runtime = new FakeModuleRuntime();
+    mailboxes.set("worker", 1, 100);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+    await stopping;
+
+    expect(runtime.tickCount).toBe(0);
+    expect(scheduler.state).toBe("stopped");
+    expect(clock.liveTimerCount).toBe(0);
+  });
+
+  it("does not finish a tick-prefix stop before the returned tick Promise settles", async () => {
+    let stopping: Promise<void> | undefined;
+    let stopped = false;
+    const gate = deferred<ReactiveModuleTickResult>();
+    const { clock, mailboxes, scheduler } = createScheduler();
+    const runtime: SchedulableModuleRuntime = {
+      moduleGenerationId: "generation-1",
+      tick: () => {
+        stopping = scheduler.stop().then(() => {
+          stopped = true;
+        });
+        return gate.promise;
+      },
+    };
+    mailboxes.set("worker", 1, 100);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(stopping).toBeDefined();
+    expect(stopped).toBe(false);
+    expect(scheduler.state).toBe("stopping");
+
+    gate.resolve(committedResult(1));
+    await stopping;
+
+    expect(stopped).toBe(true);
+    expect(scheduler.state).toBe("stopped");
+    expect(clock.liveTimerCount).toBe(0);
+  });
+
   it("does not finish a reentrant observer stop before its dispatched tick settles", async () => {
     let stopping: Promise<void> | undefined;
     let stopped = false;
