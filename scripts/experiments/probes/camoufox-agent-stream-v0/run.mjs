@@ -446,15 +446,17 @@ async function runCase({ caseIndex, caseDirectory, preregistration, requestUrl, 
     await record("fixture_started", { origin: "http://127.0.0.1:<ephemeral>" });
     const python = path.join(toolRoot, "venv/bin/python");
     const localEnvironment = {
-      ...process.env,
-      http_proxy: "",
-      https_proxy: "",
-      HTTP_PROXY: "",
-      HTTPS_PROXY: "",
-      ALL_PROXY: "",
-      all_proxy: "",
+      PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      HOME: path.join(toolRoot, "home"),
+      XDG_CACHE_HOME: path.join(toolRoot, "cache"),
+      TMPDIR: path.join(toolRoot, "tmp"),
+      npm_config_cache: path.join(toolRoot, "npm-cache"),
+      PIP_CACHE_DIR: path.join(toolRoot, "pip-cache"),
+      PYTHONPYCACHEPREFIX: "/home/ubuntu/codex-dolly/.tmp/camoufox-pycache",
       NO_PROXY: "127.0.0.1,localhost",
       no_proxy: "127.0.0.1,localhost",
+      LANG: "C.UTF-8",
+      LC_ALL: "C.UTF-8",
     };
     camoufoxServer = spawn(python, [
       path.join(repositoryRoot, "scripts/experiments/probes/camoufox-mcp-v0/camoufox_server.py"),

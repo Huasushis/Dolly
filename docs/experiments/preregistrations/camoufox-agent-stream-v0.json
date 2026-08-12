@@ -1,8 +1,8 @@
 {
   "experimentId": "camoufox-agent-stream-v0",
-  "version": 1,
+  "version": 2,
   "status": "frozen-before-live-model-and-browser-execution",
-  "frozenAtUtc": "2026-08-12T14:45:00Z",
+  "frozenAtUtc": "2026-08-12T14:34:00Z",
   "scope": "A bounded Linux effect demonstration using the owner's optional Aether model fixture, a real Model Context Protocol client, Microsoft Playwright MCP, and Camoufox. It is not product support and does not authorize removing Dolly's Module startup refusal.",
   "question": "Can qwen3.6-27b, using only a goal and host-selected browser tool descriptions, choose streamed tool calls that drive a fresh local Camoufox page to the exact target state and take screenshots in three independent sessions?",
   "hypotheses": {
@@ -13,6 +13,12 @@
     "run": "artifacts/experiments/probes/camoufox-mcp-v0/confirmation-v2-20260810a",
     "finding": "The same local page and exact browser stack already passed three scripted MCP repetitions and three direct Camoufox repetitions. This experiment tests only the missing model-selected action layer.",
     "notReusedAsAgentEvidence": "Scripted action traces and their pass booleans do not count as model-selected action evidence."
+  },
+  "supersededRun": {
+    "runId": "live-20260812a",
+    "result": "Runner defect before any model call: two initialization attempts inherited the shell HOME instead of the experiment dependency HOME, so Camoufox could not locate its installed browser. The run retained zero model calls and no live child process. Three exact empty directories created under the default Camoufox cache were identified by their run timestamp and removed individually with rmdir.",
+    "changeInVersion2": "Construct the browser/MCP child environment from a fixed allowlist and bind HOME, XDG_CACHE_HOME, TMPDIR, npm_config_cache, PIP_CACHE_DIR, and Python bytecode cache to the existing isolated dependency tree below /home/ubuntu/codex-dolly. Do not pass Aether configuration or ambient proxy variables to browser children.",
+    "unchanged": "Question, cases, model, prompts, tools, transport, limits, metrics, thresholds, stop rules, and decision rules."
   },
   "data": {
     "fixture": "scripts/experiments/probes/camoufox-mcp-v0/fixture/index.html",
@@ -72,6 +78,7 @@
   "execution": {
     "platform": "Ubuntu 24.04 Linux x86_64",
     "dependencyRoot": "/home/ubuntu/codex-dolly/.tools/camoufox-mcp-v0",
+    "childEnvironment": "A fixed allowlist matching the already confirmed browser stack. All home, cache, temporary, and bytecode paths are below /home/ubuntu/codex-dolly; Aether values and ambient proxy variables are absent from browser and MCP children.",
     "repetitions": 3,
     "caseIds": ["agent-r1", "agent-r2", "agent-r3"],
     "fixedOrder": [1, 2, 3],
