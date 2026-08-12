@@ -16,6 +16,7 @@ import {
   validateDollyInstanceConfig,
   type DollyInstanceConfig,
 } from "./runtime-config.js";
+import type { ReactiveModuleRecoveryResult } from "./reactive-module-runtime.js";
 import type { SourceActivationSchedulerBinding } from "./source-activation-queue.js";
 
 export type ReactiveModuleHostState =
@@ -236,7 +237,7 @@ export class ReactiveModuleHost {
   #startPromise: Promise<void> | undefined;
   #stopPromise: Promise<void> | undefined;
   readonly #startedRuntimes: ManagedReactiveModuleRuntime[] = [];
-  readonly #startupRecoveryRuntimes = new Set<ManagedReactiveModuleRuntime>();
+  readonly #startupRecoveryModuleIds = new Set<string>();
   #schedulerStarted = false;
 
   constructor(
@@ -277,12 +278,16 @@ export class ReactiveModuleHost {
 
   get state(): ReactiveModuleHostState {
     if (this.#state === "recovering") {
-      for (const runtime of this.#startupRecoveryRuntimes) {
-        if (runtime.startupRecoveryPending !== true) {
-          this.#startupRecoveryRuntimes.delete(runtime);
+      for (const moduleId of this.#startupRecoveryModuleIds) {
+        const registration = this.#modules.find((entry) => entry.moduleId === moduleId)!;
+        if (
+          registration.runtime.startupRecoveryPending !== true &&
+          this.#scheduler.status(moduleId).quarantineReason === null
+        ) {
+          this.#startupRecoveryModuleIds.delete(moduleId);
         }
       }
-      if (this.#startupRecoveryRuntimes.size === 0) {
+      if (this.#startupRecoveryModuleIds.size === 0) {
         this.#state = "running";
       }
     }
@@ -308,6 +313,23 @@ export class ReactiveModuleHost {
     return operation;
   }
 
+  /**
+   * Resolves one quarantined Module through the Scheduler-owned in-flight
+   * fence. Callers select only the configured Module identifier; they cannot
+   * substitute a runtime or bypass retry/backpressure settlement.
+   */
+  async recoverModule(moduleId: string): Promise<ReactiveModuleRecoveryResult> {
+    const state = this.state;
+    if (state !== "running" && state !== "recovering") {
+      throw new Error(`Reactive Module host cannot recover from ${state}`);
+    }
+    const result = await this.#scheduler.recoverModule(moduleId);
+    // Reading state removes any startup recovery whose durable commit reached
+    // a terminal result while the Scheduler held the recovery fence.
+    void this.state;
+    return result;
+  }
+
   async #startAll(): Promise<void> {
     try {
       for (const registration of this.#modules) {
@@ -318,7 +340,7 @@ export class ReactiveModuleHost {
       this.#schedulerStarted = true;
       for (const registration of this.#modules) {
         if (registration.runtime.startupRecoveryPending === true) {
-          this.#startupRecoveryRuntimes.add(registration.runtime);
+          this.#startupRecoveryModuleIds.add(registration.moduleId);
         }
       }
       // A prepared result that still awaits downstream capacity is a known
@@ -326,7 +348,7 @@ export class ReactiveModuleHost {
       // drive the exact commit and any downstream work needed to free space,
       // but callers must continue to treat external ingress as closed until
       // every such runtime reports that its commit-only recovery finished.
-      this.#state = this.#startupRecoveryRuntimes.size > 0
+      this.#state = this.#startupRecoveryModuleIds.size > 0
         ? "recovering"
         : "running";
     } catch (error) {

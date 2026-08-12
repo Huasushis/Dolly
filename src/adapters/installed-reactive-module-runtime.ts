@@ -451,7 +451,8 @@ export interface InstalledReactiveModuleHostOptions {
 }
 
 export interface InstalledReactiveModuleHost {
-  readonly installedRuntimes: readonly InstalledReactiveModuleRuntime[];
+  /** Read-only diagnostics; runtime and process-generation authorities stay inside the Host. */
+  readonly modules: readonly InstalledReactiveModuleStatus[];
   /**
    * The only source/manual request surface returned by installed composition.
    * It keeps the owning queue private and admits writes only after startup
@@ -459,6 +460,14 @@ export interface InstalledReactiveModuleHost {
    */
   readonly sourceActivations: readonly InstalledSourceActivation[];
   readonly host: ReactiveModuleHost;
+}
+
+export interface InstalledReactiveModuleStatus {
+  readonly moduleId: string;
+  readonly activation: DollyInstanceConfig["modules"][number]["activation"];
+  readonly moduleGenerationId: string;
+  readonly outputCommitWaiting: boolean;
+  readonly startupRecoveryPending: boolean;
 }
 
 /** A read/submit view over one private source queue, gated by Host readiness. */
@@ -701,8 +710,21 @@ export function composeInstalledReactiveModuleHost(
       ? {}
       : { onSchedulerEvent: options.onSchedulerEvent }),
   });
+  const modules = installedRuntimes.map((installed) => Object.freeze({
+    moduleId: installed.resolvedModule.module.moduleId,
+    activation: Object.freeze({ ...installed.resolvedModule.module.activation }),
+    get moduleGenerationId() {
+      return installed.runtime.moduleGenerationId;
+    },
+    get outputCommitWaiting() {
+      return installed.runtime.outputCommitWaiting;
+    },
+    get startupRecoveryPending() {
+      return installed.runtime.startupRecoveryPending;
+    },
+  } satisfies InstalledReactiveModuleStatus));
   return Object.freeze({
-    installedRuntimes: Object.freeze(installedRuntimes),
+    modules: Object.freeze(modules),
     sourceActivations: Object.freeze(
       orderedSourceActivationQueues.map((queue) => sourceActivationAdmission(queue, host)),
     ),

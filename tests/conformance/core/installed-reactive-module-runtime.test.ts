@@ -500,21 +500,16 @@ describe("installed reactive Module runtime composition", () => {
           `${moduleId}-${nextModuleGenerationId()}`,
       },
     });
-    expect(composed.installedRuntimes[0]?.runtime.outputCommitWaiting).toBe(true);
-    expect(composed.installedRuntimes[0]?.generations.processGenerationIdFor)
-      .toBeDefined();
-    expect(() => composed.installedRuntimes[0]!.generations
-      .processGenerationIdFor("worker-module-generation-a"))
-      .toThrow(/does not have a process generation/u);
+    expect(composed.modules[0]?.outputCommitWaiting).toBe(true);
     expect(pair.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
       state: "stopped",
     });
 
     await composed.host.start();
     expect(composed.host.state).toBe("recovering");
-    expect(() => composed.installedRuntimes[0]!.generations
-      .processGenerationIdFor("worker-module-generation-a"))
-      .toThrow(/does not have a process generation/u);
+    expect(pair.store.listModuleProcessRecords()).toEqual([
+      expect.objectContaining({ processGenerationId, state: "stopped" }),
+    ]);
 
     const sinkClaim = pair.store.deliveries.claim({
       consumerId: "sink",
@@ -559,13 +554,10 @@ describe("installed reactive Module runtime composition", () => {
     expect(pair.store.acknowledgeDeliveryClaim(sinkClaim)).toBe("committed");
     scheduled.find((timer) => timer.delayMs === 0)!.callback();
     await vi.waitFor(() => {
-      expect(composed.installedRuntimes[0]!.runtime.outputCommitWaiting).toBe(false);
-      expect(composed.installedRuntimes[0]!.runtime.startupRecoveryPending).toBe(false);
+      expect(composed.modules[0]!.outputCommitWaiting).toBe(false);
+      expect(composed.modules[0]!.startupRecoveryPending).toBe(false);
       expect(composed.host.state).toBe("running");
     });
-    expect(() => composed.installedRuntimes[0]!.generations
-      .processGenerationIdFor("worker-module-generation-a"))
-      .toThrow(/does not have a process generation/u);
     await expect(composed.host.stop()).resolves.toBeUndefined();
   });
 
@@ -1050,9 +1042,12 @@ describe("installed reactive Module runtime composition", () => {
     });
 
     expect(composed.host.state).toBe("created");
-    expect(composed.installedRuntimes).toHaveLength(1);
-    expect(composed.installedRuntimes[0]?.runtime.moduleGenerationId)
+    expect(composed.modules).toHaveLength(1);
+    expect(composed.modules[0]?.moduleGenerationId)
       .toBe("worker-module-generation-a");
+    expect(composed.modules[0]).not.toHaveProperty("runtime");
+    expect(composed.modules[0]).not.toHaveProperty("generations");
+    expect(composed.modules[0]).not.toHaveProperty("recover");
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
     expect(() => composeInstalledReactiveModuleHost({
       configuration: instanceConfiguration,
@@ -1261,12 +1256,9 @@ describe("installed reactive Module runtime composition", () => {
 
     expect(composed.host.state).toBe("created");
     expect(composed.sourceActivations).toHaveLength(1);
-    expect(composed.installedRuntimes[0]).toMatchObject({
-      resolvedModule: { module: { moduleId: "source-worker", activation: { kind: "source" } } },
-      sourceActivationBinding: {
-        schemaVersion: "dolly.source-activation-binding/1",
-        moduleId: "source-worker",
-      },
+    expect(composed.modules[0]).toMatchObject({
+      moduleId: "source-worker",
+      activation: { kind: "source" },
     });
     const activation = composed.sourceActivations[0]!;
     expect(activation.limits).toEqual({
@@ -1375,8 +1367,8 @@ describe("installed reactive Module runtime composition", () => {
     });
 
     expect(composed.host.state).toBe("created");
-    expect(composed.installedRuntimes).toHaveLength(1);
-    expect(composed.installedRuntimes[0]?.resolvedModule.module.activation).toEqual({
+    expect(composed.modules).toHaveLength(1);
+    expect(composed.modules[0]?.activation).toEqual({
       kind: "periodic",
       periodMs: 250,
       allowEmptyInput: false,
@@ -1462,11 +1454,11 @@ describe("installed reactive Module runtime composition", () => {
       },
       runtime,
     });
-    expect(composed.installedRuntimes.map((installed) =>
-      installed.resolvedModule.module.moduleId
+    expect(composed.modules.map((installed) =>
+      installed.moduleId
     )).toEqual(["worker", "worker-two"]);
-    expect(composed.installedRuntimes.map((installed) =>
-      installed.runtime.moduleGenerationId
+    expect(composed.modules.map((installed) =>
+      installed.moduleGenerationId
     )).toEqual([
       "worker-module-generation-a",
       "worker-two-module-generation-a",

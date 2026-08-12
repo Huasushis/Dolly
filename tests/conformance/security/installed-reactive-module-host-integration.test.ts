@@ -524,16 +524,17 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         )),
         2_000,
       )).toBe(true);
-      expect(composed.installedRuntimes).toHaveLength(3);
+      expect(composed.modules).toHaveLength(3);
       MODULE_IDS.forEach((moduleId, index) => {
-        expect(
-          composed?.installedRuntimes[index]?.generations.processGenerationIdFor(
-            `${moduleId}-generation-1`,
-          ),
-        ).toBe(processGenerationIds[index]);
+        expect(composed?.modules[index]).toMatchObject({
+          moduleId,
+          moduleGenerationId: `${moduleId}-generation-1`,
+        });
         expect(coreState.store.getModuleProcessRecord(processGenerationIds[index]!))
           .toMatchObject({
             state: "running",
+            moduleId,
+            moduleGenerationId: `${moduleId}-generation-1`,
             packageDigest: installed.packageDigest,
             declaredExternalEffects: "unrestricted",
           });
@@ -1163,9 +1164,10 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         throw error;
       }
       expect(composed.host.state).toBe("recovering");
-      expect(() => composed?.installedRuntimes[0]?.generations.processGenerationIdFor(
-        `${producerId}-generation-1`,
-      )).toThrow(/does not have a process generation/u);
+      expect(composed.modules[0]).toMatchObject({
+        moduleId: producerId,
+        startupRecoveryPending: true,
+      });
       expect(coreState.store.getModuleProcessRecord(drainerProcessId)).toMatchObject({
         state: "running",
         moduleId: drainerId,
@@ -1196,9 +1198,10 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         moduleId: producerId,
         tickStatus: "committed",
       }));
-      expect(() => composed!.installedRuntimes[0]!.generations.processGenerationIdFor(
-        `${producerId}-generation-1`,
-      )).toThrow(/does not have a process generation/u);
+      expect(composed!.modules[0]).toMatchObject({
+        moduleId: producerId,
+        startupRecoveryPending: false,
+      });
       expect(processIdentifierAllocated).toBe(true);
 
       await composed.host.stop();
@@ -2569,11 +2572,14 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       expect(composed.sourceActivations).toHaveLength(1);
       await composed.host.start();
       expect(composed.host.state).toBe("running");
-      expect(composed.installedRuntimes[0]?.generations.processGenerationIdFor(
-        `${SOURCE_MODULE_ID}-generation-1`,
-      )).toBe(processGenerationId);
+      expect(composed.modules[0]).toMatchObject({
+        moduleId: SOURCE_MODULE_ID,
+        moduleGenerationId: `${SOURCE_MODULE_ID}-generation-1`,
+      });
       expect(coreState.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
         state: "running",
+        moduleId: SOURCE_MODULE_ID,
+        moduleGenerationId: `${SOURCE_MODULE_ID}-generation-1`,
         packageDigest: installed.packageDigest,
         declaredExternalEffects: "unrestricted",
       });

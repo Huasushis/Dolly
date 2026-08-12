@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import type { JsonValue } from "../../../src/core/canonical-json.js";
 import type { ExtensionPackageManifest } from "../../../src/core/extension-installation-registry.js";
-import type { ReactiveModuleTickResult } from "../../../src/core/reactive-module-runtime.js";
+import type {
+  ReactiveModuleRecoveryResult,
+  ReactiveModuleTickResult,
+} from "../../../src/core/reactive-module-runtime.js";
 import {
   composeReactiveModuleHost,
   ReactiveModuleHost,
@@ -47,6 +50,12 @@ function scheduler(events: string[]) {
     stop: vi.fn(async () => {
       events.push("scheduler:stop");
     }),
+    recoverModule: vi.fn(async (): Promise<ReactiveModuleRecoveryResult> => ({
+      status: "nothing-to-recover",
+    })),
+    status: vi.fn((): { readonly quarantineReason: string | null } => ({
+      quarantineReason: null,
+    })),
   };
 }
 
@@ -220,6 +229,100 @@ describe("reactive Module host lifecycle", () => {
     outputCommitWaiting = true;
     expect(host.state).toBe("running");
     await expect(host.stop()).resolves.toBeUndefined();
+  });
+
+  it("routes operator recovery through the Scheduler-owned Module fence", async () => {
+    const events: string[] = [];
+    const fakeScheduler = scheduler(events);
+    fakeScheduler.recoverModule.mockResolvedValue({
+      status: "retry-scheduled",
+      moduleJobId: "job-1",
+      claimToken: "claim-1",
+      runId: "run-1",
+      attempt: 1,
+      moduleGenerationId: "worker-generation",
+      failure: { code: "MODULE_FAILED", retryable: true },
+    });
+    const managed = runtime("worker", events);
+    const host = new ReactiveModuleHost(
+      fakeScheduler as never,
+      [registration("worker", managed)],
+    );
+
+    await expect(host.recoverModule("worker")).rejects.toThrow(
+      "cannot recover from created",
+    );
+    await host.start();
+    await expect(host.recoverModule("worker")).resolves.toMatchObject({
+      status: "retry-scheduled",
+    });
+    expect(fakeScheduler.recoverModule).toHaveBeenCalledTimes(1);
+    expect(fakeScheduler.recoverModule).toHaveBeenCalledWith("worker");
+    await host.stop();
+  });
+
+  it("stops runtime work while an operator recovery is still fenced by the Scheduler", async () => {
+    const events: string[] = [];
+    let finishRecovery!: (result: ReactiveModuleRecoveryResult) => void;
+    const recovery = new Promise<ReactiveModuleRecoveryResult>((resolve) => {
+      finishRecovery = resolve;
+    });
+    const fakeScheduler = scheduler(events);
+    fakeScheduler.recoverModule.mockImplementation(() => recovery);
+    fakeScheduler.stop.mockImplementation(async () => {
+      events.push("scheduler:stop");
+      await recovery;
+    });
+    const managed = runtime("worker", events);
+    const host = new ReactiveModuleHost(
+      fakeScheduler as never,
+      [registration("worker", managed)],
+    );
+    await host.start();
+
+    const recovering = host.recoverModule("worker");
+    const stopping = host.stop();
+    await vi.waitFor(() => expect(events).toContain("stop:worker"));
+    expect(host.state).toBe("stopping");
+
+    finishRecovery({ status: "nothing-to-recover" });
+    await recovering;
+    await stopping;
+    expect(host.state).toBe("stopped");
+  });
+
+  it("does not report running when runtime recovery clears locally but Scheduler keeps quarantine", async () => {
+    const events: string[] = [];
+    let startupRecoveryPending = true;
+    const managed: ManagedReactiveModuleRuntime = {
+      moduleGenerationId: "worker-generation",
+      get startupRecoveryPending() {
+        return startupRecoveryPending;
+      },
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+      tick: vi.fn(async (): Promise<ReactiveModuleTickResult> => ({ status: "idle" })),
+    };
+    const fakeScheduler = scheduler(events);
+    fakeScheduler.status.mockReturnValue({
+      quarantineReason: "RECOVERY_REQUIRED:commit-outcome-unknown",
+    });
+    fakeScheduler.recoverModule.mockImplementation(async () => {
+      startupRecoveryPending = false;
+      throw new Error("invalid recovery result");
+    });
+    const host = new ReactiveModuleHost(
+      fakeScheduler as never,
+      [registration("worker", managed)],
+    );
+    await host.start();
+    expect(host.state).toBe("recovering");
+
+    await expect(host.recoverModule("worker")).rejects.toThrow(
+      "invalid recovery result",
+    );
+    expect(host.state).toBe("recovering");
+    await host.stop();
   });
 
   it("stops runtime work without waiting for the Scheduler tick drain first", async () => {

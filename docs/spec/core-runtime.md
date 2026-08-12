@@ -2228,6 +2228,21 @@ visible-failure action. This keeps pending-input and minimum-period semantics
 in Core while still allowing research policies to delay work and reduce batch
 size.
 
+Recovery is not a policy decision and is never a two-step “recover the runtime,
+then release Scheduler quarantine” operation. The Host identifies one
+configured Module, and the Scheduler invokes only that Module's registered
+runtime while holding its normal in-flight fence. The Scheduler consumes the
+recovery result through the same retry, output-backpressure, progress,
+counter, and quarantine transitions used for a tick. A retry result therefore
+retains its computed backoff; a still-unknown, cancelled, rejected, or
+`nothing-to-recover` result cannot silently clear the prior quarantine. The
+installed composition returns only read-only Module status and the Host
+recovery method, not raw runtime or process-generation authorities.
+The Host remains in `recovering` until both the runtime reports no startup
+result waiting for output admission and the Scheduler reports no quarantine
+for every startup-recovery Module; clearing only the runtime-local flag cannot
+open source ingress after a rejected or invalid recovery result.
+
 ### 13.2 Policy interface
 
 A scheduler policy SHOULD be a versioned, deterministic component with a
@@ -2778,11 +2793,11 @@ following cases.
 - after recovery observes that exact journal record but cannot yet confirm the
   matching Claim and submission terminal state, a later missing journal read
   preserves the recovery requirement and issues no negative acknowledgement;
-- when a runtime recovery completes outside the Scheduler while its Module is
-  quarantined, releasing that quarantine rereads whether the runtime still has
-  a result waiting for output admission; a stale cached value cannot drive the
-  Module without new input, and an unreadable runtime state keeps the Module
-  quarantined;
+- a quarantined runtime is recovered only through the Host and its
+  Scheduler-owned in-flight fence; concurrent dispatch, duplicate recovery,
+  and completed shutdown cannot overlap it, and the exact result retains
+  retry/backpressure timing and counters instead of being reduced to a generic
+  quarantine release;
 - a submitted Run whose provider/storage/tool accepts an effect and loses its
   response remains an unknown outcome, with zero negative acknowledgements,
   releases, retries, or replacement effects unless a durable query supplies

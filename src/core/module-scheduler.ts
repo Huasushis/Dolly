@@ -7,12 +7,17 @@ import {
 } from "./scheduler-policy.js";
 import type {
   ReactiveModuleClaimLimits,
+  ReactiveModuleRecoveryResult,
   ReactiveModuleTickResult,
 } from "./reactive-module-runtime.js";
 import {
   resolveSourceActivationSchedulerBinding,
   type SourceActivationSchedulerBinding,
 } from "./source-activation-queue.js";
+import {
+  assertModuleResultCommitRecord,
+  type ModuleResultCommitRecord,
+} from "./module-result-commit.js";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
@@ -35,6 +40,8 @@ export type ModuleSchedulerErrorCode =
   | "SCHEDULER_MODULE_DUPLICATE"
   | "SCHEDULER_MODULE_UNKNOWN"
   | "SCHEDULER_ACTIVATION_UNSUPPORTED"
+  | "SCHEDULER_RECOVERY_UNAVAILABLE"
+  | "SCHEDULER_RECOVERY_RESULT_INVALID"
   | "SCHEDULER_RUNTIME_STATE_UNAVAILABLE"
   | "SCHEDULER_STOPPED";
 
@@ -88,6 +95,8 @@ export interface SchedulableModuleRuntime {
   /** True when startup restored an accepted result that only needs output admission. */
   readonly outputCommitWaiting?: boolean;
   tick(limits?: ReactiveModuleClaimLimits): Promise<ReactiveModuleTickResult>;
+  /** Resolves one exact quarantined outcome without claiming or executing new input. */
+  recover?(): Promise<ReactiveModuleRecoveryResult>;
 }
 
 export interface SchedulerPendingSnapshot {
@@ -543,12 +552,163 @@ interface ModuleEntry {
   backpressured: boolean;
   blockingDownstreamIds: readonly string[];
   quarantineReason: string | null;
+  recoveryIdentity: SchedulerRecoveryIdentity | null;
   lastDecisionReasonCode: string | null;
   lastEmittedDecisionKey: string | null;
   lastPolicyName: string | null;
   lastPolicyVersion: string | null;
   lastTickStatus: string | null;
   readonly counters: MutableCounters;
+}
+
+interface SchedulerRecoveryIdentity {
+  readonly moduleJobId: string;
+  readonly claimToken: string;
+  readonly runId: string;
+  readonly attempt: number;
+  readonly moduleGenerationId: string;
+}
+
+const RECOVERY_IDENTITY_FIELDS = [
+  "moduleJobId",
+  "claimToken",
+  "runId",
+  "attempt",
+  "moduleGenerationId",
+] as const;
+
+function hasExactlyProperties(value: unknown, fields: readonly string[]): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Reflect.ownKeys(value);
+  return keys.length === fields.length && keys.every(
+    (key) => typeof key === "string" && fields.includes(key),
+  );
+}
+
+function recoveryIdentityOf(value: unknown): SchedulerRecoveryIdentity | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.moduleJobId !== "string" || !ID_PATTERN.test(candidate.moduleJobId) ||
+    typeof candidate.claimToken !== "string" || !ID_PATTERN.test(candidate.claimToken) ||
+    typeof candidate.runId !== "string" || !ID_PATTERN.test(candidate.runId) ||
+    !Number.isSafeInteger(candidate.attempt) ||
+    (candidate.attempt as number) < 1 ||
+    typeof candidate.moduleGenerationId !== "string" ||
+    !ID_PATTERN.test(candidate.moduleGenerationId)
+  ) return null;
+  return {
+    moduleJobId: candidate.moduleJobId,
+    claimToken: candidate.claimToken,
+    runId: candidate.runId,
+    attempt: candidate.attempt as number,
+    moduleGenerationId: candidate.moduleGenerationId,
+  };
+}
+
+function sameRecoveryIdentity(
+  left: SchedulerRecoveryIdentity,
+  right: SchedulerRecoveryIdentity,
+): boolean {
+  return RECOVERY_IDENTITY_FIELDS.every((field) => left[field] === right[field]);
+}
+
+const RECOVERY_REASONS = new Set([
+  "claim-persistence-unconfirmed",
+  "commit-outcome-unknown",
+  "commit-result-conflict",
+  "executor-termination-unconfirmed",
+  "external-effect-outcome-unknown",
+  "external-effect-retry-safety-unproven",
+  "failure-policy-unavailable",
+  "nack-outcome-unknown",
+  "submission-persistence-unconfirmed",
+]);
+
+function validateRecoveryResult(
+  value: unknown,
+  expectedIdentity: SchedulerRecoveryIdentity,
+  expectedModuleId: string,
+): ReactiveModuleRecoveryResult {
+  if (hasExactlyProperties(value, ["status"]) && value.status === "nothing-to-recover") {
+    return value as { readonly status: "nothing-to-recover" };
+  }
+  const identity = recoveryIdentityOf(value);
+  if (identity === null || !sameRecoveryIdentity(identity, expectedIdentity)) {
+    throw new ModuleSchedulerError(
+      "SCHEDULER_RECOVERY_RESULT_INVALID",
+      "Module recovery result does not match the quarantined Claim identity",
+    );
+  }
+  const candidate = value as Record<string, unknown>;
+  switch (candidate.status) {
+    case "committed":
+      if (
+        hasExactlyProperties(candidate, [...RECOVERY_IDENTITY_FIELDS, "status", "recovered", "record"]) &&
+        typeof candidate.recovered === "boolean" &&
+        candidate.record !== null && typeof candidate.record === "object" && !Array.isArray(candidate.record)
+      ) {
+        try {
+          assertModuleResultCommitRecord(candidate.record as ModuleResultCommitRecord);
+        } catch {
+          break;
+        }
+        const record = candidate.record as ModuleResultCommitRecord;
+        if (
+          record.state === "committed" &&
+          sameRecoveryIdentity(record, expectedIdentity) &&
+          record.source.kind === "module" &&
+          record.source.id === expectedModuleId
+        ) return candidate as unknown as ReactiveModuleRecoveryResult;
+      }
+      break;
+    case "retry-scheduled":
+    case "dead-lettered": {
+      const failure = candidate.failure;
+      if (
+        hasExactlyProperties(candidate, [...RECOVERY_IDENTITY_FIELDS, "status", "failure"]) &&
+        hasExactlyProperties(failure, ["code", "retryable"]) &&
+        typeof failure.code === "string" && ID_PATTERN.test(failure.code) &&
+        typeof failure.retryable === "boolean" &&
+        (candidate.status !== "retry-scheduled" || failure.retryable)
+      ) return candidate as unknown as ReactiveModuleRecoveryResult;
+      break;
+    }
+    case "cancelled":
+      if (
+        hasExactlyProperties(candidate, [...RECOVERY_IDENTITY_FIELDS, "status", "reason"]) &&
+        candidate.reason === "shutdown"
+      ) return candidate as unknown as ReactiveModuleRecoveryResult;
+      break;
+    case "output-backpressured":
+      if (
+        hasExactlyProperties(candidate, [
+          ...RECOVERY_IDENTITY_FIELDS,
+          "status",
+          "stage",
+          "blockedConsumerIds",
+        ]) &&
+        candidate.stage === "output-commit" &&
+        Array.isArray(candidate.blockedConsumerIds) &&
+        candidate.blockedConsumerIds.length > 0 &&
+        candidate.blockedConsumerIds.every((id) =>
+          typeof id === "string" && ID_PATTERN.test(id)
+        ) &&
+        new Set(candidate.blockedConsumerIds).size === candidate.blockedConsumerIds.length
+      ) return candidate as unknown as ReactiveModuleRecoveryResult;
+      break;
+    case "recovery-required":
+      if (
+        hasExactlyProperties(candidate, [...RECOVERY_IDENTITY_FIELDS, "status", "reason"]) &&
+        typeof candidate.reason === "string" &&
+        RECOVERY_REASONS.has(candidate.reason)
+      ) return candidate as unknown as ReactiveModuleRecoveryResult;
+      break;
+  }
+  throw new ModuleSchedulerError(
+    "SCHEDULER_RECOVERY_RESULT_INVALID",
+    "Module recovery returned an invalid closed result",
+  );
 }
 
 function assertPositiveInteger(value: number, label: string): void {
@@ -921,6 +1081,7 @@ export class ModuleScheduler {
       backpressured: false,
       blockingDownstreamIds: [],
       quarantineReason: null,
+      recoveryIdentity: null,
       lastDecisionReasonCode: null,
       lastEmittedDecisionKey: null,
       lastPolicyName: null,
@@ -935,29 +1096,110 @@ export class ModuleScheduler {
   }
 
   /**
-   * Clears a quarantine after an operator resolved the unknown outcome that
-   * caused it. It never touches Claim state; resolving that is the Module
-   * runtime's recovery path, not the scheduler's.
+   * Runs recovery through the exact runtime registered for one quarantined
+   * Module. The recovery occupies the same in-flight fence as a tick, so no
+   * Scheduler dispatch, concurrent recovery, or completed shutdown can race
+   * it. Its result is consumed by the same retry, backpressure, progress, and
+   * quarantine transitions as a normal runtime result.
    */
-  release(moduleId: string): void {
+  recoverModule(moduleId: string): Promise<ReactiveModuleRecoveryResult> {
     const entry = this.#requireEntry(moduleId);
-    let outputCommitWaiting: boolean;
-    try {
-      outputCommitWaiting = entry.runtime.outputCommitWaiting === true;
-    } catch {
-      throw new ModuleSchedulerError(
-        "SCHEDULER_RUNTIME_STATE_UNAVAILABLE",
-        `Module ${moduleId} output-commit recovery state is unavailable`,
-      );
+    if (this.#state !== "running") {
+      return Promise.reject(new ModuleSchedulerError(
+        "SCHEDULER_RECOVERY_UNAVAILABLE",
+        `Module ${moduleId} cannot be recovered while Scheduler is ${this.#state}`,
+      ));
     }
-    // Recovery may be performed through the runtime while Scheduler dispatch
-    // is quarantined. Re-read that live state before admission reopens: the
-    // cached value belongs to the tick that caused quarantine and may no
-    // longer describe a result awaiting output admission.
-    entry.outputCommitWaiting = outputCommitWaiting;
-    entry.quarantineReason = null;
-    entry.nextEligibleAt = null;
-    this.#requestPass();
+    if (entry.quarantineReason === null) {
+      return Promise.reject(new ModuleSchedulerError(
+        "SCHEDULER_RECOVERY_UNAVAILABLE",
+        `Module ${moduleId} is not quarantined for recovery`,
+      ));
+    }
+    if (entry.inFlight !== null) {
+      return Promise.reject(new ModuleSchedulerError(
+        "SCHEDULER_RECOVERY_UNAVAILABLE",
+        `Module ${moduleId} already has an in-flight operation`,
+      ));
+    }
+    if (this.#activeCount >= this.#maxConcurrentModules) {
+      return Promise.reject(new ModuleSchedulerError(
+        "SCHEDULER_RECOVERY_UNAVAILABLE",
+        `Module ${moduleId} recovery is blocked by the instance concurrency limit`,
+      ));
+    }
+    const recoveryIdentity = entry.recoveryIdentity;
+    if (recoveryIdentity === null) {
+      return Promise.reject(new ModuleSchedulerError(
+        "SCHEDULER_RECOVERY_UNAVAILABLE",
+        `Module ${moduleId} quarantine is not bound to an exact recoverable Claim`,
+      ));
+    }
+    const recover = entry.runtime.recover;
+    if (typeof recover !== "function") {
+      return Promise.reject(new ModuleSchedulerError(
+        "SCHEDULER_RECOVERY_UNAVAILABLE",
+        `Module ${moduleId} runtime does not expose recovery`,
+      ));
+    }
+
+    const recoveryStartedAt = this.#clock.monotonicNow();
+    this.#activeCount += 1;
+    // Install the fence before invoking caller-owned runtime code. Deferring
+    // the invocation to a microtask makes a synchronous reentrant recovery see
+    // this in-flight operation instead of opening a second one.
+    const pending = Promise.resolve().then(() => {
+      const candidate: unknown = recover.call(entry.runtime);
+      if (!(candidate instanceof Promise)) {
+        throw new ModuleSchedulerError(
+          "SCHEDULER_RUNTIME_STATE_UNAVAILABLE",
+          `Module ${moduleId} recovery did not return a Promise`,
+        );
+      }
+      return candidate;
+    }).then((result) => validateRecoveryResult(
+      result,
+      recoveryIdentity,
+      entry.moduleId,
+    ));
+    const settlement = pending.then(
+      (result) => {
+        let outputCommitWaiting: boolean;
+        try {
+          outputCommitWaiting = entry.runtime.outputCommitWaiting === true;
+        } catch {
+          const error = new ModuleSchedulerError(
+            "SCHEDULER_RUNTIME_STATE_UNAVAILABLE",
+            `Module ${moduleId} output-commit recovery state is unavailable`,
+          );
+          this.#settleRecoveryRejection(entry, error, recoveryStartedAt);
+          throw error;
+        }
+        this.#settleRecoveryResult(
+          entry,
+          result,
+          outputCommitWaiting,
+          recoveryStartedAt,
+        );
+        return result;
+      },
+      (error: unknown) => {
+        this.#settleRecoveryRejection(entry, error, recoveryStartedAt);
+        throw error;
+      },
+    );
+    const operation = settlement.then(
+      (result) => {
+        this.#completeRecoveryFence(entry);
+        return result;
+      },
+      (error: unknown) => {
+        this.#completeRecoveryFence(entry);
+        throw error;
+      },
+    );
+    entry.inFlight = operation.then(() => undefined, () => undefined);
+    return operation;
   }
 
   start(): void {
@@ -1722,6 +1964,63 @@ export class ModuleScheduler {
     }
   }
 
+  #settleRecoveryResult(
+    entry: ModuleEntry,
+    result: ReactiveModuleRecoveryResult,
+    outputCommitWaiting: boolean,
+    recoveryStartedAt: number,
+  ): void {
+    const now = this.#clock.monotonicNow();
+    entry.lastRunServiceTimeMs = Math.max(0, now - recoveryStartedAt);
+    entry.lastTickStatus = result.status;
+    entry.outputCommitWaiting = outputCommitWaiting;
+
+    if (result.status !== "nothing-to-recover") {
+      if (result.status !== "cancelled") {
+        // A concrete recovery outcome replaces the old unknown-outcome
+        // quarantine. `#settleResult` may immediately install a more precise
+        // quarantine for a still-unknown or self-backpressured result.
+        entry.quarantineReason = null;
+        entry.recoveryIdentity = null;
+      }
+      this.#settleResult(entry, result, now);
+    }
+
+    this.#emitModule(entry, {
+      type: "scheduler.settled",
+      tickStatus: result.status,
+      serviceTimeMs: entry.lastRunServiceTimeMs,
+    });
+    this.#armEligibilityTimer(now);
+    if (result.status === "committed" || result.status === "dead-lettered") {
+      this.#requestPass();
+    }
+  }
+
+  #settleRecoveryRejection(
+    entry: ModuleEntry,
+    error: unknown,
+    recoveryStartedAt: number,
+  ): void {
+    const now = this.#clock.monotonicNow();
+    entry.lastRunServiceTimeMs = Math.max(0, now - recoveryStartedAt);
+    entry.lastTickStatus = errorCode(error) ?? "RECOVERY_REJECTED";
+    entry.lastFailureAt = now;
+    // The pre-existing quarantine remains authoritative because a rejected
+    // recovery produced no durable disposition the Scheduler can consume.
+    this.#emitModule(entry, {
+      type: "scheduler.settled",
+      tickStatus: entry.lastTickStatus,
+      serviceTimeMs: entry.lastRunServiceTimeMs,
+    });
+    this.#armEligibilityTimer(now);
+  }
+
+  #completeRecoveryFence(entry: ModuleEntry): void {
+    entry.inFlight = null;
+    this.#activeCount = Math.max(0, this.#activeCount - 1);
+  }
+
   #settleResult(entry: ModuleEntry, result: ReactiveModuleTickResult, now: number): void {
     switch (result.status) {
       case "idle":
@@ -1752,7 +2051,7 @@ export class ModuleScheduler {
           entry.retryCount = 0;
           entry.retryDelayMs = 0;
           entry.retryJitterMs = 0;
-          this.#quarantine(entry, "OUTPUT_COMMIT_SELF_BACKPRESSURE");
+          this.#quarantine(entry, "OUTPUT_COMMIT_SELF_BACKPRESSURE", result);
           return;
         }
         entry.retryCount += 1;
@@ -1785,7 +2084,7 @@ export class ModuleScheduler {
         // quarantined until an operator resolves it.
         entry.counters.recoveryRequired += 1;
         entry.lastFailureAt = now;
-        this.#quarantine(entry, `RECOVERY_REQUIRED:${result.reason}`);
+        this.#quarantine(entry, `RECOVERY_REQUIRED:${result.reason}`, result);
         return;
     }
   }
@@ -1887,7 +2186,14 @@ export class ModuleScheduler {
     entry.arrivalsDuringLastRunBytes = Math.max(0, after.pendingBytes - retainedBytes);
   }
 
-  #quarantine(entry: ModuleEntry, reason: string): void {
+  #quarantine(
+    entry: ModuleEntry,
+    reason: string,
+    identity?: SchedulerRecoveryIdentity,
+  ): void {
+    entry.recoveryIdentity = identity === undefined
+      ? null
+      : recoveryIdentityOf(identity);
     if (entry.quarantineReason === reason) return;
     entry.quarantineReason = reason;
     entry.nextEligibleAt = null;

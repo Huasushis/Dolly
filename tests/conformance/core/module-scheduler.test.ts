@@ -13,6 +13,7 @@ import type { ModuleSubmissionRecord } from "../../../src/core/module-process-re
 import {
   InMemoryModuleResultCommitRepository,
   ModuleResultCommitCoordinator,
+  moduleJobResultDigest,
   type ModuleResultCommitRecord,
 } from "../../../src/core/module-result-commit.js";
 import {
@@ -35,6 +36,7 @@ import {
   ReactiveModuleRuntime,
   type ReactiveModuleClaimLimits,
   type ReactiveModuleInput,
+  type ReactiveModuleRecoveryResult,
   type ReactiveModuleResult,
   type ReactiveModuleRuntimeOptions,
   type ReactiveModuleTickResult,
@@ -190,7 +192,30 @@ function committedResult(index: number): ReactiveModuleTickResult {
   return { ...identity, status: "committed", recovered: false, record };
 }
 
-function retryResult(index: number): ReactiveModuleTickResult {
+function committedRecoveryResult(index: number, moduleId = "worker"):
+  ReactiveModuleRecoveryResult & { readonly status: "committed" } {
+  const identity = claimIdentity(index);
+  const immutable = {
+    source: { kind: "module" as const, id: moduleId },
+    outputPageIds: [] as readonly string[],
+  };
+  const record: ModuleResultCommitRecord = {
+    schemaVersion: "dolly.module-result-commit/1",
+    ...identity,
+    ...immutable,
+    resultDigest: moduleJobResultDigest(immutable),
+    state: "committed",
+    revision: 2,
+    outputDeliveries: [],
+    createdAt: NOW,
+    updatedAt: NOW,
+  };
+  return { ...identity, status: "committed", recovered: true, record };
+}
+
+function retryResult(
+  index: number,
+): ReactiveModuleRecoveryResult & { readonly status: "retry-scheduled" } {
   return {
     ...claimIdentity(index),
     status: "retry-scheduled",
@@ -198,7 +223,9 @@ function retryResult(index: number): ReactiveModuleTickResult {
   };
 }
 
-function outputBackpressuredResult(index: number): ReactiveModuleTickResult {
+function outputBackpressuredResult(
+  index: number,
+): ReactiveModuleRecoveryResult & { readonly status: "output-backpressured" } {
   return {
     ...claimIdentity(index),
     status: "output-backpressured",
@@ -1760,74 +1787,355 @@ describe("CORE scheduler retry backoff", () => {
     );
     expect(eventTypes(events, "worker")).toContain("scheduler.quarantined");
 
-    scheduler.release("worker");
+    await scheduler.stop();
+  });
+
+  it("settles an operator recovery through the registered runtime and preserves retry backoff", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler({
+      retryBaseMs: 250,
+      retryMaxMs: 1_000,
+      retryJitterRatio: 0,
+    });
+    const runtime = new FakeModuleRuntime(() => ({
+      ...claimIdentity(1),
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    })) as FakeModuleRuntime & {
+      recover(): Promise<ReactiveModuleRecoveryResult>;
+    };
+    runtime.recover = vi.fn(async () => retryResult(1));
+    mailboxes.set("worker", 1, 100);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+    scheduler.start();
     await drain(clock);
+
+    expect(runtime.tickCount).toBe(1);
+    expect(scheduler.status("worker").schedulingState).toBe("quarantined");
+    await advance(clock, 100);
+
+    const result = await scheduler.recoverModule("worker");
+    expect(result.status).toBe("retry-scheduled");
+    expect(runtime.recover).toHaveBeenCalledTimes(1);
+    expect(scheduler.status("worker")).toMatchObject({
+      schedulingState: "retry-backoff",
+      quarantineReason: null,
+      retryCount: 1,
+      retryDelayMs: 250,
+      nextEligibleAt: 350,
+      lastTickStatus: "retry-scheduled",
+      lastRunStartedAt: 0,
+    });
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "scheduler.settled",
+      moduleId: "worker",
+      tickStatus: "retry-scheduled",
+    }));
+
+    await advance(clock, 249);
+    expect(runtime.tickCount).toBe(1);
+    await advance(clock, 1);
     expect(runtime.tickCount).toBe(2);
     await scheduler.stop();
   });
 
-  it("does not re-drive a recovered output commit after quarantine release without new input", async () => {
+  it("fences operator recovery against dispatch, duplicate recovery, and shutdown completion", async () => {
     const { clock, mailboxes, scheduler } = createScheduler();
-    let outputCommitWaiting = true;
+    const recovery = deferred<ReactiveModuleRecoveryResult>();
     const runtime = new FakeModuleRuntime(() => ({
       ...claimIdentity(1),
       status: "recovery-required",
       reason: "commit-outcome-unknown",
-    }));
-    Object.defineProperty(runtime, "outputCommitWaiting", {
-      configurable: false,
-      enumerable: true,
-      get: () => outputCommitWaiting,
-    });
-    mailboxes.set("worker", 0, 0);
+    })) as FakeModuleRuntime & {
+      recover(): Promise<ReactiveModuleRecoveryResult>;
+    };
+    runtime.recover = vi.fn(() => recovery.promise);
+    mailboxes.set("worker", 1, 100);
     scheduler.register({
       moduleId: "worker",
       runtime,
       inputPageIds: ["input"],
-      outputPageIds: ["output"],
+      outputPageIds: [],
       mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
     scheduler.start();
     await drain(clock);
 
-    expect(runtime.tickCount).toBe(1);
-    expect(scheduler.status("worker")).toMatchObject({
-      schedulingState: "quarantined",
-      quarantineReason: "RECOVERY_REQUIRED:commit-outcome-unknown",
+    const pending = scheduler.recoverModule("worker");
+    await expect(scheduler.recoverModule("worker")).rejects.toMatchObject({
+      code: "SCHEDULER_RECOVERY_UNAVAILABLE",
     });
-
-    // An operator completed the exact runtime recovery outside the Scheduler.
-    // With no pending input, releasing quarantine must not reuse the stale
-    // output-commit-waiting snapshot and start another Extension generation.
-    outputCommitWaiting = false;
-    scheduler.release("worker");
-    await drain(clock);
-
+    await advance(clock, 5_000);
     expect(runtime.tickCount).toBe(1);
-    expect(scheduler.status("worker")).toMatchObject({
-      schedulingState: "idle",
-      quarantineReason: null,
-    });
-    await scheduler.stop();
+
+    let stopped = false;
+    const stopping = scheduler.stop().then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+
+    recovery.resolve(retryResult(1));
+    await expect(pending).resolves.toMatchObject({ status: "retry-scheduled" });
+    await stopping;
+    expect(stopped).toBe(true);
   });
 
-  it("keeps quarantine when the runtime recovery state cannot be read during release", async () => {
+  it("installs the recovery fence before invoking runtime code", async () => {
     const { clock, mailboxes, scheduler } = createScheduler();
-    let stateReadable = true;
+    const recovery = deferred<ReactiveModuleRecoveryResult>();
+    let nested: Promise<ReactiveModuleRecoveryResult> | undefined;
     const runtime = new FakeModuleRuntime(() => ({
       ...claimIdentity(1),
       status: "recovery-required",
       reason: "commit-outcome-unknown",
-    }));
-    Object.defineProperty(runtime, "outputCommitWaiting", {
-      configurable: false,
-      enumerable: true,
-      get: () => {
-        if (!stateReadable) throw new Error("runtime recovery store unavailable");
-        return true;
+    })) as FakeModuleRuntime & {
+      recover(): Promise<ReactiveModuleRecoveryResult>;
+    };
+    runtime.recover = vi.fn(() => {
+      nested = scheduler.recoverModule("worker");
+      void nested.catch(() => undefined);
+      return recovery.promise;
+    });
+    mailboxes.set("worker", 1, 100);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+    scheduler.start();
+    await drain(clock);
+
+    const pending = scheduler.recoverModule("worker");
+    await vi.waitFor(() => expect(nested).toBeDefined());
+    await expect(nested).rejects.toMatchObject({
+      code: "SCHEDULER_RECOVERY_UNAVAILABLE",
+    });
+    expect(runtime.recover).toHaveBeenCalledTimes(1);
+    recovery.resolve(retryResult(1));
+    await pending;
+    await scheduler.stop();
+  });
+
+  it.each([
+    {
+      name: "an unknown status",
+      result: { ...claimIdentity(1), status: "bogus" },
+    },
+    {
+      name: "another Claim identity",
+      result: retryResult(2),
+    },
+    {
+      name: "an extra top-level field",
+      result: { ...retryResult(1), extensionControlled: true },
+    },
+    {
+      name: "an invalid committed record",
+      result: {
+        ...claimIdentity(1),
+        status: "committed",
+        recovered: true,
+        record: {},
       },
+    },
+    {
+      name: "an empty backpressure identity set",
+      result: {
+        ...claimIdentity(1),
+        status: "output-backpressured",
+        stage: "output-commit",
+        blockedConsumerIds: [],
+      },
+    },
+    {
+      name: "an invalid failure code",
+      result: {
+        ...retryResult(1),
+        failure: { code: "not valid", retryable: true },
+      },
+    },
+    {
+      name: "a non-retryable retry disposition",
+      result: {
+        ...retryResult(1),
+        failure: { code: "MODULE_FAILED", retryable: false },
+      },
+    },
+  ])("rejects $name without clearing recovery quarantine", async ({ result }) => {
+    const { clock, mailboxes, scheduler } = createScheduler();
+    const runtime = new FakeModuleRuntime(() => ({
+      ...claimIdentity(1),
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    })) as FakeModuleRuntime & {
+      recover(): Promise<ReactiveModuleRecoveryResult>;
+    };
+    runtime.recover = vi.fn(async () => result as never);
+    mailboxes.set("worker", 1, 100);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
     });
-    mailboxes.set("worker", 0, 0);
+    scheduler.start();
+    await drain(clock);
+
+    await expect(scheduler.recoverModule("worker")).rejects.toMatchObject({
+      code: "SCHEDULER_RECOVERY_RESULT_INVALID",
+    });
+    expect(scheduler.status("worker")).toMatchObject({
+      schedulingState: "quarantined",
+      quarantineReason: "RECOVERY_REQUIRED:commit-outcome-unknown",
+    });
+    await advance(clock, 5_000);
+    expect(runtime.tickCount).toBe(1);
+    await scheduler.stop();
+  });
+
+  it("does not exceed instance concurrency for operator recovery", async () => {
+    const { clock, mailboxes, scheduler } = createScheduler({ maxConcurrentModules: 1 });
+    const quarantined = new FakeModuleRuntime(() => ({
+      ...claimIdentity(1),
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    })) as FakeModuleRuntime & {
+      recover(): Promise<ReactiveModuleRecoveryResult>;
+    };
+    quarantined.recover = vi.fn(async () => retryResult(1));
+    const busy = new FakeModuleRuntime();
+    mailboxes.set("b-quarantined", 1, 100);
+    mailboxes.set("a-busy", 0, 0);
+    scheduler.register({
+      moduleId: "b-quarantined",
+      runtime: quarantined,
+      inputPageIds: ["b-input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+    scheduler.register({
+      moduleId: "a-busy",
+      runtime: busy,
+      inputPageIds: ["a-input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+    scheduler.start();
+    await drain(clock);
+    expect(scheduler.status("b-quarantined").schedulingState).toBe("quarantined");
+
+    mailboxes.set("a-busy", 1, 100);
+    scheduler.wake();
+    await drain(clock);
+    expect(busy.concurrent).toBe(1);
+    await expect(scheduler.recoverModule("b-quarantined")).rejects.toMatchObject({
+      code: "SCHEDULER_RECOVERY_UNAVAILABLE",
+    });
+    expect(quarantined.recover).not.toHaveBeenCalled();
+
+    busy.settle({ status: "idle" });
+    await drain(clock);
+    await scheduler.stop();
+  });
+
+  it.each([
+    {
+      name: "committed",
+      result: committedRecoveryResult(1),
+      expected: {
+        schedulingState: "idle",
+        quarantineReason: null,
+        lastTickStatus: "committed",
+        counters: { committed: 1, recoveryRequired: 1 },
+      },
+    },
+    {
+      name: "downstream output backpressure",
+      result: outputBackpressuredResult(1),
+      expected: {
+        schedulingState: "backpressured",
+        quarantineReason: null,
+        lastTickStatus: "output-backpressured",
+        retryCount: 1,
+        counters: { outputBackpressured: 1, recoveryRequired: 1 },
+      },
+    },
+    {
+      name: "self output backpressure",
+      result: {
+        ...claimIdentity(1),
+        status: "output-backpressured" as const,
+        stage: "output-commit" as const,
+        blockedConsumerIds: ["worker"],
+      },
+      expected: {
+        schedulingState: "quarantined",
+        quarantineReason: "OUTPUT_COMMIT_SELF_BACKPRESSURE",
+        lastTickStatus: "output-backpressured",
+        counters: { outputBackpressured: 1, recoveryRequired: 1 },
+      },
+    },
+    {
+      name: "dead-lettered",
+      result: {
+        ...claimIdentity(1),
+        status: "dead-lettered" as const,
+        failure: { code: "MODULE_FAILED", retryable: false },
+      },
+      expected: {
+        schedulingState: "idle",
+        quarantineReason: null,
+        lastTickStatus: "dead-lettered",
+        deadLetterCount: 1,
+        counters: { deadLettered: 1, recoveryRequired: 1 },
+      },
+    },
+    {
+      name: "cancelled",
+      result: {
+        ...claimIdentity(1),
+        status: "cancelled" as const,
+        reason: "shutdown" as const,
+      },
+      expected: {
+        schedulingState: "quarantined",
+        quarantineReason: "RECOVERY_REQUIRED:commit-outcome-unknown",
+        lastTickStatus: "cancelled",
+        counters: { cancelled: 1, recoveryRequired: 1 },
+      },
+    },
+    {
+      name: "a still-unknown outcome",
+      result: {
+        ...claimIdentity(1),
+        status: "recovery-required" as const,
+        reason: "external-effect-outcome-unknown" as const,
+      },
+      expected: {
+        schedulingState: "quarantined",
+        quarantineReason: "RECOVERY_REQUIRED:external-effect-outcome-unknown",
+        lastTickStatus: "recovery-required",
+        counters: { recoveryRequired: 2 },
+      },
+    },
+  ])("applies the $name recovery settlement", async ({ result, expected }) => {
+    const { clock, mailboxes, scheduler } = createScheduler();
+    const runtime = new FakeModuleRuntime(() => ({
+      ...claimIdentity(1),
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    })) as FakeModuleRuntime & {
+      recover(): Promise<ReactiveModuleRecoveryResult>;
+    };
+    runtime.recover = vi.fn(async () => result);
+    mailboxes.set("worker", 1, 100);
     scheduler.register({
       moduleId: "worker",
       runtime,
@@ -1837,21 +2145,62 @@ describe("CORE scheduler retry backoff", () => {
     });
     scheduler.start();
     await drain(clock);
+    mailboxes.set("worker", 0, 0);
 
-    expect(runtime.tickCount).toBe(1);
-    stateReadable = false;
-    expect(() => scheduler.release("worker")).toThrowError(expect.objectContaining({
-      code: "SCHEDULER_RUNTIME_STATE_UNAVAILABLE",
-    }));
+    await scheduler.recoverModule("worker");
+    await drain(clock);
+    expect(scheduler.status("worker")).toMatchObject(expected);
+    await scheduler.stop();
+  });
+
+  it.each([
+    {
+      name: "nothing-to-recover",
+      recover: async (): Promise<ReactiveModuleRecoveryResult> => ({
+        status: "nothing-to-recover",
+      }),
+    },
+    {
+      name: "a rejected recovery",
+      recover: async (): Promise<ReactiveModuleRecoveryResult> => {
+        throw new Error("recovery store unavailable");
+      },
+    },
+  ])("keeps the original quarantine after $name", async ({ recover }) => {
+    const { clock, mailboxes, scheduler } = createScheduler();
+    const runtime = new FakeModuleRuntime(() => ({
+      ...claimIdentity(1),
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    })) as FakeModuleRuntime & {
+      recover(): Promise<ReactiveModuleRecoveryResult>;
+    };
+    runtime.recover = vi.fn(recover);
+    mailboxes.set("worker", 1, 100);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+    scheduler.start();
     await drain(clock);
 
-    expect(runtime.tickCount).toBe(1);
+    try {
+      await scheduler.recoverModule("worker");
+    } catch {
+      // The rejected case is expected; both cases must preserve quarantine.
+    }
     expect(scheduler.status("worker")).toMatchObject({
       schedulingState: "quarantined",
       quarantineReason: "RECOVERY_REQUIRED:commit-outcome-unknown",
     });
+    await advance(clock, 5_000);
+    expect(runtime.tickCount).toBe(1);
     await scheduler.stop();
   });
+
 
   it("records a concurrent tick from another caller as an invariant violation", async () => {
     const { clock, mailboxes, scheduler, events } = createScheduler();
