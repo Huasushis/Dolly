@@ -1643,14 +1643,6 @@ export class ModuleScheduler {
     entry.dispatchClaimLimitBytes = decision.claimLimitBytes;
     entry.nextEligibleAt = null;
     this.#activeCount += 1;
-    this.#emitModule(entry, {
-      type: "scheduler.dispatched",
-      reasonCode: decision.reasonCode,
-      claimLimitCount: decision.claimLimitCount,
-      claimLimitBytes: decision.claimLimitBytes,
-      missedPeriods,
-      snapshot: this.#summarize(snapshot),
-    });
 
     let tick: Promise<ReactiveModuleTickResult>;
     try {
@@ -1671,6 +1663,17 @@ export class ModuleScheduler {
         this.#settle(entry, null, error);
       },
     );
+    // Observers run synchronously and may request shutdown. Publish the event
+    // only after the Promise is visible so a reentrant stop cannot report
+    // completion while this dispatched tick is still running.
+    this.#emitModule(entry, {
+      type: "scheduler.dispatched",
+      reasonCode: decision.reasonCode,
+      claimLimitCount: decision.claimLimitCount,
+      claimLimitBytes: decision.claimLimitBytes,
+      missedPeriods,
+      snapshot: this.#summarize(snapshot),
+    });
   }
 
   #settle(entry: ModuleEntry, result: ReactiveModuleTickResult | null, error: unknown): void {

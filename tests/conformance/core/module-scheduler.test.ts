@@ -1793,6 +1793,43 @@ describe("CORE scheduler retry backoff", () => {
 });
 
 describe("CORE scheduler stop", () => {
+  it("does not finish a reentrant observer stop before its dispatched tick settles", async () => {
+    let stopping: Promise<void> | undefined;
+    let stopped = false;
+    const { clock, mailboxes, scheduler } = createScheduler({
+      onEvent: (event) => {
+        if (event.type !== "scheduler.dispatched" || stopping !== undefined) return;
+        stopping = scheduler.stop().then(() => {
+          stopped = true;
+        });
+      },
+    });
+    const runtime = new FakeModuleRuntime();
+    mailboxes.set("worker", 1, 100);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+
+    expect(runtime.tickCount).toBe(1);
+    expect(stopping).toBeDefined();
+    expect(stopped).toBe(false);
+    expect(scheduler.state).toBe("stopping");
+
+    runtime.settle(committedResult(1));
+    await stopping;
+
+    expect(stopped).toBe(true);
+    expect(scheduler.state).toBe("stopped");
+    expect(clock.liveTimerCount).toBe(0);
+  });
+
   it("waits for an in-flight tick and leaves no live timer", async () => {
     const { clock, mailboxes, scheduler } = createScheduler();
     const runtime = new FakeModuleRuntime();
