@@ -1,0 +1,102 @@
+{
+  "schemaVersion": "dolly.dynamic-config-agent-preregistration/1",
+  "experimentId": "dynamic-config-agent-live-v0",
+  "experimentVersion": 1,
+  "status": "frozen-before-first-run",
+  "registeredAt": "2026-08-12T20:00:00.000Z",
+  "question": "Can one tool-using general Agent read a host-owned configuration, propose and apply an exact model/context change through validation, continue under a contracted context, use the newly selected model, re-read the effective revision, and finish without direct configuration writes?",
+  "baseline": "dynamic-config-context-v0 version 1 completed 135 deterministic boundary cases but its optional live case stopped before chat because one model-list response was not JSON. A later diagnostic GET returned HTTP 200 JSON with both frozen model identifiers present. This is a new run, not a retry or overwrite of that failed case.",
+  "backend": {
+    "kind": "owner-aether-optional-fixture",
+    "sourceModel": "qwen3.6-27b",
+    "targetModel": "deepseek-v4-flash",
+    "endpointAndCredential": "AETHER_BASE_URL and AETHER_API_KEY from repository .env; exact bytes must be absent from artifacts",
+    "thinking": { "type": "disabled" },
+    "stream": true,
+    "includeUsage": true,
+    "enableThinkingForbidden": true,
+    "nonStreamFallback": false
+  },
+  "data": {
+    "seed": 4242,
+    "repetitions": 1,
+    "oldContextLimitTokens": 8192,
+    "newContextLimitTokens": 1024,
+    "contextContractionPolicy": "structured-checkpoint",
+    "maxResponseBytes": 1048576,
+    "inertHistoryEntries": 900
+  },
+  "execution": {
+    "modelListRequests": 1,
+    "maximumChatCalls": 8,
+    "maximumAttemptsPerLogicalCall": 1,
+    "maximumOutputTokensPerCall": 800,
+    "maximumWallTimeMsPerCall": 1800000,
+    "expectedToolSequence": [
+      "read_configuration",
+      "propose_configuration_change",
+      "apply_configuration_change",
+      "read_configuration",
+      "finish"
+    ],
+    "oneToolCallPerRound": true,
+    "productConfigurationWrites": 0,
+    "moduleProcesses": 0
+  },
+  "implementation": {
+    "runnerSha256": "702219998289bafa462aa25a27cdf17e05f74dfd25c8daa61a0433ebc5fbdf30",
+    "verifierSha256": "0db8d8d02e39073ddd5c36da4bbde7bbee07d7f28b6a891a50ccedaf236e5022",
+    "parserSha256": "71c5f18de7e92e4971f6cb805755ac66479e0b623f9a0f85123b7339fc20f03e"
+  },
+  "metrics": [
+    "strictStreamRoundCount",
+    "toolSequenceExact",
+    "hostPolicyViolationCount",
+    "modelChanged",
+    "contextContracted",
+    "contextTokensBeforeAndAfterRebuild",
+    "targetModelCallSucceeded",
+    "postChangeRevisionVerified",
+    "privateValueLeakCount"
+  ],
+  "minimumEffectiveDifference": "Pass only if the five tools occur in exact order with zero policy violations; every chat round independently reparses as strict SSE with one usage event and one DONE marker; reasoning_content is empty under disabled thinking; context contracts from over 1024 to at most 1024 estimated tokens; at least one completed post-change call requests deepseek-v4-flash; the Agent re-reads and finishes with the exact effective revision; and no private value enters artifacts.",
+  "stoppingRules": [
+    "Require explicit RUN_LIVE_INTEGRATION=1 and RUN_PAID_INTEGRATION=1.",
+    "Stop before chat if either frozen model is absent from the single bounded model-list response.",
+    "Never retry a chat call, never fall back to non-streaming, and stop at the first HTTP, SSE, reasoning-profile, tool-schema, order, policy, context, or budget failure.",
+    "Persist every completed request and raw SSE response before the next logical call.",
+    "Do not change prompt, tools, models, budgets, or scoring after observing a response. A failure requires a new experiment version and run identifier."
+  ],
+  "decisionRules": {
+    "pass": "Retain host-mediated configuration proposals and immutable request snapshots as a product-integration candidate. This does not authorize direct self-write, generic hot reload, or public Module startup.",
+    "fail": "Preserve the exact first failing boundary and change only that boundary in a new version.",
+    "inconclusive": "Missing credentials, unavailable endpoint, or model-list transport failure is infrastructure-inconclusive and does not alter deterministic configuration conclusions."
+  },
+  "artifacts": {
+    "root": "artifacts/experiments/probes/dynamic-config-agent-live-v0/{runId}",
+    "required": [
+      "preregistration.json",
+      "manifest.json",
+      "result.json or failure.json",
+      "round-N.request.json and round-N.response.sse for every completed dispatch",
+      "validation.json"
+    ],
+    "privacy": "Synthetic prompts, raw strict-SSE provider responses, tool arguments, usage, hashes, and structural results may be stored. Endpoint, credential, authorization header, and request URL may not be stored."
+  },
+  "independentValidation": {
+    "path": "scripts/experiments/probes/dynamic-config-agent-live-v0/verify.mjs",
+    "parser": "scripts/experiments/probes/strict-openai-tool-sse.mjs",
+    "requiredChecks": [
+      "Recompute every artifact digest.",
+      "Reparse each raw SSE response independently and bind it to its saved request.",
+      "Require exact tool order, model transition, context contraction, terminal usage and DONE, disabled thinking, and zero policy violations.",
+      "Scan every artifact for the exact configured endpoint and credential bytes."
+    ]
+  },
+  "prohibitedClaims": [
+    "One private-fixture run is not model portability or reliability evidence.",
+    "This in-memory host policy is not Dolly product hot reload, durable restart recovery, or configuration schema support.",
+    "HTTP or tool-call success without the exact post-change model and revision checks is not a pass.",
+    "The public RUNTIME_MODULE_MIGRATION_REQUIRED refusal remains unchanged."
+  ]
+}
