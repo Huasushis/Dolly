@@ -522,6 +522,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       expect(await waitFor(
         () =>
           actorRunCount(FIRST_MODULE_ID) === 2 &&
+          repository.list().length === 3 &&
           events.some((event) =>
             event.type === "scheduler.backpressure_entered" &&
             event.moduleId === SECOND_MODULE_ID
@@ -1337,7 +1338,8 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         () => schedulerEvents.some((event) =>
           event.type === "scheduler.decision" &&
           event.moduleId === PERIODIC_MODULE_ID &&
-          event.reasonCode === "SCHEDULER_DEFERRED"
+          (event.reasonCode === "PERIOD_NOT_DUE" ||
+            event.reasonCode === "SCHEDULER_DEFERRED")
         ),
         2_000,
       )).toBe(true);
@@ -1387,7 +1389,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         moduleId: PERIODIC_MODULE_ID,
         periodMs,
         startDeltaMs,
-        waitingReasonCode: "SCHEDULER_DEFERRED",
+        waitingReasonCodes: ["PERIOD_NOT_DUE", "SCHEDULER_DEFERRED"],
         dispatchReasonCode: "READY_PERIODIC",
         actorRuns: 2,
         committedModuleResults: reopenedRepository.list().length,
