@@ -16,12 +16,14 @@ import {
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { InstalledModulePermissionPolicyRegistry } from "../../../src/adapters/installed-module-permission-policy.js";
 import {
   composeInstalledReactiveModuleHost,
   type InstalledReactiveModuleHost,
 } from "../../../src/adapters/installed-reactive-module-runtime.js";
 import { defaultLauncherScriptPath } from "../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
 import type { BlockProposal } from "../../../src/core/block-store.js";
+import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
 import { CoreStartupRecovery } from "../../../src/core/core-startup-recovery.js";
 import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
 import { ExtensionInstallationRegistry } from "../../../src/core/extension-installation-registry.js";
@@ -30,6 +32,7 @@ import {
   createFileCoreStateStoreWithStoppedRecordWriter,
 } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
+import { FileToolJournalRepository } from "../../../src/core/file-tool-journal-repository.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
 import { resolveInstalledContentSchemaRegistrationSet } from "../../../src/core/installed-extension-module.js";
 import {
@@ -39,6 +42,8 @@ import {
 } from "../../../src/core/linux-module-cgroup.js";
 import { inspectCoreServiceBinding } from "../../../src/core/linux-core-service-binding.js";
 import type { ModuleActorEvent } from "../../../src/core/module-actor.js";
+import type { ChatBrokerInvocation } from "../../../src/core/model-provider-broker.js";
+import { ModelDescriptorRegistry } from "../../../src/core/model-provider-descriptor.js";
 import {
   systemSchedulerClock,
   type SchedulerEvent,
@@ -49,6 +54,17 @@ import {
   createDefaultDollyInstanceConfig,
   validateDollyInstanceConfig,
 } from "../../../src/core/runtime-config.js";
+import {
+  ToolRegistry,
+  type ToolDescriptor,
+  type ToolExecutionOutcome,
+  type ToolExecutionRequest,
+} from "../../../src/core/tool-policy.js";
+import {
+  CHAT_STRATEGIES,
+  chatDescriptor,
+  objectFormReasoning,
+} from "../model-provider/fixtures.js";
 
 const PYTHON = "/usr/bin/python3";
 const INSTANCE_ID = "44444444-4444-4444-8444-444444444444";
@@ -57,6 +73,7 @@ const SECOND_MODULE_ID = "scheduler-second";
 const DRAINER_MODULE_ID = "scheduler-drainer";
 const SOURCE_MODULE_ID = "scheduler-source";
 const PERIODIC_MODULE_ID = "scheduler-periodic";
+const AGENT_MODULE_ID = "scheduler-agent";
 const MODULE_IDS = [FIRST_MODULE_ID, SECOND_MODULE_ID, DRAINER_MODULE_ID] as const;
 const LIMITS: ModuleCgroupLimits = {
   memoryMaxBytes: 268_435_456,
@@ -66,6 +83,9 @@ const LIMITS: ModuleCgroupLimits = {
 };
 const FIXTURE_PATH = fileURLToPath(
   new URL("./fixtures/installed-reactive-module-fixture.mjs", import.meta.url),
+);
+const AGENT_FIXTURE_PATH = fileURLToPath(
+  new URL("../../../scripts/experiments/probes/general-agent-live-v0/extension.mjs", import.meta.url),
 );
 
 function delegatedRootCgroupPath(): string | undefined {
@@ -100,6 +120,27 @@ function proposal(text: string): BlockProposal {
       schema: "dolly.content/1",
       value: { items: [{ type: "text", text, format: "plain" }] },
     },
+  };
+}
+
+function agentToolDescriptor(options: {
+  readonly toolId: string;
+  readonly wireName: string;
+  readonly description: string;
+  readonly argumentSchema: ToolDescriptor["argumentSchema"];
+  readonly resultSchema: ToolDescriptor["resultSchema"];
+}): ToolDescriptor {
+  return {
+    ...options,
+    effectClass: "read",
+    resourceScope: "synthetic-memory",
+    approval: "never",
+    idempotency: "effect-key",
+    outcomeQuery: "supported",
+    parallel: "safe",
+    deadlineMs: 1_000,
+    maxArgumentBytes: 1_024,
+    maxResultBytes: 4_096,
   };
 }
 
@@ -728,6 +769,549 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       rmSync(scratch, { recursive: true, force: true });
     }
   }, 90_000);
+
+  it("runs a strict-streaming registered-tool Agent through the installed Scheduler", async () => {
+    if (integrationUnitName === undefined) {
+      throw new Error("The transient Core service unit name is unavailable");
+    }
+    const inspectedBinding = await inspectCoreServiceBinding({
+      unitName: integrationUnitName,
+      mode: "user",
+      queryTimeoutMs: 5_000,
+      overallTimeoutMs: 15_000,
+    });
+    if (!inspectedBinding.verified) {
+      throw new Error(inspectedBinding.failures
+        .map((failure) => `${failure.code}: ${failure.detail}`)
+        .join("; "));
+    }
+    const preparedRoot = await prepareDelegatedCgroupRoot({
+      delegatedRootCgroupPath: inspectedBinding.binding.delegatedRootCgroupPath,
+    });
+    if (!preparedRoot.prepared) {
+      throw new Error(`${preparedRoot.failure.code}: ${preparedRoot.failure.detail}`);
+    }
+
+    const scratchParent = resolve(process.cwd(), ".tmp");
+    mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
+    const scratch = mkdtempSync(join(scratchParent, "installed-agent-host-integration-"));
+    const statePath = join(scratch, "core-state.json");
+    const commitPath = join(scratch, "module-result-commits.json");
+    const toolJournalPath = join(scratch, "tool-rounds.json");
+    const effectIntentPath = join(scratch, "effect-intents.json");
+    const processGenerationId = `${AGENT_MODULE_ID}-process-${process.pid}-${Date.now()}`;
+    const moduleCgroupPath = deriveModuleCgroupPath(
+      inspectedBinding.binding.delegatedRootCgroupPath,
+      { instanceId: INSTANCE_ID, moduleId: AGENT_MODULE_ID, processGenerationId },
+    ).filesystemPath;
+    let composed: InstalledReactiveModuleHost | undefined;
+    let stopped = false;
+    let primaryFailure: unknown;
+    try {
+      const packageSource = join(scratch, "package-source");
+      mkdirSync(packageSource, { recursive: true, mode: 0o700 });
+      copyFileSync(AGENT_FIXTURE_PATH, join(packageSource, "extension.mjs"));
+      const configurationSchema = {
+        $schema: JSON_SCHEMA_2020_12,
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      } as const;
+      writeFileSync(join(packageSource, "dolly-extension.json"), JSON.stringify({
+        schemaVersion: "dolly.extension-package/1",
+        extensionId: "org.example.scheduler-agent",
+        packageVersion: "1.0.0",
+        displayName: "Installed Scheduler Agent integration fixture",
+        description: "Uses Host-selected streaming model and read-only tool policies.",
+        supportedProtocolVersions: ["3.0"],
+        entrypoint: "extension.mjs",
+        modules: [{
+          moduleKind: "general-agent",
+          activation: "reactive",
+          configVersion: 1,
+          configurationSchema,
+        }],
+        requestedCapabilities: [],
+      }), "utf8");
+      const installations = new ExtensionInstallationRegistry({
+        directory: join(scratch, "installations"),
+      });
+      const installed = installations.installNodePackage({
+        sourceDirectory: packageSource,
+        trust: "trusted",
+      });
+      rmSync(packageSource, { recursive: true, force: true });
+      const configurations = new ModuleConfigurationStore({
+        directory: join(scratch, "configurations"),
+      });
+      const agentConfiguration = configurations.create({
+        configId: "scheduler-agent-config",
+        extensionId: "org.example.scheduler-agent",
+        moduleKind: "general-agent",
+        configVersion: 1,
+        schema: configurationSchema,
+        configuration: {},
+      });
+      const defaults = createDefaultDollyInstanceConfig(INSTANCE_ID);
+      const configuration = validateDollyInstanceConfig({
+        ...defaults,
+        core: {
+          ...defaults.core,
+          scheduler: {
+            pollIntervalMs: 60_000,
+            retryBaseMs: 25,
+            retryMaxMs: 250,
+          },
+        },
+        pages: [{ pageId: "agent-input" }, { pageId: "agent-output" }],
+        modules: [{
+          moduleId: AGENT_MODULE_ID,
+          extensionId: "org.example.scheduler-agent",
+          packageVersion: "1.0.0",
+          moduleKind: "general-agent",
+          isolation: "process",
+          configurationReference: {
+            configId: agentConfiguration.configId,
+            revision: agentConfiguration.revision,
+            configVersion: agentConfiguration.configVersion,
+          },
+          permissionPolicyIds: ["model.owner-primary", "tools.owner-memory"],
+          inputPageIds: ["agent-input"],
+          outputPageIds: ["agent-output"],
+          subscriptionStart: "from-now",
+          activation: { kind: "reactive" },
+          limits: {
+            claim: { maxCount: 1, maxBytes: 64 * 1_024 },
+            maxInputBytes: 64 * 1_024,
+            maxResultBytes: 256 * 1_024,
+            maxFrameBytes: 512 * 1_024,
+            maxRunsPerGeneration: 10,
+            maxGenerations: 2,
+          },
+          timeouts: {
+            initializationTimeoutMs: 10_000,
+            executionTimeoutMs: 15_000,
+            cancellationGraceMs: 1_000,
+            terminationTimeoutMs: 10_000,
+          },
+        }],
+      });
+
+      const tools = [
+        agentToolDescriptor({
+          toolId: "synthetic.discover",
+          wireName: "alpha_discover",
+          description: "Discover synthetic memory keys before reading one item.",
+          argumentSchema: {
+            type: "object",
+            properties: {
+              prefix: { type: "string", maxBytes: 16 },
+              limit: { type: "integer", minimum: 1, maximum: 3 },
+            },
+            required: ["prefix", "limit"],
+            additionalProperties: false,
+            maxProperties: 2,
+          },
+          resultSchema: {
+            type: "object",
+            properties: {
+              keys: { type: "array", items: { type: "string", maxBytes: 32 }, maxItems: 3 },
+            },
+            required: ["keys"],
+            additionalProperties: false,
+            maxProperties: 1,
+          },
+        }),
+        agentToolDescriptor({
+          toolId: "synthetic.read",
+          wireName: "beta_read",
+          description: "Read one synthetic memory item by a discovered key.",
+          argumentSchema: {
+            type: "object",
+            properties: { key: { type: "string", maxBytes: 32 } },
+            required: ["key"],
+            additionalProperties: false,
+            maxProperties: 1,
+          },
+          resultSchema: {
+            type: "object",
+            properties: {
+              status: { type: "string", maxBytes: 16 },
+              codename: { type: "string", maxBytes: 32 },
+            },
+            required: ["status", "codename"],
+            additionalProperties: false,
+            maxProperties: 2,
+          },
+        }),
+      ] as const;
+      const toolRegistry = new ToolRegistry(tools, tools.map((tool) => tool.toolId));
+      const toolJournalRepository = new FileToolJournalRepository({ path: toolJournalPath });
+      const toolCalls: ToolExecutionRequest[] = [];
+      const executeTool = async (
+        request: ToolExecutionRequest,
+      ): Promise<ToolExecutionOutcome> => {
+        toolCalls.push(request);
+        return request.toolId === "synthetic.discover"
+          ? { status: "succeeded", content: { keys: ["deployment-note"] } }
+          : {
+              status: "succeeded",
+              content: { status: "active", codename: "EMBER-7421" },
+            };
+      };
+      const descriptors = new ModelDescriptorRegistry({
+        schemaDigest: `sha256:${"7".repeat(64)}`,
+        allowedStrategyIds: CHAT_STRATEGIES,
+      });
+      const baseDescriptor = chatDescriptor({
+        jsonObjectOutput: "supported",
+        reasoning: objectFormReasoning(),
+      });
+      const modelDescriptor = descriptors.register({
+        ...baseDescriptor,
+        features: {
+          ...baseDescriptor.features,
+          maxOutputTokens: { state: "supported", value: { maximum: 8_192 } },
+        },
+      });
+      descriptors.setStatus(modelDescriptor, "active");
+      const modelCalls: ChatBrokerInvocation[] = [];
+      const invokeModel = async (invocation: ChatBrokerInvocation) => {
+        modelCalls.push(invocation);
+        const round = modelCalls.length;
+        const finalContent = round === 1
+          ? "Discover the available keys, read the active note, then cite its source."
+          : round === 2
+            ? JSON.stringify({ action: "alpha_discover", arguments: { prefix: "", limit: 3 } })
+            : round === 3
+              ? JSON.stringify({ action: "beta_read", arguments: { key: "deployment-note" } })
+              : JSON.stringify({
+                  action: "answer",
+                  answer: "The active deployment codename is EMBER-7421.",
+                  grounded: true,
+                  evidenceKeys: ["deployment-note"],
+                });
+        return {
+          schemaVersion: "dolly.model-result/2" as const,
+          requestId: invocation.requestId,
+          operationId: invocation.context.operationId,
+          descriptor: invocation.descriptor,
+          status: "succeeded" as const,
+          output: {
+            schemaVersion: "dolly.model.chat-output/1" as const,
+            finalContent,
+            reasoning: round === 1
+              ? { state: "observed" as const, parts: ["Inspect the registry before acting."] }
+              : { state: "not-observed" as const },
+            toolCalls: [],
+            finishReason: "stop",
+          },
+          usage: { providerAttempts: 1, observations: [] },
+        };
+      };
+      let modelRequest = 0;
+      const permissionPolicies = new InstalledModulePermissionPolicyRegistry({
+        nextRequestId: () => `installed-agent-model-request-${++modelRequest}`,
+        policies: [{
+          kind: "strict-streaming-chat",
+          policyId: "model.owner-primary",
+          descriptor: modelDescriptor,
+          ownerScope: "owner-1",
+          budgets: {
+            maxProviderAttempts: 1,
+            maxWallTimeMs: 30_000,
+            maxRequestBytes: 128 * 1_024,
+            maxResponseBytes: 128 * 1_024,
+            maxInputItems: 64,
+            maxInputBytes: 64 * 1_024,
+            maxOutputBytes: 64 * 1_024,
+            maxOutputTokens: 5_200,
+          },
+          chat: { invoke: invokeModel },
+          outputContracts: ["text", "json-object"],
+          reasoningPolicies: ["require", "disable"],
+          roles: ["system", "user"],
+          limits: {
+            maxInvocations: 16,
+            maxInvocationsPerRun: 8,
+            maxInvocationsPerWindow: 16,
+            rateWindowMs: 60_000,
+          },
+          capabilityLifetimeMs: 60_000,
+        }, {
+          kind: "registered-tools",
+          policyId: "tools.owner-memory",
+          registry: toolRegistry,
+          repository: toolJournalRepository,
+          executor: { execute: executeTool },
+          budget: {
+            maxRounds: 2,
+            maxCalls: 2,
+            maxCallsPerRound: 1,
+            maxApprovals: 0,
+            maxCallBytes: 2_048,
+          },
+          approvalPolicyRevision: "policy-1",
+          limits: {
+            maxInvocations: 8,
+            maxInvocationsPerRun: 4,
+            maxCallsPerRound: 1,
+            maxArgumentBytes: 8 * 1_024,
+            maxResultBytes: 16 * 1_024,
+          },
+          capabilityLifetimeMs: 60_000,
+        }],
+      });
+      const effectIntentStore = new FileEffectIntentStore({ path: effectIntentPath });
+
+      let blockId = 0;
+      let deliveryId = 0;
+      let protocolIdentifier = 0;
+      let processIdentifierAllocated = false;
+      const now = (): string => new Date().toISOString();
+      const contentSchemas = resolveInstalledContentSchemaRegistrationSet({
+        instanceConfiguration: configuration,
+        installations,
+        reservedRegistrations: [],
+        maxRegisteredValueBytes: 256 * 1_024,
+      });
+      const coreState = createFileCoreStateStoreWithStoppedRecordWriter({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `agent-block-${++blockId}`,
+        nextDeliveryId: (kind) => `agent-${kind}-${++deliveryId}`,
+        now,
+        contentSchemas,
+      });
+      coreState.store.deliveries.createPage("agent-input");
+      coreState.store.deliveries.createPage("agent-output");
+      coreState.store.deliveries.registerConsumer(
+        "agent-input",
+        AGENT_MODULE_ID,
+        "from-now",
+      );
+      const repository = new FileModuleResultCommitRepository({ path: commitPath });
+      const mailboxes = [{
+        consumerId: AGENT_MODULE_ID,
+        pageIds: ["agent-input"],
+        maxResidentCount: 4,
+        maxResidentBytes: 256 * 1_024,
+      }];
+      const startupRecoveryHandoff = (await new CoreStartupRecovery({
+        deliveries: coreState.store.deliveries,
+        commits: createModuleResultCommitCoordinator({
+          core: coreState.store,
+          repository,
+          now,
+          mailboxes,
+        }),
+        moduleRecords: coreState.store,
+        stoppedRecordWriter: coreState.stoppedRecordWriter,
+      }).recover()).handoff;
+      const schedulerEvents: SchedulerEvent[] = [];
+      const actorEvents: ModuleActorEvent[] = [];
+      composed = composeInstalledReactiveModuleHost({
+        configuration,
+        installations,
+        configurations,
+        coreState,
+        contentSchemas,
+        maxRegisteredContentValueBytes: 256 * 1_024,
+        mailboxes,
+        startupRecoveryHandoff,
+        clock: systemSchedulerClock(),
+        scheduling: {
+          maxConcurrentModules: 1,
+          backpressureAction: "pause-upstream",
+          downstreamRecheckMs: 100,
+          noProgressAfterMs: 5_000,
+          claimLimitCount: 1,
+          claimLimitBytes: 64 * 1_024,
+          retryJitterRatio: 0,
+          lowWatermarkRatio: 1,
+        },
+        runtime: {
+          resultCommitRepository: repository,
+          permissionPolicies,
+          effectIntentStore,
+          now,
+          initialModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-1`,
+          nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
+          binding: inspectedBinding.binding,
+          lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
+          launcher: {
+            interpreterProgram: PYTHON,
+            launcherScriptPath: defaultLauncherScriptPath(),
+            controllerTimeouts: {
+              configureTimeoutMs: 5_000,
+              inCgroupTimeoutMs: 5_000,
+              membershipTimeoutMs: 5_000,
+              exitObservationTimeoutMs: 5_000,
+            },
+          },
+          host: {
+            isolationPolicy: new ExtensionIsolationPolicy(),
+            shutdownRequestTimeoutMs: 2_000,
+            forceKillDelayMs: 500,
+          },
+          channelCloseTimeoutMs: 5_000,
+          nextProcessGenerationId: () => {
+            if (processIdentifierAllocated) {
+              throw new Error("The Agent integration attempted another process generation");
+            }
+            processIdentifierAllocated = true;
+            return processGenerationId;
+          },
+          nextProtocolIdentifier: (purpose) =>
+            `${purpose}-scheduler-agent-${++protocolIdentifier}`,
+          classifyFailure: (failure) => ({ code: failure.code, retryable: false }),
+          onActorEvent: (event) => actorEvents.push(event),
+        },
+        onSchedulerEvent: (event) => schedulerEvents.push(event),
+      });
+      await composed.host.start();
+      expect(composed.host.state).toBe("running");
+      expect(coreState.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
+        state: "running",
+        packageDigest: installed.packageDigest,
+        declaredExternalEffects: "core-capabilities-only",
+      });
+      expect(existsSync(moduleCgroupPath)).toBe(true);
+
+      const input = coreState.store.blocks.commit(
+        proposal("Find the active deployment codename in private memory."),
+        { kind: "external", id: "agent-integration" },
+      );
+      coreState.store.deliveries.append("agent-input", input.id);
+      expect(await waitFor(
+        () => repository.list().length === 1 && repository.list()[0]?.state === "committed",
+        15_000,
+      )).toBe(true);
+      const result = repository.list()[0]!;
+      if (result.blockId === undefined) {
+        throw new Error("The Agent result does not reference its output Block");
+      }
+      const storedOutputBlock = coreState.store.blocks.get(result.blockId);
+      if (storedOutputBlock === null) throw new Error("The Agent output Block is absent");
+      const outputBlock = storedOutputBlock as unknown as {
+        readonly payload: {
+          readonly value: { readonly items: readonly { readonly text?: string }[] };
+        };
+      };
+      const outputText = outputBlock.payload.value.items[0]?.text;
+      if (outputText === undefined) throw new Error("The Agent result text is absent");
+      const agentResult = JSON.parse(outputText) as {
+        readonly actions: readonly string[];
+        readonly capabilityTypes: readonly string[];
+        readonly modelOutputContracts: readonly string[];
+        readonly answer: {
+          readonly answer: string;
+          readonly grounded: boolean;
+          readonly evidenceKeys: readonly string[];
+        };
+        readonly childCredentialEnvironmentPresent: boolean;
+      };
+      expect(agentResult).toMatchObject({
+        actions: ["alpha_discover", "beta_read", "answer"],
+        capabilityTypes: ["model-operation", "tool-invocation"],
+        modelOutputContracts: ["json-object", "text"],
+        answer: {
+          grounded: true,
+          evidenceKeys: ["deployment-note"],
+        },
+        childCredentialEnvironmentPresent: false,
+      });
+      expect(agentResult.answer.answer).toContain("EMBER-7421");
+      expect(modelCalls).toHaveLength(4);
+      expect(modelCalls.every((call) => call.input.stream)).toBe(true);
+      expect(toolCalls.map((call) => call.toolId)).toEqual([
+        "synthetic.discover",
+        "synthetic.read",
+      ]);
+      expect(actorEvents.filter((event) => event.type === "run.started")).toHaveLength(1);
+      expect(schedulerEvents).toContainEqual(expect.objectContaining({
+        type: "scheduler.dispatched",
+        moduleId: AGENT_MODULE_ID,
+        reasonCode: "READY_REACTIVE",
+      }));
+      expect(schedulerEvents).toContainEqual(expect.objectContaining({
+        type: "scheduler.settled",
+        moduleId: AGENT_MODULE_ID,
+        tickStatus: "committed",
+      }));
+      expect(new FileToolJournalRepository({ path: toolJournalPath })
+        .listRounds(result.moduleJobId)).toEqual([
+          expect.objectContaining({ roundIndex: 1, state: "complete" }),
+          expect.objectContaining({ roundIndex: 2, state: "complete" }),
+        ]);
+      const effects = new FileEffectIntentStore({ path: effectIntentPath }).list();
+      expect(effects).toHaveLength(8);
+      expect(effects.every((record) => record.outcome.kind === "terminal")).toBe(true);
+
+      await composed.host.stop();
+      stopped = true;
+      expect(composed.host.state).toBe("stopped");
+      expect(coreState.store.getModuleProcessRecord(processGenerationId)).toMatchObject({
+        state: "stopped",
+        moduleCgroupPath,
+      });
+      expect(existsSync(moduleCgroupPath)).toBe(false);
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `reopened-agent-block-${++blockId}`,
+        nextDeliveryId: (kind) => `reopened-agent-${kind}-${++deliveryId}`,
+        now,
+        contentSchemas,
+      });
+      const reopenedRepository = new FileModuleResultCommitRepository({ path: commitPath });
+      expect(reopenedRepository.list()).toEqual([
+        expect.objectContaining({
+          state: "committed",
+          source: { kind: "module", id: AGENT_MODULE_ID },
+        }),
+      ]);
+      expect(reopened.getModuleProcessRecord(processGenerationId)?.state).toBe("stopped");
+
+      console.info(JSON.stringify({
+        packageSchemaVersion: installed.manifest.schemaVersion,
+        packageDigest: installed.packageDigest,
+        moduleId: AGENT_MODULE_ID,
+        processGenerationId,
+        moduleCgroupPath,
+        modelCalls: modelCalls.length,
+        allModelCallsStreaming: modelCalls.every((call) => call.input.stream),
+        toolCalls: toolCalls.length,
+        durableCapabilityEffects: effects.length,
+        actorRuns: 1,
+        committedModuleResults: reopenedRepository.list().length,
+        finalRecordState: reopened.getModuleProcessRecord(processGenerationId)?.state,
+        cgroupRemoved: !existsSync(moduleCgroupPath),
+        groundedAnswer: agentResult.answer.answer,
+      }));
+    } catch (error) {
+      primaryFailure = error;
+    } finally {
+      const cleanupFailures: unknown[] = [];
+      if (!stopped && composed !== undefined &&
+        (composed.host.state === "running" || composed.host.state === "failed")) {
+        await composed.host.stop().catch((error) => cleanupFailures.push(error));
+      }
+      if (existsSync(moduleCgroupPath)) {
+        cleanupFailures.push(
+          new Error(`Exact Agent Module control group remained after cleanup: ${moduleCgroupPath}`),
+        );
+      }
+      rmSync(scratch, { recursive: true, force: true });
+      const failures = [
+        ...(primaryFailure === undefined ? [] : [primaryFailure]),
+        ...cleanupFailures,
+      ];
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "Installed Scheduler Agent integration failed");
+      }
+    }
+  }, 60_000);
 
   it("executes one durable source request in the installed Linux host", async () => {
     if (integrationUnitName === undefined) {
