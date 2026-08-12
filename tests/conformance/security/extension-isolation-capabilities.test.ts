@@ -129,6 +129,104 @@ function execution(input = {}) {
 }
 
 describe("Extension process isolation and capability checks", () => {
+  it("does not send a Run whose Host-owned admission has already expired", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-expired-run-admission-"));
+    let now = Date.parse("2026-08-12T00:00:00.000Z");
+    const host = createHost("normal", scratch, { wallClockNow: () => now });
+    try {
+      await host.start();
+      const prepared = host.prepareRun(1_000);
+      if (prepared.status !== "ready") throw new Error("expected ready Run admission");
+      now += 1_000;
+      await expect(host.execute({
+        moduleJobId: "module-job-expired",
+        runId: "run-expired",
+        attempt: 1,
+        admission: prepared.admission,
+        responseTimeoutMs: 2_000,
+        hasMore: false,
+        input: {},
+      })).rejects.toMatchObject({ code: "EXTENSION_RUN_ADMISSION_EXPIRED" });
+      expect(host.snapshot.state).toBe("ready");
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("fixes one Host-owned deadline and consumes its Run admission exactly once", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-run-admission-"));
+    let now = Date.parse("2026-08-12T00:00:00.000Z");
+    const host = createHost("normal", scratch, { wallClockNow: () => now });
+    host.grantCapability(
+      {
+        capabilityType: "private-storage",
+        capabilityVersion: "v1",
+        operations: ["read"],
+        resourceScope: { namespace: "module-a" },
+        expiresAt: "2026-08-12T00:00:05.000Z",
+        maxInvocations: 1,
+        maxInvocationsPerRun: 1,
+        maxConcurrentInvocations: 1,
+        maxArgumentBytes: 256,
+        maxResultBytes: 256,
+      },
+      async () => ({ ok: true }),
+    );
+    try {
+      await host.start();
+      const first = host.prepareRun(1_000);
+      expect(first).toMatchObject({
+        status: "ready",
+        admission: { deadline: "2026-08-12T00:00:01.000Z" },
+      });
+      if (first.status !== "ready") throw new Error("expected ready Run admission");
+      now += 500;
+      const repeated = host.prepareRun(1_000);
+      expect(repeated).toMatchObject({ status: "ready" });
+      if (repeated.status !== "ready") throw new Error("expected repeated Run admission");
+      expect(repeated.admission).toBe(first.admission);
+
+      await expect(host.execute({
+        moduleJobId: "module-job-direct",
+        runId: "run-direct",
+        attempt: 1,
+        deadline: "2026-08-12T00:00:01.500Z",
+        responseTimeoutMs: 2_000,
+        hasMore: false,
+        input: {},
+      })).rejects.toMatchObject({ code: "EXTENSION_INVOCATION_INVALID" });
+
+      await expect(host.execute({
+        moduleJobId: "module-job-a",
+        runId: "run-a",
+        attempt: 1,
+        admission: first.admission,
+        responseTimeoutMs: 2_000,
+        hasMore: false,
+        input: {},
+      })).resolves.toEqual({ ok: true, input: {} });
+      await expect(host.execute({
+        moduleJobId: "module-job-b",
+        runId: "run-b",
+        attempt: 1,
+        admission: first.admission,
+        responseTimeoutMs: 2_000,
+        hasMore: false,
+        input: {},
+      })).rejects.toMatchObject({ code: "EXTENSION_INVOCATION_INVALID" });
+      expect(host.prepareRun(4_500)).toEqual({
+        status: "rotation-required",
+        reason: "capability-expiry",
+      });
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("enforces a registry-selected strict streaming model policy in a real child", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-installed-model-policy-"));
     const claim = {
@@ -1363,6 +1461,50 @@ describe("Extension process isolation and capability checks", () => {
     }
   });
 
+  it("requires process rotation before Claim when the remaining session quota cannot cover a Run", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-active-run-quota-"));
+    const host = createHost("capability-active-run", scratch);
+    host.grantCapability(
+      {
+        capabilityType: "private-storage",
+        capabilityVersion: "v2",
+        operations: ["read"],
+        resourceScope: { descriptor: "fixture-model", executionScope: "active-run" },
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        maxInvocations: 1,
+        maxInvocationsPerRun: 1,
+        maxConcurrentInvocations: 1,
+        maxArgumentBytes: 256,
+        maxResultBytes: 256,
+        requireIdempotencyKey: true,
+      },
+      async () => ({ fromHost: true }),
+    );
+
+    try {
+      await host.start();
+      const prepared = host.prepareRun(1_000);
+      if (prepared.status !== "ready") throw new Error("expected first Run admission");
+      await expect(host.execute({
+        moduleJobId: "module-job-a",
+        runId: "run-a",
+        attempt: 1,
+        admission: prepared.admission,
+        responseTimeoutMs: 2_000,
+        hasMore: false,
+        input: {},
+      })).resolves.toEqual({ fromHost: true });
+      expect(host.prepareRun(1_000)).toEqual({
+        status: "rotation-required",
+        reason: "capability-invocation-capacity",
+      });
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("projects the Host-selected version-two tool registry for each active Run", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-tool-registry-active-run-"));
     const host = createHost("tool-registry-active-run", scratch);
@@ -1810,6 +1952,7 @@ describe("Extension process isolation and capability checks", () => {
 
     try {
       await actor.start();
+      await actor.prepareNextRun();
       const outcome = actor.submit({
         moduleGenerationId: "module-generation-a",
         moduleJobId: "module-job-capability",

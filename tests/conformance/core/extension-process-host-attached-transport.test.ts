@@ -379,10 +379,10 @@ describe("Extension process host attached to a process Core already started", ()
     const session = createExtensionProcessLinuxProtocolSession(host, process, {
       executionTimeoutMs: 1_000,
       cancellationGraceMs: 250,
-      wallClockNow: () => wallClockNow,
     });
 
     await session.initialize();
+    await session.prepareRun!();
     const result = session.execute({
       moduleJobId: "module-job-linux",
       runId: "run-linux",
@@ -403,6 +403,40 @@ describe("Extension process host attached to a process Core already started", ()
     double.reportExit();
     await expect(session.waitForChannelClosed(100)).resolves.toBe(true);
     await expect(host.terminate()).resolves.toMatchObject({ state: "stopped" });
+  });
+
+  it("rejects a Module result that arrives after the Host-owned Run deadline", async () => {
+    const startedAt = 1_700_000_000_000;
+    let wallClockNow = startedAt;
+    const double = createAttachedProcessDouble();
+    const host = new ExtensionProcessHost({
+      ...hostOptions({ wallClockNow: () => wallClockNow }),
+      attachedProcess: double.attachment,
+    });
+    const extension = startFakeExtension(double);
+    await host.start();
+    const prepared = host.prepareRun(1_000);
+    if (prepared.status !== "ready") throw new Error("expected ready Run admission");
+
+    const execution = host.execute({
+      moduleJobId: "module-job-late",
+      runId: "run-late",
+      attempt: 1,
+      admission: prepared.admission,
+      responseTimeoutMs: 2_000,
+      hasMore: false,
+      input: {},
+    });
+    const request = await extension.waitForRequest("module.execute");
+    wallClockNow = startedAt + 1_000;
+    await extension.respond(request.id, executeResult(request, { tooLate: true }));
+    await expect(execution).rejects.toMatchObject({ code: "EXTENSION_DEADLINE_EXCEEDED" });
+    expect(host.snapshot.state).toBe("ready");
+
+    const stop = host.stop();
+    await extension.waitForRequest("dolly.shutdown");
+    double.reportExit();
+    await expect(stop).resolves.toMatchObject({ state: "stopped" });
   });
 
   it("rejects options that both start a command and attach a process", () => {

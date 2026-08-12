@@ -504,6 +504,46 @@ describe("CORE scheduler run loop serialization", () => {
     await scheduler.stop();
   });
 
+  it("backs off a Claim released for fresh Run admission without counting a Module failure", async () => {
+    const { clock, mailboxes, scheduler } = createScheduler();
+    const runtime = new FakeModuleRuntime((tickCount) => tickCount === 1
+      ? {
+          ...claimIdentity(1),
+          status: "run-admission-released",
+          reason: "expired-before-execution",
+        }
+      : { status: "idle" });
+    mailboxes.set("worker", 1, 100);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+    scheduler.start();
+    await drain(clock);
+
+    expect(runtime.tickCount).toBe(1);
+    expect(scheduler.status("worker")).toMatchObject({
+      schedulingState: "retry-backoff",
+      retryCount: 1,
+      retryDelayMs: 250,
+      nextEligibleAt: 250,
+      lastTickStatus: "run-admission-released",
+      counters: {
+        runAdmissionReleased: 1,
+        retryScheduled: 0,
+        deadLettered: 0,
+      },
+    });
+    await advance(clock, 249);
+    expect(runtime.tickCount).toBe(1);
+    await advance(clock, 1);
+    expect(runtime.tickCount).toBe(2);
+    await scheduler.stop();
+  });
+
   it("does not dispatch a Module with an empty mailbox", async () => {
     const { clock, mailboxes, scheduler } = createScheduler();
     const runtime = new FakeModuleRuntime();

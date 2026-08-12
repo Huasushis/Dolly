@@ -1747,6 +1747,26 @@ before the runtime acquires the next Claim. No Delivery may be claimed with the
 exhausted generation merely to discover the limit during actor submission.
 This Run-count trigger does not replace the separate pre-Claim admission check
 for capability expiry, remaining invocation quota, or the fixed Run deadline.
+The process Host issues that single-use admission before Claim acquisition.
+The actor owns its `prepared -> assigned -> consumed` transition, so two
+submissions cannot share it and a synchronous lifecycle callback cannot release
+an admission already assigned to an entering Run.
+
+The runtime starts the execution budget before admission and Claim acquisition.
+Claim persistence, input reconstruction, and submission persistence all consume
+that same budget. When it expires before Module IPC, the runtime atomically
+releases the exact Claim and matching submission without a NACK or failed-attempt
+increment. `run-admission-released` is an explicit Scheduler outcome: the
+Scheduler applies bounded backoff before re-Claiming so persistent storage delay
+cannot create a zero-delay loop. If release persistence cannot be confirmed, the
+exact Claim is preserved as `claim-release-outcome-unknown` until recovery can
+prove the released state; recovery MUST NOT reinterpret it as a NACK.
+
+After Module IPC begins, the original deadline remains authoritative. Soft
+timeout uses the remaining pre-Claim budget and hard fencing adds only the
+configured cancellation grace. A result at or after the Host-owned deadline is
+not accepted as success and follows the ordinary external-effect evidence and
+termination rules.
 
 ### 9.2.1 Module descriptions
 

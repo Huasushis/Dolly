@@ -4,7 +4,9 @@ import type {
   ExtensionProcessHost,
   ExtensionProcessHostSnapshot,
 } from "../../../src/core/extension-process-host.js";
+import { ExtensionProcessHostError } from "../../../src/core/extension-process-host.js";
 import {
+  ModuleExecutorRunAdmissionExpiredError,
   ModuleExecutorTerminationUnconfirmedError,
 } from "../../../src/core/module-actor.js";
 import {
@@ -74,6 +76,7 @@ function processSnapshot(
 function createHostSpies(
   result: JsonValue = { schemaVersion: "dolly.module-result/1" },
   initialSnapshot = processSnapshot("created"),
+  wallClockNow: () => number = () => WALL_CLOCK_NOW_MS,
 ) {
   let currentSnapshot = initialSnapshot;
   const start = vi.fn(async () => {
@@ -81,6 +84,28 @@ function createHostSpies(
     return currentSnapshot;
   });
   const execute = vi.fn(async () => result);
+  let preparedAdmission: Readonly<{
+    moduleGenerationId: string;
+    processGenerationId: string;
+    deadline: string;
+  }> | undefined;
+  const prepareRun = vi.fn((executionTimeoutMs: number) => {
+    const now = wallClockNow();
+    const deadlineMs = now + executionTimeoutMs;
+    const deadline = new Date(deadlineMs);
+    if (!Number.isSafeInteger(now) || !Number.isSafeInteger(deadlineMs) || !Number.isFinite(deadline.getTime())) {
+      throw new RangeError("Run admission deadline is invalid");
+    }
+    preparedAdmission ??= Object.freeze({
+      moduleGenerationId: currentSnapshot.moduleGenerationId,
+      processGenerationId: currentSnapshot.processGenerationId,
+      deadline: deadline.toISOString(),
+    });
+    return { status: "ready" as const, admission: preparedAdmission };
+  });
+  const releaseRunAdmission = vi.fn(() => {
+    preparedAdmission = undefined;
+  });
   const cancel = vi.fn(async () => "sent" as const);
   const terminate = vi.fn(async () => {
     currentSnapshot = { ...currentSnapshot, state: "stopped" };
@@ -94,6 +119,8 @@ function createHostSpies(
       return currentSnapshot;
     },
     start,
+    prepareRun,
+    releaseRunAdmission,
     execute,
     cancel,
     terminate,
@@ -104,6 +131,8 @@ function createHostSpies(
   return {
     host,
     start,
+    prepareRun,
+    releaseRunAdmission,
     execute,
     cancel,
     terminate,
@@ -171,11 +200,11 @@ describe("Extension process Module executor", () => {
       {
         executionTimeoutMs: 1_000,
         cancellationGraceMs: 250,
-        wallClockNow: () => WALL_CLOCK_NOW_MS,
       },
     );
 
     await session.initialize();
+    await session.prepareRun!();
     await session.execute({
       moduleJobId: "module-job-1",
       runId: "run-1",
@@ -191,7 +220,9 @@ describe("Extension process Module executor", () => {
       moduleJobId: "module-job-1",
       runId: "run-1",
       attempt: 3,
-      deadline: new Date(WALL_CLOCK_NOW_MS + 1_000).toISOString(),
+      admission: expect.objectContaining({
+        deadline: new Date(WALL_CLOCK_NOW_MS + 1_000).toISOString(),
+      }),
       responseTimeoutMs: 1_251,
       hasMore: true,
       input: INPUT,
@@ -255,13 +286,13 @@ describe("Extension process Module executor", () => {
     const calls = createHostSpies(hostResult);
     const executor = createExtensionProcessModuleExecutor(calls.host, {
       ...EXECUTOR_OPTIONS,
-      wallClockNow: () => WALL_CLOCK_NOW_MS,
     });
 
     expect(calls.start).not.toHaveBeenCalled();
     expect(executor.isolation).toBe("process");
     await executor.start!();
     expect(calls.start).toHaveBeenCalledOnce();
+    await executor.prepareRun!();
 
     const result = await executor.execute(INPUT, RUN_CONTEXT);
 
@@ -271,15 +302,52 @@ describe("Extension process Module executor", () => {
       moduleJobId: "module-job-1",
       runId: "run-1",
       attempt: 3,
-      deadline: new Date(WALL_CLOCK_NOW_MS + 1_000).toISOString(),
+      admission: expect.objectContaining({
+        deadline: new Date(WALL_CLOCK_NOW_MS + 1_000).toISOString(),
+      }),
       responseTimeoutMs: 1_251,
       hasMore: true,
       input: INPUT,
     });
   });
 
+  it("preserves proof that an admitted Run expired before Module IPC", async () => {
+    const { host, execute } = createHostSpies();
+    execute.mockRejectedValueOnce(new ExtensionProcessHostError(
+      "EXTENSION_RUN_ADMISSION_EXPIRED",
+      "expired before send",
+    ));
+    const executor = createExtensionProcessModuleExecutor(host, {
+      moduleId: "module-1",
+      moduleGenerationId: "generation-1",
+      executionTimeoutMs: 1_000,
+      cancellationGraceMs: 250,
+    });
+    await executor.start!();
+    await executor.prepareRun!();
+
+    await expect(executor.execute({
+      schemaVersion: "dolly.reactive-module-input/2",
+      claimedDeliveryIds: [],
+      blockGroups: [],
+      hasMore: false,
+    }, {
+      moduleId: "module-1",
+      moduleGenerationId: "generation-1",
+      moduleJobId: "module-job-1",
+      runId: "run-1",
+      attempt: 1,
+      startedAt: 1,
+      signal: new AbortController().signal,
+    })).rejects.toBeInstanceOf(ModuleExecutorRunAdmissionExpiredError);
+  });
+
   it("forwards cancellation and termination without exposing process stop", async () => {
-    const calls = createHostSpies();
+    const calls = createHostSpies(
+      { schemaVersion: "dolly.module-result/1" },
+      processSnapshot("created"),
+      () => 0,
+    );
     const executor = createExtensionProcessModuleExecutor(calls.host, EXECUTOR_OPTIONS);
     const cancellation: ModuleCancellationContext = {
       moduleId: "module-1",
@@ -363,9 +431,9 @@ describe("Extension process Module executor", () => {
       moduleGenerationId: "generation-1",
       executionTimeoutMs: MAX_TIMER_DELAY_MS - 2,
       cancellationGraceMs: 1,
-      wallClockNow: () => 0,
     });
 
+    await executor.prepareRun!();
     await executor.execute(INPUT, RUN_CONTEXT);
 
     expect(calls.execute).toHaveBeenCalledWith(
@@ -376,16 +444,19 @@ describe("Extension process Module executor", () => {
   it.each([Number.NaN, 1.5, 8_640_000_000_000_000])(
     "rejects an invalid or overflowing wall-clock value %s",
     async (wallClockValue) => {
-      const { host } = createHostSpies();
+      const { host } = createHostSpies(
+        { schemaVersion: "dolly.module-result/1" },
+        processSnapshot("created"),
+        () => wallClockValue,
+      );
       const executor = createExtensionProcessModuleExecutor(host, {
         moduleId: "module-1",
         moduleGenerationId: "generation-1",
         executionTimeoutMs: 1,
         cancellationGraceMs: 1,
-        wallClockNow: () => wallClockValue,
       });
 
-      await expect(executor.execute(INPUT, RUN_CONTEXT)).rejects.toBeInstanceOf(RangeError);
+      expect(() => executor.prepareRun!()).toThrow(RangeError);
     },
   );
 

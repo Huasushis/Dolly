@@ -81,6 +81,7 @@ interface HarnessOptions {
   readonly terminationTimeoutMs?: number;
   readonly maxRunsPerGeneration?: number;
   readonly maxGenerations?: number;
+  readonly monotonicNow?: () => number;
   /** Unit-test executors simulate the process-isolation contract by default. */
   readonly simulateProcessIsolation?: boolean;
   readonly declaredExternalEffects?:
@@ -271,7 +272,7 @@ function createHarness(options: HarnessOptions) {
         : submissionRecords.get(runId),
     commits,
     nextModuleGenerationId: () => `generation-${++generation}`,
-    monotonicNow: () => 1,
+    monotonicNow: options.monotonicNow ?? (() => 1),
     createExecutor,
     classifyFailure,
     ...(options.declaredExternalEffects === null
@@ -965,6 +966,149 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     await harness.runtime.stop();
   });
 
+  it("releases a Host Run admission when the mailbox has no durable input", async () => {
+    const prepareRun = vi.fn(() => ({ status: "ready" as const }));
+    const releaseRunAdmission = vi.fn();
+    const harness = await startedHarness({
+      createExecutor: () => ({
+        prepareRun,
+        releaseRunAdmission,
+        execute: async () => ({ schemaVersion: "dolly.module-result/1" }),
+      }),
+    });
+
+    await expect(harness.runtime.tick()).resolves.toMatchObject({ status: "committed" });
+    await expect(harness.runtime.tick()).resolves.toEqual({ status: "idle" });
+    expect(prepareRun).toHaveBeenCalledTimes(2);
+    expect(releaseRunAdmission).toHaveBeenCalledOnce();
+    await harness.runtime.stop();
+  });
+
+  it("releases a Host Run admission when Claim acquisition fails before ownership", async () => {
+    const releaseRunAdmission = vi.fn();
+    const execute = vi.fn(async () => ({ schemaVersion: "dolly.module-result/1" as const }));
+    const harness = await startedHarness({
+      wrapDeliveries: (deliveries) => ({
+        ...readAndClaimDeliveries(deliveries),
+        claim: () => {
+          throw new Error("claim rejected before persistence");
+        },
+      }),
+      createExecutor: () => ({
+        prepareRun: () => ({ status: "ready" as const }),
+        releaseRunAdmission,
+        execute,
+      }),
+    });
+
+    await expect(harness.runtime.tick()).rejects.toMatchObject({ code: "RUNTIME_CLAIM_FAILED" });
+    expect(releaseRunAdmission).toHaveBeenCalledOnce();
+    expect(execute).not.toHaveBeenCalled();
+    expect(harness.deliveries.listActiveClaims()).toEqual([]);
+    await harness.runtime.stop();
+  });
+
+  it("releases its Host admission and NACKs invalid claimed input without executing", async () => {
+    const releaseRunAdmission = vi.fn();
+    const execute = vi.fn(async () => ({ schemaVersion: "dolly.module-result/1" as const }));
+    const harness = await startedHarness({
+      wrapDeliveries: (deliveries) => ({
+        ...readAndClaimDeliveries(deliveries),
+        claim: (request) => {
+          const claim = deliveries.claim(request);
+          if (claim === null) return null;
+          return {
+            ...claim,
+            blockGroups: claim.blockGroups.map((group) => ({
+              ...group,
+              occurrenceCount: 1n as never,
+            })),
+          } as DeliveryClaim;
+        },
+      }),
+      createExecutor: () => ({
+        prepareRun: () => ({ status: "ready" as const }),
+        releaseRunAdmission,
+        execute,
+      }),
+    });
+
+    await expect(harness.runtime.tick()).resolves.toMatchObject({
+      status: "retry-scheduled",
+      failure: { code: "INPUT_SNAPSHOT_REJECTED", retryable: true },
+    });
+    expect(releaseRunAdmission).toHaveBeenCalledOnce();
+    expect(execute).not.toHaveBeenCalled();
+    expect(harness.releaseDeliveryClaim).not.toHaveBeenCalled();
+    expect(harness.negativelyAcknowledgeDeliveryClaim).toHaveBeenCalledOnce();
+    await harness.runtime.stop();
+  });
+
+  it("releases an assigned Host admission when the actor clock fails before execution", async () => {
+    let clockReads = 0;
+    const releaseRunAdmission = vi.fn();
+    const execute = vi.fn(async () => ({ schemaVersion: "dolly.module-result/1" as const }));
+    const harness = await startedHarness({
+      monotonicNow: () => {
+        clockReads += 1;
+        if (clockReads === 4) throw new Error("actor clock unavailable");
+        return clockReads;
+      },
+      createExecutor: () => ({
+        prepareRun: () => ({ status: "ready" as const }),
+        releaseRunAdmission,
+        execute,
+      }),
+    });
+
+    await expect(harness.runtime.tick()).resolves.toMatchObject({
+      status: "retry-scheduled",
+      failure: { code: "ACTOR_FAILED", retryable: true },
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(releaseRunAdmission).toHaveBeenCalledOnce();
+    expect(harness.negativelyAcknowledgeDeliveryClaim).toHaveBeenCalledOnce();
+    await harness.runtime.stop();
+  });
+
+  it("does not mislabel a failed pre-execution admission release as an unknown NACK", async () => {
+    const terminate = vi.fn().mockResolvedValue(undefined);
+    const execute = vi.fn(async () => ({ schemaVersion: "dolly.module-result/1" as const }));
+    const harness = await startedHarness({
+      wrapDeliveries: (deliveries) => ({
+        ...readAndClaimDeliveries(deliveries),
+        claim: (request) => {
+          const claim = deliveries.claim(request);
+          if (claim === null) return null;
+          return {
+            ...claim,
+            blockGroups: claim.blockGroups.map((group) => ({
+              ...group,
+              occurrenceCount: 1n as never,
+            })),
+          } as DeliveryClaim;
+        },
+      }),
+      createExecutor: () => ({
+        prepareRun: () => ({ status: "ready" as const }),
+        releaseRunAdmission: () => {
+          throw new Error("Host admission ownership became unavailable");
+        },
+        execute,
+        terminate,
+      }),
+    });
+
+    await expect(harness.runtime.tick()).resolves.toMatchObject({
+      status: "retry-scheduled",
+      failure: { code: "INPUT_SNAPSHOT_REJECTED", retryable: true },
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(terminate).toHaveBeenCalledOnce();
+    expect(harness.negativelyAcknowledgeDeliveryClaim).toHaveBeenCalledOnce();
+    await expect(harness.runtime.stop()).resolves.toBeUndefined();
+  });
+
   it("retains observed commit proof when later journal reads fail", async () => {
     for (const successfulRecoveryReads of [0, 1]) {
       const harness = await startedHarness({
@@ -1148,6 +1292,141 @@ describe("CORE-004 reactive Module claim/run/commit coordination", () => {
     );
     expect(classifyFailure).not.toHaveBeenCalled();
     await harness.runtime.stop();
+  });
+
+  it("releases an unexecuted Claim when persistence recovery outlives its Run admission", async () => {
+    let persistenceAvailable = false;
+    let monotonicNow = 1;
+    const execute = vi.fn(async () => ({
+      schemaVersion: "dolly.module-result/1" as const,
+    }));
+    const prepareRun = vi.fn(() => ({ status: "ready" as const }));
+    const releaseRunAdmission = vi.fn();
+    const harness = await startedHarness({
+      executionTimeoutMs: 1_000,
+      monotonicNow: () => monotonicNow,
+      createExecutor: () => ({ execute, prepareRun, releaseRunAdmission }),
+    });
+    harness.deliveries.setMutationObserver(() => {
+      if (!persistenceAvailable) throw new Error("simulated persistence failure");
+    });
+
+    const unconfirmed = await harness.runtime.tick();
+    expect(unconfirmed).toMatchObject({
+      status: "recovery-required",
+      reason: "claim-persistence-unconfirmed",
+      attempt: 1,
+    });
+    if (unconfirmed.status !== "recovery-required") {
+      throw new Error("expected Claim persistence recovery");
+    }
+    expect(execute).not.toHaveBeenCalled();
+
+    monotonicNow = 1_001;
+    persistenceAvailable = true;
+    const released = await harness.runtime.recover();
+    expect(released).toMatchObject({
+      status: "run-admission-released",
+      reason: "expired-before-execution",
+      moduleJobId: unconfirmed.moduleJobId,
+      runId: unconfirmed.runId,
+      attempt: 1,
+    });
+    if (released.status !== "run-admission-released") {
+      throw new Error("expected the stale Run admission to release its Claim");
+    }
+    expect(execute).not.toHaveBeenCalled();
+    expect(releaseRunAdmission).toHaveBeenCalledOnce();
+    expect(harness.negativelyAcknowledgeDeliveryClaim).not.toHaveBeenCalled();
+    expect(harness.releaseDeliveryClaim).toHaveBeenCalledOnce();
+    expect(harness.deliveries.inspectClaim(released)).toMatchObject({ status: "released" });
+    expect(harness.submissionRecords.get(released.runId)).toBeUndefined();
+    expect(harness.deliveries.inspectPending("worker", ["input"]).pendingCount).toBe(1);
+    await harness.runtime.stop();
+  });
+
+  it("recovers an unconfirmed stale-admission Claim release without NACK or execution", async () => {
+    let clockReads = 0;
+    const execute = vi.fn(async () => ({ schemaVersion: "dolly.module-result/1" as const }));
+    const harness = await startedHarness({
+      executionTimeoutMs: 1_000,
+      monotonicNow: () => (++clockReads === 1 ? 1 : 1_001),
+      wrapReleaseDeliveryClaim:
+        (releaseDeliveryClaim) =>
+        ((identity: Parameters<
+          ReactiveModuleRuntimeOptions["releaseDeliveryClaim"]
+        >[0]) => {
+          releaseDeliveryClaim(identity);
+          return { then: () => undefined };
+        }) as unknown as ReactiveModuleRuntimeOptions["releaseDeliveryClaim"],
+      createExecutor: () => ({
+        prepareRun: () => ({ status: "ready" as const }),
+        releaseRunAdmission: () => undefined,
+        execute,
+      }),
+    });
+
+    const unconfirmed = await harness.runtime.tick();
+    expect(unconfirmed).toMatchObject({
+      status: "recovery-required",
+      reason: "claim-release-outcome-unknown",
+    });
+    if (unconfirmed.status !== "recovery-required") {
+      throw new Error("expected release recovery");
+    }
+    expect(execute).not.toHaveBeenCalled();
+    expect(harness.negativelyAcknowledgeDeliveryClaim).not.toHaveBeenCalled();
+    expect(harness.deliveries.inspectClaim(unconfirmed).status).toBe("released");
+
+    await expect(harness.runtime.recover()).resolves.toMatchObject({
+      moduleJobId: unconfirmed.moduleJobId,
+      claimToken: unconfirmed.claimToken,
+      runId: unconfirmed.runId,
+      attempt: unconfirmed.attempt,
+      moduleGenerationId: unconfirmed.moduleGenerationId,
+      status: "run-admission-released",
+      reason: "expired-before-execution",
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(harness.releaseDeliveryClaim).toHaveBeenCalledOnce();
+    await harness.runtime.stop();
+  });
+
+  it("charges Claim and submission persistence time to the admitted execution timeout", async () => {
+    vi.useFakeTimers();
+    let monotonicNow = 0;
+    const execution = deferred<ReactiveModuleResult>();
+    const cancel = vi.fn();
+    const harness = await startedHarness({
+      executionTimeoutMs: 100,
+      cancellationGraceMs: 50,
+      monotonicNow: () => monotonicNow,
+      wrapPersistModuleSubmission:
+        (persistModuleSubmission) => (request) => {
+          persistModuleSubmission(request);
+          monotonicNow = 60;
+        },
+      createExecutor: () => ({
+        execute: () => execution.promise,
+        cancel,
+      }),
+    });
+
+    try {
+      const tick = harness.runtime.tick();
+      await vi.advanceTimersByTimeAsync(39);
+      expect(cancel).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(cancel).toHaveBeenCalledOnce();
+      execution.resolve({ schemaVersion: "dolly.module-result/1" });
+      await expect(tick).resolves.toMatchObject({
+        status: "retry-scheduled",
+        failure: { code: "MODULE_TIMED_OUT", retryable: true },
+      });
+      await harness.runtime.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not send a Run when Claim persistence recovers without an exact submission record", async () => {

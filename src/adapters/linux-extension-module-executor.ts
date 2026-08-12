@@ -347,9 +347,6 @@ export function createLinuxExtensionModuleExecutor(
     const session = createExtensionProcessLinuxProtocolSession(host, process, {
       executionTimeoutMs: options.executionTimeoutMs,
       cancellationGraceMs: options.cancellationGraceMs,
-      ...(options.host.wallClockNow === undefined
-        ? {}
-        : { wallClockNow: options.host.wallClockNow }),
     });
     try {
       options.configureHost?.(host, process);

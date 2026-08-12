@@ -390,6 +390,7 @@ export interface SchedulerModuleCounters {
   readonly outputBackpressured: number;
   readonly deadLettered: number;
   readonly cancelled: number;
+  readonly runAdmissionReleased: number;
   readonly recoveryRequired: number;
   readonly idleTicks: number;
   readonly backpressureBlocked: number;
@@ -515,6 +516,7 @@ interface MutableCounters {
   outputBackpressured: number;
   deadLettered: number;
   cancelled: number;
+  runAdmissionReleased: number;
   recoveryRequired: number;
   idleTicks: number;
   backpressureBlocked: number;
@@ -626,6 +628,7 @@ const RECOVERY_REASONS = new Set([
   "external-effect-outcome-unknown",
   "external-effect-retry-safety-unproven",
   "failure-policy-unavailable",
+  "claim-release-outcome-unknown",
   "nack-outcome-unknown",
   "submission-persistence-unconfirmed",
 ]);
@@ -683,6 +686,12 @@ function validateRecoveryResult(
       if (
         hasExactlyProperties(candidate, [...RECOVERY_IDENTITY_FIELDS, "status", "reason"]) &&
         candidate.reason === "shutdown"
+      ) return candidate as unknown as ReactiveModuleRecoveryResult;
+      break;
+    case "run-admission-released":
+      if (
+        hasExactlyProperties(candidate, [...RECOVERY_IDENTITY_FIELDS, "status", "reason"]) &&
+        candidate.reason === "expired-before-execution"
       ) return candidate as unknown as ReactiveModuleRecoveryResult;
       break;
     case "output-backpressured":
@@ -755,6 +764,7 @@ function newCounters(): MutableCounters {
     outputBackpressured: 0,
     deadLettered: 0,
     cancelled: 0,
+    runAdmissionReleased: 0,
     recoveryRequired: 0,
     idleTicks: 0,
     backpressureBlocked: 0,
@@ -2094,6 +2104,15 @@ export class ModuleScheduler {
         return;
       case "cancelled":
         entry.counters.cancelled += 1;
+        return;
+      case "run-admission-released":
+        // The Delivery returned to pending without incrementing its failure
+        // count. Apply Scheduler backoff so a persistently slow store cannot
+        // create a zero-delay re-Claim loop.
+        entry.counters.runAdmissionReleased += 1;
+        entry.lastFailureAt = now;
+        entry.retryCount += 1;
+        this.#scheduleRetry(entry, now);
         return;
       case "recovery-required":
         // Section 14: an unknown outcome keeps its exact Claim. The scheduler

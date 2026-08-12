@@ -77,6 +77,7 @@ export type ExtensionProcessHostErrorCode =
   | "EXTENSION_PROCESS_PROTOCOL_INCOMPATIBLE"
   | "EXTENSION_PROCESS_PROTOCOL_VIOLATION"
   | "EXTENSION_QUOTA_EXCEEDED"
+  | "EXTENSION_RUN_ADMISSION_EXPIRED"
   | "EXTENSION_DEADLINE_EXCEEDED"
   | "EXTENSION_RESPONSE_TIMEOUT"
   | "EXTENSION_PROCESS_EXITED"
@@ -392,11 +393,36 @@ export interface ExtensionExecuteInvocation {
   readonly moduleJobId: string;
   readonly runId: string;
   readonly attempt: number;
-  readonly deadline: string;
+  /**
+   * A Host-owned admission fixes the deadline before Core acquires durable
+   * input. Direct protocol tests may still supply a deadline without one;
+   * product adapters use the admission path.
+   */
+  readonly admission?: ExtensionProcessRunAdmission;
+  readonly deadline?: string;
   readonly responseTimeoutMs: number;
   readonly hasMore: boolean;
   readonly input: JsonValue;
 }
+
+export interface ExtensionProcessRunAdmission {
+  readonly moduleGenerationId: string;
+  readonly processGenerationId: string;
+  readonly deadline: string;
+}
+
+export type ExtensionProcessRunAdmissionResult =
+  | {
+      readonly status: "ready";
+      readonly admission: ExtensionProcessRunAdmission;
+    }
+  | {
+      readonly status: "rotation-required";
+      readonly reason:
+        | "capability-revoked"
+        | "capability-expiry"
+        | "capability-invocation-capacity";
+    };
 
 export type ExtensionProcessHostState =
   | "created"
@@ -814,6 +840,7 @@ export class ExtensionProcessHost {
   #exitCleanupPromise?: Promise<void>;
   #activeRun?: ActiveRun;
   #activeCapabilityRequests = 0;
+  #preparedRunAdmission?: ExtensionProcessRunAdmission;
 
   constructor(options: ExtensionProcessHostOptions | AttachedExtensionProcessHostOptions) {
     this.#decision = options.isolationPolicy.resolve(options.isolation, options.trust);
@@ -938,6 +965,79 @@ export class ExtensionProcessHost {
     return handle;
   }
 
+  /**
+   * Reserves one immutable deadline and enough worst-case capability quota for
+   * the next Run. Repeated preparation is idempotent until the admission is
+   * consumed or explicitly released.
+   */
+  prepareRun(executionTimeoutMs: number): ExtensionProcessRunAdmissionResult {
+    if (this.#state !== "ready") {
+      throw new ExtensionProcessHostError(
+        "EXTENSION_STATE_INVALID",
+        "Extension process is not ready for Run admission",
+      );
+    }
+    assertTimerDelay(
+      executionTimeoutMs,
+      "executionTimeoutMs",
+      "EXTENSION_INVOCATION_INVALID",
+    );
+    const existing = this.#preparedRunAdmission;
+    if (existing !== undefined) {
+      const now = this.#wallClockNow();
+      if (Number.isSafeInteger(now) && Date.parse(existing.deadline) > now) {
+        return deepFreeze({ status: "ready" as const, admission: existing });
+      }
+      this.#preparedRunAdmission = undefined;
+    }
+    const now = this.#wallClockNow();
+    const deadlineMs = now + executionTimeoutMs;
+    if (!Number.isSafeInteger(now) || !Number.isSafeInteger(deadlineMs)) {
+      throw new ExtensionProcessHostError(
+        "EXTENSION_INVOCATION_INVALID",
+        "Run admission clock is outside the supported integer range",
+      );
+    }
+    let deadline: string;
+    try {
+      deadline = new Date(deadlineMs).toISOString();
+    } catch {
+      throw new ExtensionProcessHostError(
+        "EXTENSION_INVOCATION_INVALID",
+        "Run admission deadline is outside the supported date range",
+      );
+    }
+    const capacity = this.#capabilitySession.inspectRunCapacity(deadline);
+    if (capacity.status === "rotation-required") {
+      const reason: Extract<
+        ExtensionProcessRunAdmissionResult,
+        { readonly status: "rotation-required" }
+      >["reason"] = capacity.reason === "capability-expiry-insufficient"
+        ? "capability-expiry"
+        : capacity.reason === "capability-quota-insufficient"
+          ? "capability-invocation-capacity"
+          : "capability-revoked";
+      return deepFreeze({ status: "rotation-required" as const, reason });
+    }
+    const admission = deepFreeze({
+      moduleGenerationId: this.#moduleGenerationId,
+      processGenerationId: this.#processGenerationId,
+      deadline: capacity.deadline,
+    });
+    this.#preparedRunAdmission = admission;
+    return deepFreeze({ status: "ready" as const, admission });
+  }
+
+  releaseRunAdmission(admission: ExtensionProcessRunAdmission): void {
+    if (this.#preparedRunAdmission !== admission) {
+      throw new ExtensionProcessHostError(
+        "EXTENSION_INVOCATION_INVALID",
+        "Run admission does not belong to this Extension process",
+      );
+    }
+    this.#preparedRunAdmission = undefined;
+  }
+
   async start(): Promise<ExtensionProcessHostSnapshot> {
     if (this.#state !== "created") {
       throw new ExtensionProcessHostError(
@@ -1028,12 +1128,39 @@ export class ExtensionProcessHost {
       "responseTimeoutMs",
       "EXTENSION_INVOCATION_INVALID",
     );
-    const deadlineMs = Date.parse(invocation.deadline);
+    let deadline = invocation.deadline;
+    if (invocation.admission === undefined && this.#preparedRunAdmission !== undefined) {
+      throw new ExtensionProcessHostError(
+        "EXTENSION_INVOCATION_INVALID",
+        "A prepared Run admission cannot be bypassed by a direct deadline",
+      );
+    }
+    if (invocation.admission !== undefined) {
+      if (deadline !== undefined) {
+        throw new ExtensionProcessHostError(
+          "EXTENSION_INVOCATION_INVALID",
+          "Prepared execution cannot override its admitted deadline",
+        );
+      }
+      if (
+        this.#preparedRunAdmission !== invocation.admission ||
+        invocation.admission.moduleGenerationId !== this.#moduleGenerationId ||
+        invocation.admission.processGenerationId !== this.#processGenerationId
+      ) {
+        throw new ExtensionProcessHostError(
+          "EXTENSION_INVOCATION_INVALID",
+          "Run admission does not match this Extension process",
+        );
+      }
+      deadline = invocation.admission.deadline;
+      this.#preparedRunAdmission = undefined;
+    }
+    const deadlineMs = typeof deadline === "string" ? Date.parse(deadline) : Number.NaN;
     const now = this.#wallClockNow();
     if (
-      typeof invocation.deadline !== "string" ||
+      typeof deadline !== "string" ||
       !Number.isFinite(deadlineMs) ||
-      new Date(deadlineMs).toISOString() !== invocation.deadline
+      new Date(deadlineMs).toISOString() !== deadline
     ) {
       throw new ExtensionProcessHostError(
         "EXTENSION_INVOCATION_INVALID",
@@ -1042,7 +1169,9 @@ export class ExtensionProcessHost {
     }
     if (!Number.isFinite(now) || deadlineMs <= now) {
       throw new ExtensionProcessHostError(
-        "EXTENSION_DEADLINE_EXCEEDED",
+        invocation.admission === undefined
+          ? "EXTENSION_DEADLINE_EXCEEDED"
+          : "EXTENSION_RUN_ADMISSION_EXPIRED",
         "Extension execution deadline has already passed",
       );
     }
@@ -1076,7 +1205,7 @@ export class ExtensionProcessHost {
           moduleJobId: invocation.moduleJobId,
           runId: invocation.runId,
           attempt: invocation.attempt,
-          deadline: invocation.deadline,
+          deadline,
           hasMore: invocation.hasMore,
           input,
         },
@@ -1087,7 +1216,7 @@ export class ExtensionProcessHost {
             moduleJobId: invocation.moduleJobId,
             runId: invocation.runId,
             attempt: invocation.attempt,
-            deadline: invocation.deadline,
+            deadline,
             requestId: id,
             ...(effectIdentity === undefined ? {} : { effectIdentity }),
             acceptingCapabilities: true,
@@ -1097,6 +1226,13 @@ export class ExtensionProcessHost {
         },
       );
       const result = this.#validateExecuteResult(response, invocation.runId);
+      const completedAt = this.#wallClockNow();
+      if (!Number.isFinite(completedAt) || completedAt >= deadlineMs) {
+        throw new ExtensionProcessHostError(
+          "EXTENSION_DEADLINE_EXCEEDED",
+          "Extension execution result arrived after its admitted deadline",
+        );
+      }
       if (this.#state === "executing") this.#state = "ready";
       return result;
     } catch (error) {
@@ -1199,6 +1335,7 @@ export class ExtensionProcessHost {
    */
   closeCapabilitySession(): Promise<void> {
     if (this.#capabilityClosePromise) return this.#capabilityClosePromise;
+    this.#preparedRunAdmission = undefined;
     const active = this.#activeRun;
     if (active) active.acceptingCapabilities = false;
     try {
@@ -1256,6 +1393,7 @@ export class ExtensionProcessHost {
 
   async #performTerminate(): Promise<ExtensionProcessHostSnapshot> {
     this.#terminationRequested = true;
+    this.#preparedRunAdmission = undefined;
     if (this.#state === "created") {
       this.#state = "stopping";
       // A host that started nothing has nothing to stop, but an attached host
@@ -1283,6 +1421,7 @@ export class ExtensionProcessHost {
 
   async #performStop(): Promise<ExtensionProcessHostSnapshot> {
     this.#terminationRequested = true;
+    this.#preparedRunAdmission = undefined;
     if (this.#state === "created") {
       this.#state = "stopping";
       this.#startForcedProcessTermination();

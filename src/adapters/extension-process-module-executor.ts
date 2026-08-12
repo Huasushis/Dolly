@@ -1,12 +1,16 @@
 import type { JsonValue } from "../core/canonical-json.js";
-import type {
-  ExtensionProcessHost,
-  ExtensionProcessHostSnapshot,
+import {
+  ExtensionProcessHostError,
+  type ExtensionProcessHost,
+  type ExtensionProcessRunAdmission,
+  type ExtensionProcessHostSnapshot,
 } from "../core/extension-process-host.js";
 import {
+  ModuleExecutorRunAdmissionExpiredError,
   ModuleExecutorTerminationUnconfirmedError,
   type ModuleCancellationContext,
   type ModuleExecutor,
+  type ModuleExecutorRunPreparation,
   type ModuleRunContext,
 } from "../core/module-actor.js";
 import type { ReactiveModuleInput } from "../core/reactive-module-input.js";
@@ -22,19 +26,6 @@ function assertTimerDelay(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value <= 0 || value > MAX_TIMER_DELAY_MS) {
     throw new RangeError(`${label} must be a positive integer within the supported timer range`);
   }
-}
-
-function executionDeadline(wallClockNow: () => number, executionTimeoutMs: number): string {
-  const now = wallClockNow();
-  if (!Number.isSafeInteger(now)) {
-    throw new RangeError("wallClockNow must return milliseconds as a safe integer");
-  }
-  const deadlineMs = now + executionTimeoutMs;
-  const deadline = new Date(deadlineMs);
-  if (!Number.isSafeInteger(deadlineMs) || !Number.isFinite(deadline.getTime())) {
-    throw new RangeError("Execution deadline exceeds the supported date range");
-  }
-  return deadline.toISOString();
 }
 
 function assertSameProcessHost(
@@ -108,7 +99,6 @@ export function createExtensionProcessLinuxProtocolSession(
   options: {
     readonly executionTimeoutMs: number;
     readonly cancellationGraceMs: number;
-    readonly wallClockNow?: () => number;
   },
 ): LinuxModuleProtocolSession {
   const initialSnapshot = host.snapshot;
@@ -123,11 +113,7 @@ export function createExtensionProcessLinuxProtocolSession(
     );
   }
   const responseTimeoutMs = executionTimeoutMs + cancellationGraceMs + 1;
-  const wallClockNow = options.wallClockNow ?? Date.now;
-  if (typeof wallClockNow !== "function") {
-    throw new TypeError("wallClockNow must be a function");
-  }
-
+  let admission: ExtensionProcessRunAdmission | undefined;
   const session: LinuxModuleProtocolSession = {
     initialize: async (): Promise<void> => {
       const snapshot = await host.start();
@@ -138,16 +124,45 @@ export function createExtensionProcessLinuxProtocolSession(
         );
       }
     },
+    prepareRun: (): ModuleExecutorRunPreparation => {
+      const result = host.prepareRun(executionTimeoutMs);
+      if (result.status === "ready") admission = result.admission;
+      return result.status === "ready"
+        ? { status: "ready" }
+        : { status: "rotation-required", reason: result.reason };
+    },
+    releaseRunAdmission: (): void => {
+      if (admission === undefined) return;
+      const released = admission;
+      host.releaseRunAdmission(released);
+      admission = undefined;
+    },
     execute: async (request): Promise<ReactiveModuleResult> => {
-      const result = await host.execute({
-        moduleJobId: request.moduleJobId,
-        runId: request.runId,
-        attempt: request.attempt,
-        deadline: executionDeadline(wallClockNow, executionTimeoutMs),
-        responseTimeoutMs,
-        hasMore: request.hasMore,
-        input: request.input as unknown as JsonValue,
-      });
+      const prepared = admission;
+      if (prepared === undefined) {
+        throw new Error("Extension process execution requires a prepared Run admission");
+      }
+      admission = undefined;
+      let result;
+      try {
+        result = await host.execute({
+          moduleJobId: request.moduleJobId,
+          runId: request.runId,
+          attempt: request.attempt,
+          admission: prepared,
+          responseTimeoutMs,
+          hasMore: request.hasMore,
+          input: request.input as unknown as JsonValue,
+        });
+      } catch (error) {
+        if (
+          error instanceof ExtensionProcessHostError &&
+          error.code === "EXTENSION_RUN_ADMISSION_EXPIRED"
+        ) {
+          throw new ModuleExecutorRunAdmissionExpiredError();
+        }
+        throw error;
+      }
       return result as unknown as ReactiveModuleResult;
     },
     cancel: async (runId, reason): Promise<void> => {
@@ -171,7 +186,6 @@ export function createExtensionProcessModuleExecutor(
     readonly moduleGenerationId: string;
     readonly executionTimeoutMs: number;
     readonly cancellationGraceMs: number;
-    readonly wallClockNow?: () => number;
   },
 ): ModuleExecutor<ReactiveModuleInput, ReactiveModuleResult> {
   const initialSnapshot = host.snapshot;
@@ -196,31 +210,56 @@ export function createExtensionProcessModuleExecutor(
     );
   }
   const responseTimeoutMs = executionTimeoutMs + cancellationGraceMs + 1;
-  const wallClockNow = options.wallClockNow ?? Date.now;
-  if (typeof wallClockNow !== "function") {
-    throw new TypeError("wallClockNow must be a function");
-  }
-
+  let admission: ExtensionProcessRunAdmission | undefined;
   return Object.freeze({
     isolation: "process" as const,
     start: async (): Promise<void> => {
       const snapshot = await host.start();
       assertSameProcessHost(snapshot, initialSnapshot, "ready");
     },
+    prepareRun: (): ModuleExecutorRunPreparation => {
+      const result = host.prepareRun(executionTimeoutMs);
+      if (result.status === "ready") admission = result.admission;
+      return result.status === "ready"
+        ? { status: "ready" }
+        : { status: "rotation-required", reason: result.reason };
+    },
+    releaseRunAdmission: (): void => {
+      if (admission === undefined) return;
+      const released = admission;
+      host.releaseRunAdmission(released);
+      admission = undefined;
+    },
     execute: async (
       input: ReactiveModuleInput,
       context: ModuleRunContext,
     ): Promise<ReactiveModuleResult> => {
       assertContextMatchesModuleGeneration(context, initialSnapshot);
-      const result = await host.execute({
-        moduleJobId: context.moduleJobId,
-        runId: context.runId,
-        attempt: context.attempt,
-        deadline: executionDeadline(wallClockNow, executionTimeoutMs),
-        responseTimeoutMs,
-        hasMore: input.hasMore,
-        input: input as unknown as JsonValue,
-      });
+      const prepared = admission;
+      if (prepared === undefined) {
+        throw new Error("Extension process execution requires a prepared Run admission");
+      }
+      admission = undefined;
+      let result;
+      try {
+        result = await host.execute({
+          moduleJobId: context.moduleJobId,
+          runId: context.runId,
+          attempt: context.attempt,
+          admission: prepared,
+          responseTimeoutMs,
+          hasMore: input.hasMore,
+          input: input as unknown as JsonValue,
+        });
+      } catch (error) {
+        if (
+          error instanceof ExtensionProcessHostError &&
+          error.code === "EXTENSION_RUN_ADMISSION_EXPIRED"
+        ) {
+          throw new ModuleExecutorRunAdmissionExpiredError();
+        }
+        throw error;
+      }
       return result as unknown as ReactiveModuleResult;
     },
     cancel: async (context: ModuleCancellationContext): Promise<void> => {

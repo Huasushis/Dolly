@@ -134,6 +134,7 @@ describe("Scheduler inline-Media Agent Extension preflight", () => {
     let pid: number | undefined;
     try {
       await executor.start?.();
+      await executor.prepareRun?.();
       pid = host.snapshot.pid;
       expect(pid).toBeTypeOf("number");
       const input: ReactiveModuleInput = {

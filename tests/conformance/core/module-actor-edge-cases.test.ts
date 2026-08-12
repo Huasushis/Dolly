@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ModuleActor,
   ModuleActorError,
+  ModuleExecutorRunAdmissionExpiredError,
   ModuleExecutorTerminationUnconfirmedError,
   ModuleExecutorTerminatedError,
   type ModuleActorOptions,
@@ -1140,6 +1141,188 @@ describe("ModuleActor phase, mailbox, and lifecycle edge cases", () => {
     })).resolves.toMatchObject({ status: "succeeded", output: "second" });
     await actor.stop();
     expect(events.at(-1)).toBe("terminate:generation-2");
+  });
+
+  it("rotates an idle process before Claim ownership when its Host cannot admit a Run", async () => {
+    const events: string[] = [];
+    const actor = await startedActor(options<string, string>({
+      maxRunsPerGeneration: 10,
+      requireProcessIsolation: true,
+      initializationTimeoutMs: 1_000,
+      terminationTimeoutMs: 1_000,
+      createExecutor: (moduleGenerationId) => ({
+        isolation: "process" as const,
+        start: async () => {
+          events.push(`start:${moduleGenerationId}`);
+        },
+        prepareRun: () => {
+          events.push(`prepare:${moduleGenerationId}`);
+          return moduleGenerationId === "generation-1"
+            ? { status: "rotation-required" as const, reason: "capability-invocation-capacity" as const }
+            : { status: "ready" as const };
+        },
+        releaseRunAdmission: () => undefined,
+        execute: async (input) => input,
+        terminate: async () => {
+          events.push(`terminate:${moduleGenerationId}`);
+        },
+      }),
+      acceptResult: () => undefined,
+    }));
+
+    await expect(actor.prepareNextRun()).resolves.toBe("generation-2");
+    expect(events).toEqual([
+      "start:generation-1",
+      "prepare:generation-1",
+      "terminate:generation-1",
+      "start:generation-2",
+      "prepare:generation-2",
+    ]);
+    await expect(actor.submit({
+      moduleGenerationId: "generation-2",
+      moduleJobId: "module-job-1",
+      runId: "run-1",
+      attempt: 1,
+      input: "after-rotation",
+    })).resolves.toMatchObject({ status: "succeeded", output: "after-rotation" });
+    await actor.stop();
+  });
+
+  it("binds exactly one prepared Host admission to exactly one submitted Run", async () => {
+    const execution = deferred<string>();
+    const prepareRun = vi.fn(() => ({ status: "ready" as const }));
+    const releaseRunAdmission = vi.fn();
+    const actor = await startedActor(options<string, string>({
+      createExecutor: () => ({
+        prepareRun,
+        releaseRunAdmission,
+        execute: () => execution.promise,
+      }),
+      acceptResult: () => undefined,
+    }));
+
+    await expect(actor.prepareNextRun()).resolves.toBe("generation-1");
+    const first = actor.submit({
+      moduleGenerationId: "generation-1",
+      moduleJobId: "module-job-1",
+      runId: "run-1",
+      attempt: 1,
+      input: "first",
+    });
+    await expect(actor.submit({
+      moduleGenerationId: "generation-1",
+      moduleJobId: "module-job-2",
+      runId: "run-2",
+      attempt: 1,
+      input: "second",
+    })).rejects.toMatchObject({ code: "RUN_ADMISSION_REQUIRED" });
+    await expect(actor.releasePreparedRun()).resolves.toBeUndefined();
+    expect(releaseRunAdmission).not.toHaveBeenCalled();
+    execution.resolve("done");
+    await expect(first).resolves.toMatchObject({ status: "succeeded", output: "done" });
+    expect(prepareRun).toHaveBeenCalledOnce();
+    await actor.stop();
+  });
+
+  it("reports a Host admission that expires before IPC as not executed", async () => {
+    const actor = await startedActor(options<string, string>({
+      createExecutor: () => ({
+        prepareRun: () => ({ status: "ready" as const }),
+        releaseRunAdmission: () => undefined,
+        execute: async () => {
+          throw new ModuleExecutorRunAdmissionExpiredError();
+        },
+      }),
+      acceptResult: () => undefined,
+    }));
+
+    await actor.prepareNextRun();
+    await expect(actor.submit({
+      moduleGenerationId: "generation-1",
+      moduleJobId: "module-job-1",
+      runId: "run-1",
+      attempt: 1,
+      input: "never sent",
+    })).resolves.toMatchObject({
+      status: "not-executed",
+      reason: "run-admission-expired",
+    });
+    await actor.stop();
+  });
+
+  it("does not enter Host Run admission after shutdown begins", async () => {
+    const prepareRun = vi.fn(() => ({ status: "ready" as const }));
+    const actor = await startedActor(options<string, string>({
+      requireProcessIsolation: true,
+      initializationTimeoutMs: 1_000,
+      terminationTimeoutMs: 1_000,
+      createExecutor: () => ({
+        isolation: "process" as const,
+        start: async () => undefined,
+        prepareRun,
+        releaseRunAdmission: () => undefined,
+        execute: async (input) => input,
+        terminate: async () => undefined,
+      }),
+      acceptResult: () => undefined,
+    }));
+
+    const preparation = actor.prepareNextRun();
+    const stop = actor.stop({ cancellationGraceMs: 100 });
+    await expect(preparation).rejects.toMatchObject({ code: "ACTOR_STOPPING" });
+    await expect(stop).resolves.toBeUndefined();
+    expect(prepareRun).not.toHaveBeenCalled();
+  });
+
+  it("terminates a process whose Host Run admission throws", async () => {
+    const terminate = vi.fn().mockResolvedValue(undefined);
+    const actor = await startedActor(options<string, string>({
+      requireProcessIsolation: true,
+      initializationTimeoutMs: 1_000,
+      terminationTimeoutMs: 1_000,
+      createExecutor: () => ({
+        isolation: "process" as const,
+        start: async () => undefined,
+        prepareRun: () => {
+          throw new Error("private admission failure");
+        },
+        releaseRunAdmission: () => undefined,
+        execute: async (input) => input,
+        terminate,
+      }),
+      acceptResult: () => undefined,
+    }));
+
+    await expect(actor.prepareNextRun()).rejects.toMatchObject({ code: "ACTOR_FAILED" });
+    expect(terminate).toHaveBeenCalledOnce();
+    expect(actor.state).toBe("failed");
+    await actor.stop();
+  });
+
+  it("terminates a process whose Host Run admission cannot be released", async () => {
+    const terminate = vi.fn().mockResolvedValue(undefined);
+    const actor = await startedActor(options<string, string>({
+      requireProcessIsolation: true,
+      initializationTimeoutMs: 1_000,
+      terminationTimeoutMs: 1_000,
+      createExecutor: () => ({
+        isolation: "process" as const,
+        start: async () => undefined,
+        prepareRun: () => ({ status: "ready" as const }),
+        releaseRunAdmission: () => {
+          throw new Error("private release failure");
+        },
+        execute: async (input) => input,
+        terminate,
+      }),
+      acceptResult: () => undefined,
+    }));
+
+    await expect(actor.prepareNextRun()).resolves.toBe("generation-1");
+    await expect(actor.releasePreparedRun()).rejects.toMatchObject({ code: "ACTOR_FAILED" });
+    expect(terminate).toHaveBeenCalledOnce();
+    expect(actor.state).toBe("failed");
+    await actor.stop();
   });
 
   it.each(["return", "throw"] as const)(

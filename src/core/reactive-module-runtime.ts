@@ -99,6 +99,10 @@ export type ReactiveModuleTickResult =
       readonly reason: "shutdown";
     }>
   | MeasuredClaimResult<{
+      readonly status: "run-admission-released";
+      readonly reason: "expired-before-execution";
+    }>
+  | MeasuredClaimResult<{
       readonly status: "output-backpressured";
       readonly stage: "output-commit";
       readonly blockedConsumerIds: readonly string[];
@@ -113,6 +117,7 @@ export type ReactiveModuleTickResult =
         | "external-effect-outcome-unknown"
         | "external-effect-retry-safety-unproven"
         | "failure-policy-unavailable"
+        | "claim-release-outcome-unknown"
         | "nack-outcome-unknown"
         | "submission-persistence-unconfirmed";
     }>;
@@ -257,7 +262,7 @@ interface UnresolvedRun {
   readonly claim: DeliveryClaim;
   // `executor-termination` selects the preserve-only recovery behavior
   // described by the public recovery reason above.
-  readonly kind: "commit" | "nack" | "executor-termination";
+  readonly kind: "commit" | "nack" | "release" | "executor-termination";
   readonly output?: ReactiveModuleResult;
   readonly failure: ReactiveModuleFailure;
   /** Core has observed a durable result journal for this exact Module job. */
@@ -443,10 +448,12 @@ export class ReactiveModuleRuntime {
   readonly #externalEffectEvidence: ExternalEffectEvidenceSource | undefined;
   readonly #source: SourceIdentity;
   readonly #classifyFailure: ReactiveModuleRuntimeOptions["classifyFailure"];
+  readonly #monotonicNow: () => number;
   readonly #actor: ModuleActor<ReactiveModuleInput, ReactiveModuleResult>;
   readonly #acceptedRecords = new Map<string, ModuleResultCommitRecord>();
   readonly #attemptedOutputs = new Map<string, ReactiveModuleResult>();
   #activeClaim: DeliveryClaim | undefined;
+  #runAdmissionDeadline: { readonly runId: string; readonly monotonicAt: number } | undefined;
   /** Claim created in memory whose final persistence callback failed. */
   #claimAwaitingPersistenceConfirmation: DeliveryClaim | undefined;
   /** Claim whose exact Module submission record is not yet confirmed. */
@@ -551,6 +558,7 @@ export class ReactiveModuleRuntime {
       options.declaredExternalEffects ?? "unrestricted";
     this.#externalEffectEvidence = options.externalEffectEvidence;
     this.#classifyFailure = options.classifyFailure;
+    this.#monotonicNow = options.monotonicNow;
 
     if (options.initialDeferredCommit !== undefined) {
       this.#deferredOutputCommit = this.#restoreDeferredOutputCommit(
@@ -906,6 +914,10 @@ export class ReactiveModuleRuntime {
       });
     }
 
+    if (unresolved.kind === "release") {
+      return this.#releaseClaimForFreshRunAdmission(unresolved.claim, false);
+    }
+
     if (unresolved.kind === "commit") {
       if (!unresolved.output) {
         return deepFreeze({
@@ -977,6 +989,14 @@ export class ReactiveModuleRuntime {
     claimLimitCount: number,
     claimLimitBytes: number,
   ): Promise<ReactiveModuleTickResult> {
+    const admissionStartedAt = this.#readMonotonicNow();
+    const admissionDeadline = admissionStartedAt + this.#executionTimeoutMs;
+    if (!Number.isFinite(admissionDeadline) || admissionDeadline > Number.MAX_SAFE_INTEGER) {
+      throw new ReactiveModuleRuntimeError(
+        "RUNTIME_FAILED",
+        "Reactive Module Run admission deadline exceeded the safe integer range",
+      );
+    }
     let moduleGenerationId: string;
     try {
       moduleGenerationId = await this.#actor.prepareNextRun();
@@ -1006,14 +1026,37 @@ export class ReactiveModuleRuntime {
       });
     } catch (error) {
       if (error instanceof DeliveryClaimPersistenceUnconfirmedError) {
+        this.#runAdmissionDeadline = {
+          runId: error.claim.runId,
+          monotonicAt: admissionDeadline,
+        };
         return this.#requireClaimPersistenceRecovery(error.claim);
+      }
+      try {
+        await this.#actor.releasePreparedRun();
+      } catch {
+        throw new ReactiveModuleRuntimeError(
+          "RUNTIME_FAILED",
+          "Reactive Module could not release its unused Run admission",
+        );
       }
       throw new ReactiveModuleRuntimeError(
         "RUNTIME_CLAIM_FAILED",
         "Reactive Module input claim failed",
       );
     }
-    if (!claim) return { status: "idle" };
+    if (!claim) {
+      try {
+        await this.#actor.releasePreparedRun();
+      } catch {
+        throw new ReactiveModuleRuntimeError(
+          "RUNTIME_FAILED",
+          "Reactive Module could not release its unused Run admission",
+        );
+      }
+      return { status: "idle" };
+    }
+    this.#runAdmissionDeadline = { runId: claim.runId, monotonicAt: admissionDeadline };
 
     return this.#executeClaim(claim, true);
   }
@@ -1067,6 +1110,15 @@ export class ReactiveModuleRuntime {
     claim: DeliveryClaim,
   ): Promise<Exclude<ReactiveModuleTickResult, { readonly status: "idle" }>> {
     this.#activeClaim = claim;
+    let remainingBeforeInput: number | null;
+    try {
+      remainingBeforeInput = this.#remainingRunAdmissionMs(claim);
+    } catch {
+      return this.#releaseBeforeModuleExecution(claim, "MONOTONIC_CLOCK_FAILED");
+    }
+    if (remainingBeforeInput === null || remainingBeforeInput <= 0) {
+      return this.#releaseClaimForFreshRunAdmission(claim, true);
+    }
     let input: ReactiveModuleInput;
     try {
       input = buildReactiveModuleInput({
@@ -1075,27 +1127,27 @@ export class ReactiveModuleRuntime {
         hasMore: claim.hasMore,
       });
     } catch {
-      return this.#nackAfterExternalEffectEvidence(claim, {
-        stage: "actor-submission",
-        code: "INPUT_SNAPSHOT_REJECTED",
-      });
+      return this.#releaseBeforeModuleExecution(claim, "input-snapshot-invalid");
     }
     if (!this.#persistAndConfirmModuleSubmission(claim, input)) {
       return this.#requireSubmissionPersistenceRecovery(claim);
     }
     this.#claimAwaitingSubmissionPersistence = undefined;
 
+    let remainingExecutionMs: number;
+    try {
+      remainingExecutionMs = this.#remainingRunAdmissionMs(claim) ?? 0;
+    } catch {
+      return this.#releaseBeforeModuleExecution(claim, "MONOTONIC_CLOCK_FAILED");
+    }
+    if (remainingExecutionMs <= 0) {
+      return this.#releaseClaimForFreshRunAdmission(claim, true);
+    }
+
     let outcome: ModuleRunOutcome<ReactiveModuleResult>;
     let softTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
     let hardTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const completion = this.#actor.submit({
-        moduleGenerationId: claim.moduleGenerationId,
-        moduleJobId: claim.moduleJobId,
-        runId: claim.runId,
-        attempt: claim.attempt,
-        input,
-      });
       softTimeoutTimer = setTimeout(() => {
         if (!this.#acceptingOperations) return;
         try {
@@ -1103,7 +1155,7 @@ export class ReactiveModuleRuntime {
         } catch {
           // The run completed or entered result acceptance before the timer fired.
         }
-      }, this.#executionTimeoutMs);
+      }, remainingExecutionMs);
       hardTimeoutTimer = setTimeout(() => {
         if (!this.#acceptingOperations) return;
         try {
@@ -1111,7 +1163,14 @@ export class ReactiveModuleRuntime {
         } catch {
           // The run completed or was already fenced before the timer fired.
         }
-      }, this.#executionTimeoutMs + this.#cancellationGraceMs);
+      }, remainingExecutionMs + this.#cancellationGraceMs);
+      const completion = this.#actor.submit({
+        moduleGenerationId: claim.moduleGenerationId,
+        moduleJobId: claim.moduleJobId,
+        runId: claim.runId,
+        attempt: claim.attempt,
+        input,
+      });
       outcome = await completion;
     } catch (error) {
       if (
@@ -1121,11 +1180,10 @@ export class ReactiveModuleRuntime {
       ) {
         return this.#cancelledByShutdown(claim);
       }
-      return this.#nackAfterExternalEffectEvidence(claim, {
-        stage: "actor-submission",
-        code:
-          error instanceof ModuleActorError ? error.code : "ACTOR_SUBMISSION_REJECTED",
-      });
+      return this.#releaseBeforeModuleExecution(
+        claim,
+        error instanceof ModuleActorError ? error.code : "ACTOR_SUBMISSION_REJECTED",
+      );
     } finally {
       if (softTimeoutTimer) clearTimeout(softTimeoutTimer);
       if (hardTimeoutTimer) clearTimeout(hardTimeoutTimer);
@@ -1201,11 +1259,116 @@ export class ReactiveModuleRuntime {
       return this.#cancelledByShutdown(claim);
     }
 
+    if (
+      outcome.status === "not-executed" &&
+      outcome.reason === "run-admission-expired"
+    ) {
+      return this.#releaseClaimForFreshRunAdmission(claim, false);
+    }
+
     this.#clearTransient(claim.runId);
     return this.#nackAfterExternalEffectEvidence(
       claim,
       this.#failureForOutcome(outcome),
     );
+  }
+
+  async #releaseBeforeModuleExecution(
+    claim: DeliveryClaim,
+    failureCode: string,
+  ): Promise<Exclude<ReactiveModuleTickResult, { readonly status: "idle" }>> {
+    try {
+      await this.#actor.releasePreparedRun();
+    } catch {
+      // The actor fail-closes and attempts confirmed process termination. The
+      // Run was never submitted to executor.execute, so this does not make the
+      // input failure's external-effect outcome unknown.
+    }
+    // The Host admission was released before executor.execute could run, so
+    // external-effect evidence is unnecessary for this bounded local failure.
+    return this.#nack(claim, {
+      stage: "actor-submission",
+      code: failureCode === "input-snapshot-invalid"
+        ? "INPUT_SNAPSHOT_REJECTED"
+        : ID_PATTERN.test(failureCode)
+          ? failureCode
+          : "ACTOR_SUBMISSION_REJECTED",
+    });
+  }
+
+  #readMonotonicNow(): number {
+    let now: number;
+    try {
+      now = this.#monotonicNow();
+    } catch {
+      throw new ReactiveModuleRuntimeError(
+        "RUNTIME_FAILED",
+        "Reactive Module monotonic clock failed",
+      );
+    }
+    if (!Number.isFinite(now) || now < 0) {
+      throw new ReactiveModuleRuntimeError(
+        "RUNTIME_FAILED",
+        "Reactive Module monotonic clock returned an invalid value",
+      );
+    }
+    return now;
+  }
+
+  #remainingRunAdmissionMs(claim: DeliveryClaim): number | null {
+    const admission = this.#runAdmissionDeadline;
+    if (admission === undefined || admission.runId !== claim.runId) return null;
+    return Math.max(0, admission.monotonicAt - this.#readMonotonicNow());
+  }
+
+  async #releaseClaimForFreshRunAdmission(
+    claim: DeliveryClaim,
+    releaseActorAdmission: boolean,
+  ): Promise<Exclude<ReactiveModuleTickResult, { readonly status: "idle" }>> {
+    if (releaseActorAdmission) {
+      try {
+        await this.#actor.releasePreparedRun();
+      } catch {
+        // Admission release failure already fail-closes and terminates the
+        // actor. Module code was never invoked, so the exact input Claim may
+        // still be released without recording a Module failure.
+      }
+    }
+    const releaseIsPersisted = (): boolean => {
+      const descriptor = this.#deliveries.inspectClaim(claimIdentity(claim));
+      return (
+        descriptor.status === "released" &&
+        descriptor.consumerId === this.#moduleId &&
+        descriptorMatchesClaim(descriptor, claim) &&
+        this.#getModuleSubmissionRecord(claim.runId) === undefined
+      );
+    };
+    try {
+      if (!releaseIsPersisted()) {
+        const result: unknown = this.#releaseDeliveryClaim(claimIdentity(claim));
+        if (isPromiseLike(result) || !releaseIsPersisted()) {
+          throw new TypeError("Claim release was not synchronously confirmed");
+        }
+      }
+      this.#claimAwaitingPersistenceConfirmation = undefined;
+      this.#claimAwaitingSubmissionPersistence = undefined;
+      this.#unresolved = undefined;
+      this.#clearTransient(claim.runId);
+      return deepFreeze({
+        ...claimIdentity(claim),
+        status: "run-admission-released" as const,
+        reason: "expired-before-execution" as const,
+      });
+    } catch {
+      return this.#requireRecovery(claim, {
+        kind: "release",
+        failure: {
+          stage: "actor-submission",
+          code: "RUN_ADMISSION_EXPIRED_BEFORE_EXECUTION",
+        },
+        reason: "claim-release-outcome-unknown",
+      });
+    }
   }
 
   async #acceptResult(output: ReactiveModuleResult, context: ModuleRunContext): Promise<void> {
@@ -1283,7 +1446,7 @@ export class ReactiveModuleRuntime {
           knownPrepared: true,
         };
         this.#unresolved = undefined;
-        this.#activeClaim = undefined;
+        this.#clearTransient(claim.runId);
         return deepFreeze({
           ...claimIdentity(claim),
           status: "output-backpressured" as const,
@@ -1498,7 +1661,7 @@ export class ReactiveModuleRuntime {
     };
     try {
       if (releaseIsPersisted()) {
-        this.#activeClaim = undefined;
+        this.#clearTransient(claim.runId);
         return;
       }
     } catch {
@@ -1519,13 +1682,13 @@ export class ReactiveModuleRuntime {
       const result: unknown = this.#releaseDeliveryClaim(claimIdentity(claim));
       returnedPromise = isPromiseLike(result);
       if (!returnedPromise && releaseIsPersisted()) {
-        this.#activeClaim = undefined;
+        this.#clearTransient(claim.runId);
         return;
       }
     } catch {
       try {
         if (!returnedPromise && releaseIsPersisted()) {
-          this.#activeClaim = undefined;
+          this.#clearTransient(claim.runId);
           return;
         }
       } catch {
@@ -1617,7 +1780,7 @@ export class ReactiveModuleRuntime {
       const status =
         descriptor.status === "nacked" ? "retry-scheduled" : "dead-lettered";
       this.#unresolved = undefined;
-      this.#activeClaim = undefined;
+      this.#clearTransient(claim.runId);
       return deepFreeze({
         ...claimIdentity(claim),
         status,
@@ -1726,5 +1889,8 @@ export class ReactiveModuleRuntime {
     this.#acceptedRecords.delete(runId);
     this.#attemptedOutputs.delete(runId);
     if (this.#activeClaim?.runId === runId) this.#activeClaim = undefined;
+    if (this.#runAdmissionDeadline?.runId === runId) {
+      this.#runAdmissionDeadline = undefined;
+    }
   }
 }

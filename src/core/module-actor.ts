@@ -35,6 +35,16 @@ export interface ModuleRunContext {
   readonly signal: AbortSignal;
 }
 
+export type ModuleExecutorRunPreparation =
+  | { readonly status: "ready" }
+  | {
+      readonly status: "rotation-required";
+      readonly reason:
+        | "capability-revoked"
+        | "capability-expiry"
+        | "capability-invocation-capacity";
+    };
+
 export interface TerminationContext {
   readonly moduleId: string;
   readonly moduleGenerationId: string;
@@ -61,6 +71,15 @@ export interface ModuleExecutor<Input, Output> {
    * authentication and initialization after the factory has returned a handle.
    */
   start?(): Promise<void>;
+  /**
+   * Host-owned pre-Claim admission for the next Run. A rotation request has
+   * no side effects and must be handled while the actor is still idle.
+   */
+  prepareRun?():
+    | ModuleExecutorRunPreparation
+    | Promise<ModuleExecutorRunPreparation>;
+  /** Releases a prepared admission when Core found no durable input. */
+  releaseRunAdmission?(): void | Promise<void>;
   execute(input: Input, context: ModuleRunContext): Promise<Output>;
   cancel?(context: ModuleCancellationContext): void | Promise<void>;
   /**
@@ -107,6 +126,19 @@ export class ModuleExecutorTerminationUnconfirmedError extends Error {
   }
 }
 
+/**
+ * The executor throws this only when it can prove that `execute` did not send
+ * the Run to Module code because its Host-owned admission had already expired.
+ * It is deliberately distinct from an ordinary execution error: Core may
+ * release and re-Claim the input without incrementing its failure count.
+ */
+export class ModuleExecutorRunAdmissionExpiredError extends Error {
+  constructor(message = "Module Run admission expired before execution") {
+    super(message);
+    this.name = "ModuleExecutorRunAdmissionExpiredError";
+  }
+}
+
 export interface ModuleRunIdentity {
   readonly moduleId: string;
   readonly moduleGenerationId: string;
@@ -136,6 +168,10 @@ export type ModuleRunOutcome<Output> =
     })
   | (ModuleRunIdentity & {
       readonly status: "timed-out" | "fenced";
+    })
+  | (ModuleRunIdentity & {
+      readonly status: "not-executed";
+      readonly reason: "run-admission-expired";
     });
 
 export interface ModuleActiveRunStatus extends ModuleRunIdentity {
@@ -170,6 +206,7 @@ export type ModuleActorErrorCode =
   | "ACTOR_FAILED"
   | "ACTOR_BUSY"
   | "MODULE_JOB_ALREADY_ACTIVE"
+  | "RUN_ADMISSION_REQUIRED"
   | "RUN_NOT_ACTIVE"
   | "RUN_NOT_EXECUTING"
   | "RUN_LIMIT_REACHED"
@@ -289,6 +326,11 @@ function validateExecutor<Input, Output>(
       candidate.isolation !== "process" &&
       candidate.isolation !== "sandbox") ||
     (candidate.start !== undefined && typeof candidate.start !== "function") ||
+    (candidate.prepareRun !== undefined && typeof candidate.prepareRun !== "function") ||
+    (candidate.releaseRunAdmission !== undefined &&
+      typeof candidate.releaseRunAdmission !== "function") ||
+    ((candidate.prepareRun === undefined) !==
+      (candidate.releaseRunAdmission === undefined)) ||
     (candidate.cancel !== undefined && typeof candidate.cancel !== "function") ||
     (candidate.stop !== undefined && typeof candidate.stop !== "function") ||
     (candidate.terminate !== undefined && typeof candidate.terminate !== "function")
@@ -381,6 +423,7 @@ export class ModuleActor<Input, Output> {
   #hardTimeoutPromise: Promise<"module-generation-fenced"> | undefined;
   #replacementPromise: Promise<"module-generation-fenced"> | undefined;
   #idleRotationPromise: Promise<string> | undefined;
+  #runAdmissionState: "none" | "prepared" | "assigned" = "none";
   #pendingBytes = 0;
   #runsInModuleGeneration = 0;
   #pumping = false;
@@ -537,16 +580,43 @@ export class ModuleActor<Input, Output> {
         new ModuleActorError("ACTOR_BUSY", "Module actor is not idle for generation admission"),
       );
     }
-    if (this.#runsInModuleGeneration < this.#maxRunsPerGeneration) {
-      return Promise.resolve(this.#moduleGenerationId);
-    }
     const rotation = Promise.resolve()
-      .then(() => this.#rotateIdleExecutor())
+      .then(() => this.#prepareIdleExecutorRun())
       .finally(() => {
         if (this.#idleRotationPromise === rotation) this.#idleRotationPromise = undefined;
       });
     this.#idleRotationPromise = rotation;
     return rotation;
+  }
+
+  async releasePreparedRun(): Promise<void> {
+    const executor = this.#executor;
+    if (this.#runAdmissionState === "none") return;
+    if (this.#active !== undefined || this.#starting !== undefined) {
+      throw new ModuleActorError(
+        "ACTOR_BUSY",
+        "A Run admission assigned to an entering execution cannot be released",
+      );
+    }
+    if (executor?.releaseRunAdmission === undefined) {
+      this.#runAdmissionState = "none";
+      return;
+    }
+    try {
+      await executor.releaseRunAdmission();
+      this.#runAdmissionState = "none";
+    } catch {
+      const actorStateAfterReleaseFailure: ModuleActorState = this.state;
+      if (actorStateAfterReleaseFailure === "stopping" || actorStateAfterReleaseFailure === "stopped") {
+        throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+      }
+      await this.#failIdleAdmission(executor, this.#moduleGenerationId);
+      const actorStateAfterReleaseCleanup: ModuleActorState = this.state;
+      if (actorStateAfterReleaseCleanup === "stopping" || actorStateAfterReleaseCleanup === "stopped") {
+        throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+      }
+      throw new ModuleActorError("ACTOR_FAILED", "Module executor Run admission release failed");
+    }
   }
 
   submit(request: ModuleRunRequest<Input>): Promise<ModuleRunOutcome<Output>> {
@@ -561,6 +631,12 @@ export class ModuleActor<Input, Output> {
         throw new ModuleActorError(
           "MODULE_GENERATION_CONFLICT",
           `Run belongs to Module generation ${request.moduleGenerationId}, not ${this.#moduleGenerationId}`,
+        );
+      }
+      if (this.#executor?.prepareRun !== undefined && this.#runAdmissionState !== "prepared") {
+        throw new ModuleActorError(
+          "RUN_ADMISSION_REQUIRED",
+          "Module executor requires a prepared Run admission",
         );
       }
       if (!Number.isSafeInteger(request.attempt) || request.attempt <= 0) {
@@ -629,6 +705,12 @@ export class ModuleActor<Input, Output> {
           `Run belongs to Module generation ${request.moduleGenerationId}, not ${this.#moduleGenerationId}`,
         );
       }
+      if (this.#executor?.prepareRun !== undefined && this.#runAdmissionState !== "prepared") {
+        throw new ModuleActorError(
+          "RUN_ADMISSION_REQUIRED",
+          "Module executor requires a prepared Run admission",
+        );
+      }
       if (this.#liveModuleJobIds.has(request.moduleJobId)) {
         throw new ModuleActorError(
           "MODULE_JOB_ALREADY_ACTIVE",
@@ -681,6 +763,7 @@ export class ModuleActor<Input, Output> {
     });
     this.#liveModuleJobIds.add(request.moduleJobId);
     this.#liveRunIds.add(request.runId);
+    if (this.#executor?.prepareRun !== undefined) this.#runAdmissionState = "assigned";
     this.#pendingBytes += inputBytes;
     this.#pump();
     return completion;
@@ -858,7 +941,129 @@ export class ModuleActor<Input, Output> {
     }
   }
 
-  async #rotateIdleExecutor(): Promise<string> {
+  async #prepareIdleExecutorRun(): Promise<string> {
+    if (
+      this.#state !== "running" ||
+      this.#active !== undefined ||
+      this.#pending.length !== 0 ||
+      this.#starting !== undefined ||
+      this.#pumping
+    ) {
+      throw new ModuleActorError(
+        this.#state === "stopping" || this.#state === "stopped"
+          ? "ACTOR_STOPPING"
+          : "ACTOR_BUSY",
+        this.#state === "stopping" || this.#state === "stopped"
+          ? "Module actor is stopping"
+          : "Module actor is not idle for Run admission",
+      );
+    }
+    if (this.#runsInModuleGeneration >= this.#maxRunsPerGeneration) {
+      await this.#rotateIdleExecutor(false);
+    }
+    const executor = this.#executor;
+    if (executor === undefined) {
+      this.#state = "failed";
+      throw new ModuleActorError("ACTOR_FAILED", "Module actor has no executor to prepare");
+    }
+    let preparation: ModuleExecutorRunPreparation;
+    try {
+      preparation = executor.prepareRun === undefined
+        ? { status: "ready" as const }
+        : await executor.prepareRun();
+    } catch {
+      const actorStateAfterPreparationFailure: ModuleActorState = this.state;
+      if (actorStateAfterPreparationFailure === "stopping" || actorStateAfterPreparationFailure === "stopped") {
+        throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+      }
+      await this.#failIdleAdmission(executor, this.#moduleGenerationId);
+      const actorStateAfterPreparationCleanup: ModuleActorState = this.state;
+      if (actorStateAfterPreparationCleanup === "stopping" || actorStateAfterPreparationCleanup === "stopped") {
+        throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+      }
+      throw new ModuleActorError("ACTOR_FAILED", "Module executor Run admission failed");
+    }
+    const actorStateAfterPreparation: ModuleActorState = this.state;
+    if (actorStateAfterPreparation === "stopping" || actorStateAfterPreparation === "stopped") {
+      throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+    }
+    if (preparation.status === "ready") {
+      this.#runAdmissionState = executor.prepareRun === undefined ? "none" : "prepared";
+      return this.#moduleGenerationId;
+    }
+    if (
+      preparation.status !== "rotation-required" ||
+      (preparation.reason !== "capability-revoked" &&
+        preparation.reason !== "capability-expiry" &&
+        preparation.reason !== "capability-invocation-capacity")
+    ) {
+      await this.#failIdleAdmission(executor, this.#moduleGenerationId);
+      const actorStateAfterInvalidPreparation: ModuleActorState = this.state;
+      if (actorStateAfterInvalidPreparation === "stopping" || actorStateAfterInvalidPreparation === "stopped") {
+        throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+      }
+      throw new ModuleActorError("ACTOR_FAILED", "Module executor returned an invalid Run admission");
+    }
+    await this.#rotateIdleExecutor(true);
+    const replacement = this.#executor;
+    if (replacement === undefined) {
+      this.#state = "failed";
+      throw new ModuleActorError("ACTOR_FAILED", "Replacement executor is unavailable");
+    }
+    let replacementPreparation: ModuleExecutorRunPreparation;
+    try {
+      replacementPreparation = replacement.prepareRun === undefined
+        ? { status: "ready" as const }
+        : await replacement.prepareRun();
+    } catch {
+      const actorStateAfterReplacementFailure: ModuleActorState = this.state;
+      if (actorStateAfterReplacementFailure === "stopping" || actorStateAfterReplacementFailure === "stopped") {
+        throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+      }
+      await this.#failIdleAdmission(replacement, this.#moduleGenerationId);
+      const actorStateAfterReplacementCleanup: ModuleActorState = this.state;
+      if (actorStateAfterReplacementCleanup === "stopping" || actorStateAfterReplacementCleanup === "stopped") {
+        throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+      }
+      throw new ModuleActorError("ACTOR_FAILED", "Replacement Run admission failed");
+    }
+    const actorStateAfterReplacement: ModuleActorState = this.state;
+    if (actorStateAfterReplacement === "stopping" || actorStateAfterReplacement === "stopped") {
+      throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+    }
+    if (replacementPreparation.status === "ready") {
+      this.#runAdmissionState = replacement.prepareRun === undefined ? "none" : "prepared";
+      return this.#moduleGenerationId;
+    }
+    await this.#failIdleAdmission(replacement, this.#moduleGenerationId);
+    const actorStateAfterFreshRefusal: ModuleActorState = this.state;
+    if (actorStateAfterFreshRefusal === "stopping" || actorStateAfterFreshRefusal === "stopped") {
+      throw new ModuleActorError("ACTOR_STOPPING", "Module actor is stopping");
+    }
+    throw new ModuleActorError(
+      "ACTOR_FAILED",
+      "Fresh Module executor cannot admit one configured Run",
+    );
+  }
+
+  async #failIdleAdmission(
+    executor: ModuleExecutor<Input, Output>,
+    moduleGenerationId: string,
+  ): Promise<void> {
+    const context = { moduleId: this.#moduleId, moduleGenerationId };
+    try {
+      await this.#terminateExecutor(executor, context);
+      if (executor === this.#executor) this.#executorTerminated = true;
+      this.#executorTerminationUnconfirmed = false;
+    } catch {
+      this.#setUnconfirmedExecutor(executor, context);
+      this.#executorTerminationUnconfirmed = true;
+    }
+    if (this.#state === "running") this.#state = "failed";
+    this.#runAdmissionState = "none";
+  }
+
+  async #rotateIdleExecutor(force: boolean): Promise<string> {
     if (
       this.#state !== "running" ||
       this.#active !== undefined ||
@@ -868,7 +1073,7 @@ export class ModuleActor<Input, Output> {
     ) {
       throw new ModuleActorError("ACTOR_BUSY", "Module actor is not idle for generation rotation");
     }
-    if (this.#runsInModuleGeneration < this.#maxRunsPerGeneration) {
+    if (!force && this.#runsInModuleGeneration < this.#maxRunsPerGeneration) {
       return this.#moduleGenerationId;
     }
     const previousExecutor = this.#executor;
@@ -994,6 +1199,7 @@ export class ModuleActor<Input, Output> {
     this.#clearStartingExecutor(nextExecutor);
     this.#moduleGenerationId = nextModuleGenerationId;
     this.#executor = nextExecutor;
+    this.#runAdmissionState = "none";
     this.#executorTerminated = false;
     this.#executorTerminationUnconfirmed = false;
     this.#executorTerminatePromise = undefined;
@@ -1098,6 +1304,7 @@ export class ModuleActor<Input, Output> {
         settled: false,
       };
       this.#active = active;
+      if (this.#runAdmissionState === "assigned") this.#runAdmissionState = "none";
       this.#emit(active, { type: "run.started", startedAt });
       void this.#execute(active);
     } catch (error) {
@@ -1150,6 +1357,13 @@ export class ModuleActor<Input, Output> {
     try {
       output = await active.executor.execute(active.pending.request.input, active.context);
     } catch (error) {
+      if (error instanceof ModuleExecutorRunAdmissionExpiredError) {
+        this.#settle(
+          active,
+          this.#outcome(active, "not-executed", undefined, undefined, "run-admission-expired"),
+        );
+        return;
+      }
       if (error instanceof ModuleExecutorTerminationUnconfirmedError) {
         this.#setUnconfirmedExecutor(active.executor, {
           moduleId: active.context.moduleId,
@@ -1521,12 +1735,20 @@ export class ModuleActor<Input, Output> {
     status: ModuleRunOutcome<Output>["status"],
     error?: ModuleRunFailure,
     output?: Output,
+    notExecutedReason?: "run-admission-expired",
   ): ModuleRunOutcome<Output> {
     const identity = this.#identity(active);
     if (status === "succeeded") return Object.freeze({ ...identity, status, output: output! });
     if (status === "failed") return Object.freeze({ ...identity, status, error: error! });
     if (status === "cancelled") {
       return Object.freeze({ ...identity, status, reason: "shutdown" });
+    }
+    if (status === "not-executed") {
+      return Object.freeze({
+        ...identity,
+        status,
+        reason: notExecutedReason ?? "run-admission-expired",
+      });
     }
     return Object.freeze({ ...identity, status });
   }

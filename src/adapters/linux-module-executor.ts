@@ -30,6 +30,7 @@ import {
   ModuleExecutorTerminationUnconfirmedError,
   type ModuleCancellationContext,
   type ModuleExecutor,
+  type ModuleExecutorRunPreparation,
   type ModuleRunContext,
 } from "../core/module-actor.js";
 import type {
@@ -67,6 +68,10 @@ const DEFAULT_CORE_EXIT_CLEANUP_TIMEOUT_MS = 1_000;
 export interface LinuxModuleProtocolSession {
   /** Completes the authenticated handshake and Module creation. */
   initialize(): Promise<void>;
+  /** Optional pre-Claim capability lifetime/quota admission. */
+  prepareRun?(): ModuleExecutorRunPreparation | Promise<ModuleExecutorRunPreparation>;
+  /** Releases an admission when the consumer mailbox was empty. */
+  releaseRunAdmission?(): void | Promise<void>;
   execute(request: {
     readonly moduleJobId: string;
     readonly runId: string;
@@ -459,6 +464,20 @@ export function createLinuxModuleExecutor(
     isolation: "process" as const,
 
     start,
+
+    prepareRun: async (): Promise<ModuleExecutorRunPreparation> => {
+      if (terminationRequested) {
+        throw new Error("The Linux Module executor cannot prepare work during termination");
+      }
+      if (!startCompleted || !session) {
+        throw new Error("The Linux Module executor cannot prepare work before initialization");
+      }
+      return await session.prepareRun?.() ?? { status: "ready" as const };
+    },
+
+    releaseRunAdmission: async (): Promise<void> => {
+      await session?.releaseRunAdmission?.();
+    },
 
     execute: async (
       input: ReactiveModuleInput,

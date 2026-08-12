@@ -618,8 +618,28 @@ remain finite, so a product host must rotate the handle or restart the process
 through its normal generation lifecycle before either is exhausted.
 An installed process MUST NOT start when a newly issued handle cannot remain
 valid through its bounded initialization protocol and one complete configured
-Run. This construction check does not replace the later per-Run admission and
-normal generation rotation required for a long-lived process.
+Run.
+
+Before Core acquires a Delivery Claim for a long-lived process, the process
+host MUST issue one Host-owned Run admission. The admission freezes the current
+Module generation, process generation, and absolute Run deadline. It is issued
+only when every active-Run capability has enough remaining process-session
+invocations for that capability's complete per-Run ceiling and remains valid
+through the deadline. Insufficient expiry or invocation capacity requests
+normal process-generation rotation; it is not discovered by letting an
+untrusted Extension call an exhausted handle. One admission may authorize
+exactly one Run. An empty mailbox or pre-execution Claim failure explicitly
+releases it, and a submitted Run consumes it. A direct deadline-only execution
+MUST NOT bypass an outstanding admission.
+
+Claim and submission persistence consume the same Run time budget; they do not
+reset it. If that persistence or recovery reaches the deadline before
+`module.execute` is sent, Core MUST synchronously release the exact Claim and
+matching submission, leave the Delivery failure count unchanged, and obtain a
+fresh admission before re-Claiming. An unconfirmed release is a preserve-only
+recovery state, never a negative acknowledgement. Once `module.execute` has
+been sent, a result at or after the admitted deadline is not a success; normal
+timeout fencing and external-effect evidence rules apply.
 
 Model-operation and generic outbound-network capabilities are distinct. A large
 language model (LLM), Memory, or other ordinary model consumer receives only a
