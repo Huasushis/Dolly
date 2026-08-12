@@ -466,20 +466,45 @@ prove that it came from the same store, and result commits require the durable
 file repository rather than an in-memory test repository. Runtime limits,
 routes, timeouts, and configuration come from the resolved Module record.
 Because ordinary process isolation cannot prove that Extension code avoided
-ambient filesystem, network, or subprocess effects, this boundary no longer
-accepts an external-effect declaration or effect evidence from its caller. It
-rejects either field before executor construction. Until the closed instance
+ambient filesystem, network, or subprocess effects, this boundary does not
+accept an external-effect declaration, effect evidence source, arbitrary Host
+setup callback, or capability-effect lifecycle from its caller. It rejects
+those substitutions before executor construction. Until the closed instance
 configuration in Section 5.2 exists, it records the conservative
-`"core-capabilities-only"` disposition and supplies no evidence source, so any
-submitted Run without a committed result is preserved for recovery rather than
-automatically retried or dead-lettered. This interim record value is not
-evidence that process isolation blocked ambient effects and grants no
-capability. The boundary still rejects non-empty permission-policy identifiers,
-and the installed package format currently requires an empty
-requested-capability list. A capability-bearing Agent requires a later
-host-owned permission and durable-effect composition instead of an arbitrary
-setup callback. The runtime is returned unstarted and product bootstrap still
-does not consume it.
+`"core-capabilities-only"` disposition and supplies no evidence source to the
+retry decision, so any submitted Run without a committed result is preserved
+for recovery rather than automatically retried or dead-lettered. This remains
+true even when the Host has a complete journal of Core-mediated model calls:
+that journal cannot prove that ordinary process code caused no ambient effect.
+
+The candidate boundary now has one deliberately narrow non-empty permission
+path. An immutable in-process permission-policy registry maps the exact
+identifiers selected by the validated Module configuration to a reviewed chat
+descriptor, broker, finite budgets, allowed reasoning modes, roles, and output
+syntax. Its ordinary meaning is a Host-owned table of approved operations; it
+is not Extension configuration. The only accepted policy kind grants
+`model-operation/v2` for the Host-verified active Run, requires a stable
+idempotency key, and requires provider streaming on every chat invocation.
+Non-stream chat is rejected before broker dispatch. Embedding is not included
+in this generation policy and remains a separately measured non-stream
+operation.
+
+A non-empty policy selection additionally requires a direct file-backed effect
+intent store. The installed runtime derives the Host lifecycle from that store
+and its own Core submission records, so the Extension cannot forge Run
+identity or replace the recorder. Each authorized model invocation records its
+intent before provider input/output and records a terminal, no-effect, or
+unknown outcome afterward. The selected setup is bound to the resolved
+instance, Module, extension, package digest, configuration revision, and exact
+sorted policy identifiers; replacement process generations receive fresh
+capability definitions and per-Run counters.
+
+This is still a product-before-bootstrap candidate. The approved policy table
+itself is not yet persisted or revisioned, process isolation still permits
+ambient effects, only chat generation is composed, and the installed package
+format still requires an empty requested-capability list so package content
+cannot enlarge authority. The runtime is returned unstarted and product
+bootstrap still does not consume it.
 
 ### 5.2 Proposed Linux Module process limits
 

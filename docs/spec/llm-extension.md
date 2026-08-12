@@ -477,6 +477,14 @@ per-request choice and `forbidden` rejects true; the Extension MUST NOT infer
 these modes from a model name. A stream-required Agent cannot silently retry a
 failed stream as a non-stream request.
 
+The current installed-Module candidate composes only this required mode. The
+validated Module selects an operator-owned policy identifier; the Host maps it
+to one descriptor and finite budgets, issues an active-Run
+`model-operation/v2` handle, requires idempotency, and records each invocation
+in a file-backed effect journal. This candidate does not yet persist the policy
+table and does not enable the public Module bootstrap. Embedding is outside the
+chat-generation handle and remains non-streaming.
+
 Slow consumers receive bounded backpressure. Disconnect, malformed stream,
 timeout, or cancellation marks provisional output incomplete. Only a validated
 terminal response or complete tool round enters the turn journal and can later
