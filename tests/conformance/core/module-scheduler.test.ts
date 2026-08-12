@@ -629,6 +629,51 @@ describe("CORE scheduler run loop serialization", () => {
     }
     await scheduler.stop();
   });
+
+  it("does not advance fair dispatch order for a wake hint that cannot dispatch", async () => {
+    const nextDispatched = async (extraWakeWhileBusy: boolean): Promise<string> => {
+      const { clock, mailboxes, scheduler } = createScheduler({ maxConcurrentModules: 1 });
+      const runtimes = new Map<string, FakeModuleRuntime>();
+      for (const moduleId of ["a", "b", "c"]) {
+        const runtime = new FakeModuleRuntime();
+        runtimes.set(moduleId, runtime);
+        mailboxes.set(moduleId, 1, 100);
+        scheduler.register({
+          moduleId,
+          runtime,
+          inputPageIds: [`page-${moduleId}`],
+          outputPageIds: [],
+          mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
+        });
+      }
+
+      scheduler.start();
+      await drain(clock);
+      expect(runtimes.get("a")!.tickCount).toBe(1);
+
+      if (extraWakeWhileBusy) {
+        scheduler.wake();
+        await drain(clock);
+        expect(runtimes.get("b")!.tickCount).toBe(0);
+        expect(runtimes.get("c")!.tickCount).toBe(0);
+      }
+
+      runtimes.get("a")!.settle(committedResult(1));
+      await drain(clock);
+      const next = ["b", "c"].find((moduleId) => runtimes.get(moduleId)!.tickCount === 1);
+      expect(next).toBeDefined();
+
+      const stopping = scheduler.stop();
+      for (const runtime of runtimes.values()) {
+        while (runtime.waiting.length > 0) runtime.settle({ status: "idle" });
+      }
+      await stopping;
+      return next!;
+    };
+
+    expect(await nextDispatched(false)).toBe("b");
+    expect(await nextDispatched(true)).toBe("b");
+  });
 });
 
 describe("CORE scheduler bounded mailboxes and backpressure", () => {

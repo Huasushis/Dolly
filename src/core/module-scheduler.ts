@@ -796,7 +796,7 @@ export class ModuleScheduler {
   #eligibilityTimer: SchedulerTimer | null = null;
   #eligibilityTimerDueAt: number | null = null;
   #activeCount = 0;
-  #cursor = 0;
+  #lastDispatchedModuleId: string | null = null;
   #invariantViolationCount = 0;
   #lastProgressAt: number | null = null;
   #waitingWithoutProgressSince: number | null = null;
@@ -1448,9 +1448,13 @@ export class ModuleScheduler {
     for (const entry of entries) this.#refreshMailboxState(entry);
 
     // Round-robin so an instance-wide concurrency cap cannot permanently starve
-    // the Modules that sort last.
-    const start = this.#cursor % entries.length;
-    this.#cursor = (this.#cursor + 1) % entries.length;
+    // the Modules that sort last. A mailbox change notification is only a hint:
+    // a pass that cannot dispatch must not consume another Module's fair turn.
+    const lastDispatchedIndex =
+      this.#lastDispatchedModuleId === null
+        ? -1
+        : entries.findIndex((entry) => entry.moduleId === this.#lastDispatchedModuleId);
+    const start = lastDispatchedIndex < 0 ? 0 : (lastDispatchedIndex + 1) % entries.length;
     for (let offset = 0; offset < entries.length; offset += 1) {
       if (this.#state !== "running") break;
       this.#evaluate(entries[(start + offset) % entries.length]!, now);
@@ -1932,6 +1936,7 @@ export class ModuleScheduler {
         this.#settle(entry, null, error);
       },
     );
+    this.#lastDispatchedModuleId = entry.moduleId;
     // Observers run synchronously and may request shutdown. Publish the event
     // only after the Promise is visible so a reentrant stop cannot report
     // completion while this dispatched tick is still running.
