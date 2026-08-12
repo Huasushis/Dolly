@@ -51,6 +51,90 @@ function deferred<T>() {
 }
 
 describe("extension capability session authority", () => {
+  it("reports enough immutable lifetime and total quota for one bounded active Run", async () => {
+    let current = NOW;
+    const broker = authority(() => current);
+    const session = broker.openSession(identity("session-a"));
+    const handler = vi.fn(async () => ({ ok: true }));
+    const handle = session.issue(
+      grant({ maxInvocations: 3, maxInvocationsPerRun: 2 }),
+      handler,
+    );
+    expect(session.inspectRunCapacity("2026-07-24T00:30:00.000Z")).toEqual({
+      status: "admitted",
+      deadline: "2026-07-24T00:30:00.000Z",
+    });
+    expect(session.inspectRunCapacity("2026-07-24T01:00:00.000Z")).toEqual({
+      status: "rotation-required",
+      reason: "capability-expiry-insufficient",
+    });
+    for (const operation of ["one", "two"]) {
+      await expect(session.invoke({
+        handle,
+        operation: "read",
+        arguments: { operation },
+        moduleJobId: "module-job-a",
+        runId: "run-a",
+        attempt: 1,
+        deadline: "2026-07-24T00:30:00.000Z",
+      })).resolves.toEqual({ ok: true });
+    }
+    await expect(session.invoke({
+      handle,
+      operation: "read",
+      arguments: {},
+      moduleJobId: "module-job-a",
+      runId: "run-a",
+      attempt: 1,
+      deadline: "2026-07-24T00:30:00.000Z",
+    })).rejects.toMatchObject({ code: "CAPABILITY_QUOTA_EXCEEDED" });
+    expect(session.inspectRunCapacity("2026-07-24T00:30:00.000Z")).toEqual({
+      status: "rotation-required",
+      reason: "capability-quota-insufficient",
+    });
+
+    current = "2026-07-24T00:59:00.000Z";
+    expect(session.inspectRunCapacity("2026-07-24T01:01:00.000Z")).toEqual({
+      status: "rotation-required",
+      reason: "capability-expiry-insufficient",
+    });
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not charge an idempotent replay against a second active-Run slot", async () => {
+    const broker = authority();
+    const session = broker.openSession(identity("session-a"));
+    const handler = vi.fn(async () => ({ value: "once" }));
+    const handle = session.issue(
+      grant({
+        maxInvocations: 2,
+        maxInvocationsPerRun: 1,
+        requireIdempotencyKey: true,
+      }),
+      handler,
+    );
+    const invocation = {
+      handle,
+      operation: "read",
+      arguments: { key: "one" },
+      moduleJobId: "module-job-a",
+      runId: "run-a",
+      idempotencyKey: "module-job-a-effect-one",
+    } as const;
+
+    await expect(session.invoke(invocation)).resolves.toEqual({ value: "once" });
+    await expect(session.invoke(invocation)).resolves.toEqual({ value: "once" });
+    await expect(session.invoke({
+      ...invocation,
+      arguments: { key: "two" },
+      idempotencyKey: "module-job-a-effect-two",
+    })).rejects.toMatchObject({
+      code: "CAPABILITY_QUOTA_EXCEEDED",
+      details: { limit: "maxInvocationsPerRun", allowed: 1 },
+    });
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
   it("passes only an immutable declared scope to an explicitly granted operation", async () => {
     const broker = authority();
     const session = broker.openSession(identity("session-a"));

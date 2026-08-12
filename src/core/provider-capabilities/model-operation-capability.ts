@@ -469,6 +469,10 @@ function buildModelOperationCapability(
     },
     expiresAt: options.expiresAt,
     maxInvocations: limits.maxInvocations,
+    maxInvocationsPerRun: Math.min(
+      limits.maxInvocations,
+      limits.maxInvocationsPerRun,
+    ),
     maxConcurrentInvocations: options.maxConcurrentInvocations ?? 1,
     maxArgumentBytes: limits.maxArgumentBytes,
     maxResultBytes: limits.maxResultBytes,

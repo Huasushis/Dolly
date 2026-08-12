@@ -158,6 +158,21 @@ const ONE_MESSAGE = {
 };
 
 describe("Extension model operation capability", () => {
+  it("charges every active-Run operation, including describe, to the Host ceiling", async () => {
+    const harness = createHarness({
+      overrides: { limits: { maxInvocations: 8, maxInvocationsPerRun: 1 } },
+    });
+
+    await expect(harness.invoke("describe", {})).resolves.toMatchObject({
+      modality: "chat",
+    });
+    await expect(harness.invoke("describe", {})).rejects.toMatchObject({
+      code: "CAPABILITY_QUOTA_EXCEEDED",
+      details: { limit: "maxInvocationsPerRun", allowed: 1 },
+    });
+    expect(harness.chat.invoke).not.toHaveBeenCalled();
+  });
+
   it("binds one reusable handle to each host-verified active Run", async () => {
     let handleSeed = 0;
     const authority = new ExtensionCapabilityAuthority({

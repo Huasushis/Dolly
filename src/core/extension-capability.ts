@@ -39,12 +39,27 @@ export interface ExtensionCapabilityGrant {
   readonly resourceScope: JsonValue;
   readonly expiresAt: string;
   readonly maxInvocations: number;
+  /** Maximum distinct invocations this handle may accept for one active Run. */
+  readonly maxInvocationsPerRun?: number;
   readonly maxConcurrentInvocations: number;
   readonly maxArgumentBytes: number;
   readonly maxResultBytes: number;
   readonly executionScope?: ExtensionExecutionScope;
   readonly requireIdempotencyKey?: boolean;
 }
+
+export type ExtensionCapabilityRunCapacity =
+  | {
+      readonly status: "admitted";
+      readonly deadline: string;
+    }
+  | {
+      readonly status: "rotation-required";
+      readonly reason:
+        | "capability-revoked"
+        | "capability-expiry-insufficient"
+        | "capability-quota-insufficient";
+    };
 
 export interface ExtensionCapabilityInvocation {
   readonly handle: ExtensionCapabilityHandle;
@@ -121,6 +136,7 @@ interface CapabilityRecord {
   readonly grant: ExtensionCapabilityGrant;
   readonly handler: ExtensionCapabilityHandler;
   readonly effects: Map<string, { digest: string; promise: Promise<JsonValue> }>;
+  readonly runInvocations: Map<string, number>;
   invocations: number;
   concurrent: number;
   revoked: boolean;
@@ -190,6 +206,15 @@ function immutableGrant(
     );
   }
   assertPositive(grant.maxInvocations, "maxInvocations");
+  if (grant.maxInvocationsPerRun !== undefined) {
+    assertPositive(grant.maxInvocationsPerRun, "maxInvocationsPerRun");
+    if (grant.maxInvocationsPerRun > grant.maxInvocations) {
+      throw new ExtensionCapabilityError(
+        "CAPABILITY_CONFIG_INVALID",
+        "maxInvocationsPerRun cannot exceed maxInvocations",
+      );
+    }
+  }
   assertPositive(grant.maxConcurrentInvocations, "maxConcurrentInvocations");
   assertPositive(grant.maxArgumentBytes, "maxArgumentBytes");
   assertPositive(grant.maxResultBytes, "maxResultBytes");
@@ -215,6 +240,9 @@ function immutableGrant(
     resourceScope,
     expiresAt,
     maxInvocations: grant.maxInvocations,
+    ...(grant.maxInvocationsPerRun === undefined
+      ? {}
+      : { maxInvocationsPerRun: grant.maxInvocationsPerRun }),
     maxConcurrentInvocations: grant.maxConcurrentInvocations,
     maxArgumentBytes: grant.maxArgumentBytes,
     maxResultBytes: grant.maxResultBytes,
@@ -298,6 +326,7 @@ export class ExtensionCapabilityAuthority {
       grant,
       handler,
       effects: new Map(),
+      runInvocations: new Map(),
       invocations: 0,
       concurrent: 0,
       revoked: false,
@@ -326,6 +355,47 @@ export class ExtensionCapabilityAuthority {
       if (error instanceof ExtensionCapabilityError) PREFLIGHT_REFUSALS.add(error);
       throw error;
     }
+  }
+
+  inspectRunCapacity(
+    session: ExtensionCapabilitySession,
+    deadlineValue: string,
+  ): ExtensionCapabilityRunCapacity {
+    this.#assertActiveSession(session);
+    const deadline = canonicalTime(deadlineValue, "deadline");
+    const nowMs = Date.parse(canonicalTime(this.#now(), "clock"));
+    const deadlineMs = Date.parse(deadline);
+    if (deadlineMs <= nowMs) {
+      throw new ExtensionCapabilityError(
+        "CAPABILITY_CONFIG_INVALID",
+        "Run admission deadline must be in the future",
+      );
+    }
+    const records = [...this.#records.values()].filter(
+      (record) => record.sessionId === session.identity.sessionId,
+    );
+    if (records.some((record) => record.revoked)) {
+      return Object.freeze({
+        status: "rotation-required",
+        reason: "capability-revoked",
+      } as const);
+    }
+    if (records.some((record) => Date.parse(record.grant.expiresAt) <= deadlineMs)) {
+      return Object.freeze({
+        status: "rotation-required",
+        reason: "capability-expiry-insufficient",
+      } as const);
+    }
+    if (records.some((record) =>
+      record.grant.maxInvocationsPerRun !== undefined &&
+      record.grant.maxInvocations - record.invocations < record.grant.maxInvocationsPerRun
+    )) {
+      return Object.freeze({
+        status: "rotation-required",
+        reason: "capability-quota-insufficient",
+      } as const);
+    }
+    return Object.freeze({ status: "admitted", deadline });
   }
 
   #prepareAndInvoke(
@@ -446,6 +516,31 @@ export class ExtensionCapabilityAuthority {
         return existing.promise;
       }
     }
+    const runInvocationKey =
+      invocation.moduleJobId === undefined || invocation.runId === undefined
+        ? undefined
+        : `${invocation.moduleJobId}\u0000${invocation.runId}`;
+    if (record.grant.maxInvocationsPerRun !== undefined && runInvocationKey === undefined) {
+      throw new ExtensionCapabilityError(
+        "CAPABILITY_SCOPE_MISMATCH",
+        "Capability requires an active Run invocation scope",
+      );
+    }
+    if (
+      runInvocationKey !== undefined &&
+      record.grant.maxInvocationsPerRun !== undefined &&
+      (record.runInvocations.get(runInvocationKey) ?? 0) >=
+        record.grant.maxInvocationsPerRun
+    ) {
+      throw new ExtensionCapabilityError(
+        "CAPABILITY_QUOTA_EXCEEDED",
+        "Capability active Run invocation limit reached",
+        {
+          limit: "maxInvocationsPerRun",
+          allowed: record.grant.maxInvocationsPerRun,
+        },
+      );
+    }
     if (record.invocations >= record.grant.maxInvocations) {
       throw new ExtensionCapabilityError(
         "CAPABILITY_QUOTA_EXCEEDED",
@@ -471,6 +566,12 @@ export class ExtensionCapabilityAuthority {
       () => this.#execute(session, record, invocation, argumentsValue, controller.signal),
     );
     record.invocations += 1;
+    if (runInvocationKey !== undefined) {
+      record.runInvocations.set(
+        runInvocationKey,
+        (record.runInvocations.get(runInvocationKey) ?? 0) + 1,
+      );
+    }
     record.concurrent += 1;
     if (effectKey !== undefined) {
       record.effects.set(effectKey, { digest: effectDigest, promise: operation });
@@ -653,6 +754,10 @@ export class ExtensionCapabilitySession {
 
   invoke(invocation: ExtensionCapabilityInvocation): Promise<JsonValue> {
     return this.authority.invoke(this, invocation);
+  }
+
+  inspectRunCapacity(deadline: string): ExtensionCapabilityRunCapacity {
+    return this.authority.inspectRunCapacity(this, deadline);
   }
 
   revoke(handle: ExtensionCapabilityHandle): "revoked" | "absent" {

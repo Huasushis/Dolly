@@ -563,6 +563,14 @@ function buildModulePrivateStorageCapability(
     },
     expiresAt: options.expiresAt,
     maxInvocations: limits.maxInvocations,
+    ...(capabilityVersion === MODULE_PRIVATE_STORAGE_CAPABILITY_VERSION_V2
+      ? {
+          maxInvocationsPerRun: Math.min(
+            limits.maxInvocations,
+            (limits as ModulePrivateStorageLimitsV2).maxInvocationsPerRun,
+          ),
+        }
+      : {}),
     maxConcurrentInvocations: options.maxConcurrentInvocations ?? 1,
     maxArgumentBytes: limits.maxArgumentBytes,
     maxResultBytes: limits.maxResultBytes,
