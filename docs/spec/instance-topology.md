@@ -405,11 +405,16 @@ as an error.
   package versions 1 and 2 remain reactive-only. It can accept requests from a
   future trusted manual or external ingress owner. A periodic source remains
   rejected until an automatic producer durably records each clock activation.
-- Periodic process activation remains unsupported. Source has component and
-  product-before-bootstrap composition evidence, but product ingress and Linux
-  execution evidence remain incomplete. Product bootstrap still rejects all
-  configured Modules. Editing and startup surfaces MUST report the unsupported
-  implementation boundary, not call these declarations malformed.
+- `dolly.extension-package/4` retains the complete version-3 shape and may
+  declare `periodic`. Candidate installed composition accepts it only with at
+  least one input Page and `allowEmptyInput: false`; it uses the existing
+  Delivery Claim and `module.execute` boundary and grants no background timer
+  or capability to Extension code.
+- Empty-input periodic activation and periodic source production remain
+  unsupported. Source and non-empty periodic have component and
+  product-before-bootstrap composition evidence. Product bootstrap still
+  rejects all configured Modules. Editing and startup surfaces MUST report the
+  unsupported implementation boundary, not call these declarations malformed.
 
 ### 6.6 Finite size limits
 

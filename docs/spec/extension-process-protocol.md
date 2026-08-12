@@ -169,11 +169,19 @@ the Core-private, durable source activation queue. It does not let Extension
 code enqueue work, publish Blocks outside a Run, or invoke itself. Periodic
 activation remains unsupported.
 
-`requestedCapabilities` MUST be empty in package schema versions 1 through 3.
+`dolly.extension-package/4` retains the complete version-3 shape and also
+permits `activation: "periodic"`. This authorizes only the delivery-backed,
+non-empty periodic mode: the instance MUST provide at least one input Page and
+`allowEmptyInput: false`. It adds no Extension timer or background protocol.
+Core keeps the start-to-start period and invokes the same bounded
+`module.execute` operation only after durable input becomes eligible.
+
+`requestedCapabilities` MUST be empty in package schema versions 1 through 4.
 Capability requests, renderer registration, configuration migrations, package
-signatures, and periodic activation require a later package schema with their
-own security review and conformance tests. Source activation in version 3
-grants no capability and no ambient authority. A valid future signature may
+signatures, automatic source timers, and empty-input periodic activation require
+a later package schema with their own security review and conformance tests.
+Source activation in version 3 and non-empty periodic activation in version 4
+grant no capability and no ambient authority. A valid future signature may
 establish package provenance, but it will not grant capabilities or trust by
 itself.
 
@@ -492,15 +500,14 @@ not an omitted effect. This component path is not yet product startup wiring:
 
 No capability currently lets background code activate its own Module. Background
 code MUST NOT publish a Block or call `module.execute` on itself. The candidate
-installed composition accepts source activation only from package schema
-version 3 and only through an authentic, store-bound Core queue. The Scheduler
-component can model a delivery-backed periodic policy, but package schema
-versions 1 through 3 cannot declare periodic support and Core MUST reject it
-before process start. A version-3 source declaration whose instance trigger is
-periodic is also rejected until a Core-owned producer can persist each timed
-request. Product startup still rejects every configured Module; manual and
-external product ingress, queue-retention policy, and Linux end-to-end
-source-process evidence remain prerequisites.
+installed composition accepts source activation from package schema version 3
+or 4 only through an authentic, store-bound Core queue. Package schema version
+4 can also declare a delivery-backed periodic Module; Core still rejects
+empty-input periodic execution before process start. A source declaration whose
+instance trigger is periodic is likewise rejected until a Core-owned producer
+can persist each timed request. Product startup still rejects every configured
+Module; trusted source ingress, queue-retention policy, and broader periodic
+failure evidence remain prerequisites.
 
 An extension that prepares durable work during `module.execute` MUST NOT treat
 the returned result as committed. The first Linux Module profile defers both

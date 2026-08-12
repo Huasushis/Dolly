@@ -1909,15 +1909,13 @@ Every Module MUST declare one primary activation mode. A future accepted Extensi
 may define explicit combinations, but implicit hybrid behavior is forbidden.
 
 The product bootstrap still rejects all configured Modules. The Scheduler
-component implements one narrow delivery-backed periodic policy for scientific
-and deterministic component testing: a periodic registration with input Pages
-and `allowEmptyInput: false` uses the same runtime tick shape as a reactive
-registration. The verified Extension composition does not activate that mode:
-package versions 1 and 2 declare only reactive activation, while version 3 adds
-only the source declaration defined in Section 11.3. At component level, the
-Scheduler also accepts the authenticated Delivery-backed source queue; the
-candidate installed composition can bind manual or external source requests to
-it. Neither fact alters the bootstrap refusal.
+implements one narrow delivery-backed periodic policy: a registration with
+input Pages and `allowEmptyInput: false` uses the same runtime tick shape as a
+reactive registration. Package versions 1 and 2 declare only reactive
+activation, version 3 adds the source declaration defined in Section 11.3, and
+version 4 additionally declares this non-empty periodic mode. The candidate
+installed composition binds these activations to the same Runtime and
+Scheduler. None of this alters the bootstrap refusal.
 
 ### 11.1 Reactive mode
 
@@ -1933,12 +1931,12 @@ A periodic Module becomes eligible according to a configured target period. At
 eligibility it claims currently pending input. Configuration MUST state whether
 an empty-input run is allowed.
 
-The current Scheduler component permits only `allowEmptyInput: false`. Its first
-run becomes eligible when pending input is first observed. Every later
-eligibility is start-to-start as defined below. Waiting for a declared future
-period is not reported as no progress. This is Scheduler behavior, not process
-activation support. Empty-input periodic execution needs a durable trigger
-identity independent of a Delivery Claim and remains rejected.
+The current Scheduler and candidate installed process composition permit only
+`allowEmptyInput: false`. Its first run becomes eligible when pending input is
+first observed. Every later eligibility is start-to-start as defined below.
+Waiting for a declared future period is not reported as no progress.
+Empty-input periodic execution needs a durable trigger identity independent of
+a Delivery Claim and remains rejected.
 
 The target period is defined as the desired interval between run **start
 times**, not the delay after a run finishes.
@@ -2005,8 +2003,9 @@ limits remain separate because they measure serialized Blocks rather than the
 request envelopes. The fixed policy treats the private queue's pending Delivery
 count as the source request count and never invents an empty request.
 
-The product-before-bootstrap installed composition now accepts only a verified
-`dolly.extension-package/3` source declaration, constructs the queue from the
+The product-before-bootstrap installed composition accepts a verified
+`dolly.extension-package/3` or `dolly.extension-package/4` source declaration,
+constructs the queue from the
 same FileCore store, and passes its private Page to both
 `ReactiveModuleRuntime` and Scheduler through the authenticated binding. Source
 queue limits remain explicit composition inputs because instance schema version
@@ -2015,14 +2014,16 @@ ingress owner; it does not itself open manual or external ingress. A configured
 periodic source is rejected before queue reconciliation because no automatic
 producer yet turns clock eligibility into a durable request.
 
-This still does not establish product source execution. No product coordinator
-owns request admission across startup and shutdown, completed idempotency
-history has no bounded retention policy, and the installed source path has not
-yet passed the one-use systemd-container Linux process/cgroup test. Source
-activation without an authentic binding remains rejected by Scheduler
-registration, package versions 1 and 2 remain reactive-only, and every
-configured Module remains rejected by product bootstrap as stated in Section
-9.3.
+The one-use systemd-container Source run has now passed: one manual request
+produced `READY_SOURCE`, one real installed Extension Run, a durable result,
+whole-control-group stop proof, and a result readable after reopen. This still
+does not establish product source execution. No product coordinator owns
+request admission across startup and shutdown; completed idempotency history
+has no bounded retention policy; and Source limits are not persisted in the
+public instance schema. Source activation without an authentic binding remains
+rejected by Scheduler registration, package versions 1 and 2 remain
+reactive-only, and every configured Module remains rejected by product
+bootstrap as stated in Section 9.3.
 
 A source MUST still obey actor serialization, mailbox bounds, generation
 fencing, output transactions, and backpressure. Downstream congestion may delay

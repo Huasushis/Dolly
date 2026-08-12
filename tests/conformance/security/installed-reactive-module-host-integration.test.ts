@@ -1337,7 +1337,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         () => schedulerEvents.some((event) =>
           event.type === "scheduler.decision" &&
           event.moduleId === PERIODIC_MODULE_ID &&
-          event.reasonCode === "PERIOD_NOT_DUE"
+          event.reasonCode === "SCHEDULER_DEFERRED"
         ),
         2_000,
       )).toBe(true);
@@ -1387,7 +1387,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         moduleId: PERIODIC_MODULE_ID,
         periodMs,
         startDeltaMs,
-        waitingReasonCode: "PERIOD_NOT_DUE",
+        waitingReasonCode: "SCHEDULER_DEFERRED",
         dispatchReasonCode: "READY_PERIODIC",
         actorRuns: 2,
         committedModuleResults: reopenedRepository.list().length,
