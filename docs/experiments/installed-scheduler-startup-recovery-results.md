@@ -106,3 +106,52 @@ Evidence is stored under
 - `environment.txt`: `4c66ed875461b8796fc11fdb7f45f40d4d34a120b081b8afa1e6977bd942d3d5`
 - `preflight.txt`: `ecf7fce3780e2b756cfc847409343f9dc3196b8e6f9da072679da4c713411c36`
 - `source-snapshot.txt`: `f29a8edfeb13a57a80083bc82a8adf793bef64fb77af5d5a1818d6cdad3e8770`
+
+## Scheduler-owned operator recovery regression
+
+A later counterexample showed that exposing the installed runtime let an
+operator call `runtime.recover()` and then clear Scheduler quarantine as a
+separate step. That split lost the recovery result's retry deadline,
+backpressure disposition, counters, and exact Claim identity. It could also
+race dispatch, exceed the instance concurrency limit, or clear the
+runtime-local startup flag while Scheduler still held a valid quarantine.
+
+Commit `9be51ae9ec5a3417c2de6baa95aa2c9c1c6e4ee7` removes that authority from the
+installed composition. The Host now accepts only a configured Module ID. The
+Scheduler invokes the runtime registered for that Module while holding its
+normal in-flight fence, validates the closed recovery result against the five
+fields of the quarantined Claim, and applies the normal retry,
+output-backpressure, progress, counter, and quarantine transitions. Runtime
+recovery and Scheduler release are no longer independently callable product
+steps. Installed composition exposes read-only status instead of runtime,
+process-generation, or result-commit authorities.
+
+Component counterexamples cover synchronous reentrant recovery, duplicate
+recovery, stop during recovery, the instance concurrency limit, stale Claim
+identity, malformed committed records, non-retryable retry dispositions,
+invalid or duplicate downstream identities, and every supported recovery
+status. Host readiness additionally requires both the runtime-local startup
+result to be clear and Scheduler quarantine to be absent; an invalid recovery
+therefore cannot reopen Source ingress merely by clearing a local flag.
+
+The committed source was archived into disposable container
+`dolly-experiment-3250230-848be0c4`. The exact Linux installed-host file passed
+6/6 tests as the unprivileged account under systemd 255 and control-group v2.
+The startup-capacity case retained zero producer executions while the drainer
+freed capacity; the strict-streaming registered-tool Agent, task-switch
+checkpoint Agent, manual Source, periodic, and resident-mailbox cases also
+passed. Post-run inspection found both the exact container and its exact image
+absent.
+
+Evidence is stored under
+`artifacts/experiments/linux-core-service-ownership/container-3250230-20260812T153728Z`:
+
+- `linux-integration.log`: `9a05da166653ec10bc8163e45be4ff1389587b15207b15c7b43fabaaa8a91881`
+- `environment.txt`: `4c66ed875461b8796fc11fdb7f45f40d4d34a120b081b8afa1e6977bd942d3d5`
+- `preflight.txt`: `ecf7fce3780e2b756cfc847409343f9dc3196b8e6f9da072679da4c713411c36`
+
+This remains a candidate host below public bootstrap. It does not make an
+unknown ambient effect retry-safe, persist all required Scheduler and Linux
+configuration, or establish Windows/macOS process ownership.
+`openDollyRuntime` therefore continues to reject every configured Module with
+`RUNTIME_MODULE_MIGRATION_REQUIRED`.
