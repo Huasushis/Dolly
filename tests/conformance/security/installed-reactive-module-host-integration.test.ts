@@ -38,6 +38,7 @@ import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
 import { resolveInstalledContentSchemaRegistrationSet } from "../../../src/core/installed-extension-module.js";
 import {
   deriveModuleCgroupPath,
+  LinuxModuleCgroupStopProver,
   prepareDelegatedCgroupRoot,
   type ModuleCgroupLimits,
 } from "../../../src/core/linux-module-cgroup.js";
@@ -122,6 +123,24 @@ function proposal(text: string): BlockProposal {
       value: { items: [{ type: "text", text, format: "plain" }] },
     },
   };
+}
+
+function summarizeIntegrationError(error: unknown): unknown {
+  if (error instanceof AggregateError) {
+    return {
+      name: error.name,
+      message: error.message,
+      errors: error.errors.map(summarizeIntegrationError),
+    };
+  }
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      ...("code" in error ? { code: error.code } : {}),
+    };
+  }
+  return { value: String(error) };
 }
 
 function agentToolDescriptor(options: {
@@ -826,7 +845,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       } as const;
       writeFileSync(join(packageSource, "dolly-extension.json"), JSON.stringify({
         schemaVersion: "dolly.extension-package/1",
-        extensionId: "org.example.scheduler-recovery",
+        extensionId: "org.example.scheduler-installed",
         packageVersion: "1.0.0",
         displayName: "Installed Scheduler recovery integration fixture",
         description: "Drains capacity while an earlier result waits for commit-only recovery.",
@@ -853,7 +872,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       });
       const producerConfiguration = configurations.create({
         configId: "scheduler-recovery-producer-config",
-        extensionId: "org.example.scheduler-recovery",
+        extensionId: "org.example.scheduler-installed",
         moduleKind: "transform",
         configVersion: 1,
         schema: configurationSchema,
@@ -861,7 +880,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       });
       const drainerConfiguration = configurations.create({
         configId: "scheduler-recovery-drainer-config",
-        extensionId: "org.example.scheduler-recovery",
+        extensionId: "org.example.scheduler-installed",
         moduleKind: "transform",
         configVersion: 1,
         schema: configurationSchema,
@@ -895,7 +914,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         pages: [{ pageId: "producer-input" }, { pageId: "recovery-output" }],
         modules: [{
           moduleId: producerId,
-          extensionId: "org.example.scheduler-recovery",
+          extensionId: "org.example.scheduler-installed",
           packageVersion: "1.0.0",
           moduleKind: "transform",
           isolation: "process",
@@ -913,7 +932,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           timeouts: moduleTimeouts,
         }, {
           moduleId: drainerId,
-          extensionId: "org.example.scheduler-recovery",
+          extensionId: "org.example.scheduler-installed",
           packageVersion: "1.0.0",
           moduleKind: "transform",
           isolation: "process",
@@ -1045,6 +1064,9 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         commits,
         moduleRecords: coreState.store,
         stoppedRecordWriter: coreState.stoppedRecordWriter,
+        processStopProver: new LinuxModuleCgroupStopProver({
+          serviceBindingVerified: true,
+        }),
       }).recover();
       expect(recovery.deferredCommits).toEqual([
         expect.objectContaining({
@@ -1058,6 +1080,8 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
 
       const schedulerEvents: SchedulerEvent[] = [];
       const actorEvents: ModuleActorEvent[] = [];
+      const standardErrorChunks: Uint8Array[] = [];
+      let processGenerationRequestCount = 0;
       composed = composeInstalledReactiveModuleHost({
         configuration,
         installations,
@@ -1102,6 +1126,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           },
           channelCloseTimeoutMs: 5_000,
           nextProcessGenerationId: () => {
+            processGenerationRequestCount += 1;
             if (processIdentifierAllocated) {
               throw new Error("Startup recovery attempted to create a producer process");
             }
@@ -1112,10 +1137,26 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
             `${purpose}-scheduler-recovery-${++protocolIdentifier}`,
           classifyFailure: (failure) => ({ code: failure.code, retryable: false }),
           onActorEvent: (event) => actorEvents.push(event),
+          onStandardErrorChunk: (chunk) => {
+            if (standardErrorChunks.length < 8) standardErrorChunks.push(chunk);
+          },
         },
         onSchedulerEvent: (event) => schedulerEvents.push(event),
       });
-      await composed.host.start();
+      try {
+        await composed.host.start();
+      } catch (error) {
+        console.info(JSON.stringify({
+          diagnostic: "installed-startup-capacity-recovery-start-failed",
+          error: summarizeIntegrationError(error),
+          processGenerationRequestCount,
+          actorEvents,
+          standardError: Buffer.concat(standardErrorChunks.map((chunk) => Buffer.from(chunk)))
+            .toString("utf8"),
+          processRecords: coreState.store.listModuleProcessRecords(),
+        }));
+        throw error;
+      }
       expect(composed.host.state).toBe("recovering");
       expect(() => composed?.installedRuntimes[0]?.generations.processGenerationIdFor(
         `${producerId}-generation-1`,
