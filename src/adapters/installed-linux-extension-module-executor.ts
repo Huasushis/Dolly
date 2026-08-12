@@ -17,6 +17,10 @@ import type { ReactiveModuleResult } from "../core/reactive-module-runtime.js";
 import type { DollyInstanceConfig } from "../core/runtime-config.js";
 import type { InstalledModulePermissionPolicySetup } from "./installed-module-permission-policy.js";
 import {
+  deriveLinuxProcessConfinementExecution,
+  LINUX_PROCESS_CONFINEMENT_PROGRAM,
+} from "./linux-process-confinement.js";
+import {
   createLinuxExtensionModuleExecutor,
   type LinuxExtensionModuleExecutorOptions,
 } from "./linux-extension-module-executor.js";
@@ -41,6 +45,8 @@ export interface InstalledLinuxExtensionModuleExecutorOptions {
   readonly installations: ExtensionInstallationRegistry;
   readonly configurations: ModuleConfigurationStore;
   readonly moduleGenerationId: string;
+  /** Directory of the exact FileCore state store owned by this runtime. */
+  readonly coreStateDirectory: string;
   /** Exact systemd/Core binding verified before Module activation. */
   readonly binding: VerifiedCoreServiceBinding;
   readonly lifecycle: InstalledLifecycleOptions;
@@ -200,13 +206,13 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
       ...options.lifecycle,
       delegatedRootCgroupPath: options.binding.delegatedRootCgroupPath,
       processRecord,
-      execution: {
-        program: process.execPath,
-        argumentVector: [process.execPath, resolvedModule.installation.entrypointPath],
-        // Module authority is granted through Host capabilities, never ambient
-        // process variables inherited from Core or its service manager.
-        environment: Object.freeze({}),
-      },
+      execution: deriveLinuxProcessConfinementExecution({
+        bubblewrapProgram: LINUX_PROCESS_CONFINEMENT_PROGRAM,
+        nodeProgram: process.execPath,
+        installationDirectory: resolvedModule.installation.workingDirectory,
+        entrypointPath: resolvedModule.installation.entrypointPath,
+        coreStateDirectory: options.coreStateDirectory,
+      }),
     },
     launcher: {
       ...options.launcher,

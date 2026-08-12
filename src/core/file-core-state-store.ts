@@ -1553,6 +1553,17 @@ export class FileCoreStateStore {
     );
   }
 
+  /**
+   * Returns the directory containing this store's exact state file for the
+   * Host-owned Linux process-confinement composition. The installed runtime
+   * uses this value directly; callers cannot substitute a second path while
+   * continuing to claim that it belongs to this FileCore store.
+   */
+  stateDirectoryForProcessConfinement(): string {
+    this.#assertUsable();
+    return dirname(this.#path);
+  }
+
   /** @internal Only product composition uses this complete operation set. */
   createModuleResultCommitOperations(
     mailboxes: readonly DeliveryMailboxCapacity[] = [],

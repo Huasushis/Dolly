@@ -76,6 +76,7 @@ export interface InstalledReactiveModuleRuntimeOptions extends Omit<
   InstalledLinuxExtensionModuleGenerationFactoryOptions,
   | "cancellationGraceMs"
   | "configurations"
+  | "coreStateDirectory"
   | "executionTimeoutMs"
   | "host"
   | "installations"
@@ -302,6 +303,7 @@ function createInstalledReactiveModuleRuntimeInternal(
     moduleId: options.moduleId,
     installations: options.installations,
     configurations: options.configurations,
+    coreStateDirectory: options.core.stateDirectoryForProcessConfinement(),
     binding: options.binding,
     lifecycle: {
       ...options.lifecycle,

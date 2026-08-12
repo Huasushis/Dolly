@@ -14,6 +14,7 @@ import {
   deriveInstalledLinuxExtensionModuleExecutor,
   type InstalledLinuxExtensionModuleExecutorOptions,
 } from "../../../src/adapters/installed-linux-extension-module-executor.js";
+import { LINUX_PROCESS_CONFINEMENT_PROGRAM } from "../../../src/adapters/linux-process-confinement.js";
 import {
   canonicalJsonDigest,
   type JsonValue,
@@ -460,6 +461,7 @@ describe("installed Extension Module resolution", () => {
       installations,
       configurations,
       moduleGenerationId: MODULE_GENERATION_ID,
+      coreStateDirectory: resolve(scratch, "instance-state"),
       binding: CORE_BINDING,
       lifecycle: {
         records,
@@ -503,8 +505,33 @@ describe("installed Extension Module resolution", () => {
     expect(processRecord.moduleGenerationId).toBe(MODULE_GENERATION_ID);
     expect(processRecord.declaredExternalEffects).toBe("unrestricted");
     expect(derived.executorOptions.lifecycle.execution).toEqual({
-      program: process.execPath,
-      argumentVector: [process.execPath, installed.entrypointPath],
+      program: LINUX_PROCESS_CONFINEMENT_PROGRAM,
+      argumentVector: [
+        LINUX_PROCESS_CONFINEMENT_PROGRAM,
+        "--ro-bind", "/", "/",
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--tmpfs", "/run",
+        "--tmpfs", "/tmp",
+        "--tmpfs", resolve(scratch, "instance-state"),
+        "--dir", "/run/dolly",
+        "--ro-bind", installed.workingDirectory, "/run/dolly/extension",
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-cgroup",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-net",
+        "--disable-userns",
+        "--die-with-parent",
+        "--new-session",
+        "--clearenv",
+        "--cap-drop", "ALL",
+        "--chdir", "/run/dolly/extension",
+        "--",
+        process.execPath,
+        "/run/dolly/extension/dist/main.mjs",
+      ],
       environment: {},
     });
     expect(derived.executorOptions.launcher.launcherEnvironment).toEqual({});
@@ -540,6 +567,7 @@ describe("installed Extension Module resolution", () => {
       installations,
       configurations,
       moduleGenerationId: MODULE_GENERATION_ID,
+      coreStateDirectory: resolve(scratch, "instance-state"),
       binding: CORE_BINDING,
       lifecycle: {
         records: recordStore(),
@@ -687,6 +715,7 @@ describe("installed Extension Module resolution", () => {
       moduleId: "worker",
       installations,
       configurations,
+      coreStateDirectory: resolve(scratch, "instance-state"),
       binding: CORE_BINDING,
       lifecycle: {
         records,

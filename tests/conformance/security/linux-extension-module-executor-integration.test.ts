@@ -544,6 +544,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       moduleId: "installed-worker",
       installations,
       configurations,
+      coreStateDirectory: store.stateDirectoryForProcessConfinement(),
       binding: inspectedBinding.binding,
       lifecycle: {
         records: store,
