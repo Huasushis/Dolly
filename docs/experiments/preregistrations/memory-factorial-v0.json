@@ -1,0 +1,424 @@
+{
+  "$schema": "./memory-factorial-v0-schema.json",
+  "schemaVersion": "dolly-experiment-preregistration/v1",
+  "experimentId": "memory-factorial-v0",
+  "experimentVersion": 2,
+  "title": "Deterministic confirmation of repeated-position evidence and task-state representations",
+  "status": "frozen-before-first-run",
+  "scope": "exploratory-component",
+  "protocol": {
+    "path": "docs/experiments/protocol.md",
+    "sha256": "e5105404aafa581716e7767244ba458966b73597c4e8a02e6a64a0cbbdfa5e81"
+  },
+  "authorityReferences": [
+    "AGENTS.md",
+    ".qoder/specs/dolly_new.txt lines 91-117 and 180",
+    ".qoder/specs/dolly_owner_addendum_20260801.txt",
+    "docs/spec/memory-extension.md sections 10, 14, and 17",
+    "docs/experiments/preregistrations/memory-association-task-switch-v0.json",
+    "docs/research/memory-association-task-switch-v0.md",
+    "docs/research/memory-factorial-v0-design.md"
+  ],
+  "definitions": {
+    "repeated-position evidence": "Raw source records reached through token pairs that are adjacent in at least two distinct historical episodes; it records association, not causation.",
+    "deterministic checkpoint": "A closed task-state object copied by deterministic rules from an association evidence packet and retaining the raw source identifiers for every claim.",
+    "claim group": "One semantic claim with one or more independently sufficient source-identifier sets; the sets are logical alternatives, so duplicate equivalent sources do not multiply correctness.",
+    "old-action use": "Resuming a stored action after an explicit do-not-resume cue or cancellation, or using the initial action after a later supersession record.",
+    "reference reader": "A deterministic contract fixture that converts the bounded packet to the closed decision schema; it is not a language model or a Dolly product run.",
+    "automatic resume": "Returning a resume decision with a closed operation and exact arguments without first asking for user confirmation."
+  },
+  "question": "On sixteen frozen scenarios spanning two task families and four explicit cue classes, does repeated-position raw evidence repair the content-only evidence deficit, and can a deterministic checkpoint or checkpoint-plus-raw representation preserve that result while meeting frozen safety and byte-cost gates?",
+  "hypotheses": {
+    "primary": [
+      {
+        "id": "h1-association-useful-effect",
+        "statement": "Association raw evidence improves semantic case success over content raw by at least 0.25 absolute on the eight action-bearing positive and superseded scenarios, with no paired regression.",
+        "outcomeMeasure": "semantic_case_success"
+      },
+      {
+        "id": "h2-checkpoint-noninferiority",
+        "statement": "The deterministic checkpoint loses at most one of sixteen cases versus association raw and reduces p95 UTF-8 evidence bytes by at least 0.25 relative.",
+        "outcomeMeasure": "checkpoint_noninferiority"
+      },
+      {
+        "id": "h3-composition-added-value",
+        "statement": "Checkpoint plus association raw repairs at least two of eight action-bearing cases beyond association raw without any paired loss and remains within 1.50 times its p95 evidence bytes.",
+        "outcomeMeasure": "composition_added_value"
+      }
+    ],
+    "guardrails": [
+      {
+        "id": "g1-no-false-resume",
+        "statement": "Every candidate representation has zero false resume across the eight explicit do-not-resume and cancelled scenarios.",
+        "outcomeMeasure": "false_resume"
+      },
+      {
+        "id": "g2-no-old-action-use",
+        "statement": "Every candidate representation has zero old-action use across all do-not-resume, cancelled, and superseded scenarios.",
+        "outcomeMeasure": "old_action_use"
+      },
+      {
+        "id": "g3-source-closure",
+        "statement": "Every cited raw source resolves through the condition packet and no unrelated or cross-claim citation is accepted.",
+        "outcomeMeasure": "invalid_source_citation"
+      }
+    ]
+  },
+  "decision": {
+    "currentProductState": "Earlier Aether pilot scoring mixed a natural-language action surface form with retrieval quality and counted equivalent repeated constraint citations as if both were required. This version isolates representation mechanics with a closed operation schema and claim-group OR-set scoring. No Memory product behavior is thereby supported.",
+    "changesIfSupported": [
+      "If association meets the useful-effect and all safety gates, retain it only as a source-cited experimental retrieval candidate for a later public Agent experiment.",
+      "Select the deterministic checkpoint only if it also meets its noninferiority and 25 percent p95 byte-reduction gate; otherwise keep raw evidence.",
+      "Add checkpoint plus association raw only if it repairs at least two paired cases and passes the 1.50-times byte gate.",
+      "Keep automatic resume disabled until a separate public Agent and Dolly integration experiment passes cancellation, restart, deletion, isolation, and tool-effect boundaries."
+    ],
+    "changesIfRejected": [
+      "If association does not improve at least two of eight action-bearing cases, do not add this repeated-position mechanism to Memory.",
+      "If the checkpoint is not smaller or loses more than one case, do not use it as the default representation.",
+      "If composition adds no paired successes or exceeds the cost bound, omit the redundant combined packet.",
+      "Any false resume, old-action use, unresolved citation, or unrelated citation keeps automatic task resumption disabled."
+    ],
+    "prohibitedClaims": [
+      "The deterministic reference reader cannot establish language-model, Agent, or Dolly product efficacy.",
+      "This experiment does not test a public model, owner Aether, SSE transport, model reasoning, or model context behavior.",
+      "This experiment does not test restart recovery, deletion propagation, namespace isolation, Scheduler integration, installed Module launch, or real tool effects.",
+      "Repeated proximity is association evidence and never proof of position or causal semantics.",
+      "No result may remove, weaken, or bypass the Module startup refusal."
+    ]
+  },
+  "conditions": {
+    "baselines": [
+      {
+        "id": "content-raw",
+        "description": "Deterministic token-overlap retrieval returns at most four immutable raw source records without association expansion or a checkpoint.",
+        "frozenParameters": {
+          "maximumRecords": 4,
+          "ranking": "descending distinct query-token overlap, descending source sequence, then source identifier",
+          "checkpoint": false,
+          "association": false
+        }
+      }
+    ],
+    "treatments": [
+      {
+        "id": "association-raw",
+        "description": "At most two records reached through repeated adjacent token-pair evidence are placed before content records, deduplicated, and bounded to four raw records.",
+        "frozenParameters": {
+          "maximumAssociatedRecords": 2,
+          "maximumRecords": 4,
+          "recordDistance": 1,
+          "minimumDistinctEpisodes": 2,
+          "causalInterpretation": false
+        }
+      },
+      {
+        "id": "deterministic-checkpoint",
+        "description": "A single closed task-state checkpoint is deterministically constructed from the exact association-raw packet and cites its underlying raw sources.",
+        "frozenParameters": {
+          "input": "byte-identical association-raw packet",
+          "generatedTextAllowed": false,
+          "maximumSourceHops": 1,
+          "rawRecordsIncluded": false
+        }
+      },
+      {
+        "id": "checkpoint-association-raw",
+        "description": "The identical deterministic checkpoint is prepended to the byte-identical association-raw packet without changing retrieval.",
+        "frozenParameters": {
+          "checkpoint": "byte-identical deterministic-checkpoint cell value",
+          "rawEvidence": "byte-identical association-raw cell value",
+          "maximumSourceHops": 1
+        }
+      }
+    ]
+  },
+  "data": {
+    "generatorOrDataset": {
+      "id": "memory-factorial-deterministic-corpus",
+      "version": "2",
+      "contentDefinition": "A checked-in deterministic generator expands four base tasks into positive, explicit do-not-resume, cancelled, and superseded scenarios. Every scenario contains two independently sufficient paraphrased constraint records in distinct episodes, a current state, an identity distractor, and an explicit later state update when applicable."
+    },
+    "training": {
+      "name": "training-reserved-unused",
+      "seeds": [401, 402],
+      "caseFactors": [
+        "Reserved only for a future version; this version performs no training or tuning."
+      ]
+    },
+    "development": {
+      "name": "development-reserved-unused",
+      "seeds": [451, 452],
+      "caseFactors": [
+        "Reserved only for a future version; all version-two rules were frozen before any formal result."
+      ]
+    },
+    "evaluation": {
+      "name": "evaluation",
+      "seeds": [501, 502, 503, 504],
+      "caseFactors": [
+        "Two structured-data-import tasks and two software-incident tasks.",
+        "Each seed expands into positive, do-not-resume, cancelled, and superseded cues.",
+        "Each of sixteen scenarios is evaluated in four representation cells for exactly sixty-four case rows."
+      ]
+    },
+    "splitIsolation": "Training and development identifiers are reserved and unused. Only evaluation seeds 501 through 504 are generated, and the active context uses separate identifiers from every memory source record.",
+    "tuningUsesTrainingAndDevelopmentOnly": true
+  },
+  "backend": {
+    "allowedKinds": ["local"],
+    "requiredKind": "local",
+    "silentFallbackAllowed": false,
+    "credentialsRequired": false,
+    "networkRequired": false
+  },
+  "randomness": {
+    "generator": "No pseudorandom generator; seed values select four literal frozen task fixtures.",
+    "generatorVersion": "2",
+    "streamSeparation": "No random stream exists. Dataset order, record order, retrieval tie breaks, cell order, and case order are deterministic and source controlled.",
+    "executionOrder": "Seeds are ordered 501 through 504, cues follow the frozen cue list, and cells follow the frozen cell list; no adaptive ordering is permitted.",
+    "repetitionsPerCase": 1
+  },
+  "metrics": {
+    "primary": {
+      "name": "semantic_case_success",
+      "unit": "binary per deterministic reference-reader case",
+      "aggregation": "Macro mean by cell, with an exact paired difference on the eight positive and superseded action-bearing scenarios.",
+      "direction": "maximize",
+      "population": "All sixty-four deterministic cases, with the primary association contrast restricted to the eight paired action-bearing scenarios."
+    },
+    "secondary": [
+      {
+        "name": "checkpoint_noninferiority",
+        "unit": "case losses and relative p95 UTF-8 byte reduction",
+        "aggregation": "Count checkpoint semantic failures where paired association raw succeeds, and compute one minus checkpoint p95 bytes divided by association-raw p95 bytes.",
+        "direction": "maximize",
+        "population": "All sixteen paired deterministic-checkpoint and association-raw scenarios."
+      },
+      {
+        "name": "composition_added_value",
+        "unit": "net paired successful cases",
+        "aggregation": "Checkpoint-plus-association-raw success minus association-raw success on each of eight action-bearing scenarios.",
+        "direction": "maximize",
+        "population": "The eight positive and superseded action-bearing scenarios."
+      },
+      {
+        "name": "evidence_bytes",
+        "unit": "UTF-8 bytes of canonical JSON evidence",
+        "aggregation": "Report median and nearest-rank p95 separately for each representation cell.",
+        "direction": "minimize",
+        "population": "All sixteen scenarios in each representation cell."
+      }
+    ],
+    "guardrails": [
+      {
+        "name": "false_resume",
+        "unit": "count",
+        "aggregation": "Count resume decisions on explicit do-not-resume or cancelled scenarios by cell.",
+        "direction": "zero",
+        "population": "The eight do-not-resume and cancelled scenarios per candidate cell."
+      },
+      {
+        "name": "old_action_use",
+        "unit": "count",
+        "aggregation": "Count old action values or old action-source citations after do-not-resume, cancellation, or supersession by cell.",
+        "direction": "zero",
+        "population": "The twelve negative or state-update scenarios per candidate cell."
+      },
+      {
+        "name": "invalid_source_citation",
+        "unit": "count",
+        "aggregation": "Count citations outside one-hop evidence closure and any source identifier forbidden for the semantic claim.",
+        "direction": "zero",
+        "population": "All sixty-four deterministic cases."
+      }
+    ],
+    "minimumEffect": {
+      "metric": "semantic_case_success",
+      "magnitude": 0.25,
+      "scale": "absolute",
+      "confidenceLevel": 0.95,
+      "intervalMethod": "Exact paired enumeration is reported descriptively; with only eight pairs this mechanism screen does not make a population-inference claim.",
+      "comparison": "Association raw minus content raw on the eight positive and superseded action-bearing scenarios."
+    }
+  },
+  "execution": {
+    "factorialDesign": "One frozen sixteen-scenario dataset crossed with four representation cells: content raw, association raw, deterministic checkpoint, and checkpoint plus the identical association raw packet.",
+    "casePlan": [
+      {
+        "id": "evaluation-deterministic",
+        "phase": "evaluation",
+        "maximumCount": 64,
+        "requiredWhen": "Always required before this deterministic mechanism experiment can receive any classification.",
+        "formula": "16 scenarios * 4 cells * 1 repetition"
+      }
+    ],
+    "plannedMaximumCases": 64,
+    "maxCases": 64,
+    "maxEventsPerCase": 1,
+    "maxRawRecordsPerCase": 4,
+    "maxVirtualTimeMsPerCase": 1,
+    "maxWallClockMs": 60000,
+    "failurePolicy": "Any pre-result hash mismatch, missing or duplicate case, factor imbalance, source-derived truth mismatch, invalid schema, packet above 4096 bytes, unresolved citation, aggregate mismatch, verifier failure, or surviving mutation makes the run inconclusive.",
+    "retryPolicy": "There are no external calls and no retries; every deterministic case is computed exactly once."
+  },
+  "stoppingRules": {
+    "plannedCompletion": "Freeze and persist protocol, preregistration, dataset, and all treatment-source hashes before computing exactly sixteen checkpoints and sixty-four case rows; then independently verify the artifacts and reject every declared mutation.",
+    "earlyEfficacyStopAllowed": false,
+    "abortConditions": [
+      "Any registered protocol, dataset, or implementation hash changes before a formal run.",
+      "The generator does not produce exactly two task families by two seeds by four cue classes, or a cue is not explicit under the frozen grammar.",
+      "Any evidence packet exceeds 4096 canonical-json UTF-8 bytes, contains more than four raw records, or cites beyond one source hop.",
+      "Any network request, model download, private data access, paid service, Dolly product runtime, or installed Module launch is attempted.",
+      "The independent verifier imports the treatment generator, retrieval, checkpoint, scorer, or runner implementation."
+    ]
+  },
+  "decisionRules": {
+    "classificationOrder": "Hash, coverage, source-derived truth, output representation, citation closure, negative safety, and mutation validation gates run before useful-effect or cost comparisons; any earlier failure is inconclusive.",
+    "supported": [
+      "Association is a deterministic mechanism candidate only if it improves at least two of eight action-bearing cases, has no paired regression, and every candidate cell has zero false resume, old-action use, invalid citation, and unrelated citation.",
+      "The deterministic checkpoint is a representation candidate only if it loses at most one of sixteen paired cases and reduces p95 evidence bytes by at least 25 percent versus association raw.",
+      "Checkpoint plus association raw is a composition candidate only if it adds at least two of eight action-bearing successes, has no paired loss, and its p95 bytes are at most 1.50 times association raw."
+    ],
+    "rejected": [
+      "A complete valid association contrast with fewer than two net action-bearing gains or any paired regression rejects this repeated-position mechanism for the next Agent experiment.",
+      "A complete valid checkpoint contrast with more than one loss or less than 25 percent p95 byte reduction rejects the checkpoint as the selected representation.",
+      "A complete valid composition contrast with fewer than two net gains, any loss, or excessive p95 bytes rejects the combined representation."
+    ],
+    "inconclusive": [
+      "Any frozen-hash, coverage, source-truth, schema, citation, safety, checksum, independent-verification, or mutation-test failure prevents classification.",
+      "A deterministic result cannot be promoted to a language-model, Agent, Dolly product, or automatic-resume claim."
+    ]
+  },
+  "artifacts": {
+    "rootPattern": "artifacts/experiments/probes/memory-factorial-v0",
+    "requiredFiles": [
+      "run-freeze.json",
+      "preregistration.json",
+      "dataset.jsonl",
+      "checkpoints.jsonl",
+      "cases.jsonl",
+      "analysis.json",
+      "run-manifest.json",
+      "sha256sums.txt",
+      "validation.json",
+      "mutation-validation.json"
+    ],
+    "runManifestFields": [
+      "experimentId",
+      "experimentVersion",
+      "protocolSha256",
+      "preregistrationSha256",
+      "sourceCommit",
+      "dirtyWorktree",
+      "configuration",
+      "dataset",
+      "modelEndpointCapabilityProfile",
+      "modelIdentifier",
+      "backend",
+      "seeds",
+      "executionOrder",
+      "resourceBudgets",
+      "perCaseAccounting",
+      "rawOutputs",
+      "validatorResults",
+      "aggregateMetrics",
+      "startedAt",
+      "finishedAt",
+      "failure"
+    ]
+  },
+  "independentValidation": {
+    "analyzerPath": "scripts/experiments/probes/memory-factorial-v0/verify.mjs",
+    "readsOnlyArtifacts": true,
+    "importsTreatmentImplementation": false,
+    "requiredChecks": [
+      "Derive task identity, state, initial and replacement actions, constraints, and cue semantics independently from source text rather than trusting stored ground truth.",
+      "Recompute content retrieval, repeated-position edges, association retrieval, deterministic checkpoints, evidence packets, per-case schema and semantic scores, aggregates, and decisions without importing treatment code.",
+      "Treat the two equivalent constraint records as a claim-group OR-set: either one independently covers the claim, both count only as corroboration, and an anchor or unrelated record fails precision.",
+      "Verify exact factor coverage, one-hop source closure, packet bytes, protocol, preregistration, dataset, implementation, and artifact checksums."
+    ],
+    "mutationTests": [
+      "Replace a closed operation with a natural-language surface form and require rejection.",
+      "Use a historical anchor as constraint support and require claim-group rejection.",
+      "Resume the initial action after do-not-resume, cancellation, and supersession in three separate mutations and require rejection.",
+      "Remove one case row, change one aggregate, and alter one frozen source record in separate mutations and require rejection."
+    ]
+  },
+  "safetyBoundary": {
+    "productRuntimeUsed": false,
+    "moduleLaunchAllowed": false,
+    "networkAccessAllowed": false,
+    "privateDataAllowed": false,
+    "paidServicesAllowed": false,
+    "knownP0PathReachable": false,
+    "moduleStartupRefusalMustRemain": true
+  },
+  "domainDesign": {
+    "implementationStatus": "The public deterministic generator, scorer, runner, independent verifier, mutation harness, and conformance tests exist. No formal result directory or model evidence has been produced in this version.",
+    "frozenGroundTruth": {
+      "positive": "resume current active action plus exact arguments and one independently sufficient constraint source",
+      "do-not-resume": "abstain with explicit_do_not_resume, unknown state, null action and constraint, and empty support",
+      "cancelled": "abstain with task_cancelled, cancelled state, null action and constraint, citing only the later cancellation for state and action",
+      "superseded": "resume only the later replacement operation and arguments, citing the later supersession for state and action plus either sufficient constraint source"
+    },
+    "closedDecisionSchema": {
+      "schemaVersion": "memory-factorial/decision-v2",
+      "decisions": ["resume", "abstain"],
+      "decisionReasons": ["current_action", "explicit_do_not_resume", "task_cancelled", "superseded_action", "insufficient_evidence"],
+      "taskStates": ["active", "cancelled", "unknown"],
+      "operations": {
+        "add_idempotency_guard": ["idempotencyKey"],
+        "reconcile_duplicate_deliveries": ["batchId"],
+        "restart_service": ["serviceName"],
+        "revert_release": ["releaseId", "serviceName"]
+      },
+      "supportClaims": ["taskState", "action", "constraints"]
+    },
+    "claimGroupScoring": "A required claim succeeds when its citations contain every identifier in at least one sufficient source set. Citations must remain inside the union of that claim's sets and inside one-hop evidence closure. Citing both equivalent constraint records records corroboration count two but semantic success remains binary one.",
+    "factorMatrix": {
+      "taskFamilies": ["structured-data-import", "software-incident"],
+      "seeds": [501, 502, 503, 504],
+      "cueTypes": ["positive", "do-not-resume", "cancelled", "superseded"],
+      "cells": ["content-raw", "association-raw", "deterministic-checkpoint", "checkpoint-association-raw"]
+    },
+    "datasetSha256": "c452885e46a63327d2cb1aa8d22103a0641da5e9ca09a7f923a31377521a01b8",
+    "implementationFiles": [
+      {
+        "path": "scripts/experiments/probes/memory-factorial-v0/common.mjs",
+        "sha256": "7ca9b2204a9bfca3689df47b83738d6f6d2eec802d4929785c30d13dd50a52ae"
+      },
+      {
+        "path": "scripts/experiments/probes/memory-factorial-v0/dataset.mjs",
+        "sha256": "abe705673720daf381c28c482726fed3f854eedc675962159ea16680af49524d"
+      },
+      {
+        "path": "scripts/experiments/probes/memory-factorial-v0/scorer.mjs",
+        "sha256": "ec2b612f149e7a9e76cdd194970e4791d35d3ee5b1d3ecf248260e530a2c0663"
+      },
+      {
+        "path": "scripts/experiments/probes/memory-factorial-v0/run.mjs",
+        "sha256": "c4e2148eb1c4e3ded9fbfeddf03a35784cf3ce6ae89ee8c67bca3929d162da21"
+      },
+      {
+        "path": "scripts/experiments/probes/memory-factorial-v0/verify.mjs",
+        "sha256": "afb9d5bc60d29674e25d063a60c1a7fff294f629daecd63e4e5e0b09b4efbbff"
+      },
+      {
+        "path": "scripts/experiments/probes/memory-factorial-v0/run-mutation-tests.mjs",
+        "sha256": "e4308f919ae5101c7fe95aa87d98be42df0991af2f3bb1481d9e4cea9217e427"
+      },
+      {
+        "path": "scripts/experiments/probes/memory-factorial-v0/validate-preregistration.mjs",
+        "sha256": "866f1ddd82ef7843a016cccc9592f76e707752c4915e1a704ed28aca6afb10b7"
+      }
+    ],
+    "freezeSemantics": "The runner reads registered hashes, derives and hashes the full dataset, hashes the canonical preregistration snapshot bytes that it will write, and persists run-freeze.json before checkpoint, case, or aggregate computation. A formal result is forbidden until every registered hash matches.",
+    "modelBoundary": "No model is downloaded or called. Strict SSE Aether and a revision-pinned public model remain separately preregistered future Agent experiments; neither can be inferred from this reference reader.",
+    "remainingOutsideScope": [
+      "Language-model sensitivity to representation, reasoning mode, longer interruption gaps, negative paraphrases, and multiple decoder seeds",
+      "Dolly Memory integration, Scheduler behavior, installed Module launch, restart, cancellation propagation, deletion, isolation, and real tool effects",
+      "Generated checkpoint quality, public-model reproducibility, owner Aether deployment replication, and automatic task-resume safety",
+      "Long-term learning, daily summarization, skills, multimodal memory, emotion or desire factors, and benchmark transfer"
+    ]
+  }
+}
