@@ -79,12 +79,15 @@ describe("Linux process confinement derivation", () => {
     expect(() => deriveLinuxProcessConfinementExecution({
       ...base,
       coreStateDirectory: `${INSTALLATION}/private-state`,
-    })).toThrow(/must not overlap/u);
-    expect(() => deriveLinuxProcessConfinementExecution({
+    })).toThrow(/must not be the installed package or one of its descendants/u);
+    const installationInsideState = deriveLinuxProcessConfinementExecution({
       ...base,
       installationDirectory: `${STATE}/packages/package-a`,
       entrypointPath: `${STATE}/packages/package-a/main.mjs`,
-    })).toThrow(/must not overlap/u);
+    });
+    expect(installationInsideState.argumentVector.indexOf(STATE)).toBeLessThan(
+      installationInsideState.argumentVector.indexOf(`${STATE}/packages/package-a`),
+    );
     expect(() => deriveLinuxProcessConfinementExecution({
       ...base,
       coreStateDirectory: "/run/dolly-state",

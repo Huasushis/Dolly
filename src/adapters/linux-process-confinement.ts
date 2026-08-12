@@ -48,7 +48,8 @@ function pathsOverlap(left: string, right: string): boolean {
 
 function assertSafeStateDirectory(
   stateDirectory: string,
-  requiredPaths: readonly string[],
+  processExecutables: readonly string[],
+  installationDirectory: string,
 ): void {
   if (
     stateDirectory === "/" ||
@@ -60,9 +61,21 @@ function assertSafeStateDirectory(
       "coreStateDirectory cannot be a root or runtime-system directory",
     );
   }
-  if (requiredPaths.some((path) => pathsOverlap(stateDirectory, path))) {
+  if (processExecutables.some((path) => pathsOverlap(stateDirectory, path))) {
     throw new TypeError(
-      "coreStateDirectory must not overlap the installed package or process executables",
+      "coreStateDirectory must not overlap the process executables",
+    );
+  }
+  // The installation registry commonly lives below Core state. That direction
+  // is safe because bubblewrap resolves the Host source and remounts only the
+  // verified package after the state directory is hidden. The reverse would
+  // re-expose Core state as part of the guest package mount.
+  if (
+    stateDirectory === installationDirectory ||
+    isWithin(installationDirectory, stateDirectory)
+  ) {
+    throw new TypeError(
+      "coreStateDirectory must not be the installed package or one of its descendants",
     );
   }
 }
@@ -106,11 +119,11 @@ export function deriveLinuxProcessConfinementExecution(
   if (options.installationDirectory === "/") {
     throw new TypeError("installationDirectory cannot be the filesystem root");
   }
-  assertSafeStateDirectory(options.coreStateDirectory, [
-    options.bubblewrapProgram,
-    options.nodeProgram,
+  assertSafeStateDirectory(
+    options.coreStateDirectory,
+    [options.bubblewrapProgram, options.nodeProgram],
     options.installationDirectory,
-  ]);
+  );
 
   const guestEntrypoint = posix.join(
     GUEST_PACKAGE_DIRECTORY,
