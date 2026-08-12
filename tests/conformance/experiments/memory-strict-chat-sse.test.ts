@@ -41,7 +41,7 @@ function completeStream(): string {
     }),
     event({
       ...identity,
-      choices: [],
+      choices: [{ index: 0, delta: {} }],
       usage: { prompt_tokens: 4, completion_tokens: 5, total_tokens: 9 },
     }),
     "data: [DONE]\n\n",
@@ -75,7 +75,7 @@ describe("Memory strict chat SSE reader", () => {
     ["non-SSE content type", response(completeStream(), "application/json")],
     ["missing usage", response(completeStream().replace(event({
       ...identity,
-      choices: [],
+      choices: [{ index: 0, delta: {} }],
       usage: { prompt_tokens: 4, completion_tokens: 5, total_tokens: 9 },
     }), ""))],
     ["missing DONE", response(completeStream().replace("data: [DONE]\n\n", ""))],

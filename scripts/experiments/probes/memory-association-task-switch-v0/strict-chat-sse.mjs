@@ -65,16 +65,27 @@ function acceptEvent(event, state) {
   } else if (state.providerId !== envelope.id || state.model !== envelope.model) {
     throw new Error('SSE provider identity changed');
   }
-  if (envelope.choices.length === 0) {
+  if (envelope.usage !== undefined && envelope.usage !== null) {
     if (!plainObject(envelope.usage) || state.usage !== null) {
-      throw new Error('SSE choice-less event must carry exactly one usage object');
+      throw new Error('SSE stream must carry exactly one usage object');
+    }
+    if (envelope.choices.length === 1) {
+      const usageChoice = envelope.choices[0];
+      exactKeys(usageChoice, ['index', 'delta', 'finish_reason', 'logprobs'], 'SSE usage choice');
+      exactKeys(usageChoice.delta, [], 'SSE usage delta');
+      if (
+        usageChoice.index !== 0 ||
+        (usageChoice.finish_reason !== undefined && usageChoice.finish_reason !== null) ||
+        (usageChoice.logprobs !== undefined && usageChoice.logprobs !== null)
+      ) {
+        throw new Error('SSE usage choice must be the measured empty delta');
+      }
+    } else if (envelope.choices.length !== 0) {
+      throw new Error('SSE usage event choice count is invalid');
     }
     state.usage = envelope.usage;
     state.usageEventCount += 1;
     return;
-  }
-  if (envelope.usage !== undefined && envelope.usage !== null) {
-    throw new Error('SSE usage must be isolated in the terminal choice-less event');
   }
   if (envelope.choices.length !== 1) throw new Error('SSE choice count is invalid');
   const choice = envelope.choices[0];

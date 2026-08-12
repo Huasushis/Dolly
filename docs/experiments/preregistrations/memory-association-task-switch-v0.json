@@ -2,7 +2,7 @@
   "$schema": "./schema-v1.json",
   "schemaVersion": "dolly-experiment-preregistration/v1",
   "experimentId": "memory-association-task-switch-v0",
-  "experimentVersion": 10,
+  "experimentVersion": 11,
   "title": "Memory representations and repeated positional association in an interrupted-task Agent pilot",
   "status": "frozen-before-first-run",
   "scope": "exploratory-component",
@@ -558,7 +558,7 @@
     "moduleStartupRefusalMustRemain": true
   },
   "domainDesign": {
-    "implementationStatus": "Versions 2 through 6 established that this Aether route can spend 700 to 3600 completion tokens entirely in non-empty reasoning_content and return no content, and version 5 also exposed an undeclared 90-second harness timeout. Version 7 raised max_tokens to 5200 and asked for internal analysis under 200 words: its learner completed, but one Agent exhausted 5200 tokens and a later call timed out at 180 seconds. Version 8 used the route's measured thinking.type=disabled mode for scored Agent calls; its learner and first three Agent calls completed, then a disabled Agent request timed out after 90 seconds. Version 9 completed the 38 logical calls with transport-only retries and remains the non-stream historical result. Version 10 changes only the Aether response transport contract: every generation request sends stream=true and stream_options.include_usage=true; a successful attempt requires text/event-stream, one stable provider identity, a finish reason, exactly one choice-less usage event, and exactly one [DONE]. There is no non-stream fallback and malformed HTTP 200 streams are never retried. Data, prompts, thinking modes, splits, conditions, 38 logical calls, metrics, retryable transport categories, and effect thresholds are otherwise unchanged. Reasoning-enabled Agent efficacy remains outside this run's support. Earlier failures and frozen preregistration bytes remain retained under the experiment artifact root. The harness remains standalone and may not import Dolly runtime or current Memory implementation.",
+    "implementationStatus": "Versions 2 through 6 established that this Aether route can spend 700 to 3600 completion tokens entirely in non-empty reasoning_content and return no content, and version 5 also exposed an undeclared 90-second harness timeout. Version 7 raised max_tokens to 5200 and asked for internal analysis under 200 words: its learner completed, but one Agent exhausted 5200 tokens and a later call timed out at 180 seconds. Version 8 used the route's measured thinking.type=disabled mode for scored Agent calls; its learner and first three Agent calls completed, then a disabled Agent request timed out after 90 seconds. Version 9 completed the 38 logical calls with transport-only retries and remains the non-stream historical result. Version 10 first required strict streaming but stopped on its first HTTP 200 because it incorrectly required a choice-less usage event; retained general-Agent evidence shows the measured Aether usage event contains one empty-delta choice. Version 11 corrects only that falsified decoder assumption: exactly one usage object is accepted with either zero choices or one measured empty-delta choice, followed by exactly one [DONE]. Every request still sends stream=true and stream_options.include_usage=true; successful attempts still require text/event-stream, stable provider identity, a finish reason, bounded valid UTF-8 SSE, unique terminal usage, and no bytes after [DONE]. There is no non-stream fallback and malformed HTTP 200 streams are never retried. Data, prompts, thinking modes, splits, conditions, 38 logical calls, metrics, retryable transport categories, and effect thresholds are otherwise unchanged. Reasoning-enabled Agent efficacy remains outside this run's support. Earlier failures and frozen preregistration bytes remain retained under the experiment artifact root. The harness remains standalone and may not import Dolly runtime or current Memory implementation.",
     "implementationFiles": [
       {
         "path": "scripts/experiments/probes/memory-association-task-switch-v0/common.mjs",
@@ -574,7 +574,7 @@
       },
       {
         "path": "scripts/experiments/probes/memory-association-task-switch-v0/strict-chat-sse.mjs",
-        "sha256": "fb90bae0d5bf5aa8bd874fac099364ee304a746805f08e4c9335f2afb1ceae51"
+        "sha256": "d67ef50efac2fa7a32daaa4dc8b57c790afccbe6ef2123bc974af47f14d2999b"
       },
       {
         "path": "scripts/experiments/probes/memory-association-task-switch-v0/verify.mjs",
@@ -658,7 +658,7 @@
           "include_usage": true
         }
       },
-      "streamContract": "Every HTTP 200 attempt must have content type text/event-stream, stable id/model, one finish reason, one choice-less usage event, exactly one [DONE], no bytes after [DONE], bounded valid UTF-8 events, and no non-stream fallback.",
+      "streamContract": "Every HTTP 200 attempt must have content type text/event-stream, stable id/model, one finish reason, exactly one usage object carried by zero choices or one measured empty-delta choice, exactly one [DONE], no bytes after [DONE], bounded valid UTF-8 events, and no non-stream fallback.",
       "reasoningEvidence": "Only a non-empty response message reasoning_content proves reasoning for that call. Content and reasoning remain separate in raw artifacts.",
       "secretHandling": "Load .env without printing values; never store the API key, configured origin, authorization header, or unredacted request URL. Artifacts use the label owner-aether-qwen36 only.",
       "logicalCallBudget": 38,
