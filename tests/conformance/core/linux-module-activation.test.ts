@@ -54,6 +54,14 @@ describe("Linux Module activation preconditions", () => {
     });
   });
 
+  it("rejects low-level evidence overrides instead of minting authority from them", async () => {
+    await expect(decideLinuxModuleActivation({
+      ...baseOptions(),
+      cgroupRoot: "/tmp/forged-cgroup",
+    } as never)).rejects.toThrow(/unknown fields: cgroupRoot/u);
+    expect(runtimeMock.inspect).not.toHaveBeenCalled();
+  });
+
   it.runIf(LINUX_ONLY)("refuses every configured Module away from Linux", async () => {
     const result = await decideLinuxModuleActivation(baseOptions());
     expect(result.permitted).toBe(false);

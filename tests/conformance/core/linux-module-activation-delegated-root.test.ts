@@ -1,9 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
-import type { ModuleCgroupFileSystem } from "../../../src/core/linux-module-cgroup.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { DelegatedCgroupRootResult } from "../../../src/core/linux-module-cgroup.js";
 import type { ReviewedLinuxModuleRuntimeInspection } from "../../../src/linux-module-runtime-assets.js";
 
 const SERVICE_CGROUP = "/user.slice/dolly-core.service";
-const CGROUP_ROOT = "/test-cgroup";
 
 const runtimeMock = vi.hoisted(() => {
   const runtime = {
@@ -39,9 +38,27 @@ const bindingMock = vi.hoisted(() => {
   };
 });
 
+const cgroupMock = vi.hoisted(() => {
+  const root = {
+    filesystemPath: "/sys/fs/cgroup/user.slice/dolly-core.service",
+    controllers: ["cpu", "io", "memory", "pids"],
+    subtreeControl: ["cpu", "memory", "pids"],
+  };
+  return {
+    root,
+    prepare: vi.fn<() => Promise<DelegatedCgroupRootResult>>(
+      async () => ({ prepared: true as const, root }),
+    ),
+  };
+});
+
 vi.mock("../../../src/core/linux-core-service-binding.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../../src/core/linux-core-service-binding.js")>(),
   inspectCoreServiceBinding: bindingMock.inspect,
+}));
+vi.mock("../../../src/core/linux-module-cgroup.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/core/linux-module-cgroup.js")>(),
+  prepareDelegatedCgroupRoot: cgroupMock.prepare,
 }));
 vi.mock("../../../src/linux-module-runtime-assets.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../../src/linux-module-runtime-assets.js")>(),
@@ -50,39 +67,33 @@ vi.mock("../../../src/linux-module-runtime-assets.js", async (importOriginal) =>
 
 import { decideLinuxModuleActivation } from "../../../src/core/linux-module-activation.js";
 
-function cgroupFileSystem(readSubtreeControl: () => string): ModuleCgroupFileSystem {
-  const root = `${CGROUP_ROOT}${SERVICE_CGROUP}`;
-  return {
-    readTextFile: vi.fn(async (path: string) => {
-      if (path === `${root}/cgroup.procs`) return "";
-      if (path === `${root}/cgroup.controllers`) return "cpu io memory pids\n";
-      if (path === `${root}/cgroup.subtree_control`) return readSubtreeControl();
-      throw new Error(`unexpected read ${path}`);
-    }),
-    writeTextFile: vi.fn(async () => undefined),
-    createDirectory: vi.fn(async () => undefined),
-    removeDirectory: vi.fn(async () => undefined),
-    listChildDirectoryNames: vi.fn(async () => []),
-    directoryExists: vi.fn(async () => false),
-    writableFileExists: vi.fn(async () => true),
-  };
-}
-
-function options(fileSystem: ModuleCgroupFileSystem) {
+function options() {
   return {
     unitName: "dolly-core.service",
     mode: "user" as const,
-    cgroupRoot: CGROUP_ROOT,
-    cgroupFileSystem: fileSystem,
   };
 }
 
 describe("Linux Module activation delegated-root authority", () => {
+  beforeEach(() => {
+    cgroupMock.prepare.mockReset();
+    cgroupMock.prepare.mockResolvedValue({
+      prepared: true as const,
+      root: cgroupMock.root,
+    });
+  });
+
   it.runIf(process.platform === "linux")(
     "refuses activation when required subtree controllers do not read back",
     async () => {
-      const fileSystem = cgroupFileSystem(() => "cpu memory\n");
-      const result = await decideLinuxModuleActivation(options(fileSystem));
+      cgroupMock.prepare.mockResolvedValueOnce({
+        prepared: false as const,
+        failure: {
+          code: "MODULE_CGROUP_CONTROLLER_UNAVAILABLE" as const,
+          detail: "cgroup.subtree_control does not enable pids",
+        },
+      });
+      const result = await decideLinuxModuleActivation(options());
 
       expect(result).toEqual({
         permitted: false,
@@ -92,33 +103,22 @@ describe("Linux Module activation delegated-root authority", () => {
         }],
       });
       expect("stopProver" in result).toBe(false);
-      expect(fileSystem.writeTextFile).toHaveBeenCalledWith(
-        `${CGROUP_ROOT}${SERVICE_CGROUP}/cgroup.subtree_control`,
-        "+cpu +memory +pids",
-      );
+      expect(cgroupMock.prepare).toHaveBeenCalledWith({
+        delegatedRootCgroupPath: SERVICE_CGROUP,
+      });
     },
   );
 
   it.runIf(process.platform === "linux")(
     "binds the prepared delegated root into a permitted result",
     async () => {
-      let subtreeControl = "";
-      const fileSystem = cgroupFileSystem(() => subtreeControl);
-      vi.mocked(fileSystem.writeTextFile).mockImplementation(async (_path, value) => {
-        subtreeControl = value.replaceAll("+", "");
-      });
-
-      const result = await decideLinuxModuleActivation(options(fileSystem));
+      const result = await decideLinuxModuleActivation(options());
 
       expect(result).toMatchObject({
         permitted: true,
         binding: bindingMock.binding,
         runtime: runtimeMock.runtime,
-        delegatedRoot: {
-          filesystemPath: `${CGROUP_ROOT}${SERVICE_CGROUP}`,
-          controllers: ["cpu", "io", "memory", "pids"],
-          subtreeControl: ["cpu", "memory", "pids"],
-        },
+        delegatedRoot: cgroupMock.root,
       });
       expect("stopProver" in result).toBe(true);
     },

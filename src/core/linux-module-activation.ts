@@ -29,7 +29,6 @@ import {
   LinuxModuleCgroupStopProver,
   prepareDelegatedCgroupRoot,
   type DelegatedCgroupRootPreparation,
-  type ModuleCgroupFileSystem,
 } from "./linux-module-cgroup.js";
 import type { ModuleProcessStopProver } from "./core-startup-recovery.js";
 import {
@@ -48,8 +47,10 @@ export interface ModuleActivationRefusal {
   readonly detail: string;
 }
 
-export interface LinuxModuleActivationOptions extends CoreServiceInspectionOptions {
-  readonly cgroupFileSystem?: ModuleCgroupFileSystem;
+export interface LinuxModuleActivationOptions extends Pick<
+  CoreServiceInspectionOptions,
+  "unitName" | "mode" | "queryTimeoutMs" | "overallTimeoutMs"
+> {
 }
 
 export type LinuxModuleActivationResult =
@@ -82,6 +83,20 @@ export type LinuxModuleActivationResult =
 export async function decideLinuxModuleActivation(
   options: LinuxModuleActivationOptions,
 ): Promise<LinuxModuleActivationResult> {
+  const allowedOptionKeys = new Set([
+    "unitName",
+    "mode",
+    "queryTimeoutMs",
+    "overallTimeoutMs",
+  ]);
+  const unknownOptionKeys = Object.keys(options)
+    .filter((key) => !allowedOptionKeys.has(key))
+    .sort();
+  if (unknownOptionKeys.length > 0) {
+    throw new TypeError(
+      `Linux Module activation contains unknown fields: ${unknownOptionKeys.join(", ")}`,
+    );
+  }
   const refusals: ModuleActivationRefusal[] = [];
 
   if (process.platform !== "linux") {
@@ -121,12 +136,6 @@ export async function decideLinuxModuleActivation(
 
   const delegatedRoot = await prepareDelegatedCgroupRoot({
     delegatedRootCgroupPath: binding.binding.delegatedRootCgroupPath,
-    ...(options.cgroupRoot === undefined
-      ? {}
-      : { cgroupMountPoint: options.cgroupRoot }),
-    ...(options.cgroupFileSystem === undefined
-      ? {}
-      : { fileSystem: options.cgroupFileSystem }),
   });
   if (!delegatedRoot.prepared) {
     return {
@@ -147,9 +156,6 @@ export async function decideLinuxModuleActivation(
       // The binding above is the proof this flag stands for. It is never set
       // from configuration or from a previous run's record.
       serviceBindingVerified: true,
-      ...(options.cgroupFileSystem === undefined
-        ? {}
-        : { fileSystem: options.cgroupFileSystem }),
     }),
   };
 }

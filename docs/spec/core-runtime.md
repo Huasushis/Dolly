@@ -658,6 +658,14 @@ failure is `MODULE_ACTIVATION_LAUNCHER_UNAVAILABLE`. Installed execution still
 uses the separately frozen launcher descriptor, so the activation pathname
 check is not substituted for the no-TOCTOU execution boundary.
 
+The authority-minting activation API likewise does not expose the low-level
+`cgroupRoot`, `busctlPath`, `loginctlPath`, or `ModuleCgroupFileSystem` seams.
+It accepts only the candidate systemd unit, service mode, and finite query
+timeouts; service observations, `/proc` data, the cgroup-v2 mount, delegated
+root writes, and the resulting stop prover all use the real Host adapters.
+Those low-level seams remain independently testable, but an activation caller
+cannot replace their evidence and receive the same `permitted` result.
+
 Linux activation performs the delegated-root half of that proof before it
 returns permission to accept Module work. After verifying the exact Core
 service binding, it confirms that the delegated root contains no processes,
