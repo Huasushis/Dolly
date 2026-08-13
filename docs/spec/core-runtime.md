@@ -1861,6 +1861,28 @@ pruning does not authorize another execution or result. Recovery performs the
 same verified pruning before retrying a journal transition that reached the
 configured byte bound.
 
+This pruning bounds only the separate result-journal file. The current
+`BlockStore` and `DeliveryStore` snapshots still retain released Block commit
+effects, output append effects, terminal Claim and Module-job identities, and
+used Delivery identifiers. Some effect entries retain the complete historical
+Block. Consequently a workload with a bounded live set can still make the Core
+state file grow with the number of completed jobs until it reaches
+`maxStateBytes`. Result-journal pruning MUST NOT be described as a bound on the
+complete recovery state, and the public Module startup refusal remains in force
+while this history has no versioned finite-retention protocol.
+
+A future cleanup protocol must remain recoverable at every write boundary. It
+must durably mark the exact terminal job and effect identities before deleting
+the result journal, then retire or compact the Block effect, Delivery effects,
+terminal Claim/job state, and identifier-reuse evidence in one specified Core
+transition. A crash after journal removal must leave enough Core-owned state to
+finish that exact cleanup; a crash before removal must leave the committed
+journal valid against every effect it still requires. Merely deleting effects,
+keeping a finite in-memory cache, or trusting an external identifier callback
+is not an acceptable bound. The implementation must also prove with a
+long-running FileCore test that constant live data converges to a configured
+storage bound across reopen and cleanup crash points.
+
 Configured mailbox capacity can postpone step 3 after the result is already
 `prepared`. This is a known output-admission wait, not an unknown Run outcome:
 Core preserves the exact active Claim, submission, result record, and blocked
