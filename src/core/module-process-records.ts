@@ -19,11 +19,11 @@ import {
   CGROUP_V2_MOUNT_POINT,
   MODULE_CGROUP_NAME_PREFIX,
   PROCESS_GENERATION_ID_RULE,
-  isDerivedModuleCgroupPath,
   isLinuxBootId,
   isProcessGenerationId,
   isServiceInvocationId,
 } from "./linux-identifier-formats.js";
+import { isIdentityBoundModuleCgroupPath } from "./linux-module-cgroup-identity.js";
 
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const MAX_IDENTIFIER_LENGTH = 256;
@@ -251,7 +251,11 @@ export function assertValidModuleProcessRecord(
   ) {
     fail(code, "Module process record declaredExternalEffects value is not supported");
   }
-  if (!isDerivedModuleCgroupPath(value.moduleCgroupPath, value.processGenerationId)) {
+  if (!isIdentityBoundModuleCgroupPath(value.moduleCgroupPath, {
+    instanceId: value.instanceId as string,
+    moduleId: value.moduleId as string,
+    processGenerationId: value.processGenerationId as string,
+  })) {
     fail(
       code,
       `Module process record moduleCgroupPath must be a Core-derived Module control-group path below ${CGROUP_V2_MOUNT_POINT} whose directory name is "${MODULE_CGROUP_NAME_PREFIX}${value.processGenerationId}-" followed by the 64-digit identity digest`,

@@ -1015,7 +1015,7 @@ describe("Module process stop proof", () => {
     );
     expect(proof.proven).toBe(false);
     if (proof.proven) return;
-    expect(proof.reason).toMatch(/was not derived from process generation/);
+    expect(proof.reason).toMatch(/exact instance, Module, and process-generation identity/);
   });
 });
 
@@ -1095,16 +1095,23 @@ describe("LinuxModuleCgroupStopProver observations", () => {
   });
 
   it("validates the recorded path before it addresses the filesystem", async () => {
-    for (const moduleCgroupPath of [
-      `/sys/fs/cgroup/dolly/${IDENTITY.processGenerationId}`,
-      `/sys/fs/cgroup/../../etc/${IDENTITY.processGenerationId}`,
-      `/tmp/evil/${IDENTITY.processGenerationId}`,
-    ]) {
+    const wrongIdentityDigest = deriveModuleCgroupPath(DELEGATED_ROOT, IDENTITY).filesystemPath
+      .replace(/[0-9a-f]{64}$/u, "0".repeat(64));
+    for (const [moduleCgroupPath, reason] of [
+      [`/sys/fs/cgroup/dolly/${IDENTITY.processGenerationId}`, /exact instance/u],
+      [`/sys/fs/cgroup/../../etc/${IDENTITY.processGenerationId}`, /exact instance/u],
+      [`/tmp/evil/${IDENTITY.processGenerationId}`, /exact instance/u],
+      [wrongIdentityDigest, /exact instance/u],
+      [
+        deriveModuleCgroupPath("/system.slice/foreign.service", IDENTITY).filesystemPath,
+        /outside the verified delegated root/u,
+      ],
+    ] as const) {
       const log = new AccessLogFileSystem(newFileSystem());
       const proof = await prover(log).proveStopped(processRecord({ moduleCgroupPath }));
       expect(proof.proven, moduleCgroupPath).toBe(false);
       if (proof.proven) continue;
-      expect(proof.reason).toMatch(/was not derived from process generation/);
+      expect(proof.reason).toMatch(reason);
       // Nothing about a record that cannot be Core-derived may choose which
       // file this process opens.
       expect(log.addressedPaths, `${moduleCgroupPath} was addressed`).toEqual([]);

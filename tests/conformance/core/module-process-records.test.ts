@@ -1026,6 +1026,19 @@ describe("CORE Module process and submission records", () => {
     });
   });
 
+  it("rejects a well-shaped cgroup path with the wrong identity digest", () => {
+    const forged = cgroupPathFor("process-generation-1")
+      .replace(/[0-9a-f]{64}$/u, "0".repeat(64));
+    expect(isDerivedModuleCgroupPath(forged, "process-generation-1")).toBe(true);
+    expect(() => assertValidModuleProcessRecord(processRecord({
+      moduleCgroupPath: forged,
+    }))).toThrowError(
+      expect.objectContaining<Partial<ModuleProcessRecordError>>({
+        code: "MODULE_PROCESS_RECORD_INVALID",
+      }),
+    );
+  });
+
   it("persists an unrestricted effect boundary without treating it as retry evidence", () => {
     const store = openStore("first");
     expect(store.appendModuleProcessRecord(processRecord({

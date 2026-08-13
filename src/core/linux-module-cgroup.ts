@@ -48,7 +48,6 @@
  * reading there.
  */
 
-import { canonicalJsonDigest } from "./canonical-json.js";
 import { REQUIRED_CGROUP_CONTROLLERS } from "./linux-core-service-binding.js";
 import {
   CGROUP_V2_MOUNT_POINT,
@@ -57,8 +56,11 @@ import {
   isDerivedModuleCgroupPath,
   isLinuxBootId,
   isProcessGenerationId,
-  moduleCgroupDirectoryName,
 } from "./linux-identifier-formats.js";
+import {
+  identityBoundModuleCgroupDirectoryName,
+  isIdentityBoundModuleCgroupPath,
+} from "./linux-module-cgroup-identity.js";
 import {
   moduleProcessStopProofIdentityDigest,
   type ModuleProcessStopProof,
@@ -298,12 +300,7 @@ export function deriveModuleCgroupPath(
       `processGenerationId ${JSON.stringify(identity.processGenerationId)} is not usable as a control-group directory name; ${PROCESS_GENERATION_ID_RULE}`,
     );
   }
-  const digest = canonicalJsonDigest([
-    identity.instanceId,
-    identity.moduleId,
-    identity.processGenerationId,
-  ]).slice("sha256:".length);
-  const directoryName = moduleCgroupDirectoryName(identity.processGenerationId, digest);
+  const directoryName = identityBoundModuleCgroupDirectoryName(identity);
   const cgroupPath = `${delegatedRootCgroupPath}/${directoryName}`;
   return {
     directoryName,
@@ -1256,6 +1253,28 @@ export interface ModuleProcessStopObservation {
   readonly cgroupMountPoint: string;
 }
 
+function isDirectModuleCgroupPathBelowDelegatedRoot(input: {
+  readonly moduleCgroupPath: string;
+  readonly instanceId: string;
+  readonly moduleId: string;
+  readonly processGenerationId: string;
+  readonly delegatedRootCgroupPath: string;
+  readonly cgroupMountPoint: string;
+}): boolean {
+  if (!isAbsoluteCgroupPath(input.delegatedRootCgroupPath)) return false;
+  if (!isIdentityBoundModuleCgroupPath(
+    input.moduleCgroupPath,
+    input,
+    input.cgroupMountPoint,
+  )) return false;
+  const delegatedFilesystemRoot =
+    `${input.cgroupMountPoint}${input.delegatedRootCgroupPath}`;
+  if (!input.moduleCgroupPath.startsWith(`${delegatedFilesystemRoot}/`)) return false;
+  return !input.moduleCgroupPath
+    .slice(delegatedFilesystemRoot.length + 1)
+    .includes("/");
+}
+
 /**
  * Decides whether one old Module process record may be marked stopped, using
  * only the proofs ADR 0009 accepts. Everything else, including a populated,
@@ -1283,25 +1302,28 @@ export function decideModuleProcessStopProof(
     };
   }
   if (
-    !isDerivedModuleCgroupPath(
+    !isIdentityBoundModuleCgroupPath(
       record.moduleCgroupPath,
-      record.processGenerationId,
+      record,
       observation.cgroupMountPoint,
     )
   ) {
     return {
       proven: false,
-      reason: `the recorded Module control-group path ${JSON.stringify(record.moduleCgroupPath)} was not derived from process generation ${record.processGenerationId} below ${observation.cgroupMountPoint}`,
+      reason: `the recorded Module control-group path ${JSON.stringify(record.moduleCgroupPath)} was not derived from the record's exact instance, Module, and process-generation identity below ${observation.cgroupMountPoint}`,
     };
   }
   const delegatedFilesystemRoot =
     `${observation.cgroupMountPoint}${observation.delegatedRootCgroupPath}`;
   if (
-    !isAbsoluteCgroupPath(observation.delegatedRootCgroupPath) ||
-    !record.moduleCgroupPath.startsWith(`${delegatedFilesystemRoot}/`) ||
-    record.moduleCgroupPath
-      .slice(delegatedFilesystemRoot.length + 1)
-      .includes("/")
+    !isDirectModuleCgroupPathBelowDelegatedRoot({
+      moduleCgroupPath: record.moduleCgroupPath,
+      instanceId: record.instanceId,
+      moduleId: record.moduleId,
+      processGenerationId: record.processGenerationId,
+      delegatedRootCgroupPath: observation.delegatedRootCgroupPath,
+      cgroupMountPoint: observation.cgroupMountPoint,
+    })
   ) {
     return {
       proven: false,
@@ -1416,11 +1438,14 @@ export class LinuxModuleCgroupStopProver implements ModuleProcessStopProver {
     // not have derived, so reading one first would let a corrupted record
     // choose which file this process opens for no gain.
     if (
-      !isDerivedModuleCgroupPath(
-        record.moduleCgroupPath,
-        record.processGenerationId,
-        this.#cgroupMountPoint,
-      )
+      !isDirectModuleCgroupPathBelowDelegatedRoot({
+        moduleCgroupPath: record.moduleCgroupPath,
+        instanceId: record.instanceId,
+        moduleId: record.moduleId,
+        processGenerationId: record.processGenerationId,
+        delegatedRootCgroupPath: this.#delegatedRootCgroupPath,
+        cgroupMountPoint: this.#cgroupMountPoint,
+      })
     ) {
       return {
         currentBootId,
