@@ -437,9 +437,12 @@ derives every installed runtime's service binding from that exact object;
 copied or caller-constructed lookalikes are rejected before a recovery handoff
 is consumed or a process record is created. The direct installed-runtime
 factory retains an explicit binding only as a lower-level candidate and test
-seam. This closes one composition ambiguity, but it does not yet prove that the
-startup-recovery handoff was minted with the same activation stop prover, and
-does not make either candidate path a public bootstrap.
+seam. Startup recovery also records the exact process-stop prover that minted
+its one-use handoff, and the installed composer requires object identity with
+the prover in the same activation permission before consuming that handoff.
+Thus old-process recovery and new-process composition cannot splice two
+independently minted service authorities. This does not make either candidate
+path a public bootstrap.
 
 Candidate-host shutdown first changes the Scheduler to its stopping state,
 which synchronously closes dispatch admission. It then invokes every started

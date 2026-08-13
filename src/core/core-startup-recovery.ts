@@ -149,6 +149,7 @@ class VerifiedCoreStartupRecoveryHandoff implements CoreStartupRecoveryHandoff {
   readonly #deliveries: CoreStartupRecoveryOptions["deliveries"];
   readonly #commits: ModuleResultCommitCoordinator;
   readonly #moduleRecords: CoreStartupStateStore | undefined;
+  readonly #processStopProver: ModuleProcessStopProver | undefined;
   readonly #deferredCommits: readonly DeferredModuleResultCommit[];
   #consumed = false;
 
@@ -156,11 +157,13 @@ class VerifiedCoreStartupRecoveryHandoff implements CoreStartupRecoveryHandoff {
     deliveries: CoreStartupRecoveryOptions["deliveries"],
     commits: ModuleResultCommitCoordinator,
     moduleRecords: CoreStartupStateStore | undefined,
+    processStopProver: ModuleProcessStopProver | undefined,
     deferredCommits: readonly DeferredModuleResultCommit[],
   ) {
     this.#deliveries = deliveries;
     this.#commits = commits;
     this.#moduleRecords = moduleRecords;
+    this.#processStopProver = processStopProver;
     this.#deferredCommits = deferredCommits;
   }
 
@@ -168,6 +171,7 @@ class VerifiedCoreStartupRecoveryHandoff implements CoreStartupRecoveryHandoff {
     deliveries: CoreStartupRecoveryOptions["deliveries"],
     repository: ModuleResultCommitRepository,
     moduleRecords: CoreStartupStateStore,
+    processStopProver?: ModuleProcessStopProver,
   ): readonly DeferredModuleResultCommit[] {
     if (this.#consumed) {
       throw new TypeError("Core startup recovery handoff was already consumed");
@@ -175,10 +179,14 @@ class VerifiedCoreStartupRecoveryHandoff implements CoreStartupRecoveryHandoff {
     if (
       deliveries !== this.#deliveries ||
       !this.#commits.usesRepository(repository) ||
-      moduleRecords !== this.#moduleRecords
+      moduleRecords !== this.#moduleRecords ||
+      (
+        processStopProver !== undefined &&
+        processStopProver !== this.#processStopProver
+      )
     ) {
       throw new TypeError(
-        "Core startup recovery handoff is not bound to this Core store and result repository or its Module record store",
+        "Core startup recovery handoff is not bound to this Core store and result repository, its Module record store, and stop prover",
       );
     }
     this.#consumed = true;
@@ -192,6 +200,8 @@ export function consumeCoreStartupRecoveryHandoff(input: {
   readonly deliveries: CoreStartupRecoveryOptions["deliveries"];
   readonly repository: ModuleResultCommitRepository;
   readonly moduleRecords: CoreStartupStateStore;
+  /** When supplied, requires exact identity with the prover used by recovery. */
+  readonly processStopProver?: ModuleProcessStopProver;
 }): readonly DeferredModuleResultCommit[] {
   if (!(input.handoff instanceof VerifiedCoreStartupRecoveryHandoff)) {
     throw new TypeError("Core startup recovery handoff is not authentic");
@@ -200,6 +210,7 @@ export function consumeCoreStartupRecoveryHandoff(input: {
     input.deliveries,
     input.repository,
     input.moduleRecords,
+    input.processStopProver,
   );
 }
 
@@ -547,6 +558,7 @@ export class CoreStartupRecovery {
         this.#deliveries,
         this.#commits,
         this.#moduleRecords,
+        this.#processStopProver,
         deferredCommits,
       ),
       releasedClaims,

@@ -43,6 +43,15 @@ vi.mock("../../../src/core/linux-core-service-binding.js", async (importOriginal
 }));
 vi.mock("../../../src/core/linux-module-cgroup.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../../src/core/linux-module-cgroup.js")>(),
+  LinuxModuleCgroupStopProver: class {
+    async proveStopped(record: ModuleProcessRecord): Promise<ModuleProcessStopProof> {
+      return {
+        proven: true as const,
+        evidence: "populated-zero" as const,
+        recordIdentityDigest: moduleProcessStopProofIdentityDigest(record),
+      };
+    }
+  },
   prepareDelegatedCgroupRoot: vi.fn(async () => ({
     prepared: true as const,
     root: activationDependencies.root,
@@ -122,16 +131,6 @@ function proposal(text: string): BlockProposal {
     },
   };
 }
-
-const provenStopped = {
-  proveStopped: async (
-    record: ModuleProcessRecord,
-  ): Promise<ModuleProcessStopProof> => ({
-    proven: true,
-    evidence: "populated-zero",
-    recordIdentityDigest: moduleProcessStopProofIdentityDigest(record),
-  }),
-};
 
 describe("installed reactive Module runtime composition", () => {
   let scratch: string;
@@ -456,6 +455,7 @@ describe("installed reactive Module runtime composition", () => {
       }),
       moduleRecords: pair.store,
       stoppedRecordWriter: pair.stoppedRecordWriter,
+      processStopProver: activationPermission.stopProver,
     });
     return (await recovery.recover()).handoff;
   }
@@ -559,7 +559,7 @@ describe("installed reactive Module runtime composition", () => {
       commits,
       moduleRecords: pair.store,
       stoppedRecordWriter: pair.stoppedRecordWriter,
-      processStopProver: provenStopped,
+      processStopProver: activationPermission.stopProver,
     }).recover();
     expect(report.deferredCommits).toHaveLength(1);
 
@@ -1225,6 +1225,27 @@ describe("installed reactive Module runtime composition", () => {
       runtime.resultCommitRepository,
       mailboxes,
     );
+    const alternateActivationResult = await decideLinuxModuleActivation({
+      unitName: BINDING.unitName,
+      mode: BINDING.mode,
+    });
+    if (!alternateActivationResult.permitted) {
+      throw new Error("alternate fixture activation permission was unexpectedly refused");
+    }
+    expect(() => composeInstalledReactiveModuleHost({
+      activation: alternateActivationResult,
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
+      ...contentSchemaOptions(pair),
+      mailboxes,
+      startupRecoveryHandoff: verifiedHandoff,
+      clock,
+      scheduling,
+      runtime,
+    })).toThrow(/stop prover/u);
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
     expect(() => composeInstalledReactiveModuleHost({
       activation: activationPermission,
       configuration: instanceConfiguration,

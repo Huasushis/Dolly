@@ -38,7 +38,6 @@ import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
 import { resolveInstalledContentSchemaRegistrationSet } from "../../../src/core/installed-extension-module.js";
 import {
   deriveModuleCgroupPath,
-  LinuxModuleCgroupStopProver,
   type ModuleCgroupLimits,
 } from "../../../src/core/linux-module-cgroup.js";
 import {
@@ -527,6 +526,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         }),
         moduleRecords: coreState.store,
         stoppedRecordWriter: coreState.stoppedRecordWriter,
+        processStopProver: activation.stopProver,
       }).recover()).handoff;
       composed = composeInstalledReactiveModuleHost({
         activation,
@@ -1113,9 +1113,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         commits,
         moduleRecords: coreState.store,
         stoppedRecordWriter: coreState.stoppedRecordWriter,
-        processStopProver: new LinuxModuleCgroupStopProver({
-          serviceBindingVerified: true,
-        }),
+        processStopProver: activation.stopProver,
       }).recover();
       expect(recovery.deferredCommits).toEqual([
         expect.objectContaining({
@@ -1612,6 +1610,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         }),
         moduleRecords: coreState.store,
         stoppedRecordWriter: coreState.stoppedRecordWriter,
+        processStopProver: activation.stopProver,
       }).recover()).handoff;
       const schedulerEvents: SchedulerEvent[] = [];
       const actorEvents: ModuleActorEvent[] = [];
@@ -2171,6 +2170,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         }),
         moduleRecords: coreState.store,
         stoppedRecordWriter: coreState.stoppedRecordWriter,
+        processStopProver: activation.stopProver,
       }).recover()).handoff;
       const schedulerEvents: SchedulerEvent[] = [];
       const actorEvents: ModuleActorEvent[] = [];
@@ -2531,6 +2531,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         }),
         moduleRecords: coreState.store,
         stoppedRecordWriter: coreState.stoppedRecordWriter,
+        processStopProver: activation.stopProver,
       }).recover()).handoff;
       const schedulerEvents: SchedulerEvent[] = [];
       const actorEvents: ModuleActorEvent[] = [];
@@ -2874,6 +2875,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         }),
         moduleRecords: coreState.store,
         stoppedRecordWriter: coreState.stoppedRecordWriter,
+        processStopProver: activation.stopProver,
       }).recover()).handoff;
       const schedulerEvents: SchedulerEvent[] = [];
       const actorEvents: ModuleActorEvent[] = [];

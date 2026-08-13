@@ -442,6 +442,7 @@ describe.skipIf(!available)("installed inline Media Agent in a real control grou
         }),
         moduleRecords: coreState.store,
         stoppedRecordWriter: coreState.stoppedRecordWriter,
+        processStopProver: activation.stopProver,
       }).recover()).handoff;
       const schedulerEvents: SchedulerEvent[] = [];
       composed = composeInstalledReactiveModuleHost({
