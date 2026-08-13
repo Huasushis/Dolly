@@ -339,6 +339,7 @@ function observation(
   return {
     currentBootId: BOOT_ID,
     serviceBindingVerified: true,
+    delegatedRootCgroupPath: DELEGATED_ROOT,
     events: { kind: "populated", populated: false },
     pathRecreated: false,
     cgroupMountPoint: CGROUP_V2_MOUNT_POINT,
@@ -994,6 +995,17 @@ describe("Module process stop proof", () => {
     }
   });
 
+  it("fails closed when a valid Module path belongs to another delegated service root", () => {
+    const foreignRoot = "/system.slice/another-core.service";
+    const foreignRecord = processRecord({
+      moduleCgroupPath: deriveModuleCgroupPath(foreignRoot, IDENTITY).filesystemPath,
+    });
+    const proof = decideModuleProcessStopProof(foreignRecord, observation());
+    expect(proof.proven).toBe(false);
+    if (proof.proven) return;
+    expect(proof.reason).toMatch(/outside the verified delegated root/u);
+  });
+
   it("fails closed when the recorded path was not derived from that process generation", () => {
     const proof = decideModuleProcessStopProof(
       processRecord({
@@ -1011,6 +1023,7 @@ describe("LinuxModuleCgroupStopProver observations", () => {
   function prover(fileSystem: ModuleCgroupFileSystem, serviceBindingVerified = true) {
     return new LinuxModuleCgroupStopProver({
       serviceBindingVerified,
+      delegatedRootCgroupPath: DELEGATED_ROOT,
       fileSystem,
       readBootId: async () => BOOT_ID,
     });

@@ -184,6 +184,7 @@ export async function decideLinuxModuleActivation(
       // The binding above is the proof this flag stands for. It is never set
       // from configuration or from a previous run's record.
       serviceBindingVerified: true,
+      delegatedRootCgroupPath: binding.binding.delegatedRootCgroupPath,
     }),
   });
   LINUX_MODULE_ACTIVATION_PERMISSIONS.add(permission);

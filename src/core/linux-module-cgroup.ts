@@ -1245,6 +1245,8 @@ export interface ModuleProcessStopObservation {
   readonly currentBootId: string | undefined;
   /** Whether Core has verified its current systemd service binding. */
   readonly serviceBindingVerified: boolean;
+  /** Exact systemd cgroup root proven by that binding. */
+  readonly delegatedRootCgroupPath: string;
   readonly events: ModuleCgroupEventsObservation;
   /**
    * Whether the path existed again when it was checked a second time after a
@@ -1280,18 +1282,6 @@ export function decideModuleProcessStopProof(
         "the current systemd Core service binding is not verified, so no observation of an old Module control group can be trusted",
     };
   }
-  if (observation.currentBootId === undefined) {
-    return {
-      proven: false,
-      reason: `the current Linux boot identifier at ${BOOT_ID_PATH} could not be read, so the record's boot identifier cannot be compared`,
-    };
-  }
-  if (record.bootId !== observation.currentBootId) {
-    // A process from an earlier boot cannot still exist. Core still derives a
-    // fresh non-reused path for the replacement; the old path is never reused
-    // as an identity.
-    return accepted("changed-boot-identifier");
-  }
   if (
     !isDerivedModuleCgroupPath(
       record.moduleCgroupPath,
@@ -1303,6 +1293,32 @@ export function decideModuleProcessStopProof(
       proven: false,
       reason: `the recorded Module control-group path ${JSON.stringify(record.moduleCgroupPath)} was not derived from process generation ${record.processGenerationId} below ${observation.cgroupMountPoint}`,
     };
+  }
+  const delegatedFilesystemRoot =
+    `${observation.cgroupMountPoint}${observation.delegatedRootCgroupPath}`;
+  if (
+    !isAbsoluteCgroupPath(observation.delegatedRootCgroupPath) ||
+    !record.moduleCgroupPath.startsWith(`${delegatedFilesystemRoot}/`) ||
+    record.moduleCgroupPath
+      .slice(delegatedFilesystemRoot.length + 1)
+      .includes("/")
+  ) {
+    return {
+      proven: false,
+      reason: `the recorded Module control-group path ${JSON.stringify(record.moduleCgroupPath)} is outside the verified delegated root ${JSON.stringify(delegatedFilesystemRoot)}`,
+    };
+  }
+  if (observation.currentBootId === undefined) {
+    return {
+      proven: false,
+      reason: `the current Linux boot identifier at ${BOOT_ID_PATH} could not be read, so the record's boot identifier cannot be compared`,
+    };
+  }
+  if (record.bootId !== observation.currentBootId) {
+    // A process from an earlier boot cannot still exist. Core still derives a
+    // fresh non-reused path for the replacement; the old path is never reused
+    // as an identity.
+    return accepted("changed-boot-identifier");
   }
   switch (observation.events.kind) {
     case "populated":
@@ -1343,6 +1359,8 @@ export interface LinuxModuleCgroupStopProverOptions {
    * count as evidence.
    */
   readonly serviceBindingVerified: boolean;
+  /** Exact delegated cgroup root from the same verified service binding. */
+  readonly delegatedRootCgroupPath: string;
   readonly cgroupMountPoint?: string;
   readonly fileSystem?: ModuleCgroupFileSystem;
   /** Overridable so the decision can be exercised without a Linux host. */
@@ -1368,12 +1386,17 @@ export async function readLinuxBootId(
  */
 export class LinuxModuleCgroupStopProver implements ModuleProcessStopProver {
   readonly #serviceBindingVerified: boolean;
+  readonly #delegatedRootCgroupPath: string;
   readonly #cgroupMountPoint: string;
   readonly #fileSystem: ModuleCgroupFileSystem;
   readonly #readBootId: () => Promise<string | undefined>;
 
   constructor(options: LinuxModuleCgroupStopProverOptions) {
     this.#serviceBindingVerified = options.serviceBindingVerified;
+    if (!isAbsoluteCgroupPath(options.delegatedRootCgroupPath)) {
+      throw new TypeError("Linux Module stop prover requires an absolute delegated root cgroup path");
+    }
+    this.#delegatedRootCgroupPath = options.delegatedRootCgroupPath;
     this.#cgroupMountPoint = options.cgroupMountPoint ?? CGROUP_V2_MOUNT_POINT;
     this.#fileSystem = options.fileSystem ?? nodeModuleCgroupFileSystem;
     this.#readBootId = options.readBootId ?? (() => readLinuxBootId(this.#fileSystem));
@@ -1402,6 +1425,7 @@ export class LinuxModuleCgroupStopProver implements ModuleProcessStopProver {
       return {
         currentBootId,
         serviceBindingVerified: this.#serviceBindingVerified,
+        delegatedRootCgroupPath: this.#delegatedRootCgroupPath,
         events: {
           kind: "unreadable",
           detail: `${JSON.stringify(record.moduleCgroupPath)} is not a Core-derived Module control-group path, so it was not read`,
@@ -1430,6 +1454,7 @@ export class LinuxModuleCgroupStopProver implements ModuleProcessStopProver {
     return {
       currentBootId,
       serviceBindingVerified: this.#serviceBindingVerified,
+      delegatedRootCgroupPath: this.#delegatedRootCgroupPath,
       events,
       pathRecreated,
       cgroupMountPoint: this.#cgroupMountPoint,

@@ -1702,7 +1702,10 @@ resolved by the installation registry. `serviceInvocationId` and `bootId` are
 the manager-reported service invocation identifier and the Linux boot
 identifier captured when Core verified its service binding; both are required
 so recovery can apply the same-boot and changed-boot cgroup rules from ADR
-0009. `moduleCgroupPath` is the Core-derived path that embeds the non-reused
+0009. The stop prover is also bound to the exact delegated cgroup root from
+that same service inspection; a structurally valid Module path below another
+service root is not evidence, even when it reads `populated 0` or is missing.
+`moduleCgroupPath` is the Core-derived path that embeds the non-reused
 `processGenerationId`. `diagnosticPid` is diagnostic data only and is never
 used to address a signal. `failureCode` is a bounded, sanitized
 machine-readable code; free-form failure text belongs in logs. `inputDigest`

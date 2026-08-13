@@ -387,7 +387,10 @@ describe.skipIf(delegatedRoot === undefined)("Module cgroup on a real Linux kern
       updatedAt: "2026-07-26T00:00:00.000Z",
       ...overrides,
     });
-    const prover = new LinuxModuleCgroupStopProver({ serviceBindingVerified: true });
+    const prover = new LinuxModuleCgroupStopProver({
+      serviceBindingVerified: true,
+      delegatedRootCgroupPath: delegatedRoot!,
+    });
 
     // 1. The group exists and is empty within the same boot.
     expect(await prover.proveStopped(record())).toEqual({
@@ -427,7 +430,10 @@ describe.skipIf(delegatedRoot === undefined)("Module cgroup on a real Linux kern
 
   it("refuses a stop proof when the service binding is unverified", async () => {
     const cgroup = await prepare();
-    const prover = new LinuxModuleCgroupStopProver({ serviceBindingVerified: false });
+    const prover = new LinuxModuleCgroupStopProver({
+      serviceBindingVerified: false,
+      delegatedRootCgroupPath: delegatedRoot!,
+    });
     const proof = await prover.proveStopped({
       schemaVersion: "dolly.module-process-record/1",
       instanceId: cgroup.identity.instanceId,

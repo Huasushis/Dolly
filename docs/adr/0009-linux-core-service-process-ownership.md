@@ -116,8 +116,10 @@ Core-derived Module cgroup path from its durable records is empty. Within the
 same Linux boot, the normal proof is `populated 0` in `cgroup.events`. A missing
 path is equivalent only when the path contains the record's non-reused
 process-generation identifier, Core has verified the current service-manager
-binding, and the path has not been recreated. A populated, inaccessible, or
-ambiguous path fails closed. A changed Linux boot identifier proves that a
+binding, the path is a direct child of that binding's exact delegated root, and
+the path has not been recreated. A valid-looking path below another service
+root, a populated, inaccessible, or ambiguous path fails closed. A changed
+Linux boot identifier proves that a
 process from the old boot cannot still exist, but does not make the old path an
 identity for a new process: Core still verifies the new service binding and
 uses a fresh non-reused path. Core never infers process absence from a saved
