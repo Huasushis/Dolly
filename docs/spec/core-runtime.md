@@ -637,6 +637,15 @@ cgroup-level termination and empty-cgroup proof. Core writes each limit, reads
 it back, and refuses activation if the expected cgroup version 2 controller or
 operation is unavailable.
 
+Linux activation performs the delegated-root half of that proof before it
+returns permission to accept Module work. After verifying the exact Core
+service binding, it confirms that the delegated root contains no processes,
+writes `+cpu +memory +pids` to `cgroup.subtree_control`, reads the enabled set
+back, and binds the prepared-root snapshot into the permitted result together
+with the service binding and stop prover. A missing, rejected, or incomplete
+read-back is `MODULE_ACTIVATION_CGROUP_UNAVAILABLE`; it never produces a stop
+prover or a partial activation authority.
+
 The Linux process limits are required for every Module using the
 `linux-process` execution backend and are not portable configuration. Windows
 and other platforms continue to reject that backend until a separately

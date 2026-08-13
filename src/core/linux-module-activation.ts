@@ -27,6 +27,8 @@ import {
 } from "./linux-core-service-binding.js";
 import {
   LinuxModuleCgroupStopProver,
+  prepareDelegatedCgroupRoot,
+  type DelegatedCgroupRootPreparation,
   type ModuleCgroupFileSystem,
 } from "./linux-module-cgroup.js";
 import type { ModuleProcessStopProver } from "./core-startup-recovery.js";
@@ -34,7 +36,8 @@ import type { ModuleProcessStopProver } from "./core-startup-recovery.js";
 export type ModuleActivationRefusalCode =
   | "MODULE_ACTIVATION_PLATFORM_UNSUPPORTED"
   | "MODULE_ACTIVATION_SERVICE_UNVERIFIED"
-  | "MODULE_ACTIVATION_LAUNCHER_UNAVAILABLE";
+  | "MODULE_ACTIVATION_LAUNCHER_UNAVAILABLE"
+  | "MODULE_ACTIVATION_CGROUP_UNAVAILABLE";
 
 export interface ModuleActivationRefusal {
   readonly code: ModuleActivationRefusalCode;
@@ -63,6 +66,7 @@ export type LinuxModuleActivationResult =
   | {
       readonly permitted: true;
       readonly binding: VerifiedCoreServiceBinding;
+      readonly delegatedRoot: DelegatedCgroupRootPreparation;
       readonly stopProver: ModuleProcessStopProver;
     }
   | {
@@ -146,9 +150,29 @@ export async function decideLinuxModuleActivation(
     return { permitted: false, refusals };
   }
 
+  const delegatedRoot = await prepareDelegatedCgroupRoot({
+    delegatedRootCgroupPath: binding.binding.delegatedRootCgroupPath,
+    ...(options.cgroupRoot === undefined
+      ? {}
+      : { cgroupMountPoint: options.cgroupRoot }),
+    ...(options.cgroupFileSystem === undefined
+      ? {}
+      : { fileSystem: options.cgroupFileSystem }),
+  });
+  if (!delegatedRoot.prepared) {
+    return {
+      permitted: false,
+      refusals: [{
+        code: "MODULE_ACTIVATION_CGROUP_UNAVAILABLE",
+        detail: delegatedRoot.failure.detail,
+      }],
+    };
+  }
+
   return {
     permitted: true,
     binding: binding.binding,
+    delegatedRoot: delegatedRoot.root,
     stopProver: new LinuxModuleCgroupStopProver({
       // The binding above is the proof this flag stands for. It is never set
       // from configuration or from a previous run's record.
