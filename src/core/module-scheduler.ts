@@ -307,20 +307,40 @@ export interface SchedulerBlockedEdge {
 }
 
 interface NoProgressBlockedComponent {
-  readonly signature: string;
   readonly blockedEdges: readonly SchedulerBlockedEdge[];
-  readonly moduleIds: ReadonlySet<string>;
 }
 
-interface NoProgressBlockedEpisode extends NoProgressBlockedComponent {
+interface NoProgressBlockedEdgeEpisode {
+  readonly moduleId: string;
+  readonly blockedBy: string;
   waitingSince: number | null;
   active: boolean;
 }
 
+function noProgressBlockedEdgeKey(moduleId: string, blockedBy: string): string {
+  return `${moduleId}>${blockedBy}`;
+}
+
+function aggregateNoProgressBlockedEdges(
+  edges: readonly { readonly moduleId: string; readonly blockedBy: string }[],
+): readonly SchedulerBlockedEdge[] {
+  const targetsBySource = new Map<string, Set<string>>();
+  for (const edge of edges) {
+    const targets = targetsBySource.get(edge.moduleId) ?? new Set<string>();
+    targets.add(edge.blockedBy);
+    targetsBySource.set(edge.moduleId, targets);
+  }
+  return [...targetsBySource]
+    .sort(([left], [right]) => compareModuleIds(left, right))
+    .map(([moduleId, targets]) => ({
+      moduleId,
+      blockedBy: [...targets].sort(compareModuleIds),
+    }));
+}
+
 /**
- * Splits the directed blocked-edge graph into deterministic weakly connected
- * components. Independent components need independent no-progress clocks:
- * otherwise a flapping edge in one branch can keep resetting a stable cycle.
+ * Groups already-overdue directed edges for deterministic event reporting.
+ * Clocks live on the individual edges, not on these transient components.
  */
 function noProgressBlockedComponents(
   blockedEdges: readonly SchedulerBlockedEdge[],
@@ -355,10 +375,7 @@ function noProgressBlockedComponents(
       pending.push(...adjacent);
     }
     const componentEdges = canonicalEdges.filter((edge) => moduleIds.has(edge.moduleId));
-    const signature = componentEdges
-      .map((edge) => `${edge.moduleId}>${edge.blockedBy.join(",")}`)
-      .join(";");
-    components.push({ signature, blockedEdges: componentEdges, moduleIds });
+    components.push({ blockedEdges: componentEdges });
   }
   return components;
 }
@@ -904,7 +921,7 @@ export class ModuleScheduler {
   #waitingWithoutProgressSince: number | null = null;
   #genericNoProgressActive = false;
   #noProgressActive = false;
-  #noProgressBlockedEpisodes = new Map<string, NoProgressBlockedEpisode>();
+  #noProgressBlockedEdges = new Map<string, NoProgressBlockedEdgeEpisode>();
   #stopPromise: Promise<void> | null = null;
   #unsubscribeDeliveryChanges: (() => void) | null = null;
 
@@ -1925,9 +1942,13 @@ export class ModuleScheduler {
     entry.lastPolicyName = decision.policyName;
     entry.lastPolicyVersion = decision.policyVersion;
 
-    const blockedBy = snapshot.downstream
+    const observedBlockedBy = snapshot.downstream
       .filter((pressure) => pressure.availability !== "available")
       .map((pressure) => pressure.moduleId);
+    // Downstream capacity is not a scheduling blocker when this Module has no
+    // work to produce. Recording such an edge would let unrelated work make an
+    // idle producer look like a stalled dependency.
+    const blockedBy = entry.pending.pendingCount > 0 ? observedBlockedBy : [];
     entry.blockingDownstreamIds = blockedBy;
 
     // The mailbox bound is enforced here, after the decision, so that a policy
@@ -2435,17 +2456,16 @@ export class ModuleScheduler {
 
   #recordProgress(entry: ModuleEntry, now: number): void {
     this.#lastProgressAt = now;
-    if (this.#noProgressBlockedEpisodes.size === 0) {
+    if (this.#noProgressBlockedEdges.size === 0) {
       this.#waitingWithoutProgressSince = null;
       this.#genericNoProgressActive = false;
     } else {
-      // Targets are included in each component because a downstream commit
-      // may genuinely release the capacity an upstream result awaits. A
-      // commit in a disjoint component leaves every other clock untouched.
-      for (const episode of this.#noProgressBlockedEpisodes.values()) {
-        if (!episode.moduleIds.has(entry.moduleId)) continue;
-        episode.waitingSince = null;
-        episode.active = false;
+      // A durable result can change only edges incident to that Module: its
+      // input ACK may release incoming capacity and its result may advance its
+      // outgoing work. Unrelated edges retain their continuous-wait clocks.
+      for (const [key, edge] of this.#noProgressBlockedEdges) {
+        if (edge.moduleId !== entry.moduleId && edge.blockedBy !== entry.moduleId) continue;
+        this.#noProgressBlockedEdges.delete(key);
       }
     }
     this.#refreshNoProgressActive(now);
@@ -2453,7 +2473,7 @@ export class ModuleScheduler {
 
   #refreshNoProgressActive(now: number): void {
     const active = this.#genericNoProgressActive ||
-      [...this.#noProgressBlockedEpisodes.values()].some((episode) => episode.active);
+      [...this.#noProgressBlockedEdges.values()].some((episode) => episode.active);
     if (active === this.#noProgressActive) return;
     const wasActive = this.#noProgressActive;
     this.#noProgressActive = active;
@@ -2474,7 +2494,11 @@ export class ModuleScheduler {
    */
   #detectNoProgress(entries: readonly ModuleEntry[], now: number): void {
     const blockedEdges = entries
-      .filter((entry) => entry.backpressured && entry.blockingDownstreamIds.length > 0)
+      .filter((entry) =>
+        entry.backpressured &&
+        entry.blockingDownstreamIds.length > 0 &&
+        (entry.pending.pendingCount > 0 || entry.outputCommitWaiting)
+      )
       .map((entry) => ({
         moduleId: entry.moduleId,
         blockedBy: [...entry.blockingDownstreamIds],
@@ -2493,49 +2517,66 @@ export class ModuleScheduler {
     if (!workWaiting) {
       this.#waitingWithoutProgressSince = null;
       this.#genericNoProgressActive = false;
-      this.#noProgressBlockedEpisodes.clear();
+      this.#noProgressBlockedEdges.clear();
       this.#refreshNoProgressActive(now);
       return;
     }
 
-    const components = noProgressBlockedComponents(blockedEdges);
-    const currentSignatures = new Set(components.map((component) => component.signature));
-    const nextEpisodes = new Map<string, NoProgressBlockedEpisode>();
-    // A dispatch temporarily clears an entry's backpressure observation. Keep
-    // that component's episode until the relevant in-flight work settles.
-    for (const [signature, episode] of this.#noProgressBlockedEpisodes) {
-      if (currentSignatures.has(signature)) continue;
-      const temporarilyInFlight = entries.some((entry) =>
-        entry.inFlight !== null && episode.moduleIds.has(entry.moduleId)
-      );
-      if (temporarilyInFlight) nextEpisodes.set(signature, episode);
-    }
-    for (const component of components) {
-      const overlapsRetainedEpisode = [...nextEpisodes.values()].some((episode) =>
-        [...component.moduleIds].some((moduleId) => episode.moduleIds.has(moduleId))
-      );
-      if (overlapsRetainedEpisode) continue;
-      const existing = this.#noProgressBlockedEpisodes.get(component.signature);
-      nextEpisodes.set(component.signature, existing ?? {
-        ...component,
-        waitingSince: null,
-        active: false,
-      });
-    }
-    this.#noProgressBlockedEpisodes = nextEpisodes;
+    const entriesById = new Map(entries.map((entry) => [entry.moduleId, entry]));
+    const currentFlatEdges = blockedEdges.flatMap((edge) =>
+      edge.blockedBy.map((blockedBy) => ({ moduleId: edge.moduleId, blockedBy }))
+    );
+    const currentKeys = new Set(currentFlatEdges.map((edge) =>
+      noProgressBlockedEdgeKey(edge.moduleId, edge.blockedBy)
+    ));
+    const nextEdges = new Map<string, NoProgressBlockedEdgeEpisode>();
 
-    if (this.#noProgressBlockedEpisodes.size > 0) {
+    // A dispatch may temporarily clear a source's observed backpressure. Keep
+    // only its own previously observed edges until that exact work settles;
+    // an unrelated in-flight Module cannot pause a stable blocked cycle.
+    for (const [key, episode] of this.#noProgressBlockedEdges) {
+      if (currentKeys.has(key)) continue;
+      const source = entriesById.get(episode.moduleId);
+      if (source !== undefined && source.inFlight !== null) {
+        nextEdges.set(key, episode);
+      }
+    }
+    for (const edge of currentFlatEdges) {
+      const key = noProgressBlockedEdgeKey(edge.moduleId, edge.blockedBy);
+      const existing = this.#noProgressBlockedEdges.get(key);
+      // Work actively consuming the target can release this precise incoming
+      // edge. Pause that edge only; siblings and cycles keep their own clocks.
+      const target = entriesById.get(edge.blockedBy);
+      if (target !== undefined && target.inFlight !== null) {
+        nextEdges.set(key, { ...edge, waitingSince: null, active: false });
+      } else {
+        nextEdges.set(key, existing ?? { ...edge, waitingSince: now, active: false });
+      }
+    }
+    this.#noProgressBlockedEdges = nextEdges;
+
+    if (this.#noProgressBlockedEdges.size > 0) {
       this.#waitingWithoutProgressSince = null;
       this.#genericNoProgressActive = false;
-      for (const episode of this.#noProgressBlockedEpisodes.values()) {
-        const relevantWorkActive = entries.some((entry) =>
-          entry.inFlight !== null && episode.moduleIds.has(entry.moduleId)
+      const overdue = currentFlatEdges.filter((edge) => {
+        const episode = this.#noProgressBlockedEdges.get(
+          noProgressBlockedEdgeKey(edge.moduleId, edge.blockedBy),
         );
-        if (relevantWorkActive) continue;
-        episode.waitingSince ??= now;
-        const stalledForMs = now - episode.waitingSince;
-        if (stalledForMs < this.#noProgressAfterMs || episode.active) continue;
-        episode.active = true;
+        return episode !== undefined && episode.waitingSince !== null &&
+          now - episode.waitingSince >= this.#noProgressAfterMs;
+      });
+      const overdueComponents = noProgressBlockedComponents(
+        aggregateNoProgressBlockedEdges(overdue),
+      );
+      for (const component of overdueComponents) {
+        const componentEpisodes = component.blockedEdges.flatMap((edge) =>
+          edge.blockedBy.map((blockedBy) => this.#noProgressBlockedEdges.get(
+            noProgressBlockedEdgeKey(edge.moduleId, blockedBy),
+          )!)
+        );
+        if (componentEpisodes.every((episode) => episode.active)) continue;
+        for (const episode of componentEpisodes) episode.active = true;
+        const waitingSince = Math.min(...componentEpisodes.map((episode) => episode.waitingSince!));
         // Observers may synchronously read instanceStatus() from the event
         // callback, so publish the aggregate state before publishing the event.
         this.#refreshNoProgressActive(now);
@@ -2543,9 +2584,10 @@ export class ModuleScheduler {
           type: "scheduler.no_progress",
           instanceId: this.#instanceId,
           monotonicAt: now,
-          stalledForMs,
-          blockedEdges: episode.blockedEdges,
+          stalledForMs: now - waitingSince,
+          blockedEdges: component.blockedEdges,
         });
+        if (this.#state !== "running") break;
       }
       this.#refreshNoProgressActive(now);
       return;

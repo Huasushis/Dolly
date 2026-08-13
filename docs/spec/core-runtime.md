@@ -2693,18 +2693,22 @@ Cycles are allowed in the Page graph, but bounded mailboxes can create cyclic
 wait. A scheduler or operator policy MUST detect sustained no-progress states
 and expose the blocked dependency cycle. Correctness MUST not depend on
 unbounded buffering. The threshold applies to one continuous interval in which
-work remains waiting without relevant durable progress. Weakly connected
-components of the blocked-edge graph have independent clocks: an edge that
-appears, disappears, or makes durable progress in one component MUST NOT reset
-a disjoint stable component. External drain, disappearance of all waiting work,
-or a committed/dead-lettered result from a Module participating as the source
-or target of one blocked component ends that component's interval. The
-instance-level `noProgressActive` state clears only after every reported
-component clears. In-flight work or a commit in an independent branch MUST NOT
-pause or reset another component's timer. Merely retrying the same blocked
-output commit does not reset it. A later independent blocked interval starts a
-new timer; it MUST NOT inherit Scheduler uptime or an earlier episode's
-duration.
+work remains waiting without relevant durable progress. Each directed blocked
+edge owns that continuous-wait clock. An edge appearing, disappearing, or
+making durable progress MUST NOT reset any other edge; an attached leaf
+therefore cannot hide a stable cycle, and a newly attached branch cannot
+inherit an older cycle's age. A committed/dead-lettered result resets only
+edges incident to that Module. In-flight work consuming a target may pause the
+precise incoming edges it can release, but MUST NOT pause sibling edges or an
+otherwise stable cycle. Events deterministically aggregate overdue edges into
+weakly connected components, while the instance-level `noProgressActive` state
+clears only after every reported edge clears. An idle producer with no pending
+input and no prepared output commit does not create a blocked edge merely
+because one of its declared consumers is full. External drain or disappearance
+of all waiting work ends the corresponding edge intervals. Merely retrying the
+same blocked output commit does not reset them. A later independent blocked
+interval starts a new timer; it MUST NOT inherit Scheduler uptime or an earlier
+episode's duration.
 
 ## 13. Scheduler policy boundary
 

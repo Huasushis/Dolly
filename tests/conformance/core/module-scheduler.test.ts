@@ -1194,6 +1194,206 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
     await scheduler.stop();
   });
 
+  it("does not restart a stable blocked cycle when an attached downstream edge drains", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler({
+      noProgressAfterMs: 1_000,
+      maxConcurrentModules: 3,
+    });
+    mailboxes.set("alpha", 4, 400);
+    scheduler.register({
+      moduleId: "alpha",
+      runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+      inputPageIds: ["page-a"],
+      outputPageIds: ["page-b"],
+      mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+    });
+    mailboxes.set("beta", 4, 400);
+    scheduler.register({
+      moduleId: "beta",
+      runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+      inputPageIds: ["page-b"],
+      outputPageIds: ["page-a", "page-g"],
+      mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+    });
+    // A claimed resident item keeps the mailbox full without making gamma
+    // eligible. This isolates the topology change from the separate rule for
+    // an in-flight downstream consumer.
+    mailboxes.set("gamma", 0, 0);
+    mailboxes.setResident("gamma", 0, 0, 4, 400);
+    scheduler.register({
+      moduleId: "gamma",
+      runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+      inputPageIds: ["page-g"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+    });
+
+    scheduler.start();
+    await advance(clock, 500);
+    mailboxes.setResident("gamma", 0, 0, 0, 0);
+    scheduler.wake();
+    await drain(clock);
+
+    await advance(clock, 600);
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toEqual([
+      expect.objectContaining({
+        blockedEdges: [
+          { moduleId: "alpha", blockedBy: ["beta"] },
+          { moduleId: "beta", blockedBy: ["alpha"] },
+        ],
+      }),
+    ]);
+    await scheduler.stop();
+  });
+
+  it("does not let an in-flight leaf pause the stable cycle attached to it", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler({
+      noProgressAfterMs: 1_000,
+      maxConcurrentModules: 3,
+    });
+    mailboxes.set("alpha", 4, 400);
+    scheduler.register({
+      moduleId: "alpha",
+      runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+      inputPageIds: ["page-a"],
+      outputPageIds: ["page-b", "page-g"],
+      mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+    });
+    mailboxes.set("beta", 4, 400);
+    scheduler.register({
+      moduleId: "beta",
+      runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+      inputPageIds: ["page-b"],
+      outputPageIds: ["page-a"],
+      mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+    });
+    const gamma = new FakeModuleRuntime();
+    mailboxes.set("gamma", 4, 400);
+    scheduler.register({
+      moduleId: "gamma",
+      runtime: gamma,
+      inputPageIds: ["page-g"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 8, maxResidentBytes: 800 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+    expect(gamma.tickCount).toBe(1);
+    await advance(clock, 1_100);
+
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toEqual([
+      expect.objectContaining({
+        blockedEdges: [
+          { moduleId: "alpha", blockedBy: ["beta"] },
+          { moduleId: "beta", blockedBy: ["alpha"] },
+        ],
+      }),
+    ]);
+    gamma.settle({ status: "idle" });
+    await drain(clock);
+    await scheduler.stop();
+  });
+
+  it("starts a new branch's clock when it separates from an older stalled cycle", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler({
+      noProgressAfterMs: 1_000,
+      maxConcurrentModules: 4,
+    });
+    for (const [moduleId, input, output] of [
+      ["alpha", "page-a", ["page-b", "page-g"]],
+      ["beta", "page-b", ["page-a"]],
+      ["gamma", "page-g", ["page-d"]],
+      ["delta", "page-d", ["page-g"]],
+    ] as const) {
+      const initiallyFull = moduleId === "alpha" || moduleId === "beta";
+      mailboxes.set(moduleId, initiallyFull ? 4 : 0, initiallyFull ? 400 : 0);
+      scheduler.register({
+        moduleId,
+        runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+        inputPageIds: [input],
+        outputPageIds: output,
+        mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+      });
+    }
+
+    scheduler.start();
+    await advance(clock, 1_100);
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toHaveLength(1);
+
+    // The new cycle first appears while an alpha -> gamma bridge temporarily
+    // joins it to the already reported cycle.
+    mailboxes.set("gamma", 4, 400);
+    mailboxes.set("delta", 4, 400);
+    scheduler.wake();
+    await drain(clock);
+    await advance(clock, 100);
+    mailboxes.set("alpha", 0, 0);
+    mailboxes.set("beta", 0, 0);
+    scheduler.wake();
+    await drain(clock);
+
+    await advance(clock, 500);
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "scheduler.no_progress_cleared")).toHaveLength(1);
+
+    await advance(clock, 600);
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toEqual([
+      expect.objectContaining({
+        blockedEdges: [
+          { moduleId: "alpha", blockedBy: ["beta"] },
+          { moduleId: "beta", blockedBy: ["alpha"] },
+        ],
+      }),
+      expect.objectContaining({
+        blockedEdges: [
+          { moduleId: "delta", blockedBy: ["gamma"] },
+          { moduleId: "gamma", blockedBy: ["delta"] },
+        ],
+      }),
+    ]);
+    await scheduler.stop();
+  });
+
+  it("does not report an idle producer as blocked by an unrelated full mailbox", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler({
+      noProgressAfterMs: 1_000,
+      maxConcurrentModules: 2,
+    });
+    mailboxes.set("idle", 0, 0);
+    scheduler.register({
+      moduleId: "idle",
+      runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+      inputPageIds: ["idle-input"],
+      outputPageIds: ["busy-input"],
+      mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+    });
+    const busy = new FakeModuleRuntime();
+    mailboxes.set("busy", 4, 400);
+    scheduler.register({
+      moduleId: "busy",
+      runtime: busy,
+      inputPageIds: ["busy-input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 8, maxResidentBytes: 800 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+    expect(busy.tickCount).toBe(1);
+    await advance(clock, 1_100);
+
+    expect(scheduler.status("idle")).toMatchObject({
+      pendingCount: 0,
+      backpressured: false,
+      blockingDownstreamIds: [],
+    });
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toEqual([]);
+    busy.settle({ status: "idle" });
+    await drain(clock);
+    await scheduler.stop();
+  });
+
   it("keeps the aggregate no-progress state active until every stalled component clears", async () => {
     const { clock, mailboxes, scheduler, events } = createScheduler({
       noProgressAfterMs: 1_000,
