@@ -404,9 +404,10 @@ export interface ExtensionExecuteInvocation {
   readonly hasMore: boolean;
   readonly input: JsonValue;
   /**
-   * Trusted synchronous persistence boundary invoked after all admission and
-   * deadline checks, but before an effect Run is opened or `module.execute`
-   * may be written. Throwing guarantees this Host sends nothing.
+   * Trusted synchronous persistence boundary invoked after initial admission
+   * validation, but before an effect Run is opened or `module.execute` may be
+   * written. The Host rechecks the absolute deadline after this boundary and
+   * effect-run persistence. Throwing guarantees this Host sends nothing.
    */
   readonly beforeDispatch?: () => void;
 }
@@ -1208,16 +1209,30 @@ export class ExtensionProcessHost {
         "beforeDispatch must complete synchronously without returning a value",
       );
     }
-    const effectIdentity = this.#openEffectRun({
-      moduleJobId: invocation.moduleJobId,
-      runId: invocation.runId,
-      attempt: invocation.attempt,
-      moduleGenerationId: this.#moduleGenerationId,
-      processGenerationId: this.#processGenerationId,
-    });
-    this.#state = "executing";
+    let effectIdentity: DeliveryClaimIdentity | undefined;
     let requestId: string | undefined;
     try {
+      effectIdentity = this.#openEffectRun({
+        moduleJobId: invocation.moduleJobId,
+        runId: invocation.runId,
+        attempt: invocation.attempt,
+        moduleGenerationId: this.#moduleGenerationId,
+        processGenerationId: this.#processGenerationId,
+      });
+      // FileCore's prepared -> send-possible transition and the effect journal
+      // both persist synchronously. They consume the same admitted wall-time
+      // budget, so check again immediately before the protocol request can be
+      // written instead of allowing an already-expired Run to execute.
+      const dispatchAt = this.#wallClockNow();
+      if (!Number.isFinite(dispatchAt) || dispatchAt >= deadlineMs) {
+        throw new ExtensionProcessHostError(
+          invocation.admission === undefined
+            ? "EXTENSION_DEADLINE_EXCEEDED"
+            : "EXTENSION_RUN_ADMISSION_EXPIRED",
+          "Extension execution deadline passed before protocol dispatch",
+        );
+      }
+      this.#state = "executing";
       const response = await this.#request(
         "module.execute",
         {

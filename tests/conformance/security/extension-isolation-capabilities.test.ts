@@ -155,6 +155,58 @@ describe("Extension process isolation and capability checks", () => {
     }
   });
 
+  it("rechecks an admitted deadline after durable pre-dispatch work", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-pre-dispatch-deadline-"));
+    const markerPath = join(scratch, "module-executed");
+    let now = Date.parse("2026-08-12T00:00:00.000Z");
+    const openRun = vi.fn();
+    const closeRun = vi.fn();
+    const effectRunLifecycle: ExtensionEffectRunLifecycle = {
+      resolveRunIdentity: (request) => ({
+        moduleJobId: request.moduleJobId,
+        runId: request.runId,
+        attempt: request.attempt,
+        claimToken: "claim-token-deadline",
+        moduleGenerationId: request.moduleGenerationId,
+      }),
+      openRun,
+      invokeCapability: async (_invocation, execute) => await execute(),
+      closeRun,
+    };
+    const host = createHost("execute-marker", scratch, {
+      wallClockNow: () => now,
+      config: { markerPath },
+      effectRunLifecycle,
+    });
+    try {
+      await host.start();
+      const prepared = host.prepareRun(1_000);
+      if (prepared.status !== "ready") throw new Error("expected ready Run admission");
+      await expect(host.execute({
+        moduleJobId: "module-job-deadline",
+        runId: "run-deadline",
+        attempt: 1,
+        admission: prepared.admission,
+        responseTimeoutMs: 2_000,
+        hasMore: false,
+        input: {},
+        beforeDispatch: () => {
+          now += 1_000;
+        },
+      })).rejects.toMatchObject({ code: "EXTENSION_RUN_ADMISSION_EXPIRED" });
+
+      expect(existsSync(markerPath)).toBe(false);
+      expect(openRun).toHaveBeenCalledOnce();
+      expect(closeRun).toHaveBeenCalledOnce();
+      expect(host.snapshot.state).toBe("ready");
+      expect(Object.hasOwn(host.snapshot, "activeRun")).toBe(false);
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("fixes one Host-owned deadline and consumes its Run admission exactly once", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-run-admission-"));
     let now = Date.parse("2026-08-12T00:00:00.000Z");

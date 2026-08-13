@@ -170,6 +170,9 @@ async function handleHostRequest(message) {
     return;
   }
   if (method === "module.execute") {
+    if (mode === "execute-marker") {
+      writeFileSync(initialized.config.markerPath, "module.execute", "utf8");
+    }
     if (mode === "model-stream-required") {
       const handle = initialized.capabilities[0].handle;
       const common = {
