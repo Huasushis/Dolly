@@ -89,6 +89,26 @@ function nextRepositoryRevision(revision: number): number {
   return revision + 1;
 }
 
+const MAX_RECORD_IDENTIFIER = "x".repeat(128);
+const MAX_CANONICAL_TIMESTAMP = new Date(8.64e15).toISOString();
+
+function terminalCapacityRecord(
+  record: ModuleResultCommitRecord,
+): ModuleResultCommitRecord {
+  if (record.state === "committed") return record;
+  return {
+    ...record,
+    state: "committed",
+    revision: record.blockProposal === undefined ? 2 : 3 + record.outputPageIds.length,
+    updatedAt: MAX_CANONICAL_TIMESTAMP,
+    ...(record.blockProposal === undefined ? {} : { blockId: MAX_RECORD_IDENTIFIER }),
+    outputDeliveries: record.outputPageIds.map((pageId) => ({
+      pageId,
+      deliveryId: MAX_RECORD_IDENTIFIER,
+    })),
+  };
+}
+
 export class FileModuleResultCommitRepository implements ModuleResultCommitRepository {
   readonly #path: string;
   readonly #lockPath: string;
@@ -125,13 +145,15 @@ export class FileModuleResultCommitRepository implements ModuleResultCommitRepos
       if (document.records.some((candidate) => candidate.moduleJobId === record.moduleJobId)) {
         return "already-exists";
       }
-      this.#writeDocument({
+      const next = {
         ...document,
         revision: nextRepositoryRevision(document.revision),
         records: [...document.records, immutableRecord(record)].sort((left, right) =>
           left.moduleJobId < right.moduleJobId ? -1 : left.moduleJobId > right.moduleJobId ? 1 : 0,
         ),
-      });
+      } as const;
+      this.#assertTerminalCapacityReserved(next);
+      this.#writeDocument(next);
       return "created";
     });
   }
@@ -164,8 +186,37 @@ export class FileModuleResultCommitRepository implements ModuleResultCommitRepos
     });
   }
 
+  deleteIfRevision(moduleJobId: string, expectedRevision: number): boolean {
+    return this.#withMutationLock(() => {
+      const document = this.#readDocument();
+      const index = document.records.findIndex((record) => record.moduleJobId === moduleJobId);
+      if (index < 0 || document.records[index]!.revision !== expectedRevision) return false;
+      this.#writeDocument({
+        ...document,
+        revision: nextRepositoryRevision(document.revision),
+        records: document.records.filter((_record, recordIndex) => recordIndex !== index),
+      });
+      return true;
+    });
+  }
+
   list(): readonly ModuleResultCommitRecord[] {
     return this.#readDocument().records;
+  }
+
+  #assertTerminalCapacityReserved(document: RepositoryDocument): void {
+    const reserved = {
+      ...document,
+      revision: Number.MAX_SAFE_INTEGER,
+      records: document.records.map(terminalCapacityRecord),
+    };
+    const payload = `${canonicalizeJson(reserved)}\n`;
+    if (Buffer.byteLength(payload, "utf8") > this.#maxBytes) {
+      throw new ModuleResultCommitError(
+        "MODULE_RESULT_COMMIT_LIMIT_EXCEEDED",
+        "Module result commit repository cannot reserve the terminal form of every prepared result",
+      );
+    }
   }
 
   #readDocument(): RepositoryDocument {

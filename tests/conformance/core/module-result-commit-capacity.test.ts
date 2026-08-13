@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -130,6 +130,102 @@ function persistSubmittedClaim(
 }
 
 describe("FileCore Module output capacity", () => {
+  it("prunes verified terminal history before resuming a size-bound prepared result", async () => {
+    const root = scratch("capacity-terminal-pruning");
+    const statePath = join(root, "core-state.json");
+    const journalPath = join(root, "result-commits.json");
+    const core = openCore(statePath, "terminal-pruning");
+    for (const [pageId, consumerId] of [
+      ["history-input", "history"],
+      ["current-input", "current"],
+      ["output", "sink"],
+    ] as const) {
+      core.deliveries.createPage(pageId);
+      core.deliveries.registerConsumer(pageId, consumerId, "from-now");
+    }
+    const repository = new FileModuleResultCommitRepository({
+      path: journalPath,
+      maxBytes: 1024 * 1024,
+    });
+    const history = prepareWorker(core, "history", "history-input");
+    const commits = createModuleResultCommitCoordinator({
+      core,
+      repository,
+      now: () => NOW,
+      mailboxes: [{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 8,
+        maxResidentBytes: 1024 * 1024,
+      }],
+    });
+    await expect(commits.commit({
+      ...history,
+      blockProposal: proposal("h".repeat(2_000)),
+    })).resolves.toMatchObject({ state: "committed" });
+
+    const current = prepareWorker(core, "current", "current-input");
+    let interrupted = false;
+    const interruptedCommits = createModuleResultCommitCoordinator({
+      core,
+      repository,
+      now: () => NOW,
+      mailboxes: [{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 8,
+        maxResidentBytes: 1024 * 1024,
+      }],
+      afterEffect: (event) => {
+        if (!interrupted && event.moduleJobId === current.moduleJobId &&
+          event.phase === "after-ack-effect") {
+          interrupted = true;
+          throw new Error("simulated restart after the atomic Core commit");
+        }
+      },
+    });
+    await expect(interruptedCommits.commit({
+      ...current,
+      blockProposal: proposal("c".repeat(2_000)),
+    })).rejects.toThrow("simulated restart after the atomic Core commit");
+    expect(core.deliveries.inspectClaim(current).status).toBe("committed");
+    expect(repository.get(history.moduleJobId)).toMatchObject({ state: "committed" });
+    expect(repository.get(current.moduleJobId)).toMatchObject({ state: "prepared" });
+
+    // The legacy-sized document itself remains readable, but recording the
+    // already durable output effect cannot grow it by even one byte until the
+    // verified terminal history is reclaimed.
+    const exactCurrentBytes = statSync(journalPath).size;
+    expect(exactCurrentBytes).toBeGreaterThan(1_024);
+    const reopenedRepository = new FileModuleResultCommitRepository({
+      path: journalPath,
+      maxBytes: exactCurrentBytes,
+    });
+    const recovering = createModuleResultCommitCoordinator({
+      core,
+      repository: reopenedRepository,
+      now: () => NOW,
+      mailboxes: [{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 8,
+        maxResidentBytes: 1024 * 1024,
+      }],
+    });
+
+    await expect(recovering.recover(current.moduleJobId)).resolves.toMatchObject({
+      moduleJobId: current.moduleJobId,
+      state: "committed",
+      outputDeliveries: [expect.objectContaining({ pageId: "output" })],
+    });
+    expect(reopenedRepository.get(history.moduleJobId)).toBeNull();
+    expect(reopenedRepository.get(current.moduleJobId)).toMatchObject({ state: "committed" });
+    expect(new FileModuleResultCommitRepository({
+      path: journalPath,
+      maxBytes: exactCurrentBytes,
+    }).get(current.moduleJobId)).toMatchObject({ state: "committed" });
+  });
+
   it("identifies the owning consumer when a self-loop output cannot fit", async () => {
     const root = scratch("capacity-self-loop");
     const core = openCore(join(root, "core-state.json"), "self-loop");
@@ -487,6 +583,8 @@ describe("FileCore Module output capacity", () => {
       get: (moduleJobId) => hideJournal ? null : stored.get(moduleJobId),
       compareAndSet: (moduleJobId, revision, next) =>
         stored.compareAndSet(moduleJobId, revision, next),
+      deleteIfRevision: (moduleJobId, revision) =>
+        stored.deleteIfRevision(moduleJobId, revision),
       list: () => hideJournal ? [] : stored.list(),
     };
     const commits = createModuleResultCommitCoordinator({
@@ -797,6 +895,8 @@ describe("FileCore Module output capacity", () => {
         get: (moduleJobId) => stored.get(moduleJobId),
         compareAndSet: (moduleJobId, revision, next) =>
           stored.compareAndSet(moduleJobId, revision, next),
+        deleteIfRevision: (moduleJobId, revision) =>
+          stored.deleteIfRevision(moduleJobId, revision),
         list: () => {
           const records = [...stored.list()];
           return reverseList ? records.reverse() : records;

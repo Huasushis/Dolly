@@ -112,6 +112,38 @@ describe("CORE durable Module result commit repository", () => {
     expect(repository.createPrepared(preparedRecord())).toBe("created");
   });
 
+  it("deletes only the exact durable revision", () => {
+    const repository = new FileModuleResultCommitRepository({ path });
+    const prepared = preparedRecord();
+    expect(repository.createPrepared(prepared)).toBe("created");
+    expect(repository.deleteIfRevision(prepared.moduleJobId, 2)).toBe(false);
+    expect(repository.deleteIfRevision(prepared.moduleJobId, 1)).toBe(true);
+    expect(repository.deleteIfRevision(prepared.moduleJobId, 1)).toBe(false);
+    expect(new FileModuleResultCommitRepository({ path }).get(prepared.moduleJobId)).toBeNull();
+  });
+
+  it("reserves the complete terminal form before accepting a prepared result", () => {
+    const repository = new FileModuleResultCommitRepository({ path, maxBytes: 1_024 });
+    const base = preparedRecord();
+    const outputPageIds = ["output-a", "output-b", "output-c", "output-d"];
+    const prepared: ModuleResultCommitRecord = {
+      ...base,
+      outputPageIds,
+      resultDigest: moduleJobResultDigest({
+        source: base.source,
+        blockProposal: base.blockProposal,
+        outputPageIds,
+      }),
+    };
+
+    expect(() => repository.createPrepared(prepared)).toThrowError(
+      expect.objectContaining<Partial<ModuleResultCommitError>>({
+        code: "MODULE_RESULT_COMMIT_LIMIT_EXCEEDED",
+      }),
+    );
+    expect(repository.list()).toEqual([]);
+  });
+
   it("rejects strict-JSON corruption without replacing the last in-memory truth", () => {
     const repository = new FileModuleResultCommitRepository({ path });
     repository.createPrepared(preparedRecord());

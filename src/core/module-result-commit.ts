@@ -81,6 +81,7 @@ export interface ModuleResultCommitRepository {
     expectedRevision: number,
     next: ModuleResultCommitRecord,
   ): boolean;
+  deleteIfRevision(moduleJobId: string, expectedRevision: number): boolean;
   list(): readonly ModuleResultCommitRecord[];
 }
 
@@ -606,6 +607,13 @@ export class InMemoryModuleResultCommitRepository
     return true;
   }
 
+  deleteIfRevision(moduleJobId: string, expectedRevision: number): boolean {
+    const current = this.#records.get(moduleJobId);
+    if (!current || current.revision !== expectedRevision) return false;
+    this.#records.delete(moduleJobId);
+    return true;
+  }
+
   list(): readonly ModuleResultCommitRecord[] {
     return [...this.#records.values()];
   }
@@ -911,7 +919,19 @@ export class ModuleResultCommitCoordinator {
       this.#assertSameResult(raced, input, resultDigest);
       return raced;
     }
-    const created = this.#repository.createPrepared(prepared);
+    let created: "created" | "already-exists";
+    try {
+      created = this.#repository.createPrepared(prepared);
+    } catch (error) {
+      if (
+        !(error instanceof ModuleResultCommitError) ||
+        error.code !== "MODULE_RESULT_COMMIT_LIMIT_EXCEEDED" ||
+        this.#pruneVerifiedTerminalRecords() === 0
+      ) {
+        throw error;
+      }
+      created = this.#repository.createPrepared(prepared);
+    }
     if (created === "created") return prepared;
     const raced = this.#repository.get(claim.moduleJobId)!;
     assertModuleResultCommitRecord(raced);
@@ -1347,11 +1367,28 @@ export class ModuleResultCommitCoordinator {
   #runExclusive(moduleJobId: string): Promise<ModuleResultCommitRecord> {
     const existing = this.#inFlight.get(moduleJobId);
     if (existing) return existing;
-    const operation = this.#resume(moduleJobId).finally(() => {
+    const operation = this.#resumeWithTerminalPruning(moduleJobId).finally(() => {
       this.#inFlight.delete(moduleJobId);
     });
     this.#inFlight.set(moduleJobId, operation);
     return operation;
+  }
+
+  async #resumeWithTerminalPruning(
+    moduleJobId: string,
+  ): Promise<ModuleResultCommitRecord> {
+    try {
+      return await this.#resume(moduleJobId);
+    } catch (error) {
+      if (
+        !(error instanceof ModuleResultCommitError) ||
+        error.code !== "MODULE_RESULT_COMMIT_LIMIT_EXCEEDED" ||
+        this.#pruneVerifiedTerminalRecords() === 0
+      ) {
+        throw error;
+      }
+      return this.#resume(moduleJobId);
+    }
   }
 
   async #resume(moduleJobId: string): Promise<ModuleResultCommitRecord> {
@@ -1469,6 +1506,30 @@ export class ModuleResultCommitCoordinator {
       }
       return committed;
     }
+  }
+
+  /**
+   * A result-commit journal is a recovery mechanism, not an audit log. Once
+   * the exact Claim and effects are durably terminal, retaining its full
+   * result forever can only consume the finite recovery budget. Every removal
+   * is preceded by the same cross-store validation used during recovery.
+   */
+  #pruneVerifiedTerminalRecords(): number {
+    let removed = 0;
+    const records = [...this.#repository.list()].sort((left, right) =>
+      left.moduleJobId < right.moduleJobId ? -1 : left.moduleJobId > right.moduleJobId ? 1 : 0,
+    );
+    for (const record of records) {
+      assertModuleResultCommitRecord(record);
+      if (record.state !== "committed") continue;
+      if (this.#validatePersistentState(record) !== "committed") continue;
+      if (!this.#repository.deleteIfRevision(record.moduleJobId, record.revision)) continue;
+      if (record.blockProposal !== undefined) {
+        this.#blocks.releaseCommitEffect(this.#blockEffectId(record.moduleJobId));
+      }
+      removed += 1;
+    }
+    return removed;
   }
 
   /**

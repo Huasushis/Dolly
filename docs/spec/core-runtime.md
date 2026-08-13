@@ -274,6 +274,11 @@ is bounded; it is not a general Module job or Delivery-store size limit. The
 version 4 field `maxProcessingJournalBytes` is rejected and requires explicit
 configuration migration; it is not an alias.
 
+Accepting a new `prepared` record MUST reserve enough of that finite bound for
+the same record's largest valid terminal form, including assigned Block and
+Delivery identifiers. A configuration that can store only the initial result
+but not finish its journal transitions fails before the first result effect.
+
 Each configured Module uses these fields in addition to its identity, Page
 routes, activation, and resource limits:
 
@@ -1818,6 +1823,17 @@ and matching submission record. A `committed` journal record MUST match a Claim
 whose status is `committed`, with no submission record. Every other combination,
 including any terminal Claim beside a submission record, is a fail-closed
 consistency error.
+
+The result journal is recovery state, not the sole audit log. When its finite
+byte reservation would otherwise reject new or recovering work, Core may prune
+an older `committed` record only after revalidating that record against its
+exact committed Claim, absent submission, source, Block effect, and every
+output Delivery effect. Removal uses the record's exact revision and a durable
+repository update. A prepared, contradictory, or unverifiable record is never
+pruned. The remaining terminal Claim still rejects reuse of that Module job;
+pruning does not authorize another execution or result. Recovery performs the
+same verified pruning before retrying a journal transition that reached the
+configured byte bound.
 
 Configured mailbox capacity can postpone step 3 after the result is already
 `prepared`. This is a known output-admission wait, not an unknown Run outcome:
