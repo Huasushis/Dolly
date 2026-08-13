@@ -65,7 +65,10 @@ vi.mock("../../../src/linux-module-runtime-assets.js", async (importOriginal) =>
   inspectReviewedLinuxModuleRuntime: runtimeMock.inspect,
 }));
 
-import { decideLinuxModuleActivation } from "../../../src/core/linux-module-activation.js";
+import {
+  assertLinuxModuleActivationPermission,
+  decideLinuxModuleActivation,
+} from "../../../src/core/linux-module-activation.js";
 
 function options() {
   return {
@@ -121,6 +124,13 @@ describe("Linux Module activation delegated-root authority", () => {
         delegatedRoot: cgroupMock.root,
       });
       expect("stopProver" in result).toBe(true);
+      if (!result.permitted) throw new Error("expected activation permission");
+      expect(() => assertLinuxModuleActivationPermission(result)).not.toThrow();
+      expect(() => assertLinuxModuleActivationPermission({ ...result }))
+        .toThrow(/was not minted by the Host activation decision/u);
+      expect(Object.isFrozen(result)).toBe(true);
+      expect(Object.isFrozen(result.binding)).toBe(true);
+      expect(Object.isFrozen(result.delegatedRoot)).toBe(true);
     },
   );
 });

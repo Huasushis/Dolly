@@ -665,6 +665,11 @@ timeouts; service observations, `/proc` data, the cgroup-v2 mount, delegated
 root writes, and the resulting stop prover all use the real Host adapters.
 Those low-level seams remain independently testable, but an activation caller
 cannot replace their evidence and receive the same `permitted` result.
+The successful result is a Host-minted, deeply frozen activation permission;
+later composition rejects a copied or caller-constructed structural lookalike.
+The permission binds the verified service identity, prepared delegated-root
+snapshot, reviewed runtime identity, and stop prover as one object. It is not a
+serializable configuration record and must never be reconstructed from JSON.
 
 Linux activation performs the delegated-root half of that proof before it
 returns permission to accept Module work. After verifying the exact Core

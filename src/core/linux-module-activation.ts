@@ -53,14 +53,16 @@ export interface LinuxModuleActivationOptions extends Pick<
 > {
 }
 
+export interface LinuxModuleActivationPermission {
+  readonly permitted: true;
+  readonly binding: VerifiedCoreServiceBinding;
+  readonly delegatedRoot: DelegatedCgroupRootPreparation;
+  readonly runtime: ReviewedLinuxModuleRuntimeIdentity;
+  readonly stopProver: ModuleProcessStopProver;
+}
+
 export type LinuxModuleActivationResult =
-  | {
-      readonly permitted: true;
-      readonly binding: VerifiedCoreServiceBinding;
-      readonly delegatedRoot: DelegatedCgroupRootPreparation;
-      readonly runtime: ReviewedLinuxModuleRuntimeIdentity;
-      readonly stopProver: ModuleProcessStopProver;
-    }
+  | LinuxModuleActivationPermission
   | {
       readonly permitted: false;
       readonly refusals: readonly ModuleActivationRefusal[];
@@ -70,6 +72,23 @@ export type LinuxModuleActivationResult =
        */
       readonly bindingFailures?: readonly CoreServiceBindingFailure[];
     };
+
+const LINUX_MODULE_ACTIVATION_PERMISSIONS = new WeakSet<object>();
+
+/** Rejects copied or caller-constructed activation evidence. */
+export function assertLinuxModuleActivationPermission(
+  value: unknown,
+): asserts value is LinuxModuleActivationPermission {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    !LINUX_MODULE_ACTIVATION_PERMISSIONS.has(value)
+  ) {
+    throw new TypeError(
+      "Linux Module activation permission was not minted by the Host activation decision",
+    );
+  }
+}
 
 /**
  * Runs the ADR 0009 preconditions in order and returns either a refusal or the
@@ -147,15 +166,26 @@ export async function decideLinuxModuleActivation(
     };
   }
 
-  return {
+  const permission: LinuxModuleActivationPermission = Object.freeze({
     permitted: true,
-    binding: binding.binding,
-    delegatedRoot: delegatedRoot.root,
+    binding: Object.freeze({
+      ...binding.binding,
+      delegatedRootControllers: Object.freeze([
+        ...binding.binding.delegatedRootControllers,
+      ]),
+    }),
+    delegatedRoot: Object.freeze({
+      ...delegatedRoot.root,
+      controllers: Object.freeze([...delegatedRoot.root.controllers]),
+      subtreeControl: Object.freeze([...delegatedRoot.root.subtreeControl]),
+    }),
     runtime,
     stopProver: new LinuxModuleCgroupStopProver({
       // The binding above is the proof this flag stands for. It is never set
       // from configuration or from a previous run's record.
       serviceBindingVerified: true,
     }),
-  };
+  });
+  LINUX_MODULE_ACTIVATION_PERMISSIONS.add(permission);
+  return permission;
 }
