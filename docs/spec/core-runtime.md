@@ -431,6 +431,16 @@ absent from version 9 remain explicit trusted inputs. This function is not calle
 slice only and does not satisfy Linux control-group ownership, durable external
 effect evidence, configuration resolution, or startup recovery.
 
+The narrower installed Host composer no longer accepts a separately supplied
+service binding. It requires the Host-minted Linux activation permission and
+derives every installed runtime's service binding from that exact object;
+copied or caller-constructed lookalikes are rejected before a recovery handoff
+is consumed or a process record is created. The direct installed-runtime
+factory retains an explicit binding only as a lower-level candidate and test
+seam. This closes one composition ambiguity, but it does not yet prove that the
+startup-recovery handoff was minted with the same activation stop prover, and
+does not make either candidate path a public bootstrap.
+
 Candidate-host shutdown first changes the Scheduler to its stopping state,
 which synchronously closes dispatch admission. It then invokes every started
 runtime's stop operation without waiting for the Scheduler's active ticks to

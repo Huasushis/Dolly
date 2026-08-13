@@ -12,6 +12,10 @@ import { FileCoreStateStore } from "../core/file-core-state-store.js";
 import type { FileCoreStateStoreWithStoppedRecordWriter } from "../core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../core/file-module-result-commit-repository.js";
 import {
+  assertLinuxModuleActivationPermission,
+  type LinuxModuleActivationPermission,
+} from "../core/linux-module-activation.js";
+import {
   resolveInstalledContentSchemaRegistrationSet,
   resolveInstalledExtensionModule,
   type InstalledExtensionModule,
@@ -428,6 +432,7 @@ type InstalledHostRuntimeOptions = Omit<
   InstalledReactiveModuleRuntimeOptions,
   | "configurations"
   | "core"
+  | "binding"
   | "initialModuleGenerationId"
   | "installations"
   | "instanceConfiguration"
@@ -451,6 +456,8 @@ export interface InstalledSourceActivationLimits {
 }
 
 export interface InstalledReactiveModuleHostOptions {
+  /** Host-minted proof of the exact service, cgroup root, and reviewed runtime. */
+  readonly activation: LinuxModuleActivationPermission;
   readonly configuration: DollyInstanceConfig;
   readonly installations: ExtensionInstallationRegistry;
   readonly configurations: ModuleConfigurationStore;
@@ -533,6 +540,7 @@ function sourceActivationAdmission(
 export function composeInstalledReactiveModuleHost(
   options: InstalledReactiveModuleHostOptions,
 ): InstalledReactiveModuleHost {
+  assertLinuxModuleActivationPermission(options.activation);
   if (!(options.contentSchemas instanceof ContentSchemaRegistrationSet)) {
     throw new TypeError("contentSchemas must be a ContentSchemaRegistrationSet");
   }
@@ -685,6 +693,7 @@ export function composeInstalledReactiveModuleHost(
       installations: options.installations,
       configurations: options.configurations,
       core: options.coreState.store,
+      binding: options.activation.binding,
       stoppedRecordWriter: options.coreState.stoppedRecordWriter,
       mailboxes: options.mailboxes,
       initialModuleGenerationId:

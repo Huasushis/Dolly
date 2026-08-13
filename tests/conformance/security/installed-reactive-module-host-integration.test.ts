@@ -39,10 +39,12 @@ import { resolveInstalledContentSchemaRegistrationSet } from "../../../src/core/
 import {
   deriveModuleCgroupPath,
   LinuxModuleCgroupStopProver,
-  prepareDelegatedCgroupRoot,
   type ModuleCgroupLimits,
 } from "../../../src/core/linux-module-cgroup.js";
-import { inspectCoreServiceBinding } from "../../../src/core/linux-core-service-binding.js";
+import {
+  decideLinuxModuleActivation,
+  type LinuxModuleActivationPermission,
+} from "../../../src/core/linux-module-activation.js";
 import type { ModuleActorEvent } from "../../../src/core/module-actor.js";
 import { EndpointBindingRegistry } from "../../../src/core/model-provider-binding.js";
 import type {
@@ -248,29 +250,32 @@ if (
   throw new Error("The installed Scheduler integration did not receive its exact Core service unit");
 }
 
+async function requireLinuxModuleActivation(
+  unitName: string,
+): Promise<LinuxModuleActivationPermission> {
+  const result = await decideLinuxModuleActivation({
+    unitName,
+    mode: "user",
+    queryTimeoutMs: 5_000,
+    overallTimeoutMs: 15_000,
+  });
+  if (!result.permitted) {
+    throw new Error(result.refusals
+      .map((refusal) => `${refusal.code}: ${refusal.detail}`)
+      .join("; "));
+  }
+  if (result.binding.delegatedRootCgroupPath !== delegatedRoot) {
+    throw new Error("Activation permission does not match the integration cgroup");
+  }
+  return result;
+}
+
 describe.skipIf(!available)("installed reactive Module host in a real control group", () => {
   it("recovers a full downstream mailbox without re-executing its producers", async () => {
     if (integrationUnitName === undefined) {
       throw new Error("The transient Core service unit name is unavailable");
     }
-    const inspectedBinding = await inspectCoreServiceBinding({
-      unitName: integrationUnitName,
-      mode: "user",
-      queryTimeoutMs: 5_000,
-      overallTimeoutMs: 15_000,
-    });
-    if (!inspectedBinding.verified) {
-      throw new Error(inspectedBinding.failures
-        .map((failure) => `${failure.code}: ${failure.detail}`)
-        .join("; "));
-    }
-    expect(inspectedBinding.binding.delegatedRootCgroupPath).toBe(delegatedRoot);
-    const preparedRoot = await prepareDelegatedCgroupRoot({
-      delegatedRootCgroupPath: inspectedBinding.binding.delegatedRootCgroupPath,
-    });
-    if (!preparedRoot.prepared) {
-      throw new Error(`${preparedRoot.failure.code}: ${preparedRoot.failure.detail}`);
-    }
+    const activation = await requireLinuxModuleActivation(integrationUnitName);
 
     const scratchParent = resolve(process.cwd(), ".tmp");
     mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
@@ -282,7 +287,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
     );
     const moduleCgroupPaths = MODULE_IDS.map((moduleId, index) =>
       deriveModuleCgroupPath(
-        inspectedBinding.binding.delegatedRootCgroupPath,
+        activation.binding.delegatedRootCgroupPath,
         {
           instanceId: INSTANCE_ID,
           moduleId,
@@ -524,6 +529,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         stoppedRecordWriter: coreState.stoppedRecordWriter,
       }).recover()).handoff;
       composed = composeInstalledReactiveModuleHost({
+        activation,
         configuration,
         installations,
         configurations,
@@ -548,7 +554,6 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           now,
           initialModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-1`,
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
-          binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),
@@ -854,23 +859,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
     if (integrationUnitName === undefined) {
       throw new Error("The transient Core service unit name is unavailable");
     }
-    const inspectedBinding = await inspectCoreServiceBinding({
-      unitName: integrationUnitName,
-      mode: "user",
-      queryTimeoutMs: 5_000,
-      overallTimeoutMs: 15_000,
-    });
-    if (!inspectedBinding.verified) {
-      throw new Error(inspectedBinding.failures
-        .map((failure) => `${failure.code}: ${failure.detail}`)
-        .join("; "));
-    }
-    const preparedRoot = await prepareDelegatedCgroupRoot({
-      delegatedRootCgroupPath: inspectedBinding.binding.delegatedRootCgroupPath,
-    });
-    if (!preparedRoot.prepared) {
-      throw new Error(`${preparedRoot.failure.code}: ${preparedRoot.failure.detail}`);
-    }
+    const activation = await requireLinuxModuleActivation(integrationUnitName);
 
     const producerId = "scheduler-recovery-producer";
     const drainerId = "scheduler-recovery-drainer";
@@ -883,7 +872,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
     const statePath = join(scratch, "core-state.json");
     const commitPath = join(scratch, "module-result-commits.json");
     const drainerCgroupPath = deriveModuleCgroupPath(
-      inspectedBinding.binding.delegatedRootCgroupPath,
+      activation.binding.delegatedRootCgroupPath,
       { instanceId: INSTANCE_ID, moduleId: drainerId, processGenerationId: drainerProcessId },
     ).filesystemPath;
     let composed: InstalledReactiveModuleHost | undefined;
@@ -1053,7 +1042,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       });
       if (oldClaim === null) throw new Error("The old producer Claim was not created");
       const oldProducerCgroupPath = deriveModuleCgroupPath(
-        inspectedBinding.binding.delegatedRootCgroupPath,
+        activation.binding.delegatedRootCgroupPath,
         {
           instanceId: INSTANCE_ID,
           moduleId: producerId,
@@ -1069,8 +1058,8 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
         packageDigest: installed.packageDigest,
         configurationReference: configuration.modules[0]!.configurationReference,
         declaredExternalEffects: "unrestricted",
-        serviceInvocationId: inspectedBinding.binding.serviceInvocationId,
-        bootId: inspectedBinding.binding.bootId,
+        serviceInvocationId: activation.binding.serviceInvocationId,
+        bootId: activation.binding.bootId,
         moduleCgroupPath: oldProducerCgroupPath,
         state: "starting",
         createdAt: now(),
@@ -1143,6 +1132,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       const standardErrorChunks: Uint8Array[] = [];
       let processGenerationRequestCount = 0;
       composed = composeInstalledReactiveModuleHost({
+        activation,
         configuration,
         installations,
         configurations,
@@ -1167,7 +1157,6 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           now,
           initialModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-1`,
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
-          binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),
@@ -1314,23 +1303,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
     if (integrationUnitName === undefined) {
       throw new Error("The transient Core service unit name is unavailable");
     }
-    const inspectedBinding = await inspectCoreServiceBinding({
-      unitName: integrationUnitName,
-      mode: "user",
-      queryTimeoutMs: 5_000,
-      overallTimeoutMs: 15_000,
-    });
-    if (!inspectedBinding.verified) {
-      throw new Error(inspectedBinding.failures
-        .map((failure) => `${failure.code}: ${failure.detail}`)
-        .join("; "));
-    }
-    const preparedRoot = await prepareDelegatedCgroupRoot({
-      delegatedRootCgroupPath: inspectedBinding.binding.delegatedRootCgroupPath,
-    });
-    if (!preparedRoot.prepared) {
-      throw new Error(`${preparedRoot.failure.code}: ${preparedRoot.failure.detail}`);
-    }
+    const activation = await requireLinuxModuleActivation(integrationUnitName);
 
     const scratchParent = resolve(process.cwd(), ".tmp");
     mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
@@ -1341,7 +1314,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
     const effectIntentPath = join(scratch, "effect-intents.json");
     const processGenerationId = `${AGENT_MODULE_ID}-process-${process.pid}-${Date.now()}`;
     const moduleCgroupPath = deriveModuleCgroupPath(
-      inspectedBinding.binding.delegatedRootCgroupPath,
+      activation.binding.delegatedRootCgroupPath,
       { instanceId: INSTANCE_ID, moduleId: AGENT_MODULE_ID, processGenerationId },
     ).filesystemPath;
     let composed: InstalledReactiveModuleHost | undefined;
@@ -1645,6 +1618,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       const standardErrorChunks: Uint8Array[] = [];
       const classifiedFailures: { readonly stage: string; readonly code: string }[] = [];
       composed = composeInstalledReactiveModuleHost({
+        activation,
         configuration,
         installations,
         configurations,
@@ -1671,7 +1645,6 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           now,
           initialModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-1`,
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
-          binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),
@@ -1910,23 +1883,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
     if (integrationUnitName === undefined) {
       throw new Error("The transient Core service unit name is unavailable");
     }
-    const inspectedBinding = await inspectCoreServiceBinding({
-      unitName: integrationUnitName,
-      mode: "user",
-      queryTimeoutMs: 5_000,
-      overallTimeoutMs: 15_000,
-    });
-    if (!inspectedBinding.verified) {
-      throw new Error(inspectedBinding.failures
-        .map((failure) => `${failure.code}: ${failure.detail}`)
-        .join("; "));
-    }
-    const preparedRoot = await prepareDelegatedCgroupRoot({
-      delegatedRootCgroupPath: inspectedBinding.binding.delegatedRootCgroupPath,
-    });
-    if (!preparedRoot.prepared) {
-      throw new Error(`${preparedRoot.failure.code}: ${preparedRoot.failure.detail}`);
-    }
+    const activation = await requireLinuxModuleActivation(integrationUnitName);
 
     const scratchParent = resolve(process.cwd(), ".tmp");
     mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
@@ -1938,7 +1895,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
     const processGenerationId =
       `${TASK_SWITCH_AGENT_MODULE_ID}-process-${process.pid}-${Date.now()}`;
     const moduleCgroupPath = deriveModuleCgroupPath(
-      inspectedBinding.binding.delegatedRootCgroupPath,
+      activation.binding.delegatedRootCgroupPath,
       {
         instanceId: INSTANCE_ID,
         moduleId: TASK_SWITCH_AGENT_MODULE_ID,
@@ -2218,6 +2175,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       const schedulerEvents: SchedulerEvent[] = [];
       const actorEvents: ModuleActorEvent[] = [];
       composed = composeInstalledReactiveModuleHost({
+        activation,
         configuration,
         installations,
         configurations,
@@ -2244,7 +2202,6 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           now,
           initialModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-1`,
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
-          binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),
@@ -2435,23 +2392,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
     if (integrationUnitName === undefined) {
       throw new Error("The transient Core service unit name is unavailable");
     }
-    const inspectedBinding = await inspectCoreServiceBinding({
-      unitName: integrationUnitName,
-      mode: "user",
-      queryTimeoutMs: 5_000,
-      overallTimeoutMs: 15_000,
-    });
-    if (!inspectedBinding.verified) {
-      throw new Error(inspectedBinding.failures
-        .map((failure) => `${failure.code}: ${failure.detail}`)
-        .join("; "));
-    }
-    const preparedRoot = await prepareDelegatedCgroupRoot({
-      delegatedRootCgroupPath: inspectedBinding.binding.delegatedRootCgroupPath,
-    });
-    if (!preparedRoot.prepared) {
-      throw new Error(`${preparedRoot.failure.code}: ${preparedRoot.failure.detail}`);
-    }
+    const activation = await requireLinuxModuleActivation(integrationUnitName);
 
     const scratchParent = resolve(process.cwd(), ".tmp");
     mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
@@ -2461,7 +2402,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
     const processGenerationId =
       `${SOURCE_MODULE_ID}-process-${process.pid}-${Date.now()}`;
     const moduleCgroupPath = deriveModuleCgroupPath(
-      inspectedBinding.binding.delegatedRootCgroupPath,
+      activation.binding.delegatedRootCgroupPath,
       { instanceId: INSTANCE_ID, moduleId: SOURCE_MODULE_ID, processGenerationId },
     ).filesystemPath;
     let composed: InstalledReactiveModuleHost | undefined;
@@ -2594,6 +2535,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       const schedulerEvents: SchedulerEvent[] = [];
       const actorEvents: ModuleActorEvent[] = [];
       composed = composeInstalledReactiveModuleHost({
+        activation,
         configuration,
         installations,
         configurations,
@@ -2626,7 +2568,6 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           now,
           initialModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-1`,
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
-          binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),
@@ -2781,23 +2722,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
     if (integrationUnitName === undefined) {
       throw new Error("The transient Core service unit name is unavailable");
     }
-    const inspectedBinding = await inspectCoreServiceBinding({
-      unitName: integrationUnitName,
-      mode: "user",
-      queryTimeoutMs: 5_000,
-      overallTimeoutMs: 15_000,
-    });
-    if (!inspectedBinding.verified) {
-      throw new Error(inspectedBinding.failures
-        .map((failure) => `${failure.code}: ${failure.detail}`)
-        .join("; "));
-    }
-    const preparedRoot = await prepareDelegatedCgroupRoot({
-      delegatedRootCgroupPath: inspectedBinding.binding.delegatedRootCgroupPath,
-    });
-    if (!preparedRoot.prepared) {
-      throw new Error(`${preparedRoot.failure.code}: ${preparedRoot.failure.detail}`);
-    }
+    const activation = await requireLinuxModuleActivation(integrationUnitName);
 
     const scratchParent = resolve(process.cwd(), ".tmp");
     mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
@@ -2807,7 +2732,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
     const processGenerationId =
       `${PERIODIC_MODULE_ID}-process-${process.pid}-${Date.now()}`;
     const moduleCgroupPath = deriveModuleCgroupPath(
-      inspectedBinding.binding.delegatedRootCgroupPath,
+      activation.binding.delegatedRootCgroupPath,
       { instanceId: INSTANCE_ID, moduleId: PERIODIC_MODULE_ID, processGenerationId },
     ).filesystemPath;
     const periodMs = 750;
@@ -2953,6 +2878,7 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
       const schedulerEvents: SchedulerEvent[] = [];
       const actorEvents: ModuleActorEvent[] = [];
       composed = composeInstalledReactiveModuleHost({
+        activation,
         configuration,
         installations,
         configurations,
@@ -2977,7 +2903,6 @@ describe.skipIf(!available)("installed reactive Module host in a real control gr
           now,
           initialModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-1`,
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
-          binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),

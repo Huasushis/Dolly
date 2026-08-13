@@ -7,6 +7,54 @@ import {
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const activationDependencies = vi.hoisted(() => {
+  const binding = {
+    mode: "system" as const,
+    unitName: "dolly-core.service",
+    serviceInvocationId: "3812432ad29e4d3bbd6776c62cafa929",
+    bootId: "1a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
+    mainPid: 10_002,
+    delegatedRootCgroupPath: "/system.slice/dolly-core.service",
+    coreCgroupPath: "/system.slice/dolly-core.service/core",
+    delegatedRootControllers: ["cpu", "memory", "pids"],
+  };
+  const runtime = {
+    interpreterProgram: "/usr/bin/python3" as const,
+    launcherScriptPath: "/reviewed/dolly/launcher.py",
+    launcherDigest:
+      "sha256:2c95f759603f902340f719abaaf12b2df0ab7194d9c89f35aa835927486d3177" as const,
+    confinementProgram: "/usr/bin/bwrap" as const,
+  };
+  const root = {
+    filesystemPath: "/sys/fs/cgroup/system.slice/dolly-core.service",
+    controllers: ["cpu", "memory", "pids"],
+    subtreeControl: ["cpu", "memory", "pids"],
+  };
+  return { binding, runtime, root };
+});
+
+vi.mock("../../../src/core/linux-core-service-binding.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/core/linux-core-service-binding.js")>(),
+  inspectCoreServiceBinding: vi.fn(async () => ({
+    verified: true as const,
+    binding: activationDependencies.binding,
+  })),
+}));
+vi.mock("../../../src/core/linux-module-cgroup.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/core/linux-module-cgroup.js")>(),
+  prepareDelegatedCgroupRoot: vi.fn(async () => ({
+    prepared: true as const,
+    root: activationDependencies.root,
+  })),
+}));
+vi.mock("../../../src/linux-module-runtime-assets.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/linux-module-runtime-assets.js")>(),
+  inspectReviewedLinuxModuleRuntime: vi.fn(async () => ({
+    available: true as const,
+    runtime: activationDependencies.runtime,
+  })),
+}));
 import {
   composeInstalledReactiveModuleHost,
   createInstalledReactiveModuleRuntime,
@@ -30,6 +78,10 @@ import { resolveInstalledContentSchemaRegistrationSet } from "../../../src/core/
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { FileToolJournalRepository } from "../../../src/core/file-tool-journal-repository.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
+import {
+  decideLinuxModuleActivation,
+  type LinuxModuleActivationPermission,
+} from "../../../src/core/linux-module-activation.js";
 import type { ChatBrokerInvocation } from "../../../src/core/model-provider-broker.js";
 import { ModelDescriptorRegistry } from "../../../src/core/model-provider-descriptor.js";
 import { EndpointBindingRegistry } from "../../../src/core/model-provider-binding.js";
@@ -50,16 +102,7 @@ import {
 
 const INSTANCE_ID = "33333333-3333-4333-8333-333333333333";
 const DELEGATED_ROOT = "/system.slice/dolly-core.service";
-const BINDING = {
-  mode: "system",
-  unitName: "dolly-core.service",
-  serviceInvocationId: "3812432ad29e4d3bbd6776c62cafa929",
-  bootId: "1a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
-  mainPid: 10_002,
-  delegatedRootCgroupPath: DELEGATED_ROOT,
-  coreCgroupPath: `${DELEGATED_ROOT}/core`,
-  delegatedRootControllers: ["cpu", "memory", "pids"],
-} as const;
+const BINDING = activationDependencies.binding;
 const SCHEMA = {
   $schema: JSON_SCHEMA_2020_12,
   type: "object",
@@ -95,8 +138,17 @@ describe("installed reactive Module runtime composition", () => {
   let installations: ExtensionInstallationRegistry;
   let configurations: ModuleConfigurationStore;
   let instanceConfiguration: ReturnType<typeof validateDollyInstanceConfig>;
+  let activationPermission: LinuxModuleActivationPermission;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    const activationResult = await decideLinuxModuleActivation({
+      unitName: BINDING.unitName,
+      mode: BINDING.mode,
+    });
+    if (!activationResult.permitted) {
+      throw new Error("fixture activation permission was unexpectedly refused");
+    }
+    activationPermission = activationResult;
     mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
     scratch = mkdtempSync(resolve(scratchParent, "installed-reactive-runtime-"));
     const source = resolve(scratch, "package-source");
@@ -513,6 +565,7 @@ describe("installed reactive Module runtime composition", () => {
 
     const {
       configurations: _configurations,
+      binding: _binding,
       core: _core,
       initialModuleGenerationId,
       installations: _installations,
@@ -526,6 +579,7 @@ describe("installed reactive Module runtime composition", () => {
     } = complete;
     const scheduled: Array<{ readonly delayMs: number; readonly callback: () => void }> = [];
     const composed = composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       configuration: instanceConfiguration,
       installations,
       configurations,
@@ -980,6 +1034,7 @@ describe("installed reactive Module runtime composition", () => {
     const complete = options(pair);
     const {
       configurations: _configurations,
+      binding: _binding,
       core: _core,
       initialModuleGenerationId,
       installations: _installations,
@@ -1020,6 +1075,23 @@ describe("installed reactive Module runtime composition", () => {
         maxRegisteredValueBytes: 64 * 1024,
       });
     expect(() => composeInstalledReactiveModuleHost({
+      activation: { ...activationPermission },
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
+      ...contentSchemaOptions(pair),
+      mailboxes,
+      startupRecoveryHandoff: {
+        schemaVersion: "dolly.core-startup-recovery-handoff/1",
+      },
+      clock,
+      scheduling,
+      runtime,
+    })).toThrow(/was not minted by the Host activation decision/u);
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
+    expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       configuration: instanceConfiguration,
       installations,
       configurations,
@@ -1063,6 +1135,7 @@ describe("installed reactive Module runtime composition", () => {
       injectedReservedSchemas,
     );
     expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       configuration: instanceConfiguration,
       installations,
       configurations,
@@ -1078,6 +1151,7 @@ describe("installed reactive Module runtime composition", () => {
       runtime,
     })).toThrow(/content schemas do not match its verified installations/u);
     expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       configuration: instanceConfiguration,
       installations,
       configurations,
@@ -1129,6 +1203,7 @@ describe("installed reactive Module runtime composition", () => {
       }),
     }).recover()).handoff;
     expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       configuration: instanceConfiguration,
       installations,
       configurations,
@@ -1151,6 +1226,7 @@ describe("installed reactive Module runtime composition", () => {
       mailboxes,
     );
     expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       configuration: instanceConfiguration,
       installations,
       configurations,
@@ -1168,6 +1244,7 @@ describe("installed reactive Module runtime composition", () => {
       },
     })).toThrow(/handoff is not bound to this Core store and result repository/u);
     const composed = composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       configuration: instanceConfiguration,
       installations,
       configurations,
@@ -1189,6 +1266,7 @@ describe("installed reactive Module runtime composition", () => {
     expect(composed.modules[0]).not.toHaveProperty("recover");
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
     expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       configuration: instanceConfiguration,
       installations,
       configurations,
@@ -1206,6 +1284,7 @@ describe("installed reactive Module runtime composition", () => {
       mailboxes,
     );
     expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       configuration: instanceConfiguration,
       installations,
       configurations,
@@ -1292,6 +1371,7 @@ describe("installed reactive Module runtime composition", () => {
     const complete = options(pair);
     const {
       configurations: _configurations,
+      binding: _binding,
       core: _core,
       initialModuleGenerationId,
       installations: _installations,
@@ -1349,6 +1429,7 @@ describe("installed reactive Module runtime composition", () => {
       }],
     });
     expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       ...common,
       configuration: periodicSourceInstance,
       sourceActivationLimits: [{
@@ -1363,6 +1444,7 @@ describe("installed reactive Module runtime composition", () => {
     );
 
     expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       ...common,
       mailboxes: [{
         consumerId: "source-worker",
@@ -1381,9 +1463,10 @@ describe("installed reactive Module runtime composition", () => {
       pagesBeforeRejectedPeriodicSource,
     );
 
-    expect(() => composeInstalledReactiveModuleHost(common))
+    expect(() => composeInstalledReactiveModuleHost({ activation: activationPermission, ...common }))
       .toThrow(/require activation limits/u);
     const composed = composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       ...common,
       sourceActivationLimits: [{
         moduleId: "source-worker",
@@ -1457,6 +1540,7 @@ describe("installed reactive Module runtime composition", () => {
     const complete = options(pair);
     const {
       configurations: _configurations,
+      binding: _binding,
       core: _core,
       initialModuleGenerationId,
       installations: _installations,
@@ -1481,6 +1565,7 @@ describe("installed reactive Module runtime composition", () => {
       mailboxes,
     );
     const composed = composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       configuration: periodicInstance,
       installations,
       configurations,
@@ -1535,6 +1620,7 @@ describe("installed reactive Module runtime composition", () => {
     const complete = options(pair);
     const {
       configurations: _configurations,
+      binding: _binding,
       core: _core,
       initialModuleGenerationId,
       installations: _installations,
@@ -1566,6 +1652,7 @@ describe("installed reactive Module runtime composition", () => {
     }];
 
     const composed = composeInstalledReactiveModuleHost({
+      activation: activationPermission,
       configuration: pipelineConfiguration,
       installations,
       configurations,

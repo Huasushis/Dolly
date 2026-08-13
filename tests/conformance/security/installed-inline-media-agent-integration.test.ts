@@ -36,10 +36,9 @@ import { resolveInstalledContentSchemaRegistrationSet } from "../../../src/core/
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
 import {
   deriveModuleCgroupPath,
-  prepareDelegatedCgroupRoot,
   type ModuleCgroupLimits,
 } from "../../../src/core/linux-module-cgroup.js";
-import { inspectCoreServiceBinding } from "../../../src/core/linux-core-service-binding.js";
+import { decideLinuxModuleActivation } from "../../../src/core/linux-module-activation.js";
 import { EndpointBindingRegistry } from "../../../src/core/model-provider-binding.js";
 import type {
   ModelHttpTransport,
@@ -168,22 +167,16 @@ describe.skipIf(!available)("installed inline Media Agent in a real control grou
     if (integrationUnitName === undefined) {
       throw new Error("The transient Core service unit name is unavailable");
     }
-    const inspectedBinding = await inspectCoreServiceBinding({
+    const activation = await decideLinuxModuleActivation({
       unitName: integrationUnitName,
       mode: "user",
       queryTimeoutMs: 5_000,
       overallTimeoutMs: 15_000,
     });
-    if (!inspectedBinding.verified) {
-      throw new Error(inspectedBinding.failures
-        .map((failure) => `${failure.code}: ${failure.detail}`)
+    if (!activation.permitted) {
+      throw new Error(activation.refusals
+        .map((refusal) => `${refusal.code}: ${refusal.detail}`)
         .join("; "));
-    }
-    const preparedRoot = await prepareDelegatedCgroupRoot({
-      delegatedRootCgroupPath: inspectedBinding.binding.delegatedRootCgroupPath,
-    });
-    if (!preparedRoot.prepared) {
-      throw new Error(`${preparedRoot.failure.code}: ${preparedRoot.failure.detail}`);
     }
 
     const scratchParent = resolve(process.cwd(), ".tmp");
@@ -195,7 +188,7 @@ describe.skipIf(!available)("installed inline Media Agent in a real control grou
     const mediaDirectory = join(scratch, "media");
     const processGenerationId = `${MODULE_ID}-process-${process.pid}-${Date.now()}`;
     const moduleCgroupPath = deriveModuleCgroupPath(
-      inspectedBinding.binding.delegatedRootCgroupPath,
+      activation.binding.delegatedRootCgroupPath,
       { instanceId: INSTANCE_ID, moduleId: MODULE_ID, processGenerationId },
     ).filesystemPath;
     let composed: InstalledReactiveModuleHost | undefined;
@@ -452,6 +445,7 @@ describe.skipIf(!available)("installed inline Media Agent in a real control grou
       }).recover()).handoff;
       const schedulerEvents: SchedulerEvent[] = [];
       composed = composeInstalledReactiveModuleHost({
+        activation,
         configuration,
         installations,
         configurations,
@@ -478,7 +472,6 @@ describe.skipIf(!available)("installed inline Media Agent in a real control grou
           now,
           initialModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-1`,
           nextModuleGenerationIdFor: (moduleId) => `${moduleId}-generation-2`,
-          binding: inspectedBinding.binding,
           lifecycle: { limits: LIMITS, maxOpenFiles: 64 },
           host: {
             isolationPolicy: new ExtensionIsolationPolicy(),
