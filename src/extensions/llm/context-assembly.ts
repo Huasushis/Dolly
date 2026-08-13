@@ -424,13 +424,15 @@ export function assembleConversationContext(
  * Bridges the assembled conversation to the broker's normalized chat input.
  *
  * The reasoning directive comes from `mapReasoningPolicy` in
- * `model-provider-chat.ts`; this function never invents a provider field.
+ * `model-provider-chat.ts`; this function never invents a provider field. The
+ * version-1 LLM Module configuration requires strict streaming, so this
+ * Module-specific bridge cannot select the broker's lower-level non-stream
+ * compatibility mode.
  */
 export function toChatInput(
   assembled: AssembledConversation,
   options: {
     readonly reasoning: ChatInput["reasoning"];
-    readonly stream: boolean;
     readonly outputContract?: ChatInput["outputContract"];
   },
 ): ChatInput {
@@ -442,6 +444,6 @@ export function toChatInput(
     })),
     outputContract: options.outputContract ?? { kind: "text" },
     reasoning: options.reasoning,
-    stream: options.stream,
+    stream: true,
   }) as ChatInput;
 }

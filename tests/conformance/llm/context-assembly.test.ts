@@ -702,7 +702,7 @@ describe("untrusted Block text cannot forge a host marker", () => {
 
 describe("bridge to the broker's normalized chat input", () => {
   it("encodes as an OpenAI-compatible request without any provider field of its own", () => {
-    const descriptor = chatSnapshot();
+    const descriptor = chatSnapshot({ streaming: true });
     const assembled = assembleConversationContext({
       moduleId: "llm-main",
       descriptor,
@@ -711,17 +711,28 @@ describe("bridge to the broker's normalized chat input", () => {
 
     const plan = encodeOpenAiCompatibleChatRequest(
       descriptor,
-      toChatInput(assembled, { reasoning: "omit", stream: false }),
+      toChatInput(assembled, { reasoning: "omit" }),
     );
-    const body = plan.body as { model: string; messages: { role: string }[]; stream: boolean };
+    const body = plan.body as {
+      model: string;
+      messages: { role: string }[];
+      stream: boolean;
+      stream_options: { include_usage: boolean };
+    };
     expect(body.model).toBe("fixture-text-model");
     expect(body.messages[0].role).toBe("system");
-    expect(body.stream).toBe(false);
-    expect(Object.keys(body).sort()).toEqual(["messages", "model", "stream"]);
+    expect(body.stream).toBe(true);
+    expect(body.stream_options).toEqual({ include_usage: true });
+    expect(Object.keys(body).sort()).toEqual([
+      "messages",
+      "model",
+      "stream",
+      "stream_options",
+    ]);
   });
 
   it("leaves media resolution to the broker rather than inlining bytes", () => {
-    const descriptor = chatSnapshot({ vision: true });
+    const descriptor = chatSnapshot({ vision: true, streaming: true });
     const assembled = assembleConversationContext({
       moduleId: "llm-main",
       descriptor,
@@ -739,7 +750,7 @@ describe("bridge to the broker's normalized chat input", () => {
     try {
       encodeOpenAiCompatibleChatRequest(
         descriptor,
-        toChatInput(assembled, { reasoning: "omit", stream: false }),
+        toChatInput(assembled, { reasoning: "omit" }),
       );
       expect.unreachable("the text-only wire strategy must refuse an unresolved media part");
     } catch (error) {

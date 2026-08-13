@@ -46,12 +46,14 @@ export interface DescriptorOptions {
   readonly maxInputBytes?: number;
   readonly maxTextBytesPerItem?: number;
   readonly imageMaxItems?: number;
+  readonly streaming?: boolean;
 }
 
 export function chatDescriptorDocument(
   options: DescriptorOptions = {},
 ): ChatDescriptorDocument {
   const vision = options.vision ?? false;
+  const streaming = options.streaming ?? false;
   const requirement: MediaRequirement = {
     ...IMAGE_REQUIREMENT,
     maxItems: options.imageMaxItems ?? IMAGE_REQUIREMENT.maxItems,
@@ -67,6 +69,7 @@ export function chatDescriptorDocument(
       version: "v1",
       requestStrategyId: "openai.chat.request.text-parts.v1",
       responseStrategyId: "openai.chat.response.v1",
+      ...(streaming ? { streamStrategyId: "openai.chat.stream.sse.v1" } : {}),
     },
     limits: {
       maxRequestBytes: 1024 * 1024,
@@ -76,7 +79,12 @@ export function chatDescriptorDocument(
       maxOutputBytes: 64 * 1024,
       maxConcurrentRequests: 1,
       maxProviderTimeoutMs: 30_000,
-      streaming: { state: "unsupported" },
+      streaming: streaming
+        ? {
+            state: "supported",
+            value: { maxEvents: 1_024, maxBufferedBytes: 256 * 1_024 },
+          }
+        : { state: "unsupported" },
     },
     input: {
       modalities: vision ? ["text", "image"] : ["text"],

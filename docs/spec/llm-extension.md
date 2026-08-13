@@ -481,7 +481,10 @@ values fail at the capability boundary before the broker runs. The lower-level
 model-operation capability retains explicit optional and forbidden modes for
 provider components that are not the LLM Module, but the version 1 LLM Module
 cannot select them. It also cannot silently retry a failed stream as a
-non-stream request.
+non-stream request. Its context-to-chat-input bridge exposes no stream toggle
+and always emits the normalized streaming mode; the reviewed provider codec
+then adds terminal usage collection. This keeps the Module-specific contract
+closed even before the capability repeats the same enforcement.
 
 The current installed-Module candidate composes only this required mode. The
 validated Module selects an operator-owned policy identifier; the Host maps it
