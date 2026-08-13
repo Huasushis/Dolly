@@ -2,13 +2,13 @@
   "$schema": "./memory-longmemeval-retrieval-v0-schema.json",
   "schemaVersion": "dolly-experiment-preregistration/v1",
   "experimentId": "memory-longmemeval-retrieval-v0",
-  "experimentVersion": 3,
+  "experimentVersion": 4,
   "title": "Gold-blind repeated-position retrieval screen on LongMemEval-S",
   "status": "frozen-before-first-run",
   "scope": "comparative",
   "protocol": {
     "path": "docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-protocol.md",
-    "sha256": "2031b24421badb5da860461ff0dd718762aa91e7f3e7d661f473a025ef0f7930"
+    "sha256": "2d72f9b31e8d4971cdc77ab19f81878f1c40d1facde57d795f4d8752f2544f39"
   },
   "authorityReferences": [
     "AGENTS.md",
@@ -368,8 +368,8 @@
     "moduleStartupRefusalMustRemain": true
   },
   "domainDesign": {
-    "implementationStatus": "Version 3 replaces versions 1 and 2 before the first dataset run. The treatment, adapter, runner, independent analyzer, mutation harness, artifact contract, and synthetic conformance tests are frozen together by the source commit containing this preregistration. A formal run must independently prove those bytes equal its clean source commit before ranking. No formal dataset run or retrieval-outcome inspection has occurred under any version at freeze time.",
-    "artifactContract": {"path": "docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-artifacts.md", "sha256": "3a60f3f69a7257243ec9b51306b97265d5f5a9628b2e8bffa12368c05ba9968f"},
+    "implementationStatus": "Version 4 replaces version 3 after its only formal attempt hit the unchanged 1800000ms limit during development treatment and before either ranking artifact, selected weights, analysis, or manifest existed. The partial version-3 directory remains non-classifiable and was not inspected for retrieval outcomes. Version 4 changes only the mathematically equivalent graph implementation, three-worker execution, independent-verifier caching, source inventory, and artifact version labels; dataset, split, formulas, conditions, weights, metrics, decision gates, and resource limits are unchanged. The treatment, adapter, runner, independent analyzer, workers, mutation harness, artifact contract, and synthetic conformance tests are frozen together by the source commit containing this preregistration. A formal run must independently prove those bytes equal its clean source commit before ranking.",
+    "artifactContract": {"path": "docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-artifacts.md", "sha256": "1daaa3957f92e9c71c22dfe52d2695974cb11fe7cd9c6f3448e8665200dab53a"},
     "datasetPath": "test/memory-data/benchmarks/conversation-memory/longmemeval/longmemeval_s",
     "datasetSha256": "08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894",
     "datasetExpectedQuestions": 500,

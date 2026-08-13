@@ -11,4 +11,4 @@ export function prepareFreeze(options?: {
 export function writeFormalRun(
   outputDirectory: string,
   options?: { readonly runId?: string },
-): Readonly<{ outputDirectory: string; runId: string }>;
+): Promise<Readonly<{ outputDirectory: string; runId: string }>>;

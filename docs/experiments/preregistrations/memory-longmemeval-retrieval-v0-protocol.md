@@ -1,11 +1,15 @@
 # LongMemEval-S retrieval screen protocol
 
-This version-3 protocol selects or eliminates repeated adjacent-position raw
+This version-4 protocol selects or eliminates repeated adjacent-position raw
 retrieval as a later experiment factor. It does not authorize a Dolly Memory
 index, automatic recall, task resumption, a Module launch, a model call, or a
-network request. Version 3 replaces versions 1 and 2 before the first dataset
-run so the artifact, checksum, and independent-verification contracts can be
-frozen. No retrieval outcome was inspected while making these replacements.
+network request. Versions 1 and 2 were replaced before any dataset run. The
+only version-3 attempt reached the frozen 30-minute limit during development
+treatment before writing either ranking file, selected weights, analysis, or a
+manifest. Version 4 therefore changes only the implementation strategy and
+artifact version labels: data, split, formulas, conditions, weights, metrics,
+decision gates, and resource limits remain unchanged. No retrieval ranking or
+outcome was available or inspected while making this replacement.
 
 ## Dataset adapter and gold isolation
 
@@ -109,6 +113,16 @@ admitted at support of at least two distinct retained session identifiers.
 The edge's ranking value is the binary value one; support count is retained
 only for audit bytes and does not increase score.
 
+Version 4 computes the same support relation without materializing unsupported
+one-session string pairs. A token with total session frequency below two is
+removed before pair enumeration because it cannot be an endpoint of an
+admitted edge. Recurrence-without-position support uses per-token session
+bitsets and subtracts a session exactly when both tokens occur only in the same
+single message; adjacent and shuffled-position support use numeric token-pair
+identifiers. Token identifiers follow UTF-16 code-unit token order, preserving
+canonical edge order and bytes. Treatment and independent verification keep
+separate implementations and do not import one another's graph code.
+
 `recurrence-no-position` admits every pair of different messages in a session.
 `repeated-adjacent-position` admits only supplied indices `(i,i+1)`.
 `shuffled-position` first shuffles message references and then applies the same
@@ -173,7 +187,12 @@ all four variants; evaluation measures only the selected variant. Wall-clock
 timings are environment observations and resource diagnostics, not a
 cross-machine scientific decision gate. Timeout or non-finite timing makes the
 run inconclusive; a slow but completed run does not eliminate the retrieval
-design.
+design. The runner and verifier each use exactly three worker threads and
+preserve result ordering by frozen question and condition order. Verification
+may retain independently recomputed per-question results in process memory for
+the baseline, declared mutation copies, and final attestation; cache keys bind
+the canonical case hash and selected-weight profile, and never reuse treatment
+output.
 
 ## Verification and decision
 

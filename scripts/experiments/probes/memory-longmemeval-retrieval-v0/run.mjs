@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import Ajv2020 from "ajv/dist/2020.js";
 
 import {
@@ -47,8 +48,10 @@ export const REQUIRED_SOURCE_PATHS = Object.freeze([
   "docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-artifacts.md",
   "scripts/experiments/probes/memory-longmemeval-retrieval-v0/common.mjs",
   "scripts/experiments/probes/memory-longmemeval-retrieval-v0/treatment.mjs",
+  "scripts/experiments/probes/memory-longmemeval-retrieval-v0/treatment-worker.mjs",
   "scripts/experiments/probes/memory-longmemeval-retrieval-v0/run.mjs",
   "scripts/experiments/probes/memory-longmemeval-retrieval-v0/verify.mjs",
+  "scripts/experiments/probes/memory-longmemeval-retrieval-v0/verify-worker.mjs",
   "scripts/experiments/probes/memory-longmemeval-retrieval-v0/run-mutation-tests.mjs",
 ]);
 
@@ -98,7 +101,7 @@ function assertRelevantSourcesClean() {
 }
 
 export function prepareFreeze({
-  runId = "in-memory-v3",
+  runId = "in-memory-v4",
   frozenAt = "1970-01-01T00:00:00.000Z",
   enforceCleanSources = false,
 } = {}) {
@@ -119,7 +122,7 @@ export function prepareFreeze({
   }));
   return Object.freeze({
     freeze: Object.freeze({
-      schemaVersion: "memory-longmemeval-retrieval/freeze-v3",
+      schemaVersion: "memory-longmemeval-retrieval/freeze-v4",
       experimentId: EXPERIMENT_ID,
       experimentVersion: EXPERIMENT_VERSION,
       runId,
@@ -157,9 +160,64 @@ function warmTreatment() {
   });
 }
 
+const TREATMENT_WORKER_COUNT = 3;
+
+function evaluateTreatmentJobs(jobs, onCompleted) {
+  if (jobs.length === 0) return Promise.resolve([]);
+  return new Promise((resolvePromise, rejectPromise) => {
+    const results = new Array(jobs.length);
+    const workers = [];
+    let nextIndex = 0;
+    let completed = 0;
+    let settled = false;
+    const stopWorkers = () => Promise.all(workers.map((worker) => worker.terminate()));
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      void stopWorkers().finally(() => rejectPromise(error));
+    };
+    const dispatch = (worker) => {
+      if (nextIndex >= jobs.length) return;
+      const index = nextIndex;
+      nextIndex += 1;
+      worker.postMessage({ index, ...jobs[index] });
+    };
+    for (let workerIndex = 0; workerIndex < Math.min(TREATMENT_WORKER_COUNT, jobs.length); workerIndex += 1) {
+      const worker = new Worker(new URL("./treatment-worker.mjs", import.meta.url));
+      workers.push(worker);
+      worker.on("message", (message) => {
+        if (settled) return;
+        if (message.error !== undefined) {
+          fail(new Error(`treatment worker failed: ${message.error}`));
+          return;
+        }
+        results[message.index] = message.result;
+        completed += 1;
+        try {
+          onCompleted(completed);
+        } catch (error) {
+          fail(error);
+          return;
+        }
+        if (completed === jobs.length) {
+          settled = true;
+          void stopWorkers().then(() => resolvePromise(results), rejectPromise);
+          return;
+        }
+        dispatch(worker);
+      });
+      worker.on("error", fail);
+      worker.on("exit", (code) => {
+        if (!settled && code !== 0) fail(new Error(`treatment worker exited with ${code}`));
+      });
+      dispatch(worker);
+    }
+  });
+}
+
 function rankingRowsForQuestion(result, splitName, caseSha256, selectedWeightsSha256 = undefined) {
   return result.conditions.map((condition) => Object.freeze({
-    schemaVersion: "memory-longmemeval-retrieval/ranking-v3",
+    schemaVersion: "memory-longmemeval-retrieval/ranking-v4",
     questionId: result.questionId,
     caseSha256,
     split: splitName,
@@ -197,7 +255,7 @@ function assertBudgets(startedAt, rowsWritten) {
   if (rowsWritten > 2000) throw new Error("formal run exceeded condition-row budget");
 }
 
-export function writeFormalRun(outputDirectory, { runId } = {}) {
+export async function writeFormalRun(outputDirectory, { runId } = {}) {
   const absoluteOutput = resolve(outputDirectory);
   const relativeToWorkspace = relative(WORKSPACE_ROOT, absoluteOutput);
   if (relativeToWorkspace === ".." || relativeToWorkspace.startsWith(`..${sep}`)) {
@@ -213,7 +271,7 @@ export function writeFormalRun(outputDirectory, { runId } = {}) {
   writeExclusive(absoluteOutput, "preregistration.json", prepared.preregistrationBytes);
   const rowByQuestion = new Map(prepared.rows.map((row) => [row.questionId, row]));
   const splitRows = prepared.split.rows.map((row) => Object.freeze({
-    schemaVersion: "memory-longmemeval-retrieval/split-row-v3",
+    schemaVersion: "memory-longmemeval-retrieval/split-row-v4",
     questionId: row.questionId,
     questionType: row.questionType,
     splitDigest: row.digest,
@@ -227,15 +285,18 @@ export function writeFormalRun(outputDirectory, { runId } = {}) {
   writeExclusive(absoluteOutput, "cases.jsonl", serializeJsonLines(cases));
 
   warmTreatment();
-  const developmentRows = [];
-  for (const splitRow of prepared.split.development) {
-    developmentRows.push(...rankingRowsForQuestion(
-      evaluateTreatmentQuestion(rowByQuestion.get(splitRow.questionId).input),
-      "development",
-      rowByQuestion.get(splitRow.questionId).inputSha256,
-    ));
-    assertBudgets(startedAt, developmentRows.length);
-  }
+  const developmentResults = await evaluateTreatmentJobs(
+    prepared.split.development.map((splitRow) => ({
+      input: rowByQuestion.get(splitRow.questionId).input,
+      selectedWeights: undefined,
+    })),
+    (completed) => assertBudgets(startedAt, completed * CONDITIONS.length),
+  );
+  const developmentRows = developmentResults.flatMap((result, index) => rankingRowsForQuestion(
+    result,
+    "development",
+    rowByQuestion.get(prepared.split.development[index].questionId).inputSha256,
+  ));
   developmentRows.sort((left, right) =>
     codeUnitCompare(left.questionId, right.questionId) ||
     CONDITIONS.indexOf(left.conditionId) - CONDITIONS.indexOf(right.conditionId)
@@ -249,7 +310,7 @@ export function writeFormalRun(outputDirectory, { runId } = {}) {
   const developmentSelection = selectDevelopmentWeights(developmentRows, rowByQuestion);
   const selectedWeights = developmentSelection.selectedWeights;
   const selectedWeightArtifact = Object.freeze({
-    schemaVersion: "memory-longmemeval-retrieval/selected-weights-v3",
+    schemaVersion: "memory-longmemeval-retrieval/selected-weights-v4",
     developmentRankingsSha256: sha256(developmentBytes),
     selectedWeights,
     selections: developmentSelection.selections,
@@ -258,16 +319,19 @@ export function writeFormalRun(outputDirectory, { runId } = {}) {
   const selectedWeightsSha256 = sha256(selectedWeightsBytes);
   writeExclusive(absoluteOutput, "selected-weights.json", selectedWeightsBytes);
 
-  const evaluationRows = [];
-  for (const splitRow of prepared.split.evaluation) {
-    evaluationRows.push(...rankingRowsForQuestion(
-      evaluateTreatmentQuestion(rowByQuestion.get(splitRow.questionId).input, selectedWeights),
-      "evaluation",
-      rowByQuestion.get(splitRow.questionId).inputSha256,
-      selectedWeightsSha256,
-    ));
-    assertBudgets(startedAt, developmentRows.length + evaluationRows.length);
-  }
+  const evaluationResults = await evaluateTreatmentJobs(
+    prepared.split.evaluation.map((splitRow) => ({
+      input: rowByQuestion.get(splitRow.questionId).input,
+      selectedWeights,
+    })),
+    (completed) => assertBudgets(startedAt, developmentRows.length + completed * CONDITIONS.length),
+  );
+  const evaluationRows = evaluationResults.flatMap((result, index) => rankingRowsForQuestion(
+    result,
+    "evaluation",
+    rowByQuestion.get(prepared.split.evaluation[index].questionId).inputSha256,
+    selectedWeightsSha256,
+  ));
   evaluationRows.sort((left, right) =>
     codeUnitCompare(left.questionId, right.questionId) ||
     CONDITIONS.indexOf(left.conditionId) - CONDITIONS.indexOf(right.conditionId)
@@ -286,7 +350,7 @@ export function writeFormalRun(outputDirectory, { runId } = {}) {
   writeExclusive(absoluteOutput, "analysis.json", payload(analysis));
   const finishedAt = new Date().toISOString();
   const manifest = Object.freeze({
-    schemaVersion: "memory-longmemeval-retrieval/manifest-v3",
+    schemaVersion: "memory-longmemeval-retrieval/manifest-v4",
     attemptStatus: "complete",
     experimentId: EXPERIMENT_ID,
     experimentVersion: EXPERIMENT_VERSION,
@@ -344,6 +408,6 @@ function parseArguments(argv) {
 
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = parseArguments(process.argv.slice(2));
-  const result = writeFormalRun(args.output, { runId: args.runId });
+  const result = await writeFormalRun(args.output, { runId: args.runId });
   process.stdout.write(`${stableJson(result)}\n`);
 }

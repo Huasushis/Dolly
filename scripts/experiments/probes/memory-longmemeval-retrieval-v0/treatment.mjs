@@ -89,7 +89,7 @@ function projectDocuments(input) {
     throw new TypeError("LongMemEval treatment input must contain sessions");
   }
   const seen = new Set();
-  const documents = entry.sessions.map((rawSession, index) => {
+  const projectedDocuments = entry.sessions.map((rawSession, index) => {
     const session = assertClosedObject(rawSession, ["session_id", "messages"], `sessions[${index}]`);
     const sessionId = requireString(session.session_id, `sessions[${index}].session_id`);
     if (seen.has(sessionId)) throw new TypeError(`Duplicate session identifier ${sessionId}`);
@@ -97,11 +97,10 @@ function projectDocuments(input) {
     const messages = session.messages;
     const text = encodeSession(messages, `sessions[${index}].messages`);
     const tokens = tokenize(text);
-    return Object.freeze({
+    return {
       sessionId,
       text,
       tokens: Object.freeze(tokens),
-      uniqueTokens: new Set(tokens),
       tokenCounts: countTokens(tokens),
       messages: Object.freeze(messages.map((message) => Object.freeze({
         role: message.role,
@@ -112,12 +111,37 @@ function projectDocuments(input) {
         tokens: Object.freeze(tokenize(message.content)),
       }))),
       contentTokens: new Set(messages.flatMap((message) => tokenize(message.content))),
-    });
+    };
   });
+  // An admitted edge must be supported by at least two distinct sessions. A
+  // token present in only one session can therefore never be an endpoint of
+  // an admitted edge. Filtering it before pair enumeration is exact and avoids
+  // materializing the overwhelming majority of one-session pairs.
+  const sessionFrequency = new Map();
+  for (const document of projectedDocuments) {
+    for (const token of document.contentTokens) {
+      sessionFrequency.set(token, (sessionFrequency.get(token) ?? 0) + 1);
+    }
+  }
+  const vocabulary = Object.freeze([...sessionFrequency]
+    .filter(([, frequency]) => frequency >= 2)
+    .map(([token]) => token)
+    .sort(codeUnitCompare));
+  const tokenIds = new Map(vocabulary.map((token, index) => [token, index]));
+  const documents = projectedDocuments.map((document) => Object.freeze({
+    ...document,
+    associationMessages: Object.freeze(document.messages.map((message) => Object.freeze([
+      ...new Set(message.tokens.filter((token) => tokenIds.has(token)).map((token) => tokenIds.get(token))),
+    ]))),
+    associationContentTokenIds: Object.freeze([...document.contentTokens]
+      .filter((token) => tokenIds.has(token))
+      .map((token) => tokenIds.get(token))),
+  }));
   return Object.freeze({
     questionId,
     queryTokens: Object.freeze([...new Set(tokenize(question))]),
     documents: Object.freeze(documents),
+    associationVocabulary: Object.freeze({ tokens: vocabulary, tokenIds }),
     corpusRawSessionBytes: documents.reduce(
       (sum, document) => sum + Buffer.byteLength(document.text, "utf8"),
       0,
@@ -154,8 +178,10 @@ function bm25(documents, queryTokens) {
   }));
 }
 
-function unorderedPair(left, right) {
-  return codeUnitCompare(left, right) < 0 ? `${left}\0${right}` : `${right}\0${left}`;
+function numericPair(left, right, vocabularySize) {
+  const low = Math.min(left, right);
+  const high = Math.max(left, right);
+  return low * vocabularySize + high;
 }
 
 function xorshift32(seed) {
@@ -184,6 +210,59 @@ function shuffledMessages(questionId, sessionId, messages) {
   return result;
 }
 
+function popcount32(value) {
+  let bits = value >>> 0;
+  bits -= (bits >>> 1) & 0x55555555;
+  bits = (bits & 0x33333333) + ((bits >>> 2) & 0x33333333);
+  return (((bits + (bits >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+}
+
+function recurrenceAssociationGraph(documents, vocabulary) {
+  const vocabularySize = vocabulary.tokens.length;
+  const sessionMasks = Array.from(
+    { length: Math.ceil(documents.length / 32) },
+    () => new Uint32Array(vocabularySize),
+  );
+  const sameOnlyMessage = new Map();
+  for (let sessionIndex = 0; sessionIndex < documents.length; sessionIndex += 1) {
+    const document = documents[sessionIndex];
+    const word = Math.floor(sessionIndex / 32);
+    const bit = 1 << (sessionIndex % 32);
+    for (const tokenId of document.associationContentTokenIds) sessionMasks[word][tokenId] |= bit;
+    const messageOccurrences = new Uint16Array(vocabularySize);
+    for (const message of document.associationMessages) {
+      for (const tokenId of message) messageOccurrences[tokenId] += 1;
+    }
+    for (const message of document.associationMessages) {
+      const exclusive = message.filter((tokenId) => messageOccurrences[tokenId] === 1);
+      for (let left = 0; left < exclusive.length; left += 1) {
+        for (let right = left + 1; right < exclusive.length; right += 1) {
+          const pair = numericPair(exclusive[left], exclusive[right], vocabularySize);
+          sameOnlyMessage.set(pair, (sameOnlyMessage.get(pair) ?? 0) + 1);
+        }
+      }
+    }
+  }
+  const edges = new Set();
+  let canonicalBytes = 0;
+  for (let leftId = 0; leftId < vocabularySize; leftId += 1) {
+    for (let rightId = leftId + 1; rightId < vocabularySize; rightId += 1) {
+      const pair = leftId * vocabularySize + rightId;
+      const distinctSessions = sessionMasks.reduce((sum, mask) =>
+        sum + popcount32(mask[leftId] & mask[rightId]), 0
+      ) - (sameOnlyMessage.get(pair) ?? 0);
+      if (distinctSessions < 2) continue;
+      edges.add(pair);
+      canonicalBytes += Buffer.byteLength(JSON.stringify({
+        left: vocabulary.tokens[leftId],
+        right: vocabulary.tokens[rightId],
+        distinctSessions,
+      }) + "\n", "utf8");
+    }
+  }
+  return Object.freeze({ edges, canonicalBytes, vocabularySize });
+}
+
 function messagePairs(messages, conditionId) {
   const result = [];
   if (conditionId === "recurrence-no-position") {
@@ -200,52 +279,54 @@ function messagePairs(messages, conditionId) {
   return result;
 }
 
-function associationGraph(questionId, documents, conditionId) {
+function associationGraph(questionId, documents, conditionId, vocabulary) {
+  const vocabularySize = vocabulary.tokens.length;
+  if (conditionId === "recurrence-no-position") {
+    return recurrenceAssociationGraph(documents, vocabulary);
+  }
   const support = new Map();
-  for (const document of documents) {
+  const addPair = (left, right, sessionIndex) => {
+    if (left === right) return;
+    const pair = numericPair(left, right, vocabularySize);
+    const prior = support.get(pair) ?? 0;
+    const lastSession = Math.floor(prior / 128);
+    if (lastSession !== sessionIndex + 1) support.set(pair, (sessionIndex + 1) * 128 + prior % 128 + 1);
+  };
+  for (let sessionIndex = 0; sessionIndex < documents.length; sessionIndex += 1) {
+    const document = documents[sessionIndex];
     const messages = conditionId === "shuffled-position"
-      ? shuffledMessages(questionId, document.sessionId, document.messages)
-      : document.messages;
-    const perSession = new Set();
-    for (const [left, right] of messagePairs(messages, conditionId)) {
-      const leftTokens = new Set(left.tokens);
-      const rightTokens = new Set(right.tokens);
-      for (const leftToken of leftTokens) {
-        for (const rightToken of rightTokens) {
-          if (leftToken !== rightToken) perSession.add(unorderedPair(leftToken, rightToken));
-        }
+      ? shuffledMessages(questionId, document.sessionId, document.associationMessages)
+      : document.associationMessages;
+    for (let index = 0; index + 1 < messages.length; index += 1) {
+      for (const leftToken of messages[index]) {
+        for (const rightToken of messages[index + 1]) addPair(leftToken, rightToken, sessionIndex);
       }
     }
-    for (const pair of perSession) support.set(pair, (support.get(pair) ?? 0) + 1);
   }
-  const edges = new Map();
+  const edges = new Set();
   let canonicalBytes = 0;
-  for (const [pair, distinctSessions] of [...support].sort(([left], [right]) =>
-    codeUnitCompare(left, right)
-  )) {
+  for (const [pair, encodedSupport] of [...support].sort(([left], [right]) => left - right)) {
+    const distinctSessions = encodedSupport % 128;
     if (distinctSessions < 2) continue;
-    edges.set(pair, distinctSessions);
-    const separator = pair.indexOf("\0");
+    edges.add(pair);
+    const leftId = Math.floor(pair / vocabularySize);
+    const rightId = pair % vocabularySize;
     canonicalBytes += Buffer.byteLength(JSON.stringify({
-      left: pair.slice(0, separator),
-      right: pair.slice(separator + 1),
+      left: vocabulary.tokens[leftId],
+      right: vocabulary.tokens[rightId],
       distinctSessions,
     }) + "\n", "utf8");
   }
-  return Object.freeze({ edges, canonicalBytes });
+  return Object.freeze({ edges, canonicalBytes, vocabularySize });
 }
 
-function associationScore(queryTokens, candidateTokens, edges) {
-  const query = new Set(queryTokens);
-  for (const queryToken of query) {
-    for (const candidateToken of candidateTokens) {
-      if (
-        queryToken !== candidateToken &&
-        !query.has(candidateToken) &&
-        edges.has(unorderedPair(queryToken, candidateToken))
-      ) {
-        return 1;
-      }
+function associationScore(queryTokens, candidateTokenIds, graph, vocabulary) {
+  const queryIds = new Set(queryTokens.map((token) => vocabulary.tokenIds.get(token))
+    .filter((tokenId) => tokenId !== undefined));
+  for (const queryTokenId of queryIds) {
+    for (const candidateTokenId of candidateTokenIds) {
+      if (queryTokenId !== candidateTokenId && !queryIds.has(candidateTokenId) &&
+        graph.edges.has(numericPair(queryTokenId, candidateTokenId, graph.vocabularySize))) return 1;
     }
   }
   return 0;
@@ -326,12 +407,22 @@ export function evaluateTreatmentQuestion(input, selectedWeights = undefined) {
 
   for (const conditionId of CONDITION_ORDER.slice(1)) {
     const buildStartedAt = performance.now();
-    const graph = associationGraph(projection.questionId, projection.documents, conditionId);
+    const graph = associationGraph(
+      projection.questionId,
+      projection.documents,
+      conditionId,
+      projection.associationVocabulary,
+    );
     const buildMilliseconds = elapsedMilliseconds(buildStartedAt);
     const queryStartedAt = performance.now();
     const associationScores = new Map(projection.documents.map((document) => [
       document.sessionId,
-      associationScore(projection.queryTokens, document.contentTokens, graph.edges),
+      associationScore(
+        projection.queryTokens,
+        document.associationContentTokenIds,
+        graph,
+        projection.associationVocabulary,
+      ),
     ]));
     const weights = selectedWeights === undefined
       ? ASSOCIATION_WEIGHTS
@@ -365,7 +456,7 @@ export function evaluateTreatmentQuestion(input, selectedWeights = undefined) {
   }
 
   return Object.freeze({
-    schemaVersion: "memory-longmemeval-retrieval/treatment-result-v3",
+    schemaVersion: "memory-longmemeval-retrieval/treatment-result-v4",
     questionId: projection.questionId,
     conditions: Object.freeze(conditions),
     totalMilliseconds: elapsedMilliseconds(totalStartedAt),

@@ -28,7 +28,7 @@ export interface TreatmentRankingEntry {
 }
 
 export interface TreatmentResult {
-  readonly schemaVersion: "memory-longmemeval-retrieval/treatment-result-v3";
+  readonly schemaVersion: "memory-longmemeval-retrieval/treatment-result-v4";
   readonly questionId: string;
   readonly conditions: readonly {
     readonly conditionId: string;

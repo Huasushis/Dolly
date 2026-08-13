@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 export const EXPERIMENT_ID = "memory-longmemeval-retrieval-v0";
-export const EXPERIMENT_VERSION = 3;
+export const EXPERIMENT_VERSION = 4;
 export const DATASET_PATH =
   "test/memory-data/benchmarks/conversation-memory/longmemeval/longmemeval_s";
 export const DATASET_SHA256 =
@@ -198,7 +198,7 @@ export function createSplit(rows) {
     );
     const developmentCount = Math.floor(entries.length * 0.3);
     entries.forEach((entry, index) => splitByQuestion.set(entry.row.questionId, Object.freeze({
-      schemaVersion: "memory-longmemeval-retrieval/split-v3",
+      schemaVersion: "memory-longmemeval-retrieval/split-v4",
       questionId: entry.row.questionId,
       questionType,
       digest: entry.digest,
@@ -395,7 +395,7 @@ export function analyzeEvaluation(evaluationRows, rowByQuestion, selectedWeights
   const knowledgeGuard = positionError - contentError <= 0.02;
   const costGuard = ratioP95 <= 2;
   return Object.freeze({
-    schemaVersion: "memory-longmemeval-retrieval/analysis-v3",
+    schemaVersion: "memory-longmemeval-retrieval/analysis-v4",
     selectedWeights,
     developmentConditionMetrics: aggregateConditionMetrics(
       developmentRows,

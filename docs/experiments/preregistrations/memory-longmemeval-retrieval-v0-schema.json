@@ -15,7 +15,7 @@
     "$schema": { "const": "./memory-longmemeval-retrieval-v0-schema.json" },
     "schemaVersion": { "const": "dolly-experiment-preregistration/v1" },
     "experimentId": { "const": "memory-longmemeval-retrieval-v0" },
-    "experimentVersion": { "const": 3 },
+    "experimentVersion": { "const": 4 },
     "title": { "type": "string", "minLength": 20 },
     "status": { "const": "frozen-before-first-run" },
     "scope": { "const": "comparative" },
@@ -25,7 +25,7 @@
       "required": ["path", "sha256"],
       "properties": {
         "path": { "const": "docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-protocol.md" },
-        "sha256": { "const": "2031b24421badb5da860461ff0dd718762aa91e7f3e7d661f473a025ef0f7930" }
+        "sha256": { "const": "2d72f9b31e8d4971cdc77ab19f81878f1c40d1facde57d795f4d8752f2544f39" }
       }
     },
     "authorityReferences": { "type": "array", "minItems": 4, "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
@@ -158,7 +158,7 @@
       "type": "object", "additionalProperties": false,
       "required": ["implementationStatus", "artifactContract", "datasetPath", "datasetSha256", "datasetExpectedQuestions", "datasetObservedSessionCountRangeBeforeFreeze", "questionTypeCounts", "splitProcedure", "splitCounts", "treatmentProjectionFields", "forbiddenTreatmentFields", "duplicateSessionRule", "emptySessionRule", "sessionEncoding", "tokenization", "associationScore", "tieBreak", "cutoffs", "bootstrap", "resourceBudgets", "remainingOutsideScope"],
       "properties": {
-        "implementationStatus": { "$ref": "#/$defs/nonemptyString" }, "artifactContract": { "const": {"path":"docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-artifacts.md","sha256":"3a60f3f69a7257243ec9b51306b97265d5f5a9628b2e8bffa12368c05ba9968f"} }, "datasetPath": { "const": "test/memory-data/benchmarks/conversation-memory/longmemeval/longmemeval_s" }, "datasetSha256": { "const": "08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894" }, "datasetExpectedQuestions": { "const": 500 }, "datasetObservedSessionCountRangeBeforeFreeze": { "const": [39, 66] }, "questionTypeCounts": { "const": {"knowledge-update":78,"multi-session":133,"single-session-assistant":56,"single-session-preference":30,"single-session-user":70,"temporal-reasoning":133} },
+        "implementationStatus": { "$ref": "#/$defs/nonemptyString" }, "artifactContract": { "const": {"path":"docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-artifacts.md","sha256":"1daaa3957f92e9c71c22dfe52d2695974cb11fe7cd9c6f3448e8665200dab53a"} }, "datasetPath": { "const": "test/memory-data/benchmarks/conversation-memory/longmemeval/longmemeval_s" }, "datasetSha256": { "const": "08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894" }, "datasetExpectedQuestions": { "const": 500 }, "datasetObservedSessionCountRangeBeforeFreeze": { "const": [39, 66] }, "questionTypeCounts": { "const": {"knowledge-update":78,"multi-session":133,"single-session-assistant":56,"single-session-preference":30,"single-session-user":70,"temporal-reasoning":133} },
         "splitProcedure": { "$ref": "#/$defs/nonemptyString" }, "splitCounts": { "const": { "development": 147, "evaluation": 353, "conditionRows": 2000, "rankingVectors": 3323 } }, "treatmentProjectionFields": { "const": ["question_id", "question", "sessions[].session_id", "sessions[].messages[].role", "sessions[].messages[].content"] }, "forbiddenTreatmentFields": { "const": ["answer", "answer_session_ids", "question_type", "has_answer", "haystack_dates", "question_date", "inferredGold", "recordRole"] },
         "duplicateSessionRule": { "$ref": "#/$defs/nonemptyString" }, "emptySessionRule": { "$ref": "#/$defs/nonemptyString" }, "sessionEncoding": { "$ref": "#/$defs/nonemptyString" }, "tokenization": { "type": "object", "minProperties": 5 }, "associationScore": { "$ref": "#/$defs/nonemptyString" }, "tieBreak": { "$ref": "#/$defs/nonemptyString" }, "cutoffs": { "const": [1, 5, 10] }, "bootstrap": { "type": "object", "minProperties": 8 }, "resourceBudgets": { "type": "object", "minProperties": 7 }, "remainingOutsideScope": { "$ref": "#/$defs/stringArray" }
       }

@@ -1,7 +1,10 @@
 # LongMemEval-S retrieval artifact contract
 
-This contract is part of experiment version 3 and is frozen before the first
-retrieval run. A classifiable run lives only at
+This contract is part of experiment version 4 and is frozen before the first
+classifiable retrieval run. The version-3 resource-limit attempt produced only
+the freeze, preregistration snapshot, split, and treatment cases; those partial
+files remain non-classifiable and are not inputs to version 4. A classifiable
+run lives only at
 `artifacts/experiments/probes/memory-longmemeval-retrieval-v0/runs/<runId>/`,
 where `runId` matches `[a-z0-9][a-z0-9._-]{0,79}`. Failed or interrupted
 attempts are not classifiable and must use a different run ID; no file may be
@@ -32,7 +35,7 @@ mutation-validation.json
 sha256sums.txt
 ```
 
-`run-freeze.json` is written first and identifies experiment version 3, the
+`run-freeze.json` is written first and identifies experiment version 4, the
 run, source commit, exact preregistration/protocol/dataset hashes, every
 result-affecting source path and hash, the exact checksum file list, and
 `resultComputationStarted:false`. Every registered source path must be clean

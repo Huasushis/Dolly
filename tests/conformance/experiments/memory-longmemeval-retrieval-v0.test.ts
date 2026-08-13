@@ -37,7 +37,7 @@ function fixture(): LongMemEvalTreatmentInput {
 }
 
 describe("LongMemEval-S gold-blind retrieval treatment", () => {
-  it("freezes the version-3 protocol and rejects decision-changing preregistration mutations", () => {
+  it("freezes the version-4 protocol and rejects decision-changing preregistration mutations", () => {
     const protocol = readFileSync(
       "docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-protocol.md",
     );
@@ -52,12 +52,12 @@ describe("LongMemEval-S gold-blind retrieval treatment", () => {
     const validate = new Ajv2020({ allErrors: true, strict: true }).compile(schema);
     expect(validate(preregistration), validate.errors?.map((error) => error.message).join("; ")).toBe(true);
     expect(createHash("sha256").update(protocol).digest("hex")).toBe(
-      "2031b24421badb5da860461ff0dd718762aa91e7f3e7d661f473a025ef0f7930",
+      "2d72f9b31e8d4971cdc77ab19f81878f1c40d1facde57d795f4d8752f2544f39",
     );
-    expect((preregistration as any).experimentVersion).toBe(3);
+    expect((preregistration as any).experimentVersion).toBe(4);
     expect(createHash("sha256").update(readFileSync(
       "docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-artifacts.md",
-    )).digest("hex")).toBe("3a60f3f69a7257243ec9b51306b97265d5f5a9628b2e8bffa12368c05ba9968f");
+    )).digest("hex")).toBe("1daaa3957f92e9c71c22dfe52d2695974cb11fe7cd9c6f3448e8665200dab53a");
 
     const mutate = (mutation: (copy: any) => void) => {
       const copy = structuredClone(preregistration);

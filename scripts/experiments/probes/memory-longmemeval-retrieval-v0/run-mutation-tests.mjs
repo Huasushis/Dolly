@@ -94,7 +94,7 @@ export function finalizeAndVerify(runDirectory) {
     }
   }
   const mutationValidation = {
-    schemaVersion: "memory-longmemeval-retrieval/mutation-validation-v3",
+    schemaVersion: "memory-longmemeval-retrieval/mutation-validation-v4",
     mutations: summaries,
     allRejected: summaries.every((row) => row.rejected),
   };
