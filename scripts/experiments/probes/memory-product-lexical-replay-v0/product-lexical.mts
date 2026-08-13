@@ -3,6 +3,7 @@ import { canonicalJsonByteLength } from "../../../../src/core/canonical-json.js"
 import {
   DOLLY_CONTENT_TEXT_EXTRACTOR_CONTRACT,
   InMemoryMemoryJournal,
+  LEXICAL_CHANNEL_ID,
   MEMORY_QUERY_SCHEMA,
   MemoryBackgroundIndexer,
   MemoryStore,
@@ -13,7 +14,9 @@ import {
   featurePlanDigest,
   normalizeExtractedText,
   runMemoryModuleAction,
+  type CoverageState,
   type DeliveredInput,
+  type ExtractionSkipReason,
   type MemoryAuthorization,
   type MemoryBlockReader,
   type MemorySourceBlock,
@@ -39,13 +42,58 @@ export interface ProductLexicalCase {
 
 export interface ProductLexicalResult {
   readonly questionId: string;
-  /** Record ranks mapped to sessions after truncation; duplicates are retained. */
-  readonly sessionIds: readonly string[];
-  readonly recordIds: readonly string[];
+  readonly lexicalGeneration: ReturnType<typeof deriveLexicalGeneration>;
+  readonly effectiveMode: "lexical";
+  readonly channelIds: readonly string[];
+  /** Record ranks are truncated before session mapping; duplicates remain in place. */
+  readonly ranking: readonly ProductLexicalRank[];
+  readonly inputCounts: {
+    readonly sessions: number;
+    readonly messages: number;
+    readonly emptySessions: number;
+  };
+  readonly extractionCoverage: ProductLexicalExtractionCoverage;
+  readonly terminalJobAccounting: ProductLexicalTerminalJobAccounting;
+  readonly queryCoverage: CoverageState;
   readonly recordCount: number;
   readonly featureCount: number;
+  readonly canonicalRecordBytes: number;
   readonly canonicalFeatureBytes: number;
-  readonly normalizedSourceBytes: number;
+}
+
+export interface ProductLexicalRank {
+  readonly rank: number;
+  readonly recordId: string;
+  readonly sourceBlockId: string;
+  readonly sessionId: string;
+  readonly rawBm25: number;
+}
+
+export interface ProductLexicalExtractionCoverage {
+  readonly normalizedInputBytes: number;
+  readonly coveredNormalizedBytes: number;
+  readonly uncoveredNormalizedBytes: number;
+  readonly truncatedItems: number;
+  readonly skippedItemsByReason: Readonly<Record<ExtractionSkipReason, number>>;
+  readonly complete: boolean;
+}
+
+export interface ProductLexicalTerminalJobAccounting {
+  readonly pending: number;
+  readonly running: number;
+  readonly retryable: number;
+  readonly succeeded: number;
+  readonly skipped: number;
+  readonly permanentFailure: number;
+  readonly cancelled: number;
+  readonly outstandingLeases: number;
+  readonly maxObservedConcurrency: number;
+}
+
+export interface ProductSessionRankingMetrics {
+  readonly hit: 0 | 1;
+  readonly recall: number;
+  readonly ndcg: number;
 }
 
 const EMPTY_THRESHOLDS: ThresholdProfile = Object.freeze({
@@ -68,6 +116,66 @@ function stableBlockId(questionId: string, sessionId: string, index: number): st
 
 function messageText(message: ProductLexicalMessage): string {
   return `${message.role.toLowerCase()}: ${message.content}`;
+}
+
+function coveredByteCount(
+  ranges: readonly { readonly startByte: number; readonly endByte: number }[],
+): number {
+  const ordered = [...ranges].sort((left, right) =>
+    left.startByte - right.startByte || left.endByte - right.endByte,
+  );
+  let total = 0;
+  let start = 0;
+  let end = 0;
+  let active = false;
+  for (const range of ordered) {
+    if (!active) {
+      start = range.startByte;
+      end = range.endByte;
+      active = true;
+      continue;
+    }
+    if (range.startByte <= end) {
+      end = Math.max(end, range.endByte);
+      continue;
+    }
+    total += end - start;
+    start = range.startByte;
+    end = range.endByte;
+  }
+  return active ? total + end - start : 0;
+}
+
+/** Gold-aware analyzer primitive. Duplicate sessions occupy their original ranks. */
+export function scoreProductSessionRanking(
+  sessionIds: readonly string[],
+  goldSessionIds: readonly string[],
+  cutoff: number,
+): ProductSessionRankingMetrics {
+  if (!Number.isSafeInteger(cutoff) || cutoff <= 0) {
+    throw new TypeError("product lexical metric cutoff must be a positive safe integer");
+  }
+  const gold = new Set(goldSessionIds);
+  const seen = new Set<string>();
+  let relevant = 0;
+  let dcg = 0;
+  sessionIds.slice(0, cutoff).forEach((sessionId, index) => {
+    if (seen.has(sessionId)) return;
+    seen.add(sessionId);
+    if (!gold.has(sessionId)) return;
+    relevant += 1;
+    dcg += 1 / Math.log2(index + 2);
+  });
+  const idealRelevant = Math.min(cutoff, gold.size);
+  let idealDcg = 0;
+  for (let index = 0; index < idealRelevant; index += 1) {
+    idealDcg += 1 / Math.log2(index + 2);
+  }
+  return Object.freeze({
+    hit: relevant > 0 ? 1 : 0,
+    recall: gold.size === 0 ? 0 : relevant / gold.size,
+    ndcg: idealDcg === 0 ? 0 : dcg / idealDcg,
+  });
 }
 
 function delivered(
@@ -180,18 +288,39 @@ export async function evaluateProductLexicalCase(
 
   const blockToSession = new Map<string, string>();
   const blocks = new Map<string, MemorySourceBlock>();
-  let normalizedSourceBytes = 0;
+  let normalizedInputBytes = 0;
+  let coveredNormalizedBytes = 0;
+  let truncatedItems = 0;
+  const skippedItemsByReason: Record<ExtractionSkipReason, number> = {
+    MEMORY_CONTROL_ITEM: 0,
+    SCHEMA_NOT_ALLOWLISTED: 0,
+    TEXT_INPUT_TOO_LARGE: 0,
+    TEXT_EMPTY: 0,
+  };
   const inputs = input.sessions.map((source, index) => {
     const sourceBlockId = stableBlockId(input.question_id, source.session_id, index);
     const texts = source.messages.map(messageText);
-    normalizedSourceBytes += texts.reduce(
-      (total, text) => total + Buffer.byteLength(normalizeExtractedText(text), "utf8"),
-      0,
-    );
     const block: MemorySourceBlock = {
       payloadSchema: "dolly.content/1",
       content: { items: texts.map((text) => ({ type: "text" as const, text })) },
     };
+    const extraction = extractor.extract({
+      sourceBlockId,
+      payloadSchema: block.payloadSchema,
+      content: block.content,
+    });
+    for (const skipped of extraction.skipped) {
+      skippedItemsByReason[skipped.reason] += 1;
+    }
+    texts.forEach((text, itemIndex) => {
+      const itemBytes = Buffer.byteLength(normalizeExtractedText(text), "utf8");
+      normalizedInputBytes += itemBytes;
+      const covered = coveredByteCount(
+        extraction.segments.filter((segment) => segment.itemIndex === itemIndex),
+      );
+      coveredNormalizedBytes += covered;
+      if (covered > 0 && covered < itemBytes) truncatedItems += 1;
+    });
     blockToSession.set(sourceBlockId, source.session_id);
     blocks.set(sourceBlockId, block);
     return delivered(sourceBlockId, block, index + 1);
@@ -289,24 +418,91 @@ export async function evaluateProductLexicalCase(
     throw new TypeError(`product lexical replay query failed for ${input.question_id}`);
   }
   const matches = outcome.result?.matches ?? [];
+  const queryResult = outcome.result;
+  if (
+    queryResult === undefined ||
+    queryResult.effectiveMode !== "lexical" ||
+    queryResult.channels.length !== 1 ||
+    queryResult.channels[0]?.channelId !== LEXICAL_CHANNEL_ID ||
+    queryResult.snapshot.lexicalGenerationId !== lexicalGeneration.generationId ||
+    queryResult.snapshot.coverage.length !== 1
+  ) {
+    throw new TypeError(`product lexical replay query used an unexpected retrieval profile`);
+  }
   const records = session.records();
   const features = session.features();
+  const jobs = session.featureJobs();
+  const countJobs = (state: (typeof jobs)[number]["state"]): number =>
+    jobs.filter((job) => job.state === state).length;
+  const ranking = matches.map((match, index): ProductLexicalRank => {
+    const sessionId = blockToSession.get(match.sourceBlockId);
+    if (sessionId === undefined) {
+      throw new TypeError(`ranked record refers to unknown replay Block ${match.sourceBlockId}`);
+    }
+    const lexicalScore = match.scores.find((score) => score.channelId === LEXICAL_CHANNEL_ID);
+    if (
+      match.rank !== index + 1 ||
+      lexicalScore === undefined ||
+      lexicalScore.rank < 1 ||
+      !Number.isFinite(lexicalScore.raw)
+    ) {
+      throw new TypeError(`product lexical replay returned an invalid lexical rank`);
+    }
+    return Object.freeze({
+      rank: match.rank,
+      recordId: match.recordId,
+      sourceBlockId: match.sourceBlockId,
+      sessionId,
+      rawBm25: lexicalScore.raw,
+    });
+  });
+  const uncoveredNormalizedBytes = normalizedInputBytes - coveredNormalizedBytes;
+  const queryCoverage = queryResult.snapshot.coverage[0]!;
   return Object.freeze({
     questionId: input.question_id,
-    sessionIds: Object.freeze(matches.map((match) => {
-      const sessionId = blockToSession.get(match.sourceBlockId);
-      if (sessionId === undefined) {
-        throw new TypeError(`ranked record refers to unknown replay Block ${match.sourceBlockId}`);
-      }
-      return sessionId;
-    })),
-    recordIds: Object.freeze(matches.map((match) => match.recordId)),
+    lexicalGeneration,
+    effectiveMode: "lexical" as const,
+    channelIds: Object.freeze(queryResult.channels.map((channel) => channel.channelId)),
+    ranking: Object.freeze(ranking),
+    inputCounts: Object.freeze({
+      sessions: input.sessions.length,
+      messages: input.sessions.reduce((total, source) => total + source.messages.length, 0),
+      emptySessions: input.sessions.filter((source) => source.messages.length === 0).length,
+    }),
+    extractionCoverage: Object.freeze({
+      normalizedInputBytes,
+      coveredNormalizedBytes,
+      uncoveredNormalizedBytes,
+      truncatedItems,
+      skippedItemsByReason: Object.freeze({ ...skippedItemsByReason }),
+      complete:
+        uncoveredNormalizedBytes === 0 &&
+        truncatedItems === 0 &&
+        skippedItemsByReason.MEMORY_CONTROL_ITEM === 0 &&
+        skippedItemsByReason.SCHEMA_NOT_ALLOWLISTED === 0 &&
+        skippedItemsByReason.TEXT_INPUT_TOO_LARGE === 0,
+    }),
+    terminalJobAccounting: Object.freeze({
+      pending: countJobs("pending"),
+      running: countJobs("running"),
+      retryable: countJobs("retryable"),
+      succeeded: countJobs("succeeded"),
+      skipped: countJobs("skipped"),
+      permanentFailure: countJobs("permanent-failure"),
+      cancelled: countJobs("cancelled"),
+      outstandingLeases: report.outstandingLeases,
+      maxObservedConcurrency: report.maxObservedConcurrency,
+    }),
+    queryCoverage,
     recordCount: records.length,
     featureCount: features.length,
+    canonicalRecordBytes: records.reduce(
+      (total, record) => total + canonicalJsonByteLength(record as never),
+      0,
+    ),
     canonicalFeatureBytes: features.reduce(
       (total, feature) => total + canonicalJsonByteLength(feature as never),
       0,
     ),
-    normalizedSourceBytes,
   });
 }

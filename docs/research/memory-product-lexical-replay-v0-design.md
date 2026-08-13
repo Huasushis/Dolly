@@ -1,6 +1,8 @@
 # Memory product lexical replay v0 design
 
-Status: design frozen before the first LongMemEval outcome run.
+Status: implementation candidate revised before the first LongMemEval outcome
+run. The formal artifact contract, runner, analyzer, verifier, and mutation
+harness remain prerequisites to freezing the experiment.
 
 This experiment asks one narrow engineering question: is Dolly's current
 product lexical representation close enough to the already frozen
@@ -28,7 +30,7 @@ product implementation. The two lexical paths differ materially:
 Therefore production wiring before this replay would mix a representation
 choice with integration work and make a later failure expensive to interpret.
 
-## Frozen treatment
+## Proposed treatment to freeze
 
 The treatment reads only the 500 gold-blind `cases.jsonl` rows from the
 classifiable `retrieval-v4-20260813a` projection. It never reads
@@ -51,9 +53,11 @@ For each question, independently:
    threshold profile, and `includeSourceRefs:false`. No embedding operation,
    network, model, provider, automatic injection, or automatic recall exists.
 5. Take the first ten ranked Memory records, then map each record's
-   `sourceBlockId` to its source session. Do not collapse before truncation and
-   do not backfill. The first occurrence of a session may be relevant; later
-   occurrences consume a rank and count as nonrelevant duplicates.
+   `sourceBlockId` to its source session. Persist each original rank with its
+   `recordId`, `sourceBlockId`, `sessionId`, and raw `lexical.bm25` score. Do
+   not collapse before truncation and do not backfill. The first occurrence of
+   a session may be relevant; later occurrences consume a rank and count as
+   nonrelevant duplicates.
 
 The executable treatment is
 `scripts/experiments/probes/memory-product-lexical-replay-v0/product-lexical.mts`.
@@ -78,32 +82,49 @@ ranking files after every treatment row is durable.
 ## Metrics
 
 The primary paired evaluation metrics are NDCG@10 and Recall@10 with distinct
-gold session identifiers. A repeated returned session after its first
-occurrence has zero gain and cannot increase recall. The analyzer also reports
-Hit@1/5/10, NDCG@1/5, Recall@1/5, the exact paired discordant cases, and
-knowledge-update top-one error using the existing six-type LongMemEval
-classification.
+gold session identifiers. Metrics iterate the original record ranks up to the
+cutoff. The first returned occurrence of a gold session has binary gain one; a
+repeated occurrence has gain zero but continues to occupy its original rank.
+The implementation MUST NOT create a deduplicated list before applying the
+cutoff, because doing so would pull records from beyond rank ten into the
+scored result. The analyzer also reports Hit@1/5/10, NDCG@1/5, Recall@1/5, the
+exact paired discordant cases, and knowledge-update top-one error using the
+existing six-type LongMemEval classification.
 
 Cost is deterministic, not wall-clock based:
 
-- `canonicalFeatureBytes` is the sum of canonical JSON bytes for every
-  committed product lexical `FeatureRecord` in that question;
-- `normalizedSourceBytes` is the sum of UTF-8 bytes after the product extractor's
-  NFC and whitespace normalization for every mapped message text;
-- the reported ratio is `canonicalFeatureBytes / normalizedSourceBytes`, with
-  zero denominator and nonzero numerator treated as infinity.
+- `canonicalRecordBytes` and `canonicalFeatureBytes` are the separate sums of
+  canonical JSON bytes for every committed product `MemoryRecord` and lexical
+  `FeatureRecord` in that question;
+- `normalizedInputBytes` is the sum of UTF-8 bytes after the product
+  extractor's NFC and whitespace normalization for every mapped message;
+- `coveredNormalizedBytes` is the byte length of the union of the actual
+  product segment intervals for each item. Overlap is counted once. Text that
+  exceeds `maxInputBytes`, or bytes after the last allowed segment, is not in
+  this denominator;
+- the classifying ratio is
+  `canonicalFeatureBytes / coveredNormalizedBytes`, with zero denominator and
+  nonzero numerator treated as infinity. The input-byte value remains a
+  coverage audit field and can never dilute this ratio.
 
-Record count, feature count, duplicated-session positions, empty sessions, and
-skipped text items are descriptive outputs. Timing and RSS may be recorded for
-operations planning but cannot classify the result without a separately frozen
-reference host and measurement protocol.
+Every row reports skip counts by the exact extractor reason, truncated item
+count, uncovered normalized bytes, terminal feature-job counts, outstanding
+leases, the exact lexical generation, channel identity, and final Page
+coverage. The coverage gate requires zero uncovered bytes, zero truncated
+items, no non-empty skipped text, no pending/retryable/running/permanent-failed
+job, and no outstanding lease. Empty normalized text may be reported as the
+typed `TEXT_EMPTY` skip without inventing source bytes. Record count, feature
+count, duplicated-session positions, and empty sessions remain descriptive
+outputs. Timing and RSS may be recorded for operations planning but cannot
+classify the result without a separately frozen reference host and measurement
+protocol.
 
 Paired confidence intervals use the same pre-generated, shared 10,000-row
 evaluation resample matrix as the v4 reference analysis. The formal protocol
 must copy that exact matrix-generation and binary64 aggregation rule; it may
 not generate a new bootstrap stream per metric or condition.
 
-## Frozen decision rule
+## Proposed decision rule to freeze
 
 The treatment is a candidate for production wiring only if all of the
 following hold on the 353 sealed evaluation questions:
@@ -114,8 +135,9 @@ following hold on the 353 sealed evaluation questions:
    `Recall@10(product - reference)` is at least `-0.02`;
 3. product knowledge-update top-one error minus reference error is at most
    `0.02`;
-4. p95 `canonicalFeatureBytes / normalizedSourceBytes` is at most `2`;
-5. all 500 treatment rows, all expected record/session mappings, checksums,
+4. every row passes the coverage and terminal-job gate, and p95
+   `canonicalFeatureBytes / coveredNormalizedBytes` is at most `2`;
+5. all 500 treatment rows, all expected rank/record/Block/session mappings, checksums,
    source hashes, independent metric recomputation, and preregistered mutation
    tests validate without a structural or secret-leak failure.
 
@@ -137,8 +159,11 @@ receive a new version and sealed evaluation.
 
 Before a classifiable run, a follow-up commit must add the closed artifact
 schemas, runner, gold-aware analyzer, independent verifier, exact source
-inventory, checksum inventory, and mutation harness. This design and its two
-conformance fixtures are not retrieval evidence by themselves.
+inventory, checksum inventory, and mutation harness. A treatment row must
+persist the exact lexical generation; original rank objects; input counts;
+extraction coverage; terminal job accounting; query coverage; record and
+feature counts; and their separate canonical byte totals. This design and its
+four conformance fixtures are not retrieval evidence by themselves.
 
 No outcome from this replay can enable `automaticRecall`, automatic task
 resumption, source-reference emission, vector/hybrid retrieval, or configured
