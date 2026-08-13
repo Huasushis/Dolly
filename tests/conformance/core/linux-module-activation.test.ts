@@ -30,14 +30,19 @@ const runtimeMock = vi.hoisted(() => {
   };
 });
 
+const platformMock = vi.hoisted(() => ({
+  observe: vi.fn<() => NodeJS.Platform>(() => process.platform),
+}));
+
 vi.mock("../../../src/linux-module-runtime-assets.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../../src/linux-module-runtime-assets.js")>(),
   inspectReviewedLinuxModuleRuntime: runtimeMock.inspect,
 }));
+vi.mock("../../../src/core/host-platform.js", () => ({
+  observeHostPlatform: platformMock.observe,
+}));
 
 import { decideLinuxModuleActivation } from "../../../src/core/linux-module-activation.js";
-
-const LINUX_ONLY = process.platform !== "linux";
 
 function baseOptions() {
   return {
@@ -50,6 +55,8 @@ function baseOptions() {
 
 describe("Linux Module activation preconditions", () => {
   beforeEach(() => {
+    platformMock.observe.mockReset();
+    platformMock.observe.mockReturnValue(process.platform);
     runtimeMock.inspect.mockReset();
     runtimeMock.inspect.mockResolvedValue({
       available: true as const,
@@ -65,17 +72,21 @@ describe("Linux Module activation preconditions", () => {
     expect(runtimeMock.inspect).not.toHaveBeenCalled();
   });
 
-  it.runIf(LINUX_ONLY)("refuses every configured Module away from Linux", async () => {
-    const result = await decideLinuxModuleActivation(baseOptions());
-    expect(result.permitted).toBe(false);
-    if (result.permitted) throw new Error("expected a refusal");
-    expect(result.refusals.map((refusal) => refusal.code)).toEqual([
-      "MODULE_ACTIVATION_PLATFORM_UNSUPPORTED",
-    ]);
-    expect(runtimeMock.inspect).not.toHaveBeenCalled();
-  });
+  it.each(["win32", "darwin"] as const)(
+    "refuses every configured Module on %s before any runtime probe",
+    async (platform) => {
+      platformMock.observe.mockReturnValueOnce(platform);
+      const result = await decideLinuxModuleActivation(baseOptions());
+      expect(result.permitted).toBe(false);
+      if (result.permitted) throw new Error("expected a refusal");
+      expect(result.refusals.map((refusal) => refusal.code)).toEqual([
+        "MODULE_ACTIVATION_PLATFORM_UNSUPPORTED",
+      ]);
+      expect(runtimeMock.inspect).not.toHaveBeenCalled();
+    },
+  );
 
-  it.skipIf(LINUX_ONLY)(
+  it.skipIf(process.platform !== "linux")(
     "refuses when the child launcher is missing, even before the service is checked",
     async () => {
       runtimeMock.inspect.mockResolvedValueOnce({
@@ -98,7 +109,7 @@ describe("Linux Module activation preconditions", () => {
     },
   );
 
-  it.skipIf(LINUX_ONLY)(
+  it.skipIf(process.platform !== "linux")(
     "refuses when the service binding cannot be proven, and reports its exact failures",
     async () => {
       const result = await decideLinuxModuleActivation({

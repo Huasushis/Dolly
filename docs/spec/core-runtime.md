@@ -708,6 +708,10 @@ The Linux process limits are required for every Module using the
 `linux-process` execution backend and are not portable configuration. Windows
 and other platforms continue to reject that backend until a separately
 reviewed design defines equivalent process ownership and resource enforcement.
+Platform is observed through a zero-argument Host adapter, never read from
+instance configuration or activation options. Conformance tests substitute
+that trusted observation on Linux CI and require the typed platform refusal
+before the runtime, systemd, or cgroup probes can run.
 The exact installed package digest and
 configuration revision are persisted before the child launcher starts and remain
 pinned until the associated process record and any unresolved Run are terminal.

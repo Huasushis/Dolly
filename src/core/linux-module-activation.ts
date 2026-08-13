@@ -35,6 +35,7 @@ import {
   inspectReviewedLinuxModuleRuntime,
   type ReviewedLinuxModuleRuntimeIdentity,
 } from "../linux-module-runtime-assets.js";
+import { observeHostPlatform } from "./host-platform.js";
 
 export type ModuleActivationRefusalCode =
   | "MODULE_ACTIVATION_PLATFORM_UNSUPPORTED"
@@ -118,13 +119,14 @@ export async function decideLinuxModuleActivation(
   }
   const refusals: ModuleActivationRefusal[] = [];
 
-  if (process.platform !== "linux") {
+  const platform = observeHostPlatform();
+  if (platform !== "linux") {
     return {
       permitted: false,
       refusals: [
         {
           code: "MODULE_ACTIVATION_PLATFORM_UNSUPPORTED",
-          detail: `configured Modules require Linux but this process runs on ${process.platform}`,
+          detail: `configured Modules require Linux but this process runs on ${platform}`,
         },
       ],
     };
