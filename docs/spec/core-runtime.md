@@ -848,6 +848,16 @@ such a store resolves immutable records and its revision enters the future
 process record, this selection can support conformance wiring only and cannot
 remove the bootstrap refusal.
 
+`deriveReservedV10InstalledModuleProcessProvenance` joins that exact policy
+selection to the resolver-minted installed plan. Its canonical snapshot binds
+the installed-plan and policy-selection digests, package digest, configuration
+revision/schema/value digests, external-effect declaration, and complete Linux
+execution record. The result is again an in-process authority and copied
+lookalikes are rejected. It is intentionally not a Module process record and
+the current Core-state store will not persist it. This keeps the future
+`dolly.module-process-record/2` preimage explicit without allowing startup
+recovery to trust an in-memory policy revision as durable evidence.
+
 The three version-9 Scheduler intervals keep their existing bounds:
 `pollIntervalMs` is at most 60,000, `retryBaseMs` is at most 3,600,000, and
 `retryMaxMs` is at most 86,400,000, with retry maximum no smaller than retry

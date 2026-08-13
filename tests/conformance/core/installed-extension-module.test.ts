@@ -13,6 +13,8 @@ import {
   createInstalledLinuxExtensionModuleGenerationFactory,
   deriveInstalledLinuxExtensionModuleExecutor,
   deriveReservedV10InstalledLinuxModuleExecutionPlan,
+  deriveReservedV10InstalledModuleProcessProvenance,
+  assertReservedV10InstalledModuleProcessProvenance,
   type InstalledLinuxExtensionModuleExecutorOptions,
 } from "../../../src/adapters/installed-linux-extension-module-executor.js";
 import {
@@ -507,6 +509,22 @@ describe("installed Extension Module resolution", () => {
     }));
     expect(policySelection.selectionDigest)
       .toBe(canonicalJsonDigest(policySelection.snapshot));
+    const processProvenance = deriveReservedV10InstalledModuleProcessProvenance(
+      resolved,
+      policySelection,
+    );
+    expect(processProvenance.snapshot).toEqual(expect.objectContaining({
+      installedPlanDigest: resolved.provenanceDigest,
+      permissionPolicySelectionDigest: policySelection.selectionDigest,
+      packageDigest: installed.packageDigest,
+      declaredExternalEffects: "core-capabilities-only",
+      execution: resolved.module.execution,
+    }));
+    expect(processProvenance.provenanceDigest)
+      .toBe(canonicalJsonDigest(processProvenance.snapshot));
+    expect(() => assertReservedV10InstalledModuleProcessProvenance({
+      ...processProvenance,
+    })).toThrow(/not minted by the installed composition/u);
     expect(() => assertReservedV10InstalledPermissionPolicySelection(
       { ...policySelection },
       resolved,

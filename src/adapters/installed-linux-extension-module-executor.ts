@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import {
+  canonicalJsonDigest,
+  deepFreeze,
+  type JsonValue,
+} from "../core/canonical-json.js";
 import type { ExtensionInstallationRegistry } from "../core/extension-installation-registry.js";
 import type { ExtensionSessionIdentity } from "../core/extension-capability.js";
 import type { ExtensionProcessHost } from "../core/extension-process-host.js";
@@ -22,7 +27,11 @@ import {
 import type { ReactiveModuleInput } from "../core/reactive-module-input.js";
 import type { ReactiveModuleResult } from "../core/reactive-module-runtime.js";
 import type { DollyInstanceConfig } from "../core/runtime-config.js";
-import type { InstalledModulePermissionPolicySetup } from "./installed-module-permission-policy.js";
+import {
+  assertReservedV10InstalledPermissionPolicySelection,
+  type InstalledModulePermissionPolicySetup,
+  type ReservedV10InstalledPermissionPolicySelection,
+} from "./installed-module-permission-policy.js";
 import {
   deriveLinuxProcessConfinementExecution,
   LINUX_PROCESS_CONFINEMENT_PROGRAM,
@@ -100,6 +109,16 @@ export interface ReservedV10InstalledLinuxModuleExecutionPlan {
   readonly timeouts: ReservedV10InstalledModulePlan["module"]["timeouts"];
 }
 
+export interface ReservedV10InstalledModuleProcessProvenance {
+  readonly installedModule: ReservedV10InstalledModulePlan;
+  readonly permissionPolicies: ReservedV10InstalledPermissionPolicySelection;
+  readonly linuxExecution: ReservedV10InstalledLinuxModuleExecutionPlan;
+  readonly snapshot: JsonValue;
+  readonly provenanceDigest: string;
+}
+
+const RESERVED_V10_PROCESS_PROVENANCE = new WeakSet<object>();
+
 /**
  * Projects the exact Linux-owned values from one resolver-minted v10 plan.
  * It performs no process, cgroup, protocol, or Core-state mutation. Sandbox
@@ -135,6 +154,64 @@ export function deriveReservedV10InstalledLinuxModuleExecutionPlan(
     permissionPolicyReferences: resolvedModule.module.permissionPolicyReferences,
     timeouts: resolvedModule.module.timeouts,
   });
+}
+
+/**
+ * Joins the two independently minted v10 authorities into the closed
+ * provenance that a future process-record/2 factory must consume. It does not
+ * create a durable process record because the current Core-state schema and
+ * startup recovery intentionally accept only their existing record boundary.
+ */
+export function deriveReservedV10InstalledModuleProcessProvenance(
+  installedModule: ReservedV10InstalledModulePlan,
+  permissionPolicies: ReservedV10InstalledPermissionPolicySelection,
+): ReservedV10InstalledModuleProcessProvenance {
+  const linuxExecution = deriveReservedV10InstalledLinuxModuleExecutionPlan(
+    installedModule,
+  );
+  assertReservedV10InstalledPermissionPolicySelection(
+    permissionPolicies,
+    installedModule,
+  );
+  const snapshot = deepFreeze({
+    schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
+    instanceId: installedModule.instanceId,
+    moduleId: installedModule.module.moduleId,
+    installedPlanDigest: installedModule.provenanceDigest,
+    permissionPolicySelectionDigest: permissionPolicies.selectionDigest,
+    packageDigest: installedModule.installation.packageDigest,
+    configuration: {
+      revision: installedModule.configuration.revision,
+      schemaDigest: installedModule.configuration.schemaDigest,
+      configurationDigest: installedModule.configuration.configurationDigest,
+    },
+    declaredExternalEffects: installedModule.module.declaredExternalEffects,
+    execution: installedModule.module.execution as unknown as JsonValue,
+  } satisfies JsonValue);
+  const provenance = Object.freeze({
+    installedModule,
+    permissionPolicies,
+    linuxExecution,
+    snapshot,
+    provenanceDigest: canonicalJsonDigest(snapshot),
+  });
+  RESERVED_V10_PROCESS_PROVENANCE.add(provenance);
+  return provenance;
+}
+
+/** Rejects copied process-provenance objects before any future durable write. */
+export function assertReservedV10InstalledModuleProcessProvenance(
+  value: unknown,
+): asserts value is ReservedV10InstalledModuleProcessProvenance {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    !RESERVED_V10_PROCESS_PROVENANCE.has(value)
+  ) {
+    throw new TypeError(
+      "Reserved version-10 Module process provenance was not minted by the installed composition",
+    );
+  }
 }
 
 function assertNoDerivedFields(
