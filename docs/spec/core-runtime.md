@@ -637,6 +637,17 @@ cgroup-level termination and empty-cgroup proof. Core writes each limit, reads
 it back, and refuses activation if the expected cgroup version 2 controller or
 operation is unavailable.
 
+The installed launcher is also part of the Linux execution preimage. Its
+build-reviewed SHA-256 digest, the fixed `/usr/bin/python3` interpreter, and
+the selected confinement program are included in the reserved v10 process
+provenance candidate. Installed composition reads the colocated launcher,
+requires the reviewed digest, copies those exact bytes into an unlinked
+read-only snapshot, and starts Python with that inherited file at
+`/proc/self/fd/5`. The parent closes its copy immediately after spawn and the
+launcher closes the descriptor after Python has loaded it. Lower-level probes
+may still exercise an explicit path, but that path mode is not the installed
+composition and cannot support product activation evidence.
+
 Linux activation performs the delegated-root half of that proof before it
 returns permission to accept Module work. After verifying the exact Core
 service binding, it confirms that the delegated root contains no processes,

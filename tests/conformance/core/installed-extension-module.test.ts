@@ -23,6 +23,7 @@ import {
 } from "../../../src/adapters/linux-process-confinement.js";
 import {
   defaultLauncherScriptPath,
+  REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
 } from "../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
 import {
   assertReservedV10InstalledPermissionPolicySelection,
@@ -528,6 +529,11 @@ describe("installed Extension Module resolution", () => {
       packageDigest: installed.packageDigest,
       declaredExternalEffects: "core-capabilities-only",
       execution: resolved.module.execution,
+      linuxRuntime: {
+        interpreterProgram: "/usr/bin/python3",
+        launcherDigest: REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
+        confinementProgram: LINUX_PROCESS_CONFINEMENT_PROGRAM,
+      },
     }));
     expect(processProvenance.provenanceDigest)
       .toBe(canonicalJsonDigest(processProvenance.snapshot));
@@ -914,9 +920,14 @@ describe("installed Extension Module resolution", () => {
       .toEqual(installed.packageSnapshot.copyBytes());
     expect(derived.executorOptions.launcher).toEqual({
       interpreterProgram: "/usr/bin/python3",
-      launcherScriptPath: defaultLauncherScriptPath(),
       launcherEnvironment: {},
     });
+    expect(derived.executorOptions.reviewedLauncherSnapshot).toMatchObject({
+      digest: REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
+      stagingDirectory: resolve(scratch, "instance-state"),
+    });
+    expect(Buffer.from(derived.executorOptions.reviewedLauncherSnapshot!.bytes))
+      .toEqual(readFileSync(defaultLauncherScriptPath()));
     expect(processRecord.serviceInvocationId).toBe(CORE_BINDING.serviceInvocationId);
     expect(processRecord.bootId).toBe(CORE_BINDING.bootId);
     expect(processRecord.moduleCgroupPath).toBe(

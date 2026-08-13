@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
   canonicalJsonDigest,
   deepFreeze,
@@ -42,6 +43,7 @@ import {
 } from "./linux-extension-module-executor.js";
 import {
   defaultLauncherScriptPath,
+  REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
 } from "./linux-module-launcher/linux-module-launcher-process.js";
 
 type InstalledLifecycleOptions = Omit<
@@ -187,6 +189,11 @@ export function deriveReservedV10InstalledModuleProcessProvenance(
     },
     declaredExternalEffects: installedModule.module.declaredExternalEffects,
     execution: installedModule.module.execution as unknown as JsonValue,
+    linuxRuntime: {
+      interpreterProgram: INSTALLED_LINUX_LAUNCHER_INTERPRETER,
+      launcherDigest: REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
+      confinementProgram: LINUX_PROCESS_CONFINEMENT_PROGRAM,
+    },
   } satisfies JsonValue);
   const provenance = Object.freeze({
     installedModule,
@@ -348,6 +355,15 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     packageSnapshot: resolvedModule.installation.packageSnapshot,
     coreStateDirectory: options.coreStateDirectory,
   });
+  const launcherBytes = readFileSync(defaultLauncherScriptPath());
+  const launcherDigest = `sha256:${createHash("sha256")
+    .update(launcherBytes)
+    .digest("hex")}`;
+  if (launcherDigest !== REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST) {
+    throw new TypeError(
+      "Installed Linux launcher bytes do not match the reviewed build digest",
+    );
+  }
   const executorOptions: LinuxExtensionModuleExecutorOptions = {
     moduleId: resolvedModule.module.moduleId,
     moduleGenerationId: options.moduleGenerationId,
@@ -363,8 +379,12 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     },
     launcher: {
       interpreterProgram: INSTALLED_LINUX_LAUNCHER_INTERPRETER,
-      launcherScriptPath: defaultLauncherScriptPath(),
       launcherEnvironment: Object.freeze({}),
+    },
+    reviewedLauncherSnapshot: {
+      bytes: new Uint8Array(launcherBytes),
+      digest: launcherDigest,
+      stagingDirectory: options.coreStateDirectory,
     },
     host: {
       ...options.host,

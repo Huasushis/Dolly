@@ -1,9 +1,14 @@
+import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { copyRuntimeAssets } from "../../../scripts/copy-runtime-assets.mjs";
+import {
+  defaultLauncherScriptPath,
+  REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
+} from "../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
 
 const LAUNCHER_PATH = "src/adapters/linux-module-launcher/launcher.py";
 const LAUNCHER_CONSUMER_PATH =
@@ -31,6 +36,13 @@ async function fixture() {
 }
 
 describe("runtime build assets", () => {
+  it("keeps the shipped launcher bytes bound to their reviewed digest", () => {
+    const digest = `sha256:${createHash("sha256")
+      .update(readFileSync(defaultLauncherScriptPath()))
+      .digest("hex")}`;
+    expect(digest).toBe(REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST);
+  });
+
   it("copies the Linux launcher beside its compiled module with exact bytes", async () => {
     const { repositoryRoot, outputDirectory, source } = await fixture();
 

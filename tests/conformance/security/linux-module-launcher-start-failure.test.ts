@@ -8,8 +8,10 @@
  * exception, which would end the Core process. Under `Restart=on-failure`
  * that becomes a restart loop that spends the finite restart budget.
  */
+import { closeSync, openSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  defaultLauncherScriptPath,
   LinuxModuleLauncherStartError,
   startLinuxModuleLauncher,
 } from "../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
@@ -73,6 +75,23 @@ describe("Linux Module launcher start failure", () => {
         launcherScriptPath: "launcher.py",
       }),
     ).toThrowError(TypeError);
+  });
+
+  it.skipIf(POSIX_ONLY)("executes the launcher from one inherited pinned descriptor", async () => {
+    const descriptor = openSync(defaultLauncherScriptPath(), "r");
+    let started: ReturnType<typeof startLinuxModuleLauncher> | undefined;
+    try {
+      started = startLinuxModuleLauncher({
+        interpreterProgram: "/usr/bin/python3",
+        launcherScriptDescriptor: descriptor,
+        protocolStdio: ["ignore", "ignore", "ignore"],
+      });
+    } finally {
+      closeSync(descriptor);
+    }
+    expect(started.launchError).toBeUndefined();
+    started.closeControlChannel();
+    await expect(started.waitForExit(2_000)).resolves.toBe(true);
   });
 
   it("names its start failure distinctly from a launcher protocol failure", () => {

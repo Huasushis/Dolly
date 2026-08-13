@@ -7,10 +7,10 @@
  * at descriptor 3 and above on Linux, which matches the specification's
  * description of the control channel as one Core-created private channel.
  *
- * This adapter is Linux-only at run time. It is written so that the launcher
- * program itself stays replaceable: the caller supplies the absolute
- * interpreter path and script path, and nothing else about the launcher is
- * assumed.
+ * This adapter is Linux-only at run time. Lower-level probes may supply an
+ * absolute script path. Installed composition instead supplies Host-frozen
+ * reviewed bytes at descriptor 5, so checking one pathname and executing
+ * later pathname contents cannot form a time-of-check/time-of-use gap.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { isAbsolute } from "node:path";
@@ -41,8 +41,10 @@ export class LinuxModuleLauncherStartError extends Error {
 export interface StartLinuxModuleLauncherOptions {
   /** Absolute path of the interpreter that runs the launcher script. */
   readonly interpreterProgram: string;
-  /** Absolute path of the installed launcher script. */
-  readonly launcherScriptPath: string;
+  /** Absolute path of a launcher script, retained only for lower-level probes. */
+  readonly launcherScriptPath?: string;
+  /** Host-pinned read-only launcher bytes inherited at descriptor 5. */
+  readonly launcherScriptDescriptor?: number;
   /**
    * Descriptors 0, 1, and 2 of the launcher process. Descriptors 0 and 1 carry
    * the Extension protocol transport and survive `exec`; descriptor 2 carries
@@ -109,11 +111,26 @@ export function defaultLauncherScriptPath(): string {
   return fileURLToPath(new URL("./launcher.py", import.meta.url));
 }
 
+/** Digest of the reviewed launcher bytes copied unchanged by the build. */
+export const REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST =
+  "sha256:2c95f759603f902340f719abaaf12b2df0ab7194d9c89f35aa835927486d3177";
+
 export function startLinuxModuleLauncher(
   options: StartLinuxModuleLauncherOptions,
 ): StartedLinuxModuleLauncher {
-  if (!isAbsolute(options.interpreterProgram) || !isAbsolute(options.launcherScriptPath)) {
-    throw new TypeError("The launcher interpreter and script paths must be absolute");
+  const hasLauncherPath = options.launcherScriptPath !== undefined;
+  const hasLauncherDescriptor = options.launcherScriptDescriptor !== undefined;
+  if (
+    !isAbsolute(options.interpreterProgram) ||
+    hasLauncherPath === hasLauncherDescriptor ||
+    (hasLauncherPath && !isAbsolute(options.launcherScriptPath!)) ||
+    (hasLauncherDescriptor &&
+      (!Number.isSafeInteger(options.launcherScriptDescriptor) ||
+        options.launcherScriptDescriptor! < 0))
+  ) {
+    throw new TypeError(
+      "The launcher requires an absolute script path or one non-negative pinned descriptor",
+    );
   }
   const [stdin, stdout, stderr] = options.protocolStdio ?? ["pipe", "pipe", "pipe"];
   if (
@@ -127,7 +144,11 @@ export function startLinuxModuleLauncher(
     options.interpreterProgram,
     // Isolated mode ignores PYTHON* environment variables and the user site
     // directory; -B keeps the installed launcher directory free of cache files.
-    ["-I", "-B", options.launcherScriptPath],
+    [
+      "-I",
+      "-B",
+      hasLauncherDescriptor ? "/proc/self/fd/5" : options.launcherScriptPath!,
+    ],
     {
       stdio: [
         stdin,
@@ -135,6 +156,7 @@ export function startLinuxModuleLauncher(
         stderr,
         "pipe",
         options.immutableInputDescriptor ?? "ignore",
+        ...(hasLauncherDescriptor ? [options.launcherScriptDescriptor!] : []),
         ...(options.additionalInheritedStdio ?? []),
       ],
       env: { ...(options.launcherEnvironment ?? {}) },

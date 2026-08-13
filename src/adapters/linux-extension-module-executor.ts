@@ -57,10 +57,19 @@ type LinuxExtensionHostOptions = Omit<
 
 type LinuxLauncherOptions = Omit<
   StartLinuxModuleLauncherOptions,
-  "additionalInheritedStdio" | "immutableInputDescriptor" | "protocolStdio"
+  | "additionalInheritedStdio"
+  | "immutableInputDescriptor"
+  | "launcherScriptDescriptor"
+  | "protocolStdio"
 >;
 
 export interface LinuxExtensionPackageSnapshotInput {
+  readonly bytes: Uint8Array;
+  readonly digest: string;
+  readonly stagingDirectory: string;
+}
+
+export interface LinuxExtensionReviewedLauncherSnapshotInput {
   readonly bytes: Uint8Array;
   readonly digest: string;
   readonly stagingDirectory: string;
@@ -83,6 +92,8 @@ export interface LinuxExtensionModuleExecutorOptions {
   readonly host: LinuxExtensionHostOptions;
   /** Registry-captured package bytes; absent only for lower-level non-installed tests. */
   readonly packageSnapshot?: LinuxExtensionPackageSnapshotInput;
+  /** Build-reviewed launcher bytes; installed composition always supplies it. */
+  readonly reviewedLauncherSnapshot?: LinuxExtensionReviewedLauncherSnapshotInput;
   readonly executionTimeoutMs: number;
   readonly cancellationGraceMs: number;
   readonly terminationTimeoutMs: number;
@@ -130,7 +141,8 @@ function assertClosedLauncherOptions(options: LinuxLauncherOptions): void {
   if (
     Object.hasOwn(supplied, "protocolStdio") ||
     Object.hasOwn(supplied, "additionalInheritedStdio") ||
-    Object.hasOwn(supplied, "immutableInputDescriptor")
+    Object.hasOwn(supplied, "immutableInputDescriptor") ||
+    Object.hasOwn(supplied, "launcherScriptDescriptor")
   ) {
     throw new TypeError(
       "Linux Extension launchers must use the adapter-owned protocol pipes and may not inherit extra descriptors",
@@ -142,15 +154,16 @@ function digestBytes(bytes: Uint8Array): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
 
-function openAnonymousPackageSnapshot(
-  snapshot: LinuxExtensionPackageSnapshotInput,
+function openAnonymousReadOnlySnapshot(
+  snapshot: LinuxExtensionPackageSnapshotInput | LinuxExtensionReviewedLauncherSnapshotInput,
+  purpose: "package" | "launcher",
 ): number {
   if (
     !/^sha256:[0-9a-f]{64}$/u.test(snapshot.digest) ||
     digestBytes(snapshot.bytes) !== snapshot.digest ||
     !isAbsolute(snapshot.stagingDirectory)
   ) {
-    throw new TypeError("Installed package snapshot input is invalid");
+    throw new TypeError(`Installed ${purpose} snapshot input is invalid`);
   }
   const directoryMetadata = lstatSync(snapshot.stagingDirectory);
   const canonicalDirectory = realpathSync.native(snapshot.stagingDirectory);
@@ -159,7 +172,7 @@ function openAnonymousPackageSnapshot(
   }
   const path = join(
     canonicalDirectory,
-    `.dolly-package-snapshot-${randomBytes(24).toString("hex")}.tmp`,
+    `.dolly-${purpose}-snapshot-${randomBytes(24).toString("hex")}.tmp`,
   );
   let writeDescriptor: number | undefined;
   let readDescriptor: number | undefined;
@@ -189,7 +202,7 @@ function openAnonymousPackageSnapshot(
       descriptorMetadata.size !== snapshot.bytes.byteLength ||
       pathMetadata.size !== snapshot.bytes.byteLength
     ) {
-      throw new Error("Installed package snapshot staging file changed identity");
+      throw new Error(`Installed ${purpose} snapshot staging file changed identity`);
     }
     const digest = createHash("sha256");
     let position = 0;
@@ -204,12 +217,14 @@ function openAnonymousPackageSnapshot(
         buffer.byteLength,
         position,
       );
-      if (bytesRead < 1) throw new Error("Installed package snapshot staging read ended early");
+      if (bytesRead < 1) {
+        throw new Error(`Installed ${purpose} snapshot staging read ended early`);
+      }
       digest.update(buffer.subarray(0, bytesRead));
       position += bytesRead;
     }
     if (`sha256:${digest.digest("hex")}` !== snapshot.digest) {
-      throw new Error("Installed package snapshot staging bytes changed");
+      throw new Error(`Installed ${purpose} snapshot staging bytes changed`);
     }
     unlinkSync(path);
     pathExists = false;
@@ -271,6 +286,14 @@ export function createLinuxExtensionModuleExecutor(
 ): ModuleExecutor<ReactiveModuleInput, ReactiveModuleResult> {
   assertSameConfiguredIdentity(options);
   assertClosedLauncherOptions(options.launcher);
+  if (
+    (options.reviewedLauncherSnapshot === undefined) ===
+    (options.launcher.launcherScriptPath === undefined)
+  ) {
+    throw new TypeError(
+      "Linux Extension executor requires exactly one path or reviewed launcher snapshot",
+    );
+  }
 
   let startedLauncher: StartedLinuxModuleLauncher | undefined;
   let launcherControl: Awaited<ReturnType<StartModuleProcessOptions["startLauncher"]>> | undefined;
@@ -280,9 +303,19 @@ export function createLinuxExtensionModuleExecutor(
       throw new Error("A Linux Extension executor cannot create more than one launcher");
     }
     let snapshotDescriptor: number | undefined;
+    let launcherDescriptor: number | undefined;
     try {
       if (options.packageSnapshot !== undefined) {
-        snapshotDescriptor = openAnonymousPackageSnapshot(options.packageSnapshot);
+        snapshotDescriptor = openAnonymousReadOnlySnapshot(
+          options.packageSnapshot,
+          "package",
+        );
+      }
+      if (options.reviewedLauncherSnapshot !== undefined) {
+        launcherDescriptor = openAnonymousReadOnlySnapshot(
+          options.reviewedLauncherSnapshot,
+          "launcher",
+        );
       }
       const started = startLinuxModuleLauncher({
         ...options.launcher,
@@ -291,10 +324,14 @@ export function createLinuxExtensionModuleExecutor(
         ...(snapshotDescriptor === undefined
           ? {}
           : { immutableInputDescriptor: snapshotDescriptor }),
+        ...(launcherDescriptor === undefined
+          ? {}
+          : { launcherScriptDescriptor: launcherDescriptor }),
       });
       startedLauncher = started;
     } finally {
       if (snapshotDescriptor !== undefined) closeSync(snapshotDescriptor);
+      if (launcherDescriptor !== undefined) closeSync(launcherDescriptor);
     }
     const started = startedLauncher!;
     started.child.stderr?.on("data", (chunk: Buffer) => {
