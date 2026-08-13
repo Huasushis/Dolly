@@ -1328,6 +1328,43 @@ describe("installed reactive Module runtime composition", () => {
       runtime,
     })).toThrow(/mailbox Pages do not match Module worker/u);
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
+
+    const allocatorHandoff = await startupHandoff(
+      pair,
+      runtime.resultCommitRepository,
+      mailboxes,
+    );
+    expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
+      ...contentSchemaOptions(pair),
+      mailboxes,
+      startupRecoveryHandoff: allocatorHandoff,
+      clock,
+      scheduling,
+      runtime: {
+        ...runtime,
+        initialModuleGenerationIdFor: () => {
+          throw new Error("injected generation allocator failure");
+        },
+      },
+    })).toThrow(/injected generation allocator failure/u);
+    expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
+      ...contentSchemaOptions(pair),
+      mailboxes,
+      startupRecoveryHandoff: allocatorHandoff,
+      clock,
+      scheduling,
+      runtime,
+    })).not.toThrow();
   });
 
   it("binds a package-version-3 source Module to one Core-private activation queue", async () => {

@@ -655,6 +655,26 @@ export function composeInstalledReactiveModuleHost(
     }
     return Object.freeze({ module, mailbox });
   });
+  const {
+    initialModuleGenerationIdFor,
+    nextModuleGenerationIdFor,
+    ...sharedRuntimeOptions
+  } = options.runtime;
+  // Allocators are trusted Host seams but may still reject or return malformed
+  // data. Resolve the first generation for every Module before consuming the
+  // one-use startup proof so a pure construction failure can be corrected and
+  // retried with that same handoff.
+  const initialModuleGenerationIds = new Map<string, string>();
+  const generationIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+  for (const { module } of moduleMailboxes) {
+    const generationId = initialModuleGenerationIdFor(module.moduleId);
+    if (!generationIdPattern.test(generationId)) {
+      throw new TypeError(
+        `Initial Module generation for ${module.moduleId} is not a valid identifier`,
+      );
+    }
+    initialModuleGenerationIds.set(module.moduleId, generationId);
+  }
   // Startup recovery authority must be authenticated before source
   // reconciliation is allowed to create any private Page. A copied or
   // store-mismatched handoff is a refusal, not a partially applied
@@ -688,11 +708,6 @@ export function composeInstalledReactiveModuleHost(
   // source limit, and startup-recovery result has passed the non-mutating
   // composition checks above.
   for (const queue of orderedSourceActivationQueues) queue.reconcile();
-  const {
-    initialModuleGenerationIdFor,
-    nextModuleGenerationIdFor,
-    ...sharedRuntimeOptions
-  } = options.runtime;
   const installedRuntimes = moduleMailboxes.map(({ module }) =>
     createInstalledReactiveModuleRuntimeInternal({
       ...sharedRuntimeOptions,
@@ -705,8 +720,7 @@ export function composeInstalledReactiveModuleHost(
       runtime: options.activation.runtime,
       stoppedRecordWriter: options.coreState.stoppedRecordWriter,
       mailboxes: options.mailboxes,
-      initialModuleGenerationId:
-        initialModuleGenerationIdFor(module.moduleId),
+      initialModuleGenerationId: initialModuleGenerationIds.get(module.moduleId)!,
       nextModuleGenerationId: () =>
         nextModuleGenerationIdFor(module.moduleId),
       monotonicNow: options.clock.monotonicNow,

@@ -448,6 +448,10 @@ the prover in the same activation permission before consuming that handoff.
 The composer authenticates that handoff and validates every deferred result
 before source-queue reconciliation may create a private Page, so a copied or
 store-mismatched handoff cannot leave a partial Core-state mutation behind.
+It also resolves and validates every initial Module generation identifier
+before consuming the one-use proof; a pure allocator/configuration error can
+therefore be corrected and retried without rerunning a recovery that never
+authorized a mutation.
 Thus old-process recovery and new-process composition cannot splice two
 independently minted service authorities. This does not make either candidate
 path a public bootstrap.
