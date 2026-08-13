@@ -422,7 +422,7 @@ describe("reserved Dolly instance version 10 configuration", () => {
     }
   });
 
-  it("requires an empty mailbox to fit one maximum fan-out result", () => {
+  it("requires an empty mailbox to fit the durable Block ceiling across fan-out", () => {
     const producer = reactiveModule({
       moduleId: "producer",
       inputConnections: [{ pageId: "trigger", start: "from-now" }],
@@ -449,14 +449,25 @@ describe("reserved Dolly instance version 10 configuration", () => {
     const pages = ["trigger", "fan-a", "fan-b"].map((pageId) => ({ pageId }));
     expect(() => validateDollyInstanceConfigV10Draft(
       configuration([producer, consumer], pages) as JsonValue,
-    )).toThrow(/mailbox cannot hold one maximum result/u);
+    )).toThrow(/mailbox cannot hold one maximum durable Block/u);
 
     const limits = consumer.limits as Record<string, JsonValue>;
-    expect(validateDollyInstanceConfigV10Draft(configuration([
+    expect(() => validateDollyInstanceConfigV10Draft(configuration([
       producer,
       { ...consumer, limits: {
         ...limits,
         mailbox: { maxResidentCount: 2, maxResidentBytes: 8_192 },
+      } },
+    ], pages) as JsonValue)).toThrow(/durable Block/u);
+
+    expect(validateDollyInstanceConfigV10Draft(configuration([
+      producer,
+      { ...consumer, limits: {
+        ...limits,
+        mailbox: {
+          maxResidentCount: 2,
+          maxResidentBytes: 2 * 64 * 1_024 * 1_024,
+        },
       } },
     ], pages) as JsonValue).modules).toHaveLength(2);
   });

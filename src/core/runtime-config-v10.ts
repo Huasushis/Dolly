@@ -725,9 +725,13 @@ export function validateDollyInstanceConfigV10Draft(value: JsonValue): DollyInst
     };
   });
 
-  // One accepted result broadcasts one Block to every configured output Page.
-  // If a consumer subscribes to more than one of those Pages it receives one
-  // Delivery per Page, so an empty mailbox must fit the full multiplicity.
+  // One accepted result broadcasts one durable Block to every configured
+  // output Page. maxResultBytes bounds the Extension's module-result envelope,
+  // not the committed Block after Core adds identity, source, sequence, and
+  // time metadata. Version 10 does not yet carry a narrower final-Block bound,
+  // so maxStateBytes is the conservative upper bound for any Block that the
+  // same Core state store can durably accept. If a consumer subscribes to more
+  // than one output Page it receives one logical resident occurrence per Page.
   for (const producer of modules) {
     for (const consumer of modules) {
       const consumerPages = new Set(
@@ -737,7 +741,7 @@ export function validateDollyInstanceConfigV10Draft(value: JsonValue): DollyInst
         consumerPages.has(pageId)
       ).length;
       if (multiplicity === 0) continue;
-      const requiredBytes = producer.limits.maxResultBytes * multiplicity;
+      const requiredBytes = projected.core.limits.maxStateBytes * multiplicity;
       if (!Number.isSafeInteger(requiredBytes)) {
         throw invalid(
           `Output from Module ${producer.moduleId} has an unsafe mailbox byte projection`,
@@ -749,7 +753,7 @@ export function validateDollyInstanceConfigV10Draft(value: JsonValue): DollyInst
         consumer.limits.mailbox.maxResidentBytes < requiredBytes
       ) {
         throw invalid(
-          `Module ${consumer.moduleId} mailbox cannot hold one maximum result from ${producer.moduleId} across ${multiplicity} input connections`,
+          `Module ${consumer.moduleId} mailbox cannot hold one maximum durable Block from ${producer.moduleId} across ${multiplicity} input connections`,
           true,
         );
       }

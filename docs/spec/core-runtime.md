@@ -884,13 +884,19 @@ pre-check. Scheduler status reports all four Claim values and both mailbox
 bounds.
 
 Configuration validation also proves that an empty consumer mailbox can hold
-one maximum result from every directly connected producer considered one at a
-time. If one producer output reaches the same consumer through `N` output
-Pages, the projection is `N` resident Deliveries and
-`N * producer.maxResultBytes`; both values must fit that consumer's mailbox and
-the byte multiplication must remain a safe integer. This static condition does
-not replace the atomic exact-byte check for a real result or reserve capacity
-across concurrent producers.
+one maximum durable Block from every directly connected producer considered
+one at a time. `maxResultBytes` bounds the Extension's
+`dolly.module-result/1` envelope and is not a Block-size unit: Core adds Block
+identity, source, sequence, and timestamp fields before Delivery accounting.
+The reserved version-10 schema has no narrower final-Block limit, so it uses
+`core.limits.maxStateBytes` as the conservative upper bound for any Block the
+same state store can durably accept. If one producer output reaches the same
+consumer through `N` output Pages, the projection is `N` resident Deliveries
+and `N * core.limits.maxStateBytes`; both values must fit that consumer's
+mailbox and the multiplication must remain a safe integer. This deliberately
+conservative proof can be narrowed only by a later schema field enforced at
+the Block commit boundary. It does not replace the atomic exact-byte check for
+a real Block or reserve capacity across concurrent producers.
 
 A source Module has no public `inputConnections`. Its Claim baseline count and
 hard count MUST both equal one because one durable source request is one Module
