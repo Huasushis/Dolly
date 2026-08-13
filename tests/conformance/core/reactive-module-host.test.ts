@@ -198,6 +198,49 @@ describe("reactive Module host lifecycle", () => {
     ]);
   });
 
+  it("accepts shutdown during runtime startup without ever starting the Scheduler", async () => {
+    const events: string[] = [];
+    let finishRuntimeStart!: () => void;
+    const runtimeStart = new Promise<void>((resolve) => {
+      finishRuntimeStart = resolve;
+    });
+    const fakeScheduler = scheduler(events);
+    const host = new ReactiveModuleHost(
+      fakeScheduler as never,
+      [registration("worker", runtime(
+        "worker",
+        events,
+        () => runtimeStart,
+      ))],
+    );
+
+    const starting = host.start();
+    await vi.waitFor(() => expect(events).toContain("start:worker"));
+    expect(host.state).toBe("starting");
+
+    const stopping = host.stop();
+    expect(host.stop()).toBe(stopping);
+    expect(host.state).toBe("stopping");
+    expect(fakeScheduler.start).not.toHaveBeenCalled();
+    let stopSettled = false;
+    void stopping.then(() => {
+      stopSettled = true;
+    });
+    await Promise.resolve();
+    expect(stopSettled).toBe(false);
+
+    finishRuntimeStart();
+    await expect(starting).rejects.toThrow(/startup was interrupted by stop/u);
+    await expect(stopping).resolves.toBeUndefined();
+    expect(host.state).toBe("stopped");
+    expect(fakeScheduler.start).not.toHaveBeenCalled();
+    expect(events).toEqual([
+      "register:worker",
+      "start:worker",
+      "stop:worker",
+    ]);
+  });
+
   it("does not report running while a startup result still awaits output capacity", async () => {
     const events: string[] = [];
     let outputCommitWaiting = true;

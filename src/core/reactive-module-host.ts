@@ -396,6 +396,13 @@ export function composeReservedV10ReactiveModuleHost(
   return new ReactiveModuleHost(scheduler, hostRegistrations);
 }
 
+class ReactiveModuleHostStartupInterruptedError extends Error {
+  constructor() {
+    super("Reactive Module host startup was interrupted by stop");
+    this.name = "ReactiveModuleHostStartupInterruptedError";
+  }
+}
+
 /**
  * Coordinates one set of already-constructed reactive Module runtimes with one
  * Scheduler. It is deliberately outside `openDollyRuntime`: the product
@@ -480,12 +487,20 @@ export class ReactiveModuleHost {
       );
     }
     this.#state = "starting";
-    const operation = this.#startAll();
+    // Install the lifecycle fence before invoking any runtime. A runtime may
+    // synchronously re-enter the Host from the prefix of start().
+    const operation = Promise.resolve().then(() => this.#startAll());
     this.#startPromise = operation;
     void operation.finally(() => {
       if (this.#startPromise === operation) this.#startPromise = undefined;
     }).catch(() => undefined);
     return operation;
+  }
+
+  #assertStartupMayContinue(): void {
+    if (this.#state !== "starting") {
+      throw new ReactiveModuleHostStartupInterruptedError();
+    }
   }
 
   /**
@@ -508,14 +523,25 @@ export class ReactiveModuleHost {
   async #startAll(): Promise<void> {
     try {
       for (const registration of this.#modules) {
+        this.#assertStartupMayContinue();
         // Lifecycle ownership begins before start: a runtime may create an
         // executor and then reject while retaining an unconfirmed termination
         // that only a later stop() call can retry.
         this.#ownedRuntimes.push(registration.runtime);
         await registration.runtime.start();
+        this.#assertStartupMayContinue();
       }
-      this.#scheduler.start();
+      this.#assertStartupMayContinue();
+      // Publish Scheduler ownership before calling start(), so a synchronous
+      // stop re-entry from Scheduler observation also closes that Scheduler.
       this.#schedulerStarted = true;
+      try {
+        this.#scheduler.start();
+      } catch (error) {
+        if (this.#state === "starting") this.#schedulerStarted = false;
+        throw error;
+      }
+      this.#assertStartupMayContinue();
       for (const registration of this.#modules) {
         if (registration.runtime.startupRecoveryPending === true) {
           this.#startupRecoveryModuleIds.add(registration.moduleId);
@@ -530,6 +556,12 @@ export class ReactiveModuleHost {
         ? "recovering"
         : "running";
     } catch (error) {
+      // A concurrent stop owns cleanup for every runtime already acquired and
+      // waits for this startup operation to settle. Do not race it with a
+      // second rollback or overwrite its stopping/stopped state.
+      if (this.#state === "stopping" || this.#state === "stopped") {
+        throw error;
+      }
       const cleanupErrors: unknown[] = [];
       for (const runtime of [...this.#ownedRuntimes].reverse()) {
         try {
@@ -552,7 +584,11 @@ export class ReactiveModuleHost {
 
   stop(): Promise<void> {
     if (this.#stopPromise) return this.#stopPromise;
+    const startupOperation = this.#state === "starting"
+      ? this.#startPromise
+      : undefined;
     if (
+      this.#state !== "starting" &&
       this.#state !== "running" &&
       this.#state !== "recovering" &&
       this.#state !== "failed"
@@ -562,7 +598,7 @@ export class ReactiveModuleHost {
       );
     }
     this.#state = "stopping";
-    const operation = this.#stopAll();
+    const operation = this.#stopAll(startupOperation);
     this.#stopPromise = operation;
     void operation.finally(() => {
       if (this.#stopPromise === operation) this.#stopPromise = undefined;
@@ -570,13 +606,18 @@ export class ReactiveModuleHost {
     return operation;
   }
 
-  async #stopAll(): Promise<void> {
+  async #stopAll(startupOperation?: Promise<void>): Promise<void> {
     const errors: unknown[] = [];
     const operations: Array<{
-      readonly kind: "scheduler" | "runtime";
+      readonly kind: "scheduler" | "runtime" | "startup";
       readonly runtime?: ManagedReactiveModuleRuntime;
       readonly operation: Promise<void>;
     }> = [];
+    if (startupOperation !== undefined) {
+      // Its rejection belongs to the start() caller. Waiting here prevents
+      // stop() from reporting success while startup can still continue.
+      operations.push({ kind: "startup", operation: startupOperation });
+    }
     if (this.#schedulerStarted) {
       try {
         // `stop()` changes Scheduler state to stopping synchronously, so no
@@ -599,6 +640,7 @@ export class ReactiveModuleHost {
     );
     results.forEach((result, index) => {
       const entry = operations[index]!;
+      if (entry.kind === "startup") return;
       if (result.status === "rejected") {
         errors.push(result.reason);
         return;
