@@ -1523,10 +1523,13 @@ export class ModuleResultCommitCoordinator {
       assertModuleResultCommitRecord(record);
       if (record.state !== "committed") continue;
       if (this.#validatePersistentState(record) !== "committed") continue;
-      if (!this.#repository.deleteIfRevision(record.moduleJobId, record.revision)) continue;
       if (record.blockProposal !== undefined) {
         this.#blocks.releaseCommitEffect(this.#blockEffectId(record.moduleJobId));
       }
+      // Releasing the Block reference is idempotent while deleting the
+      // journal is not reversible. Keep the terminal journal as the cleanup
+      // anchor until the release has durably succeeded.
+      if (!this.#repository.deleteIfRevision(record.moduleJobId, record.revision)) continue;
       removed += 1;
     }
     return removed;

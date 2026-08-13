@@ -11,6 +11,7 @@ import { createModuleResultCommitCoordinator } from "../../../src/core/module-re
 import {
   InMemoryModuleResultCommitRepository,
   ModuleResultCommitBackpressureError,
+  ModuleResultCommitCoordinator,
   type ModuleResultCommitInput,
   type ModuleResultCommitRepository,
 } from "../../../src/core/module-result-commit.js";
@@ -201,16 +202,55 @@ describe("FileCore Module output capacity", () => {
       path: journalPath,
       maxBytes: exactCurrentBytes,
     });
+    const mailboxes = [{
+      consumerId: "sink",
+      pageIds: ["output"],
+      maxResidentCount: 8,
+      maxResidentBytes: 1024 * 1024,
+    }] as const;
+    const operations = core.createModuleResultCommitOperations(mailboxes);
+    const releaseFailure = new Error("simulated Block effect release failure");
+    const failingBlocks = {
+      commitOnce: operations.blocks.commitOnce.bind(operations.blocks),
+      inspectCommitEffect: operations.blocks.inspectCommitEffect.bind(operations.blocks),
+      normalizeInput: operations.blocks.normalizeInput.bind(operations.blocks),
+      releaseCommitEffect: () => { throw releaseFailure; },
+      validateInput: operations.blocks.validateInput.bind(operations.blocks),
+      validateSource: operations.blocks.validateSource.bind(operations.blocks),
+    };
+    const failingDeliveries = {
+      appendOnce: operations.deliveries.appendOnce.bind(operations.deliveries),
+      inspectAppendEffect:
+        operations.deliveries.inspectAppendEffect.bind(operations.deliveries),
+      inspectClaim: operations.deliveries.inspectClaim.bind(operations.deliveries),
+      inspectClaimInput:
+        operations.deliveries.inspectClaimInput.bind(operations.deliveries),
+      inspectClaimInputBlockIds:
+        operations.deliveries.inspectClaimInputBlockIds.bind(operations.deliveries),
+      inspectClaimInputMediaReferences:
+        operations.deliveries.inspectClaimInputMediaReferences.bind(operations.deliveries),
+      listPageIds: operations.deliveries.listPageIds.bind(operations.deliveries),
+      validateOutputPages:
+        operations.deliveries.validateOutputPages.bind(operations.deliveries),
+      usesSameBlockStore: (candidate: unknown) => candidate === failingBlocks,
+    };
+    const interruptedCleanup = new ModuleResultCommitCoordinator({
+      ...operations,
+      blocks: failingBlocks,
+      deliveries: failingDeliveries,
+      repository: reopenedRepository,
+      now: () => NOW,
+    });
+
+    await expect(interruptedCleanup.recover(current.moduleJobId)).rejects.toBe(releaseFailure);
+    expect(reopenedRepository.get(history.moduleJobId)).toMatchObject({ state: "committed" });
+    expect(reopenedRepository.get(current.moduleJobId)).toMatchObject({ state: "prepared" });
+
     const recovering = createModuleResultCommitCoordinator({
       core,
       repository: reopenedRepository,
       now: () => NOW,
-      mailboxes: [{
-        consumerId: "sink",
-        pageIds: ["output"],
-        maxResidentCount: 8,
-        maxResidentBytes: 1024 * 1024,
-      }],
+      mailboxes,
     });
 
     await expect(recovering.recover(current.moduleJobId)).resolves.toMatchObject({
