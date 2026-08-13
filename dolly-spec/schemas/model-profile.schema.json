@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/model-profile.schema.json",
+  "title": "Resolved ModelProfileRevision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "profile_id", "revision", "provider_adapter", "provider_model",
+    "endpoint", "credential_ref", "context_window_tokens",
+    "max_output_tokens", "safety_margin_tokens", "tokenizer",
+    "input_modalities", "output_modalities", "tool_calling",
+    "parallel_tool_calls", "structured_output", "reasoning", "streaming",
+    "image_coordinates", "pricing_revision", "enabled", "adapter_options"
+  ],
+  "properties": {
+    "profile_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "provider_adapter": { "$ref": "common.schema.json#/$defs/StableId" },
+    "provider_model": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "endpoint": { "type": "string", "format": "uri", "pattern": "^https://", "maxLength": 2048 },
+    "credential_ref": { "$ref": "common.schema.json#/$defs/SecretRef" },
+    "context_window_tokens": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        { "type": "null" }
+      ]
+    },
+    "max_output_tokens": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "safety_margin_tokens": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "tokenizer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "revision"],
+      "properties": {
+        "kind": { "enum": ["named", "provider_remote", "conservative_bound"] },
+        "id": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "revision": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "input_modalities": {
+      "type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true,
+      "items": { "enum": ["text", "image", "audio", "video", "file"] }
+    },
+    "output_modalities": {
+      "type": "array", "minItems": 1, "maxItems": 5, "uniqueItems": true,
+      "items": { "enum": ["text", "image", "audio", "video", "file"] }
+    },
+    "tool_calling": { "enum": ["supported", "unsupported", "unknown"] },
+    "parallel_tool_calls": { "enum": ["supported", "unsupported", "unknown"] },
+    "structured_output": { "enum": ["json_schema", "json_object", "unsupported", "unknown"] },
+    "reasoning": { "enum": ["provider_managed", "visible", "unsupported", "unknown"] },
+    "streaming": { "enum": ["supported", "unsupported", "unknown"] },
+    "image_coordinates": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/StableId" },
+        { "type": "null" }
+      ]
+    },
+    "pricing_revision": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "enabled": { "type": "boolean" },
+    "adapter_options": { "type": "object", "maxProperties": 128 }
+  }
+}

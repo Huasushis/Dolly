@@ -1,0 +1,33 @@
+{
+  "schema": "dolly.test-fixture/v1",
+  "fixture_id": "activation-result-staged-two-durable-pages",
+  "kind": "logical_state",
+  "value": {
+    "instance_id": "test",
+    "active_config_revision": 1,
+    "active_graph_revision": 1,
+    "next_commit_seq": 40,
+    "module": {"module_id": "worker", "lifecycle_state": "waiting", "nonterminal_activation_id": "0198ab31-6c44-7e8a-b2bb-000000000201"},
+    "input_subscription": {"page_id": "input", "module_id": "worker", "cursor": 7},
+    "output_pages": {
+      "out-a": {"mode": "durable", "next_page_seq": 3, "deliveries": []},
+      "out-b": {"mode": "durable", "next_page_seq": 5, "deliveries": []}
+    },
+    "activation": {
+      "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000201",
+      "state": "result_staged",
+      "manifest_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "result_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "cursor_span": {"page_id": "input", "from_page_seq": 7, "to_page_seq": 8},
+      "output_page_ids": ["out-a", "out-b"],
+      "staged_output": {
+        "schema": "dolly.block-draft/v1",
+        "description": "",
+        "parts": [{"kind": "text", "text": "done", "format": "plain"}],
+        "actions": [],
+        "metadata": {},
+        "hints": {}
+      }
+    }
+  }
+}

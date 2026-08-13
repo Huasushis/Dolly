@@ -1,0 +1,23 @@
+{
+  "schema": "dolly.test-fixture/v1",
+  "fixture_id": "research-hint-registration-set",
+  "kind": "research_hint_registration_set",
+  "value": [
+    {
+      "schema": "dolly.research-hint-registration/v1",
+      "registration_id": "tensity-context-registration-v1",
+      "hint_name": "org.dolly.research.tensity",
+      "envelope_version": 1,
+      "payload_schema_uri": "urn:dolly:research-hint:tensity:1",
+      "payload_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "experiment_id": "tensity-context-v1",
+      "plan_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "producer_modules": ["main-brain"],
+      "consumer_modules": ["main-brain"],
+      "graph_revision": 7,
+      "config_revision": 11,
+      "enabled": true,
+      "expires_at": "2026-08-17T18:30:00.000000Z"
+    }
+  ]
+}

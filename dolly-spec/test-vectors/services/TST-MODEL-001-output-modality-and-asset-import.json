@@ -1,0 +1,54 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-MODEL-001",
+  "kind": "service",
+  "covers": ["REQ-MODEL-003", "REQ-ASSET-001", "REQ-LLM-003"],
+  "initial": {
+    "authenticated_module_id": "main-brain",
+    "request_id": "0198ab31-6c44-7e8a-b2bb-000000000401",
+    "requested_output_modalities": ["text", "image"],
+    "profile_output_modalities": ["text", "image"],
+    "granted_output_modalities": ["text", "image"],
+    "max_output_asset_bytes": 4096,
+    "provider_output": [
+      {"kind": "text", "text": "rendered"},
+      {
+        "kind": "typed_media",
+        "source_kind": "temporary_url",
+        "declared_media_type": "image/png",
+        "temporary_url": "https://media.example.invalid/short-lived-token"
+      }
+    ],
+    "model_operation_state": "PROVIDER_COMPLETE",
+    "output_import_bindings": []
+  },
+  "stimulus": {
+    "events": [
+      "normalize_provider_occurrences",
+      "persist_output_binding_for_ordinal_1",
+      "asset_import_accepted",
+      "asset_import_available_with_sniffed_image_png_and_2048_bytes",
+      "commit_model_response"
+    ]
+  },
+  "expected": {
+    "outcome": "available_asset_then_successful_subset_response",
+    "assertions": [
+      {"path": "/provider_dispatch_count", "op": "equals", "value": 1},
+      {"path": "/output_import_bindings/0/request_id", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000401"},
+      {"path": "/output_import_bindings/0/ordinal", "op": "equals", "value": 1},
+      {"path": "/output_import_bindings/0/import_id", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000402"},
+      {"path": "/asset_status/state", "op": "equals", "value": "available"},
+      {"path": "/asset_status/asset/media_type", "op": "equals", "value": "image/png"},
+      {"path": "/asset_status/asset/byte_length", "op": "equals", "value": 2048},
+      {"path": "/response/output_parts/1/kind", "op": "equals", "value": "asset"},
+      {"path": "/response/output_parts/1/media_type", "op": "equals", "value": "image/png"},
+      {"path": "/response/temporary_url", "op": "absent"},
+      {"path": "/response/provider_bytes", "op": "absent"},
+      {"path": "/actual_modalities_are_requested_subset", "op": "equals", "value": true},
+      {"path": "/model_status/state", "op": "equals", "value": "succeeded"}
+    ],
+    "emitted": [],
+    "crash_label": null
+  }
+}

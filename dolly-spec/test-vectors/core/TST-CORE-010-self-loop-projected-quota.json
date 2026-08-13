@@ -1,0 +1,60 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-010",
+  "kind": "core_transition",
+  "covers": ["REQ-PAGE-001", "INV-PAGELOG-012", "INV-RAM-017"],
+  "initial": {
+    "page": {
+      "page_id": "loop",
+      "durability": "durable",
+      "next_page_seq": 2,
+      "quota": {"max_entries": 1, "max_bytes": 1048576},
+      "deliveries": [{"page_seq": 1, "canonical_block_bytes": 128}],
+      "subscriptions": [{"module_id": "worker", "cursor": 1}]
+    },
+    "activation": {
+      "module_id": "worker",
+      "state": "result_staged",
+      "cursor_span": {"page_id": "loop", "from_page_seq": 1, "to_page_seq": 2},
+      "output_page_ids": ["loop"],
+      "candidate_output_canonical_bytes": 128
+    },
+    "lagging_subscriber_control": {
+      "page": {
+        "page_id": "loop-control",
+        "durability": "durable",
+        "next_page_seq": 2,
+        "quota": {"max_entries": 1, "max_bytes": 1048576},
+        "deliveries": [{"page_seq": 1, "canonical_block_bytes": 128}],
+        "subscriptions": [
+          {"module_id": "worker", "cursor": 1},
+          {"module_id": "observer", "cursor": 1}
+        ]
+      },
+      "activation": {
+        "module_id": "worker",
+        "state": "result_staged",
+        "cursor_span": {"page_id": "loop-control", "from_page_seq": 1, "to_page_seq": 2},
+        "output_page_ids": ["loop-control"],
+        "candidate_output_canonical_bytes": 128
+      }
+    }
+  },
+  "stimulus": {"commands": ["ApplyResult(primary)", "ApplyResult(lagging_subscriber_control)"]},
+  "expected": {
+    "outcome": "committed_with_projected_pending_count_one",
+    "assertions": [
+      {"path": "/activation/state", "op": "equals", "value": "committed"},
+      {"path": "/page/subscriptions/0/cursor", "op": "equals", "value": 2},
+      {"path": "/page/next_page_seq", "op": "equals", "value": 3},
+      {"path": "/page/projected_admission_entries", "op": "equals", "value": 1},
+      {"path": "/page/pending_deliveries/0/page_seq", "op": "equals", "value": 2},
+      {"path": "/lagging_subscriber_control/activation/state", "op": "equals", "value": "commit_blocked"},
+      {"path": "/lagging_subscriber_control/page/projected_admission_entries", "op": "equals", "value": 2},
+      {"path": "/lagging_subscriber_control/page/subscriptions/1/cursor", "op": "equals", "value": 1},
+      {"path": "/lagging_subscriber_control/page/next_page_seq", "op": "equals", "value": 2}
+    ],
+    "emitted": [{"event": "ActivationCommitted"}],
+    "crash_label": null
+  }
+}

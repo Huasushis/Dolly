@@ -1,0 +1,29 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-PROTO-002",
+  "kind": "protocol",
+  "covers": ["REQ-XRPC-001", "INV-XRPC-001"],
+  "initial": {
+    "frame_depth_limit": 96,
+    "semantic_payload_depth_limit": 64,
+    "depth_rule": "top-level-container-is-one"
+  },
+  "stimulus": {
+    "frames": [
+      {"case": "wrapped-valid-block", "frame_depth": 72, "semantic_block_depth": 64},
+      {"case": "too-deep-frame", "frame_depth": 97, "semantic_payload_depth": 1}
+    ]
+  },
+  "expected": {
+    "outcome": "independent_frame_and_semantic_limits",
+    "assertions": [
+      {"path": "/cases/wrapped-valid-block/accepted", "op": "equals", "value": true},
+      {"path": "/cases/wrapped-valid-block/error", "op": "absent"},
+      {"path": "/cases/too-deep-frame/accepted", "op": "equals", "value": false},
+      {"path": "/cases/too-deep-frame/error/code", "op": "equals", "value": "frame_too_deep"},
+      {"path": "/connection/reusable_after_frame_rejection", "op": "equals", "value": false}
+    ],
+    "emitted": [],
+    "crash_label": null
+  }
+}

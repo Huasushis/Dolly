@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/tool-broker-config.schema.json",
+  "title": "Resolved Host tool-broker configuration",
+  "$defs": {
+    "SchemaDocument": {"oneOf": [{"type": "object"}, {"type": "boolean"}]},
+    "InputSchemaDocument": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {"type": {"const": "object"}}
+    },
+    "IdempotencyPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {"kind": {"const": "none"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "argument_pointer"],
+          "properties": {
+            "kind": {"const": "argument_key"},
+            "argument_pointer": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "pattern": "^(?:/(?:[^~/]|~[01])*)+$"
+            }
+          }
+        }
+      ]
+    },
+    "Limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startup_timeout_ms", "request_timeout_ms", "max_concurrency", "max_request_bytes", "max_response_bytes"],
+      "properties": {
+        "startup_timeout_ms": {"type": "integer", "minimum": 100, "maximum": 300000},
+        "request_timeout_ms": {"type": "integer", "minimum": 100, "maximum": 3600000},
+        "max_concurrency": {"type": "integer", "minimum": 1, "maximum": 1024},
+        "max_request_bytes": {"type": "integer", "minimum": 1024, "maximum": 67108864},
+        "max_response_bytes": {"type": "integer", "minimum": 1024, "maximum": 67108864}
+      }
+    },
+    "StdioTransport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "package_id", "package_version", "package_digest",
+        "executable", "executable_digest", "args", "secret_bindings"
+      ],
+      "properties": {
+        "kind": {"const": "stdio"},
+        "package_id": {"$ref": "common.schema.json#/$defs/ExtensionId"},
+        "package_version": {"type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"},
+        "package_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "executable": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "^(?!.*(?:^|/)\\.\\.?(?:/|$))[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$"},
+        "executable_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "args": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 4096}},
+        "secret_bindings": {
+          "type": "object",
+          "maxProperties": 32,
+          "propertyNames": {"pattern": "^[A-Z][A-Z0-9_]{0,63}$"},
+          "additionalProperties": {"$ref": "common.schema.json#/$defs/SecretRef"}
+        }
+      }
+    },
+    "HttpTransport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "endpoint", "credential_ref", "tls_spki_sha256"],
+      "properties": {
+        "kind": {"const": "streamable_http"},
+        "endpoint": {"type": "string", "format": "uri", "pattern": "^https://", "minLength": 9, "maxLength": 2048},
+        "credential_ref": {"oneOf": [{"$ref": "common.schema.json#/$defs/SecretRef"}, {"type": "null"}]},
+        "tls_spki_sha256": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/Sha256"}}
+      }
+    },
+    "Tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["upstream_name", "description", "input_schema", "input_schema_digest", "output_schema", "output_schema_digest", "side_effect_class", "idempotency", "requires_confirmation", "enabled"],
+      "properties": {
+        "upstream_name": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[ -~]+$"},
+        "description": {"type": "string", "maxLength": 4096},
+        "input_schema": {"$ref": "#/$defs/InputSchemaDocument"},
+        "input_schema_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "output_schema": {"$ref": "#/$defs/SchemaDocument"},
+        "output_schema_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "side_effect_class": {"enum": ["read_only", "idempotent_write", "non_idempotent_write", "unknown"]},
+        "idempotency": {"$ref": "#/$defs/IdempotencyPolicy"},
+        "requires_confirmation": {"type": "boolean"},
+        "enabled": {"type": "boolean"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"side_effect_class": {"const": "idempotent_write"}}, "required": ["side_effect_class"]},
+          "then": {"properties": {"idempotency": {"type": "object", "properties": {"kind": {"const": "argument_key"}}, "required": ["kind"]}}},
+          "else": {"properties": {"idempotency": {"type": "object", "properties": {"kind": {"const": "none"}}, "required": ["kind"]}}}
+        }
+      ]
+    },
+    "Server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "adapter", "protocol_version", "transport", "allowed_modules", "limits", "tools"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "adapter": {"const": "mcp"},
+        "protocol_version": {"const": "2025-06-18"},
+        "transport": {"oneOf": [{"$ref": "#/$defs/StdioTransport"}, {"$ref": "#/$defs/HttpTransport"}]},
+        "allowed_modules": {"type": "array", "maxItems": 4096, "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/StableId"}},
+        "limits": {"$ref": "#/$defs/Limits"},
+        "tools": {
+          "type": "object",
+          "maxProperties": 4096,
+          "propertyNames": {"$ref": "common.schema.json#/$defs/StableId"},
+          "additionalProperties": {"$ref": "#/$defs/Tool"}
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "servers"],
+  "properties": {
+    "schema": {"const": "dolly.tool-broker-config/v1"},
+    "servers": {
+      "type": "object",
+      "maxProperties": 1024,
+      "propertyNames": {"$ref": "common.schema.json#/$defs/StableId"},
+      "additionalProperties": {"$ref": "#/$defs/Server"}
+    }
+  }
+}

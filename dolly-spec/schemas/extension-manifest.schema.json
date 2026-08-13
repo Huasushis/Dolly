@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/extension-manifest.schema.json",
+  "title": "Dolly Extension Manifest",
+  "$defs": {
+    "ConfigSchemaBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "schema_digest"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "uri",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[^?#]+$"
+        },
+        "schema_digest": {"$ref": "common.schema.json#/$defs/Sha256"}
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_version", "extension_id", "extension_version", "publisher",
+    "protocol", "hosting", "executables", "module_types", "requested_capabilities",
+    "config_schema", "state_schemas"
+  ],
+  "properties": {
+    "manifest_version": { "const": 1 },
+    "extension_id": { "$ref": "common.schema.json#/$defs/ExtensionId" },
+    "extension_version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"
+    },
+    "publisher": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "min_minor", "max_minor"],
+      "properties": {
+        "major": { "const": 1 },
+        "min_minor": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "max_minor": { "type": "integer", "minimum": 0, "maximum": 65535 }
+      }
+    },
+    "hosting": { "enum": ["per_extension", "per_module"] },
+    "executables": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 16,
+      "propertyNames": {
+        "pattern": "^(linux|windows|macos)-(x86_64|aarch64)$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "sha256": { "$ref": "common.schema.json#/$defs/Sha256" }
+        }
+      }
+    },
+    "module_types": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 128,
+      "propertyNames": { "$ref": "common.schema.json#/$defs/StableId" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["display_name", "descriptor_template", "config_schema"],
+        "properties": {
+          "display_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "descriptor_template": { "$ref": "module-descriptor.schema.json#/$defs/Template" },
+          "config_schema": { "$ref": "#/$defs/ConfigSchemaBinding" }
+        }
+      }
+    },
+    "requested_capabilities": {
+      "type": "array",
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": { "$ref": "common.schema.json#/$defs/QualifiedName" }
+    },
+    "config_schema": { "$ref": "#/$defs/ConfigSchemaBinding" },
+    "state_schemas": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": { "type": "integer", "minimum": 1, "maximum": 65535 }
+    }
+  }
+}

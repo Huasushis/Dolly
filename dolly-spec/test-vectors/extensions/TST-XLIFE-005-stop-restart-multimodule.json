@@ -1,0 +1,45 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-XLIFE-005",
+  "kind": "crash_recovery",
+  "covers": ["INV-XLIFE-005", "REQ-XLIFE-002"],
+  "initial": {
+    "extension_generation": 7,
+    "intent": "run",
+    "modules": {
+      "memory-a": {
+        "state": "Ready",
+        "storage_scope_id": "0198ab31-6c44-7e8a-b2bb-000000000441"
+      },
+      "memory-b": {
+        "state": "Ready",
+        "storage_scope_id": "0198ab31-6c44-7e8a-b2bb-000000000442"
+      }
+    }
+  },
+  "stimulus": {
+    "command": "planned_shutdown_then_restart",
+    "shutdown_delivery": "parallel",
+    "fault": "memory-b-shutdown-response-lost-and-status-unknown",
+    "crash_after": "extension-shutdown-response-before-process-exit"
+  },
+  "expected": {
+    "outcome": "module_barrier_then_fenced_restart_under_same_scopes",
+    "assertions": [
+      {"path": "/ordering/module_shutdown_started_before_extension_shutdown", "op": "equals", "value": true},
+      {"path": "/ordering/independent_module_shutdowns_parallel", "op": "equals", "value": true},
+      {"path": "/before_kill/memory-a/state", "op": "equals", "value": "Stopped"},
+      {"path": "/before_kill/memory-b/state", "op": "equals", "value": "Failed"},
+      {"path": "/restart/extension_generation", "op": "equals", "value": 8},
+      {"path": "/restart/memory-a/storage_scope_id", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000441"},
+      {"path": "/restart/memory-b/storage_scope_id", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000442"},
+      {"path": "/restart/instantiate_operation_ids_are_fresh", "op": "equals", "value": true},
+      {"path": "/restart/ordinary_restore_called", "op": "equals", "value": false}
+    ],
+    "emitted": [
+      {"kind": "audit", "event": "module_shutdown_unknown"},
+      {"kind": "audit", "event": "extension_generation_restarted"}
+    ],
+    "crash_label": "CP-XLIFE-MULTIMODULE-AFTER-EXTENSION-SHUTDOWN-RESPONSE"
+  }
+}

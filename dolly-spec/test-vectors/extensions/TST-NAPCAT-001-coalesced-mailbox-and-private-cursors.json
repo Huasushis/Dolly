@@ -1,0 +1,70 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-NAPCAT-001",
+  "kind": "extension",
+  "covers": ["REQ-NAPCAT-001", "REQ-NAPCAT-003", "REQ-NAPCAT-006"],
+  "initial": {
+    "hub": {
+      "account_ref": "qq-main",
+      "host_account_principal": "qq-principal-main",
+      "actual_self_id": "123456789",
+      "journal_cursor": "1041"
+    },
+    "facades": {
+      "facade-a": {
+        "consumer_principal": {"instance_id": "main", "module_id": "agent-a"},
+        "private_result_page_id": "qq-a-results",
+        "private_notification_page_id": "qq-a-hints",
+        "read_cursor": "1041",
+        "ack_cursor": "1041"
+      },
+      "facade-b": {
+        "consumer_principal": {"instance_id": "main", "module_id": "agent-b"},
+        "private_result_page_id": "qq-b-results",
+        "private_notification_page_id": "qq-b-hints",
+        "read_cursor": "1041",
+        "ack_cursor": "1041"
+      }
+    },
+    "premise_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "stimulus": {
+    "command": "journal_47_events_coalesce_private_hints_then_pull",
+    "events": {"from": "1042", "to": "1088", "conversations": 3, "messages": 47, "mentions": 1, "requests": 0},
+    "request_block_producer": {"kind": "module", "instance_id": "main", "module_id": "agent-a"},
+    "target_facade": "facade-a",
+    "read_limit": 20,
+    "ack_through": "1061"
+  },
+  "expected": {
+    "outcome": "content_free_private_hints_and_principal_scoped_pull",
+    "assertions": [
+      {"path": "/hub/journal/events", "op": "count", "value": 47},
+      {"path": "/pages/qq-a-hints/blocks", "op": "count", "value": 1},
+      {"path": "/pages/qq-b-hints/blocks", "op": "count", "value": 1},
+      {"path": "/pages/public/raw_event_blocks", "op": "count", "value": 0},
+      {"path": "/hints/0/payload/schema", "op": "equals", "value": "dolly.napcatqq-mailbox-changed/v1"},
+      {"path": "/hints/0/payload/kind", "op": "equals", "value": "qq_mailbox_changed"},
+      {"path": "/hints/0/payload/account_ref", "op": "absent"},
+      {"path": "/hints/0/payload/cursor_from", "op": "absent"},
+      {"path": "/hints/0/payload/message_count", "op": "absent"},
+      {"path": "/hints/0/payload/gap", "op": "absent"},
+      {"path": "/hints/0/block/parts", "op": "count", "value": 1},
+      {"path": "/hints/0/block/actions", "op": "count", "value": 0},
+      {"path": "/hints/0/block/description", "op": "absent"},
+      {"path": "/hints/0/block/metadata", "op": "absent"},
+      {"path": "/hints/0/block/hints", "op": "absent"},
+      {"path": "/facades/facade-a/ack_cursor", "op": "equals", "value": "1061"},
+      {"path": "/facades/facade-b/ack_cursor", "op": "equals", "value": "1041"},
+      {"path": "/pages/qq-a-results/subscribers", "op": "equals", "value": [{"instance_id": "main", "module_id": "agent-a"}]},
+      {"path": "/pages/qq-b-results/subscribers", "op": "equals", "value": [{"instance_id": "main", "module_id": "agent-b"}]},
+      {"path": "/qq_upstream_mark_read_calls", "op": "count", "value": 0},
+      {"path": "/premise_digest", "op": "unchanged"}
+    ],
+    "emitted": [
+      {"page_id": "qq-a-hints", "block": {"schema": "dolly.block-draft/v1", "parts": [{"kind": "json", "schema_uri": "https://dolly.example/spec/0.1/schemas/napcatqq-mailbox-changed.schema.json", "value": {"schema": "dolly.napcatqq-mailbox-changed/v1", "kind": "qq_mailbox_changed"}}], "actions": []}},
+      {"page_id": "qq-b-hints", "block": {"schema": "dolly.block-draft/v1", "parts": [{"kind": "json", "schema_uri": "https://dolly.example/spec/0.1/schemas/napcatqq-mailbox-changed.schema.json", "value": {"schema": "dolly.napcatqq-mailbox-changed/v1", "kind": "qq_mailbox_changed"}}], "actions": []}}
+    ],
+    "crash_label": null
+  }
+}

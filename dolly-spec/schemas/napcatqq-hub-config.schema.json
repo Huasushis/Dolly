@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/napcatqq-hub-config.schema.json",
+  "title": "NapCatQQ shared-hub resolved Module configuration",
+  "$comment": "The napcat-onebot-v11-hub Module type MUST bind this whole root. Host profile admission additionally checks per_extension placement, graph/ingress scopes, daemon ownership, and parsed endpoint/network policy.",
+  "$ref": "napcatqq-config.schema.json#/$defs/HubConfig"
+}

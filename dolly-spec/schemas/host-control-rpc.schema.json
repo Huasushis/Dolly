@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/host-control-rpc.schema.json",
+  "title": "Consolidated Host scheduling and configuration-control RPC contracts",
+  "$comment": "This catalog container is not a value schema. Callers MUST select one exact $defs fragment.",
+  "not": {},
+  "$defs": {
+    "RequestActivationParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "module_id", "reason", "coalesce_key", "not_before", "deadline"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "reason": { "enum": ["background_ready", "timer", "external_event", "manual_followup"] },
+        "coalesce_key": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[ -~]+$" },
+        "not_before": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/Timestamp" },
+            { "type": "null" }
+          ]
+        },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "RequestActivationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "state", "activation_request_id", "activation_id", "next_eligible_at"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "state": { "enum": ["scheduled", "coalesced"] },
+        "activation_request_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "activation_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/UuidV7" },
+            { "type": "null" }
+          ]
+        },
+        "next_eligible_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "RequestWakeupParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "module_id", "idempotency_key", "not_before", "expires_at",
+        "reason", "replacement_policy", "deadline"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[ -~]+$" },
+        "not_before": { "$ref": "common.schema.json#/$defs/Timestamp" },
+        "expires_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "replacement_policy": { "enum": ["keep_existing", "keep_earliest", "replace"] },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "RequestWakeupResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "wakeup_id", "state", "not_before", "expires_at"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "wakeup_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "state": { "enum": ["scheduled", "coalesced", "unchanged"] },
+        "not_before": { "$ref": "common.schema.json#/$defs/Timestamp" },
+        "expires_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ConfigProposeResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "proposal_id", "state", "base_revision", "recorded_at"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "proposal_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "state": { "enum": ["recorded", "approval_required"] },
+        "base_revision": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "recorded_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    }
+  }
+}

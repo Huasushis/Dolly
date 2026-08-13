@@ -1,0 +1,45 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-MODEL-002",
+  "kind": "crash_recovery",
+  "covers": ["REQ-MODEL-003", "REQ-ASSET-001", "REQ-FAIL-001"],
+  "initial": {
+    "authenticated_module_id": "main-brain",
+    "request_id": "0198ab31-6c44-7e8a-b2bb-000000000403",
+    "provider_dispatch_count": 1,
+    "provider_result_skeleton_durable": true,
+    "output_order": ["text", "asset"],
+    "binding": {
+      "ordinal": 1,
+      "import_id": "0198ab31-6c44-7e8a-b2bb-000000000404"
+    },
+    "asset_import_state": "acquiring",
+    "model_operation_state": "running"
+  },
+  "stimulus": {
+    "events": [
+      "kill_gateway_after_asset_acquisition_started",
+      "restart_gateway",
+      "query_same_asset_import_id",
+      "recover_complete_staging_object_to_available",
+      "commit_original_model_response"
+    ]
+  },
+  "expected": {
+    "outcome": "same_import_reconciled_without_provider_redispatch",
+    "assertions": [
+      {"path": "/request_id", "op": "unchanged"},
+      {"path": "/binding/import_id", "op": "unchanged"},
+      {"path": "/binding/ordinal", "op": "equals", "value": 1},
+      {"path": "/provider_dispatch_count", "op": "equals", "value": 1},
+      {"path": "/asset_import_count", "op": "equals", "value": 1},
+      {"path": "/status_before_available/state", "op": "equals", "value": "running"},
+      {"path": "/status_before_available/result", "op": "equals", "value": null},
+      {"path": "/asset_import_state", "op": "equals", "value": "available"},
+      {"path": "/model_operation_state", "op": "equals", "value": "succeeded"},
+      {"path": "/response/output_parts/1/kind", "op": "equals", "value": "asset"}
+    ],
+    "emitted": [],
+    "crash_label": "model_output_import_after_acquiring"
+  }
+}

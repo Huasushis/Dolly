@@ -1,0 +1,53 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-TOOL-003",
+  "kind": "service",
+  "covers": ["REQ-TOOL-001", "REQ-TOOL-003"],
+  "initial": {
+    "original_operation_id": "0198ab31-6c44-7e8a-b2bb-000000000342",
+    "original_request_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "original_operation_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "original_ledger_state": "FAILED",
+    "original_result": {
+      "status": "failed",
+      "error": {
+        "code": "TOOL_UPSTREAM_NOT_APPLIED",
+        "retryable": false,
+        "outcome": "not_applied"
+      }
+    },
+    "server_state": "Ready"
+  },
+  "stimulus": {
+    "events": [
+      "repeat_original_identity",
+      "reuse_original_identity_with_different_digest",
+      "fresh_authorization_with_new_operation_id"
+    ],
+    "conflicting_request_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "fresh_operation_id": "0198ab31-6c44-7e8a-b2bb-000000000343"
+  },
+  "expected": {
+    "outcome": "original_terminal_result_replayed_and_fresh_operation_separate",
+    "assertions": [
+      {"path": "/original_operation_id", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000342"},
+      {"path": "/original_request_digest", "op": "equals", "value": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+      {"path": "/original_operation_digest", "op": "equals", "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      {"path": "/original_ledger_state", "op": "equals", "value": "FAILED"},
+      {"path": "/original_row_mutation_count", "op": "equals", "value": 0},
+      {"path": "/original_same_identity_dispatch_count", "op": "equals", "value": 0},
+      {"path": "/original_result/error/retryable", "op": "equals", "value": false},
+      {"path": "/conflicting_attempt/result/error/code", "op": "equals", "value": "TOOL_IDEMPOTENCY_CONFLICT"},
+      {"path": "/conflicting_attempt/result/error/outcome", "op": "equals", "value": "not_applied"},
+      {"path": "/fresh_operation_id", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000343"},
+      {"path": "/fresh_ledger_state", "op": "equals", "value": "AUTHORIZED"}
+    ],
+    "emitted": [
+      {
+        "event": "ToolOperationAuthorized",
+        "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000343"
+      }
+    ],
+    "crash_label": null
+  }
+}

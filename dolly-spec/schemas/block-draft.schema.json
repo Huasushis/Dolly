@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/block-draft.schema.json",
+  "title": "BlockDraft",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "parts", "actions"],
+  "properties": {
+    "schema": { "const": "dolly.block-draft/v1" },
+    "description": { "type": "string", "maxLength": 4096 },
+    "parts": {
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "common.schema.json#/$defs/Part" }
+    },
+    "actions": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "$ref": "common.schema.json#/$defs/ActionDraft" }
+    },
+    "metadata": { "$ref": "common.schema.json#/$defs/Metadata" },
+    "hints": { "$ref": "common.schema.json#/$defs/Hints" }
+  }
+}
+

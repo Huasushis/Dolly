@@ -1,0 +1,37 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-006",
+  "kind": "crash_recovery",
+  "covers": ["INV-ACTIVATION-009", "INV-RAM-012", "INV-RAM-013"],
+  "initial": {
+    "activation_state": "leased",
+    "attempt": 1,
+    "frozen_replay_contract": {"mode": "never_auto_retry", "evidence": "none", "ledger": null},
+    "last_dispatch": {
+      "state": "started",
+      "transport_started": true,
+      "frame_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "cursor": 7,
+    "module_execution_slot": "attempt-1"
+  },
+  "stimulus": {
+    "command": "FenceComplete",
+    "reason": "process_exit_without_result",
+    "host_fence_evidence_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "expected": {
+    "outcome": "ACTIVATION_REPLAY_NOT_AUTHORIZED",
+    "assertions": [
+      {"path": "/activation/state", "op": "equals", "value": "quarantined"},
+      {"path": "/activation/next_attempt_authorization", "op": "absent"},
+      {"path": "/activation/last_dispatch/state", "op": "equals", "value": "fenced"},
+      {"path": "/module/execution_slot", "op": "absent"},
+      {"path": "/subscription/cursor", "op": "equals", "value": 7}
+    ],
+    "emitted": [
+      {"event": "ModuleQuarantined", "reason": "ACTIVATION_REPLAY_NOT_AUTHORIZED"}
+    ],
+    "crash_label": "CP-05"
+  }
+}

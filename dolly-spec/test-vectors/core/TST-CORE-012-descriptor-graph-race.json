@@ -1,0 +1,32 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-012",
+  "kind": "core_transition",
+  "covers": ["REQ-DESC-003", "INV-DESC-007", "INV-CFG-002"],
+  "initial": {
+    "active_graph": {
+      "graph_revision": 7,
+      "module_descriptor_revision": 9,
+      "module_descriptor_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+    },
+    "verified_inactive_descriptor": {
+      "descriptor_revision": 10,
+      "descriptor_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "stimulus": {
+    "commands": ["BeginBuildManifest", "InstallGraphRevision(8,descriptor_revision=10)", "CommitBuildManifest"],
+    "injection_point": "after_manifest_read_before_atomic_recheck"
+  },
+  "expected": {
+    "outcome": "stale_build_retried_against_complete_new_graph_tuple",
+    "assertions": [
+      {"path": "/manifest/graph_revision", "op": "equals", "value": 8},
+      {"path": "/manifest/module_descriptor_revision", "op": "equals", "value": 10},
+      {"path": "/manifest/module_descriptor_digest", "op": "equals", "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      {"path": "/manifests_with_graph_7_descriptor_10", "op": "count", "value": 0}
+    ],
+    "emitted": [{"event": "ManifestBuildCasRetry", "reason": "graph_or_descriptor_changed"}],
+    "crash_label": null
+  }
+}

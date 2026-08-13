@@ -1,0 +1,91 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-NAPCAT-003",
+  "kind": "config",
+  "covers": ["REQ-NAPCAT-003", "REQ-NAPCAT-005"],
+  "initial": {
+    "daemon_owner_registry": {},
+    "candidate_a": {
+      "extension_process": "channel-process-a",
+      "account_ref": "qq-main",
+      "host_account_principal": "qq-principal-main",
+      "expected_self_id": "123456789",
+      "actual_self_id": "123456789",
+      "endpoint": "ws://127.0.0.1:3001"
+    }
+  },
+  "stimulus": {
+    "commands": [
+      {"command": "activate_hub", "candidate": "candidate_a"},
+      {
+        "command": "prepare_alias_hub",
+        "extension_process": "channel-process-b",
+        "account_ref": "qq-alias",
+        "host_account_principal": "qq-principal-main",
+        "expected_self_id": "123456789",
+        "actual_self_id": "123456789",
+        "endpoint": "ws://127.0.0.1:4001"
+      },
+      {
+        "command": "prepare_cross_daemon_active_hub",
+        "host_account_principal": "qq-principal-main",
+        "actual_self_id": "123456789",
+        "claimed_external_lease": "lease-7"
+      },
+      {"command": "validate_endpoint", "value": "ws://user:secret@127.0.0.1:3001/?token=x#fragment"},
+      {"command": "validate_endpoint", "value": "ws://localhost:3001", "allow_non_loopback": false},
+      {
+        "command": "prepare_facade_graph",
+        "consumer_principal": {"instance_id": "main", "module_id": "agent-a"},
+        "private_result_page_subscribers": [
+          {"instance_id": "main", "module_id": "agent-a"},
+          {"instance_id": "main", "module_id": "agent-b"}
+        ]
+      },
+      {
+        "command": "prepare_alias_hub_after_authentication",
+        "account_ref": "qq-second-secret-record",
+        "host_account_principal": "qq-principal-alias-record",
+        "expected_self_id": "123456789",
+        "actual_self_id": "123456789"
+      },
+      {"command": "validate_endpoint", "value": "ws://127.1:3001", "allow_non_loopback": false},
+      {
+        "command": "prepare_facade_graph",
+        "consumer_principal": {"instance_id": "main", "module_id": "agent-a"},
+        "private_result_page_subscribers": [{"instance_id": "main", "module_id": "agent-a"}],
+        "module_output_pages": ["qq-a-results", "public-debug"]
+      },
+      {
+        "command": "prepare_facade_placement",
+        "manifest_hosting": "per_module",
+        "hub_process_cohort": "hub-process",
+        "facade_process_cohort": "facade-process"
+      },
+      {
+        "command": "prepare_facade_storage",
+        "hub_storage_scope_id": "scope-shared",
+        "facade_storage_scope_id": "scope-shared"
+      }
+    ]
+  },
+  "expected": {
+    "outcome": "daemon_owner_and_private_page_configuration_fail_closed",
+    "assertions": [
+      {"path": "/commands/0/outcome", "op": "equals", "value": "owner_granted"},
+      {"path": "/commands/1/error/code", "op": "equals", "value": "NAPCAT_DUPLICATE_ACCOUNT_OWNER"},
+      {"path": "/commands/2/error/code", "op": "equals", "value": "NAPCAT_CROSS_DAEMON_ACTIVE_WRITE_UNSUPPORTED"},
+      {"path": "/commands/3/error/code", "op": "equals", "value": "NAPCAT_ENDPOINT_URI_INVALID"},
+      {"path": "/commands/4/error/code", "op": "equals", "value": "NAPCAT_LOOPBACK_LITERAL_REQUIRED"},
+      {"path": "/commands/5/error/code", "op": "equals", "value": "NAPCAT_RESULT_PAGE_NOT_PRIVATE"},
+      {"path": "/commands/6/error/code", "op": "equals", "value": "NAPCAT_DUPLICATE_ACTUAL_SELF_OWNER"},
+      {"path": "/commands/7/error/code", "op": "equals", "value": "NAPCAT_LOOPBACK_LITERAL_REQUIRED"},
+      {"path": "/commands/8/error/code", "op": "equals", "value": "NAPCAT_FACADE_OUTPUT_NOT_EXACT"},
+      {"path": "/commands/9/error/code", "op": "equals", "value": "NAPCAT_PLACEMENT_NOT_PER_EXTENSION"},
+      {"path": "/commands/10/error/code", "op": "equals", "value": "NAPCAT_STORAGE_SCOPE_ALIAS"},
+      {"path": "/daemon_owner_registry/active_count", "op": "equals", "value": 1}
+    ],
+    "emitted": [],
+    "crash_label": null
+  }
+}

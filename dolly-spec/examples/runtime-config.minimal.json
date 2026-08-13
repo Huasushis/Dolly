@@ -1,0 +1,235 @@
+{
+  "api_version": "dolly.example/v1alpha1",
+  "kind": "DollyInstance",
+  "metadata": {
+    "instance_id": "personal",
+    "display_name": "Personal Dolly"
+  },
+  "spec": {
+    "pages": {
+      "assistant-output": {
+        "mode": "durable",
+        "new_subscription_start": "latest",
+        "retention": {"min_age_ms": 86400000, "max_age_ms": 2592000000},
+        "quota": {"max_entries": 100000, "max_bytes": 1073741824}
+      },
+      "channel-actions": {
+        "mode": "durable",
+        "new_subscription_start": "latest",
+        "retention": {"min_age_ms": 86400000, "max_age_ms": 2592000000},
+        "quota": {"max_entries": 100000, "max_bytes": 1073741824}
+      },
+      "user-input": {
+        "mode": "durable",
+        "new_subscription_start": "latest",
+        "retention": {"min_age_ms": 86400000, "max_age_ms": 2592000000},
+        "quota": {"max_entries": 100000, "max_bytes": 1073741824}
+      }
+    },
+    "extensions": {
+      "brain": {
+        "package": "org.dolly.llm",
+        "version": "0.1.0",
+        "hosting": "per_module",
+        "granted_capabilities": ["host.models.invoke", "host.tools.invoke", "host.activation.status"],
+        "config": {}
+      },
+      "channel": {
+        "package": "org.dolly.channel",
+        "version": "0.1.0",
+        "hosting": "per_module",
+        "granted_capabilities": ["host.assets.import", "host.ingress.submit", "host.activation.status"],
+        "config": {}
+      }
+    },
+    "modules": {
+      "main-brain": {
+        "extension": "brain",
+        "module_type": "llm",
+        "inputs": ["user-input"],
+        "outputs": ["assistant-output", "channel-actions"],
+        "activation": {
+          "debounce_ms": 25,
+          "max_wait_ms": 250,
+          "max_blocks": 128,
+          "max_occurrences": 512,
+          "max_input_bytes": 1048576,
+          "max_descriptor_bytes": 1048576,
+          "manifest_structural_reserve_bytes": 1048576,
+          "execution_timeout_ms": 120000,
+          "lease_grace_ms": 30000,
+          "fencing_grace_ms": 5000,
+          "max_attempts": 5,
+          "retry_base_ms": 500,
+          "retry_cap_ms": 30000
+        },
+        "descriptor": {
+          "schema": "dolly.module-descriptor/v1",
+          "module_id": "main-brain",
+          "descriptor_revision": 1,
+          "display_name": "Main brain",
+          "accepts": {"summary": "Conversation input and action results.", "part_kinds": ["text", "json", "asset", "block_ref"], "action_names": []},
+          "emits": {"summary": "Assistant content and targeted actions.", "part_kinds": ["text", "json", "asset", "block_ref"], "action_names": ["org.dolly.channel.send"]},
+          "actions": [],
+          "activation_replay_contract": {"mode": "never_auto_retry", "evidence": "none", "ledger": null},
+          "trust": "trusted",
+          "metadata": {}
+        },
+        "config": {"model_profile": "model-main"}
+      },
+      "web-channel": {
+        "extension": "channel",
+        "module_type": "channel",
+        "inputs": ["channel-actions"],
+        "outputs": ["user-input"],
+        "activation": {
+          "debounce_ms": 0,
+          "max_wait_ms": 100,
+          "max_blocks": 128,
+          "max_occurrences": 512,
+          "max_input_bytes": 1048576,
+          "max_descriptor_bytes": 1048576,
+          "manifest_structural_reserve_bytes": 1048576,
+          "execution_timeout_ms": 120000,
+          "lease_grace_ms": 30000,
+          "fencing_grace_ms": 5000,
+          "max_attempts": 5,
+          "retry_base_ms": 500,
+          "retry_cap_ms": 30000
+        },
+        "descriptor": {
+          "schema": "dolly.module-descriptor/v1",
+          "module_id": "web-channel",
+          "descriptor_revision": 1,
+          "display_name": "Web channel",
+          "accepts": {"summary": "Targeted outbound send actions.", "part_kinds": ["text", "json", "asset", "block_ref"], "action_names": ["org.dolly.channel.send"]},
+          "emits": {"summary": "Action results.", "part_kinds": ["json"], "action_names": []},
+          "actions": [
+            {
+              "name": "org.dolly.channel.send",
+              "arguments_schema": {
+                "uri": "schemas/channel-send.schema.json",
+              "schema_digest": "sha256:64fbd12a17d44adb095ff1886020231fabbbb1b29d15c6a5f6d099a1d2e750aa",
+                "semantic_validator": null
+              },
+              "result_schema": {
+                "uri": "schemas/channel-send-result.schema.json",
+              "schema_digest": "sha256:14edf90d6ac5a7082fafdd3bcfb5de311ebb92640e04235b98d247c19222b239",
+                "semantic_validator": {
+                  "id": "org.dolly.validator.channel-send-result",
+                  "revision": 1
+                }
+              },
+              "description": "Send bounded parts to the mapped session.",
+              "side_effect_class": "idempotent_write"
+            }
+          ],
+          "activation_replay_contract": {"mode": "fenced_replay", "evidence": "activation_ledger", "ledger": {"namespace": "org.dolly.channel.activation-ledger", "schema_version": "v1", "location": "module_state_directory"}},
+          "trust": "untrusted",
+          "metadata": {}
+        },
+        "config": {"transport": "web", "ingress_pages": ["user-input"]}
+      }
+    },
+    "limits": {
+      "max_block_bytes": 1048576,
+      "max_frame_bytes": 4194304,
+      "max_parts_per_block": 256,
+      "max_actions_per_block": 64,
+      "max_text_part_bytes": 262144,
+      "max_metadata_bytes": 65536,
+      "max_metadata_properties": 32,
+      "max_causal_parents": 256,
+      "max_root_traces_per_block": 16,
+      "max_hops": 64,
+      "max_trace_blocks": 4096,
+      "max_trace_bytes": 67108864,
+      "max_module_activations_per_root_trace": 256,
+      "activation_bucket_capacity": 60,
+      "activation_refill_millitokens_per_second": 1000,
+      "max_trace_age_ms": 86400000,
+      "max_pending_activations": 10000,
+      "max_json_nesting_depth": 64
+    },
+    "services": {
+      "asset": {
+        "local_root": "data/assets",
+        "max_encoded_bytes": 67108864,
+        "max_inline_base64_chars": 1048576,
+        "max_decoded_bytes": 268435456,
+        "max_image_pixels": 100000000,
+        "max_frames": 10000,
+        "max_redirects": 5,
+        "remote_fetch_timeout_ms": 30000,
+        "lease_max_ms": 600000,
+        "gc_grace_ms": 604800000,
+        "replica_retry": {"max_import_attempts": 5, "retry_base_ms": 1000, "retry_cap_ms": 60000},
+        "replica": {"enabled": false}
+      },
+      "model_gateway": {
+        "profiles": {
+          "model-main": {
+            "profile_id": "model-main",
+            "revision": 1,
+            "provider_adapter": "openai-compatible-v2",
+            "provider_model": "example-model",
+            "endpoint": "https://api.example.invalid/v1",
+            "credential_ref": "secret://provider/model-main",
+            "context_window_tokens": 131072,
+            "max_output_tokens": 8192,
+            "safety_margin_tokens": 1024,
+            "tokenizer": {"kind": "named", "id": "example-tokenizer", "revision": "2026-08"},
+            "input_modalities": ["text", "image"],
+            "output_modalities": ["text"],
+            "tool_calling": "supported",
+            "parallel_tool_calls": "unknown",
+            "structured_output": "json_schema",
+            "reasoning": "provider_managed",
+            "streaming": "supported",
+            "image_coordinates": "upright-normalized-v1",
+            "pricing_revision": "2026-08-01",
+            "enabled": true,
+            "adapter_options": {}
+          }
+        },
+        "rate_limits": [
+          {"scope": "profile", "profile_id": "model-main", "credential_ref": null, "max_requests_per_minute": 60, "max_tokens_per_minute": 1000000, "max_cost_microunits_per_day": 100000000, "max_concurrency": 4},
+          {"scope": "credential", "profile_id": null, "credential_ref": "secret://provider/model-main", "max_requests_per_minute": 60, "max_tokens_per_minute": 1000000, "max_cost_microunits_per_day": 100000000, "max_concurrency": 4}
+        ],
+        "max_concurrency": 8,
+        "queue_capacity": 128,
+        "default_deadline_ms": 120000,
+        "max_attempts": 3,
+        "retry_base_ms": 500,
+        "retry_cap_ms": 10000,
+        "request_record_retention_ms": 604800000
+      },
+      "tool_broker": {
+        "schema": "dolly.tool-broker-config/v1",
+        "servers": {}
+      },
+      "observability": {
+        "log_buffer_events": 10000,
+        "trace_buffer_events": 10000,
+        "error_reserve_events": 1000,
+        "exporter": {"kind": "disabled"},
+        "retention": {"logs_days": 14, "traces_days": 7, "metrics_days": 30, "audit_days": 365, "journal_days": 90, "payload_days": 0},
+        "access": {
+          "logs": ["org.dolly.admin.logs"],
+          "traces": ["org.dolly.admin.traces"],
+          "metrics": ["org.dolly.admin.metrics"],
+          "audit": ["org.dolly.admin.audit"],
+          "journal": ["org.dolly.admin.journal"],
+          "payload": ["org.dolly.admin.payload"]
+        },
+        "payload_logging": {"enabled": false}
+      }
+    },
+    "security": {
+      "admin_bind": "local_only",
+      "sandbox_policy": "required",
+      "allow_remote_assets": false
+    },
+    "feature_flags": {}
+  }
+}

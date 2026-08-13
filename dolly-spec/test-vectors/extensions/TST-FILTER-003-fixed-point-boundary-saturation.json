@@ -1,0 +1,34 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-FILTER-003",
+  "kind": "extension",
+  "covers": ["REQ-FILTER-001", "REQ-FILTER-002"],
+  "initial": {
+    "channel": "default",
+    "state_epoch": "baseline-v1",
+    "new_sample_weight_ppm": 7,
+    "bias_correction": true,
+    "internal_scale": 1000000,
+    "accumulator": 0,
+    "weight": 0
+  },
+  "stimulus": {
+    "command": "apply_constant_upper_boundary_sequence",
+    "score": 1000,
+    "observation_count": 17336
+  },
+  "expected": {
+    "outcome": "independent_rounding_overshoot_is_saturated_before_selection",
+    "assertions": [
+      {"path": "/raw/accumulator", "op": "equals", "value": 114278232},
+      {"path": "/raw/weight", "op": "equals", "value": 114221},
+      {"path": "/raw/corrected_score_q", "op": "equals", "value": 1000501064},
+      {"path": "/candidate/corrected_score_q", "op": "equals", "value": 1000000000},
+      {"path": "/output/normalized_score", "op": "equals", "value": 1000}
+    ],
+    "emitted": [
+      {"kind": "filter_signal", "channel": "default", "score": 1000}
+    ],
+    "crash_label": null
+  }
+}

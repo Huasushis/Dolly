@@ -1,0 +1,36 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-STATE-001",
+  "kind": "security",
+  "covers": ["REQ-XCAP-003", "INV-XCAP-004", "REQ-ID-005", "REQ-MEM-001"],
+  "initial": {
+    "physical_database": "one-host-brokered-database",
+    "modules": {
+      "memory-a": {"storage_scope_id": "0198ab31-6c44-7e8a-b2bb-000000000421", "tenant": null},
+      "memory-b": {"storage_scope_id": "0198ab31-6c44-7e8a-b2bb-000000000422", "tenant": null}
+    }
+  },
+  "stimulus": {
+    "command": "instantiate_write_restart_and_attempt_cross_scope_restore",
+    "remove_module_id": "memory-a",
+    "create_unrelated_with_requested_id": "memory-a"
+  },
+  "expected": {
+    "outcome": "logical_tenants_are_automatic_and_identity_cannot_be_reused",
+    "assertions": [
+      {"path": "/modules/memory-a/tenant_owner", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000421"},
+      {"path": "/modules/memory-b/tenant_owner", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000422"},
+      {"path": "/modules/memory-a/visible_memory-b_rows", "op": "count", "value": 0},
+      {"path": "/restart/memory-a/storage_scope_id", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000421"},
+      {"path": "/cross_scope_restore/error", "op": "equals", "value": "STATE_SCOPE_MISMATCH"},
+      {"path": "/unrelated_recreate/error", "op": "equals", "value": "CONFIG_ID_TOMBSTONED"},
+      {"path": "/database/raw_path_exposed", "op": "equals", "value": false}
+    ],
+    "emitted": [
+      {"kind": "audit", "event": "cross_scope_restore_rejected"},
+      {"kind": "audit", "event": "configured_id_reuse_rejected"}
+    ],
+    "crash_label": null
+  }
+}
+

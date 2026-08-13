@@ -1,0 +1,43 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-FILTER-002",
+  "kind": "extension",
+  "covers": ["REQ-FILTER-001", "REQ-FILTER-002", "REQ-FILTER-003"],
+  "initial": {
+    "tracked": {
+      "expert-a": {"corrected_score": 640, "observation_count": 4},
+      "expert-b": {"corrected_score": null, "observation_count": 0}
+    },
+    "manifest": [
+      {"source": "expert-a", "block_id": "0198ab31-6c44-7e8a-b2bb-000000000401", "pages": ["p1", "p2"], "signal": "missing", "actions": 1, "action_results": 1},
+      {"source": "expert-b", "block_id": "0198ab31-6c44-7e8a-b2bb-000000000402", "pages": ["p1"], "signal": "missing", "actions": 0, "action_results": 0},
+      {"source": "filter-main", "block_id": "0198ab31-6c44-7e8a-b2bb-000000000403", "pages": ["p1"], "signal": 500, "actions": 0, "action_results": 0}
+    ]
+  },
+  "stimulus": {
+    "command": "process_manifest_twice_across_crash_reconciliation",
+    "crash_after": "prepared_decision_fsync",
+    "host_activation_status": "committed"
+  },
+  "expected": {
+    "outcome": "missing_holds_never_seen_and_self_are_ignored_and_copy_is_inert",
+    "assertions": [
+      {"path": "/state/expert-a/corrected_score", "op": "equals", "value": 640},
+      {"path": "/state/expert-a/observation_count", "op": "equals", "value": 4},
+      {"path": "/candidates", "op": "equals", "value": ["expert-a"]},
+      {"path": "/observation_updates", "op": "count", "value": 0},
+      {"path": "/output/actions", "op": "count", "value": 0},
+      {"path": "/output/action_results", "op": "count", "value": 0},
+      {"path": "/output/copied_json_parts", "op": "count", "value": 0},
+      {"path": "/output/copied_metadata_namespaces", "op": "count", "value": 0},
+      {"path": "/output/foreign_filter_signals", "op": "count", "value": 0},
+      {"path": "/output/envelope_identity", "op": "absent"},
+      {"path": "/output/filter_signals_for_default", "op": "count", "value": 1},
+      {"path": "/recovery/prepared_decision_apply_count", "op": "equals", "value": 1}
+    ],
+    "emitted": [
+      {"kind": "new_block_draft", "source_module_id": "expert-a", "normalized_score": 640}
+    ],
+    "crash_label": "filter.prepared_decision.after_fsync"
+  }
+}

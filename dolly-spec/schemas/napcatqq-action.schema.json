@@ -1,0 +1,277 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/napcatqq-action.schema.json",
+  "title": "NapCatQQ consumer-facade Action argument catalog",
+  "x-dolly-action-arguments-validator": {
+    "id": "org.dolly.validator.napcatqq-action",
+    "revision": 1
+  },
+  "$comment": "This is a catalog container. Each fixed ActionContract selects one exact $defs fragment; the bound pure validator checks the fragment discriminator, view epoch form, frozen registry/sanitizer bindings, and effective output limits.",
+  "not": {},
+  "$defs": {
+    "Cursor": {"type": "string", "pattern": "^(0|[1-9][0-9]{0,18})$"},
+    "QqId": {"type": "string", "pattern": "^[0-9]{1,32}$"},
+    "OperationKey": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$", "maxLength": 128},
+    "ConversationRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"enum": ["private", "group"]},
+        "id": {"$ref": "#/$defs/QqId"}
+      }
+    },
+    "ViewRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["view_id", "expected_view_epoch"],
+      "properties": {
+        "view_id": {"$ref": "common.schema.json#/$defs/UuidV7"},
+        "expected_view_epoch": {"$ref": "common.schema.json#/$defs/Revision"}
+      }
+    },
+    "ConversationSelector": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["conversation"],
+          "properties": {"conversation": {"$ref": "#/$defs/ConversationRef"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["view"],
+          "properties": {"view": {"$ref": "#/$defs/ViewRef"}}
+        }
+      ]
+    },
+    "EventFilter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["conversations", "event_kinds", "mentions_only", "requests_only"],
+      "properties": {
+        "conversations": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/ConversationRef"}},
+        "event_kinds": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {"enum": ["message", "message_sent", "request", "notice", "meta", "gap"]}
+        },
+        "mentions_only": {"type": "boolean"},
+        "requests_only": {"type": "boolean"}
+      }
+    },
+    "OutboundPart": {
+      "$comment": "Outbound QQ text/media uses the ordinary Core Part algebra. In particular, an asset_id inside an ad-hoc JSON segment is not an Asset authorization or reachability edge.",
+      "allOf": [
+        {"$ref": "common.schema.json#/$defs/Part"},
+        {
+          "type": "object",
+          "properties": {
+            "kind": {"enum": ["text", "asset"]}
+          }
+        }
+      ]
+    },
+    "MailboxArgs": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "after_cursor", "filters", "limit", "max_bytes", "include_segments", "media_mode"],
+          "properties": {
+            "operation": {"enum": ["peek", "read"]},
+            "after_cursor": {"oneOf": [{"$ref": "#/$defs/Cursor"}, {"type": "null"}]},
+            "filters": {"$ref": "#/$defs/EventFilter"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10000},
+            "max_bytes": {"type": "integer", "minimum": 1024, "maximum": 16777216},
+            "include_segments": {"type": "boolean"},
+            "media_mode": {"const": "references_only"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "through_cursor"],
+          "properties": {
+            "operation": {"const": "ack"},
+            "through_cursor": {"$ref": "#/$defs/Cursor"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation"],
+          "properties": {"operation": {"const": "stats"}}
+        }
+      ]
+    },
+    "ConversationArgs": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "kind", "query", "cursor", "limit"],
+          "properties": {
+            "operation": {"const": "list"},
+            "kind": {"enum": ["private", "group", "all"]},
+            "query": {"type": "string", "maxLength": 512},
+            "cursor": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 512}, {"type": "null"}]},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "conversation", "view_id"],
+          "properties": {
+            "operation": {"const": "open"},
+            "conversation": {"$ref": "#/$defs/ConversationRef"},
+            "view_id": {"oneOf": [{"$ref": "common.schema.json#/$defs/UuidV7"}, {"type": "null"}]}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "view"],
+          "properties": {
+            "operation": {"const": "close"},
+            "view": {"$ref": "#/$defs/ViewRef"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "selector", "before_cursor", "query", "limit", "max_bytes", "media_mode"],
+          "properties": {
+            "operation": {"enum": ["history", "search"]},
+            "selector": {"$ref": "#/$defs/ConversationSelector"},
+            "before_cursor": {"oneOf": [{"$ref": "#/$defs/Cursor"}, {"type": "null"}]},
+            "query": {"type": "string", "maxLength": 4096},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10000},
+            "max_bytes": {"type": "integer", "minimum": 1024, "maximum": 16777216},
+            "media_mode": {"const": "references_only"}
+          }
+        }
+      ]
+    },
+    "QqSendArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selector", "segments", "reply_to_message_id"],
+      "properties": {
+        "selector": {"$ref": "#/$defs/ConversationSelector"},
+        "segments": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {"$ref": "#/$defs/OutboundPart"}
+        },
+        "reply_to_message_id": {
+          "oneOf": [
+            {"type": "string", "minLength": 1, "maxLength": 128},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "MediaArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "media_handle", "max_bytes"],
+      "properties": {
+        "operation": {"const": "acquire"},
+        "media_handle": {"$ref": "common.schema.json#/$defs/StableId"},
+        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1073741824}
+      }
+    },
+    "MessageControlArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "selector", "message_id", "reaction"],
+      "properties": {
+        "operation": {"enum": ["reaction_add", "reaction_remove", "recall", "mark_read"]},
+        "selector": {"$ref": "#/$defs/ConversationSelector"},
+        "message_id": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 128}, {"type": "null"}]},
+        "reaction": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 128}, {"type": "null"}]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"operation": {"enum": ["reaction_add", "reaction_remove"]}}, "required": ["operation"]},
+          "then": {"properties": {"message_id": {"type": "string"}, "reaction": {"type": "string"}}}
+        },
+        {
+          "if": {"properties": {"operation": {"const": "recall"}}, "required": ["operation"]},
+          "then": {"properties": {"message_id": {"type": "string"}, "reaction": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"operation": {"const": "mark_read"}}, "required": ["operation"]},
+          "then": {"properties": {"message_id": {"type": "null"}, "reaction": {"type": "null"}}}
+        }
+      ]
+    },
+    "CatalogArgs": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "query", "family", "limit"],
+          "properties": {
+            "operation": {"const": "search"},
+            "query": {"type": "string", "minLength": 1, "maxLength": 1024},
+            "family": {"oneOf": [{"enum": ["query", "mutate", "manage", "files"]}, {"type": "null"}]},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 32}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "registry_digest", "operation_key"],
+          "properties": {
+            "operation": {"const": "get"},
+            "registry_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+            "operation_key": {"$ref": "#/$defs/OperationKey"}
+          }
+        }
+      ]
+    },
+    "InvokeBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["family", "registry_digest", "operation_key", "sanitizer_digest", "arguments", "selector"],
+      "properties": {
+        "family": {"enum": ["query", "mutate", "manage", "files"]},
+        "registry_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "operation_key": {"$ref": "#/$defs/OperationKey"},
+        "sanitizer_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "arguments": {"type": "object", "maxProperties": 256},
+        "selector": {"oneOf": [{"$ref": "#/$defs/ConversationSelector"}, {"type": "null"}]}
+      }
+    },
+    "QueryInvokeArgs": {
+      "allOf": [
+        {"$ref": "#/$defs/InvokeBase"},
+        {"type": "object", "properties": {"family": {"const": "query"}}}
+      ]
+    },
+    "MutateInvokeArgs": {
+      "allOf": [
+        {"$ref": "#/$defs/InvokeBase"},
+        {"type": "object", "properties": {"family": {"const": "mutate"}}}
+      ]
+    },
+    "ManageInvokeArgs": {
+      "allOf": [
+        {"$ref": "#/$defs/InvokeBase"},
+        {"type": "object", "properties": {"family": {"const": "manage"}}}
+      ]
+    },
+    "FilesInvokeArgs": {
+      "allOf": [
+        {"$ref": "#/$defs/InvokeBase"},
+        {"type": "object", "properties": {"family": {"const": "files"}}}
+      ]
+    }
+  }
+}

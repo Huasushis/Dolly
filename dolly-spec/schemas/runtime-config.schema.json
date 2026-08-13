@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/runtime-config.schema.json",
+  "title": "Resolved Dolly instance configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_version", "kind", "metadata", "spec"],
+  "properties": {
+    "api_version": { "const": "dolly.example/v1alpha1" },
+    "kind": { "const": "DollyInstance" },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instance_id", "display_name"],
+      "properties": {
+        "instance_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "display_name": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pages", "extensions", "modules", "limits", "services", "security", "feature_flags"],
+      "properties": {
+        "pages": {
+          "type": "object",
+          "maxProperties": 4096,
+          "propertyNames": { "$ref": "common.schema.json#/$defs/StableId" },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["mode", "new_subscription_start", "retention", "quota"],
+            "properties": {
+              "mode": { "enum": ["durable", "lossy"] },
+              "new_subscription_start": { "enum": ["earliest", "latest"] },
+              "retention": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["min_age_ms", "max_age_ms"],
+                "properties": {
+                  "min_age_ms": { "type": "integer", "minimum": 0, "maximum": 315576000000 },
+                  "max_age_ms": { "type": ["integer", "null"], "minimum": 1, "maximum": 315576000000 }
+                }
+              },
+              "quota": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["max_entries", "max_bytes"],
+                "properties": {
+                  "max_entries": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+                  "max_bytes": { "type": "integer", "minimum": 1048576, "maximum": 9007199254740991 }
+                }
+              }
+            }
+          }
+        },
+        "extensions": {
+          "type": "object",
+          "maxProperties": 1024,
+          "propertyNames": { "$ref": "common.schema.json#/$defs/StableId" },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["package", "version", "hosting", "granted_capabilities", "config"],
+            "properties": {
+              "package": { "$ref": "common.schema.json#/$defs/ExtensionId" },
+              "version": { "type": "string", "maxLength": 64 },
+              "hosting": { "enum": ["per_extension", "per_module"] },
+              "granted_capabilities": {
+                "type": "array",
+                "maxItems": 128,
+                "uniqueItems": true,
+                "items": { "$ref": "common.schema.json#/$defs/QualifiedName" }
+              },
+              "config": { "type": "object", "maxProperties": 1024 }
+            }
+          }
+        },
+        "modules": {
+          "type": "object",
+          "maxProperties": 4096,
+          "propertyNames": { "$ref": "common.schema.json#/$defs/StableId" },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["extension", "module_type", "inputs", "outputs", "activation", "descriptor", "config"],
+            "properties": {
+              "extension": { "$ref": "common.schema.json#/$defs/StableId" },
+              "module_type": { "$ref": "common.schema.json#/$defs/StableId" },
+              "inputs": {
+                "type": "array",
+                "maxItems": 256,
+                "uniqueItems": true,
+                "items": { "$ref": "common.schema.json#/$defs/StableId" }
+              },
+              "outputs": {
+                "type": "array",
+                "maxItems": 256,
+                "uniqueItems": true,
+                "items": { "$ref": "common.schema.json#/$defs/StableId" }
+              },
+              "activation": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["debounce_ms", "max_wait_ms", "max_blocks", "max_occurrences", "max_input_bytes", "max_descriptor_bytes", "manifest_structural_reserve_bytes", "execution_timeout_ms", "lease_grace_ms", "fencing_grace_ms", "max_attempts", "retry_base_ms", "retry_cap_ms"],
+                "properties": {
+                  "debounce_ms": { "type": "integer", "minimum": 0, "maximum": 60000 },
+                  "max_wait_ms": { "type": "integer", "minimum": 1, "maximum": 3600000 },
+                  "max_blocks": { "type": "integer", "minimum": 1, "maximum": 256 },
+                  "max_occurrences": { "type": "integer", "minimum": 1, "maximum": 2048 },
+                  "max_input_bytes": { "type": "integer", "minimum": 1024, "maximum": 8388608 },
+                  "max_descriptor_bytes": { "type": "integer", "minimum": 2, "maximum": 1048576 },
+                  "manifest_structural_reserve_bytes": { "type": "integer", "minimum": 1024, "maximum": 8388608 },
+                  "execution_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 3600000 },
+                  "lease_grace_ms": { "type": "integer", "minimum": 1000, "maximum": 300000 },
+                  "fencing_grace_ms": { "type": "integer", "minimum": 0, "maximum": 60000 },
+                  "max_attempts": { "type": "integer", "minimum": 1, "maximum": 64 },
+                  "retry_base_ms": { "type": "integer", "minimum": 1, "maximum": 60000 },
+                  "retry_cap_ms": { "type": "integer", "minimum": 1, "maximum": 3600000 }
+                }
+              },
+              "descriptor": { "$ref": "module-descriptor.schema.json" },
+              "config": { "type": "object", "maxProperties": 1024 }
+            }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_block_bytes", "max_frame_bytes", "max_parts_per_block",
+            "max_actions_per_block", "max_text_part_bytes", "max_metadata_bytes",
+            "max_metadata_properties", "max_causal_parents",
+            "max_root_traces_per_block", "max_hops", "max_trace_blocks",
+            "max_trace_bytes", "max_module_activations_per_root_trace",
+            "activation_bucket_capacity", "activation_refill_millitokens_per_second",
+            "max_trace_age_ms", "max_pending_activations", "max_json_nesting_depth"
+          ],
+          "properties": {
+            "max_block_bytes": { "type": "integer", "minimum": 1024, "maximum": 8388608 },
+            "max_frame_bytes": { "type": "integer", "minimum": 1024, "maximum": 67108864 },
+            "max_parts_per_block": { "type": "integer", "minimum": 1, "maximum": 256 },
+            "max_actions_per_block": { "type": "integer", "minimum": 0, "maximum": 64 },
+            "max_text_part_bytes": { "type": "integer", "minimum": 1, "maximum": 262144 },
+            "max_metadata_bytes": { "type": "integer", "minimum": 2, "maximum": 65536 },
+            "max_metadata_properties": { "type": "integer", "minimum": 0, "maximum": 32 },
+            "max_causal_parents": { "type": "integer", "minimum": 1, "maximum": 256 },
+            "max_root_traces_per_block": { "type": "integer", "minimum": 1, "maximum": 16 },
+            "max_hops": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "max_trace_blocks": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "max_trace_bytes": { "type": "integer", "minimum": 1024, "maximum": 9007199254740991 },
+            "max_module_activations_per_root_trace": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "activation_bucket_capacity": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "activation_refill_millitokens_per_second": { "type": "integer", "minimum": 1, "maximum": 1000000000 },
+            "max_trace_age_ms": { "type": "integer", "minimum": 1000, "maximum": 315576000000 },
+            "max_pending_activations": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+            "max_json_nesting_depth": { "type": "integer", "minimum": 1, "maximum": 64 }
+          }
+        },
+        "services": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["asset", "model_gateway", "tool_broker", "observability"],
+          "properties": {
+            "asset": { "$ref": "asset-service-config.schema.json" },
+            "model_gateway": { "$ref": "model-gateway-config.schema.json" },
+            "tool_broker": { "$ref": "tool-broker-config.schema.json" },
+            "observability": { "$ref": "observability-config.schema.json" }
+          }
+        },
+        "security": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["admin_bind", "sandbox_policy", "allow_remote_assets"],
+          "properties": {
+            "admin_bind": { "enum": ["local_only", "explicit_remote_tls"] },
+            "sandbox_policy": { "enum": ["required", "best_available", "trusted_extensions_only"] },
+            "allow_remote_assets": { "type": "boolean" }
+          }
+        },
+        "feature_flags": {
+          "type": "object",
+          "maxProperties": 256,
+          "propertyNames": { "$ref": "common.schema.json#/$defs/QualifiedName" },
+          "additionalProperties": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

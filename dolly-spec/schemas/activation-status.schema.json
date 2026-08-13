@@ -1,0 +1,356 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/activation-status.schema.json",
+  "title": "Activation status and module.activation_disposition params",
+  "x-dolly-semantic-validator": {
+    "id": "org.dolly.validator.activation-status",
+    "revision": 1
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "module_id", "activation_id", "manifest_digest", "state", "terminal",
+    "result_digest", "frozen_replay_contract", "last_dispatch",
+    "next_attempt_authorization"
+  ],
+  "properties": {
+    "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "activation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "manifest_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "state": { "enum": ["ready", "leased", "fencing", "retry_wait", "result_staged", "commit_blocked", "committed", "quarantined", "cancelled"] },
+    "terminal": { "type": "boolean" },
+    "result_digest": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/Sha256" },
+        { "type": "null" }
+      ]
+    },
+    "frozen_replay_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["descriptor_revision", "config_revision", "contract"],
+      "properties": {
+        "descriptor_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "contract": { "$ref": "module-descriptor.schema.json#/$defs/ActivationReplayContract" }
+      }
+    },
+    "last_dispatch": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "attempt", "state", "transport_started", "frame_digest",
+            "fence_evidence_digest"
+          ],
+          "properties": {
+            "attempt": { "type": "integer", "minimum": 1, "maximum": 64 },
+            "state": { "enum": ["prepared", "started", "response_received", "fenced"] },
+            "transport_started": { "type": "boolean" },
+            "frame_digest": {
+              "oneOf": [
+                { "$ref": "common.schema.json#/$defs/Sha256" },
+                { "type": "null" }
+              ]
+            },
+            "fence_evidence_digest": {
+              "oneOf": [
+                { "$ref": "common.schema.json#/$defs/Sha256" },
+                { "type": "null" }
+              ]
+            }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "state": { "const": "prepared" } }, "required": ["state"] },
+              "then": {
+                "properties": {
+                  "transport_started": { "const": false },
+                  "frame_digest": { "type": "null" },
+                  "fence_evidence_digest": { "type": "null" }
+                }
+              }
+            },
+            {
+              "if": { "properties": { "state": { "enum": ["started", "response_received"] } }, "required": ["state"] },
+              "then": {
+                "properties": {
+                  "transport_started": { "const": true },
+                  "frame_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+                  "fence_evidence_digest": { "type": "null" }
+                }
+              }
+            },
+            {
+              "if": { "properties": { "state": { "const": "fenced" } }, "required": ["state"] },
+              "then": {
+                "properties": {
+                  "fence_evidence_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+                }
+              }
+            },
+            {
+              "if": { "properties": { "transport_started": { "const": true } }, "required": ["transport_started"] },
+              "then": { "properties": { "frame_digest": { "$ref": "common.schema.json#/$defs/Sha256" } } },
+              "else": { "properties": { "frame_digest": { "type": "null" } } }
+            }
+          ]
+        }
+      ]
+    },
+    "next_attempt_authorization": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "authorized_attempt", "source_attempt", "reason", "evidence_digest"
+          ],
+          "properties": {
+            "authorized_attempt": { "type": "integer", "minimum": 1, "maximum": 64 },
+            "source_attempt": { "type": "integer", "minimum": 0, "maximum": 64 },
+            "reason": {
+              "enum": [
+                "safe_before_dispatch", "explicit_retryable_failure",
+                "pure_compute", "activation_ledger", "operator_review"
+              ]
+            },
+            "evidence_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+          }
+        },
+        { "type": "null" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "state": { "enum": ["committed", "cancelled"] } }, "required": ["state"] },
+      "then": { "properties": { "terminal": { "const": true } } },
+      "else": { "properties": { "terminal": { "const": false } } }
+    },
+    {
+      "if": { "properties": { "state": { "enum": ["result_staged", "commit_blocked", "committed"] } }, "required": ["state"] },
+      "then": { "properties": { "result_digest": { "$ref": "common.schema.json#/$defs/Sha256" } } }
+    },
+    {
+      "if": { "properties": { "state": { "enum": ["ready", "leased", "fencing", "retry_wait", "cancelled"] } }, "required": ["state"] },
+      "then": { "properties": { "result_digest": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "state": { "enum": ["leased", "fencing"] } }, "required": ["state"] },
+      "then": {
+        "properties": {
+          "last_dispatch": {
+            "type": "object",
+            "properties": { "state": { "enum": ["prepared", "started"] } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": { "const": "ready" },
+          "next_attempt_authorization": { "type": "null" }
+        },
+        "required": ["state", "next_attempt_authorization"]
+      },
+      "then": { "properties": { "last_dispatch": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "state": { "const": "retry_wait" } }, "required": ["state"] },
+      "then": {
+        "properties": {
+          "last_dispatch": {
+            "type": "object",
+            "properties": { "state": { "enum": ["response_received", "fenced"] } }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "state": { "enum": ["result_staged", "commit_blocked", "committed"] } }, "required": ["state"] },
+      "then": {
+        "properties": {
+          "last_dispatch": {
+            "type": "object",
+            "properties": { "state": { "const": "response_received" } }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "state": { "const": "retry_wait" } }, "required": ["state"] },
+      "then": {
+        "properties": {
+          "next_attempt_authorization": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "leased", "fencing", "result_staged", "commit_blocked",
+              "committed", "quarantined", "cancelled"
+            ]
+          }
+        },
+        "required": ["state"]
+      },
+      "then": { "properties": { "next_attempt_authorization": { "type": "null" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": { "const": "ready" },
+          "next_attempt_authorization": { "type": "object" }
+        },
+        "required": ["state", "next_attempt_authorization"]
+      },
+      "then": {
+        "properties": {
+          "next_attempt_authorization": {
+            "properties": { "reason": { "const": "operator_review" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "next_attempt_authorization": {
+            "type": "object",
+            "properties": { "reason": { "const": "safe_before_dispatch" } },
+            "required": ["reason"]
+          }
+        },
+        "required": ["next_attempt_authorization"]
+      },
+      "then": {
+        "properties": {
+          "state": { "const": "retry_wait" },
+          "last_dispatch": {
+            "type": "object",
+            "properties": {
+              "state": { "const": "fenced" },
+              "transport_started": { "const": false }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "next_attempt_authorization": {
+            "type": "object",
+            "properties": { "reason": { "const": "explicit_retryable_failure" } },
+            "required": ["reason"]
+          }
+        },
+        "required": ["next_attempt_authorization"]
+      },
+      "then": {
+        "properties": {
+          "state": { "const": "retry_wait" },
+          "last_dispatch": {
+            "type": "object",
+            "properties": {
+              "state": { "const": "response_received" },
+              "transport_started": { "const": true }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "next_attempt_authorization": {
+            "type": "object",
+            "properties": { "reason": { "const": "pure_compute" } },
+            "required": ["reason"]
+          }
+        },
+        "required": ["next_attempt_authorization"]
+      },
+      "then": {
+        "properties": {
+          "state": { "const": "retry_wait" },
+          "frozen_replay_contract": {
+            "properties": {
+              "contract": {
+                "properties": { "evidence": { "const": "pure_compute" } }
+              }
+            }
+          },
+          "last_dispatch": {
+            "type": "object",
+            "properties": {
+              "state": { "const": "fenced" },
+              "transport_started": { "const": true }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "next_attempt_authorization": {
+            "type": "object",
+            "properties": { "reason": { "const": "activation_ledger" } },
+            "required": ["reason"]
+          }
+        },
+        "required": ["next_attempt_authorization"]
+      },
+      "then": {
+        "properties": {
+          "state": { "const": "retry_wait" },
+          "frozen_replay_contract": {
+            "properties": {
+              "contract": {
+                "properties": { "evidence": { "const": "activation_ledger" } }
+              }
+            }
+          },
+          "last_dispatch": {
+            "type": "object",
+            "properties": {
+              "state": { "const": "fenced" },
+              "transport_started": { "const": true }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "next_attempt_authorization": {
+            "type": "object",
+            "properties": { "reason": { "const": "operator_review" } },
+            "required": ["reason"]
+          }
+        },
+        "required": ["next_attempt_authorization"]
+      },
+      "then": {
+        "properties": {
+          "state": { "const": "ready" },
+          "last_dispatch": {
+            "type": "object",
+            "properties": { "state": { "const": "fenced" } }
+          }
+        }
+      }
+    }
+  ]
+}

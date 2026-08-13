@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/observability-config.schema.json",
+  "title": "Resolved observability configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["log_buffer_events", "trace_buffer_events", "error_reserve_events", "exporter", "retention", "access", "payload_logging"],
+  "properties": {
+    "log_buffer_events": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+    "trace_buffer_events": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+    "error_reserve_events": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+    "exporter": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "const": "disabled" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind", "endpoint", "credential_ref", "spool_max_bytes",
+            "spool_overflow_policy", "spool_eviction_order", "outage_behavior"
+          ],
+          "properties": {
+            "kind": { "const": "otlp_https" },
+            "endpoint": { "type": "string", "format": "uri", "pattern": "^https://", "maxLength": 2048 },
+            "credential_ref": {
+              "oneOf": [
+                { "$ref": "common.schema.json#/$defs/SecretRef" },
+                { "type": "null" }
+              ]
+            },
+            "spool_max_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            "spool_overflow_policy": { "const": "drop_oldest_eligible_telemetry" },
+            "spool_eviction_order": {
+              "const": ["trace", "debug", "info"]
+            },
+            "outage_behavior": { "const": "degrade_and_buffer" }
+          }
+        }
+      ]
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logs_days", "traces_days", "metrics_days", "audit_days", "journal_days", "payload_days"],
+      "properties": {
+        "logs_days": { "type": "integer", "minimum": 0, "maximum": 36500 },
+        "traces_days": { "type": "integer", "minimum": 0, "maximum": 36500 },
+        "metrics_days": { "type": "integer", "minimum": 0, "maximum": 36500 },
+        "audit_days": { "type": "integer", "minimum": 1, "maximum": 36500 },
+        "journal_days": { "type": "integer", "minimum": 1, "maximum": 36500 },
+        "payload_days": { "type": "integer", "minimum": 0, "maximum": 36500 }
+      }
+    },
+    "access": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logs", "traces", "metrics", "audit", "journal", "payload"],
+      "properties": {
+        "logs": { "$ref": "#/$defs/ScopeSet" },
+        "traces": { "$ref": "#/$defs/ScopeSet" },
+        "metrics": { "$ref": "#/$defs/ScopeSet" },
+        "audit": { "$ref": "#/$defs/ScopeSet" },
+        "journal": { "$ref": "#/$defs/ScopeSet" },
+        "payload": { "$ref": "#/$defs/ScopeSet" }
+      }
+    },
+    "payload_logging": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": { "enabled": { "const": false } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "scope", "expires_at", "max_bytes_per_event"],
+          "properties": {
+            "enabled": { "const": true },
+            "scope": { "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/QualifiedName" } },
+            "expires_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+            "max_bytes_per_event": { "type": "integer", "minimum": 1, "maximum": 1048576 }
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "ScopeSet": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "common.schema.json#/$defs/QualifiedName" }
+    }
+  }
+}

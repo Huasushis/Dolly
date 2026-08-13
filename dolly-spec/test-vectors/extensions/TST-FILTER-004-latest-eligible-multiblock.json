@@ -1,0 +1,69 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-FILTER-004",
+  "kind": "extension",
+  "covers": ["REQ-FILTER-001", "REQ-FILTER-002", "REQ-FILTER-003"],
+  "initial": {
+    "config": {
+      "channel": "default",
+      "state_epoch": "baseline-v1",
+      "new_sample_weight_ppm": 1000000,
+      "bias_correction": true
+    },
+    "cases": [
+      {
+        "name": "valid_then_malformed",
+        "blocks": [
+          {"block": "a-1", "signal": 200, "projectable": true},
+          {"block": "a-2", "signal": "malformed", "projectable": true}
+        ],
+        "expected_selected_block": "a-1",
+        "expected_observation_updates": 1,
+        "expected_normalized_score": 200
+      },
+      {
+        "name": "valid_then_oversize",
+        "blocks": [
+          {"block": "b-1", "signal": 400, "projectable": true},
+          {"block": "b-2", "signal": 600, "projectable": false}
+        ],
+        "expected_selected_block": "b-1",
+        "expected_observation_updates": 2,
+        "expected_normalized_score": 600
+      },
+      {
+        "name": "malformed_then_valid",
+        "blocks": [
+          {"block": "c-1", "signal": "malformed", "projectable": true},
+          {"block": "c-2", "signal": 800, "projectable": true}
+        ],
+        "expected_selected_block": "c-2",
+        "expected_observation_updates": 1,
+        "expected_normalized_score": 800
+      }
+    ]
+  },
+  "stimulus": {
+    "command": "process_each_manifest_in_canonical_delivery_order_and_select_latest_eligible_block"
+  },
+  "expected": {
+    "outcome": "state_updates_are_ordered_and_content_uses_last_eligible_manifest_block",
+    "assertions": [
+      {"path": "/valid_then_malformed/selected_block", "op": "equals", "value": "a-1"},
+      {"path": "/valid_then_malformed/state_score", "op": "equals", "value": 200},
+      {"path": "/valid_then_malformed/output_normalized_score", "op": "equals", "value": 200},
+      {"path": "/valid_then_oversize/selected_block", "op": "equals", "value": "b-1"},
+      {"path": "/valid_then_oversize/state_observations", "op": "equals", "value": 2},
+      {"path": "/valid_then_oversize/output_normalized_score", "op": "equals", "value": 600},
+      {"path": "/malformed_then_valid/selected_block", "op": "equals", "value": "c-2"},
+      {"path": "/malformed_then_valid/state_score", "op": "equals", "value": 800},
+      {"path": "/malformed_then_valid/output_normalized_score", "op": "equals", "value": 800}
+    ],
+    "emitted": [
+      {"kind": "new_block_draft", "case": "valid_then_malformed", "source_block": "a-1"},
+      {"kind": "new_block_draft", "case": "valid_then_oversize", "source_block": "b-1"},
+      {"kind": "new_block_draft", "case": "malformed_then_valid", "source_block": "c-2"}
+    ],
+    "crash_label": null
+  }
+}

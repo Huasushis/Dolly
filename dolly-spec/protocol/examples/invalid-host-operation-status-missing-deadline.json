@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": "host-operation-status-invalid-1",
+  "method": "host.operation.status",
+  "params": {
+    "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000206",
+    "module_id": "writer",
+    "target_operation_id": "0198ab31-6c44-7e8a-b2bb-000000000207",
+    "target_method": "host.block.pin"
+  }
+}

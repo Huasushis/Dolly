@@ -1,0 +1,48 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-NAPCAT-005",
+  "kind": "crash_recovery",
+  "covers": ["REQ-NAPCAT-001", "REQ-NAPCAT-003"],
+  "initial": {
+    "limits": {"max_journal_events": 3, "max_journal_bytes": 3000, "max_normalized_event_bytes": 1500},
+    "journal": [
+      {"cursor": "10", "bytes": 700},
+      {"cursor": "11", "bytes": 700},
+      {"cursor": "12", "bytes": 700}
+    ],
+    "oldest_available_cursor": "10",
+    "consumers": {
+      "agent-a": {"read_cursor": "12", "ack_cursor": "12"},
+      "agent-b": {"read_cursor": "10", "ack_cursor": "10"}
+    }
+  },
+  "stimulus": {
+    "commands": [
+      {"command": "append", "cursor": "13", "bytes": 1000},
+      {"command": "read", "consumer": "agent-b", "after_cursor": "10"},
+      {"command": "append_oversized", "cursor": "14", "bytes": 2000, "payload_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+      {"command": "append_with_disk_full", "cursor": "15", "bytes": 100}
+    ]
+  },
+  "expected": {
+    "outcome": "atomic_prefix_eviction_visible_gap_and_no_unjournaled_hint",
+    "assertions": [
+      {"path": "/commands/0/evicted_cursors", "op": "equals", "value": ["10"]},
+      {"path": "/commands/0/oldest_available_cursor", "op": "equals", "value": "11"},
+      {"path": "/commands/0/gap/reason", "op": "equals", "value": "retention"},
+      {"path": "/commands/0/gap/from_cursor", "op": "equals", "value": "10"},
+      {"path": "/commands/0/gap/to_cursor", "op": "equals", "value": "10"},
+      {"path": "/consumers/agent-b/ack_cursor", "op": "equals", "value": "10"},
+      {"path": "/commands/1/result/gaps/0/reason", "op": "equals", "value": "retention"},
+      {"path": "/commands/2/marker/reason", "op": "equals", "value": "oversized_event"},
+      {"path": "/commands/2/marker/raw_payload", "op": "absent"},
+      {"path": "/commands/3/transport_state", "op": "equals", "value": "disconnected"},
+      {"path": "/commands/3/hints_submitted", "op": "count", "value": 0},
+      {"path": "/recovery/gap/reason", "op": "equals", "value": "disk_full"}
+    ],
+    "emitted": [
+      {"schema": "dolly.napcatqq-mailbox-changed/v1", "kind": "qq_mailbox_changed"}
+    ],
+    "crash_label": "napcat.journal.disk_full_before_marker_commit"
+  }
+}

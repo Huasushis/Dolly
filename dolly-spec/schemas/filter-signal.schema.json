@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/filter-signal.schema.json",
+  "title": "Dolly provider-neutral Filter signal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "channel", "score"],
+  "properties": {
+    "schema": {"const": "dolly.filter-signal/v1"},
+    "channel": {"$ref": "common.schema.json#/$defs/StableId"},
+    "score": {"type": "integer", "minimum": 0, "maximum": 1000}
+  }
+}
+

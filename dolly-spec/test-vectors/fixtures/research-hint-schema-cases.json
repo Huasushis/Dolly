@@ -1,0 +1,35 @@
+{
+  "schema": "dolly.test-fixture/v1",
+  "fixture_id": "research-hint-schema-cases",
+  "kind": "block_draft_schema_cases",
+  "value": [
+    {
+      "id": "removed-direct-number",
+      "expected_valid": false,
+      "value": {
+        "schema": "dolly.block-draft/v1",
+        "parts": [],
+        "actions": [],
+        "hints": {"tensity": 1.0}
+      }
+    },
+    {
+      "id": "opaque-versioned-envelope",
+      "expected_valid": true,
+      "value": {
+        "schema": "dolly.block-draft/v1",
+        "parts": [],
+        "actions": [],
+        "hints": {
+          "org.dolly.research.tensity": {
+            "version": 1,
+            "schema_uri": "urn:dolly:research-hint:tensity:1",
+            "schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "experiment_id": "tensity-context-v1",
+            "payload": {"score": 0.73}
+          }
+        }
+      }
+    }
+  ]
+}

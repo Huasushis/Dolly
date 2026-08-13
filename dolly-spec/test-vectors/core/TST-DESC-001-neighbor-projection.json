@@ -1,0 +1,32 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-DESC-001",
+  "kind": "core_transition",
+  "covers": ["REQ-DESC-002", "INV-DESC-001", "INV-DESC-003"],
+  "initial": {
+    "fixture": "neighbor-is-both-input-producer-and-output-consumer",
+    "source_descriptor_revision": 9,
+    "source_descriptor_digest": "sha256:dcdb688583af0951e2b3ab7f79cd0129bf74bd0a157aab1886898871cbd4d6ba",
+    "authorized_metadata_namespaces": ["org.dolly.llm"]
+  },
+  "stimulus": {
+    "command": "BuildManifest",
+    "receiving_module": "reviewer",
+    "neighbor_module": "analyst"
+  },
+  "expected": {
+    "outcome": "one_authorized_dual-relationship_projection",
+    "assertions": [
+      {"path": "/manifest/neighbor_descriptors", "op": "count", "value": 1},
+      {"path": "/manifest/neighbor_descriptors/0/module_id", "op": "equals", "value": "analyst"},
+      {"path": "/manifest/neighbor_descriptors/0/relationships", "op": "equals", "value": ["input_producer", "output_consumer"]},
+      {"path": "/manifest/neighbor_descriptors/0/projection/emits", "op": "contains", "value": "contract"},
+      {"path": "/manifest/neighbor_descriptors/0/projection/accepts", "op": "contains", "value": "contract"},
+      {"path": "/manifest/neighbor_descriptors/0/projection/actions", "op": "contains", "value": "authorized-contracts"},
+      {"path": "/manifest/neighbor_descriptors/0/projection/schema", "op": "absent"},
+      {"path": "/manifest/neighbor_descriptors/0/projection/unauthorized_metadata", "op": "absent"}
+    ],
+    "emitted": [],
+    "crash_label": null
+  }
+}

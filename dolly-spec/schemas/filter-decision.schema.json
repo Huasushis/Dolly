@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/filter-decision.schema.json",
+  "title": "Prepared two-thirds Filter Activation decision",
+  "x-dolly-semantic-validator": "org.dolly.validator.filter-decision@1",
+  "$defs": {
+    "Observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instance_id", "source_module_id", "source_block_id", "channel", "manifest_ordinal", "disposition", "applied_score", "projection_eligible"],
+      "properties": {
+        "instance_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "source_module_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "source_block_id": {"$ref": "common.schema.json#/$defs/UuidV7"},
+        "channel": {"$ref": "common.schema.json#/$defs/StableId"},
+        "manifest_ordinal": {"type": "integer", "minimum": 0, "maximum": 4095},
+        "disposition": {"enum": ["applied", "duplicate", "missing_hold", "never_seen", "malformed", "self_ignored", "non_module_ignored", "other_channel"]},
+        "applied_score": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000}, {"type": "null"}]},
+        "projection_eligible": {"type": "boolean"}
+      }
+    },
+    "SourceState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instance_id", "source_module_id", "accumulator", "weight", "observation_count"],
+      "properties": {
+        "instance_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "source_module_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "accumulator": {"type": "integer", "minimum": 0, "maximum": 1000000000},
+        "weight": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "observation_count": {"type": "integer", "minimum": 1, "maximum": 1000000000}
+      }
+    },
+    "AccumulatorState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm_revision", "internal_scale", "bias_correction", "sources"],
+      "properties": {
+        "algorithm_revision": {"const": "two-thirds-mean-filter-v1"},
+        "internal_scale": {"const": 1000000},
+        "bias_correction": {"type": "boolean"},
+        "sources": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {"$ref": "#/$defs/SourceState"}
+        }
+      }
+    },
+    "Candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instance_id", "source_module_id", "tie_break_key", "selected_input_block_id", "accumulator", "weight", "corrected_score_q", "distance"],
+      "properties": {
+        "instance_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "source_module_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "tie_break_key": {"type": "string", "minLength": 1, "maxLength": 512},
+        "selected_input_block_id": {"$ref": "common.schema.json#/$defs/UuidV7"},
+        "accumulator": {"type": "integer", "minimum": 0, "maximum": 1000000000},
+        "weight": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "corrected_score_q": {"type": "integer", "minimum": 0, "maximum": 1000000000},
+        "distance": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "activation_id", "manifest_digest", "config_revision",
+    "config_digest", "config_schema_digest", "algorithm_revision",
+    "storage_scope_id", "channel", "state_epoch", "before_state", "after_state",
+    "before_state_digest", "after_state_digest",
+    "observations", "candidates", "selected_instance_id", "selected_source_module_id",
+    "selected_input_block_id", "output_payload", "output_digest", "state"
+  ],
+  "properties": {
+    "schema": {"const": "dolly.filter-decision/v1"},
+    "activation_id": {"$ref": "common.schema.json#/$defs/UuidV7"},
+    "manifest_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "config_revision": {"$ref": "common.schema.json#/$defs/Revision"},
+    "config_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "config_schema_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "algorithm_revision": {"const": "two-thirds-mean-filter-v1"},
+    "storage_scope_id": {"$ref": "common.schema.json#/$defs/ModuleStorageScopeId"},
+    "channel": {"$ref": "common.schema.json#/$defs/StableId"},
+    "state_epoch": {"$ref": "common.schema.json#/$defs/StableId"},
+    "before_state": {"$ref": "#/$defs/AccumulatorState"},
+    "after_state": {"$ref": "#/$defs/AccumulatorState"},
+    "before_state_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "after_state_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "observations": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {"$ref": "#/$defs/Observation"}
+    },
+    "candidates": {"type": "array", "maxItems": 4096, "items": {"$ref": "#/$defs/Candidate"}},
+    "selected_instance_id": {
+      "oneOf": [
+        {"$ref": "common.schema.json#/$defs/StableId"},
+        {"type": "null"}
+      ]
+    },
+    "selected_source_module_id": {
+      "oneOf": [
+        {"$ref": "common.schema.json#/$defs/StableId"},
+        {"type": "null"}
+      ]
+    },
+    "selected_input_block_id": {
+      "oneOf": [
+        {"$ref": "common.schema.json#/$defs/UuidV7"},
+        {"type": "null"}
+      ]
+    },
+    "output_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "output_payload": {"$ref": "activation-result.schema.json#/$defs/ActivationPayload"},
+    "state": {"enum": ["prepared", "committed", "discarded", "quarantined"]}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"selected_source_module_id": {"type": "null"}}, "required": ["selected_source_module_id"]},
+      "then": {
+        "properties": {
+          "selected_instance_id": {"type": "null"},
+          "selected_input_block_id": {"type": "null"},
+          "output_payload": {
+            "allOf": [
+              {"$ref": "activation-result.schema.json#/$defs/ActivationPayload"},
+              {"properties": {"status": {"const": "success"}, "output": {"type": "null"}}}
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "selected_instance_id": {"$ref": "common.schema.json#/$defs/StableId"},
+          "selected_input_block_id": {"$ref": "common.schema.json#/$defs/UuidV7"},
+          "output_payload": {
+            "allOf": [
+              {"$ref": "activation-result.schema.json#/$defs/ActivationPayload"},
+              {"properties": {"status": {"const": "success"}, "output": {"$ref": "block-draft.schema.json"}}}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"selected_instance_id": {"type": "null"}}, "required": ["selected_instance_id"]},
+      "then": {"properties": {"selected_source_module_id": {"type": "null"}}},
+      "else": {"properties": {"selected_source_module_id": {"$ref": "common.schema.json#/$defs/StableId"}}}
+    }
+  ]
+}

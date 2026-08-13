@@ -1,0 +1,19 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-004",
+  "kind": "crash_recovery",
+  "covers": ["INV-PAGELOG-008", "INV-PAGELOG-011", "INV-STORAGE-009"],
+  "initial": {"fixture": "lossy-page", "persisted_next_page_seq": 9, "diagnostic_cursor": 6, "memory_entries": [6, 7, 8]},
+  "stimulus": {"command": "RestartWorker"},
+  "expected": {
+    "outcome": "pending_loss_reported_as_gap",
+    "assertions": [
+      {"path": "/page/next_page_seq", "op": "equals", "value": 9},
+      {"path": "/page/memory_entries", "op": "count", "value": 0},
+      {"path": "/manifest/lossy_gaps/0/from_page_seq", "op": "equals", "value": 6},
+      {"path": "/manifest/lossy_gaps/0/to_page_seq", "op": "equals", "value": 9}
+    ],
+    "emitted": [{"event": "LossyGap", "reason": "restart"}],
+    "crash_label": "worker_exit"
+  }
+}

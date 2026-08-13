@@ -1,0 +1,59 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-MODEL-003",
+  "kind": "security",
+  "covers": ["REQ-MODEL-003", "REQ-ASSET-001"],
+  "initial": {
+    "requested_output_modalities": ["text", "image"],
+    "max_output_asset_bytes": 4096,
+    "provider_phase_outcome": "complete",
+    "cases": [
+      {
+        "id": "unrequested-audio",
+        "provider_kind": "audio",
+        "detected_media_type": "audio/ogg",
+        "byte_length": 2048
+      },
+      {
+        "id": "mime-mismatch",
+        "provider_kind": "image",
+        "declared_media_type": "image/png",
+        "detected_media_type": "audio/ogg",
+        "byte_length": 2048
+      },
+      {
+        "id": "aggregate-size",
+        "provider_kind": "image",
+        "detected_media_type": "image/png",
+        "byte_length": 4097
+      },
+      {
+        "id": "expired-url",
+        "provider_kind": "image",
+        "source_kind": "temporary_url",
+        "asset_state": "rejected",
+        "asset_error": "SOURCE_UNAVAILABLE"
+      }
+    ]
+  },
+  "stimulus": {
+    "event": "validate_each_completed_provider_media_case"
+  },
+  "expected": {
+    "outcome": "post_provider_failures_are_explicit_and_never_partial_success",
+    "assertions": [
+      {"path": "/cases/unrequested-audio/error/code", "op": "equals", "value": "MODEL_OUTPUT_MODALITY_UNREQUESTED"},
+      {"path": "/cases/mime-mismatch/error/code", "op": "equals", "value": "MODEL_OUTPUT_ASSET_REJECTED"},
+      {"path": "/cases/aggregate-size/error/code", "op": "equals", "value": "MODEL_OUTPUT_ASSET_LIMIT"},
+      {"path": "/cases/expired-url/error/code", "op": "equals", "value": "MODEL_OUTPUT_ASSET_UNAVAILABLE"},
+      {"path": "/all/error/outcome", "op": "equals", "value": "applied"},
+      {"path": "/all/error/retryable", "op": "equals", "value": false},
+      {"path": "/all/model_status/state", "op": "equals", "value": "failed"},
+      {"path": "/all/response", "op": "absent"},
+      {"path": "/all/provider_redispatch_count", "op": "equals", "value": 0},
+      {"path": "/all/temporary_url_in_status_or_error", "op": "equals", "value": false}
+    ],
+    "emitted": [],
+    "crash_label": null
+  }
+}

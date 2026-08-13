@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/alarm-result.schema.json",
+  "title": "Successful org.dolly.alarm ActionResult payloads",
+  "x-dolly-action-result-validator": {
+    "id": "org.dolly.validator.alarm-result",
+    "revision": 1
+  },
+  "$defs": {
+    "NullableCursor": {
+      "oneOf": [
+        { "type": "string", "minLength": 1, "maxLength": 512 },
+        { "type": "null" }
+      ]
+    },
+    "CreateResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "record"],
+      "properties": {
+        "schema": { "const": "dolly.alarm.create-result/v1" },
+        "record": { "$ref": "alarm-record.schema.json" }
+      }
+    },
+    "ListResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "The bound semantic validator requires ascending (next_occurrence nulls last, alarm_id) order.",
+      "required": ["schema", "records", "next_cursor"],
+      "properties": {
+        "schema": { "const": "dolly.alarm.list-result/v1" },
+        "records": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": { "$ref": "alarm-record.schema.json" }
+        },
+        "next_cursor": { "$ref": "#/$defs/NullableCursor" }
+      }
+    },
+    "GetResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "record"],
+      "properties": {
+        "schema": { "const": "dolly.alarm.get-result/v1" },
+        "record": { "$ref": "alarm-record.schema.json" }
+      }
+    },
+    "UpdateResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "record"],
+      "properties": {
+        "schema": { "const": "dolly.alarm.update-result/v1" },
+        "record": { "$ref": "alarm-record.schema.json" }
+      }
+    },
+    "DeleteResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "alarm_id", "deleted_alarm_revision"],
+      "properties": {
+        "schema": { "const": "dolly.alarm.delete-result/v1" },
+        "alarm_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "deleted_alarm_revision": { "$ref": "common.schema.json#/$defs/Revision" }
+      }
+    },
+    "SnoozeResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "snoozed_occurrence_id", "record"],
+      "properties": {
+        "schema": { "const": "dolly.alarm.snooze-result/v1" },
+        "snoozed_occurrence_id": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "record": { "$ref": "alarm-record.schema.json" }
+      }
+    },
+    "AcknowledgeResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "alarm_id", "alarm_revision", "occurrence_id",
+        "acknowledged_at", "already_acknowledged"
+      ],
+      "properties": {
+        "schema": { "const": "dolly.alarm.acknowledge-result/v1" },
+        "alarm_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "alarm_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "occurrence_id": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "acknowledged_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+        "already_acknowledged": { "type": "boolean" }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/CreateResult" },
+    { "$ref": "#/$defs/ListResult" },
+    { "$ref": "#/$defs/GetResult" },
+    { "$ref": "#/$defs/UpdateResult" },
+    { "$ref": "#/$defs/DeleteResult" },
+    { "$ref": "#/$defs/SnoozeResult" },
+    { "$ref": "#/$defs/AcknowledgeResult" }
+  ]
+}

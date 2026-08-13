@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/activation-manifest.schema.json",
+  "title": "ActivationManifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "activation_id", "module_id", "reason", "created_at",
+    "graph_revision", "config_revision", "descriptor_revision",
+    "effective_config", "effective_config_digest", "effective_config_schema_digest",
+    "input_items",
+    "cursor_spans", "lossy_gaps", "output_page_ids", "neighbor_descriptors",
+    "required_frame_bytes", "required_frame_nesting_depth", "deadline",
+    "manifest_digest"
+  ],
+  "properties": {
+    "schema": { "const": "dolly.activation-manifest/v1" },
+    "activation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "reason": { "enum": ["input", "timer", "background_ready", "manual"] },
+    "created_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "graph_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "descriptor_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "effective_config": { "type": "object", "maxProperties": 1024 },
+    "effective_config_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "effective_config_schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "required_frame_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 67108864
+    },
+    "required_frame_nesting_depth": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 96
+    },
+    "input_items": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["block", "occurrences", "occurrence_count"],
+        "properties": {
+          "block": { "$ref": "block.schema.json" },
+          "occurrences": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2048,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["page_id", "page_seq", "commit_seq"],
+              "properties": {
+                "page_id": { "$ref": "common.schema.json#/$defs/StableId" },
+                "page_seq": { "$ref": "common.schema.json#/$defs/Seq" },
+                "commit_seq": { "$ref": "common.schema.json#/$defs/Seq" }
+              }
+            }
+          },
+          "occurrence_count": { "type": "integer", "minimum": 1, "maximum": 2048 }
+        }
+      }
+    },
+    "cursor_spans": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["page_id", "from_page_seq", "to_page_seq"],
+        "properties": {
+          "page_id": { "$ref": "common.schema.json#/$defs/StableId" },
+          "from_page_seq": { "$ref": "common.schema.json#/$defs/Seq" },
+          "to_page_seq": { "$ref": "common.schema.json#/$defs/Seq" }
+        }
+      }
+    },
+    "lossy_gaps": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["page_id", "from_page_seq", "to_page_seq", "reason"],
+        "properties": {
+          "page_id": { "$ref": "common.schema.json#/$defs/StableId" },
+          "from_page_seq": {
+            "oneOf": [
+              { "$ref": "common.schema.json#/$defs/Seq" },
+              { "type": "null" }
+            ]
+          },
+          "to_page_seq": { "$ref": "common.schema.json#/$defs/Seq" },
+          "reason": { "enum": ["overflow", "restart"] }
+        }
+      }
+    },
+    "output_page_ids": {
+      "type": "array",
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": { "$ref": "common.schema.json#/$defs/StableId" }
+    },
+    "neighbor_descriptors": {
+      "type": "array",
+      "maxItems": 512,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "module_id", "descriptor_revision", "source_descriptor_digest",
+          "relationships", "projection"
+        ],
+        "properties": {
+          "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+          "descriptor_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+          "source_descriptor_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+          "relationships": {
+            "oneOf": [
+              { "const": ["input_producer"] },
+              { "const": ["output_consumer"] },
+              { "const": ["input_producer", "output_consumer"] }
+            ]
+          },
+          "projection": { "type": "object" }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": { "relationships": { "const": ["input_producer"] } },
+              "required": ["relationships"]
+            },
+            "then": {
+              "properties": {
+                "projection": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["display_name", "trust", "metadata", "emits"],
+                  "properties": {
+                    "display_name": { "$ref": "module-descriptor.schema.json#/properties/display_name" },
+                    "trust": { "$ref": "module-descriptor.schema.json#/properties/trust" },
+                    "metadata": { "$ref": "module-descriptor.schema.json#/properties/metadata" },
+                    "emits": { "$ref": "module-descriptor.schema.json#/properties/emits" }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": { "relationships": { "const": ["output_consumer"] } },
+              "required": ["relationships"]
+            },
+            "then": {
+              "properties": {
+                "projection": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["display_name", "trust", "metadata", "accepts", "actions"],
+                  "properties": {
+                    "display_name": { "$ref": "module-descriptor.schema.json#/properties/display_name" },
+                    "trust": { "$ref": "module-descriptor.schema.json#/properties/trust" },
+                    "metadata": { "$ref": "module-descriptor.schema.json#/properties/metadata" },
+                    "accepts": { "$ref": "module-descriptor.schema.json#/properties/accepts" },
+                    "actions": { "$ref": "module-descriptor.schema.json#/properties/actions" }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "relationships": { "const": ["input_producer", "output_consumer"] }
+              },
+              "required": ["relationships"]
+            },
+            "then": {
+              "properties": {
+                "projection": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "display_name", "trust", "metadata", "emits", "accepts", "actions"
+                  ],
+                  "properties": {
+                    "display_name": { "$ref": "module-descriptor.schema.json#/properties/display_name" },
+                    "trust": { "$ref": "module-descriptor.schema.json#/properties/trust" },
+                    "metadata": { "$ref": "module-descriptor.schema.json#/properties/metadata" },
+                    "emits": { "$ref": "module-descriptor.schema.json#/properties/emits" },
+                    "accepts": { "$ref": "module-descriptor.schema.json#/properties/accepts" },
+                    "actions": { "$ref": "module-descriptor.schema.json#/properties/actions" }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "manifest_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+  }
+}

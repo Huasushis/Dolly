@@ -1,0 +1,56 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CONFIG-003",
+  "kind": "config",
+  "covers": ["REQ-CFG-003", "REQ-CFG-004"],
+  "initial": {
+    "config_revision": 7,
+    "extension_config": {
+      "cache": {"shared": true, "size": 64},
+      "tags": ["base", "shared"],
+      "nullable": "base",
+      "inherited": 1
+    },
+    "module_config": {
+      "cache": {"module": true},
+      "tags": ["module"],
+      "nullable": null
+    },
+    "module_schema_bundle_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "stimulus": {
+    "command": "NormalizeEffectiveConfig",
+    "extension_alias": "brain",
+    "module_id": "main-brain"
+  },
+  "expected": {
+    "outcome": "effective_config_resolved",
+    "assertions": [
+      {
+        "path": "/effective_config",
+        "op": "equals",
+        "value": {
+          "cache": {"module": true},
+          "inherited": 1,
+          "nullable": null,
+          "tags": ["module"]
+        }
+      },
+      {
+        "path": "/effective_config/cache/shared",
+        "op": "absent"
+      },
+      {
+        "path": "/effective_config_digest",
+        "op": "equals",
+        "value": "sha256:75d72a950e3a0e5a7ad5150b6a52bfc4f2bc83c001c23dd7d44045b13149d223"
+      },
+      {
+        "path": "/effective_config_schema_digest",
+        "op": "equals",
+        "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "emitted": []
+  }
+}

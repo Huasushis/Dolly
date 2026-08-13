@@ -1,0 +1,386 @@
+{
+  "schema": "dolly.extension-rpc-registry/v1",
+  "protocol": { "major": 1, "minor": 0 },
+  "error_data_schema": "https://dolly.example/spec/0.1/schemas/error.schema.json",
+  "requests": [
+    {
+      "method": "extension.initialize",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-initialize-request.schema.json",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/extension-initialize-result.schema.json",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "connection_generation", "pointers": ["/worker_epoch", "/extension_generation"] },
+      "reconciliation": { "kind": "process_state", "method": null },
+      "unknown_policy": "process_state_authoritative",
+      "state_changing": true
+    },
+    {
+      "method": "extension.ping",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ExtensionPingParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ExtensionPingResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "extension_process", "pointers": ["/operation_id"] },
+      "reconciliation": { "kind": "read_retry", "method": null },
+      "unknown_policy": "read_retry",
+      "state_changing": false
+    },
+    {
+      "method": "extension.shutdown",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ExtensionShutdownParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ExtensionShutdownResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "extension_process", "pointers": ["/operation_id"] },
+      "reconciliation": { "kind": "process_state", "method": null },
+      "unknown_policy": "process_state_authoritative",
+      "state_changing": true
+    },
+    {
+      "method": "module.instantiate",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleInstantiateParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleInstantiateResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "module", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "module.operation_status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "module.activate",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/activation-request.schema.json",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/activation-result.schema.json",
+      "deadline": { "kind": "manifest_pointer", "pointer": "/manifest/deadline" },
+      "operation_identity": { "scope": "activation", "pointers": ["/manifest/activation_id", "/attempt", "/lease_generation", "/lease_token"] },
+      "reconciliation": { "kind": "frozen_activation", "method": null },
+      "unknown_policy": "frozen_activation_contract",
+      "state_changing": true
+    },
+    {
+      "method": "module.prepare_config",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModulePrepareConfigParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModulePrepareConfigResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "configuration_transaction", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "module.operation_status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "module.commit_config",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleCommitConfigParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleCommitConfigResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "configuration_transaction", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "module.operation_status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "module.abort_config",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleAbortConfigParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleAbortConfigResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "configuration_transaction", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "module.operation_status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "module.snapshot",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleSnapshotParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleSnapshotResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "module", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "module.operation_status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "module.restore",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleRestoreParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleRestoreResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "module", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "module.operation_status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "module.migrate_state",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleMigrateStateParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleMigrateStateResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "module", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "module.operation_status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "module.operation_status",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleOperationStatusParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleOperationStatusResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "module", "pointers": ["/module_id", "/operation_id", "/target_operation_id", "/target_method"] },
+      "reconciliation": { "kind": "read_retry", "method": null },
+      "unknown_policy": "read_retry",
+      "state_changing": false
+    },
+    {
+      "method": "module.health",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleHealthParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleHealthResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "module", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "read_retry", "method": null },
+      "unknown_policy": "read_retry",
+      "state_changing": false
+    },
+    {
+      "method": "module.shutdown",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleShutdownParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json#/$defs/ModuleShutdownResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "module", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "module.operation_status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "host.block.get",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/host-resource-rpc.schema.json#/$defs/BlockGetParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/block.schema.json",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "authenticated_module", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "read_retry", "method": null },
+      "unknown_policy": "read_retry",
+      "state_changing": false
+    },
+    {
+      "method": "host.block.pin",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/host-resource-rpc.schema.json#/$defs/BlockPinParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/host-resource-rpc.schema.json#/$defs/BlockPinResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "authenticated_module", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "host.operation.status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "host.block.unpin",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/host-resource-rpc.schema.json#/$defs/BlockUnpinParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/host-resource-rpc.schema.json#/$defs/BlockUnpinResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "authenticated_module", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "host.operation.status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "host.asset.import",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/asset-import.schema.json",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/asset-status.schema.json#/$defs/ImportResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "asset_import", "pointers": ["/module_id", "/import_id"] },
+      "reconciliation": { "kind": "method", "method": "host.asset.status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "host.asset.status",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/asset-status-request.schema.json",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/asset-status.schema.json#/$defs/StatusResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "authenticated_module", "pointers": ["/module_id", "/operation_id", "/import_id"] },
+      "reconciliation": { "kind": "read_retry", "method": null },
+      "unknown_policy": "read_retry",
+      "state_changing": false
+    },
+    {
+      "method": "host.asset.get",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/host-resource-rpc.schema.json#/$defs/AssetGetParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/host-resource-rpc.schema.json#/$defs/AssetGetResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "authenticated_module", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "read_retry", "method": null },
+      "unknown_policy": "read_retry",
+      "state_changing": false
+    },
+    {
+      "method": "host.asset.materialize_view",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/host-resource-rpc.schema.json#/$defs/AssetMaterializeViewParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/host-resource-rpc.schema.json#/$defs/AssetMaterializeViewResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "authenticated_module", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "host.operation.status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "host.model.invoke",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/model-request.schema.json",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/model-response.schema.json",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "model_request", "pointers": ["/module_id", "/request_id"] },
+      "reconciliation": { "kind": "method", "method": "host.operation.status" },
+      "unknown_policy": "no_auto_replay",
+      "state_changing": true
+    },
+    {
+      "method": "host.tool.invoke",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/tool-invoke.schema.json",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/tool-result.schema.json#/$defs/InvokeResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "tool_call", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "host.tool.status" },
+      "unknown_policy": "no_auto_replay",
+      "state_changing": true
+    },
+    {
+      "method": "host.tool.status",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/tool-status-request.schema.json",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/tool-result.schema.json#/$defs/StatusResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "authenticated_module", "pointers": ["/module_id", "/operation_id", "/target_operation_id"] },
+      "reconciliation": { "kind": "read_retry", "method": null },
+      "unknown_policy": "read_retry",
+      "state_changing": false
+    },
+    {
+      "method": "host.ingress.submit",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/ingress-submit.schema.json",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/ingress-result.schema.json",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "ingress", "pointers": ["/module_id", "/idempotency_key"] },
+      "reconciliation": { "kind": "method", "method": "host.ingress.status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "host.ingress.status",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/ingress-status-request.schema.json",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/ingress-status.schema.json",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "ingress", "pointers": ["/module_id", "/operation_id", "/idempotency_key"] },
+      "reconciliation": { "kind": "read_retry", "method": null },
+      "unknown_policy": "read_retry",
+      "state_changing": false
+    },
+    {
+      "method": "host.activation.status",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/activation-status-request.schema.json",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/activation-status.schema.json",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "activation", "pointers": ["/module_id", "/operation_id", "/activation_id"] },
+      "reconciliation": { "kind": "read_retry", "method": null },
+      "unknown_policy": "read_retry",
+      "state_changing": false
+    },
+    {
+      "method": "host.module.request_activation",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/host-control-rpc.schema.json#/$defs/RequestActivationParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/host-control-rpc.schema.json#/$defs/RequestActivationResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "authenticated_module", "pointers": ["/module_id", "/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "host.operation.status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "host.module.request_wakeup",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/host-control-rpc.schema.json#/$defs/RequestWakeupParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/host-control-rpc.schema.json#/$defs/RequestWakeupResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "authenticated_module", "pointers": ["/module_id", "/operation_id", "/idempotency_key"] },
+      "reconciliation": { "kind": "method", "method": "host.operation.status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "host.config.propose",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/config-proposal.schema.json",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/host-control-rpc.schema.json#/$defs/ConfigProposeResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "authenticated_module", "pointers": ["/operation_id"] },
+      "reconciliation": { "kind": "method", "method": "host.operation.status" },
+      "unknown_policy": "same_identity_only",
+      "state_changing": true
+    },
+    {
+      "method": "host.operation.status",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/host-operation-status.schema.json#/$defs/OperationStatusParams",
+      "result_schema": "https://dolly.example/spec/0.1/schemas/host-operation-status.schema.json#/$defs/OperationStatusResult",
+      "deadline": { "kind": "params_pointer", "pointer": "/deadline" },
+      "operation_identity": { "scope": "authenticated_module", "pointers": ["/module_id", "/operation_id", "/target_operation_id", "/target_method"] },
+      "reconciliation": { "kind": "read_retry", "method": null },
+      "unknown_policy": "read_retry",
+      "state_changing": false
+    }
+  ],
+  "notifications": [
+    {
+      "method": "$/cancelRequest",
+      "caller": "either",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-notification-rpc.schema.json#/$defs/CancelRequestParams",
+      "loss_policy": "best_effort"
+    },
+    {
+      "method": "module.activation_disposition",
+      "caller": "host",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/activation-status.schema.json",
+      "loss_policy": "advisory_reconcile"
+    },
+    {
+      "method": "descriptor.changed",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-notification-rpc.schema.json#/$defs/DescriptorChangedParams",
+      "loss_policy": "untrusted_hint"
+    },
+    {
+      "method": "extension.progress",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-notification-rpc.schema.json#/$defs/ExtensionProgressParams",
+      "loss_policy": "lossy_telemetry"
+    },
+    {
+      "method": "host.log.emit",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-notification-rpc.schema.json#/$defs/LogEmitParams",
+      "loss_policy": "lossy_telemetry"
+    },
+    {
+      "method": "host.metrics.record",
+      "caller": "extension",
+      "params_schema": "https://dolly.example/spec/0.1/schemas/extension-notification-rpc.schema.json#/$defs/MetricsRecordParams",
+      "loss_policy": "lossy_telemetry"
+    }
+  ]
+}

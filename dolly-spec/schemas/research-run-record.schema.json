@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/research-run-record.schema.json",
+  "title": "Dolly research run record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "plan_digest", "experiment_id", "track", "unit_id", "split",
+    "treatment_id", "repetition", "seed", "system_artifacts", "started_at",
+    "ended_at", "status", "usage", "oracle", "metric_values", "trace_uri",
+    "trace_digest"
+  ],
+  "properties": {
+    "schema": { "const": "dolly.research-run/v1" },
+    "plan_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "experiment_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "track": { "$ref": "research-experiment-plan.schema.json#/properties/track" },
+    "unit_id": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "split": { "enum": ["train", "development", "held_out"] },
+    "treatment_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "repetition": { "type": "integer", "minimum": 0, "maximum": 9999 },
+    "seed": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+    "system_artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": { "$ref": "common.schema.json#/$defs/Sha256" }
+    },
+    "started_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "ended_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "status": {
+      "enum": [
+        "succeeded", "task_failed", "refused", "timed_out", "crashed",
+        "budget_exhausted", "invalid_output", "harness_error"
+      ]
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_calls", "tokens", "tool_calls", "wall_milliseconds", "cost_microunits",
+        "network_bytes", "persistent_storage_growth_bytes", "peak_memory_bytes"
+      ],
+      "properties": {
+        "model_calls": { "type": "integer", "minimum": 0, "maximum": 1000000000 },
+        "tokens": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "tool_calls": { "type": "integer", "minimum": 0, "maximum": 1000000000 },
+        "wall_milliseconds": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "cost_microunits": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "network_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "persistent_storage_growth_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "peak_memory_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "evidence_digest"],
+      "properties": {
+        "verdict": { "enum": ["pass", "fail", "abstain", "not_reached", "invalid"] },
+        "evidence_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+      }
+    },
+    "metric_values": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": { "$ref": "common.schema.json#/$defs/StableId" },
+      "additionalProperties": { "type": "number" }
+    },
+    "trace_uri": { "type": "string", "format": "uri", "maxLength": 1024 },
+    "trace_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+  }
+}

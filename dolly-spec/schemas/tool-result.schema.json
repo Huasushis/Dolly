@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/tool-result.schema.json",
+  "title": "host.tool.invoke/status result",
+  "$defs": {
+    "ToolError": {
+      "allOf": [
+        {"$ref": "error.schema.json"},
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "TOOL_SERVER_UNAVAILABLE", "TOOL_SERVER_QUARANTINED",
+                "TOOL_UNKNOWN", "TOOL_CAPABILITY_DENIED", "TOOL_STALE_LEASE",
+                "TOOL_STALE_CONFIG_REVISION", "TOOL_CONFIRMATION_REQUIRED",
+                "TOOL_CONFIRMATION_EXPIRED", "TOOL_INPUT_INVALID",
+                "TOOL_REQUEST_LIMIT", "TOOL_IDEMPOTENCY_CONFLICT",
+                "TOOL_DISPATCH_NOT_APPLIED", "TOOL_UPSTREAM_NOT_APPLIED",
+                "TOOL_UPSTREAM_FAILED",
+                "TOOL_OUTPUT_INVALID", "TOOL_RESPONSE_LIMIT",
+                "TOOL_EXTERNAL_OUTCOME_UNKNOWN"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "InvokeResult": {
+      "allOf": [
+        { "$ref": "#" },
+        {
+          "not": {
+            "properties": { "status": { "const": "absent" } },
+            "required": ["status"]
+          }
+        }
+      ]
+    },
+    "StatusResult": {
+      "allOf": [
+        { "$ref": "#" },
+        {
+          "not": {
+            "properties": { "status": { "const": "denied" } },
+            "required": ["status"]
+          }
+        }
+      ]
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["operation_id", "status", "output", "error", "server_request_id"],
+  "properties": {
+    "operation_id": {
+      "$ref": "common.schema.json#/$defs/UuidV7",
+      "$comment": "For host.tool.invoke this equals the invoke operation_id. For host.tool.status this equals the requested target_operation_id, never the fresh status-read operation_id."
+    },
+    "status": { "enum": ["absent", "authorized", "dispatched", "succeeded", "failed", "unknown", "denied"] },
+    "output": { "$ref": "common.schema.json#/$defs/JsonValue" },
+    "error": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/ToolError" }
+      ]
+    },
+    "server_request_id": {
+      "oneOf": [
+        { "type": "string", "minLength": 1, "maxLength": 512 },
+        { "type": "null" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "succeeded" } }, "required": ["status"] },
+      "then": { "properties": { "error": { "type": "null" } } },
+      "else": {
+        "if": { "properties": { "status": { "enum": ["failed", "unknown", "denied"] } }, "required": ["status"] },
+        "then": { "properties": { "output": { "type": "null" }, "error": { "$ref": "#/$defs/ToolError" } } }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "unknown" } }, "required": ["status"] },
+      "then": { "properties": { "error": { "allOf": [{ "$ref": "#/$defs/ToolError" }, { "type": "object", "properties": { "outcome": { "const": "unknown" } } }] } } }
+    },
+    {
+      "$comment": "An unknown external outcome is always represented by the unknown terminal status, never failed or denied.",
+      "if": {
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": { "outcome": { "const": "unknown" } },
+            "required": ["outcome"]
+          }
+        },
+        "required": ["error"]
+      },
+      "then": { "properties": { "status": { "const": "unknown" } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "denied" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "error": {
+            "allOf": [
+              { "$ref": "#/$defs/ToolError" },
+              { "type": "object", "properties": { "outcome": { "const": "not_applied" } } }
+            ]
+          },
+          "server_request_id": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "enum": ["absent", "authorized", "dispatched"] } }, "required": ["status"] },
+      "then": { "properties": { "output": { "type": "null" }, "error": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "absent" } }, "required": ["status"] },
+      "then": { "properties": { "server_request_id": { "type": "null" } } }
+    }
+  ]
+}

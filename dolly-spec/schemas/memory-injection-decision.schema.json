@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/memory-injection-decision.schema.json",
+  "title": "Immutable decision to include or suppress one Memory record in one model request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "decision_id", "target_model_request_id", "target_activation_id",
+    "target_module_id", "retrieval_id", "memory_id", "record_revision",
+    "search_result_digest", "query_digest", "query_basis_digest", "policy_id",
+    "policy_revision", "prior_model_request_count", "last_model_request_at",
+    "decision", "reason", "created_at"
+  ],
+  "properties": {
+    "schema": { "const": "dolly.memory-injection-decision/v1" },
+    "decision_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "target_model_request_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "target_activation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "target_module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "retrieval_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "memory_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "record_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "search_result_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "query_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "query_basis_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "policy_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "policy_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "prior_model_request_count": {
+      "$comment": "Earlier canonical Model Gateway requests containing this exact (memory_id, record_revision); this is not a usefulness or provider-read signal.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "last_model_request_at": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/Timestamp" },
+        { "type": "null" }
+      ]
+    },
+    "decision": { "enum": ["include", "suppress"] },
+    "reason": {
+      "enum": [
+        "first_relevant_delivery",
+        "repeat_relevant_to_current_context",
+        "record_revision_changed",
+        "explicit_consumer_request",
+        "duplicate_in_target_request",
+        "below_threshold",
+        "token_budget",
+        "automatic_rate_limit",
+        "repeat_not_useful"
+      ]
+    },
+    "created_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "decision": { "const": "include" } }, "required": ["decision"] },
+      "then": {
+        "properties": {
+          "reason": {
+            "enum": [
+              "first_relevant_delivery",
+              "repeat_relevant_to_current_context",
+              "record_revision_changed",
+              "explicit_consumer_request"
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "reason": {
+            "enum": [
+              "duplicate_in_target_request",
+              "below_threshold",
+              "token_budget",
+              "automatic_rate_limit",
+              "repeat_not_useful"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "prior_model_request_count": { "const": 0 } }, "required": ["prior_model_request_count"] },
+      "then": {
+        "properties": {
+          "last_model_request_at": { "type": "null" },
+          "reason": {
+            "not": {
+              "enum": ["repeat_relevant_to_current_context", "record_revision_changed", "repeat_not_useful"]
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "last_model_request_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+          "reason": { "not": { "const": "first_relevant_delivery" } }
+        }
+      }
+    }
+  ]
+}

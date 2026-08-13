@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/napcatqq-config.schema.json",
+  "title": "NapCatQQ resolved hub or consumer-facade configuration",
+  "$comment": "Shared definition/catalog resource. A Module MUST bind the role-specific napcatqq-hub-config.schema.json or napcatqq-facade-config.schema.json root, never this union. URI, graph privacy, owner-registry, principal-binding, placement, ingress authority, and aggregate-output relations are additionally enforced by the Host-owned NapCatQQ control/profile validator.",
+  "$defs": {
+    "QqId": {"type": "string", "pattern": "^[0-9]{1,32}$"},
+    "OperationKey": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$", "maxLength": 128},
+    "ConsumerPrincipal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instance_id", "module_id"],
+      "properties": {
+        "instance_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "module_id": {"$ref": "common.schema.json#/$defs/StableId"}
+      }
+    },
+    "ConversationRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"enum": ["private", "group"]},
+        "id": {"$ref": "#/$defs/QqId"}
+      }
+    },
+    "Policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["read", "notify", "send", "upload", "message_control", "moderate", "manage", "catalog_invoke"],
+      "properties": {
+        "read": {"type": "boolean"},
+        "notify": {"enum": ["none", "direct_and_mention", "all"]},
+        "send": {"type": "boolean"},
+        "upload": {"type": "boolean"},
+        "message_control": {"type": "boolean"},
+        "moderate": {"type": "boolean"},
+        "manage": {"type": "boolean"},
+        "catalog_invoke": {"type": "boolean"}
+      }
+    },
+    "ConsumerRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["consumer_principal", "policy"],
+      "properties": {
+        "consumer_principal": {"$ref": "#/$defs/ConsumerPrincipal"},
+        "policy": {"$ref": "#/$defs/Policy"}
+      }
+    },
+    "ConversationRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["conversation", "policy"],
+      "properties": {
+        "conversation": {"$ref": "#/$defs/ConversationRef"},
+        "policy": {"$ref": "#/$defs/Policy"}
+      }
+    },
+    "HubConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "module_role", "runtime_mode", "account_ref", "host_account_principal",
+        "expected_self_id", "connection", "ownership", "compatibility", "account_policy",
+        "consumer_rules", "conversation_rules", "denied_operation_keys", "notifications",
+        "media", "limits"
+      ],
+      "properties": {
+        "schema": {"const": "dolly.napcatqq-config/v1"},
+        "module_role": {"const": "shared_hub"},
+        "runtime_mode": {"enum": ["shadow", "read_only", "active"]},
+        "account_ref": {"$ref": "common.schema.json#/$defs/StableId"},
+        "host_account_principal": {"$ref": "common.schema.json#/$defs/StableId"},
+        "expected_self_id": {"$ref": "#/$defs/QqId"},
+        "connection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "websocket_endpoint", "http_endpoint", "credential_ref", "allow_non_loopback"],
+          "properties": {
+            "mode": {"const": "forward_websocket"},
+            "websocket_endpoint": {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^wss?://(?![^/?#]*@)[^/?#\\s]+(?:/[^?#\\s]*)?$",
+              "maxLength": 2048
+            },
+            "http_endpoint": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "format": "uri",
+                  "pattern": "^https?://(?![^/?#]*@)[^/?#\\s]+(?:/[^?#\\s]*)?$",
+                  "maxLength": 2048
+                },
+                {"type": "null"}
+              ]
+            },
+            "credential_ref": {"$ref": "common.schema.json#/$defs/SecretRef"},
+            "allow_non_loopback": {"type": "boolean"}
+          }
+        },
+        "ownership": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "cross_daemon_active_write"],
+          "properties": {
+            "mode": {"const": "daemon_wide_exclusive"},
+            "cross_daemon_active_write": {"const": "unsupported_v1"}
+          }
+        },
+        "compatibility": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["profile", "registry_digest", "minimum_napcat_version"],
+          "properties": {
+            "profile": {"const": "napcat-onebot-v11"},
+            "registry_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+            "minimum_napcat_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"}
+          }
+        },
+        "account_policy": {"$ref": "#/$defs/Policy"},
+        "consumer_rules": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {"$ref": "#/$defs/ConsumerRule"}
+        },
+        "conversation_rules": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": {"$ref": "#/$defs/ConversationRule"}
+        },
+        "denied_operation_keys": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/OperationKey"}
+        },
+        "notifications": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["debounce_ms", "max_hints_per_minute", "critical_page_durable"],
+          "properties": {
+            "debounce_ms": {"type": "integer", "minimum": 0, "maximum": 600000},
+            "max_hints_per_minute": {"type": "integer", "minimum": 1, "maximum": 60000},
+            "critical_page_durable": {"type": "boolean"}
+          }
+        },
+        "media": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["capture_mode", "convert_silk", "max_asset_bytes", "max_forward_depth", "max_forward_messages"],
+          "properties": {
+            "capture_mode": {"enum": ["capture_all", "capture_notified", "lazy"]},
+            "convert_silk": {"type": "boolean"},
+            "max_asset_bytes": {"type": "integer", "minimum": 1, "maximum": 1073741824},
+            "max_forward_depth": {"type": "integer", "minimum": 0, "maximum": 16},
+            "max_forward_messages": {"type": "integer", "minimum": 1, "maximum": 10000}
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_journal_events", "max_journal_bytes", "max_normalized_event_bytes",
+            "send_per_minute", "management_per_minute"
+          ],
+          "properties": {
+            "max_journal_events": {"type": "integer", "minimum": 1, "maximum": 1000000000},
+            "max_journal_bytes": {"type": "integer", "minimum": 1024, "maximum": 9007199254740991},
+            "max_normalized_event_bytes": {"type": "integer", "minimum": 1024, "maximum": 16777216},
+            "send_per_minute": {"type": "integer", "minimum": 1, "maximum": 60000},
+            "management_per_minute": {"type": "integer", "minimum": 1, "maximum": 60000}
+          }
+        }
+      }
+    },
+    "FacadeConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "module_role", "runtime_mode", "account_ref", "host_account_principal",
+        "hub_module_id", "consumer_principal", "private_result_page_id",
+        "private_notification_page_id", "output_limits"
+      ],
+      "properties": {
+        "schema": {"const": "dolly.napcatqq-config/v1"},
+        "module_role": {"const": "consumer_facade"},
+        "runtime_mode": {"enum": ["shadow", "read_only", "active"]},
+        "account_ref": {"$ref": "common.schema.json#/$defs/StableId"},
+        "host_account_principal": {"$ref": "common.schema.json#/$defs/StableId"},
+        "hub_module_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "consumer_principal": {"$ref": "#/$defs/ConsumerPrincipal"},
+        "private_result_page_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "private_notification_page_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "output_limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_actions_per_activation", "max_output_block_bytes", "max_read_events",
+            "max_read_bytes", "max_top_level_parts", "max_attached_assets",
+            "max_attached_asset_bytes"
+          ],
+          "properties": {
+            "max_actions_per_activation": {"type": "integer", "minimum": 1, "maximum": 64},
+            "max_output_block_bytes": {"type": "integer", "minimum": 4096, "maximum": 16777216},
+            "max_read_events": {"type": "integer", "minimum": 1, "maximum": 10000},
+            "max_read_bytes": {"type": "integer", "minimum": 1024, "maximum": 16777216},
+            "max_top_level_parts": {"type": "integer", "minimum": 1, "maximum": 256},
+            "max_attached_assets": {"type": "integer", "minimum": 0, "maximum": 64},
+            "max_attached_asset_bytes": {"type": "integer", "minimum": 0, "maximum": 1073741824}
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/HubConfig"},
+    {"$ref": "#/$defs/FacadeConfig"}
+  ]
+}

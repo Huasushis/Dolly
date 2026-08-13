@@ -1,0 +1,44 @@
+{
+  "schema": "dolly.test-fixture/v1",
+  "fixture_id": "research-run-set",
+  "kind": "research_run_set",
+  "value": [
+    {
+      "schema": "dolly.research-run/v1",
+      "plan_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "experiment_id": "learning-heldout-v1",
+      "track": "learning",
+      "unit_id": "heldout-method-017",
+      "split": "held_out",
+      "treatment_id": "declared-intervention",
+      "repetition": 0,
+      "seed": 131,
+      "system_artifacts": [
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      ],
+      "started_at": "2026-08-10T18:30:00.123456Z",
+      "ended_at": "2026-08-10T18:30:09.654321Z",
+      "status": "succeeded",
+      "usage": {
+        "model_calls": 2,
+        "tokens": 4096,
+        "tool_calls": 1,
+        "wall_milliseconds": 9531,
+        "cost_microunits": 125000,
+        "network_bytes": 8192,
+        "persistent_storage_growth_bytes": 4096,
+        "peak_memory_bytes": 67108864
+      },
+      "oracle": {
+        "verdict": "pass",
+        "evidence_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "metric_values": {
+        "heldout-success": 1,
+        "negative-transfer": 0
+      },
+      "trace_uri": "urn:dolly:artifacts:learning-heldout-v1:run-017",
+      "trace_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  ]
+}

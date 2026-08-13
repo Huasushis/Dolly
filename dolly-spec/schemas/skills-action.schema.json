@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/skills-action.schema.json",
+  "title": "Stable org.dolly.skills committed Actions",
+  "$defs": {
+    "CatalogRevision": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/Revision" },
+        { "type": "null" }
+      ]
+    },
+    "SkillName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "ListArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filter", "catalog_revision", "cursor", "limit"],
+      "properties": {
+        "filter": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 256 },
+            { "type": "null" }
+          ]
+        },
+        "catalog_revision": { "$ref": "#/$defs/CatalogRevision" },
+        "cursor": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 512 },
+            { "type": "null" }
+          ]
+        },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+      }
+    },
+    "NamedArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "catalog_revision"],
+      "properties": {
+        "name": { "$ref": "#/$defs/SkillName" },
+        "catalog_revision": { "$ref": "#/$defs/CatalogRevision" }
+      }
+    },
+    "ResourceArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "relative_path", "catalog_revision", "byte_range"],
+      "properties": {
+        "name": { "$ref": "#/$defs/SkillName" },
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^[^/\\\\\\u0000][^\\\\\\u0000]*$",
+          "$comment": "Canonical paths use slash separators. The Extension additionally rejects dot/dot-dot segments, resolves beneath the selected canonical Skill root, and rejects platform-equivalent escapes."
+        },
+        "catalog_revision": { "$ref": "#/$defs/CatalogRevision" },
+        "byte_range": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["offset", "length"],
+              "properties": {
+                "offset": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+                "length": { "type": "integer", "minimum": 1, "maximum": 8388608 }
+              }
+            },
+            { "type": "null" }
+          ]
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/CommittedAction" },
+        {
+          "required": ["target"],
+          "properties": {
+            "name": { "const": "org.dolly.skills.list" },
+            "arguments": { "$ref": "#/$defs/ListArgs" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/CommittedAction" },
+        {
+          "required": ["target"],
+          "properties": {
+            "name": { "const": "org.dolly.skills.resolve" },
+            "arguments": { "$ref": "#/$defs/NamedArgs" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/CommittedAction" },
+        {
+          "required": ["target"],
+          "properties": {
+            "name": { "const": "org.dolly.skills.get-manifest" },
+            "arguments": { "$ref": "#/$defs/NamedArgs" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/CommittedAction" },
+        {
+          "required": ["target"],
+          "properties": {
+            "name": { "const": "org.dolly.skills.get-resource" },
+            "arguments": { "$ref": "#/$defs/ResourceArgs" }
+          }
+        }
+      ]
+    }
+  ]
+}

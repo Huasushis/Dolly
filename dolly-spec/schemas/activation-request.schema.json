@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/activation-request.schema.json",
+  "title": "module.activate params",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "worker_epoch", "extension_generation", "lease_generation", "lease_token",
+    "attempt", "manifest"
+  ],
+  "properties": {
+    "worker_epoch": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "extension_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+    "lease_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+    "lease_token": { "$ref": "common.schema.json#/$defs/LeaseToken" },
+    "attempt": { "$ref": "common.schema.json#/$defs/Seq" },
+    "manifest": { "$ref": "activation-manifest.schema.json" }
+  }
+}
+

@@ -1,0 +1,44 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-016",
+  "kind": "config",
+  "covers": ["REQ-ACT-001", "INV-ACTIVATION-011", "INV-RAM-016", "REQ-XUPG-003"],
+  "initial": {
+    "activation": {
+      "state": "ready",
+      "attempt": 0,
+      "manifest": {
+        "config_revision": 42,
+        "effective_config": {"mode": "legacy", "threshold": 7},
+        "effective_config_digest": "sha256:0406c7d60dad47428a106f950b07195c98317e0e3c3c3325b2ff2a77b44b7613",
+        "effective_config_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "current_module_config": {
+      "config_revision": 43,
+      "effective_config": {"mode": "current", "threshold": 9},
+      "effective_config_digest": "sha256:f26d094f9ee954e3a5cc96e73cdac37fbd401b08a8efe888659b33cc53090778",
+      "effective_config_schema_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "generations": [
+      {"generation": 8, "state": "Ready", "current_for_module": true, "supported_config_schema_digests": ["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]},
+      {"generation": 9, "state": "InitializedCandidate", "current_for_module": false, "supported_config_schema_digests": ["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}
+    ]
+  },
+  "stimulus": {"commands": ["AdmitGeneration(9)", "IssueLease"]},
+  "expected": {
+    "outcome": "old_compatible_generation_executes_frozen_config",
+    "assertions": [
+      {"path": "/generations/1/ready_for_module", "op": "equals", "value": false},
+      {"path": "/generations/0/current_for_module", "op": "equals", "value": true},
+      {"path": "/lease/extension_generation", "op": "equals", "value": 8},
+      {"path": "/activation/state", "op": "equals", "value": "leased"},
+      {"path": "/activation/attempt", "op": "equals", "value": 1},
+      {"path": "/module_activate_request/manifest/effective_config", "op": "equals", "value": {"mode": "legacy", "threshold": 7}},
+      {"path": "/module_activate_request/manifest/effective_config_digest", "op": "equals", "value": "sha256:0406c7d60dad47428a106f950b07195c98317e0e3c3c3325b2ff2a77b44b7613"},
+      {"path": "/current_module_config", "op": "unchanged"}
+    ],
+    "emitted": [{"event": "ExtensionGenerationIncompatible", "generation": 9, "reason": "effective_config_schema_digest"}],
+    "crash_label": null
+  }
+}

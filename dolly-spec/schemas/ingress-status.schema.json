@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/ingress-status.schema.json",
+  "title": "host.ingress.status result",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": { "status": { "const": "absent" } }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "result"],
+      "properties": {
+        "status": { "const": "committed" },
+        "result": { "$ref": "ingress-result.schema.json" }
+      }
+    }
+  ]
+}

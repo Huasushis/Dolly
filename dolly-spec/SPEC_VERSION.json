@@ -1,0 +1,9 @@
+{
+  "spec_version": "0.1.0-draft",
+  "protocol_major": 1,
+  "protocol_minor": 0,
+  "config_api_version": "dolly.example/v1alpha1",
+  "json_schema_dialect": "https://json-schema.org/draft/2020-12/schema",
+  "status": "pre-implementation-review"
+}
+

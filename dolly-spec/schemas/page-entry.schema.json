@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/page-entry.schema.json",
+  "title": "DeliveryRecord",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["page_id", "page_seq", "commit_seq", "block_id", "origin"],
+  "properties": {
+    "page_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "page_seq": { "$ref": "common.schema.json#/$defs/Seq" },
+    "commit_seq": { "$ref": "common.schema.json#/$defs/Seq" },
+    "block_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "origin": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "activation_id"],
+          "properties": {
+            "kind": { "const": "activation" },
+            "activation_id": { "$ref": "common.schema.json#/$defs/UuidV7" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "ingress_id"],
+          "properties": {
+            "kind": { "const": "external" },
+            "ingress_id": { "$ref": "common.schema.json#/$defs/UuidV7" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "runtime_event_id"],
+          "properties": {
+            "kind": { "const": "runtime" },
+            "runtime_event_id": { "$ref": "common.schema.json#/$defs/UuidV7" }
+          }
+        }
+      ]
+    }
+  }
+}

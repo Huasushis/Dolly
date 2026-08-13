@@ -1,0 +1,27 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-011",
+  "kind": "core_transition",
+  "covers": ["REQ-PAGE-002", "INV-PAGELOG-013"],
+  "initial": {
+    "page": {"page_id": "jobs", "next_page_seq": 6},
+    "subscription": {"module_id": "worker", "cursor": 4, "status": "paused"},
+    "disposition_audit_rows": []
+  },
+  "stimulus": {
+    "command": "SkipRange",
+    "expected_cursor": 4,
+    "end_exclusive": 7,
+    "reason": "operator-reviewed"
+  },
+  "expected": {
+    "outcome": "SUBSCRIPTION_DISPOSITION_CONFLICT",
+    "assertions": [
+      {"path": "/subscription/cursor", "op": "equals", "value": 4},
+      {"path": "/page/next_page_seq", "op": "equals", "value": 6},
+      {"path": "/disposition_audit_rows", "op": "count", "value": 0}
+    ],
+    "emitted": [],
+    "crash_label": null
+  }
+}

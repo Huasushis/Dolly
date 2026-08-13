@@ -1,0 +1,33 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-014",
+  "kind": "core_transition",
+  "covers": ["REQ-PAGE-003", "INV-PAGELOG-008", "INV-PAGELOG-014"],
+  "initial": {
+    "clock": "2025-01-01T00:00:03.000000Z",
+    "module": {"module_id": "observer", "lifecycle_state": "idle", "subscription_status": "active"},
+    "lossy_page": {
+      "page_id": "signals",
+      "retained_deliveries": [],
+      "pending_unreported_gaps": [{"from_page_seq": 1, "to_page_seq": 2, "reason": "overflow"}]
+    },
+    "eligibility": {
+      "first_pending_at": "2025-01-01T00:00:00.000000Z",
+      "last_arrival_at": "2025-01-01T00:00:00.000000Z",
+      "eligible_at": "2025-01-01T00:00:03.000000Z"
+    }
+  },
+  "stimulus": {"command": "BuildManifest", "reason": "input"},
+  "expected": {
+    "outcome": "gap_only_manifest_ready",
+    "assertions": [
+      {"path": "/manifest/reason", "op": "equals", "value": "input"},
+      {"path": "/manifest/input_items", "op": "count", "value": 0},
+      {"path": "/manifest/cursor_spans", "op": "count", "value": 0},
+      {"path": "/manifest/lossy_gaps", "op": "count", "value": 1},
+      {"path": "/activation/state", "op": "equals", "value": "ready"}
+    ],
+    "emitted": [{"event": "ManifestCreated", "reason": "input"}],
+    "crash_label": null
+  }
+}

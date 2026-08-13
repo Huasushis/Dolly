@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/napcatqq-mailbox-changed.schema.json",
+  "title": "Content-free coalesced NapCatQQ mailbox-change hint",
+  "$comment": "The target private notification Page identifies the facade/account. The payload deliberately carries no cursor, count, conversation, event class, sender, message, gap, overflow, or media state. Ingress idempotency and coalescing state live outside this payload. This schema closes only the JSON value; org.dolly.validator.napcatqq-profile-admission@1 closes the entire ingress BlockDraft to exactly one such JSON Part, actions:[], and no description/metadata/hints/extra Parts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "kind"],
+  "properties": {
+    "schema": {"const": "dolly.napcatqq-mailbox-changed/v1"},
+    "kind": {"const": "qq_mailbox_changed"}
+  }
+}

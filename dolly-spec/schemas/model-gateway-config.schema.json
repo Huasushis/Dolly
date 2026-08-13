@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/model-gateway-config.schema.json",
+  "title": "Resolved Model Gateway configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profiles", "rate_limits", "max_concurrency", "queue_capacity", "default_deadline_ms", "max_attempts", "retry_base_ms", "retry_cap_ms", "request_record_retention_ms"],
+  "properties": {
+    "profiles": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 256,
+      "propertyNames": { "$ref": "common.schema.json#/$defs/StableId" },
+      "additionalProperties": { "$ref": "model-profile.schema.json" }
+    },
+    "rate_limits": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scope", "profile_id", "credential_ref", "max_requests_per_minute", "max_tokens_per_minute", "max_cost_microunits_per_day", "max_concurrency"],
+        "properties": {
+          "scope": { "enum": ["profile", "credential", "profile_credential"] },
+          "profile_id": {
+            "oneOf": [
+              { "$ref": "common.schema.json#/$defs/StableId" },
+              { "type": "null" }
+            ]
+          },
+          "credential_ref": {
+            "oneOf": [
+              { "$ref": "common.schema.json#/$defs/SecretRef" },
+              { "type": "null" }
+            ]
+          },
+          "max_requests_per_minute": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+          "max_tokens_per_minute": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+          "max_cost_microunits_per_day": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+          "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 4096 }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "scope": { "const": "profile" } }, "required": ["scope"] },
+            "then": { "properties": { "profile_id": { "$ref": "common.schema.json#/$defs/StableId" }, "credential_ref": { "type": "null" } } }
+          },
+          {
+            "if": { "properties": { "scope": { "const": "credential" } }, "required": ["scope"] },
+            "then": { "properties": { "profile_id": { "type": "null" }, "credential_ref": { "$ref": "common.schema.json#/$defs/SecretRef" } } }
+          },
+          {
+            "if": { "properties": { "scope": { "const": "profile_credential" } }, "required": ["scope"] },
+            "then": { "properties": { "profile_id": { "$ref": "common.schema.json#/$defs/StableId" }, "credential_ref": { "$ref": "common.schema.json#/$defs/SecretRef" } } }
+          }
+        ]
+      }
+    },
+    "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 4096 },
+    "queue_capacity": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+    "default_deadline_ms": { "type": "integer", "minimum": 100, "maximum": 86400000 },
+    "max_attempts": { "type": "integer", "minimum": 1, "maximum": 16 },
+    "retry_base_ms": { "type": "integer", "minimum": 1, "maximum": 60000 },
+    "retry_cap_ms": { "type": "integer", "minimum": 1, "maximum": 3600000 },
+    "request_record_retention_ms": { "type": "integer", "minimum": 60000, "maximum": 31557600000 }
+  }
+}

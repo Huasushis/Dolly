@@ -1,0 +1,26 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-RESEARCH-001",
+  "kind": "research",
+  "covers": ["INV-BLOCK-007", "REQ-TENSITY-001", "REQ-TENSITY-002"],
+  "initial": {
+    "stable_context": ["current-input", "pinned-evidence"],
+    "registry": [],
+    "cases": [
+      {"id": "removed-direct-number", "hints": {"tensity": 1.0}},
+      {"id": "unsupported-envelope", "hints": {"org.dolly.research.tensity": {"version": 1, "schema_uri": "urn:dolly:research-hint:tensity:1", "schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "experiment_id": "tensity-context-v1", "payload": {"score": 0.73}}}}
+    ]
+  },
+  "stimulus": {"command": "validate_then_compile_context_and_run_gc"},
+  "expected": {
+    "outcome": "direct_shape_rejected_and_unregistered_envelope_ignored",
+    "assertions": [
+      {"path": "/cases/removed-direct-number/schema_valid", "op": "equals", "value": false},
+      {"path": "/cases/unsupported-envelope/schema_valid", "op": "equals", "value": true},
+      {"path": "/cases/unsupported-envelope/semantic_effect", "op": "equals", "value": false},
+      {"path": "/stable_context", "op": "equals", "value": ["current-input", "pinned-evidence"]},
+      {"path": "/gc_reachability", "op": "unchanged"}
+    ],
+    "emitted": [{"event": "research_hint_ignored", "reason": "registry_entry_missing"}]
+  }
+}

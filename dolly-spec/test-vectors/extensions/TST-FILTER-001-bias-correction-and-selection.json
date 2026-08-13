@@ -1,0 +1,46 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-FILTER-001",
+  "kind": "extension",
+  "covers": ["REQ-FILTER-001", "REQ-FILTER-002"],
+  "initial": {
+    "config": {
+      "channel": "default",
+      "state_epoch": "baseline-v1",
+      "new_sample_weight_ppm": 200000,
+      "bias_correction": true
+    },
+    "internal_scale": 1000000,
+    "sources": {
+      "expert-a": {"accumulator": 0, "weight": 0, "observation_count": 0},
+      "expert-b": {"accumulator": 0, "weight": 0, "observation_count": 0},
+      "expert-c": {"accumulator": 0, "weight": 0, "observation_count": 0}
+    }
+  },
+  "stimulus": {
+    "command": "apply_distinct_observations_then_select",
+    "ema_probe": {"source": "expert-a", "scores": [100, 900]},
+    "selection_probe_corrected_scores_q": {
+      "expert-a": 200000000,
+      "expert-b": 400000000,
+      "expert-c": 750000000
+    }
+  },
+  "expected": {
+    "outcome": "integer_bias_corrected_ema_and_jcs_utf8_tie_break",
+    "assertions": [
+      {"path": "/ema_probe/after_first/corrected_score_q", "op": "equals", "value": 100000000},
+      {"path": "/ema_probe/after_second/accumulator", "op": "equals", "value": 196000000},
+      {"path": "/ema_probe/after_second/weight", "op": "equals", "value": 360000},
+      {"path": "/ema_probe/after_second/corrected_score_q", "op": "equals", "value": 544444444},
+      {"path": "/selection/target_score_q", "op": "equals", "value": 300000000},
+      {"path": "/selection/expert-a/distance", "op": "equals", "value": 900000000},
+      {"path": "/selection/expert-b/distance", "op": "equals", "value": 900000000},
+      {"path": "/selection/winner", "op": "equals", "value": "expert-a"}
+    ],
+    "emitted": [
+      {"kind": "selection", "source_module_id": "expert-a", "normalized_score": 200}
+    ],
+    "crash_label": null
+  }
+}

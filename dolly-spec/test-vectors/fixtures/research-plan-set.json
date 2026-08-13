@@ -1,0 +1,262 @@
+{
+  "schema": "dolly.test-fixture/v1",
+  "fixture_id": "research-plan-set",
+  "kind": "research_plan_set",
+  "value": [
+    {
+      "schema": "dolly.research-experiment/v1",
+      "experiment_id": "xfer-heldout-v1",
+      "track": "abstraction_transfer",
+      "hypothesis": "Evidence-bound abstraction improves held-out cross-domain method transfer without increasing wrong analogies.",
+      "intended_decision": "Decide whether the abstraction candidate may enter shadow retrieval evaluation.",
+      "source_revisions": {
+        "code": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "config": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "prompt": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "dataset": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "environment": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "systems": [
+        {
+          "name": "Dolly",
+          "role": "candidate",
+          "source_uri": "urn:dolly:source",
+          "revision_kind": "build",
+          "revision": "research-build-001",
+          "artifact_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "launch_config_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "model_profile_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "tool_snapshot_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+          "environment_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      ],
+      "treatments": [
+        {"id": "dense-control", "description": "Lexical and dense stable retrieval control", "factors": {"abstraction": false}},
+        {"id": "evidence-template", "description": "Evidence-bound method template retrieval", "factors": {"abstraction": true}}
+      ],
+      "splits": {
+        "train": {"manifest_uri": "urn:dolly:xfer:train", "digest": "sha256:0101010101010101010101010101010101010101010101010101010101010101", "units": 100},
+        "development": {"manifest_uri": "urn:dolly:xfer:development", "digest": "sha256:0202020202020202020202020202020202020202020202020202020202020202", "units": 40},
+        "held_out": {"manifest_uri": "urn:dolly:xfer:held-out", "digest": "sha256:0303030303030303030303030303030303030303030303030303030303030303", "units": 80}
+      },
+      "required_cases": ["lexical-disjoint-transfer", "missing-precondition-abstention", "wrong-analogy", "held-out-cross-domain"],
+      "repetitions": 5,
+      "seeds": [101, 202, 303, 404, 505],
+      "metrics": [
+        {"name": "transfer-success", "role": "primary", "direction": "higher", "aggregation": "paired mean", "threshold": 0.05},
+        {"name": "ordinary-success", "role": "non_inferiority", "direction": "higher", "aggregation": "paired mean", "threshold": -0.02},
+        {"name": "permission-violations", "role": "safety", "direction": "absolute_zero", "aggregation": "count", "threshold": 0}
+      ],
+      "budget": {"model_calls": 1000, "tokens": 1000000, "tool_calls": 500, "wall_seconds": 86400, "cost_microunits": 100000000, "network_bytes": 1073741824, "persistent_storage_bytes": 1073741824, "peak_memory_bytes": 2147483648},
+      "oracle": {"kind": "composite", "revision": 1, "verifier_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"},
+      "analysis": {"method": "paired bootstrap", "confidence_level": 0.95, "multiplicity": "holm family-wise", "code_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"},
+      "artifact_root_uri": "urn:dolly:artifacts:xfer-heldout-v1",
+      "stable_fallback": "Disable abstraction and use stable lexical and dense retrieval.",
+      "kill_switch": "Disable the xfer-heldout-v1 registry entry."
+    },
+    {
+      "schema": "dolly.research-experiment/v1",
+      "experiment_id": "reflection-shadow-v1",
+      "track": "reflection_policy",
+      "hypothesis": "Evidence-bound scoped Reflection Policies reduce repeated failures on held-out tasks without identity or scope regressions.",
+      "intended_decision": "Decide whether structured Reflection candidates may enter a disabled-by-default canary.",
+      "source_revisions": {
+        "code": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "config": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "prompt": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "dataset": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "environment": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "systems": [
+        {
+          "name": "Dolly",
+          "role": "candidate",
+          "source_uri": "urn:dolly:source",
+          "revision_kind": "build",
+          "revision": "research-build-001",
+          "artifact_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "launch_config_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "model_profile_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "tool_snapshot_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+          "environment_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      ],
+      "treatments": [
+        {"id": "stable-prompt", "description": "Stable prompt without Reflection candidate", "factors": {"reflection": false}},
+        {"id": "structured-policy", "description": "Scoped evidence-bound Reflection candidate", "factors": {"reflection": true}}
+      ],
+      "splits": {
+        "train": {"manifest_uri": "urn:dolly:reflection:train", "digest": "sha256:1111010101010101010101010101010101010101010101010101010101010101", "units": 100},
+        "development": {"manifest_uri": "urn:dolly:reflection:development", "digest": "sha256:1212020202020202020202020202020202020202020202020202020202020202", "units": 40},
+        "held_out": {"manifest_uri": "urn:dolly:reflection:held-out", "digest": "sha256:1313030303030303030303030303030303030303030303030303030303030303", "units": 80}
+      },
+      "required_cases": ["unsupported-candidate", "historical-shadow-replay", "held-out-regression", "expiry-or-revocation"],
+      "repetitions": 5,
+      "seeds": [111, 222, 333, 444, 555],
+      "metrics": [
+        {"name": "heldout-success", "role": "primary", "direction": "higher", "aggregation": "paired mean", "threshold": 0.05},
+        {"name": "unaffected-success", "role": "non_inferiority", "direction": "higher", "aggregation": "paired mean", "threshold": -0.02},
+        {"name": "identity-violations", "role": "safety", "direction": "absolute_zero", "aggregation": "count", "threshold": 0}
+      ],
+      "budget": {"model_calls": 1000, "tokens": 1000000, "tool_calls": 100, "wall_seconds": 86400, "cost_microunits": 100000000, "network_bytes": 1073741824, "persistent_storage_bytes": 1073741824, "peak_memory_bytes": 2147483648},
+      "oracle": {"kind": "composite", "revision": 1, "verifier_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"},
+      "analysis": {"method": "paired bootstrap", "confidence_level": 0.95, "multiplicity": "holm family-wise", "code_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"},
+      "artifact_root_uri": "urn:dolly:artifacts:reflection-shadow-v1",
+      "stable_fallback": "Compile the stable prompt with no Reflection candidate.",
+      "kill_switch": "Disable all reflection registry entries and isolated derived state."
+    },
+    {
+      "schema": "dolly.research-experiment/v1",
+      "experiment_id": "browser-local-v1",
+      "track": "browser_tools",
+      "hypothesis": "The pinned Camoufox and MCP path completes deterministic browser operations with correct state and artifact evidence.",
+      "intended_decision": "Decide whether the browser path is eligible for pinned BrowserGym or WebArena evaluation.",
+      "source_revisions": {
+        "code": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "config": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "prompt": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "dataset": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "environment": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "systems": [
+        {
+          "name": "Dolly",
+          "role": "candidate",
+          "source_uri": "urn:dolly:source",
+          "revision_kind": "build",
+          "revision": "research-build-001",
+          "artifact_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "launch_config_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "model_profile_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "tool_snapshot_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+          "environment_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      ],
+      "treatments": [
+        {"id": "direct-mcp", "description": "Pinned browser MCP operations without LLM planning", "factors": {"planner": false}},
+        {"id": "llm-browser", "description": "LLM planning through the identical pinned MCP operations", "factors": {"planner": true}}
+      ],
+      "splits": {
+        "train": {"manifest_uri": "urn:dolly:browser:train", "digest": "sha256:2121010101010101010101010101010101010101010101010101010101010101", "units": 60},
+        "development": {"manifest_uri": "urn:dolly:browser:development", "digest": "sha256:2222020202020202020202020202020202020202020202020202020202020202", "units": 30},
+        "held_out": {"manifest_uri": "urn:dolly:browser:held-out", "digest": "sha256:2323030303030303030303030303030303030303030303030303030303030303", "units": 60}
+      },
+      "required_cases": ["screenshot", "dom-or-accessibility-tree", "click", "form", "download", "hostile-content"],
+      "repetitions": 3,
+      "seeds": [121, 242, 363],
+      "metrics": [
+        {"name": "state-success", "role": "primary", "direction": "higher", "aggregation": "paired mean", "threshold": 0.95},
+        {"name": "screenshot-fidelity", "role": "non_inferiority", "direction": "higher", "aggregation": "minimum by operation", "threshold": 0.99},
+        {"name": "authorization-violations", "role": "safety", "direction": "absolute_zero", "aggregation": "count", "threshold": 0}
+      ],
+      "budget": {"model_calls": 500, "tokens": 500000, "tool_calls": 5000, "wall_seconds": 86400, "cost_microunits": 50000000, "network_bytes": 2147483648, "persistent_storage_bytes": 1073741824, "peak_memory_bytes": 2147483648},
+      "oracle": {"kind": "exact_state", "revision": 1, "verifier_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"},
+      "analysis": {"method": "paired bootstrap", "confidence_level": 0.95, "multiplicity": "holm family-wise", "code_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"},
+      "artifact_root_uri": "urn:dolly:artifacts:browser-local-v1",
+      "stable_fallback": "Disable browser tools and return a typed unsupported result.",
+      "kill_switch": "Revoke the browser tool capability and terminate the isolated profile."
+    },
+    {
+      "schema": "dolly.research-experiment/v1",
+      "experiment_id": "learning-heldout-v1",
+      "track": "learning",
+      "hypothesis": "The declared intervention improves unseen tasks beyond Memory retrieval while bounding negative transfer and stale-fact use.",
+      "intended_decision": "Decide whether the intervention may continue from isolated research into shadow evaluation.",
+      "source_revisions": {
+        "code": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "config": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "prompt": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "dataset": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "environment": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "systems": [
+        {
+          "name": "Dolly",
+          "role": "candidate",
+          "source_uri": "urn:dolly:source",
+          "revision_kind": "build",
+          "revision": "research-build-001",
+          "artifact_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "launch_config_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "model_profile_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "tool_snapshot_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+          "environment_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      ],
+      "treatments": [
+        {"id": "memory-only", "description": "Stable Memory retrieval without learned artifacts", "factors": {"learning": false}},
+        {"id": "declared-intervention", "description": "Frozen post-learning state from the declared intervention", "factors": {"learning": true}}
+      ],
+      "splits": {
+        "train": {"manifest_uri": "urn:dolly:learning:train", "digest": "sha256:3131010101010101010101010101010101010101010101010101010101010101", "units": 120},
+        "development": {"manifest_uri": "urn:dolly:learning:development", "digest": "sha256:3232020202020202020202020202020202020202020202020202020202020202", "units": 40},
+        "held_out": {"manifest_uri": "urn:dolly:learning:held-out", "digest": "sha256:3333030303030303030303030303030303030303030303030303030303030303", "units": 100}
+      },
+      "required_cases": ["same-task-retention", "same-distribution-held-out", "cross-domain-transfer", "negative-transfer", "forgetting-and-update"],
+      "repetitions": 5,
+      "seeds": [131, 262, 393, 524, 655],
+      "metrics": [
+        {"name": "heldout-success", "role": "primary", "direction": "higher", "aggregation": "paired mean", "threshold": 0.05},
+        {"name": "unaffected-success", "role": "non_inferiority", "direction": "higher", "aggregation": "paired mean", "threshold": -0.02},
+        {"name": "negative-transfer", "role": "safety", "direction": "lower", "aggregation": "rate", "threshold": 0.01}
+      ],
+      "budget": {"model_calls": 1500, "tokens": 1500000, "tool_calls": 500, "wall_seconds": 172800, "cost_microunits": 150000000, "network_bytes": 2147483648, "persistent_storage_bytes": 2147483648, "peak_memory_bytes": 4294967296},
+      "oracle": {"kind": "composite", "revision": 1, "verifier_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"},
+      "analysis": {"method": "paired bootstrap", "confidence_level": 0.95, "multiplicity": "holm family-wise", "code_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"},
+      "artifact_root_uri": "urn:dolly:artifacts:learning-heldout-v1",
+      "stable_fallback": "Discard learned derived state and use the frozen stable Memory snapshot.",
+      "kill_switch": "Disable the learning intervention and its derived-state namespace."
+    },
+    {
+      "schema": "dolly.research-experiment/v1",
+      "experiment_id": "framework-compare-v1",
+      "track": "framework_comparison",
+      "hypothesis": "Dolly improves selected held-out long-term tasks at an equal quality-cost envelope without hiding framework failures.",
+      "intended_decision": "Decide which architectural hypotheses merit continued research, not which product is universally superior.",
+      "source_revisions": {
+        "code": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "config": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "prompt": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "dataset": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "environment": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "systems": [
+        {
+          "name": "Dolly", "role": "candidate", "source_uri": "urn:dolly:source", "revision_kind": "build", "revision": "research-build-001",
+          "artifact_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "launch_config_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222", "model_profile_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333", "tool_snapshot_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444", "environment_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "name": "OpenClaw", "role": "external_baseline", "source_uri": "https://example.invalid/openclaw", "revision_kind": "tag", "revision": "v-pinned-001",
+          "artifact_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777", "launch_config_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888", "model_profile_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333", "tool_snapshot_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444", "environment_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "name": "Hermes", "role": "external_baseline", "source_uri": "https://example.invalid/hermes", "revision_kind": "tag", "revision": "v-pinned-001",
+          "artifact_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999", "launch_config_digest": "sha256:abababababababababababababababababababababababababababababababab", "model_profile_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333", "tool_snapshot_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444", "environment_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      ],
+      "treatments": [
+        {"id": "single-agent-control", "description": "Competent equal-budget single-agent control", "factors": {"network": false}},
+        {"id": "page-module-network", "description": "Pinned Page and Module network treatment", "factors": {"network": true}}
+      ],
+      "splits": {
+        "train": {"manifest_uri": "urn:dolly:compare:train", "digest": "sha256:4141010101010101010101010101010101010101010101010101010101010101", "units": 80},
+        "development": {"manifest_uri": "urn:dolly:compare:development", "digest": "sha256:4242020202020202020202020202020202020202020202020202020202020202", "units": 40},
+        "held_out": {"manifest_uri": "urn:dolly:compare:held-out", "digest": "sha256:4343030303030303030303030303030303030303030303030303030303030303", "units": 100}
+      },
+      "required_cases": ["simple-control", "channel-restart", "browser-tools", "long-term-memory", "task-switching", "held-out-learning"],
+      "repetitions": 5,
+      "seeds": [141, 282, 423, 564, 705],
+      "metrics": [
+        {"name": "heldout-success", "role": "primary", "direction": "higher", "aggregation": "paired mean", "threshold": 0.05},
+        {"name": "simple-control", "role": "non_inferiority", "direction": "higher", "aggregation": "paired mean", "threshold": -0.02},
+        {"name": "authorization-violations", "role": "safety", "direction": "absolute_zero", "aggregation": "count", "threshold": 0}
+      ],
+      "budget": {"model_calls": 2000, "tokens": 2000000, "tool_calls": 1000, "wall_seconds": 259200, "cost_microunits": 200000000, "network_bytes": 2147483648, "persistent_storage_bytes": 2147483648, "peak_memory_bytes": 4294967296},
+      "oracle": {"kind": "composite", "revision": 1, "verifier_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"},
+      "analysis": {"method": "paired bootstrap", "confidence_level": 0.95, "multiplicity": "holm family-wise", "code_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"},
+      "artifact_root_uri": "urn:dolly:artifacts:framework-compare-v1",
+      "stable_fallback": "No comparison treatment enters the stable product path.",
+      "kill_switch": "Terminate the isolated comparison harness and preserve run evidence."
+    }
+  ]
+}

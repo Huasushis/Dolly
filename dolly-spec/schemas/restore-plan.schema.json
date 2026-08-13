@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/restore-plan.schema.json",
+  "title": "Dolly restore or clone identity plan",
+  "$defs": {
+    "InstanceIdentity": {
+      "$ref": "backup-manifest.schema.json#/$defs/InstanceIdentity"
+    },
+    "FenceProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "proof_digest", "observed_at"],
+      "properties": {
+        "kind": {
+          "enum": ["exclusive_instance_lock", "source_retired", "external_backend_fence"]
+        },
+        "proof_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "observed_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ScopeDisposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "module_id", "source_storage_scope_id", "disposition",
+        "target_storage_scope_id", "migration_operation_id"
+      ],
+      "properties": {
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "source_storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+        "disposition": { "enum": ["preserve", "isolated_copy", "remap", "disabled"] },
+        "target_storage_scope_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+            { "type": "null" }
+          ]
+        },
+        "migration_operation_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/UuidV7" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "disposition": { "enum": ["preserve", "isolated_copy"] } },
+            "required": ["disposition"]
+          },
+          "then": {
+            "properties": {
+              "target_storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+              "migration_operation_id": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "disposition": { "const": "remap" } },
+            "required": ["disposition"]
+          },
+          "then": {
+            "properties": {
+              "target_storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+              "migration_operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "disposition": { "const": "disabled" } },
+            "required": ["disposition"]
+          },
+          "then": {
+            "properties": {
+              "target_storage_scope_id": { "type": "null" },
+              "migration_operation_id": { "type": "null" }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "operation_id", "backup_id", "mode", "source", "target",
+    "scope_dispositions", "source_fence_proof", "external_effect_policy", "deadline"
+  ],
+  "properties": {
+    "schema": { "const": "dolly.restore-plan/v1" },
+    "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "backup_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "mode": {
+      "enum": ["replace_same_identity", "isolated_snapshot_clone", "portable_fork"]
+    },
+    "source": { "$ref": "#/$defs/InstanceIdentity" },
+    "target": { "$ref": "#/$defs/InstanceIdentity" },
+    "scope_dispositions": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/ScopeDisposition" }
+    },
+    "source_fence_proof": {
+      "oneOf": [
+        { "$ref": "#/$defs/FenceProof" },
+        { "type": "null" }
+      ]
+    },
+    "external_effect_policy": {
+      "enum": ["restore_only_after_fence", "disabled", "disabled_until_rebound"]
+    },
+    "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "mode": { "const": "replace_same_identity" } },
+        "required": ["mode"]
+      },
+      "then": {
+        "properties": {
+          "source_fence_proof": { "$ref": "#/$defs/FenceProof" },
+          "external_effect_policy": { "const": "restore_only_after_fence" },
+          "scope_dispositions": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/ScopeDisposition" },
+                { "properties": { "disposition": { "const": "preserve" } } }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "mode": { "const": "isolated_snapshot_clone" } },
+        "required": ["mode"]
+      },
+      "then": {
+        "properties": {
+          "source_fence_proof": { "type": "null" },
+          "external_effect_policy": { "const": "disabled" },
+          "scope_dispositions": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/ScopeDisposition" },
+                { "properties": { "disposition": { "const": "isolated_copy" } } }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "mode": { "const": "portable_fork" } },
+        "required": ["mode"]
+      },
+      "then": {
+        "properties": {
+          "source_fence_proof": { "type": "null" },
+          "external_effect_policy": { "const": "disabled_until_rebound" },
+          "scope_dispositions": {
+            "items": {
+              "allOf": [
+                { "$ref": "#/$defs/ScopeDisposition" },
+                { "properties": { "disposition": { "enum": ["remap", "disabled"] } } }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

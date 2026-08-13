@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/module-descriptor.schema.json",
+  "title": "ModuleDescriptor",
+  "x-dolly-action-set-validator": {
+    "id": "org.dolly.validator.module-descriptor-actions",
+    "revision": 1
+  },
+  "$defs": {
+    "ActivationLedgerDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "schema_version", "location"],
+      "properties": {
+        "namespace": { "$ref": "common.schema.json#/$defs/QualifiedName" },
+        "schema_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+        },
+        "location": { "const": "module_state_directory" }
+      }
+    },
+    "ActivationReplayContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "evidence", "ledger"],
+      "properties": {
+        "mode": {
+          "enum": ["never_auto_retry", "fenced_replay"],
+          "default": "never_auto_retry"
+        },
+        "evidence": {
+          "enum": ["none", "pure_compute", "activation_ledger"],
+          "default": "none"
+        },
+        "ledger": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/ActivationLedgerDescriptor" }
+          ],
+          "default": null
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "mode": { "const": "never_auto_retry" } },
+            "required": ["mode"]
+          },
+          "then": {
+            "properties": {
+              "evidence": { "const": "none" },
+              "ledger": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "mode": { "const": "fenced_replay" } },
+            "required": ["mode"]
+          },
+          "then": {
+            "properties": {
+              "evidence": { "enum": ["pure_compute", "activation_ledger"] }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "evidence": { "const": "pure_compute" } },
+            "required": ["evidence"]
+          },
+          "then": { "properties": { "ledger": { "type": "null" } } }
+        },
+        {
+          "if": {
+            "properties": { "evidence": { "const": "activation_ledger" } },
+            "required": ["evidence"]
+          },
+          "then": { "properties": { "ledger": { "type": "object" } } }
+        }
+      ]
+    },
+    "Contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "part_kinds", "action_names"],
+      "properties": {
+        "summary": { "type": "string", "maxLength": 16384 },
+        "part_kinds": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "enum": ["text", "json", "asset", "block_ref"] }
+        },
+        "action_names": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/ActionName" }
+        }
+      }
+    },
+    "SemanticValidatorBinding": {
+      "$ref": "common.schema.json#/$defs/ActionSemanticValidatorBinding"
+    },
+    "SchemaBinding": {
+      "$ref": "common.schema.json#/$defs/ActionSchemaBinding"
+    },
+    "ActionContract": {
+      "$ref": "common.schema.json#/$defs/FrozenActionContract"
+    },
+    "Template": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accepts", "emits", "actions"],
+      "properties": {
+        "accepts": { "$ref": "#/$defs/Contract" },
+        "emits": { "$ref": "#/$defs/Contract" },
+        "actions": {
+          "type": "array",
+          "maxItems": 128,
+          "$comment": "The bound module-descriptor semantic validator rejects duplicate ActionContract.name values.",
+          "items": { "$ref": "#/$defs/ActionContract" }
+        },
+        "activation_replay_contract": {
+          "$ref": "#/$defs/ActivationReplayContract",
+          "default": { "mode": "never_auto_retry", "evidence": "none", "ledger": null }
+        },
+        "metadata": { "$ref": "common.schema.json#/$defs/Metadata" }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "module_id", "descriptor_revision", "display_name", "accepts",
+    "emits", "actions", "activation_replay_contract", "trust", "metadata"
+  ],
+  "properties": {
+    "schema": { "const": "dolly.module-descriptor/v1" },
+    "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "descriptor_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "display_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "accepts": { "$ref": "#/$defs/Contract" },
+    "emits": { "$ref": "#/$defs/Contract" },
+    "actions": {
+      "type": "array",
+      "maxItems": 128,
+      "$comment": "The bound module-descriptor semantic validator rejects duplicate ActionContract.name values.",
+      "items": { "$ref": "#/$defs/ActionContract" }
+    },
+    "activation_replay_contract": { "$ref": "#/$defs/ActivationReplayContract" },
+    "trust": { "enum": ["system", "trusted", "untrusted"] },
+    "metadata": { "$ref": "common.schema.json#/$defs/Metadata" }
+  }
+}

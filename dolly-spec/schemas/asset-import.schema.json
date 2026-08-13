@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/asset-import.schema.json",
+  "title": "Asset import request",
+  "$comment": "This is the preprocessed host.asset.import input. asset_input is not a BlockDraft member; a successful import yields an ordinary asset Part reference.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "import_id", "instance_id", "module_id", "media_kind", "source",
+    "declared_media_type", "remote_required", "deadline"
+  ],
+  "properties": {
+    "import_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "instance_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "activation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "lease_token": { "$ref": "common.schema.json#/$defs/LeaseToken" },
+    "media_kind": { "enum": ["image", "audio", "video", "file"] },
+    "source": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "base64"],
+          "properties": {
+            "kind": { "const": "inline_base64" },
+            "base64": {
+              "type": "string",
+              "minLength": 4,
+              "maxLength": 50331648,
+              "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "url", "max_bytes"],
+          "properties": {
+            "kind": { "const": "remote_url" },
+            "url": { "type": "string", "format": "uri", "pattern": "^https://", "maxLength": 4096 },
+            "max_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "file_capability"],
+          "properties": {
+            "kind": { "const": "module_file" },
+            "file_capability": { "$ref": "common.schema.json#/$defs/LeaseToken" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "asset_id"],
+          "properties": {
+            "kind": { "const": "existing_asset" },
+            "asset_id": { "$ref": "common.schema.json#/$defs/AssetId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "stream_capability", "max_bytes"],
+          "properties": {
+            "kind": { "const": "stream" },
+            "stream_capability": { "$ref": "common.schema.json#/$defs/LeaseToken" },
+            "max_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+          }
+        }
+      ]
+    },
+    "declared_media_type": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/MimeType" },
+        { "type": "null" }
+      ]
+    },
+    "remote_required": { "type": "boolean" },
+    "expected_byte_length": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
+    "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "source": {
+            "properties": { "kind": { "const": "inline_base64" } },
+            "required": ["kind"]
+          }
+        },
+        "required": ["source"]
+      },
+      "then": {
+        "properties": {
+          "declared_media_type": { "$ref": "common.schema.json#/$defs/MimeType" }
+        }
+      }
+    },
+    {
+      "if": { "required": ["activation_id"] },
+      "then": { "required": ["lease_token"] }
+    },
+    {
+      "if": { "required": ["lease_token"] },
+      "then": { "required": ["activation_id"] }
+    }
+  ]
+}

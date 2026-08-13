@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/asset-service-config.schema.json",
+  "title": "Resolved Asset Service configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "local_root", "max_encoded_bytes", "max_inline_base64_chars", "max_decoded_bytes",
+    "max_image_pixels", "max_frames", "max_redirects",
+    "remote_fetch_timeout_ms", "lease_max_ms", "gc_grace_ms", "replica_retry", "replica"
+  ],
+  "properties": {
+    "local_root": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "max_encoded_bytes": { "type": "integer", "minimum": 1024, "maximum": 268435456 },
+    "max_inline_base64_chars": { "type": "integer", "minimum": 4, "maximum": 50331648 },
+    "max_decoded_bytes": { "type": "integer", "minimum": 1024, "maximum": 1073741824 },
+    "max_image_pixels": { "type": "integer", "minimum": 1, "maximum": 1000000000 },
+    "max_frames": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+    "max_redirects": { "type": "integer", "minimum": 0, "maximum": 16 },
+    "remote_fetch_timeout_ms": { "type": "integer", "minimum": 100, "maximum": 3600000 },
+    "lease_max_ms": { "type": "integer", "minimum": 1000, "maximum": 604800000 },
+    "gc_grace_ms": { "type": "integer", "minimum": 60000, "maximum": 315576000000 },
+    "replica_retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_import_attempts", "retry_base_ms", "retry_cap_ms"],
+      "properties": {
+        "max_import_attempts": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "retry_base_ms": { "type": "integer", "minimum": 1, "maximum": 60000 },
+        "retry_cap_ms": { "type": "integer", "minimum": 1, "maximum": 3600000 }
+      }
+    },
+    "replica": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": { "enabled": { "const": false } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "endpoint", "bucket", "prefix", "credential_ref"],
+          "properties": {
+            "enabled": { "const": true },
+            "endpoint": { "type": "string", "format": "uri", "pattern": "^https://", "maxLength": 2048 },
+            "bucket": { "type": "string", "minLength": 1, "maxLength": 255 },
+            "prefix": { "type": "string", "minLength": 1, "maxLength": 1024 },
+            "credential_ref": { "$ref": "common.schema.json#/$defs/SecretRef" }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/levelupper-portable-block.schema.json",
+  "title": "LevelUpper stable portable Block content without Core authority",
+  "$defs": {
+    "ForeignKey": {
+      "type": "string", "minLength": 1, "maxLength": 255,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "PortablePart": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "text", "format"],
+          "properties": {
+            "kind": {"const": "text"},
+            "text": {"type": "string", "maxLength": 262144},
+            "format": {"enum": ["plain", "markdown"]},
+            "language": {"type": "string", "minLength": 2, "maxLength": 71, "pattern": "^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "value", "schema_uri", "schema_digest"],
+          "properties": {
+            "kind": {"const": "json"},
+            "value": {"$ref": "common.schema.json#/$defs/JsonValue"},
+            "schema_uri": {"type": "string", "format": "uri", "minLength": 3, "maxLength": 512},
+            "schema_digest": {"$ref": "common.schema.json#/$defs/Sha256"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "foreign_asset_key", "content_digest", "byte_length", "media_type", "view"],
+          "properties": {
+            "kind": {"const": "asset"},
+            "foreign_asset_key": {"$ref": "#/$defs/ForeignKey"},
+            "content_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+            "byte_length": {"type": "integer", "minimum": 0, "maximum": 1073741824},
+            "media_type": {"$ref": "common.schema.json#/$defs/MimeType"},
+            "view": {"oneOf": [{"$ref": "common.schema.json#/$defs/CropRect"}, {"type": "null"}]}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "foreign_block_key", "relation"],
+          "properties": {
+            "kind": {"const": "block_ref"},
+            "foreign_block_key": {"$ref": "#/$defs/ForeignKey"},
+            "relation": {"enum": ["forward", "reply_to", "evidence", "derived_from"]}
+          }
+        }
+      ]
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "semantic_validator", "foreign_block_key", "source_alias", "description", "parts",
+    "content_digest"
+  ],
+  "properties": {
+    "schema": {"const": "dolly.levelupper-portable-block/v1"},
+    "semantic_validator": {"const": "org.dolly.validator.levelupper-content@1"},
+    "foreign_block_key": {"$ref": "#/$defs/ForeignKey"},
+    "source_alias": {"$ref": "common.schema.json#/$defs/StableId"},
+    "description": {"type": "string", "maxLength": 4096},
+    "parts": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/PortablePart"}},
+    "content_digest": {"$ref": "common.schema.json#/$defs/Sha256"}
+  }
+}

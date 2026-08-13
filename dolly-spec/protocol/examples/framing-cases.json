@@ -1,0 +1,9 @@
+{
+  "schema": "dolly.protocol-framing-cases/v1",
+  "cases": [
+    {"id": "empty-object", "header_hex": "00000002", "payload_hex": "7b7d", "frame": "valid", "message": "invalid_jsonrpc_request"},
+    {"id": "zero-length", "header_hex": "00000000", "payload_hex": "", "frame": "fatal_zero_length", "message": "not_parsed"},
+    {"id": "truncated-header", "header_hex": "0000", "payload_hex": "", "frame": "fatal_eof_in_header", "message": "not_parsed"},
+    {"id": "truncated-payload", "header_hex": "00000005", "payload_hex": "7b7d", "frame": "fatal_eof_in_payload", "message": "not_parsed"}
+  ]
+}

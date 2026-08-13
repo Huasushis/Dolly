@@ -1,0 +1,40 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-TOOL-006",
+  "kind": "crash_recovery",
+  "covers": ["REQ-TOOL-001", "REQ-TOOL-003", "REQ-TOOL-006"],
+  "initial": {
+    "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000346",
+    "request_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "operation_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "frozen_tool_server_generation": 7,
+    "ledger_state": "AUTHORIZED",
+    "transport_eligible_byte_count": 0,
+    "transport_sent_byte_count": 0
+  },
+  "stimulus": {
+    "event": "frozen_generation_crashes_before_dispatch_marker"
+  },
+  "expected": {
+    "outcome": "accepted_binding_failed_with_authoritative_non_application",
+    "assertions": [
+      {"path": "/operation_id", "op": "unchanged"},
+      {"path": "/request_digest", "op": "unchanged"},
+      {"path": "/operation_digest", "op": "unchanged"},
+      {"path": "/frozen_tool_server_generation", "op": "equals", "value": 7},
+      {"path": "/replacement_generation_dispatch_count", "op": "equals", "value": 0},
+      {"path": "/ledger_state", "op": "equals", "value": "FAILED"},
+      {"path": "/result/status", "op": "equals", "value": "failed"},
+      {"path": "/result/error/code", "op": "equals", "value": "TOOL_DISPATCH_NOT_APPLIED"},
+      {"path": "/result/error/outcome", "op": "equals", "value": "not_applied"},
+      {"path": "/result/error/retryable", "op": "equals", "value": false}
+    ],
+    "emitted": [
+      {
+        "event": "ToolDispatchProvedNotApplied",
+        "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000346"
+      }
+    ],
+    "crash_label": "tool_after_authorized_before_dispatch"
+  }
+}

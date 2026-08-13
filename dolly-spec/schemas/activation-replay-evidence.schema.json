@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/activation-replay-evidence.schema.json",
+  "title": "Host-verified activation-ledger replay evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "module_id", "storage_scope_id", "activation_id", "manifest_digest",
+    "source_attempt", "target_extension_generation", "ledger", "continuity",
+    "ledger_state", "replay_disposition", "state_digest", "result_digest",
+    "migration_operation_id", "continuity_proof_digest", "checked_at"
+  ],
+  "properties": {
+    "schema": { "const": "dolly.activation-replay-evidence/v1" },
+    "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+    "activation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "manifest_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "source_attempt": { "type": "integer", "minimum": 1, "maximum": 64 },
+    "target_extension_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+    "ledger": { "$ref": "module-descriptor.schema.json#/$defs/ActivationLedgerDescriptor" },
+    "continuity": { "enum": ["retained", "migrated"] },
+    "ledger_state": { "enum": ["complete", "reconcilable", "absent", "unknown", "corrupt"] },
+    "replay_disposition": { "enum": ["return_result", "reconcile_only", "quarantine"] },
+    "state_digest": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/Sha256" },
+        { "type": "null" }
+      ]
+    },
+    "result_digest": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/Sha256" },
+        { "type": "null" }
+      ]
+    },
+    "migration_operation_id": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/UuidV7" },
+        { "type": "null" }
+      ]
+    },
+    "continuity_proof_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "checked_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "continuity": { "const": "retained" } }, "required": ["continuity"] },
+      "then": { "properties": { "migration_operation_id": { "type": "null" } } },
+      "else": { "properties": { "migration_operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" } } }
+    },
+    {
+      "if": { "properties": { "ledger_state": { "const": "complete" } }, "required": ["ledger_state"] },
+      "then": {
+        "properties": {
+          "replay_disposition": { "const": "return_result" },
+          "state_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+          "result_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "ledger_state": { "const": "reconcilable" } }, "required": ["ledger_state"] },
+      "then": {
+        "properties": {
+          "replay_disposition": { "const": "reconcile_only" },
+          "state_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+          "result_digest": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "ledger_state": { "enum": ["absent", "unknown", "corrupt"] } }, "required": ["ledger_state"] },
+      "then": {
+        "properties": {
+          "replay_disposition": { "const": "quarantine" },
+          "result_digest": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "ledger_state": { "const": "absent" } }, "required": ["ledger_state"] },
+      "then": { "properties": { "state_digest": { "type": "null" } } }
+    }
+  ]
+}

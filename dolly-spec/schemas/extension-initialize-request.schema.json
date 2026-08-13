@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/extension-initialize-request.schema.json",
+  "title": "extension.initialize params",
+  "$defs": {
+    "ProtocolVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {
+        "major": { "const": 1 },
+        "minor": { "type": "integer", "minimum": 0, "maximum": 65535 }
+      }
+    },
+    "Limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_frame_bytes", "max_frame_nesting_depth", "max_json_nesting_depth",
+        "max_outstanding_host_requests", "max_outstanding_extension_requests",
+        "max_queued_outbound_bytes", "max_requests_per_second",
+        "max_notifications_per_second"
+      ],
+      "properties": {
+        "max_frame_bytes": { "type": "integer", "minimum": 1024, "maximum": 67108864 },
+        "max_frame_nesting_depth": { "type": "integer", "minimum": 1, "maximum": 96 },
+        "max_json_nesting_depth": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "max_outstanding_host_requests": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "max_outstanding_extension_requests": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "max_queued_outbound_bytes": { "type": "integer", "minimum": 1024, "maximum": 268435456 },
+        "max_requests_per_second": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+        "max_notifications_per_second": { "type": "integer", "minimum": 1, "maximum": 1000000 }
+      }
+    },
+    "ExpectedModule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module_id", "module_type", "storage_scope_id", "activation_replay_contract"],
+      "properties": {
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "module_type": { "$ref": "common.schema.json#/$defs/StableId" },
+        "storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+        "activation_replay_contract": { "$ref": "module-descriptor.schema.json#/$defs/ActivationReplayContract" }
+      }
+    },
+    "StorageHandle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["handle_name", "scope", "module_id", "storage_scope_id", "capability"],
+      "properties": {
+        "handle_name": { "$ref": "common.schema.json#/$defs/StableId" },
+        "scope": { "enum": ["extension_state_directory", "module_state_directory", "temporary_directory"] },
+        "module_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/StableId" },
+            { "type": "null" }
+          ]
+        },
+        "storage_scope_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+            { "type": "null" }
+          ]
+        },
+        "access_mode": {
+          "enum": ["read_only", "staging_read_write", "active_read_write"]
+        },
+        "writer_generation": {
+          "oneOf": [
+            { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            { "type": "null" }
+          ]
+        },
+        "capability": { "$ref": "common.schema.json#/$defs/LeaseToken" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "scope": { "const": "module_state_directory" } }, "required": ["scope"] },
+          "then": {
+            "required": ["access_mode", "writer_generation"],
+            "properties": {
+              "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+              "storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" }
+            }
+          },
+          "else": {
+            "properties": {
+              "module_id": { "type": "null" },
+              "storage_scope_id": { "type": "null" },
+              "access_mode": false,
+              "writer_generation": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "access_mode": { "const": "active_read_write" } },
+            "required": ["access_mode"]
+          },
+          "then": {
+            "properties": {
+              "writer_generation": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            }
+          },
+          "else": {
+            "properties": { "writer_generation": { "type": "null" } }
+          }
+        }
+      ]
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "worker_epoch", "extension_alias", "extension_generation",
+    "expected_extension_id", "expected_extension_version",
+    "expected_package_digest", "config_revision", "extension_config",
+    "extension_config_digest", "extension_config_schema_digest",
+    "offered_protocols", "offered_limits",
+    "granted_host_services", "expected_modules", "storage_handles",
+    "host", "deadline"
+  ],
+  "properties": {
+    "worker_epoch": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "extension_alias": { "$ref": "common.schema.json#/$defs/StableId" },
+    "extension_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+    "expected_extension_id": { "$ref": "common.schema.json#/$defs/ExtensionId" },
+    "expected_extension_version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"
+    },
+    "expected_package_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "extension_config": { "type": "object", "maxProperties": 1024 },
+    "extension_config_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "extension_config_schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "offered_protocols": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/ProtocolVersion" }
+    },
+    "offered_limits": { "$ref": "#/$defs/Limits" },
+    "granted_host_services": {
+      "type": "array",
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": { "$ref": "common.schema.json#/$defs/QualifiedName" }
+    },
+    "expected_modules": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/ExpectedModule" }
+    },
+    "storage_handles": {
+      "type": "array",
+      "maxItems": 8192,
+      "items": { "$ref": "#/$defs/StorageHandle" }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["implementation", "implementation_version", "spec_version", "supported_sdk_abis"],
+      "properties": {
+        "implementation": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "implementation_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "spec_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "supported_sdk_abis": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+        }
+      }
+    },
+    "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  }
+}

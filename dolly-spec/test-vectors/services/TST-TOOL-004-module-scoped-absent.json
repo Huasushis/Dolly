@@ -1,0 +1,32 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-TOOL-004",
+  "kind": "security",
+  "covers": ["REQ-TOOL-001", "REQ-TOOL-004"],
+  "initial": {
+    "authenticated_module_id": "module-a",
+    "target_operation_id": "0198ab31-6c44-7e8a-b2bb-000000000344",
+    "ledger_rows": [
+      {
+        "module_id": "module-b",
+        "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000344",
+        "state": "SUCCEEDED"
+      }
+    ]
+  },
+  "stimulus": {
+    "event": "module_a_queries_same_uuid_owned_by_module_b"
+  },
+  "expected": {
+    "outcome": "module_scoped_absent_without_existence_leak",
+    "assertions": [
+      {"path": "/lookup_key/module_id", "op": "equals", "value": "module-a"},
+      {"path": "/lookup_key/operation_id", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000344"},
+      {"path": "/result/operation_id", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000344"},
+      {"path": "/result/status", "op": "equals", "value": "absent"},
+      {"path": "/cross_module_rows_revealed", "op": "equals", "value": 0}
+    ],
+    "emitted": [],
+    "crash_label": null
+  }
+}

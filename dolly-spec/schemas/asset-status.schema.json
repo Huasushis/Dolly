@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/asset-status.schema.json",
+  "title": "host.asset.import/status result",
+  "$defs": {
+    "ImportResult": {
+      "allOf": [
+        { "$ref": "#" },
+        {
+          "not": {
+            "properties": { "state": { "const": "absent" } },
+            "required": ["state"]
+          }
+        }
+      ]
+    },
+    "StatusResult": { "$ref": "#" }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["import_id", "state", "terminal", "asset", "error"],
+  "properties": {
+    "import_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "state": {
+      "enum": [
+        "absent", "accepted", "acquiring", "verifying", "committing",
+        "replicating", "replica_failed", "available", "rejected", "cancelled"
+      ]
+    },
+    "terminal": { "type": "boolean" },
+    "asset": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["asset_id", "media_type", "byte_length"],
+          "properties": {
+            "asset_id": { "$ref": "common.schema.json#/$defs/AssetId" },
+            "media_type": { "$ref": "common.schema.json#/$defs/MimeType" },
+            "byte_length": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          }
+        }
+      ]
+    },
+    "error": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "error.schema.json" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "state": { "const": "available" } },
+        "required": ["state"]
+      },
+      "then": {
+        "properties": {
+          "terminal": { "const": true },
+          "asset": { "type": "object" },
+          "error": { "type": "null" }
+        }
+      },
+      "else": { "properties": { "asset": { "type": "null" } } }
+    },
+    {
+      "if": {
+        "properties": { "state": { "enum": ["available", "rejected", "cancelled"] } },
+        "required": ["state"]
+      },
+      "then": { "properties": { "terminal": { "const": true } } },
+      "else": { "properties": { "terminal": { "const": false } } }
+    },
+    {
+      "if": {
+        "properties": { "state": { "enum": ["replica_failed", "rejected"] } },
+        "required": ["state"]
+      },
+      "then": { "properties": { "error": { "$ref": "error.schema.json" } } },
+      "else": { "properties": { "error": { "type": "null" } } }
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/error.schema.json",
+  "title": "DollyError",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["code", "retryable", "outcome", "message", "details"],
+  "properties": {
+    "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$", "maxLength": 96 },
+    "retryable": { "type": "boolean" },
+    "outcome": { "enum": ["not_applied", "applied", "unknown"] },
+    "message": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "correlation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "details": { "type": "object", "maxProperties": 64 }
+  }
+}
+

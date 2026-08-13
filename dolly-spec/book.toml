@@ -1,0 +1,20 @@
+[book]
+title = "Dolly Specification"
+authors = ["Dolly Project"]
+description = "Normative runtime, extension, operations, and research specification for Dolly"
+language = "en"
+multilingual = false
+src = "docs"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+no-section-label = false
+default-theme = "navy"
+preferred-dark-theme = "navy"
+
+[output.html.fold]
+enable = true
+level = 1

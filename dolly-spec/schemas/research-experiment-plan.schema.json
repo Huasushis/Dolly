@@ -1,0 +1,303 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/research-experiment-plan.schema.json",
+  "title": "Dolly preregistered research experiment plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "experiment_id", "track", "hypothesis", "intended_decision",
+    "source_revisions", "systems", "treatments", "splits", "required_cases",
+    "repetitions", "seeds", "metrics", "budget", "oracle", "analysis",
+    "artifact_root_uri", "stable_fallback", "kill_switch"
+  ],
+  "properties": {
+    "schema": { "const": "dolly.research-experiment/v1" },
+    "experiment_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "track": {
+      "enum": [
+        "memory_association", "adaptive_scheduler", "tensity",
+        "multi_agent_topology", "abstraction_transfer", "reflection_policy",
+        "browser_tools", "learning", "testament_replay",
+        "network_levelupper", "framework_comparison"
+      ]
+    },
+    "hypothesis": { "type": "string", "minLength": 20, "maxLength": 4096 },
+    "intended_decision": { "type": "string", "minLength": 10, "maxLength": 2048 },
+    "source_revisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "config", "prompt", "dataset", "environment"],
+      "properties": {
+        "code": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "config": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "prompt": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "dataset": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "environment": { "$ref": "common.schema.json#/$defs/Sha256" }
+      }
+    },
+    "systems": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/SystemPin" }
+    },
+    "treatments": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/Treatment" }
+    },
+    "splits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["train", "development", "held_out"],
+      "properties": {
+        "train": { "$ref": "#/$defs/DataSplit" },
+        "development": { "$ref": "#/$defs/DataSplit" },
+        "held_out": { "$ref": "#/$defs/DataSplit" }
+      }
+    },
+    "required_cases": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "common.schema.json#/$defs/StableId" }
+    },
+    "repetitions": { "type": "integer", "minimum": 2, "maximum": 10000 },
+    "seeds": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 10000,
+      "uniqueItems": true,
+      "items": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+    },
+    "metrics": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/Metric" },
+      "allOf": [
+        { "contains": { "properties": { "role": { "const": "primary" } }, "required": ["role"] } },
+        { "contains": { "properties": { "role": { "const": "safety" } }, "required": ["role"] } },
+        { "contains": { "properties": { "role": { "const": "non_inferiority" } }, "required": ["role"] } }
+      ]
+    },
+    "budget": { "$ref": "#/$defs/Budget" },
+    "oracle": { "$ref": "#/$defs/Oracle" },
+    "analysis": { "$ref": "#/$defs/Analysis" },
+    "artifact_root_uri": { "type": "string", "format": "uri", "maxLength": 1024 },
+    "stable_fallback": { "type": "string", "minLength": 5, "maxLength": 1024 },
+    "kill_switch": { "type": "string", "minLength": 5, "maxLength": 1024 }
+  },
+  "$defs": {
+    "SystemPin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name", "role", "source_uri", "revision_kind", "revision",
+        "artifact_digest", "launch_config_digest", "model_profile_digest",
+        "tool_snapshot_digest", "environment_digest"
+      ],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "role": { "enum": ["candidate", "internal_baseline", "external_baseline"] },
+        "source_uri": { "type": "string", "format": "uri", "maxLength": 1024 },
+        "revision_kind": { "enum": ["commit", "tag", "build"] },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "not": { "enum": ["latest", "main", "master", "head", "HEAD", "trunk"] }
+        },
+        "artifact_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "launch_config_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "model_profile_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "tool_snapshot_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "environment_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+      }
+    },
+    "Treatment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description", "factors"],
+      "properties": {
+        "id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "description": { "type": "string", "minLength": 5, "maxLength": 1024 },
+        "factors": { "type": "object", "maxProperties": 32 }
+      }
+    },
+    "DataSplit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest_uri", "digest", "units"],
+      "properties": {
+        "manifest_uri": { "type": "string", "format": "uri", "maxLength": 1024 },
+        "digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "units": { "type": "integer", "minimum": 1, "maximum": 1000000000 }
+      }
+    },
+    "Metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "role", "direction", "aggregation", "threshold"],
+      "properties": {
+        "name": { "$ref": "common.schema.json#/$defs/StableId" },
+        "role": { "enum": ["primary", "non_inferiority", "safety", "diagnostic"] },
+        "direction": { "enum": ["higher", "lower", "absolute_zero"] },
+        "aggregation": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "threshold": { "type": "number" }
+      }
+    },
+    "Budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_calls", "tokens", "tool_calls", "wall_seconds", "cost_microunits",
+        "network_bytes", "persistent_storage_bytes", "peak_memory_bytes"
+      ],
+      "properties": {
+        "model_calls": { "type": "integer", "minimum": 0, "maximum": 1000000000 },
+        "tokens": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "tool_calls": { "type": "integer", "minimum": 0, "maximum": 1000000000 },
+        "wall_seconds": { "type": "integer", "minimum": 1, "maximum": 315576000 },
+        "cost_microunits": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "network_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "persistent_storage_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "peak_memory_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "Oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "revision", "verifier_digest"],
+      "properties": {
+        "kind": { "enum": ["exact_state", "evidence", "metric_script", "composite"] },
+        "revision": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "verifier_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+      }
+    },
+    "Analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "confidence_level", "multiplicity", "code_digest"],
+      "properties": {
+        "method": { "type": "string", "minLength": 3, "maxLength": 255 },
+        "confidence_level": { "type": "number", "minimum": 0.9, "exclusiveMaximum": 1 },
+        "multiplicity": { "type": "string", "minLength": 3, "maxLength": 255 },
+        "code_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "track": { "const": "abstraction_transfer" } }, "required": ["track"] },
+      "then": {
+        "properties": {
+          "required_cases": {
+            "allOf": [
+              { "contains": { "const": "lexical-disjoint-transfer" } },
+              { "contains": { "const": "missing-precondition-abstention" } },
+              { "contains": { "const": "wrong-analogy" } },
+              { "contains": { "const": "held-out-cross-domain" } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "track": { "const": "reflection_policy" } }, "required": ["track"] },
+      "then": {
+        "properties": {
+          "required_cases": {
+            "allOf": [
+              { "contains": { "const": "unsupported-candidate" } },
+              { "contains": { "const": "historical-shadow-replay" } },
+              { "contains": { "const": "held-out-regression" } },
+              { "contains": { "const": "expiry-or-revocation" } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "track": { "const": "browser_tools" } }, "required": ["track"] },
+      "then": {
+        "properties": {
+          "required_cases": {
+            "allOf": [
+              { "contains": { "const": "screenshot" } },
+              { "contains": { "const": "dom-or-accessibility-tree" } },
+              { "contains": { "const": "click" } },
+              { "contains": { "const": "form" } },
+              { "contains": { "const": "download" } },
+              { "contains": { "const": "hostile-content" } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "track": { "const": "learning" } }, "required": ["track"] },
+      "then": {
+        "properties": {
+          "required_cases": {
+            "allOf": [
+              { "contains": { "const": "same-task-retention" } },
+              { "contains": { "const": "same-distribution-held-out" } },
+              { "contains": { "const": "cross-domain-transfer" } },
+              { "contains": { "const": "negative-transfer" } },
+              { "contains": { "const": "forgetting-and-update" } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "track": { "const": "testament_replay" } }, "required": ["track"] },
+      "then": {
+        "properties": {
+          "required_cases": {
+            "allOf": [
+              { "contains": { "const": "production-isolation" } },
+              { "contains": { "const": "fresh-core-identities" } },
+              { "contains": { "const": "deterministic-module-remap" } },
+              { "contains": { "const": "crash-resume" } },
+              { "contains": { "const": "held-out-isolation" } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "track": { "const": "network_levelupper" } }, "required": ["track"] },
+      "then": {
+        "properties": {
+          "required_cases": {
+            "allOf": [
+              { "contains": { "const": "ack-loss-idempotency" } },
+              { "contains": { "const": "asset-range-resume" } },
+              { "contains": { "const": "forged-remote-identity" } },
+              { "contains": { "const": "loop-termination" } },
+              { "contains": { "const": "stale-checkpoint-reconciliation" } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "track": { "const": "framework_comparison" } }, "required": ["track"] },
+      "then": {
+        "properties": {
+          "systems": {
+            "allOf": [
+              { "contains": { "properties": { "name": { "const": "Dolly" }, "role": { "const": "candidate" } }, "required": ["name", "role"] } },
+              { "contains": { "properties": { "name": { "const": "OpenClaw" }, "role": { "const": "external_baseline" } }, "required": ["name", "role"] } },
+              { "contains": { "properties": { "name": { "const": "Hermes" }, "role": { "const": "external_baseline" } }, "required": ["name", "role"] } }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CONFIG-002",
+  "kind": "config",
+  "covers": ["REQ-CFG-001"],
+  "initial": {"base_revision": 4, "candidate_revision": 5},
+  "stimulus": {
+    "validate_candidates": [
+      {"case": "transfer-without-target", "disposition": "transfer"},
+      {"case": "discard-with-target", "disposition": "audited_discard", "target_id": "replacement-module"},
+      {"case": "transfer-with-target", "disposition": "transfer", "target_id": "replacement-module"}
+    ]
+  },
+  "expected": {
+    "outcome": "only_closed_transfer_shape_accepted",
+    "assertions": [
+      {"path": "/cases/transfer-without-target/valid", "op": "equals", "value": false},
+      {"path": "/cases/discard-with-target/valid", "op": "equals", "value": false},
+      {"path": "/cases/transfer-with-target/valid", "op": "equals", "value": true}
+    ],
+    "emitted": [],
+    "crash_label": null
+  }
+}

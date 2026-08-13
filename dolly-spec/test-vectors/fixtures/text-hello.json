@@ -1,0 +1,13 @@
+{
+  "schema": "dolly.test-fixture/v1",
+  "fixture_id": "text-hello",
+  "kind": "block_draft",
+  "value": {
+    "schema": "dolly.block-draft/v1",
+    "description": "",
+    "parts": [{"kind": "text", "text": "Hello", "format": "plain"}],
+    "actions": [],
+    "metadata": {},
+    "hints": {}
+  }
+}

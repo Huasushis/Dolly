@@ -1,0 +1,354 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/napcatqq-result.schema.json",
+  "title": "NapCatQQ successful consumer-facade Action result catalog",
+  "x-dolly-action-result-validator": {
+    "id": "org.dolly.validator.napcatqq-action-result",
+    "revision": 1
+  },
+  "$comment": "This is a catalog container. Each fixed ActionContract selects one exact $defs fragment. The per-Action validator checks only relations available from the frozen Action/result context. Whole-Block, whole-Action-set, ingress-shape, and authoritative Asset relations belong to the Host-owned NapCatQQ profile-admission validator.",
+  "not": {},
+  "$defs": {
+    "Cursor": {"type": "string", "pattern": "^(0|[1-9][0-9]{0,18})$"},
+    "OperationKey": {"$ref": "napcatqq-action.schema.json#/$defs/OperationKey"},
+    "ConversationRef": {"$ref": "napcatqq-action.schema.json#/$defs/ConversationRef"},
+    "AssetContentHash": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": {"const": "blake3-256"},
+        "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "SanitizedFieldName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "not": {
+        "pattern": "(?:password|passwd|pwd|authorization|auth|credential|cookie|token|secret|session[_-]?key|access[_-]?key|api[_-]?key|client[_-]?key|ticket|signature|signed[_-]?url|local[_-]?path|file[_-]?path|raw[_-]?packet|process[_-]?control|url|uri|path)"
+      }
+    },
+    "SanitizedString": {
+      "type": "string",
+      "maxLength": 4096,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]*$"
+    },
+    "SanitizedValue": {
+      "$comment": "The semantic validator additionally enforces depth, total-node/JCS-byte limits, rejects path/URI spellings, and replays the immutable registry entry's pinned sanitizer and operation-specific result schema.",
+      "oneOf": [
+        {"type": "null"},
+        {"type": "boolean"},
+        {"type": "number"},
+        {"$ref": "#/$defs/SanitizedString"},
+        {
+          "type": "array",
+          "maxItems": 256,
+          "items": {"$ref": "#/$defs/SanitizedValue"}
+        },
+        {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {"$ref": "#/$defs/SanitizedFieldName"},
+          "additionalProperties": {"$ref": "#/$defs/SanitizedValue"}
+        }
+      ]
+    },
+    "Gap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gap_id", "reason", "from_cursor", "to_cursor", "certainty"],
+      "properties": {
+        "gap_id": {"$ref": "common.schema.json#/$defs/UuidV7"},
+        "reason": {"enum": ["disconnect", "retention", "upstream_unreplayable", "corrupt_event", "oversized_event", "disk_full"]},
+        "from_cursor": {"oneOf": [{"$ref": "#/$defs/Cursor"}, {"type": "null"}]},
+        "to_cursor": {"oneOf": [{"$ref": "#/$defs/Cursor"}, {"type": "null"}]},
+        "certainty": {"enum": ["definite_eviction", "possible_loss", "payload_redacted"]}
+      }
+    },
+    "TextSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "text", "truncated"],
+      "properties": {
+        "kind": {"const": "text"},
+        "text": {"type": "string", "maxLength": 262144},
+        "truncated": {"type": "boolean"}
+      }
+    },
+    "MentionSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "target_id", "display_text"],
+      "properties": {
+        "kind": {"const": "mention"},
+        "target_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "display_text": {"type": "string", "maxLength": 512}
+      }
+    },
+    "FaceSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "face_id", "display_text"],
+      "properties": {
+        "kind": {"const": "face"},
+        "face_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "display_text": {"type": "string", "maxLength": 512}
+      }
+    },
+    "ReplySegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "message_id"],
+      "properties": {
+        "kind": {"const": "reply"},
+        "message_id": {"type": "string", "minLength": 1, "maxLength": 128}
+      }
+    },
+    "LocationSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "label", "latitude", "longitude"],
+      "properties": {
+        "kind": {"const": "location"},
+        "label": {"type": "string", "maxLength": 1024},
+        "latitude": {"type": "number", "minimum": -90, "maximum": 90},
+        "longitude": {"type": "number", "minimum": -180, "maximum": 180}
+      }
+    },
+    "ForwardSummarySegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "forward_handle", "message_count", "truncated"],
+      "properties": {
+        "kind": {"const": "forward_summary"},
+        "forward_handle": {"$ref": "common.schema.json#/$defs/StableId"},
+        "message_count": {"type": "integer", "minimum": 0, "maximum": 10000},
+        "truncated": {"type": "boolean"}
+      }
+    },
+    "MediaSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ordinal", "media_handle", "media_kind", "state", "media_type", "byte_length", "expires_at"],
+      "properties": {
+        "kind": {"const": "media_ref"},
+        "ordinal": {"type": "integer", "minimum": 0, "maximum": 63},
+        "media_handle": {"$ref": "common.schema.json#/$defs/StableId"},
+        "media_kind": {"enum": ["image", "audio", "video", "file", "thumbnail"]},
+        "state": {"enum": ["available", "pending", "expired", "denied", "too_large"]},
+        "media_type": {"oneOf": [{"$ref": "common.schema.json#/$defs/MimeType"}, {"type": "null"}]},
+        "byte_length": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1073741824}, {"type": "null"}]},
+        "expires_at": {"oneOf": [{"$ref": "common.schema.json#/$defs/Timestamp"}, {"type": "null"}]}
+      }
+    },
+    "UnsupportedSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "segment_key", "disposition"],
+      "properties": {
+        "kind": {"const": "unsupported"},
+        "segment_key": {"$ref": "#/$defs/OperationKey"},
+        "disposition": {"enum": ["omitted", "requires_catalog", "forbidden"]}
+      }
+    },
+    "MailboxSegment": {
+      "oneOf": [
+        {"$ref": "#/$defs/TextSegment"},
+        {"$ref": "#/$defs/MentionSegment"},
+        {"$ref": "#/$defs/FaceSegment"},
+        {"$ref": "#/$defs/ReplySegment"},
+        {"$ref": "#/$defs/LocationSegment"},
+        {"$ref": "#/$defs/ForwardSummarySegment"},
+        {"$ref": "#/$defs/MediaSegment"},
+        {"$ref": "#/$defs/UnsupportedSegment"}
+      ]
+    },
+    "MailboxEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cursor", "event_kind", "conversation", "sender_id", "received_at",
+        "message_id", "segments", "normalized_payload_digest"
+      ],
+      "properties": {
+        "cursor": {"$ref": "#/$defs/Cursor"},
+        "event_kind": {"enum": ["message", "message_sent", "request", "notice", "meta", "gap"]},
+        "conversation": {"oneOf": [{"$ref": "#/$defs/ConversationRef"}, {"type": "null"}]},
+        "sender_id": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 128}, {"type": "null"}]},
+        "received_at": {"$ref": "common.schema.json#/$defs/Timestamp"},
+        "message_id": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 128}, {"type": "null"}]},
+        "segments": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/MailboxSegment"}},
+        "normalized_payload_digest": {"$ref": "common.schema.json#/$defs/Sha256"}
+      }
+    },
+    "MailboxResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "operation", "events", "next_cursor", "has_more",
+        "oldest_available_cursor", "ack_cursor", "gaps"
+      ],
+      "properties": {
+        "schema": {"const": "dolly.napcatqq-mailbox-result/v1"},
+        "operation": {"enum": ["peek", "read", "ack", "stats"]},
+        "events": {"type": "array", "maxItems": 10000, "items": {"$ref": "#/$defs/MailboxEvent"}},
+        "next_cursor": {"$ref": "#/$defs/Cursor"},
+        "has_more": {"type": "boolean"},
+        "oldest_available_cursor": {"$ref": "#/$defs/Cursor"},
+        "ack_cursor": {"$ref": "#/$defs/Cursor"},
+        "gaps": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/Gap"}}
+      }
+    },
+    "ConversationSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["conversation", "display_name", "unread_count", "last_event_cursor"],
+      "properties": {
+        "conversation": {"$ref": "#/$defs/ConversationRef"},
+        "display_name": {"type": "string", "maxLength": 512},
+        "unread_count": {"type": "integer", "minimum": 0, "maximum": 1000000000},
+        "last_event_cursor": {"$ref": "#/$defs/Cursor"}
+      }
+    },
+    "ConversationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "operation", "conversations", "view_id", "view_epoch", "events", "next_cursor", "has_more", "gaps"],
+      "properties": {
+        "schema": {"const": "dolly.napcatqq-conversation-result/v1"},
+        "operation": {"enum": ["list", "open", "close", "history", "search"]},
+        "conversations": {"type": "array", "maxItems": 1000, "items": {"$ref": "#/$defs/ConversationSummary"}},
+        "view_id": {"oneOf": [{"$ref": "common.schema.json#/$defs/UuidV7"}, {"type": "null"}]},
+        "view_epoch": {"oneOf": [{"$ref": "common.schema.json#/$defs/Revision"}, {"type": "null"}]},
+        "events": {"type": "array", "maxItems": 10000, "items": {"$ref": "#/$defs/MailboxEvent"}},
+        "next_cursor": {"oneOf": [{"$ref": "#/$defs/Cursor"}, {"type": "null"}]},
+        "has_more": {"type": "boolean"},
+        "gaps": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/Gap"}}
+      }
+    },
+    "SendResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "conversation", "view_id", "view_epoch", "delivery_outcome", "messages"],
+      "properties": {
+        "schema": {"const": "dolly.napcatqq-send-result/v1"},
+        "conversation": {"$ref": "#/$defs/ConversationRef"},
+        "view_id": {"oneOf": [{"$ref": "common.schema.json#/$defs/UuidV7"}, {"type": "null"}]},
+        "view_epoch": {"oneOf": [{"$ref": "common.schema.json#/$defs/Revision"}, {"type": "null"}]},
+        "delivery_outcome": {"const": "sent"},
+        "messages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["ordinal", "external_message_id"],
+            "properties": {
+              "ordinal": {"type": "integer", "minimum": 0, "maximum": 31},
+              "external_message_id": {"type": "string", "minLength": 1, "maxLength": 512}
+            }
+          }
+        }
+      }
+    },
+    "MediaResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "media_handle", "delivery_ingress_id", "asset_id", "media_type",
+        "byte_length", "content_hash"
+      ],
+      "properties": {
+        "schema": {"const": "dolly.napcatqq-media-result/v1"},
+        "media_handle": {"$ref": "common.schema.json#/$defs/StableId"},
+        "delivery_ingress_id": {"$ref": "common.schema.json#/$defs/UuidV7"},
+        "asset_id": {"$ref": "common.schema.json#/$defs/AssetId"},
+        "media_type": {"$ref": "common.schema.json#/$defs/MimeType"},
+        "byte_length": {"type": "integer", "minimum": 0, "maximum": 1073741824},
+        "content_hash": {"$ref": "#/$defs/AssetContentHash"}
+      }
+    },
+    "MediaDeliveryEnvelope": {
+      "$comment": "This value is the first JSON Part in the hub-produced private media ingress Block. The profile-admission validator requires exactly one following Core Asset Part and compares all repeated fields with the authoritative Asset record.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "action_id", "delivery_ingress_id", "media_handle", "asset_id",
+        "media_type", "byte_length", "content_hash"
+      ],
+      "properties": {
+        "schema": {"const": "dolly.napcatqq-media-delivery/v1"},
+        "action_id": {"$ref": "common.schema.json#/$defs/UuidV7"},
+        "delivery_ingress_id": {"$ref": "common.schema.json#/$defs/UuidV7"},
+        "media_handle": {"$ref": "common.schema.json#/$defs/StableId"},
+        "asset_id": {"$ref": "common.schema.json#/$defs/AssetId"},
+        "media_type": {"$ref": "common.schema.json#/$defs/MimeType"},
+        "byte_length": {"type": "integer", "minimum": 0, "maximum": 1073741824},
+        "content_hash": {"$ref": "#/$defs/AssetContentHash"}
+      }
+    },
+    "CatalogEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_key", "family", "summary", "arguments_schema_digest",
+        "result_schema_digest", "sanitizer_digest", "upstream_binding_digest", "supported"
+      ],
+      "properties": {
+        "operation_key": {"$ref": "#/$defs/OperationKey"},
+        "family": {"enum": ["query", "mutate", "manage", "files", "operator_only", "forbidden"]},
+        "summary": {"type": "string", "maxLength": 2048},
+        "arguments_schema_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "result_schema_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "sanitizer_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "upstream_binding_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "supported": {"type": "boolean"}
+      }
+    },
+    "CatalogResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "registry_digest", "entries", "selected_operation", "arguments_schema", "result_schema"],
+      "properties": {
+        "schema": {"const": "dolly.napcatqq-catalog-result/v1"},
+        "registry_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "entries": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/CatalogEntry"}},
+        "selected_operation": {"oneOf": [{"$ref": "#/$defs/CatalogEntry"}, {"type": "null"}]},
+        "arguments_schema": {"$ref": "common.schema.json#/$defs/JsonValue"},
+        "result_schema": {"$ref": "common.schema.json#/$defs/JsonValue"}
+      }
+    },
+    "InvokeResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "registry_digest", "family", "operation_key", "sanitizer_digest",
+        "upstream_request_id", "sanitized_value"
+      ],
+      "properties": {
+        "schema": {"const": "dolly.napcatqq-invoke-result/v1"},
+        "registry_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "family": {"enum": ["query", "mutate", "manage", "files"]},
+        "operation_key": {"$ref": "#/$defs/OperationKey"},
+        "sanitizer_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "upstream_request_id": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 256}, {"type": "null"}]},
+        "sanitized_value": {"$ref": "#/$defs/SanitizedValue"}
+      }
+    },
+    "MessageControlResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "operation", "conversation", "message_id", "applied"],
+      "properties": {
+        "schema": {"const": "dolly.napcatqq-message-control-result/v1"},
+        "operation": {"enum": ["reaction_add", "reaction_remove", "recall", "mark_read"]},
+        "conversation": {"$ref": "#/$defs/ConversationRef"},
+        "message_id": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 128}, {"type": "null"}]},
+        "applied": {"const": true}
+      }
+    }
+  }
+}

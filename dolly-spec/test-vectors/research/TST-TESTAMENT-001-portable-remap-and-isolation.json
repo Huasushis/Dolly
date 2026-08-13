@@ -1,0 +1,84 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-TESTAMENT-001",
+  "kind": "research",
+  "covers": ["REQ-TESTAMENT-001", "REQ-TESTAMENT-002", "REQ-TESTAMENT-003", "REQ-TESTAMENT-004", "REQ-TESTAMENT-005"],
+  "initial": {
+    "source_record": {
+      "record_key": "input-17",
+      "source_recipient_alias": "brain-old",
+      "source_block_id": "0198ab31-6c44-7e8a-b2bb-000000000431",
+      "source_activation_id": "0198ab31-6c44-7e8a-b2bb-000000000432",
+      "parts": ["text", "asset", "block_ref"],
+      "actions": [
+        {
+          "source_action_key": "action-send-1",
+          "ordinal": 0,
+          "name": "send_external_message",
+          "arguments_schema": {
+            "uri": "https://schemas.example/actions/send-external-message/v1",
+            "schema_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+          },
+          "source_target_alias": "source-channel",
+          "side_effect_class": "non_idempotent_write",
+          "arguments": {"text": "recorded but inert"}
+        }
+      ],
+      "fixture_manifest": {
+        "bundle_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "entries": [
+          {
+            "fixture_key": "fixture-send-1",
+            "fixture_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "role": "environment_event",
+            "oracle_only": false,
+            "block_keys": [],
+            "asset_keys": [],
+            "action_keys": ["action-send-1"]
+          }
+        ]
+      }
+    },
+    "mapping": {
+      "fanout_mode": "independent_clones",
+      "targets": [
+        {"treatment_id": "treatment-a", "sandbox_id": "sandbox-a", "target_module_id": "brain-a", "replay_page_id": "replay-a"},
+        {"treatment_id": "treatment-b", "sandbox_id": "sandbox-b", "target_module_id": "brain-b", "replay_page_id": "replay-b"}
+      ],
+      "action_rules": [
+        {
+          "source_action_key": "action-send-1",
+          "policy": "mock",
+          "fixture_key": "fixture-send-1",
+          "fixture_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "adapter_digest": null,
+          "target_action_alias": null
+        }
+      ]
+    }
+  },
+  "stimulus": {
+    "command": "portable_semantic_replay_then_finalize",
+    "crash_after": "target-a-ingress-committed",
+    "resume_same_run": true
+  },
+  "expected": {
+    "outcome": "fresh_idempotent_sandbox_replay_and_quarantined_artifacts",
+    "assertions": [
+      {"path": "/production/writes", "op": "count", "value": 0},
+      {"path": "/targets/brain-a/local_block_id", "op": "not_equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000431"},
+      {"path": "/targets/brain-b/local_block_id", "op": "not_equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000431"},
+      {"path": "/targets/brain-a/local_activation_id", "op": "not_equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000432"},
+      {"path": "/targets/brain-a/ingress_commit_count", "op": "equals", "value": 1},
+      {"path": "/targets/brain-b/ingress_commit_count", "op": "equals", "value": 1},
+      {"path": "/external_send_calls", "op": "count", "value": 0},
+      {"path": "/mock_calls", "op": "count", "value": 2},
+      {"path": "/target_mutable_state_shared", "op": "equals", "value": false},
+      {"path": "/artifacts/0/lifecycle", "op": "equals", "value": "quarantined"}
+    ],
+    "emitted": [
+      {"kind": "testament_run", "state": "complete", "promotion_applied": false}
+    ],
+    "crash_label": "testament.target-ingress.after-commit"
+  }
+}

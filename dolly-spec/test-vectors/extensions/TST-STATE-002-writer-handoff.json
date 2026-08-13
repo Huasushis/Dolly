@@ -1,0 +1,31 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-STATE-002",
+  "kind": "security",
+  "covers": ["INV-XCAP-005", "INV-XUPG-004", "INV-RAM-018"],
+  "initial": {
+    "storage_scope_id": "0198ab31-6c44-7e8a-b2bb-000000000451",
+    "owner": {"extension_generation": 7, "writer_generation": 12, "state": "granted"},
+    "candidate": {"extension_generation": 8, "access_mode": "staging_read_write"}
+  },
+  "stimulus": {
+    "command": "handoff_active_writer",
+    "candidate_requests_active_before_release": true,
+    "fault": "old-process-handle-closure-cannot-be-proved"
+  },
+  "expected": {
+    "outcome": "uncertain_release_write_fences_scope_without_second_writer",
+    "assertions": [
+      {"path": "/candidate/pre_release/error", "op": "equals", "value": "STATE_WRITER_BUSY"},
+      {"path": "/ownership/state", "op": "equals", "value": "write_fenced_unknown"},
+      {"path": "/ownership/active_writer_count", "op": "count", "value": 0},
+      {"path": "/candidate/production_activation_allowed", "op": "equals", "value": false},
+      {"path": "/old_owner/stale_write_accepted", "op": "equals", "value": false},
+      {"path": "/operator_error", "op": "equals", "value": "STATE_WRITER_HANDOFF_UNKNOWN"}
+    ],
+    "emitted": [
+      {"kind": "security", "event": "storage_writer_release_unknown"}
+    ],
+    "crash_label": "CP-STATE-WRITER-RELEASING-BEFORE-PROOF"
+  }
+}

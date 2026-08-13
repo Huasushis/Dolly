@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/channel-send-result.schema.json",
+  "title": "Successful org.dolly.channel.send ActionResult payload",
+  "x-dolly-action-result-validator": {
+    "id": "org.dolly.validator.channel-send-result",
+    "revision": 1
+  },
+  "$comment": "After JSON Schema validation, the bound semantic validator requires messages[i].ordinal == i and unique external_message_id values.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "session_id", "delivery_outcome", "messages"],
+  "properties": {
+    "schema": { "const": "dolly.channel.send-result/v1" },
+    "session_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "delivery_outcome": { "const": "sent" },
+    "messages": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ordinal", "external_message_id"],
+        "properties": {
+          "ordinal": { "type": "integer", "minimum": 0, "maximum": 31 },
+          "external_message_id": { "type": "string", "minLength": 1, "maxLength": 512 }
+        }
+      }
+    }
+  }
+}

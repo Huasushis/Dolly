@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/activation-result.schema.json",
+  "title": "module.activate result",
+  "$defs": {
+    "ActivationPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "output", "scheduling_hint", "error"],
+      "properties": {
+        "status": {"enum": ["success", "retryable_failure", "permanent_failure"]},
+        "output": {"oneOf": [{"type": "null"}, {"$ref": "block-draft.schema.json"}]},
+        "scheduling_hint": {"oneOf": [{"type": "null"}, {"$ref": "common.schema.json#/$defs/SchedulingHint"}]},
+        "error": {"oneOf": [{"type": "null"}, {"$ref": "error.schema.json"}]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "success"}}},
+          "then": {"properties": {"error": {"type": "null"}}},
+          "else": {
+            "properties": {
+              "output": {"type": "null"},
+              "scheduling_hint": {"type": "null"},
+              "error": {"$ref": "error.schema.json"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"status": {"const": "retryable_failure"}}},
+          "then": {"properties": {"error": {"allOf": [{"$ref": "error.schema.json"}, {"properties": {"retryable": {"const": true}}}]}}}
+        },
+        {
+          "if": {"properties": {"status": {"const": "permanent_failure"}}},
+          "then": {"properties": {"error": {"allOf": [{"$ref": "error.schema.json"}, {"properties": {"retryable": {"const": false}}}]}}}
+        }
+      ]
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "worker_epoch", "extension_generation", "activation_id", "manifest_digest",
+    "lease_generation", "lease_token", "payload", "result_digest"
+  ],
+  "properties": {
+    "worker_epoch": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "extension_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+    "activation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "manifest_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "lease_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+    "lease_token": { "$ref": "common.schema.json#/$defs/LeaseToken" },
+    "payload": {"$ref": "#/$defs/ActivationPayload"},
+    "result_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+  }
+}

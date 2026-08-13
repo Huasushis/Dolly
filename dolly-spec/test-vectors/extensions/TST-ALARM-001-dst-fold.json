@@ -1,0 +1,20 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-ALARM-001",
+  "kind": "extension",
+  "covers": ["REQ-ALARM-001"],
+  "initial": {"tzdb_fixture": "America/New_York-2025a", "cron": "30 1 2 11 *", "dst_fold_policy": "both", "alarm_revision": 4},
+  "stimulus": {"evaluate_local_date": "2025-11-02"},
+  "expected": {
+    "outcome": "two_distinct_occurrences",
+    "assertions": [
+      {"path": "/occurrences", "op": "count", "value": 2},
+      {"path": "/occurrences/0/utc", "op": "equals", "value": "2025-11-02T05:30:00.000000Z"},
+      {"path": "/occurrences/0/fold_ordinal", "op": "equals", "value": 0},
+      {"path": "/occurrences/1/utc", "op": "equals", "value": "2025-11-02T06:30:00.000000Z"},
+      {"path": "/occurrences/1/fold_ordinal", "op": "equals", "value": 1}
+    ],
+    "emitted": [],
+    "crash_label": null
+  }
+}

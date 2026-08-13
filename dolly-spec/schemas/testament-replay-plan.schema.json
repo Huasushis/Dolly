@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/testament-replay-plan.schema.json",
+  "title": "Testament immutable replay plan",
+  "$defs": {
+    "CorpusKey": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
+    "Target": {
+      "type": "object", "additionalProperties": false,
+      "required": ["treatment_id", "sandbox_id", "target_module_id", "replay_page_id"],
+      "properties": {
+        "treatment_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "sandbox_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "target_module_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "replay_page_id": {"$ref": "common.schema.json#/$defs/StableId"}
+      }
+    },
+    "ActionRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_action_key", "policy", "fixture_key", "fixture_digest",
+        "adapter_digest", "target_action_alias"
+      ],
+      "properties": {
+        "source_action_key": {"$ref": "#/$defs/CorpusKey"},
+        "policy": {"enum": ["strip_and_record", "inert_json", "mock", "explicit_remap"]},
+        "fixture_key": {
+          "oneOf": [{"$ref": "#/$defs/CorpusKey"}, {"type": "null"}]
+        },
+        "fixture_digest": {
+          "oneOf": [{"$ref": "common.schema.json#/$defs/Sha256"}, {"type": "null"}]
+        },
+        "adapter_digest": {
+          "oneOf": [{"$ref": "common.schema.json#/$defs/Sha256"}, {"type": "null"}]
+        },
+        "target_action_alias": {
+          "oneOf": [{"$ref": "common.schema.json#/$defs/StableId"}, {"type": "null"}]
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"policy": {"const": "mock"}}, "required": ["policy"]},
+          "then": {
+            "properties": {
+              "fixture_key": {"$ref": "#/$defs/CorpusKey"},
+              "fixture_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+              "adapter_digest": {"type": "null"},
+              "target_action_alias": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"policy": {"const": "explicit_remap"}}, "required": ["policy"]},
+          "then": {
+            "properties": {
+              "fixture_key": {"type": "null"},
+              "fixture_digest": {"type": "null"},
+              "adapter_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+              "target_action_alias": {"$ref": "common.schema.json#/$defs/StableId"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"policy": {"enum": ["strip_and_record", "inert_json"]}}, "required": ["policy"]},
+          "then": {
+            "properties": {
+              "fixture_key": {"type": "null"},
+              "fixture_digest": {"type": "null"},
+              "adapter_digest": {"type": "null"},
+              "target_action_alias": {"type": "null"}
+            }
+          }
+        }
+      ]
+    },
+    "Mapping": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "source_recipient_alias", "targets", "fanout_mode", "state_isolation",
+        "transform_profile", "transform_revision_digest", "action_rules",
+        "missing_reference_policy"
+      ],
+      "properties": {
+        "source_recipient_alias": {"$ref": "common.schema.json#/$defs/StableId"},
+        "targets": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"$ref": "#/$defs/Target"}},
+        "fanout_mode": {"enum": ["independent_clones", "cooperative_graph"]},
+        "state_isolation": {"enum": ["fresh", "snapshot_clone"]},
+        "transform_profile": {"$ref": "common.schema.json#/$defs/StableId"},
+        "transform_revision_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "action_rules": {
+          "type": "array", "maxItems": 1000000,
+          "items": {"$ref": "#/$defs/ActionRule"}
+        },
+        "missing_reference_policy": {"enum": ["strict", "sanitized_explicit"]}
+      }
+    },
+    "ScriptedSchedulerConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "script_digest", "transition_catalog_digest", "ordered_transition_ids", "max_steps"
+      ],
+      "properties": {
+        "script_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "transition_catalog_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "ordered_transition_ids": {
+          "type": "array", "minItems": 1, "maxItems": 1000000, "uniqueItems": true,
+          "items": {"$ref": "common.schema.json#/$defs/StableId"}
+        },
+        "max_steps": {"type": "integer", "minimum": 1, "maximum": 1000000000}
+      }
+    },
+    "ControllerSchedulerConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "controller_id", "model_id", "model_digest", "prompt_id", "prompt_digest",
+        "policy_id", "policy_digest", "transition_catalog_id",
+        "transition_catalog_digest", "max_steps"
+      ],
+      "properties": {
+        "controller_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "model_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "model_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "prompt_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "prompt_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "policy_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "policy_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "transition_catalog_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "transition_catalog_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "max_steps": {"type": "integer", "minimum": 1, "maximum": 1000000000}
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "semantic_validator", "run_id", "mode", "corpus_digest",
+    "source_backup_manifest_digest", "sandbox_template_digest",
+    "mappings", "clock", "scheduler", "scheduler_config", "budgets", "network_policy",
+    "external_effect_policy", "seeds", "stop_conditions", "plan_digest"
+  ],
+  "properties": {
+    "schema": {"const": "dolly.testament-replay-plan/v1"},
+    "semantic_validator": {"const": "org.dolly.validator.testament-replay-plan@1"},
+    "run_id": {"$ref": "common.schema.json#/$defs/UuidV7"},
+    "mode": {"enum": ["full_snapshot_clone", "portable_semantic_replay"]},
+    "corpus_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "source_backup_manifest_digest": {
+      "oneOf": [{"$ref": "common.schema.json#/$defs/Sha256"}, {"type": "null"}]
+    },
+    "sandbox_template_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "mappings": {"type": "array", "maxItems": 4096, "items": {"$ref": "#/$defs/Mapping"}},
+    "clock": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "scale_numerator", "scale_denominator"],
+      "properties": {
+        "mode": {"enum": ["recorded_scaled", "step", "event_driven"]},
+        "scale_numerator": {"type": "integer", "minimum": 1, "maximum": 1000000000},
+        "scale_denominator": {"type": "integer", "minimum": 1, "maximum": 1000000000}
+      }
+    },
+    "scheduler": {"enum": ["normal_graph", "scripted_steps", "controller"]},
+    "scheduler_config": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/ScriptedSchedulerConfig"},
+        {"$ref": "#/$defs/ControllerSchedulerConfig"}
+      ]
+    },
+    "budgets": {
+      "type": "object", "additionalProperties": false,
+      "required": ["activations", "blocks", "model_calls", "tool_calls", "tokens", "cost_microunits", "virtual_time_us", "wall_seconds", "network_bytes", "disk_bytes", "memory_bytes"],
+      "properties": {
+        "activations": {"type": "integer", "minimum": 1, "maximum": 1000000000},
+        "blocks": {"type": "integer", "minimum": 1, "maximum": 1000000000},
+        "model_calls": {"type": "integer", "minimum": 0, "maximum": 1000000000},
+        "tool_calls": {"type": "integer", "minimum": 0, "maximum": 1000000000},
+        "tokens": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "cost_microunits": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "virtual_time_us": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "wall_seconds": {"type": "integer", "minimum": 1, "maximum": 315576000},
+        "network_bytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "disk_bytes": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "memory_bytes": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}
+      }
+    },
+    "network_policy": {"enum": ["deny_all", "fixtures_only", "pinned_allowlist"]},
+    "external_effect_policy": {"enum": ["mock_only", "deny", "pinned_research"]},
+    "seeds": {"type": "array", "minItems": 1, "maxItems": 10000, "uniqueItems": true, "items": {"type": "integer", "minimum": 0, "maximum": 4294967295}},
+    "stop_conditions": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "common.schema.json#/$defs/StableId"}},
+    "plan_digest": {"$ref": "common.schema.json#/$defs/Sha256"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"mode": {"const": "full_snapshot_clone"}}, "required": ["mode"]},
+      "then": {
+        "properties": {
+          "mappings": {"maxItems": 0},
+          "source_backup_manifest_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+          "network_policy": {"enum": ["deny_all", "fixtures_only"]},
+          "external_effect_policy": {"enum": ["deny", "mock_only"]}
+        }
+      },
+      "else": {
+        "properties": {
+          "mappings": {"minItems": 1},
+          "source_backup_manifest_digest": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"scheduler": {"const": "normal_graph"}}, "required": ["scheduler"]},
+      "then": {"properties": {"scheduler_config": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"scheduler": {"const": "scripted_steps"}}, "required": ["scheduler"]},
+      "then": {"properties": {"scheduler_config": {"$ref": "#/$defs/ScriptedSchedulerConfig"}}}
+    },
+    {
+      "if": {"properties": {"scheduler": {"const": "controller"}}, "required": ["scheduler"]},
+      "then": {"properties": {"scheduler_config": {"$ref": "#/$defs/ControllerSchedulerConfig"}}}
+    }
+  ]
+}

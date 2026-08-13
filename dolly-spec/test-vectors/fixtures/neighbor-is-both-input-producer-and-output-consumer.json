@@ -1,0 +1,44 @@
+{
+  "schema": "dolly.test-fixture/v1",
+  "fixture_id": "neighbor-is-both-input-producer-and-output-consumer",
+  "kind": "descriptor_graph",
+  "value": {
+    "receiving_module": "reviewer",
+    "neighbor_module": "analyst",
+    "input_pages": {"reviewer": ["shared-in"]},
+    "output_pages": {"reviewer": ["shared-out"], "analyst": ["shared-in"]},
+    "subscriptions": {"shared-out": ["analyst"]},
+    "source_descriptor": {
+      "schema": "dolly.module-descriptor/v1",
+      "module_id": "analyst",
+      "descriptor_revision": 9,
+      "display_name": "Analyst",
+      "accepts": {"summary": "Review work", "part_kinds": ["text"], "action_names": ["org.dolly.llm.review"]},
+      "emits": {"summary": "Analysis", "part_kinds": ["text"], "action_names": []},
+      "actions": [
+        {
+          "name": "org.dolly.llm.review",
+          "arguments_schema": {
+            "uri": "schemas/channel-send.schema.json",
+          "schema_digest": "sha256:64fbd12a17d44adb095ff1886020231fabbbb1b29d15c6a5f6d099a1d2e750aa",
+            "semantic_validator": null
+          },
+          "result_schema": {
+            "uri": "schemas/channel-send-result.schema.json",
+          "schema_digest": "sha256:14edf90d6ac5a7082fafdd3bcfb5de311ebb92640e04235b98d247c19222b239",
+            "semantic_validator": {
+              "id": "org.dolly.validator.channel-send-result",
+              "revision": 1
+            }
+          },
+          "description": "Review a draft",
+          "side_effect_class": "read_only"
+        }
+      ],
+      "activation_replay_contract": {"mode": "fenced_replay", "evidence": "pure_compute", "ledger": null},
+      "trust": "trusted",
+      "metadata": {"org.dolly.llm": {"role": "analyst"}, "org.example.private": {"secret": "must-be-filtered"}}
+    },
+    "authorized_metadata_namespaces": ["org.dolly.llm"]
+  }
+}

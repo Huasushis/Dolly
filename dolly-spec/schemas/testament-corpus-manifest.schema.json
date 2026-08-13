@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/testament-corpus-manifest.schema.json",
+  "title": "Testament immutable Corpus Manifest",
+  "$defs": {
+    "CorpusKey": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"},
+    "PortablePart": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "text", "format"],
+          "properties": {
+            "kind": {"const": "text"},
+            "text": {"type": "string", "maxLength": 262144},
+            "format": {"enum": ["plain", "markdown"]},
+            "language": {"type": "string", "minLength": 2, "maxLength": 71, "pattern": "^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "value", "schema_uri", "schema_digest"],
+          "properties": {
+            "kind": {"const": "json"},
+            "value": {"$ref": "common.schema.json#/$defs/JsonValue"},
+            "schema_uri": {"type": "string", "format": "uri", "minLength": 3, "maxLength": 512},
+            "schema_digest": {"$ref": "common.schema.json#/$defs/Sha256"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "foreign_asset_key", "media_type", "view"],
+          "properties": {
+            "kind": {"const": "asset"},
+            "foreign_asset_key": {"$ref": "#/$defs/CorpusKey"},
+            "media_type": {"$ref": "common.schema.json#/$defs/MimeType"},
+            "view": {"oneOf": [{"$ref": "common.schema.json#/$defs/CropRect"}, {"type": "null"}]}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "foreign_block_key", "relation"],
+          "properties": {
+            "kind": {"const": "block_ref"},
+            "foreign_block_key": {"$ref": "#/$defs/CorpusKey"},
+            "relation": {"enum": ["forward", "reply_to", "evidence", "derived_from"]}
+          }
+        }
+      ]
+    },
+    "ArgumentsSchemaBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "schema_digest"],
+      "properties": {
+        "uri": {"type": "string", "format": "uri", "minLength": 3, "maxLength": 512},
+        "schema_digest": {"$ref": "common.schema.json#/$defs/Sha256"}
+      }
+    },
+    "PortableRecordedAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_action_key", "ordinal", "name", "arguments_schema",
+        "source_target_alias", "side_effect_class", "arguments"
+      ],
+      "properties": {
+        "source_action_key": {"$ref": "#/$defs/CorpusKey"},
+        "ordinal": {"type": "integer", "minimum": 0, "maximum": 63},
+        "name": {"$ref": "common.schema.json#/$defs/ActionName"},
+        "arguments_schema": {"$ref": "#/$defs/ArgumentsSchemaBinding"},
+        "source_target_alias": {"$ref": "#/$defs/CorpusKey"},
+        "side_effect_class": {
+          "enum": ["read_only", "idempotent_write", "non_idempotent_write", "unknown"]
+        },
+        "arguments": {"$ref": "common.schema.json#/$defs/JsonValue"}
+      }
+    },
+    "PortableBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["foreign_block_key", "role", "description", "parts", "recorded_actions", "content_digest"],
+      "properties": {
+        "foreign_block_key": {"$ref": "#/$defs/CorpusKey"},
+        "role": {"enum": ["stimulus", "demonstration", "feedback", "environment_event", "expected_observation", "oracle_only"]},
+        "description": {"type": "string", "maxLength": 4096},
+        "parts": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/PortablePart"}},
+        "recorded_actions": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/PortableRecordedAction"}},
+        "content_digest": {"$ref": "common.schema.json#/$defs/Sha256"}
+      }
+    },
+    "AssetObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["foreign_asset_key", "object_ref", "byte_length", "content_digest", "media_type", "security_domain"],
+      "properties": {
+        "foreign_asset_key": {"$ref": "#/$defs/CorpusKey"},
+        "object_ref": {"$ref": "#/$defs/CorpusKey"},
+        "byte_length": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "content_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "media_type": {"$ref": "common.schema.json#/$defs/MimeType"},
+        "security_domain": {"$ref": "common.schema.json#/$defs/StableId"}
+      }
+    },
+    "Occurrence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["foreign_block_key", "source_page_alias", "occurrence_ordinal"],
+      "properties": {
+        "foreign_block_key": {"$ref": "#/$defs/CorpusKey"},
+        "source_page_alias": {"$ref": "common.schema.json#/$defs/StableId"},
+        "occurrence_ordinal": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+      }
+    },
+    "InputGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record_key", "source_recipient_alias", "recorded_virtual_time_us", "record_ordinal", "occurrences", "source_descriptor_digest", "source_config_digest"],
+      "properties": {
+        "record_key": {"$ref": "#/$defs/CorpusKey"},
+        "source_recipient_alias": {"$ref": "common.schema.json#/$defs/StableId"},
+        "recorded_virtual_time_us": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "record_ordinal": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "occurrences": {"type": "array", "minItems": 1, "maxItems": 4096, "items": {"$ref": "#/$defs/Occurrence"}},
+        "source_descriptor_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "source_config_digest": {"$ref": "common.schema.json#/$defs/Sha256"}
+      }
+    },
+    "FixtureEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixture_key", "fixture_digest", "role", "oracle_only",
+        "block_keys", "asset_keys", "action_keys"
+      ],
+      "properties": {
+        "fixture_key": {"$ref": "#/$defs/CorpusKey"},
+        "fixture_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "role": {
+          "enum": [
+            "stimulus", "demonstration", "feedback", "environment_event",
+            "expected_observation", "oracle_only"
+          ]
+        },
+        "oracle_only": {"type": "boolean"},
+        "block_keys": {
+          "type": "array", "maxItems": 1000000, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/CorpusKey"}
+        },
+        "asset_keys": {
+          "type": "array", "maxItems": 1000000, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/CorpusKey"}
+        },
+        "action_keys": {
+          "type": "array", "maxItems": 1000000, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/CorpusKey"}
+        }
+      }
+    },
+    "FixtureManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bundle_digest", "entries"],
+      "properties": {
+        "bundle_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "entries": {
+          "type": "array", "maxItems": 1000000,
+          "items": {"$ref": "#/$defs/FixtureEntry"}
+        }
+      }
+    },
+    "Split": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record_keys", "digest"],
+      "properties": {
+        "record_keys": {"type": "array", "minItems": 1, "maxItems": 100000000, "uniqueItems": true, "items": {"$ref": "#/$defs/CorpusKey"}},
+        "digest": {"$ref": "common.schema.json#/$defs/Sha256"}
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "semantic_validator", "corpus_id", "corpus_revision", "source_kind", "created_at",
+    "source_revisions", "authorization_digest", "redaction_policy_digest",
+    "retention_policy_digest", "security_domain", "blocks", "assets",
+    "input_groups", "splits", "fixture_manifest", "inventory_digest", "corpus_digest"
+  ],
+  "properties": {
+    "schema": {"const": "dolly.testament-corpus/v1"},
+    "semantic_validator": {"const": "org.dolly.validator.testament-corpus@1"},
+    "corpus_id": {"$ref": "common.schema.json#/$defs/StableId"},
+    "corpus_revision": {"$ref": "common.schema.json#/$defs/Revision"},
+    "source_kind": {"enum": ["recorded", "curated", "synthetic", "derived"]},
+    "created_at": {"$ref": "common.schema.json#/$defs/Timestamp"},
+    "source_revisions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["recorder", "graph", "config", "packages", "models", "tools", "prompts", "environment"],
+      "properties": {
+        "recorder": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "graph": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "config": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "packages": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "models": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "tools": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "prompts": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "environment": {"$ref": "common.schema.json#/$defs/Sha256"}
+      }
+    },
+    "authorization_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "redaction_policy_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "retention_policy_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "security_domain": {"$ref": "common.schema.json#/$defs/StableId"},
+    "blocks": {"type": "array", "maxItems": 100000000, "items": {"$ref": "#/$defs/PortableBlock"}},
+    "assets": {"type": "array", "maxItems": 100000000, "items": {"$ref": "#/$defs/AssetObject"}},
+    "input_groups": {"type": "array", "minItems": 1, "maxItems": 100000000, "items": {"$ref": "#/$defs/InputGroup"}},
+    "splits": {
+      "type": "object", "additionalProperties": false,
+      "required": ["train", "development", "held_out"],
+      "properties": {"train": {"$ref": "#/$defs/Split"}, "development": {"$ref": "#/$defs/Split"}, "held_out": {"$ref": "#/$defs/Split"}}
+    },
+    "fixture_manifest": {"$ref": "#/$defs/FixtureManifest"},
+    "inventory_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "corpus_digest": {"$ref": "common.schema.json#/$defs/Sha256"}
+  }
+}

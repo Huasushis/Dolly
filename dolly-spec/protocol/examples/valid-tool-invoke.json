@@ -1,0 +1,21 @@
+{
+  "jsonrpc": "2.0",
+  "id": "rpc-tool-1",
+  "method": "host.tool.invoke",
+  "params": {
+    "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000102",
+    "tool_transaction_id": "0198ab31-6c44-7e8a-b2bb-000000000103",
+    "module_id": "main-brain",
+    "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000104",
+    "config_revision": 1,
+    "lease_token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "tool_server_id": "local-files",
+    "tool_name": "read-file",
+    "tool_schema_digest": "sha256:cc312e640fbf1a761a84f981be0997e94b5e0a5c13a54808048852bc42fb9368",
+    "arguments": {"path": "README.md"},
+    "side_effect_class": "read_only",
+    "idempotency_key": null,
+    "confirmation_id": null,
+    "deadline": "2026-08-10T01:02:03.000000Z"
+  }
+}

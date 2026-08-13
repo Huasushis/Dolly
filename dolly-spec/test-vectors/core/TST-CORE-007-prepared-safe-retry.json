@@ -1,0 +1,38 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-007",
+  "kind": "crash_recovery",
+  "covers": ["INV-ACTIVATION-009", "INV-RAM-012", "INV-RAM-013"],
+  "initial": {
+    "activation_state": "leased",
+    "attempt": 1,
+    "frozen_replay_contract": {"mode": "never_auto_retry", "evidence": "none", "ledger": null},
+    "last_dispatch": {
+      "state": "prepared",
+      "transport_started": false,
+      "frame_digest": null
+    },
+    "cursor": 7,
+    "module_execution_slot": "attempt-1"
+  },
+  "stimulus": {
+    "command": "FenceComplete",
+    "reason": "worker_crash_before_dispatch_marker",
+    "host_fence_evidence_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "retry_jitter_ms": 17
+  },
+  "expected": {
+    "outcome": "safe_before_dispatch_retry",
+    "assertions": [
+      {"path": "/activation/state", "op": "equals", "value": "retry_wait"},
+      {"path": "/activation/next_attempt_authorization", "op": "equals", "value": {"authorized_attempt": 2, "source_attempt": 1, "reason": "safe_before_dispatch", "evidence_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"}},
+      {"path": "/activation/retry_delay_ms", "op": "equals", "value": 17},
+      {"path": "/module/execution_slot", "op": "absent"},
+      {"path": "/subscription/cursor", "op": "equals", "value": 7}
+    ],
+    "emitted": [
+      {"event": "ActivationRetryScheduled", "authorization": "safe_before_dispatch"}
+    ],
+    "crash_label": "CP-04"
+  }
+}

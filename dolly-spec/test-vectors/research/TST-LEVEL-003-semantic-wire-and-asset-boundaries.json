@@ -1,0 +1,84 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-LEVEL-003",
+  "kind": "research",
+  "covers": [
+    "REQ-LEVELUPPER-001",
+    "REQ-LEVELUPPER-002",
+    "REQ-LEVELUPPER-003",
+    "REQ-LEVELUPPER-004",
+    "REQ-LEVELUPPER-005",
+    "REQ-LEVELUPPER-006"
+  ],
+  "initial": {
+    "semantic_negative_cases": [
+      "share.endpoint_credentials",
+      "share.endpoint_query",
+      "share.endpoint_fragment",
+      "share.endpoint_canonical_duplicate",
+      "share.duplicate_peer_id",
+      "share.duplicate_share_id",
+      "share.duplicate_direction",
+      "share.duplicate_direction_id",
+      "share.page_direction_alias",
+      "share.unauthorized_peer_share",
+      "activation.wrong_fenced_replay_descriptor",
+      "content.digest_mismatch",
+      "content.invalid_raster_crop",
+      "entry.previous_hash_mismatch",
+      "entry.hop_path_mismatch",
+      "entry.hash_mismatch",
+      "wire.outer_nested_share_mismatch",
+      "wire.sender_path_mismatch",
+      "wire.frame_digest_mismatch",
+      "wire.unretained_content_digest",
+      "wire.hello_version_range_invalid",
+      "wire.protocol_downgrade",
+      "wire.negotiation_transcript_mismatch",
+      "wire.effective_limit_mismatch",
+      "wire.flow_credit_conflicting_repeat",
+      "wire.flow_credit_stale_revision",
+      "wire.checkpoint_zero_hash_mismatch",
+      "wire.ack_not_continuous_high_water",
+      "wire.ack_above_sender_high_water",
+      "wire.nack_advances_high_water",
+      "storage.same_peer_share_cross_scope_ack",
+      "storage.same_peer_share_cross_scope_pin",
+      "storage.same_peer_share_cross_scope_broker_handle",
+      "asset.offer_content_metadata_mismatch",
+      "asset.request_ranges_unsorted",
+      "asset.request_ranges_overlap",
+      "asset.request_range_out_of_offer",
+      "asset.request_count_over_limit",
+      "asset.complete_inexact_coverage",
+      "asset.binary_cross_session_replay",
+      "asset.binary_unsolicited_range",
+      "asset.binary_conflicting_overlap",
+      "asset.binary_trailing_bytes"
+    ]
+  },
+  "stimulus": {
+    "command": "run_levelupper_named_semantic_validators_and_binary_decoder",
+    "validators": [
+      "org.dolly.validator.levelupper-share@1",
+      "org.dolly.validator.levelupper-content@1",
+      "org.dolly.validator.levelupper-entry@1",
+      "org.dolly.validator.levelupper-wire@1"
+    ],
+    "activation_descriptor_namespace": "org.dolly.levelupper.activation",
+    "binary_magic": "DLYLUA01"
+  },
+  "expected": {
+    "outcome": "all_shape_valid_authority_integrity_and_resource_violations_rejected",
+    "assertions": [
+      {"path": "/accepted_negative_cases", "op": "count", "value": 0},
+      {"path": "/asset_bytes_staged_from_invalid_cases", "op": "equals", "value": 0},
+      {"path": "/local_ingress_calls_from_invalid_cases", "op": "equals", "value": 0},
+      {"path": "/entry_acks_from_invalid_cases", "op": "equals", "value": 0}
+    ],
+    "emitted": [
+      {"kind": "semantic_validation_summary", "invalid_cases": 43, "all_rejected": true}
+    ],
+    "crash_label": null
+  }
+}

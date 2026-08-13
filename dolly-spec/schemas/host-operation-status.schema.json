@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/host-operation-status.schema.json",
+  "title": "Generic durable Host-operation reconciliation contract",
+  "$comment": "This catalog container is not a value schema. Callers MUST select one exact $defs fragment.",
+  "not": {},
+  "$defs": {
+    "TargetMethod": {
+      "enum": [
+        "host.block.pin",
+        "host.block.unpin",
+        "host.asset.materialize_view",
+        "host.model.invoke",
+        "host.module.request_activation",
+        "host.module.request_wakeup",
+        "host.config.propose"
+      ]
+    },
+    "OperationStatusParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "module_id", "target_operation_id", "target_method", "deadline"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "target_operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "target_method": { "$ref": "#/$defs/TargetMethod" },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "OperationSuccess": {
+      "oneOf": [
+        { "$ref": "host-resource-rpc.schema.json#/$defs/BlockPinResult" },
+        { "$ref": "host-resource-rpc.schema.json#/$defs/BlockUnpinResult" },
+        { "$ref": "host-resource-rpc.schema.json#/$defs/AssetMaterializeViewResult" },
+        { "$ref": "model-response.schema.json" },
+        { "$ref": "host-control-rpc.schema.json#/$defs/RequestActivationResult" },
+        { "$ref": "host-control-rpc.schema.json#/$defs/RequestWakeupResult" },
+        { "$ref": "host-control-rpc.schema.json#/$defs/ConfigProposeResult" }
+      ]
+    },
+    "OperationStatusResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_operation_id", "target_method", "state", "terminal", "operation_digest",
+        "result_digest", "result", "error", "updated_at"
+      ],
+      "properties": {
+        "target_operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "target_method": { "$ref": "#/$defs/TargetMethod" },
+        "state": { "enum": ["absent", "accepted", "running", "succeeded", "failed", "unknown", "cancelled"] },
+        "terminal": { "type": "boolean" },
+        "operation_digest": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/Sha256" },
+            { "type": "null" }
+          ]
+        },
+        "result_digest": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/Sha256" },
+            { "type": "null" }
+          ]
+        },
+        "result": {
+          "oneOf": [
+            { "$ref": "#/$defs/OperationSuccess" },
+            { "type": "null" }
+          ]
+        },
+        "error": {
+          "oneOf": [
+            { "$ref": "error.schema.json" },
+            { "type": "null" }
+          ]
+        },
+        "updated_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "state": { "const": "absent" } }, "required": ["state"] },
+          "then": {
+            "properties": {
+              "terminal": { "const": true },
+              "operation_digest": { "type": "null" },
+              "result_digest": { "type": "null" },
+              "result": { "type": "null" },
+              "error": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "enum": ["accepted", "running"] } }, "required": ["state"] },
+          "then": {
+            "properties": {
+              "terminal": { "const": false },
+              "operation_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+              "result_digest": { "type": "null" },
+              "result": { "type": "null" },
+              "error": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "const": "succeeded" } }, "required": ["state"] },
+          "then": {
+            "properties": {
+              "terminal": { "const": true },
+              "operation_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+              "result_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+              "result": { "$ref": "#/$defs/OperationSuccess" },
+              "error": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "enum": ["failed", "unknown", "cancelled"] } }, "required": ["state"] },
+          "then": {
+            "properties": {
+              "terminal": { "const": true },
+              "operation_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+              "result_digest": { "type": "null" },
+              "result": { "type": "null" },
+              "error": { "$ref": "error.schema.json" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "const": "unknown" } }, "required": ["state"] },
+          "then": {
+            "properties": {
+              "error": {
+                "allOf": [
+                  { "$ref": "error.schema.json" },
+                  { "type": "object", "properties": { "outcome": { "const": "unknown" } } }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "error": {
+                "type": "object",
+                "properties": { "outcome": { "const": "unknown" } },
+                "required": ["outcome"]
+              }
+            },
+            "required": ["error"]
+          },
+          "then": { "properties": { "state": { "const": "unknown" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "host.block.pin" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "host-resource-rpc.schema.json#/$defs/BlockPinResult" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "host.block.unpin" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "host-resource-rpc.schema.json#/$defs/BlockUnpinResult" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "host.asset.materialize_view" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "host-resource-rpc.schema.json#/$defs/AssetMaterializeViewResult" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "host.model.invoke" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "model-response.schema.json" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "host.module.request_activation" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "host-control-rpc.schema.json#/$defs/RequestActivationResult" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "host.module.request_wakeup" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "host-control-rpc.schema.json#/$defs/RequestWakeupResult" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "host.config.propose" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "host-control-rpc.schema.json#/$defs/ConfigProposeResult" } } }
+        }
+      ]
+    }
+  }
+}

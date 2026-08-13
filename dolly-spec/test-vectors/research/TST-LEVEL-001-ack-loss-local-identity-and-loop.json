@@ -1,0 +1,41 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-LEVEL-001",
+  "kind": "research",
+  "covers": ["REQ-LEVELUPPER-001", "REQ-LEVELUPPER-002", "REQ-LEVELUPPER-003", "REQ-LEVELUPPER-004", "REQ-LEVELUPPER-005"],
+  "initial": {
+    "entry": {
+      "origin_peer_id": "peer-a",
+      "foreign_entry_key": "entry-99",
+      "foreign_block_key": "block-41",
+      "remote_block_id": "0198ab31-6c44-7e8a-b2bb-000000000441",
+      "remote_action": "org.example.remote.execute",
+      "asset_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "receiver": {"inbox": {}, "local_ingress": {}, "visited_peer_path": ["peer-a"]}
+  },
+  "stimulus": {
+    "command": "import_then_drop_ack_retransmit_and_reexport_to_origin",
+    "drop_first_ack": true,
+    "asset_chunks": [0, 1, 1, 2],
+    "final_asset_digest_valid": true
+  },
+  "expected": {
+    "outcome": "one_local_import_ack_recovery_and_bridge_loop_stop",
+    "assertions": [
+      {"path": "/receiver/local_ingress/entry-99/commit_count", "op": "equals", "value": 1},
+      {"path": "/receiver/local_ingress/entry-99/block_id", "op": "not_equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000441"},
+      {"path": "/receiver/local_ingress/entry-99/producer", "op": "equals", "value": "local-levelupper-ingress"},
+      {"path": "/receiver/local_ingress/entry-99/actions", "op": "count", "value": 0},
+      {"path": "/receiver/assets/available", "op": "equals", "value": true},
+      {"path": "/receiver/assets/publish_count", "op": "equals", "value": 1},
+      {"path": "/sender/retransmissions", "op": "equals", "value": 1},
+      {"path": "/receiver/acks/entry-99", "op": "equals", "value": "locally_committed"},
+      {"path": "/reexport_to_peer-a/error", "op": "equals", "value": "LEVELUPPER_LOOP_DETECTED"}
+    ],
+    "emitted": [
+      {"kind": "entry_ack", "foreign_entry_key": "entry-99", "continuous": true}
+    ],
+    "crash_label": "levelupper.inbound.after-local-commit-before-ack"
+  }
+}

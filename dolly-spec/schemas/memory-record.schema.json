@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/memory-record.schema.json",
+  "title": "Stable MemoryRecord",
+  "$defs": {
+    "RecordStatus": {
+      "enum": ["current", "historical", "candidate", "disputed", "retracted"]
+    },
+    "ValidationState": {
+      "enum": ["source_fidelity", "unvalidated", "validated", "rejected"]
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "memory_id", "record_revision", "page_id", "source_block_ids",
+    "record_type", "text", "event_time_start", "event_time_end",
+    "ingestion_time", "valid_time", "provenance", "confidence", "status",
+    "supersedes_memory_id", "conflict_set_id"
+  ],
+  "properties": {
+    "memory_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "record_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "page_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "source_block_ids": {
+      "type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true,
+      "items": { "$ref": "common.schema.json#/$defs/UuidV7" }
+    },
+    "record_type": { "enum": ["evidence", "event", "fact", "preference", "decision", "procedure_candidate"] },
+    "text": { "type": "string", "maxLength": 262144 },
+    "event_time_start": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/Timestamp" },
+        { "type": "null" }
+      ]
+    },
+    "event_time_end": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/Timestamp" },
+        { "type": "null" }
+      ]
+    },
+    "ingestion_time": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "valid_time": {
+      "type": "object", "additionalProperties": false,
+      "required": ["from", "until"],
+      "properties": {
+        "from": { "oneOf": [{ "$ref": "common.schema.json#/$defs/Timestamp" }, { "type": "null" }] },
+        "until": { "oneOf": [{ "$ref": "common.schema.json#/$defs/Timestamp" }, { "type": "null" }] }
+      }
+    },
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["extractor_revision", "part_paths", "chunk_ordinal", "model_profile_revision", "validation_state"],
+      "properties": {
+        "extractor_revision": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "part_paths": {
+          "type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^/", "maxLength": 1024 }
+        },
+        "chunk_ordinal": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "model_profile_revision": {
+          "oneOf": [
+            { "$ref": "model-request.schema.json#/$defs/ProfileRef" },
+            { "type": "null" }
+          ]
+        },
+        "validation_state": { "$ref": "#/$defs/ValidationState" }
+      }
+    },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "status": { "$ref": "#/$defs/RecordStatus" },
+    "supersedes_memory_id": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/UuidV7" },
+        { "type": "null" }
+      ]
+    },
+    "conflict_set_id": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/UuidV7" },
+        { "type": "null" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "A disputed record must identify the record it supersedes or its conflict set.",
+      "if": { "properties": { "status": { "const": "disputed" } }, "required": ["status"] },
+      "then": {
+        "anyOf": [
+          {
+            "properties": { "supersedes_memory_id": { "$ref": "common.schema.json#/$defs/UuidV7" } },
+            "required": ["supersedes_memory_id"]
+          },
+          {
+            "properties": { "conflict_set_id": { "$ref": "common.schema.json#/$defs/UuidV7" } },
+            "required": ["conflict_set_id"]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "A rejected claim remains auditable but cannot be exposed as a current record.",
+      "if": {
+        "properties": {
+          "provenance": {
+            "type": "object",
+            "properties": { "validation_state": { "const": "rejected" } },
+            "required": ["validation_state"]
+          }
+        },
+        "required": ["provenance"]
+      },
+      "then": { "properties": { "status": { "not": { "const": "current" } } } }
+    }
+  ]
+}

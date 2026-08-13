@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/block.schema.json",
+  "title": "BlockEnvelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "id", "created_at", "creation_commit_seq", "producer", "trace",
+    "body", "body_digest", "envelope_digest"
+  ],
+  "properties": {
+    "schema": { "const": "dolly.block/v1" },
+    "id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "created_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "creation_commit_seq": { "$ref": "common.schema.json#/$defs/Seq" },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "instance_id"],
+      "properties": {
+        "kind": { "enum": ["module", "external", "runtime"] },
+        "instance_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "module" } } },
+          "then": { "required": ["module_id"] },
+          "else": { "not": { "required": ["module_id"] } }
+        }
+      ]
+    },
+    "trace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trace_id", "root_trace_ids", "causal_parents", "hop_count"],
+      "properties": {
+        "trace_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "root_trace_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/UuidV7" }
+        },
+        "causal_parents": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/UuidV7" }
+        },
+        "hop_count": { "type": "integer", "minimum": 0, "maximum": 65535 }
+      }
+    },
+    "body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description", "parts", "actions", "metadata", "hints"],
+      "properties": {
+        "description": { "type": "string", "maxLength": 4096 },
+        "parts": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "common.schema.json#/$defs/Part" }
+        },
+        "actions": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "common.schema.json#/$defs/CommittedAction" }
+        },
+        "metadata": { "$ref": "common.schema.json#/$defs/Metadata" },
+        "hints": { "$ref": "common.schema.json#/$defs/Hints" }
+      }
+    },
+    "body_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "envelope_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+  }
+}
+

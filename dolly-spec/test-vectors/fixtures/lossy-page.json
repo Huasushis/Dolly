@@ -1,0 +1,13 @@
+{
+  "schema": "dolly.test-fixture/v1",
+  "fixture_id": "lossy-page",
+  "kind": "logical_state",
+  "value": {
+    "page_id": "progress",
+    "mode": "lossy",
+    "persisted_next_page_seq": 9,
+    "diagnostic_cursor": 6,
+    "memory_entries": [6, 7, 8],
+    "subscription": {"module_id": "observer", "cursor": 6}
+  }
+}

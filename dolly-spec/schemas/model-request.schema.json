@@ -1,0 +1,254 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/model-request.schema.json",
+  "title": "host.model.invoke params",
+  "$defs": {
+    "OutputModality": {
+      "enum": ["text", "image", "audio", "video", "file"]
+    },
+    "ProfileRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "revision"],
+      "properties": {
+        "profile_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "revision": { "$ref": "common.schema.json#/$defs/Revision" }
+      }
+    },
+    "ToolCallPart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "tool_transaction_id", "operation_id", "tool_server_id", "tool_name", "tool_schema_digest", "arguments"],
+      "properties": {
+        "kind": { "const": "tool_call" },
+        "tool_transaction_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "tool_server_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "tool_name": { "$ref": "common.schema.json#/$defs/StableId" },
+        "tool_schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "arguments": { "type": "object", "maxProperties": 256 }
+      }
+    },
+    "ToolResultPart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "tool_transaction_id", "result"],
+      "properties": {
+        "kind": { "const": "tool_result" },
+        "tool_transaction_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "result": { "$ref": "tool-result.schema.json" }
+      }
+    },
+    "ActionResultPart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "result"],
+      "properties": {
+        "kind": { "const": "action_result" },
+        "result": { "$ref": "action-result.schema.json" }
+      }
+    },
+    "MemoryEvidencePart": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "The LLM Extension verifies that the retained search result hashes to decision.search_result_digest and that every decision/search/record/target identity matches before creating this part.",
+      "required": ["kind", "trust_class", "decision", "record"],
+      "properties": {
+        "kind": { "const": "memory_evidence" },
+        "trust_class": { "const": "untrusted_user_derived" },
+        "decision": {
+          "allOf": [
+            { "$ref": "memory-injection-decision.schema.json" },
+            {
+              "type": "object",
+              "properties": { "decision": { "const": "include" } },
+              "required": ["decision"]
+            }
+          ]
+        },
+        "record": { "$ref": "memory-search-result.schema.json#/$defs/SearchResult" }
+      }
+    },
+    "CanonicalPart": {
+      "oneOf": [
+        {
+          "allOf": [
+            { "$ref": "common.schema.json#/$defs/Part" },
+            {
+              "type": "object",
+              "required": ["kind"],
+              "properties": {
+                "kind": { "enum": ["text", "asset", "block_ref"] }
+              }
+            }
+          ]
+        },
+        { "$ref": "#/$defs/ToolCallPart" },
+        { "$ref": "#/$defs/ToolResultPart" },
+        { "$ref": "#/$defs/ActionResultPart" },
+        { "$ref": "#/$defs/MemoryEvidencePart" }
+      ]
+    },
+    "ToolDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool_server_id", "tool_name", "description", "input_schema", "tool_schema_digest", "side_effect_class"],
+      "properties": {
+        "tool_server_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "tool_name": { "$ref": "common.schema.json#/$defs/StableId" },
+        "description": { "type": "string", "maxLength": 4096 },
+        "input_schema": { "$ref": "tool-broker-config.schema.json#/$defs/InputSchemaDocument" },
+        "tool_schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "side_effect_class": { "enum": ["read_only", "idempotent_write", "non_idempotent_write", "unknown"] }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "request_id", "module_id", "activation_id", "lease_token", "profile",
+    "operation", "messages", "tools", "requested_output_modalities",
+    "output_contract", "sampling", "budget",
+    "deadline", "metadata", "adapter_options"
+  ],
+  "properties": {
+    "request_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "activation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "lease_token": { "$ref": "common.schema.json#/$defs/LeaseToken" },
+    "profile": { "$ref": "#/$defs/ProfileRef" },
+    "operation": { "const": "generate" },
+    "messages": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["entry_id", "role_class", "parts", "transaction_id"],
+        "properties": {
+          "entry_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+          "role_class": { "enum": ["system", "assistant", "external", "tool"] },
+          "parts": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "$ref": "#/$defs/CanonicalPart" } },
+          "transaction_id": {
+            "oneOf": [
+              { "$ref": "common.schema.json#/$defs/UuidV7" },
+              { "type": "null" }
+            ]
+          }
+        },
+        "allOf": [
+          {
+            "$comment": "Memory evidence has untrusted external authority and can never occupy a system, assistant, or tool role class.",
+            "if": {
+              "properties": {
+                "parts": {
+                  "contains": {
+                    "type": "object",
+                    "properties": { "kind": { "const": "memory_evidence" } },
+                    "required": ["kind"]
+                  }
+                }
+              },
+              "required": ["parts"]
+            },
+            "then": { "properties": { "role_class": { "const": "external" } } }
+          }
+        ]
+      }
+    },
+    "tools": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/ToolDefinition" } },
+    "requested_output_modalities": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/OutputModality" }
+    },
+    "output_contract": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "none" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "text" } } },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "schema", "schema_digest"],
+          "$comment": "Before dispatch, the Gateway recomputes schema_digest from the UTF-8 JCS bytes of schema and rejects a mismatch.",
+          "properties": {
+            "kind": { "const": "json_schema" },
+            "schema": { "type": "object" },
+            "schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "schema", "schema_digest"],
+          "$comment": "The schema is the complete BlockDraft output schema. Before dispatch, the Gateway recomputes schema_digest from its UTF-8 JCS bytes and rejects a mismatch.",
+          "properties": {
+            "kind": { "const": "block_draft" },
+            "schema": { "type": "object" },
+            "schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+          }
+        }
+      ]
+    },
+    "sampling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["temperature", "seed"],
+      "properties": {
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+        "seed": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_output_tokens", "max_output_asset_bytes", "max_cost_microunits"],
+      "properties": {
+        "max_output_tokens": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "max_output_asset_bytes": { "type": "integer", "minimum": 0, "maximum": 1073741824 },
+        "max_cost_microunits": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trace_id"],
+      "properties": { "trace_id": { "$ref": "common.schema.json#/$defs/UuidV7" } }
+    },
+    "adapter_options": { "type": "object", "maxProperties": 128 }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"requested_output_modalities": {"contains": {"const": "text"}}},
+        "required": ["requested_output_modalities"]
+      },
+      "then": {"properties": {"output_contract": {"not": {"properties": {"kind": {"const": "none"}}, "required": ["kind"]}}}},
+      "else": {"properties": {"output_contract": {"properties": {"kind": {"const": "none"}}, "required": ["kind"]}}}
+    },
+    {
+      "if": {
+        "properties": {
+          "requested_output_modalities": {
+            "contains": {"enum": ["image", "audio", "video", "file"]}
+          }
+        },
+        "required": ["requested_output_modalities"]
+      },
+      "then": {"properties": {"budget": {"properties": {"max_output_asset_bytes": {"minimum": 1}}}}},
+      "else": {"properties": {"budget": {"properties": {"max_output_asset_bytes": {"const": 0}}}}}
+    }
+  ]
+}

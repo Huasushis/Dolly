@@ -1,0 +1,19 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-ASSET-001",
+  "kind": "service",
+  "covers": ["REQ-ASSET-001"],
+  "initial": {"display_width": 3, "display_height": 2, "orientation": 1},
+  "stimulus": {"view": {"kind": "image_rect_v1", "x0": 333333, "y0": 0, "x1": 666667, "y1": 1000000}},
+  "expected": {
+    "outcome": "materialized_bounds",
+    "assertions": [
+      {"path": "/left", "op": "equals", "value": 0},
+      {"path": "/top", "op": "equals", "value": 0},
+      {"path": "/right", "op": "equals", "value": 3},
+      {"path": "/bottom", "op": "equals", "value": 2}
+    ],
+    "emitted": [],
+    "crash_label": null
+  }
+}

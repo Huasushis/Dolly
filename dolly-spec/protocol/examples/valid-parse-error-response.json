@@ -1,0 +1,17 @@
+{
+  "jsonrpc": "2.0",
+  "id": null,
+  "error": {
+    "code": -32700,
+    "message": "Parse error",
+    "data": {
+      "code": "PROTOCOL_PARSE_ERROR",
+      "retryable": false,
+      "outcome": "not_applied",
+      "message": "The framed payload was not valid JSON.",
+      "details": {
+        "error_name": "parse_error"
+      }
+    }
+  }
+}

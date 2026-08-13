@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/ingress-status-request.schema.json",
+  "title": "host.ingress.status params",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["operation_id", "module_id", "idempotency_key", "deadline"],
+  "properties": {
+    "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[ -~]+$" },
+    "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  }
+}

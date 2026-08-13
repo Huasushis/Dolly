@@ -1,0 +1,23 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-RESEARCH-005",
+  "kind": "research",
+  "covers": ["REQ-LEARN-001", "REQ-LEARN-002", "REQ-LEARN-003", "REQ-LEARN-004"],
+  "initial": {
+    "training_units": ["task-template-a-instance-1"],
+    "evaluation_units": ["task-template-a-instance-1"],
+    "observed": {"before_success": false, "after_success": true},
+    "held_out_units": []
+  },
+  "stimulus": {"command": "decide_learning_claim"},
+  "expected": {
+    "outcome": "same_task_improvement_is_retention_not_learning_evidence",
+    "assertions": [
+      {"path": "/classification", "op": "equals", "value": "same-task-retention"},
+      {"path": "/generalization_claim", "op": "equals", "value": false},
+      {"path": "/promotion_decision", "op": "equals", "value": "inconclusive"},
+      {"path": "/missing_required_cases", "op": "contains", "value": "same-distribution-held-out"}
+    ],
+    "emitted": []
+  }
+}

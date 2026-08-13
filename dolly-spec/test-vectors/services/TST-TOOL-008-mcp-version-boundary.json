@@ -1,0 +1,39 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-TOOL-008",
+  "kind": "config",
+  "covers": ["REQ-TOOL-001", "REQ-TOOL-008"],
+  "initial": {
+    "active_config_revision": 11,
+    "active_protocol_version": "2025-06-18",
+    "active_tool_server_generation": 7
+  },
+  "stimulus": {
+    "candidate_config_revision": 12,
+    "candidate_protocol_version": "2026-07-28",
+    "server_behaviors": [
+      "server_discover",
+      "stateless_per_request_metadata",
+      "tools_call_input_required"
+    ]
+  },
+  "expected": {
+    "outcome": "candidate_rejected_before_generation_start",
+    "assertions": [
+      {"path": "/candidate/error", "op": "equals", "value": "TOOL_CONFIG_INVALID"},
+      {"path": "/active_config_revision", "op": "equals", "value": 11},
+      {"path": "/active_protocol_version", "op": "equals", "value": "2025-06-18"},
+      {"path": "/active_tool_server_generation", "op": "equals", "value": 7},
+      {"path": "/candidate/tool_server_generation", "op": "absent"},
+      {"path": "/continuation_dispatch_count", "op": "equals", "value": 0}
+    ],
+    "emitted": [
+      {
+        "event": "ToolRegistryCandidateRejected",
+        "reason": "unsupported_protocol_version",
+        "protocol_version": "2026-07-28"
+      }
+    ],
+    "crash_label": null
+  }
+}

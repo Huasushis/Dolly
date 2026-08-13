@@ -1,0 +1,38 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-REC-001",
+  "kind": "crash_recovery",
+  "covers": ["REQ-REC-004", "INV-XCAP-005"],
+  "initial": {
+    "backup": {
+      "source_daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000461",
+      "source_instance_id": "main",
+      "module_id": "memory-main",
+      "storage_scope_id": "0198ab31-6c44-7e8a-b2bb-000000000462",
+      "last_writer_generation": 4,
+      "external_state": "remote-database"
+    }
+  },
+  "stimulus": {
+    "command": "evaluate_restore_identity_modes",
+    "cases": ["replace_same_identity", "isolated_snapshot_clone", "portable_fork"]
+  },
+  "expected": {
+    "outcome": "identity_mode_controls_scope_and_external_authority",
+    "assertions": [
+      {"path": "/replace/storage_scope_id", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000462"},
+      {"path": "/replace/writer_generation", "op": "equals", "value": 5},
+      {"path": "/replace/external_write_before_fence", "op": "equals", "value": false},
+      {"path": "/isolated_clone/external_effects_enabled", "op": "equals", "value": false},
+      {"path": "/isolated_clone/mutable_store_shared_with_source", "op": "equals", "value": false},
+      {"path": "/portable_fork/reused_source_scope/error", "op": "equals", "value": "STATE_CLONE_REMAP_REQUIRED"},
+      {"path": "/portable_fork/remapped_scope", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000463"},
+      {"path": "/portable_fork/unsupported_opaque_module/state", "op": "equals", "value": "disabled"}
+    ],
+    "emitted": [
+      {"kind": "audit", "event": "restore_identity_plan_verified"},
+      {"kind": "audit", "event": "portable_scope_remap_recorded"}
+    ],
+    "crash_label": null
+  }
+}

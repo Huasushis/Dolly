@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/skills-result.schema.json",
+  "title": "Successful org.dolly.skills ActionResult payloads",
+  "x-dolly-action-result-validator": {
+    "id": "org.dolly.validator.skills-result",
+    "revision": 1
+  },
+  "$defs": {
+    "SkillName": { "$ref": "skills-action.schema.json#/$defs/SkillName" },
+    "NullableCursor": {
+      "oneOf": [
+        { "type": "string", "minLength": 1, "maxLength": 512 },
+        { "type": "null" }
+      ]
+    },
+    "ResourceDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative_path", "media_type", "byte_length", "content_hash"],
+      "properties": {
+        "relative_path": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "media_type": { "$ref": "common.schema.json#/$defs/MimeType" },
+        "byte_length": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "content_hash": { "$ref": "common.schema.json#/$defs/Sha256" }
+      }
+    },
+    "CatalogEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name", "description", "source", "trust", "enabled", "content_hash",
+        "skill_schema_revision", "required_capabilities", "resources",
+        "validation_warnings", "catalog_revision"
+      ],
+      "properties": {
+        "name": { "$ref": "#/$defs/SkillName" },
+        "description": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["root_id", "root_class", "relative_path"],
+          "properties": {
+            "root_id": { "$ref": "common.schema.json#/$defs/StableId" },
+            "root_class": { "enum": ["instance", "user", "bundled"] },
+            "relative_path": { "type": "string", "minLength": 1, "maxLength": 1024 }
+          }
+        },
+        "trust": { "enum": ["system", "trusted", "untrusted"] },
+        "enabled": { "type": "boolean" },
+        "content_hash": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "skill_schema_revision": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "required_capabilities": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/QualifiedName" }
+        },
+        "resources": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/ResourceDescriptor" }
+        },
+        "validation_warnings": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+        },
+        "catalog_revision": { "$ref": "common.schema.json#/$defs/Revision" }
+      }
+    },
+    "ListResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "catalog_revision", "entries", "next_cursor"],
+      "properties": {
+        "schema": { "const": "dolly.skills.list-result/v1" },
+        "catalog_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "entries": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": { "$ref": "#/$defs/CatalogEntry" }
+        },
+        "next_cursor": { "$ref": "#/$defs/NullableCursor" }
+      }
+    },
+    "ResolveResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "catalog_revision", "entry"],
+      "properties": {
+        "schema": { "const": "dolly.skills.resolve-result/v1" },
+        "catalog_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "entry": { "$ref": "#/$defs/CatalogEntry" }
+      }
+    },
+    "ManifestResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "The Extension additionally enforces that content_hash hashes the UTF-8 manifest bytes and that their byte length is within the frozen resource limit.",
+      "required": ["schema", "catalog_revision", "name", "content_hash", "manifest_text"],
+      "properties": {
+        "schema": { "const": "dolly.skills.get-manifest-result/v1" },
+        "catalog_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "name": { "$ref": "#/$defs/SkillName" },
+        "content_hash": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "manifest_text": { "type": "string", "maxLength": 8388608 }
+      }
+    },
+    "ResourceResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "The bound semantic validator checks decoded data length, offset/returned_bytes/total_bytes, truncation truth, the requested byte range, and configured byte limits.",
+      "required": [
+        "schema", "catalog_revision", "name", "relative_path", "media_type",
+        "content_hash", "encoding", "data", "offset", "returned_bytes",
+        "total_bytes", "truncated"
+      ],
+      "properties": {
+        "schema": { "const": "dolly.skills.get-resource-result/v1" },
+        "catalog_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "name": { "$ref": "#/$defs/SkillName" },
+        "relative_path": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "media_type": { "$ref": "common.schema.json#/$defs/MimeType" },
+        "content_hash": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "encoding": { "enum": ["utf8", "base64"] },
+        "data": { "type": "string", "maxLength": 11184812 },
+        "offset": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "returned_bytes": { "type": "integer", "minimum": 0, "maximum": 8388608 },
+        "total_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "truncated": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "encoding": { "const": "base64" } }, "required": ["encoding"] },
+          "then": {
+            "properties": {
+              "data": {
+                "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/ListResult" },
+    { "$ref": "#/$defs/ResolveResult" },
+    { "$ref": "#/$defs/ManifestResult" },
+    { "$ref": "#/$defs/ResourceResult" }
+  ]
+}

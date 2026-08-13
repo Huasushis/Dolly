@@ -1,0 +1,8 @@
+/book/
+/dist/
+/.venv/
+/node_modules/
+__pycache__/
+*.pyc
+*.tmp
+*.log

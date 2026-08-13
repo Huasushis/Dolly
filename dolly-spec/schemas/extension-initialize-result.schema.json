@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/extension-initialize-result.schema.json",
+  "title": "Successful extension.initialize result",
+  "$defs": {
+    "LedgerBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "module_id", "module_type", "storage_scope_id", "ledger", "continuity",
+        "source_extension_generation", "target_extension_generation",
+        "source_state_digest", "target_state_digest",
+        "migration_operation_id", "proof_digest"
+      ],
+      "properties": {
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "module_type": { "$ref": "common.schema.json#/$defs/StableId" },
+        "storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+        "ledger": { "$ref": "module-descriptor.schema.json#/$defs/ActivationLedgerDescriptor" },
+        "continuity": { "enum": ["initialized", "retained", "migrated"] },
+        "source_extension_generation": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/Seq" },
+            { "type": "null" }
+          ]
+        },
+        "target_extension_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+        "source_state_digest": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/Sha256" },
+            { "type": "null" }
+          ]
+        },
+        "target_state_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "migration_operation_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/UuidV7" },
+            { "type": "null" }
+          ]
+        },
+        "proof_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "continuity": { "const": "initialized" } }, "required": ["continuity"] },
+          "then": {
+            "properties": {
+              "source_extension_generation": { "type": "null" },
+              "source_state_digest": { "type": "null" },
+              "migration_operation_id": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "continuity": { "const": "retained" } }, "required": ["continuity"] },
+          "then": {
+            "properties": {
+              "source_extension_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+              "source_state_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+              "migration_operation_id": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "continuity": { "const": "migrated" } }, "required": ["continuity"] },
+          "then": {
+            "properties": {
+              "source_extension_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+              "source_state_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+              "migration_operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "extension_id", "extension_version", "package_digest", "worker_epoch",
+    "extension_generation", "config_revision", "extension_config_digest",
+    "extension_config_schema_digest", "selected_protocol", "effective_limits",
+    "supported_module_types", "state_schemas", "sdk_abi", "ledger_bindings"
+  ],
+  "properties": {
+    "extension_id": { "$ref": "common.schema.json#/$defs/ExtensionId" },
+    "extension_version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"
+    },
+    "package_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "worker_epoch": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "extension_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+    "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "extension_config_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "extension_config_schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "selected_protocol": { "$ref": "extension-initialize-request.schema.json#/$defs/ProtocolVersion" },
+    "effective_limits": { "$ref": "extension-initialize-request.schema.json#/$defs/Limits" },
+    "supported_module_types": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": { "$ref": "common.schema.json#/$defs/StableId" }
+    },
+    "state_schemas": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": { "type": "integer", "minimum": 1, "maximum": 65535 }
+    },
+    "sdk_abi": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "ledger_bindings": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/LedgerBinding" }
+    }
+  }
+}

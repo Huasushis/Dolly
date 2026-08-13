@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/action-result.schema.json",
+  "title": "ActionResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "action_id", "status", "result", "error"],
+  "properties": {
+    "schema": { "const": "dolly.action-result/v1" },
+    "action_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "status": { "enum": ["succeeded", "failed", "unknown"] },
+    "result": { "$ref": "common.schema.json#/$defs/JsonValue" },
+    "error": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "error.schema.json" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "succeeded" } }, "required": ["status"] },
+      "then": { "properties": { "error": { "type": "null" } } },
+      "else": {
+        "properties": {
+          "result": { "type": "null" },
+          "error": { "$ref": "error.schema.json" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "unknown" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "error": {
+            "allOf": [
+              { "$ref": "error.schema.json" },
+              { "type": "object", "properties": { "outcome": { "const": "unknown" } } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "The unknown-outcome relation is bidirectional: callers must not label an unknown external outcome as an ordinary failure.",
+      "if": {
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": { "outcome": { "const": "unknown" } },
+            "required": ["outcome"]
+          }
+        },
+        "required": ["error"]
+      },
+      "then": { "properties": { "status": { "const": "unknown" } } }
+    }
+  ]
+}

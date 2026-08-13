@@ -1,0 +1,56 @@
+{
+  "schema": "dolly.tool-broker-config/v1",
+  "servers": {
+    "local-files": {
+      "enabled": true,
+      "adapter": "mcp",
+      "protocol_version": "2025-06-18",
+      "transport": {
+        "kind": "stdio",
+        "package_id": "org.dolly.tools.files",
+        "package_version": "1.0.0",
+        "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "executable": "bin/dolly-file-tools",
+        "executable_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "args": ["--stdio"],
+        "secret_bindings": {}
+      },
+      "allowed_modules": ["main-brain"],
+      "limits": {
+        "startup_timeout_ms": 10000,
+        "request_timeout_ms": 30000,
+        "max_concurrency": 4,
+        "max_request_bytes": 1048576,
+        "max_response_bytes": 4194304
+      },
+      "tools": {
+        "read-file": {
+          "upstream_name": "read_file",
+          "description": "Read one policy-authorized text file.",
+          "input_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path"],
+            "properties": {
+              "path": {"type": "string", "minLength": 1, "maxLength": 4096}
+            }
+          },
+          "input_schema_digest": "sha256:cc312e640fbf1a761a84f981be0997e94b5e0a5c13a54808048852bc42fb9368",
+          "output_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["text"],
+            "properties": {
+              "text": {"type": "string", "maxLength": 1048576}
+            }
+          },
+          "output_schema_digest": "sha256:f90646d61a7a2375f63be072d059dc207b571b46a00d14aef909c094bf1ef6bb",
+          "side_effect_class": "read_only",
+          "idempotency": {"kind": "none"},
+          "requires_confirmation": false,
+          "enabled": true
+        }
+      }
+    }
+  }
+}

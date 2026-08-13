@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/test-vectors/fixture.schema.json",
+  "title": "Dolly conformance fixture",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "fixture_id", "kind", "value"],
+  "properties": {
+    "schema": { "const": "dolly.test-fixture/v1" },
+    "fixture_id": { "type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$", "maxLength": 128 },
+    "kind": { "enum": ["logical_state", "block_draft", "descriptor_graph", "research_plan_set", "research_run_set", "research_hint_registration_set", "block_draft_schema_cases"] },
+    "value": true
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "kind": { "const": "research_plan_set" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "https://dolly.example/spec/0.1/schemas/research-experiment-plan.schema.json"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "research_run_set" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "https://dolly.example/spec/0.1/schemas/research-run-record.schema.json"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "block_draft_schema_cases" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "expected_valid", "value"],
+              "properties": {
+                "id": { "$ref": "https://dolly.example/spec/0.1/schemas/common.schema.json#/$defs/StableId" },
+                "expected_valid": { "type": "boolean" },
+                "value": true
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "properties": { "expected_valid": { "const": true } },
+                    "required": ["expected_valid"]
+                  },
+                  "then": {
+                    "properties": {
+                      "value": { "$ref": "https://dolly.example/spec/0.1/schemas/block-draft.schema.json" }
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "value": {
+                        "not": { "$ref": "https://dolly.example/spec/0.1/schemas/block-draft.schema.json" }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "research_hint_registration_set" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "https://dolly.example/spec/0.1/schemas/research-hint-registration.schema.json"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

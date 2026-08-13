@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/research-hint-registration.schema.json",
+  "title": "Dolly experimental research hint registration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "registration_id", "hint_name", "envelope_version",
+    "payload_schema_uri", "payload_schema_digest", "experiment_id",
+    "plan_digest", "producer_modules", "consumer_modules", "graph_revision",
+    "config_revision", "enabled"
+  ],
+  "properties": {
+    "schema": { "const": "dolly.research-hint-registration/v1" },
+    "registration_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "hint_name": { "$ref": "common.schema.json#/$defs/QualifiedName" },
+    "envelope_version": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "payload_schema_uri": { "type": "string", "format": "uri", "minLength": 3, "maxLength": 512 },
+    "payload_schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "experiment_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "plan_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "producer_modules": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "common.schema.json#/$defs/StableId" }
+    },
+    "consumer_modules": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "common.schema.json#/$defs/StableId" }
+    },
+    "graph_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "enabled": { "type": "boolean" },
+    "expires_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  }
+}

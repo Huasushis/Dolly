@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/levelupper-wire-control.schema.json",
+  "title": "LevelUpper v1 bounded JCS control frame",
+  "$defs": {
+    "ForeignKey": {
+      "type": "string", "minLength": 1, "maxLength": 255,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "ShareBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["share_id", "share_revision", "direction_id", "share_epoch_id"],
+      "properties": {
+        "share_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "share_revision": {"$ref": "common.schema.json#/$defs/Revision"},
+        "direction_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "share_epoch_id": {"$ref": "common.schema.json#/$defs/UuidV7"}
+      }
+    },
+    "Limits": {
+      "type": "object", "additionalProperties": false,
+      "required": ["max_frame_bytes", "max_batch_entries", "max_in_flight_bytes", "max_asset_bytes", "max_asset_chunk_bytes", "max_outstanding_requests"],
+      "properties": {
+        "max_frame_bytes": {"type": "integer", "minimum": 1024, "maximum": 67108864},
+        "max_batch_entries": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "max_in_flight_bytes": {"type": "integer", "minimum": 1024, "maximum": 1073741824},
+        "max_asset_bytes": {"type": "integer", "minimum": 1, "maximum": 1073741824},
+        "max_asset_chunk_bytes": {"type": "integer", "minimum": 1024, "maximum": 16777216},
+        "max_outstanding_requests": {"type": "integer", "minimum": 1, "maximum": 65536}
+      }
+    },
+    "Hello": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "minimum_version", "maximum_version", "nonce", "limits"],
+      "properties": {
+        "kind": {"const": "hello"},
+        "minimum_version": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "maximum_version": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "nonce": {"$ref": "common.schema.json#/$defs/UuidV7"},
+        "limits": {"$ref": "#/$defs/Limits"}
+      }
+    },
+    "OpenShare": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "share", "direction", "effective_limits", "policy_digest", "negotiation_transcript_digest"],
+      "properties": {
+        "kind": {"enum": ["open_share", "accept_share"]},
+        "share": {"$ref": "#/$defs/ShareBinding"},
+        "direction": {"enum": ["export", "import"]},
+        "effective_limits": {"$ref": "#/$defs/Limits"},
+        "policy_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "negotiation_transcript_digest": {"$ref": "common.schema.json#/$defs/Sha256"}
+      }
+    },
+    "Checkpoint": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "share", "export_seq", "entry_hash"],
+      "properties": {
+        "kind": {"const": "resume_checkpoint"},
+        "share": {"$ref": "#/$defs/ShareBinding"},
+        "export_seq": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "entry_hash": {"oneOf": [{"$ref": "common.schema.json#/$defs/Sha256"}, {"type": "null"}]}
+      }
+    },
+    "Content": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "share", "content"],
+      "properties": {
+        "kind": {"const": "portable_content"},
+        "share": {"$ref": "#/$defs/ShareBinding"},
+        "content": {"$ref": "levelupper-portable-block.schema.json"}
+      }
+    },
+    "Entry": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "share", "entry"],
+      "properties": {
+        "kind": {"const": "portable_entry"},
+        "share": {"$ref": "#/$defs/ShareBinding"},
+        "entry": {"$ref": "levelupper-entry-envelope.schema.json"}
+      }
+    },
+    "AssetOffer": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "share", "foreign_asset_key", "content_digest", "byte_length", "media_type", "chunk_bytes"],
+      "properties": {
+        "kind": {"const": "asset_offer"},
+        "share": {"$ref": "#/$defs/ShareBinding"},
+        "foreign_asset_key": {"$ref": "#/$defs/ForeignKey"},
+        "content_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "byte_length": {"type": "integer", "minimum": 0, "maximum": 1073741824},
+        "media_type": {"$ref": "common.schema.json#/$defs/MimeType"},
+        "chunk_bytes": {"type": "integer", "minimum": 1024, "maximum": 16777216}
+      }
+    },
+    "AssetRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "share", "foreign_asset_key", "ranges"],
+      "properties": {
+        "kind": {"const": "asset_request"},
+        "share": {"$ref": "#/$defs/ShareBinding"},
+        "foreign_asset_key": {"$ref": "#/$defs/ForeignKey"},
+        "ranges": {
+          "type": "array", "minItems": 1, "maxItems": 4096,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["offset", "length"],
+            "properties": {
+              "offset": {"type": "integer", "minimum": 0, "maximum": 1073741824},
+              "length": {"type": "integer", "minimum": 1, "maximum": 16777216}
+            }
+          }
+        }
+      }
+    },
+    "AssetComplete": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "share", "foreign_asset_key", "content_digest"],
+      "properties": {
+        "kind": {"const": "asset_complete"},
+        "share": {"$ref": "#/$defs/ShareBinding"},
+        "foreign_asset_key": {"$ref": "#/$defs/ForeignKey"},
+        "content_digest": {"$ref": "common.schema.json#/$defs/Sha256"}
+      }
+    },
+    "EntryAck": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "share", "foreign_entry_key", "export_seq", "entry_hash", "code"],
+      "properties": {
+        "kind": {"const": "entry_ack"},
+        "share": {"$ref": "#/$defs/ShareBinding"},
+        "foreign_entry_key": {"$ref": "#/$defs/ForeignKey"},
+        "export_seq": {"$ref": "common.schema.json#/$defs/Seq"},
+        "entry_hash": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "code": {"const": "LOCALLY_COMMITTED"}
+      }
+    },
+    "EntryNack": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "share", "foreign_entry_key", "export_seq", "entry_hash", "code", "disposition"],
+      "properties": {
+        "kind": {"const": "entry_nack"},
+        "share": {"$ref": "#/$defs/ShareBinding"},
+        "foreign_entry_key": {"$ref": "#/$defs/ForeignKey"},
+        "export_seq": {"$ref": "common.schema.json#/$defs/Seq"},
+        "entry_hash": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "code": {"enum": ["TEMPORARY_BACKPRESSURE", "ASSET_PENDING", "POLICY_REJECTED", "INVALID_ENTRY", "SEQUENCE_GAP", "HASH_MISMATCH", "QUOTA_EXCEEDED", "SHARE_REVOKED"]},
+        "disposition": {"enum": ["retryable", "terminal_share_block"]}
+      }
+    },
+    "Flow": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "share", "credit_revision", "credit_bytes", "credit_entries"],
+      "properties": {
+        "kind": {"const": "flow_control"},
+        "share": {"$ref": "#/$defs/ShareBinding"},
+        "credit_revision": {"$ref": "common.schema.json#/$defs/Revision"},
+        "credit_bytes": {"type": "integer", "minimum": 0, "maximum": 1073741824},
+        "credit_entries": {"type": "integer", "minimum": 0, "maximum": 1000000}
+      }
+    },
+    "ConnectionControl": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "correlation_id", "code"],
+      "properties": {
+        "kind": {"enum": ["ping", "pong", "drain", "error", "close"]},
+        "correlation_id": {"oneOf": [{"$ref": "common.schema.json#/$defs/UuidV7"}, {"type": "null"}]},
+        "code": {"type": "string", "minLength": 1, "maxLength": 127, "pattern": "^[A-Z][A-Z0-9_]*$"}
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "semantic_validator", "protocol_version", "link_session_id", "connection_epoch", "sender_peer_id", "message_id", "body", "frame_digest"],
+  "properties": {
+    "schema": {"const": "dolly.levelupper-wire-control/v1"},
+    "semantic_validator": {"const": "org.dolly.validator.levelupper-wire@1"},
+    "protocol_version": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "link_session_id": {"$ref": "common.schema.json#/$defs/UuidV7"},
+    "connection_epoch": {"$ref": "common.schema.json#/$defs/Revision"},
+    "sender_peer_id": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "message_id": {"$ref": "common.schema.json#/$defs/UuidV7"},
+    "frame_digest": {"$ref": "common.schema.json#/$defs/Sha256"},
+    "body": {
+      "oneOf": [
+        {"$ref": "#/$defs/Hello"},
+        {"$ref": "#/$defs/OpenShare"},
+        {"$ref": "#/$defs/Checkpoint"},
+        {"$ref": "#/$defs/Content"},
+        {"$ref": "#/$defs/Entry"},
+        {"$ref": "#/$defs/AssetOffer"},
+        {"$ref": "#/$defs/AssetRequest"},
+        {"$ref": "#/$defs/AssetComplete"},
+        {"$ref": "#/$defs/EntryAck"},
+        {"$ref": "#/$defs/EntryNack"},
+        {"$ref": "#/$defs/Flow"},
+        {"$ref": "#/$defs/ConnectionControl"}
+      ]
+    }
+  }
+}

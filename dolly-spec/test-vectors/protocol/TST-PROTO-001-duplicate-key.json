@@ -1,0 +1,18 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-PROTO-001",
+  "kind": "protocol",
+  "covers": ["REQ-XRPC-001"],
+  "initial": {"connection_state": "ready"},
+  "stimulus": {"utf8": "{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"id\":\"b\",\"method\":\"extension.ping\"}"},
+  "expected": {
+    "outcome": "fatal_message_violation",
+    "assertions": [
+      {"path": "/method_invocations", "op": "count", "value": 0},
+      {"path": "/connection_state", "op": "equals", "value": "closed"},
+      {"path": "/extension_process", "op": "equals", "value": "terminated"}
+    ],
+    "emitted": [{"transport_error": -32700}],
+    "crash_label": null
+  }
+}

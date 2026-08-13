@@ -1,0 +1,23 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-RESEARCH-003",
+  "kind": "research",
+  "covers": ["REQ-REFLECT-001", "REQ-REFLECT-002", "REQ-REFLECT-003", "REQ-REFLECT-004"],
+  "initial": {
+    "candidate": {"id": "check-api-fields", "revision": 3, "status": "active-canary", "scope": ["api-compatibility"], "evidence": ["block-17"], "expires_at": "2026-08-10T19:00:00.000000Z"},
+    "clock": "2026-08-10T19:00:00.000001Z",
+    "compiled_prompt_candidates": ["check-api-fields"],
+    "stable_prompt_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "stimulus": {"command": "compile_prompt_after_expiry"},
+  "expected": {
+    "outcome": "expired_candidate_excluded_without_source_rewrite",
+    "assertions": [
+      {"path": "/candidate/status", "op": "equals", "value": "expired"},
+      {"path": "/compiled_prompt_candidates", "op": "count", "value": 0},
+      {"path": "/source_evidence/block-17", "op": "unchanged"},
+      {"path": "/stable_prompt_digest", "op": "equals", "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+    ],
+    "emitted": [{"event": "reflection_candidate_expired", "candidate_id": "check-api-fields", "revision": 3}]
+  }
+}

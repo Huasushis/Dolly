@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/tool-invoke.schema.json",
+  "title": "host.tool.invoke params",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "operation_id", "tool_transaction_id", "module_id", "activation_id", "config_revision",
+    "lease_token", "tool_server_id", "tool_name", "tool_schema_digest",
+    "arguments", "side_effect_class", "idempotency_key", "confirmation_id",
+    "deadline"
+  ],
+  "properties": {
+    "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "tool_transaction_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "activation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "lease_token": { "$ref": "common.schema.json#/$defs/LeaseToken" },
+    "tool_server_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "tool_name": { "$ref": "common.schema.json#/$defs/StableId" },
+    "tool_schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "arguments": { "type": "object", "maxProperties": 256 },
+    "side_effect_class": { "enum": ["read_only", "idempotent_write", "non_idempotent_write", "unknown"] },
+    "idempotency_key": {
+      "oneOf": [
+        { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[ -~]+$" },
+        { "type": "null" }
+      ]
+    },
+    "confirmation_id": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/UuidV7" },
+        { "type": "null" }
+      ]
+    },
+    "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "side_effect_class": { "const": "idempotent_write" } }, "required": ["side_effect_class"] },
+      "then": { "properties": { "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[ -~]+$" } } }
+    }
+  ]
+}

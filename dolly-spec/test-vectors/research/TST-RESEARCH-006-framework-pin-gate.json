@@ -1,0 +1,25 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-RESEARCH-006",
+  "kind": "research",
+  "covers": ["REQ-COMPARE-001", "REQ-COMPARE-002", "REQ-COMPARE-003", "REQ-COMPARE-004"],
+  "initial": {
+    "systems": [
+      {"name": "Dolly", "revision_kind": "build", "revision": "research-build-001"},
+      {"name": "OpenClaw", "revision_kind": "tag", "revision": "latest"},
+      {"name": "Hermes", "revision_kind": "tag", "revision": "v-pinned-001"}
+    ],
+    "outcomes_visible": false
+  },
+  "stimulus": {"command": "register_framework_comparison_plan"},
+  "expected": {
+    "outcome": "floating_revision_rejected_before_execution",
+    "assertions": [
+      {"path": "/registered", "op": "equals", "value": false},
+      {"path": "/error", "op": "equals", "value": "RESEARCH_PLAN_UNPINNED_SYSTEM"},
+      {"path": "/runs_started", "op": "equals", "value": 0},
+      {"path": "/failure_attribution", "op": "equals", "value": "harness"}
+    ],
+    "emitted": []
+  }
+}

@@ -1,0 +1,4 @@
+{"jsonrpc":"2.0","id":"a","id":"b","method":"extension.ping","params":{}}
+
+Expected: fatal message violation (`-32700` may be sent safely), then connection
+close and Extension process termination. The second `id` is never accepted.

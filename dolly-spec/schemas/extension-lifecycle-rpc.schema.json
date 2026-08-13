@@ -1,0 +1,760 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/extension-lifecycle-rpc.schema.json",
+  "title": "Consolidated Extension and Module lifecycle RPC contracts",
+  "$comment": "This catalog container is not a value schema. Callers MUST select one exact $defs fragment.",
+  "not": {},
+  "$defs": {
+    "ExtensionPingParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "worker_epoch", "extension_generation", "sent_at", "deadline"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "worker_epoch": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "extension_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+        "sent_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ExtensionPingResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "worker_epoch", "extension_generation", "state", "received_at"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "worker_epoch": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "extension_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+        "state": { "const": "alive" },
+        "received_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ExtensionShutdownParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "worker_epoch", "extension_generation", "reason", "deadline"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "worker_epoch": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "extension_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+        "reason": { "enum": ["instance_shutdown", "reload", "upgrade", "operator_request", "health_failure"] },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ExtensionShutdownResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "state", "remaining_module_count", "unresolved_module_ids"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "state": { "enum": ["stopping", "already_stopping"] },
+        "remaining_module_count": { "type": "integer", "minimum": 0, "maximum": 4096 },
+        "unresolved_module_ids": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/StableId" }
+        }
+      }
+    },
+    "ModuleInstantiateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "module_id", "module_type", "descriptor_revision",
+        "config_revision", "effective_config", "effective_config_digest",
+        "effective_config_schema_digest", "state_schema_version", "storage_scope_id",
+        "storage_access_mode", "storage_writer_generation", "storage_capability", "deadline"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "module_type": { "$ref": "common.schema.json#/$defs/StableId" },
+        "descriptor_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "effective_config": { "type": "object", "maxProperties": 1024 },
+        "effective_config_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "effective_config_schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "state_schema_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+        "storage_access_mode": {
+          "enum": ["none", "read_only", "staging_read_write", "active_read_write"]
+        },
+        "storage_writer_generation": {
+          "oneOf": [
+            { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            { "type": "null" }
+          ]
+        },
+        "storage_capability": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/LeaseToken" },
+            { "type": "null" }
+          ]
+        },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "storage_access_mode": { "const": "active_read_write" } },
+            "required": ["storage_access_mode"]
+          },
+          "then": {
+            "properties": {
+              "storage_writer_generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+              "storage_capability": { "$ref": "common.schema.json#/$defs/LeaseToken" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "storage_access_mode": { "const": "none" } },
+            "required": ["storage_access_mode"]
+          },
+          "then": {
+            "properties": {
+              "storage_writer_generation": { "type": "null" },
+              "storage_capability": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "storage_access_mode": { "enum": ["read_only", "staging_read_write"] } },
+            "required": ["storage_access_mode"]
+          },
+          "then": {
+            "properties": {
+              "storage_writer_generation": { "type": "null" },
+              "storage_capability": { "$ref": "common.schema.json#/$defs/LeaseToken" }
+            }
+          }
+        }
+      ]
+    },
+    "ModuleInstantiateResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "module_id", "state", "state_schema_version", "storage_scope_id",
+        "storage_access_mode", "storage_writer_generation",
+        "config_revision", "effective_config_digest",
+        "effective_config_schema_digest", "descriptor"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "state": { "enum": ["ready", "already_ready"] },
+        "state_schema_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+        "storage_access_mode": {
+          "enum": ["none", "read_only", "staging_read_write", "active_read_write"]
+        },
+        "storage_writer_generation": {
+          "oneOf": [
+            { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            { "type": "null" }
+          ]
+        },
+        "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "effective_config_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "effective_config_schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "descriptor": { "$ref": "module-descriptor.schema.json" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "storage_access_mode": { "const": "active_read_write" } },
+            "required": ["storage_access_mode"]
+          },
+          "then": {
+            "properties": {
+              "storage_writer_generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+            }
+          },
+          "else": {
+            "properties": { "storage_writer_generation": { "type": "null" } }
+          }
+        }
+      ]
+    },
+    "ModulePrepareConfigParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "module_id", "base_config_revision", "target_config_revision",
+        "extension_generation", "target_effective_config",
+        "target_effective_config_digest", "target_effective_config_schema_digest",
+        "input_digest", "deadline"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "base_config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "target_config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "extension_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+        "target_effective_config": { "type": "object", "maxProperties": 1024 },
+        "target_effective_config_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "target_effective_config_schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "input_digest": {
+          "$ref": "common.schema.json#/$defs/Sha256",
+          "$comment": "sha256(JCS({method:'module.prepare_config',params:<the complete params object with only input_digest omitted>})); the single quotes here are descriptive, not JSON bytes."
+        },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ModulePrepareConfigResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "module_id", "prepare_token", "input_digest", "change_class",
+        "target_config_revision", "target_effective_config_digest",
+        "target_effective_config_schema_digest",
+        "requires_quiescence", "compatible_state_schema_min", "compatible_state_schema_max",
+        "estimated_memory_bytes", "estimated_disk_bytes", "warnings"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "prepare_token": { "$ref": "common.schema.json#/$defs/LeaseToken" },
+        "input_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "target_config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "target_effective_config_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "target_effective_config_schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "change_class": { "enum": ["live", "module_restart", "package_restart", "state_migration", "offline_required"] },
+        "requires_quiescence": { "type": "boolean" },
+        "compatible_state_schema_min": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "compatible_state_schema_max": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "estimated_memory_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "estimated_disk_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "warnings": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+        }
+      }
+    },
+    "ModuleCommitConfigParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "module_id", "prepare_token", "target_config_revision", "deadline"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "prepare_token": { "$ref": "common.schema.json#/$defs/LeaseToken" },
+        "target_config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ModuleCommitConfigResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "module_id", "state", "config_revision", "committed_at"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "state": { "enum": ["committed", "already_committed"] },
+        "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "committed_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ModuleAbortConfigParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "module_id", "prepare_token", "reason", "deadline"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "prepare_token": { "$ref": "common.schema.json#/$defs/LeaseToken" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ModuleAbortConfigResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "module_id", "state", "observed_config_revision"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "state": { "enum": ["aborted", "already_aborted", "already_committed"] },
+        "observed_config_revision": { "$ref": "common.schema.json#/$defs/Revision" }
+      }
+    },
+    "SnapshotPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "asset_id"],
+          "properties": {
+            "kind": { "const": "asset" },
+            "asset_id": { "$ref": "common.schema.json#/$defs/AssetId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "storage_capability"],
+          "properties": {
+            "kind": { "const": "storage_capability" },
+            "storage_capability": { "$ref": "common.schema.json#/$defs/LeaseToken" }
+          }
+        }
+      ]
+    },
+    "SnapshotEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "snapshot_id", "daemon_installation_id", "instance_id", "module_id", "module_type",
+        "storage_scope_id", "extension_id", "source_package_digest",
+        "source_extension_generation", "state_schema_version", "config_revision",
+        "last_activation_id", "last_operation_ids", "payload", "payload_digest", "byte_length", "created_at"
+      ],
+      "properties": {
+        "snapshot_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "daemon_installation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "instance_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "module_type": { "$ref": "common.schema.json#/$defs/StableId" },
+        "storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+        "extension_id": { "$ref": "common.schema.json#/$defs/ExtensionId" },
+        "source_package_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "source_extension_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+        "state_schema_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "last_activation_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/UuidV7" },
+            { "type": "null" }
+          ]
+        },
+        "last_operation_ids": {
+          "type": "array",
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/UuidV7" }
+        },
+        "payload": { "$ref": "#/$defs/SnapshotPayload" },
+        "payload_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "byte_length": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "created_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ModuleSnapshotParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "module_id", "storage_scope_id", "config_revision", "reason", "deadline"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+        "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "reason": { "enum": ["reload", "upgrade", "backup", "operator_request", "recovery"] },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ModuleSnapshotResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "state", "snapshot"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "state": { "enum": ["snapshotted", "already_snapshotted"] },
+        "snapshot": { "$ref": "#/$defs/SnapshotEnvelope" }
+      }
+    },
+    "ModuleRestoreParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "module_id", "target_storage_scope_id", "snapshot",
+        "target_config_revision", "deadline"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "target_storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+        "snapshot": { "$ref": "#/$defs/SnapshotEnvelope" },
+        "target_config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ModuleRestoreResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "module_id", "storage_scope_id", "state", "state_digest", "restored_at"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+        "state": { "enum": ["restored", "already_restored"] },
+        "state_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "restored_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ModuleMigrateStateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "module_id", "migration_kind", "source_snapshot",
+        "target_storage_scope_id", "target_state_schema_version",
+        "target_package_digest", "approval_id", "deadline"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "migration_kind": {
+          "enum": ["schema_same_scope", "clone_to_fresh_scope", "identity_adoption"]
+        },
+        "source_snapshot": { "$ref": "#/$defs/SnapshotEnvelope" },
+        "target_storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+        "target_state_schema_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "target_package_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "approval_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/UuidV7" },
+            { "type": "null" }
+          ]
+        },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "migration_kind": { "const": "identity_adoption" } },
+            "required": ["migration_kind"]
+          },
+          "then": {
+            "properties": { "approval_id": { "$ref": "common.schema.json#/$defs/UuidV7" } }
+          }
+        }
+      ]
+    },
+    "ModuleMigrateStateResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "state", "snapshot", "report"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "state": { "enum": ["migrated", "already_migrated"] },
+        "snapshot": { "$ref": "#/$defs/SnapshotEnvelope" },
+        "report": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source_payload_digest", "target_payload_digest", "lossy", "changes"],
+          "properties": {
+            "source_payload_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+            "target_payload_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+            "lossy": { "type": "boolean" },
+            "changes": {
+              "type": "array",
+              "maxItems": 256,
+              "items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+            }
+          }
+        }
+      }
+    },
+    "ModuleOperationTargetMethod": {
+      "enum": [
+        "module.instantiate", "module.prepare_config", "module.commit_config", "module.abort_config",
+        "module.snapshot", "module.restore", "module.migrate_state", "module.shutdown"
+      ]
+    },
+    "ModuleOperationStatusParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "module_id", "storage_scope_id", "target_operation_id", "target_method", "deadline"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+        "target_operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "target_method": { "$ref": "#/$defs/ModuleOperationTargetMethod" },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ModuleOperationSuccess": {
+      "oneOf": [
+        { "$ref": "#/$defs/ModuleInstantiateResult" },
+        { "$ref": "#/$defs/ModulePrepareConfigResult" },
+        { "$ref": "#/$defs/ModuleCommitConfigResult" },
+        { "$ref": "#/$defs/ModuleAbortConfigResult" },
+        { "$ref": "#/$defs/ModuleSnapshotResult" },
+        { "$ref": "#/$defs/ModuleRestoreResult" },
+        { "$ref": "#/$defs/ModuleMigrateStateResult" },
+        { "$ref": "#/$defs/ModuleShutdownResult" }
+      ]
+    },
+    "ModuleOperationStatusResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_operation_id", "target_method", "state", "terminal", "operation_digest",
+        "result_digest", "result", "error", "updated_at"
+      ],
+      "properties": {
+        "target_operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "target_method": { "$ref": "#/$defs/ModuleOperationTargetMethod" },
+        "state": { "enum": ["absent", "accepted", "running", "succeeded", "failed", "unknown", "cancelled"] },
+        "terminal": { "type": "boolean" },
+        "operation_digest": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/Sha256" },
+            { "type": "null" }
+          ]
+        },
+        "result_digest": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/Sha256" },
+            { "type": "null" }
+          ]
+        },
+        "result": {
+          "oneOf": [
+            { "$ref": "#/$defs/ModuleOperationSuccess" },
+            { "type": "null" }
+          ]
+        },
+        "error": {
+          "oneOf": [
+            { "$ref": "error.schema.json" },
+            { "type": "null" }
+          ]
+        },
+        "updated_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "state": { "const": "absent" } }, "required": ["state"] },
+          "then": {
+            "properties": {
+              "terminal": { "const": true },
+              "operation_digest": { "type": "null" },
+              "result_digest": { "type": "null" },
+              "result": { "type": "null" },
+              "error": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "enum": ["accepted", "running"] } }, "required": ["state"] },
+          "then": {
+            "properties": {
+              "terminal": { "const": false },
+              "target_method": { "type": "string" },
+              "operation_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+              "result_digest": { "type": "null" },
+              "result": { "type": "null" },
+              "error": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "const": "succeeded" } }, "required": ["state"] },
+          "then": {
+            "properties": {
+              "terminal": { "const": true },
+              "target_method": { "type": "string" },
+              "operation_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+              "result_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+              "result": { "$ref": "#/$defs/ModuleOperationSuccess" },
+              "error": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "enum": ["failed", "unknown", "cancelled"] } }, "required": ["state"] },
+          "then": {
+            "properties": {
+              "terminal": { "const": true },
+              "target_method": { "type": "string" },
+              "operation_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+              "result_digest": { "type": "null" },
+              "result": { "type": "null" },
+              "error": { "$ref": "error.schema.json" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "const": "unknown" } }, "required": ["state"] },
+          "then": {
+            "properties": {
+              "error": {
+                "allOf": [
+                  { "$ref": "error.schema.json" },
+                  { "type": "object", "properties": { "outcome": { "const": "unknown" } } }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "error": {
+                "type": "object",
+                "properties": { "outcome": { "const": "unknown" } },
+                "required": ["outcome"]
+              }
+            },
+            "required": ["error"]
+          },
+          "then": { "properties": { "state": { "const": "unknown" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "module.instantiate" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "#/$defs/ModuleInstantiateResult" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "module.prepare_config" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "#/$defs/ModulePrepareConfigResult" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "module.commit_config" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "#/$defs/ModuleCommitConfigResult" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "module.abort_config" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "#/$defs/ModuleAbortConfigResult" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "module.snapshot" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "#/$defs/ModuleSnapshotResult" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "module.restore" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "#/$defs/ModuleRestoreResult" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "module.migrate_state" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "#/$defs/ModuleMigrateStateResult" } } }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "succeeded" }, "target_method": { "const": "module.shutdown" } },
+            "required": ["state", "target_method"]
+          },
+          "then": { "properties": { "result": { "$ref": "#/$defs/ModuleShutdownResult" } } }
+        }
+      ]
+    },
+    "ModuleHealthParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "module_id", "probe", "deadline"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "probe": { "enum": ["liveness", "readiness", "dependencies", "full"] },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ModuleHealthResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "module_id", "state", "observed_at", "checks"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "state": { "enum": ["healthy", "degraded", "unhealthy", "unknown"] },
+        "observed_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+        "checks": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "state", "latency_ms", "detail"],
+            "properties": {
+              "name": { "$ref": "common.schema.json#/$defs/QualifiedName" },
+              "state": { "enum": ["pass", "warn", "fail", "unknown"] },
+              "latency_ms": {
+                "oneOf": [
+                  { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+                  { "type": "null" }
+                ]
+              },
+              "detail": { "type": "string", "maxLength": 1024 }
+            }
+          }
+        }
+      }
+    },
+    "ModuleShutdownParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "module_id", "storage_scope_id", "storage_writer_generation", "reason", "deadline"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+        "storage_writer_generation": {
+          "oneOf": [
+            { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            { "type": "null" }
+          ]
+        },
+        "reason": { "enum": ["instance_shutdown", "reload", "upgrade", "remove", "operator_request"] },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "ModuleShutdownResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "module_id", "storage_scope_id", "storage_writer_generation",
+        "state", "state_digest", "stopped_at"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "storage_scope_id": { "$ref": "common.schema.json#/$defs/ModuleStorageScopeId" },
+        "storage_writer_generation": {
+          "oneOf": [
+            { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+            { "type": "null" }
+          ]
+        },
+        "state": { "enum": ["stopped", "already_stopped"] },
+        "state_digest": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/Sha256" },
+            { "type": "null" }
+          ]
+        },
+        "stopped_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CONFIG-001",
+  "kind": "config",
+  "covers": ["INV-CFG-003"],
+  "initial": {"active_graph_revision": 7, "activation_manifest_revision": 7, "manifest_output_pages": ["old-output"], "candidate_revision": 8, "candidate_output_pages": ["new-output"]},
+  "stimulus": {"commands": ["InstallGraph(8)", "ApplyOldManifestResult"]},
+  "expected": {
+    "outcome": "old_manifest_commits_to_old_snapshot",
+    "assertions": [
+      {"path": "/active_graph_revision", "op": "equals", "value": 8},
+      {"path": "/deliveries/old-output", "op": "count", "value": 1},
+      {"path": "/deliveries/new-output", "op": "count", "value": 0},
+      {"path": "/activation/state", "op": "equals", "value": "committed"}
+    ],
+    "emitted": [{"event": "GraphInstalled", "revision": 8}, {"event": "ActivationCommitted", "graph_revision": 7}],
+    "crash_label": null
+  }
+}

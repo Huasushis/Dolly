@@ -1,0 +1,19 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-005",
+  "kind": "security",
+  "covers": ["INV-ACT-003", "INV-ACTIVATION-004"],
+  "initial": {"fixture": "committed-activation", "authoritative_result_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "stimulus": {"command": "ReceiveResult", "authenticated_previously_issued_fence": true, "result_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+  "expected": {
+    "outcome": "ACTIVATION_RESULT_CONFLICT",
+    "assertions": [
+      {"path": "/activation/state", "op": "equals", "value": "committed"},
+      {"path": "/activation/result_digest", "op": "equals", "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      {"path": "/module/lifecycle_state", "op": "equals", "value": "quarantined"},
+      {"path": "/outputs", "op": "unchanged"}
+    ],
+    "emitted": [{"event": "QuarantineCreated", "reason": "ACTIVATION_RESULT_CONFLICT"}],
+    "crash_label": null
+  }
+}

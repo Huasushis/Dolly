@@ -1,0 +1,31 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CONFIG-004",
+  "kind": "config",
+  "covers": ["REQ-CFG-003", "REQ-CFG-005"],
+  "initial": {
+    "extension_config_top_level_members": 1024,
+    "module_config_top_level_members": 1,
+    "overlapping_member_names": 0,
+    "each_source_object_schema_valid": true
+  },
+  "stimulus": {
+    "command": "NormalizeEffectiveConfig"
+  },
+  "expected": {
+    "outcome": "candidate_rejected_before_revision_commit",
+    "assertions": [
+      {"path": "/resolved_effective_config_top_level_members", "op": "equals", "value": 1025},
+      {"path": "/config_revision_committed", "op": "equals", "value": false},
+      {"path": "/module_instantiate_called", "op": "equals", "value": false},
+      {"path": "/activation_manifest_created", "op": "equals", "value": false}
+    ],
+    "emitted": [
+      {
+        "event": "ConfigurationCandidateRejected",
+        "reason": "effective_config_max_properties"
+      }
+    ],
+    "crash_label": null
+  }
+}

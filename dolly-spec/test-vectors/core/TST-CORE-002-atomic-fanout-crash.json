@@ -1,0 +1,19 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-002",
+  "kind": "crash_recovery",
+  "covers": ["INV-TXN-001"],
+  "initial": {"fixture": "activation-result-staged-two-durable-pages", "cursor": 7},
+  "stimulus": {"command": "ApplyResult", "crash_at": "before_sqlite_commit"},
+  "expected": {
+    "outcome": "transaction_absent_after_recovery",
+    "assertions": [
+      {"path": "/activation/state", "op": "equals", "value": "result_staged"},
+      {"path": "/cursor", "op": "equals", "value": 7},
+      {"path": "/output_block", "op": "absent"},
+      {"path": "/deliveries", "op": "count", "value": 0}
+    ],
+    "emitted": [],
+    "crash_label": "before_sqlite_commit"
+  }
+}

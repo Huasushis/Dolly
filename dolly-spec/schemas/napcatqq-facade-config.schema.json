@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/napcatqq-facade-config.schema.json",
+  "title": "NapCatQQ trusted-consumer facade resolved Module configuration",
+  "$comment": "The napcat-onebot-v11-facade Module type MUST bind this whole root. Host profile admission additionally checks the exact singleton output, exact hub ingress Pages, private subscriber cohorts, same per_extension placement cohort, and distinct storage scopes.",
+  "$ref": "napcatqq-config.schema.json#/$defs/FacadeConfig"
+}

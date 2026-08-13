@@ -1,0 +1,53 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-INJECT-001",
+  "kind": "research",
+  "covers": ["REQ-INJECT-001"],
+  "initial": {
+    "clock": "2026-08-12T10:00:00.000000Z",
+    "record": {
+      "memory_id": "0198ab31-6c44-7e8a-b2bb-000000000221",
+      "record_revision": 4
+    },
+    "automatic_attempt_limits": {
+      "minimum_interval_ms": 5000,
+      "maximum_attempts_per_minute": 6
+    },
+    "requests": [
+      {
+        "request_id": "0198ab31-6c44-7e8a-b2bb-000000000222",
+        "at": "2026-08-12T10:00:00.000000Z",
+        "task": "resume unresolved task",
+        "nominations": 2
+      },
+      {
+        "request_id": "0198ab31-6c44-7e8a-b2bb-000000000223",
+        "at": "2026-08-12T10:07:00.000000Z",
+        "task": "continue the same unresolved task with new input",
+        "nominations": 1
+      }
+    ]
+  },
+  "stimulus": {
+    "command": "run_explicit_search_and_context_selection_for_both_requests",
+    "candidate_scores_frozen": true,
+    "token_budget_equal": true
+  },
+  "expected": {
+    "outcome": "deduplicate_within_each_request_but_allow_same_day_repeat",
+    "assertions": [
+      {"path": "/requests/0/memory/0198ab31-6c44-7e8a-b2bb-000000000221@4", "op": "count", "value": 1},
+      {"path": "/requests/1/memory/0198ab31-6c44-7e8a-b2bb-000000000221@4", "op": "count", "value": 1},
+      {"path": "/requests/1/decision/reason", "op": "equals", "value": "repeat_relevant_to_current_context"},
+      {"path": "/record/next_eligible_at", "op": "absent"},
+      {"path": "/explicit_search/results", "op": "unchanged"},
+      {"path": "/premise", "op": "unchanged"}
+    ],
+    "emitted": [
+      {"request_ordinal": 0, "decision": "include", "reason": "first_relevant_delivery"},
+      {"request_ordinal": 0, "decision": "suppress", "reason": "duplicate_in_target_request"},
+      {"request_ordinal": 1, "decision": "include", "reason": "repeat_relevant_to_current_context"}
+    ],
+    "crash_label": null
+  }
+}

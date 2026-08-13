@@ -1,0 +1,48 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-TESTAMENT-002",
+  "kind": "research",
+  "covers": ["REQ-TESTAMENT-001", "REQ-TESTAMENT-003", "REQ-TESTAMENT-005"],
+  "initial": {
+    "invalid_mutations": [
+      "duplicate_foreign_block_key",
+      "dangling_asset_reference",
+      "overlapping_train_and_held_out_record_key",
+      "oracle_only_transitively_reachable_from_target_input",
+      "independent_targets_share_sandbox_id",
+      "full_snapshot_clone_contains_mapping",
+      "asset_object_ref_resolves_to_file_uri",
+      "duplicate_source_action_key",
+      "recorded_action_ordinal_does_not_equal_array_position",
+      "mapping_missing_reachable_action_rule",
+      "mock_fixture_key_or_digest_does_not_match_manifest",
+      "mock_fixture_is_oracle_only",
+      "scripted_scheduler_repeats_transition_id",
+      "controller_resource_id_digest_pair_is_not_authorized",
+      "full_snapshot_clone_requests_live_network_or_effects"
+    ],
+    "valid_controls": [
+      "different_source_mappings_reuse_the_same_complete_treatment_target_for_many_to_one"
+    ]
+  },
+  "stimulus": {
+    "command": "run_frozen_corpus_and_replay_plan_semantic_validators",
+    "validators": [
+      "org.dolly.validator.testament-corpus@1",
+      "org.dolly.validator.testament-replay-plan@1"
+    ]
+  },
+  "expected": {
+    "outcome": "all_contract_authority_and_isolation_violations_rejected",
+    "assertions": [
+      {"path": "/accepted", "op": "count", "value": 0},
+      {"path": "/valid_controls_accepted", "op": "count", "value": 1},
+      {"path": "/production_capabilities_issued", "op": "count", "value": 0},
+      {"path": "/target_ingress_calls", "op": "count", "value": 0}
+    ],
+    "emitted": [
+      {"kind": "validation_summary", "invalid_cases": 15, "valid_controls": 1, "materialization_started": false}
+    ],
+    "crash_label": null
+  }
+}

@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/host-resource-rpc.schema.json",
+  "title": "Consolidated Host Block and Asset resource RPC contracts",
+  "$comment": "This catalog container is not a value schema. Callers MUST select one exact $defs fragment.",
+  "not": {},
+  "$defs": {
+    "BlockGetParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "module_id", "block_id", "activation_id", "lease_token", "deadline"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "block_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "activation_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/UuidV7" },
+            { "type": "null" }
+          ]
+        },
+        "lease_token": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/LeaseToken" },
+            { "type": "null" }
+          ]
+        },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "activation_id": { "type": "string" } }, "required": ["activation_id"] },
+          "then": { "properties": { "lease_token": { "$ref": "common.schema.json#/$defs/LeaseToken" } } },
+          "else": { "properties": { "lease_token": { "type": "null" } } }
+        }
+      ]
+    },
+    "BlockPinParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "module_id", "block_id", "reason", "expires_at", "deadline"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "block_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "expires_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "BlockPinResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "pin_id", "block_id", "state", "expires_at", "byte_length"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "pin_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "block_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "state": { "enum": ["pinned", "already_pinned"] },
+        "expires_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+        "byte_length": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "BlockUnpinParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "module_id", "pin_id", "deadline"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "pin_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "BlockUnpinResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "pin_id", "state", "released_at"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "pin_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "state": { "enum": ["unpinned", "already_unpinned"] },
+        "released_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "AssetGetParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "module_id", "asset_id", "representation", "max_inline_bytes",
+        "activation_id", "lease_token", "deadline"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "asset_id": { "$ref": "common.schema.json#/$defs/AssetId" },
+        "representation": { "enum": ["metadata", "inline_base64", "stream"] },
+        "max_inline_bytes": { "type": "integer", "minimum": 0, "maximum": 1048576 },
+        "activation_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/UuidV7" },
+            { "type": "null" }
+          ]
+        },
+        "lease_token": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/LeaseToken" },
+            { "type": "null" }
+          ]
+        },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "activation_id": { "type": "string" } }, "required": ["activation_id"] },
+          "then": { "properties": { "lease_token": { "$ref": "common.schema.json#/$defs/LeaseToken" } } },
+          "else": { "properties": { "lease_token": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "representation": { "const": "inline_base64" } }, "required": ["representation"] },
+          "then": { "properties": { "max_inline_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 } } }
+        }
+      ]
+    },
+    "AssetGetResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset_id", "media_type", "byte_length", "content_digest", "delivery"],
+      "properties": {
+        "asset_id": { "$ref": "common.schema.json#/$defs/AssetId" },
+        "media_type": { "$ref": "common.schema.json#/$defs/MimeType" },
+        "byte_length": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "content_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "delivery": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind"],
+              "properties": { "kind": { "const": "metadata" } }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "base64"],
+              "properties": {
+                "kind": { "const": "inline_base64" },
+                "base64": {
+                  "type": "string",
+                  "maxLength": 1398104,
+                  "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "stream_capability", "expires_at", "max_bytes"],
+              "properties": {
+                "kind": { "const": "stream" },
+                "stream_capability": { "$ref": "common.schema.json#/$defs/LeaseToken" },
+                "expires_at": { "$ref": "common.schema.json#/$defs/Timestamp" },
+                "max_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "AssetMaterializeViewParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "module_id", "source_asset_id", "view", "output_media_type",
+        "activation_id", "lease_token", "deadline"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "source_asset_id": { "$ref": "common.schema.json#/$defs/AssetId" },
+        "view": { "$ref": "common.schema.json#/$defs/CropRect" },
+        "output_media_type": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/MimeType" },
+            { "type": "null" }
+          ]
+        },
+        "activation_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/UuidV7" },
+            { "type": "null" }
+          ]
+        },
+        "lease_token": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/LeaseToken" },
+            { "type": "null" }
+          ]
+        },
+        "deadline": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "activation_id": { "type": "string" } }, "required": ["activation_id"] },
+          "then": { "properties": { "lease_token": { "$ref": "common.schema.json#/$defs/LeaseToken" } } },
+          "else": { "properties": { "lease_token": { "type": "null" } } }
+        }
+      ]
+    },
+    "AssetMaterializeViewResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id", "source_asset_id", "view_digest", "asset_id", "media_type", "byte_length"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "source_asset_id": { "$ref": "common.schema.json#/$defs/AssetId" },
+        "view_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "asset_id": { "$ref": "common.schema.json#/$defs/AssetId" },
+        "media_type": { "$ref": "common.schema.json#/$defs/MimeType" },
+        "byte_length": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-PROTO-003",
+  "kind": "protocol",
+  "covers": ["INV-ACTIVATION-010", "INV-RAM-014"],
+  "initial": {
+    "activation_state": "ready",
+    "attempt": 0,
+    "manifest_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+    "required_frame_bytes": 4194304,
+    "required_frame_nesting_depth": 80,
+    "candidate_generation": {
+      "generation": 9,
+      "max_frame_bytes": 2097152,
+      "max_frame_nesting_depth": 96
+    }
+  },
+  "stimulus": {"command": "AdmitGenerationThenIssueLease"},
+  "expected": {
+    "outcome": "ACTIVATION_FRAME_INCOMPATIBLE",
+    "assertions": [
+      {"path": "/candidate_generation/ready_for_module", "op": "equals", "value": false},
+      {"path": "/activation/state", "op": "equals", "value": "ready"},
+      {"path": "/activation/attempt", "op": "equals", "value": 0},
+      {"path": "/activation/lease_generation", "op": "unchanged"},
+      {"path": "/activation/manifest_digest", "op": "equals", "value": "sha256:6666666666666666666666666666666666666666666666666666666666666666"}
+    ],
+    "emitted": [
+      {"event": "ExtensionGenerationIncompatible", "reason": "frame_bounds"}
+    ],
+    "crash_label": null
+  }
+}

@@ -1,0 +1,154 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-009",
+  "kind": "crash_recovery",
+  "covers": ["INV-ACTIVATION-009", "INV-RAM-013", "INV-RAM-015", "INV-STORAGE-014"],
+  "initial": {
+    "cases": {
+      "complete": {
+        "module_id": "writer",
+        "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000009",
+        "activation_state": "leased",
+        "attempt": 1,
+        "manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "frozen_replay_contract": {
+          "mode": "fenced_replay",
+          "evidence": "activation_ledger",
+          "ledger": {
+            "namespace": "org.dolly.writer.effects",
+            "schema_version": "v1",
+            "location": "module_state_directory"
+          }
+        },
+        "last_dispatch": {
+          "state": "started",
+          "transport_started": true,
+          "frame_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+        },
+        "target_extension_generation": 8,
+        "cursor": 7,
+        "module_execution_slot": "attempt-1"
+      },
+      "unknown": {
+        "module_id": "writer",
+        "activation_id": "0198ab31-6c44-7e8a-b2bb-00000000000a",
+        "activation_state": "leased",
+        "attempt": 1,
+        "manifest_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "frozen_replay_contract": {
+          "mode": "fenced_replay",
+          "evidence": "activation_ledger",
+          "ledger": {
+            "namespace": "org.dolly.writer.effects",
+            "schema_version": "v1",
+            "location": "module_state_directory"
+          }
+        },
+        "last_dispatch": {
+          "state": "started",
+          "transport_started": true,
+          "frame_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+        },
+        "target_extension_generation": 8,
+        "cursor": 11,
+        "module_execution_slot": "attempt-1"
+      }
+    }
+  },
+  "stimulus": {
+    "cases": {
+      "complete": {
+        "commands": [
+          {"command": "BeginFence", "reason": "process_exit_without_result"},
+          {
+            "command": "RecordReplayEvidence",
+            "record": {
+              "schema": "dolly.activation-replay-evidence/v1",
+              "module_id": "writer",
+              "storage_scope_id": "0198ab31-6c44-7e8a-b2bb-000000000109",
+              "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000009",
+              "manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source_attempt": 1,
+              "target_extension_generation": 8,
+              "ledger": {
+                "namespace": "org.dolly.writer.effects",
+                "schema_version": "v1",
+                "location": "module_state_directory"
+              },
+              "continuity": "retained",
+              "ledger_state": "complete",
+              "replay_disposition": "return_result",
+              "state_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "result_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "migration_operation_id": null,
+              "continuity_proof_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "checked_at": "2026-08-10T22:00:00.000000Z"
+            },
+            "expected_evidence_digest": "sha256:163044a98366fa57c64fddec465da070d43087db9c780c25e1f39251037ebea6"
+          },
+          {
+            "command": "FenceComplete",
+            "host_fence_evidence_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "retry_jitter_ms": 19
+          }
+        ]
+      },
+      "unknown": {
+        "commands": [
+          {"command": "BeginFence", "reason": "process_exit_without_result"},
+          {
+            "command": "RecordReplayEvidence",
+            "record": {
+              "schema": "dolly.activation-replay-evidence/v1",
+              "module_id": "writer",
+              "storage_scope_id": "0198ab31-6c44-7e8a-b2bb-000000000109",
+              "activation_id": "0198ab31-6c44-7e8a-b2bb-00000000000a",
+              "manifest_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+              "source_attempt": 1,
+              "target_extension_generation": 8,
+              "ledger": {
+                "namespace": "org.dolly.writer.effects",
+                "schema_version": "v1",
+                "location": "module_state_directory"
+              },
+              "continuity": "retained",
+              "ledger_state": "unknown",
+              "replay_disposition": "quarantine",
+              "state_digest": null,
+              "result_digest": null,
+              "migration_operation_id": null,
+              "continuity_proof_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+              "checked_at": "2026-08-10T22:00:01.000000Z"
+            },
+            "expected_evidence_digest": "sha256:ce81b3a9daeadd315dddb097b626bafa702cfd4d4da0be75487c6f6a8a18bfb8"
+          },
+          {
+            "command": "FenceComplete",
+            "host_fence_evidence_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      }
+    }
+  },
+  "expected": {
+    "outcome": "complete_authorized_unknown_quarantined",
+    "assertions": [
+      {"path": "/complete/activation/state", "op": "equals", "value": "retry_wait"},
+      {"path": "/complete/activation/next_attempt_authorization", "op": "equals", "value": {"authorized_attempt": 2, "source_attempt": 1, "reason": "activation_ledger", "evidence_digest": "sha256:163044a98366fa57c64fddec465da070d43087db9c780c25e1f39251037ebea6"}},
+      {"path": "/complete/activation/last_dispatch/state", "op": "equals", "value": "fenced"},
+      {"path": "/complete/activation/last_dispatch/fence_evidence_digest", "op": "equals", "value": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+      {"path": "/complete/activation/retry_delay_ms", "op": "equals", "value": 19},
+      {"path": "/complete/subscription/cursor", "op": "equals", "value": 7},
+      {"path": "/unknown/activation/state", "op": "equals", "value": "quarantined"},
+      {"path": "/unknown/activation/next_attempt_authorization", "op": "absent"},
+      {"path": "/unknown/quarantine/reason", "op": "equals", "value": "ACTIVATION_EXTERNAL_OUTCOME_UNKNOWN"},
+      {"path": "/unknown/subscription/cursor", "op": "equals", "value": 11}
+    ],
+    "emitted": [
+      {"case": "complete", "event": "ActivationReplayEvidenceRecorded", "evidence_digest": "sha256:163044a98366fa57c64fddec465da070d43087db9c780c25e1f39251037ebea6"},
+      {"case": "complete", "event": "ActivationRetryScheduled", "authorization": "activation_ledger"},
+      {"case": "unknown", "event": "ModuleQuarantined", "reason": "ACTIVATION_EXTERNAL_OUTCOME_UNKNOWN"}
+    ],
+    "crash_label": "CP-05"
+  }
+}

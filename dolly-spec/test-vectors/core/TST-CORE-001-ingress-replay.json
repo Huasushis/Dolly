@@ -1,0 +1,19 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-001",
+  "kind": "core_transition",
+  "covers": ["INV-STORAGE-007"],
+  "initial": {"fixture": "empty-instance-r1", "next_commit_seq": 10},
+  "stimulus": {"commands": [{"kind": "ingress", "key": "channel:m1", "pages": ["a", "b"], "draft_fixture": "text-hello"}, {"kind": "ingress", "key": "channel:m1", "pages": ["b", "a"], "draft_fixture": "text-hello"}]},
+  "expected": {
+    "outcome": "idempotent_existing_result",
+    "assertions": [
+      {"path": "/blocks", "op": "count", "value": 1},
+      {"path": "/deliveries", "op": "count", "value": 2},
+      {"path": "/results/0/block_id", "op": "equals", "value": "@same:/results/1/block_id"},
+      {"path": "/next_commit_seq", "op": "equals", "value": 13}
+    ],
+    "emitted": [{"event": "IngressCommitted", "count": 1}],
+    "crash_label": null
+  }
+}

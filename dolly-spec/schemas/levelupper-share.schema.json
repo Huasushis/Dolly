@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/levelupper-share.schema.json",
+  "title": "LevelUpper research share configuration",
+  "$defs": {
+    "Peer": {
+      "type": "object", "additionalProperties": false,
+      "required": ["peer_id", "node_display_name", "transport_role", "endpoints", "credential_ref", "allowed_share_ids"],
+      "properties": {
+        "peer_id": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "node_display_name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "transport_role": {"enum": ["listen", "connect", "both"]},
+        "endpoints": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "format": "uri", "pattern": "^wss://", "maxLength": 2048}},
+        "credential_ref": {"$ref": "common.schema.json#/$defs/SecretRef"},
+        "allowed_share_ids": {"type": "array", "minItems": 1, "maxItems": 1024, "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/StableId"}}
+      }
+    },
+    "Direction": {
+      "type": "object", "additionalProperties": false,
+      "required": ["direction_id", "kind", "local_page_ids", "remote_stream_labels", "source_alias"],
+      "properties": {
+        "direction_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "kind": {"enum": ["export", "import"]},
+        "local_page_ids": {"type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/StableId"}},
+        "remote_stream_labels": {"type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/StableId"}},
+        "source_alias": {"$ref": "common.schema.json#/$defs/StableId"}
+      }
+    },
+    "Share": {
+      "type": "object", "additionalProperties": false,
+      "required": ["share_id", "share_revision", "peer_id", "directions", "content_policy", "metadata_policy", "action_policy", "asset_policy", "reference_policy", "ordering", "hop_limit", "limits"],
+      "properties": {
+        "share_id": {"$ref": "common.schema.json#/$defs/StableId"},
+        "share_revision": {"$ref": "common.schema.json#/$defs/Revision"},
+        "peer_id": {"$ref": "common.schema.json#/$defs/Sha256"},
+        "directions": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"$ref": "#/$defs/Direction"}},
+        "content_policy": {"const": "portable_parts"},
+        "metadata_policy": {"const": "strip"},
+        "action_policy": {"const": "strip_and_record"},
+        "asset_policy": {"enum": ["deny", "authorized_transfer"]},
+        "reference_policy": {"enum": ["strict", "loss_tolerant_explicit"]},
+        "ordering": {"enum": ["strict", "quarantine_gap"]},
+        "hop_limit": {"type": "integer", "minimum": 1, "maximum": 64},
+        "limits": {
+          "type": "object", "additionalProperties": false,
+          "required": ["max_backlog_items", "max_backlog_bytes", "max_backlog_age_seconds", "max_batch_items", "max_frame_bytes", "max_asset_bytes", "max_in_flight_bytes", "max_outstanding_requests"],
+          "properties": {
+            "max_backlog_items": {"type": "integer", "minimum": 1, "maximum": 1000000000},
+            "max_backlog_bytes": {"type": "integer", "minimum": 1024, "maximum": 9007199254740991},
+            "max_backlog_age_seconds": {"type": "integer", "minimum": 1, "maximum": 315576000},
+            "max_batch_items": {"type": "integer", "minimum": 1, "maximum": 10000},
+            "max_frame_bytes": {"type": "integer", "minimum": 1024, "maximum": 67108864},
+            "max_asset_bytes": {"type": "integer", "minimum": 1, "maximum": 1073741824},
+            "max_in_flight_bytes": {"type": "integer", "minimum": 1024, "maximum": 1073741824},
+            "max_outstanding_requests": {"type": "integer", "minimum": 1, "maximum": 65536}
+          }
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "semantic_validator", "node_display_name", "minimum_protocol_version", "network_broker_grant", "peers", "shares"],
+  "properties": {
+    "schema": {"const": "dolly.levelupper-share-config/v1"},
+    "semantic_validator": {"const": "org.dolly.validator.levelupper-share@1"},
+    "node_display_name": {"type": "string", "minLength": 1, "maxLength": 256},
+    "minimum_protocol_version": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "network_broker_grant": {"$ref": "common.schema.json#/$defs/QualifiedName"},
+    "peers": {"type": "array", "minItems": 1, "maxItems": 1024, "items": {"$ref": "#/$defs/Peer"}},
+    "shares": {"type": "array", "minItems": 1, "maxItems": 4096, "items": {"$ref": "#/$defs/Share"}}
+  }
+}

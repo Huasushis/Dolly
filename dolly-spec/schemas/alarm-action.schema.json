@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/alarm-action.schema.json",
+  "title": "Stable org.dolly.alarm committed Actions",
+  "$defs": {
+    "CreateSchedule": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "at"],
+          "properties": {
+            "kind": { "const": "once" },
+            "at": {
+              "type": "string",
+              "format": "date-time",
+              "maxLength": 35,
+              "$comment": "Input requires an explicit Z or numeric offset; the Alarm normalizer rejects leap seconds and invalid calendar dates and stores UTC microseconds."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "every_seconds", "anchor"],
+          "properties": {
+            "kind": { "const": "interval" },
+            "every_seconds": { "type": "integer", "minimum": 1, "maximum": 315576000 },
+            "anchor": { "$ref": "common.schema.json#/$defs/Timestamp" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "expression"],
+          "properties": {
+            "kind": { "const": "cron_v1" },
+            "expression": { "type": "string", "minLength": 9, "maxLength": 128, "pattern": "^[0-9*/, -]+$" },
+            "timezone": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[A-Za-z][A-Za-z0-9._+-]*(?:/[A-Za-z0-9._+-]+)*$" }
+          }
+        }
+      ]
+    },
+    "CreateArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title", "schedule", "delivery", "enabled"
+      ],
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "schedule": { "$ref": "#/$defs/CreateSchedule" },
+        "delivery": { "$ref": "alarm-record.schema.json#/properties/delivery" },
+        "misfire_policy": { "$ref": "alarm-record.schema.json#/properties/misfire_policy" },
+        "dst_gap_policy": { "$ref": "alarm-record.schema.json#/properties/dst_gap_policy" },
+        "dst_fold_policy": { "$ref": "alarm-record.schema.json#/properties/dst_fold_policy" },
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "ListArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "cursor", "limit"],
+      "properties": {
+        "enabled": { "type": ["boolean", "null"] },
+        "cursor": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 512 },
+            { "type": "null" }
+          ]
+        },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+      }
+    },
+    "GetArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alarm_id"],
+      "properties": {
+        "alarm_id": { "$ref": "common.schema.json#/$defs/UuidV7" }
+      }
+    },
+    "UpdateArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alarm_id", "expected_revision", "replacement"],
+      "properties": {
+        "alarm_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "expected_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "replacement": { "$ref": "#/$defs/CreateArgs" }
+      }
+    },
+    "DeleteArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alarm_id", "expected_revision"],
+      "properties": {
+        "alarm_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "expected_revision": { "$ref": "common.schema.json#/$defs/Revision" }
+      }
+    },
+    "SnoozeArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alarm_id", "occurrence_id", "expected_revision", "new_at"],
+      "properties": {
+        "alarm_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "occurrence_id": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "expected_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "new_at": { "$ref": "common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "AcknowledgeArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alarm_id", "occurrence_id", "expected_revision"],
+      "properties": {
+        "alarm_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "occurrence_id": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "expected_revision": { "$ref": "common.schema.json#/$defs/Revision" }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/CommittedAction" },
+        {
+          "required": ["target"],
+          "properties": {
+            "name": { "const": "org.dolly.alarm.create" },
+            "arguments": { "$ref": "#/$defs/CreateArgs" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/CommittedAction" },
+        {
+          "required": ["target"],
+          "properties": {
+            "name": { "const": "org.dolly.alarm.list" },
+            "arguments": { "$ref": "#/$defs/ListArgs" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/CommittedAction" },
+        {
+          "required": ["target"],
+          "properties": {
+            "name": { "const": "org.dolly.alarm.get" },
+            "arguments": { "$ref": "#/$defs/GetArgs" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/CommittedAction" },
+        {
+          "required": ["target"],
+          "properties": {
+            "name": { "const": "org.dolly.alarm.update" },
+            "arguments": { "$ref": "#/$defs/UpdateArgs" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/CommittedAction" },
+        {
+          "required": ["target"],
+          "properties": {
+            "name": { "const": "org.dolly.alarm.delete" },
+            "arguments": { "$ref": "#/$defs/DeleteArgs" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/CommittedAction" },
+        {
+          "required": ["target"],
+          "properties": {
+            "name": { "const": "org.dolly.alarm.snooze" },
+            "arguments": { "$ref": "#/$defs/SnoozeArgs" }
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/CommittedAction" },
+        {
+          "required": ["target"],
+          "properties": {
+            "name": { "const": "org.dolly.alarm.acknowledge" },
+            "arguments": { "$ref": "#/$defs/AcknowledgeArgs" }
+          }
+        }
+      ]
+    }
+  ]
+}

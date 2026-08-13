@@ -1,0 +1,38 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-TOOL-005",
+  "kind": "service",
+  "covers": ["REQ-TOOL-001", "REQ-TOOL-003", "REQ-TOOL-005"],
+  "initial": {
+    "authenticated_module_id": "module-a",
+    "candidate_operation_id": "0198ab31-6c44-7e8a-b2bb-000000000345",
+    "candidate_request_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "registry_resolution": "tool_alias_absent",
+    "tool_call_row": null
+  },
+  "stimulus": {
+    "events": [
+      "invoke_unknown_alias",
+      "query_module_scoped_status"
+    ]
+  },
+  "expected": {
+    "outcome": "pre_resolution_denial_without_operation_binding",
+    "assertions": [
+      {"path": "/invoke_result/status", "op": "equals", "value": "denied"},
+      {"path": "/invoke_result/error/code", "op": "equals", "value": "TOOL_UNKNOWN"},
+      {"path": "/invoke_result/error/retryable", "op": "equals", "value": false},
+      {"path": "/tool_call_row", "op": "absent"},
+      {"path": "/operation_digest", "op": "absent"},
+      {"path": "/status_result/status", "op": "equals", "value": "absent"},
+      {"path": "/dispatch_count", "op": "equals", "value": 0}
+    ],
+    "emitted": [
+      {
+        "event": "ToolCandidateDenied",
+        "request_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
+    ],
+    "crash_label": null
+  }
+}

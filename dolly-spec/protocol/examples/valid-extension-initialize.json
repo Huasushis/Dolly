@@ -1,0 +1,68 @@
+{
+  "jsonrpc": "2.0",
+  "id": "rpc-initialize-1",
+  "method": "extension.initialize",
+  "params": {
+    "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000110",
+    "extension_alias": "channel-ext",
+    "extension_generation": 7,
+    "expected_extension_id": "org.dolly.channel",
+    "expected_extension_version": "1.0.0",
+    "expected_package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "config_revision": 42,
+    "extension_config": {},
+    "extension_config_digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "extension_config_schema_digest": "sha256:6a1119239e3376b1b68e288836a58722301e83d32c614011eeba104a934c8788",
+    "offered_protocols": [
+      { "major": 1, "minor": 0 }
+    ],
+    "offered_limits": {
+      "max_frame_bytes": 4194304,
+      "max_frame_nesting_depth": 96,
+      "max_json_nesting_depth": 64,
+      "max_outstanding_host_requests": 64,
+      "max_outstanding_extension_requests": 64,
+      "max_queued_outbound_bytes": 8388608,
+      "max_requests_per_second": 1000,
+      "max_notifications_per_second": 1000
+    },
+    "granted_host_services": [
+      "host.activation.status",
+      "host.ingress.submit"
+    ],
+    "expected_modules": [
+      {
+        "module_id": "web-channel",
+        "module_type": "channel",
+        "storage_scope_id": "0198ab31-6c44-7e8a-b2bb-000000000111",
+        "activation_replay_contract": {
+          "mode": "fenced_replay",
+          "evidence": "activation_ledger",
+          "ledger": {
+            "namespace": "org.dolly.channel.activation",
+            "schema_version": "1",
+            "location": "module_state_directory"
+          }
+        }
+      }
+    ],
+    "storage_handles": [
+      {
+        "handle_name": "web-channel-state",
+        "scope": "module_state_directory",
+        "module_id": "web-channel",
+        "storage_scope_id": "0198ab31-6c44-7e8a-b2bb-000000000111",
+        "access_mode": "active_read_write",
+        "writer_generation": 3,
+        "capability": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      }
+    ],
+    "host": {
+      "implementation": "dolly-reference-runtime",
+      "implementation_version": "0.1.0",
+      "spec_version": "0.1.0",
+      "supported_sdk_abis": ["dolly-extension-sdk/1"]
+    },
+    "deadline": "2026-08-10T01:02:13.000000Z"
+  }
+}

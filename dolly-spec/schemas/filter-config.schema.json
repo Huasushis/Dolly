@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/filter-config.schema.json",
+  "title": "Two-thirds mean Filter resolved Module configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "signal_channel", "state_epoch", "new_sample_weight_ppm", "bias_correction",
+    "candidate_scope", "self_source_policy", "tie_break",
+    "copy_description", "copy_block_refs", "copy_json_parts",
+    "copy_metadata", "copy_research_hints",
+    "max_tracked_sources", "max_observation_ledger_entries",
+    "max_output_parts", "max_output_bytes"
+  ],
+  "properties": {
+    "schema": {"const": "dolly.filter-config/v1"},
+    "signal_channel": {"$ref": "common.schema.json#/$defs/StableId"},
+    "state_epoch": {"$ref": "common.schema.json#/$defs/StableId"},
+    "new_sample_weight_ppm": {"type": "integer", "minimum": 1, "maximum": 1000000},
+    "bias_correction": {"type": "boolean"},
+    "candidate_scope": {"const": "manifest_present_sources"},
+    "self_source_policy": {"const": "ignore"},
+    "tie_break": {"const": "source_identity_jcs_utf8"},
+    "copy_description": {"type": "boolean"},
+    "copy_block_refs": {"type": "boolean"},
+    "copy_json_parts": {"const": false},
+    "copy_metadata": {"const": false},
+    "copy_research_hints": {"const": false},
+    "max_tracked_sources": {"type": "integer", "minimum": 1, "maximum": 4096},
+    "max_observation_ledger_entries": {"type": "integer", "minimum": 1, "maximum": 1000000000},
+    "max_output_parts": {"type": "integer", "minimum": 1, "maximum": 256},
+    "max_output_bytes": {"type": "integer", "minimum": 1024, "maximum": 67108864}
+  }
+}

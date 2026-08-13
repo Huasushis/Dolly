@@ -1,0 +1,271 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/common.schema.json",
+  "title": "Dolly common types",
+  "$defs": {
+    "UuidV7": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "ModuleStorageScopeId": {
+      "$ref": "#/$defs/UuidV7",
+      "$comment": "Host-assigned stable storage isolation identity for one logical Module; not a capability token."
+    },
+    "StableId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+    },
+    "ExtensionId": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 255,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:\\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*){2,}$"
+    },
+    "QualifiedName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 255,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:\\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*)+$"
+    },
+    "ActionName": {
+      "type": "string",
+      "minLength": 7,
+      "maxLength": 255,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:\\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*){3,}$"
+    },
+    "Seq": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "Revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{6}Z$"
+    },
+    "Sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "AssetId": {
+      "type": "string",
+      "pattern": "^ast_b3_[a-z2-7]{51}[aq]$"
+    },
+    "LeaseToken": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+    },
+    "SecretRef": {
+      "type": "string",
+      "minLength": 12,
+      "maxLength": 255,
+      "pattern": "^secret://[a-z][a-z0-9-]{0,62}/[A-Za-z0-9][A-Za-z0-9._/-]{0,190}$"
+    },
+    "JsonValue": true,
+    "MimeType": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 255,
+      "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$"
+    },
+    "Metadata": {
+      "type": "object",
+      "maxProperties": 32,
+      "propertyNames": { "$ref": "#/$defs/ExtensionId" },
+      "additionalProperties": { "$ref": "#/$defs/JsonValue" }
+    },
+    "ResearchHintEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "schema_uri", "schema_digest", "experiment_id", "payload"],
+      "properties": {
+        "version": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "schema_uri": { "type": "string", "format": "uri", "minLength": 3, "maxLength": 512 },
+        "schema_digest": { "$ref": "#/$defs/Sha256" },
+        "experiment_id": { "$ref": "#/$defs/StableId" },
+        "payload": { "$ref": "#/$defs/JsonValue" }
+      }
+    },
+    "Hints": {
+      "type": "object",
+      "maxProperties": 8,
+      "propertyNames": { "$ref": "#/$defs/QualifiedName" },
+      "additionalProperties": { "$ref": "#/$defs/ResearchHintEnvelope" }
+    },
+    "CropRect": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "JSON Schema validates coordinate bounds; Core additionally enforces x0 < x1 and y0 < y1.",
+      "required": ["kind", "x0", "y0", "x1", "y1"],
+      "properties": {
+        "kind": { "const": "image_rect_v1" },
+        "x0": { "type": "integer", "minimum": 0, "maximum": 999999 },
+        "y0": { "type": "integer", "minimum": 0, "maximum": 999999 },
+        "x1": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+        "y1": { "type": "integer", "minimum": 1, "maximum": 1000000 }
+      }
+    },
+    "Part": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "text", "format"],
+          "$comment": "maxLength counts Unicode code points; Core additionally enforces at most 262144 UTF-8 octets.",
+          "properties": {
+            "kind": { "const": "text" },
+            "text": { "type": "string", "maxLength": 262144 },
+            "format": { "enum": ["plain", "markdown"] },
+            "language": { "type": "string", "minLength": 2, "maxLength": 71, "pattern": "^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "json" },
+            "value": { "$ref": "#/$defs/JsonValue" },
+            "schema_uri": { "type": "string", "format": "uri", "maxLength": 512 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "asset_id", "media_type"],
+          "properties": {
+            "kind": { "const": "asset" },
+            "asset_id": { "$ref": "#/$defs/AssetId" },
+            "media_type": { "$ref": "#/$defs/MimeType" },
+            "view": { "$ref": "#/$defs/CropRect" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "block_id", "relation"],
+          "properties": {
+            "kind": { "const": "block_ref" },
+            "block_id": { "$ref": "#/$defs/UuidV7" },
+            "relation": { "enum": ["forward", "reply_to", "evidence", "derived_from"] }
+          }
+        }
+      ]
+    },
+    "ActionTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module_id"],
+      "properties": {
+        "module_id": { "$ref": "#/$defs/StableId" }
+      }
+    },
+    "ActionDraft": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "arguments"],
+      "properties": {
+        "name": { "$ref": "#/$defs/ActionName" },
+        "arguments": { "type": "object", "maxProperties": 256 },
+        "target": { "$ref": "#/$defs/ActionTarget" },
+        "correlation_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[ -~]+$" },
+        "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[ -~]+$" }
+      }
+    },
+    "ActionSemanticValidatorBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision"],
+      "properties": {
+        "id": { "$ref": "#/$defs/QualifiedName" },
+        "revision": { "$ref": "#/$defs/Revision" }
+      }
+    },
+    "ActionSchemaBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "schema_digest", "semantic_validator"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "uri-reference",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "schema_digest": { "$ref": "#/$defs/Sha256" },
+        "semantic_validator": {
+          "oneOf": [
+            { "$ref": "#/$defs/ActionSemanticValidatorBinding" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "FrozenActionContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name", "arguments_schema", "result_schema", "description", "side_effect_class"
+      ],
+      "properties": {
+        "name": { "$ref": "#/$defs/ActionName" },
+        "arguments_schema": { "$ref": "#/$defs/ActionSchemaBinding" },
+        "result_schema": { "$ref": "#/$defs/ActionSchemaBinding" },
+        "description": { "type": "string", "maxLength": 4096 },
+        "side_effect_class": {
+          "enum": ["read_only", "idempotent_write", "non_idempotent_write", "unknown"]
+        }
+      }
+    },
+    "ActionContractBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "module_id", "descriptor_revision", "action_contract_digest", "action_contract"
+      ],
+      "properties": {
+        "module_id": { "$ref": "#/$defs/StableId" },
+        "descriptor_revision": { "$ref": "#/$defs/Revision" },
+        "action_contract_digest": { "$ref": "#/$defs/Sha256" },
+        "action_contract": { "$ref": "#/$defs/FrozenActionContract" }
+      }
+    },
+    "CommittedAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action_id", "name", "arguments"],
+      "properties": {
+        "action_id": { "$ref": "#/$defs/UuidV7" },
+        "name": { "$ref": "#/$defs/ActionName" },
+        "arguments": { "type": "object", "maxProperties": 256 },
+        "target": { "$ref": "#/$defs/ActionTarget" },
+        "contract_binding": { "$ref": "#/$defs/ActionContractBinding" },
+        "correlation_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[ -~]+$" },
+        "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[ -~]+$" }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["target"] },
+          "then": { "required": ["contract_binding"] },
+          "else": { "not": { "required": ["contract_binding"] } }
+        }
+      ]
+    },
+    "SchedulingHint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "not_before": { "$ref": "#/$defs/Timestamp" },
+        "desired_by": { "$ref": "#/$defs/Timestamp" },
+        "load_signal": { "enum": ["underloaded", "balanced", "overloaded"] }
+      }
+    }
+  }
+}

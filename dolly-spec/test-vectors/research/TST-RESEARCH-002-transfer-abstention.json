@@ -1,0 +1,23 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-RESEARCH-002",
+  "kind": "research",
+  "covers": ["REQ-RES-002", "REQ-XFER-001", "REQ-XFER-002", "REQ-XFER-003", "REQ-XFER-004"],
+  "initial": {
+    "source_method": {"operation": "atomic-replace", "preconditions": ["same-filesystem", "durable-directory-sync"]},
+    "target_task": {"surface_domain": "remote-object-store", "available_preconditions": ["durable-directory-sync"]},
+    "retrieval_score": 0.99,
+    "oracle": "inapplicable_missing_same_filesystem"
+  },
+  "stimulus": {"command": "evaluate_method_transfer", "treatment": "evidence-template"},
+  "expected": {
+    "outcome": "high_similarity_does_not_override_missing_precondition",
+    "assertions": [
+      {"path": "/decision", "op": "equals", "value": "abstain"},
+      {"path": "/cited_source_evidence", "op": "contains", "value": "same-filesystem"},
+      {"path": "/negative_transfer", "op": "equals", "value": false},
+      {"path": "/promotion_gate", "op": "equals", "value": "eligible_sample"}
+    ],
+    "emitted": []
+  }
+}
