@@ -327,8 +327,7 @@ function createInstalledReactiveModuleRuntimeInternal(
     installations: options.installations,
     configurations: options.configurations,
     coreStateDirectory: options.core.stateDirectoryForProcessConfinement(),
-    binding: options.binding,
-    runtime: options.runtime,
+    activation: options.activation,
     lifecycle: {
       ...options.lifecycle,
       records: options.core,
@@ -433,7 +432,7 @@ type InstalledHostRuntimeOptions = Omit<
   InstalledReactiveModuleRuntimeOptions,
   | "configurations"
   | "core"
-  | "binding"
+  | "activation"
   | "initialModuleGenerationId"
   | "installations"
   | "instanceConfiguration"
@@ -441,7 +440,6 @@ type InstalledHostRuntimeOptions = Omit<
   | "moduleId"
   | "monotonicNow"
   | "nextModuleGenerationId"
-  | "runtime"
   | "stoppedRecordWriter"
 > & {
   /** Allocates the first non-reused generation identifier for each configured Module. */
@@ -716,8 +714,7 @@ export function composeInstalledReactiveModuleHost(
       installations: options.installations,
       configurations: options.configurations,
       core: options.coreState.store,
-      binding: options.activation.binding,
-      runtime: options.activation.runtime,
+      activation: options.activation,
       stoppedRecordWriter: options.coreState.stoppedRecordWriter,
       mailboxes: options.mailboxes,
       initialModuleGenerationId: initialModuleGenerationIds.get(module.moduleId)!,

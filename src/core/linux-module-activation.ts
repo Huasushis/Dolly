@@ -35,6 +35,7 @@ import {
   inspectReviewedLinuxModuleRuntime,
   type ReviewedLinuxModuleRuntimeIdentity,
 } from "../linux-module-runtime-assets.js";
+import { canonicalJsonDigest, deepFreeze, type JsonValue } from "./canonical-json.js";
 import { observeHostPlatform } from "./host-platform.js";
 
 export type ModuleActivationRefusalCode =
@@ -58,8 +59,24 @@ export interface LinuxModuleActivationPermission {
   readonly permitted: true;
   readonly binding: VerifiedCoreServiceBinding;
   readonly delegatedRoot: DelegatedCgroupRootPreparation;
-  readonly runtime: ReviewedLinuxModuleRuntimeIdentity;
+  readonly runtime: LinuxModuleRuntimeBinding;
   readonly stopProver: ModuleProcessStopProver;
+}
+
+/**
+ * Host-owned proof that one closed Linux runtime profile passed the activation
+ * inspection. The audit profile describes the executable paths and reviewed
+ * launcher bytes; object identity ties later composition to this exact
+ * inspection rather than to a caller-created object with equal fields.
+ *
+ * The revision is an audit-record digest, not a claim that dynamic libraries,
+ * the kernel, or bubblewrap semantics are portable across hosts. A future
+ * durable process record must pair it with separately versioned host
+ * conformance evidence before public Module activation can be enabled.
+ */
+export interface LinuxModuleRuntimeBinding {
+  readonly bindingRevision: string;
+  readonly auditProfile: ReviewedLinuxModuleRuntimeIdentity;
 }
 
 export type LinuxModuleActivationResult =
@@ -75,6 +92,37 @@ export type LinuxModuleActivationResult =
     };
 
 const LINUX_MODULE_ACTIVATION_PERMISSIONS = new WeakSet<object>();
+const LINUX_MODULE_RUNTIME_BINDINGS = new WeakSet<object>();
+
+function mintLinuxModuleRuntimeBinding(
+  profile: ReviewedLinuxModuleRuntimeIdentity,
+): LinuxModuleRuntimeBinding {
+  const auditProfile = deepFreeze({
+    ...profile,
+  }) as unknown as ReviewedLinuxModuleRuntimeIdentity;
+  const bindingRevision = canonicalJsonDigest(deepFreeze({
+    schemaVersion: "dolly.linux-module-runtime-binding/1",
+    auditProfile: auditProfile as unknown as JsonValue,
+  }));
+  const binding = Object.freeze({ bindingRevision, auditProfile });
+  LINUX_MODULE_RUNTIME_BINDINGS.add(binding);
+  return binding;
+}
+
+/** Rejects copied runtime profiles and bindings not minted by activation. */
+export function assertLinuxModuleRuntimeBinding(
+  value: unknown,
+): asserts value is LinuxModuleRuntimeBinding {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    !LINUX_MODULE_RUNTIME_BINDINGS.has(value)
+  ) {
+    throw new TypeError(
+      "Linux Module runtime binding was not minted by the Host activation decision",
+    );
+  }
+}
 
 /** Rejects copied or caller-constructed activation evidence. */
 export function assertLinuxModuleActivationPermission(
@@ -139,7 +187,7 @@ export async function decideLinuxModuleActivation(
       detail: runtimeInspection.detail,
     });
   }
-  const runtime = runtimeInspection.runtime;
+  const runtimeProfile = runtimeInspection.runtime;
 
   const binding = await inspectCoreServiceBinding(options);
   if (!binding.verified) {
@@ -154,6 +202,8 @@ export async function decideLinuxModuleActivation(
   if (refusals.length > 0) {
     return { permitted: false, refusals };
   }
+
+  const runtime = mintLinuxModuleRuntimeBinding(runtimeProfile);
 
   const delegatedRoot = await prepareDelegatedCgroupRoot({
     delegatedRootCgroupPath: binding.binding.delegatedRootCgroupPath,

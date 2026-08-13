@@ -314,8 +314,7 @@ describe("installed reactive Module runtime composition", () => {
       initialModuleGenerationId: "module-generation-a",
       nextModuleGenerationId: () => "module-generation-b",
       monotonicNow: () => 0,
-      binding: BINDING,
-      runtime: activationDependencies.runtime,
+      activation: activationPermission,
       lifecycle: {
         limits: {
           memoryMaxBytes: 64 * 1024 * 1024,
@@ -572,7 +571,7 @@ describe("installed reactive Module runtime composition", () => {
 
     const {
       configurations: _configurations,
-      binding: _binding,
+      activation: _activation,
       core: _core,
       initialModuleGenerationId,
       installations: _installations,
@@ -1041,7 +1040,7 @@ describe("installed reactive Module runtime composition", () => {
     const complete = options(pair);
     const {
       configurations: _configurations,
-      binding: _binding,
+      activation: _activation,
       core: _core,
       initialModuleGenerationId,
       installations: _installations,
@@ -1436,7 +1435,7 @@ describe("installed reactive Module runtime composition", () => {
     const complete = options(pair);
     const {
       configurations: _configurations,
-      binding: _binding,
+      activation: _activation,
       core: _core,
       initialModuleGenerationId,
       installations: _installations,
@@ -1620,7 +1619,7 @@ describe("installed reactive Module runtime composition", () => {
     const complete = options(pair);
     const {
       configurations: _configurations,
-      binding: _binding,
+      activation: _activation,
       core: _core,
       initialModuleGenerationId,
       installations: _installations,
@@ -1700,7 +1699,7 @@ describe("installed reactive Module runtime composition", () => {
     const complete = options(pair);
     const {
       configurations: _configurations,
-      binding: _binding,
+      activation: _activation,
       core: _core,
       initialModuleGenerationId,
       installations: _installations,

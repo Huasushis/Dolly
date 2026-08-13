@@ -676,11 +676,13 @@ may still exercise an explicit path, but that path mode is not the installed
 composition and cannot support product activation evidence.
 
 The activation decision has no caller-selected interpreter, launcher, or
-confinement path. It checks the same closed runtime identity used by installed
-composition: fixed `/usr/bin/python3`, the colocated launcher with its reviewed
-digest, fixed `/usr/bin/bwrap`, and the current Core Node executable and
-version. Its permitted result carries that identity
-beside the service binding and prepared delegated root. The default check
+confinement path. It checks the same closed runtime audit profile used by
+installed composition: fixed `/usr/bin/python3`, the colocated launcher with
+its reviewed digest, fixed `/usr/bin/bwrap`, and the current Core Node
+executable and version. A successful inspection mints a runtime binding: an
+unforgeable in-process object that contains the frozen audit profile and its
+canonical revision. Its permitted result carries that binding beside the
+service binding and prepared delegated root. The default check
 requires both programs to be executable and recomputes the launcher digest;
 failure is `MODULE_ACTIVATION_LAUNCHER_UNAVAILABLE`. Installed execution still
 uses the separately frozen launcher descriptor, so the activation pathname
@@ -696,8 +698,12 @@ cannot replace their evidence and receive the same `permitted` result.
 The successful result is a Host-minted, deeply frozen activation permission;
 later composition rejects a copied or caller-constructed structural lookalike.
 The permission binds the verified service identity, prepared delegated-root
-snapshot, reviewed runtime identity, and stop prover as one object. It is not a
-serializable configuration record and must never be reconstructed from JSON.
+snapshot, reviewed runtime binding, and stop prover as one object. Both the
+permission and the runtime binding reject copied structural lookalikes.
+Installed runtime, generation, and executor composition consume that exact
+permission instead of accepting the service binding and runtime profile as
+separate caller values. It is not a serializable configuration record and must
+never be reconstructed from JSON.
 
 Linux activation performs the delegated-root half of that proof before it
 returns permission to accept Module work. After verifying the exact Core
@@ -933,18 +939,20 @@ process record, this selection supports conformance wiring only and cannot
 remove the bootstrap refusal.
 
 `deriveReservedV10InstalledModuleProcessProvenance` joins that exact policy
-selection to the resolver-minted installed plan. Its canonical snapshot binds
+selection and Host-minted activation permission to the resolver-minted
+installed plan. Its canonical snapshot binds
 the installed-plan and policy-selection digests, package digest, configuration
-revision/schema/value digests, external-effect declaration, and complete Linux
-execution record. It also records the exact locally observed Node
-path/version and reviewed launcher profile; a substituted runtime profile is
-rejected instead of sharing a provenance digest. The result is a
-resolver-minted Linux process-provenance
+revision/schema/value digests, external-effect declaration, complete Linux
+execution record, verified service identity, prepared delegated-root snapshot,
+runtime-binding revision, and audit profile. A copied activation permission or
+runtime binding is rejected instead of sharing a provenance digest. The result
+is a resolver-minted Linux process-provenance
 candidate and copied lookalikes are rejected. Resolver provenance prevents
 structural substitution but does not prove current desired-state ownership,
-platform support, dynamic-library identity, bubblewrap/kernel enforcement, or
-a durable Host runtime-binding revision. It is
-intentionally not a Module process record and the current Core-state store will
+platform support, dynamic-library identity, or bubblewrap/kernel enforcement.
+The runtime-binding revision identifies this audit record; it is not yet a
+durable Host conformance record and cannot establish cross-host equivalence. It
+is intentionally not a Module process record and the current Core-state store will
 not persist it. This keeps the future
 `dolly.module-process-record/2` preimage explicit without allowing startup
 recovery to trust an in-memory policy revision as durable evidence.

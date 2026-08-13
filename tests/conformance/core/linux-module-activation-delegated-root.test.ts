@@ -70,6 +70,7 @@ vi.mock("../../../src/linux-module-runtime-assets.js", async (importOriginal) =>
 
 import {
   assertLinuxModuleActivationPermission,
+  assertLinuxModuleRuntimeBinding,
   decideLinuxModuleActivation,
 } from "../../../src/core/linux-module-activation.js";
 
@@ -123,7 +124,10 @@ describe("Linux Module activation delegated-root authority", () => {
       expect(result).toMatchObject({
         permitted: true,
         binding: bindingMock.binding,
-        runtime: runtimeMock.runtime,
+        runtime: {
+          auditProfile: runtimeMock.runtime,
+          bindingRevision: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        },
         delegatedRoot: cgroupMock.root,
       });
       expect("stopProver" in result).toBe(true);
@@ -131,9 +135,14 @@ describe("Linux Module activation delegated-root authority", () => {
       expect(() => assertLinuxModuleActivationPermission(result)).not.toThrow();
       expect(() => assertLinuxModuleActivationPermission({ ...result }))
         .toThrow(/was not minted by the Host activation decision/u);
+      expect(() => assertLinuxModuleRuntimeBinding(result.runtime)).not.toThrow();
+      expect(() => assertLinuxModuleRuntimeBinding({ ...result.runtime }))
+        .toThrow(/was not minted by the Host activation decision/u);
       expect(Object.isFrozen(result)).toBe(true);
       expect(Object.isFrozen(result.binding)).toBe(true);
       expect(Object.isFrozen(result.delegatedRoot)).toBe(true);
+      expect(Object.isFrozen(result.runtime)).toBe(true);
+      expect(Object.isFrozen(result.runtime.auditProfile)).toBe(true);
     },
   );
 });

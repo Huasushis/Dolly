@@ -9,9 +9,6 @@
  */
 
 import {
-  reviewedLinuxModuleRuntimeIdentity,
-} from "../../../src/linux-module-runtime-assets.js";
-import {
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -50,6 +47,7 @@ import {
 import { createFileCoreActiveRunModelMediaResolver } from "../../../src/core/media-capability/index.js";
 import type { ModelMediaResolutionRequest } from "../../../src/core/model-provider-broker.js";
 import { inspectCoreServiceBinding } from "../../../src/core/linux-core-service-binding.js";
+import { decideLinuxModuleActivation } from "../../../src/core/linux-module-activation.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
 import type { ModuleExecutor } from "../../../src/core/module-actor.js";
 import { ModuleConfigurationStore } from "../../../src/core/module-configuration-store.js";
@@ -407,18 +405,18 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     if (integrationUnitName === undefined) {
       throw new Error("The transient Core service unit name is unavailable");
     }
-    const inspectedBinding = await inspectCoreServiceBinding({
+    const activation = await decideLinuxModuleActivation({
       unitName: integrationUnitName,
       mode: "user",
       queryTimeoutMs: 5_000,
       overallTimeoutMs: 15_000,
     });
-    if (!inspectedBinding.verified) {
-      throw new Error(inspectedBinding.failures
+    if (!activation.permitted) {
+      throw new Error(activation.refusals
         .map((failure) => `${failure.code}: ${failure.detail}`)
         .join("; "));
     }
-    expect(inspectedBinding.binding.delegatedRootCgroupPath).toBe(delegatedRoot);
+    expect(activation.binding.delegatedRootCgroupPath).toBe(delegatedRoot);
 
     const scratchParent = resolve(process.cwd(), ".tmp");
     mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
@@ -583,13 +581,6 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     });
     if (claim === null) throw new Error("The installed integration input was not claimed");
 
-    const root = await prepareDelegatedCgroupRoot({
-      delegatedRootCgroupPath: inspectedBinding.binding.delegatedRootCgroupPath,
-    });
-    if (!root.prepared) {
-      throw new Error(`${root.failure.code}: ${root.failure.detail}`);
-    }
-
     const processGenerationId = `process-installed-linux-${process.pid}-${Date.now()}`;
     let launchedProcess: ProcessIdentity | undefined;
     let protocolIdentifier = 0;
@@ -599,8 +590,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       installations,
       configurations,
       coreStateDirectory: store.stateDirectoryForProcessConfinement(),
-      binding: inspectedBinding.binding,
-      runtime: reviewedLinuxModuleRuntimeIdentity(),
+      activation,
       lifecycle: {
         records: store,
         stoppedRecordWriter,
@@ -671,8 +661,8 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       packageDigest: installed.packageDigest,
       configurationReference: instanceConfiguration.modules[0]?.configurationReference,
       declaredExternalEffects: "unrestricted",
-      serviceInvocationId: inspectedBinding.binding.serviceInvocationId,
-      bootId: inspectedBinding.binding.bootId,
+      serviceInvocationId: activation.binding.serviceInvocationId,
+      bootId: activation.binding.bootId,
     });
 
     const input = store.deliveries.inspectClaimInput(claim);
@@ -805,7 +795,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     expect(factory.sessionForProcess(processGenerationId)).toBeNull();
     await expect(mediaResolver.resolve(mediaRequest, {})).rejects.toThrow("not authorized");
     const moduleCgroupPath = deriveModuleCgroupPath(
-      inspectedBinding.binding.delegatedRootCgroupPath,
+      activation.binding.delegatedRootCgroupPath,
       { instanceId, moduleId: "installed-worker", processGenerationId },
     ).filesystemPath;
     expect(store.getModuleProcessRecord(processGenerationId)).toMatchObject({

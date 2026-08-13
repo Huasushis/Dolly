@@ -8,6 +8,52 @@ import {
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const activationFixture = vi.hoisted(() => ({
+  binding: {
+    mode: "system" as const,
+    unitName: "dolly-core.service",
+    serviceInvocationId: "2812432ad29e4d3bbd6776c62cafa929",
+    bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
+    mainPid: 10_001,
+    delegatedRootCgroupPath: "/system.slice/dolly-core.service",
+    coreCgroupPath: "/system.slice/dolly-core.service/core",
+    delegatedRootControllers: ["cpu", "memory", "pids"],
+  },
+  root: {
+    filesystemPath: "/sys/fs/cgroup/system.slice/dolly-core.service",
+    controllers: ["cpu", "memory", "pids"],
+    subtreeControl: ["cpu", "memory", "pids"],
+  },
+}));
+
+vi.mock("../../../src/core/host-platform.js", () => ({
+  observeHostPlatform: () => "linux",
+}));
+vi.mock("../../../src/core/linux-core-service-binding.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/core/linux-core-service-binding.js")>(),
+  inspectCoreServiceBinding: vi.fn(async () => ({
+    verified: true as const,
+    binding: activationFixture.binding,
+  })),
+}));
+vi.mock("../../../src/core/linux-module-cgroup.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/core/linux-module-cgroup.js")>(),
+  prepareDelegatedCgroupRoot: vi.fn(async () => ({
+    prepared: true as const,
+    root: activationFixture.root,
+  })),
+}));
+vi.mock("../../../src/linux-module-runtime-assets.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../../../src/linux-module-runtime-assets.js")>();
+  return {
+    ...original,
+    inspectReviewedLinuxModuleRuntime: vi.fn(async () => ({
+      available: true as const,
+      runtime: original.reviewedLinuxModuleRuntimeIdentity(),
+    })),
+  };
+});
 import {
   createInstalledLinuxExtensionModuleExecutor,
   createInstalledLinuxExtensionModuleGenerationFactory,
@@ -49,6 +95,10 @@ import {
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
+import {
+  decideLinuxModuleActivation,
+  type LinuxModuleActivationPermission,
+} from "../../../src/core/linux-module-activation.js";
 import type { ModuleProcessRecordStore } from "../../../src/core/linux-module-process-lifecycle.js";
 import type {
   ModuleProcessRecord,
@@ -345,8 +395,15 @@ describe("installed Extension Module resolution", () => {
   let scratch: string;
   let installations: ExtensionInstallationRegistry;
   let configurations: ModuleConfigurationStore;
+  let activation: LinuxModuleActivationPermission;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    const result = await decideLinuxModuleActivation({
+      unitName: CORE_BINDING.unitName,
+      mode: CORE_BINDING.mode,
+    });
+    if (!result.permitted) throw new Error("fixture activation was refused");
+    activation = result;
     mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
     scratch = mkdtempSync(resolve(scratchParent, "installed-extension-module-"));
     installations = new ExtensionInstallationRegistry({
@@ -529,7 +586,7 @@ describe("installed Extension Module resolution", () => {
     const processProvenance = deriveReservedV10InstalledModuleProcessProvenance(
       resolved,
       policySelection,
-      RUNTIME,
+      activation,
     );
     expect(processProvenance.snapshot).toEqual(expect.objectContaining({
       installedPlanDigest: resolved.provenanceDigest,
@@ -537,15 +594,20 @@ describe("installed Extension Module resolution", () => {
       packageDigest: installed.packageDigest,
       declaredExternalEffects: "none",
       execution: resolved.module.execution,
-      linuxRuntime: RUNTIME,
+      linuxActivation: {
+        serviceBinding: activation.binding,
+        delegatedRoot: activation.delegatedRoot,
+        runtimeBindingRevision: activation.runtime.bindingRevision,
+        runtimeAuditProfile: activation.runtime.auditProfile,
+      },
     }));
     expect(processProvenance.provenanceDigest)
       .toBe(canonicalJsonDigest(processProvenance.snapshot));
     expect(() => deriveReservedV10InstalledModuleProcessProvenance(
       resolved,
       policySelection,
-      { ...RUNTIME, nodeVersion: "0.0.0-substituted" },
-    )).toThrow(/does not match this reviewed Host runtime/u);
+      { ...activation, runtime: { ...activation.runtime } },
+    )).toThrow(/not minted by the Host activation decision/u);
     expect(() => assertReservedV10InstalledModuleProcessProvenance({
       ...processProvenance,
     })).toThrow(/not minted by the installed composition/u);
@@ -821,8 +883,7 @@ describe("installed Extension Module resolution", () => {
       configurations,
       moduleGenerationId: MODULE_GENERATION_ID,
       coreStateDirectory: resolve(scratch, "instance-state"),
-      binding: CORE_BINDING,
-      runtime: RUNTIME,
+      activation,
       lifecycle: {
         records,
         stoppedRecordWriter: stopped,
@@ -875,7 +936,7 @@ describe("installed Extension Module resolution", () => {
         "--tmpfs", "/tmp",
         "--dir", "/run/dolly",
         "--file", "4", "/run/dolly/package.snapshot",
-        "--ro-bind", RUNTIME.nodeProgram, "/run/dolly/node",
+        "--ro-bind", activation.runtime.auditProfile.nodeProgram, "/run/dolly/node",
         "--unshare-user",
         "--unshare-pid",
         "--unshare-cgroup",
@@ -967,8 +1028,7 @@ describe("installed Extension Module resolution", () => {
       configurations,
       moduleGenerationId: MODULE_GENERATION_ID,
       coreStateDirectory: resolve(scratch, "instance-state"),
-      binding: CORE_BINDING,
-      runtime: RUNTIME,
+      activation,
       lifecycle: {
         records: recordStore(),
         stoppedRecordWriter: stoppedRecordWriter(),
@@ -1003,8 +1063,8 @@ describe("installed Extension Module resolution", () => {
     )).toThrow(/cannot accept a caller-supplied external-effect declaration/u);
     expect(() => deriveInstalledLinuxExtensionModuleExecutor({
       ...base,
-      runtime: { ...RUNTIME, nodeProgram: "/tmp/substituted-node" },
-    })).toThrow(/does not match this reviewed Host runtime/u);
+      activation: { ...activation },
+    })).toThrow(/not minted by the Host activation decision/u);
     expect(() => deriveInstalledLinuxExtensionModuleExecutor({
       ...base,
       configureHost: () => undefined,
@@ -1058,11 +1118,14 @@ describe("installed Extension Module resolution", () => {
     );
     expect(() => deriveInstalledLinuxExtensionModuleExecutor({
       ...base,
-      binding: {
-        ...CORE_BINDING,
-        serviceInvocationId: "not-a-systemd-invocation",
+      activation: {
+        ...activation,
+        binding: {
+          ...activation.binding,
+          serviceInvocationId: "not-a-systemd-invocation",
+        },
       },
-    })).toThrow(/serviceInvocationId must be the 32 lower-case hexadecimal digits/u);
+    })).toThrow(/not minted by the Host activation decision/u);
     const sandboxConfiguration = validateDollyInstanceConfig({
       ...base.instanceConfiguration,
       modules: base.instanceConfiguration.modules.map((module) => ({
@@ -1119,8 +1182,7 @@ describe("installed Extension Module resolution", () => {
       installations,
       configurations,
       coreStateDirectory: resolve(scratch, "instance-state"),
-      binding: CORE_BINDING,
-      runtime: RUNTIME,
+      activation,
       lifecycle: {
         records,
         stoppedRecordWriter: stoppedRecordWriter(),

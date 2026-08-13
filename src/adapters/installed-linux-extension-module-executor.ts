@@ -18,7 +18,6 @@ import {
   deriveModuleCgroupPath,
   type ModuleCgroupLimits,
 } from "../core/linux-module-cgroup.js";
-import type { VerifiedCoreServiceBinding } from "../core/linux-core-service-binding.js";
 import type { ModuleExecutor } from "../core/module-actor.js";
 import type { ModuleConfigurationStore } from "../core/module-configuration-store.js";
 import {
@@ -41,9 +40,10 @@ import {
   type LinuxExtensionModuleExecutorOptions,
 } from "./linux-extension-module-executor.js";
 import {
-  snapshotReviewedLinuxModuleRuntimeIdentity,
-  type ReviewedLinuxModuleRuntimeIdentity,
-} from "../linux-module-runtime-assets.js";
+  assertLinuxModuleActivationPermission,
+  assertLinuxModuleRuntimeBinding,
+  type LinuxModuleActivationPermission,
+} from "../core/linux-module-activation.js";
 
 type InstalledLifecycleOptions = Omit<
   LinuxExtensionModuleExecutorOptions["lifecycle"],
@@ -62,10 +62,8 @@ export interface InstalledLinuxExtensionModuleExecutorOptions {
   readonly moduleGenerationId: string;
   /** Directory of the exact FileCore state store owned by this runtime. */
   readonly coreStateDirectory: string;
-  /** Exact systemd/Core binding verified before Module activation. */
-  readonly binding: VerifiedCoreServiceBinding;
-  /** Exact runtime profile frozen by the Host activation decision. */
-  readonly runtime: ReviewedLinuxModuleRuntimeIdentity;
+  /** Exact service, cgroup-root, stop-proof, and runtime decision. */
+  readonly activation: LinuxModuleActivationPermission;
   readonly lifecycle: InstalledLifecycleOptions;
   readonly processRecord: ProcessRecordDetails;
   readonly host: InstalledHostOptions;
@@ -168,7 +166,7 @@ export function deriveReservedV10InstalledLinuxModuleExecutionPlan(
 export function deriveReservedV10InstalledModuleProcessProvenance(
   installedModule: ReservedV10InstalledModulePlan,
   permissionPolicies: ReservedV10InstalledPermissionPolicySelection,
-  runtime: ReviewedLinuxModuleRuntimeIdentity,
+  activation: LinuxModuleActivationPermission,
 ): ReservedV10InstalledModuleProcessProvenance {
   const linuxExecution = deriveReservedV10InstalledLinuxModuleExecutionPlan(
     installedModule,
@@ -177,7 +175,8 @@ export function deriveReservedV10InstalledModuleProcessProvenance(
     permissionPolicies,
     installedModule,
   );
-  const runtimeSnapshot = snapshotReviewedLinuxModuleRuntimeIdentity(runtime);
+  assertLinuxModuleActivationPermission(activation);
+  assertLinuxModuleRuntimeBinding(activation.runtime);
   const snapshot = deepFreeze({
     schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
     instanceId: installedModule.instanceId,
@@ -192,7 +191,12 @@ export function deriveReservedV10InstalledModuleProcessProvenance(
     },
     declaredExternalEffects: installedModule.module.declaredExternalEffects,
     execution: installedModule.module.execution as unknown as JsonValue,
-    linuxRuntime: runtimeSnapshot as unknown as JsonValue,
+    linuxActivation: {
+      serviceBinding: activation.binding as unknown as JsonValue,
+      delegatedRoot: activation.delegatedRoot as unknown as JsonValue,
+      runtimeBindingRevision: activation.runtime.bindingRevision,
+      runtimeAuditProfile: activation.runtime.auditProfile as unknown as JsonValue,
+    },
   } satisfies JsonValue);
   const provenance = Object.freeze({
     installedModule,
@@ -292,7 +296,10 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     installations: options.installations,
     configurations: options.configurations,
   });
-  const runtime = snapshotReviewedLinuxModuleRuntimeIdentity(options.runtime);
+  assertLinuxModuleActivationPermission(options.activation);
+  assertLinuxModuleRuntimeBinding(options.activation.runtime);
+  const binding = options.activation.binding;
+  const runtime = options.activation.runtime.auditProfile;
   if (resolvedModule.module.permissionPolicyIds.length === 0) {
     if (options.permissionPolicySetup !== undefined) {
       throw new TypeError(
@@ -320,7 +327,7 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     throw new TypeError("Linux process identity does not match the resolved instance Module");
   }
   const derivedCgroupPath = deriveModuleCgroupPath(
-    options.binding.delegatedRootCgroupPath,
+    binding.delegatedRootCgroupPath,
     identity,
   ).filesystemPath;
   // This executor is deliberately process-isolated, not sandboxed. Resolve
@@ -338,8 +345,8 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
       ...resolvedModule.module.configurationReference,
     }),
     declaredExternalEffects: INSTALLED_PROCESS_EFFECT_DECLARATION,
-    serviceInvocationId: options.binding.serviceInvocationId,
-    bootId: options.binding.bootId,
+    serviceInvocationId: binding.serviceInvocationId,
+    bootId: binding.bootId,
     moduleCgroupPath: derivedCgroupPath,
     ...options.processRecord,
     state: "starting" as const,
@@ -369,7 +376,7 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     moduleGenerationId: options.moduleGenerationId,
     lifecycle: {
       ...options.lifecycle,
-      delegatedRootCgroupPath: options.binding.delegatedRootCgroupPath,
+      delegatedRootCgroupPath: binding.delegatedRootCgroupPath,
       processRecord,
       execution: {
         program: confinementExecution.program,
