@@ -2687,14 +2687,18 @@ Cycles are allowed in the Page graph, but bounded mailboxes can create cyclic
 wait. A scheduler or operator policy MUST detect sustained no-progress states
 and expose the blocked dependency cycle. Correctness MUST not depend on
 unbounded buffering. The threshold applies to one continuous interval in which
-work remains waiting without relevant durable progress. External drain,
-disappearance of all waiting work, or a committed/dead-lettered result from a
-Module participating as the source or target of the blocked-edge signature
-ends that interval and clears an active no-progress report. In-flight work or
-a commit in an independent branch MUST NOT pause or reset the blocked
-subgraph's timer. Merely retrying the same blocked output commit does not reset
-it. A later independent blocked interval starts a new timer; it MUST NOT
-inherit Scheduler uptime or an earlier episode's duration.
+work remains waiting without relevant durable progress. Weakly connected
+components of the blocked-edge graph have independent clocks: an edge that
+appears, disappears, or makes durable progress in one component MUST NOT reset
+a disjoint stable component. External drain, disappearance of all waiting work,
+or a committed/dead-lettered result from a Module participating as the source
+or target of one blocked component ends that component's interval. The
+instance-level `noProgressActive` state clears only after every reported
+component clears. In-flight work or a commit in an independent branch MUST NOT
+pause or reset another component's timer. Merely retrying the same blocked
+output commit does not reset it. A later independent blocked interval starts a
+new timer; it MUST NOT inherit Scheduler uptime or an earlier episode's
+duration.
 
 ## 13. Scheduler policy boundary
 

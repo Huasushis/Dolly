@@ -306,6 +306,63 @@ export interface SchedulerBlockedEdge {
   readonly blockedBy: readonly string[];
 }
 
+interface NoProgressBlockedComponent {
+  readonly signature: string;
+  readonly blockedEdges: readonly SchedulerBlockedEdge[];
+  readonly moduleIds: ReadonlySet<string>;
+}
+
+interface NoProgressBlockedEpisode extends NoProgressBlockedComponent {
+  waitingSince: number | null;
+  active: boolean;
+}
+
+/**
+ * Splits the directed blocked-edge graph into deterministic weakly connected
+ * components. Independent components need independent no-progress clocks:
+ * otherwise a flapping edge in one branch can keep resetting a stable cycle.
+ */
+function noProgressBlockedComponents(
+  blockedEdges: readonly SchedulerBlockedEdge[],
+): readonly NoProgressBlockedComponent[] {
+  const neighbors = new Map<string, Set<string>>();
+  const canonicalEdges = blockedEdges.map((edge) => ({
+    moduleId: edge.moduleId,
+    blockedBy: [...edge.blockedBy].sort(compareModuleIds),
+  })).sort((left, right) => compareModuleIds(left.moduleId, right.moduleId));
+  for (const edge of canonicalEdges) {
+    const sourceNeighbors = neighbors.get(edge.moduleId) ?? new Set<string>();
+    neighbors.set(edge.moduleId, sourceNeighbors);
+    for (const target of edge.blockedBy) {
+      sourceNeighbors.add(target);
+      const targetNeighbors = neighbors.get(target) ?? new Set<string>();
+      targetNeighbors.add(edge.moduleId);
+      neighbors.set(target, targetNeighbors);
+    }
+  }
+
+  const remaining = new Set(neighbors.keys());
+  const components: NoProgressBlockedComponent[] = [];
+  for (const first of [...remaining].sort(compareModuleIds)) {
+    if (!remaining.has(first)) continue;
+    const moduleIds = new Set<string>();
+    const pending = [first];
+    while (pending.length > 0) {
+      const moduleId = pending.pop()!;
+      if (!remaining.delete(moduleId)) continue;
+      moduleIds.add(moduleId);
+      const adjacent = [...(neighbors.get(moduleId) ?? [])].sort(compareModuleIds).reverse();
+      pending.push(...adjacent);
+    }
+    const componentEdges = canonicalEdges.filter((edge) => moduleIds.has(edge.moduleId));
+    const signature = componentEdges
+      .map((edge) => `${edge.moduleId}>${edge.blockedBy.join(",")}`)
+      .join(";");
+    components.push({ signature, blockedEdges: componentEdges, moduleIds });
+  }
+  return components;
+}
+
 interface SchedulerEventBase {
   readonly instanceId: string;
   readonly monotonicAt: number;
@@ -845,9 +902,9 @@ export class ModuleScheduler {
   #invariantViolationCount = 0;
   #lastProgressAt: number | null = null;
   #waitingWithoutProgressSince: number | null = null;
+  #genericNoProgressActive = false;
   #noProgressActive = false;
-  #noProgressBlockedSignature: string | null = null;
-  readonly #noProgressRelevantModuleIds = new Set<string>();
+  #noProgressBlockedEpisodes = new Map<string, NoProgressBlockedEpisode>();
   #stopPromise: Promise<void> | null = null;
   #unsubscribeDeliveryChanges: (() => void) | null = null;
 
@@ -2378,20 +2435,29 @@ export class ModuleScheduler {
 
   #recordProgress(entry: ModuleEntry, now: number): void {
     this.#lastProgressAt = now;
-    // Progress in an independent branch must not reset a blocked subgraph's
-    // clock. Targets are included because a downstream commit may genuinely
-    // release the capacity an upstream result is waiting for.
-    if (
-      this.#noProgressBlockedSignature !== null &&
-      !this.#noProgressRelevantModuleIds.has(entry.moduleId)
-    ) return;
-    this.#waitingWithoutProgressSince = null;
-    this.#clearNoProgress(now);
+    if (this.#noProgressBlockedEpisodes.size === 0) {
+      this.#waitingWithoutProgressSince = null;
+      this.#genericNoProgressActive = false;
+    } else {
+      // Targets are included in each component because a downstream commit
+      // may genuinely release the capacity an upstream result awaits. A
+      // commit in a disjoint component leaves every other clock untouched.
+      for (const episode of this.#noProgressBlockedEpisodes.values()) {
+        if (!episode.moduleIds.has(entry.moduleId)) continue;
+        episode.waitingSince = null;
+        episode.active = false;
+      }
+    }
+    this.#refreshNoProgressActive(now);
   }
 
-  #clearNoProgress(now: number): void {
-    if (!this.#noProgressActive) return;
-    this.#noProgressActive = false;
+  #refreshNoProgressActive(now: number): void {
+    const active = this.#genericNoProgressActive ||
+      [...this.#noProgressBlockedEpisodes.values()].some((episode) => episode.active);
+    if (active === this.#noProgressActive) return;
+    const wasActive = this.#noProgressActive;
+    this.#noProgressActive = active;
+    if (!wasActive || active) return;
     this.#emit({
       type: "scheduler.no_progress_cleared",
       instanceId: this.#instanceId,
@@ -2413,33 +2479,6 @@ export class ModuleScheduler {
         moduleId: entry.moduleId,
         blockedBy: [...entry.blockingDownstreamIds],
       }));
-    const blockedSignature = blockedEdges.length === 0
-      ? null
-      : blockedEdges
-          .map((edge) => `${edge.moduleId}>${edge.blockedBy.join(",")}`)
-          .join(";");
-    const blockedEdgeTemporarilyInFlight =
-      blockedSignature === null &&
-      this.#noProgressBlockedSignature !== null &&
-      entries.some((entry) =>
-        entry.inFlight !== null &&
-        this.#noProgressRelevantModuleIds.has(entry.moduleId)
-      );
-    if (
-      !blockedEdgeTemporarilyInFlight &&
-      blockedSignature !== this.#noProgressBlockedSignature
-    ) {
-      this.#noProgressBlockedSignature = blockedSignature;
-      this.#noProgressRelevantModuleIds.clear();
-      for (const edge of blockedEdges) {
-        this.#noProgressRelevantModuleIds.add(edge.moduleId);
-        for (const moduleId of edge.blockedBy) {
-          this.#noProgressRelevantModuleIds.add(moduleId);
-        }
-      }
-      this.#waitingWithoutProgressSince = null;
-      this.#clearNoProgress(now);
-    }
     const workWaiting = entries.some((entry) =>
       (entry.pending.pendingCount > 0 || entry.outputCommitWaiting) &&
       entry.quarantineReason === null &&
@@ -2453,25 +2492,71 @@ export class ModuleScheduler {
     );
     if (!workWaiting) {
       this.#waitingWithoutProgressSince = null;
-      this.#noProgressBlockedSignature = null;
-      this.#noProgressRelevantModuleIds.clear();
-      this.#clearNoProgress(now);
+      this.#genericNoProgressActive = false;
+      this.#noProgressBlockedEpisodes.clear();
+      this.#refreshNoProgressActive(now);
       return;
     }
-    const relevantWorkActive = this.#noProgressBlockedSignature === null
-      ? this.#activeCount > 0
-      : entries.some((entry) =>
-          entry.inFlight !== null &&
-          this.#noProgressRelevantModuleIds.has(entry.moduleId)
+
+    const components = noProgressBlockedComponents(blockedEdges);
+    const currentSignatures = new Set(components.map((component) => component.signature));
+    const nextEpisodes = new Map<string, NoProgressBlockedEpisode>();
+    // A dispatch temporarily clears an entry's backpressure observation. Keep
+    // that component's episode until the relevant in-flight work settles.
+    for (const [signature, episode] of this.#noProgressBlockedEpisodes) {
+      if (currentSignatures.has(signature)) continue;
+      const temporarilyInFlight = entries.some((entry) =>
+        entry.inFlight !== null && episode.moduleIds.has(entry.moduleId)
+      );
+      if (temporarilyInFlight) nextEpisodes.set(signature, episode);
+    }
+    for (const component of components) {
+      const overlapsRetainedEpisode = [...nextEpisodes.values()].some((episode) =>
+        [...component.moduleIds].some((moduleId) => episode.moduleIds.has(moduleId))
+      );
+      if (overlapsRetainedEpisode) continue;
+      const existing = this.#noProgressBlockedEpisodes.get(component.signature);
+      nextEpisodes.set(component.signature, existing ?? {
+        ...component,
+        waitingSince: null,
+        active: false,
+      });
+    }
+    this.#noProgressBlockedEpisodes = nextEpisodes;
+
+    if (this.#noProgressBlockedEpisodes.size > 0) {
+      this.#waitingWithoutProgressSince = null;
+      this.#genericNoProgressActive = false;
+      for (const episode of this.#noProgressBlockedEpisodes.values()) {
+        const relevantWorkActive = entries.some((entry) =>
+          entry.inFlight !== null && episode.moduleIds.has(entry.moduleId)
         );
-    if (relevantWorkActive) return;
+        if (relevantWorkActive) continue;
+        episode.waitingSince ??= now;
+        const stalledForMs = now - episode.waitingSince;
+        if (stalledForMs < this.#noProgressAfterMs || episode.active) continue;
+        episode.active = true;
+        // Observers may synchronously read instanceStatus() from the event
+        // callback, so publish the aggregate state before publishing the event.
+        this.#refreshNoProgressActive(now);
+        this.#emit({
+          type: "scheduler.no_progress",
+          instanceId: this.#instanceId,
+          monotonicAt: now,
+          stalledForMs,
+          blockedEdges: episode.blockedEdges,
+        });
+      }
+      this.#refreshNoProgressActive(now);
+      return;
+    }
+
+    if (this.#activeCount > 0) return;
     this.#waitingWithoutProgressSince ??= now;
     const stalledForMs = now - this.#waitingWithoutProgressSince;
-    if (stalledForMs < this.#noProgressAfterMs) {
-      return;
-    }
-    if (this.#noProgressActive) return;
-    this.#noProgressActive = true;
+    if (stalledForMs < this.#noProgressAfterMs || this.#genericNoProgressActive) return;
+    this.#genericNoProgressActive = true;
+    this.#refreshNoProgressActive(now);
     this.#emit({
       type: "scheduler.no_progress",
       instanceId: this.#instanceId,

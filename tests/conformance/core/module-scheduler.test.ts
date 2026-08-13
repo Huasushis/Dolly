@@ -1153,6 +1153,92 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
     await scheduler.stop();
   });
 
+  it("does not restart a stable blocked component's clock when another blocked component drains", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler({
+      noProgressAfterMs: 1_000,
+      maxConcurrentModules: 4,
+    });
+    for (const [moduleId, input, output] of [
+      ["alpha", "page-a", "page-b"],
+      ["beta", "page-b", "page-a"],
+      ["gamma", "page-g", "page-d"],
+      ["delta", "page-d", "page-g"],
+    ] as const) {
+      mailboxes.set(moduleId, 4, 400);
+      scheduler.register({
+        moduleId,
+        runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+        inputPageIds: [input],
+        outputPageIds: [output],
+        mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+      });
+    }
+
+    scheduler.start();
+    await advance(clock, 500);
+    mailboxes.set("gamma", 0, 0);
+    mailboxes.set("delta", 0, 0);
+    scheduler.wake();
+    await drain(clock);
+
+    await advance(clock, 600);
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toEqual([
+      expect.objectContaining({
+        blockedEdges: [
+          { moduleId: "alpha", blockedBy: ["beta"] },
+          { moduleId: "beta", blockedBy: ["alpha"] },
+        ],
+      }),
+    ]);
+    expect(scheduler.instanceStatus().noProgressActive).toBe(true);
+    await scheduler.stop();
+  });
+
+  it("keeps the aggregate no-progress state active until every stalled component clears", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler({
+      noProgressAfterMs: 1_000,
+      maxConcurrentModules: 4,
+    });
+    for (const [moduleId, input, output] of [
+      ["alpha", "page-a", "page-b"],
+      ["beta", "page-b", "page-a"],
+      ["gamma", "page-g", "page-d"],
+      ["delta", "page-d", "page-g"],
+    ] as const) {
+      mailboxes.set(moduleId, 4, 400);
+      scheduler.register({
+        moduleId,
+        runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+        inputPageIds: [input],
+        outputPageIds: [output],
+        mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+      });
+    }
+
+    scheduler.start();
+    await advance(clock, 1_100);
+    expect(events.filter((event) => event.type === "scheduler.no_progress"))
+      .toHaveLength(2);
+    expect(scheduler.instanceStatus().noProgressActive).toBe(true);
+
+    mailboxes.set("gamma", 0, 0);
+    mailboxes.set("delta", 0, 0);
+    scheduler.wake();
+    await drain(clock);
+    expect(scheduler.instanceStatus().noProgressActive).toBe(true);
+    expect(events.filter((event) => event.type === "scheduler.no_progress_cleared"))
+      .toHaveLength(0);
+
+    mailboxes.set("alpha", 0, 0);
+    mailboxes.set("beta", 0, 0);
+    scheduler.wake();
+    await drain(clock);
+    expect(scheduler.instanceStatus().noProgressActive).toBe(false);
+    expect(events.filter((event) => event.type === "scheduler.no_progress_cleared"))
+      .toHaveLength(1);
+    await scheduler.stop();
+  });
+
   it("ends a no-progress episode after external drain and times a later episode from its own start", async () => {
     const { clock, mailboxes, scheduler, events } = createScheduler({ noProgressAfterMs: 1_000 });
     for (const [moduleId, input, output] of [
