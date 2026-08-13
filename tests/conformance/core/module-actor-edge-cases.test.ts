@@ -1224,6 +1224,37 @@ describe("ModuleActor phase, mailbox, and lifecycle edge cases", () => {
     await actor.stop();
   });
 
+  it("gives one caller exclusive ownership of a prepared Host admission", async () => {
+    const preparation = deferred<{ readonly status: "ready" }>();
+    const prepareRun = vi.fn()
+      .mockImplementationOnce(() => preparation.promise)
+      .mockReturnValue({ status: "ready" as const });
+    const releaseRunAdmission = vi.fn();
+    const actor = await startedActor(options<string, string>({
+      createExecutor: () => ({
+        prepareRun,
+        releaseRunAdmission,
+        execute: async (input) => input,
+      }),
+      acceptResult: () => undefined,
+    }));
+
+    const first = actor.prepareNextRun();
+    await expect(actor.prepareNextRun()).rejects.toMatchObject({ code: "ACTOR_BUSY" });
+    preparation.resolve({ status: "ready" });
+    await expect(first).resolves.toBe("generation-1");
+
+    // A later caller cannot borrow the same Host token after the first
+    // caller received it. Explicit release creates the next ownership turn.
+    await expect(actor.prepareNextRun()).rejects.toMatchObject({ code: "ACTOR_BUSY" });
+    await expect(actor.releasePreparedRun()).resolves.toBeUndefined();
+    await expect(actor.prepareNextRun()).resolves.toBe("generation-1");
+    expect(prepareRun).toHaveBeenCalledTimes(2);
+    expect(releaseRunAdmission).toHaveBeenCalledOnce();
+    await actor.releasePreparedRun();
+    await actor.stop();
+  });
+
   it("reports a Host admission that expires before IPC as not executed", async () => {
     const actor = await startedActor(options<string, string>({
       createExecutor: () => ({

@@ -569,7 +569,14 @@ export class ModuleActor<Input, Output> {
    * lifecycle rotation, not a reason to claim work that this actor cannot run.
    */
   prepareNextRun(): Promise<string> {
-    if (this.#idleRotationPromise) return this.#idleRotationPromise;
+    if (this.#idleRotationPromise) {
+      return Promise.reject(
+        new ModuleActorError(
+          "ACTOR_BUSY",
+          "Another caller already owns Module generation admission",
+        ),
+      );
+    }
     try {
       this.#assertCanSubmit();
     } catch (error) {
@@ -578,6 +585,14 @@ export class ModuleActor<Input, Output> {
     if (this.#active || this.#pending.length > 0 || this.#starting || this.#pumping) {
       return Promise.reject(
         new ModuleActorError("ACTOR_BUSY", "Module actor is not idle for generation admission"),
+      );
+    }
+    if (this.#runAdmissionState !== "none") {
+      return Promise.reject(
+        new ModuleActorError(
+          "ACTOR_BUSY",
+          "A prepared Module Run admission already has an owner",
+        ),
       );
     }
     const rotation = Promise.resolve()

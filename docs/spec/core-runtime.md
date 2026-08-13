@@ -2029,7 +2029,10 @@ for capability expiry, remaining invocation quota, or the fixed Run deadline.
 The process Host issues that single-use admission before Claim acquisition.
 The actor owns its `prepared -> assigned -> consumed` transition, so two
 submissions cannot share it and a synchronous lifecycle callback cannot release
-an admission already assigned to an entering Run.
+an admission already assigned to an entering Run. Exactly one caller owns the
+prepare turn: a concurrent prepare or a later prepare before the first caller
+submits or explicitly releases the admission fails with `ACTOR_BUSY`. The
+actor never hands the same generation/admission promise to two Claim owners.
 
 The runtime starts the execution budget before admission and Claim acquisition.
 Claim persistence, input reconstruction, and submission persistence all consume
