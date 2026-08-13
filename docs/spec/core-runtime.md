@@ -825,9 +825,10 @@ package and immutable Module configuration from their integrity-checking
 stores, and mints an in-process plan whose canonical provenance digest includes
 the complete Module record, complete instance-document digest, package digest,
 trust classification, configuration and schema digests, declared effects,
-Linux execution limits, and exact permission-policy references. The plan is an
-authority object rather than a structural DTO: a copied or caller-constructed
-lookalike is rejected by the Linux projection. That projection maps `maxTasks`
+Linux execution limits, and exact permission-policy references. The plan is a
+resolver-minted candidate handle rather than a structural DTO or activation
+authority: a copied or caller-constructed lookalike is rejected by the Linux
+projection. That projection maps `maxTasks`
 to the kernel `pids.max` limit, keeps `maxOpenFiles` as the launcher's
 `RLIMIT_NOFILE`, and rejects both unsupported sandbox execution and an
 untrusted package on the ordinary-process path before any process exists.
@@ -837,24 +838,29 @@ must bind this provenance to those store-resolved policy records and startup
 recovery. The public Module startup refusal remains in force.
 
 `ReservedV10InstalledPermissionPolicyRegistry` closes only the next selection
-rule for candidate composition: every configured `(policyId, revision)` pair
-must exactly match one operator-provided implementation, duplicate revisions
-are rejected, and the resulting authority object is bound to the installed
-plan, package, and configuration digests. A structural copy is not authority.
-This registry is deliberately in-process and is not the durable policy store
-required for product activation; its caller-supplied revision label is not
-proof that policy implementation bytes were persisted under that digest. Until
-such a store resolves immutable records and its revision enters the future
-process record, this selection can support conformance wiring only and cannot
+rule for candidate composition. Every configured policy reference must resolve
+to one operator-provided closed policy definition whose canonical digest is
+the exact configured revision; duplicate revisions and caller-selected labels
+are rejected. The resulting resolver-minted selection is bound to the
+installed plan, package, configuration, and selected policy-definition
+digests. It is not execution authority: the in-process broker, storage backend,
+tool executor, secret material, and data domain are not durable binding records
+and are deliberately excluded from the definition digest. A future Host-owned
+binding store must give those live dependencies separate stable identifiers
+and revisions. Until both definition and binding records enter the future
+process record, this selection supports conformance wiring only and cannot
 remove the bootstrap refusal.
 
 `deriveReservedV10InstalledModuleProcessProvenance` joins that exact policy
 selection to the resolver-minted installed plan. Its canonical snapshot binds
 the installed-plan and policy-selection digests, package digest, configuration
 revision/schema/value digests, external-effect declaration, and complete Linux
-execution record. The result is again an in-process authority and copied
-lookalikes are rejected. It is intentionally not a Module process record and
-the current Core-state store will not persist it. This keeps the future
+execution record. The result is a resolver-minted Linux process-provenance
+candidate and copied lookalikes are rejected. Resolver provenance prevents
+structural substitution but does not prove current desired-state ownership,
+platform support, kernel enforcement, or durable runtime bindings. It is
+intentionally not a Module process record and the current Core-state store will
+not persist it. This keeps the future
 `dolly.module-process-record/2` preimage explicit without allowing startup
 recovery to trust an in-memory policy revision as durable evidence.
 

@@ -450,6 +450,75 @@ function immutablePolicy(
       : immutableStoragePolicy(policy);
 }
 
+function definitionForImmutablePolicy(
+  policy: InstalledModulePermissionPolicy,
+): JsonValue {
+  if (policy.kind === "strict-streaming-chat") {
+    const effectiveLimits = { ...DEFAULT_MODEL_OPERATION_LIMITS, ...policy.limits };
+    return deepFreeze({
+      schemaVersion: "dolly.installed-permission-policy-definition/1",
+      kind: policy.kind,
+      policyId: policy.policyId,
+      descriptor: policy.descriptor as unknown as JsonValue,
+      ownerScope: policy.ownerScope,
+      budgets: policy.budgets as unknown as JsonValue,
+      brokerBinding: policy.brokerOptions === undefined
+        ? "reviewed-direct-port"
+        : "descriptor-and-endpoint-registries",
+      outputContracts: [...policy.outputContracts],
+      mediaRequirementIds: [...(policy.mediaRequirementIds ?? [])],
+      reasoningPolicies: [...policy.reasoningPolicies],
+      roles: [...policy.roles],
+      limits: effectiveLimits as unknown as JsonValue,
+      capabilityLifetimeMs: policy.capabilityLifetimeMs,
+      maxConcurrentInvocations: policy.maxConcurrentInvocations ?? 1,
+    } satisfies JsonValue);
+  }
+  if (policy.kind === "registered-tools") {
+    const registry = policy.registry.snapshot();
+    return deepFreeze({
+      schemaVersion: "dolly.installed-permission-policy-definition/1",
+      kind: policy.kind,
+      policyId: policy.policyId,
+      registryDigest: registry.registryDigest,
+      toolWireNames: registry.tools.map((tool) => tool.name),
+      budget: policy.budget as unknown as JsonValue,
+      approvalPolicyRevision: policy.approvalPolicyRevision,
+      limits: policy.limits as unknown as JsonValue,
+      capabilityLifetimeMs: policy.capabilityLifetimeMs,
+      maxConcurrentInvocations: policy.maxConcurrentInvocations ?? 1,
+    } satisfies JsonValue);
+  }
+  return deepFreeze({
+    schemaVersion: "dolly.installed-permission-policy-definition/1",
+    kind: policy.kind,
+    policyId: policy.policyId,
+    operations: [...policy.operations],
+    limits: policy.limits as unknown as JsonValue,
+    capabilityLifetimeMs: policy.capabilityLifetimeMs,
+    maxConcurrentInvocations: policy.maxConcurrentInvocations ?? 1,
+  } satisfies JsonValue);
+}
+
+/**
+ * Canonical, secret-free definition of every policy field the capability
+ * factory consumes. Live broker, executor, repository, and storage objects do
+ * not enter this JSON definition and still require a future durable binding.
+ */
+export function reservedV10InstalledPermissionPolicyDefinition(
+  supplied: InstalledModulePermissionPolicy,
+): JsonValue {
+  return definitionForImmutablePolicy(immutablePolicy(supplied));
+}
+
+export function reservedV10InstalledPermissionPolicyRevision(
+  supplied: InstalledModulePermissionPolicy,
+): string {
+  return canonicalJsonDigest(
+    reservedV10InstalledPermissionPolicyDefinition(supplied),
+  );
+}
+
 function assertInstalledLlmConfigurationPolicyBinding(
   resolved: InstalledExtensionModule,
   policies: readonly InstalledModulePermissionPolicy[],
@@ -916,13 +985,20 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
           "Reserved version-10 policy implementation does not match its policyId",
         );
       }
+      const policy = immutablePolicy(supplied.policy);
+      const derivedRevision = canonicalJsonDigest(definitionForImmutablePolicy(policy));
+      if (supplied.revision !== derivedRevision) {
+        throw new TypeError(
+          `Reserved version-10 permission policy ${supplied.policyId} revision does not match its canonical definition`,
+        );
+      }
       const key = `${supplied.policyId}\u0000${supplied.revision}`;
       if (this.#policies.has(key)) {
         throw new TypeError(
           `Duplicate reserved version-10 permission policy ${supplied.policyId}@${supplied.revision}`,
         );
       }
-      this.#policies.set(key, immutablePolicy(supplied.policy));
+      this.#policies.set(key, policy);
     }
   }
 
@@ -961,7 +1037,7 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
   }
 }
 
-/** Rejects forged or stale v10 policy selections at later composition seams. */
+/** Rejects copied or stale v10 definition selections at later candidate seams. */
 export function assertReservedV10InstalledPermissionPolicySelection(
   selection: unknown,
   installed: ReservedV10InstalledModulePlan,

@@ -26,7 +26,9 @@ import {
 } from "../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
 import {
   assertReservedV10InstalledPermissionPolicySelection,
+  reservedV10InstalledPermissionPolicyRevision,
   ReservedV10InstalledPermissionPolicyRegistry,
+  type InstalledModulePrivateStoragePolicy,
 } from "../../../src/adapters/installed-module-permission-policy.js";
 import {
   canonicalJsonDigest,
@@ -405,9 +407,37 @@ describe("installed Extension Module resolution", () => {
       schema: CONFIGURATION_SCHEMA,
       configuration: { prefix: "reserved-v10" },
     });
+    const storagePolicy: InstalledModulePrivateStoragePolicy = {
+      kind: "module-private-storage",
+      policyId: "model.primary",
+      backend: new ModulePrivateStorageBackend({
+        root: resolve(scratch, "reserved-v10-storage"),
+        now: () => "2026-08-13T00:00:00.000Z",
+      }),
+      operations: ["get"],
+      limits: {
+        maxKeyBytes: 128,
+        maxValueBytes: 1024,
+        maxEntries: 16,
+        maxTotalBytes: 8192,
+        maxListResults: 16,
+        maxArgumentBytes: 1024,
+        maxResultBytes: 4096,
+        maxInvocations: 4,
+        maxInvocationsPerRun: 1,
+      },
+      capabilityLifetimeMs: 10_000,
+    };
+    const policyRevision = reservedV10InstalledPermissionPolicyRevision(storagePolicy);
     const instance = reservedV10InstanceConfiguration(
       "10.0.0",
       configuration.revision,
+      {
+        permissionPolicyReferences: [{
+          policyId: "model.primary",
+          revision: policyRevision,
+        }],
+      },
     );
 
     const resolved = resolveReservedV10InstalledModulePlan({
@@ -424,7 +454,7 @@ describe("installed Extension Module resolution", () => {
     expect(resolved.module.declaredExternalEffects).toBe("core-capabilities-only");
     expect(resolved.module.permissionPolicyReferences).toEqual([{
       policyId: "model.primary",
-      revision: `sha256:${"2".repeat(64)}`,
+      revision: policyRevision,
     }]);
     expect(resolved.instanceConfigurationDigest).toBe(canonicalJsonDigest(instance));
     expect(resolved.provenanceDigest).toBe(canonicalJsonDigest(resolved.provenance));
@@ -459,7 +489,7 @@ describe("installed Extension Module resolution", () => {
         declaredExternalEffects: "core-capabilities-only",
         permissionPolicyReferences: [{
           policyId: "model.primary",
-          revision: `sha256:${"2".repeat(64)}`,
+          revision: policyRevision,
         }],
       }),
     );
@@ -468,32 +498,11 @@ describe("installed Extension Module resolution", () => {
       ...resolved,
     })).toThrow(/not minted by the store-bound resolver/u);
 
-    const policyRevision = `sha256:${"2".repeat(64)}`;
     const policyRegistry = new ReservedV10InstalledPermissionPolicyRegistry({
       policies: [{
         policyId: "model.primary",
         revision: policyRevision,
-        policy: {
-          kind: "module-private-storage",
-          policyId: "model.primary",
-          backend: new ModulePrivateStorageBackend({
-            root: resolve(scratch, "reserved-v10-storage"),
-            now: () => "2026-08-13T00:00:00.000Z",
-          }),
-          operations: ["get"],
-          limits: {
-            maxKeyBytes: 128,
-            maxValueBytes: 1024,
-            maxEntries: 16,
-            maxTotalBytes: 8192,
-            maxListResults: 16,
-            maxArgumentBytes: 1024,
-            maxResultBytes: 4096,
-            maxInvocations: 4,
-            maxInvocationsPerRun: 1,
-          },
-          capabilityLifetimeMs: 10_000,
-        },
+        policy: storagePolicy,
       }],
     });
     const policySelection = policyRegistry.resolveFor(resolved);
@@ -547,6 +556,27 @@ describe("installed Extension Module resolution", () => {
     });
     expect(() => policyRegistry.resolveFor(otherRevision))
       .toThrow(/model\.primary@sha256:3{64} is not registered/u);
+
+    expect(() => new ReservedV10InstalledPermissionPolicyRegistry({
+      policies: [{
+        policyId: "model.primary",
+        revision: `sha256:${"4".repeat(64)}`,
+        policy: storagePolicy,
+      }],
+    })).toThrow(/revision does not match its canonical definition/u);
+    const expandedStoragePolicy: InstalledModulePrivateStoragePolicy = {
+      ...storagePolicy,
+      operations: ["get", "set"],
+    };
+    expect(reservedV10InstalledPermissionPolicyRevision(expandedStoragePolicy))
+      .not.toBe(policyRevision);
+    expect(() => new ReservedV10InstalledPermissionPolicyRegistry({
+      policies: [{
+        policyId: "model.primary",
+        revision: policyRevision,
+        policy: expandedStoragePolicy,
+      }],
+    })).toThrow(/revision does not match its canonical definition/u);
 
     const changedLimit = resolveReservedV10InstalledModulePlan({
       instanceConfiguration: reservedV10InstanceConfiguration(
