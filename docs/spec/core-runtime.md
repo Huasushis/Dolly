@@ -445,6 +445,9 @@ factory retains an explicit binding only as a lower-level candidate and test
 seam. Startup recovery also records the exact process-stop prover that minted
 its one-use handoff, and the installed composer requires object identity with
 the prover in the same activation permission before consuming that handoff.
+The composer authenticates that handoff and validates every deferred result
+before source-queue reconciliation may create a private Page, so a copied or
+store-mismatched handoff cannot leave a partial Core-state mutation behind.
 Thus old-process recovery and new-process composition cannot splice two
 independently minted service authorities. This does not make either candidate
 path a public bootstrap.

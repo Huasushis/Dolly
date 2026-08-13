@@ -653,9 +653,10 @@ export function composeInstalledReactiveModuleHost(
     }
     return Object.freeze({ module, mailbox });
   });
-  // Do not create the private Page until every caller-supplied mailbox and
-  // source limit has passed the non-mutating composition checks above.
-  for (const queue of orderedSourceActivationQueues) queue.reconcile();
+  // Startup recovery authority must be authenticated before source
+  // reconciliation is allowed to create any private Page. A copied or
+  // store-mismatched handoff is a refusal, not a partially applied
+  // composition.
   const deferredCommits = consumeCoreStartupRecoveryHandoff({
     handoff: options.startupRecoveryHandoff,
     deliveries: options.coreState.store.deliveries,
@@ -681,6 +682,10 @@ export function composeInstalledReactiveModuleHost(
     }
     deferredByModule.set(record.source.id, deferred);
   }
+  // Do not create the private Page until every caller-supplied mailbox,
+  // source limit, and startup-recovery result has passed the non-mutating
+  // composition checks above.
+  for (const queue of orderedSourceActivationQueues) queue.reconcile();
   const {
     initialModuleGenerationIdFor,
     nextModuleGenerationIdFor,

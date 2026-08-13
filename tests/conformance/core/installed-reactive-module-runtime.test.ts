@@ -1486,6 +1486,21 @@ describe("installed reactive Module runtime composition", () => {
 
     expect(() => composeInstalledReactiveModuleHost({ activation: activationPermission, ...common }))
       .toThrow(/require activation limits/u);
+    const pagesBeforeForgedHandoff = pair.store.deliveries.listPageIds();
+    expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
+      ...common,
+      startupRecoveryHandoff: {
+        schemaVersion: "dolly.core-startup-recovery-handoff/1",
+      },
+      sourceActivationLimits: [{
+        moduleId: "source-worker",
+        maxResidentCount: 2,
+        maxResidentBytes: 4096,
+        maxRequestBytes: 2048,
+      }],
+    })).toThrow(/handoff is not authentic/u);
+    expect(pair.store.deliveries.listPageIds()).toEqual(pagesBeforeForgedHandoff);
     const composed = composeInstalledReactiveModuleHost({
       activation: activationPermission,
       ...common,
