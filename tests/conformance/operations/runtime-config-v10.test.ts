@@ -36,12 +36,10 @@ function scheduler(): Record<string, JsonValue> {
   };
 }
 
-function execution(
-  isolation: "process" | "sandbox" = "process",
-): Record<string, JsonValue> {
+function execution(): Record<string, JsonValue> {
   return {
     kind: "linux-process",
-    isolation,
+    isolation: "process",
     limits: {
       memoryMaxBytes: 64 * 1_024 * 1_024,
       maxTasks: 32,
@@ -386,6 +384,10 @@ describe("reserved Dolly instance version 10 configuration", () => {
           memoryMaxBytes: 64 * 1_024 * 1_024 + 1,
         },
       } }),
+      reactiveModule({ execution: {
+        ...execution(),
+        isolation: "sandbox",
+      } }),
       sourceModule({
         limits: {
           ...(sourceModule().limits as Record<string, JsonValue>),
@@ -669,10 +671,10 @@ describe("explicit version 9 to version 10 migration planning", () => {
       change: {
         modules: [{
           ...(migrationInput().modules as readonly Record<string, JsonValue>[])[0]!,
-          execution: execution("sandbox"),
+          execution: { ...execution(), isolation: "sandbox" },
         }],
       },
-      pattern: /isolation.*does not match/u,
+      pattern: /isolation is unsupported/u,
     },
     {
       label: "foreign policy",

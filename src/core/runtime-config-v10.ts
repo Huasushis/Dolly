@@ -45,7 +45,7 @@ export interface DollyModuleMailboxLimitsV10 {
 
 export interface DollyLinuxProcessExecutionV10 {
   readonly kind: "linux-process";
-  readonly isolation: "process" | "sandbox";
+  readonly isolation: "process";
   readonly limits: Readonly<{
     memoryMaxBytes: number;
     maxTasks: number;
@@ -372,8 +372,10 @@ function validateExecution(value: unknown, label: string): DollyLinuxProcessExec
   if (value.kind !== "linux-process") {
     throw invalid(`${label}.kind is unsupported`);
   }
-  if (value.isolation !== "process" && value.isolation !== "sandbox") {
-    throw invalid(`${label}.isolation is unsupported`);
+  if (value.isolation !== "process") {
+    throw invalid(
+      `${label}.isolation is unsupported; reserved version 10 defines only ordinary process isolation`,
+    );
   }
   exactObject(value.limits, [
     "memoryMaxBytes",

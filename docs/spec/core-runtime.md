@@ -765,7 +765,7 @@ interface ModuleMailboxConfiguration {
 
 interface LinuxProcessExecutionConfiguration {
   kind: "linux-process";
-  isolation: "process" | "sandbox";
+  isolation: "process";
   limits: {
     memoryMaxBytes: number;
     maxTasks: number;
@@ -944,9 +944,13 @@ version-10 Module and are not accepted as aliases.
 `declaredExternalEffects` is a cross-platform Run and recovery property, so it
 is not nested inside the Linux execution record. `execution` is a closed,
 discriminated operating-system backend. Version 10 defines only
-`kind: "linux-process"`; another operating system adds a different reviewed
-kind in a later schema version rather than nullable Linux fields. A host may
-parse and inspect the document on another platform, but activation fails with
+`kind: "linux-process"` with ordinary `process` isolation. The unimplemented
+`sandbox` result label is not accepted as a configuration profile: a future
+sandbox must name a reviewed backend version and carry enforceable guarantees
+in a later schema instead of being inferred from that label. Another operating
+system likewise adds a different reviewed kind in a later schema version
+rather than nullable Linux fields. A host may parse and inspect the document
+on another platform, but activation fails with
 a typed platform-unsupported result before it creates a controller lock,
 Core-state file, consumer subscription, source queue, process record, or child
 process.

@@ -608,7 +608,7 @@ describe("installed Extension Module resolution", () => {
     });
     expect(changedEffect.provenanceDigest).not.toBe(resolved.provenanceDigest);
 
-    const sandbox = resolveReservedV10InstalledModulePlan({
+    expect(() => resolveReservedV10InstalledModulePlan({
       instanceConfiguration: reservedV10InstanceConfiguration(
         "10.0.0",
         configuration.revision,
@@ -629,9 +629,7 @@ describe("installed Extension Module resolution", () => {
       moduleId: "worker",
       installations,
       configurations,
-    });
-    expect(() => deriveReservedV10InstalledLinuxModuleExecutionPlan(sandbox))
-      .toThrow(/does not implement sandbox isolation/u);
+    })).toThrow(/isolation is unsupported/u);
 
     expect(() => resolveReservedV10InstalledModulePlan({
       instanceConfiguration: instance,
