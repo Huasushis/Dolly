@@ -817,9 +817,24 @@ record. `deriveDollyInstanceV10SchedulerPlan` and
 configuration-to-Scheduler boundary. The latter accepts only runtime lifecycle
 handles and an authenticated source binding; it rejects a second mailbox,
 Claim, topology, concurrency, retry, backpressure, or watermark input. This is
-product-before-bootstrap evidence only. It does not resolve installations,
-permission-policy records, process-record provenance, or startup recovery, and
-the public Module startup refusal remains in force.
+product-before-bootstrap evidence only.
+
+`resolveReservedV10InstalledModulePlan` implements the next, still unstarted
+boundary. It revalidates the complete reserved document, resolves the selected
+package and immutable Module configuration from their integrity-checking
+stores, and mints an in-process plan whose canonical provenance digest includes
+the complete Module record, complete instance-document digest, package digest,
+trust classification, configuration and schema digests, declared effects,
+Linux execution limits, and exact permission-policy references. The plan is an
+authority object rather than a structural DTO: a copied or caller-constructed
+lookalike is rejected by the Linux projection. That projection maps `maxTasks`
+to the kernel `pids.max` limit, keeps `maxOpenFiles` as the launcher's
+`RLIMIT_NOFILE`, and rejects both unsupported sandbox execution and an
+untrusted package on the ordinary-process path before any process exists.
+It does not resolve the referenced permission-policy records, mint a process
+record, write Core state, or start a launcher. A later process-record version
+must bind this provenance to those store-resolved policy records and startup
+recovery. The public Module startup refusal remains in force.
 
 The three version-9 Scheduler intervals keep their existing bounds:
 `pollIntervalMs` is at most 60,000, `retryBaseMs` is at most 3,600,000, and

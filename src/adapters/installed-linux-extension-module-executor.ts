@@ -3,10 +3,15 @@ import type { ExtensionInstallationRegistry } from "../core/extension-installati
 import type { ExtensionSessionIdentity } from "../core/extension-capability.js";
 import type { ExtensionProcessHost } from "../core/extension-process-host.js";
 import {
+  assertReservedV10InstalledModulePlan,
   resolveInstalledExtensionModule,
   type InstalledExtensionModule,
+  type ReservedV10InstalledModulePlan,
 } from "../core/installed-extension-module.js";
-import { deriveModuleCgroupPath } from "../core/linux-module-cgroup.js";
+import {
+  deriveModuleCgroupPath,
+  type ModuleCgroupLimits,
+} from "../core/linux-module-cgroup.js";
 import type { VerifiedCoreServiceBinding } from "../core/linux-core-service-binding.js";
 import type { ModuleExecutor } from "../core/module-actor.js";
 import type { ModuleConfigurationStore } from "../core/module-configuration-store.js";
@@ -80,6 +85,56 @@ const INSTALLED_LINUX_LAUNCHER_INTERPRETER = "/usr/bin/python3";
 export interface InstalledLinuxExtensionModuleExecutorDerivation {
   readonly resolvedModule: InstalledExtensionModule;
   readonly executorOptions: LinuxExtensionModuleExecutorOptions;
+}
+
+export interface ReservedV10InstalledLinuxModuleExecutionPlan {
+  readonly resolvedModule: ReservedV10InstalledModulePlan;
+  readonly provenanceDigest: string;
+  readonly cgroupLimits: ModuleCgroupLimits;
+  readonly maxOpenFiles: number;
+  readonly declaredExternalEffects: "none" | "core-capabilities-only";
+  readonly permissionPolicyReferences: readonly Readonly<{
+    readonly policyId: string;
+    readonly revision: string;
+  }>[];
+  readonly timeouts: ReservedV10InstalledModulePlan["module"]["timeouts"];
+}
+
+/**
+ * Projects the exact Linux-owned values from one resolver-minted v10 plan.
+ * It performs no process, cgroup, protocol, or Core-state mutation. Sandbox
+ * activation remains unsupported here, and untrusted packages cannot enter
+ * the ordinary-process path.
+ */
+export function deriveReservedV10InstalledLinuxModuleExecutionPlan(
+  resolvedModule: ReservedV10InstalledModulePlan,
+): ReservedV10InstalledLinuxModuleExecutionPlan {
+  assertReservedV10InstalledModulePlan(resolvedModule);
+  if (resolvedModule.module.execution.isolation !== "process") {
+    throw new TypeError(
+      "Reserved version-10 installed Linux process composition does not implement sandbox isolation",
+    );
+  }
+  if (resolvedModule.installation.trust !== "trusted") {
+    throw new TypeError(
+      "Untrusted installed packages cannot use ordinary process isolation",
+    );
+  }
+  const limits = resolvedModule.module.execution.limits;
+  return Object.freeze({
+    resolvedModule,
+    provenanceDigest: resolvedModule.provenanceDigest,
+    cgroupLimits: Object.freeze({
+      memoryMaxBytes: limits.memoryMaxBytes,
+      maxProcesses: limits.maxTasks,
+      cpuQuotaMicros: limits.cpuQuotaMicros,
+      cpuPeriodMicros: limits.cpuPeriodMicros,
+    }),
+    maxOpenFiles: limits.maxOpenFiles,
+    declaredExternalEffects: resolvedModule.module.declaredExternalEffects,
+    permissionPolicyReferences: resolvedModule.module.permissionPolicyReferences,
+    timeouts: resolvedModule.module.timeouts,
+  });
 }
 
 function assertNoDerivedFields(

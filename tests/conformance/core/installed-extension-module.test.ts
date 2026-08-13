@@ -12,6 +12,7 @@ import {
   createInstalledLinuxExtensionModuleExecutor,
   createInstalledLinuxExtensionModuleGenerationFactory,
   deriveInstalledLinuxExtensionModuleExecutor,
+  deriveReservedV10InstalledLinuxModuleExecutionPlan,
   type InstalledLinuxExtensionModuleExecutorOptions,
 } from "../../../src/adapters/installed-linux-extension-module-executor.js";
 import {
@@ -30,6 +31,7 @@ import { ExtensionInstallationRegistry } from "../../../src/core/extension-insta
 import {
   resolveInstalledContentSchemaRegistrationSet,
   resolveInstalledExtensionModule,
+  resolveReservedV10InstalledModulePlan,
 } from "../../../src/core/installed-extension-module.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
@@ -219,6 +221,94 @@ function instanceConfiguration(
   });
 }
 
+function reservedV10InstanceConfiguration(
+  packageVersion: string,
+  revision: string,
+  overrides: Readonly<Record<string, JsonValue>> = {},
+): JsonValue {
+  const defaults = createDefaultDollyInstanceConfig(INSTANCE_ID);
+  return {
+    schemaVersion: "dolly.instance/10",
+    instanceId: INSTANCE_ID,
+    displayName: "Reserved v10 installed fixture",
+    stateDirectory: null,
+    core: {
+      limits: {
+        ...defaults.core.limits,
+        maxRegisteredContentValueBytes: 64 * 1024,
+      },
+      media: defaults.core.media,
+      scheduler: {
+        pollIntervalMs: 100,
+        retryBaseMs: 250,
+        retryMaxMs: 30_000,
+        maxConcurrentModules: 1,
+        backpressureAction: "pause-upstream",
+        downstreamRecheckMs: 100,
+        noProgressAfterMs: 5_000,
+        retryJitterBasisPoints: 0,
+        lowWatermarkBasisPoints: 10_000,
+        policy: { kind: "fixed" },
+        policyFailureAction: "quarantine",
+      },
+    },
+    pages: [{ pageId: "input" }, { pageId: "output" }],
+    modules: [{
+      moduleId: "worker",
+      extensionId: "org.example.installed",
+      packageVersion,
+      moduleKind: "transform",
+      configurationReference: {
+        configId: "worker-config",
+        revision,
+        configVersion: 1,
+      },
+      permissionPolicyReferences: [{
+        policyId: "model.primary",
+        revision: `sha256:${"2".repeat(64)}`,
+      }],
+      inputConnections: [{ pageId: "input", start: "from-now" }],
+      outputPageIds: ["output"],
+      activation: { kind: "reactive" },
+      declaredExternalEffects: "core-capabilities-only",
+      execution: {
+        kind: "linux-process",
+        isolation: "process",
+        limits: {
+          memoryMaxBytes: 64 * 1024 * 1024,
+          maxTasks: 32,
+          cpuQuotaMicros: 100_000,
+          cpuPeriodMicros: 100_000,
+          maxOpenFiles: 128,
+        },
+      },
+      limits: {
+        claim: {
+          baselineCount: 1,
+          baselineBytes: 4096,
+          maxCount: 1,
+          maxBytes: 4096,
+        },
+        mailbox: { maxResidentCount: 16, maxResidentBytes: 64 * 1024 },
+        sourceRequestMaxBytes: null,
+        maxInputBytes: 4096,
+        maxResultBytes: 4096,
+        maxFrameBytes: 8192,
+        maxRunsPerGeneration: 10,
+        maxGenerations: 2,
+      },
+      timeouts: {
+        initializationTimeoutMs: 1000,
+        executionTimeoutMs: 1000,
+        cancellationGraceMs: 100,
+        terminationTimeoutMs: 1000,
+      },
+      ...overrides,
+    }],
+    logging: defaults.logging,
+  };
+}
+
 function recordStore(): ModuleProcessRecordStore {
   return {
     getModuleProcessRecord: vi.fn(),
@@ -291,6 +381,157 @@ describe("installed Extension Module resolution", () => {
     expect(resolved.configuration).toEqual(configuration);
     expect(resolved.packageModule.configurationSchema).toEqual(CONFIGURATION_SCHEMA);
     expect(Object.isFrozen(resolved)).toBe(true);
+  });
+
+  it("binds every reserved version-10 execution input to one canonical installed plan", () => {
+    const source = resolve(scratch, "source-v10");
+    writePackage(source, "10.0.0");
+    const installed = installations.installNodePackage({
+      sourceDirectory: source,
+      trust: "trusted",
+    });
+    const configuration = configurations.create({
+      configId: "worker-config",
+      extensionId: "org.example.installed",
+      moduleKind: "transform",
+      configVersion: 1,
+      schema: CONFIGURATION_SCHEMA,
+      configuration: { prefix: "reserved-v10" },
+    });
+    const instance = reservedV10InstanceConfiguration(
+      "10.0.0",
+      configuration.revision,
+    );
+
+    const resolved = resolveReservedV10InstalledModulePlan({
+      instanceConfiguration: instance,
+      moduleId: "worker",
+      installations,
+      configurations,
+    });
+
+    expect(resolved.installation.packageDigest).toBe(installed.packageDigest);
+    expect(resolved.configuration.configurationDigest)
+      .toBe(configuration.configurationDigest);
+    expect(resolved.module.execution.limits.maxTasks).toBe(32);
+    expect(resolved.module.declaredExternalEffects).toBe("core-capabilities-only");
+    expect(resolved.module.permissionPolicyReferences).toEqual([{
+      policyId: "model.primary",
+      revision: `sha256:${"2".repeat(64)}`,
+    }]);
+    expect(resolved.instanceConfigurationDigest).toBe(canonicalJsonDigest(instance));
+    expect(resolved.provenanceDigest).toBe(canonicalJsonDigest(resolved.provenance));
+    expect(resolved.provenance).toEqual(expect.objectContaining({
+      module: expect.objectContaining({
+        execution: expect.objectContaining({
+          limits: expect.objectContaining({ maxTasks: 32 }),
+        }),
+        declaredExternalEffects: "core-capabilities-only",
+      }),
+      installation: expect.objectContaining({
+        packageDigest: installed.packageDigest,
+        trust: "trusted",
+      }),
+      configuration: expect.objectContaining({
+        configurationDigest: configuration.configurationDigest,
+      }),
+    }));
+    expect(Object.isFrozen(resolved)).toBe(true);
+    expect(Object.isFrozen(resolved.provenance)).toBe(true);
+    expect(deriveReservedV10InstalledLinuxModuleExecutionPlan(resolved)).toEqual(
+      expect.objectContaining({
+        resolvedModule: resolved,
+        provenanceDigest: resolved.provenanceDigest,
+        cgroupLimits: {
+          memoryMaxBytes: 64 * 1024 * 1024,
+          maxProcesses: 32,
+          cpuQuotaMicros: 100_000,
+          cpuPeriodMicros: 100_000,
+        },
+        maxOpenFiles: 128,
+        declaredExternalEffects: "core-capabilities-only",
+        permissionPolicyReferences: [{
+          policyId: "model.primary",
+          revision: `sha256:${"2".repeat(64)}`,
+        }],
+      }),
+    );
+
+    expect(() => deriveReservedV10InstalledLinuxModuleExecutionPlan({
+      ...resolved,
+    })).toThrow(/not minted by the store-bound resolver/u);
+
+    const changedLimit = resolveReservedV10InstalledModulePlan({
+      instanceConfiguration: reservedV10InstanceConfiguration(
+        "10.0.0",
+        configuration.revision,
+        {
+          execution: {
+            kind: "linux-process",
+            isolation: "process",
+            limits: {
+              memoryMaxBytes: 64 * 1024 * 1024,
+              maxTasks: 31,
+              cpuQuotaMicros: 100_000,
+              cpuPeriodMicros: 100_000,
+              maxOpenFiles: 128,
+            },
+          },
+        },
+      ),
+      moduleId: "worker",
+      installations,
+      configurations,
+    });
+    expect(changedLimit.provenanceDigest).not.toBe(resolved.provenanceDigest);
+
+    const changedEffect = resolveReservedV10InstalledModulePlan({
+      instanceConfiguration: reservedV10InstanceConfiguration(
+        "10.0.0",
+        configuration.revision,
+        {
+          declaredExternalEffects: "none",
+          permissionPolicyReferences: [],
+        },
+      ),
+      moduleId: "worker",
+      installations,
+      configurations,
+    });
+    expect(changedEffect.provenanceDigest).not.toBe(resolved.provenanceDigest);
+
+    const sandbox = resolveReservedV10InstalledModulePlan({
+      instanceConfiguration: reservedV10InstanceConfiguration(
+        "10.0.0",
+        configuration.revision,
+        {
+          execution: {
+            kind: "linux-process",
+            isolation: "sandbox",
+            limits: {
+              memoryMaxBytes: 64 * 1024 * 1024,
+              maxTasks: 32,
+              cpuQuotaMicros: 100_000,
+              cpuPeriodMicros: 100_000,
+              maxOpenFiles: 128,
+            },
+          },
+        },
+      ),
+      moduleId: "worker",
+      installations,
+      configurations,
+    });
+    expect(() => deriveReservedV10InstalledLinuxModuleExecutionPlan(sandbox))
+      .toThrow(/does not implement sandbox isolation/u);
+
+    expect(() => resolveReservedV10InstalledModulePlan({
+      instanceConfiguration: instance,
+      moduleId: "worker",
+      installations,
+      configurations,
+      declaredExternalEffects: "none",
+    } as never)).toThrow(/unknown fields: declaredExternalEffects/u);
   });
 
   it("binds installed package schema producers to FileCore before Block allocation", () => {

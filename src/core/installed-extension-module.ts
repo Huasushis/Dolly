@@ -1,4 +1,8 @@
-import type { JsonValue } from "./canonical-json.js";
+import {
+  canonicalJsonDigest,
+  deepFreeze,
+  type JsonValue,
+} from "./canonical-json.js";
 import {
   ContentSchemaRegistrationSet,
   type ContentSchemaRegistrationInput,
@@ -19,6 +23,10 @@ import {
   type DollyInstanceConfig,
   type DollyModuleConfig,
 } from "./runtime-config.js";
+import {
+  validateDollyInstanceConfigV10Draft,
+  type DollyModuleConfigV10,
+} from "./runtime-config-v10.js";
 
 export interface InstalledExtensionModule {
   readonly instanceId: string;
@@ -34,6 +42,48 @@ export interface ResolveInstalledExtensionModuleOptions {
   readonly moduleId: string;
   readonly installations: ExtensionInstallationRegistry;
   readonly configurations: ModuleConfigurationStore;
+}
+
+export interface ReservedV10InstalledModulePlan {
+  readonly instanceId: string;
+  /** Digest of the complete, revalidated reserved version-10 document. */
+  readonly instanceConfigurationDigest: string;
+  readonly module: Readonly<DollyModuleConfigV10>;
+  readonly installation: Readonly<ResolvedExtensionInstallation>;
+  readonly packageModule: Readonly<ExtensionPackageModule>;
+  readonly configuration: Readonly<ModuleConfigurationRecord>;
+  /**
+   * Closed canonical preimage for the future process-record/2 composition.
+   * It contains every configuration, package, trust, policy, and execution
+   * value that can change how this installed Module runs.
+   */
+  readonly provenance: JsonValue;
+  readonly provenanceDigest: string;
+}
+
+export interface ResolveReservedV10InstalledModulePlanOptions {
+  /** The complete reserved version-10 document is validated again before I/O. */
+  readonly instanceConfiguration: JsonValue;
+  readonly moduleId: string;
+  readonly installations: ExtensionInstallationRegistry;
+  readonly configurations: ModuleConfigurationStore;
+}
+
+const RESERVED_V10_INSTALLED_MODULE_PLANS = new WeakSet<object>();
+
+/** Rejects structurally forged plans at internal composition boundaries. */
+export function assertReservedV10InstalledModulePlan(
+  value: unknown,
+): asserts value is ReservedV10InstalledModulePlan {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    !RESERVED_V10_INSTALLED_MODULE_PLANS.has(value)
+  ) {
+    throw new TypeError(
+      "Reserved version-10 installed Module plan was not minted by the store-bound resolver",
+    );
+  }
 }
 
 export interface ResolveInstalledContentSchemaRegistrationSetOptions {
@@ -109,6 +159,113 @@ export function resolveInstalledExtensionModule(
     packageModule,
     configuration: resolvedConfiguration,
   });
+}
+
+/**
+ * Resolves the installation and immutable Module configuration selected by a
+ * complete reserved version-10 document without starting a process or writing
+ * Core state.
+ *
+ * The returned provenance digest is deliberately broader than the existing
+ * process-record/1 shape. A later Linux composition may consume this one plan;
+ * it must not accept caller replacements for limits, effects, policy
+ * revisions, package trust, or configuration bytes. This does not register
+ * version 10 with public bootstrap and is not itself activation authority.
+ */
+export function resolveReservedV10InstalledModulePlan(
+  options: ResolveReservedV10InstalledModulePlanOptions,
+): ReservedV10InstalledModulePlan {
+  const expectedOptionKeys = new Set([
+    "instanceConfiguration",
+    "moduleId",
+    "installations",
+    "configurations",
+  ]);
+  const unexpectedOptionKeys = Object.keys(options)
+    .filter((key) => !expectedOptionKeys.has(key))
+    .sort();
+  if (unexpectedOptionKeys.length > 0) {
+    throw new TypeError(
+      `Reserved version-10 installed Module resolution contains unknown fields: ${unexpectedOptionKeys.join(", ")}`,
+    );
+  }
+  if (!(options.installations instanceof ExtensionInstallationRegistry)) {
+    throw new TypeError("installations must be an ExtensionInstallationRegistry");
+  }
+  if (!(options.configurations instanceof ModuleConfigurationStore)) {
+    throw new TypeError("configurations must be a ModuleConfigurationStore");
+  }
+
+  const instanceConfiguration = validateDollyInstanceConfigV10Draft(
+    options.instanceConfiguration,
+  );
+  const module = instanceConfiguration.modules.find((candidate) =>
+    candidate.moduleId === options.moduleId
+  );
+  if (module === undefined) {
+    throw new TypeError(`Instance does not contain Module ${options.moduleId}`);
+  }
+
+  const installation = options.installations.resolve({
+    extensionId: module.extensionId,
+    packageVersion: module.packageVersion,
+  });
+  assertExtensionModuleCompatibility(installation.manifest, {
+    extensionId: module.extensionId,
+    packageVersion: module.packageVersion,
+    moduleKind: module.moduleKind,
+    configVersion: module.configurationReference.configVersion,
+    activation: module.activation.kind,
+  });
+  const packageModule = installation.manifest.modules.find((candidate) =>
+    candidate.moduleKind === module.moduleKind
+  );
+  if (packageModule === undefined) {
+    throw new TypeError(`Installed package does not contain Module ${module.moduleKind}`);
+  }
+  const configuration = options.configurations.resolve({
+    configId: module.configurationReference.configId,
+    revision: module.configurationReference.revision,
+    extensionId: module.extensionId,
+    moduleKind: module.moduleKind,
+    configVersion: module.configurationReference.configVersion,
+    schema: packageModule.configurationSchema,
+  });
+
+  const instanceConfigurationDigest = canonicalJsonDigest(instanceConfiguration);
+  const provenance = deepFreeze({
+    schemaVersion: "dolly.reserved-v10-installed-module-plan/1",
+    instanceId: instanceConfiguration.instanceId,
+    instanceConfigurationDigest,
+    module: module as unknown as JsonValue,
+    installation: {
+      extensionId: installation.manifest.extensionId,
+      packageVersion: installation.manifest.packageVersion,
+      packageDigest: installation.packageDigest,
+      trust: installation.trust,
+      moduleKind: packageModule.moduleKind,
+    },
+    configuration: {
+      configId: configuration.configId,
+      revision: configuration.revision,
+      configVersion: configuration.configVersion,
+      schemaDigest: configuration.schemaDigest,
+      configurationDigest: configuration.configurationDigest,
+    },
+  } satisfies JsonValue);
+
+  const plan = Object.freeze({
+    instanceId: instanceConfiguration.instanceId,
+    instanceConfigurationDigest,
+    module,
+    installation,
+    packageModule,
+    configuration,
+    provenance,
+    provenanceDigest: canonicalJsonDigest(provenance),
+  });
+  RESERVED_V10_INSTALLED_MODULE_PLANS.add(plan);
+  return plan;
 }
 
 /**
