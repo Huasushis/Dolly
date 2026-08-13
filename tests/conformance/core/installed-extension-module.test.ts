@@ -32,6 +32,9 @@ import {
   type InstalledModulePrivateStoragePolicy,
 } from "../../../src/adapters/installed-module-permission-policy.js";
 import {
+  reviewedLinuxModuleRuntimeIdentity,
+} from "../../../src/linux-module-runtime-assets.js";
+import {
   canonicalJsonDigest,
   type JsonValue,
 } from "../../../src/core/canonical-json.js";
@@ -59,6 +62,7 @@ import {
 } from "../../../src/core/runtime-config.js";
 
 const INSTANCE_ID = "11111111-1111-4111-8111-111111111111";
+const RUNTIME = reviewedLinuxModuleRuntimeIdentity();
 const PROCESS_IDENTITY = {
   instanceId: INSTANCE_ID,
   moduleId: "worker",
@@ -525,6 +529,7 @@ describe("installed Extension Module resolution", () => {
     const processProvenance = deriveReservedV10InstalledModuleProcessProvenance(
       resolved,
       policySelection,
+      RUNTIME,
     );
     expect(processProvenance.snapshot).toEqual(expect.objectContaining({
       installedPlanDigest: resolved.provenanceDigest,
@@ -532,14 +537,15 @@ describe("installed Extension Module resolution", () => {
       packageDigest: installed.packageDigest,
       declaredExternalEffects: "none",
       execution: resolved.module.execution,
-      linuxRuntime: {
-        interpreterProgram: "/usr/bin/python3",
-        launcherDigest: REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
-        confinementProgram: LINUX_PROCESS_CONFINEMENT_PROGRAM,
-      },
+      linuxRuntime: RUNTIME,
     }));
     expect(processProvenance.provenanceDigest)
       .toBe(canonicalJsonDigest(processProvenance.snapshot));
+    expect(() => deriveReservedV10InstalledModuleProcessProvenance(
+      resolved,
+      policySelection,
+      { ...RUNTIME, nodeVersion: "0.0.0-substituted" },
+    )).toThrow(/does not match this reviewed Host runtime/u);
     expect(() => assertReservedV10InstalledModuleProcessProvenance({
       ...processProvenance,
     })).toThrow(/not minted by the installed composition/u);
@@ -816,6 +822,7 @@ describe("installed Extension Module resolution", () => {
       moduleGenerationId: MODULE_GENERATION_ID,
       coreStateDirectory: resolve(scratch, "instance-state"),
       binding: CORE_BINDING,
+      runtime: RUNTIME,
       lifecycle: {
         records,
         stoppedRecordWriter: stopped,
@@ -868,7 +875,7 @@ describe("installed Extension Module resolution", () => {
         "--tmpfs", "/tmp",
         "--dir", "/run/dolly",
         "--file", "4", "/run/dolly/package.snapshot",
-        "--ro-bind", process.execPath, "/run/dolly/node",
+        "--ro-bind", RUNTIME.nodeProgram, "/run/dolly/node",
         "--unshare-user",
         "--unshare-pid",
         "--unshare-cgroup",
@@ -961,6 +968,7 @@ describe("installed Extension Module resolution", () => {
       moduleGenerationId: MODULE_GENERATION_ID,
       coreStateDirectory: resolve(scratch, "instance-state"),
       binding: CORE_BINDING,
+      runtime: RUNTIME,
       lifecycle: {
         records: recordStore(),
         stoppedRecordWriter: stoppedRecordWriter(),
@@ -993,6 +1001,10 @@ describe("installed Extension Module resolution", () => {
     expect(() => deriveInstalledLinuxExtensionModuleExecutor(
       callerEffectDeclaration,
     )).toThrow(/cannot accept a caller-supplied external-effect declaration/u);
+    expect(() => deriveInstalledLinuxExtensionModuleExecutor({
+      ...base,
+      runtime: { ...RUNTIME, nodeProgram: "/tmp/substituted-node" },
+    })).toThrow(/does not match this reviewed Host runtime/u);
     expect(() => deriveInstalledLinuxExtensionModuleExecutor({
       ...base,
       configureHost: () => undefined,
@@ -1108,6 +1120,7 @@ describe("installed Extension Module resolution", () => {
       configurations,
       coreStateDirectory: resolve(scratch, "instance-state"),
       binding: CORE_BINDING,
+      runtime: RUNTIME,
       lifecycle: {
         records,
         stoppedRecordWriter: stoppedRecordWriter(),

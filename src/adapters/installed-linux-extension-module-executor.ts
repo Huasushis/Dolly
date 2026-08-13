@@ -41,10 +41,8 @@ import {
   type LinuxExtensionModuleExecutorOptions,
 } from "./linux-extension-module-executor.js";
 import {
-  defaultLauncherScriptPath,
-  LINUX_MODULE_LAUNCHER_INTERPRETER,
-  LINUX_PROCESS_CONFINEMENT_PROGRAM,
-  REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
+  snapshotReviewedLinuxModuleRuntimeIdentity,
+  type ReviewedLinuxModuleRuntimeIdentity,
 } from "../linux-module-runtime-assets.js";
 
 type InstalledLifecycleOptions = Omit<
@@ -66,6 +64,8 @@ export interface InstalledLinuxExtensionModuleExecutorOptions {
   readonly coreStateDirectory: string;
   /** Exact systemd/Core binding verified before Module activation. */
   readonly binding: VerifiedCoreServiceBinding;
+  /** Exact runtime profile frozen by the Host activation decision. */
+  readonly runtime: ReviewedLinuxModuleRuntimeIdentity;
   readonly lifecycle: InstalledLifecycleOptions;
   readonly processRecord: ProcessRecordDetails;
   readonly host: InstalledHostOptions;
@@ -158,14 +158,17 @@ export function deriveReservedV10InstalledLinuxModuleExecutionPlan(
 }
 
 /**
- * Joins the two independently minted v10 authorities into the closed
- * provenance that a future process-record/2 factory must consume. It does not
- * create a durable process record because the current Core-state schema and
+ * Joins the resolver-minted plan and policy selection with one frozen local
+ * runtime profile into the candidate provenance that a future process-record/2
+ * factory must consume. The profile prevents structural runtime substitution;
+ * it is not the still-missing durable Host runtime-binding authority. This
+ * function creates no process record because the current Core-state schema and
  * startup recovery intentionally accept only their existing record boundary.
  */
 export function deriveReservedV10InstalledModuleProcessProvenance(
   installedModule: ReservedV10InstalledModulePlan,
   permissionPolicies: ReservedV10InstalledPermissionPolicySelection,
+  runtime: ReviewedLinuxModuleRuntimeIdentity,
 ): ReservedV10InstalledModuleProcessProvenance {
   const linuxExecution = deriveReservedV10InstalledLinuxModuleExecutionPlan(
     installedModule,
@@ -174,6 +177,7 @@ export function deriveReservedV10InstalledModuleProcessProvenance(
     permissionPolicies,
     installedModule,
   );
+  const runtimeSnapshot = snapshotReviewedLinuxModuleRuntimeIdentity(runtime);
   const snapshot = deepFreeze({
     schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
     instanceId: installedModule.instanceId,
@@ -188,11 +192,7 @@ export function deriveReservedV10InstalledModuleProcessProvenance(
     },
     declaredExternalEffects: installedModule.module.declaredExternalEffects,
     execution: installedModule.module.execution as unknown as JsonValue,
-    linuxRuntime: {
-      interpreterProgram: LINUX_MODULE_LAUNCHER_INTERPRETER,
-      launcherDigest: REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
-      confinementProgram: LINUX_PROCESS_CONFINEMENT_PROGRAM,
-    },
+    linuxRuntime: runtimeSnapshot as unknown as JsonValue,
   } satisfies JsonValue);
   const provenance = Object.freeze({
     installedModule,
@@ -292,6 +292,7 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     installations: options.installations,
     configurations: options.configurations,
   });
+  const runtime = snapshotReviewedLinuxModuleRuntimeIdentity(options.runtime);
   if (resolvedModule.module.permissionPolicyIds.length === 0) {
     if (options.permissionPolicySetup !== undefined) {
       throw new TypeError(
@@ -347,18 +348,18 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
   // timestamps cannot be deferred until after process creation.
   assertValidModuleProcessRecord(processRecord);
   const confinementExecution = deriveLinuxProcessConfinementExecution({
-    bubblewrapProgram: LINUX_PROCESS_CONFINEMENT_PROGRAM,
-    nodeProgram: process.execPath,
+    bubblewrapProgram: runtime.confinementProgram,
+    nodeProgram: runtime.nodeProgram,
     installationDirectory: resolvedModule.installation.workingDirectory,
     entrypointPath: resolvedModule.installation.entrypointPath,
     packageSnapshot: resolvedModule.installation.packageSnapshot,
     coreStateDirectory: options.coreStateDirectory,
   });
-  const launcherBytes = readFileSync(defaultLauncherScriptPath());
+  const launcherBytes = readFileSync(runtime.launcherScriptPath);
   const launcherDigest = `sha256:${createHash("sha256")
     .update(launcherBytes)
     .digest("hex")}`;
-  if (launcherDigest !== REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST) {
+  if (launcherDigest !== runtime.launcherDigest) {
     throw new TypeError(
       "Installed Linux launcher bytes do not match the reviewed build digest",
     );
@@ -377,7 +378,7 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
       },
     },
     launcher: {
-      interpreterProgram: LINUX_MODULE_LAUNCHER_INTERPRETER,
+      interpreterProgram: runtime.interpreterProgram,
       launcherEnvironment: Object.freeze({}),
     },
     reviewedLauncherSnapshot: {

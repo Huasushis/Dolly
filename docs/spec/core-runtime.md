@@ -661,7 +661,9 @@ operation is unavailable.
 The installed launcher is also part of the Linux execution preimage. Its
 build-reviewed SHA-256 digest, the fixed `/usr/bin/python3` interpreter, and
 the selected confinement program are included in the reserved v10 process
-provenance candidate. Installed composition reads the colocated launcher,
+provenance candidate together with the exact Core `nodeProgram` and Node
+version that will execute the Extension. Installed composition reads the
+colocated launcher,
 requires the reviewed digest, copies those exact bytes into an unlinked
 read-only snapshot, and starts Python with that inherited file at
 `/proc/self/fd/5`. The parent closes its copy immediately after spawn and the
@@ -672,7 +674,8 @@ composition and cannot support product activation evidence.
 The activation decision has no caller-selected interpreter, launcher, or
 confinement path. It checks the same closed runtime identity used by installed
 composition: fixed `/usr/bin/python3`, the colocated launcher with its reviewed
-digest, and fixed `/usr/bin/bwrap`. Its permitted result carries that identity
+digest, fixed `/usr/bin/bwrap`, and the current Core Node executable and
+version. Its permitted result carries that identity
 beside the service binding and prepared delegated root. The default check
 requires both programs to be executable and recomputes the launcher digest;
 failure is `MODULE_ACTIVATION_LAUNCHER_UNAVAILABLE`. Installed execution still
@@ -925,10 +928,14 @@ remove the bootstrap refusal.
 selection to the resolver-minted installed plan. Its canonical snapshot binds
 the installed-plan and policy-selection digests, package digest, configuration
 revision/schema/value digests, external-effect declaration, and complete Linux
-execution record. The result is a resolver-minted Linux process-provenance
+execution record. It also records the exact locally observed Node
+path/version and reviewed launcher profile; a substituted runtime profile is
+rejected instead of sharing a provenance digest. The result is a
+resolver-minted Linux process-provenance
 candidate and copied lookalikes are rejected. Resolver provenance prevents
 structural substitution but does not prove current desired-state ownership,
-platform support, kernel enforcement, or durable runtime bindings. It is
+platform support, dynamic-library identity, bubblewrap/kernel enforcement, or
+a durable Host runtime-binding revision. It is
 intentionally not a Module process record and the current Core-state store will
 not persist it. This keeps the future
 `dolly.module-process-record/2` preimage explicit without allowing startup

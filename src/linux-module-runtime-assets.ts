@@ -20,6 +20,11 @@ export const REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST =
 
 /** Closed identity shared by activation checks and installed execution. */
 export interface ReviewedLinuxModuleRuntimeIdentity {
+  readonly schemaVersion: "dolly.linux-module-runtime-profile/1";
+  /** Exact Node executable that the confinement plan exposes to the Module. */
+  readonly nodeProgram: string;
+  /** Node runtime semantics paired with `nodeProgram` for this Core process. */
+  readonly nodeVersion: string;
   readonly interpreterProgram: typeof LINUX_MODULE_LAUNCHER_INTERPRETER;
   readonly launcherScriptPath: string;
   readonly launcherDigest: typeof REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST;
@@ -28,11 +33,49 @@ export interface ReviewedLinuxModuleRuntimeIdentity {
 
 export function reviewedLinuxModuleRuntimeIdentity(): ReviewedLinuxModuleRuntimeIdentity {
   return Object.freeze({
+    schemaVersion: "dolly.linux-module-runtime-profile/1",
+    nodeProgram: process.execPath,
+    nodeVersion: process.versions.node,
     interpreterProgram: LINUX_MODULE_LAUNCHER_INTERPRETER,
     launcherScriptPath: defaultLauncherScriptPath(),
     launcherDigest: REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
     confinementProgram: LINUX_PROCESS_CONFINEMENT_PROGRAM,
   });
+}
+
+/**
+ * Rejects a structurally substituted profile before it reaches a launcher.
+ * The Host-minted activation permission remains the authority boundary; this
+ * check additionally prevents lower-level candidate seams from describing a
+ * Node runtime different from the one that will actually be exposed.
+ */
+export function assertReviewedLinuxModuleRuntimeIdentity(
+  value: ReviewedLinuxModuleRuntimeIdentity,
+): void {
+  const expected = reviewedLinuxModuleRuntimeIdentity();
+  const keys = Object.keys(value).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  if (
+    keys.length !== expectedKeys.length ||
+    keys.some((key, index) => key !== expectedKeys[index]) ||
+    expectedKeys.some((key) =>
+      value[key as keyof ReviewedLinuxModuleRuntimeIdentity] !==
+        expected[key as keyof ReviewedLinuxModuleRuntimeIdentity]
+    )
+  ) {
+    throw new TypeError(
+      "Linux Module runtime profile does not match this reviewed Host runtime",
+    );
+  }
+}
+
+/** Copies the closed fields once so caller getters cannot change them after validation. */
+export function snapshotReviewedLinuxModuleRuntimeIdentity(
+  value: ReviewedLinuxModuleRuntimeIdentity,
+): ReviewedLinuxModuleRuntimeIdentity {
+  const snapshot = Object.freeze({ ...value });
+  assertReviewedLinuxModuleRuntimeIdentity(snapshot);
+  return snapshot;
 }
 
 export type ReviewedLinuxModuleRuntimeInspection =

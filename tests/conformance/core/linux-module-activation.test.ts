@@ -13,6 +13,9 @@ import type { ReviewedLinuxModuleRuntimeInspection } from "../../../src/linux-mo
 
 const runtimeMock = vi.hoisted(() => {
   const runtime = {
+    schemaVersion: "dolly.linux-module-runtime-profile/1" as const,
+    nodeProgram: process.execPath,
+    nodeVersion: process.versions.node,
     interpreterProgram: "/usr/bin/python3" as const,
     launcherScriptPath: "/reviewed/dolly/launcher.py",
     launcherDigest:

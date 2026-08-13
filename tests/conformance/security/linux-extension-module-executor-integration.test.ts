@@ -9,6 +9,9 @@
  */
 
 import {
+  reviewedLinuxModuleRuntimeIdentity,
+} from "../../../src/linux-module-runtime-assets.js";
+import {
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -597,6 +600,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       configurations,
       coreStateDirectory: store.stateDirectoryForProcessConfinement(),
       binding: inspectedBinding.binding,
+      runtime: reviewedLinuxModuleRuntimeIdentity(),
       lifecycle: {
         records: store,
         stoppedRecordWriter,

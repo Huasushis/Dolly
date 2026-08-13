@@ -20,8 +20,14 @@ const activationDependencies = vi.hoisted(() => {
     delegatedRootControllers: ["cpu", "memory", "pids"],
   };
   const runtime = {
+    schemaVersion: "dolly.linux-module-runtime-profile/1" as const,
+    nodeProgram: process.execPath,
+    nodeVersion: process.versions.node,
     interpreterProgram: "/usr/bin/python3" as const,
-    launcherScriptPath: "/reviewed/dolly/launcher.py",
+    launcherScriptPath: new URL(
+      "../../../src/adapters/linux-module-launcher/launcher.py",
+      import.meta.url,
+    ).pathname,
     launcherDigest:
       "sha256:2c95f759603f902340f719abaaf12b2df0ab7194d9c89f35aa835927486d3177" as const,
     confinementProgram: "/usr/bin/bwrap" as const,
@@ -309,6 +315,7 @@ describe("installed reactive Module runtime composition", () => {
       nextModuleGenerationId: () => "module-generation-b",
       monotonicNow: () => 0,
       binding: BINDING,
+      runtime: activationDependencies.runtime,
       lifecycle: {
         limits: {
           memoryMaxBytes: 64 * 1024 * 1024,
