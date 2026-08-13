@@ -217,6 +217,14 @@ export function resolveReservedV10InstalledModulePlan(
     configVersion: module.configurationReference.configVersion,
     activation: module.activation.kind,
   });
+  if (
+    module.permissionPolicyReferences.length > 0 &&
+    installation.manifest.requestedCapabilities.length === 0
+  ) {
+    throw new TypeError(
+      `Installed package schema ${installation.manifest.schemaVersion} cannot be bound to permission policies because it requests no capabilities`,
+    );
+  }
   const packageModule = installation.manifest.modules.find((candidate) =>
     candidate.moduleKind === module.moduleKind
   );

@@ -861,7 +861,13 @@ recovery. The public Module startup refusal remains in force.
 rule for candidate composition. Every configured policy reference must resolve
 to one operator-provided closed policy definition whose canonical digest is
 the exact configured revision; duplicate revisions and caller-selected labels
-are rejected. The resulting resolver-minted selection is bound to the
+are rejected. Package schemas 1 through 4 request no capabilities, so the
+store-bound v10 installed-plan resolver rejects every non-empty policy
+reference for those packages before a selection can be minted. This is an
+intentional compatibility gate, not an implicit grant: a future package schema
+must define a closed capability request and its compatibility rule before this
+candidate path can select a live policy. The currently reachable empty
+resolver-minted selection is bound to the
 installed plan, package, configuration, and selected policy-definition
 digests. It is not execution authority: the in-process broker, storage backend,
 tool executor, secret material, and data domain are not durable binding records

@@ -273,14 +273,11 @@ function reservedV10InstanceConfiguration(
         revision,
         configVersion: 1,
       },
-      permissionPolicyReferences: [{
-        policyId: "model.primary",
-        revision: `sha256:${"2".repeat(64)}`,
-      }],
+      permissionPolicyReferences: [],
       inputConnections: [{ pageId: "input", start: "from-now" }],
       outputPageIds: ["output"],
       activation: { kind: "reactive" },
-      declaredExternalEffects: "core-capabilities-only",
+      declaredExternalEffects: "none",
       execution: {
         kind: "linux-process",
         isolation: "process",
@@ -435,12 +432,27 @@ describe("installed Extension Module resolution", () => {
       "10.0.0",
       configuration.revision,
       {
-        permissionPolicyReferences: [{
-          policyId: "model.primary",
-          revision: policyRevision,
-        }],
+        declaredExternalEffects: "none",
+        permissionPolicyReferences: [],
       },
     );
+
+    expect(() => resolveReservedV10InstalledModulePlan({
+      instanceConfiguration: reservedV10InstanceConfiguration(
+        "10.0.0",
+        configuration.revision,
+        {
+          declaredExternalEffects: "core-capabilities-only",
+          permissionPolicyReferences: [{
+            policyId: "model.primary",
+            revision: policyRevision,
+          }],
+        },
+      ),
+      moduleId: "worker",
+      installations,
+      configurations,
+    })).toThrow(/cannot be bound to permission policies because it requests no capabilities/u);
 
     const resolved = resolveReservedV10InstalledModulePlan({
       instanceConfiguration: instance,
@@ -453,11 +465,8 @@ describe("installed Extension Module resolution", () => {
     expect(resolved.configuration.configurationDigest)
       .toBe(configuration.configurationDigest);
     expect(resolved.module.execution.limits.maxTasks).toBe(32);
-    expect(resolved.module.declaredExternalEffects).toBe("core-capabilities-only");
-    expect(resolved.module.permissionPolicyReferences).toEqual([{
-      policyId: "model.primary",
-      revision: policyRevision,
-    }]);
+    expect(resolved.module.declaredExternalEffects).toBe("none");
+    expect(resolved.module.permissionPolicyReferences).toEqual([]);
     expect(resolved.instanceConfigurationDigest).toBe(canonicalJsonDigest(instance));
     expect(resolved.provenanceDigest).toBe(canonicalJsonDigest(resolved.provenance));
     expect(resolved.provenance).toEqual(expect.objectContaining({
@@ -465,7 +474,7 @@ describe("installed Extension Module resolution", () => {
         execution: expect.objectContaining({
           limits: expect.objectContaining({ maxTasks: 32 }),
         }),
-        declaredExternalEffects: "core-capabilities-only",
+        declaredExternalEffects: "none",
       }),
       installation: expect.objectContaining({
         packageDigest: installed.packageDigest,
@@ -488,11 +497,8 @@ describe("installed Extension Module resolution", () => {
           cpuPeriodMicros: 100_000,
         },
         maxOpenFiles: 128,
-        declaredExternalEffects: "core-capabilities-only",
-        permissionPolicyReferences: [{
-          policyId: "model.primary",
-          revision: policyRevision,
-        }],
+        declaredExternalEffects: "none",
+        permissionPolicyReferences: [],
       }),
     );
 
@@ -512,11 +518,7 @@ describe("installed Extension Module resolution", () => {
       installedPlanDigest: resolved.provenanceDigest,
       packageDigest: installed.packageDigest,
       configurationDigest: configuration.configurationDigest,
-      policies: [{
-        policyId: "model.primary",
-        revision: policyRevision,
-        kind: "module-private-storage",
-      }],
+      policies: [],
     }));
     expect(policySelection.selectionDigest)
       .toBe(canonicalJsonDigest(policySelection.snapshot));
@@ -528,7 +530,7 @@ describe("installed Extension Module resolution", () => {
       installedPlanDigest: resolved.provenanceDigest,
       permissionPolicySelectionDigest: policySelection.selectionDigest,
       packageDigest: installed.packageDigest,
-      declaredExternalEffects: "core-capabilities-only",
+      declaredExternalEffects: "none",
       execution: resolved.module.execution,
       linuxRuntime: {
         interpreterProgram: "/usr/bin/python3",
@@ -545,24 +547,6 @@ describe("installed Extension Module resolution", () => {
       { ...policySelection },
       resolved,
     )).toThrow(/not minted by its revision registry/u);
-
-    const otherRevision = resolveReservedV10InstalledModulePlan({
-      instanceConfiguration: reservedV10InstanceConfiguration(
-        "10.0.0",
-        configuration.revision,
-        {
-          permissionPolicyReferences: [{
-            policyId: "model.primary",
-            revision: `sha256:${"3".repeat(64)}`,
-          }],
-        },
-      ),
-      moduleId: "worker",
-      installations,
-      configurations,
-    });
-    expect(() => policyRegistry.resolveFor(otherRevision))
-      .toThrow(/model\.primary@sha256:3{64} is not registered/u);
 
     expect(() => new ReservedV10InstalledPermissionPolicyRegistry({
       policies: [{
@@ -614,7 +598,7 @@ describe("installed Extension Module resolution", () => {
         "10.0.0",
         configuration.revision,
         {
-          declaredExternalEffects: "none",
+          declaredExternalEffects: "core-capabilities-only",
           permissionPolicyReferences: [],
         },
       ),
