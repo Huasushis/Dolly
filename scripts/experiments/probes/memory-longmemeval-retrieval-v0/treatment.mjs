@@ -118,7 +118,7 @@ function projectDocuments(input) {
     questionId,
     queryTokens: Object.freeze([...new Set(tokenize(question))]),
     documents: Object.freeze(documents),
-    rawSessionBytes: documents.reduce(
+    corpusRawSessionBytes: documents.reduce(
       (sum, document) => sum + Buffer.byteLength(document.text, "utf8"),
       0,
     ),
@@ -289,6 +289,10 @@ export function evaluateTreatmentQuestion(input, selectedWeights = undefined) {
   const contentStartedAt = performance.now();
   const projection = projectDocuments(input);
   const contentScores = bm25(projection.documents, projection.queryTokens);
+  const sessionBytes = new Map(projection.documents.map((document) => [
+    document.sessionId,
+    Buffer.byteLength(document.text, "utf8"),
+  ]));
   const contentBuildMs = elapsedMilliseconds(contentStartedAt);
   const contentQueryStartedAt = performance.now();
   const contentRanking = rank(
@@ -300,15 +304,25 @@ export function evaluateTreatmentQuestion(input, selectedWeights = undefined) {
   const contentQueryMs = elapsedMilliseconds(contentQueryStartedAt);
   const conditions = [{
     conditionId: "content",
-    variants: [{ weight: 0, ranking: contentRanking }],
+    variants: [{
+      weight: 0,
+      ranking: contentRanking,
+      returnedRawSessionBytes: contentRanking.reduce(
+        (sum, entry) => sum + sessionBytes.get(entry.sessionId),
+        0,
+      ),
+    }],
     cost: {
       buildMilliseconds: contentBuildMs,
       queryMilliseconds: contentQueryMs,
       edgeCount: 0,
       edgeBytes: 0,
-      rawSessionBytes: projection.rawSessionBytes,
+      corpusRawSessionBytes: projection.corpusRawSessionBytes,
     },
   }];
+  if (selectedWeights !== undefined) {
+    assertClosedObject(selectedWeights, CONDITION_ORDER.slice(1), "selected weights");
+  }
 
   for (const conditionId of CONDITION_ORDER.slice(1)) {
     const buildStartedAt = performance.now();
@@ -325,10 +339,17 @@ export function evaluateTreatmentQuestion(input, selectedWeights = undefined) {
     if (weights.some((weight) => !ASSOCIATION_WEIGHTS.includes(weight))) {
       throw new TypeError(`Selected weight for ${conditionId} is outside the frozen grid`);
     }
-    const variants = weights.map((weight) => ({
-      weight,
-      ranking: rank(projection.documents, contentScores, associationScores, weight),
-    }));
+    const variants = weights.map((weight) => {
+      const ranking = rank(projection.documents, contentScores, associationScores, weight);
+      return {
+        weight,
+        ranking,
+        returnedRawSessionBytes: ranking.reduce(
+          (sum, entry) => sum + sessionBytes.get(entry.sessionId),
+          0,
+        ),
+      };
+    });
     const queryMilliseconds = elapsedMilliseconds(queryStartedAt);
     conditions.push({
       conditionId,
@@ -338,13 +359,13 @@ export function evaluateTreatmentQuestion(input, selectedWeights = undefined) {
         queryMilliseconds,
         edgeCount: graph.edges.size,
         edgeBytes: graph.canonicalBytes,
-        rawSessionBytes: projection.rawSessionBytes,
+        corpusRawSessionBytes: projection.corpusRawSessionBytes,
       },
     });
   }
 
   return Object.freeze({
-    schemaVersion: "memory-longmemeval-retrieval/treatment-result-v2",
+    schemaVersion: "memory-longmemeval-retrieval/treatment-result-v3",
     questionId: projection.questionId,
     conditions: Object.freeze(conditions),
     totalMilliseconds: elapsedMilliseconds(totalStartedAt),

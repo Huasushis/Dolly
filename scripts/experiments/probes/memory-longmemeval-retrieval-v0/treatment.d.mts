@@ -28,20 +28,21 @@ export interface TreatmentRankingEntry {
 }
 
 export interface TreatmentResult {
-  readonly schemaVersion: "memory-longmemeval-retrieval/treatment-result-v2";
+  readonly schemaVersion: "memory-longmemeval-retrieval/treatment-result-v3";
   readonly questionId: string;
   readonly conditions: readonly {
     readonly conditionId: string;
     readonly variants: readonly {
       readonly weight: number;
       readonly ranking: readonly TreatmentRankingEntry[];
+      readonly returnedRawSessionBytes: number;
     }[];
     readonly cost: {
       readonly buildMilliseconds: number;
       readonly queryMilliseconds: number;
       readonly edgeCount: number;
       readonly edgeBytes: number;
-      readonly rawSessionBytes: number;
+      readonly corpusRawSessionBytes: number;
     };
   }[];
   readonly totalMilliseconds: number;

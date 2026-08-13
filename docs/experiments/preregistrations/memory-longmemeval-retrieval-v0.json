@@ -2,13 +2,13 @@
   "$schema": "./memory-longmemeval-retrieval-v0-schema.json",
   "schemaVersion": "dolly-experiment-preregistration/v1",
   "experimentId": "memory-longmemeval-retrieval-v0",
-  "experimentVersion": 2,
+  "experimentVersion": 3,
   "title": "Gold-blind repeated-position retrieval screen on LongMemEval-S",
   "status": "frozen-before-first-run",
   "scope": "comparative",
   "protocol": {
     "path": "docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-protocol.md",
-    "sha256": "b3f24eeaaf11e247f8908d3b483debf3be21c6b5672d25f52f9d79fd3a6f515e"
+    "sha256": "2031b24421badb5da860461ff0dd718762aa91e7f3e7d661f473a025ef0f7930"
   },
   "authorityReferences": [
     "AGENTS.md",
@@ -295,7 +295,7 @@
     ]
   },
   "artifacts": {
-    "rootPattern": "artifacts/experiments/probes/memory-longmemeval-retrieval-v0",
+    "rootPattern": "artifacts/experiments/probes/memory-longmemeval-retrieval-v0/runs/<runId>",
     "requiredFiles": [
       "run-freeze.json",
       "preregistration.json",
@@ -306,18 +306,20 @@
       "evaluation-rankings.jsonl",
       "analysis.json",
       "run-manifest.json",
-      "sha256sums.txt",
       "validation.json",
-      "mutation-validation.json"
+      "mutation-validation.json",
+      "sha256sums.txt"
     ],
     "runManifestFields": [
       "experimentId",
       "experimentVersion",
+      "attemptStatus",
       "protocolSha256",
       "preregistrationSha256",
       "datasetSha256",
       "sourceCommit",
       "dirtyWorktree",
+      "relevantSourcesClean",
       "configuration",
       "dataset",
       "modelEndpointCapabilityProfile",
@@ -346,14 +348,14 @@
       "Prove treatment input and output artifacts contain no answer, answer-session identifiers, question type, has_answer, dates, inferred gold, or record-role fields; physical timing is audited but not expected to reproduce exactly."
     ],
     "mutationTests": [
-      "Swap one gold answer-session identifier and require metric or dataset-identity rejection.",
-      "Inject question_type into one treatment input projection and require isolation rejection.",
-      "Change one supplied message position before edge construction and require ranking or source-hash rejection.",
-      "Remove one ranking row and require coverage rejection.",
-      "Change one selected development weight outside the deterministic selection and require rejection.",
-      "Forge one aggregate NDCG value and require independent metric rejection.",
-      "Remove one checksum inventory entry and require artifact rejection.",
-      "Inject one configured secret marker and require leakage rejection."
+      "gold-session-swap changes only split.jsonl, regenerates checksums, and must fail SPLIT_GOLD_SOURCE_MISMATCH.",
+      "projection-forbidden-field injects question_type into only the first case, regenerates checksums, and must fail PROJECTION_UNKNOWN_FIELD.",
+      "projection-message-order swaps one unequal adjacent source-message pair in cases.jsonl, regenerates checksums, and must fail PROJECTION_SOURCE_MISMATCH.",
+      "ranking-row-removed removes the first repeated-position evaluation row, regenerates checksums, and must fail EVALUATION_RANKING_COVERAGE_MISMATCH.",
+      "selected-weight-wrong-grid-member changes repeated-position to another valid grid member, regenerates checksums, and must fail SELECTED_WEIGHT_MISMATCH.",
+      "analysis-ndcg-forged changes repeated-position NDCG@10 by a frozen nonzero amount, regenerates checksums, and must fail ANALYSIS_METRIC_MISMATCH.",
+      "checksum-entry-removed removes only the analysis.json inventory line and must fail CHECKSUM_INVENTORY_SET_MISMATCH.",
+      "secret-marker-injected changes only a schema-permitted manifest string, regenerates checksums, and must fail SECRET_MARKER_LEAK without recording the marker in summaries."
     ]
   },
   "safetyBoundary": {
@@ -366,7 +368,8 @@
     "moduleStartupRefusalMustRemain": true
   },
   "domainDesign": {
-    "implementationStatus": "Version 2 replaces version 1 before the first dataset run. A treatment module and synthetic conformance test exist; the dataset adapter, runner, independent analyzer, mutation harness, formal artifacts, and report do not yet exist, and no retrieval outcome has been inspected under either version.",
+    "implementationStatus": "Version 3 replaces versions 1 and 2 before the first dataset run. The treatment, adapter, runner, independent analyzer, mutation harness, artifact contract, and synthetic conformance tests are frozen together by the source commit containing this preregistration. A formal run must independently prove those bytes equal its clean source commit before ranking. No formal dataset run or retrieval-outcome inspection has occurred under any version at freeze time.",
+    "artifactContract": {"path": "docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-artifacts.md", "sha256": "3a60f3f69a7257243ec9b51306b97265d5f5a9628b2e8bffa12368c05ba9968f"},
     "datasetPath": "test/memory-data/benchmarks/conversation-memory/longmemeval/longmemeval_s",
     "datasetSha256": "08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894",
     "datasetExpectedQuestions": 500,

@@ -1,10 +1,11 @@
 # LongMemEval-S retrieval screen protocol
 
-This version-2 protocol selects or eliminates repeated adjacent-position raw
+This version-3 protocol selects or eliminates repeated adjacent-position raw
 retrieval as a later experiment factor. It does not authorize a Dolly Memory
 index, automatic recall, task resumption, a Module launch, a model call, or a
-network request. Version 2 replaces version 1 before the first dataset run. No
-retrieval outcome was inspected while making this replacement.
+network request. Version 3 replaces versions 1 and 2 before the first dataset
+run so the artifact, checksum, and independent-verification contracts can be
+frozen. No retrieval outcome was inspected while making these replacements.
 
 ## Dataset adapter and gold isolation
 
@@ -84,9 +85,11 @@ set. Query terms are the first occurrences of the resulting question tokens;
 query repetition has no weight. There is no stemming, synonym expansion,
 embedding, language model, or answer-derived feature.
 
-For each unique query term, BM25 uses term frequency in the retrieval unit,
-document frequency across all retained units, `k1=1.2`, `b=0.75`, and
-`ln(1+(N-df+0.5)/(df+0.5))`. Document length is token count, including zero.
+For each unique query term, BM25 contribution uses this exact JavaScript
+binary64 evaluation order:
+`idf * ((tf * (k1+1)) / (tf+k1*(1-b+b*dl/avgdl)))`, where `k1=1.2`, `b=0.75`, and
+`idf=ln(1+(N-df+0.5)/(df+0.5))`. Document length is filtered token count,
+including zero.
 Average length is the sum of lengths divided by `N`; if it is zero, every BM25
 score is exactly zero. All candidates remain rankable even when their score is
 zero.
@@ -146,14 +149,18 @@ decision is therefore sorted index 249. Resampling is unstratified because
 the primary population is the frozen aggregate evaluation set; question-type
 metrics remain descriptive strata.
 
-Normalized raw session bytes are the UTF-8 bytes of the exact NFKC-lowercased
+Corpus raw session bytes are the UTF-8 bytes of the exact NFKC-lowercased
 BM25 session encodings after first-occurrence deduplication. Returned raw bytes
-are the sum for the ten returned units. Canonical graph bytes are UTF-8 JSONL,
+are a separate descriptive sum for the ten returned units and never the ratio
+denominator. Canonical graph bytes are UTF-8 JSONL,
 one admitted edge per line sorted by `left`, then `right` in UTF-16 code-unit
 order, with property order exactly
 `{"left":...,"right":...,"distinctSessions":...}` and LF. The per-question
-edge-to-raw ratio is edge bytes divided by raw bytes; it is zero only when both
-are zero and is positive infinity when raw is zero but edge bytes are not.
+edge-to-raw ratio is edge bytes divided by corpus raw session bytes; it is zero
+only when both are zero and is positive infinity when corpus raw bytes are zero
+but edge bytes are not. Each line uses ECMAScript `JSON.stringify`: Unicode
+letter/number token characters remain literal UTF-8 rather than being rewritten
+as `\uXXXX`; only escapes required by that algorithm are emitted.
 Nearest-rank p50 and p95 use sorted index `ceil(p*n)-1`.
 
 One fixed non-dataset synthetic question warms the JavaScript functions before
