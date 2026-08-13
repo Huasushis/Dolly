@@ -1,4 +1,8 @@
-import type { JsonValue } from "../core/canonical-json.js";
+import {
+  canonicalJsonDigest,
+  deepFreeze,
+  type JsonValue,
+} from "../core/canonical-json.js";
 import {
   createModulePrivateStorageCapabilityV2,
   ModulePrivateStorageBackend,
@@ -7,7 +11,11 @@ import {
 } from "../core/capabilities/module-private-storage-capability.js";
 import type { ExtensionProcessHost } from "../core/extension-process-host.js";
 import { FileToolJournalRepository } from "../core/file-tool-journal-repository.js";
-import type { InstalledExtensionModule } from "../core/installed-extension-module.js";
+import {
+  assertReservedV10InstalledModulePlan,
+  type InstalledExtensionModule,
+  type ReservedV10InstalledModulePlan,
+} from "../core/installed-extension-module.js";
 import type {
   ChatModelBrokerOptions,
   ModelInvocationBudgets,
@@ -41,8 +49,13 @@ import {
 } from "../core/tool-policy.js";
 
 const POLICY_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,254}[A-Za-z0-9])?$/u;
+const POLICY_REVISION_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const setups = new WeakSet<InstalledModulePermissionPolicySetup>();
 const SETUP_TOKEN = Symbol("installed-module-permission-policy-setup");
+const RESERVED_V10_POLICY_SELECTIONS = new WeakMap<
+  object,
+  readonly InstalledModulePermissionPolicy[]
+>();
 
 /**
  * One operator-selected policy for chat generation. The ordinary meaning of
@@ -125,6 +138,21 @@ export interface InstalledModulePermissionPolicyRegistryOptions {
   readonly nextRequestId?: () => string;
 }
 
+export interface ReservedV10InstalledPermissionPolicyRevision {
+  readonly policyId: string;
+  readonly revision: string;
+  readonly policy: InstalledModulePermissionPolicy;
+}
+
+export interface ReservedV10InstalledPermissionPolicyRegistryOptions {
+  readonly policies: readonly ReservedV10InstalledPermissionPolicyRevision[];
+}
+
+export interface ReservedV10InstalledPermissionPolicySelection {
+  readonly snapshot: JsonValue;
+  readonly selectionDigest: string;
+}
+
 export interface InstalledModulePermissionPolicySetupSnapshot {
   readonly instanceId: string;
   readonly moduleId: string;
@@ -162,6 +190,12 @@ export interface InstalledModulePermissionPolicySetupSnapshot {
 function assertIdentifier(value: string, label: string): void {
   if (!POLICY_ID_PATTERN.test(value)) {
     throw new TypeError(`${label} must be a finite policy identifier`);
+  }
+}
+
+function assertPolicyRevision(value: string, label: string): void {
+  if (!POLICY_REVISION_PATTERN.test(value)) {
+    throw new TypeError(`${label} must be a canonical SHA-256 revision`);
   }
 }
 
@@ -842,6 +876,115 @@ export class InstalledModulePermissionPolicyRegistry {
       this.#now,
       this.#nextRequestId,
       options.modelMediaResolver,
+    );
+  }
+}
+
+/**
+ * Resolves the exact versioned policy references in a resolver-minted v10
+ * installed plan. This registry intentionally does not persist policies and
+ * does not configure a Host; it closes only revision selection and provenance.
+ */
+export class ReservedV10InstalledPermissionPolicyRegistry {
+  readonly #policies = new Map<string, InstalledModulePermissionPolicy>();
+
+  constructor(options: ReservedV10InstalledPermissionPolicyRegistryOptions) {
+    const optionKeys = Object.keys(options);
+    if (optionKeys.length !== 1 || optionKeys[0] !== "policies") {
+      throw new TypeError(
+        "Reserved version-10 permission policy registry options must contain only policies",
+      );
+    }
+    if (!Array.isArray(options.policies)) {
+      throw new TypeError("Reserved version-10 permission policies must be an array");
+    }
+    for (const supplied of options.policies) {
+      if (
+        supplied === null ||
+        typeof supplied !== "object" ||
+        Array.isArray(supplied) ||
+        Object.keys(supplied).sort().join(",") !== "policy,policyId,revision"
+      ) {
+        throw new TypeError(
+          "Reserved version-10 permission policy revision must be a closed object",
+        );
+      }
+      assertIdentifier(supplied.policyId, "policyId");
+      assertPolicyRevision(supplied.revision, "revision");
+      if (supplied.policy.policyId !== supplied.policyId) {
+        throw new TypeError(
+          "Reserved version-10 policy implementation does not match its policyId",
+        );
+      }
+      const key = `${supplied.policyId}\u0000${supplied.revision}`;
+      if (this.#policies.has(key)) {
+        throw new TypeError(
+          `Duplicate reserved version-10 permission policy ${supplied.policyId}@${supplied.revision}`,
+        );
+      }
+      this.#policies.set(key, immutablePolicy(supplied.policy));
+    }
+  }
+
+  resolveFor(
+    installed: ReservedV10InstalledModulePlan,
+  ): ReservedV10InstalledPermissionPolicySelection {
+    assertReservedV10InstalledModulePlan(installed);
+    const policies = installed.module.permissionPolicyReferences.map((reference) => {
+      const policy = this.#policies.get(`${reference.policyId}\u0000${reference.revision}`);
+      if (policy === undefined) {
+        throw new TypeError(
+          `Reserved version-10 permission policy ${reference.policyId}@${reference.revision} is not registered`,
+        );
+      }
+      return policy;
+    });
+    const snapshot = deepFreeze({
+      schemaVersion: "dolly.reserved-v10-permission-policy-selection/1",
+      instanceId: installed.instanceId,
+      moduleId: installed.module.moduleId,
+      installedPlanDigest: installed.provenanceDigest,
+      packageDigest: installed.installation.packageDigest,
+      configurationDigest: installed.configuration.configurationDigest,
+      policies: installed.module.permissionPolicyReferences.map((reference, index) => ({
+        policyId: reference.policyId,
+        revision: reference.revision,
+        kind: policies[index]!.kind,
+      })),
+    } satisfies JsonValue);
+    const selection = Object.freeze({
+      snapshot,
+      selectionDigest: canonicalJsonDigest(snapshot),
+    });
+    RESERVED_V10_POLICY_SELECTIONS.set(selection, Object.freeze(policies));
+    return selection;
+  }
+}
+
+/** Rejects forged or stale v10 policy selections at later composition seams. */
+export function assertReservedV10InstalledPermissionPolicySelection(
+  selection: unknown,
+  installed: ReservedV10InstalledModulePlan,
+): asserts selection is ReservedV10InstalledPermissionPolicySelection {
+  assertReservedV10InstalledModulePlan(installed);
+  if (
+    selection === null ||
+    typeof selection !== "object" ||
+    !RESERVED_V10_POLICY_SELECTIONS.has(selection)
+  ) {
+    throw new TypeError(
+      "Reserved version-10 permission policy selection was not minted by its revision registry",
+    );
+  }
+  const snapshot = (selection as ReservedV10InstalledPermissionPolicySelection).snapshot;
+  if (
+    snapshot === null ||
+    typeof snapshot !== "object" ||
+    Array.isArray(snapshot) ||
+    Reflect.get(snapshot, "installedPlanDigest") !== installed.provenanceDigest
+  ) {
+    throw new TypeError(
+      "Reserved version-10 permission policy selection does not match its installed Module plan",
     );
   }
 }

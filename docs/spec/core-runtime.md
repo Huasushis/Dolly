@@ -836,6 +836,18 @@ record, write Core state, or start a launcher. A later process-record version
 must bind this provenance to those store-resolved policy records and startup
 recovery. The public Module startup refusal remains in force.
 
+`ReservedV10InstalledPermissionPolicyRegistry` closes only the next selection
+rule for candidate composition: every configured `(policyId, revision)` pair
+must exactly match one operator-provided implementation, duplicate revisions
+are rejected, and the resulting authority object is bound to the installed
+plan, package, and configuration digests. A structural copy is not authority.
+This registry is deliberately in-process and is not the durable policy store
+required for product activation; its caller-supplied revision label is not
+proof that policy implementation bytes were persisted under that digest. Until
+such a store resolves immutable records and its revision enters the future
+process record, this selection can support conformance wiring only and cannot
+remove the bootstrap refusal.
+
 The three version-9 Scheduler intervals keep their existing bounds:
 `pollIntervalMs` is at most 60,000, `retryBaseMs` is at most 3,600,000, and
 `retryMaxMs` is at most 86,400,000, with retry maximum no smaller than retry

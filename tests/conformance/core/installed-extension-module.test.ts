@@ -23,9 +23,14 @@ import {
   defaultLauncherScriptPath,
 } from "../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
 import {
+  assertReservedV10InstalledPermissionPolicySelection,
+  ReservedV10InstalledPermissionPolicyRegistry,
+} from "../../../src/adapters/installed-module-permission-policy.js";
+import {
   canonicalJsonDigest,
   type JsonValue,
 } from "../../../src/core/canonical-json.js";
+import { ModulePrivateStorageBackend } from "../../../src/core/capabilities/module-private-storage-capability.js";
 import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
 import { ExtensionInstallationRegistry } from "../../../src/core/extension-installation-registry.js";
 import {
@@ -460,6 +465,70 @@ describe("installed Extension Module resolution", () => {
     expect(() => deriveReservedV10InstalledLinuxModuleExecutionPlan({
       ...resolved,
     })).toThrow(/not minted by the store-bound resolver/u);
+
+    const policyRevision = `sha256:${"2".repeat(64)}`;
+    const policyRegistry = new ReservedV10InstalledPermissionPolicyRegistry({
+      policies: [{
+        policyId: "model.primary",
+        revision: policyRevision,
+        policy: {
+          kind: "module-private-storage",
+          policyId: "model.primary",
+          backend: new ModulePrivateStorageBackend({
+            root: resolve(scratch, "reserved-v10-storage"),
+            now: () => "2026-08-13T00:00:00.000Z",
+          }),
+          operations: ["get"],
+          limits: {
+            maxKeyBytes: 128,
+            maxValueBytes: 1024,
+            maxEntries: 16,
+            maxTotalBytes: 8192,
+            maxListResults: 16,
+            maxArgumentBytes: 1024,
+            maxResultBytes: 4096,
+            maxInvocations: 4,
+            maxInvocationsPerRun: 1,
+          },
+          capabilityLifetimeMs: 10_000,
+        },
+      }],
+    });
+    const policySelection = policyRegistry.resolveFor(resolved);
+    expect(policySelection.snapshot).toEqual(expect.objectContaining({
+      installedPlanDigest: resolved.provenanceDigest,
+      packageDigest: installed.packageDigest,
+      configurationDigest: configuration.configurationDigest,
+      policies: [{
+        policyId: "model.primary",
+        revision: policyRevision,
+        kind: "module-private-storage",
+      }],
+    }));
+    expect(policySelection.selectionDigest)
+      .toBe(canonicalJsonDigest(policySelection.snapshot));
+    expect(() => assertReservedV10InstalledPermissionPolicySelection(
+      { ...policySelection },
+      resolved,
+    )).toThrow(/not minted by its revision registry/u);
+
+    const otherRevision = resolveReservedV10InstalledModulePlan({
+      instanceConfiguration: reservedV10InstanceConfiguration(
+        "10.0.0",
+        configuration.revision,
+        {
+          permissionPolicyReferences: [{
+            policyId: "model.primary",
+            revision: `sha256:${"3".repeat(64)}`,
+          }],
+        },
+      ),
+      moduleId: "worker",
+      installations,
+      configurations,
+    });
+    expect(() => policyRegistry.resolveFor(otherRevision))
+      .toThrow(/model\.primary@sha256:3{64} is not registered/u);
 
     const changedLimit = resolveReservedV10InstalledModulePlan({
       instanceConfiguration: reservedV10InstanceConfiguration(
