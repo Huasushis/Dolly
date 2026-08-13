@@ -1,0 +1,400 @@
+{
+  "$schema": "./memory-longmemeval-retrieval-v0-schema.json",
+  "schemaVersion": "dolly-experiment-preregistration/v1",
+  "experimentId": "memory-longmemeval-retrieval-v0",
+  "experimentVersion": 1,
+  "title": "Gold-blind repeated-position retrieval screen on LongMemEval-S",
+  "status": "frozen-before-first-run",
+  "scope": "comparative",
+  "protocol": {
+    "path": "docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-protocol.md",
+    "sha256": "6eac98255e9f5cc35fc81dc211865d69968653b90f582d751b0a2f44d49de048"
+  },
+  "authorityReferences": [
+    "AGENTS.md",
+    ".qoder/specs/dolly_new.txt lines 91-117 and 180",
+    ".qoder/specs/dolly_owner_addendum_20260801.txt",
+    "docs/spec/memory-extension.md sections 10, 14, and 17",
+    "docs/research/memory-task-state-confirmation-v0.md",
+    "docs/research/memory-factorial-v0-design.md"
+  ],
+  "definitions": {
+    "retrieval unit": "One supplied LongMemEval haystack session identified by its supplied session identifier and containing its ordered role/content messages.",
+    "repeated adjacent-position association": "An unordered token-pair edge supported by adjacent messages in at least two distinct supplied sessions; it is association evidence, never causal evidence.",
+    "gold-blind treatment projection": "Question text plus ordered session identifiers and ordered role/content messages, excluding answer, answer-session identifiers, question type, and inferred role labels.",
+    "content retrieval": "BM25 ranking over the exact same normalized session corpus without any association edge.",
+    "public Agent experiment": "A future separately preregistered evaluation on a revision-pinned public model; this retrieval-only run is not that experiment."
+  },
+  "question": "Under the same raw session corpus and returned-session count, does repeated adjacent-position association improve held-out answer-session retrieval over content BM25, recurrence without position, and shuffled-position controls without unacceptable knowledge-update errors or index cost?",
+  "hypotheses": {
+    "primary": [
+      {
+        "id": "h1-position-over-content",
+        "statement": "Repeated adjacent-position evaluation NDCG@10 exceeds content BM25 by at least 0.02 absolute and its paired bootstrap lower 95 percent bound is greater than zero.",
+        "outcomeMeasure": "ndcg-at-10"
+      },
+      {
+        "id": "h2-position-specificity",
+        "statement": "Repeated adjacent-position evaluation NDCG@10 separately exceeds recurrence without position and shuffled position by at least 0.02 absolute with each paired lower bound greater than zero.",
+        "outcomeMeasure": "position-specificity"
+      }
+    ],
+    "guardrails": [
+      {
+        "id": "g1-knowledge-update",
+        "statement": "Repeated adjacent-position top-one error on knowledge-update questions is no more than 0.02 absolute worse than content BM25.",
+        "outcomeMeasure": "knowledge-update-top1-error"
+      },
+      {
+        "id": "g2-index-cost",
+        "statement": "Repeated adjacent-position p95 build is at most 500 milliseconds, p95 query is at most 50 milliseconds, and p95 edge bytes are at most twice normalized raw session bytes.",
+        "outcomeMeasure": "association-cost"
+      },
+      {
+        "id": "g3-gold-isolation",
+        "statement": "Treatment indexing, graph construction, development scoring inputs, and ranking never receive answer, answer-session identifiers, question type, inferred gold, or record-role labels.",
+        "outcomeMeasure": "forbidden-field-access"
+      }
+    ]
+  },
+  "decision": {
+    "currentProductState": "The latest private-Aether task-state result rejected association raw, checkpoints, and their composition. Raw association remains only a retrieval hypothesis because its prior packets were built from known record roles. Automatic recall is unimplemented and rejected by configuration.",
+    "changesIfSupported": [
+      "Retain repeated adjacent-position raw retrieval only as a factor in a separately preregistered public revision-pinned Agent experiment.",
+      "Keep retrieval explicit, source-cited, bounded, independently deletable, and disabled by default.",
+      "Do not carry the rejected checkpoint or checkpoint-plus-raw representations into that experiment."
+    ],
+    "changesIfRejected": [
+      "Do not implement a repeated-position association index in Dolly Memory.",
+      "Retain content retrieval while any different retrieval hypothesis requires a new preregistration.",
+      "Do not rescue a valid rejection with prior synthetic or private-Aether results."
+    ],
+    "prohibitedClaims": [
+      "This retrieval-only run cannot establish language-model, Agent, Memory product, or automatic-resume efficacy.",
+      "Repeated proximity is not position semantics or causal inference.",
+      "A supported retrieval result cannot enable automatic injection, tool execution, task resumption, or a Module launch.",
+      "No result may remove, weaken, or bypass the public Module startup refusal."
+    ]
+  },
+  "conditions": {
+    "baselines": [
+      {
+        "id": "content",
+        "description": "BM25 ranks the exact normalized session corpus without an association graph.",
+        "frozenParameters": {
+          "k1": 1.2,
+          "b": 0.75,
+          "idf": "ln(1+(N-df+0.5)/(df+0.5))",
+          "associationWeight": 0
+        }
+      }
+    ],
+    "treatments": [
+      {
+        "id": "recurrence-no-position",
+        "description": "BM25 is augmented by token-pair recurrence across any two distinct messages in a session with position ignored.",
+        "frozenParameters": {
+          "minimumDistinctSessions": 2,
+          "maximumMessageDistance": "unbounded",
+          "weightGrid": [0.25, 0.5, 1, 2]
+        }
+      },
+      {
+        "id": "repeated-adjacent-position",
+        "description": "BM25 is augmented only by token-pair recurrence from supplied adjacent messages in at least two sessions.",
+        "frozenParameters": {
+          "minimumDistinctSessions": 2,
+          "maximumMessageDistance": 1,
+          "weightGrid": [0.25, 0.5, 1, 2]
+        }
+      },
+      {
+        "id": "shuffled-position",
+        "description": "Messages are deterministically shuffled inside each session before applying the identical adjacent-position edge rule.",
+        "frozenParameters": {
+          "minimumDistinctSessions": 2,
+          "maximumMessageDistance": 1,
+          "shuffleSeed": "first 32 bits of SHA-256(question_id, NUL, session_id, NUL, position-shuffle)",
+          "weightGrid": [0.25, 0.5, 1, 2]
+        }
+      }
+    ]
+  },
+  "data": {
+    "generatorOrDataset": {
+      "id": "longmemeval-s",
+      "version": "sha256-08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894",
+      "contentDefinition": "The local MIT-licensed LongMemEval-S file contains exactly 500 questions, each with question text, ordered haystack sessions, supplied session identifiers, answer text, answer-session identifiers, and question type. Only the closed gold-blind projection enters treatment code."
+    },
+    "training": {
+      "name": "training-unused",
+      "seeds": [0, 1],
+      "caseFactors": [
+        "No training rows or fitted model exist; these two identifiers are reserved and unused."
+      ]
+    },
+    "development": {
+      "name": "development",
+      "seeds": [1296387376, 1886352176],
+      "caseFactors": [
+        "Within each question type, the first floor(0.30*n) rows after the frozen SHA-256 sort.",
+        "Select one association weight per treatment by macro NDCG@10 and break ties toward the smaller weight."
+      ]
+    },
+    "evaluation": {
+      "name": "evaluation",
+      "seeds": [1296387377, 1886352177],
+      "caseFactors": [
+        "All remaining rows after the frozen stratified development split.",
+        "Exactly four rankings and metrics at cutoffs one, five, and ten for every evaluation question."
+      ]
+    },
+    "splitIsolation": "Question type is read only by the split driver. The driver persists split membership, then creates a new closed treatment projection without question type, answer, answer-session identifiers, inferred gold, or record-role labels. Development selects only weights; evaluation cannot change any rule.",
+    "tuningUsesTrainingAndDevelopmentOnly": true
+  },
+  "backend": {
+    "allowedKinds": ["local"],
+    "requiredKind": "local",
+    "silentFallbackAllowed": false,
+    "credentialsRequired": false,
+    "networkRequired": false
+  },
+  "randomness": {
+    "generator": "xorshift32 only for deterministic message shuffling and paired bootstrap resampling",
+    "generatorVersion": "1",
+    "streamSeparation": "Position shuffle seeds are independently derived per question and session from SHA-256. The paired bootstrap uses the fixed xorshift32 seed 1296387376 and consumes no shuffle state.",
+    "executionOrder": "Question rows use UTF-16 code-unit ascending question_id and conditions use content, recurrence-no-position, repeated-adjacent-position, then shuffled-position. Rankings use the frozen score and identifier tie break.",
+    "repetitionsPerCase": 1
+  },
+  "metrics": {
+    "primary": {
+      "name": "ndcg-at-10",
+      "unit": "binary-relevance NDCG per question",
+      "aggregation": "Macro mean by condition and exact paired condition differences with a 10000-resample percentile bootstrap.",
+      "direction": "maximize",
+      "population": "Every held-out evaluation question with at least one supplied answer-session identifier."
+    },
+    "secondary": [
+      {
+        "name": "answer-session-recall",
+        "unit": "fraction of distinct gold sessions",
+        "aggregation": "Macro mean reported separately at cutoffs one, five, and ten by split and condition.",
+        "direction": "maximize",
+        "population": "All development and evaluation questions with nonempty answer-session identifiers."
+      },
+      {
+        "name": "any-answer-session-hit",
+        "unit": "binary per question",
+        "aggregation": "Macro mean reported separately at cutoffs one, five, and ten by split and condition.",
+        "direction": "maximize",
+        "population": "All development and evaluation questions with nonempty answer-session identifiers."
+      },
+      {
+        "name": "position-specificity",
+        "unit": "paired NDCG@10 difference",
+        "aggregation": "Repeated adjacent-position minus recurrence-no-position and minus shuffled-position, each with mean and percentile confidence bounds.",
+        "direction": "maximize",
+        "population": "Every held-out evaluation question."
+      }
+    ],
+    "guardrails": [
+      {
+        "name": "knowledge-update-top1-error",
+        "unit": "binary per knowledge-update question",
+        "aggregation": "Macro error rate by condition and repeated-position minus content absolute difference.",
+        "direction": "minimize",
+        "population": "Held-out evaluation questions whose split metadata question_type is knowledge-update; treatment never receives the type."
+      },
+      {
+        "name": "association-cost",
+        "unit": "milliseconds and bytes per question",
+        "aggregation": "Nearest-rank p50 and p95 for build milliseconds, query milliseconds, canonical edge bytes, normalized raw session bytes, and returned raw session bytes.",
+        "direction": "minimize",
+        "population": "All held-out evaluation questions for each treatment condition."
+      },
+      {
+        "name": "forbidden-field-access",
+        "unit": "count",
+        "aggregation": "Count treatment inputs or treatment outputs containing answer, answer-session identifiers, question type, inferred gold, or record-role labels.",
+        "direction": "zero",
+        "population": "Every development and evaluation treatment invocation."
+      }
+    ],
+    "minimumEffect": {
+      "metric": "ndcg-at-10",
+      "magnitude": 0.02,
+      "scale": "absolute",
+      "confidenceLevel": 0.95,
+      "intervalMethod": "Paired nonparametric percentile bootstrap over evaluation question identifiers with 10000 resamples from xorshift32 seed 1296387376.",
+      "comparison": "Repeated adjacent-position minus each of content, recurrence-no-position, and shuffled-position on identical evaluation questions."
+    }
+  },
+  "execution": {
+    "factorialDesign": "Five hundred fixed LongMemEval-S questions are crossed with four retrieval conditions; development and evaluation membership is fixed before treatment projection.",
+    "casePlan": [
+      {
+        "id": "development-ranking",
+        "phase": "development",
+        "maximumCount": 600,
+        "requiredWhen": "Always required before an association weight can be selected or any evaluation result can be inspected.",
+        "formula": "at most 150 development questions * 4 conditions"
+      },
+      {
+        "id": "evaluation-ranking",
+        "phase": "evaluation",
+        "maximumCount": 1400,
+        "requiredWhen": "Required after development selections are persisted and before a supported or rejected classification.",
+        "formula": "at least 350 evaluation questions * 4 conditions"
+      }
+    ],
+    "plannedMaximumCases": 2000,
+    "maxCases": 2000,
+    "maxEventsPerCase": 10,
+    "maxRawRecordsPerCase": 66,
+    "maxVirtualTimeMsPerCase": 1,
+    "maxWallClockMs": 1800000,
+    "failurePolicy": "Any dataset, protocol, preregistration, split, coverage, treatment-projection, numeric, resource, artifact-hash, independent-verification, or mutation mismatch makes the run inconclusive and prevents an efficacy classification.",
+    "retryPolicy": "There are no external calls and no retries; each question-condition ranking is computed and persisted exactly once."
+  },
+  "stoppingRules": {
+    "plannedCompletion": "Persist the registered source hashes and split, complete every development ranking, persist all selected weights, complete every evaluation ranking without efficacy peeking, write checksums, independently verify, and reject every declared mutation.",
+    "earlyEfficacyStopAllowed": false,
+    "abortConditions": [
+      "Dataset length, identifiers, field shape, or SHA-256 differs from the frozen LongMemEval-S identity.",
+      "Treatment code receives or emits a forbidden gold or role field.",
+      "Any condition, split, question-condition row, selected weight, ranking cutoff, raw cost record, or required artifact is missing or duplicated.",
+      "Wall clock exceeds 1800000 milliseconds or resident memory exceeds 4294967296 bytes.",
+      "Any network request, model call, credential read, product runtime, installed Module, or paid service is attempted.",
+      "The independent analyzer imports treatment tokenization, BM25, association, shuffle, ranking, or metric code."
+    ]
+  },
+  "decisionRules": {
+    "classificationOrder": "Validate registered bytes, dataset identity, split, gold-blind projection, complete rankings, finite costs, checksums, independent recomputation, and mutation rejection before inspecting any useful-effect or cost threshold.",
+    "supported": [
+      "Retain repeated adjacent-position retrieval for a public Agent experiment only if its evaluation NDCG@10 mean gain is at least 0.02 and paired lower 95 percent bound is above zero against content, recurrence-no-position, and shuffled-position separately.",
+      "The knowledge-update top-one error difference versus content must be at most 0.02, p95 build at most 500 milliseconds, p95 query at most 50 milliseconds, and p95 canonical edge bytes at most twice normalized raw session bytes.",
+      "All structural, isolation, checksum, independent-verification, and mutation gates must pass."
+    ],
+    "rejected": [
+      "A structurally valid miss of any useful-effect, specificity, knowledge-update, or cost threshold eliminates this repeated-position association-index design.",
+      "Prior synthetic or private-Aether results cannot reverse the rejection."
+    ],
+    "inconclusive": [
+      "Any earlier structural, isolation, resource, checksum, independent-verification, or mutation failure prevents a supported or rejected classification.",
+      "A valid retrieval result cannot be promoted to an Agent, product Memory, automatic recall, task-resume, or Module-support claim."
+    ]
+  },
+  "artifacts": {
+    "rootPattern": "artifacts/experiments/probes/memory-longmemeval-retrieval-v0",
+    "requiredFiles": [
+      "run-freeze.json",
+      "preregistration.json",
+      "split.jsonl",
+      "cases.jsonl",
+      "development-rankings.jsonl",
+      "selected-weights.json",
+      "evaluation-rankings.jsonl",
+      "analysis.json",
+      "run-manifest.json",
+      "sha256sums.txt",
+      "validation.json",
+      "mutation-validation.json"
+    ],
+    "runManifestFields": [
+      "experimentId",
+      "experimentVersion",
+      "protocolSha256",
+      "preregistrationSha256",
+      "datasetSha256",
+      "sourceCommit",
+      "dirtyWorktree",
+      "configuration",
+      "dataset",
+      "modelEndpointCapabilityProfile",
+      "modelIdentifier",
+      "backend",
+      "seeds",
+      "executionOrder",
+      "resourceBudgets",
+      "perCaseAccounting",
+      "rawOutputs",
+      "validatorResults",
+      "aggregateMetrics",
+      "startedAt",
+      "finishedAt",
+      "failure"
+    ]
+  },
+  "independentValidation": {
+    "analyzerPath": "scripts/experiments/probes/memory-longmemeval-retrieval-v0/verify.mjs",
+    "readsOnlyArtifacts": false,
+    "importsTreatmentImplementation": false,
+    "requiredChecks": [
+      "Read the registered local dataset only to verify its byte hash, shape, split metadata, and ranking relevance independently of treatment code.",
+      "Recompute the exact stratified hash split, treatment projection closure, tokenizer, BM25, all three association graphs, deterministic shuffle, development weight selection, rankings, metrics, bootstrap, costs, and decision.",
+      "Verify 500 unique questions, the closed condition set, one row per question-condition, exact cutoff rankings, finite numbers, selected weights from the frozen grid, all required artifact hashes, and absence of configured secret values or URLs.",
+      "Prove treatment input and output artifacts contain no answer, answer-session identifiers, question type, inferred gold, or record-role fields."
+    ],
+    "mutationTests": [
+      "Swap one gold answer-session identifier and require metric or dataset-identity rejection.",
+      "Inject question_type into one treatment input projection and require isolation rejection.",
+      "Change one supplied message position before edge construction and require ranking or source-hash rejection.",
+      "Remove one ranking row and require coverage rejection.",
+      "Change one selected development weight outside the deterministic selection and require rejection.",
+      "Forge one aggregate NDCG value and require independent metric rejection.",
+      "Remove one checksum inventory entry and require artifact rejection.",
+      "Inject one configured secret marker and require leakage rejection."
+    ]
+  },
+  "safetyBoundary": {
+    "productRuntimeUsed": false,
+    "moduleLaunchAllowed": false,
+    "networkAccessAllowed": false,
+    "privateDataAllowed": false,
+    "paidServicesAllowed": false,
+    "knownP0PathReachable": false,
+    "moduleStartupRefusalMustRemain": true
+  },
+  "domainDesign": {
+    "implementationStatus": "Only this protocol and preregistration are frozen. The treatment runner, independent analyzer, mutation harness, formal artifacts, and report do not yet exist, and no dataset result has been inspected under this version.",
+    "datasetPath": "test/memory-data/benchmarks/conversation-memory/longmemeval/longmemeval_s",
+    "datasetSha256": "08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894",
+    "datasetExpectedQuestions": 500,
+    "datasetObservedSessionCountRangeBeforeFreeze": [39, 66],
+    "splitProcedure": "Within each question_type sort by SHA-256 of UTF-8 question_type, NUL, question_id; development is first floor(0.30*n), evaluation is the remainder.",
+    "treatmentProjectionFields": ["question_id", "question", "haystack_session_ids", "haystack_sessions"],
+    "forbiddenTreatmentFields": ["answer", "answer_session_ids", "question_type", "inferredGold", "recordRole"],
+    "sessionEncoding": "For each supplied message in supplied order, lowercase role, colon-space, exact content, LF; apply Unicode NFKC and Unicode lowercase before tokenization.",
+    "tokenization": {
+      "pattern": "maximal Unicode letter-or-number sequences",
+      "minimumCodePoints": 2,
+      "stemming": false,
+      "synonyms": false,
+      "stopWords": ["a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have", "i", "in", "is", "it", "my", "of", "on", "or", "that", "the", "this", "to", "was", "were", "what", "when", "where", "which", "who", "why", "with", "you", "your"]
+    },
+    "associationScore": "For a candidate session, maximum admitted edge score between a query token and a candidate token absent from the query; final score BM25 plus selected weight times association score.",
+    "tieBreak": "Higher final score, higher association score, higher BM25, then UTF-16 code-unit ascending session identifier.",
+    "cutoffs": [1, 5, 10],
+    "bootstrap": {
+      "generator": "xorshift32",
+      "seed": 1296387376,
+      "resamples": 10000,
+      "bounds": [0.025, 0.975]
+    },
+    "resourceBudgets": {
+      "maximumWallClockMs": 1800000,
+      "maximumResidentBytes": 4294967296,
+      "maximumCases": 2000,
+      "maximumSessionsPerQuestion": 66,
+      "networkCalls": 0,
+      "modelCalls": 0,
+      "paidCalls": 0
+    },
+    "remainingOutsideScope": [
+      "Language-model answer quality, reasoning, context assembly, strict SSE, tool use, and public model reproducibility",
+      "Dolly Memory persistence, deletion, namespace isolation, Scheduler integration, restart recovery, and installed Module launch",
+      "Automatic recall, automatic task resumption, checkpoint representations, generated summaries, and checkpoint-plus-raw composition",
+      "Multimodal Memory, emotion or desire mechanisms, long-term summarization, skills, and causal claims"
+    ]
+  }
+}

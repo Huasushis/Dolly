@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.invalid/schemas/memory-longmemeval-retrieval-v0-schema.json",
+  "title": "LongMemEval-S retrieval screen preregistration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "experimentId",
+    "experimentVersion",
+    "title",
+    "status",
+    "scope",
+    "protocol",
+    "authorityReferences",
+    "definitions",
+    "question",
+    "hypotheses",
+    "decision",
+    "conditions",
+    "data",
+    "backend",
+    "randomness",
+    "metrics",
+    "execution",
+    "stoppingRules",
+    "decisionRules",
+    "artifacts",
+    "independentValidation",
+    "safetyBoundary",
+    "domainDesign"
+  ],
+  "properties": {
+    "$schema": { "const": "./memory-longmemeval-retrieval-v0-schema.json" },
+    "schemaVersion": { "const": "dolly-experiment-preregistration/v1" },
+    "experimentId": { "const": "memory-longmemeval-retrieval-v0" },
+    "experimentVersion": { "const": 1 },
+    "title": { "type": "string", "minLength": 20 },
+    "status": { "const": "frozen-before-first-run" },
+    "scope": { "const": "comparative" },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "const": "docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-protocol.md" },
+        "sha256": { "const": "6eac98255e9f5cc35fc81dc211865d69968653b90f582d751b0a2f44d49de048" }
+      }
+    },
+    "authorityReferences": { "type": "array", "minItems": 4, "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "definitions": { "type": "object", "minProperties": 4 },
+    "question": { "type": "string", "minLength": 40 },
+    "hypotheses": { "$ref": "#/$defs/nonemptyObject" },
+    "decision": { "$ref": "#/$defs/nonemptyObject" },
+    "conditions": { "$ref": "#/$defs/nonemptyObject" },
+    "data": { "$ref": "#/$defs/nonemptyObject" },
+    "backend": { "$ref": "#/$defs/nonemptyObject" },
+    "randomness": { "$ref": "#/$defs/nonemptyObject" },
+    "metrics": { "$ref": "#/$defs/nonemptyObject" },
+    "execution": { "$ref": "#/$defs/nonemptyObject" },
+    "stoppingRules": { "$ref": "#/$defs/nonemptyObject" },
+    "decisionRules": { "$ref": "#/$defs/nonemptyObject" },
+    "artifacts": { "$ref": "#/$defs/nonemptyObject" },
+    "independentValidation": { "$ref": "#/$defs/nonemptyObject" },
+    "safetyBoundary": { "$ref": "#/$defs/nonemptyObject" },
+    "domainDesign": { "$ref": "#/$defs/nonemptyObject" }
+  },
+  "$defs": {
+    "nonemptyObject": { "type": "object", "minProperties": 1 }
+  }
+}
