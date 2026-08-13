@@ -2,13 +2,13 @@
   "$schema": "./memory-longmemeval-retrieval-v0-schema.json",
   "schemaVersion": "dolly-experiment-preregistration/v1",
   "experimentId": "memory-longmemeval-retrieval-v0",
-  "experimentVersion": 1,
+  "experimentVersion": 2,
   "title": "Gold-blind repeated-position retrieval screen on LongMemEval-S",
   "status": "frozen-before-first-run",
   "scope": "comparative",
   "protocol": {
     "path": "docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-protocol.md",
-    "sha256": "6eac98255e9f5cc35fc81dc211865d69968653b90f582d751b0a2f44d49de048"
+    "sha256": "b3f24eeaaf11e247f8908d3b483debf3be21c6b5672d25f52f9d79fd3a6f515e"
   },
   "authorityReferences": [
     "AGENTS.md",
@@ -21,7 +21,7 @@
   "definitions": {
     "retrieval unit": "One supplied LongMemEval haystack session identified by its supplied session identifier and containing its ordered role/content messages.",
     "repeated adjacent-position association": "An unordered token-pair edge supported by adjacent messages in at least two distinct supplied sessions; it is association evidence, never causal evidence.",
-    "gold-blind treatment projection": "Question text plus ordered session identifiers and ordered role/content messages, excluding answer, answer-session identifiers, question type, and inferred role labels.",
+    "gold-blind treatment projection": "A recursively reconstructed object containing only question_id, question, and first-occurrence sessions with session_id plus ordered role/content messages; it excludes answer, answer-session identifiers, question type, has_answer, dates, and inferred labels.",
     "content retrieval": "BM25 ranking over the exact same normalized session corpus without any association edge.",
     "public Agent experiment": "A future separately preregistered evaluation on a revision-pinned public model; this retrieval-only run is not that experiment."
   },
@@ -47,12 +47,12 @@
       },
       {
         "id": "g2-index-cost",
-        "statement": "Repeated adjacent-position p95 build is at most 500 milliseconds, p95 query is at most 50 milliseconds, and p95 edge bytes are at most twice normalized raw session bytes.",
+        "statement": "Repeated adjacent-position p95 per-question canonical-edge-bytes divided by normalized-raw-session-bytes is at most 2. Build and query milliseconds are descriptive environment observations rather than a scientific decision gate.",
         "outcomeMeasure": "association-cost"
       },
       {
         "id": "g3-gold-isolation",
-        "statement": "Treatment indexing, graph construction, development scoring inputs, and ranking never receive answer, answer-session identifiers, question type, inferred gold, or record-role labels.",
+        "statement": "Treatment projection, indexing, graph construction, and ranking never receive answer, answer-session identifiers, question type, has_answer, dates, inferred gold, or record-role labels. Only the separate development selector and analyzer join persisted rankings to distinct gold session identifiers.",
         "outcomeMeasure": "forbidden-field-access"
       }
     ]
@@ -80,12 +80,14 @@
     "baselines": [
       {
         "id": "content",
-        "description": "BM25 ranks the exact normalized session corpus without an association graph.",
+        "description": "BM25 ranks the exact first-occurrence normalized session corpus without an association graph.",
         "frozenParameters": {
           "k1": 1.2,
           "b": 0.75,
           "idf": "ln(1+(N-df+0.5)/(df+0.5))",
-          "associationWeight": 0
+          "associationWeight": 0,
+          "queryTerms": "unique after frozen tokenization",
+          "emptyDocumentRule": "document length zero; if corpus average length is zero every BM25 score is zero"
         }
       }
     ],
@@ -96,7 +98,10 @@
         "frozenParameters": {
           "minimumDistinctSessions": 2,
           "maximumMessageDistance": "unbounded",
-          "weightGrid": [0.25, 0.5, 1, 2]
+          "weightGrid": [0.25, 0.5, 1, 2],
+          "graphScope": "one query-independent graph per question",
+          "edgeValue": 1,
+          "associationTokens": "message content only"
         }
       },
       {
@@ -105,7 +110,10 @@
         "frozenParameters": {
           "minimumDistinctSessions": 2,
           "maximumMessageDistance": 1,
-          "weightGrid": [0.25, 0.5, 1, 2]
+          "weightGrid": [0.25, 0.5, 1, 2],
+          "graphScope": "one query-independent graph per question",
+          "edgeValue": 1,
+          "associationTokens": "message content only"
         }
       },
       {
@@ -114,8 +122,12 @@
         "frozenParameters": {
           "minimumDistinctSessions": 2,
           "maximumMessageDistance": 1,
-          "shuffleSeed": "first 32 bits of SHA-256(question_id, NUL, session_id, NUL, position-shuffle)",
-          "weightGrid": [0.25, 0.5, 1, 2]
+          "shuffleSeed": "first four SHA-256 bytes interpreted unsigned big-endian over UTF-8 question_id, NUL, session_id, NUL, position-shuffle",
+          "shuffleIndex": "floor(nextUint32*(i+1)/4294967296) for Fisher-Yates i descending",
+          "weightGrid": [0.25, 0.5, 1, 2],
+          "graphScope": "one query-independent graph per question",
+          "edgeValue": 1,
+          "associationTokens": "message content only"
         }
       }
     ]
@@ -124,7 +136,7 @@
     "generatorOrDataset": {
       "id": "longmemeval-s",
       "version": "sha256-08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894",
-      "contentDefinition": "The local MIT-licensed LongMemEval-S file contains exactly 500 questions, each with question text, ordered haystack sessions, supplied session identifiers, answer text, answer-session identifiers, and question type. Only the closed gold-blind projection enters treatment code."
+      "contentDefinition": "The local MIT-licensed LongMemEval-S file contains exactly 500 questions. Answer may be text or number. The adapter validates source alignment, first-occurrence session identity, duplicate equality, and gold membership, then recursively constructs the closed gold-blind projection; no original row or message object enters treatment code."
     },
     "training": {
       "name": "training-unused",
@@ -135,21 +147,19 @@
     },
     "development": {
       "name": "development",
-      "seeds": [1296387376, 1886352176],
       "caseFactors": [
-        "Within each question type, the first floor(0.30*n) rows after the frozen SHA-256 sort.",
-        "Select one association weight per treatment by macro NDCG@10 and break ties toward the smaller weight."
+        "Exactly 147 questions: knowledge-update 23, multi-session 39, single-session-assistant 16, single-session-preference 9, single-session-user 21, temporal-reasoning 39.",
+        "The treatment writes 588 condition rows and 1911 weight-specific ranking vectors; a separate gold-aware selector chooses one association weight per treatment by unrounded macro NDCG@10 and breaks exact ties toward the smaller weight."
       ]
     },
     "evaluation": {
       "name": "evaluation",
-      "seeds": [1296387377, 1886352177],
       "caseFactors": [
-        "All remaining rows after the frozen stratified development split.",
-        "Exactly four rankings and metrics at cutoffs one, five, and ten for every evaluation question."
+        "Exactly 353 questions: knowledge-update 55, multi-session 94, single-session-assistant 40, single-session-preference 21, single-session-user 49, temporal-reasoning 94.",
+        "Exactly 1412 condition rows and 1412 ranking vectors at persisted selected weights, with metrics at cutoffs one, five, and ten."
       ]
     },
-    "splitIsolation": "Question type is read only by the split driver. The driver persists split membership, then creates a new closed treatment projection without question type, answer, answer-session identifiers, inferred gold, or record-role labels. Development selects only weights; evaluation cannot change any rule.",
+    "splitIsolation": "Question type is read only by the split driver. The adapter persists membership, recursively reconstructs first-occurrence session objects containing only session_id and role/content messages, and passes no source row or source message object to treatment. The treatment writes rankings before the separate selector receives gold. Evaluation cannot change any rule.",
     "tuningUsesTrainingAndDevelopmentOnly": true
   },
   "backend": {
@@ -160,9 +170,9 @@
     "networkRequired": false
   },
   "randomness": {
-    "generator": "xorshift32 only for deterministic message shuffling and paired bootstrap resampling",
+    "generator": "xorshift32 with JavaScript 32-bit bitwise transitions x^=x<<13, x^=x>>>17, x^=x<<5; shuffle and bootstrap map unsigned output with floor(output*bound/4294967296)",
     "generatorVersion": "1",
-    "streamSeparation": "Position shuffle seeds are independently derived per question and session from SHA-256. The paired bootstrap uses the fixed xorshift32 seed 1296387376 and consumes no shuffle state.",
+    "streamSeparation": "Position shuffle seeds are the first four big-endian digest bytes independently derived per question and session. One unstratified bootstrap index matrix from seed 1296387376 is reused for all three paired contrasts and consumes no shuffle state.",
     "executionOrder": "Question rows use UTF-16 code-unit ascending question_id and conditions use content, recurrence-no-position, repeated-adjacent-position, then shuffled-position. Rankings use the frozen score and identifier tie break.",
     "repetitionsPerCase": 1
   },
@@ -170,7 +180,7 @@
     "primary": {
       "name": "ndcg-at-10",
       "unit": "binary-relevance NDCG per question",
-      "aggregation": "Macro mean by condition and exact paired condition differences with a 10000-resample percentile bootstrap.",
+        "aggregation": "Binary relevance over distinct gold and returned session identifiers; macro mean by condition and exact paired condition differences with one shared 10000-resample unstratified nearest-rank percentile bootstrap.",
       "direction": "maximize",
       "population": "Every held-out evaluation question with at least one supplied answer-session identifier."
     },
@@ -208,14 +218,14 @@
       {
         "name": "association-cost",
         "unit": "milliseconds and bytes per question",
-        "aggregation": "Nearest-rank p50 and p95 for build milliseconds, query milliseconds, canonical edge bytes, normalized raw session bytes, and returned raw session bytes.",
+        "aggregation": "Nearest-rank p50 and p95 for descriptive build/query milliseconds, canonical edge bytes, normalized raw session bytes, returned top-ten raw session bytes, and the per-question edge-to-raw byte ratio. Only the deterministic ratio is a decision gate.",
         "direction": "minimize",
         "population": "All held-out evaluation questions for each treatment condition."
       },
       {
         "name": "forbidden-field-access",
         "unit": "count",
-        "aggregation": "Count treatment inputs or treatment outputs containing answer, answer-session identifiers, question type, inferred gold, or record-role labels.",
+        "aggregation": "Count treatment inputs or treatment outputs containing answer, answer-session identifiers, question type, has_answer, dates, inferred gold, or record-role labels.",
         "direction": "zero",
         "population": "Every development and evaluation treatment invocation."
       }
@@ -225,7 +235,7 @@
       "magnitude": 0.02,
       "scale": "absolute",
       "confidenceLevel": 0.95,
-      "intervalMethod": "Paired nonparametric percentile bootstrap over evaluation question identifiers with 10000 resamples from xorshift32 seed 1296387376.",
+      "intervalMethod": "Paired unstratified percentile bootstrap over evaluation question identifiers in code-unit order with one shared 10000 by 353 index matrix from xorshift32 seed 1296387376; bounds are nearest-rank indices 249 and 9749.",
       "comparison": "Repeated adjacent-position minus each of content, recurrence-no-position, and shuffled-position on identical evaluation questions."
     }
   },
@@ -235,16 +245,16 @@
       {
         "id": "development-ranking",
         "phase": "development",
-        "maximumCount": 600,
+        "maximumCount": 588,
         "requiredWhen": "Always required before an association weight can be selected or any evaluation result can be inspected.",
-        "formula": "at most 150 development questions * 4 conditions"
+        "formula": "exactly 147 development questions * 4 condition rows; those rows contain exactly 1911 weight-specific ranking vectors"
       },
       {
         "id": "evaluation-ranking",
         "phase": "evaluation",
-        "maximumCount": 1400,
+        "maximumCount": 1412,
         "requiredWhen": "Required after development selections are persisted and before a supported or rejected classification.",
-        "formula": "at least 350 evaluation questions * 4 conditions"
+        "formula": "exactly 353 evaluation questions * 4 conditions at frozen selected weights, hence 1412 ranking vectors"
       }
     ],
     "plannedMaximumCases": 2000,
@@ -272,7 +282,7 @@
     "classificationOrder": "Validate registered bytes, dataset identity, split, gold-blind projection, complete rankings, finite costs, checksums, independent recomputation, and mutation rejection before inspecting any useful-effect or cost threshold.",
     "supported": [
       "Retain repeated adjacent-position retrieval for a public Agent experiment only if its evaluation NDCG@10 mean gain is at least 0.02 and paired lower 95 percent bound is above zero against content, recurrence-no-position, and shuffled-position separately.",
-      "The knowledge-update top-one error difference versus content must be at most 0.02, p95 build at most 500 milliseconds, p95 query at most 50 milliseconds, and p95 canonical edge bytes at most twice normalized raw session bytes.",
+      "The knowledge-update top-one error difference versus content must be at most 0.02 and the nearest-rank p95 per-question canonical-edge-byte to normalized-raw-session-byte ratio must be at most 2.",
       "All structural, isolation, checksum, independent-verification, and mutation gates must pass."
     ],
     "rejected": [
@@ -331,9 +341,9 @@
     "importsTreatmentImplementation": false,
     "requiredChecks": [
       "Read the registered local dataset only to verify its byte hash, shape, split metadata, and ranking relevance independently of treatment code.",
-      "Recompute the exact stratified hash split, treatment projection closure, tokenizer, BM25, all three association graphs, deterministic shuffle, development weight selection, rankings, metrics, bootstrap, costs, and decision.",
-      "Verify 500 unique questions, the closed condition set, one row per question-condition, exact cutoff rankings, finite numbers, selected weights from the frozen grid, all required artifact hashes, and absence of configured secret values or URLs.",
-      "Prove treatment input and output artifacts contain no answer, answer-session identifiers, question type, inferred gold, or record-role fields."
+      "Recompute the exact stratified hash split, recursive first-occurrence treatment projection, tokenizer, BM25 including empty documents, all three per-question association graphs, deterministic shuffle, development weight selection, rankings, metrics, bootstrap, canonical bytes, and decision.",
+      "Verify 500 unique questions, exact per-type split counts, 2000 condition rows, 3323 ranking vectors, the closed condition set, exact top-ten rankings, finite numbers, selected weights from the frozen grid, all required artifact hashes, and absence of configured secret values or URLs.",
+      "Prove treatment input and output artifacts contain no answer, answer-session identifiers, question type, has_answer, dates, inferred gold, or record-role fields; physical timing is audited but not expected to reproduce exactly."
     ],
     "mutationTests": [
       "Swap one gold answer-session identifier and require metric or dataset-identity rejection.",
@@ -356,14 +366,18 @@
     "moduleStartupRefusalMustRemain": true
   },
   "domainDesign": {
-    "implementationStatus": "Only this protocol and preregistration are frozen. The treatment runner, independent analyzer, mutation harness, formal artifacts, and report do not yet exist, and no dataset result has been inspected under this version.",
+    "implementationStatus": "Version 2 replaces version 1 before the first dataset run. A treatment module and synthetic conformance test exist; the dataset adapter, runner, independent analyzer, mutation harness, formal artifacts, and report do not yet exist, and no retrieval outcome has been inspected under either version.",
     "datasetPath": "test/memory-data/benchmarks/conversation-memory/longmemeval/longmemeval_s",
     "datasetSha256": "08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894",
     "datasetExpectedQuestions": 500,
     "datasetObservedSessionCountRangeBeforeFreeze": [39, 66],
-    "splitProcedure": "Within each question_type sort by SHA-256 of UTF-8 question_type, NUL, question_id; development is first floor(0.30*n), evaluation is the remainder.",
-    "treatmentProjectionFields": ["question_id", "question", "haystack_session_ids", "haystack_sessions"],
-    "forbiddenTreatmentFields": ["answer", "answer_session_ids", "question_type", "inferredGold", "recordRole"],
+    "questionTypeCounts": {"knowledge-update": 78, "multi-session": 133, "single-session-assistant": 56, "single-session-preference": 30, "single-session-user": 70, "temporal-reasoning": 133},
+    "splitProcedure": "Within each question_type sort by lowercase hexadecimal SHA-256 of UTF-8 question_type, NUL, question_id, then code-unit question_id collision tie-break; development is first floor(0.30*n), evaluation is the remainder.",
+    "splitCounts": {"development": 147, "evaluation": 353, "conditionRows": 2000, "rankingVectors": 3323},
+    "treatmentProjectionFields": ["question_id", "question", "sessions[].session_id", "sessions[].messages[].role", "sessions[].messages[].content"],
+    "forbiddenTreatmentFields": ["answer", "answer_session_ids", "question_type", "has_answer", "haystack_dates", "question_date", "inferredGold", "recordRole"],
+    "duplicateSessionRule": "Within a question, require duplicate session IDs to have byte-identical ordered role/content arrays, retain the first occurrence, and remove later occurrences before treatment; IDs may repeat across different questions because each graph is per-question.",
+    "emptySessionRule": "Preserve empty sessions as retrieval units with document length zero and preserve empty content strings.",
     "sessionEncoding": "For each supplied message in supplied order, lowercase role, colon-space, exact content, LF; apply Unicode NFKC and Unicode lowercase before tokenization.",
     "tokenization": {
       "pattern": "maximal Unicode letter-or-number sequences",
@@ -372,14 +386,18 @@
       "synonyms": false,
       "stopWords": ["a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have", "i", "in", "is", "it", "my", "of", "on", "or", "that", "the", "this", "to", "was", "were", "what", "when", "where", "which", "who", "why", "with", "you", "your"]
     },
-    "associationScore": "For a candidate session, maximum admitted edge score between a query token and a candidate token absent from the query; final score BM25 plus selected weight times association score.",
+    "associationScore": "Build one complete query-independent graph per question from content token sets only. A distinct session supports an unordered pair at most once; support of at least two admits a binary-value-one edge. Candidate sessions participate in support. Candidate score is one iff an edge joins a unique query token to a candidate content token absent from the query; final score is BM25 plus selected weight times that value.",
     "tieBreak": "Higher final score, higher association score, higher BM25, then UTF-16 code-unit ascending session identifier.",
     "cutoffs": [1, 5, 10],
     "bootstrap": {
       "generator": "xorshift32",
       "seed": 1296387376,
       "resamples": 10000,
-      "bounds": [0.025, 0.975]
+      "bounds": [0.025, 0.975],
+      "population": 353,
+      "resampleIndexRule": "floor(nextUint32*353/4294967296)",
+      "nearestRankIndices": [249, 9749],
+      "sharedAcrossContrasts": true
     },
     "resourceBudgets": {
       "maximumWallClockMs": 1800000,

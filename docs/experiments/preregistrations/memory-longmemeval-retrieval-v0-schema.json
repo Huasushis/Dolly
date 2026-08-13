@@ -5,37 +5,17 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "$schema",
-    "schemaVersion",
-    "experimentId",
-    "experimentVersion",
-    "title",
-    "status",
-    "scope",
-    "protocol",
-    "authorityReferences",
-    "definitions",
-    "question",
-    "hypotheses",
-    "decision",
-    "conditions",
-    "data",
-    "backend",
-    "randomness",
-    "metrics",
-    "execution",
-    "stoppingRules",
-    "decisionRules",
-    "artifacts",
-    "independentValidation",
-    "safetyBoundary",
-    "domainDesign"
+    "$schema", "schemaVersion", "experimentId", "experimentVersion", "title",
+    "status", "scope", "protocol", "authorityReferences", "definitions",
+    "question", "hypotheses", "decision", "conditions", "data", "backend",
+    "randomness", "metrics", "execution", "stoppingRules", "decisionRules",
+    "artifacts", "independentValidation", "safetyBoundary", "domainDesign"
   ],
   "properties": {
     "$schema": { "const": "./memory-longmemeval-retrieval-v0-schema.json" },
     "schemaVersion": { "const": "dolly-experiment-preregistration/v1" },
     "experimentId": { "const": "memory-longmemeval-retrieval-v0" },
-    "experimentVersion": { "const": 1 },
+    "experimentVersion": { "const": 2 },
     "title": { "type": "string", "minLength": 20 },
     "status": { "const": "frozen-before-first-run" },
     "scope": { "const": "comparative" },
@@ -45,28 +25,143 @@
       "required": ["path", "sha256"],
       "properties": {
         "path": { "const": "docs/experiments/preregistrations/memory-longmemeval-retrieval-v0-protocol.md" },
-        "sha256": { "const": "6eac98255e9f5cc35fc81dc211865d69968653b90f582d751b0a2f44d49de048" }
+        "sha256": { "const": "b3f24eeaaf11e247f8908d3b483debf3be21c6b5672d25f52f9d79fd3a6f515e" }
       }
     },
     "authorityReferences": { "type": "array", "minItems": 4, "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
-    "definitions": { "type": "object", "minProperties": 4 },
+    "definitions": { "type": "object", "minProperties": 5 },
     "question": { "type": "string", "minLength": 40 },
-    "hypotheses": { "$ref": "#/$defs/nonemptyObject" },
-    "decision": { "$ref": "#/$defs/nonemptyObject" },
-    "conditions": { "$ref": "#/$defs/nonemptyObject" },
-    "data": { "$ref": "#/$defs/nonemptyObject" },
-    "backend": { "$ref": "#/$defs/nonemptyObject" },
-    "randomness": { "$ref": "#/$defs/nonemptyObject" },
-    "metrics": { "$ref": "#/$defs/nonemptyObject" },
-    "execution": { "$ref": "#/$defs/nonemptyObject" },
-    "stoppingRules": { "$ref": "#/$defs/nonemptyObject" },
-    "decisionRules": { "$ref": "#/$defs/nonemptyObject" },
-    "artifacts": { "$ref": "#/$defs/nonemptyObject" },
-    "independentValidation": { "$ref": "#/$defs/nonemptyObject" },
-    "safetyBoundary": { "$ref": "#/$defs/nonemptyObject" },
-    "domainDesign": { "$ref": "#/$defs/nonemptyObject" }
+    "hypotheses": { "$ref": "#/$defs/hypotheses" },
+    "decision": { "$ref": "#/$defs/decision" },
+    "conditions": { "const": {"baselines":[{"id":"content","description":"BM25 ranks the exact first-occurrence normalized session corpus without an association graph.","frozenParameters":{"k1":1.2,"b":0.75,"idf":"ln(1+(N-df+0.5)/(df+0.5))","associationWeight":0,"queryTerms":"unique after frozen tokenization","emptyDocumentRule":"document length zero; if corpus average length is zero every BM25 score is zero"}}],"treatments":[{"id":"recurrence-no-position","description":"BM25 is augmented by token-pair recurrence across any two distinct messages in a session with position ignored.","frozenParameters":{"minimumDistinctSessions":2,"maximumMessageDistance":"unbounded","weightGrid":[0.25,0.5,1,2],"graphScope":"one query-independent graph per question","edgeValue":1,"associationTokens":"message content only"}},{"id":"repeated-adjacent-position","description":"BM25 is augmented only by token-pair recurrence from supplied adjacent messages in at least two sessions.","frozenParameters":{"minimumDistinctSessions":2,"maximumMessageDistance":1,"weightGrid":[0.25,0.5,1,2],"graphScope":"one query-independent graph per question","edgeValue":1,"associationTokens":"message content only"}},{"id":"shuffled-position","description":"Messages are deterministically shuffled inside each session before applying the identical adjacent-position edge rule.","frozenParameters":{"minimumDistinctSessions":2,"maximumMessageDistance":1,"shuffleSeed":"first four SHA-256 bytes interpreted unsigned big-endian over UTF-8 question_id, NUL, session_id, NUL, position-shuffle","shuffleIndex":"floor(nextUint32*(i+1)/4294967296) for Fisher-Yates i descending","weightGrid":[0.25,0.5,1,2],"graphScope":"one query-independent graph per question","edgeValue":1,"associationTokens":"message content only"}}]} },
+    "data": { "$ref": "#/$defs/data" },
+    "backend": { "$ref": "#/$defs/backend" },
+    "randomness": { "const": {"generator":"xorshift32 with JavaScript 32-bit bitwise transitions x^=x<<13, x^=x>>>17, x^=x<<5; shuffle and bootstrap map unsigned output with floor(output*bound/4294967296)","generatorVersion":"1","streamSeparation":"Position shuffle seeds are the first four big-endian digest bytes independently derived per question and session. One unstratified bootstrap index matrix from seed 1296387376 is reused for all three paired contrasts and consumes no shuffle state.","executionOrder":"Question rows use UTF-16 code-unit ascending question_id and conditions use content, recurrence-no-position, repeated-adjacent-position, then shuffled-position. Rankings use the frozen score and identifier tie break.","repetitionsPerCase":1} },
+    "metrics": { "$ref": "#/$defs/metrics" },
+    "execution": { "const": {"factorialDesign":"Five hundred fixed LongMemEval-S questions are crossed with four retrieval conditions; development and evaluation membership is fixed before treatment projection.","casePlan":[{"id":"development-ranking","phase":"development","maximumCount":588,"requiredWhen":"Always required before an association weight can be selected or any evaluation result can be inspected.","formula":"exactly 147 development questions * 4 condition rows; those rows contain exactly 1911 weight-specific ranking vectors"},{"id":"evaluation-ranking","phase":"evaluation","maximumCount":1412,"requiredWhen":"Required after development selections are persisted and before a supported or rejected classification.","formula":"exactly 353 evaluation questions * 4 conditions at frozen selected weights, hence 1412 ranking vectors"}],"plannedMaximumCases":2000,"maxCases":2000,"maxEventsPerCase":10,"maxRawRecordsPerCase":66,"maxVirtualTimeMsPerCase":1,"maxWallClockMs":1800000,"failurePolicy":"Any dataset, protocol, preregistration, split, coverage, treatment-projection, numeric, resource, artifact-hash, independent-verification, or mutation mismatch makes the run inconclusive and prevents an efficacy classification.","retryPolicy":"There are no external calls and no retries; each question-condition ranking is computed and persisted exactly once."} },
+    "stoppingRules": { "$ref": "#/$defs/stoppingRules" },
+    "decisionRules": { "const": {"classificationOrder":"Validate registered bytes, dataset identity, split, gold-blind projection, complete rankings, finite costs, checksums, independent recomputation, and mutation rejection before inspecting any useful-effect or cost threshold.","supported":["Retain repeated adjacent-position retrieval for a public Agent experiment only if its evaluation NDCG@10 mean gain is at least 0.02 and paired lower 95 percent bound is above zero against content, recurrence-no-position, and shuffled-position separately.","The knowledge-update top-one error difference versus content must be at most 0.02 and the nearest-rank p95 per-question canonical-edge-byte to normalized-raw-session-byte ratio must be at most 2.","All structural, isolation, checksum, independent-verification, and mutation gates must pass."],"rejected":["A structurally valid miss of any useful-effect, specificity, knowledge-update, or cost threshold eliminates this repeated-position association-index design.","Prior synthetic or private-Aether results cannot reverse the rejection."],"inconclusive":["Any earlier structural, isolation, resource, checksum, independent-verification, or mutation failure prevents a supported or rejected classification.","A valid retrieval result cannot be promoted to an Agent, product Memory, automatic recall, task-resume, or Module-support claim."]} },
+    "artifacts": { "$ref": "#/$defs/artifacts" },
+    "independentValidation": { "$ref": "#/$defs/independentValidation" },
+    "safetyBoundary": { "const": {"productRuntimeUsed":false,"moduleLaunchAllowed":false,"networkAccessAllowed":false,"privateDataAllowed":false,"paidServicesAllowed":false,"knownP0PathReachable":false,"moduleStartupRefusalMustRemain":true} },
+    "domainDesign": { "$ref": "#/$defs/domainDesign" }
   },
   "$defs": {
-    "nonemptyObject": { "type": "object", "minProperties": 1 }
+    "nonemptyString": { "type": "string", "minLength": 1 },
+    "stringArray": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/nonemptyString" } },
+    "namedMeasure": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "statement", "outcomeMeasure"],
+      "properties": { "id": { "$ref": "#/$defs/nonemptyString" }, "statement": { "$ref": "#/$defs/nonemptyString" }, "outcomeMeasure": { "$ref": "#/$defs/nonemptyString" } }
+    },
+    "hypotheses": {
+      "type": "object", "additionalProperties": false, "required": ["primary", "guardrails"],
+      "properties": {
+        "primary": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/$defs/namedMeasure" } },
+        "guardrails": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "$ref": "#/$defs/namedMeasure" } }
+      }
+    },
+    "decision": {
+      "type": "object", "additionalProperties": false,
+      "required": ["currentProductState", "changesIfSupported", "changesIfRejected", "prohibitedClaims"],
+      "properties": {
+        "currentProductState": { "$ref": "#/$defs/nonemptyString" },
+        "changesIfSupported": { "$ref": "#/$defs/stringArray" },
+        "changesIfRejected": { "$ref": "#/$defs/stringArray" },
+        "prohibitedClaims": { "$ref": "#/$defs/stringArray" }
+      }
+    },
+    "condition": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "description", "frozenParameters"],
+      "properties": {
+        "id": { "enum": ["content", "recurrence-no-position", "repeated-adjacent-position", "shuffled-position"] },
+        "description": { "$ref": "#/$defs/nonemptyString" },
+        "frozenParameters": { "type": "object", "minProperties": 4 }
+      }
+    },
+    "conditions": {
+      "type": "object", "additionalProperties": false, "required": ["baselines", "treatments"],
+      "properties": {
+        "baselines": { "type": "array", "minItems": 1, "maxItems": 1, "prefixItems": [{ "$ref": "#/$defs/condition" }], "items": false },
+        "treatments": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "$ref": "#/$defs/condition" } }
+      }
+    },
+    "split": {
+      "type": "object", "additionalProperties": false, "required": ["name", "caseFactors"],
+      "properties": { "name": { "$ref": "#/$defs/nonemptyString" }, "seeds": { "type": "array", "maxItems": 2, "items": { "type": "integer" } }, "caseFactors": { "$ref": "#/$defs/stringArray" } }
+    },
+    "data": {
+      "type": "object", "additionalProperties": false,
+      "required": ["generatorOrDataset", "training", "development", "evaluation", "splitIsolation", "tuningUsesTrainingAndDevelopmentOnly"],
+      "properties": {
+        "generatorOrDataset": {
+          "type": "object", "additionalProperties": false, "required": ["id", "version", "contentDefinition"],
+          "properties": { "id": { "const": "longmemeval-s" }, "version": { "const": "sha256-08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894" }, "contentDefinition": { "$ref": "#/$defs/nonemptyString" } }
+        },
+        "training": { "$ref": "#/$defs/split" }, "development": { "$ref": "#/$defs/split" }, "evaluation": { "$ref": "#/$defs/split" },
+        "splitIsolation": { "$ref": "#/$defs/nonemptyString" }, "tuningUsesTrainingAndDevelopmentOnly": { "const": true }
+      }
+    },
+    "backend": {
+      "type": "object", "additionalProperties": false,
+      "required": ["allowedKinds", "requiredKind", "silentFallbackAllowed", "credentialsRequired", "networkRequired"],
+      "properties": { "allowedKinds": { "const": ["local"] }, "requiredKind": { "const": "local" }, "silentFallbackAllowed": { "const": false }, "credentialsRequired": { "const": false }, "networkRequired": { "const": false } }
+    },
+    "randomness": {
+      "type": "object", "additionalProperties": false,
+      "required": ["generator", "generatorVersion", "streamSeparation", "executionOrder", "repetitionsPerCase"],
+      "properties": { "generator": { "$ref": "#/$defs/nonemptyString" }, "generatorVersion": { "const": "1" }, "streamSeparation": { "$ref": "#/$defs/nonemptyString" }, "executionOrder": { "$ref": "#/$defs/nonemptyString" }, "repetitionsPerCase": { "const": 1 } }
+    },
+    "metrics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["primary", "secondary", "guardrails", "minimumEffect"],
+      "properties": { "primary": { "type": "object", "minProperties": 5 }, "secondary": { "type": "array", "minItems": 3, "maxItems": 3 }, "guardrails": { "type": "array", "minItems": 3, "maxItems": 3 }, "minimumEffect": { "const": {"metric":"ndcg-at-10","magnitude":0.02,"scale":"absolute","confidenceLevel":0.95,"intervalMethod":"Paired unstratified percentile bootstrap over evaluation question identifiers in code-unit order with one shared 10000 by 353 index matrix from xorshift32 seed 1296387376; bounds are nearest-rank indices 249 and 9749.","comparison":"Repeated adjacent-position minus each of content, recurrence-no-position, and shuffled-position on identical evaluation questions."} } }
+    },
+    "casePlan": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "phase", "maximumCount", "requiredWhen", "formula"],
+      "properties": { "id": { "enum": ["development-ranking", "evaluation-ranking"] }, "phase": { "enum": ["development", "evaluation"] }, "maximumCount": { "enum": [588, 1412] }, "requiredWhen": { "$ref": "#/$defs/nonemptyString" }, "formula": { "$ref": "#/$defs/nonemptyString" } }
+    },
+    "execution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["factorialDesign", "casePlan", "plannedMaximumCases", "maxCases", "maxEventsPerCase", "maxRawRecordsPerCase", "maxVirtualTimeMsPerCase", "maxWallClockMs", "failurePolicy", "retryPolicy"],
+      "properties": {
+        "factorialDesign": { "$ref": "#/$defs/nonemptyString" }, "casePlan": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/$defs/casePlan" } },
+        "plannedMaximumCases": { "const": 2000 }, "maxCases": { "const": 2000 }, "maxEventsPerCase": { "const": 10 }, "maxRawRecordsPerCase": { "const": 66 }, "maxVirtualTimeMsPerCase": { "const": 1 }, "maxWallClockMs": { "const": 1800000 },
+        "failurePolicy": { "$ref": "#/$defs/nonemptyString" }, "retryPolicy": { "$ref": "#/$defs/nonemptyString" }
+      }
+    },
+    "stoppingRules": {
+      "type": "object", "additionalProperties": false, "required": ["plannedCompletion", "earlyEfficacyStopAllowed", "abortConditions"],
+      "properties": { "plannedCompletion": { "$ref": "#/$defs/nonemptyString" }, "earlyEfficacyStopAllowed": { "const": false }, "abortConditions": { "$ref": "#/$defs/stringArray" } }
+    },
+    "decisionRules": {
+      "type": "object", "additionalProperties": false, "required": ["classificationOrder", "supported", "rejected", "inconclusive"],
+      "properties": { "classificationOrder": { "$ref": "#/$defs/nonemptyString" }, "supported": { "$ref": "#/$defs/stringArray" }, "rejected": { "$ref": "#/$defs/stringArray" }, "inconclusive": { "$ref": "#/$defs/stringArray" } }
+    },
+    "artifacts": {
+      "type": "object", "additionalProperties": false, "required": ["rootPattern", "requiredFiles", "runManifestFields"],
+      "properties": { "rootPattern": { "const": "artifacts/experiments/probes/memory-longmemeval-retrieval-v0" }, "requiredFiles": { "$ref": "#/$defs/stringArray" }, "runManifestFields": { "$ref": "#/$defs/stringArray" } }
+    },
+    "independentValidation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["analyzerPath", "readsOnlyArtifacts", "importsTreatmentImplementation", "requiredChecks", "mutationTests"],
+      "properties": { "analyzerPath": { "const": "scripts/experiments/probes/memory-longmemeval-retrieval-v0/verify.mjs" }, "readsOnlyArtifacts": { "const": false }, "importsTreatmentImplementation": { "const": false }, "requiredChecks": { "$ref": "#/$defs/stringArray" }, "mutationTests": { "type": "array", "minItems": 8, "maxItems": 8, "items": { "$ref": "#/$defs/nonemptyString" } } }
+    },
+    "safetyBoundary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["productRuntimeUsed", "moduleLaunchAllowed", "networkAccessAllowed", "privateDataAllowed", "paidServicesAllowed", "knownP0PathReachable", "moduleStartupRefusalMustRemain"],
+      "properties": { "productRuntimeUsed": { "const": false }, "moduleLaunchAllowed": { "const": false }, "networkAccessAllowed": { "const": false }, "privateDataAllowed": { "const": false }, "paidServicesAllowed": { "const": false }, "knownP0PathReachable": { "const": false }, "moduleStartupRefusalMustRemain": { "const": true } }
+    },
+    "domainDesign": {
+      "type": "object", "additionalProperties": false,
+      "required": ["implementationStatus", "datasetPath", "datasetSha256", "datasetExpectedQuestions", "datasetObservedSessionCountRangeBeforeFreeze", "questionTypeCounts", "splitProcedure", "splitCounts", "treatmentProjectionFields", "forbiddenTreatmentFields", "duplicateSessionRule", "emptySessionRule", "sessionEncoding", "tokenization", "associationScore", "tieBreak", "cutoffs", "bootstrap", "resourceBudgets", "remainingOutsideScope"],
+      "properties": {
+        "implementationStatus": { "$ref": "#/$defs/nonemptyString" }, "datasetPath": { "const": "test/memory-data/benchmarks/conversation-memory/longmemeval/longmemeval_s" }, "datasetSha256": { "const": "08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894" }, "datasetExpectedQuestions": { "const": 500 }, "datasetObservedSessionCountRangeBeforeFreeze": { "const": [39, 66] }, "questionTypeCounts": { "const": {"knowledge-update":78,"multi-session":133,"single-session-assistant":56,"single-session-preference":30,"single-session-user":70,"temporal-reasoning":133} },
+        "splitProcedure": { "$ref": "#/$defs/nonemptyString" }, "splitCounts": { "const": { "development": 147, "evaluation": 353, "conditionRows": 2000, "rankingVectors": 3323 } }, "treatmentProjectionFields": { "const": ["question_id", "question", "sessions[].session_id", "sessions[].messages[].role", "sessions[].messages[].content"] }, "forbiddenTreatmentFields": { "const": ["answer", "answer_session_ids", "question_type", "has_answer", "haystack_dates", "question_date", "inferredGold", "recordRole"] },
+        "duplicateSessionRule": { "$ref": "#/$defs/nonemptyString" }, "emptySessionRule": { "$ref": "#/$defs/nonemptyString" }, "sessionEncoding": { "$ref": "#/$defs/nonemptyString" }, "tokenization": { "type": "object", "minProperties": 5 }, "associationScore": { "$ref": "#/$defs/nonemptyString" }, "tieBreak": { "$ref": "#/$defs/nonemptyString" }, "cutoffs": { "const": [1, 5, 10] }, "bootstrap": { "type": "object", "minProperties": 8 }, "resourceBudgets": { "type": "object", "minProperties": 7 }, "remainingOutsideScope": { "$ref": "#/$defs/stringArray" }
+      }
+    }
   }
 }

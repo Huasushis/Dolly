@@ -1,61 +1,192 @@
 # LongMemEval-S retrieval screen protocol
 
-This protocol selects or eliminates repeated adjacent-position raw retrieval as
-a later experiment factor. It does not authorize a Dolly Memory index,
-automatic recall, task resumption, a Module launch, a model call, or a network
-request.
+This version-2 protocol selects or eliminates repeated adjacent-position raw
+retrieval as a later experiment factor. It does not authorize a Dolly Memory
+index, automatic recall, task resumption, a Module launch, a model call, or a
+network request. Version 2 replaces version 1 before the first dataset run. No
+retrieval outcome was inspected while making this replacement.
 
-The only dataset is the local MIT-licensed LongMemEval-S file whose SHA-256 is
-`08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894` and
-which must contain 500 unique questions. The treatment receives question text,
-ordered session identifiers, and ordered role/content messages. It must not
-receive answer text, answer-session identifiers, question type, an inferred
-gold label, or an inferred record-role label. The split driver may read
-question type only to construct the frozen stratified split; it passes a closed
-gold-blind projection to the treatment.
+## Dataset adapter and gold isolation
 
-Within each question type, rows are sorted by lowercase SHA-256 of the UTF-8
-bytes `question_type`, one NUL byte, and `question_id`. The first
-`floor(0.30*n)` rows are development; the rest are evaluation. Development
-chooses one association weight per association condition from
-`[0.25, 0.5, 1, 2]` by macro NDCG@10, with ties going to the smaller weight.
-Evaluation is opened once after those choices and development artifacts are
-persisted.
+The only dataset is the local MIT-licensed LongMemEval-S file with SHA-256
+`08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894`.
+It must contain exactly 500 rows with unique nonempty `question_id` values and
+the six exact question-type counts frozen in the preregistration. The adapter
+validates the complete source row, but constructs treatment input recursively:
 
-Each supplied session is one retrieval unit. Its text is the supplied messages
-in order, each encoded as lowercase role, `: `, exact content, and LF. Text is
-Unicode NFKC-normalized and lowercased. Tokens are maximal Unicode
-letter-or-number sequences of length at least two after removing the exact
-stop-word list in the preregistration. There is no stemming, synonym expansion,
+```text
+{
+  question_id: string,
+  question: string,
+  sessions: Array<{
+    session_id: string,
+    messages: Array<{ role: string, content: string }>
+  }>
+}
+```
+
+The adapter copies only those fields. In particular it does not spread or
+serialize source messages, because some source messages contain the gold field
+`has_answer`. A later occurrence of the same session identifier must have a
+byte-identical ordered role/content array or the run aborts; the adapter then
+retains only the first occurrence and its aligned message array. Empty sessions
+and empty message content remain valid retrieval data; an empty session has
+document length zero. Duplicate gold session identifiers are reduced to
+distinct IDs. Every distinct gold identifier must name a retained retrieval
+unit.
+
+The treatment never receives `answer` (which may be text or a number),
+`answer_session_ids`, `question_type`, `has_answer`, dates, an inferred gold
+label, or an inferred record-role label. The split driver may read
+`question_type`. A separate gold-aware selector and analyzer may read distinct
+gold session IDs only after treatment rankings have been persisted. Gold is
+never an argument to tokenization, graph construction, ranking, or timing.
+
+## Split and execution order
+
+For a row, compute lowercase hexadecimal SHA-256 of the UTF-8 bytes formed by
+`question_type`, one NUL byte, and `question_id`. Within each question type,
+sort by that digest and then by UTF-16 code-unit ascending `question_id` to
+resolve any digest collision. The first `floor(0.30*n)` rows are development;
+the rest are evaluation. Exact counts are:
+
+| Question type | Total | Development | Evaluation |
+| --- | ---: | ---: | ---: |
+| knowledge-update | 78 | 23 | 55 |
+| multi-session | 133 | 39 | 94 |
+| single-session-assistant | 56 | 16 | 40 |
+| single-session-preference | 30 | 9 | 21 |
+| single-session-user | 70 | 21 | 49 |
+| temporal-reasoning | 133 | 39 | 94 |
+| Total | 500 | 147 | 353 |
+
+Development produces 588 question-condition rows and 1,911 ranking vectors:
+one content vector plus four weight variants for each of three association
+conditions per question. The gold-aware selector chooses one weight per
+association condition from `[0.25, 0.5, 1, 2]` using the unrounded macro
+development NDCG@10, with an exact tie going to the smaller weight. It persists
+the rankings, metrics, and selected weights before evaluation opens.
+Evaluation then produces exactly 1,412 question-condition rows and 1,412
+ranking vectors, using only the persisted selected weights. Thus the run has
+2,000 condition rows and 3,323 ranking vectors. Question rows and artifact rows
+use UTF-16 code-unit ascending `question_id`; conditions use `content`,
+`recurrence-no-position`, `repeated-adjacent-position`, then
+`shuffled-position`.
+
+## Text and BM25
+
+Each first-occurrence session identifier is one retrieval unit. BM25 text is
+the supplied messages in order, each encoded as lowercase role, `: `, exact
+content, and LF. The complete string is Unicode NFKC-normalized and Unicode
+lowercased. Tokens are maximal Unicode letter-or-number sequences with at
+least two Unicode code points after removing the exact preregistered stop-word
+set. Query terms are the first occurrences of the resulting question tokens;
+query repetition has no weight. There is no stemming, synonym expansion,
 embedding, language model, or answer-derived feature.
 
-Content ranking is BM25 with `k1=1.2`, `b=0.75`, and
-`ln(1+(N-df+0.5)/(df+0.5))` IDF. An association edge is an unordered pair of
-distinct tokens with at most one maximum proximity observation per session and
-support in at least two distinct sessions. Repeated adjacent-position edges use
-only messages at supplied distance one. The no-position control permits any
-two distinct messages in a session. The shuffled control applies deterministic
-Fisher-Yates inside each session using the first 32 bits of SHA-256 over
-`question_id`, NUL, `session_id`, NUL, and `position-shuffle`, then applies the
-same adjacent rule. The score added to a candidate is the maximum admitted edge
-between a query token and a candidate token absent from the query. All four
-conditions index the identical session bytes and return the same number of
-session identifiers.
+For each unique query term, BM25 uses term frequency in the retrieval unit,
+document frequency across all retained units, `k1=1.2`, `b=0.75`, and
+`ln(1+(N-df+0.5)/(df+0.5))`. Document length is token count, including zero.
+Average length is the sum of lengths divided by `N`; if it is zero, every BM25
+score is exactly zero. All candidates remain rankable even when their score is
+zero.
 
-The independent analyzer recomputes the split, tokenizer, BM25, graphs,
-development choices, rankings, Recall@1/5/10, hit@1/5/10, NDCG@1/5/10,
-knowledge-update top-1 error, costs, and paired 10,000-resample bootstrap from
-raw artifacts without importing treatment code. Artifact or dataset hash
-mismatch, missing/duplicate rows, treatment access to forbidden fields,
-non-finite measurements, resource abort, analyzer disagreement, checksum
-failure, or surviving declared mutation makes the run inconclusive.
+## Association graphs and ranking
 
-Repeated adjacent-position retrieval is retained for a separately
-preregistered public revision-pinned Agent experiment only when its evaluation
-NDCG@10 mean gain is at least 0.02 and paired lower 95 percent bootstrap bound
-is above zero against each of content, no-position recurrence, and shuffled
-position; its knowledge-update top-1 error is no more than 0.02 worse than
-content; p95 per-question build is at most 500 ms, p95 query is at most 50 ms,
-and p95 canonical association-edge bytes are at most twice normalized raw
-session bytes. A structurally valid miss eliminates this association-index
-design. No result enables automatic injection or task execution.
+Each question has its own query-independent graph over that question's
+retained session corpus. No edge or support crosses question boundaries.
+Association construction uses message `content` tokens only; structural role
+labels remain in BM25 text but never generate association edges. Tokens within
+each message are treated as a set. For every admitted pair of different
+messages, form the cross-product of their token sets, discard equal-token
+pairs, and canonicalize each remaining pair as the UTF-16 code-unit smaller
+token followed by the larger token. A session supports a pair at most once,
+and the candidate session itself remains part of corpus support. An edge is
+admitted at support of at least two distinct retained session identifiers.
+The edge's ranking value is the binary value one; support count is retained
+only for audit bytes and does not increase score.
+
+`recurrence-no-position` admits every pair of different messages in a session.
+`repeated-adjacent-position` admits only supplied indices `(i,i+1)`.
+`shuffled-position` first shuffles message references and then applies the same
+adjacent rule. Its seed is the first four SHA-256 bytes interpreted as an
+unsigned big-endian integer over UTF-8 `question_id`, NUL, `session_id`, NUL,
+and `position-shuffle`. Xorshift32 applies `x ^= x << 13`, `x ^= x >>> 17`,
+and `x ^= x << 5` with 32-bit JavaScript bitwise semantics and returns the
+unsigned state. Fisher-Yates iterates `i` from `length-1` down to one and swaps
+`i` with `floor(nextUint32()*(i+1)/4294967296)`.
+
+For a candidate, association score is one if at least one admitted edge joins
+a unique query token to a candidate content token not itself present in the
+query; otherwise it is zero. Final score is BM25 plus selected weight times
+that score. Ranking sorts by descending final score, descending association
+score, descending BM25, then UTF-16 code-unit ascending session identifier,
+and returns the first ten unique identifiers.
+
+## Metrics, bootstrap, and cost
+
+Relevance is binary membership in distinct gold session IDs. At cutoff `k`,
+Recall is the number of distinct relevant returned IDs divided by distinct
+gold count, and hit is one iff that intersection is nonempty. DCG is
+`sum(relevance(rank)/log2(rank+1))`; IDCG uses ones in the first
+`min(k,goldCount)` ranks; NDCG is DCG divided by IDCG. Knowledge-update top-one
+error is one iff the first returned ID is not a distinct gold ID. Metrics are
+summed in UTF-16 code-unit `question_id` order using JavaScript binary64 and
+divided once by the population size.
+
+The three paired evaluation contrasts use the same 10,000 bootstrap index
+vectors. Evaluation question IDs are first placed in UTF-16 code-unit order.
+Xorshift32 starts at unsigned seed `1296387376`; each vector draws exactly `n`
+indices independently with replacement as
+`floor(nextUint32()*n/4294967296)`. For each
+contrast and vector, differences are summed in sampled order and divided by
+`n`. Sorted bounds use nearest-rank indices
+`ceil(0.025*10000)-1` and `ceil(0.975*10000)-1`. The lower bound used by the
+decision is therefore sorted index 249. Resampling is unstratified because
+the primary population is the frozen aggregate evaluation set; question-type
+metrics remain descriptive strata.
+
+Normalized raw session bytes are the UTF-8 bytes of the exact NFKC-lowercased
+BM25 session encodings after first-occurrence deduplication. Returned raw bytes
+are the sum for the ten returned units. Canonical graph bytes are UTF-8 JSONL,
+one admitted edge per line sorted by `left`, then `right` in UTF-16 code-unit
+order, with property order exactly
+`{"left":...,"right":...,"distinctSessions":...}` and LF. The per-question
+edge-to-raw ratio is edge bytes divided by raw bytes; it is zero only when both
+are zero and is positive infinity when raw is zero but edge bytes are not.
+Nearest-rank p50 and p95 use sorted index `ceil(p*n)-1`.
+
+One fixed non-dataset synthetic question warms the JavaScript functions before
+timing and is excluded from every artifact metric. Timings use
+`performance.now()`: build covers document projection plus BM25 for content,
+and graph construction for each association condition; query covers candidate
+association scoring, ranking, and all requested weight variants. Graphs are
+built once per question-condition, not once per weight. Development measures
+all four variants; evaluation measures only the selected variant. Wall-clock
+timings are environment observations and resource diagnostics, not a
+cross-machine scientific decision gate. Timeout or non-finite timing makes the
+run inconclusive; a slow but completed run does not eliminate the retrieval
+design.
+
+## Verification and decision
+
+The treatment writes rankings and gold-blind cost data. The development
+selector and independent analyzer separately join persisted rankings with
+gold. The analyzer recomputes the source projection, split, tokenizer, BM25,
+graphs, shuffle, weight selection, rankings, relevance metrics, bootstrap,
+canonical byte counts, and decision without importing treatment code. It may
+remeasure time for diagnostics but must not require physical timing equality.
+Artifact or registered-source hash mismatch, missing or duplicate rows,
+forbidden-field exposure, non-finite numbers, resource abort, analyzer
+disagreement, checksum failure, or a surviving declared mutation makes the run
+inconclusive.
+
+Repeated adjacent-position retrieval is retained only as a factor for a
+separately preregistered public revision-pinned Agent experiment when its
+evaluation NDCG@10 mean gain is at least 0.02 and its paired lower 95 percent
+bootstrap bound is above zero against each of content, recurrence-no-position,
+and shuffled-position; its knowledge-update top-one error is no more than 0.02
+worse than content; and its p95 per-question edge-to-normalized-raw byte ratio
+is at most two. A structurally valid miss eliminates this association-index
+design. No result enables automatic injection, automatic recall, task
+execution, or Module startup.
