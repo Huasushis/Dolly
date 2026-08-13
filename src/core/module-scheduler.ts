@@ -2515,10 +2515,11 @@ export class ModuleScheduler {
     const workWaiting = entries.some((entry) =>
       (entry.pending.pendingCount > 0 || entry.outputCommitWaiting) &&
       entry.quarantineReason === null &&
+      // Retry, policy, and periodic deadlines are explicit scheduled waits,
+      // not stalls. Backpressured work remains observable because its blocked
+      // edge can age continuously between bounded capacity rechecks.
       !(
-        entry.activation.kind === "periodic" &&
         !entry.backpressured &&
-        entry.retryCount === 0 &&
         entry.nextEligibleAt !== null &&
         entry.nextEligibleAt > now
       )

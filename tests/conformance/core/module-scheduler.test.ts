@@ -1101,6 +1101,44 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
     await scheduler.stop();
   });
 
+  it("does not report a known retry delay as no progress", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler({
+      noProgressAfterMs: 1_000,
+      retryBaseMs: 5_000,
+      retryMaxMs: 5_000,
+      retryJitterRatio: 0,
+    });
+    const runtime = new FakeModuleRuntime();
+    mailboxes.set("worker", 1, 100);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
+    });
+    scheduler.start();
+    await drain(clock);
+    expect(runtime.tickCount).toBe(1);
+
+    runtime.fail(new Error("retry later"));
+    await drain(clock);
+    expect(scheduler.status("worker")).toMatchObject({
+      schedulingState: "retry-backoff",
+      nextEligibleAt: 5_000,
+    });
+
+    await advance(clock, 1_100);
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toEqual([]);
+    expect(scheduler.instanceStatus().noProgressActive).toBe(false);
+
+    await advance(clock, 3_900);
+    expect(runtime.tickCount).toBe(2);
+    runtime.settle({ status: "idle" });
+    await drain(clock);
+    await scheduler.stop();
+  });
+
   it("does not let unrelated in-flight work or its commit hide a blocked dependency cycle", async () => {
     const { clock, mailboxes, scheduler, events } = createScheduler({
       noProgressAfterMs: 1_000,
