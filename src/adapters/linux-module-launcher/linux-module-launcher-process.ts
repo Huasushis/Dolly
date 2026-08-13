@@ -14,8 +14,11 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { isAbsolute } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { Readable, Writable } from "node:stream";
+import {
+  defaultLauncherScriptPath,
+  REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
+} from "../../linux-module-runtime-assets.js";
 import { FramedJsonChannel } from "../../core/framed-json-channel.js";
 import { LAUNCHER_CONTROL_MAX_FRAME_BYTES } from "./launcher-control-protocol.js";
 import {
@@ -106,14 +109,7 @@ export interface StartedLinuxModuleLauncher {
   closeControlChannel(): void;
 }
 
-/** Absolute path of the launcher script shipped next to this module. */
-export function defaultLauncherScriptPath(): string {
-  return fileURLToPath(new URL("./launcher.py", import.meta.url));
-}
-
-/** Digest of the reviewed launcher bytes copied unchanged by the build. */
-export const REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST =
-  "sha256:2c95f759603f902340f719abaaf12b2df0ab7194d9c89f35aa835927486d3177";
+export { defaultLauncherScriptPath, REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST };
 
 export function startLinuxModuleLauncher(
   options: StartLinuxModuleLauncherOptions,

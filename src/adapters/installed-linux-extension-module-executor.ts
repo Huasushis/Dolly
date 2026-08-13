@@ -35,7 +35,6 @@ import {
 } from "./installed-module-permission-policy.js";
 import {
   deriveLinuxProcessConfinementExecution,
-  LINUX_PROCESS_CONFINEMENT_PROGRAM,
 } from "./linux-process-confinement.js";
 import {
   createLinuxExtensionModuleExecutor,
@@ -43,8 +42,10 @@ import {
 } from "./linux-extension-module-executor.js";
 import {
   defaultLauncherScriptPath,
+  LINUX_MODULE_LAUNCHER_INTERPRETER,
+  LINUX_PROCESS_CONFINEMENT_PROGRAM,
   REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
-} from "./linux-module-launcher/linux-module-launcher-process.js";
+} from "../linux-module-runtime-assets.js";
 
 type InstalledLifecycleOptions = Omit<
   LinuxExtensionModuleExecutorOptions["lifecycle"],
@@ -90,8 +91,6 @@ export interface InstalledLinuxExtensionModuleExecutorOptions {
  */
 export const INSTALLED_PROCESS_EFFECT_DECLARATION =
   "unrestricted" as const;
-
-const INSTALLED_LINUX_LAUNCHER_INTERPRETER = "/usr/bin/python3";
 
 export interface InstalledLinuxExtensionModuleExecutorDerivation {
   readonly resolvedModule: InstalledExtensionModule;
@@ -190,7 +189,7 @@ export function deriveReservedV10InstalledModuleProcessProvenance(
     declaredExternalEffects: installedModule.module.declaredExternalEffects,
     execution: installedModule.module.execution as unknown as JsonValue,
     linuxRuntime: {
-      interpreterProgram: INSTALLED_LINUX_LAUNCHER_INTERPRETER,
+      interpreterProgram: LINUX_MODULE_LAUNCHER_INTERPRETER,
       launcherDigest: REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
       confinementProgram: LINUX_PROCESS_CONFINEMENT_PROGRAM,
     },
@@ -378,7 +377,7 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
       },
     },
     launcher: {
-      interpreterProgram: INSTALLED_LINUX_LAUNCHER_INTERPRETER,
+      interpreterProgram: LINUX_MODULE_LAUNCHER_INTERPRETER,
       launcherEnvironment: Object.freeze({}),
     },
     reviewedLauncherSnapshot: {

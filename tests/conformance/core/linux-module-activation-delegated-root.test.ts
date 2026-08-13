@@ -1,8 +1,25 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ModuleCgroupFileSystem } from "../../../src/core/linux-module-cgroup.js";
+import type { ReviewedLinuxModuleRuntimeInspection } from "../../../src/linux-module-runtime-assets.js";
 
 const SERVICE_CGROUP = "/user.slice/dolly-core.service";
 const CGROUP_ROOT = "/test-cgroup";
+
+const runtimeMock = vi.hoisted(() => {
+  const runtime = {
+    interpreterProgram: "/usr/bin/python3" as const,
+    launcherScriptPath: "/reviewed/dolly/launcher.py",
+    launcherDigest:
+      "sha256:2c95f759603f902340f719abaaf12b2df0ab7194d9c89f35aa835927486d3177" as const,
+    confinementProgram: "/usr/bin/bwrap" as const,
+  };
+  return {
+    runtime,
+    inspect: vi.fn<() => Promise<ReviewedLinuxModuleRuntimeInspection>>(
+      async () => ({ available: true as const, runtime }),
+    ),
+  };
+});
 
 const bindingMock = vi.hoisted(() => {
   const serviceCgroup = "/user.slice/dolly-core.service";
@@ -25,6 +42,10 @@ const bindingMock = vi.hoisted(() => {
 vi.mock("../../../src/core/linux-core-service-binding.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../../src/core/linux-core-service-binding.js")>(),
   inspectCoreServiceBinding: bindingMock.inspect,
+}));
+vi.mock("../../../src/linux-module-runtime-assets.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../src/linux-module-runtime-assets.js")>(),
+  inspectReviewedLinuxModuleRuntime: runtimeMock.inspect,
 }));
 
 import { decideLinuxModuleActivation } from "../../../src/core/linux-module-activation.js";
@@ -52,9 +73,6 @@ function options(fileSystem: ModuleCgroupFileSystem) {
     unitName: "dolly-core.service",
     mode: "user" as const,
     cgroupRoot: CGROUP_ROOT,
-    launcherInterpreterPath: "/usr/bin/python3",
-    launcherScriptPath: "/opt/dolly/launcher.py",
-    checkLauncherAvailable: async () => true as const,
     cgroupFileSystem: fileSystem,
   };
 }
@@ -95,6 +113,7 @@ describe("Linux Module activation delegated-root authority", () => {
       expect(result).toMatchObject({
         permitted: true,
         binding: bindingMock.binding,
+        runtime: runtimeMock.runtime,
         delegatedRoot: {
           filesystemPath: `${CGROUP_ROOT}${SERVICE_CGROUP}`,
           controllers: ["cpu", "io", "memory", "pids"],

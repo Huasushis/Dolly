@@ -1,5 +1,8 @@
 import { posix } from "node:path";
 import type { ExtensionPackageSnapshot } from "../core/extension-package-snapshot.js";
+import { LINUX_PROCESS_CONFINEMENT_PROGRAM } from "../linux-module-runtime-assets.js";
+
+export { LINUX_PROCESS_CONFINEMENT_PROGRAM };
 
 const GUEST_NODE_PROGRAM = "/run/dolly/node";
 const GUEST_PACKAGE_SNAPSHOT = "/run/dolly/package.snapshot";
@@ -47,9 +50,6 @@ except BaseException as e:
  try:os.write(2,('dolly-package-bootstrap: '+str(e)+'\n').encode('utf-8','replace')[:512])
  finally:os._exit(70)
 `.trim();
-
-/** Exact backend exercised by the Ubuntu 24.04 acceptance environment. */
-export const LINUX_PROCESS_CONFINEMENT_PROGRAM = "/usr/bin/bwrap";
 
 export interface LinuxProcessConfinementOptions {
   /** Absolute Host path of the reviewed bubblewrap executable. */

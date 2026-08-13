@@ -32,6 +32,10 @@ import {
   type ModuleCgroupFileSystem,
 } from "./linux-module-cgroup.js";
 import type { ModuleProcessStopProver } from "./core-startup-recovery.js";
+import {
+  inspectReviewedLinuxModuleRuntime,
+  type ReviewedLinuxModuleRuntimeIdentity,
+} from "../linux-module-runtime-assets.js";
 
 export type ModuleActivationRefusalCode =
   | "MODULE_ACTIVATION_PLATFORM_UNSUPPORTED"
@@ -45,21 +49,7 @@ export interface ModuleActivationRefusal {
 }
 
 export interface LinuxModuleActivationOptions extends CoreServiceInspectionOptions {
-  /**
-   * Absolute path of the Python 3 interpreter that runs the reviewed child
-   * launcher. ADR 0009 records why the launcher cannot be a Node.js program:
-   * it must join a control group, set its own open-file limit, and replace its
-   * own process image in one process.
-   */
-  readonly launcherInterpreterPath: string;
-  /** Absolute path of the installed launcher script. */
-  readonly launcherScriptPath: string;
   readonly cgroupFileSystem?: ModuleCgroupFileSystem;
-  /** Verifies that both launcher paths exist and are executable. */
-  readonly checkLauncherAvailable?: (
-    interpreterPath: string,
-    scriptPath: string,
-  ) => Promise<true | string>;
 }
 
 export type LinuxModuleActivationResult =
@@ -67,6 +57,7 @@ export type LinuxModuleActivationResult =
       readonly permitted: true;
       readonly binding: VerifiedCoreServiceBinding;
       readonly delegatedRoot: DelegatedCgroupRootPreparation;
+      readonly runtime: ReviewedLinuxModuleRuntimeIdentity;
       readonly stopProver: ModuleProcessStopProver;
     }
   | {
@@ -78,25 +69,6 @@ export type LinuxModuleActivationResult =
        */
       readonly bindingFailures?: readonly CoreServiceBindingFailure[];
     };
-
-async function defaultCheckLauncherAvailable(
-  interpreterPath: string,
-  scriptPath: string,
-): Promise<true | string> {
-  const { access } = await import("node:fs/promises");
-  const { constants } = await import("node:fs");
-  for (const [label, path, mode] of [
-    ["interpreter", interpreterPath, constants.X_OK],
-    ["launcher script", scriptPath, constants.R_OK],
-  ] as const) {
-    try {
-      await access(path, mode);
-    } catch {
-      return `the child launcher ${label} at ${path} is missing or not usable`;
-    }
-  }
-  return true;
-}
 
 /**
  * Runs the ADR 0009 preconditions in order and returns either a refusal or the
@@ -124,17 +96,14 @@ export async function decideLinuxModuleActivation(
     };
   }
 
-  const checkLauncher = options.checkLauncherAvailable ?? defaultCheckLauncherAvailable;
-  const launcherAvailable = await checkLauncher(
-    options.launcherInterpreterPath,
-    options.launcherScriptPath,
-  );
-  if (launcherAvailable !== true) {
+  const runtimeInspection = await inspectReviewedLinuxModuleRuntime();
+  if (!runtimeInspection.available) {
     refusals.push({
       code: "MODULE_ACTIVATION_LAUNCHER_UNAVAILABLE",
-      detail: launcherAvailable,
+      detail: runtimeInspection.detail,
     });
   }
+  const runtime = runtimeInspection.runtime;
 
   const binding = await inspectCoreServiceBinding(options);
   if (!binding.verified) {
@@ -173,6 +142,7 @@ export async function decideLinuxModuleActivation(
     permitted: true,
     binding: binding.binding,
     delegatedRoot: delegatedRoot.root,
+    runtime,
     stopProver: new LinuxModuleCgroupStopProver({
       // The binding above is the proof this flag stands for. It is never set
       // from configuration or from a previous run's record.

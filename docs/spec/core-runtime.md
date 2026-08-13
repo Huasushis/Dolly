@@ -648,6 +648,16 @@ launcher closes the descriptor after Python has loaded it. Lower-level probes
 may still exercise an explicit path, but that path mode is not the installed
 composition and cannot support product activation evidence.
 
+The activation decision has no caller-selected interpreter, launcher, or
+confinement path. It checks the same closed runtime identity used by installed
+composition: fixed `/usr/bin/python3`, the colocated launcher with its reviewed
+digest, and fixed `/usr/bin/bwrap`. Its permitted result carries that identity
+beside the service binding and prepared delegated root. The default check
+requires both programs to be executable and recomputes the launcher digest;
+failure is `MODULE_ACTIVATION_LAUNCHER_UNAVAILABLE`. Installed execution still
+uses the separately frozen launcher descriptor, so the activation pathname
+check is not substituted for the no-TOCTOU execution boundary.
+
 Linux activation performs the delegated-root half of that proof before it
 returns permission to accept Module work. After verifying the exact Core
 service binding, it confirms that the delegated root contains no processes,
