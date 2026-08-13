@@ -846,6 +846,8 @@ export class ModuleScheduler {
   #lastProgressAt: number | null = null;
   #waitingWithoutProgressSince: number | null = null;
   #noProgressActive = false;
+  #noProgressBlockedSignature: string | null = null;
+  readonly #noProgressRelevantModuleIds = new Set<string>();
   #stopPromise: Promise<void> | null = null;
   #unsubscribeDeliveryChanges: (() => void) | null = null;
 
@@ -2191,7 +2193,7 @@ export class ModuleScheduler {
         entry.retryDelayMs = 0;
         entry.retryJitterMs = 0;
         entry.lastSuccessAt = now;
-        this.#recordProgress(now);
+        this.#recordProgress(entry, now);
         return;
       case "output-backpressured":
         entry.counters.outputBackpressured += 1;
@@ -2230,7 +2232,7 @@ export class ModuleScheduler {
         entry.retryDelayMs = 0;
         entry.retryJitterMs = 0;
         entry.lastFailureAt = now;
-        this.#recordProgress(now);
+        this.#recordProgress(entry, now);
         return;
       case "cancelled":
         entry.counters.cancelled += 1;
@@ -2374,8 +2376,15 @@ export class ModuleScheduler {
     this.#emitModule(entry, { type: "scheduler.quarantined", reason });
   }
 
-  #recordProgress(now: number): void {
+  #recordProgress(entry: ModuleEntry, now: number): void {
     this.#lastProgressAt = now;
+    // Progress in an independent branch must not reset a blocked subgraph's
+    // clock. Targets are included because a downstream commit may genuinely
+    // release the capacity an upstream result is waiting for.
+    if (
+      this.#noProgressBlockedSignature !== null &&
+      !this.#noProgressRelevantModuleIds.has(entry.moduleId)
+    ) return;
     this.#waitingWithoutProgressSince = null;
     this.#clearNoProgress(now);
   }
@@ -2398,6 +2407,39 @@ export class ModuleScheduler {
    * cycle appears in them directly.
    */
   #detectNoProgress(entries: readonly ModuleEntry[], now: number): void {
+    const blockedEdges = entries
+      .filter((entry) => entry.backpressured && entry.blockingDownstreamIds.length > 0)
+      .map((entry) => ({
+        moduleId: entry.moduleId,
+        blockedBy: [...entry.blockingDownstreamIds],
+      }));
+    const blockedSignature = blockedEdges.length === 0
+      ? null
+      : blockedEdges
+          .map((edge) => `${edge.moduleId}>${edge.blockedBy.join(",")}`)
+          .join(";");
+    const blockedEdgeTemporarilyInFlight =
+      blockedSignature === null &&
+      this.#noProgressBlockedSignature !== null &&
+      entries.some((entry) =>
+        entry.inFlight !== null &&
+        this.#noProgressRelevantModuleIds.has(entry.moduleId)
+      );
+    if (
+      !blockedEdgeTemporarilyInFlight &&
+      blockedSignature !== this.#noProgressBlockedSignature
+    ) {
+      this.#noProgressBlockedSignature = blockedSignature;
+      this.#noProgressRelevantModuleIds.clear();
+      for (const edge of blockedEdges) {
+        this.#noProgressRelevantModuleIds.add(edge.moduleId);
+        for (const moduleId of edge.blockedBy) {
+          this.#noProgressRelevantModuleIds.add(moduleId);
+        }
+      }
+      this.#waitingWithoutProgressSince = null;
+      this.#clearNoProgress(now);
+    }
     const workWaiting = entries.some((entry) =>
       (entry.pending.pendingCount > 0 || entry.outputCommitWaiting) &&
       entry.quarantineReason === null &&
@@ -2411,10 +2453,18 @@ export class ModuleScheduler {
     );
     if (!workWaiting) {
       this.#waitingWithoutProgressSince = null;
+      this.#noProgressBlockedSignature = null;
+      this.#noProgressRelevantModuleIds.clear();
       this.#clearNoProgress(now);
       return;
     }
-    if (this.#activeCount > 0) return;
+    const relevantWorkActive = this.#noProgressBlockedSignature === null
+      ? this.#activeCount > 0
+      : entries.some((entry) =>
+          entry.inFlight !== null &&
+          this.#noProgressRelevantModuleIds.has(entry.moduleId)
+        );
+    if (relevantWorkActive) return;
     this.#waitingWithoutProgressSince ??= now;
     const stalledForMs = now - this.#waitingWithoutProgressSince;
     if (stalledForMs < this.#noProgressAfterMs) {
@@ -2427,12 +2477,7 @@ export class ModuleScheduler {
       instanceId: this.#instanceId,
       monotonicAt: now,
       stalledForMs,
-      blockedEdges: entries
-        .filter((entry) => entry.backpressured && entry.blockingDownstreamIds.length > 0)
-        .map((entry) => ({
-          moduleId: entry.moduleId,
-          blockedBy: [...entry.blockingDownstreamIds],
-        })),
+      blockedEdges,
     });
   }
 

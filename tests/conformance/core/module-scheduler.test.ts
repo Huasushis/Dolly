@@ -1101,6 +1101,58 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
     await scheduler.stop();
   });
 
+  it("does not let unrelated in-flight work or its commit hide a blocked dependency cycle", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler({
+      noProgressAfterMs: 1_000,
+      maxConcurrentModules: 3,
+    });
+    for (const [moduleId, input, output] of [
+      ["alpha", "page-a", "page-b"],
+      ["beta", "page-b", "page-a"],
+    ] as const) {
+      mailboxes.set(moduleId, 4, 400);
+      scheduler.register({
+        moduleId,
+        runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+        inputPageIds: [input],
+        outputPageIds: [output],
+        mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+      });
+    }
+    const heartbeat = new FakeModuleRuntime();
+    mailboxes.set("heartbeat", 1, 10);
+    scheduler.register({
+      moduleId: "heartbeat",
+      runtime: heartbeat,
+      inputPageIds: ["heartbeat-input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 10, maxResidentBytes: 1_000 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+    expect(heartbeat.tickCount).toBe(1);
+    expect(scheduler.instanceStatus().activeModules).toBe(1);
+
+    await advance(clock, 500);
+    mailboxes.set("heartbeat", 0, 0);
+    heartbeat.settle(committedResult(1));
+    await drain(clock);
+    expect(scheduler.instanceStatus().activeModules).toBe(0);
+
+    await advance(clock, 600);
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toEqual([
+      expect.objectContaining({
+        blockedEdges: [
+          { moduleId: "alpha", blockedBy: ["beta"] },
+          { moduleId: "beta", blockedBy: ["alpha"] },
+        ],
+      }),
+    ]);
+
+    await scheduler.stop();
+  });
+
   it("ends a no-progress episode after external drain and times a later episode from its own start", async () => {
     const { clock, mailboxes, scheduler, events } = createScheduler({ noProgressAfterMs: 1_000 });
     for (const [moduleId, input, output] of [
