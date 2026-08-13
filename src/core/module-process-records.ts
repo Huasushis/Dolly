@@ -89,7 +89,9 @@ export interface ModuleProcessStoppedRecordWriter {
 }
 
 export interface ModuleSubmissionRecord {
-  readonly schemaVersion: "dolly.module-submission-record/1";
+  readonly schemaVersion:
+    | "dolly.module-submission-record/1"
+    | "dolly.module-submission-record/2";
   readonly moduleJobId: string;
   readonly claimToken: string;
   readonly runId: string;
@@ -98,6 +100,8 @@ export interface ModuleSubmissionRecord {
   readonly processGenerationId: string;
   readonly inputDigest: string;
   readonly createdAt: string;
+  /** Required and closed by the validator for version 2; forbidden for v1. */
+  readonly dispatchState?: "prepared" | "send-possible";
 }
 
 export type ModuleProcessRecordErrorCode =
@@ -110,6 +114,7 @@ export type ModuleProcessRecordErrorCode =
   | "MODULE_SUBMISSION_RECORD_INVALID"
   | "MODULE_SUBMISSION_RECORD_CONFLICT"
   | "MODULE_SUBMISSION_RECORD_NOT_FOUND"
+  | "MODULE_SUBMISSION_RECORD_STATE_INVALID"
   | "MODULE_SUBMISSION_RECORD_UNAUTHORIZED"
   /**
    * An older Core-state format cannot prove whether this Claim's submission
@@ -283,9 +288,7 @@ export function assertValidModuleSubmissionRecord(
 ): asserts value is ModuleSubmissionRecord {
   const code = "MODULE_SUBMISSION_RECORD_INVALID";
   if (!isPlainObject(value)) fail(code, "Module submission record must be an object");
-  assertClosedKeys(
-    value,
-    [
+  const commonKeys = [
       "schemaVersion",
       "moduleJobId",
       "claimToken",
@@ -295,12 +298,27 @@ export function assertValidModuleSubmissionRecord(
       "processGenerationId",
       "inputDigest",
       "createdAt",
-    ],
+    ] as const;
+  if (
+    value.schemaVersion !== "dolly.module-submission-record/1" &&
+    value.schemaVersion !== "dolly.module-submission-record/2"
+  ) {
+    fail(code, "Module submission record schema version is not supported");
+  }
+  assertClosedKeys(
+    value,
+    value.schemaVersion === "dolly.module-submission-record/2"
+      ? [...commonKeys, "dispatchState"]
+      : commonKeys,
     code,
     "Module submission record",
   );
-  if (value.schemaVersion !== "dolly.module-submission-record/1") {
-    fail(code, "Module submission record schema version is not supported");
+  if (
+    value.schemaVersion === "dolly.module-submission-record/2" &&
+    value.dispatchState !== "prepared" &&
+    value.dispatchState !== "send-possible"
+  ) {
+    fail(code, "Module submission record dispatchState is not supported");
   }
   for (const field of [
     "moduleJobId",

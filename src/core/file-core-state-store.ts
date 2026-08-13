@@ -140,12 +140,13 @@ interface CoreStateComponentPayload {
 }
 
 /**
- * The version 17 Core-state fields covered by `stateDigest`. Unlike versions
- * 15 and 16, the digest includes `schemaVersion`, so changing the format label
- * without constructing and validating a new document invalidates the digest.
+ * The version 18 Core-state fields covered by `stateDigest`. Version 18 is the
+ * first outer document that may contain Module submission-record/2 dispatch
+ * phases; changing only the nested record version inside version 17 is
+ * deliberately rejected.
  */
 export interface CoreStatePayload extends CoreStateComponentPayload {
-  readonly schemaVersion: "dolly.core-state/17";
+  readonly schemaVersion: "dolly.core-state/18";
   readonly moduleProcessRecords: readonly ModuleProcessRecord[];
   readonly moduleSubmissionRecords: readonly ModuleSubmissionRecord[];
   /**
@@ -175,9 +176,19 @@ interface CoreStateVersion16Document extends CoreStateComponentPayload {
   readonly moduleSubmissionRecords: readonly ModuleSubmissionRecord[];
 }
 
+interface CoreStateVersion17Document extends CoreStateComponentPayload {
+  readonly schemaVersion: "dolly.core-state/17";
+  readonly stateDigest: string;
+  readonly moduleProcessRecords: readonly ModuleProcessRecord[];
+  readonly moduleSubmissionRecords: readonly ModuleSubmissionRecord[];
+  readonly activeClaimsWithUnknownSubmissionHistory:
+    readonly DeliveryClaimIdentity[];
+}
+
 type DecodedCoreStateDocument =
   | CoreStateVersion15Document
   | CoreStateVersion16Document
+  | CoreStateVersion17Document
   | CoreStateDocument;
 
 interface ValidatedCoreStateComponents {
@@ -246,8 +257,10 @@ export interface CoreStateMigrationOptions {
   };
 }
 
-function stateDigest(payload: CoreStatePayload): string {
-  return canonicalJsonDigest(payload);
+function stateDigest(
+  payload: CoreStatePayload | Omit<CoreStateVersion17Document, "stateDigest">,
+): string {
+  return canonicalJsonDigest(payload as unknown as JsonValue);
 }
 
 function assertDocumentObject(
@@ -321,6 +334,7 @@ function assertCoreStateComponentPayload(
 
 function decodeModuleRecordCollections(
   value: Record<string, JsonValue>,
+  allowSubmissionVersion2: boolean,
 ): {
   readonly moduleProcessRecords: readonly ModuleProcessRecord[];
   readonly moduleSubmissionRecords: readonly ModuleSubmissionRecord[];
@@ -343,6 +357,15 @@ function decodeModuleRecordCollections(
     });
     moduleSubmissionRecords = value.moduleSubmissionRecords.map((record) => {
       assertValidModuleSubmissionRecord(record);
+      if (
+        !allowSubmissionVersion2 &&
+        record.schemaVersion !== "dolly.module-submission-record/1"
+      ) {
+        throw new ModuleProcessRecordError(
+          "MODULE_SUBMISSION_RECORD_INVALID",
+          "Core-state versions before 18 cannot contain Module submission record version 2",
+        );
+      }
       return record;
     });
     assertModuleRecordCollectionsConsistent(
@@ -430,7 +453,8 @@ function decodeCoreStateDocument(value: JsonValue): DecodedCoreStateDocument {
   if (
     schemaVersion !== "dolly.core-state/15" &&
     schemaVersion !== "dolly.core-state/16" &&
-    schemaVersion !== "dolly.core-state/17"
+    schemaVersion !== "dolly.core-state/17" &&
+    schemaVersion !== "dolly.core-state/18"
   ) {
     throw new CoreStateError(
       "CORE_STATE_DOCUMENT_INVALID",
@@ -470,7 +494,10 @@ function decodeCoreStateDocument(value: JsonValue): DecodedCoreStateDocument {
     });
   }
 
-  const records = decodeModuleRecordCollections(value);
+  const records = decodeModuleRecordCollections(
+    value,
+    schemaVersion === "dolly.core-state/18",
+  );
   if (schemaVersion === "dolly.core-state/16") {
     const legacyDigestPayload = { ...components, ...records };
     if (canonicalJsonDigest(legacyDigestPayload) !== value.stateDigest) {
@@ -486,19 +513,35 @@ function decodeCoreStateDocument(value: JsonValue): DecodedCoreStateDocument {
     });
   }
 
+  const unknownHistory = decodeUnknownSubmissionHistory(
+    value.activeClaimsWithUnknownSubmissionHistory as JsonValue,
+  );
+  if (schemaVersion === "dolly.core-state/17") {
+    const payload: Omit<CoreStateVersion17Document, "stateDigest"> = {
+      schemaVersion,
+      ...components,
+      ...records,
+      activeClaimsWithUnknownSubmissionHistory: unknownHistory,
+    };
+    if (stateDigest(payload) !== value.stateDigest) {
+      throw new CoreStateError(
+        "CORE_STATE_DOCUMENT_INVALID",
+        "Core state version 17 digest does not match its payload",
+      );
+    }
+    return deepFreeze({ stateDigest: value.stateDigest, ...payload });
+  }
+
   const payload: CoreStatePayload = {
     schemaVersion,
     ...components,
     ...records,
-    activeClaimsWithUnknownSubmissionHistory:
-      decodeUnknownSubmissionHistory(
-        value.activeClaimsWithUnknownSubmissionHistory as JsonValue,
-      ),
+    activeClaimsWithUnknownSubmissionHistory: unknownHistory,
   };
   if (stateDigest(payload) !== value.stateDigest) {
     throw new CoreStateError(
       "CORE_STATE_DOCUMENT_INVALID",
-      "Core state version 17 digest does not match its payload",
+      "Core state version 18 digest does not match its payload",
     );
   }
   return deepFreeze({ stateDigest: value.stateDigest, ...payload });
@@ -530,7 +573,7 @@ function createCoreStatePayload(
     readonly DeliveryClaimIdentity[],
 ): CoreStatePayload {
   return {
-    schemaVersion: "dolly.core-state/17",
+    schemaVersion: "dolly.core-state/18",
     revision,
     referenceGraph: referenceGraph.snapshot(),
     ...(media === undefined ? {} : { media: media.snapshot() }),
@@ -874,6 +917,7 @@ const MODULE_SUBMISSION_RECORD_FIELDS = new Set([
   "processGenerationId",
   "inputDigest",
   "createdAt",
+  "dispatchState",
 ]);
 
 function copyUnrecognizedFields(
@@ -966,6 +1010,9 @@ function copyModuleSubmissionRecordInput(
     processGenerationId: Reflect.get(source, "processGenerationId"),
     inputDigest: Reflect.get(source, "inputDigest"),
     createdAt: Reflect.get(source, "createdAt"),
+    ...(Reflect.get(source, "dispatchState") === undefined
+      ? {}
+      : { dispatchState: Reflect.get(source, "dispatchState") }),
   };
   copyUnrecognizedFields(
     source,
@@ -1197,7 +1244,8 @@ function validateCoreStateComponents(
         ? []
         : document.moduleSubmissionRecords;
     const unknownHistory =
-      document.schemaVersion === "dolly.core-state/17"
+      document.schemaVersion === "dolly.core-state/17" ||
+      document.schemaVersion === "dolly.core-state/18"
         ? document.activeClaimsWithUnknownSubmissionHistory
         : [];
     assertSubmissionRecordsMatchActiveClaims(
@@ -1995,6 +2043,68 @@ export class FileCoreStateStore {
   }
 
   /**
+   * Marks the unique point after which `module.execute` may be sent. The
+   * update is durable before the Host opens the effect Run or writes to its
+   * protocol channel; it never claims that delivery actually occurred.
+   */
+  markModuleSubmissionSendPossible(
+    suppliedIdentity: Omit<DeliveryClaimIdentity, "claimToken">,
+    processGenerationId: string,
+  ): ModuleSubmissionRecord {
+    this.#assertUsable();
+    const existing = this.#moduleSubmissionRecords.get(suppliedIdentity.runId);
+    if (existing === undefined) {
+      throw new ModuleProcessRecordError(
+        "MODULE_SUBMISSION_RECORD_NOT_FOUND",
+        `Module submission record for Run "${suppliedIdentity.runId}" does not exist`,
+      );
+    }
+    if (
+      existing.moduleJobId !== suppliedIdentity.moduleJobId ||
+      existing.runId !== suppliedIdentity.runId ||
+      existing.attempt !== suppliedIdentity.attempt ||
+      existing.moduleGenerationId !== suppliedIdentity.moduleGenerationId ||
+      existing.processGenerationId !== processGenerationId
+    ) {
+      throw new ModuleProcessRecordError(
+        "MODULE_SUBMISSION_RECORD_CONFLICT",
+        "Module submission dispatch transition must match the exact active Claim",
+      );
+    }
+    if (
+      existing.schemaVersion !== "dolly.module-submission-record/2" ||
+      existing.dispatchState !== "prepared"
+    ) {
+      throw new ModuleProcessRecordError(
+        "MODULE_SUBMISSION_RECORD_STATE_INVALID",
+        "Only a prepared version 2 Module submission may become send-possible",
+      );
+    }
+    const claim = this.#deliveries.inspectClaim(existing);
+    const processRecord = this.#moduleProcessRecords.get(
+      existing.processGenerationId,
+    );
+    if (claim.status !== "active" || processRecord?.state !== "running") {
+      throw new ModuleProcessRecordError(
+        "MODULE_SUBMISSION_RECORD_UNAUTHORIZED",
+        "A send-possible transition requires the exact active Claim and running process",
+      );
+    }
+    const updated = deepFreeze({
+      ...existing,
+      dispatchState: "send-possible" as const,
+    });
+    this.#moduleSubmissionRecords.set(suppliedIdentity.runId, updated);
+    try {
+      this.#persistCurrent();
+    } catch (error) {
+      this.#moduleSubmissionRecords.set(suppliedIdentity.runId, existing);
+      throw error;
+    }
+    return updated;
+  }
+
+  /**
    * Commits one exact Delivery Claim and removes its matching Module
    * submission record in the same Core-state update.
    */
@@ -2521,14 +2631,14 @@ export class FileCoreStateStore {
       );
     }
     const document = decodeCoreStateDocument(value);
-    if (document.schemaVersion !== "dolly.core-state/17") {
+    if (document.schemaVersion !== "dolly.core-state/18") {
       // A digest-valid older document can still contain an invalid nested
       // snapshot. Report corruption before suggesting a migration that must
       // refuse the same document.
       validateCoreStateComponents(document);
       throw new CoreStateError(
         "CORE_STATE_MIGRATION_REQUIRED",
-        `Core state uses ${document.schemaVersion} and requires an explicit migration to version 17`,
+        `Core state uses ${document.schemaVersion} and requires an explicit migration to version 18`,
       );
     }
     return document;
@@ -2639,12 +2749,13 @@ export type CoreStateMigrationResult =
       readonly status: "migrated";
       readonly sourceSchemaVersion:
         | "dolly.core-state/15"
-        | "dolly.core-state/16";
+        | "dolly.core-state/16"
+        | "dolly.core-state/17";
       readonly backupPath: string;
     }
   | {
       readonly status: "already-current";
-      readonly schemaVersion: "dolly.core-state/17";
+      readonly schemaVersion: "dolly.core-state/18";
     };
 
 function readCoreStateForMigration(
@@ -2683,8 +2794,11 @@ function readCoreStateForMigration(
   return { raw, document: decodeCoreStateDocument(value) };
 }
 
-function createVersion17Document(
-  source: CoreStateVersion15Document | CoreStateVersion16Document,
+function createVersion18Document(
+  source:
+    | CoreStateVersion15Document
+    | CoreStateVersion16Document
+    | CoreStateVersion17Document,
   components: ValidatedCoreStateComponents,
 ): CoreStateDocument {
   const processRecords =
@@ -2698,18 +2812,21 @@ function createVersion17Document(
   const submittedRuns = new Set(
     submissionRecords.map((record) => record.runId),
   );
-  const activeClaimsWithUnknownSubmissionHistory = components.deliveries
-    .listActiveClaims()
-    .filter((claim) => !submittedRuns.has(claim.runId))
-    .map((claim) =>
-      deepFreeze({
-        moduleJobId: claim.moduleJobId,
-        claimToken: claim.claimToken,
-        runId: claim.runId,
-        attempt: claim.attempt,
-        moduleGenerationId: claim.moduleGenerationId,
-      }),
-    );
+  const activeClaimsWithUnknownSubmissionHistory =
+    source.schemaVersion === "dolly.core-state/17"
+      ? source.activeClaimsWithUnknownSubmissionHistory
+      : components.deliveries
+          .listActiveClaims()
+          .filter((claim) => !submittedRuns.has(claim.runId))
+          .map((claim) =>
+            deepFreeze({
+              moduleJobId: claim.moduleJobId,
+              claimToken: claim.claimToken,
+              runId: claim.runId,
+              attempt: claim.attempt,
+              moduleGenerationId: claim.moduleGenerationId,
+            }),
+          );
   const payload = createCoreStatePayload(
     nextRevision(source.revision),
     components.referenceGraph,
@@ -2813,15 +2930,15 @@ function createOrVerifyMigrationBackup(
 }
 
 /**
- * Explicitly migrates a fully validated version 15 or version 16 Core-state
- * file directly to version 17. The caller remains responsible for running this
+ * Explicitly migrates a fully validated version 15, 16, or 17 Core-state file
+ * directly to version 18. The caller remains responsible for running this
  * only while the instance is stopped and no older Dolly process can write the
  * file. Migration takes the normal Core-state lock, increments the revision
  * once, writes an exact source-version backup, and atomically replaces the
  * primary file. A retry may reuse only a regular backup whose bytes exactly
  * equal the still-current source file.
  */
-export function migrateCoreStateDocumentToVersion17(
+export function migrateCoreStateDocumentToVersion18(
   path: string,
   options: CoreStateMigrationOptions,
 ): CoreStateMigrationResult {
@@ -2851,7 +2968,7 @@ export function migrateCoreStateDocumentToVersion17(
       document,
       options.runtimeConfiguration,
     );
-    if (document.schemaVersion === "dolly.core-state/17") {
+    if (document.schemaVersion === "dolly.core-state/18") {
       const reconstructedPayload = createCoreStatePayload(
         document.revision,
         components.referenceGraph,
@@ -2871,28 +2988,25 @@ export function migrateCoreStateDocumentToVersion17(
       synchronizeCoreStateFile(resolved);
       return deepFreeze({
         status: "already-current" as const,
-        schemaVersion: "dolly.core-state/17" as const,
+        schemaVersion: "dolly.core-state/18" as const,
       });
     }
 
-    const migrated = createVersion17Document(document, components);
+    const migrated = createVersion18Document(document, components);
     const decodedTarget = decodeCoreStateDocument(
       migrated as unknown as JsonValue,
     );
-    if (decodedTarget.schemaVersion !== "dolly.core-state/17") {
+    if (decodedTarget.schemaVersion !== "dolly.core-state/18") {
       throw new CoreStateError(
         "CORE_STATE_DOCUMENT_INVALID",
-        "Migration did not construct a version 17 Core-state document",
+        "Migration did not construct a version 18 Core-state document",
       );
     }
     validateCoreStateComponents(decodedTarget, options.runtimeConfiguration);
     assertMigrationTargetFits(migrated, maxBytes);
 
     const sourceVersion = document.schemaVersion;
-    const backupPath =
-      sourceVersion === "dolly.core-state/15"
-        ? `${resolved}.v15.backup`
-        : `${resolved}.v16.backup`;
+    const backupPath = `${resolved}.v${sourceVersion.slice(-2)}.backup`;
     createOrVerifyMigrationBackup(backupPath, raw);
     atomicWriteCoreStateFile(resolved, maxBytes, migrated);
     return deepFreeze({

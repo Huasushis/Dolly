@@ -94,6 +94,14 @@ export interface LinuxExtensionModuleExecutorOptions {
   readonly packageSnapshot?: LinuxExtensionPackageSnapshotInput;
   /** Build-reviewed launcher bytes; installed composition always supplies it. */
   readonly reviewedLauncherSnapshot?: LinuxExtensionReviewedLauncherSnapshotInput;
+  /** Store-bound transition at the unique Host protocol send boundary. */
+  readonly beforeDispatch?: (identity: {
+    readonly moduleJobId: string;
+    readonly runId: string;
+    readonly attempt: number;
+    readonly moduleGenerationId: string;
+    readonly processGenerationId: string;
+  }) => void;
   readonly executionTimeoutMs: number;
   readonly cancellationGraceMs: number;
   readonly terminationTimeoutMs: number;
@@ -384,6 +392,9 @@ export function createLinuxExtensionModuleExecutor(
     const session = createExtensionProcessLinuxProtocolSession(host, process, {
       executionTimeoutMs: options.executionTimeoutMs,
       cancellationGraceMs: options.cancellationGraceMs,
+      ...(options.beforeDispatch === undefined
+        ? {}
+        : { beforeDispatch: options.beforeDispatch }),
     });
     try {
       options.configureHost?.(host, process);

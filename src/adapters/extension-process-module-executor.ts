@@ -99,6 +99,13 @@ export function createExtensionProcessLinuxProtocolSession(
   options: {
     readonly executionTimeoutMs: number;
     readonly cancellationGraceMs: number;
+    readonly beforeDispatch?: (identity: {
+      readonly moduleJobId: string;
+      readonly runId: string;
+      readonly attempt: number;
+      readonly moduleGenerationId: string;
+      readonly processGenerationId: string;
+    }) => void;
   },
 ): LinuxModuleProtocolSession {
   const initialSnapshot = host.snapshot;
@@ -153,6 +160,17 @@ export function createExtensionProcessLinuxProtocolSession(
           responseTimeoutMs,
           hasMore: request.hasMore,
           input: request.input as unknown as JsonValue,
+          ...(options.beforeDispatch === undefined
+            ? {}
+            : {
+                beforeDispatch: () => options.beforeDispatch!({
+                  moduleJobId: request.moduleJobId,
+                  runId: request.runId,
+                  attempt: request.attempt,
+                  moduleGenerationId: initialSnapshot.moduleGenerationId,
+                  processGenerationId: initialSnapshot.processGenerationId,
+                }),
+              }),
         });
       } catch (error) {
         if (
@@ -186,6 +204,7 @@ export function createExtensionProcessModuleExecutor(
     readonly moduleGenerationId: string;
     readonly executionTimeoutMs: number;
     readonly cancellationGraceMs: number;
+    readonly beforeDispatch?: (context: ModuleRunContext) => void;
   },
 ): ModuleExecutor<ReactiveModuleInput, ReactiveModuleResult> {
   const initialSnapshot = host.snapshot;
@@ -250,6 +269,9 @@ export function createExtensionProcessModuleExecutor(
           responseTimeoutMs,
           hasMore: input.hasMore,
           input: input as unknown as JsonValue,
+          ...(options.beforeDispatch === undefined
+            ? {}
+            : { beforeDispatch: () => options.beforeDispatch!(context) }),
         });
       } catch (error) {
         if (

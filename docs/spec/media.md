@@ -630,7 +630,7 @@ execution or Extension Media read is enabled; it does not enable Module
 execution, Media upload from a Module result, or an isolated Extension Media
 read capability.
 
-The enabled path uses `dolly.media-store/9` inside `dolly.core-state/17`. It
+The enabled path uses `dolly.media-store/9` inside `dolly.core-state/18`. It
 persists upload and deletion state before external side effects, replays
 interrupted deletion and registration, verifies available local bytes, and then
 reconciles persistent uploads. Retryable and non-retryable failures remain
@@ -706,7 +706,7 @@ Current closed snapshot and message versions are:
 | Provider access grant | `dolly.media-access-grant/5` |
 | Provider access record | An entry in `dolly.media-store/9`; it has no separate schema |
 | Reference graph snapshot | `dolly.reference-graph/4` |
-| Core state document | `dolly.core-state/17` |
+| Core state document | `dolly.core-state/18` |
 | Block store snapshot | `dolly.block-store/3` |
 | Delivery store snapshot | `dolly.delivery-store/6` |
 | Media storage record | `dolly.media-storage-record/4` |
@@ -726,7 +726,7 @@ The Core state document is the one exception to rejection without a path
 forward, and it is still not an automatic migration. Reading
 `dolly.core-state/15` or `dolly.core-state/16` fails closed with
 `CORE_STATE_MIGRATION_REQUIRED`; an operator runs the explicit offline
-migration to `dolly.core-state/17` described in `core-runtime.md` Section 7.7
+migration to `dolly.core-state/18` described in `core-runtime.md` Section 7.7
 before starting the instance. Version 14 and earlier are rejected outright.
 
 There is no automatic migration from the rejected multi-object model. An

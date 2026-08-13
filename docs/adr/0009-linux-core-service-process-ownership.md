@@ -410,6 +410,14 @@ digest and authority to send. It is not a new job, Run, or execution identity.
 It is necessary because a crash between protocol send and result receipt
 otherwise makes it unsafe to decide whether a Run was executed.
 
+Version 2 narrows the pre-send crash window without claiming an impossible
+atomic relationship with the pipe write. Core first persists `prepared`. The
+unique Host boundary then persists `send-possible` before opening an effect Run
+or writing `module.execute`. After the old process is proven stopped,
+`prepared` proves the Run never became send-eligible; `send-possible` says only
+that a send may have started. Version 1 has no such distinction and is always
+treated like `send-possible` during recovery.
+
 For this decision, a **Core-state update** is one atomic replacement of the
 complete persisted Core state, including Delivery Claims, Module process
 records, and Module submission records. It is not another repository or result
@@ -422,15 +430,17 @@ versions, identity mismatches, a submission record that cannot be linked to its
 exact active Claim, a terminal Claim beside a submission record, or a partial
 or unknown update fail closed.
 
-Before `module.execute`, Core makes one confirmed Core-state update containing
-the exact active Claim, matching running process record, process generation,
-canonical input digest, and authority to send. It sends only after that update
-returns successfully. If the write result is uncertain, Core rereads the exact
-state; until it can prove the update's result, it does not send. Therefore a
+Before `module.execute`, Core first makes one confirmed Core-state update
+containing the exact active Claim, matching running process record, process
+generation, canonical input digest, and a version 2 `prepared` record. After
+all Host admission and deadline checks, it makes a second confirmed update to
+`send-possible`, then and only then may open an effect Run or write the
+protocol frame. If either write result is uncertain, Core does not send and
+rereads the exact state. Therefore a
 submission record absent from a valid recovered Core-state update means Core
 never received durable authority to send that Run only when the writer or an
-explicit migration is known to enforce this decision. Version 17 makes that
-distinction explicit. An **unknown submission history item** records the exact
+explicit migration is known to enforce this decision. Version 17 made absence
+explicit; version 18 adds the dispatch phase. An **unknown submission history item** records the exact
 identity of an active Claim migrated from an older Core-state format when Dolly
 cannot determine whether its submission record ever existed. It contains the
 Claim's `moduleJobId`, claim token, `runId`, attempt, and
@@ -496,12 +506,15 @@ The required startup reconciliation order is:
    record before marking a `prepared` journal record `committed`.
 4. For each remaining active Claim, inspect the matching process and submission
    records from that one Core-state update.
-5. In version 17, when neither a submission record nor an exact
+5. In version 18, when neither a submission record nor an exact
    unknown submission history item exists and every old process was proven
    stopped, release only the exact Claim with reason
    `never-authorized-to-send`. A matching unknown submission history item keeps
    the Claim active and blocks startup; ambiguous version 15 or version 16
-   absence never meets this condition directly.
+   absence never meets this condition directly. A version 2 `prepared`
+   submission is also releasable after its old process is proven stopped;
+   `send-possible` and every version 1 submission remain outcome-unknown
+   without additional evidence.
 6. A valid `prepared` journal record with its active Claim and submission record
    resumes under step 3; it is not an unknown outcome merely because the journal
    is not yet `committed`. If configured mailbox capacity is the only remaining
@@ -708,8 +721,8 @@ verify the interpreter before Module activation and fail closed when it is
 absent, in the same way it fails closed on missing systemd or cgroup version 2
 delegation.
 
-The explicit `migrate-core-state` command migrates Core-state version 15 or
-version 16 directly to the current version 17. It inspects the instance
+The explicit `migrate-core-state` command migrates Core-state version 15, 16,
+or 17 directly to the current version 18. It inspects the instance
 configuration, acquires that instance's controller lock, and then claims the
 same instance identity and configuration revision. While holding the lock, it
 restores and validates both the source and proposed target with the claimed
@@ -718,9 +731,9 @@ Core-state byte limit. Validation failure or a configuration revision change
 therefore leaves the source unchanged and creates no backup.
 
 A successful migration increments the Core-state revision exactly once. Its
-version 17 digest covers `schemaVersion` as well as the rest of the document.
+version 18 digest covers `schemaVersion` as well as the rest of the document.
 Before atomic replacement, migration writes an exact source-byte backup named
-for the actual source version, `.v15.backup` or `.v16.backup`. A retry may reuse
+for the actual source version, `.v15.backup`, `.v16.backup`, or `.v17.backup`. A retry may reuse
 that path only when it is a regular file whose bytes exactly match the
 still-current source; a partial or different backup fails closed.
 
@@ -740,7 +753,7 @@ is neither a submission record nor proof that sending was never authorized.
 unique by `runId`, and not overlap a submission record. It rejects ordinary
 submission creation, acknowledgement, negative acknowledgement, release, and
 result-commit acknowledgement for that Claim without changing state. Startup
-recovery also fails closed. Only a version 17 active Claim with neither a
+recovery also fails closed. Only a version 17 or version 18 active Claim with neither a
 submission record nor an exact unknown submission history item may be released
 as `never-authorized-to-send`, and only after every old process is proven
 stopped.

@@ -56,6 +56,13 @@ export interface ModuleProcessRecordStore {
     state: "running" | "stopping",
     failureCode?: string,
   ): ModuleProcessRecord;
+  /** Optional until the version-2 submission dispatch boundary is composed. */
+  markModuleSubmissionSendPossible?(identity: {
+    readonly moduleJobId: string;
+    readonly runId: string;
+    readonly attempt: number;
+    readonly moduleGenerationId: string;
+  }, processGenerationId: string): unknown;
 }
 
 /**

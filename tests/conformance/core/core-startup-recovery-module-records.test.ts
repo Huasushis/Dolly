@@ -755,6 +755,67 @@ describe("CORE startup reconciliation with Module records", () => {
     expect(store.deliveries.listActiveClaims()).toHaveLength(1);
   });
 
+  it("releases a prepared version 2 submission after its process is proven stopped", async () => {
+    const store = openStore("prepared-v2");
+    const claim = seedActiveClaim(store);
+    store.appendModuleProcessRecord(processRecord({
+      declaredExternalEffects: "unrestricted",
+    }));
+    store.updateModuleProcessRecordState("process-generation-1", "running");
+    const preparedSubmission = {
+      ...submissionFor(claim),
+      schemaVersion: "dolly.module-submission-record/2",
+      dispatchState: "prepared",
+    } as unknown as ModuleSubmissionRecord;
+    store.appendModuleSubmissionRecord(preparedSubmission);
+
+    const report = await new CoreStartupRecovery({
+      deliveries: store.deliveries,
+      commits: openCommits(store),
+      moduleRecords: store,
+      stoppedRecordWriter: stoppedRecordWriterFor(store),
+      processStopProver: provenStopped,
+    }).recover();
+
+    expect(report.releasedClaims).toEqual([
+      expect.objectContaining({
+        runId: claim.runId,
+        reason: "prepared-run-was-never-send-eligible",
+      }),
+    ]);
+    expect(store.deliveries.inspectClaim(claim).status).toBe("released");
+  });
+
+  it("preserves a send-possible version 2 submission as outcome-unknown", async () => {
+    const store = openStore("send-possible-v2");
+    const claim = seedActiveClaim(store);
+    store.appendModuleProcessRecord(processRecord({
+      declaredExternalEffects: "unrestricted",
+    }));
+    store.updateModuleProcessRecordState("process-generation-1", "running");
+    store.appendModuleSubmissionRecord({
+      ...submissionFor(claim),
+      schemaVersion: "dolly.module-submission-record/2",
+      dispatchState: "prepared",
+    });
+    store.markModuleSubmissionSendPossible(claim, "process-generation-1");
+
+    await expect(new CoreStartupRecovery({
+      deliveries: store.deliveries,
+      commits: openCommits(store),
+      moduleRecords: store,
+      stoppedRecordWriter: stoppedRecordWriterFor(store),
+      processStopProver: provenStopped,
+    }).recover()).rejects.toMatchObject({
+      code: "STARTUP_ACTIVE_CLAIM_UNRESOLVED",
+      message: expect.stringContaining("ambient effects are not excluded"),
+    });
+    expect(store.deliveries.inspectClaim(claim).status).toBe("active");
+    expect(store.getModuleSubmissionRecord(claim.runId)).toMatchObject({
+      dispatchState: "send-possible",
+    });
+  });
+
   it("does not trust a reopened version 1 no-effect declaration without configuration provenance", async () => {
     const store = openStore("first");
     const claim = seedActiveClaim(store);

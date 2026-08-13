@@ -65,6 +65,14 @@ function resolveSubmittedRun(
   ) {
     throw new Error("Module submission does not match the Host execution identity");
   }
+  if (
+    submission.schemaVersion === "dolly.module-submission-record/2" &&
+    submission.dispatchState !== "send-possible"
+  ) {
+    throw new Error(
+      "Module submission has not crossed the durable send-possible boundary",
+    );
+  }
   return {
     moduleJobId: submission.moduleJobId,
     runId: submission.runId,

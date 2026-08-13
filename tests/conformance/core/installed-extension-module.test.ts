@@ -326,6 +326,7 @@ function recordStore(): ModuleProcessRecordStore {
     updateModuleProcessRecordState: vi.fn(() => {
       throw new Error("the derivation must not update process records");
     }),
+    markModuleSubmissionSendPossible: vi.fn(),
   };
 }
 
@@ -937,6 +938,22 @@ describe("installed Extension Module resolution", () => {
     expect(derived.executorOptions.host.trust).toBe("trusted");
     expect(derived.executorOptions.host.moduleKind).toBe("transform");
     expect(derived.executorOptions.host.config).toEqual({ prefix: "verified" });
+    derived.executorOptions.beforeDispatch?.({
+      moduleJobId: "module-job-1",
+      runId: "run-1",
+      attempt: 1,
+      moduleGenerationId: MODULE_GENERATION_ID,
+      processGenerationId: PROCESS_IDENTITY.processGenerationId,
+    });
+    expect(records.markModuleSubmissionSendPossible).toHaveBeenCalledWith(
+      {
+        moduleJobId: "module-job-1",
+        runId: "run-1",
+        attempt: 1,
+        moduleGenerationId: MODULE_GENERATION_ID,
+      },
+      PROCESS_IDENTITY.processGenerationId,
+    );
     expect(executor.isolation).toBe("process");
     expect(records.appendModuleProcessRecord).not.toHaveBeenCalled();
     expect(stopped.writeStopped).not.toHaveBeenCalled();

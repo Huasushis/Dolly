@@ -386,6 +386,20 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
       digest: launcherDigest,
       stagingDirectory: options.coreStateDirectory,
     },
+    beforeDispatch: (identity) => {
+      const transition = options.lifecycle.records.markModuleSubmissionSendPossible;
+      if (typeof transition !== "function") {
+        throw new TypeError(
+          "Installed Linux execution requires a store-bound submission dispatch transition",
+        );
+      }
+      const { processGenerationId, ...claimIdentity } = identity;
+      transition.call(
+        options.lifecycle.records,
+        claimIdentity,
+        processGenerationId,
+      );
+    },
     host: {
       ...options.host,
       trust: resolvedModule.installation.trust,

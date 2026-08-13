@@ -14,7 +14,7 @@ import {
 import type { DeliveryClaimIdentity } from "../../../src/core/delivery-store.js";
 import {
   FileCoreStateStore,
-  migrateCoreStateDocumentToVersion17,
+  migrateCoreStateDocumentToVersion18,
 } from "../../../src/core/file-core-state-store.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import {
@@ -163,7 +163,7 @@ function seedMigratedState(path: string): SeededState {
     initial.deliveries.inspectClaimInput(identity),
   );
   rewriteAsVersion16(path);
-  expect(migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS)).toEqual({
+  expect(migrateCoreStateDocumentToVersion18(path, MIGRATION_OPTIONS)).toEqual({
     status: "migrated",
     sourceSchemaVersion: "dolly.core-state/16",
     backupPath: `${path}.v16.backup`,

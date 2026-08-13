@@ -96,7 +96,7 @@ export interface ReleasedClaimReport {
   readonly attempt: number;
   readonly moduleGenerationId: string;
   /**
-   * `never-authorized-to-send` means version 17 persisted the active Claim
+   * `never-authorized-to-send` means version 18 persisted the active Claim
    * without a Module submission record or a migration marker for unknown
    * history. Under that format's invariant, no Extension process-protocol send
    * was durably authorized for the Run.
@@ -106,9 +106,12 @@ export interface ReleasedClaimReport {
    * boundary. Version 1 declarations never authorize this disposition.
    * `external-effects-safe-to-retry` follows persistent evidence that the
    * submitted Run caused no effect or that retrying cannot add another effect.
+   * `prepared-run-was-never-send-eligible` is carried only by submission v2:
+   * its unique Host dispatch boundary was never durably entered.
    */
   readonly reason:
     | "never-authorized-to-send"
+    | "prepared-run-was-never-send-eligible"
     | "no-external-effect"
     | "external-effects-safe-to-retry";
 }
@@ -1005,6 +1008,15 @@ export class CoreStartupRecovery {
       return {
         kind: "outcome-unknown",
         reason: `matching Module process record is ${processRecord.state}`,
+      };
+    }
+    if (
+      submission.schemaVersion === "dolly.module-submission-record/2" &&
+      submission.dispatchState === "prepared"
+    ) {
+      return {
+        kind: "release",
+        reason: "prepared-run-was-never-send-eligible",
       };
     }
     if (processRecord.declaredExternalEffects === "unrestricted") {

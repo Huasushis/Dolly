@@ -403,6 +403,12 @@ export interface ExtensionExecuteInvocation {
   readonly responseTimeoutMs: number;
   readonly hasMore: boolean;
   readonly input: JsonValue;
+  /**
+   * Trusted synchronous persistence boundary invoked after all admission and
+   * deadline checks, but before an effect Run is opened or `module.execute`
+   * may be written. Throwing guarantees this Host sends nothing.
+   */
+  readonly beforeDispatch?: () => void;
 }
 
 export interface ExtensionProcessRunAdmission {
@@ -1184,7 +1190,24 @@ export class ExtensionProcessHost {
     if (typeof invocation.hasMore !== "boolean") {
       throw new ExtensionProcessHostError("EXTENSION_INVOCATION_INVALID", "hasMore must be boolean");
     }
+    if (
+      invocation.beforeDispatch !== undefined &&
+      (invocation.admission === undefined ||
+        typeof invocation.beforeDispatch !== "function")
+    ) {
+      throw new ExtensionProcessHostError(
+        "EXTENSION_INVOCATION_INVALID",
+        "beforeDispatch requires a prepared Run admission and must be a function",
+      );
+    }
     const input = immutableJson(invocation.input);
+    const dispatchPreparation = invocation.beforeDispatch?.() as unknown;
+    if (dispatchPreparation !== undefined) {
+      throw new ExtensionProcessHostError(
+        "EXTENSION_INVOCATION_INVALID",
+        "beforeDispatch must complete synchronously without returning a value",
+      );
+    }
     const effectIdentity = this.#openEffectRun({
       moduleJobId: invocation.moduleJobId,
       runId: invocation.runId,

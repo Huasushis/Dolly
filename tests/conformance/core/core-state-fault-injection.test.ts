@@ -30,7 +30,7 @@ import {
   CoreStateError,
   FileCoreStateStore,
   createFileCoreStateStoreWithStoppedRecordWriter,
-  migrateCoreStateDocumentToVersion17,
+  migrateCoreStateDocumentToVersion18,
 } from "../../../src/core/file-core-state-store.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import {
@@ -281,7 +281,7 @@ describe("CORE state atomic write fault injection", () => {
   function assertOneCompleteView(prefix: string, state: ClaimedState): "old" | "new" {
     const document = JSON.parse(readFileSync(path, "utf8")) as Record<string, JsonValue>;
     const { stateDigest, ...payload } = document;
-    expect(document.schemaVersion).toBe("dolly.core-state/17");
+    expect(document.schemaVersion).toBe("dolly.core-state/18");
     expect(canonicalJsonDigest(payload)).toBe(stateDigest);
     expect(readdirSync(root).filter(isTemporaryCoreStatePath)).toEqual([]);
 
@@ -746,7 +746,7 @@ describe("CORE state atomic write fault injection", () => {
     writeFileSync(backupPath, "earlier backup\n", "utf8");
 
     expect(() =>
-      migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS),
+      migrateCoreStateDocumentToVersion18(path, MIGRATION_OPTIONS),
     ).toThrowError(
       expect.objectContaining<Partial<CoreStateError>>({ code: "CORE_STATE_IO_FAILED" }),
     );
@@ -768,7 +768,7 @@ describe("CORE state atomic write fault injection", () => {
     writeFileSync(path, tamperedRaw, "utf8");
 
     expect(() =>
-      migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS),
+      migrateCoreStateDocumentToVersion18(path, MIGRATION_OPTIONS),
     ).toThrowError(
       expect.objectContaining<Partial<CoreStateError>>({
         code: "CORE_STATE_DOCUMENT_INVALID",
@@ -787,7 +787,7 @@ describe("CORE state atomic write fault injection", () => {
     };
 
     expect(() =>
-      migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS),
+      migrateCoreStateDocumentToVersion18(path, MIGRATION_OPTIONS),
     ).toThrowError(
       expect.objectContaining<Partial<CoreStateError>>({ code: "CORE_STATE_IO_FAILED" }),
     );
@@ -805,14 +805,14 @@ describe("CORE state atomic write fault injection", () => {
     // it is byte-for-byte identical to the still-current source file, the next
     // migration can verify and reuse it.
     expect(readFileSync(backupPath, "utf8")).toBe(raw);
-    expect(migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS)).toEqual({
+    expect(migrateCoreStateDocumentToVersion18(path, MIGRATION_OPTIONS)).toEqual({
       status: "migrated",
       sourceSchemaVersion: "dolly.core-state/15",
       backupPath: resolve(backupPath),
     });
 
     const migrated = openStore("migrated");
-    expect(migrated.snapshot().schemaVersion).toBe("dolly.core-state/17");
+    expect(migrated.snapshot().schemaVersion).toBe("dolly.core-state/18");
     expect(migrated.listModuleProcessRecords()).toEqual([]);
     expect(migrated.listModuleSubmissionRecords()).toEqual([]);
     expect(migrated.deliveries.listActiveClaims()).toHaveLength(1);
@@ -826,7 +826,7 @@ describe("CORE state atomic write fault injection", () => {
     };
 
     expect(() =>
-      migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS),
+      migrateCoreStateDocumentToVersion18(path, MIGRATION_OPTIONS),
     ).toThrowError(
       expect.objectContaining<Partial<CoreStateError>>({
         code: "CORE_STATE_IO_FAILED",
@@ -836,7 +836,7 @@ describe("CORE state atomic write fault injection", () => {
     expect(
       (JSON.parse(readFileSync(path, "utf8")) as Record<string, JsonValue>)
         .schemaVersion,
-    ).toBe("dolly.core-state/17");
+    ).toBe("dolly.core-state/18");
 
     let currentFileDescriptor: number | undefined;
     faults.afterOpen = (openedPath, flags, descriptor) => {
@@ -850,7 +850,7 @@ describe("CORE state atomic write fault injection", () => {
       }
     };
     expect(() =>
-      migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS),
+      migrateCoreStateDocumentToVersion18(path, MIGRATION_OPTIONS),
     ).toThrowError(
       expect.objectContaining<Partial<CoreStateError>>({
         code: "CORE_STATE_IO_FAILED",
@@ -859,9 +859,9 @@ describe("CORE state atomic write fault injection", () => {
     expect(currentFileDescriptor).toBeTypeOf("number");
 
     clearFaults();
-    expect(migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS)).toEqual({
+    expect(migrateCoreStateDocumentToVersion18(path, MIGRATION_OPTIONS)).toEqual({
       status: "already-current",
-      schemaVersion: "dolly.core-state/17",
+      schemaVersion: "dolly.core-state/18",
     });
   });
 });

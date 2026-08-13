@@ -194,7 +194,7 @@ describe("CORE Module process and submission records", () => {
     const reopened = openStore("second");
     expect(reopened.listModuleProcessRecords()).toEqual([record]);
     expect(reopened.getModuleProcessRecord("process-generation-1")).toEqual(record);
-    expect(reopened.snapshot().schemaVersion).toBe("dolly.core-state/17");
+    expect(reopened.snapshot().schemaVersion).toBe("dolly.core-state/18");
   });
 
   it("copies an accessor-based process record once before validation and persistence", () => {
@@ -527,6 +527,63 @@ describe("CORE Module process and submission records", () => {
     expect(() => store.appendModuleSubmissionRecord(submission)).toThrowError(
       expect.objectContaining<Partial<ModuleProcessRecordError>>({
         code: "MODULE_SUBMISSION_RECORD_CONFLICT",
+      }),
+    );
+  });
+
+  it("persists the prepared-to-send-possible transition before execution", () => {
+    const store = openStore("dispatch-transition");
+    const claim = seedActiveClaim(store);
+    store.appendModuleProcessRecord(processRecord());
+    store.updateModuleProcessRecordState("process-generation-1", "running");
+    store.appendModuleSubmissionRecord(submissionForClaim(store, claim, {
+      schemaVersion: "dolly.module-submission-record/2",
+      dispatchState: "prepared",
+    }));
+
+    expect(() => store.markModuleSubmissionSendPossible(
+      claim,
+      "process-generation-9",
+    )).toThrowError(
+      expect.objectContaining<Partial<ModuleProcessRecordError>>({
+        code: "MODULE_SUBMISSION_RECORD_CONFLICT",
+      }),
+    );
+
+    expect(store.markModuleSubmissionSendPossible(claim, "process-generation-1")).toMatchObject({
+      schemaVersion: "dolly.module-submission-record/2",
+      dispatchState: "send-possible",
+    });
+    expect(openStore("dispatch-reopened").getModuleSubmissionRecord(claim.runId))
+      .toMatchObject({ dispatchState: "send-possible" });
+    expect(() => store.markModuleSubmissionSendPossible(claim, "process-generation-1")).toThrowError(
+      expect.objectContaining<Partial<ModuleProcessRecordError>>({
+        code: "MODULE_SUBMISSION_RECORD_STATE_INVALID",
+      }),
+    );
+  });
+
+  it("rejects submission version 2 when relabeled into Core-state version 17", () => {
+    const store = openStore("outer-version");
+    const claim = seedActiveClaim(store);
+    store.appendModuleProcessRecord(processRecord());
+    store.updateModuleProcessRecordState("process-generation-1", "running");
+    store.appendModuleSubmissionRecord(submissionForClaim(store, claim, {
+      schemaVersion: "dolly.module-submission-record/2",
+      dispatchState: "prepared",
+    }));
+    const document = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    delete document.stateDigest;
+    document.schemaVersion = "dolly.core-state/17";
+    const legacy = {
+      stateDigest: canonicalJsonDigest(document as never),
+      ...document,
+    };
+    writeFileSync(path, `${JSON.stringify(legacy)}\n`, "utf8");
+
+    expect(() => openStore("invalid-v17")).toThrowError(
+      expect.objectContaining<Partial<CoreStateError>>({
+        code: "CORE_STATE_DOCUMENT_INVALID",
       }),
     );
   });

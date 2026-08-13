@@ -1,7 +1,7 @@
 import { join, resolve } from "node:path";
 import {
   CoreStateError,
-  migrateCoreStateDocumentToVersion17,
+  migrateCoreStateDocumentToVersion18,
   type CoreStateMigrationResult,
 } from "./core/file-core-state-store.js";
 import {
@@ -262,7 +262,7 @@ async function migrateCoreState(options: {
       configRevision: inspected.configRevision,
     });
     statePath = join(claimed.stateDirectory, "core-state.json");
-    result = migrateCoreStateDocumentToVersion17(statePath, {
+    result = migrateCoreStateDocumentToVersion18(statePath, {
       maxBytes: claimed.document.core.limits.maxStateBytes,
       runtimeConfiguration: {
         maxFailedAttempts: claimed.document.core.limits.maxFailedAttempts,
@@ -298,7 +298,7 @@ async function migrateCoreState(options: {
   }
   writeLine(
     stdout,
-    `Migrated ${statePath} from ${result.sourceSchemaVersion} to dolly.core-state/17`,
+    `Migrated ${statePath} from ${result.sourceSchemaVersion} to dolly.core-state/18`,
   );
   writeLine(stdout, `Backup:   ${result.backupPath}`);
   writeLine(

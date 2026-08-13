@@ -19,7 +19,7 @@ import {
 import {
   CoreStateError,
   FileCoreStateStore,
-  migrateCoreStateDocumentToVersion17,
+  migrateCoreStateDocumentToVersion18,
 } from "../../../src/core/file-core-state-store.js";
 import {
   MediaStore,
@@ -489,7 +489,7 @@ describe("CORE atomic file state", () => {
     openStore(path, "first");
     writeFileSync(
       path,
-      '{"schemaVersion":"dolly.core-state/17","revision":0,"revision":1,"stateDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","referenceGraph":{},"blocks":{},"deliveries":{},"moduleProcessRecords":[],"moduleSubmissionRecords":[],"activeClaimsWithUnknownSubmissionHistory":[]}',
+      '{"schemaVersion":"dolly.core-state/18","revision":0,"revision":1,"stateDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","referenceGraph":{},"blocks":{},"deliveries":{},"moduleProcessRecords":[],"moduleSubmissionRecords":[],"activeClaimsWithUnknownSubmissionHistory":[]}',
       "utf8",
     );
     expect(() => openStore(path, "bad-json")).toThrowError(
@@ -606,22 +606,22 @@ describe("CORE atomic file state", () => {
       }),
     );
 
-    expect(migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS)).toEqual({
+    expect(migrateCoreStateDocumentToVersion18(path, MIGRATION_OPTIONS)).toEqual({
       status: "migrated",
       sourceSchemaVersion: "dolly.core-state/15",
       backupPath: resolve(`${path}.v15.backup`),
     });
     const migrated = openStore(path, "migrated");
-    expect(migrated.snapshot().schemaVersion).toBe("dolly.core-state/17");
+    expect(migrated.snapshot().schemaVersion).toBe("dolly.core-state/18");
     expect(migrated.listModuleProcessRecords()).toEqual([]);
     expect(migrated.listModuleSubmissionRecords()).toEqual([]);
     expect(migrated.listActiveClaimsWithUnknownSubmissionHistory()).toEqual([]);
     expect(JSON.parse(readFileSync(`${path}.v15.backup`, "utf8"))).toMatchObject({
       schemaVersion: "dolly.core-state/15",
     });
-    expect(migrateCoreStateDocumentToVersion17(path, MIGRATION_OPTIONS)).toEqual({
+    expect(migrateCoreStateDocumentToVersion18(path, MIGRATION_OPTIONS)).toEqual({
       status: "already-current",
-      schemaVersion: "dolly.core-state/17",
+      schemaVersion: "dolly.core-state/18",
     });
   });
 });

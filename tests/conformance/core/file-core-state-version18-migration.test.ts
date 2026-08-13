@@ -18,7 +18,7 @@ import {
 const NOW = "2026-07-31T00:00:00.000Z";
 
 type JsonObject = Record<string, JsonValue>;
-type SourceVersion = "15" | "16";
+type SourceVersion = "15" | "16" | "17";
 
 interface ExactClaimIdentity {
   readonly moduleJobId: string;
@@ -35,20 +35,21 @@ interface SeededDocument {
   readonly version: SourceVersion;
 }
 
-type Version17MigrationResult =
+type Version18MigrationResult =
   | {
       readonly status: "migrated";
       readonly sourceSchemaVersion:
         | "dolly.core-state/15"
-        | "dolly.core-state/16";
+        | "dolly.core-state/16"
+        | "dolly.core-state/17";
       readonly backupPath: string;
     }
   | {
       readonly status: "already-current";
-      readonly schemaVersion: "dolly.core-state/17";
+      readonly schemaVersion: "dolly.core-state/18";
     };
 
-type Version17Migration = (
+type Version18Migration = (
   path: string,
   options: {
     readonly runtimeConfiguration: {
@@ -56,7 +57,7 @@ type Version17Migration = (
       readonly media: { readonly enabled: false };
     };
   },
-) => Version17MigrationResult;
+) => Version18MigrationResult;
 
 /**
  * `activeClaimsWithUnknownSubmissionHistory` stores exact active Claim
@@ -67,17 +68,17 @@ type Version17Migration = (
 const UNKNOWN_SUBMISSION_HISTORY_FIELD =
   "activeClaimsWithUnknownSubmissionHistory";
 
-function migrateToVersion17(path: string): ReturnType<Version17Migration> {
+function migrateToVersion18(path: string): ReturnType<Version18Migration> {
   const candidate = Reflect.get(
     fileCoreStateModule,
-    "migrateCoreStateDocumentToVersion17",
+    "migrateCoreStateDocumentToVersion18",
   );
   if (typeof candidate !== "function") {
     throw new Error(
-      "FileCoreStateStore must export migrateCoreStateDocumentToVersion17",
+      "FileCoreStateStore must export migrateCoreStateDocumentToVersion18",
     );
   }
-  return (candidate as Version17Migration)(path, {
+  return (candidate as Version18Migration)(path, {
     runtimeConfiguration: {
       maxFailedAttempts: 3,
       media: { enabled: false },
@@ -151,6 +152,23 @@ function writeVersion16(path: string): { readonly raw: string; readonly revision
   };
 }
 
+function writeVersion17(path: string): { readonly raw: string; readonly revision: number } {
+  const current = readDocument(path);
+  const payload: JsonObject = {
+    schemaVersion: "dolly.core-state/17",
+    ...version16Payload(current),
+    activeClaimsWithUnknownSubmissionHistory:
+      current.activeClaimsWithUnknownSubmissionHistory!,
+  };
+  const legacy: JsonObject = {
+    stateDigest: canonicalJsonDigest(payload),
+    ...payload,
+  };
+  const raw = `${JSON.stringify(legacy)}\n`;
+  writeFileSync(path, raw, "utf8");
+  return { raw, revision: legacy.revision as number };
+}
+
 function seedActiveClaim(
   path: string,
   version: SourceVersion,
@@ -192,7 +210,7 @@ function seedActiveClaim(
       version,
     };
   }
-  const legacy = writeVersion16(path);
+  const legacy = version === "16" ? writeVersion16(path) : writeVersion17(path);
   return {
     identity,
     raw: legacy.raw,
@@ -227,12 +245,12 @@ function writeNestedInvalidDocument(
   return { ...seeded, raw };
 }
 
-describe("explicit Core-state version 17 migration", () => {
+describe("explicit Core-state version 18 migration", () => {
   let root: string;
   let path: string;
 
   beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), "dolly-core-state-v17-migration-"));
+    root = mkdtempSync(join(tmpdir(), "dolly-core-state-v18-migration-"));
     path = join(root, "core-state.json");
   });
 
@@ -240,21 +258,23 @@ describe("explicit Core-state version 17 migration", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it.each<SourceVersion>(["15", "16"])(
-    "migrates version %s directly to version 17 and preserves the source bytes",
+  it.each<SourceVersion>(["15", "16", "17"])(
+    "migrates version %s directly to version 18 and preserves the source bytes",
     (version) => {
       const source = seedActiveClaim(path, version);
 
-      expect(migrateToVersion17(path)).toEqual({
+      expect(migrateToVersion18(path)).toEqual({
         status: "migrated",
         sourceSchemaVersion: `dolly.core-state/${version}`,
         backupPath: resolve(backupPath(path, version)),
       });
 
       const migrated = readDocument(path);
-      expect(migrated.schemaVersion).toBe("dolly.core-state/17");
+      expect(migrated.schemaVersion).toBe("dolly.core-state/18");
       expect(migrated.revision).toBe(source.revision + 1);
-      expect(migrated[UNKNOWN_SUBMISSION_HISTORY_FIELD]).toEqual([source.identity]);
+      expect(migrated[UNKNOWN_SUBMISSION_HISTORY_FIELD]).toEqual(
+        version === "17" ? [] : [source.identity],
+      );
       expect(migrated.moduleSubmissionRecords).toEqual([]);
       expect(readFileSync(backupPath(path, version), "utf8")).toBe(source.raw);
       expect(existsSync(backupPath(path, version === "15" ? "16" : "15"))).toBe(false);
@@ -263,7 +283,7 @@ describe("explicit Core-state version 17 migration", () => {
 
   it("does not treat a version 16 active Claim without a submission record as never submitted", () => {
     const source = seedActiveClaim(path, "16");
-    expect(migrateToVersion17(path)).toEqual({
+    expect(migrateToVersion18(path)).toEqual({
       status: "migrated",
       sourceSchemaVersion: "dolly.core-state/16",
       backupPath: resolve(backupPath(path, "16")),
@@ -280,9 +300,9 @@ describe("explicit Core-state version 17 migration", () => {
     expect(readFileSync(path, "utf8")).toBe(migratedRaw);
   });
 
-  it("increments revision once and includes the schema version in the version 17 digest", () => {
+  it("increments revision once and includes the schema version in the version 18 digest", () => {
     const source = seedActiveClaim(path, "16");
-    expect(migrateToVersion17(path)).toEqual({
+    expect(migrateToVersion18(path)).toEqual({
       status: "migrated",
       sourceSchemaVersion: "dolly.core-state/16",
       backupPath: resolve(backupPath(path, "16")),
@@ -309,13 +329,13 @@ describe("explicit Core-state version 17 migration", () => {
       const existingBackupPath = backupPath(path, version);
       writeFileSync(existingBackupPath, source.raw, "utf8");
 
-      expect(migrateToVersion17(path)).toEqual({
+      expect(migrateToVersion18(path)).toEqual({
         status: "migrated",
         sourceSchemaVersion: `dolly.core-state/${version}`,
         backupPath: resolve(existingBackupPath),
       });
       expect(readFileSync(existingBackupPath, "utf8")).toBe(source.raw);
-      expect(readDocument(path).schemaVersion).toBe("dolly.core-state/17");
+      expect(readDocument(path).schemaVersion).toBe("dolly.core-state/18");
     },
   );
 
@@ -335,7 +355,7 @@ describe("explicit Core-state version 17 migration", () => {
           : '{"different":"document"}\n';
       writeFileSync(existingBackupPath, existingBackup, "utf8");
 
-      expect(() => migrateToVersion17(path)).toThrowError(
+      expect(() => migrateToVersion18(path)).toThrowError(
         expect.objectContaining<Partial<CoreStateError>>({
           code: "CORE_STATE_IO_FAILED",
         }),
@@ -350,7 +370,7 @@ describe("explicit Core-state version 17 migration", () => {
     (version) => {
       const source = writeNestedInvalidDocument(path, version);
 
-      expect(() => migrateToVersion17(path)).toThrowError(
+      expect(() => migrateToVersion18(path)).toThrowError(
         expect.objectContaining<Partial<CoreStateError>>({
           code: "CORE_STATE_DOCUMENT_INVALID",
         }),

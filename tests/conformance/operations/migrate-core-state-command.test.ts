@@ -187,12 +187,12 @@ describe("dolly migrate-core-state", () => {
       const backupPath = `${statePath}.v${version}.backup`;
       expect(code, stderr.text).toBe(0);
       expect(stdout.text).toContain(
-        `from dolly.core-state/${version} to dolly.core-state/17`,
+        `from dolly.core-state/${version} to dolly.core-state/18`,
       );
       expect(stdout.text).toContain(`Backup:   ${backupPath}`);
       expect(readFileSync(backupPath, "utf8")).toBe(before);
       const migrated = JSON.parse(readFileSync(statePath, "utf8")) as JsonObject;
-      expect(migrated.schemaVersion).toBe("dolly.core-state/17");
+      expect(migrated.schemaVersion).toBe("dolly.core-state/18");
       expect(migrated.moduleProcessRecords).toEqual([]);
       expect(migrated.moduleSubmissionRecords).toEqual([]);
       expect(migrated.activeClaimsWithUnknownSubmissionHistory).toEqual([]);
@@ -222,7 +222,7 @@ describe("dolly migrate-core-state", () => {
     );
 
     expect(code).toBe(0);
-    expect(stdout.text).toContain("already dolly.core-state/17");
+    expect(stdout.text).toContain("already dolly.core-state/18");
     expect(readFileSync(statePath, "utf8")).toBe(before);
   });
 
@@ -406,7 +406,7 @@ describe("dolly migrate-core-state", () => {
 
     expect(code, stderr.text).toBe(0);
     expect(stdout.text).toContain(
-      "from dolly.core-state/16 to dolly.core-state/17",
+      "from dolly.core-state/16 to dolly.core-state/18",
     );
     expect(readFileSync(`${statePath}.v16.backup`, "utf8")).toBe(source);
   });

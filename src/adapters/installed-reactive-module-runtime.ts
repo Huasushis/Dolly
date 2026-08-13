@@ -386,12 +386,13 @@ function createInstalledReactiveModuleRuntimeInternal(
     },
     persistModuleSubmission: (request) => {
       options.core.appendModuleSubmissionRecord({
-        schemaVersion: "dolly.module-submission-record/1",
+        schemaVersion: "dolly.module-submission-record/2",
         ...request,
         processGenerationId: generations.processGenerationIdFor(
           request.moduleGenerationId,
         ),
         createdAt: now(),
+        dispatchState: "prepared",
       });
     },
     releaseDeliveryClaim: (identity) =>

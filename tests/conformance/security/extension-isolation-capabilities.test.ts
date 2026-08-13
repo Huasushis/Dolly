@@ -227,6 +227,62 @@ describe("Extension process isolation and capability checks", () => {
     }
   });
 
+  it("does not open or send a Run when the durable dispatch transition fails", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-dispatch-transition-"));
+    const host = createHost("normal", scratch);
+    const beforeDispatch = vi.fn(() => {
+      throw new Error("persist dispatch transition failed");
+    });
+    try {
+      await host.start();
+      const prepared = host.prepareRun(1_000);
+      if (prepared.status !== "ready") throw new Error("expected ready Run admission");
+      await expect(host.execute({
+        moduleJobId: "module-job-not-sent",
+        runId: "run-not-sent",
+        attempt: 1,
+        admission: prepared.admission,
+        responseTimeoutMs: 2_000,
+        hasMore: false,
+        input: {},
+        beforeDispatch,
+      })).rejects.toThrow("persist dispatch transition failed");
+      expect(beforeDispatch).toHaveBeenCalledOnce();
+      expect(host.snapshot.state).toBe("ready");
+      expect(Object.hasOwn(host.snapshot, "activeRun")).toBe(false);
+
+      const asynchronous = host.prepareRun(1_000);
+      if (asynchronous.status !== "ready") throw new Error("expected replacement admission");
+      await expect(host.execute({
+        moduleJobId: "module-job-async-boundary",
+        runId: "run-async-boundary",
+        attempt: 1,
+        admission: asynchronous.admission,
+        responseTimeoutMs: 2_000,
+        hasMore: false,
+        input: {},
+        beforeDispatch: async () => undefined,
+      })).rejects.toMatchObject({ code: "EXTENSION_INVOCATION_INVALID" });
+      expect(host.snapshot.state).toBe("ready");
+
+      const next = host.prepareRun(1_000);
+      if (next.status !== "ready") throw new Error("expected next admission");
+      await expect(host.execute({
+        moduleJobId: "module-job-next",
+        runId: "run-next",
+        attempt: 1,
+        admission: next.admission,
+        responseTimeoutMs: 2_000,
+        hasMore: false,
+        input: {},
+      })).resolves.toEqual({ ok: true, input: {} });
+      await host.stop();
+    } finally {
+      if (host.snapshot.state !== "stopped") await host.terminate().catch(() => undefined);
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("enforces a registry-selected strict streaming model policy in a real child", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "dolly-extension-installed-model-policy-"));
     const claim = {
