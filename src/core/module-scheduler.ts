@@ -1355,6 +1355,15 @@ export class ModuleScheduler {
     }
 
     const recoveryStartedAt = this.#clock.monotonicNow();
+    // Reading a runtime method or an injected clock is caller-owned synchronous
+    // code. Either access may re-enter stop(), so repeat the lifecycle gate
+    // after both reads and before this operation occupies an execution slot.
+    if (this.#state !== "running") {
+      return Promise.reject(new ModuleSchedulerError(
+        "SCHEDULER_RECOVERY_UNAVAILABLE",
+        `Module ${moduleId} cannot be recovered while Scheduler is ${this.#state}`,
+      ));
+    }
     this.#activeCount += 1;
     // Install the fence before invoking caller-owned runtime code. Deferring
     // the invocation to a microtask makes a synchronous reentrant recovery see

@@ -2738,6 +2738,56 @@ describe("CORE scheduler retry backoff", () => {
     await scheduler.stop();
   });
 
+  it("does not start recovery after a runtime getter synchronously stops the Scheduler", async () => {
+    const { clock, mailboxes, scheduler } = createScheduler();
+    const runtime = new FakeModuleRuntime(() => ({
+      ...claimIdentity(1),
+      status: "recovery-required",
+      reason: "commit-outcome-unknown",
+    })) as FakeModuleRuntime & {
+      readonly recover: () => Promise<ReactiveModuleRecoveryResult>;
+    };
+    let stopping: Promise<void> | undefined;
+    let recoveryCalls = 0;
+    Object.defineProperty(runtime, "recover", {
+      configurable: true,
+      get: () => {
+        stopping = scheduler.stop();
+        return async () => {
+          recoveryCalls += 1;
+          return retryResult(1);
+        };
+      },
+    });
+    mailboxes.set("worker", 1, 100);
+    scheduler.register({
+      moduleId: "worker",
+      runtime,
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 100, maxResidentBytes: 100_000 },
+    });
+    scheduler.start();
+    await drain(clock);
+
+    await expect(scheduler.recoverModule("worker")).rejects.toMatchObject({
+      code: "SCHEDULER_RECOVERY_UNAVAILABLE",
+    });
+    expect(stopping).toBeDefined();
+    await stopping;
+
+    expect(recoveryCalls).toBe(0);
+    expect(scheduler.state).toBe("stopped");
+    expect(scheduler.instanceStatus()).toMatchObject({
+      activeModules: 0,
+      quarantinedModules: 1,
+    });
+    expect(scheduler.status("worker")).toMatchObject({
+      schedulingState: "quarantined",
+      quarantineReason: "RECOVERY_REQUIRED:commit-outcome-unknown",
+    });
+  });
+
   it.each([
     {
       name: "an unknown status",
