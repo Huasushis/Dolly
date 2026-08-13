@@ -1439,6 +1439,50 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
     await scheduler.stop();
   });
 
+  it("does not publish another stalled component after an observer stops the Scheduler", async () => {
+    let stopping: Promise<void> | undefined;
+    const stalls: Extract<SchedulerEvent, { readonly type: "scheduler.no_progress" }>[] = [];
+    const { clock, mailboxes, scheduler } = createScheduler({
+      noProgressAfterMs: 1_000,
+      maxConcurrentModules: 4,
+      onEvent: (event) => {
+        if (event.type !== "scheduler.no_progress") return;
+        stalls.push(event);
+        stopping ??= scheduler.stop();
+      },
+    });
+    for (const [moduleId, input, output] of [
+      ["alpha", "page-a", "page-b"],
+      ["beta", "page-b", "page-a"],
+      ["gamma", "page-g", "page-d"],
+      ["delta", "page-d", "page-g"],
+    ] as const) {
+      mailboxes.set(moduleId, 4, 400);
+      scheduler.register({
+        moduleId,
+        runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+        inputPageIds: [input],
+        outputPageIds: [output],
+        mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+      });
+    }
+
+    scheduler.start();
+    await advance(clock, 1_100);
+    await stopping;
+
+    expect(stalls).toEqual([
+      expect.objectContaining({
+        blockedEdges: [
+          { moduleId: "alpha", blockedBy: ["beta"] },
+          { moduleId: "beta", blockedBy: ["alpha"] },
+        ],
+      }),
+    ]);
+    expect(scheduler.state).toBe("stopped");
+    expect(clock.liveTimerCount).toBe(0);
+  });
+
   it("ends a no-progress episode after external drain and times a later episode from its own start", async () => {
     const { clock, mailboxes, scheduler, events } = createScheduler({ noProgressAfterMs: 1_000 });
     for (const [moduleId, input, output] of [
