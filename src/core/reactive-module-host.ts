@@ -17,8 +17,12 @@ import {
   validateDollyInstanceConfig,
   type DollyInstanceConfig,
 } from "./runtime-config.js";
+import { deriveDollyInstanceV10SchedulerPlan } from "./runtime-config-v10.js";
 import type { ReactiveModuleRecoveryResult } from "./reactive-module-runtime.js";
-import type { SourceActivationSchedulerBinding } from "./source-activation-queue.js";
+import {
+  resolveSourceActivationSchedulerBinding,
+  type SourceActivationSchedulerBinding,
+} from "./source-activation-queue.js";
 
 export type ReactiveModuleHostState =
   | "created"
@@ -92,6 +96,44 @@ export interface ReactiveModuleHostComposition {
   readonly random?: () => number;
   /** Structured observation only; it cannot influence Scheduler decisions. */
   readonly onSchedulerEvent?: (event: SchedulerEvent) => void;
+}
+
+export interface ReservedV10ReactiveModuleRuntimeRegistration {
+  readonly moduleId: string;
+  readonly runtime: ManagedReactiveModuleRuntime;
+  readonly sourceActivationBinding?: SourceActivationSchedulerBinding;
+}
+
+export interface ReservedV10ReactiveModuleHostComposition {
+  /** Raw bytes are revalidated as the complete reserved version-10 document. */
+  readonly configuration: JsonValue;
+  readonly deliveries: SchedulerMailboxReader;
+  readonly clock: SchedulerClock;
+  readonly wallClockNow?: () => number;
+  readonly registrations: readonly ReservedV10ReactiveModuleRuntimeRegistration[];
+  readonly onSchedulerEvent?: (event: SchedulerEvent) => void;
+}
+
+function assertExactCompositionFields(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[],
+  label: string,
+): void {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  const allowed = new Set([...required, ...optional]);
+  const unknown = Reflect.ownKeys(value).filter(
+    (key) => typeof key !== "string" || !allowed.has(key),
+  );
+  if (unknown.length > 0) {
+    throw new TypeError(`${label} contains caller-supplied correctness fields`);
+  }
+  const missing = required.filter((key) => !Object.hasOwn(value, key));
+  if (missing.length > 0) {
+    throw new TypeError(`${label} is missing fields: ${missing.join(", ")}`);
+  }
 }
 
 /**
@@ -219,6 +261,137 @@ export function composeReactiveModuleHost(
     ...input.scheduling,
     random: input.random,
     onEvent: input.onSchedulerEvent,
+  });
+  return new ReactiveModuleHost(scheduler, hostRegistrations);
+}
+
+/**
+ * Connects the complete reserved version-10 Scheduler projection to an
+ * unstarted Host. Callers supply only runtime lifecycle handles (and the
+ * authenticated source binding when needed); Claim, mailbox, topology,
+ * concurrency, retry, backpressure, and watermark values all come from the
+ * same revalidated document.
+ *
+ * This is an internal product-before-bootstrap boundary. It does not resolve
+ * installed packages, policies, Linux process provenance, or startup recovery,
+ * and `openDollyRuntime` deliberately does not call it.
+ */
+export function composeReservedV10ReactiveModuleHost(
+  input: ReservedV10ReactiveModuleHostComposition,
+): ReactiveModuleHost {
+  assertExactCompositionFields(
+    input,
+    ["configuration", "deliveries", "clock", "registrations"],
+    ["wallClockNow", "onSchedulerEvent"],
+    "Reserved version-10 Scheduler composition",
+  );
+  if (!Array.isArray(input.registrations)) {
+    throw new TypeError("Reserved version-10 runtime registrations must be an array");
+  }
+  const supplied = new Map<string, ReservedV10ReactiveModuleRuntimeRegistration>();
+  for (const registration of input.registrations) {
+    assertExactCompositionFields(
+      registration,
+      ["moduleId", "runtime"],
+      ["sourceActivationBinding"],
+      "Reserved version-10 runtime registration",
+    );
+    if (supplied.has(registration.moduleId)) {
+      throw new TypeError(
+        `Reserved version-10 composition has duplicate runtime registration ${registration.moduleId}`,
+      );
+    }
+    supplied.set(registration.moduleId, registration);
+  }
+
+  const plan = deriveDollyInstanceV10SchedulerPlan(input.configuration);
+  const configuredIds = new Set(plan.modules.map((module) => module.moduleId));
+  const missing = plan.modules
+    .map((module) => module.moduleId)
+    .filter((moduleId) => !supplied.has(moduleId));
+  if (missing.length > 0) {
+    throw new TypeError(
+      `Reserved version-10 composition is missing runtime registrations: ${missing.join(", ")}`,
+    );
+  }
+  const unknown = [...supplied.keys()].filter((moduleId) => !configuredIds.has(moduleId));
+  if (unknown.length > 0) {
+    throw new TypeError(
+      `Reserved version-10 composition has unknown runtime registrations: ${unknown.join(", ")}`,
+    );
+  }
+
+  const hostRegistrations = plan.modules.map((module) => {
+    if (module.activation.kind === "periodic" && module.activation.allowEmptyInput) {
+      throw new TypeError(
+        `Reserved version-10 composition cannot schedule empty periodic Module ${module.moduleId}`,
+      );
+    }
+    const registration = supplied.get(module.moduleId)!;
+    if (
+      (module.activation.kind === "source") !==
+        (registration.sourceActivationBinding !== undefined)
+    ) {
+      throw new TypeError(
+        `Reserved version-10 source binding does not match Module ${module.moduleId}`,
+      );
+    }
+    if (module.activation.kind === "source") {
+      const source = resolveSourceActivationSchedulerBinding(
+        registration.sourceActivationBinding,
+        module.moduleId,
+        input.deliveries,
+      );
+      if (
+        source.maxResidentCount !== module.mailbox.maxResidentCount ||
+        source.maxResidentBytes !== module.mailbox.maxResidentBytes ||
+        source.maxRequestBytes !== module.sourceRequestMaxBytes
+      ) {
+        throw new TypeError(
+          `Reserved version-10 source queue limits do not match Module ${module.moduleId}`,
+        );
+      }
+    }
+    const activation = module.activation.kind === "periodic"
+      ? {
+          kind: "periodic" as const,
+          periodMs: module.activation.periodMs,
+          allowEmptyInput: false as const,
+        }
+      : module.activation;
+    return {
+      moduleId: module.moduleId,
+      runtime: registration.runtime,
+      inputPageIds: module.inputPageIds,
+      outputPageIds: module.outputPageIds,
+      mailbox: module.mailbox,
+      claimLimits: module.claimLimits,
+      activation,
+      ...(registration.sourceActivationBinding === undefined
+        ? {}
+        : { sourceActivationBinding: registration.sourceActivationBinding }),
+    } satisfies ReactiveModuleHostRegistration;
+  });
+
+  const configuredScheduler = plan.scheduler;
+  const scheduler = new ModuleScheduler({
+    instanceId: plan.instanceId,
+    deliveries: input.deliveries,
+    clock: input.clock,
+    ...(input.wallClockNow === undefined ? {} : { wallClockNow: input.wallClockNow }),
+    pollIntervalMs: configuredScheduler.pollIntervalMs,
+    retryBaseMs: configuredScheduler.retryBaseMs,
+    retryMaxMs: configuredScheduler.retryMaxMs,
+    maxConcurrentModules: configuredScheduler.maxConcurrentModules,
+    backpressureAction: configuredScheduler.backpressureAction,
+    downstreamRecheckMs: configuredScheduler.downstreamRecheckMs,
+    noProgressAfterMs: configuredScheduler.noProgressAfterMs,
+    retryJitterRatio: 0,
+    lowWatermarkBasisPoints: configuredScheduler.lowWatermarkBasisPoints,
+    onPolicyFailure: "quarantine",
+    ...(input.onSchedulerEvent === undefined
+      ? {}
+      : { onEvent: input.onSchedulerEvent }),
   });
   return new ReactiveModuleHost(scheduler, hostRegistrations);
 }

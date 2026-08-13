@@ -263,8 +263,8 @@ export interface ModuleSchedulerOptions {
    * Legacy defaults for direct registrations that omit `claimLimits`.
    * Product composition supplies a closed per-Module contract instead.
    */
-  readonly claimLimitCount: number;
-  readonly claimLimitBytes: number;
+  readonly claimLimitCount?: number;
+  readonly claimLimitBytes?: number;
   /** Defaults to the Section 13.3 fixed baseline. */
   readonly policy?: SchedulerPolicy;
   /** Section 14: fall back to a declared safe fixed policy, or fail visibly. */
@@ -283,6 +283,12 @@ export interface ModuleSchedulerOptions {
    * consumer is back under its configured bound.
    */
   readonly lowWatermarkRatio?: number;
+  /**
+   * Exact persisted low-watermark fraction in ten-thousandths. This is
+   * mutually exclusive with `lowWatermarkRatio` and avoids a floating-point
+   * slot error when a configured mailbox count is close to MAX_SAFE_INTEGER.
+   */
+  readonly lowWatermarkBasisPoints?: number;
   readonly onEvent?: (event: SchedulerEvent) => void;
 }
 
@@ -816,13 +822,14 @@ export class ModuleScheduler {
   readonly #backpressureAction: SchedulerBackpressureAction;
   readonly #downstreamRecheckMs: number;
   readonly #noProgressAfterMs: number;
-  readonly #defaultClaimLimitCount: number;
-  readonly #defaultClaimLimitBytes: number;
+  readonly #defaultClaimLimitCount: number | null;
+  readonly #defaultClaimLimitBytes: number | null;
   readonly #policy: SchedulerPolicy | undefined;
   readonly #onPolicyFailure: SchedulerPolicyFailureAction;
   readonly #retryJitterRatio: number;
   readonly #random: () => number;
   readonly #lowWatermarkRatio: number;
+  readonly #lowWatermarkBasisPoints: number | null;
   readonly #onEvent: ((event: SchedulerEvent) => void) | undefined;
 
   readonly #entries = new Map<string, ModuleEntry>();
@@ -855,8 +862,16 @@ export class ModuleScheduler {
     assertTimerDelay(options.downstreamRecheckMs, "downstreamRecheckMs");
     assertTimerDelay(options.noProgressAfterMs, "noProgressAfterMs");
     assertPositiveInteger(options.maxConcurrentModules, "maxConcurrentModules");
-    assertPositiveInteger(options.claimLimitCount, "claimLimitCount");
-    assertPositiveInteger(options.claimLimitBytes, "claimLimitBytes");
+    if ((options.claimLimitCount === undefined) !== (options.claimLimitBytes === undefined)) {
+      throw new ModuleSchedulerError(
+        "SCHEDULER_CONFIGURATION_INVALID",
+        "claimLimitCount and claimLimitBytes must either both be present or both be absent",
+      );
+    }
+    if (options.claimLimitCount !== undefined) {
+      assertPositiveInteger(options.claimLimitCount, "claimLimitCount");
+      assertPositiveInteger(options.claimLimitBytes!, "claimLimitBytes");
+    }
     if (options.retryMaxMs < options.retryBaseMs) {
       throw new ModuleSchedulerError(
         "SCHEDULER_CONFIGURATION_INVALID",
@@ -870,7 +885,30 @@ export class ModuleScheduler {
         "retryJitterRatio must be a finite fraction in [0, 1]",
       );
     }
-    const lowWatermarkRatio = options.lowWatermarkRatio ?? 1;
+    if (
+      options.lowWatermarkRatio !== undefined &&
+      options.lowWatermarkBasisPoints !== undefined
+    ) {
+      throw new ModuleSchedulerError(
+        "SCHEDULER_CONFIGURATION_INVALID",
+        "lowWatermarkRatio and lowWatermarkBasisPoints are mutually exclusive",
+      );
+    }
+    const lowWatermarkBasisPoints = options.lowWatermarkBasisPoints ?? null;
+    if (
+      lowWatermarkBasisPoints !== null &&
+      (!Number.isSafeInteger(lowWatermarkBasisPoints) ||
+        lowWatermarkBasisPoints < 1 ||
+        lowWatermarkBasisPoints > 10_000)
+    ) {
+      throw new ModuleSchedulerError(
+        "SCHEDULER_CONFIGURATION_INVALID",
+        "lowWatermarkBasisPoints must be an integer in [1, 10000]",
+      );
+    }
+    const lowWatermarkRatio = lowWatermarkBasisPoints === null
+      ? options.lowWatermarkRatio ?? 1
+      : 1;
     if (!Number.isFinite(lowWatermarkRatio) || lowWatermarkRatio <= 0 || lowWatermarkRatio > 1) {
       throw new ModuleSchedulerError(
         "SCHEDULER_CONFIGURATION_INVALID",
@@ -928,11 +966,12 @@ export class ModuleScheduler {
     this.#backpressureAction = options.backpressureAction;
     this.#downstreamRecheckMs = options.downstreamRecheckMs;
     this.#noProgressAfterMs = options.noProgressAfterMs;
-    this.#defaultClaimLimitCount = options.claimLimitCount;
-    this.#defaultClaimLimitBytes = options.claimLimitBytes;
+    this.#defaultClaimLimitCount = options.claimLimitCount ?? null;
+    this.#defaultClaimLimitBytes = options.claimLimitBytes ?? null;
     this.#retryJitterRatio = jitterRatio;
     this.#random = options.random ?? Math.random;
     this.#lowWatermarkRatio = lowWatermarkRatio;
+    this.#lowWatermarkBasisPoints = lowWatermarkBasisPoints;
     this.#onPolicyFailure = options.onPolicyFailure ?? "fallback-baseline";
     this.#onEvent = options.onEvent;
     this.#policy = options.policy;
@@ -1004,12 +1043,22 @@ export class ModuleScheduler {
     }
     assertPositiveInteger(registration.mailbox.maxResidentCount, "mailbox.maxResidentCount");
     assertPositiveInteger(registration.mailbox.maxResidentBytes, "mailbox.maxResidentBytes");
-    const claimLimits = registration.claimLimits ?? {
-      baselineCount: this.#defaultClaimLimitCount,
-      baselineBytes: this.#defaultClaimLimitBytes,
-      maxCount: this.#defaultClaimLimitCount,
-      maxBytes: this.#defaultClaimLimitBytes,
-    };
+    const claimLimits = registration.claimLimits ?? (
+      this.#defaultClaimLimitCount === null || this.#defaultClaimLimitBytes === null
+        ? null
+        : {
+            baselineCount: this.#defaultClaimLimitCount,
+            baselineBytes: this.#defaultClaimLimitBytes,
+            maxCount: this.#defaultClaimLimitCount,
+            maxBytes: this.#defaultClaimLimitBytes,
+          }
+    );
+    if (claimLimits === null) {
+      throw new ModuleSchedulerError(
+        "SCHEDULER_CONFIGURATION_INVALID",
+        "Module registration requires explicit Claim limits when Scheduler defaults are absent",
+      );
+    }
     const baselineClaimLimitCount = claimLimits.baselineCount;
     const baselineClaimLimitBytes = claimLimits.baselineBytes;
     const maxClaimLimitCount = claimLimits.maxCount;
@@ -1064,6 +1113,15 @@ export class ModuleScheduler {
         throw new ModuleSchedulerError(
           "SCHEDULER_CONFIGURATION_INVALID",
           "The source activation binding is not authentic for this Module and Core store",
+        );
+      }
+      if (
+        authority.maxResidentCount !== registration.mailbox.maxResidentCount ||
+        authority.maxResidentBytes !== registration.mailbox.maxResidentBytes
+      ) {
+        throw new ModuleSchedulerError(
+          "SCHEDULER_CONFIGURATION_INVALID",
+          "Source activation queue limits do not match the Scheduler mailbox",
         );
       }
       sourcePrivatePageId = authority.privatePageId;
@@ -1665,10 +1723,19 @@ export class ModuleScheduler {
       return;
     }
     if (!entry.mailboxFull) return;
-    const resumeCount = Math.floor(entry.maxResidentCount * this.#lowWatermarkRatio);
-    const resumeBytes = Math.floor(entry.maxResidentBytes * this.#lowWatermarkRatio);
+    const resumeCount = this.#lowWatermarkThreshold(entry.maxResidentCount);
+    const resumeBytes = this.#lowWatermarkThreshold(entry.maxResidentBytes);
     entry.mailboxFull =
       entry.resident.residentCount > resumeCount || entry.resident.residentBytes > resumeBytes;
+  }
+
+  #lowWatermarkThreshold(maximum: number): number {
+    if (this.#lowWatermarkBasisPoints === null) {
+      return Math.floor(maximum * this.#lowWatermarkRatio);
+    }
+    return Number(
+      (BigInt(maximum) * BigInt(this.#lowWatermarkBasisPoints)) / 10_000n,
+    );
   }
 
   #downstreamPressure(entry: ModuleEntry): readonly DownstreamPressure[] {

@@ -807,6 +807,20 @@ floating-point intermediate.
 Experimental policies do not become product configuration merely because the
 Scheduler accepts an injected policy in a test or research runner.
 
+The Scheduler library accepts this exact basis-point value separately from its
+legacy test/candidate ratio input and rejects supplying both. It evaluates the
+integer threshold without an overflowing number multiplication. The reserved
+version-10 projection also omits the legacy instance-wide Claim default:
+every registration must carry the baseline and maximum from its own Module
+record. `deriveDollyInstanceV10SchedulerPlan` and
+`composeReservedV10ReactiveModuleHost` implement this pure, unstarted
+configuration-to-Scheduler boundary. The latter accepts only runtime lifecycle
+handles and an authenticated source binding; it rejects a second mailbox,
+Claim, topology, concurrency, retry, backpressure, or watermark input. This is
+product-before-bootstrap evidence only. It does not resolve installations,
+permission-policy records, process-record provenance, or startup recovery, and
+the public Module startup refusal remains in force.
+
 The three version-9 Scheduler intervals keep their existing bounds:
 `pollIntervalMs` is at most 60,000, `retryBaseMs` is at most 3,600,000, and
 `retryMaxMs` is at most 86,400,000, with retry maximum no smaller than retry

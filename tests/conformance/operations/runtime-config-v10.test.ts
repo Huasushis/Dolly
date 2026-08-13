@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { cloneJson, type JsonValue } from "../../../src/core/canonical-json.js";
 import {
+  composeReservedV10ReactiveModuleHost,
+  type ManagedReactiveModuleRuntime,
+} from "../../../src/core/reactive-module-host.js";
+import {
+  deriveDollyInstanceV10SchedulerPlan,
   planDollyInstanceConfigV10Migration,
   validateDollyInstanceConfigV10Draft,
 } from "../../../src/core/runtime-config-v10.js";
@@ -188,6 +193,25 @@ function version9ModuleConfiguration() {
       },
     }],
   });
+}
+
+function immediateSchedulerClock() {
+  return {
+    monotonicNow: () => 0,
+    schedule: (delayMs: number, callback: () => void) => {
+      let cancelled = false;
+      if (delayMs === 0) {
+        queueMicrotask(() => {
+          if (!cancelled) callback();
+        });
+      }
+      return {
+        cancel: () => {
+          cancelled = true;
+        },
+      };
+    },
+  };
 }
 
 function version9SourceModuleConfiguration() {
@@ -435,6 +459,83 @@ describe("reserved Dolly instance version 10 configuration", () => {
         mailbox: { maxResidentCount: 2, maxResidentBytes: 8_192 },
       } },
     ], pages) as JsonValue).modules).toHaveLength(2);
+  });
+});
+
+describe("reserved version 10 Scheduler composition", () => {
+  it("derives every Scheduler and per-Module correctness value from the document", () => {
+    const plan = deriveDollyInstanceV10SchedulerPlan(configuration() as JsonValue);
+
+    expect(plan).toEqual({
+      schemaVersion: "dolly.instance-v10-scheduler-plan/1",
+      instanceId: INSTANCE_ID,
+      scheduler: scheduler(),
+      modules: [{
+        moduleId: "worker",
+        inputPageIds: ["input"],
+        outputPageIds: ["output"],
+        mailbox: { maxResidentCount: 16, maxResidentBytes: 64 * 1_024 },
+        claimLimits: {
+          baselineCount: 2,
+          baselineBytes: 1_024,
+          maxCount: 4,
+          maxBytes: 4_096,
+        },
+        sourceRequestMaxBytes: null,
+        activation: { kind: "reactive" },
+      }],
+    });
+    expect(Object.isFrozen(plan)).toBe(true);
+    expect(Object.isFrozen(plan.scheduler)).toBe(true);
+    expect(Object.isFrozen(plan.modules[0])).toBe(true);
+  });
+
+  it("drives exact per-Module Claim baselines and rejects a second correctness input", async () => {
+    const tick = vi.fn(async () => ({ status: "idle" as const }));
+    const managed: ManagedReactiveModuleRuntime = {
+      moduleGenerationId: "worker-generation",
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+      tick,
+    };
+    const input = {
+      configuration: configuration() as JsonValue,
+      deliveries: {
+        inspectPending: () => ({ pendingCount: 1, pendingBytes: 128 }),
+        inspectResident: () => ({
+          pendingCount: 1,
+          pendingBytes: 128,
+          claimedCount: 0,
+          claimedBytes: 0,
+          residentCount: 1,
+          residentBytes: 128,
+        }),
+      },
+      clock: immediateSchedulerClock(),
+      registrations: [{ moduleId: "worker", runtime: managed }],
+    } as const;
+
+    expect(() => composeReservedV10ReactiveModuleHost({
+      ...input,
+      scheduling: { claimLimitCount: 99 },
+    } as never)).toThrow(/caller-supplied correctness fields/u);
+    expect(() => composeReservedV10ReactiveModuleHost({
+      ...input,
+      registrations: [{
+        moduleId: "worker",
+        runtime: managed,
+        mailbox: { maxResidentCount: 1, maxResidentBytes: 1 },
+      }],
+    } as never)).toThrow(/caller-supplied correctness fields/u);
+
+    const host = composeReservedV10ReactiveModuleHost(input);
+    await host.start();
+    await vi.waitFor(() => expect(tick).toHaveBeenCalledTimes(1));
+    expect(tick).toHaveBeenCalledWith({
+      claimLimitCount: 2,
+      claimLimitBytes: 1_024,
+    });
+    await host.stop();
   });
 });
 

@@ -778,6 +778,42 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
     await scheduler.stop();
   });
 
+  it("applies configured low-watermark basis points without a floating-point slot error", async () => {
+    const maximum = Number.MAX_SAFE_INTEGER;
+    const basisPoints = 9_999;
+    const exactResumeCount = Number(
+      (BigInt(maximum) * BigInt(basisPoints)) / 10_000n,
+    );
+    const { clock, mailboxes, scheduler } = createScheduler({
+      lowWatermarkBasisPoints: basisPoints,
+    } as HarnessOptions & { readonly lowWatermarkBasisPoints: number });
+    mailboxes.set("worker", maximum, 0);
+    scheduler.register({
+      moduleId: "worker",
+      runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: {
+        maxResidentCount: maximum,
+        maxResidentBytes: maximum,
+      },
+    });
+    scheduler.start();
+    await drain(clock);
+    expect(scheduler.status("worker").mailboxFull).toBe(true);
+
+    // A binary floating-point multiplication rounds this exact value up by
+    // one slot, which would resume the mailbox too early.
+    mailboxes.set("worker", exactResumeCount + 1, 0);
+    await advance(clock, 100);
+    expect(scheduler.status("worker").mailboxFull).toBe(true);
+
+    mailboxes.set("worker", exactResumeCount, 0);
+    await advance(clock, 100);
+    expect(scheduler.status("worker").mailboxFull).toBe(false);
+    await scheduler.stop();
+  });
+
   it("pauses an upstream Module while a downstream mailbox is at its bound and resumes after it drains", async () => {
     const harness = fanOut();
     registerFanOut(harness, ["producer", "left", "right"]);
@@ -2973,6 +3009,10 @@ describe("CORE scheduler configuration and observability", () => {
       { retryMaxMs: 100 },
       { retryJitterRatio: 1.5 },
       { lowWatermarkRatio: 0 },
+      { lowWatermarkBasisPoints: 0 },
+      { lowWatermarkBasisPoints: 10_001 },
+      { lowWatermarkRatio: 0.5, lowWatermarkBasisPoints: 5_000 },
+      { claimLimitBytes: undefined },
       { instanceId: "not a valid id" },
     ]) {
       expect(() => new ModuleScheduler({ ...base, ...override })).toThrowError(
@@ -2988,6 +3028,44 @@ describe("CORE scheduler configuration and observability", () => {
       code: "SCHEDULER_CONFIGURATION_INVALID",
     }));
     expect(() => new ModuleScheduler(base)).not.toThrow();
+  });
+
+  it("requires each registration to carry Claim limits when no legacy defaults exist", () => {
+    const { claimLimitCount: _count, claimLimitBytes: _bytes, ...withoutDefaults } = {
+      instanceId: "instance-1",
+      deliveries: new FakeMailboxes(),
+      clock: new FakeSchedulerClock(),
+      pollIntervalMs: 100,
+      retryBaseMs: 250,
+      retryMaxMs: 1_000,
+      maxConcurrentModules: 2,
+      backpressureAction: "pause-upstream" as const,
+      downstreamRecheckMs: 50,
+      noProgressAfterMs: 1_000,
+      claimLimitCount: 8,
+      claimLimitBytes: 4_096,
+    };
+    const scheduler = new ModuleScheduler(withoutDefaults);
+    const registration = {
+      moduleId: "worker",
+      runtime: new FakeModuleRuntime(),
+      inputPageIds: ["input"],
+      outputPageIds: [],
+      mailbox: { maxResidentCount: 1, maxResidentBytes: 256 },
+    };
+
+    expect(() => scheduler.register(registration)).toThrowError(
+      expect.objectContaining({ code: "SCHEDULER_CONFIGURATION_INVALID" }),
+    );
+    expect(() => scheduler.register({
+      ...registration,
+      claimLimits: {
+        baselineCount: 1,
+        baselineBytes: 256,
+        maxCount: 1,
+        maxBytes: 256,
+      },
+    })).not.toThrow();
   });
 
   it("rejects a duplicate Module and an unknown Module lookup", () => {

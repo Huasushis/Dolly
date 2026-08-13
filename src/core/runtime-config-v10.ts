@@ -161,6 +161,34 @@ export interface DollyInstanceV10MigrationPlan {
   readonly document: DollyInstanceConfigV10Draft;
 }
 
+export interface DollyInstanceV10SchedulerModulePlan {
+  readonly moduleId: string;
+  readonly inputPageIds: readonly string[];
+  readonly outputPageIds: readonly string[];
+  readonly mailbox: DollyModuleMailboxLimitsV10;
+  readonly claimLimits: DollyModuleClaimLimitsV10;
+  readonly sourceRequestMaxBytes: number | null;
+  readonly activation:
+    | Readonly<{ readonly kind: "reactive" }>
+    | Readonly<{ readonly kind: "source" }>
+    | Readonly<{
+        readonly kind: "periodic";
+        readonly periodMs: number;
+        readonly allowEmptyInput: boolean;
+      }>;
+}
+
+/**
+ * The exact Scheduler-owned projection of one reserved version-10 document.
+ * It deliberately contains no caller-supplied defaults or policy objects.
+ */
+export interface DollyInstanceV10SchedulerPlan {
+  readonly schemaVersion: "dolly.instance-v10-scheduler-plan/1";
+  readonly instanceId: string;
+  readonly scheduler: DollySchedulerConfigV10;
+  readonly modules: readonly DollyInstanceV10SchedulerModulePlan[];
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
@@ -744,6 +772,39 @@ export function validateDollyInstanceConfigV10Draft(value: JsonValue): DollyInst
     pages: projected.pages,
     modules,
     logging: projected.logging,
+  });
+}
+
+/**
+ * Revalidates and projects the complete reserved document into the only
+ * correctness values a Scheduler composition may consume. This does not
+ * register version 10 with product bootstrap and it performs no I/O.
+ */
+export function deriveDollyInstanceV10SchedulerPlan(
+  value: JsonValue,
+): DollyInstanceV10SchedulerPlan {
+  const configuration = validateDollyInstanceConfigV10Draft(value);
+  return deepFreeze({
+    schemaVersion: "dolly.instance-v10-scheduler-plan/1",
+    instanceId: configuration.instanceId,
+    scheduler: configuration.core.scheduler,
+    modules: configuration.modules.map((module) => ({
+      moduleId: module.moduleId,
+      inputPageIds: module.inputConnections.map((connection) => connection.pageId),
+      outputPageIds: [...module.outputPageIds],
+      mailbox: module.limits.mailbox,
+      claimLimits: module.limits.claim,
+      sourceRequestMaxBytes: module.limits.sourceRequestMaxBytes,
+      activation: module.activation.kind === "periodic"
+        ? {
+            kind: "periodic" as const,
+            periodMs: module.activation.periodMs,
+            allowEmptyInput: module.activation.allowEmptyInput,
+          }
+        : module.activation.kind === "source"
+          ? { kind: "source" as const }
+          : { kind: "reactive" as const },
+    })),
   });
 }
 

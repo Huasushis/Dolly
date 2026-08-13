@@ -380,6 +380,21 @@ describe("Core-private source activation queue", () => {
       runtime,
       inputPageIds: [],
       outputPageIds: [],
+      mailbox: { maxResidentCount: 3, maxResidentBytes: 4096 },
+      claimLimits: {
+        baselineCount: 1,
+        baselineBytes: 2048,
+        maxCount: 1,
+        maxBytes: 4096,
+      },
+      activation: { kind: "source" },
+      sourceActivationBinding: binding,
+    })).toThrow(/queue limits do not match/u);
+    expect(() => scheduler.register({
+      moduleId: "source-module",
+      runtime,
+      inputPageIds: [],
+      outputPageIds: [],
       mailbox: { maxResidentCount: 2, maxResidentBytes: 4096 },
       activation: { kind: "source" },
       sourceActivationBinding: binding,

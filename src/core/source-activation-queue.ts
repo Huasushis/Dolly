@@ -88,6 +88,9 @@ interface SourceActivationSchedulerAuthority {
   readonly moduleId: string;
   readonly privatePageId: string;
   readonly deliveries: FileCoreDeliveryOperations;
+  readonly maxResidentCount: number;
+  readonly maxResidentBytes: number;
+  readonly maxRequestBytes: number;
 }
 
 const schedulerBindings = new WeakMap<
@@ -100,7 +103,11 @@ export function resolveSourceActivationSchedulerBinding(
   candidate: unknown,
   moduleId: string,
   deliveries: unknown,
-): Pick<SourceActivationSchedulerBinding, "moduleId" | "privatePageId"> {
+): Pick<SourceActivationSchedulerBinding, "moduleId" | "privatePageId"> & Readonly<{
+  maxResidentCount: number;
+  maxResidentBytes: number;
+  maxRequestBytes: number;
+}> {
   if (candidate === null || typeof candidate !== "object") {
     throw new SourceActivationQueueError(
       "SOURCE_ACTIVATION_ROUTE_INVALID",
@@ -123,6 +130,9 @@ export function resolveSourceActivationSchedulerBinding(
   return deepFreeze({
     moduleId: authority.moduleId,
     privatePageId: authority.privatePageId,
+    maxResidentCount: authority.maxResidentCount,
+    maxResidentBytes: authority.maxResidentBytes,
+    maxRequestBytes: authority.maxRequestBytes,
   });
 }
 
@@ -387,6 +397,9 @@ export class SourceActivationQueue {
       moduleId: this.#moduleId,
       privatePageId: this.privatePageId,
       deliveries: this.#core.deliveries,
+      maxResidentCount: this.#maxResidentCount,
+      maxResidentBytes: this.#maxResidentBytes,
+      maxRequestBytes: this.#maxRequestBytes,
     });
     return binding;
   }
