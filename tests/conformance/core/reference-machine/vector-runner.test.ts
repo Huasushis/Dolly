@@ -464,7 +464,7 @@ function execute(vector: FrozenVector): ScenarioResult {
       return {
         outcome: issued.error?.code === "CORE_STATE_GENERATION_INVALID" ? "malformed_pool_generation_refused" : "unexpected",
         before: {},
-        observed: { error_code: issued.error?.code ?? null, activation: { state: issued.state.activations.a?.state, attempt: issued.state.activations.a?.attempt } },
+        observed: { error_code: issued.error?.code ?? null, error_generation_detail: issued.error?.details?.generation ?? null, activation: { state: issued.state.activations.a?.state, attempt: issued.state.activations.a?.attempt } },
         emitted: issued.events.map(flattened),
       };
     }

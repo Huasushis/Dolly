@@ -1398,6 +1398,7 @@ fn execute(vector: &Value) -> (Value, Value, String, Vec<Value>) {
                 json!({
                     "activation": {"state": result.state.activations["a"].state, "attempt": result.state.activations["a"].attempt},
                     "error_code": result.error.as_ref().map(|error| Value::String(error.code.clone())).unwrap_or(Value::Null),
+                    "error_generation_detail": result.error.as_ref().and_then(|error| error.details.as_ref().and_then(|details| details.get("generation"))).cloned().unwrap_or(Value::Null),
                 }),
                 json!({}),
                 if result.error.as_ref().is_some_and(|error| error.code == "CORE_STATE_GENERATION_INVALID") {
