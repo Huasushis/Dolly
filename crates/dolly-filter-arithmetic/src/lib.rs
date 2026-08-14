@@ -27,7 +27,7 @@ pub const MAX_Q: u64 = MAX_SCORE * SCALE;
 pub enum FilterArithmeticError {
     /// `new_sample_weight_ppm` outside `1..=SCALE`.
     InvalidWeight,
-    /// `internal_scale` is zero.
+    /// `internal_scale` must be exactly `SCALE`: the spec fixes `R = 1_000_000`.
     InvalidScale,
     /// A raw score outside `0..=1000`.
     InvalidScore,
@@ -35,7 +35,12 @@ pub enum FilterArithmeticError {
     ZeroWeight,
     /// Division by a zero denominator that the spec excludes by construction.
     ZeroDivision,
-    /// A checked intermediate exceeded the type range for the configured bounds.
+    /// Selection cohort larger than the normative maximum of 16 modules.
+    CohortTooLarge,
+    /// A corrected value beyond `MAX_Q` was passed where the mandatory clamp
+    /// is required first (selection candidate or normalized output).
+    UnclampedValue,
+    /// A checked intermediate exceeded the type range for the enforced bounds.
     Overflow,
 }
 
@@ -46,12 +51,16 @@ pub struct FilterConfig {
     pub new_sample_weight_ppm: u64,
     /// Whether `q_raw = round_half_even(A' * W / Z')` is applied.
     pub bias_correction: bool,
-    /// Internal scale `R` (default `SCALE`).
+    /// Internal scale `R`, always equal to the normative `SCALE`; the
+    /// constructor rejects every other value, so every bound derived from it
+    /// is exact and never silently saturated.
     pub internal_scale: u64,
 }
 
 impl FilterConfig {
-    /// Validate the configuration against the spec bounds.
+    /// Validate the configuration against the spec bounds. `internal_scale`
+    /// must be exactly `SCALE`: the normative spec fixes `R = 1_000_000`, and
+    /// rejecting every other value is what keeps the checked arithmetic exact.
     pub fn new(
         new_sample_weight_ppm: u64,
         bias_correction: bool,
@@ -60,13 +69,13 @@ impl FilterConfig {
         if new_sample_weight_ppm == 0 || new_sample_weight_ppm > SCALE {
             return Err(FilterArithmeticError::InvalidWeight);
         }
-        if internal_scale == 0 {
+        if internal_scale != SCALE {
             return Err(FilterArithmeticError::InvalidScale);
         }
         Ok(Self {
             new_sample_weight_ppm,
             bias_correction,
-            internal_scale,
+            internal_scale: SCALE,
         })
     }
 
@@ -147,8 +156,12 @@ pub fn corrected_score_q(
 }
 
 /// Normalized output score `round_half_even(q / R)` in `0..=1000`
-/// (spec §4 projection).
+/// (spec §4 projection). The mandatory clamp is enforced: input beyond the
+/// exact ceiling `MAX_Q` (`1000 * R`) is rejected, never silently coerced.
 pub fn normalized_score(config: &FilterConfig, q: u64) -> Result<u64, FilterArithmeticError> {
+    if q > MAX_Q {
+        return Err(FilterArithmeticError::UnclampedValue);
+    }
     round_half_even_div(q, config.internal_scale)
 }
 
@@ -177,6 +190,12 @@ pub struct Selection {
 /// `|3n*q_i - 2S|`; equal distances are resolved by ascending bytewise
 /// comparison of `UTF8(JCS([instance_id, module_id, signal_channel]))`
 /// (spec §3). Zero candidates returns `Ok(None)` with no error.
+///
+/// Bounds are enforced: the cohort is at most the normative maximum of 16
+/// modules, and every candidate carries a corrected value that has already
+/// passed the mandatory clamp (`q <= MAX_Q`). All aggregates use checked or
+/// wide arithmetic, and JCS tie-break keys are computed only for candidates
+/// that actually tie at the minimum distance.
 pub fn select_winner(
     instance_id: &str,
     channel: &str,
@@ -186,9 +205,15 @@ pub fn select_winner(
     if n == 0 {
         return Ok(None);
     }
+    if n > 16 {
+        return Err(FilterArithmeticError::CohortTooLarge);
+    }
     let n_wide = n as i128;
     let mut sum: u64 = 0;
     for candidate in candidates {
+        if candidate.corrected_score_q > MAX_Q {
+            return Err(FilterArithmeticError::UnclampedValue);
+        }
         sum = sum
             .checked_add(candidate.corrected_score_q)
             .ok_or(FilterArithmeticError::Overflow)?;
@@ -196,23 +221,42 @@ pub fn select_winner(
     let twice_sum = 2_i128 * sum as i128;
 
     let mut distances = Vec::with_capacity(n);
-    let mut keys = Vec::with_capacity(n);
     for candidate in candidates {
         let q_wide = candidate.corrected_score_q as i128;
         let distance = (3 * n_wide * q_wide - twice_sum).abs();
         distances.push(u64::try_from(distance).map_err(|_| FilterArithmeticError::Overflow)?);
-        keys.push(tie_break_key(instance_id, &candidate.module_id, channel)?);
     }
 
+    // Minimum distance first; JCS tie-break keys only if there is a real tie.
     let mut best = 0usize;
     for index in 1..n {
-        let tie = distances[index] == distances[best] && keys[index] < keys[best];
-        if distances[index] < distances[best] || tie {
+        if distances[index] < distances[best] {
             best = index;
         }
     }
+    let min_distance = distances[best];
+    let tied: Vec<usize> = (0..n)
+        .filter(|&index| distances[index] == min_distance)
+        .collect();
+    if tied.len() > 1 {
+        let mut keyed: Vec<(usize, Vec<u8>)> = Vec::with_capacity(tied.len());
+        for index in tied {
+            keyed.push((
+                index,
+                tie_break_key(instance_id, &candidates[index].module_id, channel)?,
+            ));
+        }
+        keyed.sort_by(|left, right| left.1.cmp(&right.1));
+        best = keyed[0].0;
+    }
 
-    let target_score_q = (2 * sum) / (3 * n as u64);
+    let scale_3n = (n as u64)
+        .checked_mul(3)
+        .ok_or(FilterArithmeticError::Overflow)?;
+    let target_score_q = sum
+        .checked_mul(2)
+        .and_then(|numerator| numerator.checked_div(scale_3n))
+        .ok_or(FilterArithmeticError::Overflow)?;
     Ok(Some(Selection {
         winner: Some(best),
         target_score_q,
@@ -221,20 +265,19 @@ pub fn select_winner(
 }
 
 /// Canonical `UTF8(JCS([instance_id, module_id, signal_channel]))` bytes used
-/// for the deterministic tie-break (spec §3). Exposed so the vector runner and
+/// for the deterministic tie-break (spec §3). The key is serialized from
+/// borrowed strings (no intermediate `String` allocations); only the canonical
+/// output bytes themselves are produced. Exposed so the vector runner and
 /// future ledger validators share one implementation.
 pub fn tie_break_key(
     instance_id: &str,
     module_id: &str,
     channel: &str,
 ) -> Result<Vec<u8>, FilterArithmeticError> {
-    canonicalize(&[
-        instance_id.to_string(),
-        module_id.to_string(),
-        channel.to_string(),
-    ])
-    .map(|(bytes, _)| bytes.as_ref().to_vec())
-    .map_err(|_| FilterArithmeticError::Overflow)
+    let key = [instance_id, module_id, channel];
+    canonicalize(&key)
+        .map(|(bytes, _)| bytes.as_ref().to_vec())
+        .map_err(|_| FilterArithmeticError::Overflow)
 }
 
 /// Round `numerator / denominator` to the nearest integer, ties to even,
