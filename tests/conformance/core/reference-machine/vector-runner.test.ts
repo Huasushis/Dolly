@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { canonicalJsonDigest, type JsonValue } from "../../../../src/schema-bundle/index.js";
@@ -7,6 +7,8 @@ import { emptyCoreSnapshot, reduceCore, type CoreEvent, type CoreSnapshot, type 
 
 const SPEC_ROOT = path.resolve(import.meta.dirname, "../../../../dolly-spec");
 const VECTOR_ROOT = path.join(SPEC_ROOT, "test-vectors", "core");
+// Repository-owned overlay; the imported snapshot stays byte-faithful.
+const OVERLAY_ROOT = path.resolve(import.meta.dirname, "../../../../test-vectors/core");
 const FIXTURE_ROOT = path.join(SPEC_ROOT, "test-vectors", "fixtures");
 const FENCE = `sha256:${"f".repeat(64)}`;
 // Host-owned test-environment state; replay evidence cannot define its own authority scope.
@@ -448,7 +450,12 @@ function execute(vector: FrozenVector): ScenarioResult {
   }
 }
 
-const vectors = readdirSync(VECTOR_ROOT).filter((name) => /^TST-CORE-\d{3}.*\.json$/.test(name)).sort().map((name) => object(readFrozenJsonTestFile(path.join(VECTOR_ROOT, name)), name) as unknown as FrozenVector);
+const vectors = [...new Set([VECTOR_ROOT, OVERLAY_ROOT].flatMap((root) => readdirSync(root).filter((name) => /^TST-CORE-\d{3}.*\.json$/.test(name))))]
+  .sort()
+  .map((name) => {
+    const owner = [VECTOR_ROOT, OVERLAY_ROOT].find((root) => existsSync(path.join(root, name)));
+    return object(readFrozenJsonTestFile(path.join(owner!, name)), name) as unknown as FrozenVector;
+  });
 
 describe("immutable Core vectors", () => {
   it("executes exactly TST-CORE-001 through TST-CORE-017", () => {

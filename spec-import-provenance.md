@@ -16,3 +16,12 @@ Imported into branch `spec/import` from the authoritative owner-supplied archive
 
 No content outside `dolly-spec/` was altered. Head of the worktree is the pre-import
 commit `c8c6712f9c6707daed86b59795e3aa591dfe9b50`.
+
+## Repository-owned overlay
+
+`test-vectors/` at the repository root is owned by this repository and
+extends the imported set with locally authored conformance vectors (see
+`test-vectors/OWNERSHIP.md`). `TST-CORE-017` is such a vector and lives in
+`test-vectors/core/`, outside this imported tree. The `dolly-spec/` subtree
+is byte-identical to the import commit (`git diff fd5b252 -- dolly-spec/`
+is empty).
