@@ -302,6 +302,9 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
         });
       }
       if (item.state !== "ready" && item.state !== "retry_wait") return failure(state, "ACTIVATION_NOT_LEASABLE");
+      if (item.state === "retry_wait" && !retryAuthorizationValid(next, command.activation_id, item)) {
+        return failure(state, "ACTIVATION_RETRY_NOT_AUTHORIZED");
+      }
       const candidates = next.generations.filter((candidate) => candidate.compatible !== false).map((candidate) => Number(candidate.generation)).filter(Number.isSafeInteger);
       const generation = command.extension_generation ?? (candidates.length ? Math.max(...candidates) : next.current_generation ?? undefined);
       if (generation !== undefined && next.generations.length && !candidates.includes(generation)) return failure(state, "EXTENSION_GENERATION_INCOMPATIBLE");
