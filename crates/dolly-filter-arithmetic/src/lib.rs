@@ -18,10 +18,9 @@ pub const SCALE: u64 = 1_000_000;
 /// Maximum raw score admitted by the Filter signal schema (`0..=1000`).
 pub const MAX_SCORE: u64 = 1_000;
 
-/// The mandatory saturation ceiling for a corrected internal value: `1000 * R`.
-pub const fn corrected_ceiling(scale: u64) -> u64 {
-    MAX_SCORE.saturating_mul(scale)
-}
+/// The normative saturation ceiling `1000 * R` with the fixed scale
+/// `R = SCALE`: compile-time exact, never saturated.
+pub const MAX_Q: u64 = MAX_SCORE * SCALE;
 
 /// Errors produced by the checked arithmetic; there is no silent overflow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,9 +72,10 @@ impl FilterConfig {
 
     /// Saturation clamp `q = clamp(q_raw, 0, 1000 * R)` applied before the
     /// value enters candidate state, selection, a decision record, or the
-    /// normalized signal (spec §3).
+    /// normalized signal (spec §3). `R` is the fixed normative scale, so the
+    /// ceiling is the exact compile-time constant `MAX_Q`; nothing saturates.
     pub fn clamp_q(&self, q_raw: u64) -> u64 {
-        q_raw.min(corrected_ceiling(self.internal_scale))
+        q_raw.min(MAX_Q)
     }
 }
 
@@ -245,7 +245,7 @@ fn round_half_even_div(numerator: u64, denominator: u64) -> Result<u64, FilterAr
     }
     let quotient = numerator / denominator;
     let remainder = numerator % denominator;
-    match (2 * remainder).cmp(&denominator) {
+    match (2_u128 * remainder as u128).cmp(&(denominator as u128)) {
         std::cmp::Ordering::Less => Ok(quotient),
         std::cmp::Ordering::Greater => Ok(quotient + 1),
         std::cmp::Ordering::Equal => {
@@ -255,5 +255,30 @@ fn round_half_even_div(numerator: u64, denominator: u64) -> Result<u64, FilterAr
                 Ok(quotient + 1)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FilterArithmeticError, round_half_even_div};
+
+    #[test]
+    fn round_half_even_ties_to_even() {
+        // The half-even contract: exact ties round to the even quotient.
+        assert_eq!(round_half_even_div(5, 2).unwrap(), 2); // 2.5 -> 2
+        assert_eq!(round_half_even_div(7, 2).unwrap(), 4); // 3.5 -> 4
+        assert_eq!(round_half_even_div(15, 2).unwrap(), 8); // 7.5 -> 8
+        assert_eq!(round_half_even_div(1, 2).unwrap(), 0); // 0.5 -> 0
+        assert_eq!(round_half_even_div(10, 2).unwrap(), 5); // exact
+        assert_eq!(round_half_even_div(6, 2).unwrap(), 3); // exact
+        assert_eq!(round_half_even_div(0, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn round_half_even_rejects_zero_denominator() {
+        assert_eq!(
+            round_half_even_div(1, 0),
+            Err(FilterArithmeticError::ZeroDivision)
+        );
     }
 }
