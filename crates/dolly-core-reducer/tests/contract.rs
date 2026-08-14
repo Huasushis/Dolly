@@ -1065,6 +1065,23 @@ fn durable_counter_exhaustion_fails_closed_without_panicking() {
     let result = reduce(&exhausted_attempt, &issue, &input());
     assert_eq!(result.error.unwrap().code, "ATTEMPT_SEQUENCE_EXHAUSTED");
     assert_eq!(result.state, exhausted_attempt);
+
+    let mut exhausted_generation_events = empty_core_snapshot();
+    exhausted_generation_events.next_commit_seq = MAX_SAFE_INTEGER - 2;
+    exhausted_generation_events.activations.insert(
+        "a".into(),
+        ActivationRecord {
+            state: ActivationState::Ready,
+            ..Default::default()
+        },
+    );
+    exhausted_generation_events.generations = vec![
+        json!({"generation":1,"compatible":false}),
+        json!({"generation":2,"compatible":false}),
+    ];
+    let result = reduce(&exhausted_generation_events, &issue, &input());
+    assert_eq!(result.error.unwrap().code, "COMMIT_SEQUENCE_EXHAUSTED");
+    assert_eq!(result.state, exhausted_generation_events);
 }
 
 #[test]

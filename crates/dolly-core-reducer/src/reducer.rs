@@ -251,12 +251,21 @@ fn next_attempt(attempt: i64) -> Option<i64> {
         .checked_add(1)
         .filter(|value| safe_nonnegative(*value))
 }
-fn commit_increment_budget(command: &CoreCommand) -> Option<i64> {
+fn commit_increment_budget(state: &CoreSnapshot, command: &CoreCommand) -> Option<i64> {
     match command {
         CoreCommand::Ingress(command) => i64::try_from(command.pages.len()).ok()?.checked_add(1),
-        CoreCommand::IssueLease(_) | CoreCommand::ReceiveResult(_) | CoreCommand::Recover(_) => {
-            Some(2)
-        }
+        CoreCommand::IssueLease(_) => i64::try_from(
+            state
+                .generations
+                .iter()
+                .filter(|generation| {
+                    generation.get("compatible").and_then(Value::as_bool) == Some(false)
+                })
+                .count(),
+        )
+        .ok()?
+        .checked_add(1),
+        CoreCommand::ReceiveResult(_) | CoreCommand::Recover(_) => Some(2),
         _ => Some(1),
     }
 }
@@ -495,7 +504,7 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                 .map(|label| json!({"crash_point":label})),
         );
     }
-    let Some(commit_increment_budget) = commit_increment_budget(command) else {
+    let Some(commit_increment_budget) = commit_increment_budget(state, command) else {
         return failure(state, "COMMIT_SEQUENCE_EXHAUSTED", false, None);
     };
     if state
