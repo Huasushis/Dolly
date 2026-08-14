@@ -1320,12 +1320,59 @@ fn execute(vector: &Value) -> (Value, Value, String, Vec<Value>) {
                 vec![flatten(event)],
             )
         }
+        "TST-CORE-017" => {
+            let commands = stimulus["commands"].as_array().unwrap();
+            let to_lease = |value: &Value| {
+                CoreCommand::IssueLease(IssueLeaseCommand {
+                    command_id: value["command_id"].as_str().unwrap().into(),
+                    activation_id: value["activation_id"].as_str().unwrap().into(),
+                    lease_id: value["lease_id"].as_str().unwrap().into(),
+                    token_digest: value["token_digest"].as_str().unwrap().into(),
+                    extension_connection_id: value["extension_connection_id"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                    worker_epoch: value["worker_epoch"].as_i64().unwrap(),
+                    extension_generation: value.get("extension_generation").and_then(Value::as_i64),
+                })
+            };
+            let mut state = empty_core_snapshot();
+            state.activations.insert(
+                "a".into(),
+                ActivationRecord {
+                    state: ActivationState::Ready,
+                    attempt: 0,
+                    ..Default::default()
+                },
+            );
+            let issued = run(&state, to_lease(&commands[0]), |_| {});
+            let replay = run(&issued.state, to_lease(&commands[1]), |_| {});
+            let outcome = if replay
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == "STORAGE_IDEMPOTENCY_CONFLICT")
+            {
+                "omitted_generation_replay_refused"
+            } else {
+                "unexpected"
+            };
+            (
+                json!({
+                    "lease": issued.state.leases["lease-1"],
+                    "activation": {"state": issued.state.activations["a"].state, "attempt": issued.state.activations["a"].attempt},
+                    "replay_error_code": replay.error.as_ref().map(|error| Value::String(error.code.clone())).unwrap_or(Value::Null),
+                }),
+                json!({}),
+                outcome.into(),
+                issued.events.iter().map(flatten).collect(),
+            )
+        }
         other => panic!("unmapped immutable vector {other}"),
     }
 }
 
 #[test]
-fn executes_all_sixteen_immutable_core_vectors() {
+fn executes_all_seventeen_immutable_core_vectors() {
     let root = spec_root().join("test-vectors/core");
     let mut files: Vec<_> = fs::read_dir(root)
         .unwrap()
@@ -1340,7 +1387,7 @@ fn executes_all_sixteen_immutable_core_vectors() {
         .collect();
     files.sort();
     let vectors: Vec<_> = files.iter().map(read).collect();
-    assert_eq!(vectors.len(), 16);
+    assert_eq!(vectors.len(), 17);
     for (index, vector) in vectors.iter().enumerate() {
         assert_eq!(vector["test_id"], format!("TST-CORE-{:03}", index + 1));
         let (observed, before, outcome, emitted) = execute(vector);
