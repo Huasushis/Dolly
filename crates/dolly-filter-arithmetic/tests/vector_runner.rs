@@ -42,21 +42,45 @@ fn read_vector(name: &str) -> Value {
     vector
 }
 
+/// The cross-language seam carries `internal_scale` in each vector; the spec
+/// fixes `R = SCALE`, so a vector declaring any other scale must be rejected
+/// by `config` before any arithmetic runs.
+#[test]
+fn vector_rejects_non_fixed_internal_scale() {
+    let mut vector = read_vector("TST-FILTER-003-fixed-point-boundary-saturation");
+    vector["initial"]["internal_scale"] = json!(SCALE - 1);
+    let err =
+        config(&vector["initial"]).expect_err("non-normative internal_scale must be rejected");
+    assert!(
+        err.contains("internal_scale"),
+        "unexpected rejection message: {err}"
+    );
+}
+
 /// Parse the smoothing configuration from a vector `initial` block. Both the
 /// `config`-nested layout (TST-FILTER-001) and the flat layout (TST-FILTER-003)
-/// are accepted; `internal_scale` defaults to `SCALE` when absent.
-fn config(initial: &Value) -> FilterConfig {
+/// are accepted. The vector-declared `internal_scale` must be exactly the
+/// normative fixed `R = SCALE`; any other value is rejected with a message.
+fn config(initial: &Value) -> Result<FilterConfig, String> {
     let cfg = initial.get("config").unwrap_or(initial);
-    let internal_scale = initial
-        .get("internal_scale")
-        .and_then(Value::as_u64)
-        .unwrap_or(SCALE);
+    if let Some(scale) = initial.get("internal_scale") {
+        let scale = scale.as_u64().ok_or("internal_scale must be an integer")?;
+        if scale != SCALE {
+            return Err(format!(
+                "non-normative internal_scale {scale}; the spec fixes R = {SCALE}"
+            ));
+        }
+    }
     FilterConfig::new(
-        cfg["new_sample_weight_ppm"].as_u64().unwrap(),
-        cfg["bias_correction"].as_bool().unwrap(),
-        internal_scale,
+        cfg["new_sample_weight_ppm"]
+            .as_u64()
+            .ok_or("new_sample_weight_ppm must be an integer")?,
+        cfg["bias_correction"]
+            .as_bool()
+            .ok_or("bias_correction must be a boolean")?,
+        SCALE,
     )
-    .expect("vector config must be in spec bounds")
+    .map_err(|e| format!("{e:?}"))
 }
 
 fn navigate<'a>(value: &'a Value, path: &str) -> &'a Value {
@@ -105,7 +129,7 @@ struct Evaluated {
 
 fn evaluate_tst_filter_001(vector: &Value) -> Evaluated {
     let initial = &vector["initial"];
-    let cfg = config(initial);
+    let cfg = config(initial).expect("vector config must be in spec bounds");
     let stimulus = &vector["stimulus"];
     assert_eq!(
         stimulus["command"],
@@ -201,7 +225,7 @@ fn evaluate_tst_filter_001(vector: &Value) -> Evaluated {
 
 fn evaluate_tst_filter_003(vector: &Value) -> Evaluated {
     let initial = &vector["initial"];
-    let cfg = config(initial);
+    let cfg = config(initial).expect("vector config must be in spec bounds");
     let stimulus = &vector["stimulus"];
     assert_eq!(
         stimulus["command"],
