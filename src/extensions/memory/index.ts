@@ -259,3 +259,13 @@ export {
   type RetentionPlan,
   type RetentionPolicy,
 } from "./retention.js";
+
+export {
+  EXTRACTION_ITEM_SCHEMA_VERSION,
+  ExtractionStore,
+  compareExtractionItems,
+  deriveExtractionId,
+  type ExtractionItem,
+  type ExtractionWriteResult,
+  type RecordExtractionInput,
+} from "./extraction-store.js";
