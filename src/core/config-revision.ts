@@ -9,15 +9,16 @@
  * Sections 1 and 4). A `(configId, revision)` pair is immutable: an edit
  * creates a new revision, and the previous pair is never overwritten.
  *
- * The runner implements the config-value side of the migration contract in
- * `dolly-spec/docs/spec/extension-protocol/04-hot-reload-and-state-migration.md`
- * Section 5, as part of the Section 6 generation-replacement preparation
- * sequence: one-step upgrade paths vN -> vN+1, deterministic for identical
+ * The runner implements the Host-internal configuration-value upgrade chain
+ * defined in `docs/adr/0010-configuration-value-upgrade-chain.md` (ADR-0010,
+ * Proposed): one-step upgrade paths vN -> vN+1, deterministic for identical
  * input bytes and parameters, idempotent by migration operation id,
  * output-size and expansion limited, and never mutating the source value. A
  * step that drops, synthesizes, or semantically changes user data MUST declare
  * its loss class and require the configured approval identity; silent lossy
- * migration is refused.
+ * migration is refused. No imported extension-protocol section normatively
+ * defines this chain: 04-hot-reload-and-state-migration.md Section 5 governs
+ * `module.migrate_state` snapshot state, not configuration values.
  *
  * This module is deliberately NOT `module.migrate_state`: that is the
  * Extension-side wire method (`01-wire-protocol.md`) that operates only on
@@ -41,7 +42,7 @@ const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const DECIMAL_SEQUENCE_PATTERN = /^(0|[1-9][0-9]*)$/u;
 
 /**
- * The closed set of loss classes a migration step can declare (spec Section 5):
+ * The closed set of loss classes a migration step can declare (ADR-0010):
  * the transform drops user data, synthesizes values, or semantically changes
  * user data. `none` declares the transform is lossless and never synthesizes.
  */
@@ -55,7 +56,7 @@ const LOSS_DECLARATIONS: Readonly<Record<ConfigLossDeclaration, true>> = {
 };
 
 /**
- * The default approval identity (spec Section 5 "configured approval class")
+ * The default approval identity (ADR-0010 "configured approval class")
  * that approves every loss-declaring step when supplied to `migrate`.
  */
 export const DEFAULT_APPROVAL_CLASS = "config.migration.approval";
@@ -119,9 +120,9 @@ export type ConfigMigration = (source: JsonValue) => ConfigMigrationOutput;
 
 /**
  * A registered one-step upgrade path. `operationId` is the stable identity a
- * call chain is idempotent on (spec Section 5), `lossDeclaration` the closed
- * loss class, and `approvalRequired` the spec-mandated approval gate for any
- * step that is not declared `none`.
+ * call chain is idempotent on (ADR-0010), `lossDeclaration` the closed
+ * loss class, and `approvalRequired` the approval gate required by ADR-0010
+ * for any step that is not declared `none`.
  */
 export interface ConfigMigrationStep {
   readonly fromVersion: number;
@@ -168,12 +169,12 @@ export interface ConfigMigrationRunnerOptions {
   readonly approvalClass?: string;
   /**
    * Absolute cap on the canonical UTF-8 byte length of the migrated
-   * configuration (spec Section 5, output-size limit).
+   * configuration (ADR-0010, output-size limit).
    */
   readonly maxOutputBytes?: number;
   /**
    * Cap on how many canonical UTF-8 bytes the migrated configuration may
-   * expand the source value by (spec Section 5, expansion limit).
+   * expand the source value by (ADR-0010, expansion limit).
    */
   readonly maxExpansionBytes?: number;
 }
@@ -301,7 +302,7 @@ function parseMigrationOutput(value: unknown): ConfigMigrationOutput {
  * Applies deterministic one-step migrations to immutable configuration
  * revisions. The runner is side-effect free: `migrate` only reads its inputs
  * and returns a new revision, so equal inputs produce equal outputs, and the
- * migration never runs against the sole active value (spec Section 5).
+ * migration never runs against the sole active value (ADR-0010).
  */
 export class ConfigMigrationRunner {
   readonly #schemas: ReadonlyMap<number, JsonValue>;

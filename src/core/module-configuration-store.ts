@@ -443,9 +443,11 @@ export class ModuleConfigurationStore {
  * Migrate one immutable configuration record to `targetVersion` through the
  * pure `ConfigMigrationRunner`, producing the target record exactly as this
  * store would persist it. This is the deterministic bridge between the
- * accepted config-value migration domain (`config-revision.ts`) and the
- * durable store: a Host migration flow resolves the source record here,
- * calls this function, and persists the returned record with `create`.
+ * proposed Host-internal configuration-value upgrade contract
+ * (`docs/adr/0010-configuration-value-upgrade-chain.md`, ADR-0010, implemented
+ * in `config-revision.ts`) and the durable store: a Host migration flow
+ * resolves the source record here, calls this function, and persists the
+ * returned record with `create`.
  *
  * The runner enforces every migration gate unchanged (target/source version
  * reachability, per-step schema validation, approval for loss-declaring
