@@ -26,6 +26,7 @@ Current proposals:
 - ADR-0007: crash-recoverable synchronous cross-process locks.
 - ADR-0009: Linux Core service ownership of Module processes and per-Module
   control groups.
+- ADR-0010: Host-internal configuration-value upgrade chain.
 
 Rejected decisions:
 
