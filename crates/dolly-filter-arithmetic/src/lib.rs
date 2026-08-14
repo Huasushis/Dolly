@@ -45,16 +45,20 @@ pub enum FilterArithmeticError {
 }
 
 /// Frozen configuration for the smoothing arithmetic (spec §3).
+///
+/// Every field is private and only reachable through [`FilterConfig::new`],
+/// which enforces the invariant-bearing bounds, so no public operation can
+/// receive an invalid configuration except through unsafe code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FilterConfig {
     /// `new_sample_weight_ppm`, in `1..=SCALE`.
-    pub new_sample_weight_ppm: u64,
+    new_sample_weight_ppm: u64,
     /// Whether `q_raw = round_half_even(A' * W / Z')` is applied.
-    pub bias_correction: bool,
+    bias_correction: bool,
     /// Internal scale `R`, always equal to the normative `SCALE`; the
     /// constructor rejects every other value, so every bound derived from it
     /// is exact and never silently saturated.
-    pub internal_scale: u64,
+    internal_scale: u64,
 }
 
 impl FilterConfig {
@@ -227,27 +231,41 @@ pub fn select_winner(
         distances.push(u64::try_from(distance).map_err(|_| FilterArithmeticError::Overflow)?);
     }
 
-    // Minimum distance first; JCS tie-break keys only if there is a real tie.
+    // Minimum-distance winner in a single pass. Canonical JCS key bytes are
+    // computed only when a candidate actually ties the running minimum
+    // distance; the lexicographically smallest key wins, and an identical
+    // key resolves to the earliest index (matching the previous stable
+    // tie-break). No tie lists or sorts are built.
     let mut best = 0usize;
+    let mut min_distance = distances[0];
+    let mut best_key: Option<Vec<u8>> = None;
     for index in 1..n {
-        if distances[index] < distances[best] {
+        let distance = distances[index];
+        if distance < min_distance {
+            min_distance = distance;
             best = index;
+            best_key = None;
+        } else if distance == min_distance {
+            let key = tie_break_key(instance_id, &candidates[index].module_id, channel)?;
+            match best_key.as_ref() {
+                None => {
+                    // First real tie: seed with the running best's own key.
+                    let current_best_key =
+                        tie_break_key(instance_id, &candidates[best].module_id, channel)?;
+                    if key < current_best_key {
+                        best_key = Some(key);
+                        best = index;
+                    } else {
+                        best_key = Some(current_best_key);
+                    }
+                }
+                Some(current_best_key) if key < *current_best_key => {
+                    best_key = Some(key);
+                    best = index;
+                }
+                Some(_) => {}
+            }
         }
-    }
-    let min_distance = distances[best];
-    let tied: Vec<usize> = (0..n)
-        .filter(|&index| distances[index] == min_distance)
-        .collect();
-    if tied.len() > 1 {
-        let mut keyed: Vec<(usize, Vec<u8>)> = Vec::with_capacity(tied.len());
-        for index in tied {
-            keyed.push((
-                index,
-                tie_break_key(instance_id, &candidates[index].module_id, channel)?,
-            ));
-        }
-        keyed.sort_by(|left, right| left.1.cmp(&right.1));
-        best = keyed[0].0;
     }
 
     let scale_3n = (n as u64)
