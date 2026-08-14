@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/dolly-canonical-json",
+    "crates/dolly-core-domain",
+    "crates/dolly-schema",
+    "crates/dolly-core-reducer",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"

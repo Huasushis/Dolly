@@ -29,15 +29,17 @@ class JsonStructureScanner {
 
   scan(): void {
     this.#whitespace();
-    this.#value(0);
+    this.#value(1);
     this.#whitespace();
     if (this.#offset !== this.text.length) throw new SyntaxError("Trailing JSON data");
   }
 
   #value(depth: number): void {
-    if (depth > this.maxDepth) throw new SyntaxError("JSON nesting limit exceeded");
     this.#whitespace();
     const token = this.text[this.#offset];
+    if ((token === "{" || token === "[") && depth > this.maxDepth) {
+      throw new SyntaxError("JSON nesting limit exceeded");
+    }
     if (token === "{") this.#object(depth + 1);
     else if (token === "[") this.#array(depth + 1);
     else if (token === '"') void this.#string();
