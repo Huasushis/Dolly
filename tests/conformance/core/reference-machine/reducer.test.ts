@@ -593,4 +593,44 @@ describe("WP-003: IssueLease idempotency replay boundary", () => {
     expect(replay.outcome).toBe("rolled_back");
     expect(replay.error?.code).toBe("STORAGE_IDEMPOTENCY_CONFLICT");
   });
+
+  it("rejects replay omitting extension_generation when stored lease has a present null (malformed)", () => {
+    const state = emptyCoreSnapshot();
+    state.activations.a = { state: "ready", attempt: 0 };
+    // Simulate a corrupted stored lease with a present null extension_generation
+    state.leases["lease-malformed"] = {
+      activation_id: "a",
+      token_digest: A,
+      extension_connection_id: "conn-1",
+      worker_epoch: 1,
+      attempt: 1,
+      extension_generation: null as unknown as number,
+    };
+    const replay = run(state, {
+      type: "IssueLease", command_id: "cmd-1", activation_id: "a", lease_id: "lease-malformed",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1,
+    });
+    expect(replay.outcome).toBe("rolled_back");
+    expect(replay.error?.code).toBe("STORAGE_IDEMPOTENCY_CONFLICT");
+  });
+
+  it("rejects replay omitting extension_generation when stored lease has a present string (malformed)", () => {
+    const state = emptyCoreSnapshot();
+    state.activations.a = { state: "ready", attempt: 0 };
+    // Simulate a malformed stored lease with a present string extension_generation
+    state.leases["lease-malformed-str"] = {
+      activation_id: "a",
+      token_digest: A,
+      extension_connection_id: "conn-1",
+      worker_epoch: 1,
+      attempt: 1,
+      extension_generation: "8" as unknown as number,
+    };
+    const replay = run(state, {
+      type: "IssueLease", command_id: "cmd-1", activation_id: "a", lease_id: "lease-malformed-str",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1,
+    });
+    expect(replay.outcome).toBe("rolled_back");
+    expect(replay.error?.code).toBe("STORAGE_IDEMPOTENCY_CONFLICT");
+  });
 });

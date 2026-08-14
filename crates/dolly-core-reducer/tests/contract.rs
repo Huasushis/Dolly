@@ -1287,3 +1287,81 @@ fn issue_lease_idempotency_replay_mismatched_generation_conflicts() {
     );
     assert_eq!(replay.error.unwrap().code, "STORAGE_IDEMPOTENCY_CONFLICT");
 }
+
+#[test]
+fn issue_lease_idempotency_replay_omitting_generation_conflicts_with_present_null() {
+    let mut state = empty_core_snapshot();
+    state.activations.insert(
+        "a".into(),
+        ActivationRecord {
+            state: ActivationState::Ready,
+            attempt: 0,
+            ..Default::default()
+        },
+    );
+    // Simulate a corrupted/malformed stored lease with a present null extension_generation
+    state.leases.insert(
+        "lease-malformed".into(),
+        json!({
+            "activation_id": "a",
+            "token_digest": A,
+            "extension_connection_id": "conn-1",
+            "worker_epoch": 1,
+            "attempt": 1,
+            "extension_generation": null
+        }),
+    );
+    let replay = reduce(
+        &state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "cmd-1".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-malformed".into(),
+            token_digest: A.into(),
+            extension_connection_id: "conn-1".into(),
+            worker_epoch: 1,
+            extension_generation: None,
+        }),
+        &input(),
+    );
+    assert_eq!(replay.error.unwrap().code, "STORAGE_IDEMPOTENCY_CONFLICT");
+}
+
+#[test]
+fn issue_lease_idempotency_replay_omitting_generation_conflicts_with_present_string() {
+    let mut state = empty_core_snapshot();
+    state.activations.insert(
+        "a".into(),
+        ActivationRecord {
+            state: ActivationState::Ready,
+            attempt: 0,
+            ..Default::default()
+        },
+    );
+    // Simulate a malformed stored lease with a present string extension_generation
+    state.leases.insert(
+        "lease-malformed-str".into(),
+        json!({
+            "activation_id": "a",
+            "token_digest": A,
+            "extension_connection_id": "conn-1",
+            "worker_epoch": 1,
+            "attempt": 1,
+            "extension_generation": "8"
+        }),
+    );
+    let replay = reduce(
+        &state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "cmd-1".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-malformed-str".into(),
+            token_digest: A.into(),
+            extension_connection_id: "conn-1".into(),
+            worker_epoch: 1,
+            extension_generation: None,
+        }),
+        &input(),
+    );
+    assert_eq!(replay.error.unwrap().code, "STORAGE_IDEMPOTENCY_CONFLICT");
+}
