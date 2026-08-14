@@ -1469,6 +1469,67 @@ fn execute(vector: &Value) -> (Value, Value, String, Vec<Value>) {
                 result.events.iter().map(flatten).collect(),
             )
         }
+        "TST-PROTO-003" => {
+            let candidate = &initial["candidate_generation"];
+            let mut state = empty_core_snapshot();
+            state.activations.insert(
+                "a".into(),
+                ActivationRecord {
+                    state: ActivationState::Ready,
+                    attempt: 0,
+                    manifest: Some(json!({
+                        "manifest_digest": initial["manifest_digest"],
+                        "required_frame_bytes": initial["required_frame_bytes"],
+                        "required_frame_nesting_depth": initial["required_frame_nesting_depth"],
+                    })),
+                    ..Default::default()
+                },
+            );
+            state.generations = vec![json!({
+                "generation": candidate["generation"],
+                "current_for_module": true,
+                "compatible": true,
+                "ready_for_module": false,
+                "incompatibility_reason": "frame_bounds",
+                "max_frame_bytes": candidate["max_frame_bytes"],
+                "max_frame_nesting_depth": candidate["max_frame_nesting_depth"],
+            })];
+            let before = json!({
+                "candidate_generation": state.generations[0],
+                "activation": {"state": "ready", "attempt": 0},
+            });
+            let result = run(
+                &state,
+                CoreCommand::IssueLease(IssueLeaseCommand {
+                    command_id: "admit-lease".into(),
+                    activation_id: "a".into(),
+                    lease_id: "l".into(),
+                    token_digest: "token".into(),
+                    extension_connection_id: "connection-1".into(),
+                    worker_epoch: 1,
+                    extension_generation: None,
+                }),
+                |_| {},
+            );
+            let activation = &result.state.activations["a"];
+            (
+                json!({
+                    "candidate_generation": result.state.generations[0],
+                    "activation": {
+                        "state": activation.state,
+                        "attempt": activation.attempt,
+                        "manifest_digest": activation.manifest.as_ref().unwrap()["manifest_digest"],
+                    },
+                }),
+                before,
+                result
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.clone())
+                    .unwrap_or_else(|| "unexpected".into()),
+                result.events.iter().map(flatten).collect(),
+            )
+        }
         other => panic!("unmapped immutable vector {other}"),
     }
 }
@@ -1512,4 +1573,114 @@ fn executes_all_nineteen_immutable_core_vectors() {
         let (observed, before, outcome, emitted) = execute(vector);
         assert_vector(vector, &observed, &before, &outcome, &emitted);
     }
+}
+
+/// Admit a single candidate Extension generation (generation 9) with the
+/// given negotiated frame limits against an activation whose Manifest carries
+/// the given required frame bounds, then issue a lease. Returns the resulting
+/// snapshot, the error (if any), and the flattened emitted events.
+fn frame_control(
+    required_bytes: i64,
+    required_depth: i64,
+    max_bytes: i64,
+    max_depth: i64,
+) -> (CoreSnapshot, Option<CoreError>, Vec<Value>) {
+    let mut state = empty_core_snapshot();
+    state.activations.insert(
+        "a".into(),
+        ActivationRecord {
+            state: ActivationState::Ready,
+            attempt: 0,
+            manifest: Some(json!({
+                "manifest_digest": initial_digest(),
+                "required_frame_bytes": required_bytes,
+                "required_frame_nesting_depth": required_depth,
+            })),
+            ..Default::default()
+        },
+    );
+    state.generations = vec![json!({
+        "generation": 9,
+        "current_for_module": true,
+        "compatible": true,
+        "ready_for_module": true,
+        "max_frame_bytes": max_bytes,
+        "max_frame_nesting_depth": max_depth,
+    })];
+    let result = run(
+        &state,
+        CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "frame-control".into(),
+            activation_id: "a".into(),
+            lease_id: "l".into(),
+            token_digest: "token".into(),
+            extension_connection_id: "connection-1".into(),
+            worker_epoch: 1,
+            extension_generation: None,
+        }),
+        |_| {},
+    );
+    (
+        result.state,
+        result.error,
+        result.events.iter().map(flatten).collect(),
+    )
+}
+
+#[test]
+fn executes_proto003_frame_generation_compatibility() {
+    // Authoritative vector: the candidate generation negotiates 2 MiB / 96
+    // against a Manifest requiring 4 MiB / 80 (byte bound fails). refuse with
+    // ACTIVATION_FRAME_INCOMPATIBLE and leave the activation untouched.
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let path = repo_root.join("dolly-spec/test-vectors/protocol");
+    let mut names: Vec<_> = fs::read_dir(&path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("TST-PROTO-003") && name.ends_with(".json"))
+        .collect();
+    assert_eq!(names.len(), 1);
+    names.sort();
+    let name = names.remove(0);
+    let vector = read(path.join(name));
+    assert_eq!(vector["test_id"], "TST-PROTO-003");
+    let (observed, before, outcome, emitted) = execute(&vector);
+    assert_vector(&vector, &observed, &before, &outcome, &emitted);
+
+    // Depth-only control: the byte bound is satisfied (8 MiB >= 4 MiB) but
+    // the nesting depth is not (64 < 80): same frame_bounds refusal, no lease.
+    let (refused, error, emitted) = frame_control(4 * 1024 * 1024, 80, 8 * 1024 * 1024, 64);
+    assert_eq!(error.unwrap().code, "ACTIVATION_FRAME_INCOMPATIBLE");
+    assert!(refused.leases.is_empty());
+    assert_eq!(refused.activations["a"].state, ActivationState::Ready);
+    assert_eq!(refused.activations["a"].attempt, 0);
+    assert_eq!(refused.activations["a"].extension_generation, None);
+    assert!(emitted.iter().any(|value| {
+        value["event"] == "ExtensionGenerationIncompatible" && value["reason"] == "frame_bounds"
+    }));
+
+    // Satisfied positive control: both bounds are met (8 MiB >= 4 MiB and
+    // 96 >= 80), so the lease issues: activation Leased at attempt 1 with
+    // extension generation 9, no incompatibility event.
+    let (issued, error, emitted) = frame_control(4 * 1024 * 1024, 80, 8 * 1024 * 1024, 96);
+    assert!(error.is_none());
+    assert_eq!(issued.activations["a"].state, ActivationState::Leased);
+    assert_eq!(issued.activations["a"].attempt, 1);
+    assert_eq!(issued.activations["a"].extension_generation, Some(9));
+    assert_eq!(issued.leases["l"]["extension_generation"], 9);
+    assert_eq!(issued.leases["l"]["manifest_digest"], initial_digest());
+    assert!(
+        !emitted
+            .iter()
+            .any(|value| value["event"] == "ExtensionGenerationIncompatible")
+    );
+    assert!(emitted.iter().any(|value| value["event"] == "LeaseIssued"));
+}
+
+fn initial_digest() -> Value {
+    json!("sha256:6666666666666666666666666666666666666666666666666666666666666666")
 }
