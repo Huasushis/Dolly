@@ -158,6 +158,11 @@ fn verified_digest(value: &Value, claimed: &str) -> bool {
 fn object_i64(value: &Value, key: &str) -> Option<i64> {
     value.get(key).and_then(Value::as_i64)
 }
+/// Distinguishes a missing key (`None`) from a present key whose value is not
+/// an integer (`Some(None)`); `object_i64` conflates the two.
+fn object_i64_present(value: &Value, key: &str) -> Option<Option<i64>> {
+    value.get(key).map(Value::as_i64)
+}
 fn object_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
@@ -349,7 +354,11 @@ fn result_binding_valid(
         && object_str(lease, "extension_connection_id")
             == Some(proof.extension_connection_id.as_str())
         && object_i64(lease, "worker_epoch") == Some(proof.worker_epoch)
-        && object_i64(lease, "extension_generation") == proof.extension_generation
+        && match object_i64_present(lease, "extension_generation") {
+            None => proof.extension_generation.is_none(),
+            Some(None) => false,
+            Some(Some(stored)) => proof.extension_generation == Some(stored),
+        }
         && lease
             .get("manifest_digest")
             .and_then(Value::as_str)
@@ -833,12 +842,19 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             {
                 return failure(state, "ACTIVATION_RETRY_NOT_AUTHORIZED", false, None);
             }
-            let candidates: Vec<i64> = next
-                .generations
-                .iter()
-                .filter(|value| value.get("compatible").and_then(Value::as_bool) != Some(false))
-                .filter_map(|value| object_i64(value, "generation"))
-                .collect();
+            let mut candidates: Vec<i64> = Vec::new();
+            for value in &next.generations {
+                if value.get("compatible").and_then(Value::as_bool) == Some(false) {
+                    continue;
+                }
+                match object_i64_present(value, "generation") {
+                    None => {}
+                    Some(None) => {
+                        return failure(state, "CORE_STATE_GENERATION_INVALID", false, None);
+                    }
+                    Some(Some(generation)) => candidates.push(generation),
+                }
+            }
             let generation = c
                 .extension_generation
                 .or_else(|| candidates.iter().max().copied())

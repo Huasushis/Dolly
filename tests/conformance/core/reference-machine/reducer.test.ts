@@ -690,4 +690,79 @@ describe("WP-003: IssueLease idempotency replay boundary", () => {
     expect(result.outcome).toBe("rolled_back");
     expect(result.error?.code).toBe("ACTIVATION_FENCE_INVALID");
   });
+
+  it("rejects IssueLease when a compatible persisted generation candidate is a malformed numeric string", () => {
+    const state = emptyCoreSnapshot();
+    state.activations.a = { state: "ready", attempt: 0 };
+    state.generations = [{ generation: "8" as unknown as number, compatible: true }];
+    const result = run(state, {
+      type: "IssueLease", command_id: "cmd-1", activation_id: "a", lease_id: "lease-1",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1, extension_generation: 8,
+    });
+    expect(result.outcome).toBe("rolled_back");
+    expect(result.error?.code).toBe("CORE_STATE_GENERATION_INVALID");
+  });
+
+  it("rejects IssueLease when a compatible persisted generation candidate is null, boolean, or unsafe", () => {
+    for (const malformed of [null, true, 2 ** 53]) {
+      const state = emptyCoreSnapshot();
+      state.activations.a = { state: "ready", attempt: 0 };
+      state.generations = [{ generation: malformed as unknown as number, compatible: true }];
+      const result = run(state, {
+        type: "IssueLease", command_id: "cmd-1", activation_id: "a", lease_id: `lease-${String(malformed)}`,
+        token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1, extension_generation: 8,
+      });
+      expect(result.outcome, String(malformed)).toBe("rolled_back");
+      expect(result.error?.code, String(malformed)).toBe("CORE_STATE_GENERATION_INVALID");
+    }
+  });
+
+  it("still issues a lease when no persisted generation records exist (legacy absence)", () => {
+    const state = emptyCoreSnapshot();
+    state.activations.a = { state: "ready", attempt: 0 };
+    const result = run(state, {
+      type: "IssueLease", command_id: "cmd-1", activation_id: "a", lease_id: "lease-1",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1, extension_generation: 8,
+    });
+    expect(result.outcome).toBe("committed");
+    expect(result.reply?.extension_generation).toBe(8);
+  });
+
+  it("treats a persisted candidate with no generation field as a non-matching legacy record", () => {
+    const state = emptyCoreSnapshot();
+    state.activations.a = { state: "ready", attempt: 0 };
+    state.generations = [{ compatible: true } as unknown as JsonObject];
+    const result = run(state, {
+      type: "IssueLease", command_id: "cmd-1", activation_id: "a", lease_id: "lease-1",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1, extension_generation: 8,
+    });
+    expect(result.outcome).toBe("rolled_back");
+    expect(result.error?.code).toBe("EXTENSION_GENERATION_INCOMPATIBLE");
+  });
+
+  it("rejects result binding when the persisted lease generation is malformed and the proof omits generation", () => {
+    for (const malformed of ["8", null, true]) {
+      const state = leasedState("dispatched");
+      state.leases.l!.extension_generation = malformed as unknown as number;
+      const payloadDigest = canonicalJsonDigest({});
+      const result = run(
+        state,
+        { type: "ReceiveResult", command_id: "receive", activation_id: "a", lease_id: "l", status: "success", result_digest: payloadDigest, result: {} },
+        { host_result_verification: resultVerification(payloadDigest)! },
+      );
+      expect(result.outcome, String(malformed)).toBe("rolled_back");
+      expect(result.error?.code, String(malformed)).toBe("ACTIVATION_FENCE_INVALID");
+    }
+  });
+
+  it("still binds a result when both the stored lease and the proof omit generation", () => {
+    const state = leasedState("dispatched");
+    const payloadDigest = canonicalJsonDigest({});
+    const result = run(
+      state,
+      { type: "ReceiveResult", command_id: "receive", activation_id: "a", lease_id: "l", status: "success", result_digest: payloadDigest, result: {} },
+      { host_result_verification: resultVerification(payloadDigest)! },
+    );
+    expect(result.outcome).toBe("committed");
+  });
 });

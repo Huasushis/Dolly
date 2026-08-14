@@ -1365,3 +1365,55 @@ fn issue_lease_idempotency_replay_omitting_generation_conflicts_with_present_str
     );
     assert_eq!(replay.error.unwrap().code, "STORAGE_IDEMPOTENCY_CONFLICT");
 }
+
+#[test]
+fn malformed_present_lease_generation_rejects_binding_when_proof_omits_generation() {
+    let mut state = leased(ActivationState::Dispatched, None);
+    state.leases.insert(
+        "l".into(),
+        json!({"activation_id":"a","token_digest":"token-digest","extension_connection_id":"connection-1","worker_epoch":1,"attempt":1,"dispatch_state":"started","extension_generation":"8"}),
+    );
+    let mut binding_input = input();
+    binding_input.host_result_verification = Some(result_proof(A));
+    let result = reduce(
+        &state,
+        &CoreCommand::ReceiveResult(ReceiveResultCommand {
+            command_id: "result".into(),
+            activation_id: "a".into(),
+            lease_id: "l".into(),
+            result_digest: A.into(),
+            status: ReceiveResultStatus::Success,
+            result: None,
+        }),
+        &binding_input,
+    );
+    assert_eq!(result.error.unwrap().code, "ACTIVATION_FENCE_INVALID");
+}
+
+#[test]
+fn issue_lease_refuses_malformed_present_pool_generation() {
+    let mut state = empty_core_snapshot();
+    state.activations.insert(
+        "a".into(),
+        ActivationRecord {
+            state: ActivationState::Ready,
+            attempt: 0,
+            ..Default::default()
+        },
+    );
+    state.generations = vec![json!({"generation":"8","compatible":true})];
+    let result = reduce(
+        &state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "lease-1".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-1".into(),
+            token_digest: A.into(),
+            extension_connection_id: "connection-1".into(),
+            worker_epoch: 1,
+            extension_generation: Some(8),
+        }),
+        &input(),
+    );
+    assert_eq!(result.error.unwrap().code, "CORE_STATE_GENERATION_INVALID");
+}
