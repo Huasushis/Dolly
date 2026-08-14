@@ -24,6 +24,11 @@ import {
 import { parseStrictJsonBytes, StrictJsonError } from "./strict-json.js";
 import { withSynchronousCrossProcessLock } from "./synchronous-cross-process-lock.js";
 import { JsonSchemaError, validateJsonSchema } from "./json-schema.js";
+import {
+  ConfigMigrationRunner,
+  createConfigRevision,
+  type ConfigMigrationOptions,
+} from "./config-revision.js";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
@@ -79,6 +84,28 @@ export interface ResolveModuleConfigurationInput {
   readonly moduleKind: string;
   readonly configVersion: number;
   readonly schema: JsonValue;
+}
+
+export interface MigrateModuleConfigurationInput {
+  /** The immutable source record, as persisted by this store. */
+  readonly source: ModuleConfigurationRecord;
+  /**
+   * The migration runner carrying the registered one-step upgrade paths and
+   * retained schemas (`config-revision.ts`). Its approval, idempotency,
+   * schema, and byte-size gates run unchanged.
+   */
+  readonly migration: ConfigMigrationRunner;
+  /** The target configuration version; the runner enforces positivity and that it exceeds the source version. */
+  readonly targetVersion: number;
+  /**
+   * The retained JSON Schema for `targetVersion`. Its canonical digest is
+   * bound into the returned record as `schemaDigest`, and it must actually
+   * validate the migrated configuration; an inconsistent schema is refused
+   * instead of producing a record the store cannot resolve.
+   */
+  readonly targetSchema: JsonValue;
+  /** Passed through to the runner as `alreadyApplied` / `approvals`. */
+  readonly options?: ConfigMigrationOptions;
 }
 
 export interface ModuleConfigurationStoreOptions {
@@ -410,4 +437,49 @@ export class ModuleConfigurationStore {
       );
     }
   }
+}
+
+/**
+ * Migrate one immutable configuration record to `targetVersion` through the
+ * pure `ConfigMigrationRunner`, producing the target record exactly as this
+ * store would persist it. This is the deterministic bridge between the
+ * accepted config-value migration domain (`config-revision.ts`) and the
+ * durable store: a Host migration flow resolves the source record here,
+ * calls this function, and persists the returned record with `create`.
+ *
+ * The runner enforces every migration gate unchanged (target/source version
+ * reachability, per-step schema validation, approval for loss-declaring
+ * steps, idempotent replay by operation id, output-size and expansion
+ * limits). This function is pure: it performs no I/O, does not mutate
+ * `source`, and only validates that the supplied `targetSchema` actually
+ * validates the migrated configuration so the returned `schemaDigest` binds a
+ * consistent schema.
+ */
+export function migrateModuleConfigurationRecord(
+  input: MigrateModuleConfigurationInput,
+): ModuleConfigurationRecord {
+  assertJsonValue(input.targetSchema);
+  const sourceRevision = createConfigRevision({
+    configId: input.source.configId,
+    extensionId: input.source.extensionId,
+    moduleKind: input.source.moduleKind,
+    configVersion: input.source.configVersion,
+    configuration: input.source.configuration,
+  });
+  const result = input.migration.migrate(sourceRevision, input.targetVersion, input.options);
+  validateSchemaAndConfiguration(input.targetSchema, result.revision.configuration);
+  const body = {
+    configId: input.source.configId,
+    extensionId: input.source.extensionId,
+    moduleKind: input.source.moduleKind,
+    configVersion: result.revision.configVersion,
+    schemaDigest: canonicalJsonDigest(input.targetSchema),
+    configurationDigest: canonicalJsonDigest(result.revision.configuration),
+    configuration: result.revision.configuration,
+  } as const;
+  return immutableRecord({
+    schemaVersion: "dolly.module-configuration/1",
+    ...body,
+    revision: revisionFor(body),
+  });
 }
