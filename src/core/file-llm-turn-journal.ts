@@ -42,7 +42,7 @@ import {
 } from "./synchronous-cross-process-lock.js";
 
 interface LLMTurnJournalDocument {
-  readonly schemaVersion: "dolly.llm-turn-journal/1";
+  readonly schemaVersion: "dolly.llm-turn-journal/2";
   /** Number of completed rotations; also the deterministic archive segment index. */
   readonly rotation: number;
   /** Number of entries appended since the last rotation (equals entries.length). */
@@ -75,7 +75,7 @@ function fsyncDirectory(path: string): void {
 
 function emptyDocument(): LLMTurnJournalDocument {
   return {
-    schemaVersion: "dolly.llm-turn-journal/1",
+    schemaVersion: "dolly.llm-turn-journal/2",
     rotation: 0,
     sequence: 0,
     entries: [],
@@ -186,7 +186,7 @@ export class FileLLMTurnJournal implements LLMTurnJournal {
       // a crash between the two leaves every entry in at least one file.
       this.#writeDocumentAt(archivePath, document);
       this.#writeDocument({
-        schemaVersion: "dolly.llm-turn-journal/1",
+        schemaVersion: "dolly.llm-turn-journal/2",
         rotation: nextRotation(document),
         sequence: 0,
         entries: [],
@@ -262,7 +262,7 @@ export class FileLLMTurnJournal implements LLMTurnJournal {
       Object.keys(value).some(
         (key) => key !== "schemaVersion" && key !== "rotation" && key !== "sequence" && key !== "entries",
       ) ||
-      value.schemaVersion !== "dolly.llm-turn-journal/1" ||
+      value.schemaVersion !== "dolly.llm-turn-journal/2" ||
       typeof value.rotation !== "number" ||
       !Number.isSafeInteger(value.rotation) ||
       value.rotation < 0 ||
@@ -294,7 +294,7 @@ export class FileLLMTurnJournal implements LLMTurnJournal {
       }
     }
     return {
-      schemaVersion: "dolly.llm-turn-journal/1",
+      schemaVersion: "dolly.llm-turn-journal/2",
       rotation: value.rotation,
       sequence: value.sequence,
       entries,

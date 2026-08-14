@@ -40,6 +40,12 @@ export interface PreparedTurnInput {
   readonly inputDeliveryIds: readonly string[];
   /** Frozen model operation snapshot identity this turn plans to use. */
   readonly modelSnapshotId: string;
+  /** Core Activation this preparation belongs to (fixed across attempts). */
+  readonly activationId: string;
+  /** Immutable attempt counter this prepared record belongs to. */
+  readonly attempt: number;
+  /** Lease epoch under which this record was prepared. */
+  readonly leaseEpoch: number;
   /** Turn budget: maximum provider request count. */
   readonly maxRequests: number;
   /** Turn budget: maximum approval decision count. */
@@ -173,6 +179,9 @@ function assertPreparedTurnFields(value: Record<string, unknown>): void {
   assertIdentifier(value.moduleJobId, "Prepared turn moduleJobId");
   assertIdentifier(value.runId, "Prepared turn runId");
   assertIdentifier(value.modelSnapshotId, "Prepared turn modelSnapshotId");
+  assertIdentifier(value.activationId, "Prepared turn activationId");
+  assertNonNegativeSafeInteger(value.attempt, "Prepared turn attempt");
+  assertNonNegativeSafeInteger(value.leaseEpoch, "Prepared turn leaseEpoch");
   assertNonNegativeSafeInteger(
     value.conversationRevision,
     "Prepared turn conversationRevision",
@@ -196,8 +205,11 @@ export function assertPreparedTurnInput(value: unknown): asserts value is Prepar
     throw new LLMTurnJournalError("LLM_TURN_INVALID", "Prepared turn input is not JSON data");
   }
   const expectedKeys = [
+    "activationId",
+    "attempt",
     "conversationRevision",
     "inputDeliveryIds",
+    "leaseEpoch",
     "maxApprovals",
     "maxRequests",
     "maxToolCalls",
@@ -215,9 +227,12 @@ export function assertPreparedTurnInput(value: unknown): asserts value is Prepar
 /** Validates one complete prepared turn entry, including its timestamp. */
 export function assertPreparedTurnRecord(value: unknown): asserts value is PreparedTurnRecord {
   if (!isPlainRecord(value) || value.kind !== "prepared-turn" || !exactKeys(value, [
+    "activationId",
+    "attempt",
     "conversationRevision",
     "inputDeliveryIds",
     "kind",
+    "leaseEpoch",
     "maxApprovals",
     "maxRequests",
     "maxToolCalls",

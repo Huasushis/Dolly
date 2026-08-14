@@ -1,6 +1,6 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FileLLMTurnJournal } from "../../../src/core/file-llm-turn-journal.js";
 import {
@@ -9,6 +9,7 @@ import {
   resolveTurnJournalStateDirectory,
   type ApprovalDecisionInput,
   type PreparedTurnInput,
+  type PreparedTurnRecord,
 } from "../../../src/core/llm-turn-journal.js";
 import { withSynchronousCrossProcessLock } from "../../../src/core/synchronous-cross-process-lock.js";
 
@@ -22,6 +23,9 @@ function preparedTurnInput(overrides: Partial<PreparedTurnInput> = {}): Prepared
     conversationRevision: 3,
     inputDeliveryIds: ["delivery-a", "delivery-b"],
     modelSnapshotId: "model-snapshot-1",
+    activationId: "activation-1",
+    attempt: 1,
+    leaseEpoch: 1,
     maxRequests: 8,
     maxApprovals: 1,
     maxToolCalls: 4,
@@ -135,6 +139,70 @@ describe("durable prepared-turn and approval journal", () => {
     expect(() => badClock.appendPreparedTurn(preparedTurnInput())).toThrowError(
       expect.objectContaining<Partial<LLMTurnJournalError>>({
         code: "LLM_TURN_JOURNAL_CLOCK_INVALID",
+      }),
+    );
+  });
+
+  it("fixes attempt identity: activation, attempt, and lease epoch round-trip across reopen", () => {
+    const journal = new FileLLMTurnJournal({ path, now: () => NOW });
+    journal.appendPreparedTurn(
+      preparedTurnInput({ activationId: "activation-9", attempt: 2, leaseEpoch: 3 }),
+    );
+    expect(new FileLLMTurnJournal({ path, now: () => NOW }).list()).toEqual([
+      {
+        ...preparedTurnInput({ activationId: "activation-9", attempt: 2, leaseEpoch: 3 }),
+        kind: "prepared-turn",
+        recordedAt: NOW,
+      },
+    ]);
+  });
+
+  it("retains the same turnId on distinct attempts as separate append-only records", () => {
+    const journal = new FileLLMTurnJournal({ path, now: () => NOW });
+    journal.appendPreparedTurn(preparedTurnInput({ attempt: 1, leaseEpoch: 1 }));
+    journal.appendPreparedTurn(preparedTurnInput({ attempt: 2, leaseEpoch: 2 }));
+    const records = journal.list() as readonly PreparedTurnRecord[];
+    expect(records).toHaveLength(2);
+    expect(records[0]).toMatchObject({ turnId: "turn-1", activationId: "activation-1", attempt: 1, leaseEpoch: 1 });
+    expect(records[1]).toMatchObject({ turnId: "turn-1", activationId: "activation-1", attempt: 2, leaseEpoch: 2 });
+  });
+
+  it("rejects prepared turns with missing or malformed attempt identity", () => {
+    const journal = new FileLLMTurnJournal({ path, now: () => NOW });
+    const missingActivation = { ...preparedTurnInput() } as Record<string, unknown>;
+    delete missingActivation.activationId;
+    expect(() =>
+      journal.appendPreparedTurn(missingActivation as unknown as PreparedTurnInput),
+    ).toThrowError(
+      expect.objectContaining<Partial<LLMTurnJournalError>>({ code: "LLM_TURN_INVALID" }),
+    );
+    expect(() =>
+      journal.appendPreparedTurn(preparedTurnInput({ activationId: "bad id" })),
+    ).toThrowError(
+      expect.objectContaining<Partial<LLMTurnJournalError>>({ code: "LLM_TURN_INVALID" }),
+    );
+    expect(() =>
+      journal.appendPreparedTurn(preparedTurnInput({ attempt: -1 })),
+    ).toThrowError(
+      expect.objectContaining<Partial<LLMTurnJournalError>>({ code: "LLM_TURN_INVALID" }),
+    );
+    expect(() =>
+      journal.appendPreparedTurn(preparedTurnInput({ leaseEpoch: 1.5 })),
+    ).toThrowError(
+      expect.objectContaining<Partial<LLMTurnJournalError>>({ code: "LLM_TURN_INVALID" }),
+    );
+  });
+
+  it("fails closed on a v1 journal document that was never shipped", () => {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(
+      path,
+      '{"schemaVersion":"dolly.llm-turn-journal/1","rotation":0,"sequence":0,"entries":[]}',
+      "utf8",
+    );
+    expect(() => new FileLLMTurnJournal({ path })).toThrowError(
+      expect.objectContaining<Partial<LLMTurnJournalError>>({
+        code: "LLM_TURN_JOURNAL_DOCUMENT_INVALID",
       }),
     );
   });
