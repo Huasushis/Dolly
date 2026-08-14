@@ -1373,20 +1373,37 @@ fn execute(vector: &Value) -> (Value, Value, String, Vec<Value>) {
 
 #[test]
 fn executes_all_seventeen_immutable_core_vectors() {
-    let root = spec_root().join("test-vectors/core");
-    let mut files: Vec<_> = fs::read_dir(root)
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
         .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("TST-CORE-")
-                && path.extension().is_some_and(|ext| ext == "json")
+        .parent()
+        .unwrap();
+    // Imported vectors are authoritative; the repository-owned overlay
+    // extends the set, so the imported root is resolved first on any name
+    // collision and the merged list stays byte-deterministic.
+    let roots = [
+        repo_root.join("dolly-spec/test-vectors/core"),
+        repo_root.join("test-vectors/core"),
+    ];
+    let mut names: Vec<_> = roots
+        .iter()
+        .flat_map(|root| fs::read_dir(root).unwrap())
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("TST-CORE-") && name.ends_with(".json"))
+        .collect();
+    names.sort();
+    names.dedup();
+    let vectors: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let imported = roots[0].join(name);
+            read(if imported.exists() {
+                imported
+            } else {
+                roots[1].join(name)
+            })
         })
         .collect();
-    files.sort();
-    let vectors: Vec<_> = files.iter().map(read).collect();
     assert_eq!(vectors.len(), 17);
     for (index, vector) in vectors.iter().enumerate() {
         assert_eq!(vector["test_id"], format!("TST-CORE-{:03}", index + 1));
