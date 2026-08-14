@@ -226,4 +226,75 @@ describe("PKG-001 distributable package", () => {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it("keeps every internal module clause out of the pack selection", () => {
+    const repositoryRoot = resolve(import.meta.dirname, "../../..");
+    const temporaryRoot = mkdtempSync(join(tmpdir(), "dolly-pack-clause-"));
+
+    try {
+      const cacheDirectory = join(temporaryRoot, "npm-cache");
+      mkdirSync(cacheDirectory, { recursive: true });
+
+      const npmCli = process.env.npm_execpath;
+      if (!npmCli) {
+        throw new Error("Package smoke test must run through an npm script");
+      }
+      const packed = spawnSync(
+        process.execPath,
+        [
+          npmCli,
+          "pack",
+          "--json",
+          "--dry-run",
+          "--cache",
+          cacheDirectory,
+        ],
+        {
+          cwd: repositoryRoot,
+          encoding: "utf8",
+          env: { ...process.env, NO_COLOR: "1" },
+        },
+      );
+      expect(packed.status, packed.stderr).toBe(0);
+
+      const manifest = parsePackOutput(packed.stdout);
+      const publishedPaths = new Set(manifest.files.map((file) => file.path));
+
+      const requiredPaths = [
+        "LICENSE",
+        "bin/dolly.js",
+        "dist/src/entry.js",
+        "dist/src/entry.d.ts",
+        "dist/src/sdk/index.js",
+        "dist/src/sdk/index.d.ts",
+        "dist/src/sdk/types.d.ts",
+      ];
+      for (const requiredPath of requiredPaths) {
+        expect(publishedPaths, `missing ${requiredPath}`).toContain(requiredPath);
+      }
+
+      const forbiddenClauses: Array<{ label: string; pattern: RegExp }> = [
+        { label: "dist/daemon", pattern: /^dist\/daemon(?:\/|$)/ },
+        { label: "dist/extensions", pattern: /^dist\/extensions(?:\/|$)/ },
+        { label: "dist/src/core/ipc", pattern: /^dist\/src\/core\/ipc(?:\.|$)/ },
+        { label: "dist/src/config", pattern: /^dist\/src\/config(?:\.|$)/ },
+        { label: "dist/src/core/block-manager", pattern: /^dist\/src\/core\/block-manager(?:\.|$)/ },
+        {
+          label: "dist/src/core/legacy-in-process-extension",
+          pattern: /^dist\/src\/core\/legacy-in-process-extension(?:\.|$)/,
+        },
+        { label: "dist/src/core/media", pattern: /^dist\/src\/core\/media(?:\.|$)/ },
+        { label: "dist/src/core/orchestrator", pattern: /^dist\/src\/core\/orchestrator(?:\.|$)/ },
+        { label: "dist/src/core/page", pattern: /^dist\/src\/core\/page(?:\.|$)/ },
+        { label: "dist/src/core/scheduler", pattern: /^dist\/src\/core\/scheduler(?:\.|$)/ },
+        { label: "dist/src/core/types", pattern: /^dist\/src\/core\/types(?:\.|$)/ },
+      ];
+      for (const { label, pattern } of forbiddenClauses) {
+        const offenders = [...publishedPaths].filter((path) => pattern.test(path));
+        expect(offenders, `pack selection still ships internal module ${label}`).toEqual([]);
+      }
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
