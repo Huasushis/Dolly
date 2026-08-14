@@ -494,7 +494,7 @@ fn round_half_even_div(numerator: u64, denominator: u64) -> Result<u64, FilterAr
 
 #[cfg(test)]
 mod tests {
-    use super::{round_half_even_div, FilterArithmeticError};
+    use super::{FilterArithmeticError, round_half_even_div};
 
     #[test]
     fn round_half_even_ties_to_even() {
