@@ -80,3 +80,13 @@ export {
   type ProcessIdentityProbe,
   type ProcessLiveness,
 } from "./process-identity.js";
+
+export {
+  ProcessGenerationError,
+  ProcessGenerationSequence,
+  formatProcessGenerationToken,
+  parseProcessGenerationToken,
+  type ProcessGenerationErrorCode,
+  type ProcessGenerationSequenceOptions,
+  type ProcessGenerationToken,
+} from "./process-generation.js";
