@@ -3,14 +3,16 @@
 //! `dolly-spec/docs/spec/extensions/filter-two-thirds.md` (§3).
 //!
 //! This crate implements ONLY the arithmetic exercised by the authoritative
-//! `TST-FILTER-001`, `TST-FILTER-003`, and `TST-FILTER-004` vectors: checked
-//! integer half-even smoothing (`A`, `Z`), bias correction, the mandatory
-//! saturation clamp, division-free two-thirds cohort selection with a JCS
-//! UTF-8 tie-break, and ordered per-source block application with explicit
-//! malformed-signal rejection and latest-eligible content selection for
-//! projectable Blocks. It contains no Extension scaffolding, durable state,
-//! projection, activation ledger, provider, or runtime dependency; floating
-//! point is non-conforming and is never used.
+//! `TST-FILTER-001`, `TST-FILTER-003`, `TST-FILTER-004`, and `TST-FILTER-006`
+//! vectors: checked integer half-even smoothing (`A`, `Z`), bias correction,
+//! the mandatory saturation clamp, division-free two-thirds cohort selection
+//! with a JCS UTF-8 tie-break, ordered per-source block application with
+//! explicit malformed-signal rejection and latest-eligible content selection
+//! for projectable Blocks, and the ordered decision-state replay that derives
+//! `after_state` from `before_state` and the applied observations and requires
+//! it to equal the claimed `after_state`. It contains no Extension scaffolding,
+//! durable state, projection, activation ledger, provider, or runtime
+//! dependency; floating point is non-conforming and is never used.
 
 use dolly_canonical_json::canonicalize;
 
@@ -243,30 +245,34 @@ pub fn select_winner(
     let mut best_key: Option<Vec<u8>> = None;
     for index in 1..n {
         let distance = distances[index];
-        if distance < min_distance {
-            min_distance = distance;
-            best = index;
-            best_key = None;
-        } else if distance == min_distance {
-            let key = tie_break_key(instance_id, &candidates[index].module_id, channel)?;
-            match best_key.as_ref() {
-                None => {
-                    // First real tie: seed with the running best's own key.
-                    let current_best_key =
-                        tie_break_key(instance_id, &candidates[best].module_id, channel)?;
-                    if key < current_best_key {
+        match distance.cmp(&min_distance) {
+            std::cmp::Ordering::Less => {
+                min_distance = distance;
+                best = index;
+                best_key = None;
+            }
+            std::cmp::Ordering::Equal => {
+                let key = tie_break_key(instance_id, &candidates[index].module_id, channel)?;
+                match best_key.as_ref() {
+                    None => {
+                        // First real tie: seed with the running best's own key.
+                        let current_best_key =
+                            tie_break_key(instance_id, &candidates[best].module_id, channel)?;
+                        if key < current_best_key {
+                            best_key = Some(key);
+                            best = index;
+                        } else {
+                            best_key = Some(current_best_key);
+                        }
+                    }
+                    Some(current_best_key) if key < *current_best_key => {
                         best_key = Some(key);
                         best = index;
-                    } else {
-                        best_key = Some(current_best_key);
                     }
+                    Some(_) => {}
                 }
-                Some(current_best_key) if key < *current_best_key => {
-                    best_key = Some(key);
-                    best = index;
-                }
-                Some(_) => {}
             }
+            std::cmp::Ordering::Greater => {}
         }
     }
 
@@ -382,6 +388,89 @@ pub fn apply_block_sequence<'a>(
     })
 }
 
+/// One trusted observation in the canonical ordered tape (spec §5).
+///
+/// The tape is the authoritative, ordered observation sequence derived from
+/// the trusted Manifest in ascending `manifest_ordinal`. The replay oracle
+/// applies it in that canonical order; it carries no disposition or
+/// projection authority of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayObservation<'a> {
+    /// Ascending application order within the Manifest.
+    pub manifest_ordinal: u64,
+    /// Trusted source key (`instance_id`/`module_id`/`channel` together).
+    pub source: &'a str,
+    /// Valid score in `0..=1000`; validated by [`update`] on replay.
+    pub score: u64,
+}
+
+/// Outcome of replaying a decision's ordered observations from `before_state`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayOutcome<'a> {
+    /// Per-source accumulator state after every applied observation, in
+    /// ascending bytewise source order. Sources present in `before_state`
+    /// with no new observation are held unchanged.
+    pub derived_after_state: Vec<(&'a str, Accumulator)>,
+    /// Whether the claimed `after_state` exactly equals the replay-derived
+    /// state for every source pair; `false` means the prepared decision must
+    /// be rejected (`FILTER_ORDERED_STATE_REPLAY_MISMATCH`).
+    pub claimed_matches: bool,
+}
+
+/// Replay the ordered decision tape from `before_state` under the frozen
+/// configuration and require the result to equal the claimed `after_state`
+/// (spec §5 "starts from `before_state`, applies only `applied` observations
+/// in ascending `manifest_ordinal` with the frozen `new_sample_weight_ppm`,
+/// and requires the result to equal `after_state`").
+///
+/// Every well-formed score updates the per-source accumulator exactly once;
+/// a source absent from `before_state` starts from `A0 = 0, Z0 = 0`. Both
+/// states are compared as (source, accumulator) sets sorted by bytewise
+/// source key; equal sources with any differing accumulator, or a source
+/// present in exactly one side, makes `claimed_matches` false. No digest,
+/// manifest, or ledger authority is consulted: this is the fixed arithmetic
+/// alone, and the caller decides rejection from `claimed_matches`.
+pub fn replay_decision_state<'a>(
+    config: &FilterConfig,
+    before_state: &[(&'a str, Accumulator)],
+    observations: &[ReplayObservation<'a>],
+    claimed_after_state: &[(&'a str, Accumulator)],
+) -> Result<ReplayOutcome<'a>, FilterArithmeticError> {
+    // Seed the derived state with the committed before_state (bytes are
+    // borrowed; only the accumulator copies are written in place).
+    let mut derived_after_state: Vec<(&'a str, Accumulator)> = before_state.to_vec();
+
+    for observation in observations {
+        match derived_after_state
+            .iter_mut()
+            .find(|(source, _)| *source == observation.source)
+        {
+            Some((_, state)) => update(config, state, observation.score)?,
+            None => {
+                let mut state = Accumulator::default();
+                update(config, &mut state, observation.score)?;
+                derived_after_state.push((observation.source, state));
+            }
+        }
+    }
+
+    // Canonical server-wide order: ascending bytewise source key.
+    derived_after_state.sort_by_key(|&(source, _)| source);
+
+    let mut claimed: Vec<(&'a str, Accumulator)> = claimed_after_state.to_vec();
+    claimed.sort_by_key(|&(source, _)| source);
+    let claimed_matches = derived_after_state.len() == claimed.len()
+        && derived_after_state
+            .iter()
+            .zip(claimed.iter())
+            .all(|(left, right)| left == right);
+
+    Ok(ReplayOutcome {
+        derived_after_state,
+        claimed_matches,
+    })
+}
+
 /// Round `numerator / denominator` to the nearest integer, ties to even,
 /// for non-negative operands (spec §3 requires half-even rounding).
 fn round_half_even_div(numerator: u64, denominator: u64) -> Result<u64, FilterArithmeticError> {
@@ -405,7 +494,7 @@ fn round_half_even_div(numerator: u64, denominator: u64) -> Result<u64, FilterAr
 
 #[cfg(test)]
 mod tests {
-    use super::{FilterArithmeticError, round_half_even_div};
+    use super::{round_half_even_div, FilterArithmeticError};
 
     #[test]
     fn round_half_even_ties_to_even() {
