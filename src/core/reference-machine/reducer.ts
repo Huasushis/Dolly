@@ -174,7 +174,7 @@ function resultBindingValid(state: CoreSnapshot, command: Extract<CoreCommand, {
   if (lease.activation_id !== command.activation_id || lease.token_digest !== proof.token_digest || Number(lease.attempt) !== proof.attempt || item.attempt !== proof.attempt) return false;
   if (lease.extension_connection_id !== proof.extension_connection_id || Number(lease.worker_epoch) !== proof.worker_epoch) return false;
   if ((lease.extension_generation === undefined) !== (proof.extension_generation === undefined)) return false;
-  if (proof.extension_generation !== undefined && Number(lease.extension_generation) !== proof.extension_generation) return false;
+  if (proof.extension_generation !== undefined && lease.extension_generation !== proof.extension_generation) return false;
   if ((lease.manifest_digest === undefined) !== (proof.manifest_digest === undefined)) return false;
   if (proof.manifest_digest !== undefined && lease.manifest_digest !== proof.manifest_digest) return false;
   return true;
@@ -318,13 +318,13 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
           && existing.extension_connection_id === command.extension_connection_id
           && Number(existing.worker_epoch) === command.worker_epoch
           && Number(existing.attempt) === item.attempt
-          && (command.extension_generation !== undefined ? Number(existing.extension_generation) === command.extension_generation : !("extension_generation" in existing));
+          && (command.extension_generation !== undefined ? existing.extension_generation === command.extension_generation : !("extension_generation" in existing));
         if (!exact) return failure(state, "STORAGE_IDEMPOTENCY_CONFLICT", false, { lease_id: command.lease_id });
-        const existingGeneration = Number(existing.extension_generation);
+        const existingGeneration = existing.extension_generation;
         return success(state, [], {
           lease_id: command.lease_id,
           attempt: item.attempt,
-          ...(Number.isSafeInteger(existingGeneration) ? { extension_generation: existingGeneration } : {}),
+          ...(typeof existingGeneration === "number" && Number.isSafeInteger(existingGeneration) ? { extension_generation: existingGeneration } : {}),
           ...(item.manifest?.effective_config ? { effective_config: item.manifest.effective_config } : {}),
         });
       }
