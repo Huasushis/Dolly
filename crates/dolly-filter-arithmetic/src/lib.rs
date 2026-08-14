@@ -3,12 +3,14 @@
 //! `dolly-spec/docs/spec/extensions/filter-two-thirds.md` (§3).
 //!
 //! This crate implements ONLY the arithmetic exercised by the authoritative
-//! `TST-FILTER-001` and `TST-FILTER-003` vectors: checked integer half-even
-//! smoothing (`A`, `Z`), bias correction, the mandatory saturation clamp, and
-//! the division-free two-thirds cohort selection with a JCS UTF-8 tie-break.
-//! It contains no Extension scaffolding, durable state, projection, activation
-//! ledger, provider, or runtime dependency; floating point is non-conforming
-//! and is never used.
+//! `TST-FILTER-001`, `TST-FILTER-003`, and `TST-FILTER-004` vectors: checked
+//! integer half-even smoothing (`A`, `Z`), bias correction, the mandatory
+//! saturation clamp, division-free two-thirds cohort selection with a JCS
+//! UTF-8 tie-break, and ordered per-source block application with explicit
+//! malformed-signal rejection and latest-eligible content selection for
+//! projectable Blocks. It contains no Extension scaffolding, durable state,
+//! projection, activation ledger, provider, or runtime dependency; floating
+//! point is non-conforming and is never used.
 
 use dolly_canonical_json::canonicalize;
 
