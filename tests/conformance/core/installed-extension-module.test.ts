@@ -64,6 +64,11 @@ import {
   type InstalledLinuxExtensionModuleExecutorOptions,
 } from "../../../src/adapters/installed-linux-extension-module-executor.js";
 import {
+  createLinuxModuleExecutor,
+  type LinuxModuleAuthorizedProcess,
+  type LinuxModuleProtocolSession,
+} from "../../../src/adapters/linux-module-executor.js";
+import {
   LINUX_PACKAGE_SNAPSHOT_BOOTSTRAP,
   LINUX_PROCESS_CONFINEMENT_PROGRAM,
 } from "../../../src/adapters/linux-process-confinement.js";
@@ -104,6 +109,12 @@ import type {
   ModuleProcessRecord,
   ModuleProcessStoppedRecordWriter,
 } from "../../../src/core/module-process-records.js";
+import type { ReactiveModuleResult } from "../../../src/core/reactive-module-runtime.js";
+import {
+  createVersion19RecordStore,
+  version19CgroupPath,
+  VERSION19_MINTED_PROCESS_GENERATION_ID,
+} from "./fixtures/linux-module-executor-version19.js";
 import { ModuleConfigurationStore } from "../../../src/core/module-configuration-store.js";
 import {
   createDefaultDollyInstanceConfig,
@@ -392,6 +403,46 @@ function stoppedRecordWriter(): ModuleProcessStoppedRecordWriter {
     writeStopped: vi.fn(() => {
       throw new Error("the derivation must not write process records");
     }),
+  };
+}
+
+/**
+ * An in-memory control-group filesystem for one full start/stop composition.
+ * The group is always reported empty so the whole-group termination proof can
+ * resolve without simulating kernel membership.
+ */
+function cgroupFileSystemFor() {
+  const files = new Map<string, string>();
+  const directories = new Set<string>();
+  return {
+    files,
+    directories,
+    async createDirectory(path: string): Promise<void> {
+      directories.add(path);
+    },
+    async removeDirectory(path: string): Promise<void> {
+      directories.delete(path);
+    },
+    async directoryExists(path: string): Promise<boolean> {
+      return directories.has(path);
+    },
+    async listChildDirectoryNames(): Promise<readonly string[]> {
+      return [];
+    },
+    async writableFileExists(path: string): Promise<boolean> {
+      return directories.has(path.slice(0, path.lastIndexOf("/")));
+    },
+    async readTextFile(path: string): Promise<string> {
+      if (path.endsWith("/cgroup.events")) return "populated 0\nfrozen 0\n";
+      const value = files.get(path);
+      if (value === undefined) {
+        throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      }
+      return value;
+    },
+    async writeTextFile(path: string, contents: string): Promise<void> {
+      files.set(path, contents);
+    },
   };
 }
 
@@ -988,6 +1039,28 @@ describe("installed Extension Module resolution", () => {
     expect(processRecord.moduleCgroupPath).toBe(
       deriveModuleCgroupPath(DELEGATED_ROOT, PROCESS_IDENTITY).filesystemPath,
     );
+    // The version 19 store owns the identifier, so the installed lifecycle
+    // carries an id-less twin instead of a caller process generation. The
+    // twin keeps the unrelated record fields and the delegated control-group
+    // root the store derives the path from.
+    const startingRecord = derived.executorOptions.lifecycle.startingRecord;
+    if (startingRecord === undefined) {
+      throw new Error("the installed lifecycle must derive a starting record");
+    }
+    expect(Object.hasOwn(startingRecord, "processGenerationId")).toBe(false);
+    expect(Object.hasOwn(startingRecord, "moduleCgroupPath")).toBe(false);
+    expect(startingRecord.delegatedRootCgroupPath).toBe(DELEGATED_ROOT);
+    const {
+      processGenerationId: _placeholderProcessGenerationId,
+      moduleCgroupPath: _placeholderModuleCgroupPath,
+      ...processRecordBody
+    } = processRecord;
+    const {
+      delegatedRootCgroupPath: _derivedRoot,
+      moduleCgroupPath: _optionalCallerPath,
+      ...startingBody
+    } = startingRecord;
+    expect(startingBody).toEqual(processRecordBody);
     expect(derived.executorOptions.host.manifest).toStrictEqual(installed.manifest);
     expect(derived.executorOptions.host.trust).toBe("trusted");
     expect(derived.executorOptions.host.moduleKind).toBe("transform");
@@ -1231,5 +1304,135 @@ describe("installed Extension Module resolution", () => {
     expect(() => factory.createExecutor("module-generation-d"))
       .toThrow(/Process generation process-installed-existing has already been used/u);
     expect(records.appendModuleProcessRecord).not.toHaveBeenCalled();
+  });
+
+  it("lets a version 19 store mint the installed identifier for running and stop transitions", async () => {
+    const source = resolve(scratch, "source-v19");
+    writePackage(source, "1.0.0");
+    installations.installNodePackage({ sourceDirectory: source, trust: "trusted" });
+    const configuration = configurations.create({
+      configId: "worker-config",
+      extensionId: "org.example.installed",
+      moduleKind: "transform",
+      configVersion: 1,
+      schema: CONFIGURATION_SCHEMA,
+      configuration: { prefix: "composed" },
+    });
+    const records = createVersion19RecordStore();
+
+    const options: InstalledLinuxExtensionModuleExecutorOptions = {
+      instanceConfiguration: instanceConfiguration("1.0.0", configuration.revision),
+      moduleId: "worker",
+      installations,
+      configurations,
+      moduleGenerationId: MODULE_GENERATION_ID,
+      coreStateDirectory: resolve(scratch, "instance-state"),
+      activation,
+      lifecycle: {
+        records,
+        stoppedRecordWriter: records.stoppedRecordWriter,
+        identity: PROCESS_IDENTITY,
+        limits: {
+          memoryMaxBytes: 64 * 1_024 * 1_024,
+          maxProcesses: 16,
+          cpuQuotaMicros: 50_000,
+          cpuPeriodMicros: 100_000,
+        },
+        maxOpenFiles: 64,
+      },
+      processRecord: {
+        createdAt: "2026-08-10T00:00:00.000Z",
+        updatedAt: "2026-08-10T00:00:00.000Z",
+      },
+      host: {
+        isolationPolicy: new ExtensionIsolationPolicy(),
+      },
+      executionTimeoutMs: 1_000,
+      cancellationGraceMs: 250,
+      terminationTimeoutMs: 2_000,
+      channelCloseTimeoutMs: 1_000,
+    };
+    const derived = deriveInstalledLinuxExtensionModuleExecutor(options);
+    const lifecycle = derived.executorOptions.lifecycle;
+    // The installed lifecycle never carries a caller process generation; the
+    // version 19 store allocates it. The reviewed placeholder stays only in
+    // the version 18 record twin, which this store ignores.
+    expect(Object.hasOwn(lifecycle.startingRecord!, "processGenerationId")).toBe(false);
+    expect(lifecycle.processRecord.processGenerationId)
+      .toBe(PROCESS_IDENTITY.processGenerationId);
+
+    const fileSystem = cgroupFileSystemFor();
+    const mintedPath = version19CgroupPath(
+      {
+        instanceId: PROCESS_IDENTITY.instanceId,
+        moduleId: PROCESS_IDENTITY.moduleId,
+      },
+      VERSION19_MINTED_PROCESS_GENERATION_ID,
+    );
+    const openProtocolSession = (
+      started: LinuxModuleAuthorizedProcess,
+    ): LinuxModuleProtocolSession => {
+      expect(started.record.processGenerationId)
+        .toBe(VERSION19_MINTED_PROCESS_GENERATION_ID);
+      expect(started.cgroup.path).toBe(mintedPath);
+      return {
+        initialize: async () => undefined,
+        execute: async () => ({ schemaVersion: "dolly.module-result/1" }) as ReactiveModuleResult,
+        cancel: async () => undefined,
+        closeCapabilitySession: async () => undefined,
+        waitForChannelClosed: async () => true,
+      };
+    };
+
+    const composition = createLinuxModuleExecutor({
+      moduleId: options.moduleId,
+      moduleGenerationId: options.moduleGenerationId,
+      lifecycle: {
+        ...lifecycle,
+        startLauncher: async () => ({
+          processId: 4242,
+          configure: async () => undefined,
+          authorizeExecution: async () => ({
+            executionAuthorized: true,
+            verifiedProcessIds: [4242],
+          }) as const,
+          requestExit: async () => true,
+        }),
+        cgroupFileSystem: fileSystem,
+      },
+      openProtocolSession,
+      terminationTimeoutMs: 200,
+      channelCloseTimeoutMs: 200,
+      coreExitCleanupTimeoutMs: 200,
+      exitCoreProcess: () => undefined,
+    });
+    if (composition.start === undefined || composition.terminate === undefined) {
+      throw new Error("the Linux Module executor must provide start and terminate");
+    }
+
+    await composition.start();
+    expect(records.log[0]).toBe("allocate");
+    expect(records.log).not.toContain("append");
+    expect(records.current?.state).toBe("running");
+    expect(records.current?.processGenerationId)
+      .toBe(VERSION19_MINTED_PROCESS_GENERATION_ID);
+    expect(records.getModuleProcessRecord(PROCESS_IDENTITY.processGenerationId))
+      .toBeUndefined();
+    expect(fileSystem.directories.has(mintedPath)).toBe(true);
+
+    await composition.terminate({
+      moduleId: options.moduleId,
+      moduleGenerationId: options.moduleGenerationId,
+    });
+    expect(records.current?.state).toBe("stopped");
+    expect(records.current?.processGenerationId)
+      .toBe(VERSION19_MINTED_PROCESS_GENERATION_ID);
+    expect(records.log).toEqual([
+      "allocate",
+      "state:running",
+      "state:stopping",
+      "state:stopped",
+    ]);
+    expect(records.log).not.toContain("append");
   });
 });

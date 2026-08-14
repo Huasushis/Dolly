@@ -20,8 +20,16 @@ import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js
 import {
   canTransitionModuleProcessRecordState,
   type ModuleProcessRecord,
+  type ModuleProcessStartingRecordInput,
   type ModuleProcessStoppedRecordWriter,
 } from "../../../src/core/module-process-records.js";
+import { isVersion19ProcessGenerationId } from "../../../src/core/linux-identifier-formats.js";
+import {
+  createVersion19RecordStore,
+  version19CgroupPath,
+  version19StartingRecordInput,
+  VERSION19_MINTED_PROCESS_GENERATION_ID,
+} from "./fixtures/linux-module-executor-version19.js";
 
 const DELEGATED_ROOT = "/system.slice/dolly-core.service";
 const IDENTITY = {
@@ -855,5 +863,165 @@ describe("Linux Module process lifecycle order", () => {
     expect(fileSystem.directories.has(started.cgroup.path)).toBe(true);
     expect(records.log).not.toContain("state:stopping");
     expect(records.log).not.toContain("state:stopped");
+  });
+
+  describe("version 19 store allocation", () => {
+    it("allocates the minted identifier and follows it for every cgroup and launcher use", async () => {
+      const records = createVersion19RecordStore();
+      const fileSystem = fakeCgroupFileSystem();
+      const configuredPaths: string[] = [];
+      const authorizedPaths: string[] = [];
+      const startedAt = new Date("2026-08-10T00:00:00.000Z");
+      const control: ModuleLauncherControl = {
+        processId: 4242,
+        async configure(request) {
+          configuredPaths.push(request.moduleCgroupPath);
+        },
+        async authorizeExecution(request) {
+          authorizedPaths.push(request.moduleCgroupPath);
+          return { executionAuthorized: true, verifiedProcessIds: [4242] } as const;
+        },
+        async requestExit() {
+          return true;
+        },
+      };
+      const startLauncher = vi.fn(async () => control);
+
+      const result = await startModuleProcess({
+        records,
+        stoppedRecordWriter: records.stoppedRecordWriter,
+        // The reviewed placeholder record must be bypassed entirely on a
+        // version 19 store, where the store owns the identifier.
+        processRecord: processRecord(),
+        startingRecord: version19StartingRecordInput(),
+        delegatedRootCgroupPath: DELEGATED_ROOT,
+        identity: IDENTITY,
+        limits: LIMITS,
+        maxOpenFiles: 256,
+        startLauncher,
+        execution: EXECUTION,
+        cgroupFileSystem: fileSystem,
+      });
+
+      expect(result.executionAuthorized).toBe(true);
+      if (!result.executionAuthorized) throw new Error("expected authorization");
+      const mintedPath = version19CgroupPath(
+        { instanceId: IDENTITY.instanceId, moduleId: IDENTITY.moduleId },
+        VERSION19_MINTED_PROCESS_GENERATION_ID,
+      );
+      // The store minted its own identifier; the caller placeholder was never
+      // appended and no state transition happened inside the seam.
+      expect(records.log).toEqual(["allocate"]);
+      expect(records.log).not.toContain("append");
+      expect(records.getModuleProcessRecord(IDENTITY.processGenerationId)).toBeUndefined();
+      expect(result.record.processGenerationId).toBe(VERSION19_MINTED_PROCESS_GENERATION_ID);
+      expect(isVersion19ProcessGenerationId(result.record.processGenerationId)).toBe(true);
+      expect(result.record.moduleCgroupPath).toBe(mintedPath);
+      // The control group and the launcher observe only the minted identity.
+      expect(result.cgroup.identity.processGenerationId).toBe(
+        VERSION19_MINTED_PROCESS_GENERATION_ID,
+      );
+      expect(result.cgroup.path).toBe(mintedPath);
+      expect(fileSystem.directories.has(mintedPath)).toBe(true);
+      expect(configuredPaths).toEqual([mintedPath]);
+      expect(authorizedPaths).toEqual([mintedPath]);
+      expect(startLauncher).toHaveBeenCalledOnce();
+      expect(result.launcher).toBe(control);
+      expect(result.record.createdAt).toBe(startedAt.toISOString());
+    });
+
+    it("fails closed when the id-less starting record is missing", async () => {
+      const records = createVersion19RecordStore();
+      const fileSystem = fakeCgroupFileSystem();
+      const startLauncher = vi.fn(async () => launcher());
+
+      const result = await startModuleProcess({
+        records,
+        stoppedRecordWriter: records.stoppedRecordWriter,
+        processRecord: processRecord(),
+        delegatedRootCgroupPath: DELEGATED_ROOT,
+        identity: IDENTITY,
+        limits: LIMITS,
+        maxOpenFiles: 256,
+        startLauncher,
+        execution: EXECUTION,
+        cgroupFileSystem: fileSystem,
+      });
+
+      expect(result.executionAuthorized).toBe(false);
+      if (result.executionAuthorized) throw new Error("expected a refusal");
+      expect(result.failure.code).toBe("MODULE_PROCESS_RECORD_FAILED");
+      expect(records.log).toEqual([]);
+      expect(records.current).toBeUndefined();
+      expect(startLauncher).not.toHaveBeenCalled();
+      expect(fileSystem.directories.size).toBe(0);
+    });
+
+    it("fails closed when the starting record's delegated control-group root mismatches", async () => {
+      const records = createVersion19RecordStore();
+      const fileSystem = fakeCgroupFileSystem();
+      const startLauncher = vi.fn(async () => launcher());
+
+      const result = await startModuleProcess({
+        records,
+        stoppedRecordWriter: records.stoppedRecordWriter,
+        processRecord: processRecord(),
+        startingRecord: version19StartingRecordInput({
+          delegatedRootCgroupPath: "/system.slice/other.service",
+        }),
+        delegatedRootCgroupPath: DELEGATED_ROOT,
+        identity: IDENTITY,
+        limits: LIMITS,
+        maxOpenFiles: 256,
+        startLauncher,
+        execution: EXECUTION,
+        cgroupFileSystem: fileSystem,
+      });
+
+      expect(result.executionAuthorized).toBe(false);
+      if (result.executionAuthorized) throw new Error("expected a refusal");
+      expect(result.failure.code).toBe("MODULE_PROCESS_RECORD_FAILED");
+      expect(records.log).toEqual([]);
+      expect(records.current).toBeUndefined();
+      expect(startLauncher).not.toHaveBeenCalled();
+      expect(fileSystem.directories.size).toBe(0);
+    });
+
+    it("fails closed when the starting record smuggles a caller process generation", async () => {
+      const records = createVersion19RecordStore();
+      const fileSystem = fakeCgroupFileSystem();
+      const startLauncher = vi.fn(async () => launcher());
+      const smuggled = {
+        ...version19StartingRecordInput(),
+        processGenerationId: IDENTITY.processGenerationId,
+        moduleCgroupPath: version19CgroupPath(
+          { instanceId: IDENTITY.instanceId, moduleId: IDENTITY.moduleId },
+          IDENTITY.processGenerationId,
+        ),
+      } as unknown as ModuleProcessStartingRecordInput;
+
+      const result = await startModuleProcess({
+        records,
+        stoppedRecordWriter: records.stoppedRecordWriter,
+        processRecord: processRecord(),
+        startingRecord: smuggled,
+        delegatedRootCgroupPath: DELEGATED_ROOT,
+        identity: IDENTITY,
+        limits: LIMITS,
+        maxOpenFiles: 256,
+        startLauncher,
+        execution: EXECUTION,
+        cgroupFileSystem: fileSystem,
+      });
+
+      expect(result.executionAuthorized).toBe(false);
+      if (result.executionAuthorized) throw new Error("expected a refusal");
+      expect(result.failure.code).toBe("MODULE_PROCESS_RECORD_FAILED");
+      // The store refused the caller-supplied identifier and nothing survived.
+      expect(records.log).toEqual(["allocate"]);
+      expect(records.current).toBeUndefined();
+      expect(startLauncher).not.toHaveBeenCalled();
+      expect(fileSystem.directories.size).toBe(0);
+    });
   });
 });
