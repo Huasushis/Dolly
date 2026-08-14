@@ -332,7 +332,16 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
       if (item.state === "retry_wait" && !retryAuthorizationValid(next, command.activation_id, item)) {
         return failure(state, "ACTIVATION_RETRY_NOT_AUTHORIZED");
       }
-      const candidates = next.generations.filter((candidate) => candidate.compatible !== false).map((candidate) => Number(candidate.generation)).filter(Number.isSafeInteger);
+      const candidates: number[] = [];
+      for (const candidate of next.generations) {
+        if (candidate.compatible === false) continue;
+        const candidateGeneration = (candidate as { generation?: unknown }).generation;
+        if (candidateGeneration === undefined) continue;
+        if (typeof candidateGeneration !== "number" || !Number.isSafeInteger(candidateGeneration)) {
+          return failure(state, "CORE_STATE_GENERATION_INVALID", false, { generation: candidateGeneration as JsonValue });
+        }
+        candidates.push(candidateGeneration);
+      }
       const generation = command.extension_generation ?? (candidates.length ? Math.max(...candidates) : next.current_generation ?? undefined);
       if (generation !== undefined && next.generations.length && !candidates.includes(generation)) return failure(state, "EXTENSION_GENERATION_INCOMPATIBLE");
       const attempt = nextAttempt(item.attempt);
@@ -342,7 +351,7 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
       if (generation !== undefined) item.extension_generation = generation;
       const manifestDigest = typeof item.manifest?.manifest_digest === "string" ? item.manifest.manifest_digest : undefined;
       next.leases[command.lease_id] = { activation_id: command.activation_id, token_digest: command.token_digest, extension_connection_id: command.extension_connection_id, worker_epoch: command.worker_epoch, state: "leased", dispatch_state: "prepared", attempt: item.attempt, ...(generation === undefined ? {} : { extension_generation: generation }), ...(manifestDigest === undefined ? {} : { manifest_digest: manifestDigest }) };
-      for (const candidate of next.generations) if (candidate.compatible === false) events.push(appendEvent(next, command.command_id, "ExtensionGenerationIncompatible", { generation: Number(candidate.generation), reason: String(candidate.incompatibility_reason ?? "effective_config_schema_digest") }));
+      for (const candidate of next.generations) if (candidate.compatible === false) events.push(appendEvent(next, command.command_id, "ExtensionGenerationIncompatible", { generation: typeof candidate.generation === "number" && Number.isSafeInteger(candidate.generation) ? candidate.generation : null, reason: String(candidate.incompatibility_reason ?? "effective_config_schema_digest") }));
       events.push(appendEvent(next, command.command_id, "LeaseIssued", { activation_id: command.activation_id, lease_id: command.lease_id }));
       return success(next, events, { lease_id: command.lease_id, attempt: item.attempt, ...(generation === undefined ? {} : { extension_generation: generation }), ...(item.manifest?.effective_config ? { effective_config: item.manifest.effective_config } : {}) });
     }
