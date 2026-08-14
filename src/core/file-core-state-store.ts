@@ -49,6 +49,7 @@ import {
 import {
   ModuleProcessRecordError,
   assertModuleRecordCollectionsConsistent,
+  assertNonTerminalModuleProcessTuplesUnique,
   assertValidModuleProcessRecord,
   assertValidModuleSubmissionRecord,
   canTransitionModuleProcessRecordState,
@@ -1855,7 +1856,10 @@ export class FileCoreStateStore {
   /**
    * Persists one Module process record in its `starting` state. The record is
    * durable before any child launcher may be created; the process-generation
-   * identifier is never reused, so an existing entry is a conflict.
+   * identifier is never reused, so an existing entry is a conflict. At most
+   * one non-terminal record may exist for one (instance, Module, Module
+   * generation) tuple, so a record whose tuple already has a non-terminal
+   * record is refused before any mutation or persistence.
    */
   appendModuleProcessRecord(record: ModuleProcessRecord): ModuleProcessRecord {
     this.#assertUsable();
@@ -1873,6 +1877,10 @@ export class FileCoreStateStore {
         `Module process record "${copiedRecord.processGenerationId}" already exists`,
       );
     }
+    assertNonTerminalModuleProcessTuplesUnique([
+      ...this.#moduleProcessRecords.values(),
+      copiedRecord,
+    ]);
     const stored = deepFreeze(copiedRecord);
     this.#moduleProcessRecords.set(copiedRecord.processGenerationId, stored);
     try {

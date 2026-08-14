@@ -368,8 +368,44 @@ export function canTransitionModuleProcessRecordState(
 }
 
 /**
+ * The identity of the one changing Module slot a process record occupies:
+ * instance, Module, Module generation. `stopped` is the only terminal state,
+ * so Core may hold at most one non-terminal record per tuple; every other
+ * record for the same tuple is retained stopped history.
+ */
+function moduleProcessTupleKey(record: ModuleProcessRecord): string {
+  // Identifiers can never contain a NUL (isIdentifier rejects code points
+  // below 0x20), so the separator cannot appear inside a tuple member.
+  return `${record.instanceId}\u0000${record.moduleId}\u0000${record.moduleGenerationId}`;
+}
+
+/**
+ * Rejects any pair of non-terminal Module process records that share one
+ * (instance, Module, Module-generation) tuple. This is the single shared
+ * implementation of that invariant: the file-backed store enforces it at
+ * append, and persisted-document validation enforces it on every load.
+ */
+export function assertNonTerminalModuleProcessTuplesUnique(
+  records: readonly ModuleProcessRecord[],
+): void {
+  const nonTerminalTuples = new Set<string>();
+  for (const record of records) {
+    if (record.state === "stopped") continue;
+    const tupleKey = moduleProcessTupleKey(record);
+    if (nonTerminalTuples.has(tupleKey)) {
+      fail(
+        "MODULE_PROCESS_RECORD_CONFLICT",
+        `Multiple non-terminal Module process records exist for instance "${record.instanceId}", Module "${record.moduleId}", Module generation "${record.moduleGenerationId}"`,
+      );
+    }
+    nonTerminalTuples.add(tupleKey);
+  }
+}
+
+/**
  * Validates the cross-record rules that hold inside one Core-state document:
- * unique identity keys, and every submission record referring to a process
+ * unique identity keys, at most one non-terminal process record per Module
+ * generation tuple, and every submission record referring to a process
  * record with the same Module generation. Claim linkage is validated by
  * startup reconciliation, which owns the Delivery view.
  */
@@ -387,6 +423,7 @@ export function assertModuleRecordCollectionsConsistent(
     }
     byProcessGeneration.set(record.processGenerationId, record);
   }
+  assertNonTerminalModuleProcessTuplesUnique(processRecords);
   const seenRuns = new Set<string>();
   for (const submission of submissionRecords) {
     if (seenRuns.has(submission.runId)) {
