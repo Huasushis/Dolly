@@ -153,6 +153,8 @@ describe("PKG-001 distributable package", () => {
       for (const publishedPath of publishedPaths) {
         expect(publishedPath).not.toMatch(/^dist\/daemon(?:\/|$)/);
         expect(publishedPath).not.toMatch(/^dist\/extensions(?:\/|$)/);
+        expect(publishedPath).not.toMatch(/^dist\/src\/daemon(?:\/|$)/);
+        expect(publishedPath).not.toMatch(/^dist\/src\/extensions(?:\/|$)/);
         expect(publishedPath).not.toMatch(/^dist\/src\/core\/ipc(?:\.|$)/);
         expect(publishedPath).not.toMatch(
           /^dist\/src\/(?:config|core\/(?:block-manager|legacy-in-process-extension|media|orchestrator|page|scheduler|types))(?:\.|$)/,
