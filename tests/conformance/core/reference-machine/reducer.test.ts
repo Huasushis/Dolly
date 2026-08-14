@@ -68,6 +68,23 @@ function stagedState(payload: JsonObject): CoreSnapshot {
   return state;
 }
 
+function retryWaitState(authorization?: JsonObject): CoreSnapshot {
+  const state = emptyCoreSnapshot();
+  state.activations.a = {
+    state: "retry_wait",
+    attempt: 1,
+    result_digest: A,
+    ...(authorization ? { next_attempt_authorization: authorization } : {}),
+  };
+  return state;
+}
+
+const retryAuthorization: JsonObject = { activation_id: "a", source_attempt: 1, authorized_attempt: 2, reason: "explicit_retryable_failure", evidence_digest: A };
+
+function retryLeaseCommand(command_id: string): CoreCommand {
+  return { type: "IssueLease", extension_connection_id: "connection-1", worker_epoch: 1, command_id, activation_id: "a", lease_id: `lease-${command_id}`, token_digest: "token" };
+}
+
 describe("Core reference abstract machine", () => {
   it("admits idempotent ingress once with sorted unique Pages", () => {
     const state = emptyCoreSnapshot(); state.next_commit_seq = 10;
@@ -423,5 +440,46 @@ describe("Core reference abstract machine", () => {
     const recovered = run(recovering, { type: "Recover", command_id: "recover-unsafe", persisted_next_page_seq: Number.MAX_SAFE_INTEGER + 1 });
     expect(recovered.error?.code).toBe("PAGE_SEQUENCE_INVALID");
     expect(recovered.state_hash).toBe(hashCoreState(recovering));
+  });
+  it("WP-003: rejects IssueLease on retry_wait without next_attempt_authorization", () => {
+    const state = retryWaitState();
+    const result = run(state, retryLeaseCommand("no-auth"));
+    expect(result.error?.code).toBe("ACTIVATION_RETRY_NOT_AUTHORIZED");
+  });
+
+  it("WP-003: rejects IssueLease on retry_wait with wrong activation_id in authorization", () => {
+    const state = retryWaitState({ ...retryAuthorization, activation_id: "other" });
+    const result = run(state, retryLeaseCommand("wrong-id"));
+    expect(result.error?.code).toBe("ACTIVATION_RETRY_NOT_AUTHORIZED");
+  });
+
+  it("WP-003: rejects IssueLease on retry_wait with wrong authorized_attempt", () => {
+    const state = retryWaitState({ ...retryAuthorization, authorized_attempt: 3 });
+    const result = run(state, retryLeaseCommand("wrong-attempt"));
+    expect(result.error?.code).toBe("ACTIVATION_RETRY_NOT_AUTHORIZED");
+  });
+
+  it("WP-003: rejects IssueLease on retry_wait with wrong source_attempt", () => {
+    const state = retryWaitState({ ...retryAuthorization, source_attempt: 0 });
+    const result = run(state, retryLeaseCommand("wrong-source"));
+    expect(result.error?.code).toBe("ACTIVATION_RETRY_NOT_AUTHORIZED");
+  });
+
+  it("WP-003: accepts IssueLease on retry_wait with valid authorization and consumes it", () => {
+    const state = retryWaitState(retryAuthorization);
+    const result = run(state, retryLeaseCommand("valid-auth"));
+    expect(result.outcome).toBe("committed");
+    expect(result.state.activations.a?.state).toBe("leased");
+    expect(result.state.activations.a?.attempt).toBe(2);
+    expect(result.state.activations.a?.next_attempt_authorization).toBeUndefined();
+  });
+
+  it("WP-003: accepts IssueLease on ready state without authorization (regression guard)", () => {
+    const state = emptyCoreSnapshot();
+    state.activations.a = { state: "ready", attempt: 0 };
+    const result = run(state, retryLeaseCommand("ready-no-auth"));
+    expect(result.outcome).toBe("committed");
+    expect(result.state.activations.a?.state).toBe("leased");
+    expect(result.state.activations.a?.attempt).toBe(1);
   });
 });
