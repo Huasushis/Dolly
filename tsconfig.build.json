@@ -1,5 +1,17 @@
 {
   "extends": "./tsconfig.json",
   "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/config.ts",
+    "src/core/block-manager.ts",
+    "src/core/ipc.ts",
+    "src/core/legacy-in-process-extension.ts",
+    "src/core/media.ts",
+    "src/core/orchestrator.ts",
+    "src/core/page.ts",
+    "src/core/scheduler.ts",
+    "src/core/types.ts"
+  ]
 }
