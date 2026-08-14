@@ -12,7 +12,7 @@
 
 use dolly_canonical_json::canonicalize;
 
-/// The fixed internal scale `W = R = 1,000,000` (spec §3).
+/// The fixed internal scale `W = 1,000,000` (spec §3).
 pub const SCALE: u64 = 1_000_000;
 
 /// Maximum raw score admitted by the Filter signal schema (`0..=1000`).
@@ -34,7 +34,9 @@ pub enum FilterArithmeticError {
     InvalidScore,
     /// Bias-corrected value requested before any observation (`Z == 0`).
     ZeroWeight,
-    /// A checked intermediate exceeded `u64` range for the configured bounds.
+    /// Division by a zero denominator that the spec excludes by construction.
+    ZeroDivision,
+    /// A checked intermediate exceeded the type range for the configured bounds.
     Overflow,
 }
 
@@ -89,16 +91,38 @@ pub struct Accumulator {
 }
 
 /// Apply exactly one valid observation at `score` (`0..=1000`), updating
-/// `A` and `Z` with checked integer half-even arithmetic (spec §3).
+/// `A` and `Z` with checked integer half-even arithmetic (spec §3):
+/// `A' = round_half_even(((W - w) * A + w * xq) / W)` and the analogue for
+/// `Z'`, where `xq = score * R`.
 pub fn update(
     config: &FilterConfig,
     state: &mut Accumulator,
     score: u64,
 ) -> Result<(), FilterArithmeticError> {
-    // INTENTIONAL STUB — wrong arithmetic so the authoritative vector
-    // expectations fail red. Replaced by the real oracle in the next commit.
-    let _ = (config, score);
-    state.observation_count = state.observation_count.wrapping_add(1);
+    if score > MAX_SCORE {
+        return Err(FilterArithmeticError::InvalidScore);
+    }
+    let w = config.new_sample_weight_ppm;
+    let w_complement = SCALE - w;
+    let xq = score
+        .checked_mul(config.internal_scale)
+        .ok_or(FilterArithmeticError::Overflow)?;
+
+    let a_numerator = w_complement
+        .checked_mul(state.accumulator)
+        .and_then(|term| term.checked_add(w.checked_mul(xq)?))
+        .ok_or(FilterArithmeticError::Overflow)?;
+    let z_numerator = w_complement
+        .checked_mul(state.weight)
+        .and_then(|term| term.checked_add(w.checked_mul(SCALE)?))
+        .ok_or(FilterArithmeticError::Overflow)?;
+
+    state.accumulator = round_half_even_div(a_numerator, SCALE)?;
+    state.weight = round_half_even_div(z_numerator, SCALE)?;
+    state.observation_count = state
+        .observation_count
+        .checked_add(1)
+        .ok_or(FilterArithmeticError::Overflow)?;
     Ok(())
 }
 
@@ -109,22 +133,23 @@ pub fn corrected_score_q(
     config: &FilterConfig,
     state: &Accumulator,
 ) -> Result<u64, FilterArithmeticError> {
-    // INTENTIONAL STUB — wrong arithmetic so the authoritative vector
-    // expectations fail red. Replaced by the real oracle in the next commit.
-    let _ = config;
-    Ok(state.accumulator)
+    if !config.bias_correction {
+        return Ok(state.accumulator);
+    }
+    if state.weight == 0 {
+        return Err(FilterArithmeticError::ZeroWeight);
+    }
+    let numerator = state
+        .accumulator
+        .checked_mul(SCALE)
+        .ok_or(FilterArithmeticError::Overflow)?;
+    round_half_even_div(numerator, state.weight)
 }
 
 /// Normalized output score `round_half_even(q / R)` in `0..=1000`
 /// (spec §4 projection).
-pub fn normalized_score(
-    config: &FilterConfig,
-    q: u64,
-) -> Result<u64, FilterArithmeticError> {
-    // INTENTIONAL STUB — wrong arithmetic so the authoritative vector
-    // expectations fail red. Replaced by the real oracle in the next commit.
-    let _ = config;
-    Ok(q / config.internal_scale)
+pub fn normalized_score(config: &FilterConfig, q: u64) -> Result<u64, FilterArithmeticError> {
+    round_half_even_div(q, config.internal_scale)
 }
 
 /// One selection candidate: a module plus its corrected internal value.
@@ -157,16 +182,41 @@ pub fn select_winner(
     channel: &str,
     candidates: &[Candidate],
 ) -> Result<Option<Selection>, FilterArithmeticError> {
-    // INTENTIONAL STUB — wrong arithmetic so the authoritative vector
-    // expectations fail red. Replaced by the real oracle in the next commit.
-    if candidates.is_empty() {
+    let n = candidates.len();
+    if n == 0 {
         return Ok(None);
     }
-    let _ = (instance_id, channel);
+    let n_wide = n as i128;
+    let mut sum: u64 = 0;
+    for candidate in candidates {
+        sum = sum
+            .checked_add(candidate.corrected_score_q)
+            .ok_or(FilterArithmeticError::Overflow)?;
+    }
+    let twice_sum = 2_i128 * sum as i128;
+
+    let mut distances = Vec::with_capacity(n);
+    let mut keys = Vec::with_capacity(n);
+    for candidate in candidates {
+        let q_wide = candidate.corrected_score_q as i128;
+        let distance = (3 * n_wide * q_wide - twice_sum).abs();
+        distances.push(u64::try_from(distance).map_err(|_| FilterArithmeticError::Overflow)?);
+        keys.push(tie_break_key(instance_id, &candidate.module_id, channel)?);
+    }
+
+    let mut best = 0usize;
+    for index in 1..n {
+        let tie = distances[index] == distances[best] && keys[index] < keys[best];
+        if distances[index] < distances[best] || tie {
+            best = index;
+        }
+    }
+
+    let target_score_q = (2 * sum) / (3 * n as u64);
     Ok(Some(Selection {
-        winner: Some(0),
-        target_score_q: 0,
-        distances: vec![0; candidates.len()],
+        winner: Some(best),
+        target_score_q,
+        distances,
     }))
 }
 
@@ -185,4 +235,25 @@ pub fn tie_break_key(
     ])
     .map(|(bytes, _)| bytes.as_ref().to_vec())
     .map_err(|_| FilterArithmeticError::Overflow)
+}
+
+/// Round `numerator / denominator` to the nearest integer, ties to even,
+/// for non-negative operands (spec §3 requires half-even rounding).
+fn round_half_even_div(numerator: u64, denominator: u64) -> Result<u64, FilterArithmeticError> {
+    if denominator == 0 {
+        return Err(FilterArithmeticError::ZeroDivision);
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    match (2 * remainder).cmp(&denominator) {
+        std::cmp::Ordering::Less => Ok(quotient),
+        std::cmp::Ordering::Greater => Ok(quotient + 1),
+        std::cmp::Ordering::Equal => {
+            if quotient % 2 == 0 {
+                Ok(quotient)
+            } else {
+                Ok(quotient + 1)
+            }
+        }
+    }
 }

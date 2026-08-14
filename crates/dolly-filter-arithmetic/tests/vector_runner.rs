@@ -13,7 +13,7 @@ use std::{
 };
 
 use dolly_filter_arithmetic::{
-    Candidate, FilterConfig, Accumulator, SCALE, corrected_score_q, normalized_score,
+    Accumulator, Candidate, FilterConfig, SCALE, corrected_score_q, normalized_score,
     select_winner, update,
 };
 use serde_json::{Map, Value, json};
@@ -80,8 +80,7 @@ fn check_assertions(result: &Value, vector: &Value) {
             "only the equals op is exercised by the selected vectors"
         );
         assert_eq!(
-            actual,
-            &assertion["value"],
+            actual, &assertion["value"],
             "TST-FILTER assertion failed at {path}"
         );
     }
@@ -108,7 +107,10 @@ fn evaluate_tst_filter_001(vector: &Value) -> Evaluated {
     let initial = &vector["initial"];
     let cfg = config(initial);
     let stimulus = &vector["stimulus"];
-    assert_eq!(stimulus["command"], "apply_distinct_observations_then_select");
+    assert_eq!(
+        stimulus["command"],
+        "apply_distinct_observations_then_select"
+    );
 
     let probe = &stimulus["ema_probe"];
     let probe_source = probe["source"].as_str().unwrap();
@@ -166,9 +168,15 @@ fn evaluate_tst_filter_001(vector: &Value) -> Evaluated {
 
     let mut selection_map = Map::new();
     for (index, id) in module_ids.iter().enumerate() {
-        selection_map.insert(id.clone(), json!({ "distance": selection.distances[index] }));
+        selection_map.insert(
+            id.clone(),
+            json!({ "distance": selection.distances[index] }),
+        );
     }
-    selection_map.insert("target_score_q".to_string(), json!(selection.target_score_q));
+    selection_map.insert(
+        "target_score_q".to_string(),
+        json!(selection.target_score_q),
+    );
     selection_map.insert("winner".to_string(), json!(winner_module));
 
     Evaluated {
@@ -195,7 +203,10 @@ fn evaluate_tst_filter_003(vector: &Value) -> Evaluated {
     let initial = &vector["initial"];
     let cfg = config(initial);
     let stimulus = &vector["stimulus"];
-    assert_eq!(stimulus["command"], "apply_constant_upper_boundary_sequence");
+    assert_eq!(
+        stimulus["command"],
+        "apply_constant_upper_boundary_sequence"
+    );
 
     let score = stimulus["score"].as_u64().unwrap();
     let count = stimulus["observation_count"].as_u64().unwrap();
