@@ -3,7 +3,8 @@
 //! `dolly-spec/docs/spec/extensions/filter-two-thirds.md` (§3).
 //!
 //! This crate implements ONLY the arithmetic exercised by the authoritative
-//! `TST-FILTER-001`, `TST-FILTER-003`, `TST-FILTER-004`, `TST-FILTER-005`,
+//! `TST-FILTER-001`, `TST-FILTER-002`, `TST-FILTER-003`, `TST-FILTER-004`,
+//! `TST-FILTER-005`,
 //! `TST-FILTER-006`, and `TST-FILTER-007` vectors: checked integer
 //! half-even smoothing (`A`, `Z`), bias correction, the mandatory saturation
 //! clamp, division-free two-thirds cohort selection with a JCS UTF-8
@@ -11,7 +12,12 @@
 //! malformed-signal rejection and latest-eligible content selection for
 //! projectable Blocks, the ordered decision-state replay that derives
 //! `after_state` from `before_state` and the applied observations and
-//! requires it to equal the claimed `after_state`, the pure state-header
+//! requires it to equal the claimed `after_state`, the pure two-phase decision
+//! oracle that classifies one frozen Manifest cohort per trusted source (holds
+//! on absent signals, never-seen ineligibility, malformed-not-omission,
+//! default self-source exclusion, Block dedup), builds the v1 safe-copy
+//! projection, and promotes the prepared decision exactly once across an
+//! ambiguous interruption (spec §2, §4, §5), the pure state-header
 //! prepare/restart transitions that freeze the algorithm revision, internal
 //! scale, and bias correction of a populated channel (spec §6), and the pure
 //! complete-ActivationPayload reconstruction/rejection oracle that rebuilds
@@ -27,6 +33,13 @@
 //! point is non-conforming and is never used.
 
 use dolly_canonical_json::canonicalize;
+
+mod decision;
+
+pub use decision::{
+    BlockDraft, DecisionError, DecisionLifecycle, HostActivationStatus, ManifestBlock,
+    PreparedDecision, Promotion, SafeCopyOutput, TrackedSource, prepare_decision,
+};
 
 mod state_header;
 
