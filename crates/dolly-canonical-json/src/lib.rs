@@ -37,6 +37,11 @@ impl ParseLimits {
                 "max_nesting_depth must be at least 1",
             ));
         }
+        if max_nesting_depth > PROTOCOL_WIRE_PARSE_DEPTH {
+            return Err(CanonicalError::invalid_json(format!(
+                "max_nesting_depth must not exceed PROTOCOL_WIRE_PARSE_DEPTH ({PROTOCOL_WIRE_PARSE_DEPTH}), got {max_nesting_depth}"
+            )));
+        }
         Ok(Self { max_nesting_depth })
     }
 
