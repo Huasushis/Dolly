@@ -22,7 +22,18 @@
   "files": [
     "bin/",
     "dist/",
-    "LICENSE"
+    "LICENSE",
+    "!dist/daemon",
+    "!dist/extensions",
+    "!dist/src/config.*",
+    "!dist/src/core/block-manager.*",
+    "!dist/src/core/ipc.*",
+    "!dist/src/core/legacy-in-process-extension.*",
+    "!dist/src/core/media.*",
+    "!dist/src/core/orchestrator.*",
+    "!dist/src/core/page.*",
+    "!dist/src/core/scheduler.*",
+    "!dist/src/core/types.*"
   ],
   "engines": {
     "node": ">=20.9.0"
