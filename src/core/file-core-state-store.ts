@@ -55,9 +55,16 @@ import {
   canTransitionModuleProcessRecordState,
   type ModuleProcessRecord,
   type ModuleProcessRecordState,
+  type ModuleProcessStartingRecordInput,
   type ModuleProcessStoppedRecordWriter,
   type ModuleSubmissionRecord,
 } from "./module-process-records.js";
+import {
+  formatVersion19ProcessGenerationId,
+  isVersion19ProcessGenerationId,
+} from "./linux-identifier-formats.js";
+import { deriveModuleCgroupPath } from "./linux-module-cgroup.js";
+import { isIdentityBoundModuleCgroupPath } from "./linux-module-cgroup-identity.js";
 import {
   type ModuleResultCommitOperations,
   type ModuleResultCommitOutputDelivery,
@@ -90,7 +97,8 @@ export type CoreStateErrorCode =
   | "CORE_STATE_REVISION_CONFLICT"
   | "CORE_STATE_REVISION_EXHAUSTED"
   | "CORE_STATE_REOPEN_REQUIRED"
-  | "CORE_STATE_IO_FAILED";
+  | "CORE_STATE_IO_FAILED"
+  | "CORE_STATE_PROCESS_GENERATION_EXHAUSTED";
 
 export class CoreStateError extends Error {
   constructor(readonly code: CoreStateErrorCode, message: string) {
@@ -165,6 +173,34 @@ export interface CoreStateDocument extends CoreStatePayload {
   readonly stateDigest: string;
 }
 
+/**
+ * The version 19 Core-state fields covered by `stateDigest`. Version 19 is the
+ * explicit-transition form of version 18: it preserves every version 18 field,
+ * directed by `activeClaimsWithUnknownSubmissionHistory`, and adds the
+ * store-owned monotonic count of allocated version 19 process-generation
+ * identifiers. After migration to version 19 the store alone allocates every
+ * new process generation.
+ */
+export interface CoreStateVersion19Payload
+  extends CoreStateComponentPayload {
+  readonly schemaVersion: "dolly.core-state/19";
+  readonly moduleProcessRecords: readonly ModuleProcessRecord[];
+  readonly moduleSubmissionRecords: readonly ModuleSubmissionRecord[];
+  readonly activeClaimsWithUnknownSubmissionHistory:
+    readonly DeliveryClaimIdentity[];
+  /**
+   * The count of version 19 process-generation identifiers this Core state has
+   * allocated so far; zero means none yet. The store advances this count in the
+   * same atomic write that persists the allocated starting record.
+   */
+  readonly processGenerationIdCounter: number;
+}
+
+export interface CoreStateVersion19Document
+  extends CoreStateVersion19Payload {
+  readonly stateDigest: string;
+}
+
 interface CoreStateVersion15Document extends CoreStateComponentPayload {
   readonly schemaVersion: "dolly.core-state/15";
   readonly stateDigest: string;
@@ -190,7 +226,8 @@ type DecodedCoreStateDocument =
   | CoreStateVersion15Document
   | CoreStateVersion16Document
   | CoreStateVersion17Document
-  | CoreStateDocument;
+  | CoreStateDocument
+  | CoreStateVersion19Document;
 
 interface ValidatedCoreStateComponents {
   readonly referenceGraph: ReferenceGraph;
@@ -259,7 +296,10 @@ export interface CoreStateMigrationOptions {
 }
 
 function stateDigest(
-  payload: CoreStatePayload | Omit<CoreStateVersion17Document, "stateDigest">,
+  payload:
+    | CoreStatePayload
+    | Omit<CoreStateVersion17Document, "stateDigest">
+    | Omit<CoreStateVersion19Document, "stateDigest">,
 ): string {
   return canonicalJsonDigest(payload as unknown as JsonValue);
 }
@@ -455,7 +495,8 @@ function decodeCoreStateDocument(value: JsonValue): DecodedCoreStateDocument {
     schemaVersion !== "dolly.core-state/15" &&
     schemaVersion !== "dolly.core-state/16" &&
     schemaVersion !== "dolly.core-state/17" &&
-    schemaVersion !== "dolly.core-state/18"
+    schemaVersion !== "dolly.core-state/18" &&
+    schemaVersion !== "dolly.core-state/19"
   ) {
     throw new CoreStateError(
       "CORE_STATE_DOCUMENT_INVALID",
@@ -471,12 +512,20 @@ function decodeCoreStateDocument(value: JsonValue): DecodedCoreStateDocument {
             "moduleProcessRecords",
             "moduleSubmissionRecords",
           ]
-        : [
-            ...CORE_STATE_BASE_FIELDS,
-            "moduleProcessRecords",
-            "moduleSubmissionRecords",
-            "activeClaimsWithUnknownSubmissionHistory",
-          ];
+        : schemaVersion === "dolly.core-state/19"
+          ? [
+              ...CORE_STATE_BASE_FIELDS,
+              "moduleProcessRecords",
+              "moduleSubmissionRecords",
+              "activeClaimsWithUnknownSubmissionHistory",
+              "processGenerationIdCounter",
+            ]
+          : [
+              ...CORE_STATE_BASE_FIELDS,
+              "moduleProcessRecords",
+              "moduleSubmissionRecords",
+              "activeClaimsWithUnknownSubmissionHistory",
+            ];
   assertDocumentFields(value, fields, schemaVersion);
   assertCoreStateComponentPayload(value);
   const components = componentPayloadFromDocument(value);
@@ -497,7 +546,8 @@ function decodeCoreStateDocument(value: JsonValue): DecodedCoreStateDocument {
 
   const records = decodeModuleRecordCollections(
     value,
-    schemaVersion === "dolly.core-state/18",
+    schemaVersion === "dolly.core-state/18" ||
+      schemaVersion === "dolly.core-state/19",
   );
   if (schemaVersion === "dolly.core-state/16") {
     const legacyDigestPayload = { ...components, ...records };
@@ -533,16 +583,43 @@ function decodeCoreStateDocument(value: JsonValue): DecodedCoreStateDocument {
     return deepFreeze({ stateDigest: value.stateDigest, ...payload });
   }
 
-  const payload: CoreStatePayload = {
+  if (schemaVersion === "dolly.core-state/18") {
+    const payload: CoreStatePayload = {
+      schemaVersion,
+      ...components,
+      ...records,
+      activeClaimsWithUnknownSubmissionHistory: unknownHistory,
+    };
+    if (stateDigest(payload) !== value.stateDigest) {
+      throw new CoreStateError(
+        "CORE_STATE_DOCUMENT_INVALID",
+        "Core state version 18 digest does not match its payload",
+      );
+    }
+    return deepFreeze({ stateDigest: value.stateDigest, ...payload });
+  }
+
+  if (
+    !Number.isSafeInteger(value.processGenerationIdCounter) ||
+    (value.processGenerationIdCounter as number) < 0 ||
+    (value.processGenerationIdCounter as number) > Number.MAX_SAFE_INTEGER
+  ) {
+    throw new CoreStateError(
+      "CORE_STATE_DOCUMENT_INVALID",
+      "Core state version 19 process-generation counter is not a valid safe integer",
+    );
+  }
+  const payload: Omit<CoreStateVersion19Document, "stateDigest"> = {
     schemaVersion,
     ...components,
     ...records,
     activeClaimsWithUnknownSubmissionHistory: unknownHistory,
+    processGenerationIdCounter: value.processGenerationIdCounter as number,
   };
   if (stateDigest(payload) !== value.stateDigest) {
     throw new CoreStateError(
       "CORE_STATE_DOCUMENT_INVALID",
-      "Core state version 18 digest does not match its payload",
+      "Core state version 19 digest does not match its payload",
     );
   }
   return deepFreeze({ stateDigest: value.stateDigest, ...payload });
@@ -572,9 +649,32 @@ function createCoreStatePayload(
   moduleSubmissionRecords: readonly ModuleSubmissionRecord[],
   activeClaimsWithUnknownSubmissionHistory:
     readonly DeliveryClaimIdentity[],
-): CoreStatePayload {
-  return {
-    schemaVersion: "dolly.core-state/18",
+): CoreStatePayload;
+function createCoreStatePayload(
+  revision: number,
+  referenceGraph: ReferenceGraph,
+  media: MediaStore | undefined,
+  blocks: BlockStore,
+  deliveries: DeliveryStore,
+  moduleProcessRecords: readonly ModuleProcessRecord[],
+  moduleSubmissionRecords: readonly ModuleSubmissionRecord[],
+  activeClaimsWithUnknownSubmissionHistory:
+    readonly DeliveryClaimIdentity[],
+  processGenerationIdCounter: number | undefined,
+): CoreStatePayload | CoreStateVersion19Payload;
+function createCoreStatePayload(
+  revision: number,
+  referenceGraph: ReferenceGraph,
+  media: MediaStore | undefined,
+  blocks: BlockStore,
+  deliveries: DeliveryStore,
+  moduleProcessRecords: readonly ModuleProcessRecord[],
+  moduleSubmissionRecords: readonly ModuleSubmissionRecord[],
+  activeClaimsWithUnknownSubmissionHistory:
+    readonly DeliveryClaimIdentity[],
+  processGenerationIdCounter?: number,
+): CoreStatePayload | CoreStateVersion19Payload {
+  const recordSnapshot = {
     revision,
     referenceGraph: referenceGraph.snapshot(),
     ...(media === undefined ? {} : { media: media.snapshot() }),
@@ -589,6 +689,17 @@ function createCoreStatePayload(
     activeClaimsWithUnknownSubmissionHistory: [
       ...activeClaimsWithUnknownSubmissionHistory,
     ].sort((left, right) => compareText(left.runId, right.runId)),
+  };
+  if (processGenerationIdCounter === undefined) {
+    return {
+      schemaVersion: "dolly.core-state/18",
+      ...recordSnapshot,
+    };
+  }
+  return {
+    schemaVersion: "dolly.core-state/19",
+    ...recordSnapshot,
+    processGenerationIdCounter,
   };
 }
 
@@ -1246,7 +1357,8 @@ function validateCoreStateComponents(
         : document.moduleSubmissionRecords;
     const unknownHistory =
       document.schemaVersion === "dolly.core-state/17" ||
-      document.schemaVersion === "dolly.core-state/18"
+      document.schemaVersion === "dolly.core-state/18" ||
+      document.schemaVersion === "dolly.core-state/19"
         ? document.activeClaimsWithUnknownSubmissionHistory
         : [];
     assertSubmissionRecordsMatchActiveClaims(
@@ -1348,6 +1460,12 @@ export class FileCoreStateStore {
   readonly #deliveryChangeListeners = new Set<() => void>();
   #deliveryChangePending = false;
   #persistedStateDigest: string;
+  /**
+   * The store-owned count of allocated version 19 process-generation
+   * identifiers; undefined while the document is version 18 or older and
+   * defined once the document has been migrated to version 19.
+   */
+  #processGenerationIdCounter: number | undefined;
 
   constructor(options: FileCoreStateStoreOptions) {
     if (
@@ -1437,6 +1555,10 @@ export class FileCoreStateStore {
 
     this.#revision = document.revision;
     this.#persistedStateDigest = document.stateDigest;
+    this.#processGenerationIdCounter =
+      document.schemaVersion === "dolly.core-state/19"
+        ? document.processGenerationIdCounter
+        : undefined;
     let loaded: ValidatedCoreStateComponents;
     try {
       loaded = restoreCoreStateComponents(document, {
@@ -1473,6 +1595,7 @@ export class FileCoreStateStore {
       document.moduleProcessRecords,
       document.moduleSubmissionRecords,
       document.activeClaimsWithUnknownSubmissionHistory,
+      this.#processGenerationIdCounter,
     );
     if (stateDigest(reconstructedPayload) !== document.stateDigest) {
       throw new CoreStateError(
@@ -1777,7 +1900,7 @@ export class FileCoreStateStore {
     return this.#revision;
   }
 
-  snapshot(): CoreStateDocument {
+  snapshot(): CoreStateDocument | CoreStateVersion19Document {
     this.#assertUsable();
     return this.#createDocument(
       this.#revision,
@@ -1861,10 +1984,26 @@ export class FileCoreStateStore {
    * generation) tuple, so a record whose tuple already has a non-terminal
    * record is refused before any mutation or persistence.
    */
+  supportsVersion19Identity(): boolean {
+    return this.#processGenerationIdCounter !== undefined;
+  }
+
   appendModuleProcessRecord(record: ModuleProcessRecord): ModuleProcessRecord {
     this.#assertUsable();
     const copiedRecord = copyModuleProcessRecordInput(record);
     assertValidModuleProcessRecord(copiedRecord);
+    if (this.#processGenerationIdCounter !== undefined) {
+      throw new ModuleProcessRecordError(
+        "MODULE_PROCESS_RECORD_ALLOCATION_REQUIRED",
+        "A migrated version 19 Core state allocates its own process-generation identifiers; no caller-supplied record can be appended",
+      );
+    }
+    if (isVersion19ProcessGenerationId(copiedRecord.processGenerationId)) {
+      throw new ModuleProcessRecordError(
+        "MODULE_PROCESS_RECORD_ALLOCATION_REQUIRED",
+        "A version 19 Module process record identifier is minted by the Core-state store and cannot be supplied by the caller",
+      );
+    }
     if (copiedRecord.state !== "starting") {
       throw new ModuleProcessRecordError(
         "MODULE_PROCESS_RECORD_STATE_INVALID",
@@ -1887,6 +2026,91 @@ export class FileCoreStateStore {
       this.#persistCurrent();
     } catch (error) {
       this.#moduleProcessRecords.delete(copiedRecord.processGenerationId);
+      throw error;
+    }
+    return stored;
+  }
+
+  /**
+   * Mints the next version 19 process-generation identifier from the durable
+   * counter and appends the caller's starting record atomically in the same
+   * persisted revision. The store owns the identifier and the derived
+   * control-group path; the caller supplies every other record field. The
+   * counter advances only together with the persisted record, so a failed
+   * append leaves both the counter and the record exactly as they were.
+   */
+  allocateAndAppendStartingRecord(
+    input: ModuleProcessStartingRecordInput,
+  ): ModuleProcessRecord {
+    this.#assertUsable();
+    if (this.#processGenerationIdCounter === undefined) {
+      throw new ModuleProcessRecordError(
+        "MODULE_PROCESS_RECORD_IDENTITY_MIGRATION_REQUIRED",
+        "The Core-state document must be migrated to version 19 before the store can allocate process-generation identifiers",
+      );
+    }
+    if (this.#processGenerationIdCounter >= Number.MAX_SAFE_INTEGER) {
+      throw new CoreStateError(
+        "CORE_STATE_PROCESS_GENERATION_EXHAUSTED",
+        "The Core state has allocated every remaining version 19 process-generation identifier",
+      );
+    }
+    const counter = this.#processGenerationIdCounter + 1;
+    const processGenerationId =
+      formatVersion19ProcessGenerationId(counter);
+    const identity = {
+      instanceId: input.instanceId,
+      moduleId: input.moduleId,
+      processGenerationId,
+    };
+    if (
+      input.moduleCgroupPath !== undefined &&
+      !isIdentityBoundModuleCgroupPath(input.moduleCgroupPath, identity)
+    ) {
+      throw new ModuleProcessRecordError(
+        "MODULE_PROCESS_RECORD_INVALID",
+        "A caller-supplied Module control-group path must be Core's own identity-bound derivation for this instance, Module, and process generation",
+      );
+    }
+    const derived = deriveModuleCgroupPath(
+      input.delegatedRootCgroupPath,
+      identity,
+    );
+    const copiedRecord: ModuleProcessRecord = {
+      schemaVersion: input.schemaVersion,
+      instanceId: input.instanceId,
+      moduleId: input.moduleId,
+      moduleGenerationId: input.moduleGenerationId,
+      processGenerationId,
+      packageDigest: input.packageDigest,
+      configurationReference: input.configurationReference,
+      declaredExternalEffects: input.declaredExternalEffects,
+      serviceInvocationId: input.serviceInvocationId,
+      bootId: input.bootId,
+      moduleCgroupPath: derived.filesystemPath,
+      state: input.state,
+      createdAt: input.createdAt,
+      updatedAt: input.updatedAt,
+    };
+    assertValidModuleProcessRecord(copiedRecord);
+    if (this.#moduleProcessRecords.has(processGenerationId)) {
+      throw new ModuleProcessRecordError(
+        "MODULE_PROCESS_RECORD_CONFLICT",
+        `Module process record "${processGenerationId}" already exists`,
+      );
+    }
+    assertNonTerminalModuleProcessTuplesUnique([
+      ...this.#moduleProcessRecords.values(),
+      copiedRecord,
+    ]);
+    const stored = deepFreeze(copiedRecord);
+    this.#moduleProcessRecords.set(processGenerationId, stored);
+    this.#processGenerationIdCounter = counter;
+    try {
+      this.#persistCurrent();
+    } catch (error) {
+      this.#moduleProcessRecords.delete(processGenerationId);
+      this.#processGenerationIdCounter = counter - 1;
       throw error;
     }
     return stored;
@@ -2590,7 +2814,7 @@ export class FileCoreStateStore {
     media: MediaStore | undefined,
     blocks: BlockStore,
     deliveries: DeliveryStore,
-  ): CoreStateDocument {
+  ): CoreStateDocument | CoreStateVersion19Document {
     const payload = createCoreStatePayload(
       revision,
       referenceGraph,
@@ -2600,6 +2824,7 @@ export class FileCoreStateStore {
       [...this.#moduleProcessRecords.values()],
       [...this.#moduleSubmissionRecords.values()],
       [...this.#activeClaimsWithUnknownSubmissionHistory.values()],
+      this.#processGenerationIdCounter,
     );
     return deepFreeze({
       stateDigest: stateDigest(payload),
@@ -2607,7 +2832,7 @@ export class FileCoreStateStore {
     });
   }
 
-  #readDocument(): CoreStateDocument {
+  #readDocument(): CoreStateDocument | CoreStateVersion19Document {
     let bytes: Buffer;
     try {
       if (lstatSync(this.#path).isSymbolicLink()) {
@@ -2639,7 +2864,10 @@ export class FileCoreStateStore {
       );
     }
     const document = decodeCoreStateDocument(value);
-    if (document.schemaVersion !== "dolly.core-state/18") {
+    if (
+      document.schemaVersion !== "dolly.core-state/18" &&
+      document.schemaVersion !== "dolly.core-state/19"
+    ) {
       // A digest-valid older document can still contain an invalid nested
       // snapshot. Report corruption before suggesting a migration that must
       // refuse the same document.
@@ -2652,7 +2880,9 @@ export class FileCoreStateStore {
     return document;
   }
 
-  #writeDocument(document: CoreStateDocument): void {
+  #writeDocument(
+    document: CoreStateDocument | CoreStateVersion19Document,
+  ): void {
     atomicWriteCoreStateFile(this.#path, this.#maxBytes, document);
   }
 
@@ -2758,12 +2988,13 @@ export type CoreStateMigrationResult =
       readonly sourceSchemaVersion:
         | "dolly.core-state/15"
         | "dolly.core-state/16"
-        | "dolly.core-state/17";
+        | "dolly.core-state/17"
+        | "dolly.core-state/18";
       readonly backupPath: string;
     }
   | {
       readonly status: "already-current";
-      readonly schemaVersion: "dolly.core-state/18";
+      readonly schemaVersion: "dolly.core-state/18" | "dolly.core-state/19";
     };
 
 function readCoreStateForMigration(
@@ -2852,7 +3083,7 @@ function createVersion18Document(
 }
 
 function assertMigrationTargetFits(
-  document: CoreStateDocument,
+  document: CoreStateDocument | CoreStateVersion19Document,
   maxBytes: number,
 ): void {
   const byteLength = Buffer.byteLength(
@@ -2972,6 +3203,12 @@ export function migrateCoreStateDocumentToVersion18(
   }
   const run = (): CoreStateMigrationResult => {
     const { raw, document } = readCoreStateForMigration(resolved, maxBytes);
+    if (document.schemaVersion === "dolly.core-state/19") {
+      throw new CoreStateError(
+        "CORE_STATE_DOCUMENT_INVALID",
+        "Core state is already at a newer version and cannot migrate down to version 18",
+      );
+    }
     const components = validateCoreStateComponents(
       document,
       options.runtimeConfiguration,
@@ -3042,6 +3279,170 @@ export function migrateCoreStateDocumentToVersion18(
     throw new CoreStateError(
       "CORE_STATE_IO_FAILED",
       "Core state migration completion could not be confirmed; rerun the migration to validate the file on disk",
+    );
+  }
+}
+
+function createVersion19Document(
+  source:
+    | CoreStateVersion15Document
+    | CoreStateVersion16Document
+    | CoreStateVersion17Document
+    | CoreStateDocument,
+  components: ValidatedCoreStateComponents,
+): CoreStateVersion19Document {
+  const processRecords =
+    source.schemaVersion === "dolly.core-state/15"
+      ? []
+      : source.moduleProcessRecords;
+  const submissionRecords =
+    source.schemaVersion === "dolly.core-state/15"
+      ? []
+      : source.moduleSubmissionRecords;
+  const submittedRuns = new Set(
+    submissionRecords.map((record) => record.runId),
+  );
+  const activeClaimsWithUnknownSubmissionHistory =
+    source.schemaVersion === "dolly.core-state/17" ||
+    source.schemaVersion === "dolly.core-state/18"
+      ? source.activeClaimsWithUnknownSubmissionHistory
+      : components.deliveries
+          .listActiveClaims()
+          .filter((claim) => !submittedRuns.has(claim.runId))
+          .map((claim) =>
+            deepFreeze({
+              moduleJobId: claim.moduleJobId,
+              claimToken: claim.claimToken,
+              runId: claim.runId,
+              attempt: claim.attempt,
+              moduleGenerationId: claim.moduleGenerationId,
+            }),
+          );
+  const payload = createCoreStatePayload(
+    nextRevision(source.revision),
+    components.referenceGraph,
+    components.media,
+    components.blocks,
+    components.deliveries,
+    processRecords,
+    submissionRecords,
+    activeClaimsWithUnknownSubmissionHistory,
+    0,
+  );
+  return deepFreeze({
+    stateDigest: stateDigest(payload),
+    ...payload,
+  }) as CoreStateVersion19Document;
+}
+
+/**
+ * Explicitly migrates a fully validated version 15, 16, 17, or 18 Core-state
+ * file to version 19, the store-owned identifier domain. The caller remains
+ * responsible for running this only while the instance is stopped and no
+ * older Dolly process can write the file. Migration takes the normal
+ * Core-state lock, increments the revision once, writes an exact
+ * source-version backup, and atomically replaces the primary file. A retry
+ * may reuse only a regular backup whose bytes exactly equal the still-current
+ * source file. After migration the store alone allocates every new process
+ * generation, starting from counter value one.
+ */
+export function migrateCoreStateDocumentToVersion19(
+  path: string,
+  options: CoreStateMigrationOptions,
+): CoreStateMigrationResult {
+  if (
+    typeof path !== "string" ||
+    path.length === 0 ||
+    path.includes(String.fromCharCode(0))
+  ) {
+    throw new CoreStateError(
+      "CORE_STATE_PATH_INVALID",
+      "Core state path is invalid",
+    );
+  }
+  if (options?.runtimeConfiguration === undefined) {
+    throw new TypeError(
+      "Core-state migration requires the stopped instance's current runtime configuration",
+    );
+  }
+  const resolved = resolve(path);
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1024) {
+    throw new TypeError("Core state maxBytes must be at least 1024");
+  }
+  const run = (): CoreStateMigrationResult => {
+    const { raw, document } = readCoreStateForMigration(resolved, maxBytes);
+    const components = validateCoreStateComponents(
+      document,
+      options.runtimeConfiguration,
+    );
+    if (document.schemaVersion === "dolly.core-state/19") {
+      const reconstructedPayload = createCoreStatePayload(
+        document.revision,
+        components.referenceGraph,
+        components.media,
+        components.blocks,
+        components.deliveries,
+        document.moduleProcessRecords,
+        document.moduleSubmissionRecords,
+        document.activeClaimsWithUnknownSubmissionHistory,
+        document.processGenerationIdCounter,
+      );
+      if (stateDigest(reconstructedPayload) !== document.stateDigest) {
+        throw new CoreStateError(
+          "CORE_STATE_DOCUMENT_INVALID",
+          "Core state component snapshots and record collections are not in their persisted canonical order",
+        );
+      }
+      synchronizeCoreStateFile(resolved);
+      return deepFreeze({
+        status: "already-current" as const,
+        schemaVersion: "dolly.core-state/19" as const,
+      });
+    }
+
+    const migrated = createVersion19Document(document, components);
+    const decodedTarget = decodeCoreStateDocument(
+      migrated as unknown as JsonValue,
+    );
+    if (decodedTarget.schemaVersion !== "dolly.core-state/19") {
+      throw new CoreStateError(
+        "CORE_STATE_DOCUMENT_INVALID",
+        "Migration did not construct a version 19 Core-state document",
+      );
+    }
+    validateCoreStateComponents(decodedTarget, options.runtimeConfiguration);
+    assertMigrationTargetFits(migrated, maxBytes);
+
+    const sourceVersion = document.schemaVersion;
+    const backupPath = `${resolved}.v${sourceVersion.slice(-2)}.backup`;
+    createOrVerifyMigrationBackup(backupPath, raw);
+    atomicWriteCoreStateFile(resolved, maxBytes, migrated);
+    return deepFreeze({
+      status: "migrated" as const,
+      sourceSchemaVersion: sourceVersion,
+      backupPath,
+    });
+  };
+  try {
+    return withSynchronousCrossProcessLock(
+      { resourceId: `${resolved}.lock` },
+      run,
+    );
+  } catch (error) {
+    if (error instanceof CoreStateError) throw error;
+    if (
+      error instanceof SynchronousCrossProcessLockError &&
+      error.code === "CROSS_PROCESS_LOCK_HELD"
+    ) {
+      throw new CoreStateError(
+        "CORE_STATE_LOCKED",
+        "Another writer owns the Core state lock",
+      );
+    }
+    throw new CoreStateError(
+      "CORE_STATE_IO_FAILED",
+      "Core state migration to version 19 could not be confirmed; rerun the migration to validate the file on disk",
     );
   }
 }
