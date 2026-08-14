@@ -127,6 +127,26 @@ describe("process-generation tokens", () => {
     expect(parseProcessGenerationToken(`generation:${EPOCH}:99999999999999999999`)).toBeUndefined();
   });
 
+  it("parses the safe-integer counter boundary exactly", () => {
+    // The largest safe integer is a legal counter; one more is not a token.
+    const max = Number.MAX_SAFE_INTEGER;
+    expect(max).toBe(9007199254740991);
+    const boundaryToken = `generation:${EPOCH}:${max}`;
+    expect(boundaryToken).toMatch(GENERATION_ID_RULE);
+    expect(parseProcessGenerationToken(boundaryToken)).toEqual({ epoch: EPOCH, counter: max });
+    expect(parseProcessGenerationToken(`generation:${EPOCH}:${max + 1}`)).toBeUndefined();
+
+    // The boundary value is a genuine counter for the guard, not a malformed
+    // string: an unissued boundary generation is refused as unissued.
+    const sequence = new ProcessGenerationSequence({ epoch: EPOCH });
+    sequence.bump();
+    expect(() => sequence.guard(boundaryToken)).toThrowError(
+      expect.objectContaining<Partial<ProcessGenerationError>>({
+        code: "PROCESS_GENERATION_ID_INVALID",
+      }),
+    );
+  });
+
   it("rejects an invalid epoch marker at construction and a malformed token at serialization", () => {
     expect(() => new ProcessGenerationSequence({ epoch: "epoch:with-colon" })).toThrowError(
       expect.objectContaining<Partial<ProcessGenerationError>>({
@@ -298,5 +318,138 @@ describe("process-generation guard inside daemon ownership checks", () => {
     ).rejects.toBeInstanceOf(Error);
     expect(launcher.launchCount).toBe(1);
     expect(records.read(instance.instanceId)).toBeNull();
+  });
+
+  it("leaves a foreign-epoch token to the identity evidence at the manager level", async () => {
+    root = mkdtempSync(join(tmpdir(), "dolly-process-generation-"));
+    registry = createTestInstanceRegistry(root);
+    records = new InstanceProcessRecordStore({ directory: join(root, "process-records") });
+    const instance = registry.register("foreign-token");
+    seedRecord(instance.instanceId, {
+      processGenerationId: "generation:22222222-2222-4222-8222-222222222222:3",
+    });
+
+    const launcher = new TrackingNeverLauncher();
+    const manager = createManager(
+      launcher,
+      new StubIdentityProbe({ kind: "identity", identityToken: "identity-of-a-different-process" }),
+    );
+
+    // A token from another epoch is never this session's business: the guard
+    // skips it, the identity evidence decides, and a replacement spawn is
+    // attempted. The rejection is the launcher failure, not a token error.
+    const error = await manager
+      .startInstance(instance.instanceId, "op-start-foreign-token")
+      .then(
+        () => null,
+        (failure) => failure as Error,
+      );
+    expect(error).toBeInstanceOf(Error);
+    expect((error as { code?: string }).code).not.toMatch(/^PROCESS_GENERATION_/);
+    expect(launcher.launchCount).toBe(1);
+    expect(records.read(instance.instanceId)).toBeNull();
+  });
+
+  it("passes the same-epoch generation this manager currently holds", async () => {
+    root = mkdtempSync(join(tmpdir(), "dolly-process-generation-"));
+    registry = createTestInstanceRegistry(root);
+    records = new InstanceProcessRecordStore({ directory: join(root, "process-records") });
+    const launcher = new TrackingNeverLauncher();
+    const manager = createManager(
+      launcher,
+      // Matches the recorded operating-system identity, proving the child live.
+      new StubIdentityProbe({ kind: "identity", identityToken: "recorded-identity-token" }),
+    );
+
+    // This session's first start mints generation EPOCH:1 even though the
+    // launcher then fails, so the manager's current generation is EPOCH:1.
+    const minted = registry.register("minted");
+    await expect(manager.startInstance(minted.instanceId, "op-start-minted")).rejects.toBeInstanceOf(
+      Error,
+    );
+    expect(launcher.launchCount).toBe(1);
+
+    const sameCurrent = registry.register("same-current");
+    seedRecord(sameCurrent.instanceId, { processGenerationId: `generation:${EPOCH}:1` });
+    // The record names the current generation, so the guard passes and the
+    // identity evidence decides: the recorded child is still running, so no
+    // replacement spawn is started. This is an ownership refusal, not a token
+    // error.
+    await expect(
+      manager.startInstance(sameCurrent.instanceId, "op-start-same-current"),
+    ).rejects.toMatchObject({ code: "DAEMON_INSTANCE_ORPHAN_UNRESOLVED" });
+    expect(launcher.launchCount).toBe(1);
+  });
+
+  it("fails closed on a same-epoch generation one step older than the current one", async () => {
+    root = mkdtempSync(join(tmpdir(), "dolly-process-generation-"));
+    registry = createTestInstanceRegistry(root);
+    records = new InstanceProcessRecordStore({ directory: join(root, "process-records") });
+    const launcher = new TrackingNeverLauncher();
+    const manager = createManager(
+      launcher,
+      // Even a matching identity must never be reached for a stale token.
+      new StubIdentityProbe({ kind: "identity", identityToken: "recorded-identity-token" }),
+    );
+
+    // Two failed starts mint EPOCH:1 then EPOCH:2, so EPOCH:1 is now stale.
+    const first = registry.register("gen-one");
+    await expect(manager.startInstance(first.instanceId, "op-gen-one")).rejects.toBeInstanceOf(Error);
+    const second = registry.register("gen-two");
+    await expect(manager.startInstance(second.instanceId, "op-gen-two")).rejects.toBeInstanceOf(Error);
+    expect(launcher.launchCount).toBe(2);
+
+    const stale = registry.register("stale-generation");
+    seedRecord(stale.instanceId, { processGenerationId: `generation:${EPOCH}:1` });
+    await expect(
+      manager.startInstance(stale.instanceId, "op-start-stale"),
+    ).rejects.toMatchObject({ code: "PROCESS_GENERATION_STALE" });
+    expect(launcher.launchCount).toBe(2);
+  });
+
+  it("makes two managers sharing one controllerId refuse same-epoch ownership each did not issue", async () => {
+    root = mkdtempSync(join(tmpdir(), "dolly-process-generation-"));
+    registry = createTestInstanceRegistry(root);
+    records = new InstanceProcessRecordStore({ directory: join(root, "process-records") });
+
+    // Manager A's session issues EPOCH:1 for this controllerId.
+    const launcherA = new TrackingNeverLauncher();
+    const managerA = createManager(
+      launcherA,
+      new StubIdentityProbe({ kind: "identity", identityToken: "never-reached" }),
+    );
+    const mintedByA = registry.register("issued-by-a");
+    await expect(managerA.startInstance(mintedByA.instanceId, "op-a-mints")).rejects.toBeInstanceOf(
+      Error,
+    );
+    expect(launcherA.launchCount).toBe(1);
+
+    // Manager B declares the same controllerId but has issued nothing yet.
+    const launcherB = new TrackingNeverLauncher();
+    const managerB = createManager(
+      launcherB,
+      new StubIdentityProbe({ kind: "identity", identityToken: "never-reached" }),
+    );
+
+    // B refuses the generation A issued: the counter is neither stale nor
+    // current for B's session, so it counts as never issued by B.
+    const fromA = registry.register("from-a");
+    seedRecord(fromA.instanceId, { processGenerationId: `generation:${EPOCH}:1` });
+    await expect(managerB.startInstance(fromA.instanceId, "op-b-refuses-a")).rejects.toMatchObject({
+      code: "PROCESS_GENERATION_ID_INVALID",
+    });
+    expect(launcherB.launchCount).toBe(0);
+
+    // Both sessions refuse a same-epoch counter neither of them issued.
+    const unissued = registry.register("unissued-by-both");
+    seedRecord(unissued.instanceId, { processGenerationId: `generation:${EPOCH}:9` });
+    await expect(managerA.startInstance(unissued.instanceId, "op-a-refuses-unissued")).rejects.toMatchObject(
+      { code: "PROCESS_GENERATION_ID_INVALID" },
+    );
+    await expect(managerB.startInstance(unissued.instanceId, "op-b-refuses-unissued")).rejects.toMatchObject(
+      { code: "PROCESS_GENERATION_ID_INVALID" },
+    );
+    expect(launcherA.launchCount).toBe(1);
+    expect(launcherB.launchCount).toBe(0);
   });
 });
