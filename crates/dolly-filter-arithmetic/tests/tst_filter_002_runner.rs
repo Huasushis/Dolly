@@ -63,11 +63,13 @@ fn check_assertions(result: &Value, vector: &Value) {
             ),
             "count" => {
                 let expected = assertion["value"].as_u64().expect("count assertion value");
-                let actual = navigate(result, path)
-                    .expect("count assertion addresses a present array")
-                    .as_array()
-                    .expect("count assertion addresses an array")
-                    .len() as u64;
+                let actual = match navigate(result, path).expect("count assertion path present") {
+                    Value::Array(items) => items.len() as u64,
+                    Value::Number(number) => {
+                        number.as_u64().expect("count of a non-negative integer")
+                    }
+                    other => panic!("count assertion addresses an array or count, got {other}"),
+                };
                 assert_eq!(actual, expected, "TST-FILTER assertion failed at {path}");
             }
             "equals" => {
@@ -157,8 +159,15 @@ fn evaluate_tst_filter_002(vector: &Value) -> Evaluated {
 
     // Dispatch 1: compute the decision and durably record it, then crash
     // after `prepared_decision_fsync`. The recorded decision survives.
-    let prepared = prepare_decision(&cfg, instance_id, channel, self_module_id, &tracked, &manifest)
-        .expect("vector must stay in spec bounds");
+    let prepared = prepare_decision(
+        &cfg,
+        instance_id,
+        channel,
+        self_module_id,
+        &tracked,
+        &manifest,
+    )
+    .expect("vector must stay in spec bounds");
 
     // Dispatch 2 (redispatch of the same Activation): reconciliation queries
     // the Host disposition and promotes the RETAINED decision exactly once.
@@ -188,7 +197,11 @@ fn evaluate_tst_filter_002(vector: &Value) -> Evaluated {
         Promotion::Retained
     );
     assert_eq!(lifecycle.apply_count(), 1);
-    assert_eq!(emitted.len(), 1, "only the single promotion emits the draft");
+    assert_eq!(
+        emitted.len(),
+        1,
+        "only the single promotion emits the draft"
+    );
 
     let mut state_map = Map::new();
     for entry in &prepared.after_state {
