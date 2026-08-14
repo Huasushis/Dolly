@@ -4,20 +4,27 @@
 //!
 //! This crate implements ONLY the arithmetic exercised by the authoritative
 //! `TST-FILTER-001`, `TST-FILTER-003`, `TST-FILTER-004`, `TST-FILTER-005`,
-//! and `TST-FILTER-006` vectors: checked integer half-even smoothing (`A`,
-//! `Z`), bias correction, the mandatory saturation clamp, division-free
-//! two-thirds cohort selection with a JCS UTF-8 tie-break, ordered per-source
-//! block application with explicit malformed-signal rejection and
-//! latest-eligible content selection for projectable Blocks, the ordered
-//! decision-state replay that derives `after_state` from `before_state` and
-//! the applied observations and requires it to equal the claimed
-//! `after_state`, and the pure state-header prepare/restart transitions that
-//! freeze the algorithm revision, internal scale, and bias correction of a
-//! populated channel (spec §6). The state-header surface is transition-only:
-//! no codec, file, or storage boundary and no epoch authority, so nothing
-//! here is durable. This crate contains no Extension scaffolding, durable
-//! state, projection, activation ledger, provider, or runtime dependency;
-//! floating point is non-conforming and is never used.
+//! `TST-FILTER-006`, and `TST-FILTER-007` vectors: checked integer
+//! half-even smoothing (`A`, `Z`), bias correction, the mandatory saturation
+//! clamp, division-free two-thirds cohort selection with a JCS UTF-8
+//! tie-break, ordered per-source block application with explicit
+//! malformed-signal rejection and latest-eligible content selection for
+//! projectable Blocks, the ordered decision-state replay that derives
+//! `after_state` from `before_state` and the applied observations and
+//! requires it to equal the claimed `after_state`, the pure state-header
+//! prepare/restart transitions that freeze the algorithm revision, internal
+//! scale, and bias correction of a populated channel (spec §6), and the pure
+//! complete-ActivationPayload reconstruction/rejection oracle that rebuilds
+//! the exact v1 projection of a trusted selected Block under the frozen
+//! manifest envelope digest and the exact Asset-view and BlockRef-relation
+//! grants and accepts only byte-identical canonical claims (spec §4-§5).
+//! The state-header surface is transition-only and the activation surface is
+//! reconstruction/rejection-only: no codec, file, storage, or reopen
+//! boundary, no epoch authority, and no durability, so the archival
+//! `preparedOutput` and output digest are evidence only and cannot authorize
+//! a deviation. This crate contains no Extension scaffolding, durable state,
+//! projection, activation ledger, provider, or runtime dependency; floating
+//! point is non-conforming and is never used.
 
 use dolly_canonical_json::canonicalize;
 
@@ -25,6 +32,14 @@ mod state_header;
 
 pub use state_header::{
     EpochMode, FilterStateHeader, FilterStateHeaderError, prepare_config, restart,
+};
+
+mod activation_payload;
+
+pub use activation_payload::{
+    BlockSourcePart, ClaimedPayload, PayloadBudgets, PayloadReconstructionError, ProjectedPart,
+    ProjectedPayload, ProjectedSignal, ProjectionReceipt, ReconstructionAuthorities,
+    SelectionBinding, TrustedBlock, reconstruct_complete_activation_payload,
 };
 
 /// The fixed internal scale `W = 1,000,000` (spec §3).
