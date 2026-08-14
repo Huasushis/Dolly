@@ -19,6 +19,11 @@ const CANONICAL_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}
  * inputs, and the same injected clock: only the entry timestamps come from
  * the clock, and every other byte of the journal is a pure function of the
  * appended records.
+ *
+ * A turn is keyed, per spec §4.2, by its module job; a retry of the same
+ * module job finds the journal with `findPreparedTurnsForModuleJob` and reuses
+ * a known terminal provider response and tool results instead of calling the
+ * model again merely because the run changed.
  */
 
 /**
@@ -376,4 +381,31 @@ export function immutableLLMTurnJournalEntry(
   return deepFreeze(
     cloneJson(entry as unknown as JsonValue) as unknown as LLMTurnJournalEntry,
   );
+}
+
+/**
+ * Returns every prepared-turn record for the exact module job, in append
+ * order, from a journal entry list. Per spec §4.2 the turn journal is keyed by
+ * `moduleJobId`: a retry of the same module job must find its journal entries
+ * and reuse a known terminal provider response and tool results instead of
+ * calling the model again merely because `runId` changed. The last returned
+ * record is the latest (highest) prepared attempt for the job.
+ *
+ * The lookup is pure: it reads only the `moduleJobId` field of each entry,
+ * returns a fresh array, and never mutates the list. A `moduleJobId` that is
+ * not a valid journal identifier fails fast with `LLM_TURN_INVALID`, matching
+ * every other journal identity check.
+ */
+export function findPreparedTurnsForModuleJob(
+  entries: readonly LLMTurnJournalEntry[],
+  moduleJobId: string,
+): readonly PreparedTurnRecord[] {
+  assertIdentifier(moduleJobId, "findPreparedTurnsForModuleJob moduleJobId");
+  const records: PreparedTurnRecord[] = [];
+  for (const entry of entries) {
+    if (entry.kind === "prepared-turn" && entry.moduleJobId === moduleJobId) {
+      records.push(entry);
+    }
+  }
+  return records;
 }

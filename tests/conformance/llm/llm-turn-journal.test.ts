@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FileLLMTurnJournal } from "../../../src/core/file-llm-turn-journal.js";
 import {
+  findPreparedTurnsForModuleJob,
   LLMTurnJournalError,
   llmTurnJournalPath,
   resolveTurnJournalStateDirectory,
@@ -334,5 +335,79 @@ describe("durable prepared-turn and approval journal", () => {
     const journal = new FileLLMTurnJournal({ path: llmTurnJournalPath(located), now: () => NOW });
     journal.appendPreparedTurn(preparedTurnInput());
     expect(readFileSync(llmTurnJournalPath(located), "utf8")).toContain("prepared-turn");
+  });
+
+  it("finds a module job's prepared turns by the spec 4.2 idempotency key in append order", () => {
+    const journal = new FileLLMTurnJournal({ path, now: () => NOW });
+    journal.appendPreparedTurn(
+      preparedTurnInput({ turnId: "turn-a-1", moduleJobId: "module-job-a", attempt: 1, leaseEpoch: 1 }),
+    );
+    journal.appendPreparedTurn(
+      preparedTurnInput({ turnId: "turn-b-1", moduleJobId: "module-job-b", attempt: 1, leaseEpoch: 1 }),
+    );
+    journal.appendPreparedTurn(
+      preparedTurnInput({ turnId: "turn-a-2", moduleJobId: "module-job-a", attempt: 2, leaseEpoch: 2 }),
+    );
+    journal.appendApprovalDecision(
+      approvalDecisionInput({ decisionId: "decision-a", turnId: "turn-a-2" }),
+    );
+
+    const forA = findPreparedTurnsForModuleJob(journal.list(), "module-job-a");
+    expect(forA.map((record) => record.turnId)).toEqual(["turn-a-1", "turn-a-2"]);
+    expect(forA.every((record) => record.kind === "prepared-turn")).toBe(true);
+    expect(forA[forA.length - 1]).toMatchObject({
+      moduleJobId: "module-job-a",
+      turnId: "turn-a-2",
+      attempt: 2,
+      leaseEpoch: 2,
+    });
+
+    const forB = findPreparedTurnsForModuleJob(journal.list(), "module-job-b");
+    expect(forB.map((record) => record.turnId)).toEqual(["turn-b-1"]);
+  });
+
+  it("returns an empty list for a module job with no prepared turn", () => {
+    const journal = new FileLLMTurnJournal({ path, now: () => NOW });
+    journal.appendPreparedTurn(preparedTurnInput());
+    expect(findPreparedTurnsForModuleJob(journal.list(), "module-job-missing")).toEqual([]);
+  });
+
+  it("rejects an invalid moduleJobId argument to the spec lookup", () => {
+    const journal = new FileLLMTurnJournal({ path, now: () => NOW });
+    journal.appendPreparedTurn(preparedTurnInput());
+    expect(() => findPreparedTurnsForModuleJob(journal.list(), "not a module job id")).toThrowError(
+      expect.objectContaining<Partial<LLMTurnJournalError>>({ code: "LLM_TURN_INVALID" }),
+    );
+  });
+
+  it("returns a fresh array that leaves the journal entries untouched", () => {
+    const journal = new FileLLMTurnJournal({ path, now: () => NOW });
+    journal.appendPreparedTurn(
+      preparedTurnInput({ moduleJobId: "module-job-m", attempt: 1, leaseEpoch: 1 }),
+    );
+    const before = journal.list();
+    const records = findPreparedTurnsForModuleJob(before, "module-job-m");
+    expect(records).not.toBe(before);
+    expect(records).toEqual(before);
+    expect(journal.list()).toEqual(before);
+  });
+
+  it("lets a retry of the same module job find its durable prepared turn across reopen", () => {
+    const first = new FileLLMTurnJournal({ path, now: () => NOW });
+    first.appendPreparedTurn(
+      preparedTurnInput({ turnId: "turn-retry", moduleJobId: "module-job-retry", attempt: 1, leaseEpoch: 1 }),
+    );
+
+    const rewriter = new FileLLMTurnJournal({ path, now: () => NOW });
+    const records = findPreparedTurnsForModuleJob(rewriter.list(), "module-job-retry");
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      kind: "prepared-turn",
+      moduleJobId: "module-job-retry",
+      turnId: "turn-retry",
+      attempt: 1,
+      leaseEpoch: 1,
+      recordedAt: NOW,
+    });
   });
 });
