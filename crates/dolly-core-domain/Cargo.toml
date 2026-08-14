@@ -1,0 +1,10 @@
+[package]
+name = "dolly-core-domain"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dolly-canonical-json = { path = "../dolly-canonical-json" }
+serde = { version = "1", features = ["derive"] }
