@@ -390,6 +390,132 @@ describe("CORE Module process and submission records", () => {
     expect(store.listModuleProcessRecords()).toHaveLength(1);
   });
 
+  it("rejects a second non-terminal record for the same Module generation while the first is starting", () => {
+    const store = openStore("first");
+    store.appendModuleProcessRecord(processRecord());
+    const beforeRevision = store.revision;
+    const beforeBytes = readFileSync(path, "utf8");
+
+    expect(() =>
+      store.appendModuleProcessRecord(
+        processRecord({ processGenerationId: "process-generation-2" }),
+      ),
+    ).toThrowError(
+      expect.objectContaining<Partial<ModuleProcessRecordError>>({
+        code: "MODULE_PROCESS_RECORD_CONFLICT",
+      }),
+    );
+    expect(store.revision).toBe(beforeRevision);
+    expect(readFileSync(path, "utf8")).toBe(beforeBytes);
+    expect(store.listModuleProcessRecords()).toHaveLength(1);
+  });
+
+  it("rejects a second non-terminal record for the same Module generation while the first is running", () => {
+    const store = openStore("first");
+    store.appendModuleProcessRecord(processRecord());
+    store.updateModuleProcessRecordState("process-generation-1", "running");
+    const beforeRevision = store.revision;
+    const beforeBytes = readFileSync(path, "utf8");
+
+    expect(() =>
+      store.appendModuleProcessRecord(
+        processRecord({ processGenerationId: "process-generation-2" }),
+      ),
+    ).toThrowError(
+      expect.objectContaining<Partial<ModuleProcessRecordError>>({
+        code: "MODULE_PROCESS_RECORD_CONFLICT",
+      }),
+    );
+    expect(store.revision).toBe(beforeRevision);
+    expect(readFileSync(path, "utf8")).toBe(beforeBytes);
+    expect(store.listModuleProcessRecords()).toHaveLength(1);
+  });
+
+  it("allows one non-terminal record per distinct Module tuple", () => {
+    const store = openStore("first");
+    store.appendModuleProcessRecord(processRecord());
+    store.appendModuleProcessRecord(
+      processRecord({
+        processGenerationId: "process-generation-2",
+        moduleGenerationId: "module-generation-2",
+      }),
+    );
+    store.appendModuleProcessRecord(
+      processRecord({
+        processGenerationId: "process-generation-3",
+        moduleId: "worker-two",
+        moduleCgroupPath: cgroupPathFor("process-generation-3", "worker-two"),
+      }),
+    );
+    expect(store.listModuleProcessRecords()).toHaveLength(3);
+
+    const reopened = openStore("second");
+    expect(reopened.listModuleProcessRecords()).toHaveLength(3);
+  });
+
+  it("allows a replacement record after the prior one is proven stopped", () => {
+    const store = openStore("first");
+    store.appendModuleProcessRecord(processRecord());
+    stoppedRecordWriterFor(store).writeStopped("process-generation-1", "ROTATED");
+    store.appendModuleProcessRecord(
+      processRecord({ processGenerationId: "process-generation-2" }),
+    );
+    expect(store.listModuleProcessRecords()).toHaveLength(2);
+    expect(store.getModuleProcessRecord("process-generation-2")).toMatchObject({
+      state: "starting",
+    });
+
+    const reopened = openStore("second");
+    expect(reopened.listModuleProcessRecords()).toHaveLength(2);
+  });
+
+  it("preserves multiple stopped historical records for one Module generation", () => {
+    const store = openStore("first");
+    store.appendModuleProcessRecord(processRecord());
+    stoppedRecordWriterFor(store).writeStopped("process-generation-1", "ROTATED");
+    clock = LATER;
+    store.appendModuleProcessRecord(
+      processRecord({ processGenerationId: "process-generation-2" }),
+    );
+    stoppedRecordWriterFor(store).writeStopped("process-generation-2", "ROTATED");
+
+    expect(store.listModuleProcessRecords()).toHaveLength(2);
+    const reopened = openStore("second");
+    expect(reopened.listModuleProcessRecords()).toHaveLength(2);
+  });
+
+  it.each(["starting", "running"] as const)(
+    "fails closed when a persisted document holds two non-terminal records for one Module generation (%s)",
+    (existingState) => {
+      const store = openStore("first");
+      store.appendModuleProcessRecord(processRecord());
+      if (existingState === "running") {
+        store.updateModuleProcessRecordState("process-generation-1", "running");
+      }
+
+      const document = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      const processRecords = document.moduleProcessRecords as Record<string, unknown>[];
+      document.moduleProcessRecords = [
+        processRecords[0]!,
+        {
+          ...processRecords[0]!,
+          processGenerationId: "process-generation-2",
+          moduleCgroupPath: cgroupPathFor("process-generation-2"),
+          state: "starting",
+        },
+      ];
+      const { stateDigest: _stateDigest, ...payload } = document;
+      document.stateDigest = canonicalJsonDigest(payload);
+      writeFileSync(path, `${JSON.stringify(document)}\n`, "utf8");
+
+      expect(() => openStore("second")).toThrowError(
+        expect.objectContaining<Partial<CoreStateError>>({
+          code: "CORE_STATE_DOCUMENT_INVALID",
+        }),
+      );
+    },
+  );
+
   it("rejects a new record that does not begin in the starting state", () => {
     const store = openStore("first");
     expect(() =>
