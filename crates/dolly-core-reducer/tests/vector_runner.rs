@@ -1401,7 +1401,11 @@ fn execute(vector: &Value) -> (Value, Value, String, Vec<Value>) {
                     "error_generation_detail": result.error.as_ref().and_then(|error| error.details.as_ref().and_then(|details| details.get("generation"))).cloned().unwrap_or(Value::Null),
                 }),
                 json!({}),
-                if result.error.as_ref().is_some_and(|error| error.code == "CORE_STATE_GENERATION_INVALID") {
+                if result
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.code == "CORE_STATE_GENERATION_INVALID")
+                {
                     "malformed_pool_generation_refused"
                 } else {
                     "unexpected"
@@ -1422,7 +1426,9 @@ fn execute(vector: &Value) -> (Value, Value, String, Vec<Value>) {
                     ..Default::default()
                 },
             );
-            state.leases.insert(lease_id.into(), initial["lease"].clone());
+            state
+                .leases
+                .insert(lease_id.into(), initial["lease"].clone());
             let result_digest = initial["proof"]["result_digest"].as_str().unwrap();
             let result = run(
                 &state,
@@ -1460,12 +1466,77 @@ fn execute(vector: &Value) -> (Value, Value, String, Vec<Value>) {
                     "error_code": result.error.as_ref().map(|error| Value::String(error.code.clone())).unwrap_or(Value::Null),
                 }),
                 json!({}),
-                if result.error.as_ref().is_some_and(|error| error.code == "ACTIVATION_FENCE_INVALID") {
+                if result
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.code == "ACTIVATION_FENCE_INVALID")
+                {
                     "malformed_lease_generation_binding_refused"
                 } else {
                     "unexpected"
                 }
                 .into(),
+                result.events.iter().map(flatten).collect(),
+            )
+        }
+        "TST-PROTO-003" => {
+            let candidate = &initial["candidate_generation"];
+            let mut state = empty_core_snapshot();
+            state.activations.insert(
+                "a".into(),
+                ActivationRecord {
+                    state: ActivationState::Ready,
+                    attempt: 0,
+                    manifest: Some(json!({
+                        "manifest_digest": initial["manifest_digest"],
+                        "required_frame_bytes": initial["required_frame_bytes"],
+                        "required_frame_nesting_depth": initial["required_frame_nesting_depth"],
+                    })),
+                    ..Default::default()
+                },
+            );
+            state.generations = vec![json!({
+                "generation": candidate["generation"],
+                "current_for_module": true,
+                "compatible": true,
+                "ready_for_module": false,
+                "incompatibility_reason": "frame_bounds",
+                "max_frame_bytes": candidate["max_frame_bytes"],
+                "max_frame_nesting_depth": candidate["max_frame_nesting_depth"],
+            })];
+            let before = json!({
+                "candidate_generation": state.generations[0],
+                "activation": {"state": "ready", "attempt": 0},
+            });
+            let result = run(
+                &state,
+                CoreCommand::IssueLease(IssueLeaseCommand {
+                    command_id: "admit-lease".into(),
+                    activation_id: "a".into(),
+                    lease_id: "l".into(),
+                    token_digest: "token".into(),
+                    extension_connection_id: "connection-1".into(),
+                    worker_epoch: 1,
+                    extension_generation: None,
+                }),
+                |_| {},
+            );
+            let activation = &result.state.activations["a"];
+            (
+                json!({
+                    "candidate_generation": result.state.generations[0],
+                    "activation": {
+                        "state": activation.state,
+                        "attempt": activation.attempt,
+                        "manifest_digest": activation.manifest.as_ref().unwrap()["manifest_digest"],
+                    },
+                }),
+                before,
+                result
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.clone())
+                    .unwrap_or_else(|| "unexpected".into()),
                 result.events.iter().map(flatten).collect(),
             )
         }
@@ -1512,4 +1583,26 @@ fn executes_all_nineteen_immutable_core_vectors() {
         let (observed, before, outcome, emitted) = execute(vector);
         assert_vector(vector, &observed, &before, &outcome, &emitted);
     }
+}
+
+#[test]
+fn executes_proto003_frame_generation_compatibility() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let path = repo_root.join("dolly-spec/test-vectors/protocol");
+    let mut names: Vec<_> = fs::read_dir(&path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("TST-PROTO-003") && name.ends_with(".json"))
+        .collect();
+    assert_eq!(names.len(), 1);
+    names.sort();
+    let name = names.remove(0);
+    let vector = read(path.join(name));
+    assert_eq!(vector["test_id"], "TST-PROTO-003");
+    let (observed, before, outcome, emitted) = execute(&vector);
+    assert_vector(&vector, &observed, &before, &outcome, &emitted);
 }
