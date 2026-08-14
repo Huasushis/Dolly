@@ -18,9 +18,9 @@ use std::{
 };
 
 use dolly_filter_arithmetic::{
-    replay_decision_state, Accumulator, FilterConfig, ReplayObservation, SCALE,
+    Accumulator, FilterConfig, ReplayObservation, SCALE, replay_decision_state,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 fn spec_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
