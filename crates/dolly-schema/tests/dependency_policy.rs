@@ -113,8 +113,12 @@ fn parse_dep_entry(name: &str, info: &str) -> DependencyInfo {
 }
 
 /// The set of allowed Dolly workspace crate names.
-const ALLOWED_DOLLY_CRATES: &[&str] =
-    &["dolly-canonical-json", "dolly-core-domain", "dolly-schema"];
+const ALLOWED_DOLLY_CRATES: &[&str] = &[
+    "dolly-canonical-json",
+    "dolly-core-domain",
+    "dolly-schema",
+    "dolly-filter-arithmetic",
+];
 
 /// Dependencies forbidden in any WP-001 crate.
 const FORBIDDEN_DEPS: &[&str] = &[
@@ -174,6 +178,7 @@ fn dependency_policy_enforced() {
         root.join("crates/dolly-canonical-json/Cargo.toml"),
         root.join("crates/dolly-core-domain/Cargo.toml"),
         root.join("crates/dolly-schema/Cargo.toml"),
+        root.join("crates/dolly-filter-arithmetic/Cargo.toml"),
     ];
 
     let mut member_infos = BTreeMap::new();
@@ -189,8 +194,8 @@ fn dependency_policy_enforced() {
 
     assert_eq!(
         member_infos.len(),
-        3,
-        "should have exactly 3 workspace members"
+        4,
+        "should have exactly 4 workspace members"
     );
 
     // Verify allowed Dolly crates
@@ -212,6 +217,22 @@ fn dependency_policy_enforced() {
         assert_ne!(
             dep.name, "dolly-schema",
             "dolly-canonical-json must not depend on dolly-schema"
+        );
+    }
+
+    // dolly-filter-arithmetic: leaf crate — no Dolly workspace dependencies
+    // other than dolly-canonical-json, and no third-party dependency other
+    // than serde.
+    let fa = &member_infos["dolly-filter-arithmetic"];
+    let fa_dep_names: Vec<&str> = fa.dependencies.iter().map(|d| d.name.as_str()).collect();
+    assert!(
+        fa_dep_names.contains(&"dolly-canonical-json"),
+        "dolly-filter-arithmetic must depend on dolly-canonical-json"
+    );
+    for dep in fa_dep_names {
+        assert!(
+            dep == "dolly-canonical-json" || dep == "serde",
+            "dolly-filter-arithmetic must only depend on dolly-canonical-json and serde, found {dep}"
         );
     }
 
