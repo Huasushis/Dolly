@@ -864,6 +864,55 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             {
                 return failure(state, "EXTENSION_GENERATION_INCOMPATIBLE", false, None);
             }
+            // Frame-bound gate: a Manifest that persists either required
+            // frame bound constrains the chosen Extension generation to meet
+            // or exceed the Manifest's complete-frame byte and nesting-depth
+            // limits. Refuses without changing the Activation, attempt, or
+            // lease generation, additively with the schema-digest gate above.
+            let manifest = item.manifest.as_ref();
+            let required_bytes =
+                manifest.and_then(|value| object_i64_present(value, "required_frame_bytes"));
+            let required_depth = manifest
+                .and_then(|value| object_i64_present(value, "required_frame_nesting_depth"));
+            if required_bytes.is_some() || required_depth.is_some() {
+                let chosen = generation.and_then(|target| {
+                    next.generations
+                        .iter()
+                        .find(|candidate| object_i64(candidate, "generation") == Some(target))
+                });
+                let maximum_bytes = chosen.and_then(|value| object_i64(value, "max_frame_bytes"));
+                let maximum_depth =
+                    chosen.and_then(|value| object_i64(value, "max_frame_nesting_depth"));
+                let bytes_ok = match required_bytes {
+                    None => true,
+                    Some(None) => false,
+                    Some(Some(required)) => {
+                        safe_nonnegative(required)
+                            && maximum_bytes.is_some_and(|maximum| {
+                                safe_nonnegative(maximum) && maximum >= required
+                            })
+                    }
+                };
+                let depth_ok = match required_depth {
+                    None => true,
+                    Some(None) => false,
+                    Some(Some(required)) => {
+                        safe_nonnegative(required)
+                            && maximum_depth.is_some_and(|maximum| {
+                                safe_nonnegative(maximum) && maximum >= required
+                            })
+                    }
+                };
+                if !bytes_ok || !depth_ok {
+                    return failure_with_emission(
+                        state,
+                        &c.command_id,
+                        "ACTIVATION_FRAME_INCOMPATIBLE",
+                        "ExtensionGenerationIncompatible",
+                        json!({"reason": "frame_bounds"}),
+                    );
+                }
+            }
             let Some(attempt) = next_attempt(item.attempt) else {
                 return failure(state, "ATTEMPT_SEQUENCE_EXHAUSTED", false, None);
             };
