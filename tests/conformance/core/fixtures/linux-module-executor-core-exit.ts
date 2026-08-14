@@ -49,6 +49,12 @@ const executor = createLinuxModuleExecutor({
         currentRecord = record;
         return record;
       },
+      supportsVersion19Identity() {
+        return false;
+      },
+      allocateAndAppendStartingRecord() {
+        throw new Error("the test record store never mints version 19 identifiers");
+      },
       updateModuleProcessRecordState(_processGenerationId, state) {
         currentRecord = { ...currentRecord, state };
         return currentRecord;

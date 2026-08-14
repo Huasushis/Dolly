@@ -108,6 +108,12 @@ function recordStore(): ModuleProcessRecordStore & {
       current = record;
       return record;
     },
+    supportsVersion19Identity() {
+      return false;
+    },
+    allocateAndAppendStartingRecord() {
+      throw new Error("the test record store never mints version 19 identifiers");
+    },
     updateModuleProcessRecordState(_id, state, failureCode) {
       return writeState(state, failureCode);
     },

@@ -124,6 +124,12 @@ function recordStore(
       current = record;
       return record;
     },
+    supportsVersion19Identity() {
+      return false;
+    },
+    allocateAndAppendStartingRecord() {
+      throw new Error("the test record store never mints version 19 identifiers");
+    },
     updateModuleProcessRecordState(_id, state) {
       if (options.rejectStateChange?.(state) === true) {
         throw new Error(`simulated failure persisting process-record state ${state}`);

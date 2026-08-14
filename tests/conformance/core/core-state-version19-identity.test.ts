@@ -230,9 +230,21 @@ describe("CORE process-generation identity domain (version 19)", () => {
    * explicit migration, then open the migrated document.
    */
   function migrateToVersion19(prefix: string): FileCoreStateStore {
+    // Persist a fresh version 18 document first, the same way an operator
+    // would before running the explicit migration.
+    openStore(`${prefix}-seed`);
     const migration = migrateCoreStateDocumentToVersion19(path, MIGRATION_OPTIONS);
     expect(migration.status).toBe("migrated");
     return openStore(`${prefix}`);
+  }
+
+  /** The store's persisted allocation counter, narrowed to a version 19 document. */
+  function version19CounterOf(store: FileCoreStateStore): number {
+    const snapshot = store.snapshot();
+    if (snapshot.schemaVersion !== "dolly.core-state/19") {
+      throw new Error("Expected a version 19 Core-state document");
+    }
+    return snapshot.processGenerationIdCounter;
   }
 
   beforeEach(() => {
@@ -347,7 +359,9 @@ describe("CORE process-generation identity domain (version 19)", () => {
       expect(first.state).toBe("starting");
       expect(first.moduleCgroupPath).toBe(cgroupPathFor("_v19_host_1"));
 
-      const second = store.allocateAndAppendStartingRecord(startingRecord());
+      const second = store.allocateAndAppendStartingRecord(
+        startingRecord({ moduleGenerationId: "module-generation-2" }),
+      );
       expect(second.processGenerationId).toBe("_v19_host_2");
       expect(store.getModuleProcessRecord("_v19_host_2")).toEqual(second);
     });
@@ -363,11 +377,15 @@ describe("CORE process-generation identity domain (version 19)", () => {
     it("persists the counter across reopening", () => {
       const store = migrateToVersion19("reopen");
       store.allocateAndAppendStartingRecord(startingRecord());
-      store.allocateAndAppendStartingRecord(startingRecord());
+      store.allocateAndAppendStartingRecord(
+        startingRecord({ moduleGenerationId: "module-generation-2" }),
+      );
 
       const reopened = openStore("reopen-two");
       expect(reopened.snapshot().schemaVersion).toBe("dolly.core-state/19");
-      expect(reopened.allocateAndAppendStartingRecord(startingRecord()).processGenerationId)
+      expect(reopened.allocateAndAppendStartingRecord(
+        startingRecord({ moduleGenerationId: "module-generation-3" }),
+      ).processGenerationId)
         .toBe("_v19_host_3");
     });
 
@@ -421,7 +439,7 @@ describe("CORE process-generation identity domain (version 19)", () => {
       const reopened = openStore("atomic-reopened");
       expect(reopened.revision).toBe(beforeRevision);
       expect(reopened.getModuleProcessRecord("_v19_host_1")).toBeUndefined();
-      expect(reopened.snapshot().processGenerationIdCounter).toBe(0);
+      expect(version19CounterOf(reopened)).toBe(0);
       // No phantom allocation: the next allocation is the same counter value.
       expect(reopened.allocateAndAppendStartingRecord(startingRecord()).processGenerationId)
         .toBe("_v19_host_1");
@@ -443,10 +461,13 @@ describe("CORE process-generation identity domain (version 19)", () => {
       expect(renamed).toBe(true);
 
       const reopened = openStore("atomic-after-reopened");
-      expect(reopened.snapshot().processGenerationIdCounter).toBe(1);
+      expect(version19CounterOf(reopened)).toBe(1);
       expect(reopened.getModuleProcessRecord("_v19_host_1")).toBeDefined();
-      expect(reopened.allocateAndAppendStartingRecord(startingRecord()).processGenerationId)
-        .toBe("_v19_host_2");
+      expect(
+        reopened.allocateAndAppendStartingRecord(
+          startingRecord({ moduleGenerationId: "module-generation-2" }),
+        ).processGenerationId,
+      ).toBe("_v19_host_2");
     });
   });
 
@@ -483,8 +504,10 @@ describe("CORE process-generation identity domain (version 19)", () => {
   describe("R6 explicit v18 to v19 migration", () => {
     it("preserves legacy records and exact source bytes, then forbids new legacy identifiers", () => {
       const store = openStore("legacy-migrate");
-      const legacy = store.appendModuleProcessRecord(processRecord());
+      store.appendModuleProcessRecord(processRecord());
       store.updateModuleProcessRecordState("process-generation-1", "running");
+      const running = store.getModuleProcessRecord("process-generation-1");
+      expect(running?.state).toBe("running");
       const before = readFileSync(path, "utf8");
       const beforeRevision = store.revision;
 
@@ -499,9 +522,9 @@ describe("CORE process-generation identity domain (version 19)", () => {
       const migrated = openStore("migrated-legacy");
       expect(migrated.snapshot().schemaVersion).toBe("dolly.core-state/19");
       expect(migrated.revision).toBe(beforeRevision + 1);
-      expect(migrated.snapshot().processGenerationIdCounter).toBe(0);
+      expect(version19CounterOf(migrated)).toBe(0);
       // The legacy record and its running state are preserved, not re-allocated.
-      expect(migrated.getModuleProcessRecord("process-generation-1")).toEqual(legacy);
+      expect(migrated.getModuleProcessRecord("process-generation-1")).toEqual(running);
       expect(migrated.getModuleProcessRecord("process-generation-1")?.state).toBe(
         "running",
       );
@@ -519,8 +542,11 @@ describe("CORE process-generation identity domain (version 19)", () => {
 
       // The store allocates the first version 19 identifier after the legacy
       // record; the two domains never collide.
-      expect(migrated.allocateAndAppendStartingRecord(startingRecord()).processGenerationId)
-        .toBe("_v19_host_1");
+      expect(
+        migrated.allocateAndAppendStartingRecord(
+          startingRecord({ moduleGenerationId: "module-generation-2" }),
+        ).processGenerationId,
+      ).toBe("_v19_host_1");
     });
 
     it("reports already-current when run again on a version 19 document", () => {
@@ -548,7 +574,7 @@ describe("CORE process-generation identity domain (version 19)", () => {
       };
       const legacy: Record<string, unknown> = {
         schemaVersion: "dolly.core-state/15",
-        stateDigest: canonicalJsonDigest(payload as JsonValue),
+        stateDigest: canonicalJsonDigest(payload as unknown as JsonValue),
         ...payload,
       };
       const raw = `${JSON.stringify(legacy)}\n`;
@@ -565,7 +591,7 @@ describe("CORE process-generation identity domain (version 19)", () => {
       const migrated = openStore("v15-migrated");
       expect(migrated.snapshot().schemaVersion).toBe("dolly.core-state/19");
       expect(migrated.snapshot().revision).toBe((legacy.revision as number) + 1);
-      expect(migrated.snapshot().processGenerationIdCounter).toBe(0);
+      expect(version19CounterOf(migrated)).toBe(0);
       expect(migrated.listModuleProcessRecords()).toEqual([]);
 
       // The migrated document is the current version and needs no further work.

@@ -68,6 +68,10 @@ function options(
   const records: ModuleProcessRecordStore = {
     getModuleProcessRecord: vi.fn(),
     appendModuleProcessRecord: vi.fn((record: ModuleProcessRecord) => record),
+    supportsVersion19Identity: vi.fn(() => false),
+    allocateAndAppendStartingRecord: vi.fn(() => {
+      throw new Error("the test record store never mints version 19 identifiers");
+    }),
     updateModuleProcessRecordState: vi.fn((
       _processGenerationId: string,
       _state: "running" | "stopping",

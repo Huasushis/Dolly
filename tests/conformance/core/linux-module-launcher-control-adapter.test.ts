@@ -333,6 +333,12 @@ function recordStore(): ModuleProcessRecordStore & {
       records.set(record.processGenerationId, record);
       return record;
     },
+    supportsVersion19Identity() {
+      return false;
+    },
+    allocateAndAppendStartingRecord() {
+      throw new Error("the test record store never mints version 19 identifiers");
+    },
     updateModuleProcessRecordState(processGenerationId, state) {
       const current = records.get(processGenerationId);
       if (!current) throw new Error(`no record for ${processGenerationId}`);

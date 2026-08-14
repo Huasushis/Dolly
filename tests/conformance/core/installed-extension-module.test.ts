@@ -374,6 +374,10 @@ function recordStore(): ModuleProcessRecordStore {
   return {
     getModuleProcessRecord: vi.fn(),
     appendModuleProcessRecord: vi.fn((record: ModuleProcessRecord) => record),
+    supportsVersion19Identity: vi.fn(() => false),
+    allocateAndAppendStartingRecord: vi.fn(() => {
+      throw new Error("the test derivation must not allocate process records");
+    }),
     updateModuleProcessRecordState: vi.fn(() => {
       throw new Error("the derivation must not update process records");
     }),
