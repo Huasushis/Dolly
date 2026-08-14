@@ -483,3 +483,73 @@ describe("Core reference abstract machine", () => {
     expect(result.state.activations.a?.attempt).toBe(1);
   });
 });
+
+describe("WP-003: IssueLease idempotency replay boundary", () => {
+  it("rejects replay omitting extension_generation when stored lease has one", () => {
+    const state = emptyCoreSnapshot();
+    state.activations.a = { state: "ready", attempt: 0 };
+    state.generations = [{ generation: 8, compatible: true }];
+    const original = run(state, {
+      type: "IssueLease", command_id: "cmd-1", activation_id: "a", lease_id: "lease-1",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1, extension_generation: 8,
+    });
+    expect(original.outcome).toBe("committed");
+    expect(original.reply?.extension_generation).toBe(8);
+    const replay = run(original.state, {
+      type: "IssueLease", command_id: "cmd-2", activation_id: "a", lease_id: "lease-1",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1,
+    });
+    expect(replay.outcome).toBe("rolled_back");
+    expect(replay.error?.code).toBe("STORAGE_IDEMPOTENCY_CONFLICT");
+  });
+
+  it("accepts replay with matching extension_generation", () => {
+    const state = emptyCoreSnapshot();
+    state.activations.a = { state: "ready", attempt: 0 };
+    state.generations = [{ generation: 8, compatible: true }];
+    const original = run(state, {
+      type: "IssueLease", command_id: "cmd-1", activation_id: "a", lease_id: "lease-1",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1, extension_generation: 8,
+    });
+    expect(original.outcome).toBe("committed");
+    const replay = run(original.state, {
+      type: "IssueLease", command_id: "cmd-2", activation_id: "a", lease_id: "lease-1",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1, extension_generation: 8,
+    });
+    expect(replay.outcome).toBe("committed");
+    expect(replay.reply?.extension_generation).toBe(8);
+  });
+
+  it("accepts replay omitting extension_generation when stored lease also lacks one", () => {
+    const state = emptyCoreSnapshot();
+    state.activations.a = { state: "ready", attempt: 0 };
+    const original = run(state, {
+      type: "IssueLease", command_id: "cmd-1", activation_id: "a", lease_id: "lease-2",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1,
+    });
+    expect(original.outcome).toBe("committed");
+    expect(original.reply?.extension_generation).toBeUndefined();
+    const replay = run(original.state, {
+      type: "IssueLease", command_id: "cmd-2", activation_id: "a", lease_id: "lease-2",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1,
+    });
+    expect(replay.outcome).toBe("committed");
+  });
+
+  it("rejects replay with mismatched extension_generation", () => {
+    const state = emptyCoreSnapshot();
+    state.activations.a = { state: "ready", attempt: 0 };
+    state.generations = [{ generation: 8, compatible: true }, { generation: 9, compatible: true }];
+    const original = run(state, {
+      type: "IssueLease", command_id: "cmd-1", activation_id: "a", lease_id: "lease-3",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1, extension_generation: 8,
+    });
+    expect(original.outcome).toBe("committed");
+    const replay = run(original.state, {
+      type: "IssueLease", command_id: "cmd-2", activation_id: "a", lease_id: "lease-3",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1, extension_generation: 9,
+    });
+    expect(replay.outcome).toBe("rolled_back");
+    expect(replay.error?.code).toBe("STORAGE_IDEMPOTENCY_CONFLICT");
+  });
+});

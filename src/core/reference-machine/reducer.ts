@@ -291,7 +291,7 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
           && existing.extension_connection_id === command.extension_connection_id
           && Number(existing.worker_epoch) === command.worker_epoch
           && Number(existing.attempt) === item.attempt
-          && (command.extension_generation === undefined || Number(existing.extension_generation) === command.extension_generation);
+          && (command.extension_generation !== undefined ? Number(existing.extension_generation) === command.extension_generation : !("extension_generation" in existing));
         if (!exact) return failure(state, "STORAGE_IDEMPOTENCY_CONFLICT", false, { lease_id: command.lease_id });
         const existingGeneration = Number(existing.extension_generation);
         return success(state, [], {
