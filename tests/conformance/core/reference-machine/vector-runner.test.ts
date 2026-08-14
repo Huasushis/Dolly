@@ -10,6 +10,7 @@ const VECTOR_ROOT = path.join(SPEC_ROOT, "test-vectors", "core");
 // Repository-owned overlay; the imported snapshot stays byte-faithful.
 const OVERLAY_ROOT = path.resolve(import.meta.dirname, "../../../../test-vectors/core");
 const FIXTURE_ROOT = path.join(SPEC_ROOT, "test-vectors", "fixtures");
+const PROTOCOL_ROOT = path.join(SPEC_ROOT, "test-vectors", "protocol");
 const FENCE = `sha256:${"f".repeat(64)}`;
 // Host-owned test-environment state; replay evidence cannot define its own authority scope.
 const ACTIVATION_LEDGER_STORAGE_SCOPE_ID = "0198ab31-6c44-7e8a-b2bb-000000000109";
@@ -506,20 +507,61 @@ function execute(vector: FrozenVector): ScenarioResult {
         emitted: received.events.map(flattened),
       };
     }
+    case "TST-PROTO-003": {
+      const activationId = "a";
+      const candidate = object(initial.candidate_generation, "candidate_generation");
+      const state = emptyCoreSnapshot();
+      state.activations[activationId] = {
+        state: initial.activation_state === "ready" ? "ready" : "leased",
+        attempt: integer(initial.attempt, "attempt"),
+        manifest: {
+          manifest_digest: text(initial.manifest_digest, "manifest_digest"),
+          required_frame_bytes: integer(initial.required_frame_bytes, "required_frame_bytes"),
+          required_frame_nesting_depth: integer(initial.required_frame_nesting_depth, "required_frame_nesting_depth"),
+        },
+      };
+      state.generations = [{
+        generation: integer(candidate.generation, "candidate_generation.generation"),
+        max_frame_bytes: integer(candidate.max_frame_bytes, "candidate_generation.max_frame_bytes"),
+        max_frame_nesting_depth: integer(candidate.max_frame_nesting_depth, "candidate_generation.max_frame_nesting_depth"),
+      }] as unknown as JsonObject[];
+      const before = { activation: { lease_generation: state.activations[activationId]!.extension_generation } };
+      const issued = transition(
+        state,
+        { type: "IssueLease", command_id: "lease", activation_id: activationId, lease_id: "l", token_digest: "token", extension_connection_id: "connection-1", worker_epoch: 1, extension_generation: integer(candidate.generation, "candidate_generation.generation") },
+      );
+      return {
+        outcome: issued.error?.code ?? "unexpected",
+        before,
+        observed: {
+          candidate_generation: { ready_for_module: issued.error === undefined },
+          activation: {
+            state: issued.state.activations[activationId]?.state,
+            attempt: issued.state.activations[activationId]?.attempt,
+            lease_generation: issued.state.activations[activationId]?.extension_generation,
+            manifest_digest: issued.state.activations[activationId]?.manifest?.manifest_digest,
+          },
+        },
+        emitted: issued.events.map(flattened),
+      };
+    }
     default: throw new Error(`unmapped immutable vector ${vector.test_id}`);
   }
 }
 
-const vectors = [...new Set([VECTOR_ROOT, OVERLAY_ROOT].flatMap((root) => readdirSync(root).filter((name) => /^TST-CORE-\d{3}.*\.json$/.test(name))))]
+const coreVectors = [...new Set([VECTOR_ROOT, OVERLAY_ROOT].flatMap((root) => readdirSync(root).filter((name) => /^TST-CORE-\d{3}.*\.json$/.test(name))))]
   .sort()
   .map((name) => {
     const owner = [VECTOR_ROOT, OVERLAY_ROOT].find((root) => existsSync(path.join(root, name)));
     return object(readFrozenJsonTestFile(path.join(owner!, name)), name) as unknown as FrozenVector;
   });
+const protocolVectorName = "TST-PROTO-003-frame-generation-compatibility.json";
+const protocolVector = object(readFrozenJsonTestFile(path.join(PROTOCOL_ROOT, protocolVectorName)), protocolVectorName) as unknown as FrozenVector;
+const vectors = [...coreVectors, protocolVector];
 
 describe("immutable Core vectors", () => {
-  it("executes exactly TST-CORE-001 through TST-CORE-019", () => {
-    expect(vectors.map((vector) => vector.test_id)).toEqual(Array.from({ length: 19 }, (_, index) => `TST-CORE-${String(index + 1).padStart(3, "0")}`));
+  it("executes exactly TST-CORE-001 through TST-CORE-019 plus the reducer-covered protocol vector TST-PROTO-003", () => {
+    expect(vectors.map((vector) => vector.test_id)).toEqual([...Array.from({ length: 19 }, (_, index) => `TST-CORE-${String(index + 1).padStart(3, "0")}`), "TST-PROTO-003"]);
   });
 
   for (const vector of vectors) {
@@ -532,4 +574,74 @@ describe("immutable Core vectors", () => {
       for (const [index, required] of vector.expected.emitted.entries()) expect(scenario.emitted[index]).toMatchObject(required);
     });
   }
+});
+
+describe("IssueLease frame-bound fail-closed coverage", () => {
+  const issue = (manifest: JsonObject, generation: JsonObject | undefined, extensionGeneration: number | undefined) => {
+    const state = emptyCoreSnapshot();
+    state.activations.a = { state: "ready", attempt: 0, manifest };
+    if (generation !== undefined) state.generations = [generation];
+    const before = { activation: { lease_generation: state.activations.a!.extension_generation } };
+    const issued = transition(state, { type: "IssueLease", command_id: "lease", activation_id: "a", lease_id: "l", token_digest: "token", extension_connection_id: "connection-1", worker_epoch: 1, ...(extensionGeneration === undefined ? {} : { extension_generation: extensionGeneration }) });
+    return { before, issued };
+  };
+
+  it("rejects a generation whose declared max_frame_nesting_depth cannot carry the manifest depth requirement", () => {
+    const { issued } = issue(
+      { manifest_digest: "sha256:7777777777777777777777777777777777777777777777777777777777777777", required_frame_bytes: 1048576, required_frame_nesting_depth: 80 },
+      { generation: 9, compatible: true, max_frame_bytes: 4194304, max_frame_nesting_depth: 64 },
+      9,
+    );
+    expect(issued.error?.code).toBe("ACTIVATION_FRAME_INCOMPATIBLE");
+    expect(issued.outcome).toBe("rolled_back");
+    expect(issued.state.activations.a).toMatchObject({ state: "ready", attempt: 0 });
+    expect(issued.state.leases.l).toBeUndefined();
+    expect(issued.events.map(flattened)).toEqual([{ event: "ExtensionGenerationIncompatible", reason: "frame_bounds" }]);
+  });
+
+  it("fails closed when the manifest declares a frame requirement the generation does not declare", () => {
+    const { issued } = issue(
+      { manifest_digest: "sha256:7777777777777777777777777777777777777777777777777777777777777778", required_frame_bytes: 1048576 },
+      { generation: 9, compatible: true },
+      9,
+    );
+    expect(issued.error?.code).toBe("ACTIVATION_FRAME_INCOMPATIBLE");
+    expect(issued.outcome).toBe("rolled_back");
+    expect(issued.state.activations.a).toMatchObject({ state: "ready", attempt: 0 });
+    expect(issued.state.leases.l).toBeUndefined();
+    expect(issued.events.map(flattened)).toEqual([{ event: "ExtensionGenerationIncompatible", reason: "frame_bounds" }]);
+  });
+
+  it("still issues the lease when the generation meets both declared frame bounds", () => {
+    const { issued } = issue(
+      { manifest_digest: "sha256:7777777777777777777777777777777777777777777777777777777777777779", required_frame_bytes: 4194304, required_frame_nesting_depth: 80 },
+      { generation: 9, compatible: true, max_frame_bytes: 4194304, max_frame_nesting_depth: 96 },
+      9,
+    );
+    expect(issued.error).toBeUndefined();
+    expect(issued.state.activations.a).toMatchObject({ state: "leased", attempt: 1 });
+    expect(issued.events.some((event) => event.event === "LeaseIssued")).toBe(true);
+  });
+
+  it("keeps existing behavior when the manifest declares no frame requirement", () => {
+    const { issued } = issue(
+      { manifest_digest: "sha256:7777777777777777777777777777777777777777777777777777777777777770" },
+      { generation: 9, compatible: true },
+      9,
+    );
+    expect(issued.error).toBeUndefined();
+    expect(issued.state.activations.a).toMatchObject({ state: "leased", attempt: 1 });
+  });
+
+  it("fails closed when a frame requirement is declared but no generation exists to carry it", () => {
+    const { issued } = issue(
+      { manifest_digest: "sha256:7777777777777777777777777777777777777777777777777777777777777771", required_frame_nesting_depth: 80 },
+      undefined,
+      undefined,
+    );
+    expect(issued.error?.code).toBe("ACTIVATION_FRAME_INCOMPATIBLE");
+    expect(issued.outcome).toBe("rolled_back");
+    expect(issued.state.activations.a).toMatchObject({ state: "ready", attempt: 0 });
+    expect(issued.state.leases.l).toBeUndefined();
+  });
 });
