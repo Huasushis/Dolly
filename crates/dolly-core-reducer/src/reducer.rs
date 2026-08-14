@@ -871,10 +871,10 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             // ACTIVATION_FRAME_INCOMPATIBLE refusal without changing the
             // Activation, attempt, or lease generation.
             let manifest = item.manifest.as_ref();
-            let required_bytes = manifest.and_then(|value| object_i64_present(value, "required_frame_bytes"));
-            let required_depth = manifest.and_then(|value| {
-                object_i64_present(value, "required_frame_nesting_depth")
-            });
+            let required_bytes =
+                manifest.and_then(|value| object_i64_present(value, "required_frame_bytes"));
+            let required_depth = manifest
+                .and_then(|value| object_i64_present(value, "required_frame_nesting_depth"));
             if required_bytes.is_some() || required_depth.is_some() {
                 let chosen = generation.and_then(|target| {
                     next.generations
@@ -882,7 +882,8 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                         .find(|candidate| object_i64(candidate, "generation") == Some(target))
                 });
                 let maximum_bytes = chosen.and_then(|value| object_i64(value, "max_frame_bytes"));
-                let maximum_depth = chosen.and_then(|value| object_i64(value, "max_frame_nesting_depth"));
+                let maximum_depth =
+                    chosen.and_then(|value| object_i64(value, "max_frame_nesting_depth"));
                 let bytes_ok = match required_bytes {
                     None => true,
                     Some(None) => false,
