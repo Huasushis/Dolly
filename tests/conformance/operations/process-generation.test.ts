@@ -54,6 +54,18 @@ class StubIdentityProbe implements ProcessIdentityProbe {
   }
 }
 
+/** An identity probe that counts observations so zero-activity is provable. */
+class CountingIdentityProbe implements ProcessIdentityProbe {
+  observeCount = 0;
+
+  constructor(private readonly answer: ProcessIdentityObservation) {}
+
+  observe(pid: number): Promise<ProcessIdentityObservation> {
+    this.observeCount += 1;
+    return Promise.resolve(this.answer);
+  }
+}
+
 /** A launcher that records every attempted spawn and always fails. */
 class TrackingNeverLauncher implements ProcessLauncher {
   launchCount = 0;
@@ -405,6 +417,37 @@ describe("process-generation guard inside daemon ownership checks", () => {
       manager.startInstance(stale.instanceId, "op-start-stale"),
     ).rejects.toMatchObject({ code: "PROCESS_GENERATION_STALE" });
     expect(launcher.launchCount).toBe(2);
+  });
+
+  it("refuses a stop of a persisted record naming a stale same-epoch generation", async () => {
+    root = mkdtempSync(join(tmpdir(), "dolly-process-generation-"));
+    registry = createTestInstanceRegistry(root);
+    records = new InstanceProcessRecordStore({ directory: join(root, "process-records") });
+    const launcher = new TrackingNeverLauncher();
+    const probe = new CountingIdentityProbe({ kind: "identity", identityToken: "recorded-identity-token" });
+    const manager = createManager(launcher, probe);
+
+    // Two failed starts mint EPOCH:1 then EPOCH:2, so EPOCH:1 is now stale.
+    const first = registry.register("gen-one");
+    await expect(manager.startInstance(first.instanceId, "op-gen-one")).rejects.toBeInstanceOf(Error);
+    const second = registry.register("gen-two");
+    await expect(manager.startInstance(second.instanceId, "op-gen-two")).rejects.toBeInstanceOf(Error);
+    expect(launcher.launchCount).toBe(2);
+
+    // The persisted record names EPOCH:1 while the manager's current
+    // authenticated generation is EPOCH:2. The stop is refused by the token
+    // guard before any launcher, spawn, signal, or identity probe, even though
+    // the recorded identity would have matched.
+    const stopped = registry.register("stale-stop");
+    seedRecord(stopped.instanceId, { processGenerationId: `generation:${EPOCH}:1` });
+    await expect(
+      manager.stopInstance(stopped.instanceId, "op-stop-stale"),
+    ).rejects.toMatchObject({ code: "PROCESS_GENERATION_STALE" });
+    expect(launcher.launchCount).toBe(2);
+    expect(probe.observeCount).toBe(0);
+    // The refusal left the durable record untouched; no clear or stale-mark
+    // followed the refusal.
+    expect(records.read(stopped.instanceId)?.processGenerationId).toBe(`generation:${EPOCH}:1`);
   });
 
   it("makes two managers sharing one controllerId refuse same-epoch ownership each did not issue", async () => {
