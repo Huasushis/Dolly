@@ -633,4 +633,61 @@ describe("WP-003: IssueLease idempotency replay boundary", () => {
     expect(replay.outcome).toBe("rolled_back");
     expect(replay.error?.code).toBe("STORAGE_IDEMPOTENCY_CONFLICT");
   });
+
+  it("rejects generation replay when persisted extension_generation is a malformed numeric string", () => {
+    const state = emptyCoreSnapshot();
+    // Attempt-aligned corrupted lease: every identity field matches the command
+    // and Number(existing.attempt) equals item.attempt, so only the generation
+    // comparison decides the replay instead of short-circuiting on attempt.
+    state.activations.a = { state: "ready", attempt: 1 };
+    state.leases["lease-malformed-str"] = {
+      activation_id: "a",
+      token_digest: A,
+      extension_connection_id: "conn-1",
+      worker_epoch: 1,
+      attempt: 1,
+      extension_generation: "8" as unknown as number,
+    };
+    const replay = run(state, {
+      type: "IssueLease", command_id: "cmd-1", activation_id: "a", lease_id: "lease-malformed-str",
+      token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1, extension_generation: 8,
+    });
+    expect(replay.outcome).toBe("rolled_back");
+    expect(replay.error?.code).toBe("STORAGE_IDEMPOTENCY_CONFLICT");
+  });
+
+  it("rejects generation replay when persisted extension_generation is null or a wrong type", () => {
+    for (const malformed of [null, true, "eight"]) {
+      const state = emptyCoreSnapshot();
+      state.activations.a = { state: "ready", attempt: 1 };
+      const leaseId = `lease-${String(malformed)}`;
+      state.leases[leaseId] = {
+        activation_id: "a",
+        token_digest: A,
+        extension_connection_id: "conn-1",
+        worker_epoch: 1,
+        attempt: 1,
+        extension_generation: malformed as unknown as number,
+      };
+      const replay = run(state, {
+        type: "IssueLease", command_id: "cmd-1", activation_id: "a", lease_id: leaseId,
+        token_digest: A, extension_connection_id: "conn-1", worker_epoch: 1, extension_generation: 8,
+      });
+      expect(replay.outcome, String(malformed)).toBe("rolled_back");
+      expect(replay.error?.code, String(malformed)).toBe("STORAGE_IDEMPOTENCY_CONFLICT");
+    }
+  });
+
+  it("rejects result binding when persisted extension_generation is a malformed numeric string", () => {
+    const state = leasedState("dispatched");
+    state.leases.l!.extension_generation = "8" as unknown as number;
+    const payloadDigest = canonicalJsonDigest({});
+    const result = run(
+      state,
+      { type: "ReceiveResult", command_id: "receive", activation_id: "a", lease_id: "l", status: "success", result_digest: payloadDigest, result: {} },
+      { host_result_verification: { ...resultVerification(payloadDigest)!, extension_generation: 8 } },
+    );
+    expect(result.outcome).toBe("rolled_back");
+    expect(result.error?.code).toBe("ACTIVATION_FENCE_INVALID");
+  });
 });
