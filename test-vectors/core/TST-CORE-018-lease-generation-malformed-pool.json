@@ -35,6 +35,11 @@
         "value": "CORE_STATE_GENERATION_INVALID"
       },
       {
+        "path": "/error_generation_detail",
+        "op": "equals",
+        "value": null
+      },
+      {
         "path": "/activation/state",
         "op": "equals",
         "value": "ready"

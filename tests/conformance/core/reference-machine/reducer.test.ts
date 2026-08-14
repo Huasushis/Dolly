@@ -701,6 +701,7 @@ describe("WP-003: IssueLease idempotency replay boundary", () => {
     });
     expect(result.outcome).toBe("rolled_back");
     expect(result.error?.code).toBe("CORE_STATE_GENERATION_INVALID");
+    expect(result.error?.details).toBeUndefined();
   });
 
   it("rejects IssueLease when a compatible persisted generation candidate is null, boolean, or unsafe", () => {
@@ -714,6 +715,7 @@ describe("WP-003: IssueLease idempotency replay boundary", () => {
       });
       expect(result.outcome, String(malformed)).toBe("rolled_back");
       expect(result.error?.code, String(malformed)).toBe("CORE_STATE_GENERATION_INVALID");
+      expect(result.error?.details, String(malformed)).toBeUndefined();
     }
   });
 

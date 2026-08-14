@@ -338,7 +338,7 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
         const candidateGeneration = (candidate as { generation?: unknown }).generation;
         if (candidateGeneration === undefined) continue;
         if (typeof candidateGeneration !== "number" || !Number.isSafeInteger(candidateGeneration)) {
-          return failure(state, "CORE_STATE_GENERATION_INVALID", false, { generation: candidateGeneration as JsonValue });
+          return failure(state, "CORE_STATE_GENERATION_INVALID", false);
         }
         candidates.push(candidateGeneration);
       }
