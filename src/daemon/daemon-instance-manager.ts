@@ -55,6 +55,11 @@ import {
   type RegisteredInstance,
 } from "./instance-registry.js";
 import { createOsProcessIdentityProbe, type ProcessIdentityProbe } from "./process-identity.js";
+import {
+  ProcessGenerationSequence,
+  formatProcessGenerationToken,
+  parseProcessGenerationToken,
+} from "./process-generation.js";
 
 const OPERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 
@@ -152,11 +157,16 @@ export interface DaemonInstanceManagerOptions {
  * secret that authenticates it.
  */
 class GenerationSecretLedger {
+  readonly #generations: ProcessGenerationSequence;
   readonly #ipcSessionIds = new Map<string, string>();
   #pending?: string;
 
+  constructor(generations: ProcessGenerationSequence) {
+    this.#generations = generations;
+  }
+
   nextProcessGenerationId(): string {
-    const processGenerationId = `process-${randomBytes(24).toString("base64url")}`;
+    const processGenerationId = formatProcessGenerationToken(this.#generations.bump());
     this.#pending = processGenerationId;
     return processGenerationId;
   }
@@ -223,6 +233,7 @@ export class DaemonInstanceManager {
   readonly #records: InstanceProcessRecordStore;
   readonly #probe: ProcessIdentityProbe;
   readonly #controllerId: string;
+  readonly #generations: ProcessGenerationSequence;
   readonly #now: () => string;
   readonly #managed = new Map<string, ManagedInstance>();
   readonly #instanceTails = new Map<string, Promise<unknown>>();
@@ -235,6 +246,9 @@ export class DaemonInstanceManager {
     });
     this.#probe = options.identityProbe ?? createOsProcessIdentityProbe();
     this.#controllerId = options.controllerId ?? randomUUID();
+    // One supervision epoch per daemon session: the controller identity scopes
+    // every generation counter, so a later session can never reuse a token.
+    this.#generations = new ProcessGenerationSequence({ epoch: this.#controllerId });
     this.#now = options.now ?? (() => new Date().toISOString());
   }
 
@@ -376,7 +390,7 @@ export class DaemonInstanceManager {
       throw error;
     }
 
-    const ledger = new GenerationSecretLedger();
+    const ledger = new GenerationSecretLedger(this.#generations);
     const managed: ManagedInstance = {
       instance,
       lock,
@@ -487,7 +501,9 @@ export class DaemonInstanceManager {
 
     // Stopping an instance this daemon does not own is idempotent only when
     // the durable evidence proves nothing of ours is still running.
-    const evidence = await evaluateProcessRecord(this.#records.read(instanceId), this.#probe);
+    const record = this.#records.read(instanceId);
+    this.#guardRecordGeneration(record);
+    const evidence = await evaluateProcessRecord(record, this.#probe);
     if (evidence.kind === "identity-unprovable") {
       await this.#markStale(instance, evidence.record, evidence.reason, operationId);
       throw new DaemonInstanceManagerError(
@@ -595,14 +611,28 @@ export class DaemonInstanceManager {
   }
 
   /**
+   * Refuses an ownership decision on a durable record that names a process
+   * generation this daemon's epoch no longer vouches for. An older generation
+   * of this same epoch is stale and a same-epoch token this session never
+   * issued is invalid. Records from an earlier epoch or written before tokens
+   * existed are skipped: the operating-system identity evidence decides those
+   * exactly as it always has, so current-generation behavior is unchanged.
+   */
+  #guardRecordGeneration(record: InstanceProcessRecord | null): void {
+    if (record === null) return;
+    const token = parseProcessGenerationToken(record.processGenerationId);
+    if (token === undefined || token.epoch !== this.#generations.epoch) return;
+    this.#generations.guard(token);
+  }
+
+  /**
    * Reconciles the durable process record before any spawn. A record that
    * cannot be proven dead never becomes a second running child.
    */
   async #reconcileBeforeSpawn(instance: RegisteredInstance, operationId: string): Promise<void> {
-    const evidence = await evaluateProcessRecord(
-      this.#records.read(instance.instanceId),
-      this.#probe,
-    );
+    const record = this.#records.read(instance.instanceId);
+    this.#guardRecordGeneration(record);
+    const evidence = await evaluateProcessRecord(record, this.#probe);
     if (evidence.kind === "none") return;
     if (evidence.kind === "identity-unprovable") {
       await this.#markStale(instance, evidence.record, evidence.reason, operationId);
