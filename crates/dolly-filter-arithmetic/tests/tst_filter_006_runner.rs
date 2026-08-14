@@ -18,9 +18,9 @@ use std::{
 };
 
 use dolly_filter_arithmetic::{
-    Accumulator, FilterConfig, ReplayObservation, SCALE, replay_decision_state,
+    replay_decision_state, Accumulator, FilterConfig, ReplayObservation, SCALE,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 fn spec_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -134,7 +134,9 @@ fn evaluate_tst_filter_006(vector: &Value) -> Evaluated {
         .iter()
         .map(|source| {
             let name = source["source"].as_str().unwrap_or_else(|| {
-                source["source_module_id"].as_str().expect("source identity")
+                source["source_module_id"]
+                    .as_str()
+                    .expect("source identity")
             });
             (
                 name,
@@ -209,7 +211,10 @@ fn evaluate_tst_filter_006(vector: &Value) -> Evaluated {
     }
 
     let mut result = Map::new();
-    result.insert("derived_after_state".to_string(), Value::Object(derived_map));
+    result.insert(
+        "derived_after_state".to_string(),
+        Value::Object(derived_map),
+    );
     result.insert(
         "claimed_after_state".to_string(),
         Value::Object(claimed_map),
