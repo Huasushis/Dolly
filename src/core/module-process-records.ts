@@ -19,7 +19,9 @@ import {
   CGROUP_V2_MOUNT_POINT,
   MODULE_CGROUP_NAME_PREFIX,
   PROCESS_GENERATION_ID_RULE,
+  VERSION19_PROCESS_GENERATION_ID_RULE,
   isLinuxBootId,
+  isModuleProcessGenerationId,
   isProcessGenerationId,
   isServiceInvocationId,
 } from "./linux-identifier-formats.js";
@@ -72,6 +74,41 @@ export interface ModuleProcessRecord {
 }
 
 /**
+ * The input from which the Core-state store allocates a starting Module
+ * process record. The caller supplies every field except the process-generation
+ * identifier and the derived control-group path: the store mints the version 19
+ * identifier from its durable counter and binds the control-group path to that
+ * identifier before appending and persisting the starting record atomically.
+ */
+export interface ModuleProcessStartingRecordInput {
+  readonly schemaVersion: "dolly.module-process-record/1";
+  readonly instanceId: string;
+  readonly moduleId: string;
+  readonly moduleGenerationId: string;
+  readonly packageDigest: string;
+  readonly configurationReference: {
+    readonly configId: string;
+    readonly revision: string;
+    readonly configVersion: number;
+  };
+  readonly declaredExternalEffects: DeclaredExternalEffects;
+  readonly serviceInvocationId: string;
+  readonly bootId: string;
+  /** The delegated control-group root Core derives the record's path from. */
+  readonly delegatedRootCgroupPath: string;
+  /**
+   * An optional caller-derived control-group path for the same generation.
+   * Core always stores its own derivation; a supplied path must still be the
+   * identity-bound derivation Core itself would produce, and is otherwise
+   * refused before any state changes.
+   */
+  readonly moduleCgroupPath?: string;
+  readonly state: "starting";
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/**
  * Narrow authority to persist the terminal state of a Module process record.
  * Ordinary record stores do not expose this operation: product composition
  * gives the capability only to coordinators that first prove the whole
@@ -111,6 +148,18 @@ export type ModuleProcessRecordErrorCode =
   | "MODULE_PROCESS_RECORD_STATE_INVALID"
   | "MODULE_PROCESS_STOP_PROOF_REQUIRED"
   | "MODULE_PROCESS_RECORD_IN_USE"
+  /**
+   * The process-generation identifier was submitted by the caller although
+   * the Core-state store alone allocates identifiers in the version 19
+   * identity domain (and, after migration to `dolly.core-state/19`, every
+   * new process generation).
+   */
+  | "MODULE_PROCESS_RECORD_ALLOCATION_REQUIRED"
+  /**
+   * The store cannot allocate version 19 identifiers because the Core-state
+   * document has not been explicitly migrated to `dolly.core-state/19`.
+   */
+  | "MODULE_PROCESS_RECORD_IDENTITY_MIGRATION_REQUIRED"
   | "MODULE_SUBMISSION_RECORD_INVALID"
   | "MODULE_SUBMISSION_RECORD_CONFLICT"
   | "MODULE_SUBMISSION_RECORD_NOT_FOUND"
@@ -204,10 +253,10 @@ export function assertValidModuleProcessRecord(
       fail(code, `Module process record field "${field}" must be an identifier`);
     }
   }
-  if (!isProcessGenerationId(value.processGenerationId)) {
+  if (!isModuleProcessGenerationId(value.processGenerationId)) {
     fail(
       code,
-      `Module process record processGenerationId ${PROCESS_GENERATION_ID_RULE}`,
+      `Module process record processGenerationId ${PROCESS_GENERATION_ID_RULE}, or ${VERSION19_PROCESS_GENERATION_ID_RULE}`,
     );
   }
   if (!isServiceInvocationId(value.serviceInvocationId)) {
@@ -334,10 +383,10 @@ export function assertValidModuleSubmissionRecord(
       fail(code, `Module submission record field "${field}" must be an identifier`);
     }
   }
-  if (!isProcessGenerationId(value.processGenerationId)) {
+  if (!isModuleProcessGenerationId(value.processGenerationId)) {
     fail(
       code,
-      `Module submission record processGenerationId ${PROCESS_GENERATION_ID_RULE}`,
+      `Module submission record processGenerationId ${PROCESS_GENERATION_ID_RULE}, or ${VERSION19_PROCESS_GENERATION_ID_RULE}`,
     );
   }
   if (!Number.isSafeInteger(value.attempt) || (value.attempt as number) < 1) {

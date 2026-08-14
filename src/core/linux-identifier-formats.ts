@@ -49,6 +49,75 @@ export function isProcessGenerationId(value: unknown): value is string {
 export const PROCESS_GENERATION_ID_RULE =
   'it must be 1 to 128 characters of letters, digits, "-", or "_" and start with a letter or digit';
 
+/**
+ * The version 19 process-generation identifier is the durable identity the
+ * Core-state store allocates from its counter after explicit migration to
+ * `dolly.core-state/19`. Its wire form is `_v19_host_<counter>`: the leading
+ * underscore marks the store-owned version 19 domain, `host` is the only
+ * allocation domain, and the counter is canonical base ten without leading
+ * zeros, from 1 through `Number.MAX_SAFE_INTEGER`. The leading underscore is
+ * outside the legacy version 18 grammar, so no identifier belongs to both
+ * domains.
+ */
+const VERSION19_PROCESS_GENERATION_PATTERN = /^_v19_host_([1-9][0-9]*)$/;
+
+/**
+ * A process-generation identifier the runtime may store durably: either a
+ * legacy version 18 identifier or a version 19 identifier allocated by the
+ * Core-state store.
+ */
+export function isModuleProcessGenerationId(
+  value: unknown,
+): value is string {
+  return (
+    isProcessGenerationId(value) || isVersion19ProcessGenerationId(value)
+  );
+}
+
+/** Whether a value is a version 19 store-owned process-generation identifier. */
+export function isVersion19ProcessGenerationId(
+  value: unknown,
+): value is string {
+  if (typeof value !== "string") return false;
+  const match = VERSION19_PROCESS_GENERATION_PATTERN.exec(value);
+  if (match === null) return false;
+  const counter = Number(match[1]);
+  return Number.isSafeInteger(counter) && counter >= 1;
+}
+
+/** The plain-language rule `isVersion19ProcessGenerationId` applies, for failure messages. */
+export const VERSION19_PROCESS_GENERATION_ID_RULE =
+  'it must be "_v19_host_" followed by the canonical base-ten counter from 1 through the maximum safe integer';
+
+/**
+ * The counter of a version 19 process-generation identifier, or `undefined`
+ * when the value is not one.
+ */
+export function version19ProcessGenerationCounter(
+  value: unknown,
+): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const match = VERSION19_PROCESS_GENERATION_PATTERN.exec(value);
+  if (match === null) return undefined;
+  const counter = Number(match[1]);
+  if (!Number.isSafeInteger(counter) || counter < 1) return undefined;
+  return counter;
+}
+
+/** The canonical version 19 wire form for one counter value. */
+export function formatVersion19ProcessGenerationId(counter: number): string {
+  if (
+    !Number.isInteger(counter) ||
+    counter < 1 ||
+    counter > Number.MAX_SAFE_INTEGER
+  ) {
+    throw new RangeError(
+      `version 19 process-generation counter must be an integer from 1 through ${Number.MAX_SAFE_INTEGER}`,
+    );
+  }
+  return `_v19_host_${counter}`;
+}
+
 export function isServiceInvocationId(value: unknown): value is string {
   return typeof value === "string" && SERVICE_INVOCATION_ID_PATTERN.test(value);
 }
@@ -90,7 +159,7 @@ export function isModuleCgroupDirectoryName(
   value: unknown,
   processGenerationId: string,
 ): value is string {
-  if (typeof value !== "string" || !isProcessGenerationId(processGenerationId)) return false;
+  if (typeof value !== "string" || !isModuleProcessGenerationId(processGenerationId)) return false;
   const prefix = `${MODULE_CGROUP_NAME_PREFIX}${processGenerationId}-`;
   return (
     value.startsWith(prefix) && IDENTITY_DIGEST_PATTERN.test(value.slice(prefix.length))

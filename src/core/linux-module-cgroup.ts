@@ -52,9 +52,11 @@ import { REQUIRED_CGROUP_CONTROLLERS } from "./linux-core-service-binding.js";
 import {
   CGROUP_V2_MOUNT_POINT,
   PROCESS_GENERATION_ID_RULE,
+  VERSION19_PROCESS_GENERATION_ID_RULE,
   isAbsoluteCgroupPath,
   isDerivedModuleCgroupPath,
   isLinuxBootId,
+  isModuleProcessGenerationId,
   isProcessGenerationId,
 } from "./linux-identifier-formats.js";
 import {
@@ -294,10 +296,10 @@ export function deriveModuleCgroupPath(
       );
     }
   }
-  if (!isProcessGenerationId(identity.processGenerationId)) {
+  if (!isModuleProcessGenerationId(identity.processGenerationId)) {
     throw new ModuleCgroupError(
       "MODULE_CGROUP_IDENTITY_INVALID",
-      `processGenerationId ${JSON.stringify(identity.processGenerationId)} is not usable as a control-group directory name; ${PROCESS_GENERATION_ID_RULE}`,
+      `processGenerationId ${JSON.stringify(identity.processGenerationId)} is not usable as a control-group directory name; ${PROCESS_GENERATION_ID_RULE}, or ${VERSION19_PROCESS_GENERATION_ID_RULE}`,
     );
   }
   const directoryName = identityBoundModuleCgroupDirectoryName(identity);
