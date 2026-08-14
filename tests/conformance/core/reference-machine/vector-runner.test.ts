@@ -9,6 +9,8 @@ const SPEC_ROOT = path.resolve(import.meta.dirname, "../../../../dolly-spec");
 const VECTOR_ROOT = path.join(SPEC_ROOT, "test-vectors", "core");
 const FIXTURE_ROOT = path.join(SPEC_ROOT, "test-vectors", "fixtures");
 const FENCE = `sha256:${"f".repeat(64)}`;
+// Host-owned test-environment state; replay evidence cannot define its own authority scope.
+const ACTIVATION_LEDGER_STORAGE_SCOPE_ID = "0198ab31-6c44-7e8a-b2bb-000000000109";
 
 type RecordValue = Record<string, unknown>;
 interface Assertion { path: string; op: "equals" | "not_equals" | "contains" | "count" | "absent" | "unchanged"; value?: unknown }
@@ -318,7 +320,7 @@ function execute(vector: FrozenVector): ScenarioResult {
             manifest_digest: initialCase.manifest_digest as JsonValue,
             frozen_replay_contract: initialCase.frozen_replay_contract as JsonValue,
             module_id: text(initialCase.module_id, "module_id"),
-            storage_scope_id: text(evidenceRecord.storage_scope_id, "storage_scope_id"),
+            storage_scope_id: ACTIVATION_LEDGER_STORAGE_SCOPE_ID,
           },
         };
         state.leases.l = {
@@ -330,7 +332,11 @@ function execute(vector: FrozenVector): ScenarioResult {
           manifest_digest: initialCase.manifest_digest as JsonValue,
         };
         state.subscriptions.s = { cursor: integer(initialCase.cursor, "cursor") };
-        const begun = transition(state, { type: "BeginFence", command_id: `${caseName}-begin`, activation_id: activationId }); const evidenceDigest = text(recordCommand.expected_evidence_digest, "expected_evidence_digest"); const ledgerState = text(evidenceRecord.ledger_state, "ledger_state");
+        const begun = transition(state, { type: "BeginFence", command_id: `${caseName}-begin`, activation_id: activationId });
+        const expectedEvidenceDigest = text(recordCommand.expected_evidence_digest, "expected_evidence_digest");
+        const evidenceDigest = canonicalJsonDigest(evidenceRecord as JsonObject);
+        if (evidenceDigest !== expectedEvidenceDigest) throw new Error(`${caseName} evidence digest does not match its record`);
+        const ledgerState = text(evidenceRecord.ledger_state, "ledger_state");
         const recorded = transition(begun.state, { type: "RecordReplayEvidence", command_id: `${caseName}-record`, activation_id: activationId }, { host_replay_evidence: { verified: true, activation_id: activationId, source_attempt: 1, target_generation: Number(evidenceRecord.target_extension_generation), observation: ledgerState === "complete" ? "succeeded" : "unknown", record: evidenceRecord as JsonObject, digest: evidenceDigest } });
         const completeCommand = commands[2]!; const proofDigest = text(completeCommand.host_fence_evidence_digest, "host_fence_evidence_digest"); const completed = transition(recorded.state, { type: "FenceComplete", command_id: `${caseName}-complete`, activation_id: activationId, retry_delay: Number(completeCommand.retry_jitter_ms ?? 0) }, { host_fence_verification: { verified: true, activation_id: activationId, source_attempt: 1, execution_slot_empty: true, proof_digest: proofDigest } });
         const item = completed.state.activations[activationId]!; const authorization = item.next_attempt_authorization; observed[caseName] = { activation: { state: item.state, next_attempt_authorization: authorization && { authorized_attempt: authorization.authorized_attempt, source_attempt: authorization.source_attempt, reason: authorization.reason, evidence_digest: authorization.evidence_digest }, last_dispatch: { state: completed.state.leases.l?.dispatch_state, fence_evidence_digest: completed.state.leases.l?.fence_evidence_digest }, retry_delay_ms: item.retry_delay }, subscription: { cursor: completed.state.subscriptions.s?.cursor }, quarantine: completed.state.quarantines[activationId] };

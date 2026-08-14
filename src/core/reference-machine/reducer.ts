@@ -403,6 +403,11 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
       const item = activation(next, command.activation_id);
       if (!item || item.state !== "result_staged" || !item.staged_result) return failure(state, "ACTIVATION_RESULT_NOT_STAGED");
       const staged = item.staged_result;
+      for (const expected of Object.values(staged.expected_cursors)) {
+        if (!Number.isSafeInteger(expected) || expected < 0 || expected >= Number.MAX_SAFE_INTEGER) {
+          return failure(state, "ACTIVATION_INVALID_RESULT");
+        }
+      }
       for (const pages of Object.values(staged.admitted_pages)) {
         for (const page of pages) {
           if (!Number.isSafeInteger(page.page_seq) || page.page_seq < 0 || page.page_seq >= Number.MAX_SAFE_INTEGER) {

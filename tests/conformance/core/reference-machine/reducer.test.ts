@@ -412,10 +412,9 @@ describe("Core reference abstract machine", () => {
     expect(page.error?.code).toBe("PAGE_SEQUENCE_INVALID");
     expect(page.state_hash).toBe(hashCoreState(pageState));
 
-    const cursorPayload: JsonObject = { expected_cursors: { s: Number.MAX_SAFE_INTEGER }, admitted_pages: {}, outputs: [], projected_admission_entries: 0 };
-    const cursorDigest = canonicalJsonDigest(cursorPayload);
-    const cursorState = leasedState("dispatched");
-    const cursor = run(cursorState, { type: "ReceiveResult", command_id: "cursor", activation_id: "a", lease_id: "l", status: "success", result_digest: cursorDigest, result: cursorPayload }, { host_result_verification: resultVerification(cursorDigest) });
+    const cursorState = stagedState({ expected_cursors: { s: Number.MAX_SAFE_INTEGER }, admitted_pages: {}, outputs: [], projected_admission_entries: 0 });
+    cursorState.subscriptions.s = { cursor: Number.MAX_SAFE_INTEGER };
+    const cursor = run(cursorState, { type: "ApplyResult", command_id: "cursor", activation_id: "a" });
     expect(cursor.error?.code).toBe("ACTIVATION_INVALID_RESULT");
     expect(cursor.state_hash).toBe(hashCoreState(cursorState));
 
