@@ -1367,12 +1367,113 @@ fn execute(vector: &Value) -> (Value, Value, String, Vec<Value>) {
                 issued.events.iter().map(flatten).collect(),
             )
         }
+        "TST-CORE-018" => {
+            let mut state = empty_core_snapshot();
+            state.activations.insert(
+                "a".into(),
+                ActivationRecord {
+                    state: ActivationState::Ready,
+                    attempt: initial["activation"]["attempt"].as_i64().unwrap_or(0),
+                    ..Default::default()
+                },
+            );
+            state.generations = initial["generations"].as_array().unwrap().clone();
+            let result = run(
+                &state,
+                CoreCommand::IssueLease(IssueLeaseCommand {
+                    command_id: stimulus["command_id"].as_str().unwrap().into(),
+                    activation_id: "a".into(),
+                    lease_id: stimulus["lease_id"].as_str().unwrap().into(),
+                    token_digest: stimulus["token_digest"].as_str().unwrap().into(),
+                    extension_connection_id: stimulus["extension_connection_id"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                    worker_epoch: stimulus["worker_epoch"].as_i64().unwrap(),
+                    extension_generation: stimulus["extension_generation"].as_i64(),
+                }),
+                |_| {},
+            );
+            (
+                json!({
+                    "activation": {"state": result.state.activations["a"].state, "attempt": result.state.activations["a"].attempt},
+                    "error_code": result.error.as_ref().map(|error| Value::String(error.code.clone())).unwrap_or(Value::Null),
+                }),
+                json!({}),
+                if result.error.as_ref().is_some_and(|error| error.code == "CORE_STATE_GENERATION_INVALID") {
+                    "malformed_pool_generation_refused"
+                } else {
+                    "unexpected"
+                }
+                .into(),
+                result.events.iter().map(flatten).collect(),
+            )
+        }
+        "TST-CORE-019" => {
+            let id = initial["activation"]["activation_id"].as_str().unwrap();
+            let lease_id = stimulus["lease_id"].as_str().unwrap();
+            let mut state = empty_core_snapshot();
+            state.activations.insert(
+                id.into(),
+                ActivationRecord {
+                    state: ActivationState::Dispatched,
+                    attempt: initial["activation"]["attempt"].as_i64().unwrap(),
+                    ..Default::default()
+                },
+            );
+            state.leases.insert(lease_id.into(), initial["lease"].clone());
+            let result_digest = initial["proof"]["result_digest"].as_str().unwrap();
+            let result = run(
+                &state,
+                CoreCommand::ReceiveResult(ReceiveResultCommand {
+                    command_id: stimulus["command_id"].as_str().unwrap().into(),
+                    activation_id: id.into(),
+                    lease_id: lease_id.into(),
+                    result_digest: result_digest.into(),
+                    status: ReceiveResultStatus::Success,
+                    result: None,
+                }),
+                |input| {
+                    input.host_result_verification = Some(HostResultVerification {
+                        verified: true,
+                        payload_valid: true,
+                        activation_id: id.into(),
+                        lease_id: lease_id.into(),
+                        token_digest: initial["proof"]["token_digest"].as_str().unwrap().into(),
+                        attempt: initial["proof"]["attempt"].as_i64().unwrap(),
+                        extension_connection_id: initial["proof"]["extension_connection_id"]
+                            .as_str()
+                            .unwrap()
+                            .into(),
+                        worker_epoch: initial["proof"]["worker_epoch"].as_i64().unwrap(),
+                        extension_generation: None,
+                        manifest_digest: None,
+                        result_digest: result_digest.into(),
+                    });
+                },
+            );
+            (
+                json!({
+                    "lease": result.state.leases[lease_id],
+                    "activation": {"state": result.state.activations[id].state},
+                    "error_code": result.error.as_ref().map(|error| Value::String(error.code.clone())).unwrap_or(Value::Null),
+                }),
+                json!({}),
+                if result.error.as_ref().is_some_and(|error| error.code == "ACTIVATION_FENCE_INVALID") {
+                    "malformed_lease_generation_binding_refused"
+                } else {
+                    "unexpected"
+                }
+                .into(),
+                result.events.iter().map(flatten).collect(),
+            )
+        }
         other => panic!("unmapped immutable vector {other}"),
     }
 }
 
 #[test]
-fn executes_all_seventeen_immutable_core_vectors() {
+fn executes_all_nineteen_immutable_core_vectors() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -1404,7 +1505,7 @@ fn executes_all_seventeen_immutable_core_vectors() {
             })
         })
         .collect();
-    assert_eq!(vectors.len(), 17);
+    assert_eq!(vectors.len(), 19);
     for (index, vector) in vectors.iter().enumerate() {
         assert_eq!(vector["test_id"], format!("TST-CORE-{:03}", index + 1));
         let (observed, before, outcome, emitted) = execute(vector);

@@ -1,0 +1,56 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-019",
+  "kind": "core_transition",
+  "covers": [
+    "INV-ACTIVATION-002"
+  ],
+  "initial": {
+    "activation": {
+      "activation_id": "a",
+      "state": "dispatched",
+      "attempt": 1
+    },
+    "lease": {
+      "activation_id": "a",
+      "token_digest": "token",
+      "extension_connection_id": "connection-1",
+      "worker_epoch": 1,
+      "attempt": 1,
+      "dispatch_state": "started",
+      "extension_generation": "8"
+    },
+    "proof": {
+      "verified": true,
+      "payload_valid": true,
+      "token_digest": "token",
+      "extension_connection_id": "connection-1",
+      "attempt": 1,
+      "worker_epoch": 1,
+      "result_digest": "digest"
+    }
+  },
+  "stimulus": {
+    "command_id": "receive",
+    "activation_id": "a",
+    "lease_id": "l",
+    "result_digest": "digest"
+  },
+  "expected": {
+    "outcome": "malformed_lease_generation_binding_refused",
+    "assertions": [
+      {
+        "path": "/error_code",
+        "op": "equals",
+        "value": "ACTIVATION_FENCE_INVALID"
+      },
+      {
+        "path": "/activation/state",
+        "op": "equals",
+        "value": "dispatched"
+      }
+    ],
+    "emitted": [],
+    "crash_label": null
+  }
+}
