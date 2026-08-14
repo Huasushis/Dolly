@@ -3,18 +3,29 @@
 //! `dolly-spec/docs/spec/extensions/filter-two-thirds.md` (§3).
 //!
 //! This crate implements ONLY the arithmetic exercised by the authoritative
-//! `TST-FILTER-001`, `TST-FILTER-003`, `TST-FILTER-004`, and `TST-FILTER-006`
-//! vectors: checked integer half-even smoothing (`A`, `Z`), bias correction,
-//! the mandatory saturation clamp, division-free two-thirds cohort selection
-//! with a JCS UTF-8 tie-break, ordered per-source block application with
-//! explicit malformed-signal rejection and latest-eligible content selection
-//! for projectable Blocks, and the ordered decision-state replay that derives
-//! `after_state` from `before_state` and the applied observations and requires
-//! it to equal the claimed `after_state`. It contains no Extension scaffolding,
-//! durable state, projection, activation ledger, provider, or runtime
-//! dependency; floating point is non-conforming and is never used.
+//! `TST-FILTER-001`, `TST-FILTER-003`, `TST-FILTER-004`, `TST-FILTER-005`,
+//! and `TST-FILTER-006` vectors: checked integer half-even smoothing (`A`,
+//! `Z`), bias correction, the mandatory saturation clamp, division-free
+//! two-thirds cohort selection with a JCS UTF-8 tie-break, ordered per-source
+//! block application with explicit malformed-signal rejection and
+//! latest-eligible content selection for projectable Blocks, the ordered
+//! decision-state replay that derives `after_state` from `before_state` and
+//! the applied observations and requires it to equal the claimed
+//! `after_state`, and the pure state-header prepare/restart transitions that
+//! freeze the algorithm revision, internal scale, and bias correction of a
+//! populated channel (spec §6). The state-header surface is transition-only:
+//! no codec, file, or storage boundary and no epoch authority, so nothing
+//! here is durable. This crate contains no Extension scaffolding, durable
+//! state, projection, activation ledger, provider, or runtime dependency;
+//! floating point is non-conforming and is never used.
 
 use dolly_canonical_json::canonicalize;
+
+mod state_header;
+
+pub use state_header::{
+    EpochMode, FilterStateHeader, FilterStateHeaderError, prepare_config, restart,
+};
 
 /// The fixed internal scale `W = 1,000,000` (spec §3).
 pub const SCALE: u64 = 1_000_000;

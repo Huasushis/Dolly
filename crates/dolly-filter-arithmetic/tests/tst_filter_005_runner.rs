@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use dolly_filter_arithmetic::state_header::{
+use dolly_filter_arithmetic::{
     EpochMode, FilterStateHeader, FilterStateHeaderError, prepare_config, restart,
 };
 use serde_json::{Map, Value, json};
@@ -56,7 +56,15 @@ fn read_vector(name: &str) -> Value {
 fn navigate<'a>(value: &'a Value, path: &str) -> &'a Value {
     let mut current = value;
     for segment in path.trim_start_matches('/').split('/') {
-        current = &current[segment];
+        current = match current {
+            Value::Array(array) => match segment.parse::<usize>() {
+                Ok(index) => array
+                    .get(index)
+                    .unwrap_or_else(|| panic!("array index {index} out of bounds at {path}")),
+                Err(_) => panic!("non-numeric segment {segment} on array at {path}"),
+            },
+            _ => &current[segment],
+        };
     }
     current
 }
@@ -71,8 +79,7 @@ fn check_assertions(result: &Value, vector: &Value) {
         let op = assertion["op"].as_str().expect("assertion op");
         match op {
             "equals" => assert_eq!(
-                actual,
-                &assertion["value"],
+                actual, &assertion["value"],
                 "TST-FILTER assertion failed at {path}"
             ),
             "count" => {
@@ -83,10 +90,7 @@ fn check_assertions(result: &Value, vector: &Value) {
                     .as_array()
                     .unwrap_or_else(|| panic!("count op requires an array at {path}"))
                     .len() as u64;
-                assert_eq!(
-                    count, expected,
-                    "TST-FILTER assertion failed at {path}"
-                );
+                assert_eq!(count, expected, "TST-FILTER assertion failed at {path}");
             }
             other => panic!("unsupported assertion op {other}"),
         }
@@ -125,7 +129,9 @@ fn evaluate_tst_filter_005(vector: &Value) -> Evaluated {
         header_json["algorithm_revision"]
             .as_str()
             .expect("algorithm_revision"),
-        header_json["internal_scale"].as_u64().expect("internal_scale"),
+        header_json["internal_scale"]
+            .as_u64()
+            .expect("internal_scale"),
         header_json["bias_correction"]
             .as_bool()
             .expect("bias_correction"),
@@ -161,10 +167,7 @@ fn evaluate_tst_filter_005(vector: &Value) -> Evaluated {
                 match prepare_config(&header, bias_correction, epoch) {
                     Ok(next) => {
                         header = next;
-                        entry.insert(
-                            "outcome".to_string(),
-                            json!("fresh_state_epoch_prepared"),
-                        );
+                        entry.insert("outcome".to_string(), json!("fresh_state_epoch_prepared"));
                         entry.insert(
                             "inherited_observation_count".to_string(),
                             json!(header.observation_count()),
@@ -173,7 +176,7 @@ fn evaluate_tst_filter_005(vector: &Value) -> Evaluated {
                     Err(FilterStateHeaderError::Conflict) => {
                         entry.insert(
                             "error".to_string(),
-                            json!("FILTER_STATE_HEADER_CONFLICT"),
+                            json!(FilterStateHeaderError::Conflict.wire_code().unwrap()),
                         );
                         entry.insert("state_mutations".to_string(), Value::Array(Vec::new()));
                     }
@@ -196,10 +199,8 @@ fn evaluate_tst_filter_005(vector: &Value) -> Evaluated {
                         "algorithm_revision".to_string(),
                         json!(header.algorithm_revision()),
                     );
-                    state_header.insert(
-                        "internal_scale".to_string(),
-                        json!(header.internal_scale()),
-                    );
+                    state_header
+                        .insert("internal_scale".to_string(), json!(header.internal_scale()));
                     entry.insert("state_header".to_string(), Value::Object(state_header));
                     entry.insert(
                         "storage_scope_id".to_string(),
@@ -210,7 +211,7 @@ fn evaluate_tst_filter_005(vector: &Value) -> Evaluated {
                 Err(FilterStateHeaderError::Conflict) => {
                     entry.insert(
                         "error".to_string(),
-                        json!("FILTER_STATE_HEADER_CONFLICT"),
+                        json!(FilterStateHeaderError::Conflict.wire_code().unwrap()),
                     );
                     entry.insert("state_mutations".to_string(), Value::Array(Vec::new()));
                 }
