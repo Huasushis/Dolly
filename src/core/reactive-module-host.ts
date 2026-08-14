@@ -17,7 +17,11 @@ import {
   validateDollyInstanceConfig,
   type DollyInstanceConfig,
 } from "./runtime-config.js";
-import { deriveDollyInstanceV10SchedulerPlan } from "./runtime-config-v10.js";
+import {
+  deriveDollyInstanceV10SchedulerPlan,
+  type DollyModuleMailboxLimitsV10,
+} from "./runtime-config-v10.js";
+import type { DeliveryMailboxCapacity } from "./delivery-store.js";
 import type { ReactiveModuleRecoveryResult } from "./reactive-module-runtime.js";
 import {
   resolveSourceActivationSchedulerBinding,
@@ -263,6 +267,35 @@ export function composeReactiveModuleHost(
     onEvent: input.onSchedulerEvent,
   });
   return new ReactiveModuleHost(scheduler, hostRegistrations);
+}
+
+export interface ReservedV10ModuleMailboxCapacityInput {
+  readonly moduleId: string;
+  readonly inputPageIds: readonly string[];
+  readonly mailbox: DollyModuleMailboxLimitsV10;
+}
+
+/**
+ * Deterministically projects one reserved version-10 module plan into the
+ * exact Delivery mailbox capacities the result-commit coordinator requires:
+ * one capacity per Module consumer, naming exactly the Pages the Module
+ * subscribes to, with the limits already validated by the complete
+ * version-10 document. The document validation also checks that every
+ * consumer mailbox can hold one maximum durable Block per subscribed output
+ * route; commit-time projection in the Delivery store repeats the check
+ * against the actual committed Block bytes.
+ */
+export function deriveReservedV10ModuleMailboxCapacities(
+  modules: readonly ReservedV10ModuleMailboxCapacityInput[],
+): readonly DeliveryMailboxCapacity[] {
+  return modules.map((module) =>
+    Object.freeze({
+      consumerId: module.moduleId,
+      pageIds: Object.freeze([...module.inputPageIds].sort()),
+      maxResidentCount: module.mailbox.maxResidentCount,
+      maxResidentBytes: module.mailbox.maxResidentBytes,
+    }),
+  );
 }
 
 /**

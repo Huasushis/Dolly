@@ -3,7 +3,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type BlockProposal } from "../../../src/core/block-store.js";
-import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
+import type { DeliveryMailboxCapacity } from "../../../src/core/delivery-store.js";
+import { canonicalJsonDigest, type JsonValue } from "../../../src/core/canonical-json.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
@@ -15,7 +16,10 @@ import {
   type ModuleResultCommitInput,
   type ModuleResultCommitRepository,
 } from "../../../src/core/module-result-commit.js";
+import { deriveReservedV10ModuleMailboxCapacities } from "../../../src/core/reactive-module-host.js";
 import { ReactiveModuleRuntime } from "../../../src/core/reactive-module-runtime.js";
+import { createDefaultDollyInstanceConfig } from "../../../src/core/runtime-config.js";
+import { deriveDollyInstanceV10SchedulerPlan } from "../../../src/core/runtime-config-v10.js";
 
 const NOW = "2026-08-09T00:00:00.000Z";
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -987,5 +991,269 @@ describe("FileCore Module output capacity", () => {
     expect(forward.recoveredModuleJobId).toBe(forward.sortedModuleJobIds[0]);
     expect(reverse.recoveredModuleJobId).toBe(reverse.sortedModuleJobIds[0]);
     expect(reverse.recoveredModuleJobId).toBe(forward.recoveredModuleJobId);
+  });
+});
+
+const V10_INSTANCE_ID = "44444444-4444-4444-8444-444444444444";
+
+function v10Scheduler(): Record<string, JsonValue> {
+  return {
+    pollIntervalMs: 100,
+    retryBaseMs: 250,
+    retryMaxMs: 30_000,
+    maxConcurrentModules: 4,
+    backpressureAction: "pause-upstream",
+    downstreamRecheckMs: 100,
+    noProgressAfterMs: 5_000,
+    retryJitterBasisPoints: 0,
+    lowWatermarkBasisPoints: 10_000,
+    policy: { kind: "fixed" },
+    policyFailureAction: "quarantine",
+  };
+}
+
+function v10Execution(): Record<string, JsonValue> {
+  return {
+    kind: "linux-process",
+    isolation: "process",
+    limits: {
+      memoryMaxBytes: 64 * 1024 * 1024,
+      maxTasks: 32,
+      cpuQuotaMicros: 100_000,
+      cpuPeriodMicros: 100_000,
+      maxOpenFiles: 128,
+    },
+  };
+}
+
+function v10SelfLoopDocument(
+  mailbox: { maxResidentCount: number; maxResidentBytes: number },
+): Record<string, JsonValue> {
+  const version9 = createDefaultDollyInstanceConfig(V10_INSTANCE_ID);
+  return {
+    schemaVersion: "dolly.instance/10",
+    instanceId: V10_INSTANCE_ID,
+    displayName: "reserved v10 mailbox capacity fixture",
+    stateDirectory: null,
+    core: {
+      limits: {
+        ...version9.core.limits,
+        maxRegisteredContentValueBytes: 64 * 1024,
+      },
+      media: version9.core.media,
+      scheduler: v10Scheduler(),
+    },
+    pages: [{ pageId: "loop-a" }, { pageId: "loop-b" }],
+    modules: [{
+      moduleId: "loop",
+      extensionId: "org.example.loop",
+      packageVersion: "1.0.0",
+      moduleKind: "transform",
+      configurationReference: {
+        configId: "loop-default",
+        revision: `sha256:${"1".repeat(64)}`,
+        configVersion: 1,
+      },
+      permissionPolicyReferences: [],
+      inputConnections: [
+        { pageId: "loop-a", start: { checkpoint: "0" } },
+        { pageId: "loop-b", start: { checkpoint: "0" } },
+      ],
+      outputPageIds: ["loop-a", "loop-b"],
+      activation: { kind: "reactive" },
+      declaredExternalEffects: "none",
+      execution: v10Execution(),
+      limits: {
+        claim: { baselineCount: 1, baselineBytes: 1024, maxCount: 1, maxBytes: 4096 },
+        mailbox,
+        sourceRequestMaxBytes: null,
+        maxInputBytes: 4096,
+        maxResultBytes: 4096,
+        maxFrameBytes: 8192,
+        maxRunsPerGeneration: 100,
+        maxGenerations: 10,
+      },
+      timeouts: {
+        initializationTimeoutMs: 10_000,
+        executionTimeoutMs: 30_000,
+        cancellationGraceMs: 1_000,
+        terminationTimeoutMs: 2_000,
+      },
+    }],
+    logging: version9.logging,
+  };
+}
+
+function v10SelfLoopMailboxCapacities(): readonly DeliveryMailboxCapacity[] {
+  const maxStateBytes = Number(
+    createDefaultDollyInstanceConfig(V10_INSTANCE_ID).core.limits.maxStateBytes,
+  );
+  const plan = deriveDollyInstanceV10SchedulerPlan(v10SelfLoopDocument({
+    maxResidentCount: 2,
+    maxResidentBytes: 2 * maxStateBytes,
+  }));
+  return deriveReservedV10ModuleMailboxCapacities(plan.modules);
+}
+
+function setupReservedV10SelfLoop(
+  core: FileCoreStateStore,
+  residentBlocks = 0,
+): ModuleResultCommitInput {
+  for (const pageId of ["loop-a", "loop-b"]) {
+    core.deliveries.createPage(pageId);
+    core.deliveries.registerConsumer(pageId, "loop", "from-now");
+  }
+  const inputBlock = core.blocks.commit(proposal("reserved v10 input"), {
+    kind: "external",
+    id: "console",
+  });
+  core.deliveries.append("loop-a", inputBlock.id);
+  for (let index = 0; index < residentBlocks; index += 1) {
+    const extra = core.blocks.commit(proposal(`reserved v10 resident ${index}`), {
+      kind: "external",
+      id: "console",
+    });
+    core.deliveries.append("loop-a", extra.id);
+  }
+  const claim = core.deliveries.claim({
+    consumerId: "loop",
+    pageIds: ["loop-a", "loop-b"],
+    moduleGenerationId: "loop-generation",
+    maxCount: 1,
+    maxBytes: 1024 * 1024,
+  })!;
+  persistSubmittedClaim(core, "loop", claim);
+  return {
+    ...claim,
+    source: { kind: "module", id: "loop" },
+    outputPageIds: ["loop-a", "loop-b"],
+    blockProposal: proposal("reserved v10 output"),
+  };
+}
+
+describe("reserved v10 mailbox capacities through the result-commit coordinator", () => {
+  it("rejects every output commit when the coordinator gets the current empty mailbox set", async () => {
+    const root = scratch("capacity-reserved-v10-empty");
+    const core = openCore(join(root, "core-state.json"), "v10-empty");
+    const input = setupReservedV10SelfLoop(core);
+    const commits = createModuleResultCommitCoordinator({
+      core,
+      repository: new InMemoryModuleResultCommitRepository(),
+      now: () => NOW,
+      mailboxes: [],
+    });
+
+    const error = await commits.commit(input).then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    expect(error).toMatchObject({ code: "OUTPUT_CAPACITY_INVALID" });
+    expect(String(error instanceof Error ? error.message : "")).toMatch(
+      /no mailbox capacity/u,
+    );
+  });
+
+  it("commits output with capacities derived from the reserved v10 plan", async () => {
+    const root = scratch("capacity-reserved-v10-derived");
+    const core = openCore(join(root, "core-state.json"), "v10-derived");
+    const input = setupReservedV10SelfLoop(core);
+    const maxStateBytes = Number(
+      createDefaultDollyInstanceConfig(V10_INSTANCE_ID).core.limits.maxStateBytes,
+    );
+    const mailboxes = v10SelfLoopMailboxCapacities();
+    expect(mailboxes).toEqual([{
+      consumerId: "loop",
+      pageIds: ["loop-a", "loop-b"],
+      maxResidentCount: 2,
+      maxResidentBytes: 2 * maxStateBytes,
+    }]);
+    const repository = new InMemoryModuleResultCommitRepository();
+    const commits = createModuleResultCommitCoordinator({
+      core,
+      repository,
+      now: () => NOW,
+      mailboxes,
+    });
+
+    await expect(commits.commit(input)).resolves.toMatchObject({
+      state: "committed",
+      outputDeliveries: [
+        expect.objectContaining({ pageId: "loop-a" }),
+        expect.objectContaining({ pageId: "loop-b" }),
+      ],
+    });
+    expect(repository.get(input.moduleJobId)).toMatchObject({ state: "committed" });
+  });
+
+  it("distinguishes invalid capacity from ordinary output backpressure", async () => {
+    const invalidRoot = scratch("capacity-reserved-v10-invalid");
+    const invalidCore = openCore(join(invalidRoot, "core-state.json"), "v10-invalid");
+    const invalidInput = setupReservedV10SelfLoop(invalidCore);
+    invalidCore.deliveries.createPage("extra");
+    invalidCore.deliveries.registerConsumer("extra", "loop", "from-now");
+    const invalidCommits = createModuleResultCommitCoordinator({
+      core: invalidCore,
+      repository: new InMemoryModuleResultCommitRepository(),
+      now: () => NOW,
+      mailboxes: v10SelfLoopMailboxCapacities(),
+    });
+    const invalidError = await invalidCommits.commit(invalidInput).then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    expect(invalidError).toMatchObject({ code: "OUTPUT_CAPACITY_INVALID" });
+    expect(String(invalidError instanceof Error ? invalidError.message : "")).toMatch(
+      /must name every subscribed Page/u,
+    );
+
+    const blockedRoot = scratch("capacity-reserved-v10-blocked");
+    const blockedCore = openCore(join(blockedRoot, "core-state.json"), "v10-blocked");
+    const blockedInput = setupReservedV10SelfLoop(blockedCore, 4);
+    const blockedCommits = createModuleResultCommitCoordinator({
+      core: blockedCore,
+      repository: new InMemoryModuleResultCommitRepository(),
+      now: () => NOW,
+      mailboxes: v10SelfLoopMailboxCapacities(),
+    });
+    await expect(blockedCommits.commit(blockedInput)).rejects.toMatchObject({
+      code: "MODULE_RESULT_OUTPUT_BACKPRESSURED",
+      blockedConsumerIds: ["loop"],
+    });
+  });
+
+  it("recovers persisted output with the same derived capacities", async () => {
+    const root = scratch("capacity-reserved-v10-recovery");
+    const statePath = join(root, "core-state.json");
+    const journalPath = join(root, "module-result-commits.json");
+    const mailboxes = v10SelfLoopMailboxCapacities();
+    const first = openCore(statePath, "v10-recovery");
+    const input = setupReservedV10SelfLoop(first);
+    const repository = new FileModuleResultCommitRepository({
+      path: journalPath,
+      maxBytes: 16 * 1024 * 1024,
+    });
+    const commits = createModuleResultCommitCoordinator({
+      core: first,
+      repository,
+      now: () => NOW,
+      mailboxes,
+    });
+    await expect(commits.commit(input)).resolves.toMatchObject({ state: "committed" });
+
+    const reopened = openCore(statePath, "v10-recovery-reopened");
+    const reopenedRepository = new FileModuleResultCommitRepository({
+      path: journalPath,
+      maxBytes: 16 * 1024 * 1024,
+    });
+    const recovering = createModuleResultCommitCoordinator({
+      core: reopened,
+      repository: reopenedRepository,
+      now: () => NOW,
+      mailboxes,
+    });
+    await expect(recovering.recoverAll()).resolves.toMatchObject({ recoveredCommits: [] });
+    expect(reopenedRepository.get(input.moduleJobId)).toMatchObject({ state: "committed" });
+    expect(reopened.deliveries.inspectResident("loop", ["loop-a", "loop-b"]))
+      .toMatchObject({ residentCount: 2 });
   });
 });
