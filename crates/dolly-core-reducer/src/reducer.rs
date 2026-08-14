@@ -793,9 +793,7 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                         == Some(c.extension_connection_id.as_str())
                     && object_i64(existing, "worker_epoch") == Some(c.worker_epoch)
                     && object_i64(existing, "attempt") == Some(item.attempt)
-                    && c.extension_generation.is_none_or(|generation| {
-                        object_i64(existing, "extension_generation") == Some(generation)
-                    });
+                    && c.extension_generation == object_i64(existing, "extension_generation");
                 if !exact {
                     return failure(
                         state,
