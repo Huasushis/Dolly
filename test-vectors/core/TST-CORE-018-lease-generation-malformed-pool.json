@@ -1,0 +1,46 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-CORE-018",
+  "kind": "core_transition",
+  "covers": [
+    "INV-STORAGE-007"
+  ],
+  "initial": {
+    "activation": {
+      "state": "ready",
+      "attempt": 0
+    },
+    "generations": [
+      {
+        "generation": "8",
+        "compatible": true
+      }
+    ]
+  },
+  "stimulus": {
+    "command_id": "lease-1",
+    "lease_id": "lease-1",
+    "activation_id": "a",
+    "token_digest": "token",
+    "extension_connection_id": "connection-1",
+    "worker_epoch": 1,
+    "extension_generation": 8
+  },
+  "expected": {
+    "outcome": "malformed_pool_generation_refused",
+    "assertions": [
+      {
+        "path": "/error_code",
+        "op": "equals",
+        "value": "CORE_STATE_GENERATION_INVALID"
+      },
+      {
+        "path": "/activation/state",
+        "op": "equals",
+        "value": "ready"
+      }
+    ],
+    "emitted": [],
+    "crash_label": null
+  }
+}

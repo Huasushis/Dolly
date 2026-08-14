@@ -446,6 +446,66 @@ function execute(vector: FrozenVector): ScenarioResult {
         emitted: issued.events.map(flattened),
       };
     }
+    case "TST-CORE-018": {
+      const activationInitial = object(initial.activation, "activation");
+      const state = emptyCoreSnapshot();
+      state.activations.a = { state: activationInitial.state === "retry_wait" ? "retry_wait" : "ready", attempt: integer(activationInitial.attempt, "attempt") };
+      state.generations = list(initial.generations, "generations").map((value) => object(value, "generation record")) as unknown as JsonObject[];
+      const issued = transition(state, {
+        type: "IssueLease",
+        command_id: text(stimulus.command_id, "command_id"),
+        activation_id: "a",
+        lease_id: text(stimulus.lease_id, "lease_id"),
+        token_digest: text(stimulus.token_digest, "token_digest"),
+        extension_connection_id: text(stimulus.extension_connection_id, "extension_connection_id"),
+        worker_epoch: integer(stimulus.worker_epoch, "worker_epoch"),
+        extension_generation: integer(stimulus.extension_generation, "extension_generation"),
+      });
+      return {
+        outcome: issued.error?.code === "CORE_STATE_GENERATION_INVALID" ? "malformed_pool_generation_refused" : "unexpected",
+        before: {},
+        observed: { error_code: issued.error?.code ?? null, activation: { state: issued.state.activations.a?.state, attempt: issued.state.activations.a?.attempt } },
+        emitted: issued.events.map(flattened),
+      };
+    }
+    case "TST-CORE-019": {
+      const activationInitial = object(initial.activation, "activation");
+      const leaseInitial = object(initial.lease, "lease");
+      const proof = object(initial.proof, "proof");
+      const activationId = text(activationInitial.activation_id, "activation_id");
+      const leaseId = text(stimulus.lease_id, "lease_id");
+      const resultDigest = text(proof.result_digest, "proof.result_digest");
+      const state = emptyCoreSnapshot();
+      state.activations[activationId] = { state: "dispatched", attempt: integer(activationInitial.attempt, "attempt") };
+      state.leases[leaseId] = { ...structuredClone(leaseInitial), activation_id: activationId } as JsonObject;
+      const received = transition(state, {
+        type: "ReceiveResult",
+        command_id: text(stimulus.command_id, "command_id"),
+        activation_id: activationId,
+        lease_id: leaseId,
+        status: "success",
+        result: undefined,
+        result_digest: resultDigest,
+      }, {
+        host_result_verification: {
+          verified: true,
+          payload_valid: true,
+          activation_id: activationId,
+          lease_id: leaseId,
+          token_digest: text(proof.token_digest, "proof.token_digest"),
+          extension_connection_id: text(proof.extension_connection_id, "proof.extension_connection_id"),
+          attempt: integer(proof.attempt, "proof.attempt"),
+          worker_epoch: integer(proof.worker_epoch, "proof.worker_epoch"),
+          result_digest: resultDigest,
+        },
+      });
+      return {
+        outcome: received.error?.code === "ACTIVATION_FENCE_INVALID" ? "malformed_lease_generation_binding_refused" : "unexpected",
+        before: {},
+        observed: { error_code: received.error?.code ?? null, lease: received.state.leases[leaseId], activation: { state: received.state.activations[activationId]?.state } },
+        emitted: received.events.map(flattened),
+      };
+    }
     default: throw new Error(`unmapped immutable vector ${vector.test_id}`);
   }
 }
@@ -458,8 +518,8 @@ const vectors = [...new Set([VECTOR_ROOT, OVERLAY_ROOT].flatMap((root) => readdi
   });
 
 describe("immutable Core vectors", () => {
-  it("executes exactly TST-CORE-001 through TST-CORE-017", () => {
-    expect(vectors.map((vector) => vector.test_id)).toEqual(Array.from({ length: 17 }, (_, index) => `TST-CORE-${String(index + 1).padStart(3, "0")}`));
+  it("executes exactly TST-CORE-001 through TST-CORE-019", () => {
+    expect(vectors.map((vector) => vector.test_id)).toEqual(Array.from({ length: 19 }, (_, index) => `TST-CORE-${String(index + 1).padStart(3, "0")}`));
   });
 
   for (const vector of vectors) {
