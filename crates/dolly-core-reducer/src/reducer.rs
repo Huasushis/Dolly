@@ -797,7 +797,7 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                         Some(generation) => {
                             object_i64(existing, "extension_generation") == Some(generation)
                         }
-                        None => object_i64(existing, "extension_generation").is_none(),
+                        None => existing.get("extension_generation").is_none(),
                     };
                 if !exact {
                     return failure(
