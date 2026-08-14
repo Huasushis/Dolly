@@ -1,23 +1,34 @@
 /**
- * Immutable configuration revisions and the deterministic migration runner.
+ * Immutable configuration revisions and the deterministic config-value
+ * migration runner (config-value revision/upgrade support).
  *
  * A configuration revision binds a content-addressed revision identity to a
  * frozen configuration snapshot together with the identity fields a Module
  * resolution checks before extension code starts
- * (`extension-process-protocol.md` Section 7.1.1). A `(configId, revision)`
- * pair is immutable: an edit creates a new revision, and the previous pair is
- * never overwritten.
+ * (`dolly-spec/docs/spec/extension-protocol/02-lifecycle-and-fencing.md`
+ * Sections 1 and 4). A `(configId, revision)` pair is immutable: an edit
+ * creates a new revision, and the previous pair is never overwritten.
  *
- * The migration runner implements the Section 7.2 contract for one-step
- * upgrade paths vN -> vN+1. It validates the stored snapshot against the
- * retained source-version schema, validates the result of every step against
- * the next version's schema before accepting it, and refuses a target version
- * that is not higher than the source or is not reachable through the
- * registered one-step paths and retained schemas.
+ * The runner implements the config-value side of the migration contract in
+ * `dolly-spec/docs/spec/extension-protocol/04-hot-reload-and-state-migration.md`
+ * Section 5, as part of the Section 6 generation-replacement preparation
+ * sequence: one-step upgrade paths vN -> vN+1, deterministic for identical
+ * input bytes and parameters, idempotent by migration operation id,
+ * output-size and expansion limited, and never mutating the source value. A
+ * step that drops, synthesizes, or semantically changes user data MUST declare
+ * its loss class and require the configured approval identity; silent lossy
+ * migration is refused.
+ *
+ * This module is deliberately NOT `module.migrate_state`: that is the
+ * Extension-side wire method (`01-wire-protocol.md`) that operates only on
+ * staged snapshot state under Host authority. This unit provides Host-side
+ * pure config-value revision/upgrade support only; Store, Host, snapshot, and
+ * startup wiring are out of scope here.
  */
 
 import {
   assertJsonValue,
+  canonicalJsonByteLength,
   canonicalJsonDigest,
   cloneJson,
   deepFreeze,
@@ -29,6 +40,26 @@ const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const DECIMAL_SEQUENCE_PATTERN = /^(0|[1-9][0-9]*)$/u;
 
+/**
+ * The closed set of loss classes a migration step can declare (spec Section 5):
+ * the transform drops user data, synthesizes values, or semantically changes
+ * user data. `none` declares the transform is lossless and never synthesizes.
+ */
+export type ConfigLossDeclaration = "none" | "value-loss" | "synthesis" | "semantic-change";
+
+const LOSS_DECLARATIONS: Readonly<Record<ConfigLossDeclaration, true>> = {
+  none: true,
+  "value-loss": true,
+  synthesis: true,
+  "semantic-change": true,
+};
+
+/**
+ * The default approval identity (spec Section 5 "configured approval class")
+ * that approves every loss-declaring step when supplied to `migrate`.
+ */
+export const DEFAULT_APPROVAL_CLASS = "config.migration.approval";
+
 export type ConfigRevisionErrorCode =
   | "CONFIG_REVISION_INVALID"
   | "CONFIG_MIGRATION_REFUSED"
@@ -36,7 +67,9 @@ export type ConfigRevisionErrorCode =
   | "CONFIG_MIGRATION_STEP_MISSING"
   | "CONFIG_TARGET_VERSION_UNSUPPORTED"
   | "CONFIG_MIGRATION_OUTPUT_INVALID"
-  | "CONFIG_MIGRATION_VALUE_INVALID";
+  | "CONFIG_MIGRATION_VALUE_INVALID"
+  | "CONFIG_MIGRATION_APPROVAL_REQUIRED"
+  | "CONFIG_MIGRATION_EXPANSION_LIMIT";
 
 export class ConfigRevisionError extends Error {
   constructor(
@@ -84,9 +117,18 @@ export interface ConfigMigrationOutput {
 /** A one-step, deterministic migration from version `fromVersion` to `fromVersion + 1`. */
 export type ConfigMigration = (source: JsonValue) => ConfigMigrationOutput;
 
+/**
+ * A registered one-step upgrade path. `operationId` is the stable identity a
+ * call chain is idempotent on (spec Section 5), `lossDeclaration` the closed
+ * loss class, and `approvalRequired` the spec-mandated approval gate for any
+ * step that is not declared `none`.
+ */
 export interface ConfigMigrationStep {
   readonly fromVersion: number;
   readonly toVersion: number;
+  readonly operationId: string;
+  readonly lossDeclaration: ConfigLossDeclaration;
+  readonly approvalRequired: boolean;
   readonly migrate: ConfigMigration;
 }
 
@@ -95,6 +137,23 @@ export interface ConfigMigrationResult {
   readonly revision: ConfigRevision;
   /** Warnings from every applied step, in application order. */
   readonly warnings: readonly string[];
+  /** The ordered operation ids this value has been migrated through. */
+  readonly appliedOperations: readonly string[];
+}
+
+export interface ConfigMigrationOptions {
+  /**
+   * Operation ids already applied to this value. Their steps skip the
+   * approval gate; each id MUST be part of the current migration path. This
+   * is what makes re-running an upgrade idempotent by operation id.
+   */
+  readonly alreadyApplied?: readonly string[];
+  /**
+   * Explicit approvals for the current run: step operation ids and/or the
+   * runner's configured approval class. A loss-declaring step with no
+   * matching approval is refused.
+   */
+  readonly approvals?: readonly string[];
 }
 
 export interface ConfigMigrationRunnerOptions {
@@ -105,12 +164,27 @@ export interface ConfigMigrationRunnerOptions {
   readonly schemas: Readonly<Record<number, JsonValue>>;
   /** The registered one-step migrations, keyed by their source version. */
   readonly migrations: readonly ConfigMigrationStep[];
+  /** Approval identity that approves every loss-declaring step when supplied. */
+  readonly approvalClass?: string;
+  /**
+   * Absolute cap on the canonical UTF-8 byte length of the migrated
+   * configuration (spec Section 5, output-size limit).
+   */
+  readonly maxOutputBytes?: number;
+  /**
+   * Cap on how many canonical UTF-8 bytes the migrated configuration may
+   * expand the source value by (spec Section 5, expansion limit).
+   */
+  readonly maxExpansionBytes?: number;
 }
 
 const MIGRATION_OUTPUT_KEYS: Readonly<Record<string, true>> = {
   configuration: true,
   warnings: true,
 };
+
+const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+const DEFAULT_MAX_EXPANSION_BYTES = 64 * 1024;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
@@ -127,12 +201,26 @@ function assertId(value: unknown, label: string): asserts value is string {
   }
 }
 
+function assertLossDeclaration(value: unknown, label: string): asserts value is ConfigLossDeclaration {
+  if (typeof value !== "string" || !LOSS_DECLARATIONS[value as ConfigLossDeclaration]) {
+    throw new TypeError(
+      `${label} must be one of: none, value-loss, synthesis, semantic-change`,
+    );
+  }
+}
+
 function assertConfigVersion(value: unknown): asserts value is number {
   if (!Number.isSafeInteger(value) || (value as number) <= 0) {
     throw new ConfigRevisionError(
       "CONFIG_REVISION_INVALID",
       "configVersion must be a positive safe integer",
     );
+  }
+}
+
+function assertPositiveByteLimit(value: unknown, label: string): asserts value is number {
+  if (!Number.isSafeInteger(value) || (value as number) <= 0) {
+    throw new TypeError(`${label} must be a positive safe integer`);
   }
 }
 
@@ -212,12 +300,16 @@ function parseMigrationOutput(value: unknown): ConfigMigrationOutput {
 /**
  * Applies deterministic one-step migrations to immutable configuration
  * revisions. The runner is side-effect free: `migrate` only reads its inputs
- * and returns a new revision, so equal inputs produce equal outputs.
+ * and returns a new revision, so equal inputs produce equal outputs, and the
+ * migration never runs against the sole active value (spec Section 5).
  */
 export class ConfigMigrationRunner {
   readonly #schemas: ReadonlyMap<number, JsonValue>;
   readonly #steps: ReadonlyMap<number, ConfigMigrationStep>;
   readonly #maxVersion: number;
+  readonly #approvalClass: string;
+  readonly #maxOutputBytes: number;
+  readonly #maxExpansionBytes: number;
 
   constructor(options: ConfigMigrationRunnerOptions) {
     const schemas = new Map<number, JsonValue>();
@@ -234,6 +326,7 @@ export class ConfigMigrationRunner {
     }
 
     const steps = new Map<number, ConfigMigrationStep>();
+    const seenOperationIds = new Set<string>();
     for (const step of options.migrations) {
       if (!Number.isSafeInteger(step.fromVersion) || step.fromVersion <= 0) {
         throw new TypeError("Migration fromVersion must be a positive safe integer");
@@ -243,6 +336,24 @@ export class ConfigMigrationRunner {
         step.toVersion !== step.fromVersion + 1
       ) {
         throw new TypeError("Migration toVersion must be exactly fromVersion + 1");
+      }
+      if (typeof step.operationId !== "string" || !ID_PATTERN.test(step.operationId)) {
+        throw new TypeError("Migration operationId must be a valid identifier");
+      }
+      if (seenOperationIds.has(step.operationId)) {
+        throw new TypeError(`Duplicate migration operation id ${step.operationId}`);
+      }
+      seenOperationIds.add(step.operationId);
+      assertLossDeclaration(step.lossDeclaration, "Migration lossDeclaration");
+      if (step.lossDeclaration !== "none" && !step.approvalRequired) {
+        throw new TypeError(
+          `Migration ${step.operationId} declares ${step.lossDeclaration} but does not require approval; silent lossy migration is forbidden`,
+        );
+      }
+      if (step.lossDeclaration === "none" && step.approvalRequired) {
+        throw new TypeError(
+          `Migration ${step.operationId} requires approval but declares no loss; a declared loss class is required for approval`,
+        );
       }
       if (typeof step.migrate !== "function") {
         throw new TypeError("Migration migrate must be a function");
@@ -261,9 +372,23 @@ export class ConfigMigrationRunner {
       if (step.toVersion > maxVersion) maxVersion = step.toVersion;
     }
 
+    if (
+      options.approvalClass !== undefined &&
+      (typeof options.approvalClass !== "string" || !ID_PATTERN.test(options.approvalClass))
+    ) {
+      throw new TypeError("approvalClass must be a valid identifier");
+    }
+    const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+    const maxExpansionBytes = options.maxExpansionBytes ?? DEFAULT_MAX_EXPANSION_BYTES;
+    assertPositiveByteLimit(maxOutputBytes, "maxOutputBytes");
+    assertPositiveByteLimit(maxExpansionBytes, "maxExpansionBytes");
+
     this.#schemas = schemas;
     this.#steps = steps;
     this.#maxVersion = maxVersion;
+    this.#approvalClass = options.approvalClass ?? DEFAULT_APPROVAL_CLASS;
+    this.#maxOutputBytes = maxOutputBytes;
+    this.#maxExpansionBytes = maxExpansionBytes;
   }
 
   /**
@@ -273,8 +398,20 @@ export class ConfigMigrationRunner {
    * paths and retained schemas. The whole chain is validated before any
    * migration runs, and every step result is validated against its target
    * schema before the next step is applied.
+   *
+   * Each step is idempotent by operation id: a step whose operationId is
+   * already present in `options.alreadyApplied` skips the approval gate, and
+   * any `alreadyApplied` operation that is not part of the current path is
+   * refused. A loss-declaring step that is not already applied and has no
+   * matching approval is refused with `CONFIG_MIGRATION_APPROVAL_REQUIRED`.
+   * The final configuration is additionally capped by the runner's canonical
+   * byte-size and expansion limits.
    */
-  migrate(source: ConfigRevision, targetVersion: number): ConfigMigrationResult {
+  migrate(
+    source: ConfigRevision,
+    targetVersion: number,
+    options: ConfigMigrationOptions = {},
+  ): ConfigMigrationResult {
     if (!Number.isSafeInteger(targetVersion) || targetVersion <= 0) {
       throw new ConfigRevisionError(
         "CONFIG_TARGET_VERSION_UNSUPPORTED",
@@ -287,6 +424,28 @@ export class ConfigMigrationRunner {
         `Migration to version ${targetVersion} is refused: target must be higher than source version ${source.configVersion}`,
       );
     }
+    if (
+      options.alreadyApplied !== undefined &&
+      (options.alreadyApplied.some((id) => typeof id !== "string") ||
+        options.alreadyApplied.some((id) => !ID_PATTERN.test(id)))
+    ) {
+      throw new ConfigRevisionError(
+        "CONFIG_MIGRATION_REFUSED",
+        "alreadyApplied must be an array of valid operation ids",
+      );
+    }
+    if (
+      options.approvals !== undefined &&
+      options.approvals.some((id) => typeof id !== "string")
+    ) {
+      throw new ConfigRevisionError(
+        "CONFIG_MIGRATION_REFUSED",
+        "approvals must be an array of strings",
+      );
+    }
+    const alreadyApplied = new Set<string>(options.alreadyApplied ?? []);
+    const approvals = new Set<string>(options.approvals ?? []);
+
     const sourceSchema = this.#schemas.get(source.configVersion);
     if (sourceSchema === undefined) {
       throw new ConfigRevisionError(
@@ -300,6 +459,7 @@ export class ConfigMigrationRunner {
         `Target version ${targetVersion} is not registered by any retained schema or migration`,
       );
     }
+    const chainOperations: string[] = [];
     for (let version = source.configVersion + 1; version <= targetVersion; version += 1) {
       if (!this.#steps.has(version - 1)) {
         throw new ConfigRevisionError(
@@ -311,6 +471,15 @@ export class ConfigMigrationRunner {
         throw new ConfigRevisionError(
           "CONFIG_TARGET_VERSION_UNSUPPORTED",
           `No retained schema for version ${version}`,
+        );
+      }
+      chainOperations.push(this.#steps.get(version - 1)!.operationId);
+    }
+    for (const operationId of alreadyApplied) {
+      if (!chainOperations.includes(operationId)) {
+        throw new ConfigRevisionError(
+          "CONFIG_MIGRATION_REFUSED",
+          `alreadyApplied operation id ${operationId} is not part of the migration path to version ${targetVersion}`,
         );
       }
     }
@@ -326,6 +495,16 @@ export class ConfigMigrationRunner {
     for (let version = source.configVersion + 1; version <= targetVersion; version += 1) {
       const step = this.#steps.get(version - 1)!;
       const targetSchema = this.#schemas.get(version)!;
+      if (!alreadyApplied.has(step.operationId) && step.approvalRequired) {
+        const approved =
+          approvals.has(step.operationId) || approvals.has(this.#approvalClass);
+        if (!approved) {
+          throw new ConfigRevisionError(
+            "CONFIG_MIGRATION_APPROVAL_REQUIRED",
+            `Migration ${step.operationId} (${step.lossDeclaration}) from version ${version - 1} to ${version} requires explicit approval before applying`,
+          );
+        }
+      }
       let output: ConfigMigrationOutput;
       try {
         output = parseMigrationOutput(step.migrate(configuration));
@@ -346,6 +525,21 @@ export class ConfigMigrationRunner {
       for (const warning of output.warnings) warnings.push(warning);
     }
 
+    const sourceBytes = canonicalJsonByteLength(source.configuration);
+    const outputBytes = canonicalJsonByteLength(configuration);
+    if (outputBytes > this.#maxOutputBytes) {
+      throw new ConfigRevisionError(
+        "CONFIG_MIGRATION_EXPANSION_LIMIT",
+        `Migration result for version ${targetVersion} is ${outputBytes} canonical bytes, exceeding the maximum output size of ${this.#maxOutputBytes} bytes`,
+      );
+    }
+    if (outputBytes > sourceBytes + this.#maxExpansionBytes) {
+      throw new ConfigRevisionError(
+        "CONFIG_MIGRATION_EXPANSION_LIMIT",
+        `Migration result for version ${targetVersion} expands the source by ${outputBytes - sourceBytes} canonical bytes, exceeding the expansion limit of ${this.#maxExpansionBytes} bytes`,
+      );
+    }
+
     return {
       revision: createConfigRevision({
         configId: source.configId,
@@ -355,6 +549,7 @@ export class ConfigMigrationRunner {
         configuration: cloneJson(configuration),
       }),
       warnings,
+      appliedOperations: chainOperations,
     };
   }
 
