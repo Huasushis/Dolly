@@ -1103,3 +1103,187 @@ fn recovery_rejects_unsafe_persisted_page_sequence() {
         assert_eq!(result.state, state);
     }
 }
+
+#[test]
+fn issue_lease_idempotency_replay_omitting_generation_conflicts() {
+    let mut state = empty_core_snapshot();
+    state.activations.insert(
+        "a".into(),
+        ActivationRecord {
+            state: ActivationState::Ready,
+            attempt: 0,
+            ..Default::default()
+        },
+    );
+    state
+        .generations
+        .push(json!({"generation": 8, "compatible": true}));
+    let original = reduce(
+        &state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "cmd-1".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-1".into(),
+            token_digest: A.into(),
+            extension_connection_id: "conn-1".into(),
+            worker_epoch: 1,
+            extension_generation: Some(8),
+        }),
+        &input(),
+    );
+    assert_eq!(original.outcome, TransitionOutcome::Committed);
+    assert_eq!(
+        original.reply.as_ref().unwrap()["extension_generation"],
+        json!(8)
+    );
+    let replay = reduce(
+        &original.state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "cmd-2".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-1".into(),
+            token_digest: A.into(),
+            extension_connection_id: "conn-1".into(),
+            worker_epoch: 1,
+            extension_generation: None,
+        }),
+        &input(),
+    );
+    assert_eq!(replay.error.unwrap().code, "STORAGE_IDEMPOTENCY_CONFLICT");
+}
+
+#[test]
+fn issue_lease_idempotency_replay_matching_generation_accepted() {
+    let mut state = empty_core_snapshot();
+    state.activations.insert(
+        "a".into(),
+        ActivationRecord {
+            state: ActivationState::Ready,
+            attempt: 0,
+            ..Default::default()
+        },
+    );
+    state
+        .generations
+        .push(json!({"generation": 8, "compatible": true}));
+    let original = reduce(
+        &state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "cmd-1".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-1".into(),
+            token_digest: A.into(),
+            extension_connection_id: "conn-1".into(),
+            worker_epoch: 1,
+            extension_generation: Some(8),
+        }),
+        &input(),
+    );
+    assert_eq!(original.outcome, TransitionOutcome::Committed);
+    let replay = reduce(
+        &original.state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "cmd-2".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-1".into(),
+            token_digest: A.into(),
+            extension_connection_id: "conn-1".into(),
+            worker_epoch: 1,
+            extension_generation: Some(8),
+        }),
+        &input(),
+    );
+    assert_eq!(replay.outcome, TransitionOutcome::Committed);
+    assert_eq!(
+        replay.reply.as_ref().unwrap()["extension_generation"],
+        json!(8)
+    );
+}
+
+#[test]
+fn issue_lease_idempotency_replay_both_lacking_generation_accepted() {
+    let mut state = empty_core_snapshot();
+    state.activations.insert(
+        "a".into(),
+        ActivationRecord {
+            state: ActivationState::Ready,
+            attempt: 0,
+            ..Default::default()
+        },
+    );
+    let original = reduce(
+        &state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "cmd-1".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-2".into(),
+            token_digest: A.into(),
+            extension_connection_id: "conn-1".into(),
+            worker_epoch: 1,
+            extension_generation: None,
+        }),
+        &input(),
+    );
+    assert_eq!(original.outcome, TransitionOutcome::Committed);
+    let replay = reduce(
+        &original.state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "cmd-2".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-2".into(),
+            token_digest: A.into(),
+            extension_connection_id: "conn-1".into(),
+            worker_epoch: 1,
+            extension_generation: None,
+        }),
+        &input(),
+    );
+    assert_eq!(replay.outcome, TransitionOutcome::Committed);
+}
+
+#[test]
+fn issue_lease_idempotency_replay_mismatched_generation_conflicts() {
+    let mut state = empty_core_snapshot();
+    state.activations.insert(
+        "a".into(),
+        ActivationRecord {
+            state: ActivationState::Ready,
+            attempt: 0,
+            ..Default::default()
+        },
+    );
+    state
+        .generations
+        .push(json!({"generation": 8, "compatible": true}));
+    state
+        .generations
+        .push(json!({"generation": 9, "compatible": true}));
+    let original = reduce(
+        &state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "cmd-1".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-3".into(),
+            token_digest: A.into(),
+            extension_connection_id: "conn-1".into(),
+            worker_epoch: 1,
+            extension_generation: Some(8),
+        }),
+        &input(),
+    );
+    assert_eq!(original.outcome, TransitionOutcome::Committed);
+    let replay = reduce(
+        &original.state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "cmd-2".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-3".into(),
+            token_digest: A.into(),
+            extension_connection_id: "conn-1".into(),
+            worker_epoch: 1,
+            extension_generation: Some(9),
+        }),
+        &input(),
+    );
+    assert_eq!(replay.error.unwrap().code, "STORAGE_IDEMPOTENCY_CONFLICT");
+}
