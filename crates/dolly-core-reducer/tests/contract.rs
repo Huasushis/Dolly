@@ -923,6 +923,81 @@ fn lease_ids_are_immutable_across_activations_and_replay_exactly() {
         collision.state.activations["b"].state,
         ActivationState::Ready
     );
+    let explicit = reduce(
+        &state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "lease-explicit".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-gen".into(),
+            token_digest: "token-a".into(),
+            extension_connection_id: "connection-a".into(),
+            worker_epoch: 1,
+            extension_generation: Some(8),
+        }),
+        &input(),
+    );
+    let identical_explicit = reduce(
+        &explicit.state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "lease-identical-explicit".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-gen".into(),
+            token_digest: "token-a".into(),
+            extension_connection_id: "connection-a".into(),
+            worker_epoch: 1,
+            extension_generation: Some(8),
+        }),
+        &input(),
+    );
+    assert_eq!(identical_explicit.state_hash, explicit.state_hash);
+    assert!(identical_explicit.events.is_empty());
+    let omitted_replay = reduce(
+        &explicit.state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "lease-omitted-replay".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-gen".into(),
+            token_digest: "token-a".into(),
+            extension_connection_id: "connection-a".into(),
+            worker_epoch: 1,
+            extension_generation: None,
+        }),
+        &input(),
+    );
+    assert_eq!(
+        omitted_replay.error.unwrap().code,
+        "STORAGE_IDEMPOTENCY_CONFLICT"
+    );
+    let unbound = reduce(
+        &state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "lease-none".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-none".into(),
+            token_digest: "token-a".into(),
+            extension_connection_id: "connection-a".into(),
+            worker_epoch: 1,
+            extension_generation: None,
+        }),
+        &input(),
+    );
+    let explicit_against_unbound = reduce(
+        &unbound.state,
+        &CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "lease-explicit-against-none".into(),
+            activation_id: "a".into(),
+            lease_id: "lease-none".into(),
+            token_digest: "token-a".into(),
+            extension_connection_id: "connection-a".into(),
+            worker_epoch: 1,
+            extension_generation: Some(8),
+        }),
+        &input(),
+    );
+    assert_eq!(
+        explicit_against_unbound.error.unwrap().code,
+        "STORAGE_IDEMPOTENCY_CONFLICT"
+    );
 }
 
 #[test]

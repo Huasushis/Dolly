@@ -404,6 +404,15 @@ describe("Core reference abstract machine", () => {
     const collision = run(first.state, { ...command, command_id: "collision", token_digest: "different" });
     expect(collision.error?.code).toBe("STORAGE_IDEMPOTENCY_CONFLICT");
     expect(collision.state_hash).toBe(first.state_hash);
+    const explicit = run(ready, { ...command, command_id: "explicit", lease_id: "lease-gen", extension_generation: 8 });
+    const identicalExplicit = run(explicit.state, { ...command, command_id: "explicit-replay", lease_id: "lease-gen", extension_generation: 8 });
+    expect(identicalExplicit.state_hash).toBe(explicit.state_hash);
+    expect(identicalExplicit.events).toEqual([]);
+    const omittedReplay = run(explicit.state, { ...command, command_id: "omitted-replay", lease_id: "lease-gen" });
+    expect(omittedReplay.error?.code).toBe("STORAGE_IDEMPOTENCY_CONFLICT");
+    const unbound = run(ready, { ...command, command_id: "unbound", lease_id: "lease-none" });
+    const explicitAgainstUnbound = run(unbound.state, { ...command, command_id: "explicit-replay", lease_id: "lease-none", extension_generation: 8 });
+    expect(explicitAgainstUnbound.error?.code).toBe("STORAGE_IDEMPOTENCY_CONFLICT");
   });
 
   it("rejects page and cursor sequences that cannot be incremented safely", () => {
