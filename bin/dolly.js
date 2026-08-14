@@ -3,7 +3,12 @@
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const help = `Usage: dolly <command>
+// Help text for the un-built wrapper, kept in sync with the canonical
+// DOLLY_CLI_HELP in src/cli/help.ts. When the package is built this wrapper
+// routes every invocation through the compiled subcommand dispatcher
+// (dist/src/cli/dispatch.js), which is the single source of subcommand
+// selection, the installed version, and the canonical help.
+const METADATA_HELP = `Usage: dolly <command> [options]
 
 Commands:
   init                 Create and register a new local instance
@@ -21,21 +26,24 @@ Options:
 
 Daemon and extension commands are unavailable until their secure runtime migration is complete.`;
 
-const [command] = process.argv.slice(2);
+const dispatchUrl = new URL("../dist/src/cli/dispatch.js", import.meta.url);
 
-if (command === "--help" || command === "-h" || command === "help") {
-  console.log(help);
-} else if (command === "--version" || command === "-v") {
-  const packageUrl = new URL("../package.json", import.meta.url);
-  const packageJson = JSON.parse(readFileSync(packageUrl, "utf8"));
-  console.log(packageJson.version);
+if (existsSync(fileURLToPath(dispatchUrl))) {
+  const dispatch = await import(dispatchUrl.href);
+  process.exitCode = await dispatch.runCli(process.argv.slice(2));
 } else {
-  const entryUrl = new URL("../dist/src/entry.js", import.meta.url);
-  if (!existsSync(fileURLToPath(entryUrl))) {
+  // The installed package always ships dist, but the metadata commands must
+  // still resolve before a build exists (running `node bin/dolly.js --help`
+  // from a source checkout, for example).
+  const [command] = process.argv.slice(2);
+  if (command === "--help" || command === "-h" || command === "help") {
+    console.log(METADATA_HELP);
+  } else if (command === "--version" || command === "-v" || command === "version") {
+    const packageUrl = new URL("../package.json", import.meta.url);
+    const packageJson = JSON.parse(readFileSync(packageUrl, "utf8"));
+    console.log(packageJson.version);
+  } else {
     console.error("Dolly is not built. Run `npm run build` before invoking the CLI.");
     process.exitCode = 1;
-  } else {
-    const entry = await import(entryUrl.href);
-    process.exitCode = await entry.runDollyCli(process.argv.slice(2));
   }
 }
