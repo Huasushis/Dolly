@@ -481,6 +481,7 @@ describe("Core reference abstract machine", () => {
     expect(result.outcome).toBe("committed");
     expect(result.state.activations.a?.state).toBe("leased");
     expect(result.state.activations.a?.attempt).toBe(1);
+  });
 
   it("rejects snapshots with counters exceeding MAX_SAFE_INTEGER", () => {
     const overCommit = emptyCoreSnapshot();
