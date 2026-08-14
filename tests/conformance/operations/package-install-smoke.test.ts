@@ -7,15 +7,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 
 interface PackResult {
   filename: string;
-  files: Array<{ path: string; size: number }>;
-  size: number;
-  unpackedSize: number;
+  files: Array<{ path: string }>;
 }
 
 function readNullTerminated(buffer: Buffer, start: number, length: number): string {
@@ -88,11 +86,39 @@ function readTarGzFiles(tarball: Buffer): Map<string, Buffer> {
 
 function parsePackOutput(stdout: string): PackResult {
   const trimmed = stdout.trim();
-  const candidates = [trimmed, trimmed.slice(trimmed.lastIndexOf("\n[") + 1)];
+  const candidates = [
+    trimmed,
+    trimmed.slice(trimmed.lastIndexOf("\n{") + 1),
+    trimmed.slice(trimmed.lastIndexOf("\n[") + 1),
+  ];
   for (const candidate of candidates) {
     try {
-      const parsed = JSON.parse(candidate) as PackResult[];
-      if (Array.isArray(parsed) && parsed.length === 1) return parsed[0]!;
+      const parsed = JSON.parse(candidate) as unknown;
+      const manifest = Array.isArray(parsed)
+        ? (parsed.length === 1 ? parsed[0] : undefined)
+        : (typeof parsed === "object" && parsed !== null
+            ? parsed
+            : undefined);
+      if (
+        manifest &&
+        typeof manifest === "object" &&
+        "filename" in manifest &&
+        "files" in manifest
+      ) {
+        const files = Array.isArray(manifest.files)
+          ? manifest.files
+              .map((file: unknown) =>
+                file && typeof file === "object" && "path" in file
+                  ? file.path
+                  : undefined,
+              )
+              .filter(
+                (path: unknown): path is string => typeof path === "string",
+              )
+              .map((path: string) => ({ path }))
+          : [];
+        return { filename: basename(String(manifest.filename ?? "")), files };
+      }
     } catch {
       // Try the next candidate so lifecycle output cannot hide the pack manifest.
     }
@@ -115,17 +141,19 @@ describe("PKG-001 distributable package", () => {
       if (!npmCli) {
         throw new Error("Package smoke test must run through an npm script");
       }
+      const packArguments = [
+        npmCli,
+        "pack",
+        "--json",
+        "--pack-destination",
+        packDirectory,
+      ];
+      if (!basename(npmCli).toLowerCase().startsWith("pnpm")) {
+        packArguments.push("--cache", cacheDirectory);
+      }
       const packed = spawnSync(
         process.execPath,
-        [
-          npmCli,
-          "pack",
-          "--json",
-          "--pack-destination",
-          packDirectory,
-          "--cache",
-          cacheDirectory,
-        ],
+        packArguments,
         {
           cwd: repositoryRoot,
           encoding: "utf8",
@@ -165,11 +193,14 @@ describe("PKG-001 distributable package", () => {
         expect(publishedPath).not.toMatch(/\.tar\.gz$/);
         if (publishedPath.endsWith(".ts")) expect(publishedPath).toMatch(/\.d\.ts$/);
       }
-      expect(manifest.size).toBeLessThan(5_000_000);
-      expect(manifest.unpackedSize).toBeLessThan(10_000_000);
-
       const tarball = readFileSync(join(packDirectory, manifest.filename));
+      expect(tarball.length).toBeLessThan(5_000_000);
       const tarFiles = readTarGzFiles(tarball);
+      const unpackedSize = [...tarFiles.values()].reduce(
+        (total, data) => total + data.length,
+        0,
+      );
+      expect(unpackedSize).toBeLessThan(10_000_000);
       const packageJson = JSON.parse(
         tarFiles.get("package/package.json")?.toString("utf8") ?? "null",
       );
