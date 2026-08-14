@@ -152,6 +152,27 @@ run("apply_result", {
   activation_id: "activation-1",
 });
 
+state.activations["activation-gen"] = { state: "ready", attempt: 0 };
+run("lease_generation_issue", {
+  type: "IssueLease",
+  command_id: "lease-gen-1",
+  activation_id: "activation-gen",
+  lease_id: "lease-gen-1",
+  token_digest: TOKEN_DIGEST,
+  extension_connection_id: "connection-1",
+  worker_epoch: 1,
+  extension_generation: 8,
+});
+run("lease_generation_omitted_replay", {
+  type: "IssueLease",
+  command_id: "lease-gen-1-replay",
+  activation_id: "activation-gen",
+  lease_id: "lease-gen-1",
+  token_digest: TOKEN_DIGEST,
+  extension_connection_id: "connection-1",
+  worker_epoch: 1,
+});
+
 const document = canonicalizeJson(records);
 const outputPath = process.argv[2];
 if (outputPath) writeFileSync(outputPath, `${document}\n`, { mode: 0o600 });

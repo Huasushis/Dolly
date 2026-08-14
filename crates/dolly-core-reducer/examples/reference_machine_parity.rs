@@ -227,6 +227,45 @@ fn main() {
         input(),
     );
 
+    state.activations.insert(
+        "activation-gen".into(),
+        ActivationRecord {
+            state: ActivationState::Ready,
+            attempt: 0,
+            ..Default::default()
+        },
+    );
+    run(
+        &mut records,
+        &mut state,
+        "lease_generation_issue",
+        CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "lease-gen-1".into(),
+            activation_id: "activation-gen".into(),
+            lease_id: "lease-gen-1".into(),
+            token_digest: TOKEN_DIGEST.into(),
+            extension_connection_id: "connection-1".into(),
+            worker_epoch: 1,
+            extension_generation: Some(8),
+        }),
+        input(),
+    );
+    run(
+        &mut records,
+        &mut state,
+        "lease_generation_omitted_replay",
+        CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: "lease-gen-1-replay".into(),
+            activation_id: "activation-gen".into(),
+            lease_id: "lease-gen-1".into(),
+            token_digest: TOKEN_DIGEST.into(),
+            extension_connection_id: "connection-1".into(),
+            worker_epoch: 1,
+            extension_generation: None,
+        }),
+        input(),
+    );
+
     let bytes = canonicalize(&Value::Array(records)).unwrap().0.into_vec();
     if let Some(path) = env::args_os().nth(1) {
         fs::write(path, [&bytes[..], b"\n"].concat()).unwrap();

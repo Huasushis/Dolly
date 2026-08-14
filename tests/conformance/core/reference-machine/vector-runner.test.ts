@@ -421,6 +421,29 @@ function execute(vector: FrozenVector): ScenarioResult {
       const incompatible = issued.events.find((event) => event.event === "ExtensionGenerationIncompatible")!;
       return { outcome: issued.state.leases.l?.extension_generation === 8 ? "old_compatible_generation_executes_frozen_config" : "unexpected", before, observed: { generations: issued.state.generations, lease: issued.state.leases.l, activation: issued.state.activations.a, module_activate_request: { manifest: { effective_config: issued.reply?.effective_config, effective_config_digest: manifest.effective_config_digest } }, current_module_config: initial.current_module_config }, emitted: [flattened(incompatible)] };
     }
+    case "TST-CORE-017": {
+      const activationInitial = object(initial.activation, "activation");
+      const commands = list(stimulus.commands, "commands").map((value) => object(value, "lease command"));
+      const state = emptyCoreSnapshot();
+      state.activations.a = { state: activationInitial.state === "retry_wait" ? "retry_wait" : "ready", attempt: integer(activationInitial.attempt, "attempt") };
+      const resolve = (command: RecordValue) => ({
+        command_id: text(command.command_id, "command_id"),
+        activation_id: text(command.activation_id, "activation_id"),
+        lease_id: text(command.lease_id, "lease_id"),
+        token_digest: text(command.token_digest, "token_digest"),
+        extension_connection_id: text(command.extension_connection_id, "extension_connection_id"),
+        worker_epoch: integer(command.worker_epoch, "worker_epoch"),
+        ...(command.extension_generation === undefined ? {} : { extension_generation: integer(command.extension_generation, "extension_generation") }),
+      });
+      const issued = transition(state, { type: "IssueLease", ...resolve(commands[0]!) });
+      const replay = transition(issued.state, { type: "IssueLease", ...resolve(commands[1]!) });
+      return {
+        outcome: replay.error?.code === "STORAGE_IDEMPOTENCY_CONFLICT" ? "omitted_generation_replay_refused" : "unexpected",
+        before: {},
+        observed: { lease: issued.state.leases[resolve(commands[0]!).lease_id], activation: { state: issued.state.activations.a?.state, attempt: issued.state.activations.a?.attempt }, replay_error_code: replay.error?.code ?? null },
+        emitted: issued.events.map(flattened),
+      };
+    }
     default: throw new Error(`unmapped immutable vector ${vector.test_id}`);
   }
 }
@@ -428,8 +451,8 @@ function execute(vector: FrozenVector): ScenarioResult {
 const vectors = readdirSync(VECTOR_ROOT).filter((name) => /^TST-CORE-\d{3}.*\.json$/.test(name)).sort().map((name) => object(readFrozenJsonTestFile(path.join(VECTOR_ROOT, name)), name) as unknown as FrozenVector);
 
 describe("immutable Core vectors", () => {
-  it("executes exactly TST-CORE-001 through TST-CORE-016", () => {
-    expect(vectors.map((vector) => vector.test_id)).toEqual(Array.from({ length: 16 }, (_, index) => `TST-CORE-${String(index + 1).padStart(3, "0")}`));
+  it("executes exactly TST-CORE-001 through TST-CORE-017", () => {
+    expect(vectors.map((vector) => vector.test_id)).toEqual(Array.from({ length: 17 }, (_, index) => `TST-CORE-${String(index + 1).padStart(3, "0")}`));
   });
 
   for (const vector of vectors) {
