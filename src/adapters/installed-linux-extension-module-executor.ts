@@ -23,6 +23,7 @@ import type { ModuleConfigurationStore } from "../core/module-configuration-stor
 import {
   assertValidModuleProcessRecord,
   type ModuleProcessRecord,
+  type ModuleProcessStartingRecordInput,
 } from "../core/module-process-records.js";
 import type { ReactiveModuleInput } from "../core/reactive-module-input.js";
 import type { ReactiveModuleResult } from "../core/reactive-module-runtime.js";
@@ -264,7 +265,7 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
   }
   assertNoDerivedFields(
     options.lifecycle,
-    ["delegatedRootCgroupPath", "execution", "processRecord"],
+    ["delegatedRootCgroupPath", "execution", "processRecord", "startingRecord"],
     "lifecycle",
   );
   assertNoDerivedFields(
@@ -354,6 +355,24 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
   // Reuse the durable-store validator so malformed binding identifiers or
   // timestamps cannot be deferred until after process creation.
   assertValidModuleProcessRecord(processRecord);
+  // The id-less twin a version 19 store allocates itself. It carries every
+  // unrelated field, so one derivation feeds both identifier domains.
+  const startingRecord = Object.freeze({
+    schemaVersion: "dolly.module-process-record/1" as const,
+    instanceId: identity.instanceId,
+    moduleId: identity.moduleId,
+    moduleGenerationId: options.moduleGenerationId,
+    packageDigest: resolvedModule.installation.packageDigest,
+    configurationReference: Object.freeze({
+      ...resolvedModule.module.configurationReference,
+    }),
+    declaredExternalEffects: INSTALLED_PROCESS_EFFECT_DECLARATION,
+    serviceInvocationId: binding.serviceInvocationId,
+    bootId: binding.bootId,
+    delegatedRootCgroupPath: binding.delegatedRootCgroupPath,
+    ...options.processRecord,
+    state: "starting" as const,
+  });
   const confinementExecution = deriveLinuxProcessConfinementExecution({
     bubblewrapProgram: runtime.confinementProgram,
     nodeProgram: runtime.nodeProgram,
@@ -378,6 +397,7 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
       ...options.lifecycle,
       delegatedRootCgroupPath: binding.delegatedRootCgroupPath,
       processRecord,
+      startingRecord,
       execution: {
         program: confinementExecution.program,
         argumentVector: confinementExecution.argumentVector,

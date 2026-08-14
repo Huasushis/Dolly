@@ -45,6 +45,7 @@ import {
   type StartModuleProcessOptions,
 } from "../core/linux-module-process-lifecycle.js";
 import type { ModuleCgroup } from "../core/linux-module-cgroup.js";
+import type { ModuleProcessRecord } from "../core/module-process-records.js";
 
 const DEFAULT_CORE_EXIT_CLEANUP_TIMEOUT_MS = 1_000;
 
@@ -204,6 +205,10 @@ export function createLinuxModuleExecutor(
   const exitCoreProcess = options.exitCoreProcess ?? ((status: number) => process.exit(status));
   let session: LinuxModuleProtocolSession | undefined;
   let processStart: Promise<ModuleProcessStartResult> | undefined;
+  // The resolved process record once start returned one. A version 19 store
+  // mints the identifier inside that record, so every later state transition
+  // keys on this rather than on the reviewed identity.
+  let startedRecord: ModuleProcessRecord | undefined;
   let startOperation: Promise<void> | undefined;
   let startCompleted = false;
   let terminationRequested = false;
@@ -250,9 +255,10 @@ export function createLinuxModuleExecutor(
       try {
         try {
           options.lifecycle.records.updateModuleProcessRecordState(
+          startedRecord?.processGenerationId ??
             options.lifecycle.identity.processGenerationId,
-            "stopping",
-          );
+          "stopping",
+        );
         } catch {
           // The exit remains required even when the durable intent is lost.
         }
@@ -308,6 +314,9 @@ export function createLinuxModuleExecutor(
           undefined,
         );
       }
+      if (started.executionAuthorized) {
+        startedRecord = started.record;
+      }
       if (!started.executionAuthorized) {
         setAvailableSession(undefined);
         if (started.failure.coreMustExit) {
@@ -342,7 +351,8 @@ export function createLinuxModuleExecutor(
         );
       }
       options.lifecycle.records.updateModuleProcessRecordState(
-        options.lifecycle.identity.processGenerationId,
+        startedRecord?.processGenerationId ??
+          options.lifecycle.identity.processGenerationId,
         "running",
       );
       if (terminationRequested) {
@@ -368,6 +378,9 @@ export function createLinuxModuleExecutor(
         undefined,
         undefined,
       );
+    }
+    if (started.executionAuthorized) {
+      startedRecord = started.record;
     }
     let cgroup;
     if (!started.executionAuthorized) {
@@ -397,7 +410,8 @@ export function createLinuxModuleExecutor(
       stopped = await stopModuleProcess({
         records: options.lifecycle.records,
         stoppedRecordWriter: options.lifecycle.stoppedRecordWriter,
-        processGenerationId: options.lifecycle.identity.processGenerationId,
+        processGenerationId: startedRecord?.processGenerationId ??
+        options.lifecycle.identity.processGenerationId,
         cgroup,
         timeoutMs: options.terminationTimeoutMs,
         closeCapabilitySession: () => {

@@ -43,6 +43,7 @@ import {
 } from "./linux-module-cgroup.js";
 import type {
   ModuleProcessRecord,
+  ModuleProcessStartingRecordInput,
   ModuleProcessStoppedRecordWriter,
 } from "./module-process-records.js";
 
@@ -51,6 +52,20 @@ export interface ModuleProcessRecordStore {
   /** Returns the store's stable immutable object for the current record version. */
   getModuleProcessRecord(processGenerationId: string): ModuleProcessRecord | undefined;
   appendModuleProcessRecord(record: ModuleProcessRecord): ModuleProcessRecord;
+  /**
+   * Whether this store allocates version 19 process-generation identifiers
+   * itself. A migrated store answers true and refuses every caller-supplied
+   * identifier, so starts on it must supply the id-less starting record.
+   */
+  supportsVersion19Identity(): boolean;
+  /**
+   * Mints the next store-owned version 19 identifier and appends it with the
+   * caller's starting record in one durable write. Only valid on a store that
+   * `supportsVersion19Identity`.
+   */
+  allocateAndAppendStartingRecord(
+    input: ModuleProcessStartingRecordInput,
+  ): ModuleProcessRecord;
   updateModuleProcessRecordState(
     processGenerationId: string,
     state: "running" | "stopping",
@@ -174,6 +189,13 @@ export interface StartModuleProcessOptions {
   readonly stoppedRecordWriter: ModuleProcessStoppedRecordWriter;
   /** The record to persist before any child exists. Its state must be `starting`. */
   readonly processRecord: ModuleProcessRecord;
+  /**
+   * The id-less starting record for a store that allocates version 19
+   * identifiers itself; required exactly when `records.supportsVersion19Identity`
+   * and ignored otherwise. Its delegated control-group root must equal
+   * `delegatedRootCgroupPath`.
+   */
+  readonly startingRecord?: ModuleProcessStartingRecordInput;
   readonly delegatedRootCgroupPath: string;
   readonly identity: ModuleCgroupIdentity;
   readonly limits: ModuleCgroupLimits;
@@ -218,12 +240,29 @@ function cgroupFailure(
 export async function startModuleProcess(
   options: StartModuleProcessOptions,
 ): Promise<ModuleProcessStartResult> {
-  const { records, identity } = options;
+  const { records } = options;
 
   // Step 1. The process generation becomes durable before any child exists.
   let record: ModuleProcessRecord;
   try {
-    record = records.appendModuleProcessRecord(options.processRecord);
+    if (records.supportsVersion19Identity()) {
+      if (options.startingRecord === undefined) {
+        throw new TypeError(
+          "A version 19 process store requires the id-less starting record",
+        );
+      }
+      if (
+        options.startingRecord.delegatedRootCgroupPath !==
+        options.delegatedRootCgroupPath
+      ) {
+        throw new TypeError(
+          "The starting record's delegated control-group root does not match the lifecycle options",
+        );
+      }
+      record = records.allocateAndAppendStartingRecord(options.startingRecord);
+    } else {
+      record = records.appendModuleProcessRecord(options.processRecord);
+    }
   } catch (error) {
     return {
       executionAuthorized: false,
@@ -234,12 +273,19 @@ export async function startModuleProcess(
       },
     };
   }
+  // The persisted record is the single source of truth for the process
+  // generation; for a version 19 store it carries the identifier the store
+  // minted, for a version 18 store it carries the reviewed one.
+  const generationIdentity = {
+    ...options.identity,
+    processGenerationId: record.processGenerationId,
+  };
 
   // Step 2. The control group must be able to enforce its limits before a
   // process joins it, so every limit is written and read back here.
   const prepared = await prepareModuleCgroup({
     delegatedRootCgroupPath: options.delegatedRootCgroupPath,
-    identity,
+    identity: generationIdentity,
     limits: options.limits,
     ...(options.cgroupFileSystem === undefined
       ? {}
@@ -287,7 +333,7 @@ export async function startModuleProcess(
     return await finishFailedStartBeforeExecutionAuthorization(
       records,
       options.stoppedRecordWriter,
-      identity.processGenerationId,
+      generationIdentity.processGenerationId,
       cgroup,
       launcher,
       "MODULE_PROCESS_LAUNCHER_FAILED",
@@ -299,7 +345,7 @@ export async function startModuleProcess(
     return await finishFailedStartBeforeExecutionAuthorization(
       records,
       options.stoppedRecordWriter,
-      identity.processGenerationId,
+      generationIdentity.processGenerationId,
       cgroup,
       launcher,
       "MODULE_PROCESS_STOP_REQUESTED",
@@ -322,7 +368,7 @@ export async function startModuleProcess(
     return await finishFailedStartBeforeExecutionAuthorization(
       records,
       options.stoppedRecordWriter,
-      identity.processGenerationId,
+      generationIdentity.processGenerationId,
       cgroup,
       launcher,
       "MODULE_PROCESS_MEMBERSHIP_UNVERIFIED",
@@ -364,7 +410,7 @@ export async function startModuleProcess(
       return await finishFailedStartBeforeExecutionAuthorization(
         records,
         options.stoppedRecordWriter,
-        identity.processGenerationId,
+        generationIdentity.processGenerationId,
         cgroup,
         launcher,
         code,
