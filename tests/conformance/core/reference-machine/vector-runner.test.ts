@@ -644,4 +644,21 @@ describe("IssueLease frame-bound fail-closed coverage", () => {
     expect(issued.state.activations.a).toMatchObject({ state: "ready", attempt: 0 });
     expect(issued.state.leases.l).toBeUndefined();
   });
+
+  it("refuses coercible non-number frame bounds (numeric strings, null) without lease or state mutation", () => {
+    const coercionFixtures: Array<{ name: string; manifest: JsonObject; generation: JsonObject }> = [
+      { name: "string required_frame_bytes", manifest: { required_frame_bytes: "4194304" }, generation: { generation: 9, max_frame_bytes: 4194304, max_frame_nesting_depth: 96 } },
+      { name: "string max_frame_bytes", manifest: { required_frame_bytes: 4194304 }, generation: { generation: 9, max_frame_bytes: "4194304", max_frame_nesting_depth: 96 } },
+      { name: "null required_frame_nesting_depth", manifest: { required_frame_nesting_depth: null }, generation: { generation: 9, max_frame_bytes: 4194304, max_frame_nesting_depth: 96 } },
+      { name: "null max_frame_nesting_depth", manifest: { required_frame_bytes: 1048576, required_frame_nesting_depth: 80 }, generation: { generation: 9, max_frame_bytes: 4194304, max_frame_nesting_depth: null } },
+    ];
+    for (const fixture of coercionFixtures) {
+      const { issued } = issue(fixture.manifest, fixture.generation, 9);
+      expect(issued.error?.code, fixture.name).toBe("ACTIVATION_FRAME_INCOMPATIBLE");
+      expect(issued.outcome).toBe("rolled_back");
+      expect(issued.state.activations.a, fixture.name).toMatchObject({ state: "ready", attempt: 0 });
+      expect(issued.state.leases.l, fixture.name).toBeUndefined();
+      expect(issued.events.map(flattened)).toEqual([{ event: "ExtensionGenerationIncompatible", reason: "frame_bounds" }]);
+    }
+  });
 });

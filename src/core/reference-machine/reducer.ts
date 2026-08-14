@@ -346,18 +346,21 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
       if (generation !== undefined && next.generations.length && !candidates.includes(generation)) return failure(state, "EXTENSION_GENERATION_INCOMPATIBLE");
       if (item.manifest?.required_frame_bytes !== undefined || item.manifest?.required_frame_nesting_depth !== undefined) {
         const chosen = generation === undefined ? undefined : next.generations.find((candidate) => (candidate as { generation?: JsonValue }).generation === generation);
-        let frameIncompatible = false;
-        if (item.manifest.required_frame_bytes !== undefined) {
-          const required = Number(item.manifest.required_frame_bytes);
-          const maximum = chosen === undefined ? undefined : Number(chosen.max_frame_bytes);
-          frameIncompatible = !safeNonnegative(required) || maximum === undefined || !safeNonnegative(maximum) || maximum < required;
-        }
-        if (!frameIncompatible && item.manifest.required_frame_nesting_depth !== undefined) {
-          const required = Number(item.manifest.required_frame_nesting_depth);
-          const maximum = chosen === undefined ? undefined : Number(chosen.max_frame_nesting_depth);
-          frameIncompatible = !safeNonnegative(required) || maximum === undefined || !safeNonnegative(maximum) || maximum < required;
-        }
-        if (frameIncompatible) return failureWithEmission(state, command.command_id, "ACTIVATION_FRAME_INCOMPATIBLE", "ExtensionGenerationIncompatible", { reason: "frame_bounds" });
+        const requiredBytes = item.manifest.required_frame_bytes;
+        const maximumBytes = chosen === undefined ? undefined : chosen.max_frame_bytes;
+        const bytesOk = requiredBytes === undefined
+          ? true
+          : typeof requiredBytes === "number" && safeNonnegative(requiredBytes)
+            && typeof maximumBytes === "number" && safeNonnegative(maximumBytes)
+            && maximumBytes >= requiredBytes;
+        const requiredDepth = item.manifest.required_frame_nesting_depth;
+        const maximumDepth = chosen === undefined ? undefined : chosen.max_frame_nesting_depth;
+        const depthOk = requiredDepth === undefined
+          ? true
+          : typeof requiredDepth === "number" && safeNonnegative(requiredDepth)
+            && typeof maximumDepth === "number" && safeNonnegative(maximumDepth)
+            && maximumDepth >= requiredDepth;
+        if (!bytesOk || !depthOk) return failureWithEmission(state, command.command_id, "ACTIVATION_FRAME_INCOMPATIBLE", "ExtensionGenerationIncompatible", { reason: "frame_bounds" });
       }
       const attempt = nextAttempt(item.attempt);
       if (attempt === undefined) return failure(state, "ATTEMPT_SEQUENCE_EXHAUSTED");
