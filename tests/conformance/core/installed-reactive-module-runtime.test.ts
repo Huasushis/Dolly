@@ -100,7 +100,10 @@ import {
 import type { ChatBrokerInvocation } from "../../../src/core/model-provider-broker.js";
 import { ModelDescriptorRegistry } from "../../../src/core/model-provider-descriptor.js";
 import { EndpointBindingRegistry } from "../../../src/core/model-provider-binding.js";
-import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
+import {
+  LinuxModuleCgroupStopProver,
+  deriveModuleCgroupPath,
+} from "../../../src/core/linux-module-cgroup.js";
 import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
 import { ModuleConfigurationStore } from "../../../src/core/module-configuration-store.js";
 import { createModuleResultCommitCoordinator } from "../../../src/core/module-result-commit-factory.js";
@@ -1364,6 +1367,107 @@ describe("installed reactive Module runtime composition", () => {
       scheduling,
       runtime,
     })).not.toThrow();
+  });
+
+  it("rejects a handoff minted with a structurally equivalent but separately constructed stop prover", async () => {
+    const pair = coreState("prover-identity");
+    const complete = options(pair);
+    const mailboxes = [...complete.mailboxes];
+    const {
+      configurations: _configurations,
+      activation: _activation,
+      core: _core,
+      initialModuleGenerationId,
+      installations: _installations,
+      instanceConfiguration: _instanceConfiguration,
+      mailboxes: _mailboxes,
+      moduleId: _moduleId,
+      monotonicNow: _monotonicNow,
+      nextModuleGenerationId,
+      stoppedRecordWriter: _stoppedRecordWriter,
+      ...sharedRuntime
+    } = complete;
+    const runtime = {
+      ...sharedRuntime,
+      initialModuleGenerationIdFor: (moduleId: string) =>
+        `${moduleId}-${initialModuleGenerationId}`,
+      nextModuleGenerationIdFor: (moduleId: string) =>
+        `${moduleId}-${nextModuleGenerationId()}`,
+    };
+    const clock = {
+      monotonicNow: () => 0,
+      schedule: () => ({ cancel: () => undefined }),
+    };
+    const scheduling = {
+      maxConcurrentModules: 1,
+      backpressureAction: "pause-upstream" as const,
+      downstreamRecheckMs: 100,
+      noProgressAfterMs: 5_000,
+      claimLimitCount: 1,
+      claimLimitBytes: 1024,
+      retryJitterRatio: 0,
+      lowWatermarkRatio: 1,
+    };
+    const separatelyConstructedProver = new LinuxModuleCgroupStopProver({
+      serviceBindingVerified: true,
+      delegatedRootCgroupPath: BINDING.delegatedRootCgroupPath,
+    });
+    expect(separatelyConstructedProver)
+      .not.toBe(activationPermission.stopProver);
+    const controlHandoff = (await new CoreStartupRecovery({
+      deliveries: pair.store.deliveries,
+      commits: createModuleResultCommitCoordinator({
+        core: pair.store,
+        repository: complete.resultCommitRepository,
+        now: complete.now,
+        mailboxes,
+      }),
+      moduleRecords: pair.store,
+      stoppedRecordWriter: pair.stoppedRecordWriter,
+      processStopProver: activationPermission.stopProver,
+    }).recover()).handoff;
+    // Positive control: the same Core, repository, records, and compose
+    // arguments succeed with the exact permission prover, so the rejection
+    // below is attributable to stop-prover object identity alone.
+    expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
+      ...contentSchemaOptions(pair),
+      mailboxes,
+      startupRecoveryHandoff: controlHandoff,
+      clock,
+      scheduling,
+      runtime,
+    })).not.toThrow();
+    const handoff = (await new CoreStartupRecovery({
+      deliveries: pair.store.deliveries,
+      commits: createModuleResultCommitCoordinator({
+        core: pair.store,
+        repository: complete.resultCommitRepository,
+        now: complete.now,
+        mailboxes,
+      }),
+      moduleRecords: pair.store,
+      stoppedRecordWriter: pair.stoppedRecordWriter,
+      processStopProver: separatelyConstructedProver,
+    }).recover()).handoff;
+    expect(() => composeInstalledReactiveModuleHost({
+      activation: activationPermission,
+      configuration: instanceConfiguration,
+      installations,
+      configurations,
+      coreState: pair,
+      ...contentSchemaOptions(pair),
+      mailboxes,
+      startupRecoveryHandoff: handoff,
+      clock,
+      scheduling,
+      runtime,
+    })).toThrow(/stop prover/u);
+    expect(pair.store.listModuleProcessRecords()).toEqual([]);
   });
 
   it("binds a package-version-3 source Module to one Core-private activation queue", async () => {
