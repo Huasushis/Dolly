@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { canonicalJsonDigest, type JsonValue } from "../../../../src/schema-bundle/index.js";
 import { parseStrictJsonBytes } from "../../../../src/core/strict-json.js";
+import { buildNeighborDescriptors } from "../../../../src/core/reference-machine/neighbor-projection.js";
 import { emptyCoreSnapshot, reduceCore, type CoreEvent, type CoreSnapshot, type JsonObject, type ReducerInput, type Transition } from "../../../../src/core/reference-machine/index.js";
 
 const SPEC_ROOT = path.resolve(import.meta.dirname, "../../../../dolly-spec");
@@ -545,6 +547,27 @@ function execute(vector: FrozenVector): ScenarioResult {
         emitted: issued.events.map(flattened),
       };
     }
+    case "TST-DESC-002": {
+      const receivingModule = text(initial.receiving_module, "receiving_module");
+      const neighborModule = text(initial.neighbor_module, "neighbor_module");
+      const sourceDescriptor = object(initial.source_descriptor, "source_descriptor") as unknown as JsonObject;
+      const neighborDescriptors = buildNeighborDescriptors({
+        receiving_module: receivingModule,
+        input_pages: initial.input_pages as Record<string, string[]>,
+        output_pages: initial.output_pages as Record<string, string[]>,
+        subscriptions: initial.subscriptions as Record<string, string[]>,
+        descriptors: { [neighborModule]: sourceDescriptor },
+        authorized_metadata_namespaces: initial.authorized_metadata_namespaces as string[],
+      });
+      const manifest: JsonObject = { reason: "neighbor-projection", graph_revision: 1, neighbor_descriptors: neighborDescriptors as unknown as JsonValue };
+      const built = transition(emptyCoreSnapshot(), { type: "BuildManifest", command_id: "build", activation_id: receivingModule, manifest });
+      return {
+        outcome: built.state.manifests[receivingModule] !== undefined && built.state.activations[receivingModule]?.state === "ready" ? "dual_relationship_projection_frozen" : "unexpected",
+        before: {},
+        observed: { manifest: built.state.manifests[receivingModule] ?? {} },
+        emitted: built.events.map(flattened),
+      };
+    }
     default: throw new Error(`unmapped immutable vector ${vector.test_id}`);
   }
 }
@@ -555,13 +578,45 @@ const coreVectors = [...new Set([VECTOR_ROOT, OVERLAY_ROOT].flatMap((root) => re
     const owner = [VECTOR_ROOT, OVERLAY_ROOT].find((root) => existsSync(path.join(root, name)));
     return object(readFrozenJsonTestFile(path.join(owner!, name)), name) as unknown as FrozenVector;
   });
+// Repository-owned overlay vector under the unique id TST-DESC-002. The
+// imported TST-DESC-001 stays dormant under an errata record (see the errata
+// test below); this vector pins the same neighbor projection with
+// fixture-derived object/array values.
+const descVectorName = "TST-DESC-002-neighbor-projection.json";
+const descOwner = [VECTOR_ROOT, OVERLAY_ROOT].find((root) => existsSync(path.join(root, descVectorName)));
+const descVectors = descOwner === undefined
+  ? []
+  : [object(readFrozenJsonTestFile(path.join(descOwner, descVectorName)), descVectorName) as unknown as FrozenVector];
 const protocolVectorName = "TST-PROTO-003-frame-generation-compatibility.json";
 const protocolVector = object(readFrozenJsonTestFile(path.join(PROTOCOL_ROOT, protocolVectorName)), protocolVectorName) as unknown as FrozenVector;
-const vectors = [...coreVectors, protocolVector];
+const vectors = [...coreVectors, ...descVectors, protocolVector];
 
 describe("immutable Core vectors", () => {
-  it("executes exactly TST-CORE-001 through TST-CORE-019 plus the reducer-covered protocol vector TST-PROTO-003", () => {
-    expect(vectors.map((vector) => vector.test_id)).toEqual([...Array.from({ length: 19 }, (_, index) => `TST-CORE-${String(index + 1).padStart(3, "0")}`), "TST-PROTO-003"]);
+  it("executes exactly TST-CORE-001 through TST-CORE-019 plus the overlay vector TST-DESC-002 and the reducer-covered protocol vector TST-PROTO-003", () => {
+    expect(vectors.map((vector) => vector.test_id)).toEqual([...Array.from({ length: 19 }, (_, index) => `TST-CORE-${String(index + 1).padStart(3, "0")}`), "TST-DESC-002", "TST-PROTO-003"]);
+  });
+
+  it("errata: imported TST-DESC-001 stays dormant with bytes preserved and is never overridden", () => {
+    expect(vectors.map((vector) => vector.test_id)).not.toContain("TST-DESC-001");
+    const importedPath = path.join(VECTOR_ROOT, "TST-DESC-001-neighbor-projection.json");
+    expect(existsSync(importedPath)).toBe(true);
+    // Byte-faithful import provenance (spec-import commit fd5b252): any local
+    // edit to the imported vector fails this stable digest check.
+    expect(createHash("sha256").update(readFileSync(importedPath)).digest("hex")).toBe("501bc99cd1fa0f43cbf1b24a38cef208aeb7176cf466ff5be7adef336c54d0c9");
+    const imported = object(readFrozenJsonTestFile(importedPath), "TST-DESC-001") as unknown as FrozenVector;
+    expect(imported.test_id).toBe("TST-DESC-001");
+    // The identity half of the imported vector is sound: source_descriptor_digest
+    // pins the JCS digest of the fixture's source descriptor.
+    const fixtureEnvelope = object(readFrozenJsonTestFile(path.join(FIXTURE_ROOT, "neighbor-is-both-input-producer-and-output-consumer.json")), "fixture");
+    const fixtureValue = object(fixtureEnvelope.value, "fixture.value");
+    expect(imported.initial.source_descriptor_digest).toBe(canonicalJsonDigest(object(fixtureValue.source_descriptor, "source_descriptor") as unknown as JsonValue));
+    // The assertions half is unsound as imported: literal contains-values
+    // ("contract" on the object-valued emits/accepts and "authorized-contracts"
+    // on actions) exist nowhere in the fixture or in the 06-module-descriptor.md
+    // projection, so the imported vector cannot pass any faithful runner. The
+    // overlay vector TST-DESC-002 pins the same projection with fixture-derived
+    // object/array values instead. Upstream dolly-spec must correct TST-DESC-001.
+    expect(imported.expected.assertions.some((assertion) => assertion.op === "contains")).toBe(true);
   });
 
   for (const vector of vectors) {

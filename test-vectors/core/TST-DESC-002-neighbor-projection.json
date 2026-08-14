@@ -1,0 +1,53 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-DESC-002",
+  "kind": "core_transition",
+  "covers": ["REQ-DESC-002", "INV-DESC-001", "INV-DESC-003"],
+  "initial": {
+    "fixture": "neighbor-is-both-input-producer-and-output-consumer",
+    "source_descriptor_revision": 9,
+    "source_descriptor_digest": "sha256:dcdb688583af0951e2b3ab7f79cd0129bf74bd0a157aab1886898871cbd4d6ba",
+    "authorized_metadata_namespaces": ["org.dolly.llm"]
+  },
+  "stimulus": {
+    "command": "BuildManifest",
+    "receiving_module": "reviewer",
+    "neighbor_module": "analyst"
+  },
+  "expected": {
+    "outcome": "dual_relationship_projection_frozen",
+    "assertions": [
+      {"path": "/manifest/neighbor_descriptors", "op": "count", "value": 1},
+      {"path": "/manifest/neighbor_descriptors/0/module_id", "op": "equals", "value": "analyst"},
+      {"path": "/manifest/neighbor_descriptors/0/descriptor_revision", "op": "equals", "value": 9},
+      {"path": "/manifest/neighbor_descriptors/0/relationships", "op": "equals", "value": ["input_producer", "output_consumer"]},
+      {"path": "/manifest/neighbor_descriptors/0/projection/emits", "op": "equals", "value": {"summary": "Analysis", "part_kinds": ["text"], "action_names": []}},
+      {"path": "/manifest/neighbor_descriptors/0/projection/accepts", "op": "equals", "value": {"summary": "Review work", "part_kinds": ["text"], "action_names": ["org.dolly.llm.review"]}},
+      {"path": "/manifest/neighbor_descriptors/0/projection/actions", "op": "equals", "value": [
+        {
+          "name": "org.dolly.llm.review",
+          "arguments_schema": {
+            "uri": "schemas/channel-send.schema.json",
+            "schema_digest": "sha256:64fbd12a17d44adb095ff1886020231fabbbb1b29d15c6a5f6d099a1d2e750aa",
+            "semantic_validator": null
+          },
+          "result_schema": {
+            "uri": "schemas/channel-send-result.schema.json",
+            "schema_digest": "sha256:14edf90d6ac5a7082fafdd3bcfb5de311ebb92640e04235b98d247c19222b239",
+            "semantic_validator": {
+              "id": "org.dolly.validator.channel-send-result",
+              "revision": 1
+            }
+          },
+          "description": "Review a draft",
+          "side_effect_class": "read_only"
+        }
+      ]},
+      {"path": "/manifest/neighbor_descriptors/0/projection/metadata", "op": "equals", "value": {"org.dolly.llm": {"role": "analyst"}}},
+      {"path": "/manifest/neighbor_descriptors/0/projection/schema", "op": "absent"},
+      {"path": "/manifest/neighbor_descriptors/0/projection/unauthorized_metadata", "op": "absent"}
+    ],
+    "emitted": [{"event": "ManifestCreated", "activation_id": "reviewer", "reason": "neighbor-projection"}],
+    "crash_label": null
+  }
+}
