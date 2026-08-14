@@ -481,5 +481,45 @@ describe("Core reference abstract machine", () => {
     expect(result.outcome).toBe("committed");
     expect(result.state.activations.a?.state).toBe("leased");
     expect(result.state.activations.a?.attempt).toBe(1);
+
+  it("rejects snapshots with counters exceeding MAX_SAFE_INTEGER", () => {
+    const overCommit = emptyCoreSnapshot();
+    overCommit.next_commit_seq = Number.MAX_SAFE_INTEGER + 1;
+    const commitResult = run(overCommit, { type: "Ingress", command_id: "bad-commit", runtime_source: "host", ingress_key: "k", operation_digest: A, block_id: "b", block: {}, pages: [] });
+    expect(commitResult.outcome).toBe("rolled_back_with_safety_stop");
+    expect(commitResult.error?.code).toBe("CORE_STATE_COUNTER_INVALID");
+    expect(commitResult.state.mode).toBe("recovery_required");
+
+    const overAttempt = emptyCoreSnapshot();
+    overAttempt.activations.a = { state: "ready", attempt: Number.MAX_SAFE_INTEGER + 1 };
+    const attemptResult = run(overAttempt, { type: "IssueLease", command_id: "bad-attempt", activation_id: "a", lease_id: "l", token_digest: "t", extension_connection_id: "c", worker_epoch: 1 });
+    expect(attemptResult.outcome).toBe("rolled_back_with_safety_stop");
+    expect(attemptResult.error?.code).toBe("CORE_STATE_COUNTER_INVALID");
+  });
+
+  it("rejects Ingress that would exhaust the commit sequence budget", () => {
+    const nearLimit = emptyCoreSnapshot();
+    nearLimit.next_commit_seq = Number.MAX_SAFE_INTEGER - 1;
+    const result = run(nearLimit, { type: "Ingress", command_id: "exhaust", runtime_source: "host", ingress_key: "k", operation_digest: A, block_id: "b", block: {}, pages: ["p1"] });
+    expect(result.error?.code).toBe("COMMIT_SEQUENCE_EXHAUSTED");
+    expect(result.state_hash).toBe(hashCoreState(nearLimit));
+  });
+
+  it("rejects IssueLease when the attempt sequence is exhausted", () => {
+    const ready = emptyCoreSnapshot();
+    ready.activations.a = { state: "ready", attempt: Number.MAX_SAFE_INTEGER };
+    const result = run(ready, { type: "IssueLease", command_id: "exhaust", activation_id: "a", lease_id: "l", token_digest: "t", extension_connection_id: "c", worker_epoch: 1 });
+    expect(result.error?.code).toBe("ATTEMPT_SEQUENCE_EXHAUSTED");
+    expect(result.state_hash).toBe(hashCoreState(ready));
+  });
+
+  it("rejects ReceiveResult retry authorization when the attempt sequence is exhausted", () => {
+    const dispatched = leasedState("dispatched");
+    dispatched.activations.a!.attempt = Number.MAX_SAFE_INTEGER;
+    dispatched.leases.l.attempt = Number.MAX_SAFE_INTEGER;
+    const resultDigest = canonicalJsonDigest({});
+    const result = run(dispatched, { type: "ReceiveResult", command_id: "exhaust", activation_id: "a", lease_id: "l", status: "retryable", result_digest: resultDigest }, { host_result_verification: { ...resultVerification(resultDigest)!, attempt: Number.MAX_SAFE_INTEGER } });
+    expect(result.error?.code).toBe("ATTEMPT_SEQUENCE_EXHAUSTED");
+    expect(result.state_hash).toBe(hashCoreState(dispatched));
   });
 });

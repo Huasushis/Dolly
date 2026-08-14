@@ -3,6 +3,29 @@ import { hashCoreState, projectCoreState } from "./projection.js";
 import { emptyCoreSnapshot, type ActivationRecord, type CoreCommand, type CoreError, type CoreEvent, type CoreSnapshot, type JsonObject, type PageRecord, type ReducerInput, type StagedResult, type Transition } from "./types.js";
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
+const MAX_SAFE_INTEGER = 9007199254740991;
+function safeNonnegative(value: number): boolean { return Number.isSafeInteger(value) && value >= 0 && value <= MAX_SAFE_INTEGER; }
+function snapshotCountersValid(state: CoreSnapshot): boolean {
+  return safeNonnegative(state.next_commit_seq)
+    && safeNonnegative(state.next_page_seq)
+    && Object.values(state.subscriptions).every((sub) => safeNonnegative(sub.cursor))
+    && Object.values(state.pages).flat().every((page) => Number.isSafeInteger(page.page_seq) && page.page_seq >= 0 && page.page_seq < MAX_SAFE_INTEGER)
+    && Object.values(state.activations).every((act) => safeNonnegative(act.attempt))
+    && state.journal.every((event) => safeNonnegative(event.commit_seq));
+}
+function nextAttempt(attempt: number): number | undefined {
+  const result = attempt + 1;
+  return Number.isSafeInteger(result) && result >= 0 && result <= MAX_SAFE_INTEGER ? result : undefined;
+}
+function commitIncrementBudget(state: CoreSnapshot, command: CoreCommand): number | undefined {
+  switch (command.type) {
+    case "Ingress": return command.pages.length + 1;
+    case "IssueLease": return state.generations.filter((g) => g.compatible === false).length + 1;
+    case "ReceiveResult":
+    case "Recover": return 2;
+    default: return 1;
+  }
+}
 
 function copy(state: CoreSnapshot): CoreSnapshot { return structuredClone(state); }
 function activation(state: CoreSnapshot, id: string): ActivationRecord | undefined { return state.activations[id]; }
@@ -23,17 +46,17 @@ function appendEvent(state: CoreSnapshot, commandId: string, event: string, deta
 function success(state: CoreSnapshot, events: CoreEvent[], reply?: JsonObject, error?: CoreError): Transition {
   return { outcome: "committed", state, events, ...(reply ? { reply } : {}), ...(error ? { error } : {}), projection: projectCoreState(state), state_hash: hashCoreState(state) };
 }
-function invalidSnapshotTransition(): Transition {
+function invalidSnapshotTransition(code = "CORE_STATE_CANONICAL_JSON_INVALID"): Transition {
   const stopped = emptyCoreSnapshot();
   stopped.mode = "recovery_required";
-  const details: JsonObject = { reason: "CORE_STATE_CANONICAL_JSON_INVALID" };
+  const details: JsonObject = { reason: code };
   stopped.security_incidents.push(details);
   const event = appendEvent(stopped, "snapshot-validation", "RecoveryRequired", details);
   return {
     outcome: "rolled_back_with_safety_stop",
     state: stopped,
     events: [event],
-    error: { code: "CORE_STATE_CANONICAL_JSON_INVALID", retryable: false, outcome: "not_applied", details },
+    error: { code, retryable: false, outcome: "not_applied", details },
     projection: projectCoreState(stopped),
     state_hash: hashCoreState(stopped),
     safety_stop: { state: stopped, event },
@@ -176,7 +199,8 @@ function replayEvidenceValid(item: ActivationRecord, activationId: string, evide
 function retryAuthorizationValid(state: CoreSnapshot, activationId: string, item: ActivationRecord): boolean {
   const authorization = item.next_attempt_authorization;
   if (!authorization) return false;
-  if (authorization.activation_id !== activationId || authorization.source_attempt !== item.attempt || authorization.authorized_attempt !== item.attempt + 1) return false;
+  const authorizedAttempt = nextAttempt(item.attempt);
+  if (authorizedAttempt === undefined || authorization.activation_id !== activationId || authorization.source_attempt !== item.attempt || authorization.authorized_attempt !== authorizedAttempt) return false;
   const digest = authorization.evidence_digest;
   if (typeof digest !== "string" || !DIGEST.test(digest)) return false;
   if (authorization.reason === "safe_before_dispatch") {
@@ -196,6 +220,9 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
   } catch {
     return invalidSnapshotTransition();
   }
+  if (!snapshotCountersValid(state)) return invalidSnapshotTransition("CORE_STATE_COUNTER_INVALID");
+  const budget = commitIncrementBudget(state, command);
+  if (budget === undefined || state.next_commit_seq + budget > MAX_SAFE_INTEGER) return failure(state, "COMMIT_SEQUENCE_EXHAUSTED");
   if (state.mode === "recovery_required" && command.type !== "Recover") return failure(state, "RECOVERY_REQUIRED");
   if (input.storage_observation === "before_commit") return failure(state, "SIMULATED_CRASH", true, input.crash_point ? { crash_point: input.crash_point } : undefined);
   const next = copy(state);
@@ -308,8 +335,10 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
       const candidates = next.generations.filter((candidate) => candidate.compatible !== false).map((candidate) => Number(candidate.generation)).filter(Number.isSafeInteger);
       const generation = command.extension_generation ?? (candidates.length ? Math.max(...candidates) : next.current_generation ?? undefined);
       if (generation !== undefined && next.generations.length && !candidates.includes(generation)) return failure(state, "EXTENSION_GENERATION_INCOMPATIBLE");
+      const attempt = nextAttempt(item.attempt);
+      if (attempt === undefined) return failure(state, "ATTEMPT_SEQUENCE_EXHAUSTED");
       delete item.next_attempt_authorization;
-      item.state = "leased"; item.attempt += 1;
+      item.state = "leased"; item.attempt = attempt;
       if (generation !== undefined) item.extension_generation = generation;
       const manifestDigest = typeof item.manifest?.manifest_digest === "string" ? item.manifest.manifest_digest : undefined;
       next.leases[command.lease_id] = { activation_id: command.activation_id, token_digest: command.token_digest, extension_connection_id: command.extension_connection_id, worker_epoch: command.worker_epoch, state: "leased", dispatch_state: "prepared", attempt: item.attempt, ...(generation === undefined ? {} : { extension_generation: generation }), ...(manifestDigest === undefined ? {} : { manifest_digest: manifestDigest }) };
@@ -341,6 +370,8 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
         return success(next, events, undefined, { code: "ACTIVATION_RESULT_CONFLICT", retryable: false, outcome: "applied" });
       }
       if (item.state !== "leased" && item.state !== "dispatched") return failure(state, "ACTIVATION_FENCE_INVALID");
+      const authorizedAttempt = command.status === "retryable" ? nextAttempt(item.attempt) : undefined;
+      if (command.status === "retryable" && authorizedAttempt === undefined) return failure(state, "ATTEMPT_SEQUENCE_EXHAUSTED");
       item.result_digest = command.result_digest;
       if (command.status === "success") {
         const staged = parseStagedResult(command.result);
@@ -349,7 +380,7 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
         if (staged.validation) item.validation = staged.validation;
       } else if (command.status === "retryable") {
         item.state = "retry_wait"; item.authoritative_disposition = "retry_wait"; item.retry_delay = input.retry_jitter ?? 0;
-        item.next_attempt_authorization = { activation_id: command.activation_id, authorized_attempt: item.attempt + 1, source_attempt: item.attempt, reason: "explicit_retryable_failure", evidence_digest: command.result_digest };
+        item.next_attempt_authorization = { activation_id: command.activation_id, authorized_attempt: authorizedAttempt!, source_attempt: item.attempt, reason: "explicit_retryable_failure", evidence_digest: command.result_digest };
       } else {
         events.push(recordQuarantine(next, command, command.activation_id, "ACTIVATION_RESULT_PERMANENT", false, "ModuleQuarantined"));
         item.authoritative_disposition = "quarantined";
@@ -393,8 +424,10 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
       const ledgerAuthorized = contract.evidence === "activation_ledger" && (item.replay_evidence?.observation === "succeeded" || item.replay_evidence?.observation === "failed");
       if (safeBeforeDispatch || ledgerAuthorized) {
         const evidenceDigest = safeBeforeDispatch ? proof.proof_digest : String(item.replay_evidence!.evidence_digest);
+        const authorizedAttempt = nextAttempt(item.attempt);
+        if (authorizedAttempt === undefined) return failure(state, "ATTEMPT_SEQUENCE_EXHAUSTED");
         item.state = "retry_wait"; item.retry_delay = command.retry_delay;
-        item.next_attempt_authorization = { activation_id: command.activation_id, authorized_attempt: item.attempt + 1, source_attempt: item.attempt, reason: safeBeforeDispatch ? "safe_before_dispatch" : "activation_ledger", evidence_digest: evidenceDigest };
+        item.next_attempt_authorization = { activation_id: command.activation_id, authorized_attempt: authorizedAttempt, source_attempt: item.attempt, reason: safeBeforeDispatch ? "safe_before_dispatch" : "activation_ledger", evidence_digest: evidenceDigest };
         events.push(appendEvent(next, command.command_id, "ActivationRetryScheduled", { activation_id: command.activation_id, authorization: safeBeforeDispatch ? "safe_before_dispatch" : "activation_ledger" }));
       } else {
         const reason = contract.mode === "never_auto_retry" ? "ACTIVATION_REPLAY_NOT_AUTHORIZED" : "ACTIVATION_EXTERNAL_OUTCOME_UNKNOWN";
@@ -457,8 +490,10 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
         const proof = input.host_fence_verification;
         const digest = proof?.proof_digest;
         if (quarantine.fence_complete !== true || !proof?.verified || !proof.execution_slot_empty || proof.activation_id !== command.activation_id || proof.source_attempt !== item.attempt || !digest || !DIGEST.test(digest)) return failure(state, "QUARANTINE_REVIEW_NOT_AUTHORIZED");
+        const authorizedAttempt = nextAttempt(item.attempt);
+        if (authorizedAttempt === undefined) return failure(state, "ATTEMPT_SEQUENCE_EXHAUSTED");
         item.state = "retry_wait"; item.retry_delay = command.retry_delay ?? input.retry_jitter ?? 0;
-        item.next_attempt_authorization = { activation_id: command.activation_id, authorized_attempt: item.attempt + 1, source_attempt: item.attempt, reason: "operator_review", evidence_digest: digest, reviewed: true };
+        item.next_attempt_authorization = { activation_id: command.activation_id, authorized_attempt: authorizedAttempt, source_attempt: item.attempt, reason: "operator_review", evidence_digest: digest, reviewed: true };
       } else {
         item.state = "cancelled";
       }
