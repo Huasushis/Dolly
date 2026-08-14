@@ -298,6 +298,88 @@ pub fn tie_break_key(
         .map_err(|_| FilterArithmeticError::Overflow)
 }
 
+/// One block observation for a trusted source in canonical delivery order:
+/// its opaque Block identifier, its explicit signal classification, and
+/// whether its content is eligible for projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockInput<'a> {
+    /// Opaque Block identifier produced by the trusted source; used only to
+    /// name the selected content, never to address storage.
+    pub block_id: &'a str,
+    /// Explicit signal disposition: a well-formed score is an observation;
+    /// `Malformed` is an explicit input variant that neither updates state
+    /// nor becomes content-eligible (not an exception fallback).
+    pub signal: BlockSignal,
+    /// Whether this Block's content may be projected downstream. An oversize
+    /// (non-projectable) but well-formed Block still updates the accumulator.
+    pub projectable: bool,
+}
+
+/// Explicit signal classification for a block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockSignal {
+    /// Well-formed score in `0..=1000`, validated by [`update`].
+    WellFormed(u64),
+    /// Malformed signal: rejected, neither a state update nor eligible
+    /// content. This is an explicit input variant, not an exception path.
+    Malformed,
+}
+
+/// Outcome of applying an ordered block sequence for one source
+/// (spec `filter-two-thirds.md` §5 "A projection_eligible observation selects
+/// the latest eligible Block for that source but does not bypass the ordered
+/// EMA").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockSequenceOutcome<'a> {
+    /// Latest Block that is both well-formed and projectable; `None` when no
+    /// block qualifies. Content falls back to it when a later well-formed
+    /// Block is oversize/non-projectable.
+    pub selected_block_id: Option<&'a str>,
+    /// Number of well-formed signals applied to the accumulator; malformed
+    /// signals contribute none.
+    pub observation_updates: u64,
+    /// Clamped corrected internal value after the final well-formed update.
+    pub state_q: u64,
+    /// Normalized output score in `0..=1000`, derived from ALL well-formed
+    /// updates in delivery order, not from the selected block's score alone.
+    pub normalized_score: u64,
+}
+
+/// Apply blocks in input (canonical delivery) order for one source: every
+/// well-formed score updates the ordered EMA accumulator; the latest Block
+/// that is well-formed AND projectable supplies the selected content (an
+/// oversize later Block updates state but not content); malformed signals are
+/// ignored entirely; the final normalized score comes from the complete
+/// well-formed sequence. Borrows Block identifiers, so no String is allocated.
+pub fn apply_block_sequence<'a>(
+    config: &FilterConfig,
+    blocks: &[BlockInput<'a>],
+) -> Result<BlockSequenceOutcome<'a>, FilterArithmeticError> {
+    let mut accumulator = Accumulator::default();
+    let mut observation_updates = 0u64;
+    let mut selected_block_id: Option<&'a str> = None;
+    for block in blocks {
+        match block.signal {
+            BlockSignal::WellFormed(score) => {
+                update(config, &mut accumulator, score)?;
+                observation_updates += 1;
+                if block.projectable {
+                    selected_block_id = Some(block.block_id);
+                }
+            }
+            BlockSignal::Malformed => {}
+        }
+    }
+    let state_q = config.clamp_q(corrected_score_q(config, &accumulator)?);
+    let normalized_score = normalized_score(config, state_q)?;
+    Ok(BlockSequenceOutcome {
+        selected_block_id,
+        observation_updates,
+        state_q,
+        normalized_score,
+    })
+}
+
 /// Round `numerator / denominator` to the nearest integer, ties to even,
 /// for non-negative operands (spec §3 requires half-even rounding).
 fn round_half_even_div(numerator: u64, denominator: u64) -> Result<u64, FilterArithmeticError> {

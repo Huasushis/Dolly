@@ -12,9 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use dolly_filter_arithmetic::{
-    BlockInput, BlockSignal, FilterConfig, SCALE, apply_block_sequence,
-};
+use dolly_filter_arithmetic::{BlockInput, BlockSignal, FilterConfig, SCALE, apply_block_sequence};
 use serde_json::{Map, Value, json};
 
 fn spec_root() -> PathBuf {
