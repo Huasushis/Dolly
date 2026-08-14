@@ -37,14 +37,17 @@ import {
   parseProcessGenerationToken,
 } from "../../../src/daemon/process-generation.js";
 import type { ProcessIdentityObservation, ProcessIdentityProbe } from "../../../src/daemon/process-identity.js";
+import { isProcessGenerationId } from "../../../src/core/linux-identifier-formats.js";
+import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
+import { assertValidModuleProcessRecord } from "../../../src/core/module-process-records.js";
 import {
   createTestInstanceRegistry,
   type TestInstanceRegistry,
 } from "./fixtures/daemon-test-registry.js";
 
 const EPOCH = "11111111-1111-4111-8111-111111111111";
-/** The durable record store's rule for a processGenerationId string. */
-const GENERATION_ID_RULE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+/** The authoritative Core rule a durable record's processGenerationId must match. */
+const GENERATION_ID_RULE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
 
 class StubIdentityProbe implements ProcessIdentityProbe {
   constructor(private readonly answer: ProcessIdentityObservation) {}
@@ -100,7 +103,7 @@ describe("process-generation tokens", () => {
     try {
       const sequence = new ProcessGenerationSequence({ epoch: EPOCH });
       const id = formatProcessGenerationToken(sequence.bump());
-      expect(id).toBe(`generation:${EPOCH}:1`);
+      expect(id).toBe(`generation_${EPOCH}_1`);
       expect(id).toMatch(GENERATION_ID_RULE);
       expect(parseProcessGenerationToken(id)).toEqual({ epoch: EPOCH, counter: 1 });
 
@@ -124,6 +127,43 @@ describe("process-generation tokens", () => {
     }
   });
 
+  it("formats tokens that pass the authoritative Core process-record boundary", () => {
+    const sequence = new ProcessGenerationSequence({ epoch: EPOCH });
+    const id = formatProcessGenerationToken(sequence.bump());
+
+    // The produced identifier must satisfy the authoritative Core grammar that
+    // durable Module process and submission records validate, so a daemon token
+    // can cross the durable-record boundary.
+    expect(isProcessGenerationId(id), `token ${id} must match the Core grammar`).toBe(true);
+
+    // A durable Module process record carrying the identifier must validate.
+    const record = {
+      schemaVersion: "dolly.module-process-record/1",
+      instanceId: "instance-process-generation",
+      moduleId: "worker",
+      moduleGenerationId: "module-generation-1",
+      processGenerationId: id,
+      packageDigest: `sha256:${"a".repeat(64)}`,
+      configurationReference: {
+        configId: "config-1",
+        revision: `sha256:${"b".repeat(64)}`,
+        configVersion: 1,
+      },
+      declaredExternalEffects: "core-capabilities-only",
+      serviceInvocationId: "2812432ad29e4d3bbd6776c62cafa929",
+      bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
+      moduleCgroupPath: deriveModuleCgroupPath("/system.slice/dolly-core.service", {
+        instanceId: "instance-process-generation",
+        moduleId: "worker",
+        processGenerationId: id,
+      }).filesystemPath,
+      state: "starting",
+      createdAt: "2026-08-14T00:00:00.000Z",
+      updatedAt: "2026-08-14T00:00:00.000Z",
+    };
+    expect(() => assertValidModuleProcessRecord(record)).not.toThrow();
+  });
+
   it("treats malformed tokens and identifiers written before tokens as non-tokens", () => {
     expect(parseProcessGenerationToken(undefined)).toBeUndefined();
     expect(parseProcessGenerationToken(42)).toBeUndefined();
@@ -143,10 +183,10 @@ describe("process-generation tokens", () => {
     // The largest safe integer is a legal counter; one more is not a token.
     const max = Number.MAX_SAFE_INTEGER;
     expect(max).toBe(9007199254740991);
-    const boundaryToken = `generation:${EPOCH}:${max}`;
+    const boundaryToken = `generation_${EPOCH}_${max}`;
     expect(boundaryToken).toMatch(GENERATION_ID_RULE);
     expect(parseProcessGenerationToken(boundaryToken)).toEqual({ epoch: EPOCH, counter: max });
-    expect(parseProcessGenerationToken(`generation:${EPOCH}:${max + 1}`)).toBeUndefined();
+    expect(parseProcessGenerationToken(`generation_${EPOCH}_${max + 1}`)).toBeUndefined();
 
     // The boundary value is a genuine counter for the guard, not a malformed
     // string: an unissued boundary generation is refused as unissued.
@@ -224,7 +264,7 @@ describe("process-generation tokens", () => {
     expect(() => sequence.guard("process-recovered-generation")).not.toThrow();
     expect(() => sequence.guard(`generation:${EPOCH}:0`)).not.toThrow();
     // A same-epoch token this session never issued is refused, not guessed at.
-    expect(() => sequence.guard(`generation:${EPOCH}:7`)).toThrowError(
+    expect(() => sequence.guard(`generation_${EPOCH}_7`)).toThrowError(
       expect.objectContaining<Partial<ProcessGenerationError>>({
         code: "PROCESS_GENERATION_ID_INVALID",
       }),
@@ -270,7 +310,7 @@ describe("process-generation guard inside daemon ownership checks", () => {
     records.write({
       schemaVersion: "dolly.instance-process-record/1",
       instanceId,
-      processGenerationId: `generation:${EPOCH}:5`,
+      processGenerationId: `generation_${EPOCH}_5`,
       pid: 1234,
       controllerId: EPOCH,
       configRevision: `sha256:${"c".repeat(64)}`,
@@ -338,7 +378,7 @@ describe("process-generation guard inside daemon ownership checks", () => {
     records = new InstanceProcessRecordStore({ directory: join(root, "process-records") });
     const instance = registry.register("foreign-token");
     seedRecord(instance.instanceId, {
-      processGenerationId: "generation:22222222-2222-4222-8222-222222222222:3",
+      processGenerationId: "generation_22222222-2222-4222-8222-222222222222_3",
     });
 
     const launcher = new TrackingNeverLauncher();
@@ -382,7 +422,7 @@ describe("process-generation guard inside daemon ownership checks", () => {
     expect(launcher.launchCount).toBe(1);
 
     const sameCurrent = registry.register("same-current");
-    seedRecord(sameCurrent.instanceId, { processGenerationId: `generation:${EPOCH}:1` });
+    seedRecord(sameCurrent.instanceId, { processGenerationId: `generation_${EPOCH}_1` });
     // The record names the current generation, so the guard passes and the
     // identity evidence decides: the recorded child is still running, so no
     // replacement spawn is started. This is an ownership refusal, not a token
@@ -412,7 +452,7 @@ describe("process-generation guard inside daemon ownership checks", () => {
     expect(launcher.launchCount).toBe(2);
 
     const stale = registry.register("stale-generation");
-    seedRecord(stale.instanceId, { processGenerationId: `generation:${EPOCH}:1` });
+    seedRecord(stale.instanceId, { processGenerationId: `generation_${EPOCH}_1` });
     await expect(
       manager.startInstance(stale.instanceId, "op-start-stale"),
     ).rejects.toMatchObject({ code: "PROCESS_GENERATION_STALE" });
@@ -439,7 +479,7 @@ describe("process-generation guard inside daemon ownership checks", () => {
     // guard before any launcher, spawn, signal, or identity probe, even though
     // the recorded identity would have matched.
     const stopped = registry.register("stale-stop");
-    seedRecord(stopped.instanceId, { processGenerationId: `generation:${EPOCH}:1` });
+    seedRecord(stopped.instanceId, { processGenerationId: `generation_${EPOCH}_1` });
     await expect(
       manager.stopInstance(stopped.instanceId, "op-stop-stale"),
     ).rejects.toMatchObject({ code: "PROCESS_GENERATION_STALE" });
@@ -447,7 +487,7 @@ describe("process-generation guard inside daemon ownership checks", () => {
     expect(probe.observeCount).toBe(0);
     // The refusal left the durable record untouched; no clear or stale-mark
     // followed the refusal.
-    expect(records.read(stopped.instanceId)?.processGenerationId).toBe(`generation:${EPOCH}:1`);
+    expect(records.read(stopped.instanceId)?.processGenerationId).toBe(`generation_${EPOCH}_1`);
   });
 
   it("makes two managers sharing one controllerId refuse same-epoch ownership each did not issue", async () => {
@@ -477,7 +517,7 @@ describe("process-generation guard inside daemon ownership checks", () => {
     // B refuses the generation A issued: the counter is neither stale nor
     // current for B's session, so it counts as never issued by B.
     const fromA = registry.register("from-a");
-    seedRecord(fromA.instanceId, { processGenerationId: `generation:${EPOCH}:1` });
+    seedRecord(fromA.instanceId, { processGenerationId: `generation_${EPOCH}_1` });
     await expect(managerB.startInstance(fromA.instanceId, "op-b-refuses-a")).rejects.toMatchObject({
       code: "PROCESS_GENERATION_ID_INVALID",
     });
@@ -485,7 +525,7 @@ describe("process-generation guard inside daemon ownership checks", () => {
 
     // Both sessions refuse a same-epoch counter neither of them issued.
     const unissued = registry.register("unissued-by-both");
-    seedRecord(unissued.instanceId, { processGenerationId: `generation:${EPOCH}:9` });
+    seedRecord(unissued.instanceId, { processGenerationId: `generation_${EPOCH}_9` });
     await expect(managerA.startInstance(unissued.instanceId, "op-a-refuses-unissued")).rejects.toMatchObject(
       { code: "PROCESS_GENERATION_ID_INVALID" },
     );

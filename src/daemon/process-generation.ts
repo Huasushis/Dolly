@@ -5,7 +5,7 @@
  * supervision epoch. A token names that generation with an epoch marker and a
  * monotonic counter:
  *
- *   generation:<epoch>:<counter>
+ *   generation_<epoch>_<counter>
  *
  * The epoch marker is one per daemon supervision session (the controller
  * identity), so the counter never collides with a generation minted by a
@@ -16,13 +16,21 @@
  * epoch is foreign. A string that is not a generation token — for example a
  * durable record written before tokens existed — is left to the
  * operating-system identity evidence that already decides ownership.
+ *
+ * The wire form must satisfy the authoritative Core
+ * `isProcessGenerationId` grammar, so a supervision token can cross the
+ * durable Module process-record boundary. The epoch marker is therefore
+ * restricted to Core-safe identifier characters and the `_` separator is
+ * reserved from the epoch marker, keeping the epoch/counter split lossless.
  */
 
-const EPOCH_SOURCE = "[A-Za-z0-9][A-Za-z0-9._-]{0,63}";
+import { isProcessGenerationId } from "../core/linux-identifier-formats.js";
+
+const EPOCH_SOURCE = "[A-Za-z0-9][A-Za-z0-9-]{0,63}";
 const COUNTER_SOURCE = "[0-9]{1,20}";
 const EPOCH_PATTERN = new RegExp(`^${EPOCH_SOURCE}$`, "u");
 const FULL_TOKEN_PATTERN = new RegExp(
-  `^generation:(${EPOCH_SOURCE}):(${COUNTER_SOURCE})$`,
+  `^generation_(${EPOCH_SOURCE})_(${COUNTER_SOURCE})$`,
   "u",
 );
 
@@ -87,7 +95,17 @@ export function formatProcessGenerationToken(token: ProcessGenerationToken): str
       "A process-generation token must carry a valid epoch and a positive counter",
     );
   }
-  return `generation:${token.epoch}:${token.counter}`;
+  const id = `generation_${token.epoch}_${token.counter}`;
+  // Fail closed if the encoding ever drifts outside the authoritative Core
+  // grammar, so every token the daemon mints can cross the durable-record
+  // boundary that Module process and submission records validate against.
+  if (!isProcessGenerationId(id)) {
+    throw new ProcessGenerationError(
+      "PROCESS_GENERATION_ID_INVALID",
+      "A process-generation token serialization must satisfy the Core process-generation identifier grammar",
+    );
+  }
+  return id;
 }
 
 export interface ProcessGenerationSequenceOptions {
@@ -155,13 +173,13 @@ export class ProcessGenerationSequence {
     if (token.counter < this.#counter) {
       throw new ProcessGenerationError(
         "PROCESS_GENERATION_STALE",
-        `Refusing a stale process-generation token generation:${token.epoch}:${token.counter}; the current generation is ${this.#counter}`,
+        `Refusing a stale process-generation token generation_${token.epoch}_${token.counter}; the current generation is ${this.#counter}`,
       );
     }
     if (token.counter > this.#counter) {
       throw new ProcessGenerationError(
         "PROCESS_GENERATION_ID_INVALID",
-        `Refusing a process-generation token generation:${token.epoch}:${token.counter} that this epoch has not issued`,
+        `Refusing a process-generation token generation_${token.epoch}_${token.counter} that this epoch has not issued`,
       );
     }
   }
