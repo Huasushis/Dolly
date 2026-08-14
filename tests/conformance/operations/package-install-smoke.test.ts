@@ -7,15 +7,15 @@ import {
   writeFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 
 interface PackResult {
   filename: string;
-  files: Array<{ path: string; size: number }>;
-  size: number;
-  unpackedSize: number;
+  files: Array<{ path: string; size?: number }>;
+  size?: number;
+  unpackedSize?: number;
 }
 
 function readNullTerminated(buffer: Buffer, start: number, length: number): string {
@@ -88,13 +88,27 @@ function readTarGzFiles(tarball: Buffer): Map<string, Buffer> {
 
 function parsePackOutput(stdout: string): PackResult {
   const trimmed = stdout.trim();
-  const candidates = [trimmed, trimmed.slice(trimmed.lastIndexOf("\n[") + 1)];
-  for (const candidate of candidates) {
+  // Lifecycle output (for example the prepack build) can precede the JSON
+  // manifest. Scan trailing JSON candidates from the end; npm wraps the
+  // manifest in a one-element array while pnpm emits the bare object, so
+  // either client can run this contract.
+  for (let index = trimmed.length - 1; index >= 0; index -= 1) {
+    const char = trimmed[index]!;
+    if (char !== "{" && char !== "[") continue;
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(candidate) as PackResult[];
-      if (Array.isArray(parsed) && parsed.length === 1) return parsed[0]!;
+      parsed = JSON.parse(trimmed.slice(index)) as unknown;
     } catch {
-      // Try the next candidate so lifecycle output cannot hide the pack manifest.
+      continue;
+    }
+    const manifest = Array.isArray(parsed) ? parsed[0] : parsed;
+    if (
+      manifest !== null &&
+      typeof manifest === "object" &&
+      typeof (manifest as { filename?: unknown }).filename === "string" &&
+      Array.isArray((manifest as { files?: unknown }).files)
+    ) {
+      return manifest as PackResult;
     }
   }
   throw new Error(`npm pack did not return one JSON result:\n${stdout}`);
@@ -115,17 +129,22 @@ describe("PKG-001 distributable package", () => {
       if (!npmCli) {
         throw new Error("Package smoke test must run through an npm script");
       }
+      // `--cache` isolates npm's pack cache so a dirty shared cache cannot
+      // leak into the fixture. pnpm's pack keeps no cache and rejects the
+      // flag, so it is only passed to npm-based clients.
+      const packArgs = [
+        npmCli,
+        "pack",
+        "--json",
+        "--pack-destination",
+        packDirectory,
+      ];
+      if (!/pnpm/u.test(npmCli)) {
+        packArgs.push("--cache", cacheDirectory);
+      }
       const packed = spawnSync(
         process.execPath,
-        [
-          npmCli,
-          "pack",
-          "--json",
-          "--pack-destination",
-          packDirectory,
-          "--cache",
-          cacheDirectory,
-        ],
+        packArgs,
         {
           cwd: repositoryRoot,
           encoding: "utf8",
@@ -163,11 +182,20 @@ describe("PKG-001 distributable package", () => {
         expect(publishedPath).not.toMatch(/\.tar\.gz$/);
         if (publishedPath.endsWith(".ts")) expect(publishedPath).toMatch(/\.d\.ts$/);
       }
-      expect(manifest.size).toBeLessThan(5_000_000);
-      expect(manifest.unpackedSize).toBeLessThan(10_000_000);
-
-      const tarball = readFileSync(join(packDirectory, manifest.filename));
+      // pnpm reports no packed sizes in its manifest, so the size limits are
+      // enforced against the actual tarball and its extracted entries rather
+      // than the manifest's self-declared numbers.
+      const tarballPath = isAbsolute(manifest.filename)
+        ? manifest.filename
+        : join(packDirectory, manifest.filename);
+      const tarball = readFileSync(tarballPath);
       const tarFiles = readTarGzFiles(tarball);
+      const unpackedSize = [...tarFiles.values()].reduce(
+        (total, data) => total + data.byteLength,
+        0,
+      );
+      expect(tarball.byteLength).toBeLessThan(5_000_000);
+      expect(unpackedSize).toBeLessThan(10_000_000);
       const packageJson = JSON.parse(
         tarFiles.get("package/package.json")?.toString("utf8") ?? "null",
       );
