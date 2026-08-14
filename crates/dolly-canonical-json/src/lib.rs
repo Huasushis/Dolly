@@ -182,7 +182,7 @@ impl TryFrom<serde_json::Value> for CanonicalJsonValue {
 }
 
 // Allow CanonicalJsonValue to be used as a serde Deserializer for deserialize_core_json
-impl<'de> serde::de::IntoDeserializer<'de, CanonicalError> for CanonicalJsonValue {
+impl serde::de::IntoDeserializer<'_, CanonicalError> for CanonicalJsonValue {
     type Deserializer = CanonicalJsonValueDeserializer;
 
     fn into_deserializer(self) -> Self::Deserializer {
@@ -193,7 +193,7 @@ impl<'de> serde::de::IntoDeserializer<'de, CanonicalError> for CanonicalJsonValu
 /// A deserializer that wraps a `CanonicalJsonValue` and drives serde deserialization.
 pub struct CanonicalJsonValueDeserializer(CanonicalJsonValue);
 
-impl<'de> serde::de::IntoDeserializer<'de, CanonicalError> for CanonicalJsonValueDeserializer {
+impl serde::de::IntoDeserializer<'_, CanonicalError> for CanonicalJsonValueDeserializer {
     type Deserializer = Self;
 
     fn into_deserializer(self) -> Self::Deserializer {
