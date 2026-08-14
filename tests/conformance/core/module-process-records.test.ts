@@ -447,10 +447,21 @@ describe("CORE Module process and submission records", () => {
         moduleCgroupPath: cgroupPathFor("process-generation-3", "worker-two"),
       }),
     );
-    expect(store.listModuleProcessRecords()).toHaveLength(3);
+    store.appendModuleProcessRecord(
+      processRecord({
+        instanceId: "instance-2",
+        processGenerationId: "process-generation-4",
+        moduleCgroupPath: deriveModuleCgroupPath(DELEGATED_ROOT, {
+          instanceId: "instance-2",
+          moduleId: MODULE_ID,
+          processGenerationId: "process-generation-4",
+        }).filesystemPath,
+      }),
+    );
+    expect(store.listModuleProcessRecords()).toHaveLength(4);
 
     const reopened = openStore("second");
-    expect(reopened.listModuleProcessRecords()).toHaveLength(3);
+    expect(reopened.listModuleProcessRecords()).toHaveLength(4);
   });
 
   it("allows a replacement record after the prior one is proven stopped", () => {

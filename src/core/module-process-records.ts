@@ -368,10 +368,10 @@ export function canTransitionModuleProcessRecordState(
 }
 
 /**
- * The identity of the one changing Module slot a process record occupies:
- * instance, Module, Module generation. `stopped` is the only terminal state,
- * so Core may hold at most one non-terminal record per tuple; every other
- * record for the same tuple is retained stopped history.
+ * The identity of one tuple a process record occupies: instance, Module and
+ * Module generation. `stopped` is the only terminal state, so at most one
+ * non-terminal record may exist per tuple; every other record for the same
+ * tuple is retained stopped history.
  */
 function moduleProcessTupleKey(record: ModuleProcessRecord): string {
   // Identifiers can never contain a NUL (isIdentifier rejects code points
@@ -380,12 +380,39 @@ function moduleProcessTupleKey(record: ModuleProcessRecord): string {
 }
 
 /**
- * Rejects any pair of non-terminal Module process records that share one
- * (instance, Module, Module-generation) tuple. This is the single shared
- * implementation of that invariant: the file-backed store enforces it at
- * append, and persisted-document validation enforces it on every load.
+ * Returns the first existing non-terminal process record that shares
+ * candidate's (instance, Module, Module generation) tuple, or undefined.
+ * This is the shared candidate-vs-existing check the file-backed store runs
+ * on append; it scans the live collection directly, so the append path
+ * allocates no array and stops at the first conflict.
  */
-export function assertNonTerminalModuleProcessTuplesUnique(
+export function findNonTerminalModuleProcessTupleConflict(
+  candidate: ModuleProcessRecord,
+  existingRecords: Iterable<ModuleProcessRecord>,
+): ModuleProcessRecord | undefined {
+  for (const existing of existingRecords) {
+    if (existing.state === "stopped") continue;
+    if (
+      existing.instanceId === candidate.instanceId &&
+      existing.moduleId === candidate.moduleId &&
+      existing.moduleGenerationId === candidate.moduleGenerationId
+    ) {
+      return existing;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Rejects any pair of non-terminal Module process records that share one
+ * (instance, Module, Module generation) tuple. Persisted-document validation
+ * runs this once per load over the whole collection; it keys a Set on the
+ * tuple so a corrupt document cannot force an unbounded secondary scan. The
+ * file-backed store enforces the same invariant on append through
+ * {@link findNonTerminalModuleProcessTupleConflict}, which works against the
+ * live collection without allocating.
+ */
+function assertNonTerminalModuleProcessTuplesUnique(
   records: readonly ModuleProcessRecord[],
 ): void {
   const nonTerminalTuples = new Set<string>();

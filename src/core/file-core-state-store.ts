@@ -49,10 +49,10 @@ import {
 import {
   ModuleProcessRecordError,
   assertModuleRecordCollectionsConsistent,
-  assertNonTerminalModuleProcessTuplesUnique,
   assertValidModuleProcessRecord,
   assertValidModuleSubmissionRecord,
   canTransitionModuleProcessRecordState,
+  findNonTerminalModuleProcessTupleConflict,
   type ModuleProcessRecord,
   type ModuleProcessRecordState,
   type ModuleProcessStoppedRecordWriter,
@@ -1877,10 +1877,16 @@ export class FileCoreStateStore {
         `Module process record "${copiedRecord.processGenerationId}" already exists`,
       );
     }
-    assertNonTerminalModuleProcessTuplesUnique([
-      ...this.#moduleProcessRecords.values(),
+    const conflicting = findNonTerminalModuleProcessTupleConflict(
       copiedRecord,
-    ]);
+      this.#moduleProcessRecords.values(),
+    );
+    if (conflicting !== undefined) {
+      throw new ModuleProcessRecordError(
+        "MODULE_PROCESS_RECORD_CONFLICT",
+        `Multiple non-terminal Module process records exist for instance "${copiedRecord.instanceId}", Module "${copiedRecord.moduleId}", Module generation "${copiedRecord.moduleGenerationId}" (conflicting with "${conflicting.processGenerationId}")`,
+      );
+    }
     const stored = deepFreeze(copiedRecord);
     this.#moduleProcessRecords.set(copiedRecord.processGenerationId, stored);
     try {
