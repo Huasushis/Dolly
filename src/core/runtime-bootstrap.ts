@@ -12,7 +12,6 @@ import { FileMediaByteStore } from "./file-media-byte-store.js";
 import { FileModuleResultCommitRepository } from "./file-module-result-commit-repository.js";
 import {
   InstanceConfigError,
-  InstanceConfigStore,
   type LoadedInstanceConfig,
 } from "./instance-config-store.js";
 import { InstanceControllerLock } from "./instance-controller-lock.js";
@@ -20,9 +19,9 @@ import type { MediaInspector } from "./media-store.js";
 import { createModuleResultCommitCoordinator } from "./module-result-commit-factory.js";
 import type { ModuleResultCommitCoordinator } from "./module-result-commit.js";
 import {
-  dollyInstanceConfigSchema,
-  type DollyInstanceConfig,
-} from "./runtime-config.js";
+  DollyInstanceConfigAdmission,
+  type DollyInstanceConfigDialect,
+} from "./instance-config-admission.js";
 
 export interface DollyRuntimeDirectories {
   readonly registryDirectory: string;
@@ -138,7 +137,7 @@ async function createDefaultMediaInspector(): Promise<MediaInspector> {
 
 function reconcilePageTopology(
   core: FileCoreStateStore,
-  document: Readonly<DollyInstanceConfig>,
+  document: Readonly<DollyInstanceConfigDialect>,
 ): void {
   const desired = new Set(document.pages.map((page) => page.pageId));
   const snapshot = core.deliveries.snapshot();
@@ -167,7 +166,7 @@ function reconcilePageTopology(
 }
 
 export class DollyRuntimeSession {
-  readonly config: LoadedInstanceConfig<DollyInstanceConfig>;
+  readonly config: LoadedInstanceConfig<DollyInstanceConfigDialect>;
   readonly core: FileCoreStateStore;
   readonly commits: ModuleResultCommitCoordinator;
   readonly recovery: CoreStartupRecoveryReport;
@@ -177,7 +176,7 @@ export class DollyRuntimeSession {
   #stopOperation: Promise<void> | undefined;
 
   constructor(options: {
-    readonly config: LoadedInstanceConfig<DollyInstanceConfig>;
+    readonly config: LoadedInstanceConfig<DollyInstanceConfigDialect>;
     readonly core: FileCoreStateStore;
     readonly commits: ModuleResultCommitCoordinator;
     readonly recovery: CoreStartupRecoveryReport;
@@ -233,13 +232,12 @@ export async function openDollyRuntime(
   options: OpenDollyRuntimeOptions,
 ): Promise<DollyRuntimeSession> {
   const now = options.now ?? (() => new Date().toISOString());
-  const configStore = new InstanceConfigStore({
-    schema: dollyInstanceConfigSchema,
+  const admission = new DollyInstanceConfigAdmission({
     registryDirectory: options.registryDirectory,
     defaultStateRoot: options.defaultStateRoot,
     now,
   });
-  const inspected = configStore.inspect(options.configPath);
+  const inspected = admission.inspect(options.configPath);
   if (inspected.document.modules.length > 0) {
     throw new RuntimeBootstrapError(
       "RUNTIME_MODULE_MIGRATION_REQUIRED",
@@ -259,9 +257,9 @@ export async function openDollyRuntime(
     now,
   });
   try {
-    let config: LoadedInstanceConfig<DollyInstanceConfig>;
+    let config: LoadedInstanceConfig<DollyInstanceConfigDialect>;
     try {
-      config = configStore.claim(inspected.configPath, {
+      config = admission.claim(inspected.configPath, {
         instanceId: inspected.instanceId,
         configRevision: inspected.configRevision,
       });
