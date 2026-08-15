@@ -8,6 +8,7 @@ import {
   InstanceConfigError,
   InstanceConfigStore,
 } from "./core/instance-config-store.js";
+import { DollyInstanceConfigAdmission } from "./core/instance-config-admission.js";
 import {
   InstanceControllerLock,
   InstanceControllerLockError,
@@ -203,7 +204,7 @@ async function migrateCoreState(options: {
   readonly stdout: TextOutput;
 }): Promise<number> {
   const { configPath, directories, confirmed, stdout } = options;
-  const store = configStore(directories);
+  const store = admissionConfigStore(directories);
   const inspected = store.inspect(configPath);
 
   if (!confirmed) {
@@ -316,6 +317,13 @@ function configStore(directories: DollyRuntimeDirectories) {
   });
 }
 
+function admissionConfigStore(directories: DollyRuntimeDirectories) {
+  return new DollyInstanceConfigAdmission({
+    registryDirectory: directories.registryDirectory,
+    defaultStateRoot: directories.defaultStateRoot,
+  });
+}
+
 function waitForProcessSignal(): Promise<void> {
   return new Promise((resolveWait) => {
     let received = false;
@@ -382,7 +390,7 @@ async function execute(
         "Usage: dolly config show [--config <path>]",
       );
     }
-    const inspected = configStore(directories).inspect(parsed.configPath);
+    const inspected = admissionConfigStore(directories).inspect(parsed.configPath);
     writeLine(stdout, JSON.stringify(inspected.redactedDocument, null, 2));
     return 0;
   }
