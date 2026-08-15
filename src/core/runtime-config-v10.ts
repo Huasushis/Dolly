@@ -1,4 +1,5 @@
-import { deepFreeze, type JsonValue } from "./canonical-json.js";
+import { cloneJson, deepFreeze, type JsonValue } from "./canonical-json.js";
+import { type InstanceConfigSchema } from "./instance-config-store.js";
 import {
   RuntimeConfigError,
   validateDollyInstanceConfig,
@@ -26,24 +27,24 @@ export type DollyInputConnectionStartV10 =
   | "from-now"
   | Readonly<{ checkpoint: string }>;
 
-export interface DollyInputConnectionV10 {
+export interface DollyInputConnectionV10 extends Readonly<Record<string, JsonValue>> {
   readonly pageId: string;
   readonly start: DollyInputConnectionStartV10;
 }
 
-export interface DollyModuleClaimLimitsV10 {
+export interface DollyModuleClaimLimitsV10 extends Readonly<Record<string, JsonValue>> {
   readonly baselineCount: number;
   readonly baselineBytes: number;
   readonly maxCount: number;
   readonly maxBytes: number;
 }
 
-export interface DollyModuleMailboxLimitsV10 {
+export interface DollyModuleMailboxLimitsV10 extends Readonly<Record<string, JsonValue>> {
   readonly maxResidentCount: number;
   readonly maxResidentBytes: number;
 }
 
-export interface DollyLinuxProcessExecutionV10 {
+export interface DollyLinuxProcessExecutionV10 extends Readonly<Record<string, JsonValue>> {
   readonly kind: "linux-process";
   readonly isolation: "process";
   readonly limits: Readonly<{
@@ -55,12 +56,12 @@ export interface DollyLinuxProcessExecutionV10 {
   }>;
 }
 
-export interface DollyPermissionPolicyReferenceV10 {
+export interface DollyPermissionPolicyReferenceV10 extends Readonly<Record<string, JsonValue>> {
   readonly policyId: string;
   readonly revision: string;
 }
 
-export interface DollySchedulerConfigV10 {
+export interface DollySchedulerConfigV10 extends Readonly<Record<string, JsonValue>> {
   readonly pollIntervalMs: number;
   readonly retryBaseMs: number;
   readonly retryMaxMs: number;
@@ -77,7 +78,7 @@ export interface DollySchedulerConfigV10 {
   readonly policyFailureAction: "quarantine";
 }
 
-export interface DollyModuleLimitsV10 {
+export interface DollyModuleLimitsV10 extends Readonly<Record<string, JsonValue>> {
   readonly claim: DollyModuleClaimLimitsV10;
   readonly mailbox: DollyModuleMailboxLimitsV10;
   readonly sourceRequestMaxBytes: number | null;
@@ -88,7 +89,7 @@ export interface DollyModuleLimitsV10 {
   readonly maxGenerations: number;
 }
 
-export interface DollyModuleConfigV10 {
+export interface DollyModuleConfigV10 extends Readonly<Record<string, JsonValue>> {
   readonly moduleId: string;
   readonly extensionId: string;
   readonly packageVersion: string;
@@ -104,14 +105,14 @@ export interface DollyModuleConfigV10 {
   readonly timeouts: DollyModuleTimeouts;
 }
 
-export interface DollyCoreLimitsV10 {
+export interface DollyCoreLimitsV10 extends Readonly<Record<string, JsonValue>> {
   readonly maxFailedAttempts: number;
   readonly maxStateBytes: number;
   readonly maxModuleResultCommitJournalBytes: number;
   readonly maxRegisteredContentValueBytes: number;
 }
 
-export interface DollyInstanceConfigV10Draft {
+export interface DollyInstanceConfigV10Draft extends Readonly<Record<string, JsonValue>> {
   readonly schemaVersion: "dolly.instance/10";
   readonly instanceId: string;
   readonly displayName: string;
@@ -1004,3 +1005,25 @@ export function planDollyInstanceConfigV10Migration(
     document,
   });
 }
+
+/**
+ * Instance-config schema over the complete validated version-10 draft. The
+ * product read path uses this only as the second dialect of configuration
+ * admission: a document is checked against the version-9 dialect first, and
+ * this schema is consulted only when the version-9 store rejects the document
+ * as not satisfying its closed schema. The accepted document is always the
+ * complete version-10 document; every version-10-only field participates in
+ * `configRevision`.
+ */
+export const dollyInstanceConfigV10Schema: InstanceConfigSchema<DollyInstanceConfigV10Draft> = {
+  schemaVersion: "dolly.instance/10",
+  validate: validateDollyInstanceConfigV10Draft,
+  instanceId: (document) => document.instanceId,
+  stateDirectory: (document) => document.stateDirectory ?? undefined,
+  withInstanceId: (document, instanceId) =>
+    validateDollyInstanceConfigV10Draft({
+      ...cloneJson(document),
+      instanceId,
+    } as unknown as JsonValue),
+  redact: (document) => cloneJson(document),
+};
