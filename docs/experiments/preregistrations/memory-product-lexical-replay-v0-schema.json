@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.invalid/schemas/memory-product-lexical-replay-v0-schema.json",
+  "title": "Memory product lexical replay v0 preregistration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema", "schemaVersion", "experimentId", "experimentVersion", "title",
+    "status", "scope", "protocol", "authorityReferences", "question",
+    "hypotheses", "decision", "conditions", "data", "backend", "randomness",
+    "metrics", "execution", "stoppingRules", "decisionRules", "artifacts",
+    "independentValidation", "safetyBoundary", "domainDesign"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "./memory-product-lexical-replay-v0-schema.json"
+    },
+    "schemaVersion": {
+      "const": "dolly-experiment-preregistration/v1"
+    },
+    "experimentId": {
+      "const": "memory-product-lexical-replay-v0"
+    },
+    "experimentVersion": {
+      "const": 1
+    },
+    "title": { "type": "string", "minLength": 20 },
+    "status": { "const": "frozen-before-first-run" },
+    "scope": { "const": "single-treatment-comparison" },
+    "protocol": {
+      "type": "string",
+      "minLength": 10,
+      "description": "Relative path to the protocol markdown that is frozen with this preregistration."
+    },
+    "authorityReferences": {
+      "type": "array",
+      "minItems": 4,
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "question": { "type": "string", "minLength": 40 },
+    "hypotheses": { "$ref": "#/$defs/hypotheses" },
+    "decision": { "$ref": "#/$defs/decision" },
+    "conditions": { "$ref": "#/$defs/conditions" },
+    "data": { "$ref": "#/$defs/data" },
+    "backend": { "$ref": "#/$defs/backend" },
+    "randomness": { "$ref": "#/$defs/randomness" },
+    "metrics": { "$ref": "#/$defs/metrics" },
+    "execution": { "$ref": "#/$defs/execution" },
+    "stoppingRules": { "$ref": "#/$defs/stoppingRules" },
+    "decisionRules": { "type": "object", "minProperties": 3 },
+    "artifacts": { "$ref": "#/$defs/artifacts" },
+    "independentValidation": { "$ref": "#/$defs/independentValidation" },
+    "safetyBoundary": { "$ref": "#/$defs/safetyBoundary" },
+    "domainDesign": { "$ref": "#/$defs/domainDesign" }
+  },
+  "$defs": {
+    "nonemptyString": { "type": "string", "minLength": 1 },
+    "stringArray": {
+      "type": "array", "minItems": 1,
+      "items": { "$ref": "#/$defs/nonemptyString" }
+    },
+    "hypotheses": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "decisionPositive", "decisionNegative"],
+      "properties": {
+        "primary": { "type": "string", "minLength": 20 },
+        "decisionPositive": { "type": "string", "minLength": 20 },
+        "decisionNegative": { "type": "string", "minLength": 20 }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supportedCondition", "decisionRuleReference"],
+      "properties": {
+        "supportedCondition": { "$ref": "#/$defs/nonemptyString" },
+        "decisionRuleReference": { "$ref": "#/$defs/nonemptyString" }
+      }
+    },
+    "conditions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baselines", "treatments"],
+      "properties": {
+        "baselines": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/condition" }
+        },
+        "treatments": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/condition" }
+        }
+      }
+    },
+    "condition": {
+      "id": "condition",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description", "frozenParameters"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonemptyString" },
+        "description": { "type": "string", "minLength": 20 },
+        "frozenParameters": { "type": "object", "minProperties": 1 }
+      }
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["datasetPath", "sha256", "questionCount", "splitDevelopment", "splitEvaluation", "caseSource", "goldIsolation"],
+      "properties": {
+        "datasetPath": { "$ref": "#/$defs/nonemptyString" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "questionCount": { "type": "integer", "minimum": 1 },
+        "splitDevelopment": { "type": "integer", "minimum": 0 },
+        "splitEvaluation": { "type": "integer", "minimum": 1 },
+        "caseSource": { "$ref": "#/$defs/nonemptyString" },
+        "goldIsolation": { "type": "string", "minLength": 20 }
+      }
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["implementation"],
+      "properties": {
+        "implementation": { "type": "string", "minLength": 10 }
+      }
+    },
+    "randomness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["determinism", "streamSeparation"],
+      "properties": {
+        "determinism": { "type": "string", "minLength": 10 },
+        "streamSeparation": { "type": "string", "minLength": 10 }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": true,
+      "minProperties": 1
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "treatmentEntry", "workerCount", "failurePolicy"],
+      "properties": {
+        "mode": { "const": "gold-blind-synthetic-first" },
+        "treatmentEntry": { "$ref": "#/$defs/nonemptyString" },
+        "workerCount": { "type": "integer", "minimum": 1 },
+        "failurePolicy": { "type": "string", "minLength": 10 }
+      }
+    },
+    "stoppingRules": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["maxCases", "maxWallClockMs"]
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "schemas"],
+      "properties": {
+        "root": { "$ref": "#/$defs/nonemptyString" },
+        "schemas": { "type": "object", "minProperties": 1 }
+      }
+    },
+    "independentValidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verifier", "mustNotImport", "recomputeSurface"],
+      "properties": {
+        "verifier": { "$ref": "#/$defs/nonemptyString" },
+        "mustNotImport": { "type": "array", "items": { "type": "string" } },
+        "recomputeSurface": { "type": "string", "minLength": 20 }
+      }
+    },
+    "safetyBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["automaticRecall", "automaticResume", "vectorRetrieval", "association", "checkpoint", "productStartup"],
+      "properties": {
+        "automaticRecall": { "const": false },
+        "automaticResume": { "const": false },
+        "vectorRetrieval": { "const": false },
+        "association": { "const": false },
+        "checkpoint": { "const": false },
+        "productStartup": { "const": false }
+      }
+    },
+    "domainDesign": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["extractor", "segment", "rank", "duplicate", "modeQuery"],
+      "properties": {
+        "extractor": { "$ref": "#/$defs/nonemptyString" },
+        "segment": { "$ref": "#/$defs/nonemptyString" },
+        "rank": { "$ref": "#/$defs/nonemptyString" },
+        "duplicate": { "$ref": "#/$defs/nonemptyString" },
+        "modeQuery": { "$ref": "#/$defs/nonemptyString" }
+      }
+    }
+  }
+}
