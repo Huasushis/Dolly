@@ -113,11 +113,10 @@ Each part MUST be registered through the ordinary Media registration path in
 `media.md` Section 3, so it obtains a digest, a bounded inspection, a
 registration record, and a resource node like any other Media item.
 
-Registration provenance MUST record that the bytes came from a host derivation.
-The provenance enumeration in `media.md` Section 3 does not yet contain such a
-value; adding one is a prerequisite for wiring this contract, and an
-implementation MUST fail closed rather than label a derived part with an
-unrelated provenance class such as `local-file` or `provider-output`.
+Registration provenance MUST record that the bytes came from a host derivation
+using the `derived` provenance class in `media.md` Section 3. An implementation
+MUST fail closed rather than label a derived part with an unrelated provenance
+class such as `local-file` or `provider-output`.
 
 The derivation record additionally stores `derivedFrom`, naming the source
 Media identifier and the part's position. `derivedFrom` is diagnostic data. It
@@ -349,15 +348,19 @@ What does **not** exist:
 - persistence of the derivation record. The current skeleton is in-process
   only, so it makes no crash-recovery claim and Section 6's startup recovery is
   unimplemented;
-- the `derived` provenance value required by Section 3;
+- the `derived` provenance value required by Section 3 now exists in
+  `MediaStore`, but the derivation pipeline is not wired to register parts
+  through it yet;
 - any Extension-facing derivation capability; and
 - registration of parts through a real `MediaStore`. The pipeline calls an
   injected registrar port so that tests need neither FFmpeg nor a configured
   Media store.
 
 Dolly MUST NOT describe audio segmentation or video frame extraction as
-available until the FFmpeg integration, the derivation record persistence, the
-provenance value, and live evidence from a real media file all exist.
+available until the FFmpeg integration, the derivation record persistence, and
+live evidence from a real media file all exist. The `derived` provenance value
+is a prerequisite that has been added; it does not by itself make derivation
+available.
 
 ## 11. Required evidence
 

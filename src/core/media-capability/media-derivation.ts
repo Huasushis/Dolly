@@ -10,8 +10,9 @@ import { deepFreeze, type JsonValue } from "../canonical-json.js";
  * unavailable, so an unconfigured deployment fails visibly instead of
  * silently returning the source or a shortened result. Section 10 of the
  * specification lists everything else that is still missing, including
- * derivation record persistence, the `derived` provenance value, crash
- * recovery, and any Extension-facing capability.
+ * derivation record persistence, crash recovery, and any Extension-facing
+ * capability. The `derived` provenance value has been added to `MediaStore`
+ * but the pipeline is not wired to register parts through it yet.
  */
 
 export type MediaDerivationOperation = "audio.split" | "video.extractFrames";
@@ -155,9 +156,10 @@ export interface DerivedPartRegistration {
 /**
  * The trusted-host port that turns produced bytes into registered Media.
  *
- * A real implementation calls `MediaStore.registerMedia` with a derivation
- * provenance. `media.md` does not define that provenance value yet, which is
- * one reason this pipeline is not wired to a real store.
+ * A real implementation calls `MediaStore.registerMedia` with the `derived`
+ * provenance class from `media.md` Section 3. That provenance value now exists,
+ * but this pipeline is still not wired to a real store because the derivation
+ * record persistence and the FFmpeg toolchain integration are absent.
  */
 export interface MediaDerivationRegistrar {
   registerDerivedPart(input: DerivedPartRegistration): Promise<string>;

@@ -83,12 +83,19 @@ export class InMemoryMediaByteStore implements MediaByteStore {
 }
 
 export interface MediaProvenance {
+  /**
+   * The class of authorized source that supplied the bytes. `derived` records
+   * bytes a host Media derivation produced from another Media item; it is set
+   * by trusted host code, never by an untrusted caller, and does not authorize
+   * anything. See `docs/spec/media-derivation.md` Section 3.
+   */
   readonly sourceClass:
     | "streamed-upload"
     | "extension-bytes"
     | "local-file"
     | "remote-fetch"
-    | "provider-output";
+    | "provider-output"
+    | "derived";
   /** Optional diagnostic text. It does not grant access or establish identity. */
   readonly sourceLabel?: string;
 }
@@ -774,7 +781,8 @@ function normalizeProvenance(value: MediaProvenance): MediaProvenance {
     value.sourceClass !== "extension-bytes" &&
     value.sourceClass !== "local-file" &&
     value.sourceClass !== "remote-fetch" &&
-    value.sourceClass !== "provider-output"
+    value.sourceClass !== "provider-output" &&
+    value.sourceClass !== "derived"
   ) {
     throw new MediaStoreError(
       "MEDIA_INSPECTION_INVALID",
@@ -855,7 +863,8 @@ function restoreMediaRecord(candidate: Media, maxMediaBytes: number, label: stri
     candidate.provenance.sourceClass !== "extension-bytes" &&
     candidate.provenance.sourceClass !== "local-file" &&
     candidate.provenance.sourceClass !== "remote-fetch" &&
-    candidate.provenance.sourceClass !== "provider-output"
+    candidate.provenance.sourceClass !== "provider-output" &&
+    candidate.provenance.sourceClass !== "derived"
   ) {
     throw new MediaStoreError(
       "MEDIA_SNAPSHOT_INVALID",
@@ -2657,7 +2666,8 @@ export class MediaStore implements MediaReferenceResolver {
         candidate.provenance.sourceClass !== "extension-bytes" &&
         candidate.provenance.sourceClass !== "local-file" &&
         candidate.provenance.sourceClass !== "remote-fetch" &&
-        candidate.provenance.sourceClass !== "provider-output"
+        candidate.provenance.sourceClass !== "provider-output" &&
+        candidate.provenance.sourceClass !== "derived"
       ) {
         throw new MediaStoreError(
           "MEDIA_SNAPSHOT_INVALID",
