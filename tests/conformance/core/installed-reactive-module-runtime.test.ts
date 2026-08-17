@@ -72,11 +72,16 @@ vi.mock("../../../src/linux-module-runtime-assets.js", async (importOriginal) =>
 }));
 import {
   composeInstalledReactiveModuleHost,
+  createInstalledFileCoreStateStoreWithStoppedRecordWriter,
   createInstalledReactiveModuleRuntime,
 } from "../../../src/adapters/installed-reactive-module-runtime.js";
-import { InstalledModulePermissionPolicyRegistry } from "../../../src/adapters/installed-module-permission-policy.js";
+import { deriveReservedV10InstalledModuleProcessProvenance } from "../../../src/adapters/installed-linux-extension-module-executor.js";
+import {
+  InstalledModulePermissionPolicyRegistry,
+  ReservedV10InstalledPermissionPolicyRegistry,
+} from "../../../src/adapters/installed-module-permission-policy.js";
 import type { BlockProposal } from "../../../src/core/block-store.js";
-import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
+import { canonicalJsonDigest, type JsonValue } from "../../../src/core/canonical-json.js";
 import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
 import { ModulePrivateStorageBackend } from "../../../src/core/capabilities/module-private-storage-capability.js";
 import { ContentSchemaRegistrationSet } from "../../../src/core/content-schema-registry.js";
@@ -87,9 +92,16 @@ import {
 } from "../../../src/core/core-startup-recovery.js";
 import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
 import { ExtensionInstallationRegistry } from "../../../src/core/extension-installation-registry.js";
-import { createFileCoreStateStoreWithStoppedRecordWriter } from "../../../src/core/file-core-state-store.js";
+import {
+  createFileCoreStateStoreWithStoppedRecordWriter,
+  migrateCoreStateDocumentToVersion19,
+  type FileCoreStateStoreOptions,
+} from "../../../src/core/file-core-state-store.js";
 import { FileMediaByteStore } from "../../../src/core/file-media-byte-store.js";
-import { resolveInstalledContentSchemaRegistrationSet } from "../../../src/core/installed-extension-module.js";
+import {
+  resolveInstalledContentSchemaRegistrationSet,
+  resolveReservedV10InstalledModulePlan,
+} from "../../../src/core/installed-extension-module.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { FileToolJournalRepository } from "../../../src/core/file-tool-journal-repository.js";
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
@@ -1873,5 +1885,202 @@ describe("installed reactive Module runtime composition", () => {
       "worker-two-module-generation-a",
     ]);
     expect(pair.store.listModuleProcessRecords()).toEqual([]);
+  });
+
+  describe("installed FileCore state construction seam", () => {
+    function reservedV10InstanceConfiguration(
+      packageVersion: string,
+      revision: string,
+    ): JsonValue {
+      const defaults = createDefaultDollyInstanceConfig(INSTANCE_ID);
+      return {
+        schemaVersion: "dolly.instance/10",
+        instanceId: INSTANCE_ID,
+        displayName: "Installed v10 seam fixture",
+        stateDirectory: null,
+        core: {
+          limits: {
+            ...defaults.core.limits,
+            maxRegisteredContentValueBytes: 64 * 1024,
+          },
+          media: defaults.core.media,
+          scheduler: {
+            pollIntervalMs: 100,
+            retryBaseMs: 250,
+            retryMaxMs: 30_000,
+            maxConcurrentModules: 1,
+            backpressureAction: "pause-upstream",
+            downstreamRecheckMs: 100,
+            noProgressAfterMs: 5_000,
+            retryJitterBasisPoints: 0,
+            lowWatermarkBasisPoints: 10_000,
+            policy: { kind: "fixed" },
+            policyFailureAction: "quarantine",
+          },
+        },
+        pages: [{ pageId: "input" }, { pageId: "output" }],
+        modules: [{
+          moduleId: "worker",
+          extensionId: "org.example.seam-authority",
+          packageVersion,
+          moduleKind: "transform",
+          configurationReference: {
+            configId: "seam-config",
+            revision,
+            configVersion: 1,
+          },
+          permissionPolicyReferences: [],
+          inputConnections: [{ pageId: "input", start: "from-now" }],
+          outputPageIds: ["output"],
+          activation: { kind: "reactive" },
+          declaredExternalEffects: "none",
+          execution: {
+            kind: "linux-process",
+            isolation: "process",
+            limits: {
+              memoryMaxBytes: 64 * 1024 * 1024,
+              maxTasks: 32,
+              cpuQuotaMicros: 100_000,
+              cpuPeriodMicros: 100_000,
+              maxOpenFiles: 128,
+            },
+          },
+          limits: {
+            claim: {
+              baselineCount: 1,
+              baselineBytes: 4096,
+              maxCount: 1,
+              maxBytes: 4096,
+            },
+            mailbox: { maxResidentCount: 16, maxResidentBytes: 64 * 1024 },
+            sourceRequestMaxBytes: null,
+            maxInputBytes: 4096,
+            maxResultBytes: 4096,
+            maxFrameBytes: 8192,
+            maxRunsPerGeneration: 10,
+            maxGenerations: 2,
+          },
+          timeouts: {
+            initializationTimeoutMs: 1000,
+            executionTimeoutMs: 1000,
+            cancellationGraceMs: 100,
+            terminationTimeoutMs: 1000,
+          },
+        }],
+        logging: defaults.logging,
+      };
+    }
+
+    function version19CoreState(name: string) {
+      const path = resolve(scratch, `${name}-core.json`);
+      let blockId = 0;
+      let deliveryId = 0;
+      const options: Omit<FileCoreStateStoreOptions, "declarationProvenanceAuthorityProvider"> = {
+        path,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `${name}-block-${++blockId}`,
+        nextDeliveryId: (kind) => `${name}-${kind}-${++deliveryId}`,
+        now: () => "2026-08-10T00:00:00.000Z",
+      } as const;
+      // Persist a fresh version 18 document first, the way an operator would.
+      createInstalledFileCoreStateStoreWithStoppedRecordWriter(options);
+      expect(migrateCoreStateDocumentToVersion19(path, {
+        runtimeConfiguration: {
+          maxFailedAttempts: 3,
+          media: { enabled: false as const },
+        },
+      }).status).toBe("migrated");
+      return createInstalledFileCoreStateStoreWithStoppedRecordWriter(options);
+    }
+
+    function installedV2Fixture() {
+      const source = resolve(scratch, "authority-source");
+      mkdirSync(source, { recursive: true, mode: 0o700 });
+      mkdirSync(resolve(source, "dist"), { recursive: true, mode: 0o700 });
+      writeFileSync(
+        resolve(source, "dist", "main.mjs"),
+        "export const installedFixture = true;\n",
+        "utf8",
+      );
+      writeFileSync(resolve(source, "dolly-extension.json"), JSON.stringify({
+        schemaVersion: "dolly.extension-package/1",
+        extensionId: "org.example.seam-authority",
+        packageVersion: "1.0.0",
+        displayName: "Installed seam authority fixture",
+        description: "Exercises installed process record declaration provenance.",
+        supportedProtocolVersions: ["3.0"],
+        entrypoint: "dist/main.mjs",
+        modules: [{
+          moduleKind: "transform",
+          activation: "reactive",
+          configVersion: 1,
+          configurationSchema: SCHEMA,
+        }],
+        requestedCapabilities: [],
+      }), "utf8");
+      installations.installNodePackage({
+        sourceDirectory: source,
+        trust: "trusted",
+      });
+      const configuration = configurations.create({
+        configId: "seam-config",
+        extensionId: "org.example.seam-authority",
+        moduleKind: "transform",
+        configVersion: 1,
+        schema: SCHEMA,
+        configuration: { prefix: "verified" },
+      });
+      const plan = resolveReservedV10InstalledModulePlan({
+        instanceConfiguration: reservedV10InstanceConfiguration(
+          "1.0.0",
+          configuration.revision,
+        ),
+        moduleId: "worker",
+        installations,
+        configurations,
+      });
+      const policySelection = new ReservedV10InstalledPermissionPolicyRegistry({
+        policies: [],
+      }).resolveFor(plan);
+      const provenance = deriveReservedV10InstalledModuleProcessProvenance(
+        plan,
+        policySelection,
+        activationPermission,
+      );
+      return { plan, provenance };
+    }
+
+    it("allocates and validates a version 2 record with declaration provenance through the installed boundary", () => {
+      const { plan, provenance } = installedV2Fixture();
+      const pair = version19CoreState("bound");
+      expect(pair.stoppedRecordWriter.isStoreBoundTo(pair.store)).toBe(true);
+      const record = pair.store.allocateAndAppendStartingRecord({
+        schemaVersion: "dolly.module-process-record/2",
+        instanceId: plan.instanceId,
+        moduleId: plan.module.moduleId,
+        moduleGenerationId: "module-generation-1",
+        packageDigest: plan.installation.packageDigest,
+        configurationReference: {
+          configId: plan.configuration.configId,
+          revision: plan.configuration.revision,
+          configVersion: plan.configuration.configVersion,
+        },
+        declaredExternalEffects: "none",
+        declarationProvenance: provenance,
+        serviceInvocationId: "2812432ad29e4d3bbd6776c62cafa929",
+        bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
+        delegatedRootCgroupPath: DELEGATED_ROOT,
+        state: "starting",
+        createdAt: "2026-08-10T00:00:00.000Z",
+        updatedAt: "2026-08-10T00:00:00.000Z",
+      });
+      expect(record.schemaVersion).toBe("dolly.module-process-record/2");
+      expect(record.declarationProvenance).toEqual({
+        schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
+        provenanceDigest: provenance.provenanceDigest,
+      });
+      expect(pair.store.listModuleProcessRecords()).toHaveLength(1);
+      expect(pair.stoppedRecordWriter.isBoundTo(record)).toBe(true);
+    });
   });
 });
