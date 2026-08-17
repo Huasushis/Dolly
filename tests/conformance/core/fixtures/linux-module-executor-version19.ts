@@ -161,6 +161,7 @@ export function createVersion19RecordStore(
       const {
         delegatedRootCgroupPath: _ignoredRoot,
         moduleCgroupPath: _ignoredCallerPath,
+        declarationProvenance: _ignoredProvenance,
         ...body
       } = input;
       current = {

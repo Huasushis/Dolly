@@ -53,6 +53,8 @@ import {
   assertValidModuleProcessRecord,
   assertValidModuleSubmissionRecord,
   canTransitionModuleProcessRecordState,
+  type ModuleProcessDeclarationProvenanceAuthority,
+  type ModuleProcessDeclarationProvenance,
   type ModuleProcessRecord,
   type ModuleProcessRecordState,
   type ModuleProcessStartingRecordInput,
@@ -247,6 +249,15 @@ export interface FileCoreStateStoreOptions {
   /** Frozen package/deployment registrations used for every Block validation. */
   readonly contentSchemas?: ContentSchemaRegistrationSet;
   readonly media?: FileCoreMediaOptions;
+  /**
+   * A provider for the Core-owned, store-bound version 2 declaration
+   * authority. Return an authority bound to the constructed store to
+   * allow version 2 starting-record allocation, or return nothing to keep
+   * every version 2 allocation refused.
+   */
+  readonly declarationProvenanceAuthorityProvider?: (
+    store: FileCoreStateStore,
+  ) => ModuleProcessDeclarationProvenanceAuthority;
 }
 
 export interface FileCoreStateStoreWithStoppedRecordWriter {
@@ -1003,6 +1014,7 @@ const MODULE_PROCESS_RECORD_FIELDS = new Set([
   "packageDigest",
   "configurationReference",
   "declaredExternalEffects",
+  "declarationProvenance",
   "serviceInvocationId",
   "bootId",
   "moduleCgroupPath",
@@ -1017,6 +1029,11 @@ const MODULE_PROCESS_CONFIGURATION_FIELDS = new Set([
   "configId",
   "revision",
   "configVersion",
+]);
+
+const MODULE_PROCESS_DECLARATION_PROVENANCE_FIELDS = new Set([
+  "schemaVersion",
+  "provenanceDigest",
 ]);
 
 const MODULE_SUBMISSION_RECORD_FIELDS = new Set([
@@ -1075,6 +1092,30 @@ function copyModuleProcessRecordInput(input: ModuleProcessRecord): unknown {
     configurationReference = copiedConfiguration;
   }
 
+  const declarationProvenanceInput = Reflect.get(
+    source,
+    "declarationProvenance",
+  ) as unknown;
+  let declarationProvenance: unknown = declarationProvenanceInput;
+  if (
+    declarationProvenanceInput !== null &&
+    typeof declarationProvenanceInput === "object" &&
+    !Array.isArray(declarationProvenanceInput)
+  ) {
+    const provenanceSource = declarationProvenanceInput as Record<string, unknown>;
+    const copiedProvenance: Record<string, unknown> = {
+      schemaVersion: Reflect.get(provenanceSource, "schemaVersion"),
+      provenanceDigest: Reflect.get(provenanceSource, "provenanceDigest"),
+    };
+    copyUnrecognizedFields(
+      provenanceSource,
+      Object.keys(provenanceSource),
+      MODULE_PROCESS_DECLARATION_PROVENANCE_FIELDS,
+      copiedProvenance,
+    );
+    declarationProvenance = copiedProvenance;
+  }
+
   const diagnosticPid = Reflect.get(source, "diagnosticPid") as unknown;
   const failureCode = Reflect.get(source, "failureCode") as unknown;
   const copied: Record<string, unknown> = {
@@ -1086,6 +1127,9 @@ function copyModuleProcessRecordInput(input: ModuleProcessRecord): unknown {
     packageDigest: Reflect.get(source, "packageDigest"),
     configurationReference,
     declaredExternalEffects: Reflect.get(source, "declaredExternalEffects"),
+    ...(declarationProvenance === undefined
+      ? {}
+      : { declarationProvenance }),
     serviceInvocationId: Reflect.get(source, "serviceInvocationId"),
     bootId: Reflect.get(source, "bootId"),
     moduleCgroupPath: Reflect.get(source, "moduleCgroupPath"),
@@ -1467,6 +1511,14 @@ export class FileCoreStateStore {
    */
   #processGenerationIdCounter: number | undefined;
 
+  /**
+   * The store-bound version 2 declaration-provenance authority, or
+   * undefined to keep every version 2 allocation refused. Core owns the
+   * capability slot; the installed composition supplies its `verify` at
+   * construction.
+   */
+  #declarationProvenanceAuthority: ModuleProcessDeclarationProvenanceAuthority | undefined;
+
   constructor(options: FileCoreStateStoreOptions) {
     if (
       typeof options.path !== "string" ||
@@ -1723,6 +1775,23 @@ export class FileCoreStateStore {
           this.#writeStoppedModuleProcessRecord(processGenerationId, failureCode),
       }),
     );
+
+    // The declaration-provenance authority is Core-owned and store-bound.
+    // The option supplies only the `verify` implementation, wired to the
+    // WeakSet in the installed composition. A foreign-store authority fails
+    // construction, and a store without an authority refuses every version 2
+    // allocation.
+    const declarationProvenanceAuthority =
+      options.declarationProvenanceAuthorityProvider?.(this);
+    if (declarationProvenanceAuthority !== undefined) {
+      if (!declarationProvenanceAuthority.isStoreBoundTo(this)) {
+        throw new CoreStateError(
+          "CORE_STATE_IO_FAILED",
+          "The Module process declaration provenance authority is not bound to this store",
+        );
+      }
+      this.#declarationProvenanceAuthority = declarationProvenanceAuthority;
+    }
   }
 
   /**
@@ -2076,6 +2145,25 @@ export class FileCoreStateStore {
       input.delegatedRootCgroupPath,
       identity,
     );
+    let declarationProvenanceBinding:
+      | ModuleProcessDeclarationProvenance
+      | undefined;
+    if (input.schemaVersion === "dolly.module-process-record/2") {
+      if (input.declarationProvenance === undefined) {
+        throw new ModuleProcessRecordError(
+          "MODULE_PROCESS_RECORD_INVALID",
+          "A version 2 starting record input must carry a declaration provenance value",
+        );
+      }
+      const authority = this.#declarationProvenanceAuthority;
+      if (authority === undefined) {
+        throw new ModuleProcessRecordError(
+          "MODULE_PROCESS_RECORD_DECLARATION_PROVENANCE_REQUIRED",
+          "Version 2 starting records require a store-bound declaration provenance authority",
+        );
+      }
+      declarationProvenanceBinding = authority.verify(input);
+    }
     const copiedRecord: ModuleProcessRecord = {
       schemaVersion: input.schemaVersion,
       instanceId: input.instanceId,
@@ -2085,6 +2173,9 @@ export class FileCoreStateStore {
       packageDigest: input.packageDigest,
       configurationReference: input.configurationReference,
       declaredExternalEffects: input.declaredExternalEffects,
+      ...(declarationProvenanceBinding === undefined
+        ? {}
+        : { declarationProvenance: declarationProvenanceBinding }),
       serviceInvocationId: input.serviceInvocationId,
       bootId: input.bootId,
       moduleCgroupPath: derived.filesystemPath,

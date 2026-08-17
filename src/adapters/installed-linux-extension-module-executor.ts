@@ -8,6 +8,7 @@ import {
 import type { ExtensionInstallationRegistry } from "../core/extension-installation-registry.js";
 import type { ExtensionSessionIdentity } from "../core/extension-capability.js";
 import type { ExtensionProcessHost } from "../core/extension-process-host.js";
+import type { FileCoreStateStore } from "../core/file-core-state-store.js";
 import {
   assertReservedV10InstalledModulePlan,
   resolveInstalledExtensionModule,
@@ -22,6 +23,7 @@ import type { ModuleExecutor } from "../core/module-actor.js";
 import type { ModuleConfigurationStore } from "../core/module-configuration-store.js";
 import {
   assertValidModuleProcessRecord,
+  type ModuleProcessDeclarationProvenanceAuthority,
   type ModuleProcessRecord,
   type ModuleProcessStartingRecordInput,
 } from "../core/module-process-records.js";
@@ -223,6 +225,69 @@ export function assertReservedV10InstalledModuleProcessProvenance(
       "Reserved version-10 Module process provenance was not minted by the installed composition",
     );
   }
+}
+
+/**
+ * The store-bound authority that persists a WeakSet-authenticated reserved
+ * version-10 process provenance on a version 2 Module process record. Product
+ * composition passes this function directly as the store's
+ * `declarationProvenanceAuthorityProvider`, or a wrapper of it. Records
+ * allocated by the returned authority bind the exact instance, Module,
+ * package, configuration, policy selection, and Linux execution values the
+ * provenance embeds; forged or copied values fail verification.
+ */
+export function createInstalledModuleProcessDeclarationProvenanceAuthority(
+  store: FileCoreStateStore,
+): ModuleProcessDeclarationProvenanceAuthority {
+  return Object.freeze({
+    isStoreBoundTo: (candidate: unknown) => candidate === store,
+    verify: (input: ModuleProcessStartingRecordInput) => {
+      if (input.schemaVersion !== "dolly.module-process-record/2") {
+        throw new TypeError(
+          "Version 1 starting records carry no declaration provenance to authenticate",
+        );
+      }
+      const provenance = input.declarationProvenance;
+      if (provenance === undefined) {
+        throw new TypeError(
+          "A version 2 starting record must carry its reserved version-10 declaration provenance",
+        );
+      }
+      assertReservedV10InstalledModuleProcessProvenance(provenance);
+      const snapshot = provenance.snapshot as Record<string, unknown> & {
+        readonly instanceId: string;
+        readonly moduleId: string;
+        readonly packageDigest: string;
+        readonly declaredExternalEffects: string;
+        readonly configuration: { readonly revision: string };
+      };
+      if (input.instanceId !== snapshot.instanceId) {
+        throw new TypeError("Declaration provenance is not bound to this instance");
+      }
+      if (input.moduleId !== snapshot.moduleId) {
+        throw new TypeError("Declaration provenance is not bound to this Module");
+      }
+      if (input.packageDigest !== snapshot.packageDigest) {
+        throw new TypeError("Declaration provenance packageDigest does not match the input");
+      }
+      if (
+        input.configurationReference.revision !== snapshot.configuration.revision
+      ) {
+        throw new TypeError(
+          "Declaration provenance configuration revision does not match the input",
+        );
+      }
+      if (input.declaredExternalEffects !== snapshot.declaredExternalEffects) {
+        throw new TypeError(
+          "Declaration provenance declaredExternalEffects does not match the input",
+        );
+      }
+      return Object.freeze({
+        schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
+        provenanceDigest: provenance.provenanceDigest,
+      });
+    },
+  });
 }
 
 function assertNoDerivedFields(

@@ -54,7 +54,7 @@ import {
   FileCoreStateStore,
   createFileCoreStateStoreWithStoppedRecordWriter,
   migrateCoreStateDocumentToVersion19,
-  type CoreStateError,
+  CoreStateError,
   type CoreStateMigrationResult,
 } from "../../../src/core/file-core-state-store.js";
 import {
@@ -69,11 +69,15 @@ import {
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import {
   assertValidModuleProcessRecord,
+  type ModuleProcessDeclarationProvenanceAuthority,
   type ModuleProcessRecord,
   type ModuleProcessRecordError,
   type ModuleProcessStoppedRecordWriter,
   type ModuleProcessStartingRecordInput,
 } from "../../../src/core/module-process-records.js";
+import {
+  createInstalledModuleProcessDeclarationProvenanceAuthority,
+} from "../../../src/adapters/installed-linux-extension-module-executor.js";
 
 const MIGRATION_OPTIONS = {
   runtimeConfiguration: {
@@ -601,6 +605,96 @@ describe("CORE process-generation identity domain (version 19)", () => {
         status: "already-current",
         schemaVersion: "dolly.core-state/19",
       });
+    });
+  });
+
+  describe("version 2 declaration provenance authority gate", () => {
+    function openStoreWithAuthority(
+      prefix: string,
+      authority: ModuleProcessDeclarationProvenanceAuthority,
+    ): FileCoreStateStore {
+      let blockId = 0;
+      let runtimeId = 0;
+      const created = createFileCoreStateStoreWithStoppedRecordWriter({
+        path,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `${prefix}-block-${++blockId}`,
+        nextDeliveryId: (kind) => `${prefix}-${kind}-${++runtimeId}`,
+        now: () => clock,
+        declarationProvenanceAuthorityProvider: () => authority,
+      });
+      return created.store;
+    }
+
+    it("refuses a version 2 allocation when no authority is bound", () => {
+      const store = migrateToVersion19("no-authority");
+      expect(() =>
+        store.allocateAndAppendStartingRecord(
+          startingRecord({
+            schemaVersion: "dolly.module-process-record/2",
+            declarationProvenance: { minted: true },
+          }),
+        ),
+      ).toThrowError(
+        expect.objectContaining<Partial<ModuleProcessRecordError>>({
+          code: "MODULE_PROCESS_RECORD_DECLARATION_PROVENANCE_REQUIRED",
+        }),
+      );
+    });
+
+    it("refuses construction when the authority is not store-bound", () => {
+      const foreign = openStore("foreign");
+      let blockId = 0;
+      let runtimeId = 0;
+      expect(() =>
+        createFileCoreStateStoreWithStoppedRecordWriter({
+          path: join(root, "core-state-foreign-auth.json"),
+          maxFailedAttempts: 3,
+          nextBlockId: () => `foreign-auth-block-${++blockId}`,
+          nextDeliveryId: (kind) => `foreign-auth-${kind}-${++runtimeId}`,
+          now: () => clock,
+          declarationProvenanceAuthorityProvider: () =>
+            createInstalledModuleProcessDeclarationProvenanceAuthority(foreign),
+        }),
+      ).toThrowError(CoreStateError);
+    });
+
+    it("allocates a version 2 record when the store-bound authority verifies", () => {
+      const DIGEST_C = `sha256:${"c".repeat(64)}`;
+      migrateToVersion19("with-authority");
+      // Reopen the migrated document with a provider that binds the
+      // authority to the store under construction, the same way the
+      // installed composition calls
+      // `createInstalledModuleProcessDeclarationProvenanceAuthority(store)`.
+      let blockId = 0;
+      let runtimeId = 0;
+      const reopened = createFileCoreStateStoreWithStoppedRecordWriter({
+        path,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `with-auth-block-${++blockId}`,
+        nextDeliveryId: (kind) => `with-auth-${kind}-${++runtimeId}`,
+        now: () => clock,
+        declarationProvenanceAuthorityProvider: (store) => ({
+          isStoreBoundTo: (candidate: unknown) => candidate === store,
+          verify: () => ({
+            schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
+            provenanceDigest: DIGEST_C,
+          }),
+        }),
+      }).store;
+      const record = reopened.allocateAndAppendStartingRecord(
+        startingRecord({
+          schemaVersion: "dolly.module-process-record/2",
+          declaredExternalEffects: "none",
+          declarationProvenance: { minted: true },
+        }),
+      );
+      expect(record.schemaVersion).toBe("dolly.module-process-record/2");
+      expect(record.declarationProvenance).toEqual({
+        schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
+        provenanceDigest: DIGEST_C,
+      });
+      assertValidModuleProcessRecord(record);
     });
   });
 });
