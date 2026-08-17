@@ -174,9 +174,11 @@ that field to `false` and retains only the input identity fields through
 registration ID.
 
 Provenance records how authorized bytes entered the store; for example,
-`local-file` means an approved local-file reader supplied them and
-`remote-fetch` means an approved remote fetch supplied them. Provenance is
-diagnostic data and never substitutes for a Media ingress capability.
+`local-file` means an approved local-file reader supplied them,
+`remote-fetch` means an approved remote fetch supplied them, and `derived`
+means a trusted-host Media derivation produced them from another Media item.
+Provenance is diagnostic data and never substitutes for a Media ingress
+capability.
 
 At an untrusted ingress boundary, a Media ingress capability binds one subject,
 one ingress mode, and one registration ID before file, network, or byte-stream
