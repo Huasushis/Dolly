@@ -3,10 +3,12 @@
 //! input tape; the reducer performs no input/output.
 
 mod command;
+mod disposition;
 mod projection;
 mod reducer;
 mod types;
 
+pub use disposition::{Disposition, DispositionShapeError, validate_disposition_candidate};
 pub use command::{
     ApplyResultCommand, BeginFenceCommand, BuildManifestCommand, CancelActivationCommand,
     CompleteQuarantineFenceCommand, CoreCommand, DeadLetterRangeCommand, DispatchLeaseCommand,
