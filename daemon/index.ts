@@ -6,6 +6,29 @@ import { randomBytes } from "node:crypto";
 import net from "node:net";
 import { handleRequest, handleUpgrade, broadcaster } from "./api.js";
 import { IpcServer, IpcClient, getIpcPath } from "../src/core/ipc.js";
+import { observeHostPlatform } from "../src/core/host-platform.js";
+
+// ── Platform gate ─────────────────────────────────────────────────
+
+export type DaemonPlatformErrorCode = "DAEMON_PLATFORM_UNSUPPORTED";
+
+/**
+ * Stable typed refusal raised before the daemon performs any durable mutation
+ * (configuration file, instance registry, PID file, or Unix-domain socket) on a
+ * host the supported runtime does not own. The host platform is read through
+ * the zero-argument observer in `src/core/host-platform.ts`, the same trusted
+ * seam the Linux Module activation and Core service binding gates use, so the
+ * refusal is provable on Linux CI without exposing platform as configuration.
+ */
+export class DaemonPlatformError extends Error {
+  readonly code: DaemonPlatformErrorCode;
+
+  constructor(code: DaemonPlatformErrorCode, message: string) {
+    super(message);
+    this.name = "DaemonPlatformError";
+    this.code = code;
+  }
+}
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -86,6 +109,13 @@ export class Daemon {
   private healthFailures: Map<string, number> = new Map();
 
   constructor() {
+    const platform = observeHostPlatform();
+    if (platform !== "linux") {
+      throw new DaemonPlatformError(
+        "DAEMON_PLATFORM_UNSUPPORTED",
+        `The Dolly daemon is supported on Linux but this process runs on ${platform}`,
+      );
+    }
     this.configDir = resolve(".dolly", "daemon");
     this.registryPath = resolve(this.configDir, "registry.json");
     this.config = this.loadOrCreateConfig();
