@@ -6,6 +6,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -44,6 +45,99 @@ vi.mock("../../../src/core/linux-module-cgroup.js", async (importOriginal) => ({
     root: activationFixture.root,
   })),
 }));
+vi.mock("../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js")>();
+  return {
+    ...original,
+    startLinuxModuleLauncher: vi.fn(() => {
+      const stdin = new PassThrough();
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      return {
+        processId: 4242,
+        child: { stdin, stdout, stderr },
+        controller: {},
+        waitForExit: () => Promise.resolve(true),
+        exit: undefined,
+        launchError: undefined,
+        waitForLaunchError: () => Promise.resolve(undefined),
+        writeRawControlBytes: () => undefined,
+        closeControlChannel: () => undefined,
+      };
+    }),
+  };
+});
+vi.mock("../../../src/adapters/linux-module-launcher/module-launcher-control.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../../../src/adapters/linux-module-launcher/module-launcher-control.js")>();
+  return {
+    ...original,
+    createModuleLauncherControl: vi.fn(() => ({
+      processId: 4242,
+      configure: async () => undefined,
+      authorizeExecution: async () => ({
+        executionAuthorized: true,
+        verifiedProcessIds: [4242],
+      }) as const,
+      requestExit: async () => true,
+    })),
+  };
+});
+vi.mock("../../../src/adapters/extension-process-module-executor.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../../../src/adapters/extension-process-module-executor.js")>();
+  return {
+    ...original,
+    createExtensionProcessLinuxProtocolSession: vi.fn(() => ({
+      initialize: async () => undefined,
+      execute: async () => ({ schemaVersion: "dolly.module-result/1" }) as ReactiveModuleResult,
+      cancel: async () => undefined,
+      closeCapabilitySession: async () => undefined,
+      waitForChannelClosed: async () => true,
+    })),
+  };
+});
+vi.mock("../../../src/core/extension-process-host.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../../../src/core/extension-process-host.js")>();
+  return {
+    ...original,
+    ExtensionProcessHost: class {
+      readonly options: {
+        instanceId: string;
+        moduleId: string;
+        moduleGenerationId: string;
+        moduleKind: string;
+        manifest: { extensionId: string; packageVersion: string };
+        nextIdentifier?: (purpose: "process-generation" | "session" | "request") => string;
+      };
+      readonly processGenerationId: string;
+      readonly sessionId: string;
+      constructor(options: {
+        instanceId: string;
+        moduleId: string;
+        moduleGenerationId: string;
+        moduleKind: string;
+        manifest: { extensionId: string; packageVersion: string };
+        nextIdentifier?: (purpose: "process-generation" | "session" | "request") => string;
+      }) {
+        this.options = { ...options };
+        this.processGenerationId =
+          options.nextIdentifier?.("process-generation") ?? "process-generation";
+        this.sessionId = options.nextIdentifier?.("session") ?? "session";
+      }
+      get snapshot(): Record<string, unknown> {
+        return Object.freeze({
+          isolation: "process",
+          state: "created",
+          extensionId: this.options.manifest.extensionId,
+          instanceId: this.options.instanceId,
+          moduleId: this.options.moduleId,
+          moduleGenerationId: this.options.moduleGenerationId,
+          processGenerationId: this.options.nextIdentifier?.("process-generation") ?? this.processGenerationId,
+          sessionId: this.sessionId,
+        });
+      }
+    },
+  };
+});
 vi.mock("../../../src/linux-module-runtime-assets.js", async (importOriginal) => {
   const original = await importOriginal<typeof import("../../../src/linux-module-runtime-assets.js")>();
   return {
@@ -1423,6 +1517,92 @@ describe("installed Extension Module resolution", () => {
     await composition.terminate({
       moduleId: options.moduleId,
       moduleGenerationId: options.moduleGenerationId,
+    });
+    expect(records.current?.state).toBe("stopped");
+    expect(records.current?.processGenerationId)
+      .toBe(VERSION19_MINTED_PROCESS_GENERATION_ID);
+    expect(records.log).toEqual([
+      "allocate",
+      "state:running",
+      "state:stopping",
+      "state:stopped",
+    ]);
+    expect(records.log).not.toContain("append");
+  });
+
+  it("binds a version 19 generation factory to the store-minted process generation", async () => {
+    const source = resolve(scratch, "source-v19-factory");
+    writePackage(source, "1.0.0");
+    installations.installNodePackage({ sourceDirectory: source, trust: "trusted" });
+    const configuration = configurations.create({
+      configId: "worker-config",
+      extensionId: "org.example.installed",
+      moduleKind: "transform",
+      configVersion: 1,
+      schema: CONFIGURATION_SCHEMA,
+      configuration: { prefix: "composed" },
+    });
+    const records = createVersion19RecordStore();
+    const fileSystem = cgroupFileSystemFor();
+    const coreStateDirectory = resolve(scratch, "instance-state");
+    mkdirSync(coreStateDirectory, { recursive: true, mode: 0o700 });
+    const factory = createInstalledLinuxExtensionModuleGenerationFactory({
+      instanceConfiguration: instanceConfiguration("1.0.0", configuration.revision),
+      moduleId: "worker",
+      installations,
+      configurations,
+      coreStateDirectory,
+      activation,
+      lifecycle: {
+        records,
+        stoppedRecordWriter: records.stoppedRecordWriter,
+        cgroupFileSystem: fileSystem,
+        limits: {
+          memoryMaxBytes: 64 * 1_024 * 1_024,
+          maxProcesses: 16,
+          cpuQuotaMicros: 50_000,
+          cpuPeriodMicros: 100_000,
+        },
+        maxOpenFiles: 64,
+      },
+      host: {
+        isolationPolicy: new ExtensionIsolationPolicy(),
+      },
+      executionTimeoutMs: 1_000,
+      cancellationGraceMs: 250,
+      terminationTimeoutMs: 2_000,
+      channelCloseTimeoutMs: 1_000,
+      nextProcessGenerationId: () => PROCESS_IDENTITY.processGenerationId,
+      wallClockNow: () => Date.parse("2026-08-10T00:00:00.000Z"),
+    });
+
+    const executor = factory.createExecutor(MODULE_GENERATION_ID);
+    if (executor.start === undefined || executor.terminate === undefined) {
+      throw new Error("the factory executor must provide start and terminate");
+    }
+    await executor.start();
+
+    expect(records.log[0]).toBe("allocate");
+    expect(records.log).not.toContain("append");
+    expect(records.current?.state).toBe("running");
+    expect(records.current?.processGenerationId)
+      .toBe(VERSION19_MINTED_PROCESS_GENERATION_ID);
+    expect(records.getModuleProcessRecord(PROCESS_IDENTITY.processGenerationId))
+      .toBeUndefined();
+    expect(factory.processGenerationIdFor(MODULE_GENERATION_ID))
+      .toBe(VERSION19_MINTED_PROCESS_GENERATION_ID);
+    const mintedPath = version19CgroupPath(
+      {
+        instanceId: PROCESS_IDENTITY.instanceId,
+        moduleId: PROCESS_IDENTITY.moduleId,
+      },
+      VERSION19_MINTED_PROCESS_GENERATION_ID,
+    );
+    expect(fileSystem.directories.has(mintedPath)).toBe(true);
+
+    await executor.terminate({
+      moduleId: "worker",
+      moduleGenerationId: MODULE_GENERATION_ID,
     });
     expect(records.current?.state).toBe("stopped");
     expect(records.current?.processGenerationId)

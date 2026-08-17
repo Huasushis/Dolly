@@ -595,24 +595,25 @@ export function createInstalledLinuxExtensionModuleGenerationFactory(
       configureHost: (host, process) => {
         configuredHost?.(host, process);
         const snapshot = host.snapshot;
+        const durableProcessGenerationId = process.record.processGenerationId;
         if (
           snapshot.state !== "created" ||
           snapshot.instanceId !== process.record.instanceId ||
           snapshot.moduleId !== process.record.moduleId ||
           snapshot.moduleGenerationId !== process.record.moduleGenerationId ||
-          snapshot.processGenerationId !== process.record.processGenerationId ||
-          snapshot.processGenerationId !== processGenerationId
+          snapshot.processGenerationId !== durableProcessGenerationId
         ) {
           throw new TypeError(
             "Installed Extension Host session does not match its authorized process generation",
           );
         }
-        if (hostByProcessGeneration.has(processGenerationId)) {
+        if (hostByProcessGeneration.has(durableProcessGenerationId)) {
           throw new TypeError(
-            `Process generation ${processGenerationId} already has an Extension Host session`,
+            `Process generation ${durableProcessGenerationId} already has an Extension Host session`,
           );
         }
-        hostByProcessGeneration.set(processGenerationId, host);
+        hostByProcessGeneration.set(durableProcessGenerationId, host);
+        processByModuleGeneration.set(moduleGenerationId, durableProcessGenerationId);
       },
     });
     processByModuleGeneration.set(moduleGenerationId, processGenerationId);
