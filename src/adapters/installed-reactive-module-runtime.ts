@@ -8,8 +8,12 @@ import { FileEffectIntentStore } from "../core/capabilities/file-effect-intent-s
 import { ContentSchemaRegistrationSet } from "../core/content-schema-registry.js";
 import type { DeliveryMailboxCapacity, FailureClassification } from "../core/delivery-store.js";
 import type { ExtensionInstallationRegistry } from "../core/extension-installation-registry.js";
-import { FileCoreStateStore } from "../core/file-core-state-store.js";
-import type { FileCoreStateStoreWithStoppedRecordWriter } from "../core/file-core-state-store.js";
+import {
+  createFileCoreStateStoreWithStoppedRecordWriter,
+  FileCoreStateStore,
+  type FileCoreStateStoreOptions,
+  type FileCoreStateStoreWithStoppedRecordWriter,
+} from "../core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../core/file-module-result-commit-repository.js";
 import {
   assertLinuxModuleActivationPermission,
@@ -57,6 +61,7 @@ import type { DollyInstanceConfig } from "../core/runtime-config.js";
 import { createExtensionEffectJournalLifecycle } from "./extension-effect-run-lifecycle.js";
 import {
   createInstalledLinuxExtensionModuleGenerationFactory,
+  createInstalledModuleProcessDeclarationProvenanceAuthority,
   INSTALLED_PROCESS_EFFECT_DECLARATION,
   type InstalledLinuxExtensionModuleGenerationFactory,
   type InstalledLinuxExtensionModuleGenerationFactoryOptions,
@@ -138,6 +143,23 @@ function canonicalNow(now: () => string): string {
     throw new TypeError("Installed Module runtime wall clock returned an invalid time");
   }
   return new Date(milliseconds).toISOString();
+}
+
+/**
+ * @internal Installed-adapter construction seam. Creates FileCore state with
+ * a store-bound process-record/2 declaration-provenance authority and the
+ * stopped-record writer, so v2 starting records can be allocated and
+ * validated from one store. No public runtime path calls this yet; public
+ * activation remains guarded.
+ */
+export function createInstalledFileCoreStateStoreWithStoppedRecordWriter(
+  options: Omit<FileCoreStateStoreOptions, "declarationProvenanceAuthorityProvider">,
+): FileCoreStateStoreWithStoppedRecordWriter {
+  return createFileCoreStateStoreWithStoppedRecordWriter({
+    ...options,
+    declarationProvenanceAuthorityProvider: (store) =>
+      createInstalledModuleProcessDeclarationProvenanceAuthority(store),
+  });
 }
 
 /**
