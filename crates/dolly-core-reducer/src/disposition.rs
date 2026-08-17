@@ -46,9 +46,7 @@ pub enum DispositionShapeError {
 ///
 /// Accepts exactly `{"disposition": "transfer", "target_id": <string>}` and
 /// non-transfer dispositions without `target_id`; rejects everything else.
-pub fn validate_disposition_candidate(
-    candidate: &Value,
-) -> Result<(), DispositionShapeError> {
+pub fn validate_disposition_candidate(candidate: &Value) -> Result<(), DispositionShapeError> {
     let object = candidate
         .as_object()
         .ok_or(DispositionShapeError::NotAnObject)?;
@@ -101,25 +99,35 @@ mod tests {
     #[test]
     fn non_transfer_rejects_target() {
         assert_eq!(
-            validate_disposition_candidate(&json!({"disposition": "audited_discard", "target_id": "replacement-module"})),
+            validate_disposition_candidate(
+                &json!({"disposition": "audited_discard", "target_id": "replacement-module"})
+            ),
             Err(DispositionShapeError::TargetNotAllowed(
                 Disposition::AuditedDiscard
             ))
         );
         assert_eq!(
             validate_disposition_candidate(&json!({"disposition": "archive", "target_id": "m"})),
-            Err(DispositionShapeError::TargetNotAllowed(Disposition::Archive))
+            Err(DispositionShapeError::TargetNotAllowed(
+                Disposition::Archive
+            ))
         );
         assert_eq!(
-            validate_disposition_candidate(&json!({"disposition": "dead_letter", "target_id": "m"})),
-            Err(DispositionShapeError::TargetNotAllowed(Disposition::DeadLetter))
+            validate_disposition_candidate(
+                &json!({"disposition": "dead_letter", "target_id": "m"})
+            ),
+            Err(DispositionShapeError::TargetNotAllowed(
+                Disposition::DeadLetter
+            ))
         );
     }
 
     #[test]
     fn transfer_with_target_ok() {
         assert_eq!(
-            validate_disposition_candidate(&json!({"disposition": "transfer", "target_id": "replacement-module"})),
+            validate_disposition_candidate(
+                &json!({"disposition": "transfer", "target_id": "replacement-module"})
+            ),
             Ok(())
         );
     }
@@ -161,7 +169,9 @@ mod tests {
     #[test]
     fn closed_field_set_and_disposition_set() {
         assert_eq!(
-            validate_disposition_candidate(&json!({"disposition": "transfer", "target_id": "m", "extra": 1})),
+            validate_disposition_candidate(
+                &json!({"disposition": "transfer", "target_id": "m", "extra": 1})
+            ),
             Err(DispositionShapeError::UnknownField("extra".into()))
         );
         assert_eq!(

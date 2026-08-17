@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fs, path::{Path, PathBuf}};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use dolly_core_reducer::validate_disposition_candidate;
 use serde_json::Value;
@@ -15,10 +19,8 @@ fn spec_root() -> PathBuf {
 }
 fn read_vector() -> Value {
     serde_json::from_slice(
-        &fs::read(
-            spec_root().join("test-vectors/config/TST-CONFIG-002-disposition-target.json"),
-        )
-        .unwrap(),
+        &fs::read(spec_root().join("test-vectors/config/TST-CONFIG-002-disposition-target.json"))
+            .unwrap(),
     )
     .unwrap()
 }
@@ -29,7 +31,10 @@ fn tst_config_002_disposition_target_vector() {
     assert_eq!(vector["schema"], "dolly.test-vector/v1");
     assert_eq!(vector["test_id"], "TST-CONFIG-002");
     assert_eq!(vector["kind"], "config");
-    assert_eq!(vector["expected"]["outcome"], "only_closed_transfer_shape_accepted");
+    assert_eq!(
+        vector["expected"]["outcome"],
+        "only_closed_transfer_shape_accepted"
+    );
 
     // Build `/cases/<name>/valid` expectations from the fixture assertions.
     let mut expected_valid: BTreeMap<&str, bool> = BTreeMap::new();
@@ -41,9 +46,15 @@ fn tst_config_002_disposition_target_vector() {
         expected_valid.insert(path[2], assertion["value"].as_bool().unwrap());
     }
 
-    let cases = vector["stimulus"]["validate_candidates"].as_array().unwrap();
+    let cases = vector["stimulus"]["validate_candidates"]
+        .as_array()
+        .unwrap();
     assert!(!cases.is_empty());
-    assert_eq!(expected_valid.len(), cases.len(), "every case needs an assertion");
+    assert_eq!(
+        expected_valid.len(),
+        cases.len(),
+        "every case needs an assertion"
+    );
 
     let mut accepted = 0usize;
     for case in cases {

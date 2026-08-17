@@ -8,7 +8,6 @@ mod projection;
 mod reducer;
 mod types;
 
-pub use disposition::{Disposition, DispositionShapeError, validate_disposition_candidate};
 pub use command::{
     ApplyResultCommand, BeginFenceCommand, BuildManifestCommand, CancelActivationCommand,
     CompleteQuarantineFenceCommand, CoreCommand, DeadLetterRangeCommand, DispatchLeaseCommand,
@@ -18,6 +17,7 @@ pub use command::{
     ReleaseStorageWriterCommand, ResolveQuarantineCommand, ResolveQuarantineResolution,
     RuntimeEventCommand, SkipRangeCommand,
 };
+pub use disposition::{Disposition, DispositionShapeError, validate_disposition_candidate};
 pub use projection::{hash_core_state, project_core_state};
 pub use reducer::{SafetyStop, Transition, reduce};
 pub use types::{
