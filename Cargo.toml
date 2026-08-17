@@ -5,6 +5,7 @@ members = [
     "crates/dolly-core-domain",
     "crates/dolly-schema",
     "crates/dolly-core-reducer",
+    "crates/dolly-protocol",
 ]
 
 [workspace.package]

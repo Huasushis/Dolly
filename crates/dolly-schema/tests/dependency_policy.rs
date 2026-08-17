@@ -113,8 +113,12 @@ fn parse_dep_entry(name: &str, info: &str) -> DependencyInfo {
 }
 
 /// The set of allowed Dolly workspace crate names.
-const ALLOWED_DOLLY_CRATES: &[&str] =
-    &["dolly-canonical-json", "dolly-core-domain", "dolly-schema"];
+const ALLOWED_DOLLY_CRATES: &[&str] = &[
+    "dolly-canonical-json",
+    "dolly-core-domain",
+    "dolly-protocol",
+    "dolly-schema",
+];
 
 /// Dependencies forbidden in any WP-001 crate.
 const FORBIDDEN_DEPS: &[&str] = &[
@@ -161,8 +165,8 @@ fn dependency_policy_enforced() {
         "workspace must include dolly-canonical-json"
     );
     assert!(
-        workspace_toml.contains("dolly-core-domain"),
-        "workspace must include dolly-core-domain"
+        workspace_toml.contains("dolly-protocol"),
+        "workspace must include dolly-protocol"
     );
     assert!(
         workspace_toml.contains("dolly-schema"),
@@ -173,6 +177,7 @@ fn dependency_policy_enforced() {
     let members = [
         root.join("crates/dolly-canonical-json/Cargo.toml"),
         root.join("crates/dolly-core-domain/Cargo.toml"),
+        root.join("crates/dolly-protocol/Cargo.toml"),
         root.join("crates/dolly-schema/Cargo.toml"),
     ];
 
@@ -189,8 +194,8 @@ fn dependency_policy_enforced() {
 
     assert_eq!(
         member_infos.len(),
-        3,
-        "should have exactly 3 workspace members"
+        4,
+        "should have exactly 4 workspace members"
     );
 
     // Verify allowed Dolly crates
@@ -214,6 +219,23 @@ fn dependency_policy_enforced() {
             "dolly-canonical-json must not depend on dolly-schema"
         );
     }
+
+    // dolly-protocol: depends on dolly-canonical-json only (sits below
+    // dolly-core-domain and dolly-schema in the layering).
+    let dp = &member_infos["dolly-protocol"];
+    let dp_dep_names: Vec<&str> = dp.dependencies.iter().map(|d| d.name.as_str()).collect();
+    assert!(
+        dp_dep_names.contains(&"dolly-canonical-json"),
+        "dolly-protocol must depend on dolly-canonical-json"
+    );
+    assert!(
+        !dp_dep_names.contains(&"dolly-core-domain"),
+        "dolly-protocol must not depend on dolly-core-domain"
+    );
+    assert!(
+        !dp_dep_names.contains(&"dolly-schema"),
+        "dolly-protocol must not depend on dolly-schema"
+    );
 
     // dolly-core-domain: depends on dolly-canonical-json and serde only
     let cd = &member_infos["dolly-core-domain"];
