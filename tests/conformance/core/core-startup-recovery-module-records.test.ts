@@ -816,6 +816,77 @@ describe("CORE startup reconciliation with Module records", () => {
     });
   });
 
+  it("releases a proven-stopped version 2 no-effect declaration with validated provenance", async () => {
+    const store = openStore("process-record-v2-none");
+    const claim = seedActiveClaim(store);
+    store.appendModuleProcessRecord({
+      ...processRecord(),
+      schemaVersion: "dolly.module-process-record/2",
+      declaredExternalEffects: "none",
+      declarationProvenance: {
+        schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
+        provenanceDigest: DIGEST_B,
+      },
+    } as unknown as ModuleProcessRecord);
+    store.updateModuleProcessRecordState("process-generation-1", "running");
+    store.appendModuleSubmissionRecord(submissionFor(claim));
+
+    const report = await new CoreStartupRecovery({
+      deliveries: store.deliveries,
+      commits: openCommits(store),
+      moduleRecords: store,
+      stoppedRecordWriter: stoppedRecordWriterFor(store),
+      processStopProver: provenStopped,
+    }).recover();
+
+    expect(report.releasedClaims).toEqual([
+      expect.objectContaining({
+        runId: claim.runId,
+        reason: "no-external-effect",
+      }),
+    ]);
+    expect(store.deliveries.inspectClaim(claim).status).toBe("released");
+  });
+
+  it("consults the capability journal for a proven-stopped version 2 core-capabilities-only declaration", async () => {
+    const store = openStore("process-record-v2-ccc");
+    const claim = seedActiveClaim(store);
+    store.appendModuleProcessRecord({
+      ...processRecord(),
+      schemaVersion: "dolly.module-process-record/2",
+      declarationProvenance: {
+        schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
+        provenanceDigest: DIGEST_B,
+      },
+    } as unknown as ModuleProcessRecord);
+    store.updateModuleProcessRecordState("process-generation-1", "running");
+    store.appendModuleSubmissionRecord(submissionFor(claim));
+
+    const inspectRunEffects = vi.fn(
+      async (): Promise<ExternalEffectEvidence> => ({
+        kind: "no-effect",
+        reason: "the provider confirmed no ambient effect",
+      }),
+    );
+    const report = await new CoreStartupRecovery({
+      deliveries: store.deliveries,
+      commits: openCommits(store),
+      moduleRecords: store,
+      stoppedRecordWriter: stoppedRecordWriterFor(store),
+      processStopProver: provenStopped,
+      externalEffectEvidence: { inspectRunEffects },
+    }).recover();
+
+    expect(inspectRunEffects).toHaveBeenCalledOnce();
+    expect(report.releasedClaims).toEqual([
+      expect.objectContaining({
+        runId: claim.runId,
+        reason: "external-effects-safe-to-retry",
+      }),
+    ]);
+    expect(store.deliveries.inspectClaim(claim).status).toBe("released");
+  });
+
   it("does not trust a reopened version 1 no-effect declaration without configuration provenance", async () => {
     const store = openStore("first");
     const claim = seedActiveClaim(store);

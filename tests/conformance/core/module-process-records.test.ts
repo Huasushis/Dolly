@@ -1398,4 +1398,20 @@ describe("CORE Module process and submission records", () => {
     });
     expect(store.revision).toBe(before);
   });
+
+  describe("version 2 module process records", () => {
+    it("accepts a version 2 process record with a closed declaration provenance", () => {
+      const v2 = {
+        ...processRecord(),
+        schemaVersion: "dolly.module-process-record/2",
+        declaredExternalEffects: "none",
+        declarationProvenance: {
+          schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
+          provenanceDigest: DIGEST_B,
+        },
+      } as unknown as ModuleProcessRecord;
+
+      expect(assertValidModuleProcessRecord(v2)).toBeUndefined();
+    });
+  });
 });
