@@ -327,7 +327,10 @@ function reservedV10InstanceConfiguration(
         policyFailureAction: "quarantine",
       },
     },
-    pages: [{ pageId: "input" }, { pageId: "output" }],
+    pages: [
+      { pageId: "input", quota: { maxEntries: 1_000_000, maxBytes: 64 * 1_024 * 1_024 } },
+      { pageId: "output", quota: { maxEntries: 1_000_000, maxBytes: 64 * 1_024 * 1_024 } },
+    ],
     modules: [{
       moduleId: "worker",
       extensionId: "org.example.installed",

@@ -104,12 +104,17 @@ function reactiveModule(
   };
 }
 
+function pageEntry(overrides: Readonly<Record<string, JsonValue>> = {}): Record<string, JsonValue> {
+  return {
+    pageId: "input",
+    quota: { maxEntries: 1_000_000, maxBytes: 64 * 1_024 * 1_024 },
+    ...overrides,
+  };
+}
+
 function configuration(
   modules: readonly JsonValue[] = [reactiveModule()],
-  pages: readonly JsonValue[] = [
-    { pageId: "input" },
-    { pageId: "output" },
-  ],
+  pages: readonly JsonValue[] = [pageEntry(), pageEntry({ pageId: "output" })],
 ): Record<string, JsonValue> {
   const version9 = createDefaultDollyInstanceConfig(INSTANCE_ID);
   return {
