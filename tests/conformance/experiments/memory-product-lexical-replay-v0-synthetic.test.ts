@@ -23,13 +23,13 @@ const SYNTHETIC_SPLIT = Object.freeze([
   { question_id: "synthetic-empty", question_type: "edge", split: "evaluation", goldSessionIds: ["empty"] },
 ]);
 
-function writeSplit(runDirectory) {
+function writeSplit(runDirectory: string): string {
   const bytes = SYNTHETIC_SPLIT.map((row) => `${canonicalJson(row)}\n`).join("");
   writeFileSync(join(runDirectory, "split.jsonl"), bytes);
   return bytes;
 }
 
-async function withBundle(action) {
+async function withBundle<T>(action: (directory: string) => T | Promise<T>): Promise<T> {
   const directory = mkdtempSync(join(tmpdir(), "dolly-lexical-conformance-"));
   try {
     await writeSyntheticBundle(directory);
