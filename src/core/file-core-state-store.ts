@@ -741,6 +741,7 @@ const BLOCK_STORE_PUBLIC_METHODS = [
   "commit",
   "commitOnce",
   "releaseCommitEffect",
+  "retireCommitEffect",
   "collectUnreachable",
 ] as const;
 
@@ -803,6 +804,7 @@ const MODULE_RESULT_COMMIT_BLOCK_METHODS = [
   "inspectCommitEffect",
   "commitOnce",
   "releaseCommitEffect",
+  "retireCommitEffect",
 ] as const;
 
 const MODULE_RESULT_COMMIT_DELIVERY_METHODS = [
@@ -822,6 +824,7 @@ const BLOCK_STORE_MUTATION_METHODS = new Set<PropertyKey>([
   "commit",
   "commitOnce",
   "releaseCommitEffect",
+  "retireCommitEffect",
   "collectUnreachable",
 ]);
 

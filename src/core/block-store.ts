@@ -127,6 +127,7 @@ interface BlockCommitEffect {
   readonly digest: string;
   readonly record: Block;
   strongReferenceHeld: boolean;
+  owner: string | undefined;
 }
 
 export interface BlockCommitEffectSnapshot {
@@ -134,10 +135,13 @@ export interface BlockCommitEffectSnapshot {
   readonly digest: string;
   readonly record: Block;
   readonly strongReferenceHeld: boolean;
+  readonly owner?: string;
 }
 
+export type BlockStoreSnapshotVersion = "dolly.block-store/3" | "dolly.block-store/4";
+
 export interface BlockStoreSnapshot {
-  readonly schemaVersion: "dolly.block-store/3";
+  readonly schemaVersion: BlockStoreSnapshotVersion;
   readonly nextSequence: string;
   readonly records: readonly Block[];
   readonly commitEffects: readonly BlockCommitEffectSnapshot[];
@@ -268,6 +272,25 @@ function referencesForProposal(proposal: BlockProposal): ReturnType<typeof conte
   return contentReferences(parseBlockContent(proposal.payload.value));
 }
 
+/**
+ * Normalizes an optional durable owner for a Block commit effect. An owner is
+ * a plain identifier that names the protocol authorized to retire the effect
+ * later; `undefined` means the effect is ownerless (legacy or foreign) and
+ * never eligible for the owned retirement path. An empty string is treated
+ * as ownerless so a caller that forgets to pass an owner cannot silently
+ * mint one.
+ */
+function normalizeEffectOwner(owner: string | undefined): string | undefined {
+  if (owner === undefined || owner === "") return undefined;
+  if (typeof owner !== "string" || !ID_PATTERN.test(owner)) {
+    throw new BlockStoreError(
+      "BLOCK_ID_INVALID",
+      "Block effect owner must be a valid identifier when present",
+    );
+  }
+  return owner;
+}
+
 export class BlockStore {
   readonly #storeIdentity = {};
   readonly #records = new Map<string, Block>();
@@ -347,6 +370,7 @@ export class BlockStore {
           digest: effect.digest,
           record: effect.record,
           strongReferenceHeld: effect.strongReferenceHeld,
+          owner: effect.owner,
         });
   }
 
@@ -374,12 +398,13 @@ export class BlockStore {
         digest: effect.digest,
         record: effect.record,
         strongReferenceHeld: effect.strongReferenceHeld,
+        ...(effect.owner === undefined ? {} : { owner: effect.owner }),
       }))
       .sort((left, right) =>
         left.effectId < right.effectId ? -1 : left.effectId > right.effectId ? 1 : 0,
       );
     return deepFreeze({
-      schemaVersion: "dolly.block-store/3" as const,
+      schemaVersion: "dolly.block-store/4" as const,
       nextSequence: this.#nextSequence.toString(10),
       records,
       commitEffects,
@@ -471,15 +496,16 @@ export class BlockStore {
     this.#persistMutation();
     return record;
   }
-
   commitOnce(
     effectId: string,
     proposalInput: BlockProposal,
     sourceInput: SourceIdentity,
+    owner?: string,
   ): Block {
     if (!ID_PATTERN.test(effectId)) {
       throw new BlockStoreError("BLOCK_ID_INVALID", "effectId is not a valid identifier");
     }
+    const normalizedOwner = normalizeEffectOwner(owner);
     const input = this.normalizeInput(proposalInput, sourceInput);
     const digest = canonicalJsonDigest(input);
     const existing = this.#commitEffects.get(effectId);
@@ -491,7 +517,18 @@ export class BlockStore {
           { effectId },
         );
       }
-      this.flushPersistence();
+      // A matching digest is the idempotency key; the owner only authorizes
+      // later retirement. A concurrent committer may have created the same
+      // effect without an owner, so a caller that supplies an owner upgrades
+      // an ownerless effect to owned rather than conflicting. An effect that
+      // already has a different owner is left untouched, since its retirement
+      // is governed by that owner.
+      if (normalizedOwner !== undefined && existing.owner === undefined) {
+        existing.owner = normalizedOwner;
+        this.#persistMutation();
+      } else {
+        this.flushPersistence();
+      }
       return existing.record;
     }
 
@@ -503,7 +540,12 @@ export class BlockStore {
       targetId: record.id,
     };
     this.referenceGraph.addStrongReference(strongReference);
-    this.#commitEffects.set(effectId, { digest, record, strongReferenceHeld: true });
+    this.#commitEffects.set(effectId, {
+      digest,
+      record,
+      strongReferenceHeld: true,
+      owner: normalizedOwner,
+    });
     this.#persistMutation();
     return record;
   }
@@ -527,6 +569,51 @@ export class BlockStore {
     effect.strongReferenceHeld = false;
     this.#persistMutation();
     return result === "removed" ? "released" : "absent";
+  }
+
+  /**
+   * Forgets one owned Block commit-effect tombstone after Core has durably
+   * retired the Module-result that created it. This is the terminal cleanup
+   * step for the result-journal lifecycle: the strong reference must already
+   * have been released (`releaseCommitEffect`) and Core retirement must be
+   * confirmed by the caller. The `owner` must match the durable owner
+   * recorded when the effect was committed, so a foreign, legacy, or
+   * ownerless effect is never eligible and its replay-conflict tombstone is
+   * preserved. Absence is treated as already retired only when the caller's
+   * owner is valid; a malformed owner is rejected before any lookup.
+   */
+  retireCommitEffect(effectId: string, owner: string): "retired" | "absent" {
+    if (!ID_PATTERN.test(effectId)) {
+      throw new BlockStoreError("BLOCK_ID_INVALID", "effectId is not a valid identifier");
+    }
+    const normalizedOwner = normalizeEffectOwner(owner);
+    if (normalizedOwner === undefined) {
+      throw new BlockStoreError(
+        "BLOCK_EFFECT_CONFLICT",
+        "Block effect retirement requires a durable owner",
+        { effectId },
+      );
+    }
+    this.flushPersistence();
+    const effect = this.#commitEffects.get(effectId);
+    if (effect === undefined) return "absent";
+    if (effect.owner !== normalizedOwner) {
+      throw new BlockStoreError(
+        "BLOCK_EFFECT_CONFLICT",
+        `Block effect ${effectId} is not owned by the retirement caller`,
+        { effectId },
+      );
+    }
+    if (effect.strongReferenceHeld) {
+      throw new BlockStoreError(
+        "BLOCK_EFFECT_CONFLICT",
+        `Block effect ${effectId} still holds its strong reference`,
+        { effectId },
+      );
+    }
+    this.#commitEffects.delete(effectId);
+    this.#persistMutation();
+    return "retired";
   }
 
   #commitValidated(input: ValidatedBlockInput): Block {
@@ -646,13 +733,15 @@ export class BlockStore {
       if (
         snapshot === null ||
         typeof snapshot !== "object" ||
-        snapshot.schemaVersion !== "dolly.block-store/3" ||
+        (snapshot.schemaVersion !== "dolly.block-store/3" &&
+          snapshot.schemaVersion !== "dolly.block-store/4") ||
         !/^[1-9][0-9]*$/.test(snapshot.nextSequence) ||
         !Array.isArray(snapshot.records) ||
         !Array.isArray(snapshot.commitEffects)
       ) {
         throw new BlockStoreError("BLOCK_SNAPSHOT_INVALID", "BlockStore snapshot schema is invalid");
       }
+      const isVersion4 = snapshot.schemaVersion === "dolly.block-store/4";
       const nextSequence = BigInt(snapshot.nextSequence);
       const recordIds = new Set<string>();
       const recordSequences = new Set<string>();
@@ -718,11 +807,15 @@ export class BlockStore {
 
       const effectIds = new Set<string>();
       for (const candidate of snapshot.commitEffects) {
-        assertClosedObject(
-          candidate,
-          ["effectId", "digest", "record", "strongReferenceHeld"],
-          "commitEffect",
-        );
+        const effectKeys = isVersion4
+          ? ["effectId", "digest", "record", "strongReferenceHeld", "owner"]
+          : ["effectId", "digest", "record", "strongReferenceHeld"];
+        assertClosedObject(candidate, effectKeys, "commitEffect");
+        const owner = isVersion4
+          ? normalizeEffectOwner(
+              typeof candidate.owner === "string" ? candidate.owner : undefined,
+            )
+          : undefined;
         if (
           typeof candidate.effectId !== "string" ||
           !ID_PATTERN.test(candidate.effectId) ||
@@ -790,6 +883,7 @@ export class BlockStore {
           digest: candidate.digest,
           record,
           strongReferenceHeld: candidate.strongReferenceHeld,
+          owner,
         });
       }
 

@@ -36,6 +36,14 @@ const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
  * input. It is not called a transaction because those effects are persisted
  * separately and resumed idempotently after interruption.
  */
+/**
+ * The durable owner token the Module-result commit protocol attaches to its
+ * Block commit effect. Only an effect committed with this owner is eligible
+ * for the owned retirement path; foreign, legacy, and ownerless effects keep
+ * an undefined owner and are never retired.
+ */
+const MODULE_RESULT_COMMIT_BLOCK_OWNER = "module-result-commit";
+
 export type ModuleResultCommitState = "prepared" | "committed";
 
 export interface ModuleResultCommitOutputDelivery {
@@ -631,6 +639,7 @@ export type ModuleResultCommitBlockOperations = Pick<
   | "inspectCommitEffect"
   | "normalizeInput"
   | "releaseCommitEffect"
+  | "retireCommitEffect"
   | "validateInput"
   | "validateSource"
 >;
@@ -1436,6 +1445,7 @@ export class ModuleResultCommitCoordinator {
             this.#blockEffectId(moduleJobId),
             record.blockProposal,
             record.source,
+            MODULE_RESULT_COMMIT_BLOCK_OWNER,
           );
           await this.#afterEffect?.({ phase: "after-block-effect", moduleJobId });
           const next = immutableRecord({
@@ -1513,6 +1523,23 @@ export class ModuleResultCommitCoordinator {
    * the exact Claim and effects are durably terminal, retaining its full
    * result forever can only consume the finite recovery budget. Every removal
    * is preceded by the same cross-store validation used during recovery.
+   *
+   * The committed journal record is the crash-recovery anchor for its Block
+   * commit-effect tombstone. Retirement is exact and idempotent so a crash
+   * between steps is safe to re-enter:
+   *
+   *   1. Release the Block strong reference (idempotent; persists via the
+   *      BlockStore mutation observer into Core state, not the journal).
+   *   2. Retire the owned Block commit-effect tombstone (idempotent; rejects
+   *      foreign/ownerless effects; persists via Core state). The tombstone is
+   *      forgotten only after this durably succeeds.
+   *   3. Delete the journal record via a revision-checked delete. This is the
+   *      only step that writes the journal, and it shrinks it, so the
+   *      terminal cleanup never grows the journal past its capacity.
+   *
+   * A crash after step 1 or 2 leaves the committed record, which restart
+   * re-enters here; both release and retire are idempotent. A crash after step
+   * 3 leaves no record, which is the terminal state.
    */
   #pruneVerifiedTerminalRecords(): number {
     let removed = 0;
@@ -1525,10 +1552,11 @@ export class ModuleResultCommitCoordinator {
       if (this.#validatePersistentState(record) !== "committed") continue;
       if (record.blockProposal !== undefined) {
         this.#blocks.releaseCommitEffect(this.#blockEffectId(record.moduleJobId));
+        this.#blocks.retireCommitEffect(
+          this.#blockEffectId(record.moduleJobId),
+          MODULE_RESULT_COMMIT_BLOCK_OWNER,
+        );
       }
-      // Releasing the Block reference is idempotent while deleting the
-      // journal is not reversible. Keep the terminal journal as the cleanup
-      // anchor until the release has durably succeeded.
       if (!this.#repository.deleteIfRevision(record.moduleJobId, record.revision)) continue;
       removed += 1;
     }

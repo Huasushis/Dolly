@@ -219,6 +219,7 @@ describe("FileCore Module output capacity", () => {
       inspectCommitEffect: operations.blocks.inspectCommitEffect.bind(operations.blocks),
       normalizeInput: operations.blocks.normalizeInput.bind(operations.blocks),
       releaseCommitEffect: () => { throw releaseFailure; },
+      retireCommitEffect: operations.blocks.retireCommitEffect.bind(operations.blocks),
       validateInput: operations.blocks.validateInput.bind(operations.blocks),
       validateSource: operations.blocks.validateSource.bind(operations.blocks),
     };
