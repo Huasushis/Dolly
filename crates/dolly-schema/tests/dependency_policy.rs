@@ -118,6 +118,7 @@ const ALLOWED_DOLLY_CRATES: &[&str] = &[
     "dolly-core-domain",
     "dolly-protocol",
     "dolly-schema",
+    "dolly-storage",
 ];
 
 /// Dependencies forbidden in any WP-001 crate.
@@ -179,6 +180,7 @@ fn dependency_policy_enforced() {
         root.join("crates/dolly-core-domain/Cargo.toml"),
         root.join("crates/dolly-protocol/Cargo.toml"),
         root.join("crates/dolly-schema/Cargo.toml"),
+        root.join("crates/dolly-storage/Cargo.toml"),
     ];
 
     let mut member_infos = BTreeMap::new();
@@ -194,8 +196,8 @@ fn dependency_policy_enforced() {
 
     assert_eq!(
         member_infos.len(),
-        4,
-        "should have exactly 4 workspace members"
+        5,
+        "should have exactly 5 workspace members"
     );
 
     // Verify allowed Dolly crates
@@ -286,6 +288,26 @@ fn dependency_policy_enforced() {
         sc_dep_names.contains(&"jsonschema"),
         "dolly-schema must depend on jsonschema"
     );
+
+    // dolly-storage: depends on dolly-canonical-json, dolly-core-reducer,
+    // serde, and thiserror; must never acquire rusqlite/sqlx/tokio anyhow here
+    // (backend provisioning is a separate, reviewed change).
+    let st = &member_infos["dolly-storage"];
+    let st_dep_names: Vec<&str> = st.dependencies.iter().map(|d| d.name.as_str()).collect();
+    assert!(
+        st_dep_names.contains(&"dolly-canonical-json"),
+        "dolly-storage must depend on dolly-canonical-json"
+    );
+    assert!(
+        st_dep_names.contains(&"dolly-core-reducer"),
+        "dolly-storage must depend on dolly-core-reducer"
+    );
+    for required in ["serde", "thiserror"] {
+        assert!(
+            st_dep_names.contains(&required),
+            "dolly-storage must depend on {required}"
+        );
+    }
 
     // Verify jsonschema has default-features = false (no network resolution),
     // asserted from the parsed dependency metadata rather than the raw TOML.
