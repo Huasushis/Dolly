@@ -126,9 +126,17 @@ function sourceModule(
   return { ...base, ...overrides };
 }
 
+function pageEntry(overrides: Readonly<Record<string, JsonValue>> = {}): Record<string, JsonValue> {
+  return {
+    pageId: "input",
+    quota: { maxEntries: 1_000_000, maxBytes: 64 * 1_024 * 1_024 },
+    ...overrides,
+  };
+}
+
 function configuration(
   modules: readonly JsonValue[] = [reactiveModule()],
-  pages: readonly JsonValue[] = [{ pageId: "input" }, { pageId: "output" }],
+  pages: readonly JsonValue[] = [pageEntry(), pageEntry({ pageId: "output" })],
 ): Record<string, JsonValue> {
   const version9 = createDefaultDollyInstanceConfig(INSTANCE_ID);
   return {
@@ -253,12 +261,18 @@ function version9SourceModuleConfiguration() {
 
 function migrationInput(
   overrides: Readonly<Record<string, JsonValue>> = {},
+  pages: readonly JsonValue[] = [
+    { pageId: "input-a", quota: { maxEntries: 1_000_000, maxBytes: 64 * 1_024 * 1_024 } },
+    { pageId: "input-b", quota: { maxEntries: 1_000_000, maxBytes: 64 * 1_024 * 1_024 } },
+    { pageId: "output", quota: { maxEntries: 1_000_000, maxBytes: 64 * 1_024 * 1_024 } },
+  ],
 ): Record<string, JsonValue> {
   return {
     schemaVersion: "dolly.instance-v10-migration-input/1",
     expectedSourceRevision: SOURCE_REVISION,
     maxRegisteredContentValueBytes: 64 * 1_024,
     scheduler: scheduler(),
+    pages,
     modules: [{
       moduleId: "worker",
       claimBaseline: { count: 2, bytes: 1_024 },
@@ -448,7 +462,7 @@ describe("reserved Dolly instance version 10 configuration", () => {
         mailbox: { maxResidentCount: 1, maxResidentBytes: 8_192 },
       },
     });
-    const pages = ["trigger", "fan-a", "fan-b"].map((pageId) => ({ pageId }));
+    const pages = ["trigger", "fan-a", "fan-b"].map((pageId) => pageEntry({ pageId }));
     expect(() => validateDollyInstanceConfigV10Draft(
       configuration([producer, consumer], pages) as JsonValue,
     )).toThrow(/mailbox cannot hold one maximum durable Block/u);
@@ -472,6 +486,43 @@ describe("reserved Dolly instance version 10 configuration", () => {
         },
       } },
     ], pages) as JsonValue).modules).toHaveLength(2);
+  });
+
+  it("rejects an output Page that cannot durably fit one maximum legal Block", () => {
+    // Single-Module document: no producer/consumer pair exists, so the
+    // mailbox invariant never runs here and only the Page durability
+    // relation can decide. The producer's one maximum legal Block is
+    // bounded by the Core state bytes; the routed Page's frozen byte
+    // quota must fit that Block even when the Page starts empty.
+    const document = configuration([reactiveModule()], [
+      pageEntry(),
+      pageEntry({
+        pageId: "output",
+        quota: { maxEntries: 1_000_000, maxBytes: 1_048_576 },
+      }),
+    ]);
+    const core = document.core as Record<string, JsonValue>;
+    const limits = core.limits as Record<string, JsonValue>;
+    const withMaxBlockBytes = (maxStateBytes: number) => ({
+      ...document,
+      core: { ...core, limits: { ...limits, maxStateBytes } },
+    });
+
+    expect(() => validateDollyInstanceConfigV10Draft(
+      withMaxBlockBytes(8 * 1_024 * 1_024) as JsonValue,
+    )).toThrow(/Page output quota cannot hold one maximum durable Block/u);
+
+    expect(() => validateDollyInstanceConfigV10Draft(
+      withMaxBlockBytes(1_048_576 + 1) as JsonValue,
+    )).toThrow(/cannot hold one maximum durable Block/u);
+
+    const fitted = validateDollyInstanceConfigV10Draft(
+      withMaxBlockBytes(1_048_576) as JsonValue,
+    );
+    expect(fitted.pages[1]!).toEqual({
+      pageId: "output",
+      quota: { maxEntries: 1_000_000, maxBytes: 1_048_576 },
+    });
   });
 });
 
@@ -610,7 +661,10 @@ describe("explicit version 9 to version 10 migration planning", () => {
         declaredExternalEffects: "none",
         permissionPolicyReferences: [],
       }],
-    });
+    }, [{
+      pageId: "output",
+      quota: { maxEntries: 1_000_000, maxBytes: 64 * 1_024 * 1_024 },
+    }]);
 
     expect(planDollyInstanceConfigV10Migration(source, input).document.modules[0]).toMatchObject({
       moduleId: "source",

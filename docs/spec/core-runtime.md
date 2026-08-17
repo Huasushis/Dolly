@@ -991,6 +991,22 @@ conservative proof can be narrowed only by a later schema field enforced at
 the Block commit boundary. It does not replace the atomic exact-byte check for
 a real Block or reserve capacity across concurrent producers.
 
+Every Page also declares a `quota` of `maxEntries` and `maxBytes`. The
+`quota` records the durable byte budget of that Page: runtime admission
+charges the stored canonical Block envelope bytes of each new Delivery against
+`maxBytes` and one Delivery against `maxEntries`. `maxEntries` is a positive
+safe integer and `maxBytes` is from 1,048,576 through 1,073,741,824. Because
+one accepted result appends one Delivery per output Page, an otherwise empty
+output Page must be able to hold one maximum durable Block: for every producer,
+each configured output Page must have `quota.maxBytes` no smaller than
+`core.limits.maxStateBytes`, and every routed Page is checked independently so
+a broadcast to `N` output Pages requires `N` Pages each able to hold that one
+Block. The capacity proof therefore uses the same conservative
+`core.limits.maxStateBytes` Block unit as the mailbox projection above and
+never substitutes the result envelope bytes for stored Block bytes. The version-9 source Page entries have no `quota`; the version 9 to version 10
+migration input carries one `quota` per Page, matching the source Page set
+exactly.
+
 A source Module has no public `inputConnections`. Its Claim baseline count and
 hard count MUST both equal one because one durable source request is one Module
 job. `sourceRequestMaxBytes` is a positive safe integer for a source Module and

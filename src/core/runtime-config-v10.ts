@@ -19,6 +19,7 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MAX_CONFIGURED_MODULES = 1_024;
 const MAX_CLAIM_COUNT = 10_000;
 const MAX_CONFIGURED_BYTES = 1_024 * 1_024 * 1_024;
+const MIN_PAGE_QUOTA_BYTES = 1_024 * 1_024;
 const MAX_MODULE_FRAME_BYTES = 64 * 1_024 * 1_024;
 const MODULE_FRAME_OVERHEAD_BYTES = 4 * 1_024;
 
@@ -112,6 +113,24 @@ export interface DollyCoreLimitsV10 extends Readonly<Record<string, JsonValue>> 
   readonly maxRegisteredContentValueBytes: number;
 }
 
+/**
+ * Reserved version 10 page quota. Mirrors the authoritative imported spec's
+ * `quota.max_entries` and `quota.max_bytes` in the repo's camelCase config
+ * dialect: a resolved configuration MUST materialize both per-Page values so
+ * admission can prove an otherwise empty Page can hold one maximum durable
+ * Block. `maxBytes` is the durable byte quota against which runtime admission
+ * charges the canonical Block envelope bytes of each new Delivery.
+ */
+export interface DollyPageQuotaV10 extends Readonly<Record<string, JsonValue>> {
+  readonly maxEntries: number;
+  readonly maxBytes: number;
+}
+
+export interface DollyPageConfigV10 extends Readonly<Record<string, JsonValue>> {
+  readonly pageId: string;
+  readonly quota: DollyPageQuotaV10;
+}
+
 export interface DollyInstanceConfigV10Draft extends Readonly<Record<string, JsonValue>> {
   readonly schemaVersion: "dolly.instance/10";
   readonly instanceId: string;
@@ -122,7 +141,7 @@ export interface DollyInstanceConfigV10Draft extends Readonly<Record<string, Jso
     media: DollyMediaConfig;
     scheduler: DollySchedulerConfigV10;
   }>;
-  readonly pages: readonly DollyPageConfig[];
+  readonly pages: readonly DollyPageConfigV10[];
   readonly modules: readonly DollyModuleConfigV10[];
   readonly logging: Readonly<{ level: DollyLogLevel }>;
 }
@@ -137,11 +156,17 @@ export interface DollyInstanceV10ModuleMigrationInput {
   readonly permissionPolicyReferences: readonly DollyPermissionPolicyReferenceV10[];
 }
 
+export interface DollyInstanceV10PageMigrationInput {
+  readonly pageId: string;
+  readonly quota: DollyPageQuotaV10;
+}
+
 export interface DollyInstanceV10MigrationInput {
   readonly schemaVersion: "dolly.instance-v10-migration-input/1";
   readonly expectedSourceRevision: string;
   readonly maxRegisteredContentValueBytes: number;
   readonly scheduler: DollySchedulerConfigV10;
+  readonly pages: readonly DollyInstanceV10PageMigrationInput[];
   readonly modules: readonly DollyInstanceV10ModuleMigrationInput[];
 }
 
@@ -262,6 +287,29 @@ function uniqueIdentifiers(value: unknown, label: string, maximum: number): stri
     throw invalid(`${label} contains duplicates`);
   }
   return values;
+}
+
+interface ParsedPageShape {
+  readonly id: string;
+  readonly quota: DollyPageQuotaV10;
+}
+
+function parsePageShape(value: unknown, index: number, labelPrefix = "pages"): ParsedPageShape {
+  const label = `${labelPrefix}[${index}]`;
+  exactObject(value, ["pageId", "quota"], label);
+  exactObject(value.quota, ["maxEntries", "maxBytes"], `${label}.quota`);
+  return {
+    id: identifier(value.pageId, `${label}.pageId`),
+    quota: {
+      maxEntries: integer(value.quota.maxEntries, `${label}.quota.maxEntries`, 1),
+      maxBytes: integer(
+        value.quota.maxBytes,
+        `${label}.quota.maxBytes`,
+        MIN_PAGE_QUOTA_BYTES,
+        MAX_CONFIGURED_BYTES,
+      ),
+    },
+  };
 }
 
 function validateStart(value: unknown, label: string): DollyInputConnectionStartV10 {
@@ -648,6 +696,10 @@ export function validateDollyInstanceConfigV10Draft(value: JsonValue): DollyInst
     MAX_CONFIGURED_BYTES,
   );
   const scheduler = validateScheduler(value.core.scheduler);
+  if (!Array.isArray(value.pages) || value.pages.length === 0 || value.pages.length > 4_096) {
+    throw invalid("pages must contain between 1 and 4096 entries");
+  }
+  const parsedPages = value.pages.map((page, index) => parsePageShape(page, index));
   if (!Array.isArray(value.modules) || value.modules.length > MAX_CONFIGURED_MODULES) {
     throw invalid(`modules must be an array with at most ${MAX_CONFIGURED_MODULES} entries`);
   }
@@ -671,7 +723,7 @@ export function validateDollyInstanceConfigV10Draft(value: JsonValue): DollyInst
         retryMaxMs: scheduler.retryMaxMs,
       },
     },
-    pages: value.pages,
+    pages: parsedPages.map((page) => ({ pageId: page.id })),
     modules: parsedModules.map(projectedModuleForV9),
     logging: value.logging,
   } as unknown as JsonValue);
@@ -763,6 +815,28 @@ export function validateDollyInstanceConfigV10Draft(value: JsonValue): DollyInst
     }
   }
 
+  // Durability accounting: the durable Page admission charge is the stored
+  // canonical Block envelope bytes, one Delivery per output Page per accepted
+  // result. maxResultBytes bounds only the Extension's result envelope, so it
+  // is never substituted for the stored Block bound; maxStateBytes remains
+  // the conservative upper bound of any Block the same state store can
+  // durably accept (see the mailbox reasoning above). Therefore an otherwise
+  // empty output Page must fit one maximum durable Block, and route
+  // multiplicity means every routed Page must satisfy this independently.
+  const pageQuotaById = new Map(parsedPages.map((page) => [page.id, page.quota]));
+  for (const producer of modules) {
+    for (const pageId of producer.outputPageIds) {
+      const page = pageQuotaById.get(pageId);
+      // Page membership is already enforced by the version-9 projection.
+      if (page !== undefined && page.maxBytes < projected.core.limits.maxStateBytes) {
+        throw invalid(
+          `Page ${pageId} quota cannot hold one maximum durable Block from Module ${producer.moduleId}`,
+          true,
+        );
+      }
+    }
+  }
+
   return deepFreeze({
     schemaVersion: "dolly.instance/10",
     instanceId: projected.instanceId,
@@ -776,7 +850,7 @@ export function validateDollyInstanceConfigV10Draft(value: JsonValue): DollyInst
       media: projected.core.media,
       scheduler,
     },
-    pages: projected.pages,
+    pages: parsedPages.map((page) => ({ pageId: page.id, quota: page.quota })),
     modules,
     logging: projected.logging,
   });
@@ -889,6 +963,7 @@ export function planDollyInstanceConfigV10Migration(
     "expectedSourceRevision",
     "maxRegisteredContentValueBytes",
     "scheduler",
+    "pages",
     "modules",
   ], "migration");
   if (input.schemaVersion !== "dolly.instance-v10-migration-input/1") {
@@ -908,6 +983,22 @@ export function planDollyInstanceConfigV10Migration(
     MAX_CONFIGURED_BYTES,
   );
   const scheduler = validateScheduler(input.scheduler);
+  if (!Array.isArray(input.pages) || input.pages.length === 0 || input.pages.length > 4_096) {
+    throw invalid("migration.pages must contain between 1 and 4096 entries");
+  }
+  const migrationPages = input.pages.map((page, index) =>
+    parsePageShape(page, index, "migration.pages")
+  );
+  const sourcePageIds = validatedSource.pages.map((page) => page.pageId);
+  const pageIds = migrationPages.map((page) => page.id);
+  const missingPages = sourcePageIds.filter((pageId) => !pageIds.includes(pageId));
+  const extraPages = pageIds.filter((pageId) => !sourcePageIds.includes(pageId));
+  if (missingPages.length > 0 || extraPages.length > 0) {
+    throw invalid(
+      `migration Page set does not match configuration; missing: ${missingPages.join(", ") || "none"}; extra: ${extraPages.join(", ") || "none"}`,
+    );
+  }
+  const migrationPageById = new Map(migrationPages.map((page) => [page.id, page]));
   if (!Array.isArray(input.modules) || input.modules.length > MAX_CONFIGURED_MODULES) {
     throw invalid(`migration.modules must have at most ${MAX_CONFIGURED_MODULES} entries`);
   }
@@ -938,7 +1029,10 @@ export function planDollyInstanceConfigV10Migration(
       media: validatedSource.core.media,
       scheduler,
     },
-    pages: validatedSource.pages,
+    pages: validatedSource.pages.map((page) => {
+      const migrationPage = migrationPageById.get(page.pageId)!;
+      return { pageId: migrationPage.id, quota: migrationPage.quota };
+    }),
     modules: validatedSource.modules.map((module) => {
       const migration = migrationById.get(module.moduleId)!;
       if (migration.execution.isolation !== module.isolation) {

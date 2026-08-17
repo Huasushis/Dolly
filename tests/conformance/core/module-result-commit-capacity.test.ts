@@ -1043,7 +1043,10 @@ function v10SelfLoopDocument(
       media: version9.core.media,
       scheduler: v10Scheduler(),
     },
-    pages: [{ pageId: "loop-a" }, { pageId: "loop-b" }],
+    pages: [
+      { pageId: "loop-a", quota: { maxEntries: 1_000_000, maxBytes: 1_000_000_000 } },
+      { pageId: "loop-b", quota: { maxEntries: 1_000_000, maxBytes: 1_000_000_000 } },
+    ],
     modules: [{
       moduleId: "loop",
       extensionId: "org.example.loop",
