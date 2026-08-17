@@ -2560,7 +2560,13 @@ export class ModuleScheduler {
       if (target !== undefined && target.inFlight !== null) {
         nextEdges.set(key, { ...edge, waitingSince: null, active: false });
       } else {
-        nextEdges.set(key, existing ?? { ...edge, waitingSince: now, active: false });
+        const episode = existing ?? { ...edge, waitingSince: now, active: false };
+        // Aging resumes the moment it is eligible again: an edge first
+        // observed while its target was in flight carries a null clock, and a
+        // settled target must hand that edge back to continuous aging instead
+        // of freezing it out of no-progress detection forever.
+        if (episode.waitingSince === null) episode.waitingSince = now;
+        nextEdges.set(key, episode);
       }
     }
     this.#noProgressBlockedEdges = nextEdges;

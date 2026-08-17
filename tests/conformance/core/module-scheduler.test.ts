@@ -1393,6 +1393,71 @@ describe("CORE scheduler bounded mailboxes and backpressure", () => {
     await scheduler.stop();
   });
 
+  it("ages a blocked edge first observed while its target was in flight once that target settles", async () => {
+    const { clock, mailboxes, scheduler, events } = createScheduler({
+      noProgressAfterMs: 1_000,
+      maxConcurrentModules: 2,
+    });
+    mailboxes.set("alpha", 4, 400);
+    scheduler.register({
+      moduleId: "alpha",
+      runtime: new FakeModuleRuntime(() => ({ status: "idle" })),
+      inputPageIds: ["page-a"],
+      outputPageIds: ["page-b"],
+      mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+    });
+    const beta = new FakeModuleRuntime();
+    mailboxes.set("beta", 4, 400);
+    scheduler.register({
+      moduleId: "beta",
+      runtime: beta,
+      inputPageIds: ["page-b"],
+      outputPageIds: ["page-c"],
+      mailbox: { maxResidentCount: 2, maxResidentBytes: 200 },
+    });
+
+    scheduler.start();
+    await drain(clock);
+    expect(beta.tickCount).toBe(1);
+
+    // The alpha -> beta edge is first observed while beta's tick is in
+    // flight, so it starts paused with no waiting clock at all.
+    expect(scheduler.instanceStatus().noProgressActive).toBe(false);
+
+    // Keep beta's mailbox over its bound so alpha stays backpressured, but
+    // drain beta's pending queue so it is not re-dispatched after its
+    // in-flight tick settles. The same blocked edge is still observed on the
+    // first poll after the settle.
+    mailboxes.set("beta", 0, 0);
+    mailboxes.setResident("beta", 0, 0, 4, 400);
+    beta.settle({ status: "idle" });
+    await advance(clock, 100);
+    expect(scheduler.status("beta")).toMatchObject({
+      schedulingState: "idle",
+      pendingCount: 0,
+    });
+    expect(scheduler.status("alpha")).toMatchObject({
+      backpressured: true,
+      blockingDownstreamIds: ["beta"],
+    });
+
+    // The edge keeps the paused episode's null clock forever, so it never
+    // ages past the threshold and no episode is reported.
+    await advance(clock, 1_000);
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toEqual([
+      expect.objectContaining({
+        stalledForMs: 1_000,
+        blockedEdges: [{ moduleId: "alpha", blockedBy: ["beta"] }],
+      }),
+    ]);
+    expect(scheduler.instanceStatus().noProgressActive).toBe(true);
+
+    // One report per episode, as with every other blocked cycle.
+    await advance(clock, 2_000);
+    expect(events.filter((event) => event.type === "scheduler.no_progress")).toHaveLength(1);
+    await scheduler.stop();
+  });
+
   it("does not report an idle producer as blocked by an unrelated full mailbox", async () => {
     const { clock, mailboxes, scheduler, events } = createScheduler({
       noProgressAfterMs: 1_000,
