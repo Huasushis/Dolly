@@ -32,6 +32,7 @@
 import { execFile } from "node:child_process";
 import { readFile, statfs } from "node:fs/promises";
 import { promisify } from "node:util";
+import { observeHostPlatform } from "./host-platform.js";
 import {
   isLinuxBootId,
   isServiceInvocationId,
@@ -708,13 +709,14 @@ interface BusctlValue {
 export async function collectCoreServiceObservation(
   options: CoreServiceInspectionOptions,
 ): Promise<CoreServiceObservationResult> {
-  if (process.platform !== "linux") {
+  const platform = observeHostPlatform();
+  if (platform !== "linux") {
     return {
       observed: false,
       failures: [
         {
           code: "CORE_SERVICE_PLATFORM_UNSUPPORTED",
-          detail: `Core service binding verification requires Linux but this process runs on ${process.platform}`,
+          detail: `Core service binding verification requires Linux but this process runs on ${platform}`,
         },
       ],
     };

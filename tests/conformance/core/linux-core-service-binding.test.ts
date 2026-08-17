@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   NO_ENVIRONMENT_EXPANSION_FLAG,
   collectCoreServiceObservation,
@@ -15,6 +15,18 @@ import {
   type CoreServiceObservation,
   type CoreServiceUnitProperties,
 } from "../../../src/core/linux-core-service-binding.js";
+
+// Host-owned platform observation. Defaulting to the real platform keeps every
+// existing Linux test unchanged; only the refusal test overrides it so the
+// non-Linux refusal is provable on Linux CI, matching the activation-decision
+// test pattern in linux-module-activation.test.ts.
+const platformMock = vi.hoisted(() => ({
+  observe: vi.fn<() => NodeJS.Platform>(() => process.platform),
+}));
+
+vi.mock("../../../src/core/host-platform.js", () => ({
+  observeHostPlatform: platformMock.observe,
+}));
 
 const SERVICE_CGROUP =
   "/user.slice/user-1000.slice/user@1000.service/app.slice/dolly-core.service";
@@ -639,25 +651,29 @@ describe("Core service binding, systemd value parsing", () => {
 });
 
 describe("Core service binding, unsupported platform", () => {
-  const linuxOnly = process.platform === "linux";
-
-  it.skipIf(linuxOnly)("fails closed rather than guessing on a non-Linux platform", async () => {
-    const collected = await collectCoreServiceObservation({
+  it("types the non-Linux platform refusal with zero probes on any host", async () => {
+    // A nonexistent busctl proves the refusal precedes any service-manager
+    // probe: the platform gate must fire before busctl is even consulted.
+    const options = {
       unitName: "dolly-core.service",
-      mode: "user",
-    });
+      mode: "user" as const,
+      busctlPath: "/nonexistent/dolly-test-busctl",
+    };
+
+    platformMock.observe.mockReturnValueOnce("win32");
+    const collected = await collectCoreServiceObservation(options);
     expect(collected.observed).toBe(false);
-    if (collected.observed) return;
+    if (collected.observed) throw new Error("expected a refusal");
     expect(collected.failures.map((failure) => failure.code)).toEqual([
       "CORE_SERVICE_PLATFORM_UNSUPPORTED",
     ]);
 
-    const inspected = await inspectCoreServiceBinding({
-      unitName: "dolly-core.service",
-      mode: "user",
-    });
+    platformMock.observe.mockReturnValueOnce("darwin");
+    const inspected = await inspectCoreServiceBinding(options);
     expect(inspected.verified).toBe(false);
-    if (inspected.verified) return;
-    expect(inspected.failures[0]!.code).toBe("CORE_SERVICE_PLATFORM_UNSUPPORTED");
+    if (inspected.verified) throw new Error("expected a refusal");
+    expect(inspected.failures.map((failure) => failure.code)).toEqual([
+      "CORE_SERVICE_PLATFORM_UNSUPPORTED",
+    ]);
   });
 });
