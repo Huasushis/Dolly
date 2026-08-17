@@ -7,8 +7,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 
 interface PackResult {
@@ -127,7 +129,7 @@ function parsePackOutput(stdout: string): PackResult {
 }
 
 describe("PKG-001 distributable package", () => {
-  it("packs only runtime files and runs the extracted CLI metadata commands", () => {
+  it("packs only runtime files and runs the extracted CLI metadata commands", async () => {
     const repositoryRoot = resolve(import.meta.dirname, "../../..");
     const temporaryRoot = mkdtempSync(join(tmpdir(), "dolly-package-smoke-"));
 
@@ -173,14 +175,17 @@ describe("PKG-001 distributable package", () => {
         "dist/src/sdk/index.js",
         "dist/src/sdk/index.d.ts",
         "dist/src/sdk/types.d.ts",
+        "dist/src/linux-module-runtime-assets.js",
+        "dist/src/adapters/installed-linux-extension-module-executor.js",
+        "dist/src/adapters/linux-process-confinement.js",
+        "dist/src/adapters/linux-module-launcher/linux-module-launcher-process.js",
+        "dist/src/adapters/linux-module-launcher/launcher.py",
       ];
       for (const requiredPath of requiredPaths) {
         expect(publishedPaths, `missing ${requiredPath}`).toContain(requiredPath);
       }
 
       for (const publishedPath of publishedPaths) {
-        expect(publishedPath).not.toMatch(/^dist\/daemon(?:\/|$)/);
-        expect(publishedPath).not.toMatch(/^dist\/extensions(?:\/|$)/);
         expect(publishedPath).not.toMatch(/^dist\/src\/daemon(?:\/|$)/);
         expect(publishedPath).not.toMatch(/^dist\/src\/extensions(?:\/|$)/);
         expect(publishedPath).not.toMatch(/^dist\/src\/core\/ipc(?:\.|$)/);
@@ -231,8 +236,38 @@ describe("PKG-001 distributable package", () => {
       expect(publicSdkTypes).not.toContain("legacy-in-process-extension");
       expect(publicSdkTypes).not.toContain("../core/types.js");
 
+      const reviewedLauncherSource = readFileSync(
+        resolve(repositoryRoot, "src/adapters/linux-module-launcher/launcher.py"),
+      );
+      const linuxRuntimeGraphArchivePaths = [
+        "package/dist/src/adapters/installed-linux-extension-module-executor.js",
+        "package/dist/src/adapters/linux-process-confinement.js",
+        "package/dist/src/adapters/linux-module-launcher/linux-module-launcher-process.js",
+        "package/dist/src/adapters/linux-module-launcher/launcher.py",
+      ];
+      for (const archivePath of linuxRuntimeGraphArchivePaths) {
+        const data = tarFiles.get(archivePath);
+        expect(data, `missing tar entry ${archivePath}`).toBeDefined();
+        expect(data!.length).toBeGreaterThan(0);
+      }
+      // The launcher asset must be shipped byte-for-byte as reviewed, so the
+      // installed runtime graph can consume a fixed program.
+      const packagedLauncher = tarFiles.get(
+        "package/dist/src/adapters/linux-module-launcher/launcher.py",
+      );
+      expect(packagedLauncher).toEqual(reviewedLauncherSource);
+      expect(
+        `sha256:${createHash("sha256").update(packagedLauncher!).digest("hex")}`,
+      ).toBe("sha256:2c95f759603f902340f719abaaf12b2df0ab7194d9c89f35aa835927486d3177");
+
       const extractedPackage = join(temporaryRoot, "installed", "package");
-      const filesToExtract = ["package/package.json", "package/bin/dolly.js"];
+      const filesToExtract = [
+        "package/package.json",
+        "package/bin/dolly.js",
+        "package/dist/src/linux-module-runtime-assets.js",
+        "package/dist/src/linux-module-runtime-assets.js.map",
+        "package/dist/src/adapters/linux-module-launcher/launcher.py",
+      ];
       for (const archivePath of filesToExtract) {
         const data = tarFiles.get(archivePath);
         expect(data, `missing tar entry ${archivePath}`).toBeDefined();
@@ -255,6 +290,23 @@ describe("PKG-001 distributable package", () => {
       });
       expect(versionResult.status, versionResult.stderr).toBe(0);
       expect(versionResult.stdout.trim()).toBe(packageJson.version);
+
+      // The extracted installed module is only present under a temp dir at
+      // pack time; a static import cannot reference a path created here.
+      const runtimeAssetsModule = await import(
+        pathToFileURL(
+          join(extractedPackage, "dist/src/linux-module-runtime-assets.js"),
+        ).href
+      );
+      const installedLauncherPath = join(
+        extractedPackage,
+        "dist/src/adapters/linux-module-launcher/launcher.py",
+      );
+      expect(runtimeAssetsModule.defaultLauncherScriptPath()).toBe(installedLauncherPath);
+      const installedLauncherBytes = readFileSync(installedLauncherPath);
+      expect(
+        `sha256:${createHash("sha256").update(installedLauncherBytes).digest("hex")}`,
+      ).toBe(runtimeAssetsModule.REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST);
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }
