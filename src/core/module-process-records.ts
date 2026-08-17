@@ -50,8 +50,22 @@ export type DeclaredExternalEffects =
   | "none"
   | "core-capabilities-only";
 
+/**
+ * The durable declaration-provenance binding a version 2 Module process
+ * record carries. `provenanceDigest` is the closed canonical digest of the
+ * original WeakSet-authenticated provenance value; persisting the digest
+ * lets Core recover the exact declaration without retaining the
+ * adapter-owned value itself.
+ */
+export interface ModuleProcessDeclarationProvenance {
+  readonly schemaVersion: "dolly.reserved-v10-module-process-provenance/1";
+  readonly provenanceDigest: string;
+}
+
 export interface ModuleProcessRecord {
-  readonly schemaVersion: "dolly.module-process-record/1";
+  readonly schemaVersion:
+    | "dolly.module-process-record/1"
+    | "dolly.module-process-record/2";
   readonly instanceId: string;
   readonly moduleId: string;
   readonly moduleGenerationId: string;
@@ -63,6 +77,12 @@ export interface ModuleProcessRecord {
     readonly configVersion: number;
   };
   readonly declaredExternalEffects: DeclaredExternalEffects;
+  /**
+   * Version 2 only. The durable binding the installed composition's
+   * authority authenticated at allocation time. Version 1 records never
+   * carry this field, and the validator refuses it on a version 1 record.
+   */
+  readonly declarationProvenance?: ModuleProcessDeclarationProvenance;
   readonly serviceInvocationId: string;
   readonly bootId: string;
   readonly moduleCgroupPath: string;
@@ -81,7 +101,9 @@ export interface ModuleProcessRecord {
  * identifier before appending and persisting the starting record atomically.
  */
 export interface ModuleProcessStartingRecordInput {
-  readonly schemaVersion: "dolly.module-process-record/1";
+  readonly schemaVersion:
+    | "dolly.module-process-record/1"
+    | "dolly.module-process-record/2";
   readonly instanceId: string;
   readonly moduleId: string;
   readonly moduleGenerationId: string;
@@ -92,6 +114,14 @@ export interface ModuleProcessStartingRecordInput {
     readonly configVersion: number;
   };
   readonly declaredExternalEffects: DeclaredExternalEffects;
+  /**
+   * Version 2 only. The opaque, WeakSet-authenticated declaration-provenance
+   * value minted by the installed extension Module executor. Core never
+   * inspects the value; the store-bound authority reduces it to the durable
+   * digest binding persisted on the record. Version 1 inputs must not carry
+   * one.
+   */
+  readonly declarationProvenance?: unknown;
   readonly serviceInvocationId: string;
   readonly bootId: string;
   /** The delegated control-group root Core derives the record's path from. */
@@ -125,6 +155,28 @@ export interface ModuleProcessStoppedRecordWriter {
   ): ModuleProcessRecord;
 }
 
+/**
+ * A Core-owned, store-bound authenticator slot for version 2 Module process
+ * record declaration provenance. The installed composition supplies an
+ * implementation bound to one Core-state store; the store's starting-record
+ * allocator invokes its `verify` to reduce a WeakSet-authenticated provenance
+ * value to the durable binding persisted on the record. A store without a
+ * bound authority refuses every version 2 allocation, so Core never imports
+ * adapters and never accepts provenance it cannot authenticate.
+ */
+export interface ModuleProcessDeclarationProvenanceAuthority {
+  /** Rejects composition that pairs this authority with another Core store. */
+  isStoreBoundTo(store: unknown): boolean;
+  /**
+   * Authenticates the starting input's declaration provenance and returns the
+   * durable binding. Throws when the value is forged, copied, foreign-store,
+   * or inconsistent with the input's identity, package, or configuration.
+   */
+  verify(
+    input: ModuleProcessStartingRecordInput,
+  ): ModuleProcessDeclarationProvenance;
+}
+
 export interface ModuleSubmissionRecord {
   readonly schemaVersion:
     | "dolly.module-submission-record/1"
@@ -155,6 +207,12 @@ export type ModuleProcessRecordErrorCode =
    * new process generation).
    */
   | "MODULE_PROCESS_RECORD_ALLOCATION_REQUIRED"
+  /**
+   * A version 2 starting record requires a store-bound
+   * `ModuleProcessDeclarationProvenanceAuthority`; without one the store
+   * refuses every version 2 allocation so it cannot authenticate provenance.
+   */
+  | "MODULE_PROCESS_RECORD_DECLARATION_PROVENANCE_REQUIRED"
   /**
    * The store cannot allocate version 19 identifiers because the Core-state
    * document has not been explicitly migrated to `dolly.core-state/19`.
@@ -233,6 +291,7 @@ export function assertValidModuleProcessRecord(
       "packageDigest",
       "configurationReference",
       "declaredExternalEffects",
+      "declarationProvenance",
       "serviceInvocationId",
       "bootId",
       "moduleCgroupPath",
@@ -245,8 +304,47 @@ export function assertValidModuleProcessRecord(
     code,
     "Module process record",
   );
-  if (value.schemaVersion !== "dolly.module-process-record/1") {
+  if (value.schemaVersion === "dolly.module-process-record/2") {
+    const provenance = value.declarationProvenance;
+    if (provenance === undefined) {
+      fail(
+        code,
+        "Module process record declarationProvenance is required for schema version 2",
+      );
+    }
+    if (
+      provenance === null ||
+      typeof provenance !== "object" ||
+      Array.isArray(provenance)
+    ) {
+      fail(code, "Module process record declarationProvenance must be an object");
+    }
+    const provenanceRecord = provenance as Record<string, unknown>;
+    assertClosedKeys(
+      provenanceRecord,
+      ["schemaVersion", "provenanceDigest"],
+      code,
+      "Module process record declarationProvenance",
+    );
+    if (
+      provenanceRecord.schemaVersion !==
+      "dolly.reserved-v10-module-process-provenance/1"
+    ) {
+      fail(code, "Module process record declarationProvenance schema version is not supported");
+    }
+    if (
+      typeof provenanceRecord.provenanceDigest !== "string" ||
+      !DIGEST_PATTERN.test(provenanceRecord.provenanceDigest)
+    ) {
+      fail(code, "Module process record declarationProvenance provenanceDigest must be a sha256 digest");
+    }
+  } else if (value.schemaVersion !== "dolly.module-process-record/1") {
     fail(code, "Module process record schema version is not supported");
+  } else if (value.declarationProvenance !== undefined) {
+    fail(
+      code,
+      "Module process record declarationProvenance requires schema version 2",
+    );
   }
   for (const field of ["instanceId", "moduleId", "moduleGenerationId"] as const) {
     if (!isIdentifier(value[field])) {

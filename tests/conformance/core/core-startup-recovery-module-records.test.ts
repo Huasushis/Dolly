@@ -865,7 +865,6 @@ describe("CORE startup reconciliation with Module records", () => {
     const inspectRunEffects = vi.fn(
       async (): Promise<ExternalEffectEvidence> => ({
         kind: "no-effect",
-        reason: "the provider confirmed no ambient effect",
       }),
     );
     const report = await new CoreStartupRecovery({
