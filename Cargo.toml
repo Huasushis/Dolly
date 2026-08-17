@@ -6,6 +6,7 @@ members = [
     "crates/dolly-schema",
     "crates/dolly-core-reducer",
     "crates/dolly-protocol",
+    "crates/dolly-storage",
 ]
 
 [workspace.package]

@@ -1,0 +1,233 @@
+//! Pure SQLite build-attestation gate for the `dolly-storage` first slice.
+//!
+//! Implements REQ-TECH-003 / ADR 0006 as a closed, deterministic validator:
+//! given the release attestation recorded for a build and the SQLite library
+//! actually loaded by that build, decide whether the loaded library may be
+//! used for writable storage. The gate is deliberately pure — it performs no
+//! FFI, no file I/O, and no library probing. Feeding it identity data from an
+//! unattested source is meaningless; the enclosing startup path obtains the
+//! loaded identity from the real `sqlite3_libversion*` family before invoking
+//! this validator. This slice contains no SQLite dependency, so the validator
+//! is the only part of REQ-TECH-003 exercised by TST-STORAGE-001/002.
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{StorageError, StorageResult};
+
+/// Upstream SQLite release number required by REQ-TECH-003, i.e.
+/// `sqlite3_libversion_number() >= 3051003` (`SQLITE_VERSION_NUMBER >= 3051003`).
+/// Encoded as the decimal concatenation of major.minor.patch with the hundredth
+/// omitted from the minor, matching SQLite's own `SQLITE_VERSION_NUMBER`.
+///
+/// Do not lower this value; the WAL-reset race that motivates the floor is
+/// present in every release through 3.51.2 (see ADR 0006).
+pub const SQLITE_VERSION_NUMBER_MIN: u32 = 3051003;
+
+/// Release attestation for an embedded SQLite library.
+///
+/// Mirrors `REQ-TECH-003`'s manifest record. `compile_options` and
+/// `linkage_mode` are optionals so that a future attestation may tighten the
+/// gate toward the full manifest without invalidating the current vectors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseAttestation {
+    /// Lowest attested `sqlite3_libversion_number()`.
+    pub sqlite_version_number_min: u32,
+    /// Attested `sqlite3_sourceid()` exactly as produced by the build.
+    pub sqlite_source_id: String,
+    /// Attested digest of the embedded library artifact.
+    pub artifact_digest: dolly_canonical_json::Sha256Digest,
+    /// Attested compile options, if the manifest ships them.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "compile_options"
+    )]
+    pub compile_options: Option<Vec<String>>,
+    /// Attested linkage mode, if the manifest ships it.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "linkage_mode"
+    )]
+    pub linkage_mode: Option<String>,
+}
+
+/// Identity of the SQLite library loaded by the current build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoadedSqlite {
+    pub version: String,
+    pub version_number: u32,
+    pub source_id: String,
+    pub artifact_digest: dolly_canonical_json::Sha256Digest,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "compile_options"
+    )]
+    pub compile_options: Option<Vec<String>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "linkage_mode"
+    )]
+    pub linkage_mode: Option<String>,
+}
+
+/// Positive result of the build gate, admitted for writable startup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifiedSqliteBuild {
+    pub version_number: u32,
+    pub source_id: String,
+    pub artifact_digest: dolly_canonical_json::Sha256Digest,
+}
+
+/// The authoritative SQLite build gate from REQ-TECH-003 / ADR 0006.
+///
+/// Every field of `loaded` that the attestation names MUST match before the
+/// build is admitted. There is deliberately no "trust this version otherwise"
+/// path: a version number above the floor with an unlisted `source_id` or
+/// digest is still a substituted, unattested build and fails closed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SqliteBuildGate;
+
+impl SqliteBuildGate {
+    pub fn verify(
+        &self,
+        attestation: &ReleaseAttestation,
+        loaded: &LoadedSqlite,
+    ) -> StorageResult<VerifiedSqliteBuild> {
+        if loaded.version_number < attestation.sqlite_version_number_min {
+            return Err(StorageError::unsafe_sqlite_build(
+                loaded.version_number,
+                attestation.sqlite_version_number_min,
+            ));
+        }
+        if loaded.source_id != attestation.sqlite_source_id {
+            return Err(StorageError::unsafe_sqlite_build(
+                loaded.version_number,
+                attestation.sqlite_version_number_min,
+            ));
+        }
+        if loaded.artifact_digest != attestation.artifact_digest {
+            return Err(StorageError::unsafe_sqlite_build(
+                loaded.version_number,
+                attestation.sqlite_version_number_min,
+            ));
+        }
+        // A named compile-option set or linkage mode in the attestation must be
+        // replicated exactly by the loaded library. Absent on both sides it is
+        // not a checking failure: the current vectors omit them.
+        if attestation.compile_options.is_some()
+            && loaded.compile_options != attestation.compile_options
+        {
+            return Err(StorageError::unsafe_sqlite_build(
+                loaded.version_number,
+                attestation.sqlite_version_number_min,
+            ));
+        }
+        if attestation.linkage_mode.is_some() && loaded.linkage_mode != attestation.linkage_mode {
+            return Err(StorageError::unsafe_sqlite_build(
+                loaded.version_number,
+                attestation.sqlite_version_number_min,
+            ));
+        }
+        Ok(VerifiedSqliteBuild {
+            version_number: loaded.version_number,
+            source_id: loaded.source_id.clone(),
+            artifact_digest: loaded.artifact_digest.clone(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::StorageError;
+
+    const MIN: u32 = SQLITE_VERSION_NUMBER_MIN;
+    const SOURCE: &str = "sqlite-3.51.3-attested-source";
+    const SHA_C: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const SHA_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn attestation() -> ReleaseAttestation {
+        ReleaseAttestation {
+            sqlite_version_number_min: MIN,
+            sqlite_source_id: SOURCE.to_string(),
+            artifact_digest: SHA_C.parse().unwrap(),
+            compile_options: None,
+            linkage_mode: None,
+        }
+    }
+    fn loaded(version_number: u32) -> LoadedSqlite {
+        LoadedSqlite {
+            version: format!(
+                "{}.{}.{}",
+                version_number / 1000000,
+                (version_number / 1000) % 1000,
+                version_number % 1000
+            ),
+            version_number,
+            source_id: SOURCE.to_string(),
+            artifact_digest: SHA_C.parse().unwrap(),
+            compile_options: None,
+            linkage_mode: None,
+        }
+    }
+
+    #[test]
+    fn rejects_below_floor() {
+        let result = SqliteBuildGate.verify(&attestation(), &loaded(MIN - 1));
+        assert!(matches!(
+            result,
+            Err(StorageError::UnsafeSqliteBuild { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_at_floor_with_matching_identity() {
+        let result = SqliteBuildGate.verify(&attestation(), &loaded(MIN));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().version_number, MIN);
+    }
+
+    #[test]
+    fn rejects_source_id_mismatch() {
+        let mut l = loaded(MIN);
+        l.source_id = "different-source".to_string();
+        assert!(SqliteBuildGate.verify(&attestation(), &l).is_err());
+    }
+
+    #[test]
+    fn rejects_digest_mismatch() {
+        let mut l = loaded(MIN);
+        l.artifact_digest = SHA_B.parse().unwrap();
+        assert!(SqliteBuildGate.verify(&attestation(), &l).is_err());
+    }
+
+    #[test]
+    fn rejects_named_compile_options_mismatch() {
+        let mut a = attestation();
+        a.compile_options = Some(vec!["THREADSAFE=1".to_string(), "ENABLE_FTS5".to_string()]);
+        let mut l = loaded(MIN);
+        l.compile_options = Some(vec!["ENABLE_FTS5".to_string()]);
+        assert!(SqliteBuildGate.verify(&a, &l).is_err());
+
+        // Exact replication passes.
+        let ok = loaded(MIN);
+        let mut ok_loaded = ok.clone();
+        ok_loaded.compile_options =
+            Some(vec!["THREADSAFE=1".to_string(), "ENABLE_FTS5".to_string()]);
+        assert!(SqliteBuildGate.verify(&a, &ok_loaded).is_ok());
+    }
+
+    #[test]
+    fn rejects_named_linkage_mode_mismatch() {
+        let mut a = attestation();
+        a.linkage_mode = Some("static".to_string());
+        let mut l = loaded(MIN);
+        l.linkage_mode = Some("dynamic".to_string());
+        assert!(SqliteBuildGate.verify(&a, &l).is_err());
+    }
+}
