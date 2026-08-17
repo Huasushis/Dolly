@@ -1,0 +1,142 @@
+{
+  "$schema": "./memory-product-lexical-replay-v0-schema.json",
+  "schemaVersion": "dolly-experiment-preregistration/v1",
+  "experimentId": "memory-product-lexical-replay-v0",
+  "experimentVersion": 1,
+  "title": "Dolly product lexical replay: noninferiority against the frozen session-document BM25 reference",
+  "status": "frozen-before-first-run",
+  "scope": "single-treatment-comparison",
+  "protocol": "./memory-product-lexical-replay-v0-protocol.md",
+  "authorityReferences": [
+    "https://dolly.invalid/spec/research/memory-injection",
+    "https://dolly.invalid/spec/research/memory-association",
+    "https://dolly.invalid/spec/extensions/memory-baseline",
+    "https://dolly.invalid/adr/0009-memory-recall-transport-and-repeat-policy",
+    "./docs/research/memory-product-lexical-replay-v0-design.md",
+    "./artifacts/experiments/probes/memory-longmemeval-retrieval-v0/runs/retrieval-v4-20260813a/analysis.json"
+  ],
+  "question": "Dolly's product lexical retrieval treats memory as per-message Blocks, NFC-normalized all-unicode tokens, 512-byte segments with 64-byte overlap, and ranks records rather than sessions; the frozen v4 reference treats each session as one NFKC-normalized document ranked by content BM25. Is the product lexical representation close enough to the frozen session-document BM25 reference to justify installing durable-journal and Module wiring, without enabling automatic recall, automatic resume, vector/hybrid retrieval, association expansion, or checkpointing?",
+  "hypotheses": {
+    "primary": "On the 353 sealed evaluation questions, product NDCG@10 and Recall@10 are each no worse than the frozen content reference within a paired lower-95% margin of -0.02, and product knowledge-update top-one error is no more than 0.02 worse than reference.",
+    "decisionPositive": "A pass freezes the current extractor, segment, rank, and duplicate semantics for the next reversible engineering slice (durable file journal, Block reader, restart/delete/isolation tests, explicit-query-only admission).",
+    "decisionNegative": "A miss rejects production wiring for this representation; a later attempt may change one preregistered representation factor using development data and must receive a new version and sealed evaluation."
+  },
+  "decision": {
+    "supportedCondition": "product-lexical",
+    "decisionRuleReference": "./docs/research/memory-product-lexical-replay-v0-design.md"
+  },
+  "conditions": {
+    "baselines": [
+      {
+        "id": "content",
+        "description": "Frozen v4 session-document content BM25 top-10 ranking is the read-only reference and is not refit.",
+        "frozenParameters": {
+          "reference": "retrieval-v4-20260813a",
+          "readOnly": true,
+          "refit": false
+        }
+      }
+    ],
+    "treatments": [
+      {
+        "id": "product-lexical",
+        "description": "Dolly product Memory lexical path: one dolly.content/1 Block per session, one text item per message as lowercase role and exact content, NFC normalization, all-unicode tokens, 512-byte segments with 64-byte overlap, record-level ranking, then rank-to-session mapping without collapsing before the top-10 cutoff.",
+        "frozenParameters": {
+          "mode": "lexical",
+          "limit": 10,
+          "contextExpansion": 0,
+          "thresholdProfile": "empty",
+          "includeSourceRefs": false,
+          "segmentsBytes": 512,
+          "overlapBytes": 64,
+          "normalization": "NFC",
+          "duplicateRule": "first returned occurrence gains one; later occurrences keep their original recorded rank and gain zero (never collapse-and-refill)",
+          "refit": false
+        }
+      }
+    ]
+  },
+  "data": {
+    "datasetPath": "test/memory-data/benchmarks/conversation-memory/longmemeval/longmemeval_s",
+    "sha256": "08d8dad4be43ee2049a22ff5674eb86725d0ce5ff434cde2627e5e8e7e117894",
+    "questionCount": 500,
+    "splitDevelopment": 147,
+    "splitEvaluation": 353,
+    "caseSource": "artifacts/experiments/probes/memory-longmemeval-retrieval-v0/runs/retrieval-v4-20260813a/cases.jsonl",
+    "goldIsolation": "Treatment reads only gold-blind cases.jsonl rows (question_id, question, sessions) and never answer_session_ids, answers, question type, split, dates, or reference rankings. A separate analyzer may read split/gold only after every treatment row is persisted and verified."
+  },
+  "backend": {
+    "implementation": "https://dolly.invalid/probes/product-lexical-replay-v0/treatment",
+    "process": "one worker per case is gold-blind; the analyzer is a separate process and never imports treatment",
+    "dependencies": "node:fs, node:crypto, node:path only for the verifier; the treatment imports only the real product Memory modules"
+  },
+  "randomness": {
+    "determinism": "No model, network, provider, or sampling exists; all steps are deterministic and repeatable byte-for-byte.",
+    "streamSeparation": "The shared 10,000-row evaluation resample matrix from retrieval-v4-20260813a is reused unchanged; no new bootstrap stream is generated."
+  },
+  "metrics": {
+    "primary": ["NDCG@10", "Recall@10"],
+    "knowledgeUpdate": "top-one error using the existing six-type LongMemEval classification",
+    "duplicates": "repeated returned occurrences occupy their original ranks with zero gain",
+    "cost": "canonicalFeatureBytes / coveredNormalizedBytes with zero-denominator non-zero-numerator treated as infinity",
+    "cutoffs": [1, 5, 10]
+  },
+  "execution": {
+    "mode": "gold-blind-synthetic-first",
+    "treatmentEntry": "scripts/experiments/probes/memory-product-lexical-replay-v0/product-lexical.mts",
+    "workerCount": 3,
+    "failurePolicy": "Typed product limit/coverage/job failures are persisted as closed failure rows and force classification rejected, never inconclusive. Any structural, isolation, checksum, independent-verification, or mutation failure prevents supported/rejected classification."
+  },
+  "stoppingRules": {
+    "maxCases": 500,
+    "maxWallClockMs": 1800000,
+    "noRetry": true
+  },
+  "decisionRules": {
+    "classificationOrder": "Validate checksum inventory, gold-blind projection, complete rankings, coverage and terminal-job gate, source hashes, independent recomputation, and mutation rejection before inspecting any efficacy or cost threshold.",
+    "supported": [
+      "paired lower 95% bound of NDCG@10(product - reference) >= -0.02",
+      "paired lower 95% bound of Recall@10(product - reference) >= -0.02",
+      "knowledge-update top-one error(product - reference) <= 0.02",
+      "every row passes coverage and terminal-job gate; p95 canonicalFeatureBytes/coveredNormalizedBytes <= 2",
+      "all 500 treatment rows, rank/record/Block/session mappings, checksums, source hashes, independent metric recomputation, and preregistered mutation tests validate"
+    ],
+    "rejected": [
+      "a structurally valid miss of any gate rejects production wiring for this representation",
+      "the evaluation split must not be inspected to tune representation factors"
+    ],
+    "inconclusive": [
+      "any earlier structural/checksum/verification/mutation failure prevents a supported or rejected classification",
+      "running the synthetic foundation bundle does not observe sealed evaluation outcomes"
+    ]
+  },
+  "artifacts": {
+    "root": "artifacts/experiments/probes/memory-product-lexical-replay-v0/runs",
+    "schemas": {
+      "treatmentRow": "https://dolly.invalid/schemas/memory-product-lexical-replay-v0-treatment-row.json",
+      "ranking": "https://dolly.invalid/schemas/memory-product-lexical-replay-v0-ranking.json",
+      "runManifest": "https://dolly.invalid/schemas/memory-product-lexical-replay-v0-run-manifest.json",
+      "analysis": "https://dolly.invalid/schemas/memory-product-lexical-replay-v0-analysis.json"
+    }
+  },
+  "independentValidation": {
+    "verifier": "scripts/experiments/probes/memory-product-lexical-replay-v0/verify-synthetic.mjs",
+    "mustNotImport": ["product-lexical", "analyze", "common", "src/extensions/memory", "treatment"],
+    "recomputeSurface": "recompute coverage bytes, record/rank/session mapping, duplicate-rank occupancy, and canonical digest of every persisted row from frozen bytes; reuse the v4 resample matrix unchanged"
+  },
+  "safetyBoundary": {
+    "automaticRecall": false,
+    "automaticResume": false,
+    "vectorRetrieval": false,
+    "association": false,
+    "checkpoint": false,
+    "productStartup": false
+  },
+  "domainDesign": {
+    "extractor": "createTextContentExtractor with NFC and whitespace normalization, maxInputBytes bound, typed skip reasons",
+    "segment": "512-byte segments, 64-byte overlap, per-message union coverage computed once",
+    "rank": "lexical BM25 record ranking then rank-to-session mapping with sourceBlockId provenance",
+    "duplicate": "keep every returned rank; first gold occurrence gains one, later occurrences gain zero and never consume a refilled position",
+    "modeQuery": "exactly one explicit dolly.memory.query/1 mode:lexical with limit 10 and contextExpansion 0"
+  }
+}
