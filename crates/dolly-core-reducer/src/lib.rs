@@ -4,6 +4,7 @@
 
 mod command;
 mod disposition;
+pub mod neighbors;
 mod projection;
 mod reducer;
 mod types;
@@ -18,6 +19,10 @@ pub use command::{
     RuntimeEventCommand, SkipRangeCommand,
 };
 pub use disposition::{Disposition, DispositionShapeError, validate_disposition_candidate};
+pub use neighbors::{
+    AUTHORIZED_CONTRACTS_TOKEN, CONTRACT_TOKEN, FrozenDescriptor, INPUT_PRODUCER,
+    NeighborDescriptor, NeighborGraph, OUTPUT_CONSUMER, build_neighbor_descriptors,
+};
 pub use projection::{hash_core_state, project_core_state};
 pub use reducer::{SafetyStop, Transition, reduce};
 pub use types::{
