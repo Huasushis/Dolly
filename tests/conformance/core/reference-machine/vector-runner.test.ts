@@ -306,7 +306,7 @@ function execute(vector: FrozenVector): ScenarioResult {
       }
       const deliveryCounts = new Map<string, number>(); for (const delivery of state.deliveries) deliveryCounts.set(String(delivery.page_id), (deliveryCounts.get(String(delivery.page_id)) ?? 0) + 1);
       const original = Object.values(state.runtime_events)[0]!;
-      return { outcome: results[2]!.error?.code === "STORAGE_IDEMPOTENCY_CONFLICT" ? "one_commit_one_replay_one_conflict" : "unexpected", before: {}, observed: { runtime_event_operations: state.runtime_events, blocks: state.blocks, deliveries: { by_target_page: [...deliveryCounts.values()].every((count) => count === 1) ? "one_each" : "duplicate" }, third: { error: results[2]!.error?.code }, original }, emitted: [flattened(results[0]!.events[0]!), { event: "SecurityIncident", reason: results[2]!.error?.code }] };
+      return { outcome: results[2]!.error?.code === "STORAGE_IDEMPOTENCY_CONFLICT" ? "one_commit_one_replay_one_conflict" : "unexpected", before: {}, observed: { runtime_event_operations: state.runtime_events, blocks: state.blocks, deliveries: { by_target_page: [...deliveryCounts.values()].every((count) => count === 1) ? "one_each" : "duplicate" }, third: { error: results[2]!.error?.code }, original }, emitted: [flattened(results[0]!.events[0]!), { event: "SecurityIncident", reason: results[2]!.error?.code }, { error: results[2]!.error?.code, retryable: results[2]!.error?.retryable, outcome: results[2]!.error?.outcome }] };
     }
     case "TST-CORE-009": {
       const casesInitial = object(initial.cases, "initial.cases"); const casesStimulus = object(stimulus.cases, "stimulus.cases"); const observed: RecordValue = {}; const emitted: RecordValue[] = [];
@@ -600,23 +600,31 @@ describe("immutable Core vectors", () => {
     expect(vectors.map((vector) => vector.test_id)).not.toContain("TST-DESC-001");
     const importedPath = path.join(VECTOR_ROOT, "TST-DESC-001-neighbor-projection.json");
     expect(existsSync(importedPath)).toBe(true);
-    // Byte-faithful import provenance (spec-import commit fd5b252): any local
+    // Byte-faithful import provenance (reconcile commit 6ef777d): any local
     // edit to the imported vector fails this stable digest check.
-    expect(createHash("sha256").update(readFileSync(importedPath)).digest("hex")).toBe("501bc99cd1fa0f43cbf1b24a38cef208aeb7176cf466ff5be7adef336c54d0c9");
+    expect(createHash("sha256").update(readFileSync(importedPath)).digest("hex")).toBe("f0533f0c3e2c4707185a6c1fcad8171dceb2a18d54ecdaf1630005f40704e2a0");
     const imported = object(readFrozenJsonTestFile(importedPath), "TST-DESC-001") as unknown as FrozenVector;
     expect(imported.test_id).toBe("TST-DESC-001");
     // The identity half of the imported vector is sound: source_descriptor_digest
     // pins the JCS digest of the fixture's source descriptor.
     const fixtureEnvelope = object(readFrozenJsonTestFile(path.join(FIXTURE_ROOT, "neighbor-is-both-input-producer-and-output-consumer.json")), "fixture");
     const fixtureValue = object(fixtureEnvelope.value, "fixture.value");
-    expect(imported.initial.source_descriptor_digest).toBe(canonicalJsonDigest(object(fixtureValue.source_descriptor, "source_descriptor") as unknown as JsonValue));
-    // The assertions half is unsound as imported: literal contains-values
-    // ("contract" on the object-valued emits/accepts and "authorized-contracts"
-    // on actions) exist nowhere in the fixture or in the 06-module-descriptor.md
-    // projection, so the imported vector cannot pass any faithful runner. The
-    // overlay vector TST-DESC-002 pins the same projection with fixture-derived
-    // object/array values instead. Upstream dolly-spec must correct TST-DESC-001.
-    expect(imported.expected.assertions.some((assertion) => assertion.op === "contains")).toBe(true);
+    const sourceDescriptor = object(fixtureValue.source_descriptor, "source_descriptor");
+    expect(imported.initial.source_descriptor_digest).toBe(canonicalJsonDigest(sourceDescriptor as unknown as JsonValue));
+    // The assertions half is corrected (reconcile commit 6ef777d): each
+    // projection group is asserted with exact equals against the schema-valid
+    // fixture source group, replacing the pre-correction scalar contains
+    // tokens ("contract", "authorized-contracts") that existed nowhere in the
+    // fixture or the 06-module-descriptor.md projection. Reinjecting those old
+    // tokens is rejected below on two independent guards: the byte digest
+    // above moves off f0533f0c, and no assertion may use contains or diverge
+    // from the fixture group this vector now pins.
+    for (const group of ["emits", "accepts", "actions"] as const) {
+      const assertion = imported.expected.assertions.find((entry) => entry.path === `/manifest/neighbor_descriptors/0/projection/${group}`);
+      expect(assertion?.op, `projection.${group}`).toBe("equals");
+      expect(assertion?.value, `projection.${group}`).toEqual(sourceDescriptor[group]);
+    }
+    expect(imported.expected.assertions.some((assertion) => assertion.op === "contains")).toBe(false);
   });
 
   for (const vector of vectors) {

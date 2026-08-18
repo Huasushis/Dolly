@@ -268,7 +268,7 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
         const incident: JsonObject = { code: "STORAGE_IDEMPOTENCY_CONFLICT", identity, original_digest: existing.operation_digest, conflicting_digest: command.operation_digest };
         next.security_incidents.push(incident);
         events.push(appendEvent(next, command.command_id, "SecurityIncident", incident));
-        return success(next, events, undefined, { code: "STORAGE_IDEMPOTENCY_CONFLICT", retryable: false, outcome: "applied", details: incident });
+        return success(next, events, undefined, { code: "STORAGE_IDEMPOTENCY_CONFLICT", retryable: false, outcome: "not_applied", details: incident });
       }
       if (!canonicalValue(command.block)) return failure(state, "CANONICAL_JSON_INVALID");
       next.runtime_events[identity] = { operation_digest: command.operation_digest, block_id: command.block_id };
@@ -433,7 +433,7 @@ export function reduceCore(state: CoreSnapshot, command: CoreCommand, input: Red
         if (item.replay_evidence.evidence_digest === evidence.digest) return success(state, [], { evidence_digest: evidence.digest, idempotent: true });
         const incident: JsonObject = { code: "STORAGE_IDEMPOTENCY_CONFLICT", activation_id: command.activation_id };
         next.security_incidents.push(incident); events.push(appendEvent(next, command.command_id, "SecurityIncident", incident));
-        return success(next, events, undefined, { code: "STORAGE_IDEMPOTENCY_CONFLICT", retryable: false, outcome: "applied", details: incident });
+        return success(next, events, undefined, { code: "STORAGE_IDEMPOTENCY_CONFLICT", retryable: false, outcome: "not_applied", details: incident });
       }
       item.replay_evidence = { ...evidence.record, evidence_digest: evidence.digest, observation: evidence.observation, ...(evidence.target_generation === undefined ? {} : { target_generation: evidence.target_generation }) };
       events.push(appendEvent(next, command.command_id, "ActivationReplayEvidenceRecorded", { activation_id: command.activation_id, observation: evidence.observation, evidence_digest: evidence.digest }));
