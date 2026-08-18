@@ -22,7 +22,8 @@
     ],
     "emitted": [
       {"event": "RuntimeEventCommitted"},
-      {"event": "SecurityIncident", "reason": "STORAGE_IDEMPOTENCY_CONFLICT"}
+      {"event": "SecurityIncident", "reason": "STORAGE_IDEMPOTENCY_CONFLICT"},
+      {"error": "STORAGE_IDEMPOTENCY_CONFLICT", "retryable": false, "outcome": "not_applied"}
     ],
     "crash_label": null
   }

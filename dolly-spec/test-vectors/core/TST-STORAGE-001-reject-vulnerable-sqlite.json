@@ -25,6 +25,6 @@
       {"path": "/instance/migration_started", "op": "equals", "value": false},
       {"path": "/instance/recovery_write_started", "op": "equals", "value": false}
     ],
-    "emitted": [{"error": "STORAGE_UNSAFE_SQLITE_BUILD", "retryable": false}]
+    "emitted": [{"error": "STORAGE_UNSAFE_SQLITE_BUILD", "retryable": false, "outcome": "not_applied"}]
   }
 }
