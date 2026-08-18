@@ -4,6 +4,7 @@
 
 mod command;
 mod disposition;
+mod effective_config;
 pub mod neighbors;
 mod projection;
 mod reducer;
@@ -19,6 +20,10 @@ pub use command::{
     RuntimeEventCommand, SkipRangeCommand,
 };
 pub use disposition::{Disposition, DispositionShapeError, validate_disposition_candidate};
+pub use effective_config::{
+    EFFECTIVE_CONFIG_MAX_PROPERTIES, EFFECTIVE_CONFIG_MAX_PROPERTIES_CODE, EffectiveConfigError,
+    MAX_EFFECTIVE_CONFIG_PROPERTIES, NormalizedEffectiveConfig, normalize_effective_config,
+};
 pub use neighbors::{
     FrozenDescriptor, INPUT_PRODUCER, NeighborDescriptor, NeighborError, NeighborGraph,
     OUTPUT_CONSUMER, build_neighbor_descriptors,
