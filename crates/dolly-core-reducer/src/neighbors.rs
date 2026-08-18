@@ -3,26 +3,25 @@
 //! Implements the frozen neighbor-snapshot rules of dolly-spec
 //! `06-module-descriptor.md` (`REQ-DESC-002`, `INV-DESC-001`, `INV-DESC-003`):
 //! for the receiving Module, every input-Page producer contributes an
-//! `input_producer` relationship and its `emits` contract, every Module
+//! `input_producer` relationship and its `emits` contract, and every Module
 //! subscribed to an output Page contributes `output_consumer` plus its
-//! `accepts` contract and the Actions it may target. Neighbors are deduplicated
-//! by Module ID — a dual-role neighbor keeps both relationship labels and both
-//! authorized field groups — and entries are ordered by
-//! `(module_id, descriptor_revision)`.
+//! `accepts` contract and the Actions the receiver is authorized to target.
+//! Neighbors are deduplicated by Module ID — a dual-role neighbor keeps both
+//! relationship labels and both authorized field sets — and entries are ordered
+//! by `(module_id, descriptor_revision)`.
+//!
+//! The projected `emits`, `accepts`, and `actions` groups are the exact
+//! schema-valid source values (a Contract for `emits`/`accepts`, an array of
+//! ActionContract for `actions`), never token-injected containers. Each entry's
+//! `source_descriptor_digest` is recomputed from the canonical source Descriptor
+//! bytes at projection time and the projection fails closed when the frozen
+//! snapshot's claimed digest does not match, when a named neighbor Descriptor is
+//! missing, or when the source Descriptor is malformed.
 //!
 //! Each entry's `projection` is frozen by the enclosing Activation manifest
 //! digest, not by reusing the source Descriptor's identity.
-//!
-//! The exact imported vector `TST-DESC-001` pins `projection.emits` and
-//! `projection.accepts` to containers whose members include the scalar
-//! `contract`, and `projection.actions` to a container whose member includes
-//! `authorized-contracts`. To honour those exact containment semantics without
-//! discarding any authorized source content, each projected group is an array
-//! whose first element is the group token and whose remaining elements are the
-//! authorized source values (`emits` Contract, `accepts` Contract, and each
-//! targetable ActionContract). A faithful runner treats `contains` as
-//! membership for arrays, as the crate's conformance runner does.
 
+use dolly_canonical_json::canonicalize;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -33,12 +32,54 @@ pub const INPUT_PRODUCER: &str = "input_producer";
 /// Canonical relationship label naming a neighbor that subscribes to at least
 /// one frozen output Page of the receiving Module.
 pub const OUTPUT_CONSUMER: &str = "output_consumer";
-/// Member token present in each projected `emits`/`accepts` group, per the
-/// exact TST-DESC-001 containment assertion.
-pub const CONTRACT_TOKEN: &str = "contract";
-/// Member token present in the projected `actions` group, naming the list of
-/// Action contracts the receiving Module may target, per TST-DESC-001.
-pub const AUTHORIZED_CONTRACTS_TOKEN: &str = "authorized-contracts";
+
+/// Why a neighbor projection could not be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NeighborError {
+    /// A relationship-bearing neighbor has no frozen Descriptor in the graph
+    /// snapshot. Projection fails closed rather than silently omitting it.
+    MissingDescriptor { module_id: String },
+    /// The frozen snapshot's claimed `source_descriptor_digest` does not match
+    /// the canonical digest of the source Descriptor bytes. Projection fails
+    /// closed rather than projecting bytes bound by an unverifiable digest.
+    DigestMismatch {
+        module_id: String,
+        claimed: String,
+        computed: String,
+    },
+    /// The source Descriptor lacks a field the frozen relationships require,
+    /// or that field has the wrong shape.
+    InvalidDescriptor { module_id: String, detail: String },
+}
+
+impl std::fmt::Display for NeighborError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NeighborError::MissingDescriptor { module_id } => {
+                write!(
+                    f,
+                    "neighbor {module_id} has a frozen relationship but no source Descriptor"
+                )
+            }
+            NeighborError::DigestMismatch {
+                module_id,
+                claimed,
+                computed,
+            } => write!(
+                f,
+                "neighbor {module_id} source Descriptor digest mismatch: claimed {claimed}, computed {computed}"
+            ),
+            NeighborError::InvalidDescriptor { module_id, detail } => {
+                write!(
+                    f,
+                    "neighbor {module_id} source Descriptor invalid: {detail}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for NeighborError {}
 
 /// A frozen source Descriptor selected from the graph snapshot: the complete
 /// canonical `value` and the `source_descriptor_digest` that binds its bytes.
@@ -67,6 +108,10 @@ pub struct NeighborGraph {
     /// Namespaces the receiving Module is authorized to see in neighbor
     /// metadata; all other metadata is filtered out of the projection.
     pub authorized_metadata_namespaces: Vec<String>,
+    /// Names of the Actions the receiving Module is authorized to target.
+    /// Only source Actions with one of these names are projected; all others
+    /// are excluded. An empty set projects no Actions.
+    pub authorized_action_names: Vec<String>,
 }
 
 /// A closed neighbor Descriptor projection wrapper
@@ -88,6 +133,25 @@ struct Relationship {
     output_consumer: bool,
 }
 
+/// Recompute the canonical digest of the source Descriptor `value` and compare
+/// it with the claimed digest from the frozen snapshot.
+fn verify_descriptor_digest(frozen: &FrozenDescriptor) -> Result<String, NeighborError> {
+    let (_, computed) =
+        canonicalize(&frozen.value).map_err(|error| NeighborError::InvalidDescriptor {
+            module_id: frozen.module_id.clone(),
+            detail: format!("cannot canonicalize source bytes: {error}"),
+        })?;
+    let computed = computed.to_canonical_string();
+    if computed != frozen.source_descriptor_digest {
+        return Err(NeighborError::DigestMismatch {
+            module_id: frozen.module_id.clone(),
+            claimed: frozen.source_descriptor_digest.clone(),
+            computed,
+        });
+    }
+    Ok(computed)
+}
+
 /// Filter the Descriptor metadata to the namespaces the receiving Module is
 /// authorized to see. The rebuild keeps the frozen namespace order of the
 /// graph snapshot, not the source map's key order.
@@ -104,23 +168,67 @@ fn authorized_metadata(source: &Value, namespaces: &[String]) -> Value {
     Value::Object(filtered)
 }
 
-fn contract_group(contract: Value) -> Value {
-    json!([CONTRACT_TOKEN, contract])
+/// The exact source `emits`/`accepts` Contract. Fail-closed when the source
+/// field is absent or not an object.
+fn require_contract(source: &Value, field: &str, module_id: &str) -> Result<Value, NeighborError> {
+    let value = source.get(field);
+    match value {
+        Some(Value::Object(_)) => Ok(value.cloned().unwrap()),
+        Some(_) => Err(NeighborError::InvalidDescriptor {
+            module_id: module_id.to_string(),
+            detail: format!("{field} must be a Contract object"),
+        }),
+        None => Err(NeighborError::InvalidDescriptor {
+            module_id: module_id.to_string(),
+            detail: format!("{field} is required"),
+        }),
+    }
 }
 
-fn action_group(actions: Value) -> Value {
-    let mut group = vec![json!(AUTHORIZED_CONTRACTS_TOKEN)];
-    if let Some(list) = actions.as_array() {
-        group.extend(list.iter().cloned());
-    }
-    Value::Array(group)
+/// The exact source `actions` array filtered to the ActionContracts the
+/// receiving Module is authorized to target, preserving source order. Fails
+/// closed when the source Actions are not an array.
+fn require_authorized_actions(
+    source: &Value,
+    module_id: &str,
+    authorized: &[String],
+) -> Result<Value, NeighborError> {
+    let value = source.get("actions");
+    let Some(actions) = value else {
+        return Err(NeighborError::InvalidDescriptor {
+            module_id: module_id.to_string(),
+            detail: "actions is required".to_string(),
+        });
+    };
+    let Some(list) = actions.as_array() else {
+        return Err(NeighborError::InvalidDescriptor {
+            module_id: module_id.to_string(),
+            detail: "actions must be an array of ActionContract".to_string(),
+        });
+    };
+    Ok(Value::Array(
+        list.iter()
+            .filter(|action| {
+                action
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .is_some_and(|name| authorized.iter().any(|candidate| candidate == name))
+            })
+            .cloned()
+            .collect(),
+    ))
 }
 
 /// Build the ordered `neighbor_descriptors` array for a frozen graph snapshot.
 ///
 /// Deterministic and side-effect free: no live Extension queries, no clock, no
-/// storage; all inputs come from the caller's frozen snapshot.
-pub fn build_neighbor_descriptors(graph: &NeighborGraph) -> Vec<NeighborDescriptor> {
+/// storage; all inputs come from the caller's frozen snapshot. Fails closed on
+/// any relationship-bearing neighbor whose Descriptor is missing, digest-mismatched,
+/// or malformed — it never silently omits the neighbor, a relationship, or an
+/// authorized Action contract.
+pub fn build_neighbor_descriptors(
+    graph: &NeighborGraph,
+) -> Result<Vec<NeighborDescriptor>, NeighborError> {
     let mut relationship_by_module: BTreeMap<String, Relationship> = BTreeMap::new();
     let receiving_input_pages = graph
         .input_pages
@@ -131,12 +239,10 @@ pub fn build_neighbor_descriptors(graph: &NeighborGraph) -> Vec<NeighborDescript
         .get(&graph.receiving_module)
         .map_or_else(Vec::new, Clone::clone);
 
-    // input_producer: every Module (other than the receiver) that outputs to a
-    // frozen input Page of the receiving Module.
+    // input_producer: every Module — including the receiver itself on a real
+    // self-delivery path (REQ-DESC-002) — that outputs to a frozen input Page
+    // of the receiving Module.
     for (module_id, pages) in &graph.output_pages {
-        if module_id == &graph.receiving_module {
-            continue;
-        }
         if pages
             .iter()
             .any(|page| receiving_input_pages.iter().any(|input| input == page))
@@ -147,16 +253,14 @@ pub fn build_neighbor_descriptors(graph: &NeighborGraph) -> Vec<NeighborDescript
                 .input_producer = true;
         }
     }
-    // output_consumer: every Module (other than the receiver) subscribed to a
-    // frozen output Page of the receiving Module.
+    // output_consumer: every Module — including the receiver itself on a real
+    // self-delivery path — subscribed to a frozen output Page of the receiving
+    // Module.
     for (page_id, subscribers) in &graph.subscriptions {
         if !receiving_output_pages.contains(page_id) {
             continue;
         }
         for module_id in subscribers {
-            if module_id == &graph.receiving_module {
-                continue;
-            }
             relationship_by_module
                 .entry(module_id.clone())
                 .or_default()
@@ -167,7 +271,9 @@ pub fn build_neighbor_descriptors(graph: &NeighborGraph) -> Vec<NeighborDescript
     let mut results: Vec<NeighborDescriptor> = Vec::new();
     for (module_id, relationship) in relationship_by_module {
         let Some(frozen) = graph.descriptors.get(&module_id) else {
-            continue;
+            return Err(NeighborError::MissingDescriptor {
+                module_id: module_id.clone(),
+            });
         };
         let mut labels = Vec::new();
         if relationship.input_producer {
@@ -179,25 +285,53 @@ pub fn build_neighbor_descriptors(graph: &NeighborGraph) -> Vec<NeighborDescript
         if labels.is_empty() {
             continue;
         }
+        let verified_digest = verify_descriptor_digest(frozen)?;
         let source = &frozen.value;
+        if !source.is_object() {
+            return Err(NeighborError::InvalidDescriptor {
+                module_id: module_id.clone(),
+                detail: "source Descriptor value must be an object".to_string(),
+            });
+        }
+        let Some(display_name) = source.get("display_name") else {
+            return Err(NeighborError::InvalidDescriptor {
+                module_id: module_id.clone(),
+                detail: "display_name is required".to_string(),
+            });
+        };
+        let Some(trust) = source.get("trust") else {
+            return Err(NeighborError::InvalidDescriptor {
+                module_id: module_id.clone(),
+                detail: "trust is required".to_string(),
+            });
+        };
         let mut projection = Map::new();
-        projection.insert("display_name".into(), source["display_name"].clone());
-        projection.insert("trust".into(), source["trust"].clone());
+        projection.insert("display_name".into(), display_name.clone());
+        projection.insert("trust".into(), trust.clone());
         projection.insert(
             "metadata".into(),
             authorized_metadata(&source["metadata"], &graph.authorized_metadata_namespaces),
         );
         if relationship.input_producer {
-            projection.insert("emits".into(), contract_group(source["emits"].clone()));
+            projection.insert(
+                "emits".into(),
+                require_contract(source, "emits", &module_id)?,
+            );
         }
         if relationship.output_consumer {
-            projection.insert("accepts".into(), contract_group(source["accepts"].clone()));
-            projection.insert("actions".into(), action_group(source["actions"].clone()));
+            projection.insert(
+                "accepts".into(),
+                require_contract(source, "accepts", &module_id)?,
+            );
+            projection.insert(
+                "actions".into(),
+                require_authorized_actions(source, &module_id, &graph.authorized_action_names)?,
+            );
         }
         results.push(NeighborDescriptor {
             module_id: module_id.clone(),
             descriptor_revision: frozen.descriptor_revision,
-            source_descriptor_digest: frozen.source_descriptor_digest.clone(),
+            source_descriptor_digest: verified_digest,
             relationships: labels,
             projection: Value::Object(projection),
         });
@@ -207,5 +341,5 @@ pub fn build_neighbor_descriptors(graph: &NeighborGraph) -> Vec<NeighborDescript
             .cmp(&right.module_id)
             .then(left.descriptor_revision.cmp(&right.descriptor_revision))
     });
-    results
+    Ok(results)
 }

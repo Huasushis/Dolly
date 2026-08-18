@@ -1,11 +1,27 @@
+//! RED/GREEN conformance tests for the corrected frozen neighbor Descriptor
+//! projection (TST-DESC-001 schema-conformant `equals` groups).
+//!
+//! The token-injection design is gone: every projected `emits`/`accepts` value
+//! is the exact schema-valid source Contract and every projected `actions`
+//! value is the exact source ActionContract array filtered by the receiving
+//! Module's explicit authorization input. The vector's pinned digest must equal
+//! the recomputed canonical digest of the source Descriptor, and a missing or
+//! digest-mismatched neighbor Descriptor fails closed instead of being silently
+//! omitted.
+
 use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
 
-use dolly_core_reducer::neighbors::{FrozenDescriptor, NeighborGraph, build_neighbor_descriptors};
-use dolly_core_reducer::{BuildManifestCommand, CoreCommand, empty_core_snapshot, reduce};
+use dolly_canonical_json::canonicalize;
+use dolly_core_reducer::neighbors::{
+    FrozenDescriptor, NeighborError, NeighborGraph, build_neighbor_descriptors,
+};
+use dolly_core_reducer::{
+    BuildManifestCommand, CoreCommand, INPUT_PRODUCER, OUTPUT_CONSUMER, empty_core_snapshot, reduce,
+};
 use serde_json::{Value, json};
 
 fn spec_root() -> PathBuf {
@@ -32,9 +48,39 @@ fn fixture(name: &str) -> Value {
     envelope["value"].clone()
 }
 
+fn map_str_vec(value: &Value) -> BTreeMap<String, Vec<String>> {
+    value
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(key, pages)| {
+            (
+                key.clone(),
+                pages
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|page| page.as_str().unwrap().to_string())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// Names of every Action the neighbor's source Descriptor declares.
+fn source_action_names(source_descriptor: &Value) -> Vec<String> {
+    source_descriptor["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|action| action["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
 /// Build the `NeighborGraph` exactly as the imported TST-DESC-001 vector does:
 /// the `neighbor-is-both-input-producer-and-output-consumer` fixture with the
-/// vector's explicit initial overrides applied.
+/// vector's explicit initial overrides applied. The receiver is authorized to
+/// target every Action the neighbor source descriptor declares.
 fn graph_from_vector(vector: &Value) -> NeighborGraph {
     let mut value = fixture("neighbor-is-both-input-producer-and-output-consumer");
     let map = value.as_object_mut().unwrap();
@@ -71,26 +117,19 @@ fn graph_from_vector(vector: &Value) -> NeighborGraph {
             .iter()
             .map(|value| value.as_str().unwrap().to_string())
             .collect(),
+        authorized_action_names: source_action_names(descriptor),
     }
 }
 
-fn map_str_vec(value: &Value) -> BTreeMap<String, Vec<String>> {
-    value
-        .as_object()
-        .unwrap()
-        .iter()
-        .map(|(key, pages)| {
-            (
-                key.clone(),
-                pages
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|page| page.as_str().unwrap().to_string())
-                    .collect(),
-            )
-        })
-        .collect()
+/// Build JSON neighbor wrappers from the frozen projection builder.
+fn build_neighbors_json(graph: &NeighborGraph) -> Value {
+    let neighbors = build_neighbor_descriptors(graph).expect("valid graph builds");
+    Value::Array(
+        neighbors
+            .into_iter()
+            .map(|entry| serde_json::to_value(&entry).expect("NeighborDescriptor is a JSON object"))
+            .collect(),
+    )
 }
 
 /// Run the imported-vector stimulus (BuildManifest carrying the built
@@ -98,17 +137,14 @@ fn map_str_vec(value: &Value) -> BTreeMap<String, Vec<String>> {
 /// vector is the activated manifest.
 fn build_scenario_projection(vector: &Value) -> (Value, dolly_core_reducer::Transition) {
     let graph = graph_from_vector(vector);
-    let neighbors = build_neighbor_descriptors(&graph)
-        .into_iter()
-        .map(|entry| serde_json::to_value(&entry).expect("NeighborDescriptor is a JSON object"))
-        .collect::<Vec<_>>();
+    let neighbors = build_neighbors_json(&graph);
     let manifest = json!({
         "schema": "dolly.activation-manifest/v1",
         "activation_id":"r","module_id":graph.receiving_module,"reason":"input",
         "created_at":null,"graph_revision":1,"config_revision":1,
         "descriptor_revision":9,"effective_config":{},"effective_config_digest":null,
         "effective_config_schema_digest":null,"input_items":[],"cursor_spans":[],
-        "lossy_gaps":[],"output_page_ids":[],"neighbor_descriptors":Value::Array(neighbors),
+        "lossy_gaps":[],"output_page_ids":[],"neighbor_descriptors":neighbors,
         "required_frame_bytes":1,"required_frame_nesting_depth":1,"deadline":null,
         "manifest_digest": null,
     });
@@ -131,34 +167,6 @@ fn build_scenario_projection(vector: &Value) -> (Value, dolly_core_reducer::Tran
     (json!({"manifest": result.state.manifests["r"]}), result)
 }
 
-fn subset_contains(actual: &Value, required: &Value) -> bool {
-    match actual {
-        Value::Array(array) => array.iter().any(|member| subset(member, required)),
-        Value::String(text) => required
-            .as_str()
-            .is_some_and(|needle| text.contains(needle)),
-        _ => false,
-    }
-}
-fn subset(actual: &Value, required: &Value) -> bool {
-    match required {
-        Value::Object(map) => map.iter().all(|(key, value)| {
-            actual
-                .get(key)
-                .is_some_and(|candidate| subset(candidate, value))
-        }),
-        Value::Array(items) => actual.as_array().is_some_and(|array| {
-            array.len() == items.len() && array.iter().zip(items).all(|(a, b)| subset(a, b))
-        }),
-        _ => actual == required,
-    }
-}
-
-/// The language-neutral expected projection: canonical-JCS of this exact
-/// literal is the language-neutral expected vector a later TypeScript
-/// implementation MUST reproduce byte-for-byte.
-const EXPECTED_NEIGHBOR_PROJECTION: &str = r#"{"analyst":{"display_name":"Analyst","trust":"trusted","metadata":{"org.dolly.llm":{"role":"analyst"}},"emits":["contract",{"summary":"Analysis","part_kinds":["text"],"action_names":[]}],"accepts":["contract",{"summary":"Review work","part_kinds":["text"],"action_names":["org.dolly.llm.review"]}],"actions":["authorized-contracts",{"name":"org.dolly.llm.review","arguments_schema":{"uri":"schemas/channel-send.schema.json","schema_digest":"sha256:64fbd12a17d44adb095ff1886020231fabbbb1b29d15c6a5f6d099a1d2e750aa","semantic_validator":null},"result_schema":{"uri":"schemas/channel-send-result.schema.json","schema_digest":"sha256:14edf90d6ac5a7082fafdd3bcfb5de311ebb92640e04235b98d247c19222b239","semantic_validator":{"id":"org.dolly.validator.channel-send-result","revision":1}},"description":"Review a draft","side_effect_class":"read_only"}]}}"#;
-
 #[test]
 fn tst_desc_001_neighbor_projection_vector() {
     let vector = read(spec_root().join("test-vectors/core/TST-DESC-001-neighbor-projection.json"));
@@ -170,6 +178,8 @@ fn tst_desc_001_neighbor_projection_vector() {
         json!(["REQ-DESC-002", "INV-DESC-001", "INV-DESC-003"])
     );
 
+    let fixture_value = fixture("neighbor-is-both-input-producer-and-output-consumer");
+    let source = &fixture_value["source_descriptor"];
     let (scenario, transition) = build_scenario_projection(&vector);
     assert!(
         transition.error.is_none(),
@@ -183,24 +193,36 @@ fn tst_desc_001_neighbor_projection_vector() {
     let entry = &neighbors[0];
     assert_eq!(entry["module_id"], "analyst");
     assert_eq!(entry["descriptor_revision"], 9);
+
+    // The digest is recomputed from the canonical source Descriptor at
+    // projection time and must equal the frozen snapshot's pinned digest.
+    let recomputed = canonicalize(source).unwrap().1.to_canonical_string();
     assert_eq!(
         entry["source_descriptor_digest"],
-        "sha256:dcdb688583af0951e2b3ab7f79cd0129bf74bd0a157aab1886898871cbd4d6ba"
+        vector["initial"]["source_descriptor_digest"]
     );
+    assert_eq!(entry["source_descriptor_digest"], recomputed);
     assert_eq!(
         entry["relationships"],
         json!(["input_producer", "output_consumer"])
     );
-    let projection = &entry["projection"];
-    assert!(subset_contains(&projection["emits"], &json!("contract")));
-    assert!(subset_contains(&projection["accepts"], &json!("contract")));
-    assert!(subset_contains(
-        &projection["actions"],
-        &json!("authorized-contracts")
-    ));
 
-    // Exact frozen wrapper semantics (INV-DESC-001/003): the projection is a
-    // closed view, not a ModuleDescriptor.
+    // The corrected vector asserts schema-valid groups with exact equality,
+    // not containment of injected scalar tokens.
+    let projection = &entry["projection"];
+    for group in ["emits", "accepts", "actions"] {
+        let asserted = &vector["expected"]["assertions"];
+        let expected = asserted
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|assertion| {
+                assertion["path"] == format!("/manifest/neighbor_descriptors/0/projection/{group}")
+            })
+            .expect("assertion exists")["value"]
+            .clone();
+        assert_eq!(entry["projection"][group], expected);
+    }
     assert!(
         projection.get("schema").is_none(),
         "projection must not expose schema"
@@ -215,14 +237,24 @@ fn tst_desc_001_neighbor_projection_vector() {
         json!({"org.dolly.llm":{"role":"analyst"}})
     );
     assert!(projection.get("org.example.private").is_none());
-    // The wrapper is not the source Descriptor: no top-level identity reuse.
-    assert!(entry.get("schema").is_none());
+    assert!(
+        entry.get("schema").is_none(),
+        "wrapper must not be a ModuleDescriptor"
+    );
 
-    // Language-neutral expected vector: canonical JCS of the literal above.
-    let expected = serde_json::from_str::<Value>(EXPECTED_NEIGHBOR_PROJECTION).unwrap();
+    // The projection is exactly the source descriptor's own authorized
+    // groups — the same shape the corrected (schema-conformant) vector asserts.
+    let expected = json!({
+        "display_name": source["display_name"],
+        "trust": source["trust"],
+        "metadata": json!({"org.dolly.llm":{"role":"analyst"}}),
+        "emits": source["emits"],
+        "accepts": source["accepts"],
+        "actions": source["actions"],
+    });
     assert_eq!(
-        projection, &expected["analyst"],
-        "projection digest must be frozen"
+        projection, &expected,
+        "projection must equal the source groups"
     );
 
     // Deterministic frozen projection (INV-DESC-003): retry builds byte-identical bytes.
@@ -234,15 +266,373 @@ fn tst_desc_001_neighbor_projection_vector() {
 fn tst_desc_001_projection_is_deterministic_and_sorted() {
     let vector = read(spec_root().join("test-vectors/core/TST-DESC-001-neighbor-projection.json"));
     let graph = graph_from_vector(&vector);
-    let first = build_neighbor_descriptors(&graph);
-    let second = build_neighbor_descriptors(&graph);
+    let first = build_neighbor_descriptors(&graph).unwrap();
+    let second = build_neighbor_descriptors(&graph).unwrap();
     assert_eq!(first, second);
 
-    // Ordering: by (module_id, descriptor_revision).
     let neighbor = &first[0];
     assert_eq!(neighbor.module_id, "analyst");
     assert_eq!(
         neighbor.relationships,
         vec!["input_producer".to_string(), "output_consumer".to_string()]
     );
+    // No token/raw scalar leftover from the token-injection design.
+    let serialized = serde_json::to_value(neighbor).unwrap();
+    assert!(
+        !serialized.to_string().contains("\"contract\"")
+            && !serialized.to_string().contains("authorized-contracts"),
+        "projection must not retain injected token strings"
+    );
+}
+
+#[test]
+fn produced_manifest_validates_against_activation_manifest_schema() {
+    let vector = read(spec_root().join("test-vectors/core/TST-DESC-001-neighbor-projection.json"));
+    let graph = graph_from_vector(&vector);
+    let neighbors = build_neighbors_json(&graph);
+
+    // A fully schema-valid activation manifest carrying the produced
+    // neighbor_descriptors array must pass the embedded golden schema.
+    //
+    // Note: dolly-schema embeds a catalog byte-identical to the checked-in
+    // schemas (verified by the catalog test), validating the produced wrapper
+    // against the exact authoritative golden, not a re-derivation.
+    let manifest = json!({
+        "schema": "dolly.activation-manifest/v1",
+        "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000004",
+        "module_id": "reviewer",
+        "reason": "input",
+        "created_at": "2026-08-10T22:00:00.000000Z",
+        "graph_revision": 1,
+        "config_revision": 1,
+        "descriptor_revision": 9,
+        "effective_config": {},
+        "effective_config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "effective_config_schema_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "input_items": [],
+        "cursor_spans": [],
+        "lossy_gaps": [],
+        "output_page_ids": [],
+        "neighbor_descriptors": neighbors,
+        "required_frame_bytes": 1,
+        "required_frame_nesting_depth": 1,
+        "deadline": "2026-08-10T22:00:00.000000Z",
+        "manifest_digest": canonicalize(&json!({})).unwrap().1.to_canonical_string(),
+    });
+    let catalog = dolly_schema::embedded_schema_catalog().expect("embedded catalog loads");
+    let value = dolly_canonical_json::CanonicalJsonValue::try_from(manifest).unwrap();
+    catalog
+        .validate(
+            dolly_schema::ACTIVATION_MANIFEST_SCHEMA_ID,
+            &value,
+            dolly_canonical_json::MAX_SEMANTIC_JSON_NESTING_DEPTH,
+        )
+        .map_err(|issues| panic!("produced manifest violates golden schema: {issues}"))
+        .unwrap();
+}
+
+#[test]
+fn source_descriptor_digest_mismatch_rejected() {
+    let vector = read(spec_root().join("test-vectors/core/TST-DESC-001-neighbor-projection.json"));
+    let mut graph = graph_from_vector(&vector);
+    let neighbor = graph.descriptors.keys().next().unwrap().clone();
+    graph
+        .descriptors
+        .get_mut(&neighbor)
+        .unwrap()
+        .source_descriptor_digest =
+        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string();
+
+    let error = build_neighbor_descriptors(&graph).unwrap_err();
+    assert!(
+        matches!(error, NeighborError::DigestMismatch { ref module_id, .. } if module_id == &neighbor),
+        "expected DigestMismatch, got {error:?}"
+    );
+}
+
+#[test]
+fn unauthorized_action_is_excluded() {
+    let vector = read(spec_root().join("test-vectors/core/TST-DESC-001-neighbor-projection.json"));
+    let mut graph = graph_from_vector(&vector);
+    let neighbor = graph.descriptors.keys().next().unwrap().clone();
+    {
+        let descriptor = graph.descriptors.get_mut(&neighbor).unwrap();
+        // Two actions, only one authorized.
+        let extra = serde_json::from_str::<Value>(r#"{
+            "name": "org.dolly.llm.analyze",
+            "arguments_schema": {"uri":"schemas/channel-send.schema.json","schema_digest":"sha256:64fbd12a17d44adb095ff1886020231fabbbb1b29d15c6a5f6d099a1d2e750aa","semantic_validator":null},
+            "result_schema": {"uri":"schemas/channel-send-result.schema.json","schema_digest":"sha256:14edf90d6ac5a7082fafdd3bcfb5de311ebb92640e04235b98d247c19222b239","semantic_validator":{"id":"org.dolly.validator.channel-send-result","revision":1}},
+            "description":"dummy",
+            "side_effect_class":"read_only"
+        }"#).unwrap();
+        let mut updated = descriptor.value["actions"].as_array().unwrap().clone();
+        updated.push(extra);
+        descriptor.value["actions"] = Value::Array(updated);
+        // digest must now match modified value
+        let (_, digest) = canonicalize(&descriptor.value).unwrap();
+        descriptor.source_descriptor_digest = digest.to_string();
+    }
+    graph.authorized_action_names = vec!["org.dolly.llm.review".to_string()];
+
+    let entry = &build_neighbor_descriptors(&graph).unwrap()[0];
+    let actions = &entry.projection["actions"];
+    assert_eq!(actions.as_array().unwrap().len(), 1);
+    assert_eq!(actions[0]["name"], "org.dolly.llm.review");
+    // accepts still projects the full source contract.
+    assert_eq!(
+        entry.projection["accepts"],
+        json!({"summary":"Review work","part_kinds":["text"],"action_names":["org.dolly.llm.review"]})
+    );
+    // The unauthorized action name is not unioned in.
+    assert!(
+        !actions.to_string().contains("org.dolly.llm.analyze"),
+        "unauthorized Action must not be projected"
+    );
+}
+
+#[test]
+fn self_loop_relationship_is_preserved() {
+    let vector = read(spec_root().join("test-vectors/core/TST-DESC-001-neighbor-projection.json"));
+    let mut graph = graph_from_vector(&vector);
+    let receiving = graph.receiving_module.clone();
+    // A real self-delivery path: the receiving module outputs directly to one
+    // of its own input pages.
+    graph
+        .output_pages
+        .entry(receiving.clone())
+        .or_default()
+        .push("shared-in".to_string());
+    graph.descriptors.insert(
+        receiving.clone(),
+        FrozenDescriptor {
+            module_id: receiving.clone(),
+            descriptor_revision: vector["initial"]["source_descriptor_revision"]
+                .as_i64()
+                .unwrap(),
+            source_descriptor_digest: vector["initial"]["source_descriptor_digest"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            value:
+                fixture("neighbor-is-both-input-producer-and-output-consumer")["source_descriptor"]
+                    .clone(),
+        },
+    );
+
+    let descriptors = build_neighbor_descriptors(&graph).unwrap();
+    let self_entry = descriptors
+        .iter()
+        .find(|entry| entry.module_id == receiving)
+        .expect("self-loop neighbor present");
+    // REQ-DESC-002: M is included only with the real self-delivery path's
+    // relationship label (input_producer here).
+    assert_eq!(self_entry.relationships, vec![INPUT_PRODUCER]);
+    assert!(self_entry.projection.get("emits").is_some());
+    assert!(self_entry.projection.get("accepts").is_none());
+    assert!(self_entry.projection.get("actions").is_none());
+    // The pre-existing analyst neighbor is unchanged.
+    assert!(descriptors.iter().any(|entry| entry.module_id == "analyst"));
+}
+
+#[test]
+fn missing_neighbor_descriptor_fails_closed() {
+    let vector = read(spec_root().join("test-vectors/core/TST-DESC-001-neighbor-projection.json"));
+    let mut graph = graph_from_vector(&vector);
+    // A relationship-bearing neighbor with no frozen descriptor.
+    graph
+        .subscriptions
+        .entry("extra-out".to_string())
+        .or_default()
+        .push("missing-neighbor".to_string());
+    graph
+        .output_pages
+        .entry(graph.receiving_module.clone())
+        .or_default()
+        .push("extra-out".to_string());
+    // The old behavior silently omitted this neighbor; the corrected builder
+    // must fail closed instead.
+    let error = build_neighbor_descriptors(&graph).unwrap_err();
+    assert!(
+        matches!(error, NeighborError::MissingDescriptor { ref module_id } if module_id == "missing-neighbor"),
+        "expected MissingDescriptor, got {error:?}"
+    );
+}
+
+#[test]
+fn single_direction_projection_and_dual_order() {
+    let vector = read(spec_root().join("test-vectors/core/TST-DESC-001-neighbor-projection.json"));
+    let mut graph = graph_from_vector(&vector);
+
+    // A pure input producer: outputs to a frozen input page of the receiver.
+    // A pure output consumer: subscribes to an extra output page of the receiver.
+    graph
+        .output_pages
+        .insert("producer-module".to_string(), vec!["shared-in".to_string()]);
+    graph.subscriptions.insert(
+        "extra-page".to_string(),
+        vec!["consumer-module".to_string()],
+    );
+    graph
+        .output_pages
+        .entry(graph.receiving_module.clone())
+        .or_default()
+        .push("extra-page".to_string());
+
+    let base =
+        fixture("neighbor-is-both-input-producer-and-output-consumer")["source_descriptor"].clone();
+    for module_id in ["consumer-module", "producer-module"] {
+        let mut value = base.clone();
+        value["module_id"] = json!(module_id);
+        let (_, digest) = canonicalize(&value).unwrap();
+        graph.descriptors.insert(
+            module_id.to_string(),
+            FrozenDescriptor {
+                module_id: module_id.to_string(),
+                descriptor_revision: vector["initial"]["source_descriptor_revision"]
+                    .as_i64()
+                    .unwrap(),
+                source_descriptor_digest: digest.to_string(),
+                value,
+            },
+        );
+    }
+
+    let descriptors = build_neighbor_descriptors(&graph).unwrap();
+    // Canonical (module_id, descriptor_revision) ordering.
+    let ids: Vec<_> = descriptors
+        .iter()
+        .map(|entry| entry.module_id.as_str())
+        .collect();
+    assert_eq!(ids, ["analyst", "consumer-module", "producer-module"]);
+
+    let producer = descriptors
+        .iter()
+        .find(|entry| entry.module_id == "producer-module")
+        .unwrap();
+    assert_eq!(producer.relationships, vec![INPUT_PRODUCER]);
+    assert!(producer.projection.get("emits").is_some());
+    assert!(producer.projection.get("accepts").is_none());
+    assert!(producer.projection.get("actions").is_none());
+
+    let consumer = descriptors
+        .iter()
+        .find(|entry| entry.module_id == "consumer-module")
+        .unwrap();
+    assert_eq!(consumer.relationships, vec![OUTPUT_CONSUMER]);
+    assert!(consumer.projection.get("accepts").is_some());
+    assert!(consumer.projection.get("actions").is_some());
+    assert!(consumer.projection.get("emits").is_none());
+
+    // The dual-role analyst keeps both field groups once, in the canonical
+    // relationship order, without unioning any unauthorized capability.
+    let analyst = descriptors
+        .iter()
+        .find(|entry| entry.module_id == "analyst")
+        .unwrap();
+    assert_eq!(analyst.relationships, vec![INPUT_PRODUCER, OUTPUT_CONSUMER]);
+    assert!(analyst.projection.get("emits").is_some());
+    assert!(analyst.projection.get("accepts").is_some());
+    assert!(analyst.projection.get("actions").is_some());
+    assert_eq!(
+        analyst.projection["actions"].as_array().unwrap().len(),
+        1,
+        "only the authorized Action is projected"
+    );
+    assert!(
+        !analyst.projection["actions"]
+            .to_string()
+            .contains("org.dolly.llm.analyze")
+    );
+}
+
+/// Recursively assert that neither the wrapper nor the projection is or
+/// contains a ModuleDescriptor-like object carrying a `schema` member: the
+/// closed wrapper never aliases a source Descriptor identity.
+fn assert_no_schema_member(value: &Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                assert_ne!(
+                    key.as_str(),
+                    "schema",
+                    "neither the wrapper nor the projection may expose a schema member"
+                );
+                assert_no_schema_member(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                assert_no_schema_member(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn reversed_or_unrelated_neighbors_are_not_projected() {
+    let vector = read(spec_root().join("test-vectors/core/TST-DESC-001-neighbor-projection.json"));
+    let mut graph = graph_from_vector(&vector);
+    let base =
+        fixture("neighbor-is-both-input-producer-and-output-consumer")["source_descriptor"].clone();
+
+    // (a) "wrong neighbor": a frozen descriptor exists for a module that has
+    // no frozen edge to the receiver — it must not be projected.
+    // (b) "reversal": `reverse-consumer` subscribes to `shared-in`, which is a
+    // receiving INPUT page, not an output page — direction must not invert.
+    // (c) `reverse-producer` outputs `shared-out`, a receiving OUTPUT page —
+    // producing the receiver's output page is not producing its input page.
+    graph
+        .subscriptions
+        .entry("shared-in".to_string())
+        .or_default()
+        .push("reverse-consumer".to_string());
+    graph
+        .output_pages
+        .entry("reverse-producer".to_string())
+        .or_default()
+        .push("shared-out".to_string());
+
+    for module_id in ["reverse-consumer", "reverse-producer", "unrelated-module"] {
+        let mut value = base.clone();
+        value["module_id"] = json!(module_id);
+        let (_, digest) = canonicalize(&value).unwrap();
+        graph.descriptors.insert(
+            module_id.to_string(),
+            FrozenDescriptor {
+                module_id: module_id.to_string(),
+                descriptor_revision: vector["initial"]["source_descriptor_revision"]
+                    .as_i64()
+                    .unwrap(),
+                source_descriptor_digest: digest.to_string(),
+                value,
+            },
+        );
+    }
+
+    let descriptors = build_neighbor_descriptors(&graph).unwrap();
+    let ids: Vec<_> = descriptors
+        .iter()
+        .map(|entry| entry.module_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        ["analyst"],
+        "only the real-direction neighbor is projected; misdirected or unrelated modules stay out"
+    );
+}
+
+#[test]
+fn wrapper_and_projection_never_alias_a_module_descriptor() {
+    let path = spec_root().join("test-vectors/core/TST-DESC-001-neighbor-projection.json");
+    let vector = read(path);
+    let graph = graph_from_vector(&vector);
+    let neighbors = build_neighbor_descriptors(&graph).unwrap();
+    for entry in &neighbors {
+        let serialized = serde_json::to_value(entry).unwrap();
+        assert_no_schema_member(&serialized);
+        // Projection and wrapper are not the ModuleDescriptor itself, so the
+        // wrapper must not carry the source's `module_id` non-nested as identity.
+        assert_eq!(entry.module_id, "analyst");
+    }
 }
