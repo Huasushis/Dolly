@@ -4,6 +4,10 @@ use dolly_canonical_json::canonicalize;
 use serde_json::{Map, Value, json};
 
 use crate::command::*;
+use crate::effective_config::{
+    EFFECTIVE_CONFIG_MAX_PROPERTIES, EFFECTIVE_CONFIG_MAX_PROPERTIES_CODE,
+    MAX_EFFECTIVE_CONFIG_PROPERTIES,
+};
 use crate::projection::{hash_core_state, project_core_state};
 use crate::types::*;
 
@@ -51,6 +55,7 @@ fn failure_with_emission(
     command_id: &str,
     code: &str,
     event: &str,
+    retryable: bool,
     details: Value,
 ) -> Transition {
     let emitted = CoreEvent {
@@ -65,7 +70,7 @@ fn failure_with_emission(
         events: vec![emitted],
         error: Some(CoreError {
             code: code.into(),
-            retryable: true,
+            retryable,
             outcome: ErrorOutcome::NotApplied,
             details: Some(details),
         }),
@@ -530,6 +535,20 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             {
                 return failure(state, "CONFIG_REVISION_CONFLICT", false, None);
             }
+            if c.effective_config
+                .as_object()
+                .map_or(0, |object| object.len())
+                > MAX_EFFECTIVE_CONFIG_PROPERTIES
+            {
+                return failure_with_emission(
+                    state,
+                    &c.command_id,
+                    EFFECTIVE_CONFIG_MAX_PROPERTIES_CODE,
+                    "ConfigurationCandidateRejected",
+                    false,
+                    json!({"reason": EFFECTIVE_CONFIG_MAX_PROPERTIES}),
+                );
+            }
             next.config = json!({"revision":c.revision,"effective_config":c.effective_config,"digest":c.digest});
             events.push(append_event(
                 &mut next,
@@ -737,6 +756,7 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                     &c.command_id,
                     "MANIFEST_BUILD_CAS_RETRY",
                     "ManifestBuildCasRetry",
+                    true,
                     json!({"reason":"graph_or_descriptor_changed"}),
                 );
             }
