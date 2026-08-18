@@ -1,10 +1,13 @@
 //! Typed storage error codes per `§10 Storage errors` of the storage-and-recovery spec.
 //!
-//! Each variant maps one-for-one to a normative `STORAGE_*` code and a fixed
-//! retryability bit. The raw-message rule of §10 is enforced at the call sites
+//! Each variant maps one-for-one to a normative `STORAGE_*` code, a fixed
+//! retryability bit, and a fixed envelope `outcome` (§10: every storage error
+//! is a pre-apply gate failure or all-or-nothing rollback, so each carries
+//! `not_applied`). The raw-message rule of §10 is enforced at the call sites
 //! (details are optional structured JSON, never free-form DB error text as a
 //! contract).
 
+use dolly_core_reducer::ErrorOutcome;
 use thiserror::Error;
 
 /// Result alias for storage operations.
@@ -57,6 +60,13 @@ impl StorageError {
         matches!(self, StorageError::Busy)
     }
 
+    /// Closed envelope outcome from §10 — `not_applied` for every storage
+    /// error, because each is a pre-apply gate failure or all-or-nothing
+    /// rollback.
+    pub fn outcome(&self) -> ErrorOutcome {
+        ErrorOutcome::NotApplied
+    }
+
     /// Structured identity side-channel for `UnsafeSqliteBuild`.
     pub fn unsafe_sqlite_build(observed_version_number: u32, required_version_number: u32) -> Self {
         StorageError::UnsafeSqliteBuild {
@@ -71,12 +81,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codes_and_retryability_match_spec_table() {
-        let cases: &[(StorageError, &str, bool)] = &[
+    fn codes_retryability_and_outcome_match_spec_table() {
+        let cases: &[(StorageError, &str, bool, ErrorOutcome)] = &[
             (
                 StorageError::InstanceLocked,
                 "STORAGE_INSTANCE_LOCKED",
                 false,
+                ErrorOutcome::NotApplied,
             ),
             (
                 StorageError::UnsafeSqliteBuild {
@@ -85,34 +96,56 @@ mod tests {
                 },
                 "STORAGE_UNSAFE_SQLITE_BUILD",
                 false,
+                ErrorOutcome::NotApplied,
             ),
             (
                 StorageError::UnsafeConfiguration,
                 "STORAGE_UNSAFE_CONFIGURATION",
                 false,
+                ErrorOutcome::NotApplied,
             ),
-            (StorageError::Busy, "STORAGE_BUSY", true),
-            (StorageError::Full, "STORAGE_FULL", false),
-            (StorageError::Corrupt, "STORAGE_CORRUPT", false),
+            (
+                StorageError::Busy,
+                "STORAGE_BUSY",
+                true,
+                ErrorOutcome::NotApplied,
+            ),
+            (
+                StorageError::Full,
+                "STORAGE_FULL",
+                false,
+                ErrorOutcome::NotApplied,
+            ),
+            (
+                StorageError::Corrupt,
+                "STORAGE_CORRUPT",
+                false,
+                ErrorOutcome::NotApplied,
+            ),
             (
                 StorageError::IdempotencyConflict,
                 "STORAGE_IDEMPOTENCY_CONFLICT",
                 false,
+                ErrorOutcome::NotApplied,
             ),
             (
                 StorageError::SequenceConflict,
                 "STORAGE_SEQUENCE_CONFLICT",
                 false,
+                ErrorOutcome::NotApplied,
             ),
             (
                 StorageError::MigrationRequired,
                 "STORAGE_MIGRATION_REQUIRED",
                 false,
+                ErrorOutcome::NotApplied,
             ),
         ];
-        for (err, code, retryable) in cases {
+        for (err, code, retryable, outcome) in cases {
             assert_eq!(err.code(), *code);
             assert_eq!(err.retryable(), *retryable);
+            assert_eq!(err.outcome(), *outcome);
+            assert_eq!(serde_json::to_value(err.outcome()).unwrap(), "not_applied");
         }
     }
 }
