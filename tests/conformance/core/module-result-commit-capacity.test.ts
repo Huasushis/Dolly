@@ -217,8 +217,17 @@ describe("FileCore Module output capacity", () => {
     const failingBlocks = {
       commitOnce: operations.blocks.commitOnce.bind(operations.blocks),
       inspectCommitEffect: operations.blocks.inspectCommitEffect.bind(operations.blocks),
+      inspectCommitEffectRetirementTicket:
+        operations.blocks.inspectCommitEffectRetirementTicket.bind(operations.blocks),
+      listCommitEffectRetirementTickets:
+        operations.blocks.listCommitEffectRetirementTickets.bind(operations.blocks),
       normalizeInput: operations.blocks.normalizeInput.bind(operations.blocks),
       releaseCommitEffect: () => { throw releaseFailure; },
+      retireCommitEffect: operations.blocks.retireCommitEffect.bind(operations.blocks),
+      stageCommitEffectRetirement:
+        operations.blocks.stageCommitEffectRetirement.bind(operations.blocks),
+      clearCommitEffectRetirementTicket:
+        operations.blocks.clearCommitEffectRetirementTicket.bind(operations.blocks),
       validateInput: operations.blocks.validateInput.bind(operations.blocks),
       validateSource: operations.blocks.validateSource.bind(operations.blocks),
     };

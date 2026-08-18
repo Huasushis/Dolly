@@ -93,11 +93,9 @@ describe("general Agent waiter with a real quarantined Extension", () => {
       const repository = new FileModuleResultCommitRepository({
         path: join(root, "module-result-commits.json"),
       });
+      const operations = core.createModuleResultCommitOperations();
       const commits = new ModuleResultCommitCoordinator({
-        blocks: core.blocks,
-        deliveries: core.deliveries,
-        acknowledgeDeliveryClaim: (identity) => core.acknowledgeDeliveryClaim(identity),
-        getModuleSubmissionRecord: (runId) => core.getModuleSubmissionRecord(runId),
+        ...operations,
         repository,
         now: () => NOW,
       });
