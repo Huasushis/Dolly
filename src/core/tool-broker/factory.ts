@@ -28,6 +28,10 @@ export interface ToolBrokerServer {
   readonly toolServerGeneration: number;
   /** Drives the handshake to completion. See `ToolBrokerSession.prepare`. */
   prepare(): Promise<PrepareResult>;
+  /** Sends a serialized post-handshake ping request and waits for the exact
+   * correlated response. Rejects on protocol violation, timeout, child exit,
+   * or when the generation is not `Ready`. */
+  ping(): Promise<void>;
   /** Stops the generation and tears down the child. Idempotent. */
   stop(): Promise<void>;
 }
@@ -70,6 +74,7 @@ export function startToolBrokerServer(
       return session.toolServerGeneration;
     },
     prepare: () => session.prepare(),
+    ping: () => session.ping(),
     stop: () => session.stop(),
   };
 }

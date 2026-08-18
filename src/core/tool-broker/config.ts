@@ -16,8 +16,11 @@ import { ToolBrokerConfigError, MCP_PROTOCOL_VERSION, type ToolBrokerServerConfi
 const SERVER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 /** Known top-level keys of `ToolBrokerServerConfig`. */
-const ALLOWED_KEYS = ["serverId", "adapter", "protocolVersion", "transport", "startupTimeoutMs"] as const;
+const ALLOWED_KEYS = ["serverId", "adapter", "protocolVersion", "transport", "startupTimeoutMs", "requestTimeoutMs"] as const;
 const ALLOWED_TRANSPORT_KEYS = ["kind", "command", "args", "env"] as const;
+
+/** Default bounded wall-clock wait for a post-handshake request response. */
+const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -45,7 +48,7 @@ export function parseToolBrokerConfig(input: unknown): ToolBrokerServerConfig {
     }
   }
 
-  const { serverId, adapter, protocolVersion, transport, startupTimeoutMs } = input as Record<string, unknown>;
+  const { serverId, adapter, protocolVersion, transport, startupTimeoutMs, requestTimeoutMs } = input as Record<string, unknown>;
 
   if (typeof serverId !== "string" || !SERVER_ID_PATTERN.test(serverId)) {
     reject("serverId must be a stable identifier matching /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/");
@@ -61,6 +64,15 @@ export function parseToolBrokerConfig(input: unknown): ToolBrokerServerConfig {
 
   if (typeof startupTimeoutMs !== "number" || !Number.isInteger(startupTimeoutMs) || startupTimeoutMs < 100 || startupTimeoutMs > 300000) {
     reject("startupTimeoutMs must be an integer in [100, 300000]");
+  }
+
+  // requestTimeoutMs is optional with a 10000ms default; when present it must
+  // be a positive integer capped at 300000 (same admission style as
+  // startupTimeoutMs). Only the resolved number is ever stored.
+  if (requestTimeoutMs !== undefined) {
+    if (typeof requestTimeoutMs !== "number" || !Number.isInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 300000) {
+      reject("requestTimeoutMs must be an integer in [1, 300000]");
+    }
   }
 
   // Transport: must be stdio in this slice.
@@ -107,8 +119,10 @@ export function parseToolBrokerConfig(input: unknown): ToolBrokerServerConfig {
       env: transport.env as Readonly<Record<string, string>>,
     },
     startupTimeoutMs,
+    // Always store the resolved number (never undefined) so the session can
+    // read a concrete request timeout off the closed config.
+    requestTimeoutMs: requestTimeoutMs === undefined ? DEFAULT_REQUEST_TIMEOUT_MS : requestTimeoutMs,
   };
-
 
   return config;
 }

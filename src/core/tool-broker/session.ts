@@ -13,6 +13,12 @@
  * Out-of-order `notifications/initialized` before the initialize response does
  * not satisfy the response wait. A duplicate initialize response after the
  * first is ignored (the first response already settled the handshake).
+ *
+ * After a successful handshake the generation stays alive (stdin is not
+ * closed) and the host may send exactly one post-handshake request at a time.
+ * `ping()` sends a `ping` with the next monotonic id (2 on first call),
+ * requires an exact-correlated closed result, and quarantines on any protocol
+ * violation, timeout, or child exit during the request.
  */
 
 import type { ChildProcess } from "node:child_process";
@@ -31,6 +37,11 @@ import { createStdioReader, createStdioWriter, StdioReadError, type StdioMessage
 
 /** Bounded wall-clock wait for SIGTERM before escalating to SIGKILL, in ms. */
 const TEARDOWN_GRACE_MS = 500;
+
+/** Default bounded wall-clock wait for a post-handshake request response,
+ * used when a `requestTimeoutMs` is not present on a directly-constructed
+ * config (the same default `parseToolBrokerConfig` resolves). */
+const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
 
 /**
  * Module-private identity store of every `PrepareResult` minted by
@@ -57,32 +68,32 @@ const INITIALIZED_RESULT_KEYS = ["protocolVersion", "capabilities", "serverInfo"
 /** Permitted top-level fields of a JSON-RPC response envelope. */
 const RESPONSE_ENVELOPE_KEYS = ["jsonrpc", "id", "result", "error", "_meta"] as const;
 /** Validates an initialize response result object. Returns the protocolVersion
- * string on success; throws a `HandshakeError` otherwise. */
+ * string on success; throws a `ToolBrokerSessionError` otherwise. */
 function assertInitializeResult(result: JsonValue): string {
   if (!isJsonObject(result)) {
-    throw new HandshakeError("TOOL_BROKER_HANDSHAKE_MALFORMED", "initialize result is not an object");
+    throw new ToolBrokerSessionError("TOOL_BROKER_HANDSHAKE_MALFORMED", "initialize result is not an object");
   }
   // Reject unknown top-level fields in the result object (only protocolVersion,
   // capabilities, serverInfo, and optional _meta are permitted).
   for (const key of Object.keys(result)) {
     if (!(INITIALIZED_RESULT_KEYS as readonly string[]).includes(key)) {
-      throw new HandshakeError("TOOL_BROKER_HANDSHAKE_MALFORMED", `initialize result has unknown field "${key}"`);
+      throw new ToolBrokerSessionError("TOOL_BROKER_HANDSHAKE_MALFORMED", `initialize result has unknown field "${key}"`);
     }
   }
 
   const { protocolVersion, capabilities, serverInfo } = result;
   if (typeof protocolVersion !== "string") {
-    throw new HandshakeError("TOOL_BROKER_HANDSHAKE_MALFORMED", "initialize result.protocolVersion is not a string");
+    throw new ToolBrokerSessionError("TOOL_BROKER_HANDSHAKE_MALFORMED", "initialize result.protocolVersion is not a string");
   }
   if (capabilities === undefined || !isJsonObject(capabilities)) {
-    throw new HandshakeError("TOOL_BROKER_HANDSHAKE_MALFORMED", "initialize result.capabilities is not an object");
+    throw new ToolBrokerSessionError("TOOL_BROKER_HANDSHAKE_MALFORMED", "initialize result.capabilities is not an object");
   }
   if (serverInfo === undefined || !isJsonObject(serverInfo)) {
-    throw new HandshakeError("TOOL_BROKER_HANDSHAKE_MALFORMED", "initialize result.serverInfo is not an object");
+    throw new ToolBrokerSessionError("TOOL_BROKER_HANDSHAKE_MALFORMED", "initialize result.serverInfo is not an object");
   }
   // serverInfo must have name and version strings.
   if (typeof (serverInfo as Record<string, unknown>).name !== "string" || typeof (serverInfo as Record<string, unknown>).version !== "string") {
-    throw new HandshakeError("TOOL_BROKER_HANDSHAKE_MALFORMED", "initialize result.serverInfo must have string name and version");
+    throw new ToolBrokerSessionError("TOOL_BROKER_HANDSHAKE_MALFORMED", "initialize result.serverInfo must have string name and version");
   }
   return protocolVersion;
 }
@@ -92,31 +103,54 @@ function assertInitializeResult(result: JsonValue): string {
  * `result` value. */
 function assertResponseEnvelope(message: JsonValue, expectedId: number): JsonValue {
   if (!isJsonObject(message)) {
-    throw new HandshakeError("TOOL_BROKER_HANDSHAKE_MALFORMED", "response is not an object");
+    throw new ToolBrokerSessionError("TOOL_BROKER_HANDSHAKE_MALFORMED", "response is not an object");
   }
   for (const key of Object.keys(message)) {
     if (!(RESPONSE_ENVELOPE_KEYS as readonly string[]).includes(key)) {
-      throw new HandshakeError("TOOL_BROKER_HANDSHAKE_MALFORMED", `response has unknown field "${key}"`);
+      throw new ToolBrokerSessionError("TOOL_BROKER_HANDSHAKE_MALFORMED", `response has unknown field "${key}"`);
     }
   }
   const id = (message as Record<string, unknown>).id;
   if (typeof id !== "number" || id !== expectedId) {
-    throw new HandshakeError("TOOL_BROKER_HANDSHAKE_MALFORMED", `response.id must be ${expectedId}`);
+    throw new ToolBrokerSessionError("TOOL_BROKER_HANDSHAKE_MALFORMED", `response.id must be ${expectedId}`);
   }
   if ((message as Record<string, unknown>).error !== undefined) {
-    throw new HandshakeError("TOOL_BROKER_HANDSHAKE_MALFORMED", "initialize returned a JSON-RPC error");
+    throw new ToolBrokerSessionError("TOOL_BROKER_HANDSHAKE_MALFORMED", "initialize returned a JSON-RPC error");
   }
   if (!("result" in message)) {
-    throw new HandshakeError("TOOL_BROKER_HANDSHAKE_MALFORMED", "response has no result");
+    throw new ToolBrokerSessionError("TOOL_BROKER_HANDSHAKE_MALFORMED", "response has no result");
   }
   return (message as Record<string, unknown>).result as JsonValue;
 }
 
+/** Permitted top-level fields of a ping `result` object: a closed object
+ * (nothing) or the optional `_meta` field. */
+const PING_RESULT_KEYS = ["_meta"] as const;
+
+/** Validates a ping response `result`: it must be an object with no fields
+ * except the optional `_meta` (an object). Throws `ToolBrokerSessionError`
+ * with `TOOL_BROKER_PROTOCOL_FAILURE` for an unknown field, a non-object
+ * result, or a malformed `_meta`. */
+function assertPingResult(result: JsonValue): void {
+  if (!isJsonObject(result)) {
+    throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", "ping result is not an object");
+  }
+  for (const key of Object.keys(result)) {
+    if (!(PING_RESULT_KEYS as readonly string[]).includes(key)) {
+      throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", `ping result has unknown field "${key}"`);
+    }
+  }
+  const meta = result._meta;
+  if (meta !== undefined && !isJsonObject(meta)) {
+    throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", "ping result._meta must be an object");
+  }
+}
+
 /** Internal error carrying a public `ToolBrokerErrorCode`. */
-export class HandshakeError extends Error {
+export class ToolBrokerSessionError extends Error {
   constructor(readonly code: ToolBrokerErrorCode, message: string) {
     super(`${code}: ${message}`);
-    this.name = "HandshakeError";
+    this.name = "ToolBrokerSessionError";
   }
 }
 
@@ -131,6 +165,8 @@ export class ToolBrokerSession {
   #writer: StdioMessageWriter;
   #config: ToolBrokerServerConfig;
   #nextRequestId = 1;
+  #requestTimeoutMs: number;
+  #pingInFlight = false;
   #stopped = false;
   #prepareSettled = false;
   #prepareResult: PrepareResult | undefined;
@@ -145,6 +181,7 @@ export class ToolBrokerSession {
     this.#child = child;
     this.#reader = createStdioReader(child);
     this.#writer = createStdioWriter(child);
+    this.#requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   }
 
   get state(): ToolBrokerServerState {
@@ -192,6 +229,8 @@ export class ToolBrokerSession {
 
     try {
       this.#writer.write(initializeRequest);
+      // initialize consumed id 1; the next post-handshake request id is 2.
+      this.#nextRequestId += 1;
 
       // Wait for the initialize response with a timeout. A child exit or
       // stream end before the response is a child-exited failure; a timeout
@@ -201,7 +240,7 @@ export class ToolBrokerSession {
       const serverProtocolVersion = assertInitializeResult(result);
 
       if (serverProtocolVersion !== MCP_PROTOCOL_VERSION) {
-        throw new HandshakeError(
+        throw new ToolBrokerSessionError(
           "TOOL_BROKER_PROTOCOL_VERSION_MISMATCH",
           `server selected protocol version ${JSON.stringify(serverProtocolVersion)}, expected ${JSON.stringify(MCP_PROTOCOL_VERSION)}`,
         );
@@ -215,11 +254,11 @@ export class ToolBrokerSession {
       this.#writer.write(initializedNotification);
 
       this.#state = "Ready";
-      // Close stdin so a well-behaved server can exit; the broker keeps the
-      // child reference for teardown. In the full slice the child stays alive
-      // for discovery/invocation, but this handshake-only slice has no further
-      // messages to send, so closing stdin is safe.
-      this.#writer.close();
+      // Keep the generation alive: stdin stays open for post-handshake
+      // requests (ping in this slice). The broker holds the child reference
+      // for teardown; the child exits only when the host tears it down.
+      // `this.#writer.close()` is intentionally NOT called here — closing
+      // stdin would kill a well-behaved server that waits on fd 0.
 
       this.#prepareResult = mintPrepareResult({
         state: "Ready",
@@ -242,13 +281,13 @@ export class ToolBrokerSession {
   }
 
   /**
-   * Maps a caught error to a public `ToolBrokerErrorCode`. `HandshakeError`
+   * Maps a caught error to a public `ToolBrokerErrorCode`. `ToolBrokerSessionError`
    * carries its own code; a `StdioReadError` of kind `exit` or `closed` is a
    * child-exited failure; a `malformed` read is a malformed handshake; anything
    * else defaults to malformed.
    */
   #errorCodeFrom(error: unknown): ToolBrokerErrorCode {
-    if (error instanceof HandshakeError) {
+    if (error instanceof ToolBrokerSessionError) {
       return error.code;
     }
     if (error instanceof StdioReadError) {
@@ -269,7 +308,7 @@ export class ToolBrokerSession {
     const deadline = this.#config.startupTimeoutMs;
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => {
-        reject(new HandshakeError("TOOL_BROKER_STARTUP_TIMEOUT", `initialize response not received within ${deadline}ms`));
+        reject(new ToolBrokerSessionError("TOOL_BROKER_STARTUP_TIMEOUT", `initialize response not received within ${deadline}ms`));
       }, deadline).unref();
     });
 
@@ -277,7 +316,7 @@ export class ToolBrokerSession {
       const message = await Promise.race<JsonValue>([this.#reader.read(), timeoutPromise]);
 
       if (!isJsonObject(message)) {
-        throw new HandshakeError("TOOL_BROKER_HANDSHAKE_MALFORMED", "received a non-object message");
+        throw new ToolBrokerSessionError("TOOL_BROKER_HANDSHAKE_MALFORMED", "received a non-object message");
       }
       const record = message as Record<string, unknown>;
       // A notification (has `method`, no `id`) arriving before the initialize
@@ -285,7 +324,7 @@ export class ToolBrokerSession {
       // `notifications/initialized` (or any other notification) out of order.
       // Per spec this is a protocol failure, not a completion signal.
       if (record.method !== undefined && record.id === undefined) {
-        throw new HandshakeError(
+        throw new ToolBrokerSessionError(
           "TOOL_BROKER_HANDSHAKE_MALFORMED",
           `received notification ${JSON.stringify(record.method)} before the initialize response`,
         );
@@ -295,7 +334,118 @@ export class ToolBrokerSession {
       if (record.id !== undefined) {
         return message;
       }
-      throw new HandshakeError("TOOL_BROKER_HANDSHAKE_MALFORMED", "received a message that is neither a request response nor a notification");
+      throw new ToolBrokerSessionError("TOOL_BROKER_HANDSHAKE_MALFORMED", "received a message that is neither a request response nor a notification");
+    }
+  }
+
+  /**
+   * Sends a `ping` request with the next monotonically increasing id and
+   * waits for the exact correlated response, validating the result is closed
+   * (with optional `_meta`). The server reply is correlated evidence only: it
+   * never authorizes another request or a second ping — every ping carries its
+   * own host-issued id. Exactly one request may be in flight at a time. On
+   * timeout, protocol violation, or child exit, quarantines and tears the
+   * child down before rejecting.
+   */
+  async ping(): Promise<void> {
+    if (this.#state !== "Ready") {
+      // Synchronous rejection: no frame, no teardown, state unchanged.
+      throw new ToolBrokerSessionError("TOOL_BROKER_NOT_READY", `ping requires a Ready generation (state is ${this.#state})`);
+    }
+    if (this.#pingInFlight) {
+      throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", "a request is already in flight");
+    }
+    this.#pingInFlight = true;
+    const pingId = this.#nextRequestId;
+    try {
+      this.#writer.write({ jsonrpc: "2.0", id: pingId, method: "ping" } as JsonValue);
+      // One request in flight; the next post-handshake request id is n + 1.
+      this.#nextRequestId += 1;
+      const result = await this.#readPingResponseOrTimeout(pingId);
+      assertPingResult(result);
+    } catch (error) {
+      if (this.#stopped) {
+        // A concurrent stop() already transitioned to Stopped and tore down;
+        // the in-flight read was aborted by reader.stop(). Do not quarantine
+        // or re-tear-down the terminal generation.
+        throw error;
+      }
+      this.#state = "Quarantined";
+      await this.#teardown();
+      throw error;
+    } finally {
+      this.#pingInFlight = false;
+    }
+  }
+
+  /**
+   * Reads messages until the ping response for `requestId` arrives. Rejects
+   * with `TOOL_BROKER_REQUEST_TIMEOUT` after `requestTimeoutMs` (timer is
+   * unrefed and cleared on settlement), `TOOL_BROKER_CHILD_EXITED` on child
+   * exit or stream end, or `TOOL_BROKER_PROTOCOL_FAILURE` on any violation:
+   * wrong or non-numeric id, error envelope, notification-as-response,
+   * unknown envelope key, non-object result, malformed line. A response can
+   * settle exactly one request; anything after that settles nothing here.
+   */
+  async #readPingResponseOrTimeout(requestId: number): Promise<JsonValue> {
+    const deadline = this.#requestTimeoutMs;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new ToolBrokerSessionError("TOOL_BROKER_REQUEST_TIMEOUT", `ping response not received within ${deadline}ms`));
+      }, deadline);
+      timer.unref();
+    });
+
+    try {
+      for (;;) {
+        let message: JsonValue;
+        try {
+          message = await Promise.race<JsonValue>([this.#reader.read(), timeoutPromise]);
+        } catch (error) {
+          if (error instanceof ToolBrokerSessionError) {
+            // The request timeout, or a settled/aborted read: propagate.
+            throw error;
+          }
+          if (error instanceof StdioReadError) {
+            // exit/closed => the child left mid-request; a malformed line is
+            // a post-handshake protocol failure.
+            throw error.kind === "malformed"
+              ? new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", `malformed line while awaiting ping response: ${error.message}`)
+              : new ToolBrokerSessionError("TOOL_BROKER_CHILD_EXITED", `child exited while awaiting ping response: ${error.message}`);
+          }
+          throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", String(error));
+        }
+
+        if (!isJsonObject(message)) {
+          throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", "ping response is not an object");
+        }
+        const record = message as Record<string, unknown>;
+        // A notification (method present, id absent) while a request is in
+        // flight can never complete a request: protocol failure.
+        if (record.method !== undefined && record.id === undefined) {
+          throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", `received notification ${JSON.stringify(record.method)} while a request is in flight`);
+        }
+        // A response (has `id`). `assertResponseEnvelope` enforces the exact
+        // envelope (jsonrpc "2.0", numeric id === requestId, result present,
+        // no error, no unknown top-level keys); remap its handshake-flavored
+        // message to a post-handshake protocol failure.
+        if (record.id !== undefined) {
+          try {
+            return assertResponseEnvelope(message, requestId);
+          } catch (error) {
+            if (error instanceof ToolBrokerSessionError) {
+              throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", error.message);
+            }
+            throw error;
+          }
+        }
+        throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", "received a message that is neither a response nor a notification");
+      }
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
     }
   }
 

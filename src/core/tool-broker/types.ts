@@ -70,6 +70,11 @@ export interface ToolBrokerServerConfig {
   readonly transport: StdioTransportConfig;
   /** Bounded wall-clock time to wait for the initialize response. */
   readonly startupTimeoutMs: number;
+  /** Bounded wall-clock time to wait for a post-handshake request response.
+   * Optional: `parseToolBrokerConfig` resolves it to 10000 when absent and
+   * the session falls back to the same default for direct construction, so
+   * the effective timeout is always a positive integer. */
+  readonly requestTimeoutMs?: number;
 }
 
 /** Subset of `node:child_process` `spawn` used for dependency injection in
@@ -89,15 +94,19 @@ export interface ToolBrokerServerOptions {
   readonly now: NowFn;
 }
 
-/** Error codes for the handshake slice. Each maps to a `Quarantined` result
- * except `TOOL_BROKER_CONFIG_INVALID`, which is thrown synchronously from
- * `parseToolBrokerConfig` before any child is spawned. */
+/** Error codes for the handshake and post-handshake session. Each handshake
+ * and request failure maps to a `Quarantined` result or rejection; the
+ * post-handshake codes (`requestTimeoutMs`, `protocolFailure`,
+ * `notReady`) guard the ping request substrate. */
 export type ToolBrokerErrorCode =
   | "TOOL_BROKER_CONFIG_INVALID"
   | "TOOL_BROKER_PROTOCOL_VERSION_MISMATCH"
   | "TOOL_BROKER_HANDSHAKE_MALFORMED"
   | "TOOL_BROKER_STARTUP_TIMEOUT"
-  | "TOOL_BROKER_CHILD_EXITED";
+  | "TOOL_BROKER_CHILD_EXITED"
+  | "TOOL_BROKER_NOT_READY"
+  | "TOOL_BROKER_PROTOCOL_FAILURE"
+  | "TOOL_BROKER_REQUEST_TIMEOUT";
 
 /** Result of `prepare()`. A `Ready` result carries the generation number; a
  * `Quarantined` result carries the failure code. `Stopped` is not returned by

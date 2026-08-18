@@ -8,7 +8,7 @@
  */
 
 export { parseToolBrokerConfig } from "./config.js";
-export { adaptToolBrokerServer, ToolBrokerSession, killChild, HandshakeError } from "./session.js";
+export { adaptToolBrokerServer, ToolBrokerSession, killChild, ToolBrokerSessionError } from "./session.js";
 export {
   CLIENT_INFO,
   MCP_PROTOCOL_VERSION,
