@@ -161,8 +161,9 @@ readline.on("line", (line) => {
       process.exit(0);
     }
     if (mode === "ping-idle-exit") {
-      // Leave the handshake complete, then exit cleanly after a delay so
-      // the host has a live generation whose child dies mid-request.
+      // Complete the handshake, then exit cleanly after a delay so the host
+      // has a live, Ready generation whose child dies with no request in
+      // flight. The host must observe the exit in the background.
       setTimeout(() => process.exit(0), 300);
     }
     if (mode === "ping-server-request") {
