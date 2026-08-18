@@ -68,6 +68,7 @@ fn run_gate(vector: &Value) -> (String, Value, Value) {
             let emitted = json!([{
                 "error": err.code(),
                 "retryable": err.retryable(),
+                "outcome": err.outcome(),
             }]);
             (err.code().to_string(), instance, emitted)
         }
