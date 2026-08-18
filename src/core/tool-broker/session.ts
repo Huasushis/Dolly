@@ -40,8 +40,14 @@ const TEARDOWN_GRACE_MS = 500;
  */
 const MINTED_PREPARE_RESULTS = new WeakSet<object>();
 
-/** Registers a `PrepareResult` in the identity store and returns it. */
+/**
+ * Registers a `PrepareResult` in the identity store and returns it. The result
+ * is frozen before registration so the minted identity can never be mutated
+ * into a forged state or altered generation: `adaptToolBrokerServer` reads
+ * authority from the same frozen object it identity-checks.
+ */
 function mintPrepareResult(result: PrepareResult): PrepareResult {
+  Object.freeze(result);
   MINTED_PREPARE_RESULTS.add(result);
   return result;
 }
