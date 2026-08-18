@@ -290,8 +290,8 @@ fn dependency_policy_enforced() {
     );
 
     // dolly-storage: depends on dolly-canonical-json, dolly-core-reducer,
-    // serde, and thiserror; must never acquire rusqlite/sqlx/tokio anyhow here
-    // (backend provisioning is a separate, reviewed change).
+    // serde, thiserror, and the bundled-SQLite crates (rusqlite +
+    // libsqlite3-sys, ADR 0006). It must never acquire sqlx/tokio/anyhow here.
     let st = &member_infos["dolly-storage"];
     let st_dep_names: Vec<&str> = st.dependencies.iter().map(|d| d.name.as_str()).collect();
     assert!(
@@ -302,7 +302,7 @@ fn dependency_policy_enforced() {
         st_dep_names.contains(&"dolly-core-reducer"),
         "dolly-storage must depend on dolly-core-reducer"
     );
-    for required in ["serde", "thiserror"] {
+    for required in ["serde", "thiserror", "rusqlite", "libsqlite3-sys"] {
         assert!(
             st_dep_names.contains(&required),
             "dolly-storage must depend on {required}"
@@ -323,7 +323,11 @@ fn dependency_policy_enforced() {
 
     // Verify no forbidden dependencies in any member, across every
     // dependency kind (normal, dev, build). cargo_metadata is allowed as a
-    // dev-dependency only because it is absent from FORBIDDEN_DEPS.
+    // dev-dependency. The bundled-SQLite edit (ADR 0006, REQ-TECH-003) is
+    // the reviewed "separate change" that admits exactly the SQLite crates in
+    // dolly-storage; everywhere else they remain forbidden.
+    const SQLITE_DEPS: &[&str] = &["rusqlite", "libsqlite3-sys"];
+    const SQLITE_ALLOWED_IN: &[&str] = &["dolly-storage"];
     for (name, info) in &member_infos {
         for dep in info
             .dependencies
@@ -331,7 +335,12 @@ fn dependency_policy_enforced() {
             .chain(&info.dev_dependencies)
             .chain(&info.build_dependencies)
         {
+            let sqlite_allowed = SQLITE_ALLOWED_IN.contains(&name.as_str())
+                && SQLITE_DEPS.contains(&dep.name.as_str());
             for forbidden in FORBIDDEN_DEPS {
+                if sqlite_allowed && *forbidden == "rusqlite" {
+                    continue; // admitted by ADR 0006 as a reviewed change
+                }
                 assert_ne!(
                     dep.name, *forbidden,
                     "{name} must not depend on {forbidden}"

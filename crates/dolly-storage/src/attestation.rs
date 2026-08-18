@@ -23,6 +23,31 @@ use crate::error::{StorageError, StorageResult};
 /// present in every release through 3.51.2 (see ADR 0006).
 pub const SQLITE_VERSION_NUMBER_MIN: u32 = 3051003;
 
+/// Release attestation for the embedded SQLite, derived at build time from the
+/// bundled libsqlite3-sys amalgamation by `build.rs` (the same bytes compiled
+/// into the binary). These values are the release record; startup verifies the
+/// loaded library against them.
+pub fn release_attestation() -> ReleaseAttestation {
+    let source_id = env!("DOLLY_STORAGE_SQLITE3_SOURCE_ID").to_string();
+    let version_number_env = env!("DOLLY_STORAGE_SQLITE3_VERSION_NUMBER");
+    let attested_min: u32 = version_number_env
+        .parse()
+        .expect("build.rs must emit a numeric SQLITE_VERSION_NUMBER");
+    let digest_hex = env!("DOLLY_STORAGE_SQLITE3_C_SHA256");
+    debug_assert_eq!(digest_hex.len(), 64);
+    // `sha256:` + 64 lowercase hex; build.rs guarantees lowercase.
+    let artifact_digest: dolly_canonical_json::Sha256Digest = format!("sha256:{digest_hex}")
+        .parse()
+        .expect("build.rs must emit a valid sha256: hex digest");
+    ReleaseAttestation {
+        sqlite_version_number_min: attested_min,
+        sqlite_source_id: source_id,
+        artifact_digest,
+        compile_options: None,
+        linkage_mode: Some("bundled-static".to_string()),
+    }
+}
+
 /// Release attestation for an embedded SQLite library.
 ///
 /// Mirrors `REQ-TECH-003`'s manifest record. `compile_options` and
