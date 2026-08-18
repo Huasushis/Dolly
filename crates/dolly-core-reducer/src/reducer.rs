@@ -647,7 +647,7 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                     Some(CoreError {
                         code: "STORAGE_IDEMPOTENCY_CONFLICT".into(),
                         retryable: false,
-                        outcome: ErrorOutcome::Applied,
+                        outcome: ErrorOutcome::NotApplied,
                         details: Some(incident),
                     }),
                 );
@@ -1149,7 +1149,7 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                     Some(CoreError {
                         code: "STORAGE_IDEMPOTENCY_CONFLICT".into(),
                         retryable: false,
-                        outcome: ErrorOutcome::Applied,
+                        outcome: ErrorOutcome::NotApplied,
                         details: Some(incident),
                     }),
                 );
