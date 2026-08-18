@@ -77,16 +77,10 @@ fn run_gate(vector: &Value) -> (String, Value, Value) {
 #[test]
 fn storage_vectors_execute() {
     let cases = [
-        (
-            "TST-STORAGE-001-reject-vulnerable-sqlite.json",
-            "STORAGE_UNSAFE_SQLITE_BUILD",
-        ),
-        (
-            "TST-STORAGE-002-accept-fixed-sqlite.json",
-            "sqlite_build_gate_passed",
-        ),
+        "TST-STORAGE-001-reject-vulnerable-sqlite.json",
+        "TST-STORAGE-002-accept-fixed-sqlite.json",
     ];
-    for (name, expected_outcome) in cases {
+    for name in cases {
         let vector = read_vector(name);
         let expected = &vector["expected"];
 
@@ -95,8 +89,12 @@ fn storage_vectors_execute() {
             "{name}: schema must be the canonical vector schema"
         );
 
+        let expected_outcome = expected
+            .get("outcome")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{name}: fixture expected.outcome must be a string"));
         let (outcome, mut instance, emitted) = run_gate(&vector);
-        assert_eq!(outcome, *expected_outcome, "{name}: outcome");
+        assert_eq!(outcome, expected_outcome, "{name}: outcome");
 
         for assertion in expected["assertions"].as_array().unwrap() {
             let path = assertion["path"].as_str().unwrap();
