@@ -32,6 +32,20 @@ import { createStdioReader, createStdioWriter, StdioReadError, type StdioMessage
 /** Bounded wall-clock wait for SIGTERM before escalating to SIGKILL, in ms. */
 const TEARDOWN_GRACE_MS = 500;
 
+/**
+ * Module-private identity store of every `PrepareResult` minted by
+ * `prepare()`. `prepare()` is the sole producer of Ready evidence;
+ * `adaptToolBrokerServer` requires the exact minted object so a forged,
+ * copied, or spread result can never project generation authority.
+ */
+const MINTED_PREPARE_RESULTS = new WeakSet<object>();
+
+/** Registers a `PrepareResult` in the identity store and returns it. */
+function mintPrepareResult(result: PrepareResult): PrepareResult {
+  MINTED_PREPARE_RESULTS.add(result);
+  return result;
+}
+
 /** Permitted top-level fields of an initialize `result` object. */
 const INITIALIZED_RESULT_KEYS = ["protocolVersion", "capabilities", "serverInfo", "_meta"] as const;
 /** Permitted top-level fields of a JSON-RPC response envelope. */
@@ -113,6 +127,7 @@ export class ToolBrokerSession {
   #nextRequestId = 1;
   #stopped = false;
   #prepareSettled = false;
+  #prepareResult: PrepareResult | undefined;
 
   constructor(
     config: ToolBrokerServerConfig,
@@ -145,7 +160,14 @@ export class ToolBrokerSession {
    * call returns the first result.
    */
   async prepare(): Promise<PrepareResult> {
+    if (this.#prepareResult !== undefined) {
+      return this.#prepareResult;
+    }
     if (this.#prepareSettled) {
+      // Concurrent second call while the handshake is in flight: return a
+      // minted, non-Ready current result instead of starting a second
+      // handshake. `adaptToolBrokerServer` rejects it because the identity is
+      // minted but not Ready.
       return this.#currentResult();
     }
     this.#prepareSettled = true;
@@ -193,21 +215,23 @@ export class ToolBrokerSession {
       // messages to send, so closing stdin is safe.
       this.#writer.close();
 
-      return {
+      this.#prepareResult = mintPrepareResult({
         state: "Ready",
         toolServerId: this.#config.serverId,
         toolServerGeneration: this.#generation,
-      };
+      });
+      return this.#prepareResult;
     } catch (error) {
       this.#state = "Quarantined";
       const code = this.#errorCodeFrom(error);
       await this.#teardown();
-      return {
+      this.#prepareResult = mintPrepareResult({
         state: "Quarantined",
         toolServerId: this.#config.serverId,
         toolServerGeneration: this.#generation,
         errorCode: code,
-      };
+      });
+      return this.#prepareResult;
     }
   }
 
@@ -290,21 +314,23 @@ export class ToolBrokerSession {
   }
 
   #currentResult(): PrepareResult {
-    if (this.#state === "Ready") {
-      return {
-        state: "Ready",
-        toolServerId: this.#config.serverId,
-        toolServerGeneration: this.#generation,
-      };
-    }
-    // If prepare already settled to Quarantined, we don't retain the error
-    // code on the instance (it was returned from prepare). Return a generic
-    // Quarantined result; stop() is the normal terminal path.
-    return {
-      state: "Quarantined",
-      toolServerId: this.#config.serverId,
-      toolServerGeneration: this.#generation,
-    };
+    // Concurrent-call path only: the handshake is still in flight or the
+    // settle result was never retained, so a fresh minted object is returned.
+    // `adaptToolBrokerServer` rejects these because they are either non-Ready
+    // or the exact identity is minted but never Ready for projection.
+    return mintPrepareResult(
+      this.#state === "Ready"
+        ? {
+            state: "Ready",
+            toolServerId: this.#config.serverId,
+            toolServerGeneration: this.#generation,
+          }
+        : {
+            state: "Quarantined",
+            toolServerId: this.#config.serverId,
+            toolServerGeneration: this.#generation,
+          },
+    );
   }
 }
 
@@ -360,8 +386,18 @@ export async function killChild(child: ChildProcess): Promise<void> {
   await exitPromise;
 }
 
-/** Builds the frozen, reusable projection of a ready generation. */
+/**
+ * Builds the frozen, reusable projection of a ready generation.
+ *
+ * Only the exact minted object returned by `prepare()` is accepted; a
+ * caller-constructed or copied/spread result is rejected before any authority
+ * is projected, so downstream consumers can trust that the generation fence
+ * (`toolServerId`/`toolServerGeneration`) came from the host's own handshake.
+ */
 export function adaptToolBrokerServer(prepared: PrepareResult): AdaptedToolBrokerServer {
+  if (typeof prepared !== "object" || prepared === null || !MINTED_PREPARE_RESULTS.has(prepared)) {
+    throw new Error("adaptToolBrokerServer requires the exact PrepareResult returned by prepare()");
+  }
   if (prepared.state !== "Ready") {
     throw new Error("adaptToolBrokerServer requires a Ready prepared result");
   }

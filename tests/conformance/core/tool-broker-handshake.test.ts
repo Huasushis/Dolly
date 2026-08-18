@@ -23,6 +23,7 @@ import {
   type ToolBrokerServer,
   type ToolBrokerServerConfig,
   type ToolBrokerServerState,
+  type PrepareResult,
 } from "../../../src/core/tool-broker/index.js";
 import { assertJsonValue, isJsonObject, type JsonValue } from "../../../src/core/canonical-json.js";
 
@@ -327,6 +328,47 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
     expect(Object.isFrozen(adapted)).toBe(true);
     expect(adapted.toolServerId).toBe("fake-mcp");
     expect(adapted.protocolVersion).toBe(MCP_PROTOCOL_VERSION);
+    await broker.stop();
+  });
+
+  it("rejects a caller-forged Ready result with no minted identity", async () => {
+    const forged: PrepareResult = {
+      state: "Ready",
+      toolServerId: "ghost",
+      toolServerGeneration: 2,
+    };
+    expect(() => adaptToolBrokerServer(forged)).toThrow(
+      /exact.*PrepareResult|mint/iu,
+    );
+  });
+
+  it("rejects a spread copy of a genuine result", async () => {
+    const child = spawnFake("exact");
+    const broker = startToolBrokerServer(baseConfig(), {
+      spawn: () => child,
+      now: () => 0,
+    });
+    const prepared = await broker.prepare();
+    const copied = { ...prepared };
+    expect(copied).not.toBe(prepared);
+    expect(() => adaptToolBrokerServer(copied)).toThrow(
+      /exact.*PrepareResult|mint/iu,
+    );
+    await broker.stop();
+  });
+
+  it("reuses the exact minted identity on an idempotent prepare call", async () => {
+    const child = spawnFake("exact");
+    const broker = startToolBrokerServer(baseConfig(), {
+      spawn: () => child,
+      now: () => 0,
+    });
+    const first = await broker.prepare();
+    const second = await broker.prepare();
+    expect(second).toBe(first);
+    const adapted = adaptToolBrokerServer(second);
+    expect(adapted.toolServerId).toBe("fake-mcp");
+    expect(adapted.toolServerGeneration).toBe(1);
     await broker.stop();
   });
 });
