@@ -51,6 +51,42 @@ describe("extension process protocol length-prefixed JSON framing", () => {
     channel.close();
   });
 
+  it("accepts a complete frame nested at the 96-level JSON limit", () => {
+    const inbound = new PassThrough();
+    const outbound = new PassThrough();
+    const onMessage = vi.fn();
+    const onError = vi.fn();
+    const channel = new FramedJsonChannel(inbound, outbound, {
+      maxFrameBytes: 1_024,
+      onMessage,
+      onError,
+    });
+    const depth96 = "[".repeat(96) + "1" + "]".repeat(96);
+    inbound.write(frame(depth96));
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+    channel.close();
+  });
+
+  it("rejects a complete frame nested at depth 97 with FRAME_JSON_INVALID", () => {
+    const inbound = new PassThrough();
+    const outbound = new PassThrough();
+    const onMessage = vi.fn();
+    const onError = vi.fn();
+    const channel = new FramedJsonChannel(inbound, outbound, {
+      maxFrameBytes: 1_024,
+      onMessage,
+      onError,
+    });
+    const depth97 = "[".repeat(97) + "1" + "]".repeat(97);
+    inbound.write(frame(depth97));
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "FRAME_JSON_INVALID" }),
+    );
+    channel.close();
+  });
+
   it("rejects an over-limit length from the four-byte header without waiting for a body", () => {
     const inbound = new PassThrough();
     const outbound = new PassThrough();

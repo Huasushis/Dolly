@@ -202,7 +202,7 @@ export class FramedJsonChannel {
     try {
       value = parseStrictJsonText(text, {
         maxBytes: this.#maxFrameBytes,
-        maxDepth: 128,
+        maxDepth: 96,
       });
     } catch {
       this.#fail(
