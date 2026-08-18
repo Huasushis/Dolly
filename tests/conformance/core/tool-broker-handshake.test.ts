@@ -371,4 +371,45 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
     expect(adapted.toolServerGeneration).toBe(1);
     await broker.stop();
   });
+
+  it("cannot mutate a genuine Quarantined result into Ready; identity does not project", async () => {
+    const child = spawnFake("wrong-version");
+    const broker = startToolBrokerServer(baseConfig(), {
+      spawn: () => child,
+      now: () => 0,
+    });
+    const result = await broker.prepare();
+    expect(result.state).toBe("Quarantined");
+    // The minted result is frozen: mutation must fail in strict mode.
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(() => {
+      (result as { state: string }).state = "Ready";
+    }).toThrow(TypeError);
+    expect(result.state).toBe("Quarantined");
+    // Identity cannot project altered authority either way.
+    expect(() => adaptToolBrokerServer(result)).toThrow(/Ready/iu);
+    await broker.stop();
+  });
+
+  it("cannot mutate a genuine Ready generation to project altered authority", async () => {
+    const child = spawnFake("exact");
+    const broker = startToolBrokerServer(baseConfig(), {
+      spawn: () => child,
+      now: () => 0,
+    });
+    const result = await broker.prepare();
+    expect(result.state).toBe("Ready");
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(() => {
+      (result as { toolServerGeneration: number }).toolServerGeneration = 99;
+    }).toThrow(TypeError);
+    expect(() => {
+      (result as { toolServerId: string }).toolServerId = "ghost";
+    }).toThrow(TypeError);
+
+    const adapted = adaptToolBrokerServer(result);
+    expect(adapted.toolServerId).toBe("fake-mcp");
+    expect(adapted.toolServerGeneration).toBe(1);
+    await broker.stop();
+  });
 });
