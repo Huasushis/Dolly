@@ -64,7 +64,7 @@ export class OutboundPolicy {
       }
       return Object.freeze({
         allowed: true as const,
-        recipient: { kind: "group", group_id: normalized.id },
+        recipient: { kind: "group" as const, group_id: normalized.id },
       });
     }
     if (this.#users.includes(normalized.id) === false) {
@@ -72,7 +72,7 @@ export class OutboundPolicy {
     }
     return Object.freeze({
       allowed: true as const,
-      recipient: { kind: "private", user_id: normalized.id },
+      recipient: { kind: "private" as const, user_id: normalized.id },
     });
   }
 }
