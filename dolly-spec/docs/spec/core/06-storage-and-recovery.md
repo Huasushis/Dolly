@@ -389,17 +389,21 @@ Fault-injection tests MUST exercise every labeled point.
 
 ## 10. Errors
 
-| Code | Retryable | Meaning |
-| --- | ---: | --- |
-| `STORAGE_INSTANCE_LOCKED` | no | another writer owns the instance |
-| `STORAGE_UNSAFE_SQLITE_BUILD` | no | loaded SQLite is older than 3.51.3 or does not match the release attestation |
-| `STORAGE_UNSAFE_CONFIGURATION` | no | required SQLite durability setting is absent |
-| `STORAGE_BUSY` | yes | lock contention exceeded the configured busy timeout |
-| `STORAGE_FULL` | after operator action | disk or quota cannot admit the transaction |
-| `STORAGE_CORRUPT` | no | SQLite, canonical bytes, references, or uniqueness are inconsistent |
-| `STORAGE_IDEMPOTENCY_CONFLICT` | no | one idempotency identity names different canonical operations |
-| `STORAGE_SEQUENCE_CONFLICT` | no | a supposedly unique sequence is repeated or regresses |
-| `STORAGE_MIGRATION_REQUIRED` | no | database schema is not supported by this binary |
+The `outcome` column is the mandatory `DollyError.outcome` field from the
+[standard Core error envelope](01-identifiers-and-canonical-json.md#7-standard-core-error-envelope);
+it is part of every emitted storage error envelope.
+
+| Code | Retryable | Outcome | Meaning |
+| --- | ---: | --- | --- |
+| `STORAGE_INSTANCE_LOCKED` | no | `not_applied` | another writer owns the instance |
+| `STORAGE_UNSAFE_SQLITE_BUILD` | no | `not_applied` | loaded SQLite is older than 3.51.3 or does not match the release attestation |
+| `STORAGE_UNSAFE_CONFIGURATION` | no | `not_applied` | required SQLite durability setting is absent |
+| `STORAGE_BUSY` | yes | `not_applied` | lock contention exceeded the configured busy timeout |
+| `STORAGE_FULL` | after operator action | `not_applied` | disk or quota cannot admit the transaction |
+| `STORAGE_CORRUPT` | no | `not_applied` | SQLite, canonical bytes, references, or uniqueness are inconsistent |
+| `STORAGE_IDEMPOTENCY_CONFLICT` | no | `not_applied` | one idempotency identity names different canonical operations |
+| `STORAGE_SEQUENCE_CONFLICT` | no | `not_applied` | a supposedly unique sequence is repeated or regresses |
+| `STORAGE_MIGRATION_REQUIRED` | no | `not_applied` | database schema is not supported by this binary |
 
 `SQLITE_BUSY` and `SQLITE_FULL` MUST be translated to stable Core errors. Raw database messages MAY be logged after redaction but MUST NOT be the protocol contract.
 

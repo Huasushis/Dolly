@@ -32,6 +32,19 @@ for (const [file, schema] of schemas) {
 }
 
 const schemaBase = "https://dolly.example/spec/0.1/schemas/";
+// §10 of docs/spec/core/06-storage-and-recovery.md; every storage error is a pre-apply
+// gate failure or all-or-nothing rollback, so each envelope carries outcome "not_applied".
+const STORAGE_ERROR_OUTCOMES = new Map([
+  ["STORAGE_INSTANCE_LOCKED", "not_applied"],
+  ["STORAGE_UNSAFE_SQLITE_BUILD", "not_applied"],
+  ["STORAGE_UNSAFE_CONFIGURATION", "not_applied"],
+  ["STORAGE_BUSY", "not_applied"],
+  ["STORAGE_FULL", "not_applied"],
+  ["STORAGE_CORRUPT", "not_applied"],
+  ["STORAGE_IDEMPOTENCY_CONFLICT", "not_applied"],
+  ["STORAGE_SEQUENCE_CONFLICT", "not_applied"],
+  ["STORAGE_MIGRATION_REQUIRED", "not_applied"],
+]);
 const registryFile = path.join(root, "protocol", "extension-rpc-v1.registry.json");
 const rpcRegistry = JSON.parse(fs.readFileSync(registryFile, "utf8"));
 const registryValidator = ajv.getSchema(`${schemaBase}extension-rpc-registry.schema.json`);
@@ -445,6 +458,19 @@ for (const [file, schemaId] of cases) {
   }
   if (value.schema === "dolly.test-vector/v1" && Array.isArray(value.expected?.emitted)) {
     for (const [index, emitted] of value.expected.emitted.entries()) {
+      if (typeof emitted?.error === "string") {
+        const relative = path.relative(root, file);
+        const envelope = { ...emitted, code: emitted.error, message: "test", details: {} };
+        delete envelope.error;
+        assertValid(`${relative}.expected.emitted[${index}] error envelope`, `${schemaBase}error.schema.json`, envelope);
+        const outcome = STORAGE_ERROR_OUTCOMES.get(emitted.error);
+        if (!outcome) {
+          throw new Error(`${relative}.expected.emitted[${index}]: unknown storage error code ${emitted.error}`);
+        }
+        if (emitted.outcome !== outcome || outcome !== "not_applied") {
+          throw new Error(`${relative}.expected.emitted[${index}]: outcome must be "${outcome}" per §10`);
+        }
+      }
       if (emitted?.schema === "dolly.action-result/v1") {
         assertValid(
           `${path.relative(root, file)}.expected.emitted[${index}]`,
