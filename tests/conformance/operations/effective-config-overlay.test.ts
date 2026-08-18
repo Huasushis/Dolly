@@ -236,3 +236,90 @@ describe("effective-config closed validation", () => {
     expect(result.effectiveConfig.inherited).toBe(1);
   });
 });
+
+describe("effective-config no reference aliasing", () => {
+  function expectDeepFrozen(value: unknown, label: string): void {
+    if (value === null || typeof value !== "object") return;
+    expect(Object.isFrozen(value), `${label} depth`).toBe(true);
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      expectDeepFrozen(child, `${label}.${key}`);
+    }
+  }
+
+  it("returns inherited nested objects and arrays as deep copies, not references to the Extension object", () => {
+    const extension = { nested: { shared: true }, arr: [1, 2], inherited: 1 };
+    const module = { cache: { module: true } };
+    const result = normalizeEffectiveConfig(extension, module);
+
+    expect(result.effectiveConfig.nested).toEqual({ shared: true });
+    expect(result.effectiveConfig.nested).not.toBe(extension.nested);
+    expect(result.effectiveConfig.arr).toEqual([1, 2]);
+    expect(result.effectiveConfig.arr).not.toBe(extension.arr);
+    expect(Object.isExtensible(extension.nested)).toBe(true);
+    expectDeepFrozen(result.effectiveConfig, "effectiveConfig");
+  });
+
+  it("returns overridden nested objects and arrays as deep copies, not references to the Module object", () => {
+    const extension = { base: 1, nested: { shared: true }, arr: [1, 2] };
+    const module = { nested: { module: true }, arr: [3, 4] };
+    const result = normalizeEffectiveConfig(extension, module);
+
+    expect(result.effectiveConfig.nested).toEqual({ module: true });
+    expect(result.effectiveConfig.nested).not.toBe(module.nested);
+    expect(result.effectiveConfig.arr).toEqual([3, 4]);
+    expect(result.effectiveConfig.arr).not.toBe(module.arr);
+    // The Module's original nested value is untouched.
+    expect(module.nested).toEqual({ module: true });
+    expect(Object.isExtensible(module.nested)).toBe(true);
+    expectDeepFrozen(result.effectiveConfig, "effectiveConfig");
+  });
+
+  it("binds the digest to immutable bytes: mutation cannot alter the effective result", () => {
+    const extension = { nested: { shared: true }, arr: [1, 2], inherited: 1 };
+    const module = { cache: { module: true } };
+    const result = normalizeEffectiveConfig(extension, module);
+    const snapshotDigest = result.digest;
+    expect(result.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
+
+    // Attempting to mutate the returned config must fail (frozen deep copy).
+    expect(() => {
+      (result.effectiveConfig.nested as Record<string, unknown>).shared = false;
+    }).toThrowError(TypeError);
+    expect(() => {
+      (result.effectiveConfig.arr as unknown[]).push(3);
+    }).toThrowError(TypeError);
+
+    // Mutating the live Extension source afterwards cannot change the snapshot
+    // or its digest; the next normalization is independent.
+    extension.nested.shared = false;
+    extension.arr.push(3);
+    expect(result.effectiveConfig.nested).toEqual({ shared: true });
+    expect(result.effectiveConfig.arr).toEqual([1, 2]);
+    expect(result.effectiveConfig.nested).toHaveProperty("shared", true);
+    expect(result.digest).toBe(snapshotDigest);
+  });
+
+  it("keeps sibling normalizations independent: overrides never flow back into defaults or each other", () => {
+    const extension = { shared_limit: 10, nested: { base: "e" } };
+    const module = { nested: { base: "m" } };
+    const first = normalizeEffectiveConfig(extension, module);
+    const second = normalizeEffectiveConfig({ ...extension }, { ...module });
+
+    // Result objects are distinct deep copies — not the same reference.
+    expect(first.effectiveConfig).not.toBe(second.effectiveConfig);
+    expect(first.effectiveConfig.nested).not.toBe(second.effectiveConfig.nested);
+    // Both calls agree on value and digest.
+    expect(first).toEqual(second);
+
+    // Upstream defaults and the first call's Module override remain unchanged.
+    expect(extension).toEqual({ shared_limit: 10, nested: { base: "e" } });
+    expect(module).toEqual({ nested: { base: "m" } });
+    // Second normalization is unaffected by the first result's frozen state.
+    expect(second.effectiveConfig.nested).toEqual({ base: "m" });
+    // Extension-level value is preserved by the overlay for both.
+    for (const call of [first, second]) {
+      expect(call.effectiveConfig.shared_limit).toBe(10);
+      expect(call.effectiveConfig.nested).toEqual({ base: "m" });
+    }
+  });
+});
