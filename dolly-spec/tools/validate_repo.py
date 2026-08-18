@@ -560,6 +560,22 @@ def validate_examples(errors: list[str]) -> None:
     )
     if vector["initial"]["source_descriptor_digest"] != descriptor_digest:
         errors.append("TST-DESC-001: source_descriptor_digest does not match fixture")
+    source = fixture["value"]["source_descriptor"]
+    for group_name in ("emits", "accepts", "actions"):
+        expected_group = next(
+            (
+                assertion["value"]
+                for assertion in vector["expected"]["assertions"]
+                if assertion["path"]
+                == f"/manifest/neighbor_descriptors/0/projection/{group_name}"
+            ),
+            None,
+        )
+        if expected_group != source[group_name]:
+            errors.append(
+                f"TST-DESC-001: projection.{group_name} assertion does not equal "
+                f"the fixture source {group_name} Contract/ActionContract group"
+            )
 
     replay_vector = load_json(
         ROOT / "test-vectors" / "core" / "TST-CORE-009-activation-ledger-evidence.json"
