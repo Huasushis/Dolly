@@ -616,6 +616,77 @@ const descriptorFixture = JSON.parse(fs.readFileSync(
   path.join(root, "test-vectors", "fixtures", "neighbor-is-both-input-producer-and-output-consumer.json"),
   "utf8",
 )).value.source_descriptor;
+
+// TST-DESC-001 neighbor projection: the vector's expected projection groups
+// MUST be schema-conformant Contract values. The activation-manifest
+// projection reuses the module-descriptor Contract/ActionContract schemas, so
+// validating the vector's expected values against those properties proves the
+// expected manifest is acceptable and a token-injected group array (the
+// previously demonstrated contradiction) cannot pass.
+const descProjectionVector = JSON.parse(fs.readFileSync(
+  path.join(root, "test-vectors", "core", "TST-DESC-001-neighbor-projection.json"),
+  "utf8",
+));
+if (descProjectionVector.schema !== "dolly.test-vector/v1" || descProjectionVector.test_id !== "TST-DESC-001") {
+  throw new Error("TST-DESC-001: unexpected vector identity");
+}
+const descAssertionValue = (suffix) => descProjectionVector.expected.assertions.find(
+  (entry) => entry.path === `/manifest/neighbor_descriptors/0/projection/${suffix}`,
+)?.value;
+const projectedEmits = descAssertionValue("emits");
+const projectedAccepts = descAssertionValue("accepts");
+const projectedActions = descAssertionValue("actions");
+if (
+  projectedEmits === undefined ||
+  projectedAccepts === undefined ||
+  projectedActions === undefined
+) {
+  throw new Error("TST-DESC-001: projection emits/accepts/actions must be asserted");
+}
+for (const [group, label] of [
+  [projectedEmits, "emits"],
+  [projectedAccepts, "accepts"],
+  [projectedActions, "actions"],
+]) {
+  assertValid(
+    `TST-DESC-001 projection.${label}`,
+    `${schemaBase}module-descriptor.schema.json#/properties/${label}`,
+    group,
+  );
+}
+if (
+  canonicalJson({
+    emits: projectedEmits,
+    accepts: projectedAccepts,
+    actions: projectedActions,
+  }) !== canonicalJson({
+    emits: descriptorFixture.emits,
+    accepts: descriptorFixture.accepts,
+    actions: descriptorFixture.actions,
+  })
+) {
+  throw new Error("TST-DESC-001: projected groups must equal the source descriptor groups");
+}
+// The demonstrated contradiction — a leading string token inside the projected
+// group arrays — is not a Contract/ActionContract and MUST fail the schema.
+assertValid(
+  "TST-DESC-001 token-injected emits",
+  `${schemaBase}module-descriptor.schema.json#/properties/emits`,
+  ["contract", projectedEmits],
+  false,
+);
+assertValid(
+  "TST-DESC-001 token-injected accepts",
+  `${schemaBase}module-descriptor.schema.json#/properties/accepts`,
+  ["contract", projectedAccepts],
+  false,
+);
+assertValid(
+  "TST-DESC-001 token-injected actions",
+  `${schemaBase}module-descriptor.schema.json#/properties/actions`,
+  ["authorized-contracts", ...projectedActions],
+  false,
+);
 const frozenActionContract = structuredClone(descriptorFixture.actions[0]);
 const targetedCommittedAction = {
   action_id: testUuid(250),

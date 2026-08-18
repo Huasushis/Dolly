@@ -20,9 +20,9 @@
       {"path": "/manifest/neighbor_descriptors", "op": "count", "value": 1},
       {"path": "/manifest/neighbor_descriptors/0/module_id", "op": "equals", "value": "analyst"},
       {"path": "/manifest/neighbor_descriptors/0/relationships", "op": "equals", "value": ["input_producer", "output_consumer"]},
-      {"path": "/manifest/neighbor_descriptors/0/projection/emits", "op": "contains", "value": "contract"},
-      {"path": "/manifest/neighbor_descriptors/0/projection/accepts", "op": "contains", "value": "contract"},
-      {"path": "/manifest/neighbor_descriptors/0/projection/actions", "op": "contains", "value": "authorized-contracts"},
+      {"path": "/manifest/neighbor_descriptors/0/projection/emits", "op": "equals", "value": {"summary": "Analysis", "part_kinds": ["text"], "action_names": []}},
+      {"path": "/manifest/neighbor_descriptors/0/projection/accepts", "op": "equals", "value": {"summary": "Review work", "part_kinds": ["text"], "action_names": ["org.dolly.llm.review"]}},
+      {"path": "/manifest/neighbor_descriptors/0/projection/actions", "op": "equals", "value": [{"name": "org.dolly.llm.review", "arguments_schema": {"uri": "schemas/channel-send.schema.json", "schema_digest": "sha256:64fbd12a17d44adb095ff1886020231fabbbb1b29d15c6a5f6d099a1d2e750aa", "semantic_validator": null}, "result_schema": {"uri": "schemas/channel-send-result.schema.json", "schema_digest": "sha256:14edf90d6ac5a7082fafdd3bcfb5de311ebb92640e04235b98d247c19222b239", "semantic_validator": {"id": "org.dolly.validator.channel-send-result", "revision": 1}}, "description": "Review a draft", "side_effect_class": "read_only"}]},
       {"path": "/manifest/neighbor_descriptors/0/projection/schema", "op": "absent"},
       {"path": "/manifest/neighbor_descriptors/0/projection/unauthorized_metadata", "op": "absent"}
     ],
