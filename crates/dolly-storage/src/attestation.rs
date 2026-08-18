@@ -86,9 +86,10 @@ pub struct VerifiedSqliteBuild {
 /// The authoritative SQLite build gate from REQ-TECH-003 / ADR 0006.
 ///
 /// Every field of `loaded` that the attestation names MUST match before the
-/// build is admitted. There is deliberately no "trust this version otherwise"
-/// path: a version number above the floor with an unlisted `source_id` or
-/// digest is still a substituted, unattested build and fails closed.
+/// build is admitted, and a release attestation can never lower the absolute
+/// version floor. There is deliberately no way to weaken the check via a
+/// bundled attestation: a higher attested minimum may tighten it, but the
+/// absolute floor always wins.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SqliteBuildGate;
 
@@ -98,10 +99,14 @@ impl SqliteBuildGate {
         attestation: &ReleaseAttestation,
         loaded: &LoadedSqlite,
     ) -> StorageResult<VerifiedSqliteBuild> {
-        if loaded.version_number < attestation.sqlite_version_number_min {
+        // The absolute REQ-TECH-003 floor is unconditional: a signed
+        // attestation claiming a lower minimum can tighten but never weaken
+        // the constant. The effective floor is the stricter of the two.
+        let effective_min = SQLITE_VERSION_NUMBER_MIN.max(attestation.sqlite_version_number_min);
+        if loaded.version_number < effective_min {
             return Err(StorageError::unsafe_sqlite_build(
                 loaded.version_number,
-                attestation.sqlite_version_number_min,
+                effective_min,
             ));
         }
         if loaded.source_id != attestation.sqlite_source_id {
@@ -183,6 +188,31 @@ mod tests {
             result,
             Err(StorageError::UnsafeSqliteBuild { .. })
         ));
+    }
+
+    /// A vulnerable loaded build must be rejected even when the attestation
+    /// illegally claims a lower minimum than the spec floor: the constant
+    /// never weakens.
+    #[test]
+    fn rejects_below_floor_despite_lowered_attestation_min() {
+        let mut a = attestation();
+        a.sqlite_version_number_min = MIN - 100; // attacker/corrupt attestation
+        assert!(a.sqlite_version_number_min < MIN);
+        // loaded is below the absolute floor but above the lowered attested min.
+        let result = SqliteBuildGate.verify(&a, &loaded(MIN - 1));
+        assert!(matches!(
+            result,
+            Err(StorageError::UnsafeSqliteBuild { .. })
+        ));
+    }
+
+    /// A higher attested minimum may tighten beyond the spec floor.
+    #[test]
+    fn higher_attestation_min_tightens_but_never_loosens() {
+        // floor pass, attested-min fail
+        let mut a = attestation();
+        a.sqlite_version_number_min = MIN + 1;
+        assert!(SqliteBuildGate.verify(&a, &loaded(MIN)).is_err());
     }
 
     #[test]
