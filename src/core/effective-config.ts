@@ -13,12 +13,15 @@
  * (no NaN, infinity, negative zero, `undefined`, functions, class instances,
  * cycles, or unpaired surrogates) before digesting. The digest is the JCS
  * (RFC 8785) SHA-256 of the resolved object via the existing canonical-json
- * layer, emitted as `sha256:<64 hex>`.
+ * layer, emitted as `sha256:<64 hex>`, and it is computed after the overlay is
+ * deep-cloned and deeply frozen so the result always binds to immutable bytes.
  */
 
 import {
   assertJsonValue,
   canonicalJsonDigest,
+  cloneJson,
+  deepFreeze,
   isJsonObject,
   type JsonValue,
 } from "./canonical-json.js";
@@ -43,10 +46,10 @@ export class EffectiveConfigError extends Error {
 }
 
 /**
- * The resolved Module effective object and its JCS digest. Effective child
- * values are shared by reference with the validated sources, which are never
- * mutated by this module; callers must treat the result as immutable to
- * preserve the digest contract.
+ * The resolved Module effective object and its JCS digest. The effective
+ * object is a deep-cloned, deeply frozen copy of the overlay: it shares no
+ * references with either source and cannot be mutated, so the digest is bound
+ * to immutable bytes for the lifetime of the result.
  */
 export interface EffectiveConfigOverlay {
   readonly effectiveConfig: Readonly<Record<string, JsonValue>>;
@@ -106,5 +109,6 @@ export function normalizeEffectiveConfig(
     );
   }
 
-  return { effectiveConfig: overlay, digest: canonicalJsonDigest(overlay) };
+  const effectiveConfig = deepFreeze(cloneJson(overlay));
+  return { effectiveConfig, digest: canonicalJsonDigest(effectiveConfig) };
 }
