@@ -170,6 +170,7 @@ export class ToolBrokerSession {
   #stopped = false;
   #prepareSettled = false;
   #prepareResult: PrepareResult | undefined;
+  #childExitObserved = false;
 
   constructor(
     config: ToolBrokerServerConfig,
@@ -254,6 +255,10 @@ export class ToolBrokerSession {
       this.#writer.write(initializedNotification);
 
       this.#state = "Ready";
+      // Observe the child only from this point: a termination after a Ready
+      // generation with no request in flight must not leave the state Ready
+      // forever. The watcher is attached once; `exit` fires once per child.
+      this.#installIdleExitWatcher();
       // Keep the generation alive: stdin stays open for post-handshake
       // requests (ping in this slice). The broker holds the child reference
       // for teardown; the child exits only when the host tears it down.
@@ -450,6 +455,49 @@ export class ToolBrokerSession {
   }
 
   /**
+   * Background observation of post-handshake child termination. Installed
+   * exactly once when the session reaches `Ready`. If the child exits while
+   * `Ready` and no request is in flight, transitions the generation to
+   * `Quarantined` and runs the (idempotent, confirmed) teardown. Races
+   * safely with `stop()`, the request timeout, protocol failure, and the
+   * in-flight ping catch: a `Stopped` terminal state is never overwritten,
+   * an in-flight ping owns its own quarantine/teardown, and termination is
+   * handled exactly once.
+   */
+  #installIdleExitWatcher(): void {
+    this.#child.once("exit", this.#onChildExit);
+  }
+
+  #onChildExit = (): void => {
+    if (this.#stopped) {
+      // stop() owns the terminal state; a late exit must not overwrite it.
+      return;
+    }
+    if (this.#childExitObserved) {
+      // Exactly-once: child termination must not run twice.
+      return;
+    }
+    this.#childExitObserved = true;
+    if (this.#pingInFlight) {
+      // The in-flight ping read observes the exit and owns the quarantine
+      // and teardown; do not double-teardown here.
+      return;
+    }
+    this.#state = "Quarantined";
+    // Fire-and-forget: `#teardown` is governed by `#stopped`, `#pingInFlight`,
+    // and the exactly-once flag, so a concurrent stop() or ping catch cannot
+    // be clobbered by this background transition. Teardown is idempotent.
+    void this.#teardown();
+  }
+
+  /** Confirmed, idempotent teardown of the generation transport. */
+  async #teardown(): Promise<void> {
+    this.#reader.stop();
+    this.#writer.close();
+    await killChild(this.#child);
+  }
+
+  /**
    * Stops the generation: sends SIGTERM, waits up to `TEARDOWN_GRACE_MS` for
    * exit, then SIGKILL. Resolves only after the child is confirmed exited.
    * Idempotent.
@@ -461,12 +509,6 @@ export class ToolBrokerSession {
     this.#stopped = true;
     this.#state = "Stopped";
     await this.#teardown();
-  }
-
-  async #teardown(): Promise<void> {
-    this.#reader.stop();
-    this.#writer.close();
-    await killChild(this.#child);
   }
 
   #currentResult(): PrepareResult {

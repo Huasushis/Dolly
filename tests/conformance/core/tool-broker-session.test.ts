@@ -18,6 +18,7 @@ import {
   type ToolBrokerServer,
   type ToolBrokerServerConfig,
   type ToolBrokerErrorCode,
+  type ToolBrokerServerState,
 } from "../../../src/core/tool-broker/index.js";
 import { isJsonObject, type JsonValue } from "../../../src/core/canonical-json.js";
 
@@ -134,6 +135,35 @@ function pingFrames(messages: JsonValue[]): Array<{ id: number }> {
     .map((message) => ({ id: message.id }));
 }
 
+/** Boundedly waits for the broker to reach a state. Used where the session
+ * must observe an asynchronous background transition (idle child exit).
+ *
+ * This is a real-integration wait: the child is a separate process that
+ * exits on the platform clock, so fake timers cannot drive it (the event
+ * does not travel through vitest's clock), and the broker exposes no promise
+ * for the background transition. Polling keeps the wait bounded so a missed
+ * transition surfaces as a state assertion, not a hang.
+ */
+function waitForState(
+  broker: ToolBrokerServer,
+  state: ToolBrokerServerState,
+  timeoutMs: number,
+): Promise<void> {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const tick = (): void => {
+      if (broker.state === state || Date.now() - started >= timeoutMs) {
+        resolve();
+        return;
+      }
+      setTimeout(tick, 20);
+    };
+    tick();
+    // NOTE: Promise.withResolvers is unavailable on Node 20, the runtime
+    // Vitest executes under; the executor form is required here.
+  });
+}
+
 /** Asserts the quarantine contract shared by every ping failure path:
  * the error code, the Ready->Quarantined transition, and a confirmed-dead
  * child (teardown completed before the rejection surfaced). */
@@ -240,15 +270,46 @@ describe("Tool Broker post-handshake session (ping substrate)", () => {
     await broker.stop();
   });
 
-  it("ping rejects an in-flight child exit", async () => {
-    const { broker, child } = startBroker("ping-idle-exit");
+  it("fails closed on a served request frame — reverse premise", async () => {
+    const { broker, child, capture } = startBroker("ping-server-request");
     await broker.prepare();
+    expect(broker.state).toBe("Ready");
+
+    // The server initiates its own JSON-RPC request (id 777, tools/list)
+    // instead of answering the host's ping. It cannot act as the correlated
+    // response for id 2 nor authorize any upstream authority.
     const error = await broker.ping().then(
       () => undefined,
       (e: unknown) => e,
     );
-    assertQuarantined(error, "TOOL_BROKER_CHILD_EXITED", broker, child);
+    assertQuarantined(error, "TOOL_BROKER_PROTOCOL_FAILURE", broker, child);
+
+    // Fail-closed: exactly one outbound ping, no retry of the request, and
+    // no response written for the server's own id-777 request.
+    await capture.done;
+    expect(pingFrames(capture.messages)).toEqual([{ id: 2 }]);
+    expect(capture.messages.some((m) => isJsonObject(m) && m.id === 777)).toBe(false);
+
     await broker.stop();
+    expect(broker.state).toBe("Stopped");
+  });
+
+  it("observes an idle child exit and quarantines without any request", async () => {
+    const { broker, child, capture } = startBroker("ping-idle-exit");
+    await broker.prepare();
+    expect(broker.state).toBe("Ready");
+
+    // No ping is sent: the child exits on its own after the handshake and the
+    // session must observe that background exit and quarantine exactly once.
+    await waitForState(broker, "Quarantined", 3000);
+    expect(broker.state).toBe("Quarantined");
+    expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+    // No ping frame was ever sent to the server.
+    await capture.done;
+    expect(pingFrames(capture.messages)).toEqual([]);
+
+    await broker.stop();
+    expect(broker.state).toBe("Stopped");
   });
 
   it("stop while ping in flight tears down and ping rejects", async () => {
