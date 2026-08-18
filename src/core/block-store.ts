@@ -127,7 +127,6 @@ interface BlockCommitEffect {
   readonly digest: string;
   readonly record: Block;
   strongReferenceHeld: boolean;
-  owner: string | undefined;
 }
 
 export interface BlockCommitEffectSnapshot {
@@ -135,16 +134,36 @@ export interface BlockCommitEffectSnapshot {
   readonly digest: string;
   readonly record: Block;
   readonly strongReferenceHeld: boolean;
-  readonly owner?: string;
 }
 
-export type BlockStoreSnapshotVersion = "dolly.block-store/3" | "dolly.block-store/4";
+/**
+ * A durable retirement ticket recorded by the Module-result commit protocol
+ * (whose identity cannot be forged by a raw Block caller, since Blocks are
+ * never given the ticket mutation surface). The ticket binds the exact
+ * job, result digest, and Block before the effect tombstone is removed and
+ * survives the separate result-journal delete, so recovery can distinguish
+ * "retirement in progress" from persisted corruption.
+ */
+export interface BlockCommitEffectRetirementTicket {
+  readonly schemaVersion: "dolly.commit-effect-retirement/1";
+  readonly moduleJobId: string;
+  readonly blockId: string;
+  readonly digest: string;
+}
+
+export interface BlockCommitEffectRetirementTicketSnapshot
+  extends BlockCommitEffectRetirementTicket {
+  readonly effectId: string;
+}
+
+export type BlockStoreSnapshotVersion = "dolly.block-store/3" | "dolly.block-store/5";
 
 export interface BlockStoreSnapshot {
   readonly schemaVersion: BlockStoreSnapshotVersion;
   readonly nextSequence: string;
   readonly records: readonly Block[];
   readonly commitEffects: readonly BlockCommitEffectSnapshot[];
+  readonly retirementTickets: readonly BlockCommitEffectRetirementTicketSnapshot[];
 }
 
 const DEFAULT_LIMITS: BlockStoreLimits = {
@@ -273,28 +292,52 @@ function referencesForProposal(proposal: BlockProposal): ReturnType<typeof conte
 }
 
 /**
- * Normalizes an optional durable owner for a Block commit effect. An owner is
- * a plain identifier that names the protocol authorized to retire the effect
- * later; `undefined` means the effect is ownerless (legacy or foreign) and
- * never eligible for the owned retirement path. An empty string is treated
- * as ownerless so a caller that forgets to pass an owner cannot silently
- * mint one.
+ * Validates a durable retirement ticket reported by the Module-result
+ * protocol. The ticket must be a closed object binding the effectId (as its
+ * storage key), an exact moduleJobId, the exact Block, and the exact input
+ * digest. A raw Block caller cannot stage a ticket (retirement mutations are
+ * not part of the public Blocks surface), so this shape is only reachable
+ * through the coordinator's durable record.
  */
-function normalizeEffectOwner(owner: string | undefined): string | undefined {
-  if (owner === undefined || owner === "") return undefined;
-  if (typeof owner !== "string" || !ID_PATTERN.test(owner)) {
+function normalizeRetirementTicket(
+  ticket: unknown,
+  effectId: string,
+): BlockCommitEffectRetirementTicket {
+  assertClosedObject(ticket, ["schemaVersion", "moduleJobId", "blockId", "digest"], "retirement ticket");
+  if (ticket.schemaVersion !== "dolly.commit-effect-retirement/1") {
     throw new BlockStoreError(
-      "BLOCK_ID_INVALID",
-      "Block effect owner must be a valid identifier when present",
+      "BLOCK_EFFECT_CONFLICT",
+      "Block retirement ticket schema version is invalid",
+      { effectId },
     );
   }
-  return owner;
+  if (
+    typeof ticket.moduleJobId !== "string" ||
+    !ID_PATTERN.test(ticket.moduleJobId) ||
+    typeof ticket.blockId !== "string" ||
+    !ID_PATTERN.test(ticket.blockId) ||
+    typeof ticket.digest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/.test(ticket.digest)
+  ) {
+    throw new BlockStoreError(
+      "BLOCK_EFFECT_CONFLICT",
+      "Block retirement ticket does not bind an exact identity",
+      { effectId },
+    );
+  }
+  return deepFreeze({
+    schemaVersion: "dolly.commit-effect-retirement/1" as const,
+    moduleJobId: ticket.moduleJobId,
+    blockId: ticket.blockId,
+    digest: ticket.digest,
+  });
 }
 
 export class BlockStore {
   readonly #storeIdentity = {};
   readonly #records = new Map<string, Block>();
   readonly #commitEffects = new Map<string, BlockCommitEffect>();
+  readonly #retirementTickets = new Map<string, BlockCommitEffectRetirementTicket>();
   readonly #nextBlockId: () => string;
   readonly #now: () => string;
   readonly #media?: MediaReferenceResolver;
@@ -370,8 +413,43 @@ export class BlockStore {
           digest: effect.digest,
           record: effect.record,
           strongReferenceHeld: effect.strongReferenceHeld,
-          owner: effect.owner,
         });
+  }
+
+  inspectCommitEffectRetirementTicket(
+    effectId: string,
+  ): BlockCommitEffectRetirementTicketSnapshot | null {
+    if (!ID_PATTERN.test(effectId)) {
+      throw new BlockStoreError("BLOCK_ID_INVALID", "effectId is not a valid identifier");
+    }
+    this.flushPersistence();
+    const ticket = this.#retirementTickets.get(effectId);
+    return ticket === undefined
+      ? null
+      : deepFreeze({
+          effectId,
+          schemaVersion: ticket.schemaVersion,
+          moduleJobId: ticket.moduleJobId,
+          blockId: ticket.blockId,
+          digest: ticket.digest,
+        });
+  }
+
+  listCommitEffectRetirementTickets(): readonly BlockCommitEffectRetirementTicketSnapshot[] {
+    this.flushPersistence();
+    return deepFreeze(
+      [...this.#retirementTickets.entries()]
+        .map(([effectId, ticket]) => ({
+          effectId,
+          schemaVersion: ticket.schemaVersion,
+          moduleJobId: ticket.moduleJobId,
+          blockId: ticket.blockId,
+          digest: ticket.digest,
+        }))
+        .sort((left, right) =>
+          left.effectId < right.effectId ? -1 : left.effectId > right.effectId ? 1 : 0,
+        ),
+    );
   }
 
   setMutationObserver(observer: (() => void) | undefined): void {
@@ -398,16 +476,27 @@ export class BlockStore {
         digest: effect.digest,
         record: effect.record,
         strongReferenceHeld: effect.strongReferenceHeld,
-        ...(effect.owner === undefined ? {} : { owner: effect.owner }),
+      }))
+      .sort((left, right) =>
+        left.effectId < right.effectId ? -1 : left.effectId > right.effectId ? 1 : 0,
+      );
+    const retirementTickets = [...this.#retirementTickets.entries()]
+      .map(([effectId, ticket]) => ({
+        effectId,
+        schemaVersion: ticket.schemaVersion,
+        moduleJobId: ticket.moduleJobId,
+        blockId: ticket.blockId,
+        digest: ticket.digest,
       }))
       .sort((left, right) =>
         left.effectId < right.effectId ? -1 : left.effectId > right.effectId ? 1 : 0,
       );
     return deepFreeze({
-      schemaVersion: "dolly.block-store/4" as const,
+      schemaVersion: "dolly.block-store/5" as const,
       nextSequence: this.#nextSequence.toString(10),
       records,
       commitEffects,
+      retirementTickets,
     });
   }
 
@@ -500,12 +589,10 @@ export class BlockStore {
     effectId: string,
     proposalInput: BlockProposal,
     sourceInput: SourceIdentity,
-    owner?: string,
   ): Block {
     if (!ID_PATTERN.test(effectId)) {
       throw new BlockStoreError("BLOCK_ID_INVALID", "effectId is not a valid identifier");
     }
-    const normalizedOwner = normalizeEffectOwner(owner);
     const input = this.normalizeInput(proposalInput, sourceInput);
     const digest = canonicalJsonDigest(input);
     const existing = this.#commitEffects.get(effectId);
@@ -517,19 +604,21 @@ export class BlockStore {
           { effectId },
         );
       }
-      // A matching digest is the idempotency key; the owner only authorizes
-      // later retirement. A concurrent committer may have created the same
-      // effect without an owner, so a caller that supplies an owner upgrades
-      // an ownerless effect to owned rather than conflicting. An effect that
-      // already has a different owner is left untouched, since its retirement
-      // is governed by that owner.
-      if (normalizedOwner !== undefined && existing.owner === undefined) {
-        existing.owner = normalizedOwner;
-        this.#persistMutation();
-      } else {
-        this.flushPersistence();
-      }
+      this.flushPersistence();
       return existing.record;
+    }
+    const ticket = this.#retirementTickets.get(effectId);
+    if (ticket !== undefined) {
+      // A durable retirement ticket means the Module-result protocol already
+      // moved this effect past the commit phase. Never mint a replacement
+      // Block: either the effect tombstone still exists and its digest must
+      // match (handled above), or retirement is in flight and this identity
+      // is finished forever.
+      throw new BlockStoreError(
+        "BLOCK_EFFECT_CONFLICT",
+        `Block effect ${effectId} is being retired and cannot be re-committed`,
+        { effectId },
+      );
     }
 
     const record = this.#commitValidated(input);
@@ -544,7 +633,6 @@ export class BlockStore {
       digest,
       record,
       strongReferenceHeld: true,
-      owner: normalizedOwner,
     });
     this.#persistMutation();
     return record;
@@ -572,35 +660,28 @@ export class BlockStore {
   }
 
   /**
-   * Forgets one owned Block commit-effect tombstone after Core has durably
-   * retired the Module-result that created it. This is the terminal cleanup
-   * step for the result-journal lifecycle: the strong reference must already
-   * have been released (`releaseCommitEffect`) and Core retirement must be
-   * confirmed by the caller. The `owner` must match the durable owner
-   * recorded when the effect was committed, so a foreign, legacy, or
-   * ownerless effect is never eligible and its replay-conflict tombstone is
-   * preserved. Absence is treated as already retired only when the caller's
-   * owner is valid; a malformed owner is rejected before any lookup.
+   * Writes the durable retirement ticket for one Module-result effect Id
+   * before any effect removal or journal delete. The ticket must bind the
+   * exact moduleJobId, Block, and input digest to the existing effect; only
+   * the coordinator, which derives these values from its durable journal and
+   * Claim, can stage an authentic ticket. The mutation is persisted by the
+   * Core mutation observer, so a crash at any later point leaves the ticket
+   * in place for recovery.
    */
-  retireCommitEffect(effectId: string, owner: string): "retired" | "absent" {
+  stageCommitEffectRetirement(
+    effectId: string,
+    ticket: BlockCommitEffectRetirementTicket,
+  ): void {
     if (!ID_PATTERN.test(effectId)) {
       throw new BlockStoreError("BLOCK_ID_INVALID", "effectId is not a valid identifier");
     }
-    const normalizedOwner = normalizeEffectOwner(owner);
-    if (normalizedOwner === undefined) {
-      throw new BlockStoreError(
-        "BLOCK_EFFECT_CONFLICT",
-        "Block effect retirement requires a durable owner",
-        { effectId },
-      );
-    }
+    const normalized = normalizeRetirementTicket(ticket, effectId);
     this.flushPersistence();
     const effect = this.#commitEffects.get(effectId);
-    if (effect === undefined) return "absent";
-    if (effect.owner !== normalizedOwner) {
+    if (effect === undefined) {
       throw new BlockStoreError(
         "BLOCK_EFFECT_CONFLICT",
-        `Block effect ${effectId} is not owned by the retirement caller`,
+        `Block effect ${effectId} is not committed and cannot be retired`,
         { effectId },
       );
     }
@@ -611,9 +692,86 @@ export class BlockStore {
         { effectId },
       );
     }
+    if (normalized.blockId !== effect.record.id) {
+      throw new BlockStoreError(
+        "BLOCK_EFFECT_CONFLICT",
+        `Block effect ${effectId} does not match its retirement ticket Block`,
+        { effectId },
+      );
+    }
+    const input = {
+      proposal: {
+        ...(effect.record.summary === undefined ? {} : { summary: effect.record.summary }),
+        payload: effect.record.payload,
+      },
+      source: effect.record.source,
+    };
+    if (canonicalJsonDigest(input) !== normalized.digest) {
+      throw new BlockStoreError(
+        "BLOCK_EFFECT_CONFLICT",
+        `Block effect ${effectId} does not match its retirement ticket digest`,
+        { effectId },
+      );
+    }
+    this.#retirementTickets.set(effectId, normalized);
+    this.#persistMutation();
+  }
+
+  /**
+   * Removes the retired effect tombstone after a durable ticket was staged.
+   * The ticket is intentionally retained so a crash before the journal delete
+   * leaves an authentic, recoverable marker rather than an unexplained
+   * missing effect. Absence is treated as already retired only while the
+   * matching ticket is present; without a ticket this is always a conflict,
+   * because a foreign/legacy effect is never eligible for retirement.
+   */
+  retireCommitEffect(effectId: string): "retired" | "absent" {
+    if (!ID_PATTERN.test(effectId)) {
+      throw new BlockStoreError("BLOCK_ID_INVALID", "effectId is not a valid identifier");
+    }
+    this.flushPersistence();
+    const ticket = this.#retirementTickets.get(effectId);
+    if (ticket === undefined) {
+      throw new BlockStoreError(
+        "BLOCK_EFFECT_CONFLICT",
+        `Block effect ${effectId} is not eligible for retirement without a durable ticket`,
+        { effectId },
+      );
+    }
+    const effect = this.#commitEffects.get(effectId);
+    if (effect === undefined) return "absent";
+    if (effect.strongReferenceHeld) {
+      throw new BlockStoreError(
+        "BLOCK_EFFECT_CONFLICT",
+        `Block effect ${effectId} still holds its strong reference`,
+        { effectId },
+      );
+    }
+    if (ticket.blockId !== effect.record.id) {
+      throw new BlockStoreError(
+        "BLOCK_EFFECT_CONFLICT",
+        `Block effect ${effectId} does not match its retirement ticket Block`,
+        { effectId },
+      );
+    }
     this.#commitEffects.delete(effectId);
     this.#persistMutation();
     return "retired";
+  }
+
+  /**
+   * Removes the durable retirement ticket after the separate result-journal
+   * delete has succeeded. The ticket is the only residue that may be dropped
+   * at this point: recovery re-enters retirement while it is present.
+   */
+  clearCommitEffectRetirementTicket(effectId: string): "cleared" | "absent" {
+    if (!ID_PATTERN.test(effectId)) {
+      throw new BlockStoreError("BLOCK_ID_INVALID", "effectId is not a valid identifier");
+    }
+    this.flushPersistence();
+    if (!this.#retirementTickets.delete(effectId)) return "absent";
+    this.#persistMutation();
+    return "cleared";
   }
 
   #commitValidated(input: ValidatedBlockInput): Block {
@@ -734,14 +892,18 @@ export class BlockStore {
         snapshot === null ||
         typeof snapshot !== "object" ||
         (snapshot.schemaVersion !== "dolly.block-store/3" &&
-          snapshot.schemaVersion !== "dolly.block-store/4") ||
+          snapshot.schemaVersion !== "dolly.block-store/5") ||
         !/^[1-9][0-9]*$/.test(snapshot.nextSequence) ||
         !Array.isArray(snapshot.records) ||
-        !Array.isArray(snapshot.commitEffects)
+        !Array.isArray(snapshot.commitEffects) ||
+        (snapshot.schemaVersion === "dolly.block-store/5" &&
+          !Array.isArray(snapshot.retirementTickets))
       ) {
         throw new BlockStoreError("BLOCK_SNAPSHOT_INVALID", "BlockStore snapshot schema is invalid");
       }
-      const isVersion4 = snapshot.schemaVersion === "dolly.block-store/4";
+      const shouldRestoreTickets =
+        snapshot.schemaVersion === "dolly.block-store/5" &&
+        Array.isArray(snapshot.retirementTickets);
       const nextSequence = BigInt(snapshot.nextSequence);
       const recordIds = new Set<string>();
       const recordSequences = new Set<string>();
@@ -807,15 +969,8 @@ export class BlockStore {
 
       const effectIds = new Set<string>();
       for (const candidate of snapshot.commitEffects) {
-        const effectKeys = isVersion4
-          ? ["effectId", "digest", "record", "strongReferenceHeld", "owner"]
-          : ["effectId", "digest", "record", "strongReferenceHeld"];
+        const effectKeys = ["effectId", "digest", "record", "strongReferenceHeld"];
         assertClosedObject(candidate, effectKeys, "commitEffect");
-        const owner = isVersion4
-          ? normalizeEffectOwner(
-              typeof candidate.owner === "string" ? candidate.owner : undefined,
-            )
-          : undefined;
         if (
           typeof candidate.effectId !== "string" ||
           !ID_PATTERN.test(candidate.effectId) ||
@@ -883,8 +1038,27 @@ export class BlockStore {
           digest: candidate.digest,
           record,
           strongReferenceHeld: candidate.strongReferenceHeld,
-          owner,
         });
+      }
+
+      const ticketIds = new Set<string>();
+      for (const candidate of snapshot.retirementTickets ?? []) {
+        const keys = ["effectId", "schemaVersion", "moduleJobId", "blockId", "digest"];
+        assertClosedObject(candidate, keys, "retirementTicket");
+        const { effectId: candidateEffectId, ...ticketFields } = candidate;
+        const ticket = normalizeRetirementTicket(ticketFields, candidateEffectId as string);
+        if (
+          typeof candidate.effectId !== "string" ||
+          !ID_PATTERN.test(candidate.effectId) ||
+          ticketIds.has(candidate.effectId)
+        ) {
+          throw new BlockStoreError(
+            "BLOCK_SNAPSHOT_INVALID",
+            "BlockStore retirement ticket identity is invalid",
+          );
+        }
+        ticketIds.add(candidate.effectId);
+        this.#retirementTickets.set(candidate.effectId as string, ticket);
       }
 
       const referenceGraph = this.referenceGraph.snapshot();

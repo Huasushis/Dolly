@@ -33,9 +33,6 @@ function moduleResultBlockEffectId(moduleJobId: string): string {
   return canonicalJsonDigest(["module-result-commit-block", moduleJobId]);
 }
 
-/** The durable owner token the Module-result commit protocol attaches. */
-const moduleResultOwner = "module-result-commit";
-
 interface StoreHarness {
   readonly blocks: BlockStore;
   nextId(): string;
@@ -65,7 +62,7 @@ function restoreFrom(blocks: BlockStore): BlockStore {
 }
 
 describe("CORE-005 Module-result Block commit-effect retirement (RED)", () => {
-  it("forgets an owned released Module-result Block effect tombstone through the retire operation", () => {
+  it("retires a released Module-result Block effect tombstone after staging a durable ticket", () => {
     const harness = createStore();
     const blocks = harness.blocks;
 
@@ -75,7 +72,8 @@ describe("CORE-005 Module-result Block commit-effect retirement (RED)", () => {
     expect(blocks.size).toBe(1);
 
     const moduleEffectId = moduleResultBlockEffectId("module-job-1");
-    blocks.commitOnce(moduleEffectId, proposal("module output"), moduleSource, moduleResultOwner);
+    const moduleJobId = "moduleJobId-1";
+    blocks.commitOnce(moduleEffectId, proposal("module output"), moduleSource);
     expect(blocks.size).toBe(2);
     expect(blocks.inspectCommitEffect(moduleEffectId)).toMatchObject({
       strongReferenceHeld: true,
@@ -87,47 +85,104 @@ describe("CORE-005 Module-result Block commit-effect retirement (RED)", () => {
     blocks.collectUnreachable();
     expect(blocks.size).toBe(0);
 
-    // After the reference is released and Core retirement is durably
-    // confirmed, the owned retire operation removes only this exact
-    // Module-result commit-effect tombstone. The tombstone must no longer be
-    // retained and must not survive a snapshot reopen.
-    expect(blocks.retireCommitEffect(moduleEffectId, moduleResultOwner)).toBe("retired");
+    // The coordinator stages a durable ticket binding the exact job, Block,
+    // and digest, then retires the effect. The ticket survives the removal so
+    // a crash before the journal delete is distinguishable from corruption.
+    const blockId = blocks.inspectCommitEffect(moduleEffectId)!.record.id;
+    blocks.stageCommitEffectRetirement(moduleEffectId, {
+      schemaVersion: "dolly.commit-effect-retirement/1",
+      moduleJobId: moduleJobId,
+      blockId,
+      digest: canonicalJsonDigest({
+        proposal: proposal("module output"),
+        source: moduleSource,
+      }),
+    });
+    expect(blocks.retireCommitEffect(moduleEffectId)).toBe("retired");
     expect(blocks.inspectCommitEffect(moduleEffectId)).toBeNull();
+    // The ticket is retained (not cleared) so restart recovery can finish the
+    // separate journal delete without wedging.
+    expect(
+      blocks.inspectCommitEffectRetirementTicket(moduleEffectId),
+    ).toMatchObject({ moduleJobId, blockId });
+
+    // Reopen: the retired tombstone stays gone and the ticket survives as the
+    // recovery anchor for the not-yet-deleted journal record.
     const reopened = restoreFrom(blocks);
     expect(reopened.inspectCommitEffect(moduleEffectId)).toBeNull();
+    expect(
+      reopened.inspectCommitEffectRetirementTicket(moduleEffectId),
+    ).toMatchObject({ moduleJobId, blockId });
+
+    // The coordinator clears the ticket only after the journal delete
+    // succeeds. Clearing is the last residue to drop.
+    expect(reopened.clearCommitEffectRetirementTicket(moduleEffectId)).toBe("cleared");
+    expect(reopened.inspectCommitEffectRetirementTicket(moduleEffectId)).toBeNull();
   });
 
-  it("rejects retiring an effect that still holds its strong reference", () => {
+  it("rejects staging a retirement ticket while the effect holds its strong reference", () => {
     const harness = createStore();
     const blocks = harness.blocks;
     const moduleEffectId = moduleResultBlockEffectId("module-job-2");
-    blocks.commitOnce(moduleEffectId, proposal("module output"), moduleSource, moduleResultOwner);
+    blocks.commitOnce(moduleEffectId, proposal("module output"), moduleSource);
 
+    const { record } = blocks.inspectCommitEffect(moduleEffectId)!;
     expect(() =>
-      blocks.retireCommitEffect(moduleEffectId, moduleResultOwner),
+      blocks.stageCommitEffectRetirement(moduleEffectId, {
+        schemaVersion: "dolly.commit-effect-retirement/1",
+        moduleJobId: "moduleJobId-2",
+        blockId: record.id,
+        digest: canonicalJsonDigest({
+          proposal: proposal("module output"),
+          source: moduleSource,
+        }),
+      }),
     ).toThrowError(
       expect.objectContaining({ code: "BLOCK_EFFECT_CONFLICT" }),
     );
-    // The tombstone is preserved because retirement was rejected.
     expect(blocks.inspectCommitEffect(moduleEffectId)).not.toBeNull();
   });
 
-  it("rejects retiring an owned effect with the wrong owner", () => {
+  it("rejects a retirement ticket that binds the wrong Block or digest", () => {
     const harness = createStore();
     const blocks = harness.blocks;
     const moduleEffectId = moduleResultBlockEffectId("module-job-3");
-    blocks.commitOnce(moduleEffectId, proposal("module output"), moduleSource, moduleResultOwner);
+    blocks.commitOnce(moduleEffectId, proposal("module output"), moduleSource);
     blocks.releaseCommitEffect(moduleEffectId);
+    const { record } = blocks.inspectCommitEffect(moduleEffectId)!;
 
+    // A ticket that disagrees with the exact effect identity is forged or
+    // corrupted and must be rejected before any retirement.
     expect(() =>
-      blocks.retireCommitEffect(moduleEffectId, "wrong-owner"),
+      blocks.stageCommitEffectRetirement(moduleEffectId, {
+        schemaVersion: "dolly.commit-effect-retirement/1",
+        moduleJobId: "moduleJobId-3",
+        blockId: "block-some-other-block",
+        digest: canonicalJsonDigest({
+          proposal: proposal("module output"),
+          source: moduleSource,
+        }),
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "BLOCK_EFFECT_CONFLICT" }),
+    );
+    expect(() =>
+      blocks.stageCommitEffectRetirement(moduleEffectId, {
+        schemaVersion: "dolly.commit-effect-retirement/1",
+        moduleJobId: "moduleJobId-3",
+        blockId: record.id,
+        digest: canonicalJsonDigest({
+          proposal: proposal("different output"),
+          source: moduleSource,
+        }),
+      }),
     ).toThrowError(
       expect.objectContaining({ code: "BLOCK_EFFECT_CONFLICT" }),
     );
     expect(blocks.inspectCommitEffect(moduleEffectId)).not.toBeNull();
   });
 
-  it("does not make a foreign SourceActivation/raw Block effect eligible for owned retirement", () => {
+  it("does not make a foreign SourceActivation/raw Block effect eligible for retirement without a matching durable ticket", () => {
     const harness = createStore();
     const blocks = harness.blocks;
 
@@ -137,42 +192,81 @@ describe("CORE-005 Module-result Block commit-effect retirement (RED)", () => {
     blocks.commitOnce(foreignEffectId, proposal("foreign"), moduleSource);
     blocks.releaseCommitEffect(foreignEffectId);
 
-    // A foreign/SourceActivation/raw effect has no durable owner and must not
-    // be eligible for the owned retirement path. The retire operation must
-    // reject it outright so that SourceActivation retention and raw
-    // replay-conflict guarantees are not weakened.
+    // No Module-result record ever stages a ticket for a foreign effect, and
+    // retirement without the coordinator's durable ticket is a hard conflict.
     expect(() =>
-      blocks.retireCommitEffect(foreignEffectId, moduleResultOwner),
+      blocks.retireCommitEffect(foreignEffectId),
     ).toThrowError(
       expect.objectContaining({ code: "BLOCK_EFFECT_CONFLICT" }),
     );
+    expect(
+      blocks.inspectCommitEffectRetirementTicket(foreignEffectId),
+    ).toBeNull();
 
-    // The foreign effect tombstone must remain intact (preserved, not
-    // reinterpreted as owned/forgettable) across reopen.
+    // The foreign effect tombstone must remain intact across reopen, and a
+    // legacy v3 snapshot (which carries no ticket metadata) must also keep
+    // its effect non-retireable.
     const reopened = restoreFrom(blocks);
     expect(reopened.inspectCommitEffect(foreignEffectId)).not.toBeNull();
   });
 
-  it("preserves a legacy v3 snapshot effect as ownerless and not retireable", () => {
+  it("preserves a legacy v3 snapshot effect without tickets as not retireable", () => {
     const harness = createStore();
     const blocks = harness.blocks;
     const legacyEffectId = "legacy-effect-1";
     blocks.commitOnce(legacyEffectId, proposal("legacy"), moduleSource);
     blocks.releaseCommitEffect(legacyEffectId);
 
-    // A legacy v3 snapshot carries no owner metadata. Restoring it must keep
-    // the effect ownerless, so the owned retire path rejects it.
+    // A v3 legacy snapshot carries no retirement ticket metadata. Restoring
+    // it must keep the effect intact and non-retireable.
     const legacySnapshot = structuredClone(blocks.snapshot()) as BlockStoreSnapshot;
     const reopened = restore(legacySnapshot, new ReferenceGraph({
       snapshot: structuredClone(blocks.referenceGraph.snapshot()),
     }));
     expect(reopened.inspectCommitEffect(legacyEffectId)).not.toBeNull();
     expect(() =>
-      reopened.retireCommitEffect(legacyEffectId, moduleResultOwner),
+      reopened.retireCommitEffect(legacyEffectId),
     ).toThrowError(
       expect.objectContaining({ code: "BLOCK_EFFECT_CONFLICT" }),
     );
     expect(reopened.inspectCommitEffect(legacyEffectId)).not.toBeNull();
+  });
+
+  it("forbids re-committing a retired effect while its ticket is staged", () => {
+    const harness = createStore();
+    const blocks = harness.blocks;
+    const moduleEffectId = moduleResultBlockEffectId("module-job-4");
+    const moduleJobId = "moduleJobId-4";
+    blocks.commitOnce(moduleEffectId, proposal("module output"), moduleSource);
+    blocks.releaseCommitEffect(moduleEffectId);
+    const { record } = blocks.inspectCommitEffect(moduleEffectId)!;
+    blocks.stageCommitEffectRetirement(moduleEffectId, {
+      schemaVersion: "dolly.commit-effect-retirement/1",
+      moduleJobId,
+      blockId: record.id,
+      digest: canonicalJsonDigest({
+        proposal: proposal("module output"),
+        source: moduleSource,
+      }),
+    });
+    blocks.retireCommitEffect(moduleEffectId);
+    expect(blocks.inspectCommitEffect(moduleEffectId)).toBeNull();
+    expect(
+      blocks.inspectCommitEffectRetirementTicket(moduleEffectId),
+    ).not.toBeNull();
+
+    // Replaying the commit during in-flight retirement (effect tombstone
+    // gone, journal delete pending, ticket present) must not silently mint a
+    // replacement Block nor clear the ticket.
+    expect(() =>
+      blocks.commitOnce(moduleEffectId, proposal("module output"), moduleSource),
+    ).toThrowError(
+      expect.objectContaining({ code: "BLOCK_EFFECT_CONFLICT" }),
+    );
+    expect(blocks.inspectCommitEffect(moduleEffectId)).toBeNull();
+    expect(
+      blocks.inspectCommitEffectRetirementTicket(moduleEffectId),
+    ).not.toBeNull();
   });
 });
 
@@ -351,6 +445,147 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
 
       expect(reopened.blocks.inspectCommitEffect(effectId)).toBeNull();
       expect(reopenedRepository.get(claim.moduleJobId)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("finishes a journal delete interrupted between the Block retirement and the journal delete on recovery", async () => {
+    const root = mkdtempSync(join(tmpdir(), "artifact-module-result-retire-crash-"));
+    try {
+      const statePath = join(root, "core-state.json");
+      const journalPath = join(root, "module-result-commits.json");
+      let blockId = 0;
+      let deliveryId = 0;
+      const core = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      setupOutput(core);
+      const claim = setupWorker(core, "worker", "input");
+      const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      const commits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes });
+      await commits.commit({
+        moduleJobId: claim.moduleJobId,
+        claimToken: claim.claimToken,
+        runId: claim.runId,
+        attempt: claim.attempt,
+        moduleGenerationId: claim.moduleGenerationId,
+        source: moduleSource,
+        outputPageIds: ["output"],
+        blockProposal: proposal("first"),
+      });
+      const record = repository.get(claim.moduleJobId)!;
+      const effectId = moduleResultBlockEffectId(claim.moduleJobId);
+
+      // Simulate the crash window: retire the effect by staging and applying
+      // its durable ticket, but keep the committed journal record (the delete
+      // that would follow never ran).
+      const operations = core.createModuleResultCommitOperations(mailboxes);
+      operations.blocks.stageCommitEffectRetirement(effectId, {
+        schemaVersion: "dolly.commit-effect-retirement/1",
+        moduleJobId: claim.moduleJobId,
+        blockId: record.blockId!,
+        digest: canonicalJsonDigest({
+          proposal: record.blockProposal,
+          source: record.source,
+        }),
+      });
+      operations.blocks.retireCommitEffect(effectId);
+      expect(core.blocks.inspectCommitEffect(effectId)).toBeNull();
+      expect(operations.blocks.inspectCommitEffectRetirementTicket(effectId)).not.toBeNull();
+      expect(repository.get(claim.moduleJobId)?.state).toBe("committed");
+
+      // Reopen Core and journal: the committed record and the durable ticket
+      // both survive. recoverAll must finish the journal delete and then clear
+      // the ticket, with no conflict.
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      const reopenedRepository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      const reopenedOperations = reopened.createModuleResultCommitOperations(mailboxes);
+      expect(reopenedOperations.blocks.inspectCommitEffectRetirementTicket(effectId)).not.toBeNull();
+      expect(reopenedRepository.get(claim.moduleJobId)?.state).toBe("committed");
+
+      const recovering = createModuleResultCommitCoordinator({ core: reopened, repository: reopenedRepository, now: () => NOW, mailboxes });
+      await recovering.recoverAll();
+
+      expect(reopened.blocks.inspectCommitEffect(effectId)).toBeNull();
+      expect(reopenedOperations.blocks.inspectCommitEffectRetirementTicket(effectId)).toBeNull();
+      expect(reopenedRepository.get(claim.moduleJobId)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("still reports a conflict when a committed journal's Block effect is absent without its durable ticket", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dolly-cleanup-conflict-"));
+    try {
+      const statePath = join(root, "core-state.json");
+      const journalPath = join(root, "module-result-commits.json");
+      let blockId = 0;
+      let deliveryId = 0;
+      const core = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      setupOutput(core);
+      const claim = setupWorker(core, "worker", "input");
+      const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      const commits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes });
+      await commits.commit({
+        moduleJobId: claim.moduleJobId,
+        claimToken: claim.claimToken,
+        runId: claim.runId,
+        attempt: claim.attempt,
+        moduleGenerationId: claim.moduleGenerationId,
+        source: moduleSource,
+        outputPageIds: ["output"],
+        blockProposal: proposal("first"),
+      });
+      const record = repository.get(claim.moduleJobId)!;
+      const effectId = moduleResultBlockEffectId(claim.moduleJobId);
+      const operations = core.createModuleResultCommitOperations(mailboxes);
+      operations.blocks.stageCommitEffectRetirement(effectId, {
+        schemaVersion: "dolly.commit-effect-retirement/1",
+        moduleJobId: claim.moduleJobId,
+        blockId: record.blockId!,
+        digest: canonicalJsonDigest({
+          proposal: record.blockProposal,
+          source: record.source,
+        }),
+      });
+      operations.blocks.retireCommitEffect(effectId);
+      // Drop the ticket without deleting the journal: exactly the corruption
+      // that a missing-ticket absence must reject.
+      operations.blocks.clearCommitEffectRetirementTicket(effectId);
+      expect(core.blocks.inspectCommitEffect(effectId)).toBeNull();
+      expect(operations.blocks.inspectCommitEffectRetirementTicket(effectId)).toBeNull();
+      expect(repository.get(claim.moduleJobId)?.state).toBe("committed");
+
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      const reopenedRepository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      const recovering = createModuleResultCommitCoordinator({ core: reopened, repository: reopenedRepository, now: () => NOW, mailboxes });
+      await expect(recovering.recoverAll()).rejects.toMatchObject({
+        name: "ModuleResultCommitError",
+        code: "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+      });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

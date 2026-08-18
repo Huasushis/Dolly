@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type BlockProposal } from "../../../src/core/block-store.js";
 import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
+import type { DeliveryMailboxCapacity } from "../../../src/core/delivery-store.js";
 import {
   CoreStartupRecovery,
   moduleProcessStopProofIdentityDigest,
@@ -84,13 +85,11 @@ function coordinator(
   core: FileCoreStateStore,
   repository: FileModuleResultCommitRepository,
   afterEffect?: ModuleResultCommitCoordinatorOptions["afterEffect"],
+  mailboxes: readonly DeliveryMailboxCapacity[] = [],
 ) {
+  const operations = core.createModuleResultCommitOperations(mailboxes);
   return new ModuleResultCommitCoordinator({
-    blocks: core.blocks,
-    deliveries: core.deliveries,
-    getModuleSubmissionRecord: (runId) =>
-      core.getModuleSubmissionRecord(runId),
-    acknowledgeDeliveryClaim: (identity) => core.acknowledgeDeliveryClaim(identity),
+    ...operations,
     repository,
     now: () => NOW,
     ...(afterEffect === undefined ? {} : { afterEffect }),
@@ -290,7 +289,12 @@ describe("CORE startup journal recovery", () => {
     const restartedRepository = new FileModuleResultCommitRepository({ path: journalPath });
     const recovery = new CoreStartupRecovery({
       deliveries: restarted.deliveries,
-      commits: coordinator(restarted, restartedRepository),
+      commits: coordinator(restarted, restartedRepository, undefined, [{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 10,
+        maxResidentBytes: 1024 * 1024,
+      }]),
       moduleRecords: restarted,
       stoppedRecordWriter: restartedStoppedRecordWriter,
       processStopProver: provenStopped,
@@ -340,7 +344,7 @@ describe("CORE startup journal recovery", () => {
     let captured: Buffer | undefined;
     let interrupted = false;
     await expect(coordinator(first, repository, (event) => {
-      if (event.phase === "after-delivery-effect" && !interrupted) {
+      if (event.phase === "after-block-effect" && !interrupted) {
         interrupted = true;
         captured = readFileSync(statePath);
         throw new Error("capture before terminal ack");

@@ -6,6 +6,7 @@ import {
   type JsonValue,
 } from "./canonical-json.js";
 import {
+  type BlockCommitEffectRetirementTicketSnapshot,
   type BlockProposal,
   type BlockStore,
   type SourceIdentity,
@@ -37,12 +38,13 @@ const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
  * separately and resumed idempotently after interruption.
  */
 /**
- * The durable owner token the Module-result commit protocol attaches to its
- * Block commit effect. Only an effect committed with this owner is eligible
- * for the owned retirement path; foreign, legacy, and ownerless effects keep
- * an undefined owner and are never retired.
+ * The durable retirement-ticket schema version staged by the Module-result
+ * commit protocol before it retires a Block commit effect. The ticket binds
+ * the exact job, Block, and digest so recovery can distinguish "retirement
+ * in progress" from corruption.
  */
-const MODULE_RESULT_COMMIT_BLOCK_OWNER = "module-result-commit";
+const MODULE_RESULT_COMMIT_RETIREMENT_SCHEMA_VERSION =
+  "dolly.commit-effect-retirement/1";
 
 export type ModuleResultCommitState = "prepared" | "committed";
 
@@ -635,11 +637,15 @@ export class InMemoryModuleResultCommitRepository
  */
 export type ModuleResultCommitBlockOperations = Pick<
   BlockStore,
+  | "clearCommitEffectRetirementTicket"
   | "commitOnce"
   | "inspectCommitEffect"
+  | "inspectCommitEffectRetirementTicket"
+  | "listCommitEffectRetirementTickets"
   | "normalizeInput"
   | "releaseCommitEffect"
   | "retireCommitEffect"
+  | "stageCommitEffectRetirement"
   | "validateInput"
   | "validateSource"
 >;
@@ -801,6 +807,16 @@ export class ModuleResultCommitCoordinator {
       } else if (record.state === "committed") {
         await this.#runExclusive(record.moduleJobId);
       }
+    }
+
+    // A crash between the journal delete and the ticket clear leaves an
+    // orphaned retirement ticket with no journal record. Sweep those now: a
+    // ticket whose moduleJobId has no journal record can only be post-delete
+    // residue, never an in-flight retirement (staging happens before any
+    // delete, so the record is always present until the delete succeeds).
+    for (const ticket of this.#blocks.listCommitEffectRetirementTickets()) {
+      if (this.#repository.get(ticket.moduleJobId) !== null) continue;
+      this.#blocks.clearCommitEffectRetirementTicket(ticket.effectId);
     }
 
     // A prepared result can be waiting for capacity that a later prepared
@@ -1237,8 +1253,15 @@ export class ModuleResultCommitCoordinator {
       proposal: record.blockProposal,
       source: record.source,
     });
+    const effectId = this.#blockEffectId(record.moduleJobId);
+    const retirementTicket =
+      record.blockId === undefined || blockEffect !== null
+        ? null
+        : this.#blocks.inspectCommitEffectRetirementTicket(effectId);
     if (
-      (record.blockId !== undefined && blockEffect === null) ||
+      (record.blockId !== undefined &&
+        blockEffect === null &&
+        !this.#ticketMatchesRecord(retirementTicket, record, expectedBlockEffectDigest)) ||
       (blockEffect !== null &&
         (blockEffect.digest !== expectedBlockEffectDigest ||
           (record.state === "prepared" && !blockEffect.strongReferenceHeld) ||
@@ -1268,7 +1291,7 @@ export class ModuleResultCommitCoordinator {
       }
       return;
     }
-    if (blockEffect === null) {
+    if (blockEffect === null && !this.#ticketMatchesRecord(retirementTicket, record, expectedBlockEffectDigest)) {
       throw new ModuleResultCommitError(
         "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
         `Module result ${record.moduleJobId} does not match its recorded Block effect`,
@@ -1419,8 +1442,22 @@ export class ModuleResultCommitCoordinator {
       const claimState = this.#validatePersistentState(record);
       if (claimState === "committed") {
         if (record.state === "committed") {
-          if (record.blockProposal !== undefined) {
-            this.#blocks.releaseCommitEffect(this.#blockEffectId(moduleJobId));
+          if (record.blockId !== undefined && record.blockProposal !== undefined) {
+            const effectId = this.#blockEffectId(moduleJobId);
+            const blockEffect = this.#blocks.inspectCommitEffect(effectId);
+            const ticket = this.#blocks.inspectCommitEffectRetirementTicket(effectId);
+            if (blockEffect === null && ticket !== null) {
+              // A crash between the durable effect retirement and the journal
+              // delete left the committed record legitimally anchored by the
+              // staged retirement ticket. Finish the exact cleanup now: the
+              // journal delete is revision-checked and the ticket clears only
+              // after it succeeds.
+              if (this.#repository.deleteIfRevision(moduleJobId, record.revision)) {
+                this.#blocks.clearCommitEffectRetirementTicket(effectId);
+              }
+              return record;
+            }
+            this.#blocks.releaseCommitEffect(effectId);
           }
           return record;
         }
@@ -1445,7 +1482,6 @@ export class ModuleResultCommitCoordinator {
             this.#blockEffectId(moduleJobId),
             record.blockProposal,
             record.source,
-            MODULE_RESULT_COMMIT_BLOCK_OWNER,
           );
           await this.#afterEffect?.({ phase: "after-block-effect", moduleJobId });
           const next = immutableRecord({
@@ -1528,18 +1564,19 @@ export class ModuleResultCommitCoordinator {
    * commit-effect tombstone. Retirement is exact and idempotent so a crash
    * between steps is safe to re-enter:
    *
-   *   1. Release the Block strong reference (idempotent; persists via the
-   *      BlockStore mutation observer into Core state, not the journal).
-   *   2. Retire the owned Block commit-effect tombstone (idempotent; rejects
-   *      foreign/ownerless effects; persists via Core state). The tombstone is
-   *      forgotten only after this durably succeeds.
-   *   3. Delete the journal record via a revision-checked delete. This is the
-   *      only step that writes the journal, and it shrinks it, so the
-   *      terminal cleanup never grows the journal past its capacity.
+   *   1. Stage a durable ticket binding the exact job, Block, and digest.
+   *      The ticket is written before the tombstone is destroyed.
+   *   2. Remove the result journal record via a revision-checked delete.
+   *      This is the only step that writes the journal, and it shrinks it,
+   *      so the terminal cleanup never grows the journal past its capacity.
+   *   3. Clear the ticket.
    *
-   * A crash after step 1 or 2 leaves the committed record, which restart
-   * re-enters here; both release and retire are idempotent. A crash after step
-   * 3 leaves no record, which is the terminal state.
+   * A crash after staging or retiring leaves the committed record and its
+   * ticket, which restart re-enters here; stage, release, and retire are
+   * idempotent. A crash with the retired effect gone but the journal record
+   * intact leaves a recognizable ticket: `#resume` finishes the journal
+   * delete then clears the ticket, so restart recovery never wedges and the
+   * journal's committed record never outlives its ticket.
    */
   #pruneVerifiedTerminalRecords(): number {
     let removed = 0;
@@ -1551,13 +1588,26 @@ export class ModuleResultCommitCoordinator {
       if (record.state !== "committed") continue;
       if (this.#validatePersistentState(record) !== "committed") continue;
       if (record.blockProposal !== undefined) {
-        this.#blocks.releaseCommitEffect(this.#blockEffectId(record.moduleJobId));
-        this.#blocks.retireCommitEffect(
-          this.#blockEffectId(record.moduleJobId),
-          MODULE_RESULT_COMMIT_BLOCK_OWNER,
-        );
+        const effectId = this.#blockEffectId(record.moduleJobId);
+        const blockEffect = this.#blocks.inspectCommitEffect(effectId);
+        if (blockEffect !== null) {
+          this.#blocks.stageCommitEffectRetirement(effectId, {
+            schemaVersion: MODULE_RESULT_COMMIT_RETIREMENT_SCHEMA_VERSION,
+            moduleJobId: record.moduleJobId,
+            blockId: record.blockId!,
+            digest: canonicalJsonDigest({
+              proposal: record.blockProposal,
+              source: record.source,
+            }),
+          });
+        }
+        this.#blocks.releaseCommitEffect(effectId);
+        this.#blocks.retireCommitEffect(effectId);
       }
       if (!this.#repository.deleteIfRevision(record.moduleJobId, record.revision)) continue;
+      if (record.blockProposal !== undefined) {
+        this.#blocks.clearCommitEffectRetirementTicket(this.#blockEffectId(record.moduleJobId));
+      }
       removed += 1;
     }
     return removed;
@@ -1684,6 +1734,19 @@ export class ModuleResultCommitCoordinator {
 
   #blockEffectId(moduleJobId: string): string {
     return canonicalJsonDigest(["module-result-commit-block", moduleJobId]);
+  }
+
+  #ticketMatchesRecord(
+    ticket: BlockCommitEffectRetirementTicketSnapshot | null,
+    record: ModuleResultCommitRecord,
+    expectedBlockEffectDigest: string,
+  ): boolean {
+    return (
+      ticket !== null &&
+      ticket.moduleJobId === record.moduleJobId &&
+      ticket.blockId === record.blockId &&
+      ticket.digest === expectedBlockEffectDigest
+    );
   }
 
   #deliveryEffectId(moduleJobId: string, pageId: string): string {

@@ -122,11 +122,14 @@ describe("Reactive Module runtime with a real Extension process", () => {
       const repository = new FileModuleResultCommitRepository({
         path: commitRepositoryPath,
       });
+      const commitsOperations = core.createModuleResultCommitOperations([{
+        consumerId: "sink",
+        pageIds: ["output"],
+        maxResidentCount: 10,
+        maxResidentBytes: 1024 * 1024,
+      }]);
       const commits = new ModuleResultCommitCoordinator({
-        blocks: core.blocks,
-        deliveries: core.deliveries,
-        acknowledgeDeliveryClaim: (identity) => core.acknowledgeDeliveryClaim(identity),
-        getModuleSubmissionRecord: (runId) => core.getModuleSubmissionRecord(runId),
+        ...commitsOperations,
         repository,
         now: () => NOW,
       });

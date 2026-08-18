@@ -69,12 +69,9 @@ describe("CORE startup reconciliation with Module records", () => {
   }
 
   function openCommits(store: FileCoreStateStore): ModuleResultCommitCoordinator {
+    const operations = store.createModuleResultCommitOperations();
     return new ModuleResultCommitCoordinator({
-      blocks: store.blocks,
-      deliveries: store.deliveries,
-      getModuleSubmissionRecord: (runId) =>
-        store.getModuleSubmissionRecord(runId),
-      acknowledgeDeliveryClaim: (identity) => store.acknowledgeDeliveryClaim(identity),
+      ...operations,
       repository: new FileModuleResultCommitRepository({ path: journalPath }),
       now: () => NOW,
     });

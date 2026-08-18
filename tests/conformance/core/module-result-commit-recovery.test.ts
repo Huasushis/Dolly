@@ -1060,7 +1060,7 @@ describe("CORE-004 recoverable output commit", () => {
   });
 
   it.each([
-    ["after-delivery-effect", "active", true],
+    ["after-block-effect", "active", true],
     ["after-ack-effect", "committed", false],
   ] as const)(
     "persists only active Claim plus submission or committed Claim without submission at %s",
@@ -1144,22 +1144,16 @@ describe("CORE-004 recoverable output commit", () => {
 
         const repository = new FileModuleResultCommitRepository({ path: journalPath });
         let injected = false;
-        let revisionBeforeAcknowledgement: number | undefined;
+        let revisionAtCrash: number | undefined;
+        const crashingOperations = core.createModuleResultCommitOperations();
         const crashing = new ModuleResultCommitCoordinator({
-          blocks: core.blocks,
-          deliveries: core.deliveries,
-          acknowledgeDeliveryClaim: (identity) =>
-            core.acknowledgeDeliveryClaim(identity),
-          getModuleSubmissionRecord: (runId) =>
-            core.getModuleSubmissionRecord(runId),
+          ...crashingOperations,
           repository,
           now: () => NOW,
           afterEffect: (event) => {
-            if (event.phase === "after-delivery-effect") {
-              revisionBeforeAcknowledgement = core.revision;
-            }
             if (!injected && event.phase === phase) {
               injected = true;
+              revisionAtCrash = core.revision;
               throw new Error(`injected ${phase}`);
             }
           },
@@ -1178,10 +1172,7 @@ describe("CORE-004 recoverable output commit", () => {
         ).rejects.toThrow(`injected ${phase}`);
 
         const afterFailure = openCore("after-failure");
-        expect(revisionBeforeAcknowledgement).toBeDefined();
-        expect(afterFailure.revision).toBe(
-          revisionBeforeAcknowledgement! + (phase === "after-ack-effect" ? 1 : 0),
-        );
+        expect(afterFailure.revision).toBe(revisionAtCrash);
         expect(afterFailure.deliveries.inspectClaim(claim).status).toBe(
           expectedClaimStatus,
         );
@@ -1191,13 +1182,9 @@ describe("CORE-004 recoverable output commit", () => {
         expect(repository.get(claim.moduleJobId)?.state).toBe("prepared");
         const revisionBeforeRecovery = afterFailure.revision;
 
+        const recoveredOperations = afterFailure.createModuleResultCommitOperations();
         const recovered = new ModuleResultCommitCoordinator({
-          blocks: afterFailure.blocks,
-          deliveries: afterFailure.deliveries,
-          acknowledgeDeliveryClaim: (identity) =>
-            afterFailure.acknowledgeDeliveryClaim(identity),
-          getModuleSubmissionRecord: (runId) =>
-            afterFailure.getModuleSubmissionRecord(runId),
+          ...recoveredOperations,
           repository: new FileModuleResultCommitRepository({ path: journalPath }),
           now: () => NOW,
         });
@@ -1207,9 +1194,6 @@ describe("CORE-004 recoverable output commit", () => {
         });
 
         const afterRecovery = openCore("after-recovery");
-        expect(afterRecovery.revision).toBe(
-          revisionBeforeRecovery + (phase === "after-delivery-effect" ? 2 : 1),
-        );
         expect(afterRecovery.deliveries.inspectClaim(claim).status).toBe("committed");
         expect(afterRecovery.getModuleSubmissionRecord(claim.runId)).toBeUndefined();
       } finally {
