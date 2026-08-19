@@ -12,6 +12,7 @@
 pub mod attestation;
 pub mod database;
 pub mod error;
+pub mod restore_identity;
 pub mod transaction;
 
 pub use attestation::{
@@ -22,4 +23,9 @@ pub use database::{
     ConnectionConfiguration, Database, SCHEMA_VERSION, probe_loaded_sqlite, required,
 };
 pub use error::{StorageError, StorageResult};
+pub use restore_identity::{
+    MAX_SAFE_JSON_INTEGER, RestoreIdentityAuditEvent, RestoreIdentityBackupEntry,
+    RestoreIdentityMode, RestoreIdentityModesPlan, RestoreIdentityPlannerError,
+    RestoreIdentityPlannerErrorCode, evaluate_restore_identity_modes,
+};
 pub use transaction::CoreTransaction;
