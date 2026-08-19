@@ -16,23 +16,37 @@
  *
  * After a successful handshake the generation stays alive (stdin is not
  * closed) and the host may send exactly one post-handshake request at a time.
- * `ping()` sends a `ping` with the next monotonic id (2 on first call),
- * requires an exact-correlated closed result, and quarantines on any protocol
- * violation, timeout, or child exit during the request.
+ * `prepare()` then issues `tools/list` discovery (spec section 3) with the
+ * next monotonic id, verifies the closed configured map against it, and pins
+ * the catalog before reaching Ready. `ping()` sends a `ping` with the next
+ * monotonic id after discovery, requires an exact-correlated closed result,
+ * and quarantines on any protocol violation, timeout, or child exit during
+ * the request.
  */
 
 import type { ChildProcess } from "node:child_process";
 import {
   CLIENT_INFO,
   MCP_PROTOCOL_VERSION,
+  TOOL_CATALOG_SCHEMA,
+  UPSTREAM_NAME_PATTERN,
   type AdaptedToolBrokerServer,
+  type ConfiguredTool,
+  type PinnedToolCatalog,
   type PrepareResult,
-  type StdioTransportConfig,
   type ToolBrokerErrorCode,
   type ToolBrokerServerConfig,
   type ToolBrokerServerState,
+  type ToolCatalogContext,
+  type StdioTransportConfig,
 } from "./types.js";
-import { deepFreeze, isJsonObject, type JsonValue } from "../canonical-json.js";
+import {
+  deepFreeze,
+  isJsonObject,
+  canonicalJsonDigest,
+  cloneJson,
+  type JsonValue,
+} from "../canonical-json.js";
 import { createStdioReader, createStdioWriter, StdioReadError, type StdioMessageReader, type StdioMessageWriter } from "./stdio-transport.js";
 
 /** Bounded wall-clock wait for SIGTERM before escalating to SIGKILL, in ms. */
@@ -50,6 +64,16 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
  * copied, or spread result can never project generation authority.
  */
 const MINTED_PREPARE_RESULTS = new WeakSet<object>();
+/** Module-private identity store of every pinned catalog produced by
+ * `prepare()`. `prepare()` is the sole producer of catalogs;
+ * `pinnedToolCatalog` and `matchToolCatalog` require the exact minted object
+ * so a forged or copied catalog can never authorize use. */
+const MINTED_CATALOGS = new WeakSet<object>();
+
+/** Upper bound on discovered tool entries. Discovery is bounded like the
+ * closed configured map (both capped to the schema's `maxProperties`),
+ * so an oversized catalog rejects the candidate (spec section 3). */
+const MAX_DISCOVERED_TOOLS = 4096;
 
 /**
  * Registers a `PrepareResult` in the identity store and returns it. The result
@@ -170,6 +194,7 @@ export class ToolBrokerSession {
   #stopped = false;
   #prepareSettled = false;
   #prepareResult: PrepareResult | undefined;
+  #catalog: PinnedToolCatalog | undefined;
   #childExitObserved = false;
 
   constructor(
@@ -254,6 +279,27 @@ export class ToolBrokerSession {
       };
       this.#writer.write(initializedNotification);
 
+      // Discovery and contract pinning (spec section 3), issued during
+      // prepare, after the handshake and before Ready. The correlated
+      // tools/list response is verification input only: it can never add,
+      // rename, relax, rotate, or replay a configured tool. Any missing
+      // upstream, schema-digest mismatch, duplicate, or malformed content
+      // rejects the candidate with `TOOL_CONFIG_INVALID` and the generation
+      // is quarantined — state never reaches Ready.
+      const discoveryId = this.#nextRequestId;
+      this.#writer.write({ jsonrpc: "2.0", id: discoveryId, method: "tools/list" } as JsonValue);
+      // Discovery consumed the next request id; the following post-handshake
+      // request id is one higher.
+      this.#nextRequestId += 1;
+      const discoveryResult = await this.#readCorrelatedResponse(
+        discoveryId,
+        this.#config.startupTimeoutMs,
+        "TOOL_BROKER_STARTUP_TIMEOUT",
+        "tools/list",
+      );
+      const catalog = this.#pinConfiguredCatalog(discoveryResult);
+      this.#catalog = catalog;
+
       this.#state = "Ready";
       // Observe the child only from this point: a termination after a Ready
       // generation with no request in flight must not leave the state Ready
@@ -269,6 +315,7 @@ export class ToolBrokerSession {
         state: "Ready",
         toolServerId: this.#config.serverId,
         toolServerGeneration: this.#generation,
+        catalog: this.#catalog,
       });
       return this.#prepareResult;
     } catch (error) {
@@ -366,7 +413,7 @@ export class ToolBrokerSession {
       this.#writer.write({ jsonrpc: "2.0", id: pingId, method: "ping" } as JsonValue);
       // One request in flight; the next post-handshake request id is n + 1.
       this.#nextRequestId += 1;
-      const result = await this.#readPingResponseOrTimeout(pingId);
+      const result = await this.#readCorrelatedResponse(pingId, this.#requestTimeoutMs, "TOOL_BROKER_REQUEST_TIMEOUT", "ping");
       assertPingResult(result);
     } catch (error) {
       if (this.#stopped) {
@@ -384,20 +431,27 @@ export class ToolBrokerSession {
   }
 
   /**
-   * Reads messages until the ping response for `requestId` arrives. Rejects
-   * with `TOOL_BROKER_REQUEST_TIMEOUT` after `requestTimeoutMs` (timer is
-   * unrefed and cleared on settlement), `TOOL_BROKER_CHILD_EXITED` on child
-   * exit or stream end, or `TOOL_BROKER_PROTOCOL_FAILURE` on any violation:
-   * wrong or non-numeric id, error envelope, notification-as-response,
-   * unknown envelope key, non-object result, malformed line. A response can
-   * settle exactly one request; anything after that settles nothing here.
+   * Reads messages until the response for `requestId` arrives. Rejects with
+   * `timeoutCode` after `deadlineMs` (timer is unrefed and cleared on
+   * settlement), `TOOL_BROKER_CHILD_EXITED` on child exit or stream end, or
+   * `TOOL_BROKER_PROTOCOL_FAILURE` on any violation: wrong or non-numeric id,
+   * error envelope, notification-as-response, unknown envelope key,
+   * non-object result, malformed line. A response can settle exactly one
+   * request; anything after that settles nothing here. Used by both
+   * discovery (startup deadline) and ping (request deadline) so the
+   * post-handshake read substrate is shared.
    */
-  async #readPingResponseOrTimeout(requestId: number): Promise<JsonValue> {
-    const deadline = this.#requestTimeoutMs;
+  async #readCorrelatedResponse(
+    requestId: number,
+    deadlineMs: number,
+    timeoutCode: "TOOL_BROKER_REQUEST_TIMEOUT" | "TOOL_BROKER_STARTUP_TIMEOUT",
+    subject: string,
+  ): Promise<JsonValue> {
+    const deadline = deadlineMs;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        reject(new ToolBrokerSessionError("TOOL_BROKER_REQUEST_TIMEOUT", `ping response not received within ${deadline}ms`));
+        reject(new ToolBrokerSessionError(timeoutCode, `${subject} response not received within ${deadline}ms`));
       }, deadline);
       timer.unref();
     });
@@ -416,14 +470,14 @@ export class ToolBrokerSession {
             // exit/closed => the child left mid-request; a malformed line is
             // a post-handshake protocol failure.
             throw error.kind === "malformed"
-              ? new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", `malformed line while awaiting ping response: ${error.message}`)
-              : new ToolBrokerSessionError("TOOL_BROKER_CHILD_EXITED", `child exited while awaiting ping response: ${error.message}`);
+              ? new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", `malformed line while awaiting ${subject} response: ${error.message}`)
+              : new ToolBrokerSessionError("TOOL_BROKER_CHILD_EXITED", `child exited while awaiting ${subject} response: ${error.message}`);
           }
           throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", String(error));
         }
 
         if (!isJsonObject(message)) {
-          throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", "ping response is not an object");
+          throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", `${subject} response is not an object`);
         }
         const record = message as Record<string, unknown>;
         // A notification (method present, id absent) while a request is in
@@ -445,13 +499,104 @@ export class ToolBrokerSession {
             throw error;
           }
         }
-        throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", "received a message that is neither a response nor a notification");
+        throw new ToolBrokerSessionError("TOOL_BROKER_PROTOCOL_FAILURE", `received a message that is neither a response nor a notification`);
       }
     } finally {
       if (timer !== undefined) {
         clearTimeout(timer);
       }
     }
+  }
+
+  /**
+   * Validates the correlated tools/list `result` against the closed configured
+   * tool map and returns the pinned catalog. Authority stays on the Host: the
+   * advertised content can only verify the configured bindings, never add,
+   * rename, relax, rotate, or replay them. Any discovery failure throws
+   * `TOOL_CONFIG_INVALID` so `prepare()` quarantines and never reaches Ready.
+   */
+  #pinConfiguredCatalog(result: JsonValue): PinnedToolCatalog {
+    if (!isJsonObject(result)) {
+      throw new ToolBrokerSessionError("TOOL_CONFIG_INVALID", "tools/list result is not an object");
+    }
+    for (const key of Object.keys(result)) {
+      if (key !== "tools" && key !== "_meta") {
+        throw new ToolBrokerSessionError("TOOL_CONFIG_INVALID", `tools/list result has unknown field "${key}"`);
+      }
+    }
+    const advertised = result.tools;
+    if (!Array.isArray(advertised)) {
+      throw new ToolBrokerSessionError("TOOL_CONFIG_INVALID", "tools/list result.tools must be an array");
+    }
+    if (advertised.length > MAX_DISCOVERED_TOOLS) {
+      throw new ToolBrokerSessionError("TOOL_CONFIG_INVALID", `tools/list advertised ${advertised.length} tools (max ${MAX_DISCOVERED_TOOLS})`);
+    }
+
+    // Index advertised name -> input schema, rejecting duplicates and
+    // malformed entries before consulting the configured map.
+    const advertisedByUpstream = new Map<string, JsonValue>();
+    for (const entry of advertised) {
+      if (!isJsonObject(entry)) {
+        throw new ToolBrokerSessionError("TOOL_CONFIG_INVALID", "tools/list entry is not an object");
+      }
+      for (const key of Object.keys(entry)) {
+        if (key !== "name" && key !== "description" && key !== "inputSchema") {
+          throw new ToolBrokerSessionError("TOOL_CONFIG_INVALID", `tools/list entry has unknown field "${key}"`);
+        }
+      }
+      const { name, description, inputSchema } = entry;
+      if (typeof name !== "string" || !UPSTREAM_NAME_PATTERN.test(name)) {
+        throw new ToolBrokerSessionError("TOOL_CONFIG_INVALID", "tools/list entry name must match /^[ -~]{1,255}$/");
+      }
+      if (description !== undefined && typeof description !== "string") {
+        throw new ToolBrokerSessionError("TOOL_CONFIG_INVALID", `tools/list entry "${name}" description must be a string`);
+      }
+      if (!isJsonObject(inputSchema) || inputSchema.type !== "object") {
+        throw new ToolBrokerSessionError("TOOL_CONFIG_INVALID", `tools/list entry "${name}" inputSchema must be an object-form schema with root type "object"`);
+      }
+      if (advertisedByUpstream.has(name)) {
+        throw new ToolBrokerSessionError("TOOL_CONFIG_INVALID", `tools/list advertises duplicate upstream name "${name}"`);
+      }
+      advertisedByUpstream.set(name, inputSchema);
+    }
+
+    // Verify every configured binding against discovery; extras never widen.
+    for (const [alias, configured] of Object.entries(this.#config.tools)) {
+      const advertisedSchema = advertisedByUpstream.get(configured.upstreamName);
+      if (advertisedSchema === undefined) {
+        throw new ToolBrokerSessionError(
+          "TOOL_CONFIG_INVALID",
+          `configured tool "${alias}" upstream "${configured.upstreamName}" is not advertised by tools/list`,
+        );
+      }
+      if (canonicalJsonDigest(advertisedSchema) !== configured.inputSchemaDigest) {
+        throw new ToolBrokerSessionError(
+          "TOOL_CONFIG_INVALID",
+          `configured tool "${alias}" upstream "${configured.upstreamName}" has a schema digest mismatch with the advertised schema`,
+        );
+      }
+    }
+
+    // The pinned catalog carries exactly the closed configured map, pinned to
+    // this server ID, generation, and config revision. Tools are cloned so
+    // the freeze below cannot reach into caller-owned config nodes.
+    const pinnedTools: Record<string, ConfiguredTool> = {};
+    for (const [alias, configured] of Object.entries(this.#config.tools)) {
+      pinnedTools[alias] = {
+        upstreamName: configured.upstreamName,
+        inputSchema: cloneJson(configured.inputSchema),
+        inputSchemaDigest: configured.inputSchemaDigest,
+      };
+    }
+    const catalog = deepFreeze({
+      schema: TOOL_CATALOG_SCHEMA,
+      toolServerId: this.#config.serverId,
+      toolServerGeneration: this.#generation,
+      configRevision: this.#config.configRevision,
+      tools: deepFreeze(pinnedTools),
+    });
+    MINTED_CATALOGS.add(catalog);
+    return catalog;
   }
 
   /**
@@ -522,6 +667,7 @@ export class ToolBrokerSession {
             state: "Ready",
             toolServerId: this.#config.serverId,
             toolServerGeneration: this.#generation,
+            catalog: this.#catalog,
           }
         : {
             state: "Quarantined",
@@ -530,6 +676,44 @@ export class ToolBrokerSession {
           },
     );
   }
+}
+
+/**
+ * Returns the pinned catalog of a prepared result.
+ *
+ * Only the exact minted object returned by `prepare()` is accepted; a
+ * caller-constructed or copied/spread result is rejected, and only a Ready
+ * result carries a catalog. This is the single authority a later invocation
+ * gate can hold: the catalog cannot be fabricated, retained from a stopped
+ * generation, or produced without discovery verification.
+ */
+export function pinnedToolCatalog(prepared: PrepareResult): PinnedToolCatalog {
+  if (typeof prepared !== "object" || prepared === null || !MINTED_PREPARE_RESULTS.has(prepared)) {
+    throw new Error("pinnedToolCatalog requires the exact PrepareResult returned by prepare()");
+  }
+  if (prepared.state !== "Ready" || prepared.catalog === undefined) {
+    throw new Error("pinnedToolCatalog requires a Ready prepared result with a pinned catalog");
+  }
+  return prepared.catalog;
+}
+
+/**
+ * Checks whether a pinned catalog matches the current context a later
+ * authorization gate would compare a request against (server ID, generation,
+ * config revision). A catalog from a stale generation or a stale config
+ * revision must not authorize later use, so this returns `false` instead of
+ * letting an old catalog pass. The catalog must be one produced by
+ * `prepare()` — a fabricated object is rejected outright.
+ */
+export function matchToolCatalog(catalog: PinnedToolCatalog, context: ToolCatalogContext): boolean {
+  if (!MINTED_CATALOGS.has(catalog)) {
+    throw new Error("matchToolCatalog requires a catalog produced by prepare()");
+  }
+  return (
+    catalog.toolServerId === context.toolServerId &&
+    catalog.toolServerGeneration === context.toolServerGeneration &&
+    catalog.configRevision === context.configRevision
+  );
 }
 
 /** Tears down a child: first waits briefly for a natural exit (the child
