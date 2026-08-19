@@ -96,6 +96,10 @@ function baseConfig(): ToolBrokerServerConfig {
       env: {},
     },
     startupTimeoutMs: 2000,
+    configRevision: "rev-1",
+    // Closed configured tool map: empty in the handshake-focused tests, so
+    // the fixture's empty advertised tools/list verifies it during prepare.
+    tools: {},
   };
 }
 
@@ -213,7 +217,7 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
     expect(broker.state).toBe("Stopped");
   });
 
-  it("ignores a duplicate initialize response and completes only on the first", async () => {
+  it("fails closed when a duplicate initialize response arrives during discovery", async () => {
     const child = spawnFake("duplicate-init");
     const broker = startToolBrokerServer(baseConfig(), {
       spawn: () => child,
@@ -221,9 +225,13 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
     });
     const result = await broker.prepare();
 
-    // The first response selects 2025-06-18; the duplicate must not corrupt
-    // state or restart the lifecycle.
-    expect(result.state).toBe("Ready");
+    // The first response selects 2025-06-18 and completes the handshake; the
+    // duplicate is then read while the discovery request (a request id the
+    // duplicate does not own) is in flight. An unexpected-id frame during an
+    // in-flight request is a request-correlation violation, so the session
+    // fails closed rather than letting a stray frame ride a later request.
+    expect(result.state).toBe("Quarantined");
+    expect(result.errorCode).toBe("TOOL_BROKER_PROTOCOL_FAILURE");
 
     await broker.stop();
     expect(broker.state).toBe("Stopped");

@@ -1,23 +1,31 @@
 /**
- * Config admission for the Tool Broker handshake slice.
+ * Config admission for the Tool Broker slice.
  *
  * `parseToolBrokerConfig` is the first fail-closed layer: it rejects any
  * config that does not name exactly protocol `2025-06-18`, adapter `mcp`, and
- * a stdio transport, before any child is spawned. Unknown top-level fields are
- * rejected so a stale or typo'd config cannot silently widen behaviour.
+ * a stdio transport, or that does not carry a closed tool map with an exact
+ * schema digest per binding, before any child is spawned. Unknown top-level
+ * fields are rejected so a stale or typo'd config cannot silently widen
+ * behaviour. Server discovery can verify this map, never widen it.
  *
- * The full registry also fixes `enabled`, `allowed_modules`, `limits`, and a
- * closed tool map; validating those is the later discovery/authorization gate
- * and is intentionally not in this slice.
+ * Scope: this slice binds exactly `tools` entries with `upstreamName`,
+ * `inputSchema`, `inputSchemaDigest`; the other `Tool` schema fields are later
+ * gates and are rejected here so the binding stays closed.
  */
 
-import { ToolBrokerConfigError, MCP_PROTOCOL_VERSION, type ToolBrokerServerConfig } from "./types.js";
+import { canonicalJsonDigest, assertJsonValue, type JsonValue } from "../canonical-json.js";
+import { ToolBrokerConfigError, MCP_PROTOCOL_VERSION, STABLE_ID_PATTERN, UPSTREAM_NAME_PATTERN, SHA256_PATTERN, type ToolBrokerServerConfig, type ConfiguredTool } from "./types.js";
 
-const SERVER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SERVER_ID_PATTERN = STABLE_ID_PATTERN;
 
 /** Known top-level keys of `ToolBrokerServerConfig`. */
-const ALLOWED_KEYS = ["serverId", "adapter", "protocolVersion", "transport", "startupTimeoutMs", "requestTimeoutMs"] as const;
+const ALLOWED_KEYS = ["serverId", "adapter", "protocolVersion", "transport", "startupTimeoutMs", "requestTimeoutMs", "configRevision", "tools"] as const;
 const ALLOWED_TRANSPORT_KEYS = ["kind", "command", "args", "env"] as const;
+/** Known keys of one configured tool binding. */
+const ALLOWED_TOOL_KEYS = ["upstreamName", "inputSchema", "inputSchemaDigest"] as const;
+/** Upper bound on configured tools (matches the `maxProperties` cap in
+ * `tool-broker-config.schema.json` Tools map). */
+const MAX_CONFIGURED_TOOLS = 4096;
 
 /** Default bounded wall-clock wait for a post-handshake request response. */
 const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
@@ -48,10 +56,14 @@ export function parseToolBrokerConfig(input: unknown): ToolBrokerServerConfig {
     }
   }
 
-  const { serverId, adapter, protocolVersion, transport, startupTimeoutMs, requestTimeoutMs } = input as Record<string, unknown>;
+  const { serverId, adapter, protocolVersion, transport, startupTimeoutMs, requestTimeoutMs, configRevision, tools } = input as Record<string, unknown>;
 
   if (typeof serverId !== "string" || !SERVER_ID_PATTERN.test(serverId)) {
     reject("serverId must be a stable identifier matching /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/");
+  }
+
+  if (typeof configRevision !== "string" || !SERVER_ID_PATTERN.test(configRevision)) {
+    reject("configRevision must be a stable identifier matching /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/");
   }
 
   if (adapter !== "mcp") {
@@ -108,6 +120,67 @@ export function parseToolBrokerConfig(input: unknown): ToolBrokerServerConfig {
     }
   }
 
+  // Closed configured tool map. Every alias must bind an exact upstream name
+  // and an exact input schema with a recomputed digest; any duplicate upstream
+  // name across the map, unknown entry field, or digest mismatch is rejected.
+  if (!isPlainObject(tools)) {
+    reject("tools must be a map of aliases to configured tool bindings");
+  }
+  const toolCount = Object.keys(tools).length;
+  if (toolCount > MAX_CONFIGURED_TOOLS) {
+    reject(`tools must have at most ${MAX_CONFIGURED_TOOLS} entries`);
+  }
+  const configuredTools: Record<string, ConfiguredTool> = {};
+  const upstreamNames = new Set<string>();
+  for (const [alias, rawTool] of Object.entries(tools)) {
+    if (!SERVER_ID_PATTERN.test(alias)) {
+      reject(`tools key "${alias}" must be a stable identifier matching /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/`);
+    }
+    if (!isPlainObject(rawTool)) {
+      reject(`tools["${alias}"] must be an object`);
+    }
+    for (const key of Object.keys(rawTool)) {
+      if (!(ALLOWED_TOOL_KEYS as readonly string[]).includes(key)) {
+        reject(`unknown tool field "${key}" in tools["${alias}"]`);
+      }
+    }
+    const { upstreamName, inputSchema, inputSchemaDigest } = rawTool as Record<string, unknown>;
+    if (typeof upstreamName !== "string" || !UPSTREAM_NAME_PATTERN.test(upstreamName)) {
+      reject(`tools["${alias}"].upstreamName must match /^[ -~]{1,255}$/`);
+    }
+    if (upstreamNames.has(upstreamName)) {
+      reject(`tools["${alias}"] reuses upstreamName "${upstreamName}" which is already bound`);
+    }
+    upstreamNames.add(upstreamName);
+    if (typeof inputSchemaDigest !== "string" || !SHA256_PATTERN.test(inputSchemaDigest)) {
+      reject(`tools["${alias}"].inputSchemaDigest must match /^sha256:[0-9a-f]{64}$/`);
+    }
+    // The configured input schema must be a full JSON value with object-form
+    // root type "object" (self-contained). assertJsonValue both validates and
+    // narrows the unknown to JsonValue for the closed config.
+    try {
+      assertJsonValue(inputSchema);
+    } catch {
+      reject(`tools["${alias}"].inputSchema must be a JSON value`);
+    }
+    const schemaDocument = inputSchema as JsonValue;
+    if (!isPlainObject(schemaDocument) || schemaDocument.type !== "object") {
+      reject(`tools["${alias}"].inputSchema must be an object-form schema with root type "object"`);
+    }
+    // Recompute the digest (spec section 2: the normalizer MUST recompute every
+    // schema digest and reject a mismatch) so a previously-rotated key or a
+    // stale siloed copy cannot pin a different contract than the schema holds.
+    const recomputed = canonicalJsonDigest(schemaDocument);
+    if (recomputed !== inputSchemaDigest) {
+      reject(`tools["${alias}"].inputSchemaDigest does not match the recomputed digest of its inputSchema`);
+    }
+    configuredTools[alias] = {
+      upstreamName,
+      inputSchema: schemaDocument,
+      inputSchemaDigest,
+    };
+  }
+
   const config: ToolBrokerServerConfig = {
     serverId,
     adapter: "mcp",
@@ -122,6 +195,8 @@ export function parseToolBrokerConfig(input: unknown): ToolBrokerServerConfig {
     // Always store the resolved number (never undefined) so the session can
     // read a concrete request timeout off the closed config.
     requestTimeoutMs: requestTimeoutMs === undefined ? DEFAULT_REQUEST_TIMEOUT_MS : requestTimeoutMs,
+    configRevision,
+    tools: configuredTools,
   };
 
   return config;

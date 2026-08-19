@@ -94,6 +94,10 @@ function pingConfig(overrides: Partial<ToolBrokerServerConfig> = {}): ToolBroker
     },
     startupTimeoutMs: 2000,
     requestTimeoutMs: 10000,
+    configRevision: "rev-1",
+    // Closed configured tool map: empty in the ping-substrate tests, so the
+    // fixture's empty advertised tools/list verifies it during prepare.
+    tools: {},
     ...overrides,
   };
 }
@@ -202,7 +206,7 @@ describe("Tool Broker post-handshake session (ping substrate)", () => {
     await broker.stop();
   });
 
-  it("post-handshake request id starts at 2 and increments monotonically", async () => {
+  it("post-handshake request id starts at 3 and increments monotonically", async () => {
     const { broker, capture } = startBroker("ping-ok");
     await broker.prepare();
     await broker.ping();
@@ -210,8 +214,10 @@ describe("Tool Broker post-handshake session (ping substrate)", () => {
     await broker.stop();
     await capture.done;
 
+    // prepare() consumes id 1 (initialize) and id 2 (tools/list discovery);
+    // the first ping is therefore id 3.
     const ids = pingFrames(capture.messages).map((frame) => frame.id);
-    expect(ids).toEqual([2, 3]);
+    expect(ids).toEqual([3, 4]);
   });
 
   it("ping rejects a response with the wrong id", async () => {
@@ -272,22 +278,22 @@ describe("Tool Broker post-handshake session (ping substrate)", () => {
 
   it("fails closed on a served request frame — reverse premise", async () => {
     const { broker, child, capture } = startBroker("ping-server-request");
-    await broker.prepare();
-    expect(broker.state).toBe("Ready");
-
     // The server initiates its own JSON-RPC request (id 777, tools/list)
-    // instead of answering the host's ping. It cannot act as the correlated
-    // response for id 2 nor authorize any upstream authority.
-    const error = await broker.ping().then(
-      () => undefined,
-      (e: unknown) => e,
-    );
-    assertQuarantined(error, "TOOL_BROKER_PROTOCOL_FAILURE", broker, child);
+    // right after the initialized notification, instead of answering the
+    // host's discovery request (id 2). prepare() must reject it as a
+    // protocol failure: the host is the sole authority that assigns
+    // request ids, and a server-originated request can never double as the
+    // correlated response for the host's own tools/list.
+    const result = await broker.prepare();
+    expect(result.state).toBe("Quarantined");
+    expect(result.errorCode).toBe("TOOL_BROKER_PROTOCOL_FAILURE");
+    expect(broker.state).toBe("Quarantined");
+    expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
 
-    // Fail-closed: exactly one outbound ping, no retry of the request, and
-    // no response written for the server's own id-777 request.
+    // Fail-closed: exactly one outbound discovery request, no retry, and no
+    // response written for the server's own id-777 request.
     await capture.done;
-    expect(pingFrames(capture.messages)).toEqual([{ id: 2 }]);
+    expect(capture.messages.filter(isJsonObject).map((m) => m.method)).toContain("tools/list");
     expect(capture.messages.some((m) => isJsonObject(m) && m.id === 777)).toBe(false);
 
     await broker.stop();

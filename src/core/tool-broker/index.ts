@@ -8,12 +8,22 @@
  */
 
 export { parseToolBrokerConfig } from "./config.js";
-export { adaptToolBrokerServer, ToolBrokerSession, killChild, ToolBrokerSessionError } from "./session.js";
+export {
+  adaptToolBrokerServer,
+  ToolBrokerSession,
+  killChild,
+  ToolBrokerSessionError,
+  pinnedToolCatalog,
+  matchToolCatalog,
+} from "./session.js";
 export {
   CLIENT_INFO,
   MCP_PROTOCOL_VERSION,
+  TOOL_CATALOG_SCHEMA,
   ToolBrokerConfigError,
   type AdaptedToolBrokerServer,
+  type ConfiguredTool,
+  type PinnedToolCatalog,
   type PrepareResult,
   type SpawnFn,
   type NowFn,
@@ -21,5 +31,7 @@ export {
   type ToolBrokerErrorCode,
   type ToolBrokerServerConfig,
   type ToolBrokerServerState,
+  type ToolCatalogContext,
+  type ToolBrokerServerOptions,
 } from "./types.js";
 export { startToolBrokerServer, type ToolBrokerServer } from "./factory.js";

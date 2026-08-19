@@ -15,6 +15,7 @@ import type {
   PrepareResult,
   SpawnFn,
   ToolBrokerServerConfig,
+  ToolBrokerServerOptions,
   ToolBrokerServerState,
 } from "./types.js";
 /** The broker server handle returned by `startToolBrokerServer`. It owns one
@@ -38,16 +39,17 @@ export interface ToolBrokerServer {
 
 /**
  * Starts a Tool Broker server generation: spawns the stdio child and returns
- * a handle. The handshake is driven by calling `prepare()`.
+ * a handle. The handshake and discovery are driven by calling `prepare()`.
  *
  * `generation` starts at 1 and increments per server ID. In this single-start
- * slice every `startToolBrokerServer` call gets generation 1; the monotonic
- * counter across restarts is a later gate (spec section 4) because this slice
- * owns only one start per handle.
+ * slice every `startToolBrokerServer` call gets generation 1 unless
+ * `options.generation` pins one (for proving catalog pinning against a stale
+ * generation); the monotonic counter across restarts is a later gate (spec
+ * section 4) because this slice owns only one start per handle.
  */
 export function startToolBrokerServer(
   config: ToolBrokerServerConfig,
-  options: { spawn: SpawnFn; now: NowFn },
+  options: ToolBrokerServerOptions,
 ): ToolBrokerServer {
   // The `now` injection is accepted for deterministic clock plumbing. This
   // slice's timeout uses `setTimeout` with the configured `startupTimeoutMs`,
@@ -61,7 +63,7 @@ export function startToolBrokerServer(
     windowsHide: true,
   });
 
-  const session = new ToolBrokerSession(config, 1, child);
+  const session = new ToolBrokerSession(config, options.generation ?? 1, child);
 
   return {
     get state(): ToolBrokerServerState {
