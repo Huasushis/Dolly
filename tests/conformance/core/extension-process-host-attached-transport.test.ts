@@ -35,6 +35,10 @@ import {
 } from "../../../src/core/extension-process-host.js";
 import type { ExtensionPackageManifest } from "../../../src/core/extension-installation-registry.js";
 import { FramedJsonChannel } from "../../../src/core/framed-json-channel.js";
+import {
+  formatVersion19ProcessGenerationId,
+  isVersion19ProcessGenerationId,
+} from "../../../src/core/linux-identifier-formats.js";
 import { ModuleExecutorTerminatedError } from "../../../src/core/module-actor.js";
 
 const PROTOCOL_VERSION = "3.0";
@@ -818,5 +822,36 @@ describe("Extension process host attached to a process Core already started", ()
       }
       rmSync(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
+  });
+
+  it("accepts a store-owned v19 process-generation identifier as the attached host identifier", () => {
+    const double = createAttachedProcessDouble(31_337);
+    const v19 = formatVersion19ProcessGenerationId(7);
+    let generated = 0;
+    const host = new ExtensionProcessHost({
+      ...hostOptions({
+        nextIdentifier: (purpose: string) =>
+          purpose === "process-generation" ? v19 : `${purpose}-${++generated}`,
+      }),
+      attachedProcess: double.attachment,
+    });
+
+    expect(isVersion19ProcessGenerationId(host.snapshot.processGenerationId)).toBe(true);
+    expect(host.snapshot.processGenerationId).toBe(v19);
+    expect(host.snapshot).toMatchObject({ state: "created" });
+  });
+
+  it("still rejects a store-owned v19 identifier generated for a session", () => {
+    const double = createAttachedProcessDouble(31_337);
+    const v19 = formatVersion19ProcessGenerationId(7);
+    expect(() => {
+      new ExtensionProcessHost({
+        ...hostOptions({
+          nextIdentifier: (purpose: string) =>
+            purpose === "session" ? v19 : `${purpose}-1`,
+        }),
+        attachedProcess: double.attachment,
+      });
+    }).toThrow(/Runtime generated an invalid identifier/i);
   });
 });
