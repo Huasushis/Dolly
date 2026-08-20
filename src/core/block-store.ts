@@ -23,6 +23,8 @@ import {
 } from "./reserved-content-schema.js";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+/** Max canonical JSON sequence value; the highest assignment is one below it. */
+const MAX_SAFE_INTEGER = 9007199254740991n;
 const NAME_PATTERN = /^[A-Za-z][A-Za-z0-9._/-]{0,127}$/;
 
 export type BlockStoreErrorCode =
@@ -30,6 +32,7 @@ export type BlockStoreErrorCode =
   | "BLOCK_LIMIT_EXCEEDED"
   | "BLOCK_ID_INVALID"
   | "BLOCK_ID_CONFLICT"
+  | "BLOCK_SEQUENCE_EXHAUSTED"
   | "BLOCK_EFFECT_CONFLICT"
   | "BLOCK_SOURCE_INVALID"
   | "BLOCK_CONTENT_INVALID"
@@ -824,6 +827,16 @@ export class BlockStore {
 
   #commitValidated(input: ValidatedBlockInput): Block {
     const { proposal, source } = input;
+    // The host-owned sequence counter is the sole authority: reject the
+    // commit before allocating an ID or mutating any state so a restored
+    // store resting on the maximum safe sequence cannot emit or persist an
+    // unsafe next value.
+    if (this.#nextSequence >= MAX_SAFE_INTEGER) {
+      throw new BlockStoreError(
+        "BLOCK_SEQUENCE_EXHAUSTED",
+        "Block commit sequence space is exhausted",
+      );
+    }
     let id: string;
     try {
       id = this.#nextBlockId();
@@ -942,6 +955,7 @@ export class BlockStore {
         (snapshot.schemaVersion !== "dolly.block-store/3" &&
           snapshot.schemaVersion !== "dolly.block-store/5") ||
         !/^[1-9][0-9]*$/.test(snapshot.nextSequence) ||
+        BigInt(snapshot.nextSequence) > MAX_SAFE_INTEGER ||
         !Array.isArray(snapshot.records) ||
         !Array.isArray(snapshot.commitEffects) ||
         (snapshot.schemaVersion === "dolly.block-store/5" &&

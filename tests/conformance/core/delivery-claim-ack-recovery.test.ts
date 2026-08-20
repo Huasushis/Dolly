@@ -11,6 +11,7 @@ import {
 } from "../../../src/core/reactive-module-input.js";
 
 const NOW = "2026-07-24T00:00:00.000Z";
+const MAX_SAFE = 9007199254740991;
 const source = { kind: "module", id: "producer" } as const;
 
 function proposal(text: string): BlockProposal {
@@ -229,9 +230,11 @@ describe("CORE-004 per-consumer claim/ack recovery", () => {
     const firstDelivery = deliveries.append("page", firstBlock.id);
     const secondDelivery = deliveries.append("page", secondBlock.id);
 
-    const firstSequence = `1${"0".repeat(999)}`;
-    const secondSequence = `2${"0".repeat(999)}`;
-    const nextSequence = `3${"0".repeat(999)}`;
+    // Values inside the supported safe sequence domain but large enough that
+    // the canonical Module input envelope differs measurably across prefixes.
+    const firstSequence = (MAX_SAFE - 2).toString();
+    const secondSequence = (MAX_SAFE - 1).toString();
+    const nextSequence = MAX_SAFE.toString();
     const snapshot = structuredClone(deliveries.snapshot()) as unknown as {
       nextGlobalSequence: string;
       deliveries: Array<{ record: { deliveryId: string; globalSequence: string } }>;

@@ -20,6 +20,8 @@ import {
 } from "./reactive-module-input.js";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+/** Max canonical JSON sequence value; the highest assignment is one below it. */
+const MAX_SAFE_INTEGER = 9007199254740991n;
 
 export interface DeliveryRecord {
   readonly schemaVersion: "dolly.delivery/1";
@@ -97,6 +99,7 @@ export type SubscriptionStart =
 export type DeliveryStoreErrorCode =
   | "DELIVERY_ID_INVALID"
   | "DELIVERY_ID_CONFLICT"
+  | "DELIVERY_SEQUENCE_EXHAUSTED"
   | "DELIVERY_EFFECT_CONFLICT"
   | "PAGE_EXISTS"
   | "PAGE_NOT_FOUND"
@@ -964,6 +967,19 @@ export class DeliveryStore {
 
   #append(pageId: string, blockId: string): DeliveryRecord {
     const page = this.#requirePage(pageId);
+    // The host-owned counters are the sole authority: reject at the boundary
+    // before allocating an ID, adding a strong reference, or mutating state,
+    // so an append can never emit or persist an unsafe next sequence and a
+    // rolled-back allocation is never an append.
+    if (
+      page.nextSequence >= MAX_SAFE_INTEGER ||
+      this.#nextGlobalSequence >= MAX_SAFE_INTEGER
+    ) {
+      throw new DeliveryStoreError(
+        "DELIVERY_SEQUENCE_EXHAUSTED",
+        "Delivery sequence space is exhausted",
+      );
+    }
     const block = this.#blocks.get(blockId);
     if (!block) {
       throw new DeliveryStoreError("BLOCK_NOT_FOUND", `Block ${blockId} is not committed`);
@@ -1647,6 +1663,7 @@ export class DeliveryStore {
       snapshot.maxFailedAttempts !== this.#maxFailedAttempts ||
       typeof snapshot.nextGlobalSequence !== "string" ||
       !/^[1-9][0-9]*$/.test(snapshot.nextGlobalSequence) ||
+      BigInt(snapshot.nextGlobalSequence) > MAX_SAFE_INTEGER ||
       !Array.isArray(snapshot.usedIds) ||
       !Array.isArray(snapshot.pages) ||
       !Array.isArray(snapshot.deliveries) ||
@@ -1684,6 +1701,7 @@ export class DeliveryStore {
         this.#pages.has(candidate.id) ||
         typeof candidate.nextSequence !== "string" ||
         !/^[1-9][0-9]*$/.test(candidate.nextSequence) ||
+        BigInt(candidate.nextSequence) > MAX_SAFE_INTEGER ||
         !Array.isArray(candidate.deliveryIds) ||
         !Array.isArray(candidate.subscriptions)
       ) {
