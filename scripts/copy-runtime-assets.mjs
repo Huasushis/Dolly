@@ -13,6 +13,20 @@ const RUNTIME_ASSETS = [
     path: "src/adapters/linux-module-launcher/launcher.py",
     compiledConsumer: "src/adapters/linux-module-launcher/linux-module-launcher-process.js",
   },
+  {
+    // The console client page, script, and styles resolve relative to the
+    // compiled web-channel loader (`new URL("./web/…", import.meta.url)`).
+    path: "src/extensions/console/web/index.html",
+    compiledConsumer: "src/extensions/console/web-channel.js",
+  },
+  {
+    path: "src/extensions/console/web/app.js",
+    compiledConsumer: "src/extensions/console/web-channel.js",
+  },
+  {
+    path: "src/extensions/console/web/styles.css",
+    compiledConsumer: "src/extensions/console/web-channel.js",
+  },
 ];
 
 function requireOrdinaryFile(path, label) {

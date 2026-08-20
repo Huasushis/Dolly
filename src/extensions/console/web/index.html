@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<!--
+  Dolly Console client application shell.
+
+  Inert by construction: no session data, no inline script, no third-party
+  origin. Data arrives only over the authenticated, session-scoped channel
+  (`/v1/*`) after a one-time pairing exchange — see `docs/spec/console-extension.md`
+  sections 4 and 13. The pairing code is submitted once in a POST body; it is
+  never placed in a URL, stored, or rendered back.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dolly Console</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="chat-container">
+  <div class="chat-header">
+    <h1>Dolly Console</h1>
+    <div class="status-row">
+      <span id="status-dot" class="status-dot disconnected"></span>
+      <span id="status" role="status">Checking session…</span>
+      <span id="reconnect-info" class="reconnect-info"></span>
+    </div>
+    <div id="session-line" class="session-line"></div>
+  </div>
+
+  <div id="pair-view" class="pair-view" hidden>
+    <form id="pair-form" autocomplete="off">
+      <label for="pair-code">Pairing code</label>
+      <input id="pair-code" name="pair-code" type="password" autocomplete="off" spellcheck="false" required>
+      <button id="pair-submit" type="submit">Connect</button>
+    </form>
+    <p id="pair-error" class="pair-error" role="alert" hidden></p>
+    <p id="pair-hint" class="pair-hint">Ask the operator for a one-time pairing code. The code is used once and is never stored or shown again.</p>
+  </div>
+
+  <div id="chat-view" hidden>
+    <div id="messages" role="log" aria-live="off" aria-label="Messages" aria-busy="false"></div>
+    <div class="input-area">
+      <form id="composer-form" autocomplete="off">
+        <input id="composer-text" type="text" placeholder="Type a message..." autocomplete="off" disabled>
+        <button id="composer-send" type="submit" class="send-btn" disabled>Send</button>
+        <button id="logout" type="button" class="logout-btn">Disconnect</button>
+      </form>
+    </div>
+  </div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

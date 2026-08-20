@@ -590,6 +590,24 @@ export class ConsoleSessionStore {
     return session.display.filter((item) => BigInt(item.displaySequence) > after);
   }
 
+  /**
+   * Retention window for reconnect replay (sections 4.3 and 6.5): which
+   * sequences were issued and which unacknowledged items are still retained.
+   * `oldestRetained` is null when nothing is retained, so a caller can tell
+   * "nothing issued" apart from "issued and fully released".
+   */
+  displayWatermark(
+    sessionId: string,
+    principalId: string,
+  ): { readonly oldestRetained: string | null; readonly newestIssued: string } {
+    const session = this.#requireSession(sessionId, principalId);
+    return {
+      oldestRetained:
+        session.display.length === 0 ? null : session.display[0]!.displaySequence,
+      newestIssued: decimal(session.nextDisplaySequence - 1n),
+    };
+  }
+
   displayCursor(sessionId: string, principalId: string): string {
     return decimal(this.#requireSession(sessionId, principalId).ackThrough);
   }

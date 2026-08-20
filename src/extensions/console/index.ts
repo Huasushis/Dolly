@@ -123,6 +123,13 @@ export {
 } from "./http-channel.js";
 
 export {
+  ConsoleWebChannel,
+  loadConsoleClientApplication,
+  type ConsoleWebChannelDisplayInput,
+  type ConsoleWebChannelOptions,
+} from "./web-channel.js";
+
+export {
   buildCliExternalMessage,
   runConsoleCli,
   type ConsoleCliDependencies,

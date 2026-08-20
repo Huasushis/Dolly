@@ -56,6 +56,26 @@ export interface ConsoleGatewayOptions {
   readonly nextId: (kind: "session" | "message" | "event") => string;
   readonly nextSecret: (kind: "pairing" | "session" | "csrf") => string;
   readonly limits?: Partial<ConsoleGatewayLimits>;
+  /**
+   * Static client application (HTML, script, styles) served on the same
+   * trusted origin. The shell is inert: it carries no session data, and all
+   * data paths remain authenticated. Scripts execute only from this origin.
+   */
+  readonly clientApplication?: ConsoleClientApplication;
+  /**
+   * Host notification of authenticated session lifecycle transitions. Fired
+   * after a session is created by pairing and after it becomes permanently
+   * closed (logout, idle expiry, revoke, or gateway stop).
+   */
+  readonly onSessionChange?: (event: ConsoleSessionChangeEvent) => void;
+  /**
+   * Host-owned bounded replay source. Called only for an already
+   * authenticated session; the gateway never exposes cross-session display
+   * state because the callback receives the authenticated session identity.
+   */
+  readonly resolveDisplayResume?: (
+    input: ConsoleDisplayResumeRequest,
+  ) => ConsoleDisplayResumeResult;
 }
 
 export interface ConsoleGatewayAddress {
@@ -63,6 +83,34 @@ export interface ConsoleGatewayAddress {
   readonly port: number;
   readonly origin: string;
 }
+
+export interface ConsoleClientApplication {
+  readonly html: string;
+  readonly script: string;
+  readonly styles: string;
+}
+
+export interface ConsoleSessionChangeEvent {
+  readonly type: "opened" | "closed";
+  readonly sessionId: string;
+  readonly principalId: string;
+  readonly routeAliases: readonly string[];
+}
+
+export interface ConsoleDisplayResumeRequest {
+  readonly sessionId: string;
+  readonly principalId: string;
+  readonly afterSequence: string;
+}
+
+export type ConsoleDisplayResumeResult =
+  | {
+      readonly kind: "resume";
+      readonly items: readonly JsonValue[];
+      readonly truncated: boolean;
+    }
+  | { readonly kind: "cursor-invalid" }
+  | { readonly kind: "unavailable" };
 
 export interface PairingCodeRequest {
   readonly principalId: string;
@@ -97,6 +145,7 @@ interface SessionState {
   readonly sessionId: string;
   readonly principalId: string;
   readonly tokenDigest: string;
+  readonly csrfToken: string;
   readonly csrfDigest: string;
   readonly routeAliases: ReadonlySet<string>;
   readonly queue: ConsoleQueuedMessage[];
@@ -179,6 +228,28 @@ function normalizedLimits(input: Partial<ConsoleGatewayLimits>): ConsoleGatewayL
   }
   return deepFreeze(limits);
 }
+function validateClientApplication(
+  application: ConsoleClientApplication | undefined,
+): ConsoleClientApplication | null {
+  if (application === undefined) return null;
+  for (const name of ["html", "script", "styles"] as const) {
+    if (
+      typeof application[name] !== "string" ||
+      application[name].length === 0 ||
+      application[name].length > 512 * 1024
+    ) {
+      throw new TypeError(
+        `Console client application ${name} must be a non-empty string up to 512 KiB`,
+      );
+    }
+  }
+  return {
+    html: application.html,
+    script: application.script,
+    styles: application.styles,
+  };
+}
+
 
 function parseCookies(header: string | undefined): ReadonlyMap<string, string> {
   const cookies = new Map<string, string>();
@@ -210,6 +281,11 @@ export class ConsoleGateway {
   readonly #limits: ConsoleGatewayLimits;
   readonly #pairings = new Map<string, PairingRecord>();
   readonly #sessions = new Map<string, SessionState>();
+  readonly #clientApplication: ConsoleClientApplication | null;
+  readonly #onSessionChange: ((event: ConsoleSessionChangeEvent) => void) | null;
+  readonly #resolveDisplayResume:
+    | ((input: ConsoleDisplayResumeRequest) => ConsoleDisplayResumeResult)
+    | null;
   readonly #sessionByTokenDigest = new Map<string, string>();
   readonly #pairingAttempts = new Map<string, PairingAttemptBucket>();
   readonly #usedIds = new Set<string>();
@@ -227,6 +303,9 @@ export class ConsoleGateway {
     this.#nextId = options.nextId;
     this.#nextSecret = options.nextSecret;
     this.#limits = normalizedLimits(options.limits ?? {});
+    this.#clientApplication = validateClientApplication(options.clientApplication);
+    this.#onSessionChange = options.onSessionChange ?? null;
+    this.#resolveDisplayResume = options.resolveDisplayResume ?? null;
     this.#wss = new WebSocketServer({
       noServer: true,
       maxPayload: this.#limits.maxWebSocketMessageBytes,
@@ -351,9 +430,11 @@ export class ConsoleGateway {
     if (!server) return;
     this.#server = null;
     for (const session of this.#sessions.values()) {
+      if (session.closed) continue;
       session.closed = true;
       for (const socket of session.sockets) socket.terminate();
       session.sockets.clear();
+      this.#notifyClosed(session);
     }
     await new Promise<void>((resolve, reject) => {
       this.#wss.close(() => {
@@ -378,6 +459,43 @@ export class ConsoleGateway {
       this.#writeJson(response, 200, { status: "ok" });
       return;
     }
+
+    // The inert client shell is public; every data route below remains
+    // authenticated. Assets are host-provided static strings, and the HTML
+    // policy permits only same-origin script/style loads plus same-origin
+    // fetch and WebSocket connections (console-extension.md section 13).
+    if (this.#clientApplication && request.method === "GET") {
+      if (url.pathname === "/" || url.pathname === "/index.html") {
+        this.#writeApplicationAsset(
+          response,
+          this.#clientApplication.html,
+          "text/html; charset=utf-8",
+        );
+        return;
+      }
+      if (url.pathname === "/app.js") {
+        this.#writeApplicationAsset(
+          response,
+          this.#clientApplication.script,
+          "text/javascript; charset=utf-8",
+        );
+        return;
+      }
+      if (url.pathname === "/styles.css") {
+        this.#writeApplicationAsset(
+          response,
+          this.#clientApplication.styles,
+          "text/css; charset=utf-8",
+        );
+        return;
+      }
+    }
+    // A path naming no route is closed before authentication, so the gateway
+    // never reveals whether a session exists by status code (404 vs 401).
+    // Only data routes under /v1/ reach the auth boundary below.
+    if (!url.pathname.startsWith("/v1/")) {
+      throw new ConsoleHttpError(404, "NOT_FOUND", "Route does not exist");
+    }
     if (request.method === "POST" && url.pathname === "/v1/session/pair") {
       this.#requireOrigin(request);
       const body = await this.#readJson(request);
@@ -392,6 +510,7 @@ export class ConsoleGateway {
       );
       this.#writeJson(response, 201, {
         version: "1",
+        principalId: result.session.principalId,
         sessionId: result.session.sessionId,
         csrfToken: result.csrfToken,
         routeAliases: [...result.session.routeAliases],
@@ -405,7 +524,14 @@ export class ConsoleGateway {
       this.#writeJson(response, 200, {
         version: "1",
         sessionId: session.sessionId,
+        principalId: session.principalId,
         routeAliases: [...session.routeAliases],
+        csrfToken: session.csrfToken,
+        limits: {
+          maxTextBytes: this.#limits.maxTextBytes,
+          maxQueuedMessagesPerSession: this.#limits.maxQueuedMessagesPerSession,
+          sessionIdleMs: this.#limits.sessionIdleMs,
+        },
       });
       return;
     }
@@ -425,6 +551,49 @@ export class ConsoleGateway {
         disposition: "queued-volatile",
         externalMessageId: message.externalMessageId,
         sequence: message.sequence,
+      });
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/v1/session/close") {
+      // Logout permanently closes the session; the structural parts
+      // (consistent display state, bounded retention) are already satisfied
+      // because a closed session can never be resumed (section 4.3).
+      this.#requireOrigin(request);
+      this.#requireCsrf(request, session);
+      this.#closeSession(session);
+      this.#writeJson(response, 200, { version: "1", type: "session.closed" });
+      return;
+    }
+    if (request.method === "GET" && url.pathname.startsWith("/v1/display/since/")) {
+      // Bounded display replay for reconnecting clients (sections 6.2 and
+      // 8.1). The cursor rides in the path — never the query string — and
+      // the host resolver receives only the authenticated session identity,
+      // so one session can never name another session's display state.
+      const resolver = this.#resolveDisplayResume;
+      if (resolver === null) {
+        throw new ConsoleHttpError(404, "NOT_FOUND", "Route does not exist");
+      }
+      const afterSequence = url.pathname.slice("/v1/display/since/".length);
+      if (!/^(0|[1-9][0-9]{0,18})$/.test(afterSequence)) {
+        throw new ConsoleHttpError(400, "INVALID_REQUEST", "Display cursor is invalid");
+      }
+      const result = resolver({
+        sessionId: session.sessionId,
+        principalId: session.principalId,
+        afterSequence,
+      });
+      if (result.kind === "unavailable") {
+        throw new ConsoleHttpError(404, "DISPLAY_UNAVAILABLE", "Display state does not exist");
+      }
+      if (result.kind === "cursor-invalid") {
+        throw new ConsoleHttpError(409, "DISPLAY_CURSOR_INVALID", "Display cursor is invalid");
+      }
+      this.#writeJson(response, 200, {
+        version: "1",
+        type: "display.resume",
+        afterSequence,
+        truncated: result.truncated,
+        items: result.items,
       });
       return;
     }
@@ -514,6 +683,7 @@ export class ConsoleGateway {
       sessionId,
       principalId: pairing.principalId,
       tokenDigest,
+      csrfToken,
       csrfDigest: digestSecret(csrfToken),
       routeAliases: new Set(pairing.routeAliases),
       queue: [],
@@ -527,6 +697,21 @@ export class ConsoleGateway {
     };
     this.#sessions.set(sessionId, session);
     this.#sessionByTokenDigest.set(tokenDigest, sessionId);
+    // The host binds external session state (store binding, display routes)
+    // at this point. If the binding fails, the gateway session is rolled
+    // back so no client credential can reference partial state.
+    try {
+      this.#emitSessionChange({
+        type: "opened",
+        sessionId,
+        principalId: session.principalId,
+        routeAliases: [...session.routeAliases],
+      });
+    } catch (error) {
+      this.#closeSession(session);
+      this.#sessions.delete(sessionId);
+      throw error;
+    }
     return { session, sessionToken, csrfToken };
   }
 
@@ -575,6 +760,48 @@ export class ConsoleGateway {
     this.#sessionByTokenDigest.delete(session.tokenDigest);
     for (const socket of session.sockets) socket.close(1008, "session expired");
     session.sockets.clear();
+    this.#notifyClosed(session);
+  }
+
+  #emitSessionChange(event: ConsoleSessionChangeEvent): void {
+    this.#onSessionChange?.(deepFreeze(event));
+  }
+
+  /** Closed notifications are best-effort: the close already completed and a
+   * failing host observer must not corrupt in-flight requests or stop(). */
+  #notifyClosed(session: SessionState): void {
+    try {
+      this.#emitSessionChange({
+        type: "closed",
+        sessionId: session.sessionId,
+        principalId: session.principalId,
+        routeAliases: [...session.routeAliases],
+      });
+    } catch {
+      // See method note.
+    }
+  }
+
+  #writeApplicationAsset(
+    response: ServerResponse,
+    body: string,
+    contentType: string,
+  ): void {
+    response.setHeader("Content-Type", contentType);
+    if (contentType.startsWith("text/html")) {
+      // The application page may load only its own origin's script and style
+      // and connect only back to the same gateway — no inline script, no
+      // third-party origin, no eval (console-extension.md section 13).
+      response.setHeader(
+        "Content-Security-Policy",
+        "default-src 'none'; script-src 'self'; style-src 'self'; " +
+          "connect-src 'self'; img-src 'self'; base-uri 'none'; " +
+          "form-action 'self'; frame-ancestors 'none'",
+      );
+    }
+    response.setHeader("Content-Length", Buffer.byteLength(body));
+    response.writeHead(200);
+    response.end(body);
   }
 
   #requireOrigin(request: IncomingMessage): void {
