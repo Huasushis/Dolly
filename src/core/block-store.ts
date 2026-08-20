@@ -143,18 +143,42 @@ export interface BlockCommitEffectSnapshot {
  * job, result digest, and Block before the effect tombstone is removed and
  * survives the separate result-journal delete, so recovery can distinguish
  * "retirement in progress" from persisted corruption.
+ *
+ * Version 2 additionally binds the complete ordered set of exact
+ * Module-result-owned Delivery append-effect identities. Only a version-2
+ * ticket authorizes the DeliveryStore retirement operation; a version-1
+ * ticket may finish only the original Block retirement semantics.
  */
-export interface BlockCommitEffectRetirementTicket {
-  readonly schemaVersion: "dolly.commit-effect-retirement/1";
-  readonly moduleJobId: string;
-  readonly blockId: string;
-  readonly digest: string;
-}
+export type BlockCommitEffectRetirementTicket =
+  | {
+      readonly schemaVersion: "dolly.commit-effect-retirement/1";
+      readonly moduleJobId: string;
+      readonly blockId: string;
+      readonly digest: string;
+    }
+  | {
+      readonly schemaVersion: "dolly.commit-effect-retirement/2";
+      readonly moduleJobId: string;
+      readonly blockId: string;
+      readonly digest: string;
+      readonly deliveryEffectIds: readonly string[];
+    };
 
-export interface BlockCommitEffectRetirementTicketSnapshot
-  extends BlockCommitEffectRetirementTicket {
-  readonly effectId: string;
-}
+export type BlockCommitEffectRetirementTicketSnapshot = (
+  | {
+      readonly schemaVersion: "dolly.commit-effect-retirement/1";
+      readonly moduleJobId: string;
+      readonly blockId: string;
+      readonly digest: string;
+    }
+  | {
+      readonly schemaVersion: "dolly.commit-effect-retirement/2";
+      readonly moduleJobId: string;
+      readonly blockId: string;
+      readonly digest: string;
+      readonly deliveryEffectIds: readonly string[];
+    }
+) & { readonly effectId: string };
 
 export type BlockStoreSnapshotVersion = "dolly.block-store/3" | "dolly.block-store/5";
 
@@ -303,8 +327,11 @@ function normalizeRetirementTicket(
   ticket: unknown,
   effectId: string,
 ): BlockCommitEffectRetirementTicket {
-  assertClosedObject(ticket, ["schemaVersion", "moduleJobId", "blockId", "digest"], "retirement ticket");
-  if (ticket.schemaVersion !== "dolly.commit-effect-retirement/1") {
+  assertClosedObject(ticket, ["schemaVersion", "moduleJobId", "blockId", "digest", "deliveryEffectIds"], "retirement ticket");
+  if (
+    ticket.schemaVersion !== "dolly.commit-effect-retirement/1" &&
+    ticket.schemaVersion !== "dolly.commit-effect-retirement/2"
+  ) {
     throw new BlockStoreError(
       "BLOCK_EFFECT_CONFLICT",
       "Block retirement ticket schema version is invalid",
@@ -325,11 +352,42 @@ function normalizeRetirementTicket(
       { effectId },
     );
   }
+  if (ticket.schemaVersion === "dolly.commit-effect-retirement/1") {
+    if (ticket.deliveryEffectIds !== undefined) {
+      throw new BlockStoreError(
+        "BLOCK_EFFECT_CONFLICT",
+        "A version-1 retirement ticket cannot bind Delivery append-effect identities",
+        { effectId },
+      );
+    }
+    return deepFreeze({
+      schemaVersion: "dolly.commit-effect-retirement/1" as const,
+      moduleJobId: ticket.moduleJobId,
+      blockId: ticket.blockId,
+      digest: ticket.digest,
+    });
+  }
+
+  if (
+    !Array.isArray(ticket.deliveryEffectIds) ||
+    ticket.deliveryEffectIds.some(
+      (deliveryEffectId) => typeof deliveryEffectId !== "string" ||
+        !/^sha256:[0-9a-f]{64}$/.test(deliveryEffectId),
+    ) ||
+    new Set(ticket.deliveryEffectIds).size !== ticket.deliveryEffectIds.length
+  ) {
+    throw new BlockStoreError(
+      "BLOCK_EFFECT_CONFLICT",
+      "A version-2 retirement ticket must bind a unique set of Delivery append-effect identities",
+      { effectId },
+    );
+  }
   return deepFreeze({
-    schemaVersion: "dolly.commit-effect-retirement/1" as const,
+    schemaVersion: "dolly.commit-effect-retirement/2" as const,
     moduleJobId: ticket.moduleJobId,
     blockId: ticket.blockId,
     digest: ticket.digest,
+    deliveryEffectIds: [...ticket.deliveryEffectIds],
   });
 }
 
@@ -424,15 +482,11 @@ export class BlockStore {
     }
     this.flushPersistence();
     const ticket = this.#retirementTickets.get(effectId);
-    return ticket === undefined
-      ? null
-      : deepFreeze({
-          effectId,
-          schemaVersion: ticket.schemaVersion,
-          moduleJobId: ticket.moduleJobId,
-          blockId: ticket.blockId,
-          digest: ticket.digest,
-        });
+    if (ticket === undefined) return null;
+    return deepFreeze({
+      effectId,
+      ...ticket,
+    } as BlockCommitEffectRetirementTicketSnapshot);
   }
 
   listCommitEffectRetirementTickets(): readonly BlockCommitEffectRetirementTicketSnapshot[] {
@@ -441,11 +495,8 @@ export class BlockStore {
       [...this.#retirementTickets.entries()]
         .map(([effectId, ticket]) => ({
           effectId,
-          schemaVersion: ticket.schemaVersion,
-          moduleJobId: ticket.moduleJobId,
-          blockId: ticket.blockId,
-          digest: ticket.digest,
-        }))
+          ...ticket,
+        } as BlockCommitEffectRetirementTicketSnapshot))
         .sort((left, right) =>
           left.effectId < right.effectId ? -1 : left.effectId > right.effectId ? 1 : 0,
         ),
@@ -483,10 +534,7 @@ export class BlockStore {
     const retirementTickets = [...this.#retirementTickets.entries()]
       .map(([effectId, ticket]) => ({
         effectId,
-        schemaVersion: ticket.schemaVersion,
-        moduleJobId: ticket.moduleJobId,
-        blockId: ticket.blockId,
-        digest: ticket.digest,
+        ...ticket,
       }))
       .sort((left, right) =>
         left.effectId < right.effectId ? -1 : left.effectId > right.effectId ? 1 : 0,
@@ -1043,7 +1091,7 @@ export class BlockStore {
 
       const ticketIds = new Set<string>();
       for (const candidate of snapshot.retirementTickets ?? []) {
-        const keys = ["effectId", "schemaVersion", "moduleJobId", "blockId", "digest"];
+        const keys = ["effectId", "schemaVersion", "moduleJobId", "blockId", "digest", "deliveryEffectIds"];
         assertClosedObject(candidate, keys, "retirementTicket");
         const { effectId: candidateEffectId, ...ticketFields } = candidate;
         const ticket = normalizeRetirementTicket(ticketFields, candidateEffectId as string);

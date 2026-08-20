@@ -68,6 +68,8 @@ import {
 import { deriveModuleCgroupPath } from "./linux-module-cgroup.js";
 import { isIdentityBoundModuleCgroupPath } from "./linux-module-cgroup-identity.js";
 import {
+  ModuleResultCommitError,
+  moduleResultCommitDeliveryEffectId,
   type ModuleResultCommitOperations,
   type ModuleResultCommitOutputDelivery,
 } from "./module-result-commit.js";
@@ -78,6 +80,7 @@ import {
 } from "./synchronous-cross-process-lock.js";
 
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 
 function fsyncDirectory(path: string): void {
@@ -1884,6 +1887,17 @@ export class FileCoreStateStore {
             (copiedIdentity) => this.#deliveries.ack(copiedIdentity),
           ),
       },
+      retireModuleResultEffects: {
+        configurable: false,
+        enumerable: true,
+        writable: false,
+        value: (input: {
+          readonly moduleJobId: string;
+          readonly claim: DeliveryClaimIdentity;
+          readonly blockEffectId: string;
+          readonly deliveryEffectIds: readonly string[];
+        }) => this.#retireModuleResultEffects(input),
+      },
     });
     return Object.freeze(operations) as unknown as ModuleResultCommitOperations;
   }
@@ -1969,6 +1983,183 @@ export class FileCoreStateStore {
     return deepFreeze({
       status: "committed" as const,
       outputDeliveries: [...outputDeliveries],
+    });
+  }
+
+  /**
+   * One store-bound atomic FileCore retirement for a committed Module result:
+   * releases and retires its Block commit-effect tombstone and retires every
+   * exact Delivery appendage batch effect proved by the staged version-2
+   * retention ticket — all in one deferred Core-state write that commits or
+   * aborts as a unit, so a crash leaves only the all-old or all-retired
+   * reopened states.
+   *
+   * Everything is revalidated against the stores while the write is still
+   * deferred: the exact claim identity must be committed with no submission
+   * record or unknown-history claim, the version-2 ticket must bind this exact
+   * module job, and the set of owned Delivery append-effects must equal
+   * exactly the ticket's ordered identities (missing, extra, duplicated,
+   * stale, or foreign identities fail closed before anything is removed).
+   */
+  #retireModuleResultEffects(supplied: {
+    readonly moduleJobId: string;
+    readonly claim: DeliveryClaimIdentity;
+    readonly blockEffectId: string;
+    readonly deliveryEffectIds: readonly string[];
+  }): void {
+    this.#assertUsable();
+    const moduleJobId = supplied.moduleJobId;
+    const blockEffectId = supplied.blockEffectId;
+    if (
+      typeof moduleJobId !== "string" ||
+      !ID_PATTERN.test(moduleJobId) ||
+      typeof blockEffectId !== "string" ||
+      !/^sha256:[0-9a-f]{64}$/.test(blockEffectId)
+    ) {
+      throw new ModuleResultCommitError(
+        "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+        "Module result retirement identities are invalid",
+        { moduleJobId, blockEffectId },
+      );
+    }
+    const claim = copyAndFreezeClaimIdentity(supplied.claim);
+    const deliveryEffectIds = supplied.deliveryEffectIds.map((deliveryEffectId) => {
+      if (
+        typeof deliveryEffectId !== "string" ||
+        !/^sha256:[0-9a-f]{64}$/.test(deliveryEffectId)
+      ) {
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          "Module result Delivery retirement identities are invalid",
+          { deliveryEffectId },
+        );
+      }
+      return deliveryEffectId;
+    });
+    const expectedOrderedSet = Object.freeze([...deliveryEffectIds]);
+
+    this.runAtomicUpdate(() => {
+      // The version-2 retirement ticket is the durable anchor: it must be
+      // staged, bind exactly this module job's Block, and authorize only its
+      // exact ordered Delivery append-effect identities.
+      const ticket = this.#blocks.inspectCommitEffectRetirementTicket(blockEffectId);
+      if (
+        ticket === null ||
+        ticket.schemaVersion !== "dolly.commit-effect-retirement/2" ||
+        ticket.moduleJobId !== moduleJobId
+      ) {
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          `Module result ${moduleJobId} has no matching version-2 retirement ticket`,
+          { moduleJobId },
+        );
+      }
+      if (ticket.deliveryEffectIds.length !== expectedOrderedSet.length) {
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          `Module result ${moduleJobId} retirement ticket does not bind the exact Delivery effect set`,
+          { moduleJobId },
+        );
+      }
+      for (let index = 0; index < expectedOrderedSet.length; index += 1) {
+        if (ticket.deliveryEffectIds[index] !== expectedOrderedSet[index]) {
+          throw new ModuleResultCommitError(
+            "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+            `Module result ${moduleJobId} retirement ticket does not bind the exact ordered Delivery effect set`,
+            { moduleJobId },
+          );
+        }
+      }
+
+      const blockEffect = this.#blocks.inspectCommitEffect(blockEffectId);
+      if (blockEffect !== null) {
+        if (
+          ticket.blockId !== blockEffect.record.id ||
+          ticket.digest !== blockEffect.digest ||
+          blockEffect.strongReferenceHeld
+        ) {
+          throw new ModuleResultCommitError(
+            "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+            `Block effect ${blockEffectId} does not match its retirement ticket`,
+          );
+        }
+      }
+
+      // Complete ordered Page/Delivery/effect-set proof: every append-effect
+      // identity derivable from this module job must be exactly the ticket's
+      // ordered set, and every owned ticket identity must resolve to an append
+      // effect targeting the retired Block. Missing, extra, duplicated, stale,
+      // or foreign effects fail closed without touching any store.
+      const ownedEffectIds = new Set(ticket.deliveryEffectIds);
+      const observedOwnedEffects = new Set<string>();
+      for (const pageId of this.#deliveries.listPageIds()) {
+        const derivedId = moduleResultCommitDeliveryEffectId(moduleJobId, pageId);
+        const effect = this.#deliveries.inspectAppendEffect(derivedId);
+        if (effect === null) continue;
+        if (!ownedEffectIds.has(derivedId)) {
+          throw new ModuleResultCommitError(
+            "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+            `Module result ${moduleJobId} has a Delivery effect not bound by its retirement ticket`,
+            { moduleJobId, pageId },
+          );
+        }
+        if (effect.pageId !== pageId || effect.blockId !== ticket.blockId) {
+          throw new ModuleResultCommitError(
+            "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+            `Module result ${moduleJobId} Delivery effect is stale or foreign`,
+            { moduleJobId, pageId },
+          );
+        }
+        observedOwnedEffects.add(derivedId);
+      }
+      if (blockEffect !== null && observedOwnedEffects.size !== ownedEffectIds.size) {
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          `Module result ${moduleJobId} is missing a bound Delivery effect`,
+          { moduleJobId },
+        );
+      }
+      if (blockEffect === null && observedOwnedEffects.size !== 0) {
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          `Module result ${moduleJobId} retired its Block effect but left a Delivery effect; no partial states allowed`,
+          { moduleJobId },
+        );
+      }
+
+      const persistedClaim = this.#deliveries.inspectClaim(claim);
+      if (
+        persistedClaim.status !== "committed" ||
+        persistedClaim.moduleJobId !== claim.moduleJobId ||
+        persistedClaim.claimToken !== claim.claimToken ||
+        persistedClaim.attempt !== claim.attempt ||
+        persistedClaim.runId !== claim.runId ||
+        persistedClaim.moduleGenerationId !== claim.moduleGenerationId
+      ) {
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          "A Module result may be retired only after its exact Claim committed",
+          { ...claim },
+        );
+      }
+      if (
+        this.#moduleSubmissionRecords.get(claim.runId) !== undefined ||
+        this.#activeClaimsWithUnknownSubmissionHistory.has(claim.runId)
+      ) {
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          "A Module result with a submission record or unknown submission history cannot be retired",
+          { runId: claim.runId },
+        );
+      }
+
+      if (blockEffect !== null) {
+        this.#blocks.releaseCommitEffect(blockEffectId);
+        this.#blocks.retireCommitEffect(blockEffectId);
+        for (const deliveryEffectId of ticket.deliveryEffectIds) {
+          this.#deliveries.retireAppendEffect(deliveryEffectId);
+        }
+      }
     });
   }
 

@@ -44,7 +44,7 @@ const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
  * in progress" from corruption.
  */
 const MODULE_RESULT_COMMIT_RETIREMENT_SCHEMA_VERSION =
-  "dolly.commit-effect-retirement/1";
+  "dolly.commit-effect-retirement/2";
 
 export type ModuleResultCommitState = "prepared" | "committed";
 
@@ -260,6 +260,28 @@ export function moduleJobResultDigest(
     blockProposal: record.blockProposal ?? null,
     outputPageIds: record.outputPageIds,
   });
+}
+
+/**
+ * The deterministic identity of the BlockStore commit-effect tombstone one
+ * Module result owns. The Module-result retirement protocol and the FileCore
+ * retirement operation share this one derivation, so recovery and the store-bound
+ * retirement can agree on the exact identity without a second convention.
+ */
+export function moduleResultCommitBlockEffectId(moduleJobId: string): string {
+  return canonicalJsonDigest(["module-result-commit-block", moduleJobId]);
+}
+
+/**
+ * The deterministic identity of the DeliveryStore append-effect tombstone one
+ * Module result owns for one exact output page. The protocol and the FileCore
+ * retirement operation share this one derivation.
+ */
+export function moduleResultCommitDeliveryEffectId(
+  moduleJobId: string,
+  pageId: string,
+): string {
+  return canonicalJsonDigest(["module-result-commit-delivery", moduleJobId, pageId]);
 }
 
 export function assertModuleResultCommitRecord(record: ModuleResultCommitRecord): void {
@@ -700,6 +722,22 @@ export interface ModuleResultCommitOperations {
         readonly status: "backpressured";
         readonly blockedConsumerIds: readonly string[];
       };
+  /**
+   * One store-bound atomic FileCore retirement: releases the owned Block
+   * tombstone and retires every exact Delivery append-effect proved by the
+   * staged version-2 retirement ticket, in a single durable Core-state write.
+   * Persistent implementations revalidate everything against the stores while
+   * the update is deferred, so missing, extra, duplicated, stale, or foreign
+   * identities fail closed before any effect is removed. Direct protocol
+   * fixtures may omit this operation; their journal hits no capacity limit, so
+   * they never reach the prune that would call it.
+   */
+  readonly retireModuleResultEffects?: (input: {
+    readonly moduleJobId: string;
+    readonly claim: DeliveryClaimIdentity;
+    readonly blockEffectId: string;
+    readonly deliveryEffectIds: readonly string[];
+  }) => void;
 }
 
 export interface ModuleResultCommitCoordinatorOptions
@@ -736,6 +774,8 @@ export class ModuleResultCommitCoordinator {
     ModuleResultCommitCoordinatorOptions["getModuleSubmissionRecord"];
   readonly #commitOutputBatch:
     ModuleResultCommitCoordinatorOptions["commitOutputBatch"];
+  readonly #retireModuleResultEffects:
+    ModuleResultCommitCoordinatorOptions["retireModuleResultEffects"];
   readonly #repository: ModuleResultCommitRepository;
   readonly #now: () => string;
   readonly #afterEffect?: ModuleResultCommitCoordinatorOptions["afterEffect"];
@@ -752,6 +792,7 @@ export class ModuleResultCommitCoordinator {
     this.#acknowledgeDeliveryClaim = options.acknowledgeDeliveryClaim;
     this.#getModuleSubmissionRecord = options.getModuleSubmissionRecord;
     this.#commitOutputBatch = options.commitOutputBatch;
+    this.#retireModuleResultEffects = options.retireModuleResultEffects;
     this.#repository = options.repository;
     this.#now = options.now;
     this.#afterEffect = options.afterEffect;
@@ -1299,12 +1340,29 @@ export class ModuleResultCommitCoordinator {
       );
     }
 
+    // The reopened state must be all-old or all-retired under the exact
+    // version-2 anchor: a version-2 ticket authorizes every owned Delivery
+    // append-effect to be absent, but a partial subset (or a version-1 ticket,
+    // which never retires Deliveries) stays fail-closed in the loop below.
+    const retiredDeliverySetComplete =
+      blockEffect === null &&
+      retirementTicket !== null &&
+      retirementTicket.schemaVersion === MODULE_RESULT_COMMIT_RETIREMENT_SCHEMA_VERSION &&
+      ticketsDeliveryEffectSetMatches(retirementTicket, record);
     for (let index = 0; index < record.outputPageIds.length; index += 1) {
       const pageId = record.outputPageIds[index]!;
       const output = record.outputDeliveries[index];
       const deliveryEffect = this.#deliveries.inspectAppendEffect(
         this.#deliveryEffectId(record.moduleJobId, pageId),
       );
+      if (retiredDeliverySetComplete) {
+        if (deliveryEffect === null) continue;
+        throw new ModuleResultCommitError(
+          "MODULE_RESULT_PERSISTED_STATE_CONFLICT",
+          `Module result ${record.moduleJobId} retired its Block effect but left a Delivery append-effect for Page ${pageId}; no partial retirement is allowed`,
+          { moduleJobId: record.moduleJobId, pageId },
+        );
+      }
       if (output !== undefined) {
         if (
           deliveryEffect !== null &&
@@ -1590,7 +1648,17 @@ export class ModuleResultCommitCoordinator {
       if (record.blockProposal !== undefined) {
         const effectId = this.#blockEffectId(record.moduleJobId);
         const blockEffect = this.#blocks.inspectCommitEffect(effectId);
-        if (blockEffect !== null) {
+        if (blockEffect === null) {
+          // All-old or all-retired: a present ticket means the retirement is
+          // already applied (or in-flight under legacy v1). Staging and the
+          // atomic retire op are both idempotent no-ops here; the revision
+          // checked journal delete plus ticket clear below finish it.
+          this.#blocks.releaseCommitEffect(effectId);
+          this.#blocks.retireCommitEffect(effectId);
+        } else if (this.#retireModuleResultEffects !== undefined) {
+          const deliveryEffectIds = record.outputPageIds.map((pageId) =>
+            this.#deliveryEffectId(record.moduleJobId, pageId),
+          );
           this.#blocks.stageCommitEffectRetirement(effectId, {
             schemaVersion: MODULE_RESULT_COMMIT_RETIREMENT_SCHEMA_VERSION,
             moduleJobId: record.moduleJobId,
@@ -1599,10 +1667,18 @@ export class ModuleResultCommitCoordinator {
               proposal: record.blockProposal,
               source: record.source,
             }),
+            deliveryEffectIds,
           });
+          this.#retireModuleResultEffects({
+            moduleJobId: record.moduleJobId,
+            claim: this.#claimIdentity(record),
+            blockEffectId: effectId,
+            deliveryEffectIds,
+          });
+        } else {
+          this.#blocks.releaseCommitEffect(effectId);
+          this.#blocks.retireCommitEffect(effectId);
         }
-        this.#blocks.releaseCommitEffect(effectId);
-        this.#blocks.retireCommitEffect(effectId);
       }
       if (!this.#repository.deleteIfRevision(record.moduleJobId, record.revision)) continue;
       if (record.blockProposal !== undefined) {
@@ -1733,7 +1809,7 @@ export class ModuleResultCommitCoordinator {
   }
 
   #blockEffectId(moduleJobId: string): string {
-    return canonicalJsonDigest(["module-result-commit-block", moduleJobId]);
+    return moduleResultCommitBlockEffectId(moduleJobId);
   }
 
   #ticketMatchesRecord(
@@ -1745,11 +1821,28 @@ export class ModuleResultCommitCoordinator {
       ticket !== null &&
       ticket.moduleJobId === record.moduleJobId &&
       ticket.blockId === record.blockId &&
-      ticket.digest === expectedBlockEffectDigest
+      ticket.digest === expectedBlockEffectDigest &&
+      (ticket.schemaVersion !== MODULE_RESULT_COMMIT_RETIREMENT_SCHEMA_VERSION ||
+        ticketsDeliveryEffectSetMatches(ticket, record))
     );
   }
 
   #deliveryEffectId(moduleJobId: string, pageId: string): string {
-    return canonicalJsonDigest(["module-result-commit-delivery", moduleJobId, pageId]);
+    return moduleResultCommitDeliveryEffectId(moduleJobId, pageId);
   }
+}
+
+function ticketsDeliveryEffectSetMatches(
+  ticket: Extract<
+    BlockCommitEffectRetirementTicketSnapshot,
+    { readonly schemaVersion: "dolly.commit-effect-retirement/2" }
+  >,
+  record: ModuleResultCommitRecord,
+): boolean {
+  return (
+    ticket.deliveryEffectIds.length === record.outputPageIds.length &&
+    record.outputPageIds.every(
+      (pageId, index) => ticket.deliveryEffectIds[index] === moduleResultCommitDeliveryEffectId(record.moduleJobId, pageId),
+    )
+  );
 }

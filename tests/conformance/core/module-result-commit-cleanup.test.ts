@@ -7,6 +7,7 @@ import { ReferenceGraph } from "../../../src/core/reference-graph.js";
 import { canonicalJsonDigest, type JsonValue } from "../../../src/core/canonical-json.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
+import { InMemoryModuleResultCommitRepository } from "../../../src/core/module-result-commit.js";
 import { createModuleResultCommitCoordinator } from "../../../src/core/module-result-commit-factory.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 const NOW = "2026-07-24T00:00:00.000Z";
@@ -31,6 +32,16 @@ function proposal(text: string): BlockProposal {
  */
 function moduleResultBlockEffectId(moduleJobId: string): string {
   return canonicalJsonDigest(["module-result-commit-block", moduleJobId]);
+}
+
+/**
+ * A Module-result Delivery append-effect is identified by the same effect-id
+ * derivation the coordinator and FileStoreCore use: the canonical digest of
+ * of the literal marker tuple `["module-result-commit-delivery", moduleJobId,
+ * pageId]`.
+ */
+function moduleResultDeliveryEffectId(moduleJobId: string, pageId: string): string {
+  return canonicalJsonDigest(["module-result-commit-delivery", moduleJobId, pageId]);
 }
 
 interface StoreHarness {
@@ -382,6 +393,726 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       // The first job's tombstone is retired and its journal deleted.
       expect(core.blocks.inspectCommitEffect(effectId)).toBeNull();
       expect(repository.get(claim.moduleJobId)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("RED: atomic retirement removes the exact Delivery append-effect on capacity-pressure prune and it stays absent after reopen", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dolly-cleanup-red-delivery-"));
+    try {
+      const statePath = join(root, "core-state.json");
+      const journalPath = join(root, "module-result-commits.json");
+      let blockId = 0;
+      let deliveryId = 0;
+      const core = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      setupOutput(core);
+      const claim = setupWorker(core, "worker", "input");
+      const deliveryEffectId = moduleResultDeliveryEffectId(claim.moduleJobId, "output");
+      const repository = new FileModuleResultCommitRepository({
+        path: journalPath,
+        maxBytes: 1024,
+      });
+      const commits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes });
+      await commits.commit({
+        moduleJobId: claim.moduleJobId,
+        claimToken: claim.claimToken,
+        runId: claim.runId,
+        attempt: claim.attempt,
+        moduleGenerationId: claim.moduleGenerationId,
+        source: { kind: "module", id: "worker" },
+        outputPageIds: ["output"],
+        blockProposal: proposal("first"),
+      });
+      // The output Delivery append-effect is recorded commit-side, exactly as
+      // the protocol derives it; it must be the object the retirement retires.
+      expect(core.deliveries.inspectAppendEffect(deliveryEffectId)).toMatchObject({
+        pageId: "output",
+      });
+      const existingTicket = core.createModuleResultCommitOperations(mailboxes)
+        .blocks.inspectCommitEffectRetirementTicket(moduleResultBlockEffectId(claim.moduleJobId));
+      expect(existingTicket).toBeNull();
+
+      // A second committed result fills the confined journal and forces the
+      // one store-bound atomic retirement: Block tombstone, exact Delivery
+      // append-effect, and journal record all retire together.
+      const claim2 = setupWorker(core, "worker2", "input2");
+      const tightCommits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes });
+      await tightCommits.commit({
+        moduleJobId: claim2.moduleJobId,
+        claimToken: claim2.claimToken,
+        runId: claim2.runId,
+        attempt: claim2.attempt,
+        moduleGenerationId: claim2.moduleGenerationId,
+        source: { kind: "module", id: "worker2" },
+        outputPageIds: ["output"],
+        blockProposal: proposal("second"),
+      });
+
+      const effectId = moduleResultBlockEffectId(claim.moduleJobId);
+      expect(core.blocks.inspectCommitEffect(effectId)).toBeNull();
+      expect(core.deliveries.inspectAppendEffect(deliveryEffectId)).toBeNull();
+      expect(repository.get(claim.moduleJobId)).toBeNull();
+      expect(
+        core.createModuleResultCommitOperations(mailboxes)
+          .blocks.inspectCommitEffectRetirementTicket(effectId),
+      ).toBeNull();
+
+      // Reopen the durable Core state and journal: the retired delivery
+      // append-effect must stay absent and a second startup must stay
+      // unchanged (idempotent, no effect resurrection).
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      const reopenedRepository = new FileModuleResultCommitRepository({
+        path: journalPath,
+        maxBytes: 16 * 1024 * 1024,
+      });
+      expect(reopened.deliveries.inspectAppendEffect(deliveryEffectId)).toBeNull();
+      expect(reopened.blocks.inspectCommitEffect(effectId)).toBeNull();
+      expect(reopenedRepository.get(claim.moduleJobId)).toBeNull();
+
+      const recovering = createModuleResultCommitCoordinator({
+        core: reopened,
+        repository: reopenedRepository,
+        now: () => NOW,
+        mailboxes,
+      });
+      await expect(recovering.recoverAll()).resolves.toMatchObject({
+        recoveredCommits: [],
+        deferredCommits: [],
+      });
+      expect(reopened.deliveries.inspectAppendEffect(deliveryEffectId)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("crash between the durable ticket and the atomic retirement: reopen prunes the all-old state completely", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dolly-cleanup-pre-atomic-"));
+    try {
+      const statePath = join(root, "core-state.json");
+      const journalPath = join(root, "module-result-commits.json");
+      let blockId = 0;
+      let deliveryId = 0;
+      const core = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      setupOutput(core);
+      const claim = setupWorker(core, "worker", "input");
+      const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      const commits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes });
+      await commits.commit({
+        moduleJobId: claim.moduleJobId,
+        claimToken: claim.claimToken,
+        runId: claim.runId,
+        attempt: claim.attempt,
+        moduleGenerationId: claim.moduleGenerationId,
+        source: { kind: "module", id: "worker" },
+        outputPageIds: ["output"],
+        blockProposal: proposal("first"),
+      });
+      const record = repository.get(claim.moduleJobId)!;
+      const effectId = moduleResultBlockEffectId(claim.moduleJobId);
+      const deliveryEffectId = moduleResultDeliveryEffectId(claim.moduleJobId, "output");
+
+      // Crash window: only the durable version-2 retirement ticket is written;
+      // the atomic retirement (block + deliveries) never ran.
+      const operations = core.createModuleResultCommitOperations(mailboxes);
+      operations.blocks.stageCommitEffectRetirement(effectId, {
+        schemaVersion: "dolly.commit-effect-retirement/2",
+        moduleJobId: claim.moduleJobId,
+        blockId: record.blockId!,
+        digest: canonicalJsonDigest({
+          proposal: record.blockProposal,
+          source: record.source,
+        }),
+        deliveryEffectIds: [deliveryEffectId],
+      });
+      expect(core.blocks.inspectCommitEffect(effectId)).not.toBeNull();
+      expect(core.deliveries.inspectAppendEffect(deliveryEffectId)).not.toBeNull();
+
+      // Reopen: everything is still all-old and recovery must finish the
+      // atomic retirement, delete the journal, and clear the durable ticket.
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      const reopenedRepository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      expect(reopened.blocks.inspectCommitEffect(effectId)).not.toBeNull();
+      expect(reopened.deliveries.inspectAppendEffect(deliveryEffectId)).not.toBeNull();
+      expect(
+        reopened.createModuleResultCommitOperations(mailboxes)
+          .blocks.inspectCommitEffectRetirementTicket(effectId),
+      ).toMatchObject({ schemaVersion: "dolly.commit-effect-retirement/2" });
+
+      // Second committed result triggers the retry prune on the reopened store.
+      const claim2 = setupWorker(reopened, "worker2", "input2");
+      const tightCommits = createModuleResultCommitCoordinator({ core: reopened, repository: reopenedRepository, now: () => NOW, mailboxes });
+      await tightCommits.commit({
+        moduleJobId: claim2.moduleJobId,
+        claimToken: claim2.claimToken,
+        runId: claim2.runId,
+        attempt: claim2.attempt,
+        moduleGenerationId: claim2.moduleGenerationId,
+        source: { kind: "module", id: "worker2" },
+        outputPageIds: ["output"],
+        blockProposal: proposal("second"),
+      });
+
+      expect(reopened.blocks.inspectCommitEffect(effectId)).toBeNull();
+      expect(reopened.deliveries.inspectAppendEffect(deliveryEffectId)).toBeNull();
+      expect(reopenedRepository.get(claim.moduleJobId)).toBeNull();
+      expect(
+        reopened.createModuleResultCommitOperations(mailboxes)
+          .blocks.inspectCommitEffectRetirementTicket(effectId),
+      ).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("crash after the atomic retirement before the journal delete: reopen finishes and never resurrects effects", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dolly-cleanup-post-atomic-"));
+    try {
+      const statePath = join(root, "core-state.json");
+      const journalPath = join(root, "module-result-commits.json");
+      let blockId = 0;
+      let deliveryId = 0;
+      const core = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      setupOutput(core);
+      const claim = setupWorker(core, "worker", "input");
+      const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      const commits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes });
+      await commits.commit({
+        moduleJobId: claim.moduleJobId,
+        claimToken: claim.claimToken,
+        runId: claim.runId,
+        attempt: claim.attempt,
+        moduleGenerationId: claim.moduleGenerationId,
+        source: { kind: "module", id: "worker" },
+        outputPageIds: ["output"],
+        blockProposal: proposal("first"),
+      });
+      const record = repository.get(claim.moduleJobId)!;
+      const effectId = moduleResultBlockEffectId(claim.moduleJobId);
+      const deliveryEffectId = moduleResultDeliveryEffectId(claim.moduleJobId, "output");
+
+      // Apply the full atomic retirement through the real store-bound op, but
+      // stop before the journal delete (the delete that follows never ran).
+      const operations = core.createModuleResultCommitOperations(mailboxes);
+      operations.blocks.stageCommitEffectRetirement(effectId, {
+        schemaVersion: "dolly.commit-effect-retirement/2",
+        moduleJobId: claim.moduleJobId,
+        blockId: record.blockId!,
+        digest: canonicalJsonDigest({
+          proposal: record.blockProposal,
+          source: record.source,
+        }),
+        deliveryEffectIds: [deliveryEffectId],
+      });
+      operations.retireModuleResultEffects!({
+        moduleJobId: claim.moduleJobId,
+        claim: {
+          moduleJobId: claim.moduleJobId,
+          claimToken: claim.claimToken,
+          runId: claim.runId,
+          attempt: claim.attempt,
+          moduleGenerationId: claim.moduleGenerationId,
+        },
+        blockEffectId: effectId,
+        deliveryEffectIds: [deliveryEffectId],
+      });
+      expect(core.blocks.inspectCommitEffect(effectId)).toBeNull();
+      expect(core.deliveries.inspectAppendEffect(deliveryEffectId)).toBeNull();
+      expect(repository.get(claim.moduleJobId)?.state).toBe("committed");
+
+      // Reopen: the ticket is the only residue and recoverAll must finish the
+      // journal delete and clear the ticket, resurrecting nothing.
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      const reopenedRepository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      expect(reopened.blocks.inspectCommitEffect(effectId)).toBeNull();
+      expect(reopened.deliveries.inspectAppendEffect(deliveryEffectId)).toBeNull();
+      expect(
+        reopened.createModuleResultCommitOperations(mailboxes)
+          .blocks.inspectCommitEffectRetirementTicket(effectId),
+      ).toMatchObject({ schemaVersion: "dolly.commit-effect-retirement/2" });
+
+      const recovering = createModuleResultCommitCoordinator({ core: reopened, repository: reopenedRepository, now: () => NOW, mailboxes });
+      await recovering.recoverAll();
+
+      expect(reopenedRepository.get(claim.moduleJobId)).toBeNull();
+      expect(
+        reopened.createModuleResultCommitOperations(mailboxes)
+          .blocks.inspectCommitEffectRetirementTicket(effectId),
+      ).toBeNull();
+      expect(reopened.blocks.inspectCommitEffect(effectId)).toBeNull();
+      expect(reopened.deliveries.inspectAppendEffect(deliveryEffectId)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a stale version-1 ticket as authority for Delivery retirement on reopen", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dolly-cleanup-v1-ticket-"));
+    try {
+      const statePath = join(root, "core-state.json");
+      const journalPath = join(root, "module-result-commits.json");
+      let blockId = 0;
+      let deliveryId = 0;
+      const core = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      setupOutput(core);
+      const claim = setupWorker(core, "worker", "input");
+      const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      const commits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes });
+      await commits.commit({
+        moduleJobId: claim.moduleJobId,
+        claimToken: claim.claimToken,
+        runId: claim.runId,
+        attempt: claim.attempt,
+        moduleGenerationId: claim.moduleGenerationId,
+        source: { kind: "module", id: "worker" },
+        outputPageIds: ["output"],
+        blockProposal: proposal("first"),
+      });
+      const record = repository.get(claim.moduleJobId)!;
+      const effectId = moduleResultBlockEffectId(claim.moduleJobId);
+      const deliveryEffectId = moduleResultDeliveryEffectId(claim.moduleJobId, "output");
+
+      // A legacy v1 ticket may finish only the original Block retirement
+      // semantics. It must never authorize Delivery append deletion.
+      const operations = core.createModuleResultCommitOperations(mailboxes);
+      operations.blocks.stageCommitEffectRetirement(effectId, {
+        schemaVersion: "dolly.commit-effect-retirement/1",
+        moduleJobId: claim.moduleJobId,
+        blockId: record.blockId!,
+        digest: canonicalJsonDigest({
+          proposal: record.blockProposal,
+          source: record.source,
+        }),
+      });
+      operations.blocks.retireCommitEffect(effectId);
+      expect(core.blocks.inspectCommitEffect(effectId)).toBeNull();
+      expect(core.deliveries.inspectAppendEffect(deliveryEffectId)).not.toBeNull();
+
+      // Reopen; the committed journal's Delivery append-effect must survive.
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      const reopenedRepository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      expect(reopened.deliveries.inspectAppendEffect(deliveryEffectId)).not.toBeNull();
+
+      const recovering = createModuleResultCommitCoordinator({ core: reopened, repository: reopenedRepository, now: () => NOW, mailboxes });
+      await recovering.recoverAll();
+
+      // The v1 ticket retires only the Block tombstone; the Delivery
+      // append-effect is never touched and the journal delete still happens.
+      expect(reopenedRepository.get(claim.moduleJobId)).toBeNull();
+      expect(reopened.blocks.inspectCommitEffect(effectId)).toBeNull();
+      expect(reopened.deliveries.inspectAppendEffect(deliveryEffectId)).not.toBeNull();
+      expect(
+        reopened.createModuleResultCommitOperations(mailboxes)
+          .blocks.inspectCommitEffectRetirementTicket(effectId),
+      ).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed on partial Delivery retirement: a ticket with a stale set never deletes anything", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dolly-cleanup-partial-effect-"));
+    try {
+      const statePath = join(root, "core-state.json");
+      const journalPath = join(root, "module-result-commits.json");
+      let blockId = 0;
+      let blockIdGen = () => `block-${++blockId}`;
+      let deliveryId = 0;
+      const core = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: blockIdGen,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      setupOutput(core);
+      const claim = setupWorker(core, "worker", "input");
+      const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      const commits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes });
+      await commits.commit({
+        moduleJobId: claim.moduleJobId,
+        claimToken: claim.claimToken,
+        runId: claim.runId,
+        attempt: claim.attempt,
+        moduleGenerationId: claim.moduleGenerationId,
+        source: { kind: "module", id: "worker" },
+        outputPageIds: ["output"],
+        blockProposal: proposal("first"),
+      });
+      const record = repository.get(claim.moduleJobId)!;
+      const effectId = moduleResultBlockEffectId(claim.moduleJobId);
+      const deliveryEffectId = moduleResultDeliveryEffectId(claim.moduleJobId, "output");
+      const foreignEffectId = moduleResultDeliveryEffectId("some-other-job", "output");
+
+      // A version-2 ticket naming a stale/foreign Delivery effect cannot be
+      // used to delete anything: the store-bound op must fail closed before a
+      // single effect is removed.
+      const operations = core.createModuleResultCommitOperations(mailboxes);
+      operations.blocks.stageCommitEffectRetirement(effectId, {
+        schemaVersion: "dolly.commit-effect-retirement/2",
+        moduleJobId: claim.moduleJobId,
+        blockId: record.blockId!,
+        digest: canonicalJsonDigest({
+          proposal: record.blockProposal,
+          source: record.source,
+        }),
+        deliveryEffectIds: [foreignEffectId],
+      });
+      expect(() =>
+        operations.retireModuleResultEffects!({
+          moduleJobId: claim.moduleJobId,
+          claim: {
+            moduleJobId: claim.moduleJobId,
+            claimToken: claim.claimToken,
+            runId: claim.runId,
+            attempt: claim.attempt,
+            moduleGenerationId: claim.moduleGenerationId,
+          },
+          blockEffectId: effectId,
+          deliveryEffectIds: [foreignEffectId],
+        }),
+      ).toThrowError(
+        expect.objectContaining({ code: "MODULE_RESULT_PERSISTED_STATE_CONFLICT" }),
+      );
+      expect(core.blocks.inspectCommitEffect(effectId)).not.toBeNull();
+      expect(core.deliveries.inspectAppendEffect(deliveryEffectId)).not.toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("multi-output atomic retirement: every exact append-effect retires in one prune", async () => {
+    const multiMailboxes = [
+      { consumerId: "sink", pageIds: ["output-a", "output-b"], maxResidentCount: 8, maxResidentBytes: 1024 * 1024 },
+    ];
+    const root = mkdtempSync(join(tmpdir(), "dolly-cleanup-multi-output-"));
+    try {
+      const statePath = join(root, "core-state.json");
+      const journalPath = join(root, "module-result-commits.json");
+      let blockId = 0;
+      let deliveryId = 0;
+      const core = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      core.deliveries.createPage("output-a");
+      core.deliveries.createPage("output-b");
+      core.deliveries.registerConsumer("output-a", "sink", "from-now");
+      core.deliveries.registerConsumer("output-b", "sink", "from-now");
+      const claim = setupWorker(core, "worker", "input");
+      const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1536 });
+      const commits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes: multiMailboxes });
+      await commits.commit({
+        moduleJobId: claim.moduleJobId,
+        claimToken: claim.claimToken,
+        runId: claim.runId,
+        attempt: claim.attempt,
+        moduleGenerationId: claim.moduleGenerationId,
+        source: { kind: "module", id: "worker" },
+        outputPageIds: ["output-a", "output-b"],
+        blockProposal: proposal("first"),
+      });
+      const effectId = moduleResultBlockEffectId(claim.moduleJobId);
+      const effectA = moduleResultDeliveryEffectId(claim.moduleJobId, "output-a");
+      const effectB = moduleResultDeliveryEffectId(claim.moduleJobId, "output-b");
+      expect(core.deliveries.inspectAppendEffect(effectA)).not.toBeNull();
+      expect(core.deliveries.inspectAppendEffect(effectB)).not.toBeNull();
+
+      const claim2 = setupWorker(core, "worker2", "input2");
+      const tightCommits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes: multiMailboxes });
+      await tightCommits.commit({
+        moduleJobId: claim2.moduleJobId,
+        claimToken: claim2.claimToken,
+        runId: claim2.runId,
+        attempt: claim2.attempt,
+        moduleGenerationId: claim2.moduleGenerationId,
+        source: { kind: "module", id: "worker2" },
+        outputPageIds: ["output-a", "output-b"],
+        blockProposal: proposal("second"),
+      });
+
+      expect(core.blocks.inspectCommitEffect(effectId)).toBeNull();
+      expect(core.deliveries.inspectAppendEffect(effectA)).toBeNull();
+      expect(core.deliveries.inspectAppendEffect(effectB)).toBeNull();
+      expect(repository.get(claim.moduleJobId)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("E: an opaque SourceActivation append-effect in the same stores survives Module-result cleanup and reopen", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dolly-cleanup-sa-isolation-"));
+    try {
+      const statePath = join(root, "core-state.json");
+      const journalPath = join(root, "module-result-commits.json");
+      let blockId = 0;
+      let deliveryId = 0;
+      const core = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      core.deliveries.createPage("output");
+      core.deliveries.createPage("private");
+      core.deliveries.registerConsumer("output", "sink", "from-now");
+      // SourceActivation uses its own private page and opaque effect
+      // identities; it is never part of any Module-result commit.
+      core.deliveries.registerConsumer("private", "source", "from-now");
+      const saBlock = core.blocks.commitOnce(
+        "source-activation.test.block.00000000",
+        proposal("source activation"),
+        { kind: "external", id: "source-activation" },
+      );
+      const saDelivery = core.deliveries.appendOnce(
+        "source-activation.test.delivery.00000000",
+        "private",
+        saBlock.id,
+      );
+
+      const claim = setupWorker(core, "worker", "input");
+      const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      const commits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes });
+      await commits.commit({
+        moduleJobId: claim.moduleJobId,
+        claimToken: claim.claimToken,
+        runId: claim.runId,
+        attempt: claim.attempt,
+        moduleGenerationId: claim.moduleGenerationId,
+        source: { kind: "module", id: "worker" },
+        outputPageIds: ["output"],
+        blockProposal: proposal("first"),
+      });
+      // Capacity prune retires the Module result's own effects atomically.
+      const claim2 = setupWorker(core, "worker2", "input2");
+      const tightCommits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes });
+      await tightCommits.commit({
+        moduleJobId: claim2.moduleJobId,
+        claimToken: claim2.claimToken,
+        runId: claim2.runId,
+        attempt: claim2.attempt,
+        moduleGenerationId: claim2.moduleGenerationId,
+        source: { kind: "module", id: "worker2" },
+        outputPageIds: ["output"],
+        blockProposal: proposal("second"),
+      });
+      const moduleEffectId = moduleResultBlockEffectId(claim.moduleJobId);
+      const moduleDeliveryEffectId = moduleResultDeliveryEffectId(claim.moduleJobId, "output");
+      expect(core.blocks.inspectCommitEffect(moduleEffectId)).toBeNull();
+      expect(core.deliveries.inspectAppendEffect(moduleDeliveryEffectId)).toBeNull();
+      // The opaque SourceActivation effect stays byte/identity-equivalent.
+      expect(core.blocks.inspectCommitEffect("source-activation.test.block.00000000")).not.toBeNull();
+      expect(core.deliveries.inspectAppendEffect("source-activation.test.delivery.00000000")).toMatchObject({
+        pageId: "private",
+        blockId: saBlock.id,
+      });
+
+      // Reopen: identity-equivalent and idempotency still resolves terminal
+      // duplicates exactly as before the Module-result cleanup.
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      // The opaque SourceActivation append-effect is byte/identity-equivalent
+      // across reopen and its terminal duplicate still resolves.
+      expect(reopened.deliveries.inspectAppendEffect("source-activation.test.delivery.00000000")).toMatchObject({
+        pageId: "private",
+        blockId: saBlock.id,
+      });
+      const reopenedIdempotent = reopened.deliveries.appendOnce(
+        "source-activation.test.delivery.00000000",
+        "private",
+        saBlock.id,
+      );
+      expect(reopenedIdempotent).toEqual(saDelivery);
+      expect(reopened.blocks.inspectCommitEffect("source-activation.test.block.00000000")).not.toBeNull();
+      expect(
+        reopened.deliveries.inspectAppendEffect("source-activation.test.delivery.00000000")!.record.blockId,
+      ).toBe(saBlock.id);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("C: journal absence alone is never cleanup authority; the durable anchor is required", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dolly-cleanup-journal-absent-"));
+    try {
+      const statePath = join(root, "core-state.json");
+      const journalPath = join(root, "module-result-commits.json");
+      let blockId = 0;
+      let deliveryId = 0;
+      const core = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      setupOutput(core);
+      const claim = setupWorker(core, "worker", "input");
+      const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      const commits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes });
+      await commits.commit({
+        moduleJobId: claim.moduleJobId,
+        claimToken: claim.claimToken,
+        runId: claim.runId,
+        attempt: claim.attempt,
+        moduleGenerationId: claim.moduleGenerationId,
+        source: { kind: "module", id: "worker" },
+        outputPageIds: ["output"],
+        blockProposal: proposal("first"),
+      });
+      const effectId = moduleResultBlockEffectId(claim.moduleJobId);
+      const deliveryEffectId = moduleResultDeliveryEffectId(claim.moduleJobId, "output");
+      // The journal disappears out from under the store, with no durable
+      // ticket ever staged. Absence alone must never become cleanup authority:
+      // recovery leaves the committed effects untouched.
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      // The journal for this result is entirely absent: no record and no
+      // durable ticket were ever written. Absence alone must never grant
+      // cleanup authority, so recovery lifts nothing.
+      const reopenedJournal = new InMemoryModuleResultCommitRepository();
+      const recovering = createModuleResultCommitCoordinator({
+        core: reopened,
+        repository: reopenedJournal,
+        now: () => NOW,
+        mailboxes,
+      });
+      await expect(recovering.recoverAll()).resolves.toMatchObject({
+        recoveredCommits: [],
+        deferredCommits: [],
+      });
+      // No ticket exists, so absence proved nothing: effects stay untouched.
+      expect(reopened.blocks.inspectCommitEffect(effectId)).not.toBeNull();
+      expect(reopened.deliveries.inspectAppendEffect(deliveryEffectId)).not.toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("F: wrong Claim identity or wrong digest on retirement fails closed with no effect removed", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dolly-cleanup-wrong-claim-"));
+    try {
+      const statePath = join(root, "core-state.json");
+      const journalPath = join(root, "module-result-commits.json");
+      let blockId = 0;
+      let deliveryId = 0;
+      const core = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => `block-${++blockId}`,
+        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+        now: () => NOW,
+      });
+      setupOutput(core);
+      const claim = setupWorker(core, "worker", "input");
+      const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
+      const commits = createModuleResultCommitCoordinator({ core, repository, now: () => NOW, mailboxes });
+      await commits.commit({
+        moduleJobId: claim.moduleJobId,
+        claimToken: claim.claimToken,
+        runId: claim.runId,
+        attempt: claim.attempt,
+        moduleGenerationId: claim.moduleGenerationId,
+        source: { kind: "module", id: "worker" },
+        outputPageIds: ["output"],
+        blockProposal: proposal("first"),
+      });
+      const record = repository.get(claim.moduleJobId)!;
+      const effectId = moduleResultBlockEffectId(claim.moduleJobId);
+      const deliveryEffectId = moduleResultDeliveryEffectId(claim.moduleJobId, "output");
+      const operations = core.createModuleResultCommitOperations(mailboxes);
+      operations.blocks.stageCommitEffectRetirement(effectId, {
+        schemaVersion: "dolly.commit-effect-retirement/2",
+        moduleJobId: claim.moduleJobId,
+        blockId: record.blockId!,
+        digest: canonicalJsonDigest({
+          proposal: record.blockProposal,
+          source: record.source,
+        }),
+        deliveryEffectIds: [deliveryEffectId],
+      });
+      // Wrong Claim identity (swapped runId): the store-bound op fails
+      // closed on the exact delivery-claim mismatch before any mutation.
+      expect(() =>
+        operations.retireModuleResultEffects!({
+          moduleJobId: claim.moduleJobId,
+          claim: {
+            moduleJobId: claim.moduleJobId,
+            claimToken: claim.claimToken,
+            runId: "not-the-run",
+            attempt: claim.attempt,
+            moduleGenerationId: claim.moduleGenerationId,
+          },
+          blockEffectId: effectId,
+          deliveryEffectIds: [deliveryEffectId],
+        }),
+      ).toThrowError(
+        expect.objectContaining({ code: "CLAIM_RUN_MISMATCH" }),
+      );
+      expect(core.blocks.inspectCommitEffect(effectId)).not.toBeNull();
+      expect(core.deliveries.inspectAppendEffect(deliveryEffectId)).not.toBeNull();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

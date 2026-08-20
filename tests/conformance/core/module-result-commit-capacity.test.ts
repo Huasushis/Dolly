@@ -214,43 +214,13 @@ describe("FileCore Module output capacity", () => {
     }] as const;
     const operations = core.createModuleResultCommitOperations(mailboxes);
     const releaseFailure = new Error("simulated Block effect release failure");
-    const failingBlocks = {
-      commitOnce: operations.blocks.commitOnce.bind(operations.blocks),
-      inspectCommitEffect: operations.blocks.inspectCommitEffect.bind(operations.blocks),
-      inspectCommitEffectRetirementTicket:
-        operations.blocks.inspectCommitEffectRetirementTicket.bind(operations.blocks),
-      listCommitEffectRetirementTickets:
-        operations.blocks.listCommitEffectRetirementTickets.bind(operations.blocks),
-      normalizeInput: operations.blocks.normalizeInput.bind(operations.blocks),
-      releaseCommitEffect: () => { throw releaseFailure; },
-      retireCommitEffect: operations.blocks.retireCommitEffect.bind(operations.blocks),
-      stageCommitEffectRetirement:
-        operations.blocks.stageCommitEffectRetirement.bind(operations.blocks),
-      clearCommitEffectRetirementTicket:
-        operations.blocks.clearCommitEffectRetirementTicket.bind(operations.blocks),
-      validateInput: operations.blocks.validateInput.bind(operations.blocks),
-      validateSource: operations.blocks.validateSource.bind(operations.blocks),
-    };
-    const failingDeliveries = {
-      appendOnce: operations.deliveries.appendOnce.bind(operations.deliveries),
-      inspectAppendEffect:
-        operations.deliveries.inspectAppendEffect.bind(operations.deliveries),
-      inspectClaim: operations.deliveries.inspectClaim.bind(operations.deliveries),
-      inspectClaimInput:
-        operations.deliveries.inspectClaimInput.bind(operations.deliveries),
-      inspectClaimInputBlockIds:
-        operations.deliveries.inspectClaimInputBlockIds.bind(operations.deliveries),
-      inspectClaimInputMediaReferences:
-        operations.deliveries.inspectClaimInputMediaReferences.bind(operations.deliveries),
-      listPageIds: operations.deliveries.listPageIds.bind(operations.deliveries),
-      validateOutputPages:
-        operations.deliveries.validateOutputPages.bind(operations.deliveries),
-      usesSameBlockStore: (candidate: unknown) => candidate === failingBlocks,
-    };
+    // The retirement is now one store-bound atomic op; simulate a crash at
+    // its boundary by letting the durable ticket stage and then failing the
+    // retirement before it runs, so the committed journal and all effects
+    // survive untouched for a fresh coordinator to finish.
     const interruptedCleanup = new ModuleResultCommitCoordinator({
       ...operations,
-      blocks: failingBlocks,
-      deliveries: failingDeliveries,
+      retireModuleResultEffects: () => { throw releaseFailure; },
       repository: reopenedRepository,
       now: () => NOW,
     });
