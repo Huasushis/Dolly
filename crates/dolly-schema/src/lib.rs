@@ -7,11 +7,16 @@
 
 mod bundle;
 mod catalog;
+mod crop;
 mod generated;
 mod validator;
 
 pub use bundle::SchemaBundle;
 pub use catalog::{CatalogEntry, SchemaCatalog, schema_canonical_bytes, schema_digest};
+pub use crop::{
+    CROP_NORMALIZED_SCALE, CropError, CropErrorCode, CropRect, DisplaySize, ExifOrientation,
+    MAX_SUPPORTED_DIMENSION, MaterializedBounds, materialize_crop_bounds,
+};
 pub use generated::*;
 pub use validator::{SchemaError, SchemaValidator, ValidationErrors, ValidationIssue};
 
