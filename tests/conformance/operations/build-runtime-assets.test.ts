@@ -13,6 +13,9 @@ import {
 const LAUNCHER_PATH = "src/adapters/linux-module-launcher/launcher.py";
 const LAUNCHER_CONSUMER_PATH =
   "src/adapters/linux-module-launcher/linux-module-launcher-process.js";
+const CONSOLE_WEB_DIR = "src/extensions/console/web";
+const CONSOLE_WEB_CONSUMER_PATH = "src/extensions/console/web-channel.js";
+const CONSOLE_WEB_ASSETS = ["index.html", "app.js", "styles.css"];
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -32,6 +35,14 @@ async function fixture() {
   const compiledConsumer = join(outputDirectory, LAUNCHER_CONSUMER_PATH);
   mkdirSync(dirname(compiledConsumer), { recursive: true });
   writeFileSync(compiledConsumer, "export const compiled = true;\n");
+  const webDirectory = join(repositoryRoot, CONSOLE_WEB_DIR);
+  mkdirSync(webDirectory, { recursive: true });
+  for (const name of CONSOLE_WEB_ASSETS) {
+    writeFileSync(join(webDirectory, name), `/* ${name} */\n`);
+  }
+  const webConsumer = join(outputDirectory, CONSOLE_WEB_CONSUMER_PATH);
+  mkdirSync(dirname(webConsumer), { recursive: true });
+  writeFileSync(webConsumer, "export const loader = true;\n");
   return { repositoryRoot, outputDirectory, source };
 }
 
@@ -46,7 +57,10 @@ describe("runtime build assets", () => {
   it("copies the Linux launcher beside its compiled module with exact bytes", async () => {
     const { repositoryRoot, outputDirectory, source } = await fixture();
 
-    expect(copyRuntimeAssets({ repositoryRoot, outputDirectory })).toEqual([LAUNCHER_PATH]);
+    expect(copyRuntimeAssets({ repositoryRoot, outputDirectory })).toEqual([
+      LAUNCHER_PATH,
+      ...CONSOLE_WEB_ASSETS.map((name) => join(CONSOLE_WEB_DIR, name)),
+    ]);
 
     const target = join(outputDirectory, LAUNCHER_PATH);
     expect(readFileSync(target)).toEqual(readFileSync(source));
@@ -83,5 +97,20 @@ describe("runtime build assets", () => {
     expect(() => copyRuntimeAssets({ repositoryRoot, outputDirectory })).toThrow(
       /Compiled runtime asset consumer/u,
     );
+  });
+
+  it("copies the console web assets beside their loader with exact bytes", async () => {
+    const { repositoryRoot, outputDirectory } = await fixture();
+
+    const assets = copyRuntimeAssets({ repositoryRoot, outputDirectory });
+
+    // Deterministic order: launcher first, then page, script, styles.
+    expect(assets.slice(0, 1)).toEqual([LAUNCHER_PATH]);
+    expect(assets.slice(1)).toEqual(CONSOLE_WEB_ASSETS.map((name) => join(CONSOLE_WEB_DIR, name)));
+    for (const name of CONSOLE_WEB_ASSETS) {
+      const target = join(outputDirectory, CONSOLE_WEB_DIR, name);
+      expect(readFileSync(target, "utf8")).toBe(`/* ${name} */\n`);
+      expect(statSync(target).mode & 0o777).toBe(0o644);
+    }
   });
 });
