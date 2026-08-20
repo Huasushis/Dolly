@@ -5,6 +5,7 @@ import {
   type ExtensionCapabilityGrant,
   type ExtensionSessionIdentity,
 } from "../../../src/core/extension-capability.js";
+import { formatVersion19ProcessGenerationId } from "../../../src/core/linux-identifier-formats.js";
 
 const NOW = "2026-07-24T00:00:00.000Z";
 
@@ -438,5 +439,21 @@ describe("extension capability session authority", () => {
       message: "Capability broker dependency failed",
     });
     expect(JSON.stringify(failure)).not.toContain("super-secret");
+  });
+
+  it("accepts a store-owned v19 identifier as the process generation identity field", () => {
+    const broker = authority();
+    const v19Generation = formatVersion19ProcessGenerationId(7);
+    const session = broker.openSession(identity("session-a", v19Generation));
+    expect(session.identity.processGenerationId).toBe(v19Generation);
+  });
+
+  it("still rejects a store-owned v19 identifier as the session identity field", () => {
+    const broker = authority();
+    const v19Generation = formatVersion19ProcessGenerationId(7);
+    expect(() => broker.openSession(identity(v19Generation))).toThrow(
+      /CAPABILITY_CONFIG_INVALID|sessionId is not a valid identifier/u,
+    );
+    expect(() => broker.openSession(identity("session-a", v19Generation))).not.toThrow();
   });
 });

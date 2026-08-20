@@ -17,6 +17,7 @@ import {
   type ExtensionCapabilitySession,
 } from "./extension-capability.js";
 import { FramedJsonChannel, FramedJsonError } from "./framed-json-channel.js";
+import { isVersion19ProcessGenerationId } from "./linux-identifier-formats.js";
 import {
   ModuleExecutorTerminationUnconfirmedError,
   ModuleExecutorTerminatedError,
@@ -796,8 +797,15 @@ function attachChildProcess(
   };
 }
 
-function assertGeneratedIdentifier(value: string): void {
-  if (!IDENTIFIER_PATTERN.test(value)) {
+function assertGeneratedIdentifier(
+  value: string,
+  purpose: "process-generation" | "session" | "request",
+): void {
+  const valid =
+    purpose === "process-generation"
+      ? IDENTIFIER_PATTERN.test(value) || isVersion19ProcessGenerationId(value)
+      : IDENTIFIER_PATTERN.test(value);
+  if (!valid) {
     throw new ExtensionProcessHostError(
       "EXTENSION_HOST_OPTIONS_INVALID",
       "Runtime generated an invalid identifier",
@@ -2156,7 +2164,7 @@ export class ExtensionProcessHost {
 
   #generateIdentifier(purpose: "process-generation" | "session" | "request"): string {
     const value = this.#nextIdentifier(purpose);
-    assertGeneratedIdentifier(value);
+    assertGeneratedIdentifier(value, purpose);
     return value;
   }
 }

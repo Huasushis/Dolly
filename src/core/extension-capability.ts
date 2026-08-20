@@ -7,6 +7,7 @@ import {
   deepFreeze,
   type JsonValue,
 } from "./canonical-json.js";
+import { isVersion19ProcessGenerationId } from "./linux-identifier-formats.js";
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const HANDLE_PATTERN = /^[A-Za-z0-9_-]{43,128}$/;
@@ -177,7 +178,21 @@ function immutableJson<T extends JsonValue>(value: T): T {
 }
 
 function immutableIdentity(identity: ExtensionSessionIdentity): ExtensionSessionIdentity {
-  for (const [label, value] of Object.entries(identity)) assertId(value, label);
+  assertId(identity.extensionId, "extensionId");
+  assertId(identity.instanceId, "instanceId");
+  if (
+    typeof identity.processGenerationId !== "string" ||
+    (!ID_PATTERN.test(identity.processGenerationId) &&
+      !isVersion19ProcessGenerationId(identity.processGenerationId))
+  ) {
+    throw new ExtensionCapabilityError(
+      "CAPABILITY_CONFIG_INVALID",
+      "processGenerationId is not a valid identifier",
+    );
+  }
+  assertId(identity.sessionId, "sessionId");
+  assertId(identity.moduleId, "moduleId");
+  assertId(identity.moduleGenerationId, "moduleGenerationId");
   return deepFreeze({ ...identity }) as ExtensionSessionIdentity;
 }
 
