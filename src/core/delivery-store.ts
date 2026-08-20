@@ -1201,6 +1201,34 @@ export class DeliveryStore {
   }
 
   /**
+   * Removes one exact append-effect tombstone recorded by the Module-result
+   * commit protocol. This is not a generic public delete: it is bound to the
+   * exact identities a durable retirement ticket proved to the FileCore
+   * atomic update, and it fails closed when the effect is absent or when the
+   * effect's delivery record is still load-bearing for another consumer.
+   *
+   * The delivery record itself is intentionally preserved: it is a live
+   * artifact that downstream claims resolve by identity, and retirement only
+   * releases the protocol's own effect ownership, never live Delivery IDs or
+   * used-ID history.
+   */
+  retireAppendEffect(effectId: string): "retired" {
+    this.flushPersistence();
+    assertId(effectId, "effectId");
+    const effect = this.#appendEffects.get(effectId);
+    if (effect === undefined) {
+      throw new DeliveryStoreError(
+        "DELIVERY_EFFECT_CONFLICT",
+        `Delivery append effect ${effectId} is not committed and cannot be retired`,
+        { effectId },
+      );
+    }
+    this.#appendEffects.delete(effectId);
+    this.#persistMutation();
+    return "retired";
+  }
+
+  /**
    * Lists every existing Page identity without exposing the rest of the
    * Delivery snapshot. Append effects can target only existing Pages, and
    * Pages are not removed, so callers can inspect a deterministic effect ID
