@@ -1,0 +1,103 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-AUTH-002",
+  "kind": "crash_recovery",
+  "covers": ["REQ-ACT-003", "REQ-ACT-004", "INV-ACTIVATION-012", "INV-ACTIVATION-013", "INV-ACTIVATION-015"],
+  "initial": {
+    "installed_executable_module_count": 2,
+    "inspected_configuration": {
+      "instance_id": "0198ab31-6c44-7e8a-b2bb-000000000511",
+      "config_revision": 42,
+      "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "service_candidate": {
+      "schema": "dolly.linux-service-candidate/v1",
+      "origin": {
+        "kind": "installed_product_component",
+        "component_id": "org.dolly.runtime.service-candidate",
+        "component_revision": 2,
+        "component_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "unit_name": "dollyd@main.service",
+      "mode": "user"
+    },
+    "cases": {
+      "non_linux": {
+        "platform": "windows",
+        "controller_lock_exists": false,
+        "core_store_exists": false
+      },
+      "linux_current": {
+        "platform": "linux",
+        "current_config_revision": 42,
+        "current_config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "all_premise_digests_valid": true,
+        "service_binding_verified": true,
+        "delegated_root_prepared_and_read_back": true,
+        "old_module_containers_empty": true,
+        "startup_recovery_complete": true
+      },
+      "linux_config_changed": {
+        "platform": "linux",
+        "current_config_revision": 43,
+        "current_config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "linux_untrusted_candidate_origin": {
+        "platform": "linux",
+        "candidate_source": "environment_only"
+      },
+      "linux_system_mode": {
+        "platform": "linux",
+        "candidate_mode": "system"
+      }
+    }
+  },
+  "stimulus": {
+    "command": "OpenInstalledModuleRuntime",
+    "required_linux_trace": [
+      "InspectConfigReadOnly",
+      "ObservePlatform",
+      "AcquireControllerLock",
+      "ClaimCurrentConfiguration",
+      "ValidateAndResolveActivationPremises",
+      "InspectServiceAndRuntime",
+      "PrepareDelegatedRootAndReadBack",
+      "OpenAndValidateCoreStore",
+      "ProveOldModuleContainersEmpty",
+      "RecoverCoreState",
+      "MintRecoveryHandoff",
+      "ConsumeRecoveryHandoffInInstalledComposition",
+      "CreateFreshModuleAndProcessGenerations",
+      "ExposeReady"
+    ]
+  },
+  "expected": {
+    "outcome": "platform_and_current_authority_precede_recovery_composition_and_ready",
+    "assertions": [
+      {"path": "/cases/non_linux/error", "op": "equals", "value": "MODULE_ACTIVATION_PLATFORM_UNSUPPORTED"},
+      {"path": "/cases/non_linux/trace", "op": "equals", "value": ["InspectConfigReadOnly", "ObservePlatform"]},
+      {"path": "/cases/non_linux/controller_lock_created", "op": "equals", "value": false},
+      {"path": "/cases/non_linux/configuration_claimed", "op": "equals", "value": false},
+      {"path": "/cases/non_linux/core_store_created", "op": "equals", "value": false},
+      {"path": "/cases/non_linux/systemd_query_count", "op": "equals", "value": 0},
+      {"path": "/cases/non_linux/cgroup_write_count", "op": "equals", "value": 0},
+      {"path": "/cases/linux_current/trace", "op": "equals", "value": ["InspectConfigReadOnly", "ObservePlatform", "AcquireControllerLock", "ClaimCurrentConfiguration", "ValidateAndResolveActivationPremises", "InspectServiceAndRuntime", "PrepareDelegatedRootAndReadBack", "OpenAndValidateCoreStore", "ProveOldModuleContainersEmpty", "RecoverCoreState", "MintRecoveryHandoff", "ConsumeRecoveryHandoffInInstalledComposition", "CreateFreshModuleAndProcessGenerations", "ExposeReady"]},
+      {"path": "/cases/linux_current/activation_permission_count", "op": "equals", "value": 1},
+      {"path": "/cases/linux_current/runtime_binding_count", "op": "equals", "value": 1},
+      {"path": "/cases/linux_current/recovery_handoff_count", "op": "equals", "value": 1},
+      {"path": "/cases/linux_current/recovery_handoff_consume_count", "op": "equals", "value": 1},
+      {"path": "/cases/linux_current/ready", "op": "equals", "value": true},
+      {"path": "/cases/linux_config_changed/error", "op": "equals", "value": "CONFIG_REVISION_CONFLICT"},
+      {"path": "/cases/linux_config_changed/trace", "op": "equals", "value": ["InspectConfigReadOnly", "ObservePlatform", "AcquireControllerLock", "ClaimCurrentConfiguration", "ReleaseControllerLock"]},
+      {"path": "/cases/linux_config_changed/activation_permission_count", "op": "equals", "value": 0},
+      {"path": "/cases/linux_untrusted_candidate_origin/error", "op": "equals", "value": "MODULE_ACTIVATION_PREMISES_INVALID"},
+      {"path": "/cases/linux_untrusted_candidate_origin/systemd_query_count", "op": "equals", "value": 0},
+      {"path": "/cases/linux_system_mode/error", "op": "equals", "value": "MODULE_ACTIVATION_PREMISES_INVALID"},
+      {"path": "/cases/linux_system_mode/activation_permission_count", "op": "equals", "value": 0}
+    ],
+    "emitted": [
+      {"event": "ModuleActivationReady", "config_revision": 42}
+    ],
+    "crash_label": null
+  }
+}

@@ -26,6 +26,7 @@ S = (
   active_config_revision,
   active_graph_revision,
   Configs,
+  ModuleActivationPremises,
   Graphs,
   Pages,
   Blocks,
@@ -201,7 +202,7 @@ An implementation MUST NOT expose a post-state before its transaction commits.
 | `DeadLetterRange` | authenticated policy, expected cursor matches | cursor advanced with exact retained Delivery/Block evidence | unchanged |
 | `SkipRange` | authenticated policy, expected cursor matches | cursor advanced with skip evidence | unchanged |
 | `LossyEvict` | lossy queue exceeds a limit | oldest prefix removed; gaps recorded | not applicable |
-| `Recover` | instance lock held; integrity valid | deterministic recovered runnable state | read-only or refused startup |
+| `Recover` | read-only configuration valid; executable Module platform/premise preflight eligible | exclusive current owner; deterministic recovered and, when applicable, installed-composed runnable state | no lock/writes on platform refusal; otherwise read-only or refused startup |
 
 ## 5. Transition pseudocode
 
@@ -274,20 +275,30 @@ No invalid or permanent response can leave dispatch evidence looking merely
 ### 5.1 InstallConfig and InstallGraph
 
 ```text
-InstallConfig(candidate_config, cutover_evidence):
+InstallConfig(candidate_config, candidate_activation_premises, cutover_evidence):
   C := S.active_config_revision
   validate complete resolved configuration and finite limits
   require candidate_config.revision == C + 1
   require candidate_config has no effective graph change
   require control-plane cutover preconditions for cutover_evidence.change_class are satisfied
   canonical_config := JCS(candidate_config)
+  canonical_premises := absent
+  if candidate_config selects an installed Linux Module:
+    require candidate_activation_premises.config_revision == C + 1
+    require candidate_activation_premises.config_digest == sha256(canonical_config)
+    validate complete definition/binding cardinality, revisions, digests, origins, service candidate, and premises_digest
+    canonical_premises := JCS(candidate_activation_premises)
+  else:
+    require candidate_activation_premises is absent
   atomic {
     insert Configs[C + 1] = canonical_config
+    if canonical_premises exists:
+      insert ModuleActivationPremises[C + 1] = canonical_premises
     S.active_config_revision = C + 1
-    Journal += ConfigInstalled(C + 1, sha256(canonical_config), S.active_graph_revision)
+    Journal += ConfigInstalled(C + 1, sha256(canonical_config), digest_or_absent(canonical_premises), S.active_graph_revision)
   }
 
-InstallGraph(candidate_config, candidate_graph, cutover_evidence):
+InstallGraph(candidate_config, candidate_graph, candidate_activation_premises, cutover_evidence):
   C := S.active_config_revision
   R := S.active_graph_revision
   validate complete resolved configuration, identifiers, Pages, Modules, unique edges, and finite limits
@@ -302,14 +313,24 @@ InstallGraph(candidate_config, candidate_graph, cutover_evidence):
   require every stranded durable range has an exact completed approved disposition
   canonical_config := JCS(candidate_config)
   canonical_graph := JCS(candidate_graph)
+  canonical_premises := absent
+  if candidate_config selects an installed Linux Module:
+    require candidate_activation_premises.config_revision == C + 1
+    require candidate_activation_premises.config_digest == sha256(canonical_config)
+    validate complete definition/binding cardinality, revisions, digests, origins, service candidate, and premises_digest
+    canonical_premises := JCS(candidate_activation_premises)
+  else:
+    require candidate_activation_premises is absent
   atomic {
     insert Configs[C + 1] = canonical_config
+    if canonical_premises exists:
+      insert ModuleActivationPremises[C + 1] = canonical_premises
     insert Graphs[R + 1] = canonical_graph
     create new subscriptions with explicit/default start cursors
     mark removed subscriptions draining
     S.active_config_revision = C + 1
     S.active_graph_revision = R + 1
-    Journal += GraphInstalled(C + 1, R + 1, sha256(canonical_config), sha256(canonical_graph))
+    Journal += GraphInstalled(C + 1, R + 1, sha256(canonical_config), sha256(canonical_graph), digest_or_absent(canonical_premises))
   }
 ```
 
@@ -926,9 +947,20 @@ LossyEvict(page_id):
 
 ```text
 Recover():
-  acquire exclusive instance lock
-  open and verify SQLite configuration, schema, integrity, and digests
-  prove old Extension execution epoch absent; otherwise terminate it
+  inspect configuration without writable ownership
+  if configuration contains an installed Linux Module:
+    observe Host platform
+    if platform != linux: return MODULE_ACTIVATION_PLATFORM_UNSUPPORTED without acquiring/creating the instance lock or another writable resource
+  acquire exclusive instance controller lock and mint fresh controller generation
+  claim and reread exact active configuration revision and digest
+  open and verify SQLite configuration, schema, integrity, bounds, and digests
+  if configuration contains an installed Linux Module:
+    P := the one schema-valid Module activation premise record for the claimed configuration revision
+    verify P's digest, exact definition/binding cardinality, and installed-product origins
+    resolve fresh branded live policy bindings for this controller generation
+    verify P's product-owned service candidate and reviewed runtime
+    prepare/read back delegated root and mint the branded activation permission, runtime binding, and stop prover
+  prove old Extension execution epoch absent; otherwise terminate it using the exact current Host proof
   for every granted or releasing Module storage scope, revoke the old grant and obtain broker/backend/process-container release proof
   move a scope without release proof to write_fenced_unknown and do not grant or dispatch its Module
   verify/rebuild counters after unclean shutdown
@@ -936,6 +968,9 @@ Recover():
   reset lossy queues and record restart gaps
   apply every result_staged or commit_blocked Activation in (ManifestCreated journal_seq, activation_id) order
   move orphaned leased Activations through fencing to retry_wait, cancellation, or quarantine according to their persisted dispatch evidence, one-shot authorization, and frozen replay contract
+  if configuration contains an installed Linux Module:
+    mint one recovery handoff bound to P, the controller generation, activation permission, stop prover, exact store, and result repository
+    installed composition consumes that handoff and the exact live bindings once before creating fresh Module/process generations
   expose ready and retry_wait work only after the above completes
 ```
 

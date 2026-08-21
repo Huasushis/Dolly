@@ -1,0 +1,129 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-AUTH-001",
+  "kind": "security",
+  "covers": ["REQ-ACT-002", "INV-ACTIVATION-012", "INV-ACTIVATION-013", "INV-ACTIVATION-015"],
+  "initial": {
+    "active_configuration": {
+      "instance_id": "0198ab31-6c44-7e8a-b2bb-000000000501",
+      "config_revision": 42,
+      "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "permission_policy_references": [
+        {
+          "policy_id": "read-tools",
+          "policy_revision": 7,
+          "policy_definition_digest": "sha256:3ddf15701a58e5333fb37c0ad38aa6f2ed92b1baeab118dcb66a7cccaee67773",
+          "binding_id": "read-tools-host",
+          "binding_revision": 3,
+          "binding_digest": "sha256:2b07a83cc3674d6c20097b7b375df3ac432a130e9584b66e1e133ab473f151eb"
+        }
+      ]
+    },
+    "premise_record": {
+      "schema": "dolly.module-activation-premises/v1",
+      "instance_id": "0198ab31-6c44-7e8a-b2bb-000000000501",
+      "config_revision": 42,
+      "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "permission_policy_definitions": [
+        {
+          "schema": "dolly.permission-policy-definition/v1",
+          "policy_id": "read-tools",
+          "policy_revision": 7,
+          "definition_schema_uri": "https://dolly.example/policies/read-tools.schema.json",
+          "definition_schema_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "definition": {
+            "kind": "registered-read-tools",
+            "registry_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "effect_class": "read-only"
+          },
+          "origin": {
+            "kind": "operator_approved_policy",
+            "source_id": "org.dolly.policy-store",
+            "source_revision": 11,
+            "source_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "definition_digest": "sha256:3ddf15701a58e5333fb37c0ad38aa6f2ed92b1baeab118dcb66a7cccaee67773"
+        }
+      ],
+      "permission_policy_bindings": [
+        {
+          "schema": "dolly.permission-policy-binding/v1",
+          "binding_id": "read-tools-host",
+          "binding_revision": 3,
+          "binding_digest": "sha256:2b07a83cc3674d6c20097b7b375df3ac432a130e9584b66e1e133ab473f151eb",
+          "policy_id": "read-tools",
+          "policy_revision": 7,
+          "policy_definition_digest": "sha256:3ddf15701a58e5333fb37c0ad38aa6f2ed92b1baeab118dcb66a7cccaee67773",
+          "origin": {
+            "kind": "installed_product_component",
+            "component_id": "org.dolly.host.read-tools",
+            "component_revision": 5,
+            "component_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        }
+      ],
+      "service_candidate": {
+        "schema": "dolly.linux-service-candidate/v1",
+        "origin": {
+          "kind": "installed_product_component",
+          "component_id": "org.dolly.runtime.service-candidate",
+          "component_revision": 2,
+          "component_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "unit_name": "dollyd@main.service",
+        "mode": "user"
+      },
+      "premises_digest": "sha256:0676c117940553c9c6f66487fb1a73d2f9e82d3c053f0a9487985ecd91864e7f"
+    },
+    "installed_components": [
+      {
+        "component_id": "org.dolly.host.read-tools",
+        "component_revision": 5,
+        "component_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      }
+    ],
+    "hostile_cases": [
+      "copied_structural_live_binding",
+      "binding_record_with_backend_path_secret_or_function",
+      "same_policy_revision_with_different_definition_bytes",
+      "duplicate_binding_record",
+      "ready_process_result_and_ack_without_binding_record"
+    ]
+  },
+  "stimulus": {
+    "commands": [
+      "ValidatePremiseRecord",
+      "ResolveExactPolicyDefinition",
+      "ResolveInstalledProductBinding",
+      "MintControllerGenerationBinding",
+      "AttemptHostileSubstitutions"
+    ],
+    "controller_generation": "0198ab31-6c44-7e8a-b2bb-000000000502"
+  },
+  "expected": {
+    "outcome": "one_exact_fresh_host_binding_and_all_structural_substitutions_refused",
+    "assertions": [
+      {"path": "/resolved_definition_count", "op": "equals", "value": 1},
+      {"path": "/resolved_binding_count", "op": "equals", "value": 1},
+      {"path": "/definition_digest_verified", "op": "equals", "value": true},
+      {"path": "/binding_digest_verified", "op": "equals", "value": true},
+      {"path": "/premises_digest_verified", "op": "equals", "value": true},
+      {"path": "/live_binding/controller_generation", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000502"},
+      {"path": "/live_binding/branded_by_host", "op": "equals", "value": true},
+      {"path": "/live_binding/serialized_secret", "op": "absent"},
+      {"path": "/live_binding/serialized_path", "op": "absent"},
+      {"path": "/live_binding/serialized_function", "op": "absent"},
+      {"path": "/hostile_results/copied_structural_live_binding/error", "op": "equals", "value": "MODULE_ACTIVATION_POLICY_BINDING_UNAVAILABLE"},
+      {"path": "/hostile_results/binding_record_with_backend_path_secret_or_function/error", "op": "equals", "value": "MODULE_ACTIVATION_PREMISES_INVALID"},
+      {"path": "/hostile_results/same_policy_revision_with_different_definition_bytes/error", "op": "equals", "value": "MODULE_ACTIVATION_PREMISES_INVALID"},
+      {"path": "/hostile_results/duplicate_binding_record/error", "op": "equals", "value": "MODULE_ACTIVATION_PREMISES_INVALID"},
+      {"path": "/hostile_results/ready_process_result_and_ack_without_binding_record/error", "op": "equals", "value": "MODULE_ACTIVATION_POLICY_BINDING_UNAVAILABLE"},
+      {"path": "/hostile_results/ready_process_result_and_ack_without_binding_record/capability_count", "op": "equals", "value": 0},
+      {"path": "/hostile_results/ready_process_result_and_ack_without_binding_record/process_count", "op": "equals", "value": 0}
+    ],
+    "emitted": [
+      {"event": "ModuleActivationPolicyBindingResolved", "policy_id": "read-tools", "binding_id": "read-tools-host", "binding_revision": 3}
+    ],
+    "crash_label": null
+  }
+}

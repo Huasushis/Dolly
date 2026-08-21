@@ -48,6 +48,7 @@
 - [Operations](spec/operations/01-threat-model.md)
   - [Cross-platform contract](spec/operations/02-cross-platform-contract.md)
   - [Backup, migration, and incident recovery](spec/operations/03-backup-migration-incident.md)
+  - [Installed Linux Module activation authority](spec/operations/04-module-activation-authority.md)
 
 - [Verification](spec/verification/01-test-oracle-and-strategy.md)
   - [Failure matrix](spec/verification/02-failure-matrix.md)
@@ -84,6 +85,7 @@
   - [ADR 0011: Filter signal and semantic copy](adrs/0011-two-thirds-filter-signal-and-copy.md)
   - [ADR 0012: NapCatQQ mailbox and catalog](adrs/0012-napcatqq-mailbox-and-catalog.md)
   - [ADR 0013: Testament and LevelUpper boundaries](adrs/0013-testament-and-levelupper-boundaries.md)
+  - [ADR 0014: Installed Module activation authority](adrs/0014-installed-module-activation-authority.md)
 
 - [Source material](baseline/SOURCE-MANIFEST.md)
   - [Review of the newly uploaded conversation](baseline/REVIEW.md)

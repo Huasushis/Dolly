@@ -22,7 +22,7 @@ self-identifies as GPT-5.6 Pro.
 | `REQ-ID-*` | Owner-1 Block identity/JSON plus Owner-5 non-colliding Module state | Core 01 | schema, canonicalization, tombstone, and storage-scope vectors |
 | `REQ-BLOCK-*` | Owner-1 Block/forward/multimodal | Core 02 | Block schemas and invalid-reference vectors |
 | `REQ-PAGE-*`, `INV-PAGELOG-*` | Owner-1 broadcast Page | Core 03 | delivery model tests |
-| `REQ-ACT-*`, `INV-ACTIVATION-*` | Owner-1 serial Module activation | Core 04 | reference machine and crash vectors |
+| `REQ-ACT-*`, `INV-ACTIVATION-*` | Owner-1 serial Module activation plus engineering security/restart authority closure | Core 04 and Operations 04 | reference machine, crash, binding-origin, startup-order, and downstream-abstention vectors |
 | `INV-ROUTING-*` | Owner-1 allows cyclic topology | Core 05 | cycle budgets and self-delivery vectors |
 | `REQ-XRPC-*`, `REQ-XLIFE-*`, `REQ-XCAP-*`, `REQ-XUPG-*`, `INV-XCAP-*` | Owner-1 decoupled Extensions/JSON plus Owner-5 multi-open/restart isolation | Extension protocol | hostile mock Extension, generation fence, state-scope, and migration suites |
 | `REQ-ASSET-*` | Owner-1 asset IDs/crops/OSS | Assets service | content, crop, SSRF, and GC suites |

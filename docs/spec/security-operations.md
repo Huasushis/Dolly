@@ -464,18 +464,22 @@ ADR 0009 forbids `none` isolation for it and requires that the execution
 backend keep the Module process and every descendant inside one non-reused
 Module control group, terminate that whole group on stop, hard timeout,
 failure, and replacement, and prove `populated 0` before any replacement or
-Claim disposition. Before any of that, Core MUST prove in both directions that
-it is the main process of its own service: the service manager must report this
-process as the unit's main process, and this process's own control group, read
-from the process filesystem, must be the delegated subgroup inside the control
-group the manager reports for that same unit. A unit name carried in the
-environment is only a candidate for that check, never authority. Core MUST also
-confirm that the settings the manager actually applies match the restart, kill,
-timeout, delegation, and control-group requirements, and MUST fail closed on
-any value it cannot read. This verification is implemented and has been run
-against a real service; the group-termination and activation work above has
-not, so Modules stay disabled. Claims, Module process records, and Module submission
-records live in one atomic Core-state update as defined by `core-runtime.md`,
+Claim disposition. Before any of that, Core MUST hold the current controller
+lock, claim the current configuration revision/digest, validate its exact
+activation-premise record, and prove in both directions that it is the main
+process of the product-owned systemd user-service candidate. The candidate
+origin, unit name, and mode are lookup inputs, not authority: the service
+manager must report this process as the unit's main process, and this process's
+own control group, read from the process filesystem, must be the delegated
+subgroup inside the manager-reported unit cgroup. An environment value,
+instance field, process record, Ready response, result, acknowledgement, or
+absence cannot create that candidate or proof. Core MUST also confirm the
+effective restart, kill, timeout, delegation, and control-group settings and
+fail closed on any unreadable value. This verification and the persistent
+policy definition/backend-binding chain remain prerequisites; current candidate
+evidence does not satisfy the complete product composition, so Modules stay
+disabled under `RUNTIME_MODULE_MIGRATION_REQUIRED`.
+Claims, Module process records, and Module submission records live in one atomic Core-state update as defined by `core-runtime.md`,
 and a submitted Run without a
 committed result MUST NOT be automatically negatively acknowledged, released,
 or retried unless the result journal and every possible external effect have
