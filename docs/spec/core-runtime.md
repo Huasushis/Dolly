@@ -1811,10 +1811,10 @@ proof bound to that exact process record. The exact container layout inside
 identity keys are the non-reused `processGenerationId` for process records and
 `runId` for submission records and unknown submission history items.
 
-Reading a `dolly.core-state/15`, `/16`, or `/17` document during normal
+Reading a `dolly.core-state/15`, `/16`, `/17`, or `/18` document during normal
 startup reports `CORE_STATE_MIGRATION_REQUIRED`; startup never infers version
-18. The explicit `migrate-core-state` command migrates any supported older
-version directly to version 18. It first inspects the instance configuration,
+19. The explicit `migrate-core-state` command migrates any supported older
+version directly to version 19. It first inspects the instance configuration,
 acquires that instance's controller lock, and then claims the same instance
 identity and configuration revision. While holding that lock, it restores and
 validates the source and proposed target with the claimed failure limit, Media
@@ -1824,8 +1824,9 @@ cross-record relationship, or oversized target fails before a backup is
 created or the source is replaced.
 
 Migration increments the Core-state revision exactly once, computes a version
-18 digest that includes `schemaVersion`, writes the exact original bytes beside
-the state file as `.v15.backup`, `.v16.backup`, or `.v17.backup`, and then atomically replaces
+19 digest that includes `schemaVersion` and the version 19 process-generation
+counter, writes the exact original bytes beside the state file as
+`.v15.backup`, `.v16.backup`, `.v17.backup`, or `.v18.backup`, and then atomically replaces
 the source. A retry may reuse an existing backup only when it is a regular file
 whose bytes exactly equal the still-current source; a partial or different
 backup fails closed. The Core-state file lock protects the replacement in
