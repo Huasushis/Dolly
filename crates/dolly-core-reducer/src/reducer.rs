@@ -1369,11 +1369,22 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             item.authoritative_disposition = Some(ActivationState::Committed);
             item.staged_result = None;
             let digest = item.result_digest.clone();
+            // INV-ROUTE-001: report the manifest-pinned graph revision, never
+            // the active graph at result time (INV-CFG-003).
+            let graph_revision = item
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.get("graph_revision"))
+                .and_then(Value::as_i64);
+            let mut details = json!({"activation_id":c.activation_id,"result_digest":digest});
+            if let Some(graph_revision) = graph_revision {
+                details["graph_revision"] = json!(graph_revision);
+            }
             events.push(append_event(
                 &mut next,
                 &c.command_id,
                 "ActivationCommitted",
-                Some(json!({"activation_id":c.activation_id,"result_digest":digest})),
+                Some(details),
             ));
             success(
                 next,
