@@ -90,7 +90,14 @@ export function analyzeBundle(runDirectory, { cutoff = 10 } = {}) {
   }
 
   const goldByQuestion = new Map();
-  for (const row of split) goldByQuestion.set(row.question_id, new Set(row.goldSessionIds ?? []));
+  const splitByQuestion = new Map();
+  for (const row of split) {
+    if (row.split !== "development" && row.split !== "evaluation") {
+      throw new TypeError(`split value ${String(row.split)} is not in the frozen enum`);
+    }
+    goldByQuestion.set(row.question_id, new Set(row.goldSessionIds ?? []));
+    splitByQuestion.set(row.question_id, row.split);
+  }
 
   const rankingByQuestion = new Map();
   for (const row of ranking) {
@@ -104,6 +111,9 @@ export function analyzeBundle(runDirectory, { cutoff = 10 } = {}) {
   let allCoverageComplete = true;
   let allJobsTerminal = true;
   for (const row of treatment) {
+    // Development rows are structural only; they never enter the scored
+    // result. A typed failure in any row still forces rejection below.
+    if (splitByQuestion.get(row.questionId) !== "evaluation") continue;
     const gold = goldByQuestion.get(row.questionId) ?? new Set();
     const ranked = rankingByQuestion.get(row.questionId) ?? [];
     const duplicateOccupancy = ranked.length - new Set(ranked.map((r) => r.sessionId)).size;

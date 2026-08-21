@@ -14,8 +14,12 @@ The only dataset is the local MIT-licensed LongMemEval-S file with SHA-256
 run must verify the complete v4 checksum inventory
 (`retrieval-v4-20260813a/sha256sums.txt`) and bind every case by
 `questionId` plus `caseSha256` before treatment. The split is exactly 147
-development and 353 evaluation. The reference is the frozen `content` top-10
-ranking from `retrieval-v4`; it is never recomputed.
+development and 353 evaluation. Every split row's `split` value must be
+exactly one of the frozen enum strings `development` or `evaluation`; unknown,
+duplicate, or missing split membership fails closed. Metrics, gates, and cost
+are computed exclusively over the `evaluation` rows; development rows never
+enter the scored result or any final gate. The reference is the frozen
+`content` top-10 ranking from `retrieval-v4`; it is never recomputed.
 
 ## Gold-blind treatment
 
@@ -77,7 +81,10 @@ actual product segment intervals for each item; overlap is counted once; text
 beyond `maxInputBytes` or after the last allowed segment is not in this
 denominator. The classifying ratio is
 `canonicalFeatureBytes / coveredNormalizedBytes`; zero denominator with nonzero
-numerator is infinity. Input bytes never dilute the ratio.
+numerator is infinity and zero-over-zero is zero (closed rule). Input bytes
+never dilute the ratio. The p95 over the evaluation rows uses the frozen order
+statistic `ceil(0.95*n)-1` of the ascending ratios (0 when n is 0), identical
+in the analyzer and the verifier.
 
 ## Decision rule
 
@@ -86,12 +93,16 @@ hold on the 353 sealed evaluation questions:
 
 1. paired lower 95% bound of `NDCG@10(product - reference)` >= `-0.02`;
 2. paired lower 95% bound of `Recall@10(product - reference)` >= `-0.02`;
-3. product knowledge-update top-one error minus reference error <= `0.02`;
-4. every row passes the coverage and terminal-job gate, and p95
-   `canonicalFeatureBytes / coveredNormalizedBytes` <= `2`;
+3. product knowledge-update top-one error minus reference error
+   (`errorRates.difference`) <= `0.02` on the evaluation rows;
+4. every evaluation row passes the coverage and terminal-job gate, and p95
+   `canonicalFeatureBytes / coveredNormalizedBytes` <= `2` with the frozen
+   `cost-ratio-p95` gate counted in `metricGateFailures`;
 5. all 500 treatment rows, rank/record/Block/session mappings, checksums,
-   source hashes, independent metric recomputation, and mutation tests
-   validate without structural or secret-leak failure.
+   source hashes (recomputed by the verifier from the frozen source
+   fingerprint, not just checked for a hex shape), independent metric
+   recomputation, and mutation tests validate without structural or
+   secret-leak failure.
 
 A miss rejects production wiring for this representation. No outcome enables
 `automaticRecall`, automatic task resumption, source-reference emission,

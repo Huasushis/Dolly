@@ -57,9 +57,13 @@ checksumInventoryVerified, workerCount, startedAtUs, totalJobs, status` with
 `status: "ok" | "failed"`.
 
 **analysis** — closed order:
-`classification, decisionGates, primaryMetrics, diceScore, errorRates,
-duplicateOccupancy, discordantCases, mutationRejected, verifier, verdict` —
-`verdict.valid`, `verdict.classification`.
+`classification, decisionGates, primaryMetrics, diceScore, errorRates, cost,
+metricGateFailures, duplicateOccupancy, discordantCases, evaluationRows,
+mutationRejected, verifier, verdict` — `verdict.valid`,
+`verdict.classification`, `cost.p95`, `metricGateFailures`. Gates are
+`ndcg10-lower95, recall10-lower95, knowledge-update-error, coverage-terminal,
+cost-ratio-p95, structural-validation`; only evaluation split rows are scored
+and `evaluationRows` reports how many rows entered the metrics.
 
 ## Independent verification surface
 

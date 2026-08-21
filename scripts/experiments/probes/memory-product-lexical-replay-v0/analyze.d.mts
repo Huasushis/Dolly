@@ -8,7 +8,21 @@
 export const BOOTSTRAP_SEED: number;
 export const BOOTSTRAP_ROWS: number;
 export const LOWER_BOUND_INDEX: number;
+export const SPLIT_DEVELOPMENT: "development";
+export const SPLIT_EVALUATION: "evaluation";
+export const DATASET_QUESTION_COUNT: 500;
+export const SPLIT_DEVELOPMENT_COUNT: 147;
+export const SPLIT_EVALUATION_COUNT: 353;
+export const COST_P95_INDEX_RULE: string;
+export const KNOWLEDGE_UPDATE_MARGIN: 0.02;
+export const COST_P95_LIMIT: 2;
 export const ANALYSIS_KEYS: readonly string[];
+
+export function costRatioP95(ratios: readonly number[]): number;
+export function costRatioForRow(row: {
+  readonly coverage: { readonly coveredNormalizedBytes: number };
+  readonly canonicalFeatureBytes: number;
+}): number;
 
 export interface AnalysisGate {
   readonly gate: string;
@@ -28,6 +42,12 @@ export interface ErrorRates {
   readonly difference: number;
 }
 
+export interface CostSummary {
+  readonly p95: number;
+  readonly perEvaluatedRow: number;
+  readonly limit: number;
+}
+
 export interface AnalysisVerdict {
   readonly valid: boolean;
   readonly classification: string;
@@ -45,8 +65,11 @@ export interface AnalysisRecord {
   };
   diceScore: number;
   errorRates: ErrorRates;
+  cost: CostSummary;
+  metricGateFailures: number;
   duplicateOccupancy: number;
   discordantCases: string[];
+  evaluationRows: number;
   mutationRejected: boolean | null;
   verifier: Record<string, unknown> | null;
   verdict: AnalysisVerdict | null;

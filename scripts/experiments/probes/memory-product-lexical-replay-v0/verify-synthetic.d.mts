@@ -7,6 +7,9 @@
 
 export const REPOSITORY_ROOT: string;
 export const SECRET_SENTINEL: string;
+export const SYNTHETIC_SOURCE_FINGERPRINT_PATHS: readonly string[];
+
+export function recomputeSyntheticSourceHash(): string;
 
 export interface VerifyResult {
   readonly valid: boolean;

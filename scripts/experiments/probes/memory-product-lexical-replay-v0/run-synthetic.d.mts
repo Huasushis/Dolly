@@ -13,6 +13,7 @@ export const SYNTHETIC_RUN_ID: "synthetic-foundation";
 export const COMMAND_TEXT: string;
 
 export const SYNTHETIC_CASES: readonly SyntheticCase[];
+export const SOURCE_FINGERPRINT_PATHS: readonly string[];
 
 export interface SyntheticMessage {
   readonly role: string;

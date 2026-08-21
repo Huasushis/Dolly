@@ -47,15 +47,24 @@ export const REPOSITORY_ROOT = resolve(HERE, "../../../..");
 
 export const RUN_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,79}$/u;
 
-/** Source files frozen into `run-manifest.json` `sourceHash` (list order). */
+/**
+ * Source files frozen into `run-manifest.json` `sourceHash`, in exact list
+ * order. Every result-affecting script — the treatment, runner, analyzer,
+ * verifier, and finalizer — plus their shared helper and the preregistration
+ * documents enter the fingerprint, so editing any of them after a run starts
+ * invalidates the run's source freeze.
+ */
 export const SOURCE_FINGERPRINT_PATHS = Object.freeze([
   "docs/experiments/preregistrations/memory-product-lexical-replay-v0.json",
   "docs/experiments/preregistrations/memory-product-lexical-replay-v0-protocol.md",
   "docs/experiments/preregistrations/memory-product-lexical-replay-v0-schema.json",
   "docs/experiments/preregistrations/memory-product-lexical-replay-v0-artifacts.md",
   "scripts/experiments/probes/memory-product-lexical-replay-v0/product-lexical.mts",
-  "scripts/experiments/probes/memory-product-lexical-replay-v0/run.mjs",
   "scripts/experiments/probes/memory-product-lexical-replay-v0/run-synthetic.mjs",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/run.mjs",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/analyze.mjs",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/verify.mjs",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/finalize.mjs",
 ]);
 
 /** Exact artifact files covered by the formal checksum inventory. */
@@ -143,14 +152,62 @@ function querySnapshot(result) {
 }
 
 /**
+ * Classifies a caught treatment error into one of the four typed failure
+ * kinds. Limit errors are every `MEMORY_LIMIT_EXCEEDED`; job-state and
+ * fenced-generation errors are job failures; anything else is a permanent
+ * error. Untyped errors are never passed through as `ok`.
+ */
+function typedFailureKind(caught) {
+  const code = typeof caught?.code === "string" ? caught.code : undefined;
+  if (code === "MEMORY_LIMIT_EXCEEDED") return "limit-failure";
+  if (code === "MEMORY_JOB_STATE_INVALID" || code === "MEMORY_GENERATION_FENCED") {
+    return "job-failure";
+  }
+  return "permanent-error";
+}
+
+function failedRow(input, digest, kind, reason) {
+  return {
+    row: {
+      questionId: input.question_id,
+      caseSha256: digest,
+      state: "failed",
+      failure: { kind, reason },
+    },
+    rankings: [],
+  };
+}
+
+/**
  * Gold-blind single-case worker. Returns a typed closed treatment row plus
  * the ranking rows for that case; never reads split, gold, or reference.
+ * Typed failures are stable and distinct: a `limit-failure` for a configured
+ * budget, a `coverage-failure` for uncovered/truncated/typed-skipped source
+ * bytes, a `job-failure` for pending/running/retryable/permanently-failed
+ * jobs or outstanding leases, and `permanent-error` for any other
+ * unrecoverable treatment error. Any typed failure persists a closed failed
+ * row with `state: "failed"`.
  */
 export async function processCase(input, limit = QUERY_LIMIT) {
   const digest = caseDigest(input);
   try {
     const result = await evaluateProductLexicalCase(input, limit);
     const coverage = result.extractionCoverage;
+    const jobsNonTerminal =
+      result.terminalJobAccounting.pending > 0 ||
+      result.terminalJobAccounting.running > 0 ||
+      result.terminalJobAccounting.retryable > 0 ||
+      result.terminalJobAccounting.permanentFailure > 0 ||
+      result.terminalJobAccounting.cancelled > 0 ||
+      result.terminalJobAccounting.outstandingLeases > 0;
+    if (jobsNonTerminal) {
+      return failedRow(input, digest, "job-failure",
+        `terminal job accounting is not clean after indexing ${input.question_id}`);
+    }
+    if (!coverage.complete) {
+      return failedRow(input, digest, "coverage-failure",
+        `coverage is not complete for ${input.question_id}`);
+    }
     const row = {
       questionId: input.question_id,
       caseSha256: digest,
@@ -182,15 +239,7 @@ export async function processCase(input, limit = QUERY_LIMIT) {
     }));
     return { row, rankings };
   } catch (error) {
-    return {
-      row: {
-        questionId: input.question_id,
-        caseSha256: digest,
-        state: "failed",
-        failure: { kind: "permanent-error", reason: String(error?.message ?? error) },
-      },
-      rankings: [],
-    };
+    return failedRow(input, digest, typedFailureKind(error), String(error?.message ?? error));
   }
 }
 

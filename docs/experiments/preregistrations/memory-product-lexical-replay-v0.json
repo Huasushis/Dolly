@@ -62,6 +62,7 @@
     "questionCount": 500,
     "splitDevelopment": 147,
     "splitEvaluation": 353,
+    "splitValues": ["development", "evaluation"],
     "caseSource": "artifacts/experiments/probes/memory-longmemeval-retrieval-v0/runs/retrieval-v4-20260813a/cases.jsonl",
     "goldIsolation": "Treatment reads only gold-blind cases.jsonl rows (question_id, question, sessions) and never answer_session_ids, answers, question type, split, dates, or reference rankings. A separate analyzer may read split/gold only after every treatment row is persisted and verified."
   },
@@ -120,9 +121,9 @@
     }
   },
   "independentValidation": {
-    "verifier": "scripts/experiments/probes/memory-product-lexical-replay-v0/verify-synthetic.mjs",
+    "verifier": "scripts/experiments/probes/memory-product-lexical-replay-v0/verify.mjs",
     "mustNotImport": ["product-lexical", "analyze", "common", "src/extensions/memory", "treatment"],
-    "recomputeSurface": "recompute coverage bytes, record/rank/session mapping, duplicate-rank occupancy, and canonical digest of every persisted row from frozen bytes; reuse the v4 resample matrix unchanged"
+    "recomputeSurface": "recompute coverage bytes, record/rank/session mapping, duplicate-rank occupancy, cost ratios, canonical digest of every persisted row, and the frozen source fingerprint from frozen bytes; reuse the v4 resampling matrix unchanged"
   },
   "safetyBoundary": {
     "automaticRecall": false,

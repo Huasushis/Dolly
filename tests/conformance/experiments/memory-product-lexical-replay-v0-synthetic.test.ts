@@ -18,7 +18,7 @@ import {
 // exercised end-to-end. The test writes split.jsonl AFTER the durable bundle,
 // mirroring the sealed run's gold-isolation order.
 const SYNTHETIC_SPLIT = Object.freeze([
-  { question_id: "synthetic-basic", question_type: "single-session", split: "evaluation", goldSessionIds: ["exact"] },
+  { question_id: "synthetic-basic", question_type: "single-session", split: "development", goldSessionIds: ["exact"] },
   { question_id: "synthetic-duplicates", question_type: "multi-session", split: "evaluation", goldSessionIds: ["trip"] },
   { question_id: "synthetic-empty", question_type: "edge", split: "evaluation", goldSessionIds: ["empty"] },
 ]);

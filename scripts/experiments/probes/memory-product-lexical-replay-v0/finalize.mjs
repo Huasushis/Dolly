@@ -110,6 +110,11 @@ const MUTATION_OPERATORS = Object.freeze({
     analysis.primaryMetrics.ndcg10.product += 0.25;
     writeFileSync(join(copy, "analyse.json"), `${canonicalJson(analysis)}\n`);
   },
+  "source-freeze-tampered": (copy) => {
+    const manifest = JSON.parse(readFileSync(join(copy, "run-manifest.json"), "utf8"));
+    manifest.sourceHash = "0".repeat(64);
+    writeFileSync(join(copy, "run-manifest.json"), `${canonicalJson(manifest)}\n`);
+  },
   "checksum-entry-removed": (copy) => {
     const inventory = readFileSync(join(copy, "sha256sums.txt"), "utf8")
       .split("\n")

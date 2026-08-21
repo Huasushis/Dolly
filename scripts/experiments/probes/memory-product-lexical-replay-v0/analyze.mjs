@@ -33,6 +33,45 @@ export const BOOTSTRAP_SEED = 1296387376;
 export const BOOTSTRAP_ROWS = 10000;
 export const LOWER_BOUND_INDEX = 249;
 
+/** Frozen split membership values. */
+export const SPLIT_DEVELOPMENT = "development";
+export const SPLIT_EVALUATION = "evaluation";
+
+/** Frozen split counts for the sealed 500-case dataset. */
+export const DATASET_QUESTION_COUNT = 500;
+export const SPLIT_DEVELOPMENT_COUNT = 147;
+export const SPLIT_EVALUATION_COUNT = 353;
+
+/** Frozen order statistic for the p95 cost ratio gate. */
+export const COST_P95_INDEX_RULE = "ceil(0.95*n)-1";
+
+/**
+ * Frozen p95 order statistic: the ratio at index
+ * `Math.min(n - 1, Math.ceil(0.95 * n) - 1)` of the ascending ratios, or zero
+ * when n is zero (no evaluable rows).
+ */
+export function costRatioP95(ratios) {
+  if (ratios.length === 0) return 0;
+  const sorted = [...ratios].sort((left, right) => left - right);
+  const index = Math.min(sorted.length - 1, Math.ceil(0.95 * sorted.length) - 1);
+  return sorted[index];
+}
+
+/** Closed zero-denominator rule for `canonicalFeatureBytes / coveredNormalizedBytes`. */
+export function costRatioForRow(row) {
+  if (row.coverage.coveredNormalizedBytes === 0) {
+    return row.canonicalFeatureBytes === 0 ? 0 : Infinity;
+  }
+  return row.canonicalFeatureBytes / row.coverage.coveredNormalizedBytes;
+}
+
+/**
+ * Frozen classification rule: product error minus reference error is the
+ * paired contrast; a positive product advantage is allowed only up to 0.02.
+ */
+export const KNOWLEDGE_UPDATE_MARGIN = 0.02;
+export const COST_P95_LIMIT = 2;
+
 export function parseCanonicalJsonLines(bytes) {
   const text = bytes.toString("utf8");
   if (text.length === 0) return [];
@@ -118,6 +157,11 @@ function diceCoefficient(productSessions, referenceSessions) {
  * reference content rankings (canonical JSONL rows `{questionId, rank,
  * sessionId}`, rank contiguous from 1 per question). Gold is opened only
  * after the product rankings file is read and every treatment row accounted.
+ * Metrics are computed exclusively over rows whose split is exactly
+ * `SPLIT_EVALUATION`; development rows never enter the scored result or the
+ * final gates. The split enum, per-question existence, exact counts for the
+ * sealed 500-case dataset, and unknown/duplicate/missing membership all fail
+ * closed.
  */
 export function analyzeFormal(runDirectory, { referencePath, cutoff = 10 } = {}) {
   let treatment;
@@ -160,11 +204,49 @@ export function analyzeFormal(runDirectory, { referencePath, cutoff = 10 } = {})
   }
   const referenceRows = parseCanonicalJsonLines(readFileSync(resolve(referencePath)));
 
+  const treatmentByQuestion = new Map(treatment.map((row) => [row.questionId, row]));
   const goldByQuestion = new Map();
   const typeByQuestion = new Map();
+  const splitByQuestion = new Map();
   for (const row of split) {
+    if (splitByQuestion.has(row.question_id)) {
+      const duplicate = new TypeError(`split row repeats question_id ${row.question_id}`);
+      duplicate.code = "SPLIT_GOLD_UNCLOSED";
+      throw duplicate;
+    }
+    if (!treatmentByQuestion.has(row.question_id)) {
+      const unknown = new TypeError(`split row references unknown treatment question ${row.question_id}`);
+      unknown.code = "SPLIT_GOLD_UNCLOSED";
+      throw unknown;
+    }
+    if (row.split !== SPLIT_DEVELOPMENT && row.split !== SPLIT_EVALUATION) {
+      const invalid = new TypeError(`split value ${String(row.split)} is not in the frozen enum`);
+      invalid.code = "SPLIT_GOLD_UNCLOSED";
+      throw invalid;
+    }
+    splitByQuestion.set(row.question_id, row.split);
     goldByQuestion.set(row.question_id, new Set(row.goldSessionIds ?? []));
     typeByQuestion.set(row.question_id, row.question_type ?? null);
+  }
+  const missingSplit = treatment.filter((row) => !splitByQuestion.has(row.questionId));
+  if (missingSplit.length > 0) {
+    const missing = new TypeError(
+      `treatment row without a split row: ${missingSplit.map((row) => row.questionId).join(",")}`,
+    );
+    missing.code = "SPLIT_GOLD_UNCLOSED";
+    throw missing;
+  }
+  if (treatment.length === DATASET_QUESTION_COUNT) {
+    const developmentCount = [...splitByQuestion.values()].filter((v) => v === SPLIT_DEVELOPMENT).length;
+    const evaluationCount = [...splitByQuestion.values()].filter((v) => v === SPLIT_EVALUATION).length;
+    if (developmentCount !== SPLIT_DEVELOPMENT_COUNT || evaluationCount !== SPLIT_EVALUATION_COUNT) {
+      const wrong = new TypeError(
+        `split counts (${developmentCount} development, ${evaluationCount} evaluation) do not match the frozen ` +
+        `${SPLIT_DEVELOPMENT_COUNT}/${SPLIT_EVALUATION_COUNT}`,
+      );
+      wrong.code = "SPLIT_GOLD_UNCLOSED";
+      throw wrong;
+    }
   }
 
   const productByQuestion = new Map();
@@ -189,11 +271,18 @@ export function analyzeFormal(runDirectory, { referencePath, cutoff = 10 } = {})
   const diceValues = [];
   const discordant = [];
   const duplicity = [];
+  const costRatios = [];
   let allCoverageComplete = true;
   let allJobsTerminal = true;
   let typedFailurePresent = false;
 
   for (const row of treatment) {
+    // Development rows are structural only; they never enter the scored
+    // result or the final gates.
+    if (splitByQuestion.get(row.questionId) !== SPLIT_EVALUATION) {
+      if (row.state !== "ok") typedFailurePresent = true;
+      continue;
+    }
     const gold = goldByQuestion.get(row.questionId) ?? new Set();
     const productRows = productByQuestion.get(row.questionId) ?? [];
     const referenceRowsFor = referenceByQuestion.get(row.questionId) ?? [];
@@ -224,15 +313,20 @@ export function analyzeFormal(runDirectory, { referencePath, cutoff = 10 } = {})
     productMetrics.push(metrics);
     ndcgDeltas.push(metrics.ndcg - referenceMetricsFor.ndcg);
     recallDeltas.push(metrics.recall - referenceMetricsFor.recall);
+    hitDeltas.push(metrics.hit - referenceMetricsFor.hit);
     diceValues.push(diceCoefficient(productSessions.slice(0, cutoff), referenceSessions.slice(0, cutoff)));
     if (metrics.hit !== referenceMetricsFor.hit) discordant.push(row.questionId);
+    costRatios.push(costRatioForRow(row));
   }
 
   const aggregation = (values) =>
     values.length === 0 ? 0 : values.reduce((sum, value) => sum + value, 0) / values.length;
 
+  // Knowledge-update error is computed on the evaluation rows only, exactly
+  // like the primary metrics; development rows never enter the error rate.
   const knowledgeUpdateIds = [...typeByQuestion.entries()]
-    .filter(([, type]) => type === "knowledge-update")
+    .filter(([questionId, type]) =>
+      type === "knowledge-update" && splitByQuestion.get(questionId) === SPLIT_EVALUATION)
     .map(([questionId]) => questionId);
   const kuError = (kind) => {
     if (knowledgeUpdateIds.length === 0) return 0;
@@ -271,18 +365,21 @@ export function analyzeFormal(runDirectory, { referencePath, cutoff = 10 } = {})
   const missForbidden = -0.02;
   const ndcgGate = primary.bounds.ndcg10 >= missForbidden;
   const recallGate = primary.bounds.recall10 >= missForbidden;
-  const kuDifference = kuError("reference") - kuError("product");
-  const knowledgeGate = kuDifference <= 0.02;
+  const kuDifference = kuError("product") - kuError("reference");
+  const knowledgeGate = kuDifference <= KNOWLEDGE_UPDATE_MARGIN;
   const coverageTerminalGate = allCoverageComplete && allJobsTerminal && !typedFailurePresent;
+  const estimatedCostP95 = costRatioP95(costRatios);
+  const costGate = estimatedCostP95 <= COST_P95_LIMIT;
 
   const gates = [
     { gate: "ndcg10-lower95", passed: ndcgGate },
     { gate: "recall10-lower95", passed: recallGate },
     { gate: "knowledge-update-error", passed: knowledgeGate },
     { gate: "coverage-terminal", passed: coverageTerminalGate },
+    { gate: "cost-ratio-p95", passed: costGate },
     { gate: "structural-validation", passed: false },
   ];
-  const metricGateFailures = gates.slice(0, 4).filter((gate) => !gate.passed).length;
+  const metricGateFailures = gates.slice(0, 5).filter((gate) => !gate.passed).length;
   const classification = metricGateFailures > 0 ? "rejected" : "supported";
 
   return {
@@ -311,10 +408,17 @@ export function analyzeFormal(runDirectory, { referencePath, cutoff = 10 } = {})
     errorRates: {
       product: kuError("product"),
       reference: kuError("reference"),
-      difference: kuError("reference") - kuError("product"),
+      difference: kuError("product") - kuError("reference"),
     },
+    cost: {
+      p95: estimatedCostP95,
+      perEvaluatedRow: costRatios.length,
+      limit: COST_P95_LIMIT,
+    },
+    metricGateFailures,
     duplicateOccupancy: duplicity.reduce((sum, value) => sum + value, 0),
     discordantCases: discordant,
+    evaluationRows: productMetrics.length,
     mutationRejected: null,
     verifier: null,
     verdict: null,
@@ -327,8 +431,11 @@ export const ANALYSIS_KEYS = Object.freeze([
   "primaryMetrics",
   "diceScore",
   "errorRates",
+  "cost",
+  "metricGateFailures",
   "duplicateOccupancy",
   "discordantCases",
+  "evaluationRows",
   "mutationRejected",
   "verifier",
   "verdict",

@@ -8,7 +8,7 @@
 // frozen reference rankings. Nothing in this file imports them.
 
 import { createHash } from "node:crypto";
-import { closeSync, fsyncSync, mkdirSync, openSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { evaluateProductLexicalCase } from "./product-lexical.mjs";
@@ -253,18 +253,25 @@ export async function writeSyntheticBundle(
 function moduleSourceFingerprint() {
   // The sealed runner fingerprints the preregistered source files; for the
   // synthetic foundation the source-freeze surface is the preregistration
-  // and the treatment entry path declared in the frozen prereg.
-  return [
-    "docs/experiments/preregistrations/memory-product-lexical-replay-v0.json",
-    "docs/experiments/preregistrations/memory-product-lexical-replay-v0-protocol.md",
-    "docs/experiments/preregistrations/memory-product-lexical-replay-v0-schema.json",
-    "docs/experiments/preregistrations/memory-product-lexical-replay-v0-artifacts.md",
-    "scripts/experiments/probes/memory-product-lexical-replay-v0/product-lexical.mts",
-    "scripts/experiments/probes/memory-product-lexical-replay-v0/run-synthetic.mjs",
-    "scripts/experiments/probes/memory-product-lexical-replay-v0/analyze-synthetic.mjs",
-    "scripts/experiments/probes/memory-product-lexical-replay-v0/verify-synthetic.mjs",
-  ].join("\n");
+  // and every result-affecting synthetic script declared in the frozen
+  // prereg. The manifest stores sha256 of this content fingerprint, and the
+  // synthetic verifier re-derives the same value from the frozen files.
+  return SOURCE_FINGERPRINT_PATHS
+    .map((path) => `${path}\u0000${sha256hex(readFileSync(resolve(REPOSITORY_ROOT, path), "utf8"))}`)
+    .join("\n");
 }
+
+/** Source files frozen into the synthetic `run-manifest.json` `sourceHash`. */
+export const SOURCE_FINGERPRINT_PATHS = Object.freeze([
+  "docs/experiments/preregistrations/memory-product-lexical-replay-v0.json",
+  "docs/experiments/preregistrations/memory-product-lexical-replay-v0-protocol.md",
+  "docs/experiments/preregistrations/memory-product-lexical-replay-v0-schema.json",
+  "docs/experiments/preregistrations/memory-product-lexical-replay-v0-artifacts.md",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/product-lexical.mts",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/run-synthetic.mjs",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/analyze-synthetic.mjs",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/verify-synthetic.mjs",
+]);
 
 if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
   const target = resolve(

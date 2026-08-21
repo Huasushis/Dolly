@@ -9,7 +9,7 @@
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 // The verifier is executed as a stand-alone node process and must import no
 // module that transitively pulls in the treatment; canonicalJson is
@@ -29,6 +29,32 @@ export const BOOTSTRAP_SEED = 1296387376;
 export const BOOTSTRAP_ROWS = 10000;
 export const LOWER_BOUND_INDEX = 249;
 
+/** Frozen split membership values (byte-identical to analyze.mjs). */
+export const SPLIT_DEVELOPMENT = "development";
+export const SPLIT_EVALUATION = "evaluation";
+export const DATASET_QUESTION_COUNT = 500;
+export const SPLIT_DEVELOPMENT_COUNT = 147;
+export const SPLIT_EVALUATION_COUNT = 353;
+export const COST_P95_INDEX_RULE = "ceil(0.95*n)-1";
+export const KNOWLEDGE_UPDATE_MARGIN = 0.02;
+export const COST_P95_LIMIT = 2;
+
+/** Frozen p95 order statistic, byte-identical to analyze.mjs. */
+export function costRatioP95(ratios) {
+  if (ratios.length === 0) return 0;
+  const sorted = [...ratios].sort((left, right) => left - right);
+  const index = Math.min(sorted.length - 1, Math.ceil(0.95 * sorted.length) - 1);
+  return sorted[index];
+}
+
+/** Closed zero-denominator rule, byte-identical to analyze.mjs. */
+export function costRatioForRow(row) {
+  if (row.coverage.coveredNormalizedBytes === 0) {
+    return row.canonicalFeatureBytes === 0 ? 0 : Infinity;
+  }
+  return row.canonicalFeatureBytes / row.coverage.coveredNormalizedBytes;
+}
+
 export const CHECKSUM_FILES = Object.freeze([
   "cases.jsonl",
   "split.jsonl",
@@ -39,6 +65,36 @@ export const CHECKSUM_FILES = Object.freeze([
   "mutation-summary.json",
   "command.txt",
 ]);
+
+/** Repository root resolved from this file, identical to run.mjs. */
+export const REPOSITORY_ROOT = resolve(join(dirname(fileURLToPath(import.meta.url)), "../../../.."));
+
+/**
+ * Exact source fingerprint list and order, identical to run.mjs. The verifier
+ * re-derives `sourceHash` from the frozen source files on disk instead of
+ * trusting the manifest's hex value alone.
+ */
+export const SOURCE_FINGERPRINT_PATHS = Object.freeze([
+  "docs/experiments/preregistrations/memory-product-lexical-replay-v0.json",
+  "docs/experiments/preregistrations/memory-product-lexical-replay-v0-protocol.md",
+  "docs/experiments/preregistrations/memory-product-lexical-replay-v0-schema.json",
+  "docs/experiments/preregistrations/memory-product-lexical-replay-v0-artifacts.md",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/product-lexical.mts",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/run-synthetic.mjs",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/run.mjs",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/analyze.mjs",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/verify.mjs",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/finalize.mjs",
+]);
+
+/** Recomputes the frozen source fingerprint the runner sealed at run time. */
+export function recomputeSourceHash() {
+  return sha256hex(
+    SOURCE_FINGERPRINT_PATHS
+      .map((path) => `${path}\u0000${sha256hex(readFileSync(resolve(REPOSITORY_ROOT, path), "utf8"))}`)
+      .join("\n"),
+  );
+}
 
 const CASES_FORBIDDEN_FIELDS = ["answer", "answer_session_ids", "question_type", "split", "goldSessionIds", "reference"];
 const PROJECTION_FIELDS = ["question_id", "question", "sessions", "caseSha256"];
@@ -401,7 +457,10 @@ function splitGold(result) {
       fail(result, "SPLIT_GOLD_SESSION_MISMATCH", `split row ${index} references unknown question`);
       return false;
     }
-    if (typeof row.question_type !== "string" || (row.split !== 0 && row.split !== 1)) {
+    if (
+      typeof row.question_type !== "string" ||
+      (row.split !== SPLIT_DEVELOPMENT && row.split !== SPLIT_EVALUATION)
+    ) {
       fail(result, "SPLIT_GOLD_SESSION_MISMATCH", `split row ${index} has invalid fields`);
       return false;
     }
@@ -412,6 +471,32 @@ function splitGold(result) {
           `gold session ${sessionId} is outside ${row.question_id}`);
         return false;
       }
+    }
+  }
+  // Every treatment question must have exactly one split row (missing and
+  // duplicate are rejected above); for the sealed 500-case dataset the frozen
+  // split counts must hold exactly.
+  const treatmentRows = result.treatment ?? [];
+  const treatmentCount = treatmentRows.length;
+  if (rows.length !== treatmentCount) {
+    fail(result, "SPLIT_GOLD_SESSION_MISMATCH",
+      `split has ${rows.length} rows, treatment has ${treatmentCount}`);
+    return false;
+  }
+  for (const row of treatmentRows) {
+    if (!seen.has(row.questionId)) {
+      fail(result, "SPLIT_GOLD_SESSION_MISMATCH",
+        `treatment question ${row.questionId} has no split row`);
+      return false;
+    }
+  }
+  if (treatmentCount === DATASET_QUESTION_COUNT) {
+    const developmentCount = rows.filter((row) => row.split === SPLIT_DEVELOPMENT).length;
+    const evaluationCount = rows.length - developmentCount;
+    if (developmentCount !== SPLIT_DEVELOPMENT_COUNT || evaluationCount !== SPLIT_EVALUATION_COUNT) {
+      fail(result, "SPLIT_GOLD_SESSION_MISMATCH",
+        `split counts ${developmentCount}/${evaluationCount} do not match frozen ${SPLIT_DEVELOPMENT_COUNT}/${SPLIT_EVALUATION_COUNT}`);
+      return false;
     }
   }
   return true;
@@ -447,6 +532,14 @@ function manifestIdentity(result) {
     fail(result, "MANIFEST_HASH_MISMATCH", "run-manifest.json has unexpected fields");
     return false;
   }
+  // The frozen source fingerprint is checked first: a manifest whose
+  // sourceHash does not match the sealed source files is rejected with
+  // MANIFEST_SOURCE_MISMATCH before any other manifest identity hop.
+  if (manifest.sourceHash !== recomputeSourceHash()) {
+    fail(result, "MANIFEST_SOURCE_MISMATCH",
+      "manifest sourceHash does not match the frozen source fingerprint");
+    return false;
+  }
   const casesSha256 = sha256hex(result.byName.get("cases.jsonl").toString("utf8"));
   if (manifest.casesSha256 !== casesSha256) {
     fail(result, "MANIFEST_HASH_MISMATCH", "manifest casesSha256 does not match cases.jsonl");
@@ -473,10 +566,6 @@ function manifestIdentity(result) {
     return false;
   }
   void rankingCount;
-  if (!/^[0-9a-f]{64}$/.test(manifest.sourceHash)) {
-    fail(result, "MANIFEST_HASH_MISMATCH", "manifest sourceHash is not a sha256 hex digest");
-    return false;
-  }
   if (typeof manifest.runId !== "string" || manifest.runId.length === 0) {
     fail(result, "MANIFEST_HASH_MISMATCH", "manifest runId is missing");
     return false;
@@ -561,9 +650,11 @@ function recomputeAnalysis(result, referencePath, cutoff = 10) {
 
   const goldByQuestion = new Map();
   const typeByQuestion = new Map();
+  const splitByQuestion = new Map();
   for (const row of splitRows) {
     goldByQuestion.set(row.question_id, new Set(row.goldSessionIds ?? []));
     typeByQuestion.set(row.question_id, row.question_type ?? null);
+    splitByQuestion.set(row.question_id, row.split ?? null);
   }
   const productByQuestion = new Map();
   for (const row of ranked) {
@@ -586,11 +677,16 @@ function recomputeAnalysis(result, referencePath, cutoff = 10) {
   const diceValues = [];
   const discordant = [];
   const duplicity = [];
+  const costRatios = [];
   let allCoverageComplete = true;
   let allJobsTerminal = true;
   let typedFailurePresent = false;
 
   for (const row of result.treatment ?? []) {
+    if (splitByQuestion.get(row.questionId) !== SPLIT_EVALUATION) {
+      if (row.state !== "ok") typedFailurePresent = true;
+      continue;
+    }
     const gold = goldByQuestion.get(row.questionId) ?? new Set();
     const productRows = productByQuestion.get(row.questionId) ?? [];
     const referenceRowsFor = referenceByQuestion.get(row.questionId) ?? [];
@@ -621,12 +717,14 @@ function recomputeAnalysis(result, referencePath, cutoff = 10) {
     hitDeltas.push(metrics.hit - referenceMetricsFor.hit);
     diceValues.push(diceCoefficient(productSessions.slice(0, cutoff), referenceSessions.slice(0, cutoff)));
     if (metrics.hit !== referenceMetricsFor.hit) discordant.push(row.questionId);
+    costRatios.push(costRatioForRow(row));
   }
 
   const aggregation = (values) =>
     values.length === 0 ? 0 : values.reduce((sum, value) => sum + value, 0) / values.length;
   const knowledgeUpdateIds = [...typeByQuestion.entries()]
-    .filter(([, type]) => type === "knowledge-update")
+    .filter(([questionId, type]) =>
+      type === "knowledge-update" && splitByQuestion.get(questionId) === SPLIT_EVALUATION)
     .map(([questionId]) => questionId);
   const kuError = (kind) => {
     if (knowledgeUpdateIds.length === 0) return 0;
@@ -643,10 +741,16 @@ function recomputeAnalysis(result, referencePath, cutoff = 10) {
   const missForbidden = -0.02;
   const ndcgGate = pairedBootstrapLower95(ndcgDeltas) >= missForbidden;
   const recallGate = pairedBootstrapLower95(recallDeltas) >= missForbidden;
-  const kuDifference = kuError("reference") - kuError("product");
-  const knowledgeGate = kuDifference <= 0.02;
+  const kuDifference = kuError("product") - kuError("reference");
+  const knowledgeGate = kuDifference <= KNOWLEDGE_UPDATE_MARGIN;
   const coverageTerminalGate = allCoverageComplete && allJobsTerminal && !typedFailurePresent;
-  const metricGateFailures = [ndcgGate, recallGate, knowledgeGate, coverageTerminalGate]
+  const cost = {
+    p95: costRatioP95(costRatios),
+    perEvaluatedRow: costRatios.length,
+    limit: COST_P95_LIMIT,
+  };
+  const costGate = cost.p95 <= COST_P95_LIMIT;
+  const metricGateFailures = [ndcgGate, recallGate, knowledgeGate, coverageTerminalGate, costGate]
     .filter((passed) => !passed).length;
 
   return {
@@ -656,6 +760,7 @@ function recomputeAnalysis(result, referencePath, cutoff = 10) {
       { gate: "recall10-lower95", passed: recallGate },
       { gate: "knowledge-update-error", passed: knowledgeGate },
       { gate: "coverage-terminal", passed: coverageTerminalGate },
+      { gate: "cost-ratio-p95", passed: costGate },
     ],
     primaryMetrics: {
       ndcg10: {
@@ -680,8 +785,11 @@ function recomputeAnalysis(result, referencePath, cutoff = 10) {
     errorRates: {
       product: kuError("product"),
       reference: kuError("reference"),
-      difference: kuError("reference") - kuError("product"),
+      difference: kuError("product") - kuError("reference"),
     },
+    cost,
+    metricGateFailures,
+    evaluationRows: productMetrics.length,
     duplicateOccupancy: duplicity.reduce((sum, value) => sum + value, 0),
     discordantCases: discordant,
   };
@@ -706,7 +814,16 @@ function analysisComparison(result, referencePath) {
     fail(result, "ANALYSIS_METRIC_MISMATCH", "analyse.json decision gates do not match recomputation");
     return false;
   }
-  for (const key of ["primaryMetrics", "diceScore", "errorRates", "duplicateOccupancy", "discordantCases"]) {
+  for (const key of [
+    "primaryMetrics",
+    "diceScore",
+    "errorRates",
+    "cost",
+    "metricGateFailures",
+    "evaluationRows",
+    "duplicateOccupancy",
+    "discordantCases",
+  ]) {
     if (canonicalJson(persisted[key]) !== canonicalJson(expected[key])) {
       fail(result, "ANALYSIS_METRIC_MISMATCH", `analyse.json ${key} does not match recomputation`);
       return false;
@@ -722,6 +839,7 @@ export const EXPECTED_MUTATIONS = Object.freeze([
   { mutationId: "ranking-row-removed", expectedCode: "RANKING_COVERAGE_MISMATCH" },
   { mutationId: "treatment-coverage-forged", expectedCode: "COVERAGE_MISMATCH" },
   { mutationId: "analysis-metrics-forged", expectedCode: "ANALYSIS_METRIC_MISMATCH" },
+  { mutationId: "source-freeze-tampered", expectedCode: "MANIFEST_SOURCE_MISMATCH" },
   { mutationId: "checksum-entry-removed", expectedCode: "CHECKSUM_INVENTORY_SET_MISMATCH" },
   { mutationId: "secret-marker-injected", expectedCode: "SECRET_MARKER_LEAK" },
 ]);

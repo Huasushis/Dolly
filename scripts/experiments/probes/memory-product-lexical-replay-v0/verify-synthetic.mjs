@@ -64,6 +64,30 @@ const FORBIDDEN_PROJECTION_FIELDS = new Set([
 
 export const SECRET_SENTINEL = "DOLLY_LEXICAL_TEST_SECRET_7f9d";
 
+// Source-freeze surface for the synthetic foundation bundle, identical to
+// run-synthetic.mjs `moduleSourceFingerprint`. The verifier re-derives the
+// manifest `sourceHash` from these frozen files rather than trusting a hex
+// shape alone.
+export const SYNTHETIC_SOURCE_FINGERPRINT_PATHS = Object.freeze([
+  "docs/experiments/preregistrations/memory-product-lexical-replay-v0.json",
+  "docs/experiments/preregistrations/memory-product-lexical-replay-v0-protocol.md",
+  "docs/experiments/preregistrations/memory-product-lexical-replay-v0-schema.json",
+  "docs/experiments/preregistrations/memory-product-lexical-replay-v0-artifacts.md",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/product-lexical.mts",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/run-synthetic.mjs",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/analyze-synthetic.mjs",
+  "scripts/experiments/probes/memory-product-lexical-replay-v0/verify-synthetic.mjs",
+]);
+
+/** Recomputes the synthetic manifest `sourceHash` from the frozen source list. */
+export function recomputeSyntheticSourceHash() {
+  return sha256hex(
+    SYNTHETIC_SOURCE_FINGERPRINT_PATHS
+      .map((path) => `${path}\u0000${sha256hex(readFileSync(resolve(REPOSITORY_ROOT, path), "utf8"))}`)
+      .join("\n"),
+  );
+}
+
 const MUTATIONS = Object.freeze([
   ["projection-forbidden-field", "PROJECTION_UNKNOWN_FIELD"],
   ["projection-gold-leak", "PROJECTION_GOLD_LEAK"],
@@ -72,6 +96,7 @@ const MUTATIONS = Object.freeze([
   ["treatment-coverage-forged", "COVERAGE_MISMATCH"],
   ["checksum-entry-removed", "CHECKSUM_INVENTORY_MISMATCH"],
   ["manifest-status-forged", "MANIFEST_STATUS_MISMATCH"],
+  ["source-freeze-tampered", "MANIFEST_SOURCE_MISMATCH"],
   ["secret-marker-injected", "SECRET_MARKER_LEAK"],
 ]);
 
@@ -271,8 +296,8 @@ function validateManifest(manifest, projection, treatment, rankings) {
     fail("MANIFEST_SCHEMA_MISMATCH", "frozenAt");
   }
   if (manifest.splitSha256 !== null) fail("MANIFEST_SCHEMA_MISMATCH", "splitSha256 must be null for runner");
-  if (typeof manifest.sourceHash !== "string" || manifest.sourceHash.length !== 64) {
-    fail("MANIFEST_SCHEMA_MISMATCH", "sourceHash");
+  if (manifest.sourceHash !== recomputeSyntheticSourceHash()) {
+    fail("MANIFEST_SOURCE_MISMATCH", "sourceHash does not match the frozen synthetic source fingerprint");
   }
 }
 
@@ -401,6 +426,12 @@ function mutate(directory, mutationId) {
     case "manifest-status-forged": {
       const manifest = readJson(directory, "run-manifest.json");
       manifest.status = manifest.status === "ok" ? "failed" : "ok";
+      writeFileSync(join(directory, "run-manifest.json"), `${canonicalJson(manifest)}\n`);
+      return ["run-manifest.json"];
+    }
+    case "source-freeze-tampered": {
+      const manifest = readJson(directory, "run-manifest.json");
+      manifest.sourceHash = "0".repeat(64);
       writeFileSync(join(directory, "run-manifest.json"), `${canonicalJson(manifest)}\n`);
       return ["run-manifest.json"];
     }
