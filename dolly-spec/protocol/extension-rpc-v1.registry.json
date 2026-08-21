@@ -1,6 +1,17 @@
 {
   "schema": "dolly.extension-rpc-registry/v1",
   "protocol": { "major": 1, "minor": 0 },
+  "semantic_depth": {
+    "max_json_nesting_depth": 64,
+    "root_depth": 1,
+    "rpc_envelope_counted": false,
+    "declared_schema_roots": [
+      "request_params",
+      "notification_params",
+      "success_result",
+      "error_data"
+    ]
+  },
   "error_data_schema": "https://dolly.example/spec/0.1/schemas/error.schema.json",
   "requests": [
     {

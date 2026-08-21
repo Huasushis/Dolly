@@ -2,28 +2,158 @@
   "schema": "dolly.test-vector/v1",
   "test_id": "TST-PROTO-002",
   "kind": "protocol",
-  "covers": ["REQ-XRPC-001", "INV-XRPC-001"],
+  "covers": ["INV-XRPC-001", "INV-XRPC-006"],
   "initial": {
+    "receiver_role": "host",
     "frame_depth_limit": 96,
     "semantic_payload_depth_limit": 64,
-    "depth_rule": "top-level-container-is-one"
+    "case_isolation": "each case starts on an independent ready connection",
+    "semantic_depth_rule": {
+      "root_container_depth": 1,
+      "rpc_envelope_counted": false,
+      "declared_schema_roots": [
+        "request_params",
+        "notification_params",
+        "success_result",
+        "error_data"
+      ]
+    }
   },
   "stimulus": {
-    "frames": [
-      {"case": "wrapped-valid-block", "frame_depth": 72, "semantic_block_depth": 64},
-      {"case": "too-deep-frame", "frame_depth": 97, "semantic_payload_depth": 1}
+    "cases": [
+      {
+        "case": "wrapped-valid-depth-64",
+        "message_kind": "request",
+        "declared_schema_root": "request_params",
+        "semantic_depth": 64,
+        "frame_depth": 65
+      },
+      {
+        "case": "request-params-depth-65",
+        "message_kind": "request",
+        "declared_schema_root": "request_params",
+        "semantic_depth": 65,
+        "frame_depth": 66
+      },
+      {
+        "case": "success-result-depth-65",
+        "message_kind": "success_response",
+        "declared_schema_root": "success_result",
+        "semantic_depth": 65,
+        "frame_depth": 66,
+        "correlated_request_may_have_crossed_effect_boundary": true
+      },
+      {
+        "case": "error-data-depth-65",
+        "message_kind": "error_response",
+        "declared_schema_root": "error_data",
+        "semantic_depth": 65,
+        "frame_depth": 67,
+        "correlated_request_may_have_crossed_effect_boundary": true
+      },
+      {
+        "case": "notification-params-depth-65",
+        "message_kind": "notification",
+        "declared_schema_root": "notification_params",
+        "semantic_depth": 65,
+        "frame_depth": 66
+      },
+      {
+        "case": "frame-depth-97",
+        "message_kind": "request",
+        "declared_schema_root": "request_params",
+        "semantic_depth": 1,
+        "frame_depth": 97
+      }
     ]
   },
   "expected": {
-    "outcome": "independent_frame_and_semantic_limits",
+    "outcome": "independent_semantic_roots_with_closed_dispositions",
     "assertions": [
-      {"path": "/cases/wrapped-valid-block/accepted", "op": "equals", "value": true},
-      {"path": "/cases/wrapped-valid-block/error", "op": "absent"},
-      {"path": "/cases/too-deep-frame/accepted", "op": "equals", "value": false},
-      {"path": "/cases/too-deep-frame/error/code", "op": "equals", "value": "frame_too_deep"},
-      {"path": "/connection/reusable_after_frame_rejection", "op": "equals", "value": false}
+      {"path": "/cases/wrapped-valid-depth-64/accepted", "op": "equals", "value": true},
+      {"path": "/cases/wrapped-valid-depth-64/error", "op": "absent"},
+      {"path": "/cases/wrapped-valid-depth-64/connection_reusable", "op": "equals", "value": true},
+
+      {"path": "/cases/request-params-depth-65/accepted", "op": "equals", "value": false},
+      {"path": "/cases/request-params-depth-65/error/jsonrpc_code", "op": "equals", "value": -32602},
+      {"path": "/cases/request-params-depth-65/error/data/code", "op": "equals", "value": "RPC_INVALID_PARAMS"},
+      {"path": "/cases/request-params-depth-65/error/data/details/error_name", "op": "equals", "value": "invalid_params"},
+      {"path": "/cases/request-params-depth-65/error/data/retryable", "op": "equals", "value": false},
+      {"path": "/cases/request-params-depth-65/error/data/outcome", "op": "equals", "value": "not_applied"},
+      {"path": "/cases/request-params-depth-65/method_handler_invocations", "op": "count", "value": 0},
+      {"path": "/cases/request-params-depth-65/backend_dispatches", "op": "count", "value": 0},
+      {"path": "/cases/request-params-depth-65/connection_state", "op": "equals", "value": "ready"},
+      {"path": "/cases/request-params-depth-65/connection_reusable", "op": "equals", "value": true},
+
+      {"path": "/cases/success-result-depth-65/accepted", "op": "equals", "value": false},
+      {"path": "/cases/success-result-depth-65/wire_response", "op": "absent"},
+      {"path": "/cases/success-result-depth-65/local_error/code", "op": "equals", "value": "PROTOCOL_INVALID_RESPONSE"},
+      {"path": "/cases/success-result-depth-65/local_error/details/error_name", "op": "equals", "value": "invalid_response"},
+      {"path": "/cases/success-result-depth-65/local_error/retryable", "op": "equals", "value": false},
+      {"path": "/cases/success-result-depth-65/local_error/outcome", "op": "equals", "value": "unknown"},
+      {"path": "/cases/success-result-depth-65/success_deliveries", "op": "count", "value": 0},
+      {"path": "/cases/success-result-depth-65/receiver_method_handler_invocations", "op": "count", "value": 0},
+      {"path": "/cases/success-result-depth-65/receiver_backend_dispatches", "op": "count", "value": 0},
+      {"path": "/cases/success-result-depth-65/callee_handler_invocations", "op": "equals", "value": "unknown"},
+      {"path": "/cases/success-result-depth-65/callee_backend_dispatches", "op": "equals", "value": "unknown"},
+      {"path": "/cases/success-result-depth-65/external_effect_outcome", "op": "equals", "value": "unknown"},
+      {"path": "/cases/success-result-depth-65/connection_state", "op": "equals", "value": "closed"},
+      {"path": "/cases/success-result-depth-65/connection_reusable", "op": "equals", "value": false},
+
+      {"path": "/cases/error-data-depth-65/accepted", "op": "equals", "value": false},
+      {"path": "/cases/error-data-depth-65/wire_response", "op": "absent"},
+      {"path": "/cases/error-data-depth-65/peer_error_deliveries", "op": "count", "value": 0},
+      {"path": "/cases/error-data-depth-65/peer_error_outcome_trusted", "op": "equals", "value": false},
+      {"path": "/cases/error-data-depth-65/local_error/code", "op": "equals", "value": "PROTOCOL_INVALID_RESPONSE"},
+      {"path": "/cases/error-data-depth-65/local_error/details/error_name", "op": "equals", "value": "invalid_response"},
+      {"path": "/cases/error-data-depth-65/local_error/retryable", "op": "equals", "value": false},
+      {"path": "/cases/error-data-depth-65/local_error/outcome", "op": "equals", "value": "unknown"},
+      {"path": "/cases/error-data-depth-65/receiver_method_handler_invocations", "op": "count", "value": 0},
+      {"path": "/cases/error-data-depth-65/receiver_backend_dispatches", "op": "count", "value": 0},
+      {"path": "/cases/error-data-depth-65/callee_handler_invocations", "op": "equals", "value": "unknown"},
+      {"path": "/cases/error-data-depth-65/callee_backend_dispatches", "op": "equals", "value": "unknown"},
+      {"path": "/cases/error-data-depth-65/external_effect_outcome", "op": "equals", "value": "unknown"},
+      {"path": "/cases/error-data-depth-65/connection_state", "op": "equals", "value": "closed"},
+      {"path": "/cases/error-data-depth-65/connection_reusable", "op": "equals", "value": false},
+
+      {"path": "/cases/notification-params-depth-65/accepted", "op": "equals", "value": false},
+      {"path": "/cases/notification-params-depth-65/wire_response", "op": "absent"},
+      {"path": "/cases/notification-params-depth-65/diagnostic/code", "op": "equals", "value": "RPC_INVALID_PARAMS"},
+      {"path": "/cases/notification-params-depth-65/diagnostic/details/error_name", "op": "equals", "value": "invalid_params"},
+      {"path": "/cases/notification-params-depth-65/diagnostic/retryable", "op": "equals", "value": false},
+      {"path": "/cases/notification-params-depth-65/diagnostic/outcome", "op": "equals", "value": "not_applied"},
+      {"path": "/cases/notification-params-depth-65/method_handler_invocations", "op": "count", "value": 0},
+      {"path": "/cases/notification-params-depth-65/backend_dispatches", "op": "count", "value": 0},
+      {"path": "/cases/notification-params-depth-65/connection_state", "op": "equals", "value": "ready"},
+      {"path": "/cases/notification-params-depth-65/connection_reusable", "op": "equals", "value": true},
+
+      {"path": "/cases/frame-depth-97/accepted", "op": "equals", "value": false},
+      {"path": "/cases/frame-depth-97/error/code", "op": "equals", "value": "frame_too_deep"},
+      {"path": "/cases/frame-depth-97/method_handler_invocations", "op": "count", "value": 0},
+      {"path": "/cases/frame-depth-97/backend_dispatches", "op": "count", "value": 0},
+      {"path": "/cases/frame-depth-97/connection_state", "op": "equals", "value": "closed"},
+      {"path": "/cases/frame-depth-97/connection_reusable", "op": "equals", "value": false},
+      {"path": "/cases/frame-depth-97/extension_process", "op": "equals", "value": "terminated"}
     ],
-    "emitted": [],
+    "emitted": [
+      {
+        "case": "request-params-depth-65",
+        "jsonrpc_error": -32602,
+        "data": {"code": "RPC_INVALID_PARAMS", "retryable": false, "outcome": "not_applied"}
+      },
+      {
+        "case": "notification-params-depth-65",
+        "local_diagnostic": {"code": "RPC_INVALID_PARAMS", "retryable": false, "outcome": "not_applied"}
+      },
+      {
+        "case": "success-result-depth-65",
+        "local_error": {"code": "PROTOCOL_INVALID_RESPONSE", "retryable": false, "outcome": "unknown"}
+      },
+      {
+        "case": "error-data-depth-65",
+        "local_error": {"code": "PROTOCOL_INVALID_RESPONSE", "retryable": false, "outcome": "unknown"}
+      }
+    ],
     "crash_label": null
   }
 }
