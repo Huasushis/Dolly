@@ -10,16 +10,69 @@ export type FramedJsonErrorCode =
   | "FRAME_CONFIG_INVALID"
   | "FRAME_LENGTH_INVALID"
   | "FRAME_UTF8_INVALID"
+  | "FRAME_TOO_DEEP"
   | "FRAME_JSON_INVALID"
   | "FRAME_BACKPRESSURE_LIMIT"
   | "FRAME_CHANNEL_CLOSED"
   | "FRAME_TRANSPORT_FAILED";
+
+/**
+ * V1 Host default for the negotiated complete-frame `max_frame_nesting_depth`.
+ * The top-level JSON-RPC object counts as depth 1 and each directly nested
+ * object or array increases the depth by 1. Independent of the semantic
+ * `max_json_nesting_depth` (64) which this module does not enforce.
+ */
+export const DEFAULT_MAX_FRAME_NESTING_DEPTH = 96;
 
 export class FramedJsonError extends Error {
   constructor(readonly code: FramedJsonErrorCode, message: string) {
     super(message);
     this.name = "FramedJsonError";
   }
+}
+
+/**
+ * Byte-level, iterative measurement of complete-frame JSON container depth.
+ * Counts every `{` or `[` in descent order as +1 and every `}` or `]` as -1,
+ * starting the top-level container at 1. Structural bytes inside a JSON string
+ * are ignored, honoring `\"` and `\\` escapes; UTF-8 lead and continuation
+ * bytes (0x80-0xFF) cannot collide with ASCII structural bytes and are skipped.
+ * Returns true as soon as depth exceeds `limit`. Never parses the payload and
+ * never recurses, so it poses no stack risk for hostile framing.
+ */
+function frameDepthExceeds(bytes: Buffer, limit: number): boolean {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let offset = 0; offset < bytes.byteLength; offset += 1) {
+    const byte = bytes[offset];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (byte === 0x5c /* backslash */) {
+        escaped = true;
+      } else if (byte === 0x22 /* double quote */) {
+        inString = false;
+      }
+      continue;
+    }
+    if (byte === 0x22) {
+      inString = true;
+      continue;
+    }
+    if (byte === 0x7b /* { */ || byte === 0x5b /* [ */) {
+      depth += 1;
+      if (depth > limit) return true;
+      continue;
+    }
+    if (byte === 0x7d /* } */ || byte === 0x5d /* ] */) {
+      if (depth > 0) depth -= 1;
+      continue;
+    }
+    // Whitespace, structural separators, number/literal bytes, and UTF-8
+    // multi-byte sequences are not container delimiters.
+  }
+  return false;
 }
 
 export interface FramedJsonChannelOptions {
@@ -198,11 +251,23 @@ export class FramedJsonChannel {
       this.#fail(new FramedJsonError("FRAME_UTF8_INVALID", "Inbound frame is not UTF-8"));
       return;
     }
+    // Measure container depth on the raw payload before any JSON.parse so an
+    // over-deep frame is rejected without parsing or echoing its payload. The
+    // scanner is iterative and runs in linear time.
+    if (frameDepthExceeds(bytes, DEFAULT_MAX_FRAME_NESTING_DEPTH)) {
+      this.#fail(
+        new FramedJsonError(
+          "FRAME_TOO_DEEP",
+          "Inbound frame exceeds the negotiated complete-frame nesting depth",
+        ),
+      );
+      return;
+    }
     let value: JsonValue;
     try {
       value = parseStrictJsonText(text, {
         maxBytes: this.#maxFrameBytes,
-        maxDepth: 96,
+        maxDepth: DEFAULT_MAX_FRAME_NESTING_DEPTH,
       });
     } catch {
       this.#fail(
