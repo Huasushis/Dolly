@@ -1,0 +1,12 @@
+[package]
+name = "dolly-tool-broker"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dolly-canonical-json = { path = "../dolly-canonical-json" }
+dolly-schema = { path = "../dolly-schema" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
