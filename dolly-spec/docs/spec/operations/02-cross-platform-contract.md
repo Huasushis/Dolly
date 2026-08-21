@@ -27,6 +27,14 @@ V1 supports Linux and Windows as runtime targets. macOS is build-and-unit-test o
 `dollyd` is a user process. Where systemd user services are available, the supported background integration is a `systemd --user` unit. Environments without systemd MAY run `dollyd` foreground or under a documented user supervisor, but process ownership and IPC permissions remain identical.
 
 The daemon **MUST NOT** require root. System-wide multi-user daemon mode is outside v1.
+The installed Linux process backend is narrower than platform-neutral Module
+semantics. Its [activation authority contract](04-module-activation-authority.md)
+accepts only a product-owned systemd user-service candidate and refuses that
+backend on Windows or macOS before acquiring an instance lock or creating a
+writable resource. A future Windows backend requires its own versioned service
+or Job Object ownership premise; it MUST NOT reinterpret a Linux candidate,
+process record, Ready response, result, acknowledgement, or absence as that
+authority.
 
 ### 2.2 Windows
 

@@ -65,6 +65,9 @@ Physical normalization MAY differ, but a conforming database MUST enforce the eq
 | `graph_revisions` | `graph_revision` | canonical immutable graph snapshots |
 | `descriptor_revisions` | `(module_id, descriptor_revision)` | immutable Descriptor snapshots |
 | `extension_generations` | `(extension_alias, extension_generation)` | durable Worker epoch, process/package identity, negotiated limits, Module binding, readiness, and activation-ledger continuity |
+| `permission_policy_definitions` | `(policy_id, policy_revision)`; unique `definition_digest` | immutable operator-approved policy definitions without live backend authority |
+| `permission_policy_bindings` | `(binding_id, binding_revision)`; unique `binding_digest`; one definition foreign key | non-secret installed-Host component selection metadata |
+| `module_activation_premises` | `config_revision`; unique `premises_digest` | exact policy records and product-owned Linux service candidate for installed Linux Module startup |
 | `modules` | `module_id`; unique non-null `nonterminal_activation_id`; at most one execution-slot binding | lifecycle, Module fence generation, current ownership, and pending host fence |
 | `activations` | `activation_id`; at most one nonterminal per `module_id` | lifecycle, attempts, lease generation, frozen replay-contract source, one-shot next-attempt authorization, terminal result |
 | `activation_manifests` | `activation_id`; unique `manifest_digest` per Activation | frozen canonical manifest bytes, complete effective configuration, and value/schema digests |
@@ -98,6 +101,9 @@ The database MUST use foreign keys or equivalent checks so that:
   its target Extension generation MUST reference the
   `extension_generations` row under the Extension alias frozen for that Module
   and that row MUST retain the same Module/Extension binding;
+- a permission-policy binding cannot exist without its exact definition triple,
+  and an activation-premise row cannot exist without its exact configuration
+  revision, complete selected definition/binding set, and verified digests;
 - a committed activation output cannot exist without its Activation; and
 - a durable subscription cannot reference an absent Page or Module tombstone.
 
@@ -121,6 +127,14 @@ Other Core records that require ordering, such as external ingress and audited s
 Before this transaction, the control plane MUST have satisfied the cutover requirements for the candidate's change class and completed every required backlog disposition. Graph-only routing changes MAY leave old frozen Activations live, in which case all referenced old objects MUST be retained. Changes requiring state/process replacement, immediate authority revocation, destructive disposition, or removal of an object that cannot be retained safely MUST quiesce and fence the applicable participants.
 
 Every accepted configuration change inserts the complete canonical resolved configuration and advances `config_revision` in one transaction. If effective graph semantics also change, that same transaction inserts the complete canonical graph, advances `graph_revision`, and creates or drains subscriptions. A non-graph configuration change leaves the active `graph_revision` unchanged. The transaction appends its journal record and MUST NOT delete any configuration or graph snapshot referenced by a nonterminal Activation.
+
+When the target configuration selects an installed Linux Module, that same
+transaction MUST insert its one complete activation-premise record and all
+referenced immutable permission-policy definition/backend-binding records.
+Changing any definition, binding, installed-product origin, or service
+candidate requires a new configuration revision and premise digest. Missing or
+extra records abort the transaction; no later process, Ready, result,
+acknowledgement, or absent record fills them.
 
 ### 5.2 External ingress
 
@@ -318,23 +332,39 @@ A caller receiving `unknown` MUST replay with the same idempotency identity. It 
 
 Startup in writable mode MUST perform this order:
 
-1. acquire the instance lock;
-2. open SQLite with the required PRAGMAs;
-3. verify schema version and migrations;
-4. run `PRAGMA quick_check` and a foreign-key check;
-5. verify the instance identity and sequence bounds;
-6. verify canonical digest samples and all nonterminal manifest/result digests;
-7. terminate or prove absence of Extension processes from the old worker epoch;
-8. rebuild or verify trace counters after an unclean shutdown;
-9. reconstruct Module and subscription states;
-10. reset every lossy Page and record restart gaps before any recovered result can append new lossy output;
-11. apply every `result_staged` or `commit_blocked` Activation in deterministic `(ManifestCreated journal_seq, activation_id)` order;
-12. move every orphaned `leased` Activation through fencing to its safe recovered disposition with the same Manifest; and
-13. only now expose `ready` and eligible `retry_wait` work to Modules in deterministic `(ManifestCreated journal_seq, activation_id)` order.
+1. inspect configuration read-only; when it contains an installed Linux Module,
+   observe the Host platform and refuse non-Linux activation before
+   acquiring or creating the instance controller lock or any writable resource;
+2. acquire the exclusive instance controller lock;
+3. claim and reread the exact active configuration revision under that lock;
+4. open SQLite with the required PRAGMAs;
+5. verify schema version and migrations;
+6. run `PRAGMA quick_check` and a foreign-key check;
+7. verify the instance identity and sequence bounds;
+8. verify canonical digest samples and all nonterminal manifest/result digests;
+9. for an installed Linux Module, load and resolve its exact
+   [activation premises](../operations/04-module-activation-authority.md), verify
+   the product-owned service/runtime binding, and prepare/read back the
+   delegated root in the order defined there;
+10. terminate or prove absence of Extension processes from the old worker epoch;
+11. rebuild or verify trace counters after an unclean shutdown;
+12. reconstruct Module and subscription states;
+13. reset every lossy Page and record restart gaps before any recovered result
+    can append new lossy output;
+14. apply every `result_staged` or `commit_blocked` Activation in deterministic
+    `(ManifestCreated journal_seq, activation_id)` order;
+15. move every orphaned `leased` Activation through fencing to its safe
+    recovered disposition with the same Manifest; and
+16. for an installed Linux Module, mint and consume the one-use recovery
+    handoff in installed composition; only now expose `ready` and eligible
+    `retry_wait` work in deterministic
+    `(ManifestCreated journal_seq, activation_id)` order.
 
-No Extension MAY receive an Activation before steps 1–12 complete. Recovery
-MUST NOT publish runnable work between reconstruction, lossy reset, staged
-application, and orphan fencing.
+No Extension MAY receive an Activation before steps 1–15 complete, and an
+installed Linux Module cannot receive one before step 16 completes.
+Recovery MUST NOT publish runnable work between configuration/premise
+verification, reconstruction, lossy reset, staged application, orphan fencing,
+and installed composition.
 
 An integrity failure MUST start the instance in read-only recovery mode or refuse startup. It MUST NOT delete offending rows, reset cursors, or reconstruct canonical data from logs automatically.
 

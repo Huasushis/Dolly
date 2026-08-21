@@ -688,22 +688,27 @@ failure is `MODULE_ACTIVATION_LAUNCHER_UNAVAILABLE`. Installed execution still
 uses the separately frozen launcher descriptor, so the activation pathname
 check is not substituted for the no-TOCTOU execution boundary.
 
-The authority-minting activation API likewise does not expose the low-level
-`cgroupRoot`, `busctlPath`, `loginctlPath`, or `ModuleCgroupFileSystem` seams.
-It accepts only the candidate systemd unit, service mode, and finite query
-timeouts; service observations, `/proc` data, the cgroup-v2 mount, delegated
-root writes, and the resulting stop prover all use the real Host adapters.
-Those low-level seams remain independently testable, but an activation caller
-cannot replace their evidence and receive the same `permitted` result.
-The successful result is a Host-minted, deeply frozen activation permission;
-later composition rejects a copied or caller-constructed structural lookalike.
-The permission binds the verified service identity, prepared delegated-root
-snapshot, reviewed runtime binding, and stop prover as one object. Both the
-permission and the runtime binding reject copied structural lookalikes.
-Installed runtime, generation, and executor composition consume that exact
-permission instead of accepting the service binding and runtime profile as
-separate caller values. It is not a serializable configuration record and must
-never be reconstructed from JSON.
+The lower-level activation probe does not expose `cgroupRoot`, `busctlPath`,
+`loginctlPath`, or `ModuleCgroupFileSystem`; its explicit unit, mode, and
+timeout options remain test seams and are not product authority. Product
+activation instead consumes the one
+`dolly.linux-service-candidate/v1` record in the current
+`dolly.module-activation-premises/v1` record defined by the authoritative
+[installed Linux Module activation contract](../../dolly-spec/docs/spec/operations/04-module-activation-authority.md).
+That candidate must have verified installed-product origin and `mode: "user"`;
+a caller, environment value, instance document, process record, or test factory
+cannot supply it. Service observations, `/proc` data, the cgroup-v2 mount,
+delegated-root writes, and the resulting stop prover still use the real Host
+adapters.
+
+A successful product check mints one Host-owned, deeply frozen activation
+permission and runtime binding for the current controller generation. Later
+composition rejects a copied, deserialized, stale, or caller-constructed
+lookalike. The permission binds the candidate origin, verified service identity,
+prepared delegated-root snapshot, reviewed runtime binding, and stop prover as
+one object. Installed runtime, generation, and executor composition consume
+that exact permission instead of accepting service/runtime fields separately.
+Neither live object is serializable or reconstructible from JSON.
 
 Linux activation performs the delegated-root half of that proof before it
 returns permission to accept Module work. After verifying the exact Core
@@ -775,8 +780,9 @@ implementation of `dolly.instance/10`.
 `dolly.instance/10` is reserved for the first product Module configuration. It
 MUST NOT be released as a partial schema that merely adds Linux process limits.
 The same version must also remove the trusted out-of-document values currently
-needed by Scheduler composition, persist exact permission policy revisions,
-and represent each input connection's start position. Until every field and
+needed by Scheduler composition, persist exact permission-policy definition and
+backend-binding identities/revisions/digests, and represent each input
+connection's start position. Until every field and
 migration rule in this section is implemented, the runtime validator continues
 to accept only `dolly.instance/9` and product startup continues to reject every
 configured Module.
@@ -838,7 +844,11 @@ interface LinuxProcessExecutionConfiguration {
 
 interface PermissionPolicyReference {
   policyId: string;
-  revision: string;
+  policyRevision: number;
+  policyDefinitionDigest: string;
+  bindingId: string;
+  bindingRevision: number;
+  bindingDigest: string;
 }
 
 interface ModuleConfigurationV10 {
@@ -918,44 +928,47 @@ record, write Core state, or start a launcher. A later process-record version
 must bind this provenance to those store-resolved policy records and startup
 recovery. The public Module startup refusal remains in force.
 
-`ReservedV10InstalledPermissionPolicyRegistry` closes only the next selection
-rule for candidate composition. Every configured policy reference must resolve
-to one operator-provided closed policy definition whose canonical digest is
-the exact configured revision; duplicate revisions and caller-selected labels
-are rejected. Package schemas 1 through 4 request no capabilities, so the
-store-bound v10 installed-plan resolver rejects every non-empty policy
-reference for those packages before a selection can be minted. This is an
-intentional compatibility gate, not an implicit grant: a future package schema
-must define a closed capability request and its compatibility rule before this
-candidate path can select a live policy. The currently reachable empty
-resolver-minted selection is bound to the
-installed plan, package, configuration, and selected policy-definition
-digests. It is not execution authority: the in-process broker, storage backend,
-tool executor, secret material, and data domain are not durable binding records
-and are deliberately excluded from the definition digest. A future Host-owned
-binding store must give those live dependencies separate stable identifiers
-and revisions. Until both definition and binding records enter the future
-process record, this selection supports conformance wiring only and cannot
-remove the bootstrap refusal.
+`ReservedV10InstalledPermissionPolicyRegistry` closes only a candidate
+definition-selection rule. The authoritative activation contract now requires
+every configured reference to resolve to exactly one persistent
+`dolly.permission-policy-definition/v1` record and one persistent
+`dolly.permission-policy-binding/v1` record. The configured policy and binding
+revisions are positive safe integers; their separate digests verify the exact
+canonical records. The binding digest covers its installed-product component
+origin. Duplicate, stale, extra, same-revision/different-byte, and
+cross-definition records are rejected.
 
-`deriveReservedV10InstalledModuleProcessProvenance` joins that exact policy
-selection and Host-minted activation permission to the resolver-minted
-installed plan. Its canonical snapshot binds
-the installed-plan and policy-selection digests, package digest, configuration
-revision/schema/value digests, external-effect declaration, complete Linux
-execution record, verified service identity, prepared delegated-root snapshot,
-runtime-binding revision, and audit profile. A copied activation permission or
-runtime binding is rejected instead of sharing a provenance digest. The result
-is a resolver-minted Linux process-provenance
-candidate and copied lookalikes are rejected. Resolver provenance prevents
-structural substitution but does not prove current desired-state ownership,
-platform support, dynamic-library identity, or bubblewrap/kernel enforcement.
-The runtime-binding revision identifies this audit record; it is not yet a
-durable Host conformance record and cannot establish cross-host equivalence. It
-is intentionally not a Module process record and the current Core-state store will
-not persist it. This keeps the future
-`dolly.module-process-record/2` preimage explicit without allowing startup
-recovery to trust an in-memory policy revision as durable evidence.
+Package schemas 1 through 4 request no capabilities, so the candidate
+installed-plan resolver continues to reject every non-empty policy reference
+for those packages. A future package schema must define a closed capability
+request and compatibility rule. The currently reachable empty selection remains
+bound to the installed plan, package, configuration, and selected definition
+digests, but it is not execution authority.
+
+A backend-binding record serializes no broker, repository, storage backend,
+tool executor, secret or secret reference, endpoint, filesystem path, function,
+factory, generic I/O handle, or capability. The installed Host registry must
+match its exact binding identifier, revision, digest, and component origin,
+then mint a fresh object-identity-branded live binding for the current
+controller generation. The current in-process policy registry does not
+implement that persistent record-to-live-binding boundary, so its selections
+remain conformance wiring only and cannot remove the bootstrap refusal.
+
+`deriveReservedV10InstalledModuleProcessProvenance` still joins the candidate
+policy selection and Host-minted activation permission to the resolver-minted
+installed plan. A future conforming snapshot must additionally bind the active
+configuration revision/digest, complete activation-premise digest, every
+definition/binding identity and origin, controller generation, installed-plan
+digest, package and Module configuration digests, external-effect declaration,
+Linux execution record, verified service identity, prepared delegated-root
+snapshot, and runtime-binding revision/digest. Copied live objects are rejected
+instead of sharing provenance.
+
+The current provenance candidate proves neither current desired-state
+ownership nor this persistent premise chain. It is not a Module process record
+and the current Core-state store does not persist the required fields.
+`dolly.module-process-record/2` must carry them without treating version 1,
+Ready, process success, result/acknowledgement, or record absence as authority.
 
 The three version-9 Scheduler intervals keep their existing bounds:
 `pollIntervalMs` is at most 60,000, `retryBaseMs` is at most 3,600,000, and
@@ -1032,34 +1045,40 @@ selected backend and controller operations are available and can enforce the
 exact values; a valid document is not a promise that the current host can run
 it.
 
-Permission policy identifiers become immutable references. Each referenced
-record must exist in a persistent Host-owned policy store, match the exact
-revision, and be compatible with the resolved package and Module before any
-capability handle is issued. An in-memory registry supplied by a caller is not
-product composition. Policy references are unique by `policyId`; changing a
-revision is a generation-restart configuration change.
+Permission policy references freeze both the persistent definition and the
+persistent Host backend binding. Each distinct reference must resolve exactly
+one definition by `(policyId, policyRevision, policyDefinitionDigest)` and one
+binding by `(bindingId, bindingRevision, bindingDigest)`. The binding record
+must name that exact definition and verified installed-product component
+origin. Records are unique, sorted, digest-verified, and compatible with the
+resolved package and Module before any live binding or capability is issued.
+An in-memory registry, same-label component, or caller-supplied backend is not
+product composition. Changing either revision/digest or origin is a
+generation-restart configuration change.
 
-A Module declaring `none` has an empty permission-policy reference list and
-its resolved package manifest requests no capability. A Module declaring
-`core-capabilities-only` may reference only persistent policies that the Host
-can resolve and bind to a requested capability. A mismatch is a configuration
-or installation error before process start; Core does not silently discard an
-unused reference or add a manifest request that configuration omitted.
+A Module declaring `none` has an empty permission-policy reference list and its
+resolved package manifest requests no capability. A Module declaring
+`core-capabilities-only` may reference only definitions and bindings the Host
+can resolve to requested capabilities through the current activation premise
+record. A mismatch is a configuration or installation error before process
+start; Core does not discard an unused reference, add a manifest request, or
+mint authority from process/result/acknowledgement/absence evidence.
 
 #### 5.3.1 Explicit migration from version 9
 
 Migration is a separate operation, not an alias in the version-10 validator.
 It receives one validated version-9 document and configuration revision from
-the same configuration-store read, plus an explicit migration input
-containing the complete version-10 Scheduler record and, for every configured
-Module, its Claim baseline, mailbox bounds, source request byte limit when
-applicable, Linux execution record, external-effect declaration, and exact
-permission policy revisions. Missing or extra per-Module migration entries are
-an error. Migration input also supplies the new
-`core.limits.maxRegisteredContentValueBytes`; it is not inferred from the
-currently installed schemas. The migration MUST NOT infer these values from
-machine capacity, current queue contents, experiment defaults, or an in-memory
-registry.
+the same configuration-store read, plus an explicit migration input containing
+the complete version-10 Scheduler record and, for every configured Module, its
+Claim baseline, mailbox bounds, source request byte limit when applicable,
+Linux execution record, external-effect declaration, and complete policy
+definition/binding identities, revisions, digests, and origins. It also receives
+the complete target `dolly.module-activation-premises/v1` record, including the
+verified installed-product Linux service candidate. Missing or extra
+per-Module or premise records are errors. Migration input supplies
+`core.limits.maxRegisteredContentValueBytes`; none of these values may be
+inferred from machine capacity, queue contents, experiment defaults, an
+in-memory registry, process/result/acknowledgement evidence, or absence.
 
 For each existing non-source Module, migration copies the version-9 Claim
 maxima and refuses a supplied baseline above them. For a source Module it sets
@@ -1070,17 +1089,19 @@ the same order with the Module's exact version-9 `subscriptionStart` value.
 Output Page order, package identity, immutable configuration reference,
 activation, input/result/frame limits, generation limits, and timeouts are
 copied exactly. Each version-9 permission policy identifier must resolve to the
-explicitly supplied persistent revision; unresolved or additional references
-fail migration.
+explicitly supplied persistent definition and backend-binding records;
+unresolved, stale, duplicate, or additional references fail migration.
 
 Migration first requires the revision in that source snapshot to equal the
 explicit expected source revision, then constructs and validates the complete
-version-10 document and an auditable change plan without changing external
-state. Applying the plan rechecks the same source revision and writes one new
-configuration revision atomically. It does
-not create subscriptions, source queues, process records, or child processes,
-and it does not remove or weaken the version-9 Module startup refusal. Applying
-the migrated document is a later recovery and activation operation.
+version-10 document, target activation-premise record, and auditable change
+plan without changing external state. Applying the plan rechecks the same
+source revision and writes one new configuration revision and its complete
+premise record atomically. It creates no live backend binding, activation
+permission, recovery handoff, subscription, source queue, process record, or
+child process. It does not remove or weaken the version-9 Module startup
+refusal. Applying the migrated document is a later ordered recovery and
+activation operation.
 
 #### 5.3.2 Release gate
 
@@ -1091,27 +1112,41 @@ startup remains refused until all of the following are connected in one
 composition and tested across restart:
 
 1. every Scheduler, Claim, mailbox, source request, content-schema, execution,
-   timeout, and permission value is derived from the same validated document;
-2. installed package bytes, configuration revision, permission policy
-   revisions, Module generation, process generation, and process record are
-   created by one factory and cannot be substituted independently;
-3. the Linux backend enforces its filesystem, namespace, control-group, file
+   timeout, and permission value is derived from the same claimed current
+   configuration revision and digest;
+2. every permission reference resolves one persistent definition and
+   backend-binding record with exact identifier, revision, digest, and
+   installed-product origin, and restart remints rather than deserializes its
+   live binding;
+3. the product-owned user-service candidate, reviewed runtime, delegated root,
+   activation permission, runtime binding, stop prover, and one-use recovery
+   handoff satisfy the authority direction and exact cardinality in the
+   installed Linux Module activation contract;
+4. non-Linux refusal precedes lock creation, then controller-lock ownership,
+   current configuration claim, store/premise validation, service/root proof,
+   startup recovery, handoff, installed composition, fresh generations, and
+   Ready occur in that order;
+5. installed package bytes, configuration and premise digests, permission
+   records, Module generation, process generation, and process record are
+   created by one installed composition and cannot be substituted independently;
+6. the Linux backend enforces its filesystem, namespace, control-group, file
    descriptor, and descendant-ownership boundary and confirms whole-group
    termination before replacement;
-4. a new process-record schema binds the external-effect declaration to the
-   accepted instance revision and execution boundary; historical version-1
-   declarations remain preserve-only;
-5. startup recovery produces one store-bound handoff only after old-process
-   stop proof, result-commit recovery, and unresolved-Claim classification;
-6. persistent permission policy and effect-intent records survive restart and
+7. a new process-record schema binds the external-effect declaration and all
+   activation premises to the accepted instance revision and execution
+   boundary; historical version-1 declarations remain preserve-only;
+8. persistent permission policy and effect-intent records survive restart and
    keep unknown outcomes quarantined rather than retried; and
-7. a Linux installed-Module test exercises configuration through Claim,
+9. a Linux installed-Module test exercises configuration through Claim,
    process, capability, atomic result commit, shutdown, and reopen while the
    public bootstrap refusal test remains green until the final gate is met.
 
-Passing the version-10 JSON validator alone does not meet this release gate.
-No implementation may remove `RUNTIME_MODULE_MIGRATION_REQUIRED` one item at a
-time or route product startup through a candidate composition to avoid it.
+Passing the version-10 JSON validator or the activation-premise schema alone
+does not meet this release gate. No implementation may remove or weaken
+`RUNTIME_MODULE_MIGRATION_REQUIRED` one item at a time or route product startup
+through candidate composition. This authority contract also does not establish
+global aggregate boundedness for `FileCoreStateStore` or the file-backed Module
+result journal; that remains a separate storage release gate.
 
 ## 6. Block model
 

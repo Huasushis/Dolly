@@ -1,0 +1,90 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-AUTH-003",
+  "kind": "crash_recovery",
+  "covers": ["REQ-ACT-005", "INV-ACTIVATION-014", "INV-ACTIVATION-015"],
+  "initial": {
+    "persistent_premises": {
+      "config_revision": 42,
+      "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "policy_definition_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "binding_id": "read-tools-host",
+      "binding_revision": 3,
+      "binding_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "binding_origin": {
+        "component_id": "org.dolly.host.read-tools",
+        "component_revision": 5,
+        "component_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "premises_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "first_startup": {
+      "controller_generation": "0198ab31-6c44-7e8a-b2bb-000000000521",
+      "module_generation": 8,
+      "process_generation": 13,
+      "live_binding_object_id": "host-object-1",
+      "activation_permission_object_id": "host-object-2",
+      "runtime_binding_object_id": "host-object-3",
+      "recovery_handoff_object_id": "host-object-4",
+      "recovery_handoff_consumed": true
+    },
+    "restart": {
+      "controller_generation": "0198ab31-6c44-7e8a-b2bb-000000000522",
+      "requested_module_generation": 9,
+      "requested_process_generation": 14,
+      "presented_stale_object_ids": ["host-object-1", "host-object-2", "host-object-3", "host-object-4"]
+    },
+    "migration": {
+      "expected_source_config_revision": 41,
+      "actual_source_config_revision": 41,
+      "legacy_policy_ids": ["read-tools"],
+      "supplied_definition_records": [],
+      "supplied_binding_records": [],
+      "in_memory_registry_has_same_label": true,
+      "historical_process_record_has_success": true,
+      "historical_acknowledgement_present": true
+    },
+    "downstream_attempts": [
+      "ready_without_current_policy_binding",
+      "successful_process_record_without_service_permission",
+      "matching_result_digest_without_recovery_handoff",
+      "positive_acknowledgement_without_configuration_claim",
+      "absence_of_submission_record_as_policy_authority"
+    ],
+    "public_guard": "RUNTIME_MODULE_MIGRATION_REQUIRED"
+  },
+  "stimulus": {
+    "commands": [
+      "RestartUnderNewControllerGeneration",
+      "ResolvePersistentPremisesAgain",
+      "AttemptStaleLiveAuthorityReuse",
+      "AttemptLegacyMigration",
+      "AttemptDownstreamAuthorityManufacture"
+    ]
+  },
+  "expected": {
+    "outcome": "restart_remints_live_authority_and_migration_or_downstream_evidence_never_fills_missing_premises",
+    "assertions": [
+      {"path": "/restart/persistent_premises", "op": "equals", "value": {"config_revision": 42, "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "policy_definition_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "binding_id": "read-tools-host", "binding_revision": 3, "binding_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "binding_origin": {"component_id": "org.dolly.host.read-tools", "component_revision": 5, "component_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"}, "premises_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"}},
+      {"path": "/restart/live_binding_object_id", "op": "not_equals", "value": "host-object-1"},
+      {"path": "/restart/activation_permission_object_id", "op": "not_equals", "value": "host-object-2"},
+      {"path": "/restart/runtime_binding_object_id", "op": "not_equals", "value": "host-object-3"},
+      {"path": "/restart/recovery_handoff_object_id", "op": "not_equals", "value": "host-object-4"},
+      {"path": "/restart/module_generation", "op": "equals", "value": 9},
+      {"path": "/restart/process_generation", "op": "equals", "value": 14},
+      {"path": "/restart/stale_object_results", "op": "equals", "value": ["stale_controller_generation", "stale_controller_generation", "stale_controller_generation", "already_consumed_or_stale_controller_generation"]},
+      {"path": "/migration/applied", "op": "equals", "value": false},
+      {"path": "/migration/error", "op": "equals", "value": "MODULE_ACTIVATION_POLICY_BINDING_UNAVAILABLE"},
+      {"path": "/migration/target_premise_record", "op": "absent"},
+      {"path": "/migration/live_binding_count", "op": "equals", "value": 0},
+      {"path": "/migration/recovery_handoff_count", "op": "equals", "value": 0},
+      {"path": "/downstream_attempt_results", "op": "equals", "value": ["refused_missing_upstream_authority", "refused_missing_upstream_authority", "refused_missing_upstream_authority", "refused_missing_upstream_authority", "refused_missing_upstream_authority"]},
+      {"path": "/public_guard", "op": "equals", "value": "RUNTIME_MODULE_MIGRATION_REQUIRED"},
+      {"path": "/global_filecore_boundedness_claimed", "op": "equals", "value": false}
+    ],
+    "emitted": [
+      {"event": "ModuleActivationMigrationRefused", "reason": "missing_permission_policy_binding"}
+    ],
+    "crash_label": "after_first_startup_handoff_consumed_before_restart"
+  }
+}

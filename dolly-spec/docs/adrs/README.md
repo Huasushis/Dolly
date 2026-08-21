@@ -18,5 +18,6 @@ They are not substitutes for normative requirements.
 | [0011](0011-two-thirds-filter-signal-and-copy.md) | Carry Filter scores as JSON Parts and emit a safe semantic copy | Accepted |
 | [0012](0012-napcatqq-mailbox-and-catalog.md) | Journal QQ events and expose a bounded pull/catalog interface | Accepted |
 | [0013](0013-testament-and-levelupper-boundaries.md) | Keep Testament isolated and LevelUpper identity-local | Accepted |
+| [0014](0014-installed-module-activation-authority.md) | Keep installed Module activation authority upstream of execution | Accepted |
 
 Status may be `Proposed`, `Accepted`, `Deprecated`, or `Superseded`.

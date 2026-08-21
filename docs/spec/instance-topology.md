@@ -557,11 +557,14 @@ Adding a Module requires:
   `extension-process-protocol.md` Section 7.1.1, which the control plane
   resolves and revalidates before the Module can start;
 - an explicit start position for every input connection, per Section 7.7; and
-- limits, timeouts, isolation, and permission policy identifiers that the
-  deployment permits.
+- limits, timeouts, isolation, and exact permission-policy definition and
+  backend-binding identifiers/revisions/digests that the deployment permits.
 
-A newly added Module reaches READY only through the normal lifecycle in
-`core-runtime.md` Section 10. Until Module execution is enabled at all, the
+A newly added installed Linux Module reaches READY only after the ordered
+activation-premise, service/runtime, delegated-root, startup-recovery handoff,
+and installed-composition contract in `core-runtime.md` Section 5.3. READY is a
+downstream observation and cannot fill a missing configuration, policy, binding,
+service, or recovery premise. Until Module execution is enabled at all, the
 plan entry is `rejected` with the reason recorded in Section 7.14.
 
 ### 7.6 Removing a Module
@@ -697,9 +700,10 @@ MUST surface that confirmation rather than answering it.
 - `permissionPolicyIds`: classification `generation-restart`. Capability grants
   are established when the Extension process session starts and are not
   editable within a session. Broadening them is `breaking`. In the reserved
-  version-10 schema, the corresponding field is
-  `permissionPolicyReferences`; changing either the identifier or immutable
-  revision has the same classification.
+  version-10 schema, `permissionPolicyReferences` replaces the identifier list
+  with exact definition and backend-binding identifiers, revisions, and
+  digests. Changing any member or its installed-product origin has the same
+  classification; equal labels never preserve authority across such a change.
 - `limits` and `timeouts`: classification `generation-restart` by default.
   Reducing a limit while work is in flight MUST NOT invalidate an existing
   Claim retroactively; the existing Module job keeps the bounds it was created

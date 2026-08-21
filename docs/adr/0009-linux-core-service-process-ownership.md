@@ -62,7 +62,8 @@ contain more than one Module cgroup.
 
 This proposal does not enable configured Modules. It may become `Accepted` only
 after its contracts, implementation, migration, and failure tests exist and
-pass. Until then, `runtime-bootstrap.ts` must reject configurations containing a
+pass. Until then, `runtime-bootstrap.ts` must preserve the public
+`RUNTIME_MODULE_MIGRATION_REQUIRED` refusal for configurations containing a
 Module.
 
 ### Stable Core service lifecycle
@@ -91,25 +92,30 @@ commands, or shell syntax from Module configuration. Clearing only the command
 used to ask systemd to start Core is insufficient because a user service can
 inherit its user manager's environment.
 
-Core may retain a non-secret candidate unit name and invocation identifier in
-that minimal environment, but neither is authority. Before accepting Module
-work, Core uses the systemd D-Bus service-manager interface and the Linux
-process filesystem at `/proc/self/cgroup` to prove both directions of the
-binding: the manager reports the current Core process identifier and expected
-control-group path for the unit, and Core's own process identifier and cgroup
-match them. It then records the manager-reported invocation identifier, the
-Linux boot identifier, and only a Core-derived Module cgroup path. A saved
-process identifier, environment value, unit property by itself, or child
-report is insufficient.
+The product receives one non-secret unit-name/mode candidate from the exact
+verified installed-product component recorded in the current
+`dolly.module-activation-premises/v1` record. A value in the minimal
+environment may assist a lower-level probe, but an environment value,
+configuration field, process record, or same-label caller object cannot create
+the product candidate or its origin. The candidate itself is not authority.
 
-A user service must verify that user lingering is enabled so its service manager
-remains available after the last login session ends. A server deployment may
-instead use a system service with a dedicated service account. If the expected
-service lifetime, effective unit settings, current manager binding, cgroup
-version 2 delegation, controller availability, timeout, or environment
-boundary is absent or cannot be verified within a bounded wait, Module
-activation fails closed. There is no foreground direct-child fallback that
-claims restart safety.
+Before accepting Module work, Core uses the systemd D-Bus service-manager
+interface and `/proc/self/cgroup` to prove both directions of the live binding:
+the manager reports the current Core process identifier and expected
+control-group path for the candidate unit, and Core's own process identifier
+and cgroup match them. It records the manager-reported invocation identifier,
+Linux boot identifier, and only a Core-derived Module cgroup path. A saved
+process identifier, candidate, unit property by itself, or child report is
+insufficient.
+
+The v1 product candidate has `mode: "user"` and the Host verifies that user
+lingering is enabled. A lower-level experiment may inspect a system service
+with a dedicated account, but system mode is outside the v1 product profile and
+cannot mint product activation permission. If service lifetime, effective
+settings, current manager binding, cgroup version 2 delegation, controller
+availability, timeout, origin, or environment boundary is absent or cannot be
+verified within a bounded wait, Module activation fails closed. There is no
+foreground direct-child fallback that claims restart safety.
 
 Before recovering or starting Module work, Core verifies every old
 Core-derived Module cgroup path from its durable records is empty. Within the
@@ -498,51 +504,59 @@ exactly-once Module execution or exactly-once external effects.
 
 The required startup reconciliation order is:
 
-1. Verify the current Core service and prove every old Module cgroup empty.
-2. Open and validate one complete Core-state update. Any submission record
-   lacking its exact active Claim or process record, a terminal Claim beside a
-   submission record, an invalid unknown submission history item, or any record
-   identity mismatch blocks Module activation.
-3. Reconcile the existing result-commit journal, then reread Core state because
+1. Inspect configuration read-only. If it selects the installed Linux process
+   backend, observe the Host platform and refuse non-Linux activation before
+   creating/acquiring the controller lock or another writable resource.
+2. Acquire the instance controller lock, mint a fresh controller generation,
+   and claim/reread the exact inspected configuration revision and digest.
+3. Open and validate the complete Core state and result journal under that
+   lock. Any invalid digest, bound, submission/Claim/process mismatch, terminal
+   Claim beside a submission record, or invalid unknown-history item blocks
+   activation.
+4. Load the one current activation-premise record. Resolve exactly one
+   persistent definition and backend-binding record for every configured
+   permission reference, verify all revisions/digests/installed-product
+   origins, and mint fresh live bindings for this controller generation.
+5. Verify the current product-owned user-service candidate and reviewed runtime,
+   prepare/read back the delegated root, and mint the exact activation
+   permission, runtime binding, and stop prover.
+6. Use that stop prover to prove every old Module cgroup empty.
+7. Reconcile the existing result-commit journal, then reread Core state because
    journal recovery can atomically complete a Claim and remove its submission
    record before marking a `prepared` journal record `committed`.
-4. For each remaining active Claim, inspect the matching process and submission
+8. For each remaining active Claim, inspect the matching process and submission
    records from that one Core-state update.
-5. In version 18, when neither a submission record nor an exact
-   unknown submission history item exists and every old process was proven
-   stopped, release only the exact Claim with reason
-   `never-authorized-to-send`. A matching unknown submission history item keeps
-   the Claim active and blocks startup; ambiguous version 15 or version 16
-   absence never meets this condition directly. A version 2 `prepared`
-   submission is also releasable after its old process is proven stopped;
-   `send-possible` and every version 1 submission remain outcome-unknown
-   without additional evidence.
-6. A valid `prepared` journal record with its active Claim and submission record
-   resumes under step 3; it is not an unknown outcome merely because the journal
-   is not yet `committed`. If configured mailbox capacity is the only remaining
-   obstacle, startup reports the record as deferred and hands it to a
-   commit-only Scheduler state. That state retries only the durable result and
-   does not start the producing Extension process; a later real input may start
-   the new generation after the commit succeeds. The handoff is opaque,
-   one-use, bound to the exact Core Delivery store and result repository, and
-   issued only after the old process group is freshly proven stopped. Installed
-   composition also rechecks the stopped record's package digest,
-   configuration reference, Module generation, instance, and effect class.
-   A verified journal that later disappears remains an unknown consistency
-   failure and never permits negative acknowledgement or re-execution. When no valid recoverable
-   result record exists,
-   preserve a submitted Claim as an unknown outcome unless every possible effect
-   has durable no-effect or retry-safe evidence, or an explicit audited operator
-   disposition. A terminal effect outcome without a separate durable
-   idempotency contract remains unresolved.
-7. A `prepared` journal record with a Claim whose status is `committed` and no
-   submission record may finish the verified transition described above. A
-   `committed` journal record requires that same Claim status and absence of the
-   submission record; every other journal/Claim combination fails closed.
+9. In version 18, when neither a submission record nor an exact unknown
+   submission history item exists and every old process was proven stopped,
+   release only the exact Claim with reason `never-authorized-to-send`. A
+   matching unknown-history item keeps the Claim active and blocks startup;
+   ambiguous version 15/16 absence never qualifies. A version 2 `prepared`
+   submission is also releasable after old-process stop proof; `send-possible`
+   and every version 1 submission remain outcome-unknown without more evidence.
+10. A valid `prepared` journal record with its active Claim and submission
+    record resumes under step 7. If configured mailbox capacity is the only
+    obstacle, retain it as commit-only work; never start the producing process.
+    A disappearing verified journal is an unknown consistency failure. Without
+    a valid recoverable result, preserve a submitted Claim unless every possible
+    effect has durable no-effect/retry-safe evidence or an explicit audited
+    operator disposition. A terminal effect without a separate durable
+    idempotency contract remains unresolved.
+11. A `prepared` journal record with a committed Claim and no submission record
+    may finish the verified transition. A `committed` journal record requires
+    that same Claim status and absence; every other combination fails closed.
+12. Mint one opaque recovery handoff only now. Bind it to the controller
+    generation, current configuration/premise digests, exact Core Delivery
+    store and result repository, activation permission, and stop prover.
+    Installed composition consumes that handoff and the exact live policy and
+    runtime bindings once, then creates fresh Module/process generations.
+    Ready follows composition and required commit-only recovery, never precedes
+    them.
 
-Neither durable record alone authorizes acknowledgement, negative
-acknowledgement, retry, dead letter, Claim release after an unknown outcome, or
-a replacement Module generation.
+Ready, process state, result bytes/digest, acknowledgement, status, timeout, or
+record absence remains downstream evidence. Neither it nor any durable record
+alone creates an upstream policy/service/configuration premise or authorizes
+acknowledgement, negative acknowledgement, retry, dead letter, Claim release
+after an unknown outcome, or a replacement Module generation.
 
 ### Capability handling and orderly stop
 
@@ -703,7 +717,16 @@ Before this ADR can become `Accepted`, Linux tests must cover at least:
    termination levels must perform the group operation; implementing the
    escalation as a no-op would encode an unverified claim that the first call
    succeeded, which is what this decision refuses to do everywhere else; and
-14. cleanup leaving no Dolly test service, process, cgroup, socket, or temporary
+14. exact policy definition/binding cardinality and installed-product origin,
+    including stale revision, digest mismatch, duplicate/extra record, copied
+    live object, and serialized path/secret/function rejection;
+15. non-Linux refusal before lock creation, then lock, current configuration
+    claim, store/premise validation, service/root proof, recovery handoff,
+    installed composition, generation creation, and Ready in exact order;
+16. restart reminting every live brand and migration refusing to infer missing
+    definitions/bindings from an in-memory registry, process/result/acknowledgement,
+    status, or absence; and
+17. cleanup leaving no Dolly test service, process, cgroup, socket, or temporary
    record behind.
 
 The tests use local fixtures and bounded timeouts. They do not require a model
@@ -731,6 +754,14 @@ restores and validates both the source and proposed target with the claimed
 failure limit, Media enablement, Media identifier namespace, Media limits, and
 Core-state byte limit. Validation failure or a configuration revision change
 therefore leaves the source unchanged and creates no backup.
+The separate instance/configuration migration that introduces executable
+Modules must validate and atomically install a complete
+`dolly.module-activation-premises/v1` record with exact policy
+definition/binding identities, revisions, digests, origins, and product service
+candidate. It creates no live binding, activation permission, or recovery
+handoff. Missing legacy authority remains blocked; migration never infers it
+from process, result, acknowledgement, status, absence, or an in-memory
+registry.
 
 A successful migration increments the Core-state revision exactly once. Its
 version 18 digest covers `schemaVersion` as well as the rest of the document.
@@ -767,3 +798,8 @@ failure tests must still pass before Module activation. A later configuration
 revision must pin the package and configuration revision of every unresolved
 Run; package upgrades and process-record collection cannot alter or erase that
 evidence.
+
+This ADR and the activation-premise contract do not authorize removal or
+weakening of `RUNTIME_MODULE_MIGRATION_REQUIRED`. They also make no claim that
+`FileCoreStateStore` or the file-backed result journal satisfies global
+aggregate boundedness.
