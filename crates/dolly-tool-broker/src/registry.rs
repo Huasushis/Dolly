@@ -173,6 +173,12 @@ pub struct ResolvedServer {
     pub allowed_modules: Vec<String>,
     pub tools: BTreeMap<String, ResolvedTool>,
     pub enabled: bool,
+    /// The exact closed `Server` object from the retained registry, retained
+    /// canonically at admission. `operation_digest` binds its JCS bytes as the
+    /// spec §5 `server_contract`, so every authority-bearing field
+    /// (`adapter`, `protocol_version`, full `transport`, `allowed_modules`,
+    /// `limits`, tool map, schema digests) is frozen with the binding.
+    pub server_contract: CanonicalJsonObject,
 }
 
 /// The closed resolved registry, authoritative for invoke mapping. Only
@@ -286,6 +292,11 @@ fn build_registry(value: &CanonicalJsonValue) -> Result<ResolvedToolBrokerConfig
         let transport = transport_kind(server)?.to_owned();
         let allowed_modules = required_strings(server, "allowed_modules")?;
         let tools = build_tools(server, server_id)?;
+        // Retain the exact canonical closed `Server` object so the frozen
+        // operation binding can bind the complete authority (spec §5
+        // `server_contract`): adapter, protocol, full transport, limits,
+        // allowed modules, tools, and schema digests.
+        let server_contract = server.clone();
         resolved.servers.insert(
             server_id.to_owned(),
             ResolvedServer {
@@ -295,6 +306,7 @@ fn build_registry(value: &CanonicalJsonValue) -> Result<ResolvedToolBrokerConfig
                 allowed_modules,
                 tools,
                 enabled,
+                server_contract,
             },
         );
     }

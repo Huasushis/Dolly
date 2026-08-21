@@ -84,12 +84,35 @@ pub const OPERATION_BINDING_SCHEMA: &str = "dolly.tool-operation-binding/v1";
 /// The schema tag of the pre-resolution digest envelope.
 pub const INVOKE_METHOD: &str = "host.tool.invoke";
 
-/// The always-computable pre-resolution caller digest.
-pub fn request_digest(operation_id: &str, txn_id: &str, params: &JsonValue) -> Sha256Digest {
-    // request_digest = sha256(JCS({"method":"host.tool.invoke","params":P}))
-    // where P = the complete params. In the minimal pure-core crate the
-    // envelope re-serializes the provided params; no registry is needed here.
-    let _ = (operation_id, txn_id);
+/// The always-computable pre-resolution caller digest (spec §5).
+///
+/// `params` is the complete `host.tool.invoke` params object. The digest is
+/// computed over `P`, the complete params after removing only `operation_id`,
+/// `deadline`, and `lease_token`:
+///
+/// ```text
+/// request_digest = sha256(JCS({"method":"host.tool.invoke","params":P}))
+/// ```
+///
+/// Every other member — including `tool_transaction_id`, `module_id`,
+/// `config_revision`, `tool_server_id`, `tool_name`, `tool_schema_digest`,
+/// `arguments`, and the side-effect/idempotency/confirmation bindings — is
+/// part of `P` and therefore of the identity. Only the three identity-volatile
+/// keys are excluded, so re-submitting the same semantic call after a fresh
+/// lease/deadline keeps the identity digest stable. A non-object input is a
+/// schema violation and is hashed as-is for totality (the wire layer rejects
+/// it earlier).
+pub fn request_digest(params: &JsonValue) -> Sha256Digest {
+    let p = match params {
+        JsonValue::Object(map) => {
+            let mut map = map.clone();
+            map.remove("operation_id");
+            map.remove("deadline");
+            map.remove("lease_token");
+            JsonValue::Object(map)
+        }
+        _ => params.clone(),
+    };
     let envelope = CanonicalJsonObject::try_from_iter(vec![
         (
             "method".to_owned(),
@@ -97,7 +120,7 @@ pub fn request_digest(operation_id: &str, txn_id: &str, params: &JsonValue) -> S
         ),
         (
             "params".to_owned(),
-            serde_to_canonical(params).unwrap_or(CanonicalJsonValue::Null),
+            serde_to_canonical(&p).unwrap_or(CanonicalJsonValue::Null),
         ),
     ])
     .expect("unique envelope keys");
@@ -280,8 +303,7 @@ pub fn evaluate_invoke<B: ResolutionBackend>(
     let operation_digest = operation_digest(
         &candidate.request_digest,
         tool_server_generation,
-        &candidate.tool_server_id,
-        &tool.upstream_name,
+        &server.server_contract,
     );
     InvokeOutcome::Authorized {
         binding: FrozenBinding {
@@ -297,13 +319,25 @@ fn rejection(candidate: &InvokeCandidate, code: ToolErrorCode, message: String) 
 }
 
 /// Stage-2 digest: `sha256(JCS(operation-binding))`, freezing the request
-/// digest, the selected generation, and the exact resolved server contract.
-/// The `operation_digest` never exists for a denial (REQ-TOOL-005).
+/// digest, the selected generation, and the exact closed Server object from
+/// the retained registry (spec §5 `server_contract`). The `operation_digest`
+/// never exists for a denial (REQ-TOOL-005).
+///
+/// `server_contract` is the canonical, closed, serializable Server snapshot
+/// retained by admission. Its JCS bytes bind the full closed-registry
+/// authority — `adapter`, `protocol_version`, the complete `transport`
+/// (endpoint/package/executable metadata), `allowed_modules`, `limits`, the
+/// tool map, and both schema digests — so any authority-bearing field change
+/// rotates the digest even when the resolved tool alias and `upstream_name`
+/// are unchanged. Discovery and results never contribute to it. It contains
+/// only secret *references* (`secret://` URIs), never resolved secret values,
+/// function bodies, or runtime backend state, so the digest is a pure function
+/// of the frozen inputs: request digest, selected generation, and retained
+/// snapshot.
 pub fn operation_digest(
     request_digest: &Sha256Digest,
     tool_server_generation: u64,
-    tool_server_id: &str,
-    upstream_name: &str,
+    server_contract: &CanonicalJsonObject,
 ) -> Sha256Digest {
     let binding = CanonicalJsonObject::try_from_iter(vec![
         (
@@ -323,7 +357,7 @@ pub fn operation_digest(
         ),
         (
             "server_contract".to_owned(),
-            CanonicalJsonValue::String(format!("{tool_server_id}:{upstream_name}")),
+            CanonicalJsonValue::Object(server_contract.clone()),
         ),
         (
             "confirmation_decision".to_owned(),
