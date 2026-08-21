@@ -724,7 +724,7 @@ absent, in the same way it fails closed on missing systemd or cgroup version 2
 delegation.
 
 The explicit `migrate-core-state` command migrates Core-state version 15, 16,
-or 17 directly to the current version 18. It inspects the instance
+17, or 18 directly to the current version 19. It inspects the instance
 configuration, acquires that instance's controller lock, and then claims the
 same instance identity and configuration revision. While holding the lock, it
 restores and validates both the source and proposed target with the claimed
@@ -733,9 +733,10 @@ Core-state byte limit. Validation failure or a configuration revision change
 therefore leaves the source unchanged and creates no backup.
 
 A successful migration increments the Core-state revision exactly once. Its
-version 18 digest covers `schemaVersion` as well as the rest of the document.
-Before atomic replacement, migration writes an exact source-byte backup named
-for the actual source version, `.v15.backup`, `.v16.backup`, or `.v17.backup`. A retry may reuse
+version 19 digest covers `schemaVersion`, the version 19 process-generation
+counter, and the rest of the document. Before atomic replacement, migration
+writes an exact source-byte backup named for the actual source version,
+`.v15.backup`, `.v16.backup`, `.v17.backup`, or `.v18.backup`. A retry may reuse
 that path only when it is a regular file whose bytes exactly match the
 still-current source; a partial or different backup fails closed.
 

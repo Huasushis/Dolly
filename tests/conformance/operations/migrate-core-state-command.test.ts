@@ -14,7 +14,10 @@ import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { canonicalJsonDigest, type JsonValue } from "../../../src/core/canonical-json.js";
 import { runDollyCli } from "../../../src/entry.js";
-import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
+import {
+  FileCoreStateStore,
+  migrateCoreStateDocumentToVersion19,
+} from "../../../src/core/file-core-state-store.js";
 import { FileMediaByteStore } from "../../../src/core/file-media-byte-store.js";
 import { InstanceControllerLock } from "../../../src/core/instance-controller-lock.js";
 
@@ -187,19 +190,37 @@ describe("dolly migrate-core-state", () => {
       const backupPath = `${statePath}.v${version}.backup`;
       expect(code, stderr.text).toBe(0);
       expect(stdout.text).toContain(
-        `from dolly.core-state/${version} to dolly.core-state/18`,
+        `from dolly.core-state/${version} to dolly.core-state/19`,
       );
       expect(stdout.text).toContain(`Backup:   ${backupPath}`);
       expect(readFileSync(backupPath, "utf8")).toBe(before);
       const migrated = JSON.parse(readFileSync(statePath, "utf8")) as JsonObject;
-      expect(migrated.schemaVersion).toBe("dolly.core-state/18");
+      expect(migrated.schemaVersion).toBe("dolly.core-state/19");
+      expect(migrated.processGenerationIdCounter).toBe(0);
       expect(migrated.moduleProcessRecords).toEqual([]);
       expect(migrated.moduleSubmissionRecords).toEqual([]);
       expect(migrated.activeClaimsWithUnknownSubmissionHistory).toEqual([]);
+      // Reopening the migrated document presents the store-owned version 19
+      // identity domain: allocation is supported and the durable counter is
+      // restored without fabricating any reserved identifier.
+      const reopened = new FileCoreStateStore({
+        path: statePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => "block-1",
+        nextDeliveryId: (kind) => `${kind}-1`,
+        now: () => "2026-07-26T00:00:00.000Z",
+      });
+      expect(reopened.supportsVersion19Identity()).toBe(true);
+      const reopenedSnapshot = reopened.snapshot() as {
+        schemaVersion: string;
+        processGenerationIdCounter: number;
+      };
+      expect(reopenedSnapshot.schemaVersion).toBe("dolly.core-state/19");
+      expect(reopenedSnapshot.processGenerationIdCounter).toBe(0);
     },
   );
 
-  it("reports an already current document without touching it", async () => {
+  it("reports an already current version 19 document without touching it", async () => {
     const { statePath } = await initializeInstance();
     new FileCoreStateStore({
       path: statePath,
@@ -208,6 +229,14 @@ describe("dolly migrate-core-state", () => {
       nextDeliveryId: (kind) => `${kind}-1`,
       now: () => "2026-07-26T00:00:00.000Z",
     });
+    const seedMigration = migrateCoreStateDocumentToVersion19(statePath, {
+      maxBytes: 64 * 1024 * 1024,
+      runtimeConfiguration: {
+        maxFailedAttempts: 3,
+        media: { enabled: false },
+      },
+    });
+    expect(seedMigration.status).toBe("migrated");
     const before = readFileSync(statePath, "utf8");
     const stdout = new Capture();
 
@@ -222,7 +251,8 @@ describe("dolly migrate-core-state", () => {
     );
 
     expect(code).toBe(0);
-    expect(stdout.text).toContain("already dolly.core-state/18");
+    expect(stdout.text).toContain("already dolly.core-state/19");
+    expect(stdout.text).not.toContain("Migrated ");
     expect(readFileSync(statePath, "utf8")).toBe(before);
   });
 
@@ -406,7 +436,7 @@ describe("dolly migrate-core-state", () => {
 
     expect(code, stderr.text).toBe(0);
     expect(stdout.text).toContain(
-      "from dolly.core-state/16 to dolly.core-state/18",
+      "from dolly.core-state/16 to dolly.core-state/19",
     );
     expect(readFileSync(`${statePath}.v16.backup`, "utf8")).toBe(source);
   });
