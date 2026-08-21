@@ -16,7 +16,7 @@ pub mod version;
 
 pub use invoke::{
     ExistingOperation, FrozenBinding, InvokeCandidate, InvokeOutcome, ResolutionBackend,
-    evaluate_invoke, operation_digest, request_digest,
+    evaluate_invoke, operation_digest, request_digest, resolve_json_pointer,
 };
 pub use registry::{
     AdmissionOutcome, ConfigRejection, IdempotencyPolicy, RejectionReason, ResolvedServer,

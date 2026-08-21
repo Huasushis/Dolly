@@ -11,8 +11,8 @@ use std::{
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_tool_broker::{
-    AdmissionOutcome, InvokeCandidate, InvokeOutcome, ResolutionBackend, StatusOutcome,
-    admit_config, evaluate_invoke, lookup_status,
+    AdmissionOutcome, IdempotencyPolicy, InvokeCandidate, InvokeOutcome, ResolutionBackend,
+    StatusOutcome, ToolErrorCode, admit_config, evaluate_invoke, lookup_status,
 };
 use serde_json::{Map, Value, json};
 
@@ -301,5 +301,204 @@ fn executes_tst_tool_005_and_008_vectors() {
             _ => unreachable!(),
         };
         assert_vector(&vector, &scenario, &emitted);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TST-TOOL-002 coverable pre-assertions (REQ-TOOL-002 argument_key slice).
+//
+// The full vector's expected outcome (`automatic_redispatch_count`, ledger
+// `UNKNOWN`, `server_effect_count`, `ToolOutcomeUnknown`) belongs to the
+// later dispatch-loss / no-redispatch slice. This crate only covers the
+// parts the pure-core pre-resolution layer can prove: the argument_key
+// config admits with the pointer retained, the RFC 6901 pointer MUST resolve
+// on the caller arguments to a string exactly equal to idempotency_key, and
+// every missing/non-string/unequal form is TOOL_INPUT_INVALID before any
+// backend call.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tst_tool_002_coverable_preflight_assertions() {
+    let vector = vector("TST-TOOL-002-argument-key-is-not-attestation.json");
+    let initial = &vector["initial"];
+    assert_eq!(initial["side_effect_class"], "idempotent_write");
+    let policy = &initial["idempotency_policy"];
+    assert_eq!(policy["kind"], "argument_key");
+    let pointer = policy["argument_pointer"].as_str().unwrap();
+    assert_eq!(
+        pointer, "/request_id",
+        "vector declares the RFC 6901 pointer"
+    );
+
+    // The vector's own invariant: the pointer resolves on the caller
+    // arguments to a string exactly equal to idempotency_key. Assert it from
+    // the vector data itself (not constants) so a spec edit cannot silently
+    // pass with a stale fixture.
+    let idempotency_key = initial["idempotency_key"].as_str().unwrap();
+    let arguments = initial["arguments"].clone();
+    assert_eq!(arguments["request_id"], json!(idempotency_key));
+
+    // Config admission: the vector's argument_key policy must admit and keep
+    // the pointer (the registry must not drop it).
+    let config = tst_tool_002_config(pointer, &arguments);
+    let registry = match admit_config(&serde_json::to_vec(&config).unwrap()) {
+        AdmissionOutcome::Admitted(registry) => registry,
+        AdmissionOutcome::Rejected(rejection) => {
+            panic!("TST-TOOL-002 argument_key config must admit: {rejection:?}")
+        }
+    };
+    let tool = &registry.servers()["fs"].tools["submit-order"];
+    match &tool.idempotency {
+        IdempotencyPolicy::ArgumentKey { argument_pointer } => {
+            assert_eq!(argument_pointer, pointer);
+        }
+        other => panic!("vector policy must retain pointer, got {other:?}"),
+    }
+
+    // Pre-resolution gate: pointer value exactly equal to the key authorizes.
+    let mut ok = CoinBackend { calls: 0 };
+    let outcome = evaluate_invoke(
+        &registry,
+        "module-a",
+        &tst_tool_002_candidate(Some("stable-request-1"), arguments),
+        None,
+        &mut ok,
+    );
+    match outcome {
+        InvokeOutcome::Authorized { .. } => {}
+        other => panic!("equal argument_key must authorize, got {other:?}"),
+    }
+    assert_eq!(ok.calls, 1);
+
+    // Unequal key on identical arguments: TOOL_INPUT_INVALID, no backend.
+    let mut bad = CoinBackend { calls: 0 };
+    let denied = evaluate_invoke(
+        &registry,
+        "module-a",
+        &tst_tool_002_candidate(
+            Some("different-key"),
+            json!({"request_id": "stable-request-1", "value": "example"}),
+        ),
+        None,
+        &mut bad,
+    );
+    match denied {
+        InvokeOutcome::PreResolutionDenied { result } => {
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                ToolErrorCode::InputInvalid
+            );
+        }
+        other => panic!("unequal key must not authorize, got {other:?}"),
+    }
+    assert_eq!(bad.calls, 0, "no backend call on denial");
+}
+
+/// Closed registry config mirroring the vector's tool: side-effect class
+/// `idempotent_write` and `argument {"kind":"argument_key","argument_pointer":
+/// "/request_id"}` on tool `submit-order`.
+fn tst_tool_002_config(pointer: &str, _arguments: &Value) -> Value {
+    let input_schema = json!({"type": "object", "additionalProperties": false, "required": ["request_id", "value"], "properties": {"request_id": {"type": "string"}, "value": {"type": "string"}}});
+    let output_schema = json!({"type": "object", "additionalProperties": false, "required": ["ok"], "properties": {"ok": {"type": "boolean"}}});
+    let input_schema_digest = canonicalize(&input_schema).unwrap().1.to_canonical_string();
+    let output_schema_digest = canonicalize(&output_schema)
+        .unwrap()
+        .1
+        .to_canonical_string();
+    let tool = json!({
+        "upstream_name": "submit_order",
+        "description": "Submit one idempotent order.",
+        "input_schema": input_schema,
+        "input_schema_digest": input_schema_digest,
+        "output_schema": output_schema,
+        "output_schema_digest": output_schema_digest,
+        "side_effect_class": "idempotent_write",
+        "idempotency": {"kind": "argument_key", "argument_pointer": pointer},
+        "requires_confirmation": false,
+        "enabled": true
+    });
+    json!({
+        "schema": "dolly.tool-broker-config/v1",
+        "servers": {
+            "fs": {
+                "enabled": true,
+                "adapter": "mcp",
+                "protocol_version": "2025-06-18",
+                "transport": {
+                    "kind": "stdio",
+                    "package_id": "org.dolly.tools.fs",
+                    "package_version": "1.0.0",
+                    "package_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                    "executable": "bin/dolly-fs-tools",
+                    "executable_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                    "args": ["--stdio"],
+                    "secret_bindings": {}
+                },
+                "allowed_modules": ["module-a"],
+                "limits": {
+                    "startup_timeout_ms": 10000,
+                    "request_timeout_ms": 30000,
+                    "max_concurrency": 4,
+                    "max_request_bytes": 1048576,
+                    "max_response_bytes": 4194304
+                },
+                "tools": { "submit-order": tool }
+            }
+        }
+    })
+}
+
+/// Invoke candidate against the TST-TOOL-002 vector tool shape.
+fn tst_tool_002_candidate(key: Option<&str>, arguments: Value) -> InvokeCandidate {
+    let tool_schema_digest = canonicalize(
+        &tst_tool_002_config("/request_id", &arguments)["servers"]["fs"]["tools"]["submit-order"]
+            ["input_schema"],
+    )
+    .unwrap()
+    .1;
+    let params = json!({
+        "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000341",
+        "tool_transaction_id": "0198ab31-6c44-7e8a-b2bb-000000000099",
+        "module_id": "module-a",
+        "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000101",
+        "config_revision": 11,
+        "lease_token": "lease-token-1",
+        "tool_server_id": "fs",
+        "tool_name": "submit-order",
+        "tool_schema_digest": tool_schema_digest.to_canonical_string(),
+        "arguments": arguments.clone(),
+        "side_effect_class": "idempotent_write",
+        "idempotency_key": key.map(str::to_owned),
+        "confirmation_id": null,
+        "deadline": "2026-08-21T00:00:00.000Z"
+    });
+    InvokeCandidate {
+        operation_id: params["operation_id"].as_str().unwrap().into(),
+        tool_transaction_id: params["tool_transaction_id"].as_str().unwrap().into(),
+        module_id: params["module_id"].as_str().unwrap().into(),
+        activation_id: params["activation_id"].as_str().unwrap().into(),
+        config_revision: 11,
+        lease_token: params["lease_token"].as_str().unwrap().into(),
+        tool_server_id: params["tool_server_id"].as_str().unwrap().into(),
+        tool_name: params["tool_name"].as_str().unwrap().into(),
+        tool_schema_digest,
+        arguments,
+        side_effect_class: params["side_effect_class"].as_str().unwrap().into(),
+        idempotency_key: key.map(str::to_owned),
+        confirmation_id: None,
+        deadline: params["deadline"].as_str().unwrap().into(),
+        request_digest: dolly_tool_broker::request_digest(&params),
+    }
+}
+
+/// Resolution backend adopting the vector fixture generation counter.
+struct CoinBackend {
+    calls: usize,
+}
+
+impl ResolutionBackend for CoinBackend {
+    fn resolve_server(&mut self, _server_id: &str, _tool_name: &str) -> Option<u64> {
+        self.calls += 1;
+        Some(7)
     }
 }
