@@ -20,6 +20,23 @@ schema explicitly declares an extension point. Failure uses a JSON-RPC error
 whose `data` validates against
 [`error.schema.json`](../../../schemas/error.schema.json); a failed request
 never returns a success-result-shaped object with an ad hoc error member.
+The registry's `semantic_depth` policy freezes request `params`, notification
+`params`, successful `result`, and Dolly error `error.data` as four independent
+declared schema roots. Each root container starts at depth 1; JSON-RPC envelope
+objects do not count; and v1 `max_json_nesting_depth` cannot exceed 64. Thus a
+selected root at depth 64 is valid at the v1 maximum and depth 65 is invalid
+even when the complete frame remains below its separate depth limit.
+
+The over-limit dispositions are closed by the
+[wire protocol semantic-depth table](01-wire-protocol.md#3-json-rules).
+Invalid request or notification params prove `not_applied`, are non-retryable,
+invoke neither a method handler nor a backend, and leave the connection
+reusable; notifications emit no JSON-RPC response. An invalid success result or
+error data value is not delivered: the caller observes
+`PROTOCOL_INVALID_RESPONSE` with `retryable: false` and `outcome: unknown`, then
+closes the non-reusable connection and reconciles under the method row below.
+The malformed response cannot prove whether the remote handler, a durable
+commit, or an external backend dispatch occurred.
 
 Unless a dedicated schema defines a stricter identity, a newly specified
 state-changing request uses `operation_id` as its durable idempotency identity.

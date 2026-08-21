@@ -70,16 +70,56 @@ A conforming decoder **MUST** reject:
 
 For the 96-level complete-frame ceiling, the top-level JSON-RPC object has
 depth 1 and each directly nested object or array increases the depth by 1.
-Independently, every semantic schema root declared by the method inside
-`params`, `result`, or Dolly error `data` **MUST** satisfy the resolved
-`max_json_nesting_depth`, which **MUST NOT** exceed 64. Semantic depth uses the
-schema-root/reset rule in
-[Core Identifiers and Canonical JSON](../core/01-identifiers-and-canonical-json.md):
-each declared root starts at depth 1, and an embedded document already
-validated at its own declared schema root is a leaf for its enclosing
-document's structural count. JSON-RPC and method-envelope objects do not
-consume that semantic quota. This reset never affects the ordinary depth of
-the complete frame; a message **MUST** satisfy both limits.
+Independently, the registry declares exactly four kinds of semantic schema
+root:
+
+- request `params`;
+- notification `params`;
+- a successful response `result`; and
+- a Dolly error response `error.data`.
+
+Each selected schema resource is counted independently from its own root. A
+root object or array has depth 1, a primitive has depth 0, and the recursive
+rule is the one in
+[Core Identifiers and Canonical JSON](../core/01-identifiers-and-canonical-json.md).
+The JSON-RPC envelope, including its request, notification, response, and
+`error` objects, does not consume the selected root's semantic quota. An
+embedded document already validated at another declared schema root is a leaf
+for the enclosing document's structural count. The effective
+`max_json_nesting_depth` applies separately to every root and **MUST NOT**
+exceed 64; at the v1 maximum, depth 64 is valid and depth 65 is invalid. These
+resets never affect complete-frame depth, so every message **MUST** satisfy both
+limits.
+
+A semantic-depth violation in an otherwise valid complete frame is not a fatal
+framing violation. After correlating the message where applicable, the receiver
+**MUST** use the following closed disposition:
+
+| Root over its effective limit | Observable error | Receiver execution | `retryable` / `outcome` | Connection |
+| --- | --- | --- | --- | --- |
+| request `params` | JSON-RPC `-32602 Invalid params` with conforming Dolly error data whose `code` is `RPC_INVALID_PARAMS` and whose `details.error_name` is `invalid_params` | zero method-handler invocations and zero backend dispatches | `false` / `not_applied` | remains reusable |
+| notification `params` | no JSON-RPC response; a bounded local Dolly error diagnostic with `code: RPC_INVALID_PARAMS` and `details.error_name: invalid_params` | zero method-handler invocations and zero backend dispatches | `false` / `not_applied` | remains reusable |
+| successful response `result` | no response-to-response; complete the correlated local wait with conforming Dolly error data whose `code` is `PROTOCOL_INVALID_RESPONSE` and whose `details.error_name` is `invalid_response` | do not deliver the result and perform zero receiver-side method-handler invocations or backend dispatches; callee-side execution is unproved | `false` / `unknown` | close; not reusable |
+| error response `error.data` | no response-to-response; discard the peer's error data and complete the correlated local wait with the same `PROTOCOL_INVALID_RESPONSE` Dolly error | do not deliver or trust the peer's error and perform zero receiver-side method-handler invocations or backend dispatches; callee-side execution is unproved | `false` / `unknown` | close; not reusable |
+
+Request and notification validation precedes method invocation, so rejection
+proves `not_applied`. A response can be constructed after the callee crossed a
+durable commit or external-effect boundary; invalid `result` or `error.data`
+therefore proves nothing about callee-side handler execution, backend dispatch,
+or operation outcome. The caller **MUST NOT** trust a malformed error's claimed
+outcome, automatically replay the request, or allocate a fresh semantic
+identity. It **MUST** use the method's registered reconciliation and unknown
+outcome policy.
+
+Closing after an invalid response is a semantic protocol-safety action, not a
+reclassification as fatal framing: the frame boundary remains known, but the
+peer has failed the closed response contract and JSON-RPC provides no legal
+response to a response. Continuing to accept results from that process would
+allow an already nonconforming peer to cross further method boundaries. The
+receiver **MUST** close the protocol connection; if the Host is the receiver,
+it **MUST** terminate the Extension and record `protocol_violation`. Other
+outstanding requests take the indeterminate transport disposition in Section
+9.
 
 Integer-valued protocol fields **MUST** be JSON integers in `0..9007199254740991` unless their method schema explicitly defines a decimal-string encoding. Core sequence, revision, attempt, and lease-generation fields use the safe-integer form and **MUST** fail closed before exhaustion. Implementations **MUST NOT** infer identifiers from JSON number formatting.
 
@@ -350,3 +390,9 @@ A protocol implementation is conforming only if it passes golden tests for:
 - `REQ-XRPC-003` — Every v1 request and notification is present exactly once in
   the method-contract catalog with closed machine-readable params and, for a
   request, a closed success result.
+- `INV-XRPC-006` — Request params, notification params, success results, and
+  Dolly error data are independent semantic schema roots. An over-limit input
+  is rejected before handler or backend dispatch without closing the
+  connection; an over-limit response is not delivered, has an unknown external
+  outcome, and closes the non-reusable connection without being classified as
+  a fatal framing violation.
