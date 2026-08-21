@@ -1,7 +1,10 @@
 import {
   contentReferences,
+  materializeCropBounds,
   parseBlockContent,
   parseRect,
+  cropContains,
+  cropEquals,
   type MediaReferenceItem,
   type Rect,
 } from "../block-content.js";
@@ -173,50 +176,24 @@ function base64ByteLength(byteLength: number): number {
   return Math.ceil(byteLength / 3) * 4;
 }
 
-/** `crop` values are exact normalized doubles, so containment is exact too. */
-function cropContains(outer: Rect, inner: Rect): boolean {
-  return (
-    inner.topLeft.x >= outer.topLeft.x &&
-    inner.topLeft.y >= outer.topLeft.y &&
-    inner.bottomRight.x <= outer.bottomRight.x &&
-    inner.bottomRight.y <= outer.bottomRight.y
-  );
-}
-
-function sameCrop(left: Rect, right: Rect): boolean {
-  return (
-    left.topLeft.x === right.topLeft.x &&
-    left.topLeft.y === right.topLeft.y &&
-    left.bottomRight.x === right.bottomRight.x &&
-    left.bottomRight.y === right.bottomRight.y
-  );
-}
-
 /**
- * The edge conversion required by `media.md` section 5: all four edges round
- * independently, and the result must stay inside the image with positive
- * integer width and height. Rounding width or height directly is not
- * conformant because it can disagree with independently rounded edges.
+ * The edge screening required by `media.md` section 5: through the single
+ * shared materializer, an accepted fixed-point crop always materializes to a
+ * positive area on a positive display. The result must stay inside the image
+ * and be non-empty; a null materialization means the crop premise cannot
+ * serve a pixel.
  */
 function rectCoversAPixel(rect: Rect, width: number, height: number): boolean {
-  const left = Math.round(rect.topLeft.x * width);
-  const top = Math.round(rect.topLeft.y * height);
-  const right = Math.round(rect.bottomRight.x * width);
-  const bottom = Math.round(rect.bottomRight.y * height);
-  return (
-    left >= 0 &&
-    top >= 0 &&
-    right <= width &&
-    bottom <= height &&
-    right - left >= 1 &&
-    bottom - top >= 1
-  );
+  return materializeCropBounds(rect, width, height) !== null;
 }
 
 function rectJson(rect: Rect): JsonValue {
   return {
-    topLeft: { x: rect.topLeft.x, y: rect.topLeft.y },
-    bottomRight: { x: rect.bottomRight.x, y: rect.bottomRight.y },
+    kind: rect.kind,
+    x0: rect.x0,
+    y0: rect.y0,
+    x1: rect.x1,
+    y1: rect.y1,
   };
 }
 
@@ -269,7 +246,7 @@ function deriveAuthorizedMedia(
         continue;
       }
       const crop = reference.crop;
-      if (!entry.crops.some((existing) => sameCrop(existing, crop))) {
+      if (!entry.crops.some((existing) => cropEquals(existing, crop))) {
         entry.crops.push(crop);
       }
     }
@@ -282,8 +259,11 @@ function deriveAuthorizedMedia(
       deliveryIds: [...entry.deliveryIds].sort(),
       allowsFullMedia: entry.allowsFullMedia,
       crops: entry.crops.map((crop) => ({
-        topLeft: { ...crop.topLeft },
-        bottomRight: { ...crop.bottomRight },
+        kind: "image_rect_v1",
+        x0: crop.x0,
+        y0: crop.y0,
+        x1: crop.x1,
+        y1: crop.y1,
       })),
     });
   }

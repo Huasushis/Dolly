@@ -9,6 +9,7 @@ import {
   type JsonValue,
 } from "./canonical-json.js";
 import {
+  materializeCropBounds,
   parseRect,
   type MediaReferenceItem,
   type Rect,
@@ -688,30 +689,26 @@ function registrationReference(registrationId: string, mediaId: string) {
   };
 }
 
+/**
+ * Converts a fixed-point crop into the exact integer pixel rectangle the
+ * storage adapter consumes, via the single shared `materializeCropBounds`
+ * helper. `PixelCrop` keeps the adapter's `left/top/width/height` shape while
+ * derived edges (`right = left + width`) follow the helper's floor/ceil/clamp
+ * semantics, never a separately approximated formula. Returns `null` when the
+ * crop does not select a pixel (fail closed).
+ */
 function rectToPixelCrop(
   rect: Rect,
   imageWidth: number,
   imageHeight: number,
 ): PixelCrop | null {
-  const left = Math.round(rect.topLeft.x * imageWidth);
-  const top = Math.round(rect.topLeft.y * imageHeight);
-  const right = Math.round(rect.bottomRight.x * imageWidth);
-  const bottom = Math.round(rect.bottomRight.y * imageHeight);
-  if (
-    left < 0 ||
-    top < 0 ||
-    right > imageWidth ||
-    bottom > imageHeight ||
-    right - left < 1 ||
-    bottom - top < 1
-  ) {
-    return null;
-  }
+  const bounds = materializeCropBounds(rect, imageWidth, imageHeight);
+  if (bounds === null) return null;
   return {
-    left,
-    top,
-    width: right - left,
-    height: bottom - top,
+    left: bounds.left,
+    top: bounds.top,
+    width: bounds.right - bounds.left,
+    height: bounds.bottom - bounds.top,
   };
 }
 

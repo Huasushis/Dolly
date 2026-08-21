@@ -7,6 +7,7 @@ import {
   type JsonValue,
 } from "./canonical-json.js";
 import {
+  cropEquals,
   parseMediaReferenceItem,
   type MediaReferenceItem,
 } from "./block-content.js";
@@ -368,16 +369,6 @@ function mediaPosition(messageIndex: number, partIndex: number): string {
   return `${messageIndex}:${partIndex}`;
 }
 
-function sameCrop(left: MediaReferenceItem["crop"], right: MediaReferenceItem["crop"]): boolean {
-  if (left === undefined || right === undefined) return left === right;
-  return (
-    left.topLeft.x === right.topLeft.x &&
-    left.topLeft.y === right.topLeft.y &&
-    left.bottomRight.x === right.bottomRight.x &&
-    left.bottomRight.y === right.bottomRight.y
-  );
-}
-
 function inlineImageUrl(
   resolved: ResolvedChatMediaPart,
   reference: MediaReferenceItem,
@@ -408,7 +399,13 @@ function inlineImageUrl(
       "Resolved Media does not match its chat reference",
     );
   }
-  if (!sameCrop(reference.crop, resolved.crop)) {
+  // `reference.crop` is undefined by this point (a cropped reference already
+  // failed above), so the shared `cropEquals` reduces the grant check to
+  // "the resolved grant must carry no crop either".
+  if (
+    resolved.crop !== undefined &&
+    (reference.crop === undefined || !cropEquals(reference.crop, resolved.crop))
+  ) {
     throw new ModelChatError(
       "CHAT_INPUT_INVALID",
       "Resolved Media grant changed the requested crop",

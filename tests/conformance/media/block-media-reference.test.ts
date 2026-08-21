@@ -60,8 +60,11 @@ describe("Block media references", () => {
                 type: "media-reference",
                 mediaId,
                 crop: {
-                  topLeft: { x: start, y: start },
-                  bottomRight: { x: end, y: end },
+                  kind: "image_rect_v1",
+                  x0: start,
+                  y0: start,
+                  x1: end,
+                  y1: end,
                 },
               }],
             },
@@ -70,18 +73,21 @@ describe("Block media references", () => {
         { kind: "module", id: "module-a" },
       );
 
-    expect(() => commitCrop(audio.mediaId, 0.1, 0.9)).toThrowError(
+    // A crop on non-image Media has no pixels to deliver.
+    expect(() => commitCrop(audio.mediaId, 100_000, 900_000)).toThrowError(
       expect.objectContaining({
         code: "BLOCK_MEDIA_REFERENCE_INVALID",
       }),
     );
-    expect(() => commitCrop(image.mediaId, 0.006, 0.014)).toThrowError(
+    // A reversed fixed-point crop is not a valid rectangle.
+    expect(() => commitCrop(image.mediaId, 500_000, 400_000)).toThrowError(
       expect.objectContaining({
-        code: "BLOCK_MEDIA_REFERENCE_INVALID",
+        code: "BLOCK_CONTENT_INVALID",
       }),
     );
-
-    const valid = commitCrop(image.mediaId, 0.004, 0.006);
+    // A fixed-point crop always covers at least one pixel on this 100x100
+    // image: floor(100000*100/1e6)=0, ceil(900000*100/1e6)=90.
+    const valid = commitCrop(image.mediaId, 100_000, 900_000);
     expect(valid.payload.value).toMatchObject({
       items: [{ type: "media-reference", mediaId: image.mediaId }],
     });

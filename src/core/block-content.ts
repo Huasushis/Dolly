@@ -9,12 +9,46 @@ export const CONTENT_SCHEMA_NAME_PATTERN =
   /^[a-z][a-z0-9]*(\.[a-z0-9-]+)+\/[1-9][0-9]{0,3}$/u;
 
 /**
- * A rectangle uses coordinates from 0 to 1 relative to the original image.
- * The media store converts it to pixels only when a provider needs bytes.
+ * The fixed-point division scale of a normalized crop rectangle. Every crop
+ * coordinate is an integer on `0..=1_000_000`; the wire record `image_rect_v1`
+ * names this scale only implicitly.
+ */
+export const CROP_NORMALIZED_SCALE = 1_000_000;
+
+/**
+ * The largest supported display dimension: the safe JSON integer ceiling
+ * `9007199254740991` (`2^53 - 1`). Multiplications above this ceiling are
+ * rejected before any arithmetic, and within it intermediate products are
+ * computed in `BigInt` so they stay exact.
+ */
+export const MAX_SUPPORTED_DIMENSION = 9_007_199_254_740_991;
+
+/**
+ * The versioned fixed-point crop rectangle `image_rect_v1`. Coordinates are
+ * integers on the `0..=1_000_000` grid of upright display space; the origin is
+ * the top-left corner, right and bottom edges are exclusive, and a valid
+ * rectangle satisfies `x0 < x1` and `y0 < y1`. This is the single crop type
+ * shared by Block content, the Media store, provider access, and the
+ * delivered-Media read capability.
  */
 export interface Rect {
-  readonly topLeft: { readonly x: number; readonly y: number };
-  readonly bottomRight: { readonly x: number; readonly y: number };
+  readonly kind: "image_rect_v1";
+  readonly x0: number;
+  readonly y0: number;
+  readonly x1: number;
+  readonly y1: number;
+}
+
+/** Exact pixel bounds produced by materializing a fixed-point crop. */
+export interface MaterializedCropBounds {
+  /** Inclusive left pixel column in `0..width`. */
+  readonly left: number;
+  /** Inclusive top pixel row in `0..height`. */
+  readonly top: number;
+  /** Exclusive right pixel column in `0..width`. */
+  readonly right: number;
+  /** Exclusive bottom pixel row in `0..height`. */
+  readonly bottom: number;
 }
 
 export interface TextContentItem {
@@ -113,31 +147,130 @@ function optionalString(value: unknown, label: string): asserts value is string 
   }
 }
 
-function coordinate(value: unknown, label: string): asserts value is number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
-    throw new Error(`${label} must be a finite number between 0 and 1`);
+function fixedCoordinate(
+  value: unknown,
+  label: string,
+  max = CROP_NORMALIZED_SCALE,
+): asserts value is number {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > max
+  ) {
+    throw new Error(`${label} must be a fixed-point integer in 0..${max}`);
   }
 }
 
-/** Validate and copy a normalized rectangle from an untrusted input. */
+/** Validate and copy a fixed-point crop rectangle from an untrusted input. */
 export function parseRect(value: unknown, label = "crop"): Rect {
-  closedObject(value, ["topLeft", "bottomRight"], label);
-  closedObject(value.topLeft, ["x", "y"], `${label}.topLeft`);
-  closedObject(value.bottomRight, ["x", "y"], `${label}.bottomRight`);
-  coordinate(value.topLeft.x, `${label}.topLeft.x`);
-  coordinate(value.topLeft.y, `${label}.topLeft.y`);
-  coordinate(value.bottomRight.x, `${label}.bottomRight.x`);
-  coordinate(value.bottomRight.y, `${label}.bottomRight.y`);
-  if (
-    value.topLeft.x >= value.bottomRight.x ||
-    value.topLeft.y >= value.bottomRight.y
-  ) {
-    throw new Error(`${label} must have positive width and height`);
+  closedObject(value, ["kind", "x0", "y0", "x1", "y1"], label);
+  if (value.kind !== "image_rect_v1") {
+    throw new Error(`${label}.kind must be image_rect_v1`);
+  }
+  fixedCoordinate(value.x0, `${label}.x0`);
+  fixedCoordinate(value.y0, `${label}.y0`);
+  fixedCoordinate(value.x1, `${label}.x1`);
+  fixedCoordinate(value.y1, `${label}.y1`);
+  if (value.x0 >= value.x1 || value.y0 >= value.y1) {
+    throw new Error(
+      `${label} must satisfy x0 < x1 and y0 < y1 (the right and bottom edges are exclusive)`,
+    );
   }
   return {
-    topLeft: { x: value.topLeft.x, y: value.topLeft.y },
-    bottomRight: { x: value.bottomRight.x, y: value.bottomRight.y },
+    kind: "image_rect_v1",
+    x0: value.x0,
+    y0: value.y0,
+    x1: value.x1,
+    y1: value.y1,
   };
+}
+
+/**
+ * The single shared fixed-point crop materializer, never copied as a separate
+ * formula. It is identical in semantics to the accepted Rust lane: with an
+ * integer `BigInt` divide and a precise ceil, it computes
+ * `left/top = floor(coordinate * dimension / 1_000_000)` and
+ * `right/bottom = ceil(coordinate * dimension / 1_000_000)`, clamps each edge
+ * to `[0, limit]`, and refuses a display whose dimension is not a positive
+ * safe integer no larger than `MAX_SUPPORTED_DIMENSION`. The empty guard
+ * (`right <= left` or `bottom <= top`) exists as the pipeline's fail-closed
+ * safety net just like `EMPTY_CROP`; for any crop this module accepts on any
+ * positive display it cannot fire.
+ *
+ * Returns `null` when any premise is invalid (fail closed); it never guesses a
+ * coordinate or appends to a crop. A caller decides the typed error it maps
+ * `null` to (`MEDIA_CROP_INVALID`, `MEDIA_SNAPSHOT_INVALID`,
+ * `CAPABILITY_ARGUMENT_INVALID`, ...).
+ */
+export function materializeCropBounds(
+  rect: Rect,
+  displayWidth: number,
+  displayHeight: number,
+): MaterializedCropBounds | null {
+  if (!Number.isSafeInteger(displayWidth) || !Number.isSafeInteger(displayHeight)) {
+    return null;
+  }
+  if (displayWidth <= 0 || displayHeight <= 0 || displayWidth > MAX_SUPPORTED_DIMENSION || displayHeight > MAX_SUPPORTED_DIMENSION) {
+    return null;
+  }
+  if (rect.kind !== "image_rect_v1") return null;
+  const coords = [rect.x0, rect.y0, rect.x1, rect.y1];
+  for (const coordinate of coords) {
+    if (!Number.isSafeInteger(coordinate) || coordinate < 0 || coordinate > CROP_NORMALIZED_SCALE) {
+      return null;
+    }
+  }
+  if (rect.x0 >= rect.x1 || rect.y0 >= rect.y1) return null;
+
+  const scale = CROP_NORMALIZED_SCALE;
+  const w = BigInt(displayWidth);
+  const h = BigInt(displayHeight);
+  const numerator = BigInt(scale);
+
+  const left = Number((BigInt(rect.x0) * w) / numerator);
+  const top = Number((BigInt(rect.y0) * h) / numerator);
+  const rightNumerator = BigInt(rect.x1) * w;
+  const bottomNumerator = BigInt(rect.y1) * h;
+  const rightRaw = Number((rightNumerator + numerator - 1n) / numerator);
+  const bottomRaw = Number((bottomNumerator + numerator - 1n) / numerator);
+  const leftClamped = Math.min(Math.max(left, 0), displayWidth);
+  const topClamped = Math.min(Math.max(top, 0), displayHeight);
+  const rightClamped = Math.min(Math.max(rightRaw, 0), displayWidth);
+  const bottomClamped = Math.min(Math.max(bottomRaw, 0), displayHeight);
+  if (rightClamped <= leftClamped || bottomClamped <= topClamped) {
+    // The fail-closed empty guard of the fixed-point pipeline. It is
+    // unreachable for valid input but kept so a drifted decoder cannot
+    // materialize an empty region.
+    return null;
+  }
+  return {
+    left: leftClamped,
+    top: topClamped,
+    right: rightClamped,
+    bottom: bottomClamped,
+  };
+}
+
+/** Exact equality of two fixed-point crop rectangles. */
+export function cropEquals(left: Rect, right: Rect): boolean {
+  return (
+    left.kind === right.kind &&
+    left.x0 === right.x0 &&
+    left.y0 === right.y0 &&
+    left.x1 === right.x1 &&
+    left.y1 === right.y1
+  );
+}
+
+/** One fixed-point crop entirely inside another. */
+export function cropContains(outer: Rect, inner: Rect): boolean {
+  return (
+    inner.x0 >= outer.x0 &&
+    inner.y0 >= outer.y0 &&
+    inner.x1 <= outer.x1 &&
+    inner.y1 <= outer.y1
+  );
 }
 
 /** Validate and copy one Media reference from an untrusted input. */

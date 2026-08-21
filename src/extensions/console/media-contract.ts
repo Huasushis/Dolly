@@ -1,5 +1,7 @@
 import {
   contentReferences,
+  cropContains,
+  cropEquals,
   parseBlockContent,
   type MediaReferenceItem,
   type Rect,
@@ -91,24 +93,6 @@ function deliveredMediaReferences(block: Block): readonly MediaReferenceItem[] {
   }
 }
 
-function sameCrop(left: Rect, right: Rect): boolean {
-  return (
-    left.topLeft.x === right.topLeft.x &&
-    left.topLeft.y === right.topLeft.y &&
-    left.bottomRight.x === right.bottomRight.x &&
-    left.bottomRight.y === right.bottomRight.y
-  );
-}
-
-function cropContains(outer: Rect, inner: Rect): boolean {
-  return (
-    inner.topLeft.x >= outer.topLeft.x &&
-    inner.topLeft.y >= outer.topLeft.y &&
-    inner.bottomRight.x <= outer.bottomRight.x &&
-    inner.bottomRight.y <= outer.bottomRight.y
-  );
-}
-
 /**
  * Derives the display scope from the Blocks delivered to this egress Module
  * job. Nothing else contributes: not text, not a filename, not a field inside
@@ -140,7 +124,7 @@ export function deriveDeliveredMediaScope(
         continue;
       }
       const crop = reference.crop;
-      if (!entry.crops.some((existing) => sameCrop(existing, crop))) entry.crops.push(crop);
+      if (!entry.crops.some((existing) => cropEquals(existing, crop))) entry.crops.push(crop);
     }
   }
   const scope = new Map<string, DeliveredMediaEntry>();
@@ -153,8 +137,11 @@ export function deriveDeliveredMediaScope(
         deliveryIds: [...entry.deliveryIds].sort(),
         allowsFullMedia: entry.allowsFullMedia,
         crops: entry.crops.map((crop) => ({
-          topLeft: { ...crop.topLeft },
-          bottomRight: { ...crop.bottomRight },
+          kind: crop.kind,
+          x0: crop.x0,
+          y0: crop.y0,
+          x1: crop.x1,
+          y1: crop.y1,
         })),
       }),
     );

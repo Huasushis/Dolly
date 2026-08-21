@@ -32,20 +32,23 @@ const IDENTITY: ExtensionSessionIdentity = {
 };
 
 function rect(x1: number, y1: number, x2: number, y2: number): Rect {
-  return { topLeft: { x: x1, y: y1 }, bottomRight: { x: x2, y: y2 } };
+  return { kind: "image_rect_v1", x0: x1, y0: y1, x1: x2, y1: y2 };
 }
 
 /** The same rectangle as Block payload JSON. */
 function cropJson(value: Rect): JsonValue {
   return {
-    topLeft: { x: value.topLeft.x, y: value.topLeft.y },
-    bottomRight: { x: value.bottomRight.x, y: value.bottomRight.y },
+    kind: value.kind,
+    x0: value.x0,
+    y0: value.y0,
+    x1: value.x1,
+    y1: value.y1,
   };
 }
 
 /** Two disjoint crops delivered on the same Media item. */
-const DELIVERED_CROP_A = rect(0, 0, 0.4, 0.4);
-const DELIVERED_CROP_B = rect(0.5, 0.5, 0.9, 0.9);
+const DELIVERED_CROP_A = rect(0, 0, 400_000, 400_000);
+const DELIVERED_CROP_B = rect(500_000, 500_000, 900_000, 900_000);
 
 function block(id: string, sequence: string, value: JsonValue): Block {
   return {
@@ -187,8 +190,8 @@ function createFakeSource(
 
 function httpsSigner(request: MediaSignedUrlRequest): MediaSignedUrl {
   const crop = request.crop
-    ? `&crop=${request.crop.topLeft.x},${request.crop.topLeft.y}` +
-      `,${request.crop.bottomRight.x},${request.crop.bottomRight.y}`
+    ? `&crop=${request.crop.x0},${request.crop.y0}` +
+      `,${request.crop.x1},${request.crop.y1}`
     : "";
   return {
     url: `https://storage.example/${request.mediaId}?sig=abc&req=${request.requestId}${crop}`,
@@ -539,20 +542,20 @@ describe("Extension delivered-Media crop containment", () => {
     readonly allowed: boolean;
   }[] = [
     { name: "exactly the delivered crop", crop: DELIVERED_CROP_A, allowed: true },
-    { name: "strictly inside a delivered crop", crop: rect(0.1, 0.1, 0.3, 0.3), allowed: true },
-    { name: "sharing one edge with a delivered crop", crop: rect(0, 0, 0.4, 0.2), allowed: true },
+    { name: "strictly inside a delivered crop", crop: rect(100_000, 100_000, 300_000, 300_000), allowed: true },
+    { name: "sharing one edge with a delivered crop", crop: rect(0, 0, 400_000, 200_000), allowed: true },
     {
       name: "partially overlapping a delivered crop",
-      crop: rect(0.3, 0.3, 0.6, 0.6),
+      crop: rect(300_000, 300_000, 600_000, 600_000),
       allowed: false,
     },
     {
       name: "completely disjoint from both delivered crops",
-      crop: rect(0.42, 0.42, 0.48, 0.48),
+      crop: rect(420_000, 420_000, 480_000, 480_000),
       allowed: false,
     },
-    { name: "the union of both delivered crops", crop: rect(0, 0, 0.9, 0.9), allowed: false },
-    { name: "an enlarged delivered crop", crop: rect(0, 0, 0.5, 0.5), allowed: false },
+    { name: "the union of both delivered crops", crop: rect(0, 0, 900_000, 900_000), allowed: false },
+    { name: "an enlarged delivered crop", crop: rect(0, 0, 500_000, 500_000), allowed: false },
     { name: "the whole image", crop: undefined, allowed: false },
   ];
 
@@ -590,7 +593,7 @@ describe("Extension delivered-Media crop containment", () => {
       harness.invoke("read", { mediaId: "media-photo", representation: "base64" }),
     ).resolves.toMatchObject({ mediaId: "media-photo", byteLength: 3_000 });
     await expect(
-      harness.invoke("sign-url", { mediaId: "media-photo", crop: rect(0.6, 0.6, 0.7, 0.7) }),
+      harness.invoke("sign-url", { mediaId: "media-photo", crop: rect(600_000, 600_000, 700_000, 700_000) }),
     ).resolves.toMatchObject({ mediaId: "media-photo" });
   });
 
@@ -603,7 +606,7 @@ describe("Extension delivered-Media crop containment", () => {
     await expect(
       harness.invoke("read", {
         mediaId: "media-tile",
-        crop: rect(0, 0, 0.9, 0.9),
+        crop: rect(0, 0, 900_000, 900_000),
         representation: "bytes",
       }),
     ).rejects.toMatchObject({
@@ -612,23 +615,27 @@ describe("Extension delivered-Media crop containment", () => {
     });
   });
 
-  it("rejects a crop that selects no pixel, a crop on non-image Media, and an out-of-range crop", async () => {
+  it("rejects an inverted crop, a crop on non-image Media, and an out-of-range crop", async () => {
     const harness = createHarness({ signer: httpsSigner });
 
+    // An inverted fixed-point rectangle (x1 < x0) is not a valid crop. A valid
+    // crop always covers at least one pixel on a positive display, so the only
+    // rejections available here are premise errors, never a rounded-to-zero
+    // rectangle.
     await expect(
-      harness.invoke("sign-url", { mediaId: "media-thumb", crop: rect(0, 0, 0.1, 0.1) }),
+      harness.invoke("sign-url", { mediaId: "media-thumb", crop: rect(100_000, 100_000, 50_000, 50_000) }),
     ).rejects.toMatchObject({ code: "CAPABILITY_ARGUMENT_INVALID" });
     await expect(
-      harness.invoke("sign-url", { mediaId: "media-audio", crop: rect(0, 0, 0.5, 0.5) }),
+      harness.invoke("sign-url", { mediaId: "media-audio", crop: rect(0, 0, 500_000, 500_000) }),
     ).rejects.toMatchObject({ code: "CAPABILITY_ARGUMENT_INVALID" });
     await expect(
-      harness.invoke("sign-url", { mediaId: "media-thumb", crop: rect(0, 0, 1.5, 1) }),
+      harness.invoke("sign-url", { mediaId: "media-thumb", crop: rect(0, 0, 1_500_000, 1_000_000) }),
     ).rejects.toMatchObject({ code: "CAPABILITY_ARGUMENT_INVALID" });
     expect(harness.source.signCalls).toEqual([]);
 
     // The same tiny image accepts a crop that does cover at least one pixel.
     await expect(
-      harness.invoke("sign-url", { mediaId: "media-thumb", crop: rect(0, 0, 0.5, 0.5) }),
+      harness.invoke("sign-url", { mediaId: "media-thumb", crop: rect(0, 0, 500_000, 500_000) }),
     ).resolves.toMatchObject({ mediaId: "media-thumb" });
   });
 
@@ -639,7 +646,7 @@ describe("Extension delivered-Media crop containment", () => {
       await expect(
         harness.invoke("read", {
           mediaId: "media-photo",
-          crop: rect(0.1, 0.1, 0.2, 0.2),
+          crop: rect(100_000, 100_000, 200_000, 200_000),
           representation,
         }),
       ).rejects.toMatchObject({

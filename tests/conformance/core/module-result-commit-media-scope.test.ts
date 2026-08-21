@@ -27,8 +27,11 @@ function crop(
   bottom: number,
 ) {
   return {
-    topLeft: { x: left, y: top },
-    bottomRight: { x: right, y: bottom },
+    kind: "image_rect_v1",
+    x0: left,
+    y0: top,
+    x1: right,
+    y1: bottom,
   } satisfies Rect;
 }
 
@@ -260,7 +263,7 @@ describe("module result Media reuse", () => {
       harness.coordinator.commit(
         resultInput(
           harness,
-          mediaProposal([mediaReference("input-media", crop(0.2, 0.2, 0.8, 0.8))]),
+          mediaProposal([mediaReference("input-media", crop(200_000, 200_000, 800_000, 800_000))]),
         ),
       ),
     ).resolves.toMatchObject({ state: "committed", blockId: "block-2" });
@@ -268,8 +271,8 @@ describe("module result Media reuse", () => {
 
   it("does not combine separate delivered crops or expand them to the full image", async () => {
     const harness = createHarness([
-      mediaReference("input-media", crop(0, 0, 0.5, 1)),
-      mediaReference("input-media", crop(0.5, 0, 1, 1)),
+      mediaReference("input-media", crop(0, 0, 500_000, 1_000_000)),
+      mediaReference("input-media", crop(500_000, 0, 1_000_000, 1_000_000)),
     ]);
 
     await expect(
@@ -281,7 +284,7 @@ describe("module result Media reuse", () => {
       harness.coordinator.commit(
         resultInput(
           harness,
-          mediaProposal([mediaReference("input-media", crop(0.25, 0, 0.75, 1))]),
+          mediaProposal([mediaReference("input-media", crop(250_000, 0, 750_000, 1_000_000))]),
         ),
       ),
     ).rejects.toMatchObject({ code: "MODULE_JOB_OUTPUT_INVALID" });
@@ -291,13 +294,13 @@ describe("module result Media reuse", () => {
   });
 
   it("does not enlarge a single delivered crop", async () => {
-    const harness = createHarness([mediaReference("input-media", crop(0.1, 0.1, 0.9, 0.9))]);
+    const harness = createHarness([mediaReference("input-media", crop(100_000, 100_000, 900_000, 900_000))]);
 
     await expect(
       harness.coordinator.commit(
         resultInput(
           harness,
-          mediaProposal([mediaReference("input-media", crop(0.05, 0.1, 0.9, 0.9))]),
+          mediaProposal([mediaReference("input-media", crop(50_000, 100_000, 900_000, 900_000))]),
         ),
       ),
     ).rejects.toMatchObject({ code: "MODULE_JOB_OUTPUT_INVALID" });
@@ -307,13 +310,13 @@ describe("module result Media reuse", () => {
   });
 
   it("allows a crop contained in one delivered crop", async () => {
-    const harness = createHarness([mediaReference("input-media", crop(0.1, 0.1, 0.9, 0.9))]);
+    const harness = createHarness([mediaReference("input-media", crop(100_000, 100_000, 900_000, 900_000))]);
 
     await expect(
       harness.coordinator.commit(
         resultInput(
           harness,
-          mediaProposal([mediaReference("input-media", crop(0.2, 0.2, 0.8, 0.8))]),
+          mediaProposal([mediaReference("input-media", crop(200_000, 200_000, 800_000, 800_000))]),
         ),
       ),
     ).resolves.toMatchObject({ state: "committed", blockId: "block-2" });
@@ -321,13 +324,13 @@ describe("module result Media reuse", () => {
 
   it("does not recover a prepared record that enlarges a delivered crop", async () => {
     const harness = createHarness([
-      mediaReference("input-media", crop(0.1, 0.1, 0.9, 0.9)),
+      mediaReference("input-media", crop(100_000, 100_000, 900_000, 900_000)),
     ]);
     harness.repository.createPrepared(
       preparedRecord(
         harness,
         moduleSource,
-        mediaProposal([mediaReference("input-media", crop(0.05, 0.1, 0.9, 0.9))]),
+        mediaProposal([mediaReference("input-media", crop(50_000, 100_000, 900_000, 900_000))]),
       ),
     );
 

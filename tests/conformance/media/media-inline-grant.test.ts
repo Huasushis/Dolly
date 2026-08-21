@@ -106,8 +106,11 @@ describe("inline media grants", () => {
       media.resolveProviderAccess({
         mediaId: registeredMedia.mediaId,
         crop: {
-          topLeft: { x: 0.1, y: 0.1 },
-          bottomRight: { x: 0.9, y: 0.9 },
+          kind: "image_rect_v1",
+          x0: 100_000,
+          y0: 100_000,
+          x1: 900_000,
+          y1: 900_000,
         },
         requestId: "inline-crop-request",
         recipientId: "provider-recipient",
@@ -118,8 +121,11 @@ describe("inline media grants", () => {
       media.resolveProviderAccess({
         mediaId: registeredMedia.mediaId,
         crop: {
-          topLeft: { x: 0.1, y: 0.1 },
-          bottomRight: { x: 0.9, y: 0.9 },
+          kind: "image_rect_v1",
+          x0: 100_000,
+          y0: 100_000,
+          x1: 900_000,
+          y1: 900_000,
           extra: true,
         } as never,
         requestId: "invalid-crop-request",

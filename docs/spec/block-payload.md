@@ -26,10 +26,7 @@ locators (URLs), paths, base64, commands, or references.
         {
           "type": "media-reference",
           "mediaId": "media-1",
-          "crop": {
-            "topLeft": { "x": 0.1, "y": 0.2 },
-            "bottomRight": { "x": 0.9, "y": 0.8 }
-          }
+          "crop": {"kind": "image_rect_v1", "x0": 100000, "y0": 200000, "x1": 900000, "y1": 800000}
         }
       ]
     }
@@ -166,17 +163,22 @@ returns no Block instead of an empty content value.
 
 ## 3. Crop coordinates
 
-`Rect` uses normalized coordinates. Each coordinate is finite and in the range
-`[0, 1]`; `topLeft.x < bottomRight.x` and `topLeft.y < bottomRight.y` are
-required. Crop is currently supported only for images whose dimensions were
-inspected successfully.
+A crop is the versioned fixed-point rectangle `image_rect_v1`:
+`{ "kind": "image_rect_v1", "x0": 100000, "y0": 200000, "x1": 900000, "y1": 800000 }`.
+The four coordinates are integers on a `0..=1_000_000` grid of upright display
+space; `x0 < x1` and `y0 < y1` are required and the right and bottom edges are
+exclusive. Fractions, NaN, strings, and unknown fields are rejected. Crop is
+currently supported only for images whose dimensions were inspected
+successfully.
 
-When a provider needs pixels, the media store converts the four coordinates
-independently with nearest-integer rounding, then uses the resulting left, top,
-right, and bottom edges. The resulting width and height must each be at least
-one pixel and the edges must stay inside the original image. The same rule is
-used by every adapter. A provider URL query parameter is an adapter detail and
-must never be stored as the Media identity.
+When a provider needs pixels, every consumer calls the single shared
+materializer, which converts the four coordinates independently with fixed-
+point arithmetic (floor for left/top, ceil for right/bottom, clamped to the
+display), then uses the resulting left, top, right, and bottom edges. The
+resulting width and height must each be at least one pixel and the edges must
+stay inside the original image. The same rule is used by every adapter, and
+no approximate formula is ever duplicated. A provider URL query parameter is
+an adapter detail and must never be stored as the Media identity.
 
 The first version does not define resize, rotation, video editing, audio
 editing, point annotations, or persistent derived files.

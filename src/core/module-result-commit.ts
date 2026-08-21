@@ -13,6 +13,7 @@ import {
 } from "./block-store.js";
 import {
   contentReferences,
+  cropContains,
   parseBlockContent,
   type BlockReferenceItem,
   type MediaReferenceItem,
@@ -234,12 +235,7 @@ function blockReferencesForProposal(proposal: BlockProposal): readonly BlockRefe
  * crop. Separate delivered crops are never combined into a larger region.
  */
 function cropIsInside(candidate: Rect, containing: Rect): boolean {
-  return (
-    candidate.topLeft.x >= containing.topLeft.x &&
-    candidate.topLeft.y >= containing.topLeft.y &&
-    candidate.bottomRight.x <= containing.bottomRight.x &&
-    candidate.bottomRight.y <= containing.bottomRight.y
-  );
+  return cropContains(containing, candidate);
 }
 
 function immutableRecord(record: ModuleResultCommitRecord): ModuleResultCommitRecord {

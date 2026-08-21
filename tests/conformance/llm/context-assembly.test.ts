@@ -312,8 +312,11 @@ describe("multimodal placement", () => {
         type: "media-reference",
         mediaId: "media-1",
         crop: {
-          topLeft: { x: 0.1, y: 0.2 },
-          bottomRight: { x: 0.9, y: 0.8 },
+          kind: "image_rect_v1",
+          x0: 100_000,
+          y0: 200_000,
+          x1: 900_000,
+          y1: 800_000,
         },
         caption: "a receipt",
       },
@@ -339,7 +342,7 @@ describe("multimodal placement", () => {
     const marker = previous.kind === "text" ? previous.text : "";
     expect(marker).toContain('media="media-1"');
     expect(marker).toContain("attached=true");
-    expect(marker).toContain('crop="0.100000,0.200000,0.900000,0.800000"');
+    expect(marker).toContain('crop="100000,200000,900000,800000"');
 
     const mediaPart = parts[mediaIndex];
     expect(mediaPart).toEqual({
@@ -348,7 +351,7 @@ describe("multimodal placement", () => {
       mediaReference: {
         type: "media-reference",
         mediaId: "media-1",
-        crop: { topLeft: { x: 0.1, y: 0.2 }, bottomRight: { x: 0.9, y: 0.8 } },
+        crop: { kind: "image_rect_v1", x0: 100_000, y0: 200_000, x1: 900_000, y1: 800_000 },
         caption: "a receipt",
       },
     });

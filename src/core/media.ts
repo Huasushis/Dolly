@@ -3,7 +3,8 @@ import { existsSync, mkdirSync } from "fs";
 import { readFile, writeFile, unlink } from "fs/promises";
 import path from "path";
 import sharp from "sharp";
-import type { Media, Rect } from "./types.js";
+import type { Media } from "./types.js";
+import { materializeCropBounds, type Rect } from "./block-content.js";
 
 // ─── OSS Configuration ───────────────────────────────────────────────────────
 
@@ -198,33 +199,30 @@ export class MediaManager {
   }
 
   /**
-   * D5: 图片裁剪
+   * 图片裁剪
    * - 如果启用 OSS 且图片已有 OSS URL，使用 OSS URL 参数裁剪（无需本地处理）
    * - 否则使用 sharp 本地裁剪并注册为新 media 对象
-   * @param id 原始图片 mediaId
-   * @param rect 归一化裁剪区域 (topLeft/bottomRight, 0~1.0)
-   * @returns 新 mediaId（裁剪后的图片）
+   *
+   * The crop is the versioned fixed-point `image_rect_v1` handled through the
+   * one shared materializer (`materializeCropBounds`): left/top floor, right/
+   * bottom ceil, clamped to the inspected upright display dimensions. Returns
+   * a new mediaId for the cropped image.
    */
   async crop(id: string, rect: Rect): Promise<string> {
     const media = this.store.get(id);
     if (!media) throw new Error(`Media not found: ${id}`);
     if (!isImageMime(media.mimeType)) throw new Error(`Cannot crop non-image media: ${id}`);
 
-    // Validate rect
-    const { topLeft, bottomRight } = rect;
-    if (topLeft.x < 0 || topLeft.y < 0 || bottomRight.x > 1 || bottomRight.y > 1) {
-      throw new Error(`Invalid crop rect: coordinates must be in [0, 1.0]`);
-    }
-    if (topLeft.x >= bottomRight.x || topLeft.y >= bottomRight.y) {
-      throw new Error(`Invalid crop rect: topLeft must be above-left of bottomRight`);
-    }
-
     // Strategy 1: OSS URL parameter crop (no local processing needed)
     if (this.ossConfig && media.ossObjectKey && media.width && media.height) {
-      const px = Math.round(topLeft.x * media.width);
-      const py = Math.round(topLeft.y * media.height);
-      const pw = Math.round((bottomRight.x - topLeft.x) * media.width);
-      const ph = Math.round((bottomRight.y - topLeft.y) * media.height);
+      const bounds = materializeCropBounds(rect, media.width, media.height);
+      if (bounds === null) {
+        throw new Error(`Invalid media caveat: fixed-point crop does not select a pixel on ${media.width}x${media.height}`);
+      }
+      const px = bounds.left;
+      const py = bounds.top;
+      const pw = bounds.right - bounds.left;
+      const ph = bounds.bottom - bounds.top;
       const ossCropUrl = `${this.ossPublicUrl(media.ossObjectKey)}?x-oss-process=image/crop,x_${px},y_${py},w_${pw},h_${ph}`;
 
       // Register as new media with the OSS crop URL
@@ -248,14 +246,18 @@ export class MediaManager {
     if (!media.localPath) throw new Error(`Media has no local file for cropping: ${id}`);
     const inputData = await readFile(media.localPath);
     const meta = await sharp(inputData).metadata();
-    const imgW = meta.width ?? 0;
-    const imgH = meta.height ?? 0;
-    if (imgW === 0 || imgH === 0) throw new Error(`Cannot determine image dimensions: ${id}`);
+    const width = meta.width ?? 0;
+    const height = meta.height ?? 0;
+    if (width === 0 || height === 0) throw new Error(`Cannot determine image dimensions: ${id}`);
 
-    const px = Math.round(topLeft.x * imgW);
-    const py = Math.round(topLeft.y * imgH);
-    const pw = Math.round((bottomRight.x - topLeft.x) * imgW);
-    const ph = Math.round((bottomRight.y - topLeft.y) * imgH);
+    const bounds = materializeCropBounds(rect, width, height);
+    if (bounds === null) {
+      throw new Error(`Invalid media caveat: fixed-point crop does not select a pixel on ${width}x${height}`);
+    }
+    const px = bounds.left;
+    const py = bounds.top;
+    const pw = bounds.right - bounds.left;
+    const ph = bounds.bottom - bounds.top;
 
     const croppedBuf = await sharp(inputData)
       .extract({ left: px, top: py, width: pw, height: ph })

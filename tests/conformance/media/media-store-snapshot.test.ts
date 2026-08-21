@@ -341,8 +341,11 @@ describe("persistent Media metadata snapshot", () => {
     );
     await media.storeOriginal(registeredMedia.mediaId, "crop-storage");
     const crop = {
-      topLeft: { x: 0.1, y: 0.25 },
-      bottomRight: { x: 0.4, y: 0.75 },
+      kind: "image_rect_v1",
+      x0: 100_000,
+      y0: 250_000,
+      x1: 400_000,
+      y1: 750_000,
     } as const;
     const grant = await media.resolveProviderAccess({
       mediaId: registeredMedia.mediaId,
@@ -675,8 +678,11 @@ describe("persistent Media metadata snapshot", () => {
     await media.resolveProviderAccess({
       mediaId: registeredMedia.mediaId,
       crop: {
-        topLeft: { x: 0.1, y: 0.1 },
-        bottomRight: { x: 0.9, y: 0.9 },
+        kind: "image_rect_v1",
+        x0: 100_000,
+        y0: 100_000,
+        x1: 900_000,
+        y1: 900_000,
       },
       requestId: "provider-request",
       recipientId: "provider",
@@ -706,8 +712,11 @@ describe("persistent Media metadata snapshot", () => {
       providerAccess: persisted.providerAccess.map((record) => ({
         ...record,
         crop: {
-          topLeft: { x: 0.9, y: 0.1 },
-          bottomRight: { x: 0.1, y: 0.9 },
+          kind: "image_rect_v1",
+          x0: 900_000,
+          y0: 100_000,
+          x1: 100_000,
+          y1: 900_000,
         },
       })),
     };
@@ -721,6 +730,34 @@ describe("persistent Media metadata snapshot", () => {
       idNamespace: "provider-snapshot",
       now: () => NOW,
       snapshot: forged,
+      onMutation: () => undefined,
+    })).toThrowError(expect.objectContaining<Partial<MediaStoreError>>({
+      code: "MEDIA_SNAPSHOT_INVALID",
+    }));
+
+    // A persisted legacy float-scale crop (topLeft/bottomRight doubles) must
+    // fail closed on restore, never be silently reinterpreted as a fixed-point
+    // rectangle. The closed image_rect_v1 wire shape is the only accepted form.
+    const legacyFloat: MediaStoreSnapshot = {
+      ...persisted,
+      providerAccess: persisted.providerAccess.map((record) => ({
+        ...record,
+        crop: {
+          topLeft: { x: 0.1, y: 0.25 },
+          bottomRight: { x: 0.4, y: 0.75 },
+        },
+      })),
+    };
+    expect(() => new MediaStore({
+      durability: "persistent",
+      referenceGraph: new ReferenceGraph({ snapshot: referenceGraph.snapshot() }),
+      bytes,
+      inspector,
+      adapters: [createCropStorage()],
+      maxMediaBytes: 1024,
+      idNamespace: "provider-snapshot",
+      now: () => NOW,
+      snapshot: legacyFloat,
       onMutation: () => undefined,
     })).toThrowError(expect.objectContaining<Partial<MediaStoreError>>({
       code: "MEDIA_SNAPSHOT_INVALID",
