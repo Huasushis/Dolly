@@ -271,25 +271,36 @@ provider access.
 
 ## 5. Crop contract
 
-Each normalized coordinate is a finite number from 0 through 1. The top-left
-coordinates MUST be strictly less than the bottom-right coordinates. The
-coordinates are relative to the inspected dimensions of the original Media.
+A crop is the versioned fixed-point rectangle `image_rect_v1`: four integers
+`x0`/`y0`/`x1`/`y1` on a `0..=1_000_000` grid of upright display space, with
+`x0 < x1` and `y0 < y1`, right and bottom edges exclusive. Fractions are never
+stored: a coordinate is an integer count of millionths. The wire shape is
+closed (`kind: "image_rect_v1"`, exactly those five fields), and the shared
+materializer in `src/core/block-content.ts` (`materializeCropBounds`) computes
+pixels once for every consumer.
 
-For an image with width `W` and height `H`, Dolly converts all four edges
-independently:
+For an image with display width `W` and height `H`, all four edges are computed
+independently with integer arithmetic:
 
 ```text
-left   = round(topLeft.x     * W)
-top    = round(topLeft.y     * H)
-right  = round(bottomRight.x * W)
-bottom = round(bottomRight.y * H)
+left   = clamp(floor(x0 * W / 1_000_000), 0, W)
+top    = clamp(floor(y0 * H / 1_000_000), 0, H)
+right  = clamp(ceil (x1 * W / 1_000_000), 0, W)
+bottom = clamp(ceil (y1 * H / 1_000_000), 0, H)
 width  = right - left
 height = bottom - top
 ```
 
-The converted rectangle MUST stay within the original image and have positive
-integer width and height. Rounding width or height directly is not conformant,
-because it can disagree with independently rounded edges.
+The multiplication must not overflow: coordinates are at most `1_000_000` and
+the supported display dimension ceiling is the safe JSON integer limit
+`9_007_199_254_740_991`, with intermediates kept exact. The converted rectangle
+MUST stay within the original image and have positive integer width and height.
+Rounding the width or height directly is not conformant, because it can
+disagree with independently rounded edges. A crop that becomes empty after the
+decoder's bounds checks fails closed (`EMPTY_CROP` guard); for any crop this
+runtime accepts it is provably non-empty. A stored legacy float-scale rectangle
+(`topLeft`/`bottomRight` doubles) is never reinterpreted: every entry point
+refuses it as an invalid `image_rect_v1` instead.
 
 A crop:
 

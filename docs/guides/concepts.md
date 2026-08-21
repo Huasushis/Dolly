@@ -273,16 +273,15 @@ A **crop** is a logical rectangle over an existing image, written next to the
 {
   "type": "media-reference",
   "mediaId": "media-7",
-  "crop": {
-    "topLeft": { "x": 0.1, "y": 0.2 },
-    "bottomRight": { "x": 0.9, "y": 0.8 }
-  }
+  "crop": { "kind": "image_rect_v1", "x0": 100000, "y0": 200000, "x1": 900000, "y1": 800000 }
 }
 ```
 
-Coordinates are normalized to the range 0 to 1. A crop is not a new Media item,
-not a new identifier, and not a new stored object. It is a reference to part of
-the same bytes, so referring to a region costs nothing in storage.
+A crop is a closed `image_rect_v1` value whose coordinates are fixed-point
+integers on a `0..=1_000_000` grid of upright display space (`x0 < x1`,
+`y0 < y1`, right and bottom edges exclusive). It is not a new Media item, not
+a new identifier, and not a new stored object. It is a reference to part of the
+same bytes, so referring to a region costs nothing in storage.
 
 Crops narrow, never widen. When a Module produces a Block, each Media reference
 in its output must reuse a reference it actually received. If every delivered

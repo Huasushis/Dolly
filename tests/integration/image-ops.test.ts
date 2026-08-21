@@ -10,7 +10,8 @@ import type {
   MediaAccess,
   ModuleContext,
 } from "../../src/core/legacy-in-process-extension.js";
-import type { Block, ExecuteInput, PremiseCollection, Rect, Point } from "../../src/core/types.js";
+import type { Block, ExecuteInput, PremiseCollection, Point } from "../../src/core/types.js";
+import type { Rect } from "../../src/core/block-content.js";
 
 loadEnv();
 

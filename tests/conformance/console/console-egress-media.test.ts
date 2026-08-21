@@ -15,8 +15,11 @@ import {
 import { contentBlock, createStoreHarness, makeBlock, type StoreHarness } from "./fixtures.js";
 
 const FULL_CROP = {
-  topLeft: { x: 0.1, y: 0.1 },
-  bottomRight: { x: 0.5, y: 0.5 },
+  kind: "image_rect_v1",
+  x0: 100_000,
+  y0: 100_000,
+  x1: 500_000,
+  y1: 500_000,
 };
 
 function expectConsoleError(run: () => unknown, code: ConsoleErrorCode): ConsoleExtensionError {
@@ -296,7 +299,7 @@ describe("Console egress and Media contract", () => {
           moduleJobId: "job-1",
           sessionId: "session-a",
           mediaId: "media-cropped",
-          crop: { topLeft: { x: 0.05, y: 0.05 }, bottomRight: { x: 0.6, y: 0.6 } },
+          crop: { kind: "image_rect_v1", x0: 50_000, y0: 50_000, x1: 600_000, y1: 600_000 },
         }),
       "MEDIA_CROP_NOT_DELIVERED",
     );
@@ -306,7 +309,7 @@ describe("Console egress and Media contract", () => {
         moduleJobId: "job-1",
         sessionId: "session-a",
         mediaId: "media-cropped",
-        crop: { topLeft: { x: 0.2, y: 0.2 }, bottomRight: { x: 0.4, y: 0.4 } },
+        crop: { kind: "image_rect_v1", x0: 200_000, y0: 200_000, x1: 400_000, y1: 400_000 },
       }).crops,
     ).toEqual([FULL_CROP]);
 

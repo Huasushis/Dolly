@@ -13,12 +13,18 @@ import type {
   ExecuteInput,
   PremiseCollection,
   RawBlock,
-  Rect,
   ScheduleConfig,
 } from "./types.js";
+import type { Rect } from "./block-content.js";
 
 export interface MediaAccess {
   get(id: string, format: "buffer" | "base64" | "url"): Promise<Buffer | string>;
+  /**
+   * Crops use the shared versioned fixed-point `image_rect_v1` rectangle, the
+   * same type the Block content pipeline and Media store use. The in-process
+   * host delegates the conversion to the single shared materializer; it never
+   * interprets the coordinates itself. (Legacy orchestrator path only.)
+   */
   crop(id: string, rect: Rect): Promise<string>;
 }
 

@@ -78,8 +78,11 @@ describe("MEDIA atomic Core/Media state", () => {
               type: "media-reference",
               mediaId: media.mediaId,
               crop: {
-                topLeft: { x: 0.1, y: 0.25 },
-                bottomRight: { x: 0.4, y: 0.75 },
+                kind: "image_rect_v1",
+                x0: 100_000,
+                y0: 250_000,
+                x1: 400_000,
+                y1: 750_000,
               },
             }],
           },

@@ -189,12 +189,7 @@ function placeInline(
 }
 
 function formatCrop(crop: Rect): string {
-  return [
-    crop.topLeft.x.toFixed(6),
-    crop.topLeft.y.toFixed(6),
-    crop.bottomRight.x.toFixed(6),
-    crop.bottomRight.y.toFixed(6),
-  ].join(",");
+  return [crop.x0, crop.y0, crop.x1, crop.y1].join(",");
 }
 
 function selectMediaRequirement(

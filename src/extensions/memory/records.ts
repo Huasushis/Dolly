@@ -285,9 +285,18 @@ export interface FeatureRecord {
   readonly tokens?: readonly string[];
   /** Media-derived features only. */
   readonly sourceMediaId?: string;
+  /**
+   * The exact fixed-point crop (`image_rect_v1`) the feature was derived
+   * from; it mirrors the Block content crop so feature records never carry a
+   * separately-interpreted rectangle. Informational provenance only; it never
+   * grants Media authority.
+   */
   readonly sourceCrop?: {
-    readonly topLeft: { readonly x: number; readonly y: number };
-    readonly bottomRight: { readonly x: number; readonly y: number };
+    readonly kind: "image_rect_v1";
+    readonly x0: number;
+    readonly y0: number;
+    readonly x1: number;
+    readonly y1: number;
   };
   /** §8.3: derived assertions are labelled derived and never source truth. */
   readonly derivedText?: string;
