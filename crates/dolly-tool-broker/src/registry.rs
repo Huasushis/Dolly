@@ -125,11 +125,18 @@ pub enum AdmissionOutcome {
 }
 
 /// Closed resolved idempotency policy (spec §5 closed tagged union).
+///
+/// The `argument_key` variant retains the configured RFC 6901
+/// `argument_pointer` so call-time verification can resolve it on the
+/// complete caller-supplied `arguments` object and require the resolved
+/// value to be a string exactly equal to `host.tool.invoke.idempotency_key`
+/// (REQ-TOOL-002). Admission rejects a missing, empty, or malformed pointer
+/// as config invalid; the pointer is never dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IdempotencyPolicy {
     None,
-    ArgumentKey,
+    ArgumentKey { argument_pointer: String },
 }
 
 /// Side-effect class (closed set).
@@ -457,13 +464,66 @@ fn idempotency_policy(tool: &CanonicalJsonObject) -> Result<IdempotencyPolicy, C
     let kind = required_string(idemp, "kind")?;
     Ok(match kind {
         "none" => IdempotencyPolicy::None,
-        "argument_key" => IdempotencyPolicy::ArgumentKey,
+        "argument_key" => {
+            // The pointer is required, non-empty, well-formed RFC 6901, and
+            // retained on the closed policy (REQ-TOOL-002 / spec §5). The
+            // embedded schema constrains the pointer syntax; this check
+            // keeps the resolved registry closed regardless of the schema.
+            let pointer = required_string(idemp, "argument_pointer")?;
+            if pointer.trim().is_empty() {
+                return Err(ConfigRejection::new(RejectionReason::Malformed {
+                    message: "argument_pointer must be non-empty".into(),
+                }));
+            }
+            if !well_formed_rfc6901_pointer(pointer) {
+                return Err(ConfigRejection::new(RejectionReason::Malformed {
+                    message: format!(
+                        "argument_pointer {pointer:?} is not a well-formed RFC 6901 pointer"
+                    ),
+                }));
+            }
+            IdempotencyPolicy::ArgumentKey {
+                argument_pointer: pointer.to_owned(),
+            }
+        }
         other => {
             return Err(ConfigRejection::new(RejectionReason::Malformed {
                 message: format!("unknown idempotency kind {other}"),
             }));
         }
     })
+}
+
+/// Non-recursive RFC 6901 well-formedness check (pointer syntax alone; no
+/// document traversal). A pointer is either the whole document (`""`) or a
+/// `/`-led reference-token path in which every `~` is escaped as `~0`
+/// (tilde) or `~1` (slash); any other `~` occurrence makes the pointer
+/// malformed.
+pub(crate) fn well_formed_rfc6901_pointer(pointer: &str) -> bool {
+    if pointer.is_empty() {
+        // RFC 6901: the empty string refers to the whole document. The
+        // config schema requires non-empty, so admission rejects it earlier;
+        // the resolver still honors it when called directly.
+        return true;
+    }
+    if !pointer.starts_with('/') {
+        return false;
+    }
+    let mut escaped = false;
+    for byte in pointer.bytes() {
+        if escaped {
+            if byte != b'0' && byte != b'1' {
+                return false;
+            }
+            escaped = false;
+        } else {
+            match byte {
+                b'~' => escaped = true,
+                _ => {}
+            }
+        }
+    }
+    !escaped
 }
 
 fn transport_kind(server: &CanonicalJsonObject) -> Result<&str, ConfigRejection> {
