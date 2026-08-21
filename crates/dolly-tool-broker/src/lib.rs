@@ -8,11 +8,17 @@
 //! Authority is closed. The `ResolvedToolBrokerConfig` is produced only by
 //! `admit_config`; discovery and results are never consulted to expand it.
 
+pub mod dispatch;
 pub mod invoke;
 pub mod registry;
 pub mod result;
 pub mod status;
 pub mod version;
+
+pub use dispatch::{
+    DispatchDisposition, DurableDispatchRow, EVENT_TOOL_DISPATCH_PROVED_NOT_APPLIED,
+    EVENT_TOOL_OUTCOME_UNKNOWN, LedgerState, recover_operation,
+};
 
 pub use invoke::{
     ExistingOperation, FrozenBinding, InvokeCandidate, InvokeOutcome, ResolutionBackend,
