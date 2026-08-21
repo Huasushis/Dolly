@@ -170,4 +170,50 @@ impl ToolResult {
             server_request_id: None,
         }
     }
+
+    /// A terminal `failed` result for an accepted operation binding
+    /// (spec §8): `outcome:not_applied`, `retryable:false`. Used for the
+    /// proved non-application (`TOOL_DISPATCH_NOT_APPLIED`) and other
+    /// upstream `failed` terminals.
+    pub fn failed(
+        operation_id: impl Into<String>,
+        code: ToolErrorCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            operation_id: operation_id.into(),
+            status: ToolStatus::Failed,
+            output: Value::Null,
+            error: Some(ToolError {
+                code,
+                retryable: false,
+                outcome: ErrorOutcome::NotApplied,
+                message: message.into(),
+                details: Map::new(),
+            }),
+            server_request_id: None,
+        }
+    }
+
+    /// The terminal `unknown` result (spec §8): `status:unknown`,
+    /// `outcome:unknown`, `retryable:false` with
+    /// `TOOL_EXTERNAL_OUTCOME_UNKNOWN`. This is the only legal shape for an
+    /// unrecoverable dispatch fact — never `failed`, never `not_applied`.
+    pub fn unknown_outcome(operation_id: impl Into<String>) -> Self {
+        Self {
+            operation_id: operation_id.into(),
+            status: ToolStatus::Unknown,
+            output: Value::Null,
+            error: Some(ToolError {
+                code: ToolErrorCode::ExternalOutcomeUnknown,
+                retryable: false,
+                outcome: ErrorOutcome::Unknown,
+                message:
+                    "dispatch may have reached the server and no authoritative disposition exists"
+                        .into(),
+                details: Map::new(),
+            }),
+            server_request_id: None,
+        }
+    }
 }
