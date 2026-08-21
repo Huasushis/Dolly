@@ -170,6 +170,7 @@ import {
   defaultLauncherScriptPath,
   REVIEWED_LINUX_MODULE_LAUNCHER_DIGEST,
 } from "../../../src/adapters/linux-module-launcher/linux-module-launcher-process.js";
+import { createModuleLauncherControl } from "../../../src/adapters/linux-module-launcher/module-launcher-control.js";
 import {
   assertReservedV10InstalledPermissionPolicySelection,
   reservedV10InstalledPermissionPolicyRevision,
@@ -1386,12 +1387,14 @@ describe("installed Extension Module resolution", () => {
     expect(() => factory.processGenerationIdFor("module-generation-a"))
       .toThrow(/does not have a process generation/u);
     expect(factory.sessionForProcess("process-installed-a")).toBeNull();
+    // Creating an executor must not expose the caller-generated ID: the
+    // reserve-before-start value is an allocator input only.
     expect(factory.createExecutor("module-generation-a").isolation).toBe("process");
     expect(factory.createExecutor("module-generation-b").isolation).toBe("process");
-    expect(factory.processGenerationIdFor("module-generation-a"))
-      .toBe("process-installed-a");
-    expect(factory.processGenerationIdFor("module-generation-b"))
-      .toBe("process-installed-b");
+    expect(() => factory.processGenerationIdFor("module-generation-a"))
+      .toThrow(/does not have a process generation/u);
+    expect(() => factory.processGenerationIdFor("module-generation-b"))
+      .toThrow(/does not have a process generation/u);
     expect(factory.sessionForProcess("process-installed-a")).toBeNull();
     expect(factory.sessionForProcess("process-installed-b")).toBeNull();
     expect(() => factory.createExecutor("module-generation-a"))
@@ -1616,6 +1619,84 @@ describe("installed Extension Module resolution", () => {
       "state:stopping",
       "state:stopped",
     ]);
+    expect(records.log).not.toContain("append");
+  });
+
+  it("keeps a failed installed start from exposing any process generation to mapping consumers", async () => {
+    const source = resolve(scratch, "source-v19-failure");
+    writePackage(source, "1.0.0");
+    installations.installNodePackage({ sourceDirectory: source, trust: "trusted" });
+    const configuration = configurations.create({
+      configId: "worker-config",
+      extensionId: "org.example.installed",
+      moduleKind: "transform",
+      configVersion: 1,
+      schema: CONFIGURATION_SCHEMA,
+      configuration: { prefix: "composed" },
+    });
+    const records = createVersion19RecordStore();
+    const fileSystem = cgroupFileSystemFor();
+    const coreStateDirectory = resolve(scratch, "instance-state");
+    mkdirSync(coreStateDirectory, { recursive: true, mode: 0o700 });
+    const factory = createInstalledLinuxExtensionModuleGenerationFactory({
+      instanceConfiguration: instanceConfiguration("1.0.0", configuration.revision),
+      moduleId: "worker",
+      installations,
+      configurations,
+      coreStateDirectory,
+      activation,
+      lifecycle: {
+        records,
+        stoppedRecordWriter: records.stoppedRecordWriter,
+        cgroupFileSystem: fileSystem,
+        limits: {
+          memoryMaxBytes: 64 * 1_024 * 1_024,
+          maxProcesses: 16,
+          cpuQuotaMicros: 50_000,
+          cpuPeriodMicros: 100_000,
+        },
+        maxOpenFiles: 64,
+      },
+      host: {
+        isolationPolicy: new ExtensionIsolationPolicy(),
+      },
+      executionTimeoutMs: 1_000,
+      cancellationGraceMs: 250,
+      terminationTimeoutMs: 2_000,
+      channelCloseTimeoutMs: 1_000,
+      nextProcessGenerationId: () => PROCESS_IDENTITY.processGenerationId,
+      wallClockNow: () => Date.parse("2026-08-10T00:00:00.000Z"),
+    });
+
+    const executor = factory.createExecutor(MODULE_GENERATION_ID);
+    if (executor.start === undefined || executor.terminate === undefined) {
+      throw new Error("the factory executor must provide start and terminate");
+    }
+    // The exact launcher this start creates cannot prove membership.
+    vi.mocked(createModuleLauncherControl).mockImplementationOnce(() => ({
+      processId: 4242,
+      configure: async () => undefined,
+      authorizeExecution: async () => ({
+        executionAuthorized: false as const,
+        code: "LAUNCHER_MEMBERSHIP_UNVERIFIED" as const,
+        detail: "the launcher never reported membership",
+        membershipVerified: false,
+        observedProcessIds: [],
+        executeCommandMayHaveBeenDelivered: false,
+        launcherExitObserved: true,
+      }),
+      requestExit: async () => true,
+    }));
+
+    await expect(executor.start()).rejects.toThrow();
+    // No identifier may become visible: the persisted record is the only
+    // source of the process generation, and none was bound to the caller.
+    expect(() => factory.processGenerationIdFor(MODULE_GENERATION_ID))
+      .toThrow(/does not have a process generation/u);
+    expect(records.log[0]).toBe("allocate");
+    expect(records.current?.state).toBe("stopped");
+    expect(records.getModuleProcessRecord(PROCESS_IDENTITY.processGenerationId))
+      .toBeUndefined();
     expect(records.log).not.toContain("append");
   });
 });

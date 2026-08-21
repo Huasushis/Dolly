@@ -563,8 +563,10 @@ export interface InstalledLinuxExtensionModuleGenerationFactory {
     moduleGenerationId: string,
   ) => ModuleExecutor<ReactiveModuleInput, ReactiveModuleResult>;
   /**
-   * Returns the exact process generation that owns submissions from this
-   * Module generation. It is unavailable until `createExecutor` succeeds.
+   * Returns the exact durable process generation that owns submissions from
+   * this Module generation. It is unavailable until the executor start has
+   * bound the persisted process record's identifier: the caller-generated
+   * allocator input is never returned.
    */
   readonly processGenerationIdFor: (moduleGenerationId: string) => string;
   /**
@@ -592,7 +594,10 @@ function processGenerationTimestamp(wallClockNow: () => number): string {
 /**
  * Owns the one-to-one Module-generation to process-generation mapping used by
  * both executor creation and durable submission records. Creating the factory
- * or an executor starts no process; `ModuleActor` remains the owner of start.
+ * or an executor starts no process; `ModuleActor` remains the owner of start,
+ * and the mapping is bound only when start exposes the persisted process
+ * record through Host configuration. The caller-generated allocator input is
+ * never visible to mapping consumers.
  */
 export function createInstalledLinuxExtensionModuleGenerationFactory(
   options: InstalledLinuxExtensionModuleGenerationFactoryOptions,
@@ -613,15 +618,21 @@ export function createInstalledLinuxExtensionModuleGenerationFactory(
     (() => `process-${randomUUID()}`);
   const wallClockNow = wallClockNowOption ?? Date.now;
   const processByModuleGeneration = new Map<string, string>();
+  const executorModuleGenerations = new Set<string>();
   const usedProcessGenerations = new Set<string>();
   const hostByProcessGeneration = new Map<string, ExtensionProcessHost>();
 
   const createExecutor = (
     moduleGenerationId: string,
   ): ModuleExecutor<ReactiveModuleInput, ReactiveModuleResult> => {
-    if (processByModuleGeneration.has(moduleGenerationId)) {
+    if (executorModuleGenerations.has(moduleGenerationId)) {
       throw new TypeError(
         `Module generation ${moduleGenerationId} already has an installed Linux executor`,
+      );
+    }
+    if (processByModuleGeneration.has(moduleGenerationId)) {
+      throw new TypeError(
+        `Module generation ${moduleGenerationId} already has a bound process generation`,
       );
     }
     const processGenerationId = nextProcessGenerationId();
@@ -681,7 +692,7 @@ export function createInstalledLinuxExtensionModuleGenerationFactory(
         processByModuleGeneration.set(moduleGenerationId, durableProcessGenerationId);
       },
     });
-    processByModuleGeneration.set(moduleGenerationId, processGenerationId);
+    executorModuleGenerations.add(moduleGenerationId);
     return executor;
   };
 
