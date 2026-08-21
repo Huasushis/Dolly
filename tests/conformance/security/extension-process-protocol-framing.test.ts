@@ -13,7 +13,21 @@ function frame(text: string): Buffer {
   return result;
 }
 
-describe("extension process protocol length-prefixed JSON framing", () => {
+function exercise(text: string, maxFrameBytes = 1_024) {
+  const inbound = new PassThrough();
+  const outbound = new PassThrough();
+  const messages: unknown[] = [];
+  const errors: FramedJsonError[] = [];
+  const channel = new FramedJsonChannel(inbound, outbound, {
+    maxFrameBytes,
+    onMessage: (message) => messages.push(message),
+    onError: (error) => errors.push(error),
+  });
+  inbound.write(frame(text));
+  return { channel, inbound, outbound, messages, errors };
+}
+
+describe("extension process protocol length-prefixed JSON framing (TST-PROTO-002 depth)", () => {
   it("parses fragmented and adjacent frames without newline assumptions", async () => {
     const inbound = new PassThrough();
     const outbound = new PassThrough();
@@ -34,74 +48,139 @@ describe("extension process protocol length-prefixed JSON framing", () => {
   });
 
   it("rejects duplicate object keys before JSON.parse can overwrite them", () => {
-    const inbound = new PassThrough();
-    const outbound = new PassThrough();
-    const onMessage = vi.fn();
-    const onError = vi.fn();
-    const channel = new FramedJsonChannel(inbound, outbound, {
-      maxFrameBytes: 1_024,
-      onMessage,
-      onError,
-    });
-    inbound.write(frame('{"jsonrpc":"2.0","id":"one","id":"forged"}'));
-    expect(onMessage).not.toHaveBeenCalled();
-    expect(onError).toHaveBeenCalledWith(
-      expect.objectContaining({ code: "FRAME_JSON_INVALID" }),
+    const { inbound, messages, errors } = exercise(
+      '{"jsonrpc":"2.0","a":1,"a":2}',
     );
-    channel.close();
+    expect(messages).toEqual([]);
+    expect(errors.map((error) => error.code)).toEqual(["FRAME_JSON_INVALID"]);
+    inbound.end();
   });
 
-  it("accepts a complete frame nested at the 96-level JSON limit", () => {
-    const inbound = new PassThrough();
-    const outbound = new PassThrough();
-    const onMessage = vi.fn();
-    const onError = vi.fn();
-    const channel = new FramedJsonChannel(inbound, outbound, {
-      maxFrameBytes: 1_024,
-      onMessage,
-      onError,
-    });
-    const depth96 = "[".repeat(96) + "1" + "]".repeat(96);
-    inbound.write(frame(depth96));
-    expect(onMessage).toHaveBeenCalledTimes(1);
-    expect(onError).not.toHaveBeenCalled();
-    channel.close();
-  });
-
-  it("rejects a complete frame nested at depth 97 with FRAME_JSON_INVALID", () => {
-    const inbound = new PassThrough();
-    const outbound = new PassThrough();
-    const onMessage = vi.fn();
-    const onError = vi.fn();
-    const channel = new FramedJsonChannel(inbound, outbound, {
-      maxFrameBytes: 1_024,
-      onMessage,
-      onError,
-    });
-    const depth97 = "[".repeat(97) + "1" + "]".repeat(97);
-    inbound.write(frame(depth97));
-    expect(onMessage).not.toHaveBeenCalled();
-    expect(onError).toHaveBeenCalledWith(
-      expect.objectContaining({ code: "FRAME_JSON_INVALID" }),
+  it("accepts a complete frame at the 96-level limit, top-level container counted as 1", () => {
+    const { inbound, messages, errors } = exercise(
+      "[".repeat(96) + "1" + "]".repeat(96),
     );
+    expect(messages.length).toBe(1);
+    expect(errors).toEqual([]);
+    inbound.end();
+  });
+
+  it("rejects an array frame nested to depth 97 with FRAME_TOO_DEEP and latches the connection", () => {
+    const { channel, inbound, outbound, messages, errors } = exercise(
+      "[".repeat(97) + "1" + "]".repeat(97),
+    );
+    expect(messages).toEqual([]);
+    expect(errors.map((error) => error.code)).toEqual(["FRAME_TOO_DEEP"]);
+    // The over-depth rejection must not leak payload bytes onto the stream.
+    expect(outbound.readableLength).toBe(0);
+    // A subsequent valid frame cannot recover the latched connection.
+    inbound.write(frame('{"jsonrpc":"2.0","id":"ok","method":"ping"}'));
+    expect(messages).toEqual([]);
+    expect(outbound.readableLength).toBe(0);
     channel.close();
   });
 
-  it("rejects an over-limit length from the four-byte header without waiting for a body", () => {
+  it("rejects an object frame nested to depth 97 with FRAME_TOO_DEEP", () => {
+    const { inbound, messages, errors } = exercise(
+      "[".repeat(96) + '[{"jsonrpc":"2.0","id":"x","params":{}}]' + "]".repeat(96),
+    );
+    expect(messages).toEqual([]);
+    expect(errors.map((error) => error.code)).toEqual(["FRAME_TOO_DEEP"]);
+  });
+
+  it("returns FRAME_TOO_DEEP when arrays and objects both exceed 96", () => {
+    const { inbound, messages, errors } = exercise(
+      "[".repeat(95) + '{"jsonrpc":"2.0","id":"x","params":{}}' + "]".repeat(95),
+    );
+    expect(messages).toEqual([]);
+    expect(errors.map((error) => error.code)).toEqual(["FRAME_TOO_DEEP"]);
+    inbound.end();
+  });
+
+  it("ignores brackets, escaped quotes, and backslashes inside strings when measuring depth", () => {
+    // Structural depth is 2: string content carries many brackets and both
+    // escape forms, none of which count as containers.
+    const payload = JSON.stringify([
+      "[[[{{{" + "[\"{[\\\"escaped\\\"]}\"" + "]]]}}}",
+      "[{]}",
+      '\\"\\\\[',
+    ]);
+    const inbound = new PassThrough();
+    const messages: unknown[] = [];
+    const errors: FramedJsonError[] = [];
+    void errors;
+    const outbound = new PassThrough();
+    const channel = new FramedJsonChannel(inbound, outbound, {
+      maxFrameBytes: 1_024,
+      onMessage: (message) => messages.push(message),
+      onError: vi.fn(),
+    });
+    inbound.write(frame(payload));
+    expect(messages.length).toBe(1);
+    channel.close();
+  });
+
+  it("accepts UTF-8 multi-byte characters inside strings without misreading structural bytes", () => {
+    const { inbound, messages, errors } = exercise(
+      JSON.stringify({ key: '中文[你好]{{{"quoted"}]]]' }),
+    );
+    expect(messages.length).toBe(1);
+    expect(errors).toEqual([]);
+    inbound.end();
+  });
+
+  it("does not echo a payload nor emit further frames after an over-deep rejection", async () => {
+    const { channel, inbound, outbound, messages, errors } = exercise(
+      "[".repeat(97) + '{"jsonrpc":"2.0","id":"deep","method":"x"}' + "]".repeat(97),
+      // The payload itself is small; nesting, not bytes, exceeds the limit.
+      64 * 1024,
+    );
+    expect(messages).toEqual([]);
+    expect(errors.map((error) => error.code)).toEqual(["FRAME_TOO_DEEP"]);
+    expect(outbound.readableLength).toBe(0);
+    // The channel is latched: a later well-formed frame is dropped and send()
+    // reports the channel unusable rather than emitting an extension message.
+    inbound.write(frame('{"jsonrpc":"2.0","id":"ok","method":"ping"}'));
+    expect(messages).toEqual([]);
+    expect(outbound.readableLength).toBe(0);
+    expect(channel.closed).toBe(false);
+    await expect(
+      channel.send({ jsonrpc: "2.0", id: "s", method: "ping" }),
+    ).rejects.toMatchObject({ code: "FRAME_CHANNEL_CLOSED" });
+    channel.close();
+  });
+
+  it("rejects an over-limit length from the four-byte header before the body arrives", () => {
+    const { channel, inbound, outbound, messages, errors } = exercise(
+      "x".repeat(20),
+      16,
+    );
+    expect(messages).toEqual([]);
+    expect(errors.map((error) => error.code)).toEqual(["FRAME_LENGTH_INVALID"]);
+    expect(outbound.readableLength).toBe(0);
+    channel.close();
+  });
+
+  it("rejects non-UTF8 bytes with FRAME_UTF8_INVALID before any depth handling", () => {
+    const payload = Buffer.concat([
+      Buffer.from('[{"jsonrpc":"2.0","id":"u","method":"ping","s":"'),
+      Buffer.from([0xff]),
+      Buffer.from('"}]'),
+    ]);
+    const inboundBytes = Buffer.allocUnsafe(4 + payload.byteLength);
+    inboundBytes.writeUInt32BE(payload.byteLength, 0);
+    payload.copy(inboundBytes, 4);
     const inbound = new PassThrough();
     const outbound = new PassThrough();
-    const onError = vi.fn();
+    const errors: FramedJsonError[] = [];
     const channel = new FramedJsonChannel(inbound, outbound, {
-      maxFrameBytes: 16,
+      maxFrameBytes: 64 * 1024,
       onMessage: vi.fn(),
-      onError,
+      onError: (error) => errors.push(error),
     });
-    const header = Buffer.allocUnsafe(4);
-    header.writeUInt32BE(17, 0);
-    inbound.write(header);
-    expect(onError).toHaveBeenCalledWith(
-      expect.objectContaining({ code: "FRAME_LENGTH_INVALID" }),
-    );
+    inbound.write(inboundBytes);
+    expect(errors.map((error) => error.code)).toEqual(["FRAME_UTF8_INVALID"]);
+    expect(outbound.readableLength).toBe(0);
     channel.close();
   });
 });
