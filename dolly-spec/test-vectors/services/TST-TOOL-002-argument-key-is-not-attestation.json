@@ -1,7 +1,7 @@
 {
   "schema": "dolly.test-vector/v1",
   "test_id": "TST-TOOL-002",
-  "kind": "service",
+  "kind": "crash_recovery",
   "covers": ["REQ-TOOL-001", "REQ-TOOL-002"],
   "initial": {
     "side_effect_class": "idempotent_write",
@@ -16,16 +16,24 @@
       "value": "example"
     },
     "ledger_state": "DISPATCHED",
+    "ledger_revision": 2,
+    "outbound_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "server_effect_count": 1,
     "authoritative_response_lost": true
   },
   "stimulus": {
-    "event": "recover_after_dispatch_without_authoritative_result"
+    "events": [
+      "host_process_killed",
+      "database_reopened_and_nonterminal_rows_recovered"
+    ]
   },
   "expected": {
     "outcome": "argument_key_does_not_authorize_redispatch",
     "assertions": [
       {"path": "/operation_id", "op": "unchanged"},
+      {"path": "/ledger_revision", "op": "equals", "value": 3},
+      {"path": "/outbound_digest", "op": "unchanged"},
+      {"path": "/recreated_send_permit_count", "op": "equals", "value": 0},
       {"path": "/automatic_redispatch_count", "op": "equals", "value": 0},
       {"path": "/server_effect_count", "op": "equals", "value": 1},
       {"path": "/ledger_state", "op": "equals", "value": "UNKNOWN"},

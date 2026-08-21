@@ -139,12 +139,20 @@ stopping Core or unrelated servers.
 
 `host.tool.invoke` MUST conform to
 [`tool-invoke.schema.json`](../../../schemas/tool-invoke.schema.json). The Host
-binds its `module_id`, `activation_id`, lease, and `config_revision` to the
-current authenticated Activation; resolves the exact retained registry
-revision; checks Module/server/tool enablement, `host.tools.invoke` capability,
-arguments, schema digest, side-effect class, confirmation, limits, and deadline;
-then durably inserts an accepted operation binding and `AUTHORIZED` ledger
-state before dispatch.
+binds its instance, `module_id`, `activation_id`, lease generation, and
+`config_revision` to the current authenticated Activation; resolves the exact
+retained registry revision; checks Module/server/tool enablement,
+`host.tools.invoke` capability, arguments, schema digest, side-effect class,
+confirmation, limits, and deadline; and selects one exact Ready server
+generation.
+
+The **Tool call ledger** is the Host-owned durable set of accepted Tool
+operations and their dispositions. It is authority for whether one operation
+may cross the Tool transport boundary; a trace, adapter object, queue item,
+response, acknowledgement, or server log is not. Each accepted row is the
+closed record
+[`dolly.tool-call-ledger/v1`](../../../schemas/tool-call-ledger-record.schema.json)
+in the instance's authoritative Runtime SQLite database.
 
 Identity comparison and resolved execution use two different digests. Let `P`
 be the complete `host.tool.invoke` params after removing only `operation_id`,
@@ -158,121 +166,238 @@ The Host first looks up `(authenticated_module_id, operation_id)`. If a row
 exists, it compares the stored `request_digest` without resolving any current
 registry or generation: an equal digest returns the recorded state/result, and
 a different digest returns `TOOL_IDEMPOTENCY_CONFLICT` without changing the
-row. Only when the scoped identity is absent does the Host perform current
-authorization and resolution.
+row. A repeated request's excluded deadline and lease token do not mutate an
+existing row or refresh its accepted deadline. Only when the scoped identity is
+absent does the Host perform current authorization and resolution.
 
-After every registry, schema, generation, capability, argument, confirmation,
-limit, and deadline check succeeds, the Host constructs this exact accepted
-binding:
+After every check succeeds, the Host constructs the exact closed
+[`dolly.tool-operation-binding/v1`](../../../schemas/tool-operation-binding.schema.json).
+That binding freezes the Host-owned instance and authenticated identity fields,
+Activation lease generation, accepted deadline, caller arguments and
+idempotency key, exact registry Server object, selected server generation,
+confirmation decision, and one Host-assigned `server_request_id`. The binding
+MUST also satisfy these semantic checks:
+
+- `server_contract` is byte-for-byte JCS-equal to the exact Server object in
+  `config_revision`, and its `tools[tool_name]` entry exists and equals the
+  authorized tool;
+- the stored schema digest, side-effect class, and idempotency policy equal that
+  tool entry; an `argument_key` pointer resolves in the stored arguments to the
+  exact stored key, while policy `none` has a null key;
+- the selected generation is Ready for that retained revision and server; and
+- the confirmation decision is `not_required` exactly when the selected tool
+  does not require confirmation; otherwise it is the consumed approval ID bound
+  to the operation digest.
+
+`operation_digest` is
+`sha256(JCS(complete dolly.tool-operation-binding/v1 object))`. The Host inserts
+the binding, `request_digest`, `operation_digest`, state `AUTHORIZED`, and
+`ledger_revision = 1` in one SQLite transaction. Any single-use confirmation
+consumption occurs in that same transaction. The operation is accepted only
+after commit succeeds. A pre-authorization denial creates no Tool-call row.
+`tool_transaction_id` groups the proposal, result, and dependent model turn but
+does not authorize another operation.
+
+For the built-in v1 MCP adapter, the exact outbound application payload is the
+UTF-8 JCS encoding of:
 
 ```text
 {
-  "schema": "dolly.tool-operation-binding/v1",
-  "request_digest": <request_digest>,
-  "tool_server_generation": <selected generation>,
-  "server_contract": <exact closed Server object from the retained registry>,
-  "confirmation_decision": <"not_required" or the approved confirmation ID>
+  "jsonrpc": "2.0",
+  "id": binding.server_request_id,
+  "method": "tools/call",
+  "params": {
+    "name": binding.server_contract.tools[binding.tool_name].upstream_name,
+    "arguments": binding.arguments
+  }
 }
 ```
 
-`operation_digest` is the SHA-256 of the JCS bytes of that object. The Host
-persists the binding, `request_digest`, and `operation_digest` atomically with
-`AUTHORIZED`. It never re-resolves an existing identity against a newer
-registry. `tool_transaction_id` groups the proposal, result, and dependent
-model turn but does not authorize another operation.
+`outbound_digest` is the SHA-256 digest of those exact bytes. Transport framing,
+HTTP headers, and TLS bytes are not part of that digest, but none of those
+request bytes may become eligible for send before the durable transition in
+section 6. The adapter MUST recompute the payload and digest from the stored
+binding rather than a mutable discovery result or queue object.
 
 `REQ-TOOL-005` — Tool identity comparison MUST use the pre-resolution
-`request_digest`; an accepted row MUST additionally freeze the complete
-resolved operation binding and its digest. A pre-authorization denial MUST NOT
-create a Tool call row, and an identity conflict MUST NOT mutate the existing
-row.
+`request_digest`; an accepted row MUST additionally freeze the complete closed
+operation binding and its digest. A pre-authorization denial MUST NOT create a
+Tool call row, and an identity conflict MUST NOT mutate the existing row.
 
 The v1 idempotency policy is a closed tagged union. Every `read_only`,
-`non_idempotent_write`, and `unknown` tool has exactly `{"kind":"none"}`.
-Every `idempotent_write` has exactly
-`{"kind":"argument_key","argument_pointer":"/..."}`. The pointer is RFC
-6901 into the complete caller-supplied `arguments` object. It MUST resolve to a
+`non_idempotent_write`, and `unknown` tool has exactly `{"kind":"none"}` and a
+null invoke key. Every `idempotent_write` has exactly
+`{"kind":"argument_key","argument_pointer":"/..."}`. The pointer is RFC 6901
+into the complete caller-supplied `arguments` object. It MUST resolve to a
 string exactly equal to `host.tool.invoke.idempotency_key`; the Host does not
 insert, replace, normalize, or remove that argument before upstream dispatch.
-Missing, non-string, or unequal values are `TOOL_INPUT_INVALID` and no dispatch
-occurs. The same operation always transmits byte-identical arguments and key.
-`server_status` is not a v1 mechanism; adding it requires a versioned status
-request/result mapping and a new schema.
+Missing, non-string, or unequal values are `TOOL_INPUT_INVALID` and no accepted
+row or dispatch occurs.
 
-An `argument_key` binding proves only that Dolly sent the caller's exact key in
+An `argument_key` binding proves only that Dolly sends the caller's exact key in
 the configured argument. It is not evidence that an upstream server durably
 deduplicates that key, retains a disposition, or returns the original result.
 MCP discovery does not attest those properties, and the v1 registry defines no
 attestation authority, retention contract, or upstream status mapping from
-which the Host could infer them.
+which the Host could infer them. `server_status` is not a v1 mechanism; adding
+it requires a versioned status request/result mapping and a new schema.
 
-No v1 Tool class may therefore be automatically redispatched after the durable
-`DISPATCHED` marker. This includes `read_only` and `idempotent_write`: their
-labels do not prove that a second observation is identical, free, or
-side-effect-free in the concrete server. Replay of the identical semantic
-operation under the original identity is allowed only after a Module-scoped
-`absent` Host-ledger result proves that Dolly never recorded or dispatched it;
-only the explicitly excluded lease token and deadline may be refreshed. Required
-confirmation must name a live, single-use approval bound to the operation
-digest; approval for one call cannot authorize another.
+No v1 Tool class may be automatically redispatched after `DISPATCHED`. This
+includes `read_only` and `idempotent_write`: their labels do not prove that a
+second observation is identical, free, or side-effect-free in the concrete
+server. An `absent` status result is only a scoped read observation; it never
+authorizes dispatch or redispatch. A later invoke can create an operation only
+through the absent-row authorization transaction above. Required confirmation
+must name a live, single-use approval bound to the operation digest; approval
+for one call cannot authorize another.
 
 `REQ-TOOL-002` — Once a Tool operation reaches `DISPATCHED`, loss of an
 authoritative result MUST become `TOOL_EXTERNAL_OUTCOME_UNKNOWN` without
-automatic redispatch for every v1 side-effect class. `idempotent_write` and
-`argument_key` MUST NOT be treated as a durable-deduplication attestation. A
-future post-dispatch replay mechanism requires a versioned proof schema,
-verifier authority, server/transport/schema binding, retention guarantee, and
-reconciliation contract.
+automatic redispatch for every v1 side-effect class. `DISPATCHED`, transport
+ambiguity, a result, acknowledgement, error, timeout, or `absent` lookup MUST
+NOT authorize redispatch. `idempotent_write` and `argument_key` MUST NOT be
+treated as a durable-deduplication attestation. A future post-dispatch replay
+mechanism requires a versioned proof schema, verifier authority,
+server/transport/schema binding, retention guarantee, and reconciliation
+contract.
 
-## 6. Result, status, and unknown outcomes
+## 6. Durable transitions, result, status, and recovery
 
-The durable Host Tool-call ledger states are `AUTHORIZED`, `DISPATCHED`,
-`SUCCEEDED`, `FAILED`, and `UNKNOWN`. The transition to `DISPATCHED`, selected
-generation, and exact outbound digest MUST be durable before any request byte
-is eligible for transport. A crash or timeout after that point is not evidence
-of non-execution. A wire status of `denied` is a pre-authorization response and
-does not create a new Tool-call row; it may be retained in audit and Extension
-model-trace records, but a Host status lookup for that candidate identity is
-`absent`.
+The durable states are `AUTHORIZED`, `DISPATCHED`, `SUCCEEDED`, `FAILED`, and
+`UNKNOWN`. `AUTHORIZED` means no request byte is eligible for transport.
+`DISPATCHED` is the durable **send-possible** boundary: it permits at most one
+send attempt but does not assert that any byte was sent or applied. The only
+forward transitions are:
 
-An accepted `AUTHORIZED` row remains bound to its frozen generation and may
-wait only within its deadline; it cannot fall forward to a replacement
-generation. If that generation becomes unusable, the deadline expires, or a
-reserved pre-dispatch resource is lost before `DISPATCHED`, the Host first
-proves from the state transition and transport fence that zero request bytes
-were eligible for transmission. It then durably terminates the accepted row as
-`FAILED` with `TOOL_DISPATCH_NOT_APPLIED`. If zero-byte non-application cannot
-be proved, the Host MUST first treat the dispatch boundary as crossed and use
-`TOOL_EXTERNAL_OUTCOME_UNKNOWN`.
+```text
+AUTHORIZED -> DISPATCHED -> SUCCEEDED | FAILED | UNKNOWN
+AUTHORIZED -> FAILED
+```
 
-`REQ-TOOL-006` — Failure after `AUTHORIZED` but before `DISPATCHED` MUST
-preserve the accepted binding. It terminates as
-`TOOL_DISPATCH_NOT_APPLIED` only with authoritative proof that no request byte
-was eligible or sent; any ambiguity is `TOOL_EXTERNAL_OUTCOME_UNKNOWN`.
+The direct `AUTHORIZED -> FAILED` transition is permitted only for
+`TOOL_DISPATCH_NOT_APPLIED` with the zero-byte proof below. Terminal rows are
+immutable. Every transition is a compare-and-set on the exact
+`(module_id, operation_id, ledger_revision, state)` and increments
+`ledger_revision` by one in the same transaction. A stale compare-and-set
+changes nothing: the caller rereads the authoritative row and applies its
+recorded disposition. It never retries the stale write or creates another row.
+
+To cross the dispatch boundary, the Broker holds the exact generation's
+exclusive transport fence, rechecks that the stored generation is still Ready
+and the stored deadline and resources remain valid, and recomputes the exact
+outbound bytes and digest from the stored binding. It then commits a
+compare-and-set from
+`AUTHORIZED` to `DISPATCHED` with that `outbound_digest`. Only a successful,
+unambiguous SQLite commit may release one in-memory, one-use send permit bound
+to the operation key, new ledger revision, server generation,
+`server_request_id`, and outbound digest. The sender MUST require and consume
+that permit before the first application, framing, HTTP, or TLS request byte.
+No queue insertion, socket ownership, connection setup that emits request
+bytes, or adapter write path may bypass this gate. The send fence is held until
+the permit is consumed or destroyed.
+
+An unknown SQLite commit acknowledgement releases no permit. On reread,
+`AUTHORIZED` remains eligible for the same compare-and-set because zero bytes
+were eligible; `DISPATCHED` is conservatively send-possible and MUST NOT
+recreate a permit. This deliberately permits an unknown external outcome even
+when a particular crash happened before a physical write.
+
+A schema-valid, digest-valid `AUTHORIZED` row plus the verified exclusive send
+gate is authoritative zero-byte proof. The Broker may continue that same
+operation—not create or redispatch another operation—only to its exact stored
+generation, before its stored deadline, by the `AUTHORIZED -> DISPATCHED`
+transaction. If the frozen generation is unavailable or stale, the deadline
+expired, or a reserved pre-dispatch resource was lost, that proof instead
+permits `AUTHORIZED -> FAILED` with `TOOL_DISPATCH_NOT_APPLIED`. A replacement
+generation is never selected. If the implementation cannot establish the
+zero-byte proof, it MUST durably cross to `DISPATCHED` without releasing a send
+permit and then terminate `UNKNOWN`.
+
+`REQ-TOOL-006` — Failure or reopen after `AUTHORIZED` but before `DISPATCHED`
+MUST preserve the accepted binding. The same operation may proceed to its exact
+frozen generation only from authoritative zero-byte proof and a successful
+dispatch compare-and-set. It terminates as `TOOL_DISPATCH_NOT_APPLIED` only
+with that proof; any ambiguity crosses the durable dispatch boundary and
+becomes `TOOL_EXTERNAL_OUTCOME_UNKNOWN`. No replacement generation, fresh
+deadline, response, acknowledgement, error, timeout, or absence authorizes
+dispatch.
 
 The Broker validates and bounds the complete response before `SUCCEEDED`.
-Transport/provider IDs are audit correlation, not Dolly operation identity.
-It may accept a late response only from the already dispatched request on the
-retained generation and only while that operation is still nonterminal. It
-MUST NOT issue a second request or an upstream status call to manufacture a
-disposition. A lost or ambiguous result is terminal `UNKNOWN`; it MUST NOT be
-relabeled failed or silently retried.
+Response acceptance requires an exact match to the stored operation key,
+server ID, server generation, `server_request_id`, and outbound digest, and
+requires the row still to be `DISPATCHED`. A stale-generation, duplicate,
+cross-request, or cross-Module response cannot settle any row; it is retained
+as bounded security evidence and causes no transition. A valid terminal
+transition stores the complete schema-valid `ToolResult`,
+`terminal_result_digest = sha256(JCS(ToolResult))`, and the new record digest in
+one transaction. A lost terminal-commit acknowledgement is resolved by reread
+and returns the exact stored result.
+
+Transport/provider IDs are audit correlation, not Dolly operation identity. A
+late response is accepted only from the one already dispatched request while
+the operation remains nonterminal. The Broker MUST NOT issue a second request
+or an upstream status call to manufacture a disposition. A lost or ambiguous
+result is terminal `UNKNOWN`; it MUST NOT be relabeled failed or silently
+retried.
+
+On database reopen, after SQLite integrity, foreign-key, schema, canonical-byte,
+and digest checks succeed and before the Tool Broker becomes Ready, the Host
+enumerates every `AUTHORIZED` and `DISPATCHED` row in deterministic
+`(module_id, operation_id)` order. Enumeration MAY use bounded batches, but v1
+sets no global bound on the number of retained Tool operations and every
+nonterminal row must be visited.
+
+`recover_operation(record, facts)` is a pure recovery decision: it performs no
+I/O and reads no current registry. Its verified `facts` input contains only the
+record's exact-generation availability, whether its stored deadline has
+expired, and whether the exclusive send gate establishes zero-byte proof. It
+returns:
+
+```text
+AUTHORIZED + proof + exact generation Ready + live deadline
+    -> propose DISPATCHED and one send permit after successful CAS
+AUTHORIZED + proof + unusable generation/deadline/resource
+    -> propose FAILED / TOOL_DISPATCH_NOT_APPLIED
+AUTHORIZED + no proof
+    -> propose DISPATCHED with no permit, then UNKNOWN
+DISPATCHED
+    -> propose UNKNOWN / TOOL_EXTERNAL_OUTCOME_UNKNOWN
+terminal
+    -> no change
+```
+
+The caller rechecks the proposed transition by compare-and-set. A stale
+proposal is discarded and the pure decision is rerun on the new row. Recovery
+never recreates a send permit for a row already observed as `DISPATCHED`.
+
+Every load validates the closed ledger schema and recomputes the record,
+operation, outbound when present, and terminal-result digests. It also checks
+that indexed identity fields equal the canonical record, revisions do not
+regress or skip, the instance equals `core_meta`, and the referenced Activation
+and configuration exist. Any mismatch, impossible state/field combination,
+duplicate transport correlation, or bytes observed from the wrong request is
+`STORAGE_CORRUPT`: writable startup or transition stops without deletion,
+repair, redispatch, or fabricated terminal disposition. An unsupported ledger
+schema version is `STORAGE_MIGRATION_REQUIRED`, never an implicit reinterpretation.
 
 `host.tool.status` reads the Host ledger and never invokes, retries, cancels, or
-advances the operation. The Host first authenticates the connection and MUST
-require `request.module_id` to equal that authenticated Module. It then looks
-up exactly the composite key `(authenticated_module_id,
-target_operation_id)`. A missing composite key returns `absent`, even if a
-different Module has a row with the same UUID; the Host MUST NOT perform a
-global UUID lookup or reveal that other row's existence. For a present row,
-the returned `ToolResult.operation_id` equals `target_operation_id`, the
-original invoke identity. The result contains no independently trusted Module
-echo.
+advances an operation. The Host first authenticates the connection and requires
+`request.module_id` to equal that authenticated Module. It looks up exactly
+`(authenticated_module_id, target_operation_id)`. A missing composite key
+returns `absent`, even if another Module has the same UUID, and reveals no other
+row. For a present row, `ToolResult.operation_id` is the original invoke
+identity. The result contains no independently trusted Module echo.
 
 `REQ-TOOL-004` — Tool invocation and status identity is scoped by the
 authenticated Module. A status lookup MUST reveal only the exact
 `(module_id,target_operation_id)` row and MUST return indistinguishable
 `absent` for a same UUID owned by another Module.
+
+V1 defines no Tool-call-ledger deletion, pruning, operation-ID reuse, or
+terminal-result cleanup authority. Terminal rows therefore remain authoritative.
+A future cleanup policy requires an explicit versioned retention and
+referential-integrity contract; this chapter makes no globally bounded storage
+claim.
 
 ## 7. Configuration transactions
 
@@ -371,19 +496,34 @@ unproved failure at or after the durable dispatch marker is
 `TOOL_EXTERNAL_OUTCOME_UNKNOWN`. These mappings cannot be weakened by an
 upstream server error string. All errors use the common envelope.
 
-Tests MUST cover registry digest recomputation, unconfigured discovery,
-duplicate/renamed tools, non-object input schemas, malicious schemas, stdio
-package/executable substitution and path/shell/env injection,
-HTTP SSRF/redirect/DNS rebinding/TLS policy, startup and crash loops, stale
-generation responses, both v1 idempotency policy variants, argument-pointer/key
+The following crash/reopen vectors are mandatory storage-writer gates:
+
+| Vector | Required reopened observation |
+| --- | --- |
+| `TST-TOOL-001` | a disconnected `DISPATCHED` call becomes immutable `UNKNOWN`; no send permit or redispatch |
+| `TST-TOOL-002` | an `argument_key` call reopened after dispatch becomes `UNKNOWN`; the key is not attestation |
+| `TST-TOOL-006` | an `AUTHORIZED` call whose exact generation is lost becomes `FAILED` only from zero-byte proof |
+| `TST-TOOL-009` | an `AUTHORIZED` call with proof and the exact Ready generation performs one successful dispatch CAS and at most one send |
+| `TST-TOOL-010` | loss of the dispatch-commit acknowledgement recreates no send permit; a durable `DISPATCHED` row becomes `UNKNOWN` |
+| `TST-TOOL-011` | loss of a terminal-commit acknowledgement returns the exact stored terminal result and digest |
+| `TST-TOOL-012` | a record/schema/digest/index mismatch blocks writable Tool Broker readiness as `STORAGE_CORRUPT` |
+| `TST-TOOL-013` | stale CAS and wrong-generation/request responses leave the authoritative row unchanged |
+
+Tests MUST also cover closed binding/ledger schema rejection, record and
+terminal-result digest recomputation, registry digest recomputation,
+unconfigured discovery, duplicate/renamed tools, non-object input schemas,
+malicious schemas, stdio package/executable substitution and path/shell/env
+injection, HTTP SSRF/redirect/DNS rebinding/TLS policy, startup and crash loops,
+stale generation and cross-request responses, compare-and-set races and
+revision gaps, both v1 idempotency policy variants, argument-pointer/key
 mismatch, proof that an argument key is not a replay attestation, confirmation
 races, same-ID terminal-result replay versus fresh-ID reauthorization,
-same-target-UUID cross-Module status non-disclosure,
-failure between authorization and dispatch, kill before and after the durable
-dispatch marker, lost responses and status
-reconciliation, output prompt injection/size/schema rejection, registry hot
-update with in-flight calls, secret redaction, and proof that no tool result can
-grant capability or mutate Core outside the requesting Activation. They MUST
-also reject a configured protocol other than `2025-06-18`, a server-selected
-version mismatch, version-foreign lifecycle frames, and an
+same-target-UUID cross-Module status non-disclosure, proof that `absent` grants
+no dispatch authority, failure between authorization and dispatch, kill before
+and after the durable dispatch marker, lost commit acknowledgements, lost
+responses and status reconciliation, output prompt injection/size/schema
+rejection, registry hot update with in-flight calls, secret redaction, and proof
+that no tool result can grant capability or mutate Core outside the requesting
+Activation. They MUST reject a configured protocol other than `2025-06-18`, a
+server-selected version mismatch, version-foreign lifecycle frames, and an
 `input_required` result without ever issuing a continuation request.

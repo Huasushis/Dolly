@@ -1,0 +1,46 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-TOOL-011",
+  "kind": "crash_recovery",
+  "covers": ["REQ-TOOL-001", "REQ-TOOL-003", "INV-STORAGE-017"],
+  "initial": {
+    "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000351",
+    "request_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "ledger_state": "DISPATCHED",
+    "ledger_revision": 2,
+    "outbound_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "terminal_result": {
+      "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000351",
+      "status": "succeeded",
+      "output": {"value": "accepted"},
+      "error": null,
+      "server_request_id": "0198ab31-6c44-7e8a-b2bb-000000000451"
+    },
+    "terminal_result_digest": "sha256:16a7c3df54bbb8cac41d1c44b9b14fe314dc3cf1b263e8c81f8495c174721b53"
+  },
+  "stimulus": {
+    "events": [
+      "terminal_compare_and_set_commits_revision_3",
+      "sqlite_commit_acknowledgement_lost",
+      "host_process_killed",
+      "database_reopened",
+      "same_identity_invoked"
+    ]
+  },
+  "expected": {
+    "outcome": "exact_terminal_result_replayed_after_reopen",
+    "assertions": [
+      {"path": "/operation_id", "op": "unchanged"},
+      {"path": "/request_digest", "op": "unchanged"},
+      {"path": "/ledger_state", "op": "equals", "value": "SUCCEEDED"},
+      {"path": "/ledger_revision", "op": "equals", "value": 3},
+      {"path": "/terminal_result", "op": "unchanged"},
+      {"path": "/terminal_result_digest", "op": "unchanged"},
+      {"path": "/row_mutation_count_after_reopen", "op": "equals", "value": 0},
+      {"path": "/recreated_send_permit_count", "op": "equals", "value": 0},
+      {"path": "/automatic_redispatch_count", "op": "equals", "value": 0}
+    ],
+    "emitted": [],
+    "crash_label": "tool_terminal_commit_ack_lost"
+  }
+}

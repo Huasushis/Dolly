@@ -210,20 +210,24 @@ authoritative Host Tool-call ledger begins only at `AUTHORIZED`; a `DENIED`
 trace result creates no Host call row.
 
 ```text
-PROPOSED -> AUTHORIZED -> DISPATCHED -> SUCCEEDED
-                      |            -> FAILED
-                      |            -> UNKNOWN
-                      -> DENIED
+PROPOSED -> DENIED
+         -> AUTHORIZED -> DISPATCHED -> SUCCEEDED
+                       |            -> FAILED
+                       |            -> UNKNOWN
+                       -> FAILED
 ```
 
-The canonical `tool_transaction_id` and `tool_call_id` identify one Tool
-operation and MUST remain stable when an `absent` Host-ledger result proves
-that original request was never recorded or dispatched. No v1 Tool class is
-automatically redispatched after `DISPATCHED`; an `argument_key` is a bound
-upstream argument, not a durable-deduplication attestation. After an
-authoritative terminal `not_applied` result, the Extension may propose a fresh
-operation only through a new authorization decision and new `tool_call_id`.
-The old Tool result and causal model trace remain immutable.
+The direct accepted `AUTHORIZED -> FAILED` path is only the Broker's
+zero-byte-proved `TOOL_DISPATCH_NOT_APPLIED` transition. The canonical
+`tool_transaction_id` and proposed `tool_call_id` may remain stable after an
+`absent` Host-ledger read, but that read grants no dispatch authority: only the
+Broker's atomic absent-row authorization transaction can accept and dispatch
+the operation. No v1 Tool class is automatically redispatched after
+`DISPATCHED`; an `argument_key` is a bound upstream argument, not a
+durable-deduplication attestation. After an authoritative terminal
+`not_applied` result, the Extension may propose a fresh operation only through
+a new authorization decision and new `tool_call_id`. The old Tool result and
+causal model trace remain immutable.
 
 A disconnect, timeout, or crash after dispatch with no authoritative result
 MUST become `UNKNOWN`. Unknown outcome is not a tool error result invented for
