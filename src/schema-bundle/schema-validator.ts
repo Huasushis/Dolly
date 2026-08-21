@@ -68,18 +68,63 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * Resolve a user-facing schema name to its canonical `$id`. Accepts:
  * - the full `$id` (e.g. `https://dolly.example/spec/0.1/schemas/error.schema.json`),
  * - the filename (e.g. `error.schema.json`),
- * - or the short name (e.g. `error` or `block-draft`).
+ * - the short name (e.g. `error` or `block-draft`), or
+ * - any of the above followed by a fragment, e.g.
+ *   `extension-lifecycle-rpc.schema.json#/$defs/ExtensionPingParams` (the
+ *   fragment names the selected sub-schema; resolution returns the base
+ *   document's `$id`).
  */
 function resolveSchemaId(known: Map<string, string>, name: string): string {
-  const direct = known.get(name);
+  const base = splitSchemaFragment(name).base;
+  const direct = known.get(base);
   if (direct !== undefined) return direct;
-  const filename = name.endsWith(SCHEMA_EXT) ? name : `${name}${SCHEMA_EXT}`;
+  const filename = base.endsWith(SCHEMA_EXT) ? base : `${base}${SCHEMA_EXT}`;
   const byFilename = known.get(filename);
   if (byFilename !== undefined) return byFilename;
   for (const [id, canonical] of known) {
     if (basename(id) === filename) return canonical;
   }
   throw new SchemaBundleError("SCHEMA_NOT_FOUND", `Schema not found: ${name}`);
+}
+
+/**
+ * Split a schema reference at its fragment. RFC 6901 JSON Pointers follow
+ * the `#`, so `error.schema.json#/$defs/foo` names both the base document
+ * and the exact sub-schema inside it. Returns `{ base, fragment }` where
+ * `fragment` is the raw text after `#` (empty string when there is none).
+ */
+function splitSchemaFragment(name: string): { base: string; fragment: string } {
+  const split = name.indexOf("#");
+  if (split === -1) return { base: name, fragment: "" };
+  return { base: name.slice(0, split), fragment: name.slice(split + 1) };
+}
+
+/**
+ * Resolve a JSON Pointer (RFC 6901) fragment against a schema document.
+ * Returns null when the fragment is not a well-formed pointer or addresses
+ * a member that does not exist. An empty or "/" fragment addresses the
+ * document root itself.
+ */
+function resolveSchemaPointer(schema: unknown, fragment: string): unknown | null {
+  if (fragment === "") return schema;
+  if (!fragment.startsWith("/")) return null;
+  let node = schema;
+  for (const rawToken of fragment.slice(1).split("/")) {
+    if (node === null || typeof node !== "object") return null;
+    if (/~(?![01])/.test(rawToken)) return null; // bare ~ is not valid RFC 6901
+    const token = rawToken.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (Array.isArray(node)) {
+      if (!/^(0|[1-9][0-9]*)$/.test(token)) return null;
+      const index = Number(token);
+      if (index >= node.length) return null;
+      node = node[index];
+    } else if (Object.prototype.hasOwnProperty.call(node, token)) {
+      node = (node as Record<string, unknown>)[token];
+    } else {
+      return null;
+    }
+  }
+  return node;
 }
 
 export interface SchemaBundle {
@@ -186,21 +231,66 @@ export function createSchemaBundle(options: CreateSchemaBundleOptions): SchemaBu
   for (const $id of idByFilename.values()) known.set($id, $id);
   for (const [filename, $id] of idByFilename) known.set(filename, $id);
 
+  // Keep the parsed document per $id so a fragment can navigate RFC 6901
+  // pointers into the exact loaded schema resource. Every schema was already
+  // verified to declare a string `$id` above.
+  const schemasById = new Map<string, unknown>();
+  for (const schema of schemas) {
+    schemasById.set(schema.$id as string, schema);
+  }
+
   const validators = new Map<string, ValidateFunction>();
+  const fragmentValidators = new Map<string, ValidateFunction>();
+  let fragmentCounter = 0;
   function getValidator(name: string): ValidateFunction {
-    const $id = resolveSchemaId(known, name);
-    let fn = validators.get($id);
-    if (fn !== undefined) return fn;
+    const { base, fragment } = splitSchemaFragment(name);
+    const $id = resolveSchemaId(known, base);
+    if (fragment === "") {
+      let fn = validators.get($id);
+      if (fn !== undefined) return fn;
+      try {
+        fn = ajv.getSchema($id) as ValidateFunction | undefined;
+      } catch {
+        fn = undefined;
+      }
+      if (fn === undefined) {
+        throw new SchemaBundleError("SCHEMA_NOT_FOUND", `Schema not compiled: ${name} (id=${$id})`);
+      }
+      validators.set($id, fn);
+      return fn;
+    }
+    const key = `${$id}#${fragment}`;
+    let fragmentFn = fragmentValidators.get(key);
+    if (fragmentFn !== undefined) return fragmentFn;
+    const document = schemasById.get($id);
+    const target = resolveSchemaPointer(document ?? null, fragment);
+    if (target === null || typeof target !== "object") {
+      throw new SchemaBundleError(
+        "SCHEMA_NOT_FOUND",
+        `Schema fragment not found: ${name} (id=${key})`,
+      );
+    }
+    // Draft 2020-12 uses `$defs`; compile the selected sub-schema against the
+    // same Ajv instance so `$ref`s that name sibling `$defs` or other files
+    // still resolve. The wrapper carries a stable internal URI so the same
+    // fragment is compiled once, and the enumerated keywords of the fragment
+    // are preserved unchanged.
+    const wrapperId = `urn:dolly:internal-fragment:${++fragmentCounter}`;
+    const wrapper = { $id: wrapperId, $ref: `${$id}#${fragment}` };
     try {
-      fn = ajv.getSchema($id) as ValidateFunction | undefined;
+      ajv.addSchema(wrapper as AnySchemaObject);
+      fragmentFn = ajv.getSchema(wrapperId) as ValidateFunction | undefined;
     } catch {
-      fn = undefined;
+      fragmentFn = undefined;
     }
-    if (fn === undefined) {
-      throw new SchemaBundleError("SCHEMA_NOT_FOUND", `Schema not compiled: ${name} (id=${$id})`);
+    if (fragmentFn === undefined) {
+      throw new SchemaBundleError(
+        "SCHEMA_NOT_FOUND",
+        `Schema fragment not compiled: ${name} (id=${key})`,
+      );
     }
-    validators.set($id, fn);
-    return fn;
+    fragmentValidators.set(key, fragmentFn);
+    return fragmentFn;
   }
 
   return {
