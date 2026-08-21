@@ -64,6 +64,7 @@ import {
 import {
   formatVersion19ProcessGenerationId,
   isVersion19ProcessGenerationId,
+  version19ProcessGenerationCounter,
 } from "./linux-identifier-formats.js";
 import { deriveModuleCgroupPath } from "./linux-module-cgroup.js";
 import { isIdentityBoundModuleCgroupPath } from "./linux-module-cgroup-identity.js";
@@ -390,6 +391,7 @@ function assertCoreStateComponentPayload(
 function decodeModuleRecordCollections(
   value: Record<string, JsonValue>,
   allowSubmissionVersion2: boolean,
+  acceptVersion19Records: boolean,
 ): {
   readonly moduleProcessRecords: readonly ModuleProcessRecord[];
   readonly moduleSubmissionRecords: readonly ModuleSubmissionRecord[];
@@ -408,6 +410,15 @@ function decodeModuleRecordCollections(
   try {
     moduleProcessRecords = value.moduleProcessRecords.map((record) => {
       assertValidModuleProcessRecord(record);
+      if (
+        !acceptVersion19Records &&
+        isVersion19ProcessGenerationId(record.processGenerationId)
+      ) {
+        throw new ModuleProcessRecordError(
+          "MODULE_PROCESS_RECORD_INVALID",
+          "A legacy Core-state document cannot contain a version 19 process-generation identifier",
+        );
+      }
       return record;
     });
     moduleSubmissionRecords = value.moduleSubmissionRecords.map((record) => {
@@ -562,6 +573,7 @@ function decodeCoreStateDocument(value: JsonValue): DecodedCoreStateDocument {
     value,
     schemaVersion === "dolly.core-state/18" ||
       schemaVersion === "dolly.core-state/19",
+    schemaVersion === "dolly.core-state/19",
   );
   if (schemaVersion === "dolly.core-state/16") {
     const legacyDigestPayload = { ...components, ...records };
@@ -622,6 +634,18 @@ function decodeCoreStateDocument(value: JsonValue): DecodedCoreStateDocument {
       "CORE_STATE_DOCUMENT_INVALID",
       "Core state version 19 process-generation counter is not a valid safe integer",
     );
+  }
+  const processGenerationIdCounter = value.processGenerationIdCounter as number;
+  for (const record of records.moduleProcessRecords) {
+    const counter = version19ProcessGenerationCounter(
+      record.processGenerationId,
+    );
+    if (counter !== undefined && counter > processGenerationIdCounter) {
+      throw new CoreStateError(
+        "CORE_STATE_DOCUMENT_INVALID",
+        "Core state version 19 document contains a process-generation identifier the persisted counter has not authorized",
+      );
+    }
   }
   const payload: Omit<CoreStateVersion19Document, "stateDigest"> = {
     schemaVersion,
@@ -2260,16 +2284,22 @@ export class FileCoreStateStore {
     this.#assertUsable();
     const copiedRecord = copyModuleProcessRecordInput(record);
     assertValidModuleProcessRecord(copiedRecord);
+    if (isVersion19ProcessGenerationId(copiedRecord.processGenerationId)) {
+      throw new ModuleProcessRecordError(
+        "MODULE_PROCESS_RECORD_ALLOCATION_REQUIRED",
+        "A version 19 Module process record identifier is minted by the Core-state store and cannot be supplied by the caller",
+      );
+    }
     if (this.#processGenerationIdCounter !== undefined) {
       throw new ModuleProcessRecordError(
         "MODULE_PROCESS_RECORD_ALLOCATION_REQUIRED",
         "A migrated version 19 Core state allocates its own process-generation identifiers; no caller-supplied record can be appended",
       );
     }
-    if (isVersion19ProcessGenerationId(copiedRecord.processGenerationId)) {
+    if (this.#processGenerationIdCounter === undefined) {
       throw new ModuleProcessRecordError(
-        "MODULE_PROCESS_RECORD_ALLOCATION_REQUIRED",
-        "A version 19 Module process record identifier is minted by the Core-state store and cannot be supplied by the caller",
+        "MODULE_PROCESS_RECORD_IDENTITY_MIGRATION_REQUIRED",
+        "A legacy Core-state document refuses new caller-supplied process records; migrate it to version 19 so the store allocates the identifier",
       );
     }
     if (copiedRecord.state !== "starting") {

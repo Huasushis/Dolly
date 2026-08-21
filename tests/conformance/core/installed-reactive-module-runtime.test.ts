@@ -98,6 +98,7 @@ import {
   type FileCoreStateStoreOptions,
 } from "../../../src/core/file-core-state-store.js";
 import { FileMediaByteStore } from "../../../src/core/file-media-byte-store.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
 import {
   resolveInstalledContentSchemaRegistrationSet,
   resolveReservedV10InstalledModulePlan,
@@ -301,6 +302,42 @@ describe("installed reactive Module runtime composition", () => {
     return { ...pair, contentSchemas };
   }
 
+  function freshCoreStateDocument(name: string) {
+    return createFileCoreStateStoreWithStoppedRecordWriter({
+      path: resolve(scratch, `${name}-core.json`),
+      maxFailedAttempts: 3,
+      nextBlockId: () => `${name}-seed-block`,
+      nextDeliveryId: (kind) => `${name}-seed-${kind}`,
+      now: () => "2026-08-10T00:00:00.000Z",
+    });
+  }
+
+  function seededCoreState(
+    name: string,
+    records: readonly ModuleProcessRecord[],
+  ) {
+    freshCoreStateDocument(name);
+    seedLegacyProcessRecords(resolve(scratch, `${name}-core.json`), {
+      processRecords: records,
+    });
+    return coreState(name);
+  }
+
+  function version19CoreState(name: string) {
+    freshCoreStateDocument(name);
+    const migration = migrateCoreStateDocumentToVersion19(
+      resolve(scratch, `${name}-core.json`),
+      {
+        runtimeConfiguration: {
+          maxFailedAttempts: 3,
+          media: { enabled: false as const },
+        },
+      },
+    );
+    expect(migration.status).toBe("migrated");
+    return coreState(name);
+  }
+
   function contentSchemaOptions(pair: ReturnType<typeof coreState>) {
     return {
       contentSchemas: pair.contentSchemas,
@@ -498,7 +535,7 @@ describe("installed reactive Module runtime composition", () => {
   });
 
   it("accepts a stopped-process handoff without starting a replacement Extension", async () => {
-    const pair = coreState("deferred-installed");
+    const pair = version19CoreState("deferred-installed");
     pair.store.deliveries.registerConsumer("output", "sink", "from-now");
     const resident = pair.store.blocks.commit(proposal("resident"), {
       kind: "external",
@@ -522,27 +559,22 @@ describe("installed reactive Module runtime composition", () => {
       packageVersion: "1.0.0",
     });
     const reference = instanceConfiguration.modules[0]!.configurationReference;
-    const processGenerationId = "process-deferred-installed-1";
-    pair.store.appendModuleProcessRecord({
+    const workerRecord = pair.store.allocateAndAppendStartingRecord({
       schemaVersion: "dolly.module-process-record/1",
       instanceId: INSTANCE_ID,
       moduleId: "worker",
       moduleGenerationId: claim.moduleGenerationId,
-      processGenerationId,
       packageDigest: installed.packageDigest,
       configurationReference: reference,
       declaredExternalEffects: "unrestricted",
       serviceInvocationId: BINDING.serviceInvocationId,
       bootId: BINDING.bootId,
-      moduleCgroupPath: deriveModuleCgroupPath(BINDING.delegatedRootCgroupPath, {
-        instanceId: INSTANCE_ID,
-        moduleId: "worker",
-        processGenerationId,
-      }).filesystemPath,
+      delegatedRootCgroupPath: BINDING.delegatedRootCgroupPath,
       state: "starting",
       createdAt: "2026-08-10T00:00:00.000Z",
       updatedAt: "2026-08-10T00:00:00.000Z",
     });
+    const processGenerationId = workerRecord.processGenerationId;
     pair.store.updateModuleProcessRecordState(processGenerationId, "running");
     pair.store.appendModuleSubmissionRecord({
       schemaVersion: "dolly.module-submission-record/1",
@@ -651,27 +683,22 @@ describe("installed reactive Module runtime composition", () => {
       maxCount: 1,
       maxBytes: 64 * 1024,
     })!;
-    const sinkProcessGenerationId = "sink-drain-process";
-    pair.store.appendModuleProcessRecord({
+    const sinkRecord = pair.store.allocateAndAppendStartingRecord({
       schemaVersion: "dolly.module-process-record/1",
       instanceId: INSTANCE_ID,
       moduleId: "sink",
       moduleGenerationId: sinkClaim.moduleGenerationId,
-      processGenerationId: sinkProcessGenerationId,
       packageDigest: installed.packageDigest,
       configurationReference: reference,
       declaredExternalEffects: "none",
       serviceInvocationId: BINDING.serviceInvocationId,
       bootId: BINDING.bootId,
-      moduleCgroupPath: deriveModuleCgroupPath(BINDING.delegatedRootCgroupPath, {
-        instanceId: INSTANCE_ID,
-        moduleId: "sink",
-        processGenerationId: sinkProcessGenerationId,
-      }).filesystemPath,
+      delegatedRootCgroupPath: BINDING.delegatedRootCgroupPath,
       state: "starting",
       createdAt: "2026-08-10T00:00:00.000Z",
       updatedAt: "2026-08-10T00:00:00.000Z",
     });
+    const sinkProcessGenerationId = sinkRecord.processGenerationId;
     pair.store.updateModuleProcessRecordState(sinkProcessGenerationId, "running");
     pair.store.appendModuleSubmissionRecord({
       schemaVersion: "dolly.module-submission-record/1",
@@ -1186,19 +1213,16 @@ describe("installed reactive Module runtime composition", () => {
       scheduling,
       runtime,
     })).toThrow(/handoff is not authentic/u);
-    const unverifiedProcessPair = coreState("unverified-old-process");
-    const unverifiedProcessOptions = options(unverifiedProcessPair);
     const installed = installations.resolve({
       extensionId: "org.example.installed-runtime",
       packageVersion: "1.0.0",
     });
-    const processGenerationId = "unverified-old-process-generation";
-    unverifiedProcessPair.store.appendModuleProcessRecord({
+    const unverifiedProcessRecord: ModuleProcessRecord = {
       schemaVersion: "dolly.module-process-record/1",
       instanceId: INSTANCE_ID,
       moduleId: "worker",
       moduleGenerationId: "unverified-old-module-generation",
-      processGenerationId,
+      processGenerationId: "unverified-old-process-generation",
       packageDigest: installed.packageDigest,
       configurationReference: instanceConfiguration.modules[0]!.configurationReference,
       declaredExternalEffects: "unrestricted",
@@ -1207,12 +1231,18 @@ describe("installed reactive Module runtime composition", () => {
       moduleCgroupPath: deriveModuleCgroupPath(BINDING.delegatedRootCgroupPath, {
         instanceId: INSTANCE_ID,
         moduleId: "worker",
-        processGenerationId,
+        processGenerationId: "unverified-old-process-generation",
       }).filesystemPath,
       state: "starting",
       createdAt: "2026-08-10T00:00:00.000Z",
       updatedAt: "2026-08-10T00:00:00.000Z",
-    });
+    };
+    const unverifiedProcessPair = seededCoreState(
+      "unverified-old-process",
+      [unverifiedProcessRecord],
+    );
+    const unverifiedProcessOptions = options(unverifiedProcessPair);
+    const processGenerationId = unverifiedProcessRecord.processGenerationId;
     unverifiedProcessPair.store.updateModuleProcessRecordState(processGenerationId, "running");
     const unverifiedProcessHandoff = (await new CoreStartupRecovery({
       deliveries: unverifiedProcessPair.store.deliveries,

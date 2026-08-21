@@ -37,6 +37,7 @@ import {
   type ModuleProcessRecord,
   type ModuleProcessStoppedRecordWriter,
 } from "../../../src/core/module-process-records.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
 
 const MIGRATION_OPTIONS = {
   runtimeConfiguration: {
@@ -210,6 +211,11 @@ describe("CORE state atomic write fault injection", () => {
   function seedClaimedState(prefix: string): ClaimedState {
     let blockId = 0;
     let runtimeId = 0;
+    // A legacy document can no longer accept caller-supplied process records,
+    // so the fixture seeds the exact starting record into the freshly created
+    // document before the store is reopened.
+    openStore(`${prefix}-seed`);
+    seedLegacyProcessRecords(path, { processRecords: [processRecord()] });
     const { store, stoppedRecordWriter } =
       createFileCoreStateStoreWithStoppedRecordWriter({
         path,
@@ -225,7 +231,6 @@ describe("CORE state atomic write fault injection", () => {
       { kind: "external", id: "console" },
     );
     store.deliveries.append("input", block.id);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState(PROCESS_GENERATION_ID, "running");
     const claim = store.deliveries.claim({
       consumerId: "worker",

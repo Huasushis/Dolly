@@ -78,6 +78,7 @@ import {
 import {
   createInstalledModuleProcessDeclarationProvenanceAuthority,
 } from "../../../src/adapters/installed-linux-extension-module-executor.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
 
 const MIGRATION_OPTIONS = {
   runtimeConfiguration: {
@@ -507,8 +508,13 @@ describe("CORE process-generation identity domain (version 19)", () => {
 
   describe("R6 explicit v18 to v19 migration", () => {
     it("preserves legacy records and exact source bytes, then forbids new legacy identifiers", () => {
+      // Legacy documents no longer accept caller-supplied process records, so
+      // the fixture seeds the exact legacy record into the fresh document the
+      // same way a pre-cutover Dolly would have left it on disk.
+      const seedStore = openStore("legacy-seed");
+      seedLegacyProcessRecords(path, { processRecords: [processRecord()] });
+      void seedStore;
       const store = openStore("legacy-migrate");
-      store.appendModuleProcessRecord(processRecord());
       store.updateModuleProcessRecordState("process-generation-1", "running");
       const running = store.getModuleProcessRecord("process-generation-1");
       expect(running?.state).toBe("running");

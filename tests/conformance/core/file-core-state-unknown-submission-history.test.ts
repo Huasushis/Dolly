@@ -22,6 +22,7 @@ import {
   type ModuleProcessRecord,
   type ModuleSubmissionRecord,
 } from "../../../src/core/module-process-records.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
 
 const NOW = "2026-07-31T00:00:00.000Z";
 const MIGRATION_OPTIONS = {
@@ -129,6 +130,8 @@ function rewriteAsVersion16(path: string): void {
 }
 
 function seedMigratedState(path: string): SeededState {
+  openStore(path, "seed");
+  seedLegacyProcessRecords(path, { processRecords: [processRecord()] });
   const initial = openStore(path, "initial");
   initial.deliveries.createPage("input");
   initial.deliveries.registerConsumer("input", MODULE_ID, "from-now");
@@ -156,7 +159,6 @@ function seedMigratedState(path: string): SeededState {
     attempt: claim.attempt,
     moduleGenerationId: claim.moduleGenerationId,
   });
-  initial.appendModuleProcessRecord(processRecord());
   initial.updateModuleProcessRecordState(PROCESS_GENERATION_ID, "running");
 
   const inputDigest = canonicalJsonDigest(

@@ -10,6 +10,8 @@ import {
 } from "../../../src/core/extension-process-host.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
+import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
 import type { ExtensionPackageManifest } from "../../../src/core/extension-installation-registry.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import { systemSchedulerClock } from "../../../src/core/module-scheduler.js";
@@ -85,13 +87,51 @@ describe("reactive Module host with a real child process", () => {
       let deliveryId = 0;
       let nextGeneration = 1;
       let monotonic = 0;
-      const core = new FileCoreStateStore({
-        path: join(root, "core-state.json"),
-        maxFailedAttempts: 3,
-        nextBlockId: () => `block-${++blockId}`,
-        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
-        now: () => NOW,
+      const coreStatePath = join(root, "core-state.json");
+      const openCoreState = () =>
+        new FileCoreStateStore({
+          path: coreStatePath,
+          maxFailedAttempts: 3,
+          nextBlockId: () => `block-${++blockId}`,
+          nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+          now: () => NOW,
+        });
+      const processRecordBody: ModuleProcessRecord = {
+        schemaVersion: "dolly.module-process-record/1",
+        instanceId: INSTANCE_ID,
+        moduleId: "worker",
+        moduleGenerationId,
+        processGenerationId,
+        packageDigest: `sha256:${"a".repeat(64)}`,
+        configurationReference: {
+          configId: "config-host-real",
+          revision: `sha256:${"b".repeat(64)}`,
+          configVersion: 1,
+        },
+        declaredExternalEffects: "none",
+        serviceInvocationId: "2812432ad29e4d3bbd6776c62cafa929",
+        bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
+        moduleCgroupPath: deriveModuleCgroupPath(
+          "/system.slice/dolly-core.service",
+          {
+            instanceId: INSTANCE_ID,
+            moduleId: "worker",
+            processGenerationId,
+          },
+        ).filesystemPath,
+        state: "starting",
+        createdAt: NOW,
+        updatedAt: NOW,
+      };
+      // A legacy document can no longer accept caller-supplied process
+      // records, so the fixture seeds the exact starting record into the
+      // freshly created document before the store is reopened.
+      const base = openCoreState();
+      seedLegacyProcessRecords(coreStatePath, {
+        processRecords: [processRecordBody],
       });
+      void base;
+      const core = openCoreState();
       core.deliveries.createPage("input");
       core.deliveries.createPage("output");
       core.deliveries.registerConsumer("input", "worker", "from-now");
@@ -139,33 +179,6 @@ describe("reactive Module host with a real child process", () => {
             terminationTimeoutMs: 3_000,
           },
         }],
-      });
-      core.appendModuleProcessRecord({
-        schemaVersion: "dolly.module-process-record/1",
-        instanceId: INSTANCE_ID,
-        moduleId: "worker",
-        moduleGenerationId,
-        processGenerationId,
-        packageDigest: `sha256:${"a".repeat(64)}`,
-        configurationReference: {
-          configId: "config-host-real",
-          revision: `sha256:${"b".repeat(64)}`,
-          configVersion: 1,
-        },
-        declaredExternalEffects: "none",
-        serviceInvocationId: "2812432ad29e4d3bbd6776c62cafa929",
-        bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
-        moduleCgroupPath: deriveModuleCgroupPath(
-          "/system.slice/dolly-core.service",
-          {
-            instanceId: INSTANCE_ID,
-            moduleId: "worker",
-            processGenerationId,
-          },
-        ).filesystemPath,
-        state: "starting",
-        createdAt: NOW,
-        updatedAt: NOW,
       });
       const repository = new FileModuleResultCommitRepository({
         path: join(root, "module-result-commits.json"),

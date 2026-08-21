@@ -29,6 +29,7 @@ import type {
   ModuleProcessStoppedRecordWriter,
   ModuleSubmissionRecord,
 } from "../../../src/core/module-process-records.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
 
 const NOW = "2026-07-26T00:00:00.000Z";
 const DIGEST_A = `sha256:${"a".repeat(64)}`;
@@ -75,6 +76,17 @@ describe("CORE startup reconciliation with Module records", () => {
       repository: new FileModuleResultCommitRepository({ path: journalPath }),
       now: () => NOW,
     });
+  }
+
+  /** Opens a legacy v18 store whose document already contains the records. */
+  function seededStore(
+    prefix: string,
+    records: readonly ModuleProcessRecord[] = [],
+    path: string = statePath,
+  ): FileCoreStateStore {
+    openStore(`${prefix}-seed`, path);
+    seedLegacyProcessRecords(path, { processRecords: records });
+    return openStore(prefix, path);
   }
 
   function processRecord(
@@ -293,9 +305,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("keeps a migrated Claim unresolved when its submission history is unknown", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
 
     await expect(
       new CoreStartupRecovery({
@@ -319,9 +330,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("releases a never-authorized Claim only after every old process is proven stopped", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
 
     const report = await new CoreStartupRecovery({
       deliveries: store.deliveries,
@@ -393,9 +403,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("rejects a Claim present in both submission-history classifications", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     const submission = submissionFor(claim);
 
@@ -439,9 +448,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("refuses to release when the old Module cgroup cannot be proven empty", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
 
     await expect(
       new CoreStartupRecovery({
@@ -463,9 +471,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("refuses to assume a process stopped when no prover is available", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
 
     await expect(
       new CoreStartupRecovery({
@@ -481,8 +488,7 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("refuses to trust an existing stopped label without a fresh proof and preserves it", async () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
     store.updateModuleProcessRecordState("process-generation-1", "running");
     stoppedRecordWriterFor(store).writeStopped("process-generation-1");
     const beforeRevision = store.revision;
@@ -510,8 +516,7 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("rejects a structured stop proof without the store-bound writer and preserves durable state", async () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
     const beforeRevision = store.revision;
 
     await expect(
@@ -538,8 +543,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("accepts a fresh proof for an existing stopped record without distributing write authority", async () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
+    store.updateModuleProcessRecordState("process-generation-1", "running");
     stoppedRecordWriterFor(store).writeStopped("process-generation-1");
 
     const report = await new CoreStartupRecovery({
@@ -555,8 +560,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("rejects a failed fresh proof for an existing stopped record", async () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
+    store.updateModuleProcessRecordState("process-generation-1", "running");
     stoppedRecordWriterFor(store).writeStopped("process-generation-1");
     const beforeRevision = store.revision;
 
@@ -576,8 +581,7 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("rejects a structural stopped-record writer that performs no durable write", async () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
     const beforeRevision = store.revision;
 
     await expect(
@@ -604,10 +608,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("rejects a stopped-record writer bound to a different state store", async () => {
-    const store = openStore("first");
-    const otherStore = openStore("other", join(root, "other-core-state.json"));
-    store.appendModuleProcessRecord(processRecord());
-    otherStore.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
+    const otherStore = seededStore("other", [processRecord()], join(root, "other-core-state.json"));
 
     await expect(
       new CoreStartupRecovery({
@@ -633,9 +635,8 @@ describe("CORE startup reconciliation with Module records", () => {
   it.each(invalidProcessStopProofs)(
     "keeps the Claim active when the stop prover returns %s",
     async (_description, proof) => {
-      const store = openStore("first");
+      const store = seededStore("first", [processRecord()]);
       seedActiveClaim(store);
-      store.appendModuleProcessRecord(processRecord());
       const processStopProver = {
         proveStopped: (() => Promise.resolve(proof)) as unknown as
           ModuleProcessStopProver["proveStopped"],
@@ -661,13 +662,12 @@ describe("CORE startup reconciliation with Module records", () => {
   );
 
   it("rejects a valid stop proof that belongs to a different process record", async () => {
-    const store = openStore("first");
-    seedActiveClaim(store);
     const record = processRecord();
+    const store = seededStore("first", [record]);
+    seedActiveClaim(store);
     const otherRecord = processRecord({
       processGenerationId: "process-generation-other",
     });
-    store.appendModuleProcessRecord(record);
 
     await expect(
       new CoreStartupRecovery({
@@ -696,9 +696,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("does not inspect effect evidence for an unproven version 1 declaration", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionFor(claim));
 
@@ -730,9 +729,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("preserves a submitted Run when no external-effect evidence source exists", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionFor(claim));
 
@@ -753,11 +751,10 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("releases a prepared version 2 submission after its process is proven stopped", async () => {
-    const store = openStore("prepared-v2");
+    const store = seededStore("prepared-v2", [
+      processRecord({ declaredExternalEffects: "unrestricted" }),
+    ]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord({
-      declaredExternalEffects: "unrestricted",
-    }));
     store.updateModuleProcessRecordState("process-generation-1", "running");
     const preparedSubmission = {
       ...submissionFor(claim),
@@ -784,11 +781,10 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("preserves a send-possible version 2 submission as outcome-unknown", async () => {
-    const store = openStore("send-possible-v2");
+    const store = seededStore("send-possible-v2", [
+      processRecord({ declaredExternalEffects: "unrestricted" }),
+    ]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord({
-      declaredExternalEffects: "unrestricted",
-    }));
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord({
       ...submissionFor(claim),
@@ -814,17 +810,18 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("releases a proven-stopped version 2 no-effect declaration with validated provenance", async () => {
-    const store = openStore("process-record-v2-none");
+    const store = seededStore("process-record-v2-none", [
+      {
+        ...processRecord(),
+        schemaVersion: "dolly.module-process-record/2",
+        declaredExternalEffects: "none",
+        declarationProvenance: {
+          schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
+          provenanceDigest: DIGEST_B,
+        },
+      } as unknown as ModuleProcessRecord,
+    ]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord({
-      ...processRecord(),
-      schemaVersion: "dolly.module-process-record/2",
-      declaredExternalEffects: "none",
-      declarationProvenance: {
-        schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
-        provenanceDigest: DIGEST_B,
-      },
-    } as unknown as ModuleProcessRecord);
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionFor(claim));
 
@@ -846,16 +843,17 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("consults the capability journal for a proven-stopped version 2 core-capabilities-only declaration", async () => {
-    const store = openStore("process-record-v2-ccc");
+    const store = seededStore("process-record-v2-ccc", [
+      {
+        ...processRecord(),
+        schemaVersion: "dolly.module-process-record/2",
+        declarationProvenance: {
+          schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
+          provenanceDigest: DIGEST_B,
+        },
+      } as unknown as ModuleProcessRecord,
+    ]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord({
-      ...processRecord(),
-      schemaVersion: "dolly.module-process-record/2",
-      declarationProvenance: {
-        schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
-        provenanceDigest: DIGEST_B,
-      },
-    } as unknown as ModuleProcessRecord);
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionFor(claim));
 
@@ -883,11 +881,10 @@ describe("CORE startup reconciliation with Module records", () => {
     expect(store.deliveries.inspectClaim(claim).status).toBe("released");
   });
   it("does not trust a reopened version 1 no-effect declaration without configuration provenance", async () => {
-    const store = openStore("first");
-    const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(
+    const store = seededStore("first", [
       processRecord({ declaredExternalEffects: "none" }),
-    );
+    ]);
+    const claim = seedActiveClaim(store);
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionFor(claim));
     const reopened = openStore("legacy-none-reopened");
@@ -915,9 +912,8 @@ describe("CORE startup reconciliation with Module records", () => {
   it.each(["no-effect", "retry-safe"] as const)(
     "does not consult persistent %s evidence for a version 1 capability-only declaration",
     async (kind) => {
-      const store = openStore("first");
+      const store = seededStore("first", [processRecord()]);
       const claim = seedActiveClaim(store);
-      store.appendModuleProcessRecord(processRecord());
       store.updateModuleProcessRecordState("process-generation-1", "running");
       store.appendModuleSubmissionRecord(submissionFor(claim));
 
@@ -941,11 +937,10 @@ describe("CORE startup reconciliation with Module records", () => {
   );
 
   it("does not treat an empty capability journal as proof that an ordinary process made no ambient effect", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [
+      processRecord({ declaredExternalEffects: "unrestricted" }),
+    ]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord({
-      declaredExternalEffects: "unrestricted",
-    }));
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionFor(claim));
     const journal = new EffectIntentJournal({
@@ -974,11 +969,10 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("does not trust a legacy capability-only process record without configuration provenance", async () => {
-    const store = openStore("legacy-capability-only");
+    const store = seededStore("legacy-capability-only", [
+      processRecord({ declaredExternalEffects: "core-capabilities-only" }),
+    ]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord({
-      declaredExternalEffects: "core-capabilities-only",
-    }));
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionFor(claim));
     const journal = new EffectIntentJournal({
@@ -1007,9 +1001,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("does not inspect terminal evidence for a version 1 capability-only declaration", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionFor(claim));
 
@@ -1179,9 +1172,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("fails closed when a submission record does not match its active Claim", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     const submission = store.appendModuleSubmissionRecord(submissionFor(claim));
     const mismatched = {
@@ -1206,9 +1198,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("fails closed when a terminal Claim still has a submission record", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     const submission = store.appendModuleSubmissionRecord(submissionFor(claim));
     store.releaseDeliveryClaim(claim);
@@ -1228,14 +1219,11 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("keeps a migrated Claim unresolved after two stopped process attempts", async () => {
-    const store = openStore("first");
-    const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
-    store.updateModuleProcessRecordState("process-generation-1", "running");
-    stoppedRecordWriterFor(store).writeStopped("process-generation-1");
-    store.appendModuleProcessRecord(
+    const store = seededStore("first", [
+      processRecord({ state: "stopped" }),
       processRecord({ processGenerationId: "process-generation-2" }),
-    );
+    ]);
+    const claim = seedActiveClaim(store);
 
     await expect(
       new CoreStartupRecovery({
@@ -1258,14 +1246,11 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("proves every old process stopped before classifying migrated Claim history", async () => {
-    const store = openStore("first");
-    const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
-    store.updateModuleProcessRecordState("process-generation-1", "running");
-    stoppedRecordWriterFor(store).writeStopped("process-generation-1");
-    store.appendModuleProcessRecord(
+    const store = seededStore("first", [
+      processRecord({ state: "stopped" }),
       processRecord({ processGenerationId: "process-generation-2" }),
-    );
+    ]);
+    const claim = seedActiveClaim(store);
     const provedProcessGenerationIds: string[] = [];
     const refusesSecondProcess = {
       proveStopped: async (
@@ -1310,9 +1295,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("does not collect a process record when a terminal Claim still has a submission record", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     const submission = store.appendModuleSubmissionRecord(submissionFor(claim));
     stoppedRecordWriterFor(store).writeStopped("process-generation-1");
@@ -1335,9 +1319,8 @@ describe("CORE startup reconciliation with Module records", () => {
   });
 
   it("keeps every record of a Module generation whose Claim is an unknown outcome", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionFor(claim));
 

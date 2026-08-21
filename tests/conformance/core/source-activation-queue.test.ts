@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
+import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
 import { createModuleResultCommitCoordinator } from "../../../src/core/module-result-commit-factory.js";
 import { InMemoryModuleResultCommitRepository } from "../../../src/core/module-result-commit.js";
 import {
@@ -151,9 +153,9 @@ function openQueue(
   return queue;
 }
 
-function appendRunningProcess(core: FileCoreStateStore): void {
+function processRecordBody(): ModuleProcessRecord {
   const processGenerationId = "source-process-generation-1";
-  core.appendModuleProcessRecord({
+  return {
     schemaVersion: "dolly.module-process-record/1",
     instanceId: "source-instance",
     moduleId: "source-module",
@@ -179,8 +181,18 @@ function appendRunningProcess(core: FileCoreStateStore): void {
     state: "starting",
     createdAt: NOW,
     updatedAt: NOW,
-  });
-  core.updateModuleProcessRecordState(processGenerationId, "running");
+  };
+}
+
+// A legacy document can no longer accept caller-supplied process records, so
+// the fixture seeds the exact starting record into the freshly created
+// document and drives it to running through the unchanged legacy API.
+function openCoreWithRunningProcess(path: string, prefix: string): FileCoreStateStore {
+  openStore(path, `${prefix}-seed`);
+  seedLegacyProcessRecords(path, { processRecords: [processRecordBody()] });
+  const core = openStore(path, prefix);
+  core.updateModuleProcessRecordState("source-process-generation-1", "running");
+  return core;
 }
 
 describe("Core-private source activation queue", () => {
@@ -439,9 +451,8 @@ describe("Core-private source activation queue", () => {
   });
 
   it("runs the private request through ReactiveModuleRuntime and atomically commits it", async () => {
-    const core = openStore(statePath, "runtime");
+    const core = openCoreWithRunningProcess(statePath, "runtime");
     const queue = openQueue(core);
-    appendRunningProcess(core);
     const repository = new InMemoryModuleResultCommitRepository();
     const commits = createModuleResultCommitCoordinator({
       core,

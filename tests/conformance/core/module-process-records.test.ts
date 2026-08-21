@@ -12,16 +12,26 @@ import {
   CoreStateError,
   FileCoreStateStore,
   createFileCoreStateStoreWithStoppedRecordWriter,
+  migrateCoreStateDocumentToVersion19,
 } from "../../../src/core/file-core-state-store.js";
 import {
   ModuleProcessRecordError,
   assertValidModuleProcessRecord,
   type ModuleProcessRecord,
   type ModuleProcessStoppedRecordWriter,
+  type ModuleProcessStartingRecordInput,
   type ModuleSubmissionRecord,
 } from "../../../src/core/module-process-records.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import { isDerivedModuleCgroupPath } from "../../../src/core/linux-identifier-formats.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
+
+const MIGRATION_OPTIONS = {
+  runtimeConfiguration: {
+    maxFailedAttempts: 3,
+    media: { enabled: false as const },
+  },
+};
 
 const NOW = "2026-07-26T00:00:00.000Z";
 const LATER = "2026-07-26T00:00:05.000Z";
@@ -74,6 +84,31 @@ function processRecord(
   } as ModuleProcessRecord;
 }
 
+function startingRecord(
+  overrides: Partial<ModuleProcessStartingRecordInput> = {},
+): ModuleProcessStartingRecordInput {
+  return {
+    schemaVersion: "dolly.module-process-record/1",
+    instanceId: INSTANCE_ID,
+    moduleId: MODULE_ID,
+    moduleGenerationId: "module-generation-1",
+    packageDigest: DIGEST_A,
+    configurationReference: {
+      configId: "config-1",
+      revision: DIGEST_B,
+      configVersion: 1,
+    },
+    declaredExternalEffects: "core-capabilities-only",
+    serviceInvocationId: INVOCATION_ID,
+    bootId: BOOT_ID,
+    delegatedRootCgroupPath: DELEGATED_ROOT,
+    state: "starting",
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...overrides,
+  } as ModuleProcessStartingRecordInput;
+}
+
 function submissionRecord(
   overrides: Partial<ModuleSubmissionRecord> = {},
 ): ModuleSubmissionRecord {
@@ -124,6 +159,28 @@ describe("CORE Module process and submission records", () => {
     return writer;
   }
 
+  /**
+   * Builds a legacy version 18 store that already contains the supplied
+   * process records by writing them into the persisted document directly
+   * (the only sanctioned way to obtain such a document now), then reopens it.
+   */
+  function seededStore(
+    prefix: string,
+    records: readonly ModuleProcessRecord[] = [],
+  ): FileCoreStateStore {
+    openStore(`${prefix}-seed`);
+    seedLegacyProcessRecords(path, { processRecords: records });
+    return openStore(prefix);
+  }
+
+  /** Builds a version 19 Core-state document from a fresh version 18 store. */
+  function openVersion19(prefix: string): FileCoreStateStore {
+    openStore(`${prefix}-seed`);
+    const migration = migrateCoreStateDocumentToVersion19(path, MIGRATION_OPTIONS);
+    expect(migration.status).toBe("migrated");
+    return openStore(prefix);
+  }
+
   function seedActiveClaim(
     store: FileCoreStateStore,
     options: {
@@ -169,7 +226,6 @@ describe("CORE Module process and submission records", () => {
 
   function seedSubmittedClaim(store: FileCoreStateStore): DeliveryClaim {
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionForClaim(store, claim));
     return claim;
@@ -187,8 +243,8 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("persists a process record before any child and reopens it unchanged", () => {
-    const store = openStore("first");
-    const record = store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
+    const record = store.getModuleProcessRecord("process-generation-1")!;
     expect(record.state).toBe("starting");
 
     const reopened = openStore("second");
@@ -220,17 +276,21 @@ describe("CORE Module process and submission records", () => {
       },
     });
 
-    const stored = store.appendModuleProcessRecord(supplied);
+    expect(() => store.appendModuleProcessRecord(supplied)).toThrowError(
+      expect.objectContaining<Partial<ModuleProcessRecordError>>({
+        code: "MODULE_PROCESS_RECORD_IDENTITY_MIGRATION_REQUIRED",
+      }),
+    );
     expect([...reads.values()].every((count) => count === 1)).toBe(true);
     expect([...configurationReads.values()].every((count) => count === 1)).toBe(true);
 
     const reopened = openStore("second");
-    expect(reopened.getModuleProcessRecord(input.processGenerationId)).toEqual(stored);
-    expect(reopened.listModuleProcessRecords()).toEqual([stored]);
+    expect(reopened.getModuleProcessRecord(input.processGenerationId)).toBeUndefined();
+    expect(reopened.listModuleProcessRecords()).toEqual([]);
   });
 
   it("rejects a returned value without reading it or persisting a partial update", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const savedBlocksSnapshot = store.blocks.snapshot;
     const beforeRevision = store.revision;
     const beforeBytes = readFileSync(path, "utf8");
@@ -243,7 +303,7 @@ describe("CORE Module process and submission records", () => {
       },
     });
     const operation = () => {
-      store.appendModuleProcessRecord(processRecord());
+      store.updateModuleProcessRecordState("process-generation-1", "running");
       return returnedValue;
     };
 
@@ -277,14 +337,14 @@ describe("CORE Module process and submission records", () => {
     expect(readFileSync(path, "utf8")).toBe(beforeBytes);
     const reopened = openStore("reopened");
     expect(reopened.revision).toBe(beforeRevision);
-    expect(reopened.listModuleProcessRecords()).toEqual([]);
+    expect(reopened.listModuleProcessRecords()).toEqual([processRecord()]);
     expect(() =>
       reopened.deliveries.validateOutputPages(["then-getter-page"]),
     ).toThrowError();
   });
 
   it("prevents an asynchronous continuation from writing after rejection", async () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const savedDeliveriesSnapshot = store.deliveries.snapshot;
     const beforeRevision = store.revision;
     const beforeBytes = readFileSync(path, "utf8");
@@ -294,7 +354,7 @@ describe("CORE Module process and submission records", () => {
     });
     let continuation!: Promise<void>;
     const operation = () => {
-      store.appendModuleProcessRecord(processRecord());
+      store.updateModuleProcessRecordState("process-generation-1", "running");
       continuation = (async () => {
         await gate;
         store.updateModuleProcessRecordState("process-generation-1", "running");
@@ -323,7 +383,7 @@ describe("CORE Module process and submission records", () => {
     expect(readFileSync(path, "utf8")).toBe(beforeBytes);
     const reopened = openStore("reopened");
     expect(reopened.revision).toBe(beforeRevision);
-    expect(reopened.listModuleProcessRecords()).toEqual([]);
+    expect(reopened.listModuleProcessRecords()).toEqual([processRecord()]);
   });
 
   it("fails closed before a returned Promise makes its first state change", async () => {
@@ -379,20 +439,18 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("never reuses a process-generation identifier", () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
 
     expect(() => store.appendModuleProcessRecord(processRecord())).toThrowError(
       expect.objectContaining<Partial<ModuleProcessRecordError>>({
-        code: "MODULE_PROCESS_RECORD_CONFLICT",
+        code: "MODULE_PROCESS_RECORD_IDENTITY_MIGRATION_REQUIRED",
       }),
     );
     expect(store.listModuleProcessRecords()).toHaveLength(1);
   });
 
   it("rejects a second non-terminal record for the same Module generation while the first is starting", () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord({ state: "starting" })]);
     const beforeRevision = store.revision;
     const beforeBytes = readFileSync(path, "utf8");
 
@@ -402,7 +460,7 @@ describe("CORE Module process and submission records", () => {
       ),
     ).toThrowError(
       expect.objectContaining<Partial<ModuleProcessRecordError>>({
-        code: "MODULE_PROCESS_RECORD_CONFLICT",
+        code: "MODULE_PROCESS_RECORD_IDENTITY_MIGRATION_REQUIRED",
       }),
     );
     expect(store.revision).toBe(beforeRevision);
@@ -411,8 +469,7 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("rejects a second non-terminal record for the same Module generation while the first is running", () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
     store.updateModuleProcessRecordState("process-generation-1", "running");
     const beforeRevision = store.revision;
     const beforeBytes = readFileSync(path, "utf8");
@@ -423,7 +480,7 @@ describe("CORE Module process and submission records", () => {
       ),
     ).toThrowError(
       expect.objectContaining<Partial<ModuleProcessRecordError>>({
-        code: "MODULE_PROCESS_RECORD_CONFLICT",
+        code: "MODULE_PROCESS_RECORD_IDENTITY_MIGRATION_REQUIRED",
       }),
     );
     expect(store.revision).toBe(beforeRevision);
@@ -432,21 +489,18 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("allows one non-terminal record per distinct Module tuple", () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
-    store.appendModuleProcessRecord(
+    const store = seededStore("first", [
+      processRecord(),
       processRecord({
         processGenerationId: "process-generation-2",
         moduleGenerationId: "module-generation-2",
       }),
-    );
-    store.appendModuleProcessRecord(
       processRecord({
         processGenerationId: "process-generation-3",
         moduleId: "worker-two",
         moduleCgroupPath: cgroupPathFor("process-generation-3", "worker-two"),
       }),
-    );
+    ]);
     expect(store.listModuleProcessRecords()).toHaveLength(3);
 
     const reopened = openStore("second");
@@ -454,14 +508,14 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("allows a replacement record after the prior one is proven stopped", () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
-    stoppedRecordWriterFor(store).writeStopped("process-generation-1", "ROTATED");
-    store.appendModuleProcessRecord(
-      processRecord({ processGenerationId: "process-generation-2" }),
-    );
+    const store = openVersion19("replacement");
+    const first = store.allocateAndAppendStartingRecord(startingRecord());
+    expect(first.processGenerationId).toBe("_v19_host_1");
+    stoppedRecordWriterFor(store).writeStopped(first.processGenerationId, "ROTATED");
+    const second = store.allocateAndAppendStartingRecord(startingRecord());
+    expect(second.processGenerationId).toBe("_v19_host_2");
     expect(store.listModuleProcessRecords()).toHaveLength(2);
-    expect(store.getModuleProcessRecord("process-generation-2")).toMatchObject({
+    expect(store.getModuleProcessRecord(second.processGenerationId)).toMatchObject({
       state: "starting",
     });
 
@@ -470,14 +524,16 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("preserves multiple stopped historical records for one Module generation", () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
-    stoppedRecordWriterFor(store).writeStopped("process-generation-1", "ROTATED");
+    const store = openVersion19("stopped-history");
+    const first = store.allocateAndAppendStartingRecord(startingRecord());
+    expect(first.processGenerationId).toBe("_v19_host_1");
+    stoppedRecordWriterFor(store).writeStopped(first.processGenerationId, "ROTATED");
     clock = LATER;
-    store.appendModuleProcessRecord(
-      processRecord({ processGenerationId: "process-generation-2" }),
+    const second = store.allocateAndAppendStartingRecord(
+      startingRecord(),
     );
-    stoppedRecordWriterFor(store).writeStopped("process-generation-2", "ROTATED");
+    expect(second.processGenerationId).toBe("_v19_host_2");
+    stoppedRecordWriterFor(store).writeStopped(second.processGenerationId, "ROTATED");
 
     expect(store.listModuleProcessRecords()).toHaveLength(2);
     const reopened = openStore("second");
@@ -487,8 +543,7 @@ describe("CORE Module process and submission records", () => {
   it.each(["starting", "running"] as const)(
     "fails closed when a persisted document holds two non-terminal records for one Module generation (%s)",
     (existingState) => {
-      const store = openStore("first");
-      store.appendModuleProcessRecord(processRecord());
+      const store = seededStore("first", [processRecord()]);
       if (existingState === "running") {
         store.updateModuleProcessRecordState("process-generation-1", "running");
       }
@@ -518,19 +573,23 @@ describe("CORE Module process and submission records", () => {
 
   it("rejects a new record that does not begin in the starting state", () => {
     const store = openStore("first");
+    const beforeRevision = store.revision;
+    const beforeBytes = readFileSync(path, "utf8");
+
     expect(() =>
       store.appendModuleProcessRecord(processRecord({ state: "running" })),
     ).toThrowError(
       expect.objectContaining<Partial<ModuleProcessRecordError>>({
-        code: "MODULE_PROCESS_RECORD_STATE_INVALID",
+        code: "MODULE_PROCESS_RECORD_IDENTITY_MIGRATION_REQUIRED",
       }),
     );
+    expect(store.revision).toBe(beforeRevision);
+    expect(readFileSync(path, "utf8")).toBe(beforeBytes);
     expect(store.listModuleProcessRecords()).toEqual([]);
   });
 
   it("advances process state only along the permitted order", () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
     clock = LATER;
 
     const running = store.updateModuleProcessRecordState("process-generation-1", "running");
@@ -577,13 +636,12 @@ describe("CORE Module process and submission records", () => {
       (directStore as unknown as Record<string, unknown>).writeStopped,
     ).toBeUndefined();
 
-    const store = openStore("factory");
+    const store = seededStore("factory", [
+      processRecord({ processGenerationId: "process-generation-factory" }),
+    ]);
     const writer = stoppedRecordWriterFor(store);
     expect(Object.isFrozen(writer)).toBe(true);
 
-    store.appendModuleProcessRecord(
-      processRecord({ processGenerationId: "process-generation-factory" }),
-    );
     expect(() => writer.writeStopped("process-generation-other")).toThrowError(
       expect.objectContaining<Partial<ModuleProcessRecordError>>({
         code: "MODULE_PROCESS_RECORD_NOT_FOUND",
@@ -604,8 +662,7 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("rejects a generic stopped write without stop proof and preserves durable state", () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
     const beforeRevision = store.revision;
     const beforeBytes = readFileSync(path, "utf8");
     clock = LATER;
@@ -635,10 +692,9 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("authorizes a submission record only for an exact active Claim and running process", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
     const submission = submissionForClaim(store, claim);
-    store.appendModuleProcessRecord(processRecord());
 
     expect(() => store.appendModuleSubmissionRecord(submission)).toThrowError(
       expect.objectContaining<Partial<ModuleProcessRecordError>>({
@@ -658,9 +714,8 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("persists the prepared-to-send-possible transition before execution", () => {
-    const store = openStore("dispatch-transition");
+    const store = seededStore("dispatch-transition", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionForClaim(store, claim, {
       schemaVersion: "dolly.module-submission-record/2",
@@ -690,9 +745,8 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("rejects submission version 2 when relabeled into Core-state version 17", () => {
-    const store = openStore("outer-version");
+    const store = seededStore("outer-version", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionForClaim(store, claim, {
       schemaVersion: "dolly.module-submission-record/2",
@@ -715,9 +769,8 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("copies an accessor-based submission record once before validation and persistence", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     const input = submissionForClaim(store, claim);
     const reads = new Map<PropertyKey, number>();
@@ -738,9 +791,8 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("rejects a submission record with no process record or a mismatched generation", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
 
     expect(() =>
@@ -784,8 +836,7 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("rejects a submission record when no exact active Claim exists", () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
     store.updateModuleProcessRecordState("process-generation-1", "running");
 
     expect(() => store.appendModuleSubmissionRecord(submissionRecord())).toThrowError(
@@ -805,15 +856,14 @@ describe("CORE Module process and submission records", () => {
   ] satisfies readonly (readonly [string, Partial<ModuleSubmissionRecord>])[])(
     "rejects a submission record whose %s does not match the active Claim",
     (_label, mismatch) => {
-      const store = openStore("first");
-      const claim = seedActiveClaim(store);
-      store.appendModuleProcessRecord(
+      const store = seededStore("first", [
         processRecord({
           ...("moduleGenerationId" in mismatch
             ? { moduleGenerationId: mismatch.moduleGenerationId }
             : {}),
         }),
-      );
+      ]);
+      const claim = seedActiveClaim(store);
       store.updateModuleProcessRecordState("process-generation-1", "running");
 
       expect(() =>
@@ -828,9 +878,8 @@ describe("CORE Module process and submission records", () => {
   );
 
   it("rejects a submission record for a Claim owned by another Module", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store, { consumerId: "another-module" });
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
 
     expect(() =>
@@ -844,9 +893,8 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("rejects a submission record whose input digest is not the persisted Claim input", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
 
     expect(() =>
@@ -896,7 +944,7 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("acknowledges a Claim and removes its submission record in one Core-state update", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedSubmittedClaim(store);
     const before = store.revision;
 
@@ -931,20 +979,11 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("removes only the acknowledged Claim's submission and preserves another active Claim", () => {
-    const store = openStore("first");
-    const firstClaim = seedActiveClaim(store);
     const secondModuleId = "worker-two";
     const secondModuleGenerationId = "module-generation-2";
     const secondProcessGenerationId = "process-generation-2";
-    const secondClaim = seedActiveClaim(store, {
-      consumerId: secondModuleId,
-      moduleGenerationId: secondModuleGenerationId,
-      pageId: "input-two",
-    });
-
-    store.appendModuleProcessRecord(processRecord());
-    store.updateModuleProcessRecordState("process-generation-1", "running");
-    const secondProcess = store.appendModuleProcessRecord(
+    const store = seededStore("first", [
+      processRecord(),
       processRecord({
         moduleId: secondModuleId,
         moduleGenerationId: secondModuleGenerationId,
@@ -954,7 +993,16 @@ describe("CORE Module process and submission records", () => {
           secondModuleId,
         ),
       }),
-    );
+    ]);
+    const firstClaim = seedActiveClaim(store);
+    const secondClaim = seedActiveClaim(store, {
+      consumerId: secondModuleId,
+      moduleGenerationId: secondModuleGenerationId,
+      pageId: "input-two",
+    });
+
+    store.updateModuleProcessRecordState("process-generation-1", "running");
+    const secondProcess = store.getModuleProcessRecord(secondProcessGenerationId)!;
     store.updateModuleProcessRecordState(secondProcessGenerationId, "running");
 
     const firstSubmission = store.appendModuleSubmissionRecord(
@@ -988,7 +1036,7 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("releases a Claim and removes its submission record in one Core-state update", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedSubmittedClaim(store);
     const before = store.revision;
 
@@ -1001,7 +1049,7 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("negatively acknowledges a Claim and removes its submission record in one Core-state update", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedSubmittedClaim(store);
     const before = store.revision;
 
@@ -1017,7 +1065,7 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("persists a non-retryable negative acknowledgement and its failure code", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedSubmittedClaim(store);
     const failure = {
       code: "permanent-module-failure",
@@ -1046,7 +1094,7 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("fails closed when a terminal Claim still has a submission record", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedSubmittedClaim(store);
     const submission = store.getModuleSubmissionRecord(claim.runId)!;
     store.releaseDeliveryClaim(claim);
@@ -1065,8 +1113,7 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("writes the submission record in one Core-state revision", () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
     store.updateModuleProcessRecordState("process-generation-1", "running");
     const claim = seedActiveClaim(store);
     const beforeSubmission = store.revision;
@@ -1084,9 +1131,8 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("pins a process record that a submission record still references", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionForClaim(store, claim));
     stoppedRecordWriterFor(store).writeStopped("process-generation-1");
@@ -1103,9 +1149,8 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("pins a process record while its Module generation still has an active Claim", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     stoppedRecordWriterFor(store).writeStopped("process-generation-1");
 
     expect(() => store.removeModuleProcessRecord("process-generation-1")).toThrowError(
@@ -1121,8 +1166,7 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("refuses to remove a process record that has not stopped", () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
     expect(() => store.removeModuleProcessRecord("process-generation-1")).toThrowError(
       expect.objectContaining<Partial<ModuleProcessRecordError>>({
         code: "MODULE_PROCESS_RECORD_IN_USE",
@@ -1144,10 +1188,10 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("accepts exactly the control-group path Core derives", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const derived = cgroupPathFor("process-generation-1");
     expect(isDerivedModuleCgroupPath(derived, "process-generation-1")).toBe(true);
-    expect(store.appendModuleProcessRecord(processRecord())).toMatchObject({
+    expect(store.getModuleProcessRecord("process-generation-1")).toMatchObject({
       moduleCgroupPath: derived,
     });
   });
@@ -1166,10 +1210,10 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("persists an unrestricted effect boundary without treating it as retry evidence", () => {
-    const store = openStore("first");
-    expect(store.appendModuleProcessRecord(processRecord({
+    const store = seededStore("first", [processRecord({
       declaredExternalEffects: "unrestricted",
-    }))).toMatchObject({
+    })]);
+    expect(store.getModuleProcessRecord("process-generation-1")).toMatchObject({
       declaredExternalEffects: "unrestricted",
     });
   });
@@ -1200,9 +1244,8 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("fails closed when a persisted document holds an orphan submission record", () => {
-    const store = openStore("first");
+    const store = seededStore("first", [processRecord()]);
     const claim = seedActiveClaim(store);
-    store.appendModuleProcessRecord(processRecord());
     store.updateModuleProcessRecordState("process-generation-1", "running");
     store.appendModuleSubmissionRecord(submissionForClaim(store, claim));
 
@@ -1234,9 +1277,8 @@ describe("CORE Module process and submission records", () => {
   ] as const)(
     "fails closed when a persisted submission record says %s",
     (_label, changeProcessRecord) => {
-      const store = openStore("first");
+      const store = seededStore("first", [processRecord()]);
       const claim = seedActiveClaim(store);
-      store.appendModuleProcessRecord(processRecord());
       store.updateModuleProcessRecordState("process-generation-1", "running");
       store.appendModuleSubmissionRecord(submissionForClaim(store, claim));
 
@@ -1369,8 +1411,7 @@ describe("CORE Module process and submission records", () => {
     });
 
     it("rejects a submission record whose process generation is not a usable name", () => {
-      const store = openStore("first");
-      store.appendModuleProcessRecord(processRecord());
+      const store = seededStore("first", [processRecord()]);
       store.updateModuleProcessRecordState("process-generation-1", "running");
       expect(() =>
         store.appendModuleSubmissionRecord(
@@ -1385,8 +1426,7 @@ describe("CORE Module process and submission records", () => {
   });
 
   it("keeps records unchanged when the atomic write of an update fails", () => {
-    const store = openStore("first");
-    store.appendModuleProcessRecord(processRecord());
+    const store = seededStore("first", [processRecord()]);
     const before = store.revision;
 
     rmSync(root, { recursive: true, force: true });

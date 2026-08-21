@@ -26,6 +26,7 @@ import type {
   ModuleProcessRecord,
   ModuleProcessStoppedRecordWriter,
 } from "../../../src/core/module-process-records.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
 
 const NOW = "2026-07-24T00:00:00.000Z";
 const PACKAGE_DIGEST = `sha256:${"a".repeat(64)}`;
@@ -96,24 +97,15 @@ function coordinator(
   });
 }
 
-function appendStoppedProcessAndSubmission(
-  core: FileCoreStateStore,
-  stoppedRecordWriter: ModuleProcessStoppedRecordWriter,
-  claim: {
-    readonly moduleJobId: string;
-    readonly claimToken: string;
-    readonly runId: string;
-    readonly attempt: number;
-    readonly moduleGenerationId: string;
-  },
-): void {
-  const processGenerationId = "process-generation-1";
-  core.appendModuleProcessRecord({
+const PROCESS_GENERATION_ID = "process-generation-1";
+
+function stoppedProcessSeed(moduleGenerationId: string): ModuleProcessRecord {
+  return {
     schemaVersion: "dolly.module-process-record/1",
     instanceId: "instance-1",
     moduleId: "worker",
-    moduleGenerationId: claim.moduleGenerationId,
-    processGenerationId,
+    moduleGenerationId,
+    processGenerationId: PROCESS_GENERATION_ID,
     packageDigest: PACKAGE_DIGEST,
     configurationReference: {
       configId: "config-1",
@@ -126,13 +118,26 @@ function appendStoppedProcessAndSubmission(
     moduleCgroupPath: deriveModuleCgroupPath("/system.slice/dolly-core.service", {
       instanceId: "instance-1",
       moduleId: "worker",
-      processGenerationId,
+      processGenerationId: PROCESS_GENERATION_ID,
     }).filesystemPath,
     state: "starting",
     createdAt: NOW,
     updatedAt: NOW,
-  });
-  core.updateModuleProcessRecordState(processGenerationId, "running");
+  };
+}
+
+function appendSubmissionAndStop(
+  core: FileCoreStateStore,
+  stoppedRecordWriter: ModuleProcessStoppedRecordWriter,
+  claim: {
+    readonly moduleJobId: string;
+    readonly claimToken: string;
+    readonly runId: string;
+    readonly attempt: number;
+    readonly moduleGenerationId: string;
+  },
+): void {
+  core.updateModuleProcessRecordState(PROCESS_GENERATION_ID, "running");
   core.appendModuleSubmissionRecord({
     schemaVersion: "dolly.module-submission-record/1",
     moduleJobId: claim.moduleJobId,
@@ -140,11 +145,11 @@ function appendStoppedProcessAndSubmission(
     runId: claim.runId,
     attempt: claim.attempt,
     moduleGenerationId: claim.moduleGenerationId,
-    processGenerationId,
+    processGenerationId: PROCESS_GENERATION_ID,
     inputDigest: canonicalJsonDigest(core.deliveries.inspectClaimInput(claim)),
     createdAt: NOW,
   });
-  stoppedRecordWriter.writeStopped(processGenerationId);
+  stoppedRecordWriter.writeStopped(PROCESS_GENERATION_ID);
 }
 
 describe("CORE startup journal recovery", () => {
@@ -163,6 +168,13 @@ describe("CORE startup journal recovery", () => {
   });
 
   it("reports a known prepared result as deferred when only mailbox capacity is missing", async () => {
+    // A legacy document can no longer accept caller-supplied process records,
+    // so the fixture seeds the exact stopped-process seed into the freshly
+    // created document before the store is reopened.
+    openCoreWithStoppedRecordWriter(statePath, "first");
+    seedLegacyProcessRecords(statePath, {
+      processRecords: [stoppedProcessSeed("generation-1")],
+    });
     const {
       store: first,
       stoppedRecordWriter,
@@ -188,7 +200,7 @@ describe("CORE startup journal recovery", () => {
       maxCount: 1,
       maxBytes: 1024 * 1024,
     })!;
-    appendStoppedProcessAndSubmission(first, stoppedRecordWriter, claim);
+    appendSubmissionAndStop(first, stoppedRecordWriter, claim);
     const repository = new FileModuleResultCommitRepository({ path: journalPath });
     const limited = createModuleResultCommitCoordinator({
       core: first,
@@ -245,6 +257,13 @@ describe("CORE startup journal recovery", () => {
   });
 
   it("recovers a prepared result for an active Claim with its exact submission", async () => {
+    // A legacy document can no longer accept caller-supplied process records,
+    // so the fixture seeds the exact stopped-process seed into the freshly
+    // created document before the store is reopened.
+    openCoreWithStoppedRecordWriter(statePath, "first");
+    seedLegacyProcessRecords(statePath, {
+      processRecords: [stoppedProcessSeed("generation-1")],
+    });
     const {
       store: first,
       stoppedRecordWriter,
@@ -265,7 +284,7 @@ describe("CORE startup journal recovery", () => {
       maxCount: 1,
       maxBytes: 1024 * 1024,
     })!;
-    appendStoppedProcessAndSubmission(first, stoppedRecordWriter, claim);
+    appendSubmissionAndStop(first, stoppedRecordWriter, claim);
     const repository = new FileModuleResultCommitRepository({ path: journalPath });
     const interrupted = coordinator(first, repository, (event) => {
       if (event.phase === "after-block-effect") throw new Error("simulated interruption");
@@ -320,6 +339,13 @@ describe("CORE startup journal recovery", () => {
   });
 
   it("fails closed when a committed result journal has an active Claim", async () => {
+    // A legacy document can no longer accept caller-supplied process records,
+    // so the fixture seeds the exact stopped-process seed into the freshly
+    // created document before the store is reopened.
+    openCoreWithStoppedRecordWriter(statePath, "first");
+    seedLegacyProcessRecords(statePath, {
+      processRecords: [stoppedProcessSeed("generation-1")],
+    });
     const {
       store: first,
       stoppedRecordWriter,
@@ -339,7 +365,7 @@ describe("CORE startup journal recovery", () => {
       maxCount: 1,
       maxBytes: 1024 * 1024,
     })!;
-    appendStoppedProcessAndSubmission(first, stoppedRecordWriter, claim);
+    appendSubmissionAndStop(first, stoppedRecordWriter, claim);
     const repository = new FileModuleResultCommitRepository({ path: journalPath });
     let captured: Buffer | undefined;
     let interrupted = false;

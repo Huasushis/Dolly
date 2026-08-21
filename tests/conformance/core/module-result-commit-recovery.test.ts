@@ -8,7 +8,11 @@ import { DeliveryStore } from "../../../src/core/delivery-store.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
-import type { ModuleSubmissionRecord } from "../../../src/core/module-process-records.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
+import type {
+  ModuleProcessRecord,
+  ModuleSubmissionRecord,
+} from "../../../src/core/module-process-records.js";
 import {
   InMemoryModuleResultCommitRepository,
   ModuleResultCommitCoordinator,
@@ -1085,7 +1089,37 @@ describe("CORE-004 recoverable output commit", () => {
         });
       }
 
+      const processRecord: ModuleProcessRecord = {
+        schemaVersion: "dolly.module-process-record/1",
+        instanceId: "instance-1",
+        moduleId: "worker",
+        moduleGenerationId,
+        processGenerationId,
+        packageDigest: `sha256:${"a".repeat(64)}`,
+        configurationReference: {
+          configId: "config-1",
+          revision: `sha256:${"b".repeat(64)}`,
+          configVersion: 1,
+        },
+        declaredExternalEffects: "core-capabilities-only",
+        serviceInvocationId: invocationId,
+        bootId,
+        moduleCgroupPath: deriveModuleCgroupPath(
+          "/system/dolly-core.service",
+          {
+            instanceId: "instance-1",
+            moduleId: "worker",
+            processGenerationId,
+          },
+        ).filesystemPath,
+        state: "starting",
+        createdAt: NOW,
+        updatedAt: NOW,
+      };
+
       try {
+        openCore(`${phase}-seed`);
+        seedLegacyProcessRecords(statePath, { processRecords: [processRecord] });
         const core = openCore("initial");
         core.deliveries.createPage("input");
         core.deliveries.createPage("output");
@@ -1102,33 +1136,7 @@ describe("CORE-004 recoverable output commit", () => {
           maxCount: 1,
           maxBytes: 1024 * 1024,
         })!;
-        core.appendModuleProcessRecord({
-          schemaVersion: "dolly.module-process-record/1",
-          instanceId: "instance-1",
-          moduleId: "worker",
-          moduleGenerationId,
-          processGenerationId,
-          packageDigest: `sha256:${"a".repeat(64)}`,
-          configurationReference: {
-            configId: "config-1",
-            revision: `sha256:${"b".repeat(64)}`,
-            configVersion: 1,
-          },
-          declaredExternalEffects: "core-capabilities-only",
-          serviceInvocationId: invocationId,
-          bootId,
-          moduleCgroupPath: deriveModuleCgroupPath(
-            "/system.slice/dolly-core.service",
-            {
-              instanceId: "instance-1",
-              moduleId: "worker",
-              processGenerationId,
-            },
-          ).filesystemPath,
-          state: "starting",
-          createdAt: NOW,
-          updatedAt: NOW,
-        });
+
         core.updateModuleProcessRecordState(processGenerationId, "running");
         core.appendModuleSubmissionRecord({
           schemaVersion: "dolly.module-submission-record/1",

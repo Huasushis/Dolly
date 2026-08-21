@@ -5,6 +5,8 @@ import { canonicalJsonDigest } from "../../../src/core/canonical-json.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { FileMediaByteStore } from "../../../src/core/file-media-byte-store.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
+import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
+import { seedLegacyProcessRecords } from "../core/fixtures/process-id-v19-cutover.js";
 import { createFileCoreActiveRunModelMediaResolver } from "../../../src/core/media-capability/index.js";
 import type { ModelMediaResolutionRequest } from "../../../src/core/model-provider-broker.js";
 
@@ -23,51 +25,20 @@ describe("FileCore active-Run model Media resolver", () => {
     let blockId = 0;
     let deliveryId = 0;
     try {
-      const core = new FileCoreStateStore({
-        path: join(scratch, "core-state.json"),
-        maxFailedAttempts: 1,
-        nextBlockId: () => `block-active-media-${++blockId}`,
-        nextDeliveryId: (kind) => `${kind}-active-media-${++deliveryId}`,
-        now: () => NOW,
-        media: {
-          durability: "persistent",
-          bytes: new FileMediaByteStore({
-            directory: join(scratch, "media"),
-            maxMediaBytes: 1024,
-          }),
-          inspector: {
-            inspect: async () => ({ mimeType: "image/png", width: 2, height: 1 }),
-          },
+      const coreStatePath = join(scratch, "core-state.json");
+      const mediaOptions = {
+        durability: "persistent" as const,
+        bytes: new FileMediaByteStore({
+          directory: join(scratch, "media"),
           maxMediaBytes: 1024,
-          idNamespace: "active-run-resolver",
+        }),
+        inspector: {
+          inspect: async () => ({ mimeType: "image/png", width: 2, height: 1 }),
         },
-      });
-      if (!core.media) throw new Error("Media was not enabled");
-      core.deliveries.createPage("input");
-      core.deliveries.registerConsumer("input", MODULE_ID, "from-now");
-      const bytes = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4);
-      const media = await core.media.registerMedia({
-        registrationId: "registration-active-media",
-        bytes,
-        declaredMimeType: "image/png",
-        provenance: { sourceClass: "streamed-upload" },
-      });
-      const block = core.blocks.commit({
-        payload: {
-          schema: "dolly.content/1",
-          value: { items: [{ type: "media-reference", mediaId: media.mediaId }] },
-        },
-      }, { kind: "external", id: "test" });
-      core.deliveries.append("input", block.id);
-      const claim = core.deliveries.claim({
-        consumerId: MODULE_ID,
-        pageIds: ["input"],
-        moduleGenerationId: MODULE_GENERATION_ID,
-        maxCount: 1,
-        maxBytes: 1024,
-      });
-      if (!claim) throw new Error("The test Claim was not created");
-      core.appendModuleProcessRecord({
+        maxMediaBytes: 1024,
+        idNamespace: "active-run-resolver",
+      };
+      const processRecordBody: ModuleProcessRecord = {
         schemaVersion: "dolly.module-process-record/1",
         instanceId: INSTANCE_ID,
         moduleId: MODULE_ID,
@@ -93,7 +64,55 @@ describe("FileCore active-Run model Media resolver", () => {
         state: "starting",
         createdAt: NOW,
         updatedAt: NOW,
+      };
+      const openCoreState = () => {
+        let reopenedBlockId = 0;
+        let reopenedDeliveryId = 0;
+        void blockId;
+        void deliveryId;
+        return new FileCoreStateStore({
+          path: coreStatePath,
+          maxFailedAttempts: 1,
+          nextBlockId: () => `block-active-media-${++reopenedBlockId}`,
+          nextDeliveryId: (kind) => `${kind}-active-media-${++reopenedDeliveryId}`,
+          now: () => NOW,
+          media: mediaOptions,
+        });
+      };
+      // A legacy document can no longer accept caller-supplied process
+      // records, so the fixture seeds the exact running-process record into
+      // the freshly created document before the store is reopened.
+      const base = openCoreState();
+      seedLegacyProcessRecords(coreStatePath, {
+        processRecords: [processRecordBody],
       });
+      void base;
+      const core = openCoreState();
+      if (!core.media) throw new Error("Media was not enabled");
+      core.deliveries.createPage("input");
+      core.deliveries.registerConsumer("input", MODULE_ID, "from-now");
+      const bytes = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4);
+      const media = await core.media.registerMedia({
+        registrationId: "registration-active-media",
+        bytes,
+        declaredMimeType: "image/png",
+        provenance: { sourceClass: "streamed-upload" },
+      });
+      const block = core.blocks.commit({
+        payload: {
+          schema: "dolly.content/1",
+          value: { items: [{ type: "media-reference", mediaId: media.mediaId }] },
+        },
+      }, { kind: "external", id: "test" });
+      core.deliveries.append("input", block.id);
+      const claim = core.deliveries.claim({
+        consumerId: MODULE_ID,
+        pageIds: ["input"],
+        moduleGenerationId: MODULE_GENERATION_ID,
+        maxCount: 1,
+        maxBytes: 1024,
+      });
+      if (!claim) throw new Error("The test Claim was not created");
       core.updateModuleProcessRecordState(PROCESS_GENERATION_ID, "running");
       core.appendModuleSubmissionRecord({
         schemaVersion: "dolly.module-submission-record/1",

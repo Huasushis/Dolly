@@ -16,7 +16,9 @@ import {
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
+import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
 import { ModuleResultCommitCoordinator } from "../../../src/core/module-result-commit.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
 import {
   ReactiveModuleRuntime,
   type ReactiveModuleFailure,
@@ -60,47 +62,51 @@ describe("Reactive Module runtime with a real Extension process", () => {
     let runtime: ReactiveModuleRuntime | undefined;
 
     try {
-      const core = new FileCoreStateStore({
-        path: coreStatePath,
-        maxFailedAttempts: 3,
-        nextBlockId: () => `block-${++blockId}`,
-        nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
-        now: () => NOW,
+      const openCoreState = (): FileCoreStateStore =>
+        new FileCoreStateStore({
+          path: coreStatePath,
+          maxFailedAttempts: 3,
+          nextBlockId: () => `block-${++blockId}`,
+          nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
+          now: () => NOW,
+        });
+      const base = openCoreState();
+      const processGenerationId = "process-generation-real-process-test-1";
+      seedLegacyProcessRecords(coreStatePath, {
+        processRecords: [{
+          schemaVersion: "dolly.module-process-record/1",
+          instanceId: "instance-real-process",
+          moduleId: "worker",
+          moduleGenerationId: "module-generation-1",
+          processGenerationId,
+          packageDigest: `sha256:${"a".repeat(64)}`,
+          configurationReference: {
+            configId: "config-real-process",
+            revision: `sha256:${"b".repeat(64)}`,
+            configVersion: 1,
+          },
+          declaredExternalEffects: "none",
+          serviceInvocationId: "2812432ad29e4d3bbd6776c62cafa929",
+          bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
+          moduleCgroupPath: deriveModuleCgroupPath(
+            "/system.slice/dolly-core.service",
+            {
+              instanceId: "instance-real-process",
+              moduleId: "worker",
+              processGenerationId,
+            },
+          ).filesystemPath,
+          state: "starting",
+          createdAt: NOW,
+          updatedAt: NOW,
+        }],
       });
+      void base;
+      const core = openCoreState();
       core.deliveries.createPage("input");
       core.deliveries.createPage("output");
       core.deliveries.registerConsumer("input", "worker", "from-now");
       core.deliveries.registerConsumer("output", "sink", "from-now");
-
-      const processGenerationId = "process-generation-real-process-test-1";
-      core.appendModuleProcessRecord({
-        schemaVersion: "dolly.module-process-record/1",
-        instanceId: "instance-real-process",
-        moduleId: "worker",
-        moduleGenerationId: "module-generation-1",
-        processGenerationId,
-        packageDigest: `sha256:${"a".repeat(64)}`,
-        configurationReference: {
-          configId: "config-real-process",
-          revision: `sha256:${"b".repeat(64)}`,
-          configVersion: 1,
-        },
-        declaredExternalEffects: "none",
-        serviceInvocationId: "2812432ad29e4d3bbd6776c62cafa929",
-        bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
-        moduleCgroupPath: deriveModuleCgroupPath(
-          "/system.slice/dolly-core.service",
-          {
-            instanceId: "instance-real-process",
-            moduleId: "worker",
-            processGenerationId,
-          },
-        ).filesystemPath,
-        state: "starting",
-        createdAt: NOW,
-        updatedAt: NOW,
-      });
-
       const firstInputBlock = core.blocks.commit(proposal("first input"), {
         kind: "external",
         id: "console",
