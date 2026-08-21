@@ -38,8 +38,8 @@ product activation is systemd user-service only; system-service probes remain
 lower-level evidence outside the v1 profile.
 
 For executable Modules the order is platform refusal, controller-lock ownership,
-current configuration claim, exact premise resolution, service/runtime proof and
-delegated-root preparation, authoritative-store validation and startup recovery,
+current configuration claim, authoritative-store validation, exact premise
+resolution, service/runtime proof, delegated-root preparation, startup recovery,
 one-use handoff, installed composition, fresh generations, then Ready. Restart
 revalidates persistent bytes and remints every live object. Migration installs a
 complete premise record atomically with its target configuration and never
