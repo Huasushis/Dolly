@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, realpathSync, statSync } from "node:fs";
 import { parse, resolve } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
+import { observeHostPlatform } from "./host-platform.js";
 
 const INSTANCE_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -175,6 +176,18 @@ export class InstanceControllerLock {
   static async acquire(
     options: AcquireInstanceControllerLockOptions,
   ): Promise<InstanceControllerLock> {
+    // Trusted internal platform preflight, read through the same host-owned
+    // observer the daemon, Linux Module activation, and Core service binding
+    // gates use. It runs before `canonicalDirectory` so an unsupported host is
+    // refused before any durable mutation (the controller namespace mkdir) or
+    // before the kernel listen that proves ownership.
+    const platform = observeHostPlatform();
+    if (platform !== "linux") {
+      throw new InstanceControllerLockError(
+        "CONTROLLER_LOCK_PLATFORM_UNSUPPORTED",
+        `Crash-recoverable controller locking requires Linux but this process runs on ${platform}`,
+      );
+    }
     const directory = canonicalDirectory(options.directory);
     const info = validateIdentity(options);
     const endpoint = controllerEndpoint(directory, info.instanceId);
