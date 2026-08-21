@@ -1,0 +1,48 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-TOOL-009",
+  "kind": "crash_recovery",
+  "covers": ["REQ-TOOL-001", "REQ-TOOL-006", "INV-STORAGE-017"],
+  "initial": {
+    "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000349",
+    "ledger_state": "AUTHORIZED",
+    "ledger_revision": 1,
+    "frozen_tool_server_generation": 7,
+    "exact_generation_state": "Ready",
+    "stored_deadline_state": "live",
+    "server_request_id": "0198ab31-6c44-7e8a-b2bb-000000000449",
+    "upstream_name": "read_file",
+    "arguments": {"path": "notes/example.txt"},
+    "outbound_digest": null,
+    "zero_byte_proof": "verified_exclusive_send_gate",
+    "transport_eligible_byte_count": 0
+  },
+  "stimulus": {
+    "events": [
+      "database_connection_lost_before_dispatch_compare_and_set",
+      "database_reopened_with_exact_generation_still_fenced_ready",
+      "dispatch_compare_and_set_commits",
+      "one_use_send_permit_consumed"
+    ]
+  },
+  "expected": {
+    "outcome": "same_authorized_operation_dispatched_once",
+    "assertions": [
+      {"path": "/operation_id", "op": "unchanged"},
+      {"path": "/ledger_state", "op": "equals", "value": "DISPATCHED"},
+      {"path": "/ledger_revision", "op": "equals", "value": 2},
+      {"path": "/selected_tool_server_generation", "op": "equals", "value": 7},
+      {"path": "/outbound_digest", "op": "equals", "value": "sha256:85cf52f49c90ecb8457c0849d765afa5dec5923c95d2ad790f9090a71cac92d6"},
+      {"path": "/send_permit_issue_count", "op": "equals", "value": 1},
+      {"path": "/transport_send_attempt_count", "op": "equals", "value": 1},
+      {"path": "/replacement_generation_dispatch_count", "op": "equals", "value": 0}
+    ],
+    "emitted": [
+      {
+        "event": "ToolOperationDispatched",
+        "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000349"
+      }
+    ],
+    "crash_label": "tool_authorized_commit_before_dispatch_cas"
+  }
+}

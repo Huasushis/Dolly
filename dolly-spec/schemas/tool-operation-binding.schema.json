@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/tool-operation-binding.schema.json",
+  "title": "Durable accepted Tool operation binding",
+  "$defs": {
+    "ConfirmationDecision": {
+      "oneOf": [
+        { "const": "not_required" },
+        { "$ref": "common.schema.json#/$defs/UuidV7" }
+      ]
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "instance_id", "module_id", "operation_id", "tool_transaction_id",
+    "activation_id", "activation_lease_generation", "config_revision",
+    "tool_server_id", "tool_name", "tool_schema_digest", "arguments",
+    "side_effect_class", "idempotency", "idempotency_key", "authorized_deadline",
+    "request_digest", "tool_server_generation", "server_request_id",
+    "server_contract", "confirmation_decision"
+  ],
+  "properties": {
+    "schema": { "const": "dolly.tool-operation-binding/v1" },
+    "instance_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "module_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "operation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "tool_transaction_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "activation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "activation_lease_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+    "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "tool_server_id": { "$ref": "common.schema.json#/$defs/StableId" },
+    "tool_name": { "$ref": "common.schema.json#/$defs/StableId" },
+    "tool_schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "arguments": { "$ref": "tool-invoke.schema.json#/properties/arguments" },
+    "side_effect_class": { "$ref": "tool-invoke.schema.json#/properties/side_effect_class" },
+    "idempotency": { "$ref": "tool-broker-config.schema.json#/$defs/IdempotencyPolicy" },
+    "idempotency_key": { "$ref": "tool-invoke.schema.json#/properties/idempotency_key" },
+    "authorized_deadline": { "$ref": "common.schema.json#/$defs/Timestamp" },
+    "request_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "tool_server_generation": { "$ref": "common.schema.json#/$defs/Seq" },
+    "server_request_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+    "server_contract": { "$ref": "tool-broker-config.schema.json#/$defs/Server" },
+    "confirmation_decision": { "$ref": "#/$defs/ConfirmationDecision" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "side_effect_class": { "const": "idempotent_write" } },
+        "required": ["side_effect_class"]
+      },
+      "then": {
+        "properties": {
+          "idempotency": {
+            "type": "object",
+            "properties": { "kind": { "const": "argument_key" } },
+            "required": ["kind"]
+          },
+          "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[ -~]+$" }
+        }
+      },
+      "else": {
+        "properties": {
+          "idempotency": {
+            "type": "object",
+            "properties": { "kind": { "const": "none" } },
+            "required": ["kind"]
+          },
+          "idempotency_key": { "type": "null" }
+        }
+      }
+    }
+  ]
+}

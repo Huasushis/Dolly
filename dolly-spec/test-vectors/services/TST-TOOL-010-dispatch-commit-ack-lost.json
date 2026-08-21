@@ -1,0 +1,41 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-TOOL-010",
+  "kind": "crash_recovery",
+  "covers": ["REQ-TOOL-001", "REQ-TOOL-002", "REQ-TOOL-006", "INV-STORAGE-017"],
+  "initial": {
+    "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000350",
+    "ledger_state": "AUTHORIZED",
+    "ledger_revision": 1,
+    "outbound_digest": null,
+    "transport_sent_byte_count": 0
+  },
+  "stimulus": {
+    "events": [
+      "dispatch_compare_and_set_commits_revision_2",
+      "sqlite_commit_acknowledgement_lost_before_send_permit_release",
+      "host_process_killed",
+      "database_reopened_and_nonterminal_rows_recovered"
+    ]
+  },
+  "expected": {
+    "outcome": "durable_send_possible_boundary_without_redispatch",
+    "assertions": [
+      {"path": "/operation_id", "op": "unchanged"},
+      {"path": "/ledger_state", "op": "equals", "value": "UNKNOWN"},
+      {"path": "/ledger_revision", "op": "equals", "value": 3},
+      {"path": "/outbound_digest", "op": "equals", "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      {"path": "/send_permit_issue_count", "op": "equals", "value": 0},
+      {"path": "/transport_sent_byte_count", "op": "equals", "value": 0},
+      {"path": "/automatic_redispatch_count", "op": "equals", "value": 0},
+      {"path": "/result/error/code", "op": "equals", "value": "TOOL_EXTERNAL_OUTCOME_UNKNOWN"}
+    ],
+    "emitted": [
+      {
+        "event": "ToolOutcomeUnknown",
+        "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000350"
+      }
+    ],
+    "crash_label": "tool_dispatch_commit_ack_lost_before_permit"
+  }
+}

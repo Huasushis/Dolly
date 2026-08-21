@@ -75,6 +75,7 @@ Physical normalization MAY differ, but a conforming database MUST enforce the eq
 | `activation_replay_evidence` | primary `(activation_id, source_attempt, target_extension_generation)`; unique `evidence_digest` | immutable Host-verified activation-ledger continuity, outcome, and target-generation binding |
 | `activation_results` | `(activation_id, result_digest)` | staged authoritative result and conflicting evidence |
 | `runtime_event_operations` | `(runtime_source, event_key)`; unique `runtime_event_id`; unique `block_id` | trusted Runtime-event digest and replay identity |
+| `tool_call_ledger` | `(module_id, operation_id)`; unique transport correlation; unique non-null confirmation ID | closed accepted Tool binding, transition revision, dispatch digest, and terminal result authority |
 | `trace_roots` | `root_trace_id` | root time and retained lineage |
 | `trace_counters` | `(root_trace_id, counter_kind, subject)` | deterministic loop charges |
 | `quarantines` | quarantine ID | reason, evidence, resolution |
@@ -105,6 +106,10 @@ The database MUST use foreign keys or equivalent checks so that:
   and an activation-premise row cannot exist without its exact configuration
   revision, complete selected definition/binding set, and verified digests;
 - a committed activation output cannot exist without its Activation; and
+- a Tool-call row cannot exist without its exact Activation and configuration
+  revision; its instance identity MUST equal `core_meta`, all indexed fields
+  MUST equal the canonical closed record, and its operation, outbound, record,
+  and terminal-result digests MUST verify for the stored state; and
 - a durable subscription cannot reference an absent Page or Module tombstone.
 
 ## 4. Sequence allocation
@@ -316,6 +321,121 @@ An explicit dead-letter or skip transaction verifies the expected current cursor
 
 For dead-letter, the same transaction MUST insert one `subscription_dead_letters` record for every Delivery in the range, including its original Delivery and Block identities. Those records MUST keep the referenced Blocks reachable for at least the configured dead-letter retention period. For skip, the immutable evidence MUST identify the exact range and reviewed discard authority; no payload-retention claim is made.
 
+### 5.10 Tool call ledger
+
+The Tool call ledger defined by the
+[Tool Broker](../services/tool-broker.md) is a logical table in the one
+authoritative Runtime SQLite database. It is written under the same exclusive
+instance lock and durability profile as Core state. A dedicated Tool Broker
+database, sidecar ledger, adapter-owned store, or process-memory replay log is
+not a v1 authority because it would place the dispatch decision outside this
+lock, integrity check, and startup-recovery order.
+
+The minimum logical columns and constraints are equivalent to:
+
+```sql
+CREATE TABLE tool_call_ledger (
+  instance_id                 TEXT    NOT NULL,
+  module_id                   TEXT    NOT NULL,
+  operation_id                TEXT    NOT NULL,
+  ledger_revision             INTEGER NOT NULL
+                                      CHECK (ledger_revision BETWEEN 1 AND 9007199254740991),
+  state                       TEXT    NOT NULL
+                                      CHECK (state IN (
+                                        'AUTHORIZED', 'DISPATCHED',
+                                        'SUCCEEDED', 'FAILED', 'UNKNOWN'
+                                      )),
+  activation_id               TEXT    NOT NULL,
+  config_revision             INTEGER NOT NULL,
+  tool_server_id              TEXT    NOT NULL,
+  tool_name                   TEXT    NOT NULL,
+  tool_server_generation      INTEGER NOT NULL,
+  server_request_id           TEXT    NOT NULL,
+  request_digest              TEXT    NOT NULL,
+  operation_digest            TEXT    NOT NULL,
+  outbound_digest             TEXT,
+  idempotency_argument_pointer TEXT,
+  confirmation_id              TEXT    UNIQUE,
+  terminal_result_digest      TEXT,
+  record_jcs                  BLOB    NOT NULL,
+  record_digest               TEXT    NOT NULL,
+  PRIMARY KEY (module_id, operation_id),
+  UNIQUE (tool_server_id, tool_server_generation, server_request_id),
+  FOREIGN KEY (activation_id) REFERENCES activations(activation_id),
+  FOREIGN KEY (config_revision) REFERENCES config_revisions(config_revision),
+  CHECK (
+    (state = 'AUTHORIZED' AND ledger_revision = 1
+                           AND outbound_digest IS NULL
+                           AND terminal_result_digest IS NULL) OR
+    (state = 'DISPATCHED' AND ledger_revision = 2
+                           AND outbound_digest IS NOT NULL
+                           AND terminal_result_digest IS NULL) OR
+    (state IN ('SUCCEEDED', 'UNKNOWN') AND ledger_revision = 3
+                                        AND outbound_digest IS NOT NULL
+                                        AND terminal_result_digest IS NOT NULL) OR
+    (state = 'FAILED' AND ledger_revision IN (2, 3)
+                      AND terminal_result_digest IS NOT NULL)
+  )
+);
+CREATE INDEX tool_call_ledger_recovery
+  ON tool_call_ledger(state, module_id, operation_id);
+```
+
+`record_jcs` is the exact
+[`dolly.tool-call-ledger/v1`](../../../schemas/tool-call-ledger-record.schema.json)
+document. Because `record_jcs` is already the exact JCS byte sequence,
+`record_digest` is stored outside that document and equals
+`sha256(record_jcs)`; it covers state and revision without a self-referential
+digest. Indexed identity and digest columns are projections,
+not a second authority, and MUST equal the decoded canonical record on every
+load. `idempotency_argument_pointer` is null for policy `none` and otherwise
+equals the accepted binding's exact RFC 6901 pointer. `confirmation_id` is null
+for `not_required` and otherwise equals the binding's approval ID; its unique
+constraint makes insertion the durable single-use consumption. A conforming
+physical normalization MAY avoid duplicate storage but MUST enforce all
+equivalent checks and indexes. This table has no v1 cardinality ceiling.
+
+The authorization transaction begins with the scoped primary-key lookup. An
+existing equal `request_digest` returns the row; a different digest returns the
+Tool idempotency conflict without mutation. For an absent key, the transaction
+rechecks the authenticated Activation and lease generation, exact retained
+configuration, Ready server generation, capability, confirmation, deadline,
+and limits; consumes any single-use confirmation; and inserts the complete
+revision-1 `AUTHORIZED` record. Rollback leaves neither row nor consumed
+confirmation.
+
+While the Broker holds the exact generation's exclusive transport fence, the
+transaction rechecks that generation, deadline, and resources; recomputes the
+outbound digest from the stored binding; and compare-and-sets one exact row and
+revision from `AUTHORIZED` to `DISPATCHED`. It increments the revision and
+updates `record_jcs`, `record_digest`, and `outbound_digest` atomically. The
+transport receives a one-use send permit only after that commit returns
+unambiguous success. A busy, full, rollback, process kill, or unknown commit
+acknowledgement returns no permit and emits no request byte.
+
+A terminal transaction validates exact transport correlation and the complete
+Tool result, then compare-and-sets `DISPATCHED` to one terminal state while
+atomically storing its canonical result bytes inside `record_jcs`,
+`terminal_result_digest`, new record digest, and incremented revision. The sole
+pre-dispatch terminal transaction compare-and-sets `AUTHORIZED` to `FAILED`
+with `TOOL_DISPATCH_NOT_APPLIED` and a null outbound digest after zero-byte
+proof. No transaction may replace a terminal record.
+
+Compare-and-set zero-row results are stale observations, not permission to
+repeat work. The writer rereads and returns or recovers from the winning row.
+Revision saturation or a revision gap is `STORAGE_SEQUENCE_CONFLICT` and
+releases no send permit. Corrupt schema, canonical bytes, projection, digest,
+reference, state, or transport-correlation data is `STORAGE_CORRUPT`; recovery
+does not delete, patch, or terminalize the row.
+
+After reopen and the database checks in section 7, Tool recovery streams every
+nonterminal row through the pure `recover_operation` decision from the Tool
+Broker chapter before Tool Broker readiness or a new Tool authorization.
+Terminal rows remain the idempotency and status authority. V1 authorizes no
+Tool-call-ledger cleanup, compaction that drops logical fields, or operation-ID
+reuse; any future retention transaction requires a new normative contract.
+
+
 ## 6. Acknowledgement rule
 
 The Runtime MUST acknowledge a durable operation only after SQLite commit returns success. If the acknowledgement is lost, replay MUST return the previously committed identity or result based on idempotency and uniqueness records.
@@ -467,5 +587,9 @@ it is part of every emitted storage error envelope.
   its digest cannot be replaced by fence evidence or a current-package claim.
 - **INV-STORAGE-015 — Frozen effective configuration.** A Manifest stores and verifies the complete Module-scoped effective configuration plus its value and schema-bundle digests; redispatch never substitutes current configuration.
 - **INV-STORAGE-016 — Cursor-conflict stop state.** An `ACTIVATION_CURSOR_CONFLICT` leaves the staged Activation and Module ownership unchanged while the instance enters `RecoveryRequired`.
+- **INV-STORAGE-017 — Tool dispatch authority.** The authoritative Tool row is
+  in the instance SQLite database; `AUTHORIZED` proves zero eligible request
+  bytes, and only a committed `DISPATCHED` compare-and-set may create one
+  process-local send permit that recovery never recreates.
 
 The state-transition implementation against this storage model is specified in [Reference Abstract Machine](07-reference-abstract-machine.md).

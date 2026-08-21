@@ -39,7 +39,8 @@
   "allOf": [
     {
       "if": { "properties": { "side_effect_class": { "const": "idempotent_write" } }, "required": ["side_effect_class"] },
-      "then": { "properties": { "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[ -~]+$" } } }
+      "then": { "properties": { "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[ -~]+$" } } },
+      "else": { "properties": { "idempotency_key": { "type": "null" } } }
     }
   ]
 }

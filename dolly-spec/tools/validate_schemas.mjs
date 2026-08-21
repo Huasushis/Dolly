@@ -611,6 +611,156 @@ for (const [label, field, invalidSchema] of [
   assertSemantic(label, toolBrokerConfigSemanticErrors, value, false);
 }
 
+const validToolInvoke = JSON.parse(fs.readFileSync(
+  path.join(root, "protocol", "examples", "valid-tool-invoke.json"), "utf8",
+)).params;
+assertValid(
+  "read-only Tool invoke with an idempotency key",
+  `${schemaBase}tool-invoke.schema.json`,
+  { ...validToolInvoke, idempotency_key: "not-authority" },
+  false,
+);
+
+const validToolOperationBinding = {
+  schema: "dolly.tool-operation-binding/v1",
+  instance_id: "main",
+  module_id: "main-brain",
+  operation_id: testUuid(470),
+  tool_transaction_id: testUuid(471),
+  activation_id: testUuid(472),
+  activation_lease_generation: 3,
+  config_revision: 7,
+  tool_server_id: "local-files",
+  tool_name: "read-file",
+  tool_schema_digest: toolBrokerConfig.servers["local-files"].tools["read-file"].input_schema_digest,
+  arguments: { path: "notes/example.txt" },
+  side_effect_class: "read_only",
+  idempotency: { kind: "none" },
+  idempotency_key: null,
+  authorized_deadline: "2026-08-21T01:02:03.000000Z",
+  request_digest: testDigest("1"),
+  tool_server_generation: 7,
+  server_request_id: testUuid(473),
+  server_contract: structuredClone(toolBrokerConfig.servers["local-files"]),
+  confirmation_decision: "not_required",
+};
+assertValid(
+  "closed Tool operation binding",
+  `${schemaBase}tool-operation-binding.schema.json`,
+  validToolOperationBinding,
+);
+assertValid(
+  "Tool operation binding with an undeclared field",
+  `${schemaBase}tool-operation-binding.schema.json`,
+  { ...validToolOperationBinding, mutable_queue_state: "ready" },
+  false,
+);
+assertValid(
+  "read-only Tool operation binding with an idempotency key",
+  `${schemaBase}tool-operation-binding.schema.json`,
+  { ...validToolOperationBinding, idempotency_key: "not-authority" },
+  false,
+);
+
+const validAuthorizedToolLedgerRecord = {
+  schema: "dolly.tool-call-ledger/v1",
+  ledger_revision: 1,
+  state: "AUTHORIZED",
+  operation_binding: validToolOperationBinding,
+  operation_digest: canonicalDigest(validToolOperationBinding),
+  outbound_digest: null,
+  terminal_result: null,
+  terminal_result_digest: null,
+};
+assertValid(
+  "AUTHORIZED Tool ledger record",
+  `${schemaBase}tool-call-ledger-record.schema.json`,
+  validAuthorizedToolLedgerRecord,
+);
+assertValid(
+  "AUTHORIZED Tool ledger record with an outbound digest",
+  `${schemaBase}tool-call-ledger-record.schema.json`,
+  { ...validAuthorizedToolLedgerRecord, outbound_digest: testDigest("2") },
+  false,
+);
+
+const validDispatchedToolLedgerRecord = {
+  ...validAuthorizedToolLedgerRecord,
+  ledger_revision: 2,
+  state: "DISPATCHED",
+  outbound_digest: testDigest("2"),
+};
+assertValid(
+  "DISPATCHED Tool ledger record",
+  `${schemaBase}tool-call-ledger-record.schema.json`,
+  validDispatchedToolLedgerRecord,
+);
+assertValid(
+  "DISPATCHED Tool ledger record without an outbound digest",
+  `${schemaBase}tool-call-ledger-record.schema.json`,
+  { ...validDispatchedToolLedgerRecord, outbound_digest: null },
+  false,
+);
+
+const validToolSuccessResult = {
+  operation_id: validToolOperationBinding.operation_id,
+  status: "succeeded",
+  output: { text: "example" },
+  error: null,
+  server_request_id: validToolOperationBinding.server_request_id,
+};
+
+const validSucceededToolLedgerRecord = {
+  ...validDispatchedToolLedgerRecord,
+  ledger_revision: 3,
+  state: "SUCCEEDED",
+  terminal_result: validToolSuccessResult,
+  terminal_result_digest: canonicalDigest(validToolSuccessResult),
+};
+assertValid(
+  "SUCCEEDED Tool ledger record",
+  `${schemaBase}tool-call-ledger-record.schema.json`,
+  validSucceededToolLedgerRecord,
+);
+assertValid(
+  "SUCCEEDED Tool ledger record with a skipped revision",
+  `${schemaBase}tool-call-ledger-record.schema.json`,
+  { ...validSucceededToolLedgerRecord, ledger_revision: 4 },
+  false,
+);
+
+const toolDispatchNotAppliedResult = {
+  operation_id: validToolOperationBinding.operation_id,
+  status: "failed",
+  output: null,
+  error: {
+    code: "TOOL_DISPATCH_NOT_APPLIED",
+    retryable: false,
+    outcome: "not_applied",
+    message: "The request did not cross the dispatch boundary.",
+    details: {},
+  },
+  server_request_id: null,
+};
+const validPredispatchFailedToolLedgerRecord = {
+  ...validAuthorizedToolLedgerRecord,
+  ledger_revision: 2,
+  state: "FAILED",
+  terminal_result: toolDispatchNotAppliedResult,
+  terminal_result_digest: canonicalDigest(toolDispatchNotAppliedResult),
+};
+assertValid(
+  "zero-byte-proved FAILED Tool ledger record",
+  `${schemaBase}tool-call-ledger-record.schema.json`,
+  validPredispatchFailedToolLedgerRecord,
+);
+assertValid(
+  "zero-byte-proved FAILED Tool ledger record with an outbound digest",
+  `${schemaBase}tool-call-ledger-record.schema.json`,
+  { ...validPredispatchFailedToolLedgerRecord, outbound_digest: testDigest("2") },
+  false,
+);
+
 function resolveEffectiveConfig(extensionConfig, moduleConfig) {
   return { ...structuredClone(extensionConfig), ...structuredClone(moduleConfig) };
 }
@@ -1159,14 +1309,15 @@ assertValid("closed denied Tool result", `${schemaBase}tool-result.schema.json`,
 assertSemantic("closed denied Tool result", toolResultSemanticErrors, deniedToolResult);
 const wrongToolErrorMapping = structuredClone(deniedToolResult);
 wrongToolErrorMapping.status = "failed";
-assertValid("shape-valid wrong Tool error mapping", `${schemaBase}tool-result.schema.json`, wrongToolErrorMapping);
+assertValid("wrong Tool error mapping", `${schemaBase}tool-result.schema.json`, wrongToolErrorMapping, false);
 assertSemantic("wrong Tool error mapping", toolResultSemanticErrors, wrongToolErrorMapping, false);
 const retryableTerminalToolResult = structuredClone(deniedToolResult);
 retryableTerminalToolResult.error.retryable = true;
 assertValid(
-  "shape-valid retryable terminal Tool result",
+  "retryable terminal Tool result",
   `${schemaBase}tool-result.schema.json`,
   retryableTerminalToolResult,
+  false,
 );
 assertSemantic(
   "retryable terminal Tool result",
