@@ -5,11 +5,13 @@ import { describe, expect, it } from "vitest";
 import { BlockStore, type BlockProposal, type BlockStoreSnapshot } from "../../../src/core/block-store.js";
 import { ReferenceGraph } from "../../../src/core/reference-graph.js";
 import { canonicalJsonDigest, type JsonValue } from "../../../src/core/canonical-json.js";
-import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
+import { FileCoreStateStore, type FileCoreStateStoreOptions } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { InMemoryModuleResultCommitRepository } from "../../../src/core/module-result-commit.js";
 import { createModuleResultCommitCoordinator } from "../../../src/core/module-result-commit-factory.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
+import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
 const NOW = "2026-07-24T00:00:00.000Z";
 const moduleSource = { kind: "module", id: "worker" } as const;
 const externalSource = { kind: "external", id: "console" } as const;
@@ -286,17 +288,13 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
     { consumerId: "sink", pageIds: ["output"], maxResidentCount: 8, maxResidentBytes: 1024 * 1024 },
   ];
 
-  function persistSubmittedClaim(
-    core: FileCoreStateStore,
-    moduleId: string,
-    claim: { attempt: number; claimToken: string; moduleGenerationId: string; moduleJobId: string; runId: string },
-  ): void {
+  function cleanupProcessRecord(moduleId: string): ModuleProcessRecord {
     const processGenerationId = `${moduleId}-process-generation`;
-    core.appendModuleProcessRecord({
+    return {
       schemaVersion: "dolly.module-process-record/1",
       instanceId: "cleanup-instance",
       moduleId,
-      moduleGenerationId: claim.moduleGenerationId,
+      moduleGenerationId: `${moduleId}-generation`,
       processGenerationId,
       packageDigest: `sha256:${"a".repeat(64)}`,
       configurationReference: { configId: `${moduleId}-config`, revision: `sha256:${"b".repeat(64)}`, configVersion: 1 },
@@ -307,7 +305,33 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       state: "starting",
       createdAt: NOW,
       updatedAt: NOW,
+    };
+  }
+
+  function openSeededCoreState(
+    statePath: string,
+    options: Omit<FileCoreStateStoreOptions, "path">,
+    moduleIds: readonly string[],
+  ): FileCoreStateStore {
+    // A legacy v18 document can no longer accept caller-supplied process
+    // records through the append API, so the fixture seeds the exact rows the
+    // test needs before the store is reopened.
+    new FileCoreStateStore({ path: statePath, ...options });
+    seedLegacyProcessRecords(statePath, {
+      processRecords: moduleIds.map((moduleId) => cleanupProcessRecord(moduleId)),
     });
+    return new FileCoreStateStore({ path: statePath, ...options });
+  }
+
+  function persistSubmittedClaim(
+    core: FileCoreStateStore,
+    moduleId: string,
+    claim: { attempt: number; claimToken: string; moduleGenerationId: string; moduleJobId: string; runId: string },
+  ): void {
+    const processGenerationId = `${moduleId}-process-generation`;
+    // The process record was seeded into the document before this store was
+    // opened; the running transition and the submission append below are
+    // unchanged legacy-document operations.
     core.updateModuleProcessRecordState(processGenerationId, "running");
     core.appendModuleSubmissionRecord({
       schemaVersion: "dolly.module-submission-record/1",
@@ -350,13 +374,12 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       const journalPath = join(root, "module-result-commits.json");
       let blockId = 0;
       let deliveryId = 0;
-      const core = new FileCoreStateStore({
-        path: statePath,
+      const core = openSeededCoreState(statePath, {
         maxFailedAttempts: 3,
         nextBlockId: () => `block-${++blockId}`,
         nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
         now: () => NOW,
-      });
+      }, ["worker", "worker2"]);
       setupOutput(core);
       const claim = setupWorker(core, "worker", "input");
       const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
@@ -405,13 +428,12 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       const journalPath = join(root, "module-result-commits.json");
       let blockId = 0;
       let deliveryId = 0;
-      const core = new FileCoreStateStore({
-        path: statePath,
+      const core = openSeededCoreState(statePath, {
         maxFailedAttempts: 3,
         nextBlockId: () => `block-${++blockId}`,
         nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
         now: () => NOW,
-      });
+      }, ["worker", "worker2"]);
       setupOutput(core);
       const claim = setupWorker(core, "worker", "input");
       const deliveryEffectId = moduleResultDeliveryEffectId(claim.moduleJobId, "output");
@@ -505,13 +527,12 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       const journalPath = join(root, "module-result-commits.json");
       let blockId = 0;
       let deliveryId = 0;
-      const core = new FileCoreStateStore({
-        path: statePath,
+      const core = openSeededCoreState(statePath, {
         maxFailedAttempts: 3,
         nextBlockId: () => `block-${++blockId}`,
         nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
         now: () => NOW,
-      });
+      }, ["worker", "worker2"]);
       setupOutput(core);
       const claim = setupWorker(core, "worker", "input");
       const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
@@ -596,13 +617,12 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       const journalPath = join(root, "module-result-commits.json");
       let blockId = 0;
       let deliveryId = 0;
-      const core = new FileCoreStateStore({
-        path: statePath,
+      const core = openSeededCoreState(statePath, {
         maxFailedAttempts: 3,
         nextBlockId: () => `block-${++blockId}`,
         nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
         now: () => NOW,
-      });
+      }, ["worker"]);
       setupOutput(core);
       const claim = setupWorker(core, "worker", "input");
       const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
@@ -689,13 +709,12 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       const journalPath = join(root, "module-result-commits.json");
       let blockId = 0;
       let deliveryId = 0;
-      const core = new FileCoreStateStore({
-        path: statePath,
+      const core = openSeededCoreState(statePath, {
         maxFailedAttempts: 3,
         nextBlockId: () => `block-${++blockId}`,
         nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
         now: () => NOW,
-      });
+      }, ["worker"]);
       setupOutput(core);
       const claim = setupWorker(core, "worker", "input");
       const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
@@ -766,13 +785,12 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       let blockId = 0;
       let blockIdGen = () => `block-${++blockId}`;
       let deliveryId = 0;
-      const core = new FileCoreStateStore({
-        path: statePath,
+      const core = openSeededCoreState(statePath, {
         maxFailedAttempts: 3,
         nextBlockId: blockIdGen,
         nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
         now: () => NOW,
-      });
+      }, ["worker"]);
       setupOutput(core);
       const claim = setupWorker(core, "worker", "input");
       const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
@@ -839,13 +857,12 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       const journalPath = join(root, "module-result-commits.json");
       let blockId = 0;
       let deliveryId = 0;
-      const core = new FileCoreStateStore({
-        path: statePath,
+      const core = openSeededCoreState(statePath, {
         maxFailedAttempts: 3,
         nextBlockId: () => `block-${++blockId}`,
         nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
         now: () => NOW,
-      });
+      }, ["worker", "worker2"]);
       core.deliveries.createPage("output-a");
       core.deliveries.createPage("output-b");
       core.deliveries.registerConsumer("output-a", "sink", "from-now");
@@ -898,13 +915,12 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       const journalPath = join(root, "module-result-commits.json");
       let blockId = 0;
       let deliveryId = 0;
-      const core = new FileCoreStateStore({
-        path: statePath,
+      const core = openSeededCoreState(statePath, {
         maxFailedAttempts: 3,
         nextBlockId: () => `block-${++blockId}`,
         nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
         now: () => NOW,
-      });
+      }, ["worker", "worker2"]);
       core.deliveries.createPage("output");
       core.deliveries.createPage("private");
       core.deliveries.registerConsumer("output", "sink", "from-now");
@@ -996,13 +1012,12 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       const journalPath = join(root, "module-result-commits.json");
       let blockId = 0;
       let deliveryId = 0;
-      const core = new FileCoreStateStore({
-        path: statePath,
+      const core = openSeededCoreState(statePath, {
         maxFailedAttempts: 3,
         nextBlockId: () => `block-${++blockId}`,
         nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
         now: () => NOW,
-      });
+      }, ["worker"]);
       setupOutput(core);
       const claim = setupWorker(core, "worker", "input");
       const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
@@ -1058,13 +1073,12 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       const journalPath = join(root, "module-result-commits.json");
       let blockId = 0;
       let deliveryId = 0;
-      const core = new FileCoreStateStore({
-        path: statePath,
+      const core = openSeededCoreState(statePath, {
         maxFailedAttempts: 3,
         nextBlockId: () => `block-${++blockId}`,
         nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
         now: () => NOW,
-      });
+      }, ["worker"]);
       setupOutput(core);
       const claim = setupWorker(core, "worker", "input");
       const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
@@ -1125,13 +1139,12 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       const journalPath = join(root, "module-result-commits.json");
       let blockId = 0;
       let deliveryId = 0;
-      const core = new FileCoreStateStore({
-        path: statePath,
+      const core = openSeededCoreState(statePath, {
         maxFailedAttempts: 3,
         nextBlockId: () => `block-${++blockId}`,
         nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
         now: () => NOW,
-      });
+      }, ["worker", "worker2"]);
       setupOutput(core);
       const claim = setupWorker(core, "worker", "input");
       const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
@@ -1188,13 +1201,12 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       const journalPath = join(root, "module-result-commits.json");
       let blockId = 0;
       let deliveryId = 0;
-      const core = new FileCoreStateStore({
-        path: statePath,
+      const core = openSeededCoreState(statePath, {
         maxFailedAttempts: 3,
         nextBlockId: () => `block-${++blockId}`,
         nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
         now: () => NOW,
-      });
+      }, ["worker"]);
       setupOutput(core);
       const claim = setupWorker(core, "worker", "input");
       const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });
@@ -1263,13 +1275,12 @@ describe("CORE-005 Module-result Block commit-effect retirement lifecycle", () =
       const journalPath = join(root, "module-result-commits.json");
       let blockId = 0;
       let deliveryId = 0;
-      const core = new FileCoreStateStore({
-        path: statePath,
+      const core = openSeededCoreState(statePath, {
         maxFailedAttempts: 3,
         nextBlockId: () => `block-${++blockId}`,
         nextDeliveryId: (kind) => `${kind}-${++deliveryId}`,
         now: () => NOW,
-      });
+      }, ["worker"]);
       setupOutput(core);
       const claim = setupWorker(core, "worker", "input");
       const repository = new FileModuleResultCommitRepository({ path: journalPath, maxBytes: 1024 });

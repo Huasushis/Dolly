@@ -9,6 +9,7 @@ import {
   ExtensionProcessHost,
 } from "../../../src/core/extension-process-host.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
+import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
 import { ModuleScheduler, systemSchedulerClock } from "../../../src/core/module-scheduler.js";
@@ -23,6 +24,7 @@ import {
   type ReactiveModuleRuntimeOptions,
 } from "../../../src/core/reactive-module-runtime.js";
 import { waitForAgentCase } from "../../../scripts/experiments/probes/general-agent-live-v0/wait-for-case.mjs";
+import { seedLegacyProcessRecords } from "../core/fixtures/process-id-v19-cutover.js";
 
 const NOW = "2026-08-10T00:00:00.000Z";
 const FIXTURE = fileURLToPath(
@@ -55,18 +57,19 @@ describe("general Agent waiter with a real quarantined Extension", () => {
     let extensionHost: ExtensionProcessHost | undefined;
 
     try {
-      const core = new FileCoreStateStore({
-        path: join(root, "core-state.json"),
-        maxFailedAttempts: 3,
-        nextBlockId: () => `block-agent-quarantine-${++blockSequence}`,
-        nextDeliveryId: (kind) => `${kind}-agent-quarantine-${++deliverySequence}`,
-        now: () => NOW,
-      });
-      core.deliveries.createPage("input");
-      core.deliveries.createPage("output");
-      core.deliveries.registerConsumer("input", moduleId, "from-now");
-      core.deliveries.registerConsumer("output", "sink", "from-now");
-      core.appendModuleProcessRecord({
+      const coreStatePath = join(root, "core-state.json");
+      const openCore = () => {
+        let block = 0;
+        let delivery = 0;
+        return new FileCoreStateStore({
+          path: coreStatePath,
+          maxFailedAttempts: 3,
+          nextBlockId: () => `block-agent-quarantine-${++block}`,
+          nextDeliveryId: (kind) => `${kind}-agent-quarantine-${++delivery}`,
+          now: () => NOW,
+        });
+      };
+      const processRecordBody: ModuleProcessRecord = {
         schemaVersion: "dolly.module-process-record/1",
         instanceId,
         moduleId,
@@ -88,7 +91,26 @@ describe("general Agent waiter with a real quarantined Extension", () => {
         state: "starting",
         createdAt: NOW,
         updatedAt: NOW,
+      };
+      // A legacy document can no longer accept caller-supplied process
+      // records, so the fixture seeds the running-process record into the
+      // freshly created document before the store is reopened.
+      const seedCore = new FileCoreStateStore({
+        path: coreStatePath,
+        maxFailedAttempts: 3,
+        nextBlockId: () => "seed-block-0",
+        nextDeliveryId: (kind) => `seed-${kind}-0`,
+        now: () => NOW,
       });
+      seedLegacyProcessRecords(coreStatePath, {
+        processRecords: [processRecordBody],
+      });
+      void seedCore;
+      const core = openCore();
+      core.deliveries.createPage("input");
+      core.deliveries.createPage("output");
+      core.deliveries.registerConsumer("input", moduleId, "from-now");
+      core.deliveries.registerConsumer("output", "sink", "from-now");
 
       const repository = new FileModuleResultCommitRepository({
         path: join(root, "module-result-commits.json"),

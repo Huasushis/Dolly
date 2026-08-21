@@ -12,6 +12,7 @@ import type {
   ModuleProcessRecord,
   ModuleProcessStoppedRecordWriter,
 } from "../../../src/core/module-process-records.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
 
 const NOW = "2026-07-31T00:00:00.000Z";
 const LATER = "2026-07-31T00:00:05.000Z";
@@ -81,7 +82,7 @@ describe("FileCore configured callback reentrancy", () => {
     let reenter = false;
     let blockId = 0;
     let deliveryId = 0;
-    ({ store, stoppedRecordWriter } =
+    const openWriterStore = () =>
       createFileCoreStateStoreWithStoppedRecordWriter({
         path,
         maxFailedAttempts: 3,
@@ -94,8 +95,13 @@ describe("FileCore configured callback reentrancy", () => {
           }
           return LATER;
         },
-      }));
-    store.appendModuleProcessRecord(processRecord());
+      });
+    // A legacy document can no longer accept caller-supplied process records,
+    // so the fixture seeds the starting record into the freshly created
+    // document before the store is reopened.
+    openWriterStore();
+    seedLegacyProcessRecords(path, { processRecords: [processRecord()] });
+    ({ store, stoppedRecordWriter } = openWriterStore());
     store.updateModuleProcessRecordState(PROCESS_GENERATION_ID, "running");
     const revisionBefore = store.revision;
     const bytesBefore = readFileSync(path);

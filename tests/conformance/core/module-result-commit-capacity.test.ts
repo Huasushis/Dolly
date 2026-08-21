@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { type BlockProposal } from "../../../src/core/block-store.js";
 import type { DeliveryMailboxCapacity } from "../../../src/core/delivery-store.js";
 import { canonicalJsonDigest, type JsonValue } from "../../../src/core/canonical-json.js";
+import { type ModuleProcessRecord } from "../../../src/core/module-process-records.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
 import { FileCoreStateStore } from "../../../src/core/file-core-state-store.js";
 import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import { deriveModuleCgroupPath } from "../../../src/core/linux-module-cgroup.js";
@@ -60,6 +62,48 @@ function openCore(path: string, prefix: string): FileCoreStateStore {
   });
 }
 
+function processRecordBody(moduleId: string): ModuleProcessRecord {
+  return {
+    schemaVersion: "dolly.module-process-record/1",
+    instanceId: "capacity-instance",
+    moduleId,
+    moduleGenerationId: `${moduleId}-generation`,
+    processGenerationId: `${moduleId}-process-generation`,
+    packageDigest: `sha256:${"a".repeat(64)}`,
+    configurationReference: {
+      configId: `${moduleId}-config`,
+      revision: `sha256:${"b".repeat(64)}`,
+      configVersion: 1,
+    },
+    declaredExternalEffects: "core-capabilities-only",
+    serviceInvocationId: "2812432ad29e4d3bbd6776c62cafa929",
+    bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
+    moduleCgroupPath: deriveModuleCgroupPath(
+      "/system.slice/dolly-core.service",
+      {
+        instanceId: "capacity-instance",
+        moduleId,
+        processGenerationId: `${moduleId}-process-generation`,
+      },
+    ).filesystemPath,
+    state: "starting",
+    createdAt: NOW,
+    updatedAt: NOW,
+  };
+}
+
+function seededCore(
+  path: string,
+  prefix: string,
+  moduleIds: readonly string[],
+): FileCoreStateStore {
+  openCore(path, `${prefix}-seed`);
+  seedLegacyProcessRecords(path, {
+    processRecords: moduleIds.map(processRecordBody),
+  });
+  return openCore(path, prefix);
+}
+
 function prepareWorker(
   core: FileCoreStateStore,
   moduleId: string,
@@ -97,29 +141,6 @@ function persistSubmittedClaim(
 ): void {
   const moduleGenerationId = claim.moduleGenerationId;
   const processGenerationId = `${moduleId}-process-generation`;
-  core.appendModuleProcessRecord({
-    schemaVersion: "dolly.module-process-record/1",
-    instanceId: "capacity-instance",
-    moduleId,
-    moduleGenerationId,
-    processGenerationId,
-    packageDigest: `sha256:${"a".repeat(64)}`,
-    configurationReference: {
-      configId: `${moduleId}-config`,
-      revision: `sha256:${"b".repeat(64)}`,
-      configVersion: 1,
-    },
-    declaredExternalEffects: "core-capabilities-only",
-    serviceInvocationId: "2812432ad29e4d3bbd6776c62cafa929",
-    bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
-    moduleCgroupPath: deriveModuleCgroupPath(
-      "/system.slice/dolly-core.service",
-      { instanceId: "capacity-instance", moduleId, processGenerationId },
-    ).filesystemPath,
-    state: "starting",
-    createdAt: NOW,
-    updatedAt: NOW,
-  });
   core.updateModuleProcessRecordState(processGenerationId, "running");
   core.appendModuleSubmissionRecord({
     schemaVersion: "dolly.module-submission-record/1",
@@ -139,7 +160,7 @@ describe("FileCore Module output capacity", () => {
     const root = scratch("capacity-terminal-pruning");
     const statePath = join(root, "core-state.json");
     const journalPath = join(root, "result-commits.json");
-    const core = openCore(statePath, "terminal-pruning");
+    const core = seededCore(statePath, "terminal-pruning", ["history", "current"]);
     for (const [pageId, consumerId] of [
       ["history-input", "history"],
       ["current-input", "current"],
@@ -251,7 +272,7 @@ describe("FileCore Module output capacity", () => {
 
   it("identifies the owning consumer when a self-loop output cannot fit", async () => {
     const root = scratch("capacity-self-loop");
-    const core = openCore(join(root, "core-state.json"), "self-loop");
+    const core = seededCore(join(root, "core-state.json"), "self-loop", ["loop"]);
     for (const pageId of ["loop-a", "loop-b"]) {
       core.deliveries.createPage(pageId);
       core.deliveries.registerConsumer(pageId, "loop", "from-now");
@@ -304,7 +325,7 @@ describe("FileCore Module output capacity", () => {
     const root = scratch("capacity-restart-order");
     const statePath = join(root, "core-state.json");
     const journalPath = join(root, "module-result-commits.json");
-    const core = openCore(statePath, "initial");
+    const core = seededCore(statePath, "initial", ["upstream", "sink"]);
     core.deliveries.createPage("upstream-input");
     core.deliveries.createPage("output");
     core.deliveries.registerConsumer("upstream-input", "upstream", "from-now");
@@ -323,46 +344,7 @@ describe("FileCore Module output capacity", () => {
       maxCount: 1,
       maxBytes: 1024 * 1024,
     })!;
-    const sinkProcessGenerationId = "sink-process-generation";
-    core.appendModuleProcessRecord({
-      schemaVersion: "dolly.module-process-record/1",
-      instanceId: "capacity-instance",
-      moduleId: "sink",
-      moduleGenerationId: sinkClaim.moduleGenerationId,
-      processGenerationId: sinkProcessGenerationId,
-      packageDigest: `sha256:${"a".repeat(64)}`,
-      configurationReference: {
-        configId: "sink-config",
-        revision: `sha256:${"b".repeat(64)}`,
-        configVersion: 1,
-      },
-      declaredExternalEffects: "core-capabilities-only",
-      serviceInvocationId: "2812432ad29e4d3bbd6776c62cafa929",
-      bootId: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9",
-      moduleCgroupPath: deriveModuleCgroupPath(
-        "/system.slice/dolly-core.service",
-        {
-          instanceId: "capacity-instance",
-          moduleId: "sink",
-          processGenerationId: sinkProcessGenerationId,
-        },
-      ).filesystemPath,
-      state: "starting",
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
-    core.updateModuleProcessRecordState(sinkProcessGenerationId, "running");
-    core.appendModuleSubmissionRecord({
-      schemaVersion: "dolly.module-submission-record/1",
-      moduleJobId: sinkClaim.moduleJobId,
-      claimToken: sinkClaim.claimToken,
-      runId: sinkClaim.runId,
-      attempt: sinkClaim.attempt,
-      moduleGenerationId: sinkClaim.moduleGenerationId,
-      processGenerationId: sinkProcessGenerationId,
-      inputDigest: canonicalJsonDigest(core.deliveries.inspectClaimInput(sinkClaim)),
-      createdAt: NOW,
-    });
+    persistSubmittedClaim(core, "sink", sinkClaim);
 
     const repository = new FileModuleResultCommitRepository({ path: journalPath });
     const coordinator = createModuleResultCommitCoordinator({
@@ -456,7 +438,7 @@ describe("FileCore Module output capacity", () => {
     const root = scratch("capacity-runtime-restart");
     const statePath = join(root, "core-state.json");
     const journalPath = join(root, "module-result-commits.json");
-    const first = openCore(statePath, "first");
+    const first = seededCore(statePath, "first", ["worker", "sink"]);
     first.deliveries.createPage("input");
     first.deliveries.createPage("output");
     first.deliveries.registerConsumer("input", "worker", "from-now");
@@ -588,7 +570,7 @@ describe("FileCore Module output capacity", () => {
   it("never nacks a startup-verified result when its journal later disappears", async () => {
     const root = scratch("capacity-runtime-missing-journal");
     const statePath = join(root, "core-state.json");
-    const core = openCore(statePath, "missing");
+    const core = seededCore(statePath, "missing", ["worker"]);
     core.deliveries.createPage("input");
     core.deliveries.createPage("output");
     core.deliveries.registerConsumer("input", "worker", "from-now");
@@ -702,7 +684,7 @@ describe("FileCore Module output capacity", () => {
   it("keeps a blocked result prepared, then catches its journal up after one atomic commit", async () => {
     const root = scratch("capacity-recovery");
     const statePath = join(root, "core-state.json");
-    const core = openCore(statePath, "initial");
+    const core = seededCore(statePath, "initial", ["worker"]);
     core.deliveries.createPage("input");
     core.deliveries.createPage("output");
     core.deliveries.registerConsumer("input", "worker", "from-now");
@@ -797,7 +779,7 @@ describe("FileCore Module output capacity", () => {
 
   it("does not classify a hook-thrown backpressure lookalike as deferred capacity", async () => {
     const root = scratch("capacity-hook-lookalike");
-    const core = openCore(join(root, "core-state.json"), "hook");
+    const core = seededCore(join(root, "core-state.json"), "hook", ["worker"]);
     core.deliveries.createPage("input");
     core.deliveries.createPage("output");
     core.deliveries.registerConsumer("input", "worker", "from-now");
@@ -849,7 +831,7 @@ describe("FileCore Module output capacity", () => {
 
   it("serializes two producers competing for the same final slot", async () => {
     const root = scratch("capacity-race");
-    const core = openCore(join(root, "core-state.json"), "race");
+    const core = seededCore(join(root, "core-state.json"), "race", ["worker-a", "worker-b"]);
     for (const pageId of ["input-a", "input-b", "output"]) {
       core.deliveries.createPage(pageId);
     }
@@ -897,7 +879,7 @@ describe("FileCore Module output capacity", () => {
       readonly sortedModuleJobIds: readonly string[];
     }> {
       const root = scratch(reverseList ? "capacity-order-reverse" : "capacity-order-forward");
-      const core = openCore(join(root, "core-state.json"), "order");
+      const core = seededCore(join(root, "core-state.json"), "order", ["worker-a", "worker-b", "sink"]);
       for (const pageId of ["input-a", "input-b", "output"]) {
         core.deliveries.createPage(pageId);
       }
@@ -1116,7 +1098,7 @@ function setupReservedV10SelfLoop(
 describe("reserved v10 mailbox capacities through the result-commit coordinator", () => {
   it("rejects every output commit when the coordinator gets the current empty mailbox set", async () => {
     const root = scratch("capacity-reserved-v10-empty");
-    const core = openCore(join(root, "core-state.json"), "v10-empty");
+    const core = seededCore(join(root, "core-state.json"), "v10-empty", ["loop"]);
     const input = setupReservedV10SelfLoop(core);
     const commits = createModuleResultCommitCoordinator({
       core,
@@ -1137,7 +1119,7 @@ describe("reserved v10 mailbox capacities through the result-commit coordinator"
 
   it("commits output with capacities derived from the reserved v10 plan", async () => {
     const root = scratch("capacity-reserved-v10-derived");
-    const core = openCore(join(root, "core-state.json"), "v10-derived");
+    const core = seededCore(join(root, "core-state.json"), "v10-derived", ["loop"]);
     const input = setupReservedV10SelfLoop(core);
     const maxStateBytes = Number(
       createDefaultDollyInstanceConfig(V10_INSTANCE_ID).core.limits.maxStateBytes,
@@ -1169,7 +1151,7 @@ describe("reserved v10 mailbox capacities through the result-commit coordinator"
 
   it("distinguishes invalid capacity from ordinary output backpressure", async () => {
     const invalidRoot = scratch("capacity-reserved-v10-invalid");
-    const invalidCore = openCore(join(invalidRoot, "core-state.json"), "v10-invalid");
+    const invalidCore = seededCore(join(invalidRoot, "core-state.json"), "v10-invalid", ["loop"]);
     const invalidInput = setupReservedV10SelfLoop(invalidCore);
     invalidCore.deliveries.createPage("extra");
     invalidCore.deliveries.registerConsumer("extra", "loop", "from-now");
@@ -1189,7 +1171,7 @@ describe("reserved v10 mailbox capacities through the result-commit coordinator"
     );
 
     const blockedRoot = scratch("capacity-reserved-v10-blocked");
-    const blockedCore = openCore(join(blockedRoot, "core-state.json"), "v10-blocked");
+    const blockedCore = seededCore(join(blockedRoot, "core-state.json"), "v10-blocked", ["loop"]);
     const blockedInput = setupReservedV10SelfLoop(blockedCore, 4);
     const blockedCommits = createModuleResultCommitCoordinator({
       core: blockedCore,
@@ -1208,7 +1190,7 @@ describe("reserved v10 mailbox capacities through the result-commit coordinator"
     const statePath = join(root, "core-state.json");
     const journalPath = join(root, "module-result-commits.json");
     const mailboxes = v10SelfLoopMailboxCapacities();
-    const first = openCore(statePath, "v10-recovery");
+    const first = seededCore(statePath, "v10-recovery", ["loop"]);
     const input = setupReservedV10SelfLoop(first);
     const repository = new FileModuleResultCommitRepository({
       path: journalPath,

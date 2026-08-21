@@ -25,6 +25,7 @@ import type {
   ModuleProcessRecord,
   ModuleSubmissionRecord,
 } from "../../../src/core/module-process-records.js";
+import { seedLegacyProcessRecords } from "./fixtures/process-id-v19-cutover.js";
 
 const NOW = "2026-07-31T00:00:00.000Z";
 const INSTANCE_ID = "instance-1";
@@ -175,7 +176,6 @@ function seedSubmittedClaim(store: FileCoreStateStore): {
     id: "console",
   });
   store.deliveries.append("input", block.id);
-  store.appendModuleProcessRecord(processRecord());
   store.updateModuleProcessRecordState(PROCESS_GENERATION_ID, "running");
   const claim = store.deliveries.claim({
     consumerId: MODULE_ID,
@@ -216,6 +216,28 @@ describe("File Core state mutation failures before persistence notification", ()
   afterEach(() => {
     rmSync(root, { recursive: true, force: true });
   });
+
+  // A legacy document can no longer accept caller-supplied process records
+  // through the store's write API, so the fixture seeds the exact record into
+  // the freshly created version-18 document before the store is reopened.
+  function seededStore(
+    prefix: string,
+    controls: FaultControls,
+    options: {
+      readonly maxFailedAttempts?: number;
+      readonly mediaBytes?: MediaByteStore;
+      readonly mediaInspector?: MediaInspector;
+    } = {},
+  ): FileCoreStateStore {
+    openStore({
+      path,
+      prefix: `${prefix}-seed`,
+      controls: { failClock: false },
+      ...options,
+    });
+    seedLegacyProcessRecords(path, { processRecords: [processRecord()] });
+    return openStore({ path, prefix, controls, ...options });
+  }
 
   it("requires reopening when Delivery append consumes an ID before the clock fails", () => {
     const controls: FaultControls = { failClock: false };
@@ -265,12 +287,7 @@ describe("File Core state mutation failures before persistence notification", ()
   ] as const) {
     it(`requires reopening when ${fault.name} fails after nack has changed Delivery state`, () => {
       const controls: FaultControls = { failClock: false };
-      const store = openStore({
-        path,
-        prefix: "nack",
-        controls,
-        maxFailedAttempts: 1,
-      });
+      const store = seededStore("nack", controls, { maxFailedAttempts: 1 });
       const { identity, blockId } = seedSubmittedClaim(store);
       const beforeSnapshot = store.snapshot();
       const beforeRevision = store.revision;
