@@ -2,16 +2,26 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://dolly.example/spec/0.1/schemas/error.schema.json",
   "title": "DollyError",
+  "description": "Closed common Dolly error data envelope. Every JSON-RPC error.data value and every locally synthesized protocol error value is an independent semantic schema root: its root container has depth 1, its effective maximum cannot exceed 64, and JSON-RPC envelope objects do not consume that quota.",
   "type": "object",
   "additionalProperties": false,
   "required": ["code", "retryable", "outcome", "message", "details"],
   "properties": {
-    "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$", "maxLength": 96 },
+    "code": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]+$",
+      "maxLength": 96,
+      "description": "Stable Dolly error code. PROTOCOL_INVALID_RESPONSE identifies a correlated response whose success result or error data violated its semantic schema-root limit."
+    },
     "retryable": { "type": "boolean" },
     "outcome": { "enum": ["not_applied", "applied", "unknown"] },
     "message": { "type": "string", "minLength": 1, "maxLength": 4096 },
     "correlation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
-    "details": { "type": "object", "maxProperties": 64 }
+    "details": {
+      "type": "object",
+      "maxProperties": 64,
+      "description": "Bounded structured diagnostics. RPC mappings place their stable error_name here; nested values remain within the enclosing error-data semantic-depth limit."
+    }
   }
 }
 
