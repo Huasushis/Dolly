@@ -34,25 +34,55 @@ pub enum LedgerState {
     Unknown,
 }
 
-impl LedgerState {
-    /// Whether the row has durably crossed the dispatch boundary.
-    pub fn crossed_dispatch_boundary(self) -> bool {
-        matches!(self, LedgerState::Dispatched)
-    }
-}
-
 /// The event published when a dispatch fact cannot be resolved.
 pub const EVENT_TOOL_OUTCOME_UNKNOWN: &str = "ToolOutcomeUnknown";
 /// The event published when zero-byte non-application is authoritatively
 /// proved (TST-TOOL-006).
 pub const EVENT_TOOL_DISPATCH_PROVED_NOT_APPLIED: &str = "ToolDispatchProvedNotApplied";
 
+/// The fixed wire discriminator of the durable dispatch journal row. Every
+/// serialized `DurableDispatchRow` MUST carry this exact value in its
+/// `schema` member (established Dolly closed-document form: a `schema` field
+/// with a fixed `dolly.<kind>/v<n>` tag); reopening is fail-closed, so a
+/// missing, wrong, or unknown value is a journal corruption, not an upgrade.
+pub const DURABLE_DISPATCH_ROW_SCHEMA: &str = "dolly.tool-dispatch-row/v1";
+
+/// Copies of the durable dispatch journal tag; equality is by the fixed
+/// string, so any other value fails deserialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DurableDispatchRowSchemaTag;
+
+impl Serialize for DurableDispatchRowSchemaTag {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(DURABLE_DISPATCH_ROW_SCHEMA)
+    }
+}
+
+impl<'de> Deserialize<'de> for DurableDispatchRowSchemaTag {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value == DURABLE_DISPATCH_ROW_SCHEMA {
+            Ok(Self)
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "expected {DURABLE_DISPATCH_ROW_SCHEMA:?}, got {value:?}"
+            )))
+        }
+    }
+}
+
 /// The durable journal form of a Tool-call row. Serializing these bytes IS
 /// the durable dispatch journal; the Host persists them atomically with each
-/// transition and re-reads them after restart. Purely a snapshot: no method
-/// on it mutates the row or re-dispatches.
+/// transition and re-reads them after restart. The representation is closed
+/// and explicitly versioned: the fixed `schema` discriminator must be exactly
+/// `dolly.tool-dispatch-row/v1`, and any unknown member fails reopen
+/// (`deny_unknown_fields`) rather than being silently dropped. Purely a
+/// snapshot: no method on it mutates the row or re-dispatches.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableDispatchRow {
+    /// Version discriminator: fixed `dolly.tool-dispatch-row/v1`, required.
+    pub schema: DurableDispatchRowSchemaTag,
     /// Original invoke operation identity (unchanged across the lifecycle).
     pub operation_id: String,
     /// Pre-resolution identity digest (REQ-TOOL-005), frozen at acceptance.

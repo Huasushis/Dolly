@@ -15,9 +15,12 @@ pub mod result;
 pub mod status;
 pub mod version;
 
+/// The fixed durable dispatch journal discriminator value.
+pub use dispatch::DURABLE_DISPATCH_ROW_SCHEMA;
 pub use dispatch::{
-    DispatchDisposition, DurableDispatchRow, EVENT_TOOL_DISPATCH_PROVED_NOT_APPLIED,
-    EVENT_TOOL_OUTCOME_UNKNOWN, LedgerState, recover_operation,
+    DispatchDisposition, DurableDispatchRow, DurableDispatchRowSchemaTag,
+    EVENT_TOOL_DISPATCH_PROVED_NOT_APPLIED, EVENT_TOOL_OUTCOME_UNKNOWN, LedgerState,
+    recover_operation,
 };
 
 pub use invoke::{
