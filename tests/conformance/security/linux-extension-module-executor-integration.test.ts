@@ -642,21 +642,24 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       }
     }, 30_000);
 
-    expect(factory.processGenerationIdFor(MODULE_GENERATION_ID)).toBe(processGenerationId);
+    expect(() => factory.processGenerationIdFor(MODULE_GENERATION_ID))
+      .toThrow(/does not have a process generation/u);
     expect(store.getModuleProcessRecord(processGenerationId)).toBeUndefined();
     await expect(executor.start()).resolves.toBeUndefined();
     expect(launchedProcess).toBeDefined();
-    const liveSession = factory.sessionForProcess(processGenerationId);
+    const durableProcessGenerationId =
+      factory.processGenerationIdFor(MODULE_GENERATION_ID);
+    const liveSession = factory.sessionForProcess(durableProcessGenerationId);
     expect(liveSession).toMatchObject({
       extensionId: installed.manifest.extensionId,
       instanceId,
       moduleId: "installed-worker",
       moduleGenerationId: MODULE_GENERATION_ID,
-      processGenerationId,
+      processGenerationId: durableProcessGenerationId,
     });
     expect(liveSession?.sessionId).toMatch(/^session-/u);
     expect(factory.sessionForProcess("process-installed-linux-foreign")).toBeNull();
-    expect(store.getModuleProcessRecord(processGenerationId)).toMatchObject({
+    expect(store.getModuleProcessRecord(durableProcessGenerationId)).toMatchObject({
       state: "running",
       packageDigest: installed.packageDigest,
       configurationReference: instanceConfiguration.modules[0]?.configurationReference,
@@ -792,13 +795,13 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     expect(store.getModuleSubmissionRecord(claim.runId)).toBeUndefined();
 
     await expect(executor.terminate(terminationContext)).resolves.toBeUndefined();
-    expect(factory.sessionForProcess(processGenerationId)).toBeNull();
+    expect(factory.sessionForProcess(durableProcessGenerationId)).toBeNull();
     await expect(mediaResolver.resolve(mediaRequest, {})).rejects.toThrow("not authorized");
     const moduleCgroupPath = deriveModuleCgroupPath(
       activation.binding.delegatedRootCgroupPath,
-      { instanceId, moduleId: "installed-worker", processGenerationId },
+      { instanceId, moduleId: "installed-worker", processGenerationId: durableProcessGenerationId },
     ).filesystemPath;
-    expect(store.getModuleProcessRecord(processGenerationId)).toMatchObject({
+    expect(store.getModuleProcessRecord(durableProcessGenerationId)).toMatchObject({
       state: "stopped",
       packageDigest: installed.packageDigest,
       moduleCgroupPath,
