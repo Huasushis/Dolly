@@ -37,7 +37,10 @@ import {
   ExtensionInstallationRegistry,
   type ExtensionPackageManifest,
 } from "../../../src/core/extension-installation-registry.js";
-import { createFileCoreStateStoreWithStoppedRecordWriter } from "../../../src/core/file-core-state-store.js";
+import {
+  createFileCoreStateStoreWithStoppedRecordWriter,
+  migrateCoreStateDocumentToVersion19,
+} from "../../../src/core/file-core-state-store.js";
 import { FileMediaByteStore } from "../../../src/core/file-media-byte-store.js";
 import {
   deriveModuleCgroupPath,
@@ -51,7 +54,10 @@ import { decideLinuxModuleActivation } from "../../../src/core/linux-module-acti
 import { JSON_SCHEMA_2020_12 } from "../../../src/core/json-schema.js";
 import type { ModuleExecutor } from "../../../src/core/module-actor.js";
 import { ModuleConfigurationStore } from "../../../src/core/module-configuration-store.js";
-import type { ModuleProcessRecord } from "../../../src/core/module-process-records.js";
+import type {
+  ModuleProcessRecord,
+  ModuleProcessStartingRecordInput,
+} from "../../../src/core/module-process-records.js";
 import type { ReactiveModuleInput } from "../../../src/core/reactive-module-input.js";
 import type { ReactiveModuleResult } from "../../../src/core/reactive-module-runtime.js";
 import {
@@ -172,12 +178,19 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     const scratch = mkdtempSync(join(tmpdir(), "dolly-linux-extension-executor-"));
     const statePath = join(scratch, "core-state.json");
     const effectPath = join(scratch, "effect-intents.json");
-    const processGenerationId = `process-linux-extension-${process.pid}-${Date.now()}`;
+    // The caller does not provide a process-generation identifier in the
+    // version 19 identity domain: the migrated store mints one. This fixed
+    // allocator-input identity is never exposed to Host/session/store/cgroup;
+    // the durable `_v19_host_N` minted by the store on start is captured and
+    // every assertion keys on it.
     const identity = {
       instanceId: "instance-linux-extension",
       moduleId: "module-linux-extension",
-      processGenerationId,
+      processGenerationId: "process-linux-extension",
     } as const;
+    // Path used only by the legacy twin the executor's construction checks
+    // against its allocator input; the durable record's path is derived from
+    // the allocated identifier below.
     const moduleCgroupPath = deriveModuleCgroupPath(delegatedRoot!, identity).filesystemPath;
     const serviceInvocationId = process.env.INVOCATION_ID;
     if (serviceInvocationId === undefined) {
@@ -185,6 +198,27 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     }
     const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
     const now = (): string => new Date().toISOString();
+    // Persist a fresh version 18 Core-state document exactly as an operator
+    // would, then explicitly migrate it to version 19 through the public path,
+    // and reopen the migrated document so the store itself allocates.
+    createFileCoreStateStoreWithStoppedRecordWriter({
+      path: statePath,
+      maxFailedAttempts: 3,
+      nextBlockId: () => "unused-linux-extension-block",
+      nextDeliveryId: (kind) => `unused-linux-extension-${kind}`,
+      now,
+    });
+    const migration = migrateCoreStateDocumentToVersion19(statePath, {
+      runtimeConfiguration: {
+        maxFailedAttempts: 3,
+        media: { enabled: false },
+      },
+    });
+    if (migration.status !== "migrated") {
+      throw new Error(
+        `The fresh state file did not migrate to version 19: ${JSON.stringify(migration)}`,
+      );
+    }
     const { store, stoppedRecordWriter } =
       createFileCoreStateStoreWithStoppedRecordWriter({
         path: statePath,
@@ -242,6 +276,22 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       createdAt,
       updatedAt: createdAt,
     };
+    // The id-less twin the migrated version 19 store itself completes.
+    const startingRecord: ModuleProcessStartingRecordInput = {
+      schemaVersion: "dolly.module-process-record/1",
+      instanceId: identity.instanceId,
+      moduleId: identity.moduleId,
+      moduleGenerationId: MODULE_GENERATION_ID,
+      packageDigest: processRecord.packageDigest,
+      configurationReference: processRecord.configurationReference,
+      declaredExternalEffects: processRecord.declaredExternalEffects,
+      serviceInvocationId,
+      bootId,
+      delegatedRootCgroupPath: delegatedRoot!,
+      state: "starting",
+      createdAt,
+      updatedAt: createdAt,
+    };
 
     const root = await prepareDelegatedCgroupRoot({
       delegatedRootCgroupPath: delegatedRoot!,
@@ -252,6 +302,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
 
     let host: ExtensionProcessHost | undefined;
     let launchedProcess: ProcessIdentity | undefined;
+    let durableProcessGenerationId: string | undefined;
     let protocolIdentifier = 0;
     const standardErrorChunks: Uint8Array[] = [];
     const executor = createLinuxExtensionModuleExecutor({
@@ -261,6 +312,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
         records: store,
         stoppedRecordWriter,
         processRecord,
+        startingRecord,
         delegatedRootCgroupPath: delegatedRoot!,
         identity,
         limits: LIMITS,
@@ -304,6 +356,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       configureHost: (configuredHost, authorized) => {
         host = configuredHost;
         launchedProcess = readProcessIdentity(authorized.launcher.processId);
+        durableProcessGenerationId = authorized.record.processGenerationId;
       },
       onStandardErrorChunk: (chunk) => {
         // Retain only a finite diagnostic prefix in the test; the adapter
@@ -325,16 +378,27 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     }, 30_000);
 
     await expect(executor.start()).resolves.toBeUndefined();
+    if (durableProcessGenerationId === undefined) {
+      throw new Error("Starting did not surface the store-minted durable process generation");
+    }
+    expect(/^_v19_host_[1-9][0-9]*$/u.test(durableProcessGenerationId)).toBe(true);
+    // The allocator input is never persisted: the durable identifier is the
+    // only one, so a caller-exposing value cannot appear in any record or path.
+    expect(store.getModuleProcessRecord(identity.processGenerationId)).toBeUndefined();
+    const durableModuleCgroupPath = deriveModuleCgroupPath(
+      delegatedRoot!,
+      { ...identity, processGenerationId: durableProcessGenerationId },
+    ).filesystemPath;
     expect(host?.snapshot).toMatchObject({
       state: "ready",
       instanceId: identity.instanceId,
       moduleId: identity.moduleId,
       moduleGenerationId: MODULE_GENERATION_ID,
-      processGenerationId,
+      processGenerationId: durableProcessGenerationId,
       pid: launchedProcess?.processId,
     });
     expect(launchedProcess).toBeDefined();
-    expect(store.getModuleProcessRecord(processGenerationId)?.state).toBe("running");
+    expect(store.getModuleProcessRecord(durableProcessGenerationId)?.state).toBe("running");
 
     const input = store.deliveries.inspectClaimInput(claim);
     store.appendModuleSubmissionRecord({
@@ -344,11 +408,14 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       runId: claim.runId,
       attempt: claim.attempt,
       moduleGenerationId: claim.moduleGenerationId,
-      processGenerationId,
+      processGenerationId: durableProcessGenerationId,
       inputDigest: canonicalJsonDigest(input),
       createdAt: now(),
     });
 
+    // The run admission must be prepared on the authorized process before
+    // `execute` can dispatch, mirroring the ModuleActor sequence.
+    expect(await executor.prepareRun?.()).toEqual({ status: "ready" });
     const result = await executor.execute(
       input,
       {
@@ -371,12 +438,12 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     ).toEqual({ kind: "no-effect" });
 
     await expect(executor.terminate(terminationContext)).resolves.toBeUndefined();
-    expect(store.getModuleProcessRecord(processGenerationId)).toMatchObject({
+    expect(store.getModuleProcessRecord(durableProcessGenerationId)).toMatchObject({
       state: "stopped",
-      processGenerationId,
-      moduleCgroupPath,
+      processGenerationId: durableProcessGenerationId,
+      moduleCgroupPath: durableModuleCgroupPath,
     });
-    expect(existsSync(moduleCgroupPath)).toBe(false);
+    expect(existsSync(durableModuleCgroupPath)).toBe(false);
     expect(
       await waitFor(
         () => launchedProcess === undefined || !sameLiveProcess(launchedProcess),
@@ -387,13 +454,13 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       .toBeLessThanOrEqual(64 * 1_024);
 
     console.info(JSON.stringify({
-      processGenerationId,
+      processGenerationId: durableProcessGenerationId,
       launcherProcessId: launchedProcess?.processId,
-      moduleCgroupPath,
+      moduleCgroupPath: durableModuleCgroupPath,
       result,
-      finalRecordState: store.getModuleProcessRecord(processGenerationId)?.state,
+      finalRecordState: store.getModuleProcessRecord(durableProcessGenerationId)?.state,
       effectEvidence: effectJournal.evidenceForRun(claim).kind,
-      cgroupRemoved: !existsSync(moduleCgroupPath),
+      cgroupRemoved: !existsSync(durableModuleCgroupPath),
       exactProcessIdentityGone:
         launchedProcess === undefined || !sameLiveProcess(launchedProcess),
     }));
@@ -530,26 +597,50 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     });
     const now = (): string => new Date().toISOString();
     const mediaBytes = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4);
-    const { store, stoppedRecordWriter } =
-      createFileCoreStateStoreWithStoppedRecordWriter({
-        path: statePath,
-        maxFailedAttempts: 3,
-        nextBlockId: () => "unused-installed-linux-block",
-        nextDeliveryId: (kind) => `unused-installed-linux-${kind}`,
-        now,
-        media: {
-          durability: "persistent",
-          bytes: new FileMediaByteStore({
-            directory: resolve(scratch, "media"),
-            maxMediaBytes: 1_024,
-          }),
-          inspector: {
-            inspect: async () => ({ mimeType: "image/png", width: 2, height: 1 }),
-          },
+    const storeOptions = {
+      path: statePath,
+      maxFailedAttempts: 3,
+      nextBlockId: () => "unused-installed-linux-block",
+      nextDeliveryId: (kind: string) => `unused-installed-linux-${kind}`,
+      now,
+      media: {
+        durability: "persistent" as const,
+        bytes: new FileMediaByteStore({
+          directory: resolve(scratch, "media"),
           maxMediaBytes: 1_024,
-          idNamespace: "installed-linux-active-run",
+        }),
+        inspector: {
+          inspect: async () => ({ mimeType: "image/png", width: 2, height: 1 }),
         },
-      });
+        maxMediaBytes: 1_024,
+        idNamespace: "installed-linux-active-run",
+      },
+    };
+    // Persist a fresh version 18 document, migrate it to version 19 through
+    // the public path, then reopen so the store itself mints identifiers.
+    createFileCoreStateStoreWithStoppedRecordWriter(storeOptions);
+    const migration = migrateCoreStateDocumentToVersion19(statePath, {
+      runtimeConfiguration: {
+        maxFailedAttempts: 3,
+        media: {
+          enabled: true,
+          idNamespace: "installed-linux-active-run",
+          maxMediaBytes: 1_024,
+          maxTotalMediaBytes: 1_024_000,
+          maxRegistrationRecords: 10_000,
+          maxStorageRecords: 10_000,
+          maxProviderAccessRecords: 10_000,
+          deletedRegistrationRetentionMs: 24 * 60 * 60 * 1_000,
+        },
+      },
+    });
+    if (migration.status !== "migrated") {
+      throw new Error(
+        `The installed state file did not migrate to version 19: ${JSON.stringify(migration)}`,
+      );
+    }
+    const { store, stoppedRecordWriter } =
+      createFileCoreStateStoreWithStoppedRecordWriter(storeOptions);
     if (!store.media) throw new Error("The installed integration Media store is absent");
     store.deliveries.createPage("input");
     store.deliveries.registerConsumer("input", "installed-worker", "from-now");
@@ -670,7 +761,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
 
     const input = store.deliveries.inspectClaimInput(claim);
     store.appendModuleSubmissionRecord({
-      schemaVersion: "dolly.module-submission-record/1",
+      schemaVersion: "dolly.module-submission-record/2",
       moduleJobId: claim.moduleJobId,
       claimToken: claim.claimToken,
       runId: claim.runId,
@@ -678,6 +769,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       moduleGenerationId: claim.moduleGenerationId,
       processGenerationId: factory.processGenerationIdFor(claim.moduleGenerationId),
       inputDigest: canonicalJsonDigest(input),
+      dispatchState: "prepared",
       createdAt: now(),
     });
     const mediaResolver = createFileCoreActiveRunModelMediaResolver({
@@ -755,6 +847,7 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
       kind: "media",
       id: registeredMedia.mediaId,
     })).toBe(0);
+    expect(await executor.prepareRun?.()).toEqual({ status: "ready" });
     const result = await executor.execute(input, {
       moduleId: "installed-worker",
       moduleGenerationId: MODULE_GENERATION_ID,
@@ -817,10 +910,10 @@ describe.skipIf(!available)("Linux Extension Module executor in a real control g
     console.info(JSON.stringify({
       installedPackageDigest: installed.packageDigest,
       installedEntrypoint: installed.entrypointPath,
-      processGenerationId,
+      processGenerationId: durableProcessGenerationId,
       launcherProcessId: launchedProcess?.processId,
       moduleCgroupPath,
-      finalRecordState: store.getModuleProcessRecord(processGenerationId)?.state,
+      finalRecordState: store.getModuleProcessRecord(durableProcessGenerationId)?.state,
       cgroupRemoved: !existsSync(moduleCgroupPath),
       exactProcessIdentityGone:
         launchedProcess === undefined || !sameLiveProcess(launchedProcess),
