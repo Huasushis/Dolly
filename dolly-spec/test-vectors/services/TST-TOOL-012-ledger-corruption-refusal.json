@@ -1,0 +1,39 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-TOOL-012",
+  "kind": "crash_recovery",
+  "covers": ["REQ-TOOL-001", "INV-STORAGE-002", "INV-STORAGE-017"],
+  "initial": {
+    "ledger_state": "AUTHORIZED",
+    "ledger_revision": 1,
+    "indexed_module_id": "module-a",
+    "record_module_id": "module-b",
+    "stored_record_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "recomputed_record_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "transport_eligible_byte_count": 0
+  },
+  "stimulus": {
+    "events": [
+      "unclean_shutdown",
+      "database_reopened",
+      "tool_call_ledger_integrity_checked"
+    ]
+  },
+  "expected": {
+    "outcome": "corrupt_authority_blocks_writable_broker",
+    "assertions": [
+      {"path": "/startup_error", "op": "equals", "value": "STORAGE_CORRUPT"},
+      {"path": "/tool_broker_ready", "op": "equals", "value": false},
+      {"path": "/ledger_state", "op": "unchanged"},
+      {"path": "/ledger_revision", "op": "unchanged"},
+      {"path": "/row_repair_count", "op": "equals", "value": 0},
+      {"path": "/terminalization_count", "op": "equals", "value": 0},
+      {"path": "/send_permit_issue_count", "op": "equals", "value": 0},
+      {"path": "/transport_sent_byte_count", "op": "equals", "value": 0}
+    ],
+    "emitted": [
+      {"event": "StorageCorruptionDetected", "table": "tool_call_ledger"}
+    ],
+    "crash_label": "tool_ledger_corrupt_on_reopen"
+  }
+}

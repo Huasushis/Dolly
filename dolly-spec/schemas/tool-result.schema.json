@@ -21,7 +21,8 @@
                 "TOOL_OUTPUT_INVALID", "TOOL_RESPONSE_LIMIT",
                 "TOOL_EXTERNAL_OUTCOME_UNKNOWN"
               ]
-            }
+            },
+            "retryable": { "const": false }
           }
         }
       ]
@@ -110,6 +111,96 @@
             ]
           },
           "server_request_id": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "unknown" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "error": {
+            "allOf": [
+              { "$ref": "#/$defs/ToolError" },
+              {
+                "type": "object",
+                "properties": {
+                  "code": { "const": "TOOL_EXTERNAL_OUTCOME_UNKNOWN" },
+                  "outcome": { "const": "unknown" }
+                },
+                "required": ["code", "outcome"]
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "denied" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "error": {
+            "allOf": [
+              { "$ref": "#/$defs/ToolError" },
+              {
+                "type": "object",
+                "properties": {
+                  "code": {
+                    "enum": [
+                      "TOOL_SERVER_UNAVAILABLE", "TOOL_SERVER_QUARANTINED",
+                      "TOOL_UNKNOWN", "TOOL_CAPABILITY_DENIED", "TOOL_STALE_LEASE",
+                      "TOOL_STALE_CONFIG_REVISION", "TOOL_CONFIRMATION_REQUIRED",
+                      "TOOL_CONFIRMATION_EXPIRED", "TOOL_INPUT_INVALID",
+                      "TOOL_REQUEST_LIMIT", "TOOL_IDEMPOTENCY_CONFLICT"
+                    ]
+                  },
+                  "outcome": { "const": "not_applied" }
+                },
+                "required": ["code", "outcome"]
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "failed" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "error": {
+            "oneOf": [
+              {
+                "allOf": [
+                  { "$ref": "#/$defs/ToolError" },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "code": {
+                        "enum": [
+                          "TOOL_DISPATCH_NOT_APPLIED", "TOOL_UPSTREAM_NOT_APPLIED",
+                          "TOOL_UPSTREAM_FAILED"
+                        ]
+                      },
+                      "outcome": { "const": "not_applied" }
+                    },
+                    "required": ["code", "outcome"]
+                  }
+                ]
+              },
+              {
+                "allOf": [
+                  { "$ref": "#/$defs/ToolError" },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "code": { "enum": ["TOOL_OUTPUT_INVALID", "TOOL_RESPONSE_LIMIT"] },
+                      "outcome": { "const": "applied" }
+                    },
+                    "required": ["code", "outcome"]
+                  }
+                ]
+              }
+            ]
+          }
         }
       }
     },

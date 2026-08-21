@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/tool-call-ledger-record.schema.json",
+  "title": "Durable Tool call ledger record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "ledger_revision", "state", "operation_binding",
+    "operation_digest", "outbound_digest", "terminal_result",
+    "terminal_result_digest"
+  ],
+  "properties": {
+    "schema": { "const": "dolly.tool-call-ledger/v1" },
+    "ledger_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+    "state": { "enum": ["AUTHORIZED", "DISPATCHED", "SUCCEEDED", "FAILED", "UNKNOWN"] },
+    "operation_binding": { "$ref": "tool-operation-binding.schema.json" },
+    "operation_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+    "outbound_digest": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/Sha256" },
+        { "type": "null" }
+      ]
+    },
+    "terminal_result": {
+      "oneOf": [
+        { "$ref": "tool-result.schema.json" },
+        { "type": "null" }
+      ]
+    },
+    "terminal_result_digest": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/Sha256" },
+        { "type": "null" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "state": { "const": "AUTHORIZED" } }, "required": ["state"] },
+      "then": {
+        "properties": {
+          "ledger_revision": { "const": 1 },
+          "outbound_digest": { "type": "null" },
+          "terminal_result": { "type": "null" },
+          "terminal_result_digest": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "state": { "const": "DISPATCHED" } }, "required": ["state"] },
+      "then": {
+        "properties": {
+          "ledger_revision": { "const": 2 },
+          "outbound_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+          "terminal_result": { "type": "null" },
+          "terminal_result_digest": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "state": { "const": "SUCCEEDED" } }, "required": ["state"] },
+      "then": {
+        "properties": {
+          "ledger_revision": { "const": 3 },
+          "outbound_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+          "terminal_result": {
+            "allOf": [
+              { "$ref": "tool-result.schema.json" },
+              { "type": "object", "properties": { "status": { "const": "succeeded" } }, "required": ["status"] }
+            ]
+          },
+          "terminal_result_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "state": { "const": "FAILED" } }, "required": ["state"] },
+      "then": {
+        "properties": {
+          "ledger_revision": { "enum": [2, 3] },
+          "terminal_result": {
+            "allOf": [
+              { "$ref": "tool-result.schema.json" },
+              { "type": "object", "properties": { "status": { "const": "failed" } }, "required": ["status"] }
+            ]
+          },
+          "terminal_result_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "state": { "const": "FAILED" } }, "required": ["state"] },
+      "then": {
+        "if": {
+          "properties": {
+            "terminal_result": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "object",
+                  "properties": { "code": { "const": "TOOL_DISPATCH_NOT_APPLIED" } },
+                  "required": ["code"]
+                }
+              },
+              "required": ["error"]
+            }
+          },
+          "required": ["terminal_result"]
+        },
+        "then": {
+          "properties": {
+            "ledger_revision": { "const": 2 },
+            "outbound_digest": { "type": "null" }
+          }
+        },
+        "else": {
+          "properties": {
+            "ledger_revision": { "const": 3 },
+            "outbound_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "state": { "const": "UNKNOWN" } }, "required": ["state"] },
+      "then": {
+        "properties": {
+          "ledger_revision": { "const": 3 },
+          "outbound_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+          "terminal_result": {
+            "allOf": [
+              { "$ref": "tool-result.schema.json" },
+              { "type": "object", "properties": { "status": { "const": "unknown" } }, "required": ["status"] }
+            ]
+          },
+          "terminal_result_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+        }
+      }
+    }
+  ]
+}

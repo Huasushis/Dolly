@@ -78,12 +78,14 @@ methods enumerated by
 Its request has its own read `operation_id` and names the original method and
 `target_operation_id`. The Host MUST authorize both the status capability and
 the original method/object scope before revealing whether the target exists.
-The read never starts, retries, cancels, or advances work. `absent` proves no
-durable pre-effect record exists and permits identical replay under the
-original identity; `unknown` preserves an unproved external outcome and
-forbids a fresh semantic identity. Asset import, tool, ingress, and Activation
-state retain their dedicated status methods and MUST be rejected as generic
-status targets.
+The read never starts, retries, cancels, or advances work. For an admitted
+generic-status target, `absent` proves no durable pre-effect record exists, but
+the target method's authorization transaction remains the only authority for a
+later attempt; `unknown` preserves an unproved external outcome and forbids a
+fresh semantic identity. Asset import, Tool, ingress, and Activation state
+retain their dedicated status methods and MUST be rejected as generic status
+targets. In particular, Tool `absent` is never dispatch or redispatch
+authority.
 
 Authorization success does not imply the operation succeeded. Responses **MUST** distinguish policy denial, invalid object scope, resource exhaustion, retryable service failure, and permanent failure.
 
@@ -231,15 +233,17 @@ messages are rejected under `REQ-TOOL-008`.
 
 For `host.tool.invoke`, `operation_id` is also the canonical `tool_call_id` for
 one immutable Tool operation. Reuse with the same semantic input returns its
-recorded state/result; reuse with different input is a conflict. Only a scoped
-`absent` status, proving that the original request was never recorded or
-dispatched, permits replay under that identity. A later attempt after a
-terminal `not_applied` result is a newly authorized operation with a new ID,
-not a retry. `tool_transaction_id` groups the model proposal, Tool result, and
-dependent continuation but grants no replay authority. A current live lease is
-required to start a call. A later `host.tool.status` has its own request
-`operation_id` and names the original call as `target_operation_id`; it
-requires the caller's current authenticated Module grant.
+recorded state/result; reuse with different input is a conflict. A scoped
+`absent` status is only a read observation and grants no dispatch or redispatch
+authority. A later invoke under that identity can proceed only through the Tool
+Broker's atomic absent-row authorization transaction with a current live lease
+and all current checks. A later attempt after a terminal `not_applied` result is
+a newly authorized operation with a new ID, not a retry.
+`tool_transaction_id` groups the model proposal, Tool result, and dependent
+continuation but grants no replay authority. A later `host.tool.status` has its
+own request `operation_id` and names the original call as
+`target_operation_id`; it requires the caller's current authenticated Module
+grant.
 
 The Host MUST first require the request `module_id` to match the authenticated
 Module, then query only `(authenticated_module_id,target_operation_id)`. The
@@ -252,23 +256,23 @@ represented.
 
 The accepted Host Tool-call ledger states are `AUTHORIZED`, `DISPATCHED`,
 `SUCCEEDED`, `FAILED`, and `UNKNOWN`; wire results use their lowercase
-equivalents from `schemas/tool-result.schema.json`. A wire `denied` result is a
-pre-authorization response and creates no new Host call row. Invoke uses the
-non-`absent` `InvokeResult` fragment; status uses `StatusResult`. A status-only
-`absent` proves that the Host has no Module-scoped ledger row and therefore
-never dispatched that semantic operation; replay with the same
-identity/request digest and refreshed excluded lease/deadline fields is then
-safe after a lost response. Once any v1 Tool request reaches `DISPATCHED`, the
-Host may accept only the original request's late response from its retained
-generation. Loss of an authoritative result becomes `unknown` and is never
-auto-redispatched or reconciled through an invented upstream status call. Tool
-output is bounded untrusted data and grants no capability.
+equivalents from `schemas/tool-result.schema.json`. The closed durable binding
+and ledger-record schemas are defined by the Tool Broker chapter. A wire
+`denied` result is a pre-authorization response and creates no new Host call
+row. Invoke uses the non-`absent` `InvokeResult` fragment; status uses
+`StatusResult`.
 
-If the frozen generation fails after `AUTHORIZED` but before `DISPATCHED`, the
-accepted row remains authoritative. Proof that the transport fence allowed
-zero request bytes terminates it as failed/not-applied with
-`TOOL_DISPATCH_NOT_APPLIED`; inability to prove that boundary yields `unknown`,
-never a denied/no-row response.
+`AUTHORIZED` proves through the exclusive send gate that no request byte was
+eligible. The same operation can continue only to its exact frozen generation,
+before its stored deadline, after the durable compare-and-set to `DISPATCHED`.
+If that generation is unusable, zero-byte proof permits the immutable
+failed/not-applied result `TOOL_DISPATCH_NOT_APPLIED`; inability to prove the
+boundary first crosses to `DISPATCHED` without sending and then becomes
+`unknown`. Once `DISPATCHED`, the Host may accept only the original request's
+late response from its retained generation. Loss of an authoritative result
+becomes `unknown`; no result, acknowledgement, error, timeout, or absence
+authorizes automatic redispatch or an invented upstream status call. Tool
+output is bounded untrusted data and grants no capability.
 
 ## 10. Scheduling services
 
