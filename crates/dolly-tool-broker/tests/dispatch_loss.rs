@@ -26,8 +26,8 @@
 
 use dolly_canonical_json::Sha256Digest;
 use dolly_tool_broker::{
-    DispatchDisposition, DurableDispatchRow, ErrorOutcome, LedgerState, ToolErrorCode, ToolStatus,
-    recover_operation,
+    DispatchDisposition, DurableDispatchRow, DurableDispatchRowSchemaTag, ErrorOutcome,
+    LedgerState, ToolErrorCode, ToolStatus, recover_operation,
 };
 use serde_json::json;
 
@@ -40,6 +40,7 @@ fn digest_hex(full: &str) -> Sha256Digest {
 /// marker, authoritative response lost, `server_effect_count` already 1.
 fn dispatched_row() -> DurableDispatchRow {
     DurableDispatchRow {
+        schema: DurableDispatchRowSchemaTag,
         operation_id: "0198ab31-6c44-7e8a-b2bb-000000000341".into(),
         request_digest: digest_hex(
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -93,6 +94,7 @@ fn dispatched_row_recoversto_unknown_without_redispatch() {
 #[test]
 fn argument_key_is_not_a_redispatch_attestation() {
     let row = DurableDispatchRow {
+        schema: DurableDispatchRowSchemaTag,
         operation_id: "0198ab31-6c44-7e8a-b2bb-000000000341".into(),
         request_digest: digest_hex(
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -129,6 +131,7 @@ fn argument_key_is_not_a_redispatch_attestation() {
 #[test]
 fn authorized_zero_byte_proof_fails_not_applied() {
     let row = DurableDispatchRow {
+        schema: DurableDispatchRowSchemaTag,
         operation_id: "0198ab31-6c44-7e8a-b2bb-000000000346".into(),
         request_digest: digest_hex(
             "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
@@ -174,6 +177,7 @@ fn authorized_zero_byte_proof_fails_not_applied() {
 #[test]
 fn authorized_without_zero_byte_proof_recovers_unknown() {
     let row = DurableDispatchRow {
+        schema: DurableDispatchRowSchemaTag,
         operation_id: "0198ab31-6c44-7e8a-b2bb-000000000346".into(),
         request_digest: digest_hex(
             "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
@@ -275,4 +279,88 @@ fn recorded_result_replayed_without_redispatch() {
     };
     assert_eq!(result.operation_id, row.operation_id);
     assert_eq!(disposition.automatic_redispatch_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// RED: durable JSON reopen/corruption (explicitly versioned closed form).
+//
+// The durable journal form is the row's serialized bytes. A reopen must be
+// fail-closed: a row without the exact version discriminator, with an unknown
+// version value, or with any unknown member is NOT a well-formed journal and
+// must not be reconstructed into a recoverable document. Corruption must be
+// detected at reopen, never silently repaired.
+// ---------------------------------------------------------------------------
+
+/// The wire form must carry exactly the fixed version discriminator; wrong,
+/// missing, or unknown versions fail closed before the row is usable.
+#[test]
+fn durable_reopen_rejects_missing_wrong_and_unknown_version() {
+    let good = serde_json::to_value(dispatched_row()).unwrap();
+
+    // Missing discriminator: strip the `schema` member from the serialized form.
+    let mut missing = good.clone();
+    missing.as_object_mut().unwrap().remove("schema");
+    assert!(
+        serde_json::from_value::<DurableDispatchRow>(missing).is_err(),
+        "missing version discriminator must fail closed"
+    );
+
+    // Unknown / wrong discriminator value.
+    for bad in [
+        "dolly.block/v1",
+        "dolly.tool-dispatch-row/v2",
+        "bogus",
+        "dolly.test-vector/v1",
+    ] {
+        let mut wrong = good.clone();
+        wrong
+            .as_object_mut()
+            .unwrap()
+            .insert("schema".into(), json!(bad));
+        assert!(
+            serde_json::from_value::<DurableDispatchRow>(wrong).is_err(),
+            "wrong version discriminator {bad:?} must fail closed"
+        );
+    }
+}
+
+/// Unknown members in the durable journal fail closed (closed-world input
+/// rule): a foreign/forward field must never be silently dropped and the
+/// remaining bytes reinterpreted as a row.
+#[test]
+fn durable_reopen_rejects_unknown_fields() {
+    let mut widened = serde_json::to_value(dispatched_row()).unwrap();
+    widened
+        .as_object_mut()
+        .unwrap()
+        .insert("ghost_future_field".into(), json!({"nested": true}));
+    assert!(
+        serde_json::from_value::<DurableDispatchRow>(widened).is_err(),
+        "unknown journal member must fail closed"
+    );
+}
+
+/// Corrupt journal bytes (truncation, garbage, or a non-object) must fail
+/// closed at reopen: they never produce a recoverable row.
+#[test]
+fn corrupt_journal_bytes_fail_closed_at_reopen() {
+    let good = serde_json::to_vec(&dispatched_row()).unwrap();
+
+    let truncated = serde_json::from_slice::<DurableDispatchRow>(&good[..good.len() / 2]);
+    assert!(
+        truncated.is_err(),
+        "truncated journal must fail closed, got {truncated:?}"
+    );
+
+    let garbage = serde_json::from_slice::<DurableDispatchRow>(b"{ not json at all ".as_slice());
+    assert!(
+        garbage.is_err(),
+        "non-JSON journal must fail closed, got {garbage:?}"
+    );
+
+    let array = serde_json::from_slice::<DurableDispatchRow>(b"[1,2,3]".as_slice());
+    assert!(
+        array.is_err(),
+        "non-object journal must fail closed, got {array:?}"
+    );
 }

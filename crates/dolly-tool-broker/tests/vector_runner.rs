@@ -11,9 +11,9 @@ use std::{
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_tool_broker::{
-    AdmissionOutcome, DispatchDisposition, DurableDispatchRow, IdempotencyPolicy, InvokeCandidate,
-    InvokeOutcome, LedgerState, ResolutionBackend, StatusOutcome, ToolErrorCode, admit_config,
-    evaluate_invoke, lookup_status, recover_operation,
+    AdmissionOutcome, DispatchDisposition, DurableDispatchRow, DurableDispatchRowSchemaTag,
+    IdempotencyPolicy, InvokeCandidate, InvokeOutcome, LedgerState, ResolutionBackend,
+    StatusOutcome, ToolErrorCode, admit_config, evaluate_invoke, lookup_status, recover_operation,
 };
 use serde_json::{Map, Value, json};
 
@@ -247,6 +247,51 @@ fn run_tst_tool_005(vector: &Value) -> (Value, Vec<Value>) {
     (Value::Object(scenario), emitted)
 }
 
+fn run_tst_tool_001(vector: &Value) -> (Value, Vec<Value>) {
+    let initial = &vector["initial"];
+    assert_eq!(initial["side_effect_class"], "non_idempotent_write");
+    assert_eq!(initial["ledger_state"], "DISPATCHED");
+
+    // Durable dispatch marker crossed, transport disconnect before the
+    // authoritative result: recovery must be terminal UNKNOWN /
+    // TOOL_EXTERNAL_OUTCOME_UNKNOWN with zero automatic retries, and the
+    // emitted event is ToolOutcomeUnknown (never a re-dispatch).
+    let row = DurableDispatchRow {
+        schema: DurableDispatchRowSchemaTag,
+        operation_id: "0198ab31-6c44-7e8a-b2bb-000000000341".into(),
+        request_digest: digest_hex(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        operation_digest: digest_hex(
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+        tool_server_generation: 7,
+        ledger_state: LedgerState::Dispatched,
+        transport_eligible_byte_count: 1,
+        transport_sent_byte_count: 1,
+        server_effect_count: 0,
+        result: None,
+    };
+    let disposition = recover_operation(&row);
+    let recovered_result = match &disposition {
+        DispatchDisposition::Unknown { result } => result,
+        other => panic!("lost DISPATCHED result must be UNKNOWN, got {other:?}"),
+    };
+    assert_eq!(disposition.automatic_redispatch_count(), 0);
+
+    let mut scenario = Map::new();
+    scenario.insert("outcome".into(), json!("unknown_without_replay"));
+    scenario.insert("ledger_state".into(), json!("UNKNOWN"));
+    scenario.insert("automatic_retry_count".into(), json!(0));
+    scenario.insert(
+        "result".into(),
+        serde_json::to_value(recovered_result.clone()).unwrap(),
+    );
+
+    let emitted = vec![json!({ "event": "ToolOutcomeUnknown" })];
+    (Value::Object(scenario), emitted)
+}
+
 fn run_tst_tool_002(vector: &Value) -> (Value, Vec<Value>) {
     let initial = &vector["initial"];
     let pointer = initial["idempotency_policy"]["argument_pointer"]
@@ -286,6 +331,7 @@ fn run_tst_tool_002(vector: &Value) -> (Value, Vec<Value>) {
     // vector's initial ledger_state DISPATCHED with server_effect_count 1
     // and authoritative_response_lost = true.
     let row = DurableDispatchRow {
+        schema: DurableDispatchRowSchemaTag,
         operation_id: initial["operation_id"].as_str().unwrap().to_owned(),
         request_digest: candidate.request_digest,
         operation_digest: authorized.operation_digest,
@@ -365,7 +411,12 @@ fn run_tst_tool_008(vector: &Value) -> (Value, Vec<Value>) {
 
 #[test]
 fn executes_tst_tool_005_and_008_vectors() {
-    for test_id in ["TST-TOOL-002", "TST-TOOL-005", "TST-TOOL-008"] {
+    for test_id in [
+        "TST-TOOL-001",
+        "TST-TOOL-002",
+        "TST-TOOL-005",
+        "TST-TOOL-008",
+    ] {
         let files = fs::read_dir(spec_root().join("test-vectors/services"))
             .unwrap()
             .filter_map(|entry| {
@@ -380,6 +431,7 @@ fn executes_tst_tool_005_and_008_vectors() {
         );
         let vector = vector(&files[0]);
         let (scenario, emitted) = match test_id {
+            "TST-TOOL-001" => run_tst_tool_001(&vector),
             "TST-TOOL-002" => run_tst_tool_002(&vector),
             "TST-TOOL-005" => run_tst_tool_005(&vector),
             "TST-TOOL-008" => run_tst_tool_008(&vector),
