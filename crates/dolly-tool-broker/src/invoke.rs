@@ -84,6 +84,83 @@ pub const OPERATION_BINDING_SCHEMA: &str = "dolly.tool-operation-binding/v1";
 /// The schema tag of the pre-resolution digest envelope.
 pub const INVOKE_METHOD: &str = "host.tool.invoke";
 
+/// Non-recursive RFC 6901 JSON Pointer resolution over caller-supplied data.
+///
+/// The pointer syntax is evaluated against `document` (the complete
+/// `host.tool.invoke.arguments` object) without mutating or normalizing a
+/// single caller byte:
+///   - `""` is the whole document (RFC 6901 root reference);
+///   - `"/"` addresses the member whose key is the empty string;
+///   - a reference token is unescaped `~1 → /`, `~0 → ~`, directly (RFC
+///     6901 §4: a literal `~` must be followed by `0` or `1`);
+///   - on an array, a token is the zero-prefix-free index of an existing
+///     element; an out-of-range index or continuation from a scalar is a
+///     MISS result.
+/// Resolution is non-recursive and returns `None` for any missing member,
+/// missing index, or structurally invalid pointer. It never reorders, adds,
+/// or removes caller arguments, so the pointer always reads the exact
+/// byte-identical object the caller supplied.
+pub fn resolve_json_pointer<'a>(document: &'a JsonValue, pointer: &str) -> Option<&'a JsonValue> {
+    if pointer.is_empty() {
+        return Some(document);
+    }
+    if !pointer.starts_with('/') {
+        return None;
+    }
+    let mut current = document;
+    for raw_token in pointer[1..].split('/') {
+        let token = unescape_pointer_token(raw_token)?;
+        match current {
+            JsonValue::Object(map) => current = map.get(&token)?,
+            JsonValue::Array(items) => {
+                let index = parse_array_index(&token)?;
+                current = items.get(index)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+/// RFC 6901 token unescaping (`~1` → `/`, `~0` → `~`). Any `~` not followed
+/// by `0` or `1` is an invalid pointer.
+fn unescape_pointer_token(token: &str) -> Option<String> {
+    if !token.contains('~') {
+        return Some(token.to_owned());
+    }
+    let mut out = String::with_capacity(token.len());
+    let mut bytes = token.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte != b'~' {
+            out.push(char::from(byte));
+            continue;
+        }
+        match bytes.next() {
+            Some(b'0') => out.push('~'),
+            Some(b'1') => out.push('/'),
+            Some(_) => return None,
+            None => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Parse an RFC 6901 array index: `"0"` or a non-zero-leading decimal; any
+/// other token (including `-`) is not an existing array element reference
+/// under RFC 6901 evaluation.
+fn parse_array_index(token: &str) -> Option<usize> {
+    if token == "0" {
+        return Some(0);
+    }
+    if token.is_empty() || !token.starts_with(|c: char| c >= '1' && c <= '9') {
+        return None;
+    }
+    if !token.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    token.parse().ok()
+}
+
 /// The always-computable pre-resolution caller digest (spec §5).
 ///
 /// `params` is the complete `host.tool.invoke` params object. The digest is
@@ -265,16 +342,35 @@ pub fn evaluate_invoke<B: ResolutionBackend>(
             ),
         );
     }
-    // Idempotency binding per the closed policy.
-    let idempotency_ok = match &tool.idempotency {
+    // Idempotency binding per the closed policy (REQ-TOOL-002). For
+    // argument_key the RFC 6901 pointer MUST resolve on the caller-supplied
+    // arguments to a string byte-identical to `idempotency_key`; a missing
+    // target, a non-string target, or an unequal value is TOOL_INPUT_INVALID
+    // and the denial returns before the backend seam. The key is never
+    // treated as a dedup attestation: nothing here (no redispatch, no
+    // upstream status probe, no result replay) is implied by a match.
+    let matching_argument = match &tool.idempotency {
         IdempotencyPolicy::None => true,
-        IdempotencyPolicy::ArgumentKey => candidate.idempotency_key.is_some(),
+        IdempotencyPolicy::ArgumentKey { argument_pointer } => {
+            match resolve_json_pointer(&candidate.arguments, argument_pointer) {
+                Some(JsonValue::String(resolved)) => {
+                    candidate.idempotency_key.as_deref() == Some(resolved.as_str())
+                }
+                _ => false,
+            }
+        }
     };
-    if !idempotency_ok {
+    if !matching_argument {
+        let pointer = match &tool.idempotency {
+            IdempotencyPolicy::ArgumentKey { argument_pointer } => Some(argument_pointer.as_str()),
+            _ => None,
+        };
         return rejection(
             candidate,
             ToolErrorCode::InputInvalid,
-            format!("configured argument_key idempotency requires an idempotency_key"),
+            format!(
+                "configured argument_key idempotency requires argument_pointer {pointer:?} to resolve to exactly the idempotency_key"
+            ),
         );
     }
     // Confirmation policy per the frozen contract.
