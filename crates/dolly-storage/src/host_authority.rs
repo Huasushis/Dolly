@@ -1332,15 +1332,20 @@ fn insert_mapping(
     mapping: &ConfigRevisionMapping,
     bytes: &[u8],
 ) -> Result<(), HostAuthorityError> {
-    let existing: Option<(String, Vec<u8>)> = tx
+    let existing: Option<(String, String, String, Vec<u8>)> = tx
         .query_row(
-            "SELECT config_digest, canonical_bytes FROM config_revision_mappings WHERE config_revision = ?1",
+            "SELECT daemon_installation_id, instance_id, config_digest, canonical_bytes
+             FROM config_revision_mappings WHERE config_revision = ?1",
             [mapping.config_revision],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    if let Some((digest, existing_bytes)) = existing {
-        if digest == mapping.config_digest.to_string() && existing_bytes == bytes {
+    if let Some((daemon_installation_id, instance_id, digest, existing_bytes)) = existing {
+        if daemon_installation_id == mapping.daemon_installation_id
+            && instance_id == mapping.instance_id
+            && digest == mapping.config_digest.to_string()
+            && existing_bytes == bytes
+        {
             return Ok(());
         }
         return Err(HostAuthorityError::RevisionConflict {
