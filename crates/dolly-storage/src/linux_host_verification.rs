@@ -1,10 +1,10 @@
 //! Live Linux Host service and delegated-cgroup-root verification.
 //!
 //! Persistent Host authority remains in [`crate::host_authority`].  This
-//! module consumes a fully verified current snapshot and only returns fresh,
-//! process-local evidence for the next Host producer.  It never writes the
-//! Runtime authority database, starts a process, creates a transport, or
-//! grants a capability.
+//! module loads and re-verifies the fully authoritative current snapshot and
+//! only returns fresh, process-local evidence for the next Host producer.  It
+//! never writes the Runtime authority database, starts a process, creates a
+//! transport, or grants a capability.
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
@@ -20,11 +20,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
+use rusqlite::Connection;
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::host_authority::{
-    CurrentAuthoritySnapshot, InstalledComponentOrigin, LinuxServiceCandidate,
+    CurrentAuthoritySnapshot, HostAuthorityError, InstalledComponentOrigin, LinuxServiceCandidate,
+    load_current_authority,
 };
 
 /// The fixed Linux control-group v2 mount point used by the product profile.
@@ -85,7 +87,7 @@ impl LinuxHostVerificationError {
 
 /// One effective systemd ExecStart command.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinuxExecStart {
+pub(crate) struct LinuxExecStart {
     pub path: String,
     pub arguments: Vec<String>,
     pub flags: Vec<String>,
@@ -94,7 +96,7 @@ pub struct LinuxExecStart {
 /// Effective unit settings read from the service manager, not from unit-file
 /// text.  Durations are microseconds and must be finite and positive.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinuxServiceRuntimeProfile {
+pub(crate) struct LinuxServiceRuntimeProfile {
     pub unit_type: String,
     pub restart: String,
     pub start_limit_burst: u64,
@@ -117,7 +119,7 @@ pub struct LinuxServiceRuntimeProfile {
 /// The delegated service root observation.  The root itself must be empty and
 /// must already report all required subtree controllers as enabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinuxDelegatedRootObservation {
+pub(crate) struct LinuxDelegatedRootObservation {
     pub cgroup_path: String,
     pub filesystem_path: String,
     pub owner_unit_name: String,
@@ -132,7 +134,7 @@ pub struct LinuxDelegatedRootObservation {
 /// to exercise pure verification; production obtains it from systemd, `/proc`,
 /// `/sys/fs/cgroup`, and `loginctl` through [`observe_current_linux_host`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinuxHostObservation {
+pub(crate) struct LinuxHostObservation {
     pub platform: String,
     pub manager_mode: String,
     pub unit_name: String,
@@ -249,9 +251,8 @@ impl VerifiedLinuxHostProof {
 
 /// Verify one deterministic observation against the exact current authority.
 ///
-/// This is the testable decision boundary.  It does not query the environment,
-/// write a cgroup file, or create downstream authority.
-pub fn verify_linux_host_observation(
+#[cfg(test)]
+fn verify_linux_host_observation(
     snapshot: &CurrentAuthoritySnapshot,
     observation: LinuxHostObservation,
 ) -> Result<VerifiedLinuxHostProof, LinuxHostVerificationError> {
@@ -267,13 +268,16 @@ pub fn verify_linux_host_observation(
     let candidate = validate_current_snapshot(snapshot)?;
     verify_observation(snapshot, candidate, observation)
 }
-
-/// Observe and verify the current Linux Host service in one bounded operation.
+/// Observe and verify the authoritative current Linux Host service in one
+/// bounded operation.  The SQLite pointer and every canonical premise are
+/// loaded internally; callers cannot substitute a snapshot or observation.
 ///
 /// The first and second complete passes are compared to fence a service/root
-/// change during observation.  A changed pass is never treated as a proof.
+/// change during observation.  The authoritative pointer is loaded again
+/// after both passes, and any identity, revision, digest, premise, or
+/// candidate change refuses the proof.
 pub fn verify_current_linux_host(
-    snapshot: &CurrentAuthoritySnapshot,
+    connection: &Connection,
 ) -> Result<VerifiedLinuxHostProof, LinuxHostVerificationError> {
     if !cfg!(target_os = "linux") {
         return Err(LinuxHostVerificationError::refused(
@@ -281,32 +285,69 @@ pub fn verify_current_linux_host(
             "installed Linux Host verification requires Linux",
         ));
     }
-    let candidate = validate_current_snapshot(snapshot)?;
-    let first = observe_current_linux_host_for_candidate(candidate)?;
-    let second = observe_current_linux_host_for_candidate(candidate)?;
+    verify_current_linux_host_with_observer(connection, observe_current_linux_host_for_candidate)
+}
+
+fn verify_current_linux_host_with_observer<F>(
+    connection: &Connection,
+    mut observe: F,
+) -> Result<VerifiedLinuxHostProof, LinuxHostVerificationError>
+where
+    F: FnMut(&LinuxServiceCandidate) -> Result<LinuxHostObservation, LinuxHostVerificationError>,
+{
+    let initial = load_authoritative_snapshot(connection)?;
+    let candidate = validate_current_snapshot(&initial)?;
+    let first = observe(candidate)?;
+    let second = observe(candidate)?;
     if observation_identity(&first) != observation_identity(&second) {
         return Err(LinuxHostVerificationError::refused(
             LinuxHostVerificationCode::ObservationChanged,
             "service, invocation, process, cgroup, or delegated-root observations changed during verification",
         ));
     }
-    verify_observation(snapshot, candidate, second)
-}
-
-/// Gather one production observation pass without minting a proof.  This is a
-/// real Linux seam; deterministic tests should use
-/// [`verify_linux_host_observation`] rather than replacing this implementation.
-pub fn observe_current_linux_host(
-    snapshot: &CurrentAuthoritySnapshot,
-) -> Result<LinuxHostObservation, LinuxHostVerificationError> {
-    if !cfg!(target_os = "linux") {
+    let final_snapshot = load_authoritative_snapshot(connection)?;
+    if !same_authority_binding(&initial, &final_snapshot) {
         return Err(LinuxHostVerificationError::refused(
-            LinuxHostVerificationCode::PlatformUnsupported,
-            "installed Linux Host observation requires Linux",
+            LinuxHostVerificationCode::ObservationChanged,
+            "authoritative Runtime identity, revision, digest, premise, or service candidate changed during observation",
         ));
     }
-    let candidate = validate_current_snapshot(snapshot)?;
-    observe_current_linux_host_for_candidate(candidate)
+    verify_observation(&initial, candidate, second)
+}
+
+fn load_authoritative_snapshot(
+    connection: &Connection,
+) -> Result<CurrentAuthoritySnapshot, LinuxHostVerificationError> {
+    load_current_authority(connection)
+        .map_err(|error: HostAuthorityError| {
+            LinuxHostVerificationError::refused(
+                LinuxHostVerificationCode::PremiseStale,
+                format!("authoritative current pointer could not be loaded: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            LinuxHostVerificationError::refused(
+                LinuxHostVerificationCode::PremiseMissing,
+                "authoritative current pointer has no committed Host activation premise",
+            )
+        })
+}
+
+fn same_authority_binding(
+    initial: &CurrentAuthoritySnapshot,
+    final_snapshot: &CurrentAuthoritySnapshot,
+) -> bool {
+    initial.mapping.daemon_installation_id == final_snapshot.mapping.daemon_installation_id
+        && initial.mapping.instance_id == final_snapshot.mapping.instance_id
+        && initial.mapping.config_revision == final_snapshot.mapping.config_revision
+        && initial.mapping.config_digest == final_snapshot.mapping.config_digest
+        && match (&initial.premise, &final_snapshot.premise) {
+            (Some(initial), Some(final_premise)) => {
+                initial.premises_digest == final_premise.premises_digest
+                    && initial.service_candidate == final_premise.service_candidate
+            }
+            _ => false,
+        }
 }
 
 fn validate_current_snapshot(
@@ -1380,4 +1421,227 @@ fn observation_io_error(error: io::Error) -> LinuxHostVerificationError {
         LinuxHostVerificationCode::ObservationUnavailable,
         error.to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_authority::{
+        ConfigRevisionMapping, HostAuthorityRevision, ModuleActivationPremises,
+        ResolvedConfiguration, RuntimeAuthorityIdentity, create_host_authority_schema,
+        install_host_authority_revision,
+    };
+    use dolly_canonical_json::CanonicalJsonValue;
+    use serde_json::{Value, json};
+    use tempfile::{TempDir, tempdir};
+
+    fn digest(value: &Value) -> Sha256Digest {
+        canonicalize(value).unwrap().1
+    }
+
+    fn without(value: &Value, field: &str) -> Value {
+        let mut object = value.as_object().unwrap().clone();
+        object.remove(field);
+        Value::Object(object)
+    }
+
+    fn authority() -> CurrentAuthoritySnapshot {
+        let origin = InstalledComponentOrigin {
+            schema: "dolly.installed-component-origin/v1".into(),
+            kind: "installed_product_component".into(),
+            component_id: "org.dolly.host-runtime".into(),
+            component_revision: 1,
+            component_digest: digest(&json!({"component": "host-runtime"})),
+        };
+        let mut candidate_record = json!({
+            "schema": "dolly.linux-service-candidate/v1",
+            "origin": serde_json::to_value(&origin).unwrap(),
+            "unit_name": "dollyd@main.service",
+            "mode": "user",
+            "candidate_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        });
+        candidate_record["candidate_digest"] =
+            json!(digest(&without(&candidate_record, "candidate_digest")).to_string());
+        let candidate: LinuxServiceCandidate = serde_json::from_value(candidate_record).unwrap();
+        let config = ResolvedConfiguration {
+            runtime_config: CanonicalJsonValue::try_from(json!({"modules": ["installed"]}))
+                .unwrap(),
+            permission_policy_selections: Vec::new(),
+            service_candidate: Some(candidate.clone()),
+        };
+        let config_digest = canonicalize(&config).unwrap().1;
+        let mut premise_record = json!({
+            "schema": "dolly.module-activation-premises/v1",
+            "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000001",
+            "instance_id": "instance-one",
+            "config_revision": 1,
+            "config_digest": config_digest,
+            "permission_policy_definitions": [],
+            "permission_policy_backend_bindings": [],
+            "service_candidate": serde_json::to_value(&candidate).unwrap(),
+            "premises_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        });
+        premise_record["premises_digest"] =
+            json!(digest(&without(&premise_record, "premises_digest")).to_string());
+        let premise: ModuleActivationPremises = serde_json::from_value(premise_record).unwrap();
+        CurrentAuthoritySnapshot {
+            mapping: ConfigRevisionMapping {
+                schema: "dolly.config-revision-mapping/v1".into(),
+                daemon_installation_id: premise.daemon_installation_id.clone(),
+                instance_id: premise.instance_id.clone(),
+                config_revision: 1,
+                config_digest,
+                canonical_config: config,
+            },
+            premise: Some(premise),
+        }
+    }
+
+    fn good_observation() -> LinuxHostObservation {
+        LinuxHostObservation {
+            platform: "linux".into(),
+            manager_mode: "user".into(),
+            unit_name: "dollyd@main.service".into(),
+            unit_id: "dollyd@main.service".into(),
+            unit_names: vec!["dollyd@main.service".into()],
+            load_state: "loaded".into(),
+            active_state: "active".into(),
+            sub_state: "running".into(),
+            result: "success".into(),
+            self_pid: 4242,
+            main_pid: 4242,
+            control_group: "/user.slice/dollyd@main.service".into(),
+            self_cgroup_path: "/user.slice/dollyd@main.service/core".into(),
+            invocation_id: "2812432ad29e4d3bbd6776c62cafa929".into(),
+            boot_id: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9".into(),
+            cgroup_v2: true,
+            runtime: LinuxServiceRuntimeProfile {
+                unit_type: "exec".into(),
+                restart: "on-failure".into(),
+                start_limit_burst: 5,
+                start_limit_interval_usec: 20_000_000,
+                kill_mode: "control-group".into(),
+                send_sigkill: true,
+                timeout_stop_usec: 20_000_000,
+                delegate: true,
+                delegate_subgroup: "core".into(),
+                exit_type: "main".into(),
+                restart_mode: "normal".into(),
+                remain_after_exit: false,
+                success_exit_status: Vec::new(),
+                restart_prevent_exit_status: Vec::new(),
+                pass_environment: Vec::new(),
+                environment_files: Vec::new(),
+                exec_start: vec![LinuxExecStart {
+                    path: "/usr/bin/dollyd".into(),
+                    arguments: vec!["/usr/bin/dollyd".into()],
+                    flags: vec!["no-env-expand".into()],
+                }],
+            },
+            user_linger: Some(true),
+            delegated_root: LinuxDelegatedRootObservation {
+                cgroup_path: "/user.slice/dollyd@main.service".into(),
+                filesystem_path: "/sys/fs/cgroup/user.slice/dollyd@main.service".into(),
+                owner_unit_name: "dollyd@main.service".into(),
+                owner_manager_mode: "user".into(),
+                process_ids: Vec::new(),
+                controllers: vec!["cpu".into(), "memory".into(), "pids".into()],
+                subtree_control: vec!["cpu".into(), "memory".into(), "pids".into()],
+                cgroup_v2: true,
+            },
+            observation_generation: 7,
+            observed_at_unix_millis: 1_755_876_800_000,
+        }
+    }
+
+    fn durable_database() -> (TempDir, crate::Database) {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite3");
+        let mut db = crate::Database::open(&path).unwrap();
+        create_host_authority_schema(db.connection()).unwrap();
+        let snapshot = authority();
+        install_host_authority_revision(
+            &mut db,
+            HostAuthorityRevision {
+                identity: RuntimeAuthorityIdentity {
+                    daemon_installation_id: snapshot.mapping.daemon_installation_id.clone(),
+                    instance_id: snapshot.mapping.instance_id.clone(),
+                },
+                mapping: snapshot.mapping,
+                premise: snapshot.premise,
+            },
+        )
+        .unwrap();
+        (directory, db)
+    }
+
+    #[test]
+    fn complete_observation_mints_only_private_test_proof() {
+        let proof = verify_linux_host_observation(&authority(), good_observation()).unwrap();
+        assert_eq!(proof.schema(), LINUX_HOST_VERIFICATION_PROOF_SCHEMA);
+        assert_eq!(proof.config_revision(), 1);
+        assert_eq!(proof.instance_id(), "instance-one");
+        assert_eq!(
+            proof.delegated_root().cgroup_path,
+            "/user.slice/dollyd@main.service"
+        );
+    }
+
+    #[test]
+    fn service_and_root_mismatches_fail_closed() {
+        let snapshot = authority();
+        for mutate in [
+            |observation: &mut LinuxHostObservation| observation.manager_mode = "system".into(),
+            |observation: &mut LinuxHostObservation| observation.active_state = "failed".into(),
+            |observation: &mut LinuxHostObservation| observation.main_pid = 0,
+            |observation: &mut LinuxHostObservation| observation.self_cgroup_path = "/wrong".into(),
+            |observation: &mut LinuxHostObservation| {
+                observation.delegated_root.process_ids = vec![7]
+            },
+            |observation: &mut LinuxHostObservation| {
+                observation.delegated_root.subtree_control = vec!["cpu".into()]
+            },
+        ] {
+            let mut observation = good_observation();
+            mutate(&mut observation);
+            assert!(verify_linux_host_observation(&snapshot, observation).is_err());
+        }
+    }
+
+    #[test]
+    fn missing_or_stale_premise_never_reaches_private_observer() {
+        let mut missing = authority();
+        missing.premise = None;
+        let error = verify_linux_host_observation(&missing, good_observation()).unwrap_err();
+        assert_eq!(error.code, LinuxHostVerificationCode::PremiseMissing);
+
+        let mut stale = authority();
+        stale.mapping.config_digest = digest(&json!({"changed": true}));
+        let error = verify_linux_host_observation(&stale, good_observation()).unwrap_err();
+        assert_eq!(error.code, LinuxHostVerificationCode::PremiseDigestMismatch);
+    }
+
+    #[test]
+    fn current_pointer_change_after_observation_never_mints_proof() {
+        let (_directory, db) = durable_database();
+        let connection = db.connection();
+        let mut calls = 0;
+        let result = verify_current_linux_host_with_observer(connection, |_candidate| {
+            calls += 1;
+            if calls == 2 {
+                connection
+                    .execute(
+                        "UPDATE runtime_authority_state SET instance_id = 'changed-instance'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            Ok(good_observation())
+        });
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err().code,
+            LinuxHostVerificationCode::PremiseStale | LinuxHostVerificationCode::ObservationChanged
+        ));
+    }
 }
