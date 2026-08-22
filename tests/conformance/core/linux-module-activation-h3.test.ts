@@ -40,6 +40,8 @@ const live = vi.hoisted(() => ({
   service: undefined as CoreServiceBindingResult | undefined,
   runtime: undefined as ReviewedLinuxModuleRuntimeInspection | undefined,
   delegatedRoot: undefined as DelegatedCgroupRootResult | undefined,
+  beforeRuntimeProof: undefined as (() => Promise<void> | void) | undefined,
+  runtimeIdentityStale: false,
 }));
 
 vi.mock("../../../src/core/host-platform.js", () => ({
@@ -49,10 +51,23 @@ vi.mock("../../../src/core/linux-core-service-binding.js", async (importOriginal
   ...await importOriginal<typeof LinuxCoreServiceBindingModule>(),
   inspectCoreServiceBinding: vi.fn(async () => live.service),
 }));
-vi.mock("../../../src/linux-module-runtime-assets.js", async (importOriginal) => ({
-  ...await importOriginal<typeof LinuxRuntimeAssetsModule>(),
-  inspectReviewedLinuxModuleRuntime: vi.fn(async () => live.runtime),
-}));
+vi.mock("../../../src/linux-module-runtime-assets.js", async (importOriginal) => {
+  const original = await importOriginal<typeof LinuxRuntimeAssetsModule>();
+  return {
+    ...original,
+    inspectReviewedLinuxModuleRuntime: vi.fn(async () => {
+      await live.beforeRuntimeProof?.();
+      live.beforeRuntimeProof = undefined;
+      return live.runtime;
+    }),
+    assertReviewedLinuxModuleRuntimeIdentity: vi.fn((value) => {
+      if (live.runtimeIdentityStale) {
+        throw new TypeError("the reviewed runtime identity is stale");
+      }
+      return original.assertReviewedLinuxModuleRuntimeIdentity(value);
+    }),
+  };
+});
 vi.mock("../../../src/core/linux-module-cgroup.js", async (importOriginal) => ({
   ...await importOriginal<typeof LinuxModuleCgroupModule>(),
   prepareDelegatedCgroupRoot: vi.fn(async () => live.delegatedRoot),
@@ -215,6 +230,8 @@ async function fixture(configRevision = 1): Promise<{
 
 function setCompleteLiveProof(): void {
   live.platform = "linux";
+  live.beforeRuntimeProof = undefined;
+  live.runtimeIdentityStale = false;
   live.service = {
     verified: true,
     binding: {
@@ -270,6 +287,24 @@ describe("H3 live Linux Module activation proof", () => {
     expect(result.runtimeBinding.auditProfile).toEqual(currentRuntimeProfile());
     expect(result.delegatedRoot.subtreeControl).toEqual(["cpu", "memory", "pids"]);
     expect(result.installedComponentOrigins).toContain(permission.serviceCandidate.origin);
+    await controller.release();
+  });
+
+  it("does not mint after the authoritative H2 revision changes during an awaited live check", async () => {
+    const { database, origin, permission, controller } = await fixture();
+    const replacement = buildAuthority(origin, 2);
+    live.beforeRuntimeProof = async () => {
+      database.installConfig({
+        identity,
+        canonicalConfigBytes: replacement.bytes,
+        configDigest: replacement.digest,
+        premise: replacement.premise,
+        verifiedOrigins: [origin],
+      });
+    };
+    await expect(proveLinuxModuleActivation({
+      startupAuthorityPermission: permission,
+    })).rejects.toThrow(/stale|revision/i);
     await controller.release();
   });
 
@@ -386,6 +421,24 @@ describe("H3 live Linux Module activation proof", () => {
     const activation = consumeLinuxModuleActivationHandoff({ handoff, startupAuthorityPermission: permission });
     expect(activation).toBe(handoff.activationPermission);
     expect(() => consumeLinuxModuleActivationHandoff({ handoff, startupAuthorityPermission: permission })).toThrow(/consumed|once/i);
+    await controller.release();
+  });
+
+  it("rechecks the stored reviewed runtime identity before consuming", async () => {
+    const { permission, controller } = await fixture();
+    const result = await proveLinuxModuleActivation({ startupAuthorityPermission: permission });
+    expect(result.permitted).toBe(true);
+    if (!result.permitted) throw new Error("expected complete live proof");
+    live.runtimeIdentityStale = true;
+    expect(() => consumeLinuxModuleActivationHandoff({
+      handoff: result,
+      startupAuthorityPermission: permission,
+    })).toThrow(/runtime.*stale|stale.*runtime/i);
+    live.runtimeIdentityStale = false;
+    expect(consumeLinuxModuleActivationHandoff({
+      handoff: result,
+      startupAuthorityPermission: permission,
+    })).toBe(result.activationPermission);
     await controller.release();
   });
 
