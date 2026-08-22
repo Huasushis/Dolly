@@ -1,0 +1,16 @@
+[package]
+name = "dolly-tool-coordinator"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dolly-canonical-json = { path = "../dolly-canonical-json" }
+dolly-tool-broker = { path = "../dolly-tool-broker" }
+dolly-storage = { path = "../dolly-storage" }
+
+[dev-dependencies]
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tempfile = "3"

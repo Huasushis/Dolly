@@ -8,6 +8,7 @@ members = [
     "crates/dolly-protocol",
     "crates/dolly-storage",
     "crates/dolly-tool-broker",
+    "crates/dolly-tool-coordinator",
 ]
 
 [workspace.package]
