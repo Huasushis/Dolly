@@ -81,10 +81,12 @@ explicit approval rather than an implementation guess:
   per Module/storage scope. A global stream gives one deletion frontier and
   one replay order; per-Module streams isolate pressure but multiply migration
   and checkpoint state.
-- **Reader evidence.** Whether authenticated reader observations may be
-  included as evidence in a producer checkpoint. The recommendation permits
-  an evidence digest for audit but never delegates deletion authority to a
-  reader, an acknowledgement, or an absent reader.
+- **Reader evidence is non-authoritative (resolved).** Reader progress, reader
+  acknowledgements, reader absence, cache state, and authenticated reader
+  observations are audit-only. They MUST NOT derive, gate, select, or advance
+  `delete_through` or any producer checkpoint. An optional `evidence_digest`
+  binds audit bytes only and is never consulted for checkpoint publication or
+  deletion eligibility.
 - **Legacy migration semantics.** Whether a legacy JSON snapshot should expose
   a synthetic history entry. The recommendation does not synthesize one: the
   old formats contain no ordered history and cannot prove one.
@@ -165,8 +167,11 @@ The logical tables are:
   `history_id`, `checkpoint_version`, `producer_id`, `producer_epoch`,
   `producer_revision`, `delete_through`, `issued_at`, `evidence_digest`, and
   `checkpoint_digest`. Replacing this row is allowed only with the next
-  checkpoint version and an exact producer epoch; the previous checkpoint is
-  not needed for reader replay and is not an unbounded second history.
+  checkpoint version, an exact producer epoch, and
+  `delete_through >= current_checkpoint.delete_through`. `delete_through` is a
+  monotonic non-decreasing, non-revocable producer watermark; a regressing
+  value fails before mutation. The previous checkpoint is not needed for
+  reader replay and is not an unbounded second history.
 - `filecore_history_readers`, at most `max_readers` rows per `history_id`,
   containing a configured `reader_id`, `cursor`, `reader_revision`, and
   `cursor_digest`. Reader rows are bounded metadata for replay diagnostics;
@@ -207,20 +212,27 @@ one of the approvals above.
    `HISTORY_IDEMPOTENCY_CONFLICT`. Append never deletes older entries and
    never infers a checkpoint.
 3. `publishCheckpoint` is available only to the producer authority. It writes
-   the next `checkpoint_version`, requires `delete_through <= produced_through`,
+   the next `checkpoint_version`, requires
+   `current_checkpoint.delete_through <= delete_through <= produced_through`,
    binds `producer_revision` and `producer_epoch`, and commits the checkpoint
    before any deletion transaction. A reader, reader acknowledgement, empty
-   reader set, cache, or compactor cannot call this operation. An evidence
-   digest may identify authenticated observations used by the producer's
-   policy, but it does not transfer authority.
+   reader set, cache, authenticated reader observation, or compactor cannot
+   call this operation. Reader progress, reader acknowledgements, reader
+   absence, cache state, and authenticated reader observations are audit-only.
+   They MUST NOT derive, gate, select, or advance `delete_through` or any
+   producer checkpoint. An optional `evidence_digest` binds audit bytes only
+   and is never consulted for checkpoint publication or deletion eligibility.
+   A regressing value fails as `HISTORY_CHECKPOINT_REGRESSION` without
+   mutation.
 4. `deleteEligible` rereads the current checkpoint and requires the exact
    `(checkpoint_version, checkpoint_digest, producer_epoch)` supplied by the
    caller. It deletes only entries with `sequence <= delete_through`, updates
    `retained_from` to one past the greatest deleted sequence, and updates the
    count/byte projections in one transaction. No checkpoint means no deletion;
-   a stale checkpoint is `HISTORY_CHECKPOINT_STALE`; a checkpoint beyond the
-   producer frontier is invalid. A successful delete cannot create or advance
-   a checkpoint.
+   a stale or regressing checkpoint fails without mutation
+   (`HISTORY_CHECKPOINT_STALE` or `HISTORY_CHECKPOINT_REGRESSION`); a
+   checkpoint beyond the producer frontier is invalid. A successful delete
+   cannot create or advance a checkpoint.
 5. Physical compaction may rewrite SQLite storage after logical deletion, but
    it must preserve every remaining sequence, canonical byte sequence, digest,
    and head projection. A successful physical compaction alone cannot advance
@@ -312,13 +324,16 @@ following before this ADR can become `Accepted`:
 2. **Bounded append:** count and canonical-byte limits reject the candidate
    before any row, head revision, or producer sequence changes; a duplicate
    idempotency key replays the same entry and a conflicting digest refuses.
-3. **Authority direction:** reader progress, an acknowledgement, an empty
-   reader set, a cache-only observation, and a successful physical compaction
-   cannot advance a checkpoint or delete a row. Only the producer authority
-   with the current epoch can publish a checkpoint.
+3. **Authority direction:** reader progress, reader acknowledgements, reader
+   absence, cache-only observations, authenticated reader observations, and a
+   successful physical compaction are audit-only. None can derive, gate,
+   select, or advance `delete_through` or any producer checkpoint. Only the
+   producer authority with the current epoch can publish a checkpoint.
 4. **Checkpoint-before-delete:** deletion without a checkpoint, with a stale
-   checkpoint, with a wrong digest/epoch, or beyond `produced_through` refuses
-   without mutation. The exact checkpoint permits only its inclusive range.
+   or regressing checkpoint, with a wrong digest/epoch, or beyond
+   `produced_through` refuses without mutation. Checkpoint replacement requires
+   a monotonic non-decreasing, non-revocable `delete_through`; the exact
+   checkpoint permits only its inclusive range.
 5. **Reader behavior:** `from-head`, `from-now`, contiguous replay, empty
    frontier, cursor-ahead refusal, and honest post-deletion `HISTORY_GAP` are
    deterministic across reopen; reading never advances a cursor.
@@ -326,7 +341,9 @@ following before this ADR can become `Accepted`:
    controller lock; stale head/reader revisions and producer epochs are
    fenced; injected failures before and after checkpoint, append, and delete
    commit reopen to the corresponding all-old or all-new state without a
-   duplicate entry or invented deletion premise.
+   duplicate entry or invented deletion premise. A stale or regressing
+   checkpoint replacement leaves the prior checkpoint and all history rows
+   unchanged.
 7. **Bounded reader metadata:** configured reader slots cannot exceed
    `max_readers`, and reader acknowledgements cannot grow an unbounded history
    table.
@@ -346,8 +363,10 @@ this ADR before implementation begins, specifically confirming:
 1. the logical canonical-entry count/byte measure as the v1 retention bound (or
    supplying a separate physical SQLite bound);
 2. one instance-global stream with finite configured reader slots;
-3. producer-issued checkpoints as the sole deletion authority, with reader ACKs
-   as non-authoritative evidence only; and
+3. producer-issued checkpoints as the sole deletion authority, with reader
+   progress, acknowledgements, reader absence, cache state, and authenticated
+   reader observations audit-only and forbidden from deriving, gating,
+   selecting, or advancing `delete_through` or any producer checkpoint; and
 4. an explicit migration gap rather than fabricated legacy history, while
    retaining `RUNTIME_MODULE_MIGRATION_REQUIRED`.
 
