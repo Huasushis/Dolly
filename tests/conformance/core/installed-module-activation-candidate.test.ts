@@ -23,6 +23,13 @@ import {
   type InstalledModuleActivationCandidateOptions,
 } from "../../../src/core/installed-module-activation-candidate.js";
 import {
+  assertInstalledModuleRuntimePremise,
+  composeInstalledModuleRuntimePremise,
+} from "../../../src/adapters/installed-module-runtime-premise.js";
+import {
+  ReservedV10InstalledPermissionPolicyRegistry,
+} from "../../../src/adapters/installed-module-permission-policy.js";
+import {
   proveLinuxModuleActivation,
   consumeLinuxModuleActivationHandoff,
   type LinuxModuleActivationHandoff,
@@ -482,6 +489,79 @@ describe("post-H3 installed Module activation candidate", () => {
       for (const field of ["process", "ready", "acknowledgement", "absence", "retry"]) {
         expect(() => composeInstalledModuleActivationCandidate({
           ...options(current),
+          [field]: true,
+        } as never), field).toThrow(/unknown fields/u);
+      }
+    } finally {
+      await closeFixture(current);
+    }
+  });
+  it("projects the exact branded candidate into an immutable per-Module runtime premise", async () => {
+    const current = await fixture();
+    try {
+      const candidate = composeInstalledModuleActivationCandidate(options(current));
+      const permissionPolicies = new ReservedV10InstalledPermissionPolicyRegistry({
+        policies: [],
+      });
+      const premise = composeInstalledModuleRuntimePremise({
+        candidate,
+        permissionPolicies,
+      });
+      const module = premise.modules[0]!;
+      expect(premise.schemaVersion).toBe("dolly.installed-module-runtime-premise/1");
+      expect(premise.candidate).toBe(candidate);
+      expect(premise.modules).toHaveLength(1);
+      expect(module.moduleId).toBe(candidate.modules[0]!.moduleId);
+      expect(module.packageOrigin).toBe(candidate.modules[0]!.packageOrigin);
+      expect(module.permissionPolicies.snapshot).toEqual({
+        schemaVersion: "dolly.reserved-v10-permission-policy-selection/1",
+        instanceId: candidate.modules[0]!.installedModule.instanceId,
+        moduleId: candidate.modules[0]!.installedModule.module.moduleId,
+        installedPlanDigest: candidate.modules[0]!.installedModule.provenanceDigest,
+        packageDigest: candidate.modules[0]!.installedModule.installation.packageDigest,
+        configurationDigest: candidate.modules[0]!.installedModule.configuration.configurationDigest,
+        policies: [],
+      });
+      expect(module.processProvenance.installedModule)
+        .toBe(candidate.modules[0]!.installedModule);
+      expect(module.processProvenance.permissionPolicies).toBe(module.permissionPolicies);
+      expect(module.processProvenance.snapshot).toMatchObject({
+        installedPlanDigest: candidate.modules[0]!.installedModule.provenanceDigest,
+      });
+      expect(Object.isFrozen(premise)).toBe(true);
+      expect(Object.isFrozen(module)).toBe(true);
+      expect(Object.keys(premise).sort()).toEqual([
+        "candidate",
+        "modules",
+        "schemaVersion",
+      ]);
+      expect(Object.keys(module).sort()).toEqual([
+        "moduleId",
+        "packageOrigin",
+        "permissionPolicies",
+        "processProvenance",
+      ]);
+      expect(() => assertInstalledModuleRuntimePremise({ ...premise })).toThrow(/not minted/u);
+    } finally {
+      await closeFixture(current);
+    }
+  });
+
+  it("rejects copied candidates and all downstream-shaped premise inputs", async () => {
+    const current = await fixture();
+    try {
+      const candidate = composeInstalledModuleActivationCandidate(options(current));
+      const permissionPolicies = new ReservedV10InstalledPermissionPolicyRegistry({
+        policies: [],
+      });
+      expect(() => composeInstalledModuleRuntimePremise({
+        candidate: { ...candidate },
+        permissionPolicies,
+      } as never)).toThrow(/not minted/u);
+      for (const field of ["process", "ready", "acknowledgement", "absence", "retry"]) {
+        expect(() => composeInstalledModuleRuntimePremise({
+          candidate,
+          permissionPolicies,
           [field]: true,
         } as never), field).toThrow(/unknown fields/u);
       }
