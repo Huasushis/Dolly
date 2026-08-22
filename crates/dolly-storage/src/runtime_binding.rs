@@ -159,6 +159,17 @@ impl RuntimeBinding {
     pub fn service_candidate_digest(&self) -> &Sha256Digest {
         &self.service_candidate_digest
     }
+    pub fn service_candidate_origin(&self) -> &InstalledComponentOrigin {
+        &self.service_candidate_origin
+    }
+
+    pub fn service(&self) -> &VerifiedLinuxServiceIdentity {
+        &self.service
+    }
+
+    pub fn delegated_root(&self) -> &VerifiedDelegatedCgroupRoot {
+        &self.delegated_root
+    }
 
     /// Mint exactly one fresh process-generation identity from this binding.
     ///

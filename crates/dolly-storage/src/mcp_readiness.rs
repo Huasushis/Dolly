@@ -10,14 +10,16 @@
 use std::fmt;
 
 use dolly_canonical_json::{CanonicalJsonObject, CanonicalJsonValue, Sha256Digest, canonicalize};
-use dolly_core_domain::{ExtensionGeneration, ExtensionId};
+use dolly_core_domain::{ExtensionGeneration, ExtensionId, WorkerEpoch};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::Database;
 use crate::host_authority::{CurrentAuthoritySnapshot, HostAuthorityError, load_current_authority};
-use crate::linux_host_verification::verify_current_linux_host;
+use crate::linux_host_verification::{
+    LinuxHostVerificationError, VerifiedLinuxHostProof, verify_current_linux_host,
+};
 use crate::runtime_binding::{
     ProcessGeneration, RuntimeBinding, RuntimeBindingError, mint_runtime_binding,
 };
@@ -168,6 +170,22 @@ impl McpTransportBinding {
 pub struct McpHandshakeObservation {
     /// The configured server identity reported by the transport adapter.
     pub server_id: Option<String>,
+    /// The adapter identity used for the handshake.
+    pub adapter: Option<String>,
+    /// The daemon installation authority identity observed by the adapter.
+    pub daemon_installation_id: Option<String>,
+    /// The Runtime instance authority identity observed by the adapter.
+    pub instance_id: Option<String>,
+    /// The current controller generation observed by the adapter.
+    pub controller_generation: Option<ExtensionGeneration>,
+    /// The current worker epoch observed by the adapter.
+    pub worker_epoch: Option<WorkerEpoch>,
+    /// The extension alias observed by the adapter.
+    pub extension_alias: Option<ExtensionId>,
+    /// The current extension process generation observed by the adapter.
+    pub extension_generation: Option<ExtensionGeneration>,
+    /// Digest of the exact runtime binding used by the handshake.
+    pub runtime_binding_digest: Option<Sha256Digest>,
     /// The observed transport kind (`stdio` or `streamable_http`).
     pub transport_kind: Option<String>,
     /// The exact endpoint identity observed by the adapter.
@@ -344,11 +362,33 @@ pub fn prove_current_mcp_transport_readiness<P>(
 where
     P: McpTransportProbe,
 {
+    prove_current_mcp_transport_readiness_with_verifier(
+        connection,
+        runtime_binding,
+        process_generation,
+        server_id,
+        probe,
+        verify_current_linux_host,
+    )
+}
+
+fn prove_current_mcp_transport_readiness_with_verifier<P, F>(
+    connection: &Connection,
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    server_id: &str,
+    probe: &mut P,
+    mut verify_live_host: F,
+) -> Result<McpTransportReadiness, McpReadinessError>
+where
+    P: McpTransportProbe,
+    F: FnMut(&Connection) -> Result<VerifiedLinuxHostProof, LinuxHostVerificationError>,
+{
     let snapshot = load_current_snapshot(connection)?;
     let binding = load_mcp_transport_binding(&snapshot, server_id)?;
     validate_runtime_process_authority(connection, &snapshot, runtime_binding, process_generation)?;
     let observation = probe.observe(&binding).map_err(map_probe_error)?;
-    let handshake = validate_handshake(&binding, observation)?;
+    let handshake = validate_handshake(&binding, runtime_binding, process_generation, observation)?;
     let final_snapshot = load_current_snapshot(connection)?;
     if !same_authority_binding(&snapshot, &final_snapshot) {
         return Err(McpReadinessError::refused(
@@ -362,8 +402,30 @@ where
         runtime_binding,
         process_generation,
     )?;
+    let final_host_proof = verify_live_host(connection).map_err(|error| {
+        McpReadinessError::refused(McpReadinessCode::HostProofUnavailable, error.to_string())
+    })?;
+    let proof_snapshot = load_current_snapshot(connection)?;
+    if !same_authority_binding(&final_snapshot, &proof_snapshot) {
+        return Err(McpReadinessError::refused(
+            McpReadinessCode::HostPremiseStale,
+            "Runtime Host premise changed during final live Host verification",
+        ));
+    }
+    validate_runtime_process_authority(
+        connection,
+        &proof_snapshot,
+        runtime_binding,
+        process_generation,
+    )?;
+    validate_live_host_proof(
+        &proof_snapshot,
+        runtime_binding,
+        process_generation,
+        &final_host_proof,
+    )?;
     mint_readiness_record(
-        &final_snapshot,
+        &proof_snapshot,
         runtime_binding,
         process_generation,
         &binding,
@@ -416,6 +478,50 @@ fn same_authority_binding(
             }
             _ => false,
         }
+}
+fn validate_live_host_proof(
+    snapshot: &CurrentAuthoritySnapshot,
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    proof: &VerifiedLinuxHostProof,
+) -> Result<(), McpReadinessError> {
+    let premise = snapshot.premise.as_ref().ok_or_else(|| {
+        McpReadinessError::refused(
+            McpReadinessCode::HostPremiseMissing,
+            "final live Host proof has no current durable premise",
+        )
+    })?;
+    let identity_matches = proof.schema()
+        == crate::linux_host_verification::LINUX_HOST_VERIFICATION_PROOF_SCHEMA
+        && proof.daemon_installation_id() == snapshot.mapping.daemon_installation_id
+        && proof.instance_id() == snapshot.mapping.instance_id
+        && proof.config_revision() == snapshot.mapping.config_revision
+        && proof.config_digest() == &snapshot.mapping.config_digest
+        && proof.premises_digest() == &premise.premises_digest
+        && proof.service_candidate_digest() == &premise.service_candidate.candidate_digest
+        && proof.service_candidate_origin() == &premise.service_candidate.origin
+        && proof.daemon_installation_id() == runtime_binding.daemon_installation_id()
+        && proof.instance_id() == runtime_binding.instance_id()
+        && proof.config_revision() == runtime_binding.config_revision()
+        && proof.config_digest() == runtime_binding.config_digest()
+        && proof.premises_digest() == runtime_binding.premises_digest()
+        && proof.service_candidate_digest() == runtime_binding.service_candidate_digest()
+        && proof.service_candidate_origin() == runtime_binding.service_candidate_origin()
+        && proof.service() == runtime_binding.service()
+        && proof.delegated_root() == runtime_binding.delegated_root()
+        && proof.daemon_installation_id() == process_generation.daemon_installation_id()
+        && proof.instance_id() == process_generation.instance_id()
+        && proof.config_revision() == process_generation.config_revision()
+        && proof.config_digest() == process_generation.config_digest()
+        && proof.service() == process_generation.service()
+        && proof.delegated_root() == process_generation.delegated_root();
+    if !identity_matches {
+        return Err(McpReadinessError::refused(
+            McpReadinessCode::HostPremiseStale,
+            "final live Host proof is not the exact proof bound to the current RuntimeBinding and ProcessGeneration",
+        ));
+    }
+    Ok(())
 }
 
 struct ValidatedHandshake {
@@ -581,8 +687,80 @@ fn load_mcp_transport_binding(
 
 fn validate_handshake(
     binding: &McpTransportBinding,
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
     observation: McpHandshakeObservation,
 ) -> Result<ValidatedHandshake, McpReadinessError> {
+    let Some(adapter) = observation.adapter else {
+        return Err(McpReadinessError::refused(
+            McpReadinessCode::ProbeAbsent,
+            "transport probe did not identify an adapter",
+        ));
+    };
+    if adapter != binding.adapter {
+        return Err(McpReadinessError::refused(
+            McpReadinessCode::HandshakeIdentityMismatch,
+            format!(
+                "observed adapter {adapter} differs from {}",
+                binding.adapter
+            ),
+        ));
+    }
+    let Some(daemon_installation_id) = observation.daemon_installation_id else {
+        return Err(McpReadinessError::refused(
+            McpReadinessCode::ProbeAbsent,
+            "transport probe did not identify the daemon installation",
+        ));
+    };
+    let Some(instance_id) = observation.instance_id else {
+        return Err(McpReadinessError::refused(
+            McpReadinessCode::ProbeAbsent,
+            "transport probe did not identify the Runtime instance",
+        ));
+    };
+    let Some(controller_generation) = observation.controller_generation else {
+        return Err(McpReadinessError::refused(
+            McpReadinessCode::ProbeAbsent,
+            "transport probe did not identify the controller generation",
+        ));
+    };
+    let Some(worker_epoch) = observation.worker_epoch else {
+        return Err(McpReadinessError::refused(
+            McpReadinessCode::ProbeAbsent,
+            "transport probe did not identify the WorkerEpoch",
+        ));
+    };
+    let Some(extension_alias) = observation.extension_alias else {
+        return Err(McpReadinessError::refused(
+            McpReadinessCode::ProbeAbsent,
+            "transport probe did not identify the extension alias",
+        ));
+    };
+    let Some(extension_generation) = observation.extension_generation else {
+        return Err(McpReadinessError::refused(
+            McpReadinessCode::ProbeAbsent,
+            "transport probe did not identify the ExtensionGeneration",
+        ));
+    };
+    let Some(runtime_binding_digest) = observation.runtime_binding_digest else {
+        return Err(McpReadinessError::refused(
+            McpReadinessCode::ProbeAbsent,
+            "transport probe did not identify the runtime binding",
+        ));
+    };
+    if daemon_installation_id != runtime_binding.daemon_installation_id()
+        || instance_id != runtime_binding.instance_id()
+        || controller_generation != runtime_binding.controller_generation()
+        || worker_epoch != *runtime_binding.worker_epoch()
+        || extension_alias != *runtime_binding.extension_alias()
+        || extension_generation != process_generation.extension_generation()
+        || runtime_binding_digest != *runtime_binding.binding_digest()
+    {
+        return Err(McpReadinessError::refused(
+            McpReadinessCode::HandshakeIdentityMismatch,
+            "observed transport session is not bound to the current RuntimeBinding and ProcessGeneration",
+        ));
+    }
     let Some(server_id) = observation.server_id else {
         return Err(McpReadinessError::refused(
             McpReadinessCode::ProbeAbsent,
@@ -1045,7 +1223,7 @@ mod tests {
         LinuxServiceCandidate, ModuleActivationPremises, ResolvedConfiguration,
         RuntimeAuthorityIdentity, create_host_authority_schema, install_host_authority_revision,
     };
-    use crate::linux_host_verification::test_proof_for_authority;
+    use crate::linux_host_verification::{LinuxHostVerificationCode, test_proof_for_authority};
     use dolly_canonical_json::canonicalize;
     use serde_json::{Value, json};
     use tempfile::{TempDir, tempdir};
@@ -1060,6 +1238,60 @@ mod tests {
             _binding: &McpTransportBinding,
         ) -> Result<McpHandshakeObservation, McpTransportProbeError> {
             self.observation.clone()
+        }
+    }
+    fn prove_current_mcp_transport_readiness<P>(
+        connection: &Connection,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        server_id: &str,
+        probe: &mut P,
+    ) -> Result<McpTransportReadiness, McpReadinessError>
+    where
+        P: McpTransportProbe,
+    {
+        let verify_live_host = |connection: &Connection| -> Result<
+            VerifiedLinuxHostProof,
+            LinuxHostVerificationError,
+        > {
+            let snapshot = load_current_authority(connection)
+                .map_err(|error| LinuxHostVerificationError {
+                    code: LinuxHostVerificationCode::PremiseStale,
+                    detail: error.to_string(),
+                })?
+                .ok_or_else(|| LinuxHostVerificationError {
+                    code: LinuxHostVerificationCode::PremiseMissing,
+                    detail: "test Host premise is absent".into(),
+                })?;
+            Ok(test_proof_for_authority(&snapshot))
+        };
+        super::prove_current_mcp_transport_readiness_with_verifier(
+            connection,
+            runtime_binding,
+            process_generation,
+            server_id,
+            probe,
+            verify_live_host,
+        )
+    }
+
+    struct MutatingProbe<'a> {
+        connection: &'a Connection,
+        observation: McpHandshakeObservation,
+    }
+
+    impl McpTransportProbe for MutatingProbe<'_> {
+        fn observe(
+            &mut self,
+            _binding: &McpTransportBinding,
+        ) -> Result<McpHandshakeObservation, McpTransportProbeError> {
+            self.connection
+                .execute(
+                    "UPDATE runtime_authority_state SET record_jcs = X'00' WHERE singleton = 1",
+                    [],
+                )
+                .map_err(|error| McpTransportProbeError::Failed(error.to_string()))?;
+            Ok(self.observation.clone())
         }
     }
 
@@ -1174,9 +1406,21 @@ mod tests {
         (directory, db, snapshot)
     }
 
-    fn successful_observation(binding: &McpTransportBinding) -> McpHandshakeObservation {
+    fn successful_observation(
+        binding: &McpTransportBinding,
+        runtime: &RuntimeBinding,
+        process: &ProcessGeneration,
+    ) -> McpHandshakeObservation {
         McpHandshakeObservation {
             server_id: Some(binding.server_id().to_string()),
+            adapter: Some(binding.adapter().to_string()),
+            daemon_installation_id: Some(runtime.daemon_installation_id().to_string()),
+            instance_id: Some(runtime.instance_id().to_string()),
+            controller_generation: Some(runtime.controller_generation()),
+            worker_epoch: Some(runtime.worker_epoch().clone()),
+            extension_alias: Some(runtime.extension_alias().clone()),
+            extension_generation: Some(process.extension_generation()),
+            runtime_binding_digest: Some(runtime.binding_digest().clone()),
             transport_kind: Some(binding.transport_kind().to_string()),
             endpoint: Some(binding.endpoint().to_string()),
             transport_digest: Some(binding.transport_digest().clone()),
@@ -1199,7 +1443,7 @@ mod tests {
         let process = runtime.mint_process_generation(&mut db).unwrap();
         let binding = load_mcp_transport_binding(&snapshot, "server-one").unwrap();
         let mut probe = FixedProbe {
-            observation: Ok(successful_observation(&binding)),
+            observation: Ok(successful_observation(&binding, &runtime, &process)),
         };
         let readiness = prove_current_mcp_transport_readiness(
             db.connection(),
@@ -1254,7 +1498,7 @@ mod tests {
         .unwrap();
         let process = runtime.mint_process_generation(&mut db).unwrap();
         let binding = load_mcp_transport_binding(&snapshot, "server-one").unwrap();
-        let mut bad = successful_observation(&binding);
+        let mut bad = successful_observation(&binding, &runtime, &process);
         bad.endpoint = Some("https://other.example.test/mcp".into());
         let mut probe = FixedProbe {
             observation: Ok(bad),
@@ -1268,7 +1512,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, McpReadinessCode::HandshakeEndpointMismatch);
-        let mut identity = successful_observation(&binding);
+        let mut identity = successful_observation(&binding, &runtime, &process);
         identity.server_id = Some("other-server".into());
         let mut probe = FixedProbe {
             observation: Ok(identity),
@@ -1282,8 +1526,38 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, McpReadinessCode::HandshakeIdentityMismatch);
+        let mut adapter = successful_observation(&binding, &runtime, &process);
+        adapter.adapter = Some("other-adapter".into());
+        let mut probe = FixedProbe {
+            observation: Ok(adapter),
+        };
+        let error = prove_current_mcp_transport_readiness(
+            db.connection(),
+            &runtime,
+            &process,
+            "server-one",
+            &mut probe,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, McpReadinessCode::HandshakeIdentityMismatch);
 
-        let mut version = successful_observation(&binding);
+        let mut controller = successful_observation(&binding, &runtime, &process);
+        controller.controller_generation =
+            Some(ExtensionGeneration::new(runtime.controller_generation().value() + 1).unwrap());
+        let mut probe = FixedProbe {
+            observation: Ok(controller),
+        };
+        let error = prove_current_mcp_transport_readiness(
+            db.connection(),
+            &runtime,
+            &process,
+            "server-one",
+            &mut probe,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, McpReadinessCode::HandshakeIdentityMismatch);
+
+        let mut version = successful_observation(&binding, &runtime, &process);
         version.initialize_response_protocol_version = Some("2026-07-28".into());
         let mut probe = FixedProbe {
             observation: Ok(version),
@@ -1298,7 +1572,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, McpReadinessCode::HandshakeProtocolMismatch);
 
-        let mut absent = successful_observation(&binding);
+        let mut absent = successful_observation(&binding, &runtime, &process);
         absent.transport_digest = None;
         let mut probe = FixedProbe {
             observation: Ok(absent),
@@ -1328,7 +1602,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, McpReadinessCode::ProbeAmbiguous);
 
-        let mut no_session = successful_observation(&binding);
+        let mut no_session = successful_observation(&binding, &runtime, &process);
         no_session.session_ids.clear();
         let mut probe = FixedProbe {
             observation: Ok(no_session),
@@ -1343,7 +1617,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, McpReadinessCode::HandshakeSessionAbsent);
 
-        let mut ambiguous = successful_observation(&binding);
+        let mut ambiguous = successful_observation(&binding, &runtime, &process);
         ambiguous.session_ids.push("session-two".into());
         let mut probe = FixedProbe {
             observation: Ok(ambiguous),
@@ -1363,7 +1637,7 @@ mod tests {
             ["org.dolly.test"],
         ).unwrap();
         let mut probe = FixedProbe {
-            observation: Ok(successful_observation(&binding)),
+            observation: Ok(successful_observation(&binding, &runtime, &process)),
         };
         let error = prove_current_mcp_transport_readiness(
             db.connection(),
@@ -1374,5 +1648,57 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, McpReadinessCode::RuntimeBindingStale);
+    }
+    #[test]
+    fn live_host_proof_mutation_after_handshake_refuses_before_publication() {
+        let (_directory, mut db, snapshot) = durable_database();
+        let mut runtime = mint_runtime_binding(
+            &mut db,
+            "org.dolly.test".parse().unwrap(),
+            test_proof_for_authority(&snapshot),
+        )
+        .unwrap();
+        let process = runtime.mint_process_generation(&mut db).unwrap();
+        let binding = load_mcp_transport_binding(&snapshot, "server-one").unwrap();
+        let mut foreign_snapshot = snapshot.clone();
+        foreign_snapshot.mapping.instance_id = "other-instance".into();
+        let mut probe = FixedProbe {
+            observation: Ok(successful_observation(&binding, &runtime, &process)),
+        };
+        let error = super::prove_current_mcp_transport_readiness_with_verifier(
+            db.connection(),
+            &runtime,
+            &process,
+            "server-one",
+            &mut probe,
+            |_connection| Ok(test_proof_for_authority(&foreign_snapshot)),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, McpReadinessCode::HostPremiseStale);
+    }
+    #[test]
+    fn host_premise_mutation_during_handshake_refuses_without_readiness() {
+        let (_directory, mut db, snapshot) = durable_database();
+        let mut runtime = mint_runtime_binding(
+            &mut db,
+            "org.dolly.test".parse().unwrap(),
+            test_proof_for_authority(&snapshot),
+        )
+        .unwrap();
+        let process = runtime.mint_process_generation(&mut db).unwrap();
+        let binding = load_mcp_transport_binding(&snapshot, "server-one").unwrap();
+        let mut probe = MutatingProbe {
+            connection: db.connection(),
+            observation: successful_observation(&binding, &runtime, &process),
+        };
+        let error = prove_current_mcp_transport_readiness(
+            db.connection(),
+            &runtime,
+            &process,
+            "server-one",
+            &mut probe,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, McpReadinessCode::HostPremiseStale);
     }
 }
