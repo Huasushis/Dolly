@@ -7,8 +7,10 @@ license.workspace = true
 
 [dependencies]
 dolly-canonical-json = { path = "../dolly-canonical-json" }
+dolly-schema = { path = "../dolly-schema" }
 dolly-tool-broker = { path = "../dolly-tool-broker" }
 dolly-storage = { path = "../dolly-storage" }
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }

@@ -101,6 +101,20 @@ pub struct SchemaValidator {
 }
 
 impl SchemaValidator {
+    /// Compile a draft-2020-12 validator directly from a self-contained
+    /// embedded schema document (the frozen tool `output_schema`: internal
+    /// `#`/`#/` refs only, no `$ref` outside the document). No catalog
+    /// lookup and no network resolution.
+    pub fn from_embedded_schema(schema: &CanonicalJsonValue) -> Result<Self, SchemaError> {
+        let schema_value: Value = serde_json::to_value(schema).map_err(|e| {
+            SchemaError::Reference(format!("failed to serialize embedded schema: {e}"))
+        })?;
+        let validator = draft202012::options().build(&schema_value).map_err(|e| {
+            SchemaError::Validation(format!("embedded schema does not compile: {e}"))
+        })?;
+        Ok(Self { validator })
+    }
+
     /// Validate an already-parsed `CanonicalJsonValue` against this schema.
     pub fn validate(&self, instance: &CanonicalJsonValue) -> Result<(), ValidationErrors> {
         // Convert CanonicalJsonValue to serde_json::Value for the validator
