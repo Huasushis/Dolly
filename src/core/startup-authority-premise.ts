@@ -41,6 +41,12 @@ export interface StartupAuthorityPremiseResolverOptions {
   readonly origins: InstalledComponentOriginRegistry;
   readonly installedComponentOrigins: readonly VerifiedInstalledComponentOrigin[];
 }
+export interface StartupAuthorityPermissionContext {
+  readonly database: RuntimeAuthorityDatabase;
+  readonly controller: InstanceControllerLock;
+  readonly origins: InstalledComponentOriginRegistry;
+}
+
 
 export interface StartupAuthorityPolicyBinding
   extends Omit<PermissionPolicyBackendBinding, "origin"> {
@@ -445,4 +451,33 @@ export function assertStartupAuthorityPermission(
     throw invalid("startup authority permission was not minted by the Host resolver");
   }
   assertPermissionCurrent(state, value as StartupAuthorityPermission);
+}
+
+/**
+ * Requires the caller to hold the exact database, controller, and origin
+ * registry that minted this permission before it may read the current config.
+ * A structurally equivalent context from another Host is not authority.
+ */
+export function assertStartupAuthorityPermissionContext(
+  value: unknown,
+  context: StartupAuthorityPermissionContext,
+): asserts value is StartupAuthorityPermission {
+  if (
+    !(context.database instanceof RuntimeAuthorityDatabase) ||
+    !(context.controller instanceof InstanceControllerLock) ||
+    !(context.origins instanceof InstalledComponentOriginRegistry)
+  ) {
+    throw invalid("startup authority permission context is not a live Host context");
+  }
+  assertStartupAuthorityPermission(value);
+  const state = PERMISSION_STATES.get(value as object)!;
+  if (
+    state.database !== context.database ||
+    state.controller !== context.controller ||
+    state.origins !== context.origins
+  ) {
+    throw invalid(
+      "startup authority permission context belongs to a different Runtime authority",
+    );
+  }
 }
