@@ -134,9 +134,9 @@ impl SchemaValidator {
         let schema_value: Value = serde_json::to_value(document).map_err(|e| {
             SchemaError::Validation(format!("failed to serialize embedded schema: {e}"))
         })?;
-        let validator = draft202012::options()
-            .build(&schema_value)
-            .map_err(|e| SchemaError::Validation(format!("embedded schema does not compile: {e}")))?;
+        let validator = draft202012::options().build(&schema_value).map_err(|e| {
+            SchemaError::Validation(format!("embedded schema does not compile: {e}"))
+        })?;
         Ok(SchemaValidator { validator })
     }
 
