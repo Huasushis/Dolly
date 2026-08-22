@@ -248,6 +248,52 @@ impl VerifiedLinuxHostProof {
         self.observed_at_unix_millis
     }
 }
+#[cfg(test)]
+pub(crate) fn test_proof_for_authority(
+    snapshot: &CurrentAuthoritySnapshot,
+) -> VerifiedLinuxHostProof {
+    let premise = snapshot
+        .premise
+        .as_ref()
+        .expect("test proof requires a complete premise");
+    let candidate = &premise.service_candidate;
+    VerifiedLinuxHostProof {
+        schema: LINUX_HOST_VERIFICATION_PROOF_SCHEMA,
+        daemon_installation_id: snapshot.mapping.daemon_installation_id.clone(),
+        instance_id: snapshot.mapping.instance_id.clone(),
+        config_revision: snapshot.mapping.config_revision,
+        config_digest: snapshot.mapping.config_digest.clone(),
+        premises_digest: premise.premises_digest.clone(),
+        service_candidate_digest: candidate.candidate_digest.clone(),
+        service_candidate_origin: candidate.origin.clone(),
+        service: VerifiedLinuxServiceIdentity {
+            unit_name: candidate.unit_name.clone(),
+            mode: candidate.mode.clone(),
+            invocation_id: "2812432ad29e4d3bbd6776c62cafa929".into(),
+            boot_id: "0a1b2c3d-4e5f-4071-8293-a4b5c6d7e8f9".into(),
+            main_pid: 4242,
+            control_group: format!("/user.slice/{}", candidate.unit_name),
+            host_cgroup_path: format!(
+                "/user.slice/{}/{}",
+                candidate.unit_name, REQUIRED_DELEGATE_SUBGROUP
+            ),
+        },
+        delegated_root: VerifiedDelegatedCgroupRoot {
+            cgroup_path: format!("/user.slice/{}", candidate.unit_name),
+            filesystem_path: format!("/sys/fs/cgroup/user.slice/{}", candidate.unit_name),
+            controllers: REQUIRED_CGROUP_CONTROLLERS
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            subtree_control: REQUIRED_CGROUP_CONTROLLERS
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        },
+        observation_generation: 1,
+        observed_at_unix_millis: 1_755_876_800_000,
+    }
+}
 
 /// Verify one deterministic observation against the exact current authority.
 ///
