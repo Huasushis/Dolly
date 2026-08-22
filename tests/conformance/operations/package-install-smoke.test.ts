@@ -311,4 +311,169 @@ describe("PKG-001 distributable package", () => {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it("installs the packed tarball in a clean Node 20.20.2 consumer and attests the native SQLite binding through create, commit, close, reopen", async () => {
+    const repositoryRoot = resolve(import.meta.dirname, "../../..");
+    const temporaryRoot = mkdtempSync(join(tmpdir(), "dolly-package-sqlite-consumer-"));
+
+    try {
+      const packDirectory = join(temporaryRoot, "pack");
+      const cacheDirectory = join(temporaryRoot, "npm-cache");
+      mkdirSync(packDirectory, { recursive: true });
+      mkdirSync(cacheDirectory, { recursive: true });
+
+      const npmCli = process.env.npm_execpath;
+      if (!npmCli) {
+        throw new Error("Package smoke test must run through an npm script");
+      }
+      const packArguments = [
+        npmCli,
+        "pack",
+        "--json",
+        "--pack-destination",
+        packDirectory,
+      ];
+      if (!basename(npmCli).toLowerCase().startsWith("pnpm")) {
+        packArguments.push("--cache", cacheDirectory);
+      }
+      const packed = spawnSync(
+        process.execPath,
+        packArguments,
+        {
+          cwd: repositoryRoot,
+          encoding: "utf8",
+          env: { ...process.env, NO_COLOR: "1" },
+        },
+      );
+      expect(packed.error).toBeUndefined();
+      expect(packed.status, packed.stderr).toBe(0);
+
+      const manifest = parsePackOutput(packed.stdout);
+      const tarballBytes = readFileSync(join(packDirectory, manifest.filename));
+      const tarFiles = readTarGzFiles(tarballBytes);
+
+      // The distributable must NOT bundle a node_modules tree or a native
+      // binding; the consumer resolves the pinned better-sqlite3 prebuild
+      // itself. Only the compiled loader/attestation bridge travels in the
+      // package.
+      const nonPortable = [...tarFiles.keys()].filter(
+        (entry) =>
+          entry.includes("node_modules") ||
+          /\.(?:node|so|dylib|dll)(?:\.map)?$/u.test(entry),
+      );
+      expect(nonPortable).toEqual([]);
+      for (const required of [
+        "package/dist/src/adapters/storage/native-sqlite.js",
+        "package/dist/src/adapters/storage/native-sqlite.d.ts",
+        "package/dist/src/adapters/storage/native-sqlite-binding.js",
+      ]) {
+        expect(tarFiles.has(required), `missing ${required}`).toBe(true);
+      }
+
+      // Clean consumer: only the tarball and a minimal manifest, resolved by
+      // this machine's Node 20.20.2 with the real registry. This is the only
+      // network use the slice permits: the exact locked packages and the
+      // better-sqlite3 prebuild they pin.
+      const consumerRoot = join(temporaryRoot, "consumer");
+      mkdirSync(consumerRoot, { recursive: true });
+      writeFileSync(
+        join(consumerRoot, "package.json"),
+        JSON.stringify({ name: "dolly-smoke-consumer", private: true, version: "0.0.0" }, undefined, 2),
+      );
+      const npm = join(dirname(process.execPath), "npm");
+      const installResult = spawnSync(
+        npm,
+        [
+          "install",
+          "--no-audit",
+          "--no-fund",
+          "--no-progress",
+          "--cache",
+          cacheDirectory,
+          join(packDirectory, manifest.filename),
+        ],
+        {
+          cwd: consumerRoot,
+          encoding: "utf8",
+          env: { ...process.env, NO_COLOR: "1" },
+          timeout: 300_000,
+        },
+      );
+      expect(installResult.status, installResult.stderr).toBe(0);
+
+      // The consumer really imports the CJS binding, runs the shipped loader
+      // against a file database, commits, closes, reopens and re-attests.
+      const consumerScript = `
+import Database from "better-sqlite3";
+import { pathToFileURL } from "node:url";
+
+const [adapterFile, dbFile] = process.argv.slice(2);
+const adapter = await import(pathToFileURL(adapterFile).href);
+
+const rawProbe = new Database(":memory:");
+const rawSqliteVersion = rawProbe.prepare("SELECT sqlite_version() AS v").get().v;
+rawProbe.close();
+
+const firstAttestation = adapter.attestNativeSqliteBuild();
+const handle = adapter.openAttestedNativeSqlite(dbFile);
+handle.database.exec("CREATE TABLE IF NOT EXISTS attestation(value TEXT NOT NULL)");
+handle.database.exec("BEGIN IMMEDIATE");
+handle.database.prepare("INSERT INTO attestation(value) VALUES (?)").run("committed");
+handle.database.exec("COMMIT");
+handle.database.exec("CREATE TABLE IF NOT EXISTS attestation_2(value TEXT NOT NULL)");
+handle.database.prepare("INSERT INTO attestation_2(value) VALUES (?)").run("still-there");
+handle.database.exec("DELETE FROM attestation_2");
+handle.close();
+
+const reopened = adapter.openAttestedNativeSqlite(dbFile);
+const row = reopened.database.prepare("SELECT value FROM attestation LIMIT 1").get();
+const journalMode = reopened.database.pragma("journal_mode", { simple: true });
+const foreignKeys = reopened.database.pragma("foreign_keys", { simple: true });
+const busyTimeout = reopened.database.pragma("busy_timeout", { simple: true });
+const secondAttestation = adapter.attestNativeSqliteBuild();
+reopened.close();
+
+process.stdout.write(JSON.stringify({
+  rawSqliteVersion,
+  attestedVersion: firstAttestation.version,
+  attestedVersionAgain: secondAttestation.version,
+  persisted: row?.value ?? null,
+  journalMode,
+  foreignKeys,
+  busyTimeout,
+}));
+`;
+      const scriptPath = join(consumerRoot, "consumer-attestation.mjs");
+      writeFileSync(scriptPath, consumerScript);
+      const dbPath = join(consumerRoot, "attested.db");
+      const adapterRel = join("node_modules", "dolly", "dist/src/adapters/storage/native-sqlite.js");
+      const adapterFile = join(consumerRoot, adapterRel);
+      expect(readFileSync(adapterFile, "utf8")).toContain("better-sqlite3");
+
+      const consumerResult = spawnSync(
+        process.execPath,
+        [scriptPath, adapterFile, dbPath],
+        { cwd: consumerRoot, encoding: "utf8" },
+      );
+      expect(consumerResult.status, consumerResult.stderr).toBe(0);
+      const observed = JSON.parse(consumerResult.stdout.trim()) as {
+        rawSqliteVersion: string;
+        attestedVersion: string;
+        attestedVersionAgain: string;
+        persisted: string | null;
+        journalMode: string;
+        foreignKeys: number;
+        busyTimeout: number;
+      };
+      expect(observed.rawSqliteVersion).toBe("3.53.0");
+      expect(observed.attestedVersion).toBe("3.53.0");
+      expect(observed.attestedVersionAgain).toBe("3.53.0");
+      expect(observed.persisted).toBe("committed");
+      expect(observed.journalMode).toBe("wal");
+      expect(observed.foreignKeys).toBe(1);
+      expect(observed.busyTimeout).toBe(5000);
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  }, 360_000);
 });
