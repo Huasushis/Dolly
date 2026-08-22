@@ -36,6 +36,11 @@ fn record() -> ToolRegistryRecord {
         mcp_readiness_digest: digest(7),
         server_id: "tools".into(),
         server_digest: digest(8),
+        server_adapter: "mcp".into(),
+        server_protocol_version: "2025-06-18".into(),
+        server_transport_kind: "stdio".into(),
+        server_endpoint_digest: digest(9),
+        server_transport_digest: digest(10),
         tool_server_generation: 1,
     }
 }
@@ -62,9 +67,19 @@ fn malformed_binding_and_stale_readiness_are_refused() {
                 &digest(3),
                 &digest(6),
                 &digest(7),
+                &digest(4),
+                &record.service_candidate_origin,
+                &record.extension_alias,
                 1,
                 1,
                 "0198ab31-6c44-7e8a-b2bb-000000000001",
+                "tools",
+                &digest(8),
+                "mcp",
+                "2025-06-18",
+                "stdio",
+                &digest(9),
+                &digest(10),
             )
             .unwrap_err()
             .code,
@@ -78,13 +93,85 @@ fn malformed_binding_and_stale_readiness_are_refused() {
                 &digest(3),
                 &digest(6),
                 &digest(99),
+                &digest(4),
+                &record.service_candidate_origin,
+                &record.extension_alias,
                 1,
                 1,
                 "0198ab31-6c44-7e8a-b2bb-000000000001",
+                "tools",
+                &digest(8),
+                "mcp",
+                "2025-06-18",
+                "stdio",
+                &digest(9),
+                &digest(10),
             )
             .unwrap_err()
             .code,
         ToolBrokerAuthorityCode::ReadinessStale
+    );
+}
+
+#[test]
+fn full_identity_gate_covers_server_and_origin() {
+    let mut record = record();
+    record.service_candidate_digest = digest(44);
+    let mut origin = record.service_candidate_origin.clone();
+    origin.component_revision += 1;
+    record.service_candidate_origin = origin.clone();
+    assert_eq!(
+        record
+            .validate_identity(
+                7,
+                &digest(1),
+                &digest(3),
+                &digest(6),
+                &digest(7),
+                &digest(44),
+                &origin,
+                &record.extension_alias,
+                1,
+                1,
+                "0198ab31-6c44-7e8a-b2bb-000000000001",
+                "tools",
+                &digest(8),
+                "mcp",
+                "2025-06-18",
+                "stdio",
+                &digest(9),
+                &digest(10),
+            )
+            .unwrap(),
+        ()
+    );
+    let mut changed = record.clone();
+    changed.server_digest = digest(45);
+    assert_eq!(
+        changed
+            .validate_identity(
+                7,
+                &digest(1),
+                &digest(3),
+                &digest(6),
+                &digest(7),
+                &digest(44),
+                &origin,
+                &record.extension_alias,
+                1,
+                1,
+                "0198ab31-6c44-7e8a-b2bb-000000000001",
+                "tools",
+                &digest(8),
+                "mcp",
+                "2025-06-18",
+                "stdio",
+                &digest(9),
+                &digest(10),
+            )
+            .unwrap_err()
+            .code,
+        ToolBrokerAuthorityCode::RegistryBindingMismatch
     );
 }
 

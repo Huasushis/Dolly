@@ -433,6 +433,33 @@ where
     )
 }
 
+#[cfg(test)]
+pub(crate) fn test_prove_current_mcp_transport_readiness<P>(
+    connection: &Connection,
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    server_id: &str,
+    probe: &mut P,
+) -> Result<McpTransportReadiness, McpReadinessError>
+where
+    P: McpTransportProbe,
+{
+    prove_current_mcp_transport_readiness_with_verifier(
+        connection,
+        runtime_binding,
+        process_generation,
+        server_id,
+        probe,
+        |connection| {
+            let snapshot = load_current_authority(connection)
+                .expect("test authority schema")
+                .expect("test current authority");
+            Ok(crate::linux_host_verification::test_proof_for_authority(
+                &snapshot,
+            ))
+        },
+    )
+}
 /// Full producer seam. It consumes the private live Linux Host proof, mints a
 /// fresh runtime binding and process generation, and only then admits the real
 /// MCP transport handshake as private readiness evidence.

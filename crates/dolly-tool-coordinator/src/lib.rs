@@ -22,15 +22,21 @@
 //! - [`ports::FencedFactsProvider`] — composite Host-owned facts provider;
 //! - [`SendPermit`] — the opaque one-use permit a transport consumes once.
 
+extern crate self as dolly_tool_coordinator;
 pub mod dispatch;
 pub mod permit;
 pub mod ports;
 pub mod recovery;
 pub mod service;
 
-pub use dispatch::{
-    DispatchError, DispatchOutcome, dispatch_operation, dispatch_operation_authorized,
-};
+pub(crate) use dispatch::dispatch_operation;
+
+#[cfg(test)]
+mod coordinator_tests;
+#[cfg(test)]
+mod service_tests;
+
+pub use dispatch::{DispatchError, DispatchOutcome, dispatch_operation_authorized};
 pub use permit::{SendPermit, SendPermitBinding};
 pub use ports::{Clock, FencedFactsProvider, GenerationReadiness, RecoveryFactsProvider};
 pub use recovery::{RecoveryOutcome, reopen_recovery};

@@ -13,8 +13,11 @@
 //! are the verified `RecoveryFacts` and the storage database.
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
+use dolly_storage::mcp_readiness::McpTransportReadiness;
+use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::{
-    ToolBrokerAuthorityError, ToolDispatchAuthority, validate_dispatch_binding,
+    ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
+    validate_dispatch_binding,
 };
 use dolly_storage::tool_ledger::{CasKey, TransportCorrelation, cas_terminal, cas_to_dispatched};
 use dolly_storage::{Database, StorageError};
@@ -78,7 +81,7 @@ pub enum DispatchOutcome {
 /// facts, then applied by compare-and-set against the exact
 /// `(module_id, operation_id, ledger_revision, state)` of the row. No
 /// downstream ACK/result/error/absence is consulted.
-pub fn dispatch_operation(
+pub(crate) fn dispatch_operation(
     db: &mut Database,
     row: &ToolCallLedgerRecord,
     facts: &RecoveryFacts,
@@ -125,9 +128,19 @@ pub fn dispatch_operation(
 pub fn dispatch_operation_authorized(
     db: &mut Database,
     authority: &ToolDispatchAuthority,
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    readiness: &McpTransportReadiness,
     row: &ToolCallLedgerRecord,
     facts: &RecoveryFacts,
 ) -> Result<DispatchOutcome, DispatchError> {
+    revalidate_tool_dispatch_authority(
+        db,
+        authority,
+        runtime_binding,
+        process_generation,
+        readiness,
+    )?;
     validate_dispatch_binding(
         authority,
         row.operation_binding.config_revision as i64,

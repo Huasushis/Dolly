@@ -749,3 +749,8 @@ fn fenced_facts_provider_composes_ports() {
     assert!(facts.exact_generation_ready);
     assert!(!facts.deadline_expired, "deadline far in the future");
 }
+
+#[test]
+fn authority_dispatch_requires_current_revalidation_api() {
+    let _ = dolly_storage::tool_broker_authority::revalidate_tool_dispatch_authority;
+}
