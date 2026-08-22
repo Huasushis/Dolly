@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 dolly-canonical-json = { path = "../dolly-canonical-json" }
+dolly-core-domain = { path = "../dolly-core-domain" }
+getrandom = "0.3"
 dolly-core-reducer = { path = "../dolly-core-reducer" }
 dolly-tool-broker = { path = "../dolly-tool-broker" }
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
