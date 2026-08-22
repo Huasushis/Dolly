@@ -48,6 +48,13 @@ export interface StartupAuthorityPolicyBinding
   readonly origin: VerifiedInstalledComponentOrigin;
 }
 
+export type StartupAuthorityServiceCandidate = Omit<
+  LinuxServiceCandidate,
+  "origin"
+> & {
+  readonly origin: VerifiedInstalledComponentOrigin;
+};
+
 /**
  * A fresh Host-owned permission for the exact current persistent premise and
  * controller generation. This is a pre-composition authority token, not a
@@ -60,7 +67,7 @@ export interface StartupAuthorityPermission {
   readonly configDigest: string;
   readonly premisesDigest: string;
   readonly policyBindings: readonly StartupAuthorityPolicyBinding[];
-  readonly serviceCandidate: LinuxServiceCandidate;
+  readonly serviceCandidate: StartupAuthorityServiceCandidate;
 }
 
 interface PermissionState {
@@ -345,7 +352,7 @@ function buildPermission(
   const serviceCandidate = deepFreeze({
     ...premise.service_candidate,
     origin: serviceOrigin,
-  }) as LinuxServiceCandidate;
+  }) as StartupAuthorityServiceCandidate;
   return Object.freeze({
     permitted: true as const,
     controllerGenerationId: controller.info.controllerGenerationId,
