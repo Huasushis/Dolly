@@ -267,6 +267,46 @@ describe("Tool Broker config admission cutover (frozen v1 package-bound stdio)",
     }).toThrow(/TOOL_BROKER_CONFIG_INVALID/u);
   });
 
+  it("refuses extra keys on both frozen idempotency variants (spy0)", () => {
+    // {kind:"none"} permits exactly kind — an extra argument_pointer or any
+    // other unknown key on the none variant must refuse admission.
+    const spawn = vi.fn();
+
+    expect(() => {
+      const input = doc();
+      const tools = (input.servers["fake-mcp"] as Record<string, unknown>).tools as Record<string, unknown>;
+      const entry = tools["repo-search-issues"] as Record<string, unknown>;
+      entry.idempotency = { kind: "none", argument_pointer: "/q" };
+      parseToolBrokerConfig(input, { configRevision: "rev-1" });
+    }).toThrow(/TOOL_BROKER_CONFIG_INVALID/u);
+
+    // {kind:"argument_key", argument_pointer} permits exactly those two keys —
+    // an extra unknown key must refuse admission.
+    expect(() => {
+      const input = doc();
+      const tools = (input.servers["fake-mcp"] as Record<string, unknown>).tools as Record<string, unknown>;
+      const entry = tools["repo-search-issues"] as Record<string, unknown>;
+      entry.side_effect_class = "idempotent_write";
+      entry.idempotency = { kind: "argument_key", argument_pointer: "/q", extra_key: "x" };
+      parseToolBrokerConfig(input, { configRevision: "rev-1" });
+    }).toThrow(/TOOL_BROKER_CONFIG_INVALID/u);
+
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("admits exactly the two frozen idempotency variants", () => {
+    const none = parseServer(doc());
+    expect(none.tools["repo-search-issues"].idempotency).toEqual({ kind: "none" });
+
+    const write = doc();
+    const tools = (write.servers["fake-mcp"] as Record<string, unknown>).tools as Record<string, unknown>;
+    const entry = tools["repo-search-issues"] as Record<string, unknown>;
+    entry.side_effect_class = "idempotent_write";
+    entry.idempotency = { kind: "argument_key", argument_pointer: "/q" };
+    const argumentKeyed = parseServer(write);
+    expect(argumentKeyed.tools["repo-search-issues"].idempotency).toEqual({ kind: "argument_key", argument_pointer: "/q" });
+  });
+
   it("rejects a copied/unparsed config at the factory before spawn", () => {
     const spawn = vi.fn<(command: string, args: readonly string[], options: Record<string, unknown>) => ChildProcess>(
       () => ({} as ChildProcess),
