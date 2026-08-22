@@ -551,6 +551,17 @@ export async function proveLinuxModuleActivation(
     return refusal("MODULE_ACTIVATION_CGROUP_UNAVAILABLE", delegatedRootFailure);
   }
 
+  assertStartupAuthorityPermission(permission);
+  try {
+    assertReviewedLinuxModuleRuntimeIdentity(runtimeInspection.runtime);
+  } catch (error) {
+    return refusal(
+      "MODULE_ACTIVATION_LAUNCHER_UNAVAILABLE",
+      `the reviewed runtime proof became stale before handoff mint: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
   const runtime = mintLinuxModuleRuntimeBinding(runtimeInspection.runtime);
   const activationPermission: LinuxModuleActivationPermission = Object.freeze({
     permitted: true,
@@ -638,6 +649,7 @@ export function consumeLinuxModuleActivationHandoff(
   }
   assertLinuxModuleActivationPermission(state.activationPermission);
   assertLinuxModuleRuntimeBinding(state.runtimeBinding);
+  assertReviewedLinuxModuleRuntimeIdentity(state.runtimeBinding.auditProfile);
   state.consumed = true;
   return state.activationPermission;
 }
