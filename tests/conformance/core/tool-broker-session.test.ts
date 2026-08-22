@@ -14,7 +14,11 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  parseToolBrokerConfig,
   startToolBrokerServer,
+  TOOL_BROKER_CONFIG_SCHEMA,
+  type HostResolvedExecutablePremise,
+  type ToolBrokerConfigDocumentInput,
   type ToolBrokerServer,
   type ToolBrokerServerConfig,
   type ToolBrokerErrorCode,
@@ -26,6 +30,11 @@ const FAKE_SERVER = fileURLToPath(
   new URL("./fixtures/tool-broker-fake-mcp-server.ts", import.meta.url),
 );
 const MCP_PROTOCOL_VERSION = "2025-06-18";
+const FAKE_PACKAGE_ID = "org.dolly.tests.fake-mcp";
+const FAKE_PACKAGE_VERSION = "1.0.0";
+const FAKE_PACKAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+const FAKE_EXECUTABLE = "bin/fake-mcp-server";
+const FAKE_EXECUTABLE_DIGEST = `sha256:${"b".repeat(64)}`;
 
 function spawnFake(mode: string): ChildProcess {
   return spawn(process.execPath, ["--import", "tsx/esm", FAKE_SERVER, mode], {
@@ -81,29 +90,62 @@ function captureReceivedFrames(child: ChildProcess): CapturedFrames {
   return { lines, messages, done };
 }
 
-function pingConfig(overrides: Partial<ToolBrokerServerConfig> = {}): ToolBrokerServerConfig {
+/** Builds the frozen v1 document for the ping-substrate fake server. */
+function pingDocument(overrides: Partial<Record<string, unknown>> = {}): ToolBrokerConfigDocumentInput {
   return {
-    serverId: "fake-mcp",
-    adapter: "mcp",
-    protocolVersion: MCP_PROTOCOL_VERSION,
-    transport: {
-      kind: "stdio",
-      command: process.execPath,
-      args: ["--import", "tsx/esm", FAKE_SERVER, "ping-ok"],
-      env: {},
+    schema: TOOL_BROKER_CONFIG_SCHEMA,
+    servers: {
+      "fake-mcp": {
+        enabled: true,
+        adapter: "mcp",
+        protocol_version: MCP_PROTOCOL_VERSION,
+        transport: {
+          kind: "stdio",
+          package_id: FAKE_PACKAGE_ID,
+          package_version: FAKE_PACKAGE_VERSION,
+          package_digest: FAKE_PACKAGE_DIGEST,
+          executable: FAKE_EXECUTABLE,
+          executable_digest: FAKE_EXECUTABLE_DIGEST,
+          args: ["--import", "tsx/esm", FAKE_SERVER, "ping-ok"],
+          secret_bindings: {},
+        },
+        allowed_modules: ["main-brain"],
+        limits: {
+          startup_timeout_ms: 2000,
+          request_timeout_ms: 10000,
+          max_concurrency: 4,
+          max_request_bytes: 1048576,
+          max_response_bytes: 4194304,
+        },
+        // Closed configured tool map: empty in the ping-substrate tests, so
+        // the fixture's empty advertised tools/list verifies it during
+        // prepare.
+        tools: {},
+        ...overrides,
+      },
     },
-    startupTimeoutMs: 2000,
-    requestTimeoutMs: 10000,
-    configRevision: "rev-1",
-    // Closed configured tool map: empty in the ping-substrate tests, so the
-    // fixture's empty advertised tools/list verifies it during prepare.
-    tools: {},
-    ...overrides,
+  };
+}
+
+/** Parses a v1 document and returns the exact minted server config. */
+function parsedServer(document: ToolBrokerConfigDocumentInput): ToolBrokerServerConfig {
+  return parseToolBrokerConfig(document, { configRevision: "rev-1" }).servers["fake-mcp"];
+}
+
+/** Host-resolved executable premise that echoes the configured identity. */
+function premise(): HostResolvedExecutablePremise {
+  return {
+    executablePath: process.execPath,
+    package_id: FAKE_PACKAGE_ID,
+    package_version: FAKE_PACKAGE_VERSION,
+    package_digest: FAKE_PACKAGE_DIGEST,
+    executable: FAKE_EXECUTABLE,
+    executable_digest: FAKE_EXECUTABLE_DIGEST,
   };
 }
 
 /** Collects broker instances so their children are never left running. */
-const running: Array<{ broker: ToolBrokerServer; child: ChildProcess }> = [];
+const running: Array<{ broker: ToolBrokerServer; child: ChildProcess; capture: CapturedFrames }> = [];
 afterEach(async () => {
   while (running.length > 0) {
     const entry = running.pop()!;
@@ -119,14 +161,14 @@ interface StartedBroker {
   capture: CapturedFrames;
 }
 
-function startBroker(mode: string, overrides: Partial<ToolBrokerServerConfig> = {}): StartedBroker {
+function startBroker(mode: string, overrides: Partial<Record<string, unknown>> = {}): StartedBroker {
   const child = spawnFake(mode);
   const capture = captureReceivedFrames(child);
-  const broker = startToolBrokerServer(pingConfig(overrides), {
+  const broker = startToolBrokerServer(parsedServer(pingDocument(overrides)), premise(), {
     spawn: () => child,
     now: () => 0,
   });
-  running.push({ broker, child });
+  running.push({ broker, child, capture });
   return { broker, child, capture };
 }
 
@@ -266,7 +308,15 @@ describe("Tool Broker post-handshake session (ping substrate)", () => {
   });
 
   it("ping times out when the server never responds", async () => {
-    const { broker, child } = startBroker("ping-no-response", { requestTimeoutMs: 200 });
+    const { broker, child } = startBroker("ping-no-response", {
+      limits: {
+        startup_timeout_ms: 2000,
+        request_timeout_ms: 200,
+        max_concurrency: 4,
+        max_request_bytes: 1048576,
+        max_response_bytes: 4194304,
+      },
+    });
     await broker.prepare();
     const error = await broker.ping().then(
       () => undefined,
