@@ -1,23 +1,36 @@
 /**
- * Factory for `startToolBrokerServer`: spawns the child and constructs a
- * `ToolBrokerSession` bound to it.
+ * Factory for `startToolBrokerServer`: constructs a `ToolBrokerSession`
+ * bound to the spawned child.
  *
- * The `spawn` and `now` functions are injected so tests can supply a fake
- * child and deterministic clock. In the product runtime (a later gate) the
- * real `node:child_process.spawn` and `Date.now` are used; this slice never
- * imports them directly so the handshake is fully deterministic under test.
+ * The spawn target never comes from the config: the frozen v1 stdio config
+ * names only a relative package member (`transport.executable`) plus its
+ * digests. On every generation start the Host resolves the immutable
+ * installed package and hashes the selected file (spec section 4); that
+ * resolution is carried in a separate `HostResolvedExecutablePremise`. The
+ * factory requires the exact minted config object, requires the premise to
+ * echo the configured package/executable identity exactly, and only then
+ * spawns `premise.executablePath` through the injected `spawn` DI. If the
+ * config is not from admission, or the premise identity does not match, it
+ * rejects with `TOOL_BROKER_CONFIG_INVALID` before any spawn/fs/network/
+ * backend call.
+ *
+ * The package resolver that mints a real premise is a later gate; until it
+ * lands, tests mint premises that echo the configured identity verbatim.
  */
 
 import type { ChildProcess } from "node:child_process";
-import { ToolBrokerSession } from "./session.js";
-import type {
-  NowFn,
-  PrepareResult,
-  SpawnFn,
-  ToolBrokerServerConfig,
-  ToolBrokerServerOptions,
-  ToolBrokerServerState,
+import {
+  ToolBrokerConfigError,
+  type HostResolvedExecutablePremise,
+  type NowFn,
+  type PrepareResult,
+  type SpawnFn,
+  type ToolBrokerServerConfig,
+  type ToolBrokerServerOptions,
+  type ToolBrokerServerState,
 } from "./types.js";
+import { assertParsedToolBrokerServerConfig } from "./config.js";
+import { ToolBrokerSession } from "./session.js";
 /** The broker server handle returned by `startToolBrokerServer`. It owns one
  * generation session. */
 export interface ToolBrokerServer {
@@ -38,8 +51,15 @@ export interface ToolBrokerServer {
 }
 
 /**
- * Starts a Tool Broker server generation: spawns the stdio child and returns
- * a handle. The handshake and discovery are driven by calling `prepare()`.
+ * Starts a Tool Broker server generation: spawns the stdio child named by the
+ * Host-resolved premise and returns a handle. The handshake and discovery are
+ * driven by calling `prepare()`.
+ *
+ * `config` MUST be the exact object returned from `parseToolBrokerConfig`'s
+ * `servers[serverId]` — an unparsed or copied object is rejected before any
+ * spawn. `premise` MUST echo the configured `package_id`, `package_version`,
+ * `package_digest`, `executable`, and `executable_digest`; a mismatch is
+ * rejected with `TOOL_BROKER_CONFIG_INVALID` before any spawn.
  *
  * `generation` starts at 1 and increments per server ID. In this single-start
  * slice every `startToolBrokerServer` call gets generation 1 unless
@@ -49,17 +69,22 @@ export interface ToolBrokerServer {
  */
 export function startToolBrokerServer(
   config: ToolBrokerServerConfig,
+  premise: HostResolvedExecutablePremise,
   options: ToolBrokerServerOptions,
 ): ToolBrokerServer {
   // The `now` injection is accepted for deterministic clock plumbing. This
-  // slice's timeout uses `setTimeout` with the configured `startupTimeoutMs`,
-  // which does not require `now`; retaining the parameter keeps the DI seam
-  // stable for the later gate that measures elapsed time explicitly.
+  // slice's timeout uses `setTimeout` with the configured
+  // `limits.startup_timeout_ms`, which does not require `now`; retaining the
+  // parameter keeps the DI seam stable for the later gate that measures
+  // elapsed time explicitly.
   void options.now;
 
-  const child: ChildProcess = options.spawn(config.transport.command, config.transport.args, {
+  assertParsedToolBrokerServerConfig(config);
+  assertPremiseMatches(config, premise);
+
+  const child: ChildProcess = options.spawn(premise.executablePath, config.transport.args, {
     stdio: ["pipe", "pipe", "pipe"],
-    env: config.transport.env,
+    env: config.transport.secret_bindings,
     windowsHide: true,
   });
 
@@ -79,4 +104,29 @@ export function startToolBrokerServer(
     ping: () => session.ping(),
     stop: () => session.stop(),
   };
+}
+
+/** Rejects with `TOOL_BROKER_CONFIG_INVALID` unless the premise is the exact
+ * package/executable identity of the config; the config never supplies a
+ * spawn target. */
+function assertPremiseMatches(config: ToolBrokerServerConfig, premise: HostResolvedExecutablePremise): void {
+  const configured = config.transport;
+  const mismatches: string[] = [];
+  if (premise.package_id !== configured.package_id) mismatches.push("package_id");
+  if (premise.package_version !== configured.package_version) mismatches.push("package_version");
+  if (premise.package_digest !== configured.package_digest) mismatches.push("package_digest");
+  if (premise.executable !== configured.executable) mismatches.push("executable");
+  if (premise.executable_digest !== configured.executable_digest) mismatches.push("executable_digest");
+  if (mismatches.length > 0) {
+    throw new ToolBrokerConfigError(
+      "TOOL_BROKER_CONFIG_INVALID",
+      `premise does not echo the configured identity for ${mismatches.join(", ")}`,
+    );
+  }
+  if (typeof premise.executablePath !== "string" || premise.executablePath.length === 0) {
+    throw new ToolBrokerConfigError(
+      "TOOL_BROKER_CONFIG_INVALID",
+      "premise executablePath must be a non-empty host-resolved path",
+    );
+  }
 }

@@ -20,6 +20,9 @@ import {
   adaptToolBrokerServer,
   parseToolBrokerConfig,
   startToolBrokerServer,
+  TOOL_BROKER_CONFIG_SCHEMA,
+  type HostResolvedExecutablePremise,
+  type ToolBrokerConfigDocumentInput,
   type ToolBrokerServer,
   type ToolBrokerServerConfig,
   type ToolBrokerServerState,
@@ -84,30 +87,78 @@ function captureReceivedFrames(child: ChildProcess): {
   return { lines, messages, done };
 }
 
-function baseConfig(): ToolBrokerServerConfig {
+/** Package identity shared by the fake server's v1 stdio transport. */
+const FAKE_PACKAGE_ID = "org.dolly.tests.fake-mcp";
+const FAKE_PACKAGE_VERSION = "1.0.0";
+const FAKE_PACKAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+const FAKE_EXECUTABLE = "bin/fake-mcp-server";
+const FAKE_EXECUTABLE_DIGEST = `sha256:${"b".repeat(64)}`;
+
+/** Builds the frozen v1 document for the fake stdio server. The mode is
+ * carried in `transport.args` like every other configured arg; the Host
+ * resolves `transport.executable` to a concrete file at start time (the
+ * premise below). */
+function baseDocument(mode: string): ToolBrokerConfigDocumentInput {
   return {
-    serverId: "fake-mcp",
-    adapter: "mcp",
-    protocolVersion: MCP_PROTOCOL_VERSION,
-    transport: {
-      kind: "stdio",
-      command: process.execPath,
-      args: ["--import", "tsx/esm", FAKE_SERVER, "exact"],
-      env: {},
+    schema: TOOL_BROKER_CONFIG_SCHEMA,
+    servers: {
+      "fake-mcp": {
+        enabled: true,
+        adapter: "mcp",
+        protocol_version: MCP_PROTOCOL_VERSION,
+        transport: {
+          kind: "stdio",
+          package_id: FAKE_PACKAGE_ID,
+          package_version: FAKE_PACKAGE_VERSION,
+          package_digest: FAKE_PACKAGE_DIGEST,
+          executable: FAKE_EXECUTABLE,
+          executable_digest: FAKE_EXECUTABLE_DIGEST,
+          args: ["--import", "tsx/esm", FAKE_SERVER, mode],
+          secret_bindings: {},
+        },
+        allowed_modules: ["main-brain"],
+        limits: {
+          startup_timeout_ms: 2000,
+          request_timeout_ms: 10000,
+          max_concurrency: 4,
+          max_request_bytes: 1048576,
+          max_response_bytes: 4194304,
+        },
+        tools: {},
+      },
     },
-    startupTimeoutMs: 2000,
-    configRevision: "rev-1",
-    // Closed configured tool map: empty in the handshake-focused tests, so
-    // the fixture's empty advertised tools/list verifies it during prepare.
-    tools: {},
   };
+}
+
+/** Parses a v1 document and returns the exact minted server config for the
+ * fake server. The factory requires this minted identity. */
+function parsedServer(document: ToolBrokerConfigDocumentInput): ToolBrokerServerConfig {
+  return parseToolBrokerConfig(document, { configRevision: "rev-1" }).servers["fake-mcp"];
+}
+
+/** Host-resolved executable premise that echoes the configured identity and
+ * names the concrete file (the injected spawn DI resolves to the fixture). */
+function premise(): HostResolvedExecutablePremise {
+  return {
+    executablePath: process.execPath,
+    package_id: FAKE_PACKAGE_ID,
+    package_version: FAKE_PACKAGE_VERSION,
+    package_digest: FAKE_PACKAGE_DIGEST,
+    executable: FAKE_EXECUTABLE,
+    executable_digest: FAKE_EXECUTABLE_DIGEST,
+  };
+}
+
+/** Branded server config for handshake tests (empty closed tool map). */
+function baseConfig(): ToolBrokerServerConfig {
+  return parsedServer(baseDocument("exact"));
 }
 
 describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
   it("sends initialize with the exact protocol version and completes the lifecycle", async () => {
     const child = spawnFake("exact");
     const capture = captureReceivedFrames(child);
-    const broker = startToolBrokerServer(baseConfig(), {
+    const broker = startToolBrokerServer(baseConfig(), premise(), {
       spawn: () => child,
       now: () => 0,
     });
@@ -150,7 +201,7 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
   it("fails closed when the server advertises a different protocol version", async () => {
     const child = spawnFake("wrong-version");
     const capture = captureReceivedFrames(child);
-    const broker = startToolBrokerServer(baseConfig(), {
+    const broker = startToolBrokerServer(baseConfig(), premise(), {
       spawn: () => child,
       now: () => 0,
     });
@@ -174,7 +225,7 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
 
   it("fails closed when the server sends a malformed response", async () => {
     const child = spawnFake("malformed");
-    const broker = startToolBrokerServer(baseConfig(), {
+    const broker = startToolBrokerServer(baseConfig(), premise(), {
       spawn: () => child,
       now: () => 0,
     });
@@ -189,10 +240,24 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
 
   it("fails closed on startup timeout when the server never responds", async () => {
     const child = spawnFake("no-response");
-    const broker = startToolBrokerServer(
-      { ...baseConfig(), startupTimeoutMs: 200 },
-      { spawn: () => child, now: () => 0 },
-    );
+    // A fresh document with a shorter startup limit; parsed into a fresh
+    // minted config (spread copies are rejected by the factory).
+    const base = baseDocument("no-response");
+    const baseServer = base.servers["fake-mcp"] as Record<string, unknown>;
+    const shortDoc: ToolBrokerConfigDocumentInput = {
+      ...base,
+      servers: {
+        ...base.servers,
+        "fake-mcp": {
+          ...baseServer,
+          limits: { ...(baseServer.limits as Record<string, unknown>), startup_timeout_ms: 200 },
+        },
+      },
+    };
+    const broker = startToolBrokerServer(parsedServer(shortDoc), premise(), {
+      spawn: () => child,
+      now: () => 0,
+    });
     const result = await broker.prepare();
 
     expect(result.state).toBe("Quarantined");
@@ -204,7 +269,7 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
 
   it("fails closed when the child exits before responding", async () => {
     const child = spawnFake("early-exit");
-    const broker = startToolBrokerServer(baseConfig(), {
+    const broker = startToolBrokerServer(baseConfig(), premise(), {
       spawn: () => child,
       now: () => 0,
     });
@@ -219,7 +284,7 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
 
   it("fails closed when a duplicate initialize response arrives during discovery", async () => {
     const child = spawnFake("duplicate-init");
-    const broker = startToolBrokerServer(baseConfig(), {
+    const broker = startToolBrokerServer(baseConfig(), premise(), {
       spawn: () => child,
       now: () => 0,
     });
@@ -239,7 +304,7 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
 
   it("quarantines when the server sends initialized before the initialize result", async () => {
     const child = spawnFake("initialized-first");
-    const broker = startToolBrokerServer(baseConfig(), {
+    const broker = startToolBrokerServer(baseConfig(), premise(), {
       spawn: () => child,
       now: () => 0,
     });
@@ -255,7 +320,7 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
 
   it("tears down the exact child on any handshake failure with no orphan", async () => {
     const child = spawnFake("wrong-version");
-    const broker = startToolBrokerServer(baseConfig(), {
+    const broker = startToolBrokerServer(baseConfig(), premise(), {
       spawn: () => child,
       now: () => 0,
     });
@@ -270,44 +335,41 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
 
   it("rejects an unknown top-level config field", () => {
     expect(() =>
-      parseToolBrokerConfig({
-        ...baseConfig(),
-        unexpected: true,
-      } as unknown as ToolBrokerServerConfig),
+      parseToolBrokerConfig(
+        { ...baseDocument("exact"), unexpected: true } as unknown as ToolBrokerConfigDocumentInput,
+        { configRevision: "rev-1" },
+      ),
     ).toThrow(/TOOL_BROKER_CONFIG_INVALID/u);
   });
 
   it("rejects a protocol version other than 2025-06-18", () => {
+    const doc = baseDocument("exact");
+    (doc.servers["fake-mcp"] as Record<string, unknown>).protocol_version = "2026-07-28";
     expect(() =>
-      parseToolBrokerConfig({
-        ...baseConfig(),
-        protocolVersion: "2026-07-28",
-      } as unknown as ToolBrokerServerConfig),
+      parseToolBrokerConfig(doc as unknown as ToolBrokerConfigDocumentInput, { configRevision: "rev-1" }),
     ).toThrow(/TOOL_BROKER_CONFIG_INVALID/u);
   });
 
   it("rejects an adapter other than mcp", () => {
+    const doc = baseDocument("exact");
+    (doc.servers["fake-mcp"] as Record<string, unknown>).adapter = "mcp-next";
     expect(() =>
-      parseToolBrokerConfig({
-        ...baseConfig(),
-        adapter: "mcp-next",
-      } as unknown as ToolBrokerServerConfig),
+      parseToolBrokerConfig(doc as unknown as ToolBrokerConfigDocumentInput, { configRevision: "rev-1" }),
     ).toThrow(/TOOL_BROKER_CONFIG_INVALID/u);
   });
 
   it("rejects a non-stdio transport in this slice", () => {
+    const doc = baseDocument("exact");
+    (doc.servers["fake-mcp"] as Record<string, unknown>).transport = { kind: "streamable_http", endpoint: "https://example.invalid" };
     expect(() =>
-      parseToolBrokerConfig({
-        ...baseConfig(),
-        transport: { kind: "streamable_http", endpoint: "https://example.invalid" },
-      } as unknown as ToolBrokerServerConfig),
+      parseToolBrokerConfig(doc as unknown as ToolBrokerConfigDocumentInput, { configRevision: "rev-1" }),
     ).toThrow(/TOOL_BROKER_CONFIG_INVALID/u);
   });
 
   it("exposes a deterministic request id sequence starting at 1", async () => {
     const child = spawnFake("exact");
     const capture = captureReceivedFrames(child);
-    const broker = startToolBrokerServer(baseConfig(), {
+    const broker = startToolBrokerServer(baseConfig(), premise(), {
       spawn: () => child,
       now: () => 0,
     });
@@ -327,7 +389,7 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
 
   it("adaptToolBrokerServer returns a frozen, reusable prepared descriptor", async () => {
     const child = spawnFake("exact");
-    const broker = startToolBrokerServer(baseConfig(), {
+    const broker = startToolBrokerServer(baseConfig(), premise(), {
       spawn: () => child,
       now: () => 0,
     });
@@ -352,7 +414,7 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
 
   it("rejects a spread copy of a genuine result", async () => {
     const child = spawnFake("exact");
-    const broker = startToolBrokerServer(baseConfig(), {
+    const broker = startToolBrokerServer(baseConfig(), premise(), {
       spawn: () => child,
       now: () => 0,
     });
@@ -367,7 +429,7 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
 
   it("reuses the exact minted identity on an idempotent prepare call", async () => {
     const child = spawnFake("exact");
-    const broker = startToolBrokerServer(baseConfig(), {
+    const broker = startToolBrokerServer(baseConfig(), premise(), {
       spawn: () => child,
       now: () => 0,
     });
@@ -382,7 +444,7 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
 
   it("cannot mutate a genuine Quarantined result into Ready; identity does not project", async () => {
     const child = spawnFake("wrong-version");
-    const broker = startToolBrokerServer(baseConfig(), {
+    const broker = startToolBrokerServer(baseConfig(), premise(), {
       spawn: () => child,
       now: () => 0,
     });
@@ -401,7 +463,7 @@ describe("Tool Broker 2025-06-18 stdio handshake (REQ-TOOL-008)", () => {
 
   it("cannot mutate a genuine Ready generation to project altered authority", async () => {
     const child = spawnFake("exact");
-    const broker = startToolBrokerServer(baseConfig(), {
+    const broker = startToolBrokerServer(baseConfig(), premise(), {
       spawn: () => child,
       now: () => 0,
     });

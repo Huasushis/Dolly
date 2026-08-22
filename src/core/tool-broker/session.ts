@@ -52,11 +52,6 @@ import { createStdioReader, createStdioWriter, StdioReadError, type StdioMessage
 /** Bounded wall-clock wait for SIGTERM before escalating to SIGKILL, in ms. */
 const TEARDOWN_GRACE_MS = 500;
 
-/** Default bounded wall-clock wait for a post-handshake request response,
- * used when a `requestTimeoutMs` is not present on a directly-constructed
- * config (the same default `parseToolBrokerConfig` resolves). */
-const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
-
 /**
  * Module-private identity store of every `PrepareResult` minted by
  * `prepare()`. `prepare()` is the sole producer of Ready evidence;
@@ -207,7 +202,7 @@ export class ToolBrokerSession {
     this.#child = child;
     this.#reader = createStdioReader(child);
     this.#writer = createStdioWriter(child);
-    this.#requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.#requestTimeoutMs = config.limits.request_timeout_ms;
   }
 
   get state(): ToolBrokerServerState {
@@ -293,7 +288,7 @@ export class ToolBrokerSession {
       this.#nextRequestId += 1;
       const discoveryResult = await this.#readCorrelatedResponse(
         discoveryId,
-        this.#config.startupTimeoutMs,
+        this.#config.limits.startup_timeout_ms,
         "TOOL_BROKER_STARTUP_TIMEOUT",
         "tools/list",
       );
@@ -357,7 +352,7 @@ export class ToolBrokerSession {
    * cannot reach here because `prepare` is idempotent.
    */
   async #readResponseOrTimeout(expectedId: number): Promise<JsonValue> {
-    const deadline = this.#config.startupTimeoutMs;
+    const deadline = this.#config.limits.startup_timeout_ms;
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => {
         reject(new ToolBrokerSessionError("TOOL_BROKER_STARTUP_TIMEOUT", `initialize response not received within ${deadline}ms`));
@@ -562,17 +557,17 @@ export class ToolBrokerSession {
 
     // Verify every configured binding against discovery; extras never widen.
     for (const [alias, configured] of Object.entries(this.#config.tools)) {
-      const advertisedSchema = advertisedByUpstream.get(configured.upstreamName);
+      const advertisedSchema = advertisedByUpstream.get(configured.upstream_name);
       if (advertisedSchema === undefined) {
         throw new ToolBrokerSessionError(
           "TOOL_CONFIG_INVALID",
-          `configured tool "${alias}" upstream "${configured.upstreamName}" is not advertised by tools/list`,
+          `configured tool "${alias}" upstream "${configured.upstream_name}" is not advertised by tools/list`,
         );
       }
-      if (canonicalJsonDigest(advertisedSchema) !== configured.inputSchemaDigest) {
+      if (canonicalJsonDigest(advertisedSchema) !== configured.input_schema_digest) {
         throw new ToolBrokerSessionError(
           "TOOL_CONFIG_INVALID",
-          `configured tool "${alias}" upstream "${configured.upstreamName}" has a schema digest mismatch with the advertised schema`,
+          `configured tool "${alias}" upstream "${configured.upstream_name}" has a schema digest mismatch with the advertised schema`,
         );
       }
     }
@@ -583,9 +578,16 @@ export class ToolBrokerSession {
     const pinnedTools: Record<string, ConfiguredTool> = {};
     for (const [alias, configured] of Object.entries(this.#config.tools)) {
       pinnedTools[alias] = {
-        upstreamName: configured.upstreamName,
-        inputSchema: cloneJson(configured.inputSchema),
-        inputSchemaDigest: configured.inputSchemaDigest,
+        upstream_name: configured.upstream_name,
+        description: configured.description,
+        input_schema: cloneJson(configured.input_schema),
+        input_schema_digest: configured.input_schema_digest,
+        output_schema: cloneJson(configured.output_schema),
+        output_schema_digest: configured.output_schema_digest,
+        side_effect_class: configured.side_effect_class,
+        idempotency: cloneJson(configured.idempotency),
+        requires_confirmation: configured.requires_confirmation,
+        enabled: configured.enabled,
       };
     }
     const catalog = deepFreeze({

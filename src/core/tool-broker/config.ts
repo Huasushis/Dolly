@@ -2,33 +2,72 @@
  * Config admission for the Tool Broker slice.
  *
  * `parseToolBrokerConfig` is the first fail-closed layer: it rejects any
- * config that does not name exactly protocol `2025-06-18`, adapter `mcp`, and
- * a stdio transport, or that does not carry a closed tool map with an exact
- * schema digest per binding, before any child is spawned. Unknown top-level
- * fields are rejected so a stale or typo'd config cannot silently widen
- * behaviour. Server discovery can verify this map, never widen it.
+ * document that is not exactly the frozen `dolly.tool-broker-config/v1`
+ * shape (`tool-broker-config.schema.json` + `common.schema.json`), including
+ * any legacy camelCase field, raw `command`/`env`/path, missing allowed
+ * modules, missing full limits, or missing required Tool fields, before any
+ * child is spawned. Unknown fields are rejected so a stale or typo'd config
+ * cannot silently widen behaviour. Server discovery can verify each closed
+ * tool map, never widen it.
  *
- * Scope: this slice binds exactly `tools` entries with `upstreamName`,
- * `inputSchema`, `inputSchemaDigest`; the other `Tool` schema fields are later
- * gates and are rejected here so the binding stays closed.
+ * Scope: this slice binds the full exact `Tool` entry as the schema requires
+ * (validation and both recomputed digests). Streamable HTTP is out of scope
+ * and rejected here; package resolution, the ledger, `host.tool.invoke`, and
+ * Module activation are later gates that live outside this module. `enabled`
+ * is admitted (config) but enablement is evaluated by a later gate.
  */
 
 import { canonicalJsonDigest, assertJsonValue, type JsonValue } from "../canonical-json.js";
-import { ToolBrokerConfigError, MCP_PROTOCOL_VERSION, STABLE_ID_PATTERN, UPSTREAM_NAME_PATTERN, SHA256_PATTERN, type ToolBrokerServerConfig, type ConfiguredTool } from "./types.js";
+import {
+  ToolBrokerConfigError,
+  TOOL_BROKER_CONFIG_SCHEMA,
+  MCP_PROTOCOL_VERSION,
+  STABLE_ID_PATTERN,
+  EXTENSION_ID_PATTERN,
+  UPSTREAM_NAME_PATTERN,
+  SHA256_PATTERN,
+  SEMVER_VERSION_PATTERN,
+  EXECUTABLE_PATH_PATTERN,
+  ENV_NAME_PATTERN,
+  SECRET_REF_PATTERN,
+  ARGUMENT_POINTER_PATTERN,
+  type ConfiguredTool,
+  type StdioTransportConfig,
+  type ToolBrokerConfigDocument,
+  type ToolBrokerLimits,
+  type ToolBrokerServerConfig,
+  type ToolIdempotencyPolicy,
+  type ToolSideEffectClass,
+} from "./types.js";
 
-const SERVER_ID_PATTERN = STABLE_ID_PATTERN;
-
-/** Known top-level keys of `ToolBrokerServerConfig`. */
-const ALLOWED_KEYS = ["serverId", "adapter", "protocolVersion", "transport", "startupTimeoutMs", "requestTimeoutMs", "configRevision", "tools"] as const;
-const ALLOWED_TRANSPORT_KEYS = ["kind", "command", "args", "env"] as const;
-/** Known keys of one configured tool binding. */
-const ALLOWED_TOOL_KEYS = ["upstreamName", "inputSchema", "inputSchemaDigest"] as const;
-/** Upper bound on configured tools (matches the `maxProperties` cap in
- * `tool-broker-config.schema.json` Tools map). */
+/** Upper bounds mirrored from the frozen schema. */
+const MAX_SERVERS = 1024;
 const MAX_CONFIGURED_TOOLS = 4096;
+const MAX_ALLOWED_MODULES = 4096;
+const MAX_ARGS = 64;
+const MAX_ARG_LENGTH = 4096;
+const MAX_SECRET_BINDINGS = 32;
+const MAX_DESCRIPTION_LENGTH = 4096;
+const STABLE_ID_MAX_LENGTH = 63;
+const EXECUTABLE_MAX_LENGTH = 255;
+const EXTENSION_ID_MIN_LENGTH = 5;
+const EXTENSION_ID_MAX_LENGTH = 255;
+const SECRET_REF_MIN_LENGTH = 12;
+const SECRET_REF_MAX_LENGTH = 255;
+const POINTER_MAX_LENGTH = 512;
 
-/** Default bounded wall-clock wait for a post-handshake request response. */
-const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
+const LIMIT_RANGES: Record<keyof ToolBrokerLimits, readonly [number, number]> = {
+  startup_timeout_ms: [100, 300000],
+  request_timeout_ms: [100, 3600000],
+  max_concurrency: [1, 1024],
+  max_request_bytes: [1024, 67108864],
+  max_response_bytes: [1024, 67108864],
+};
+
+const ALLOWED_SERVER_KEYS = ["enabled", "adapter", "protocol_version", "transport", "allowed_modules", "limits", "tools"] as const;
+const ALLOWED_TRANSPORT_KEYS = ["kind", "package_id", "package_version", "package_digest", "executable", "executable_digest", "args", "secret_bindings"] as const;
+const ALLOWED_TOOL_KEYS = ["upstream_name", "description", "input_schema", "input_schema_digest", "output_schema", "output_schema_digest", "side_effect_class", "idempotency", "requires_confirmation", "enabled"] as const;
+const SIDE_EFFECT_CLASSES = ["read_only", "idempotent_write", "non_idempotent_write", "unknown"] as const;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -38,166 +77,382 @@ function reject(message: string): never {
   throw new ToolBrokerConfigError("TOOL_BROKER_CONFIG_INVALID", message);
 }
 
+/** True for a value matching the frozen StableId pattern and length cap
+ * (server IDs, tool aliases, allowed Module IDs). */
+function isStableId(value: string): boolean {
+  return value.length > 0 && value.length <= STABLE_ID_MAX_LENGTH && STABLE_ID_PATTERN.test(value);
+}
+
 /**
- * Validates and returns a closed `ToolBrokerServerConfig`. Throws
- * `ToolBrokerConfigError` (code `TOOL_BROKER_CONFIG_INVALID`) for any unknown
- * field, wrong adapter, wrong protocol version, non-stdio transport, or
- * malformed value.
+ * Identity stores for objects minted by `parseToolBrokerConfig`. The factory
+ * requires the exact minted server config object (not a spread copy), so a
+ * caller-typed value can never bypass admission and reach spawn.
  */
-export function parseToolBrokerConfig(input: unknown): ToolBrokerServerConfig {
+const MINTED_SERVER_CONFIGS = new WeakSet<object>();
+
+/**
+ * True only for a server config object returned inside a document produced by
+ * `parseToolBrokerConfig` (the exact object, not a spread copy).
+ */
+export function isParsedToolBrokerServerConfig(value: unknown): value is ToolBrokerServerConfig {
+  return typeof value === "object" && value !== null && MINTED_SERVER_CONFIGS.has(value);
+}
+
+/**
+ * Requires the exact minted server config object. Used by the factory before
+ * any spawn, so a caller-constructed or copied config cannot reach spawn.
+ */
+export function assertParsedToolBrokerServerConfig(config: ToolBrokerServerConfig): void {
+  if (!isParsedToolBrokerServerConfig(config)) {
+    reject("config was not produced by parseToolBrokerConfig; refusing to spawn");
+  }
+}
+
+interface ToolBrokerDocumentHostContext {
+  /** Immutable configuration revision the document belongs to (Host-registry
+   * metadata, spec section 7, not part of the frozen schema). Bound at
+   * admission so every minted server config pins its catalog to it. */
+  readonly configRevision: string;
+}
+
+/**
+ * Validates and returns a frozen, branded, closed `dolly.tool-broker-config/v1`
+ * document. Throws `ToolBrokerConfigError` (code `TOOL_BROKER_CONFIG_INVALID`)
+ * for any unknown field, wrong schema tag, wrong adapter, wrong protocol
+ * version, non-stdio transport, missing or malformed limits, missing allowed
+ * modules, missing required Tool fields, lax digests, or digest/schema
+ * mismatch. Runs before any spawn/fs/network/backend call; the caller never
+ * reaches the factory with an unbranded server config.
+ */
+export function parseToolBrokerConfig(input: unknown, host: ToolBrokerDocumentHostContext): ToolBrokerConfigDocument {
   if (!isPlainObject(input)) {
     reject("config must be an object");
   }
+  if (typeof host.configRevision !== "string" || !isStableId(host.configRevision)) {
+    reject("host.configRevision must be a stable identifier matching /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/ (max 63 chars)");
+  }
 
-  // Reject unknown top-level fields.
   for (const key of Object.keys(input)) {
-    if (!(ALLOWED_KEYS as readonly string[]).includes(key)) {
+    if (key !== "schema" && key !== "servers") {
       reject(`unknown config field "${key}"`);
     }
   }
 
-  const { serverId, adapter, protocolVersion, transport, startupTimeoutMs, requestTimeoutMs, configRevision, tools } = input as Record<string, unknown>;
-
-  if (typeof serverId !== "string" || !SERVER_ID_PATTERN.test(serverId)) {
-    reject("serverId must be a stable identifier matching /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/");
+  if (input.schema !== TOOL_BROKER_CONFIG_SCHEMA) {
+    reject(`schema must be exactly ${JSON.stringify(TOOL_BROKER_CONFIG_SCHEMA)} (got ${JSON.stringify(input.schema)})`);
   }
 
-  if (typeof configRevision !== "string" || !SERVER_ID_PATTERN.test(configRevision)) {
-    reject("configRevision must be a stable identifier matching /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/");
+  const serversInput = input.servers;
+  if (!isPlainObject(serversInput)) {
+    reject("servers must be an object");
+  }
+  const serverIds = Object.keys(serversInput);
+  if (serverIds.length > MAX_SERVERS) {
+    reject(`servers must have at most ${MAX_SERVERS} entries`);
+  }
+
+  const servers: Record<string, ToolBrokerServerConfig> = {};
+  for (const serverId of serverIds) {
+    if (!isStableId(serverId)) {
+      reject(`servers key "${serverId}" must be a stable identifier matching /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/ (max 63 chars)`);
+    }
+    servers[serverId] = parseServer(serverId, serversInput[serverId], host.configRevision);
+  }
+
+  return Object.freeze({
+    schema: TOOL_BROKER_CONFIG_SCHEMA,
+    servers: Object.freeze(servers),
+  });
+}
+
+function parseServer(serverId: string, input: unknown, configRevision: string): ToolBrokerServerConfig {
+  if (!isPlainObject(input)) {
+    reject(`servers["${serverId}"] must be an object`);
+  }
+  for (const key of Object.keys(input)) {
+    if (!(ALLOWED_SERVER_KEYS as readonly string[]).includes(key)) {
+      reject(`servers["${serverId}"] unknown field "${key}"`);
+    }
+  }
+
+  const { enabled, adapter, protocol_version, transport, allowed_modules, limits, tools } = input as Record<string, unknown>;
+
+  if (typeof enabled !== "boolean") {
+    reject(`servers["${serverId}"].enabled must be a boolean`);
   }
 
   if (adapter !== "mcp") {
-    reject(`adapter must be "mcp" (got ${JSON.stringify(adapter)})`);
+    reject(`servers["${serverId}"].adapter must be "mcp" (got ${JSON.stringify(adapter)})`);
   }
 
-  if (protocolVersion !== MCP_PROTOCOL_VERSION) {
-    reject(`protocolVersion must be exactly "${MCP_PROTOCOL_VERSION}" (got ${JSON.stringify(protocolVersion)})`);
+  if (protocol_version !== MCP_PROTOCOL_VERSION) {
+    reject(`servers["${serverId}"].protocol_version must be exactly "${MCP_PROTOCOL_VERSION}" (got ${JSON.stringify(protocol_version)})`);
   }
 
-  if (typeof startupTimeoutMs !== "number" || !Number.isInteger(startupTimeoutMs) || startupTimeoutMs < 100 || startupTimeoutMs > 300000) {
-    reject("startupTimeoutMs must be an integer in [100, 300000]");
-  }
+  const parsedTransport = parseStdioTransport(serverId, transport);
+  const parsedModules = parseAllowedModules(serverId, allowed_modules);
+  const parsedLimits = parseLimits(serverId, limits);
+  const parsedTools = parseTools(serverId, tools);
 
-  // requestTimeoutMs is optional with a 10000ms default; when present it must
-  // be a positive integer capped at 300000 (same admission style as
-  // startupTimeoutMs). Only the resolved number is ever stored.
-  if (requestTimeoutMs !== undefined) {
-    if (typeof requestTimeoutMs !== "number" || !Number.isInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 300000) {
-      reject("requestTimeoutMs must be an integer in [1, 300000]");
-    }
-  }
-
-  // Transport: must be stdio in this slice.
-  if (!isPlainObject(transport)) {
-    reject("transport must be an object");
-  }
-  for (const key of Object.keys(transport)) {
-    if (!(ALLOWED_TRANSPORT_KEYS as readonly string[]).includes(key)) {
-      reject(`unknown transport field "${key}"`);
-    }
-  }
-
-  if (transport.kind !== "stdio") {
-    reject(`transport.kind must be "stdio" in this slice (got ${JSON.stringify(transport.kind)})`);
-  }
-
-  if (typeof transport.command !== "string" || transport.command.length === 0 || transport.command.length > 4096) {
-    reject("transport.command must be a non-empty string");
-  }
-
-  if (!Array.isArray(transport.args) || transport.args.some((a) => typeof a !== "string")) {
-    reject("transport.args must be an array of strings");
-  }
-  if (transport.args.length > 64) {
-    reject("transport.args must have at most 64 entries");
-  }
-  if (!isPlainObject(transport.env)) {
-    reject("transport.env must be an object");
-  }
-  for (const [k, v] of Object.entries(transport.env)) {
-    if (typeof v !== "string") {
-      reject(`transport.env["${k}"] must be a string`);
-    }
-  }
-
-  // Closed configured tool map. Every alias must bind an exact upstream name
-  // and an exact input schema with a recomputed digest; any duplicate upstream
-  // name across the map, unknown entry field, or digest mismatch is rejected.
-  if (!isPlainObject(tools)) {
-    reject("tools must be a map of aliases to configured tool bindings");
-  }
-  const toolCount = Object.keys(tools).length;
-  if (toolCount > MAX_CONFIGURED_TOOLS) {
-    reject(`tools must have at most ${MAX_CONFIGURED_TOOLS} entries`);
-  }
-  const configuredTools: Record<string, ConfiguredTool> = {};
-  const upstreamNames = new Set<string>();
-  for (const [alias, rawTool] of Object.entries(tools)) {
-    if (!SERVER_ID_PATTERN.test(alias)) {
-      reject(`tools key "${alias}" must be a stable identifier matching /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/`);
-    }
-    if (!isPlainObject(rawTool)) {
-      reject(`tools["${alias}"] must be an object`);
-    }
-    for (const key of Object.keys(rawTool)) {
-      if (!(ALLOWED_TOOL_KEYS as readonly string[]).includes(key)) {
-        reject(`unknown tool field "${key}" in tools["${alias}"]`);
-      }
-    }
-    const { upstreamName, inputSchema, inputSchemaDigest } = rawTool as Record<string, unknown>;
-    if (typeof upstreamName !== "string" || !UPSTREAM_NAME_PATTERN.test(upstreamName)) {
-      reject(`tools["${alias}"].upstreamName must match /^[ -~]{1,255}$/`);
-    }
-    if (upstreamNames.has(upstreamName)) {
-      reject(`tools["${alias}"] reuses upstreamName "${upstreamName}" which is already bound`);
-    }
-    upstreamNames.add(upstreamName);
-    if (typeof inputSchemaDigest !== "string" || !SHA256_PATTERN.test(inputSchemaDigest)) {
-      reject(`tools["${alias}"].inputSchemaDigest must match /^sha256:[0-9a-f]{64}$/`);
-    }
-    // The configured input schema must be a full JSON value with object-form
-    // root type "object" (self-contained). assertJsonValue both validates and
-    // narrows the unknown to JsonValue for the closed config.
-    try {
-      assertJsonValue(inputSchema);
-    } catch {
-      reject(`tools["${alias}"].inputSchema must be a JSON value`);
-    }
-    const schemaDocument = inputSchema as JsonValue;
-    if (!isPlainObject(schemaDocument) || schemaDocument.type !== "object") {
-      reject(`tools["${alias}"].inputSchema must be an object-form schema with root type "object"`);
-    }
-    // Recompute the digest (spec section 2: the normalizer MUST recompute every
-    // schema digest and reject a mismatch) so a previously-rotated key or a
-    // stale siloed copy cannot pin a different contract than the schema holds.
-    const recomputed = canonicalJsonDigest(schemaDocument);
-    if (recomputed !== inputSchemaDigest) {
-      reject(`tools["${alias}"].inputSchemaDigest does not match the recomputed digest of its inputSchema`);
-    }
-    configuredTools[alias] = {
-      upstreamName,
-      inputSchema: schemaDocument,
-      inputSchemaDigest,
-    };
-  }
-
-  const config: ToolBrokerServerConfig = {
+  const config: ToolBrokerServerConfig = Object.freeze({
     serverId,
+    enabled,
     adapter: "mcp",
-    protocolVersion: MCP_PROTOCOL_VERSION,
-    transport: {
-      kind: "stdio",
-      command: transport.command,
-      args: transport.args as readonly string[],
-      env: transport.env as Readonly<Record<string, string>>,
-    },
-    startupTimeoutMs,
-    // Always store the resolved number (never undefined) so the session can
-    // read a concrete request timeout off the closed config.
-    requestTimeoutMs: requestTimeoutMs === undefined ? DEFAULT_REQUEST_TIMEOUT_MS : requestTimeoutMs,
+    protocol_version: MCP_PROTOCOL_VERSION,
+    transport: parsedTransport,
+    allowed_modules: parsedModules,
+    limits: parsedLimits,
     configRevision,
-    tools: configuredTools,
-  };
-
+    tools: parsedTools,
+  });
+  MINTED_SERVER_CONFIGS.add(config);
   return config;
+}
+
+function parseStdioTransport(serverId: string, input: unknown): StdioTransportConfig {
+  if (!isPlainObject(input)) {
+    reject(`servers["${serverId}"].transport must be an object`);
+  }
+  for (const key of Object.keys(input)) {
+    if (!(ALLOWED_TRANSPORT_KEYS as readonly string[]).includes(key)) {
+      reject(`servers["${serverId}"].transport unknown field "${key}"`);
+    }
+  }
+  if (input.kind !== "stdio") {
+    reject(`servers["${serverId}"].transport.kind must be "stdio" in this slice (got ${JSON.stringify(input.kind)})`);
+  }
+
+  const transportInput = input as Record<string, unknown>;
+  const { package_id, package_version, package_digest, executable, executable_digest, args, secret_bindings } = transportInput;
+
+  let parsedPackageId: string;
+  if (typeof package_id !== "string" || package_id.length < EXTENSION_ID_MIN_LENGTH || package_id.length > EXTENSION_ID_MAX_LENGTH || !EXTENSION_ID_PATTERN.test(package_id)) {
+    reject(`servers["${serverId}"].transport.package_id must match the ExtensionId pattern`);
+  } else {
+    parsedPackageId = package_id;
+  }
+  let parsedPackageVersion: string;
+  if (typeof package_version !== "string" || !SEMVER_VERSION_PATTERN.test(package_version)) {
+    reject(`servers["${serverId}"].transport.package_version must match the semver pattern`);
+  } else {
+    parsedPackageVersion = package_version;
+  }
+  const parsedPackageDigest = requireSha256Value(serverId, ".transport.package_digest", package_digest);
+  if (typeof executable !== "string" || executable.length === 0 || executable.length > EXECUTABLE_MAX_LENGTH || !EXECUTABLE_PATH_PATTERN.test(executable)) {
+    reject(`servers["${serverId}"].transport.executable must be a relative member path matching the StdioTransport pattern`);
+  }
+  const parsedExecutableDigest = requireSha256Value(serverId, ".transport.executable_digest", executable_digest);
+  if (!Array.isArray(args) || args.length > MAX_ARGS || args.some((a) => typeof a !== "string" || a.length > MAX_ARG_LENGTH)) {
+    reject(`servers["${serverId}"].transport.args must be an array of at most ${MAX_ARGS} strings (each at most ${MAX_ARG_LENGTH} chars)`);
+  }
+  if (!isPlainObject(secret_bindings)) {
+    reject(`servers["${serverId}"].transport.secret_bindings must be an object`);
+  }
+  const bindingNames = Object.keys(secret_bindings);
+  if (bindingNames.length > MAX_SECRET_BINDINGS) {
+    reject(`servers["${serverId}"].transport.secret_bindings must have at most ${MAX_SECRET_BINDINGS} entries`);
+  }
+  const secretBindings: Record<string, string> = {};
+  for (const name of bindingNames) {
+    const ref = secret_bindings[name];
+    if (!ENV_NAME_PATTERN.test(name)) {
+      reject(`servers["${serverId}"].transport.secret_bindings key "${name}" must match /^[A-Z][A-Z0-9_]{0,63}$/`);
+    }
+    if (typeof ref !== "string" || ref.length < SECRET_REF_MIN_LENGTH || ref.length > SECRET_REF_MAX_LENGTH || !SECRET_REF_PATTERN.test(ref)) {
+      reject(`servers["${serverId}"].transport.secret_bindings["${name}"] must be a secret reference matching /^secret:\\/\\/[a-z][a-z0-9-]{0,62}\\/[A-Za-z0-9][A-Za-z0-9._/-]{0,190}$/`);
+    }
+    secretBindings[name] = ref;
+  }
+
+  return Object.freeze({
+    kind: "stdio",
+    package_id: parsedPackageId,
+    package_version: parsedPackageVersion,
+    package_digest: parsedPackageDigest,
+    executable,
+    executable_digest: parsedExecutableDigest,
+    args: Object.freeze([...(args as string[])]),
+    secret_bindings: Object.freeze(secretBindings),
+  });
+}
+
+function parseAllowedModules(serverId: string, input: unknown): readonly string[] {
+  if (!Array.isArray(input)) {
+    reject(`servers["${serverId}"].allowed_modules must be an array`);
+  }
+  if (input.length > MAX_ALLOWED_MODULES) {
+    reject(`servers["${serverId}"].allowed_modules must have at most ${MAX_ALLOWED_MODULES} entries`);
+  }
+  const seen = new Set<string>();
+  for (const moduleId of input) {
+    if (typeof moduleId !== "string" || !isStableId(moduleId)) {
+      reject(`servers["${serverId}"].allowed_modules entries must be stable identifiers matching /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/ (max 63 chars)`);
+    }
+    if (seen.has(moduleId)) {
+      reject(`servers["${serverId}"].allowed_modules contains duplicate module "${moduleId}"`);
+    }
+    seen.add(moduleId);
+  }
+  return Object.freeze([...input]);
+}
+
+function parseLimits(serverId: string, input: unknown): ToolBrokerLimits {
+  if (!isPlainObject(input)) {
+    reject(`servers["${serverId}"].limits must be an object`);
+  }
+  for (const key of Object.keys(input)) {
+    if (!(Object.keys(LIMIT_RANGES) as readonly string[]).includes(key)) {
+      reject(`servers["${serverId}"].limits unknown field "${key}"`);
+    }
+  }
+  const values = input as Record<string, unknown>;
+  const limits = {} as Record<string, number>;
+  for (const [field, [min, max]] of Object.entries(LIMIT_RANGES)) {
+    const value = values[field];
+    if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
+      reject(`servers["${serverId}"].limits.${field}: value must be an integer in [${min}, ${max}]`);
+    }
+    limits[field] = value;
+  }
+  return {
+    startup_timeout_ms: limits.startup_timeout_ms,
+    request_timeout_ms: limits.request_timeout_ms,
+    max_concurrency: limits.max_concurrency,
+    max_request_bytes: limits.max_request_bytes,
+    max_response_bytes: limits.max_response_bytes,
+  };
+}
+
+function parseTools(serverId: string, input: unknown): Readonly<Record<string, ConfiguredTool>> {
+  if (!isPlainObject(input)) {
+    reject(`servers["${serverId}"].tools must be a map of aliases to configured tool bindings`);
+  }
+  const aliases = Object.keys(input);
+  if (aliases.length > MAX_CONFIGURED_TOOLS) {
+    reject(`servers["${serverId}"].tools must have at most ${MAX_CONFIGURED_TOOLS} entries`);
+  }
+  const tools: Record<string, ConfiguredTool> = {};
+  const upstreamNames = new Set<string>();
+  for (const alias of aliases) {
+    if (!isStableId(alias)) {
+      reject(`servers["${serverId}"].tools key "${alias}" must be a stable identifier matching /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/ (max 63 chars)`);
+    }
+    tools[alias] = parseTool(serverId, alias, input[alias], upstreamNames);
+  }
+  return Object.freeze(tools);
+}
+
+function parseTool(serverId: string, alias: string, input: unknown, upstreamNames: Set<string>): ConfiguredTool {
+  if (!isPlainObject(input)) {
+    reject(`servers["${serverId}"].tools["${alias}"] must be an object`);
+  }
+  for (const key of Object.keys(input)) {
+    if (!(ALLOWED_TOOL_KEYS as readonly string[]).includes(key)) {
+      reject(`servers["${serverId}"].tools["${alias}"] unknown field "${key}"`);
+    }
+  }
+
+  const { upstream_name, description, input_schema, input_schema_digest, output_schema, output_schema_digest, side_effect_class, idempotency, requires_confirmation, enabled } = input as Record<string, unknown>;
+
+  if (typeof upstream_name !== "string" || !UPSTREAM_NAME_PATTERN.test(upstream_name)) {
+    reject(`servers["${serverId}"].tools["${alias}"].upstream_name must match /^[ -~]{1,255}$/`);
+  }
+  if (upstreamNames.has(upstream_name)) {
+    reject(`servers["${serverId}"].tools["${alias}"] reuses upstream_name "${upstream_name}" which is already bound`);
+  }
+  upstreamNames.add(upstream_name);
+  if (typeof description !== "string" || description.length > MAX_DESCRIPTION_LENGTH) {
+    reject(`servers["${serverId}"].tools["${alias}"].description must be a string of at most ${MAX_DESCRIPTION_LENGTH} chars`);
+  }
+  const inputSchemaDocument = assertSchemaDocument(serverId, alias, "input_schema", input_schema, "object");
+  const parsedInputSchemaDigest = requireSha256Value(serverId, `.tools["${alias}"].input_schema_digest`, input_schema_digest);
+  const outputSchemaDocument = assertSchemaDocument(serverId, alias, "output_schema", output_schema, "object-or-boolean");
+  const parsedOutputSchemaDigest = requireSha256Value(serverId, `.tools["${alias}"].output_schema_digest`, output_schema_digest);
+  if (canonicalJsonDigest(inputSchemaDocument) !== parsedInputSchemaDigest) {
+    reject(`servers["${serverId}"].tools["${alias}"].input_schema_digest does not match the recomputed digest of its input_schema`);
+  }
+  if (canonicalJsonDigest(outputSchemaDocument) !== parsedOutputSchemaDigest) {
+    reject(`servers["${serverId}"].tools["${alias}"].output_schema_digest does not match the recomputed digest of its output_schema`);
+  }
+  const sideEffectClass = assertSideEffectClass(serverId, alias, side_effect_class);
+  const parsedIdempotency = parseIdempotency(serverId, alias, sideEffectClass, idempotency);
+  if (typeof requires_confirmation !== "boolean") {
+    reject(`servers["${serverId}"].tools["${alias}"].requires_confirmation must be a boolean`);
+  }
+  if (typeof enabled !== "boolean") {
+    reject(`servers["${serverId}"].tools["${alias}"].enabled must be a boolean`);
+  }
+
+  return Object.freeze({
+    upstream_name,
+    description,
+    input_schema: inputSchemaDocument,
+    input_schema_digest: parsedInputSchemaDigest,
+    output_schema: outputSchemaDocument,
+    output_schema_digest: parsedOutputSchemaDigest,
+    side_effect_class: sideEffectClass,
+    idempotency: parsedIdempotency,
+    requires_confirmation,
+    enabled,
+  });
+}
+
+function assertSideEffectClass(serverId: string, alias: string, value: unknown): ToolSideEffectClass {
+  if (typeof value !== "string" || !(SIDE_EFFECT_CLASSES as readonly string[]).includes(value)) {
+    reject(`servers["${serverId}"].tools["${alias}"].side_effect_class must be one of ${SIDE_EFFECT_CLASSES.join(", ")}`);
+  }
+  return value as ToolSideEffectClass;
+}
+
+function parseIdempotency(serverId: string, alias: string, sideEffectClass: ToolSideEffectClass, input: unknown): ToolIdempotencyPolicy {
+  if (!isPlainObject(input)) {
+    reject(`servers["${serverId}"].tools["${alias}"].idempotency must be an object`);
+  }
+  if (sideEffectClass === "idempotent_write") {
+    const kind = input.kind;
+    if (kind !== "argument_key") {
+      reject(`servers["${serverId}"].tools["${alias}"].idempotency.kind must be "argument_key" for an idempotent_write tool`);
+    }
+    const argumentPointer = input.argument_pointer;
+    if (typeof argumentPointer !== "string" || argumentPointer.length === 0 || argumentPointer.length > POINTER_MAX_LENGTH || !ARGUMENT_POINTER_PATTERN.test(argumentPointer)) {
+      reject(`servers["${serverId}"].tools["${alias}"].idempotency.argument_pointer must match the RFC 6901 pointer pattern`);
+    }
+    return Object.freeze({ kind: "argument_key", argument_pointer: argumentPointer });
+  }
+  if (input.kind !== "none") {
+    reject(`servers["${serverId}"].tools["${alias}"].idempotency.kind must be "none" for a ${sideEffectClass} tool`);
+  }
+  return Object.freeze({ kind: "none" });
+}
+
+/**
+ * Validates an embedded schema document: `input_schema` must be an
+ * object-form schema with root `"type":"object"`; `output_schema` must be an
+ * object-form schema or a boolean schema. Both are full JSON values.
+ */
+function assertSchemaDocument(serverId: string, alias: string, field: string, value: unknown, kind: "object" | "object-or-boolean"): JsonValue {
+  try {
+    assertJsonValue(value);
+  } catch {
+    reject(`servers["${serverId}"].tools["${alias}"].${field} must be a JSON value`);
+  }
+  const document = value as JsonValue;
+  if (kind === "object") {
+    if (!isPlainObject(document) || document.type !== "object") {
+      reject(`servers["${serverId}"].tools["${alias}"].${field} must be an object-form schema with root type "object"`);
+    }
+    return document;
+  }
+  if (document === true || document === false || (isPlainObject(document) && document.type === "object")) {
+    return document;
+  }
+  reject(`servers["${serverId}"].tools["${alias}"].${field} must be an object-form or boolean schema`);
+  return document;
+}
+
+function requireSha256Value(serverId: string, fieldPath: string, value: unknown): string {
+  if (typeof value !== "string" || !SHA256_PATTERN.test(value)) {
+    reject(`servers["${serverId}"]${fieldPath} must match /^sha256:[0-9a-f]{64}$/`);
+  }
+  return value;
 }
