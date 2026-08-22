@@ -7,6 +7,7 @@ use dolly_storage::host_authority::{
     PolicyDefinitionOrigin, ResolvedConfiguration, RuntimeAuthorityIdentity,
     create_host_authority_schema, install_host_authority_revision, load_current_authority,
 };
+use rusqlite::params;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
@@ -253,4 +254,49 @@ fn configuration_without_host_prerequisites_has_no_premise() {
             .premise
             .is_none()
     );
+}
+
+#[test]
+fn orphan_next_revision_mapping_identity_is_rejected_before_pointer_publish() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("runtime.sqlite3");
+    let mut db = Database::open(&path).unwrap();
+    create_host_authority_schema(db.connection_mut()).unwrap();
+    let first = revision();
+    install_host_authority_revision(&mut db, first.clone()).unwrap();
+    let prior = load_current_authority(db.connection()).unwrap().unwrap();
+
+    let mut incoming = revision();
+    incoming.mapping.config_revision = 2;
+    let premise = incoming.premise.as_mut().unwrap();
+    premise.config_revision = 2;
+    let premise_value = serde_json::to_value(&*premise).unwrap();
+    premise.premises_digest = digest(&without(&premise_value, "premises_digest"));
+    let config_bytes = canonicalize(&incoming.mapping.canonical_config)
+        .unwrap()
+        .0
+        .as_ref()
+        .to_vec();
+    db.connection_mut()
+        .execute(
+            "INSERT INTO config_revision_mappings (
+                config_revision, daemon_installation_id, instance_id,
+                config_digest, canonical_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                2_i64,
+                "0198ab31-6c44-7e8a-b2bb-000000000003",
+                "wrong-instance",
+                incoming.mapping.config_digest.to_string(),
+                config_bytes,
+            ],
+        )
+        .unwrap();
+
+    let error = install_host_authority_revision(&mut db, incoming).unwrap_err();
+    assert!(matches!(error, HostAuthorityError::RevisionConflict { .. }));
+    let after = load_current_authority(db.connection()).unwrap().unwrap();
+    assert_eq!(after.mapping.config_revision, prior.mapping.config_revision);
+    assert_eq!(after.mapping.config_digest, prior.mapping.config_digest);
+    assert_eq!(after.premise, prior.premise);
 }
