@@ -13,6 +13,9 @@
 //! are the verified `RecoveryFacts` and the storage database.
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
+use dolly_storage::tool_broker_authority::{
+    ToolBrokerAuthorityError, ToolDispatchAuthority, validate_dispatch_binding,
+};
 use dolly_storage::tool_ledger::{CasKey, TransportCorrelation, cas_terminal, cas_to_dispatched};
 use dolly_storage::{Database, StorageError};
 use dolly_tool_broker::{
@@ -28,12 +31,21 @@ pub enum DispatchError {
     /// The supplied record is not a closed nonterminal row consistent with
     /// the requested disposition (caller bug); nothing was mutated.
     InvalidRecord,
+    /// The row did not name the exact registry/generation that produced the
+    /// dispatch permission; nothing was mutated.
+    Authority(ToolBrokerAuthorityError),
     /// The row could not be settled within the bounded pure re-decisions.
     /// No permit.
     Ambiguous,
     /// Storage failure (`STORAGE_*`), including corruption and lost commit
     /// acknowledgements surfaced as errors. No permit.
     Storage(StorageError),
+}
+
+impl From<ToolBrokerAuthorityError> for DispatchError {
+    fn from(error: ToolBrokerAuthorityError) -> Self {
+        Self::Authority(error)
+    }
 }
 
 /// The outcome of [`dispatch_operation`] for one applied transition.
@@ -106,6 +118,23 @@ pub fn dispatch_operation(
             }
         }
     }
+}
+/// Authoritative dispatch entry point. The storage producer must first issue
+/// `ToolDispatchAuthority`; a binding mismatch is rejected before the existing
+/// compare-and-set or any send permit can be reached.
+pub fn dispatch_operation_authorized(
+    db: &mut Database,
+    authority: &ToolDispatchAuthority,
+    row: &ToolCallLedgerRecord,
+    facts: &RecoveryFacts,
+) -> Result<DispatchOutcome, DispatchError> {
+    validate_dispatch_binding(
+        authority,
+        row.operation_binding.config_revision as i64,
+        &row.operation_binding.tool_server_id,
+        row.operation_binding.tool_server_generation,
+    )?;
+    dispatch_operation(db, row, facts)
 }
 
 /// One pure-decision proposal to apply.
