@@ -6,7 +6,7 @@
 //! its document first, so a failure caused by the reference policy or an
 //! invalid document is not masked by a digest mismatch.
 
-use dolly_canonical_json::{parse_core_json, CanonicalJsonValue, ParseLimits, Sha256Digest};
+use dolly_canonical_json::{CanonicalJsonValue, ParseLimits, Sha256Digest, parse_core_json};
 use dolly_schema::{SchemaError, SchemaValidator};
 
 /// Parse a JSON document through the Core parser with the wire limit.
@@ -30,7 +30,8 @@ fn describe(result: Result<SchemaValidator, SchemaError>) -> String {
 // --- 1. exact digest + object schema -------------------------------
 #[test]
 fn object_schema_with_exact_digest_validates_matching_and_rejects_mismatch() {
-    let schema = doc(r##"{"type":"object","properties":{"a":{"type":"number"}},"required":["a"]}"##);
+    let schema =
+        doc(r##"{"type":"object","properties":{"a":{"type":"number"}},"required":["a"]}"##);
     let digest = digest_of(&schema);
     let validator = SchemaValidator::compile_embedded(&schema, &digest)
         .expect("object schema with exact digest compiles");
@@ -49,7 +50,10 @@ fn digest_mismatch_fails_before_compilation_or_validation() {
     let wrong_digest = digest_of(&doc(r##"{"type":"string"}"##));
     match SchemaValidator::compile_embedded(&schema, &wrong_digest) {
         Err(SchemaError::Digest(_)) => {}
-        other => panic!("expected digest mismatch before any schema work: {}", describe(other)),
+        other => panic!(
+            "expected digest mismatch before any schema work: {}",
+            describe(other)
+        ),
     }
 }
 
@@ -103,7 +107,10 @@ fn remote_file_package_and_cross_document_refs_rejected() {
         let digest = digest_of(&schema);
         match SchemaValidator::compile_embedded(&schema, &digest) {
             Err(SchemaError::Reference(_)) => {}
-            other => panic!("expected reference rejection for {bad:?}: {}", describe(other)),
+            other => panic!(
+                "expected reference rejection for {bad:?}: {}",
+                describe(other)
+            ),
         }
     }
 }
@@ -115,7 +122,10 @@ fn named_and_dynamic_anchors_rejected() {
     let digest = digest_of(&anchor);
     match SchemaValidator::compile_embedded(&anchor, &digest) {
         Err(SchemaError::Reference(_)) => {}
-        other => panic!("expected named-anchor reference rejection: {}", describe(other)),
+        other => panic!(
+            "expected named-anchor reference rejection: {}",
+            describe(other)
+        ),
     }
 
     // Dynamic-anchor reference.
@@ -123,7 +133,10 @@ fn named_and_dynamic_anchors_rejected() {
     let digest = digest_of(&dyn_anchor);
     match SchemaValidator::compile_embedded(&dyn_anchor, &digest) {
         Err(SchemaError::Reference(_)) => {}
-        other => panic!("expected dynamic-anchor reference rejection: {}", describe(other)),
+        other => panic!(
+            "expected dynamic-anchor reference rejection: {}",
+            describe(other)
+        ),
     }
 
     // Anchor declared in the document is still invalid: references to it are
@@ -141,8 +154,8 @@ fn named_and_dynamic_anchors_rejected() {
 fn null_type_schema_validates_null_and_rejects_non_null() {
     let schema = doc(r##"{"type":"null"}"##);
     let digest = digest_of(&schema);
-    let validator = SchemaValidator::compile_embedded(&schema, &digest)
-        .expect("null schema compiles");
+    let validator =
+        SchemaValidator::compile_embedded(&schema, &digest).expect("null schema compiles");
     // JSON null is a real, representable value here — preserving it is the
     // contract; absence is NOT represented by this API and must not be
     // synthesized (there is no Option, only CanonicalJsonValue).
