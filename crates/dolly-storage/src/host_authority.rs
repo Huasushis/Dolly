@@ -345,7 +345,20 @@ pub fn install_host_authority_revision(
     let _ = load_current_authority(db.connection())?;
 
     let tx = db.connection_mut().transaction()?;
-    let current = load_state_row(&tx)?;
+    let disposition = install_host_authority_revision_in_transaction(&tx, &input)?;
+    tx.commit()?;
+    Ok(disposition)
+}
+
+/// Shared transaction body used by normal installs and explicit legacy
+/// migration. It is deliberately crate-private: callers cannot publish a
+/// pointer without the Database controller lock and open-time gate.
+pub(crate) fn install_host_authority_revision_in_transaction(
+    tx: &Transaction<'_>,
+    input: &HostAuthorityRevision,
+) -> Result<InstallDisposition, HostAuthorityError> {
+    validate_revision(input)?;
+    let current = load_state_row(tx)?;
     if let Some((current_identity, current_revision, current_digest)) = current {
         if current_identity != input.identity {
             return Err(HostAuthorityError::RevisionConflict {
@@ -362,7 +375,6 @@ pub fn install_host_authority_revision(
                 |row| row.get(0),
             )?;
             if current_digest == input.mapping.config_digest && existing_bytes == incoming_bytes {
-                tx.commit()?;
                 return Ok(InstallDisposition::Reused {
                     config_revision: current_revision,
                 });
@@ -385,31 +397,28 @@ pub fn install_host_authority_revision(
         });
     }
 
+    ensure_core_identity(tx, &input.identity)?;
     let mapping_bytes =
         canonical_bytes(&input.mapping.canonical_config, "canonical resolved config")?;
-    insert_mapping(&tx, &input.mapping, &mapping_bytes)?;
+    insert_mapping(tx, &input.mapping, &mapping_bytes)?;
     if let Some(premise) = input.premise.as_ref() {
-        insert_origin(&tx, &premise.service_candidate.origin)?;
+        insert_origin(tx, &premise.service_candidate.origin)?;
         for definition in &premise.permission_policy_definitions {
-            // The policy origin is itself an operator source record, not an
-            // installed component; its digest is carried inside the closed
-            // definition and never becomes a live authority row.
             let definition_bytes = canonical_bytes(definition, "policy definition")?;
-            insert_definition(&tx, definition, &definition_bytes)?;
+            insert_definition(tx, definition, &definition_bytes)?;
         }
         for binding in &premise.permission_policy_backend_bindings {
-            insert_origin(&tx, &binding.origin)?;
+            insert_origin(tx, &binding.origin)?;
             let binding_bytes = canonical_bytes(binding, "policy backend binding")?;
-            insert_binding(&tx, binding, &binding_bytes)?;
+            insert_binding(tx, binding, &binding_bytes)?;
         }
         let candidate_bytes = canonical_bytes(&premise.service_candidate, "service candidate")?;
-        insert_candidate(&tx, &premise.service_candidate, &candidate_bytes)?;
-        // Policy selections are relational projections and are inserted before
-        // the complete premise, which is the final prerequisite row.
+        insert_candidate(tx, &premise.service_candidate, &candidate_bytes)?;
         for selection in &input.mapping.canonical_config.permission_policy_selections {
-            insert_selection(&tx, input.mapping.config_revision, selection)?;
+            insert_selection(tx, input.mapping.config_revision, selection)?;
         }
-        insert_premise(&tx, premise)?;
+        // The complete premise is the last prerequisite record.
+        insert_premise(tx, premise)?;
     }
 
     let state = RuntimeAuthorityStateRecord {
@@ -442,10 +451,47 @@ pub fn install_host_authority_revision(
             state_bytes,
         ],
     )?;
-    tx.commit()?;
     Ok(InstallDisposition::Committed {
         config_revision: input.mapping.config_revision,
     })
+}
+
+fn ensure_core_identity(
+    tx: &Transaction<'_>,
+    identity: &RuntimeAuthorityIdentity,
+) -> Result<(), HostAuthorityError> {
+    let existing: Option<(Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT daemon_installation_id, instance_id
+             FROM core_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((daemon, instance)) = existing else {
+        return Err(HostAuthorityError::InvalidPremise(
+            "core_meta identity row is missing".into(),
+        ));
+    };
+    match (daemon, instance) {
+        (None, None) => {
+            tx.execute(
+                "UPDATE core_meta SET daemon_installation_id = ?1, instance_id = ?2
+                 WHERE singleton = 1",
+                params![&identity.daemon_installation_id, &identity.instance_id],
+            )?;
+            Ok(())
+        }
+        (Some(daemon), Some(instance))
+            if daemon == identity.daemon_installation_id && instance == identity.instance_id =>
+        {
+            Ok(())
+        }
+        _ => Err(HostAuthorityError::RevisionConflict {
+            config_revision: 0,
+            reason: "core_meta identity differs from the authority producer".into(),
+        }),
+    }
 }
 
 /// Load and fully verify the committed current pointer and premise.
