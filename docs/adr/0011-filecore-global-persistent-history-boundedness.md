@@ -262,9 +262,10 @@ A reader always reads committed SQLite rows in ascending `sequence` order.
 - Otherwise the reader receives a contiguous, ordered range bounded by the
   requested count and byte limits. Reading does not acknowledge or advance.
 - `ack` advances only the configured reader's cursor by compare-and-set and
-  records the exact head revision observed. It is useful evidence for the
-  producer, but it cannot publish or advance a checkpoint and cannot delete a
-  history row.
+  records the exact head revision observed. The acknowledgement is audit-only
+  and MUST NOT be used to derive, gate, select, or advance checkpoint
+  eligibility, `delete_through`, or any producer checkpoint. It cannot publish
+  a checkpoint or delete a history row.
 
 A consumer that needs replay beyond `retained_from` must receive the explicit
 gap and choose its own recovery; FileCore must not recreate acknowledged or
