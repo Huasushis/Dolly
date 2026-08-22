@@ -46,6 +46,24 @@ describe("instance controller kernel lock", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  it("rejects a retired controllerId option instead of silently ignoring it", async () => {
+    // The pre-cutover callers spread `controllerId` into acquire options. The
+    // new live-generation API must fail loudly on that retired field rather
+    // than mint with it ignored, so a dead callsite can never believe a
+    // caller-supplied controller identity survived the cutover.
+    const retiredOptions = {
+      directory: root,
+      instanceId: INSTANCE_ID,
+      controllerId: "22222222-2222-4222-8222-222222222222",
+      processId: 101,
+      now: () => NOW,
+    } as unknown as Parameters<typeof InstanceControllerLock.acquire>[0];
+
+    await expect(InstanceControllerLock.acquire(retiredOptions)).rejects.toMatchObject({
+      code: "CONTROLLER_LOCK_INVALID",
+    });
+  });
+
   it("holds one instance exclusively and permits a clean later owner", async () => {
     const first = await InstanceControllerLock.acquire({
       directory: root,
