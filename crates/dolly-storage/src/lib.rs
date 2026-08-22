@@ -17,6 +17,7 @@ pub mod linux_host_verification;
 pub mod mcp_readiness;
 pub mod restore_identity;
 pub mod runtime_binding;
+pub mod tool_broker_authority;
 pub mod tool_ledger;
 pub mod transaction;
 

@@ -28,7 +28,9 @@ pub mod ports;
 pub mod recovery;
 pub mod service;
 
-pub use dispatch::{DispatchError, DispatchOutcome, dispatch_operation};
+pub use dispatch::{
+    DispatchError, DispatchOutcome, dispatch_operation, dispatch_operation_authorized,
+};
 pub use permit::{SendPermit, SendPermitBinding};
 pub use ports::{Clock, FencedFactsProvider, GenerationReadiness, RecoveryFactsProvider};
 pub use recovery::{RecoveryOutcome, reopen_recovery};

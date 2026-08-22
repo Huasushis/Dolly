@@ -23,6 +23,9 @@ use dolly_canonical_json::{
     CanonicalJsonValue, ParseLimits, Sha256Digest, canonicalize, parse_core_json,
 };
 use dolly_schema::SchemaValidator;
+use dolly_storage::tool_broker_authority::{
+    ToolBrokerAuthorityError, ToolDispatchAuthority, validate_dispatch_binding,
+};
 use dolly_storage::tool_ledger::{
     CasKey, CasOutcome, TransportCorrelation, cas_terminal, load_exact,
 };
@@ -105,6 +108,8 @@ pub enum ServiceOutcome {
 pub enum ServiceError {
     /// The committed row could not support the requested transition.
     InvalidRecord,
+    /// The producer's registry/generation permission did not match the row.
+    Authority(ToolBrokerAuthorityError),
     /// Storage failure (including corruption and lost commits).
     Storage(StorageError),
 }
@@ -122,22 +127,40 @@ impl ToolDispatchService {
 
     /// Consume `permit` exactly once and settle one operation.
     ///
-    /// 1. The permit is consumed (move semantics: compile-time single use).
-    /// 2. The authoritative row must still be `DISPATCHED`; otherwise
-    ///    `Stale`, with NO transport call.
-    /// 3. `sha256(request_bytes)` must equal the permit's outbound digest;
-    ///    otherwise fail closed via the existing ledger transition
-    ///    authority (`cas_terminal` to `UNKNOWN`) with NO transport call.
-    /// 4. The transport is called AT MOST ONCE with the exact verified
-    ///    request bytes.
-    /// 5. The response must pass the byte, depth, member, schema, and
-    ///    correlation checks to settle `SUCCEEDED`/`FAILED`; any other
-    ///    post-dispatch outcome settles `UNKNOWN`. `cas_terminal` is the
-    ///    only writer, so no downstream fact can authorize a fresh permit,
-    ///    generation rotation, or replay.
+    /// This low-level form is retained for the existing pure ledger tests.
+    /// A Host-facing caller MUST use [`Self::dispatch_authorized`] so the
+    /// storage-produced registry/generation authority is checked before the
+    /// transport boundary.
     pub fn dispatch(
         &self,
         db: &mut Database,
+        permit: SendPermit,
+        request_bytes: &[u8],
+        transport: &mut dyn ToolTransport,
+    ) -> Result<ServiceOutcome, ServiceError> {
+        self.dispatch_inner(db, None, permit, request_bytes, transport)
+    }
+
+    /// Consume an authority-bound permit and settle one operation.
+    ///
+    /// The registry/generation producer is checked before any transport call.
+    /// A mismatch consumes the in-memory permit but mutates neither the ledger
+    /// nor the transport; no downstream result can manufacture a replacement.
+    pub fn dispatch_authorized(
+        &self,
+        db: &mut Database,
+        authority: &ToolDispatchAuthority,
+        permit: SendPermit,
+        request_bytes: &[u8],
+        transport: &mut dyn ToolTransport,
+    ) -> Result<ServiceOutcome, ServiceError> {
+        self.dispatch_inner(db, Some(authority), permit, request_bytes, transport)
+    }
+
+    fn dispatch_inner(
+        &self,
+        db: &mut Database,
+        authority: Option<&ToolDispatchAuthority>,
         permit: SendPermit,
         request_bytes: &[u8],
         transport: &mut dyn ToolTransport,
@@ -155,6 +178,15 @@ impl ToolDispatchService {
             return Ok(ServiceOutcome::Stale {
                 authoritative: Some(current),
             });
+        }
+        if let Some(authority) = authority {
+            validate_dispatch_binding(
+                authority,
+                current.operation_binding.config_revision as i64,
+                &current.operation_binding.tool_server_id,
+                current.operation_binding.tool_server_generation,
+            )
+            .map_err(ServiceError::Authority)?;
         }
 
         if Sha256Digest::compute(request_bytes) != binding.outbound_digest {
