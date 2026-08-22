@@ -14,6 +14,7 @@ pub mod database;
 pub mod error;
 pub mod host_authority;
 pub mod linux_host_verification;
+pub mod mcp_readiness;
 pub mod restore_identity;
 pub mod runtime_binding;
 pub mod tool_ledger;
