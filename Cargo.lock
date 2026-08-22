@@ -209,8 +209,10 @@ name = "dolly-storage"
 version = "0.1.0"
 dependencies = [
  "dolly-canonical-json",
+ "dolly-core-domain",
  "dolly-core-reducer",
  "dolly-tool-broker",
+ "getrandom",
  "libc",
  "libsqlite3-sys",
  "rusqlite",
