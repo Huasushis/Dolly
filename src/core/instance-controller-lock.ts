@@ -191,6 +191,16 @@ export class InstanceControllerLock {
     }
     const directory = canonicalDirectory(options.directory);
     validateInstanceId(options.instanceId);
+    // The retired pre-cutover callers supplied a fixed `controllerId`; the
+    // live generation is now minted here. Refuse any such object rather than
+    // silently ignore the field, so a dead callsite can never believe its
+    // supplied controller identity survived the cutover.
+    if ("controllerId" in options) {
+      throw new InstanceControllerLockError(
+        "CONTROLLER_LOCK_INVALID",
+        "controllerId is retired; the live controllerGenerationId is minted by the lock",
+      );
+    }
     const processId = options.processId ?? process.pid;
     if (!Number.isSafeInteger(processId) || processId <= 0) {
       throw new InstanceControllerLockError(

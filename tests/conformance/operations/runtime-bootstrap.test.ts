@@ -23,7 +23,6 @@ import {
 
 const INSTANCE_ID = "11111111-1111-4111-8111-111111111111";
 const FIRST_CONTROLLER = "22222222-2222-4222-8222-222222222222";
-const SECOND_CONTROLLER = "33333333-3333-4333-8333-333333333333";
 const REPLACEMENT_INSTANCE_ID = "44444444-4444-4444-8444-444444444444";
 const NOW = "2026-07-24T13:00:00.000Z";
 
@@ -122,7 +121,6 @@ describe("production runtime bootstrap", () => {
       configPath,
       registryDirectory,
       defaultStateRoot,
-      controllerId: FIRST_CONTROLLER,
       processId: 101,
       now: () => NOW,
     });
@@ -164,7 +162,6 @@ describe("production runtime bootstrap", () => {
       configPath,
       registryDirectory,
       defaultStateRoot,
-      controllerId: FIRST_CONTROLLER,
       processId: 101,
       now: () => NOW,
     })).rejects.toMatchObject({
@@ -180,7 +177,6 @@ describe("production runtime bootstrap", () => {
       configPath,
       registryDirectory,
       defaultStateRoot,
-      controllerId: FIRST_CONTROLLER,
       processId: 101,
       now: () => NOW,
     });
@@ -214,7 +210,6 @@ describe("production runtime bootstrap", () => {
       configPath,
       registryDirectory,
       defaultStateRoot,
-      controllerId: FIRST_CONTROLLER,
       processId: 101,
       now: () => NOW,
     });
@@ -222,7 +217,6 @@ describe("production runtime bootstrap", () => {
       configPath,
       registryDirectory,
       defaultStateRoot,
-      controllerId: SECOND_CONTROLLER,
       processId: 202,
       now: () => NOW,
     })).rejects.toMatchObject({
@@ -234,7 +228,6 @@ describe("production runtime bootstrap", () => {
       configPath,
       registryDirectory,
       defaultStateRoot,
-      controllerId: SECOND_CONTROLLER,
       processId: 202,
       now: () => NOW,
     });
@@ -273,7 +266,6 @@ describe("production runtime bootstrap", () => {
       configPath,
       registryDirectory,
       defaultStateRoot,
-      controllerId: SECOND_CONTROLLER,
       processId: 202,
       now: () => NOW,
     });
@@ -343,7 +335,6 @@ describe("production runtime bootstrap", () => {
       configPath,
       registryDirectory,
       defaultStateRoot,
-      controllerId: FIRST_CONTROLLER,
       processId: 101,
       now: () => NOW,
     })).rejects.toMatchObject({
@@ -359,7 +350,6 @@ describe("production runtime bootstrap", () => {
       configPath,
       registryDirectory,
       defaultStateRoot,
-      controllerId: FIRST_CONTROLLER,
       processId: 101,
       now: () => NOW,
     });
@@ -370,7 +360,6 @@ describe("production runtime bootstrap", () => {
       configPath,
       registryDirectory,
       defaultStateRoot,
-      controllerId: SECOND_CONTROLLER,
       processId: 202,
       now: () => NOW,
     })).rejects.toMatchObject({

@@ -70,7 +70,6 @@ export interface OpenDollyRuntimeOptions extends DollyRuntimeDirectories {
   readonly nextDeliveryId?: (
     kind: "delivery" | "module-job" | "run" | "claim" | "lease" | "dead-letter",
   ) => string;
-  readonly controllerId?: string;
   readonly processId?: number;
 }
 
@@ -252,7 +251,6 @@ export async function openDollyRuntime(
   const controllerLock = await InstanceControllerLock.acquire({
     directory: join(resolve(options.registryDirectory), "controllers"),
     instanceId: inspected.instanceId,
-    ...(options.controllerId === undefined ? {} : { controllerId: options.controllerId }),
     ...(options.processId === undefined ? {} : { processId: options.processId }),
     now,
   });

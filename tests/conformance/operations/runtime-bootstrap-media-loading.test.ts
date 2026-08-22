@@ -22,7 +22,6 @@ import {
 } from "../../../src/core/runtime-config.js";
 
 const INSTANCE_ID = "11111111-1111-4111-8111-111111111111";
-const CONTROLLER_ID = "22222222-2222-4222-8222-222222222222";
 const NOW = "2026-07-24T13:00:00.000Z";
 
 class DeleteThenFailByteStore implements MediaByteStore {
@@ -85,7 +84,6 @@ describe("runtime Media dependency loading", () => {
       configPath,
       registryDirectory,
       defaultStateRoot,
-      controllerId: CONTROLLER_ID,
       processId: 101,
       now: () => NOW,
       ...(mediaInspector === undefined ? {} : { mediaInspector }),
