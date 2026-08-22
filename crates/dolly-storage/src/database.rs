@@ -130,6 +130,12 @@ impl Database {
         &self.connection
     }
 
+    /// Mutable access to the single writer connection, used by transaction
+    /// API slices (e.g. the Tool-call ledger) that own their transactions.
+    pub fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.connection
+    }
+
     pub fn configuration(&self) -> &ConnectionConfiguration {
         &self.configuration
     }
@@ -374,7 +380,7 @@ fn query_pragma<T: rusqlite::types::FromSql>(
     connection.query_row(&format!("PRAGMA {pragma};"), [], |row| row.get(0))
 }
 
-fn map_sqlite_error(error: rusqlite::Error) -> StorageError {
+pub(crate) fn map_sqlite_error(error: rusqlite::Error) -> StorageError {
     use rusqlite::{Error, ErrorCode};
     match error {
         Error::SqliteFailure(inner, _) => match inner.code {

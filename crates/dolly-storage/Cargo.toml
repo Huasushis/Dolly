@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 dolly-canonical-json = { path = "../dolly-canonical-json" }
 dolly-core-reducer = { path = "../dolly-core-reducer" }
+dolly-tool-broker = { path = "../dolly-tool-broker" }
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
 libsqlite3-sys = { version = "0.37.0", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

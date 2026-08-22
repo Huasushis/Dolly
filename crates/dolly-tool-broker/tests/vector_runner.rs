@@ -11,9 +11,11 @@ use std::{
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_tool_broker::{
-    AdmissionOutcome, DispatchDisposition, DurableDispatchRow, DurableDispatchRowSchemaTag,
-    IdempotencyPolicy, InvokeCandidate, InvokeOutcome, LedgerState, ResolutionBackend,
-    StatusOutcome, ToolErrorCode, admit_config, evaluate_invoke, lookup_status, recover_operation,
+    AdmissionOutcome, ConfirmationDecision, DispatchDisposition, IdempotencyPolicy,
+    InvokeCandidate, InvokeOutcome, LedgerState, RecoveryFacts, ResolutionBackend, SideEffectClass,
+    StatusOutcome, ToolCallLedgerRecord, ToolCallLedgerRecordSchemaTag, ToolErrorCode,
+    ToolOperationBinding, ToolOperationBindingSchemaTag, admit_config, evaluate_invoke,
+    lookup_status, recover_operation,
 };
 use serde_json::{Map, Value, json};
 
@@ -107,6 +109,141 @@ impl ResolutionBackend for SpyResolution {
 
 fn digest_hex(full: &str) -> Sha256Digest {
     full.parse().expect("valid sha256 digest string")
+}
+
+/// Whether the recovered row's outbound digest is taken from the vector's
+/// initial value (TST-TOOL-001/002 pin an exact wire digest) or recomputed
+/// from the binding.
+#[derive(Clone)]
+enum OutboundMode {
+    Exact(Sha256Digest),
+}
+
+/// Canonical closed `Server` contract fixture (spec §5 `server_contract`)
+/// with the given tool alias → `upstream_name`.
+fn server_contract_fixture(
+    tool_alias: &str,
+    upstream_name: &str,
+) -> dolly_canonical_json::CanonicalJsonObject {
+    let server = json!({
+        "enabled": true,
+        "adapter": "mcp",
+        "protocol_version": "2025-06-18",
+        "transport": {
+            "kind": "stdio",
+            "package_id": "org.dolly.tools.fs",
+            "package_version": "1.0.0",
+            "package_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "executable": "bin/dolly-fs-tools",
+            "executable_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "args": ["--stdio"],
+            "secret_bindings": {}
+        },
+        "allowed_modules": ["module-a"],
+        "limits": {
+            "startup_timeout_ms": 10000,
+            "request_timeout_ms": 30000,
+            "max_concurrency": 4,
+            "max_request_bytes": 1048576,
+            "max_response_bytes": 4194304
+        },
+        "tools": {
+            tool_alias: {
+                "upstream_name": upstream_name,
+                "description": "fixture tool",
+                "input_schema": {"type": "object", "additionalProperties": false, "properties": {}},
+                "input_schema_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+                "output_schema": {"type": "object", "additionalProperties": false, "properties": {}},
+                "output_schema_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "side_effect_class": "non_idempotent_write",
+                "idempotency": {"kind": "none"},
+                "requires_confirmation": false,
+                "enabled": true
+            }
+        }
+    });
+    serde_json::from_value(server).expect("server contract fixture is canonical")
+}
+
+fn arguments_fixture() -> Value {
+    json!({"path": "notes/example.txt"})
+}
+
+/// Facts that make a crashed `DISPATCHED`/unfenced row ambiguous.
+fn unknown_facts() -> RecoveryFacts {
+    RecoveryFacts {
+        zero_bytes_proved: false,
+        exact_generation_ready: false,
+        deadline_expired: false,
+    }
+}
+
+/// Build a closed `ToolCallLedgerRecord` for a vector initial state. `outbound`
+/// pins the wire digest when the vector declares one (the runner then compares
+/// the reopened scenario to that same value with `unchanged`).
+#[allow(clippy::too_many_arguments)]
+fn ledger_test_row(
+    state: LedgerState,
+    terminal_result: Option<dolly_tool_broker::ToolResult>,
+    contract: dolly_canonical_json::CanonicalJsonObject,
+    side_effect_class: SideEffectClass,
+    idempotency: IdempotencyPolicy,
+    idempotency_key: Option<String>,
+    arguments: Value,
+    operation_id: &str,
+    request_digest: Sha256Digest,
+    outbound: OutboundMode,
+) -> ToolCallLedgerRecord {
+    let binding = ToolOperationBinding {
+        schema: ToolOperationBindingSchemaTag,
+        instance_id: "c-inst-0001".into(),
+        module_id: "module-a".into(),
+        operation_id: operation_id.into(),
+        tool_transaction_id: "0198ab31-6c44-7e8a-b2bb-000000000099".into(),
+        activation_id: "0198ab31-6c44-7e8a-b2bb-000000000101".into(),
+        activation_lease_generation: 1,
+        config_revision: 11,
+        tool_server_id: "fs".into(),
+        tool_name: "read-file".into(),
+        tool_schema_digest: digest_hex(
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        ),
+        arguments,
+        side_effect_class,
+        idempotency,
+        idempotency_key,
+        authorized_deadline: "2026-08-21T00:00:00.000000Z".into(),
+        request_digest,
+        tool_server_generation: 7,
+        server_request_id: "0198ab31-6c44-7e8a-b2bb-000000000451".into(),
+        server_contract: contract,
+        confirmation_decision: ConfirmationDecision::NotRequired,
+    };
+    let (outbound_digest, ledger_revision) = match state {
+        LedgerState::Authorized => (None, 1),
+        LedgerState::Dispatched | LedgerState::Succeeded | LedgerState::Unknown => {
+            let OutboundMode::Exact(digest) = outbound;
+            (Some(digest), 3)
+        }
+        LedgerState::Failed => (None, 2),
+    };
+    let ledger_revision = if state == LedgerState::Dispatched {
+        2
+    } else {
+        ledger_revision
+    };
+    ToolCallLedgerRecord {
+        schema: ToolCallLedgerRecordSchemaTag,
+        ledger_revision,
+        state,
+        operation_binding: binding.clone(),
+        operation_digest: binding.operation_digest(),
+        outbound_digest,
+        terminal_result_digest: terminal_result
+            .as_ref()
+            .map(|result| canonicalize(result).expect("canonicalizable").1),
+        terminal_result,
+    }
 }
 
 /// Closed registry config for `module-a`: one enabled `mcp` server with no
@@ -251,28 +388,27 @@ fn run_tst_tool_001(vector: &Value) -> (Value, Vec<Value>) {
     let initial = &vector["initial"];
     assert_eq!(initial["side_effect_class"], "non_idempotent_write");
     assert_eq!(initial["ledger_state"], "DISPATCHED");
+    assert_eq!(initial["ledger_revision"], 2);
 
     // Durable dispatch marker crossed, transport disconnect before the
     // authoritative result: recovery must be terminal UNKNOWN /
     // TOOL_EXTERNAL_OUTCOME_UNKNOWN with zero automatic retries, and the
     // emitted event is ToolOutcomeUnknown (never a re-dispatch).
-    let row = DurableDispatchRow {
-        schema: DurableDispatchRowSchemaTag,
-        operation_id: "0198ab31-6c44-7e8a-b2bb-000000000341".into(),
-        request_digest: digest_hex(
+    let row = ledger_test_row(
+        LedgerState::Dispatched,
+        None,
+        server_contract_fixture("read-file", "read_file"),
+        SideEffectClass::NonIdempotentWrite,
+        IdempotencyPolicy::None,
+        None,
+        arguments_fixture(),
+        "0198ab31-6c44-7e8a-b2bb-000000000341",
+        digest_hex("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        OutboundMode::Exact(digest_hex(
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ),
-        operation_digest: digest_hex(
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        ),
-        tool_server_generation: 7,
-        ledger_state: LedgerState::Dispatched,
-        transport_eligible_byte_count: 1,
-        transport_sent_byte_count: 1,
-        server_effect_count: 0,
-        result: None,
-    };
-    let disposition = recover_operation(&row);
+        )),
+    );
+    let disposition = recover_operation(&row, &unknown_facts());
     let recovered_result = match &disposition {
         DispatchDisposition::Unknown { result } => result,
         other => panic!("lost DISPATCHED result must be UNKNOWN, got {other:?}"),
@@ -282,7 +418,18 @@ fn run_tst_tool_001(vector: &Value) -> (Value, Vec<Value>) {
     let mut scenario = Map::new();
     scenario.insert("outcome".into(), json!("unknown_without_replay"));
     scenario.insert("ledger_state".into(), json!("UNKNOWN"));
+    scenario.insert("ledger_revision".into(), json!(3));
+    scenario.insert(
+        "outbound_digest".into(),
+        json!(
+            row.outbound_digest
+                .expect("DISPATCHED row carries outbound")
+                .to_canonical_string()
+        ),
+    );
     scenario.insert("automatic_retry_count".into(), json!(0));
+    scenario.insert("automatic_redispatch_count".into(), json!(0));
+    scenario.insert("recreated_send_permit_count".into(), json!(0));
     scenario.insert(
         "result".into(),
         serde_json::to_value(recovered_result.clone()).unwrap(),
@@ -312,7 +459,7 @@ fn run_tst_tool_002(vector: &Value) -> (Value, Vec<Value>) {
 
     // Pre-dispatch authorization exactly once (argument-key spy0 ordering:
     // the key gate passes before the backend seam, then resolution once).
-    let candidate = tst_tool_002_candidate(Some(&idempotency_key), arguments);
+    let candidate = tst_tool_002_candidate(Some(&idempotency_key), arguments.clone());
     let mut resolution = CoinBackend { calls: 0 };
     let authorized = match evaluate_invoke(&registry, "module-a", &candidate, None, &mut resolution)
     {
@@ -330,19 +477,33 @@ fn run_tst_tool_002(vector: &Value) -> (Value, Vec<Value>) {
     // Durable dispatch marker crossed, response lost before persist: the
     // vector's initial ledger_state DISPATCHED with server_effect_count 1
     // and authoritative_response_lost = true.
-    let row = DurableDispatchRow {
-        schema: DurableDispatchRowSchemaTag,
-        operation_id: initial["operation_id"].as_str().unwrap().to_owned(),
-        request_digest: candidate.request_digest,
+    let row = ledger_test_row(
+        LedgerState::Dispatched,
+        None,
+        server_contract_fixture("read-file", "read_file"),
+        SideEffectClass::IdempotentWrite,
+        IdempotencyPolicy::ArgumentKey {
+            argument_pointer: pointer.to_owned(),
+        },
+        Some(idempotency_key),
+        arguments,
+        initial["operation_id"].as_str().unwrap(),
+        candidate.request_digest,
+        OutboundMode::Exact(
+            initial["outbound_digest"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
+        ),
+    );
+    // The frozen stage-2 operation digest from the authorized resolution
+    // (the vector's request/operation digests are the authority).
+    let row = ToolCallLedgerRecord {
         operation_digest: authorized.operation_digest,
-        tool_server_generation: authorized.tool_server_generation,
-        ledger_state: LedgerState::Dispatched,
-        transport_eligible_byte_count: 1,
-        transport_sent_byte_count: 1,
-        server_effect_count: initial["server_effect_count"].as_u64().unwrap(),
-        result: None,
+        ..row
     };
-    let disposition = recover_operation(&row);
+    let disposition = recover_operation(&row, &unknown_facts());
     let recovered_result = match &disposition {
         DispatchDisposition::Unknown { result } => result,
         other => panic!("lost authoritative result must be UNKNOWN, got {other:?}"),
@@ -354,9 +515,23 @@ fn run_tst_tool_002(vector: &Value) -> (Value, Vec<Value>) {
         "outcome".into(),
         json!("argument_key_does_not_authorize_redispatch"),
     );
-    scenario.insert("operation_id".into(), json!(row.operation_id));
+    scenario.insert(
+        "operation_id".into(),
+        json!(row.operation_binding.operation_id),
+    );
+    scenario.insert("ledger_revision".into(), json!(3));
+    scenario.insert(
+        "outbound_digest".into(),
+        json!(
+            row.outbound_digest
+                .as_ref()
+                .expect("DISPATCHED row carries outbound")
+                .to_canonical_string()
+        ),
+    );
+    scenario.insert("recreated_send_permit_count".into(), json!(0));
     scenario.insert("automatic_redispatch_count".into(), json!(0));
-    scenario.insert("server_effect_count".into(), json!(row.server_effect_count));
+    scenario.insert("server_effect_count".into(), json!(1));
     scenario.insert("ledger_state".into(), json!("UNKNOWN"));
     scenario.insert(
         "result".into(),
@@ -365,7 +540,7 @@ fn run_tst_tool_002(vector: &Value) -> (Value, Vec<Value>) {
 
     let emitted = vec![json!({
         "event": "ToolOutcomeUnknown",
-        "operation_id": row.operation_id,
+        "operation_id": row.operation_binding.operation_id,
     })];
     (Value::Object(scenario), emitted)
 }

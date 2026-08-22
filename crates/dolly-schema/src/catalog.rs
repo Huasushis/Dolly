@@ -3,7 +3,7 @@ use dolly_canonical_json::{
     Sha256Digest,
 };
 
-/// The embedded 72-schema catalog, compiled in as a JSON array.
+/// The embedded 74-schema catalog, compiled in as a JSON array.
 pub const EMBEDDED_SCHEMA_CATALOG_JSON: &str = include_str!("embedded-schema-catalog.json");
 
 /// One catalog entry: the `$id` and the schema document.
@@ -12,13 +12,13 @@ pub struct CatalogEntry {
     pub schema: CanonicalJsonObject,
 }
 
-/// The parsed catalog of 72 unique schema documents, indexed by `$id`.
+/// The parsed catalog of 74 unique schema documents, indexed by `$id`.
 pub struct SchemaCatalog {
     entries: Vec<CatalogEntry>,
 }
 
 impl SchemaCatalog {
-    /// Load the embedded catalog, parsing and verifying all 72 schemas.
+    /// Load the embedded catalog, parsing and verifying all 74 schemas.
     pub fn load() -> Result<Self, CanonicalError> {
         // Parse through the Core JSON parser to reject duplicates etc.
         let json_value = dolly_canonical_json::parse_core_json(
@@ -56,9 +56,9 @@ impl SchemaCatalog {
         }
 
         // Verify count
-        if entries.len() != 72 {
+        if entries.len() != 74 {
             return Err(CanonicalError::invalid_json(format!(
-                "embedded schema catalog must contain exactly 72 schemas, got {}",
+                "embedded schema catalog must contain exactly 74 schemas, got {}",
                 entries.len()
             )));
         }

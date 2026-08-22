@@ -15,12 +15,14 @@ pub mod result;
 pub mod status;
 pub mod version;
 
-/// The fixed durable dispatch journal discriminator value.
-pub use dispatch::DURABLE_DISPATCH_ROW_SCHEMA;
+/// The fixed durable ledger record discriminator value and the closed
+/// binding discriminator (re-exported from `invoke`).
 pub use dispatch::{
-    DispatchDisposition, DurableDispatchRow, DurableDispatchRowSchemaTag,
-    EVENT_TOOL_DISPATCH_PROVED_NOT_APPLIED, EVENT_TOOL_OUTCOME_UNKNOWN, LedgerState,
-    recover_operation,
+    ConfirmationDecision, DispatchDisposition, EVENT_TOOL_DISPATCH_PROVED_NOT_APPLIED,
+    EVENT_TOOL_OPERATION_DISPATCHED, EVENT_TOOL_OUTCOME_UNKNOWN, LedgerRecordError, LedgerState,
+    RecoveryFacts, TOOL_CALL_LEDGER_RECORD_SCHEMA, TOOL_OPERATION_BINDING_SCHEMA,
+    ToolCallLedgerRecord, ToolCallLedgerRecordSchemaTag, ToolOperationBinding,
+    ToolOperationBindingSchemaTag, recover_operation,
 };
 
 pub use invoke::{
