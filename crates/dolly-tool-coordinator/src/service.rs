@@ -1,0 +1,369 @@
+//! Tool dispatch service (tool-broker §6/§8, REQ-TOOL-002/006,
+//! INV-STORAGE-017).
+//!
+//! `ToolDispatchService` is the transport-facing half of the coordinator:
+//! it consumes ONE non-Clone [`SendPermit`] exactly once, dispatches through
+//! the injected Host transport AT MOST ONCE, and settles the authoritative
+//! row only after the closed-response checks pass. Timeout, disconnect,
+//! correlation, schema, and bound failures after dispatch are terminal
+//! `UNKNOWN` (`TOOL_EXTERNAL_OUTCOME_UNKNOWN`); the service never retries or
+//! redispatches, and no downstream response/ACK ever authorizes a new
+//! permit, generation rotation, or replay.
+//!
+//! The caller supplies the expected request bytes along with the permit;
+//! the service verifies `sha256(request_bytes) == binding.outbound_digest`
+//! BEFORE the transport is consulted. On mismatch the service fails closed
+//! through the existing ledger transition authority (the same
+//! `cas_terminal` used by [`crate::dispatch_operation`]) and never touches
+//! the transport.
+
+use dolly_canonical_json::{
+    CanonicalJsonValue, ParseLimits, Sha256Digest, canonicalize, parse_core_json,
+};
+use dolly_storage::tool_ledger::{
+    CasKey, CasOutcome, TransportCorrelation, cas_terminal, load_exact,
+};
+use dolly_storage::{Database, StorageError};
+use dolly_tool_broker::{
+    ErrorOutcome, LedgerState, ToolCallLedgerRecord, ToolError, ToolErrorCode, ToolResult,
+    ToolStatus,
+};
+use serde::de::IntoDeserializer;
+use serde::{Deserialize, Serialize};
+
+use crate::permit::{SendPermit, SendPermitBinding};
+
+/// Closed bounds on a response the service will admit (tool-broker §3/§6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchLimits {
+    /// Maximum admitted response frame size in bytes.
+    pub max_response_bytes: usize,
+    /// Maximum total JSON object members across the whole response tree.
+    pub max_members: usize,
+    /// Maximum JSON nesting depth (enforced during parse).
+    pub max_depth: u16,
+}
+
+/// The only downstream input a [`ToolDispatchService`] reads: one
+/// request/response exchange or its absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportOutcome {
+    /// A complete response frame arrived with exactly these bytes.
+    Response(Vec<u8>),
+    /// No response within the Host-configured deadline.
+    Timeout,
+    /// The connection dropped before a complete response frame arrived.
+    Disconnect,
+    /// Transport-level failure (framing, protocol, credential, …).
+    Error(String),
+}
+
+/// Transport injected by the Host, fake-testable. The service calls it AT
+/// MOST ONCE per [`ToolDispatchService::dispatch`].
+pub trait ToolTransport {
+    /// Exactly one request/response exchange. `request_bytes` are the
+    /// exact bytes the service verified against the permit's outbound
+    /// digest before this call.
+    fn call(&mut self, request_bytes: &[u8]) -> TransportOutcome;
+}
+
+/// The result of one [`ToolDispatchService::dispatch`].
+#[derive(Debug)]
+pub enum ServiceOutcome {
+    /// A correlated, closed, bounded response committed durably as
+    /// `SUCCEEDED`. The result carries the admitted upstream output.
+    Succeeded {
+        record: ToolCallLedgerRecord,
+        result: ToolResult,
+    },
+    /// A correlated, closed, bounded response with an authoritative
+    /// upstream error committed durably as `FAILED`
+    /// (`TOOL_UPSTREAM_FAILED`, `not_applied`).
+    Failed {
+        record: ToolCallLedgerRecord,
+        result: ToolResult,
+    },
+    /// A post-dispatch failure class (timeout, disconnect, correlation,
+    /// schema, or bound) committed durably as `UNKNOWN`
+    /// (`TOOL_EXTERNAL_OUTCOME_UNKNOWN`).
+    Unknown {
+        record: ToolCallLedgerRecord,
+        result: ToolResult,
+    },
+    /// The authoritative row was not `DISPATCHED` (already settled, or
+    /// absent): nothing was mutated and the transport was NOT called.
+    Stale {
+        authoritative: Option<ToolCallLedgerRecord>,
+    },
+}
+
+/// Service failure; nothing was mutated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceError {
+    /// The committed row could not support the requested transition.
+    InvalidRecord,
+    /// Storage failure (including corruption and lost commits).
+    Storage(StorageError),
+}
+
+/// The single transport-facing entry point of the coordinator.
+pub struct ToolDispatchService {
+    limits: DispatchLimits,
+}
+
+impl ToolDispatchService {
+    /// Create the service with the closed admission bounds.
+    pub fn new(limits: DispatchLimits) -> Self {
+        Self { limits }
+    }
+
+    /// Consume `permit` exactly once and settle one operation.
+    ///
+    /// 1. The permit is consumed (move semantics: compile-time single use).
+    /// 2. The authoritative row must still be `DISPATCHED`; otherwise
+    ///    `Stale`, with NO transport call.
+    /// 3. `sha256(request_bytes)` must equal the permit's outbound digest;
+    ///    otherwise fail closed via the existing ledger transition
+    ///    authority (`cas_terminal` to `UNKNOWN`) with NO transport call.
+    /// 4. The transport is called AT MOST ONCE with the exact verified
+    ///    request bytes.
+    /// 5. The response must pass the byte, depth, member, schema, and
+    ///    correlation checks to settle `SUCCEEDED`/`FAILED`; any other
+    ///    post-dispatch outcome settles `UNKNOWN`. `cas_terminal` is the
+    ///    only writer, so no downstream fact can authorize a fresh permit,
+    ///    generation rotation, or replay.
+    pub fn dispatch(
+        &self,
+        db: &mut Database,
+        permit: SendPermit,
+        request_bytes: &[u8],
+        transport: &mut dyn ToolTransport,
+    ) -> Result<ServiceOutcome, ServiceError> {
+        let binding = permit.consume();
+
+        let current = load_exact(db.connection(), &binding.module_id, &binding.operation_id)
+            .map_err(ServiceError::Storage)?;
+        let Some(current) = current else {
+            return Ok(ServiceOutcome::Stale {
+                authoritative: None,
+            });
+        };
+        if current.state != LedgerState::Dispatched {
+            return Ok(ServiceOutcome::Stale {
+                authoritative: Some(current),
+            });
+        }
+
+        if Sha256Digest::compute(request_bytes) != binding.outbound_digest {
+            // Fail closed with NO transport call: the caller did not supply
+            // the exact bytes whose digest was durably bound at dispatch.
+            let result = unknown_outcome_result(&binding);
+            return self.settle(db, &current, Terminal::unknown(result));
+        }
+
+        match transport.call(request_bytes) {
+            TransportOutcome::Response(bytes) => {
+                match self.classify(&bytes, &binding.server_request_id) {
+                    Classification::Succeeded(output) => {
+                        let result = succeeded_result(&binding, output);
+                        self.settle(db, &current, Terminal::succeeded(result))
+                    }
+                    Classification::Failed => {
+                        let result = upstream_failed_result(&binding);
+                        self.settle(db, &current, Terminal::failed(result))
+                    }
+                    Classification::Rejected => {
+                        let result = unknown_outcome_result(&binding);
+                        self.settle(db, &current, Terminal::unknown(result))
+                    }
+                }
+            }
+            TransportOutcome::Timeout
+            | TransportOutcome::Disconnect
+            | TransportOutcome::Error(_) => {
+                let result = unknown_outcome_result(&binding);
+                self.settle(db, &current, Terminal::unknown(result))
+            }
+        }
+    }
+
+    /// Classify a response frame (pure, no I/O).
+    fn classify(&self, bytes: &[u8], expected_id: &str) -> Classification {
+        if bytes.len() > self.limits.max_response_bytes {
+            return Classification::Rejected;
+        }
+        let Ok(limits) = ParseLimits::new(self.limits.max_depth) else {
+            return Classification::Rejected;
+        };
+        let tree = match parse_core_json(bytes, limits) {
+            Ok(tree) => tree,
+            Err(_) => return Classification::Rejected,
+        };
+        if count_members(&tree) > self.limits.max_members {
+            return Classification::Rejected;
+        }
+        let envelope = match ToolResponseEnvelope::deserialize(tree.into_deserializer()) {
+            Ok(envelope) => envelope,
+            Err(_) => return Classification::Rejected,
+        };
+        // Closed protocol/correlation: JSON-RPC 2.0 and the exact id.
+        if envelope.jsonrpc != "2.0" || envelope.id != expected_id {
+            return Classification::Rejected;
+        }
+        match (envelope.result, envelope.error) {
+            (Some(output), None) => Classification::Succeeded(output),
+            (None, Some(_)) => Classification::Failed,
+            _ => Classification::Rejected, // zero or both members: closed schema
+        }
+    }
+
+    /// Settle a `DISPATCHED` row to the given terminal via `cas_terminal`
+    /// (the SAME writer used by [`crate::dispatch_operation`]).
+    ///
+    /// The outcome only claims the disposition when the CAS actually
+    /// committed. A stale CAS means another writer already settled the row:
+    /// the result is `ServiceOutcome::Stale` with the authoritative row, and
+    /// this service's disposition grants nothing.
+    fn settle(
+        &self,
+        db: &mut Database,
+        current: &ToolCallLedgerRecord,
+        terminal: Terminal,
+    ) -> Result<ServiceOutcome, ServiceError> {
+        let Terminal { state, result } = terminal;
+        let transport_correlation = TransportCorrelation {
+            tool_server_id: current.operation_binding.tool_server_id.clone(),
+            tool_name: current.operation_binding.tool_name.clone(),
+            tool_server_generation: current.operation_binding.tool_server_generation,
+            server_request_id: current.operation_binding.server_request_id.clone(),
+            outbound_digest: current
+                .outbound_digest
+                .clone()
+                .ok_or(ServiceError::InvalidRecord)?,
+        };
+        let expected = CasKey {
+            module_id: current.operation_binding.module_id.clone(),
+            operation_id: current.operation_binding.operation_id.clone(),
+            expected_ledger_revision: current.ledger_revision,
+            expected_state: current.state,
+            correlation: Some(transport_correlation),
+        };
+        let terminal_digest = canonicalize(&result)
+            .map(|(_bytes, digest)| digest)
+            .map_err(|_| ServiceError::InvalidRecord)?;
+        let terminal_record = ToolCallLedgerRecord {
+            ledger_revision: 3,
+            state,
+            outbound_digest: current.outbound_digest.clone(),
+            terminal_result: Some(result.clone()),
+            terminal_result_digest: Some(terminal_digest),
+            ..current.clone()
+        };
+        match cas_terminal(db.connection_mut(), &expected, &terminal_record) {
+            Ok(CasOutcome::Committed { record }) => Ok(match state {
+                LedgerState::Succeeded => ServiceOutcome::Succeeded { record, result },
+                LedgerState::Failed => ServiceOutcome::Failed { record, result },
+                _ => ServiceOutcome::Unknown { record, result },
+            }),
+            Ok(CasOutcome::Stale { authoritative }) => Ok(ServiceOutcome::Stale {
+                authoritative: Some(authoritative),
+            }),
+            Err(error) => Err(ServiceError::Storage(error)),
+        }
+    }
+}
+
+/// Build the `SUCCEEDED` result with exact correlation evidence.
+fn succeeded_result(binding: &SendPermitBinding, output: serde_json::Value) -> ToolResult {
+    ToolResult {
+        operation_id: binding.operation_id.clone(),
+        status: ToolStatus::Succeeded,
+        output,
+        error: None,
+        server_request_id: Some(binding.server_request_id.clone()),
+    }
+}
+
+/// Build the authoritative `FAILED` result (`TOOL_UPSTREAM_FAILED`,
+/// `not_applied`, fixed message: upstream error text is untrusted data).
+fn upstream_failed_result(binding: &SendPermitBinding) -> ToolResult {
+    ToolResult {
+        operation_id: binding.operation_id.clone(),
+        status: ToolStatus::Failed,
+        output: serde_json::Value::Null,
+        error: Some(ToolError {
+            code: ToolErrorCode::UpstreamFailed,
+            retryable: false,
+            outcome: ErrorOutcome::NotApplied,
+            message: "upstream returned a terminal error with no applied disposition".into(),
+            details: Default::default(),
+        }),
+        server_request_id: Some(binding.server_request_id.clone()),
+    }
+}
+
+/// Build the terminal `UNKNOWN` result (`TOOL_EXTERNAL_OUTCOME_UNKNOWN`).
+fn unknown_outcome_result(binding: &SendPermitBinding) -> ToolResult {
+    ToolResult::unknown_outcome(binding.operation_id.clone())
+}
+
+/// One terminal disposition to commit.
+struct Terminal {
+    state: LedgerState,
+    result: ToolResult,
+}
+
+impl Terminal {
+    fn succeeded(result: ToolResult) -> Self {
+        Self {
+            state: LedgerState::Succeeded,
+            result,
+        }
+    }
+    fn failed(result: ToolResult) -> Self {
+        Self {
+            state: LedgerState::Failed,
+            result,
+        }
+    }
+    fn unknown(result: ToolResult) -> Self {
+        Self {
+            state: LedgerState::Unknown,
+            result,
+        }
+    }
+}
+
+/// The classification of one response frame.
+enum Classification {
+    Succeeded(serde_json::Value),
+    Failed,
+    Rejected,
+}
+
+/// The closed JSON-RPC 2.0 response envelope the service admits. Any other
+/// member is a schema failure; `deny_unknown_fields` keeps it closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolResponseEnvelope {
+    pub jsonrpc: String,
+    pub id: String,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<serde_json::Value>,
+}
+
+/// Total number of object members across the whole value tree. A response
+/// with more than this many members is rejected.
+fn count_members(value: &CanonicalJsonValue) -> usize {
+    match value {
+        CanonicalJsonValue::Object(map) => {
+            let mut total = map.len();
+            for (_name, member) in map.iter() {
+                total += count_members(member);
+            }
+            total
+        }
+        CanonicalJsonValue::Array(items) => items.iter().map(count_members).sum(),
+        _ => 0,
+    }
+}

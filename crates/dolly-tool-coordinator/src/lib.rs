@@ -14,15 +14,25 @@
 //!   disposition; release at most one permit, only after a committed CAS;
 //! - [`reopen_recovery`] — deterministic enumeration + pure decision +
 //!   disposition application across every nonterminal row after reopen;
+//! - [`service::ToolDispatchService`] — consume one permit exactly once,
+//!   dispatch through the injected fake-testable `ToolTransport` at most
+//!   once, and settle the row after closed correlation/schema/bounds checks;
+//! - [`service::ToolResponseEnvelope`] — the closed JSON-RPC response the
+//!   service admits;
 //! - [`ports::FencedFactsProvider`] — composite Host-owned facts provider;
-//! - [`SendPermit`] — the opaque one-use permit a future transport consumes.
+//! - [`SendPermit`] — the opaque one-use permit a transport consumes once.
 
 pub mod dispatch;
 pub mod permit;
 pub mod ports;
 pub mod recovery;
+pub mod service;
 
 pub use dispatch::{DispatchError, DispatchOutcome, dispatch_operation};
 pub use permit::{SendPermit, SendPermitBinding};
 pub use ports::{Clock, FencedFactsProvider, GenerationReadiness, RecoveryFactsProvider};
 pub use recovery::{RecoveryOutcome, reopen_recovery};
+pub use service::{
+    DispatchLimits, ServiceError, ServiceOutcome, ToolDispatchService, ToolResponseEnvelope,
+    ToolTransport, TransportOutcome,
+};
