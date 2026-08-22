@@ -1,14 +1,14 @@
 import { InstanceControllerLock } from "../../../../src/core/instance-controller-lock.js";
 
-const [directory, instanceId, controllerId, now] = process.argv.slice(2);
-if (!directory || !instanceId || !controllerId || !now) {
+const [directory, instanceId, generation, now] = process.argv.slice(2);
+if (!directory || !instanceId || !generation || !now) {
   throw new Error("controller lock fixture arguments are missing");
 }
 
 const lock = await InstanceControllerLock.acquire({
   directory,
   instanceId,
-  controllerId,
+  controllerGenerationIdGenerator: () => generation,
   now: () => now,
 });
 

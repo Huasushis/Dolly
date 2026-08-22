@@ -20,6 +20,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -29,6 +30,10 @@ import { join, parse, resolve } from "node:path";
 import { assertJsonValue, deepFreeze, type JsonValue } from "../core/canonical-json.js";
 import { NetworkExposurePolicy } from "../core/network-exposure.js";
 import { parseStrictJsonBytes } from "../core/strict-json.js";
+import {
+  generateRuntimeUuidV7,
+  isLowercaseUuidV7,
+} from "../core/runtime-authority-identities.js";
 
 const CONFIG_FILE_NAME = "daemon.json";
 const MAX_CONFIG_BYTES = 64 * 1024;
@@ -56,7 +61,20 @@ export interface DaemonCredentialRecord {
 }
 
 export interface DaemonConfigDocument {
+  readonly schemaVersion: "dolly.daemon-config/2";
+  /** Strict RFC9562 lowercase UUIDv7, minted once per installation. */
+  readonly daemonInstallationId: string;
+  readonly listen: {
+    readonly host: DaemonListenHost;
+    readonly port: number;
+  };
+  readonly credential: DaemonCredentialRecord;
+}
+
+/** Legacy `/1` document read ONLY by the atomic `/1 -> /2` migration. */
+export interface LegacyDaemonConfigV1Document {
   readonly schemaVersion: "dolly.daemon-config/1";
+  /** Retired lowercase UUIDv4, never reinterpreted or aliased. */
   readonly daemonId: string;
   readonly listen: {
     readonly host: DaemonListenHost;
@@ -71,7 +89,8 @@ export type DaemonConfigErrorCode =
   | "DAEMON_CONFIG_LISTEN_ADDRESS_FORBIDDEN"
   | "DAEMON_CONFIG_PERMISSIONS_INSECURE"
   | "DAEMON_CONFIG_LIMIT_EXCEEDED"
-  | "DAEMON_CONFIG_IO_FAILED";
+  | "DAEMON_CONFIG_IO_FAILED"
+  | "DAEMON_CONFIG_MIGRATION_REFUSED";
 
 export class DaemonConfigError extends Error {
   constructor(
@@ -251,20 +270,62 @@ function parseCredential(value: unknown): DaemonCredentialRecord {
 }
 
 export function parseDaemonConfigDocument(value: unknown): DaemonConfigDocument {
-  assertClosedObject(value, ["schemaVersion", "daemonId", "listen", "credential"], "daemon config");
-  if (value.schemaVersion !== "dolly.daemon-config/1") {
+  assertClosedObject(
+    value,
+    ["schemaVersion", "daemonInstallationId", "listen", "credential"],
+    "daemon config",
+  );
+  if (value.schemaVersion !== "dolly.daemon-config/2") {
     throw new DaemonConfigError(
       "DAEMON_CONFIG_DOCUMENT_INVALID",
       "daemon config schema version is unsupported",
     );
   }
   if (
-    typeof value.daemonId !== "string" ||
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value.daemonId)
+    typeof value.daemonInstallationId !== "string" ||
+    !isLowercaseUuidV7(value.daemonInstallationId)
   ) {
     throw new DaemonConfigError(
       "DAEMON_CONFIG_DOCUMENT_INVALID",
-      "daemonId must be a lowercase UUIDv4",
+      "daemonInstallationId must be a strict lowercase RFC9562 UUIDv7",
+    );
+  }
+  assertClosedObject(value.listen, ["host", "port"], "listen");
+  assertDaemonListenHost(value.listen.host);
+  assertPort(value.listen.port);
+  const credential = parseCredential(value.credential);
+  return deepFreeze({
+    schemaVersion: "dolly.daemon-config/2",
+    daemonInstallationId: value.daemonInstallationId,
+    listen: { host: value.listen.host, port: value.listen.port },
+    credential,
+  }) as DaemonConfigDocument;
+}
+
+/**
+ * Internal `/1` reader used ONLY by the atomic `/1 -> /2` migration in
+ * `DaemonConfigStore.load`. The retired UUIDv4 `daemonId` is validated here
+ * so a v1 document can be read, carried as listen/credential, and rewritten
+ * as `/2` with a newly minted UUIDv7 `daemonInstallationId`; the old UUIDv4
+ * is never reinterpreted, aliased, or reused as the installation identifier.
+ */
+function parseLegacyDaemonConfigV1Document(value: unknown): LegacyDaemonConfigV1Document {
+  assertClosedObject(value, ["schemaVersion", "daemonId", "listen", "credential"], "daemon config");
+  if (value.schemaVersion !== "dolly.daemon-config/1") {
+    throw new DaemonConfigError(
+      "DAEMON_CONFIG_DOCUMENT_INVALID",
+      "legacy daemon config schema version is not dolly.daemon-config/1",
+    );
+  }
+  if (
+    typeof value.daemonId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+      value.daemonId,
+    )
+  ) {
+    throw new DaemonConfigError(
+      "DAEMON_CONFIG_DOCUMENT_INVALID",
+      "legacy daemonId must be a lowercase UUIDv4",
     );
   }
   assertClosedObject(value.listen, ["host", "port"], "listen");
@@ -276,14 +337,80 @@ export function parseDaemonConfigDocument(value: unknown): DaemonConfigDocument 
     daemonId: value.daemonId,
     listen: { host: value.listen.host, port: value.listen.port },
     credential,
-  }) as DaemonConfigDocument;
+  }) as LegacyDaemonConfigV1Document;
+}
+
+/**
+ * Fail-closed guard for the `/1 -> /2` migration: the retired UUIDv4
+ * `daemonId` must not be referenced by any durable foreign document beside
+ * `daemon.json` itself, else the migration is refused so an old identifier is
+ * never silently reinterpreted. Each sibling durable record is scanned
+ * (bounded by the daemon config size limit) for the exact literal.
+ */
+function hasDurableForeignReferenceToLegacyDaemonId(
+  directory: string,
+  legacyDaemonId: string,
+): boolean {
+  for (const entry of readdirSync(directory)) {
+    if (entry === CONFIG_FILE_NAME || entry.startsWith(".")) continue;
+    const candidatePath = join(directory, entry);
+    try {
+      if (!statSync(candidatePath).isFile()) continue;
+      if (statSync(candidatePath).size > MAX_CONFIG_BYTES) continue;
+      const content = readFileSync(candidatePath, "utf8");
+      if (content.includes(legacyDaemonId)) return true;
+    } catch {
+      // A file that cannot be read is not evidence for or against; the
+      // migration continues with the documented stop condition only when a
+      // readable durable record actually names the old identifier.
+    }
+  }
+  return false;
+}
+
+/**
+ * Atomically migrates a read `/1` document to `/2`: preserve listen and
+ * credential, mint exactly one UUIDv7 `daemonInstallationId`, write the `/2`
+ * document with owner-only temp + fsync + rename + directory fsync, then
+ * reopen from disk so the returned value is the stable written state. The
+ * retired UUIDv4 `daemonId` is never reinterpreted or reused.
+ */
+function migrateLegacyDaemonConfigV1(
+  directory: string,
+  legacy: LegacyDaemonConfigV1Document,
+  mintInstallationId: (() => string) | undefined,
+): DaemonConfigDocument {
+  if (
+    hasDurableForeignReferenceToLegacyDaemonId(directory, legacy.daemonId)
+  ) {
+    throw new DaemonConfigError(
+      "DAEMON_CONFIG_MIGRATION_REFUSED",
+      "legacy UUIDv4 daemonId has a durable foreign reference; refusing the /1 -> /2 migration",
+    );
+  }
+  const daemonInstallationId = (mintInstallationId ?? defaultMintInstallationId)();
+  const config = parseDaemonConfigDocument({
+    schemaVersion: "dolly.daemon-config/2",
+    daemonInstallationId,
+    listen: { host: legacy.listen.host, port: legacy.listen.port },
+    credential: legacy.credential,
+  });
+  writeAtomicConfig(directory, config, /* replaceExisting */ true);
+  return config;
+}
+
+function defaultMintInstallationId(): string {
+  return generateRuntimeUuidV7({
+    now: () => Date.now(),
+    randomBytes: (size) => randomBytes(size),
+  });
 }
 
 /** Strips every credential field that could reconstruct or confirm a guess. */
 export function redactDaemonConfig(config: DaemonConfigDocument): JsonValue {
   return {
     schemaVersion: config.schemaVersion,
-    daemonId: config.daemonId,
+    daemonInstallationId: config.daemonInstallationId,
     listen: { host: config.listen.host, port: config.listen.port },
     credential: {
       username: config.credential.username,
@@ -306,7 +433,8 @@ export interface DaemonConfigStoreOptions {
   /** Owner-only directory that holds the daemon document. */
   readonly directory: string;
   readonly now?: () => string;
-  readonly nextDaemonId?: () => string;
+  /** Provides the strict RFC9562 lowercase UUIDv7 installation identifier. */
+  readonly nextDaemonInstallationId?: () => string;
   readonly randomBytes?: (size: number) => Buffer;
 }
 
@@ -353,7 +481,7 @@ function assertOwnerOnly(path: string): void {
 export class DaemonConfigStore {
   readonly #directory: string;
   readonly #now: () => string;
-  readonly #nextDaemonId: () => string;
+  readonly #nextDaemonInstallationId: () => string;
   readonly #randomBytes: (size: number) => Buffer;
 
   constructor(options: DaemonConfigStoreOptions) {
@@ -373,7 +501,8 @@ export class DaemonConfigStore {
     }
     this.#directory = absolute;
     this.#now = options.now ?? (() => new Date().toISOString());
-    this.#nextDaemonId = options.nextDaemonId ?? randomUUID;
+    this.#nextDaemonInstallationId =
+      options.nextDaemonInstallationId ?? defaultMintInstallationId;
     this.#randomBytes = options.randomBytes ?? randomBytes;
   }
 
@@ -385,6 +514,12 @@ export class DaemonConfigStore {
     return existsSync(this.path);
   }
 
+  /**
+   * Loads the daemon document. When the file holds a legacy `/1` document,
+   * it is atomically migrated to `/2` first (preserving listen and credential
+   * and minting one UUIDv7 installation identifier), then the stable written
+   * document is re-read and returned.
+   */
   load(): LoadedDaemonConfig {
     const path = this.path;
     if (!existsSync(path)) {
@@ -411,16 +546,28 @@ export class DaemonConfigStore {
         { cause: error },
       );
     }
-    const config = parseDaemonConfigDocument(
-      parseStrictJsonBytes(bytes, { maxBytes: MAX_CONFIG_BYTES, maxDepth: 8 }),
-    );
+    const parsed = parseStrictJsonBytes(bytes, { maxBytes: MAX_CONFIG_BYTES, maxDepth: 8 });
+    if (
+      isRecord(parsed) &&
+      parsed.schemaVersion === "dolly.daemon-config/1" &&
+      typeof parsed.daemonId === "string"
+    ) {
+      const legacy = parseLegacyDaemonConfigV1Document(parsed);
+      const config = migrateLegacyDaemonConfigV1(
+        this.#directory,
+        legacy,
+        this.#nextDaemonInstallationId,
+      );
+      return deepFreeze({ config, path }) as LoadedDaemonConfig;
+    }
+    const config = parseDaemonConfigDocument(parsed);
     return deepFreeze({ config, path }) as LoadedDaemonConfig;
   }
 
   /**
-   * Loads the daemon document, creating it with a fresh random account on
-   * first run. `generatedPassword` is set only when this call created the
-   * credential.
+   * Loads the daemon document, creating it with a fresh random account and a
+   * freshly minted `/2` installation identifier on first run.
+   * `generatedPassword` is set only when this call created the credential.
    */
   async loadOrInitialize(
     options: InitializeDaemonConfigOptions = {},
@@ -438,15 +585,15 @@ export class DaemonConfigStore {
         "credential.username is invalid",
       );
     }
-    const daemonId = this.#nextDaemonId();
+    const daemonInstallationId = this.#nextDaemonInstallationId();
     const { credential, password } = await this.#createCredential(username);
     const config = parseDaemonConfigDocument({
-      schemaVersion: "dolly.daemon-config/1",
-      daemonId,
+      schemaVersion: "dolly.daemon-config/2",
+      daemonInstallationId,
       listen: { host: listenHost, port: listenPort },
       credential,
     });
-    this.#writeAtomic(config, false);
+    writeAtomicConfig(this.#directory, config, false);
     return deepFreeze({
       config,
       path: this.path,
@@ -454,7 +601,7 @@ export class DaemonConfigStore {
     }) as LoadedDaemonConfig;
   }
 
-  /** Replaces the stored account with a fresh random password. */
+  /** Replaces the stored account with a fresh random password, keeping the installation identifier. */
   async rotateCredential(username?: string): Promise<LoadedDaemonConfig> {
     const current = this.load().config;
     const { credential, password } = await this.#createCredential(
@@ -465,7 +612,7 @@ export class DaemonConfigStore {
       listen: { ...current.listen },
       credential,
     });
-    this.#writeAtomic(config, true);
+    writeAtomicConfig(this.#directory, config, true);
     return deepFreeze({
       config,
       path: this.path,
@@ -509,50 +656,83 @@ export class DaemonConfigStore {
     }
     return new Date(parsed).toISOString();
   }
+}
 
-  #writeAtomic(config: DaemonConfigDocument, replaceExisting: boolean): void {
-    const value = config as unknown as JsonValue;
-    assertJsonValue(value);
-    mkdirSync(this.#directory, { recursive: true, mode: 0o700 });
-    const target = this.path;
-    const temporaryPath = join(this.#directory, `.${CONFIG_FILE_NAME}.${randomUUID()}.tmp`);
-    let descriptor: number | undefined;
-    try {
-      if (!replaceExisting && existsSync(target)) {
-        throw new DaemonConfigError(
-          "DAEMON_CONFIG_IO_FAILED",
-          "Daemon configuration already exists",
-        );
-      }
-      descriptor = openSync(temporaryPath, "wx", 0o600);
-      writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-      fsyncSync(descriptor);
-      closeSync(descriptor);
-      descriptor = undefined;
-      renameSync(temporaryPath, target);
-    } catch (error) {
-      if (error instanceof DaemonConfigError) throw error;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Owner-only temp + fsync + rename + directory fsync write. The temporary
+ * file is created with mode 0600 before any content enters the store, the
+ * rename is atomic in the same directory, and the containing directory is
+ * fsynced so the rename survives a crash (matching `instance-config-store`).
+ */
+function writeAtomicConfig(
+  directory: string,
+  config: DaemonConfigDocument,
+  replaceExisting: boolean,
+): void {
+  const value = config as unknown as JsonValue;
+  assertJsonValue(value);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const target = join(directory, CONFIG_FILE_NAME);
+  const temporaryPath = join(directory, `.${CONFIG_FILE_NAME}.${randomUUID()}.tmp`);
+  let descriptor: number | undefined;
+  try {
+    if (!replaceExisting && existsSync(target)) {
       throw new DaemonConfigError(
         "DAEMON_CONFIG_IO_FAILED",
-        "Atomic daemon configuration write failed",
-        { cause: error },
+        "Daemon configuration already exists",
       );
-    } finally {
-      if (descriptor !== undefined) {
-        try {
-          closeSync(descriptor);
-        } catch {
-          // The write failure above is the useful diagnostic.
-        }
-      }
-      if (existsSync(temporaryPath)) {
-        try {
-          unlinkSync(temporaryPath);
-        } catch {
-          // A same-directory temporary is never treated as committed state.
-        }
+    }
+    descriptor = openSync(temporaryPath, "wx", 0o600);
+    writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(temporaryPath, target);
+    fsyncDirectory(directory);
+  } catch (error) {
+    if (error instanceof DaemonConfigError) throw error;
+    throw new DaemonConfigError(
+      "DAEMON_CONFIG_IO_FAILED",
+      "Atomic daemon configuration write failed",
+      { cause: error },
+    );
+  } finally {
+    if (descriptor !== undefined) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // The write failure above is the useful diagnostic.
       }
     }
+    if (existsSync(temporaryPath)) {
+      try {
+        unlinkSync(temporaryPath);
+      } catch {
+        // A same-directory temporary is never treated as committed state.
+      }
+    }
+  }
+}
+
+/** Durably records a completed rename on POSIX; a no-op elsewhere. */
+function fsyncDirectory(directory: string): void {
+  if (process.platform === "win32") return;
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(directory, "r");
+    fsyncSync(descriptor);
+  } catch (error) {
+    throw new DaemonConfigError(
+      "DAEMON_CONFIG_IO_FAILED",
+      "Could not fsync the daemon configuration directory",
+      { cause: error },
+    );
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
   }
 }
 
