@@ -7,20 +7,22 @@
 //! inputs are the verified closed rows and the injected `RecoveryFacts`.
 
 use dolly_storage::Database;
+use dolly_storage::mcp_readiness::McpTransportReadiness;
+use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
+use dolly_storage::tool_broker_authority::{
+    ToolDispatchAuthority, revalidate_tool_dispatch_authority, validate_dispatch_binding,
+};
 use dolly_storage::tool_ledger::enumerate_nonterminal;
 
 use crate::dispatch::{DispatchError, DispatchOutcome, dispatch_operation};
 use crate::permit::SendPermit;
 use crate::ports::RecoveryFactsProvider;
 
-/// Upper bound on pure re-decisions per row during one recovery pass
-/// (AUTHORIZED -> DISPATCHED -> UNKNOWN plus a few stale discards). Exceeding
-/// it fails closed as [`DispatchError::Ambiguous`].
+/// Upper bound on pure re-decisions per row during one recovery pass.
 const MAX_DECISIONS_PER_ROW: usize = 6;
-
 /// The outcome of a full reopen recovery run.
 #[derive(Debug)]
-pub struct RecoveryOutcome {
+pub(crate) struct RecoveryOutcome {
     /// Number of nonterminal rows enumerated in deterministic
     /// `(module_id, operation_id)` order.
     pub rows_visited: usize,
@@ -34,12 +36,18 @@ pub struct RecoveryOutcome {
     pub permits: Vec<SendPermit>,
 }
 
-/// Run reopen recovery against `db` with the Host-owned facts provider.
+/// Run reopen recovery with one producer-issued authority and the Host-owned
+/// facts provider. Authority and current premises are revalidated before every
+/// row disposition, so stale recovery cannot reach CAS or release a permit.
 ///
-/// Fails closed: a corrupt row, storage error, or unbounded stale loop stops
-/// the whole recovery with `Err` and no partial terminalization record.
-pub fn reopen_recovery(
+/// Fails closed: a corrupt row, storage error, stale authority, or unbounded
+/// stale loop stops the whole recovery with `Err`.
+pub(crate) fn reopen_recovery(
     db: &mut Database,
+    authority: &ToolDispatchAuthority,
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    readiness: &McpTransportReadiness,
     facts: &dyn RecoveryFactsProvider,
 ) -> Result<RecoveryOutcome, DispatchError> {
     let rows = enumerate_nonterminal(db.connection()).map_err(DispatchError::Storage)?;
@@ -58,6 +66,19 @@ pub fn reopen_recovery(
                 return Err(DispatchError::Ambiguous);
             }
             let row_facts = facts.facts_for(&current);
+            revalidate_tool_dispatch_authority(
+                db,
+                authority,
+                runtime_binding,
+                process_generation,
+                readiness,
+            )?;
+            validate_dispatch_binding(
+                authority,
+                current.operation_binding.config_revision as i64,
+                &current.operation_binding.tool_server_id,
+                current.operation_binding.tool_server_generation,
+            )?;
             let outcome_step = dispatch_operation(db, &current, &row_facts)?;
             match outcome_step {
                 DispatchOutcome::Dispatched {

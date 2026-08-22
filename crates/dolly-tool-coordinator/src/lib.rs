@@ -29,6 +29,7 @@ pub mod ports;
 pub mod recovery;
 pub mod service;
 
+#[cfg(test)]
 pub(crate) use dispatch::dispatch_operation;
 
 #[cfg(test)]
@@ -39,7 +40,8 @@ mod service_tests;
 pub use dispatch::{DispatchError, DispatchOutcome, dispatch_operation_authorized};
 pub use permit::{SendPermit, SendPermitBinding};
 pub use ports::{Clock, FencedFactsProvider, GenerationReadiness, RecoveryFactsProvider};
-pub use recovery::{RecoveryOutcome, reopen_recovery};
+#[cfg(test)]
+pub(crate) use recovery::{RecoveryOutcome, reopen_recovery};
 pub use service::{
     DispatchLimits, ServiceError, ServiceOutcome, ToolDispatchService, ToolResponseEnvelope,
     ToolTransport, TransportOutcome,

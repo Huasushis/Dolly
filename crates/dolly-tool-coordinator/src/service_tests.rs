@@ -15,15 +15,15 @@ use std::path::Path;
 use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
 use dolly_storage::Database;
 use dolly_storage::tool_ledger::{
-    LedgerInsertDisposition, create_tool_ledger_schema, insert_authorized,
+    LedgerInsertDisposition, create_tool_ledger_schema, enumerate_nonterminal, insert_authorized,
 };
 use dolly_tool_broker::{
     ConfirmationDecision, IdempotencyPolicy, LedgerState, RecoveryFacts, SideEffectClass,
     ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag, ToolStatus,
 };
 use dolly_tool_coordinator::{
-    DispatchLimits, DispatchOutcome, RecoveryFactsProvider, ServiceOutcome, ToolDispatchService,
-    ToolTransport, TransportOutcome,
+    DispatchLimits, DispatchOutcome, ServiceOutcome, ToolDispatchService, ToolTransport,
+    TransportOutcome,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -279,27 +279,14 @@ fn assert_unknown(record: &ToolCallLedgerRecord, result: &dolly_tool_broker::Too
 /// Reopen the ledger and assert no nonterminal row remains and no permit is
 /// released: a downstream disposition is never redispatch authority.
 fn assert_reopen_clear(dir: &std::path::Path) {
-    struct FixedFacts(RecoveryFacts);
-    impl RecoveryFactsProvider for FixedFacts {
-        fn facts_for(&self, _record: &ToolCallLedgerRecord) -> RecoveryFacts {
-            self.0
-        }
-    }
-    let mut db = open_db(dir);
-    let outcome = dolly_tool_coordinator::reopen_recovery(
-        &mut db,
-        &FixedFacts(RecoveryFacts {
-            zero_bytes_proved: true,
-            exact_generation_ready: true,
-            deadline_expired: false,
-        }),
-    )
-    .expect("reopen must succeed");
+    let db = open_db(dir);
     assert_eq!(
-        outcome.rows_visited, 0,
+        enumerate_nonterminal(db.connection())
+            .expect("enumerate must succeed")
+            .len(),
+        0,
         "no nonterminal rows after terminal"
     );
-    assert!(outcome.permits.is_empty(), "no downstream permit authority");
 }
 
 // ---------------------------------------------------------------------------

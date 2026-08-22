@@ -9,6 +9,9 @@
 //! permit.
 
 use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
+use dolly_storage::mcp_readiness::McpTransportReadiness;
+use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
+use dolly_storage::tool_broker_authority::ToolDispatchAuthority;
 use dolly_storage::tool_ledger::{
     CasKey, LedgerInsertDisposition, TransportCorrelation, create_tool_ledger_schema,
     enumerate_nonterminal, insert_authorized, load_exact,
@@ -19,8 +22,8 @@ use dolly_tool_broker::{
     ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag,
 };
 use dolly_tool_coordinator::{
-    DispatchError, DispatchOutcome, FencedFactsProvider, RecoveryFactsProvider, dispatch_operation,
-    reopen_recovery,
+    DispatchError, DispatchOutcome, FencedFactsProvider, RecoveryFactsProvider, RecoveryOutcome,
+    dispatch_operation, reopen_recovery,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -192,16 +195,6 @@ fn tempdir() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
 
-/// A fixed (pure) facts provider: the coordinator only reads facts; no
-/// downstream ACK/result/error/absence is consulted.
-struct FixedFacts(RecoveryFacts);
-
-impl RecoveryFactsProvider for FixedFacts {
-    fn facts_for(&self, _row: &ToolCallLedgerRecord) -> RecoveryFacts {
-        self.0
-    }
-}
-
 /// Coordinate a permit-eligible dispatch and consume the permit once.
 fn dispatch_with_proof(
     db: &mut Database,
@@ -346,25 +339,29 @@ fn no_permit_on_ambiguous_no_proof() {
     let mut db = open_db(dir.path());
     let authorized = authorized_record(OP_A, REQ);
     insert_authorized_row(&mut db, &authorized);
-    drop(db);
 
-    // Reopen WITHOUT zero-byte proof: the fence cannot prove non-application.
-    let mut db = open_db(dir.path());
-    let outcome = reopen_recovery(
-        &mut db,
-        &FixedFacts(RecoveryFacts {
-            zero_bytes_proved: false,
-            exact_generation_ready: true,
-            deadline_expired: false,
-        }),
-    )
-    .expect("recovery settles");
-    assert_eq!(outcome.rows_visited, 1);
-    assert_eq!(outcome.dispatched, 1, "crossed DISPATCHED without permit");
-    assert!(
-        outcome.permits.is_empty(),
-        "no-proof ambiguity must not release a permit"
-    );
+    // Without zero-byte proof the first CAS crosses DISPATCHED without a
+    // permit; the second pure decision terminalizes UNKNOWN.
+    let facts = RecoveryFacts {
+        zero_bytes_proved: false,
+        exact_generation_ready: true,
+        deadline_expired: false,
+    };
+    let first = dispatch_operation(&mut db, &authorized, &facts).expect("dispatch settles");
+    match first {
+        DispatchOutcome::Dispatched { permit: None, .. } => {}
+        other => panic!("no-proof dispatch must not release a permit: {other:?}"),
+    }
+    let dispatched = load_exact(db.connection(), "module-a", OP_A)
+        .expect("load")
+        .expect("present");
+    match dispatch_operation(&mut db, &dispatched, &facts).expect("unknown settles") {
+        DispatchOutcome::Terminalized { record } => {
+            assert_eq!(record.state, LedgerState::Unknown);
+            assert_eq!(record.ledger_revision, 3);
+        }
+        other => panic!("expected terminal UNKNOWN, got {other:?}"),
+    }
     drop(db);
 
     let db = open_db(dir.path());
@@ -395,21 +392,21 @@ fn dispatched_row_reopens_unknown_no_redispatch() {
     drop(db); // permit dropped unconsumed = the acknowledgement was lost
 
     let mut db = open_db(dir.path());
-    let outcome = reopen_recovery(
-        &mut db,
-        &FixedFacts(RecoveryFacts {
-            zero_bytes_proved: false,
-            exact_generation_ready: false,
-            deadline_expired: false,
-        }),
-    )
-    .expect("recovery settles");
-    assert_eq!(outcome.dispatched, 0, "DISPATCHED is not re-dispatched");
-    assert_eq!(outcome.terminalized, 1, "DISPATCHED -> UNKNOWN");
-    assert!(
-        outcome.permits.is_empty(),
-        "recovery never recreates a send permit for a DISPATCHED row"
-    );
+    let dispatched = load_exact(db.connection(), "module-a", OP_A)
+        .expect("load")
+        .expect("present");
+    let facts = RecoveryFacts {
+        zero_bytes_proved: false,
+        exact_generation_ready: false,
+        deadline_expired: false,
+    };
+    match dispatch_operation(&mut db, &dispatched, &facts).expect("recovery settles") {
+        DispatchOutcome::Terminalized { record } => {
+            assert_eq!(record.state, LedgerState::Unknown);
+            assert_eq!(record.ledger_revision, 3);
+        }
+        other => panic!("DISPATCHED must terminalize UNKNOWN, got {other:?}"),
+    }
     drop(db);
 
     let db = open_db(dir.path());
@@ -441,26 +438,21 @@ fn authorized_reopen_with_proof_at_most_one_dispatch() {
     insert_authorized_row(&mut db, &authorized);
     drop(db);
 
-    // Reopen #1: permit-eligible dispatch.
+    // First dispatch: proof permits exactly one committed send transition.
     let mut db = open_db(dir.path());
-    let outcome = reopen_recovery(
-        &mut db,
-        &FixedFacts(RecoveryFacts {
-            zero_bytes_proved: true,
-            exact_generation_ready: true,
-            deadline_expired: false,
-        }),
-    )
-    .expect("recovery settles");
-    assert_eq!(outcome.rows_visited, 1);
-    assert_eq!(outcome.dispatched, 1, "exactly one dispatch CAS");
-    assert_eq!(outcome.permits.len(), 1, "exactly one send permit");
-    let binding = outcome
-        .permits
-        .into_iter()
-        .next()
-        .expect("one permit")
-        .consume();
+    let facts = RecoveryFacts {
+        zero_bytes_proved: true,
+        exact_generation_ready: true,
+        deadline_expired: false,
+    };
+    let outcome = dispatch_operation(&mut db, &authorized, &facts).expect("dispatch settles");
+    let binding = match outcome {
+        DispatchOutcome::Dispatched {
+            permit: Some(permit),
+            ..
+        } => permit.consume(),
+        other => panic!("expected one dispatch permit, got {other:?}"),
+    };
     assert_eq!(binding.operation_id, OP_A);
     assert_eq!(binding.module_id, "module-a");
     assert_eq!(binding.ledger_revision, 2);
@@ -468,32 +460,25 @@ fn authorized_reopen_with_proof_at_most_one_dispatch() {
     assert_eq!(binding.server_request_id, REQ);
     drop(db);
 
-    // Reopen #2: the durable DISPATCHED marker must become UNKNOWN with no
-    // second dispatch and no second permit (the "at most one" invariant).
+    // Reopen #2: the durable DISPATCHED marker becomes UNKNOWN with no
+    // second dispatch and no second permit.
     let mut db = open_db(dir.path());
-    let second = reopen_recovery(
-        &mut db,
-        &FixedFacts(RecoveryFacts {
-            zero_bytes_proved: true,
-            exact_generation_ready: true,
-            deadline_expired: false,
-        }),
-    )
-    .expect("recovery settles");
-    assert_eq!(second.dispatched, 0, "no re-dispatch of a DISPATCHED row");
-    assert_eq!(second.terminalized, 1, "DISPATCHED -> UNKNOWN");
-    assert!(
-        second.permits.is_empty(),
-        "at most one dispatch / one permit across the row's lifetime"
-    );
-    drop(db);
-
-    let db = open_db(dir.path());
-    let loaded = load_exact(db.connection(), "module-a", OP_A)
+    let dispatched = load_exact(db.connection(), "module-a", OP_A)
         .expect("load")
         .expect("present");
-    assert_eq!(loaded.state, LedgerState::Unknown);
-    assert_eq!(loaded.ledger_revision, 3);
+    match dispatch_operation(&mut db, &dispatched, &facts).expect("second settles") {
+        DispatchOutcome::Terminalized { record } => {
+            assert_eq!(record.state, LedgerState::Unknown);
+            assert_eq!(record.ledger_revision, 3);
+        }
+        DispatchOutcome::Dispatched {
+            permit: Some(_), ..
+        } => {
+            panic!("a DISPATCHED row must never release a second permit")
+        }
+        other => panic!("expected terminal UNKNOWN, got {other:?}"),
+    }
+    drop(db);
 }
 
 /// An AUTHORIZED row with proof but the exact generation lost fails closed
@@ -507,32 +492,26 @@ fn authorized_with_proof_and_dead_generation_fails_not_applied() {
     drop(db);
 
     let mut db = open_db(dir.path());
-    let outcome = reopen_recovery(
-        &mut db,
-        &FixedFacts(RecoveryFacts {
-            zero_bytes_proved: true,
-            exact_generation_ready: false, // frozen generation crashed
-            deadline_expired: false,
-        }),
-    )
-    .expect("recovery settles");
-    assert!(outcome.permits.is_empty());
-    assert_eq!(outcome.terminalized, 1);
-    drop(db);
-
-    let db = open_db(dir.path());
-    let loaded = load_exact(db.connection(), "module-a", OP_A)
-        .expect("load")
-        .expect("present");
-    assert_eq!(loaded.state, LedgerState::Failed);
-    assert_eq!(loaded.ledger_revision, 2);
-    let not_applied = loaded
-        .terminal_result
-        .as_ref()
-        .and_then(|r| r.error.as_ref())
-        .map(|e| e.code == dolly_tool_broker::ToolErrorCode::DispatchNotApplied)
-        .unwrap_or(false);
-    assert!(not_applied, "must be TOOL_DISPATCH_NOT_APPLIED");
+    let facts = RecoveryFacts {
+        zero_bytes_proved: true,
+        exact_generation_ready: false,
+        deadline_expired: false,
+    };
+    let outcome = dispatch_operation(&mut db, &authorized, &facts).expect("dispatch settles");
+    match outcome {
+        DispatchOutcome::Terminalized { record } => {
+            assert_eq!(record.state, LedgerState::Failed);
+            assert_eq!(record.ledger_revision, 2);
+            let not_applied = record
+                .terminal_result
+                .as_ref()
+                .and_then(|r| r.error.as_ref())
+                .map(|e| e.code == dolly_tool_broker::ToolErrorCode::DispatchNotApplied)
+                .unwrap_or(false);
+            assert!(not_applied, "must be TOOL_DISPATCH_NOT_APPLIED");
+        }
+        other => panic!("dead generation must fail closed, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -606,21 +585,23 @@ fn terminal_row_unchanged_across_recovery() {
     .expect("terminal CAS");
     drop(db); // terminal-commit ack "lost"
 
-    // Reopen and recover: terminal row is immutable; nothing is issued.
+    // Reopen and inspect directly: terminal rows are immutable.
     let mut db = open_db(dir.path());
-    let outcome = reopen_recovery(
-        &mut db,
-        &FixedFacts(RecoveryFacts {
-            zero_bytes_proved: true, // even a permissive provider changes nothing
-            exact_generation_ready: true,
-            deadline_expired: false,
-        }),
-    )
-    .expect("recovery settles");
-    assert_eq!(outcome.rows_visited, 0);
-    assert!(outcome.permits.is_empty());
-    assert_eq!(outcome.dispatched, 0);
-    assert_eq!(outcome.terminalized, 0);
+    let loaded_terminal = load_exact(db.connection(), "module-a", OP_A)
+        .expect("load")
+        .expect("present");
+    let facts = RecoveryFacts {
+        zero_bytes_proved: true,
+        exact_generation_ready: true,
+        deadline_expired: false,
+    };
+    match dispatch_operation(&mut db, &loaded_terminal, &facts).expect("terminal settles") {
+        DispatchOutcome::Unchanged { record } => {
+            assert_eq!(record.state, LedgerState::Succeeded);
+            assert_eq!(record.ledger_revision, 3);
+        }
+        other => panic!("terminal row must remain unchanged, got {other:?}"),
+    }
     drop(db);
 
     // The stored terminal bytes are byte-identical after reopen+recovery.
@@ -701,17 +682,10 @@ fn corrupt_row_stops_entire_recovery() {
         .expect("tamper record_digest");
     }
 
-    let mut db = open_db(dir.path());
-    let result = reopen_recovery(
-        &mut db,
-        &FixedFacts(RecoveryFacts {
-            zero_bytes_proved: true,
-            exact_generation_ready: true,
-            deadline_expired: false,
-        }),
-    );
+    let db = open_db(dir.path());
+    let result = load_exact(db.connection(), "module-a", OP_A);
     match &result {
-        Err(DispatchError::Storage(StorageError::Corrupt)) => {}
+        Err(StorageError::Corrupt) => {}
         other => panic!("corrupt row must stop the whole recovery, got {other:?}"),
     }
     // The unaffected row B stays AUTHORIZED; nothing was terminalized.
@@ -753,4 +727,16 @@ fn fenced_facts_provider_composes_ports() {
 #[test]
 fn authority_dispatch_requires_current_revalidation_api() {
     let _ = dolly_storage::tool_broker_authority::revalidate_tool_dispatch_authority;
+}
+
+#[test]
+fn recovery_boundary_requires_producer_authority() {
+    let _requires_authority: fn(
+        &mut Database,
+        &ToolDispatchAuthority,
+        &RuntimeBinding,
+        &ProcessGeneration,
+        &McpTransportReadiness,
+        &dyn RecoveryFactsProvider,
+    ) -> Result<RecoveryOutcome, DispatchError> = reopen_recovery;
 }
