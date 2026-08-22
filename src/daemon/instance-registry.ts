@@ -18,6 +18,7 @@ import {
   InstanceControllerLock,
   InstanceControllerLockError,
 } from "../core/instance-controller-lock.js";
+import { projectRuntimeInstanceStableId } from "../core/runtime-authority-identities.js";
 import { parseStrictJsonBytes } from "../core/strict-json.js";
 import type { InstanceProcessRecord } from "./instance-process-record-store.js";
 import type { ProcessIdentityProbe } from "./process-identity.js";
@@ -178,9 +179,17 @@ export async function probeInstanceControllerLock(
   registryDirectory: string,
   instanceId: string,
 ): Promise<ControllerLockObservation> {
+  // The controller namespace is keyed by the deterministic Runtime StableId
+  // of the instance, derived from the registry UUIDv4 source — the same
+  // projection the acquiring manager uses. The registry UUIDv4 remains the
+  // durable source of truth and is never reinterpreted as an endpoint key.
+  const canonicalInstanceId = projectRuntimeInstanceStableId(instanceId);
   let lock: InstanceControllerLock;
   try {
-    lock = await InstanceControllerLock.acquire({ directory: registryDirectory, instanceId });
+    lock = await InstanceControllerLock.acquire({
+      directory: registryDirectory,
+      instanceId: canonicalInstanceId,
+    });
   } catch (error) {
     if (error instanceof InstanceControllerLockError) {
       if (error.code === "CONTROLLER_LOCK_HELD") return "held-elsewhere";

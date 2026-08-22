@@ -10,7 +10,7 @@
  */
 
 import { createServer, connect, type Server } from "node:net";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -53,6 +53,8 @@ function firstExternalIpv4(): string | undefined {
   }
   return undefined;
 }
+
+const NOW = "2026-07-24T12:00:00.000Z";
 
 describe("OPS-002 daemon total configuration and loopback-only listener", () => {
   let root: string;
@@ -120,7 +122,7 @@ describe("OPS-002 daemon total configuration and loopback-only listener", () => 
     const rotated = await store.rotateCredential();
 
     expect(rotated.generatedPassword).not.toBe(created.generatedPassword);
-    expect(rotated.config.daemonId).toBe(created.config.daemonId);
+    expect(rotated.config.daemonInstallationId).toBe(created.config.daemonInstallationId);
     await expect(
       verifyDaemonCredential(rotated.config, {
         username: rotated.config.credential.username,
@@ -135,6 +137,84 @@ describe("OPS-002 daemon total configuration and loopback-only listener", () => 
     ).resolves.toBe(true);
     expect(readFileSync(rotated.path, "utf8")).not.toContain(rotated.generatedPassword!);
   }, 30_000);
+
+  it("atomically migrates a dolly.daemon-config/1 document to /2 with a fresh UUIDv7 installation id", async () => {
+    const legacyDaemonId = "11111111-1111-4111-8111-111111111111";
+    const store = new DaemonConfigStore({ directory: root, now: () => NOW });
+    const legacyDocument = {
+      schemaVersion: "dolly.daemon-config/1",
+      daemonId: legacyDaemonId,
+      listen: { host: "127.0.0.1", port: 0 },
+      credential: {
+        username: "dolly-admin",
+        algorithm: "scrypt",
+        salt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        verifier: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        cost: 16384,
+        blockSize: 8,
+        parallelization: 1,
+        keyLength: 32,
+        createdAt: "2026-07-24T12:00:00.000Z",
+      },
+    };
+    writeFileSync(join(root, "daemon.json"), `${JSON.stringify(legacyDocument, null, 2)}\n`, { mode: 0o600 });
+
+    const loaded = store.load();
+    expect(loaded.config.schemaVersion).toBe("dolly.daemon-config/2");
+    // A fresh UUIDv7 replaces the retired UUIDv4; the old value is never reused.
+    expect(loaded.config.daemonInstallationId).not.toBe(legacyDaemonId);
+    expect(loaded.config.daemonInstallationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    // listen and credential are preserved verbatim through the migration.
+    expect(loaded.config.listen).toEqual({ host: "127.0.0.1", port: 0 });
+    expect(loaded.config.credential.username).toBe("dolly-admin");
+    expect(loaded.config.credential.salt).toBe(legacyDocument.credential.salt);
+    // The on-disk document is now /2 and the migration is stable across loads.
+    const onDisk = JSON.parse(readFileSync(loaded.path, "utf8"));
+    expect(onDisk.schemaVersion).toBe("dolly.daemon-config/2");
+    expect(store.load().config.daemonInstallationId).toBe(loaded.config.daemonInstallationId);
+    // Credential rotation preserves the migrated installation id.
+    const rotated = await store.rotateCredential("dolly-admin");
+    expect(rotated.config.daemonInstallationId).toBe(loaded.config.daemonInstallationId);
+  }, 30_000);
+
+  it("refuses the /1 to /2 migration when a durable foreign reference to the old UUIDv4 exists", async () => {
+    const legacyDaemonId = "22222222-2222-4222-8222-222222222222";
+    const store = new DaemonConfigStore({ directory: root, now: () => NOW });
+    // A sibling durable record names the old daemon UUIDv4: migration must
+    // stop rather than retire an identifier that is still referenced.
+    writeFileSync(
+      join(root, "instance-aaa.json"),
+      JSON.stringify({ instanceId: "55555555-5555-4555-8555-555555555555", daemonId: legacyDaemonId }),
+      "utf8",
+    );
+    const legacyDocument = {
+      schemaVersion: "dolly.daemon-config/1",
+      daemonId: legacyDaemonId,
+      listen: { host: "127.0.0.1", port: 0 },
+      credential: {
+        username: "dolly-admin",
+        algorithm: "scrypt",
+        salt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        verifier: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        cost: 16384,
+        blockSize: 8,
+        parallelization: 1,
+        keyLength: 32,
+        createdAt: "2026-07-24T12:00:00.000Z",
+      },
+    };
+    writeFileSync(join(root, "daemon.json"), `${JSON.stringify(legacyDocument, null, 2)}\n`, { mode: 0o600 });
+    expect(() => store.load()).toThrow(
+      expect.objectContaining({ code: "DAEMON_CONFIG_MIGRATION_REFUSED" }),
+    );
+    // The legacy document is left untouched so the reference stays resolvable.
+    expect(JSON.parse(readFileSync(join(root, "daemon.json"), "utf8")).schemaVersion).toBe(
+      "dolly.daemon-config/1",
+    );
+  }, 30_000);
+
 
   it("refuses every listen address that is not an exact loopback literal", async () => {
     const store = new DaemonConfigStore({ directory: root });

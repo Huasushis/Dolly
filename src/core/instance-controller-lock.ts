@@ -1,18 +1,25 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, realpathSync, statSync } from "node:fs";
 import { parse, resolve } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
 import { observeHostPlatform } from "./host-platform.js";
+import { canonicalRuntimeInstanceId } from "./runtime-authority-identities.js";
+import { generateRuntimeUuidV7 } from "./runtime-authority-identities.js";
 
 const INSTANCE_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-const CONTROLLER_ID_PATTERN = INSTANCE_ID_PATTERN;
+const STABLE_INSTANCE_ID_PATTERN = /^instance-[0-9a-f]{32}$/u;
 
 export interface InstanceControllerLockInfo {
   readonly instanceId: string;
-  readonly controllerId: string;
+  /**
+   * The live controller generation for THIS acquisition: a fresh RFC9562
+   * lowercase UUIDv7 minted only after the kernel bind succeeded. It has no
+   * persistent owner and every release, crash, or reacquire invalidates it.
+   */
+  readonly controllerGenerationId: string;
   readonly processId: number;
-  readonly acquiredAt: string;
+  readonly createdAt: string;
 }
 
 export type InstanceControllerLockErrorCode =
@@ -33,8 +40,15 @@ export class InstanceControllerLockError extends Error {
 export interface AcquireInstanceControllerLockOptions {
   /** A stable per-user registry directory. Its canonical path namespaces the lock. */
   readonly directory: string;
+  /** The user-facing instance identity (registry UUIDv4 or its StableId). */
   readonly instanceId: string;
-  readonly controllerId?: string;
+  /**
+   * Optional generator for the per-acquisition live controller
+   * generation. If omitted a strict RFC9562 lowercase UUIDv7 is minted once
+   * the kernel bind has succeeded. The caller may inject a generator for
+   * deterministic tests but may never supply or reuse a generation value.
+   */
+  readonly controllerGenerationIdGenerator?: () => string;
   readonly processId?: number;
   readonly now?: () => string;
 }
@@ -71,12 +85,12 @@ function canonicalDirectory(input: string): string {
     if (!statSync(canonical).isDirectory()) {
       throw new InstanceControllerLockError(
         "CONTROLLER_LOCK_PATH_INVALID",
-        "Controller lock path must resolve to a directory",
+        "path must resolve to a directory",
       );
     }
     return canonical;
-  } catch (error) {
-    if (error instanceof InstanceControllerLockError) throw error;
+  } catch (e) {
+    if (e instanceof InstanceControllerLockError) throw e;
     throw new InstanceControllerLockError(
       "CONTROLLER_LOCK_IO_FAILED",
       "Could not prepare the controller lock namespace",
@@ -84,58 +98,43 @@ function canonicalDirectory(input: string): string {
   }
 }
 
-function controllerEndpoint(directory: string, instanceId: string): string {
-  const namespace = process.platform === "win32" ? directory.toLowerCase() : directory;
-  const digest = createHash("sha256")
-    .update(namespace, "utf8")
-    .update("\0", "utf8")
-    .update(instanceId, "utf8")
-    .digest("hex");
-  if (process.platform === "linux") {
-    // Linux abstract sockets have no filesystem entry and disappear on process death.
-    return `\0dolly-controller-${digest}`;
-  }
-  if (process.platform === "win32") {
-    // The Windows named-pipe object is owned by the open server handle.
-    return `\\\\.\\pipe\\dolly-controller-${digest}`;
-  }
+function controllerEndpoint(id: string): { name: string } {
+  const digest = createHash("sha256").update(id, "utf8").digest("hex");
+  return process.platform === "linux"
+    ? { name: `\0dolly-controller-${digest}` }
+    : process.platform === "win32"
+      ? { name: `\\\\.\\pipe\\dolly-controller-${digest}` }
+      : throwUnsupported();
+}
+
+function throwUnsupported(): never {
   throw new InstanceControllerLockError(
     "CONTROLLER_LOCK_PLATFORM_UNSUPPORTED",
     "Crash-recoverable controller locking is currently supported on Linux and Windows",
   );
 }
 
-function validateIdentity(options: AcquireInstanceControllerLockOptions): InstanceControllerLockInfo {
-  if (!INSTANCE_ID_PATTERN.test(options.instanceId)) {
+function validateInstanceId(instanceId: unknown): asserts instanceId is string {
+  if (
+    typeof instanceId !== "string" ||
+    (!INSTANCE_ID_PATTERN.test(instanceId) && !STABLE_INSTANCE_ID_PATTERN.test(instanceId))
+  ) {
     throw new InstanceControllerLockError(
       "CONTROLLER_LOCK_INVALID",
-      "Controller lock instanceId must be a lowercase UUIDv4",
+      "Controller lock instanceId must be a lowercase UUIDv4 or its deterministic Runtime StableId",
     );
   }
-  const controllerId = options.controllerId ?? randomUUID();
-  if (!CONTROLLER_ID_PATTERN.test(controllerId)) {
-    throw new InstanceControllerLockError(
-      "CONTROLLER_LOCK_INVALID",
-      "controllerId must be a lowercase UUIDv4",
-    );
-  }
-  const processId = options.processId ?? process.pid;
-  if (!Number.isSafeInteger(processId) || processId <= 0) {
-    throw new InstanceControllerLockError(
-      "CONTROLLER_LOCK_INVALID",
-      "processId must be a positive safe integer",
-    );
-  }
-  return Object.freeze({
-    instanceId: options.instanceId,
-    controllerId,
-    processId,
-    acquiredAt: canonicalTime(options.now ?? (() => new Date().toISOString())),
+}
+
+function mintId(): string {
+  return generateRuntimeUuidV7({
+    now: () => Date.now(),
+    randomBytes: (size) => randomBytes(size),
   });
 }
 
 function closeServer(server: Server, sockets: ReadonlySet<Socket>): Promise<void> {
-  for (const socket of sockets) socket.destroy();
+  for (const s of sockets) s.destroy();
   if (!server.listening) return Promise.resolve();
   return new Promise((resolveClose, rejectClose) => {
     server.close((error) => {
@@ -160,9 +159,7 @@ export class InstanceControllerLock {
     this.#server = server;
     this.#sockets = sockets;
     this.#info = info;
-    server.on("error", (error) => {
-      this.#leaseError = error;
-    });
+    server.on("error", (error) => { this.#leaseError = error; });
     server.on("close", () => {
       if (this.#held) {
         this.#leaseError = new InstanceControllerLockError(
@@ -173,9 +170,13 @@ export class InstanceControllerLock {
     });
   }
 
-  static async acquire(
-    options: AcquireInstanceControllerLockOptions,
-  ): Promise<InstanceControllerLock> {
+  static async acquire(options: {
+    readonly directory: string;
+    readonly instanceId: string;
+    readonly controllerGenerationIdGenerator?: () => string;
+    readonly processId?: number;
+    readonly now?: () => string;
+  }): Promise<InstanceControllerLock> {
     // Trusted internal platform preflight, read through the same host-owned
     // observer the daemon, Linux Module activation, and Core service binding
     // gates use. It runs before `canonicalDirectory` so an unsupported host is
@@ -189,8 +190,23 @@ export class InstanceControllerLock {
       );
     }
     const directory = canonicalDirectory(options.directory);
-    const info = validateIdentity(options);
-    const endpoint = controllerEndpoint(directory, info.instanceId);
+    validateInstanceId(options.instanceId);
+    const processId = options.processId ?? process.pid;
+    if (!Number.isSafeInteger(processId) || processId <= 0) {
+      throw new InstanceControllerLockError(
+        "CONTROLLER_LOCK_INVALID",
+        "processId must be a positive safe integer",
+      );
+    }
+    // The controller namespace is keyed by the deterministic StableId, so a
+    // manager passing the registry UUIDv4 and a manager passing the projected
+    // StableId always contend for the same kernel object. The registry UUIDv4
+    // remains the durable source; this lock only ever sees the projection.
+    const instanceId = canonicalRuntimeInstanceId(options.instanceId);
+    const acquiredAt = canonicalTime(options.now ?? (() => new Date().toISOString()));
+    const mint = options.controllerGenerationIdGenerator ?? mintId;
+    const endpoint = controllerEndpoint(`${directory}\0${instanceId}`);
+
     const sockets = new Set<Socket>();
     const server = createServer((socket) => {
       if (sockets.size >= 16) {
@@ -222,10 +238,18 @@ export class InstanceControllerLock {
         void closeServer(server, sockets).finally(() => rejectAcquire(failure));
       };
       server.once("error", onStartError);
-      server.listen({ path: endpoint, exclusive: true }, () => {
+      server.listen({ path: endpoint.name, exclusive: true }, () => {
         if (settled) return;
         settled = true;
         server.off("error", onStartError);
+        // The kernel bind has succeeded; mint the live generation NOW so a
+        // refused acquisition can never fabricate one for later reuse.
+        const info = Object.freeze({
+          instanceId,
+          controllerGenerationId: mint(),
+          processId,
+          createdAt: acquiredAt,
+        }) as InstanceControllerLockInfo;
         resolveAcquire(new InstanceControllerLock(server, sockets, info));
       });
     });
@@ -263,3 +287,4 @@ export class InstanceControllerLock {
     }
   }
 }
+

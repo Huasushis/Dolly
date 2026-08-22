@@ -248,7 +248,7 @@ describe("production runtime bootstrap", () => {
     const heldControllerLock = await InstanceControllerLock.acquire({
       directory: controllerDirectory,
       instanceId: INSTANCE_ID,
-      controllerId: FIRST_CONTROLLER,
+      controllerGenerationIdGenerator: () => FIRST_CONTROLLER,
       processId: 101,
       now: () => NOW,
     });

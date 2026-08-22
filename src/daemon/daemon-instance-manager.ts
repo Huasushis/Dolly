@@ -28,6 +28,7 @@ import {
   InstanceControllerLock,
   InstanceControllerLockError,
 } from "../core/instance-controller-lock.js";
+import { projectRuntimeInstanceStableId } from "../core/runtime-authority-identities.js";
 import {
   ProcessSupervisor,
   ProcessSupervisorError,
@@ -577,8 +578,10 @@ export class DaemonInstanceManager {
     try {
       return await InstanceControllerLock.acquire({
         directory: this.#options.registryDirectory,
-        instanceId: instance.instanceId,
-        controllerId: this.#controllerId,
+        // The controller namespace is keyed by the deterministic Runtime
+        // StableId of the instance, derived from the registry UUIDv4 source.
+        // The kernel lock never sees the raw UUIDv4 or a config path.
+        instanceId: projectRuntimeInstanceStableId(instance.instanceId),
       });
     } catch (error) {
       const held =
