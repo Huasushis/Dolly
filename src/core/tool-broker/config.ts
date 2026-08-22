@@ -409,6 +409,9 @@ function parseIdempotency(serverId: string, alias: string, sideEffectClass: Tool
     reject(`servers["${serverId}"].tools["${alias}"].idempotency must be an object`);
   }
   if (sideEffectClass === "idempotent_write") {
+    if (Object.keys(input).some((key) => key !== "kind" && key !== "argument_pointer")) {
+      reject(`servers["${serverId}"].tools["${alias}"].idempotency unknown field (idempotent_write policies must have exactly "kind" and "argument_pointer")`);
+    }
     const kind = input.kind;
     if (kind !== "argument_key") {
       reject(`servers["${serverId}"].tools["${alias}"].idempotency.kind must be "argument_key" for an idempotent_write tool`);
@@ -418,6 +421,9 @@ function parseIdempotency(serverId: string, alias: string, sideEffectClass: Tool
       reject(`servers["${serverId}"].tools["${alias}"].idempotency.argument_pointer must match the RFC 6901 pointer pattern`);
     }
     return Object.freeze({ kind: "argument_key", argument_pointer: argumentPointer });
+  }
+  if (Object.keys(input).some((key) => key !== "kind")) {
+    reject(`servers["${serverId}"].tools["${alias}"].idempotency unknown field (${sideEffectClass} policies must have exactly "kind")`);
   }
   if (input.kind !== "none") {
     reject(`servers["${serverId}"].tools["${alias}"].idempotency.kind must be "none" for a ${sideEffectClass} tool`);
