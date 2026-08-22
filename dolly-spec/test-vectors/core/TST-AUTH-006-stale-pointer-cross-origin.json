@@ -1,0 +1,77 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-AUTH-006",
+  "kind": "security",
+  "covers": ["REQ-AUTH-003", "REQ-AUTH-004", "INV-AUTH-002", "INV-ACTIVATION-012", "INV-ACTIVATION-013"],
+  "initial": {
+    "current_pointer": {
+      "config_revision": 43,
+      "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "config_mappings": [
+      {
+        "config_revision": 42,
+        "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "verified_installed_origins": [
+      {
+        "schema": "dolly.installed-component-origin/v1",
+        "kind": "installed_product_component",
+        "component_id": "org.dolly.host.read-tools",
+        "component_revision": 5,
+        "component_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      {
+        "schema": "dolly.installed-component-origin/v1",
+        "kind": "installed_product_component",
+        "component_id": "org.dolly.runtime.service-candidate",
+        "component_revision": 2,
+        "component_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    ],
+    "hostile_cases": {
+      "stale_pointer": "revision_43_mapping_absent",
+      "cross_policy_binding": "binding_names_another_definition_triple",
+      "cross_origin_binding": "binding_embeds_same_component_label_with_digest_9999",
+      "cross_origin_service_candidate": "candidate_embeds_uninstalled_component_revision",
+      "premise_before_prerequisites": "premise_insert_attempted_with_missing_deferred_selection_targets",
+      "extra_selection": "premise_contains_one_unconfigured_policy",
+      "same_digest_distinct_scoped_origins": "two_valid_identity_rows_share_digest_text"
+    }
+  },
+  "stimulus": {
+    "commands": [
+      "ReopenStalePointer",
+      "AttemptCrossPolicyBindingInsert",
+      "AttemptCrossOriginBindingInsert",
+      "AttemptCrossOriginServiceCandidateInsert",
+      "AttemptPremiseBeforePrerequisites",
+      "AttemptExtraSelection",
+      "InsertSameDigestUnderDistinctValidIdentities"
+    ]
+  },
+  "expected": {
+    "outcome": "stale_pointer_and_cross_origin_rows_fail_closed_without_treating_digest_as_global_identity",
+    "assertions": [
+      {"path": "/stale_pointer/error", "op": "equals", "value": "STORAGE_CORRUPT"},
+      {"path": "/stale_pointer/repaired_from_revision_42_digest_match", "op": "equals", "value": false},
+      {"path": "/cross_policy_binding/committed", "op": "equals", "value": false},
+      {"path": "/cross_policy_binding/error", "op": "equals", "value": "MODULE_ACTIVATION_PREMISES_INVALID"},
+      {"path": "/cross_origin_binding/committed", "op": "equals", "value": false},
+      {"path": "/cross_origin_binding/error", "op": "equals", "value": "MODULE_ACTIVATION_PREMISES_INVALID"},
+      {"path": "/cross_origin_service_candidate/committed", "op": "equals", "value": false},
+      {"path": "/cross_origin_service_candidate/error", "op": "equals", "value": "MODULE_ACTIVATION_PREMISES_INVALID"},
+      {"path": "/premise_before_prerequisites/committed", "op": "equals", "value": false},
+      {"path": "/extra_selection/committed", "op": "equals", "value": false},
+      {"path": "/same_digest_distinct_scoped_origins/committed", "op": "equals", "value": true},
+      {"path": "/same_digest_distinct_scoped_origins/global_digest_uniqueness_enforced", "op": "equals", "value": false},
+      {"path": "/new_current_pointer_count", "op": "equals", "value": 0},
+      {"path": "/live_binding_count", "op": "equals", "value": 0},
+      {"path": "/activation_permission_count", "op": "equals", "value": 0},
+      {"path": "/ready", "op": "equals", "value": false}
+    ],
+    "emitted": [],
+    "crash_label": "reopen_with_stale_pointer_before_premise_resolution"
+  }
+}

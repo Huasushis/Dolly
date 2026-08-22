@@ -117,18 +117,37 @@ Failure during `Applying` enters `RollingBack`. Since apply **MAY** have changed
 
 ## 8. Authoritative commit point
 
-The authoritative commit point is one Host database transaction that:
+The authoritative commit point is the one `BEGIN IMMEDIATE` Runtime SQLite
+transaction defined in
+[Storage and Recovery](../core/06-storage-and-recovery.md#31-runtime-authority-database-schema-version-1).
+It:
 
-1. verifies the active base revisions and all required `CommitReady` receipts;
-2. persists the target normalized configuration;
-3. advances config and, if applicable, graph revisions;
-4. selects current Extension generations;
-5. updates the active graph/config pointers; and
-6. marks the configuration transaction `Committed`.
+1. verifies the active base config/graph revisions and all required
+   `CommitReady` receipts;
+2. validates the complete canonical resolved configuration and digest;
+3. reuses the current config revision only for exact current digest **and byte**
+   equality, otherwise allocates the next integer and inserts its append-only
+   mapping;
+4. inserts or verifies every installed-component origin, permission-policy
+   definition, backend binding, service candidate, and exact premise-selection
+   row;
+5. inserts the complete Module activation premise as the last prerequisite
+   record;
+6. advances graph revision when applicable, selects current Extension
+   generations, updates the active graph/config pointers, and marks the
+   configuration transaction `Committed`; and
+7. appends the config-installed journal event and commits once.
 
-Before this database transaction commits, the base revision is authoritative. After it commits, the target revision is authoritative. There is no intermediate externally visible revision.
+Before this database transaction commits, the base revision is authoritative.
+After it commits, the complete target revision is authoritative. Rollback
+exposes no mapping, prerequisite, premise, pointer, or journal subset. A
+same-content proposal that reuses the current revision may complete its
+idempotent operation record but is not a semantic configuration change.
 
-The Host **MUST** not unquiesce target Modules until it can read back the committed record. Unquiescing occurs in `Activating`. Failure after the commit point enters `ForwardRecovering`, not ordinary abort.
+The Host **MUST** not unquiesce target Modules until it can reopen/read back the
+committed mapping, current pointer, and complete premise set. Unquiescing occurs
+in `Activating`. Failure after the commit point enters `ForwardRecovering`, not
+ordinary abort.
 
 ## 9. Rollback before the commit point
 

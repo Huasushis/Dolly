@@ -2,9 +2,11 @@
   "schema": "dolly.test-vector/v1",
   "test_id": "TST-AUTH-003",
   "kind": "crash_recovery",
-  "covers": ["REQ-ACT-005", "INV-ACTIVATION-014", "INV-ACTIVATION-015"],
+  "covers": ["REQ-ACT-005", "REQ-AUTH-005", "INV-AUTH-002", "INV-ACTIVATION-014", "INV-ACTIVATION-015"],
   "initial": {
     "persistent_premises": {
+      "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000520",
+      "instance_id": "main",
       "config_revision": 42,
       "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "policy_definition_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -63,9 +65,9 @@
     ]
   },
   "expected": {
-    "outcome": "restart_remints_live_authority_and_migration_or_downstream_evidence_never_fills_missing_premises",
+    "outcome": "restart_remints_live_authority_and_migration_or_downstream_evidence_never_fills_missing_prerequisites",
     "assertions": [
-      {"path": "/restart/persistent_premises", "op": "equals", "value": {"config_revision": 42, "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "policy_definition_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "binding_id": "read-tools-host", "binding_revision": 3, "binding_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "binding_origin": {"component_id": "org.dolly.host.read-tools", "component_revision": 5, "component_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"}, "premises_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"}},
+      {"path": "/restart/persistent_premises", "op": "equals", "value": {"daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000520", "instance_id": "main", "config_revision": 42, "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "policy_definition_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "binding_id": "read-tools-host", "binding_revision": 3, "binding_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "binding_origin": {"component_id": "org.dolly.host.read-tools", "component_revision": 5, "component_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"}, "premises_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"}},
       {"path": "/restart/live_binding_object_id", "op": "not_equals", "value": "host-object-1"},
       {"path": "/restart/activation_permission_object_id", "op": "not_equals", "value": "host-object-2"},
       {"path": "/restart/runtime_binding_object_id", "op": "not_equals", "value": "host-object-3"},
@@ -78,12 +80,14 @@
       {"path": "/migration/target_premise_record", "op": "absent"},
       {"path": "/migration/live_binding_count", "op": "equals", "value": 0},
       {"path": "/migration/recovery_handoff_count", "op": "equals", "value": 0},
+      {"path": "/migration/runtime_authority_transaction_committed", "op": "equals", "value": false},
+      {"path": "/migration/dual_json_sqlite_authority", "op": "equals", "value": false},
       {"path": "/downstream_attempt_results", "op": "equals", "value": ["refused_missing_upstream_authority", "refused_missing_upstream_authority", "refused_missing_upstream_authority", "refused_missing_upstream_authority", "refused_missing_upstream_authority"]},
       {"path": "/public_guard", "op": "equals", "value": "RUNTIME_MODULE_MIGRATION_REQUIRED"},
       {"path": "/global_filecore_boundedness_claimed", "op": "equals", "value": false}
     ],
     "emitted": [
-      {"event": "ModuleActivationMigrationRefused", "reason": "missing_permission_policy_binding"}
+      {"event": "ModuleActivationMigrationRefused", "reason": "missing_permission_policy_backend_binding"}
     ],
     "crash_label": "after_first_startup_handoff_consumed_before_restart"
   }

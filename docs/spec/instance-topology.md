@@ -145,22 +145,26 @@ Extension MUST NOT be able to request a connection change.
 
 ### 4.2 One source of truth
 
-The committed instance configuration revision is the only authoritative
-representation of the topology. The graphical editor is one editor over that
-document. It MUST NOT maintain a separate graph store, a cached authoritative
-copy, or any state from which the configuration is later regenerated.
+The current pointer and canonical resolved configuration in the shared Runtime
+SQLite authority database are the only authoritative representation of the
+topology. Its positive integer revision is allocated by the transaction in the
+normative Storage and Recovery contract; a digest verifies exact content but is
+not converted to the integer. The graphical editor is one client over that
+record. It MUST NOT maintain a separate graph store, cached authoritative copy,
+or state from which configuration is later regenerated.
 
 Concretely:
 
 - Every read the editor performs MUST resolve to one exact
-  `(instanceId, revision)` pair, and the editor MUST display which revision it
-  is showing.
+  `(instanceId, revision, digest)` record, and the editor MUST display which
+  revision it is showing.
 - Every write MUST produce a complete candidate instance configuration document
-  that is validated as a whole and committed as a new revision.
-- There MUST NOT be an editor-only representation that can drift from the
-  committed document, and there MUST NOT be a repair, resynchronize, or import
-  operation that reconciles two graph stores. If such an operation would be
-  needed, the design has two sources of truth and violates this section.
+  that is validated as a whole and submitted to the one authority transaction.
+- There MUST NOT be an editor-only representation, legacy JSON file, or
+  language-specific store that can drift from the committed database record,
+  and there MUST NOT be a repair or resynchronize operation that chooses between
+  two current configurations. If such an operation would be needed, the design
+  has two sources of truth and violates this section.
 - Deleting the editor's own state MUST NOT change the topology.
 
 ### 4.3 Presentation annotations
@@ -244,25 +248,28 @@ supplies the expected revision explicitly, receives the same change plan, and
 receives the same error codes. Non-interactive use MUST be able to print the
 plan as structured JSON and MUST exit non-zero when the operation is refused.
 
-**Editing the configuration file.** An operator may open the configuration
-document in a text editor. This is a supported workflow and MUST remain
-possible for every change that the graphical editor can make.
+**Editing a configuration file.** An operator may prepare a configuration
+document in a text editor. This remains possible for every change that the
+graphical editor can make, but the file is proposal/import input, not an
+authoritative instance configuration.
 
 A hand-edited file MUST NOT take effect implicitly:
 
 - The daemon MUST NOT watch the configuration file and apply changes because
   its bytes changed. An unvalidated file write is not an authorized, planned,
   compare-and-swap-checked commit, and a partially saved file must never reach
-  the runtime.
+  the Runtime.
 - A hand-edited file becomes effective only through an explicit authenticated
-  apply operation that reads the file, validates it, computes the plan, and
-  performs the compare-and-swap against the revision the operator expected.
-  When that operation is invoked without an expected revision, it MUST show the
-  plan and require confirmation before committing, and it MUST refuse if the
-  stored revision changed between showing the plan and confirming.
-- Editing the file of a stopped instance is permitted. Startup revalidates it,
-  computes the plan against persisted state, and may still refuse; see
-  Section 10.4.
+  apply operation that reads the file, validates and normalizes it, computes
+  exact canonical resolved bytes/digest, computes the plan, and performs the
+  compare-and-swap against the revision the operator expected. When invoked
+  without an expected revision, it MUST show the plan and require confirmation
+  before committing, and it MUST refuse if the stored revision changed between
+  showing the plan and confirming.
+- For a stopped instance, import/apply acquires the same controller lock and
+  uses the same SQLite transaction. Initial legacy migration follows the
+  expected-source procedure; after its commit, startup ignores the file for
+  current selection even if archival or removal was interrupted.
 
 The graphical editor MUST NOT be required in order to reach any state that the
 graphical editor can produce. If a topology can be drawn, it can be written.
@@ -304,9 +311,10 @@ configuration content, regardless of which interface produced them.
 Precisely: given the same starting revision and the same logical change,
 the candidate documents produced by the CLI and by the graphical editor MUST
 have identical canonical JSON bytes under the RFC 8785 JSON Canonicalization
-Scheme rules in `core-runtime.md` Section 5, and therefore the same computed
-revision. Neither interface may introduce ordering differences, defaulted
-fields the other omits, or annotations the other lacks.
+Scheme rules in `core-runtime.md` Section 5, and therefore the same digest and
+transaction result. Neither interface may introduce ordering differences,
+defaulted fields the other omits, or annotations the other lacks. The integer
+revision is the next committed allocator value, never a digest-derived value.
 
 Ordering inside the document MUST therefore be deterministic and defined by the
 schema, not by the order in which an operator clicked or typed. If the schema
@@ -1131,8 +1139,8 @@ falsifiable and none asserts only that a status string was returned.
 
 1. **Interface equivalence.** For a fixed starting revision and a fixed logical
    change, the candidate document produced through the CLI and through the
-   graphical editor's operations have identical canonical JSON bytes and yield
-   the same computed revision.
+   graphical editor's operations has identical canonical JSON bytes/digest and
+   receives the same transaction-allocated integer revision.
 2. **Capability parity.** The declared topology and configuration operation
    sets exposed to the two interfaces are equal, including operation names,
    required arguments, confirmation requirements, and error codes. Adding an
@@ -1217,23 +1225,23 @@ falsifiable and none asserts only that a status string was returned.
 
 ### 14.1 What already exists
 
-Three primitives that Section 5's pipeline needs are already implemented and
-have conformance tests. This contract builds on them rather than replacing
-them.
+The current code contains three primitives relevant to Section 5's pipeline,
+but none is the accepted Runtime authority database:
 
-- **Revision-checked instance configuration storage.**
-  `src/core/instance-config-store.ts` loads and writes the instance
-  configuration under a cross-process lock, derives the revision from a
-  canonical digest, performs the compare-and-swap in Section 9.1, and already
-  reports the conflict as `CONFIG_REVISION_CONFLICT`. It also implements the
-  instance registry, `rebind`, state-manifest binding, and instance identity
-  collision detection that Section 10 relies on.
+- **Historical revision-checked JSON storage.**
+  `src/core/instance-config-store.ts` loads and writes instance configuration
+  under a cross-process lock, uses a canonical content digest as its revision,
+  and reports `CONFIG_REVISION_CONFLICT`. That digest identity remains migration
+  input only. It does not implement the append-only positive integer mapping,
+  shared SQLite current pointer, prerequisite foreign keys, or premise-last
+  transaction, and it cannot remain a second authority after migration.
 - **Immutable Module configuration records.**
   `src/core/module-configuration-store.ts` creates and resolves the
   `dolly.module-configuration/1` record behind `configurationReference`,
-  derives its revision from the content, validates the configuration against
-  the declared schema, and refuses to overwrite one revision with different
-  content. Section 8 stores the effective Module configuration document there.
+  derives its immutable content identity from the content, validates the
+  configuration against the declared schema, and refuses to overwrite one
+  content identity with different bytes. That Module content identity is not
+  the instance `config_revision` allocator.
 - **Whole-document topology validation.** `src/core/runtime-config.ts` already
   enforces most of Section 6: identifier syntax, unique Page and Module
   identifiers, referential integrity of every input and output Page,
@@ -1242,6 +1250,11 @@ them.
 
 ### 14.2 What this contract depends on that does not exist
 
+- **Shared Runtime authority database.** No TypeScript/Rust composition yet
+  implements schema version 1, the append-only integer config mapping, exact
+  current pointer, prerequisite foreign keys, premise-last transaction, reopen
+  checks, or offline legacy-JSON cutover. Configuration work cannot claim
+  revision authority until those contracts and `TST-AUTH-004..006` pass.
 - **Module execution.** Configured Modules are rejected by the runtime, per
   `core-runtime.md` Section 5.1 and decision register rows DEC-008 and DEC-009.
   Every plan entry that would start or restart a Module generation is therefore

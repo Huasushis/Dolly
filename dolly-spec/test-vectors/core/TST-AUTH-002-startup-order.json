@@ -2,24 +2,27 @@
   "schema": "dolly.test-vector/v1",
   "test_id": "TST-AUTH-002",
   "kind": "crash_recovery",
-  "covers": ["REQ-ACT-003", "REQ-ACT-004", "INV-ACTIVATION-012", "INV-ACTIVATION-013", "INV-ACTIVATION-015"],
+  "covers": ["REQ-ACT-003", "REQ-ACT-004", "REQ-AUTH-001", "REQ-AUTH-004", "INV-ACTIVATION-012", "INV-ACTIVATION-013", "INV-ACTIVATION-015"],
   "initial": {
     "installed_executable_module_count": 2,
     "inspected_configuration": {
-      "instance_id": "0198ab31-6c44-7e8a-b2bb-000000000511",
+      "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000511",
+      "instance_id": "main",
       "config_revision": 42,
       "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
     "service_candidate": {
       "schema": "dolly.linux-service-candidate/v1",
       "origin": {
+        "schema": "dolly.installed-component-origin/v1",
         "kind": "installed_product_component",
         "component_id": "org.dolly.runtime.service-candidate",
         "component_revision": 2,
         "component_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
       },
       "unit_name": "dollyd@main.service",
-      "mode": "user"
+      "mode": "user",
+      "candidate_digest": "sha256:01fe6e668fcbb43cad4569dc7818ed16dd78ab6e20f9faf3ae3203d383e6efa4"
     },
     "cases": {
       "non_linux": {
@@ -58,8 +61,8 @@
       "InspectConfigReadOnly",
       "ObservePlatform",
       "AcquireControllerLock",
+      "OpenAndValidateRuntimeAuthorityDatabase",
       "ClaimCurrentConfiguration",
-      "OpenAndValidateCoreStore",
       "ValidateAndResolveActivationPremises",
       "InspectServiceAndRuntime",
       "PrepareDelegatedRootAndReadBack",
@@ -81,14 +84,14 @@
       {"path": "/cases/non_linux/core_store_created", "op": "equals", "value": false},
       {"path": "/cases/non_linux/systemd_query_count", "op": "equals", "value": 0},
       {"path": "/cases/non_linux/cgroup_write_count", "op": "equals", "value": 0},
-      {"path": "/cases/linux_current/trace", "op": "equals", "value": ["InspectConfigReadOnly", "ObservePlatform", "AcquireControllerLock", "ClaimCurrentConfiguration", "OpenAndValidateCoreStore", "ValidateAndResolveActivationPremises", "InspectServiceAndRuntime", "PrepareDelegatedRootAndReadBack", "ProveOldModuleContainersEmpty", "RecoverCoreState", "MintRecoveryHandoff", "ConsumeRecoveryHandoffInInstalledComposition", "CreateFreshModuleAndProcessGenerations", "ExposeReady"]},
+      {"path": "/cases/linux_current/trace", "op": "equals", "value": ["InspectConfigReadOnly", "ObservePlatform", "AcquireControllerLock", "OpenAndValidateRuntimeAuthorityDatabase", "ClaimCurrentConfiguration", "ValidateAndResolveActivationPremises", "InspectServiceAndRuntime", "PrepareDelegatedRootAndReadBack", "ProveOldModuleContainersEmpty", "RecoverCoreState", "MintRecoveryHandoff", "ConsumeRecoveryHandoffInInstalledComposition", "CreateFreshModuleAndProcessGenerations", "ExposeReady"]},
       {"path": "/cases/linux_current/activation_permission_count", "op": "equals", "value": 1},
       {"path": "/cases/linux_current/runtime_binding_count", "op": "equals", "value": 1},
       {"path": "/cases/linux_current/recovery_handoff_count", "op": "equals", "value": 1},
       {"path": "/cases/linux_current/recovery_handoff_consume_count", "op": "equals", "value": 1},
       {"path": "/cases/linux_current/ready", "op": "equals", "value": true},
       {"path": "/cases/linux_config_changed/error", "op": "equals", "value": "CONFIG_REVISION_CONFLICT"},
-      {"path": "/cases/linux_config_changed/trace", "op": "equals", "value": ["InspectConfigReadOnly", "ObservePlatform", "AcquireControllerLock", "ClaimCurrentConfiguration", "ReleaseControllerLock"]},
+      {"path": "/cases/linux_config_changed/trace", "op": "equals", "value": ["InspectConfigReadOnly", "ObservePlatform", "AcquireControllerLock", "OpenAndValidateRuntimeAuthorityDatabase", "ClaimCurrentConfiguration", "ReleaseControllerLock"]},
       {"path": "/cases/linux_config_changed/activation_permission_count", "op": "equals", "value": 0},
       {"path": "/cases/linux_untrusted_candidate_origin/error", "op": "equals", "value": "MODULE_ACTIVATION_PREMISES_INVALID"},
       {"path": "/cases/linux_untrusted_candidate_origin/systemd_query_count", "op": "equals", "value": 0},

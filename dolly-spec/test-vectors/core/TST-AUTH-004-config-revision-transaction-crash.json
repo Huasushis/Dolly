@@ -1,0 +1,79 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-AUTH-004",
+  "kind": "crash_recovery",
+  "covers": ["REQ-AUTH-002", "REQ-AUTH-003", "INV-AUTH-001", "INV-AUTH-002"],
+  "initial": {
+    "authority_schema_version": 1,
+    "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000541",
+    "instance_id": "main",
+    "current": {
+      "config_revision": 7,
+      "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "canonical_content": "A"
+    },
+    "candidates": {
+      "exact_current": {
+        "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "canonical_content": "A"
+      },
+      "same_digest_different_content": {
+        "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "canonical_content": "hostile-collision-content"
+      },
+      "changed_to_b": {
+        "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "canonical_content": "B",
+        "complete_prerequisite_set": true
+      },
+      "changed_back_to_a": {
+        "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "canonical_content": "A",
+        "complete_prerequisite_set": true
+      }
+    },
+    "crash_points": [
+      "after_begin_immediate_before_mapping",
+      "after_mapping_before_prerequisites",
+      "after_prerequisites_before_premise",
+      "after_premise_before_current_pointer",
+      "after_current_pointer_before_commit",
+      "after_commit_before_acknowledgement"
+    ]
+  },
+  "stimulus": {
+    "commands": [
+      "InstallExactCurrent",
+      "AttemptSameDigestDifferentContent",
+      "InstallChangedBAtEachCrashPoint",
+      "Reopen",
+      "InstallChangedBackToA"
+    ]
+  },
+  "expected": {
+    "outcome": "current_equal_reuses_changed_allocates_next_and_crash_exposes_all_or_none",
+    "assertions": [
+      {"path": "/exact_current/config_revision", "op": "equals", "value": 7},
+      {"path": "/exact_current/new_mapping_count", "op": "equals", "value": 0},
+      {"path": "/same_digest_different_content/error", "op": "equals", "value": "CORE_DIGEST_MISMATCH"},
+      {"path": "/same_digest_different_content/new_mapping_count", "op": "equals", "value": 0},
+      {"path": "/precommit_crashes/current_config_revision", "op": "equals", "value": 7},
+      {"path": "/precommit_crashes/candidate_mapping_count", "op": "equals", "value": 0},
+      {"path": "/precommit_crashes/candidate_prerequisite_count", "op": "equals", "value": 0},
+      {"path": "/precommit_crashes/candidate_premise_count", "op": "equals", "value": 0},
+      {"path": "/committed_b/config_revision", "op": "equals", "value": 8},
+      {"path": "/committed_b/mapping_prerequisites_premise_pointer_complete", "op": "equals", "value": true},
+      {"path": "/committed_b/acknowledgement_reopen_allocated_again", "op": "equals", "value": false},
+      {"path": "/changed_back_to_a/config_revision", "op": "equals", "value": 9},
+      {"path": "/changed_back_to_a/historical_revision_reused", "op": "equals", "value": false},
+      {"path": "/schema/global_digest_unique_constraint_count", "op": "equals", "value": 0},
+      {"path": "/schema/revision_derived_from_digest", "op": "equals", "value": false},
+      {"path": "/live_authority_created_before_commit", "op": "equals", "value": false}
+    ],
+    "emitted": [
+      {"event": "ConfigInstalled", "config_revision": 8},
+      {"event": "ConfigInstalled", "config_revision": 9}
+    ],
+    "crash_label": "each_authority_transaction_boundary"
+  }
+}

@@ -465,18 +465,28 @@ backend keep the Module process and every descendant inside one non-reused
 Module control group, terminate that whole group on stop, hard timeout,
 failure, and replacement, and prove `populated 0` before any replacement or
 Claim disposition. Before any of that, Core MUST hold the current controller
-lock, claim the current configuration revision/digest, validate its exact
-activation-premise record, and prove in both directions that it is the main
-process of the product-owned systemd user-service candidate. The candidate
-origin, unit name, and mode are lookup inputs, not authority: the service
-manager must report this process as the unit's main process, and this process's
-own control group, read from the process filesystem, must be the delegated
-subgroup inside the manager-reported unit cgroup. An environment value,
-instance field, process record, Ready response, result, acknowledgement, or
-absence cannot create that candidate or proof. Core MUST also confirm the
-effective restart, kill, timeout, delegation, and control-group settings and
-fail closed on any unreadable value. This verification and the persistent
-policy definition/backend-binding chain remain prerequisites; current candidate
+lock for the exact installation/instance identity and reopen the one shared
+Runtime SQLite authority database under its required PRAGMAs. It verifies the
+internal identity, schema version, current config mapping/revision/digest, and
+complete premise records; a filesystem path or legacy JSON file cannot claim
+or override them. A changed configuration transaction inserts all origins,
+policy definitions, backend bindings, and service candidate before writing the
+premise last and publishing the current pointer in one commit. No persistent
+record serializes a live object, function, endpoint credential, secret, path,
+capability, activation permission, runtime binding, stop prover, or recovery
+handoff.
+
+Core then proves in both directions that it is the main process of the
+product-owned systemd user-service candidate. The candidate origin, unit name,
+mode, and digest are lookup inputs, not authority: the service manager must
+report this process as the unit's main process, and this process's own control
+group, read from the process filesystem, must be the delegated subgroup inside
+the manager-reported unit cgroup. An environment value, instance source field,
+process record, Ready response, result, acknowledgement, or absence cannot
+create that candidate or proof. Core MUST also confirm the effective restart,
+kill, timeout, delegation, and control-group settings and fail closed on any
+unreadable value. This verification and the persistent policy
+definition/backend-binding chain remain prerequisites; current candidate
 evidence does not satisfy the complete product composition, so Modules stay
 disabled under `RUNTIME_MODULE_MIGRATION_REQUIRED`.
 Claims, Module process records, and Module submission records live in one atomic Core-state update as defined by `core-runtime.md`,

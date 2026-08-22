@@ -24,10 +24,12 @@ escalation path.
 ## Decision
 
 The Host persists a closed `dolly.module-activation-premises/v1` record for each
-active configuration revision. Each distinct configured permission policy has
-one immutable definition record and one non-secret backend-binding record with
-an exact binding identifier, revision, digest, and installed-product component
-origin. The installed Host registry, not JSON, resolves that record to one fresh
+active installed-Linux configuration revision in the one Runtime SQLite
+authority database selected by [ADR 0015](0015-runtime-authority-database.md).
+Each distinct configured permission policy has one immutable definition record
+and one non-secret permission-policy backend-binding record with an exact
+binding identifier, revision, digest, and installed-product component origin.
+The installed Host registry, not JSON, resolves that record to one fresh
 object-identity-branded live binding per controller generation.
 
 The installed Linux product supplies one non-secret user-service candidate from
@@ -41,9 +43,10 @@ For executable Modules the order is platform refusal, controller-lock ownership,
 current configuration claim, authoritative-store validation, exact premise
 resolution, service/runtime proof, delegated-root preparation, startup recovery,
 one-use handoff, installed composition, fresh generations, then Ready. Restart
-revalidates persistent bytes and remints every live object. Migration installs a
-complete premise record atomically with its target configuration and never
-infers missing records from runtime state.
+revalidates persistent bytes and remints every live object. Migration inserts
+every prerequisite, writes the premise last, and publishes its target
+configuration/current pointer in one SQLite transaction; it never infers
+missing records from runtime state or leaves JSON as a second authority.
 
 ## Alternatives rejected
 

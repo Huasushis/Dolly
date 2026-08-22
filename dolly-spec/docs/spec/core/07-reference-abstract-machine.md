@@ -21,11 +21,18 @@ One instance state is the tuple:
 
 ```text
 S = (
+  daemon_installation_id,
   instance_id,
   next_commit_seq,
   active_config_revision,
+  active_config_digest,
   active_graph_revision,
   Configs,
+  InstalledComponentOrigins,
+  PermissionPolicyDefinitions,
+  PermissionPolicyBackendBindings,
+  LinuxServiceCandidates,
+  ModuleActivationPremisePolicySelections,
   ModuleActivationPremises,
   Graphs,
   Pages,
@@ -45,6 +52,10 @@ S = (
 ```
 
 Maps are keyed by the identities defined in the identifier specification. Canonical map iteration is bytewise ascending key order.
+`Configs[C]` stores the mapping's digest, exact JCS bytes, and decoded canonical
+resolved configuration. Pseudocode field selection through `Configs[C]` uses
+its `runtime_config` member; `.canonical_bytes` names the complete resolved
+record bytes used for revision identity.
 
 ### 1.1 Page state
 
@@ -180,8 +191,8 @@ An implementation MUST NOT expose a post-state before its transaction commits.
 
 | Transition | Required pre-state | Success post-state | Failure post-state |
 | --- | --- | --- | --- |
-| `InstallConfig` | valid non-graph candidate, current config revision `C`, cutover preconditions satisfied | complete config revision `C+1` active; graph unchanged | unchanged |
-| `InstallGraph` | valid config/graph candidates, current revisions `C`/`R`, cutover preconditions satisfied | complete config `C+1` and graph `R+1` active | unchanged |
+| `InstallConfig` | valid non-graph candidate, current mapping `C`, cutover preconditions satisfied | exact-current bytes reuse `C`, or complete changed config `C+1` becomes active; graph unchanged | unchanged |
+| `InstallGraph` | valid config/graph candidates, current revisions `C`/`R`, cutover preconditions satisfied | complete changed config `C+1` and graph `R+1` active | unchanged |
 | `Ingress` | idempotency key unused or identical | Block and all durable target Deliveries committed | unchanged |
 | `RuntimeEvent` | trusted Runtime source; idempotency key unused or identical | Runtime Block and all durable target Deliveries committed | unchanged |
 | `GrantStorageWriter` | scope is `unowned` or `released`; no live prior owner; next generation available | one active owner at the next writer generation | unchanged or `write_fenced_unknown` when prior release cannot be proved |
@@ -277,32 +288,46 @@ No invalid or permanent response can leave dispatch evidence looking merely
 ```text
 InstallConfig(candidate_config, candidate_activation_premises, cutover_evidence):
   C := S.active_config_revision
-  validate complete resolved configuration and finite limits
-  require candidate_config.revision == C + 1
+  D := S.active_config_digest
+  validate complete canonical resolved configuration and finite limits
   require candidate_config has no effective graph change
   require control-plane cutover preconditions for cutover_evidence.change_class are satisfied
   canonical_config := JCS(candidate_config)
+  candidate_digest := sha256(canonical_config)
+  if candidate_digest == D:
+    require canonical_config == Configs[C].canonical_bytes; otherwise STORAGE_CORRUPT
+    require candidate_activation_premises is absent or JCS(candidate_activation_premises) == ModuleActivationPremises[C].canonical_bytes
+    return C
+  require C < 9007199254740991
+  target_config_revision := C + 1
   canonical_premises := absent
   if candidate_config selects an installed Linux Module:
-    require candidate_activation_premises.config_revision == C + 1
-    require candidate_activation_premises.config_digest == sha256(canonical_config)
-    validate complete definition/binding cardinality, revisions, digests, origins, service candidate, and premises_digest
+    require candidate_activation_premises.config_revision == target_config_revision
+    require candidate_activation_premises.config_digest == candidate_digest
+    validate closed origin/definition/backend-binding/service-candidate records,
+      exact foreign keys and cardinality, and every digest
     canonical_premises := JCS(candidate_activation_premises)
   else:
     require candidate_activation_premises is absent
   atomic {
-    insert Configs[C + 1] = canonical_config
+    recheck S active revision/digest and Configs[C] exact bytes
+    insert Configs[target_config_revision] = (candidate_digest, canonical_config)
+    insert or byte-identically verify installed-component origins, definitions,
+      backend bindings, service candidate, and deferred premise-policy selections
     if canonical_premises exists:
-      insert ModuleActivationPremises[C + 1] = canonical_premises
-    S.active_config_revision = C + 1
-    Journal += ConfigInstalled(C + 1, sha256(canonical_config), digest_or_absent(canonical_premises), S.active_graph_revision)
+      insert ModuleActivationPremises[target_config_revision] = canonical_premises
+        as the last prerequisite record
+    S.active_config_revision = target_config_revision
+    S.active_config_digest = candidate_digest
+    Journal += ConfigInstalled(target_config_revision, candidate_digest, digest_or_absent(canonical_premises), S.active_graph_revision)
   }
+  return target_config_revision
 
 InstallGraph(candidate_config, candidate_graph, candidate_activation_premises, cutover_evidence):
   C := S.active_config_revision
+  D := S.active_config_digest
   R := S.active_graph_revision
-  validate complete resolved configuration, identifiers, Pages, Modules, unique edges, and finite limits
-  require candidate_config.revision == C + 1
+  validate complete canonical resolved configuration, identifiers, Pages, Modules, unique edges, and finite limits
   require candidate_graph.revision == R + 1
   require control-plane cutover preconditions for cutover_evidence.change_class are satisfied
   if cutover_evidence leaves old Activations live for a graph-only route change:
@@ -312,26 +337,37 @@ InstallGraph(candidate_config, candidate_graph, candidate_activation_premises, c
   require every removed object can enter draining/tombstone state
   require every stranded durable range has an exact completed approved disposition
   canonical_config := JCS(candidate_config)
+  candidate_digest := sha256(canonical_config)
+  require candidate_digest != D
+  require C < 9007199254740991
+  target_config_revision := C + 1
   canonical_graph := JCS(candidate_graph)
   canonical_premises := absent
   if candidate_config selects an installed Linux Module:
-    require candidate_activation_premises.config_revision == C + 1
-    require candidate_activation_premises.config_digest == sha256(canonical_config)
-    validate complete definition/binding cardinality, revisions, digests, origins, service candidate, and premises_digest
+    require candidate_activation_premises.config_revision == target_config_revision
+    require candidate_activation_premises.config_digest == candidate_digest
+    validate closed origin/definition/backend-binding/service-candidate records,
+      exact foreign keys and cardinality, and every digest
     canonical_premises := JCS(candidate_activation_premises)
   else:
     require candidate_activation_premises is absent
   atomic {
-    insert Configs[C + 1] = canonical_config
+    recheck S active config revision/digest, graph revision, and Configs[C] exact bytes
+    insert Configs[target_config_revision] = (candidate_digest, canonical_config)
+    insert or byte-identically verify installed-component origins, definitions,
+      backend bindings, service candidate, and deferred premise-policy selections
     if canonical_premises exists:
-      insert ModuleActivationPremises[C + 1] = canonical_premises
+      insert ModuleActivationPremises[target_config_revision] = canonical_premises
+        as the last prerequisite record
     insert Graphs[R + 1] = canonical_graph
     create new subscriptions with explicit/default start cursors
     mark removed subscriptions draining
-    S.active_config_revision = C + 1
+    S.active_config_revision = target_config_revision
+    S.active_config_digest = candidate_digest
     S.active_graph_revision = R + 1
-    Journal += GraphInstalled(C + 1, R + 1, sha256(canonical_config), sha256(canonical_graph), digest_or_absent(canonical_premises))
+    Journal += GraphInstalled(target_config_revision, R + 1, candidate_digest, sha256(canonical_graph), digest_or_absent(canonical_premises))
   }
+  return (target_config_revision, R + 1)
 ```
 
 ### 5.2 Ingress
@@ -947,16 +983,20 @@ LossyEvict(page_id):
 
 ```text
 Recover():
-  inspect configuration without writable ownership
+  locate and inspect authority state/current canonical config without writable ownership
   if configuration contains an installed Linux Module:
     observe Host platform
     if platform != linux: return MODULE_ACTIVATION_PLATFORM_UNSUPPORTED without acquiring/creating the instance lock or another writable resource
-  acquire exclusive instance controller lock and mint fresh controller generation
-  claim and reread exact active configuration revision and digest
-  open and verify SQLite configuration, schema, integrity, bounds, and digests
+  acquire exclusive instance controller lock for (daemon_installation_id, instance_id)
+    and mint fresh controller generation
+  reopen the same Runtime database with required PRAGMAs
+  verify SQLite attestation, user_version, integrity, foreign keys, bounds,
+    core_meta/authority-state identity, exact current pointer/mapping, and equality
+    with the inspected revision/digest
   if configuration contains an installed Linux Module:
     P := the one schema-valid Module activation premise record for the claimed configuration revision
-    verify P's digest, exact definition/binding cardinality, and installed-product origins
+    verify P's digest, exact definition/backend-binding cardinality,
+      installed-product origins, service-candidate foreign key, and config mapping
     resolve fresh branded live policy bindings for this controller generation
     verify P's product-owned service candidate and reviewed runtime
     prepare/read back delegated root and mint the branded activation permission, runtime binding, and stop prover

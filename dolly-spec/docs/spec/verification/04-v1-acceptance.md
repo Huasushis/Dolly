@@ -8,7 +8,7 @@ Every gate is mandatory unless an explicit platform qualifier is stated.
 | `V1-02 Process modes` | foreground, daemon-managed, restart, multi-instance, duplicate-lock, and parent-death tests pass |
 | `V1-03 Core separation` | dependency audit proves Core has no provider/UI/Extension implementation dependency |
 | `V1-04 Extension resilience` | crash, hang, malformed frame, stale result, crash-loop quarantine, and hot replacement suites pass |
-| `V1-05 Config` | revision conflict, prepare failure, quiesce timeout, partial commit, rollback failure, and recovery tests pass |
+| `V1-05 Config` | exact digest/content revision reuse, changed-content next allocation, `A -> B -> A`, mapping/current-pointer atomicity, revision conflict, prepare failure, quiesce timeout, partial commit, rollback failure, and recovery tests pass |
 | `V1-06 Page semantics` | ordering, occurrence, durable/lossy retention, quota, dead-letter, and million-entry slow-subscriber tests pass |
 | `V1-07 Block/Asset` | schema, reference DAG, import/crop/pin/GC, SSRF/path/media abuse, OSS optional-path tests pass |
 | `V1-08 Channels` | CLI and Web can exchange text and supported multimodal Assets with auth and session isolation |
@@ -19,7 +19,7 @@ Every gate is mandatory unless an explicit platform qualifier is stated.
 | `V1-13 Memory baseline` | hybrid retrieval/provenance/update/abstention pass; effective query-basis self-exclusion, no self-index loop, unique result identities, typed external Memory evidence, and same-request deduplication pass; fixed LongMemEval/LoCoMo and Dolly task-switch reports are published |
 | `V1-14 Alarm` | persistent one-shot/repeating/acknowledged alarms pass virtual-clock, restart, DST, missed-fire, and race suites |
 | `V1-15 Observability` | journal replay reproduces Core digest; trace correlation, redaction, rotation, cardinality, and diagnostics-bundle tests pass |
-| `V1-16 Recovery` | exhaustive named crash points, known-fixed SQLite build/startup gate, WAL checkpoint/write concurrency regression, installed Linux Module definition/binding origin and startup-order gates, stale live-authority rejection, downstream-abstention, backup/restore, migration, corruption detection, and disk-full recovery pass |
+| `V1-16 Recovery` | exhaustive named crash points, known-fixed SQLite build/startup gate, WAL checkpoint/write concurrency regression, authority-database reopen/identity/digest/stale-pointer/cross-origin and legacy-JSON single-authority gates, installed Linux Module definition/backend-binding origin and startup-order gates, stale live-authority rejection, downstream-abstention, backup/restore, migration, corruption detection, and disk-full recovery pass |
 | `V1-17 Research` | harness validates immutable plan/run records and reproduces registered Memory repeat/context-selection, association, abstraction/transfer, Reflection, scheduler/versioned-hint, browser, learning, topology, and pinned framework-comparison experiments; no ungated research path is enabled by default |
 | `V1-18 Documentation` | schemas, protocol guide, Extension SDK guide, operations guide, security model, benchmark reports, ADRs, and clause-level source→requirement→implemented-test/manual-procedure inventory are complete; umbrella-only draft IDs do not pass |
 | `V1-19 Optional profiles` | each advertised optional profile independently passes its complete schema, state, lifecycle, resource, security, migration, upstream-compatibility, and adversarial suite; an omitted profile creates no base-v1 blocker |

@@ -193,11 +193,19 @@ authoritative Activation result digest, subscription cursors, and idempotent
 operation IDs. Every migration has forward, rollback-policy, interrupted-run,
 backup/restore, and schema-version tests.
 
+The first migration is the language-neutral Runtime authority schema version 1,
+not a Rust-owned variant. TypeScript configuration allocation and Rust recovery
+open the same database under the same controller lock. Repository methods must
+preserve the append-only config mapping, exact current pointer, prerequisite
+foreign keys, premise-last insertion, and no-global-digest-uniqueness contract;
+a JSON or Rust sidecar is not a fallback authority.
+
 Open SQLite only after verifying the attested embedded library required by
-`REQ-TECH-003`. Apply the normative PRAGMAs on every connection, verify their
-effective values, keep a single application writer, and run the named
-checkpoint/write regression. A pool configuration must not accidentally create
-another logical writer.
+`REQ-TECH-003`. Apply and read back the normative WAL, `synchronous=FULL`,
+foreign-key, trusted-schema, busy-timeout, and `user_version` requirements, keep
+a single application writer using immediate authority transactions, and run
+the named checkpoint/write regression. A pool configuration must not
+accidentally create another logical writer.
 
 ## 6. Scheduler and dispatch split
 
@@ -313,10 +321,14 @@ tests are separately marked and cannot replace deterministic conformance.
 
 ## 12. First implementation slice
 
-The first vertical slice contains one durable input Page, one echo Extension,
-one Module, one durable output Page, SQLite, the final framing, and the final
+The first vertical slice starts with the shared Runtime authority mapping and
+`TST-AUTH-004..006`, then contains one durable input Page, one echo Extension,
+one Module, one durable output Page, SQLite, final framing, and the final
 Activation transaction. It is complete only when it passes:
 
+- current-equal revision reuse, changed-content next allocation, and
+  `A -> B -> A`;
+- crash/reopen/stale/mismatch/cross-origin and legacy JSON cutover;
 - ingress idempotency;
 - restart before and after each write/commit boundary;
 - process death before and after Activation result staging;

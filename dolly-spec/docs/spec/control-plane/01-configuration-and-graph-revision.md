@@ -17,6 +17,17 @@ The control plane **MUST** preserve the submitted JSON document for audit and **
 - excludes presentation-only fields from graph semantics where the schema declares them presentation-only; and
 - has a cryptographic digest recorded with the revision.
 
+For revision identity, the **canonical resolved configuration** is the closed
+`ResolvedConfiguration` record in
+[`runtime-authority-record.schema.json`](../../../schemas/runtime-authority-record.schema.json).
+It contains the normalized Runtime document plus the exact sorted
+permission-policy definition/backend-binding identities and product-owned
+service-candidate record selected during Host validation. Those records are
+materialized by the Host; their presence does not let submitted JSON choose an
+installed component or service. `config_digest` is the SHA-256 digest of the
+JCS bytes of this complete resolved record. The separately retained submitted
+document and its digest are audit input, not current Runtime authority.
+
 JSON Schema's `default` keyword is an annotation and is never an input to
 normalization. Dolly v1 Extension-level and Module config schema bundles MUST
 NOT contain a JSON member named `default` at any depth (including under a
@@ -115,12 +126,27 @@ declared validation and delivery consumers.
 
 Each instance has two monotonically increasing Core safe-JSON-integer revisions:
 
-- `config_revision`, advanced exactly once for every successfully committed normalized configuration change; and
+- `config_revision`, allocated for each successfully committed change to the
+  canonical resolved configuration; and
 - `graph_revision`, advanced exactly once when the effective Page/Module/subscription/routing graph or any Descriptor/capability-policy revision pinned by that graph changes.
 
-Both begin at 1 for the first committed configuration. Revision 0 means no committed configuration. Revision values **MUST** be persisted and encoded as JSON integers in `0..9007199254740991`. The control plane **MUST** stop admission with `CORE_SEQUENCE_EXHAUSTED` before it would reuse or exceed that range.
+Both begin at 1 for the first committed configuration; no committed mapping
+uses revision 0. Revision values **MUST** be persisted and encoded as JSON
+integers in `1..9007199254740991`. The control plane **MUST** stop admission
+with `CORE_SEQUENCE_EXHAUSTED` before it would reuse or exceed that range.
 
-A transaction that changes only a non-graph setting advances `config_revision` and retains `graph_revision`. A transaction that changes graph semantics advances both in the same Host database transaction. Revisions never decrease and are never reused, including after rollback. A rollback is a new configuration transaction with new revision values.
+Revision allocation follows the authoritative transaction in
+[Storage and Recovery](../core/06-storage-and-recovery.md#31-runtime-authority-database-schema-version-1).
+An exact candidate digest and byte match with the current resolved
+configuration reuses the current `config_revision`. A changed current digest
+allocates exactly the next integer in the same transaction that installs the
+mapping and updates the current pointer. Historical digest equality is
+irrelevant: applying `A`, then `B`, then `A` allocates three revisions. A
+transaction that changes only a non-graph setting advances `config_revision`
+and retains `graph_revision`; one that changes graph semantics advances both in
+the same Runtime database transaction. Revisions never decrease or identify
+different bytes. A rollback to old content is a new configuration transaction
+and, because the current digest changes, receives a new revision.
 
 The Host **MUST** persist, for every committed revision:
 

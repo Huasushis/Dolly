@@ -1,0 +1,82 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-AUTH-005",
+  "kind": "crash_recovery",
+  "covers": ["REQ-AUTH-001", "REQ-AUTH-004", "REQ-AUTH-005", "INV-AUTH-002"],
+  "initial": {
+    "expected_identity": {
+      "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000551",
+      "instance_id": "main"
+    },
+    "authority_state": {
+      "schema": "dolly.runtime-authority-state/v1",
+      "authority_schema_version": 1,
+      "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000551",
+      "instance_id": "main",
+      "current_config_revision": 42,
+      "current_config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "current_mapping": {
+      "config_revision": 42,
+      "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "canonical_content": "exact-current-content"
+    },
+    "locators": {
+      "original": "/managed/instances/main/runtime.sqlite3",
+      "moved_same_database": "/managed/instances/main/store/runtime.sqlite3",
+      "copied_other_installation": "/tmp/runtime.sqlite3"
+    },
+    "legacy_json": {
+      "present_after_committed_migration": true,
+      "config_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "hostile_cases": [
+      "stored_daemon_installation_id_mismatch",
+      "stored_instance_id_mismatch",
+      "current_digest_same_but_content_different",
+      "current_pointer_references_missing_mapping",
+      "unsupported_user_version",
+      "copied_database_under_original_identity",
+      "legacy_json_disagrees_after_commit"
+    ]
+  },
+  "stimulus": {
+    "commands": [
+      "ReopenMovedSameDatabaseUnderSameControllerLock",
+      "AttemptEachHostileReopen",
+      "AttemptLegacyJsonOverride"
+    ],
+    "required_checks": [
+      "SQLiteAttestation",
+      "RequiredPragmas",
+      "UserVersion",
+      "QuickCheck",
+      "ForeignKeyCheck",
+      "CoreMetaAuthorityIdentity",
+      "CurrentPointerMapping",
+      "CanonicalDigestContent"
+    ]
+  },
+  "expected": {
+    "outcome": "internal_identity_and_exact_content_govern_reopen_while_path_and_legacy_json_do_not",
+    "assertions": [
+      {"path": "/moved_same_database/reopen", "op": "equals", "value": "accepted"},
+      {"path": "/moved_same_database/current_config_revision", "op": "equals", "value": 42},
+      {"path": "/moved_same_database/path_used_as_authority", "op": "equals", "value": false},
+      {"path": "/hostile_results/stored_daemon_installation_id_mismatch/error", "op": "equals", "value": "STORAGE_CORRUPT"},
+      {"path": "/hostile_results/stored_instance_id_mismatch/error", "op": "equals", "value": "STORAGE_CORRUPT"},
+      {"path": "/hostile_results/current_digest_same_but_content_different/error", "op": "equals", "value": "STORAGE_CORRUPT"},
+      {"path": "/hostile_results/current_pointer_references_missing_mapping/error", "op": "equals", "value": "STORAGE_CORRUPT"},
+      {"path": "/hostile_results/unsupported_user_version/error", "op": "equals", "value": "STORAGE_MIGRATION_REQUIRED"},
+      {"path": "/hostile_results/copied_database_under_original_identity/error", "op": "equals", "value": "STORAGE_INSTANCE_LOCKED"},
+      {"path": "/legacy_json/selected_after_sqlite_commit", "op": "equals", "value": false},
+      {"path": "/legacy_json/overrode_current_pointer", "op": "equals", "value": false},
+      {"path": "/legacy_json/dual_authority", "op": "equals", "value": false},
+      {"path": "/hostile_results/live_binding_count", "op": "equals", "value": 0},
+      {"path": "/hostile_results/recovery_handoff_count", "op": "equals", "value": 0},
+      {"path": "/hostile_results/ready", "op": "equals", "value": false}
+    ],
+    "emitted": [],
+    "crash_label": "after_sqlite_commit_before_legacy_json_archive"
+  }
+}

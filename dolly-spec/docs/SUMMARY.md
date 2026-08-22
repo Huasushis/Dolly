@@ -86,6 +86,7 @@
   - [ADR 0012: NapCatQQ mailbox and catalog](adrs/0012-napcatqq-mailbox-and-catalog.md)
   - [ADR 0013: Testament and LevelUpper boundaries](adrs/0013-testament-and-levelupper-boundaries.md)
   - [ADR 0014: Installed Module activation authority](adrs/0014-installed-module-activation-authority.md)
+  - [ADR 0015: Shared Runtime authority database](adrs/0015-runtime-authority-database.md)
 
 - [Source material](baseline/SOURCE-MANIFEST.md)
   - [Review of the newly uploaded conversation](baseline/REVIEW.md)

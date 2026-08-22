@@ -70,6 +70,14 @@ The implementation **MUST** resolve these through Windows known-folder APIs rath
 
 User-supplied data roots MAY override defaults only through validated offline configuration. Network shares and removable filesystems are unsupported for active v1 SQLite/lock state unless a later backend explicitly guarantees equivalent locking and durability.
 
+These directories and an instance's database filename are locators, not
+authority. Writable reopen still requires the exact internal
+`(daemon_installation_id, instance_id)`, the matching instance controller lock,
+schema/integrity checks, and current mapping defined by
+[Storage and Recovery](../core/06-storage-and-recovery.md#31-runtime-authority-database-schema-version-1).
+A move within supported storage does not change identity, and a copied database
+at another path does not gain a second writer or a new instance identity.
+
 ## 4. Local IPC and ACLs
 
 ### 4.1 Linux UDS
@@ -137,7 +145,11 @@ Writers **MUST** create a private temporary file in the destination filesystem, 
 - Linux uses same-filesystem `rename`/`renameat` semantics and, where durability is required, flushes the file and containing directory.
 - Windows uses `ReplaceFileW` or the documented same-volume atomic replacement primitive, flushes file buffers where durability is required, and handles sharing violations with bounded retry.
 
-An implementation **MUST NOT** assume rename is atomic across volumes. Failure before publication leaves the previous committed file authoritative; partial temporary files are recovery garbage, not active configuration.
+An implementation **MUST NOT** assume rename is atomic across volumes. For a
+non-SQLite published artifact, failure before publication leaves the previous
+committed artifact in place and partial temporary files are recovery garbage.
+Runtime configuration/current-premise authority is never published by file
+rename; it uses the one SQLite transaction defined by the storage contract.
 
 ## 9. SQLite contract
 
