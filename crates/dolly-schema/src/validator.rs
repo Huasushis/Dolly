@@ -119,12 +119,12 @@ impl SchemaValidator {
         expected_digest: &Sha256Digest,
     ) -> Result<Self, SchemaError> {
         // 1. Canonicalize the document and verify the digest first.
-        let (canonical_bytes, computed) = dolly_canonical_json::canonicalize(document)?;
-        expected_digest.verify_bytes(canonical_bytes.as_bytes()).map_err(|_| {
-            SchemaError::Digest(format!(
+        let (_, computed) = dolly_canonical_json::canonicalize(document)?;
+        if &computed != expected_digest {
+            return Err(SchemaError::Digest(format!(
                 "embedded schema digest mismatch: expected {expected_digest}, computed {computed}"
-            ))
-        })?;
+            )));
+        }
 
         // 2. Verify the self-contained reference policy before compiling.
         verify_embedded_refs(document)?;
