@@ -121,6 +121,11 @@ pub struct ToolRegistryRecord {
     pub mcp_readiness_digest: Sha256Digest,
     pub server_id: String,
     pub server_digest: Sha256Digest,
+    pub server_adapter: String,
+    pub server_protocol_version: String,
+    pub server_transport_kind: String,
+    pub server_endpoint_digest: Sha256Digest,
+    pub server_transport_digest: Sha256Digest,
     pub tool_server_generation: u64,
 }
 
@@ -163,21 +168,41 @@ impl ToolRegistryRecord {
         premises_digest: &Sha256Digest,
         runtime_binding_digest: &Sha256Digest,
         readiness_digest: &Sha256Digest,
+        service_candidate_digest: &Sha256Digest,
+        service_candidate_origin: &InstalledComponentOrigin,
+        extension_alias: &ExtensionId,
         controller_generation: u64,
         extension_generation: u64,
         worker_epoch: &str,
+        server_id: &str,
+        server_digest: &Sha256Digest,
+        server_adapter: &str,
+        server_protocol_version: &str,
+        server_transport_kind: &str,
+        server_endpoint_digest: &Sha256Digest,
+        server_transport_digest: &Sha256Digest,
     ) -> Result<(), ToolBrokerAuthorityError> {
         if self.config_revision != config_revision
             || &self.config_digest != config_digest
             || &self.premises_digest != premises_digest
+            || &self.service_candidate_digest != service_candidate_digest
+            || &self.service_candidate_origin != service_candidate_origin
+            || &self.extension_alias != extension_alias
             || &self.runtime_binding_digest != runtime_binding_digest
             || self.controller_generation.value() != controller_generation
             || self.extension_generation.value() != extension_generation
             || self.worker_epoch.to_string() != worker_epoch
+            || self.server_id != server_id
+            || &self.server_digest != server_digest
+            || self.server_adapter != server_adapter
+            || self.server_protocol_version != server_protocol_version
+            || self.server_transport_kind != server_transport_kind
+            || &self.server_endpoint_digest != server_endpoint_digest
+            || &self.server_transport_digest != server_transport_digest
         {
             return Err(ToolBrokerAuthorityError::new(
                 ToolBrokerAuthorityCode::RegistryBindingMismatch,
-                "registry revision is not bound to the current Host/runtime identity",
+                "registry revision is not bound to the complete Host/runtime/MCP identity",
             ));
         }
         if &self.mcp_readiness_digest != readiness_digest {
@@ -573,6 +598,11 @@ pub fn publish_tool_registry(
         mcp_readiness_digest: readiness.readiness_digest().clone(),
         server_id: readiness.server_id().to_owned(),
         server_digest: readiness.server_digest().clone(),
+        server_adapter: readiness.adapter().to_owned(),
+        server_protocol_version: readiness.protocol_version().to_owned(),
+        server_transport_kind: readiness.transport_kind().to_owned(),
+        server_endpoint_digest: readiness.endpoint_digest().clone(),
+        server_transport_digest: readiness.transport_digest().clone(),
         tool_server_generation: generation,
     };
     let (record_bytes, record_digest) = record.canonical_bytes_and_digest()?;
@@ -641,6 +671,7 @@ pub fn publish_tool_registry(
         &record_digest,
         next_registry_revision,
     )?;
+    tx.commit()?;
 
     Ok(ToolRegistryRevision {
         record,
@@ -705,9 +736,19 @@ pub fn authorize_tool_dispatch(
         runtime_binding.premises_digest(),
         runtime_binding.binding_digest(),
         readiness.readiness_digest(),
+        runtime_binding.service_candidate_digest(),
+        runtime_binding.service_candidate_origin(),
+        runtime_binding.extension_alias(),
         runtime_binding.controller_generation().value(),
         process_generation.extension_generation().value(),
         &runtime_binding.worker_epoch().to_string(),
+        readiness.server_id(),
+        readiness.server_digest(),
+        readiness.adapter(),
+        readiness.protocol_version(),
+        readiness.transport_kind(),
+        readiness.endpoint_digest(),
+        readiness.transport_digest(),
     )?;
     if persisted.server_id != readiness.server_id()
         || persisted.tool_server_generation != registry.tool_server_generation()
@@ -722,6 +763,7 @@ pub fn authorize_tool_dispatch(
         registry_record_digest: digest,
         config_revision: persisted.config_revision,
         config_digest: persisted.config_digest,
+
         server_id: persisted.server_id,
         tool_server_generation: persisted.tool_server_generation,
         extension_alias: persisted.extension_alias,
@@ -731,6 +773,95 @@ pub fn authorize_tool_dispatch(
         runtime_binding_digest: persisted.runtime_binding_digest,
         readiness_digest: persisted.mcp_readiness_digest,
     })
+}
+/// Revalidate a previously issued private authority at the exact dispatch
+/// boundary. This reloads the current Host/runtime/process/MCP premises and
+/// the durable registry pointer/record/generation; no cloned authority can
+/// survive a cutover or premise change.
+pub fn revalidate_tool_dispatch_authority(
+    db: &mut Database,
+    authority: &ToolDispatchAuthority,
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    readiness: &McpTransportReadiness,
+) -> Result<(), ToolBrokerAuthorityError> {
+    let snapshot = load_current_snapshot(db.connection())?;
+    let (_config_value, _config) = validate_current_premises(
+        db.connection(),
+        &snapshot,
+        runtime_binding,
+        process_generation,
+        readiness,
+    )?;
+    let state = load_authority_state(db.connection())?;
+    if state.current_registry_revision != Some(authority.registry_revision) {
+        return Err(ToolBrokerAuthorityError::new(
+            ToolBrokerAuthorityCode::RegistryNotCurrent,
+            "dispatch authority is not the current registry pointer",
+        ));
+    }
+    let persisted = load_registry_record(db.connection(), authority.registry_revision)?;
+    let (_bytes, digest) = persisted.canonical_bytes_and_digest()?;
+    if &digest != &authority.registry_record_digest {
+        return Err(ToolBrokerAuthorityError::new(
+            ToolBrokerAuthorityCode::CanonicalInvalid,
+            "dispatch authority does not name the canonical persisted registry record",
+        ));
+    }
+    let generation_record = load_generation_record(
+        db.connection(),
+        &persisted.server_id,
+        persisted.tool_server_generation,
+        persisted.registry_revision,
+    )?;
+    if generation_record.extension_alias != persisted.extension_alias
+        || generation_record.extension_generation != persisted.extension_generation
+        || generation_record.worker_epoch != persisted.worker_epoch
+        || generation_record.runtime_binding_digest != persisted.runtime_binding_digest
+        || generation_record.readiness_digest != persisted.mcp_readiness_digest
+    {
+        return Err(ToolBrokerAuthorityError::new(
+            ToolBrokerAuthorityCode::CanonicalInvalid,
+            "tool-server generation projection differs from registry revision",
+        ));
+    }
+    if persisted.config_revision != authority.config_revision
+        || persisted.config_digest != authority.config_digest
+        || persisted.server_id != authority.server_id
+        || persisted.tool_server_generation != authority.tool_server_generation
+        || persisted.extension_alias != authority.extension_alias
+        || persisted.extension_generation != authority.extension_generation
+        || persisted.controller_generation != authority.controller_generation
+        || persisted.worker_epoch != authority.worker_epoch
+        || persisted.runtime_binding_digest != authority.runtime_binding_digest
+        || persisted.mcp_readiness_digest != authority.readiness_digest
+    {
+        return Err(ToolBrokerAuthorityError::new(
+            ToolBrokerAuthorityCode::RegistryBindingMismatch,
+            "dispatch authority fields differ from the retained registry record",
+        ));
+    }
+    persisted.validate_identity(
+        snapshot.mapping.config_revision,
+        &snapshot.mapping.config_digest,
+        runtime_binding.premises_digest(),
+        runtime_binding.binding_digest(),
+        readiness.readiness_digest(),
+        runtime_binding.service_candidate_digest(),
+        runtime_binding.service_candidate_origin(),
+        runtime_binding.extension_alias(),
+        runtime_binding.controller_generation().value(),
+        process_generation.extension_generation().value(),
+        &runtime_binding.worker_epoch().to_string(),
+        readiness.server_id(),
+        readiness.server_digest(),
+        readiness.adapter(),
+        readiness.protocol_version(),
+        readiness.transport_kind(),
+        readiness.endpoint_digest(),
+        readiness.transport_digest(),
+    )?;
+    Ok(())
 }
 
 /// Validate a ledger binding against a previously issued dispatch authority.
@@ -765,19 +896,27 @@ fn ensure_same_snapshot(
     initial: &CurrentAuthoritySnapshot,
     final_snapshot: &CurrentAuthoritySnapshot,
 ) -> Result<(), ToolBrokerAuthorityError> {
-    if initial.mapping.daemon_installation_id != final_snapshot.mapping.daemon_installation_id
-        || initial.mapping.instance_id != final_snapshot.mapping.instance_id
-        || initial.mapping.config_revision != final_snapshot.mapping.config_revision
-        || initial.mapping.config_digest != final_snapshot.mapping.config_digest
-        || match (&initial.premise, &final_snapshot.premise) {
-            (Some(a), Some(b)) => {
-                a.premises_digest == b.premises_digest
-                    && a.service_candidate.origin == b.service_candidate.origin
-                    && a.service_candidate.candidate_digest == b.service_candidate.candidate_digest
-            }
-            _ => false,
-        }
-    {
+    let initial_identity = (
+        initial.mapping.daemon_installation_id.as_str(),
+        initial.mapping.instance_id.as_str(),
+        initial.mapping.config_revision,
+        &initial.mapping.config_digest,
+        initial
+            .premise
+            .as_ref()
+            .map(|premise| &premise.premises_digest),
+    );
+    let final_identity = (
+        final_snapshot.mapping.daemon_installation_id.as_str(),
+        final_snapshot.mapping.instance_id.as_str(),
+        final_snapshot.mapping.config_revision,
+        &final_snapshot.mapping.config_digest,
+        final_snapshot
+            .premise
+            .as_ref()
+            .map(|premise| &premise.premises_digest),
+    );
+    if initial_identity != final_identity {
         return Err(ToolBrokerAuthorityError::new(
             ToolBrokerAuthorityCode::HostPremiseStale,
             "Host authority changed during registry validation",
@@ -1289,4 +1428,464 @@ fn decode_registry_record(
         ));
     }
     Ok(record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_authority::{
+        ConfigRevisionMapping, HostAuthorityRevision, InstalledComponentOrigin,
+        LinuxServiceCandidate, ModuleActivationPremises, ResolvedConfiguration,
+        RuntimeAuthorityIdentity, create_host_authority_schema, install_host_authority_revision,
+        load_current_authority,
+    };
+    use crate::linux_host_verification::test_proof_for_authority;
+    use crate::mcp_readiness::{
+        McpHandshakeObservation, McpTransportBinding, McpTransportProbe, McpTransportProbeError,
+        test_prove_current_mcp_transport_readiness,
+    };
+    use crate::runtime_binding::mint_runtime_binding;
+    use dolly_core_domain::{ExtensionId, WorkerEpoch};
+    use serde_json::{Value, json};
+    use tempfile::{TempDir, tempdir};
+
+    fn digest(value: &Value) -> Sha256Digest {
+        canonicalize(value).unwrap().1
+    }
+
+    fn without(value: &Value, field: &str) -> Value {
+        let mut object = value.as_object().unwrap().clone();
+        object.remove(field);
+        Value::Object(object)
+    }
+
+    fn origin() -> InstalledComponentOrigin {
+        let record = json!({"component": "host-runtime", "revision": 1});
+        InstalledComponentOrigin {
+            schema: "dolly.installed-component-origin/v1".into(),
+            kind: "installed_product_component".into(),
+            component_id: "org.dolly.host-runtime".into(),
+            component_revision: 1,
+            component_digest: digest(&record),
+        }
+    }
+
+    fn tool_broker_config() -> Value {
+        let input_schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"path": {"type": "string"}}
+        });
+        let output_schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"text": {"type": "string"}}
+        });
+        json!({
+            "schema": "dolly.tool-broker-config/v1",
+            "servers": {
+                "fs": {
+                    "enabled": true,
+                    "adapter": "mcp",
+                    "protocol_version": "2025-06-18",
+                    "transport": {
+                        "kind": "stdio",
+                        "package_id": "org.dolly.tools.fs",
+                        "package_version": "1.0.0",
+                        "package_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                        "executable": "bin/dolly-fs-tools",
+                        "executable_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                        "args": ["--stdio"],
+                        "secret_bindings": {}
+                    },
+                    "allowed_modules": ["module-a"],
+                    "limits": {
+                        "startup_timeout_ms": 10000,
+                        "request_timeout_ms": 30000,
+                        "max_concurrency": 4,
+                        "max_request_bytes": 1048576,
+                        "max_response_bytes": 4194304
+                    },
+                    "tools": {
+                        "read-file": {
+                            "upstream_name": "read_file",
+                            "description": "Read one authorized file.",
+                            "input_schema": input_schema,
+                            "input_schema_digest": digest(&input_schema).to_string(),
+                            "output_schema": output_schema,
+                            "output_schema_digest": digest(&output_schema).to_string(),
+                            "side_effect_class": "read_only",
+                            "idempotency": {"kind": "none"},
+                            "requires_confirmation": false,
+                            "enabled": true
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn host_revision(config_revision: i64, broker_config: Value) -> HostAuthorityRevision {
+        let origin = origin();
+        let mut candidate_record = json!({
+            "schema": "dolly.linux-service-candidate/v1",
+            "origin": serde_json::to_value(&origin).unwrap(),
+            "unit_name": "dollyd.service",
+            "mode": "user",
+            "candidate_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        });
+        candidate_record["candidate_digest"] =
+            json!(digest(&without(&candidate_record, "candidate_digest")).to_string());
+        let candidate: LinuxServiceCandidate = serde_json::from_value(candidate_record).unwrap();
+        let runtime_config = CanonicalJsonValue::try_from(json!({
+            "spec": {"services": {"tool_broker": broker_config}}
+        }))
+        .unwrap();
+        let config = ResolvedConfiguration {
+            runtime_config,
+            permission_policy_selections: Vec::new(),
+            service_candidate: Some(candidate.clone()),
+        };
+        let config_digest = canonicalize(&config).unwrap().1;
+        let identity = RuntimeAuthorityIdentity {
+            daemon_installation_id: "0198ab31-6c44-7e8a-b2bb-000000000001".into(),
+            instance_id: "instance-one".into(),
+        };
+        let premise_without_digest = json!({
+            "schema": "dolly.module-activation-premises/v1",
+            "daemon_installation_id": identity.daemon_installation_id,
+            "instance_id": identity.instance_id,
+            "config_revision": config_revision,
+            "config_digest": config_digest,
+            "permission_policy_definitions": [],
+            "permission_policy_backend_bindings": [],
+            "service_candidate": serde_json::to_value(&candidate).unwrap()
+        });
+        let premise = ModuleActivationPremises {
+            schema: "dolly.module-activation-premises/v1".into(),
+            daemon_installation_id: identity.daemon_installation_id.clone(),
+            instance_id: identity.instance_id.clone(),
+            config_revision,
+            config_digest: config_digest.clone(),
+            permission_policy_definitions: Vec::new(),
+            permission_policy_backend_bindings: Vec::new(),
+            service_candidate: candidate,
+            premises_digest: digest(&premise_without_digest),
+        };
+        HostAuthorityRevision {
+            identity,
+            mapping: ConfigRevisionMapping {
+                schema: "dolly.config-revision-mapping/v1".into(),
+                daemon_installation_id: premise.daemon_installation_id.clone(),
+                instance_id: premise.instance_id.clone(),
+                config_revision,
+                config_digest,
+                canonical_config: config,
+            },
+            premise: Some(premise),
+        }
+    }
+
+    struct Probe {
+        controller_generation: ExtensionGeneration,
+        worker_epoch: WorkerEpoch,
+        extension_alias: ExtensionId,
+        extension_generation: ExtensionGeneration,
+        binding_digest: Sha256Digest,
+    }
+
+    impl McpTransportProbe for Probe {
+        fn observe(
+            &mut self,
+            binding: &McpTransportBinding,
+        ) -> Result<McpHandshakeObservation, McpTransportProbeError> {
+            Ok(McpHandshakeObservation {
+                server_id: Some(binding.server_id().into()),
+                adapter: Some(binding.adapter().into()),
+                daemon_installation_id: Some(binding.daemon_installation_id().into()),
+                instance_id: Some(binding.instance_id().into()),
+                controller_generation: Some(self.controller_generation),
+                worker_epoch: Some(self.worker_epoch.clone()),
+                extension_alias: Some(self.extension_alias.clone()),
+                extension_generation: Some(self.extension_generation),
+                runtime_binding_digest: Some(self.binding_digest.clone()),
+                transport_kind: Some(binding.transport_kind().into()),
+                endpoint: Some(binding.endpoint().into()),
+                transport_digest: Some(binding.transport_digest().clone()),
+                initialize_request_protocol_version: Some(binding.protocol_version().into()),
+                initialize_response_protocol_version: Some(binding.protocol_version().into()),
+                initialized_notification_sent: true,
+                session_ids: vec!["session-one".into()],
+            })
+        }
+    }
+
+    struct Fixture {
+        directory: TempDir,
+        db: Database,
+        runtime_binding: RuntimeBinding,
+        process_generation: ProcessGeneration,
+        readiness: McpTransportReadiness,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempdir().unwrap();
+            let mut db = Database::open(&directory.path().join("authority.sqlite")).unwrap();
+            create_host_authority_schema(db.connection()).unwrap();
+            install_host_authority_revision(&mut db, host_revision(1, tool_broker_config()))
+                .unwrap();
+            let snapshot = load_current_authority(db.connection()).unwrap().unwrap();
+            let proof = test_proof_for_authority(&snapshot);
+            let alias: ExtensionId = "org.dolly.tools".parse().unwrap();
+            let mut runtime_binding = mint_runtime_binding(&mut db, alias.clone(), proof).unwrap();
+            let process_generation = runtime_binding.mint_process_generation(&mut db).unwrap();
+            let mut probe = Probe {
+                controller_generation: runtime_binding.controller_generation(),
+                worker_epoch: runtime_binding.worker_epoch().clone(),
+                extension_alias: alias,
+                extension_generation: process_generation.extension_generation(),
+                binding_digest: runtime_binding.binding_digest().clone(),
+            };
+            let readiness = test_prove_current_mcp_transport_readiness(
+                db.connection(),
+                &runtime_binding,
+                &process_generation,
+                "fs",
+                &mut probe,
+            )
+            .unwrap();
+            Self {
+                directory,
+                db,
+                runtime_binding,
+                process_generation,
+                readiness,
+            }
+        }
+
+        fn next_identity(&mut self) -> (RuntimeBinding, ProcessGeneration, McpTransportReadiness) {
+            let snapshot = load_current_authority(self.db.connection())
+                .unwrap()
+                .unwrap();
+            let proof = test_proof_for_authority(&snapshot);
+            let alias: ExtensionId = "org.dolly.tools".parse().unwrap();
+            let mut runtime_binding =
+                mint_runtime_binding(&mut self.db, alias.clone(), proof).unwrap();
+            let process_generation = runtime_binding
+                .mint_process_generation(&mut self.db)
+                .unwrap();
+            let mut probe = Probe {
+                controller_generation: runtime_binding.controller_generation(),
+                worker_epoch: runtime_binding.worker_epoch().clone(),
+                extension_alias: alias,
+                extension_generation: process_generation.extension_generation(),
+                binding_digest: runtime_binding.binding_digest().clone(),
+            };
+            let readiness = test_prove_current_mcp_transport_readiness(
+                self.db.connection(),
+                &runtime_binding,
+                &process_generation,
+                "fs",
+                &mut probe,
+            )
+            .unwrap();
+            (runtime_binding, process_generation, readiness)
+        }
+    }
+
+    #[test]
+    fn successful_publication_survives_fresh_connection() {
+        let mut fixture = Fixture::new();
+        let registry = publish_tool_registry(
+            &mut fixture.db,
+            &fixture.runtime_binding,
+            &fixture.process_generation,
+            &fixture.readiness,
+        )
+        .unwrap();
+        let revision = registry.registry_revision();
+        let path = fixture.directory.path().join("authority.sqlite");
+        drop(fixture.db);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM tool_registry_authority_records",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT current_registry_revision FROM tool_registry_authority_state WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            revision as i64
+        );
+    }
+
+    #[test]
+    fn publication_failure_rolls_back_registry_generation_and_pointer() {
+        let mut fixture = Fixture::new();
+        create_tool_broker_authority_schema(fixture.db.connection()).unwrap();
+        fixture
+            .db
+            .connection_mut()
+            .execute_batch(
+                "CREATE TRIGGER fail_tool_registry_pointer
+                 BEFORE UPDATE ON tool_registry_authority_state
+                 BEGIN SELECT RAISE(ABORT, 'injected pointer failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            publish_tool_registry(
+                &mut fixture.db,
+                &fixture.runtime_binding,
+                &fixture.process_generation,
+                &fixture.readiness,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fixture
+                .db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM tool_registry_authority_records",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            fixture
+                .db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM tool_server_generation_authority_records",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            fixture
+                .db
+                .connection()
+                .query_row(
+                    "SELECT current_registry_revision FROM tool_registry_authority_state WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0)
+                )
+                .unwrap(),
+            None
+        );
+        let path = fixture.directory.path().join("authority.sqlite");
+        drop(fixture.db);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM tool_registry_authority_records",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .query_row(
+                    "SELECT current_registry_revision FROM tool_registry_authority_state WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0)
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn revalidation_rejects_authority_after_registry_pointer_cutover() {
+        let mut fixture = Fixture::new();
+        let registry = publish_tool_registry(
+            &mut fixture.db,
+            &fixture.runtime_binding,
+            &fixture.process_generation,
+            &fixture.readiness,
+        )
+        .unwrap();
+        let authority = authorize_tool_dispatch(
+            &mut fixture.db,
+            &registry,
+            &fixture.runtime_binding,
+            &fixture.process_generation,
+            &fixture.readiness,
+        )
+        .unwrap();
+        let (runtime_binding, process_generation, readiness) = fixture.next_identity();
+        let _next_registry = publish_tool_registry(
+            &mut fixture.db,
+            &runtime_binding,
+            &process_generation,
+            &readiness,
+        )
+        .unwrap();
+        let error = revalidate_tool_dispatch_authority(
+            &mut fixture.db,
+            &authority,
+            &fixture.runtime_binding,
+            &fixture.process_generation,
+            &fixture.readiness,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ToolBrokerAuthorityCode::RegistryNotCurrent);
+    }
+
+    #[test]
+    fn revalidation_rejects_authority_after_host_premise_cutover() {
+        let mut fixture = Fixture::new();
+        let registry = publish_tool_registry(
+            &mut fixture.db,
+            &fixture.runtime_binding,
+            &fixture.process_generation,
+            &fixture.readiness,
+        )
+        .unwrap();
+        let authority = authorize_tool_dispatch(
+            &mut fixture.db,
+            &registry,
+            &fixture.runtime_binding,
+            &fixture.process_generation,
+            &fixture.readiness,
+        )
+        .unwrap();
+        let mut changed_config = tool_broker_config();
+        changed_config["servers"]["fs"]["transport"]["args"] = json!(["--changed"]);
+        install_host_authority_revision(&mut fixture.db, host_revision(2, changed_config)).unwrap();
+        let error = revalidate_tool_dispatch_authority(
+            &mut fixture.db,
+            &authority,
+            &fixture.runtime_binding,
+            &fixture.process_generation,
+            &fixture.readiness,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.code,
+            ToolBrokerAuthorityCode::RuntimeBindingStale | ToolBrokerAuthorityCode::ReadinessStale
+        ));
+    }
 }

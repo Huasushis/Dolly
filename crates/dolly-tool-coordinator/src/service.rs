@@ -23,8 +23,11 @@ use dolly_canonical_json::{
     CanonicalJsonValue, ParseLimits, Sha256Digest, canonicalize, parse_core_json,
 };
 use dolly_schema::SchemaValidator;
+use dolly_storage::mcp_readiness::McpTransportReadiness;
+use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::{
-    ToolBrokerAuthorityError, ToolDispatchAuthority, validate_dispatch_binding,
+    ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
+    validate_dispatch_binding,
 };
 use dolly_storage::tool_ledger::{
     CasKey, CasOutcome, TransportCorrelation, cas_terminal, load_exact,
@@ -131,36 +134,51 @@ impl ToolDispatchService {
     /// A Host-facing caller MUST use [`Self::dispatch_authorized`] so the
     /// storage-produced registry/generation authority is checked before the
     /// transport boundary.
-    pub fn dispatch(
+    pub(crate) fn dispatch(
         &self,
         db: &mut Database,
         permit: SendPermit,
         request_bytes: &[u8],
         transport: &mut dyn ToolTransport,
     ) -> Result<ServiceOutcome, ServiceError> {
-        self.dispatch_inner(db, None, permit, request_bytes, transport)
+        self.dispatch_inner(db, permit, request_bytes, transport)
     }
 
-    /// Consume an authority-bound permit and settle one operation.
-    ///
-    /// The registry/generation producer is checked before any transport call.
-    /// A mismatch consumes the in-memory permit but mutates neither the ledger
-    /// nor the transport; no downstream result can manufacture a replacement.
+    /// The registry/generation producer is checked before any permit is
+    /// consumed or transport call. A mismatch mutates neither the ledger nor
+    /// the permit; no downstream result can manufacture a replacement.
     pub fn dispatch_authorized(
         &self,
         db: &mut Database,
         authority: &ToolDispatchAuthority,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        readiness: &McpTransportReadiness,
         permit: SendPermit,
         request_bytes: &[u8],
         transport: &mut dyn ToolTransport,
     ) -> Result<ServiceOutcome, ServiceError> {
-        self.dispatch_inner(db, Some(authority), permit, request_bytes, transport)
+        revalidate_tool_dispatch_authority(
+            db,
+            authority,
+            runtime_binding,
+            process_generation,
+            readiness,
+        )
+        .map_err(ServiceError::Authority)?;
+        validate_dispatch_binding(
+            authority,
+            permit.binding().config_revision as i64,
+            &permit.binding().tool_server_id,
+            permit.binding().tool_server_generation,
+        )
+        .map_err(ServiceError::Authority)?;
+        self.dispatch_inner(db, permit, request_bytes, transport)
     }
 
     fn dispatch_inner(
         &self,
         db: &mut Database,
-        authority: Option<&ToolDispatchAuthority>,
         permit: SendPermit,
         request_bytes: &[u8],
         transport: &mut dyn ToolTransport,
@@ -178,15 +196,6 @@ impl ToolDispatchService {
             return Ok(ServiceOutcome::Stale {
                 authoritative: Some(current),
             });
-        }
-        if let Some(authority) = authority {
-            validate_dispatch_binding(
-                authority,
-                current.operation_binding.config_revision as i64,
-                &current.operation_binding.tool_server_id,
-                current.operation_binding.tool_server_generation,
-            )
-            .map_err(ServiceError::Authority)?;
         }
 
         if Sha256Digest::compute(request_bytes) != binding.outbound_digest {

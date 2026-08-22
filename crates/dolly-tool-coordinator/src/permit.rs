@@ -19,6 +19,10 @@ pub struct SendPermitBinding {
     pub module_id: String,
     /// The original invoke operation identity.
     pub operation_id: String,
+    /// Host configuration revision bound by the registry authority.
+    pub config_revision: i64,
+    /// Frozen tool-server identity bound by the registry authority.
+    pub tool_server_id: String,
     /// The new ledger revision after the committed dispatch CAS (2).
     pub ledger_revision: u64,
     /// The frozen server generation the operation dispatched to.
@@ -51,6 +55,8 @@ impl SendPermit {
             binding: SendPermitBinding {
                 module_id: record.operation_binding.module_id.clone(),
                 operation_id: record.operation_binding.operation_id.clone(),
+                config_revision: record.operation_binding.config_revision as i64,
+                tool_server_id: record.operation_binding.tool_server_id.clone(),
                 ledger_revision: record.ledger_revision,
                 tool_server_generation: record.operation_binding.tool_server_generation,
                 server_request_id: record.operation_binding.server_request_id.clone(),
@@ -64,5 +70,9 @@ impl SendPermit {
     /// semantics make a second consumption a compile error.
     pub fn consume(self) -> SendPermitBinding {
         self.binding
+    }
+
+    pub(crate) fn binding(&self) -> &SendPermitBinding {
+        &self.binding
     }
 }
