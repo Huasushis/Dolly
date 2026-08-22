@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest};
+use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
 use dolly_storage::Database;
 use dolly_storage::tool_ledger::{
     LedgerInsertDisposition, create_tool_ledger_schema, insert_authorized,
@@ -35,7 +35,7 @@ fn digest(hex: u8) -> Sha256Digest {
 }
 
 fn server_contract() -> CanonicalJsonObject {
-    serde_json::from_value(json!({
+    let mut contract = json!({
         "enabled": true,
         "adapter": "mcp",
         "protocol_version": "2025-06-18",
@@ -63,16 +63,26 @@ fn server_contract() -> CanonicalJsonObject {
                 "description": "Read one file.",
                 "input_schema": {"type": "object", "additionalProperties": false, "properties": {"path": {"type": "string", "minLength": 1, "maxLength": 4096}}},
                 "input_schema_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-                "output_schema": {"type": "object", "additionalProperties": false, "properties": {"text": {"type": "string"}}},
-                "output_schema_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                "output_schema": {
+                    "type": ["object", "null"],
+                    "additionalProperties": false,
+                    "required": ["text"],
+                    "properties": {"text": {"type": "string"}}
+                },
+                "output_schema_digest": "",
                 "side_effect_class": "non_idempotent_write",
                 "idempotency": {"kind": "none"},
                 "requires_confirmation": false,
                 "enabled": true
             }
         }
-    }))
-    .expect("server contract fixture")
+    });
+    let output_schema_digest = canonicalize(&contract["tools"]["read-file"]["output_schema"])
+        .expect("output schema canonical")
+        .1
+        .to_canonical_string();
+    contract["tools"]["read-file"]["output_schema_digest"] = json!(output_schema_digest);
+    serde_json::from_value(contract).expect("server contract fixture")
 }
 
 fn binding_fn(operation_id: &str, server_request_id: &str) -> ToolOperationBinding {
@@ -300,9 +310,7 @@ fn assert_reopen_clear(dir: &std::path::Path) {
 fn valid_response_persists_succeeded_one_call_no_redispatch() {
     let (dir, authorized, outcome, spy) = run_with(
         None,
-        TransportOutcome::Response(
-            response_body(json!({"content":[{"type":"text","text":"ok"}]})).into_bytes(),
-        ),
+        TransportOutcome::Response(response_body(json!({"text":"ok"})).into_bytes()),
     );
     let expected_digest = authorized
         .recompute_outbound_digest()
@@ -319,15 +327,55 @@ fn valid_response_persists_succeeded_one_call_no_redispatch() {
             assert_eq!(record.ledger_revision, 3);
             assert!(record.outbound_digest.is_some(), "outbound retained");
             assert_eq!(result.status, ToolStatus::Succeeded);
-            assert_eq!(
-                result.output,
-                json!({"content":[{"type":"text","text":"ok"}]})
-            );
+            assert_eq!(result.output, json!({"text":"ok"}));
             assert_eq!(result.server_request_id.as_deref(), Some(REQ));
             assert_eq!(result.operation_id, OP_A);
             assert!(result.error.is_none());
         }
         other => panic!("expected Succeeded, got {other:?}"),
+    }
+    assert_reopen_clear(dir.path());
+}
+
+#[test]
+fn explicit_null_result_is_present_and_valid() {
+    let (dir, _authorized, outcome, spy) = run_with(
+        None,
+        TransportOutcome::Response(response_body(Value::Null).into_bytes()),
+    );
+    match outcome {
+        ServiceOutcome::Succeeded { record, result } => {
+            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(record.state, LedgerState::Succeeded);
+            assert_eq!(result.status, ToolStatus::Succeeded);
+            assert_eq!(result.output, Value::Null);
+            assert!(result.error.is_none());
+            assert_eq!(result.server_request_id.as_deref(), Some(REQ));
+        }
+        other => panic!("expected Succeeded for explicit null, got {other:?}"),
+    }
+    assert_reopen_clear(dir.path());
+}
+
+#[test]
+fn complete_output_schema_violation_persists_failed_applied() {
+    let (dir, _authorized, outcome, spy) = run_with(
+        None,
+        TransportOutcome::Response(response_body(json!({"text": 42})).into_bytes()),
+    );
+    match outcome {
+        ServiceOutcome::Failed { record, result } => {
+            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(record.state, LedgerState::Failed);
+            assert_eq!(result.status, ToolStatus::Failed);
+            assert_eq!(result.output, Value::Null);
+            let error = result.error.as_ref().expect("output error");
+            assert_eq!(error.code, dolly_tool_broker::ToolErrorCode::OutputInvalid);
+            assert_eq!(error.outcome, dolly_tool_broker::ErrorOutcome::Applied);
+            assert!(!error.retryable);
+            assert_eq!(result.server_request_id.as_deref(), Some(REQ));
+        }
+        other => panic!("expected Failed for schema-invalid output, got {other:?}"),
     }
     assert_reopen_clear(dir.path());
 }
@@ -506,30 +554,21 @@ fn spy_proves_at_most_one_transport_call() {
 }
 
 // ---------------------------------------------------------------------------
-// Authoritative upstream error envelope -> persisted FAILED, one call
+// Arbitrary upstream error envelope -> persisted UNKNOWN, one call
 // ---------------------------------------------------------------------------
 
 #[test]
-fn upstream_error_envelope_persists_failed_one_call_no_redispatch() {
+fn arbitrary_upstream_error_envelope_persists_unknown_one_call_no_redispatch() {
     let envelope = json!({"jsonrpc":"2.0","id":REQ,"error":{"code":-32000,"message":"boom"}})
         .to_string()
         .into_bytes();
     let (dir, _authorized, outcome, spy) = run_with(None, TransportOutcome::Response(envelope));
     match outcome {
-        ServiceOutcome::Failed { record, result } => {
+        ServiceOutcome::Unknown { record, result } => {
             assert_eq!(spy.calls, 1, "exactly one transport call");
-            assert_eq!(record.state, LedgerState::Failed);
-            assert_eq!(record.ledger_revision, 3);
-            assert!(record.outbound_digest.is_some(), "outbound retained");
-            assert_eq!(result.status, ToolStatus::Failed);
-            let error = result.error.as_ref().expect("failed error");
-            assert_eq!(error.code, dolly_tool_broker::ToolErrorCode::UpstreamFailed);
-            assert_eq!(error.outcome, dolly_tool_broker::ErrorOutcome::NotApplied);
-            assert!(!error.retryable, "authoritative errors are never retryable");
-            assert_eq!(result.server_request_id.as_deref(), Some(REQ));
-            assert_eq!(result.operation_id, OP_A);
+            assert_unknown(&record, &result);
         }
-        other => panic!("expected Failed, got {other:?}"),
+        other => panic!("expected Unknown, got {other:?}"),
     }
     assert_reopen_clear(dir.path());
 }

@@ -5,10 +5,12 @@
 //! it consumes ONE non-Clone [`SendPermit`] exactly once, dispatches through
 //! the injected Host transport AT MOST ONCE, and settles the authoritative
 //! row only after the closed-response checks pass. Timeout, disconnect,
-//! correlation, schema, and bound failures after dispatch are terminal
-//! `UNKNOWN` (`TOOL_EXTERNAL_OUTCOME_UNKNOWN`); the service never retries or
-//! redispatches, and no downstream response/ACK ever authorizes a new
-//! permit, generation rotation, or replay.
+//! transport-decode, correlation, closed-envelope, and bound failures after
+//! dispatch are terminal `UNKNOWN` (`TOOL_EXTERNAL_OUTCOME_UNKNOWN`); a
+//! present output that violates the frozen output schema is terminal `FAILED`
+//! with the Tool Broker's `TOOL_OUTPUT_INVALID`/`applied` authority. The
+//! service never retries or redispatches, and no downstream response/ACK ever
+//! authorizes a new permit, generation rotation, or replay.
 //!
 //! The caller supplies the expected request bytes along with the permit;
 //! the service verifies `sha256(request_bytes) == binding.outbound_digest`
@@ -20,13 +22,14 @@
 use dolly_canonical_json::{
     CanonicalJsonValue, ParseLimits, Sha256Digest, canonicalize, parse_core_json,
 };
+use dolly_schema::SchemaValidator;
 use dolly_storage::tool_ledger::{
     CasKey, CasOutcome, TransportCorrelation, cas_terminal, load_exact,
 };
 use dolly_storage::{Database, StorageError};
 use dolly_tool_broker::{
-    ErrorOutcome, LedgerState, ToolCallLedgerRecord, ToolError, ToolErrorCode, ToolResult,
-    ToolStatus,
+    ErrorOutcome, LedgerState, ToolCallLedgerRecord, ToolError, ToolErrorCode,
+    ToolOperationBinding, ToolResult, ToolStatus,
 };
 use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
@@ -76,16 +79,16 @@ pub enum ServiceOutcome {
         record: ToolCallLedgerRecord,
         result: ToolResult,
     },
-    /// A correlated, closed, bounded response with an authoritative
-    /// upstream error committed durably as `FAILED`
-    /// (`TOOL_UPSTREAM_FAILED`, `not_applied`).
+    /// A complete correlated response whose present output violates the
+    /// frozen output schema, committed as `FAILED` (`TOOL_OUTPUT_INVALID`,
+    /// `applied`).
     Failed {
         record: ToolCallLedgerRecord,
         result: ToolResult,
     },
-    /// A post-dispatch failure class (timeout, disconnect, correlation,
-    /// schema, or bound) committed durably as `UNKNOWN`
-    /// (`TOOL_EXTERNAL_OUTCOME_UNKNOWN`).
+    /// A post-dispatch failure class (timeout, disconnect, malformed or
+    /// closed-envelope response, correlation, or bound) committed durably as
+    /// `UNKNOWN` (`TOOL_EXTERNAL_OUTCOME_UNKNOWN`).
     Unknown {
         record: ToolCallLedgerRecord,
         result: ToolResult,
@@ -163,13 +166,13 @@ impl ToolDispatchService {
 
         match transport.call(request_bytes) {
             TransportOutcome::Response(bytes) => {
-                match self.classify(&bytes, &binding.server_request_id) {
+                match self.classify(&bytes, &current.operation_binding) {
                     Classification::Succeeded(output) => {
                         let result = succeeded_result(&binding, output);
                         self.settle(db, &current, Terminal::succeeded(result))
                     }
-                    Classification::Failed => {
-                        let result = upstream_failed_result(&binding);
+                    Classification::OutputInvalid => {
+                        let result = output_invalid_result(&binding);
                         self.settle(db, &current, Terminal::failed(result))
                     }
                     Classification::Rejected => {
@@ -188,7 +191,7 @@ impl ToolDispatchService {
     }
 
     /// Classify a response frame (pure, no I/O).
-    fn classify(&self, bytes: &[u8], expected_id: &str) -> Classification {
+    fn classify(&self, bytes: &[u8], binding: &ToolOperationBinding) -> Classification {
         if bytes.len() > self.limits.max_response_bytes {
             return Classification::Rejected;
         }
@@ -207,12 +210,31 @@ impl ToolDispatchService {
             Err(_) => return Classification::Rejected,
         };
         // Closed protocol/correlation: JSON-RPC 2.0 and the exact id.
-        if envelope.jsonrpc != "2.0" || envelope.id != expected_id {
+        if envelope.jsonrpc != "2.0" || envelope.id != binding.server_request_id {
             return Classification::Rejected;
         }
         match (envelope.result, envelope.error) {
-            (Some(output), None) => Classification::Succeeded(output),
-            (None, Some(_)) => Classification::Failed,
+            (Some(output), None) => {
+                let canonical_output = match CanonicalJsonValue::try_from(output.clone()) {
+                    Ok(output) => output,
+                    Err(_) => return Classification::Rejected,
+                };
+                let Some((schema, digest)) = frozen_output_schema(binding) else {
+                    return Classification::Rejected;
+                };
+                let Ok(validator) = SchemaValidator::compile_embedded(schema, &digest) else {
+                    return Classification::Rejected;
+                };
+                if validator.validate(&canonical_output).is_ok() {
+                    Classification::Succeeded(output)
+                } else {
+                    Classification::OutputInvalid
+                }
+            }
+            // The presence of an upstream error does not prove that the
+            // operation was not applied. No closed disposition is carried by
+            // this response envelope, so it remains externally ambiguous.
+            (None, Some(_)) => Classification::Rejected,
             _ => Classification::Rejected, // zero or both members: closed schema
         }
     }
@@ -284,18 +306,19 @@ fn succeeded_result(binding: &SendPermitBinding, output: serde_json::Value) -> T
     }
 }
 
-/// Build the authoritative `FAILED` result (`TOOL_UPSTREAM_FAILED`,
-/// `not_applied`, fixed message: upstream error text is untrusted data).
-fn upstream_failed_result(binding: &SendPermitBinding) -> ToolResult {
+/// Build the authoritative `FAILED` result for a complete response whose
+/// present output violates the frozen output schema. The output is not
+/// copied into the public result; the Tool Broker authority is `applied`.
+fn output_invalid_result(binding: &SendPermitBinding) -> ToolResult {
     ToolResult {
         operation_id: binding.operation_id.clone(),
         status: ToolStatus::Failed,
         output: serde_json::Value::Null,
         error: Some(ToolError {
-            code: ToolErrorCode::UpstreamFailed,
+            code: ToolErrorCode::OutputInvalid,
             retryable: false,
-            outcome: ErrorOutcome::NotApplied,
-            message: "upstream returned a terminal error with no applied disposition".into(),
+            outcome: ErrorOutcome::Applied,
+            message: "upstream output failed the frozen output schema".into(),
             details: Default::default(),
         }),
         server_request_id: Some(binding.server_request_id.clone()),
@@ -337,7 +360,7 @@ impl Terminal {
 /// The classification of one response frame.
 enum Classification {
     Succeeded(serde_json::Value),
-    Failed,
+    OutputInvalid,
     Rejected,
 }
 
@@ -348,8 +371,43 @@ enum Classification {
 pub struct ToolResponseEnvelope {
     pub jsonrpc: String,
     pub id: String,
+    /// `None` means the member was absent; `Some(Value::Null)` means it was
+    /// present with JSON null.
+    #[serde(default, deserialize_with = "deserialize_present_value")]
     pub result: Option<serde_json::Value>,
+    /// Presence is retained for the same reason as `result`; any present
+    /// error remains ambiguous and cannot prove `not_applied`.
+    #[serde(default, deserialize_with = "deserialize_present_value")]
     pub error: Option<serde_json::Value>,
+}
+
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+/// Resolve the retained output schema and parse its typed digest from the
+/// frozen server contract. The contract is already bound into the ledger
+/// operation, so no live registry lookup is permitted here.
+fn frozen_output_schema(
+    binding: &ToolOperationBinding,
+) -> Option<(&CanonicalJsonValue, Sha256Digest)> {
+    let tools = match binding.server_contract.get("tools")? {
+        CanonicalJsonValue::Object(tools) => tools,
+        _ => return None,
+    };
+    let tool = match tools.get(&binding.tool_name)? {
+        CanonicalJsonValue::Object(tool) => tool,
+        _ => return None,
+    };
+    let schema = tool.get("output_schema")?;
+    let digest = match tool.get("output_schema_digest")? {
+        CanonicalJsonValue::String(digest) => digest.parse().ok()?,
+        _ => return None,
+    };
+    Some((schema, digest))
 }
 
 /// Total number of object members across the whole value tree. A response
