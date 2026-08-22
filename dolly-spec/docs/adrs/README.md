@@ -19,5 +19,6 @@ They are not substitutes for normative requirements.
 | [0012](0012-napcatqq-mailbox-and-catalog.md) | Journal QQ events and expose a bounded pull/catalog interface | Accepted |
 | [0013](0013-testament-and-levelupper-boundaries.md) | Keep Testament isolated and LevelUpper identity-local | Accepted |
 | [0014](0014-installed-module-activation-authority.md) | Keep installed Module activation authority upstream of execution | Accepted |
+| [0015](0015-runtime-authority-database.md) | Share one Runtime SQLite authority database across TypeScript and Rust | Accepted |
 
 Status may be `Proposed`, `Accepted`, `Deprecated`, or `Superseded`.

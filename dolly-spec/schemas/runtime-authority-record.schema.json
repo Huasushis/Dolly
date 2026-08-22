@@ -1,0 +1,216 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dolly.example/spec/0.1/schemas/runtime-authority-record.schema.json",
+  "title": "Persistent records in the Runtime authority database",
+  "oneOf": [
+    { "$ref": "#/$defs/RuntimeAuthorityState" },
+    { "$ref": "#/$defs/ConfigRevisionMapping" },
+    { "$ref": "#/$defs/InstalledComponentOrigin" },
+    { "$ref": "#/$defs/PermissionPolicyDefinition" },
+    { "$ref": "#/$defs/PermissionPolicyBackendBinding" },
+    { "$ref": "#/$defs/LinuxServiceCandidate" },
+    { "$ref": "#/$defs/ModuleActivationPremises" }
+  ],
+  "$defs": {
+    "RuntimeAuthorityState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "authority_schema_version", "daemon_installation_id",
+        "instance_id", "current_config_revision", "current_config_digest"
+      ],
+      "properties": {
+        "schema": { "const": "dolly.runtime-authority-state/v1" },
+        "authority_schema_version": { "const": 1 },
+        "daemon_installation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "instance_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "current_config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "current_config_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+      }
+    },
+    "ConfigRevisionMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "daemon_installation_id", "instance_id", "config_revision",
+        "config_digest", "canonical_config"
+      ],
+      "properties": {
+        "schema": { "const": "dolly.config-revision-mapping/v1" },
+        "daemon_installation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "instance_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "config_digest": {
+          "$ref": "common.schema.json#/$defs/Sha256",
+          "$comment": "sha256(JCS(canonical_config))"
+        },
+        "canonical_config": { "$ref": "#/$defs/ResolvedConfiguration" }
+      }
+    },
+    "ResolvedConfiguration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime_config", "permission_policy_selections", "service_candidate"
+      ],
+      "properties": {
+        "runtime_config": { "$ref": "runtime-config.schema.json" },
+        "permission_policy_selections": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/PermissionPolicySelection" }
+        },
+        "service_candidate": {
+          "oneOf": [
+            { "$ref": "#/$defs/LinuxServiceCandidate" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "PermissionPolicySelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_id", "policy_revision", "policy_definition_digest",
+        "binding_id", "binding_revision", "binding_digest"
+      ],
+      "properties": {
+        "policy_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "policy_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "policy_definition_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "binding_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "binding_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "binding_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+      }
+    },
+    "InstalledComponentOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "kind", "component_id", "component_revision", "component_digest"
+      ],
+      "properties": {
+        "schema": { "const": "dolly.installed-component-origin/v1" },
+        "kind": { "const": "installed_product_component" },
+        "component_id": { "$ref": "common.schema.json#/$defs/QualifiedName" },
+        "component_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "component_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+      }
+    },
+    "PolicyDefinitionOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "kind", "source_id", "source_revision", "source_digest"],
+      "properties": {
+        "schema": { "const": "dolly.policy-definition-origin/v1" },
+        "kind": { "const": "operator_approved_policy" },
+        "source_id": { "$ref": "common.schema.json#/$defs/QualifiedName" },
+        "source_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "source_digest": { "$ref": "common.schema.json#/$defs/Sha256" }
+      }
+    },
+    "PermissionPolicyDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "policy_id", "policy_revision", "definition_schema_uri",
+        "definition_schema_digest", "definition", "origin", "definition_digest"
+      ],
+      "properties": {
+        "schema": { "const": "dolly.permission-policy-definition/v1" },
+        "policy_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "policy_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "definition_schema_uri": {
+          "type": "string",
+          "format": "uri-reference",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "definition_schema_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "definition": {
+          "type": "object",
+          "maxProperties": 256,
+          "$comment": "The named installed closed schema is mandatory and rejects secrets, paths, endpoint credentials, executable code, functions, and live handles."
+        },
+        "origin": { "$ref": "#/$defs/PolicyDefinitionOrigin" },
+        "definition_digest": {
+          "$ref": "common.schema.json#/$defs/Sha256",
+          "$comment": "sha256(JCS(the complete definition record after removing only definition_digest))"
+        }
+      }
+    },
+    "PermissionPolicyBackendBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "binding_id", "binding_revision", "binding_digest",
+        "policy_id", "policy_revision", "policy_definition_digest", "origin"
+      ],
+      "properties": {
+        "schema": { "const": "dolly.permission-policy-backend-binding/v1" },
+        "binding_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "binding_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "binding_digest": {
+          "$ref": "common.schema.json#/$defs/Sha256",
+          "$comment": "sha256(JCS(the complete backend-binding record after removing only binding_digest))"
+        },
+        "policy_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "policy_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "policy_definition_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "origin": { "$ref": "#/$defs/InstalledComponentOrigin" }
+      }
+    },
+    "LinuxServiceCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "origin", "unit_name", "mode", "candidate_digest"],
+      "properties": {
+        "schema": { "const": "dolly.linux-service-candidate/v1" },
+        "origin": { "$ref": "#/$defs/InstalledComponentOrigin" },
+        "unit_name": {
+          "type": "string",
+          "minLength": 9,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,246}\\.service$"
+        },
+        "mode": { "const": "user" },
+        "candidate_digest": {
+          "$ref": "common.schema.json#/$defs/Sha256",
+          "$comment": "sha256(JCS(the complete service-candidate record after removing only candidate_digest))"
+        }
+      }
+    },
+    "ModuleActivationPremises": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "daemon_installation_id", "instance_id", "config_revision",
+        "config_digest", "permission_policy_definitions",
+        "permission_policy_backend_bindings", "service_candidate", "premises_digest"
+      ],
+      "properties": {
+        "schema": { "const": "dolly.module-activation-premises/v1" },
+        "daemon_installation_id": { "$ref": "common.schema.json#/$defs/UuidV7" },
+        "instance_id": { "$ref": "common.schema.json#/$defs/StableId" },
+        "config_revision": { "$ref": "common.schema.json#/$defs/Revision" },
+        "config_digest": { "$ref": "common.schema.json#/$defs/Sha256" },
+        "permission_policy_definitions": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/PermissionPolicyDefinition" }
+        },
+        "permission_policy_backend_bindings": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/PermissionPolicyBackendBinding" }
+        },
+        "service_candidate": { "$ref": "#/$defs/LinuxServiceCandidate" },
+        "premises_digest": {
+          "$ref": "common.schema.json#/$defs/Sha256",
+          "$comment": "sha256(JCS(the complete premise record after removing only premises_digest))"
+        }
+      }
+    }
+  }
+}

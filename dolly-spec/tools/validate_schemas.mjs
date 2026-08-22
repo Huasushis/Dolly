@@ -761,6 +761,137 @@ assertValid(
   false,
 );
 
+const authorityVector = JSON.parse(fs.readFileSync(
+  path.join(root, "test-vectors", "core", "TST-AUTH-001-policy-binding-origin.json"),
+  "utf8",
+));
+const validActivationPremises = authorityVector.initial.premise_record;
+const authorityRecordSchema = `${schemaBase}runtime-authority-record.schema.json`;
+assertValid(
+  "closed Module activation premise",
+  `${schemaBase}module-activation-premises.schema.json`,
+  validActivationPremises,
+);
+assertValid("Module activation premise authority record", authorityRecordSchema, validActivationPremises);
+for (const origin of authorityVector.initial.installed_components) {
+  assertValid("closed installed-component origin authority record", authorityRecordSchema, origin);
+}
+for (const definition of validActivationPremises.permission_policy_definitions) {
+  assertValid("closed permission-policy definition authority record", authorityRecordSchema, definition);
+  const { definition_digest: definitionDigest, ...definitionWithoutDigest } = definition;
+  const expectedDefinitionDigest = canonicalDigest(definitionWithoutDigest);
+  if (definitionDigest !== expectedDefinitionDigest) {
+    throw new Error(`permission-policy definition authority record digest: expected ${expectedDefinitionDigest}, got ${definitionDigest}`);
+  }
+}
+for (const binding of validActivationPremises.permission_policy_backend_bindings) {
+  assertValid("closed permission-policy backend-binding authority record", authorityRecordSchema, binding);
+  const { binding_digest: bindingDigest, ...bindingWithoutDigest } = binding;
+  const expectedBindingDigest = canonicalDigest(bindingWithoutDigest);
+  if (bindingDigest !== expectedBindingDigest) {
+    throw new Error(`permission-policy backend-binding authority record digest: expected ${expectedBindingDigest}, got ${bindingDigest}`);
+  }
+}
+assertValid(
+  "closed Linux service-candidate authority record",
+  authorityRecordSchema,
+  validActivationPremises.service_candidate,
+);
+const {
+  candidate_digest: serviceCandidateDigest,
+  ...serviceCandidateWithoutDigest
+} = validActivationPremises.service_candidate;
+const expectedServiceCandidateDigest = canonicalDigest(serviceCandidateWithoutDigest);
+if (serviceCandidateDigest !== expectedServiceCandidateDigest) {
+  throw new Error(`Linux service-candidate authority record digest: expected ${expectedServiceCandidateDigest}, got ${serviceCandidateDigest}`);
+}
+const { premises_digest: premisesDigest, ...premisesWithoutDigest } = validActivationPremises;
+const expectedPremisesDigest = canonicalDigest(premisesWithoutDigest);
+if (premisesDigest !== expectedPremisesDigest) {
+  throw new Error(`Module activation premise authority record digest: expected ${expectedPremisesDigest}, got ${premisesDigest}`);
+}
+assertValid(
+  "Module activation premise with an undeclared field",
+  `${schemaBase}module-activation-premises.schema.json`,
+  { ...validActivationPremises, current_path: "/not-authority" },
+  false,
+);
+const {
+  permission_policy_backend_bindings: validBackendBindings,
+  ...premisesWithoutBackendBindings
+} = validActivationPremises;
+assertValid(
+  "Module activation premise with the removed binding field",
+  `${schemaBase}module-activation-premises.schema.json`,
+  {
+    ...premisesWithoutBackendBindings,
+    permission_policy_bindings: validBackendBindings,
+  },
+  false,
+);
+assertValid(
+  "legacy permission-policy binding schema",
+  authorityRecordSchema,
+  {
+    ...validBackendBindings[0],
+    schema: "dolly.permission-policy-binding/v1",
+  },
+  false,
+);
+assertValid(
+  "service candidate without its digest",
+  authorityRecordSchema,
+  serviceCandidateWithoutDigest,
+  false,
+);
+
+const authorityRuntimeConfig = JSON.parse(fs.readFileSync(
+  path.join(root, "examples", "runtime-config.minimal.json"),
+  "utf8",
+));
+const resolvedAuthorityConfig = {
+  runtime_config: authorityRuntimeConfig,
+  permission_policy_selections: [{
+    policy_id: validBackendBindings[0].policy_id,
+    policy_revision: validBackendBindings[0].policy_revision,
+    policy_definition_digest: validBackendBindings[0].policy_definition_digest,
+    binding_id: validBackendBindings[0].binding_id,
+    binding_revision: validBackendBindings[0].binding_revision,
+    binding_digest: validBackendBindings[0].binding_digest,
+  }],
+  service_candidate: validActivationPremises.service_candidate,
+};
+const validConfigRevisionMapping = {
+  schema: "dolly.config-revision-mapping/v1",
+  daemon_installation_id: validActivationPremises.daemon_installation_id,
+  instance_id: validActivationPremises.instance_id,
+  config_revision: validActivationPremises.config_revision,
+  config_digest: canonicalDigest(resolvedAuthorityConfig),
+  canonical_config: resolvedAuthorityConfig,
+};
+assertValid("closed config revision mapping", authorityRecordSchema, validConfigRevisionMapping);
+assertValid(
+  "config revision mapping with revision zero",
+  authorityRecordSchema,
+  { ...validConfigRevisionMapping, config_revision: 0 },
+  false,
+);
+const validRuntimeAuthorityState = {
+  schema: "dolly.runtime-authority-state/v1",
+  authority_schema_version: 1,
+  daemon_installation_id: validConfigRevisionMapping.daemon_installation_id,
+  instance_id: validConfigRevisionMapping.instance_id,
+  current_config_revision: validConfigRevisionMapping.config_revision,
+  current_config_digest: validConfigRevisionMapping.config_digest,
+};
+assertValid("closed current Runtime authority state", authorityRecordSchema, validRuntimeAuthorityState);
+assertValid(
+  "unknown Runtime authority schema version",
+  authorityRecordSchema,
+  { ...validRuntimeAuthorityState, authority_schema_version: 2 },
+  false,
+);
+
 function resolveEffectiveConfig(extensionConfig, moduleConfig) {
   return { ...structuredClone(extensionConfig), ...structuredClone(moduleConfig) };
 }

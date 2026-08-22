@@ -928,15 +928,27 @@ record, write Core state, or start a launcher. A later process-record version
 must bind this provenance to those store-resolved policy records and startup
 recovery. The public Module startup refusal remains in force.
 
+The accepted shared authority contract is now
+[`ADR 0015`](../../dolly-spec/docs/adrs/0015-runtime-authority-database.md)
+and the normative
+[Runtime authority database schema](../../dolly-spec/docs/spec/core/06-storage-and-recovery.md#31-runtime-authority-database-schema-version-1).
+TypeScript and Rust must use that one SQLite database under the same controller
+lock. Its positive integer config mapping binds exact canonical resolved bytes
+and digest; exact current content reuses its revision, changed content allocates
+the next integer, and `A -> B -> A` allocates a new revision. A path, legacy
+JSON file, digest-derived integer, globally unique digest, or language-specific
+sidecar is not authority.
+
 `ReservedV10InstalledPermissionPolicyRegistry` closes only a candidate
 definition-selection rule. The authoritative activation contract now requires
 every configured reference to resolve to exactly one persistent
 `dolly.permission-policy-definition/v1` record and one persistent
-`dolly.permission-policy-binding/v1` record. The configured policy and binding
-revisions are positive safe integers; their separate digests verify the exact
-canonical records. The binding digest covers its installed-product component
-origin. Duplicate, stale, extra, same-revision/different-byte, and
-cross-definition records are rejected.
+`dolly.permission-policy-backend-binding/v1` record. The configured policy and
+binding revisions are positive safe integers; their separate digests verify the
+exact canonical records. The binding digest covers its installed-product
+component origin. Duplicate, stale, extra, same-revision/different-byte, and
+cross-definition or cross-origin records are rejected by the shared database
+foreign keys and premise-cardinality checks.
 
 Package schemas 1 through 4 request no capabilities, so the candidate
 installed-plan resolver continues to reject every non-empty policy reference
@@ -1110,13 +1122,18 @@ unresolved, stale, duplicate, or additional references fail migration.
 
 Migration first requires the revision in that source snapshot to equal the
 explicit expected source revision, then constructs and validates the complete
-version-10 document, target activation-premise record, and auditable change
-plan without changing external state. Applying the plan rechecks the same
-source revision and writes one new configuration revision and its complete
-premise record atomically. It creates no live backend binding, activation
-permission, recovery handoff, subscription, source queue, process record, or
-child process. It does not remove or weaken the version-9 Module startup
-refusal. Applying the migrated document is a later ordered recovery and
+version-10 canonical resolved configuration, target activation-premise record,
+and auditable change plan without changing external state. Applying the plan
+holds the same instance controller lock, rechecks the source revision, and uses
+one `BEGIN IMMEDIATE` transaction in the shared Runtime database. It inserts
+the append-only next config mapping and all prerequisite origin, definition,
+backend-binding, service-candidate, and selection rows; writes the premise last;
+then updates the current pointer and journal before one commit. A pre-commit
+crash leaves zero new authority. After commit, SQLite is sole authority even if
+legacy JSON archival is interrupted. Migration creates no live backend binding,
+activation permission, recovery handoff, subscription, source queue, process
+record, or child process. It does not remove or weaken the version-9 Module
+startup refusal. Applying the migrated document is a later ordered recovery and
 activation operation.
 
 #### 5.3.2 Release gate
@@ -1156,6 +1173,10 @@ composition and tested across restart:
 9. a Linux installed-Module test exercises configuration through Claim,
    process, capability, atomic result commit, shutdown, and reopen while the
    public bootstrap refusal test remains green until the final gate is met.
+10. the TypeScript and Rust paths reopen the same schema-version-1 Runtime
+    SQLite authority database and pass revision reuse/next-allocation,
+    transaction-crash, stale-pointer, identity/digest mismatch, cross-origin,
+    and legacy-JSON single-authority vectors.
 
 Passing the version-10 JSON validator or the activation-premise schema alone
 does not meet this release gate. No implementation may remove or weaken

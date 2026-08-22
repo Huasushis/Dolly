@@ -11,13 +11,13 @@ end-to-end demonstration alone MUST NOT close a package.
 | --- | --- | --- | --- | --- |
 | `WP-001` | schemas and canonical JSON library | Phase 0 semantics | M | cross-language corpus |
 | `WP-002` | reference reducer and vector runner | WP-001 | L | state-hash parity |
-| `WP-003` | SQLite repositories/migrations | WP-001 | L | crash-point suite |
+| `WP-003` | shared Runtime authority schema plus SQLite repositories/migrations | WP-001 | L | `TST-AUTH-004..006` and crash-point suite |
 | `WP-004` | Page/Activation transaction engine | WP-002/003 | XL | model-based parity |
 | `WP-005` | scheduler/backpressure/retention | WP-004 | L | backlog/slow subscriber soak |
 | `WP-006` | Extension framing and lifecycle | WP-001/002 | XL | hostile peer kit |
 | `WP-007` | SDK plus mock Extensions | WP-006 | L | two-language conformance |
 | `WP-008` | daemon/worker/process control | WP-003/006 | L | native OS suite |
-| `WP-009` | config revision/update recovery | WP-004/006/008 | XL | partial failure matrix |
+| `WP-009` | config proposal, integer revision, update, and recovery | WP-003/004/006/008 | XL | partial failure and legacy single-authority matrix |
 | `WP-010` | Asset service | WP-003/006 | XL | import/GC/security suite |
 | `WP-011A` | secret store and exact external-I/O policy | WP-006/008 | M | SecretRef, redaction, exact egress, lifecycle, and denial fixtures |
 | `WP-011B` | Model Gateway | WP-006/008/010/011A | L | provider, multimodal-output, cost, retry, and redaction fixtures |

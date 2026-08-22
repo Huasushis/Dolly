@@ -25,18 +25,24 @@ unlike a deliberately weaker synchronous profile, it has no writable override.
 The check occurs before migration, recovery writes, WAL checkpointing, or any
 other instance mutation.
 
-The Runtime MUST set and verify:
+The Runtime MUST set and read back:
 
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = FULL;
 PRAGMA foreign_keys = ON;
+PRAGMA trusted_schema = OFF;
 PRAGMA busy_timeout = 5000;
 ```
 
+The connection's `PRAGMA user_version` MUST equal the supported Runtime
+authority schema version; version 1 uses `user_version = 1`. A mismatch requires
+the explicit migration procedure below and MUST NOT be repaired by changing the
+number alone.
+
 Failure to obtain or retain these values is `STORAGE_UNSAFE_CONFIGURATION`; the Runtime MUST NOT start in writable **durable-conformance mode**. An explicitly selected unsafe performance profile MAY be writable only when the operator has enabled that named profile, every API and status surface marks the instance `UnsafeDurability`, and the implementation makes no durable-Page, power-loss, or exactly-once commit claim for that run. Such a run does not satisfy the Core durability acceptance tests.
 
-Exactly one Runtime writer task SHOULD serialize Core write transactions. Read tasks MAY use separate read-only connections and SQLite snapshots. A process MUST hold an exclusive OS-level instance lock before opening the database for writing. A second process unable to acquire the lock MUST fail with `STORAGE_INSTANCE_LOCKED`.
+Exactly one Runtime writer task SHOULD serialize Core write transactions. Read tasks MAY use separate read-only connections and SQLite snapshots. A process MUST hold the exclusive operating-system instance controller lock before opening the database for writing, and authority transactions MUST use `BEGIN IMMEDIATE`. A second process unable to acquire that lock MUST fail with `STORAGE_INSTANCE_LOCKED`.
 
 Core's guarantee assumes the operating system and storage device honor durable flushes. Filesystem or hardware that falsely acknowledges flush is outside the guarantee and SHOULD be detected by deployment diagnostics.
 
@@ -61,13 +67,17 @@ Physical normalization MAY differ, but a conforming database MUST enforce the eq
 | `subscriptions` | `(page_id, module_id)` | next-uncommitted cursor and state |
 | `subscription_skips` | unique skip record ID | audited cursor advance without Activation |
 | `subscription_dead_letters` | `(page_id, module_id, page_seq)` | exact Delivery/Block evidence for an audited dead-letter cursor advance |
-| `config_revisions` | `config_revision` | canonical immutable resolved configuration snapshots |
+| `runtime_authority_state` | singleton; exact current config revision/digest foreign key | schema version, installation/instance identity, current config pointer |
+| `config_revision_mappings` | `config_revision`; composite `(config_revision, config_digest)` | append-only integer-to-canonical-config mapping |
 | `graph_revisions` | `graph_revision` | canonical immutable graph snapshots |
 | `descriptor_revisions` | `(module_id, descriptor_revision)` | immutable Descriptor snapshots |
 | `extension_generations` | `(extension_alias, extension_generation)` | durable Worker epoch, process/package identity, negotiated limits, Module binding, readiness, and activation-ledger continuity |
-| `permission_policy_definitions` | `(policy_id, policy_revision)`; unique `definition_digest` | immutable operator-approved policy definitions without live backend authority |
-| `permission_policy_bindings` | `(binding_id, binding_revision)`; unique `binding_digest`; one definition foreign key | non-secret installed-Host component selection metadata |
-| `module_activation_premises` | `config_revision`; unique `premises_digest` | exact policy records and product-owned Linux service candidate for installed Linux Module startup |
+| `installed_component_origins` | `(component_id, component_revision)`; exact digest composite key | verified installed-release component identity |
+| `permission_policy_definitions` | `(policy_id, policy_revision)`; exact digest composite key | immutable operator-approved policy definitions without live backend authority |
+| `permission_policy_backend_bindings` | `(binding_id, binding_revision)`; exact definition and origin foreign keys | non-secret installed-Host component selection metadata |
+| `linux_service_candidates` | origin component plus unit and mode; exact candidate digest composite key | product-owned Linux service lookup input |
+| `module_activation_premise_policy_selections` | `(config_revision, policy_id, policy_revision)`; exact definition and binding foreign keys | one selected backend binding per configured policy reference |
+| `module_activation_premises` | `config_revision`; exact config and service-candidate foreign keys | final complete prerequisite record for installed Linux Module startup |
 | `modules` | `module_id`; unique non-null `nonterminal_activation_id`; at most one execution-slot binding | lifecycle, Module fence generation, current ownership, and pending host fence |
 | `activations` | `activation_id`; at most one nonterminal per `module_id` | lifecycle, attempts, lease generation, frozen replay-contract source, one-shot next-attempt authorization, terminal result |
 | `activation_manifests` | `activation_id`; unique `manifest_digest` per Activation | frozen canonical manifest bytes, complete effective configuration, and value/schema digests |
@@ -80,6 +90,151 @@ Physical normalization MAY differ, but a conforming database MUST enforce the eq
 | `trace_counters` | `(root_trace_id, counter_kind, subject)` | deterministic loop charges |
 | `quarantines` | quarantine ID | reason, evidence, resolution |
 | `core_journal` | unique `journal_seq` | replay and audit events |
+
+
+### 3.1 Runtime authority database schema version 1
+
+The **Runtime authority database** is the one SQLite database whose committed
+rows decide current Runtime configuration and Core state. TypeScript and Rust
+implementations MUST use this same logical schema and transaction boundary; a
+language-specific JSON file, sidecar database, cache, or replay log is not a
+second authority. The Tool call ledger, implemented by `ToolCallLedger` in
+components that use that identifier, remains the `tool_call_ledger` logical
+table in this database.
+
+`REQ-AUTH-001` — The database identity is the tuple
+`(daemon_installation_id, instance_id)` stored in `core_meta` and repeated in
+the closed `dolly.runtime-authority-state/v1` record. The requested tuple, both
+stored copies, and the controller-lock owner MUST agree before a writable
+transaction. A configured filesystem path only locates candidate bytes. A path,
+file name, symbolic link, environment value, command-line value, current
+working directory, or equal copied database never proves instance ownership.
+Moving the same database does not change its identity; changing either identity
+member is an explicit offline restore/migration, never a path edit. All aliases
+for one database MUST resolve to the same controller-lock domain, and a copied
+database cannot be opened as a second writer under the original identity.
+
+Every logical record named below MUST validate against its definition in
+[`runtime-authority-record.schema.json`](../../../schemas/runtime-authority-record.schema.json)
+before insertion and after loading. Indexed columns are projections of the
+stored canonical JavaScript Object Notation (JSON) bytes and MUST compare equal
+to those bytes. The minimum relational constraints are:
+
+| Table | Mandatory identity, digest, and relationship constraints |
+| --- | --- |
+| `runtime_authority_state` | singleton `1`; `authority_schema_version = 1`; installation/instance identity equals `core_meta`; `(current_config_revision, current_config_digest)` references `config_revision_mappings` |
+| `config_revision_mappings` | primary key `config_revision` in `1..9007199254740991`; stores exact canonical resolved-config JCS bytes and `config_digest = sha256(bytes)`; composite unique key `(config_revision, config_digest)` for foreign keys |
+| `installed_component_origins` | primary key `(component_id, component_revision)`; stores exact component digest and closed origin record; composite unique key including `component_digest` for foreign keys |
+| `permission_policy_definitions` | primary key `(policy_id, policy_revision)`; stores closed definition bytes and verified `definition_digest`; composite unique key including that digest |
+| `permission_policy_backend_bindings` | primary key `(binding_id, binding_revision)`; exact definition triple foreign key; exact installed-component-origin triple foreign key; closed binding bytes and verified `binding_digest`; composite unique key containing the binding identity, digest, and definition triple |
+| `linux_service_candidates` | primary key `(origin_component_id, origin_component_revision, unit_name, mode)`; exact installed-component-origin triple foreign key; closed candidate bytes and verified `candidate_digest`; composite unique key including all fields and the digest |
+| `module_activation_premise_policy_selections` | primary key `(config_revision, policy_id, policy_revision)`; deferred foreign key to that revision's premise; exact definition triple foreign key; one composite foreign key to a backend binding that names that same definition triple; unique binding identity per premise |
+| `module_activation_premises` | primary key `config_revision`; exact config revision/digest foreign key; exact service-candidate composite foreign key; closed premise bytes and verified `premises_digest` |
+
+The premise selection rows are the relational projection of the two sorted
+policy arrays in the closed premise record. At commit, their set MUST equal the
+distinct policy references in the canonical resolved configuration and the
+records embedded in the premise byte-for-byte. Every selected definition has
+exactly one matching backend binding; no extra, duplicate, stale, or
+cross-policy row is permitted. A configuration selecting at least one installed
+Linux Module has exactly one premise and one service candidate. A configuration
+selecting none has no premise or selection row.
+
+A digest is an integrity check inside an identity, not a global identity.
+No digest column above has a `UNIQUE` constraint by itself. Equal digest text
+in different identity rows is permitted; a composite key may include the digest
+only to make an exact foreign key. The Runtime MUST NOT derive a revision by
+truncating, parsing, or otherwise mapping a hash to an integer.
+
+`REQ-AUTH-002` — A config revision mapping is append-only. Its
+`config_revision`, canonical config bytes, and digest MUST NOT be updated,
+deleted, reused, or relabeled. The canonical config is the complete normalized
+resolved configuration snapshot used by Core, including every selected
+package, schema, policy, binding, origin, and product service-candidate identity
+and digest that can change execution. Operator source formatting and
+presentation-only fields are not part of that identity. This materialization
+does not make a product-owned service candidate caller-selectable.
+
+Allocation and current-pointer publication use one transaction:
+
+1. While holding the controller lock, validate and normalize the complete
+   candidate, encode exact JCS bytes, and compute the SHA-256 digest.
+2. Execute `BEGIN IMMEDIATE`; reread the singleton current pointer and its
+   referenced mapping. Recheck installation/instance identity and exact current
+   bytes/digest.
+3. If the candidate digest equals the current digest, compare the bytes. Equal
+   bytes reuse the current revision and commit no semantic change. Unequal bytes
+   are `CORE_DIGEST_MISMATCH`/`STORAGE_CORRUPT`; they never allocate a revision.
+4. If the digest differs, allocate `current_config_revision + 1`, failing with
+   `CORE_SEQUENCE_EXHAUSTED` before overflow. Never search historical rows for a
+   digest-derived revision. Therefore `A -> B -> A` allocates three successive
+   revisions, while `A -> A` reuses the current one.
+5. Insert the config mapping, then every required installed-component origin,
+   permission-policy definition, backend binding, service candidate, and
+   deferred premise-selection row. Existing identity rows must have identical
+   canonical bytes and digest or the transaction fails.
+6. After every prerequisite and exact-cardinality check succeeds, insert the
+   module activation premise as the last prerequisite record. Only then update
+   `runtime_authority_state` to the new revision/digest and append its journal
+   event.
+7. Commit once. Do not publish the revision, create a live binding, recover
+   work, expose Ready, or acknowledge success before commit returns success.
+
+`REQ-AUTH-003` — A crash or error before that commit exposes zero rows, pointer
+changes, live authority, or journal events from the candidate. A crash after
+commit exposes the complete mapping, prerequisites, premise, and current
+pointer. Lost acknowledgement is resolved by reopening and comparing the exact
+current mapping; the transaction is not repeated under a newly invented
+identity. Premise insertion order is defense in depth, not permission to expose
+uncommitted prerequisite rows.
+
+Persistent records contain data needed to repeat verification, never the
+resulting authority. They MUST NOT serialize a live object, object identity
+brand, capability, function or function name, factory, endpoint credential,
+secret, secret value, secret reference, executable template, filesystem path,
+repository, process handle, backend object, stop prover, runtime binding,
+activation permission, or recovery handoff. The resolved config mapping may
+retain schema-valid non-secret configuration and secret-reference identifiers
+required by the configuration contract, but never resolved secret values.
+
+### 3.2 Reopen and legacy JSON migration
+
+`REQ-AUTH-004` — Every reopen under the controller lock MUST verify the SQLite
+build attestation, required PRAGMAs, `user_version`, `quick_check`, foreign-key
+check, `core_meta`/authority-state identity agreement, current-pointer foreign
+key, canonical current bytes/digest, every reachable prerequisite digest, and
+premise cardinality before recovery or Ready. A stale pointer, unknown schema
+version, same revision with different bytes, digest mismatch, missing row,
+cross-origin foreign key, or candidate record from another installation is
+`STORAGE_CORRUPT` or a more specific fail-closed activation error. Startup does
+not repair it from a file path, legacy JSON, log, cache, process record, Ready
+response, result, or acknowledgement.
+
+`REQ-AUTH-005` — Import from a legacy JSON configuration is an offline,
+explicitly expected migration under the same instance controller lock. With no
+committed authority-state row, the migration validates the complete JSON and
+all installed schemas, normalizes it, computes exact JCS bytes/digest, and
+creates schema version 1 through the allocation transaction above. A crash
+before commit leaves no new authority and retries the same import. Once commit
+succeeds, SQLite is the sole current-config and premise authority even if a
+crash occurs before the legacy file is archived or removed. That file may
+remain read-only audit/import evidence, but startup MUST ignore it for current
+selection; a mismatch is diagnostic refusal, never an override. If a committed
+authority-state row already exists, ordinary startup never reimports JSON.
+
+A later authority schema migration is likewise offline under the controller
+lock, names one exact source `user_version`, validates the complete target
+before writing, and changes schema/data/version in one SQLite transaction.
+Changing `user_version`, pointer rows, or legacy JSON separately is not a
+migration.
+
+- **INV-AUTH-001 — Revision identity.** One positive integer revision names one
+  exact canonical resolved configuration forever; only a changed current
+  digest allocates the next integer, and historical digest equality never
+  reuses an integer.
+- **INV-AUTH-002 — Atomic authority publication.** The current pointer never
+  names a partial prerequisite set, and no persistent prerequisite is itself a
+  live capability or process authority.
 
 Canonical JSON documents MUST be stored as BLOB bytes or a representation proven to round-trip to identical JCS bytes. Loading a row MUST verify its stored digest before exposing it to an Extension. For Blocks, this includes both `body_digest` and `envelope_digest`.
 
@@ -102,9 +257,11 @@ The database MUST use foreign keys or equivalent checks so that:
   its target Extension generation MUST reference the
   `extension_generations` row under the Extension alias frozen for that Module
   and that row MUST retain the same Module/Extension binding;
-- a permission-policy binding cannot exist without its exact definition triple,
-  and an activation-premise row cannot exist without its exact configuration
-  revision, complete selected definition/binding set, and verified digests;
+- a permission-policy backend binding cannot exist without its exact
+  definition and installed-component-origin triples; a service candidate cannot
+  exist without its exact origin; and an activation-premise row cannot exist
+  without its exact configuration revision/digest, service candidate, complete
+  selected definition/backend-binding set, and verified digests;
 - a committed activation output cannot exist without its Activation; and
 - a Tool-call row cannot exist without its exact Activation and configuration
   revision; its instance identity MUST equal `core_meta`, all indexed fields
@@ -131,15 +288,23 @@ Other Core records that require ordering, such as external ingress and audited s
 
 Before this transaction, the control plane MUST have satisfied the cutover requirements for the candidate's change class and completed every required backlog disposition. Graph-only routing changes MAY leave old frozen Activations live, in which case all referenced old objects MUST be retained. Changes requiring state/process replacement, immediate authority revocation, destructive disposition, or removal of an object that cannot be retained safely MUST quiesce and fence the applicable participants.
 
-Every accepted configuration change inserts the complete canonical resolved configuration and advances `config_revision` in one transaction. If effective graph semantics also change, that same transaction inserts the complete canonical graph, advances `graph_revision`, and creates or drains subscriptions. A non-graph configuration change leaves the active `graph_revision` unchanged. The transaction appends its journal record and MUST NOT delete any configuration or graph snapshot referenced by a nonterminal Activation.
+An exact current digest/byte match performs no semantic configuration change
+and reuses the current revision. Every accepted changed configuration follows
+`REQ-AUTH-002`: it inserts the complete canonical resolved config mapping and
+advances `config_revision` in one transaction. If graph semantics also change,
+that transaction inserts the complete canonical graph, advances
+`graph_revision`, and creates or drains subscriptions. A non-graph change
+leaves the active `graph_revision` unchanged. The transaction appends its
+journal record and MUST NOT delete a configuration or graph snapshot referenced
+by a nonterminal Activation or retained audit record.
 
-When the target configuration selects an installed Linux Module, that same
-transaction MUST insert its one complete activation-premise record and all
-referenced immutable permission-policy definition/backend-binding records.
-Changing any definition, binding, installed-product origin, or service
-candidate requires a new configuration revision and premise digest. Missing or
-extra records abort the transaction; no later process, Ready, result,
-acknowledgement, or absent record fills them.
+When the target selects an installed Linux Module, that transaction inserts or
+verifies every installed-component origin, permission-policy definition,
+backend binding, service candidate, and premise-selection row, then inserts the
+one complete activation-premise row last. Changing any prerequisite changes the
+canonical resolved configuration digest and requires the next config revision
+and a new premise digest. Missing or extra records abort the transaction; no
+later process, Ready, result, acknowledgement, or absent record fills them.
 
 ### 5.2 External ingress
 
@@ -362,7 +527,7 @@ CREATE TABLE tool_call_ledger (
   PRIMARY KEY (module_id, operation_id),
   UNIQUE (tool_server_id, tool_server_generation, server_request_id),
   FOREIGN KEY (activation_id) REFERENCES activations(activation_id),
-  FOREIGN KEY (config_revision) REFERENCES config_revisions(config_revision),
+  FOREIGN KEY (config_revision) REFERENCES config_revision_mappings(config_revision),
   CHECK (
     (state = 'AUTHORIZED' AND ledger_revision = 1
                            AND outbound_digest IS NULL
@@ -452,39 +617,45 @@ A caller receiving `unknown` MUST replay with the same idempotency identity. It 
 
 Startup in writable mode MUST perform this order:
 
-1. inspect configuration read-only; when it contains an installed Linux Module,
-   observe the Host platform and refuse non-Linux activation before
-   acquiring or creating the instance controller lock or any writable resource;
-2. acquire the exclusive instance controller lock;
-3. claim and reread the exact active configuration revision under that lock;
-4. open SQLite with the required PRAGMAs;
-5. verify schema version and migrations;
-6. run `PRAGMA quick_check` and a foreign-key check;
-7. verify the instance identity and sequence bounds;
-8. verify canonical digest samples and all nonterminal manifest/result digests;
-9. for an installed Linux Module, load and resolve its exact
-   [activation premises](../operations/04-module-activation-authority.md), verify
-   the product-owned service/runtime binding, and prepare/read back the
-   delegated root in the order defined there;
-10. terminate or prove absence of Extension processes from the old worker epoch;
-11. rebuild or verify trace counters after an unclean shutdown;
-12. reconstruct Module and subscription states;
-13. reset every lossy Page and record restart gaps before any recovered result
+1. locate and inspect the authority state/current config read-only; when it
+   contains an installed Linux Module, observe the Host platform and refuse
+   non-Linux activation before acquiring or creating the instance controller
+   lock or any writable resource;
+2. acquire the exclusive controller lock for the expected installation/instance
+   tuple;
+3. reopen the same Runtime database with the required PRAGMAs and verify the
+   loaded SQLite attestation;
+4. verify `user_version` and complete any explicitly authorized offline
+   migration before ordinary recovery;
+5. run `PRAGMA quick_check` and a foreign-key check;
+6. verify `core_meta`/authority-state identity, sequence bounds, the exact
+   current pointer and mapping, and equality with the inspected
+   revision/digest;
+7. verify canonical config/prerequisite/premise digests and cardinality plus all
+   nonterminal manifest/result digests;
+8. for an installed Linux Module, resolve fresh backend bindings, verify the
+   product-owned service/runtime binding, and prepare/read back the delegated
+   root in the order defined by
+   [activation premises](../operations/04-module-activation-authority.md);
+9. terminate or prove absence of Extension processes from the old worker epoch;
+10. rebuild or verify trace counters after an unclean shutdown;
+11. reconstruct Module and subscription states;
+12. reset every lossy Page and record restart gaps before any recovered result
     can append new lossy output;
-14. apply every `result_staged` or `commit_blocked` Activation in deterministic
+13. apply every `result_staged` or `commit_blocked` Activation in deterministic
     `(ManifestCreated journal_seq, activation_id)` order;
-15. move every orphaned `leased` Activation through fencing to its safe
-    recovered disposition with the same Manifest; and
-16. for an installed Linux Module, mint and consume the one-use recovery
-    handoff in installed composition; only now expose `ready` and eligible
-    `retry_wait` work in deterministic
+14. move every orphaned `leased` Activation through fencing to its safe
+    recovered disposition with the same Manifest;
+15. for an installed Linux Module, mint and consume the one-use recovery
+    handoff in installed composition; and
+16. only now expose `ready` and eligible `retry_wait` work in deterministic
     `(ManifestCreated journal_seq, activation_id)` order.
 
 No Extension MAY receive an Activation before steps 1–15 complete, and an
-installed Linux Module cannot receive one before step 16 completes.
-Recovery MUST NOT publish runnable work between configuration/premise
-verification, reconstruction, lossy reset, staged application, orphan fencing,
-and installed composition.
+installed Linux Module cannot receive one before step 16. Recovery MUST NOT
+publish runnable work between configuration/premise verification,
+reconstruction, lossy reset, staged application, orphan fencing, and installed
+composition.
 
 An integrity failure MUST start the instance in read-only recovery mode or refuse startup. It MUST NOT delete offending rows, reset cursors, or reconstruct canonical data from logs automatically.
 

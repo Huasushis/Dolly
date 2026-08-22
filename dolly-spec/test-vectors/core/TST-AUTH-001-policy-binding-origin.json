@@ -2,26 +2,28 @@
   "schema": "dolly.test-vector/v1",
   "test_id": "TST-AUTH-001",
   "kind": "security",
-  "covers": ["REQ-ACT-002", "INV-ACTIVATION-012", "INV-ACTIVATION-013", "INV-ACTIVATION-015"],
+  "covers": ["REQ-ACT-002", "REQ-AUTH-003", "INV-ACTIVATION-012", "INV-ACTIVATION-013", "INV-ACTIVATION-015"],
   "initial": {
     "active_configuration": {
-      "instance_id": "0198ab31-6c44-7e8a-b2bb-000000000501",
+      "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000501",
+      "instance_id": "main",
       "config_revision": 42,
       "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "permission_policy_references": [
         {
           "policy_id": "read-tools",
           "policy_revision": 7,
-          "policy_definition_digest": "sha256:3ddf15701a58e5333fb37c0ad38aa6f2ed92b1baeab118dcb66a7cccaee67773",
+          "policy_definition_digest": "sha256:a98473d2796d0d25ab176397d89ed04612dbe2928f1dce9c393b346486f09c41",
           "binding_id": "read-tools-host",
           "binding_revision": 3,
-          "binding_digest": "sha256:2b07a83cc3674d6c20097b7b375df3ac432a130e9584b66e1e133ab473f151eb"
+          "binding_digest": "sha256:b7b678b80bed905719ce6ff915e7a679c62a9de3fdfadedf8a5780a3f394497b"
         }
       ]
     },
     "premise_record": {
       "schema": "dolly.module-activation-premises/v1",
-      "instance_id": "0198ab31-6c44-7e8a-b2bb-000000000501",
+      "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000501",
+      "instance_id": "main",
       "config_revision": 42,
       "config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "permission_policy_definitions": [
@@ -37,24 +39,26 @@
             "effect_class": "read-only"
           },
           "origin": {
+            "schema": "dolly.policy-definition-origin/v1",
             "kind": "operator_approved_policy",
             "source_id": "org.dolly.policy-store",
             "source_revision": 11,
             "source_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
           },
-          "definition_digest": "sha256:3ddf15701a58e5333fb37c0ad38aa6f2ed92b1baeab118dcb66a7cccaee67773"
+          "definition_digest": "sha256:a98473d2796d0d25ab176397d89ed04612dbe2928f1dce9c393b346486f09c41"
         }
       ],
-      "permission_policy_bindings": [
+      "permission_policy_backend_bindings": [
         {
-          "schema": "dolly.permission-policy-binding/v1",
+          "schema": "dolly.permission-policy-backend-binding/v1",
           "binding_id": "read-tools-host",
           "binding_revision": 3,
-          "binding_digest": "sha256:2b07a83cc3674d6c20097b7b375df3ac432a130e9584b66e1e133ab473f151eb",
+          "binding_digest": "sha256:b7b678b80bed905719ce6ff915e7a679c62a9de3fdfadedf8a5780a3f394497b",
           "policy_id": "read-tools",
           "policy_revision": 7,
-          "policy_definition_digest": "sha256:3ddf15701a58e5333fb37c0ad38aa6f2ed92b1baeab118dcb66a7cccaee67773",
+          "policy_definition_digest": "sha256:a98473d2796d0d25ab176397d89ed04612dbe2928f1dce9c393b346486f09c41",
           "origin": {
+            "schema": "dolly.installed-component-origin/v1",
             "kind": "installed_product_component",
             "component_id": "org.dolly.host.read-tools",
             "component_revision": 5,
@@ -65,21 +69,32 @@
       "service_candidate": {
         "schema": "dolly.linux-service-candidate/v1",
         "origin": {
+          "schema": "dolly.installed-component-origin/v1",
           "kind": "installed_product_component",
           "component_id": "org.dolly.runtime.service-candidate",
           "component_revision": 2,
           "component_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
         },
         "unit_name": "dollyd@main.service",
-        "mode": "user"
+        "mode": "user",
+        "candidate_digest": "sha256:01fe6e668fcbb43cad4569dc7818ed16dd78ab6e20f9faf3ae3203d383e6efa4"
       },
-      "premises_digest": "sha256:0676c117940553c9c6f66487fb1a73d2f9e82d3c053f0a9487985ecd91864e7f"
+      "premises_digest": "sha256:eac87896e302fb55a3456ccc32299827db6ffa4c8906c6c43a8dbdf78384eca2"
     },
     "installed_components": [
       {
+        "schema": "dolly.installed-component-origin/v1",
+        "kind": "installed_product_component",
         "component_id": "org.dolly.host.read-tools",
         "component_revision": 5,
         "component_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      {
+        "schema": "dolly.installed-component-origin/v1",
+        "kind": "installed_product_component",
+        "component_id": "org.dolly.runtime.service-candidate",
+        "component_revision": 2,
+        "component_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
       }
     ],
     "hostile_cases": [
@@ -107,12 +122,14 @@
       {"path": "/resolved_binding_count", "op": "equals", "value": 1},
       {"path": "/definition_digest_verified", "op": "equals", "value": true},
       {"path": "/binding_digest_verified", "op": "equals", "value": true},
+      {"path": "/service_candidate_digest_verified", "op": "equals", "value": true},
       {"path": "/premises_digest_verified", "op": "equals", "value": true},
       {"path": "/live_binding/controller_generation", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000502"},
       {"path": "/live_binding/branded_by_host", "op": "equals", "value": true},
       {"path": "/live_binding/serialized_secret", "op": "absent"},
       {"path": "/live_binding/serialized_path", "op": "absent"},
       {"path": "/live_binding/serialized_function", "op": "absent"},
+      {"path": "/live_binding/serialized_endpoint_credential", "op": "absent"},
       {"path": "/hostile_results/copied_structural_live_binding/error", "op": "equals", "value": "MODULE_ACTIVATION_POLICY_BINDING_UNAVAILABLE"},
       {"path": "/hostile_results/binding_record_with_backend_path_secret_or_function/error", "op": "equals", "value": "MODULE_ACTIVATION_PREMISES_INVALID"},
       {"path": "/hostile_results/same_policy_revision_with_different_definition_bytes/error", "op": "equals", "value": "MODULE_ACTIVATION_PREMISES_INVALID"},

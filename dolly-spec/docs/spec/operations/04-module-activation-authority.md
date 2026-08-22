@@ -18,13 +18,14 @@ premise set MUST conform to
 
 ## 1. Premises and authority direction
 
-A **Module activation premise record** is the persistent, non-secret set of
-facts that an installed Host must verify before it may create live Module
-execution authority. It relates the active configuration revision to exact
-permission-policy definition records, backend-binding records, and one Linux
-service candidate. It is called a premise record because its JSON bytes are
-inputs to Host verification, not a capability, service proof, process handle,
-or permission.
+A **Module activation premise record** is the final persistent, non-secret
+prerequisite set that an installed Host must verify before it may create live
+Module execution authority. It binds one exact Runtime authority database
+configuration mapping to exact permission-policy definition records,
+permission-policy backend-binding records, installed-component origins, and
+one Linux service candidate. It is called a premise record because its
+canonical JSON bytes are inputs to Host verification, not a capability, service
+proof, process handle, or permission.
 
 Authority flows only in this direction:
 
@@ -74,7 +75,8 @@ A permission-policy backend-binding record connects exactly one definition
 triple `(policy_id, policy_revision, policy_definition_digest)` to an installed
 Host component. It contains only `binding_id`, monotonic `binding_revision`,
 `binding_digest`, that definition triple, and the installed-product component
-origin. `binding_digest` is
+origin. Its closed record schema is
+`dolly.permission-policy-backend-binding/v1`. `binding_digest` is
 `sha256(JCS(binding_record_without_binding_digest))`. The origin's component
 identifier, revision, and digest MUST identify one component in the verified
 installed release. A component label supplied by configuration, an Extension,
@@ -108,17 +110,21 @@ The cardinality is exact:
 
 The arrays are in ascending Unicode scalar-value order by `policy_id`, then
 revision, and are unique by those identity fields. The set of definition
-triples MUST equal the set selected by the active configuration. The binding
-array MUST contain exactly one matching row for each member of that set.
+triples MUST equal the set selected by the active configuration. The
+backend-binding array MUST contain exactly one matching row for each member of
+that set.
 
 ## 3. Product-owned Linux service candidate
 
 `REQ-ACT-003` — The installed Linux product MUST supply exactly one service
-candidate from its verified installed-product component record. The candidate's
-`origin`, `unit_name`, and `mode` are non-secret lookup inputs only. A Module,
-Extension, instance document, process record, environment value, command-line
-argument, Ready response, or saved process identifier MUST NOT create or alter
-the candidate used by product activation.
+candidate from its verified installed-product component record. The closed
+candidate record includes that origin, `unit_name`, `mode`, and
+`candidate_digest =
+sha256(JCS(candidate_record_without_candidate_digest))`. The candidate fields
+are non-secret lookup inputs only. A Module, Extension, instance source
+document, process record, environment value, command-line argument, Ready
+response, or saved process identifier MUST NOT create or alter the candidate
+used by product activation.
 
 Dolly v1 installed activation accepts only `mode: "user"`, matching the
 per-user daemon and systemd user-unit deployment contract. A lower-level probe
@@ -142,44 +148,67 @@ snapshot, stop prover, and one branded runtime binding whose revision and digest
 cover the reviewed runtime audit profile and candidate origin. Neither object
 is JSON, survives restart, or can be reconstructed from equal fields.
 
+The persistent definition, backend-binding, installed-component-origin,
+service-candidate, and premise records use the closed definitions in
+[`runtime-authority-record.schema.json`](../../../schemas/runtime-authority-record.schema.json).
+They are logical tables in the one Runtime authority database, with the exact
+foreign keys and cardinality in
+[Storage and Recovery](../core/06-storage-and-recovery.md#31-runtime-authority-database-schema-version-1).
+A digest has no global uniqueness or authority. No record serializes a live
+backend object, capability, function, endpoint credential, secret, filesystem
+path, activation permission, runtime binding, stop prover, or recovery handoff.
+
+During a changed-config transaction, installed-component origins, definitions,
+backend bindings, service candidate, and policy-selection rows are inserted or
+verified first. The complete premise row is the last prerequisite inserted;
+only the current config pointer and journal event follow it before the one
+commit. Failure or crash before commit yields zero new persistent or live
+authority.
+
 ## 4. Required startup order
 
-`REQ-ACT-004` — After read-only syntax/schema inspection identifies at least one
-installed Linux Module, writable product startup MUST perform the
-following order. The **instance controller lock** below is the one exclusive
-operating-system instance lock required by Core storage, not a second lock with
-a different ownership domain.
+`REQ-ACT-004` — After read-only inspection of the current authority-database
+configuration identifies at least one installed Linux Module, writable product
+startup MUST perform the following order. The **instance controller lock**
+below is the one exclusive operating-system instance lock required by Core
+storage, not a second lock with a different ownership domain.
 
-1. Observe the Host platform through the zero-argument Host adapter. A non-Linux
-   Host returns `MODULE_ACTIVATION_PLATFORM_UNSUPPORTED` before creating or
-   acquiring a controller lock, claiming configuration, opening writable Core
-   storage, querying systemd, preparing a cgroup, recovering state, or creating
-   a process.
-2. Acquire exclusive controller-lock ownership and mint a fresh controller
+1. Locate candidate database bytes from deployment configuration and inspect
+   the closed authority state/current config read-only. This grants no
+   ownership; a filesystem path is not authority.
+2. Observe the Host platform through the zero-argument Host adapter. A
+   non-Linux Host returns `MODULE_ACTIVATION_PLATFORM_UNSUPPORTED` before
+   creating or acquiring a controller lock, opening writable Core storage,
+   querying systemd, preparing a cgroup, recovering state, or creating a
+   process.
+3. Acquire exclusive controller-lock ownership for the exact
+   `(daemon_installation_id, instance_id)` and mint a fresh controller
    generation. No live object from a previous owner is accepted.
-3. While holding that lock, claim the exact inspected instance and active
-   configuration revision, reread the current canonical configuration, and
-   verify both `config_revision` and `config_digest`. A changed revision releases
-   the lock and refuses startup; it is never silently substituted.
-4. Open and validate the authoritative Core store under the same lock, including
-   required storage-runtime, schema, migration, integrity, identity, bound, and
-   digest checks. Do not yet recover work or expose runnable state.
+4. Under that lock, open the same Runtime authority database with the required
+   PRAGMAs and validate SQLite attestation, schema/migration version, integrity,
+   foreign keys, database identity, bounds, current pointer, and exact canonical
+   config bytes/digest. The reread must match the inspected revision/digest; a
+   change refuses startup rather than silently substituting a revision. Do not
+   yet recover work or expose runnable state.
 5. Load the one premise record for that exact configuration revision, recompute
-   every definition, binding, origin, and premise digest, enforce the exact
-   cardinalities above, and resolve fresh live backend bindings. This step
-   starts no Extension and grants no capability.
-6. Verify the product-owned service candidate and reviewed runtime, then prepare
-   and read back the delegated root. Only now mint the activation permission,
-   runtime binding, and stop prover for this controller generation.
-7. Prove every old Module execution container empty using the exact stop prover,
-   then perform startup recovery in the Storage and Recovery order.
+   every definition, backend-binding, origin, service-candidate, and premise
+   digest, enforce all foreign keys and exact cardinalities, and resolve fresh
+   live backend bindings. This step starts no Extension and grants no
+   capability.
+6. Verify the product-owned service candidate and reviewed runtime, then
+   prepare and read back the delegated root. Only now mint the activation
+   permission, runtime binding, and stop prover for this controller generation.
+7. Prove every old Module execution container empty using the exact stop
+   prover, then perform startup recovery in the Storage and Recovery order.
 8. After all old-process, result, Claim, cursor, counter, and generation
    reconciliation succeeds, mint one opaque recovery handoff. It is one-use and
-   bound to the controller generation, exact Core store, result repository,
-   configuration and premise digests, activation permission, and stop prover.
+   bound to the controller generation, exact Runtime database, result
+   repository, configuration and premise digests, activation permission, and
+   stop prover.
 9. Installed composition consumes that exact handoff, activation permission,
    runtime binding, and policy backend bindings. Only this step may create the
-   installed Host, fresh Module generations, and non-reused process generations.
+   installed Host, fresh Module generations, and non-reused process
+   generations.
 10. Expose `Ready` and admit Activation work only after composition and all
     recovered commit-only work required by the readiness contract complete.
 
@@ -200,22 +229,28 @@ persistent digest is unchanged. Module and process generations remain distinct:
 composition may preserve the logical Module but allocates every replacement
 process generation once and never reuses it.
 
-A definition, binding, installed component, service candidate, or active
-configuration change creates a new complete premise record and digest in the
-same configuration-install transaction. It requires quiescence and a new
+A definition, backend binding, installed component, service candidate, or
+active configuration change changes the complete canonical resolved
+configuration digest and creates a new config mapping plus complete premise in
+the same authority transaction. It requires quiescence and a new
 Module/process generation where the changed premise can affect execution. A
 current change never upgrades an existing Activation Manifest or authorizes a
 stale process generation.
 
-Migration is an offline, lock-owning operation against an explicitly expected
-source revision. It validates a complete target premise record before commit
-and installs the target configuration and premise record atomically. A legacy
-policy identifier, in-memory registry entry, process record, successful result,
+Migration is an offline operation under the exact instance controller lock
+against an explicitly expected source identity and revision. Legacy JSON is
+validated and normalized, and its complete resolved JCS bytes and digest are
+computed before the schema-version-1 SQLite transaction starts. That transaction
+inserts all prerequisite records, inserts the premise last, and publishes the
+mapping/current pointer once. A crash before commit leaves no new authority; a
+crash after commit leaves SQLite as the sole authority even if the JSON remains
+on disk. Startup never chooses between JSON and SQLite. A legacy policy
+identifier, in-memory registry entry, process record, successful result,
 acknowledgement, or absent record MUST NOT supply a missing definition,
-binding, revision, digest, or origin. An unresolved legacy policy remains
-blocked as `MODULE_ACTIVATION_POLICY_BINDING_UNAVAILABLE`; migration neither
-creates a live binding nor mints a recovery handoff. Normal startup must rerun
-all ten steps after migration.
+backend binding, revision, digest, or origin. An unresolved legacy policy
+remains blocked as `MODULE_ACTIVATION_POLICY_BINDING_UNAVAILABLE`; migration
+neither creates a live binding nor mints a recovery handoff. Normal startup must
+rerun all ten steps after migration.
 
 ## 6. Downstream abstention and invariants
 
@@ -246,12 +281,17 @@ permission, runtime binding, stop prover, or recovery handoff.
 
 The mandatory vectors
 [`TST-AUTH-001`](../../../test-vectors/core/TST-AUTH-001-policy-binding-origin.json),
-[`TST-AUTH-002`](../../../test-vectors/core/TST-AUTH-002-startup-order.json), and
-[`TST-AUTH-003`](../../../test-vectors/core/TST-AUTH-003-restart-migration-abstention.json)
+[`TST-AUTH-002`](../../../test-vectors/core/TST-AUTH-002-startup-order.json),
+[`TST-AUTH-003`](../../../test-vectors/core/TST-AUTH-003-restart-migration-abstention.json),
+[`TST-AUTH-004`](../../../test-vectors/core/TST-AUTH-004-config-revision-transaction-crash.json),
+[`TST-AUTH-005`](../../../test-vectors/core/TST-AUTH-005-reopen-identity-digest.json),
+and
+[`TST-AUTH-006`](../../../test-vectors/core/TST-AUTH-006-stale-pointer-cross-origin.json)
 are the minimum conformance cases. Implementations MUST additionally test every
-step boundary by crash injection and reject unknown fields, duplicate records,
-digest mismatch, stale revision, cross-policy binding, copied brand, stale
-controller generation, non-product origin, and wrong service mode.
+transaction/startup boundary by crash injection and reject unknown fields,
+duplicate records, digest/content mismatch, stale revision or pointer,
+cross-policy binding, copied brand, stale controller generation, non-product or
+cross-installation origin, and wrong service mode.
 
 This contract alone does not authorize removal or weakening of the public
 `RUNTIME_MODULE_MIGRATION_REQUIRED` refusal. It also does not claim that

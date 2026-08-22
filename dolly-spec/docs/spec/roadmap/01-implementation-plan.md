@@ -35,11 +35,13 @@ pass under arbitrary fragmentation and reordering allowed by the protocol.
 
 ## Phase 2 — Durable Runtime Core
 
-Deliver SQLite migrations, Page/Block/Subscription/Activation repositories,
-transactional commit, scheduler baseline, retention/backpressure, journal, and
+Deliver the shared TypeScript/Rust Runtime authority schema/migration first,
+then Page/Block/Subscription/Activation repositories, transactional commit,
+scheduler baseline, retention/backpressure, Tool call ledger, journal, and
 crash-point instrumentation.
 
-Exit: production Core matches the reducer; kill-after-every-write tests show no
+Exit: production Core matches the reducer; `TST-AUTH-004..006` and
+kill-after-every-write tests show no partial config mapping/premise/pointer,
 acknowledged input loss, partial output/cursor commit, or Module re-entry.
 
 ## Phase 3 — Extension Host and SDK
@@ -53,12 +55,14 @@ incompatible versions fail clearly; reference Extension hot replacement passes.
 
 ## Phase 4 — Daemon, CLI, and config transactions
 
-Deliver per-user `dollyd`, Worker lifecycle, locks, multi-instance registry,
-revisioned JSON configuration, prepare/quiesce/commit/recovery, authenticated
-local API, CLI, and minimal Web admin.
+Deliver per-user `dollyd`, Worker lifecycle, controller locks, multi-instance
+registry, JSON configuration proposal/import, SQLite-backed integer revisions,
+prepare/quiesce/commit/recovery, authenticated local API, CLI, and minimal Web
+admin. JSON never remains current authority after migration.
 
-Exit: foreground/background conflict is impossible; partial updates become an
-explicit recoverable state; native Linux/Windows process suites pass.
+Exit: foreground/background conflict is impossible; same current content reuses
+its revision, changed content allocates the next, partial updates become an
+explicit recoverable state, and native Linux/Windows process suites pass.
 
 ## Phase 5 — Assets, secrets, Model Gateway, and Tool Broker
 
