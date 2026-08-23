@@ -43,6 +43,25 @@ fn offline_handle_is_inert_until_validated_migration() {
     );
 }
 
+#[test]
+fn migration_symlink_path_is_rejected_before_target_read() {
+    let (_dir, path) = temp_db();
+    let target = path.with_file_name("target.sqlite");
+    fs::write(&target, b"authority-target-sentinel").unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+
+    let err = Database::open_for_migration(&path)
+        .unwrap()
+        .migrate_legacy_json(&legacy_json(&path))
+        .expect_err("migration must reject a symlinked database path");
+    assert!(matches!(err, StorageError::UnsafeConfiguration));
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"authority-target-sentinel",
+        "symlink target must not be opened or mutated"
+    );
+}
+
 fn instance_id(path: &Path) -> String {
     let name = path
         .parent()

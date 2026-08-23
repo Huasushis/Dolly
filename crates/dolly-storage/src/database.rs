@@ -166,6 +166,169 @@ pub struct OfflineDatabase {
     attestation: ReleaseAttestation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    length: u64,
+}
+
+#[derive(Debug)]
+struct ArtifactState {
+    bytes: Vec<u8>,
+    identity: ArtifactIdentity,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+}
+
+#[derive(Debug)]
+struct ArtifactSnapshot {
+    path: PathBuf,
+    before: Option<ArtifactState>,
+    created_identity: Option<ArtifactIdentity>,
+}
+
+impl ArtifactSnapshot {
+    fn capture(path: PathBuf) -> StorageResult<Self> {
+        Ok(Self {
+            before: capture_artifact_state(&path)?,
+            path,
+            created_identity: None,
+        })
+    }
+
+    fn note_created(&mut self) {
+        if self.before.is_none() && self.created_identity.is_none() {
+            self.created_identity = current_artifact_identity(&self.path);
+        }
+    }
+
+    fn restore(&self) {
+        if reject_symlink_components(&self.path).is_err() {
+            return;
+        }
+        match (&self.before, self.created_identity) {
+            (None, Some(identity)) => {
+                if current_artifact_identity(&self.path) == Some(identity) {
+                    let _ = fs::remove_file(&self.path);
+                }
+            }
+            (Some(state), _) => {
+                let current = current_artifact_identity(&self.path);
+                if current.is_none() || current == Some(state.identity) {
+                    let _ = restore_artifact_state(&self.path, state);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+}
+
+struct MigrationCleanup {
+    database: ArtifactSnapshot,
+    database_wal: ArtifactSnapshot,
+    database_shm: ArtifactSnapshot,
+    database_journal: ArtifactSnapshot,
+    path_lock: ArtifactSnapshot,
+    identity_lock: ArtifactSnapshot,
+    database_active: bool,
+    path_lock_active: bool,
+    identity_lock_active: bool,
+    committed: bool,
+}
+
+impl MigrationCleanup {
+    fn capture(
+        database_path: &Path,
+        path_lock_path: &Path,
+        identity_lock_path: &Path,
+    ) -> StorageResult<Self> {
+        Ok(Self {
+            database: ArtifactSnapshot::capture(database_path.to_path_buf())?,
+            database_wal: ArtifactSnapshot::capture(sqlite_sidecar_path(database_path, "-wal"))?,
+            database_shm: ArtifactSnapshot::capture(sqlite_sidecar_path(database_path, "-shm"))?,
+            database_journal: ArtifactSnapshot::capture(sqlite_sidecar_path(
+                database_path,
+                "-journal",
+            ))?,
+            path_lock: ArtifactSnapshot::capture(path_lock_path.to_path_buf())?,
+            identity_lock: ArtifactSnapshot::capture(identity_lock_path.to_path_buf())?,
+            database_active: false,
+            path_lock_active: false,
+            identity_lock_active: false,
+            committed: false,
+        })
+    }
+
+    fn note_path_lock_created(&mut self, created: bool) {
+        if created {
+            self.path_lock_active = true;
+            self.path_lock.note_created();
+        }
+    }
+
+    fn note_identity_lock_created(&mut self, created: bool) {
+        if created {
+            self.identity_lock_active = true;
+            self.identity_lock.note_created();
+        }
+    }
+
+    fn begin_database(&mut self) {
+        self.database_active = true;
+    }
+
+    fn note_database_artifacts(&mut self) {
+        if !self.database_active {
+            return;
+        }
+        self.database.note_created();
+        self.database_wal.note_created();
+        self.database_shm.note_created();
+        self.database_journal.note_created();
+    }
+
+    fn note_all_created(&mut self) {
+        self.note_database_artifacts();
+        if self.path_lock_active {
+            self.path_lock.note_created();
+        }
+        if self.identity_lock_active {
+            self.identity_lock.note_created();
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+
+    fn restore(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.note_all_created();
+        self.database_journal.restore();
+        self.database_shm.restore();
+        self.database_wal.restore();
+        self.database.restore();
+        self.identity_lock.restore();
+        self.path_lock.restore();
+    }
+}
+
+impl Drop for MigrationCleanup {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 impl Database {
     /// Open an existing committed authority database.
     pub fn open(db_path: &Path) -> StorageResult<Self> {
@@ -235,57 +398,147 @@ impl Database {
     }
 }
 
+fn open_migration_database(
+    db_path: &Path,
+    attestation: &ReleaseAttestation,
+) -> StorageResult<(Database, bool)> {
+    reject_symlink_components(db_path)?;
+    let path_lock_path = instance_lock_path(db_path);
+    reject_symlink_components(&path_lock_path)?;
+    let loaded = probe_loaded_sqlite();
+    let verified = SqliteBuildGate.verify(attestation, &loaded)?;
+    let (path_lock, path_lock_created) = acquire_lock_file_with_creation(&path_lock_path)?;
+    let expected_identity = match read_persisted_identity(db_path) {
+        Ok(identity) => identity,
+        Err(error) => {
+            if path_lock_created {
+                let _ = fs::remove_file(&path_lock_path);
+            }
+            return Err(error);
+        }
+    };
+    if expected_identity.is_some() {
+        if path_lock_created {
+            let _ = fs::remove_file(&path_lock_path);
+        }
+        return Err(StorageError::MigrationRequired);
+    }
+    let owner = match lock_owner(&path_lock) {
+        Ok(owner) => owner,
+        Err(error) => {
+            if path_lock_created {
+                let _ = fs::remove_file(&path_lock_path);
+            }
+            return Err(error);
+        }
+    };
+    if owner.is_some() {
+        if path_lock_created {
+            let _ = fs::remove_file(&path_lock_path);
+        }
+        return Err(StorageError::Corrupt);
+    }
+    Ok((
+        Database {
+            db_path: db_path.to_path_buf(),
+            connection: None,
+            path_lock,
+            identity_lock: None,
+            verified,
+            configuration: None,
+            schema_version: 0,
+            authority_identity: None,
+            controller_generation_id: None,
+        },
+        path_lock_created,
+    ))
+}
+
 impl OfflineDatabase {
     /// Import one legacy JSON document in one immediate transaction, then
     /// consume the offline handle into the ordinary writable Database type.
     pub fn migrate_legacy_json(self, bytes: &[u8]) -> StorageResult<Database> {
         let input = parse_legacy_authority(bytes)?;
         validate_revision(&input).map_err(map_host_authority_error)?;
+
+        let path_lock_path = instance_lock_path(&self.db_path);
+        reject_symlink_components(&self.db_path)?;
+        reject_symlink_components(&path_lock_path)?;
         if read_persisted_identity(&self.db_path)?.is_some() {
             return Err(StorageError::MigrationRequired);
         }
-        let mut database = open_internal(&self.db_path, &self.attestation, true)?;
-        if database.authority_identity.is_some() {
-            return Err(StorageError::MigrationRequired);
-        }
-        let controller_generation_id = mint_controller_generation_id()?;
-        let identity_lock = acquire_identity_lock(&input.identity)?;
-        verify_or_write_lock_owner(&identity_lock, &input.identity, &controller_generation_id)?;
-        if database.connection.is_none() {
-            let connection = open_connection(&database.db_path)?;
-            let configuration = apply_and_verify_configuration(&connection)?;
+
+        let identity_lock_path = canonical_identity_lock_path(&input.identity);
+        reject_symlink_components(&identity_lock_path)?;
+        let mut cleanup =
+            MigrationCleanup::capture(&self.db_path, &path_lock_path, &identity_lock_path)?;
+        let result = (|| -> StorageResult<Database> {
+            let (mut database, path_lock_created) =
+                open_migration_database(&self.db_path, &self.attestation)?;
+            cleanup.note_path_lock_created(path_lock_created);
+
+            let controller_generation_id = mint_controller_generation_id()?;
+            let (identity_lock, identity_lock_created) =
+                acquire_identity_lock_with_creation(&input.identity)?;
+            cleanup.note_identity_lock_created(identity_lock_created);
+            verify_or_write_lock_owner(&identity_lock, &input.identity, &controller_generation_id)?;
+
+            cleanup.begin_database();
+            let connection = match open_connection(&database.db_path) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    cleanup.note_database_artifacts();
+                    return Err(error);
+                }
+            };
+            cleanup.note_database_artifacts();
+            let configuration = match apply_and_verify_configuration(&connection) {
+                Ok(configuration) => configuration,
+                Err(error) => {
+                    cleanup.note_database_artifacts();
+                    return Err(error);
+                }
+            };
+            cleanup.note_database_artifacts();
             database.configuration = Some(configuration);
             database.connection = Some(connection);
-        }
-        let connection = database
-            .connection
-            .as_mut()
-            .expect("offline migration connection");
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sqlite_error)?;
-        if database.schema_version == 0 {
+
+            let connection = database
+                .connection
+                .as_mut()
+                .expect("offline migration connection");
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(map_sqlite_error)?;
             create_fresh_schema(&tx, &database.verified)?;
+            tx.execute(
+                "UPDATE core_meta SET controller_generation_id = ?1 WHERE singleton = 1",
+                [&controller_generation_id],
+            )
+            .map_err(map_sqlite_error)?;
+            let disposition = install_host_authority_revision_in_transaction(&tx, &input)
+                .map_err(map_host_authority_error)?;
+            tx.commit().map_err(map_sqlite_error)?;
+            let _ = disposition;
+            database.schema_version = SCHEMA_VERSION;
+            verify_or_write_lock_owner(
+                &database.path_lock,
+                &input.identity,
+                &controller_generation_id,
+            )?;
+            database.identity_lock = Some(identity_lock);
+            database.authority_identity = Some(input.identity);
+            database.controller_generation_id = Some(controller_generation_id);
+            Ok(database)
+        })();
+
+        match result {
+            Ok(database) => {
+                cleanup.commit();
+                Ok(database)
+            }
+            Err(error) => Err(error),
         }
-        tx.execute(
-            "UPDATE core_meta SET controller_generation_id = ?1 WHERE singleton = 1",
-            [&controller_generation_id],
-        )
-        .map_err(map_sqlite_error)?;
-        let disposition = install_host_authority_revision_in_transaction(&tx, &input)
-            .map_err(map_host_authority_error)?;
-        tx.commit().map_err(map_sqlite_error)?;
-        let _ = disposition;
-        database.schema_version = SCHEMA_VERSION;
-        verify_or_write_lock_owner(
-            &database.path_lock,
-            &input.identity,
-            &controller_generation_id,
-        )?;
-        database.identity_lock = Some(identity_lock);
-        database.authority_identity = Some(input.identity);
-        database.controller_generation_id = Some(controller_generation_id);
-        Ok(database)
     }
 
     /// Install an already validated Host producer revision while the
@@ -591,6 +844,90 @@ fn boot_artifact_digest() -> dolly_canonical_json::Sha256Digest {
         .expect("build.rs must emit a valid sha256: hex digest")
 }
 
+fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut value = database_path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn artifact_identity(metadata: &fs::Metadata) -> ArtifactIdentity {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ArtifactIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ArtifactIdentity {
+            length: metadata.len(),
+        }
+    }
+}
+
+fn current_artifact_identity(path: &Path) -> Option<ArtifactIdentity> {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| artifact_identity(&metadata))
+}
+
+fn capture_artifact_state(path: &Path) -> StorageResult<Option<ArtifactState>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(map_io_error(error)),
+    };
+    if !metadata.is_file() {
+        return Err(StorageError::UnsafeConfiguration);
+    }
+    let bytes = fs::read(path).map_err(map_io_error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(Some(ArtifactState {
+            bytes,
+            identity: artifact_identity(&metadata),
+            mode: metadata.mode() & 0o7777,
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Some(ArtifactState {
+            bytes,
+            identity: artifact_identity(&metadata),
+        }))
+    }
+}
+
+fn restore_artifact_state(path: &Path, state: &ArtifactState) -> StorageResult<()> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        options
+            .mode(state.mode)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).map_err(map_io_error)?;
+    file.write_all(&state.bytes).map_err(map_io_error)?;
+    file.sync_all().map_err(map_io_error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        unsafe {
+            let _ = libc::fchmod(fd, state.mode);
+            let _ = libc::fchown(fd, state.uid, state.gid);
+        }
+    }
+    Ok(())
+}
+
 fn reject_symlink_components(path: &Path) -> StorageResult<()> {
     let mut probe = PathBuf::new();
     for component in path.components() {
@@ -613,27 +950,58 @@ fn reject_symlink_components(path: &Path) -> StorageResult<()> {
 }
 
 fn acquire_lock_file(lock_path: &Path) -> StorageResult<File> {
+    acquire_lock_file_with_creation(lock_path).map(|(file, _)| file)
+}
+
+fn acquire_lock_file_with_creation(lock_path: &Path) -> StorageResult<(File, bool)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
 
-        let file = OpenOptions::new()
+        let mut create = OpenOptions::new();
+        create
             .read(true)
             .write(true)
-            .create(true)
+            .create_new(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(lock_path)
-            .map_err(map_io_error)?;
-        let meta = file.metadata().map_err(map_io_error)?;
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let (file, created) = match create.open(lock_path) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let mut open = OpenOptions::new();
+                open.read(true)
+                    .write(true)
+                    .create(false)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+                (open.open(lock_path).map_err(map_io_error)?, false)
+            }
+            Err(error) => return Err(map_io_error(error)),
+        };
+        let meta = match file.metadata().map_err(map_io_error) {
+            Ok(meta) => meta,
+            Err(error) => {
+                if created {
+                    let _ = fs::remove_file(lock_path);
+                }
+                return Err(error);
+            }
+        };
         if !meta.is_file()
             || meta.uid() != unsafe { libc::geteuid() }
             || meta.mode() & 0o777 != 0o600
         {
+            if created {
+                let _ = fs::remove_file(lock_path);
+            }
             return Err(StorageError::UnsafeConfiguration);
         }
-        try_lock_exclusive(&file)?;
-        Ok(file)
+        if let Err(error) = try_lock_exclusive(&file) {
+            if created {
+                let _ = fs::remove_file(lock_path);
+            }
+            return Err(error);
+        }
+        Ok((file, created))
     }
     #[cfg(not(unix))]
     {
@@ -643,9 +1011,35 @@ fn acquire_lock_file(lock_path: &Path) -> StorageResult<File> {
 }
 
 fn acquire_identity_lock(identity: &RuntimeAuthorityIdentity) -> StorageResult<File> {
+    acquire_identity_lock_with_creation(identity).map(|(file, _)| file)
+}
+
+fn acquire_identity_lock_with_creation(
+    identity: &RuntimeAuthorityIdentity,
+) -> StorageResult<(File, bool)> {
     let lock_path = identity_lock_path(identity)?;
     reject_symlink_components(&lock_path)?;
-    acquire_lock_file(&lock_path)
+    acquire_lock_file_with_creation(&lock_path)
+}
+
+fn canonical_identity_lock_path(identity: &RuntimeAuthorityIdentity) -> PathBuf {
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::geteuid() };
+        let digest = canonicalize(identity)
+            .expect("runtime identity is canonical JSON")
+            .1
+            .to_string()
+            .replace(':', "-");
+        PathBuf::from(format!(
+            "/run/user/{uid}/dolly/runtime-authority/controller-{digest}.lock"
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = identity;
+        PathBuf::new()
+    }
 }
 
 fn identity_lock_path(identity: &RuntimeAuthorityIdentity) -> StorageResult<PathBuf> {
@@ -658,13 +1052,7 @@ fn identity_lock_path(identity: &RuntimeAuthorityIdentity) -> StorageResult<Path
         validate_private_runtime_dir(&dolly_root, true)?;
         let lock_root = dolly_root.join("runtime-authority");
         validate_private_runtime_dir(&lock_root, true)?;
-
-        let digest = canonicalize(identity)
-            .expect("runtime identity is canonical JSON")
-            .1
-            .to_string()
-            .replace(':', "-");
-        Ok(lock_root.join(format!("controller-{digest}.lock")))
+        Ok(canonical_identity_lock_path(identity))
     }
     #[cfg(not(unix))]
     {

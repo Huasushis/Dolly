@@ -1490,7 +1490,7 @@ mod tests {
         Value::Object(object)
     }
 
-    fn authority() -> CurrentAuthoritySnapshot {
+    fn authority_with_instance(instance_id: &str) -> CurrentAuthoritySnapshot {
         let origin = InstalledComponentOrigin {
             schema: "dolly.installed-component-origin/v1".into(),
             kind: "installed_product_component".into(),
@@ -1518,7 +1518,7 @@ mod tests {
         let mut premise_record = json!({
             "schema": "dolly.module-activation-premises/v1",
             "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000001",
-            "instance_id": "instance-one",
+            "instance_id": instance_id,
             "config_revision": 1,
             "config_digest": config_digest,
             "permission_policy_definitions": [],
@@ -1541,6 +1541,10 @@ mod tests {
             premise: Some(premise),
             controller_generation_id: "test-controller-generation".into(),
         }
+    }
+
+    fn authority() -> CurrentAuthoritySnapshot {
+        authority_with_instance("instance-one")
     }
 
     fn good_observation() -> LinuxHostObservation {
@@ -1602,8 +1606,16 @@ mod tests {
 
     fn durable_database() -> (TempDir, crate::Database) {
         let directory = tempdir().unwrap();
+        let suffix = directory
+            .path()
+            .file_name()
+            .expect("temp directory name")
+            .to_string_lossy()
+            .replace('.', "d")
+            .to_ascii_lowercase();
+        let instance_id = format!("instance-{suffix}");
         let path = directory.path().join("runtime.sqlite3");
-        let snapshot = authority();
+        let snapshot = authority_with_instance(&instance_id);
         let db = crate::Database::open_for_migration(&path)
             .unwrap()
             .install_host_authority_revision(HostAuthorityRevision {
