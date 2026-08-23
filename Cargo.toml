@@ -6,6 +6,10 @@ members = [
     "crates/dolly-schema",
     "crates/dolly-core-reducer",
     "crates/dolly-filter-arithmetic",
+    "crates/dolly-protocol",
+    "crates/dolly-storage",
+    "crates/dolly-tool-broker",
+    "crates/dolly-tool-coordinator",
 ]
 
 [workspace.package]
