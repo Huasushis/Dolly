@@ -32,12 +32,12 @@ use dolly_canonical_json::{CanonicalJsonValue, Sha256Digest, canonicalize};
 use crate::attestation::{LoadedSqlite, ReleaseAttestation, SqliteBuildGate, VerifiedSqliteBuild};
 use crate::error::{StorageError, StorageResult};
 use crate::host_authority::{
-    ConfigRevisionMapping, HOST_AUTHORITY_SCHEMA_SQL, HostAuthorityError, HostAuthorityRevision,
-    LinuxServiceCandidate, ModuleActivationPremises, PermissionPolicyBackendBinding,
-    PermissionPolicyDefinition, PermissionPolicySelection, ResolvedConfiguration,
-    RuntimeAuthorityIdentity, install_host_authority_revision_in_transaction,
-    load_current_authority_with_generation, refresh_controller_generation_in_transaction,
-    validate_revision,
+    ConfigRevisionMapping, HOST_AUTHORITY_SCHEMA_SQL, HOST_AUTHORITY_SCHEMA_VERSION,
+    HostAuthorityError, HostAuthorityRevision, LinuxServiceCandidate, ModuleActivationPremises,
+    PermissionPolicyBackendBinding, PermissionPolicyDefinition, PermissionPolicySelection,
+    ResolvedConfiguration, RuntimeAuthorityIdentity,
+    install_host_authority_revision_in_transaction, load_current_authority_with_generation,
+    refresh_controller_generation_in_transaction, validate_revision,
 };
 
 /// Highest schema version this binary understands.
@@ -150,7 +150,11 @@ pub struct Database {
     #[allow(dead_code)]
     identity_lock: Option<File>,
     #[allow(dead_code)]
+    identity_directory_lock: Option<File>,
+    #[allow(dead_code)]
     path_lock: File,
+    #[allow(dead_code)]
+    path_directory_lock: Option<File>,
     verified: VerifiedSqliteBuild,
     configuration: Option<ConnectionConfiguration>,
     schema_version: i64,
@@ -203,15 +207,17 @@ struct ArtifactSnapshot {
     before: Option<ArtifactState>,
     created_identity: Option<ArtifactIdentity>,
     remove_created: bool,
+    allow_missing: bool,
 }
 
 impl ArtifactSnapshot {
-    fn capture(path: PathBuf, remove_created: bool) -> StorageResult<Self> {
+    fn capture(path: PathBuf, remove_created: bool, allow_missing: bool) -> StorageResult<Self> {
         Ok(Self {
             before: capture_artifact_state(&path)?,
             path,
             created_identity: None,
             remove_created,
+            allow_missing,
         })
     }
 
@@ -238,6 +244,7 @@ impl ArtifactSnapshot {
                 Some(current) if current == state.identity => {
                     restore_artifact_state(&self.path, state)
                 }
+                None if self.allow_missing => Ok(()),
                 Some(_) | None => Err(StorageError::UnsafeConfiguration),
             },
         }
@@ -252,8 +259,12 @@ struct MigrationCleanup {
     path_lock: ArtifactSnapshot,
     identity_lock: ArtifactSnapshot,
     database_active: bool,
-    path_lock_active: bool,
-    identity_lock_active: bool,
+    path_lock_created: bool,
+    path_lock_acquired: bool,
+    path_lock_guard: Option<LockGuard>,
+    identity_lock_created: bool,
+    identity_lock_acquired: bool,
+    identity_lock_guard: Option<LockGuard>,
     committed: bool,
     restored: bool,
 }
@@ -265,41 +276,64 @@ impl MigrationCleanup {
         identity_lock_path: &Path,
     ) -> StorageResult<Self> {
         Ok(Self {
-            database: ArtifactSnapshot::capture(database_path.to_path_buf(), true)?,
+            database: ArtifactSnapshot::capture(database_path.to_path_buf(), true, false)?,
             database_wal: ArtifactSnapshot::capture(
                 sqlite_sidecar_path(database_path, "-wal"),
+                true,
                 true,
             )?,
             database_shm: ArtifactSnapshot::capture(
                 sqlite_sidecar_path(database_path, "-shm"),
                 true,
+                true,
             )?,
             database_journal: ArtifactSnapshot::capture(
                 sqlite_sidecar_path(database_path, "-journal"),
                 true,
+                true,
             )?,
-            path_lock: ArtifactSnapshot::capture(path_lock_path.to_path_buf(), false)?,
-            identity_lock: ArtifactSnapshot::capture(identity_lock_path.to_path_buf(), false)?,
+            path_lock: ArtifactSnapshot::capture(path_lock_path.to_path_buf(), false, false)?,
+            identity_lock: ArtifactSnapshot::capture(
+                identity_lock_path.to_path_buf(),
+                false,
+                false,
+            )?,
             database_active: false,
-            path_lock_active: false,
-            identity_lock_active: false,
+            path_lock_created: false,
+            path_lock_acquired: false,
+            path_lock_guard: None,
+            identity_lock_created: false,
+            identity_lock_acquired: false,
+            identity_lock_guard: None,
             committed: false,
             restored: false,
         })
     }
 
-    fn note_path_lock_created(&mut self, created: bool) {
-        if created {
-            self.path_lock_active = true;
+    fn note_path_lock_acquired(&mut self, acquired: &AcquiredLock) -> StorageResult<()> {
+        self.path_lock_guard = Some(LockGuard {
+            file: acquired.file.try_clone().map_err(map_io_error)?,
+            directory_lock: acquired.directory_lock.try_clone().map_err(map_io_error)?,
+        });
+        self.path_lock_acquired = true;
+        self.path_lock_created = acquired.created;
+        if acquired.created {
             self.path_lock.note_created();
         }
+        Ok(())
     }
 
-    fn note_identity_lock_created(&mut self, created: bool) {
-        if created {
-            self.identity_lock_active = true;
+    fn note_identity_lock_acquired(&mut self, acquired: &AcquiredLock) -> StorageResult<()> {
+        self.identity_lock_guard = Some(LockGuard {
+            file: acquired.file.try_clone().map_err(map_io_error)?,
+            directory_lock: acquired.directory_lock.try_clone().map_err(map_io_error)?,
+        });
+        self.identity_lock_acquired = true;
+        self.identity_lock_created = acquired.created;
+        if acquired.created {
             self.identity_lock.note_created();
         }
+        Ok(())
     }
 
     fn begin_database(&mut self) {
@@ -318,10 +352,10 @@ impl MigrationCleanup {
 
     fn note_all_created(&mut self) {
         self.note_database_artifacts();
-        if self.path_lock_active {
+        if self.path_lock_created {
             self.path_lock.note_created();
         }
-        if self.identity_lock_active {
+        if self.identity_lock_created {
             self.identity_lock.note_created();
         }
     }
@@ -336,13 +370,23 @@ impl MigrationCleanup {
         }
         self.restored = true;
         self.note_all_created();
+        let identity_restore = if self.identity_lock_acquired {
+            self.identity_lock.restore()
+        } else {
+            Ok(())
+        };
+        let path_restore = if self.path_lock_acquired {
+            self.path_lock.restore()
+        } else {
+            Ok(())
+        };
         let restorations = [
             self.database_journal.restore(),
             self.database_shm.restore(),
             self.database_wal.restore(),
             self.database.restore(),
-            self.identity_lock.restore(),
-            self.path_lock.restore(),
+            identity_restore,
+            path_restore,
         ];
         let mut first_error = None;
         for result in restorations {
@@ -356,10 +400,13 @@ impl MigrationCleanup {
     }
 
     fn fail(&mut self, primary: StorageError) -> StorageError {
-        if let Err(cleanup_error) = self.restore() {
-            eprintln!("authority cleanup refused: {cleanup_error}");
+        match self.restore() {
+            Ok(()) => primary,
+            Err(cleanup) => StorageError::CleanupFailed {
+                primary: Box::new(primary),
+                cleanup: Box::new(cleanup),
+            },
         }
-        primary
     }
 }
 
@@ -452,8 +499,13 @@ fn open_migration_database(
     reject_symlink_components(&path_lock_path)?;
     let loaded = probe_loaded_sqlite();
     let verified = SqliteBuildGate.verify(attestation, &loaded)?;
-    let (path_lock, path_lock_created) = acquire_lock_file_with_creation(&path_lock_path)?;
-    cleanup.note_path_lock_created(path_lock_created);
+    let acquired = acquire_lock_file_with_creation(&path_lock_path)?;
+    cleanup.note_path_lock_acquired(&acquired)?;
+    let AcquiredLock {
+        file: path_lock,
+        directory_lock: path_directory_lock,
+        ..
+    } = acquired;
     if read_persisted_identity(db_path)?.is_some() {
         return Err(StorageError::MigrationRequired);
     }
@@ -464,7 +516,9 @@ fn open_migration_database(
         db_path: db_path.to_path_buf(),
         connection: None,
         identity_lock: None,
+        identity_directory_lock: None,
         path_lock,
+        path_directory_lock: Some(path_directory_lock),
         verified,
         configuration: None,
         schema_version: 0,
@@ -494,12 +548,14 @@ impl OfflineDatabase {
         let result = (|| -> StorageResult<Database> {
             let mut database =
                 open_migration_database(&self.db_path, &self.attestation, &mut cleanup)?;
-
             let controller_generation_id = mint_controller_generation_id()?;
-            let (identity_lock, identity_lock_created) =
-                acquire_identity_lock_with_creation(&input.identity)?;
-            cleanup.note_identity_lock_created(identity_lock_created);
-            verify_or_write_lock_owner(&identity_lock, &input.identity, &controller_generation_id)?;
+            let acquired_identity = acquire_identity_lock_with_creation(&input.identity)?;
+            cleanup.note_identity_lock_acquired(&acquired_identity)?;
+            let AcquiredLock {
+                file: identity_lock,
+                directory_lock: identity_directory_lock,
+                ..
+            } = acquired_identity;
             cleanup.begin_database();
             let connection = match open_connection(&database.db_path) {
                 Ok(connection) => connection,
@@ -544,6 +600,7 @@ impl OfflineDatabase {
                 &controller_generation_id,
             )?;
             database.identity_lock = Some(identity_lock);
+            database.identity_directory_lock = Some(identity_directory_lock);
             database.authority_identity = Some(input.identity);
             database.controller_generation_id = Some(controller_generation_id);
             Ok(database)
@@ -595,8 +652,13 @@ fn open_internal(db_path: &Path, attestation: &ReleaseAttestation) -> StorageRes
     reject_symlink_components(&identity_lock_path)?;
     let mut cleanup = MigrationCleanup::capture(db_path, &path_lock_path, &identity_lock_path)?;
     let result = (|| -> StorageResult<Database> {
-        let (path_lock, path_lock_created) = acquire_lock_file_with_creation(&path_lock_path)?;
-        cleanup.note_path_lock_created(path_lock_created);
+        let acquired_path = acquire_lock_file_with_creation(&path_lock_path)?;
+        cleanup.note_path_lock_acquired(&acquired_path)?;
+        let AcquiredLock {
+            file: path_lock,
+            directory_lock: path_directory_lock,
+            ..
+        } = acquired_path;
 
         let current_identity =
             read_persisted_identity(db_path)?.ok_or(StorageError::MigrationRequired)?;
@@ -604,9 +666,13 @@ fn open_internal(db_path: &Path, attestation: &ReleaseAttestation) -> StorageRes
             return Err(StorageError::Corrupt);
         }
 
-        let (identity_lock, identity_lock_created) =
-            acquire_identity_lock_with_creation(&expected_identity.0)?;
-        cleanup.note_identity_lock_created(identity_lock_created);
+        let acquired_identity = acquire_identity_lock_with_creation(&expected_identity.0)?;
+        cleanup.note_identity_lock_acquired(&acquired_identity)?;
+        let AcquiredLock {
+            file: identity_lock,
+            directory_lock: identity_directory_lock,
+            ..
+        } = acquired_identity;
         let controller_generation_id = mint_controller_generation_id()?;
         verify_or_write_lock_owner(
             &identity_lock,
@@ -636,7 +702,9 @@ fn open_internal(db_path: &Path, attestation: &ReleaseAttestation) -> StorageRes
             db_path: db_path.to_path_buf(),
             connection: Some(connection),
             identity_lock: Some(identity_lock),
+            identity_directory_lock: Some(identity_directory_lock),
             path_lock,
+            path_directory_lock: Some(path_directory_lock),
             verified,
             configuration: Some(configuration),
             schema_version,
@@ -652,6 +720,38 @@ fn open_internal(db_path: &Path, attestation: &ReleaseAttestation) -> StorageRes
         }
         Err(error) => Err(cleanup.fail(error)),
     }
+}
+fn validate_host_authority_schema_readonly(connection: &Connection) -> StorageResult<()> {
+    let host_version: Option<i64> = connection
+        .query_row(
+            "SELECT authority_schema_version
+             FROM host_authority_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| StorageError::MigrationRequired)?;
+    if host_version != Some(HOST_AUTHORITY_SCHEMA_VERSION) {
+        return Err(StorageError::MigrationRequired);
+    }
+    let mut statement = connection
+        .prepare("PRAGMA table_info(runtime_authority_state)")
+        .map_err(|_| StorageError::MigrationRequired)?;
+    let mut rows = statement
+        .query([])
+        .map_err(|_| StorageError::MigrationRequired)?;
+    let mut has_generation = false;
+    while let Some(row) = rows.next().map_err(|_| StorageError::MigrationRequired)? {
+        let name: String = row.get(1).map_err(|_| StorageError::MigrationRequired)?;
+        if name == "controller_generation_id" {
+            has_generation = true;
+            break;
+        }
+    }
+    if !has_generation {
+        return Err(StorageError::MigrationRequired);
+    }
+    Ok(())
 }
 
 fn read_persisted_identity(
@@ -674,7 +774,7 @@ fn read_persisted_identity(
     if user_version != SCHEMA_VERSION {
         return Err(StorageError::MigrationRequired);
     }
-
+    validate_host_authority_schema_readonly(&connection)?;
     let core_identity: Option<(Option<String>, Option<String>, Option<String>)> = connection
         .query_row(
             "SELECT daemon_installation_id, instance_id, controller_generation_id
@@ -893,7 +993,7 @@ fn capture_artifact_state(path: &Path) -> StorageResult<Option<ArtifactState>> {
 
 fn restore_artifact_state(path: &Path, state: &ArtifactState) -> StorageResult<()> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(false).truncate(true);
+    options.read(true).write(true).create(false).truncate(false);
     #[cfg(unix)]
     {
         options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
@@ -903,6 +1003,7 @@ fn restore_artifact_state(path: &Path, state: &ArtifactState) -> StorageResult<(
     if current_identity != state.identity {
         return Err(StorageError::UnsafeConfiguration);
     }
+    file.set_len(0).map_err(map_io_error)?;
     file.write_all(&state.bytes).map_err(map_io_error)?;
     file.sync_all().map_err(map_io_error)?;
     #[cfg(unix)]
@@ -965,11 +1066,58 @@ fn verify_lock_path_binding(lock_path: &Path, file: &File) -> StorageResult<()> 
     Ok(())
 }
 
-fn acquire_lock_file_with_creation(lock_path: &Path) -> StorageResult<(File, bool)> {
+#[derive(Debug)]
+struct AcquiredLock {
+    file: File,
+    directory_lock: File,
+    created: bool,
+}
+fn lock_coordination_path(lock_path: &Path) -> PathBuf {
+    let mut path = lock_path.as_os_str().to_os_string();
+    path.push(".coordination");
+    PathBuf::from(path)
+}
+
+fn open_lock_parent_directory(lock_path: &Path) -> StorageResult<File> {
+    let coordination_path = lock_coordination_path(lock_path);
+    reject_symlink_components(&coordination_path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
 
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&coordination_path)
+            .map_err(map_io_error)?;
+        let metadata = file.metadata().map_err(map_io_error)?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o7777 != 0o600
+        {
+            return Err(StorageError::UnsafeConfiguration);
+        }
+        verify_lock_path_binding(&coordination_path, &file)?;
+        try_lock_exclusive(&file)?;
+        verify_lock_path_binding(&coordination_path, &file)?;
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = coordination_path;
+        Err(StorageError::UnsafeConfiguration)
+    }
+}
+
+fn acquire_lock_file_with_creation(lock_path: &Path) -> StorageResult<AcquiredLock> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory_lock = open_lock_parent_directory(lock_path)?;
         let mut create = OpenOptions::new();
         create
             .read(true)
@@ -999,7 +1147,11 @@ fn acquire_lock_file_with_creation(lock_path: &Path) -> StorageResult<(File, boo
         verify_lock_path_binding(lock_path, &file)?;
         try_lock_exclusive(&file)?;
         verify_lock_path_binding(lock_path, &file)?;
-        Ok((file, created))
+        Ok(AcquiredLock {
+            file,
+            directory_lock,
+            created,
+        })
     }
     #[cfg(not(unix))]
     {
@@ -1007,13 +1159,19 @@ fn acquire_lock_file_with_creation(lock_path: &Path) -> StorageResult<(File, boo
         Err(StorageError::UnsafeConfiguration)
     }
 }
-
 fn acquire_identity_lock_with_creation(
     identity: &RuntimeAuthorityIdentity,
-) -> StorageResult<(File, bool)> {
+) -> StorageResult<AcquiredLock> {
     let lock_path = identity_lock_path(identity)?;
     reject_symlink_components(&lock_path)?;
     acquire_lock_file_with_creation(&lock_path)
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct LockGuard {
+    file: File,
+    directory_lock: File,
 }
 
 fn canonical_identity_lock_path(identity: &RuntimeAuthorityIdentity) -> PathBuf {

@@ -13,7 +13,7 @@ use thiserror::Error;
 /// Result alias for storage operations.
 pub type StorageResult<T> = Result<T, StorageError>;
 
-/// The nine normative storage error codes from §10.
+/// The normative storage error codes plus the closed cleanup-refusal error.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum StorageError {
     #[error("STORAGE_INSTANCE_LOCKED")]
@@ -35,10 +35,14 @@ pub enum StorageError {
     IdempotencyConflict,
     #[error("STORAGE_SEQUENCE_CONFLICT")]
     SequenceConflict,
+    #[error("STORAGE_CLEANUP_FAILED: primary={primary}; cleanup={cleanup}")]
+    CleanupFailed {
+        primary: Box<StorageError>,
+        cleanup: Box<StorageError>,
+    },
     #[error("STORAGE_MIGRATION_REQUIRED")]
     MigrationRequired,
 }
-
 impl StorageError {
     /// The normative code string from §10, used for protocol-envelope mapping.
     pub fn code(&self) -> &'static str {
@@ -51,6 +55,7 @@ impl StorageError {
             StorageError::Corrupt => "STORAGE_CORRUPT",
             StorageError::IdempotencyConflict => "STORAGE_IDEMPOTENCY_CONFLICT",
             StorageError::SequenceConflict => "STORAGE_SEQUENCE_CONFLICT",
+            StorageError::CleanupFailed { .. } => "STORAGE_CLEANUP_FAILED",
             StorageError::MigrationRequired => "STORAGE_MIGRATION_REQUIRED",
         }
     }

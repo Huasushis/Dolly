@@ -23,7 +23,7 @@ use thiserror::Error;
 /// Largest revision representable by the frozen safe-integer contract.
 pub const MAX_AUTHORITY_REVISION: i64 = 9_007_199_254_740_991;
 /// Runtime Host authority logical schema version.
-pub const HOST_AUTHORITY_SCHEMA_VERSION: i64 = 1;
+pub const HOST_AUTHORITY_SCHEMA_VERSION: i64 = 2;
 
 /// Physical tables for the Host prerequisite authority. The table names and
 /// projections follow runtime-authority-record/v1; `host_authority_meta` keeps
@@ -31,9 +31,9 @@ pub const HOST_AUTHORITY_SCHEMA_VERSION: i64 = 1;
 pub const HOST_AUTHORITY_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS host_authority_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1)
+    authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 2)
 );
-INSERT OR IGNORE INTO host_authority_meta (singleton, authority_schema_version) VALUES (1, 1);
+INSERT OR IGNORE INTO host_authority_meta (singleton, authority_schema_version) VALUES (1, 2);
 CREATE TABLE IF NOT EXISTS config_revision_mappings (
     config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991),
     daemon_installation_id TEXT NOT NULL,
@@ -133,7 +133,7 @@ CREATE TABLE IF NOT EXISTS module_activation_premise_policy_selections (
 );
 CREATE TABLE IF NOT EXISTS runtime_authority_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
+    authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 2),
     daemon_installation_id TEXT NOT NULL,
     instance_id TEXT NOT NULL,
     controller_generation_id TEXT NOT NULL,
