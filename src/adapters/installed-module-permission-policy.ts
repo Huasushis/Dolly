@@ -601,6 +601,52 @@ function assertBindingAuthority(
   }
 }
 
+function assertInstalledPlanMatchesAuthority(
+  installed: ReservedV10InstalledModulePlan,
+  context: StartupAuthorityPermissionContext,
+): VerifiedInstalledComponentOrigin {
+  const snapshot = context.database.readCurrentConfig();
+  if (snapshot === null) {
+    throw unavailable("installed permission binding has no current Runtime authority configuration");
+  }
+  const canonicalConfig = snapshot.canonicalConfig;
+  if (
+    canonicalConfig === null ||
+    typeof canonicalConfig !== "object" ||
+    Array.isArray(canonicalConfig)
+  ) {
+    throw unavailable("installed permission binding authority configuration is not an object");
+  }
+  const runtimeConfig = Reflect.get(canonicalConfig, "runtime_config");
+  if (
+    runtimeConfig === null ||
+    typeof runtimeConfig !== "object" ||
+    Array.isArray(runtimeConfig) ||
+    typeof Reflect.get(runtimeConfig, "instanceId") !== "string"
+  ) {
+    throw unavailable("installed permission binding authority configuration has no valid instance");
+  }
+  if (installed.instanceId !== Reflect.get(runtimeConfig, "instanceId")) {
+    throw unavailable(
+      "installed permission binding plan instance does not match the current Runtime authority",
+    );
+  }
+  const manifest = installed.installation.manifest;
+  const origin = context.origins.resolve({
+    extensionId: manifest.extensionId,
+    packageVersion: manifest.packageVersion,
+  });
+  if (
+    origin.component_id !== manifest.extensionId ||
+    origin.component_digest !== installed.installation.packageDigest
+  ) {
+    throw unavailable(
+      "installed permission binding package or manifest provenance does not match its canonical origin",
+    );
+  }
+  return origin;
+}
+
 /**
  * Rechecks a live binding against the exact durable premise and live Host
  * context that produced it. A structural copy, reopened database, released
@@ -1171,6 +1217,7 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
   ): readonly InstalledModulePermissionBinding[] {
     assertReservedV10InstalledModulePlan(installed);
     assertBindingAuthority(permission, context);
+    const installedOrigin = assertInstalledPlanMatchesAuthority(installed, context);
     const identity = context.database.identity;
     const seenReferences = new Set<string>();
     const liveBindings = installed.module.permissionPolicyReferences.map((reference) => {
@@ -1201,6 +1248,11 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
         );
       }
       const binding = matches[0]!;
+      if (!sameCanonicalJson(binding.origin, installedOrigin)) {
+        throw unavailable(
+          `persistent permission binding for ${reference.policyId}@${reference.revision} does not name the installed plan origin`,
+        );
+      }
       const definition = deepFreeze({
         ...binding.definition,
         definition: cloneJson(binding.definition.definition),

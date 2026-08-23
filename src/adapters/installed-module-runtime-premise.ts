@@ -3,6 +3,11 @@ import {
   type InstalledModuleActivationCandidate,
 } from "../core/installed-module-activation-candidate.js";
 import {
+  assertStartupAuthorityPermissionContext,
+  type StartupAuthorityPermission,
+  type StartupAuthorityPermissionContext,
+} from "../core/startup-authority-premise.js";
+import {
   assertInstalledComponentOrigin,
   type VerifiedInstalledComponentOrigin,
 } from "../core/installed-component-origin.js";
@@ -14,12 +19,16 @@ import {
 } from "./installed-linux-extension-module-executor.js";
 import {
   ReservedV10InstalledPermissionPolicyRegistry,
+  type InstalledModulePermissionBinding,
   type ReservedV10InstalledPermissionPolicySelection,
 } from "./installed-module-permission-policy.js";
 
-export interface InstalledModuleRuntimePremiseOptions {
+export interface InstalledModuleRuntimePremiseOptions
+  extends StartupAuthorityPermissionContext {
   /** The exact branded candidate minted by H3 handoff composition. */
   readonly candidate: InstalledModuleActivationCandidate;
+  /** The exact H2 permission that authorized the H3 handoff. */
+  readonly startupAuthorityPermission: StartupAuthorityPermission;
   /** Host-owned implementations for the exact policy revisions in each plan. */
   readonly permissionPolicies: ReservedV10InstalledPermissionPolicyRegistry;
 }
@@ -28,6 +37,7 @@ export interface InstalledModuleRuntimePremiseModule {
   readonly moduleId: string;
   readonly packageOrigin: VerifiedInstalledComponentOrigin;
   readonly permissionPolicies: ReservedV10InstalledPermissionPolicySelection;
+  readonly permissionBindings: readonly InstalledModulePermissionBinding[];
   readonly processProvenance: ReservedV10InstalledModuleProcessProvenance;
 }
 
@@ -56,8 +66,19 @@ function assertOptions(value: unknown): asserts value is InstalledModuleRuntimeP
   if (!isPlainObject(value)) {
     throw new TypeError("installed Module runtime premise options must be a plain object");
   }
+  const expected = [
+    "candidate",
+    "controller",
+    "database",
+    "origins",
+    "permissionPolicies",
+    "startupAuthorityPermission",
+  ].sort();
   const keys = Object.keys(value).sort();
-  if (keys.length !== 2 || keys[0] !== "candidate" || keys[1] !== "permissionPolicies") {
+  if (
+    keys.length !== expected.length ||
+    keys.some((key, index) => key !== expected[index])
+  ) {
     throw new TypeError(
       `installed Module runtime premise contains unknown fields: ${keys.join(", ")}`,
     );
@@ -68,6 +89,10 @@ function assertOptions(value: unknown): asserts value is InstalledModuleRuntimeP
       "installed Module runtime premise requires the reserved version-10 permission policy registry",
     );
   }
+  assertStartupAuthorityPermissionContext(
+    value.startupAuthorityPermission,
+    value as unknown as StartupAuthorityPermissionContext,
+  );
 }
 
 function assertCandidateModule(
@@ -114,6 +139,11 @@ export function composeInstalledModuleRuntimePremise(
   const modules = options.candidate.modules.map((module) => {
     assertCandidateModule(options.candidate, module, seenModuleIds);
     const permissionPolicies = options.permissionPolicies.resolveFor(module.installedModule);
+    const permissionBindings = options.permissionPolicies.resolveLiveBindingsFor(
+      module.installedModule,
+      options.startupAuthorityPermission,
+      options,
+    );
     const processProvenance = deriveReservedV10InstalledModuleProcessProvenance(
       module.installedModule,
       permissionPolicies,
@@ -123,6 +153,7 @@ export function composeInstalledModuleRuntimePremise(
       moduleId: module.moduleId,
       packageOrigin: module.packageOrigin,
       permissionPolicies,
+      permissionBindings,
       processProvenance,
     });
   });

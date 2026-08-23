@@ -503,11 +503,26 @@ describe("post-H3 installed Module activation candidate", () => {
       const permissionPolicies = new ReservedV10InstalledPermissionPolicyRegistry({
         policies: [],
       });
+      const resolveLiveBindings = vi.spyOn(permissionPolicies, "resolveLiveBindingsFor");
       const premise = composeInstalledModuleRuntimePremise({
         candidate,
         permissionPolicies,
+        startupAuthorityPermission: current.permission,
+        database: current.database,
+        controller: current.controller,
+        origins: current.origins,
       });
+      expect(resolveLiveBindings).toHaveBeenCalledWith(
+        candidate.modules[0]!.installedModule,
+        current.permission,
+        expect.objectContaining({
+          database: current.database,
+          controller: current.controller,
+          origins: current.origins,
+        }),
+      );
       const module = premise.modules[0]!;
+      expect(module.permissionBindings).toEqual([]);
       expect(premise.schemaVersion).toBe("dolly.installed-module-runtime-premise/1");
       expect(premise.candidate).toBe(candidate);
       expect(premise.modules).toHaveLength(1);
@@ -535,13 +550,65 @@ describe("post-H3 installed Module activation candidate", () => {
         "modules",
         "schemaVersion",
       ]);
+
       expect(Object.keys(module).sort()).toEqual([
         "moduleId",
         "packageOrigin",
+        "permissionBindings",
         "permissionPolicies",
         "processProvenance",
       ]);
       expect(() => assertInstalledModuleRuntimePremise({ ...premise })).toThrow(/not minted/u);
+    } finally {
+      await closeFixture(current);
+    }
+  });
+  it("rejects an installed plan from a different durable runtime instance", async () => {
+    const current = await fixture();
+    try {
+      const candidate = composeInstalledModuleActivationCandidate(options(current));
+      const currentSnapshot = current.database.readCurrentConfig()!;
+      const currentRuntimeConfig = (
+        currentSnapshot.canonicalConfig as Record<string, JsonValue>
+      ).runtime_config;
+      const replacementRuntimeConfig = {
+        ...(currentRuntimeConfig as Record<string, JsonValue>),
+        instanceId: "22222222-2222-4222-8222-222222222222",
+      } as JsonValue;
+      const replacement = buildAuthority(
+        current.serviceOrigin,
+        replacementRuntimeConfig,
+        2,
+      );
+      current.database.installConfig({
+        identity,
+        canonicalConfigBytes: replacement.bytes,
+        configDigest: replacement.digest,
+        premise: replacement.premise,
+        verifiedOrigins: [current.serviceOrigin],
+        expectedCurrent: {
+          revision: currentSnapshot.config_revision,
+          digest: currentSnapshot.config_digest,
+        },
+      });
+      const replacementPermission = resolveStartupAuthorityPremise({
+        database: current.database,
+        controller: current.controller,
+        origins: current.origins,
+        installedComponentOrigins: [current.serviceOrigin],
+      });
+      const permissionPolicies = new ReservedV10InstalledPermissionPolicyRegistry({
+        policies: [],
+      });
+      expect(() => permissionPolicies.resolveLiveBindingsFor(
+        candidate.modules[0]!.installedModule,
+        replacementPermission,
+        {
+          database: current.database,
+          controller: current.controller,
+          origins: current.origins,
+        },
+      )).toThrow(/plan instance does not match/u);
     } finally {
       await closeFixture(current);
     }
@@ -557,6 +624,10 @@ describe("post-H3 installed Module activation candidate", () => {
       expect(() => composeInstalledModuleRuntimePremise({
         candidate: { ...candidate },
         permissionPolicies,
+        startupAuthorityPermission: current.permission,
+        database: current.database,
+        controller: current.controller,
+        origins: current.origins,
       } as never)).toThrow(/not minted/u);
       for (const field of ["process", "ready", "acknowledgement", "absence", "retry"]) {
         expect(() => composeInstalledModuleRuntimePremise({
