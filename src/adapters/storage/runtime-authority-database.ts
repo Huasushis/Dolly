@@ -34,9 +34,18 @@ import type { NativeSqliteConnection } from "./native-sqlite-binding.js";
 import {
   assertCanonicalJsonValue,
   canonicalBytes,
+  canonicalJsonDigest,
   parseCanonicalJsonBytes,
   type JsonValue,
 } from "../../schema-bundle/index.js";
+import {
+  createFileCoreHistoryStore,
+  FileCoreHistoryError,
+  FileCoreHistoryReaderStore,
+  mintFileCoreHistoryProducerCapability,
+  FileCoreHistoryStore,
+  type FileCoreHistoryOptions,
+} from "../../core/file-core-history.js";
 
 /** Largest revision a conforming database may assign (REQ-AUTH-002 step 4). */
 export const MAX_CONFIG_REVISION = 9_007_199_254_740_991;
@@ -212,6 +221,13 @@ export interface InstallAuthorityConfigInput {
   /** When set, the transaction rechecks the pointer still names this revision/digest. */
   readonly expectedCurrent?: { readonly revision: number; readonly digest: string };
   readonly options?: AuthorityTransactionOptions;
+}
+
+export interface FileCoreHistoryMigrationInput extends FileCoreHistoryOptions {
+  readonly expectedAuthority: { readonly revision: number; readonly digest: string };
+  /** Exact canonical bytes read from the legacy FileCore source under the controller lock. */
+  readonly legacySourceBytes: Uint8Array;
+  readonly legacySourceDigest: string;
 }
 
 export interface InstallAuthorityConfigResult {
@@ -661,9 +677,159 @@ export class RuntimeAuthorityDatabase {
   get isOpen(): boolean {
     return !this.#closed && this.#connection.open;
   }
+  /** Supplies an exact context assertion to the FileCore capability mint path. */
+  fileCoreHistoryContextBinding(): {
+    readonly assertExactContext: (connection: unknown, identity: RuntimeAuthorityIdentity, lock: unknown) => void;
+  } {
+    const connection = this.#connection;
+    const lock = this.#lock;
+    const identityDigest = canonicalJsonDigest({
+      daemonInstallationId: this.#identity.daemonInstallationId,
+      instanceId: this.#identity.instanceId,
+    });
+    return Object.freeze({
+      assertExactContext: (
+        candidateConnection: unknown,
+        candidateIdentity: RuntimeAuthorityIdentity,
+        candidateLock: unknown,
+      ): void => {
+        if (!this.isOpen) throw new TypeError("Runtime authority database is closed");
+        if (!this.#lock.held) throw new RuntimeAuthorityDatabaseError(
+          "CONTROLLER_LOCK_NOT_HELD",
+          "FileCore history requires the Runtime authority controller lock",
+        );
+        this.#lock.assertHeld();
+        if (candidateConnection !== connection || candidateLock !== lock) {
+          throw new TypeError("FileCore history context is not bound to this Runtime authority");
+        }
+        const candidate = candidateIdentity as unknown as Record<string, unknown>;
+        if (
+          candidate === null ||
+          typeof candidate !== "object" ||
+          Object.keys(candidate).sort().join("\u0000") !== "daemonInstallationId\u0000instanceId" ||
+          typeof candidate.daemonInstallationId !== "string" ||
+          typeof candidate.instanceId !== "string"
+        ) {
+          throw new TypeError("FileCore history identity is not the canonical Runtime authority identity");
+        }
+        const candidateDigest = canonicalJsonDigest({
+          daemonInstallationId: candidate.daemonInstallationId,
+          instanceId: candidate.instanceId,
+        });
+        if (candidateDigest !== identityDigest) {
+          throw new TypeError("FileCore history identity is not bound to this Runtime authority");
+        }
+      },
+    });
+  }
+
 
   get identity(): RuntimeAuthorityIdentity {
     return { ...this.#identity };
+  }
+
+  /**
+   * Opens the one already-migrated FileCore global history as its producer
+   * capability. First use must go through migrateFileCoreHistory.
+   */
+  openFileCoreHistory(options: FileCoreHistoryOptions): FileCoreHistoryStore {
+    this.#requireOpen();
+    this.#requireLockHeld();
+    return createFileCoreHistoryStore(
+      this.#connection,
+      this.#identity,
+      this.#lock,
+      options,
+      this.#fileCoreHistoryProducerCapability(),
+    );
+  }
+
+  openFileCoreHistoryReader(options: FileCoreHistoryOptions): FileCoreHistoryReaderStore {
+    return FileCoreHistoryReaderStore.fromProducer(this.openFileCoreHistory(options));
+  }
+
+  migrateFileCoreHistory(input: FileCoreHistoryMigrationInput): FileCoreHistoryStore {
+    this.#requireOpen();
+    this.#requireLockHeld();
+    if (!isIntegralInRange(input.expectedAuthority.revision, 1, MAX_CONFIG_REVISION)) {
+      throw new RuntimeAuthorityDatabaseError("CONFIG_REVISION_CONFLICT", "expected history authority revision is invalid");
+    }
+    if (!isSha256(input.expectedAuthority.digest) || !isSha256(input.legacySourceDigest)) {
+      throw new RuntimeAuthorityDatabaseError("CORE_DIGEST_MISMATCH", "history migration digest is invalid");
+    }
+    const sourceDigest = sha256DigestOfBytes(input.legacySourceBytes);
+    if (sourceDigest !== input.legacySourceDigest) {
+      throw new RuntimeAuthorityDatabaseError("CORE_DIGEST_MISMATCH", "legacy FileCore bytes do not match their digest");
+    }
+    try {
+      const source = parseCanonicalJsonBytes(input.legacySourceBytes);
+      assertCanonicalJsonValue(source);
+      if (
+        (source as Record<string, unknown>).schemaVersion !== "dolly.core-state/18" &&
+          (source as Record<string, unknown>).schemaVersion !== "dolly.core-state/19"
+      ) {
+        throw new Error("legacy source is not a FileCore state snapshot");
+      }
+      const sourceRecord = source as Record<string, unknown>;
+      if (!isSha256(sourceRecord.stateDigest)) throw new Error("legacy FileCore stateDigest is invalid");
+      const { stateDigest: _stateDigest, ...statePayload } = sourceRecord;
+      if (canonicalJsonDigest(statePayload as JsonValue) !== sourceRecord.stateDigest) {
+        throw new Error("legacy FileCore stateDigest does not match canonical payload");
+      }
+    } catch (error) {
+      throw new RuntimeAuthorityDatabaseError("AUTHORITY_DATABASE_MALFORMED_RECORD", "legacy FileCore bytes are not a canonical FileCore snapshot", { cause: error });
+    }
+    const current = this.readCurrentConfig();
+    if (
+      current === null ||
+      current.config_revision !== input.expectedAuthority.revision ||
+      current.config_digest !== input.expectedAuthority.digest
+    ) {
+      throw new RuntimeAuthorityDatabaseError("CONFIG_REVISION_CONFLICT", "history migration authority moved");
+    }
+    let migrated: FileCoreHistoryStore | undefined;
+    this.#inFileCoreHistoryMigrationTransaction(() => {
+      const state = this.#connection.prepare(
+        "SELECT current_config_revision, current_config_digest FROM runtime_authority_state WHERE singleton = 1",
+      ).get();
+      if (
+        Number(state?.current_config_revision) !== input.expectedAuthority.revision ||
+        String(state?.current_config_digest) !== input.expectedAuthority.digest
+      ) {
+        throw new RuntimeAuthorityDatabaseError("CONFIG_REVISION_CONFLICT", "history migration authority moved under the lock");
+      }
+      const historyTable = this.#connection.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'filecore_history_head'",
+      ).get();
+      if (historyTable !== undefined) {
+        const existing = this.#connection.prepare(
+          "SELECT singleton FROM filecore_history_head WHERE singleton = 1",
+        ).get();
+        if (existing !== undefined) {
+          throw new FileCoreHistoryError("HISTORY_MIGRATION_REQUIRED", "FileCore history migration is already committed");
+        }
+      }
+      const producerId = `filecore-${this.#identity.instanceId}`;
+      const producerEpoch = `${input.expectedAuthority.revision}:${input.expectedAuthority.digest}`;
+      migrated = createFileCoreHistoryStore(
+        this.#connection,
+        this.#identity,
+        this.#lock,
+        {
+          maxEntries: input.maxEntries,
+          maxBytes: input.maxBytes,
+          maxReaders: input.maxReaders,
+          now: input.now,
+          producerId,
+          producerEpoch,
+          legacySourceDigest: input.legacySourceDigest,
+        },
+        this.#fileCoreHistoryProducerCapability(),
+        true,
+      );
+    });
+    if (migrated === undefined) throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", "history migration returned no store");
+    return migrated;
   }
 
   #requireOpen(): void {
@@ -678,6 +844,28 @@ export class RuntimeAuthorityDatabase {
         "CONTROLLER_LOCK_NOT_HELD",
         "Writable Runtime authority access requires the caller-held instance controller lock",
       );
+    }
+  }
+
+  #fileCoreHistoryProducerCapability() {
+    return mintFileCoreHistoryProducerCapability(this);
+  }
+  #inFileCoreHistoryMigrationTransaction(work: () => void): void {
+    this.#statement("BEGIN IMMEDIATE").run();
+    try {
+      work();
+    } catch (error) {
+      try {
+        this.#statement("ROLLBACK").run();
+      } catch (rollbackError) {
+        throw new FileCoreHistoryError("HISTORY_COMMIT_UNKNOWN", "history migration rollback outcome is unknown", { cause: rollbackError });
+      }
+      throw error;
+    }
+    try {
+      this.#statement("COMMIT").run();
+    } catch (error) {
+      throw new FileCoreHistoryError("HISTORY_COMMIT_UNKNOWN", "history migration commit outcome is unknown; reopen before retry", { cause: error });
     }
   }
 
