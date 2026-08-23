@@ -60,6 +60,7 @@ const PACKAGE_SCHEMA_VERSION_V1 = "dolly.extension-package/1";
 const PACKAGE_SCHEMA_VERSION_V2 = "dolly.extension-package/2";
 const PACKAGE_SCHEMA_VERSION_V3 = "dolly.extension-package/3";
 const PACKAGE_SCHEMA_VERSION_V4 = "dolly.extension-package/4";
+const PACKAGE_SCHEMA_VERSION_V10 = "dolly.extension-package/10";
 const INSTALLATION_RECORD_SCHEMA_VERSION = "dolly.extension-installation/1";
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
@@ -76,6 +77,29 @@ interface ExtensionPackageModuleCommon extends Readonly<Record<string, JsonValue
   readonly moduleKind: string;
   readonly configVersion: number;
   readonly configurationSchema: JsonValue;
+}
+
+/** One exact policy-definition reference selected by a reserved version-10 package. */
+export interface ExtensionPackagePermissionPolicyReferenceV10
+  extends Readonly<Record<string, JsonValue>> {
+  readonly policyId: string;
+  /** Canonical digest of the exact policy definition revision. */
+  readonly revision: string;
+}
+
+export type ExtensionPackageCapabilityTypeV10 =
+  | "model-operation"
+  | "tool-invocation"
+  | "module-private-storage";
+
+/** One closed, policy-bound capability request in a reserved version-10 package. */
+export interface ExtensionPackageCapabilityRequestV10
+  extends Readonly<Record<string, JsonValue>> {
+  readonly moduleKind: string;
+  readonly capabilityType: ExtensionPackageCapabilityTypeV10;
+  readonly capabilityVersion: "v2" | "v3";
+  readonly policyId: string;
+  readonly policyRevision: string;
 }
 
 /** One Extension-owned structured-data producer declaration. */
@@ -108,11 +132,18 @@ export interface ExtensionPackageModuleV4 extends ExtensionPackageModuleCommon {
   readonly producedContentSchemas: readonly ExtensionContentSchemaProducer[];
 }
 
+export interface ExtensionPackageModuleV10 extends ExtensionPackageModuleCommon {
+  readonly activation: "reactive" | "periodic" | "source";
+  readonly producedContentSchemas: readonly ExtensionContentSchemaProducer[];
+  readonly permissionPolicyReferences: readonly ExtensionPackagePermissionPolicyReferenceV10[];
+}
+
 export type ExtensionPackageModule =
   | ExtensionPackageModuleV1
   | ExtensionPackageModuleV2
   | ExtensionPackageModuleV3
-  | ExtensionPackageModuleV4;
+  | ExtensionPackageModuleV4
+  | ExtensionPackageModuleV10;
 
 /**
  * The closed Extension package manifest is read before any Extension code
@@ -127,34 +158,44 @@ interface ExtensionPackageManifestCommon extends Readonly<Record<string, JsonVal
   readonly description: string;
   readonly supportedProtocolVersions: readonly string[];
   readonly entrypoint: string;
-  readonly requestedCapabilities: readonly [];
 }
 
 export interface ExtensionPackageManifestV1 extends ExtensionPackageManifestCommon {
   readonly schemaVersion: "dolly.extension-package/1";
   readonly modules: readonly ExtensionPackageModuleV1[];
+  readonly requestedCapabilities: readonly [];
 }
 
 export interface ExtensionPackageManifestV2 extends ExtensionPackageManifestCommon {
   readonly schemaVersion: "dolly.extension-package/2";
   readonly modules: readonly ExtensionPackageModuleV2[];
+  readonly requestedCapabilities: readonly [];
 }
 
 export interface ExtensionPackageManifestV3 extends ExtensionPackageManifestCommon {
   readonly schemaVersion: "dolly.extension-package/3";
   readonly modules: readonly ExtensionPackageModuleV3[];
+  readonly requestedCapabilities: readonly [];
 }
 
 export interface ExtensionPackageManifestV4 extends ExtensionPackageManifestCommon {
   readonly schemaVersion: "dolly.extension-package/4";
   readonly modules: readonly ExtensionPackageModuleV4[];
+  readonly requestedCapabilities: readonly [];
+}
+
+export interface ExtensionPackageManifestV10 extends ExtensionPackageManifestCommon {
+  readonly schemaVersion: "dolly.extension-package/10";
+  readonly modules: readonly ExtensionPackageModuleV10[];
+  readonly requestedCapabilities: readonly ExtensionPackageCapabilityRequestV10[];
 }
 
 export type ExtensionPackageManifest =
   | ExtensionPackageManifestV1
   | ExtensionPackageManifestV2
   | ExtensionPackageManifestV3
-  | ExtensionPackageManifestV4;
+  | ExtensionPackageManifestV4
+  | ExtensionPackageManifestV10;
 
 export interface ExtensionModuleCompatibility {
   readonly extensionId: string;
@@ -443,7 +484,8 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V1 &&
     value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V2 &&
     value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V3 &&
-    value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V4
+    value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V4 &&
+    value.schemaVersion !== PACKAGE_SCHEMA_VERSION_V10
   ) {
     throw new ExtensionInstallationError(
       "EXTENSION_PACKAGE_INVALID",
@@ -451,6 +493,7 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     );
   }
   const schemaVersion = value.schemaVersion;
+  const isReservedV10 = schemaVersion === PACKAGE_SCHEMA_VERSION_V10;
   const extensionId = identifier(value.extensionId, "extensionId");
   if (
     !Array.isArray(value.supportedProtocolVersions) ||
@@ -484,6 +527,15 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
       candidate,
       schemaVersion === PACKAGE_SCHEMA_VERSION_V1
         ? ["moduleKind", "activation", "configVersion", "configurationSchema"]
+        : isReservedV10
+        ? [
+            "moduleKind",
+            "activation",
+            "configVersion",
+            "configurationSchema",
+            "producedContentSchemas",
+            "permissionPolicyReferences",
+          ]
         : [
             "moduleKind",
             "activation",
@@ -503,9 +555,10 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     moduleKinds.add(moduleKind);
     const activationSupported = candidate.activation === "reactive" ||
       ((schemaVersion === PACKAGE_SCHEMA_VERSION_V3 ||
-        schemaVersion === PACKAGE_SCHEMA_VERSION_V4) &&
+        schemaVersion === PACKAGE_SCHEMA_VERSION_V4 ||
+        isReservedV10) &&
         candidate.activation === "source") ||
-      (schemaVersion === PACKAGE_SCHEMA_VERSION_V4 &&
+      ((schemaVersion === PACKAGE_SCHEMA_VERSION_V4 || isReservedV10) &&
         candidate.activation === "periodic");
     if (!activationSupported) {
       throw new ExtensionInstallationError(
@@ -625,13 +678,180 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     if (schemaVersion === PACKAGE_SCHEMA_VERSION_V2) {
       return { ...common, activation: "reactive" as const, producedContentSchemas };
     }
-    return { ...common, producedContentSchemas };
+    if (!isReservedV10) {
+      return { ...common, producedContentSchemas };
+    }
+    if (
+      !Array.isArray(candidate.permissionPolicyReferences) ||
+      candidate.permissionPolicyReferences.length > 64
+    ) {
+      throw new ExtensionInstallationError(
+        "EXTENSION_PACKAGE_INVALID",
+        `${label}.permissionPolicyReferences must contain at most 64 entries`,
+      );
+    }
+    const references = candidate.permissionPolicyReferences.map(
+      (raw, referenceIndex): ExtensionPackagePermissionPolicyReferenceV10 => {
+        const referenceLabel = `${label}.permissionPolicyReferences[${referenceIndex}]`;
+        exactKeys(raw, ["policyId", "revision"], referenceLabel);
+        return {
+          policyId: identifier(raw.policyId, `${referenceLabel}.policyId`),
+          revision: (() => {
+            if (typeof raw.revision !== "string" || !DIGEST_PATTERN.test(raw.revision)) {
+              throw new ExtensionInstallationError(
+                "EXTENSION_PACKAGE_INVALID",
+                `${referenceLabel}.revision must be a canonical SHA-256 digest`,
+              );
+            }
+            return raw.revision;
+          })(),
+        };
+      },
+    );
+    for (let index = 1; index < references.length; index += 1) {
+      const previous = references[index - 1]!;
+      const current = references[index]!;
+      const previousKey = `${previous.policyId}\u0000${previous.revision}`;
+      const currentKey = `${current.policyId}\u0000${current.revision}`;
+      if (previousKey >= currentKey) {
+        throw new ExtensionInstallationError(
+          "EXTENSION_PACKAGE_INVALID",
+          `${label}.permissionPolicyReferences must be unique and canonically sorted`,
+        );
+      }
+    }
+    return { ...common, producedContentSchemas, permissionPolicyReferences: references };
   });
-  if (!Array.isArray(value.requestedCapabilities) || value.requestedCapabilities.length !== 0) {
+
+  if (!Array.isArray(value.requestedCapabilities)) {
+    throw new ExtensionInstallationError(
+      "EXTENSION_PACKAGE_INVALID",
+      "requestedCapabilities must be an array",
+    );
+  }
+  if (!isReservedV10 && value.requestedCapabilities.length !== 0) {
     throw new ExtensionInstallationError(
       "EXTENSION_PACKAGE_INVALID",
       "requestedCapabilities must be empty in package schema versions 1 through 4",
     );
+  }
+  if (isReservedV10 && value.requestedCapabilities.length > 256) {
+    throw new ExtensionInstallationError(
+      "EXTENSION_PACKAGE_INVALID",
+      "requestedCapabilities must contain at most 256 entries",
+    );
+  }
+  const requestedCapabilities: readonly ExtensionPackageCapabilityRequestV10[] =
+    isReservedV10
+      ? value.requestedCapabilities.map((raw, requestIndex) => {
+          const label = `requestedCapabilities[${requestIndex}]`;
+          exactKeys(
+            raw,
+            ["moduleKind", "capabilityType", "capabilityVersion", "policyId", "policyRevision"],
+            label,
+          );
+          const capabilityType = raw.capabilityType;
+          if (
+            capabilityType !== "model-operation" &&
+            capabilityType !== "tool-invocation" &&
+            capabilityType !== "module-private-storage"
+          ) {
+            throw new ExtensionInstallationError(
+              "EXTENSION_PACKAGE_INVALID",
+              `${label}.capabilityType is not in the closed version-10 vocabulary`,
+            );
+          }
+          const capabilityVersion = raw.capabilityVersion;
+          const compatibleVersion =
+            capabilityType === "model-operation"
+              ? capabilityVersion === "v2" || capabilityVersion === "v3"
+              : capabilityVersion === "v2";
+          if (!compatibleVersion) {
+            throw new ExtensionInstallationError(
+              "EXTENSION_PACKAGE_INVALID",
+              `${label}.capabilityVersion is incompatible with ${capabilityType}`,
+            );
+          }
+          if (typeof raw.policyRevision !== "string" || !DIGEST_PATTERN.test(raw.policyRevision)) {
+            throw new ExtensionInstallationError(
+              "EXTENSION_PACKAGE_INVALID",
+              `${label}.policyRevision must be a canonical SHA-256 digest`,
+            );
+          }
+          return {
+            moduleKind: identifier(raw.moduleKind, `${label}.moduleKind`),
+            capabilityType,
+            capabilityVersion,
+            policyId: identifier(raw.policyId, `${label}.policyId`),
+            policyRevision: raw.policyRevision,
+          };
+        })
+      : [];
+  if (isReservedV10) {
+    for (let index = 1; index < requestedCapabilities.length; index += 1) {
+      const previous = requestedCapabilities[index - 1]!;
+      const current = requestedCapabilities[index]!;
+      const previousKey = [
+        previous.moduleKind,
+        previous.capabilityType,
+        previous.capabilityVersion,
+        previous.policyId,
+        previous.policyRevision,
+      ].join("\u0000");
+      const currentKey = [
+        current.moduleKind,
+        current.capabilityType,
+        current.capabilityVersion,
+        current.policyId,
+        current.policyRevision,
+      ].join("\u0000");
+      if (previousKey >= currentKey) {
+        throw new ExtensionInstallationError(
+          "EXTENSION_PACKAGE_INVALID",
+          "requestedCapabilities must be unique and canonically sorted",
+        );
+      }
+    }
+    const versionedModules = modules as readonly ExtensionPackageModuleV10[];
+    const moduleByKind = new Map(versionedModules.map((module) => [module.moduleKind, module]));
+    for (const capability of requestedCapabilities) {
+      const module = moduleByKind.get(capability.moduleKind);
+      if (module === undefined) {
+        throw new ExtensionInstallationError(
+          "EXTENSION_PACKAGE_INVALID",
+          `requestedCapabilities references unknown Module ${capability.moduleKind}`,
+        );
+      }
+      if (
+        !module.permissionPolicyReferences.some(
+          (reference) =>
+            reference.policyId === capability.policyId &&
+            reference.revision === capability.policyRevision,
+        )
+      ) {
+        throw new ExtensionInstallationError(
+          "EXTENSION_PACKAGE_INVALID",
+          `requestedCapabilities references a missing policy ${capability.policyId}@${capability.policyRevision}`,
+        );
+      }
+    }
+    for (const module of versionedModules) {
+      for (const reference of module.permissionPolicyReferences) {
+        if (
+          !requestedCapabilities.some(
+            (capability) =>
+              capability.moduleKind === module.moduleKind &&
+              capability.policyId === reference.policyId &&
+              capability.policyRevision === reference.revision,
+          )
+        ) {
+          throw new ExtensionInstallationError(
+            "EXTENSION_PACKAGE_INVALID",
+            `Module ${module.moduleKind} contains a policy reference without a capability request`,
+          );
+        }
+      }
+    }
   }
   return deepFreeze({
     schemaVersion,
@@ -642,7 +862,7 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
     supportedProtocolVersions,
     entrypoint: entrypoint(value.entrypoint),
     modules,
-    requestedCapabilities: [],
+    requestedCapabilities,
   }) as ExtensionPackageManifest;
 }
 
