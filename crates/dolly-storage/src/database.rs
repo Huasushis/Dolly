@@ -307,30 +307,49 @@ impl MigrationCleanup {
         })
     }
 
-    fn note_path_lock_acquired(&mut self, acquired: &AcquiredLock) -> StorageResult<()> {
-        self.path_lock_guard = Some(LockGuard {
-            file: acquired.file.try_clone().map_err(map_io_error)?,
-            directory_lock: acquired.directory_lock.try_clone().map_err(map_io_error)?,
-        });
-        self.path_lock_acquired = true;
+    fn note_path_lock_acquired(&mut self, acquired: AcquiredLock) -> StorageResult<AcquiredLock> {
         self.path_lock_created = acquired.created;
-        if acquired.created {
+        self.path_lock_acquired = true;
+        self.path_lock_guard = Some(LockGuard {
+            file: acquired.file,
+            directory_lock: acquired.directory_lock,
+        });
+        if self.path_lock_created {
             self.path_lock.note_created()?;
         }
-        Ok(())
+        let guard = self
+            .path_lock_guard
+            .as_ref()
+            .expect("path lock guard recorded before cloning");
+        Ok(AcquiredLock {
+            file: guard.file.try_clone().map_err(map_io_error)?,
+            directory_lock: guard.directory_lock.try_clone().map_err(map_io_error)?,
+            created: self.path_lock_created,
+        })
     }
 
-    fn note_identity_lock_acquired(&mut self, acquired: &AcquiredLock) -> StorageResult<()> {
-        self.identity_lock_guard = Some(LockGuard {
-            file: acquired.file.try_clone().map_err(map_io_error)?,
-            directory_lock: acquired.directory_lock.try_clone().map_err(map_io_error)?,
-        });
-        self.identity_lock_acquired = true;
+    fn note_identity_lock_acquired(
+        &mut self,
+        acquired: AcquiredLock,
+    ) -> StorageResult<AcquiredLock> {
         self.identity_lock_created = acquired.created;
-        if acquired.created {
+        self.identity_lock_acquired = true;
+        self.identity_lock_guard = Some(LockGuard {
+            file: acquired.file,
+            directory_lock: acquired.directory_lock,
+        });
+        if self.identity_lock_created {
             self.identity_lock.note_created()?;
         }
-        Ok(())
+        let guard = self
+            .identity_lock_guard
+            .as_ref()
+            .expect("identity lock guard recorded before cloning");
+        Ok(AcquiredLock {
+            file: guard.file.try_clone().map_err(map_io_error)?,
+            directory_lock: guard.directory_lock.try_clone().map_err(map_io_error)?,
+            created: self.identity_lock_created,
+        })
     }
 
     fn begin_database(&mut self) {
@@ -520,12 +539,11 @@ fn open_migration_database(
     let loaded = probe_loaded_sqlite();
     let verified = SqliteBuildGate.verify(attestation, &loaded)?;
     let acquired = acquire_lock_file_with_creation(&path_lock_path)?;
-    cleanup.note_path_lock_acquired(&acquired)?;
     let AcquiredLock {
         file: path_lock,
         directory_lock: path_directory_lock,
         ..
-    } = acquired;
+    } = cleanup.note_path_lock_acquired(acquired)?;
     if read_persisted_identity(db_path)?.is_some() {
         return Err(StorageError::MigrationRequired);
     }
@@ -570,12 +588,11 @@ impl OfflineDatabase {
                 open_migration_database(&self.db_path, &self.attestation, &mut cleanup)?;
             let controller_generation_id = mint_controller_generation_id()?;
             let acquired_identity = acquire_identity_lock_with_creation(&input.identity)?;
-            cleanup.note_identity_lock_acquired(&acquired_identity)?;
             let AcquiredLock {
                 file: identity_lock,
                 directory_lock: identity_directory_lock,
                 ..
-            } = acquired_identity;
+            } = cleanup.note_identity_lock_acquired(acquired_identity)?;
             cleanup.begin_database();
             let connection = match open_connection(&database.db_path) {
                 Ok(connection) => connection,
@@ -650,24 +667,22 @@ impl OfflineDatabase {
             MigrationCleanup::capture(&self.db_path, &path_lock_path, &identity_lock_path)?;
         let result = (|| -> StorageResult<Database> {
             let acquired_path = acquire_lock_file_with_creation(&path_lock_path)?;
-            cleanup.note_path_lock_acquired(&acquired_path)?;
             let AcquiredLock {
                 file: path_lock,
                 directory_lock: path_directory_lock,
                 ..
-            } = acquired_path;
+            } = cleanup.note_path_lock_acquired(acquired_path)?;
             let current =
                 read_legacy_authority(&self.db_path)?.ok_or(StorageError::MigrationRequired)?;
             if current != expected {
                 return Err(StorageError::Corrupt);
             }
             let acquired_identity = acquire_identity_lock_with_creation(&expected.0)?;
-            cleanup.note_identity_lock_acquired(&acquired_identity)?;
             let AcquiredLock {
                 file: identity_lock,
                 directory_lock: identity_directory_lock,
                 ..
-            } = acquired_identity;
+            } = cleanup.note_identity_lock_acquired(acquired_identity)?;
             let current =
                 read_legacy_authority(&self.db_path)?.ok_or(StorageError::MigrationRequired)?;
             if current != expected {
@@ -793,12 +808,11 @@ fn open_internal(db_path: &Path, attestation: &ReleaseAttestation) -> StorageRes
     let mut cleanup = MigrationCleanup::capture(db_path, &path_lock_path, &identity_lock_path)?;
     let result = (|| -> StorageResult<Database> {
         let acquired_path = acquire_lock_file_with_creation(&path_lock_path)?;
-        cleanup.note_path_lock_acquired(&acquired_path)?;
         let AcquiredLock {
             file: path_lock,
             directory_lock: path_directory_lock,
             ..
-        } = acquired_path;
+        } = cleanup.note_path_lock_acquired(acquired_path)?;
 
         let current_identity =
             read_persisted_identity(db_path)?.ok_or(StorageError::MigrationRequired)?;
@@ -807,12 +821,11 @@ fn open_internal(db_path: &Path, attestation: &ReleaseAttestation) -> StorageRes
         }
 
         let acquired_identity = acquire_identity_lock_with_creation(&expected_identity.0)?;
-        cleanup.note_identity_lock_acquired(&acquired_identity)?;
         let AcquiredLock {
             file: identity_lock,
             directory_lock: identity_directory_lock,
             ..
-        } = acquired_identity;
+        } = cleanup.note_identity_lock_acquired(acquired_identity)?;
         let controller_generation_id = mint_controller_generation_id()?;
         verify_or_write_lock_owner(
             &identity_lock,
