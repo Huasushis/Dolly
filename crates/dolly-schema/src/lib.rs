@@ -4,6 +4,12 @@
 //! validator that resolves `$ref` by `$id` (no network resolution), and
 //! exports generated closed representations for the three public stable roots:
 //! `BlockEnvelope`, `ActivationManifest`, and `ModuleDescriptor`.
+//!
+//! Beyond the embedded catalog, [`SchemaValidator::compile_embedded`] is the
+//! reusable authority entry point: it compiles an arbitrary complete,
+//! self-contained JSON Schema 2020-12 document only after verifying its exact
+//! canonical JCS SHA-256 digest, restricting references to local `#`/`#/...`
+//! fragments, and never performs network or filesystem resolution.
 
 mod bundle;
 mod catalog;

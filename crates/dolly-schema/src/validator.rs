@@ -1,4 +1,4 @@
-use dolly_canonical_json::{CanonicalError, CanonicalJsonValue, ParseLimits};
+use dolly_canonical_json::{CanonicalError, CanonicalJsonValue, ParseLimits, Sha256Digest};
 use jsonschema::{Registry, Resource, draft202012};
 use serde_json::Value;
 
@@ -101,6 +101,45 @@ pub struct SchemaValidator {
 }
 
 impl SchemaValidator {
+    /// Compile an arbitrary complete embedded JSON Schema 2020-12 document
+    /// after authorizing it by its exact canonical JCS SHA-256 digest.
+    ///
+    /// Authority is conveyed exclusively through `expected_digest`: the
+    /// document is canonicalized to its exact JCS bytes and must hash to
+    /// `expected_digest` before any reference check or compilation happens.
+    /// Only then is the document required to be a self-contained embedded
+    /// document whose `$ref`/`$dynamicRef` values are exactly `#` or RFC 6901
+    /// `#/...` fragments within it; named anchors, remote, file,
+    /// package-relative, and cross-document references are rejected, and no
+    /// network or filesystem resolution is ever attempted. The returned
+    /// [`SchemaValidator`] is the same type used for the embedded catalog and
+    /// validates `CanonicalJsonValue` (including `Null`) without synthesis.
+    pub fn compile_embedded(
+        document: &CanonicalJsonValue,
+        expected_digest: &Sha256Digest,
+    ) -> Result<Self, SchemaError> {
+        // 1. Canonicalize the document and verify the digest first.
+        let (canonical_bytes, computed) = dolly_canonical_json::canonicalize(document)?;
+        expected_digest.verify_bytes(canonical_bytes.as_bytes()).map_err(|_| {
+            SchemaError::Digest(format!(
+                "embedded schema digest mismatch: expected {expected_digest}, computed {computed}"
+            ))
+        })?;
+
+        // 2. Verify the self-contained reference policy before compiling.
+        verify_embedded_refs(document)?;
+
+        // 3. Serialize and build the validator with no registry and no
+        //    retriever, so resolution can never leave the document.
+        let schema_value: Value = serde_json::to_value(document).map_err(|e| {
+            SchemaError::Validation(format!("failed to serialize embedded schema: {e}"))
+        })?;
+        let validator = draft202012::options()
+            .build(&schema_value)
+            .map_err(|e| SchemaError::Validation(format!("embedded schema does not compile: {e}")))?;
+        Ok(SchemaValidator { validator })
+    }
+
     /// Validate an already-parsed `CanonicalJsonValue` against this schema.
     pub fn validate(&self, instance: &CanonicalJsonValue) -> Result<(), ValidationErrors> {
         // Convert CanonicalJsonValue to serde_json::Value for the validator
@@ -202,4 +241,60 @@ pub(crate) fn validate_bytes<T: serde::de::DeserializeOwned>(
     use serde::de::IntoDeserializer;
     T::deserialize(json_value.into_deserializer())
         .map_err(|e| SchemaError::Json(CanonicalError::invalid_json(e.to_string())))
+}
+
+/// Verify that a document is a self-contained embedded schema: `$ref` and
+/// `$dynamicRef` values must be exactly `#` or RFC 6901 `#/...` fragments,
+/// and named anchors (`$anchor`/`$dynamicAnchor` keywords or `$id` values
+/// carrying fragments) are rejected. Returns `Reference` only for actual
+/// policy violations; structurally invalid JSON falls through to the compiler
+/// so the schema-build error stays faithful.
+fn verify_embedded_refs(value: &CanonicalJsonValue) -> Result<(), SchemaError> {
+    match value {
+        CanonicalJsonValue::Object(obj) => {
+            for (key, child) in obj.iter() {
+                match key {
+                    "$ref" | "$dynamicRef" => match child {
+                        CanonicalJsonValue::String(s) => {
+                            let allowed = s == "#" || s.starts_with("#/");
+                            if !allowed {
+                                return Err(SchemaError::Reference(format!(
+                                    "{key} value {s:?} is not a permitted local fragment ('#' or RFC 6901 '#/...')"
+                                )));
+                            }
+                        }
+                        // Non-string $ref/$dynamicRef is an invalid schema;
+                        // defer to the compiler so it fails closed there.
+                        _ => {}
+                    },
+                    // Named anchors are invalid: reject the declaration
+                    // outright so no anchor surface exists.
+                    "$anchor" | "$dynamicAnchor" => {
+                        return Err(SchemaError::Reference(format!(
+                            "named anchor keyword {key} not permitted in embedded schema"
+                        )));
+                    }
+                    "$id" => {
+                        if let CanonicalJsonValue::String(s) = child {
+                            if s.contains('#') {
+                                return Err(SchemaError::Reference(format!(
+                                    "$id {s:?} carries a fragment, declaring an anchor; not permitted"
+                                )));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                verify_embedded_refs(child)?;
+            }
+            Ok(())
+        }
+        CanonicalJsonValue::Array(items) => {
+            for item in items {
+                verify_embedded_refs(item)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
