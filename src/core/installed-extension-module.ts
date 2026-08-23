@@ -12,6 +12,7 @@ import {
   assertExtensionModuleCompatibility,
   ExtensionInstallationRegistry,
   type ExtensionPackageModule,
+  type ExtensionPackageModuleV10,
   type ResolvedExtensionInstallation,
 } from "./extension-installation-registry.js";
 import {
@@ -27,6 +28,9 @@ import {
   validateDollyInstanceConfigV10Draft,
   type DollyModuleConfigV10,
 } from "./runtime-config-v10.js";
+import { InstalledComponentOriginRegistry } from "./installed-component-origin.js";
+import { RuntimeAuthorityDatabase } from "../adapters/storage/runtime-authority-database.js";
+import { assertCurrentReservedV10ExtensionPackageManifest } from "./reserved-v10-extension-package.js";
 
 export interface InstalledExtensionModule {
   readonly instanceId: string;
@@ -60,13 +64,20 @@ export interface ReservedV10InstalledModulePlan {
   readonly provenance: JsonValue;
   readonly provenanceDigest: string;
 }
-
 export interface ResolveReservedV10InstalledModulePlanOptions {
   /** The complete reserved version-10 document is validated again before I/O. */
   readonly instanceConfiguration: JsonValue;
   readonly moduleId: string;
   readonly installations: ExtensionInstallationRegistry;
   readonly configurations: ModuleConfigurationStore;
+  /**
+   * Non-empty v10 capability packages must carry the installer-produced
+   * provenance artifact and the durable policy/origin authorities into the
+   * plan consumer. Older schemas never accept these fields.
+   */
+  readonly installedPackageManifest?: unknown;
+  readonly packageOrigins?: InstalledComponentOriginRegistry;
+  readonly packageDatabase?: RuntimeAuthorityDatabase;
 }
 
 const RESERVED_V10_INSTALLED_MODULE_PLANS = new WeakSet<object>();
@@ -180,6 +191,9 @@ export function resolveReservedV10InstalledModulePlan(
     "moduleId",
     "installations",
     "configurations",
+    "installedPackageManifest",
+    "packageOrigins",
+    "packageDatabase",
   ]);
   const unexpectedOptionKeys = Object.keys(options)
     .filter((key) => !expectedOptionKeys.has(key))
@@ -230,6 +244,41 @@ export function resolveReservedV10InstalledModulePlan(
   );
   if (packageModule === undefined) {
     throw new TypeError(`Installed package does not contain Module ${module.moduleKind}`);
+  }
+  if (installation.manifest.schemaVersion === "dolly.extension-package/10") {
+    if (
+      options.installedPackageManifest === undefined ||
+      !(options.packageOrigins instanceof InstalledComponentOriginRegistry) ||
+      !(options.packageDatabase instanceof RuntimeAuthorityDatabase)
+    ) {
+      throw new TypeError(
+        "reserved version-10 module plans require the installer manifest and durable package authorities",
+      );
+    }
+    assertCurrentReservedV10ExtensionPackageManifest(options.installedPackageManifest, {
+      installations: options.installations,
+      origins: options.packageOrigins,
+      database: options.packageDatabase,
+    });
+    const packageModuleForPolicy = installation.manifest.modules.find(
+      (candidate): candidate is ExtensionPackageModuleV10 =>
+        candidate.moduleKind === module.moduleKind,
+    );
+    if (packageModuleForPolicy === undefined) {
+      throw new TypeError(`Installed package does not contain Module ${module.moduleKind}`);
+    }
+    const capabilityReferences = installation.manifest.requestedCapabilities
+      .filter((capability) => capability.moduleKind === module.moduleKind)
+      .map((capability) => `${capability.policyId}\u0000${capability.policyRevision}`)
+      .sort();
+    const packageReferences = packageModuleForPolicy.permissionPolicyReferences
+      .map((reference) => `${reference.policyId}\u0000${reference.revision}`)
+      .sort();
+    if (canonicalJsonDigest(capabilityReferences) !== canonicalJsonDigest(packageReferences)) {
+      throw new TypeError(
+        `Module ${module.moduleKind} policy references do not exactly match package capabilities`,
+      );
+    }
   }
   const configuration = options.configurations.resolve({
     configId: module.configurationReference.configId,

@@ -761,16 +761,23 @@ function validateManifest(value: JsonValue): ExtensionPackageManifest {
               `${label}.capabilityType is not in the closed version-10 vocabulary`,
             );
           }
-          const capabilityVersion = raw.capabilityVersion;
-          const compatibleVersion =
-            capabilityType === "model-operation"
-              ? capabilityVersion === "v2" || capabilityVersion === "v3"
-              : capabilityVersion === "v2";
-          if (!compatibleVersion) {
-            throw new ExtensionInstallationError(
-              "EXTENSION_PACKAGE_INVALID",
-              `${label}.capabilityVersion is incompatible with ${capabilityType}`,
-            );
+          let capabilityVersion: "v2" | "v3";
+          if (capabilityType === "model-operation") {
+            if (raw.capabilityVersion !== "v2" && raw.capabilityVersion !== "v3") {
+              throw new ExtensionInstallationError(
+                "EXTENSION_PACKAGE_INVALID",
+                `${label}.capabilityVersion is incompatible with ${capabilityType}`,
+              );
+            }
+            capabilityVersion = raw.capabilityVersion;
+          } else {
+            if (raw.capabilityVersion !== "v2") {
+              throw new ExtensionInstallationError(
+                "EXTENSION_PACKAGE_INVALID",
+                `${label}.capabilityVersion is incompatible with ${capabilityType}`,
+              );
+            }
+            capabilityVersion = "v2";
           }
           if (typeof raw.policyRevision !== "string" || !DIGEST_PATTERN.test(raw.policyRevision)) {
             throw new ExtensionInstallationError(
