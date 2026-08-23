@@ -68,14 +68,18 @@ function legacyCoreSource(): Uint8Array {
   }));
 }
 
-function openAuthority(): { readonly database: RuntimeAuthorityDatabase; readonly lock: FakeLock; readonly path: string } {
+function openAuthority(authorityIdentity: RuntimeAuthorityIdentity = identity): {
+  readonly database: RuntimeAuthorityDatabase;
+  readonly lock: FakeLock;
+  readonly path: string;
+} {
   const path = join(scratch(), "runtime-authority.sqlite");
   const lock = new FakeLock();
-  const database = RuntimeAuthorityDatabase.open({ path, identity, lock });
+  const database = RuntimeAuthorityDatabase.open({ path, identity: authorityIdentity, lock });
   authorities.push(database);
   const configBytes = resolvedConfig();
   database.installConfig({
-    identity,
+    identity: authorityIdentity,
     canonicalConfigBytes: configBytes,
     configDigest: digest(configBytes),
     premise: null,
@@ -134,6 +138,42 @@ describe("FileCore bounded global history", () => {
       fakeCapability,
     )).toThrowError("not minted");
     expect(() => mintFileCoreHistoryProducerCapability({})).toThrowError("requires RuntimeAuthorityDatabase");
+    database.close();
+  });
+
+  it("binds a capability to its exact authority context before schema work", () => {
+    const authorityA = openAuthority();
+    const authorityBIdentity: RuntimeAuthorityIdentity = {
+      daemonInstallationId: "0198ab11-6c44-7e8a-b2bb-000000000502",
+      instanceId: "secondary",
+    };
+    const authorityB = openAuthority(authorityBIdentity);
+    const capabilityA = mintFileCoreHistoryProducerCapability(authorityA.database);
+    const raw = new Database(":memory:");
+    const policy: FileCoreHistoryOptions = { maxEntries: 8, maxBytes: 64, maxReaders: 2 };
+    const historyTables = (): readonly unknown[] =>
+      raw.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'filecore_history_%' ORDER BY name",
+      ).all();
+
+    expect(() => createFileCoreHistoryStore(
+      raw as never,
+      identity,
+      authorityA.lock,
+      policy,
+      capabilityA,
+    )).toThrowError("FileCore history context is not bound");
+    expect(historyTables()).toEqual([]);
+
+    expect(() => createFileCoreHistoryStore(
+      raw as never,
+      authorityB.database.identity,
+      authorityB.lock,
+      policy,
+      capabilityA,
+    )).toThrowError("FileCore history context is not bound");
+    expect(historyTables()).toEqual([]);
+    raw.close();
   });
 
   it("requires Runtime-authority migration and exposes an explicit pre-migration gap", () => {

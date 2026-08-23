@@ -643,6 +643,12 @@ export class RuntimeAuthorityDatabase {
     this.#connection = connection;
     this.#identity = identity;
     this.#lock = lock;
+    Object.defineProperty(this, "fileCoreHistoryContextBinding", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: () => this.#fileCoreHistoryContextBinding(),
+    });
   }
 
   /** Opens through the H0 attested loader and verifies the committed DB (REQ-AUTH-004). */
@@ -677,6 +683,46 @@ export class RuntimeAuthorityDatabase {
   get isOpen(): boolean {
     return !this.#closed && this.#connection.open;
   }
+  /** @internal Supplies an exact context assertion to the FileCore capability mint path. */
+  #fileCoreHistoryContextBinding(): {
+    readonly assertExactContext: (connection: unknown, identity: RuntimeAuthorityIdentity, lock: unknown) => void;
+  } {
+    const connection = this.#connection;
+    const lock = this.#lock;
+    const identityDigest = canonicalJsonDigest({
+      daemonInstallationId: this.#identity.daemonInstallationId,
+      instanceId: this.#identity.instanceId,
+    });
+    return Object.freeze({
+      assertExactContext: (
+        candidateConnection: unknown,
+        candidateIdentity: RuntimeAuthorityIdentity,
+        candidateLock: unknown,
+      ): void => {
+        if (candidateConnection !== connection || candidateLock !== lock) {
+          throw new TypeError("FileCore history context is not bound to this Runtime authority");
+        }
+        const candidate = candidateIdentity as unknown as Record<string, unknown>;
+        if (
+          candidate === null ||
+          typeof candidate !== "object" ||
+          Object.keys(candidate).sort().join("\u0000") !== "daemonInstallationId\u0000instanceId" ||
+          typeof candidate.daemonInstallationId !== "string" ||
+          typeof candidate.instanceId !== "string"
+        ) {
+          throw new TypeError("FileCore history identity is not the canonical Runtime authority identity");
+        }
+        const candidateDigest = canonicalJsonDigest({
+          daemonInstallationId: candidate.daemonInstallationId,
+          instanceId: candidate.instanceId,
+        });
+        if (candidateDigest !== identityDigest) {
+          throw new TypeError("FileCore history identity is not bound to this Runtime authority");
+        }
+      },
+    });
+  }
+
 
   get identity(): RuntimeAuthorityIdentity {
     return { ...this.#identity };

@@ -29,6 +29,12 @@ interface FileCoreHistorySqliteConnection {
   exec(source: string): unknown;
 }
 
+type FileCoreHistoryContextAssertion = (
+  connection: FileCoreHistorySqliteConnection,
+  identity: RuntimeAuthorityIdentity,
+  lock: RuntimeAuthorityLockHandle,
+) => void;
+
 type FileCoreHistoryProducerCapability = {
   readonly assertValid: () => void;
 };
@@ -377,18 +383,32 @@ const READER_KEYS = [
 
 const FILECORE_HISTORY_MIGRATION_TOKEN = Symbol("filecore-history-migration");
 const FILECORE_HISTORY_CONSTRUCTION_TOKEN = Symbol("filecore-history-construction");
-const RUNTIME_PRODUCER_CAPABILITIES = new WeakSet<object>();
+const RUNTIME_PRODUCER_CAPABILITIES = new WeakMap<object, FileCoreHistoryContextAssertion>();
 
-export function mintFileCoreHistoryProducerCapability(authority: unknown) {
+export function mintFileCoreHistoryProducerCapability(authority: unknown): FileCoreHistoryProducerCapability {
   if (!(authority instanceof RuntimeAuthorityDatabase)) {
     throw new TypeError("FileCore history producer capability requires RuntimeAuthorityDatabase");
   }
-  const capability: FileCoreHistoryProducerCapability = {
+  const contextBinding = (
+    authority as RuntimeAuthorityDatabase & {
+      readonly fileCoreHistoryContextBinding?: () => {
+        readonly assertExactContext: FileCoreHistoryContextAssertion;
+      };
+    }
+  ).fileCoreHistoryContextBinding;
+  if (typeof contextBinding !== "function") {
+    throw new TypeError("RuntimeAuthorityDatabase does not expose the FileCore history context binding");
+  }
+  const boundContext = contextBinding.call(authority);
+  if (!boundContext || typeof boundContext.assertExactContext !== "function") {
+    throw new TypeError("RuntimeAuthorityDatabase returned an invalid FileCore history context binding");
+  }
+  const capability: FileCoreHistoryProducerCapability = Object.freeze({
     assertValid: () => {
       if (!authority.isOpen) throw new FileCoreHistoryError("HISTORY_PRODUCER_FENCED", "Runtime authority database is closed");
     },
-  };
-  RUNTIME_PRODUCER_CAPABILITIES.add(capability);
+  });
+  RUNTIME_PRODUCER_CAPABILITIES.set(capability, boundContext.assertExactContext);
   return capability;
 }
 
@@ -400,9 +420,14 @@ export function createFileCoreHistoryStore(
   producerCapability: FileCoreHistoryProducerCapability,
   migrate = false,
 ): FileCoreHistoryStore {
-  if (!RUNTIME_PRODUCER_CAPABILITIES.has(producerCapability)) {
+  if (typeof producerCapability !== "object" || producerCapability === null) {
     throw new TypeError("FileCore history producer capability was not minted by RuntimeAuthorityDatabase");
   }
+  const assertExactContext = RUNTIME_PRODUCER_CAPABILITIES.get(producerCapability);
+  if (assertExactContext === undefined) {
+    throw new TypeError("FileCore history producer capability was not minted by RuntimeAuthorityDatabase");
+  }
+  assertExactContext(connection, identity, lock);
   return new FileCoreHistoryStore(
     connection,
     identity,
