@@ -17,14 +17,14 @@
 //! path are out of scope for this slice (`transaction.rs` stays untouched).
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use dolly_canonical_json::{CanonicalJsonValue, Sha256Digest, canonicalize};
@@ -33,14 +33,17 @@ use crate::attestation::{LoadedSqlite, ReleaseAttestation, SqliteBuildGate, Veri
 use crate::error::{StorageError, StorageResult};
 use crate::host_authority::{
     ConfigRevisionMapping, HOST_AUTHORITY_SCHEMA_SQL, HostAuthorityError, HostAuthorityRevision,
-    InstallDisposition, LinuxServiceCandidate, ModuleActivationPremises,
-    PermissionPolicyBackendBinding, PermissionPolicyDefinition, PermissionPolicySelection,
-    ResolvedConfiguration, RuntimeAuthorityIdentity,
-    install_host_authority_revision_in_transaction, load_current_authority,
+    LinuxServiceCandidate, ModuleActivationPremises, PermissionPolicyBackendBinding,
+    PermissionPolicyDefinition, PermissionPolicySelection, ResolvedConfiguration,
+    RuntimeAuthorityIdentity, install_host_authority_revision_in_transaction,
+    load_current_authority,
 };
 
 /// Highest schema version this binary understands.
 pub const SCHEMA_VERSION: i64 = 1;
+#[cfg(test)]
+static TEST_IDENTITY_LOCK_NONCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// The required-connection settings from storage-and-recovery §2. The readback
 /// of each must equal the mandated value or the open refuses with
@@ -56,6 +59,13 @@ pub mod required {
     pub const TRUSTED_SCHEMA: i64 = 0;
     /// `PRAGMA busy_timeout` must read back `5000`.
     pub const BUSY_TIMEOUT_MS: i64 = 5000;
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControllerLockOwner {
+    daemon_installation_id: String,
+    instance_id: String,
+    controller_generation_id: String,
 }
 
 /// Byte-level result of the open-time connection configuration checks.
@@ -131,62 +141,61 @@ impl ConnectionConfiguration {
     }
 }
 
-/// An opened, verified, write-capable storage instance.
-///
-/// Holds the instance lock descriptor for its lifetime; dropping the value
-/// releases the OS lock. `connection()` is the single writer surface behind
-/// the `CoreTransaction` boundary (`transaction.rs`).
+/// An opened, verified, write-capable storage instance with a committed
+/// authority identity. Empty/uninitialized databases cannot be represented by
+/// this public type.
 #[derive(Debug)]
 pub struct Database {
     connection: Connection,
-    #[allow(dead_code)] // the descriptor itself is the lock; keep it alive.
-    instance_lock: File,
+    #[allow(dead_code)]
+    path_lock: File,
+    #[allow(dead_code)]
+    identity_lock: Option<File>,
     verified: VerifiedSqliteBuild,
     configuration: ConnectionConfiguration,
     schema_version: i64,
     authority_identity: Option<RuntimeAuthorityIdentity>,
+    controller_generation_id: Option<String>,
+}
+
+/// A private-connection offline handle. It can only perform the explicit
+/// bootstrap/migration operation and exposes no SQLite connection.
+#[derive(Debug)]
+pub struct OfflineDatabase {
+    database: Database,
 }
 
 impl Database {
-    /// Open `db_path` with the compiled-in release attestation.
+    /// Open an existing committed authority database.
     pub fn open(db_path: &Path) -> StorageResult<Self> {
         Self::open_with(db_path, &crate::attestation::release_attestation())
     }
 
-    /// Open `db_path` using an explicit attestation (tests and release
-    /// instrumenting use this; the floor constant still cannot be weakened).
+    /// Open an existing committed authority database using an explicit
+    /// attestation (tests and release instrumenting use this).
     pub fn open_with(db_path: &Path, attestation: &ReleaseAttestation) -> StorageResult<Self> {
-        reject_symlink_components(db_path)?;
+        open_internal(db_path, attestation, false).map(|database| database)
+    }
 
-        // REQ-TECH-003 is checked before creating the controller lock or
-        // opening the candidate bytes for a write.
-        let loaded = probe_loaded_sqlite();
-        let verified = SqliteBuildGate.verify(attestation, &loaded)?;
+    /// Open the smallest explicit offline handle used to initialize/migrate
+    /// an empty database. The handle has no public connection surface.
+    pub fn open_for_migration(db_path: &Path) -> StorageResult<OfflineDatabase> {
+        Self::open_for_migration_with(db_path, &crate::attestation::release_attestation())
+    }
 
-        // The lock is held for the entire writable connection lifetime.
-        let instance_lock = acquire_instance_lock(db_path)?;
-        let connection = open_connection(db_path)?;
-        let configuration = apply_and_verify_configuration(&connection)?;
-        let schema_version = ensure_schema(&connection, &verified)?;
-        verify_sqlite_integrity(&connection)?;
-        let authority_identity = validate_authority_state(&connection)?;
-
-        Ok(Self {
-            connection,
-            instance_lock,
-            verified,
-            configuration,
-            schema_version,
-            authority_identity,
-        })
+    pub fn open_for_migration_with(
+        db_path: &Path,
+        attestation: &ReleaseAttestation,
+    ) -> StorageResult<OfflineDatabase> {
+        open_internal(db_path, attestation, true).map(|database| OfflineDatabase { database })
     }
 
     pub fn connection(&self) -> &Connection {
         &self.connection
     }
 
-    /// Mutable access to the single writer connection, used by transaction
-    /// API slices (e.g. the Tool-call ledger) that own their transactions.
+    /// Mutable access to the single writer connection. This method is only
+    /// reachable after a committed authority identity has been verified.
     pub fn connection_mut(&mut self) -> &mut Connection {
         &mut self.connection
     }
@@ -203,34 +212,279 @@ impl Database {
         &self.verified
     }
 
-    /// The persisted identity, if this database has committed an authority
-    /// revision. The filesystem path is intentionally absent from this value.
-    pub fn authority_identity(&self) -> Option<&RuntimeAuthorityIdentity> {
-        self.authority_identity.as_ref()
+    pub fn authority_identity(&self) -> &RuntimeAuthorityIdentity {
+        self.authority_identity
+            .as_ref()
+            .expect("ordinary Database always has committed authority identity")
     }
+    pub fn controller_generation_id(&self) -> &str {
+        self.controller_generation_id
+            .as_deref()
+            .expect("ordinary Database always has a fresh controller generation")
+    }
+}
 
-    /// Explicitly import one legacy JSON document. Ordinary open never calls
-    /// this method and therefore never lets JSON override SQLite authority.
-    pub fn migrate_legacy_json(&mut self, bytes: &[u8]) -> StorageResult<InstallDisposition> {
+impl OfflineDatabase {
+    /// Import one legacy JSON document in one immediate transaction, then
+    /// consume the offline handle into the ordinary writable Database type.
+    pub fn migrate_legacy_json(mut self, bytes: &[u8]) -> StorageResult<Database> {
         let input = parse_legacy_authority(bytes)?;
-        if load_current_authority(self.connection())
-            .map_err(map_host_authority_error)?
-            .is_some()
-        {
+        if self.database.authority_identity.is_some() {
             return Err(StorageError::MigrationRequired);
         }
-
-        let identity = input.identity.clone();
+        let controller_generation_id = mint_controller_generation_id()?;
+        let identity_lock = acquire_identity_lock(&input.identity)?;
+        verify_or_write_lock_owner(&identity_lock, &input.identity, &controller_generation_id)?;
         let tx = self
+            .database
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
         let disposition = install_host_authority_revision_in_transaction(&tx, &input)
             .map_err(map_host_authority_error)?;
+        tx.execute(
+            "UPDATE core_meta SET controller_generation_id = ?1 WHERE singleton = 1",
+            [&controller_generation_id],
+        )
+        .map_err(map_sqlite_error)?;
         tx.commit().map_err(map_sqlite_error)?;
-        self.authority_identity = Some(identity);
-        Ok(disposition)
+        let _ = disposition;
+        verify_or_write_lock_owner(
+            &self.database.path_lock,
+            &input.identity,
+            &controller_generation_id,
+        )?;
+        self.database.identity_lock = Some(identity_lock);
+        self.database.authority_identity = Some(input.identity);
+        self.database.controller_generation_id = Some(controller_generation_id);
+        Ok(self.database)
     }
+    /// Install an already validated Host producer revision while the
+    /// database is still in the explicit offline bootstrap mode.
+    pub fn install_host_authority_revision(
+        self,
+        input: HostAuthorityRevision,
+    ) -> StorageResult<Database> {
+        #[derive(Serialize)]
+        struct LegacyAuthorityEnvelope<'a> {
+            schema: &'static str,
+            identity: &'a RuntimeAuthorityIdentity,
+            mapping: &'a ConfigRevisionMapping,
+            premise: &'a Option<ModuleActivationPremises>,
+        }
+        let envelope = LegacyAuthorityEnvelope {
+            schema: "dolly.legacy-runtime-authority/v0",
+            identity: &input.identity,
+            mapping: &input.mapping,
+            premise: &input.premise,
+        };
+        let bytes = serde_json::to_vec(&envelope).map_err(|_| StorageError::Corrupt)?;
+        self.migrate_legacy_json(&bytes)
+    }
+}
+
+fn open_internal(
+    db_path: &Path,
+    attestation: &ReleaseAttestation,
+    offline: bool,
+) -> StorageResult<Database> {
+    reject_symlink_components(db_path)?;
+    let path_lock_path = instance_lock_path(db_path);
+    reject_symlink_components(&path_lock_path)?;
+
+    // The build gate runs before creating either lock. A normal writable open
+    // also performs a read-only identity preflight before acquiring them.
+    let loaded = probe_loaded_sqlite();
+    let verified = SqliteBuildGate.verify(attestation, &loaded)?;
+    let expected_identity = read_persisted_identity(db_path)?;
+    if !offline && expected_identity.is_none() {
+        return Err(StorageError::MigrationRequired);
+    }
+    let controller_generation_id = if !offline && expected_identity.is_some() {
+        Some(mint_controller_generation_id()?)
+    } else {
+        expected_identity
+            .as_ref()
+            .map(|(_, generation)| generation.clone())
+    };
+
+    let identity_lock = expected_identity
+        .as_ref()
+        .map(|(identity, _)| acquire_identity_lock(identity))
+        .transpose()?;
+    let path_lock = acquire_lock_file(&path_lock_path)?;
+    if let Some((identity, _)) = expected_identity.as_ref() {
+        let generation = controller_generation_id
+            .as_deref()
+            .ok_or(StorageError::Corrupt)?;
+        if let Some(lock) = identity_lock.as_ref() {
+            verify_or_write_lock_owner(lock, identity, generation)?;
+        }
+        verify_or_write_lock_owner(&path_lock, identity, generation)?;
+    } else if lock_owner(&path_lock)?.is_some() {
+        return Err(StorageError::Corrupt);
+    }
+
+    let mut connection = open_connection(db_path)?;
+    let configuration = apply_and_verify_configuration(&connection)?;
+    let schema_version = ensure_schema(&connection, &verified)?;
+    verify_sqlite_integrity(&connection)?;
+    let authority_identity = validate_authority_state(&connection)?;
+    let persisted_generation = read_controller_generation(&connection)?;
+    if authority_identity
+        != expected_identity
+            .as_ref()
+            .map(|(identity, _)| identity.clone())
+        || persisted_generation
+            != expected_identity
+                .as_ref()
+                .map(|(_, generation)| generation.clone())
+    {
+        return Err(StorageError::Corrupt);
+    }
+    if !offline && authority_identity.is_none() {
+        return Err(StorageError::MigrationRequired);
+    }
+    if !offline {
+        let fresh_generation = controller_generation_id
+            .as_deref()
+            .ok_or(StorageError::Corrupt)?;
+        refresh_controller_generation(&mut connection, fresh_generation)?;
+    }
+
+    Ok(Database {
+        connection,
+        path_lock,
+        identity_lock,
+        verified,
+        configuration,
+        schema_version,
+        authority_identity,
+        controller_generation_id,
+    })
+}
+
+fn read_persisted_identity(
+    db_path: &Path,
+) -> StorageResult<Option<(RuntimeAuthorityIdentity, String)>> {
+    let metadata = match fs::metadata(db_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(StorageError::UnsafeConfiguration),
+    };
+    if metadata.len() == 0 {
+        return Ok(None);
+    }
+
+    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| StorageError::MigrationRequired)?;
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|_| StorageError::MigrationRequired)?;
+    if user_version != SCHEMA_VERSION {
+        return Err(StorageError::MigrationRequired);
+    }
+
+    let core_identity: Option<(Option<String>, Option<String>, Option<String>)> = connection
+        .query_row(
+            "SELECT daemon_installation_id, instance_id, controller_generation_id
+             FROM core_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|_| StorageError::MigrationRequired)?;
+    let Some((daemon, instance, generation)) = core_identity else {
+        return Err(StorageError::MigrationRequired);
+    };
+    let (core, generation) = match (daemon, instance, generation) {
+        (Some(daemon_installation_id), Some(instance_id), Some(generation))
+            if !generation.is_empty() =>
+        {
+            (
+                RuntimeAuthorityIdentity {
+                    daemon_installation_id,
+                    instance_id,
+                },
+                generation,
+            )
+        }
+        (None, None, None) => return Ok(None),
+        _ => return Err(StorageError::Corrupt),
+    };
+    let state_identity: Option<(String, String)> = connection
+        .query_row(
+            "SELECT daemon_installation_id, instance_id
+             FROM runtime_authority_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|_| StorageError::Corrupt)?;
+    let Some((state_daemon, state_instance)) = state_identity else {
+        return Err(StorageError::Corrupt);
+    };
+    if core.daemon_installation_id != state_daemon || core.instance_id != state_instance {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(Some((core, generation)))
+}
+fn read_controller_generation(connection: &Connection) -> StorageResult<Option<String>> {
+    connection
+        .query_row(
+            "SELECT controller_generation_id FROM core_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)
+        .and_then(|generation: Option<Option<String>>| match generation {
+            Some(Some(generation)) if !generation.is_empty() => Ok(Some(generation)),
+            Some(None) => Ok(None),
+            None => Err(StorageError::Corrupt),
+            Some(Some(_)) => Err(StorageError::Corrupt),
+        })
+}
+
+fn refresh_controller_generation(
+    connection: &mut Connection,
+    generation: &str,
+) -> StorageResult<()> {
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sqlite_error)?;
+    tx.execute(
+        "UPDATE core_meta SET controller_generation_id = ?1 WHERE singleton = 1",
+        [generation],
+    )
+    .map_err(map_sqlite_error)?;
+    tx.commit().map_err(map_sqlite_error)
+}
+
+fn mint_controller_generation_id() -> StorageResult<String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| StorageError::UnsafeConfiguration)?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    ))
 }
 
 /// Read the loaded SQLite library identity from FFI (REQ-TECH-003 probe).
@@ -299,23 +553,19 @@ fn reject_symlink_components(path: &Path) -> StorageResult<()> {
     Ok(())
 }
 
-fn acquire_instance_lock(db_path: &Path) -> StorageResult<File> {
-    let lock_path = instance_lock_path(db_path);
+fn acquire_lock_file(lock_path: &Path) -> StorageResult<File> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        // Reusable lock file: create if absent, O_NOFOLLOW refuses a
-        // pre-existing symlink atomically; exclusivity comes from flock.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&lock_path)
+            .open(lock_path)
             .map_err(map_io_error)?;
         try_lock_exclusive(&file)?;
-        // The open may have raced a replacement; confirm what we hold.
         let meta = file.metadata().map_err(map_io_error)?;
         if !meta.is_file() {
             return Err(StorageError::UnsafeConfiguration);
@@ -325,11 +575,85 @@ fn acquire_instance_lock(db_path: &Path) -> StorageResult<File> {
     }
     #[cfg(not(unix))]
     {
-        // No advisory-exclusive lock primitive on this platform in this crate
-        // yet; refuse to open for writing rather than risk a second writer.
-        let _ = &lock_path;
+        let _ = lock_path;
         Err(StorageError::UnsafeConfiguration)
     }
+}
+
+fn acquire_identity_lock(identity: &RuntimeAuthorityIdentity) -> StorageResult<File> {
+    let lock_path = identity_lock_path(identity);
+    reject_symlink_components(&lock_path)?;
+    acquire_lock_file(&lock_path)
+}
+
+fn identity_lock_path(identity: &RuntimeAuthorityIdentity) -> PathBuf {
+    let digest = canonicalize(identity)
+        .expect("runtime identity is canonical JSON")
+        .1
+        .to_string()
+        .replace(':', "-");
+    #[cfg(test)]
+    let test_suffix = format!(
+        "-{}",
+        TEST_IDENTITY_LOCK_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    #[cfg(not(test))]
+    let test_suffix = String::new();
+    std::env::temp_dir().join(format!(
+        "dolly-runtime-controller-{digest}{test_suffix}.lock"
+    ))
+}
+
+fn lock_owner(file: &File) -> StorageResult<Option<ControllerLockOwner>> {
+    let mut clone = file.try_clone().map_err(map_io_error)?;
+    clone.seek(SeekFrom::Start(0)).map_err(map_io_error)?;
+    let mut bytes = Vec::new();
+    clone.read_to_end(&mut bytes).map_err(map_io_error)?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| StorageError::Corrupt)?;
+    if value.get("controller_generation_id").is_some() {
+        serde_json::from_value(value)
+            .map(Some)
+            .map_err(|_| StorageError::Corrupt)
+    } else {
+        let identity: RuntimeAuthorityIdentity =
+            serde_json::from_value(value).map_err(|_| StorageError::Corrupt)?;
+        Ok(Some(ControllerLockOwner {
+            daemon_installation_id: identity.daemon_installation_id,
+            instance_id: identity.instance_id,
+            controller_generation_id: String::new(),
+        }))
+    }
+}
+
+fn verify_or_write_lock_owner(
+    file: &File,
+    expected: &RuntimeAuthorityIdentity,
+    generation: &str,
+) -> StorageResult<()> {
+    if let Some(owner) = lock_owner(file)? {
+        if owner.daemon_installation_id != expected.daemon_installation_id
+            || owner.instance_id != expected.instance_id
+        {
+            return Err(StorageError::Corrupt);
+        }
+    }
+    let mut clone = file.try_clone().map_err(map_io_error)?;
+    clone.set_len(0).map_err(map_io_error)?;
+    clone.seek(SeekFrom::Start(0)).map_err(map_io_error)?;
+    let owner = ControllerLockOwner {
+        daemon_installation_id: expected.daemon_installation_id.clone(),
+        instance_id: expected.instance_id.clone(),
+        controller_generation_id: generation.to_string(),
+    };
+    let bytes = serde_json::to_vec(&owner).map_err(|_| StorageError::Corrupt)?;
+    clone.write_all(&bytes).map_err(map_io_error)?;
+    clone.write_all(b"\n").map_err(map_io_error)?;
+    clone.sync_data().map_err(map_io_error)?;
+    Ok(())
 }
 
 /// The instance lock file lives beside the database, one per storage root
@@ -416,6 +740,7 @@ fn ensure_schema(connection: &Connection, verified: &VerifiedSqliteBuild) -> Sto
                 schema_version INTEGER NOT NULL,
                 daemon_installation_id TEXT,
                 instance_id TEXT,
+                controller_generation_id TEXT,
                 clean_shutdown INTEGER NOT NULL CHECK (clean_shutdown IN (0, 1)),
                 sqlite_version_number INTEGER NOT NULL,
                 sqlite_source_id TEXT NOT NULL,
@@ -432,9 +757,9 @@ fn ensure_schema(connection: &Connection, verified: &VerifiedSqliteBuild) -> Sto
         tx.execute(
             "INSERT INTO core_meta (
                 singleton, schema_version, daemon_installation_id, instance_id,
-                clean_shutdown, sqlite_version_number, sqlite_source_id,
-                sqlite_artifact_digest
-             ) VALUES (1, ?1, NULL, NULL, 0, ?2, ?3, ?4)",
+                controller_generation_id, clean_shutdown, sqlite_version_number,
+                sqlite_source_id, sqlite_artifact_digest
+             ) VALUES (1, ?1, NULL, NULL, NULL, 0, ?2, ?3, ?4)",
             rusqlite::params![
                 SCHEMA_VERSION,
                 verified.version_number as i64,
@@ -462,6 +787,7 @@ fn ensure_schema(connection: &Connection, verified: &VerifiedSqliteBuild) -> Sto
         "schema_version",
         "daemon_installation_id",
         "instance_id",
+        "controller_generation_id",
         "clean_shutdown",
         "sqlite_version_number",
         "sqlite_source_id",
@@ -682,7 +1008,10 @@ fn parse_legacy_authority(bytes: &[u8]) -> StorageResult<HostAuthorityRevision> 
             premise.premises_digest = canonical_digest_without(&premise, "premises_digest")?;
             Some(premise)
         }
-        None if !config.permission_policy_selections.is_empty() => {
+        None if !config.permission_policy_selections.is_empty()
+            || !legacy.permission_policy_definitions.is_empty()
+            || !legacy.permission_policy_backend_bindings.is_empty() =>
+        {
             return Err(StorageError::Corrupt);
         }
         None => None,

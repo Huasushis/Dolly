@@ -1436,8 +1436,7 @@ mod tests {
     use crate::host_authority::{
         ConfigRevisionMapping, HostAuthorityRevision, InstalledComponentOrigin,
         LinuxServiceCandidate, ModuleActivationPremises, ResolvedConfiguration,
-        RuntimeAuthorityIdentity, create_host_authority_schema, install_host_authority_revision,
-        load_current_authority,
+        RuntimeAuthorityIdentity, install_host_authority_revision, load_current_authority,
     };
     use crate::linux_host_verification::test_proof_for_authority;
     use crate::mcp_readiness::{
@@ -1631,9 +1630,10 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let directory = tempdir().unwrap();
-            let mut db = Database::open(&directory.path().join("authority.sqlite")).unwrap();
-            create_host_authority_schema(db.connection()).unwrap();
-            install_host_authority_revision(&mut db, host_revision(1, tool_broker_config()))
+            let path = directory.path().join("authority.sqlite");
+            let mut db = Database::open_for_migration(&path)
+                .unwrap()
+                .install_host_authority_revision(host_revision(1, tool_broker_config()))
                 .unwrap();
             let snapshot = load_current_authority(db.connection()).unwrap().unwrap();
             let proof = test_proof_for_authority(&snapshot);

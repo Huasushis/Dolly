@@ -21,6 +21,36 @@ fn temp_db() -> (tempfile::TempDir, PathBuf) {
     let path = dir.path().join("instance.sqlite");
     (dir, path)
 }
+fn instance_id(path: &Path) -> String {
+    let name = path
+        .parent()
+        .and_then(Path::file_name)
+        .expect("temp directory name")
+        .to_string_lossy()
+        .replace('.', "d")
+        .to_ascii_lowercase();
+    format!("instance-{name}")
+}
+
+fn legacy_json(path: &Path) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema": "dolly.legacy-runtime-config/v0",
+        "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000001",
+        "instance_id": instance_id(path),
+        "config_revision": 1,
+        "runtime_config": {"modules": []},
+        "permission_policy_selections": [],
+        "service_candidate": null
+    }))
+    .unwrap()
+}
+
+fn open_migrated(path: &Path) -> Database {
+    Database::open_for_migration(path)
+        .unwrap()
+        .migrate_legacy_json(&legacy_json(path))
+        .unwrap()
+}
 
 // ---------------------------------------------------------------------------
 // REQ-TECH-003: runtime identity
@@ -86,7 +116,7 @@ fn compile_options_probe_and_gate() {
 #[test]
 fn open_initializes_and_sets_required_pragmas() {
     let (_dir, path) = temp_db();
-    let db = Database::open(&path).expect("open fresh instance");
+    let db = open_migrated(&path);
     assert_eq!(db.schema_version(), SCHEMA_VERSION);
 
     let journal_mode: String = db
@@ -118,7 +148,7 @@ fn open_initializes_and_sets_required_pragmas() {
 fn wal_persists_across_reopen() {
     let (_dir, path) = temp_db();
     {
-        let db = Database::open(&path).expect("first open");
+        let db = open_migrated(&path);
         let journal_mode: String = db
             .connection()
             .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
@@ -140,7 +170,7 @@ fn wal_persists_across_reopen() {
 fn newer_schema_is_migration_required() {
     let (_dir, path) = temp_db();
     {
-        let db = Database::open(&path).expect("open fresh");
+        let db = open_migrated(&path);
         db.connection()
             .execute(
                 "UPDATE core_meta SET schema_version = ?1 WHERE singleton = 1",
@@ -166,7 +196,7 @@ fn newer_schema_is_migration_required() {
 #[test]
 fn instance_lock_contention_and_release() {
     let (_dir, path) = temp_db();
-    let first = Database::open(&path).expect("first open holds lock");
+    let first = open_migrated(&path);
     let contended = Database::open(&path).expect_err("second open contends");
     assert!(matches!(contended, StorageError::InstanceLocked));
     drop(first);
@@ -255,6 +285,6 @@ fn unsafe_build_refused_before_any_write() {
 
     // The refused open must never have run migration: opening afterwards with
     // the true credentials yields an untouched fresh instance.
-    let db = Database::open(&path).expect("true attestation still opens");
+    let db = open_migrated(&path);
     assert_eq!(db.schema_version(), SCHEMA_VERSION);
 }

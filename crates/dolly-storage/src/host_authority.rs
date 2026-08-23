@@ -16,7 +16,7 @@ use dolly_canonical_json::{
     CanonicalJsonValue, MAX_SEMANTIC_JSON_NESTING_DEPTH, ParseLimits, Sha256Digest, canonicalize,
     deserialize_core_json,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -344,12 +344,13 @@ pub fn install_host_authority_revision(
     // verify every canonical row before allowing it to return Reused.
     let _ = load_current_authority(db.connection())?;
 
-    let tx = db.connection_mut().transaction()?;
+    let tx = db
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let disposition = install_host_authority_revision_in_transaction(&tx, &input)?;
     tx.commit()?;
     Ok(disposition)
 }
-
 /// Shared transaction body used by normal installs and explicit legacy
 /// migration. It is deliberately crate-private: callers cannot publish a
 /// pointer without the Database controller lock and open-time gate.

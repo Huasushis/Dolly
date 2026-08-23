@@ -183,7 +183,33 @@ fn authorized_record(
 
 fn open_db(dir: &std::path::Path) -> Database {
     let path = dir.join("instance.sqlite");
-    let db = Database::open(&path).expect("open real bundled SQLite");
+    if path.exists() {
+        let db = Database::open(&path).expect("reopen real bundled SQLite");
+        create_tool_ledger_schema(db.connection()).expect("authoritative ledger schema");
+        return db;
+    }
+    let instance_id = format!(
+        "instance-{}",
+        dir.file_name()
+            .expect("temp directory name")
+            .to_string_lossy()
+            .replace('.', "d")
+            .to_ascii_lowercase()
+    );
+    let legacy = serde_json::to_vec(&json!({
+        "schema": "dolly.legacy-runtime-config/v0",
+        "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000001",
+        "instance_id": instance_id,
+        "config_revision": 1,
+        "runtime_config": {"modules": []},
+        "permission_policy_selections": [],
+        "service_candidate": null
+    }))
+    .unwrap();
+    let db = Database::open_for_migration(&path)
+        .unwrap()
+        .migrate_legacy_json(&legacy)
+        .expect("explicit offline initialization");
     create_tool_ledger_schema(db.connection()).expect("authoritative ledger schema");
     db
 }

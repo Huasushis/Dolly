@@ -1248,7 +1248,7 @@ mod tests {
     use crate::host_authority::{
         ConfigRevisionMapping, HostAuthorityRevision, InstalledComponentOrigin,
         LinuxServiceCandidate, ModuleActivationPremises, ResolvedConfiguration,
-        RuntimeAuthorityIdentity, create_host_authority_schema, install_host_authority_revision,
+        RuntimeAuthorityIdentity,
     };
     use crate::linux_host_verification::{LinuxHostVerificationCode, test_proof_for_authority};
     use dolly_canonical_json::canonicalize;
@@ -1426,9 +1426,10 @@ mod tests {
     fn durable_database() -> (TempDir, Database, CurrentAuthoritySnapshot) {
         let directory = tempdir().unwrap();
         let path = directory.path().join("runtime.sqlite3");
-        let mut db = Database::open(&path).unwrap();
-        create_host_authority_schema(db.connection()).unwrap();
-        install_host_authority_revision(&mut db, authority_revision()).unwrap();
+        let db = Database::open_for_migration(&path)
+            .unwrap()
+            .install_host_authority_revision(authority_revision())
+            .unwrap();
         let snapshot = load_current_authority(db.connection()).unwrap().unwrap();
         (directory, db, snapshot)
     }

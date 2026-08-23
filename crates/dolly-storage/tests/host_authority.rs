@@ -5,7 +5,7 @@ use dolly_storage::host_authority::{
     InstalledComponentOrigin, LinuxServiceCandidate, ModuleActivationPremises,
     PermissionPolicyBackendBinding, PermissionPolicyDefinition, PermissionPolicySelection,
     PolicyDefinitionOrigin, ResolvedConfiguration, RuntimeAuthorityIdentity,
-    create_host_authority_schema, install_host_authority_revision, load_current_authority,
+    install_host_authority_revision, load_current_authority,
 };
 use rusqlite::params;
 use serde_json::{Value, json};
@@ -140,22 +140,45 @@ fn revision() -> HostAuthorityRevision {
         premise: Some(premise),
     }
 }
+fn revision_for(path: &std::path::Path) -> HostAuthorityRevision {
+    let mut input = revision();
+    let instance_id = format!(
+        "instance-{}",
+        path.parent()
+            .and_then(std::path::Path::file_name)
+            .expect("temp directory name")
+            .to_string_lossy()
+            .replace('.', "d")
+            .to_ascii_lowercase()
+    );
+    input.identity.instance_id = instance_id.clone();
+    input.mapping.instance_id = instance_id.clone();
+    if let Some(premise) = input.premise.as_mut() {
+        premise.instance_id = instance_id;
+        let value = serde_json::to_value(&*premise).unwrap();
+        premise.premises_digest = digest(&without(&value, "premises_digest"));
+    }
+    input
+}
+fn bootstrap(path: &std::path::Path, input: HostAuthorityRevision) -> Database {
+    Database::open_for_migration(path)
+        .unwrap()
+        .install_host_authority_revision(input)
+        .unwrap()
+}
 
 #[test]
 fn durable_premise_survives_reopen() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("runtime.sqlite3");
-    let mut db = Database::open(&path).unwrap();
-    create_host_authority_schema(db.connection_mut()).unwrap();
-    let input = revision();
+    let input = revision_for(&path);
     let expected_digest = input.premise.as_ref().unwrap().premises_digest.clone();
-    install_host_authority_revision(&mut db, input.clone()).unwrap();
+    let db = bootstrap(&path, input.clone());
     let current = load_current_authority(db.connection()).unwrap().unwrap();
     assert_eq!(current.mapping.config_revision, 1);
     assert_eq!(current.premise.unwrap().premises_digest, expected_digest);
     drop(db);
-    let mut reopened = Database::open(&path).unwrap();
-    create_host_authority_schema(reopened.connection_mut()).unwrap();
+    let reopened = Database::open(&path).unwrap();
     let loaded = load_current_authority(reopened.connection())
         .unwrap()
         .unwrap();
@@ -166,10 +189,8 @@ fn durable_premise_survives_reopen() {
 fn changed_bytes_at_same_revision_are_rejected_without_mutation() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("runtime.sqlite3");
-    let mut db = Database::open(&path).unwrap();
-    create_host_authority_schema(db.connection_mut()).unwrap();
-    let input = revision();
-    install_host_authority_revision(&mut db, input.clone()).unwrap();
+    let input = revision_for(&path);
+    let mut db = bootstrap(&path, input.clone());
     let mut conflicting = input;
     conflicting.mapping.canonical_config.runtime_config =
         CanonicalJsonValue::try_from(json!({"modules": ["changed"]})).unwrap();
@@ -189,12 +210,11 @@ fn changed_bytes_at_same_revision_are_rejected_without_mutation() {
 fn equal_current_revision_is_reused_without_new_authority_rows() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("runtime.sqlite3");
-    let mut db = Database::open(&path).unwrap();
-    create_host_authority_schema(db.connection_mut()).unwrap();
-    let input = revision();
+    let input = revision_for(&path);
+    let mut db = bootstrap(&path, input.clone());
     assert!(matches!(
         install_host_authority_revision(&mut db, input.clone()).unwrap(),
-        InstallDisposition::Committed { config_revision: 1 }
+        InstallDisposition::Reused { config_revision: 1 }
     ));
     assert!(matches!(
         install_host_authority_revision(&mut db, input).unwrap(),
@@ -206,9 +226,7 @@ fn equal_current_revision_is_reused_without_new_authority_rows() {
 fn canonical_projection_tampering_is_rejected_on_read() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("runtime.sqlite3");
-    let mut db = Database::open(&path).unwrap();
-    create_host_authority_schema(db.connection_mut()).unwrap();
-    install_host_authority_revision(&mut db, revision()).unwrap();
+    let mut db = bootstrap(&path, revision_for(&path));
     db.connection_mut()
         .execute(
             "UPDATE permission_policy_definitions SET record_jcs = ?1 WHERE policy_id = 'default-tools'",
@@ -222,8 +240,6 @@ fn canonical_projection_tampering_is_rejected_on_read() {
 fn configuration_without_host_prerequisites_has_no_premise() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("runtime.sqlite3");
-    let mut db = Database::open(&path).unwrap();
-    create_host_authority_schema(db.connection_mut()).unwrap();
     let config = ResolvedConfiguration {
         runtime_config: CanonicalJsonValue::try_from(json!({"modules": []})).unwrap(),
         permission_policy_selections: Vec::new(),
@@ -246,7 +262,7 @@ fn configuration_without_host_prerequisites_has_no_premise() {
         },
         premise: None,
     };
-    install_host_authority_revision(&mut db, input).unwrap();
+    let db = bootstrap(&path, input);
     assert!(
         load_current_authority(db.connection())
             .unwrap()
@@ -260,13 +276,11 @@ fn configuration_without_host_prerequisites_has_no_premise() {
 fn orphan_next_revision_mapping_identity_is_rejected_before_pointer_publish() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("runtime.sqlite3");
-    let mut db = Database::open(&path).unwrap();
-    create_host_authority_schema(db.connection_mut()).unwrap();
-    let first = revision();
-    install_host_authority_revision(&mut db, first.clone()).unwrap();
+    let first = revision_for(&path);
+    let mut db = bootstrap(&path, first.clone());
     let prior = load_current_authority(db.connection()).unwrap().unwrap();
 
-    let mut incoming = revision();
+    let mut incoming = revision_for(&path);
     incoming.mapping.config_revision = 2;
     let premise = incoming.premise.as_mut().unwrap();
     premise.config_revision = 2;

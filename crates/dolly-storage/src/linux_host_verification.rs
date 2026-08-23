@@ -1474,8 +1474,7 @@ mod tests {
     use super::*;
     use crate::host_authority::{
         ConfigRevisionMapping, HostAuthorityRevision, ModuleActivationPremises,
-        ResolvedConfiguration, RuntimeAuthorityIdentity, create_host_authority_schema,
-        install_host_authority_revision,
+        ResolvedConfiguration, RuntimeAuthorityIdentity,
     };
     use dolly_canonical_json::CanonicalJsonValue;
     use serde_json::{Value, json};
@@ -1603,21 +1602,18 @@ mod tests {
     fn durable_database() -> (TempDir, crate::Database) {
         let directory = tempdir().unwrap();
         let path = directory.path().join("runtime.sqlite3");
-        let mut db = crate::Database::open(&path).unwrap();
-        create_host_authority_schema(db.connection()).unwrap();
         let snapshot = authority();
-        install_host_authority_revision(
-            &mut db,
-            HostAuthorityRevision {
+        let db = crate::Database::open_for_migration(&path)
+            .unwrap()
+            .install_host_authority_revision(HostAuthorityRevision {
                 identity: RuntimeAuthorityIdentity {
                     daemon_installation_id: snapshot.mapping.daemon_installation_id.clone(),
                     instance_id: snapshot.mapping.instance_id.clone(),
                 },
                 mapping: snapshot.mapping,
                 premise: snapshot.premise,
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         (directory, db)
     }
 

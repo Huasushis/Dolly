@@ -3,7 +3,7 @@ use dolly_storage::Database;
 use dolly_storage::host_authority::{
     ConfigRevisionMapping, HostAuthorityRevision, InstalledComponentOrigin, LinuxServiceCandidate,
     ModuleActivationPremises, ResolvedConfiguration, RuntimeAuthorityIdentity,
-    create_host_authority_schema, install_host_authority_revision,
+    create_host_authority_schema,
 };
 use dolly_storage::linux_host_verification::{
     LinuxHostVerificationCode, verify_current_linux_host,
@@ -76,21 +76,18 @@ fn authority() -> dolly_storage::host_authority::CurrentAuthoritySnapshot {
 fn durable_database() -> (TempDir, Database) {
     let directory = tempdir().unwrap();
     let path = directory.path().join("runtime.sqlite3");
-    let mut db = Database::open(&path).unwrap();
-    create_host_authority_schema(db.connection()).unwrap();
     let snapshot = authority();
-    install_host_authority_revision(
-        &mut db,
-        HostAuthorityRevision {
+    let db = Database::open_for_migration(&path)
+        .unwrap()
+        .install_host_authority_revision(HostAuthorityRevision {
             identity: RuntimeAuthorityIdentity {
                 daemon_installation_id: snapshot.mapping.daemon_installation_id.clone(),
                 instance_id: snapshot.mapping.instance_id.clone(),
             },
             mapping: snapshot.mapping,
             premise: snapshot.premise,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     (directory, db)
 }
 

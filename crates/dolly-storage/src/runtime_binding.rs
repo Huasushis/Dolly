@@ -1327,7 +1327,6 @@ mod tests {
     use crate::host_authority::{
         ConfigRevisionMapping, HostAuthorityRevision, LinuxServiceCandidate,
         ModuleActivationPremises, ResolvedConfiguration, RuntimeAuthorityIdentity,
-        create_host_authority_schema, install_host_authority_revision,
     };
     use crate::linux_host_verification::test_proof_for_authority;
     use dolly_canonical_json::CanonicalJsonValue;
@@ -1408,9 +1407,9 @@ mod tests {
     ) -> (TempDir, Database, CurrentAuthoritySnapshot) {
         let directory = tempdir().unwrap();
         let path = directory.path().join("runtime.sqlite3");
-        let mut db = Database::open(&path).unwrap();
-        create_host_authority_schema(db.connection()).unwrap();
-        install_host_authority_revision(&mut db, authority_revision(instance_id, with_premise))
+        let db = Database::open_for_migration(&path)
+            .unwrap()
+            .install_host_authority_revision(authority_revision(instance_id, with_premise))
             .unwrap();
         let snapshot = load_authority(db.connection()).unwrap();
         (directory, db, snapshot)
