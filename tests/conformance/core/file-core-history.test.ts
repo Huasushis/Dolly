@@ -5,8 +5,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import {
+  createFileCoreHistoryStore,
   FileCoreHistoryError,
   FileCoreHistoryStore,
+  mintFileCoreHistoryProducerCapability,
   type FileCoreHistoryOptions,
 } from "../../../src/core/file-core-history.js";
 import {
@@ -122,8 +124,16 @@ describe("FileCore bounded global history", () => {
       maxEntries: 8,
       maxBytes: 64,
       maxReaders: 2,
-    })).toThrowError("producer capability");
-    database.close();
+    })).toThrowError("constructor requires the Runtime authority token");
+    const fakeCapability = { assertValid: () => undefined };
+    expect(() => createFileCoreHistoryStore(
+      database as never,
+      identity,
+      new FakeLock() as never,
+      { maxEntries: 8, maxBytes: 64, maxReaders: 2 },
+      fakeCapability,
+    )).toThrowError("not minted");
+    expect(() => mintFileCoreHistoryProducerCapability({})).toThrowError("requires RuntimeAuthorityDatabase");
   });
 
   it("requires Runtime-authority migration and exposes an explicit pre-migration gap", () => {

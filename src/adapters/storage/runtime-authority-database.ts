@@ -39,8 +39,10 @@ import {
   type JsonValue,
 } from "../../schema-bundle/index.js";
 import {
+  createFileCoreHistoryStore,
   FileCoreHistoryError,
   FileCoreHistoryReaderStore,
+  mintFileCoreHistoryProducerCapability,
   FileCoreHistoryStore,
   type FileCoreHistoryOptions,
 } from "../../core/file-core-history.js";
@@ -687,7 +689,7 @@ export class RuntimeAuthorityDatabase {
   openFileCoreHistory(options: FileCoreHistoryOptions): FileCoreHistoryStore {
     this.#requireOpen();
     this.#requireLockHeld();
-    return FileCoreHistoryStore.openForRuntimeAuthority(
+    return createFileCoreHistoryStore(
       this.#connection,
       this.#identity,
       this.#lock,
@@ -763,7 +765,7 @@ export class RuntimeAuthorityDatabase {
       }
       const producerId = `filecore-${this.#identity.instanceId}`;
       const producerEpoch = `${input.expectedAuthority.revision}:${input.expectedAuthority.digest}`;
-      migrated = FileCoreHistoryStore.migrateForRuntimeAuthority(
+      migrated = createFileCoreHistoryStore(
         this.#connection,
         this.#identity,
         this.#lock,
@@ -777,6 +779,7 @@ export class RuntimeAuthorityDatabase {
           legacySourceDigest: input.legacySourceDigest,
         },
         this.#fileCoreHistoryProducerCapability(),
+        true,
       );
     });
     if (migrated === undefined) throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", "history migration returned no store");
@@ -798,14 +801,8 @@ export class RuntimeAuthorityDatabase {
     }
   }
 
-
-  #fileCoreHistoryProducerCapability(): { readonly assertValid: () => void } {
-    return {
-      assertValid: () => {
-        this.#requireOpen();
-        this.#requireLockHeld();
-      },
-    };
+  #fileCoreHistoryProducerCapability() {
+    return mintFileCoreHistoryProducerCapability(this);
   }
   #inFileCoreHistoryMigrationTransaction(work: () => void): void {
     this.#statement("BEGIN IMMEDIATE").run();

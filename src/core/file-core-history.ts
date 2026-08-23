@@ -5,9 +5,10 @@ import {
   parseCanonicalJsonBytes,
   type JsonValue,
 } from "../schema-bundle/index.js";
-import type {
-  RuntimeAuthorityIdentity,
-  RuntimeAuthorityLockHandle,
+import {
+  RuntimeAuthorityDatabase,
+  type RuntimeAuthorityIdentity,
+  type RuntimeAuthorityLockHandle,
 } from "../adapters/storage/runtime-authority-database.js";
 
 export const FILECORE_GLOBAL_HISTORY_ID = "filecore-global" as const;
@@ -375,6 +376,43 @@ const READER_KEYS = [
 ] as const;
 
 const FILECORE_HISTORY_MIGRATION_TOKEN = Symbol("filecore-history-migration");
+const FILECORE_HISTORY_CONSTRUCTION_TOKEN = Symbol("filecore-history-construction");
+const RUNTIME_PRODUCER_CAPABILITIES = new WeakSet<object>();
+
+export function mintFileCoreHistoryProducerCapability(authority: unknown) {
+  if (!(authority instanceof RuntimeAuthorityDatabase)) {
+    throw new TypeError("FileCore history producer capability requires RuntimeAuthorityDatabase");
+  }
+  const capability: FileCoreHistoryProducerCapability = {
+    assertValid: () => {
+      if (!authority.isOpen) throw new FileCoreHistoryError("HISTORY_PRODUCER_FENCED", "Runtime authority database is closed");
+    },
+  };
+  RUNTIME_PRODUCER_CAPABILITIES.add(capability);
+  return capability;
+}
+
+export function createFileCoreHistoryStore(
+  connection: FileCoreHistorySqliteConnection,
+  identity: RuntimeAuthorityIdentity,
+  lock: RuntimeAuthorityLockHandle,
+  options: FileCoreHistoryOptions | FileCoreHistoryMigrationOptions,
+  producerCapability: FileCoreHistoryProducerCapability,
+  migrate = false,
+): FileCoreHistoryStore {
+  if (!RUNTIME_PRODUCER_CAPABILITIES.has(producerCapability)) {
+    throw new TypeError("FileCore history producer capability was not minted by RuntimeAuthorityDatabase");
+  }
+  return new FileCoreHistoryStore(
+    connection,
+    identity,
+    lock,
+    options,
+    producerCapability,
+    FILECORE_HISTORY_CONSTRUCTION_TOKEN,
+    migrate ? FILECORE_HISTORY_MIGRATION_TOKEN : undefined,
+  );
+}
 
 export class FileCoreHistoryStore {
   readonly #connection: FileCoreHistorySqliteConnection;
@@ -384,18 +422,22 @@ export class FileCoreHistoryStore {
   #producerId: string;
   #producerEpoch: string;
   readonly #now: () => string;
-  private constructor(
+  constructor(
     connection: FileCoreHistorySqliteConnection,
     identity: RuntimeAuthorityIdentity,
     lock: RuntimeAuthorityLockHandle,
-    options: FileCoreHistoryOptions,
+    options: FileCoreHistoryOptions | FileCoreHistoryMigrationOptions,
     producerCapability: FileCoreHistoryProducerCapability,
+    constructionToken: symbol,
     migrationToken?: symbol,
   ) {
     this.#connection = connection;
     this.#identity = { ...identity };
     this.#lock = lock;
     this.#producerCapability = producerCapability;
+    if (constructionToken !== FILECORE_HISTORY_CONSTRUCTION_TOKEN) {
+      throw new TypeError("FileCore history constructor requires the Runtime authority token");
+    }
     this.#producerId = "";
     this.#producerEpoch = "";
     this.#now = options.now ?? (() => new Date().toISOString());
@@ -413,27 +455,6 @@ export class FileCoreHistoryStore {
     }
   }
 
-  /** @internal RuntimeAuthorityDatabase-only producer factory. */
-  static openForRuntimeAuthority(
-    connection: FileCoreHistorySqliteConnection,
-    identity: RuntimeAuthorityIdentity,
-    lock: RuntimeAuthorityLockHandle,
-    options: FileCoreHistoryOptions,
-    producerCapability: FileCoreHistoryProducerCapability,
-  ): FileCoreHistoryStore {
-    return new FileCoreHistoryStore(connection, identity, lock, options, producerCapability);
-  }
-
-  /** @internal RuntimeAuthorityDatabase-only migration factory. */
-  static migrateForRuntimeAuthority(
-    connection: FileCoreHistorySqliteConnection,
-    identity: RuntimeAuthorityIdentity,
-    lock: RuntimeAuthorityLockHandle,
-    options: FileCoreHistoryMigrationOptions,
-    producerCapability: FileCoreHistoryProducerCapability,
-  ): FileCoreHistoryStore {
-    return new FileCoreHistoryStore(connection, identity, lock, options, producerCapability, FILECORE_HISTORY_MIGRATION_TOKEN);
-  }
 
   get identity(): RuntimeAuthorityIdentity {
     return { ...this.#identity };
