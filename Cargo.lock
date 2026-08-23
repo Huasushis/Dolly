@@ -238,6 +238,7 @@ name = "dolly-tool-coordinator"
 version = "0.1.0"
 dependencies = [
  "dolly-canonical-json",
+ "dolly-core-domain",
  "dolly-schema",
  "dolly-storage",
  "dolly-tool-broker",

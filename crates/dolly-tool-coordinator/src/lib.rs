@@ -2,12 +2,11 @@
 //! ledger (tool-broker §6, REQ-TOOL-002/006, INV-STORAGE-017).
 //!
 //! This crate composes the pure decision crate (`dolly-tool-broker`) with
-//! the authoritative ledger storage (`dolly-storage`) and nothing else. It
-//! owns no transport, Host, or network: the Host injects the readiness,
-//! clock, and zero-byte-proof facts through [`ports`], the storage database
-//! goes in through `dolly_storage::Database`, and a send permit comes out
-//! only after an unambiguous committed `AUTHORIZED -> DISPATCHED`
-//! compare-and-set.
+//! authoritative ledger storage (`dolly-storage`) and the private stdio MCP
+//! transport seam. It does not own Host startup or public activation: the Host
+//! supplies readiness, authority, clock, and zero-byte-proof facts through
+//! the existing ports, and a send permit comes out only after an unambiguous
+//! committed `AUTHORIZED -> DISPATCHED` compare-and-set.
 //!
 //! Surface:
 //! - [`dispatch_operation`] — orchestrate one row to its durable
@@ -24,6 +23,7 @@
 
 extern crate self as dolly_tool_coordinator;
 pub mod dispatch;
+mod mcp_stdio;
 pub mod permit;
 pub mod ports;
 pub mod recovery;
