@@ -8,6 +8,8 @@
 //! DISPATCHED` compare-and-set; stale/error/lost-ack/unknown observe no
 //! permit.
 
+use std::process::Child;
+
 use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
 use dolly_storage::mcp_readiness::McpTransportReadiness;
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
@@ -22,8 +24,9 @@ use dolly_tool_broker::{
     ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag,
 };
 use dolly_tool_coordinator::{
-    DispatchError, DispatchOutcome, FencedFactsProvider, HostMcpStdioInvocation,
-    RecoveryFactsProvider, RecoveryOutcome, ToolDispatchService, dispatch_operation,
+    DispatchError, DispatchOutcome, FencedFactsProvider, HostMcpStdioInstalledChildAttestation,
+    HostMcpStdioInvocation, HostMcpStdioProcessHandle, RecoveryFactsProvider, RecoveryOutcome,
+    StdioTransportError, StdioTransportLimits, ToolDispatchService, dispatch_operation,
     dispatch_operation_authorized, reopen_recovery,
 };
 use rusqlite::Connection;
@@ -765,6 +768,16 @@ fn authority_dispatch_requires_current_revalidation_api() {
         &ToolDispatchService,
         HostMcpStdioInvocation,
     ) -> Result<DispatchOutcome, DispatchError> = dispatch_operation_authorized;
+    let _mints_verified_handoff: fn(
+        Child,
+        HostMcpStdioInstalledChildAttestation,
+        &ProcessGeneration,
+        StdioTransportLimits,
+        Vec<u8>,
+    ) -> Result<
+        (HostMcpStdioInvocation, HostMcpStdioProcessHandle),
+        StdioTransportError,
+    > = HostMcpStdioInvocation::from_installed_child;
 }
 
 #[test]

@@ -12,6 +12,8 @@
 //! This crate owns no transport, Host, or network: the only outside inputs
 //! are the verified `RecoveryFacts` and the storage database.
 
+use std::process::Child;
+
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_storage::mcp_readiness::McpTransportReadiness;
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
@@ -26,7 +28,10 @@ use dolly_tool_broker::{
     recover_operation,
 };
 
-use crate::mcp_stdio::{HostMcpStdioProcessHandle, HostOwnedMcpStdioSession, StdioTransportLimits};
+use crate::mcp_stdio::{
+    HostMcpStdioInstalledChildAttestation, HostMcpStdioProcessHandle, HostOwnedMcpStdioSession,
+    StdioTransportError, StdioTransportLimits, host_session_from_installed_child,
+};
 use crate::permit::SendPermit;
 use crate::service::{ServiceOutcome, ToolDispatchService};
 
@@ -66,20 +71,26 @@ pub struct HostMcpStdioInvocation {
     limits: StdioTransportLimits,
     request_bytes: Vec<u8>,
 }
-
 impl HostMcpStdioInvocation {
-    pub fn new(
-        host_session: HostOwnedMcpStdioSession,
-        host_handle: HostMcpStdioProcessHandle,
+    /// Verify an installed Host-owned child, bind it to the current process
+    /// generation, and return both the invocation and the separately retained
+    /// owner handle. Raw child claims are not trusted by this constructor.
+    pub fn from_installed_child(
+        child: Child,
+        attestation: HostMcpStdioInstalledChildAttestation,
+        process_generation: &ProcessGeneration,
         limits: StdioTransportLimits,
         request_bytes: Vec<u8>,
-    ) -> Self {
-        Self {
+    ) -> Result<(Self, HostMcpStdioProcessHandle), StdioTransportError> {
+        let (host_session, retained_handle) =
+            host_session_from_installed_child(child, attestation, process_generation)?;
+        let invocation = Self {
             host_session,
-            host_handle,
+            host_handle: retained_handle.clone(),
             limits,
             request_bytes,
-        }
+        };
+        Ok((invocation, retained_handle))
     }
 
     fn into_parts(

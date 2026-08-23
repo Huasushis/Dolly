@@ -40,7 +40,10 @@ mod service_tests;
 pub use dispatch::{
     DispatchError, DispatchOutcome, HostMcpStdioInvocation, dispatch_operation_authorized,
 };
-pub use mcp_stdio::{HostMcpStdioProcessHandle, HostOwnedMcpStdioSession, StdioTransportLimits};
+pub use mcp_stdio::{
+    HostMcpStdioInstalledChildAttestation, HostMcpStdioProcessHandle, StdioTransportError,
+    StdioTransportLimits,
+};
 pub use permit::{SendPermit, SendPermitBinding};
 pub use ports::{Clock, FencedFactsProvider, GenerationReadiness, RecoveryFactsProvider};
 #[cfg(test)]
