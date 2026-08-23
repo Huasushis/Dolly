@@ -37,6 +37,7 @@ import {
   parseCanonicalJsonBytes,
   type JsonValue,
 } from "../../schema-bundle/index.js";
+import { FileCoreHistoryStore, type FileCoreHistoryOptions } from "../../core/file-core-history.js";
 
 /** Largest revision a conforming database may assign (REQ-AUTH-002 step 4). */
 export const MAX_CONFIG_REVISION = 9_007_199_254_740_991;
@@ -664,6 +665,17 @@ export class RuntimeAuthorityDatabase {
 
   get identity(): RuntimeAuthorityIdentity {
     return { ...this.#identity };
+  }
+
+  /**
+   * Opens the one FileCore global history on this already-attested Runtime
+   * authority connection. The returned store does not own or close the
+   * connection; RuntimeAuthorityDatabase remains the authority boundary.
+   */
+  openFileCoreHistory(options: FileCoreHistoryOptions): FileCoreHistoryStore {
+    this.#requireOpen();
+    this.#requireLockHeld();
+    return new FileCoreHistoryStore(this.#connection, this.#identity, this.#lock, options);
   }
 
   #requireOpen(): void {
