@@ -94,6 +94,24 @@ impl ToolTransport for AbortTransport {
     fn abort(&mut self) {}
 }
 
+struct ReusableMcpStdioTransport<'a> {
+    probe: &'a mut McpStdioProbe,
+    readiness: &'a McpTransportReadiness,
+    authority: &'a ToolDispatchAuthority,
+    permit: &'a SendPermitBinding,
+}
+
+impl ToolTransport for ReusableMcpStdioTransport<'_> {
+    fn call(&mut self, request_bytes: &[u8]) -> TransportOutcome {
+        self.probe
+            .call_reusable(self.readiness, self.authority, self.permit, request_bytes)
+    }
+
+    fn abort(&mut self) {
+        self.probe.abort();
+    }
+}
+
 /// The result of one [`ToolDispatchService::dispatch`].
 #[derive(Debug)]
 pub enum ServiceOutcome {
@@ -256,6 +274,56 @@ impl ToolDispatchService {
             .map_err(StdioDispatchError::Service)
     }
 
+    pub(crate) fn dispatch_prepared_reusable(
+        &self,
+        db: &mut Database,
+        authority: &ToolDispatchAuthority,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        readiness: &McpTransportReadiness,
+        probe: &mut McpStdioProbe,
+        host_handle: HostMcpStdioProcessHandle,
+        permit: SendPermit,
+        request_bytes: &[u8],
+    ) -> Result<ServiceOutcome, StdioDispatchError> {
+        if revalidate_tool_dispatch_authority(
+            db,
+            authority,
+            runtime_binding,
+            process_generation,
+            readiness,
+        )
+        .is_err()
+            || validate_dispatch_binding(
+                authority,
+                permit.binding().config_revision,
+                &permit.binding().tool_server_id,
+                permit.binding().tool_server_generation,
+            )
+            .is_err()
+        {
+            probe.abort();
+            return self.settle_admission_unknown(db, host_handle, permit, request_bytes);
+        }
+        let deadline = match absolute_deadline(&permit.binding().authorized_deadline) {
+            Ok(deadline) => deadline,
+            Err(_) => {
+                probe.abort();
+                return self.settle_admission_unknown(db, host_handle, permit, request_bytes);
+            }
+        };
+        probe.set_deadline(deadline);
+        let permit_binding = permit.binding().clone();
+        let mut transport = ReusableMcpStdioTransport {
+            probe,
+            readiness,
+            authority,
+            permit: &permit_binding,
+        };
+        self.dispatch_inner(db, permit, request_bytes, &mut transport)
+            .map_err(StdioDispatchError::Service)
+    }
+
     /// Host-owned stdio composition: readiness is freshly proven against the
     /// current Runtime binding/process generation before this exact permit is
     /// routed through the authority-checked dispatch path.
@@ -326,7 +394,7 @@ impl ToolDispatchService {
             .map_err(StdioDispatchError::Service)
     }
 
-    fn settle_admission_unknown(
+    pub(crate) fn settle_admission_unknown(
         &self,
         db: &mut Database,
         host_handle: HostMcpStdioProcessHandle,

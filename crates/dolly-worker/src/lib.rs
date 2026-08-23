@@ -8,19 +8,23 @@ use dolly_canonical_json::{
     canonicalize,
 };
 use dolly_core_domain::ExtensionId;
+use dolly_storage::mcp_readiness::{
+    MCP_PROTOCOL_VERSION_2025_06_18, McpTransportReadiness,
+};
 use dolly_storage::host_authority::load_current_authority;
-use dolly_storage::mcp_readiness::{MCP_PROTOCOL_VERSION_2025_06_18, McpTransportReadiness};
-use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding, mint_current_runtime_binding};
+use dolly_storage::runtime_binding::{
+    ProcessGeneration, RuntimeBinding, invalidate_runtime_binding, mint_current_runtime_binding,
+};
 use dolly_storage::tool_broker_authority::{
     ToolDispatchAuthority, ToolRegistryRevision, authorize_tool_dispatch, publish_tool_registry,
 };
 use dolly_storage::tool_ledger::create_tool_ledger_schema;
 use dolly_storage::Database;
-use dolly_tool_broker::{AdmissionOutcome, RecoveryFacts, ToolCallLedgerRecord};
+use dolly_tool_broker::{AdmissionOutcome, LedgerState, RecoveryFacts, ToolCallLedgerRecord};
 use dolly_tool_coordinator::{
     DispatchError, DispatchOutcome, DispatchLimits, HostMcpStdioInstalledChildAttestation,
     HostMcpStdioInvocation, HostMcpStdioProcessHandle, StdioTransportError,
-    StdioTransportLimits, ToolDispatchService, dispatch_operation_authorized,
+    StdioTransportLimits, ToolDispatchService, dispatch_operation_authorized_reusable,
 };
 use thiserror::Error;
 
@@ -120,9 +124,18 @@ impl Worker {
             config.extension_alias.clone(),
         )
         .map_err(|error| WorkerError::Authority(error.to_string()))?;
-        let process_generation = runtime_binding
-            .mint_process_generation(&mut database)
-            .map_err(|error| WorkerError::Authority(error.to_string()))?;
+        let process_generation = match runtime_binding.mint_process_generation(&mut database) {
+            Ok(generation) => generation,
+            Err(error) => {
+                return Err(startup_failure(
+                    &mut database,
+                    &runtime_binding,
+                    None,
+                    None,
+                    WorkerError::Authority(error.to_string()),
+                ));
+            }
+        };
 
         let mut command = Command::new(&executable_path);
         command
@@ -132,9 +145,18 @@ impl Worker {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let child = command
-            .spawn()
-            .map_err(|error| WorkerError::Process(error.to_string()))?;
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                return Err(startup_failure(
+                    &mut database,
+                    &runtime_binding,
+                    Some(&process_generation),
+                    None,
+                    WorkerError::Process(error.to_string()),
+                ));
+            }
+        };
         let attestation = HostMcpStdioInstalledChildAttestation::new(
             config.server_id.clone(),
             "mcp".into(),
@@ -157,14 +179,25 @@ impl Worker {
             session_id,
             child.id(),
         );
-        let (mut invocation, process_handle) = HostMcpStdioInvocation::from_installed_child(
-            child,
-            attestation,
-            &process_generation,
-            durable_server.stdio_limits,
-            Vec::new(),
-        )
-        .map_err(WorkerError::Transport)?;
+        let (mut invocation, process_handle) =
+            match HostMcpStdioInvocation::from_installed_child(
+                child,
+                attestation,
+                &process_generation,
+                durable_server.stdio_limits,
+                Vec::new(),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(startup_failure(
+                        &mut database,
+                        &runtime_binding,
+                        Some(&process_generation),
+                        None,
+                        WorkerError::Transport(error),
+                    ));
+                }
+            };
         let readiness = match invocation.initialize(
             &database,
             &runtime_binding,
@@ -174,8 +207,13 @@ impl Worker {
         ) {
             Ok(readiness) => readiness,
             Err(error) => {
-                process_handle.terminate();
-                return Err(WorkerError::Transport(error));
+                return Err(startup_failure(
+                    &mut database,
+                    &runtime_binding,
+                    Some(&process_generation),
+                    Some(&process_handle),
+                    WorkerError::Transport(error),
+                ));
             }
         };
         let registry = match publish_tool_registry(
@@ -186,8 +224,13 @@ impl Worker {
         ) {
             Ok(registry) => registry,
             Err(error) => {
-                process_handle.terminate();
-                return Err(WorkerError::Authority(error.to_string()));
+                return Err(startup_failure(
+                    &mut database,
+                    &runtime_binding,
+                    Some(&process_generation),
+                    Some(&process_handle),
+                    WorkerError::Authority(error.to_string()),
+                ));
             }
         };
         let dispatch_authority = match authorize_tool_dispatch(
@@ -199,8 +242,13 @@ impl Worker {
         ) {
             Ok(authority) => authority,
             Err(error) => {
-                process_handle.terminate();
-                return Err(WorkerError::Authority(error.to_string()));
+                return Err(startup_failure(
+                    &mut database,
+                    &runtime_binding,
+                    Some(&process_generation),
+                    Some(&process_handle),
+                    WorkerError::Authority(error.to_string()),
+                ));
             }
         };
         let service = ToolDispatchService::new(durable_server.dispatch_limits);
@@ -242,8 +290,9 @@ impl Worker {
         &self.registry
     }
 
-    /// Consume the retained session for exactly one coordinator tools/call.
-    /// Any stopped/crashed/ambiguous path is terminal and never redispatched.
+    /// Route sequential tools/call rows through the one initialized session.
+    /// The retained child is stopped only after explicit stop, terminal
+    /// recovery, or a transport/process failure.
     pub fn dispatch_tools_call(
         &mut self,
         row: &ToolCallLedgerRecord,
@@ -253,12 +302,9 @@ impl Worker {
         if self.stopped {
             return Err(WorkerError::Stopped);
         }
-        let invocation = self
-            .invocation
-            .take()
-            .ok_or(WorkerError::Stopped)?
-            .with_request_bytes(request_bytes.to_vec());
-        let outcome = dispatch_operation_authorized(
+        let invocation = self.invocation.as_mut().ok_or(WorkerError::Stopped)?;
+        invocation.set_request_bytes(request_bytes.to_vec());
+        let outcome = dispatch_operation_authorized_reusable(
             &mut self.database,
             &self.dispatch_authority,
             &self.runtime_binding,
@@ -270,22 +316,58 @@ impl Worker {
             invocation,
         )
         .map_err(WorkerError::Dispatch);
-        self.stop();
+        let should_stop = match &outcome {
+            Err(WorkerError::Dispatch(DispatchError::InvalidRecord)) => false,
+            Err(_) => true,
+            Ok(DispatchOutcome::Terminalized { record }) => record.state == LedgerState::Unknown,
+            Ok(DispatchOutcome::Unchanged { .. }) => true,
+            _ => false,
+        };
+        if should_stop {
+            self.stop()?;
+        }
         outcome
     }
 
-    /// Stop and reap the retained child. This does not create a retry or
-    /// rotate any authority.
-    pub fn stop(&mut self) {
+    /// Stop and reap the retained child, then invalidate its durable
+    /// Runtime/process pointers.
+    pub fn stop(&mut self) -> Result<(), WorkerError> {
+        if self.stopped {
+            return Ok(());
+        }
         self.invocation.take();
         self.process_handle.terminate();
         self.stopped = true;
+        invalidate_runtime_binding(
+            &mut self.database,
+            &self.runtime_binding,
+            Some(&self.process_generation),
+        )
+        .map_err(|error| WorkerError::Authority(error.to_string()))
     }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
+    }
+}
+
+fn startup_failure(
+    database: &mut Database,
+    runtime_binding: &RuntimeBinding,
+    process_generation: Option<&ProcessGeneration>,
+    process_handle: Option<&HostMcpStdioProcessHandle>,
+    error: WorkerError,
+) -> WorkerError {
+    if let Some(process_handle) = process_handle {
+        process_handle.terminate();
+    }
+    match invalidate_runtime_binding(database, runtime_binding, process_generation) {
+        Ok(()) => error,
+        Err(cleanup_error) => WorkerError::Authority(format!(
+            "{error}; durable startup cleanup failed: {cleanup_error}"
+        )),
     }
 }
 

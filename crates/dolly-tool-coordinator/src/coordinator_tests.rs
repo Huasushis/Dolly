@@ -15,7 +15,7 @@ use dolly_storage::mcp_readiness::McpTransportReadiness;
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::ToolDispatchAuthority;
 use dolly_storage::tool_ledger::{
-    CasKey, LedgerInsertDisposition, TransportCorrelation, create_tool_ledger_schema,
+    CasKey, LedgerInsertDisposition, TransportCorrelation, cas_to_dispatched, create_tool_ledger_schema,
     enumerate_nonterminal, insert_authorized, load_exact,
 };
 use dolly_storage::{Database, StorageError};
@@ -25,9 +25,9 @@ use dolly_tool_broker::{
 };
 use dolly_tool_coordinator::{
     DispatchError, DispatchOutcome, FencedFactsProvider, HostMcpStdioInstalledChildAttestation,
-    HostMcpStdioInvocation, HostMcpStdioProcessHandle, RecoveryFactsProvider, RecoveryOutcome,
-    StdioTransportError, StdioTransportLimits, ToolDispatchService, dispatch_operation,
-    dispatch_operation_authorized, reopen_recovery,
+    HostMcpStdioInvocation, HostMcpStdioProcessHandle, RecoveryFactsProvider,
+    RecoveryOutcome, StdioTransportError, StdioTransportLimits, ToolDispatchService,
+    dispatch_operation, dispatch_operation_authorized, load_authoritative_row, reopen_recovery,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -778,6 +778,41 @@ fn authority_dispatch_requires_current_revalidation_api() {
         (HostMcpStdioInvocation, HostMcpStdioProcessHandle),
         StdioTransportError,
     > = HostMcpStdioInvocation::from_installed_child;
+}
+
+#[test]
+fn authorized_boundary_rejects_forged_and_stale_rows_before_cas() {
+    let dir = tempdir();
+    let mut db = open_db(dir.path());
+    let authorized = authorized_record(OP_A, REQ);
+    insert_authorized_row(&mut db, &authorized);
+
+    let mut forged = authorized.clone();
+    forged.operation_binding.tool_name = "forged-tool".into();
+    assert!(matches!(
+        load_authoritative_row(&db, &forged),
+        Err(DispatchError::InvalidRecord)
+    ));
+
+    let dispatched = build_record(
+        LedgerState::Dispatched,
+        true,
+        None,
+        &authorized.operation_binding,
+    );
+    let expected = CasKey {
+        module_id: authorized.operation_binding.module_id.clone(),
+        operation_id: authorized.operation_binding.operation_id.clone(),
+        expected_ledger_revision: authorized.ledger_revision,
+        expected_state: LedgerState::Authorized,
+        correlation: None,
+    };
+    cas_to_dispatched(db.connection_mut(), &expected, &dispatched)
+        .expect("authoritative dispatch transition");
+    assert!(matches!(
+        load_authoritative_row(&db, &authorized),
+        Err(DispatchError::InvalidRecord)
+    ));
 }
 
 #[test]

@@ -25,7 +25,9 @@ use dolly_storage::tool_broker_authority::{
     ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
     validate_dispatch_binding,
 };
-use dolly_storage::tool_ledger::{CasKey, TransportCorrelation, cas_terminal, cas_to_dispatched};
+use dolly_storage::tool_ledger::{
+    CasKey, TransportCorrelation, cas_terminal, cas_to_dispatched, load_exact,
+};
 use dolly_storage::{Database, StorageError};
 use dolly_tool_broker::{
     DispatchDisposition, LedgerState, RecoveryFacts, ToolCallLedgerRecord, ToolResult,
@@ -65,6 +67,24 @@ impl From<ToolBrokerAuthorityError> for DispatchError {
     }
 }
 
+pub(crate) fn load_authoritative_row(
+    db: &Database,
+    supplied: &ToolCallLedgerRecord,
+) -> Result<ToolCallLedgerRecord, DispatchError> {
+    let Some(authoritative) = load_exact(
+        db.connection(),
+        &supplied.operation_binding.module_id,
+        &supplied.operation_binding.operation_id,
+    )
+    .map_err(DispatchError::Storage)?
+    else {
+        return Err(DispatchError::InvalidRecord);
+    };
+    if authoritative != *supplied {
+        return Err(DispatchError::InvalidRecord);
+    }
+    Ok(authoritative)
+}
 /// Opaque Host-owned stdio composition handed to the existing authorized
 /// dispatch entrypoint. The fields cannot be paired or replaced by callers;
 /// the installed-child verifier supplies the session and the Host retains
@@ -114,6 +134,9 @@ impl HostMcpStdioInvocation {
     pub fn with_request_bytes(mut self, request_bytes: Vec<u8>) -> Self {
         self.request_bytes = request_bytes;
         self
+    }
+    pub fn set_request_bytes(&mut self, request_bytes: Vec<u8>) {
+        self.request_bytes = request_bytes;
     }
 
     /// Complete the one MCP initialize/initialized lifecycle on this exact
@@ -251,6 +274,13 @@ pub fn dispatch_operation_authorized(
     service: &ToolDispatchService,
     invocation: HostMcpStdioInvocation,
 ) -> Result<DispatchOutcome, DispatchError> {
+    let row = match load_authoritative_row(db, row) {
+        Ok(row) => row,
+        Err(error) => {
+            invocation.host_handle.terminate();
+            return Err(error);
+        }
+    };
     revalidate_tool_dispatch_authority(
         db,
         authority,
@@ -264,7 +294,7 @@ pub fn dispatch_operation_authorized(
         &row.operation_binding.tool_server_id,
         row.operation_binding.tool_server_generation,
     )?;
-    let outcome = dispatch_operation(db, row, facts)?;
+    let outcome = dispatch_operation(db, &row, facts)?;
     let DispatchOutcome::Dispatched {
         record: _,
         permit: Some(permit),
@@ -300,16 +330,73 @@ pub fn dispatch_operation_authorized(
             permit,
             &request_bytes,
         ),
-        HostMcpStdioSessionState::Consumed => {
-            return Err(DispatchError::Stdio(
-                "MCP invocation session was already consumed".to_owned(),
-            ));
-        }
+        HostMcpStdioSessionState::Consumed =>
+            service.settle_admission_unknown(db, parts.host_handle, permit, &request_bytes),
     }
     .map_err(|error| DispatchError::Stdio(error.message()))?;
     map_service_outcome(service_outcome)
 }
 
+
+/// Reusable Worker-owned dispatch boundary. The initialized probe remains in
+/// the invocation after a successful call, so sequential tools/call rows share
+/// the same MCP session and Host process.
+pub fn dispatch_operation_authorized_reusable(
+    db: &mut Database,
+    authority: &ToolDispatchAuthority,
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    readiness: &McpTransportReadiness,
+    row: &ToolCallLedgerRecord,
+    facts: &RecoveryFacts,
+    service: &ToolDispatchService,
+    invocation: &mut HostMcpStdioInvocation,
+) -> Result<DispatchOutcome, DispatchError> {
+    let row = load_authoritative_row(db, row)?;
+    revalidate_tool_dispatch_authority(
+        db,
+        authority,
+        runtime_binding,
+        process_generation,
+        readiness,
+    )?;
+    validate_dispatch_binding(
+        authority,
+        row.operation_binding.config_revision as i64,
+        &row.operation_binding.tool_server_id,
+        row.operation_binding.tool_server_generation,
+    )?;
+    let outcome = dispatch_operation(db, &row, facts)?;
+    let DispatchOutcome::Dispatched {
+        record: _,
+        permit: Some(permit),
+    } = outcome
+    else {
+        return Ok(outcome);
+    };
+    let service_outcome = match &mut invocation.session {
+        HostMcpStdioSessionState::Prepared(probe) => service.dispatch_prepared_reusable(
+            db,
+            authority,
+            runtime_binding,
+            process_generation,
+            readiness,
+            probe,
+            invocation.host_handle.clone(),
+            permit,
+            &invocation.request_bytes,
+        ),
+        HostMcpStdioSessionState::Raw(_) | HostMcpStdioSessionState::Consumed => service
+            .settle_admission_unknown(
+                db,
+                invocation.host_handle.clone(),
+                permit,
+                &invocation.request_bytes,
+            ),
+    }
+    .map_err(|error| DispatchError::Stdio(error.message()))?;
+    map_service_outcome(service_outcome)
+}
 fn map_service_outcome(outcome: ServiceOutcome) -> Result<DispatchOutcome, DispatchError> {
     match outcome {
         ServiceOutcome::Succeeded { record, .. }

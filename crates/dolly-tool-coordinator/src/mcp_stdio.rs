@@ -688,6 +688,61 @@ impl McpStdioProbe {
             used: false,
         })
     }
+    pub(crate) fn call_reusable(
+        &mut self,
+        readiness: &McpTransportReadiness,
+        authority: &ToolDispatchAuthority,
+        permit: &SendPermitBinding,
+        request_bytes: &[u8],
+    ) -> TransportOutcome {
+        if readiness.transport_kind() != MCP_STDIO_KIND
+            || readiness.server_id() != authority.server_id()
+            || readiness.readiness_digest() != authority.readiness_digest()
+            || readiness.adapter() != self.identity.adapter
+            || readiness.protocol_version() != self.identity.protocol_version
+            || readiness.endpoint_digest() != &self.identity.endpoint_digest
+            || readiness.transport_digest() != &self.identity.transport_digest
+            || readiness.binding_digest() != &self.identity.runtime_binding_digest
+            || !authority.permits_binding(
+                permit.config_revision,
+                &permit.tool_server_id,
+                permit.tool_server_generation,
+            )
+            || readiness.server_id() != permit.tool_server_id
+            || authority.tool_server_generation() != permit.tool_server_generation
+        {
+            self.abort();
+            return TransportOutcome::Error(format_transport_error(
+                StdioTransportError::ProcessIdentityMismatch,
+            ));
+        }
+        if !self.observed {
+            self.abort();
+            return TransportOutcome::Error(format_transport_error(
+                StdioTransportError::NotInitialized,
+            ));
+        }
+        let Some(session) = self.session.take() else {
+            self.host_handle.terminate();
+            return TransportOutcome::Error(format_transport_error(
+                StdioTransportError::NotInitialized,
+            ));
+        };
+        let mut transport = McpStdioTransport {
+            session,
+            host_handle: self.host_handle.clone(),
+            expected_request_id: permit.server_request_id.clone(),
+            deadline: self.deadline,
+            used: false,
+        };
+        let outcome = transport.call(request_bytes);
+        if matches!(outcome, TransportOutcome::Response(_)) {
+            self.session = Some(transport.session);
+        } else {
+            transport.abort();
+        }
+        outcome
+    }
 }
 
 impl McpTransportProbe for McpStdioProbe {
@@ -1217,6 +1272,37 @@ mod tests {
             response,
             br#"{"jsonrpc":"2.0","id":"call-1","result":null}"#
         );
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn initialized_stdio_session_supports_a_second_correlated_call() {
+        let (mut session, server_thread) = session_with_handler(|reader, writer| {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("first call request");
+            assert!(line.contains("call-1"));
+            writer
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"call-1\",\"result\":null}\n")
+                .expect("first call response");
+            line.clear();
+            reader.read_line(&mut line).expect("second call request");
+            assert!(line.contains("call-2"));
+            writer
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"call-2\",\"result\":null}\n")
+                .expect("second call response");
+        });
+        let deadline = deadline_after(Duration::from_secs(1));
+        session.initialize(deadline).expect("initialize");
+        session
+            .exchange(call_request(), "call-1", deadline)
+            .expect("first response");
+        session
+            .exchange(
+                br#"{"jsonrpc":"2.0","id":"call-2","method":"tools/call","params":{}}"#,
+                "call-2",
+                deadline,
+            )
+            .expect("second response");
         server_thread.join().expect("server thread");
     }
 
