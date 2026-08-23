@@ -593,6 +593,7 @@ impl OfflineDatabase {
                 directory_lock: identity_directory_lock,
                 ..
             } = cleanup.note_identity_lock_acquired(acquired_identity)?;
+            verify_or_write_lock_owner(&identity_lock, &input.identity, &controller_generation_id)?;
             cleanup.begin_database();
             let connection = match open_connection(&database.db_path) {
                 Ok(connection) => connection,
@@ -717,7 +718,7 @@ impl OfflineDatabase {
             cleanup.note_database_artifacts()?;
             let configuration = apply_and_verify_configuration(&connection)?;
             cleanup.note_database_artifacts()?;
-            let schema_version = ensure_schema(&connection, &database.verified)?;
+            let schema_version = validate_legacy_schema(&connection, &database.verified)?;
             verify_sqlite_integrity(&connection)?;
             let writable_legacy = load_legacy_current_authority(&connection)
                 .map_err(map_host_authority_error)?
@@ -734,16 +735,6 @@ impl OfflineDatabase {
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(map_sqlite_error)?;
-            let updated = tx
-                .execute(
-                    "UPDATE core_meta SET controller_generation_id = ?1
-                     WHERE singleton = 1",
-                    [&controller_generation_id],
-                )
-                .map_err(map_sqlite_error)?;
-            if updated != 1 {
-                return Err(StorageError::Corrupt);
-            }
             migrate_legacy_authority_in_transaction(&tx, &controller_generation_id)
                 .map_err(map_host_authority_error)?;
             tx.commit().map_err(map_sqlite_error)?;
@@ -1612,6 +1603,117 @@ fn apply_and_verify_configuration(
         trusted_schema,
         busy_timeout,
     )
+}
+
+/// Validate the pre-generation physical schema without writing it. This is
+/// used only by the explicit offline v1 authority migration; ordinary opens
+/// remain gated by `ensure_schema` and the v2 Host schema check.
+fn validate_legacy_schema(
+    connection: &Connection,
+    verified: &VerifiedSqliteBuild,
+) -> StorageResult<i64> {
+    let object_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type IN ('table', 'index', 'trigger', 'view')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StorageError::MigrationRequired)?;
+    let user_version: i64 =
+        query_pragma(connection, "user_version").map_err(|_| StorageError::MigrationRequired)?;
+    if object_count == 0 || user_version != SCHEMA_VERSION {
+        return Err(StorageError::MigrationRequired);
+    }
+
+    let required_core_columns = [
+        "schema_version",
+        "daemon_installation_id",
+        "instance_id",
+        "clean_shutdown",
+        "sqlite_version_number",
+        "sqlite_source_id",
+        "sqlite_artifact_digest",
+    ];
+    let mut core_columns = std::collections::BTreeSet::new();
+    let mut core_statement = connection
+        .prepare("PRAGMA table_info(core_meta)")
+        .map_err(|_| StorageError::MigrationRequired)?;
+    let core_rows = core_statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|_| StorageError::MigrationRequired)?;
+    for row in core_rows {
+        core_columns.insert(row.map_err(|_| StorageError::MigrationRequired)?);
+    }
+    if !required_core_columns
+        .iter()
+        .all(|column| core_columns.contains(*column))
+    {
+        return Err(StorageError::MigrationRequired);
+    }
+
+    let required_runtime_columns = [
+        "authority_schema_version",
+        "daemon_installation_id",
+        "instance_id",
+        "current_config_revision",
+        "current_config_digest",
+        "record_jcs",
+    ];
+    let mut runtime_columns = std::collections::BTreeSet::new();
+    let mut runtime_statement = connection
+        .prepare("PRAGMA table_info(runtime_authority_state)")
+        .map_err(|_| StorageError::MigrationRequired)?;
+    let runtime_rows = runtime_statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|_| StorageError::MigrationRequired)?;
+    for row in runtime_rows {
+        runtime_columns.insert(row.map_err(|_| StorageError::MigrationRequired)?);
+    }
+    if !required_runtime_columns
+        .iter()
+        .all(|column| runtime_columns.contains(*column))
+        || runtime_columns.contains("controller_generation_id")
+    {
+        return Err(StorageError::MigrationRequired);
+    }
+
+    let host_version: Option<i64> = connection
+        .query_row(
+            "SELECT authority_schema_version
+             FROM host_authority_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| StorageError::MigrationRequired)?;
+    if host_version != Some(1) {
+        return Err(StorageError::MigrationRequired);
+    }
+
+    let existing: Option<(i64, i64, String, String)> = connection
+        .query_row(
+            "SELECT schema_version, sqlite_version_number, sqlite_source_id,
+                    sqlite_artifact_digest
+             FROM core_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|_| StorageError::MigrationRequired)?;
+    let Some((schema_version, version_number, source_id, artifact_digest)) = existing else {
+        return Err(StorageError::Corrupt);
+    };
+    if schema_version != SCHEMA_VERSION {
+        return Err(StorageError::MigrationRequired);
+    }
+    if version_number != verified.version_number as i64
+        || source_id != verified.source_id
+        || artifact_digest != verified.artifact_digest.to_string()
+    {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(SCHEMA_VERSION)
 }
 
 /// Create/check the v1 physical schema and the diagnostic SQLite attestation.

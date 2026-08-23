@@ -359,6 +359,16 @@ fn explicit_v1_authority_migration_rebuilds_state_and_gates_ordinary_open() {
         CREATE TABLE host_authority_meta__dolly_v1 (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1)
+        );
+        CREATE TABLE core_meta__dolly_v1 (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            schema_version INTEGER NOT NULL,
+            daemon_installation_id TEXT,
+            instance_id TEXT,
+            clean_shutdown INTEGER NOT NULL CHECK (clean_shutdown IN (0, 1)),
+            sqlite_version_number INTEGER NOT NULL,
+            sqlite_source_id TEXT NOT NULL,
+            sqlite_artifact_digest TEXT NOT NULL
         );",
     )
     .unwrap();
@@ -386,15 +396,31 @@ fn explicit_v1_authority_migration_rebuilds_state_and_gates_ordinary_open() {
         .unwrap();
     tx.execute_batch(
         "ALTER TABLE runtime_authority_state__dolly_v1
-            RENAME TO runtime_authority_state;
-         DROP TABLE host_authority_meta;
+            RENAME TO runtime_authority_state;",
+    )
+    .unwrap();
+    tx.execute_batch(
+        "DROP TABLE host_authority_meta;
          ALTER TABLE host_authority_meta__dolly_v1
             RENAME TO host_authority_meta;",
     )
     .unwrap();
     tx.execute(
-        "UPDATE core_meta SET controller_generation_id = NULL WHERE singleton = 1",
+        "INSERT INTO core_meta__dolly_v1 (
+            singleton, schema_version, daemon_installation_id, instance_id,
+            clean_shutdown, sqlite_version_number, sqlite_source_id,
+            sqlite_artifact_digest
+         )
+         SELECT singleton, schema_version, daemon_installation_id, instance_id,
+                clean_shutdown, sqlite_version_number, sqlite_source_id,
+                sqlite_artifact_digest
+         FROM core_meta WHERE singleton = 1",
         [],
+    )
+    .unwrap();
+    tx.execute_batch(
+        "DROP TABLE core_meta;
+         ALTER TABLE core_meta__dolly_v1 RENAME TO core_meta;",
     )
     .unwrap();
     tx.commit().unwrap();

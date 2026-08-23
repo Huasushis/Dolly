@@ -751,6 +751,25 @@ pub(crate) fn migrate_legacy_authority_in_transaction(
             "offline migration target already has controller generation".into(),
         ));
     }
+    let mut core_columns = BTreeSet::new();
+    let mut core_statement = tx.prepare("PRAGMA table_info(core_meta)")?;
+    let core_rows = core_statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in core_rows {
+        core_columns.insert(row?);
+    }
+    if !core_columns.contains("controller_generation_id") {
+        tx.execute_batch("ALTER TABLE core_meta ADD COLUMN controller_generation_id TEXT")?;
+    }
+    let updated = tx.execute(
+        "UPDATE core_meta SET controller_generation_id = ?1
+         WHERE singleton = 1",
+        [generation],
+    )?;
+    if updated != 1 {
+        return Err(HostAuthorityError::Malformed(
+            "core authority generation row is missing".into(),
+        ));
+    }
 
     let state = RuntimeAuthorityStateRecord {
         schema: "dolly.runtime-authority-state/v1".into(),
