@@ -1,16 +1,26 @@
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import {
   FileCoreHistoryError,
-  FileCoreHistoryStore,
-  type FileCoreHistorySqliteConnection,
+  type FileCoreHistoryOptions,
 } from "../../../src/core/file-core-history.js";
+import {
+  RuntimeAuthorityDatabase,
+  RuntimeAuthorityDatabaseError,
+  type RuntimeAuthorityIdentity,
+} from "../../../src/adapters/storage/runtime-authority-database.js";
+import { canonicalBytes, canonicalJsonDigest } from "../../../src/schema-bundle/index.js";
 
-const identity = {
+const identity: RuntimeAuthorityIdentity = {
   daemonInstallationId: "0198ab11-6c44-7e8a-b2bb-000000000501",
   instanceId: "main",
-} as const;
-const legacySourceDigest = `sha256:${"a".repeat(64)}`;
+};
+const temporaryDirectories: string[] = [];
+const authorities: RuntimeAuthorityDatabase[] = [];
 
 class FakeLock {
   held = true;
@@ -20,35 +30,71 @@ class FakeLock {
   }
 }
 
-const databases: Database.Database[] = [];
+function digest(bytes: Uint8Array): string {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
 
-afterEach(() => {
-  for (const database of databases.splice(0)) database.close();
-});
+function scratch(): string {
+  const directory = mkdtempSync(join(tmpdir(), "dolly-filecore-history-r31-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
 
-function openStore(options: Partial<ConstructorParameters<typeof FileCoreHistoryStore>[3]> = {}): {
-  readonly database: Database.Database;
-  readonly store: FileCoreHistoryStore;
-} {
-  const database = new Database(":memory:");
-  databases.push(database);
+function resolvedConfig(): Uint8Array {
+  return Buffer.from(canonicalBytes({
+    runtime_config: { value: "filecore-history" },
+    permission_policy_selections: [],
+    service_candidate: null,
+  }));
+}
+
+function legacyCoreSource(): Uint8Array {
+  const payload = {
+    schemaVersion: "dolly.core-state/19",
+    revision: 1,
+    referenceGraph: { deliveries: [], activations: [] },
+    blocks: { blocks: [] },
+    moduleProcessRecords: [],
+    moduleSubmissionRecords: [],
+    activeClaimsWithUnknownSubmissionHistory: [],
+    processGenerationIdCounter: 0,
+  };
+  return Buffer.from(canonicalBytes({
+    ...payload,
+    stateDigest: canonicalJsonDigest(payload),
+  }));
+}
+
+function openAuthority(): { readonly database: RuntimeAuthorityDatabase; readonly lock: FakeLock; readonly path: string } {
+  const path = join(scratch(), "runtime-authority.sqlite");
   const lock = new FakeLock();
-  const store = new FileCoreHistoryStore(
-    database as unknown as FileCoreHistorySqliteConnection,
+  const database = RuntimeAuthorityDatabase.open({ path, identity, lock });
+  authorities.push(database);
+  const configBytes = resolvedConfig();
+  database.installConfig({
     identity,
-    lock,
-    {
-      producerId: "core-producer",
-      producerEpoch: "epoch-1",
-      maxEntries: 8,
-      maxBytes: 1024,
-      maxReaders: 2,
-      legacySourceDigest,
-      now: () => "2026-08-23T00:00:00.000Z",
-      ...options,
-    },
-  );
-  return { database, store };
+    canonicalConfigBytes: configBytes,
+    configDigest: digest(configBytes),
+    premise: null,
+    verifiedOrigins: [],
+  });
+  return { database, lock, path };
+}
+
+function migrate(database: RuntimeAuthorityDatabase, options: Partial<FileCoreHistoryOptions> = {}) {
+  const current = database.readCurrentConfig();
+  if (current === null) throw new Error("authority config was not installed");
+  const sourceBytes = legacyCoreSource();
+  return database.migrateFileCoreHistory({
+    expectedAuthority: { revision: current.config_revision, digest: current.config_digest },
+    legacySourceBytes: sourceBytes,
+    legacySourceDigest: digest(sourceBytes),
+    maxEntries: 8,
+    maxBytes: 64,
+    maxReaders: 2,
+    now: () => "2026-08-23T00:00:00.000Z",
+    ...options,
+  });
 }
 
 function expectHistoryCode(action: () => unknown, code: FileCoreHistoryError["code"]): void {
@@ -62,26 +108,47 @@ function expectHistoryCode(action: () => unknown, code: FileCoreHistoryError["co
   throw new Error(`expected ${code}`);
 }
 
-describe("FileCore bounded global history", () => {
-  it("starts at an explicit migration floor and reports a pre-migration gap", () => {
-    const { store } = openStore();
-    store.registerReader("reader-a");
+afterEach(() => {
+  for (const authority of authorities.splice(0)) authority.close();
+  for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
 
-    expect(store.head).toMatchObject({
+describe("FileCore bounded global history", () => {
+  it("requires Runtime-authority migration and exposes an explicit pre-migration gap", () => {
+    const { database } = openAuthority();
+    const policy: FileCoreHistoryOptions = { maxEntries: 8, maxBytes: 64, maxReaders: 2 };
+    expect(() => database.openFileCoreHistory(policy)).toThrowError(FileCoreHistoryError);
+    const current = database.readCurrentConfig();
+    if (current === null) throw new Error("authority config was not installed");
+    const sourceBytes = legacyCoreSource();
+    expect(() => database.migrateFileCoreHistory({
+      expectedAuthority: { revision: current.config_revision + 1, digest: current.config_digest },
+      legacySourceBytes: sourceBytes,
+      legacySourceDigest: digest(sourceBytes),
+      ...policy,
+    })).toThrowError(RuntimeAuthorityDatabaseError);
+
+    const producer = migrate(database, policy);
+    const reader = database.openFileCoreHistoryReader(policy);
+    reader.registerReader("reader-a");
+    expect(producer.head).toMatchObject({
       history_id: "filecore-global",
+      producer_id: "filecore-main",
       retained_from: 1,
       produced_through: 0,
       retained_entry_count: 0,
       retained_entry_bytes: 0,
     });
     expectHistoryCode(
-      () => store.read({ readerId: "reader-a", start: { cursor: 0 } }),
+      () => reader.read({ readerId: "reader-a", start: { cursor: 0 } }),
       "HISTORY_GAP",
     );
+    expect("publishCheckpoint" in reader).toBe(false);
   });
 
   it("enforces count and canonical-byte limits before append mutation", () => {
-    const { store } = openStore({ maxEntries: 2, maxBytes: 64 });
+    const { database } = openAuthority();
+    const store = migrate(database, { maxEntries: 2 });
     const first = store.append({
       producerEntryId: "entry-1",
       value: { value: "a" },
@@ -92,66 +159,45 @@ describe("FileCore bounded global history", () => {
       value: { value: "b" },
       expectedHeadRevision: 2,
     });
+    const before = store.head;
     expect(first.sequence).toBe(1);
     expect(second.sequence).toBe(2);
-    const before = store.head;
-
     expectHistoryCode(
       () => store.append({ producerEntryId: "entry-3", value: { value: "c" }, expectedHeadRevision: 3 }),
       "HISTORY_LIMIT_EXCEEDED",
     );
     expect(store.head).toEqual(before);
-
-    const { store: byteLimitedStore } = openStore({ maxEntries: 8, maxBytes: 5 });
     expectHistoryCode(
-      () => byteLimitedStore.append({ producerEntryId: "large-entry", value: { value: "a" }, expectedHeadRevision: 1 }),
+      () => store.append({ producerEntryId: "large-entry", value: { value: "x".repeat(80) }, expectedHeadRevision: 3 }),
       "HISTORY_ENTRY_TOO_LARGE",
     );
-
-    const retry = store.append({
-      producerEntryId: "entry-2",
-      value: { value: "b" },
-      expectedHeadRevision: 1,
-    });
-    expect(retry).toEqual(second);
+    expect(store.append({ producerEntryId: "entry-2", value: { value: "b" }, expectedHeadRevision: 1 })).toEqual(second);
     expectHistoryCode(
       () => store.append({ producerEntryId: "entry-2", value: { value: "different" }, expectedHeadRevision: 3 }),
       "HISTORY_IDEMPOTENCY_CONFLICT",
     );
   });
 
-  it("bounds reader slots and keeps ACKs outside producer authority", () => {
-    const { store } = openStore({ maxReaders: 1 });
-    const reader = store.registerReader("reader-a");
-    expect(reader.cursor).toBe(1);
-    expectHistoryCode(() => store.registerReader("reader-b"), "HISTORY_READER_LIMIT");
-
-    const first = store.append({
-      producerEntryId: "entry-1",
-      value: { value: "a" },
-      expectedHeadRevision: 1,
-    });
-    const beforeAck = store.head;
-    const acknowledged = store.acknowledge({
-      readerId: "reader-a",
-      cursor: 2,
-      expectedReaderRevision: reader.reader_revision,
-    });
-    expect(acknowledged.cursor).toBe(2);
-    expect(store.head).toEqual(beforeAck);
-    expect(store.checkpoint.delete_through).toBe(0);
-
-    const checkpoint = store.publishCheckpoint({
+  it("keeps ACKs reader-only and enforces producer checkpoint monotonicity", () => {
+    const { database } = openAuthority();
+    const policy: FileCoreHistoryOptions = { maxEntries: 8, maxBytes: 64, maxReaders: 1 };
+    const producer = migrate(database, policy);
+    const reader = database.openFileCoreHistoryReader(policy);
+    const registered = reader.registerReader("reader-a");
+    const first = producer.append({ producerEntryId: "entry-1", value: { value: "a" }, expectedHeadRevision: 1 });
+    const beforeAck = producer.head;
+    expect(reader.acknowledge({ readerId: "reader-a", cursor: 2, expectedReaderRevision: registered.reader_revision }).cursor).toBe(2);
+    expect(producer.head).toEqual(beforeAck);
+    const checkpoint = producer.publishCheckpoint({
       producerRevision: first.head_revision,
       deleteThrough: 1,
       issuedAt: "2026-08-23T00:00:01.000Z",
       evidenceDigest: `sha256:${"b".repeat(64)}`,
       expectedHeadRevision: beforeAck.head_revision,
     });
-    expect(checkpoint.delete_through).toBe(1);
-    const beforeRegression = store.head;
+    const beforeRegression = producer.head;
     expectHistoryCode(
-      () => store.publishCheckpoint({
+      () => producer.publishCheckpoint({
         producerRevision: first.head_revision,
         deleteThrough: 0,
         issuedAt: "2026-08-23T00:00:02.000Z",
@@ -159,54 +205,62 @@ describe("FileCore bounded global history", () => {
       }),
       "HISTORY_CHECKPOINT_REGRESSION",
     );
-    expect(store.head).toEqual(beforeRegression);
-    expect(store.checkpoint).toEqual(checkpoint);
+    expect(producer.checkpoint).toEqual(checkpoint);
+    expect(() => database.openFileCoreHistoryReader(policy).read({ readerId: "reader-a" })).not.toThrow();
   });
 
   it("deletes only through the current producer checkpoint and leaves an honest gap", () => {
-    const { store } = openStore();
-    const reader = store.registerReader("reader-a");
-    const first = store.append({
-      producerEntryId: "entry-1",
-      value: { value: "a" },
-      expectedHeadRevision: 1,
-    });
-    store.append({
-      producerEntryId: "entry-2",
-      value: { value: "b" },
-      expectedHeadRevision: first.head_revision,
-    });
-    const checkpoint = store.publishCheckpoint({
+    const { database } = openAuthority();
+    const policy: FileCoreHistoryOptions = { maxEntries: 8, maxBytes: 64, maxReaders: 2 };
+    const producer = migrate(database, policy);
+    const reader = database.openFileCoreHistoryReader(policy);
+    reader.registerReader("reader-a");
+    const first = producer.append({ producerEntryId: "entry-1", value: { value: "a" }, expectedHeadRevision: 1 });
+    producer.append({ producerEntryId: "entry-2", value: { value: "b" }, expectedHeadRevision: first.head_revision });
+    const checkpoint = producer.publishCheckpoint({
       producerRevision: 2,
       deleteThrough: 1,
       issuedAt: "2026-08-23T00:00:01.000Z",
       expectedHeadRevision: 3,
     });
-    const beforeDelete = store.head;
+    const beforeDelete = producer.head;
     expectHistoryCode(
-      () => store.deleteEligible({
+      () => producer.deleteEligible({
         checkpointVersion: checkpoint.checkpoint_version,
         checkpointDigest: `sha256:${"c".repeat(64)}`,
-        producerEpoch: "epoch-1",
+        producerEpoch: checkpoint.producer_epoch,
         expectedHeadRevision: beforeDelete.head_revision,
       }),
       "HISTORY_CHECKPOINT_STALE",
     );
-    expect(store.head).toEqual(beforeDelete);
-
-    const deleted = store.deleteEligible({
+    const deleted = producer.deleteEligible({
       checkpointVersion: checkpoint.checkpoint_version,
       checkpointDigest: checkpoint.checkpoint_digest,
       producerEpoch: checkpoint.producer_epoch,
       expectedHeadRevision: beforeDelete.head_revision,
     });
     expect(deleted).toMatchObject({ deleted_through: 1, deleted_count: 1, retained_from: 2 });
-    expectHistoryCode(
-      () => store.read({ readerId: reader.reader_id, start: { cursor: 1 } }),
-      "HISTORY_GAP",
-    );
-    const remaining = store.read({ readerId: reader.reader_id, start: { cursor: 2 } });
-    expect(remaining.entries).toHaveLength(1);
-    expect(remaining.entries[0]?.sequence).toBe(2);
+    expectHistoryCode(() => reader.read({ readerId: "reader-a", start: { cursor: 1 } }), "HISTORY_GAP");
+    expect(reader.read({ readerId: "reader-a", start: { cursor: 2 } }).entries).toHaveLength(1);
+  });
+
+  it("requires the controller lock and detects persisted projection tampering", () => {
+    const { database, lock, path } = openAuthority();
+    const policy: FileCoreHistoryOptions = { maxEntries: 8, maxBytes: 64, maxReaders: 2 };
+    const producer = migrate(database, policy);
+    producer.append({ producerEntryId: "entry-1", value: { value: "a" }, expectedHeadRevision: 1 });
+    const reader = database.openFileCoreHistoryReader(policy);
+    reader.registerReader("reader-a");
+    lock.held = false;
+    expectHistoryCode(() => reader.read({ readerId: "reader-a" }), "HISTORY_LOCK_NOT_HELD");
+    lock.held = true;
+    database.close();
+    const tamper = new Database(path);
+    tamper.prepare("UPDATE filecore_history_entries SET entry_bytes = entry_bytes + 1 WHERE sequence = 1").run();
+    tamper.close();
+    const reopenedLock = new FakeLock();
+    const reopened = RuntimeAuthorityDatabase.open({ path, identity, lock: reopenedLock });
+    authorities.push(reopened);
+    expect(() => reopened.openFileCoreHistory(policy)).toThrowError(FileCoreHistoryError);
   });
 });

@@ -29,14 +29,18 @@ export interface FileCoreHistorySqliteConnection {
 }
 
 export interface FileCoreHistoryOptions {
-  readonly producerId: string;
-  readonly producerEpoch: string;
   readonly maxEntries: number;
   readonly maxBytes: number;
   readonly maxReaders: number;
+  readonly now?: () => string;
+  readonly legacySourceDigest?: string;
+}
+
+export interface FileCoreHistoryMigrationOptions extends FileCoreHistoryOptions {
+  readonly producerId: string;
+  readonly producerEpoch: string;
   /** Exact bytes digest of the legacy FileCore source at the migration boundary. */
   readonly legacySourceDigest: string;
-  readonly now?: () => string;
 }
 
 export interface FileCoreHistoryHead {
@@ -183,7 +187,7 @@ export class FileCoreHistoryError extends Error {
 const HISTORY_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS filecore_history_head (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  history_id TEXT NOT NULL UNIQUE,
+  history_id TEXT NOT NULL UNIQUE CHECK (history_id = 'filecore-global'),
   producer_id TEXT NOT NULL,
   producer_epoch TEXT NOT NULL,
   head_revision INTEGER NOT NULL,
@@ -200,7 +204,7 @@ CREATE TABLE IF NOT EXISTS filecore_history_head (
   record_jcs BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS filecore_history_entries (
-  history_id TEXT NOT NULL,
+  history_id TEXT NOT NULL CHECK (history_id = 'filecore-global'),
   sequence INTEGER NOT NULL,
   producer_epoch TEXT NOT NULL,
   producer_entry_id TEXT NOT NULL,
@@ -214,7 +218,7 @@ CREATE TABLE IF NOT EXISTS filecore_history_entries (
 );
 CREATE TABLE IF NOT EXISTS filecore_history_checkpoint (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  history_id TEXT NOT NULL UNIQUE,
+  history_id TEXT NOT NULL UNIQUE CHECK (history_id = 'filecore-global'),
   checkpoint_version INTEGER NOT NULL,
   producer_id TEXT NOT NULL,
   producer_epoch TEXT NOT NULL,
@@ -226,7 +230,7 @@ CREATE TABLE IF NOT EXISTS filecore_history_checkpoint (
   record_jcs BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS filecore_history_readers (
-  history_id TEXT NOT NULL,
+  history_id TEXT NOT NULL CHECK (history_id = 'filecore-global'),
   reader_id TEXT NOT NULL,
   cursor INTEGER NOT NULL,
   reader_revision INTEGER NOT NULL,
@@ -366,12 +370,14 @@ const READER_KEYS = [
   "cursor_digest",
 ] as const;
 
+const FILECORE_HISTORY_MIGRATION_TOKEN = Symbol("filecore-history-migration");
+
 export class FileCoreHistoryStore {
   readonly #connection: FileCoreHistorySqliteConnection;
   readonly #identity: RuntimeAuthorityIdentity;
   readonly #lock: RuntimeAuthorityLockHandle;
-  readonly #producerId: string;
-  readonly #producerEpoch: string;
+  #producerId: string;
+  #producerEpoch: string;
   readonly #now: () => string;
 
   constructor(
@@ -379,21 +385,32 @@ export class FileCoreHistoryStore {
     identity: RuntimeAuthorityIdentity,
     lock: RuntimeAuthorityLockHandle,
     options: FileCoreHistoryOptions,
+    migrationToken?: symbol,
   ) {
     this.#connection = connection;
     this.#identity = { ...identity };
     this.#lock = lock;
-    this.#producerId = options.producerId;
-    this.#producerEpoch = options.producerEpoch;
+    this.#producerId = "";
+    this.#producerEpoch = "";
     this.#now = options.now ?? (() => new Date().toISOString());
-    assertIdentifier(this.#producerId, "producerId");
-    assertIdentifier(this.#producerEpoch, "producerEpoch");
     assertSafeInteger(options.maxEntries, "maxEntries", 1);
     assertSafeInteger(options.maxBytes, "maxBytes", 1);
     assertSafeInteger(options.maxReaders, "maxReaders", 1);
-    assertDigest(options.legacySourceDigest, "legacySourceDigest");
     if (typeof this.#now !== "function") throw new TypeError("now must be a function");
-    this.#transaction(() => this.#openOrInitialize(options));
+    if (migrationToken === FILECORE_HISTORY_MIGRATION_TOKEN) {
+      this.#openOrInitialize(options as FileCoreHistoryMigrationOptions);
+    } else {
+      this.#transaction(() => this.#openExisting(options));
+    }
+  }
+
+  static migrateInTransaction(
+    connection: FileCoreHistorySqliteConnection,
+    identity: RuntimeAuthorityIdentity,
+    lock: RuntimeAuthorityLockHandle,
+    options: FileCoreHistoryMigrationOptions,
+  ): FileCoreHistoryStore {
+    return new FileCoreHistoryStore(connection, identity, lock, options, FILECORE_HISTORY_MIGRATION_TOKEN);
   }
 
   get identity(): RuntimeAuthorityIdentity {
@@ -418,10 +435,10 @@ export class FileCoreHistoryStore {
       const bytes = bytesFrom(input.value);
       const digest = canonicalJsonDigest(input.value);
       const existing = this.#connection.prepare(
-        "SELECT record_jcs FROM filecore_history_entries WHERE history_id = ? AND producer_epoch = ? AND producer_entry_id = ?",
+        "SELECT * FROM filecore_history_entries WHERE history_id = ? AND producer_epoch = ? AND producer_entry_id = ?",
       ).get(FILECORE_GLOBAL_HISTORY_ID, this.#producerEpoch, input.producerEntryId);
       if (existing !== undefined) {
-        const entry = this.#decodeEntry(existing.record_jcs);
+        const entry = this.#decodeEntryRow(existing);
         if (entry.entry_digest !== digest || entry.entry_jcs !== Buffer.from(bytes).toString("utf8")) {
           throw new FileCoreHistoryError(
             "HISTORY_IDEMPOTENCY_CONFLICT",
@@ -455,11 +472,12 @@ export class FileCoreHistoryStore {
         entryBytes: bytes.length,
         headRevision: nextRevision,
       });
-      this.#connection.prepare(
+      const insert = this.#connection.prepare(
         `INSERT INTO filecore_history_entries
          (history_id, sequence, producer_epoch, producer_entry_id, entry_jcs, entry_digest, entry_bytes, head_revision, record_jcs)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
+      );
+      const result = insert.run(
         FILECORE_GLOBAL_HISTORY_ID,
         sequence,
         this.#producerEpoch,
@@ -470,6 +488,7 @@ export class FileCoreHistoryStore {
         nextRevision,
         Buffer.from(canonicalBytes(entry)),
       );
+      if (result.changes !== 1) throw new FileCoreHistoryError("HISTORY_CORRUPT", "history entry insert changed an unexpected row count");
       this.#writeHead({
         ...head,
         head_revision: nextRevision,
@@ -558,9 +577,10 @@ export class FileCoreHistoryStore {
           deleted_bytes: 0,
         };
       }
-      this.#connection.prepare(
+      const deleted = this.#connection.prepare(
         "DELETE FROM filecore_history_entries WHERE history_id = ? AND sequence <= ?",
       ).run(FILECORE_GLOBAL_HISTORY_ID, deleteThrough);
+      if (deleted.changes !== rows.length) throw new FileCoreHistoryError("HISTORY_CORRUPT", "history delete changed an unexpected row count");
       const nextRevision = this.#nextRevision(head.head_revision);
       const nextHead = {
         ...head,
@@ -586,9 +606,9 @@ export class FileCoreHistoryStore {
     return this.#transaction(() => {
       const head = this.#readHead();
       const existing = this.#connection.prepare(
-        "SELECT record_jcs FROM filecore_history_readers WHERE history_id = ? AND reader_id = ?",
+        "SELECT * FROM filecore_history_readers WHERE history_id = ? AND reader_id = ?",
       ).get(FILECORE_GLOBAL_HISTORY_ID, readerId);
-      if (existing !== undefined) return this.#decodeReader(existing.record_jcs);
+      if (existing !== undefined) return this.#decodeReaderRow(existing);
       const count = Number(this.#connection.prepare(
         "SELECT COUNT(*) AS count FROM filecore_history_readers WHERE history_id = ?",
       ).get(FILECORE_GLOBAL_HISTORY_ID)?.count ?? 0);
@@ -596,11 +616,12 @@ export class FileCoreHistoryStore {
         throw new FileCoreHistoryError("HISTORY_READER_LIMIT", "history reader slot limit is exhausted");
       }
       const reader = this.#readerRecord({ readerId, cursor: head.retained_from, readerRevision: 1 });
-      this.#connection.prepare(
+      const insert = this.#connection.prepare(
         `INSERT INTO filecore_history_readers
          (history_id, reader_id, cursor, reader_revision, cursor_digest, record_jcs)
          VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(
+      );
+      const result = insert.run(
         FILECORE_GLOBAL_HISTORY_ID,
         readerId,
         reader.cursor,
@@ -608,63 +629,66 @@ export class FileCoreHistoryStore {
         reader.cursor_digest,
         Buffer.from(canonicalBytes(reader)),
       );
+      if (result.changes !== 1) throw new FileCoreHistoryError("HISTORY_CORRUPT", "history reader insert changed an unexpected row count");
       return reader;
     });
   }
 
   read(input: FileCoreHistoryReadInput): FileCoreHistoryReadResult {
     assertIdentifier(input.readerId, "readerId");
-    const head = this.#readHead();
-    const readerRow = this.#connection.prepare(
-      "SELECT record_jcs FROM filecore_history_readers WHERE history_id = ? AND reader_id = ?",
-    ).get(FILECORE_GLOBAL_HISTORY_ID, input.readerId);
-    if (readerRow === undefined) {
-      throw new FileCoreHistoryError("HISTORY_CORRUPT", "history reader is not registered");
-    }
-    const reader = this.#decodeReader(readerRow.record_jcs);
-    let cursor = reader.cursor;
-    if (input.start === "from-head") cursor = head.retained_from;
-    else if (input.start === "from-now") cursor = head.produced_through + 1;
-    else if (input.start !== undefined) {
-      assertSafeInteger(input.start.cursor, "cursor", 0);
-      cursor = input.start.cursor;
-    }
-    if (cursor < head.retained_from) {
-      throw new FileCoreHistoryError("HISTORY_GAP", "requested history precedes the retained floor", {
+    return this.#readTransaction(() => {
+      const head = this.#readHead();
+      const readerRow = this.#connection.prepare(
+        "SELECT * FROM filecore_history_readers WHERE history_id = ? AND reader_id = ?",
+      ).get(FILECORE_GLOBAL_HISTORY_ID, input.readerId);
+      if (readerRow === undefined) {
+        throw new FileCoreHistoryError("HISTORY_CORRUPT", "history reader is not registered");
+      }
+      const reader = this.#decodeReaderRow(readerRow);
+      let cursor = reader.cursor;
+      if (input.start === "from-head") cursor = head.retained_from;
+      else if (input.start === "from-now") cursor = head.produced_through + 1;
+      else if (input.start !== undefined) {
+        assertSafeInteger(input.start.cursor, "cursor", 0);
+        cursor = input.start.cursor;
+      }
+      if (cursor < head.retained_from) {
+        throw new FileCoreHistoryError("HISTORY_GAP", "requested history precedes the retained floor", {
+          retained_from: head.retained_from,
+          produced_through: head.produced_through,
+          head_revision: head.head_revision,
+          checkpoint_digest: this.#readCheckpoint(head).checkpoint_digest,
+        });
+      }
+      if (cursor > head.produced_through + 1) {
+        throw new FileCoreHistoryError("HISTORY_CURSOR_AHEAD", "requested history cursor is ahead of the producer frontier");
+      }
+      const maxEntries = input.maxEntries ?? head.max_entries;
+      const maxBytes = input.maxBytes ?? head.max_bytes;
+      assertSafeInteger(maxEntries, "maxEntries", 1);
+      assertSafeInteger(maxBytes, "maxBytes", 1);
+      const rows = this.#connection.prepare(
+        `SELECT * FROM filecore_history_entries
+         WHERE history_id = ? AND sequence >= ? ORDER BY sequence ASC`,
+      ).all(FILECORE_GLOBAL_HISTORY_ID, cursor);
+      const entries: FileCoreHistoryEntry[] = [];
+      let bytes = 0;
+      for (const row of rows) {
+        const entry = this.#decodeEntryRow(row);
+        if (entries.length >= maxEntries || bytes + entry.entry_bytes > maxBytes) break;
+        entries.push(entry);
+        bytes += entry.entry_bytes;
+      }
+      return immutable({
+        history_id: FILECORE_GLOBAL_HISTORY_ID,
+        reader_id: input.readerId,
+        cursor,
+        next_cursor: cursor + entries.length,
+        head_revision: head.head_revision,
         retained_from: head.retained_from,
         produced_through: head.produced_through,
-        head_revision: head.head_revision,
-        checkpoint_digest: this.#readCheckpoint(head).checkpoint_digest,
+        entries: Object.freeze(entries),
       });
-    }
-    if (cursor > head.produced_through + 1) {
-      throw new FileCoreHistoryError("HISTORY_CURSOR_AHEAD", "requested history cursor is ahead of the producer frontier");
-    }
-    const maxEntries = input.maxEntries ?? head.max_entries;
-    const maxBytes = input.maxBytes ?? head.max_bytes;
-    assertSafeInteger(maxEntries, "maxEntries", 1);
-    assertSafeInteger(maxBytes, "maxBytes", 1);
-    const rows = this.#connection.prepare(
-      `SELECT record_jcs FROM filecore_history_entries
-       WHERE history_id = ? AND sequence >= ? ORDER BY sequence ASC`,
-    ).all(FILECORE_GLOBAL_HISTORY_ID, cursor);
-    const entries: FileCoreHistoryEntry[] = [];
-    let bytes = 0;
-    for (const row of rows) {
-      const entry = this.#decodeEntry(row.record_jcs);
-      if (entries.length >= maxEntries || bytes + entry.entry_bytes > maxBytes) break;
-      entries.push(entry);
-      bytes += entry.entry_bytes;
-    }
-    return immutable({
-      history_id: FILECORE_GLOBAL_HISTORY_ID,
-      reader_id: input.readerId,
-      cursor,
-      next_cursor: cursor + entries.length,
-      head_revision: head.head_revision,
-      retained_from: head.retained_from,
-      produced_through: head.produced_through,
-      entries: Object.freeze(entries),
     });
   }
 
@@ -675,10 +699,10 @@ export class FileCoreHistoryStore {
     return this.#transaction(() => {
       const head = this.#readHead();
       const row = this.#connection.prepare(
-        "SELECT record_jcs FROM filecore_history_readers WHERE history_id = ? AND reader_id = ?",
+        "SELECT * FROM filecore_history_readers WHERE history_id = ? AND reader_id = ?",
       ).get(FILECORE_GLOBAL_HISTORY_ID, input.readerId);
       if (row === undefined) throw new FileCoreHistoryError("HISTORY_CORRUPT", "history reader is not registered");
-      const current = this.#decodeReader(row.record_jcs);
+      const current = this.#decodeReaderRow(row);
       if (current.reader_revision !== input.expectedReaderRevision) {
         throw new FileCoreHistoryError("HISTORY_READER_REVISION_CONFLICT", "reader revision is stale");
       }
@@ -694,11 +718,12 @@ export class FileCoreHistoryStore {
         cursor: input.cursor,
         readerRevision: this.#nextRevision(current.reader_revision),
       });
-      this.#connection.prepare(
+      const update = this.#connection.prepare(
         `UPDATE filecore_history_readers
          SET cursor = ?, reader_revision = ?, cursor_digest = ?, record_jcs = ?
          WHERE history_id = ? AND reader_id = ? AND reader_revision = ?`,
-      ).run(
+      );
+      const result = update.run(
         next.cursor,
         next.reader_revision,
         next.cursor_digest,
@@ -707,11 +732,41 @@ export class FileCoreHistoryStore {
         current.reader_id,
         current.reader_revision,
       );
+      if (result.changes !== 1) throw new FileCoreHistoryError("HISTORY_CORRUPT", "history reader update changed an unexpected row count");
       return next;
     });
   }
 
-  #openOrInitialize(options: FileCoreHistoryOptions): void {
+  #openExisting(options: FileCoreHistoryOptions): void {
+    this.#connection.exec(HISTORY_SCHEMA_SQL);
+    const row = this.#connection.prepare(
+      "SELECT record_jcs FROM filecore_history_head WHERE singleton = 1",
+    ).get();
+    if (row === undefined) {
+      throw new FileCoreHistoryError("HISTORY_MIGRATION_REQUIRED", "FileCore history has not been migrated");
+    }
+    const head = this.#readHead();
+    if (options.legacySourceDigest !== undefined && head.legacy_source_digest !== options.legacySourceDigest) {
+      throw new FileCoreHistoryError("HISTORY_MIGRATION_REQUIRED", "history migration source digest does not match");
+    }
+    if (
+      head.max_entries !== options.maxEntries ||
+      head.max_bytes !== options.maxBytes ||
+      head.max_readers !== options.maxReaders
+    ) {
+      throw new FileCoreHistoryError("HISTORY_MIGRATION_REQUIRED", "history limits do not match the persisted policy");
+    }
+    this.#producerId = head.producer_id;
+    this.#producerEpoch = head.producer_epoch;
+    this.#verifyAll(head);
+  }
+
+  #openOrInitialize(options: FileCoreHistoryMigrationOptions): void {
+    assertIdentifier(options.producerId, "producerId");
+    assertIdentifier(options.producerEpoch, "producerEpoch");
+    assertDigest(options.legacySourceDigest, "legacySourceDigest");
+    this.#producerId = options.producerId;
+    this.#producerEpoch = options.producerEpoch;
     this.#connection.exec(HISTORY_SCHEMA_SQL);
     const row = this.#connection.prepare(
       "SELECT record_jcs FROM filecore_history_head WHERE singleton = 1",
@@ -1035,6 +1090,37 @@ export class FileCoreHistoryStore {
     return immutable({ ...entry });
   }
 
+  #decodeEntryRow(row: Record<string, unknown>): FileCoreHistoryEntry {
+    const entry = this.#decodeEntry(row.record_jcs);
+    if (
+      String(row.history_id) !== entry.history_id ||
+      Number(row.sequence) !== entry.sequence ||
+      String(row.producer_epoch) !== entry.producer_epoch ||
+      String(row.producer_entry_id) !== entry.producer_entry_id ||
+      String(row.entry_digest) !== entry.entry_digest ||
+      Number(row.entry_bytes) !== entry.entry_bytes ||
+      Number(row.head_revision) !== entry.head_revision ||
+      !sameBytes(toBytes(row.entry_jcs, "history entry entry_jcs"), Buffer.from(entry.entry_jcs, "utf8"))
+    ) {
+      throw new FileCoreHistoryError("HISTORY_CORRUPT", "history entry projection disagrees with its canonical record");
+    }
+    return entry;
+  }
+
+  #decodeReaderRow(row: Record<string, unknown>): FileCoreHistoryReader {
+    const reader = this.#decodeReader(row.record_jcs);
+    if (
+      String(row.history_id) !== reader.history_id ||
+      String(row.reader_id) !== reader.reader_id ||
+      Number(row.cursor) !== reader.cursor ||
+      Number(row.reader_revision) !== reader.reader_revision ||
+      String(row.cursor_digest) !== reader.cursor_digest
+    ) {
+      throw new FileCoreHistoryError("HISTORY_CORRUPT", "history reader projection disagrees with its canonical record");
+    }
+    return reader;
+  }
+
   #decodeReader(value: unknown): FileCoreHistoryReader {
     const record = decodeRecord(value, "history reader");
     assertClosedRecord(record, READER_KEYS, "history reader");
@@ -1067,13 +1153,14 @@ export class FileCoreHistoryStore {
       maxReaders: head.max_readers,
       legacySourceDigest: head.legacy_source_digest,
     });
-    this.#connection.prepare(
+    const update = this.#connection.prepare(
       `UPDATE filecore_history_head SET
        history_id = ?, producer_id = ?, producer_epoch = ?, head_revision = ?, next_sequence = ?,
        retained_from = ?, produced_through = ?, retained_entry_count = ?, retained_entry_bytes = ?,
        max_entries = ?, max_bytes = ?, max_readers = ?, legacy_source_digest = ?, head_digest = ?, record_jcs = ?
        WHERE singleton = 1`,
-    ).run(
+    );
+    const result = update.run(
       record.history_id,
       record.producer_id,
       record.producer_epoch,
@@ -1090,15 +1177,17 @@ export class FileCoreHistoryStore {
       record.head_digest,
       Buffer.from(canonicalBytes(record)),
     );
+    if (result.changes !== 1) throw new FileCoreHistoryError("HISTORY_CORRUPT", "history head update changed an unexpected row count");
   }
 
   #writeCheckpoint(checkpoint: FileCoreHistoryCheckpoint): void {
-    this.#connection.prepare(
+    const update = this.#connection.prepare(
       `UPDATE filecore_history_checkpoint SET
        history_id = ?, checkpoint_version = ?, producer_id = ?, producer_epoch = ?, producer_revision = ?,
        delete_through = ?, issued_at = ?, evidence_digest = ?, checkpoint_digest = ?, record_jcs = ?
        WHERE singleton = 1`,
-    ).run(
+    );
+    const result = update.run(
       checkpoint.history_id,
       checkpoint.checkpoint_version,
       checkpoint.producer_id,
@@ -1110,6 +1199,7 @@ export class FileCoreHistoryStore {
       checkpoint.checkpoint_digest,
       Buffer.from(canonicalBytes(checkpoint)),
     );
+    if (result.changes !== 1) throw new FileCoreHistoryError("HISTORY_CORRUPT", "history checkpoint update changed an unexpected row count");
   }
 
   #verifyAll(head: FileCoreHistoryHead): void {
@@ -1122,13 +1212,12 @@ export class FileCoreHistoryStore {
       throw new FileCoreHistoryError("HISTORY_CORRUPT", "history checkpoint does not match the producer head");
     }
     const rows = this.#connection.prepare(
-      `SELECT sequence, producer_epoch, producer_entry_id, entry_jcs, entry_digest, entry_bytes, head_revision, record_jcs
-       FROM filecore_history_entries WHERE history_id = ? ORDER BY sequence ASC`,
+      `SELECT * FROM filecore_history_entries WHERE history_id = ? ORDER BY sequence ASC`,
     ).all(FILECORE_GLOBAL_HISTORY_ID);
     let expected = head.retained_from;
     let bytes = 0;
     for (const row of rows) {
-      const entry = this.#decodeEntry(row.record_jcs);
+      const entry = this.#decodeEntryRow(row);
       if (
         entry.sequence !== expected ||
         entry.producer_epoch !== head.producer_epoch ||
@@ -1152,12 +1241,12 @@ export class FileCoreHistoryStore {
       throw new FileCoreHistoryError("HISTORY_CORRUPT", "history head retained counts do not match entries");
     }
     const readerRows = this.#connection.prepare(
-      "SELECT record_jcs FROM filecore_history_readers WHERE history_id = ?",
+      "SELECT * FROM filecore_history_readers WHERE history_id = ?",
     ).all(FILECORE_GLOBAL_HISTORY_ID);
     if (readerRows.length > head.max_readers) {
       throw new FileCoreHistoryError("HISTORY_CORRUPT", "history reader count exceeds max_readers");
     }
-    for (const row of readerRows) this.#decodeReader(row.record_jcs);
+    for (const row of readerRows) this.#decodeReaderRow(row);
   }
 
   #transaction<T>(operation: () => T): T {
@@ -1166,23 +1255,88 @@ export class FileCoreHistoryStore {
     try {
       this.#lock.assertHeld();
       this.#connection.prepare("BEGIN IMMEDIATE").run();
-      try {
-        const result = operation();
-        this.#connection.prepare("COMMIT").run();
-        return result;
-      } catch (error) {
-        try {
-          this.#connection.prepare("ROLLBACK").run();
-        } catch {
-          // Preserve the original operation failure.
-        }
-        if (error instanceof FileCoreHistoryError) throw error;
-        const message = error instanceof Error ? error.message : String(error);
-        throw new FileCoreHistoryError("HISTORY_CORRUPT", `history transaction failed: ${message}`, { cause: error });
-      }
     } catch (error) {
-      if (error instanceof FileCoreHistoryError) throw error;
-      throw new FileCoreHistoryError("HISTORY_COMMIT_UNKNOWN", "history transaction outcome is unknown", { cause: error });
+      throw new FileCoreHistoryError("HISTORY_CORRUPT", "history transaction could not begin", { cause: error });
     }
+    let result: T;
+    try {
+      result = operation();
+    } catch (error) {
+      try {
+        this.#connection.prepare("ROLLBACK").run();
+      } catch (rollbackError) {
+        throw new FileCoreHistoryError("HISTORY_COMMIT_UNKNOWN", "history rollback outcome is unknown", { cause: rollbackError });
+      }
+      if (error instanceof FileCoreHistoryError) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      throw new FileCoreHistoryError("HISTORY_CORRUPT", `history transaction failed: ${message}`, { cause: error });
+    }
+    try {
+      this.#connection.prepare("COMMIT").run();
+    } catch (error) {
+      throw new FileCoreHistoryError("HISTORY_COMMIT_UNKNOWN", "history commit outcome is unknown; reopen before retry", { cause: error });
+    }
+    return result;
+  }
+
+  #readTransaction<T>(operation: () => T): T {
+    if (!this.#connection.open) throw new FileCoreHistoryError("HISTORY_CORRUPT", "history database is closed");
+    if (!this.#lock.held) throw new FileCoreHistoryError("HISTORY_LOCK_NOT_HELD", "history reads require the controller lock");
+    try {
+      this.#lock.assertHeld();
+      this.#connection.prepare("BEGIN").run();
+    } catch (error) {
+      throw new FileCoreHistoryError("HISTORY_CORRUPT", "history read transaction could not begin", { cause: error });
+    }
+    let result: T;
+    try {
+      result = operation();
+    } catch (error) {
+      try {
+        this.#connection.prepare("ROLLBACK").run();
+      } catch (rollbackError) {
+        throw new FileCoreHistoryError("HISTORY_COMMIT_UNKNOWN", "history read rollback outcome is unknown", { cause: rollbackError });
+      }
+      if (error instanceof FileCoreHistoryError) throw error;
+      throw new FileCoreHistoryError("HISTORY_CORRUPT", "history read transaction failed", { cause: error });
+    }
+    try {
+      this.#connection.prepare("COMMIT").run();
+    } catch (error) {
+      throw new FileCoreHistoryError("HISTORY_COMMIT_UNKNOWN", "history read commit outcome is unknown; reopen before retry", { cause: error });
+    }
+    return result;
+  }
+}
+
+export class FileCoreHistoryReaderStore {
+  readonly #store: FileCoreHistoryStore;
+
+  constructor(store: FileCoreHistoryStore) {
+    this.#store = store;
+  }
+
+  get identity(): RuntimeAuthorityIdentity {
+    return this.#store.identity;
+  }
+
+  get head(): FileCoreHistoryHead {
+    return this.#store.head;
+  }
+
+  get checkpoint(): FileCoreHistoryCheckpoint {
+    return this.#store.checkpoint;
+  }
+
+  registerReader(readerId: string): FileCoreHistoryReader {
+    return this.#store.registerReader(readerId);
+  }
+
+  read(input: FileCoreHistoryReadInput): FileCoreHistoryReadResult {
+    return this.#store.read(input);
+  }
+
+  acknowledge(input: FileCoreHistoryAckInput): FileCoreHistoryReader {
+    return this.#store.acknowledge(input);
   }
 }
