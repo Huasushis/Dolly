@@ -286,9 +286,7 @@ pub struct HostAuthorityRevision {
 pub struct CurrentAuthoritySnapshot {
     pub mapping: ConfigRevisionMapping,
     pub premise: Option<ModuleActivationPremises>,
-    pub controller_generation_id: String,
 }
-
 /// Result of one append-only install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallDisposition {
@@ -543,6 +541,13 @@ pub(crate) fn refresh_controller_generation_in_transaction(
 pub fn load_current_authority(
     connection: &Connection,
 ) -> Result<Option<CurrentAuthoritySnapshot>, HostAuthorityError> {
+    load_current_authority_with_generation(connection)
+        .map(|snapshot| snapshot.map(|(snapshot, _generation)| snapshot))
+}
+
+pub(crate) fn load_current_authority_with_generation(
+    connection: &Connection,
+) -> Result<Option<(CurrentAuthoritySnapshot, String)>, HostAuthorityError> {
     let Some((identity, generation, revision, digest, state_bytes)) = connection
         .query_row(
             "SELECT daemon_installation_id, instance_id, controller_generation_id,
@@ -626,14 +631,10 @@ pub fn load_current_authority(
         .optional()?
         .map(|bytes| decode_record(&bytes, "activation premise"))
         .transpose()?;
-    let snapshot = CurrentAuthoritySnapshot {
-        mapping,
-        premise,
-        controller_generation_id: generation,
-    };
+    let snapshot = CurrentAuthoritySnapshot { mapping, premise };
     verify_persisted_snapshot(connection, &snapshot)?;
     validate_loaded_snapshot(&snapshot)?;
-    Ok(Some(snapshot))
+    Ok(Some((snapshot, generation)))
 }
 
 fn verify_persisted_snapshot(

@@ -36,7 +36,8 @@ use crate::host_authority::{
     LinuxServiceCandidate, ModuleActivationPremises, PermissionPolicyBackendBinding,
     PermissionPolicyDefinition, PermissionPolicySelection, ResolvedConfiguration,
     RuntimeAuthorityIdentity, install_host_authority_revision_in_transaction,
-    load_current_authority, refresh_controller_generation_in_transaction, validate_revision,
+    load_current_authority_with_generation, refresh_controller_generation_in_transaction,
+    validate_revision,
 };
 
 /// Highest schema version this binary understands.
@@ -147,9 +148,9 @@ pub struct Database {
     #[allow(dead_code)]
     db_path: PathBuf,
     #[allow(dead_code)]
-    path_lock: File,
-    #[allow(dead_code)]
     identity_lock: Option<File>,
+    #[allow(dead_code)]
+    path_lock: File,
     verified: VerifiedSqliteBuild,
     configuration: Option<ConnectionConfiguration>,
     schema_version: i64,
@@ -186,6 +187,14 @@ struct ArtifactState {
     uid: u32,
     #[cfg(unix)]
     gid: u32,
+    #[cfg(unix)]
+    atime_seconds: i64,
+    #[cfg(unix)]
+    atime_nanoseconds: i64,
+    #[cfg(unix)]
+    mtime_seconds: i64,
+    #[cfg(unix)]
+    mtime_nanoseconds: i64,
 }
 
 #[derive(Debug)]
@@ -338,7 +347,7 @@ impl Database {
     /// Open an existing committed authority database using an explicit
     /// attestation (tests and release instrumenting use this).
     pub fn open_with(db_path: &Path, attestation: &ReleaseAttestation) -> StorageResult<Self> {
-        open_internal(db_path, attestation, false).map(|database| database)
+        open_internal(db_path, attestation).map(|database| database)
     }
 
     /// Open the smallest explicit offline handle used to initialize/migrate
@@ -401,57 +410,32 @@ impl Database {
 fn open_migration_database(
     db_path: &Path,
     attestation: &ReleaseAttestation,
-) -> StorageResult<(Database, bool)> {
+    cleanup: &mut MigrationCleanup,
+) -> StorageResult<Database> {
     reject_symlink_components(db_path)?;
     let path_lock_path = instance_lock_path(db_path);
     reject_symlink_components(&path_lock_path)?;
     let loaded = probe_loaded_sqlite();
     let verified = SqliteBuildGate.verify(attestation, &loaded)?;
     let (path_lock, path_lock_created) = acquire_lock_file_with_creation(&path_lock_path)?;
-    let expected_identity = match read_persisted_identity(db_path) {
-        Ok(identity) => identity,
-        Err(error) => {
-            if path_lock_created {
-                let _ = fs::remove_file(&path_lock_path);
-            }
-            return Err(error);
-        }
-    };
-    if expected_identity.is_some() {
-        if path_lock_created {
-            let _ = fs::remove_file(&path_lock_path);
-        }
+    cleanup.note_path_lock_created(path_lock_created);
+    if read_persisted_identity(db_path)?.is_some() {
         return Err(StorageError::MigrationRequired);
     }
-    let owner = match lock_owner(&path_lock) {
-        Ok(owner) => owner,
-        Err(error) => {
-            if path_lock_created {
-                let _ = fs::remove_file(&path_lock_path);
-            }
-            return Err(error);
-        }
-    };
-    if owner.is_some() {
-        if path_lock_created {
-            let _ = fs::remove_file(&path_lock_path);
-        }
+    if lock_owner(&path_lock)?.is_some() {
         return Err(StorageError::Corrupt);
     }
-    Ok((
-        Database {
-            db_path: db_path.to_path_buf(),
-            connection: None,
-            path_lock,
-            identity_lock: None,
-            verified,
-            configuration: None,
-            schema_version: 0,
-            authority_identity: None,
-            controller_generation_id: None,
-        },
-        path_lock_created,
-    ))
+    Ok(Database {
+        db_path: db_path.to_path_buf(),
+        connection: None,
+        identity_lock: None,
+        path_lock,
+        verified,
+        configuration: None,
+        schema_version: 0,
+        authority_identity: None,
+        controller_generation_id: None,
+    })
 }
 
 impl OfflineDatabase {
@@ -473,16 +457,14 @@ impl OfflineDatabase {
         let mut cleanup =
             MigrationCleanup::capture(&self.db_path, &path_lock_path, &identity_lock_path)?;
         let result = (|| -> StorageResult<Database> {
-            let (mut database, path_lock_created) =
-                open_migration_database(&self.db_path, &self.attestation)?;
-            cleanup.note_path_lock_created(path_lock_created);
+            let mut database =
+                open_migration_database(&self.db_path, &self.attestation, &mut cleanup)?;
 
             let controller_generation_id = mint_controller_generation_id()?;
             let (identity_lock, identity_lock_created) =
                 acquire_identity_lock_with_creation(&input.identity)?;
             cleanup.note_identity_lock_created(identity_lock_created);
             verify_or_write_lock_owner(&identity_lock, &input.identity, &controller_generation_id)?;
-
             cleanup.begin_database();
             let connection = match open_connection(&database.db_path) {
                 Ok(connection) => connection,
@@ -565,110 +547,76 @@ impl OfflineDatabase {
     }
 }
 
-fn open_internal(
-    db_path: &Path,
-    attestation: &ReleaseAttestation,
-    offline: bool,
-) -> StorageResult<Database> {
+fn open_internal(db_path: &Path, attestation: &ReleaseAttestation) -> StorageResult<Database> {
     reject_symlink_components(db_path)?;
     let path_lock_path = instance_lock_path(db_path);
     reject_symlink_components(&path_lock_path)?;
 
-    // The build gate runs before creating either lock. A normal writable open
-    // also performs a read-only identity preflight before acquiring them.
     let loaded = probe_loaded_sqlite();
     let verified = SqliteBuildGate.verify(attestation, &loaded)?;
-    let expected_identity = read_persisted_identity(db_path)?;
-    if !offline && expected_identity.is_none() {
-        return Err(StorageError::MigrationRequired);
-    }
-    let controller_generation_id = if !offline && expected_identity.is_some() {
-        Some(mint_controller_generation_id()?)
-    } else {
-        expected_identity
-            .as_ref()
-            .map(|(_, generation)| generation.clone())
-    };
+    let expected_identity =
+        read_persisted_identity(db_path)?.ok_or(StorageError::MigrationRequired)?;
+    let identity_lock_path = canonical_identity_lock_path(&expected_identity.0);
+    reject_symlink_components(&identity_lock_path)?;
+    let mut cleanup = MigrationCleanup::capture(db_path, &path_lock_path, &identity_lock_path)?;
+    let result = (|| -> StorageResult<Database> {
+        let (path_lock, path_lock_created) = acquire_lock_file_with_creation(&path_lock_path)?;
+        cleanup.note_path_lock_created(path_lock_created);
 
-    let identity_lock = expected_identity
-        .as_ref()
-        .map(|(identity, _)| acquire_identity_lock(identity))
-        .transpose()?;
-    let path_lock = acquire_lock_file(&path_lock_path)?;
-    if let Some((identity, _)) = expected_identity.as_ref() {
-        let generation = controller_generation_id
-            .as_deref()
-            .ok_or(StorageError::Corrupt)?;
-        if let Some(lock) = identity_lock.as_ref() {
-            verify_or_write_lock_owner(lock, identity, generation)?;
+        let current_identity =
+            read_persisted_identity(db_path)?.ok_or(StorageError::MigrationRequired)?;
+        if current_identity != expected_identity {
+            return Err(StorageError::Corrupt);
         }
-        verify_or_write_lock_owner(&path_lock, identity, generation)?;
-    } else if lock_owner(&path_lock)?.is_some() {
-        return Err(StorageError::Corrupt);
-    }
 
-    let fresh_offline = offline && expected_identity.is_none();
-    let mut connection = if fresh_offline {
-        None
-    } else {
-        Some(open_connection(db_path)?)
-    };
-    let configuration = if fresh_offline {
-        None
-    } else {
-        Some(apply_and_verify_configuration(
-            connection.as_ref().expect("ordinary connection"),
-        )?)
-    };
-    let schema_version = if fresh_offline {
-        0
-    } else {
-        ensure_schema(connection.as_ref().expect("ordinary connection"), &verified)?
-    };
-    let (authority_identity, _persisted_generation) = if fresh_offline {
-        (None, None)
-    } else {
-        let connection_ref = connection.as_ref().expect("ordinary connection");
-        verify_sqlite_integrity(connection_ref)?;
-        let authority_identity = validate_authority_state(connection_ref)?;
-        let persisted_generation = read_controller_generation(connection_ref)?;
-        if authority_identity
-            != expected_identity
-                .as_ref()
-                .map(|(identity, _)| identity.clone())
-            || persisted_generation
-                != expected_identity
-                    .as_ref()
-                    .map(|(_, generation)| generation.clone())
+        let (identity_lock, identity_lock_created) =
+            acquire_identity_lock_with_creation(&expected_identity.0)?;
+        cleanup.note_identity_lock_created(identity_lock_created);
+        let controller_generation_id = mint_controller_generation_id()?;
+        verify_or_write_lock_owner(
+            &identity_lock,
+            &expected_identity.0,
+            &controller_generation_id,
+        )?;
+        verify_or_write_lock_owner(&path_lock, &expected_identity.0, &controller_generation_id)?;
+
+        cleanup.begin_database();
+        let connection = open_connection(db_path)?;
+        cleanup.note_database_artifacts();
+        let configuration = apply_and_verify_configuration(&connection)?;
+        cleanup.note_database_artifacts();
+        let schema_version = ensure_schema(&connection, &verified)?;
+        verify_sqlite_integrity(&connection)?;
+        let authority_identity =
+            validate_authority_state(&connection)?.ok_or(StorageError::MigrationRequired)?;
+        let persisted_generation = read_controller_generation(&connection)?;
+        if authority_identity != expected_identity.0.clone()
+            || persisted_generation != Some(expected_identity.1.clone())
         {
             return Err(StorageError::Corrupt);
         }
-        (authority_identity, persisted_generation)
-    };
-    if !offline && authority_identity.is_none() {
-        return Err(StorageError::MigrationRequired);
-    }
-    if !offline {
-        let fresh_generation = controller_generation_id
-            .as_deref()
-            .ok_or(StorageError::Corrupt)?;
-        refresh_controller_generation(
-            connection.as_mut().expect("ordinary connection"),
-            fresh_generation,
-        )?;
-    }
+        let mut connection = connection;
+        refresh_controller_generation(&mut connection, &controller_generation_id)?;
+        Ok(Database {
+            db_path: db_path.to_path_buf(),
+            connection: Some(connection),
+            identity_lock: Some(identity_lock),
+            path_lock,
+            verified,
+            configuration: Some(configuration),
+            schema_version,
+            authority_identity: Some(expected_identity.0.clone()),
+            controller_generation_id: Some(controller_generation_id),
+        })
+    })();
 
-    Ok(Database {
-        db_path: db_path.to_path_buf(),
-        connection,
-        path_lock,
-        identity_lock,
-        verified,
-        configuration,
-        schema_version,
-        authority_identity,
-        controller_generation_id,
-    })
+    match result {
+        Ok(database) => {
+            cleanup.commit();
+            Ok(database)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn read_persisted_identity(
@@ -893,6 +841,10 @@ fn capture_artifact_state(path: &Path) -> StorageResult<Option<ArtifactState>> {
             mode: metadata.mode() & 0o7777,
             uid: metadata.uid(),
             gid: metadata.gid(),
+            atime_seconds: metadata.atime(),
+            atime_nanoseconds: metadata.atime_nsec(),
+            mtime_seconds: metadata.mtime(),
+            mtime_nanoseconds: metadata.mtime_nsec(),
         }))
     }
     #[cfg(not(unix))]
@@ -921,13 +873,23 @@ fn restore_artifact_state(path: &Path, state: &ArtifactState) -> StorageResult<(
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
         unsafe {
-            let _ = libc::fchmod(fd, state.mode);
             let _ = libc::fchown(fd, state.uid, state.gid);
+            let _ = libc::fchmod(fd, state.mode);
+            let times = [
+                libc::timespec {
+                    tv_sec: state.atime_seconds as libc::time_t,
+                    tv_nsec: state.atime_nanoseconds as libc::c_long,
+                },
+                libc::timespec {
+                    tv_sec: state.mtime_seconds as libc::time_t,
+                    tv_nsec: state.mtime_nanoseconds as libc::c_long,
+                },
+            ];
+            let _ = libc::futimens(fd, times.as_ptr());
         }
     }
     Ok(())
 }
-
 fn reject_symlink_components(path: &Path) -> StorageResult<()> {
     let mut probe = PathBuf::new();
     for component in path.components() {
@@ -938,7 +900,6 @@ fn reject_symlink_components(path: &Path) -> StorageResult<()> {
             }
             Ok(_) => { /* regular dir/file: continue */ }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // Remaining components do not exist yet; nothing to chase.
                 break;
             }
             Err(e) => {
@@ -949,8 +910,14 @@ fn reject_symlink_components(path: &Path) -> StorageResult<()> {
     Ok(())
 }
 
-fn acquire_lock_file(lock_path: &Path) -> StorageResult<File> {
-    acquire_lock_file_with_creation(lock_path).map(|(file, _)| file)
+fn remove_created_lock_file(lock_path: &Path, file: File) {
+    let identity = current_artifact_identity(lock_path);
+    drop(file);
+    if let Some(identity) = identity {
+        if current_artifact_identity(lock_path) == Some(identity) {
+            let _ = fs::remove_file(lock_path);
+        }
+    }
 }
 
 fn acquire_lock_file_with_creation(lock_path: &Path) -> StorageResult<(File, bool)> {
@@ -981,23 +948,23 @@ fn acquire_lock_file_with_creation(lock_path: &Path) -> StorageResult<(File, boo
             Ok(meta) => meta,
             Err(error) => {
                 if created {
-                    let _ = fs::remove_file(lock_path);
+                    remove_created_lock_file(lock_path, file);
                 }
                 return Err(error);
             }
         };
         if !meta.is_file()
             || meta.uid() != unsafe { libc::geteuid() }
-            || meta.mode() & 0o777 != 0o600
+            || meta.mode() & 0o7777 != 0o600
         {
             if created {
-                let _ = fs::remove_file(lock_path);
+                remove_created_lock_file(lock_path, file);
             }
             return Err(StorageError::UnsafeConfiguration);
         }
         if let Err(error) = try_lock_exclusive(&file) {
             if created {
-                let _ = fs::remove_file(lock_path);
+                remove_created_lock_file(lock_path, file);
             }
             return Err(error);
         }
@@ -1008,10 +975,6 @@ fn acquire_lock_file_with_creation(lock_path: &Path) -> StorageResult<(File, boo
         let _ = lock_path;
         Err(StorageError::UnsafeConfiguration)
     }
-}
-
-fn acquire_identity_lock(identity: &RuntimeAuthorityIdentity) -> StorageResult<File> {
-    acquire_identity_lock_with_creation(identity).map(|(file, _)| file)
 }
 
 fn acquire_identity_lock_with_creation(
@@ -1071,7 +1034,9 @@ fn validate_private_runtime_dir(path: &Path, create: bool) -> StorageResult<()> 
         match builder.create(path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(_) => return Err(StorageError::UnsafeConfiguration),
+            Err(_) => {
+                return Err(StorageError::UnsafeConfiguration);
+            }
         }
     }
     reject_symlink_components(path)?;
@@ -1079,7 +1044,7 @@ fn validate_private_runtime_dir(path: &Path, create: bool) -> StorageResult<()> 
     if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
         return Err(StorageError::UnsafeConfiguration);
     }
-    if metadata.mode() & 0o777 != 0o700 {
+    if metadata.mode() & 0o7777 != 0o700 {
         return Err(StorageError::UnsafeConfiguration);
     }
     Ok(())
@@ -1136,7 +1101,6 @@ fn verify_or_write_lock_owner(
     clone.sync_data().map_err(map_io_error)?;
     Ok(())
 }
-
 /// The instance lock file lives beside the database, one per storage root
 /// (cross-platform contract §6 "one lock file in its durable data root").
 fn instance_lock_path(db_path: &Path) -> PathBuf {
@@ -1383,7 +1347,8 @@ fn validate_authority_state(
         _ => return Err(StorageError::Corrupt),
     };
 
-    let snapshot = load_current_authority(connection).map_err(map_host_authority_error)?;
+    let snapshot =
+        load_current_authority_with_generation(connection).map_err(map_host_authority_error)?;
     if core_identity.is_none() && snapshot.is_none() {
         let reachable_rows: i64 = connection
             .query_row(
@@ -1403,13 +1368,13 @@ fn validate_authority_state(
         (None, None) => Ok(None),
         (Some(_), None) => Err(StorageError::Corrupt),
         (None, Some(_)) => Err(StorageError::Corrupt),
-        (Some(core), Some(snapshot)) => {
+        (Some(core), Some((snapshot, state_generation))) => {
             let state_identity = RuntimeAuthorityIdentity {
                 daemon_installation_id: snapshot.mapping.daemon_installation_id.clone(),
                 instance_id: snapshot.mapping.instance_id.clone(),
             };
             if core != state_identity
-                || core_generation.as_deref() != Some(snapshot.controller_generation_id.as_str())
+                || core_generation.as_deref() != Some(state_generation.as_str())
             {
                 return Err(StorageError::Corrupt);
             }

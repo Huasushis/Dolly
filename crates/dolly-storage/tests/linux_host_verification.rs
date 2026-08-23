@@ -72,7 +72,6 @@ fn authority_with_instance(
             canonical_config: config,
         },
         premise: Some(premise),
-        controller_generation_id: "test-controller-generation".into(),
     }
 }
 
