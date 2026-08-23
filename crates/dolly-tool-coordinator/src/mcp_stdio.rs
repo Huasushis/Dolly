@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::Child;
+use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use dolly_canonical_json::{
     CanonicalJsonObject, CanonicalJsonValue, PROTOCOL_WIRE_PARSE_DEPTH, ParseLimits, Sha256Digest,
@@ -16,40 +16,37 @@ use dolly_storage::mcp_readiness::{
     MCP_PROTOCOL_VERSION_2025_06_18, McpHandshakeObservation, McpTransportBinding,
     McpTransportProbe, McpTransportProbeError, McpTransportReadiness,
 };
+use dolly_storage::runtime_binding::ProcessGeneration;
 use dolly_storage::tool_broker_authority::ToolDispatchAuthority;
 
 use crate::permit::SendPermitBinding;
+use crate::ports::parse_rfc3339_utc;
 use crate::service::{ToolTransport, TransportOutcome};
 
 const INITIALIZE_REQUEST_ID: &str = "dolly-initialize";
 const MCP_ADAPTER: &str = "mcp";
 const MCP_STDIO_KIND: &str = "stdio";
-
-/// Bounds applied to every stdio application frame and exchange.
+/// Static bounds applied to every stdio application frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StdioTransportLimits {
     pub(crate) max_frame_bytes: usize,
     pub(crate) max_nesting_depth: u16,
-    pub(crate) request_timeout: Duration,
 }
 
 impl StdioTransportLimits {
     pub(crate) fn new(
         max_frame_bytes: usize,
         max_nesting_depth: u16,
-        request_timeout: Duration,
     ) -> Result<Self, StdioTransportError> {
         if max_frame_bytes < 2
             || max_nesting_depth == 0
             || max_nesting_depth > PROTOCOL_WIRE_PARSE_DEPTH
-            || request_timeout.is_zero()
         {
             return Err(StdioTransportError::InvalidLimits);
         }
         Ok(Self {
             max_frame_bytes,
             max_nesting_depth,
-            request_timeout,
         })
     }
 }
@@ -57,6 +54,7 @@ impl StdioTransportLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StdioTransportError {
     InvalidLimits,
+    InvalidDeadline,
     MissingPipe,
     ProcessIdentityMismatch,
     InvalidFrame,
@@ -70,24 +68,25 @@ pub(crate) enum StdioTransportError {
     Disconnected,
     Io,
 }
-
 /// Cancellation is local to one Host-owned session. It never creates a retry
 /// or an alternate send permit.
 #[derive(Clone, Debug)]
 pub(crate) struct StdioCancellation {
     cancelled: Arc<AtomicBool>,
+    process: Arc<ProcessControl>,
 }
 
 impl StdioCancellation {
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.process.stop();
     }
 
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
 }
-
+#[derive(Debug)]
 struct ProcessControl {
     child: Option<Arc<Mutex<Child>>>,
 }
@@ -114,6 +113,111 @@ impl ProcessControl {
         let _ = child.wait();
     }
 }
+#[derive(Clone)]
+pub(crate) struct HostMcpStdioProcessHandle {
+    process: Arc<ProcessControl>,
+    identity: HostVerifiedMcpStdioIdentity,
+}
+
+impl HostMcpStdioProcessHandle {
+    pub(crate) fn terminate(&self) {
+        self.process.stop();
+    }
+}
+
+#[derive(Clone)]
+struct HostVerifiedMcpStdioIdentity {
+    server_id: String,
+    adapter: String,
+    protocol_version: String,
+    transport_kind: String,
+    endpoint: String,
+    endpoint_digest: Sha256Digest,
+    transport_digest: Sha256Digest,
+    daemon_installation_id: String,
+    instance_id: String,
+    controller_generation: ExtensionGeneration,
+    worker_epoch: WorkerEpoch,
+    extension_alias: ExtensionId,
+    extension_generation: ExtensionGeneration,
+    runtime_binding_digest: Sha256Digest,
+    session_id: String,
+}
+
+pub(crate) struct HostOwnedMcpStdioSession {
+    reader: ChildStdout,
+    writer: ChildStdin,
+    handle: HostMcpStdioProcessHandle,
+}
+
+impl HostOwnedMcpStdioSession {
+    /// The Host calls this only after its installed-child verifier has
+    /// authenticated the exact executable/package digests for `binding`.
+    pub(crate) fn from_verified_child(
+        mut child: Child,
+        binding: &McpTransportBinding,
+        process_generation: &ProcessGeneration,
+    ) -> Result<Self, StdioTransportError> {
+        let reader = child
+            .stdout
+            .take()
+            .ok_or(StdioTransportError::MissingPipe)?;
+        let writer = child.stdin.take().ok_or(StdioTransportError::MissingPipe)?;
+        let process = ProcessControl::child(child);
+        let identity = HostVerifiedMcpStdioIdentity {
+            server_id: binding.server_id().to_owned(),
+            adapter: binding.adapter().to_owned(),
+            protocol_version: binding.protocol_version().to_owned(),
+            transport_kind: binding.transport_kind().to_owned(),
+            endpoint: binding.endpoint().to_owned(),
+            endpoint_digest: binding.endpoint_digest().clone(),
+            transport_digest: binding.transport_digest().clone(),
+            daemon_installation_id: process_generation.daemon_installation_id().to_owned(),
+            instance_id: process_generation.instance_id().to_owned(),
+            controller_generation: process_generation.controller_generation(),
+            worker_epoch: process_generation.worker_epoch().clone(),
+            extension_alias: process_generation.extension_alias().clone(),
+            extension_generation: process_generation.extension_generation(),
+            runtime_binding_digest: process_generation.binding_digest().clone(),
+            session_id: stdio_session_id(binding, process_generation, process.as_ref()),
+        };
+        Ok(Self {
+            reader,
+            writer,
+            handle: HostMcpStdioProcessHandle { process, identity },
+        })
+    }
+
+    pub(crate) fn process_handle(&self) -> HostMcpStdioProcessHandle {
+        self.handle.clone()
+    }
+
+    fn into_parts(self) -> (ChildStdout, ChildStdin, Arc<ProcessControl>) {
+        (self.reader, self.writer, self.handle.process)
+    }
+}
+
+fn stdio_session_id(
+    binding: &McpTransportBinding,
+    process_generation: &ProcessGeneration,
+    process: &ProcessControl,
+) -> String {
+    let process_identity = process
+        .child
+        .as_ref()
+        .and_then(|child| child.lock().ok().map(|child| child.id()))
+        .unwrap_or_default();
+    Sha256Digest::compute(
+        format!(
+            "dolly-mcp-stdio/v1/{}/{}/{}",
+            binding.server_id(),
+            process_generation.binding_digest(),
+            process_identity
+        )
+        .as_bytes(),
+    )
+    .to_string()
+}
 
 #[derive(Debug)]
 enum ReaderEvent {
@@ -123,34 +227,16 @@ enum ReaderEvent {
     Io,
 }
 
-/// One initialized stdio session. The Host supplies the already-started,
-/// digest-pinned child; this object owns only the bounded I/O seam.
+/// One initialized stdio session. The Host retains the process handle; this
+/// object owns only the bounded I/O seam and never terminates on normal Drop.
 pub(crate) struct McpStdioSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     events: mpsc::Receiver<ReaderEvent>,
-    process: Arc<ProcessControl>,
     cancellation: StdioCancellation,
     limits: StdioTransportLimits,
     initialized: bool,
 }
-
 impl McpStdioSession {
-    pub(crate) fn from_child(
-        mut child: Child,
-        limits: StdioTransportLimits,
-    ) -> Result<Self, StdioTransportError> {
-        let stdin = child.stdin.take().ok_or(StdioTransportError::MissingPipe)?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(StdioTransportError::MissingPipe)?;
-        Ok(Self::from_parts(
-            stdout,
-            stdin,
-            ProcessControl::child(child),
-            limits,
-        ))
-    }
     fn from_parts<R, W>(
         reader: R,
         writer: W,
@@ -164,6 +250,7 @@ impl McpStdioSession {
         let (events_tx, events_rx) = mpsc::sync_channel(1);
         let cancellation = StdioCancellation {
             cancelled: Arc::new(AtomicBool::new(false)),
+            process: process.clone(),
         };
         let reader_cancellation = cancellation.clone();
         thread::spawn(move || {
@@ -196,7 +283,6 @@ impl McpStdioSession {
         Self {
             writer: Arc::new(Mutex::new(Box::new(writer))),
             events: events_rx,
-            process,
             cancellation,
             limits,
             initialized: false,
@@ -207,18 +293,18 @@ impl McpStdioSession {
         self.cancellation.clone()
     }
 
-    pub(crate) fn initialize(&mut self) -> Result<(), StdioTransportError> {
+    pub(crate) fn initialize(&mut self, deadline: Instant) -> Result<(), StdioTransportError> {
         if self.initialized {
             return Err(StdioTransportError::AlreadyInitialized);
         }
         let request = initialize_request()?;
-        let response = self.exchange(&request, INITIALIZE_REQUEST_ID)?;
+        let response = self.exchange(&request, INITIALIZE_REQUEST_ID, deadline)?;
         if let Err(error) = validate_initialize_response(&response, self.limits.max_nesting_depth) {
             self.abort();
             return Err(error);
         }
         let notification = initialized_notification()?;
-        self.send_frame(&notification, Instant::now() + self.limits.request_timeout)?;
+        self.send_frame(&notification, deadline)?;
         self.initialized = true;
         Ok(())
     }
@@ -227,6 +313,7 @@ impl McpStdioSession {
         &mut self,
         request_bytes: &[u8],
         expected_request_id: &str,
+        deadline: Instant,
     ) -> Result<Vec<u8>, StdioTransportError> {
         if self.cancellation.is_cancelled() {
             return Err(StdioTransportError::Cancelled);
@@ -237,7 +324,6 @@ impl McpStdioSession {
         if request_id(request_bytes, self.limits.max_nesting_depth)? != expected_request_id {
             return Err(StdioTransportError::RequestMismatch);
         }
-        let deadline = Instant::now() + self.limits.request_timeout;
         self.send_frame(request_bytes, deadline)?;
         loop {
             if self.cancellation.is_cancelled() {
@@ -340,53 +426,38 @@ impl McpStdioSession {
 
     fn abort(&self) {
         self.cancellation.cancel();
-        self.process.stop();
     }
 }
 
 impl Drop for McpStdioSession {
     fn drop(&mut self) {
-        self.abort();
+        // The Host retains the process handle and owns normal lifecycle.
+        // Ambiguous exchange paths call abort before this point.
     }
 }
 
-/// Identity of the already-started, digest-pinned Host child process.
-pub(crate) struct McpStdioProcessIdentity {
-    pub(crate) daemon_installation_id: String,
-    pub(crate) instance_id: String,
-    pub(crate) controller_generation: ExtensionGeneration,
-    pub(crate) worker_epoch: WorkerEpoch,
-    pub(crate) extension_alias: ExtensionId,
-    pub(crate) extension_generation: ExtensionGeneration,
-    pub(crate) runtime_binding_digest: Sha256Digest,
-    pub(crate) session_id: String,
-    pub(crate) package_digest: Sha256Digest,
-    pub(crate) executable_digest: Sha256Digest,
-}
-
-/// MCP stdio probe and initialized-session owner. It performs the exact v1
-/// initialize/initialized lifecycle and returns only readiness observation.
+/// The production probe is created only from a Host-owned verified session.
 pub(crate) struct McpStdioProbe {
     session: Option<McpStdioSession>,
-    identity: McpStdioProcessIdentity,
+    identity: HostVerifiedMcpStdioIdentity,
+    deadline: Instant,
     observed: bool,
 }
 
 impl McpStdioProbe {
-    pub(crate) fn from_child(
-        child: Child,
-        identity: McpStdioProcessIdentity,
+    pub(crate) fn from_host_session(
+        host_session: HostOwnedMcpStdioSession,
         limits: StdioTransportLimits,
-    ) -> Result<Self, StdioTransportError> {
-        let session = McpStdioSession::from_child(child, limits)?;
-        if identity.session_id.is_empty() || identity.session_id.len() > 512 {
-            return Err(StdioTransportError::ProcessIdentityMismatch);
-        }
-        Ok(Self {
-            session: Some(session),
+        deadline: Instant,
+    ) -> Self {
+        let identity = host_session.handle.identity.clone();
+        let (reader, writer, process) = host_session.into_parts();
+        Self {
+            session: Some(McpStdioSession::from_parts(reader, writer, process, limits)),
             identity,
+            deadline,
             observed: false,
-        })
+        }
     }
 
     pub(crate) fn into_transport(
@@ -398,6 +469,11 @@ impl McpStdioProbe {
         if readiness.transport_kind() != MCP_STDIO_KIND
             || readiness.server_id() != authority.server_id()
             || readiness.readiness_digest() != authority.readiness_digest()
+            || readiness.adapter() != self.identity.adapter
+            || readiness.protocol_version() != self.identity.protocol_version
+            || readiness.endpoint_digest() != &self.identity.endpoint_digest
+            || readiness.transport_digest() != &self.identity.transport_digest
+            || readiness.binding_digest() != &self.identity.runtime_binding_digest
             || !authority.permits_binding(
                 permit.config_revision,
                 &permit.tool_server_id,
@@ -417,10 +493,7 @@ impl McpStdioProbe {
                 .take()
                 .ok_or(StdioTransportError::NotInitialized)?,
             expected_request_id: permit.server_request_id.clone(),
-            server_id: permit.tool_server_id.clone(),
-            server_generation: permit.tool_server_generation,
-            config_revision: permit.config_revision,
-            readiness_digest: readiness.readiness_digest().clone(),
+            deadline: self.deadline,
             used: false,
         })
     }
@@ -439,14 +512,10 @@ impl McpTransportProbe for McpStdioProbe {
         if binding.adapter() != MCP_ADAPTER
             || binding.protocol_version() != MCP_PROTOCOL_VERSION_2025_06_18
             || binding.transport_kind() != MCP_STDIO_KIND
+            || !identity_matches_binding(&self.identity, binding)
         {
-            return Err(McpTransportProbeError::Unsupported(
-                "only MCP 2025-06-18 stdio is implemented".to_owned(),
-            ));
-        }
-        if !stdio_digests_match(binding, &self.identity) {
             return Err(McpTransportProbeError::Failed(
-                "installed child digest does not match the configured stdio transport".to_owned(),
+                "Host-verified stdio identity does not match the current binding".to_owned(),
             ));
         }
         self.session
@@ -454,14 +523,14 @@ impl McpTransportProbe for McpStdioProbe {
             .ok_or_else(|| {
                 McpTransportProbeError::Ambiguous("stdio session is consumed".to_owned())
             })?
-            .initialize()
+            .initialize(self.deadline)
             .map_err(|_| {
                 McpTransportProbeError::Failed("MCP initialize lifecycle failed".to_owned())
             })?;
         self.observed = true;
         Ok(McpHandshakeObservation {
-            server_id: Some(binding.server_id().to_owned()),
-            adapter: Some(binding.adapter().to_owned()),
+            server_id: Some(self.identity.server_id.clone()),
+            adapter: Some(self.identity.adapter.clone()),
             daemon_installation_id: Some(self.identity.daemon_installation_id.clone()),
             instance_id: Some(self.identity.instance_id.clone()),
             controller_generation: Some(self.identity.controller_generation),
@@ -469,9 +538,9 @@ impl McpTransportProbe for McpStdioProbe {
             extension_alias: Some(self.identity.extension_alias.clone()),
             extension_generation: Some(self.identity.extension_generation),
             runtime_binding_digest: Some(self.identity.runtime_binding_digest.clone()),
-            transport_kind: Some(binding.transport_kind().to_owned()),
-            endpoint: Some(binding.endpoint().to_owned()),
-            transport_digest: Some(binding.transport_digest().clone()),
+            transport_kind: Some(self.identity.transport_kind.clone()),
+            endpoint: Some(self.identity.endpoint.clone()),
+            transport_digest: Some(self.identity.transport_digest.clone()),
             initialize_request_protocol_version: Some(MCP_PROTOCOL_VERSION_2025_06_18.to_owned()),
             initialize_response_protocol_version: Some(MCP_PROTOCOL_VERSION_2025_06_18.to_owned()),
             initialized_notification_sent: true,
@@ -480,16 +549,35 @@ impl McpTransportProbe for McpStdioProbe {
     }
 }
 
+fn identity_matches_binding(
+    identity: &HostVerifiedMcpStdioIdentity,
+    binding: &McpTransportBinding,
+) -> bool {
+    identity.server_id == binding.server_id()
+        && identity.adapter == binding.adapter()
+        && identity.protocol_version == binding.protocol_version()
+        && identity.transport_kind == binding.transport_kind()
+        && identity.endpoint == binding.endpoint()
+        && identity.endpoint_digest == *binding.endpoint_digest()
+        && identity.transport_digest == *binding.transport_digest()
+}
+pub(crate) fn absolute_deadline(payload: &str) -> Result<Instant, StdioTransportError> {
+    let deadline = parse_rfc3339_utc(payload).ok_or(StdioTransportError::InvalidDeadline)?;
+    let now_system = SystemTime::now();
+    let now_instant = Instant::now();
+    let remaining = deadline.duration_since(now_system).unwrap_or_default();
+    now_instant
+        .checked_add(remaining)
+        .ok_or(StdioTransportError::InvalidDeadline)
+}
+
 /// One-use stdio tools/call transport. Authority is checked before it is
 /// constructed; the transport then enforces exact request identity and one
 /// call per permit.
 pub(crate) struct McpStdioTransport {
     session: McpStdioSession,
     expected_request_id: String,
-    server_id: String,
-    server_generation: u64,
-    config_revision: i64,
-    readiness_digest: Sha256Digest,
+    deadline: Instant,
     used: bool,
 }
 
@@ -519,26 +607,13 @@ impl McpStdioTransport {
     }
 
     #[cfg(test)]
-    fn test(session: McpStdioSession, request_id: &str) -> Self {
+    fn test(session: McpStdioSession, request_id: &str, deadline: Instant) -> Self {
         Self {
             session,
             expected_request_id: request_id.to_owned(),
-            server_id: "test-server".to_owned(),
-            server_generation: 1,
-            config_revision: 1,
-            readiness_digest: Sha256Digest::compute(b"test-readiness"),
+            deadline,
             used: false,
         }
-    }
-
-    #[cfg(test)]
-    fn identity(&self) -> (&str, u64, i64, &Sha256Digest) {
-        (
-            &self.server_id,
-            self.server_generation,
-            self.config_revision,
-            &self.readiness_digest,
-        )
     }
 }
 impl ToolTransport for McpStdioTransport {
@@ -559,12 +634,13 @@ impl ToolTransport for McpStdioTransport {
         self.used = true;
         match self
             .session
-            .exchange(request_bytes, &self.expected_request_id)
+            .exchange(request_bytes, &self.expected_request_id, self.deadline)
         {
             Ok(response) => {
                 if complete_non_null_result(&response, self.session.limits.max_nesting_depth) {
                     TransportOutcome::Response(response)
                 } else {
+                    self.session.abort();
                     TransportOutcome::Error("MCP response has no complete result".to_owned())
                 }
             }
@@ -723,18 +799,10 @@ fn string_member<'a>(object: &'a CanonicalJsonObject, name: &str) -> Option<&'a 
     }
 }
 
-fn stdio_digests_match(binding: &McpTransportBinding, identity: &McpStdioProcessIdentity) -> bool {
-    let transport = binding.transport();
-    string_member(transport, "package_digest").and_then(|value| value.parse::<Sha256Digest>().ok())
-        == Some(identity.package_digest.clone())
-        && string_member(transport, "executable_digest")
-            .and_then(|value| value.parse::<Sha256Digest>().ok())
-            == Some(identity.executable_digest.clone())
-}
-
 fn format_transport_error(error: StdioTransportError) -> String {
     match error {
         StdioTransportError::InvalidLimits => "invalid transport limits",
+        StdioTransportError::InvalidDeadline => "invalid operation deadline",
         StdioTransportError::MissingPipe => "stdio pipe is missing",
         StdioTransportError::ProcessIdentityMismatch => "stdio process identity mismatch",
         StdioTransportError::InvalidFrame => "invalid MCP frame",
@@ -755,27 +823,24 @@ fn format_transport_error(error: StdioTransportError) -> String {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
-
-    fn limits(timeout: Duration) -> StdioTransportLimits {
-        StdioTransportLimits::new(1024, 16, timeout).expect("limits")
+    use std::process::{Command, Stdio};
+    fn limits() -> StdioTransportLimits {
+        StdioTransportLimits::new(1024, 16).expect("limits")
     }
 
-    fn session_with_handler<F>(
-        timeout: Duration,
-        handler: F,
-    ) -> (McpStdioSession, thread::JoinHandle<()>)
+    fn deadline_after(duration: Duration) -> Instant {
+        Instant::now() + duration
+    }
+
+    fn session_with_handler<F>(handler: F) -> (McpStdioSession, thread::JoinHandle<()>)
     where
         F: FnOnce(&mut BufReader<UnixStream>, &mut UnixStream) + Send + 'static,
     {
         let (client, server) = UnixStream::pair().expect("socket pair");
         let client_reader = client.try_clone().expect("client reader");
         let server_reader = server.try_clone().expect("server reader");
-        let session = McpStdioSession::from_parts(
-            client_reader,
-            client,
-            ProcessControl::none(),
-            limits(timeout),
-        );
+        let session =
+            McpStdioSession::from_parts(client_reader, client, ProcessControl::none(), limits());
         let thread = thread::spawn(move || {
             let mut reader = BufReader::new(server_reader);
             let mut writer = server;
@@ -803,18 +868,18 @@ mod tests {
 
     #[test]
     fn initialized_stdio_session_uses_exact_lifecycle_and_correlated_call() {
-        let (mut session, server_thread) =
-            session_with_handler(Duration::from_secs(1), |reader, writer| {
-                let mut line = String::new();
-                reader.read_line(&mut line).expect("call request");
-                assert!(line.contains("call-1"));
-                writer
-                    .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"call-1\",\"result\":null}\n")
-                    .expect("call response");
-            });
-        session.initialize().expect("initialize");
+        let (mut session, server_thread) = session_with_handler(|reader, writer| {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("call request");
+            assert!(line.contains("call-1"));
+            writer
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"call-1\",\"result\":null}\n")
+                .expect("call response");
+        });
+        let deadline = deadline_after(Duration::from_secs(1));
+        session.initialize(deadline).expect("initialize");
         let response = session
-            .exchange(call_request(), "call-1")
+            .exchange(call_request(), "call-1", deadline)
             .expect("response");
         assert_eq!(
             response,
@@ -830,32 +895,32 @@ mod tests {
             br#"{"jsonrpc":"2.0","id":"call-1","error":{"code":-1,"message":"no"}}"#.to_vec(),
             br#"{"jsonrpc":"2.0","id":"call-1"}"#.to_vec(),
         ] {
-            let (mut session, server_thread) =
-                session_with_handler(Duration::from_secs(1), move |reader, writer| {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).expect("call request");
-                    writer.write_all(&response).expect("response");
-                    writer.write_all(b"\n").expect("response delimiter");
-                });
-            session.initialize().expect("initialize");
-            assert!(session.exchange(call_request(), "call-1").is_ok());
+            let (mut session, server_thread) = session_with_handler(move |reader, writer| {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("call request");
+                writer.write_all(&response).expect("response");
+                writer.write_all(b"\n").expect("response delimiter");
+            });
+            let deadline = deadline_after(Duration::from_secs(1));
+            session.initialize(deadline).expect("initialize");
+            assert!(session.exchange(call_request(), "call-1", deadline).is_ok());
             server_thread.join().expect("server thread");
         }
     }
 
     #[test]
     fn mismatched_id_is_terminal_transport_error() {
-        let (mut session, server_thread) =
-            session_with_handler(Duration::from_secs(1), |reader, writer| {
-                let mut line = String::new();
-                reader.read_line(&mut line).expect("call request");
-                writer
-                    .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"other\",\"result\":null}\n")
-                    .expect("response");
-            });
-        session.initialize().expect("initialize");
+        let (mut session, server_thread) = session_with_handler(|reader, writer| {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("call request");
+            writer
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"other\",\"result\":null}\n")
+                .expect("response");
+        });
+        let deadline = deadline_after(Duration::from_secs(1));
+        session.initialize(deadline).expect("initialize");
         assert_eq!(
-            session.exchange(call_request(), "call-1"),
+            session.exchange(call_request(), "call-1", deadline),
             Err(StdioTransportError::RequestMismatch)
         );
         server_thread.join().expect("server thread");
@@ -870,7 +935,7 @@ mod tests {
             client_reader,
             client,
             ProcessControl::none(),
-            StdioTransportLimits::new(256, 16, Duration::from_secs(1)).expect("limits"),
+            StdioTransportLimits::new(256, 16).expect("limits"),
         );
         let server_thread = thread::spawn(move || {
             let mut reader = BufReader::new(server_reader);
@@ -894,9 +959,10 @@ mod tests {
                 )
                 .expect("oversized response");
         });
-        session.initialize().expect("initialize");
+        let deadline = deadline_after(Duration::from_secs(1));
+        session.initialize(deadline).expect("initialize");
         assert_eq!(
-            session.exchange(call_request(), "call-1"),
+            session.exchange(call_request(), "call-1", deadline),
             Err(StdioTransportError::InvalidFrame)
         );
         server_thread.join().expect("server thread");
@@ -904,28 +970,33 @@ mod tests {
 
     #[test]
     fn deadline_and_cancellation_never_wait_unbounded() {
-        let (mut session, server_thread) =
-            session_with_handler(Duration::from_millis(40), |reader, _writer| {
-                let mut line = String::new();
-                reader.read_line(&mut line).expect("call request");
-                thread::sleep(Duration::from_millis(150));
-            });
-        session.initialize().expect("initialize");
+        let (mut session, server_thread) = session_with_handler(|reader, _writer| {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("call request");
+            thread::sleep(Duration::from_millis(150));
+        });
+        let initialize_deadline = deadline_after(Duration::from_secs(1));
+        session.initialize(initialize_deadline).expect("initialize");
         assert_eq!(
-            session.exchange(call_request(), "call-1"),
+            session.exchange(
+                call_request(),
+                "call-1",
+                deadline_after(Duration::from_millis(40)),
+            ),
             Err(StdioTransportError::Deadline)
         );
         server_thread.join().expect("server thread");
 
-        let (mut session, server_thread) =
-            session_with_handler(Duration::from_secs(1), |reader, _writer| {
-                let mut line = String::new();
-                reader.read_line(&mut line).expect("call request");
-                thread::sleep(Duration::from_millis(150));
-            });
-        session.initialize().expect("initialize");
+        let (mut session, server_thread) = session_with_handler(|reader, _writer| {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("call request");
+            thread::sleep(Duration::from_millis(150));
+        });
+        let initialize_deadline = deadline_after(Duration::from_secs(1));
+        session.initialize(initialize_deadline).expect("initialize");
         let cancellation = session.cancellation();
-        let call = thread::spawn(move || session.exchange(call_request(), "call-1"));
+        let call_deadline = deadline_after(Duration::from_secs(1));
+        let call = thread::spawn(move || session.exchange(call_request(), "call-1", call_deadline));
         thread::sleep(Duration::from_millis(20));
         cancellation.cancel();
         assert_eq!(
@@ -937,19 +1008,16 @@ mod tests {
 
     #[test]
     fn transport_enforces_request_identity_and_no_redispatch() {
-        let (mut session, server_thread) =
-            session_with_handler(Duration::from_secs(1), |reader, writer| {
-                let mut line = String::new();
-                reader.read_line(&mut line).expect("call request");
-                writer
-                    .write_all(
-                        b"{\"jsonrpc\":\"2.0\",\"id\":\"call-1\",\"result\":{\"ok\":true}}\n",
-                    )
-                    .expect("response");
-            });
-        session.initialize().expect("initialize");
-        let mut transport = McpStdioTransport::test(session, "call-1");
-        assert_eq!(transport.identity().0, "test-server");
+        let (mut session, server_thread) = session_with_handler(|reader, writer| {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("call request");
+            writer
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"call-1\",\"result\":{\"ok\":true}}\n")
+                .expect("response");
+        });
+        let deadline = deadline_after(Duration::from_secs(1));
+        session.initialize(deadline).expect("initialize");
+        let mut transport = McpStdioTransport::test(session, "call-1", deadline);
         assert!(matches!(
             transport.call(br#"{"jsonrpc":"2.0","id":"wrong","method":"tools/call","params":{}}"#),
             TransportOutcome::Error(_)
@@ -971,20 +1039,54 @@ mod tests {
             br#"{"jsonrpc":"2.0","id":"call-1","result":null}"#.to_vec(),
             br#"{"jsonrpc":"2.0","id":"call-1","error":{"code":-1,"message":"no"}}"#.to_vec(),
         ] {
-            let (mut session, server_thread) =
-                session_with_handler(Duration::from_secs(1), move |reader, writer| {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).expect("call request");
-                    writer.write_all(&response).expect("response");
-                    writer.write_all(b"\n").expect("response delimiter");
-                });
-            session.initialize().expect("initialize");
-            let mut transport = McpStdioTransport::test(session, "call-1");
+            let (mut session, server_thread) = session_with_handler(move |reader, writer| {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("call request");
+                writer.write_all(&response).expect("response");
+                writer.write_all(b"\n").expect("response delimiter");
+            });
+            let deadline = deadline_after(Duration::from_secs(1));
+            session.initialize(deadline).expect("initialize");
+            let mut transport = McpStdioTransport::test(session, "call-1", deadline);
             assert!(matches!(
                 transport.call(call_request()),
                 TransportOutcome::Error(_)
             ));
             server_thread.join().expect("server thread");
         }
+    }
+    #[test]
+    fn authorized_deadline_is_absolute_and_malformed_deadlines_refuse() {
+        let before = Instant::now();
+
+        let deadline = absolute_deadline("2099-01-01T00:00:00.000000Z").expect("future deadline");
+        assert!(deadline > before);
+        assert_eq!(
+            absolute_deadline("not-a-deadline"),
+            Err(StdioTransportError::InvalidDeadline)
+        );
+    }
+    #[test]
+    fn normal_session_drop_does_not_terminate_host_process() {
+        let mut child = Command::new("sleep")
+            .arg("2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("sleep child");
+        let reader = child.stdout.take().expect("stdout");
+        let writer = child.stdin.take().expect("stdin");
+        let process = ProcessControl::child(child);
+        let session = McpStdioSession::from_parts(reader, writer, process.clone(), limits());
+        drop(session);
+        let mut child = process
+            .child
+            .as_ref()
+            .expect("child")
+            .lock()
+            .expect("child lock");
+        assert!(child.try_wait().expect("try wait").is_none());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
