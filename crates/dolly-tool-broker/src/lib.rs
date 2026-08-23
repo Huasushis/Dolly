@@ -9,6 +9,7 @@
 //! `admit_config`; discovery and results are never consulted to expand it.
 
 pub mod dispatch;
+pub mod effect_journal;
 pub mod invoke;
 pub mod registry;
 pub mod result;

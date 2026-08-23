@@ -11,6 +11,7 @@
 
 pub mod attestation;
 pub mod database;
+pub mod effect_journal;
 pub mod error;
 pub mod host_authority;
 pub mod linux_host_verification;
