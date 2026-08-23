@@ -37,11 +37,11 @@ mod coordinator_tests;
 #[cfg(test)]
 mod service_tests;
 
+pub(crate) use dispatch::load_authoritative_row;
 pub use dispatch::{
     DispatchError, DispatchOutcome, HostMcpStdioInvocation, dispatch_operation_authorized,
     dispatch_operation_authorized_reusable,
 };
-pub(crate) use dispatch::load_authoritative_row;
 pub use mcp_stdio::{
     HostMcpStdioInstalledChildAttestation, HostMcpStdioProcessHandle, StdioTransportError,
     StdioTransportLimits,

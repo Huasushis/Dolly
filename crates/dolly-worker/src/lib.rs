@@ -4,14 +4,12 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use dolly_canonical_json::{
-    CanonicalJsonObject, CanonicalJsonValue, PROTOCOL_WIRE_PARSE_DEPTH, Sha256Digest,
-    canonicalize,
+    CanonicalJsonObject, CanonicalJsonValue, PROTOCOL_WIRE_PARSE_DEPTH, Sha256Digest, canonicalize,
 };
 use dolly_core_domain::ExtensionId;
-use dolly_storage::mcp_readiness::{
-    MCP_PROTOCOL_VERSION_2025_06_18, McpTransportReadiness,
-};
+use dolly_storage::Database;
 use dolly_storage::host_authority::load_current_authority;
+use dolly_storage::mcp_readiness::{MCP_PROTOCOL_VERSION_2025_06_18, McpTransportReadiness};
 use dolly_storage::runtime_binding::{
     ProcessGeneration, RuntimeBinding, invalidate_runtime_binding, mint_current_runtime_binding,
 };
@@ -19,12 +17,11 @@ use dolly_storage::tool_broker_authority::{
     ToolDispatchAuthority, ToolRegistryRevision, authorize_tool_dispatch, publish_tool_registry,
 };
 use dolly_storage::tool_ledger::create_tool_ledger_schema;
-use dolly_storage::Database;
 use dolly_tool_broker::{AdmissionOutcome, LedgerState, RecoveryFacts, ToolCallLedgerRecord};
 use dolly_tool_coordinator::{
-    DispatchError, DispatchOutcome, DispatchLimits, HostMcpStdioInstalledChildAttestation,
-    HostMcpStdioInvocation, HostMcpStdioProcessHandle, StdioTransportError,
-    StdioTransportLimits, ToolDispatchService, dispatch_operation_authorized_reusable,
+    DispatchError, DispatchLimits, DispatchOutcome, HostMcpStdioInstalledChildAttestation,
+    HostMcpStdioInvocation, HostMcpStdioProcessHandle, StdioTransportError, StdioTransportLimits,
+    ToolDispatchService, dispatch_operation_authorized_reusable,
 };
 use thiserror::Error;
 
@@ -119,11 +116,9 @@ impl Worker {
             .checked_add(durable_server.startup_timeout)
             .ok_or_else(|| WorkerError::Process("startup deadline overflow".into()))?;
         let session_id = new_session_id()?;
-        let mut runtime_binding = mint_current_runtime_binding(
-            &mut database,
-            config.extension_alias.clone(),
-        )
-        .map_err(|error| WorkerError::Authority(error.to_string()))?;
+        let mut runtime_binding =
+            mint_current_runtime_binding(&mut database, config.extension_alias.clone())
+                .map_err(|error| WorkerError::Authority(error.to_string()))?;
         let process_generation = match runtime_binding.mint_process_generation(&mut database) {
             Ok(generation) => generation,
             Err(error) => {
@@ -179,25 +174,24 @@ impl Worker {
             session_id,
             child.id(),
         );
-        let (mut invocation, process_handle) =
-            match HostMcpStdioInvocation::from_installed_child(
-                child,
-                attestation,
-                &process_generation,
-                durable_server.stdio_limits,
-                Vec::new(),
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    return Err(startup_failure(
-                        &mut database,
-                        &runtime_binding,
-                        Some(&process_generation),
-                        None,
-                        WorkerError::Transport(error),
-                    ));
-                }
-            };
+        let (mut invocation, process_handle) = match HostMcpStdioInvocation::from_installed_child(
+            child,
+            attestation,
+            &process_generation,
+            durable_server.stdio_limits,
+            Vec::new(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(startup_failure(
+                    &mut database,
+                    &runtime_binding,
+                    Some(&process_generation),
+                    None,
+                    WorkerError::Transport(error),
+                ));
+            }
+        };
         let readiness = match invocation.initialize(
             &database,
             &runtime_binding,
@@ -387,9 +381,18 @@ fn load_durable_server(
     snapshot: &dolly_storage::host_authority::CurrentAuthoritySnapshot,
     server_id: &str,
 ) -> Result<DurableServer, WorkerError> {
-    let root = as_object(&snapshot.mapping.canonical_config.runtime_config, "runtime config")?;
-    let spec = as_object(required(root, "spec", "runtime config")?, "runtime config spec")?;
-    let services = as_object(required(spec, "services", "runtime config spec")?, "runtime services")?;
+    let root = as_object(
+        &snapshot.mapping.canonical_config.runtime_config,
+        "runtime config",
+    )?;
+    let spec = as_object(
+        required(root, "spec", "runtime config")?,
+        "runtime config spec",
+    )?;
+    let services = as_object(
+        required(spec, "services", "runtime config spec")?,
+        "runtime services",
+    )?;
     let tool_broker = required(services, "tool_broker", "runtime services")?;
     let (tool_broker_bytes, _) = canonicalize(tool_broker).map_err(|error| {
         WorkerError::Premise(format!("tool-broker config is not canonical: {error}"))
@@ -421,10 +424,15 @@ fn load_durable_server(
     }
     let server_value = CanonicalJsonValue::Object(server.server_contract.clone());
     let server_object = as_object(&server_value, "configured server")?;
-    let transport = as_object(required(server_object, "transport", "configured server")?, "stdio transport")?;
+    let transport = as_object(
+        required(server_object, "transport", "configured server")?,
+        "stdio transport",
+    )?;
     let kind = string_field(transport, "kind", "stdio transport")?;
     if kind != "stdio" {
-        return Err(WorkerError::Premise("configured transport is not stdio".into()));
+        return Err(WorkerError::Premise(
+            "configured transport is not stdio".into(),
+        ));
     }
     let endpoint = string_field(transport, "executable", "stdio transport")?.to_owned();
     if !safe_relative_member(&endpoint) {
@@ -439,9 +447,16 @@ fn load_durable_server(
             ));
         }
     }
-    let package_digest = parse_digest(string_field(transport, "package_digest", "stdio transport")?)?;
-    let executable_digest =
-        parse_digest(string_field(transport, "executable_digest", "stdio transport")?)?;
+    let package_digest = parse_digest(string_field(
+        transport,
+        "package_digest",
+        "stdio transport",
+    )?)?;
+    let executable_digest = parse_digest(string_field(
+        transport,
+        "executable_digest",
+        "stdio transport",
+    )?)?;
     let transport_value = CanonicalJsonValue::Object(transport.clone());
     let transport_digest = canonicalize(&transport_value)
         .map_err(|error| WorkerError::Premise(error.to_string()))?
@@ -454,12 +469,17 @@ fn load_durable_server(
             .iter()
             .map(|value| match value {
                 CanonicalJsonValue::String(value) => Ok(value.clone()),
-                _ => Err(WorkerError::Premise("stdio argument is not a string".into())),
+                _ => Err(WorkerError::Premise(
+                    "stdio argument is not a string".into(),
+                )),
             })
             .collect::<Result<Vec<_>, _>>()?,
         _ => return Err(WorkerError::Premise("stdio args is not an array".into())),
     };
-    let limits = as_object(required(server_object, "limits", "configured server")?, "server limits")?;
+    let limits = as_object(
+        required(server_object, "limits", "configured server")?,
+        "server limits",
+    )?;
     let startup_timeout_ms = positive_integer(limits, "startup_timeout_ms", "server limits")?;
     let max_request_bytes = positive_usize(limits, "max_request_bytes", "server limits")?;
     let max_response_bytes = positive_usize(limits, "max_response_bytes", "server limits")?;
@@ -484,40 +504,68 @@ fn load_durable_server(
     })
 }
 
-fn as_object<'a>(value: &'a CanonicalJsonValue, label: &str) -> Result<&'a CanonicalJsonObject, WorkerError> {
+fn as_object<'a>(
+    value: &'a CanonicalJsonValue,
+    label: &str,
+) -> Result<&'a CanonicalJsonObject, WorkerError> {
     match value {
         CanonicalJsonValue::Object(object) => Ok(object),
         _ => Err(WorkerError::Premise(format!("{label} is not an object"))),
     }
 }
 
-fn required<'a>(object: &'a CanonicalJsonObject, name: &str, label: &str) -> Result<&'a CanonicalJsonValue, WorkerError> {
+fn required<'a>(
+    object: &'a CanonicalJsonObject,
+    name: &str,
+    label: &str,
+) -> Result<&'a CanonicalJsonValue, WorkerError> {
     object
         .get(name)
         .ok_or_else(|| WorkerError::Premise(format!("{label} is missing {name}")))
 }
 
-fn string_field<'a>(object: &'a CanonicalJsonObject, name: &str, label: &str) -> Result<&'a str, WorkerError> {
+fn string_field<'a>(
+    object: &'a CanonicalJsonObject,
+    name: &str,
+    label: &str,
+) -> Result<&'a str, WorkerError> {
     match required(object, name, label)? {
         CanonicalJsonValue::String(value) => Ok(value),
-        _ => Err(WorkerError::Premise(format!("{label} field {name} is not a string"))),
+        _ => Err(WorkerError::Premise(format!(
+            "{label} field {name} is not a string"
+        ))),
     }
 }
 
-fn positive_integer(object: &CanonicalJsonObject, name: &str, label: &str) -> Result<u64, WorkerError> {
+fn positive_integer(
+    object: &CanonicalJsonObject,
+    name: &str,
+    label: &str,
+) -> Result<u64, WorkerError> {
     let value = match required(object, name, label)? {
         CanonicalJsonValue::Number(value) => value.as_f64(),
-        _ => return Err(WorkerError::Premise(format!("{label} field {name} is not an integer"))),
+        _ => {
+            return Err(WorkerError::Premise(format!(
+                "{label} field {name} is not an integer"
+            )));
+        }
     };
     if !value.is_finite() || value < 1.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
-        return Err(WorkerError::Premise(format!("{label} field {name} is outside bounds")));
+        return Err(WorkerError::Premise(format!(
+            "{label} field {name} is outside bounds"
+        )));
     }
     Ok(value as u64)
 }
 
-fn positive_usize(object: &CanonicalJsonObject, name: &str, label: &str) -> Result<usize, WorkerError> {
+fn positive_usize(
+    object: &CanonicalJsonObject,
+    name: &str,
+    label: &str,
+) -> Result<usize, WorkerError> {
     let value = positive_integer(object, name, label)?;
-    usize::try_from(value).map_err(|_| WorkerError::Premise(format!("{label} field {name} is too large")))
+    usize::try_from(value)
+        .map_err(|_| WorkerError::Premise(format!("{label} field {name} is too large")))
 }
 
 fn parse_digest(value: &str) -> Result<Sha256Digest, WorkerError> {
@@ -530,14 +578,18 @@ fn safe_relative_member(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('/')
         && !value.contains('\\')
-        && value.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, WorkerError> {
     let path = fs::canonicalize(path)
         .map_err(|error| WorkerError::Package(format!("package root is unavailable: {error}")))?;
     if !path.is_dir() {
-        return Err(WorkerError::Package("package root is not a directory".into()));
+        return Err(WorkerError::Package(
+            "package root is not a directory".into(),
+        ));
     }
     Ok(path)
 }
@@ -556,7 +608,9 @@ fn verify_digest(path: &Path, expected: &Sha256Digest, label: &str) -> Result<()
         .map_err(|error| WorkerError::Package(format!("{label} cannot be read: {error}")))?;
     let actual = Sha256Digest::compute(&bytes);
     if &actual != expected {
-        return Err(WorkerError::Package(format!("{label} digest does not match durable policy")));
+        return Err(WorkerError::Package(format!(
+            "{label} digest does not match durable policy"
+        )));
     }
     Ok(())
 }

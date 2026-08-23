@@ -17,9 +17,7 @@ use std::process::Child;
 use std::time::Instant;
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
-use dolly_storage::mcp_readiness::{
-    McpTransportReadiness, prove_current_mcp_transport_readiness,
-};
+use dolly_storage::mcp_readiness::{McpTransportReadiness, prove_current_mcp_transport_readiness};
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::{
     ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
@@ -330,13 +328,13 @@ pub fn dispatch_operation_authorized(
             permit,
             &request_bytes,
         ),
-        HostMcpStdioSessionState::Consumed =>
-            service.settle_admission_unknown(db, parts.host_handle, permit, &request_bytes),
+        HostMcpStdioSessionState::Consumed => {
+            service.settle_admission_unknown(db, parts.host_handle, permit, &request_bytes)
+        }
     }
     .map_err(|error| DispatchError::Stdio(error.message()))?;
     map_service_outcome(service_outcome)
 }
-
 
 /// Reusable Worker-owned dispatch boundary. The initialized probe remains in
 /// the invocation after a successful call, so sequential tools/call rows share

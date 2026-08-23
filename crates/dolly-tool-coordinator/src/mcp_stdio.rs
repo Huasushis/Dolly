@@ -1121,9 +1121,7 @@ fn format_transport_error(error: StdioTransportError) -> String {
         StdioTransportError::FrameTooLarge => "MCP frame exceeds the configured limit".to_owned(),
         StdioTransportError::RequestMismatch => "MCP request correlation mismatch".to_owned(),
         StdioTransportError::NotInitialized => "MCP session is not initialized".to_owned(),
-        StdioTransportError::AlreadyInitialized => {
-            "MCP session was already initialized".to_owned()
-        }
+        StdioTransportError::AlreadyInitialized => "MCP session was already initialized".to_owned(),
         StdioTransportError::AlreadyUsed => "MCP transport already used".to_owned(),
         StdioTransportError::Cancelled => "MCP transport cancelled".to_owned(),
         StdioTransportError::Deadline => "MCP transport deadline exceeded".to_owned(),
