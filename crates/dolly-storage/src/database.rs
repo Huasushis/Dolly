@@ -36,7 +36,7 @@ use crate::host_authority::{
     LinuxServiceCandidate, ModuleActivationPremises, PermissionPolicyBackendBinding,
     PermissionPolicyDefinition, PermissionPolicySelection, ResolvedConfiguration,
     RuntimeAuthorityIdentity, install_host_authority_revision_in_transaction,
-    load_current_authority,
+    load_current_authority, refresh_controller_generation_in_transaction,
 };
 
 /// Highest schema version this binary understands.
@@ -146,13 +146,15 @@ impl ConnectionConfiguration {
 /// this public type.
 #[derive(Debug)]
 pub struct Database {
-    connection: Connection,
+    connection: Option<Connection>,
+    #[allow(dead_code)]
+    db_path: PathBuf,
     #[allow(dead_code)]
     path_lock: File,
     #[allow(dead_code)]
     identity_lock: Option<File>,
     verified: VerifiedSqliteBuild,
-    configuration: ConnectionConfiguration,
+    configuration: Option<ConnectionConfiguration>,
     schema_version: i64,
     authority_identity: Option<RuntimeAuthorityIdentity>,
     controller_generation_id: Option<String>,
@@ -191,17 +193,23 @@ impl Database {
     }
 
     pub fn connection(&self) -> &Connection {
-        &self.connection
+        self.connection
+            .as_ref()
+            .expect("ordinary Database always has a private SQLite connection")
     }
 
     /// Mutable access to the single writer connection. This method is only
     /// reachable after a committed authority identity has been verified.
     pub fn connection_mut(&mut self) -> &mut Connection {
-        &mut self.connection
+        self.connection
+            .as_mut()
+            .expect("ordinary Database always has a private SQLite connection")
     }
 
     pub fn configuration(&self) -> &ConnectionConfiguration {
-        &self.configuration
+        self.configuration
+            .as_ref()
+            .expect("ordinary Database always has configured SQLite pragmas")
     }
 
     pub fn schema_version(&self) -> i64 {
@@ -235,20 +243,33 @@ impl OfflineDatabase {
         let controller_generation_id = mint_controller_generation_id()?;
         let identity_lock = acquire_identity_lock(&input.identity)?;
         verify_or_write_lock_owner(&identity_lock, &input.identity, &controller_generation_id)?;
-        let tx = self
+        if self.database.connection.is_none() {
+            let connection = open_connection(&self.database.db_path)?;
+            let configuration = apply_and_verify_configuration(&connection)?;
+            self.database.configuration = Some(configuration);
+            self.database.connection = Some(connection);
+        }
+        let connection = self
             .database
             .connection
+            .as_mut()
+            .expect("offline migration connection");
+        let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
-        let disposition = install_host_authority_revision_in_transaction(&tx, &input)
-            .map_err(map_host_authority_error)?;
+        if self.database.schema_version == 0 {
+            create_fresh_schema(&tx, &self.database.verified)?;
+        }
         tx.execute(
             "UPDATE core_meta SET controller_generation_id = ?1 WHERE singleton = 1",
             [&controller_generation_id],
         )
         .map_err(map_sqlite_error)?;
+        let disposition = install_host_authority_revision_in_transaction(&tx, &input)
+            .map_err(map_host_authority_error)?;
         tx.commit().map_err(map_sqlite_error)?;
         let _ = disposition;
+        self.database.schema_version = SCHEMA_VERSION;
         verify_or_write_lock_owner(
             &self.database.path_lock,
             &input.identity,
@@ -325,23 +346,44 @@ fn open_internal(
         return Err(StorageError::Corrupt);
     }
 
-    let mut connection = open_connection(db_path)?;
-    let configuration = apply_and_verify_configuration(&connection)?;
-    let schema_version = ensure_schema(&connection, &verified)?;
-    verify_sqlite_integrity(&connection)?;
-    let authority_identity = validate_authority_state(&connection)?;
-    let persisted_generation = read_controller_generation(&connection)?;
-    if authority_identity
-        != expected_identity
-            .as_ref()
-            .map(|(identity, _)| identity.clone())
-        || persisted_generation
+    let fresh_offline = offline && expected_identity.is_none();
+    let mut connection = if fresh_offline {
+        None
+    } else {
+        Some(open_connection(db_path)?)
+    };
+    let configuration = if fresh_offline {
+        None
+    } else {
+        Some(apply_and_verify_configuration(
+            connection.as_ref().expect("ordinary connection"),
+        )?)
+    };
+    let schema_version = if fresh_offline {
+        0
+    } else {
+        ensure_schema(connection.as_ref().expect("ordinary connection"), &verified)?
+    };
+    let (authority_identity, _persisted_generation) = if fresh_offline {
+        (None, None)
+    } else {
+        let connection_ref = connection.as_ref().expect("ordinary connection");
+        verify_sqlite_integrity(connection_ref)?;
+        let authority_identity = validate_authority_state(connection_ref)?;
+        let persisted_generation = read_controller_generation(connection_ref)?;
+        if authority_identity
             != expected_identity
                 .as_ref()
-                .map(|(_, generation)| generation.clone())
-    {
-        return Err(StorageError::Corrupt);
-    }
+                .map(|(identity, _)| identity.clone())
+            || persisted_generation
+                != expected_identity
+                    .as_ref()
+                    .map(|(_, generation)| generation.clone())
+        {
+            return Err(StorageError::Corrupt);
+        }
+        (authority_identity, persisted_generation)
+    };
     if !offline && authority_identity.is_none() {
         return Err(StorageError::MigrationRequired);
     }
@@ -349,10 +391,14 @@ fn open_internal(
         let fresh_generation = controller_generation_id
             .as_deref()
             .ok_or(StorageError::Corrupt)?;
-        refresh_controller_generation(&mut connection, fresh_generation)?;
+        refresh_controller_generation(
+            connection.as_mut().expect("ordinary connection"),
+            fresh_generation,
+        )?;
     }
 
     Ok(Database {
+        db_path: db_path.to_path_buf(),
         connection,
         path_lock,
         identity_lock,
@@ -412,19 +458,22 @@ fn read_persisted_identity(
         (None, None, None) => return Ok(None),
         _ => return Err(StorageError::Corrupt),
     };
-    let state_identity: Option<(String, String)> = connection
+    let state_identity: Option<(String, String, String)> = connection
         .query_row(
-            "SELECT daemon_installation_id, instance_id
+            "SELECT daemon_installation_id, instance_id, controller_generation_id
              FROM runtime_authority_state WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(|_| StorageError::Corrupt)?;
-    let Some((state_daemon, state_instance)) = state_identity else {
+    let Some((state_daemon, state_instance, state_generation)) = state_identity else {
         return Err(StorageError::Corrupt);
     };
-    if core.daemon_installation_id != state_daemon || core.instance_id != state_instance {
+    if core.daemon_installation_id != state_daemon
+        || core.instance_id != state_instance
+        || generation != state_generation
+    {
         return Err(StorageError::Corrupt);
     }
     Ok(Some((core, generation)))
@@ -458,6 +507,8 @@ fn refresh_controller_generation(
         [generation],
     )
     .map_err(map_sqlite_error)?;
+    refresh_controller_generation_in_transaction(&tx, generation)
+        .map_err(map_host_authority_error)?;
     tx.commit().map_err(map_sqlite_error)
 }
 
@@ -581,27 +632,65 @@ fn acquire_lock_file(lock_path: &Path) -> StorageResult<File> {
 }
 
 fn acquire_identity_lock(identity: &RuntimeAuthorityIdentity) -> StorageResult<File> {
-    let lock_path = identity_lock_path(identity);
+    let lock_path = identity_lock_path(identity)?;
     reject_symlink_components(&lock_path)?;
     acquire_lock_file(&lock_path)
 }
 
-fn identity_lock_path(identity: &RuntimeAuthorityIdentity) -> PathBuf {
-    let digest = canonicalize(identity)
-        .expect("runtime identity is canonical JSON")
-        .1
-        .to_string()
-        .replace(':', "-");
-    #[cfg(test)]
-    let test_suffix = format!(
-        "-{}",
-        TEST_IDENTITY_LOCK_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    #[cfg(not(test))]
-    let test_suffix = String::new();
-    std::env::temp_dir().join(format!(
-        "dolly-runtime-controller-{digest}{test_suffix}.lock"
-    ))
+fn identity_lock_path(identity: &RuntimeAuthorityIdentity) -> StorageResult<PathBuf> {
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::geteuid() };
+        let runtime_root = PathBuf::from(format!("/run/user/{uid}"));
+        validate_private_runtime_dir(&runtime_root, false)?;
+        let dolly_root = runtime_root.join("dolly");
+        validate_private_runtime_dir(&dolly_root, true)?;
+        let lock_root = dolly_root.join("runtime-authority");
+        validate_private_runtime_dir(&lock_root, true)?;
+
+        let digest = canonicalize(identity)
+            .expect("runtime identity is canonical JSON")
+            .1
+            .to_string()
+            .replace(':', "-");
+        #[cfg(test)]
+        let test_suffix = format!(
+            "-{}",
+            TEST_IDENTITY_LOCK_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        #[cfg(not(test))]
+        let test_suffix = String::new();
+        Ok(lock_root.join(format!("controller-{digest}{test_suffix}.lock")))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = identity;
+        Err(StorageError::UnsafeConfiguration)
+    }
+}
+
+#[cfg(unix)]
+fn validate_private_runtime_dir(path: &Path, create: bool) -> StorageResult<()> {
+    use std::os::unix::fs::MetadataExt;
+    if create {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(StorageError::UnsafeConfiguration),
+        }
+    }
+    reject_symlink_components(path)?;
+    let metadata = fs::metadata(path).map_err(map_io_error)?;
+    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(StorageError::UnsafeConfiguration);
+    }
+    if metadata.mode() & 0o777 != 0o700 {
+        return Err(StorageError::UnsafeConfiguration);
+    }
+    Ok(())
 }
 
 fn lock_owner(file: &File) -> StorageResult<Option<ControllerLockOwner>> {
@@ -734,47 +823,7 @@ fn ensure_schema(connection: &Connection, verified: &VerifiedSqliteBuild) -> Sto
         let tx = connection
             .unchecked_transaction()
             .map_err(map_sqlite_error)?;
-        tx.execute_batch(
-            "CREATE TABLE core_meta (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                schema_version INTEGER NOT NULL,
-                daemon_installation_id TEXT,
-                instance_id TEXT,
-                controller_generation_id TEXT,
-                clean_shutdown INTEGER NOT NULL CHECK (clean_shutdown IN (0, 1)),
-                sqlite_version_number INTEGER NOT NULL,
-                sqlite_source_id TEXT NOT NULL,
-                sqlite_artifact_digest TEXT NOT NULL
-            );
-            CREATE TABLE commit_sequence (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                next_value INTEGER NOT NULL
-            );",
-        )
-        .map_err(map_sqlite_error)?;
-        tx.execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
-            .map_err(map_sqlite_error)?;
-        tx.execute(
-            "INSERT INTO core_meta (
-                singleton, schema_version, daemon_installation_id, instance_id,
-                controller_generation_id, clean_shutdown, sqlite_version_number,
-                sqlite_source_id, sqlite_artifact_digest
-             ) VALUES (1, ?1, NULL, NULL, NULL, 0, ?2, ?3, ?4)",
-            rusqlite::params![
-                SCHEMA_VERSION,
-                verified.version_number as i64,
-                &verified.source_id,
-                verified.artifact_digest.to_string(),
-            ],
-        )
-        .map_err(map_sqlite_error)?;
-        tx.execute(
-            "INSERT INTO commit_sequence (singleton, next_value) VALUES (1, 1)",
-            [],
-        )
-        .map_err(map_sqlite_error)?;
-        tx.execute_batch("PRAGMA user_version = 1")
-            .map_err(map_sqlite_error)?;
+        create_fresh_schema(&tx, verified)?;
         tx.commit().map_err(map_sqlite_error)?;
         return Ok(SCHEMA_VERSION);
     }
@@ -834,6 +883,53 @@ fn ensure_schema(connection: &Connection, verified: &VerifiedSqliteBuild) -> Sto
     }
     Ok(SCHEMA_VERSION)
 }
+fn create_fresh_schema(
+    tx: &rusqlite::Transaction<'_>,
+    verified: &VerifiedSqliteBuild,
+) -> StorageResult<()> {
+    tx.execute_batch(
+        "CREATE TABLE core_meta (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            schema_version INTEGER NOT NULL,
+            daemon_installation_id TEXT,
+            instance_id TEXT,
+            controller_generation_id TEXT,
+            clean_shutdown INTEGER NOT NULL CHECK (clean_shutdown IN (0, 1)),
+            sqlite_version_number INTEGER NOT NULL,
+            sqlite_source_id TEXT NOT NULL,
+            sqlite_artifact_digest TEXT NOT NULL
+        );
+        CREATE TABLE commit_sequence (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            next_value INTEGER NOT NULL
+        );",
+    )
+    .map_err(map_sqlite_error)?;
+    tx.execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
+        .map_err(map_sqlite_error)?;
+    tx.execute(
+        "INSERT INTO core_meta (
+            singleton, schema_version, daemon_installation_id, instance_id,
+            controller_generation_id, clean_shutdown, sqlite_version_number,
+            sqlite_source_id, sqlite_artifact_digest
+         ) VALUES (1, ?1, NULL, NULL, NULL, 0, ?2, ?3, ?4)",
+        rusqlite::params![
+            SCHEMA_VERSION,
+            verified.version_number as i64,
+            &verified.source_id,
+            verified.artifact_digest.to_string(),
+        ],
+    )
+    .map_err(map_sqlite_error)?;
+    tx.execute(
+        "INSERT INTO commit_sequence (singleton, next_value) VALUES (1, 1)",
+        [],
+    )
+    .map_err(map_sqlite_error)?;
+    tx.execute_batch("PRAGMA user_version = 1")
+        .map_err(map_sqlite_error)?;
+    Ok(())
+}
 
 fn verify_sqlite_integrity(connection: &Connection) -> StorageResult<()> {
     let quick_check: String = connection
@@ -869,23 +965,30 @@ fn validate_authority_state(
         return Err(StorageError::Corrupt);
     }
 
-    let core_identity: Option<(Option<String>, Option<String>)> = connection
+    let core_meta: Option<(Option<String>, Option<String>, Option<String>)> = connection
         .query_row(
-            "SELECT daemon_installation_id, instance_id
+            "SELECT daemon_installation_id, instance_id, controller_generation_id
              FROM core_meta WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(|_| StorageError::Corrupt)?;
-    let core_identity = match core_identity {
+    let (core_identity, core_generation) = match core_meta {
         None => return Err(StorageError::Corrupt),
-        Some((None, None)) => None,
-        Some((Some(daemon_installation_id), Some(instance_id))) => Some(RuntimeAuthorityIdentity {
-            daemon_installation_id,
-            instance_id,
-        }),
-        Some(_) => return Err(StorageError::Corrupt),
+        Some((None, None, None)) => (None, None),
+        Some((Some(daemon_installation_id), Some(instance_id), Some(generation)))
+            if !generation.is_empty() =>
+        {
+            (
+                Some(RuntimeAuthorityIdentity {
+                    daemon_installation_id,
+                    instance_id,
+                }),
+                Some(generation),
+            )
+        }
+        _ => return Err(StorageError::Corrupt),
     };
 
     let snapshot = load_current_authority(connection).map_err(map_host_authority_error)?;
@@ -913,7 +1016,9 @@ fn validate_authority_state(
                 daemon_installation_id: snapshot.mapping.daemon_installation_id.clone(),
                 instance_id: snapshot.mapping.instance_id.clone(),
             };
-            if core != state_identity {
+            if core != state_identity
+                || core_generation.as_deref() != Some(snapshot.controller_generation_id.as_str())
+            {
                 return Err(StorageError::Corrupt);
             }
             Ok(Some(core))

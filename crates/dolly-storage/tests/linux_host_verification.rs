@@ -70,6 +70,7 @@ fn authority() -> dolly_storage::host_authority::CurrentAuthoritySnapshot {
             canonical_config: config,
         },
         premise: Some(premise),
+        controller_generation_id: "test-controller-generation".into(),
     }
 }
 

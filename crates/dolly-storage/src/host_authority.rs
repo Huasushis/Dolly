@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS runtime_authority_state (
     authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
     daemon_installation_id TEXT NOT NULL,
     instance_id TEXT NOT NULL,
+    controller_generation_id TEXT NOT NULL,
     current_config_revision INTEGER NOT NULL CHECK (current_config_revision BETWEEN 1 AND 9007199254740991),
     current_config_digest TEXT NOT NULL,
     record_jcs BLOB NOT NULL,
@@ -262,12 +263,12 @@ pub struct ConfigRevisionMapping {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RuntimeAuthorityStateRecord {
     schema: String,
     authority_schema_version: i64,
     daemon_installation_id: String,
     instance_id: String,
+    controller_generation_id: String,
     current_config_revision: i64,
     current_config_digest: Sha256Digest,
 }
@@ -285,6 +286,7 @@ pub struct HostAuthorityRevision {
 pub struct CurrentAuthoritySnapshot {
     pub mapping: ConfigRevisionMapping,
     pub premise: Option<ModuleActivationPremises>,
+    pub controller_generation_id: String,
 }
 
 /// Result of one append-only install.
@@ -339,7 +341,6 @@ pub fn install_host_authority_revision(
     input: HostAuthorityRevision,
 ) -> Result<InstallDisposition, HostAuthorityError> {
     validate_revision(&input)?;
-    create_host_authority_schema(db.connection())?;
     // A same-revision install is an idempotent read of the existing authority;
     // verify every canonical row before allowing it to return Reused.
     let _ = load_current_authority(db.connection())?;
@@ -399,6 +400,16 @@ pub(crate) fn install_host_authority_revision_in_transaction(
     }
 
     ensure_core_identity(tx, &input.identity)?;
+    let controller_generation_id: String = tx.query_row(
+        "SELECT controller_generation_id FROM core_meta WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if controller_generation_id.is_empty() {
+        return Err(HostAuthorityError::InvalidPremise(
+            "controller generation is not bound by the Controller".into(),
+        ));
+    }
     let mapping_bytes =
         canonical_bytes(&input.mapping.canonical_config, "canonical resolved config")?;
     insert_mapping(tx, &input.mapping, &mapping_bytes)?;
@@ -421,12 +432,12 @@ pub(crate) fn install_host_authority_revision_in_transaction(
         // The complete premise is the last prerequisite record.
         insert_premise(tx, premise)?;
     }
-
     let state = RuntimeAuthorityStateRecord {
         schema: "dolly.runtime-authority-state/v1".into(),
         authority_schema_version: HOST_AUTHORITY_SCHEMA_VERSION,
         daemon_installation_id: input.identity.daemon_installation_id.clone(),
         instance_id: input.identity.instance_id.clone(),
+        controller_generation_id: controller_generation_id.clone(),
         current_config_revision: input.mapping.config_revision,
         current_config_digest: input.mapping.config_digest.clone(),
     };
@@ -434,12 +445,14 @@ pub(crate) fn install_host_authority_revision_in_transaction(
     tx.execute(
         "INSERT INTO runtime_authority_state (
             singleton, authority_schema_version, daemon_installation_id, instance_id,
-            current_config_revision, current_config_digest, record_jcs
-         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+            controller_generation_id, current_config_revision, current_config_digest,
+            record_jcs
+         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(singleton) DO UPDATE SET
             authority_schema_version = excluded.authority_schema_version,
             daemon_installation_id = excluded.daemon_installation_id,
             instance_id = excluded.instance_id,
+            controller_generation_id = excluded.controller_generation_id,
             current_config_revision = excluded.current_config_revision,
             current_config_digest = excluded.current_config_digest,
             record_jcs = excluded.record_jcs",
@@ -447,6 +460,7 @@ pub(crate) fn install_host_authority_revision_in_transaction(
             HOST_AUTHORITY_SCHEMA_VERSION,
             &state.daemon_installation_id,
             &state.instance_id,
+            &state.controller_generation_id,
             state.current_config_revision,
             state.current_config_digest.to_string(),
             state_bytes,
@@ -494,15 +508,45 @@ fn ensure_core_identity(
         }),
     }
 }
+pub(crate) fn refresh_controller_generation_in_transaction(
+    tx: &Transaction<'_>,
+    generation: &str,
+) -> Result<(), HostAuthorityError> {
+    if generation.is_empty() {
+        return Err(HostAuthorityError::InvalidPremise(
+            "controller generation is empty".into(),
+        ));
+    }
+    let state_bytes: Vec<u8> = tx.query_row(
+        "SELECT record_jcs FROM runtime_authority_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut state: RuntimeAuthorityStateRecord = decode_record(&state_bytes, "authority state")?;
+    if canonical_bytes(&state, "authority state")? != state_bytes {
+        return Err(HostAuthorityError::DigestMismatch(
+            "authority state canonical bytes".into(),
+        ));
+    }
+    state.controller_generation_id = generation.to_string();
+    let refreshed_bytes = canonical_bytes(&state, "authority state")?;
+    tx.execute(
+        "UPDATE runtime_authority_state
+         SET controller_generation_id = ?1, record_jcs = ?2
+         WHERE singleton = 1",
+        params![generation, refreshed_bytes],
+    )?;
+    Ok(())
+}
 
 /// Load and fully verify the committed current pointer and premise.
 pub fn load_current_authority(
     connection: &Connection,
 ) -> Result<Option<CurrentAuthoritySnapshot>, HostAuthorityError> {
-    let Some((identity, revision, digest, state_bytes)) = connection
+    let Some((identity, generation, revision, digest, state_bytes)) = connection
         .query_row(
-            "SELECT daemon_installation_id, instance_id, current_config_revision,
-                    current_config_digest, record_jcs
+            "SELECT daemon_installation_id, instance_id, controller_generation_id,
+                    current_config_revision, current_config_digest, record_jcs
              FROM runtime_authority_state WHERE singleton = 1",
             [],
             |row| {
@@ -511,9 +555,10 @@ pub fn load_current_authority(
                         daemon_installation_id: row.get(0)?,
                         instance_id: row.get(1)?,
                     },
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
                 ))
             },
         )
@@ -531,6 +576,7 @@ pub fn load_current_authority(
         || state.authority_schema_version != HOST_AUTHORITY_SCHEMA_VERSION
         || state.daemon_installation_id != identity.daemon_installation_id
         || state.instance_id != identity.instance_id
+        || state.controller_generation_id != generation
         || state.current_config_revision != revision
         || state.current_config_digest.to_string() != digest
     {
@@ -580,7 +626,11 @@ pub fn load_current_authority(
         .optional()?
         .map(|bytes| decode_record(&bytes, "activation premise"))
         .transpose()?;
-    let snapshot = CurrentAuthoritySnapshot { mapping, premise };
+    let snapshot = CurrentAuthoritySnapshot {
+        mapping,
+        premise,
+        controller_generation_id: generation,
+    };
     verify_persisted_snapshot(connection, &snapshot)?;
     validate_loaded_snapshot(&snapshot)?;
     Ok(Some(snapshot))
