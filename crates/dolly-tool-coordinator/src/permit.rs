@@ -23,10 +23,12 @@ pub struct SendPermitBinding {
     pub config_revision: i64,
     /// Frozen tool-server identity bound by the registry authority.
     pub tool_server_id: String,
+    /// Frozen process generation selected by the registry authority.
+    pub tool_server_generation: u64,
     /// The new ledger revision after the committed dispatch CAS (2).
     pub ledger_revision: u64,
-    /// The frozen server generation the operation dispatched to.
-    pub tool_server_generation: u64,
+    /// The exact accepted operation deadline from the durable binding.
+    pub authorized_deadline: String,
     /// The Host-assigned outbound request identity.
     pub server_request_id: String,
     /// Digest of the exact outbound application payload.
@@ -59,6 +61,7 @@ impl SendPermit {
                 tool_server_id: record.operation_binding.tool_server_id.clone(),
                 ledger_revision: record.ledger_revision,
                 tool_server_generation: record.operation_binding.tool_server_generation,
+                authorized_deadline: record.operation_binding.authorized_deadline.clone(),
                 server_request_id: record.operation_binding.server_request_id.clone(),
                 outbound_digest,
             },

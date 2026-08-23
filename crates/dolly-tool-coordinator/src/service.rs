@@ -23,7 +23,9 @@ use dolly_canonical_json::{
     CanonicalJsonValue, ParseLimits, Sha256Digest, canonicalize, parse_core_json,
 };
 use dolly_schema::SchemaValidator;
-use dolly_storage::mcp_readiness::McpTransportReadiness;
+use dolly_storage::mcp_readiness::{
+    McpReadinessError, McpTransportReadiness, prove_current_mcp_transport_readiness,
+};
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::{
     ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
@@ -40,6 +42,10 @@ use dolly_tool_broker::{
 use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 
+use crate::mcp_stdio::{
+    HostOwnedMcpStdioSession, McpStdioProbe, StdioTransportError, StdioTransportLimits,
+    absolute_deadline,
+};
 use crate::permit::{SendPermit, SendPermitBinding};
 
 /// Closed bounds on a response the service will admit (tool-broker §3/§6).
@@ -117,6 +123,13 @@ pub enum ServiceError {
     Storage(StorageError),
 }
 
+#[derive(Debug)]
+pub(crate) enum StdioDispatchError {
+    Readiness(McpReadinessError),
+    Transport(StdioTransportError),
+    Service(ServiceError),
+}
+
 /// The single transport-facing entry point of the coordinator.
 pub struct ToolDispatchService {
     limits: DispatchLimits,
@@ -174,6 +187,48 @@ impl ToolDispatchService {
         )
         .map_err(ServiceError::Authority)?;
         self.dispatch_inner(db, permit, request_bytes, transport)
+    }
+    /// Host-owned stdio composition: readiness is freshly proven against the
+    /// current Runtime binding/process generation before this exact permit is
+    /// routed through the authority-checked dispatch path.
+    pub(crate) fn dispatch_stdio_authorized(
+        &self,
+        db: &mut Database,
+        authority: &ToolDispatchAuthority,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        host_session: HostOwnedMcpStdioSession,
+        limits: StdioTransportLimits,
+        permit: SendPermit,
+        request_bytes: &[u8],
+    ) -> Result<ServiceOutcome, StdioDispatchError> {
+        let deadline = absolute_deadline(&permit.binding().authorized_deadline)
+            .map_err(StdioDispatchError::Transport)?;
+        let server_id = permit.binding().tool_server_id.clone();
+        let mut probe = McpStdioProbe::from_host_session(host_session, limits, deadline);
+        let readiness = prove_current_mcp_transport_readiness(
+            db.connection(),
+            runtime_binding,
+            process_generation,
+            &server_id,
+            &mut probe,
+        )
+        .map_err(StdioDispatchError::Readiness)?;
+        let permit_binding = permit.binding().clone();
+        let mut transport = probe
+            .into_transport(&readiness, authority, &permit_binding)
+            .map_err(StdioDispatchError::Transport)?;
+        self.dispatch_authorized(
+            db,
+            authority,
+            runtime_binding,
+            process_generation,
+            &readiness,
+            permit,
+            request_bytes,
+            &mut transport,
+        )
+        .map_err(StdioDispatchError::Service)
     }
 
     fn dispatch_inner(

@@ -82,7 +82,7 @@ fn deadline_expired(payload: &str, now: SystemTime) -> bool {
     }
 }
 
-fn parse_rfc3339_utc(payload: &str) -> Option<SystemTime> {
+pub(crate) fn parse_rfc3339_utc(payload: &str) -> Option<SystemTime> {
     let b = payload.as_bytes();
     if b.len() < 20 {
         return None;
