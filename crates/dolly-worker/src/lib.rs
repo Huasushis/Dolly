@@ -8,6 +8,7 @@ use dolly_canonical_json::{
 };
 use dolly_core_domain::ExtensionId;
 use dolly_storage::Database;
+use dolly_storage::effect_journal::{create_effect_journal_schema, settle_pending_effect_journal};
 use dolly_storage::host_authority::load_current_authority;
 use dolly_storage::mcp_readiness::{MCP_PROTOCOL_VERSION_2025_06_18, McpTransportReadiness};
 use dolly_storage::runtime_binding::{
@@ -110,6 +111,15 @@ impl Worker {
             "installed executable",
         )?;
         create_tool_ledger_schema(database.connection())
+            .map_err(|error| WorkerError::Storage(error.to_string()))?;
+        // The Worker is the sole owner of the effect journal: it creates the
+        // schema and runs the deterministic reopen recovery seam. Any pending
+        // `INTENDED` intent from a previous incarnation is settled only from
+        // identity-matched authoritative ledger evidence (or `UNKNOWN_OUTCOME`);
+        // nothing is ever re-dispatched (a new attempt requires a new Claim).
+        create_effect_journal_schema(database.connection())
+            .map_err(|error| WorkerError::Storage(error.to_string()))?;
+        settle_pending_effect_journal(&mut database)
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
 
         let startup_deadline = Instant::now()
