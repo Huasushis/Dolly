@@ -29,7 +29,7 @@ const MCP_ADAPTER: &str = "mcp";
 const MCP_STDIO_KIND: &str = "stdio";
 /// Static bounds applied to every stdio application frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StdioTransportLimits {
+pub struct StdioTransportLimits {
     pub(crate) max_frame_bytes: usize,
     pub(crate) max_nesting_depth: u16,
 }
@@ -115,7 +115,7 @@ impl ProcessControl {
     }
 }
 #[derive(Clone)]
-pub(crate) struct HostMcpStdioProcessHandle {
+pub struct HostMcpStdioProcessHandle {
     process: Arc<ProcessControl>,
     identity: HostVerifiedMcpStdioIdentity,
 }
@@ -242,7 +242,7 @@ struct HostVerifiedMcpStdioIdentity {
     session_id: String,
 }
 
-pub(crate) struct HostOwnedMcpStdioSession {
+pub struct HostOwnedMcpStdioSession {
     reader: ChildStdout,
     writer: ChildStdin,
     handle: HostMcpStdioProcessHandle,
@@ -543,6 +543,8 @@ impl McpStdioProbe {
         deadline: Instant,
     ) -> Result<Self, StdioTransportError> {
         if !Arc::ptr_eq(&host_session.handle.process, &host_handle.process) {
+            host_session.handle.terminate();
+            host_handle.terminate();
             return Err(StdioTransportError::ProcessIdentityMismatch);
         }
         let identity = host_session.handle.identity.clone();
@@ -554,6 +556,14 @@ impl McpStdioProbe {
             deadline,
             observed: false,
         })
+    }
+
+    pub(crate) fn abort(&self) {
+        if let Some(session) = self.session.as_ref() {
+            session.abort();
+        } else {
+            self.host_handle.terminate();
+        }
     }
 
     pub(crate) fn into_transport(
@@ -578,16 +588,19 @@ impl McpStdioProbe {
             || readiness.server_id() != permit.tool_server_id
             || authority.tool_server_generation() != permit.tool_server_generation
         {
+            self.abort();
             return Err(StdioTransportError::ProcessIdentityMismatch);
         }
         if !self.observed {
+            self.abort();
             return Err(StdioTransportError::NotInitialized);
         }
+        let Some(session) = self.session.take() else {
+            self.host_handle.terminate();
+            return Err(StdioTransportError::NotInitialized);
+        };
         Ok(McpStdioTransport {
-            session: self
-                .session
-                .take()
-                .ok_or(StdioTransportError::NotInitialized)?,
+            session,
             host_handle: self.host_handle,
             expected_request_id: permit.server_request_id.clone(),
             deadline: self.deadline,
