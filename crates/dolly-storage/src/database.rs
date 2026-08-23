@@ -202,14 +202,16 @@ struct ArtifactSnapshot {
     path: PathBuf,
     before: Option<ArtifactState>,
     created_identity: Option<ArtifactIdentity>,
+    remove_created: bool,
 }
 
 impl ArtifactSnapshot {
-    fn capture(path: PathBuf) -> StorageResult<Self> {
+    fn capture(path: PathBuf, remove_created: bool) -> StorageResult<Self> {
         Ok(Self {
             before: capture_artifact_state(&path)?,
             path,
             created_identity: None,
+            remove_created,
         })
     }
 
@@ -219,23 +221,25 @@ impl ArtifactSnapshot {
         }
     }
 
-    fn restore(&self) {
-        if reject_symlink_components(&self.path).is_err() {
-            return;
-        }
+    fn restore(&self) -> StorageResult<()> {
+        reject_symlink_components(&self.path)?;
         match (&self.before, self.created_identity) {
-            (None, Some(identity)) => {
-                if current_artifact_identity(&self.path) == Some(identity) {
-                    let _ = fs::remove_file(&self.path);
+            (None, Some(identity)) if self.remove_created => {
+                match current_artifact_identity(&self.path) {
+                    None => Ok(()),
+                    Some(current) if current == identity => {
+                        fs::remove_file(&self.path).map_err(map_io_error)
+                    }
+                    Some(_) => Err(StorageError::UnsafeConfiguration),
                 }
             }
-            (Some(state), _) => {
-                let current = current_artifact_identity(&self.path);
-                if current.is_none() || current == Some(state.identity) {
-                    let _ = restore_artifact_state(&self.path, state);
+            (None, Some(_)) | (None, None) => Ok(()),
+            (Some(state), _) => match current_artifact_identity(&self.path) {
+                Some(current) if current == state.identity => {
+                    restore_artifact_state(&self.path, state)
                 }
-            }
-            (None, None) => {}
+                Some(_) | None => Err(StorageError::UnsafeConfiguration),
+            },
         }
     }
 }
@@ -251,6 +255,7 @@ struct MigrationCleanup {
     path_lock_active: bool,
     identity_lock_active: bool,
     committed: bool,
+    restored: bool,
 }
 
 impl MigrationCleanup {
@@ -260,19 +265,26 @@ impl MigrationCleanup {
         identity_lock_path: &Path,
     ) -> StorageResult<Self> {
         Ok(Self {
-            database: ArtifactSnapshot::capture(database_path.to_path_buf())?,
-            database_wal: ArtifactSnapshot::capture(sqlite_sidecar_path(database_path, "-wal"))?,
-            database_shm: ArtifactSnapshot::capture(sqlite_sidecar_path(database_path, "-shm"))?,
-            database_journal: ArtifactSnapshot::capture(sqlite_sidecar_path(
-                database_path,
-                "-journal",
-            ))?,
-            path_lock: ArtifactSnapshot::capture(path_lock_path.to_path_buf())?,
-            identity_lock: ArtifactSnapshot::capture(identity_lock_path.to_path_buf())?,
+            database: ArtifactSnapshot::capture(database_path.to_path_buf(), true)?,
+            database_wal: ArtifactSnapshot::capture(
+                sqlite_sidecar_path(database_path, "-wal"),
+                true,
+            )?,
+            database_shm: ArtifactSnapshot::capture(
+                sqlite_sidecar_path(database_path, "-shm"),
+                true,
+            )?,
+            database_journal: ArtifactSnapshot::capture(
+                sqlite_sidecar_path(database_path, "-journal"),
+                true,
+            )?,
+            path_lock: ArtifactSnapshot::capture(path_lock_path.to_path_buf(), false)?,
+            identity_lock: ArtifactSnapshot::capture(identity_lock_path.to_path_buf(), false)?,
             database_active: false,
             path_lock_active: false,
             identity_lock_active: false,
             committed: false,
+            restored: false,
         })
     }
 
@@ -318,23 +330,46 @@ impl MigrationCleanup {
         self.committed = true;
     }
 
-    fn restore(&mut self) {
-        if self.committed {
-            return;
+    fn restore(&mut self) -> StorageResult<()> {
+        if self.committed || self.restored {
+            return Ok(());
         }
+        self.restored = true;
         self.note_all_created();
-        self.database_journal.restore();
-        self.database_shm.restore();
-        self.database_wal.restore();
-        self.database.restore();
-        self.identity_lock.restore();
-        self.path_lock.restore();
+        let restorations = [
+            self.database_journal.restore(),
+            self.database_shm.restore(),
+            self.database_wal.restore(),
+            self.database.restore(),
+            self.identity_lock.restore(),
+            self.path_lock.restore(),
+        ];
+        let mut first_error = None;
+        for result in restorations {
+            if let Err(error) = result {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn fail(&mut self, primary: StorageError) -> StorageError {
+        if let Err(cleanup_error) = self.restore() {
+            eprintln!("authority cleanup refused: {cleanup_error}");
+        }
+        primary
     }
 }
 
 impl Drop for MigrationCleanup {
     fn drop(&mut self) {
-        self.restore();
+        if !self.committed && !self.restored {
+            if let Err(error) = self.restore() {
+                eprintln!("authority cleanup refused: {error}");
+            }
+        }
     }
 }
 
@@ -519,7 +554,7 @@ impl OfflineDatabase {
                 cleanup.commit();
                 Ok(database)
             }
-            Err(error) => Err(error),
+            Err(error) => Err(cleanup.fail(error)),
         }
     }
 
@@ -615,7 +650,7 @@ fn open_internal(db_path: &Path, attestation: &ReleaseAttestation) -> StorageRes
             cleanup.commit();
             Ok(database)
         }
-        Err(error) => Err(error),
+        Err(error) => Err(cleanup.fail(error)),
     }
 }
 
@@ -858,14 +893,16 @@ fn capture_artifact_state(path: &Path) -> StorageResult<Option<ArtifactState>> {
 
 fn restore_artifact_state(path: &Path, state: &ArtifactState) -> StorageResult<()> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(true);
+    options.read(true).write(true).create(false).truncate(true);
     #[cfg(unix)]
     {
-        options
-            .mode(state.mode)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let mut file = options.open(path).map_err(map_io_error)?;
+    let current_identity = artifact_identity(&file.metadata().map_err(map_io_error)?);
+    if current_identity != state.identity {
+        return Err(StorageError::UnsafeConfiguration);
+    }
     file.write_all(&state.bytes).map_err(map_io_error)?;
     file.sync_all().map_err(map_io_error)?;
     #[cfg(unix)]
@@ -873,8 +910,12 @@ fn restore_artifact_state(path: &Path, state: &ArtifactState) -> StorageResult<(
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
         unsafe {
-            let _ = libc::fchown(fd, state.uid, state.gid);
-            let _ = libc::fchmod(fd, state.mode);
+            if libc::fchown(fd, state.uid, state.gid) != 0 {
+                return Err(map_io_error(io::Error::last_os_error()));
+            }
+            if libc::fchmod(fd, state.mode) != 0 {
+                return Err(map_io_error(io::Error::last_os_error()));
+            }
             let times = [
                 libc::timespec {
                     tv_sec: state.atime_seconds as libc::time_t,
@@ -885,9 +926,12 @@ fn restore_artifact_state(path: &Path, state: &ArtifactState) -> StorageResult<(
                     tv_nsec: state.mtime_nanoseconds as libc::c_long,
                 },
             ];
-            let _ = libc::futimens(fd, times.as_ptr());
+            if libc::futimens(fd, times.as_ptr()) != 0 {
+                return Err(map_io_error(io::Error::last_os_error()));
+            }
         }
     }
+    file.sync_all().map_err(map_io_error)?;
     Ok(())
 }
 fn reject_symlink_components(path: &Path) -> StorageResult<()> {
@@ -909,15 +953,16 @@ fn reject_symlink_components(path: &Path) -> StorageResult<()> {
     }
     Ok(())
 }
-
-fn remove_created_lock_file(lock_path: &Path, file: File) {
-    let identity = current_artifact_identity(lock_path);
-    drop(file);
-    if let Some(identity) = identity {
-        if current_artifact_identity(lock_path) == Some(identity) {
-            let _ = fs::remove_file(lock_path);
-        }
+fn verify_lock_path_binding(lock_path: &Path, file: &File) -> StorageResult<()> {
+    let path_metadata = fs::symlink_metadata(lock_path).map_err(map_io_error)?;
+    if !path_metadata.is_file() {
+        return Err(StorageError::UnsafeConfiguration);
     }
+    let file_metadata = file.metadata().map_err(map_io_error)?;
+    if artifact_identity(&path_metadata) != artifact_identity(&file_metadata) {
+        return Err(StorageError::UnsafeConfiguration);
+    }
+    Ok(())
 }
 
 fn acquire_lock_file_with_creation(lock_path: &Path) -> StorageResult<(File, bool)> {
@@ -944,30 +989,16 @@ fn acquire_lock_file_with_creation(lock_path: &Path) -> StorageResult<(File, boo
             }
             Err(error) => return Err(map_io_error(error)),
         };
-        let meta = match file.metadata().map_err(map_io_error) {
-            Ok(meta) => meta,
-            Err(error) => {
-                if created {
-                    remove_created_lock_file(lock_path, file);
-                }
-                return Err(error);
-            }
-        };
+        let meta = file.metadata().map_err(map_io_error)?;
         if !meta.is_file()
             || meta.uid() != unsafe { libc::geteuid() }
             || meta.mode() & 0o7777 != 0o600
         {
-            if created {
-                remove_created_lock_file(lock_path, file);
-            }
             return Err(StorageError::UnsafeConfiguration);
         }
-        if let Err(error) = try_lock_exclusive(&file) {
-            if created {
-                remove_created_lock_file(lock_path, file);
-            }
-            return Err(error);
-        }
+        verify_lock_path_binding(lock_path, &file)?;
+        try_lock_exclusive(&file)?;
+        verify_lock_path_binding(lock_path, &file)?;
         Ok((file, created))
     }
     #[cfg(not(unix))]
