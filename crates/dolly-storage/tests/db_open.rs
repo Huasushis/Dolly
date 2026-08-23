@@ -8,6 +8,7 @@
 
 #![cfg(unix)] // flock, O_NOFOLLOW, and symlink fixtures are Linux-first
 
+use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -315,6 +316,137 @@ fn symlinked_lock_file_refused() {
     std::os::unix::fs::symlink(&real_lock, &lock_path).unwrap();
     let err = Database::open(&path).expect_err("symlinked lock must be refused");
     assert!(matches!(err, StorageError::UnsafeConfiguration));
+}
+#[test]
+fn explicit_v1_authority_migration_rebuilds_state_and_gates_ordinary_open() {
+    let (_dir, path) = temp_db();
+    let db = open_migrated(&path);
+    let previous_generation = db.controller_generation_id().to_owned();
+    drop(db);
+
+    let connection = Connection::open(&path).unwrap();
+    let (daemon, instance, revision, digest): (String, String, i64, String) = connection
+        .query_row(
+            "SELECT daemon_installation_id, instance_id,
+                    current_config_revision, current_config_digest
+             FROM runtime_authority_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    let old_state = serde_json::json!({
+        "authority_schema_version": 1,
+        "current_config_digest": digest,
+        "current_config_revision": revision,
+        "daemon_installation_id": daemon,
+        "instance_id": instance,
+        "schema": "dolly.runtime-authority-state/v1",
+    });
+    let old_state_bytes = serde_json::to_vec(&old_state).unwrap();
+    let tx = connection.unchecked_transaction().unwrap();
+    tx.execute_batch(
+        "CREATE TABLE runtime_authority_state__dolly_v1 (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
+            daemon_installation_id TEXT NOT NULL,
+            instance_id TEXT NOT NULL,
+            current_config_revision INTEGER NOT NULL CHECK (current_config_revision BETWEEN 1 AND 9007199254740991),
+            current_config_digest TEXT NOT NULL,
+            record_jcs BLOB NOT NULL,
+            FOREIGN KEY (current_config_revision, current_config_digest)
+              REFERENCES config_revision_mappings(config_revision, config_digest)
+        );
+        CREATE TABLE host_authority_meta__dolly_v1 (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1)
+        );",
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO runtime_authority_state__dolly_v1 (
+            singleton, authority_schema_version, daemon_installation_id, instance_id,
+            current_config_revision, current_config_digest, record_jcs
+         ) VALUES (1, 1, ?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            &daemon,
+            &instance,
+            revision,
+            &old_state["current_config_digest"].as_str().unwrap(),
+            old_state_bytes,
+        ],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO host_authority_meta__dolly_v1
+            (singleton, authority_schema_version) VALUES (1, 1)",
+        [],
+    )
+    .unwrap();
+    tx.execute("DROP TABLE runtime_authority_state", [])
+        .unwrap();
+    tx.execute_batch(
+        "ALTER TABLE runtime_authority_state__dolly_v1
+            RENAME TO runtime_authority_state;
+         DROP TABLE host_authority_meta;
+         ALTER TABLE host_authority_meta__dolly_v1
+            RENAME TO host_authority_meta;",
+    )
+    .unwrap();
+    tx.execute(
+        "UPDATE core_meta SET controller_generation_id = NULL WHERE singleton = 1",
+        [],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        Database::open(&path),
+        Err(StorageError::MigrationRequired)
+    ));
+
+    let migrated = Database::open_for_migration(&path)
+        .unwrap()
+        .migrate_v1_authority()
+        .expect("explicit offline v1 migration");
+    assert_ne!(migrated.controller_generation_id(), previous_generation);
+    let host_version: i64 = migrated
+        .connection()
+        .query_row(
+            "SELECT authority_schema_version FROM host_authority_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        host_version,
+        dolly_storage::host_authority::HOST_AUTHORITY_SCHEMA_VERSION
+    );
+    let state_generation: String = migrated
+        .connection()
+        .query_row(
+            "SELECT controller_generation_id FROM runtime_authority_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let core_generation: String = migrated
+        .connection()
+        .query_row(
+            "SELECT controller_generation_id FROM core_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state_generation, migrated.controller_generation_id());
+    assert_eq!(core_generation, migrated.controller_generation_id());
+    assert!(
+        dolly_storage::host_authority::load_current_authority(migrated.connection())
+            .unwrap()
+            .is_some()
+    );
+    drop(migrated);
+    Database::open(&path).expect("ordinary open after explicit migration");
 }
 
 fn lock_for(db: &Path) -> PathBuf {

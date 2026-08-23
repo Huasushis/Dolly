@@ -32,12 +32,14 @@ use dolly_canonical_json::{CanonicalJsonValue, Sha256Digest, canonicalize};
 use crate::attestation::{LoadedSqlite, ReleaseAttestation, SqliteBuildGate, VerifiedSqliteBuild};
 use crate::error::{StorageError, StorageResult};
 use crate::host_authority::{
-    ConfigRevisionMapping, HOST_AUTHORITY_SCHEMA_SQL, HOST_AUTHORITY_SCHEMA_VERSION,
-    HostAuthorityError, HostAuthorityRevision, LinuxServiceCandidate, ModuleActivationPremises,
-    PermissionPolicyBackendBinding, PermissionPolicyDefinition, PermissionPolicySelection,
-    ResolvedConfiguration, RuntimeAuthorityIdentity,
-    install_host_authority_revision_in_transaction, load_current_authority_with_generation,
-    refresh_controller_generation_in_transaction, validate_revision,
+    ConfigRevisionMapping, CurrentAuthoritySnapshot, HOST_AUTHORITY_SCHEMA_SQL,
+    HOST_AUTHORITY_SCHEMA_VERSION, HostAuthorityError, HostAuthorityRevision,
+    LinuxServiceCandidate, ModuleActivationPremises, PermissionPolicyBackendBinding,
+    PermissionPolicyDefinition, PermissionPolicySelection, ResolvedConfiguration,
+    RuntimeAuthorityIdentity, install_host_authority_revision_in_transaction,
+    load_current_authority_with_generation, load_legacy_current_authority,
+    migrate_legacy_authority_in_transaction, refresh_controller_generation_in_transaction,
+    validate_revision,
 };
 
 /// Highest schema version this binary understands.
@@ -221,26 +223,21 @@ impl ArtifactSnapshot {
         })
     }
 
-    fn note_created(&mut self) {
+    fn note_created(&mut self) -> StorageResult<()> {
         if self.before.is_none() && self.created_identity.is_none() {
-            self.created_identity = current_artifact_identity(&self.path);
+            self.created_identity = current_artifact_identity(&self.path)?;
         }
+        Ok(())
     }
 
     fn restore(&self) -> StorageResult<()> {
         reject_symlink_components(&self.path)?;
         match (&self.before, self.created_identity) {
             (None, Some(identity)) if self.remove_created => {
-                match current_artifact_identity(&self.path) {
-                    None => Ok(()),
-                    Some(current) if current == identity => {
-                        fs::remove_file(&self.path).map_err(map_io_error)
-                    }
-                    Some(_) => Err(StorageError::UnsafeConfiguration),
-                }
+                remove_created_artifact(&self.path, identity)
             }
             (None, Some(_)) | (None, None) => Ok(()),
-            (Some(state), _) => match current_artifact_identity(&self.path) {
+            (Some(state), _) => match current_artifact_identity(&self.path)? {
                 Some(current) if current == state.identity => {
                     restore_artifact_state(&self.path, state)
                 }
@@ -318,7 +315,7 @@ impl MigrationCleanup {
         self.path_lock_acquired = true;
         self.path_lock_created = acquired.created;
         if acquired.created {
-            self.path_lock.note_created();
+            self.path_lock.note_created()?;
         }
         Ok(())
     }
@@ -331,7 +328,7 @@ impl MigrationCleanup {
         self.identity_lock_acquired = true;
         self.identity_lock_created = acquired.created;
         if acquired.created {
-            self.identity_lock.note_created();
+            self.identity_lock.note_created()?;
         }
         Ok(())
     }
@@ -340,24 +337,48 @@ impl MigrationCleanup {
         self.database_active = true;
     }
 
-    fn note_database_artifacts(&mut self) {
-        if !self.database_active {
-            return;
+    fn note_database_artifacts(&mut self) -> StorageResult<()> {
+        let mut first_error = None;
+        if self.database_active {
+            if let Err(error) = self.database.note_created() {
+                first_error = Some(error);
+            }
+            if let Err(error) = self.database_wal.note_created() {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            if let Err(error) = self.database_shm.note_created() {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            if let Err(error) = self.database_journal.note_created() {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
-        self.database.note_created();
-        self.database_wal.note_created();
-        self.database_shm.note_created();
-        self.database_journal.note_created();
+        first_error.map_or(Ok(()), Err)
     }
 
-    fn note_all_created(&mut self) {
-        self.note_database_artifacts();
+    fn note_all_created(&mut self) -> StorageResult<()> {
+        let mut first_error = self.note_database_artifacts().err();
         if self.path_lock_created {
-            self.path_lock.note_created();
+            if let Err(error) = self.path_lock.note_created() {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
         if self.identity_lock_created {
-            self.identity_lock.note_created();
+            if let Err(error) = self.identity_lock.note_created() {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn commit(&mut self) {
@@ -369,7 +390,7 @@ impl MigrationCleanup {
             return Ok(());
         }
         self.restored = true;
-        self.note_all_created();
+        let mut first_error = self.note_all_created().err();
         let identity_restore = if self.identity_lock_acquired {
             self.identity_lock.restore()
         } else {
@@ -388,7 +409,6 @@ impl MigrationCleanup {
             identity_restore,
             path_restore,
         ];
-        let mut first_error = None;
         for result in restorations {
             if let Err(error) = result {
                 if first_error.is_none() {
@@ -559,20 +579,14 @@ impl OfflineDatabase {
             cleanup.begin_database();
             let connection = match open_connection(&database.db_path) {
                 Ok(connection) => connection,
-                Err(error) => {
-                    cleanup.note_database_artifacts();
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
-            cleanup.note_database_artifacts();
+            cleanup.note_database_artifacts()?;
             let configuration = match apply_and_verify_configuration(&connection) {
                 Ok(configuration) => configuration,
-                Err(error) => {
-                    cleanup.note_database_artifacts();
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
-            cleanup.note_database_artifacts();
+            cleanup.note_database_artifacts()?;
             database.configuration = Some(configuration);
             database.connection = Some(connection);
 
@@ -602,6 +616,132 @@ impl OfflineDatabase {
             database.identity_lock = Some(identity_lock);
             database.identity_directory_lock = Some(identity_directory_lock);
             database.authority_identity = Some(input.identity);
+            database.controller_generation_id = Some(controller_generation_id);
+            Ok(database)
+        })();
+
+        match result {
+            Ok(database) => {
+                cleanup.commit();
+                Ok(database)
+            }
+            Err(error) => Err(cleanup.fail(error)),
+        }
+    }
+
+    /// Migrate an existing pre-generation Host authority whose physical
+    /// `runtime_authority_state` table lacks `controller_generation_id`.
+    ///
+    /// This is the only path allowed to rewrite that schema. It validates the
+    /// complete legacy pointer before acquiring the path lock, revalidates it
+    /// after acquiring path then identity locks, and commits the v1-to-v2
+    /// rewrite in one immediate transaction.
+    pub fn migrate_v1_authority(self) -> StorageResult<Database> {
+        let path_lock_path = instance_lock_path(&self.db_path);
+        reject_symlink_components(&self.db_path)?;
+        reject_symlink_components(&path_lock_path)?;
+        let expected =
+            read_legacy_authority(&self.db_path)?.ok_or(StorageError::MigrationRequired)?;
+        let loaded = probe_loaded_sqlite();
+        let verified = SqliteBuildGate.verify(&self.attestation, &loaded)?;
+        let identity_lock_path = canonical_identity_lock_path(&expected.0);
+        reject_symlink_components(&identity_lock_path)?;
+        let mut cleanup =
+            MigrationCleanup::capture(&self.db_path, &path_lock_path, &identity_lock_path)?;
+        let result = (|| -> StorageResult<Database> {
+            let acquired_path = acquire_lock_file_with_creation(&path_lock_path)?;
+            cleanup.note_path_lock_acquired(&acquired_path)?;
+            let AcquiredLock {
+                file: path_lock,
+                directory_lock: path_directory_lock,
+                ..
+            } = acquired_path;
+            let current =
+                read_legacy_authority(&self.db_path)?.ok_or(StorageError::MigrationRequired)?;
+            if current != expected {
+                return Err(StorageError::Corrupt);
+            }
+            let acquired_identity = acquire_identity_lock_with_creation(&expected.0)?;
+            cleanup.note_identity_lock_acquired(&acquired_identity)?;
+            let AcquiredLock {
+                file: identity_lock,
+                directory_lock: identity_directory_lock,
+                ..
+            } = acquired_identity;
+            let current =
+                read_legacy_authority(&self.db_path)?.ok_or(StorageError::MigrationRequired)?;
+            if current != expected {
+                return Err(StorageError::Corrupt);
+            }
+            if let Some(owner) = lock_owner(&path_lock)? {
+                if owner.daemon_installation_id != expected.0.daemon_installation_id
+                    || owner.instance_id != expected.0.instance_id
+                {
+                    return Err(StorageError::Corrupt);
+                }
+            }
+            let controller_generation_id = mint_controller_generation_id()?;
+            verify_or_write_lock_owner(&identity_lock, &expected.0, &controller_generation_id)?;
+            verify_or_write_lock_owner(&path_lock, &expected.0, &controller_generation_id)?;
+
+            let mut database = Database {
+                db_path: self.db_path.clone(),
+                connection: None,
+                identity_lock: None,
+                identity_directory_lock: None,
+                path_lock,
+                path_directory_lock: Some(path_directory_lock),
+                verified,
+                configuration: None,
+                schema_version: 0,
+                authority_identity: None,
+                controller_generation_id: None,
+            };
+            cleanup.begin_database();
+            let connection = open_connection(&database.db_path)?;
+            cleanup.note_database_artifacts()?;
+            let configuration = apply_and_verify_configuration(&connection)?;
+            cleanup.note_database_artifacts()?;
+            let schema_version = ensure_schema(&connection, &database.verified)?;
+            verify_sqlite_integrity(&connection)?;
+            let writable_legacy = load_legacy_current_authority(&connection)
+                .map_err(map_host_authority_error)?
+                .ok_or(StorageError::MigrationRequired)?;
+            if writable_legacy != expected.1 {
+                return Err(StorageError::Corrupt);
+            }
+            database.configuration = Some(configuration);
+            database.connection = Some(connection);
+            let connection = database
+                .connection
+                .as_mut()
+                .expect("offline authority migration connection");
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(map_sqlite_error)?;
+            let updated = tx
+                .execute(
+                    "UPDATE core_meta SET controller_generation_id = ?1
+                     WHERE singleton = 1",
+                    [&controller_generation_id],
+                )
+                .map_err(map_sqlite_error)?;
+            if updated != 1 {
+                return Err(StorageError::Corrupt);
+            }
+            migrate_legacy_authority_in_transaction(&tx, &controller_generation_id)
+                .map_err(map_host_authority_error)?;
+            tx.commit().map_err(map_sqlite_error)?;
+            let migrated = load_current_authority_with_generation(connection)
+                .map_err(map_host_authority_error)?
+                .ok_or(StorageError::Corrupt)?;
+            if migrated.0 != expected.1 || migrated.1 != controller_generation_id {
+                return Err(StorageError::Corrupt);
+            }
+            database.schema_version = schema_version;
+            database.identity_lock = Some(identity_lock);
+            database.identity_directory_lock = Some(identity_directory_lock);
+            database.authority_identity = Some(expected.0);
             database.controller_generation_id = Some(controller_generation_id);
             Ok(database)
         })();
@@ -683,9 +823,9 @@ fn open_internal(db_path: &Path, attestation: &ReleaseAttestation) -> StorageRes
 
         cleanup.begin_database();
         let connection = open_connection(db_path)?;
-        cleanup.note_database_artifacts();
+        cleanup.note_database_artifacts()?;
         let configuration = apply_and_verify_configuration(&connection)?;
-        cleanup.note_database_artifacts();
+        cleanup.note_database_artifacts()?;
         let schema_version = ensure_schema(&connection, &verified)?;
         verify_sqlite_integrity(&connection)?;
         let authority_identity =
@@ -752,6 +892,77 @@ fn validate_host_authority_schema_readonly(connection: &Connection) -> StorageRe
         return Err(StorageError::MigrationRequired);
     }
     Ok(())
+}
+fn read_legacy_authority(
+    db_path: &Path,
+) -> StorageResult<Option<(RuntimeAuthorityIdentity, CurrentAuthoritySnapshot)>> {
+    reject_symlink_components(db_path)?;
+    let metadata = match fs::metadata(db_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(StorageError::UnsafeConfiguration),
+    };
+    if metadata.len() == 0 {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| StorageError::MigrationRequired)?;
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|_| StorageError::MigrationRequired)?;
+    if user_version != SCHEMA_VERSION {
+        return Err(StorageError::MigrationRequired);
+    }
+    let host_version: Option<i64> = connection
+        .query_row(
+            "SELECT authority_schema_version
+             FROM host_authority_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| StorageError::MigrationRequired)?;
+    if host_version != Some(1) {
+        return Err(StorageError::MigrationRequired);
+    }
+    let mut columns = std::collections::BTreeSet::new();
+    let mut statement = connection
+        .prepare("PRAGMA table_info(runtime_authority_state)")
+        .map_err(|_| StorageError::MigrationRequired)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|_| StorageError::MigrationRequired)?;
+    for row in rows {
+        columns.insert(row.map_err(|_| StorageError::MigrationRequired)?);
+    }
+    if columns.contains("controller_generation_id") {
+        return Err(StorageError::MigrationRequired);
+    }
+    let snapshot = load_legacy_current_authority(&connection)
+        .map_err(map_host_authority_error)?
+        .ok_or(StorageError::MigrationRequired)?;
+    let core_identity: Option<(Option<String>, Option<String>)> = connection
+        .query_row(
+            "SELECT daemon_installation_id, instance_id
+             FROM core_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|_| StorageError::MigrationRequired)?;
+    let Some((Some(daemon_installation_id), Some(instance_id))) = core_identity else {
+        return Err(StorageError::Corrupt);
+    };
+    let identity = RuntimeAuthorityIdentity {
+        daemon_installation_id,
+        instance_id,
+    };
+    if identity.daemon_installation_id != snapshot.mapping.daemon_installation_id
+        || identity.instance_id != snapshot.mapping.instance_id
+    {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(Some((identity, snapshot)))
 }
 
 fn read_persisted_identity(
@@ -950,11 +1161,40 @@ fn artifact_identity(metadata: &fs::Metadata) -> ArtifactIdentity {
     }
 }
 
-fn current_artifact_identity(path: &Path) -> Option<ArtifactIdentity> {
-    fs::symlink_metadata(path)
-        .ok()
-        .filter(|metadata| metadata.is_file())
-        .map(|metadata| artifact_identity(&metadata))
+fn current_artifact_identity(path: &Path) -> StorageResult<Option<ArtifactIdentity>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(artifact_identity(&metadata))),
+        Ok(_) => Err(StorageError::UnsafeConfiguration),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(map_io_error(error)),
+    }
+}
+
+fn remove_created_artifact(path: &Path, expected: ArtifactIdentity) -> StorageResult<()> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(false);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(map_io_error(error)),
+    };
+    let metadata = file.metadata().map_err(map_io_error)?;
+    if !metadata.is_file() || artifact_identity(&metadata) != expected {
+        return Err(StorageError::UnsafeConfiguration);
+    }
+    let path_metadata = fs::symlink_metadata(path).map_err(map_io_error)?;
+    if !path_metadata.is_file() || artifact_identity(&path_metadata) != expected {
+        return Err(StorageError::UnsafeConfiguration);
+    }
+    fs::remove_file(path).map_err(map_io_error)?;
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) | Err(_) => Err(StorageError::UnsafeConfiguration),
+    }
 }
 
 fn capture_artifact_state(path: &Path) -> StorageResult<Option<ArtifactState>> {
@@ -1033,6 +1273,17 @@ fn restore_artifact_state(path: &Path, state: &ArtifactState) -> StorageResult<(
         }
     }
     file.sync_all().map_err(map_io_error)?;
+    let fd_identity = artifact_identity(&file.metadata().map_err(map_io_error)?);
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(StorageError::UnsafeConfiguration);
+        }
+        Err(error) => return Err(map_io_error(error)),
+    };
+    if !path_metadata.is_file() || artifact_identity(&path_metadata) != fd_identity {
+        return Err(StorageError::UnsafeConfiguration);
+    }
     Ok(())
 }
 fn reject_symlink_components(path: &Path) -> StorageResult<()> {

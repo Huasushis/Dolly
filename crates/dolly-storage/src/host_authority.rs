@@ -272,6 +272,16 @@ struct RuntimeAuthorityStateRecord {
     current_config_revision: i64,
     current_config_digest: Sha256Digest,
 }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRuntimeAuthorityStateRecord {
+    schema: String,
+    authority_schema_version: i64,
+    daemon_installation_id: String,
+    instance_id: String,
+    current_config_revision: i64,
+    current_config_digest: Sha256Digest,
+}
 
 /// One candidate revision to commit. The premise, if present, must match the mapping.
 #[derive(Debug, Clone, PartialEq)]
@@ -589,11 +599,71 @@ pub(crate) fn load_current_authority_with_generation(
             "runtime authority pointer projection does not match its canonical record".into(),
         ));
     }
+    let snapshot = load_authority_snapshot(connection, &identity, revision, &digest)?;
+    Ok(Some((snapshot, generation)))
+}
 
+/// Load the pre-generation Host authority used only by the explicit offline
+/// v1-to-v2 migration. Ordinary open must never call this path.
+pub(crate) fn load_legacy_current_authority(
+    connection: &Connection,
+) -> Result<Option<CurrentAuthoritySnapshot>, HostAuthorityError> {
+    let Some((authority_schema_version, identity, revision, digest, state_bytes)) = connection
+        .query_row(
+            "SELECT authority_schema_version, daemon_installation_id, instance_id,
+                    current_config_revision, current_config_digest, record_jcs
+             FROM runtime_authority_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    RuntimeAuthorityIdentity {
+                        daemon_installation_id: row.get(1)?,
+                        instance_id: row.get(2)?,
+                    },
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let state: LegacyRuntimeAuthorityStateRecord =
+        decode_record(&state_bytes, "legacy authority state")?;
+    if canonical_bytes(&state, "legacy authority state")? != state_bytes {
+        return Err(HostAuthorityError::DigestMismatch(
+            "legacy authority state canonical bytes".into(),
+        ));
+    }
+    if authority_schema_version != 1
+        || state.schema != "dolly.runtime-authority-state/v1"
+        || state.authority_schema_version != 1
+        || state.daemon_installation_id != identity.daemon_installation_id
+        || state.instance_id != identity.instance_id
+        || state.current_config_revision != revision
+        || state.current_config_digest.to_string() != digest
+    {
+        return Err(HostAuthorityError::InvalidPremise(
+            "legacy runtime authority pointer projection does not match its canonical record"
+                .into(),
+        ));
+    }
+    load_authority_snapshot(connection, &identity, revision, &digest).map(Some)
+}
+
+fn load_authority_snapshot(
+    connection: &Connection,
+    identity: &RuntimeAuthorityIdentity,
+    revision: i64,
+    digest: &str,
+) -> Result<CurrentAuthoritySnapshot, HostAuthorityError> {
     let mapping_row: Option<(String, String, i64, String, Vec<u8>)> = connection
         .query_row(
             "SELECT daemon_installation_id, instance_id, config_revision, config_digest, canonical_bytes FROM config_revision_mappings WHERE config_revision = ?1 AND config_digest = ?2",
-            params![revision, &digest],
+            params![revision, digest],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
@@ -609,6 +679,12 @@ pub(crate) fn load_current_authority_with_generation(
             "current mapping is missing".into(),
         ));
     };
+    if mapping_daemon != identity.daemon_installation_id || mapping_instance != identity.instance_id
+    {
+        return Err(HostAuthorityError::InvalidPremise(
+            "current mapping identity differs from authority state".into(),
+        ));
+    }
     let mapping_digest = mapping_digest_text
         .parse::<Sha256Digest>()
         .map_err(|_| HostAuthorityError::Malformed("mapping config_digest".into()))?;
@@ -634,7 +710,106 @@ pub(crate) fn load_current_authority_with_generation(
     let snapshot = CurrentAuthoritySnapshot { mapping, premise };
     verify_persisted_snapshot(connection, &snapshot)?;
     validate_loaded_snapshot(&snapshot)?;
-    Ok(Some((snapshot, generation)))
+    Ok(snapshot)
+}
+
+/// Rewrite a validated v1 authority into the v2 physical schema. The caller
+/// must hold the path and identity locks in that order and must execute this
+/// body inside one immediate transaction.
+pub(crate) fn migrate_legacy_authority_in_transaction(
+    tx: &Transaction<'_>,
+    generation: &str,
+) -> Result<(), HostAuthorityError> {
+    if generation.is_empty() {
+        return Err(HostAuthorityError::InvalidPremise(
+            "controller generation is empty".into(),
+        ));
+    }
+    let Some(snapshot) = load_legacy_current_authority(tx)? else {
+        return Err(HostAuthorityError::InvalidPremise(
+            "legacy current authority is missing".into(),
+        ));
+    };
+    let host_version: i64 = tx.query_row(
+        "SELECT authority_schema_version FROM host_authority_meta WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if host_version != 1 {
+        return Err(HostAuthorityError::Malformed(
+            "offline migration requires Host authority schema v1".into(),
+        ));
+    }
+    let mut columns = BTreeSet::new();
+    let mut statement = tx.prepare("PRAGMA table_info(runtime_authority_state)")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        columns.insert(row?);
+    }
+    if columns.contains("controller_generation_id") {
+        return Err(HostAuthorityError::Malformed(
+            "offline migration target already has controller generation".into(),
+        ));
+    }
+
+    let state = RuntimeAuthorityStateRecord {
+        schema: "dolly.runtime-authority-state/v1".into(),
+        authority_schema_version: HOST_AUTHORITY_SCHEMA_VERSION,
+        daemon_installation_id: snapshot.mapping.daemon_installation_id.clone(),
+        instance_id: snapshot.mapping.instance_id.clone(),
+        controller_generation_id: generation.to_owned(),
+        current_config_revision: snapshot.mapping.config_revision,
+        current_config_digest: snapshot.mapping.config_digest.clone(),
+    };
+    let state_bytes = canonical_bytes(&state, "authority state")?;
+    tx.execute_batch(
+        "CREATE TABLE runtime_authority_state__dolly_v2 (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 2),
+            daemon_installation_id TEXT NOT NULL,
+            instance_id TEXT NOT NULL,
+            controller_generation_id TEXT NOT NULL,
+            current_config_revision INTEGER NOT NULL CHECK (current_config_revision BETWEEN 1 AND 9007199254740991),
+            current_config_digest TEXT NOT NULL,
+            record_jcs BLOB NOT NULL,
+            FOREIGN KEY (current_config_revision, current_config_digest)
+              REFERENCES config_revision_mappings(config_revision, config_digest)
+        );
+        CREATE TABLE host_authority_meta__dolly_v2 (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 2)
+        );",
+    )?;
+    tx.execute(
+        "INSERT INTO runtime_authority_state__dolly_v2 (
+            singleton, authority_schema_version, daemon_installation_id, instance_id,
+            controller_generation_id, current_config_revision, current_config_digest,
+            record_jcs
+         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            HOST_AUTHORITY_SCHEMA_VERSION,
+            &state.daemon_installation_id,
+            &state.instance_id,
+            generation,
+            state.current_config_revision,
+            state.current_config_digest.to_string(),
+            state_bytes,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO host_authority_meta__dolly_v2
+            (singleton, authority_schema_version) VALUES (1, ?1)",
+        [HOST_AUTHORITY_SCHEMA_VERSION],
+    )?;
+    tx.execute_batch(
+        "DROP TABLE runtime_authority_state;
+         ALTER TABLE runtime_authority_state__dolly_v2
+           RENAME TO runtime_authority_state;
+         DROP TABLE host_authority_meta;
+         ALTER TABLE host_authority_meta__dolly_v2
+           RENAME TO host_authority_meta;",
+    )?;
+    Ok(())
 }
 
 fn verify_persisted_snapshot(
