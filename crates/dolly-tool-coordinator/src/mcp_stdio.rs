@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -125,6 +126,101 @@ impl HostMcpStdioProcessHandle {
     }
 }
 
+/// Opaque capability minted by the installed-child verifier. Its fields are
+/// private so a transport caller cannot pair an arbitrary Child with copied
+/// digest or endpoint claims.
+#[derive(Clone)]
+struct HostIssuedMcpStdioAttestation {
+    server_id: String,
+    adapter: String,
+    protocol_version: String,
+    transport_kind: String,
+    endpoint: String,
+    endpoint_digest: Sha256Digest,
+    package_digest: Sha256Digest,
+    package_path: PathBuf,
+    executable_digest: Sha256Digest,
+    executable_path: PathBuf,
+    transport_digest: Sha256Digest,
+    daemon_installation_id: String,
+    instance_id: String,
+    controller_generation: ExtensionGeneration,
+    worker_epoch: WorkerEpoch,
+    extension_alias: ExtensionId,
+    extension_generation: ExtensionGeneration,
+    runtime_binding_digest: Sha256Digest,
+    session_id: String,
+    process_id: u32,
+}
+
+/// Host-issued verified process/session capability. No raw Child constructor
+/// is exposed; only the installed-child verifier can mint this value.
+pub(crate) struct HostIssuedMcpStdioProcess {
+    child: Child,
+    attestation: HostIssuedMcpStdioAttestation,
+}
+
+/// Internal verifier seam for the installed-child authority. The verifier
+/// owns the attestation and is the only code allowed to pair it with a Child.
+struct InstalledChildVerifier;
+
+impl InstalledChildVerifier {
+    fn issue(
+        child: Child,
+        attestation: HostIssuedMcpStdioAttestation,
+    ) -> Result<HostIssuedMcpStdioProcess, StdioTransportError> {
+        if child.id() != attestation.process_id
+            || !attestation_is_self_consistent(&attestation)
+            || !installed_child_is_attested(&child, &attestation)
+        {
+            return Err(StdioTransportError::ProcessIdentityMismatch);
+        }
+        Ok(HostIssuedMcpStdioProcess { child, attestation })
+    }
+}
+
+fn attestation_is_self_consistent(attestation: &HostIssuedMcpStdioAttestation) -> bool {
+    let Ok((_, endpoint_digest)) =
+        canonicalize(&CanonicalJsonValue::String(attestation.endpoint.clone()))
+    else {
+        return false;
+    };
+    endpoint_digest == attestation.endpoint_digest
+}
+
+fn installed_child_is_attested(child: &Child, attestation: &HostIssuedMcpStdioAttestation) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(package) = std::fs::read(&attestation.package_path) else {
+            return false;
+        };
+        if Sha256Digest::compute(&package) != attestation.package_digest {
+            return false;
+        }
+        let Ok(actual_link) = std::fs::read_link(format!("/proc/{}/exe", child.id())) else {
+            return false;
+        };
+        let Ok(actual_path) = std::fs::canonicalize(actual_link) else {
+            return false;
+        };
+        let Ok(expected_path) = std::fs::canonicalize(&attestation.executable_path) else {
+            return false;
+        };
+        if actual_path != expected_path {
+            return false;
+        }
+        let Ok(executable) = std::fs::read(actual_path) else {
+            return false;
+        };
+        Sha256Digest::compute(&executable) == attestation.executable_digest
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (child, attestation);
+        false
+    }
+}
+
 #[derive(Clone)]
 struct HostVerifiedMcpStdioIdentity {
     server_id: String,
@@ -133,6 +229,8 @@ struct HostVerifiedMcpStdioIdentity {
     transport_kind: String,
     endpoint: String,
     endpoint_digest: Sha256Digest,
+    package_digest: Sha256Digest,
+    executable_digest: Sha256Digest,
     transport_digest: Sha256Digest,
     daemon_installation_id: String,
     instance_id: String,
@@ -151,35 +249,48 @@ pub(crate) struct HostOwnedMcpStdioSession {
 }
 
 impl HostOwnedMcpStdioSession {
-    /// The Host calls this only after its installed-child verifier has
-    /// authenticated the exact executable/package digests for `binding`.
-    pub(crate) fn from_verified_child(
-        mut child: Child,
-        binding: &McpTransportBinding,
+    pub(crate) fn from_host_issued_process(
+        mut process: HostIssuedMcpStdioProcess,
         process_generation: &ProcessGeneration,
     ) -> Result<Self, StdioTransportError> {
-        let reader = child
+        let attestation = process.attestation.clone();
+        if attestation.runtime_binding_digest != *process_generation.binding_digest()
+            || attestation.controller_generation != process_generation.controller_generation()
+            || attestation.worker_epoch != *process_generation.worker_epoch()
+            || attestation.extension_alias != *process_generation.extension_alias()
+            || attestation.extension_generation != process_generation.extension_generation()
+        {
+            return Err(StdioTransportError::ProcessIdentityMismatch);
+        }
+        let reader = process
+            .child
             .stdout
             .take()
             .ok_or(StdioTransportError::MissingPipe)?;
-        let writer = child.stdin.take().ok_or(StdioTransportError::MissingPipe)?;
-        let process = ProcessControl::child(child);
+        let writer = process
+            .child
+            .stdin
+            .take()
+            .ok_or(StdioTransportError::MissingPipe)?;
+        let process = ProcessControl::child(process.child);
         let identity = HostVerifiedMcpStdioIdentity {
-            server_id: binding.server_id().to_owned(),
-            adapter: binding.adapter().to_owned(),
-            protocol_version: binding.protocol_version().to_owned(),
-            transport_kind: binding.transport_kind().to_owned(),
-            endpoint: binding.endpoint().to_owned(),
-            endpoint_digest: binding.endpoint_digest().clone(),
-            transport_digest: binding.transport_digest().clone(),
-            daemon_installation_id: process_generation.daemon_installation_id().to_owned(),
-            instance_id: process_generation.instance_id().to_owned(),
-            controller_generation: process_generation.controller_generation(),
-            worker_epoch: process_generation.worker_epoch().clone(),
-            extension_alias: process_generation.extension_alias().clone(),
-            extension_generation: process_generation.extension_generation(),
-            runtime_binding_digest: process_generation.binding_digest().clone(),
-            session_id: stdio_session_id(binding, process_generation, process.as_ref()),
+            server_id: attestation.server_id,
+            adapter: attestation.adapter,
+            protocol_version: attestation.protocol_version,
+            transport_kind: attestation.transport_kind,
+            endpoint: attestation.endpoint,
+            endpoint_digest: attestation.endpoint_digest,
+            package_digest: attestation.package_digest,
+            executable_digest: attestation.executable_digest,
+            transport_digest: attestation.transport_digest,
+            daemon_installation_id: attestation.daemon_installation_id,
+            instance_id: attestation.instance_id,
+            controller_generation: attestation.controller_generation,
+            worker_epoch: attestation.worker_epoch,
+            extension_alias: attestation.extension_alias,
+            extension_generation: attestation.extension_generation,
+            runtime_binding_digest: attestation.runtime_binding_digest,
+            session_id: attestation.session_id,
         };
         Ok(Self {
             reader,
@@ -195,28 +306,6 @@ impl HostOwnedMcpStdioSession {
     fn into_parts(self) -> (ChildStdout, ChildStdin, Arc<ProcessControl>) {
         (self.reader, self.writer, self.handle.process)
     }
-}
-
-fn stdio_session_id(
-    binding: &McpTransportBinding,
-    process_generation: &ProcessGeneration,
-    process: &ProcessControl,
-) -> String {
-    let process_identity = process
-        .child
-        .as_ref()
-        .and_then(|child| child.lock().ok().map(|child| child.id()))
-        .unwrap_or_default();
-    Sha256Digest::compute(
-        format!(
-            "dolly-mcp-stdio/v1/{}/{}/{}",
-            binding.server_id(),
-            process_generation.binding_digest(),
-            process_identity
-        )
-        .as_bytes(),
-    )
-    .to_string()
 }
 
 #[derive(Debug)]
@@ -436,9 +525,11 @@ impl Drop for McpStdioSession {
     }
 }
 
-/// The production probe is created only from a Host-owned verified session.
+/// The production probe is created only from a Host-owned verified session
+/// plus the Host-retained process handle.
 pub(crate) struct McpStdioProbe {
     session: Option<McpStdioSession>,
+    host_handle: HostMcpStdioProcessHandle,
     identity: HostVerifiedMcpStdioIdentity,
     deadline: Instant,
     observed: bool,
@@ -447,17 +538,22 @@ pub(crate) struct McpStdioProbe {
 impl McpStdioProbe {
     pub(crate) fn from_host_session(
         host_session: HostOwnedMcpStdioSession,
+        host_handle: HostMcpStdioProcessHandle,
         limits: StdioTransportLimits,
         deadline: Instant,
-    ) -> Self {
+    ) -> Result<Self, StdioTransportError> {
+        if !Arc::ptr_eq(&host_session.handle.process, &host_handle.process) {
+            return Err(StdioTransportError::ProcessIdentityMismatch);
+        }
         let identity = host_session.handle.identity.clone();
         let (reader, writer, process) = host_session.into_parts();
-        Self {
+        Ok(Self {
             session: Some(McpStdioSession::from_parts(reader, writer, process, limits)),
+            host_handle,
             identity,
             deadline,
             observed: false,
-        }
+        })
     }
 
     pub(crate) fn into_transport(
@@ -492,6 +588,7 @@ impl McpStdioProbe {
                 .session
                 .take()
                 .ok_or(StdioTransportError::NotInitialized)?,
+            host_handle: self.host_handle,
             expected_request_id: permit.server_request_id.clone(),
             deadline: self.deadline,
             used: false,
@@ -553,6 +650,8 @@ fn identity_matches_binding(
     identity: &HostVerifiedMcpStdioIdentity,
     binding: &McpTransportBinding,
 ) -> bool {
+    let package_digest = identity.package_digest.to_canonical_string();
+    let executable_digest = identity.executable_digest.to_canonical_string();
     identity.server_id == binding.server_id()
         && identity.adapter == binding.adapter()
         && identity.protocol_version == binding.protocol_version()
@@ -560,6 +659,9 @@ fn identity_matches_binding(
         && identity.endpoint == binding.endpoint()
         && identity.endpoint_digest == *binding.endpoint_digest()
         && identity.transport_digest == *binding.transport_digest()
+        && string_member(binding.transport(), "package_digest") == Some(package_digest.as_str())
+        && string_member(binding.transport(), "executable_digest")
+            == Some(executable_digest.as_str())
 }
 pub(crate) fn absolute_deadline(payload: &str) -> Result<Instant, StdioTransportError> {
     let deadline = parse_rfc3339_utc(payload).ok_or(StdioTransportError::InvalidDeadline)?;
@@ -576,9 +678,49 @@ pub(crate) fn absolute_deadline(payload: &str) -> Result<Instant, StdioTransport
 /// call per permit.
 pub(crate) struct McpStdioTransport {
     session: McpStdioSession,
+    host_handle: HostMcpStdioProcessHandle,
     expected_request_id: String,
     deadline: Instant,
     used: bool,
+}
+
+#[cfg(test)]
+fn test_identity() -> HostVerifiedMcpStdioIdentity {
+    let endpoint = "bin/dolly-fs-tools".to_owned();
+    let endpoint_digest = canonicalize(&CanonicalJsonValue::String(endpoint.clone()))
+        .expect("endpoint digest")
+        .1;
+    HostVerifiedMcpStdioIdentity {
+        server_id: "fs".to_owned(),
+        adapter: MCP_ADAPTER.to_owned(),
+        protocol_version: MCP_PROTOCOL_VERSION_2025_06_18.to_owned(),
+        transport_kind: MCP_STDIO_KIND.to_owned(),
+        endpoint,
+        endpoint_digest,
+        package_digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+            .parse()
+            .expect("package digest"),
+        executable_digest:
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+                .parse()
+                .expect("executable digest"),
+        transport_digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+            .parse()
+            .expect("transport digest"),
+        daemon_installation_id: "daemon-1".to_owned(),
+        instance_id: "instance-1".to_owned(),
+        controller_generation: ExtensionGeneration::new(1).expect("controller generation"),
+        worker_epoch: "0198ab31-6c44-7e8a-b2bb-000000000001"
+            .parse()
+            .expect("worker epoch"),
+        extension_alias: "org.dolly.tools".parse().expect("extension alias"),
+        extension_generation: ExtensionGeneration::new(1).expect("extension generation"),
+        runtime_binding_digest:
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+                .parse()
+                .expect("runtime binding digest"),
+        session_id: "session-1".to_owned(),
+    }
 }
 
 impl McpStdioTransport {
@@ -608,8 +750,13 @@ impl McpStdioTransport {
 
     #[cfg(test)]
     fn test(session: McpStdioSession, request_id: &str, deadline: Instant) -> Self {
+        let process = ProcessControl::none();
         Self {
             session,
+            host_handle: HostMcpStdioProcessHandle {
+                process,
+                identity: test_identity(),
+            },
             expected_request_id: request_id.to_owned(),
             deadline,
             used: false,
@@ -617,21 +764,28 @@ impl McpStdioTransport {
     }
 }
 impl ToolTransport for McpStdioTransport {
+    fn abort(&mut self) {
+        self.session.abort();
+    }
+
     fn call(&mut self, request_bytes: &[u8]) -> TransportOutcome {
         if !self.session.initialized {
+            self.session.abort();
             return TransportOutcome::Error(format_transport_error(
                 StdioTransportError::NotInitialized,
             ));
         }
         if self.used {
+            self.session.abort();
             return TransportOutcome::Error(format_transport_error(
                 StdioTransportError::AlreadyUsed,
             ));
         }
+        self.used = true;
         if let Err(error) = self.validate_request(request_bytes) {
+            self.session.abort();
             return TransportOutcome::Error(format_transport_error(error));
         }
-        self.used = true;
         match self
             .session
             .exchange(request_bytes, &self.expected_request_id, self.deadline)
@@ -644,8 +798,14 @@ impl ToolTransport for McpStdioTransport {
                     TransportOutcome::Error("MCP response has no complete result".to_owned())
                 }
             }
-            Err(StdioTransportError::Deadline) => TransportOutcome::Timeout,
-            Err(error) => TransportOutcome::Error(format_transport_error(error)),
+            Err(StdioTransportError::Deadline) => {
+                self.session.abort();
+                TransportOutcome::Timeout
+            }
+            Err(error) => {
+                self.session.abort();
+                TransportOutcome::Error(format_transport_error(error))
+            }
         }
     }
 }
@@ -865,6 +1025,80 @@ mod tests {
     fn call_request() -> &'static [u8] {
         b"{\"jsonrpc\":\"2.0\",\"id\":\"call-1\",\"method\":\"tools/call\",\"params\":{}}"
     }
+    #[cfg(target_os = "linux")]
+    fn test_attestation(
+        process_id: u32,
+        executable_path: PathBuf,
+        artifact_digest: Sha256Digest,
+    ) -> HostIssuedMcpStdioAttestation {
+        let endpoint = "bin/dolly-fs-tools".to_owned();
+        let endpoint_digest = canonicalize(&CanonicalJsonValue::String(endpoint.clone()))
+            .expect("endpoint digest")
+            .1;
+        HostIssuedMcpStdioAttestation {
+            server_id: "fs".to_owned(),
+            adapter: MCP_ADAPTER.to_owned(),
+            protocol_version: MCP_PROTOCOL_VERSION_2025_06_18.to_owned(),
+            transport_kind: MCP_STDIO_KIND.to_owned(),
+            endpoint,
+            endpoint_digest,
+            package_digest: artifact_digest.clone(),
+            package_path: executable_path.clone(),
+            executable_digest: artifact_digest,
+            executable_path,
+            transport_digest:
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                    .parse()
+                    .expect("transport digest"),
+            daemon_installation_id: "daemon-1".to_owned(),
+            instance_id: "instance-1".to_owned(),
+            controller_generation: ExtensionGeneration::new(1).expect("controller generation"),
+            worker_epoch: "0198ab31-6c44-7e8a-b2bb-000000000001"
+                .parse()
+                .expect("worker epoch"),
+            extension_alias: "org.dolly.tools".parse().expect("extension alias"),
+            extension_generation: ExtensionGeneration::new(1).expect("extension generation"),
+            runtime_binding_digest:
+                "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+                    .parse()
+                    .expect("runtime binding digest"),
+            session_id: "session-1".to_owned(),
+            process_id,
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn installed_child_verifier_binds_process_and_artifact_identity() {
+        let first = Command::new("sleep")
+            .arg("1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("first child");
+        let first_path = std::fs::canonicalize(
+            std::fs::read_link(format!("/proc/{}/exe", first.id())).expect("first executable"),
+        )
+        .expect("canonical first executable");
+        let first_bytes = std::fs::read(&first_path).expect("first executable bytes");
+        let attestation =
+            test_attestation(first.id(), first_path, Sha256Digest::compute(&first_bytes));
+        let mut issued =
+            InstalledChildVerifier::issue(first, attestation.clone()).expect("verified child");
+        issued.child.kill().expect("stop first child");
+        issued.child.wait().expect("reap first child");
+
+        let second = Command::new("sleep")
+            .arg("0.1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("second child");
+        assert!(
+            InstalledChildVerifier::issue(second, attestation).is_err(),
+            "copied claims cannot be paired with a different child"
+        );
+    }
 
     #[test]
     fn initialized_stdio_session_uses_exact_lifecycle_and_correlated_call() {
@@ -1008,12 +1242,14 @@ mod tests {
 
     #[test]
     fn transport_enforces_request_identity_and_no_redispatch() {
-        let (mut session, server_thread) = session_with_handler(|reader, writer| {
+        let (mut session, server_thread) = session_with_handler(|reader, _writer| {
+            reader
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .expect("read timeout");
             let mut line = String::new();
-            reader.read_line(&mut line).expect("call request");
-            writer
-                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"call-1\",\"result\":{\"ok\":true}}\n")
-                .expect("response");
+            let error = reader.read_line(&mut line).expect_err("no call request");
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         });
         let deadline = deadline_after(Duration::from_secs(1));
         session.initialize(deadline).expect("initialize");
@@ -1024,12 +1260,9 @@ mod tests {
         ));
         assert!(matches!(
             transport.call(call_request()),
-            TransportOutcome::Response(_)
-        ));
-        assert!(matches!(
-            transport.call(call_request()),
             TransportOutcome::Error(_)
         ));
+        drop(transport);
         server_thread.join().expect("server thread");
     }
     #[test]

@@ -43,8 +43,8 @@ use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 
 use crate::mcp_stdio::{
-    HostOwnedMcpStdioSession, McpStdioProbe, StdioTransportError, StdioTransportLimits,
-    absolute_deadline,
+    HostMcpStdioProcessHandle, HostOwnedMcpStdioSession, McpStdioProbe, StdioTransportError,
+    StdioTransportLimits, absolute_deadline,
 };
 use crate::permit::{SendPermit, SendPermitBinding};
 
@@ -80,6 +80,10 @@ pub trait ToolTransport {
     /// exact bytes the service verified against the permit's outbound
     /// digest before this call.
     fn call(&mut self, request_bytes: &[u8]) -> TransportOutcome;
+
+    /// Abort the shared transport/process control after the permit has been
+    /// consumed and a request cannot be admitted or durably settled.
+    fn abort(&mut self) {}
 }
 
 /// The result of one [`ToolDispatchService::dispatch`].
@@ -160,7 +164,7 @@ impl ToolDispatchService {
     /// The registry/generation producer is checked before any permit is
     /// consumed or transport call. A mismatch mutates neither the ledger nor
     /// the permit; no downstream result can manufacture a replacement.
-    pub fn dispatch_authorized(
+    fn dispatch_authorized_transport(
         &self,
         db: &mut Database,
         authority: &ToolDispatchAuthority,
@@ -188,6 +192,36 @@ impl ToolDispatchService {
         .map_err(ServiceError::Authority)?;
         self.dispatch_inner(db, permit, request_bytes, transport)
     }
+
+    /// Production coordinator invocation for one Host-owned MCP stdio
+    /// composition. The separately retained process handle is passed
+    /// explicitly so the transport cannot accidentally become the lifecycle
+    /// owner.
+    pub fn dispatch_authorized(
+        &self,
+        db: &mut Database,
+        authority: &ToolDispatchAuthority,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        host_session: HostOwnedMcpStdioSession,
+        host_handle: HostMcpStdioProcessHandle,
+        limits: StdioTransportLimits,
+        permit: SendPermit,
+        request_bytes: &[u8],
+    ) -> Result<ServiceOutcome, StdioDispatchError> {
+        self.dispatch_stdio_authorized(
+            db,
+            authority,
+            runtime_binding,
+            process_generation,
+            host_session,
+            host_handle,
+            limits,
+            permit,
+            request_bytes,
+        )
+    }
+
     /// Host-owned stdio composition: readiness is freshly proven against the
     /// current Runtime binding/process generation before this exact permit is
     /// routed through the authority-checked dispatch path.
@@ -198,6 +232,7 @@ impl ToolDispatchService {
         runtime_binding: &RuntimeBinding,
         process_generation: &ProcessGeneration,
         host_session: HostOwnedMcpStdioSession,
+        host_handle: HostMcpStdioProcessHandle,
         limits: StdioTransportLimits,
         permit: SendPermit,
         request_bytes: &[u8],
@@ -205,7 +240,9 @@ impl ToolDispatchService {
         let deadline = absolute_deadline(&permit.binding().authorized_deadline)
             .map_err(StdioDispatchError::Transport)?;
         let server_id = permit.binding().tool_server_id.clone();
-        let mut probe = McpStdioProbe::from_host_session(host_session, limits, deadline);
+        let mut probe =
+            McpStdioProbe::from_host_session(host_session, host_handle, limits, deadline)
+                .map_err(StdioDispatchError::Transport)?;
         let readiness = prove_current_mcp_transport_readiness(
             db.connection(),
             runtime_binding,
@@ -218,7 +255,7 @@ impl ToolDispatchService {
         let mut transport = probe
             .into_transport(&readiness, authority, &permit_binding)
             .map_err(StdioDispatchError::Transport)?;
-        self.dispatch_authorized(
+        self.dispatch_authorized_transport(
             db,
             authority,
             runtime_binding,
@@ -240,14 +277,21 @@ impl ToolDispatchService {
     ) -> Result<ServiceOutcome, ServiceError> {
         let binding = permit.consume();
 
-        let current = load_exact(db.connection(), &binding.module_id, &binding.operation_id)
-            .map_err(ServiceError::Storage)?;
+        let current = match load_exact(db.connection(), &binding.module_id, &binding.operation_id) {
+            Ok(current) => current,
+            Err(error) => {
+                transport.abort();
+                return Err(ServiceError::Storage(error));
+            }
+        };
         let Some(current) = current else {
+            transport.abort();
             return Ok(ServiceOutcome::Stale {
                 authoritative: None,
             });
         };
         if current.state != LedgerState::Dispatched {
+            transport.abort();
             return Ok(ServiceOutcome::Stale {
                 authoritative: Some(current),
             });
@@ -256,8 +300,10 @@ impl ToolDispatchService {
         if Sha256Digest::compute(request_bytes) != binding.outbound_digest {
             // Fail closed with NO transport call: the caller did not supply
             // the exact bytes whose digest was durably bound at dispatch.
+            transport.abort();
             let result = unknown_outcome_result(&binding);
-            return self.settle(db, &current, Terminal::unknown(result));
+            let settled = self.settle(db, &current, Terminal::unknown(result));
+            return settled;
         }
 
         match transport.call(request_bytes) {
@@ -265,23 +311,31 @@ impl ToolDispatchService {
                 match self.classify(&bytes, &current.operation_binding) {
                     Classification::Succeeded(output) => {
                         let result = succeeded_result(&binding, output);
-                        self.settle(db, &current, Terminal::succeeded(result))
+                        let settled = self.settle(db, &current, Terminal::succeeded(result));
+                        abort_if_settlement_not_committed(transport, &settled);
+                        settled
                     }
                     Classification::OutputInvalid => {
+                        transport.abort();
                         let result = output_invalid_result(&binding);
-                        self.settle(db, &current, Terminal::failed(result))
+                        let settled = self.settle(db, &current, Terminal::failed(result));
+                        settled
                     }
                     Classification::Rejected => {
+                        transport.abort();
                         let result = unknown_outcome_result(&binding);
-                        self.settle(db, &current, Terminal::unknown(result))
+                        let settled = self.settle(db, &current, Terminal::unknown(result));
+                        settled
                     }
                 }
             }
             TransportOutcome::Timeout
             | TransportOutcome::Disconnect
             | TransportOutcome::Error(_) => {
+                transport.abort();
                 let result = unknown_outcome_result(&binding);
-                self.settle(db, &current, Terminal::unknown(result))
+                let settled = self.settle(db, &current, Terminal::unknown(result));
+                settled
             }
         }
     }
@@ -388,6 +442,14 @@ impl ToolDispatchService {
             }),
             Err(error) => Err(ServiceError::Storage(error)),
         }
+    }
+}
+fn abort_if_settlement_not_committed(
+    transport: &mut dyn ToolTransport,
+    settled: &Result<ServiceOutcome, ServiceError>,
+) {
+    if !matches!(settled.as_ref(), Ok(ServiceOutcome::Succeeded { .. })) {
+        transport.abort();
     }
 }
 
