@@ -23,9 +23,7 @@ use dolly_canonical_json::{
     CanonicalJsonValue, ParseLimits, Sha256Digest, canonicalize, parse_core_json,
 };
 use dolly_schema::SchemaValidator;
-use dolly_storage::mcp_readiness::{
-    McpReadinessError, McpTransportReadiness, prove_current_mcp_transport_readiness,
-};
+use dolly_storage::mcp_readiness::{McpTransportReadiness, prove_current_mcp_transport_readiness};
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::{
     ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
@@ -43,8 +41,8 @@ use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 
 use crate::mcp_stdio::{
-    HostMcpStdioProcessHandle, HostOwnedMcpStdioSession, McpStdioProbe, StdioTransportError,
-    StdioTransportLimits, absolute_deadline,
+    HostMcpStdioProcessHandle, HostOwnedMcpStdioSession, McpStdioProbe, StdioTransportLimits,
+    absolute_deadline,
 };
 use crate::permit::{SendPermit, SendPermitBinding};
 
@@ -83,6 +81,16 @@ pub trait ToolTransport {
 
     /// Abort the shared transport/process control after the permit has been
     /// consumed and a request cannot be admitted or durably settled.
+    fn abort(&mut self) {}
+}
+
+struct AbortTransport;
+
+impl ToolTransport for AbortTransport {
+    fn call(&mut self, _request_bytes: &[u8]) -> TransportOutcome {
+        TransportOutcome::Error("stdio admission aborted".to_owned())
+    }
+
     fn abort(&mut self) {}
 }
 
@@ -129,9 +137,14 @@ pub enum ServiceError {
 
 #[derive(Debug)]
 pub(crate) enum StdioDispatchError {
-    Readiness(McpReadinessError),
-    Transport(StdioTransportError),
     Service(ServiceError),
+}
+
+impl StdioDispatchError {
+    pub(crate) fn message(&self) -> String {
+        let Self::Service(error) = self;
+        format!("MCP service: {error:?}")
+    }
 }
 
 /// The single transport-facing entry point of the coordinator.
@@ -161,48 +174,17 @@ impl ToolDispatchService {
         self.dispatch_inner(db, permit, request_bytes, transport)
     }
 
-    /// The registry/generation producer is checked before any permit is
-    /// consumed or transport call. A mismatch mutates neither the ledger nor
-    /// the permit; no downstream result can manufacture a replacement.
-    fn dispatch_authorized_transport(
+    /// Production coordinator invocation for one Host-owned MCP stdio
+    /// composition. The separately retained process handle is passed
+    /// explicitly so the transport cannot accidentally become the lifecycle
+    /// owner.
+    pub(crate) fn dispatch_authorized(
         &self,
         db: &mut Database,
         authority: &ToolDispatchAuthority,
         runtime_binding: &RuntimeBinding,
         process_generation: &ProcessGeneration,
         readiness: &McpTransportReadiness,
-        permit: SendPermit,
-        request_bytes: &[u8],
-        transport: &mut dyn ToolTransport,
-    ) -> Result<ServiceOutcome, ServiceError> {
-        revalidate_tool_dispatch_authority(
-            db,
-            authority,
-            runtime_binding,
-            process_generation,
-            readiness,
-        )
-        .map_err(ServiceError::Authority)?;
-        validate_dispatch_binding(
-            authority,
-            permit.binding().config_revision as i64,
-            &permit.binding().tool_server_id,
-            permit.binding().tool_server_generation,
-        )
-        .map_err(ServiceError::Authority)?;
-        self.dispatch_inner(db, permit, request_bytes, transport)
-    }
-
-    /// Production coordinator invocation for one Host-owned MCP stdio
-    /// composition. The separately retained process handle is passed
-    /// explicitly so the transport cannot accidentally become the lifecycle
-    /// owner.
-    pub fn dispatch_authorized(
-        &self,
-        db: &mut Database,
-        authority: &ToolDispatchAuthority,
-        runtime_binding: &RuntimeBinding,
-        process_generation: &ProcessGeneration,
         host_session: HostOwnedMcpStdioSession,
         host_handle: HostMcpStdioProcessHandle,
         limits: StdioTransportLimits,
@@ -214,6 +196,7 @@ impl ToolDispatchService {
             authority,
             runtime_binding,
             process_generation,
+            readiness,
             host_session,
             host_handle,
             limits,
@@ -231,41 +214,78 @@ impl ToolDispatchService {
         authority: &ToolDispatchAuthority,
         runtime_binding: &RuntimeBinding,
         process_generation: &ProcessGeneration,
+        readiness: &McpTransportReadiness,
         host_session: HostOwnedMcpStdioSession,
         host_handle: HostMcpStdioProcessHandle,
         limits: StdioTransportLimits,
         permit: SendPermit,
         request_bytes: &[u8],
     ) -> Result<ServiceOutcome, StdioDispatchError> {
-        let deadline = absolute_deadline(&permit.binding().authorized_deadline)
-            .map_err(StdioDispatchError::Transport)?;
+        if revalidate_tool_dispatch_authority(
+            db,
+            authority,
+            runtime_binding,
+            process_generation,
+            readiness,
+        )
+        .is_err()
+            || validate_dispatch_binding(
+                authority,
+                permit.binding().config_revision,
+                &permit.binding().tool_server_id,
+                permit.binding().tool_server_generation,
+            )
+            .is_err()
+        {
+            return self.settle_admission_unknown(db, host_handle, permit, request_bytes);
+        }
+        let deadline = match absolute_deadline(&permit.binding().authorized_deadline) {
+            Ok(deadline) => deadline,
+            Err(_) => return self.settle_admission_unknown(db, host_handle, permit, request_bytes),
+        };
         let server_id = permit.binding().tool_server_id.clone();
-        let mut probe =
-            McpStdioProbe::from_host_session(host_session, host_handle, limits, deadline)
-                .map_err(StdioDispatchError::Transport)?;
-        let readiness = prove_current_mcp_transport_readiness(
+        let mut probe = match McpStdioProbe::from_host_session(
+            host_session,
+            host_handle.clone(),
+            limits,
+            deadline,
+        ) {
+            Ok(probe) => probe,
+            Err(_) => return self.settle_admission_unknown(db, host_handle, permit, request_bytes),
+        };
+        let readiness = match prove_current_mcp_transport_readiness(
             db.connection(),
             runtime_binding,
             process_generation,
             &server_id,
             &mut probe,
-        )
-        .map_err(StdioDispatchError::Readiness)?;
+        ) {
+            Ok(readiness) => readiness,
+            Err(_) => {
+                probe.abort();
+                return self.settle_admission_unknown(db, host_handle, permit, request_bytes);
+            }
+        };
         let permit_binding = permit.binding().clone();
-        let mut transport = probe
-            .into_transport(&readiness, authority, &permit_binding)
-            .map_err(StdioDispatchError::Transport)?;
-        self.dispatch_authorized_transport(
-            db,
-            authority,
-            runtime_binding,
-            process_generation,
-            &readiness,
-            permit,
-            request_bytes,
-            &mut transport,
-        )
-        .map_err(StdioDispatchError::Service)
+        let mut transport = match probe.into_transport(&readiness, authority, &permit_binding) {
+            Ok(transport) => transport,
+            Err(_) => return self.settle_admission_unknown(db, host_handle, permit, request_bytes),
+        };
+        self.dispatch_inner(db, permit, request_bytes, &mut transport)
+            .map_err(StdioDispatchError::Service)
+    }
+
+    fn settle_admission_unknown(
+        &self,
+        db: &mut Database,
+        host_handle: HostMcpStdioProcessHandle,
+        permit: SendPermit,
+        request_bytes: &[u8],
+    ) -> Result<ServiceOutcome, StdioDispatchError> {
+        host_handle.terminate();
+        let mut transport = AbortTransport;
+        self.dispatch_inner(db, permit, request_bytes, &mut transport)
+            .map_err(StdioDispatchError::Service)
     }
 
     fn dispatch_inner(

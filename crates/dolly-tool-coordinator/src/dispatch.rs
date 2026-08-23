@@ -26,7 +26,9 @@ use dolly_tool_broker::{
     recover_operation,
 };
 
+use crate::mcp_stdio::{HostMcpStdioProcessHandle, HostOwnedMcpStdioSession, StdioTransportLimits};
 use crate::permit::SendPermit;
+use crate::service::{ServiceOutcome, ToolDispatchService};
 
 /// Orchestration failure. No variant ever releases a send permit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,11 +45,57 @@ pub enum DispatchError {
     /// Storage failure (`STORAGE_*`), including corruption and lost commit
     /// acknowledgements surfaced as errors. No permit.
     Storage(StorageError),
+    /// The committed permit could not complete its Host-owned MCP stdio
+    /// exchange.
+    Stdio(String),
 }
 
 impl From<ToolBrokerAuthorityError> for DispatchError {
     fn from(error: ToolBrokerAuthorityError) -> Self {
         Self::Authority(error)
+    }
+}
+
+/// Opaque Host-owned stdio composition handed to the existing authorized
+/// dispatch entrypoint. The fields cannot be paired or replaced by callers;
+/// the installed-child verifier supplies the session and the Host retains
+/// the separate process handle.
+pub struct HostMcpStdioInvocation {
+    host_session: HostOwnedMcpStdioSession,
+    host_handle: HostMcpStdioProcessHandle,
+    limits: StdioTransportLimits,
+    request_bytes: Vec<u8>,
+}
+
+impl HostMcpStdioInvocation {
+    pub fn new(
+        host_session: HostOwnedMcpStdioSession,
+        host_handle: HostMcpStdioProcessHandle,
+        limits: StdioTransportLimits,
+        request_bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            host_session,
+            host_handle,
+            limits,
+            request_bytes,
+        }
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        HostOwnedMcpStdioSession,
+        HostMcpStdioProcessHandle,
+        StdioTransportLimits,
+        Vec<u8>,
+    ) {
+        (
+            self.host_session,
+            self.host_handle,
+            self.limits,
+            self.request_bytes,
+        )
     }
 }
 
@@ -133,6 +181,8 @@ pub fn dispatch_operation_authorized(
     readiness: &McpTransportReadiness,
     row: &ToolCallLedgerRecord,
     facts: &RecoveryFacts,
+    service: &ToolDispatchService,
+    invocation: HostMcpStdioInvocation,
 ) -> Result<DispatchOutcome, DispatchError> {
     revalidate_tool_dispatch_authority(
         db,
@@ -147,7 +197,47 @@ pub fn dispatch_operation_authorized(
         &row.operation_binding.tool_server_id,
         row.operation_binding.tool_server_generation,
     )?;
-    dispatch_operation(db, row, facts)
+    let outcome = dispatch_operation(db, row, facts)?;
+    let DispatchOutcome::Dispatched {
+        record: _,
+        permit: Some(permit),
+    } = outcome
+    else {
+        return Ok(outcome);
+    };
+    let (host_session, host_handle, limits, request_bytes) = invocation.into_parts();
+    let service_outcome = service
+        .dispatch_authorized(
+            db,
+            authority,
+            runtime_binding,
+            process_generation,
+            readiness,
+            host_session,
+            host_handle,
+            limits,
+            permit,
+            &request_bytes,
+        )
+        .map_err(|error| DispatchError::Stdio(error.message()))?;
+    map_service_outcome(service_outcome)
+}
+
+fn map_service_outcome(outcome: ServiceOutcome) -> Result<DispatchOutcome, DispatchError> {
+    match outcome {
+        ServiceOutcome::Succeeded { record, .. }
+        | ServiceOutcome::Failed { record, .. }
+        | ServiceOutcome::Unknown { record, .. } => Ok(DispatchOutcome::Terminalized { record }),
+        ServiceOutcome::Stale {
+            authoritative: Some(record),
+        } if record.state.is_terminal() => Ok(DispatchOutcome::Unchanged { record }),
+        ServiceOutcome::Stale {
+            authoritative: Some(authoritative),
+        } => Ok(DispatchOutcome::Stale { authoritative }),
+        ServiceOutcome::Stale {
+            authoritative: None,
+        } => Err(DispatchError::InvalidRecord),
+    }
 }
 
 /// One pure-decision proposal to apply.

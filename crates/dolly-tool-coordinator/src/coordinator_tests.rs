@@ -22,8 +22,9 @@ use dolly_tool_broker::{
     ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag,
 };
 use dolly_tool_coordinator::{
-    DispatchError, DispatchOutcome, FencedFactsProvider, RecoveryFactsProvider, RecoveryOutcome,
-    dispatch_operation, reopen_recovery,
+    DispatchError, DispatchOutcome, FencedFactsProvider, HostMcpStdioInvocation,
+    RecoveryFactsProvider, RecoveryOutcome, ToolDispatchService, dispatch_operation,
+    dispatch_operation_authorized, reopen_recovery,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -753,6 +754,17 @@ fn fenced_facts_provider_composes_ports() {
 #[test]
 fn authority_dispatch_requires_current_revalidation_api() {
     let _ = dolly_storage::tool_broker_authority::revalidate_tool_dispatch_authority;
+    let _requires_stdio_handoff: fn(
+        &mut Database,
+        &ToolDispatchAuthority,
+        &RuntimeBinding,
+        &ProcessGeneration,
+        &McpTransportReadiness,
+        &ToolCallLedgerRecord,
+        &RecoveryFacts,
+        &ToolDispatchService,
+        HostMcpStdioInvocation,
+    ) -> Result<DispatchOutcome, DispatchError> = dispatch_operation_authorized;
 }
 
 #[test]
