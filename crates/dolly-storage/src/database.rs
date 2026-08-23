@@ -36,7 +36,7 @@ use crate::host_authority::{
     LinuxServiceCandidate, ModuleActivationPremises, PermissionPolicyBackendBinding,
     PermissionPolicyDefinition, PermissionPolicySelection, ResolvedConfiguration,
     RuntimeAuthorityIdentity, install_host_authority_revision_in_transaction,
-    load_current_authority, refresh_controller_generation_in_transaction,
+    load_current_authority, refresh_controller_generation_in_transaction, validate_revision,
 };
 
 /// Highest schema version this binary understands.
@@ -237,6 +237,7 @@ impl OfflineDatabase {
     /// consume the offline handle into the ordinary writable Database type.
     pub fn migrate_legacy_json(mut self, bytes: &[u8]) -> StorageResult<Database> {
         let input = parse_legacy_authority(bytes)?;
+        validate_revision(&input).map_err(map_host_authority_error)?;
         if self.database.authority_identity.is_some() {
             return Err(StorageError::MigrationRequired);
         }

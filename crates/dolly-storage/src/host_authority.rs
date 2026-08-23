@@ -936,7 +936,7 @@ fn verify_candidate_row(
     Ok(())
 }
 
-fn validate_revision(input: &HostAuthorityRevision) -> Result<(), HostAuthorityError> {
+pub(crate) fn validate_revision(input: &HostAuthorityRevision) -> Result<(), HostAuthorityError> {
     validate_identity(&input.identity)?;
     validate_mapping(&input.mapping)?;
     if input.mapping.daemon_installation_id != input.identity.daemon_installation_id
