@@ -21,6 +21,28 @@ fn temp_db() -> (tempfile::TempDir, PathBuf) {
     let path = dir.path().join("instance.sqlite");
     (dir, path)
 }
+
+#[test]
+fn offline_handle_is_inert_until_validated_migration() {
+    let (_dir, path) = temp_db();
+    let offline = Database::open_for_migration(&path).expect("create inert handle");
+    assert!(!path.exists(), "offline handle must not create SQLite");
+    assert!(
+        !lock_for(&path).exists(),
+        "offline handle must not create a lock"
+    );
+
+    let err = offline
+        .migrate_legacy_json(b"{}")
+        .expect_err("invalid legacy bytes must fail during preflight");
+    assert!(matches!(err, StorageError::Corrupt));
+    assert!(!path.exists(), "preflight failure must not create SQLite");
+    assert!(
+        !lock_for(&path).exists(),
+        "preflight failure must not create a path lock"
+    );
+}
+
 fn instance_id(path: &Path) -> String {
     let name = path
         .parent()
@@ -50,6 +72,25 @@ fn open_migrated(path: &Path) -> Database {
         .unwrap()
         .migrate_legacy_json(&legacy_json(path))
         .unwrap()
+}
+
+#[test]
+fn existing_lock_with_non_private_mode_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, path) = temp_db();
+    let lock_path = lock_for(&path);
+    fs::write(&lock_path, b"").unwrap();
+    let mut permissions = fs::metadata(&lock_path).unwrap().permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&lock_path, permissions).unwrap();
+
+    let err = Database::open_for_migration(&path)
+        .expect("inert handle")
+        .migrate_legacy_json(&legacy_json(&path))
+        .expect_err("non-private lock must be refused");
+    assert!(matches!(err, StorageError::UnsafeConfiguration));
+    assert!(!path.exists(), "refused lock must not create SQLite");
 }
 
 // ---------------------------------------------------------------------------

@@ -1524,7 +1524,11 @@ mod tests {
         })
     }
 
-    fn host_revision(config_revision: i64, broker_config: Value) -> HostAuthorityRevision {
+    fn host_revision(
+        config_revision: i64,
+        broker_config: Value,
+        instance_id: &str,
+    ) -> HostAuthorityRevision {
         let origin = origin();
         let mut candidate_record = json!({
             "schema": "dolly.linux-service-candidate/v1",
@@ -1548,7 +1552,7 @@ mod tests {
         let config_digest = canonicalize(&config).unwrap().1;
         let identity = RuntimeAuthorityIdentity {
             daemon_installation_id: "0198ab31-6c44-7e8a-b2bb-000000000001".into(),
-            instance_id: "instance-one".into(),
+            instance_id: instance_id.into(),
         };
         let premise_without_digest = json!({
             "schema": "dolly.module-activation-premises/v1",
@@ -1631,9 +1635,21 @@ mod tests {
         fn new() -> Self {
             let directory = tempdir().unwrap();
             let path = directory.path().join("authority.sqlite");
+            let suffix = directory
+                .path()
+                .file_name()
+                .expect("temp directory name")
+                .to_string_lossy()
+                .replace('.', "d")
+                .to_ascii_lowercase();
+            let instance_id = format!("instance-{suffix}");
             let mut db = Database::open_for_migration(&path)
                 .unwrap()
-                .install_host_authority_revision(host_revision(1, tool_broker_config()))
+                .install_host_authority_revision(host_revision(
+                    1,
+                    tool_broker_config(),
+                    &instance_id,
+                ))
                 .unwrap();
             let snapshot = load_current_authority(db.connection()).unwrap().unwrap();
             let proof = test_proof_for_authority(&snapshot);
@@ -1874,7 +1890,12 @@ mod tests {
         .unwrap();
         let mut changed_config = tool_broker_config();
         changed_config["servers"]["fs"]["transport"]["args"] = json!(["--changed"]);
-        install_host_authority_revision(&mut fixture.db, host_revision(2, changed_config)).unwrap();
+        let instance_id = fixture.db.authority_identity().instance_id.to_owned();
+        install_host_authority_revision(
+            &mut fixture.db,
+            host_revision(2, changed_config, &instance_id),
+        )
+        .unwrap();
         let error = revalidate_tool_dispatch_authority(
             &mut fixture.db,
             &authority,

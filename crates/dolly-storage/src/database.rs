@@ -41,9 +41,6 @@ use crate::host_authority::{
 
 /// Highest schema version this binary understands.
 pub const SCHEMA_VERSION: i64 = 1;
-#[cfg(test)]
-static TEST_IDENTITY_LOCK_NONCE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 /// The required-connection settings from storage-and-recovery §2. The readback
 /// of each must equal the mandated value or the open refuses with
@@ -160,11 +157,13 @@ pub struct Database {
     controller_generation_id: Option<String>,
 }
 
-/// A private-connection offline handle. It can only perform the explicit
-/// bootstrap/migration operation and exposes no SQLite connection.
+/// A private, inert migration handle. It carries no SQLite connection or
+/// lock descriptor; setup begins only after the legacy authority bytes have
+/// parsed and passed complete validation.
 #[derive(Debug)]
 pub struct OfflineDatabase {
-    database: Database,
+    db_path: PathBuf,
+    attestation: ReleaseAttestation,
 }
 
 impl Database {
@@ -180,7 +179,8 @@ impl Database {
     }
 
     /// Open the smallest explicit offline handle used to initialize/migrate
-    /// an empty database. The handle has no public connection surface.
+    /// an empty database. The handle has no public connection surface and
+    /// performs no SQLite or lock setup until migration input is validated.
     pub fn open_for_migration(db_path: &Path) -> StorageResult<OfflineDatabase> {
         Self::open_for_migration_with(db_path, &crate::attestation::release_attestation())
     }
@@ -189,7 +189,10 @@ impl Database {
         db_path: &Path,
         attestation: &ReleaseAttestation,
     ) -> StorageResult<OfflineDatabase> {
-        open_internal(db_path, attestation, true).map(|database| OfflineDatabase { database })
+        Ok(OfflineDatabase {
+            db_path: db_path.to_path_buf(),
+            attestation: attestation.clone(),
+        })
     }
 
     pub fn connection(&self) -> &Connection {
@@ -235,31 +238,34 @@ impl Database {
 impl OfflineDatabase {
     /// Import one legacy JSON document in one immediate transaction, then
     /// consume the offline handle into the ordinary writable Database type.
-    pub fn migrate_legacy_json(mut self, bytes: &[u8]) -> StorageResult<Database> {
+    pub fn migrate_legacy_json(self, bytes: &[u8]) -> StorageResult<Database> {
         let input = parse_legacy_authority(bytes)?;
         validate_revision(&input).map_err(map_host_authority_error)?;
-        if self.database.authority_identity.is_some() {
+        if read_persisted_identity(&self.db_path)?.is_some() {
+            return Err(StorageError::MigrationRequired);
+        }
+        let mut database = open_internal(&self.db_path, &self.attestation, true)?;
+        if database.authority_identity.is_some() {
             return Err(StorageError::MigrationRequired);
         }
         let controller_generation_id = mint_controller_generation_id()?;
         let identity_lock = acquire_identity_lock(&input.identity)?;
         verify_or_write_lock_owner(&identity_lock, &input.identity, &controller_generation_id)?;
-        if self.database.connection.is_none() {
-            let connection = open_connection(&self.database.db_path)?;
+        if database.connection.is_none() {
+            let connection = open_connection(&database.db_path)?;
             let configuration = apply_and_verify_configuration(&connection)?;
-            self.database.configuration = Some(configuration);
-            self.database.connection = Some(connection);
+            database.configuration = Some(configuration);
+            database.connection = Some(connection);
         }
-        let connection = self
-            .database
+        let connection = database
             .connection
             .as_mut()
             .expect("offline migration connection");
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
-        if self.database.schema_version == 0 {
-            create_fresh_schema(&tx, &self.database.verified)?;
+        if database.schema_version == 0 {
+            create_fresh_schema(&tx, &database.verified)?;
         }
         tx.execute(
             "UPDATE core_meta SET controller_generation_id = ?1 WHERE singleton = 1",
@@ -270,17 +276,18 @@ impl OfflineDatabase {
             .map_err(map_host_authority_error)?;
         tx.commit().map_err(map_sqlite_error)?;
         let _ = disposition;
-        self.database.schema_version = SCHEMA_VERSION;
+        database.schema_version = SCHEMA_VERSION;
         verify_or_write_lock_owner(
-            &self.database.path_lock,
+            &database.path_lock,
             &input.identity,
             &controller_generation_id,
         )?;
-        self.database.identity_lock = Some(identity_lock);
-        self.database.authority_identity = Some(input.identity);
-        self.database.controller_generation_id = Some(controller_generation_id);
-        Ok(self.database)
+        database.identity_lock = Some(identity_lock);
+        database.authority_identity = Some(input.identity);
+        database.controller_generation_id = Some(controller_generation_id);
+        Ok(database)
     }
+
     /// Install an already validated Host producer revision while the
     /// database is still in the explicit offline bootstrap mode.
     pub fn install_host_authority_revision(
@@ -608,7 +615,8 @@ fn reject_symlink_components(path: &Path) -> StorageResult<()> {
 fn acquire_lock_file(lock_path: &Path) -> StorageResult<File> {
     #[cfg(unix)]
     {
-        use std::os::unix::io::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -617,12 +625,14 @@ fn acquire_lock_file(lock_path: &Path) -> StorageResult<File> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(lock_path)
             .map_err(map_io_error)?;
-        try_lock_exclusive(&file)?;
         let meta = file.metadata().map_err(map_io_error)?;
-        if !meta.is_file() {
+        if !meta.is_file()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.mode() & 0o777 != 0o600
+        {
             return Err(StorageError::UnsafeConfiguration);
         }
-        let _ = file.as_raw_fd();
+        try_lock_exclusive(&file)?;
         Ok(file)
     }
     #[cfg(not(unix))]
@@ -654,14 +664,7 @@ fn identity_lock_path(identity: &RuntimeAuthorityIdentity) -> StorageResult<Path
             .1
             .to_string()
             .replace(':', "-");
-        #[cfg(test)]
-        let test_suffix = format!(
-            "-{}",
-            TEST_IDENTITY_LOCK_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        #[cfg(not(test))]
-        let test_suffix = String::new();
-        Ok(lock_root.join(format!("controller-{digest}{test_suffix}.lock")))
+        Ok(lock_root.join(format!("controller-{digest}.lock")))
     }
     #[cfg(not(unix))]
     {

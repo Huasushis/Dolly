@@ -1332,7 +1332,7 @@ mod tests {
         Value::Object(object)
     }
 
-    fn authority_revision() -> HostAuthorityRevision {
+    fn authority_revision(instance_id: &str) -> HostAuthorityRevision {
         let origin = InstalledComponentOrigin {
             schema: "dolly.installed-component-origin/v1".into(),
             kind: "installed_product_component".into(),
@@ -1374,7 +1374,7 @@ mod tests {
         let runtime = json!({
             "api_version": "dolly.example/v1alpha1",
             "kind": "DollyInstance",
-            "metadata": {"instance_id": "instance-one", "display_name": "Test"},
+            "metadata": {"instance_id": instance_id, "display_name": "Test"},
             "spec": {
                 "pages": {}, "extensions": {}, "modules": {},
                 "limits": {},
@@ -1395,7 +1395,7 @@ mod tests {
         let mut premise_record = json!({
             "schema": "dolly.module-activation-premises/v1",
             "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000001",
-            "instance_id": "instance-one",
+            "instance_id": instance_id,
             "config_revision": 1,
             "config_digest": config_digest,
             "permission_policy_definitions": [],
@@ -1409,12 +1409,12 @@ mod tests {
         HostAuthorityRevision {
             identity: RuntimeAuthorityIdentity {
                 daemon_installation_id: "0198ab31-6c44-7e8a-b2bb-000000000001".into(),
-                instance_id: "instance-one".into(),
+                instance_id: instance_id.into(),
             },
             mapping: ConfigRevisionMapping {
                 schema: "dolly.config-revision-mapping/v1".into(),
                 daemon_installation_id: "0198ab31-6c44-7e8a-b2bb-000000000001".into(),
-                instance_id: "instance-one".into(),
+                instance_id: instance_id.into(),
                 config_revision: 1,
                 config_digest,
                 canonical_config: config,
@@ -1425,10 +1425,18 @@ mod tests {
 
     fn durable_database() -> (TempDir, Database, CurrentAuthoritySnapshot) {
         let directory = tempdir().unwrap();
+        let suffix = directory
+            .path()
+            .file_name()
+            .expect("temp directory name")
+            .to_string_lossy()
+            .replace('.', "d")
+            .to_ascii_lowercase();
+        let instance_id = format!("instance-{suffix}");
         let path = directory.path().join("runtime.sqlite3");
         let db = Database::open_for_migration(&path)
             .unwrap()
-            .install_host_authority_revision(authority_revision())
+            .install_host_authority_revision(authority_revision(&instance_id))
             .unwrap();
         let snapshot = load_current_authority(db.connection()).unwrap().unwrap();
         (directory, db, snapshot)

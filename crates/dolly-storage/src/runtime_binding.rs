@@ -1406,10 +1406,18 @@ mod tests {
         with_premise: bool,
     ) -> (TempDir, Database, CurrentAuthoritySnapshot) {
         let directory = tempdir().unwrap();
+        let suffix = directory
+            .path()
+            .file_name()
+            .expect("temp directory name")
+            .to_string_lossy()
+            .replace('.', "d")
+            .to_ascii_lowercase();
+        let instance_id = format!("{instance_id}-{suffix}");
         let path = directory.path().join("runtime.sqlite3");
         let db = Database::open_for_migration(&path)
             .unwrap()
-            .install_host_authority_revision(authority_revision(instance_id, with_premise))
+            .install_host_authority_revision(authority_revision(&instance_id, with_premise))
             .unwrap();
         let snapshot = load_authority(db.connection()).unwrap();
         (directory, db, snapshot)
@@ -1430,7 +1438,7 @@ mod tests {
         assert_eq!(binding.controller_generation().value(), 1);
         assert_eq!(binding.extension_alias(), &extension_alias());
         assert_eq!(binding.worker_epoch().as_str().len(), 36);
-        assert_eq!(binding.instance_id(), "instance-one");
+        assert_eq!(binding.instance_id(), snapshot.mapping.instance_id);
         assert_eq!(
             binding.service_candidate_digest(),
             &snapshot
@@ -1446,7 +1454,7 @@ mod tests {
         assert_eq!(generation.extension_generation().value(), 1);
         assert_eq!(generation.extension_alias(), &extension_alias());
         assert_eq!(generation.worker_epoch(), binding.worker_epoch());
-        assert_eq!(generation.instance_id(), "instance-one");
+        assert_eq!(generation.instance_id(), snapshot.mapping.instance_id);
         assert_eq!(generation.service().unit_name, "dollyd@main.service");
         assert_eq!(
             generation.delegated_root().controllers,
@@ -1615,9 +1623,7 @@ mod tests {
                     controller_generation, daemon_installation_id, instance_id,
                     config_revision, config_digest, premises_digest,
                     service_candidate_digest, binding_digest, record_jcs
-                 ) VALUES (?1, 1, ?2, 1,
-                    '0198ab31-6c44-7e8a-b2bb-000000000001',
-                    'instance-one', 1,
+                ) VALUES (?1, 1, ?2, 1, ?3, ?4, 1,
                     'sha256:0000000000000000000000000000000000000000000000000000000000000000',
                     'sha256:0000000000000000000000000000000000000000000000000000000000000000',
                     'sha256:0000000000000000000000000000000000000000000000000000000000000000',
@@ -1625,7 +1631,9 @@ mod tests {
                     '{}')",
                 rusqlite::params![
                     extension_alias().to_string(),
-                    binding.worker_epoch().to_string()
+                    binding.worker_epoch().to_string(),
+                    snapshot.mapping.daemon_installation_id,
+                    snapshot.mapping.instance_id,
                 ],
             )
             .unwrap();
