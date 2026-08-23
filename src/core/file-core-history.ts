@@ -16,17 +16,21 @@ const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const NULL_DIGEST = canonicalJsonDigest(null);
 
-export interface FileCoreHistorySqliteStatement {
+interface FileCoreHistorySqliteStatement {
   get(...parameters: readonly unknown[]): Record<string, unknown> | undefined;
   all(...parameters: readonly unknown[]): readonly Record<string, unknown>[];
   run(...parameters: readonly unknown[]): { readonly changes: number; readonly lastInsertRowid: number | bigint };
 }
 
-export interface FileCoreHistorySqliteConnection {
+interface FileCoreHistorySqliteConnection {
   readonly open: boolean;
   prepare(source: string): FileCoreHistorySqliteStatement;
   exec(source: string): unknown;
 }
+
+type FileCoreHistoryProducerCapability = {
+  readonly assertValid: () => void;
+};
 
 export interface FileCoreHistoryOptions {
   readonly maxEntries: number;
@@ -376,26 +380,31 @@ export class FileCoreHistoryStore {
   readonly #connection: FileCoreHistorySqliteConnection;
   readonly #identity: RuntimeAuthorityIdentity;
   readonly #lock: RuntimeAuthorityLockHandle;
+  readonly #producerCapability: FileCoreHistoryProducerCapability;
   #producerId: string;
   #producerEpoch: string;
   readonly #now: () => string;
-
-  constructor(
+  private constructor(
     connection: FileCoreHistorySqliteConnection,
     identity: RuntimeAuthorityIdentity,
     lock: RuntimeAuthorityLockHandle,
     options: FileCoreHistoryOptions,
+    producerCapability: FileCoreHistoryProducerCapability,
     migrationToken?: symbol,
   ) {
     this.#connection = connection;
     this.#identity = { ...identity };
     this.#lock = lock;
+    this.#producerCapability = producerCapability;
     this.#producerId = "";
     this.#producerEpoch = "";
     this.#now = options.now ?? (() => new Date().toISOString());
     assertSafeInteger(options.maxEntries, "maxEntries", 1);
     assertSafeInteger(options.maxBytes, "maxBytes", 1);
     assertSafeInteger(options.maxReaders, "maxReaders", 1);
+    if (typeof this.#producerCapability?.assertValid !== "function") {
+      throw new TypeError("FileCore history producer capability is required");
+    }
     if (typeof this.#now !== "function") throw new TypeError("now must be a function");
     if (migrationToken === FILECORE_HISTORY_MIGRATION_TOKEN) {
       this.#openOrInitialize(options as FileCoreHistoryMigrationOptions);
@@ -404,13 +413,26 @@ export class FileCoreHistoryStore {
     }
   }
 
-  static migrateInTransaction(
+  /** @internal RuntimeAuthorityDatabase-only producer factory. */
+  static openForRuntimeAuthority(
+    connection: FileCoreHistorySqliteConnection,
+    identity: RuntimeAuthorityIdentity,
+    lock: RuntimeAuthorityLockHandle,
+    options: FileCoreHistoryOptions,
+    producerCapability: FileCoreHistoryProducerCapability,
+  ): FileCoreHistoryStore {
+    return new FileCoreHistoryStore(connection, identity, lock, options, producerCapability);
+  }
+
+  /** @internal RuntimeAuthorityDatabase-only migration factory. */
+  static migrateForRuntimeAuthority(
     connection: FileCoreHistorySqliteConnection,
     identity: RuntimeAuthorityIdentity,
     lock: RuntimeAuthorityLockHandle,
     options: FileCoreHistoryMigrationOptions,
+    producerCapability: FileCoreHistoryProducerCapability,
   ): FileCoreHistoryStore {
-    return new FileCoreHistoryStore(connection, identity, lock, options, FILECORE_HISTORY_MIGRATION_TOKEN);
+    return new FileCoreHistoryStore(connection, identity, lock, options, producerCapability, FILECORE_HISTORY_MIGRATION_TOKEN);
   }
 
   get identity(): RuntimeAuthorityIdentity {
@@ -850,6 +872,7 @@ export class FileCoreHistoryStore {
   }
 
   #assertProducer(head: FileCoreHistoryHead): void {
+    this.#producerCapability.assertValid();
     if (head.producer_id !== this.#producerId || head.producer_epoch !== this.#producerEpoch) {
       throw new FileCoreHistoryError("HISTORY_PRODUCER_FENCED", "history producer identity or epoch is stale");
     }
@@ -1296,7 +1319,7 @@ export class FileCoreHistoryStore {
         this.#connection.prepare("ROLLBACK").run();
       } catch (rollbackError) {
         throw new FileCoreHistoryError("HISTORY_COMMIT_UNKNOWN", "history read rollback outcome is unknown", { cause: rollbackError });
-      }
+    }
       if (error instanceof FileCoreHistoryError) throw error;
       throw new FileCoreHistoryError("HISTORY_CORRUPT", "history read transaction failed", { cause: error });
     }
@@ -1312,8 +1335,13 @@ export class FileCoreHistoryStore {
 export class FileCoreHistoryReaderStore {
   readonly #store: FileCoreHistoryStore;
 
-  constructor(store: FileCoreHistoryStore) {
+  private constructor(store: FileCoreHistoryStore) {
     this.#store = store;
+  }
+
+  /** @internal RuntimeAuthorityDatabase-only reader facade factory. */
+  static fromProducer(store: FileCoreHistoryStore): FileCoreHistoryReaderStore {
+    return new FileCoreHistoryReaderStore(store);
   }
 
   get identity(): RuntimeAuthorityIdentity {

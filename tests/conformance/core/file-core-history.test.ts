@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import {
   FileCoreHistoryError,
+  FileCoreHistoryStore,
   type FileCoreHistoryOptions,
 } from "../../../src/core/file-core-history.js";
 import {
@@ -114,6 +115,17 @@ afterEach(() => {
 });
 
 describe("FileCore bounded global history", () => {
+  it("rejects raw producer construction without the Runtime authority capability", () => {
+    const database = new Database(":memory:");
+    const RawStore = FileCoreHistoryStore as unknown as new (...args: readonly unknown[]) => unknown;
+    expect(() => new RawStore(database, identity, new FakeLock(), {
+      maxEntries: 8,
+      maxBytes: 64,
+      maxReaders: 2,
+    })).toThrowError("producer capability");
+    database.close();
+  });
+
   it("requires Runtime-authority migration and exposes an explicit pre-migration gap", () => {
     const { database } = openAuthority();
     const policy: FileCoreHistoryOptions = { maxEntries: 8, maxBytes: 64, maxReaders: 2 };

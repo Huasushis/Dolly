@@ -687,11 +687,17 @@ export class RuntimeAuthorityDatabase {
   openFileCoreHistory(options: FileCoreHistoryOptions): FileCoreHistoryStore {
     this.#requireOpen();
     this.#requireLockHeld();
-    return new FileCoreHistoryStore(this.#connection, this.#identity, this.#lock, options);
+    return FileCoreHistoryStore.openForRuntimeAuthority(
+      this.#connection,
+      this.#identity,
+      this.#lock,
+      options,
+      this.#fileCoreHistoryProducerCapability(),
+    );
   }
 
   openFileCoreHistoryReader(options: FileCoreHistoryOptions): FileCoreHistoryReaderStore {
-    return new FileCoreHistoryReaderStore(this.openFileCoreHistory(options));
+    return FileCoreHistoryReaderStore.fromProducer(this.openFileCoreHistory(options));
   }
 
   migrateFileCoreHistory(input: FileCoreHistoryMigrationInput): FileCoreHistoryStore {
@@ -734,7 +740,7 @@ export class RuntimeAuthorityDatabase {
       throw new RuntimeAuthorityDatabaseError("CONFIG_REVISION_CONFLICT", "history migration authority moved");
     }
     let migrated: FileCoreHistoryStore | undefined;
-    this.#inAuthorityTransaction(undefined, () => {
+    this.#inFileCoreHistoryMigrationTransaction(() => {
       const state = this.#connection.prepare(
         "SELECT current_config_revision, current_config_digest FROM runtime_authority_state WHERE singleton = 1",
       ).get();
@@ -757,7 +763,7 @@ export class RuntimeAuthorityDatabase {
       }
       const producerId = `filecore-${this.#identity.instanceId}`;
       const producerEpoch = `${input.expectedAuthority.revision}:${input.expectedAuthority.digest}`;
-      migrated = FileCoreHistoryStore.migrateInTransaction(
+      migrated = FileCoreHistoryStore.migrateForRuntimeAuthority(
         this.#connection,
         this.#identity,
         this.#lock,
@@ -770,6 +776,7 @@ export class RuntimeAuthorityDatabase {
           producerEpoch,
           legacySourceDigest: input.legacySourceDigest,
         },
+        this.#fileCoreHistoryProducerCapability(),
       );
     });
     if (migrated === undefined) throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", "history migration returned no store");
@@ -788,6 +795,34 @@ export class RuntimeAuthorityDatabase {
         "CONTROLLER_LOCK_NOT_HELD",
         "Writable Runtime authority access requires the caller-held instance controller lock",
       );
+    }
+  }
+
+
+  #fileCoreHistoryProducerCapability(): { readonly assertValid: () => void } {
+    return {
+      assertValid: () => {
+        this.#requireOpen();
+        this.#requireLockHeld();
+      },
+    };
+  }
+  #inFileCoreHistoryMigrationTransaction(work: () => void): void {
+    this.#statement("BEGIN IMMEDIATE").run();
+    try {
+      work();
+    } catch (error) {
+      try {
+        this.#statement("ROLLBACK").run();
+      } catch (rollbackError) {
+        throw new FileCoreHistoryError("HISTORY_COMMIT_UNKNOWN", "history migration rollback outcome is unknown", { cause: rollbackError });
+      }
+      throw error;
+    }
+    try {
+      this.#statement("COMMIT").run();
+    } catch (error) {
+      throw new FileCoreHistoryError("HISTORY_COMMIT_UNKNOWN", "history migration commit outcome is unknown; reopen before retry", { cause: error });
     }
   }
 
