@@ -243,6 +243,7 @@ fn bound_request_bytes(record: &ToolCallLedgerRecord) -> Vec<u8> {
 /// Spy transport: counts calls and remembers the exact bytes it received.
 struct Spy {
     calls: usize,
+    aborts: usize,
     bytes: Vec<u8>,
     outcome: TransportOutcome,
 }
@@ -251,6 +252,7 @@ impl Spy {
     fn serving(outcome: TransportOutcome) -> Self {
         Self {
             calls: 0,
+            aborts: 0,
             bytes: Vec::new(),
             outcome,
         }
@@ -262,6 +264,10 @@ impl ToolTransport for Spy {
         self.calls += 1;
         self.bytes.extend_from_slice(request_bytes);
         self.outcome.clone()
+    }
+
+    fn abort(&mut self) {
+        self.aborts += 1;
     }
 }
 
@@ -330,7 +336,10 @@ fn valid_response_persists_succeeded_one_call_no_redispatch() {
         .expect("bound digest");
     match outcome {
         ServiceOutcome::Succeeded { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(
+                spy.aborts, 0,
+                "successful committed response keeps Host owner alive"
+            );
             assert_eq!(
                 Sha256Digest::compute(&spy.bytes),
                 expected_digest,
@@ -378,7 +387,10 @@ fn complete_output_schema_violation_persists_failed_applied() {
     );
     match outcome {
         ServiceOutcome::Failed { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(
+                spy.aborts, 1,
+                "schema-invalid response aborts shared control"
+            );
             assert_eq!(record.state, LedgerState::Failed);
             assert_eq!(result.status, ToolStatus::Failed);
             assert_eq!(result.output, Value::Null);
@@ -407,7 +419,7 @@ fn timeout_disconnect_and_error_persist_unknown_one_call_no_redispatch() {
         let (dir, _authorized, outcome, spy) = run_with(None, response);
         match outcome {
             ServiceOutcome::Unknown { record, result } => {
-                assert_eq!(spy.calls, 1, "exactly one transport call");
+                assert_eq!(spy.aborts, 1, "post-call failure aborts shared control");
                 assert_unknown(&record, &result);
             }
             other => panic!("expected Unknown, got {other:?}"),
@@ -430,7 +442,7 @@ fn wrong_request_id_persists_unknown() {
     );
     match outcome {
         ServiceOutcome::Unknown { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(spy.aborts, 1, "correlation failure aborts shared control");
             assert_unknown(&record, &result);
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -455,7 +467,7 @@ fn malformed_or_extra_member_response_persists_unknown() {
         let (dir, _authorized, outcome, spy) = run_with(None, TransportOutcome::Response(body));
         match outcome {
             ServiceOutcome::Unknown { record, result } => {
-                assert_eq!(spy.calls, 1, "exactly one transport call");
+                assert_eq!(spy.aborts, 1, "protocol failure aborts shared control");
                 assert_unknown(&record, &result);
             }
             other => panic!("expected Unknown, got {other:?}"),
@@ -481,7 +493,7 @@ fn response_byte_overflow_persists_unknown() {
         run_with(None, TransportOutcome::Response(huge.into_bytes()));
     match outcome {
         ServiceOutcome::Unknown { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(spy.aborts, 1, "response-size failure aborts shared control");
             assert_unknown(&record, &result);
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -503,7 +515,7 @@ fn response_member_overflow_persists_unknown() {
         run_with(None, TransportOutcome::Response(body.into_bytes()));
     match outcome {
         ServiceOutcome::Unknown { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(spy.aborts, 1, "member-bound failure aborts shared control");
             assert_unknown(&record, &result);
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -522,7 +534,7 @@ fn response_depth_overflow_persists_unknown() {
         run_with(None, TransportOutcome::Response(body.into_bytes()));
     match outcome {
         ServiceOutcome::Unknown { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(spy.aborts, 1, "depth-bound failure aborts shared control");
             assert_unknown(&record, &result);
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -542,7 +554,7 @@ fn outbound_digest_mismatch_zero_transport_calls_fails_closed() {
     );
     match outcome {
         ServiceOutcome::Unknown { record, result } => {
-            assert_eq!(spy.calls, 0, "transport never consulted on digest mismatch");
+            assert_eq!(spy.aborts, 1, "digest failure aborts shared control");
             assert_unknown(&record, &result);
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -578,7 +590,7 @@ fn arbitrary_upstream_error_envelope_persists_unknown_one_call_no_redispatch() {
     let (dir, _authorized, outcome, spy) = run_with(None, TransportOutcome::Response(envelope));
     match outcome {
         ServiceOutcome::Unknown { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(spy.aborts, 1, "upstream error aborts shared control");
             assert_unknown(&record, &result);
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -640,7 +652,10 @@ fn already_settled_row_returns_stale_and_never_calls_transport() {
         .expect("service must settle");
     match outcome {
         ServiceOutcome::Stale { authoritative } => {
-            assert_eq!(spy.calls, 0, "no transport call on an already-settled row");
+            assert_eq!(
+                spy.aborts, 1,
+                "stale post-permit path aborts shared control"
+            );
             assert_eq!(
                 authoritative.expect("authoritative row").state,
                 LedgerState::Unknown
