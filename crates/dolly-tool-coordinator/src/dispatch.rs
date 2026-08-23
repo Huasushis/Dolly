@@ -12,10 +12,14 @@
 //! This crate owns no transport, Host, or network: the only outside inputs
 //! are the verified `RecoveryFacts` and the storage database.
 
+use std::mem;
 use std::process::Child;
+use std::time::Instant;
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
-use dolly_storage::mcp_readiness::McpTransportReadiness;
+use dolly_storage::mcp_readiness::{
+    McpTransportReadiness, prove_current_mcp_transport_readiness,
+};
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::{
     ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
@@ -30,7 +34,7 @@ use dolly_tool_broker::{
 
 use crate::mcp_stdio::{
     HostMcpStdioInstalledChildAttestation, HostMcpStdioProcessHandle, HostOwnedMcpStdioSession,
-    StdioTransportError, StdioTransportLimits, host_session_from_installed_child,
+    McpStdioProbe, StdioTransportError, StdioTransportLimits, host_session_from_installed_child,
 };
 use crate::permit::SendPermit;
 use crate::service::{ServiceOutcome, ToolDispatchService};
@@ -66,11 +70,25 @@ impl From<ToolBrokerAuthorityError> for DispatchError {
 /// the installed-child verifier supplies the session and the Host retains
 /// the separate process handle.
 pub struct HostMcpStdioInvocation {
-    host_session: HostOwnedMcpStdioSession,
+    session: HostMcpStdioSessionState,
     host_handle: HostMcpStdioProcessHandle,
     limits: StdioTransportLimits,
     request_bytes: Vec<u8>,
 }
+
+pub(crate) enum HostMcpStdioSessionState {
+    Raw(HostOwnedMcpStdioSession),
+    Prepared(McpStdioProbe),
+    Consumed,
+}
+
+pub(crate) struct HostMcpStdioInvocationParts {
+    pub(crate) session: HostMcpStdioSessionState,
+    pub(crate) host_handle: HostMcpStdioProcessHandle,
+    pub(crate) limits: StdioTransportLimits,
+    pub(crate) request_bytes: Vec<u8>,
+}
+
 impl HostMcpStdioInvocation {
     /// Verify an installed Host-owned child, bind it to the current process
     /// generation, and return both the invocation and the separately retained
@@ -85,7 +103,7 @@ impl HostMcpStdioInvocation {
         let (host_session, retained_handle) =
             host_session_from_installed_child(child, attestation, process_generation)?;
         let invocation = Self {
-            host_session,
+            session: HostMcpStdioSessionState::Raw(host_session),
             host_handle: retained_handle.clone(),
             limits,
             request_bytes,
@@ -93,20 +111,58 @@ impl HostMcpStdioInvocation {
         Ok((invocation, retained_handle))
     }
 
-    fn into_parts(
-        self,
-    ) -> (
-        HostOwnedMcpStdioSession,
-        HostMcpStdioProcessHandle,
-        StdioTransportLimits,
-        Vec<u8>,
-    ) {
-        (
-            self.host_session,
-            self.host_handle,
+    pub fn with_request_bytes(mut self, request_bytes: Vec<u8>) -> Self {
+        self.request_bytes = request_bytes;
+        self
+    }
+
+    /// Complete the one MCP initialize/initialized lifecycle on this exact
+    /// verified child. The resulting readiness is consumer-only evidence; the
+    /// child session remains owned by this invocation for the later dispatch.
+    pub fn initialize(
+        &mut self,
+        database: &Database,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        server_id: &str,
+        deadline: Instant,
+    ) -> Result<McpTransportReadiness, StdioTransportError> {
+        let session = mem::replace(&mut self.session, HostMcpStdioSessionState::Consumed);
+        let HostMcpStdioSessionState::Raw(host_session) = session else {
+            self.host_handle.terminate();
+            return Err(StdioTransportError::AlreadyInitialized);
+        };
+        let mut probe = McpStdioProbe::from_host_session(
+            host_session,
+            self.host_handle.clone(),
             self.limits,
-            self.request_bytes,
-        )
+            deadline,
+        )?;
+        match prove_current_mcp_transport_readiness(
+            database.connection(),
+            runtime_binding,
+            process_generation,
+            server_id,
+            &mut probe,
+        ) {
+            Ok(readiness) => {
+                self.session = HostMcpStdioSessionState::Prepared(probe);
+                Ok(readiness)
+            }
+            Err(error) => {
+                probe.abort();
+                Err(StdioTransportError::Readiness(error.to_string()))
+            }
+        }
+    }
+
+    fn into_parts(self) -> HostMcpStdioInvocationParts {
+        HostMcpStdioInvocationParts {
+            session: self.session,
+            host_handle: self.host_handle,
+            limits: self.limits,
+            request_bytes: self.request_bytes,
+        }
     }
 }
 
@@ -214,23 +270,43 @@ pub fn dispatch_operation_authorized(
         permit: Some(permit),
     } = outcome
     else {
+        invocation.host_handle.terminate();
         return Ok(outcome);
     };
-    let (host_session, host_handle, limits, request_bytes) = invocation.into_parts();
-    let service_outcome = service
-        .dispatch_authorized(
+    let parts = invocation.into_parts();
+    let request_bytes = parts.request_bytes;
+    let service_outcome = match parts.session {
+        HostMcpStdioSessionState::Raw(host_session) => service.dispatch_authorized(
             db,
             authority,
             runtime_binding,
             process_generation,
             readiness,
             host_session,
-            host_handle,
-            limits,
+            parts.host_handle,
+            parts.limits,
             permit,
             &request_bytes,
-        )
-        .map_err(|error| DispatchError::Stdio(error.message()))?;
+        ),
+        HostMcpStdioSessionState::Prepared(probe) => service.dispatch_prepared(
+            db,
+            authority,
+            runtime_binding,
+            process_generation,
+            readiness,
+            probe,
+            parts.host_handle,
+            parts.limits,
+            permit,
+            &request_bytes,
+        ),
+        HostMcpStdioSessionState::Consumed => {
+            return Err(DispatchError::Stdio(
+                "MCP invocation session was already consumed".to_owned(),
+            ));
+        }
+    }
+    .map_err(|error| DispatchError::Stdio(error.message()))?;
     map_service_outcome(service_outcome)
 }
 

@@ -1,0 +1,18 @@
+[package]
+name = "dolly-worker"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dolly-canonical-json = { path = "../dolly-canonical-json" }
+dolly-core-domain = { path = "../dolly-core-domain" }
+dolly-storage = { path = "../dolly-storage" }
+dolly-tool-broker = { path = "../dolly-tool-broker" }
+dolly-tool-coordinator = { path = "../dolly-tool-coordinator" }
+getrandom = "0.3.4"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -249,6 +249,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dolly-worker"
+version = "0.1.0"
+dependencies = [
+ "dolly-canonical-json",
+ "dolly-core-domain",
+ "dolly-storage",
+ "dolly-tool-broker",
+ "dolly-tool-coordinator",
+ "getrandom",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "email_address"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

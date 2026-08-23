@@ -68,6 +68,7 @@ pub enum StdioTransportError {
     Deadline,
     Disconnected,
     Io,
+    Readiness(String),
 }
 /// Cancellation is local to one Host-owned session. It never creates a retry
 /// or an alternate send permit.
@@ -121,7 +122,8 @@ pub struct HostMcpStdioProcessHandle {
 }
 
 impl HostMcpStdioProcessHandle {
-    pub(crate) fn terminate(&self) {
+    /// Stop the Host-owned child and wait for its exit.
+    pub fn terminate(&self) {
         self.process.stop();
     }
 }
@@ -641,6 +643,9 @@ impl McpStdioProbe {
             self.host_handle.terminate();
         }
     }
+    pub(crate) fn set_deadline(&mut self, deadline: Instant) {
+        self.deadline = deadline;
+    }
 
     pub(crate) fn into_transport(
         mut self,
@@ -1050,22 +1055,26 @@ fn string_member<'a>(object: &'a CanonicalJsonObject, name: &str) -> Option<&'a 
 
 fn format_transport_error(error: StdioTransportError) -> String {
     match error {
-        StdioTransportError::InvalidLimits => "invalid transport limits",
-        StdioTransportError::InvalidDeadline => "invalid operation deadline",
-        StdioTransportError::MissingPipe => "stdio pipe is missing",
-        StdioTransportError::ProcessIdentityMismatch => "stdio process identity mismatch",
-        StdioTransportError::InvalidFrame => "invalid MCP frame",
-        StdioTransportError::FrameTooLarge => "MCP frame exceeds the configured limit",
-        StdioTransportError::RequestMismatch => "MCP request correlation mismatch",
-        StdioTransportError::NotInitialized => "MCP session is not initialized",
-        StdioTransportError::AlreadyInitialized => "MCP session was already initialized",
-        StdioTransportError::AlreadyUsed => "MCP transport already used",
-        StdioTransportError::Cancelled => "MCP transport cancelled",
-        StdioTransportError::Deadline => "MCP transport deadline exceeded",
-        StdioTransportError::Disconnected => "MCP transport disconnected",
-        StdioTransportError::Io => "MCP transport I/O failed",
+        StdioTransportError::Readiness(detail) => format!("MCP readiness failed: {detail}"),
+        StdioTransportError::InvalidLimits => "invalid transport limits".to_owned(),
+        StdioTransportError::InvalidDeadline => "invalid operation deadline".to_owned(),
+        StdioTransportError::MissingPipe => "stdio pipe is missing".to_owned(),
+        StdioTransportError::ProcessIdentityMismatch => {
+            "stdio process identity mismatch".to_owned()
+        }
+        StdioTransportError::InvalidFrame => "invalid MCP frame".to_owned(),
+        StdioTransportError::FrameTooLarge => "MCP frame exceeds the configured limit".to_owned(),
+        StdioTransportError::RequestMismatch => "MCP request correlation mismatch".to_owned(),
+        StdioTransportError::NotInitialized => "MCP session is not initialized".to_owned(),
+        StdioTransportError::AlreadyInitialized => {
+            "MCP session was already initialized".to_owned()
+        }
+        StdioTransportError::AlreadyUsed => "MCP transport already used".to_owned(),
+        StdioTransportError::Cancelled => "MCP transport cancelled".to_owned(),
+        StdioTransportError::Deadline => "MCP transport deadline exceeded".to_owned(),
+        StdioTransportError::Disconnected => "MCP transport disconnected".to_owned(),
+        StdioTransportError::Io => "MCP transport I/O failed".to_owned(),
     }
-    .to_owned()
 }
 
 #[cfg(test)]
