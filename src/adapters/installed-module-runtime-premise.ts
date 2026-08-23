@@ -9,6 +9,7 @@ import {
 } from "../core/startup-authority-premise.js";
 import {
   assertInstalledComponentOrigin,
+  InstalledComponentOriginRegistry,
   type VerifiedInstalledComponentOrigin,
 } from "../core/installed-component-origin.js";
 import type { ReservedV10InstalledModulePlan } from "../core/installed-extension-module.js";
@@ -95,10 +96,27 @@ function assertOptions(value: unknown): asserts value is InstalledModuleRuntimeP
   );
 }
 
+function assertCandidateAuthority(
+  candidate: InstalledModuleActivationCandidate,
+  permission: StartupAuthorityPermission,
+): void {
+  if (
+    candidate.configRevision !== permission.configRevision ||
+    candidate.configDigest !== permission.configDigest ||
+    candidate.premisesDigest !== permission.premisesDigest ||
+    candidate.controllerGenerationId !== permission.controllerGenerationId
+  ) {
+    throw new TypeError(
+      "installed Module runtime premise candidate is stale for the durable Startup authority",
+    );
+  }
+}
+
 function assertCandidateModule(
   candidate: InstalledModuleActivationCandidate,
   module: InstalledModuleActivationCandidate["modules"][number],
   seenModuleIds: Set<string>,
+  origins: InstalledComponentOriginRegistry,
 ): void {
   if (seenModuleIds.has(module.moduleId)) {
     throw new TypeError(`installed Module runtime premise has duplicate Module ${module.moduleId}`);
@@ -111,6 +129,22 @@ function assertCandidateModule(
     );
   }
   assertInstalledComponentOrigin(module.packageOrigin);
+  origins.assertCurrent(module.packageOrigin);
+  const currentOrigin = origins.resolve({
+    extensionId: plan.installation.manifest.extensionId,
+    packageVersion: plan.installation.manifest.packageVersion,
+  });
+  if (
+    module.packageOrigin.schema !== currentOrigin.schema ||
+    module.packageOrigin.kind !== currentOrigin.kind ||
+    module.packageOrigin.component_id !== currentOrigin.component_id ||
+    module.packageOrigin.component_revision !== currentOrigin.component_revision ||
+    module.packageOrigin.component_digest !== currentOrigin.component_digest
+  ) {
+    throw new TypeError(
+      `installed Module runtime premise Module ${module.moduleId} package origin is stale for the current Host registry`,
+    );
+  }
   if (!candidate.installedComponentOrigins.includes(module.packageOrigin)) {
     throw new TypeError(
       `installed Module runtime premise Module ${module.moduleId} is not bound to the candidate origin set`,
@@ -135,9 +169,10 @@ export function composeInstalledModuleRuntimePremise(
   options: InstalledModuleRuntimePremiseOptions,
 ): InstalledModuleRuntimePremise {
   assertOptions(options);
+  assertCandidateAuthority(options.candidate, options.startupAuthorityPermission);
   const seenModuleIds = new Set<string>();
   const modules = options.candidate.modules.map((module) => {
-    assertCandidateModule(options.candidate, module, seenModuleIds);
+    assertCandidateModule(options.candidate, module, seenModuleIds, options.origins);
     const permissionPolicies = options.permissionPolicies.resolveFor(module.installedModule);
     const permissionBindings = options.permissionPolicies.resolveLiveBindingsFor(
       module.installedModule,

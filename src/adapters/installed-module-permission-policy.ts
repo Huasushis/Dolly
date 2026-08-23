@@ -631,6 +631,39 @@ function assertInstalledPlanMatchesAuthority(
       "installed permission binding plan instance does not match the current Runtime authority",
     );
   }
+  if (canonicalJsonDigest(runtimeConfig as unknown as JsonValue) !== installed.instanceConfigurationDigest) {
+    throw unavailable(
+      "installed permission binding plan configuration digest does not match the current Runtime authority",
+    );
+  }
+  const modules = Reflect.get(runtimeConfig, "modules");
+  if (!Array.isArray(modules)) {
+    throw unavailable("installed permission binding authority configuration has no module list");
+  }
+  const currentModule = modules.find((candidate) =>
+    candidate !== null &&
+    typeof candidate === "object" &&
+    !Array.isArray(candidate) &&
+    Reflect.get(candidate, "moduleId") === installed.module.moduleId
+  );
+  if (currentModule === undefined || !sameCanonicalJson(currentModule, installed.module)) {
+    throw unavailable(
+      "installed permission binding plan module does not match the current Runtime authority",
+    );
+  }
+  const reference = installed.module.configurationReference;
+  if (
+    installed.configuration.configId !== reference.configId ||
+    installed.configuration.revision !== reference.revision ||
+    installed.configuration.configVersion !== reference.configVersion ||
+    installed.packageModule.moduleKind !== installed.module.moduleKind ||
+    installed.installation.manifest.extensionId !== installed.module.extensionId ||
+    installed.installation.manifest.packageVersion !== installed.module.packageVersion
+  ) {
+    throw unavailable(
+      "installed permission binding plan installation or configuration linkage is not exact",
+    );
+  }
   const manifest = installed.installation.manifest;
   const origin = context.origins.resolve({
     extensionId: manifest.extensionId,

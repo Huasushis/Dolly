@@ -7,6 +7,8 @@ import {
   RuntimeAuthorityDatabase,
   type InstalledComponentOrigin,
   type ModuleActivationPremises,
+  type PermissionPolicyBackendBinding,
+  type PermissionPolicyDefinition,
   type RuntimeAuthorityIdentity,
 } from "../../../src/adapters/storage/runtime-authority-database.js";
 import { canonicalBytes } from "../../../src/schema-bundle/index.js";
@@ -27,14 +29,21 @@ import {
   composeInstalledModuleRuntimePremise,
 } from "../../../src/adapters/installed-module-runtime-premise.js";
 import {
+  reservedV10InstalledPermissionPolicyDefinition,
+  reservedV10InstalledPermissionPolicyRevision,
   ReservedV10InstalledPermissionPolicyRegistry,
+  type InstalledModulePrivateStoragePolicy,
 } from "../../../src/adapters/installed-module-permission-policy.js";
+import { ModuleConfigurationStore } from "../../../src/core/module-configuration-store.js";
 import {
   proveLinuxModuleActivation,
   consumeLinuxModuleActivationHandoff,
   type LinuxModuleActivationHandoff,
 } from "../../../src/core/linux-module-activation.js";
-import { ModuleConfigurationStore } from "../../../src/core/module-configuration-store.js";
+import {
+  DEFAULT_MODULE_PRIVATE_STORAGE_LIMITS_V2,
+  ModulePrivateStorageBackend,
+} from "../../../src/core/capabilities/module-private-storage-capability.js";
 import {
   resolveStartupAuthorityPremise,
   type StartupAuthorityPermission,
@@ -122,6 +131,11 @@ function reservedConfiguration(
   extensionId: string,
   packageVersion: string,
   revision: string,
+  permissionPolicyReferences: readonly {
+    readonly policyId: string;
+    readonly revision: string;
+  }[] = [],
+  declaredExternalEffects: "none" | "core-capabilities-only" = "none",
 ): JsonValue {
   const defaults = createDefaultDollyInstanceConfig(runtimeInstanceId);
   return {
@@ -163,11 +177,11 @@ function reservedConfiguration(
         revision,
         configVersion: 1,
       },
-      permissionPolicyReferences: [],
+      permissionPolicyReferences,
       inputConnections: [{ pageId: "input", start: "from-now" }],
       outputPageIds: ["output"],
       activation: { kind: "reactive" },
-      declaredExternalEffects: "none",
+      declaredExternalEffects,
       execution: {
         kind: "linux-process",
         isolation: "process",
@@ -205,10 +219,15 @@ function reservedConfiguration(
   };
 }
 
+interface AuthorityPolicyFixture {
+  readonly definition: PermissionPolicyDefinition;
+  readonly binding: PermissionPolicyBackendBinding;
+}
 function buildAuthority(
   origin: InstalledComponentOrigin,
   runtimeConfig: JsonValue,
   configRevision = 1,
+  policies: readonly AuthorityPolicyFixture[] = [],
 ): { bytes: Uint8Array; digest: string; premise: ModuleActivationPremises } {
   const candidate = {
     schema: "dolly.linux-service-candidate/v1",
@@ -220,7 +239,14 @@ function buildAuthority(
   candidate.candidate_digest = digestWithout(candidate, "candidate_digest");
   const resolved = {
     runtime_config: runtimeConfig,
-    permission_policy_selections: [],
+    permission_policy_selections: policies.map(({ definition, binding }) => ({
+      policy_id: definition.policy_id,
+      policy_revision: definition.policy_revision,
+      policy_definition_digest: definition.definition_digest,
+      binding_id: binding.binding_id,
+      binding_revision: binding.binding_revision,
+      binding_digest: binding.binding_digest,
+    })),
     service_candidate: candidate,
   };
   const bytes = canonicalBytes(resolved);
@@ -231,13 +257,71 @@ function buildAuthority(
     instance_id: identity.instanceId,
     config_revision: configRevision,
     config_digest: digest,
-    permission_policy_definitions: [],
-    permission_policy_backend_bindings: [],
+    permission_policy_definitions: policies.map(({ definition }) => definition),
+
+    permission_policy_backend_bindings: policies.map(({ binding }) => binding),
     service_candidate: candidate,
     premises_digest: "",
   } satisfies Record<string, unknown>;
   premise.premises_digest = digestWithout(premise, "premises_digest");
   return { bytes, digest, premise: premise as unknown as ModuleActivationPremises };
+}
+function buildPermissionPolicyFixture(
+  root: string,
+  origin: VerifiedInstalledComponentOrigin,
+): {
+  readonly policy: InstalledModulePrivateStoragePolicy;
+  readonly revision: string;
+  readonly definition: PermissionPolicyDefinition;
+  readonly binding: PermissionPolicyBackendBinding;
+} {
+  const policy: InstalledModulePrivateStoragePolicy = {
+    kind: "module-private-storage",
+    policyId: "storage-checkpoints",
+    backend: new ModulePrivateStorageBackend({
+      root: join(root, "policy-storage"),
+      now: () => "2026-08-23T00:00:00.000Z",
+    }),
+    operations: ["get", "list", "set"],
+    limits: DEFAULT_MODULE_PRIVATE_STORAGE_LIMITS_V2,
+    capabilityLifetimeMs: 5_000,
+  };
+  const revision = reservedV10InstalledPermissionPolicyRevision(policy);
+  const definitionRecord: Record<string, unknown> = {
+    schema: "dolly.permission-policy-definition/v1",
+    policy_id: policy.policyId,
+    policy_revision: 1,
+    definition_schema_uri: "https://dolly.example/installed-permission-policy.schema.json",
+    definition_schema_digest: `sha256:${"a".repeat(64)}`,
+    definition: reservedV10InstalledPermissionPolicyDefinition(policy),
+    origin: {
+      schema: "dolly.policy-definition-origin/v1",
+      kind: "operator_approved_policy",
+      source_id: "org.dolly.policy-store",
+      source_revision: 1,
+      source_digest: `sha256:${"b".repeat(64)}`,
+    },
+    definition_digest: "",
+  };
+  definitionRecord.definition_digest = digestWithout(definitionRecord, "definition_digest");
+  const definition = definitionRecord as unknown as PermissionPolicyDefinition;
+  const bindingRecord: Record<string, unknown> = {
+    schema: "dolly.permission-policy-backend-binding/v1",
+    binding_id: "storage-checkpoints-host",
+    binding_revision: 1,
+    binding_digest: "",
+    policy_id: policy.policyId,
+    policy_revision: definition.policy_revision,
+    policy_definition_digest: definition.definition_digest,
+    origin,
+  };
+  bindingRecord.binding_digest = digestWithout(bindingRecord, "binding_digest");
+  return {
+    policy,
+    revision,
+    definition,
+    binding: bindingRecord as unknown as PermissionPolicyBackendBinding,
+  };
 }
 
 function setCompleteLiveProof(): void {
@@ -611,6 +695,172 @@ describe("post-H3 installed Module activation candidate", () => {
       )).toThrow(/plan instance does not match/u);
     } finally {
       await closeFixture(current);
+    }
+  });
+
+  it("binds an exact persistent policy and rejects stale authority contexts", async () => {
+    const current = await fixture();
+    let released = false;
+    try {
+      const previous = current.database.readCurrentConfig()!;
+      const currentRuntimeConfig = (
+        previous.canonicalConfig as Record<string, JsonValue>
+      ).runtime_config;
+      const currentModule = (
+        currentRuntimeConfig as Record<string, JsonValue>
+      ).modules as JsonValue[];
+      const moduleReference = (
+        currentModule[0] as Record<string, JsonValue>
+      ).configurationReference as Record<string, JsonValue>;
+      const policyFixture = buildPermissionPolicyFixture(
+        current.root,
+        current.serviceOrigin,
+      );
+      const runtimeConfig = reservedConfiguration(
+        "org.example.candidate",
+        "10.0.0",
+        moduleReference.revision as string,
+        [{ policyId: policyFixture.policy.policyId, revision: policyFixture.revision }],
+        "core-capabilities-only",
+      );
+      const authority = buildAuthority(
+        current.serviceOrigin,
+        runtimeConfig,
+        2,
+        [policyFixture],
+      );
+      current.database.installConfig({
+        identity,
+        canonicalConfigBytes: authority.bytes,
+        configDigest: authority.digest,
+        premise: authority.premise,
+        verifiedOrigins: [current.serviceOrigin],
+        expectedCurrent: {
+          revision: previous.config_revision,
+          digest: previous.config_digest,
+        },
+      });
+      const resolveInstallation = current.installations.resolve.bind(current.installations);
+      vi.spyOn(current.installations, "resolve").mockImplementation((lookup) => ({
+        ...resolveInstallation(lookup),
+        manifest: {
+          ...resolveInstallation(lookup).manifest,
+          requestedCapabilities: ["module-private-storage"],
+        },
+      } as never));
+      const permission = resolveStartupAuthorityPremise({
+        database: current.database,
+        controller: current.controller,
+        origins: current.origins,
+        installedComponentOrigins: [current.serviceOrigin],
+      });
+      const handoff = await proveLinuxModuleActivation({
+        startupAuthorityPermission: permission,
+      });
+      if (!handoff.permitted) throw new Error("policy fixture H3 proof was refused");
+      const candidate = composeInstalledModuleActivationCandidate({
+        ...options(current),
+        handoff,
+      });
+      const permissionPolicies: ReservedV10InstalledPermissionPolicyRegistry =
+        new ReservedV10InstalledPermissionPolicyRegistry({
+          policies: [{
+            policyId: policyFixture.policy.policyId,
+            revision: policyFixture.revision,
+            policy: policyFixture.policy,
+          }],
+        });
+      const context = {
+        database: current.database,
+        controller: current.controller,
+        origins: current.origins,
+      };
+      const premise = composeInstalledModuleRuntimePremise({
+        candidate,
+        permissionPolicies,
+        startupAuthorityPermission: permission,
+        ...context,
+      });
+      const liveBinding = premise.modules[0]!.permissionBindings[0]!;
+      expect(premise.modules[0]!.permissionBindings).toHaveLength(1);
+      expect(liveBinding).toMatchObject({
+        schemaVersion: "dolly.installed-module-permission-binding/1",
+        daemonInstallationId: identity.daemonInstallationId,
+        instanceId: identity.instanceId,
+        controllerGenerationId: permission.controllerGenerationId,
+        configRevision: permission.configRevision,
+        configDigest: permission.configDigest,
+        policyId: policyFixture.policy.policyId,
+        policyRevision: 1,
+        bindingId: policyFixture.binding.binding_id,
+        bindingRevision: 1,
+        origin: current.serviceOrigin,
+      });
+      permissionPolicies.assertLiveBinding(liveBinding, context);
+
+      const replacementOrigins = new InstalledComponentOriginRegistry({
+        directory: join(current.root, "replacement-origins"),
+        installations: current.installations,
+      });
+      const replacementServiceOrigin = replacementOrigins.resolve({
+        extensionId: current.serviceOrigin.component_id,
+        packageVersion: "10.0.0",
+      });
+      const replacementPermission = resolveStartupAuthorityPremise({
+        database: current.database,
+        controller: current.controller,
+        origins: replacementOrigins,
+        installedComponentOrigins: [replacementServiceOrigin],
+      });
+      expect(() => composeInstalledModuleRuntimePremise({
+        candidate,
+        permissionPolicies,
+        startupAuthorityPermission: replacementPermission,
+        database: current.database,
+        controller: current.controller,
+        origins: replacementOrigins,
+      })).toThrow(/origin|registry/u);
+
+      const changedRuntimeConfig = {
+        ...(runtimeConfig as Record<string, JsonValue>),
+        displayName: "changed",
+      } as JsonValue;
+      const changed = buildAuthority(
+        current.serviceOrigin,
+        changedRuntimeConfig,
+        3,
+        [policyFixture],
+      );
+      current.database.installConfig({
+        identity,
+        canonicalConfigBytes: changed.bytes,
+        configDigest: changed.digest,
+        premise: changed.premise,
+        verifiedOrigins: [current.serviceOrigin],
+        expectedCurrent: { revision: 2, digest: authority.digest },
+      });
+      const changedPermission = resolveStartupAuthorityPremise({
+        database: current.database,
+        controller: current.controller,
+        origins: current.origins,
+        installedComponentOrigins: [current.serviceOrigin],
+      });
+      expect(() => composeInstalledModuleRuntimePremise({
+        candidate,
+        permissionPolicies,
+        startupAuthorityPermission: changedPermission,
+        ...context,
+      })).toThrow(/candidate is stale/u);
+      expect(() => permissionPolicies.assertLiveBinding(liveBinding, context))
+        .toThrow(/stale|current Runtime authority/u);
+
+      await current.controller.release();
+      released = true;
+      expect(() => permissionPolicies.assertLiveBinding(liveBinding, context))
+        .toThrow(/authority|controller|lock/u);
+    } finally {
+      current.database.close();
+      if (!released) await current.controller.release();
     }
   });
 
