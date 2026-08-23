@@ -35,7 +35,7 @@ pub struct StdioTransportLimits {
 }
 
 impl StdioTransportLimits {
-    pub(crate) fn new(
+    pub fn new(
         max_frame_bytes: usize,
         max_nesting_depth: u16,
     ) -> Result<Self, StdioTransportError> {
@@ -53,7 +53,7 @@ impl StdioTransportLimits {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StdioTransportError {
+pub enum StdioTransportError {
     InvalidLimits,
     InvalidDeadline,
     MissingPipe,
@@ -126,11 +126,10 @@ impl HostMcpStdioProcessHandle {
     }
 }
 
-/// Opaque capability minted by the installed-child verifier. Its fields are
-/// private so a transport caller cannot pair an arbitrary Child with copied
-/// digest or endpoint claims.
+/// Typed installed-child claims supplied by Host. The claims remain untrusted
+/// until [`InstalledChildVerifier`] checks the live child and artifact bytes.
 #[derive(Clone)]
-struct HostIssuedMcpStdioAttestation {
+pub struct HostMcpStdioInstalledChildAttestation {
     server_id: String,
     adapter: String,
     protocol_version: String,
@@ -153,11 +152,67 @@ struct HostIssuedMcpStdioAttestation {
     process_id: u32,
 }
 
+impl HostMcpStdioInstalledChildAttestation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        server_id: String,
+        adapter: String,
+        protocol_version: String,
+        transport_kind: String,
+        endpoint: String,
+        endpoint_digest: Sha256Digest,
+        package_digest: Sha256Digest,
+        package_path: PathBuf,
+        executable_digest: Sha256Digest,
+        executable_path: PathBuf,
+        transport_digest: Sha256Digest,
+        daemon_installation_id: String,
+        instance_id: String,
+        controller_generation: ExtensionGeneration,
+        worker_epoch: WorkerEpoch,
+        extension_alias: ExtensionId,
+        extension_generation: ExtensionGeneration,
+        runtime_binding_digest: Sha256Digest,
+        session_id: String,
+        process_id: u32,
+    ) -> Self {
+        Self {
+            server_id,
+            adapter,
+            protocol_version,
+            transport_kind,
+            endpoint,
+            endpoint_digest,
+            package_digest,
+            package_path,
+            executable_digest,
+            executable_path,
+            transport_digest,
+            daemon_installation_id,
+            instance_id,
+            controller_generation,
+            worker_epoch,
+            extension_alias,
+            extension_generation,
+            runtime_binding_digest,
+            session_id,
+            process_id,
+        }
+    }
+}
+
 /// Host-issued verified process/session capability. No raw Child constructor
 /// is exposed; only the installed-child verifier can mint this value.
 pub(crate) struct HostIssuedMcpStdioProcess {
     child: Child,
-    attestation: HostIssuedMcpStdioAttestation,
+    attestation: HostMcpStdioInstalledChildAttestation,
+}
+
+impl HostIssuedMcpStdioProcess {
+    fn abort(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Internal verifier seam for the installed-child authority. The verifier
@@ -166,20 +221,33 @@ struct InstalledChildVerifier;
 
 impl InstalledChildVerifier {
     fn issue(
-        child: Child,
-        attestation: HostIssuedMcpStdioAttestation,
+        mut child: Child,
+        attestation: HostMcpStdioInstalledChildAttestation,
     ) -> Result<HostIssuedMcpStdioProcess, StdioTransportError> {
         if child.id() != attestation.process_id
             || !attestation_is_self_consistent(&attestation)
             || !installed_child_is_attested(&child, &attestation)
         {
+            let _ = child.kill();
+            let _ = child.wait();
             return Err(StdioTransportError::ProcessIdentityMismatch);
         }
         Ok(HostIssuedMcpStdioProcess { child, attestation })
     }
 }
 
-fn attestation_is_self_consistent(attestation: &HostIssuedMcpStdioAttestation) -> bool {
+pub(crate) fn host_session_from_installed_child(
+    child: Child,
+    attestation: HostMcpStdioInstalledChildAttestation,
+    process_generation: &ProcessGeneration,
+) -> Result<(HostOwnedMcpStdioSession, HostMcpStdioProcessHandle), StdioTransportError> {
+    let process = InstalledChildVerifier::issue(child, attestation)?;
+    let session = HostOwnedMcpStdioSession::from_host_issued_process(process, process_generation)?;
+    let handle = session.process_handle();
+    Ok((session, handle))
+}
+
+fn attestation_is_self_consistent(attestation: &HostMcpStdioInstalledChildAttestation) -> bool {
     let Ok((_, endpoint_digest)) =
         canonicalize(&CanonicalJsonValue::String(attestation.endpoint.clone()))
     else {
@@ -188,7 +256,10 @@ fn attestation_is_self_consistent(attestation: &HostIssuedMcpStdioAttestation) -
     endpoint_digest == attestation.endpoint_digest
 }
 
-fn installed_child_is_attested(child: &Child, attestation: &HostIssuedMcpStdioAttestation) -> bool {
+fn installed_child_is_attested(
+    child: &Child,
+    attestation: &HostMcpStdioInstalledChildAttestation,
+) -> bool {
     #[cfg(target_os = "linux")]
     {
         let Ok(package) = std::fs::read(&attestation.package_path) else {
@@ -242,7 +313,7 @@ struct HostVerifiedMcpStdioIdentity {
     session_id: String,
 }
 
-pub struct HostOwnedMcpStdioSession {
+pub(crate) struct HostOwnedMcpStdioSession {
     reader: ChildStdout,
     writer: ChildStdin,
     handle: HostMcpStdioProcessHandle,
@@ -260,18 +331,23 @@ impl HostOwnedMcpStdioSession {
             || attestation.extension_alias != *process_generation.extension_alias()
             || attestation.extension_generation != process_generation.extension_generation()
         {
+            process.abort();
             return Err(StdioTransportError::ProcessIdentityMismatch);
         }
-        let reader = process
-            .child
-            .stdout
-            .take()
-            .ok_or(StdioTransportError::MissingPipe)?;
-        let writer = process
-            .child
-            .stdin
-            .take()
-            .ok_or(StdioTransportError::MissingPipe)?;
+        let reader = match process.child.stdout.take() {
+            Some(reader) => reader,
+            None => {
+                process.abort();
+                return Err(StdioTransportError::MissingPipe);
+            }
+        };
+        let writer = match process.child.stdin.take() {
+            Some(writer) => writer,
+            None => {
+                process.abort();
+                return Err(StdioTransportError::MissingPipe);
+            }
+        };
         let process = ProcessControl::child(process.child);
         let identity = HostVerifiedMcpStdioIdentity {
             server_id: attestation.server_id,
@@ -1043,12 +1119,12 @@ mod tests {
         process_id: u32,
         executable_path: PathBuf,
         artifact_digest: Sha256Digest,
-    ) -> HostIssuedMcpStdioAttestation {
+    ) -> HostMcpStdioInstalledChildAttestation {
         let endpoint = "bin/dolly-fs-tools".to_owned();
         let endpoint_digest = canonicalize(&CanonicalJsonValue::String(endpoint.clone()))
             .expect("endpoint digest")
             .1;
-        HostIssuedMcpStdioAttestation {
+        HostMcpStdioInstalledChildAttestation {
             server_id: "fs".to_owned(),
             adapter: MCP_ADAPTER.to_owned(),
             protocol_version: MCP_PROTOCOL_VERSION_2025_06_18.to_owned(),
