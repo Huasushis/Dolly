@@ -176,6 +176,20 @@ describe("FileCore bounded global history", () => {
     raw.close();
   });
 
+  it("uses the concrete Runtime authority binding on migrate and open paths", () => {
+    const { database } = openAuthority();
+    const policy: FileCoreHistoryOptions = { maxEntries: 8, maxBytes: 64, maxReaders: 2 };
+    const migrated = migrate(database, policy);
+    const opened = database.openFileCoreHistory(policy);
+    expect(opened.head).toEqual(migrated.head);
+    const entry = opened.append({
+      producerEntryId: "real-runtime-entry",
+      value: { value: "bound" },
+      expectedHeadRevision: migrated.head.head_revision,
+    });
+    expect(entry.sequence).toBe(1);
+  });
+
   it("requires Runtime-authority migration and exposes an explicit pre-migration gap", () => {
     const { database } = openAuthority();
     const policy: FileCoreHistoryOptions = { maxEntries: 8, maxBytes: 64, maxReaders: 2 };

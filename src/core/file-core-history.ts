@@ -389,20 +389,7 @@ export function mintFileCoreHistoryProducerCapability(authority: unknown): FileC
   if (!(authority instanceof RuntimeAuthorityDatabase)) {
     throw new TypeError("FileCore history producer capability requires RuntimeAuthorityDatabase");
   }
-  const contextBinding = (
-    authority as RuntimeAuthorityDatabase & {
-      readonly fileCoreHistoryContextBinding?: () => {
-        readonly assertExactContext: FileCoreHistoryContextAssertion;
-      };
-    }
-  ).fileCoreHistoryContextBinding;
-  if (typeof contextBinding !== "function") {
-    throw new TypeError("RuntimeAuthorityDatabase does not expose the FileCore history context binding");
-  }
-  const boundContext = contextBinding.call(authority);
-  if (!boundContext || typeof boundContext.assertExactContext !== "function") {
-    throw new TypeError("RuntimeAuthorityDatabase returned an invalid FileCore history context binding");
-  }
+  const boundContext = authority.fileCoreHistoryContextBinding();
   const capability: FileCoreHistoryProducerCapability = Object.freeze({
     assertValid: () => {
       if (!authority.isOpen) throw new FileCoreHistoryError("HISTORY_PRODUCER_FENCED", "Runtime authority database is closed");

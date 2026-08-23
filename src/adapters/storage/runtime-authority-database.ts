@@ -643,12 +643,6 @@ export class RuntimeAuthorityDatabase {
     this.#connection = connection;
     this.#identity = identity;
     this.#lock = lock;
-    Object.defineProperty(this, "fileCoreHistoryContextBinding", {
-      configurable: false,
-      enumerable: false,
-      writable: false,
-      value: () => this.#fileCoreHistoryContextBinding(),
-    });
   }
 
   /** Opens through the H0 attested loader and verifies the committed DB (REQ-AUTH-004). */
@@ -683,8 +677,8 @@ export class RuntimeAuthorityDatabase {
   get isOpen(): boolean {
     return !this.#closed && this.#connection.open;
   }
-  /** @internal Supplies an exact context assertion to the FileCore capability mint path. */
-  #fileCoreHistoryContextBinding(): {
+  /** Supplies an exact context assertion to the FileCore capability mint path. */
+  fileCoreHistoryContextBinding(): {
     readonly assertExactContext: (connection: unknown, identity: RuntimeAuthorityIdentity, lock: unknown) => void;
   } {
     const connection = this.#connection;
@@ -699,6 +693,12 @@ export class RuntimeAuthorityDatabase {
         candidateIdentity: RuntimeAuthorityIdentity,
         candidateLock: unknown,
       ): void => {
+        if (!this.isOpen) throw new TypeError("Runtime authority database is closed");
+        if (!this.#lock.held) throw new RuntimeAuthorityDatabaseError(
+          "CONTROLLER_LOCK_NOT_HELD",
+          "FileCore history requires the Runtime authority controller lock",
+        );
+        this.#lock.assertHeld();
         if (candidateConnection !== connection || candidateLock !== lock) {
           throw new TypeError("FileCore history context is not bound to this Runtime authority");
         }
