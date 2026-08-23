@@ -1,8 +1,21 @@
 import {
   canonicalJsonDigest,
+  canonicalizeJson,
+  cloneJson,
   deepFreeze,
   type JsonValue,
 } from "../core/canonical-json.js";
+import {
+  assertStartupAuthorityPermissionContext,
+  type StartupAuthorityPermission,
+  type StartupAuthorityPermissionContext,
+  type StartupAuthorityPolicyBinding,
+} from "../core/startup-authority-premise.js";
+import {
+  RuntimeAuthorityDatabaseError,
+  type PermissionPolicyDefinition,
+} from "./storage/runtime-authority-database.js";
+import type { VerifiedInstalledComponentOrigin } from "../core/installed-component-origin.js";
 import {
   createModulePrivateStorageCapabilityV2,
   ModulePrivateStorageBackend,
@@ -153,6 +166,41 @@ export interface ReservedV10InstalledPermissionPolicySelection {
   readonly selectionDigest: string;
 }
 
+/**
+ * One fresh live backend binding resolved from the durable authority premise.
+ * The public fields are the closed, versioned identity that a consumer may
+ * audit; the private registry state retains the executable Host policy.
+ */
+export interface InstalledModulePermissionBinding {
+  readonly schemaVersion: "dolly.installed-module-permission-binding/1";
+  readonly daemonInstallationId: string;
+  readonly instanceId: string;
+  readonly controllerGenerationId: string;
+  readonly configRevision: number;
+  readonly configDigest: string;
+  readonly premisesDigest: string;
+  readonly policyId: string;
+  readonly policyRevision: number;
+  readonly policyDefinitionDigest: string;
+  readonly bindingId: string;
+  readonly bindingRevision: number;
+  readonly bindingDigest: string;
+  readonly definition: PermissionPolicyDefinition;
+  readonly origin: VerifiedInstalledComponentOrigin;
+}
+
+interface InstalledModulePermissionBindingState {
+  readonly registry: ReservedV10InstalledPermissionPolicyRegistry;
+  readonly policy: InstalledModulePermissionPolicy;
+  readonly permission: StartupAuthorityPermission;
+  readonly binding: StartupAuthorityPolicyBinding;
+}
+
+const INSTALLED_MODULE_PERMISSION_BINDINGS = new WeakMap<
+  object,
+  InstalledModulePermissionBindingState
+>();
+
 export interface InstalledModulePermissionPolicySetupSnapshot {
   readonly instanceId: string;
   readonly moduleId: string;
@@ -164,6 +212,7 @@ export interface InstalledModulePermissionPolicySetupSnapshot {
     | {
         readonly capabilityType: "model-operation";
         readonly capabilityVersion: "v2" | "v3";
+
         readonly policyId: string;
         readonly streaming: "required";
         readonly mediaRequirementIds?: readonly string[];
@@ -197,6 +246,17 @@ function assertPolicyRevision(value: string, label: string): void {
   if (!POLICY_REVISION_PATTERN.test(value)) {
     throw new TypeError(`${label} must be a canonical SHA-256 revision`);
   }
+}
+function unavailable(message: string, cause?: unknown): RuntimeAuthorityDatabaseError {
+  return new RuntimeAuthorityDatabaseError(
+    "MODULE_ACTIVATION_POLICY_BINDING_UNAVAILABLE",
+    message,
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+function sameCanonicalJson(left: unknown, right: unknown): boolean {
+  return canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue);
 }
 
 function assertPositiveInteger(value: number, label: string): void {
@@ -503,7 +563,8 @@ function definitionForImmutablePolicy(
 /**
  * Canonical, secret-free definition of every policy field the capability
  * factory consumes. Live broker, executor, repository, and storage objects do
- * not enter this JSON definition and still require a future durable binding.
+ * not enter this JSON definition; a live binding is minted only after the
+ * versioned Runtime authority premise matches it exactly.
  */
 export function reservedV10InstalledPermissionPolicyDefinition(
   supplied: InstalledModulePermissionPolicy,
@@ -517,6 +578,74 @@ export function reservedV10InstalledPermissionPolicyRevision(
   return canonicalJsonDigest(
     reservedV10InstalledPermissionPolicyDefinition(supplied),
   );
+}
+
+function assertBindingAuthority(
+  permission: StartupAuthorityPermission,
+  context: StartupAuthorityPermissionContext,
+): void {
+  try {
+    assertStartupAuthorityPermissionContext(permission, context);
+  } catch (error) {
+    if (
+      error instanceof RuntimeAuthorityDatabaseError &&
+      error.code !== "MODULE_ACTIVATION_PREMISES_INVALID" &&
+      error.code !== "MODULE_ACTIVATION_POLICY_BINDING_UNAVAILABLE"
+    ) {
+      throw error;
+    }
+    throw unavailable(
+      "installed permission binding is stale or belongs to a different Runtime authority",
+      error,
+    );
+  }
+}
+
+/**
+ * Rechecks a live binding against the exact durable premise and live Host
+ * context that produced it. A structural copy, reopened database, released
+ * controller, changed authority revision, or replaced origin registry cannot
+ * pass this boundary.
+ */
+export function assertInstalledModulePermissionBinding(
+  value: unknown,
+  context: StartupAuthorityPermissionContext,
+): asserts value is InstalledModulePermissionBinding {
+  if (value === null || typeof value !== "object") {
+    throw unavailable("installed permission binding was not minted by the Host policy registry");
+  }
+  const state = INSTALLED_MODULE_PERMISSION_BINDINGS.get(value);
+  if (state === undefined) {
+    throw unavailable("installed permission binding was not minted by the Host policy registry");
+  }
+  assertBindingAuthority(state.permission, context);
+  const binding = value as InstalledModulePermissionBinding;
+  const identity = context.database.identity;
+  if (
+    binding.schemaVersion !== "dolly.installed-module-permission-binding/1" ||
+    binding.daemonInstallationId !== identity.daemonInstallationId ||
+    binding.instanceId !== identity.instanceId ||
+    binding.controllerGenerationId !== state.permission.controllerGenerationId ||
+    binding.configRevision !== state.permission.configRevision ||
+    binding.configDigest !== state.permission.configDigest ||
+    binding.premisesDigest !== state.permission.premisesDigest ||
+    binding.policyId !== state.binding.policy_id ||
+    binding.policyRevision !== state.binding.policy_revision ||
+    binding.policyDefinitionDigest !== state.binding.policy_definition_digest ||
+    binding.bindingId !== state.binding.binding_id ||
+    binding.bindingRevision !== state.binding.binding_revision ||
+    binding.bindingDigest !== state.binding.binding_digest ||
+    binding.origin !== state.binding.origin ||
+    !sameCanonicalJson(binding.definition, state.binding.definition)
+  ) {
+    throw unavailable("installed permission binding identity does not match its durable premise");
+  }
+  if (
+    canonicalJsonDigest(binding.definition.definition) !==
+      reservedV10InstalledPermissionPolicyRevision(state.policy)
+  ) {
+    throw unavailable("installed permission binding definition no longer matches its Host policy");
+  }
 }
 
 function assertInstalledLlmConfigurationPolicyBinding(
@@ -951,8 +1080,8 @@ export class InstalledModulePermissionPolicyRegistry {
 
 /**
  * Resolves the exact versioned policy references in a resolver-minted v10
- * installed plan. This registry intentionally does not persist policies and
- * does not configure a Host; it closes only revision selection and provenance.
+ * installed plan. Selection remains inert until a current StartupAuthority
+ * permission and Runtime authority context resolveLiveBindingsFor together.
  */
 export class ReservedV10InstalledPermissionPolicyRegistry {
   readonly #policies = new Map<string, InstalledModulePermissionPolicy>();
@@ -1034,6 +1163,89 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
     });
     RESERVED_V10_POLICY_SELECTIONS.set(selection, Object.freeze(policies));
     return selection;
+  }
+  resolveLiveBindingsFor(
+    installed: ReservedV10InstalledModulePlan,
+    permission: StartupAuthorityPermission,
+    context: StartupAuthorityPermissionContext,
+  ): readonly InstalledModulePermissionBinding[] {
+    assertReservedV10InstalledModulePlan(installed);
+    assertBindingAuthority(permission, context);
+    const identity = context.database.identity;
+    const seenReferences = new Set<string>();
+    const liveBindings = installed.module.permissionPolicyReferences.map((reference) => {
+      const referenceKey = `${reference.policyId}\u0000${reference.revision}`;
+      if (seenReferences.has(referenceKey)) {
+        throw unavailable(
+          "installed Module permission references contain a duplicate persistent identity",
+        );
+      }
+      seenReferences.add(referenceKey);
+      const policy = this.#policies.get(referenceKey);
+      if (policy === undefined) {
+        throw unavailable(
+          `installed Module permission policy ${reference.policyId}@${reference.revision} is not registered`,
+        );
+      }
+      const expectedDefinition = reservedV10InstalledPermissionPolicyDefinition(policy);
+      const matches = permission.policyBindings.filter((binding) =>
+        binding.policy_id === reference.policyId &&
+        binding.policy_definition_digest === binding.definition.definition_digest &&
+        binding.definition.policy_id === policy.policyId &&
+        canonicalJsonDigest(binding.definition.definition) === reference.revision &&
+        sameCanonicalJson(binding.definition.definition, expectedDefinition)
+      );
+      if (matches.length !== 1) {
+        throw unavailable(
+          `persistent permission binding for ${reference.policyId}@${reference.revision} is missing or ambiguous`,
+        );
+      }
+      const binding = matches[0]!;
+      const definition = deepFreeze({
+        ...binding.definition,
+        definition: cloneJson(binding.definition.definition),
+        origin: cloneJson(binding.definition.origin as unknown as JsonValue),
+      }) as unknown as PermissionPolicyDefinition;
+      const liveBinding = Object.freeze({
+        schemaVersion: "dolly.installed-module-permission-binding/1" as const,
+        daemonInstallationId: identity.daemonInstallationId,
+        instanceId: identity.instanceId,
+        controllerGenerationId: permission.controllerGenerationId,
+        configRevision: permission.configRevision,
+        configDigest: permission.configDigest,
+        premisesDigest: permission.premisesDigest,
+        policyId: binding.policy_id,
+        policyRevision: binding.policy_revision,
+        policyDefinitionDigest: binding.policy_definition_digest,
+        bindingId: binding.binding_id,
+        bindingRevision: binding.binding_revision,
+        bindingDigest: binding.binding_digest,
+        definition,
+        origin: binding.origin,
+      });
+      INSTALLED_MODULE_PERMISSION_BINDINGS.set(liveBinding, {
+        registry: this,
+        policy,
+        permission,
+        binding,
+      });
+      return liveBinding;
+    });
+    return Object.freeze(liveBindings);
+  }
+
+  assertLiveBinding(
+    value: unknown,
+    context: StartupAuthorityPermissionContext,
+  ): asserts value is InstalledModulePermissionBinding {
+    if (
+      value === null ||
+      typeof value !== "object" ||
+      INSTALLED_MODULE_PERMISSION_BINDINGS.get(value)?.registry !== this
+    ) {
+      throw unavailable("installed permission binding belongs to a different Host policy registry");
+    }
+    assertInstalledModulePermissionBinding(value, context);
   }
 }
 
