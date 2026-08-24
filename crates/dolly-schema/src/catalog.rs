@@ -108,7 +108,7 @@ impl SchemaCatalog {
     }
 
     /// Compute the catalog manifest digest: the SHA-256 digest of the
-    /// canonical JSON array of all 72 `$id`s, sorted lexicographically.
+    /// canonical JSON array of all 77 `$id`s, sorted lexicographically.
     pub fn manifest_digest(&self) -> Sha256Digest {
         let mut ids: Vec<&str> = self.entries.iter().map(|e| e.id.as_str()).collect();
         ids.sort();
