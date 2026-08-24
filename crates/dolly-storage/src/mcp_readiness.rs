@@ -14,16 +14,17 @@ use dolly_core_domain::{ExtensionGeneration, ExtensionId, WorkerEpoch};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use thiserror::Error;
-
+#[cfg(test)]
 use crate::Database;
+use crate::effect_journal::EffectJournalIntentAuthority;
 use crate::host_authority::{CurrentAuthoritySnapshot, HostAuthorityError, load_current_authority};
 use crate::linux_host_verification::{
     LinuxHostVerificationError, VerifiedLinuxHostProof, verify_current_linux_host,
 };
-use crate::runtime_binding::{
-    ProcessGeneration, RuntimeBinding, RuntimeBindingError, mint_runtime_binding,
-};
-
+use crate::runtime_binding::{ProcessGeneration, RuntimeBinding};
+#[cfg(test)]
+use crate::runtime_binding::mint_runtime_binding;
+use dolly_tool_broker::effect_journal::ExternalEffectJournalRecord;
 /// The only readiness evidence version understood by this private seam.
 pub const MCP_TRANSPORT_READINESS_SCHEMA: &str = "dolly.mcp-transport-readiness/v1";
 /// The only MCP protocol revision admitted by the frozen v1 Tool Broker.
@@ -352,7 +353,48 @@ struct McpTransportReadinessRecord {
 /// Mint private readiness from an already fresh, proof-bound runtime and
 /// process generation. The current durable Host premise and all authority
 /// rows are reloaded before the probe runs.
-pub fn prove_current_mcp_transport_readiness<P>(
+/// Prove readiness only after the durable initialize Claim is revalidated
+/// against the exact runtime/process/package and attested-child identity.
+pub fn prove_current_mcp_transport_readiness_with_intent<P>(
+    connection: &Connection,
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    server_id: &str,
+    probe: &mut P,
+    handshake_authority: &EffectJournalIntentAuthority,
+    handshake_intent: &ExternalEffectJournalRecord,
+    package_digest: &Sha256Digest,
+    attested_child_digest: &Sha256Digest,
+) -> Result<McpTransportReadiness, McpReadinessError>
+where
+    P: McpTransportProbe,
+{
+    handshake_authority
+        .verify_for_initialize(
+            connection,
+            handshake_intent,
+            runtime_binding,
+            process_generation,
+            package_digest,
+            server_id,
+            attested_child_digest,
+        )
+        .map_err(|_| {
+            McpReadinessError::refused(
+                McpReadinessCode::HandshakeIdentityMismatch,
+                "durable initialize Claim does not authorize this exact child",
+            )
+        })?;
+    prove_current_mcp_transport_readiness(
+        connection,
+        runtime_binding,
+        process_generation,
+        server_id,
+        probe,
+    )
+}
+
+pub(crate) fn prove_current_mcp_transport_readiness<P>(
     connection: &Connection,
     runtime_binding: &RuntimeBinding,
     process_generation: &ProcessGeneration,
@@ -433,7 +475,7 @@ where
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_prove_current_mcp_transport_readiness<P>(
     connection: &Connection,
     runtime_binding: &RuntimeBinding,
@@ -460,30 +502,44 @@ where
         },
     )
 }
-/// Full producer seam. It consumes the private live Linux Host proof, mints a
-/// fresh runtime binding and process generation, and only then admits the real
-/// MCP transport handshake as private readiness evidence.
-pub fn mint_current_mcp_transport_readiness<P>(
-    db: &mut Database,
-    extension_alias: ExtensionId,
+
+/// Test-only readiness producer with the same durable initialize Claim gate
+/// as production; only the Host-proof verifier is substituted.
+#[cfg(feature = "test-support")]
+pub fn test_prove_current_mcp_transport_readiness_with_intent<P>(
+    connection: &Connection,
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
     server_id: &str,
     probe: &mut P,
+    handshake_authority: &EffectJournalIntentAuthority,
+    handshake_intent: &ExternalEffectJournalRecord,
+    package_digest: &Sha256Digest,
+    attested_child_digest: &Sha256Digest,
 ) -> Result<McpTransportReadiness, McpReadinessError>
 where
     P: McpTransportProbe,
 {
-    let host_proof = verify_current_linux_host(db.connection()).map_err(|error| {
-        McpReadinessError::refused(McpReadinessCode::HostProofUnavailable, error.to_string())
-    })?;
-    let mut runtime_binding =
-        mint_runtime_binding(db, extension_alias, host_proof).map_err(map_runtime_binding_error)?;
-    let process_generation = runtime_binding
-        .mint_process_generation(db)
-        .map_err(map_runtime_binding_error)?;
-    prove_current_mcp_transport_readiness(
-        db.connection(),
-        &runtime_binding,
-        &process_generation,
+    handshake_authority
+        .verify_for_initialize(
+            connection,
+            handshake_intent,
+            runtime_binding,
+            process_generation,
+            package_digest,
+            server_id,
+            attested_child_digest,
+        )
+        .map_err(|_| {
+            McpReadinessError::refused(
+                McpReadinessCode::HandshakeIdentityMismatch,
+                "durable initialize Claim does not authorize this exact child",
+            )
+        })?;
+    test_prove_current_mcp_transport_readiness(
+        connection,
+        runtime_binding,
+        process_generation,
         server_id,
         probe,
     )
@@ -1137,18 +1193,6 @@ fn map_host_authority_error(error: HostAuthorityError) -> McpReadinessError {
     )
 }
 
-fn map_runtime_binding_error(error: RuntimeBindingError) -> McpReadinessError {
-    let code = match &error {
-        RuntimeBindingError::AuthorityMissing | RuntimeBindingError::AuthorityStateMissing => {
-            McpReadinessCode::RuntimeBindingMissing
-        }
-        RuntimeBindingError::BindingStale(_) | RuntimeBindingError::GenerationConflict { .. } => {
-            McpReadinessCode::RuntimeBindingStale
-        }
-        _ => McpReadinessCode::RuntimeBindingStale,
-    };
-    McpReadinessError::refused(code, error.to_string())
-}
 
 fn map_probe_error(error: McpTransportProbeError) -> McpReadinessError {
     match error {

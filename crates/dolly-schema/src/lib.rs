@@ -1,6 +1,6 @@
 //! Dolly schema catalog, bundle validator, and generated closed representations.
 //!
-//! This crate embeds the 72 Dolly JSON Schema documents, provides a bundle
+//! This crate embeds the 76 Dolly JSON Schema documents, provides a bundle
 //! validator that resolves `$ref` by `$id` (no network resolution), and
 //! exports generated closed representations for the three public stable roots:
 //! `BlockEnvelope`, `ActivationManifest`, and `ModuleDescriptor`.
@@ -13,11 +13,16 @@
 
 mod bundle;
 mod catalog;
+mod crop;
 mod generated;
 mod validator;
 
 pub use bundle::SchemaBundle;
 pub use catalog::{CatalogEntry, SchemaCatalog, schema_canonical_bytes, schema_digest};
+pub use crop::{
+    CROP_NORMALIZED_SCALE, CropError, CropErrorCode, CropRect, DisplaySize, ExifOrientation,
+    MAX_SUPPORTED_DIMENSION, MaterializedBounds, materialize_crop_bounds,
+};
 pub use generated::*;
 pub use validator::{SchemaError, SchemaValidator, ValidationErrors, ValidationIssue};
 

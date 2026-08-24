@@ -15,31 +15,31 @@
 //! stored transport identity, or corrupt bytes/digests change nothing and
 //! fail closed (`CasOutcome::Stale`, `StorageError::Corrupt`).
 //!
-//! The minimal `activations` and `config_revisions` parent tables are created
-//! with only the referenced key so the §5.10 foreign keys are real and
-//! enforced; their fuller column sets arrive with their own storage slices.
+//! The `activations` parent is created here only because the activation storage
+//! slice is not part of this module yet. Configuration revisions are different:
+//! `config_revision_mappings` is the Host-owned authority table and MUST already
+//! exist with its complete schema; this module never creates a parallel parent.
 
 use dolly_canonical_json::{ParseLimits, Sha256Digest, deserialize_core_json};
-use dolly_tool_broker::{
-    DispatchDisposition, LedgerState, RecoveryFacts, ToolCallLedgerRecord, recover_operation,
-};
-use rusqlite::{OptionalExtension, Row, Transaction};
+use dolly_tool_broker::{LedgerState, ToolCallLedgerRecord};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 
 use crate::database::map_sqlite_error;
 use crate::error::{StorageError, StorageResult};
+use crate::host_authority::HOST_AUTHORITY_SCHEMA_SQL;
 
 /// The logical table this slice writes.
 pub const TOOL_CALL_LEDGER_TABLE: &str = "tool_call_ledger";
+/// The Host-owned parent table for the retained configuration revision.
+pub const CONFIG_REVISION_MAPPINGS_TABLE: &str = "config_revision_mappings";
 
 /// The authoritative Tool-call ledger schema (storage-and-recovery §5.10):
-/// the minimum parent tables referenced by the foreign keys, the ledger
-/// table, and the recovery index. Idempotent (`IF NOT EXISTS`).
+/// the ledger-side activation parent, ledger table, and recovery index.
+/// Host-owned `config_revision_mappings` is verified separately and never
+/// created here. Idempotent (`IF NOT EXISTS`) for ledger-side objects.
 pub const TOOL_CALL_LEDGER_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS activations (
     activation_id TEXT PRIMARY KEY NOT NULL
-);
-CREATE TABLE IF NOT EXISTS config_revisions (
-    config_revision INTEGER PRIMARY KEY NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tool_call_ledger (
     instance_id                  TEXT    NOT NULL,
@@ -69,7 +69,8 @@ CREATE TABLE IF NOT EXISTS tool_call_ledger (
     PRIMARY KEY (module_id, operation_id),
     UNIQUE (tool_server_id, tool_server_generation, server_request_id),
     FOREIGN KEY (activation_id) REFERENCES activations(activation_id),
-    FOREIGN KEY (config_revision) REFERENCES config_revisions(config_revision),
+    FOREIGN KEY (config_revision)
+      REFERENCES config_revision_mappings(config_revision),
     CHECK (
         (state = 'AUTHORIZED' AND ledger_revision = 1
                                AND outbound_digest IS NULL
@@ -93,13 +94,401 @@ CREATE INDEX IF NOT EXISTS tool_call_ledger_recovery
 "#;
 
 /// Create the authoritative Tool-call ledger schema (table, parents, index).
+/// Existing objects are never repaired: their exact definitions and physical
+/// constraint/index properties are verified immediately and any mismatch fails
+/// closed.
 pub fn create_tool_ledger_schema(connection: &rusqlite::Connection) -> StorageResult<()> {
+    let expected = authoritative_schema_sql()?;
+    verify_existing_schema_sql(connection, "table", "activations", &expected.0)?;
+    verify_existing_schema_sql(connection, "table", TOOL_CALL_LEDGER_TABLE, &expected.2)?;
+    verify_existing_schema_sql(
+        connection,
+        "index",
+        "tool_call_ledger_recovery",
+        &expected.3,
+    )?;
+    require_existing_schema_sql(
+        connection,
+        "table",
+        CONFIG_REVISION_MAPPINGS_TABLE,
+        &expected.1,
+    )?;
+
+    // `IF NOT EXISTS` is only allowed to install genuinely missing objects.
+    // The Host mapping parent was checked above and is never created here;
+    // missing or malformed authority storage therefore fails before any
+    // ledger-side object can be installed.
     connection
         .execute_batch(TOOL_CALL_LEDGER_SCHEMA_SQL)
         .map_err(map_sqlite_error)?;
     connection
         .execute_batch(TOOL_CALL_LEDGER_RECOVERY_INDEX_SQL)
+        .map_err(map_sqlite_error)?;
+    gate_tool_ledger_schema(connection)
+}
+/// Build the expected sqlite_master definitions using the same authoritative
+/// SQL that the offline initializer uses. Comparing against this reference
+/// prevents a column-only lookalike from passing the physical schema gate.
+fn authoritative_schema_sql() -> StorageResult<(String, String, String, String)> {
+    let connection = Connection::open_in_memory().map_err(map_sqlite_error)?;
+    connection
+        .execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
+        .map_err(map_sqlite_error)?;
+    connection
+        .execute_batch(TOOL_CALL_LEDGER_SCHEMA_SQL)
+        .map_err(map_sqlite_error)?;
+    connection
+        .execute_batch(TOOL_CALL_LEDGER_RECOVERY_INDEX_SQL)
+        .map_err(map_sqlite_error)?;
+
+    let object_sql = |object_type: &str, name: &str| -> StorageResult<String> {
+        connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                rusqlite::params![object_type, name],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)
+    };
+    Ok((
+        object_sql("table", "activations")?,
+        object_sql("table", CONFIG_REVISION_MAPPINGS_TABLE)?,
+        object_sql("table", TOOL_CALL_LEDGER_TABLE)?,
+        object_sql("index", "tool_call_ledger_recovery")?,
+    ))
+}
+fn normalized_schema_sql(sql: &str) -> String {
+    // Preserve quoted literals: CHECK values such as `AUTHORIZED` are
+    // case-sensitive, so lowercasing the complete SQL would bless a replaced
+    // state constraint.
+    sql.split_whitespace().collect::<String>()
+}
+
+fn existing_schema_object(
+    connection: &rusqlite::Connection,
+    name: &str,
+) -> StorageResult<Option<(String, Option<String>)>> {
+    connection
+        .query_row(
+            "SELECT type, sql FROM sqlite_master WHERE name = ?1",
+            [name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
         .map_err(map_sqlite_error)
+}
+
+fn verify_existing_schema_sql(
+    connection: &rusqlite::Connection,
+    object_type: &str,
+    name: &str,
+    expected: &str,
+) -> StorageResult<()> {
+    match existing_schema_object(connection, name)? {
+        Some((actual_type, Some(actual)))
+            if actual_type == object_type
+                && normalized_schema_sql(&actual) == normalized_schema_sql(expected) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(StorageError::Corrupt),
+        None => Ok(()),
+    }
+}
+
+fn require_existing_schema_sql(
+    connection: &rusqlite::Connection,
+    object_type: &str,
+    name: &str,
+    expected: &str,
+) -> StorageResult<()> {
+    match existing_schema_object(connection, name)? {
+        Some((actual_type, Some(actual)))
+            if actual_type == object_type
+                && normalized_schema_sql(&actual) == normalized_schema_sql(expected) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(StorageError::Corrupt),
+        None => Err(StorageError::MigrationRequired),
+    }
+}
+
+fn verify_schema_objects(
+    connection: &rusqlite::Connection,
+    expected: &[(&str, &str, &str)],
+) -> StorageResult<()> {
+    let mut missing = false;
+    for (object_type, name, expected_sql) in expected {
+        match existing_schema_object(connection, name)? {
+            Some((actual_type, Some(actual)))
+                if actual_type == *object_type
+                    && normalized_schema_sql(&actual) == normalized_schema_sql(expected_sql) => {}
+            Some(_) => return Err(StorageError::Corrupt),
+            None => missing = true,
+        }
+    }
+    if missing {
+        Err(StorageError::MigrationRequired)
+    } else {
+        Ok(())
+    }
+}
+fn index_columns(connection: &rusqlite::Connection, index: &str) -> StorageResult<Vec<String>> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA index_info({index})"))
+        .map_err(map_sqlite_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, Option<String>>(2))
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    columns
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(StorageError::Corrupt)
+}
+
+fn verify_unique_constraints(connection: &rusqlite::Connection) -> StorageResult<()> {
+    let mut statement = connection
+        .prepare("PRAGMA index_list(tool_call_ledger)")
+        .map_err(map_sqlite_error)?;
+    let mut actual = Vec::new();
+    for row in statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(map_sqlite_error)?
+    {
+        let (name, unique, origin, partial) = row.map_err(map_sqlite_error)?;
+        if unique != 0 {
+            if partial != 0 || (origin != "pk" && origin != "u") {
+                return Err(StorageError::Corrupt);
+            }
+            actual.push((origin, index_columns(connection, &name)?));
+        }
+    }
+    actual.sort();
+
+    let mut expected = vec![
+        (
+            "pk".to_owned(),
+            vec!["module_id".to_owned(), "operation_id".to_owned()],
+        ),
+        ("u".to_owned(), vec!["confirmation_id".to_owned()]),
+        (
+            "u".to_owned(),
+            vec![
+                "tool_server_id".to_owned(),
+                "tool_server_generation".to_owned(),
+                "server_request_id".to_owned(),
+            ],
+        ),
+    ];
+    expected.sort();
+    if actual != expected {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(())
+}
+
+fn verify_foreign_keys(connection: &rusqlite::Connection) -> StorageResult<()> {
+    let mut statement = connection
+        .prepare("PRAGMA foreign_key_list(tool_call_ledger)")
+        .map_err(map_sqlite_error)?;
+    let mut actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    actual.sort();
+    let mut expected = vec![
+        (
+            "activations".to_owned(),
+            "activation_id".to_owned(),
+            "activation_id".to_owned(),
+            "NO ACTION".to_owned(),
+            "NO ACTION".to_owned(),
+            "NONE".to_owned(),
+        ),
+        (
+            CONFIG_REVISION_MAPPINGS_TABLE.to_owned(),
+            "config_revision".to_owned(),
+            "config_revision".to_owned(),
+            "NO ACTION".to_owned(),
+            "NO ACTION".to_owned(),
+            "NONE".to_owned(),
+        ),
+    ];
+    expected.sort();
+    if actual != expected {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(())
+}
+
+fn verify_recovery_index(connection: &rusqlite::Connection) -> StorageResult<()> {
+    let mut statement = connection
+        .prepare("PRAGMA index_list(tool_call_ledger)")
+        .map_err(map_sqlite_error)?;
+    let mut recovery = None;
+    for row in statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(map_sqlite_error)?
+    {
+        let (name, unique, origin, partial) = row.map_err(map_sqlite_error)?;
+        if name == "tool_call_ledger_recovery" {
+            recovery = Some((unique, origin, partial));
+            break;
+        }
+    }
+    if recovery != Some((0, "c".to_owned(), 0)) {
+        return Err(StorageError::Corrupt);
+    }
+    if index_columns(connection, "tool_call_ledger_recovery")?
+        != vec![
+            "state".to_owned(),
+            "module_id".to_owned(),
+            "operation_id".to_owned(),
+        ]
+    {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(())
+}
+
+/// Verify the physical Tool-call ledger schema before any recovery query.
+/// Missing objects are migration-required; malformed objects are corrupt.
+pub fn gate_tool_ledger_schema(connection: &rusqlite::Connection) -> StorageResult<()> {
+    let expected = authoritative_schema_sql()?;
+    verify_schema_objects(
+        connection,
+        &[
+            ("table", "activations", &expected.0),
+            ("table", CONFIG_REVISION_MAPPINGS_TABLE, &expected.1),
+            ("table", TOOL_CALL_LEDGER_TABLE, &expected.2),
+            ("index", "tool_call_ledger_recovery", &expected.3),
+        ],
+    )?;
+    verify_required_columns(
+        connection,
+        "activations",
+        &[("activation_id", "TEXT", 1, 1)],
+        false,
+    )?;
+    verify_required_columns(
+        connection,
+        CONFIG_REVISION_MAPPINGS_TABLE,
+        &[
+            ("config_revision", "INTEGER", 0, 1),
+            ("daemon_installation_id", "TEXT", 1, 0),
+            ("instance_id", "TEXT", 1, 0),
+            ("config_digest", "TEXT", 1, 0),
+            ("canonical_bytes", "BLOB", 1, 0),
+        ],
+        true,
+    )?;
+    verify_required_columns(
+        connection,
+        TOOL_CALL_LEDGER_TABLE,
+        &[
+            ("instance_id", "TEXT", 1, 0),
+            ("module_id", "TEXT", 1, 1),
+            ("operation_id", "TEXT", 1, 2),
+            ("ledger_revision", "INTEGER", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("activation_id", "TEXT", 1, 0),
+            ("config_revision", "INTEGER", 1, 0),
+            ("tool_server_id", "TEXT", 1, 0),
+            ("tool_name", "TEXT", 1, 0),
+            ("tool_server_generation", "INTEGER", 1, 0),
+            ("server_request_id", "TEXT", 1, 0),
+            ("request_digest", "TEXT", 1, 0),
+            ("operation_digest", "TEXT", 1, 0),
+            ("outbound_digest", "TEXT", 0, 0),
+            ("idempotency_argument_pointer", "TEXT", 0, 0),
+            ("confirmation_id", "TEXT", 0, 0),
+            ("terminal_result_digest", "TEXT", 0, 0),
+            ("record_jcs", "BLOB", 1, 0),
+            ("record_digest", "TEXT", 1, 0),
+        ],
+        true,
+    )?;
+    verify_unique_constraints(connection)?;
+    verify_foreign_keys(connection)?;
+    verify_recovery_index(connection)?;
+    Ok(())
+}
+
+fn verify_required_columns(
+    connection: &rusqlite::Connection,
+    table: &str,
+    expected: &[(&str, &str, i64, i64)],
+    exact: bool,
+) -> StorageResult<()> {
+    let exists: Option<String> = connection
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    if exists.is_none() {
+        return Err(StorageError::MigrationRequired);
+    }
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(map_sqlite_error)?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    if (exact && actual.len() != expected.len())
+        || actual.len() < expected.len()
+        || actual
+            .iter()
+            .take(expected.len())
+            .zip(expected)
+            .any(|(actual, expected)| {
+                actual.0 != expected.0
+                    || actual.1 != expected.1
+                    || actual.2 != expected.2
+                    || actual.3 != expected.3
+            })
+    {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(())
 }
 
 /// The result of inserting an `AUTHORIZED` ledger row.
@@ -403,7 +792,7 @@ pub fn load_exact(
     verify_row(row).map(Some)
 }
 
-fn load_verified_inner(
+pub(crate) fn load_verified_inner(
     transaction: &Transaction,
     module_id: &str,
     operation_id: &str,
@@ -516,6 +905,7 @@ fn verify_row(row: &Row) -> StorageResult<ToolCallLedgerRecord> {
 pub fn enumerate_nonterminal(
     connection: &rusqlite::Connection,
 ) -> StorageResult<Vec<ToolCallLedgerRecord>> {
+    gate_tool_ledger_schema(connection)?;
     let mut stmt = connection
         .prepare(ENUMERATE_SQL)
         .map_err(map_sqlite_error)?;
@@ -535,12 +925,3 @@ const ENUMERATE_SQL: &str = "SELECT instance_id, module_id, operation_id, ledger
              FROM tool_call_ledger
              WHERE state IN ('AUTHORIZED', 'DISPATCHED')
              ORDER BY module_id, operation_id";
-
-/// Apply the spec §6 pure recovery decision to one stored nonterminal row
-/// (pure, no I/O; the caller then compare-and-sets the proposal).
-pub fn propose_recovery(
-    record: &ToolCallLedgerRecord,
-    facts: &RecoveryFacts,
-) -> DispatchDisposition {
-    recover_operation(record, facts)
-}

@@ -23,7 +23,9 @@ use dolly_canonical_json::{
     CanonicalJsonValue, ParseLimits, Sha256Digest, canonicalize, parse_core_json,
 };
 use dolly_schema::SchemaValidator;
-use dolly_storage::mcp_readiness::McpTransportReadiness;
+use dolly_storage::mcp_readiness::{
+    McpTransportReadiness, prove_current_mcp_transport_readiness_with_intent,
+};
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::{
     ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
@@ -33,6 +35,8 @@ use dolly_storage::tool_ledger::{
     CasKey, CasOutcome, TransportCorrelation, cas_terminal, load_exact,
 };
 use dolly_storage::{Database, StorageError};
+use dolly_storage::effect_journal::EffectJournalIntentAuthority;
+use dolly_tool_broker::effect_journal::ExternalEffectJournalRecord;
 use dolly_tool_broker::{
     ErrorOutcome, LedgerState, ToolCallLedgerRecord, ToolError, ToolErrorCode,
     ToolOperationBinding, ToolResult, ToolStatus,
@@ -40,6 +44,10 @@ use dolly_tool_broker::{
 use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 
+use crate::mcp_stdio::{
+    HostMcpStdioProcessHandle, HostOwnedMcpStdioSession, McpStdioProbe, StdioTransportLimits,
+    absolute_deadline,
+};
 use crate::permit::{SendPermit, SendPermitBinding};
 
 /// Closed bounds on a response the service will admit (tool-broker §3/§6).
@@ -74,6 +82,38 @@ pub trait ToolTransport {
     /// exact bytes the service verified against the permit's outbound
     /// digest before this call.
     fn call(&mut self, request_bytes: &[u8]) -> TransportOutcome;
+
+    /// Abort the shared transport/process control after the permit has been
+    /// consumed and a request cannot be admitted or durably settled.
+    fn abort(&mut self) {}
+}
+
+struct AbortTransport;
+
+impl ToolTransport for AbortTransport {
+    fn call(&mut self, _request_bytes: &[u8]) -> TransportOutcome {
+        TransportOutcome::Error("stdio admission aborted".to_owned())
+    }
+
+    fn abort(&mut self) {}
+}
+
+struct ReusableMcpStdioTransport<'a> {
+    probe: &'a mut McpStdioProbe,
+    readiness: &'a McpTransportReadiness,
+    authority: &'a ToolDispatchAuthority,
+    permit: &'a SendPermitBinding,
+}
+
+impl ToolTransport for ReusableMcpStdioTransport<'_> {
+    fn call(&mut self, request_bytes: &[u8]) -> TransportOutcome {
+        self.probe
+            .call_reusable(self.readiness, self.authority, self.permit, request_bytes)
+    }
+
+    fn abort(&mut self) {
+        self.probe.abort();
+    }
 }
 
 /// The result of one [`ToolDispatchService::dispatch`].
@@ -117,6 +157,18 @@ pub enum ServiceError {
     Storage(StorageError),
 }
 
+#[derive(Debug)]
+pub(crate) enum StdioDispatchError {
+    Service(ServiceError),
+}
+
+impl StdioDispatchError {
+    pub(crate) fn message(&self) -> String {
+        let Self::Service(error) = self;
+        format!("MCP service: {error:?}")
+    }
+}
+
 /// The single transport-facing entry point of the coordinator.
 pub struct ToolDispatchService {
     limits: DispatchLimits,
@@ -144,36 +196,232 @@ impl ToolDispatchService {
         self.dispatch_inner(db, permit, request_bytes, transport)
     }
 
-    /// The registry/generation producer is checked before any permit is
-    /// consumed or transport call. A mismatch mutates neither the ledger nor
-    /// the permit; no downstream result can manufacture a replacement.
-    pub fn dispatch_authorized(
+    /// Production coordinator invocation for one Host-owned MCP stdio
+    /// composition. The separately retained process handle is passed
+    /// explicitly so the transport cannot accidentally become the lifecycle
+    /// owner.
+    pub(crate) fn dispatch_authorized(
         &self,
         db: &mut Database,
         authority: &ToolDispatchAuthority,
         runtime_binding: &RuntimeBinding,
         process_generation: &ProcessGeneration,
         readiness: &McpTransportReadiness,
+        handshake_authority: &EffectJournalIntentAuthority,
+        handshake_intent: &ExternalEffectJournalRecord,
+        attestation_digest: &Sha256Digest,
+        host_session: HostOwnedMcpStdioSession,
+        host_handle: HostMcpStdioProcessHandle,
+        limits: StdioTransportLimits,
         permit: SendPermit,
         request_bytes: &[u8],
-        transport: &mut dyn ToolTransport,
-    ) -> Result<ServiceOutcome, ServiceError> {
-        revalidate_tool_dispatch_authority(
+    ) -> Result<ServiceOutcome, StdioDispatchError> {
+        self.dispatch_stdio_authorized(
+            db,
+            authority,
+            runtime_binding,
+            process_generation,
+            readiness,
+            handshake_authority,
+            handshake_intent,
+            attestation_digest,
+            host_session,
+            host_handle,
+            limits,
+            permit,
+            request_bytes,
+        )
+    }
+    /// Route a session that the Worker initialized and proved before the
+    /// permit was issued. No response or readiness fact can mint authority;
+    /// the permit and current authority are still revalidated here.
+    pub(crate) fn dispatch_prepared(
+        &self,
+        db: &mut Database,
+        authority: &ToolDispatchAuthority,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        readiness: &McpTransportReadiness,
+        mut probe: McpStdioProbe,
+        host_handle: HostMcpStdioProcessHandle,
+        _limits: StdioTransportLimits,
+        permit: SendPermit,
+        request_bytes: &[u8],
+    ) -> Result<ServiceOutcome, StdioDispatchError> {
+        if revalidate_tool_dispatch_authority(
             db,
             authority,
             runtime_binding,
             process_generation,
             readiness,
         )
-        .map_err(ServiceError::Authority)?;
-        validate_dispatch_binding(
+        .is_err()
+            || validate_dispatch_binding(
+                authority,
+                permit.binding().config_revision,
+                &permit.binding().tool_server_id,
+                permit.binding().tool_server_generation,
+            )
+            .is_err()
+        {
+            probe.abort();
+            return self.settle_admission_unknown(db, host_handle, permit, request_bytes);
+        }
+        let deadline = match absolute_deadline(&permit.binding().authorized_deadline) {
+            Ok(deadline) => deadline,
+            Err(_) => {
+                probe.abort();
+                return self.settle_admission_unknown(db, host_handle, permit, request_bytes);
+            }
+        };
+        probe.set_deadline(deadline);
+        let permit_binding = permit.binding().clone();
+        let mut transport = match probe.into_transport(&readiness, authority, &permit_binding) {
+            Ok(transport) => transport,
+            Err(_) => return self.settle_admission_unknown(db, host_handle, permit, request_bytes),
+        };
+        self.dispatch_inner(db, permit, request_bytes, &mut transport)
+            .map_err(StdioDispatchError::Service)
+    }
+
+    pub(crate) fn dispatch_prepared_reusable(
+        &self,
+        db: &mut Database,
+        authority: &ToolDispatchAuthority,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        readiness: &McpTransportReadiness,
+        probe: &mut McpStdioProbe,
+        host_handle: HostMcpStdioProcessHandle,
+        permit: SendPermit,
+        request_bytes: &[u8],
+    ) -> Result<ServiceOutcome, StdioDispatchError> {
+        if revalidate_tool_dispatch_authority(
+            db,
             authority,
-            permit.binding().config_revision as i64,
-            &permit.binding().tool_server_id,
-            permit.binding().tool_server_generation,
+            runtime_binding,
+            process_generation,
+            readiness,
         )
-        .map_err(ServiceError::Authority)?;
-        self.dispatch_inner(db, permit, request_bytes, transport)
+        .is_err()
+            || validate_dispatch_binding(
+                authority,
+                permit.binding().config_revision,
+                &permit.binding().tool_server_id,
+                permit.binding().tool_server_generation,
+            )
+            .is_err()
+        {
+            probe.abort();
+            return self.settle_admission_unknown(db, host_handle, permit, request_bytes);
+        }
+        let deadline = match absolute_deadline(&permit.binding().authorized_deadline) {
+            Ok(deadline) => deadline,
+            Err(_) => {
+                probe.abort();
+                return self.settle_admission_unknown(db, host_handle, permit, request_bytes);
+            }
+        };
+        probe.set_deadline(deadline);
+        let permit_binding = permit.binding().clone();
+        let mut transport = ReusableMcpStdioTransport {
+            probe,
+            readiness,
+            authority,
+            permit: &permit_binding,
+        };
+        self.dispatch_inner(db, permit, request_bytes, &mut transport)
+            .map_err(StdioDispatchError::Service)
+    }
+
+    /// Host-owned stdio composition: readiness is freshly proven against the
+    /// current Runtime binding/process generation before this exact permit is
+    /// routed through the authority-checked dispatch path.
+    pub(crate) fn dispatch_stdio_authorized(
+        &self,
+        db: &mut Database,
+        authority: &ToolDispatchAuthority,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        readiness: &McpTransportReadiness,
+        handshake_authority: &EffectJournalIntentAuthority,
+        handshake_intent: &ExternalEffectJournalRecord,
+        attestation_digest: &Sha256Digest,
+        host_session: HostOwnedMcpStdioSession,
+        host_handle: HostMcpStdioProcessHandle,
+        limits: StdioTransportLimits,
+        permit: SendPermit,
+        request_bytes: &[u8],
+    ) -> Result<ServiceOutcome, StdioDispatchError> {
+        if revalidate_tool_dispatch_authority(
+            db,
+            authority,
+            runtime_binding,
+            process_generation,
+            readiness,
+        )
+        .is_err()
+            || validate_dispatch_binding(
+                authority,
+                permit.binding().config_revision,
+                &permit.binding().tool_server_id,
+                permit.binding().tool_server_generation,
+            )
+            .is_err()
+        {
+            return self.settle_admission_unknown(db, host_handle, permit, request_bytes);
+        }
+        let deadline = match absolute_deadline(&permit.binding().authorized_deadline) {
+            Ok(deadline) => deadline,
+            Err(_) => return self.settle_admission_unknown(db, host_handle, permit, request_bytes),
+        };
+        let server_id = permit.binding().tool_server_id.clone();
+        let mut probe = match McpStdioProbe::from_host_session(
+            host_session,
+            host_handle.clone(),
+            limits,
+            deadline,
+        ) {
+            Ok(probe) => probe,
+            Err(_) => return self.settle_admission_unknown(db, host_handle, permit, request_bytes),
+        };
+        let readiness = match prove_current_mcp_transport_readiness_with_intent(
+            db.connection(),
+            runtime_binding,
+            process_generation,
+            &server_id,
+            &mut probe,
+            handshake_authority,
+            handshake_intent,
+            &handshake_intent.package_digest,
+            attestation_digest,
+        ) {
+            Ok(readiness) => readiness,
+            Err(_) => {
+                probe.abort();
+                return self.settle_admission_unknown(db, host_handle, permit, request_bytes);
+            }
+        };
+        let permit_binding = permit.binding().clone();
+        let mut transport = match probe.into_transport(&readiness, authority, &permit_binding) {
+            Ok(transport) => transport,
+            Err(_) => return self.settle_admission_unknown(db, host_handle, permit, request_bytes),
+        };
+        self.dispatch_inner(db, permit, request_bytes, &mut transport)
+            .map_err(StdioDispatchError::Service)
+    }
+
+    pub(crate) fn settle_admission_unknown(
+        &self,
+        db: &mut Database,
+        host_handle: HostMcpStdioProcessHandle,
+        permit: SendPermit,
+        request_bytes: &[u8],
+    ) -> Result<ServiceOutcome, StdioDispatchError> {
+        host_handle.terminate();
+        let mut transport = AbortTransport;
+        self.dispatch_inner(db, permit, request_bytes, &mut transport)
+            .map_err(StdioDispatchError::Service)
     }
 
     fn dispatch_inner(
@@ -185,14 +433,21 @@ impl ToolDispatchService {
     ) -> Result<ServiceOutcome, ServiceError> {
         let binding = permit.consume();
 
-        let current = load_exact(db.connection(), &binding.module_id, &binding.operation_id)
-            .map_err(ServiceError::Storage)?;
+        let current = match load_exact(db.connection(), &binding.module_id, &binding.operation_id) {
+            Ok(current) => current,
+            Err(error) => {
+                transport.abort();
+                return Err(ServiceError::Storage(error));
+            }
+        };
         let Some(current) = current else {
+            transport.abort();
             return Ok(ServiceOutcome::Stale {
                 authoritative: None,
             });
         };
         if current.state != LedgerState::Dispatched {
+            transport.abort();
             return Ok(ServiceOutcome::Stale {
                 authoritative: Some(current),
             });
@@ -201,8 +456,10 @@ impl ToolDispatchService {
         if Sha256Digest::compute(request_bytes) != binding.outbound_digest {
             // Fail closed with NO transport call: the caller did not supply
             // the exact bytes whose digest was durably bound at dispatch.
+            transport.abort();
             let result = unknown_outcome_result(&binding);
-            return self.settle(db, &current, Terminal::unknown(result));
+            let settled = self.settle(db, &current, Terminal::unknown(result));
+            return settled;
         }
 
         match transport.call(request_bytes) {
@@ -210,23 +467,31 @@ impl ToolDispatchService {
                 match self.classify(&bytes, &current.operation_binding) {
                     Classification::Succeeded(output) => {
                         let result = succeeded_result(&binding, output);
-                        self.settle(db, &current, Terminal::succeeded(result))
+                        let settled = self.settle(db, &current, Terminal::succeeded(result));
+                        abort_if_settlement_not_committed(transport, &settled);
+                        settled
                     }
                     Classification::OutputInvalid => {
+                        transport.abort();
                         let result = output_invalid_result(&binding);
-                        self.settle(db, &current, Terminal::failed(result))
+                        let settled = self.settle(db, &current, Terminal::failed(result));
+                        settled
                     }
                     Classification::Rejected => {
+                        transport.abort();
                         let result = unknown_outcome_result(&binding);
-                        self.settle(db, &current, Terminal::unknown(result))
+                        let settled = self.settle(db, &current, Terminal::unknown(result));
+                        settled
                     }
                 }
             }
             TransportOutcome::Timeout
             | TransportOutcome::Disconnect
             | TransportOutcome::Error(_) => {
+                transport.abort();
                 let result = unknown_outcome_result(&binding);
-                self.settle(db, &current, Terminal::unknown(result))
+                let settled = self.settle(db, &current, Terminal::unknown(result));
+                settled
             }
         }
     }
@@ -333,6 +598,14 @@ impl ToolDispatchService {
             }),
             Err(error) => Err(ServiceError::Storage(error)),
         }
+    }
+}
+fn abort_if_settlement_not_committed(
+    transport: &mut dyn ToolTransport,
+    settled: &Result<ServiceOutcome, ServiceError>,
+) {
+    if !matches!(settled.as_ref(), Ok(ServiceOutcome::Succeeded { .. })) {
+        transport.abort();
     }
 }
 

@@ -786,6 +786,10 @@ fn execute(vector: &Value) -> (Value, Value, String, Vec<Value>) {
                 vec![
                     flatten(&results[0].events[0]),
                     json!({"event":"SecurityIncident","reason":results[2].error.as_ref().unwrap().code}),
+                    {
+                        let third = results[2].error.as_ref().unwrap();
+                        json!({"error":third.code,"retryable":third.retryable,"outcome":third.outcome})
+                    },
                 ],
             )
         }

@@ -18,15 +18,20 @@ use dolly_storage::tool_ledger::{
     LedgerInsertDisposition, create_tool_ledger_schema, enumerate_nonterminal, insert_authorized,
 };
 use dolly_tool_broker::{
-    ConfirmationDecision, IdempotencyPolicy, LedgerState, RecoveryFacts, SideEffectClass,
-    ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag, ToolStatus,
+    ConfirmationDecision, IdempotencyPolicy, LedgerState, SideEffectClass, ToolCallLedgerRecord,
+    ToolOperationBinding, ToolOperationBindingSchemaTag, ToolStatus,
 };
+use crate::ports::{RecoveryFacts, RecoveryProof};
 use dolly_tool_coordinator::{
     DispatchLimits, DispatchOutcome, ServiceOutcome, ToolDispatchService, ToolTransport,
     TransportOutcome,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
+
+fn dispatch_proof() -> RecoveryFacts {
+    RecoveryFacts::from_proof(RecoveryProof::coordinator_dispatch_ready())
+}
 
 fn digest(hex: u8) -> Sha256Digest {
     format!("sha256:{:064x}", hex as u128)
@@ -171,10 +176,19 @@ fn seed_parents(conn: &Connection) {
     )
     .expect("seed activation");
     conn.execute(
-        "INSERT OR IGNORE INTO config_revisions (config_revision) VALUES (?1)",
-        rusqlite::params![11_i64],
+        "INSERT OR IGNORE INTO config_revision_mappings (
+             config_revision, daemon_installation_id, instance_id,
+             config_digest, canonical_bytes
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            11_i64,
+            "daemon-test",
+            "instance-test",
+            "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            &b"{}"[..],
+        ],
     )
-    .expect("seed config revision");
+    .expect("config revision mapping parent");
 }
 
 fn insert_authorized_row(db: &mut Database, record: &ToolCallLedgerRecord) {
@@ -195,11 +209,7 @@ fn dispatch_permit(
     db: &mut Database,
     record: &ToolCallLedgerRecord,
 ) -> dolly_tool_coordinator::SendPermit {
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = dispatch_proof();
     match dolly_tool_coordinator::dispatch_operation(db, record, &facts)
         .expect("dispatch must settle")
     {
@@ -243,6 +253,7 @@ fn bound_request_bytes(record: &ToolCallLedgerRecord) -> Vec<u8> {
 /// Spy transport: counts calls and remembers the exact bytes it received.
 struct Spy {
     calls: usize,
+    aborts: usize,
     bytes: Vec<u8>,
     outcome: TransportOutcome,
 }
@@ -251,6 +262,7 @@ impl Spy {
     fn serving(outcome: TransportOutcome) -> Self {
         Self {
             calls: 0,
+            aborts: 0,
             bytes: Vec::new(),
             outcome,
         }
@@ -262,6 +274,10 @@ impl ToolTransport for Spy {
         self.calls += 1;
         self.bytes.extend_from_slice(request_bytes);
         self.outcome.clone()
+    }
+
+    fn abort(&mut self) {
+        self.aborts += 1;
     }
 }
 
@@ -330,7 +346,10 @@ fn valid_response_persists_succeeded_one_call_no_redispatch() {
         .expect("bound digest");
     match outcome {
         ServiceOutcome::Succeeded { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(
+                spy.aborts, 0,
+                "successful committed response keeps Host owner alive"
+            );
             assert_eq!(
                 Sha256Digest::compute(&spy.bytes),
                 expected_digest,
@@ -378,7 +397,10 @@ fn complete_output_schema_violation_persists_failed_applied() {
     );
     match outcome {
         ServiceOutcome::Failed { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(
+                spy.aborts, 1,
+                "schema-invalid response aborts shared control"
+            );
             assert_eq!(record.state, LedgerState::Failed);
             assert_eq!(result.status, ToolStatus::Failed);
             assert_eq!(result.output, Value::Null);
@@ -407,7 +429,7 @@ fn timeout_disconnect_and_error_persist_unknown_one_call_no_redispatch() {
         let (dir, _authorized, outcome, spy) = run_with(None, response);
         match outcome {
             ServiceOutcome::Unknown { record, result } => {
-                assert_eq!(spy.calls, 1, "exactly one transport call");
+                assert_eq!(spy.aborts, 1, "post-call failure aborts shared control");
                 assert_unknown(&record, &result);
             }
             other => panic!("expected Unknown, got {other:?}"),
@@ -430,7 +452,7 @@ fn wrong_request_id_persists_unknown() {
     );
     match outcome {
         ServiceOutcome::Unknown { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(spy.aborts, 1, "correlation failure aborts shared control");
             assert_unknown(&record, &result);
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -455,7 +477,7 @@ fn malformed_or_extra_member_response_persists_unknown() {
         let (dir, _authorized, outcome, spy) = run_with(None, TransportOutcome::Response(body));
         match outcome {
             ServiceOutcome::Unknown { record, result } => {
-                assert_eq!(spy.calls, 1, "exactly one transport call");
+                assert_eq!(spy.aborts, 1, "protocol failure aborts shared control");
                 assert_unknown(&record, &result);
             }
             other => panic!("expected Unknown, got {other:?}"),
@@ -481,7 +503,7 @@ fn response_byte_overflow_persists_unknown() {
         run_with(None, TransportOutcome::Response(huge.into_bytes()));
     match outcome {
         ServiceOutcome::Unknown { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(spy.aborts, 1, "response-size failure aborts shared control");
             assert_unknown(&record, &result);
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -503,7 +525,7 @@ fn response_member_overflow_persists_unknown() {
         run_with(None, TransportOutcome::Response(body.into_bytes()));
     match outcome {
         ServiceOutcome::Unknown { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(spy.aborts, 1, "member-bound failure aborts shared control");
             assert_unknown(&record, &result);
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -522,7 +544,7 @@ fn response_depth_overflow_persists_unknown() {
         run_with(None, TransportOutcome::Response(body.into_bytes()));
     match outcome {
         ServiceOutcome::Unknown { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(spy.aborts, 1, "depth-bound failure aborts shared control");
             assert_unknown(&record, &result);
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -542,7 +564,7 @@ fn outbound_digest_mismatch_zero_transport_calls_fails_closed() {
     );
     match outcome {
         ServiceOutcome::Unknown { record, result } => {
-            assert_eq!(spy.calls, 0, "transport never consulted on digest mismatch");
+            assert_eq!(spy.aborts, 1, "digest failure aborts shared control");
             assert_unknown(&record, &result);
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -578,7 +600,7 @@ fn arbitrary_upstream_error_envelope_persists_unknown_one_call_no_redispatch() {
     let (dir, _authorized, outcome, spy) = run_with(None, TransportOutcome::Response(envelope));
     match outcome {
         ServiceOutcome::Unknown { record, result } => {
-            assert_eq!(spy.calls, 1, "exactly one transport call");
+            assert_eq!(spy.aborts, 1, "upstream error aborts shared control");
             assert_unknown(&record, &result);
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -640,7 +662,10 @@ fn already_settled_row_returns_stale_and_never_calls_transport() {
         .expect("service must settle");
     match outcome {
         ServiceOutcome::Stale { authoritative } => {
-            assert_eq!(spy.calls, 0, "no transport call on an already-settled row");
+            assert_eq!(
+                spy.aborts, 1,
+                "stale post-permit path aborts shared control"
+            );
             assert_eq!(
                 authoritative.expect("authoritative row").state,
                 LedgerState::Unknown

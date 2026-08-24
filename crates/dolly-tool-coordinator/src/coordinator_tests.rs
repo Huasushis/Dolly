@@ -8,26 +8,49 @@
 //! DISPATCHED` compare-and-set; stale/error/lost-ack/unknown observe no
 //! permit.
 
+use std::process::Child;
+
 use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
+use dolly_storage::effect_journal::EffectJournalIntentAuthority;
 use dolly_storage::mcp_readiness::McpTransportReadiness;
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::ToolDispatchAuthority;
 use dolly_storage::tool_ledger::{
-    CasKey, LedgerInsertDisposition, TransportCorrelation, create_tool_ledger_schema,
-    enumerate_nonterminal, insert_authorized, load_exact,
+    CasKey, LedgerInsertDisposition, TransportCorrelation, cas_to_dispatched,
+    create_tool_ledger_schema, enumerate_nonterminal, insert_authorized, load_exact,
 };
 use dolly_storage::{Database, StorageError};
 use dolly_tool_broker::{
-    ConfirmationDecision, IdempotencyPolicy, LedgerState, RecoveryFacts, SideEffectClass,
-    ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag,
+    ConfirmationDecision, IdempotencyPolicy, LedgerState, SideEffectClass, ToolCallLedgerRecord,
+    ToolOperationBinding, ToolOperationBindingSchemaTag,
+};
+use crate::ports::{
+    Clock, FencedFactsProvider, GenerationReadiness, RecoveryFacts, RecoveryProof,
 };
 use dolly_tool_coordinator::{
-    DispatchError, DispatchOutcome, FencedFactsProvider, RecoveryFactsProvider, RecoveryOutcome,
-    dispatch_operation, reopen_recovery,
+    DispatchError, DispatchOutcome, HostMcpStdioInstalledChildAttestation,
+    HostMcpStdioInvocation, HostMcpStdioProcessHandle, StdioTransportError, StdioTransportLimits,
+    ToolDispatchService, dispatch_operation, dispatch_operation_authorized, load_authoritative_row,
+    reopen_recovery,
 };
 use rusqlite::Connection;
 use serde_json::json;
 
+
+fn facts(
+    _record: &ToolCallLedgerRecord,
+    zero_bytes_proved: bool,
+    exact_generation_ready: bool,
+    deadline_expired: bool,
+) -> RecoveryFacts {
+    let proof = match (zero_bytes_proved, exact_generation_ready, deadline_expired) {
+        (true, true, false) => RecoveryProof::coordinator_dispatch_ready(),
+        (true, false, false) => RecoveryProof::coordinator_dispatch_unready(),
+        (true, _, true) => RecoveryProof::coordinator_dispatch_expired(),
+        _ => RecoveryProof::coordinator_reopen(),
+    };
+    RecoveryFacts::from_proof(proof)
+}
 fn digest(hex: u8) -> Sha256Digest {
     format!("sha256:{:064x}", hex as u128)
         .parse()
@@ -203,10 +226,19 @@ fn seed_parents(conn: &Connection) {
     )
     .expect("seed activation");
     conn.execute(
-        "INSERT OR IGNORE INTO config_revisions (config_revision) VALUES (?1)",
-        rusqlite::params![11_i64],
+        "INSERT OR IGNORE INTO config_revision_mappings (
+             config_revision, daemon_installation_id, instance_id,
+             config_digest, canonical_bytes
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            11_i64,
+            "daemon-test",
+            "instance-test",
+            "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            &b"{}"[..],
+        ],
     )
-    .expect("seed config revision");
+    .expect("config revision mapping parent");
 }
 
 fn insert_authorized_row(db: &mut Database, record: &ToolCallLedgerRecord) {
@@ -226,11 +258,7 @@ fn dispatch_with_proof(
     db: &mut Database,
     record: &ToolCallLedgerRecord,
 ) -> dolly_tool_coordinator::SendPermitBinding {
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = facts(record, true, true, false);
     match dispatch_operation(db, record, &facts).expect("dispatch must settle") {
         DispatchOutcome::Dispatched { record: _, permit } => permit
             .expect("permit after committed proof dispatch")
@@ -322,12 +350,7 @@ fn no_permit_on_stale_or_ambiguous() {
 
     // The coordinator knows only the stale snapshot; the facts even permit a
     // send. A stale CAS returns `Stale` with the authoritative row and no
-    // permit; the caller reruns the pure decision on that row (spec §6).
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = facts(&authorized, true, true, false);
     let authoritative = match dispatch_operation(&mut db, &authorized, &facts).expect("must settle")
     {
         DispatchOutcome::Stale { authoritative } => authoritative,
@@ -367,12 +390,7 @@ fn no_permit_on_ambiguous_no_proof() {
     insert_authorized_row(&mut db, &authorized);
 
     // Without zero-byte proof the first CAS crosses DISPATCHED without a
-    // permit; the second pure decision terminalizes UNKNOWN.
-    let facts = RecoveryFacts {
-        zero_bytes_proved: false,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = facts(&authorized, false, true, false);
     let first = dispatch_operation(&mut db, &authorized, &facts).expect("dispatch settles");
     match first {
         DispatchOutcome::Dispatched { permit: None, .. } => {}
@@ -421,11 +439,7 @@ fn dispatched_row_reopens_unknown_no_redispatch() {
     let dispatched = load_exact(db.connection(), "module-a", OP_A)
         .expect("load")
         .expect("present");
-    let facts = RecoveryFacts {
-        zero_bytes_proved: false,
-        exact_generation_ready: false,
-        deadline_expired: false,
-    };
+    let facts = facts(&dispatched, false, false, false);
     match dispatch_operation(&mut db, &dispatched, &facts).expect("recovery settles") {
         DispatchOutcome::Terminalized { record } => {
             assert_eq!(record.state, LedgerState::Unknown);
@@ -463,14 +477,10 @@ fn authorized_reopen_with_proof_at_most_one_dispatch() {
     let authorized = authorized_record(OP_A, REQ);
     insert_authorized_row(&mut db, &authorized);
     drop(db);
+    let mut db = open_db(dir.path());
 
     // First dispatch: proof permits exactly one committed send transition.
-    let mut db = open_db(dir.path());
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = facts(&authorized, true, true, false);
     let outcome = dispatch_operation(&mut db, &authorized, &facts).expect("dispatch settles");
     let binding = match outcome {
         DispatchOutcome::Dispatched {
@@ -516,13 +526,9 @@ fn authorized_with_proof_and_dead_generation_fails_not_applied() {
     let authorized = authorized_record(OP_A, REQ);
     insert_authorized_row(&mut db, &authorized);
     drop(db);
-
     let mut db = open_db(dir.path());
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: false,
-        deadline_expired: false,
-    };
+
+    let facts = facts(&authorized, true, false, false);
     let outcome = dispatch_operation(&mut db, &authorized, &facts).expect("dispatch settles");
     match outcome {
         DispatchOutcome::Terminalized { record } => {
@@ -616,11 +622,7 @@ fn terminal_row_unchanged_across_recovery() {
     let loaded_terminal = load_exact(db.connection(), "module-a", OP_A)
         .expect("load")
         .expect("present");
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = facts(&loaded_terminal, true, true, false);
     match dispatch_operation(&mut db, &loaded_terminal, &facts).expect("terminal settles") {
         DispatchOutcome::Unchanged { record } => {
             assert_eq!(record.state, LedgerState::Succeeded);
@@ -667,11 +669,7 @@ fn no_permit_when_outbound_unreconstructible() {
     let mut binding = authorized.operation_binding.clone();
     binding.server_contract = serde_json::from_value(json!({"tools": {}})).expect("empty");
     authorized.operation_binding = binding;
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = facts(&authorized, true, true, false);
     let result = dispatch_operation(&mut db, &authorized, &facts);
     match &result {
         Err(DispatchError::InvalidRecord) | Err(DispatchError::Storage(_)) => {}
@@ -727,13 +725,13 @@ fn corrupt_row_stops_entire_recovery() {
 #[test]
 fn fenced_facts_provider_composes_ports() {
     struct Ready;
-    impl dolly_tool_coordinator::GenerationReadiness for Ready {
+    impl GenerationReadiness for Ready {
         fn exact_generation_ready(&self, module_id: &str, _server: &str, generation: u64) -> bool {
             module_id == "module-a" && generation == 7
         }
     }
     struct PeakClock;
-    impl dolly_tool_coordinator::Clock for PeakClock {
+    impl Clock for PeakClock {
         fn now(&self) -> std::time::SystemTime {
             std::time::SystemTime::UNIX_EPOCH
         }
@@ -744,25 +742,80 @@ fn fenced_facts_provider_composes_ports() {
         readiness: &Ready,
         clock: &PeakClock,
     };
-    let facts = provider.facts_for(&authorized);
-    assert!(facts.zero_bytes_proved);
-    assert!(facts.exact_generation_ready);
-    assert!(!facts.deadline_expired, "deadline far in the future");
+    let facts = crate::ports::RecoveryFactsProvider::facts_for(&provider, &authorized);
+    assert!(facts.zero_bytes_proved());
+    assert!(facts.exact_generation_ready());
+    assert!(!facts.deadline_expired(), "deadline far in the future");
 }
 
 #[test]
-fn authority_dispatch_requires_current_revalidation_api() {
-    let _ = dolly_storage::tool_broker_authority::revalidate_tool_dispatch_authority;
-}
-
-#[test]
-fn recovery_boundary_requires_producer_authority() {
-    let _requires_authority: fn(
+fn forged_recovery_proof_cannot_cross_worker_dispatch_boundary() {
+    let _requires_stdio_handoff: fn(
         &mut Database,
+        &EffectJournalIntentAuthority,
         &ToolDispatchAuthority,
         &RuntimeBinding,
         &ProcessGeneration,
         &McpTransportReadiness,
-        &dyn RecoveryFactsProvider,
-    ) -> Result<RecoveryOutcome, DispatchError> = reopen_recovery;
+        &Sha256Digest,
+        &ToolCallLedgerRecord,
+        &ToolDispatchService,
+        HostMcpStdioInvocation,
+    ) -> Result<DispatchOutcome, DispatchError> = dispatch_operation_authorized;
+    let _mints_verified_handoff: fn(
+        Child,
+        HostMcpStdioInstalledChildAttestation,
+        &RuntimeBinding,
+        &ProcessGeneration,
+        StdioTransportLimits,
+        Vec<u8>,
+        &Database,
+        &EffectJournalIntentAuthority,
+        &dolly_tool_broker::effect_journal::ExternalEffectJournalRecord,
+    ) -> Result<
+        (HostMcpStdioInvocation, HostMcpStdioProcessHandle),
+        StdioTransportError,
+    > = HostMcpStdioInvocation::from_installed_child;
+}
+
+#[test]
+fn authorized_boundary_rejects_forged_and_stale_rows_before_cas() {
+    let dir = tempdir();
+    let mut db = open_db(dir.path());
+    let authorized = authorized_record(OP_A, REQ);
+    insert_authorized_row(&mut db, &authorized);
+
+    let mut forged = authorized.clone();
+    forged.operation_binding.tool_name = "forged-tool".into();
+    assert!(matches!(
+        load_authoritative_row(&db, &forged),
+        Err(DispatchError::InvalidRecord)
+    ));
+
+    let dispatched = build_record(
+        LedgerState::Dispatched,
+        true,
+        None,
+        &authorized.operation_binding,
+    );
+    let expected = CasKey {
+        module_id: authorized.operation_binding.module_id.clone(),
+        operation_id: authorized.operation_binding.operation_id.clone(),
+        expected_ledger_revision: authorized.ledger_revision,
+        expected_state: LedgerState::Authorized,
+        correlation: None,
+    };
+    cas_to_dispatched(db.connection_mut(), &expected, &dispatched)
+        .expect("authoritative dispatch transition");
+    assert!(matches!(
+        load_authoritative_row(&db, &authorized),
+        Err(DispatchError::InvalidRecord)
+    ));
+}
+
+#[test]
+fn recovery_boundary_requires_producer_authority() {
+    let _requires_pre_generation_recovery: fn(
+        &mut Database,
+    ) -> Result<dolly_tool_coordinator::RecoveryOutcome, DispatchError> = reopen_recovery;
 }

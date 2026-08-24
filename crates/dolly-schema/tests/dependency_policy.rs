@@ -116,8 +116,9 @@ fn parse_dep_entry(name: &str, info: &str) -> DependencyInfo {
 const ALLOWED_DOLLY_CRATES: &[&str] = &[
     "dolly-canonical-json",
     "dolly-core-domain",
+    "dolly-protocol",
     "dolly-schema",
-    "dolly-filter-arithmetic",
+    "dolly-storage",
 ];
 
 /// Dependencies forbidden in any WP-001 crate.
@@ -165,8 +166,8 @@ fn dependency_policy_enforced() {
         "workspace must include dolly-canonical-json"
     );
     assert!(
-        workspace_toml.contains("dolly-core-domain"),
-        "workspace must include dolly-core-domain"
+        workspace_toml.contains("dolly-protocol"),
+        "workspace must include dolly-protocol"
     );
     assert!(
         workspace_toml.contains("dolly-schema"),
@@ -177,8 +178,9 @@ fn dependency_policy_enforced() {
     let members = [
         root.join("crates/dolly-canonical-json/Cargo.toml"),
         root.join("crates/dolly-core-domain/Cargo.toml"),
+        root.join("crates/dolly-protocol/Cargo.toml"),
         root.join("crates/dolly-schema/Cargo.toml"),
-        root.join("crates/dolly-filter-arithmetic/Cargo.toml"),
+        root.join("crates/dolly-storage/Cargo.toml"),
     ];
 
     let mut member_infos = BTreeMap::new();
@@ -194,8 +196,8 @@ fn dependency_policy_enforced() {
 
     assert_eq!(
         member_infos.len(),
-        4,
-        "should have exactly 4 workspace members"
+        5,
+        "should have exactly 5 workspace members"
     );
 
     // Verify allowed Dolly crates
@@ -220,21 +222,22 @@ fn dependency_policy_enforced() {
         );
     }
 
-    // dolly-filter-arithmetic: leaf crate — no Dolly workspace dependencies
-    // other than dolly-canonical-json, and no third-party dependency other
-    // than serde.
-    let fa = &member_infos["dolly-filter-arithmetic"];
-    let fa_dep_names: Vec<&str> = fa.dependencies.iter().map(|d| d.name.as_str()).collect();
+    // dolly-protocol: depends on dolly-canonical-json only (sits below
+    // dolly-core-domain and dolly-schema in the layering).
+    let dp = &member_infos["dolly-protocol"];
+    let dp_dep_names: Vec<&str> = dp.dependencies.iter().map(|d| d.name.as_str()).collect();
     assert!(
-        fa_dep_names.contains(&"dolly-canonical-json"),
-        "dolly-filter-arithmetic must depend on dolly-canonical-json"
+        dp_dep_names.contains(&"dolly-canonical-json"),
+        "dolly-protocol must depend on dolly-canonical-json"
     );
-    for dep in fa_dep_names {
-        assert!(
-            dep == "dolly-canonical-json" || dep == "serde",
-            "dolly-filter-arithmetic must only depend on dolly-canonical-json and serde, found {dep}"
-        );
-    }
+    assert!(
+        !dp_dep_names.contains(&"dolly-core-domain"),
+        "dolly-protocol must not depend on dolly-core-domain"
+    );
+    assert!(
+        !dp_dep_names.contains(&"dolly-schema"),
+        "dolly-protocol must not depend on dolly-schema"
+    );
 
     // dolly-core-domain: depends on dolly-canonical-json and serde only
     let cd = &member_infos["dolly-core-domain"];
@@ -286,6 +289,26 @@ fn dependency_policy_enforced() {
         "dolly-schema must depend on jsonschema"
     );
 
+    // dolly-storage: depends on dolly-canonical-json, dolly-core-reducer,
+    // serde, thiserror, and the bundled-SQLite crates (rusqlite +
+    // libsqlite3-sys, ADR 0006). It must never acquire sqlx/tokio/anyhow here.
+    let st = &member_infos["dolly-storage"];
+    let st_dep_names: Vec<&str> = st.dependencies.iter().map(|d| d.name.as_str()).collect();
+    assert!(
+        st_dep_names.contains(&"dolly-canonical-json"),
+        "dolly-storage must depend on dolly-canonical-json"
+    );
+    assert!(
+        st_dep_names.contains(&"dolly-core-reducer"),
+        "dolly-storage must depend on dolly-core-reducer"
+    );
+    for required in ["serde", "thiserror", "rusqlite", "libsqlite3-sys"] {
+        assert!(
+            st_dep_names.contains(&required),
+            "dolly-storage must depend on {required}"
+        );
+    }
+
     // Verify jsonschema has default-features = false (no network resolution),
     // asserted from the parsed dependency metadata rather than the raw TOML.
     let jsonschema_dep = sc
@@ -300,7 +323,11 @@ fn dependency_policy_enforced() {
 
     // Verify no forbidden dependencies in any member, across every
     // dependency kind (normal, dev, build). cargo_metadata is allowed as a
-    // dev-dependency only because it is absent from FORBIDDEN_DEPS.
+    // dev-dependency. The bundled-SQLite edit (ADR 0006, REQ-TECH-003) is
+    // the reviewed "separate change" that admits exactly the SQLite crates in
+    // dolly-storage; everywhere else they remain forbidden.
+    const SQLITE_DEPS: &[&str] = &["rusqlite", "libsqlite3-sys"];
+    const SQLITE_ALLOWED_IN: &[&str] = &["dolly-storage"];
     for (name, info) in &member_infos {
         for dep in info
             .dependencies
@@ -308,7 +335,12 @@ fn dependency_policy_enforced() {
             .chain(&info.dev_dependencies)
             .chain(&info.build_dependencies)
         {
+            let sqlite_allowed = SQLITE_ALLOWED_IN.contains(&name.as_str())
+                && SQLITE_DEPS.contains(&dep.name.as_str());
             for forbidden in FORBIDDEN_DEPS {
+                if sqlite_allowed && *forbidden == "rusqlite" {
+                    continue; // admitted by ADR 0006 as a reviewed change
+                }
                 assert_ne!(
                     dep.name, *forbidden,
                     "{name} must not depend on {forbidden}"

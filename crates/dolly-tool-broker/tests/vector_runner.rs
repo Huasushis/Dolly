@@ -12,10 +12,11 @@ use std::{
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_tool_broker::{
     AdmissionOutcome, ConfirmationDecision, DispatchDisposition, IdempotencyPolicy,
-    InvokeCandidate, InvokeOutcome, LedgerState, RecoveryFacts, ResolutionBackend, SideEffectClass,
-    StatusOutcome, ToolCallLedgerRecord, ToolCallLedgerRecordSchemaTag, ToolErrorCode,
-    ToolOperationBinding, ToolOperationBindingSchemaTag, admit_config, evaluate_invoke,
-    lookup_status, recover_operation,
+    InvokeCandidate, InvokeOutcome, LedgerState, RecoveryFacts, RecoveryProof,
+    ResolutionBackend, SideEffectClass, StatusOutcome, ToolCallLedgerRecord,
+    ToolCallLedgerRecordSchemaTag, ToolErrorCode, ToolOperationBinding,
+    ToolOperationBindingSchemaTag, admit_config, evaluate_invoke, lookup_status,
+    recover_operation,
 };
 use serde_json::{Map, Value, json};
 
@@ -168,14 +169,8 @@ fn server_contract_fixture(
 fn arguments_fixture() -> Value {
     json!({"path": "notes/example.txt"})
 }
-
-/// Facts that make a crashed `DISPATCHED`/unfenced row ambiguous.
-fn unknown_facts() -> RecoveryFacts {
-    RecoveryFacts {
-        zero_bytes_proved: false,
-        exact_generation_ready: false,
-        deadline_expired: false,
-    }
+fn unknown_facts(_row: &ToolCallLedgerRecord) -> RecoveryFacts {
+    RecoveryFacts::from_proof(RecoveryProof::coordinator_reopen())
 }
 
 /// Build a closed `ToolCallLedgerRecord` for a vector initial state. `outbound`
@@ -408,7 +403,7 @@ fn run_tst_tool_001(vector: &Value) -> (Value, Vec<Value>) {
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )),
     );
-    let disposition = recover_operation(&row, &unknown_facts());
+    let disposition = recover_operation(&row, &unknown_facts(&row));
     let recovered_result = match &disposition {
         DispatchDisposition::Unknown { result } => result,
         other => panic!("lost DISPATCHED result must be UNKNOWN, got {other:?}"),
@@ -503,7 +498,7 @@ fn run_tst_tool_002(vector: &Value) -> (Value, Vec<Value>) {
         operation_digest: authorized.operation_digest,
         ..row
     };
-    let disposition = recover_operation(&row, &unknown_facts());
+    let disposition = recover_operation(&row, &unknown_facts(&row));
     let recovered_result = match &disposition {
         DispatchDisposition::Unknown { result } => result,
         other => panic!("lost authoritative result must be UNKNOWN, got {other:?}"),

@@ -248,7 +248,10 @@ impl VerifiedLinuxHostProof {
         self.observed_at_unix_millis
     }
 }
-#[cfg(test)]
+/// Test-only proof constructor bound strictly to the current authority's
+/// persisted premise. It is compiled only into test-support artifacts, never
+/// into a default production library artifact.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_proof_for_authority(
     snapshot: &CurrentAuthoritySnapshot,
 ) -> VerifiedLinuxHostProof {

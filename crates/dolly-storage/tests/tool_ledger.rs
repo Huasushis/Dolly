@@ -8,21 +8,22 @@
 //! proving each crash-point observation survives close/reopen byte-for-byte.
 //!
 //! The rows are inserted only after creating the referenced `activations` and
-//! `config_revisions` parent rows so the §5.10 foreign keys are exercised for
-//! real.
+//! Host-owned `config_revision_mappings` parent rows so the §5.10 foreign keys
+//! are exercised for real.
 
 use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
+use dolly_storage::host_authority::HOST_AUTHORITY_SCHEMA_SQL;
 use dolly_storage::tool_ledger::{
-    CasKey, CasOutcome, LedgerInsertDisposition, TransportCorrelation, create_tool_ledger_schema,
-    enumerate_nonterminal, insert_authorized, load_exact, propose_recovery,
+    CasKey, CasOutcome, LedgerInsertDisposition, TOOL_CALL_LEDGER_RECOVERY_INDEX_SQL,
+    TOOL_CALL_LEDGER_SCHEMA_SQL, TransportCorrelation, create_tool_ledger_schema,
+    enumerate_nonterminal, gate_tool_ledger_schema, insert_authorized, load_exact,
 };
 use dolly_storage::{Database, StorageError};
 use dolly_tool_broker::{
-    ConfirmationDecision, DispatchDisposition, IdempotencyPolicy, LedgerState, RecoveryFacts,
-    SideEffectClass, ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag,
-    ToolStatus,
+    ConfirmationDecision, IdempotencyPolicy, LedgerState, SideEffectClass,
+    ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag, ToolStatus,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
 
 /// Request-digest/operation-digest/outbound digest shorthand.
@@ -221,10 +222,19 @@ fn seed_parents(conn: &Connection) {
     )
     .expect("seed activation");
     conn.execute(
-        "INSERT OR IGNORE INTO config_revisions (config_revision) VALUES (?1)",
-        rusqlite::params![11_i64],
+        "INSERT OR IGNORE INTO config_revision_mappings (
+             config_revision, daemon_installation_id, instance_id,
+             config_digest, canonical_bytes
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            11_i64,
+            "daemon-test",
+            "instance-test",
+            "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            &b"{}"[..],
+        ],
     )
-    .expect("seed config revision");
+    .expect("config revision mapping parent");
 }
 
 fn insert_authorized_row(db: &mut Database, record: &ToolCallLedgerRecord) {
@@ -237,6 +247,295 @@ fn insert_authorized_row(db: &mut Database, record: &ToolCallLedgerRecord) {
 
 fn tempdir() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
+}
+fn create_lookalike_schema(connection: &Connection, with_recovery_index: bool) {
+    connection
+        .execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
+        .expect("Host authority schema");
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE activations (
+                activation_id TEXT PRIMARY KEY NOT NULL
+            );
+            CREATE TABLE tool_call_ledger (
+                instance_id TEXT NOT NULL,
+                module_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                ledger_revision INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                activation_id TEXT NOT NULL,
+                config_revision INTEGER NOT NULL,
+                tool_server_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_server_generation INTEGER NOT NULL,
+                server_request_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL,
+                operation_digest TEXT NOT NULL,
+                outbound_digest TEXT,
+                idempotency_argument_pointer TEXT,
+                confirmation_id TEXT,
+                terminal_result_digest TEXT,
+                record_jcs BLOB NOT NULL,
+                record_digest TEXT NOT NULL
+            );
+            "#,
+        )
+        .expect("malformed lookalike schema");
+    if with_recovery_index {
+        connection
+            .execute(
+                "CREATE INDEX tool_call_ledger_recovery
+                 ON tool_call_ledger(state, module_id, operation_id)",
+                [],
+            )
+            .expect("lookalike recovery index");
+    }
+}
+
+fn create_wrong_parent_schema(connection: &Connection) {
+    connection
+        .execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
+        .expect("Host authority schema");
+    connection
+        .execute_batch(
+            "CREATE TABLE config_revisions (
+                 config_revision INTEGER PRIMARY KEY NOT NULL
+             );",
+        )
+        .expect("legacy parallel parent");
+    let wrong_parent_schema =
+        TOOL_CALL_LEDGER_SCHEMA_SQL.replace("config_revision_mappings", "config_revisions");
+    connection
+        .execute_batch(&wrong_parent_schema)
+        .expect("wrong-parent ledger schema");
+    connection
+        .execute_batch(TOOL_CALL_LEDGER_RECOVERY_INDEX_SQL)
+        .expect("recovery index");
+}
+
+fn ledger_side_effect_objects(connection: &Connection) -> Vec<(String, String)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name FROM sqlite_master
+             WHERE name IN ('activations', 'tool_call_ledger', 'tool_call_ledger_recovery')
+             ORDER BY name",
+        )
+        .expect("ledger object lookup");
+    statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("ledger object rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("ledger object collection")
+}
+
+#[test]
+fn wrong_kind_host_mapping_is_corrupt_before_ledger_creation() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .execute_batch("CREATE VIEW config_revision_mappings AS SELECT 1;")
+        .expect("wrong-kind Host parent");
+
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert!(
+        ledger_side_effect_objects(&connection).is_empty(),
+        "wrong-kind parent must not cause ledger-side creation"
+    );
+}
+
+#[test]
+fn wrong_kind_ledger_table_is_corrupt_before_ledger_creation() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .execute_batch("CREATE VIEW tool_call_ledger AS SELECT 1;")
+        .expect("wrong-kind ledger table");
+
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert_eq!(
+        ledger_side_effect_objects(&connection),
+        vec![("view".to_owned(), "tool_call_ledger".to_owned())],
+        "wrong-kind ledger object must not cause activation or index creation"
+    );
+}
+
+#[test]
+fn wrong_kind_recovery_index_is_corrupt_before_ledger_creation() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .execute_batch("CREATE TABLE tool_call_ledger_recovery (marker INTEGER);")
+        .expect("wrong-kind recovery index");
+
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert_eq!(
+        ledger_side_effect_objects(&connection),
+        vec![("table".to_owned(), "tool_call_ledger_recovery".to_owned())],
+        "wrong-kind index object must not cause activation or ledger-table creation"
+    );
+}
+
+#[test]
+fn authoritative_host_mapping_and_ledger_schema_are_accepted() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
+        .expect("Host authority schema");
+    create_tool_ledger_schema(&connection).expect("authoritative ledger schema");
+    gate_tool_ledger_schema(&connection).expect("schema gate");
+
+    let referenced_parent: String = connection
+        .query_row(
+            "SELECT \"table\" FROM pragma_foreign_key_list('tool_call_ledger')
+             WHERE \"from\" = 'config_revision'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("config mapping foreign key");
+    assert_eq!(referenced_parent, "config_revision_mappings");
+}
+
+#[test]
+fn missing_host_mapping_is_migration_required_before_ledger_creation() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::MigrationRequired)
+    ));
+    let ledger_objects: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE name IN ('activations', 'tool_call_ledger', 'tool_call_ledger_recovery')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("ledger object count");
+    assert_eq!(
+        ledger_objects, 0,
+        "missing parent must not cause partial creation"
+    );
+}
+
+#[test]
+fn malformed_host_mapping_is_corrupt_not_migrated() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .execute_batch(
+            "CREATE TABLE config_revision_mappings (
+                 config_revision INTEGER PRIMARY KEY NOT NULL
+             );",
+        )
+        .expect("malformed Host parent");
+    connection
+        .execute_batch(TOOL_CALL_LEDGER_SCHEMA_SQL)
+        .expect("ledger with malformed parent");
+    connection
+        .execute_batch(TOOL_CALL_LEDGER_RECOVERY_INDEX_SQL)
+        .expect("recovery index");
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+}
+
+#[test]
+fn wrong_parent_foreign_key_is_corrupt_even_when_legacy_parent_exists() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    create_wrong_parent_schema(&connection);
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+}
+#[test]
+fn malformed_lookalike_schema_is_rejected_even_with_matching_columns_and_index() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    create_lookalike_schema(&connection, true);
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+}
+
+#[test]
+fn schema_initializer_does_not_repair_malformed_existing_table() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    create_lookalike_schema(&connection, false);
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    let recovery_index: Option<String> = connection
+        .query_row(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND name = 'tool_call_ledger_recovery'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("lookalike index lookup");
+    assert!(
+        recovery_index.is_none(),
+        "IF NOT EXISTS must not repair a malformed table"
+    );
+}
+
+#[test]
+fn malformed_recovery_index_properties_are_rejected() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
+        .expect("Host authority schema");
+    create_tool_ledger_schema(&connection).expect("authoritative schema");
+    connection
+        .execute_batch(
+            "DROP INDEX tool_call_ledger_recovery;
+             CREATE UNIQUE INDEX tool_call_ledger_recovery
+             ON tool_call_ledger(module_id, state, operation_id);",
+        )
+        .expect("malformed recovery index");
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+}
+
+#[test]
+fn enumeration_requires_the_physical_ledger_schema() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    assert!(matches!(
+        enumerate_nonterminal(&connection),
+        Err(StorageError::MigrationRequired)
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -274,24 +573,11 @@ fn authorized_zero_byte_safe_retry_disposition() {
 
     // Pure zero-byte proof decision with exact Ready generation + live
     // deadline: propose dispatch with a permit (TST-TOOL-009).
-    let disposition = propose_recovery(
-        recovered,
-        &RecoveryFacts {
-            zero_bytes_proved: true,
-            exact_generation_ready: true,
-            deadline_expired: false,
-        },
-    );
-    let outbound_digest = match &disposition {
-        DispatchDisposition::ProposeDispatch {
-            outbound_digest,
-            allow_send_permit,
-        } => {
-            assert!(allow_send_permit, "permit eligible after proof");
-            outbound_digest.clone()
-        }
-        other => panic!("expected ProposeDispatch, got {other:?}"),
-    };
+    // The outbound digest is recomputed from the exact durable row; the
+    // coordinator owns the separate readiness fence and CAS authority.
+    let outbound_digest = recovered
+        .recompute_outbound_digest()
+        .expect("authorized row carries an outbound payload");
 
     // The store CAS commits the transition durably - before any send permit.
     let dispatched = build_record(
@@ -345,22 +631,12 @@ fn authorized_zero_byte_proof_unusable_generation_fails_not_applied() {
     let recovered = enumerate_nonterminal(db.connection())
         .expect("enumerate")
         .remove(0);
-    let disposition = propose_recovery(
-        &recovered,
-        &RecoveryFacts {
-            zero_bytes_proved: true,
-            exact_generation_ready: false, // frozen generation crashed
-            deadline_expired: false,
-        },
-    );
-    let terminal_result = match &disposition {
-        DispatchDisposition::ProvedNotApplied { result } => result.clone(),
-        other => panic!("expected ProvedNotApplied, got {other:?}"),
-    };
-    assert_eq!(terminal_result.status, ToolStatus::Failed);
-    assert_eq!(
-        terminal_result.error.as_ref().unwrap().code,
-        dolly_tool_broker::ToolErrorCode::DispatchNotApplied
+    // The verified zero-byte fence with an unusable generation is terminal
+    // NOT_APPLIED; the coordinator owns this pure decision.
+    let terminal_result = dolly_tool_broker::ToolResult::failed(
+        recovered.operation_binding.operation_id.clone(),
+        dolly_tool_broker::ToolErrorCode::DispatchNotApplied,
+        "durable zero-byte proof: no request byte was eligible or sent before the dispatch boundary",
     );
 
     let terminal = build_record(LedgerState::Failed, false, Some(terminal_result), &binding);
@@ -444,28 +720,11 @@ fn dispatched_row_becomes_unknown_without_redispatch() {
         .expect("enumerate")
         .remove(0);
     assert_eq!(recovered.state, LedgerState::Dispatched);
-    let disposition = propose_recovery(
-        &recovered,
-        &RecoveryFacts {
-            zero_bytes_proved: false,
-            exact_generation_ready: false,
-            deadline_expired: false,
-        },
+    // DISPATCHED recovery is an UNKNOWN outcome and never a redispatch.
+    let unknown_result = dolly_tool_broker::ToolResult::unknown_outcome(
+        recovered.operation_binding.operation_id.clone(),
     );
-    match &disposition {
-        DispatchDisposition::Unknown { result } => {
-            assert_eq!(result.status, ToolStatus::Unknown);
-            assert_eq!(disposition.automatic_redispatch_count(), 0);
-        }
-        other => panic!("DISPATCHED must recover Unknown, got {other:?}"),
-    }
-    assert_eq!(disposition.automatic_redispatch_count(), 0);
-
-    // Terminal CAS: DISPATCHED(2) -> UNKNOWN(3), outbound digest retained.
-    let unknown_result = match &disposition {
-        DispatchDisposition::Unknown { result } => result.clone(),
-        _ => unreachable!(),
-    };
+    assert_eq!(unknown_result.status, ToolStatus::Unknown);
     let terminal = build_record(LedgerState::Unknown, true, Some(unknown_result), &binding);
     let outcome = dolly_storage::tool_ledger::cas_terminal(
         db.connection_mut(),
@@ -516,18 +775,6 @@ fn dispatched_row_becomes_unknown_without_redispatch() {
     .expect("row present");
     assert_eq!(loaded.state, LedgerState::Unknown);
     assert_eq!(loaded.ledger_revision, 3);
-    let disposition = propose_recovery(
-        &loaded,
-        &RecoveryFacts {
-            zero_bytes_proved: false,
-            exact_generation_ready: false,
-            deadline_expired: false,
-        },
-    );
-    assert!(
-        matches!(disposition, DispatchDisposition::AlreadyTerminal { .. }),
-        "reopened terminal row must replay, not recreate a permit"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -617,22 +864,16 @@ fn terminal_commit_ack_lost_reopen_replays_exact() {
         terminal_bytes.as_ref(),
         "reopened record_jcs must byte-match the committed terminal record"
     );
-    // Recovery of a terminal row is a verbatim replay, never a redispatch.
-    let disposition = propose_recovery(
-        &loaded,
-        &RecoveryFacts {
-            zero_bytes_proved: false,
-            exact_generation_ready: false,
-            deadline_expired: false,
-        },
+    // The terminal record itself is the replay authority; no new permit or
+    // recovery proof is minted from this storage-only test.
+    assert_eq!(
+        loaded
+            .terminal_result
+            .as_ref()
+            .expect("terminal result")
+            .status,
+        ToolStatus::Succeeded
     );
-    match &disposition {
-        DispatchDisposition::AlreadyTerminal { result } => {
-            assert_eq!(result.status, ToolStatus::Succeeded);
-            assert_eq!(disposition.automatic_redispatch_count(), 0);
-        }
-        other => panic!("expected AlreadyTerminal, got {other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------

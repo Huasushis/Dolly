@@ -12,21 +12,36 @@
 //! This crate owns no transport, Host, or network: the only outside inputs
 //! are the verified `RecoveryFacts` and the storage database.
 
+use std::mem;
+use std::process::Child;
+use std::time::{Instant, SystemTime};
 use dolly_canonical_json::{Sha256Digest, canonicalize};
-use dolly_storage::mcp_readiness::McpTransportReadiness;
-use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
+use dolly_storage::effect_journal::{
+    EffectJournalIntentAuthority, retain_settled_effect_journal, settle_pending_effect_journal,
+    settle_unknown_intent,
+};
+use dolly_storage::mcp_readiness::{McpReadinessError, McpTransportReadiness};
 use dolly_storage::tool_broker_authority::{
     ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
     validate_dispatch_binding,
 };
-use dolly_storage::tool_ledger::{CasKey, TransportCorrelation, cas_terminal, cas_to_dispatched};
-use dolly_storage::{Database, StorageError};
-use dolly_tool_broker::{
-    DispatchDisposition, LedgerState, RecoveryFacts, ToolCallLedgerRecord, ToolResult,
-    recover_operation,
+use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
+use dolly_storage::tool_ledger::{
+    CasKey, TransportCorrelation, cas_terminal, cas_to_dispatched, load_exact,
 };
+use dolly_storage::{Database, StorageError};
+use dolly_tool_broker::effect_journal::ExternalEffectJournalRecord;
+use dolly_tool_broker::{
+    DispatchDisposition, LedgerState, ToolCallLedgerRecord, ToolErrorCode, ToolResult,
+};
+use crate::ports::RecoveryFacts;
 
+use crate::mcp_stdio::{
+    HostMcpStdioInstalledChildAttestation, HostMcpStdioProcessHandle, HostOwnedMcpStdioSession,
+    McpStdioProbe, StdioTransportError, StdioTransportLimits, host_session_from_installed_child,
+};
 use crate::permit::SendPermit;
+use crate::service::{ServiceOutcome, ToolDispatchService};
 
 /// Orchestration failure. No variant ever releases a send permit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,11 +58,312 @@ pub enum DispatchError {
     /// Storage failure (`STORAGE_*`), including corruption and lost commit
     /// acknowledgements surfaced as errors. No permit.
     Storage(StorageError),
+    /// The committed permit could not complete its Host-owned MCP stdio
+    /// exchange.
+    Stdio(String),
 }
 
 impl From<ToolBrokerAuthorityError> for DispatchError {
     fn from(error: ToolBrokerAuthorityError) -> Self {
         Self::Authority(error)
+    }
+}
+
+pub(crate) fn load_authoritative_row(
+    db: &Database,
+    supplied: &ToolCallLedgerRecord,
+) -> Result<ToolCallLedgerRecord, DispatchError> {
+    let Some(authoritative) = load_exact(
+        db.connection(),
+        &supplied.operation_binding.module_id,
+        &supplied.operation_binding.operation_id,
+    )
+    .map_err(DispatchError::Storage)?
+    else {
+        return Err(DispatchError::InvalidRecord);
+    };
+    if authoritative != *supplied {
+        return Err(DispatchError::InvalidRecord);
+    }
+    Ok(authoritative)
+}
+struct SystemClock;
+
+impl crate::ports::Clock for SystemClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+pub(crate) fn fenced_facts(
+    row: &ToolCallLedgerRecord,
+    readiness: &McpTransportReadiness,
+    zero_bytes_proved: bool,
+) -> RecoveryFacts {
+    let clock = SystemClock;
+    let fence = crate::ports::FencedFactsProvider {
+        zero_bytes_proved,
+        readiness,
+        clock: &clock,
+    };
+    crate::ports::RecoveryFactsProvider::facts_for(&fence, row)
+}
+/// Opaque Host-owned stdio composition handed to the existing authorized
+/// dispatch entrypoint. The fields cannot be paired or replaced by callers;
+/// the installed-child verifier supplies the session and the Host retains
+/// the separate process handle.
+pub struct HostMcpStdioInvocation {
+    session: HostMcpStdioSessionState,
+    host_handle: HostMcpStdioProcessHandle,
+    limits: StdioTransportLimits,
+    handshake_authority: EffectJournalIntentAuthority,
+    handshake_intent: ExternalEffectJournalRecord,
+    attestation_digest: Sha256Digest,
+    request_bytes: Vec<u8>,
+}
+
+pub(crate) enum HostMcpStdioSessionState {
+    Raw(HostOwnedMcpStdioSession),
+    Prepared(McpStdioProbe),
+    Consumed,
+}
+
+pub(crate) struct HostMcpStdioInvocationParts {
+    pub(crate) session: HostMcpStdioSessionState,
+    pub(crate) host_handle: HostMcpStdioProcessHandle,
+    pub(crate) handshake_authority: EffectJournalIntentAuthority,
+    pub(crate) handshake_intent: ExternalEffectJournalRecord,
+    pub(crate) attestation_digest: Sha256Digest,
+    pub(crate) limits: StdioTransportLimits,
+    pub(crate) request_bytes: Vec<u8>,
+}
+
+impl HostMcpStdioInvocation {
+    /// Verify an installed Host-owned child, bind it to the current process
+    /// generation, and return both the invocation and the separately retained
+    /// owner handle. Raw child claims are not trusted by this constructor.
+    pub fn from_installed_child(
+        child: Child,
+        attestation: HostMcpStdioInstalledChildAttestation,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        limits: StdioTransportLimits,
+        request_bytes: Vec<u8>,
+        database: &Database,
+        handshake_authority: &EffectJournalIntentAuthority,
+        handshake_intent: &ExternalEffectJournalRecord,
+    ) -> Result<(Self, HostMcpStdioProcessHandle), StdioTransportError> {
+        let attestation_digest = attestation.attestation_digest();
+        if handshake_authority
+            .verify_for_initialize(
+                database.connection(),
+                handshake_intent,
+                runtime_binding,
+                process_generation,
+                attestation.package_digest(),
+                attestation.server_id(),
+                &attestation_digest,
+            )
+            .is_err()
+        {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(StdioTransportError::HandshakeAuthorityMismatch);
+        }
+        let (host_session, retained_handle) =
+            host_session_from_installed_child(child, attestation, process_generation)?;
+        let invocation = Self {
+            session: HostMcpStdioSessionState::Raw(host_session),
+            host_handle: retained_handle.clone(),
+            limits,
+            handshake_authority: handshake_authority.clone(),
+            handshake_intent: handshake_intent.clone(),
+            attestation_digest,
+            request_bytes,
+        };
+        Ok((invocation, retained_handle))
+    }
+
+    pub fn with_request_bytes(mut self, request_bytes: Vec<u8>) -> Self {
+        self.request_bytes = request_bytes;
+        self
+    }
+    pub fn set_request_bytes(&mut self, request_bytes: Vec<u8>) {
+        self.request_bytes = request_bytes;
+    }
+
+    /// Complete the one MCP initialize/initialized lifecycle on this exact
+    /// verified child. The resulting readiness is consumer-only evidence; the
+    /// child session remains owned by this invocation for the later dispatch.
+    /// The caller must present the same opaque durable handshake authority
+    /// that was committed before the child was touched.
+    pub fn initialize(
+        &mut self,
+        handshake_authority: &EffectJournalIntentAuthority,
+        database: &Database,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        server_id: &str,
+        deadline: Instant,
+    ) -> Result<McpTransportReadiness, StdioTransportError> {
+        if self.handshake_authority != *handshake_authority {
+            self.host_handle.terminate();
+            return Err(StdioTransportError::HandshakeAuthorityMismatch);
+        }
+        if self
+            .handshake_authority
+            .verify_for_initialize(
+                database.connection(),
+                &self.handshake_intent,
+                runtime_binding,
+                process_generation,
+                &self.handshake_intent.package_digest,
+                server_id,
+                &self.attestation_digest,
+            )
+            .is_err()
+        {
+            self.host_handle.terminate();
+            return Err(StdioTransportError::HandshakeAuthorityMismatch);
+        }
+        let handshake_authority = self.handshake_authority.clone();
+        let handshake_intent = self.handshake_intent.clone();
+        let attestation_digest = self.attestation_digest.clone();
+        self.initialize_with_readiness(
+            database,
+            runtime_binding,
+            process_generation,
+            server_id,
+            deadline,
+            move |connection, runtime, process, server, probe| {
+                dolly_storage::mcp_readiness::prove_current_mcp_transport_readiness_with_intent(
+                    connection,
+                    runtime,
+                    process,
+                    server,
+                    probe,
+                    &handshake_authority,
+                    &handshake_intent,
+                    &handshake_intent.package_digest,
+                    &attestation_digest,
+                )
+            },
+        )
+    }
+
+    /// Test-support-only initializer. It preserves the same durable
+    /// handshake authority checks while substituting the isolated fixture
+    /// readiness prover; it is absent from default builds.
+    #[cfg(feature = "test-support")]
+    pub fn initialize_for_test(
+        &mut self,
+        handshake_authority: &EffectJournalIntentAuthority,
+        database: &Database,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        server_id: &str,
+        deadline: Instant,
+    ) -> Result<McpTransportReadiness, StdioTransportError> {
+        if self.handshake_authority != *handshake_authority
+            || self
+                .handshake_authority
+                .verify_for_initialize(
+                    database.connection(),
+                    &self.handshake_intent,
+                    runtime_binding,
+                    process_generation,
+                    &self.handshake_intent.package_digest,
+                    server_id,
+                    &self.attestation_digest,
+                )
+                .is_err()
+        {
+            self.host_handle.terminate();
+            return Err(StdioTransportError::HandshakeAuthorityMismatch);
+        }
+        let handshake_authority = self.handshake_authority.clone();
+        let handshake_intent = self.handshake_intent.clone();
+        let attestation_digest = self.attestation_digest.clone();
+        self.initialize_with_readiness(
+            database,
+            runtime_binding,
+            process_generation,
+            server_id,
+            deadline,
+            move |connection, runtime, process, server, probe| {
+                dolly_storage::mcp_readiness::test_prove_current_mcp_transport_readiness_with_intent(
+                    connection,
+                    runtime,
+                    process,
+                    server,
+                    probe,
+                    &handshake_authority,
+                    &handshake_intent,
+                    &handshake_intent.package_digest,
+                    &attestation_digest,
+                )
+            },
+        )
+    }
+    /// Internal readiness prover used only after handshake authority validation.
+    fn initialize_with_readiness<F>(
+        &mut self,
+        database: &Database,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        server_id: &str,
+        deadline: Instant,
+        prove: F,
+    ) -> Result<McpTransportReadiness, StdioTransportError>
+    where
+        F: FnOnce(
+            &rusqlite::Connection,
+            &RuntimeBinding,
+            &ProcessGeneration,
+            &str,
+            &mut McpStdioProbe,
+        ) -> Result<McpTransportReadiness, McpReadinessError>,
+    {
+        let session = mem::replace(&mut self.session, HostMcpStdioSessionState::Consumed);
+        let HostMcpStdioSessionState::Raw(host_session) = session else {
+            self.host_handle.terminate();
+            return Err(StdioTransportError::AlreadyInitialized);
+        };
+        let mut probe = McpStdioProbe::from_host_session(
+            host_session,
+            self.host_handle.clone(),
+            self.limits,
+            deadline,
+        )?;
+        match prove(
+            database.connection(),
+            runtime_binding,
+            process_generation,
+            server_id,
+            &mut probe,
+        ) {
+            Ok(readiness) => {
+                self.session = HostMcpStdioSessionState::Prepared(probe);
+                Ok(readiness)
+            }
+            Err(error) => {
+                probe.abort();
+                Err(StdioTransportError::Readiness(error.to_string()))
+            }
+        }
+    }
+
+    fn into_parts(self) -> HostMcpStdioInvocationParts {
+        HostMcpStdioInvocationParts {
+            session: self.session,
+            host_handle: self.host_handle,
+            handshake_authority: self.handshake_authority,
+            handshake_intent: self.handshake_intent,
+            attestation_digest: self.attestation_digest,
+            limits: self.limits,
+            request_bytes: self.request_bytes,
+        }
     }
 }
 
@@ -81,6 +397,53 @@ pub enum DispatchOutcome {
 /// facts, then applied by compare-and-set against the exact
 /// `(module_id, operation_id, ledger_revision, state)` of the row. No
 /// downstream ACK/result/error/absence is consulted.
+fn recover_operation(
+    record: &ToolCallLedgerRecord,
+    facts: &RecoveryFacts,
+) -> DispatchDisposition {
+    if let Some(result) = &record.terminal_result {
+        return DispatchDisposition::AlreadyTerminal {
+            result: result.clone(),
+        };
+    }
+    match record.state {
+        LedgerState::Dispatched => DispatchDisposition::Unknown {
+            result: ToolResult::unknown_outcome(record.operation_binding.operation_id.clone()),
+        },
+        LedgerState::Authorized => {
+            let outbound_digest = record
+                .recompute_outbound_digest()
+                .unwrap_or_else(|| Sha256Digest::compute(&[]));
+            if facts.zero_bytes_proved() {
+                if facts.exact_generation_ready() && !facts.deadline_expired() {
+                    DispatchDisposition::ProposeDispatch {
+                        outbound_digest,
+                        allow_send_permit: true,
+                    }
+                } else {
+                    DispatchDisposition::ProvedNotApplied {
+                        result: ToolResult::failed(
+                            record.operation_binding.operation_id.clone(),
+                            ToolErrorCode::DispatchNotApplied,
+                            "durable zero-byte proof: no request byte was eligible or sent before the dispatch boundary",
+                        ),
+                    }
+                }
+            } else {
+                DispatchDisposition::ProposeDispatch {
+                    outbound_digest,
+                    allow_send_permit: false,
+                }
+            }
+        }
+        LedgerState::Succeeded | LedgerState::Failed | LedgerState::Unknown => {
+            DispatchDisposition::Unknown {
+                result: ToolResult::unknown_outcome(record.operation_binding.operation_id.clone()),
+            }
+        }
+    }
+}
+
 pub(crate) fn dispatch_operation(
     db: &mut Database,
     row: &ToolCallLedgerRecord,
@@ -124,16 +487,25 @@ pub(crate) fn dispatch_operation(
 }
 /// Authoritative dispatch entry point. The storage producer must first issue
 /// `ToolDispatchAuthority`; a binding mismatch is rejected before the existing
-/// compare-and-set or any send permit can be reached.
 pub fn dispatch_operation_authorized(
     db: &mut Database,
+    journal_authority: &EffectJournalIntentAuthority,
     authority: &ToolDispatchAuthority,
     runtime_binding: &RuntimeBinding,
     process_generation: &ProcessGeneration,
     readiness: &McpTransportReadiness,
+    package_digest: &Sha256Digest,
     row: &ToolCallLedgerRecord,
-    facts: &RecoveryFacts,
+    service: &ToolDispatchService,
+    invocation: HostMcpStdioInvocation,
 ) -> Result<DispatchOutcome, DispatchError> {
+    let row = match load_authoritative_row(db, row) {
+        Ok(row) => row,
+        Err(error) => {
+            invocation.host_handle.terminate();
+            return Err(error);
+        }
+    };
     revalidate_tool_dispatch_authority(
         db,
         authority,
@@ -147,7 +519,225 @@ pub fn dispatch_operation_authorized(
         &row.operation_binding.tool_server_id,
         row.operation_binding.tool_server_generation,
     )?;
-    dispatch_operation(db, row, facts)
+    if let Err(error) = journal_authority.verify_for_dispatch(
+        db.connection(),
+        &row,
+        runtime_binding,
+        process_generation,
+        package_digest,
+        &invocation.request_bytes,
+    ) {
+        invocation.host_handle.terminate();
+        return Err(DispatchError::Storage(error));
+    }
+    // The fence is derived only after the authoritative row, generation, and
+    // Claim-bound intent have all been revalidated.
+    let facts = fenced_facts(&row, readiness, true);
+    let outcome = dispatch_operation(db, &row, &facts)?;
+    let permit = match outcome {
+        DispatchOutcome::Dispatched {
+            record: _,
+            permit: Some(permit),
+        } => permit,
+        DispatchOutcome::Dispatched {
+            record,
+            permit: None,
+        } => {
+            // A committed DISPATCHED row without an eligible permit is
+            // immediately ambiguous. Terminalize the ledger and journal it
+            // before returning; never leave a live child/session behind.
+            invocation.host_handle.terminate();
+            let terminal = dispatch_operation(db, &record, &facts)?;
+            if matches!(terminal, DispatchOutcome::Dispatched { .. }) {
+                return match settle_unknown_intent(db.connection_mut(), journal_authority) {
+                    Ok(_) => Err(DispatchError::Ambiguous),
+                    Err(storage_error) => Err(DispatchError::Storage(storage_error)),
+                };
+            }
+            settle_unknown_intent(db.connection_mut(), journal_authority)
+                .map_err(DispatchError::Storage)?;
+            return Ok(match terminal {
+                DispatchOutcome::Stale { authoritative } => {
+                    dispatch_operation(db, &authoritative, &facts)?
+                }
+                other => other,
+            });
+        }
+        other => {
+            invocation.host_handle.terminate();
+            settle_and_retain(db)?;
+            return Ok(other);
+        }
+    };
+    let parts = invocation.into_parts();
+    let request_bytes = parts.request_bytes;
+    let service_outcome = match parts.session {
+        HostMcpStdioSessionState::Raw(host_session) => service.dispatch_authorized(
+            db,
+            authority,
+            runtime_binding,
+            process_generation,
+            readiness,
+            &parts.handshake_authority,
+            &parts.handshake_intent,
+            &parts.attestation_digest,
+            host_session,
+            parts.host_handle,
+            parts.limits,
+            permit,
+            &request_bytes,
+        ),
+        HostMcpStdioSessionState::Prepared(probe) => service.dispatch_prepared(
+            db,
+            authority,
+            runtime_binding,
+            process_generation,
+            readiness,
+            probe,
+            parts.host_handle,
+            parts.limits,
+            permit,
+            &request_bytes,
+        ),
+        HostMcpStdioSessionState::Consumed => {
+            service.settle_admission_unknown(db, parts.host_handle, permit, &request_bytes)
+        }
+    };
+    let service_outcome = match service_outcome {
+        Ok(outcome) => outcome,
+        Err(error) => match settle_unknown_intent(db.connection_mut(), journal_authority) {
+            Ok(_) => return Err(DispatchError::Stdio(error.message())),
+            Err(storage_error) => return Err(DispatchError::Storage(storage_error)),
+        },
+    };
+    settle_and_retain(db)?;
+    map_service_outcome(service_outcome)
+}
+
+/// Reusable Worker-owned dispatch boundary. The initialized probe remains in
+/// the invocation after a successful call, so sequential tools/call rows share
+/// the same MCP session and Host process.
+pub fn dispatch_operation_authorized_reusable(
+    db: &mut Database,
+    journal_authority: &EffectJournalIntentAuthority,
+    authority: &ToolDispatchAuthority,
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    readiness: &McpTransportReadiness,
+    package_digest: &Sha256Digest,
+    row: &ToolCallLedgerRecord,
+    service: &ToolDispatchService,
+    invocation: &mut HostMcpStdioInvocation,
+) -> Result<DispatchOutcome, DispatchError> {
+    let row = load_authoritative_row(db, row)?;
+    revalidate_tool_dispatch_authority(
+        db,
+        authority,
+        runtime_binding,
+        process_generation,
+        readiness,
+    )?;
+    validate_dispatch_binding(
+        authority,
+        row.operation_binding.config_revision as i64,
+        &row.operation_binding.tool_server_id,
+        row.operation_binding.tool_server_generation,
+    )?;
+    if let Err(error) = journal_authority.verify_for_dispatch(
+        db.connection(),
+        &row,
+        runtime_binding,
+        process_generation,
+        package_digest,
+        &invocation.request_bytes,
+    ) {
+        invocation.host_handle.terminate();
+        return Err(DispatchError::Storage(error));
+    }
+    // This fence is coordinator-owned; Worker callers cannot inject facts.
+    let facts = fenced_facts(&row, readiness, true);
+    let outcome = dispatch_operation(db, &row, &facts)?;
+    let permit = match outcome {
+        DispatchOutcome::Dispatched {
+            record: _,
+            permit: Some(permit),
+        } => permit,
+        DispatchOutcome::Dispatched {
+            record,
+            permit: None,
+        } => {
+            let terminal = dispatch_operation(db, &record, &facts)?;
+            if matches!(terminal, DispatchOutcome::Dispatched { .. }) {
+                return match settle_unknown_intent(db.connection_mut(), journal_authority) {
+                    Ok(_) => Err(DispatchError::Ambiguous),
+                    Err(storage_error) => Err(DispatchError::Storage(storage_error)),
+                };
+            }
+            settle_unknown_intent(db.connection_mut(), journal_authority)
+                .map_err(DispatchError::Storage)?;
+            return Ok(match terminal {
+                DispatchOutcome::Stale { authoritative } => {
+                    dispatch_operation(db, &authoritative, &facts)?
+                }
+                other => other,
+            });
+        }
+        other => {
+            invocation.host_handle.terminate();
+            settle_and_retain(db)?;
+            return Ok(other);
+        }
+    };
+    let service_outcome = match &mut invocation.session {
+        HostMcpStdioSessionState::Prepared(probe) => service.dispatch_prepared_reusable(
+            db,
+            authority,
+            runtime_binding,
+            process_generation,
+            readiness,
+            probe,
+            invocation.host_handle.clone(),
+            permit,
+            &invocation.request_bytes,
+        ),
+        HostMcpStdioSessionState::Raw(_) | HostMcpStdioSessionState::Consumed => service
+            .settle_admission_unknown(
+                db,
+                invocation.host_handle.clone(),
+                permit,
+                &invocation.request_bytes,
+            ),
+    };
+    let service_outcome = match service_outcome {
+        Ok(outcome) => outcome,
+        Err(error) => match settle_unknown_intent(db.connection_mut(), journal_authority) {
+            Ok(_) => return Err(DispatchError::Stdio(error.message())),
+            Err(storage_error) => return Err(DispatchError::Storage(storage_error)),
+        },
+    };
+    settle_and_retain(db)?;
+    map_service_outcome(service_outcome)
+}
+fn settle_and_retain(db: &mut Database) -> Result<(), DispatchError> {
+    settle_pending_effect_journal(db).map_err(DispatchError::Storage)?;
+    retain_settled_effect_journal(db).map_err(DispatchError::Storage)?;
+    Ok(())
+}
+fn map_service_outcome(outcome: ServiceOutcome) -> Result<DispatchOutcome, DispatchError> {
+    match outcome {
+        ServiceOutcome::Succeeded { record, .. }
+        | ServiceOutcome::Failed { record, .. }
+        | ServiceOutcome::Unknown { record, .. } => Ok(DispatchOutcome::Terminalized { record }),
+        ServiceOutcome::Stale {
+            authoritative: Some(record),
+        } if record.state.is_terminal() => Ok(DispatchOutcome::Unchanged { record }),
+        ServiceOutcome::Stale {
+            authoritative: Some(authoritative),
+        } => Ok(DispatchOutcome::Stale { authoritative }),
+        ServiceOutcome::Stale {
+            authoritative: None,
+        } => Err(DispatchError::InvalidRecord),
+    }
 }
 
 /// One pure-decision proposal to apply.

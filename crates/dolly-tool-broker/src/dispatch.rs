@@ -299,8 +299,19 @@ impl ToolOperationBinding {
         self.recompute_outbound_payload()
             .map(|bytes| Sha256Digest::compute(bytes.as_ref()))
     }
+    /// The installed package digest retained in the frozen server contract.
+    pub fn recompute_package_digest(&self) -> Option<Sha256Digest> {
+        let transport = match self.server_contract.get("transport")? {
+            dolly_canonical_json::CanonicalJsonValue::Object(value) => value,
+            _ => return None,
+        };
+        let package = match transport.get("package_digest")? {
+            dolly_canonical_json::CanonicalJsonValue::String(value) => value,
+            _ => return None,
+        };
+        package.parse().ok()
+    }
 }
-
 /// Copy of the operation-binding wire tag; equality is by the fixed string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ToolOperationBindingSchemaTag;
@@ -550,30 +561,72 @@ impl ToolCallLedgerRecord {
     }
 }
 
-/// The verified facts a pure recovery decision reads from outside the closed
-/// record (spec §6): the record's exact-generation availability, whether its
-/// stored deadline has expired, and whether the exclusive send gate
-/// establishes zero-byte proof. No other fact is consulted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecoveryFacts {
-    /// Whether the exclusive transport gate proves zero bytes were eligible
-    /// or sent (INV-STORAGE-017 zero-byte proof).
-    pub zero_bytes_proved: bool,
-    /// Whether the record's frozen generation is still `Ready` for the
-    /// retained revision.
-    pub exact_generation_ready: bool,
-    /// Whether the record's authorized deadline has expired.
-    pub deadline_expired: bool,
+/// Opaque recovery proof emitted by the authoritative coordinator fence.
+/// Callers never provide individual boolean authority inputs.
+#[cfg(test)]
+pub(crate) struct RecoveryProof {
+    zero_bytes_proved: bool,
+    exact_generation_ready: bool,
+    deadline_expired: bool,
+}
+
+#[cfg(test)]
+impl RecoveryProof {
+    pub(crate) fn coordinator_dispatch_ready() -> Self {
+        Self {
+            zero_bytes_proved: true,
+            exact_generation_ready: true,
+            deadline_expired: false,
+        }
+    }
+
+    pub(crate) fn coordinator_dispatch_unready() -> Self {
+        Self {
+            zero_bytes_proved: true,
+            exact_generation_ready: false,
+            deadline_expired: false,
+        }
+    }
+
+    pub(crate) fn coordinator_dispatch_expired() -> Self {
+        Self {
+            zero_bytes_proved: true,
+            exact_generation_ready: true,
+            deadline_expired: true,
+        }
+    }
+
+    pub(crate) fn coordinator_reopen() -> Self {
+        Self {
+            zero_bytes_proved: false,
+            exact_generation_ready: false,
+            deadline_expired: false,
+        }
+    }
+}
+
+/// Host-owned recovery evidence. Its booleans remain private and can only be
+/// obtained from an opaque coordinator proof.
+#[cfg(test)]
+pub(crate) struct RecoveryFacts {
+    zero_bytes_proved: bool,
+    exact_generation_ready: bool,
+    deadline_expired: bool,
+}
+
+#[cfg(test)]
+impl RecoveryFacts {
+    pub(crate) fn from_proof(proof: RecoveryProof) -> Self {
+        Self {
+            zero_bytes_proved: proof.zero_bytes_proved,
+            exact_generation_ready: proof.exact_generation_ready,
+            deadline_expired: proof.deadline_expired,
+        }
+    }
+
 }
 
 /// The recovery decision for a durable Tool-call row.
-///
-/// Every variant is terminal for the *decision*: none re-dispatches,
-/// re-resolves, or re-authorizes the same identity. Re-authorization after
-/// `not_applied` is a separately authorized fresh operation outside this
-/// crate's boundary. `ProposeDispatch` is the only proposal that may later
-/// cross the durable boundary, and only through the caller's successful
-/// compare-and-set before any send permit (REQ-TOOL-006 / INV-STORAGE-017).
 #[derive(Debug, Clone, PartialEq)]
 pub enum DispatchDisposition {
     /// The row already records a terminal result; replay it verbatim.
@@ -587,11 +640,11 @@ pub enum DispatchDisposition {
         allow_send_permit: bool,
     },
     /// Authoritative zero-byte non-application: FAILED /
-    /// TOOL_DISPATCH_NOT_APPLIED. The row identity and digests are kept.
+    /// `TOOL_DISPATCH_NOT_APPLIED`. The row identity and digests are kept.
     ProvedNotApplied { result: ToolResult },
-    /// The durable dispatch boundary may have been crossed (DISPATCHED, or an
-    /// AUTHORIZED row without zero-byte proof): UNKNOWN /
-    /// TOOL_EXTERNAL_OUTCOME_UNKNOWN. Never relabeled failed.
+    /// The durable dispatch boundary may have been crossed (`DISPATCHED`, or
+    /// an `AUTHORIZED` row without zero-byte proof): UNKNOWN /
+    /// `TOOL_EXTERNAL_OUTCOME_UNKNOWN`. Never relabeled failed.
     Unknown { result: ToolResult },
 }
 
@@ -666,8 +719,8 @@ impl DispatchDisposition {
 ///                                          UNKNOWN (ambiguity; the caller CASes
 ///                                          DISPATCHED without releasing a
 ///                                          permit, reruns this decision on the
-///                                          new row and terminalizes UNKNOWN).
-pub fn recover_operation(
+#[cfg(test)]
+pub(crate) fn recover_operation(
     record: &ToolCallLedgerRecord,
     facts: &RecoveryFacts,
 ) -> DispatchDisposition {

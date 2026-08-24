@@ -4,9 +4,12 @@ use dolly_canonical_json::canonicalize;
 use serde_json::{Map, Value, json};
 
 use crate::command::*;
+use crate::effective_config::{
+    EFFECTIVE_CONFIG_MAX_PROPERTIES, EFFECTIVE_CONFIG_MAX_PROPERTIES_CODE,
+    MAX_EFFECTIVE_CONFIG_PROPERTIES,
+};
 use crate::projection::{hash_core_state, project_core_state};
 use crate::types::*;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct SafetyStop {
     pub state: CoreSnapshot,
@@ -51,6 +54,7 @@ fn failure_with_emission(
     command_id: &str,
     code: &str,
     event: &str,
+    retryable: bool,
     details: Value,
 ) -> Transition {
     let emitted = CoreEvent {
@@ -65,7 +69,7 @@ fn failure_with_emission(
         events: vec![emitted],
         error: Some(CoreError {
             code: code.into(),
-            retryable: true,
+            retryable,
             outcome: ErrorOutcome::NotApplied,
             details: Some(details),
         }),
@@ -539,6 +543,20 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             {
                 return failure(state, "CONFIG_REVISION_CONFLICT", false, None);
             }
+            if c.effective_config
+                .as_object()
+                .map_or(0, |object| object.len())
+                > MAX_EFFECTIVE_CONFIG_PROPERTIES
+            {
+                return failure_with_emission(
+                    state,
+                    &c.command_id,
+                    EFFECTIVE_CONFIG_MAX_PROPERTIES_CODE,
+                    "ConfigurationCandidateRejected",
+                    false,
+                    json!({"reason": EFFECTIVE_CONFIG_MAX_PROPERTIES}),
+                );
+            }
             next.config = json!({"revision":c.revision,"effective_config":c.effective_config,"digest":c.digest});
             events.push(append_event(
                 &mut next,
@@ -656,7 +674,7 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                     Some(CoreError {
                         code: "STORAGE_IDEMPOTENCY_CONFLICT".into(),
                         retryable: false,
-                        outcome: ErrorOutcome::Applied,
+                        outcome: ErrorOutcome::NotApplied,
                         details: Some(incident),
                     }),
                 );
@@ -746,6 +764,7 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                     &c.command_id,
                     "MANIFEST_BUILD_CAS_RETRY",
                     "ManifestBuildCasRetry",
+                    true,
                     json!({"reason":"graph_or_descriptor_changed"}),
                 );
             }
@@ -909,6 +928,7 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                         &c.command_id,
                         "ACTIVATION_FRAME_INCOMPATIBLE",
                         "ExtensionGenerationIncompatible",
+                        false,
                         json!({"reason": "frame_bounds"}),
                     );
                 }
@@ -1412,16 +1432,28 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                     next.deliveries.extend(deliveries.iter().cloned())
                 }
             }
+            let graph_revision = next
+                .activations
+                .get(&c.activation_id)
+                .and_then(|activation| activation.manifest.as_ref())
+                .and_then(|manifest| object_i64(manifest, "graph_revision"));
             let item = next.activations.get_mut(&c.activation_id).unwrap();
             item.state = ActivationState::Committed;
             item.authoritative_disposition = Some(ActivationState::Committed);
             item.staged_result = None;
             let digest = item.result_digest.clone();
+            let mut details = json!({"activation_id":c.activation_id,"result_digest":digest});
+            if let Some(graph_revision) = graph_revision {
+                details
+                    .as_object_mut()
+                    .expect("event details object")
+                    .insert("graph_revision".into(), json!(graph_revision));
+            }
             events.push(append_event(
                 &mut next,
                 &c.command_id,
                 "ActivationCommitted",
-                Some(json!({"activation_id":c.activation_id,"result_digest":digest})),
+                Some(details),
             ));
             success(
                 next,

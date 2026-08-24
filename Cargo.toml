@@ -10,6 +10,7 @@ members = [
     "crates/dolly-storage",
     "crates/dolly-tool-broker",
     "crates/dolly-tool-coordinator",
+    "crates/dolly-worker",
 ]
 
 [workspace.package]

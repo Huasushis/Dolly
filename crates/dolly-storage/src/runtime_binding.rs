@@ -433,6 +433,68 @@ pub fn mint_current_runtime_binding(
     mint_runtime_binding(db, extension_alias, proof)
 }
 
+/// Test-support startup seam: prove the persisted test authority and then
+/// enter the same production binding transition. No proof object crosses the
+/// crate boundary and this function is absent from default artifacts.
+#[cfg(feature = "test-support")]
+pub fn mint_test_runtime_binding(
+    db: &mut Database,
+    extension_alias: ExtensionId,
+) -> Result<RuntimeBinding, RuntimeBindingError> {
+    let snapshot = load_current_authority(db.connection())
+        .map_err(|error| RuntimeBindingError::Malformed(error.to_string()))?
+        .ok_or(RuntimeBindingError::AuthorityMissing)?;
+    let proof = crate::linux_host_verification::test_proof_for_authority(&snapshot);
+    mint_runtime_binding(db, extension_alias, proof)
+}
+/// Atomically invalidate a failed Worker startup's current Runtime/process
+/// pointers while retaining the closed provenance rows and monotonic fences.
+///
+/// The supplied live objects must still name the current pointers. A stale
+/// caller cannot clear a newer Worker binding.
+pub fn invalidate_runtime_binding(
+    db: &mut Database,
+    binding: &RuntimeBinding,
+    process_generation: Option<&ProcessGeneration>,
+) -> Result<(), RuntimeBindingError> {
+    let tx = db
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = load_authority(&tx)?;
+    let state = load_state(&tx, binding.extension_alias.as_str())?
+        .ok_or(RuntimeBindingError::AuthorityStateMissing)?;
+    state.record.ensure_snapshot_matches(&current)?;
+    if state.record.current_controller_generation != Some(binding.controller_generation)
+        || state.record.current_binding_digest.as_ref() != Some(&binding.binding_digest)
+        || state.record.current_worker_epoch.as_ref() != Some(&binding.worker_epoch)
+    {
+        return Err(RuntimeBindingError::BindingStale(
+            "runtime binding is no longer the current pointer".into(),
+        ));
+    }
+    match process_generation {
+        Some(process_generation)
+            if state.record.current_extension_generation
+                != Some(process_generation.extension_generation())
+                || state.record.current_worker_epoch.as_ref()
+                    != Some(process_generation.worker_epoch()) =>
+        {
+            return Err(RuntimeBindingError::BindingStale(
+                "process generation is no longer the current pointer".into(),
+            ));
+        }
+        None if state.record.current_extension_generation.is_some() => {
+            return Err(RuntimeBindingError::BindingStale(
+                "current process generation must be supplied for invalidation".into(),
+            ));
+        }
+        _ => {}
+    }
+    persist_state(&tx, &state.record.without_current_identity())?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Consume one private live Host proof and mint a fresh runtime binding.
 ///
 /// The proof type has private fields and no public constructor. The durable
@@ -827,6 +889,14 @@ impl RuntimeBindingStateRecord {
         state.current_extension_generation = Some(current);
         state.current_worker_epoch = Some(worker_epoch);
         state.next_extension_generation = next;
+        state
+    }
+    fn without_current_identity(&self) -> Self {
+        let mut state = self.clone();
+        state.current_controller_generation = None;
+        state.current_binding_digest = None;
+        state.current_extension_generation = None;
+        state.current_worker_epoch = None;
         state
     }
 }
@@ -1474,6 +1544,34 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn failed_worker_startup_invalidates_current_runtime_and_process_pointers() {
+        let (_directory, mut db, snapshot) = durable_database("instance-one", true);
+        let mut binding = mint_runtime_binding(
+            &mut db,
+            extension_alias(),
+            test_proof_for_authority(&snapshot),
+        )
+        .unwrap();
+        let generation = binding.mint_process_generation(&mut db).unwrap();
+        invalidate_runtime_binding(&mut db, &binding, Some(&generation)).unwrap();
+        let state = load_state(&db.connection(), extension_alias().as_str())
+            .unwrap()
+            .unwrap()
+            .record;
+        assert!(state.current_controller_generation.is_none());
+        assert!(state.current_binding_digest.is_none());
+        assert!(state.current_extension_generation.is_none());
+        assert!(state.current_worker_epoch.is_none());
+        let next_binding = mint_runtime_binding(
+            &mut db,
+            extension_alias(),
+            test_proof_for_authority(&snapshot),
+        )
+        .unwrap();
+        assert_eq!(next_binding.controller_generation().value(), 2);
     }
 
     #[test]

@@ -9,6 +9,7 @@
 //! `admit_config`; discovery and results are never consulted to expand it.
 
 pub mod dispatch;
+pub mod effect_journal;
 pub mod invoke;
 pub mod registry;
 pub mod result;
@@ -20,11 +21,24 @@ pub mod version;
 pub use dispatch::{
     ConfirmationDecision, DispatchDisposition, EVENT_TOOL_DISPATCH_PROVED_NOT_APPLIED,
     EVENT_TOOL_OPERATION_DISPATCHED, EVENT_TOOL_OUTCOME_UNKNOWN, LedgerRecordError, LedgerState,
-    RecoveryFacts, TOOL_CALL_LEDGER_RECORD_SCHEMA, TOOL_OPERATION_BINDING_SCHEMA,
-    ToolCallLedgerRecord, ToolCallLedgerRecordSchemaTag, ToolOperationBinding,
-    ToolOperationBindingSchemaTag, recover_operation,
+    TOOL_CALL_LEDGER_RECORD_SCHEMA, TOOL_OPERATION_BINDING_SCHEMA, ToolCallLedgerRecord,
+    ToolCallLedgerRecordSchemaTag, ToolOperationBinding, ToolOperationBindingSchemaTag,
 };
 
+
+#[cfg(test)]
+extern crate self as dolly_tool_broker;
+
+#[cfg(test)]
+pub(crate) use dispatch::{RecoveryFacts, RecoveryProof, recover_operation};
+
+#[cfg(test)]
+#[path = "../tests/dispatch_loss.rs"]
+mod dispatch_loss;
+
+#[cfg(test)]
+#[path = "../tests/vector_runner.rs"]
+mod vector_runner;
 pub use invoke::{
     ExistingOperation, FrozenBinding, InvokeCandidate, InvokeOutcome, ResolutionBackend,
     evaluate_invoke, operation_digest, request_digest, resolve_json_pointer,

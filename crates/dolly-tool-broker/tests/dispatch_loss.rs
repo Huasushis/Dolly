@@ -30,9 +30,9 @@
 use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
 use dolly_tool_broker::{
     ConfirmationDecision, DispatchDisposition, IdempotencyPolicy, LedgerRecordError, LedgerState,
-    RecoveryFacts, SideEffectClass, ToolCallLedgerRecord, ToolCallLedgerRecordSchemaTag,
-    ToolErrorCode, ToolOperationBinding, ToolOperationBindingSchemaTag, ToolStatus,
-    recover_operation,
+    RecoveryFacts, RecoveryProof, SideEffectClass, ToolCallLedgerRecord,
+    ToolCallLedgerRecordSchemaTag, ToolErrorCode, ToolOperationBinding,
+    ToolOperationBindingSchemaTag, ToolStatus, recover_operation,
 };
 use serde_json::json;
 
@@ -186,6 +186,7 @@ fn authorized_zero_byte_row() -> ToolCallLedgerRecord {
     record(LedgerState::Authorized, 1, false, None, &binding)
 }
 
+
 /// The facts a reopened AUTHORIZED row needs before a retry/pass disposition
 /// can be picked (depended on by every test that crosses the boundary).
 fn facts(
@@ -193,11 +194,13 @@ fn facts(
     exact_generation_ready: bool,
     deadline_expired: bool,
 ) -> RecoveryFacts {
-    RecoveryFacts {
-        zero_bytes_proved,
-        exact_generation_ready,
-        deadline_expired,
-    }
+    let proof = match (zero_bytes_proved, exact_generation_ready, deadline_expired) {
+        (true, true, false) => RecoveryProof::coordinator_dispatch_ready(),
+        (true, false, false) => RecoveryProof::coordinator_dispatch_unready(),
+        (true, _, true) => RecoveryProof::coordinator_dispatch_expired(),
+        _ => RecoveryProof::coordinator_reopen(),
+    };
+    RecoveryFacts::from_proof(proof)
 }
 
 /// Full TST-TOOL-001 / REQ-TOOL-002 outcome: the durable `DISPATCHED` marker

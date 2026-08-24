@@ -8,12 +8,78 @@
 //! defined here so the coordinator stays free of transport/Host/network.
 
 use std::time::SystemTime;
+use dolly_storage::mcp_readiness::McpTransportReadiness;
 
-use dolly_tool_broker::{RecoveryFacts, ToolCallLedgerRecord};
+use dolly_tool_broker::ToolCallLedgerRecord;
 
-/// Host-owned answer to "is the frozen generation still Ready for this
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoveryProof {
+    zero_bytes_proved: bool,
+    exact_generation_ready: bool,
+    deadline_expired: bool,
+}
+
+impl RecoveryProof {
+    pub(crate) fn coordinator_dispatch_ready() -> Self {
+        Self {
+            zero_bytes_proved: true,
+            exact_generation_ready: true,
+            deadline_expired: false,
+        }
+    }
+    pub(crate) fn coordinator_dispatch_unready() -> Self {
+        Self {
+            zero_bytes_proved: true,
+            exact_generation_ready: false,
+            deadline_expired: false,
+        }
+    }
+    pub(crate) fn coordinator_dispatch_expired() -> Self {
+        Self {
+            zero_bytes_proved: true,
+            exact_generation_ready: true,
+            deadline_expired: true,
+        }
+    }
+    pub(crate) fn coordinator_reopen() -> Self {
+        Self {
+            zero_bytes_proved: false,
+            exact_generation_ready: false,
+            deadline_expired: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoveryFacts {
+    zero_bytes_proved: bool,
+    exact_generation_ready: bool,
+    deadline_expired: bool,
+}
+
+impl RecoveryFacts {
+    pub(crate) fn from_proof(proof: RecoveryProof) -> Self {
+        Self {
+            zero_bytes_proved: proof.zero_bytes_proved,
+            exact_generation_ready: proof.exact_generation_ready,
+            deadline_expired: proof.deadline_expired,
+        }
+    }
+}
+
+impl RecoveryFacts {
+    pub(crate) fn zero_bytes_proved(&self) -> bool {
+        self.zero_bytes_proved
+    }
+    pub(crate) fn exact_generation_ready(&self) -> bool {
+        self.exact_generation_ready
+    }
+    pub(crate) fn deadline_expired(&self) -> bool {
+        self.deadline_expired
+    }
+}
 /// retained revision?" (tool-broker §4/§6).
-pub trait GenerationReadiness {
+pub(crate) trait GenerationReadiness {
     /// Whether the exact frozen generation of `(module_id, server_id)` is
     /// still Ready. `false` makes an `AUTHORIZED` row fail closed as
     /// `TOOL_DISPATCH_NOT_APPLIED` (given zero-byte proof).
@@ -24,9 +90,20 @@ pub trait GenerationReadiness {
         tool_server_generation: u64,
     ) -> bool;
 }
+impl GenerationReadiness for McpTransportReadiness {
+    fn exact_generation_ready(
+        &self,
+        _module_id: &str,
+        tool_server_id: &str,
+        tool_server_generation: u64,
+    ) -> bool {
+        self.server_id() == tool_server_id
+            && self.extension_generation().value() == tool_server_generation
+    }
+}
 
 /// Host-owned wall clock for deadline comparison (tool-broker §6).
-pub trait Clock {
+pub(crate) trait Clock {
     /// The current wall time; compared against the binding's stored
     /// `authorized_deadline`.
     fn now(&self) -> SystemTime;
@@ -34,7 +111,7 @@ pub trait Clock {
 
 /// Per-row `RecoveryFacts` production. Implementations MUST NOT read any
 /// downstream ACK, result, error, or absence as a fact.
-pub trait RecoveryFactsProvider {
+pub(crate) trait RecoveryFactsProvider {
     /// Build the verified facts for one nonterminal row.
     fn facts_for(&self, row: &ToolCallLedgerRecord) -> RecoveryFacts;
 }
@@ -42,32 +119,34 @@ pub trait RecoveryFactsProvider {
 /// Composite [`RecoveryFactsProvider`] from Host-owned readiness, clock, and
 /// zero-byte proof inputs. `zero_bytes_proved` is the result of the Host's
 /// exclusive write-lock recheck on the fence.
-pub struct FencedFactsProvider<'a> {
+pub(crate) struct FencedFactsProvider<'a> {
     /// Whether the exclusive send gate proves zero bytes were eligible or
     /// sent (Host-owned).
-    pub zero_bytes_proved: bool,
+    pub(crate) zero_bytes_proved: bool,
     /// Host-owned generation readiness.
-    pub readiness: &'a dyn GenerationReadiness,
+    pub(crate) readiness: &'a dyn GenerationReadiness,
     /// Host-owned clock for deadline expiry.
-    pub clock: &'a dyn Clock,
+    pub(crate) clock: &'a dyn Clock,
 }
 
 impl RecoveryFactsProvider for FencedFactsProvider<'_> {
     fn facts_for(&self, row: &ToolCallLedgerRecord) -> RecoveryFacts {
         let binding = &row.operation_binding;
-        RecoveryFacts {
-            zero_bytes_proved: self.zero_bytes_proved,
-            exact_generation_ready: self.readiness.exact_generation_ready(
-                &binding.module_id,
-                &binding.tool_server_id,
-                binding.tool_server_generation,
-            ),
-            deadline_expired: deadline_expired(&binding.authorized_deadline, self.clock.now()),
-        }
+        let ready = self.readiness.exact_generation_ready(
+            &binding.module_id,
+            &binding.tool_server_id,
+            binding.tool_server_generation,
+        );
+        let expired = deadline_expired(&binding.authorized_deadline, self.clock.now());
+        let proof = match (self.zero_bytes_proved, ready, expired) {
+            (true, true, false) => RecoveryProof::coordinator_dispatch_ready(),
+            (true, false, false) => RecoveryProof::coordinator_dispatch_unready(),
+            (true, _, true) => RecoveryProof::coordinator_dispatch_expired(),
+            _ => RecoveryProof::coordinator_reopen(),
+        };
+        RecoveryFacts::from_proof(proof)
     }
 }
-
-/// Strict RFC 3339 (UTC, `Z`) parse to `SystemTime`. Any unparseable
 /// deadline is reported as expired (fail-closed: never dispatches on an
 /// unreadable deadline).
 fn deadline_expired(payload: &str, now: SystemTime) -> bool {
@@ -82,7 +161,7 @@ fn deadline_expired(payload: &str, now: SystemTime) -> bool {
     }
 }
 
-fn parse_rfc3339_utc(payload: &str) -> Option<SystemTime> {
+pub(crate) fn parse_rfc3339_utc(payload: &str) -> Option<SystemTime> {
     let b = payload.as_bytes();
     if b.len() < 20 {
         return None;
