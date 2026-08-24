@@ -14,14 +14,14 @@
 use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
 use dolly_storage::tool_ledger::{
     CasKey, CasOutcome, LedgerInsertDisposition, TransportCorrelation, create_tool_ledger_schema,
-    enumerate_nonterminal, insert_authorized, load_exact,
+    enumerate_nonterminal, gate_tool_ledger_schema, insert_authorized, load_exact,
 };
 use dolly_storage::{Database, StorageError};
 use dolly_tool_broker::{
     ConfirmationDecision, IdempotencyPolicy, LedgerState, SideEffectClass,
     ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag, ToolStatus,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
 
 
@@ -238,6 +238,101 @@ fn insert_authorized_row(db: &mut Database, record: &ToolCallLedgerRecord) {
 fn tempdir() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
+fn create_lookalike_schema(connection: &Connection, with_recovery_index: bool) {
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE activations (
+                activation_id TEXT PRIMARY KEY NOT NULL
+            );
+            CREATE TABLE config_revisions (
+                config_revision INTEGER PRIMARY KEY NOT NULL
+            );
+            CREATE TABLE tool_call_ledger (
+                instance_id TEXT NOT NULL,
+                module_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                ledger_revision INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                activation_id TEXT NOT NULL,
+                config_revision INTEGER NOT NULL,
+                tool_server_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_server_generation INTEGER NOT NULL,
+                server_request_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL,
+                operation_digest TEXT NOT NULL,
+                outbound_digest TEXT,
+                idempotency_argument_pointer TEXT,
+                confirmation_id TEXT,
+                terminal_result_digest TEXT,
+                record_jcs BLOB NOT NULL,
+                record_digest TEXT NOT NULL
+            );
+            "#,
+        )
+        .expect("malformed lookalike schema");
+    if with_recovery_index {
+        connection
+            .execute(
+                "CREATE INDEX tool_call_ledger_recovery
+                 ON tool_call_ledger(state, module_id, operation_id)",
+                [],
+            )
+            .expect("lookalike recovery index");
+    }
+}
+
+#[test]
+fn malformed_lookalike_schema_is_rejected_even_with_matching_columns_and_index() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    create_lookalike_schema(&connection, true);
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+}
+
+#[test]
+fn schema_initializer_does_not_repair_malformed_existing_table() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    create_lookalike_schema(&connection, false);
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    let recovery_index: Option<String> = connection
+        .query_row(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND name = 'tool_call_ledger_recovery'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("lookalike index lookup");
+    assert!(
+        recovery_index.is_none(),
+        "IF NOT EXISTS must not repair a malformed table"
+    );
+}
+
+#[test]
+fn malformed_recovery_index_properties_are_rejected() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    create_tool_ledger_schema(&connection).expect("authoritative schema");
+    connection
+        .execute_batch(
+            "DROP INDEX tool_call_ledger_recovery;
+             CREATE UNIQUE INDEX tool_call_ledger_recovery
+             ON tool_call_ledger(module_id, state, operation_id);",
+        )
+        .expect("malformed recovery index");
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+}
+
 
 #[test]
 fn enumeration_requires_the_physical_ledger_schema() {

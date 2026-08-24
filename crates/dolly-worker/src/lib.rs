@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use dolly_canonical_json::{
@@ -57,7 +57,38 @@ type StartupInitialize = fn(
     &str,
     Instant,
 ) -> Result<McpTransportReadiness, StdioTransportError>;
+fn ignore_spawn_observer(_: u32) {}
+struct SpawnedChildCleanup {
+    child: Option<Child>,
+}
 
+impl SpawnedChildCleanup {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn id(&self) -> u32 {
+        self.child
+            .as_ref()
+            .expect("spawned child cleanup guard is armed")
+            .id()
+    }
+
+    fn into_child(mut self) -> Child {
+        self.child
+            .take()
+            .expect("spawned child cleanup guard is armed")
+    }
+}
+
+impl Drop for SpawnedChildCleanup {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 fn mint_live_runtime_binding(
     database: &mut Database,
     extension_alias: ExtensionId,
@@ -135,6 +166,20 @@ impl Worker {
         config: WorkerStartConfig,
         mint_runtime_binding: StartupMint,
         initialize_invocation: StartupInitialize,
+    ) -> Result<Self, WorkerError> {
+        Self::start_internal_with_observer(
+            config,
+            mint_runtime_binding,
+            initialize_invocation,
+            ignore_spawn_observer,
+        )
+    }
+
+    fn start_internal_with_observer(
+        config: WorkerStartConfig,
+        mint_runtime_binding: StartupMint,
+        initialize_invocation: StartupInitialize,
+        spawn_observer: fn(u32),
     ) -> Result<Self, WorkerError> {
         if !cfg!(target_os = "linux") {
             return Err(WorkerError::UnsupportedPlatform);
@@ -228,7 +273,7 @@ impl Worker {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let child = match command.spawn() {
+        let child = SpawnedChildCleanup::new(match command.spawn() {
             Ok(child) => child,
             Err(error) => {
                 return Err(startup_failure(
@@ -239,7 +284,10 @@ impl Worker {
                     WorkerError::Process(error.to_string()),
                 ));
             }
-        };
+        });
+        // This callback is test-only observation; production uses a no-op.
+        // No child I/O occurs before the durable handshake Claim insertion.
+        spawn_observer(child.id());
         let attestation = HostMcpStdioInstalledChildAttestation::new(
             config.server_id.clone(),
             "mcp".into(),
@@ -299,7 +347,7 @@ impl Worker {
                 }
             };
         let (mut invocation, process_handle) = match HostMcpStdioInvocation::from_installed_child(
-            child,
+            child.into_child(),
             attestation,
             &runtime_binding,
             &process_generation,

@@ -17,13 +17,18 @@
 //! Claim insertion, and SQLite settlement are all exercised directly.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use dolly_canonical_json::{CanonicalJsonValue, Sha256Digest, canonicalize};
 use dolly_storage::Database;
+use dolly_storage::effect_journal::{MAX_EFFECT_JOURNAL_ROWS, insert_intent};
 use dolly_storage::host_authority::{
     ConfigRevisionMapping, HostAuthorityRevision, InstalledComponentOrigin, LinuxServiceCandidate,
     ModuleActivationPremises, ResolvedConfiguration, RuntimeAuthorityIdentity,
 };
+use dolly_storage::tool_ledger::{create_tool_ledger_schema, load_exact as load_ledger_exact};
 use dolly_tool_broker::effect_journal::{
     Claim, ClaimRecordSchemaTag, EffectClass, EffectJournalRecordSchemaTag, EffectJournalState,
     ExternalEffectJournalRecord, derive_claim_token,
@@ -32,7 +37,6 @@ use dolly_tool_broker::{
     ConfirmationDecision, IdempotencyPolicy, LedgerState, SideEffectClass, ToolCallLedgerRecord,
     ToolCallLedgerRecordSchemaTag, ToolOperationBinding, ToolOperationBindingSchemaTag,
 };
-use dolly_storage::tool_ledger::{create_tool_ledger_schema, load_exact as load_ledger_exact};
 use dolly_tool_coordinator::DispatchOutcome;
 use dolly_worker::{Worker, WorkerStartConfig};
 use serde_json::{Value, json};
@@ -267,6 +271,69 @@ fn count_child_calls(root: &Path) -> usize {
         Err(_) => 0,
     }
 }
+fn capacity_intent(operation_id: String) -> ExternalEffectJournalRecord {
+    let claim_token = derive_claim_token(
+        "c-inst-0001",
+        "module-a",
+        &operation_id,
+        &digest_hex(0xcc),
+        999,
+        999,
+        "01jh8w2etc4x70xj26rg8fsdv92",
+        &digest_hex(0xaa),
+        &digest_hex(0xbb),
+        EffectClass::McpToolsCall,
+    );
+    ExternalEffectJournalRecord {
+        schema: EffectJournalRecordSchemaTag,
+        journal_revision: 1,
+        state: EffectJournalState::Intended,
+        claim: Claim {
+            schema: ClaimRecordSchemaTag,
+            instance_id: "c-inst-0001".into(),
+            module_id: "module-a".into(),
+            operation_id,
+            operation_digest: digest_hex(0xcc),
+            claim_token,
+        },
+        controller_generation: 999,
+        extension_generation: 999,
+        worker_epoch: "01jh8w2etc4x70xj26rg8fsdv92".into(),
+        package_digest: digest_hex(0xaa),
+        policy_premise_digest: digest_hex(0xbb),
+        operation_digest: digest_hex(0xcc),
+        effect_class: EffectClass::McpToolsCall,
+        intent_digest: digest_hex(0xdd),
+        evidence_digest: None,
+    }
+}
+
+fn fill_journal_capacity(db: &mut Database) {
+    for i in 0..MAX_EFFECT_JOURNAL_ROWS {
+        let record = capacity_intent(format!("prefill-{i}"));
+        insert_intent(db.connection_mut(), &record).expect("prefill insert");
+    }
+}
+
+#[cfg(target_os = "linux")]
+static LAST_SPAWNED_PID: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(target_os = "linux")]
+fn remember_spawned_pid(pid: u32) {
+    LAST_SPAWNED_PID.store(pid, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_process_reaped(pid: u32) {
+    let proc_path = format!("/proc/{pid}");
+    for _ in 0..100 {
+        if !Path::new(&proc_path).exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    panic!("spawned child {pid} was not reaped");
+}
 
 // ---------------------------------------------------------------------------
 // durable authority fixture
@@ -412,15 +479,26 @@ impl Fixture {
         binding
     }
 
-    fn start_worker(&self) -> Worker {
-        let config = WorkerStartConfig {
+    fn config(&self) -> WorkerStartConfig {
+        WorkerStartConfig {
             db_path: self.db_path.clone(),
             extension_alias: "org.dolly.tools".parse().expect("extension id"),
             server_id: "fs".into(),
             package_root: self.package_root.clone(),
             package_path: self.package_path.clone(),
-        };
-        Worker::start_for_test(config).expect("worker starts")
+        }
+    }
+
+    fn start_worker(&self) -> Worker {
+        Worker::start_for_test(self.config()).expect("worker starts")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_worker_with_observer(
+        &self,
+        observer: fn(u32),
+    ) -> Result<Worker, dolly_worker::WorkerError> {
+        Worker::start_for_test_with_spawn_observer(self.config(), observer)
     }
 }
 
@@ -668,42 +746,8 @@ fn journal_at_capacity_fails_closed_before_child_io() {
     // Fill the durable journal to the cap with INTENDED rows (no ledger
     // evidence, so startup settlement turns them UNKNOWN_OUTCOME — still
     // undeletable, still at the cap).
-    let cap = dolly_storage::effect_journal::MAX_EFFECT_JOURNAL_ROWS;
-    for i in 0..cap {
-        let claim_token = derive_claim_token(
-            "c-inst-0001",
-            "module-a",
-            &format!("prefill-{i}"),
-            &digest_hex(0xcc),
-            999,
-            999,
-            "01jh8w2etc4x70xj26rg8fsdv92",
-            &digest_hex(0xaa),
-            &digest_hex(0xbb),
-            EffectClass::McpToolsCall,
-        );
-        let record = ExternalEffectJournalRecord {
-            schema: EffectJournalRecordSchemaTag,
-            journal_revision: 1,
-            state: EffectJournalState::Intended,
-            claim: Claim {
-                schema: ClaimRecordSchemaTag,
-                instance_id: "c-inst-0001".into(),
-                module_id: "module-a".into(),
-                operation_id: format!("prefill-{i}"),
-                operation_digest: digest_hex(0xcc),
-                claim_token,
-            },
-            controller_generation: 999,
-            extension_generation: 999,
-            worker_epoch: "01jh8w2etc4x70xj26rg8fsdv92".into(),
-            package_digest: digest_hex(0xaa),
-            policy_premise_digest: digest_hex(0xbb),
-            operation_digest: digest_hex(0xcc),
-            effect_class: EffectClass::McpToolsCall,
-            intent_digest: digest_hex(0xdd),
-            evidence_digest: None,
-        };
+    for i in 0..MAX_EFFECT_JOURNAL_ROWS {
+        let record = capacity_intent(format!("prefill-{i}"));
         worker
             .insert_intent_for_test(&record)
             .expect("prefill insert");
@@ -726,5 +770,41 @@ fn journal_at_capacity_fails_closed_before_child_io() {
         count_child_calls(&fixture.package_root),
         0,
         "the intent was refused before the child was ever touched"
+    );
+}
+
+/// A real post-spawn Claim persistence failure must terminate and reap the
+/// child before Worker startup returns. The observer only records the PID;
+/// it cannot perform child I/O or own the process.
+#[cfg(target_os = "linux")]
+#[test]
+fn startup_storage_full_reaps_child_before_returning_error() {
+    LAST_SPAWNED_PID.store(0, Ordering::SeqCst);
+    let fixture = Fixture::new(false);
+    {
+        let mut db = Database::open(&fixture.db_path).expect("open fixture database");
+        fill_journal_capacity(&mut db);
+    }
+
+    let error = match fixture.start_worker_with_observer(remember_spawned_pid) {
+        Ok(_) => panic!("startup Claim persistence unexpectedly succeeded at capacity"),
+        Err(error) => error,
+    };
+    match error {
+        dolly_worker::WorkerError::Storage(detail) => {
+            assert!(
+                detail.contains("STORAGE_FULL"),
+                "unexpected storage error: {detail}"
+            );
+        }
+        other => panic!("startup capacity failure had wrong class: {other:?}"),
+    }
+    let pid = LAST_SPAWNED_PID.load(Ordering::SeqCst);
+    assert!(pid > 0, "startup observer must see the real spawned child");
+    assert_process_reaped(pid);
+    assert_eq!(
+        count_child_calls(&fixture.package_root),
+        0,
+        "startup failure happened before any child protocol I/O"
     );
 }
