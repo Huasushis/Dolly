@@ -52,6 +52,16 @@ impl Worker {
         let initialize: StartupInitialize = initialize_test;
         Self::start_internal_with(config, mint, initialize)
     }
+    /// Test-support-only startup seam that observes the real spawned PID
+    /// without granting tests any child I/O or ownership capability.
+    pub fn start_for_test_with_spawn_observer(
+        config: WorkerStartConfig,
+        observer: fn(u32),
+    ) -> Result<Self, WorkerError> {
+        let mint: StartupMint = mint_test;
+        let initialize: StartupInitialize = initialize_test;
+        Self::start_internal_with_observer(config, mint, initialize, observer)
+    }
 
     /// Test-support-only insertion through the Worker's already-open
     /// authoritative SQLite connection. This avoids a second instance owner;
