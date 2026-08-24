@@ -65,6 +65,7 @@ import type { DollyInstanceConfig } from "../core/runtime-config.js";
 import type { DollyInstanceConfigV10Draft } from "../core/runtime-config-v10.js";
 import {
   assertInstalledModuleRuntimePremise,
+  resolveInstalledModuleRuntimePremiseAuthority,
   type InstalledModuleRuntimePremise,
 } from "./installed-module-runtime-premise.js";
 import {
@@ -79,6 +80,7 @@ import {
 } from "./installed-linux-extension-module-executor.js";
 import {
   InstalledModulePermissionPolicyRegistry,
+  type ReservedV10InstalledPermissionPolicyRegistry,
   type InstalledModulePermissionPolicySetup,
 } from "./installed-module-permission-policy.js";
 import { createExtensionEffectJournalLifecycle } from "./extension-effect-run-lifecycle.js";
@@ -190,6 +192,7 @@ function assertReservedV10PremiseForRuntime(
   readonly plan: ReservedV10InstalledModulePlan;
   readonly processProvenance: ReservedV10InstalledModuleProcessProvenance;
   readonly configuration: DollyInstanceConfigV10Draft;
+  readonly permissionPolicies: ReservedV10InstalledPermissionPolicyRegistry;
 } {
   if (
     Object.hasOwn(options, "resolvedModule") ||
@@ -206,6 +209,7 @@ function assertReservedV10PremiseForRuntime(
     );
   }
   assertInstalledModuleRuntimePremise(options.premise);
+  const authority = resolveInstalledModuleRuntimePremiseAuthority(options.premise);
   const configuration = options.instanceConfiguration;
   if (configuration.schemaVersion !== "dolly.instance/10") {
     throw new TypeError(
@@ -286,40 +290,12 @@ function assertReservedV10PremiseForRuntime(
       `Installed Module runtime premise Module ${options.moduleId} is stale for its configuration record`,
     );
   }
-  const selectionSnapshot = premiseModule.permissionPolicies.snapshot;
-  const selectedPolicies =
-    selectionSnapshot !== null &&
-    typeof selectionSnapshot === "object" &&
-    !Array.isArray(selectionSnapshot) &&
-    Array.isArray(Reflect.get(selectionSnapshot, "policies"))
-      ? Reflect.get(selectionSnapshot, "policies") as readonly {
-          readonly policyId: string;
-          readonly revision: string;
-        }[]
-      : undefined;
-  if (
-    selectedPolicies === undefined ||
-    selectedPolicies.length !== plan.module.permissionPolicyReferences.length ||
-    selectedPolicies.some((selected, index) => {
-      const reference = plan.module.permissionPolicyReferences[index];
-      return (
-        reference === undefined ||
-        selected.policyId !== reference.policyId ||
-        selected.revision !== reference.revision
-      );
-    }) ||
-    premiseModule.permissionBindings.length !== selectedPolicies.length
-  ) {
-    throw new TypeError(
-      `Installed Module runtime premise Module ${options.moduleId} has mismatched policy provenance`,
-    );
-  }
-  if (selectedPolicies.length !== 0) {
-    throw new TypeError(
-      "Reserved version-10 installed Module capability Host setup is not connected to the TypeScript runtime",
-    );
-  }
-  return { plan, processProvenance, configuration };
+  return {
+    plan,
+    processProvenance,
+    configuration,
+    permissionPolicies: authority.permissionPolicies,
+  };
 }
 
 function sameV10CgroupLimits(
@@ -434,8 +410,12 @@ function assertReservedV10RuntimeBoundaryOptions(
 function createInstalledReactiveModuleRuntimeFromPremise(
   options: InstalledReactiveModuleRuntimeOptions,
 ): InstalledReactiveModuleRuntime {
-  const { plan, processProvenance, configuration } =
-    assertReservedV10PremiseForRuntime(options);
+  const {
+    plan,
+    processProvenance,
+    configuration,
+    permissionPolicies,
+  } = assertReservedV10PremiseForRuntime(options);
   const resolvedModule = projectReservedV10InstalledModule(plan);
   assertReservedV10RuntimeBoundaryOptions(options, plan, processProvenance);
   const {
@@ -452,6 +432,7 @@ function createInstalledReactiveModuleRuntimeFromPremise(
     resolvedModule,
     declarationProvenance: processProvenance,
     declaredExternalEffects: plan.module.declaredExternalEffects,
+    reservedV10PermissionPolicies: permissionPolicies,
   });
 }
 
@@ -502,6 +483,7 @@ type InstalledRuntimeInternalOptions = InstalledReactiveModuleRuntimeOptions & {
   readonly resolvedModule?: InstalledExtensionModule;
   readonly declarationProvenance?: ReservedV10InstalledModuleProcessProvenance;
   readonly declaredExternalEffects?: DeclaredExternalEffects;
+  readonly reservedV10PermissionPolicies?: ReservedV10InstalledPermissionPolicyRegistry;
 };
 
 function createInstalledReactiveModuleRuntimeInternal(
@@ -573,16 +555,50 @@ function createInstalledReactiveModuleRuntimeInternal(
   }
   let permissionPolicySetup;
   let effectRunLifecycle;
+  let generations: InstalledLinuxExtensionModuleGenerationFactory | undefined;
+  let modelMediaResolver: ModelMediaResolver | undefined;
+  const now = () => canonicalNow(options.now);
+  if (options.core.media !== undefined) {
+    modelMediaResolver = createFileCoreActiveRunModelMediaResolver({
+      core: options.core,
+      extensionId: resolvedModule.installation.manifest.extensionId,
+      instanceId: resolvedModule.instanceId,
+      moduleId: module.moduleId,
+      sessionForProcess: (processGenerationId) =>
+        generations?.sessionForProcess(processGenerationId) ?? null,
+      now,
+    });
+  }
   if (module.permissionPolicyIds.length !== 0) {
-    if (
-      options.permissionPolicies === undefined ||
-      Object.getPrototypeOf(options.permissionPolicies) !==
-        InstalledModulePermissionPolicyRegistry.prototype
+    if (options.reservedV10PermissionPolicies === undefined) {
+      if (
+        options.permissionPolicies === undefined ||
+        Object.getPrototypeOf(options.permissionPolicies) !==
+          InstalledModulePermissionPolicyRegistry.prototype
+      ) {
+        throw new TypeError(
+          "Installed Module permission policies require one direct Host policy registry",
+        );
+      }
+    } else if (
+      options.instanceConfiguration.schemaVersion !== "dolly.instance/10" ||
+      options.declarationProvenance === undefined
     ) {
       throw new TypeError(
-        "Installed Module permission policies require one direct Host policy registry",
+        "Reserved version-10 permission setup requires its branded process premise",
       );
     }
+    permissionPolicySetup = options.reservedV10PermissionPolicies === undefined
+      ? options.permissionPolicies!.setupFor(resolvedModule, {
+          ...(modelMediaResolver === undefined ? {} : { modelMediaResolver }),
+        })
+      : options.reservedV10PermissionPolicies.setupFor(
+          options.declarationProvenance!.installedModule,
+          resolvedModule,
+          {
+            ...(modelMediaResolver === undefined ? {} : { modelMediaResolver }),
+          },
+        );
     if (
       options.effectIntentStore === undefined ||
       Object.getPrototypeOf(options.effectIntentStore) !== FileEffectIntentStore.prototype
@@ -661,7 +677,6 @@ function createInstalledReactiveModuleRuntimeInternal(
     claimMaxCount = claim.maxCount;
     claimMaxBytes = claim.maxBytes;
   }
-  const now = () => canonicalNow(options.now);
   const commits = createModuleResultCommitCoordinator({
     core: options.core,
     repository: options.resultCommitRepository,
@@ -671,24 +686,6 @@ function createInstalledReactiveModuleRuntimeInternal(
       ? {}
       : { afterEffect: options.afterCommitEffect }),
   });
-  let generations: InstalledLinuxExtensionModuleGenerationFactory | undefined;
-  let modelMediaResolver: ModelMediaResolver | undefined;
-  if (options.core.media !== undefined) {
-    modelMediaResolver = createFileCoreActiveRunModelMediaResolver({
-      core: options.core,
-      extensionId: resolvedModule.installation.manifest.extensionId,
-      instanceId: resolvedModule.instanceId,
-      moduleId: module.moduleId,
-      sessionForProcess: (processGenerationId) =>
-        generations?.sessionForProcess(processGenerationId) ?? null,
-      now,
-    });
-  }
-  if (module.permissionPolicyIds.length !== 0) {
-    permissionPolicySetup = options.permissionPolicies!.setupFor(resolvedModule, {
-      ...(modelMediaResolver === undefined ? {} : { modelMediaResolver }),
-    });
-  }
   generations = createInstalledLinuxExtensionModuleGenerationFactory({
     ...(options.resolvedModule === undefined
       ? {}

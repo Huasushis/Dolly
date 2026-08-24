@@ -46,6 +46,7 @@ import {
   projectReservedV10InstalledModule,
 } from "../../../src/adapters/installed-linux-extension-module-executor.js";
 import type { FileCoreStateStoreWithStoppedRecordWriter } from "../../../src/core/file-core-state-store.js";
+import { FileEffectIntentStore } from "../../../src/core/capabilities/file-effect-intent-store.js";
 import { SourceActivationQueue } from "../../../src/core/source-activation-queue.js";
 import type {
   DeliveryMailboxCapacity,
@@ -1033,6 +1034,58 @@ describe("post-H3 installed Module activation candidate", () => {
         origin: current.serviceOrigin,
       });
       permissionPolicies.assertLiveBinding(liveBinding, context);
+      expect(() => permissionPolicies.assertLiveBindingsFor(
+        candidate.modules[0]!.installedModule,
+        permission,
+        context,
+        premise.modules[0]!.permissionPolicies,
+        [],
+      )).toThrow(/cardinality/u);
+      expect(() => permissionPolicies.assertLiveBindingsFor(
+        candidate.modules[0]!.installedModule,
+        permission,
+        context,
+        premise.modules[0]!.permissionPolicies,
+        [{ ...liveBinding }],
+      )).toThrow(/not minted|different Host policy registry/u);
+      expect(() => permissionPolicies.assertLiveBindingsFor(
+        candidate.modules[0]!.installedModule,
+        permission,
+        context,
+        premise.modules[0]!.permissionPolicies,
+        [{ ...liveBinding, bindingRevision: 2 } as never],
+      )).toThrow(/not minted|different Host policy registry|identity/u);
+      const prepared = consumerOptions(
+        current,
+        currentV10Configuration(current),
+        premise,
+      );
+      const composed = createInstalledReactiveModuleRuntime({
+        ...prepared.options,
+        effectIntentStore: new FileEffectIntentStore({
+          path: join(current.root, "runtime-effect-intents.json"),
+        }),
+      });
+      expect(composed.permissionPolicySetup?.snapshot).toMatchObject({
+        instanceId: currentV10Configuration(current).instanceId,
+        moduleId: "worker",
+        policyIds: [policyFixture.policy.policyId],
+        capabilities: [{
+          capabilityType: "module-private-storage",
+          capabilityVersion: "v2",
+          policyId: policyFixture.policy.policyId,
+        }],
+      });
+      expect(prepared.core.store.listModuleProcessRecords()).toEqual([]);
+      expect(() => createInstalledReactiveModuleRuntime({
+        ...prepared.options,
+        permissionPolicies: new ReservedV10InstalledPermissionPolicyRegistry({
+          policies: [],
+        }),
+        effectIntentStore: new FileEffectIntentStore({
+          path: join(current.root, "legacy-policy-override-effect-intents.json"),
+        }),
+      } as never)).toThrow(/consumes policy selection from its premise/u);
 
       const replacementOrigins = new InstalledComponentOriginRegistry({
         directory: join(current.root, "replacement-origins"),
@@ -1089,6 +1142,19 @@ describe("post-H3 installed Module activation candidate", () => {
       })).toThrow(/candidate is stale/u);
       expect(() => permissionPolicies.assertLiveBinding(liveBinding, context))
         .toThrow(/stale|current Runtime authority/u);
+      let effectStoreTouched = false;
+      const staleEffectStore = new Proxy({}, {
+        get() {
+          effectStoreTouched = true;
+          throw new Error("stale premise must fail before effect I/O");
+        },
+      });
+      expect(() => createInstalledReactiveModuleRuntime({
+        ...prepared.options,
+        effectIntentStore: staleEffectStore,
+      } as never)).toThrow(/stale|current Runtime authority|authority/u);
+      expect(effectStoreTouched).toBe(false);
+      expect(prepared.core.store.listModuleProcessRecords()).toEqual([]);
 
       await current.controller.release();
       released = true;
