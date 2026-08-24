@@ -17,9 +17,14 @@
 //! fails closed (`STORAGE_MIGRATION_REQUIRED` / `STORAGE_CORRUPT`) instead
 //! of being repaired.
 //!
-//! Storage is bounded: an intent insert past the pending-row ceiling or past
-//! the per-record JCS byte ceiling fails with `STORAGE_FULL` before any
-//! mutation, and every open-time gate re-verifies the same limits.
+//! Storage is bounded over the ENTIRE journal: an insert that would push the
+//! total row count past the authoritative whole-journal ceiling first runs
+//! safe deterministic retention (releasing only fully settled deterministic
+//! rows, never unresolved `INTENDED` rows or `UNKNOWN_OUTCOME` ambiguity
+//! evidence needed for recovery) and fails closed with `STORAGE_FULL` when
+//! retention cannot free capacity. The per-record JCS byte ceiling is also
+//! enforced before any mutation, and every open-time gate re-verifies the
+//! same limits.
 
 use dolly_canonical_json::{ParseLimits, Sha256Digest, deserialize_core_json};
 use dolly_tool_broker::ToolCallLedgerRecord;
@@ -35,13 +40,14 @@ use crate::error::{StorageError, StorageResult};
 /// The logical table this slice writes.
 pub const EFFECT_JOURNAL_TABLE: &str = "external_effect_journal";
 
-/// Bounded-storage ceilings for the journal slice (fail closed with
-/// `STORAGE_FULL` at the write gate; re-verified on every open-time gate).
-/// The per-record JCS ceiling is a generous fixed bound far below the
-/// protocol limit; it exists so an unbounded intent can never unboundedly
-/// grow the premise.
+/// Authoritative ceiling over the ENTIRE effect journal (all states, not only
+/// pending ones). Fail closed with `STORAGE_FULL` when an insert would exceed
+/// it and safe retention cannot free capacity. Kept deliberately far below
+/// the protocol byte floor so the premise never unboundedly grows.
+pub const MAX_EFFECT_JOURNAL_ROWS: u64 = 4096;
+/// The per-record JCS byte ceiling, a fixed bound far below the protocol
+/// limit, enforced before any mutation.
 pub const MAX_EFFECT_JOURNAL_JCS_BYTES: usize = 64 * 1024;
-pub const MAX_PENDING_INTENT_ROWS: u64 = 4096;
 
 /// The authoritative external-effect journal schema: the meta singleton, the
 /// journal table, and the recovery index. Autonomic (`IF NOT EXISTS`).
@@ -216,16 +222,20 @@ pub fn insert_intent(
 
     let tx = connection.transaction().map_err(map_sqlite_error)?;
 
-    // Pending-row ceiling (bounded storage: an unbounded backlog of
-    // unresolved intents is refused before it can grow).
-    let pending: i64 = tx
-        .query_row(
-            "SELECT COUNT(*) FROM external_effect_journal WHERE state = 'INTENDED'",
-            [],
-            |row| row.get(0),
-        )
+    // Whole-journal ceiling: run safe retention first inside the same
+    // transaction, then fail closed when the journal is still at the cap.
+    let total: i64 = tx
+        .query_row("SELECT COUNT(*) FROM external_effect_journal", [], |row| row.get(0))
         .map_err(map_sqlite_error)?;
-    if pending as u64 >= MAX_PENDING_INTENT_ROWS {
+    if (total as u64) >= MAX_EFFECT_JOURNAL_ROWS {
+        retain_bounded_rows(&tx)?;
+    }
+    // Re-check after retention: an intent that still cannot be admitted is a
+    // journal at its ceiling and its pending intent must be refused: STORAGE_FULL.
+    let total_after: i64 = tx
+        .query_row("SELECT COUNT(*) FROM external_effect_journal", [], |row| row.get(0))
+        .map_err(map_sqlite_error)?;
+    if (total_after as u64) >= MAX_EFFECT_JOURNAL_ROWS {
         return Err(StorageError::Full);
     }
 
@@ -281,6 +291,64 @@ pub fn insert_intent(
     Ok(EffectJournalInsertDisposition::Inserted {
         record: load_exact(connection, claim)?.ok_or(StorageError::Corrupt)?,
     })
+}
+
+/// Safe deterministic retention over the whole journal, run inside the
+/// insert transaction when the authoritative [`MAX_EFFECT_JOURNAL_ROWS`]
+/// ceiling is reached.
+///
+/// Only rows whose recovery job is already complete may be released: a row
+/// settled `APPLIED` or `NOT_APPLIED` by identity-matching deterministic
+/// provider evidence no longer participates in recovery. Rows that are still
+/// `INTENDED` (unresolved) or `UNKNOWN_OUTCOME` (ambiguity evidence needed by
+/// recovery) are NEVER deleted.
+///
+/// Deletion order is deterministic (lexicographic over the full frozen Claim
+/// identity of the deletable rows) so retention is reproducible. The caller
+/// re-checks the ceiling after this runs and fails closed (`STORAGE_FULL`) if
+/// capacity still cannot be freed.
+fn retain_bounded_rows(transaction: &Transaction<'_>) -> StorageResult<()> {
+    // Delete the deterministically oldest safe rows until the journal would
+    // have room again (below the whole-journal ceiling); a fresh recheck is
+    // cheap and keeps the transaction small.
+    loop {
+        let free: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM external_effect_journal
+                 WHERE state IN ('APPLIED', 'NOT_APPLIED')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let total: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM external_effect_journal", [], |row| row.get(0))
+            .map_err(map_sqlite_error)?;
+        if free == 0 || (total as u64) < MAX_EFFECT_JOURNAL_ROWS {
+            break;
+        }
+        // Delete exactly the rows needed to fall below the ceiling (an
+        // intent insert needs one slot), never more than the deletable set.
+        let delete = ((total as u64) - MAX_EFFECT_JOURNAL_ROWS + 1).min(free as u64) as i64;
+        transaction
+            .execute(
+                "DELETE FROM external_effect_journal
+                 WHERE rowid IN (
+                    SELECT rowid FROM external_effect_journal
+                    WHERE state IN ('APPLIED', 'NOT_APPLIED')
+                    ORDER BY instance_id, module_id, operation_id, claim_token
+                    LIMIT ?1
+                 )",
+                rusqlite::params![delete],
+            )
+            .map_err(map_sqlite_error)?;
+        let left: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM external_effect_journal", [], |row| row.get(0))
+            .map_err(map_sqlite_error)?;
+        if (left as u64) < MAX_EFFECT_JOURNAL_ROWS {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Settle `INTENDED` to `APPLIED`/`NOT_APPLIED`/`UNKNOWN_OUTCOME`.

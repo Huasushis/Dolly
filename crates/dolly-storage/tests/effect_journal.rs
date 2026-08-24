@@ -691,7 +691,7 @@ fn corrupt_digest_fails_closed_on_read() {
 fn pending_row_ceiling_refuses_unbounded_backlog() {
     let dir = tempdir();
     let mut db = open_db(dir.path());
-    let ceiling = dolly_storage::effect_journal::MAX_PENDING_INTENT_ROWS;
+    let ceiling = dolly_storage::effect_journal::MAX_EFFECT_JOURNAL_ROWS;
     // Fill to the ceiling with distinct operations (distinct claim contexts).
     for i in 0..ceiling {
         let record = intended_record(
@@ -770,5 +770,252 @@ fn jcs_byte_ceiling_refuses_overlarge_intent() {
             Err(StorageError::Full)
         ),
         "overlarge intent is refused before mutation"
+    );
+}
+#[test]
+fn retention_frees_only_fully_settled_rows_and_fails_closed_otherwise() {
+    let dir = tempdir();
+    let cap = dolly_storage::effect_journal::MAX_EFFECT_JOURNAL_ROWS;
+    let half = cap / 2;
+    let mut db = open_db(dir.path());
+    let mut settled_claims = Vec::new();
+    // Settle half the journal rows into APPLIED (deletable by retention).
+    for i in 0..half {
+        let record = intended_record(
+            &format!("op-s-{i}"),
+            digest(0x5f),
+            digest((i % 250) as u8 + 1),
+        );
+        assert!(matches!(
+            insert_intent(db.connection_mut(), &record),
+            Ok(EffectJournalInsertDisposition::Inserted { .. })
+        ), "settle-source {i}");
+        let applied = ExternalEffectJournalRecord {
+            journal_revision: 2,
+            state: EffectJournalState::Applied,
+            evidence_digest: Some(digest(0x6b)),
+            ..record.clone()
+        };
+        match cas_settle(
+            db.connection_mut(),
+            &EffectCasKey {
+                claim: claim_of(&record),
+                expected_journal_revision: 1,
+                expected_state: EffectJournalState::Intended,
+                correlation: Some(EffectCorrelation {
+                    operation_digest: record.operation_digest.clone(),
+                    intent_digest: record.intent_digest.clone(),
+                }),
+            },
+            &applied,
+        ) {
+            Ok(EffectCasOutcome::Committed { .. }) => settled_claims.push(claim_of(&record)),
+            other => panic!("expected committed settle, got {other:?}"),
+        }
+    }
+    // Fill the remaining half with pending intents (never deletable). The
+    // journal reaches its cap; retention has not run during the fill.
+    for i in half..cap {
+        let record = intended_record(
+            &format!("op-p-{i}"),
+            digest(0x5f),
+            digest((i % 250) as u8 + 1),
+        );
+        assert!(matches!(
+            insert_intent(db.connection_mut(), &record),
+            Ok(EffectJournalInsertDisposition::Inserted { .. })
+        ), "pending fill {i}");
+    }
+    assert_eq!(
+        enumerate_pending(db.connection()).unwrap().len() as u64,
+        half,
+        "journal is at its ceiling with half settled and half pending"
+    );
+    // The next intent hits the whole-journal cap, so retention runs: it
+    // releases exactly the capacity needed (only fully settled rows) and the
+    // intent commits. Deletion is deterministic: the oldest applied row by
+    // Claim identity (op-s-0) is released first; op-s-1 survives.
+    let admitted = intended_record("op-admitted", digest(0x60), digest(0x61));
+    match insert_intent(db.connection_mut(), &admitted).expect("retention frees capacity") {
+        EffectJournalInsertDisposition::Inserted { .. } => {}
+        other => panic!("expected a fresh insert after retention, got {other:?}"),
+    }
+    assert!(matches!(
+        load_exact(db.connection(), &settled_claims[0]),
+        Ok(None)
+    ), "the deterministically oldest settled row is released");
+    for claim in settled_claims.iter().skip(1) {
+        let loaded = load_exact(db.connection(), claim)
+            .expect("load")
+            .expect("younger settled row retained");
+        assert_eq!(loaded.state, EffectJournalState::Applied);
+    }
+    let after = enumerate_pending(db.connection()).expect("enumerate");
+    assert_eq!(after.len() as u64, half + 1, "pending rows survive retention");
+    assert!(after.iter().any(|r| r.claim.operation_id == "op-admitted"));
+    // Crash-and-reopen proves retention durability: released rows stay gone,
+    // pending rows survive intact, and retained settled rows survive.
+    drop(db);
+    let db = open_db(dir.path());
+    assert!(matches!(
+        load_exact(db.connection(), &settled_claims[0]),
+        Ok(None)
+    ), "no released row comes back on reopen");
+    for claim in settled_claims.iter().skip(1) {
+        let loaded = load_exact(db.connection(), claim)
+            .expect("load")
+            .expect("settled row present on reopen");
+        assert_eq!(loaded.state, EffectJournalState::Applied);
+    }
+    assert_eq!(
+        enumerate_pending(db.connection()).expect("enumerate").len() as u64,
+        half + 1,
+        "pending rows (never deletable) survive reopen intact"
+    );
+}
+
+#[test]
+fn unknown_outcome_rows_survive_capacity_retention() {
+    let dir = tempdir();
+    let cap = dolly_storage::effect_journal::MAX_EFFECT_JOURNAL_ROWS;
+    let quarter = cap / 4;
+    let mut db = open_db(dir.path());
+    let mut settled_claims = Vec::new();
+    // Settle to APPLIED (deletable).
+    for i in 0..quarter {
+        let record = intended_record(
+            &format!("op-a-{i}"),
+            digest(0x70),
+            digest((i % 250) as u8 + 1),
+        );
+        assert!(matches!(
+            insert_intent(db.connection_mut(), &record),
+            Ok(EffectJournalInsertDisposition::Inserted { .. })
+        ), "applied-source {i}");
+        let applied = ExternalEffectJournalRecord {
+            journal_revision: 2,
+            state: EffectJournalState::Applied,
+            evidence_digest: Some(digest(0x71)),
+            ..record.clone()
+        };
+        assert!(matches!(
+            cas_settle(
+                db.connection_mut(),
+                &EffectCasKey {
+                    claim: claim_of(&record),
+                    expected_journal_revision: 1,
+                    expected_state: EffectJournalState::Intended,
+                    correlation: Some(EffectCorrelation {
+                        operation_digest: record.operation_digest.clone(),
+                        intent_digest: record.intent_digest.clone(),
+                    }),
+                },
+                &applied,
+            ),
+            Ok(EffectCasOutcome::Committed { .. })
+        ), "applied settle {i}");
+        settled_claims.push(claim_of(&record));
+    }
+    let mut unknown_claims = Vec::new();
+    // Settle to UNKNOWN_OUTCOME (ambiguity evidence, never deletable).
+    for i in 0..quarter {
+        let record = intended_record(
+            &format!("op-u-{i}"),
+            digest(0x72),
+            digest((i % 250) as u8 + 1),
+        );
+        assert!(matches!(
+            insert_intent(db.connection_mut(), &record),
+            Ok(EffectJournalInsertDisposition::Inserted { .. })
+        ), "unknown-source {i}");
+        let unknown = ExternalEffectJournalRecord {
+            journal_revision: 2,
+            state: EffectJournalState::UnknownOutcome,
+            evidence_digest: None,
+            ..record.clone()
+        };
+        assert!(matches!(
+            cas_settle(
+                db.connection_mut(),
+                &EffectCasKey {
+                    claim: claim_of(&record),
+                    expected_journal_revision: 1,
+                    expected_state: EffectJournalState::Intended,
+                    correlation: None,
+                },
+                &unknown,
+            ),
+            Ok(EffectCasOutcome::Committed { .. })
+        ), "unknown settle {i}");
+        unknown_claims.push(claim_of(&record));
+    }
+    // Fill the remaining half with pending intents (never deletable) up to
+    // the whole-journal cap; retention has not run during the fill.
+    for i in (2 * quarter)..cap {
+        let record = intended_record(
+            &format!("op-q-{i}"),
+            digest(0x73),
+            digest((i % 250) as u8 + 1),
+        );
+        assert!(matches!(
+            insert_intent(db.connection_mut(), &record),
+            Ok(EffectJournalInsertDisposition::Inserted { .. })
+        ), "pending fill {i}");
+    }
+    assert_eq!(enumerate_pending(db.connection()).unwrap().len() as u64, 2 * quarter);
+    // Capacity retention fires on the next intent and releases only the
+    // APPLIED rows (deterministically oldest first): every UNKNOWN_OUTCOME
+    // ambiguity record survives.
+    let admitted = intended_record("op-u-admitted", digest(0x74), digest(0x75));
+    assert!(matches!(
+        insert_intent(db.connection_mut(), &admitted),
+        Ok(EffectJournalInsertDisposition::Inserted { .. })
+    ), "retention frees capacity so the intent commits");
+    assert!(matches!(
+        load_exact(db.connection(), &settled_claims[0]),
+        Ok(None)
+    ), "the deterministically oldest applied row is released");
+    for claim in settled_claims.iter().skip(1) {
+        let loaded = load_exact(db.connection(), claim)
+            .expect("load")
+            .expect("younger applied row retained");
+        assert_eq!(loaded.state, EffectJournalState::Applied);
+    }
+    for claim in &unknown_claims {
+        let loaded = load_exact(db.connection(), claim)
+            .expect("load")
+            .expect("UNKNOWN_OUTCOME row present");
+        assert_eq!(loaded.state, EffectJournalState::UnknownOutcome);
+    }
+    let pending = enumerate_pending(db.connection()).unwrap();
+    assert_eq!(pending.len() as u64, 2 * quarter + 1, "pending rows survive retention");
+    assert!(pending.iter().any(|r| r.claim.operation_id == "op-u-admitted"));
+    // Crash-and-reopen durability: released rows stay gone, UNKNOWN_OUTCOME
+    // rows stay, pending rows survive.
+    drop(db);
+    let db = open_db(dir.path());
+    assert!(matches!(
+        load_exact(db.connection(), &settled_claims[0]),
+        Ok(None)
+    ), "no released row comes back on reopen");
+    for claim in settled_claims.iter().skip(1) {
+        assert_eq!(
+            load_exact(db.connection(), claim)
+                .expect("load")
+                .expect("settled row on reopen")
+                .state,
+            EffectJournalState::Applied
+        );
+    }
+    for claim in &unknown_claims {
+        let loaded = load_exact(db.connection(), claim)
+            .expect("load")
+            .expect("UNKNOWN_OUTCOME row present on reopen");
+        assert_eq!(loaded.state, EffectJournalState::UnknownOutcome);
+    }
+    assert_eq!(
+        enumerate_pending(db.connection()).unwrap().len() as u64,
+        2 * quarter + 1,
+        "pending rows survive reopen intact"
     );
 }

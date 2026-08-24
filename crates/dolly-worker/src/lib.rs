@@ -8,21 +8,34 @@ use dolly_canonical_json::{
 };
 use dolly_core_domain::ExtensionId;
 use dolly_storage::Database;
-use dolly_storage::effect_journal::{create_effect_journal_schema, settle_pending_effect_journal};
+use dolly_storage::effect_journal::{
+    EffectJournalInsertDisposition, create_effect_journal_schema, insert_intent,
+    settle_pending_effect_journal,
+};
 use dolly_storage::host_authority::load_current_authority;
 use dolly_storage::mcp_readiness::{MCP_PROTOCOL_VERSION_2025_06_18, McpTransportReadiness};
 use dolly_storage::runtime_binding::{
-    ProcessGeneration, RuntimeBinding, invalidate_runtime_binding, mint_current_runtime_binding,
+    ProcessGeneration, RuntimeBinding, RuntimeBindingError, invalidate_runtime_binding,
+    mint_current_runtime_binding,
 };
+#[cfg(feature = "test-support")]
+use dolly_storage::linux_host_verification::VerifiedLinuxHostProof;
+#[cfg(feature = "test-support")]
+use dolly_storage::runtime_binding::mint_runtime_binding;
 use dolly_storage::tool_broker_authority::{
     ToolDispatchAuthority, ToolRegistryRevision, authorize_tool_dispatch, publish_tool_registry,
 };
 use dolly_storage::tool_ledger::create_tool_ledger_schema;
 use dolly_tool_broker::{AdmissionOutcome, LedgerState, RecoveryFacts, ToolCallLedgerRecord};
+use dolly_tool_broker::effect_journal::{
+    Claim, ClaimRecordSchemaTag, EffectClass, EffectJournalRecordSchemaTag, EffectJournalState,
+    ExternalEffectJournalRecord, derive_claim_token,
+};
 use dolly_tool_coordinator::{
-    DispatchError, DispatchLimits, DispatchOutcome, HostMcpStdioInstalledChildAttestation,
-    HostMcpStdioInvocation, HostMcpStdioProcessHandle, StdioTransportError, StdioTransportLimits,
-    ToolDispatchService, dispatch_operation_authorized_reusable,
+    DispatchError, DispatchLimits, DispatchOutcome,
+    HostMcpStdioInstalledChildAttestation, HostMcpStdioInvocation, HostMcpStdioProcessHandle,
+    StdioTransportError, StdioTransportLimits, ToolDispatchService,
+    dispatch_operation_authorized_reusable,
 };
 use thiserror::Error;
 
@@ -69,6 +82,7 @@ pub struct Worker {
     registry: ToolRegistryRevision,
     dispatch_authority: ToolDispatchAuthority,
     service: ToolDispatchService,
+    package_digest: Sha256Digest,
     invocation: Option<HostMcpStdioInvocation>,
     process_handle: HostMcpStdioProcessHandle,
     stopped: bool,
@@ -78,6 +92,33 @@ impl Worker {
     /// Execute the bounded Linux-first startup sequence and retain one
     /// verified, initialized stdio session for the next tools/call dispatch.
     pub fn start(config: WorkerStartConfig) -> Result<Self, WorkerError> {
+        Self::start_internal(config, mint_current_runtime_binding, false)
+    }
+
+    /// Test-support constructor: drives the identical production startup
+    /// path but mints the runtime binding from an injected, already-verified
+    /// Host proof instead of re-observing the live Linux host. Gated to the
+    /// `test-support` feature; production builds never expose it.
+    #[cfg(feature = "test-support")]
+    pub fn start_with_verified_proof(
+        config: WorkerStartConfig,
+        verified_proof: VerifiedLinuxHostProof,
+    ) -> Result<Self, WorkerError> {
+        Self::start_internal(
+            config,
+            move |db, alias| mint_runtime_binding(db, alias, verified_proof),
+            true,
+        )
+    }
+
+    fn start_internal<F>(
+        config: WorkerStartConfig,
+        mint: F,
+        use_test_readiness: bool,
+    ) -> Result<Self, WorkerError>
+    where
+        F: FnOnce(&mut Database, ExtensionId) -> Result<RuntimeBinding, RuntimeBindingError>,
+    {
         if !cfg!(target_os = "linux") {
             return Err(WorkerError::UnsupportedPlatform);
         }
@@ -126,9 +167,8 @@ impl Worker {
             .checked_add(durable_server.startup_timeout)
             .ok_or_else(|| WorkerError::Process("startup deadline overflow".into()))?;
         let session_id = new_session_id()?;
-        let mut runtime_binding =
-            mint_current_runtime_binding(&mut database, config.extension_alias.clone())
-                .map_err(|error| WorkerError::Authority(error.to_string()))?;
+        let mut runtime_binding = mint(&mut database, config.extension_alias.clone())
+            .map_err(|error| WorkerError::Authority(error.to_string()))?;
         let process_generation = match runtime_binding.mint_process_generation(&mut database) {
             Ok(generation) => generation,
             Err(error) => {
@@ -202,22 +242,46 @@ impl Worker {
                 ));
             }
         };
-        let readiness = match invocation.initialize(
-            &database,
-            &runtime_binding,
-            &process_generation,
-            &config.server_id,
-            startup_deadline,
-        ) {
-            Ok(readiness) => readiness,
-            Err(error) => {
-                return Err(startup_failure(
-                    &mut database,
+        let readiness = {
+            #[cfg(feature = "test-support")]
+            let result = if use_test_readiness {
+                invocation.initialize_with_verified_proof(
+                    &database,
                     &runtime_binding,
-                    Some(&process_generation),
-                    Some(&process_handle),
-                    WorkerError::Transport(error),
-                ));
+                    &process_generation,
+                    &config.server_id,
+                    startup_deadline,
+                )
+            } else {
+                invocation.initialize(
+                    &database,
+                    &runtime_binding,
+                    &process_generation,
+                    &config.server_id,
+                    startup_deadline,
+                )
+            };
+            #[cfg(not(feature = "test-support"))]
+            let _ = use_test_readiness;
+            #[cfg(not(feature = "test-support"))]
+            let result = invocation.initialize(
+                &database,
+                &runtime_binding,
+                &process_generation,
+                &config.server_id,
+                startup_deadline,
+            );
+            match result {
+                Ok(readiness) => readiness,
+                Err(error) => {
+                    return Err(startup_failure(
+                        &mut database,
+                        &runtime_binding,
+                        Some(&process_generation),
+                        Some(&process_handle),
+                        WorkerError::Transport(error),
+                    ));
+                }
             }
         };
         let registry = match publish_tool_registry(
@@ -264,6 +328,7 @@ impl Worker {
             registry,
             dispatch_authority,
             service,
+            package_digest: durable_server.package_digest.clone(),
             invocation: Some(invocation),
             process_handle,
             stopped: false,
@@ -306,6 +371,22 @@ impl Worker {
         if self.stopped {
             return Err(WorkerError::Stopped);
         }
+        // Durable Claim-bound intent BEFORE any child I/O: the intent is
+        // durably recorded, then the child is touched. A persistence failure
+        // or an identity collision (the same Claim already recorded) fails the
+        // dispatch closed; nothing dispatches on a missing or replayed intent.
+        // A settled row never reaches this seam (new attempt requires a new
+        // Claim, so an already-settled row cannot be re-dispatched).
+        let intent = self.mint_intent_record(row, request_bytes)?;
+        match insert_intent(self.database.connection_mut(), &intent) {
+            Ok(EffectJournalInsertDisposition::Inserted { .. }) => {}
+            Ok(EffectJournalInsertDisposition::Replayed { .. }) => {
+                return Err(WorkerError::Premise(
+                    "durable intent already recorded for this Claim; refusing a re-dispatch — a new attempt requires a new Claim".into(),
+                ));
+            }
+            Err(error) => return Err(WorkerError::Storage(error.to_string())),
+        }
         let invocation = self.invocation.as_mut().ok_or(WorkerError::Stopped)?;
         invocation.set_request_bytes(request_bytes.to_vec());
         let outcome = dispatch_operation_authorized_reusable(
@@ -331,6 +412,60 @@ impl Worker {
             self.stop()?;
         }
         outcome
+    }
+
+    /// Mint the exact Claim-bound `INTENDED` intent record for one dispatch.
+    ///
+    /// The Claim binds the operation identity to this Worker incarnation's
+    /// authority context (controller generation, process generation, Worker
+    /// epoch, installed package digest, and policy premise). The intent digest
+    /// is the digest of the exact request-frame bytes about to be written to
+    /// the child. An identity failure fails closed before any child I/O.
+    fn mint_intent_record(
+        &self,
+        row: &ToolCallLedgerRecord,
+        request_bytes: &[u8],
+    ) -> Result<ExternalEffectJournalRecord, WorkerError> {
+        let binding = &row.operation_binding;
+        let worker_epoch = self.runtime_binding.worker_epoch().to_string();
+        let package_digest = self.package_digest.clone();
+        let policy_premise_digest = self.runtime_binding.premises_digest().clone();
+        let claim_token = derive_claim_token(
+            &binding.instance_id,
+            &binding.module_id,
+            &binding.operation_id,
+            self.runtime_binding.controller_generation().value(),
+            self.process_generation.extension_generation().value(),
+            &worker_epoch,
+            &package_digest,
+            &policy_premise_digest,
+            EffectClass::McpToolsCall,
+        );
+        let intent = ExternalEffectJournalRecord {
+            schema: EffectJournalRecordSchemaTag,
+            journal_revision: 1,
+            state: EffectJournalState::Intended,
+            claim: Claim {
+                schema: ClaimRecordSchemaTag,
+                instance_id: binding.instance_id.clone(),
+                module_id: binding.module_id.clone(),
+                operation_id: binding.operation_id.clone(),
+                claim_token,
+            },
+            controller_generation: self.runtime_binding.controller_generation().value(),
+            extension_generation: self.process_generation.extension_generation().value(),
+            worker_epoch,
+            package_digest,
+            policy_premise_digest,
+            operation_digest: row.operation_digest.clone(),
+            effect_class: EffectClass::McpToolsCall,
+            intent_digest: Sha256Digest::compute(request_bytes),
+            evidence_digest: None,
+        };
+        intent
+            .verify()
+            .map_err(|error| WorkerError::Premise(format!("intent identity invalid: {error}")))?;
+        Ok(intent)
     }
 
     /// Stop and reap the retained child, then invalidate its durable

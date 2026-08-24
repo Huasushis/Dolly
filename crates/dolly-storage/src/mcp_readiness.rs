@@ -433,8 +433,8 @@ where
     )
 }
 
-#[cfg(test)]
-pub(crate) fn test_prove_current_mcp_transport_readiness<P>(
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_prove_current_mcp_transport_readiness<P>(
     connection: &Connection,
     runtime_binding: &RuntimeBinding,
     process_generation: &ProcessGeneration,
