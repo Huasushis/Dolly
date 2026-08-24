@@ -24,12 +24,36 @@ the same exclusive instance controller lock, SQLite attestation, WAL,
 `synchronous=FULL`, foreign keys, disabled trusted schema, schema version, and
 integrity checks used by Core.
 
-Schema version 1 stores an append-only mapping from each positive integer config
-revision to exact canonical resolved-config bytes and their SHA-256 digest. An
-exact current digest and byte match reuses the current revision. A changed
-current digest allocates the next integer; historical digest equality is
-ignored, so `A -> B -> A` allocates a new revision. Digests are integrity fields,
-not globally unique keys or integer allocators.
+The logical record discriminator remains `runtime-authority-record/v1`
+(`dolly.runtime-authority-state/v1` for the state record). It is distinct from
+the Host physical projection gate. The shared physical authority projection is
+`HOST_AUTHORITY_SCHEMA_VERSION = 2` and MUST contain:
+
+- `host_authority_meta(singleton, authority_schema_version = 2)`;
+- identity-bearing `config_revision_mappings` parent rows with
+  `(daemon_installation_id, instance_id, config_revision, config_digest,
+  canonical_bytes)`;
+- the complete installed-origin, policy-definition, backend-binding,
+  service-candidate, premise, and premise-selection parent tables;
+- `runtime_authority_state` with the authority identity pair,
+  `controller_generation_id`, current revision/digest, and exact `record_jcs`;
+- `core_meta` controller generation matching the state row.
+
+Every stored record is parsed under the shared depth/size parser limits and
+must round-trip byte-for-byte to canonical JSON (JCS). Every digest is
+recomputed from those canonical bytes and compared to its indexed projection;
+raw-hash equality alone is not sufficient. Missing, malformed, non-canonical,
+unknown-schema, identity-mismatched, digest-mismatched, foreign-key-invalid,
+or generation-mismatched reachable state is corruption and MUST fail closed.
+The physical v2 gate MUST NOT accept a parallel `config_revisions` table or
+use a digest-to-integer mapping.
+
+Schema user version 1 stores an append-only mapping from each positive integer
+config revision to exact canonical resolved-config bytes and their SHA-256
+digest. An exact current digest and byte match reuses the current revision. A
+changed current digest allocates the next integer; historical digest equality
+is ignored, so `A -> B -> A` allocates a new revision. Digests are integrity
+fields, not globally unique keys or integer allocators.
 
 The same transaction inserts the new mapping; exact installed-component
 origins, permission-policy definitions and backend bindings; one product-owned
@@ -38,6 +62,15 @@ Module activation premise last, then updates the current pointer and journal.
 Commit exposes all or none. The closed records contain no secret, endpoint
 credential, path, function, live object, capability, runtime binding, stop
 prover, or recovery handoff.
+
+The pre-bridge TypeScript v1 physical projection (no
+`host_authority_meta`, no controller generation, and mapping rows without the
+identity pair) is an explicit migration source only. Rust migration and the
+TypeScript `migrateV1Authority` entry point validate the complete old current
+projection before one immediate transaction adds identity-bearing parent
+columns, creates the v1 migration marker, rewrites the state row to physical
+v2, and reopens through the v2 gate. Ordinary open never silently repairs or
+downgrades either schema.
 
 Legacy JSON import is offline under the same lock. It validates, normalizes,
 digests, and commits schema version 1 once. Before commit it remains only import

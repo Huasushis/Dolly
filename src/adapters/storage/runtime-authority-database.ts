@@ -1,17 +1,19 @@
 /**
  * H1 Runtime SQLite authority database repository.
  *
- * Owns the durable "Runtime authority database schema version 1" defined in
- * `dolly-spec/docs/spec/core/06-storage-and-recovery.md` section 3.1 and the
- * closed records in `dolly-spec/schemas/runtime-authority-record.schema.json`
- * (spec snapshot 41d6476). It opens the shared database through the H0
- * Host-internal native SQLite loader/attestation adapter, so every open first
- * attests the pinned SQLite build and the durable PRAGMA profile before any
- * repository method runs.
+ * Owns the durable Runtime authority record contract. The logical records
+ * retain the `.../v1` discriminators from ADR 0015; the Host-owned physical
+ * authority projection is schema version 2 and is shared byte-for-byte with
+ * Rust (`host_authority_meta`, identity-bearing parent mappings, and the
+ * controller generation projection).
+ *
+ * It opens the shared database through the H0 Host-internal native SQLite
+ * loader/attestation adapter, so every open first attests the pinned SQLite
+ * build and the durable PRAGMA profile before any repository method runs.
  *
  * Scope boundary: this is an internal storage repository. It does NOT wire the
- * database into the daemon, bootstrap, installed-Linux activation, live binding
- * resolver, or any product composition, and it does not touch
+ * database into the daemon, bootstrap, installed-Linux activation, live
+ * binding resolver, or any product composition, and it does not touch
  * `InstanceConfigStore` - legacy JSON import commits SQLite as the sole
  * authority and never dual-writes or updates the JSON instance store.
  *
@@ -46,12 +48,17 @@ import {
   FileCoreHistoryStore,
   type FileCoreHistoryOptions,
 } from "../../core/file-core-history.js";
-
 /** Largest revision a conforming database may assign (REQ-AUTH-002 step 4). */
 export const MAX_CONFIG_REVISION = 9_007_199_254_740_991;
 
-/** `PRAGMA user_version` for the supported Runtime authority schema version 1. */
+/** `PRAGMA user_version` for the shared Core database schema. */
 export const RUNTIME_AUTHORITY_SCHEMA_VERSION = 1;
+
+/** Physical Host authority projection version (logical records remain `/v1`). */
+export const HOST_AUTHORITY_SCHEMA_VERSION = 2;
+
+/** Logical closed-record discriminator version. */
+export const RUNTIME_AUTHORITY_RECORD_SCHEMA_VERSION = 1;
 
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const UUIDV7_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -59,7 +66,6 @@ const STABLE_ID_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
 const QUALIFIED_NAME_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*)+$/u;
 const UNIT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,246}\.service$/u;
 const URI_REFERENCE_PATTERN = /^.{1,512}$/us;
-
 export type RuntimeAuthorityDatabaseErrorCode =
   | "CONTROLLER_LOCK_NOT_HELD"
   | "STORAGE_INSTANCE_LOCKED"
@@ -104,6 +110,12 @@ export interface RuntimeAuthorityIdentity {
 /** Caller-held controller-lock handle the repository asserts before writes. */
 export interface RuntimeAuthorityLockHandle {
   readonly held: boolean;
+  /**
+   * The concrete controller exposes this under `info`; test doubles may expose
+   * the direct projection. One of the two is required for a committed write.
+   */
+  readonly controllerGenerationId?: string;
+  readonly info?: { readonly controllerGenerationId: string };
   assertHeld(): void;
 }
 
@@ -183,6 +195,7 @@ export interface ModuleActivationPremises {
 export interface CurrentAuthoritySnapshot {
   readonly config_revision: number;
   readonly config_digest: string;
+  readonly controller_generation_id: string;
   /** Exact canonical resolved-config bytes of the current revision. */
   readonly canonicalConfigBytes: Uint8Array;
   readonly canonicalConfig: JsonValue;
@@ -332,6 +345,18 @@ function assertClosedRecord(value: unknown, keys: readonly string[], label: stri
 function validateIdentity(identity: RuntimeAuthorityIdentity): void {
   if (!identity || !UUIDV7_PATTERN.test(identity.daemonInstallationId)) throw malformed("identity.daemonInstallationId");
   if (!STABLE_ID_PATTERN.test(identity.instanceId)) throw malformed("identity.instanceId");
+}
+function controllerGenerationFromLock(lock: RuntimeAuthorityLockHandle): string {
+  const direct = lock.controllerGenerationId;
+  const nested = lock.info?.controllerGenerationId;
+  const generation = direct ?? nested;
+  if (typeof generation !== "string" || !UUIDV7_PATTERN.test(generation)) {
+    throw new RuntimeAuthorityDatabaseError(
+      "CONTROLLER_LOCK_NOT_HELD",
+      "The controller lock does not expose a valid live controller generation",
+    );
+  }
+  return generation;
 }
 
 function validateOrigin(value: unknown, label: string): InstalledComponentOrigin {
@@ -495,18 +520,35 @@ function originKey(origin: InstalledComponentOrigin): string {
 }
 
 // ---------------------------------------------------------------------------
-// Schema version 1 (physical normalization of spec section 3.1)
+// Physical Host schema version 2. Logical record discriminators remain /v1.
 // ---------------------------------------------------------------------------
 
 export const RUNTIME_AUTHORITY_SCHEMA_SQL = `
 CREATE TABLE core_meta (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
-  daemon_installation_id TEXT NOT NULL,
-  instance_id TEXT NOT NULL
+  schema_version INTEGER NOT NULL,
+  daemon_installation_id TEXT,
+  instance_id TEXT,
+  controller_generation_id TEXT,
+  clean_shutdown INTEGER NOT NULL CHECK (clean_shutdown IN (0, 1)),
+  sqlite_version_number INTEGER NOT NULL,
+  sqlite_source_id TEXT NOT NULL,
+  sqlite_artifact_digest TEXT NOT NULL
 );
+CREATE TABLE commit_sequence (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  next_value INTEGER NOT NULL
+);
+CREATE TABLE host_authority_meta (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = ${HOST_AUTHORITY_SCHEMA_VERSION})
+);
+INSERT INTO host_authority_meta (singleton, authority_schema_version)
+  VALUES (1, ${HOST_AUTHORITY_SCHEMA_VERSION});
 CREATE TABLE config_revision_mappings (
   config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND ${MAX_CONFIG_REVISION}),
+  daemon_installation_id TEXT NOT NULL,
+  instance_id TEXT NOT NULL,
   config_digest TEXT NOT NULL,
   canonical_bytes BLOB NOT NULL,
   UNIQUE (config_revision, config_digest)
@@ -598,9 +640,10 @@ CREATE TABLE module_activation_premises (
 );
 CREATE TABLE runtime_authority_state (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
+  authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = ${HOST_AUTHORITY_SCHEMA_VERSION}),
   daemon_installation_id TEXT NOT NULL,
   instance_id TEXT NOT NULL,
+  controller_generation_id TEXT NOT NULL,
   current_config_revision INTEGER NOT NULL CHECK (current_config_revision BETWEEN 1 AND ${MAX_CONFIG_REVISION}),
   current_config_digest TEXT NOT NULL,
   record_jcs BLOB NOT NULL,
@@ -617,16 +660,18 @@ CREATE TABLE core_journal (
 );
 `;
 
-function stateRecord(identity: RuntimeAuthorityIdentity, revision: number, digest: string): JsonValue {
+function stateRecord(identity: RuntimeAuthorityIdentity, controllerGenerationId: string, revision: number, digest: string): JsonValue {
   return {
     schema: "dolly.runtime-authority-state/v1",
-    authority_schema_version: RUNTIME_AUTHORITY_SCHEMA_VERSION,
+    authority_schema_version: HOST_AUTHORITY_SCHEMA_VERSION,
     daemon_installation_id: identity.daemonInstallationId,
     instance_id: identity.instanceId,
+    controller_generation_id: controllerGenerationId,
     current_config_revision: revision,
     current_config_digest: digest,
   };
 }
+
 
 /**
  * Internal repository over the Runtime authority database. A caller must hold
@@ -637,12 +682,19 @@ export class RuntimeAuthorityDatabase {
   readonly #connection: RuntimeSqliteConnection;
   readonly #identity: RuntimeAuthorityIdentity;
   readonly #lock: RuntimeAuthorityLockHandle;
+  readonly #controllerGenerationId: string;
   #closed = false;
 
-  private constructor(connection: RuntimeSqliteConnection, identity: RuntimeAuthorityIdentity, lock: RuntimeAuthorityLockHandle) {
+  private constructor(
+    connection: RuntimeSqliteConnection,
+    identity: RuntimeAuthorityIdentity,
+    lock: RuntimeAuthorityLockHandle,
+    controllerGenerationId: string,
+  ) {
     this.#connection = connection;
     this.#identity = identity;
     this.#lock = lock;
+    this.#controllerGenerationId = controllerGenerationId;
   }
 
   /** Opens through the H0 attested loader and verifies the committed DB (REQ-AUTH-004). */
@@ -657,14 +709,51 @@ export class RuntimeAuthorityDatabase {
         "A legitimate controller lock owner must open the Runtime authority database for writing",
       );
     }
+    const controllerGenerationId = controllerGenerationFromLock(options.lock);
     const handle = openAttestedNativeSqlite(options.path);
     try {
-      const repository = new RuntimeAuthorityDatabase(asRuntimeSqliteConnection(handle.database), options.identity, options.lock);
+      const repository = new RuntimeAuthorityDatabase(
+        asRuntimeSqliteConnection(handle.database),
+        options.identity,
+        options.lock,
+        controllerGenerationId,
+      );
       repository.#verifyOnOpen();
       return repository;
     } catch (error) {
       handle.close();
       throw error;
+    }
+  }
+  /**
+   * Performs the one explicit bridge from the pre-H1 TypeScript projection.
+   * Ordinary `open` refuses that shape with STORAGE_MIGRATION_REQUIRED; this
+   * entry point is the only path that may normalize it.
+   */
+  static migrateV1Authority(options: RuntimeAuthorityDatabaseOptions): void {
+    validateIdentity(options.identity);
+    if (typeof options.path !== "string" || options.path.length === 0 || options.path.includes("\0")) {
+      throw new TypeError("Runtime authority database path must be a non-empty filesystem path");
+    }
+    if (!options.lock || !options.lock.held) {
+      throw new RuntimeAuthorityDatabaseError(
+        "CONTROLLER_LOCK_NOT_HELD",
+        "A legitimate controller lock owner must run the Runtime authority migration",
+      );
+    }
+    const controllerGenerationId = controllerGenerationFromLock(options.lock);
+    const handle = openAttestedNativeSqlite(options.path);
+    try {
+      const repository = new RuntimeAuthorityDatabase(
+        asRuntimeSqliteConnection(handle.database),
+        options.identity,
+        options.lock,
+        controllerGenerationId,
+      );
+      repository.#migrateLegacyV1();
+      repository.#verifyOnOpen();
+    } finally {
+      handle.close();
     }
   }
 
@@ -726,6 +815,9 @@ export class RuntimeAuthorityDatabase {
 
   get identity(): RuntimeAuthorityIdentity {
     return { ...this.#identity };
+  }
+  get controllerGenerationId(): string {
+    return this.#controllerGenerationId;
   }
 
   /**
@@ -845,6 +937,13 @@ export class RuntimeAuthorityDatabase {
         "Writable Runtime authority access requires the caller-held instance controller lock",
       );
     }
+    this.#lock.assertHeld();
+    if (controllerGenerationFromLock(this.#lock) !== this.#controllerGenerationId) {
+      throw new RuntimeAuthorityDatabaseError(
+        "CONTROLLER_LOCK_NOT_HELD",
+        "The controller generation changed while this Runtime authority handle was open",
+      );
+    }
   }
 
   #fileCoreHistoryProducerCapability() {
@@ -909,6 +1008,7 @@ export class RuntimeAuthorityDatabase {
     return new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `Runtime authority database is corrupt: ${detail}`);
   }
 
+
   // -------------------------------------------------------------------------
   // Open verification (REQ-AUTH-004)
   // -------------------------------------------------------------------------
@@ -930,8 +1030,170 @@ export class RuntimeAuthorityDatabase {
     return typeof value === "number" ? value : Number(value ?? 0);
   }
 
+  #migrateLegacyV1(): void {
+    this.#requireOpen();
+    if (this.#userVersion() !== RUNTIME_AUTHORITY_SCHEMA_VERSION) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_MIGRATION_REQUIRED",
+        "Only the pre-H1 user_version 1 authority projection can be migrated",
+      );
+    }
+    const hostTable = this.#connection.prepare(
+      "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'host_authority_meta'",
+    ).get();
+    const hostVersion = hostTable
+      ? Number(this.#connection.prepare(
+          "SELECT authority_schema_version FROM host_authority_meta WHERE singleton = 1",
+        ).get()?.authority_schema_version)
+      : null;
+    if (hostVersion !== null && hostVersion !== 1) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_MIGRATION_REQUIRED",
+        "The physical Host authority schema is not an expected v1 migration source",
+      );
+    }
+    const coreColumns = new Set(
+      this.#connection.prepare("PRAGMA table_info(core_meta)").all().map((column) => String(column.name)),
+    );
+    const runtimeColumns = new Set(
+      this.#connection.prepare("PRAGMA table_info(runtime_authority_state)").all().map((column) => String(column.name)),
+    );
+    const typescriptV1 = hostVersion === null && coreColumns.has("authority_schema_version") && !coreColumns.has("schema_version");
+    const rustV1 = hostVersion === 1 && coreColumns.has("schema_version");
+    if ((!typescriptV1 && !rustV1) || runtimeColumns.has("controller_generation_id")) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_MIGRATION_REQUIRED",
+        "The database is not an expected v1 authority migration source",
+      );
+    }
+    const state = this.#connection.prepare(
+      "SELECT authority_schema_version, daemon_installation_id, instance_id, current_config_revision, current_config_digest, record_jcs FROM runtime_authority_state WHERE singleton = 1",
+    ).get();
+    if (!state || Number(state.authority_schema_version) !== RUNTIME_AUTHORITY_RECORD_SCHEMA_VERSION) {
+      throw this.#corrupt("legacy authority-state singleton is missing or has an unknown record version");
+    }
+    if (state.daemon_installation_id !== this.#identity.daemonInstallationId || state.instance_id !== this.#identity.instanceId) {
+      throw this.#corrupt("legacy authority-state identity does not match the requested tuple");
+    }
+    const revision = Number(state.current_config_revision);
+    const digest = String(state.current_config_digest);
+    const mapping = this.#resolveMapping(revision, digest);
+    if (mapping === null) throw this.#corrupt("legacy current pointer references a missing mapping");
+    const legacyRecord = parseCanonicalJsonBytes(toBytes(state.record_jcs));
+    assertCanonicalJsonValue(legacyRecord);
+    if (!sameBytes(toBytes(state.record_jcs), canonicalBytes(legacyRecord))) {
+      throw this.#corrupt("legacy authority-state record_jcs is not canonical");
+    }
+
+    this.#statement("BEGIN IMMEDIATE").run();
+    try {
+      const sqliteIdentity = this.#connection.prepare(
+        "SELECT sqlite_version() AS version, sqlite_source_id() AS source_id",
+      ).get();
+      const versionParts = String(sqliteIdentity?.version ?? "").split(".").map((part) => Number(part));
+      const versionNumber =
+        versionParts.length === 3 && versionParts.every((part) => Number.isSafeInteger(part))
+          ? (versionParts[0] ?? 0) * 1_000_000 + (versionParts[1] ?? 0) * 1_000 + (versionParts[2] ?? 0)
+          : 0;
+      const sourceId = String(sqliteIdentity?.source_id ?? "");
+      const artifactDigest = sha256DigestOfBytes(Buffer.from(sourceId, "utf8"));
+      for (const [column, sqlType] of [
+        ["schema_version", "INTEGER"],
+        ["clean_shutdown", "INTEGER"],
+        ["sqlite_version_number", "INTEGER"],
+        ["sqlite_source_id", "TEXT"],
+        ["sqlite_artifact_digest", "TEXT"],
+        ["controller_generation_id", "TEXT"],
+      ] as const) {
+        if (!coreColumns.has(column)) {
+          this.#connection.prepare(`ALTER TABLE core_meta ADD COLUMN ${column} ${sqlType}`).run();
+        }
+      }
+      if (typescriptV1) {
+        this.#connection.prepare(
+          "UPDATE core_meta SET schema_version = authority_schema_version, clean_shutdown = 0, sqlite_version_number = ?, sqlite_source_id = ?, sqlite_artifact_digest = ?, controller_generation_id = ? WHERE singleton = 1",
+        ).run(
+          versionNumber,
+          sourceId,
+          artifactDigest,
+          this.#controllerGenerationId,
+        );
+      } else {
+        this.#connection.prepare(
+          "UPDATE core_meta SET controller_generation_id = ? WHERE singleton = 1",
+        ).run(this.#controllerGenerationId);
+      }
+      const mappingColumns = new Set(
+        this.#connection.prepare("PRAGMA table_info(config_revision_mappings)").all().map((entry) => String(entry.name)),
+      );
+      for (const [column, sqlType] of [
+        ["daemon_installation_id", "TEXT"],
+        ["instance_id", "TEXT"],
+      ] as const) {
+        if (!mappingColumns.has(column)) {
+          this.#connection.prepare(`ALTER TABLE config_revision_mappings ADD COLUMN ${column} ${sqlType}`).run();
+        }
+      }
+      if (hostVersion === 1) {
+        this.#connection.prepare("DROP TABLE host_authority_meta").run();
+      }
+      this.#connection.prepare(
+        "CREATE TABLE host_authority_meta (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 2))",
+      ).run();
+      this.#connection.prepare(
+        "INSERT INTO host_authority_meta (singleton, authority_schema_version) VALUES (1, 2)",
+      ).run();
+      const commitSequence = this.#connection.prepare(
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'commit_sequence'",
+      ).get();
+      if (!commitSequence) {
+        this.#connection.prepare(
+          "CREATE TABLE commit_sequence (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_value INTEGER NOT NULL)",
+        ).run();
+        this.#connection.prepare(
+          "INSERT INTO commit_sequence (singleton, next_value) SELECT 1, COALESCE(MAX(config_revision), 0) + 1 FROM config_revision_mappings",
+        ).run();
+      }
+      const recordBytes = Buffer.from(canonicalBytes(
+        stateRecord(this.#identity, this.#controllerGenerationId, revision, digest),
+      ));
+      this.#connection.prepare(
+        "CREATE TABLE runtime_authority_state_v2 (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 2), daemon_installation_id TEXT NOT NULL, instance_id TEXT NOT NULL, controller_generation_id TEXT NOT NULL, current_config_revision INTEGER NOT NULL CHECK (current_config_revision BETWEEN 1 AND 9007199254740991), current_config_digest TEXT NOT NULL, record_jcs BLOB NOT NULL, FOREIGN KEY (current_config_revision, current_config_digest) REFERENCES config_revision_mappings(config_revision, config_digest))",
+      ).run();
+      this.#connection.prepare(
+        "INSERT INTO runtime_authority_state_v2 (singleton, authority_schema_version, daemon_installation_id, instance_id, controller_generation_id, current_config_revision, current_config_digest, record_jcs) VALUES (1, 2, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        this.#identity.daemonInstallationId,
+        this.#identity.instanceId,
+        this.#controllerGenerationId,
+        revision,
+        digest,
+        recordBytes,
+      );
+      this.#connection.prepare("DROP TABLE runtime_authority_state").run();
+      this.#connection.prepare("ALTER TABLE runtime_authority_state_v2 RENAME TO runtime_authority_state").run();
+      this.#statement("COMMIT").run();
+    } catch (error) {
+      try {
+        this.#statement("ROLLBACK").run();
+      } catch {
+        /* preserve the original migration error */
+      }
+      throw this.#translateError(error);
+    }
+  }
+
   #verifyOnOpen(): void {
     this.#requireOpen();
+    const parallelConfigRevisions = this.#connection.prepare(
+      "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'config_revisions'",
+    ).get();
+    if (parallelConfigRevisions) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_CORRUPT",
+        "parallel config_revisions table is not part of the Host-owned authority schema",
+      );
+    }
     const version = this.#userVersion();
     if (version === 0) return; // uninitialized candidate bytes; first write bootstraps schema 1
     if (version !== RUNTIME_AUTHORITY_SCHEMA_VERSION) {
@@ -940,7 +1202,26 @@ export class RuntimeAuthorityDatabase {
         `Runtime authority database user_version ${version} is not supported; expected ${RUNTIME_AUTHORITY_SCHEMA_VERSION}`,
       );
     }
+    const hostTable = this.#connection.prepare(
+      "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'host_authority_meta'",
+    ).get();
+    const hostMeta = hostTable
+      ? this.#connection.prepare(
+          "SELECT authority_schema_version FROM host_authority_meta WHERE singleton = 1",
+        ).get()
+      : undefined;
+    const stateColumns = this.#connection.prepare("PRAGMA table_info(runtime_authority_state)").all();
+    if (
+      Number(hostMeta?.authority_schema_version) !== HOST_AUTHORITY_SCHEMA_VERSION ||
+      !stateColumns.some((column) => column.name === "controller_generation_id")
+    ) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_MIGRATION_REQUIRED",
+        "Runtime authority database uses the legacy physical Host schema; invoke the explicit v1 migration",
+      );
+    }
     this.#verifyCommitted();
+    this.#refreshControllerGeneration();
   }
 
   #verifyCommitted(): void {
@@ -953,29 +1234,53 @@ export class RuntimeAuthorityDatabase {
       throw this.#corrupt("foreign-key check reported violations");
     }
     const meta = this.#connection.prepare(
-      "SELECT authority_schema_version, daemon_installation_id, instance_id FROM core_meta WHERE singleton = 1",
+      "SELECT schema_version, daemon_installation_id, instance_id, controller_generation_id FROM core_meta WHERE singleton = 1",
     ).get();
     const state = this.#connection.prepare(
-      "SELECT authority_schema_version, daemon_installation_id, instance_id, current_config_revision, current_config_digest FROM runtime_authority_state WHERE singleton = 1",
+      "SELECT authority_schema_version, daemon_installation_id, instance_id, controller_generation_id, current_config_revision, current_config_digest, record_jcs FROM runtime_authority_state WHERE singleton = 1",
     ).get();
     if (!meta || !state) {
       throw this.#corrupt("core_meta or authority-state singleton is missing");
     }
-    if (Number(meta.authority_schema_version) !== RUNTIME_AUTHORITY_SCHEMA_VERSION || Number(state.authority_schema_version) !== RUNTIME_AUTHORITY_SCHEMA_VERSION) {
-      throw this.#corrupt("stored authority schema version disagrees with the supported version");
+    if (Number(meta.schema_version) !== RUNTIME_AUTHORITY_SCHEMA_VERSION || Number(state.authority_schema_version) !== HOST_AUTHORITY_SCHEMA_VERSION) {
+      throw this.#corrupt("stored authority schema version disagrees with the supported physical versions");
     }
     if (meta.daemon_installation_id !== this.#identity.daemonInstallationId || meta.instance_id !== this.#identity.instanceId) {
       throw this.#corrupt("core_meta identity does not match the requested tuple");
     }
-    if (state.daemon_installation_id !== meta.daemon_installation_id || state.instance_id !== meta.instance_id) {
-      throw this.#corrupt("core_meta/authority-state identity agreement failed");
+    if (
+      state.daemon_installation_id !== meta.daemon_installation_id ||
+      state.instance_id !== meta.instance_id ||
+      typeof meta.controller_generation_id !== "string" ||
+      !UUIDV7_PATTERN.test(meta.controller_generation_id) ||
+      state.controller_generation_id !== meta.controller_generation_id
+    ) {
+      throw this.#corrupt("core_meta/authority-state identity or generation agreement failed");
     }
     const current = this.#resolveMapping(Number(state.current_config_revision), String(state.current_config_digest));
     if (current === null) {
       throw this.#corrupt("current pointer references a missing or digest-mismatched mapping");
     }
-    const canonicalConfig = parseCanonicalJsonBytes(current.bytes);
-    assertCanonicalJsonValue(canonicalConfig);
+    let stateRecordValue: JsonValue;
+    try {
+      stateRecordValue = parseCanonicalJsonBytes(toBytes(state.record_jcs));
+      assertCanonicalJsonValue(stateRecordValue);
+    } catch (error) {
+      throw this.#corrupt(`authority-state record_jcs is malformed: ${String(error)}`);
+    }
+    const expectedStateRecord = canonicalBytes(
+      stateRecord(this.#identity, String(state.controller_generation_id), Number(state.current_config_revision), String(state.current_config_digest)),
+    );
+    if (!sameBytes(toBytes(state.record_jcs), expectedStateRecord)) {
+      throw this.#corrupt("authority-state canonical bytes disagree with the relational projection");
+    }
+    let canonicalConfig: JsonValue;
+    try {
+      canonicalConfig = parseCanonicalJsonBytes(current.bytes);
+      assertCanonicalJsonValue(canonicalConfig);
+    } catch (error) {
+      throw this.#corrupt(`current canonical config bytes are malformed: ${String(error)}`);
+    }
     const premise = this.#loadPremise(Number(state.current_config_revision), String(state.current_config_digest));
     if (asResolvedConfiguration(canonicalConfig).service_candidate !== null && premise === null) {
       throw this.#corrupt("an installed Linux Module config has no premise row");
@@ -990,6 +1295,40 @@ export class RuntimeAuthorityDatabase {
     }
   }
 
+  #refreshControllerGeneration(): void {
+    this.#statement("BEGIN IMMEDIATE").run();
+    try {
+      const state = this.#connection.prepare(
+        "SELECT current_config_revision, current_config_digest FROM runtime_authority_state WHERE singleton = 1",
+      ).get();
+      if (!state) throw this.#corrupt("authority-state singleton disappeared during generation refresh");
+      const recordBytes = Buffer.from(
+        canonicalBytes(
+          stateRecord(
+            this.#identity,
+            this.#controllerGenerationId,
+            Number(state.current_config_revision),
+            String(state.current_config_digest),
+          ),
+        ),
+      );
+      this.#connection.prepare(
+        "UPDATE core_meta SET controller_generation_id = ? WHERE singleton = 1",
+      ).run(this.#controllerGenerationId);
+      this.#connection.prepare(
+        "UPDATE runtime_authority_state SET controller_generation_id = ?, record_jcs = ? WHERE singleton = 1",
+      ).run(this.#controllerGenerationId, recordBytes);
+      this.#statement("COMMIT").run();
+    } catch (error) {
+      try {
+        this.#statement("ROLLBACK").run();
+      } catch {
+        /* preserve the original failure */
+      }
+      throw this.#translateError(error);
+    }
+  }
+
   /** Loads a committed mapping with full verification; null when absent. */
   #resolveMapping(revision: number, declaredDigest: string): { bytes: Uint8Array; digest: string } | null {
     const row = this.#connection.prepare(
@@ -1000,11 +1339,22 @@ export class RuntimeAuthorityDatabase {
       throw this.#corrupt("config mapping projection disagrees with its stored record");
     }
     const bytes = toBytes(row.canonical_bytes);
-    const computed = sha256DigestOfBytes(bytes);
+    let parsed: JsonValue;
+    try {
+      parsed = parseCanonicalJsonBytes(bytes);
+      assertCanonicalJsonValue(parsed);
+    } catch (error) {
+      throw this.#corrupt(`revision ${revision} canonical_bytes are malformed: ${String(error)}`);
+    }
+    const canonical = canonicalBytes(parsed);
+    if (!sameBytes(bytes, canonical)) {
+      throw this.#corrupt(`revision ${revision} canonical_bytes are not canonical JSON bytes`);
+    }
+    const computed = sha256DigestOfBytes(canonical);
     if (computed !== declaredDigest) {
       throw this.#corrupt(`revision ${revision} canonical bytes do not match the stored digest`);
     }
-    return { bytes, digest: declaredDigest };
+    return { bytes: canonical, digest: declaredDigest };
   }
 
   /** Loads and verifies the one premise of a revision (digest + projection). Returns null when none. */
@@ -1018,8 +1368,18 @@ export class RuntimeAuthorityDatabase {
     if (Number(row.config_revision) !== revision || String(row.config_digest) !== configDigest) {
       throw this.#corrupt(`premise projection disagrees with revision ${revision}`);
     }
-    const record = parseCanonicalJsonBytes(toBytes(row.record_jcs));
-    assertCanonicalJsonValue(record);
+    const rawRecordBytes = toBytes(row.record_jcs);
+    let record: JsonValue;
+    try {
+      record = parseCanonicalJsonBytes(rawRecordBytes);
+      assertCanonicalJsonValue(record);
+    } catch (error) {
+      throw this.#corrupt(`premise record_jcs for revision ${revision} is malformed: ${String(error)}`);
+    }
+    const canonicalRecordBytes = canonicalBytes(record);
+    if (!sameBytes(rawRecordBytes, canonicalRecordBytes)) {
+      throw this.#corrupt(`premise record_jcs for revision ${revision} is not canonical JSON bytes`);
+    }
     const premise = validatePremise(record, `revision ${revision} premise`);
     if (premise.config_revision !== revision || premise.config_digest !== configDigest) {
       throw this.#corrupt(`premise record disagrees with revision ${revision}`);
@@ -1054,7 +1414,7 @@ export class RuntimeAuthorityDatabase {
     if (this.#userVersion() === 0) return null;
     this.#verifyCommitted();
     const state = this.#connection.prepare(
-      "SELECT current_config_revision, current_config_digest FROM runtime_authority_state WHERE singleton = 1",
+      "SELECT current_config_revision, current_config_digest, controller_generation_id FROM runtime_authority_state WHERE singleton = 1",
     ).get();
     const revision = Number(state?.current_config_revision);
     const digest = String(state?.current_config_digest);
@@ -1074,6 +1434,7 @@ export class RuntimeAuthorityDatabase {
     return {
       config_revision: revision,
       config_digest: digest,
+      controller_generation_id: String(state?.controller_generation_id),
       canonicalConfigBytes: mapping.bytes,
       canonicalConfig,
       premise,
@@ -1197,7 +1558,7 @@ export class RuntimeAuthorityDatabase {
       }
     }
     const state = this.#connection.prepare(
-      "SELECT current_config_revision, current_config_digest, daemon_installation_id, instance_id FROM runtime_authority_state WHERE singleton = 1",
+      "SELECT current_config_revision, current_config_digest, daemon_installation_id, instance_id, controller_generation_id FROM runtime_authority_state WHERE singleton = 1",
     ).get();
     let currentRevision: number | null = null;
     let currentDigest: string | null = null;
@@ -1256,11 +1617,18 @@ export class RuntimeAuthorityDatabase {
     if (crashPoint === "after_begin_immediate_before_mapping") {
       throw new RuntimeAuthorityCrashPointError(crashPoint);
     }
-    // Insert the append-only mapping (REQ-AUTH-002 step 5).
+    // Insert the append-only mapping (REQ-AUTH-002 step 5). The identity
+    // columns are Host-owned parent projections, not a parallel revision key.
     try {
       this.#connection.prepare(
-        "INSERT INTO config_revision_mappings (config_revision, config_digest, canonical_bytes) VALUES (?, ?, ?)",
-      ).run(next, input.configDigest, Buffer.from(input.canonicalConfigBytes));
+        "INSERT INTO config_revision_mappings (config_revision, daemon_installation_id, instance_id, config_digest, canonical_bytes) VALUES (?, ?, ?, ?, ?)",
+      ).run(
+        next,
+        input.identity.daemonInstallationId,
+        input.identity.instanceId,
+        input.configDigest,
+        Buffer.from(input.canonicalConfigBytes),
+      );
     } catch (error) {
       throw this.#translateError(error);
     }
@@ -1492,19 +1860,44 @@ export class RuntimeAuthorityDatabase {
 
   #updateCurrentPointer(next: number, input: InstallAuthorityConfigInput, first: boolean): void {
     if (first) {
+      const identity = this.#connection.prepare(
+        "SELECT sqlite_version() AS version, sqlite_source_id() AS source_id",
+      ).get();
+      const versionParts = String(identity?.version ?? "").split(".").map((part) => Number(part));
+      const versionNumber =
+        versionParts.length === 3 && versionParts.every((part) => Number.isSafeInteger(part))
+          ? (versionParts[0] ?? 0) * 1_000_000 + (versionParts[1] ?? 0) * 1_000 + (versionParts[2] ?? 0)
+          : 0;
+      const sourceId = String(identity?.source_id ?? "");
+      const artifactDigest = sha256DigestOfBytes(Buffer.from(sourceId, "utf8"));
       this.#connection.prepare(
-        "INSERT INTO core_meta (singleton, authority_schema_version, daemon_installation_id, instance_id) VALUES (1, ?, ?, ?)",
-      ).run(RUNTIME_AUTHORITY_SCHEMA_VERSION, input.identity.daemonInstallationId, input.identity.instanceId);
+        "INSERT INTO core_meta (singleton, schema_version, daemon_installation_id, instance_id, controller_generation_id, clean_shutdown, sqlite_version_number, sqlite_source_id, sqlite_artifact_digest) VALUES (1, ?, ?, ?, ?, 0, ?, ?, ?)",
+      ).run(
+        RUNTIME_AUTHORITY_SCHEMA_VERSION,
+        input.identity.daemonInstallationId,
+        input.identity.instanceId,
+        this.#controllerGenerationId,
+        versionNumber,
+        sourceId,
+        artifactDigest,
+      );
+      this.#connection.prepare(
+        "INSERT INTO commit_sequence (singleton, next_value) VALUES (1, ?)",
+      ).run(2);
     }
-    const bytes = Buffer.from(canonicalBytes(stateRecord(input.identity, next, input.configDigest)));
+    const bytes = Buffer.from(
+      canonicalBytes(stateRecord(input.identity, this.#controllerGenerationId, next, input.configDigest)),
+    );
     this.#connection.prepare(
-      "INSERT INTO runtime_authority_state (singleton, authority_schema_version, daemon_installation_id, instance_id, current_config_revision, current_config_digest, record_jcs) VALUES (1, ?, ?, ?, ?, ?, ?) " +
+      "INSERT INTO runtime_authority_state (singleton, authority_schema_version, daemon_installation_id, instance_id, controller_generation_id, current_config_revision, current_config_digest, record_jcs) VALUES (1, ?, ?, ?, ?, ?, ?, ?) " +
       "ON CONFLICT(singleton) DO UPDATE SET authority_schema_version = excluded.authority_schema_version, " +
+      "daemon_installation_id = excluded.daemon_installation_id, instance_id = excluded.instance_id, controller_generation_id = excluded.controller_generation_id, " +
       "current_config_revision = excluded.current_config_revision, current_config_digest = excluded.current_config_digest, record_jcs = excluded.record_jcs",
     ).run(
-      RUNTIME_AUTHORITY_SCHEMA_VERSION,
+      HOST_AUTHORITY_SCHEMA_VERSION,
       input.identity.daemonInstallationId,
       input.identity.instanceId,
+      this.#controllerGenerationId,
       next,
       input.configDigest,
       bytes,

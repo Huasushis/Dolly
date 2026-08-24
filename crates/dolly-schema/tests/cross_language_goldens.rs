@@ -373,3 +373,36 @@ fn nested_root_independent_depth() {
         "semantic depth 65 should be rejected under limit 64"
     );
 }
+
+#[test]
+fn tst_auth_007_runtime_state_cross_language_golden() {
+    let fixture = parse_core_json(
+        &read_fixture("test-vectors/core/TST-AUTH-007-physical-v2-bridge.json"),
+        ParseLimits::protocol_wire(),
+    )
+    .unwrap();
+    let root = match fixture {
+        dolly_canonical_json::CanonicalJsonValue::Object(object) => object,
+        _ => panic!("authority bridge vector must be an object"),
+    };
+    let stimulus = match root.get("stimulus").unwrap() {
+        dolly_canonical_json::CanonicalJsonValue::Object(object) => object,
+        _ => panic!("authority bridge stimulus must be an object"),
+    };
+    let golden = match stimulus.get("cross_language_golden").unwrap() {
+        dolly_canonical_json::CanonicalJsonValue::Object(object) => object,
+        _ => panic!("authority bridge golden must be an object"),
+    };
+    let bytes = match golden.get("state_canonical_bytes_utf8").unwrap() {
+        dolly_canonical_json::CanonicalJsonValue::String(value) => value.as_bytes(),
+        _ => panic!("authority bridge canonical bytes must be a string"),
+    };
+    let expected_digest = match golden.get("state_digest").unwrap() {
+        dolly_canonical_json::CanonicalJsonValue::String(value) => value,
+        _ => panic!("authority bridge digest must be a string"),
+    };
+    let value = parse_core_json(bytes, ParseLimits::semantic(64).unwrap()).unwrap();
+    let (canonical, digest) = canonicalize(&value).unwrap();
+    assert_eq!(canonical.as_bytes(), bytes);
+    assert_eq!(digest.to_canonical_string(), expected_digest.as_str());
+}

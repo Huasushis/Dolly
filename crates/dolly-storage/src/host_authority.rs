@@ -25,6 +25,18 @@ pub const MAX_AUTHORITY_REVISION: i64 = 9_007_199_254_740_991;
 /// Runtime Host authority logical schema version.
 pub const HOST_AUTHORITY_SCHEMA_VERSION: i64 = 2;
 
+pub(crate) fn is_uuid_v7(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23].iter().all(|index| bytes[*index] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
+        && bytes[14] == b'7'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b' | b'A' | b'B')
+}
+
 /// Physical tables for the Host prerequisite authority. The table names and
 /// projections follow runtime-authority-record/v1; `host_authority_meta` keeps
 /// this slice's schema gate separate from the older DB-open `core_meta` row.
@@ -261,8 +273,8 @@ pub struct ConfigRevisionMapping {
     pub config_digest: Sha256Digest,
     pub canonical_config: ResolvedConfiguration,
 }
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeAuthorityStateRecord {
     schema: String,
     authority_schema_version: i64,
@@ -413,9 +425,9 @@ pub(crate) fn install_host_authority_revision_in_transaction(
         [],
         |row| row.get(0),
     )?;
-    if controller_generation_id.is_empty() {
+    if !is_uuid_v7(&controller_generation_id) {
         return Err(HostAuthorityError::InvalidPremise(
-            "controller generation is not bound by the Controller".into(),
+            "controller generation is not a valid UUIDv7".into(),
         ));
     }
     let mapping_bytes =
@@ -520,9 +532,9 @@ pub(crate) fn refresh_controller_generation_in_transaction(
     tx: &Transaction<'_>,
     generation: &str,
 ) -> Result<(), HostAuthorityError> {
-    if generation.is_empty() {
+    if !is_uuid_v7(generation) {
         return Err(HostAuthorityError::InvalidPremise(
-            "controller generation is empty".into(),
+            "controller generation is not a valid UUIDv7".into(),
         ));
     }
     let state_bytes: Vec<u8> = tx.query_row(
@@ -558,6 +570,18 @@ pub fn load_current_authority(
 pub(crate) fn load_current_authority_with_generation(
     connection: &Connection,
 ) -> Result<Option<(CurrentAuthoritySnapshot, String)>, HostAuthorityError> {
+    let parallel: i64 = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config_revisions'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if parallel != 0 {
+        return Err(HostAuthorityError::Malformed(
+            "parallel config_revisions table is not part of the authority schema".into(),
+        ));
+    }
     let Some((identity, generation, revision, digest, state_bytes)) = connection
         .query_row(
             "SELECT daemon_installation_id, instance_id, controller_generation_id,
@@ -660,13 +684,42 @@ fn load_authority_snapshot(
     revision: i64,
     digest: &str,
 ) -> Result<CurrentAuthoritySnapshot, HostAuthorityError> {
-    let mapping_row: Option<(String, String, i64, String, Vec<u8>)> = connection
-        .query_row(
-            "SELECT daemon_installation_id, instance_id, config_revision, config_digest, canonical_bytes FROM config_revision_mappings WHERE config_revision = ?1 AND config_digest = ?2",
-            params![revision, digest],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-        )
-        .optional()?;
+    let has_mapping_identity = table_has_column(connection, "config_revision_mappings", "daemon_installation_id")?
+        && table_has_column(connection, "config_revision_mappings", "instance_id")?;
+    let mapping_row: Option<(String, String, i64, String, Vec<u8>)> = if has_mapping_identity {
+        connection
+            .query_row(
+                "SELECT daemon_installation_id, instance_id, config_revision, config_digest,
+                        canonical_bytes
+                 FROM config_revision_mappings
+                 WHERE config_revision = ?1 AND config_digest = ?2",
+                params![revision, digest],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()?
+    } else {
+        // TypeScript's pre-bridge v1 projection did not repeat the authority
+        // identity on each mapping row. During the explicit migration window
+        // the core identity is the only permitted source for this projection.
+        let row: Option<(i64, String, Vec<u8>)> = connection
+            .query_row(
+                "SELECT config_revision, config_digest, canonical_bytes
+                 FROM config_revision_mappings
+                 WHERE config_revision = ?1 AND config_digest = ?2",
+                params![revision, digest],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        row.map(|(mapping_revision, mapping_digest, bytes)| {
+            (
+                identity.daemon_installation_id.clone(),
+                identity.instance_id.clone(),
+                mapping_revision,
+                mapping_digest,
+                bytes,
+            )
+        })
+    };
     let Some((
         mapping_daemon,
         mapping_instance,
@@ -679,8 +732,7 @@ fn load_authority_snapshot(
             "current mapping is missing".into(),
         ));
     };
-    if mapping_daemon != identity.daemon_installation_id || mapping_instance != identity.instance_id
-    {
+    if mapping_daemon != identity.daemon_installation_id || mapping_instance != identity.instance_id {
         return Err(HostAuthorityError::InvalidPremise(
             "current mapping identity differs from authority state".into(),
         ));
@@ -713,6 +765,22 @@ fn load_authority_snapshot(
     Ok(snapshot)
 }
 
+fn table_has_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, HostAuthorityError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Rewrite a validated v1 authority into the v2 physical schema. The caller
 /// must hold the path and identity locks in that order and must execute this
 /// body inside one immediate transaction.
@@ -720,9 +788,9 @@ pub(crate) fn migrate_legacy_authority_in_transaction(
     tx: &Transaction<'_>,
     generation: &str,
 ) -> Result<(), HostAuthorityError> {
-    if generation.is_empty() {
+    if !is_uuid_v7(generation) {
         return Err(HostAuthorityError::InvalidPremise(
-            "controller generation is empty".into(),
+            "controller generation is not a valid UUIDv7".into(),
         ));
     }
     let Some(snapshot) = load_legacy_current_authority(tx)? else {

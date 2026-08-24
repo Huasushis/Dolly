@@ -20,11 +20,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use dolly_canonical_json::{CanonicalJsonValue, Sha256Digest, canonicalize};
@@ -735,6 +736,7 @@ impl OfflineDatabase {
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(map_sqlite_error)?;
+            bridge_typescript_v1_schema_in_transaction(&tx, &database.verified)?;
             migrate_legacy_authority_in_transaction(&tx, &controller_generation_id)
                 .map_err(map_host_authority_error)?;
             crate::effect_journal::initialize_effect_journal_schema(&tx)?;
@@ -919,29 +921,31 @@ fn read_legacy_authority(
     if user_version != SCHEMA_VERSION {
         return Err(StorageError::MigrationRequired);
     }
-    let host_version: Option<i64> = connection
-        .query_row(
-            "SELECT authority_schema_version
-             FROM host_authority_meta WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| StorageError::MigrationRequired)?;
-    if host_version != Some(1) {
+    let host_exists = table_exists(&connection, "host_authority_meta")?;
+    let host_version: Option<i64> = if host_exists {
+        connection
+            .query_row(
+                "SELECT authority_schema_version
+                 FROM host_authority_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StorageError::MigrationRequired)?
+    } else {
+        None
+    };
+    let core_columns = table_columns(&connection, "core_meta")?;
+    let ts_v1_bridge = host_version.is_none()
+        && core_columns.contains("authority_schema_version")
+        && !core_columns.contains("schema_version");
+    if host_version != Some(1) && !ts_v1_bridge {
         return Err(StorageError::MigrationRequired);
     }
-    let mut columns = std::collections::BTreeSet::new();
-    let mut statement = connection
-        .prepare("PRAGMA table_info(runtime_authority_state)")
-        .map_err(|_| StorageError::MigrationRequired)?;
-    let rows = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|_| StorageError::MigrationRequired)?;
-    for row in rows {
-        columns.insert(row.map_err(|_| StorageError::MigrationRequired)?);
-    }
-    if columns.contains("controller_generation_id") {
+    let runtime_columns = table_columns(&connection, "runtime_authority_state")?;
+    if !runtime_columns.contains("authority_schema_version")
+        || runtime_columns.contains("controller_generation_id")
+    {
         return Err(StorageError::MigrationRequired);
     }
     let snapshot = load_legacy_current_authority(&connection)
@@ -969,6 +973,32 @@ fn read_legacy_authority(
         return Err(StorageError::Corrupt);
     }
     Ok(Some((identity, snapshot)))
+}
+
+fn table_columns(connection: &Connection, table: &str) -> StorageResult<std::collections::BTreeSet<String>> {
+    let mut columns = std::collections::BTreeSet::new();
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|_| StorageError::MigrationRequired)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|_| StorageError::MigrationRequired)?;
+    for row in rows {
+        columns.insert(row.map_err(|_| StorageError::MigrationRequired)?);
+    }
+    Ok(columns)
+}
+fn table_exists(connection: &Connection, table: &str) -> StorageResult<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+            )",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(|_| StorageError::MigrationRequired)
 }
 
 fn read_persisted_identity(
@@ -1049,7 +1079,7 @@ fn read_controller_generation(connection: &Connection) -> StorageResult<Option<S
         .optional()
         .map_err(map_sqlite_error)
         .and_then(|generation: Option<Option<String>>| match generation {
-            Some(Some(generation)) if !generation.is_empty() => Ok(Some(generation)),
+            Some(Some(generation)) if crate::host_authority::is_uuid_v7(&generation) => Ok(Some(generation)),
             Some(None) => Ok(None),
             None => Err(StorageError::Corrupt),
             Some(Some(_)) => Err(StorageError::Corrupt),
@@ -1076,7 +1106,17 @@ fn refresh_controller_generation(
 fn mint_controller_generation_id() -> StorageResult<String> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(|_| StorageError::UnsafeConfiguration)?;
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StorageError::UnsafeConfiguration)?
+        .as_millis() as u64;
+    bytes[0] = (millis >> 40) as u8;
+    bytes[1] = (millis >> 32) as u8;
+    bytes[2] = (millis >> 24) as u8;
+    bytes[3] = (millis >> 16) as u8;
+    bytes[4] = (millis >> 8) as u8;
+    bytes[5] = millis as u8;
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
@@ -1606,6 +1646,132 @@ fn apply_and_verify_configuration(
         busy_timeout,
     )
 }
+/// Normalize the pre-bridge TypeScript v1 projection into the legacy Host
+/// shape consumed by the existing v1-to-v2 migration. This is intentionally
+/// an offline, expected migration step; ordinary opens never call it.
+fn bridge_typescript_v1_schema_in_transaction(
+    tx: &Transaction<'_>,
+    verified: &VerifiedSqliteBuild,
+) -> StorageResult<()> {
+    let core_columns = table_columns(tx, "core_meta")?;
+    let ts_v1_bridge = core_columns.contains("authority_schema_version")
+        && core_columns.contains("daemon_installation_id")
+        && core_columns.contains("instance_id")
+        && !core_columns.contains("schema_version");
+    if !ts_v1_bridge {
+        return Ok(());
+    }
+    let runtime_columns = table_columns(tx, "runtime_authority_state")?;
+    if runtime_columns.contains("controller_generation_id") {
+        return Err(StorageError::MigrationRequired);
+    }
+    if table_exists(tx, "host_authority_meta")? {
+        return Err(StorageError::MigrationRequired);
+    }
+
+    let authority_version: Option<i64> = tx
+        .query_row(
+            "SELECT authority_schema_version FROM core_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    if authority_version != Some(1) {
+        return Err(StorageError::MigrationRequired);
+    }
+
+    for (column, sql_type) in [
+        ("schema_version", "INTEGER"),
+        ("clean_shutdown", "INTEGER"),
+        ("sqlite_version_number", "INTEGER"),
+        ("sqlite_source_id", "TEXT"),
+        ("sqlite_artifact_digest", "TEXT"),
+        ("controller_generation_id", "TEXT"),
+    ] {
+        if !core_columns.contains(column) {
+            tx.execute(
+                &format!("ALTER TABLE core_meta ADD COLUMN {column} {sql_type}"),
+                [],
+            )
+            .map_err(map_sqlite_error)?;
+        }
+    }
+    tx.execute(
+        "UPDATE core_meta
+         SET schema_version = authority_schema_version,
+             clean_shutdown = 0,
+             sqlite_version_number = ?1,
+             sqlite_source_id = ?2,
+             sqlite_artifact_digest = ?3
+         WHERE singleton = 1",
+        rusqlite::params![
+            verified.version_number as i64,
+            &verified.source_id,
+            verified.artifact_digest.to_string(),
+        ],
+    )
+    .map_err(map_sqlite_error)?;
+
+    let mapping_columns = table_columns(tx, "config_revision_mappings")?;
+    for (column, sql_type) in [
+        ("daemon_installation_id", "TEXT"),
+        ("instance_id", "TEXT"),
+    ] {
+        if !mapping_columns.contains(column) {
+            tx.execute(
+                &format!("ALTER TABLE config_revision_mappings ADD COLUMN {column} {sql_type}"),
+                [],
+            )
+            .map_err(map_sqlite_error)?;
+        }
+    }
+    tx.execute(
+        "UPDATE config_revision_mappings
+         SET daemon_installation_id = (
+                 SELECT daemon_installation_id FROM core_meta WHERE singleton = 1
+             ),
+             instance_id = (
+                 SELECT instance_id FROM core_meta WHERE singleton = 1
+             )",
+        [],
+    )
+    .map_err(map_sqlite_error)?;
+
+    tx.execute_batch(
+        "CREATE TABLE host_authority_meta (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1)
+         );
+         INSERT INTO host_authority_meta (singleton, authority_schema_version)
+             VALUES (1, 1);",
+    )
+    .map_err(map_sqlite_error)?;
+    if !table_exists(tx, "commit_sequence")? {
+        tx.execute_batch(
+            "CREATE TABLE commit_sequence (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                next_value INTEGER NOT NULL
+             );",
+        )
+        .map_err(map_sqlite_error)?;
+    }
+    let next_value: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(config_revision), 0) + 1
+             FROM config_revision_mappings",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_error)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO commit_sequence (singleton, next_value) VALUES (1, ?1)",
+        [next_value],
+    )
+    .map_err(map_sqlite_error)?;
+    Ok(())
+}
+
 
 /// Validate the pre-generation physical schema without writing it. This is
 /// used only by the explicit offline v1 authority migration; ordinary opens
@@ -1628,6 +1794,7 @@ fn validate_legacy_schema(
         return Err(StorageError::MigrationRequired);
     }
 
+    let core_columns = table_columns(connection, "core_meta")?;
     let required_core_columns = [
         "schema_version",
         "daemon_installation_id",
@@ -1637,23 +1804,19 @@ fn validate_legacy_schema(
         "sqlite_source_id",
         "sqlite_artifact_digest",
     ];
-    let mut core_columns = std::collections::BTreeSet::new();
-    let mut core_statement = connection
-        .prepare("PRAGMA table_info(core_meta)")
-        .map_err(|_| StorageError::MigrationRequired)?;
-    let core_rows = core_statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|_| StorageError::MigrationRequired)?;
-    for row in core_rows {
-        core_columns.insert(row.map_err(|_| StorageError::MigrationRequired)?);
-    }
-    if !required_core_columns
-        .iter()
-        .all(|column| core_columns.contains(*column))
+    let ts_v1_bridge = core_columns.contains("authority_schema_version")
+        && core_columns.contains("daemon_installation_id")
+        && core_columns.contains("instance_id")
+        && !core_columns.contains("schema_version");
+    if !ts_v1_bridge
+        && !required_core_columns
+            .iter()
+            .all(|column| core_columns.contains(*column))
     {
         return Err(StorageError::MigrationRequired);
     }
 
+    let runtime_columns = table_columns(connection, "runtime_authority_state")?;
     let required_runtime_columns = [
         "authority_schema_version",
         "daemon_installation_id",
@@ -1662,16 +1825,6 @@ fn validate_legacy_schema(
         "current_config_digest",
         "record_jcs",
     ];
-    let mut runtime_columns = std::collections::BTreeSet::new();
-    let mut runtime_statement = connection
-        .prepare("PRAGMA table_info(runtime_authority_state)")
-        .map_err(|_| StorageError::MigrationRequired)?;
-    let runtime_rows = runtime_statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|_| StorageError::MigrationRequired)?;
-    for row in runtime_rows {
-        runtime_columns.insert(row.map_err(|_| StorageError::MigrationRequired)?);
-    }
     if !required_runtime_columns
         .iter()
         .all(|column| runtime_columns.contains(*column))
@@ -1680,17 +1833,42 @@ fn validate_legacy_schema(
         return Err(StorageError::MigrationRequired);
     }
 
-    let host_version: Option<i64> = connection
-        .query_row(
-            "SELECT authority_schema_version
-             FROM host_authority_meta WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| StorageError::MigrationRequired)?;
-    if host_version != Some(1) {
+    let host_exists = table_exists(connection, "host_authority_meta")?;
+    let host_version: Option<i64> = if host_exists {
+        connection
+            .query_row(
+                "SELECT authority_schema_version
+                 FROM host_authority_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StorageError::MigrationRequired)?
+    } else {
+        None
+    };
+    if (!ts_v1_bridge && host_version != Some(1))
+        || (ts_v1_bridge && host_version.is_some())
+    {
         return Err(StorageError::MigrationRequired);
+    }
+
+    if ts_v1_bridge {
+        let authority_version: Option<i64> = connection
+            .query_row(
+                "SELECT authority_schema_version FROM core_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StorageError::MigrationRequired)?;
+        if authority_version != Some(1) {
+            return Err(StorageError::MigrationRequired);
+        }
+        load_legacy_current_authority(connection)
+            .map_err(map_host_authority_error)?
+            .ok_or(StorageError::MigrationRequired)?;
+        return Ok(SCHEMA_VERSION);
     }
 
     let existing: Option<(i64, i64, String, String)> = connection

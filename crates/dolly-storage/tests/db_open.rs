@@ -8,6 +8,7 @@
 
 #![cfg(unix)] // flock, O_NOFOLLOW, and symlink fixtures are Linux-first
 
+use dolly_canonical_json::canonicalize;
 use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -474,6 +475,134 @@ fn explicit_v1_authority_migration_rebuilds_state_and_gates_ordinary_open() {
     drop(migrated);
     Database::open(&path).expect("ordinary open after explicit migration");
 }
+#[test]
+fn rust_migrates_pre_bridge_typescript_authority_projection() {
+    let (_dir, path) = temp_db();
+    let db = open_migrated(&path);
+    let previous_generation = db.controller_generation_id().to_owned();
+    let (daemon, instance, revision, digest, config_bytes): (String, String, i64, String, Vec<u8>) = db
+        .connection()
+        .query_row(
+            "SELECT m.daemon_installation_id, m.instance_id, m.config_revision,
+                    m.config_digest, m.canonical_bytes
+             FROM config_revision_mappings AS m
+             WHERE m.config_revision = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    drop(db);
+
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    let old_state = serde_json::json!({
+        "schema": "dolly.runtime-authority-state/v1",
+        "authority_schema_version": 1,
+        "daemon_installation_id": daemon,
+        "instance_id": instance,
+        "current_config_revision": revision,
+        "current_config_digest": digest,
+    });
+    let old_state_bytes = canonicalize(&old_state).unwrap().0.to_string().into_bytes();
+    let tx = connection.unchecked_transaction().unwrap();
+    tx.execute_batch(
+        "CREATE TABLE core_meta__typescript_v1 (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
+            daemon_installation_id TEXT NOT NULL,
+            instance_id TEXT NOT NULL
+         );
+         CREATE TABLE config_revision_mappings__typescript_v1 (
+            config_revision INTEGER PRIMARY KEY,
+            config_digest TEXT NOT NULL,
+            canonical_bytes BLOB NOT NULL,
+            UNIQUE (config_revision, config_digest)
+         );
+         CREATE TABLE runtime_authority_state__typescript_v1 (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
+            daemon_installation_id TEXT NOT NULL,
+            instance_id TEXT NOT NULL,
+            current_config_revision INTEGER NOT NULL,
+            current_config_digest TEXT NOT NULL,
+            record_jcs BLOB NOT NULL
+         );",
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO core_meta__typescript_v1
+            (singleton, authority_schema_version, daemon_installation_id, instance_id)
+         SELECT 1, 1, daemon_installation_id, instance_id
+         FROM core_meta WHERE singleton = 1",
+        [],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO config_revision_mappings__typescript_v1
+            (config_revision, config_digest, canonical_bytes)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![revision, &digest, &config_bytes],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO runtime_authority_state__typescript_v1
+            (singleton, authority_schema_version, daemon_installation_id, instance_id,
+             current_config_revision, current_config_digest, record_jcs)
+         VALUES (1, 1, ?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            &daemon,
+            &instance,
+            revision,
+            &digest,
+            old_state_bytes,
+        ],
+    )
+    .unwrap();
+    tx.execute("DROP TABLE runtime_authority_state", []).unwrap();
+    tx.execute("DROP TABLE config_revision_mappings", []).unwrap();
+    tx.execute("DROP TABLE host_authority_meta", []).unwrap();
+    tx.execute("DROP TABLE core_meta", []).unwrap();
+    tx.execute_batch(
+        "ALTER TABLE core_meta__typescript_v1 RENAME TO core_meta;
+         ALTER TABLE config_revision_mappings__typescript_v1 RENAME TO config_revision_mappings;
+         ALTER TABLE runtime_authority_state__typescript_v1 RENAME TO runtime_authority_state;",
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    connection.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        Database::open(&path),
+        Err(StorageError::MigrationRequired)
+    ));
+    let migrated = Database::open_for_migration(&path)
+        .unwrap()
+        .migrate_v1_authority()
+        .expect("Rust must bridge the pre-H1 TypeScript projection");
+    assert_ne!(migrated.controller_generation_id(), previous_generation);
+    let host_version: i64 = migrated
+        .connection()
+        .query_row(
+            "SELECT authority_schema_version FROM host_authority_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(host_version, dolly_storage::host_authority::HOST_AUTHORITY_SCHEMA_VERSION);
+    let mapping_identity: (String, String) = migrated
+        .connection()
+        .query_row(
+            "SELECT daemon_installation_id, instance_id
+             FROM config_revision_mappings WHERE config_revision = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(mapping_identity, (daemon, instance));
+    drop(migrated);
+}
+
 
 fn lock_for(db: &Path) -> PathBuf {
     let mut name = db.file_name().unwrap().to_os_string();

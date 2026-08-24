@@ -1,6 +1,6 @@
 /**
  * Conformance drive of the H1 Runtime authority SQLite repository against the
- * 41d6476 authority vectors TST-AUTH-001..006, using the real pinned native
+ * 41d6476 authority vectors TST-AUTH-001..007, using the real pinned native
  * binding on real temp-file databases with close/reopen and authority-
  * transaction crash injection via `crashPoint`.
  *
@@ -17,12 +17,13 @@
  * - downstream result/ack cannot write any authority row (TST-AUTH-001/003).
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import {
+  HOST_AUTHORITY_SCHEMA_VERSION,
   RuntimeAuthorityDatabase,
   RuntimeAuthorityCrashPointError,
   RuntimeAuthorityDatabaseError,
@@ -66,6 +67,8 @@ function hex(repeats: string): string {
 
 /** Double that implements the caller-held controller-lock contract. */
 class FakeLock {
+  readonly controllerGenerationId = "0198ab11-6c44-7e8a-b2bb-000000000701";
+
   constructor(public held: boolean = true) {}
   assertHeld(): void {
     if (!this.held) throw new Error("fake controller lock is not held");
@@ -421,6 +424,142 @@ describe("TST-AUTH-004: config revision allocation and authority-transaction cra
     db.close();
   });
 });
+describe("TST-AUTH-007: physical Host v2 bridge and canonical-byte gates", () => {
+  it("fresh TypeScript authority emits the Rust-compatible Host parent projection", () => {
+    const dir = scratch();
+    const path = join(dir, "v2.sqlite3");
+    const db = openDatabase(dir, "v2.sqlite3");
+    install(db, candidate(1, "A", false));
+    db.close();
+    const inspect = raw(path);
+    expect(inspect.prepare("SELECT authority_schema_version FROM host_authority_meta WHERE singleton = 1").get()).toEqual({
+      authority_schema_version: HOST_AUTHORITY_SCHEMA_VERSION,
+    });
+    const mappingColumns = inspect.prepare("PRAGMA table_info(config_revision_mappings)").all() as Array<{ name: string }>;
+    expect(mappingColumns.map((column) => column.name)).toContain("daemon_installation_id");
+    expect(mappingColumns.map((column) => column.name)).toContain("instance_id");
+    const state = inspect.prepare(
+      "SELECT authority_schema_version, controller_generation_id, record_jcs FROM runtime_authority_state WHERE singleton = 1",
+    ).get() as { authority_schema_version: number; controller_generation_id: string; record_jcs: Buffer };
+    expect(state.authority_schema_version).toBe(HOST_AUTHORITY_SCHEMA_VERSION);
+    expect(state.controller_generation_id).toBe(new FakeLock().controllerGenerationId);
+    expect(Buffer.from(state.record_jcs)).toEqual(Buffer.from(canonicalBytes({
+      schema: "dolly.runtime-authority-state/v1",
+      authority_schema_version: HOST_AUTHORITY_SCHEMA_VERSION,
+      daemon_installation_id: identity.daemonInstallationId,
+      instance_id: identity.instanceId,
+      controller_generation_id: state.controller_generation_id,
+      current_config_revision: 1,
+      current_config_digest: candidate(1, "A", false).digest,
+    })));
+    inspect.close();
+  });
+  it("matches the Rust cross-language canonical state golden", () => {
+    const vector = JSON.parse(readFileSync(
+      join(import.meta.dirname, "../../../dolly-spec/test-vectors/core/TST-AUTH-007-physical-v2-bridge.json"),
+      "utf8",
+    )) as {
+      stimulus: {
+        cross_language_golden: {
+          state_canonical_bytes_utf8: string;
+          state_digest: string;
+        };
+      };
+    };
+    const expected = vector.stimulus.cross_language_golden;
+    const bytes = Buffer.from(expected.state_canonical_bytes_utf8, "utf8");
+    const parsed = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+    expect(Buffer.from(canonicalBytes(parsed))).toEqual(bytes);
+    expect(digestOfBytes(bytes)).toBe(expected.state_digest);
+  });
+
+
+  it("rejects raw-hash-only non-canonical mapping bytes on reopen", () => {
+    const dir = scratch();
+    const path = join(dir, "noncanonical.sqlite3");
+    const db = openDatabase(dir, "noncanonical.sqlite3");
+    const fixture = candidate(1, "A", false);
+    install(db, fixture);
+    db.close();
+    const inspect = raw(path);
+    const row = inspect.prepare("SELECT canonical_bytes FROM config_revision_mappings WHERE config_revision = 1").get() as { canonical_bytes: Buffer };
+    const parsed = JSON.parse(row.canonical_bytes.toString("utf8")) as Record<string, unknown>;
+    const nonCanonical = Buffer.from(JSON.stringify(parsed, null, 2), "utf8");
+    expect(nonCanonical.equals(row.canonical_bytes)).toBe(false);
+    const rawDigest = digestOfBytes(nonCanonical);
+    inspect.prepare(
+      "UPDATE config_revision_mappings SET canonical_bytes = ?, config_digest = ? WHERE config_revision = 1",
+    ).run(nonCanonical, rawDigest);
+    inspect.close();
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+      "STORAGE_CORRUPT",
+    );
+  });
+
+  it("requires an explicit v1-to-v2 migration for the pre-bridge TypeScript projection", () => {
+    const dir = scratch();
+    const path = join(dir, "legacy.sqlite3");
+    const fixture = candidate(1, "legacy", false);
+    const legacyState = canonicalBytes({
+      schema: "dolly.runtime-authority-state/v1",
+      authority_schema_version: 1,
+      daemon_installation_id: identity.daemonInstallationId,
+      instance_id: identity.instanceId,
+      current_config_revision: 1,
+      current_config_digest: fixture.digest,
+    });
+    const legacy = raw(path);
+    legacy.exec(`
+      CREATE TABLE core_meta (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
+        daemon_installation_id TEXT NOT NULL,
+        instance_id TEXT NOT NULL
+      );
+      CREATE TABLE config_revision_mappings (
+        config_revision INTEGER PRIMARY KEY,
+        config_digest TEXT NOT NULL,
+        canonical_bytes BLOB NOT NULL,
+        UNIQUE (config_revision, config_digest)
+      );
+      CREATE TABLE runtime_authority_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
+        daemon_installation_id TEXT NOT NULL,
+        instance_id TEXT NOT NULL,
+        current_config_revision INTEGER NOT NULL,
+        current_config_digest TEXT NOT NULL,
+        record_jcs BLOB NOT NULL
+      );
+      CREATE TABLE module_activation_premises (
+        config_revision INTEGER PRIMARY KEY,
+        config_digest TEXT NOT NULL,
+        premises_digest TEXT NOT NULL,
+        record_jcs BLOB NOT NULL
+      );
+      PRAGMA user_version = 1;
+    `);
+    legacy.prepare("INSERT INTO core_meta VALUES (1, 1, ?, ?)").run(identity.daemonInstallationId, identity.instanceId);
+    legacy.prepare("INSERT INTO config_revision_mappings VALUES (1, ?, ?)").run(fixture.digest, Buffer.from(fixture.bytes));
+    legacy.prepare("INSERT INTO runtime_authority_state VALUES (1, 1, ?, ?, 1, ?, ?)").run(
+      identity.daemonInstallationId,
+      identity.instanceId,
+      fixture.digest,
+      Buffer.from(legacyState),
+    );
+    legacy.close();
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+      "STORAGE_MIGRATION_REQUIRED",
+    );
+    RuntimeAuthorityDatabase.migrateV1Authority({ path, identity, lock: new FakeLock() });
+    const reopened = RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() });
+    expect(reopened.readCurrentConfig()!.config_revision).toBe(1);
+    reopened.close();
+  });
+});
+
 
 
 describe("TST-AUTH-005: reopen identity, digest and legacy-JSON abstention", () => {

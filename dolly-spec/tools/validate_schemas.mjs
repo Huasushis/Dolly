@@ -878,9 +878,10 @@ assertValid(
 );
 const validRuntimeAuthorityState = {
   schema: "dolly.runtime-authority-state/v1",
-  authority_schema_version: 1,
+  authority_schema_version: 2,
   daemon_installation_id: validConfigRevisionMapping.daemon_installation_id,
   instance_id: validConfigRevisionMapping.instance_id,
+  controller_generation_id: "0198ab11-6c44-7e8a-b2bb-000000000601",
   current_config_revision: validConfigRevisionMapping.config_revision,
   current_config_digest: validConfigRevisionMapping.config_digest,
 };
@@ -888,7 +889,7 @@ assertValid("closed current Runtime authority state", authorityRecordSchema, val
 assertValid(
   "unknown Runtime authority schema version",
   authorityRecordSchema,
-  { ...validRuntimeAuthorityState, authority_schema_version: 2 },
+  { ...validRuntimeAuthorityState, authority_schema_version: 3 },
   false,
 );
 
