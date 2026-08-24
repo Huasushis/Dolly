@@ -335,10 +335,19 @@ fn prepare_tool_ledger_schema(db: &mut Database) {
         .expect("activation parent");
     db.connection()
         .execute(
-            "INSERT OR IGNORE INTO config_revisions (config_revision) VALUES (?1)",
-            rusqlite::params![11_i64],
+            "INSERT OR IGNORE INTO config_revision_mappings (
+                 config_revision, daemon_installation_id, instance_id,
+                 config_digest, canonical_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                11_i64,
+                "daemon-test",
+                "instance-test",
+                "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                &b"{}"[..],
+            ],
         )
-        .expect("config revision parent");
+        .expect("config revision mapping parent");
 }
 
 fn open_db(dir: &std::path::Path) -> Database {

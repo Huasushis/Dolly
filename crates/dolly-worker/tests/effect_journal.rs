@@ -439,19 +439,29 @@ impl Fixture {
             .install_host_authority_revision(revision)
             .expect("install authority revision");
         create_tool_ledger_schema(db.connection()).expect("ledger schema");
-        // Seed the FK parents the AUTHORIZED ledger row references.
         db.connection()
             .execute(
                 "INSERT OR IGNORE INTO activations (activation_id) VALUES (?1)",
                 rusqlite::params!["0198ab31-6c44-7e8a-b2bb-000000000101"],
             )
             .expect("seed activation");
+        // The authority install owns config_revision_mappings; this insert is
+        // an idempotent fixture assertion for the exact FK parent.
         db.connection()
             .execute(
-                "INSERT OR IGNORE INTO config_revisions (config_revision) VALUES (?1)",
-                rusqlite::params![1_i64],
+                "INSERT OR IGNORE INTO config_revision_mappings (
+                     config_revision, daemon_installation_id, instance_id,
+                     config_digest, canonical_bytes
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    1_i64,
+                    "0198ab31-6c44-7e8a-b2bb-000000000001",
+                    &instance_id,
+                    "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                    &b"{}"[..],
+                ],
             )
-            .expect("seed config revision");
+            .expect("config revision mapping parent");
         drop(db);
         Self {
             directory,

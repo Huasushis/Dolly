@@ -8,12 +8,14 @@
 //! proving each crash-point observation survives close/reopen byte-for-byte.
 //!
 //! The rows are inserted only after creating the referenced `activations` and
-//! `config_revisions` parent rows so the §5.10 foreign keys are exercised for
-//! real.
+//! Host-owned `config_revision_mappings` parent rows so the §5.10 foreign keys
+//! are exercised for real.
 
 use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
+use dolly_storage::host_authority::HOST_AUTHORITY_SCHEMA_SQL;
 use dolly_storage::tool_ledger::{
-    CasKey, CasOutcome, LedgerInsertDisposition, TransportCorrelation, create_tool_ledger_schema,
+    CasKey, CasOutcome, LedgerInsertDisposition, TOOL_CALL_LEDGER_RECOVERY_INDEX_SQL,
+    TOOL_CALL_LEDGER_SCHEMA_SQL, TransportCorrelation, create_tool_ledger_schema,
     enumerate_nonterminal, gate_tool_ledger_schema, insert_authorized, load_exact,
 };
 use dolly_storage::{Database, StorageError};
@@ -23,7 +25,6 @@ use dolly_tool_broker::{
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
-
 
 /// Request-digest/operation-digest/outbound digest shorthand.
 fn digest(hex: u8) -> Sha256Digest {
@@ -221,10 +222,19 @@ fn seed_parents(conn: &Connection) {
     )
     .expect("seed activation");
     conn.execute(
-        "INSERT OR IGNORE INTO config_revisions (config_revision) VALUES (?1)",
-        rusqlite::params![11_i64],
+        "INSERT OR IGNORE INTO config_revision_mappings (
+             config_revision, daemon_installation_id, instance_id,
+             config_digest, canonical_bytes
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            11_i64,
+            "daemon-test",
+            "instance-test",
+            "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            &b"{}"[..],
+        ],
     )
-    .expect("seed config revision");
+    .expect("config revision mapping parent");
 }
 
 fn insert_authorized_row(db: &mut Database, record: &ToolCallLedgerRecord) {
@@ -240,13 +250,13 @@ fn tempdir() -> tempfile::TempDir {
 }
 fn create_lookalike_schema(connection: &Connection, with_recovery_index: bool) {
     connection
+        .execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
+        .expect("Host authority schema");
+    connection
         .execute_batch(
             r#"
             CREATE TABLE activations (
                 activation_id TEXT PRIMARY KEY NOT NULL
-            );
-            CREATE TABLE config_revisions (
-                config_revision INTEGER PRIMARY KEY NOT NULL
             );
             CREATE TABLE tool_call_ledger (
                 instance_id TEXT NOT NULL,
@@ -283,6 +293,107 @@ fn create_lookalike_schema(connection: &Connection, with_recovery_index: bool) {
     }
 }
 
+fn create_wrong_parent_schema(connection: &Connection) {
+    connection
+        .execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
+        .expect("Host authority schema");
+    connection
+        .execute_batch(
+            "CREATE TABLE config_revisions (
+                 config_revision INTEGER PRIMARY KEY NOT NULL
+             );",
+        )
+        .expect("legacy parallel parent");
+    let wrong_parent_schema =
+        TOOL_CALL_LEDGER_SCHEMA_SQL.replace("config_revision_mappings", "config_revisions");
+    connection
+        .execute_batch(&wrong_parent_schema)
+        .expect("wrong-parent ledger schema");
+    connection
+        .execute_batch(TOOL_CALL_LEDGER_RECOVERY_INDEX_SQL)
+        .expect("recovery index");
+}
+
+#[test]
+fn authoritative_host_mapping_and_ledger_schema_are_accepted() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
+        .expect("Host authority schema");
+    create_tool_ledger_schema(&connection).expect("authoritative ledger schema");
+    gate_tool_ledger_schema(&connection).expect("schema gate");
+
+    let referenced_parent: String = connection
+        .query_row(
+            "SELECT \"table\" FROM pragma_foreign_key_list('tool_call_ledger')
+             WHERE \"from\" = 'config_revision'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("config mapping foreign key");
+    assert_eq!(referenced_parent, "config_revision_mappings");
+}
+
+#[test]
+fn missing_host_mapping_is_migration_required_before_ledger_creation() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::MigrationRequired)
+    ));
+    let ledger_objects: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE name IN ('activations', 'tool_call_ledger', 'tool_call_ledger_recovery')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("ledger object count");
+    assert_eq!(
+        ledger_objects, 0,
+        "missing parent must not cause partial creation"
+    );
+}
+
+#[test]
+fn malformed_host_mapping_is_corrupt_not_migrated() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .execute_batch(
+            "CREATE TABLE config_revision_mappings (
+                 config_revision INTEGER PRIMARY KEY NOT NULL
+             );",
+        )
+        .expect("malformed Host parent");
+    connection
+        .execute_batch(TOOL_CALL_LEDGER_SCHEMA_SQL)
+        .expect("ledger with malformed parent");
+    connection
+        .execute_batch(TOOL_CALL_LEDGER_RECOVERY_INDEX_SQL)
+        .expect("recovery index");
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+}
+
+#[test]
+fn wrong_parent_foreign_key_is_corrupt_even_when_legacy_parent_exists() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    create_wrong_parent_schema(&connection);
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+}
 #[test]
 fn malformed_lookalike_schema_is_rejected_even_with_matching_columns_and_index() {
     let connection = Connection::open_in_memory().expect("in-memory SQLite");
@@ -319,6 +430,9 @@ fn schema_initializer_does_not_repair_malformed_existing_table() {
 #[test]
 fn malformed_recovery_index_properties_are_rejected() {
     let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
+        .expect("Host authority schema");
     create_tool_ledger_schema(&connection).expect("authoritative schema");
     connection
         .execute_batch(
@@ -332,7 +446,6 @@ fn malformed_recovery_index_properties_are_rejected() {
         Err(StorageError::Corrupt)
     ));
 }
-
 
 #[test]
 fn enumeration_requires_the_physical_ledger_schema() {
@@ -672,7 +785,11 @@ fn terminal_commit_ack_lost_reopen_replays_exact() {
     // The terminal record itself is the replay authority; no new permit or
     // recovery proof is minted from this storage-only test.
     assert_eq!(
-        loaded.terminal_result.as_ref().expect("terminal result").status,
+        loaded
+            .terminal_result
+            .as_ref()
+            .expect("terminal result")
+            .status,
         ToolStatus::Succeeded
     );
 }

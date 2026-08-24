@@ -15,9 +15,10 @@
 //! stored transport identity, or corrupt bytes/digests change nothing and
 //! fail closed (`CasOutcome::Stale`, `StorageError::Corrupt`).
 //!
-//! The minimal `activations` and `config_revisions` parent tables are created
-//! with only the referenced key so the §5.10 foreign keys are real and
-//! enforced; their fuller column sets arrive with their own storage slices.
+//! The `activations` parent is created here only because the activation storage
+//! slice is not part of this module yet. Configuration revisions are different:
+//! `config_revision_mappings` is the Host-owned authority table and MUST already
+//! exist with its complete schema; this module never creates a parallel parent.
 
 use dolly_canonical_json::{ParseLimits, Sha256Digest, deserialize_core_json};
 use dolly_tool_broker::{LedgerState, ToolCallLedgerRecord};
@@ -25,19 +26,20 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 
 use crate::database::map_sqlite_error;
 use crate::error::{StorageError, StorageResult};
+use crate::host_authority::HOST_AUTHORITY_SCHEMA_SQL;
 
 /// The logical table this slice writes.
 pub const TOOL_CALL_LEDGER_TABLE: &str = "tool_call_ledger";
+/// The Host-owned parent table for the retained configuration revision.
+pub const CONFIG_REVISION_MAPPINGS_TABLE: &str = "config_revision_mappings";
 
 /// The authoritative Tool-call ledger schema (storage-and-recovery §5.10):
-/// the minimum parent tables referenced by the foreign keys, the ledger
-/// table, and the recovery index. Idempotent (`IF NOT EXISTS`).
+/// the ledger-side activation parent, ledger table, and recovery index.
+/// Host-owned `config_revision_mappings` is verified separately and never
+/// created here. Idempotent (`IF NOT EXISTS`) for ledger-side objects.
 pub const TOOL_CALL_LEDGER_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS activations (
     activation_id TEXT PRIMARY KEY NOT NULL
-);
-CREATE TABLE IF NOT EXISTS config_revisions (
-    config_revision INTEGER PRIMARY KEY NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tool_call_ledger (
     instance_id                  TEXT    NOT NULL,
@@ -67,7 +69,8 @@ CREATE TABLE IF NOT EXISTS tool_call_ledger (
     PRIMARY KEY (module_id, operation_id),
     UNIQUE (tool_server_id, tool_server_generation, server_request_id),
     FOREIGN KEY (activation_id) REFERENCES activations(activation_id),
-    FOREIGN KEY (config_revision) REFERENCES config_revisions(config_revision),
+    FOREIGN KEY (config_revision)
+      REFERENCES config_revision_mappings(config_revision),
     CHECK (
         (state = 'AUTHORIZED' AND ledger_revision = 1
                                AND outbound_digest IS NULL
@@ -97,7 +100,6 @@ CREATE INDEX IF NOT EXISTS tool_call_ledger_recovery
 pub fn create_tool_ledger_schema(connection: &rusqlite::Connection) -> StorageResult<()> {
     let expected = authoritative_schema_sql()?;
     verify_existing_schema_sql(connection, "table", "activations", &expected.0)?;
-    verify_existing_schema_sql(connection, "table", "config_revisions", &expected.1)?;
     verify_existing_schema_sql(connection, "table", TOOL_CALL_LEDGER_TABLE, &expected.2)?;
     verify_existing_schema_sql(
         connection,
@@ -105,10 +107,17 @@ pub fn create_tool_ledger_schema(connection: &rusqlite::Connection) -> StorageRe
         "tool_call_ledger_recovery",
         &expected.3,
     )?;
+    require_existing_schema_sql(
+        connection,
+        "table",
+        CONFIG_REVISION_MAPPINGS_TABLE,
+        &expected.1,
+    )?;
 
     // `IF NOT EXISTS` is only allowed to install genuinely missing objects.
-    // Existing objects were checked above, so a malformed lookalike cannot be
-    // repaired or blessed by this idempotent initializer.
+    // The Host mapping parent was checked above and is never created here;
+    // missing or malformed authority storage therefore fails before any
+    // ledger-side object can be installed.
     connection
         .execute_batch(TOOL_CALL_LEDGER_SCHEMA_SQL)
         .map_err(map_sqlite_error)?;
@@ -122,6 +131,9 @@ pub fn create_tool_ledger_schema(connection: &rusqlite::Connection) -> StorageRe
 /// prevents a column-only lookalike from passing the physical schema gate.
 fn authoritative_schema_sql() -> StorageResult<(String, String, String, String)> {
     let connection = Connection::open_in_memory().map_err(map_sqlite_error)?;
+    connection
+        .execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
+        .map_err(map_sqlite_error)?;
     connection
         .execute_batch(TOOL_CALL_LEDGER_SCHEMA_SQL)
         .map_err(map_sqlite_error)?;
@@ -140,7 +152,7 @@ fn authoritative_schema_sql() -> StorageResult<(String, String, String, String)>
     };
     Ok((
         object_sql("table", "activations")?,
-        object_sql("table", "config_revisions")?,
+        object_sql("table", CONFIG_REVISION_MAPPINGS_TABLE)?,
         object_sql("table", TOOL_CALL_LEDGER_TABLE)?,
         object_sql("index", "tool_call_ledger_recovery")?,
     ))
@@ -172,6 +184,26 @@ fn verify_existing_schema_sql(
         }
     }
     Ok(())
+}
+fn require_existing_schema_sql(
+    connection: &rusqlite::Connection,
+    object_type: &str,
+    name: &str,
+    expected: &str,
+) -> StorageResult<()> {
+    let actual: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+            rusqlite::params![object_type, name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    match actual {
+        Some(actual) if normalized_schema_sql(&actual) == normalized_schema_sql(expected) => Ok(()),
+        Some(_) => Err(StorageError::Corrupt),
+        None => Err(StorageError::MigrationRequired),
+    }
 }
 
 fn verify_schema_objects(
@@ -294,7 +326,7 @@ fn verify_foreign_keys(connection: &rusqlite::Connection) -> StorageResult<()> {
             "NONE".to_owned(),
         ),
         (
-            "config_revisions".to_owned(),
+            CONFIG_REVISION_MAPPINGS_TABLE.to_owned(),
             "config_revision".to_owned(),
             "config_revision".to_owned(),
             "NO ACTION".to_owned(),
@@ -354,7 +386,7 @@ pub fn gate_tool_ledger_schema(connection: &rusqlite::Connection) -> StorageResu
         connection,
         &[
             ("table", "activations", &expected.0),
-            ("table", "config_revisions", &expected.1),
+            ("table", CONFIG_REVISION_MAPPINGS_TABLE, &expected.1),
             ("table", TOOL_CALL_LEDGER_TABLE, &expected.2),
             ("index", "tool_call_ledger_recovery", &expected.3),
         ],
@@ -367,9 +399,15 @@ pub fn gate_tool_ledger_schema(connection: &rusqlite::Connection) -> StorageResu
     )?;
     verify_required_columns(
         connection,
-        "config_revisions",
-        &[("config_revision", "INTEGER", 1, 1)],
-        false,
+        CONFIG_REVISION_MAPPINGS_TABLE,
+        &[
+            ("config_revision", "INTEGER", 0, 1),
+            ("daemon_installation_id", "TEXT", 1, 0),
+            ("instance_id", "TEXT", 1, 0),
+            ("config_digest", "TEXT", 1, 0),
+            ("canonical_bytes", "BLOB", 1, 0),
+        ],
+        true,
     )?;
     verify_required_columns(
         connection,

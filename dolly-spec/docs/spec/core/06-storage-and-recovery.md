@@ -61,7 +61,7 @@ Physical normalization MAY differ, but a conforming database MUST enforce the eq
 | `subscriptions` | `(page_id, module_id)` | next-uncommitted cursor and state |
 | `subscription_skips` | unique skip record ID | audited cursor advance without Activation |
 | `subscription_dead_letters` | `(page_id, module_id, page_seq)` | exact Delivery/Block evidence for an audited dead-letter cursor advance |
-| `config_revisions` | `config_revision` | canonical immutable resolved configuration snapshots |
+| `config_revision_mappings` | `config_revision` | Host-owned canonical immutable resolved configuration snapshots |
 | `graph_revisions` | `graph_revision` | canonical immutable graph snapshots |
 | `descriptor_revisions` | `(module_id, descriptor_revision)` | immutable Descriptor snapshots |
 | `extension_generations` | `(extension_alias, extension_generation)` | durable Worker epoch, process/package identity, negotiated limits, Module binding, readiness, and activation-ledger continuity |
@@ -348,7 +348,7 @@ CREATE TABLE tool_call_ledger (
   PRIMARY KEY (module_id, operation_id),
   UNIQUE (tool_server_id, tool_server_generation, server_request_id),
   FOREIGN KEY (activation_id) REFERENCES activations(activation_id),
-  FOREIGN KEY (config_revision) REFERENCES config_revisions(config_revision),
+  FOREIGN KEY (config_revision) REFERENCES config_revision_mappings(config_revision),
   CHECK (
     (state = 'AUTHORIZED' AND ledger_revision = 1
                            AND outbound_digest IS NULL
