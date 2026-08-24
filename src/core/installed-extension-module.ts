@@ -81,6 +81,106 @@ export interface ResolveReservedV10InstalledModulePlanOptions {
 }
 
 const RESERVED_V10_INSTALLED_MODULE_PLANS = new WeakSet<object>();
+const RESERVED_V10_PROJECTED_MODULE_PLANS = new WeakMap<
+  object,
+  ReservedV10InstalledModulePlan
+>();
+
+function projectReservedV10SubscriptionStart(
+  inputConnections: ReservedV10InstalledModulePlan["module"]["inputConnections"],
+): "from-head" | "from-now" {
+  if (inputConnections.length === 0) return "from-head";
+  const first = inputConnections[0]!.start;
+  if (typeof first !== "string") {
+    throw new TypeError(
+      "Reserved version-10 installed Module checkpoint subscriptions require an explicit scheduler bridge before runtime construction",
+    );
+  }
+  if (
+    inputConnections.some(
+      (connection) =>
+        typeof connection.start !== "string" || connection.start !== first,
+    )
+  ) {
+    throw new TypeError(
+      "Reserved version-10 installed Module mixed input subscription starts require an explicit scheduler bridge before runtime construction",
+    );
+  }
+  return first as "from-head" | "from-now";
+}
+
+/**
+ * Projects one resolver-minted v10 plan into the legacy installed-module
+ * shape only where the existing runtime can express the same subscription
+ * semantics. Checkpoint and mixed starts are refused rather than collapsed.
+ * The identity brand prevents a low-level caller from replacing this
+ * premise-derived projection with a structurally similar module.
+ */
+export function projectReservedV10InstalledModule(
+  plan: ReservedV10InstalledModulePlan,
+): InstalledExtensionModule {
+  assertReservedV10InstalledModulePlan(plan);
+  const module = plan.module;
+  const subscriptionStart = projectReservedV10SubscriptionStart(
+    module.inputConnections,
+  );
+  const projectedModule = Object.freeze({
+    moduleId: module.moduleId,
+    extensionId: module.extensionId,
+    packageVersion: module.packageVersion,
+    moduleKind: module.moduleKind,
+    isolation: "process" as const,
+    configurationReference: Object.freeze({ ...module.configurationReference }),
+    permissionPolicyIds: Object.freeze(
+      module.permissionPolicyReferences.map((reference) => reference.policyId),
+    ),
+    inputPageIds: Object.freeze(
+      module.inputConnections.map((connection) => connection.pageId),
+    ),
+    outputPageIds: Object.freeze([...module.outputPageIds]),
+    subscriptionStart,
+    activation: module.activation,
+    limits: Object.freeze({
+      claim: module.activation.kind === "source"
+        ? null
+        : Object.freeze({
+            maxCount: module.limits.claim.maxCount,
+            maxBytes: module.limits.claim.maxBytes,
+          }),
+      maxInputBytes: module.limits.maxInputBytes,
+      maxResultBytes: module.limits.maxResultBytes,
+      maxFrameBytes: module.limits.maxFrameBytes,
+      maxRunsPerGeneration: module.limits.maxRunsPerGeneration,
+      maxGenerations: module.limits.maxGenerations,
+    }),
+    timeouts: Object.freeze({ ...module.timeouts }),
+  } satisfies DollyModuleConfig);
+  const projected = Object.freeze({
+    instanceId: plan.instanceId,
+    module: projectedModule,
+    installation: plan.installation,
+    packageModule: plan.packageModule,
+    configuration: plan.configuration,
+  });
+  RESERVED_V10_PROJECTED_MODULE_PLANS.set(projected, plan);
+  return projected;
+}
+
+export function assertReservedV10InstalledModuleProjection(
+  value: unknown,
+  plan: ReservedV10InstalledModulePlan,
+): asserts value is InstalledExtensionModule {
+  assertReservedV10InstalledModulePlan(plan);
+  if (
+    value === null ||
+    (typeof value !== "object" && typeof value !== "function") ||
+    RESERVED_V10_PROJECTED_MODULE_PLANS.get(value) !== plan
+  ) {
+    throw new TypeError(
+      "Reserved version-10 installed Linux executor requires the exact premise-derived resolved Module",
+    );
+  }
+}
 
 /** Rejects structurally forged plans at internal composition boundaries. */
 export function assertReservedV10InstalledModulePlan(

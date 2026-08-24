@@ -824,7 +824,6 @@ describe("post-H3 installed Module activation candidate", () => {
       const permissionPolicies = new ReservedV10InstalledPermissionPolicyRegistry({
         policies: [],
       });
-      const resolveLiveBindings = vi.spyOn(permissionPolicies, "resolveLiveBindingsFor");
       const premise = composeInstalledModuleRuntimePremise({
         candidate,
         permissionPolicies,
@@ -833,15 +832,6 @@ describe("post-H3 installed Module activation candidate", () => {
         controller: current.controller,
         origins: current.origins,
       });
-      expect(resolveLiveBindings).toHaveBeenCalledWith(
-        candidate.modules[0]!.installedModule,
-        current.permission,
-        expect.objectContaining({
-          database: current.database,
-          controller: current.controller,
-          origins: current.origins,
-        }),
-      );
       const module = premise.modules[0]!;
       expect(module.permissionBindings).toEqual([]);
       expect(premise.schemaVersion).toBe("dolly.installed-module-runtime-premise/1");
@@ -880,6 +870,41 @@ describe("post-H3 installed Module activation candidate", () => {
         "processProvenance",
       ]);
       expect(() => assertInstalledModuleRuntimePremise({ ...premise })).toThrow(/not minted/u);
+    } finally {
+      await closeFixture(current);
+    }
+  });
+  it("rejects subclass and monkeypatched Host policy registries at the premise boundary", async () => {
+    const current = await fixture();
+    try {
+      const candidate = composeInstalledModuleActivationCandidate(options(current));
+      const context = {
+        candidate,
+        startupAuthorityPermission: current.permission,
+        database: current.database,
+        controller: current.controller,
+        origins: current.origins,
+      };
+      class SubclassRegistry extends ReservedV10InstalledPermissionPolicyRegistry {}
+      const subclassRegistry = new SubclassRegistry({ policies: [] });
+      expect(() => composeInstalledModuleRuntimePremise({
+        ...context,
+        permissionPolicies: subclassRegistry,
+      })).toThrow(/exact Host implementation/u);
+
+      const monkeypatchedRegistry = new ReservedV10InstalledPermissionPolicyRegistry({
+        policies: [],
+      });
+      Object.defineProperty(monkeypatchedRegistry, "resolveFor", {
+        configurable: true,
+        value: () => {
+          throw new Error("forged policy selection");
+        },
+      });
+      expect(() => composeInstalledModuleRuntimePremise({
+        ...context,
+        permissionPolicies: monkeypatchedRegistry,
+      })).toThrow(/exact Host implementation/u);
     } finally {
       await closeFixture(current);
     }
@@ -1207,6 +1232,13 @@ describe("post-H3 installed Module activation candidate", () => {
         controller: current.controller,
         origins: current.origins,
       });
+      const plan = candidate.modules[0]!.installedModule;
+      const projected = projectReservedV10InstalledModule(plan);
+      expect(() => new ReservedV10InstalledPermissionPolicyRegistry({
+        policies: [],
+      }).setupFor(plan, { ...projected })).toThrow(
+        /exact premise-derived|exact projected/u,
+      );
       const prepared = consumerOptions(current, configuration, premise);
       expect(() => createInstalledReactiveModuleRuntime({
         ...prepared.options,
@@ -1220,6 +1252,38 @@ describe("post-H3 installed Module activation candidate", () => {
       expect(typeof executor.start).toBe("function");
       expect(typeof executor.terminate).toBe("function");
       expect(prepared.core.store.listModuleProcessRecords()).toEqual([]);
+    } finally {
+      await closeFixture(current);
+    }
+  });
+  it("rejects a tampered installation trust before v10 process or effect setup", async () => {
+    const current = await fixture();
+    try {
+      const configuration = currentV10Configuration(current);
+      const candidate = composeInstalledModuleActivationCandidate(options(current));
+      const premise = composeInstalledModuleRuntimePremise({
+        candidate,
+        permissionPolicies: new ReservedV10InstalledPermissionPolicyRegistry({
+          policies: [],
+        }),
+        startupAuthorityPermission: current.permission,
+        database: current.database,
+        controller: current.controller,
+        origins: current.origins,
+      });
+      const prepared = consumerOptions(current, configuration, premise);
+      const resolveInstallation = current.installations.resolve.bind(current.installations);
+      const spy = vi.spyOn(current.installations, "resolve").mockImplementation((lookup) => ({
+        ...resolveInstallation(lookup),
+        trust: "untrusted",
+      }));
+      try {
+        expect(() => createInstalledReactiveModuleRuntime(prepared.options))
+          .toThrow(/trust|stale/u);
+        expect(prepared.core.store.listModuleProcessRecords()).toEqual([]);
+      } finally {
+        spy.mockRestore();
+      }
     } finally {
       await closeFixture(current);
     }

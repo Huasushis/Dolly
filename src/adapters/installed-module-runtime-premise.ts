@@ -19,6 +19,7 @@ import {
   type ReservedV10InstalledModuleProcessProvenance,
 } from "./installed-linux-extension-module-executor.js";
 import {
+  assertReservedV10InstalledPermissionPolicyRegistry,
   ReservedV10InstalledPermissionPolicyRegistry,
   type InstalledModulePermissionBinding,
   type ReservedV10InstalledPermissionPolicySelection,
@@ -95,11 +96,7 @@ function assertOptions(value: unknown): asserts value is InstalledModuleRuntimeP
     );
   }
   assertInstalledModuleActivationCandidate(value.candidate);
-  if (!(value.permissionPolicies instanceof ReservedV10InstalledPermissionPolicyRegistry)) {
-    throw new TypeError(
-      "installed Module runtime premise requires the reserved version-10 permission policy registry",
-    );
-  }
+  assertReservedV10InstalledPermissionPolicyRegistry(value.permissionPolicies);
   assertStartupAuthorityPermissionContext(
     value.startupAuthorityPermission,
     value as unknown as StartupAuthorityPermissionContext,
@@ -232,6 +229,7 @@ function assertPremiseAuthority(
       "installed Module runtime premise has no private Host authority",
     );
   }
+  assertReservedV10InstalledPermissionPolicyRegistry(authority.permissionPolicies);
   assertStartupAuthorityPermissionContext(
     authority.startupAuthorityPermission,
     authority.context,

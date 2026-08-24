@@ -186,6 +186,26 @@ export function createInstalledFileCoreStateStoreWithStoppedRecordWriter(
       createInstalledModuleProcessDeclarationProvenanceAuthority(store),
   });
 }
+function reservedV10PlanProvenanceTrust(
+  plan: ReservedV10InstalledModulePlan,
+): unknown {
+  const provenance = plan.provenance;
+  if (provenance === null || typeof provenance !== "object") {
+    return undefined;
+  }
+  if (!("installation" in provenance)) {
+    return undefined;
+  }
+  const installation = provenance.installation;
+  if (
+    installation === null ||
+    typeof installation !== "object" ||
+    !("trust" in installation)
+  ) {
+    return undefined;
+  }
+  return installation.trust;
+}
 function assertReservedV10PremiseForRuntime(
   options: InstalledReactiveModuleRuntimeOptions,
 ): {
@@ -267,6 +287,8 @@ function assertReservedV10PremiseForRuntime(
     packageVersion: plan.module.packageVersion,
   });
   if (
+    installation.trust !== plan.installation.trust ||
+    reservedV10PlanProvenanceTrust(plan) !== installation.trust ||
     installation.packageDigest !== plan.installation.packageDigest ||
     canonicalJsonDigest(installation.manifest) !== canonicalJsonDigest(plan.installation.manifest)
   ) {
