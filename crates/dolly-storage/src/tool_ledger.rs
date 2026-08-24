@@ -164,43 +164,51 @@ fn normalized_schema_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<String>()
 }
 
+fn existing_schema_object(
+    connection: &rusqlite::Connection,
+    name: &str,
+) -> StorageResult<Option<(String, Option<String>)>> {
+    connection
+        .query_row(
+            "SELECT type, sql FROM sqlite_master WHERE name = ?1",
+            [name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(map_sqlite_error)
+}
+
 fn verify_existing_schema_sql(
     connection: &rusqlite::Connection,
     object_type: &str,
     name: &str,
     expected: &str,
 ) -> StorageResult<()> {
-    let actual: Option<String> = connection
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
-            rusqlite::params![object_type, name],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(map_sqlite_error)?;
-    if let Some(actual) = actual {
-        if normalized_schema_sql(&actual) != normalized_schema_sql(expected) {
-            return Err(StorageError::Corrupt);
+    match existing_schema_object(connection, name)? {
+        Some((actual_type, Some(actual)))
+            if actual_type == object_type
+                && normalized_schema_sql(&actual) == normalized_schema_sql(expected) =>
+        {
+            Ok(())
         }
+        Some(_) => Err(StorageError::Corrupt),
+        None => Ok(()),
     }
-    Ok(())
 }
+
 fn require_existing_schema_sql(
     connection: &rusqlite::Connection,
     object_type: &str,
     name: &str,
     expected: &str,
 ) -> StorageResult<()> {
-    let actual: Option<String> = connection
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
-            rusqlite::params![object_type, name],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(map_sqlite_error)?;
-    match actual {
-        Some(actual) if normalized_schema_sql(&actual) == normalized_schema_sql(expected) => Ok(()),
+    match existing_schema_object(connection, name)? {
+        Some((actual_type, Some(actual)))
+            if actual_type == object_type
+                && normalized_schema_sql(&actual) == normalized_schema_sql(expected) =>
+        {
+            Ok(())
+        }
         Some(_) => Err(StorageError::Corrupt),
         None => Err(StorageError::MigrationRequired),
     }
@@ -212,17 +220,10 @@ fn verify_schema_objects(
 ) -> StorageResult<()> {
     let mut missing = false;
     for (object_type, name, expected_sql) in expected {
-        let actual: Option<String> = connection
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
-                rusqlite::params![object_type, name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(map_sqlite_error)?;
-        match actual {
-            Some(actual)
-                if normalized_schema_sql(&actual) == normalized_schema_sql(expected_sql) => {}
+        match existing_schema_object(connection, name)? {
+            Some((actual_type, Some(actual)))
+                if actual_type == *object_type
+                    && normalized_schema_sql(&actual) == normalized_schema_sql(expected_sql) => {}
             Some(_) => return Err(StorageError::Corrupt),
             None => missing = true,
         }
@@ -233,7 +234,6 @@ fn verify_schema_objects(
         Ok(())
     }
 }
-
 fn index_columns(connection: &rusqlite::Connection, index: &str) -> StorageResult<Vec<String>> {
     let mut statement = connection
         .prepare(&format!("PRAGMA index_info({index})"))

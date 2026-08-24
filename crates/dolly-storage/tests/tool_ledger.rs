@@ -314,6 +314,88 @@ fn create_wrong_parent_schema(connection: &Connection) {
         .expect("recovery index");
 }
 
+fn ledger_side_effect_objects(connection: &Connection) -> Vec<(String, String)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name FROM sqlite_master
+             WHERE name IN ('activations', 'tool_call_ledger', 'tool_call_ledger_recovery')
+             ORDER BY name",
+        )
+        .expect("ledger object lookup");
+    statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("ledger object rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("ledger object collection")
+}
+
+#[test]
+fn wrong_kind_host_mapping_is_corrupt_before_ledger_creation() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .execute_batch("CREATE VIEW config_revision_mappings AS SELECT 1;")
+        .expect("wrong-kind Host parent");
+
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert!(
+        ledger_side_effect_objects(&connection).is_empty(),
+        "wrong-kind parent must not cause ledger-side creation"
+    );
+}
+
+#[test]
+fn wrong_kind_ledger_table_is_corrupt_before_ledger_creation() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .execute_batch("CREATE VIEW tool_call_ledger AS SELECT 1;")
+        .expect("wrong-kind ledger table");
+
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert_eq!(
+        ledger_side_effect_objects(&connection),
+        vec![("view".to_owned(), "tool_call_ledger".to_owned())],
+        "wrong-kind ledger object must not cause activation or index creation"
+    );
+}
+
+#[test]
+fn wrong_kind_recovery_index_is_corrupt_before_ledger_creation() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .execute_batch("CREATE TABLE tool_call_ledger_recovery (marker INTEGER);")
+        .expect("wrong-kind recovery index");
+
+    assert!(matches!(
+        gate_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert!(matches!(
+        create_tool_ledger_schema(&connection),
+        Err(StorageError::Corrupt)
+    ));
+    assert_eq!(
+        ledger_side_effect_objects(&connection),
+        vec![("table".to_owned(), "tool_call_ledger_recovery".to_owned())],
+        "wrong-kind index object must not cause activation or ledger-table creation"
+    );
+}
+
 #[test]
 fn authoritative_host_mapping_and_ledger_schema_are_accepted() {
     let connection = Connection::open_in_memory().expect("in-memory SQLite");
