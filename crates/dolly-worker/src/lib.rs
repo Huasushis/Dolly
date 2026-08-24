@@ -18,16 +18,10 @@ use dolly_storage::mcp_readiness::{
     MCP_PROTOCOL_VERSION_2025_06_18, McpTransportReadiness,
 };
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding, invalidate_runtime_binding};
-#[cfg(not(feature = "test-support"))]
-use dolly_storage::runtime_binding::mint_current_runtime_binding;
-#[cfg(feature = "test-support")]
-use dolly_storage::runtime_binding::mint_test_runtime_binding;
 use dolly_storage::tool_broker_authority::{
     ToolDispatchAuthority, ToolRegistryRevision, authorize_tool_dispatch, publish_tool_registry,
 };
-use dolly_storage::tool_ledger::{create_tool_ledger_schema, load_exact};
-#[cfg(feature = "test-support")]
-use dolly_storage::tool_ledger::{insert_authorized, LedgerInsertDisposition};
+use dolly_storage::tool_ledger::load_exact;
 use dolly_tool_broker::effect_journal::{
     Claim, ClaimRecordSchemaTag, EffectClass, EffectJournalRecordSchemaTag, EffectJournalState,
     ExternalEffectJournalRecord, derive_claim_token,
@@ -48,6 +42,47 @@ pub struct WorkerStartConfig {
     pub server_id: String,
     pub package_root: PathBuf,
     pub package_path: PathBuf,
+}
+#[cfg(feature = "test-support")]
+mod test_support;
+
+type StartupMint =
+    fn(&mut Database, ExtensionId) -> Result<RuntimeBinding, WorkerError>;
+type StartupInitialize = fn(
+    &mut HostMcpStdioInvocation,
+    &EffectJournalIntentAuthority,
+    &Database,
+    &RuntimeBinding,
+    &ProcessGeneration,
+    &str,
+    Instant,
+) -> Result<McpTransportReadiness, StdioTransportError>;
+
+fn mint_live_runtime_binding(
+    database: &mut Database,
+    extension_alias: ExtensionId,
+) -> Result<RuntimeBinding, WorkerError> {
+    dolly_storage::runtime_binding::mint_current_runtime_binding(database, extension_alias)
+        .map_err(|error| WorkerError::Authority(error.to_string()))
+}
+
+fn initialize_live(
+    invocation: &mut HostMcpStdioInvocation,
+    authority: &EffectJournalIntentAuthority,
+    database: &Database,
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    server_id: &str,
+    deadline: Instant,
+) -> Result<McpTransportReadiness, StdioTransportError> {
+    invocation.initialize(
+        authority,
+        database,
+        runtime_binding,
+        process_generation,
+        server_id,
+        deadline,
+    )
 }
 
 /// Fail-closed Worker startup or one-shot dispatch refusal.
@@ -93,10 +128,14 @@ impl Worker {
     /// Execute the bounded Linux-first startup sequence and retain one
     /// verified, initialized stdio session for the next tools/call dispatch.
     pub fn start(config: WorkerStartConfig) -> Result<Self, WorkerError> {
-        Self::start_internal(config)
+        Self::start_internal_with(config, mint_live_runtime_binding, initialize_live)
     }
 
-    fn start_internal(config: WorkerStartConfig) -> Result<Self, WorkerError> {
+    fn start_internal_with(
+        config: WorkerStartConfig,
+        mint_runtime_binding: StartupMint,
+        initialize_invocation: StartupInitialize,
+    ) -> Result<Self, WorkerError> {
         if !cfg!(target_os = "linux") {
             return Err(WorkerError::UnsupportedPlatform);
         }
@@ -129,10 +168,6 @@ impl Worker {
             &durable_server.executable_digest,
             "installed executable",
         )?;
-        create_tool_ledger_schema(database.connection())
-            .map_err(|error| WorkerError::Storage(error.to_string()))?;
-        // The journal schema is installed only by the controller-owned
-        // fresh/offline initialization transaction. Ordinary Worker reopen
         // gates the exact physical schema and version; it never repairs it.
         gate_schema_version(database.connection())
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
@@ -148,17 +183,24 @@ impl Worker {
             .checked_add(durable_server.startup_timeout)
             .ok_or_else(|| WorkerError::Process("startup deadline overflow".into()))?;
         let session_id = new_session_id()?;
-        let mut runtime_binding = {
-            #[cfg(feature = "test-support")]
-            {
-                mint_test_runtime_binding(&mut database, config.extension_alias.clone())
-            }
-            #[cfg(not(feature = "test-support"))]
-            {
-                mint_current_runtime_binding(&mut database, config.extension_alias.clone())
-            }
+        let mut runtime_binding =
+            mint_runtime_binding(&mut database, config.extension_alias.clone())?;
+        // Recover persisted ledger rows before minting a new process
+        // generation. This conservative coordinator fence can never release
+        // a send permit or redispatch a child effect.
+        if let Err(error) = reopen_recovery(&mut database) {
+            return Err(startup_failure(
+                &mut database,
+                &runtime_binding,
+                None,
+                None,
+                WorkerError::Dispatch(error),
+            ));
         }
-        .map_err(|error| WorkerError::Authority(error.to_string()))?;
+        settle_pending_effect_journal(&mut database)
+            .map_err(|error| WorkerError::Storage(error.to_string()))?;
+        retain_settled_effect_journal(&mut database)
+            .map_err(|error| WorkerError::Storage(error.to_string()))?;
         let process_generation = match runtime_binding.mint_process_generation(&mut database) {
             Ok(generation) => generation,
             Err(error) => {
@@ -279,7 +321,8 @@ impl Worker {
                 ));
             }
         };
-        let readiness = match invocation.initialize(
+        let readiness = match initialize_invocation(
+            &mut invocation,
             &handshake_authority,
             &database,
             &runtime_binding,
@@ -360,21 +403,6 @@ impl Worker {
         // conservative no-send facts inside the coordinator fence, so every
         // persisted AUTHORIZED/DISPATCHED row is terminalized fail-closed and
         // no child request is replayed.
-        if let Err(error) = reopen_recovery(
-            &mut database,
-            &dispatch_authority,
-            &runtime_binding,
-            &process_generation,
-            &readiness,
-        ) {
-            return Err(startup_failure(
-                &mut database,
-                &runtime_binding,
-                Some(&process_generation),
-                Some(&process_handle),
-                WorkerError::Dispatch(error),
-            ));
-        }
         if let Err(error) = settle_pending_effect_journal(&mut database) {
             return Err(startup_failure(
                 &mut database,
@@ -433,49 +461,6 @@ impl Worker {
         &self.registry
     }
 
-    /// Test-support-only insertion through the Worker's already-open
-    /// authoritative SQLite connection. This avoids a second instance owner;
-    /// no authority or proof object crosses the production boundary.
-    #[cfg(feature = "test-support")]
-    pub fn insert_authorized_for_test(
-        &mut self,
-        row: &ToolCallLedgerRecord,
-    ) -> Result<(), WorkerError> {
-        match insert_authorized(self.database.connection_mut(), row)
-            .map_err(|error| WorkerError::Storage(error.to_string()))?
-        {
-            LedgerInsertDisposition::Inserted { .. } | LedgerInsertDisposition::Replayed { .. } => {
-                Ok(())
-            }
-        }
-    }
-
-    /// Test-support-only journal prefill through this Worker's owned
-    /// connection, preserving the one-instance lock and production CAS.
-    #[cfg(feature = "test-support")]
-    pub fn insert_intent_for_test(
-        &mut self,
-        record: &ExternalEffectJournalRecord,
-    ) -> Result<(), WorkerError> {
-        match insert_intent(self.database.connection_mut(), record)
-            .map_err(|error| WorkerError::Storage(error.to_string()))?
-        {
-            EffectJournalInsertDisposition::Inserted { .. }
-            | EffectJournalInsertDisposition::Replayed { .. } => Ok(()),
-        }
-    }
-
-
-    /// Test-support-only exact Claim intent construction for a restart
-    /// fixture. The production minting path remains private and unchanged.
-    #[cfg(feature = "test-support")]
-    pub fn intent_record_for_test(
-        &self,
-        row: &ToolCallLedgerRecord,
-        request_bytes: &[u8],
-    ) -> Result<ExternalEffectJournalRecord, WorkerError> {
-        self.mint_intent_record(row, request_bytes)
-    }
     /// Route sequential tools/call rows through the one initialized session.
     /// The retained child is stopped only after explicit stop, terminal
     pub fn dispatch_tools_call(

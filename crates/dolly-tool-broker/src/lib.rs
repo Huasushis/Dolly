@@ -21,7 +21,7 @@ pub mod version;
 pub use dispatch::{
     ConfirmationDecision, DispatchDisposition, EVENT_TOOL_DISPATCH_PROVED_NOT_APPLIED,
     EVENT_TOOL_OPERATION_DISPATCHED, EVENT_TOOL_OUTCOME_UNKNOWN, LedgerRecordError, LedgerState,
-    RecoveryFacts, RecoveryFactsSource, TOOL_CALL_LEDGER_RECORD_SCHEMA,
+    RecoveryFacts, RecoveryProof, TOOL_CALL_LEDGER_RECORD_SCHEMA,
     TOOL_OPERATION_BINDING_SCHEMA, ToolCallLedgerRecord, ToolCallLedgerRecordSchemaTag,
     ToolOperationBinding, ToolOperationBindingSchemaTag, recover_operation,
 };

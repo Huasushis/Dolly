@@ -8,9 +8,9 @@
 //! defined here so the coordinator stays free of transport/Host/network.
 
 use std::time::SystemTime;
-
 use dolly_storage::mcp_readiness::McpTransportReadiness;
-use dolly_tool_broker::{RecoveryFacts, RecoveryFactsSource, ToolCallLedgerRecord};
+
+use dolly_tool_broker::{RecoveryFacts, RecoveryProof, ToolCallLedgerRecord};
 
 /// Host-owned answer to "is the frozen generation still Ready for this
 /// retained revision?" (tool-broker §4/§6).
@@ -64,26 +64,22 @@ pub struct FencedFactsProvider<'a> {
     pub(crate) clock: &'a dyn Clock,
 }
 
-// SAFETY: this implementation is the coordinator's sole Host-owned fence
-// boundary. Worker callers never receive the source or pass facts to dispatch.
-unsafe impl RecoveryFactsSource for FencedFactsProvider<'_> {
-    fn facts_for(&self, row: &ToolCallLedgerRecord) -> (bool, bool, bool) {
-        let binding = &row.operation_binding;
-        (
-            self.zero_bytes_proved,
-            self.readiness.exact_generation_ready(
-                &binding.module_id,
-                &binding.tool_server_id,
-                binding.tool_server_generation,
-            ),
-            deadline_expired(&binding.authorized_deadline, self.clock.now()),
-        )
-    }
-}
-
 impl RecoveryFactsProvider for FencedFactsProvider<'_> {
     fn facts_for(&self, row: &ToolCallLedgerRecord) -> RecoveryFacts {
-        RecoveryFacts::from_authoritative_source(self, row)
+        let binding = &row.operation_binding;
+        let ready = self.readiness.exact_generation_ready(
+            &binding.module_id,
+            &binding.tool_server_id,
+            binding.tool_server_generation,
+        );
+        let expired = deadline_expired(&binding.authorized_deadline, self.clock.now());
+        let proof = match (self.zero_bytes_proved, ready, expired) {
+            (true, true, false) => RecoveryProof::coordinator_dispatch_ready(),
+            (true, false, false) => RecoveryProof::coordinator_dispatch_unready(),
+            (true, _, true) => RecoveryProof::coordinator_dispatch_expired(),
+            _ => RecoveryProof::coordinator_reopen(),
+        };
+        RecoveryFacts::from_proof(proof)
     }
 }
 /// deadline is reported as expired (fail-closed: never dispatches on an

@@ -30,7 +30,7 @@
 use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
 use dolly_tool_broker::{
     ConfirmationDecision, DispatchDisposition, IdempotencyPolicy, LedgerRecordError, LedgerState,
-    RecoveryFacts, RecoveryFactsSource, SideEffectClass, ToolCallLedgerRecord,
+    RecoveryFacts, RecoveryProof, SideEffectClass, ToolCallLedgerRecord,
     ToolCallLedgerRecordSchemaTag, ToolErrorCode, ToolOperationBinding,
     ToolOperationBindingSchemaTag, ToolStatus, recover_operation,
 };
@@ -187,22 +187,6 @@ fn authorized_zero_byte_row() -> ToolCallLedgerRecord {
 }
 
 
-struct TestFacts {
-    zero_bytes_proved: bool,
-    exact_generation_ready: bool,
-    deadline_expired: bool,
-}
-
-// SAFETY: this test source models the coordinator's private fence only.
-unsafe impl RecoveryFactsSource for TestFacts {
-    fn facts_for(&self, _record: &ToolCallLedgerRecord) -> (bool, bool, bool) {
-        (
-            self.zero_bytes_proved,
-            self.exact_generation_ready,
-            self.deadline_expired,
-        )
-    }
-}
 /// The facts a reopened AUTHORIZED row needs before a retry/pass disposition
 /// can be picked (depended on by every test that crosses the boundary).
 fn facts(
@@ -210,13 +194,13 @@ fn facts(
     exact_generation_ready: bool,
     deadline_expired: bool,
 ) -> RecoveryFacts {
-    let source = TestFacts {
-        zero_bytes_proved,
-        exact_generation_ready,
-        deadline_expired,
+    let proof = match (zero_bytes_proved, exact_generation_ready, deadline_expired) {
+        (true, true, false) => RecoveryProof::coordinator_dispatch_ready(),
+        (true, false, false) => RecoveryProof::coordinator_dispatch_unready(),
+        (true, _, true) => RecoveryProof::coordinator_dispatch_expired(),
+        _ => RecoveryProof::coordinator_reopen(),
     };
-    // The decision records below all carry the same closed-row identity.
-    RecoveryFacts::from_authoritative_source(&source, &authorized_zero_byte_row())
+    RecoveryFacts::from_proof(proof)
 }
 
 /// Full TST-TOOL-001 / REQ-TOOL-002 outcome: the durable `DISPATCHED` marker

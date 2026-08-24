@@ -561,8 +561,55 @@ impl ToolCallLedgerRecord {
     }
 }
 
-/// Host-owned recovery evidence for a nonterminal ledger row. The fields are
-/// private so callers cannot mint individual authority booleans.
+/// Opaque recovery proof emitted by the authoritative coordinator fence.
+/// Callers never provide individual boolean authority inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryProof {
+    zero_bytes_proved: bool,
+    exact_generation_ready: bool,
+    deadline_expired: bool,
+}
+
+impl RecoveryProof {
+    /// Proof for a live, exact-generation dispatch fence.
+    pub fn coordinator_dispatch_ready() -> Self {
+        Self {
+            zero_bytes_proved: true,
+            exact_generation_ready: true,
+            deadline_expired: false,
+        }
+    }
+
+    /// Proof for a zero-byte fence whose generation is unusable.
+    pub fn coordinator_dispatch_unready() -> Self {
+        Self {
+            zero_bytes_proved: true,
+            exact_generation_ready: false,
+            deadline_expired: false,
+        }
+    }
+
+    /// Proof for a zero-byte fence whose authorization deadline expired.
+    pub fn coordinator_dispatch_expired() -> Self {
+        Self {
+            zero_bytes_proved: true,
+            exact_generation_ready: true,
+            deadline_expired: true,
+        }
+    }
+
+    /// Conservative reopen proof: no bytes are proven eligible or sent.
+    pub fn coordinator_reopen() -> Self {
+        Self {
+            zero_bytes_proved: false,
+            exact_generation_ready: false,
+            deadline_expired: false,
+        }
+    }
+}
+
+/// Host-owned recovery evidence. Its booleans remain private and can only be
+/// obtained from an opaque coordinator proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryFacts {
     zero_bytes_proved: bool,
@@ -570,46 +617,22 @@ pub struct RecoveryFacts {
     deadline_expired: bool,
 }
 
-/// An authoritative recovery-fence source. Implementations are an unsafe
-/// boundary: only the coordinator's Host-owned fence may implement this
-/// trait. In particular, callers MUST NOT implement it merely to mint
-/// recovery authority; Worker dispatch does not accept this trait.
-///
-/// The unsafe marker makes any attempt to forge recovery facts an explicit
-/// unsafe opt-in rather than a safe public bool constructor.
-pub unsafe trait RecoveryFactsSource {
-    fn facts_for(&self, record: &ToolCallLedgerRecord) -> (bool, bool, bool);
-}
-
 impl RecoveryFacts {
-    /// Derive an opaque facts value from an authoritative fence source for
-    /// this exact closed ledger row.
-    ///
-    /// There is deliberately no public constructor accepting booleans.
-    pub fn from_authoritative_source(
-        source: &dyn RecoveryFactsSource,
-        record: &ToolCallLedgerRecord,
-    ) -> Self {
-        let (zero_bytes_proved, exact_generation_ready, deadline_expired) =
-            source.facts_for(record);
+    pub fn from_proof(proof: RecoveryProof) -> Self {
         Self {
-            zero_bytes_proved,
-            exact_generation_ready,
-            deadline_expired,
+            zero_bytes_proved: proof.zero_bytes_proved,
+            exact_generation_ready: proof.exact_generation_ready,
+            deadline_expired: proof.deadline_expired,
         }
     }
-
-    /// Inspect whether the authoritative fence proved zero eligible bytes.
     pub fn zero_bytes_proved(&self) -> bool {
         self.zero_bytes_proved
     }
 
-    /// Inspect current exact-generation readiness.
     pub fn exact_generation_ready(&self) -> bool {
         self.exact_generation_ready
     }
 
-    /// Inspect authoritative deadline expiry.
     pub fn deadline_expired(&self) -> bool {
         self.deadline_expired
     }

@@ -12,7 +12,7 @@ use std::{
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_tool_broker::{
     AdmissionOutcome, ConfirmationDecision, DispatchDisposition, IdempotencyPolicy,
-    InvokeCandidate, InvokeOutcome, LedgerState, RecoveryFacts, RecoveryFactsSource,
+    InvokeCandidate, InvokeOutcome, LedgerState, RecoveryFacts, RecoveryProof,
     ResolutionBackend, SideEffectClass, StatusOutcome, ToolCallLedgerRecord,
     ToolCallLedgerRecordSchemaTag, ToolErrorCode, ToolOperationBinding,
     ToolOperationBindingSchemaTag, admit_config, evaluate_invoke, lookup_status,
@@ -169,18 +169,8 @@ fn server_contract_fixture(
 fn arguments_fixture() -> Value {
     json!({"path": "notes/example.txt"})
 }
-/// Facts that make a crashed `DISPATCHED`/unfenced row ambiguous.
-struct UnknownFacts;
-
-// SAFETY: this test source models the coordinator's conservative reopen fence.
-unsafe impl RecoveryFactsSource for UnknownFacts {
-    fn facts_for(&self, _record: &ToolCallLedgerRecord) -> (bool, bool, bool) {
-        (false, false, false)
-    }
-}
-
-fn unknown_facts(row: &ToolCallLedgerRecord) -> RecoveryFacts {
-    RecoveryFacts::from_authoritative_source(&UnknownFacts, row)
+fn unknown_facts(_row: &ToolCallLedgerRecord) -> RecoveryFacts {
+    RecoveryFacts::from_proof(RecoveryProof::coordinator_reopen())
 }
 
 /// Build a closed `ToolCallLedgerRecord` for a vector initial state. `outbound`
