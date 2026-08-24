@@ -23,6 +23,7 @@ import {
 } from "./canonical-json.js";
 import {
   ExtensionInstallationRegistry,
+  type ExtensionTrust,
   type ResolvedExtensionInstallation,
 } from "./extension-installation-registry.js";
 import { parseStrictJsonBytes } from "./strict-json.js";
@@ -79,8 +80,8 @@ interface OriginBrand {
   readonly extensionId: string;
   readonly packageVersion: string;
   readonly recordPath: string;
+  readonly trust: ExtensionTrust;
 }
-
 const BRANDS = new WeakMap<object, OriginBrand>();
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -315,6 +316,7 @@ export class InstalledComponentOriginRegistry {
         extensionId: options.extensionId,
         packageVersion: options.packageVersion,
         recordPath,
+        trust: installation.trust,
       });
       return branded;
     } catch (error) {
@@ -338,6 +340,9 @@ export class InstalledComponentOriginRegistry {
       extensionId: brand.extensionId,
       packageVersion: brand.packageVersion,
     });
+    if (installation.trust !== brand.trust) {
+      throw unavailable("installed component origin is stale for its installation trust");
+    }
     const persisted = this.#readRecord(
       brand.recordPath,
       brand.extensionId,

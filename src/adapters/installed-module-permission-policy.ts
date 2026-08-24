@@ -26,6 +26,7 @@ import type { ExtensionProcessHost } from "../core/extension-process-host.js";
 import { FileToolJournalRepository } from "../core/file-tool-journal-repository.js";
 import {
   assertReservedV10InstalledModulePlan,
+  assertReservedV10InstalledModuleProjection,
   type InstalledExtensionModule,
   type ReservedV10InstalledModulePlan,
 } from "../core/installed-extension-module.js";
@@ -73,6 +74,7 @@ const RESERVED_V10_POLICY_SELECTION_REGISTRIES = new WeakMap<
   object,
   ReservedV10InstalledPermissionPolicyRegistry
 >();
+const RESERVED_V10_POLICY_REGISTRIES = new WeakSet<object>();
 
 /**
  * One operator-selected policy for chat generation. The ordinary meaning of
@@ -1380,11 +1382,13 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
       }
       this.#policies.set(key, policy);
     }
+    RESERVED_V10_POLICY_REGISTRIES.add(this);
   }
 
   resolveFor(
     installed: ReservedV10InstalledModulePlan,
   ): ReservedV10InstalledPermissionPolicySelection {
+    assertReservedV10InstalledPermissionPolicyRegistry(this);
     assertReservedV10InstalledModulePlan(installed);
     const policies = installed.module.permissionPolicyReferences.map((reference) => {
       const policy = this.#policies.get(`${reference.policyId}\u0000${reference.revision}`);
@@ -1429,6 +1433,7 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
     selection: ReservedV10InstalledPermissionPolicySelection,
     installed: ReservedV10InstalledModulePlan,
   ): void {
+    assertReservedV10InstalledPermissionPolicyRegistry(this);
     assertReservedV10InstalledPermissionPolicySelection(selection, installed);
     if (RESERVED_V10_POLICY_SELECTION_REGISTRIES.get(selection) !== this) {
       throw unavailable(
@@ -1453,6 +1458,7 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
     selection: ReservedV10InstalledPermissionPolicySelection,
     bindings: readonly InstalledModulePermissionBinding[],
   ): void {
+    assertReservedV10InstalledPermissionPolicyRegistry(this);
     this.assertSelectionFor(selection, installed);
     if (
       !Array.isArray(bindings) ||
@@ -1500,7 +1506,9 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
     resolved: InstalledExtensionModule,
     options: { readonly modelMediaResolver?: ModelMediaResolver } = {},
   ): InstalledModulePermissionPolicySetup {
+    assertReservedV10InstalledPermissionPolicyRegistry(this);
     assertReservedV10InstalledModulePlan(installed);
+    assertReservedV10InstalledModuleProjection(resolved, installed);
     this.resolveFor(installed);
     const references = installed.module.permissionPolicyReferences;
     const policyIds = references.map((reference) => reference.policyId);
@@ -1542,6 +1550,7 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
     permission: StartupAuthorityPermission,
     context: StartupAuthorityPermissionContext,
   ): readonly InstalledModulePermissionBinding[] {
+    assertReservedV10InstalledPermissionPolicyRegistry(this);
     assertReservedV10InstalledModulePlan(installed);
     assertBindingAuthority(permission, context);
     const installedOrigin = assertInstalledPlanMatchesAuthority(installed, context);
@@ -1617,6 +1626,7 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
     value: unknown,
     context: StartupAuthorityPermissionContext,
   ): asserts value is InstalledModulePermissionBinding {
+    assertReservedV10InstalledPermissionPolicyRegistry(this);
     if (
       value === null ||
       typeof value !== "object" ||
@@ -1625,6 +1635,54 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
       throw unavailable("installed permission binding belongs to a different Host policy registry");
     }
     assertInstalledModulePermissionBinding(value, context);
+  }
+}
+const RESERVED_V10_REGISTRY_METHODS = {
+  resolveFor: ReservedV10InstalledPermissionPolicyRegistry.prototype.resolveFor,
+  assertSelectionFor: ReservedV10InstalledPermissionPolicyRegistry.prototype.assertSelectionFor,
+  assertLiveBindingsFor:
+    ReservedV10InstalledPermissionPolicyRegistry.prototype.assertLiveBindingsFor,
+  setupFor: ReservedV10InstalledPermissionPolicyRegistry.prototype.setupFor,
+  resolveLiveBindingsFor:
+    ReservedV10InstalledPermissionPolicyRegistry.prototype.resolveLiveBindingsFor,
+  assertLiveBinding: ReservedV10InstalledPermissionPolicyRegistry.prototype.assertLiveBinding,
+} as const;
+
+/**
+ * Requires the exact Host registry object. `instanceof` is intentionally
+ * insufficient here: subclasses and own-method replacements must not mint
+ * premise selections or bindings that the later consumer will execute.
+ */
+export function assertReservedV10InstalledPermissionPolicyRegistry(
+  value: unknown,
+): asserts value is ReservedV10InstalledPermissionPolicyRegistry {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    !RESERVED_V10_POLICY_REGISTRIES.has(value) ||
+    Object.getPrototypeOf(value) !== ReservedV10InstalledPermissionPolicyRegistry.prototype ||
+    Object.hasOwn(value, "resolveFor") ||
+    Object.hasOwn(value, "assertSelectionFor") ||
+    Object.hasOwn(value, "assertLiveBindingsFor") ||
+    Object.hasOwn(value, "setupFor") ||
+    Object.hasOwn(value, "resolveLiveBindingsFor") ||
+    Object.hasOwn(value, "assertLiveBinding") ||
+    ReservedV10InstalledPermissionPolicyRegistry.prototype.resolveFor !==
+      RESERVED_V10_REGISTRY_METHODS.resolveFor ||
+    ReservedV10InstalledPermissionPolicyRegistry.prototype.assertSelectionFor !==
+      RESERVED_V10_REGISTRY_METHODS.assertSelectionFor ||
+    ReservedV10InstalledPermissionPolicyRegistry.prototype.assertLiveBindingsFor !==
+      RESERVED_V10_REGISTRY_METHODS.assertLiveBindingsFor ||
+    ReservedV10InstalledPermissionPolicyRegistry.prototype.setupFor !==
+      RESERVED_V10_REGISTRY_METHODS.setupFor ||
+    ReservedV10InstalledPermissionPolicyRegistry.prototype.resolveLiveBindingsFor !==
+      RESERVED_V10_REGISTRY_METHODS.resolveLiveBindingsFor ||
+    ReservedV10InstalledPermissionPolicyRegistry.prototype.assertLiveBinding !==
+      RESERVED_V10_REGISTRY_METHODS.assertLiveBinding
+  ) {
+    throw new TypeError(
+      "reserved version-10 permission policy registry is not the exact Host implementation",
+    );
   }
 }
 
