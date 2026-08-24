@@ -69,6 +69,10 @@ const RESERVED_V10_POLICY_SELECTIONS = new WeakMap<
   object,
   readonly InstalledModulePermissionPolicy[]
 >();
+const RESERVED_V10_POLICY_SELECTION_REGISTRIES = new WeakMap<
+  object,
+  ReservedV10InstalledPermissionPolicyRegistry
+>();
 
 /**
  * One operator-selected policy for chat generation. The ordinary meaning of
@@ -1418,8 +1422,121 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
       selectionDigest: canonicalJsonDigest(snapshot),
     });
     RESERVED_V10_POLICY_SELECTIONS.set(selection, Object.freeze(policies));
+    RESERVED_V10_POLICY_SELECTION_REGISTRIES.set(selection, this);
     return selection;
   }
+  assertSelectionFor(
+    selection: ReservedV10InstalledPermissionPolicySelection,
+    installed: ReservedV10InstalledModulePlan,
+  ): void {
+    assertReservedV10InstalledPermissionPolicySelection(selection, installed);
+    if (RESERVED_V10_POLICY_SELECTION_REGISTRIES.get(selection) !== this) {
+      throw unavailable(
+        "reserved version-10 permission policy selection belongs to a different Host registry",
+      );
+    }
+    const expected = this.resolveFor(installed);
+    if (
+      expected.selectionDigest !== selection.selectionDigest ||
+      !sameCanonicalJson(expected.snapshot, selection.snapshot)
+    ) {
+      throw unavailable(
+        "reserved version-10 permission policy selection is stale for its installed Module plan",
+      );
+    }
+  }
+
+  assertLiveBindingsFor(
+    installed: ReservedV10InstalledModulePlan,
+    permission: StartupAuthorityPermission,
+    context: StartupAuthorityPermissionContext,
+    selection: ReservedV10InstalledPermissionPolicySelection,
+    bindings: readonly InstalledModulePermissionBinding[],
+  ): void {
+    this.assertSelectionFor(selection, installed);
+    if (
+      !Array.isArray(bindings) ||
+      bindings.length !== installed.module.permissionPolicyReferences.length
+    ) {
+      throw unavailable(
+        "reserved version-10 installed Module permission bindings have the wrong cardinality",
+      );
+    }
+    const current = this.resolveLiveBindingsFor(installed, permission, context);
+    for (const [index, supplied] of bindings.entries()) {
+      const expected = current[index];
+      if (expected === undefined) {
+        throw unavailable(
+          "reserved version-10 installed Module permission binding is missing",
+        );
+      }
+      this.assertLiveBinding(supplied, context);
+      if (
+        supplied.schemaVersion !== expected.schemaVersion ||
+        supplied.daemonInstallationId !== expected.daemonInstallationId ||
+        supplied.instanceId !== expected.instanceId ||
+        supplied.controllerGenerationId !== expected.controllerGenerationId ||
+        supplied.configRevision !== expected.configRevision ||
+        supplied.configDigest !== expected.configDigest ||
+        supplied.premisesDigest !== expected.premisesDigest ||
+        supplied.policyId !== expected.policyId ||
+        supplied.policyRevision !== expected.policyRevision ||
+        supplied.policyDefinitionDigest !== expected.policyDefinitionDigest ||
+        supplied.bindingId !== expected.bindingId ||
+        supplied.bindingRevision !== expected.bindingRevision ||
+        supplied.bindingDigest !== expected.bindingDigest ||
+        !sameCanonicalJson(supplied.definition, expected.definition) ||
+        !sameCanonicalJson(supplied.origin, expected.origin)
+      ) {
+        throw unavailable(
+          "reserved version-10 installed Module permission binding is stale or mismatched",
+        );
+      }
+    }
+  }
+
+  setupFor(
+    installed: ReservedV10InstalledModulePlan,
+    resolved: InstalledExtensionModule,
+    options: { readonly modelMediaResolver?: ModelMediaResolver } = {},
+  ): InstalledModulePermissionPolicySetup {
+    assertReservedV10InstalledModulePlan(installed);
+    this.resolveFor(installed);
+    const references = installed.module.permissionPolicyReferences;
+    const policyIds = references.map((reference) => reference.policyId);
+    if (
+      resolved.instanceId !== installed.instanceId ||
+      resolved.installation !== installed.installation ||
+      resolved.packageModule !== installed.packageModule ||
+      resolved.configuration !== installed.configuration ||
+      resolved.module.moduleId !== installed.module.moduleId ||
+      resolved.module.extensionId !== installed.module.extensionId ||
+      resolved.module.packageVersion !== installed.module.packageVersion ||
+      resolved.module.moduleKind !== installed.module.moduleKind ||
+      resolved.module.permissionPolicyIds.length !== policyIds.length ||
+      resolved.module.permissionPolicyIds.some(
+        (policyId, index) => policyId !== policyIds[index],
+      )
+    ) {
+      throw new TypeError(
+        "Reserved version-10 permission setup requires the exact projected installed Module",
+      );
+    }
+    const policies = references.map((reference) => {
+      const policy = this.#policies.get(`${reference.policyId}\u0000${reference.revision}`);
+      if (policy === undefined) {
+        throw unavailable(
+          `Reserved version-10 permission policy ${reference.policyId}@${reference.revision} is not registered`,
+        );
+      }
+      return policy;
+    });
+    return new InstalledModulePermissionPolicyRegistry({ policies }).setupFor(
+      resolved,
+      options,
+    );
+  }
+
   resolveLiveBindingsFor(
     installed: ReservedV10InstalledModulePlan,
     permission: StartupAuthorityPermission,

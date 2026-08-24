@@ -55,7 +55,17 @@ export interface InstalledModuleRuntimePremise {
   readonly modules: readonly InstalledModuleRuntimePremiseModule[];
 }
 
+export interface InstalledModuleRuntimePremiseAuthority {
+  readonly permissionPolicies: ReservedV10InstalledPermissionPolicyRegistry;
+  readonly startupAuthorityPermission: StartupAuthorityPermission;
+  readonly context: StartupAuthorityPermissionContext;
+}
+
 const RUNTIME_PREMISE_BRAND = new WeakSet<object>();
+const RUNTIME_PREMISE_AUTHORITY = new WeakMap<
+  object,
+  InstalledModuleRuntimePremiseAuthority
+>();
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
@@ -201,7 +211,62 @@ export function composeInstalledModuleRuntimePremise(
     modules: Object.freeze(modules),
   });
   RUNTIME_PREMISE_BRAND.add(premise);
+  RUNTIME_PREMISE_AUTHORITY.set(premise, Object.freeze({
+    permissionPolicies: options.permissionPolicies,
+    startupAuthorityPermission: options.startupAuthorityPermission,
+    context: Object.freeze({
+      database: options.database,
+      controller: options.controller,
+      origins: options.origins,
+    }),
+  }));
   return premise;
+}
+
+function assertPremiseAuthority(
+  premise: InstalledModuleRuntimePremise,
+): InstalledModuleRuntimePremiseAuthority {
+  const authority = RUNTIME_PREMISE_AUTHORITY.get(premise);
+  if (authority === undefined) {
+    throw new TypeError(
+      "installed Module runtime premise has no private Host authority",
+    );
+  }
+  assertStartupAuthorityPermissionContext(
+    authority.startupAuthorityPermission,
+    authority.context,
+  );
+  assertCandidateAuthority(premise.candidate, authority.startupAuthorityPermission);
+  const seenModuleIds = new Set<string>();
+  for (const module of premise.modules) {
+    const candidateModule = premise.candidate.modules.find(
+      (candidate) => candidate.moduleId === module.moduleId,
+    );
+    if (
+      candidateModule === undefined ||
+      candidateModule.installedModule !== module.processProvenance.installedModule ||
+      candidateModule.packageOrigin !== module.packageOrigin
+    ) {
+      throw new TypeError(
+        `installed Module runtime premise Module ${module.moduleId} is not bound to its activation candidate`,
+      );
+    }
+    assertCandidateModule(
+      premise.candidate,
+      candidateModule,
+      seenModuleIds,
+      authority.context.origins,
+    );
+    assertReservedV10InstalledModuleProcessProvenance(module.processProvenance);
+    authority.permissionPolicies.assertLiveBindingsFor(
+      candidateModule.installedModule,
+      authority.startupAuthorityPermission,
+      authority.context,
+      module.permissionPolicies,
+      module.permissionBindings,
+    );
+  }
+  return authority;
 }
 
 /** Rejects copied or deserialized premises before a future process factory uses them. */
@@ -217,10 +282,15 @@ export function assertInstalledModuleRuntimePremise(
       "installed Module runtime premise was not minted from a branded activation candidate",
     );
   }
-  assertInstalledModuleActivationCandidate(
-    (value as InstalledModuleRuntimePremise).candidate,
-  );
-  for (const module of (value as InstalledModuleRuntimePremise).modules) {
-    assertReservedV10InstalledModuleProcessProvenance(module.processProvenance);
-  }
+  const premise = value as InstalledModuleRuntimePremise;
+  assertInstalledModuleActivationCandidate(premise.candidate);
+  assertPremiseAuthority(premise);
+}
+
+/** Recovers only the exact private Host authority behind a branded premise. */
+export function resolveInstalledModuleRuntimePremiseAuthority(
+  value: InstalledModuleRuntimePremise,
+): InstalledModuleRuntimePremiseAuthority {
+  assertInstalledModuleRuntimePremise(value);
+  return RUNTIME_PREMISE_AUTHORITY.get(value)!;
 }
