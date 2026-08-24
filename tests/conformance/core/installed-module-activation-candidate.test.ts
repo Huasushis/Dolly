@@ -40,7 +40,16 @@ import {
   createInstalledReactiveModuleRuntime,
   type InstalledReactiveModuleRuntimeOptions,
 } from "../../../src/adapters/installed-reactive-module-runtime.js";
+import {
+  createInstalledLinuxExtensionModuleGenerationFactory,
+  deriveInstalledLinuxExtensionModuleExecutor,
+} from "../../../src/adapters/installed-linux-extension-module-executor.js";
 import type { FileCoreStateStoreWithStoppedRecordWriter } from "../../../src/core/file-core-state-store.js";
+import { SourceActivationQueue } from "../../../src/core/source-activation-queue.js";
+import type {
+  DeliveryMailboxCapacity,
+  SubscriptionStart,
+} from "../../../src/core/delivery-store.js";
 import { ModuleConfigurationStore } from "../../../src/core/module-configuration-store.js";
 import { resolveReservedV10InstalledModulePlan } from "../../../src/core/installed-extension-module.js";
 import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
@@ -116,18 +125,29 @@ function digestWithout(record: Record<string, unknown>, field: string): string {
   return `sha256:${createHash("sha256").update(canonicalBytes(rest as never)).digest("hex")}`;
 }
 
+type FixtureModuleActivation = "reactive" | "source";
+type FixtureInputConnection = {
+  readonly pageId: string;
+  readonly start: "from-head" | "from-now" | { readonly checkpoint: string };
+};
+type FixtureModuleOptions = {
+  readonly activation?: FixtureModuleActivation;
+  readonly inputConnections?: readonly FixtureInputConnection[];
+};
+
 function writePackage(
   directory: string,
   extensionId: string,
   packageVersion: string,
   schemaVersion: "dolly.extension-package/1" | "dolly.extension-package/10" =
     "dolly.extension-package/1",
+  activation: FixtureModuleActivation = "reactive",
 ): void {
   mkdirSync(join(directory, "dist"), { recursive: true });
   writeFileSync(join(directory, "dist", "main.mjs"), "export const candidate = true;\n", "utf8");
   const module: Record<string, unknown> = {
     moduleKind: "transform",
-    activation: "reactive",
+    activation,
     configVersion: 1,
     configurationSchema: {
       $schema: "https://json-schema.org/draft/2020-12/schema",
@@ -151,7 +171,6 @@ function writePackage(
     requestedCapabilities: [],
   }, null, 2) + "\n", "utf8");
 }
-
 function reservedConfiguration(
   extensionId: string,
   packageVersion: string,
@@ -161,8 +180,14 @@ function reservedConfiguration(
     readonly revision: string;
   }[] = [],
   declaredExternalEffects: "none" | "core-capabilities-only" = "none",
+  moduleOptions: FixtureModuleOptions = {},
 ): JsonValue {
   const defaults = createDefaultDollyInstanceConfig(runtimeInstanceId);
+  const activation = moduleOptions.activation ?? "reactive";
+  const inputConnections = moduleOptions.inputConnections ?? [
+    { pageId: "input", start: "from-now" as const },
+  ];
+  const inputPageIds = [...new Set(inputConnections.map((connection) => connection.pageId))];
   return {
     schemaVersion: "dolly.instance/10",
     instanceId: runtimeInstanceId,
@@ -189,7 +214,10 @@ function reservedConfiguration(
       },
     },
     pages: [
-      { pageId: "input", quota: { maxEntries: 1_000_000, maxBytes: 64 * 1024 * 1024 } },
+      ...inputPageIds.map((pageId) => ({
+        pageId,
+        quota: { maxEntries: 1_000_000, maxBytes: 64 * 1024 * 1024 },
+      })),
       { pageId: "output", quota: { maxEntries: 1_000_000, maxBytes: 64 * 1024 * 1024 } },
     ],
     modules: [{
@@ -203,9 +231,11 @@ function reservedConfiguration(
         configVersion: 1,
       },
       permissionPolicyReferences,
-      inputConnections: [{ pageId: "input", start: "from-now" }],
+      inputConnections,
       outputPageIds: ["output"],
-      activation: { kind: "reactive" },
+      activation: activation === "source"
+        ? { kind: "source", trigger: "manual" }
+        : { kind: "reactive" },
       declaredExternalEffects,
       execution: {
         kind: "linux-process",
@@ -226,7 +256,7 @@ function reservedConfiguration(
           maxBytes: 4096,
         },
         mailbox: { maxResidentCount: 16, maxResidentBytes: 64 * 1024 },
-        sourceRequestMaxBytes: null,
+        sourceRequestMaxBytes: activation === "source" ? 2048 : null,
         maxInputBytes: 4096,
         maxResultBytes: 4096,
         maxFrameBytes: 8192,
@@ -392,6 +422,7 @@ async function fixture(
   serviceExtensionId = packageExtensionId,
   packageSchemaVersion: "dolly.extension-package/1" | "dolly.extension-package/10" =
     "dolly.extension-package/1",
+  moduleOptions: FixtureModuleOptions = {},
 ): Promise<Fixture> {
   const root = scratch();
   const packageDirectory = join(root, "package");
@@ -400,6 +431,7 @@ async function fixture(
     packageExtensionId,
     "10.0.0",
     packageSchemaVersion,
+    moduleOptions.activation ?? "reactive",
   );
   const serviceDirectory = join(root, "service-package");
   if (serviceExtensionId !== packageExtensionId) {
@@ -435,6 +467,9 @@ async function fixture(
     packageExtensionId,
     "10.0.0",
     configuration.revision,
+    [],
+    "none",
+    moduleOptions,
   );
   const authority = buildAuthority(serviceOrigin, runtimeConfig);
   const controller = await InstanceControllerLock.acquire({
@@ -499,10 +534,19 @@ function currentV10Configuration(
   const canonicalConfig = snapshot.canonicalConfig as Record<string, JsonValue>;
   return validateDollyInstanceConfigV10Draft(canonicalConfig.runtime_config);
 }
+type ConsumerOptionsOverrides = {
+  readonly mailboxes?: readonly DeliveryMailboxCapacity[];
+  readonly lifecycle?: InstalledReactiveModuleRuntimeOptions["lifecycle"];
+  readonly subscriptionStart?: SubscriptionStart;
+  readonly registerSubscriptions?: boolean;
+  readonly sourceActivationQueue?: SourceActivationQueue;
+};
+
 function consumerOptions(
   fixtureValue: Fixture,
   configuration: DollyInstanceConfigV10Draft,
   premise: InstalledModuleRuntimePremise,
+  overrides: ConsumerOptionsOverrides = {},
 ): {
   readonly options: InstalledReactiveModuleRuntimeOptions;
   readonly core: FileCoreStateStoreWithStoppedRecordWriter;
@@ -520,14 +564,55 @@ function consumerOptions(
     nextDeliveryId: (kind) => `runtime-${kind}-${++deliveryId}`,
     now: () => "2026-08-24T00:00:00.000Z",
   });
-  core.store.deliveries.createPage("input");
-  core.store.deliveries.createPage("output");
-  core.store.deliveries.registerConsumer("input", "worker", "from-now");
+  const module = configuration.modules.find((candidate) =>
+    candidate.moduleId === "worker"
+  );
+  if (module === undefined) throw new Error("worker fixture Module is missing");
+  const premiseModule = premise.modules.find((candidate) =>
+    candidate.moduleId === module.moduleId
+  );
+  if (premiseModule === undefined) throw new Error("worker premise Module is missing");
+  for (const page of configuration.pages) {
+    core.store.deliveries.createPage(page.pageId);
+  }
+  if (overrides.registerSubscriptions !== false) {
+    for (const connection of module.inputConnections) {
+      core.store.deliveries.registerConsumer(
+        connection.pageId,
+        module.moduleId,
+        overrides.subscriptionStart ?? connection.start as SubscriptionStart,
+      );
+    }
+  }
+  const execution = premiseModule.processProvenance.linuxExecution;
+  const mailboxes = overrides.mailboxes ??
+    (module.activation.kind === "source"
+      ? []
+      : [{
+          consumerId: module.moduleId,
+          pageIds: module.inputConnections.map((connection) => connection.pageId),
+          maxResidentCount: module.limits.mailbox.maxResidentCount,
+          maxResidentBytes: module.limits.mailbox.maxResidentBytes,
+        }]);
+  const sourceActivationQueue = overrides.sourceActivationQueue ??
+    (module.activation.kind === "source"
+      ? new SourceActivationQueue({
+          core: core.store,
+          moduleId: module.moduleId,
+          maxResidentCount: module.limits.mailbox.maxResidentCount,
+          maxResidentBytes: module.limits.mailbox.maxResidentBytes,
+          maxRequestBytes: module.limits.sourceRequestMaxBytes!,
+        })
+      : undefined);
+  const lifecycle = overrides.lifecycle ?? {
+    limits: execution.cgroupLimits,
+    maxOpenFiles: execution.maxOpenFiles,
+  };
   return {
     core,
     options: {
       instanceConfiguration: configuration,
-      moduleId: "worker",
+      moduleId: module.moduleId,
       premise,
       installations: fixtureValue.installations,
       configurations: fixtureValue.configurations,
@@ -536,25 +621,12 @@ function consumerOptions(
       resultCommitRepository: new FileModuleResultCommitRepository({
         path: join(fixtureValue.root, "runtime-commits.json"),
       }),
-      mailboxes: [{
-        consumerId: "worker",
-        pageIds: ["input"],
-        maxResidentCount: 16,
-        maxResidentBytes: 64 * 1024,
-      }],
+      mailboxes,
       now: () => "2026-08-24T00:00:00.000Z",
       initialModuleGenerationId: "module-generation-v10",
       nextModuleGenerationId: () => "module-generation-v10-next",
       monotonicNow: () => 0,
-      lifecycle: {
-        limits: {
-          memoryMaxBytes: 64 * 1024 * 1024,
-          maxProcesses: 16,
-          cpuQuotaMicros: 50_000,
-          cpuPeriodMicros: 100_000,
-        },
-        maxOpenFiles: 64,
-      },
+      lifecycle,
       host: {
         isolationPolicy: new ExtensionIsolationPolicy(),
         shutdownRequestTimeoutMs: 250,
@@ -563,8 +635,25 @@ function consumerOptions(
       channelCloseTimeoutMs: 500,
       nextProcessGenerationId: () => "process-generation-v10",
       classifyFailure: () => ({ code: "FIXTURE_FAILURE", retryable: false }),
+      ...(sourceActivationQueue === undefined ? {} : { sourceActivationQueue }),
     },
   };
+}
+
+function emptyRuntimePremise(
+  fixtureValue: Fixture,
+): InstalledModuleRuntimePremise {
+  const candidate = composeInstalledModuleActivationCandidate(options(fixtureValue));
+  return composeInstalledModuleRuntimePremise({
+    candidate,
+    permissionPolicies: new ReservedV10InstalledPermissionPolicyRegistry({
+      policies: [],
+    }),
+    startupAuthorityPermission: fixtureValue.permission,
+    database: fixtureValue.database,
+    controller: fixtureValue.controller,
+    origins: fixtureValue.origins,
+  });
 }
 
 beforeEach(() => setCompleteLiveProof());
@@ -1063,6 +1152,171 @@ describe("post-H3 installed Module activation candidate", () => {
       const executor = composed.generations.createExecutor("module-generation-v10");
       expect(typeof executor.start).toBe("function");
       expect(typeof executor.terminate).toBe("function");
+      expect(prepared.core.store.listModuleProcessRecords()).toEqual([]);
+    } finally {
+      await closeFixture(current);
+    }
+  });
+  it("rejects caller lifecycle resources that differ from the premise before process I/O", async () => {
+    const mismatches = [
+      {
+        label: "cgroup limits",
+        lifecycle: {
+          limits: {
+            memoryMaxBytes: 64 * 1024 * 1024,
+            maxProcesses: 31,
+            cpuQuotaMicros: 100_000,
+            cpuPeriodMicros: 100_000,
+          },
+          maxOpenFiles: 128,
+        },
+      },
+      {
+        label: "maxOpenFiles",
+        lifecycle: {
+          limits: {
+            memoryMaxBytes: 64 * 1024 * 1024,
+            maxProcesses: 32,
+            cpuQuotaMicros: 100_000,
+            cpuPeriodMicros: 100_000,
+          },
+          maxOpenFiles: 127,
+        },
+      },
+    ] as const;
+    for (const mismatch of mismatches) {
+      const current = await fixture();
+      try {
+        const configuration = currentV10Configuration(current);
+        const premise = emptyRuntimePremise(current);
+        const prepared = consumerOptions(current, configuration, premise, {
+          lifecycle: mismatch.lifecycle,
+        });
+        expect(
+          () => createInstalledReactiveModuleRuntime(prepared.options),
+          mismatch.label,
+        ).toThrow(/premise/u);
+        expect(prepared.core.store.listModuleProcessRecords()).toEqual([]);
+      } finally {
+        await closeFixture(current);
+      }
+    }
+  });
+
+  it("rejects caller mailbox limits and subscription starts before Core process state", async () => {
+    const current = await fixture();
+    try {
+      const configuration = currentV10Configuration(current);
+      const premise = emptyRuntimePremise(current);
+      const mailboxMismatch = consumerOptions(current, configuration, premise, {
+        mailboxes: [{
+          consumerId: "worker",
+          pageIds: ["input"],
+          maxResidentCount: 15,
+          maxResidentBytes: 64 * 1024,
+        }],
+      });
+      expect(() => createInstalledReactiveModuleRuntime(mailboxMismatch.options))
+        .toThrow(/mailbox/u);
+      expect(mailboxMismatch.core.store.listModuleProcessRecords()).toEqual([]);
+
+      const subscriptionMismatch = consumerOptions(current, configuration, premise, {
+        subscriptionStart: "from-head",
+      });
+      expect(() => createInstalledReactiveModuleRuntime(subscriptionMismatch.options))
+        .toThrow(/subscription/u);
+      expect(subscriptionMismatch.core.store.listModuleProcessRecords()).toEqual([]);
+    } finally {
+      await closeFixture(current);
+    }
+  });
+
+  it("rejects v10 low-level executor seams without exact premise-derived bindings", async () => {
+    const current = await fixture();
+    try {
+      const configuration = currentV10Configuration(current);
+      expect(() => deriveInstalledLinuxExtensionModuleExecutor({
+        instanceConfiguration: configuration,
+      } as never)).toThrow(/premise-derived/u);
+      expect(() => createInstalledLinuxExtensionModuleGenerationFactory({
+        instanceConfiguration: configuration,
+      } as never)).toThrow(/premise-derived/u);
+
+      const premise = emptyRuntimePremise(current);
+      const provenance = premise.modules[0]!.processProvenance;
+      expect(() => deriveInstalledLinuxExtensionModuleExecutor({
+        instanceConfiguration: configuration,
+        declarationProvenance: provenance,
+        resolvedModule: {},
+      } as never)).toThrow(/exact premise-derived/u);
+    } finally {
+      await closeFixture(current);
+    }
+  });
+
+
+  it("refuses mixed and checkpoint input starts instead of collapsing them", async () => {
+    const fixtures: readonly FixtureModuleOptions[] = [
+      {
+        inputConnections: [
+          { pageId: "input", start: "from-head" },
+          { pageId: "input-two", start: "from-now" },
+        ],
+      },
+      {
+        inputConnections: [
+          { pageId: "input", start: { checkpoint: "0" } },
+        ],
+      },
+    ];
+    for (const moduleOptions of fixtures) {
+      const current = await fixture(
+        "org.example.subscription-bridge",
+        "org.example.subscription-bridge",
+        "dolly.extension-package/1",
+        moduleOptions,
+      );
+      try {
+        const configuration = currentV10Configuration(current);
+        const premise = emptyRuntimePremise(current);
+        const prepared = consumerOptions(current, configuration, premise, {
+          registerSubscriptions: false,
+        });
+        expect(() => createInstalledReactiveModuleRuntime(prepared.options))
+          .toThrow(/scheduler bridge|subscription starts/u);
+        expect(prepared.core.store.listModuleProcessRecords()).toEqual([]);
+      } finally {
+        await closeFixture(current);
+      }
+    }
+  });
+
+  it("rejects source queue limits that differ from the premise before queue reconciliation", async () => {
+    const current = await fixture(
+      "org.example.source-bridge",
+      "org.example.source-bridge",
+      "dolly.extension-package/10",
+      {
+        activation: "source",
+        inputConnections: [],
+      },
+    );
+    try {
+      const configuration = currentV10Configuration(current);
+      const premise = emptyRuntimePremise(current);
+      const prepared = consumerOptions(current, configuration, premise);
+      const wrongQueue = new SourceActivationQueue({
+        core: prepared.core.store,
+        moduleId: "worker",
+        maxResidentCount: 15,
+        maxResidentBytes: 64 * 1024,
+        maxRequestBytes: 2048,
+      });
+      expect(() => createInstalledReactiveModuleRuntime({
+        ...prepared.options,
+        sourceActivationQueue: wrongQueue,
+      })).toThrow(/source-queue limits|premise/u);
+      expect(prepared.core.store.deliveries.listPageIds()).toEqual(["output"]);
       expect(prepared.core.store.listModuleProcessRecords()).toEqual([]);
     } finally {
       await closeFixture(current);

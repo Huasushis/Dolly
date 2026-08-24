@@ -29,8 +29,14 @@ import {
 } from "../core/module-process-records.js";
 import type { ReactiveModuleInput } from "../core/reactive-module-input.js";
 import type { ReactiveModuleResult } from "../core/reactive-module-runtime.js";
-import type { DollyInstanceConfig } from "../core/runtime-config.js";
-import type { DollyInstanceConfigV10Draft } from "../core/runtime-config-v10.js";
+import type {
+  DollyInstanceConfig,
+  DollyModuleConfig,
+} from "../core/runtime-config.js";
+import type {
+  DollyInputConnectionStartV10,
+  DollyInstanceConfigV10Draft,
+} from "../core/runtime-config-v10.js";
 import {
   assertReservedV10InstalledPermissionPolicySelection,
   type InstalledModulePermissionPolicySetup,
@@ -132,6 +138,123 @@ export interface ReservedV10InstalledModuleProcessProvenance {
 }
 
 const RESERVED_V10_PROCESS_PROVENANCE = new WeakSet<object>();
+const RESERVED_V10_PROJECTED_MODULE_PLANS = new WeakMap<
+  object,
+  ReservedV10InstalledModulePlan
+>();
+
+function projectReservedV10SubscriptionStart(
+  inputConnections: ReservedV10InstalledModulePlan["module"]["inputConnections"],
+): "from-head" | "from-now" {
+  if (inputConnections.length === 0) return "from-head";
+  const first = inputConnections[0]!.start;
+  if (typeof first !== "string") {
+    throw new TypeError(
+      "Reserved version-10 installed Module checkpoint subscriptions require an explicit scheduler bridge before runtime construction",
+    );
+  }
+  if (
+    inputConnections.some(
+      (connection) =>
+        typeof connection.start !== "string" || connection.start !== first,
+    )
+  ) {
+    throw new TypeError(
+      "Reserved version-10 installed Module mixed input subscription starts require an explicit scheduler bridge before runtime construction",
+    );
+  }
+  return first as "from-head" | "from-now";
+}
+
+/**
+ * Projects one resolver-minted v10 plan into the legacy installed-module
+ * shape only where the existing runtime can express the same subscription
+ * semantics. Checkpoint and mixed starts are refused rather than collapsed.
+ * The identity brand prevents a low-level caller from replacing this
+ * premise-derived projection with a structurally similar module.
+ */
+export function projectReservedV10InstalledModule(
+  plan: ReservedV10InstalledModulePlan,
+): InstalledExtensionModule {
+  assertReservedV10InstalledModulePlan(plan);
+  const module = plan.module;
+  const subscriptionStart = projectReservedV10SubscriptionStart(
+    module.inputConnections,
+  );
+  const projectedModule = Object.freeze({
+    moduleId: module.moduleId,
+    extensionId: module.extensionId,
+    packageVersion: module.packageVersion,
+    moduleKind: module.moduleKind,
+    isolation: "process" as const,
+    configurationReference: Object.freeze({ ...module.configurationReference }),
+    permissionPolicyIds: Object.freeze(
+      module.permissionPolicyReferences.map((reference) => reference.policyId),
+    ),
+    inputPageIds: Object.freeze(
+      module.inputConnections.map((connection) => connection.pageId),
+    ),
+    outputPageIds: Object.freeze([...module.outputPageIds]),
+    subscriptionStart,
+    activation: module.activation,
+    limits: Object.freeze({
+      claim: module.activation.kind === "source"
+        ? null
+        : Object.freeze({
+            maxCount: module.limits.claim.maxCount,
+            maxBytes: module.limits.claim.maxBytes,
+          }),
+      maxInputBytes: module.limits.maxInputBytes,
+      maxResultBytes: module.limits.maxResultBytes,
+      maxFrameBytes: module.limits.maxFrameBytes,
+      maxRunsPerGeneration: module.limits.maxRunsPerGeneration,
+      maxGenerations: module.limits.maxGenerations,
+    }),
+    timeouts: Object.freeze({ ...module.timeouts }),
+  } satisfies DollyModuleConfig);
+  const projected = Object.freeze({
+    instanceId: plan.instanceId,
+    module: projectedModule,
+    installation: plan.installation,
+    packageModule: plan.packageModule,
+    configuration: plan.configuration,
+  });
+  RESERVED_V10_PROJECTED_MODULE_PLANS.set(projected, plan);
+  return projected;
+}
+
+function assertReservedV10ProjectedModule(
+  value: InstalledExtensionModule | undefined,
+  provenance: ReservedV10InstalledModuleProcessProvenance,
+): asserts value is InstalledExtensionModule {
+  if (
+    value === undefined ||
+    (typeof value !== "object" &&
+      typeof value !== "function") ||
+    RESERVED_V10_PROJECTED_MODULE_PLANS.get(value) !== provenance.installedModule
+  ) {
+    throw new TypeError(
+      "Reserved version-10 installed Linux executor requires the exact premise-derived resolved Module",
+    );
+  }
+}
+
+function assertReservedV10LowLevelBindings(
+  options: Pick<
+    InstalledLinuxExtensionModuleExecutorOptions,
+    "instanceConfiguration" | "resolvedModule" | "declarationProvenance"
+  >,
+): void {
+  if (options.instanceConfiguration.schemaVersion !== "dolly.instance/10") return;
+  const provenance = options.declarationProvenance;
+  if (provenance === undefined) {
+    throw new TypeError(
+      "Reserved version-10 installed Linux executor requires premise-derived process provenance and resolved Module",
+    );
+  }
+  assertReservedV10InstalledModuleProcessProvenance(provenance);
+  assertReservedV10ProjectedModule(options.resolvedModule, provenance);
+}
 
 /**
  * Projects the exact Linux-owned values from one resolver-minted v10 plan.
@@ -312,6 +435,44 @@ function assertNoDerivedFields(
     throw new TypeError(`${label} cannot supply derived fields: ${found.sort().join(", ")}`);
   }
 }
+function sameCgroupLimits(
+  left: ModuleCgroupLimits,
+  right: ModuleCgroupLimits,
+): boolean {
+  return (
+    left.memoryMaxBytes === right.memoryMaxBytes &&
+    left.maxProcesses === right.maxProcesses &&
+    left.cpuQuotaMicros === right.cpuQuotaMicros &&
+    left.cpuPeriodMicros === right.cpuPeriodMicros
+  );
+}
+
+function assertReservedV10ExecutionOptions(
+  options: InstalledLinuxExtensionModuleExecutorOptions,
+  provenance: ReservedV10InstalledModuleProcessProvenance,
+): void {
+  const execution = provenance.linuxExecution;
+  if (!sameCgroupLimits(options.lifecycle.limits, execution.cgroupLimits)) {
+    throw new TypeError(
+      "Reserved version-10 installed Linux executor lifecycle cgroup limits do not match its premise",
+    );
+  }
+  if (options.lifecycle.maxOpenFiles !== execution.maxOpenFiles) {
+    throw new TypeError(
+      "Reserved version-10 installed Linux executor maxOpenFiles does not match its premise",
+    );
+  }
+  const timeouts = execution.timeouts;
+  if (
+    options.executionTimeoutMs !== timeouts.executionTimeoutMs ||
+    options.cancellationGraceMs !== timeouts.cancellationGraceMs ||
+    options.terminationTimeoutMs !== timeouts.terminationTimeoutMs
+  ) {
+    throw new TypeError(
+      "Reserved version-10 installed Linux executor timeouts do not match its premise",
+    );
+  }
+}
 
 /**
  * Deterministically derives every package/configuration-sensitive low-level
@@ -321,6 +482,8 @@ function assertNoDerivedFields(
 export function deriveInstalledLinuxExtensionModuleExecutor(
   options: InstalledLinuxExtensionModuleExecutorOptions,
 ): InstalledLinuxExtensionModuleExecutorDerivation {
+  assertReservedV10LowLevelBindings(options);
+
   if (
     Object.hasOwn(options, "launcher") ||
     Object.hasOwn(options, "interpreterProgram") ||
@@ -354,6 +517,7 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     options.processRecord,
     [
       "configurationReference",
+      "declarationProvenance",
       "declaredExternalEffects",
       "bootId",
       "instanceId",
@@ -368,15 +532,20 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     ],
     "processRecord",
   );
+  const declarationProvenance = options.declarationProvenance;
+  if (declarationProvenance !== undefined) {
+    assertReservedV10InstalledModuleProcessProvenance(declarationProvenance);
+    if (options.instanceConfiguration.schemaVersion === "dolly.instance/10") {
+      assertReservedV10ExecutionOptions(options, declarationProvenance);
+    }
+  }
   const resolvedModule = options.resolvedModule ?? resolveInstalledExtensionModule({
     instanceConfiguration: options.instanceConfiguration as DollyInstanceConfig,
     moduleId: options.moduleId,
     installations: options.installations,
     configurations: options.configurations,
   });
-  const declarationProvenance = options.declarationProvenance;
   if (declarationProvenance !== undefined) {
-    assertReservedV10InstalledModuleProcessProvenance(declarationProvenance);
     const provenanceModule = declarationProvenance.installedModule;
     if (
       provenanceModule.instanceId !== resolvedModule.instanceId ||
@@ -440,6 +609,14 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
         schemaVersion: "dolly.reserved-v10-module-process-provenance/1" as const,
         provenanceDigest: declarationProvenance.provenanceDigest,
       });
+  const effectiveLifecycle = declarationProvenance === undefined
+    ? options.lifecycle
+    : {
+        ...options.lifecycle,
+        limits: declarationProvenance.linuxExecution.cgroupLimits,
+        maxOpenFiles: declarationProvenance.linuxExecution.maxOpenFiles,
+      };
+  const effectiveTimeouts = declarationProvenance?.linuxExecution.timeouts;
   const processRecord = Object.freeze({
     schemaVersion: processSchemaVersion,
     instanceId: identity.instanceId,
@@ -503,7 +680,7 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     moduleId: resolvedModule.module.moduleId,
     moduleGenerationId: options.moduleGenerationId,
     lifecycle: {
-      ...options.lifecycle,
+      ...effectiveLifecycle,
       delegatedRootCgroupPath: binding.delegatedRootCgroupPath,
       processRecord,
       startingRecord,
@@ -548,9 +725,9 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
       digest: resolvedModule.installation.packageSnapshot.digest,
       stagingDirectory: options.coreStateDirectory,
     },
-    executionTimeoutMs: options.executionTimeoutMs,
-    cancellationGraceMs: options.cancellationGraceMs,
-    terminationTimeoutMs: options.terminationTimeoutMs,
+    executionTimeoutMs: effectiveTimeouts?.executionTimeoutMs ?? options.executionTimeoutMs,
+    cancellationGraceMs: effectiveTimeouts?.cancellationGraceMs ?? options.cancellationGraceMs,
+    terminationTimeoutMs: effectiveTimeouts?.terminationTimeoutMs ?? options.terminationTimeoutMs,
     channelCloseTimeoutMs: options.channelCloseTimeoutMs,
     ...(options.coreExitCleanupTimeoutMs === undefined
       ? {}
@@ -646,6 +823,7 @@ function processGenerationTimestamp(wallClockNow: () => number): string {
 export function createInstalledLinuxExtensionModuleGenerationFactory(
   options: InstalledLinuxExtensionModuleGenerationFactoryOptions,
 ): InstalledLinuxExtensionModuleGenerationFactory {
+  assertReservedV10LowLevelBindings(options);
   const {
     lifecycle,
     nextProcessGenerationId: nextProcessGenerationIdOption,

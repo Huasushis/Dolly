@@ -61,10 +61,7 @@ import {
   type SourceActivationSchedulerBinding,
   type SourceActivationSubmission,
 } from "../core/source-activation-queue.js";
-import type {
-  DollyInstanceConfig,
-  DollyModuleConfig,
-} from "../core/runtime-config.js";
+import type { DollyInstanceConfig } from "../core/runtime-config.js";
 import type { DollyInstanceConfigV10Draft } from "../core/runtime-config-v10.js";
 import {
   assertInstalledModuleRuntimePremise,
@@ -75,6 +72,7 @@ import {
   createInstalledLinuxExtensionModuleGenerationFactory,
   createInstalledModuleProcessDeclarationProvenanceAuthority,
   INSTALLED_PROCESS_EFFECT_DECLARATION,
+  projectReservedV10InstalledModule,
   type InstalledLinuxExtensionModuleGenerationFactory,
   type InstalledLinuxExtensionModuleGenerationFactoryOptions,
   type ReservedV10InstalledModuleProcessProvenance,
@@ -186,49 +184,6 @@ export function createInstalledFileCoreStateStoreWithStoppedRecordWriter(
       createInstalledModuleProcessDeclarationProvenanceAuthority(store),
   });
 }
-function projectReservedV10Module(
-  plan: ReservedV10InstalledModulePlan,
-): InstalledExtensionModule {
-  const module = plan.module;
-  const inputConnections = module.inputConnections;
-  const firstStart = inputConnections[0]?.start;
-  const subscriptionStart = firstStart === "from-head" ? "from-head" : "from-now";
-  const projectedModule = Object.freeze({
-    moduleId: module.moduleId,
-    extensionId: module.extensionId,
-    packageVersion: module.packageVersion,
-    moduleKind: module.moduleKind,
-    isolation: "process" as const,
-    configurationReference: Object.freeze({ ...module.configurationReference }),
-    permissionPolicyIds: Object.freeze(
-      module.permissionPolicyReferences.map((reference) => reference.policyId),
-    ),
-    inputPageIds: Object.freeze(inputConnections.map((connection) => connection.pageId)),
-    outputPageIds: Object.freeze([...module.outputPageIds]),
-    subscriptionStart,
-    activation: module.activation,
-    limits: Object.freeze({
-      claim: Object.freeze({
-        maxCount: module.limits.claim.maxCount,
-        maxBytes: module.limits.claim.maxBytes,
-      }),
-      maxInputBytes: module.limits.maxInputBytes,
-      maxResultBytes: module.limits.maxResultBytes,
-      maxFrameBytes: module.limits.maxFrameBytes,
-      maxRunsPerGeneration: module.limits.maxRunsPerGeneration,
-      maxGenerations: module.limits.maxGenerations,
-    }),
-    timeouts: Object.freeze({ ...module.timeouts }),
-  } satisfies DollyModuleConfig);
-  return Object.freeze({
-    instanceId: plan.instanceId,
-    module: projectedModule,
-    installation: plan.installation,
-    packageModule: plan.packageModule,
-    configuration: plan.configuration,
-  });
-}
-
 function assertReservedV10PremiseForRuntime(
   options: InstalledReactiveModuleRuntimeOptions,
 ): {
@@ -236,6 +191,15 @@ function assertReservedV10PremiseForRuntime(
   readonly processProvenance: ReservedV10InstalledModuleProcessProvenance;
   readonly configuration: DollyInstanceConfigV10Draft;
 } {
+  if (
+    Object.hasOwn(options, "resolvedModule") ||
+    Object.hasOwn(options, "declarationProvenance")
+  ) {
+    throw new TypeError(
+      "Reserved version-10 installed Module runtime cannot accept caller-supplied derived provenance or resolved Module",
+    );
+  }
+
   if (options.premise === undefined) {
     throw new TypeError(
       "Reserved version-10 installed Module runtime requires an InstalledModuleRuntimePremise",
@@ -358,11 +322,122 @@ function assertReservedV10PremiseForRuntime(
   return { plan, processProvenance, configuration };
 }
 
+function sameV10CgroupLimits(
+  left: InstalledRuntimeLifecycleOptions["limits"],
+  right: ReservedV10InstalledModuleProcessProvenance["linuxExecution"]["cgroupLimits"],
+): boolean {
+  return (
+    left.memoryMaxBytes === right.memoryMaxBytes &&
+    left.maxProcesses === right.maxProcesses &&
+    left.cpuQuotaMicros === right.cpuQuotaMicros &&
+    left.cpuPeriodMicros === right.cpuPeriodMicros
+  );
+}
+
+function assertReservedV10RuntimeBoundaryOptions(
+  options: InstalledReactiveModuleRuntimeOptions,
+  plan: ReservedV10InstalledModulePlan,
+  processProvenance: ReservedV10InstalledModuleProcessProvenance,
+): void {
+  if (
+    Object.hasOwn(options, "resolvedModule") ||
+    Object.hasOwn(options, "declarationProvenance")
+  ) {
+    throw new TypeError(
+      "Reserved version-10 installed Module runtime cannot accept caller-supplied derived provenance or resolved Module",
+    );
+  }
+  const execution = processProvenance.linuxExecution;
+  if (!sameV10CgroupLimits(options.lifecycle.limits, execution.cgroupLimits)) {
+    throw new TypeError(
+      "Reserved version-10 installed Module runtime lifecycle cgroup limits do not match its premise",
+    );
+  }
+  if (options.lifecycle.maxOpenFiles !== execution.maxOpenFiles) {
+    throw new TypeError(
+      "Reserved version-10 installed Module runtime maxOpenFiles does not match its premise",
+    );
+  }
+  const module = plan.module;
+  const matchingMailboxes = options.mailboxes.filter(
+    (mailbox) => mailbox.consumerId === module.moduleId,
+  );
+  if (module.activation.kind === "source") {
+    if (matchingMailboxes.length !== 0) {
+      throw new TypeError(
+        `Reserved version-10 source Module ${module.moduleId} cannot accept a caller mailbox`,
+      );
+    }
+    const sourceQueue = options.sourceActivationQueue;
+    if (!(sourceQueue instanceof SourceActivationQueue)) {
+      throw new TypeError(
+        `Reserved version-10 source Module ${module.moduleId} requires its premise-bound source queue`,
+      );
+    }
+    const sourceRequestMaxBytes = module.limits.sourceRequestMaxBytes;
+    if (sourceRequestMaxBytes === null) {
+      throw new TypeError(
+        `Reserved version-10 source Module ${module.moduleId} requires a scheduler source-queue bridge for its missing request limit`,
+      );
+    }
+    if (
+      sourceQueue.moduleId !== module.moduleId ||
+      sourceQueue.limits.maxResidentCount !== module.limits.mailbox.maxResidentCount ||
+      sourceQueue.limits.maxResidentBytes !== module.limits.mailbox.maxResidentBytes ||
+      sourceQueue.limits.maxRequestBytes !== sourceRequestMaxBytes
+    ) {
+      throw new TypeError(
+        `Reserved version-10 source Module ${module.moduleId} source-queue limits do not match its premise`,
+      );
+    }
+    return;
+  }
+  if (options.sourceActivationQueue !== undefined) {
+    throw new TypeError(
+      `Reserved version-10 reactive Module ${module.moduleId} cannot accept a source queue`,
+    );
+  }
+  if (matchingMailboxes.length !== 1) {
+    throw new TypeError(
+      `Reserved version-10 reactive Module ${module.moduleId} requires one premise-bound mailbox`,
+    );
+  }
+  const mailbox = matchingMailboxes[0]!;
+  if (
+    mailbox.pageIds.length !== module.inputConnections.length ||
+    mailbox.pageIds.some(
+      (pageId, index) => pageId !== module.inputConnections[index]?.pageId,
+    ) ||
+    mailbox.maxResidentCount !== module.limits.mailbox.maxResidentCount ||
+    mailbox.maxResidentBytes !== module.limits.mailbox.maxResidentBytes
+  ) {
+    throw new TypeError(
+      `Reserved version-10 reactive Module ${module.moduleId} mailbox limits or Pages do not match its premise`,
+    );
+  }
+  for (const connection of module.inputConnections) {
+    const subscription = options.core.deliveries.inspectSubscription(
+      connection.pageId,
+      module.moduleId,
+    );
+    if (
+      subscription === null ||
+      canonicalJsonDigest(subscription.start) !== canonicalJsonDigest(connection.start)
+    ) {
+      throw new TypeError(
+        `Reserved version-10 reactive Module ${module.moduleId} subscription for Page ${connection.pageId} does not match its premise`,
+      );
+    }
+  }
+}
+
 function createInstalledReactiveModuleRuntimeFromPremise(
   options: InstalledReactiveModuleRuntimeOptions,
 ): InstalledReactiveModuleRuntime {
   const { plan, processProvenance, configuration } =
     assertReservedV10PremiseForRuntime(options);
+  const resolvedModule = projectReservedV10InstalledModule(plan);
+  assertReservedV10RuntimeBoundaryOptions(options, plan, processProvenance);
   const {
     activation: _callerActivation,
     permissionPolicies: _callerPolicies,
@@ -374,7 +449,7 @@ function createInstalledReactiveModuleRuntimeFromPremise(
     instanceConfiguration: configuration,
     moduleId: plan.module.moduleId,
     activation: options.premise!.candidate.activationPermission,
-    resolvedModule: projectReservedV10Module(plan),
+    resolvedModule,
     declarationProvenance: processProvenance,
     declaredExternalEffects: plan.module.declaredExternalEffects,
   });
