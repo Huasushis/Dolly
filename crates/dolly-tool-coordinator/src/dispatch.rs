@@ -20,9 +20,9 @@ use dolly_storage::effect_journal::{
     EffectJournalIntentAuthority, retain_settled_effect_journal, settle_pending_effect_journal,
     settle_unknown_intent,
 };
-use dolly_storage::mcp_readiness::{McpReadinessError, McpTransportReadiness};
-#[cfg(not(feature = "test-support"))]
-use dolly_storage::mcp_readiness::prove_current_mcp_transport_readiness;
+use dolly_storage::mcp_readiness::{
+    McpReadinessError, McpTransportReadiness, prove_current_mcp_transport_readiness,
+};
 #[cfg(feature = "test-support")]
 use dolly_storage::mcp_readiness::test_prove_current_mcp_transport_readiness;
 use dolly_storage::tool_broker_authority::{
@@ -208,18 +208,6 @@ impl HostMcpStdioInvocation {
             self.host_handle.terminate();
             return Err(StdioTransportError::HandshakeAuthorityMismatch);
         }
-        #[cfg(feature = "test-support")]
-        {
-            return self.initialize_with_readiness(
-                database,
-                runtime_binding,
-                process_generation,
-                server_id,
-                deadline,
-                test_prove_current_mcp_transport_readiness,
-            );
-        }
-        #[cfg(not(feature = "test-support"))]
         self.initialize_with_readiness(
             database,
             runtime_binding,
@@ -227,6 +215,38 @@ impl HostMcpStdioInvocation {
             server_id,
             deadline,
             prove_current_mcp_transport_readiness,
+        )
+    }
+
+    /// Test-support-only initializer. It preserves the same durable
+    /// handshake authority checks while substituting the isolated fixture
+    /// readiness prover; it is absent from default builds.
+    #[cfg(feature = "test-support")]
+    pub fn initialize_for_test(
+        &mut self,
+        handshake_authority: &EffectJournalIntentAuthority,
+        database: &Database,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        server_id: &str,
+        deadline: Instant,
+    ) -> Result<McpTransportReadiness, StdioTransportError> {
+        if self.handshake_authority != *handshake_authority
+            || self
+                .handshake_authority
+                .verify_for_initialize(database.connection(), &self.handshake_intent)
+                .is_err()
+        {
+            self.host_handle.terminate();
+            return Err(StdioTransportError::HandshakeAuthorityMismatch);
+        }
+        self.initialize_with_readiness(
+            database,
+            runtime_binding,
+            process_generation,
+            server_id,
+            deadline,
+            test_prove_current_mcp_transport_readiness,
         )
     }
     /// Internal readiness prover used only after handshake authority validation.

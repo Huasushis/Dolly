@@ -419,7 +419,7 @@ impl Fixture {
             package_root: self.package_root.clone(),
             package_path: self.package_path.clone(),
         };
-        Worker::start(config).expect("worker starts")
+        Worker::start_for_test(config).expect("worker starts")
     }
 }
 

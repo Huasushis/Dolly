@@ -21,8 +21,8 @@ use dolly_storage::tool_ledger::{
 };
 use dolly_storage::{Database, StorageError};
 use dolly_tool_broker::{
-    ConfirmationDecision, IdempotencyPolicy, LedgerState, RecoveryFacts, SideEffectClass,
-    ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag, RecoveryFactsSource,
+    ConfirmationDecision, IdempotencyPolicy, LedgerState, RecoveryFacts, RecoveryProof,
+    SideEffectClass, ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag,
 };
 use dolly_tool_coordinator::{
     DispatchError, DispatchOutcome, FencedFactsProvider, HostMcpStdioInstalledChildAttestation,
@@ -34,35 +34,19 @@ use rusqlite::Connection;
 use serde_json::json;
 
 
-struct TestFacts {
-    zero_bytes_proved: bool,
-    exact_generation_ready: bool,
-    deadline_expired: bool,
-}
-
-// SAFETY: tests explicitly model the coordinator's private fence source.
-unsafe impl RecoveryFactsSource for TestFacts {
-    fn facts_for(&self, _record: &ToolCallLedgerRecord) -> (bool, bool, bool) {
-        (
-            self.zero_bytes_proved,
-            self.exact_generation_ready,
-            self.deadline_expired,
-        )
-    }
-}
-
 fn facts(
-    record: &ToolCallLedgerRecord,
+    _record: &ToolCallLedgerRecord,
     zero_bytes_proved: bool,
     exact_generation_ready: bool,
     deadline_expired: bool,
 ) -> RecoveryFacts {
-    let source = TestFacts {
-        zero_bytes_proved,
-        exact_generation_ready,
-        deadline_expired,
+    let proof = match (zero_bytes_proved, exact_generation_ready, deadline_expired) {
+        (true, true, false) => RecoveryProof::coordinator_dispatch_ready(),
+        (true, false, false) => RecoveryProof::coordinator_dispatch_unready(),
+        (true, _, true) => RecoveryProof::coordinator_dispatch_expired(),
+        _ => RecoveryProof::coordinator_reopen(),
     };
-    RecoveryFacts::from_authoritative_source(&source, record)
+    RecoveryFacts::from_proof(proof)
 }
 fn digest(hex: u8) -> Sha256Digest {
     format!("sha256:{:064x}", hex as u128)
@@ -746,7 +730,7 @@ fn fenced_facts_provider_composes_ports() {
         readiness: &Ready,
         clock: &PeakClock,
     };
-    let facts = RecoveryFacts::from_authoritative_source(&provider, &authorized);
+    let facts = crate::ports::RecoveryFactsProvider::facts_for(&provider, &authorized);
     assert!(facts.zero_bytes_proved());
     assert!(facts.exact_generation_ready());
     assert!(!facts.deadline_expired(), "deadline far in the future");
@@ -818,11 +802,7 @@ fn authorized_boundary_rejects_forged_and_stale_rows_before_cas() {
 
 #[test]
 fn recovery_boundary_requires_producer_authority() {
-    let _requires_authority: fn(
+    let _requires_pre_generation_recovery: fn(
         &mut Database,
-        &ToolDispatchAuthority,
-        &RuntimeBinding,
-        &ProcessGeneration,
-        &McpTransportReadiness,
     ) -> Result<dolly_tool_coordinator::RecoveryOutcome, DispatchError> = reopen_recovery;
 }

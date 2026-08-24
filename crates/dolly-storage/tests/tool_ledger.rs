@@ -19,44 +19,26 @@ use dolly_storage::tool_ledger::{
 use dolly_storage::{Database, StorageError};
 use dolly_tool_broker::{
     ConfirmationDecision, DispatchDisposition, IdempotencyPolicy, LedgerState, RecoveryFacts,
-    RecoveryFactsSource, SideEffectClass, ToolCallLedgerRecord, ToolOperationBinding,
+    RecoveryProof, SideEffectClass, ToolCallLedgerRecord, ToolOperationBinding,
     ToolOperationBindingSchemaTag, ToolStatus,
 };
 use rusqlite::Connection;
 use serde_json::json;
 
 
-struct TestFacts {
-    zero_bytes_proved: bool,
-    exact_generation_ready: bool,
-    deadline_expired: bool,
-}
-
-// SAFETY: this fixture models coordinator-owned recovery facts.
-unsafe impl RecoveryFactsSource for TestFacts {
-    fn facts_for(&self, _record: &ToolCallLedgerRecord) -> (bool, bool, bool) {
-        (
-            self.zero_bytes_proved,
-            self.exact_generation_ready,
-            self.deadline_expired,
-        )
-    }
-}
-
 fn facts(
-    record: &ToolCallLedgerRecord,
+    _record: &ToolCallLedgerRecord,
     zero_bytes_proved: bool,
     exact_generation_ready: bool,
     deadline_expired: bool,
 ) -> RecoveryFacts {
-    RecoveryFacts::from_authoritative_source(
-        &TestFacts {
-            zero_bytes_proved,
-            exact_generation_ready,
-            deadline_expired,
-        },
-        record,
-    )
+    let proof = match (zero_bytes_proved, exact_generation_ready, deadline_expired) {
+        (true, true, false) => RecoveryProof::coordinator_dispatch_ready(),
+        (true, false, false) => RecoveryProof::coordinator_dispatch_unready(),
+        (true, _, true) => RecoveryProof::coordinator_dispatch_expired(),
+        _ => RecoveryProof::coordinator_reopen(),
+    };
+    RecoveryFacts::from_proof(proof)
 }
 /// Request-digest/operation-digest/outbound digest shorthand.
 fn digest(hex: u8) -> Sha256Digest {
