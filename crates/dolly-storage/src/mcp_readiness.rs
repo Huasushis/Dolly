@@ -433,7 +433,7 @@ where
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn test_prove_current_mcp_transport_readiness<P>(
     connection: &Connection,
     runtime_binding: &RuntimeBinding,

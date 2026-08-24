@@ -14,16 +14,17 @@
 
 use std::mem;
 use std::process::Child;
-use std::time::Instant;
-
+use std::time::{Instant, SystemTime};
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_storage::effect_journal::{
     EffectJournalIntentAuthority, retain_settled_effect_journal, settle_pending_effect_journal,
     settle_unknown_intent,
 };
-use dolly_storage::mcp_readiness::{
-    McpReadinessError, McpTransportReadiness, prove_current_mcp_transport_readiness,
-};
+use dolly_storage::mcp_readiness::{McpReadinessError, McpTransportReadiness};
+#[cfg(not(feature = "test-support"))]
+use dolly_storage::mcp_readiness::prove_current_mcp_transport_readiness;
+#[cfg(feature = "test-support")]
+use dolly_storage::mcp_readiness::test_prove_current_mcp_transport_readiness;
 use dolly_storage::tool_broker_authority::{
     ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
     validate_dispatch_binding,
@@ -33,6 +34,7 @@ use dolly_storage::tool_ledger::{
     CasKey, TransportCorrelation, cas_terminal, cas_to_dispatched, load_exact,
 };
 use dolly_storage::{Database, StorageError};
+use dolly_tool_broker::effect_journal::ExternalEffectJournalRecord;
 use dolly_tool_broker::{
     DispatchDisposition, LedgerState, RecoveryFacts, ToolCallLedgerRecord, ToolResult,
     recover_operation,
@@ -89,6 +91,27 @@ pub(crate) fn load_authoritative_row(
     }
     Ok(authoritative)
 }
+struct SystemClock;
+
+impl crate::ports::Clock for SystemClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+pub(crate) fn fenced_facts(
+    row: &ToolCallLedgerRecord,
+    readiness: &McpTransportReadiness,
+    zero_bytes_proved: bool,
+) -> RecoveryFacts {
+    let clock = SystemClock;
+    let fence = crate::ports::FencedFactsProvider {
+        zero_bytes_proved,
+        readiness,
+        clock: &clock,
+    };
+    crate::ports::RecoveryFactsProvider::facts_for(&fence, row)
+}
 /// Opaque Host-owned stdio composition handed to the existing authorized
 /// dispatch entrypoint. The fields cannot be paired or replaced by callers;
 /// the installed-child verifier supplies the session and the Host retains
@@ -97,6 +120,8 @@ pub struct HostMcpStdioInvocation {
     session: HostMcpStdioSessionState,
     host_handle: HostMcpStdioProcessHandle,
     limits: StdioTransportLimits,
+    handshake_authority: EffectJournalIntentAuthority,
+    handshake_intent: ExternalEffectJournalRecord,
     request_bytes: Vec<u8>,
 }
 
@@ -123,13 +148,27 @@ impl HostMcpStdioInvocation {
         process_generation: &ProcessGeneration,
         limits: StdioTransportLimits,
         request_bytes: Vec<u8>,
+        database: &Database,
+        handshake_authority: &EffectJournalIntentAuthority,
+        handshake_intent: &ExternalEffectJournalRecord,
     ) -> Result<(Self, HostMcpStdioProcessHandle), StdioTransportError> {
+        if handshake_authority
+            .verify_for_initialize(database.connection(), handshake_intent)
+            .is_err()
+        {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(StdioTransportError::HandshakeAuthorityMismatch);
+        }
         let (host_session, retained_handle) =
             host_session_from_installed_child(child, attestation, process_generation)?;
         let invocation = Self {
             session: HostMcpStdioSessionState::Raw(host_session),
             host_handle: retained_handle.clone(),
             limits,
+            handshake_authority: handshake_authority.clone(),
+            handshake_intent: handshake_intent.clone(),
             request_bytes,
         };
         Ok((invocation, retained_handle))
@@ -142,23 +181,45 @@ impl HostMcpStdioInvocation {
     pub fn set_request_bytes(&mut self, request_bytes: Vec<u8>) {
         self.request_bytes = request_bytes;
     }
-    /// Digest of the exact versioned initialize request plus initialized
-    /// notification bytes that the next lifecycle will send.
-    pub fn initialize_intent_digest(&self) -> Result<Sha256Digest, StdioTransportError> {
-        crate::mcp_stdio::initialize_handshake_digest()
-    }
 
     /// Complete the one MCP initialize/initialized lifecycle on this exact
     /// verified child. The resulting readiness is consumer-only evidence; the
     /// child session remains owned by this invocation for the later dispatch.
+    /// The caller must present the same opaque durable handshake authority
+    /// that was committed before the child was touched.
     pub fn initialize(
         &mut self,
+        handshake_authority: &EffectJournalIntentAuthority,
         database: &Database,
         runtime_binding: &RuntimeBinding,
         process_generation: &ProcessGeneration,
         server_id: &str,
         deadline: Instant,
     ) -> Result<McpTransportReadiness, StdioTransportError> {
+        if self.handshake_authority != *handshake_authority {
+            self.host_handle.terminate();
+            return Err(StdioTransportError::HandshakeAuthorityMismatch);
+        }
+        if self
+            .handshake_authority
+            .verify_for_initialize(database.connection(), &self.handshake_intent)
+            .is_err()
+        {
+            self.host_handle.terminate();
+            return Err(StdioTransportError::HandshakeAuthorityMismatch);
+        }
+        #[cfg(feature = "test-support")]
+        {
+            return self.initialize_with_readiness(
+                database,
+                runtime_binding,
+                process_generation,
+                server_id,
+                deadline,
+                test_prove_current_mcp_transport_readiness,
+            );
+        }
+        #[cfg(not(feature = "test-support"))]
         self.initialize_with_readiness(
             database,
             runtime_binding,
@@ -168,12 +229,7 @@ impl HostMcpStdioInvocation {
             prove_current_mcp_transport_readiness,
         )
     }
-
-
-    /// Complete the one MCP initialize/initialized lifecycle on this exact
-    /// verified child using the supplied readiness prover. The resulting
-    /// readiness is consumer-only evidence; the child session remains owned by
-    /// this invocation for the later dispatch.
+    /// Internal readiness prover used only after handshake authority validation.
     fn initialize_with_readiness<F>(
         &mut self,
         database: &Database,
@@ -313,7 +369,6 @@ pub fn dispatch_operation_authorized(
     readiness: &McpTransportReadiness,
     package_digest: &Sha256Digest,
     row: &ToolCallLedgerRecord,
-    facts: &RecoveryFacts,
     service: &ToolDispatchService,
     invocation: HostMcpStdioInvocation,
 ) -> Result<DispatchOutcome, DispatchError> {
@@ -348,7 +403,10 @@ pub fn dispatch_operation_authorized(
         invocation.host_handle.terminate();
         return Err(DispatchError::Storage(error));
     }
-    let outcome = dispatch_operation(db, &row, facts)?;
+    // The fence is derived only after the authoritative row, generation, and
+    // Claim-bound intent have all been revalidated.
+    let facts = fenced_facts(&row, readiness, true);
+    let outcome = dispatch_operation(db, &row, &facts)?;
     let permit = match outcome {
         DispatchOutcome::Dispatched {
             record: _,
@@ -362,7 +420,7 @@ pub fn dispatch_operation_authorized(
             // immediately ambiguous. Terminalize the ledger and journal it
             // before returning; never leave a live child/session behind.
             invocation.host_handle.terminate();
-            let terminal = dispatch_operation(db, &record, facts)?;
+            let terminal = dispatch_operation(db, &record, &facts)?;
             if matches!(terminal, DispatchOutcome::Dispatched { .. }) {
                 return match settle_unknown_intent(db.connection_mut(), journal_authority) {
                     Ok(_) => Err(DispatchError::Ambiguous),
@@ -373,7 +431,7 @@ pub fn dispatch_operation_authorized(
                 .map_err(DispatchError::Storage)?;
             return Ok(match terminal {
                 DispatchOutcome::Stale { authoritative } => {
-                    dispatch_operation(db, &authoritative, facts)?
+                    dispatch_operation(db, &authoritative, &facts)?
                 }
                 other => other,
             });
@@ -438,7 +496,6 @@ pub fn dispatch_operation_authorized_reusable(
     readiness: &McpTransportReadiness,
     package_digest: &Sha256Digest,
     row: &ToolCallLedgerRecord,
-    facts: &RecoveryFacts,
     service: &ToolDispatchService,
     invocation: &mut HostMcpStdioInvocation,
 ) -> Result<DispatchOutcome, DispatchError> {
@@ -467,7 +524,9 @@ pub fn dispatch_operation_authorized_reusable(
         invocation.host_handle.terminate();
         return Err(DispatchError::Storage(error));
     }
-    let outcome = dispatch_operation(db, &row, facts)?;
+    // This fence is coordinator-owned; Worker callers cannot inject facts.
+    let facts = fenced_facts(&row, readiness, true);
+    let outcome = dispatch_operation(db, &row, &facts)?;
     let permit = match outcome {
         DispatchOutcome::Dispatched {
             record: _,
@@ -477,8 +536,7 @@ pub fn dispatch_operation_authorized_reusable(
             record,
             permit: None,
         } => {
-            invocation.host_handle.terminate();
-            let terminal = dispatch_operation(db, &record, facts)?;
+            let terminal = dispatch_operation(db, &record, &facts)?;
             if matches!(terminal, DispatchOutcome::Dispatched { .. }) {
                 return match settle_unknown_intent(db.connection_mut(), journal_authority) {
                     Ok(_) => Err(DispatchError::Ambiguous),
@@ -489,7 +547,7 @@ pub fn dispatch_operation_authorized_reusable(
                 .map_err(DispatchError::Storage)?;
             return Ok(match terminal {
                 DispatchOutcome::Stale { authoritative } => {
-                    dispatch_operation(db, &authoritative, facts)?
+                    dispatch_operation(db, &authoritative, &facts)?
                 }
                 other => other,
             });

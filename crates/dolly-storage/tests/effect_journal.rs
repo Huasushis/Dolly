@@ -276,8 +276,51 @@ fn intended_record(
     record
 }
 
+fn handshake_record(operation_id: &str) -> ExternalEffectJournalRecord {
+    let operation_digest = digest(0x31);
+    let mut record = intended_record(operation_id, digest(0x32), operation_digest.clone());
+    record.effect_class = EffectClass::McpInitializeHandshake;
+    record.claim.claim_token = derive_claim_token(
+        INSTANCE,
+        MODULE,
+        operation_id,
+        &operation_digest,
+        CONTROLLER,
+        EXTENSION_GENERATION,
+        EPOCH,
+        &package_digest(),
+        &policy_digest(),
+        EffectClass::McpInitializeHandshake,
+    );
+    record.verify().expect("handshake record");
+    record
+}
+
 fn claim_of(record: &ExternalEffectJournalRecord) -> Claim {
     record.claim.clone()
+}
+
+#[test]
+fn settle_non_effect_intent_rejects_tampered_schema_before_mutation() {
+    let dir = tempdir();
+    let mut db = open_db(dir.path());
+    let record = handshake_record("op-handshake-schema-gate");
+    let authority = match insert_intent(db.connection_mut(), &record).expect("insert handshake") {
+        EffectJournalInsertDisposition::Inserted { authority, .. } => authority,
+        EffectJournalInsertDisposition::Replayed { .. } => panic!("expected fresh handshake"),
+    };
+    db.connection()
+        .execute(
+            "DROP INDEX effect_journal_recovery",
+            [],
+        )
+        .expect("tamper schema metadata");
+    let result = dolly_storage::effect_journal::settle_non_effect_intent(
+        db.connection_mut(),
+        &authority,
+        digest(0x77),
+    );
+    assert!(matches!(result, Err(StorageError::Corrupt)), "{result:?}");
 }
 
 // ---- helpers to open a real temp database and wire the journal schema ----

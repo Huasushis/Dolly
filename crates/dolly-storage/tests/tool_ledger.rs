@@ -19,12 +19,45 @@ use dolly_storage::tool_ledger::{
 use dolly_storage::{Database, StorageError};
 use dolly_tool_broker::{
     ConfirmationDecision, DispatchDisposition, IdempotencyPolicy, LedgerState, RecoveryFacts,
-    SideEffectClass, ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag,
-    ToolStatus,
+    RecoveryFactsSource, SideEffectClass, ToolCallLedgerRecord, ToolOperationBinding,
+    ToolOperationBindingSchemaTag, ToolStatus,
 };
 use rusqlite::Connection;
 use serde_json::json;
 
+
+struct TestFacts {
+    zero_bytes_proved: bool,
+    exact_generation_ready: bool,
+    deadline_expired: bool,
+}
+
+// SAFETY: this fixture models coordinator-owned recovery facts.
+unsafe impl RecoveryFactsSource for TestFacts {
+    fn facts_for(&self, _record: &ToolCallLedgerRecord) -> (bool, bool, bool) {
+        (
+            self.zero_bytes_proved,
+            self.exact_generation_ready,
+            self.deadline_expired,
+        )
+    }
+}
+
+fn facts(
+    record: &ToolCallLedgerRecord,
+    zero_bytes_proved: bool,
+    exact_generation_ready: bool,
+    deadline_expired: bool,
+) -> RecoveryFacts {
+    RecoveryFacts::from_authoritative_source(
+        &TestFacts {
+            zero_bytes_proved,
+            exact_generation_ready,
+            deadline_expired,
+        },
+        record,
+    )
+}
 /// Request-digest/operation-digest/outbound digest shorthand.
 fn digest(hex: u8) -> Sha256Digest {
     format!("sha256:{:064x}", hex as u128)
@@ -276,7 +309,7 @@ fn authorized_zero_byte_safe_retry_disposition() {
     // deadline: propose dispatch with a permit (TST-TOOL-009).
     let disposition = propose_recovery(
         recovered,
-        &RecoveryFacts::from_authoritative_inputs(true, true, false),
+        &facts(recovered, true, true, false),
     );
     let outbound_digest = match &disposition {
         DispatchDisposition::ProposeDispatch {
@@ -343,7 +376,7 @@ fn authorized_zero_byte_proof_unusable_generation_fails_not_applied() {
         .remove(0);
     let disposition = propose_recovery(
         &recovered,
-        &RecoveryFacts::from_authoritative_inputs(true, false, false),
+        &facts(&recovered, true, false, false),
     );
     let terminal_result = match &disposition {
         DispatchDisposition::ProvedNotApplied { result } => result.clone(),
@@ -438,7 +471,7 @@ fn dispatched_row_becomes_unknown_without_redispatch() {
     assert_eq!(recovered.state, LedgerState::Dispatched);
     let disposition = propose_recovery(
         &recovered,
-        &RecoveryFacts::from_authoritative_inputs(false, false, false),
+        &facts(&recovered, false, false, false),
     );
     match &disposition {
         DispatchDisposition::Unknown { result } => {
@@ -506,7 +539,7 @@ fn dispatched_row_becomes_unknown_without_redispatch() {
     assert_eq!(loaded.ledger_revision, 3);
     let disposition = propose_recovery(
         &loaded,
-        &RecoveryFacts::from_authoritative_inputs(false, false, false),
+        &facts(&loaded, false, false, false),
     );
     assert!(
         matches!(disposition, DispatchDisposition::AlreadyTerminal { .. }),
@@ -604,7 +637,7 @@ fn terminal_commit_ack_lost_reopen_replays_exact() {
     // Recovery of a terminal row is a verbatim replay, never a redispatch.
     let disposition = propose_recovery(
         &loaded,
-        &RecoveryFacts::from_authoritative_inputs(false, false, false),
+        &facts(&loaded, false, false, false),
     );
     match &disposition {
         DispatchDisposition::AlreadyTerminal { result } => {

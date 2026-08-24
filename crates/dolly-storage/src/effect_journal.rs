@@ -374,7 +374,7 @@ fn verify_table_shape(
 /// Coordinator stdio dispatch requires this exact capability and re-verifies
 /// the durable row and every frozen generation/premise before admitting a
 /// send permit.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EffectJournalIntentAuthority {
     record: ExternalEffectJournalRecord,
 }
@@ -426,6 +426,28 @@ impl EffectJournalIntentAuthority {
         }
         Ok(())
     }
+    /// Verify the opaque startup handshake authority against the exact
+    /// expected Claim-bound row before any initialize child I/O.
+    pub fn verify_for_initialize(
+        &self,
+        connection: &Connection,
+        expected: &ExternalEffectJournalRecord,
+    ) -> StorageResult<()> {
+        gate_schema_version(connection)?;
+        if expected.state != EffectJournalState::Intended
+            || expected.journal_revision != 1
+            || expected.effect_class != EffectClass::McpInitializeHandshake
+            || expected.evidence_digest.is_some()
+            || expected.verify().is_err()
+        {
+            return Err(StorageError::Corrupt);
+        }
+        let stored = load_exact(connection, &self.record.claim)?.ok_or(StorageError::Corrupt)?;
+        if stored != self.record || self.record != *expected {
+            return Err(StorageError::Corrupt);
+        }
+        Ok(())
+    }
 }
 /// Settle a versioned non-effect startup handshake after its exact lifecycle
 /// completed. The authority came only from the committed `INTENDED` Claim;
@@ -435,6 +457,7 @@ pub fn settle_non_effect_intent(
     authority: &EffectJournalIntentAuthority,
     evidence_digest: Sha256Digest,
 ) -> StorageResult<EffectCasOutcome> {
+    gate_schema_version(connection)?;
     let record = &authority.record;
     if record.state != EffectJournalState::Intended
         || record.effect_class != EffectClass::McpInitializeHandshake

@@ -9,7 +9,8 @@
 
 use std::time::SystemTime;
 
-use dolly_tool_broker::{RecoveryFacts, ToolCallLedgerRecord};
+use dolly_storage::mcp_readiness::McpTransportReadiness;
+use dolly_tool_broker::{RecoveryFacts, RecoveryFactsSource, ToolCallLedgerRecord};
 
 /// Host-owned answer to "is the frozen generation still Ready for this
 /// retained revision?" (tool-broker §4/§6).
@@ -23,6 +24,17 @@ pub trait GenerationReadiness {
         tool_server_id: &str,
         tool_server_generation: u64,
     ) -> bool;
+}
+impl GenerationReadiness for McpTransportReadiness {
+    fn exact_generation_ready(
+        &self,
+        _module_id: &str,
+        tool_server_id: &str,
+        tool_server_generation: u64,
+    ) -> bool {
+        self.server_id() == tool_server_id
+            && self.extension_generation().value() == tool_server_generation
+    }
 }
 
 /// Host-owned wall clock for deadline comparison (tool-broker §6).
@@ -52,10 +64,12 @@ pub struct FencedFactsProvider<'a> {
     pub(crate) clock: &'a dyn Clock,
 }
 
-impl RecoveryFactsProvider for FencedFactsProvider<'_> {
-    fn facts_for(&self, row: &ToolCallLedgerRecord) -> RecoveryFacts {
+// SAFETY: this implementation is the coordinator's sole Host-owned fence
+// boundary. Worker callers never receive the source or pass facts to dispatch.
+unsafe impl RecoveryFactsSource for FencedFactsProvider<'_> {
+    fn facts_for(&self, row: &ToolCallLedgerRecord) -> (bool, bool, bool) {
         let binding = &row.operation_binding;
-        RecoveryFacts::from_authoritative_inputs(
+        (
             self.zero_bytes_proved,
             self.readiness.exact_generation_ready(
                 &binding.module_id,
@@ -67,7 +81,11 @@ impl RecoveryFactsProvider for FencedFactsProvider<'_> {
     }
 }
 
-/// Strict RFC 3339 (UTC, `Z`) parse to `SystemTime`. Any unparseable
+impl RecoveryFactsProvider for FencedFactsProvider<'_> {
+    fn facts_for(&self, row: &ToolCallLedgerRecord) -> RecoveryFacts {
+        RecoveryFacts::from_authoritative_source(self, row)
+    }
+}
 /// deadline is reported as expired (fail-closed: never dispatches on an
 /// unreadable deadline).
 fn deadline_expired(payload: &str, now: SystemTime) -> bool {

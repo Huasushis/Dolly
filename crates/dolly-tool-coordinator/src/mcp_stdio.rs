@@ -58,6 +58,7 @@ pub enum StdioTransportError {
     InvalidDeadline,
     MissingPipe,
     ProcessIdentityMismatch,
+    HandshakeAuthorityMismatch,
     InvalidFrame,
     FrameTooLarge,
     RequestMismatch,
@@ -1071,7 +1072,7 @@ fn initialized_notification() -> Result<Vec<u8>, StdioTransportError> {
 /// Digest the exact bytes sent by the versioned startup lifecycle. The
 /// response is deliberately excluded from authority; it is consumed only by
 /// the readiness verifier after this intent is durable.
-pub(crate) fn initialize_handshake_digest() -> Result<Sha256Digest, StdioTransportError> {
+pub fn initialize_handshake_digest() -> Result<Sha256Digest, StdioTransportError> {
     let request = initialize_request()?;
     let notification = initialized_notification()?;
     let descriptor = serde_json::json!({
@@ -1131,6 +1132,9 @@ fn format_transport_error(error: StdioTransportError) -> String {
         StdioTransportError::MissingPipe => "stdio pipe is missing".to_owned(),
         StdioTransportError::ProcessIdentityMismatch => {
             "stdio process identity mismatch".to_owned()
+        }
+        StdioTransportError::HandshakeAuthorityMismatch => {
+            "durable initialize Claim authority mismatch".to_owned()
         }
         StdioTransportError::InvalidFrame => "invalid MCP frame".to_owned(),
         StdioTransportError::FrameTooLarge => "MCP frame exceeds the configured limit".to_owned(),

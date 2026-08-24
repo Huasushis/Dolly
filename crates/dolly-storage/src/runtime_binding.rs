@@ -432,6 +432,21 @@ pub fn mint_current_runtime_binding(
     let proof = verify_current_linux_host(db.connection())?;
     mint_runtime_binding(db, extension_alias, proof)
 }
+
+/// Test-support startup seam: prove the persisted test authority and then
+/// enter the same production binding transition. No proof object crosses the
+/// crate boundary and this function is absent from default artifacts.
+#[cfg(feature = "test-support")]
+pub fn mint_test_runtime_binding(
+    db: &mut Database,
+    extension_alias: ExtensionId,
+) -> Result<RuntimeBinding, RuntimeBindingError> {
+    let snapshot = load_current_authority(db.connection())
+        .map_err(|error| RuntimeBindingError::Malformed(error.to_string()))?
+        .ok_or(RuntimeBindingError::AuthorityMissing)?;
+    let proof = crate::linux_host_verification::test_proof_for_authority(&snapshot);
+    mint_runtime_binding(db, extension_alias, proof)
+}
 /// Atomically invalidate a failed Worker startup's current Runtime/process
 /// pointers while retaining the closed provenance rows and monotonic fences.
 ///
