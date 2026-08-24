@@ -142,6 +142,10 @@ const RESERVED_V10_PROJECTED_MODULE_PLANS = new WeakMap<
   object,
   ReservedV10InstalledModulePlan
 >();
+const RESERVED_V10_PROCESS_ACTIVATIONS = new WeakMap<
+  object,
+  LinuxModuleActivationPermission
+>();
 
 function projectReservedV10SubscriptionStart(
   inputConnections: ReservedV10InstalledModulePlan["module"]["inputConnections"],
@@ -242,7 +246,11 @@ function assertReservedV10ProjectedModule(
 function assertReservedV10LowLevelBindings(
   options: Pick<
     InstalledLinuxExtensionModuleExecutorOptions,
-    "instanceConfiguration" | "resolvedModule" | "declarationProvenance"
+    | "instanceConfiguration"
+    | "moduleId"
+    | "activation"
+    | "resolvedModule"
+    | "declarationProvenance"
   >,
 ): void {
   if (options.instanceConfiguration.schemaVersion !== "dolly.instance/10") return;
@@ -253,6 +261,25 @@ function assertReservedV10LowLevelBindings(
     );
   }
   assertReservedV10InstalledModuleProcessProvenance(provenance);
+  const plan = provenance.installedModule;
+  if (options.moduleId !== plan.module.moduleId) {
+    throw new TypeError(
+      "Reserved version-10 installed Linux executor Module identity does not match its premise",
+    );
+  }
+  if (
+    canonicalJsonDigest(options.instanceConfiguration as unknown as JsonValue) !==
+      plan.instanceConfigurationDigest
+  ) {
+    throw new TypeError(
+      "Reserved version-10 installed Linux executor configuration digest does not match its premise",
+    );
+  }
+  if (RESERVED_V10_PROCESS_ACTIVATIONS.get(provenance) !== options.activation) {
+    throw new TypeError(
+      "Reserved version-10 installed Linux executor activation is not the one bound to its premise",
+    );
+  }
   assertReservedV10ProjectedModule(options.resolvedModule, provenance);
 }
 
@@ -344,6 +371,7 @@ export function deriveReservedV10InstalledModuleProcessProvenance(
     provenanceDigest: canonicalJsonDigest(snapshot),
   });
   RESERVED_V10_PROCESS_PROVENANCE.add(provenance);
+  RESERVED_V10_PROCESS_ACTIVATIONS.set(provenance, activation);
   return provenance;
 }
 
@@ -470,6 +498,23 @@ function assertReservedV10ExecutionOptions(
   ) {
     throw new TypeError(
       "Reserved version-10 installed Linux executor timeouts do not match its premise",
+    );
+  }
+  const host = options.host as unknown as Record<string, unknown>;
+  const hostExpectations = {
+    maxFrameBytes: provenance.installedModule.module.limits.maxFrameBytes,
+    initializationTimeoutMs: timeouts.initializationTimeoutMs,
+    terminationTimeoutMs: timeouts.terminationTimeoutMs,
+  } as const;
+  const mismatchedHostFields = (
+    Object.keys(hostExpectations) as (keyof typeof hostExpectations)[]
+  ).filter(
+    (field) =>
+      Object.hasOwn(host, field) && host[field] !== hostExpectations[field],
+  ).sort();
+  if (mismatchedHostFields.length > 0) {
+    throw new TypeError(
+      `Reserved version-10 installed Linux executor Host-derived fields do not match its premise: ${mismatchedHostFields.join(", ")}`,
     );
   }
 }
@@ -715,6 +760,15 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     },
     host: {
       ...options.host,
+      ...(declarationProvenance === undefined
+        ? {}
+        : {
+            maxFrameBytes: declarationProvenance.installedModule.module.limits.maxFrameBytes,
+            initializationTimeoutMs:
+              declarationProvenance.linuxExecution.timeouts.initializationTimeoutMs,
+            terminationTimeoutMs:
+              declarationProvenance.linuxExecution.timeouts.terminationTimeoutMs,
+          }),
       trust: resolvedModule.installation.trust,
       manifest: resolvedModule.installation.manifest,
       moduleKind: resolvedModule.module.moduleKind,

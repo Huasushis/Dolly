@@ -43,6 +43,7 @@ import {
 import {
   createInstalledLinuxExtensionModuleGenerationFactory,
   deriveInstalledLinuxExtensionModuleExecutor,
+  projectReservedV10InstalledModule,
 } from "../../../src/adapters/installed-linux-extension-module-executor.js";
 import type { FileCoreStateStoreWithStoppedRecordWriter } from "../../../src/core/file-core-state-store.js";
 import { SourceActivationQueue } from "../../../src/core/source-activation-queue.js";
@@ -1231,7 +1232,7 @@ describe("post-H3 installed Module activation candidate", () => {
     }
   });
 
-  it("rejects v10 low-level executor seams without exact premise-derived bindings", async () => {
+  it("binds low-level v10 executor options to one premise before process I/O", async () => {
     const current = await fixture();
     try {
       const configuration = currentV10Configuration(current);
@@ -1243,12 +1244,114 @@ describe("post-H3 installed Module activation candidate", () => {
       } as never)).toThrow(/premise-derived/u);
 
       const premise = emptyRuntimePremise(current);
-      const provenance = premise.modules[0]!.processProvenance;
-      expect(() => deriveInstalledLinuxExtensionModuleExecutor({
+      const processProvenance = premise.modules[0]!.processProvenance;
+      const prepared = consumerOptions(current, configuration, premise);
+      const plan = processProvenance.installedModule;
+      const projectedModule = projectReservedV10InstalledModule(plan);
+      const execution = processProvenance.linuxExecution;
+      const baseOptions = {
         instanceConfiguration: configuration,
-        declarationProvenance: provenance,
-        resolvedModule: {},
-      } as never)).toThrow(/exact premise-derived/u);
+        moduleId: plan.module.moduleId,
+        installations: current.installations,
+        configurations: current.configurations,
+        resolvedModule: projectedModule,
+        declarationProvenance: processProvenance,
+        moduleGenerationId: "module-generation-v10",
+        coreStateDirectory: prepared.core.store.stateDirectoryForProcessConfinement(),
+        activation: premise.candidate.activationPermission,
+        lifecycle: {
+          records: prepared.core.store,
+          stoppedRecordWriter: prepared.options.stoppedRecordWriter,
+          identity: {
+            instanceId: plan.instanceId,
+            moduleId: plan.module.moduleId,
+            processGenerationId: "process-generation-v10",
+          },
+          limits: execution.cgroupLimits,
+          maxOpenFiles: execution.maxOpenFiles,
+        },
+        processRecord: {
+          createdAt: "2026-08-24T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        },
+        host: { ...prepared.options.host },
+        executionTimeoutMs: execution.timeouts.executionTimeoutMs,
+        cancellationGraceMs: execution.timeouts.cancellationGraceMs,
+        terminationTimeoutMs: execution.timeouts.terminationTimeoutMs,
+        channelCloseTimeoutMs: 500,
+      };
+      const derive = (overrides: Record<string, unknown> = {}) =>
+        deriveInstalledLinuxExtensionModuleExecutor({
+          ...baseOptions,
+          ...overrides,
+        } as never);
+
+      const derived = derive();
+      expect(derived.resolvedModule).toBe(projectedModule);
+      expect(derived.executorOptions.host.maxFrameBytes)
+        .toBe(plan.module.limits.maxFrameBytes);
+      expect(derived.executorOptions.host.initializationTimeoutMs)
+        .toBe(plan.module.timeouts.initializationTimeoutMs);
+      expect(derived.executorOptions.host.terminationTimeoutMs)
+        .toBe(plan.module.timeouts.terminationTimeoutMs);
+      expect(derived.executorOptions.lifecycle.limits).toEqual(execution.cgroupLimits);
+      expect(derived.executorOptions.lifecycle.maxOpenFiles).toBe(execution.maxOpenFiles);
+      expect(derived.executorOptions.lifecycle.processRecord?.declarationProvenance)
+        .toEqual({
+          schemaVersion: "dolly.reserved-v10-module-process-provenance/1",
+          provenanceDigest: processProvenance.provenanceDigest,
+        });
+      expect(derived.executorOptions.lifecycle.startingRecord?.declarationProvenance)
+        .toBe(processProvenance);
+      expect(prepared.core.store.listModuleProcessRecords()).toEqual([]);
+
+      const hostMismatchFields = [
+        ["maxFrameBytes", plan.module.limits.maxFrameBytes + 1],
+        ["initializationTimeoutMs", plan.module.timeouts.initializationTimeoutMs + 1],
+        ["terminationTimeoutMs", plan.module.timeouts.terminationTimeoutMs + 1],
+      ] as const;
+      for (const [field, value] of hostMismatchFields) {
+        expect(() => derive({
+          host: { ...baseOptions.host, [field]: value },
+        }), field).toThrow(/Host-derived fields|premise/u);
+      }
+      expect(() => derive({
+        lifecycle: {
+          ...baseOptions.lifecycle,
+          limits: { ...execution.cgroupLimits, maxProcesses: execution.cgroupLimits.maxProcesses + 1 },
+        },
+      })).toThrow(/cgroup limits|premise/u);
+      expect(() => derive({
+        lifecycle: {
+          ...baseOptions.lifecycle,
+          maxOpenFiles: execution.maxOpenFiles + 1,
+        },
+      })).toThrow(/maxOpenFiles|premise/u);
+
+      const secondHandoff = await proveLinuxModuleActivation({
+        startupAuthorityPermission: current.permission,
+      });
+      if (!secondHandoff.permitted) throw new Error("second activation proof was refused");
+      expect(() => derive({
+        activation: secondHandoff.activationPermission,
+      })).toThrow(/activation|premise/u);
+      expect(() => createInstalledLinuxExtensionModuleGenerationFactory({
+        instanceConfiguration: configuration,
+        moduleId: "other-worker",
+        activation: premise.candidate.activationPermission,
+        resolvedModule: projectedModule,
+        declarationProvenance: processProvenance,
+      } as never)).toThrow(/Module identity|premise/u);
+      expect(() => derive({ moduleId: "other-worker" }))
+        .toThrow(/Module identity|premise/u);
+      const changedConfiguration = validateDollyInstanceConfigV10Draft({
+        ...configuration,
+        displayName: "different configuration",
+      });
+      expect(() => derive({ instanceConfiguration: changedConfiguration }))
+        .toThrow(/configuration digest|premise/u);
+      expect(() => derive({ resolvedModule: { ...projectedModule } }))
+        .toThrow(/exact premise-derived/u);
     } finally {
       await closeFixture(current);
     }
