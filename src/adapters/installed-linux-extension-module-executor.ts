@@ -30,6 +30,7 @@ import {
 import type { ReactiveModuleInput } from "../core/reactive-module-input.js";
 import type { ReactiveModuleResult } from "../core/reactive-module-runtime.js";
 import type { DollyInstanceConfig } from "../core/runtime-config.js";
+import type { DollyInstanceConfigV10Draft } from "../core/runtime-config-v10.js";
 import {
   assertReservedV10InstalledPermissionPolicySelection,
   type InstalledModulePermissionPolicySetup,
@@ -58,10 +59,21 @@ type InstalledHostOptions = Omit<
 >;
 type ProcessRecordDetails = Pick<ModuleProcessRecord, "createdAt" | "updatedAt">;
 export interface InstalledLinuxExtensionModuleExecutorOptions {
-  readonly instanceConfiguration: DollyInstanceConfig;
+  readonly instanceConfiguration: DollyInstanceConfig | DollyInstanceConfigV10Draft;
   readonly moduleId: string;
   readonly installations: ExtensionInstallationRegistry;
   readonly configurations: ModuleConfigurationStore;
+  /**
+   * Resolver output already authenticated by the installed v10 premise
+   * consumer. When present, executor derivation MUST NOT resolve the legacy
+   * instance document again.
+   */
+  readonly resolvedModule?: InstalledExtensionModule;
+  /**
+   * WeakSet-authenticated v10 process provenance. Its presence selects the
+   * version-2 durable process-record declaration path.
+   */
+  readonly declarationProvenance?: ReservedV10InstalledModuleProcessProvenance;
   readonly moduleGenerationId: string;
   /** Directory of the exact FileCore state store owned by this runtime. */
   readonly coreStateDirectory: string;
@@ -160,11 +172,11 @@ export function deriveReservedV10InstalledLinuxModuleExecutionPlan(
 
 /**
  * Joins the resolver-minted plan and policy selection with one frozen local
- * runtime profile into the candidate provenance that a future process-record/2
- * factory must consume. The profile prevents structural runtime substitution;
- * it is not the still-missing durable Host runtime-binding authority. This
- * function creates no process record because the current Core-state schema and
- * startup recovery intentionally accept only their existing record boundary.
+ * runtime profile into candidate provenance consumed by the installed v10
+ * process-record/2 executor. The profile prevents structural runtime
+ * substitution; it is not the still-missing durable Host runtime-binding
+ * authority. This function creates no process record because it is the
+ * pre-process provenance handoff.
  */
 export function deriveReservedV10InstalledModuleProcessProvenance(
   installedModule: ReservedV10InstalledModulePlan,
@@ -356,12 +368,27 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     ],
     "processRecord",
   );
-  const resolvedModule = resolveInstalledExtensionModule({
-    instanceConfiguration: options.instanceConfiguration,
+  const resolvedModule = options.resolvedModule ?? resolveInstalledExtensionModule({
+    instanceConfiguration: options.instanceConfiguration as DollyInstanceConfig,
     moduleId: options.moduleId,
     installations: options.installations,
     configurations: options.configurations,
   });
+  const declarationProvenance = options.declarationProvenance;
+  if (declarationProvenance !== undefined) {
+    assertReservedV10InstalledModuleProcessProvenance(declarationProvenance);
+    const provenanceModule = declarationProvenance.installedModule;
+    if (
+      provenanceModule.instanceId !== resolvedModule.instanceId ||
+      provenanceModule.module.moduleId !== resolvedModule.module.moduleId ||
+      provenanceModule.installation.packageDigest !== resolvedModule.installation.packageDigest ||
+      provenanceModule.configuration.revision !== resolvedModule.module.configurationReference.revision
+    ) {
+      throw new TypeError(
+        "Installed Linux Extension declaration provenance does not match the resolved Module",
+      );
+    }
+  }
   assertLinuxModuleActivationPermission(options.activation);
   assertLinuxModuleRuntimeBinding(options.activation.runtime);
   const binding = options.activation.binding;
@@ -400,8 +427,21 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
   // the Host policy before any launcher exists so an untrusted package cannot
   // be started and rejected only after process creation.
   options.host.isolationPolicy.resolve("process", resolvedModule.installation.trust);
+  const processSchemaVersion =
+    declarationProvenance === undefined
+      ? "dolly.module-process-record/1" as const
+      : "dolly.module-process-record/2" as const;
+  const declaredExternalEffects =
+    declarationProvenance?.linuxExecution.declaredExternalEffects ??
+    INSTALLED_PROCESS_EFFECT_DECLARATION;
+  const durableDeclarationProvenance = declarationProvenance === undefined
+    ? undefined
+    : Object.freeze({
+        schemaVersion: "dolly.reserved-v10-module-process-provenance/1" as const,
+        provenanceDigest: declarationProvenance.provenanceDigest,
+      });
   const processRecord = Object.freeze({
-    schemaVersion: "dolly.module-process-record/1" as const,
+    schemaVersion: processSchemaVersion,
     instanceId: identity.instanceId,
     moduleId: identity.moduleId,
     moduleGenerationId: options.moduleGenerationId,
@@ -410,7 +450,10 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     configurationReference: Object.freeze({
       ...resolvedModule.module.configurationReference,
     }),
-    declaredExternalEffects: INSTALLED_PROCESS_EFFECT_DECLARATION,
+    declaredExternalEffects,
+    ...(durableDeclarationProvenance === undefined
+      ? {}
+      : { declarationProvenance: durableDeclarationProvenance }),
     serviceInvocationId: binding.serviceInvocationId,
     bootId: binding.bootId,
     moduleCgroupPath: derivedCgroupPath,
@@ -423,7 +466,7 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
   // The id-less twin a version 19 store allocates itself. It carries every
   // unrelated field, so one derivation feeds both identifier domains.
   const startingRecord = Object.freeze({
-    schemaVersion: "dolly.module-process-record/1" as const,
+    schemaVersion: processSchemaVersion,
     instanceId: identity.instanceId,
     moduleId: identity.moduleId,
     moduleGenerationId: options.moduleGenerationId,
@@ -431,7 +474,8 @@ export function deriveInstalledLinuxExtensionModuleExecutor(
     configurationReference: Object.freeze({
       ...resolvedModule.module.configurationReference,
     }),
-    declaredExternalEffects: INSTALLED_PROCESS_EFFECT_DECLARATION,
+    declaredExternalEffects,
+    ...(declarationProvenance === undefined ? {} : { declarationProvenance }),
     serviceInvocationId: binding.serviceInvocationId,
     bootId: binding.bootId,
     delegatedRootCgroupPath: binding.delegatedRootCgroupPath,
@@ -608,8 +652,8 @@ export function createInstalledLinuxExtensionModuleGenerationFactory(
     wallClockNow: wallClockNowOption,
     ...fixedOptions
   } = options;
-  const initiallyResolved = resolveInstalledExtensionModule({
-    instanceConfiguration: fixedOptions.instanceConfiguration,
+  const initiallyResolved = fixedOptions.resolvedModule ?? resolveInstalledExtensionModule({
+    instanceConfiguration: fixedOptions.instanceConfiguration as DollyInstanceConfig,
     moduleId: fixedOptions.moduleId,
     installations: fixedOptions.installations,
     configurations: fixedOptions.configurations,

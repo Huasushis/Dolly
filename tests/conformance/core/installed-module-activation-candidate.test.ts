@@ -27,6 +27,7 @@ import {
 import {
   assertInstalledModuleRuntimePremise,
   composeInstalledModuleRuntimePremise,
+  type InstalledModuleRuntimePremise,
 } from "../../../src/adapters/installed-module-runtime-premise.js";
 import {
   reservedV10InstalledPermissionPolicyDefinition,
@@ -34,8 +35,16 @@ import {
   ReservedV10InstalledPermissionPolicyRegistry,
   type InstalledModulePrivateStoragePolicy,
 } from "../../../src/adapters/installed-module-permission-policy.js";
+import {
+  createInstalledFileCoreStateStoreWithStoppedRecordWriter,
+  createInstalledReactiveModuleRuntime,
+  type InstalledReactiveModuleRuntimeOptions,
+} from "../../../src/adapters/installed-reactive-module-runtime.js";
+import type { FileCoreStateStoreWithStoppedRecordWriter } from "../../../src/core/file-core-state-store.js";
 import { ModuleConfigurationStore } from "../../../src/core/module-configuration-store.js";
 import { resolveReservedV10InstalledModulePlan } from "../../../src/core/installed-extension-module.js";
+import { ExtensionIsolationPolicy } from "../../../src/core/extension-process-host.js";
+import { FileModuleResultCommitRepository } from "../../../src/core/file-module-result-commit-repository.js";
 import {
   proveLinuxModuleActivation,
   consumeLinuxModuleActivationHandoff,
@@ -50,6 +59,10 @@ import {
   type StartupAuthorityPermission,
 } from "../../../src/core/startup-authority-premise.js";
 import { createDefaultDollyInstanceConfig } from "../../../src/core/runtime-config.js";
+import {
+  validateDollyInstanceConfigV10Draft,
+  type DollyInstanceConfigV10Draft,
+} from "../../../src/core/runtime-config-v10.js";
 import { reviewedLinuxModuleRuntimeIdentity } from "../../../src/linux-module-runtime-assets.js";
 import type * as LinuxCoreServiceBindingModule from "../../../src/core/linux-core-service-binding.js";
 import type * as LinuxModuleCgroupModule from "../../../src/core/linux-module-cgroup.js";
@@ -476,6 +489,82 @@ function options(fixtureValue: Fixture): InstalledModuleActivationCandidateOptio
 async function closeFixture(fixtureValue: Fixture): Promise<void> {
   fixtureValue.database.close();
   await fixtureValue.controller.release();
+}
+
+function currentV10Configuration(
+  fixtureValue: Fixture,
+): DollyInstanceConfigV10Draft {
+  const snapshot = fixtureValue.database.readCurrentConfig();
+  if (snapshot === null) throw new Error("fixture authority configuration is missing");
+  const canonicalConfig = snapshot.canonicalConfig as Record<string, JsonValue>;
+  return validateDollyInstanceConfigV10Draft(canonicalConfig.runtime_config);
+}
+function consumerOptions(
+  fixtureValue: Fixture,
+  configuration: DollyInstanceConfigV10Draft,
+  premise: InstalledModuleRuntimePremise,
+): {
+  readonly options: InstalledReactiveModuleRuntimeOptions;
+  readonly core: FileCoreStateStoreWithStoppedRecordWriter;
+} {
+  let blockId = 0;
+  let deliveryId = 0;
+  const stateParent = join(process.cwd(), ".tmp");
+  mkdirSync(stateParent, { recursive: true, mode: 0o700 });
+  const stateDirectory = mkdtempSync(join(stateParent, "installed-v10-consumer-"));
+  temporaryDirectories.push(stateDirectory);
+  const core = createInstalledFileCoreStateStoreWithStoppedRecordWriter({
+    path: join(stateDirectory, "runtime-core.json"),
+    maxFailedAttempts: 3,
+    nextBlockId: () => `runtime-block-${++blockId}`,
+    nextDeliveryId: (kind) => `runtime-${kind}-${++deliveryId}`,
+    now: () => "2026-08-24T00:00:00.000Z",
+  });
+  core.store.deliveries.createPage("input");
+  core.store.deliveries.createPage("output");
+  core.store.deliveries.registerConsumer("input", "worker", "from-now");
+  return {
+    core,
+    options: {
+      instanceConfiguration: configuration,
+      moduleId: "worker",
+      premise,
+      installations: fixtureValue.installations,
+      configurations: fixtureValue.configurations,
+      core: core.store,
+      stoppedRecordWriter: core.stoppedRecordWriter,
+      resultCommitRepository: new FileModuleResultCommitRepository({
+        path: join(fixtureValue.root, "runtime-commits.json"),
+      }),
+      mailboxes: [{
+        consumerId: "worker",
+        pageIds: ["input"],
+        maxResidentCount: 16,
+        maxResidentBytes: 64 * 1024,
+      }],
+      now: () => "2026-08-24T00:00:00.000Z",
+      initialModuleGenerationId: "module-generation-v10",
+      nextModuleGenerationId: () => "module-generation-v10-next",
+      monotonicNow: () => 0,
+      lifecycle: {
+        limits: {
+          memoryMaxBytes: 64 * 1024 * 1024,
+          maxProcesses: 16,
+          cpuQuotaMicros: 50_000,
+          cpuPeriodMicros: 100_000,
+        },
+        maxOpenFiles: 64,
+      },
+      host: {
+        isolationPolicy: new ExtensionIsolationPolicy(),
+        shutdownRequestTimeoutMs: 250,
+        forceKillDelayMs: 100,
+      },
+      channelCloseTimeoutMs: 500,
+      nextProcessGenerationId: () => "process-generation-v10",
+      classifyFailure: () => ({ code: "FIXTURE_FAILURE", retryable: false }),
+    },
+  };
 }
 
 beforeEach(() => setCompleteLiveProof());
@@ -943,6 +1032,129 @@ describe("post-H3 installed Module activation candidate", () => {
           [field]: true,
         } as never), field).toThrow(/unknown fields/u);
       }
+    } finally {
+      await closeFixture(current);
+    }
+  });
+  it("consumes the branded v10 premise into an unstarted runtime and executor", async () => {
+    const current = await fixture();
+    try {
+      const configuration = currentV10Configuration(current);
+      const candidate = composeInstalledModuleActivationCandidate(options(current));
+      const premise = composeInstalledModuleRuntimePremise({
+        candidate,
+        permissionPolicies: new ReservedV10InstalledPermissionPolicyRegistry({
+          policies: [],
+        }),
+        startupAuthorityPermission: current.permission,
+        database: current.database,
+        controller: current.controller,
+        origins: current.origins,
+      });
+      const prepared = consumerOptions(current, configuration, premise);
+      expect(() => createInstalledReactiveModuleRuntime({
+        ...prepared.options,
+        activation: current.handoff.activationPermission,
+      })).toThrow(/consumes activation from its premise/u);
+      const composed = createInstalledReactiveModuleRuntime(prepared.options);
+      expect(composed.resolvedModule.module.moduleId).toBe("worker");
+      expect(composed.resolvedModule.installation.packageDigest)
+        .toBe(current.serviceOrigin.component_digest);
+      const executor = composed.generations.createExecutor("module-generation-v10");
+      expect(typeof executor.start).toBe("function");
+      expect(typeof executor.terminate).toBe("function");
+      expect(prepared.core.store.listModuleProcessRecords()).toEqual([]);
+    } finally {
+      await closeFixture(current);
+    }
+  });
+
+  it("refuses a missing v10 premise without process or effect I/O", async () => {
+    const current = await fixture();
+    try {
+      const configuration = currentV10Configuration(current);
+      const candidate = composeInstalledModuleActivationCandidate(options(current));
+      const premise = composeInstalledModuleRuntimePremise({
+        candidate,
+        permissionPolicies: new ReservedV10InstalledPermissionPolicyRegistry({
+          policies: [],
+        }),
+        startupAuthorityPermission: current.permission,
+        database: current.database,
+        controller: current.controller,
+        origins: current.origins,
+      });
+      const prepared = consumerOptions(current, configuration, premise);
+      let effectStoreTouched = false;
+      const effectIntentStore = new Proxy({}, {
+        get() {
+          effectStoreTouched = true;
+          throw new Error("effect store must not be touched");
+        },
+      });
+      expect(() => createInstalledReactiveModuleRuntime({
+        ...prepared.options,
+        premise: undefined,
+        effectIntentStore,
+      } as never)).toThrow(/requires an InstalledModuleRuntimePremise/u);
+      expect(effectStoreTouched).toBe(false);
+      expect(prepared.core.store.listModuleProcessRecords()).toEqual([]);
+    } finally {
+      await closeFixture(current);
+    }
+  });
+
+  it("refuses a stale v10 configuration before Core composition", async () => {
+    const current = await fixture();
+    try {
+      const configuration = currentV10Configuration(current);
+      const candidate = composeInstalledModuleActivationCandidate(options(current));
+      const premise = composeInstalledModuleRuntimePremise({
+        candidate,
+        permissionPolicies: new ReservedV10InstalledPermissionPolicyRegistry({
+          policies: [],
+        }),
+        startupAuthorityPermission: current.permission,
+        database: current.database,
+        controller: current.controller,
+        origins: current.origins,
+      });
+      const prepared = consumerOptions(current, configuration, premise);
+      const staleConfiguration = validateDollyInstanceConfigV10Draft({
+        ...configuration,
+        displayName: "stale configuration",
+      });
+      expect(() => createInstalledReactiveModuleRuntime({
+        ...prepared.options,
+        instanceConfiguration: staleConfiguration,
+      })).toThrow(/stale/u);
+      expect(prepared.core.store.listModuleProcessRecords()).toEqual([]);
+    } finally {
+      await closeFixture(current);
+    }
+  });
+
+  it("refuses a copied v10 premise before any process or effect path", async () => {
+    const current = await fixture();
+    try {
+      const configuration = currentV10Configuration(current);
+      const candidate = composeInstalledModuleActivationCandidate(options(current));
+      const premise = composeInstalledModuleRuntimePremise({
+        candidate,
+        permissionPolicies: new ReservedV10InstalledPermissionPolicyRegistry({
+          policies: [],
+        }),
+        startupAuthorityPermission: current.permission,
+        database: current.database,
+        controller: current.controller,
+        origins: current.origins,
+      });
+      const prepared = consumerOptions(current, configuration, premise);
+      expect(() => createInstalledReactiveModuleRuntime({
+        ...prepared.options,
+        premise: JSON.parse(JSON.stringify(premise)),
+      } as never)).toThrow(/not minted|provenance/u);
+      expect(prepared.core.store.listModuleProcessRecords()).toEqual([]);
     } finally {
       await closeFixture(current);
     }

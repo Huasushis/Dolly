@@ -23,6 +23,7 @@ import {
   resolveInstalledContentSchemaRegistrationSet,
   resolveInstalledExtensionModule,
   type InstalledExtensionModule,
+  type ReservedV10InstalledModulePlan,
 } from "../core/installed-extension-module.js";
 import type { ModuleActorEvent } from "../core/module-actor.js";
 import type {
@@ -30,7 +31,10 @@ import type {
   SchedulerEvent,
 } from "../core/module-scheduler.js";
 import type { ModuleConfigurationStore } from "../core/module-configuration-store.js";
-import type { ModuleProcessStoppedRecordWriter } from "../core/module-process-records.js";
+import type {
+  DeclaredExternalEffects,
+  ModuleProcessStoppedRecordWriter,
+} from "../core/module-process-records.js";
 import { createFileCoreActiveRunModelMediaResolver } from "../core/media-capability/index.js";
 import type { ModelMediaResolver } from "../core/model-provider-broker.js";
 import { createModuleResultCommitCoordinator } from "../core/module-result-commit-factory.js";
@@ -57,19 +61,29 @@ import {
   type SourceActivationSchedulerBinding,
   type SourceActivationSubmission,
 } from "../core/source-activation-queue.js";
-import type { DollyInstanceConfig } from "../core/runtime-config.js";
-import { createExtensionEffectJournalLifecycle } from "./extension-effect-run-lifecycle.js";
+import type {
+  DollyInstanceConfig,
+  DollyModuleConfig,
+} from "../core/runtime-config.js";
+import type { DollyInstanceConfigV10Draft } from "../core/runtime-config-v10.js";
 import {
+  assertInstalledModuleRuntimePremise,
+  type InstalledModuleRuntimePremise,
+} from "./installed-module-runtime-premise.js";
+import {
+  assertReservedV10InstalledModuleProcessProvenance,
   createInstalledLinuxExtensionModuleGenerationFactory,
   createInstalledModuleProcessDeclarationProvenanceAuthority,
   INSTALLED_PROCESS_EFFECT_DECLARATION,
   type InstalledLinuxExtensionModuleGenerationFactory,
   type InstalledLinuxExtensionModuleGenerationFactoryOptions,
+  type ReservedV10InstalledModuleProcessProvenance,
 } from "./installed-linux-extension-module-executor.js";
 import {
   InstalledModulePermissionPolicyRegistry,
   type InstalledModulePermissionPolicySetup,
 } from "./installed-module-permission-policy.js";
+import { createExtensionEffectJournalLifecycle } from "./extension-effect-run-lifecycle.js";
 
 type InstalledRuntimeLifecycleOptions = Omit<
   InstalledLinuxExtensionModuleGenerationFactoryOptions["lifecycle"],
@@ -85,9 +99,11 @@ type InstalledRuntimeHostOptions = Omit<
 
 export interface InstalledReactiveModuleRuntimeOptions extends Omit<
   InstalledLinuxExtensionModuleGenerationFactoryOptions,
+  | "activation"
   | "cancellationGraceMs"
   | "configurations"
   | "coreStateDirectory"
+  | "declarationProvenance"
   | "executionTimeoutMs"
   | "host"
   | "installations"
@@ -95,12 +111,21 @@ export interface InstalledReactiveModuleRuntimeOptions extends Omit<
   | "lifecycle"
   | "moduleId"
   | "permissionPolicySetup"
+  | "resolvedModule"
   | "terminationTimeoutMs"
   | "wallClockNow"
 > {
-  readonly instanceConfiguration: DollyInstanceConfig;
+  /** v9 stays on the legacy resolver; v10 requires `premise`. */
+  readonly instanceConfiguration: DollyInstanceConfig | DollyInstanceConfigV10Draft;
   readonly moduleId: string;
   readonly installations: ExtensionInstallationRegistry;
+  /**
+   * Legacy v9 callers supply activation directly. A v10 caller MUST omit it:
+   * the Host permission is consumed from the branded runtime premise.
+   */
+  readonly activation?: LinuxModuleActivationPermission;
+  /** Exact v10 candidate/premise handoff; absent only for v9. */
+  readonly premise?: InstalledModuleRuntimePremise;
   readonly configurations: ModuleConfigurationStore;
   /** The same Core store owns Deliveries, submissions, process records, and result effects. */
   readonly core: FileCoreStateStore;
@@ -161,6 +186,199 @@ export function createInstalledFileCoreStateStoreWithStoppedRecordWriter(
       createInstalledModuleProcessDeclarationProvenanceAuthority(store),
   });
 }
+function projectReservedV10Module(
+  plan: ReservedV10InstalledModulePlan,
+): InstalledExtensionModule {
+  const module = plan.module;
+  const inputConnections = module.inputConnections;
+  const firstStart = inputConnections[0]?.start;
+  const subscriptionStart = firstStart === "from-head" ? "from-head" : "from-now";
+  const projectedModule = Object.freeze({
+    moduleId: module.moduleId,
+    extensionId: module.extensionId,
+    packageVersion: module.packageVersion,
+    moduleKind: module.moduleKind,
+    isolation: "process" as const,
+    configurationReference: Object.freeze({ ...module.configurationReference }),
+    permissionPolicyIds: Object.freeze(
+      module.permissionPolicyReferences.map((reference) => reference.policyId),
+    ),
+    inputPageIds: Object.freeze(inputConnections.map((connection) => connection.pageId)),
+    outputPageIds: Object.freeze([...module.outputPageIds]),
+    subscriptionStart,
+    activation: module.activation,
+    limits: Object.freeze({
+      claim: Object.freeze({
+        maxCount: module.limits.claim.maxCount,
+        maxBytes: module.limits.claim.maxBytes,
+      }),
+      maxInputBytes: module.limits.maxInputBytes,
+      maxResultBytes: module.limits.maxResultBytes,
+      maxFrameBytes: module.limits.maxFrameBytes,
+      maxRunsPerGeneration: module.limits.maxRunsPerGeneration,
+      maxGenerations: module.limits.maxGenerations,
+    }),
+    timeouts: Object.freeze({ ...module.timeouts }),
+  } satisfies DollyModuleConfig);
+  return Object.freeze({
+    instanceId: plan.instanceId,
+    module: projectedModule,
+    installation: plan.installation,
+    packageModule: plan.packageModule,
+    configuration: plan.configuration,
+  });
+}
+
+function assertReservedV10PremiseForRuntime(
+  options: InstalledReactiveModuleRuntimeOptions,
+): {
+  readonly plan: ReservedV10InstalledModulePlan;
+  readonly processProvenance: ReservedV10InstalledModuleProcessProvenance;
+  readonly configuration: DollyInstanceConfigV10Draft;
+} {
+  if (options.premise === undefined) {
+    throw new TypeError(
+      "Reserved version-10 installed Module runtime requires an InstalledModuleRuntimePremise",
+    );
+  }
+  assertInstalledModuleRuntimePremise(options.premise);
+  const configuration = options.instanceConfiguration;
+  if (configuration.schemaVersion !== "dolly.instance/10") {
+    throw new TypeError(
+      "Installed Module runtime premise requires a reserved version-10 configuration",
+    );
+  }
+  const premiseModule = options.premise.modules.find(
+    (candidate) => candidate.moduleId === options.moduleId,
+  );
+  if (premiseModule === undefined) {
+    throw new TypeError(
+      `Installed Module runtime premise has no Module ${options.moduleId}`,
+    );
+  }
+  const candidateModule = options.premise.candidate.modules.find(
+    (candidate) => candidate.moduleId === options.moduleId,
+  );
+  if (
+    candidateModule === undefined ||
+    candidateModule.installedModule !== premiseModule.processProvenance.installedModule ||
+    candidateModule.packageOrigin !== premiseModule.packageOrigin
+  ) {
+    throw new TypeError(
+      `Installed Module runtime premise Module ${options.moduleId} is not bound to its activation candidate`,
+    );
+  }
+  const processProvenance = premiseModule.processProvenance;
+  assertReservedV10InstalledModuleProcessProvenance(processProvenance);
+  const plan = processProvenance.installedModule;
+  if (
+    processProvenance.linuxExecution.resolvedModule !== plan ||
+    processProvenance.permissionPolicies !== premiseModule.permissionPolicies ||
+    processProvenance.snapshot === undefined ||
+    canonicalJsonDigest(processProvenance.snapshot) !== processProvenance.provenanceDigest
+  ) {
+    throw new TypeError(
+      `Installed Module runtime premise Module ${options.moduleId} has mismatched process provenance`,
+    );
+  }
+  const configuredModule = configuration.modules.find(
+    (candidate) => candidate.moduleId === options.moduleId,
+  );
+  if (
+    configuredModule === undefined ||
+    plan.instanceId !== configuration.instanceId ||
+    plan.instanceConfigurationDigest !== canonicalJsonDigest(configuration) ||
+    canonicalJsonDigest(configuredModule) !== canonicalJsonDigest(plan.module)
+  ) {
+    throw new TypeError(
+      `Installed Module runtime premise Module ${options.moduleId} is stale for the supplied version-10 configuration`,
+    );
+  }
+  const installation = options.installations.resolve({
+    extensionId: plan.module.extensionId,
+    packageVersion: plan.module.packageVersion,
+  });
+  if (
+    installation.packageDigest !== plan.installation.packageDigest ||
+    canonicalJsonDigest(installation.manifest) !== canonicalJsonDigest(plan.installation.manifest)
+  ) {
+    throw new TypeError(
+      `Installed Module runtime premise Module ${options.moduleId} is stale for the installed package`,
+    );
+  }
+  const configurationRecord = options.configurations.resolve({
+    configId: plan.module.configurationReference.configId,
+    revision: plan.module.configurationReference.revision,
+    extensionId: plan.module.extensionId,
+    moduleKind: plan.module.moduleKind,
+    configVersion: plan.module.configurationReference.configVersion,
+    schema: plan.packageModule.configurationSchema,
+  });
+  if (
+    configurationRecord.revision !== plan.configuration.revision ||
+    configurationRecord.configurationDigest !== plan.configuration.configurationDigest
+  ) {
+    throw new TypeError(
+      `Installed Module runtime premise Module ${options.moduleId} is stale for its configuration record`,
+    );
+  }
+  const selectionSnapshot = premiseModule.permissionPolicies.snapshot;
+  const selectedPolicies =
+    selectionSnapshot !== null &&
+    typeof selectionSnapshot === "object" &&
+    !Array.isArray(selectionSnapshot) &&
+    Array.isArray(Reflect.get(selectionSnapshot, "policies"))
+      ? Reflect.get(selectionSnapshot, "policies") as readonly {
+          readonly policyId: string;
+          readonly revision: string;
+        }[]
+      : undefined;
+  if (
+    selectedPolicies === undefined ||
+    selectedPolicies.length !== plan.module.permissionPolicyReferences.length ||
+    selectedPolicies.some((selected, index) => {
+      const reference = plan.module.permissionPolicyReferences[index];
+      return (
+        reference === undefined ||
+        selected.policyId !== reference.policyId ||
+        selected.revision !== reference.revision
+      );
+    }) ||
+    premiseModule.permissionBindings.length !== selectedPolicies.length
+  ) {
+    throw new TypeError(
+      `Installed Module runtime premise Module ${options.moduleId} has mismatched policy provenance`,
+    );
+  }
+  if (selectedPolicies.length !== 0) {
+    throw new TypeError(
+      "Reserved version-10 installed Module capability Host setup is not connected to the TypeScript runtime",
+    );
+  }
+  return { plan, processProvenance, configuration };
+}
+
+function createInstalledReactiveModuleRuntimeFromPremise(
+  options: InstalledReactiveModuleRuntimeOptions,
+): InstalledReactiveModuleRuntime {
+  const { plan, processProvenance, configuration } =
+    assertReservedV10PremiseForRuntime(options);
+  const {
+    activation: _callerActivation,
+    permissionPolicies: _callerPolicies,
+    premise: _premise,
+    ...runtimeOptions
+  } = options;
+  return createInstalledReactiveModuleRuntimeInternal({
+    ...runtimeOptions,
+    instanceConfiguration: configuration,
+    moduleId: plan.module.moduleId,
+    activation: options.premise!.candidate.activationPermission,
+    resolvedModule: projectReservedV10Module(plan),
+    declarationProvenance: processProvenance,
+    declaredExternalEffects: plan.module.declaredExternalEffects,
+  });
+}
 
 /**
  * Constructs one unstarted reactive runtime from one installation, one
@@ -171,16 +389,52 @@ export function createInstalledFileCoreStateStoreWithStoppedRecordWriter(
 export function createInstalledReactiveModuleRuntime(
   options: InstalledReactiveModuleRuntimeOptions,
 ): InstalledReactiveModuleRuntime {
-  return createInstalledReactiveModuleRuntimeInternal(options);
+  if (options.instanceConfiguration.schemaVersion === "dolly.instance/10") {
+    if (options.premise === undefined) {
+      throw new TypeError(
+        "Reserved version-10 installed Module runtime requires an InstalledModuleRuntimePremise",
+      );
+    }
+    if (options.activation !== undefined) {
+      throw new TypeError(
+        "Reserved version-10 installed Module runtime consumes activation from its premise",
+      );
+    }
+    if (options.permissionPolicies !== undefined) {
+      throw new TypeError(
+        "Reserved version-10 installed Module runtime consumes policy selection from its premise",
+      );
+    }
+    return createInstalledReactiveModuleRuntimeFromPremise(options);
+  }
+  if (options.premise !== undefined) {
+    throw new TypeError(
+      "Installed Module runtime premises require a reserved version-10 configuration",
+    );
+  }
+  if (options.activation === undefined) {
+    throw new TypeError("Installed Module runtime requires Host activation permission");
+  }
+  return createInstalledReactiveModuleRuntimeInternal({
+    ...options,
+    activation: options.activation,
+  });
 }
 
+type InstalledRuntimeInternalOptions = InstalledReactiveModuleRuntimeOptions & {
+  readonly activation: LinuxModuleActivationPermission;
+  readonly initialDeferredCommit?: DeferredModuleResultCommit;
+  readonly resolvedModule?: InstalledExtensionModule;
+  readonly declarationProvenance?: ReservedV10InstalledModuleProcessProvenance;
+  readonly declaredExternalEffects?: DeclaredExternalEffects;
+};
+
 function createInstalledReactiveModuleRuntimeInternal(
-  options: InstalledReactiveModuleRuntimeOptions & {
-    readonly initialDeferredCommit?: DeferredModuleResultCommit;
-  },
+  options: InstalledRuntimeInternalOptions,
 ): InstalledReactiveModuleRuntime {
   if (
-    Object.hasOwn(options, "declaredExternalEffects") ||
+    (Object.hasOwn(options, "declaredExternalEffects") &&
+      options.declarationProvenance === undefined) ||
     Object.hasOwn(options, "externalEffectEvidence")
   ) {
     throw new TypeError(
@@ -208,13 +462,29 @@ function createInstalledReactiveModuleRuntimeInternal(
       "Installed Module runtime stopped-record writer is not bound to its FileCoreStateStore",
     );
   }
-  const resolvedModule = resolveInstalledExtensionModule({
-    instanceConfiguration: options.instanceConfiguration,
+  const resolvedModule = options.resolvedModule ?? resolveInstalledExtensionModule({
+    instanceConfiguration: options.instanceConfiguration as DollyInstanceConfig,
     moduleId: options.moduleId,
     installations: options.installations,
     configurations: options.configurations,
   });
   const module = resolvedModule.module;
+  if (options.declarationProvenance !== undefined) {
+    assertReservedV10InstalledModuleProcessProvenance(options.declarationProvenance);
+    const provenanceModule = options.declarationProvenance.installedModule;
+    if (
+      provenanceModule.instanceId !== resolvedModule.instanceId ||
+      provenanceModule.module.moduleId !== module.moduleId ||
+      provenanceModule.installation.packageDigest !== resolvedModule.installation.packageDigest ||
+      provenanceModule.configuration.revision !== module.configurationReference.revision ||
+      options.declaredExternalEffects !==
+        options.declarationProvenance.linuxExecution.declaredExternalEffects
+    ) {
+      throw new TypeError(
+        "Installed Module runtime process provenance does not match its resolved Module",
+      );
+    }
+  }
   if (
     module.activation.kind === "source" &&
     module.activation.trigger === "periodic"
@@ -256,6 +526,8 @@ function createInstalledReactiveModuleRuntimeInternal(
         options.core.getModuleSubmissionRecord(runId),
     });
   }
+  const expectedExternalEffects =
+    options.declaredExternalEffects ?? INSTALLED_PROCESS_EFFECT_DECLARATION;
   if (options.initialDeferredCommit !== undefined) {
     const record = options.initialDeferredCommit.record;
     const submission = options.core.getModuleSubmissionRecord(record.runId);
@@ -274,8 +546,7 @@ function createInstalledReactiveModuleRuntimeInternal(
       processRecord.configurationReference.configId !== reference.configId ||
       processRecord.configurationReference.revision !== reference.revision ||
       processRecord.configurationReference.configVersion !== reference.configVersion ||
-      processRecord.declaredExternalEffects !==
-        INSTALLED_PROCESS_EFFECT_DECLARATION
+      processRecord.declaredExternalEffects !== expectedExternalEffects
     ) {
       throw new TypeError(
         "Deferred Module result does not match its stopped installed process, package, configuration, and effect declaration",
@@ -344,6 +615,12 @@ function createInstalledReactiveModuleRuntimeInternal(
     });
   }
   generations = createInstalledLinuxExtensionModuleGenerationFactory({
+    ...(options.resolvedModule === undefined
+      ? {}
+      : { resolvedModule: options.resolvedModule }),
+    ...(options.declarationProvenance === undefined
+      ? {}
+      : { declarationProvenance: options.declarationProvenance }),
     instanceConfiguration: options.instanceConfiguration,
     moduleId: options.moduleId,
     installations: options.installations,
@@ -428,12 +705,13 @@ function createInstalledReactiveModuleRuntimeInternal(
     getModuleSubmissionRecord: (runId) =>
       options.core.getModuleSubmissionRecord(runId),
     commits,
+    declaredExternalEffects:
+      options.declaredExternalEffects ?? INSTALLED_PROCESS_EFFECT_DECLARATION,
     ...(options.initialDeferredCommit === undefined
       ? {}
       : { initialDeferredCommit: options.initialDeferredCommit }),
     nextModuleGenerationId: options.nextModuleGenerationId,
     monotonicNow: options.monotonicNow,
-    declaredExternalEffects: INSTALLED_PROCESS_EFFECT_DECLARATION,
     createExecutor: generations.createExecutor,
     classifyFailure: options.classifyFailure,
     ...(options.onActorEvent === undefined
