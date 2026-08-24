@@ -196,7 +196,9 @@ const MODULE: &str = "module-a";
 const EPOCH: &str = "01jh8w2etc4x70xj26rg8fsdv92";
 
 fn package_digest() -> Sha256Digest {
-    digest(0x11)
+    format!("sha256:{}", "11".repeat(32))
+        .parse()
+        .expect("valid package digest")
 }
 fn policy_digest() -> Sha256Digest {
     digest(0x22)

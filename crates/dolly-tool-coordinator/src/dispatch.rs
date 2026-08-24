@@ -17,11 +17,12 @@ use std::process::Child;
 use std::time::Instant;
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
+use dolly_storage::effect_journal::EffectJournalIntentAuthority;
+#[cfg(feature = "test-support")]
+use dolly_storage::mcp_readiness::test_prove_current_mcp_transport_readiness;
 use dolly_storage::mcp_readiness::{
     McpReadinessError, McpTransportReadiness, prove_current_mcp_transport_readiness,
 };
-#[cfg(feature = "test-support")]
-use dolly_storage::mcp_readiness::test_prove_current_mcp_transport_readiness;
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::{
     ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
@@ -321,13 +322,14 @@ pub(crate) fn dispatch_operation(
 }
 /// Authoritative dispatch entry point. The storage producer must first issue
 /// `ToolDispatchAuthority`; a binding mismatch is rejected before the existing
-/// compare-and-set or any send permit can be reached.
 pub fn dispatch_operation_authorized(
     db: &mut Database,
+    journal_authority: &EffectJournalIntentAuthority,
     authority: &ToolDispatchAuthority,
     runtime_binding: &RuntimeBinding,
     process_generation: &ProcessGeneration,
     readiness: &McpTransportReadiness,
+    package_digest: &Sha256Digest,
     row: &ToolCallLedgerRecord,
     facts: &RecoveryFacts,
     service: &ToolDispatchService,
@@ -353,6 +355,17 @@ pub fn dispatch_operation_authorized(
         &row.operation_binding.tool_server_id,
         row.operation_binding.tool_server_generation,
     )?;
+    if let Err(error) = journal_authority.verify_for_dispatch(
+        db.connection(),
+        &row,
+        runtime_binding,
+        process_generation,
+        package_digest,
+        &invocation.request_bytes,
+    ) {
+        invocation.host_handle.terminate();
+        return Err(DispatchError::Storage(error));
+    }
     let outcome = dispatch_operation(db, &row, facts)?;
     let DispatchOutcome::Dispatched {
         record: _,
@@ -402,10 +415,12 @@ pub fn dispatch_operation_authorized(
 /// the same MCP session and Host process.
 pub fn dispatch_operation_authorized_reusable(
     db: &mut Database,
+    journal_authority: &EffectJournalIntentAuthority,
     authority: &ToolDispatchAuthority,
     runtime_binding: &RuntimeBinding,
     process_generation: &ProcessGeneration,
     readiness: &McpTransportReadiness,
+    package_digest: &Sha256Digest,
     row: &ToolCallLedgerRecord,
     facts: &RecoveryFacts,
     service: &ToolDispatchService,
@@ -425,6 +440,17 @@ pub fn dispatch_operation_authorized_reusable(
         &row.operation_binding.tool_server_id,
         row.operation_binding.tool_server_generation,
     )?;
+    if let Err(error) = journal_authority.verify_for_dispatch(
+        db.connection(),
+        &row,
+        runtime_binding,
+        process_generation,
+        package_digest,
+        &invocation.request_bytes,
+    ) {
+        invocation.host_handle.terminate();
+        return Err(DispatchError::Storage(error));
+    }
     let outcome = dispatch_operation(db, &row, facts)?;
     let DispatchOutcome::Dispatched {
         record: _,

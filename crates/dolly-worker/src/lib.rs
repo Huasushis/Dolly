@@ -9,33 +9,32 @@ use dolly_canonical_json::{
 use dolly_core_domain::ExtensionId;
 use dolly_storage::Database;
 use dolly_storage::effect_journal::{
-    EffectJournalInsertDisposition, create_effect_journal_schema, insert_intent,
-    settle_pending_effect_journal,
+    EffectJournalInsertDisposition, EffectJournalIntentAuthority, gate_schema_version,
+    insert_intent, settle_pending_effect_journal,
 };
 use dolly_storage::host_authority::load_current_authority;
+#[cfg(feature = "test-support")]
+use dolly_storage::linux_host_verification::VerifiedLinuxHostProof;
 use dolly_storage::mcp_readiness::{MCP_PROTOCOL_VERSION_2025_06_18, McpTransportReadiness};
+#[cfg(feature = "test-support")]
+use dolly_storage::runtime_binding::mint_runtime_binding;
 use dolly_storage::runtime_binding::{
     ProcessGeneration, RuntimeBinding, RuntimeBindingError, invalidate_runtime_binding,
     mint_current_runtime_binding,
 };
-#[cfg(feature = "test-support")]
-use dolly_storage::linux_host_verification::VerifiedLinuxHostProof;
-#[cfg(feature = "test-support")]
-use dolly_storage::runtime_binding::mint_runtime_binding;
 use dolly_storage::tool_broker_authority::{
     ToolDispatchAuthority, ToolRegistryRevision, authorize_tool_dispatch, publish_tool_registry,
 };
-use dolly_storage::tool_ledger::create_tool_ledger_schema;
-use dolly_tool_broker::{AdmissionOutcome, LedgerState, RecoveryFacts, ToolCallLedgerRecord};
+use dolly_storage::tool_ledger::{create_tool_ledger_schema, load_exact};
 use dolly_tool_broker::effect_journal::{
     Claim, ClaimRecordSchemaTag, EffectClass, EffectJournalRecordSchemaTag, EffectJournalState,
     ExternalEffectJournalRecord, derive_claim_token,
 };
+use dolly_tool_broker::{AdmissionOutcome, LedgerState, RecoveryFacts, ToolCallLedgerRecord};
 use dolly_tool_coordinator::{
-    DispatchError, DispatchLimits, DispatchOutcome,
-    HostMcpStdioInstalledChildAttestation, HostMcpStdioInvocation, HostMcpStdioProcessHandle,
-    StdioTransportError, StdioTransportLimits, ToolDispatchService,
-    dispatch_operation_authorized_reusable,
+    DispatchError, DispatchLimits, DispatchOutcome, HostMcpStdioInstalledChildAttestation,
+    HostMcpStdioInvocation, HostMcpStdioProcessHandle, StdioTransportError, StdioTransportLimits,
+    ToolDispatchService, dispatch_operation_authorized_reusable,
 };
 use thiserror::Error;
 
@@ -153,13 +152,14 @@ impl Worker {
         )?;
         create_tool_ledger_schema(database.connection())
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
-        // The Worker is the sole owner of the effect journal: it creates the
-        // schema and runs the deterministic reopen recovery seam. Any pending
-        // `INTENDED` intent from a previous incarnation is settled only from
-        // identity-matched authoritative ledger evidence (or `UNKNOWN_OUTCOME`);
-        // nothing is ever re-dispatched (a new attempt requires a new Claim).
-        create_effect_journal_schema(database.connection())
+        // The journal schema is installed only by the controller-owned
+        // fresh/offline initialization transaction. Ordinary Worker reopen
+        // gates the exact physical schema and version; it never repairs it.
+        gate_schema_version(database.connection())
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
+        // Any pending `INTENDED` intent from a previous incarnation is
+        // settled only from identity-matched authoritative ledger evidence
+        // (or the private ambiguity path); nothing is re-dispatched.
         settle_pending_effect_journal(&mut database)
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
 
@@ -361,7 +361,6 @@ impl Worker {
 
     /// Route sequential tools/call rows through the one initialized session.
     /// The retained child is stopped only after explicit stop, terminal
-    /// recovery, or a transport/process failure.
     pub fn dispatch_tools_call(
         &mut self,
         row: &ToolCallLedgerRecord,
@@ -371,30 +370,58 @@ impl Worker {
         if self.stopped {
             return Err(WorkerError::Stopped);
         }
+        let authoritative = load_exact(
+            self.database.connection(),
+            &row.operation_binding.module_id,
+            &row.operation_binding.operation_id,
+        )
+        .map_err(|error| WorkerError::Storage(error.to_string()))?
+        .ok_or_else(|| WorkerError::Premise("authoritative Tool-call row is absent".into()))?;
+        let outbound_digest = row
+            .operation_binding
+            .recompute_outbound_digest()
+            .ok_or_else(|| WorkerError::Premise("frozen outbound payload is invalid".into()))?;
+        if authoritative != *row
+            || row.state != LedgerState::Authorized
+            || row.verify_field_combination().is_err()
+            || row.operation_digest != row.operation_binding.operation_digest()
+            || Sha256Digest::compute(request_bytes) != outbound_digest
+        {
+            return Err(WorkerError::Premise(
+                "dispatch row or exact outbound bytes are not authoritative".into(),
+            ));
+        }
         // Durable Claim-bound intent BEFORE any child I/O: the intent is
         // durably recorded, then the child is touched. A persistence failure
-        // or an identity collision (the same Claim already recorded) fails the
-        // dispatch closed; nothing dispatches on a missing or replayed intent.
-        // A settled row never reaches this seam (new attempt requires a new
-        // Claim, so an already-settled row cannot be re-dispatched).
+        // or an identity collision (the same Claim already recorded) fails
+        // closed; nothing dispatches on a missing or replayed intent.
         let intent = self.mint_intent_record(row, request_bytes)?;
-        match insert_intent(self.database.connection_mut(), &intent) {
-            Ok(EffectJournalInsertDisposition::Inserted { .. }) => {}
+        let journal_authority: EffectJournalIntentAuthority = match insert_intent(
+            self.database.connection_mut(),
+            &intent,
+        ) {
+            Ok(EffectJournalInsertDisposition::Inserted { authority, .. }) => authority,
             Ok(EffectJournalInsertDisposition::Replayed { .. }) => {
                 return Err(WorkerError::Premise(
-                    "durable intent already recorded for this Claim; refusing a re-dispatch — a new attempt requires a new Claim".into(),
-                ));
+                        "durable intent already recorded for this Claim; refusing a re-dispatch — a new attempt requires a new Claim".into(),
+                    ));
             }
             Err(error) => return Err(WorkerError::Storage(error.to_string())),
+        };
+        #[cfg(feature = "test-support")]
+        if std::env::var_os("DOLLY_WORKER_TEST_CRASH_AFTER_INTENT").is_some() {
+            std::process::abort();
         }
         let invocation = self.invocation.as_mut().ok_or(WorkerError::Stopped)?;
         invocation.set_request_bytes(request_bytes.to_vec());
         let outcome = dispatch_operation_authorized_reusable(
             &mut self.database,
+            &journal_authority,
             &self.dispatch_authority,
             &self.runtime_binding,
             &self.process_generation,
             &self.readiness,
+            &self.package_digest,
             row,
             facts,
             &self.service,

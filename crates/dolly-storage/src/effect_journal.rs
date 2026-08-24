@@ -27,15 +27,16 @@
 //! same limits.
 
 use dolly_canonical_json::{ParseLimits, Sha256Digest, deserialize_core_json};
-use dolly_tool_broker::ToolCallLedgerRecord;
 use dolly_tool_broker::effect_journal::{
     Claim, EFFECT_JOURNAL_RECORD_SCHEMA, EffectClass, EffectJournalState, EffectSettlement,
     ExternalEffectJournalRecord, recover_effect_journal,
 };
-use rusqlite::{Row, Transaction};
+use dolly_tool_broker::{LedgerState, ToolCallLedgerRecord};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 
 use crate::database::{Database, map_sqlite_error};
 use crate::error::{StorageError, StorageResult};
+use crate::runtime_binding::{ProcessGeneration, RuntimeBinding};
 
 /// The logical table this slice writes.
 pub const EFFECT_JOURNAL_TABLE: &str = "external_effect_journal";
@@ -50,15 +51,17 @@ pub const MAX_EFFECT_JOURNAL_ROWS: u64 = 4096;
 pub const MAX_EFFECT_JOURNAL_JCS_BYTES: usize = 64 * 1024;
 
 /// The authoritative external-effect journal schema: the meta singleton, the
-/// journal table, and the recovery index. Autonomic (`IF NOT EXISTS`).
+/// journal table, and the recovery index. This SQL is used only by the
+/// controller-owned offline initialization transaction; ordinary opens never
+/// execute it.
 pub const EFFECT_JOURNAL_SCHEMA_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS external_effect_journal_meta (
+CREATE TABLE external_effect_journal_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL CHECK (schema_version = 1),
     schema_discriminator TEXT NOT NULL
         CHECK (schema_discriminator = 'dolly.external-effect-journal/v1')
 );
-CREATE TABLE IF NOT EXISTS external_effect_journal (
+CREATE TABLE external_effect_journal (
     instance_id TEXT NOT NULL,
     module_id TEXT NOT NULL,
     operation_id TEXT NOT NULL,
@@ -96,58 +99,254 @@ CREATE TABLE IF NOT EXISTS external_effect_journal (
 /// Deterministic recovery-order index over journal rows (parallel to the
 /// Tool-call ledger recovery index).
 pub const EFFECT_JOURNAL_RECOVERY_INDEX_SQL: &str = r#"
-CREATE INDEX IF NOT EXISTS effect_journal_recovery
+CREATE INDEX effect_journal_recovery
     ON external_effect_journal(state, instance_id, module_id, operation_id, claim_token);
 "#;
 
-/// Create the authoritative effect-journal schema (meta singleton, journal
-/// table, recovery index). Idempotent (`IF NOT EXISTS`).
-pub fn create_effect_journal_schema(connection: &rusqlite::Connection) -> StorageResult<()> {
-    connection
+/// Install the journal schema only inside the controller-owned fresh/offline
+/// initialization transaction. The SQL intentionally has no `IF NOT EXISTS`
+/// or repair operation.
+pub(crate) fn initialize_effect_journal_schema(transaction: &Transaction<'_>) -> StorageResult<()> {
+    let has_effect_objects: i64 = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type IN ('table', 'index')
+                  AND name IN (
+                    'external_effect_journal_meta',
+                    'external_effect_journal',
+                    'effect_journal_recovery'
+                  )
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite_error)?;
+    if has_effect_objects != 0 {
+        // An explicit migration may encounter an already-installed journal.
+        // Validate its exact shape/version; never recreate or repair any
+        // partial or corrupt object set.
+        return gate_schema_version(transaction);
+    }
+    transaction
         .execute_batch(EFFECT_JOURNAL_SCHEMA_SQL)
         .map_err(map_sqlite_error)?;
-    connection
+    transaction
         .execute_batch(EFFECT_JOURNAL_RECOVERY_INDEX_SQL)
         .map_err(map_sqlite_error)?;
-    connection
+    transaction
         .execute(
-            "INSERT OR IGNORE INTO external_effect_journal_meta
+            "INSERT INTO external_effect_journal_meta
                 (singleton, schema_version, schema_discriminator)
              VALUES (1, 1, 'dolly.external-effect-journal/v1')",
             [],
         )
-        .map_err(map_sqlite_error)?;
-    gate_schema_version(connection)
+        .map(|_| ())
+        .map_err(map_sqlite_error)
 }
 
-/// Fail-closed schema-version gate every writer/reader must pass. A missing
-/// meta singleton, a wrong schema version, or a wrong discriminator is a
-/// version-mismatched premise: `STORAGE_MIGRATION_REQUIRED`. A missing
-/// journal table is `STORAGE_CORRUPT`.
-pub fn gate_schema_version(connection: &rusqlite::Connection) -> StorageResult<()> {
-    let mut stmt = connection
-        .prepare(
+/// Fail-closed schema-version and physical-shape gate every journal
+/// reader/writer must pass. Ordinary opens never create or repair a missing
+/// table, index, metadata row, or metadata value.
+pub fn gate_schema_version(connection: &Connection) -> StorageResult<()> {
+    verify_table_shape(
+        connection,
+        "external_effect_journal_meta",
+        &[
+            ("singleton", "INTEGER", 0, 1),
+            ("schema_version", "INTEGER", 1, 0),
+            ("schema_discriminator", "TEXT", 1, 0),
+        ],
+        StorageError::MigrationRequired,
+    )?;
+    verify_table_shape(
+        connection,
+        EFFECT_JOURNAL_TABLE,
+        &[
+            ("instance_id", "TEXT", 1, 1),
+            ("module_id", "TEXT", 1, 2),
+            ("operation_id", "TEXT", 1, 3),
+            ("claim_token", "TEXT", 1, 4),
+            ("journal_revision", "INTEGER", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("controller_generation", "INTEGER", 1, 0),
+            ("extension_generation", "INTEGER", 1, 0),
+            ("worker_epoch", "TEXT", 1, 0),
+            ("package_digest", "TEXT", 1, 0),
+            ("policy_premise_digest", "TEXT", 1, 0),
+            ("operation_digest", "TEXT", 1, 0),
+            ("effect_class", "TEXT", 1, 0),
+            ("intent_digest", "TEXT", 1, 0),
+            ("evidence_digest", "TEXT", 0, 0),
+            ("record_jcs", "BLOB", 1, 0),
+            ("record_digest", "TEXT", 1, 0),
+        ],
+        StorageError::Corrupt,
+    )?;
+    let index_exists: Option<String> = connection
+        .query_row(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND name = 'effect_journal_recovery'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    if index_exists.is_none() {
+        return Err(StorageError::Corrupt);
+    }
+    let metadata: Option<(i64, String)> = connection
+        .query_row(
             "SELECT schema_version, schema_discriminator
              FROM external_effect_journal_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
+        .optional()
         .map_err(map_sqlite_error)?;
-    let mut rows = stmt.query([]).map_err(map_sqlite_error)?;
-    let Some(row) = rows.next().map_err(map_sqlite_error)? else {
+    let Some((version, discriminator)) = metadata else {
         return Err(StorageError::MigrationRequired);
     };
-    let version: i64 = row.get(0).map_err(map_sqlite_error)?;
-    let discriminator: String = row.get(1).map_err(map_sqlite_error)?;
     if version != 1 || discriminator != EFFECT_JOURNAL_RECORD_SCHEMA {
         return Err(StorageError::MigrationRequired);
     }
     Ok(())
 }
+/// Re-verify the bounded row count and every persisted row during an ordinary
+/// database open. Exactly-at-cap is valid; over-cap or any invalid digest,
+/// record, state, or indexed column fails closed before the handle is exposed.
+pub(crate) fn verify_open_limits(connection: &Connection) -> StorageResult<()> {
+    gate_schema_version(connection)?;
+    let total: i64 = connection
+        .query_row("SELECT COUNT(*) FROM external_effect_journal", [], |row| {
+            row.get(0)
+        })
+        .map_err(map_sqlite_error)?;
+    if total < 0 || total as u64 > MAX_EFFECT_JOURNAL_ROWS {
+        return Err(StorageError::Full);
+    }
+    let mut statement = connection
+        .prepare(ALL_SELECT_SQL)
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement.query([]).map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        verify_row(row)?;
+    }
+    Ok(())
+}
+
+fn verify_table_shape(
+    connection: &Connection,
+    table: &str,
+    expected: &[(&str, &str, i64, i64)],
+    missing_error: StorageError,
+) -> StorageResult<()> {
+    let exists: Option<String> = connection
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    if exists.is_none() {
+        return Err(missing_error);
+    }
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(map_sqlite_error)?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    if actual.len() != expected.len()
+        || actual.iter().zip(expected).any(|(actual, expected)| {
+            actual.0 != expected.0
+                || actual.1 != expected.1
+                || actual.2 != expected.2
+                || actual.3 != expected.3
+        })
+    {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(())
+}
+
+/// The unforgeable capability returned only after a new Claim intent commits.
+/// Coordinator stdio dispatch requires this exact capability and re-verifies
+/// the durable row and every frozen generation/premise before admitting a
+/// send permit.
+#[derive(Debug, PartialEq)]
+pub struct EffectJournalIntentAuthority {
+    record: ExternalEffectJournalRecord,
+}
+
+impl EffectJournalIntentAuthority {
+    /// Revalidate this capability against the authoritative ledger row,
+    /// current Worker generations, installed package, policy premise, and
+    /// exact outbound bytes. Any mismatch fails closed before child I/O.
+    pub fn verify_for_dispatch(
+        &self,
+        connection: &Connection,
+        row: &ToolCallLedgerRecord,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        package_digest: &Sha256Digest,
+        request_bytes: &[u8],
+    ) -> StorageResult<()> {
+        gate_schema_version(connection)?;
+        if self.record.state != EffectJournalState::Intended
+            || self.record.journal_revision != 1
+            || row.state != LedgerState::Authorized
+            || row.verify_field_combination().is_err()
+        {
+            return Err(StorageError::Corrupt);
+        }
+        let stored = load_exact(connection, &self.record.claim)?.ok_or(StorageError::Corrupt)?;
+        if stored != self.record
+            || self.record.claim.instance_id != row.operation_binding.instance_id
+            || self.record.claim.module_id != row.operation_binding.module_id
+            || self.record.claim.operation_id != row.operation_binding.operation_id
+            || self.record.operation_digest != row.operation_digest
+            || self.record.operation_digest != row.operation_binding.operation_digest()
+            || self.record.intent_digest != Sha256Digest::compute(request_bytes)
+            || row.operation_binding.recompute_outbound_digest().as_ref()
+                != Some(&self.record.intent_digest)
+            || self.record.controller_generation != runtime_binding.controller_generation().value()
+            || self.record.controller_generation
+                != process_generation.controller_generation().value()
+            || self.record.extension_generation != process_generation.extension_generation().value()
+            || self.record.worker_epoch != runtime_binding.worker_epoch().to_string()
+            || self.record.worker_epoch != process_generation.worker_epoch().to_string()
+            || self.record.package_digest != *package_digest
+            || self.record.policy_premise_digest != *runtime_binding.premises_digest()
+            || self.record.effect_class != EffectClass::McpToolsCall
+            || row.operation_binding.instance_id != runtime_binding.instance_id()
+            || process_generation.instance_id() != runtime_binding.instance_id()
+        {
+            return Err(StorageError::Corrupt);
+        }
+        Ok(())
+    }
+}
 
 /// The result of inserting an `INTENDED` journal intent row.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum EffectJournalInsertDisposition {
-    /// A brand-new revision-1 `INTENDED` row committed.
-    Inserted { record: ExternalEffectJournalRecord },
+    /// A brand-new revision-1 `INTENDED` row committed, with the only
+    /// capability accepted by the coordinator's stdio dispatch boundary.
+    Inserted {
+        record: ExternalEffectJournalRecord,
+        authority: EffectJournalIntentAuthority,
+    },
     /// A row with the same Claim (primary key) already existed. Because a
     /// Claim is a new-attempt identity, this is a replay of the SAME attempt:
     /// the verified authoritative row is returned without mutation and the
@@ -164,20 +363,41 @@ pub struct EffectCasKey {
     pub expected_journal_revision: u64,
     /// Expected current state.
     pub expected_state: EffectJournalState,
-    /// Correlation the incoming settled record must satisfy and the stored
-    /// row must match, present exactly for `APPLIED`/`NOT_APPLIED` settles.
-    /// A mismatch is ambiguity: nothing changes.
+    /// The complete frozen correlation. Every field is required for a
+    /// settlement, including all generations, package, policy, operation,
+    /// outbound-effect digest, and effect class.
     pub correlation: Option<EffectCorrelation>,
 }
 
-/// The identity correlation that must match the row being settled.
+/// The exact identity correlation that must match both the stored Claim and
+/// authoritative provider evidence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectCorrelation {
-    /// The exact operation identity digest of the evidence operation.
+    pub controller_generation: u64,
+    pub extension_generation: u64,
+    pub worker_epoch: String,
+    pub package_digest: Sha256Digest,
+    pub policy_premise_digest: Sha256Digest,
     pub operation_digest: Sha256Digest,
-    /// The exact effect identity (intent digest == dispatched outbound
-    /// digest) of the evidence operation.
-    pub intent_digest: Sha256Digest,
+    pub outbound_digest: Sha256Digest,
+    pub effect_class: EffectClass,
+}
+impl EffectCorrelation {
+    /// Build the complete settlement correlation from one verified journal
+    /// intent. This is used by the reopen recovery driver; callers cannot
+    /// omit or substitute one of the bound fields.
+    pub fn from_record(record: &ExternalEffectJournalRecord) -> Self {
+        Self {
+            controller_generation: record.controller_generation,
+            extension_generation: record.extension_generation,
+            worker_epoch: record.worker_epoch.clone(),
+            package_digest: record.package_digest.clone(),
+            policy_premise_digest: record.policy_premise_digest.clone(),
+            operation_digest: record.operation_digest.clone(),
+            outbound_digest: record.intent_digest.clone(),
+            effect_class: record.effect_class,
+        }
+    }
 }
 
 /// The outcome of a compare-and-set on a journal row.
@@ -222,10 +442,27 @@ pub fn insert_intent(
 
     let tx = connection.transaction().map_err(map_sqlite_error)?;
 
+    let claim = &record.claim;
+    let authoritative = load_verified_inner(&tx, claim)?;
+    if let Some(authoritative) = authoritative {
+        // Same Claim: replay the authoritative row. Never a second Intent
+        // under one Claim; a new attempt requires a new Claim. Replay is
+        // checked before capacity so a full journal cannot turn idempotent
+        // replay into a new dispatch attempt.
+        return tx
+            .commit()
+            .map(|()| EffectJournalInsertDisposition::Replayed {
+                record: authoritative,
+            })
+            .map_err(map_sqlite_error);
+    }
+
     // Whole-journal ceiling: run safe retention first inside the same
     // transaction, then fail closed when the journal is still at the cap.
     let total: i64 = tx
-        .query_row("SELECT COUNT(*) FROM external_effect_journal", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM external_effect_journal", [], |row| {
+            row.get(0)
+        })
         .map_err(map_sqlite_error)?;
     if (total as u64) >= MAX_EFFECT_JOURNAL_ROWS {
         retain_bounded_rows(&tx)?;
@@ -233,23 +470,12 @@ pub fn insert_intent(
     // Re-check after retention: an intent that still cannot be admitted is a
     // journal at its ceiling and its pending intent must be refused: STORAGE_FULL.
     let total_after: i64 = tx
-        .query_row("SELECT COUNT(*) FROM external_effect_journal", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM external_effect_journal", [], |row| {
+            row.get(0)
+        })
         .map_err(map_sqlite_error)?;
     if (total_after as u64) >= MAX_EFFECT_JOURNAL_ROWS {
         return Err(StorageError::Full);
-    }
-
-    let claim = &record.claim;
-    let authoritative = load_verified_inner(&tx, claim)?;
-    if let Some(authoritative) = authoritative {
-        // Same Claim: replay the authoritative row. Never a second Intent
-        // under one Claim; a new attempt requires a new Claim.
-        return tx
-            .commit()
-            .map(|()| EffectJournalInsertDisposition::Replayed {
-                record: authoritative,
-            })
-            .map_err(map_sqlite_error);
     }
 
     tx.execute(
@@ -288,8 +514,12 @@ pub fn insert_intent(
     .map_err(map_sqlite_error)?;
 
     tx.commit().map_err(map_sqlite_error)?;
+    let authoritative = load_exact(connection, claim)?.ok_or(StorageError::Corrupt)?;
     Ok(EffectJournalInsertDisposition::Inserted {
-        record: load_exact(connection, claim)?.ok_or(StorageError::Corrupt)?,
+        record: authoritative.clone(),
+        authority: EffectJournalIntentAuthority {
+            record: authoritative,
+        },
     })
 }
 
@@ -308,76 +538,118 @@ pub fn insert_intent(
 /// re-checks the ceiling after this runs and fails closed (`STORAGE_FULL`) if
 /// capacity still cannot be freed.
 fn retain_bounded_rows(transaction: &Transaction<'_>) -> StorageResult<()> {
-    // Delete the deterministically oldest safe rows until the journal would
-    // have room again (below the whole-journal ceiling); a fresh recheck is
-    // cheap and keeps the transaction small.
     loop {
-        let free: i64 = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM external_effect_journal
-                 WHERE state IN ('APPLIED', 'NOT_APPLIED')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(map_sqlite_error)?;
         let total: i64 = transaction
-            .query_row("SELECT COUNT(*) FROM external_effect_journal", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM external_effect_journal", [], |row| {
+                row.get(0)
+            })
             .map_err(map_sqlite_error)?;
-        if free == 0 || (total as u64) < MAX_EFFECT_JOURNAL_ROWS {
-            break;
+        if (total as u64) < MAX_EFFECT_JOURNAL_ROWS {
+            return Ok(());
         }
-        // Delete exactly the rows needed to fall below the ceiling (an
-        // intent insert needs one slot), never more than the deletable set.
-        let delete = ((total as u64) - MAX_EFFECT_JOURNAL_ROWS + 1).min(free as u64) as i64;
-        transaction
-            .execute(
-                "DELETE FROM external_effect_journal
-                 WHERE rowid IN (
-                    SELECT rowid FROM external_effect_journal
-                    WHERE state IN ('APPLIED', 'NOT_APPLIED')
-                    ORDER BY instance_id, module_id, operation_id, claim_token
-                    LIMIT ?1
-                 )",
-                rusqlite::params![delete],
-            )
-            .map_err(map_sqlite_error)?;
-        let left: i64 = transaction
-            .query_row("SELECT COUNT(*) FROM external_effect_journal", [], |row| row.get(0))
-            .map_err(map_sqlite_error)?;
-        if (left as u64) < MAX_EFFECT_JOURNAL_ROWS {
-            break;
+        let needed = (total as u64 - MAX_EFFECT_JOURNAL_ROWS + 1) as usize;
+        // Read and fully verify every candidate before deleting any of them.
+        // The state predicate excludes unresolved INTENDED rows and
+        // UNKNOWN_OUTCOME ambiguity evidence by construction.
+        let candidates = {
+            let mut statement = transaction
+                .prepare(RETENTION_SELECT_SQL)
+                .map_err(map_sqlite_error)?;
+            let mut rows = statement.query([]).map_err(map_sqlite_error)?;
+            let mut candidates = Vec::new();
+            while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+                let record = verify_row(row)?;
+                if !matches!(
+                    record.state,
+                    EffectJournalState::Applied | EffectJournalState::NotApplied
+                ) || record.evidence_digest.is_none()
+                {
+                    return Err(StorageError::Corrupt);
+                }
+                candidates.push(record);
+            }
+            candidates
+        };
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        for record in candidates.into_iter().take(needed) {
+            let (_, record_digest) = record
+                .canonical_bytes_and_digest()
+                .map_err(|_| StorageError::Corrupt)?;
+            let deleted = transaction
+                .execute(
+                    "DELETE FROM external_effect_journal
+                     WHERE instance_id = ?1 AND module_id = ?2
+                       AND operation_id = ?3 AND claim_token = ?4
+                       AND state IN ('APPLIED', 'NOT_APPLIED')
+                       AND record_digest = ?5",
+                    rusqlite::params![
+                        record.claim.instance_id,
+                        record.claim.module_id,
+                        record.claim.operation_id,
+                        record.claim.claim_token.to_canonical_string(),
+                        record_digest.to_canonical_string(),
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+            if deleted != 1 {
+                return Err(StorageError::Corrupt);
+            }
         }
     }
-    Ok(())
 }
 
-/// Settle `INTENDED` to `APPLIED`/`NOT_APPLIED`/`UNKNOWN_OUTCOME`.
+/// Settle `INTENDED` to a terminal state.
 ///
-/// The transition commits only when the stored row still has the expected
-/// Claim, revision, and state. For `APPLIED`/`NOT_APPLIED` the caller must
-/// also provide the exact correlation (operation + effect identity) that both
-/// the stored row and the incoming record satisfy; a mismatch is
-/// `EffectCasOutcome::Stale` with zero mutation. `UNKNOWN_OUTCOME` needs no
-/// correlation. No transition across terminal rows exists (settled rows are
-/// immutable).
+/// Public callers may settle only from the exact authoritative terminal
+/// Tool-call ledger record already persisted for the same operation. The
+/// incoming record is merely a proposed state and evidence digest; it is
+/// accepted only when the stored ledger deterministically derives the same
+/// transition and every Claim/generation/premise correlation matches.
+/// `UNKNOWN_OUTCOME` is available only to the private reopen recovery driver,
+/// which supplies no caller observation.
 pub fn cas_settle(
     connection: &mut rusqlite::Connection,
     expected: &EffectCasKey,
     incoming: &ExternalEffectJournalRecord,
 ) -> StorageResult<EffectCasOutcome> {
-    if !incoming.state.is_terminal() || incoming.journal_revision != 2 {
+    if incoming.state == EffectJournalState::UnknownOutcome {
         return Err(StorageError::Corrupt);
     }
-    incoming.verify().map_err(|_| StorageError::Corrupt)?;
+    cas_settle_inner(connection, expected, incoming, false)
+}
 
-    // For applied/not-applied the evidence digest must be present; the
-    // evidence identity itself is enforced below against the stored row. The
-    // broker decision (recover_effect_journal) owns provenance of the digest.
-    if let Some(correlation) = expected.correlation.as_ref() {
-        if incoming.evidence_digest.is_none() {
-            return Err(StorageError::Corrupt);
-        }
-        let _ = correlation;
+fn cas_settle_recovery(
+    connection: &mut rusqlite::Connection,
+    expected: &EffectCasKey,
+    incoming: &ExternalEffectJournalRecord,
+) -> StorageResult<EffectCasOutcome> {
+    cas_settle_inner(connection, expected, incoming, true)
+}
+
+fn cas_settle_inner(
+    connection: &mut rusqlite::Connection,
+    expected: &EffectCasKey,
+    incoming: &ExternalEffectJournalRecord,
+    allow_unknown: bool,
+) -> StorageResult<EffectCasOutcome> {
+    gate_schema_version(connection)?;
+    if incoming.journal_revision != 2
+        || !incoming.state.is_terminal()
+        || (!allow_unknown && incoming.state == EffectJournalState::UnknownOutcome)
+    {
+        return Err(StorageError::Corrupt);
+    }
+    let Some(correlation) = expected.correlation.as_ref() else {
+        return Err(StorageError::Corrupt);
+    };
+    incoming.verify().map_err(|_| StorageError::Corrupt)?;
+    let (incoming_jcs, _) = incoming
+        .canonical_bytes_and_digest()
+        .map_err(|_| StorageError::Corrupt)?;
+    if incoming_jcs.as_ref().len() > MAX_EFFECT_JOURNAL_JCS_BYTES {
+        return Err(StorageError::Full);
     }
 
     let tx = connection.transaction().map_err(map_sqlite_error)?;
@@ -394,29 +666,69 @@ pub fn cas_settle(
             .map(|()| EffectCasOutcome::Stale { authoritative })
             .map_err(map_sqlite_error);
     }
-
-    // A settled applied/not-applied must correlate with the stored row's
-    // operation and effect identity (same Claim and generation).
-    if let Some(correlation) = &expected.correlation {
-        if authoritative.operation_digest != correlation.operation_digest
-            || authoritative.intent_digest != correlation.intent_digest
-        {
-            return tx
-                .commit()
-                .map(|()| EffectCasOutcome::Stale { authoritative })
-                .map_err(map_sqlite_error);
-        }
+    if authoritative.state != EffectJournalState::Intended
+        || authoritative.journal_revision != 1
+        || expected.expected_journal_revision != 1
+        || expected.expected_state != EffectJournalState::Intended
+        || !correlation_matches(correlation, &authoritative)
+        || !same_intent_context(incoming, &authoritative)
+    {
+        return tx
+            .commit()
+            .map(|()| EffectCasOutcome::Stale { authoritative })
+            .map_err(map_sqlite_error);
     }
 
-    // Revisions must step by exactly one (1 -> 2, no regress, no skip).
-    if incoming.journal_revision != expected.expected_journal_revision + 1 {
-        return Err(StorageError::Corrupt);
+    // A terminal ledger fact with this operation/effect identity cannot prove
+    // which Claim it belongs to when another Claim already carries the same
+    // frozen operation and outbound digest. Treat the evidence as ambiguous;
+    // never let a new Claim consume an old Claim's terminal evidence.
+    let competing = has_competing_claim(&tx, &authoritative)?;
+    if competing && (!allow_unknown || incoming.state != EffectJournalState::UnknownOutcome) {
+        return tx
+            .commit()
+            .map(|()| EffectCasOutcome::Stale { authoritative })
+            .map_err(map_sqlite_error);
     }
 
-    let (jcs, digest) = incoming
+    let ledger = crate::tool_ledger::load_verified_inner(
+        &tx,
+        &authoritative.claim.module_id,
+        &authoritative.claim.operation_id,
+    )?;
+    let settlement = recover_effect_journal(&authoritative, ledger.as_ref());
+    let expected_incoming = match settlement {
+        EffectSettlement::Applied { evidence_digest } => ExternalEffectJournalRecord {
+            journal_revision: 2,
+            state: EffectJournalState::Applied,
+            evidence_digest: Some(evidence_digest),
+            ..authoritative.clone()
+        },
+        EffectSettlement::NotApplied { evidence_digest } => ExternalEffectJournalRecord {
+            journal_revision: 2,
+            state: EffectJournalState::NotApplied,
+            evidence_digest: Some(evidence_digest),
+            ..authoritative.clone()
+        },
+        EffectSettlement::UnknownOutcome => ExternalEffectJournalRecord {
+            journal_revision: 2,
+            state: EffectJournalState::UnknownOutcome,
+            evidence_digest: None,
+            ..authoritative.clone()
+        },
+    };
+    if expected_incoming != *incoming
+        || (!allow_unknown && expected_incoming.state == EffectJournalState::UnknownOutcome)
+    {
+        return tx
+            .commit()
+            .map(|()| EffectCasOutcome::Stale { authoritative })
+            .map_err(map_sqlite_error);
+    }
+
+    let (jcs, digest) = expected_incoming
         .canonical_bytes_and_digest()
         .map_err(|_| StorageError::Corrupt)?;
-
     let changed = tx
         .execute(
             "UPDATE external_effect_journal SET
@@ -429,9 +741,9 @@ pub fn cas_settle(
                 expected.claim.instance_id,
                 expected.claim.module_id,
                 expected.claim.operation_id,
-                incoming.journal_revision as i64,
-                incoming.state.wire_name(),
-                incoming
+                expected_incoming.journal_revision as i64,
+                expected_incoming.state.wire_name(),
+                expected_incoming
                     .evidence_digest
                     .as_ref()
                     .map(|d| d.to_canonical_string()),
@@ -457,6 +769,98 @@ pub fn cas_settle(
     Ok(EffectCasOutcome::Committed {
         record: load_exact(connection, &expected.claim)?.ok_or(StorageError::Corrupt)?,
     })
+}
+
+fn same_intent_context(
+    left: &ExternalEffectJournalRecord,
+    right: &ExternalEffectJournalRecord,
+) -> bool {
+    left.claim == right.claim
+        && left.controller_generation == right.controller_generation
+        && left.extension_generation == right.extension_generation
+        && left.worker_epoch == right.worker_epoch
+        && left.package_digest == right.package_digest
+        && left.policy_premise_digest == right.policy_premise_digest
+        && left.operation_digest == right.operation_digest
+        && left.effect_class == right.effect_class
+        && left.intent_digest == right.intent_digest
+}
+
+fn correlation_matches(
+    correlation: &EffectCorrelation,
+    record: &ExternalEffectJournalRecord,
+) -> bool {
+    correlation.controller_generation == record.controller_generation
+        && correlation.extension_generation == record.extension_generation
+        && correlation.worker_epoch == record.worker_epoch
+        && correlation.package_digest == record.package_digest
+        && correlation.policy_premise_digest == record.policy_premise_digest
+        && correlation.operation_digest == record.operation_digest
+        && correlation.outbound_digest == record.intent_digest
+        && correlation.effect_class == record.effect_class
+}
+fn correlation_of(record: &ExternalEffectJournalRecord) -> EffectCorrelation {
+    EffectCorrelation {
+        controller_generation: record.controller_generation,
+        extension_generation: record.extension_generation,
+        worker_epoch: record.worker_epoch.clone(),
+        package_digest: record.package_digest.clone(),
+        policy_premise_digest: record.policy_premise_digest.clone(),
+        operation_digest: record.operation_digest.clone(),
+        outbound_digest: record.intent_digest.clone(),
+        effect_class: record.effect_class,
+    }
+}
+
+fn has_competing_claim(
+    transaction: &Transaction<'_>,
+    record: &ExternalEffectJournalRecord,
+) -> StorageResult<bool> {
+    let mut statement = transaction
+        .prepare(COMPETING_SELECT_SQL)
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query(rusqlite::params![
+            record.claim.instance_id,
+            record.claim.module_id,
+            record.claim.operation_id,
+            record.operation_digest.to_canonical_string(),
+            record.intent_digest.to_canonical_string(),
+            record.claim.claim_token.to_canonical_string(),
+        ])
+        .map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let competing = verify_row(row)?;
+        if competing.claim != record.claim {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+fn has_competing_claim_connection(
+    connection: &Connection,
+    record: &ExternalEffectJournalRecord,
+) -> StorageResult<bool> {
+    let mut statement = connection
+        .prepare(COMPETING_SELECT_SQL)
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query(rusqlite::params![
+            record.claim.instance_id,
+            record.claim.module_id,
+            record.claim.operation_id,
+            record.operation_digest.to_canonical_string(),
+            record.intent_digest.to_canonical_string(),
+            record.claim.claim_token.to_canonical_string(),
+        ])
+        .map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let competing = verify_row(row)?;
+        if competing.claim != record.claim {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Exact Claim load with full canonical-byte/digest verification and
@@ -509,6 +913,32 @@ const SELECT_SQL: &str = "SELECT instance_id, module_id, operation_id, claim_tok
              FROM external_effect_journal
              WHERE instance_id = ?1 AND module_id = ?2 AND operation_id = ?3
                AND claim_token = ?4";
+const RETENTION_SELECT_SQL: &str = "SELECT instance_id, module_id, operation_id, claim_token,
+                    journal_revision, state, controller_generation,
+                    extension_generation, worker_epoch, package_digest,
+                    policy_premise_digest, operation_digest, effect_class,
+                    intent_digest, evidence_digest, record_jcs, record_digest
+             FROM external_effect_journal
+             WHERE state IN ('APPLIED', 'NOT_APPLIED')
+             ORDER BY instance_id, module_id, operation_id, claim_token";
+const ALL_SELECT_SQL: &str = "SELECT instance_id, module_id, operation_id, claim_token,
+                    journal_revision, state, controller_generation,
+                    extension_generation, worker_epoch, package_digest,
+                    policy_premise_digest, operation_digest, effect_class,
+                    intent_digest, evidence_digest, record_jcs, record_digest
+             FROM external_effect_journal
+             ORDER BY instance_id, module_id, operation_id, claim_token";
+
+const COMPETING_SELECT_SQL: &str = "SELECT instance_id, module_id, operation_id, claim_token,
+                    journal_revision, state, controller_generation,
+                    extension_generation, worker_epoch, package_digest,
+                    policy_premise_digest, operation_digest, effect_class,
+                    intent_digest, evidence_digest, record_jcs, record_digest
+             FROM external_effect_journal
+             WHERE instance_id = ?1 AND module_id = ?2 AND operation_id = ?3
+               AND operation_digest = ?4 AND intent_digest = ?5
+               AND claim_token <> ?6
+             ORDER BY claim_token";
 
 /// The full verification every read passes:
 ///   - `record_digest` recomputes to `sha256(record_jcs)`;
@@ -537,6 +967,13 @@ fn verify_row(row: &Row) -> StorageResult<ExternalEffectJournalRecord> {
     let record_jcs: Vec<u8> = row.get(15).map_err(map_sqlite_error)?;
     let record_digest: String = row.get(16).map_err(map_sqlite_error)?;
 
+    if record_jcs.len() > MAX_EFFECT_JOURNAL_JCS_BYTES
+        || journal_revision <= 0
+        || controller_generation <= 0
+        || extension_generation <= 0
+    {
+        return Err(StorageError::Corrupt);
+    }
     if Sha256Digest::compute(&record_jcs).to_canonical_string() != record_digest {
         return Err(StorageError::Corrupt);
     }
@@ -664,7 +1101,11 @@ pub fn settle_pending_effect_journal(
                 &current.claim.module_id,
                 &current.claim.operation_id,
             )?;
-            let settlement = recover_effect_journal(&current, ledger.as_ref());
+            let settlement = if has_competing_claim_connection(db.connection(), &current)? {
+                EffectSettlement::UnknownOutcome
+            } else {
+                recover_effect_journal(&current, ledger.as_ref())
+            };
             let incoming = match &settlement {
                 EffectSettlement::Applied { evidence_digest } => ExternalEffectJournalRecord {
                     journal_revision: 2,
@@ -689,17 +1130,9 @@ pub fn settle_pending_effect_journal(
                 claim: current.claim.clone(),
                 expected_journal_revision: current.journal_revision,
                 expected_state: current.state,
-                correlation: match &settlement {
-                    EffectSettlement::Applied { .. } | EffectSettlement::NotApplied { .. } => {
-                        Some(EffectCorrelation {
-                            operation_digest: current.operation_digest.clone(),
-                            intent_digest: current.intent_digest.clone(),
-                        })
-                    }
-                    EffectSettlement::UnknownOutcome => None,
-                },
+                correlation: Some(correlation_of(&current)),
             };
-            match cas_settle(db.connection_mut(), &key, &incoming)? {
+            match cas_settle_recovery(db.connection_mut(), &key, &incoming)? {
                 EffectCasOutcome::Committed { record } => {
                     match &settlement {
                         EffectSettlement::Applied { .. } => outcome.settled_applied += 1,

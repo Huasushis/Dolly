@@ -737,6 +737,7 @@ impl OfflineDatabase {
                 .map_err(map_sqlite_error)?;
             migrate_legacy_authority_in_transaction(&tx, &controller_generation_id)
                 .map_err(map_host_authority_error)?;
+            crate::effect_journal::initialize_effect_journal_schema(&tx)?;
             tx.commit().map_err(map_sqlite_error)?;
             let migrated = load_current_authority_with_generation(connection)
                 .map_err(map_host_authority_error)?
@@ -832,6 +833,7 @@ fn open_internal(db_path: &Path, attestation: &ReleaseAttestation) -> StorageRes
         cleanup.note_database_artifacts()?;
         let schema_version = ensure_schema(&connection, &verified)?;
         verify_sqlite_integrity(&connection)?;
+        crate::effect_journal::verify_open_limits(&connection)?;
         let authority_identity =
             validate_authority_state(&connection)?.ok_or(StorageError::MigrationRequired)?;
         let persisted_generation = read_controller_generation(&connection)?;
@@ -1818,6 +1820,7 @@ fn create_fresh_schema(
     .map_err(map_sqlite_error)?;
     tx.execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
         .map_err(map_sqlite_error)?;
+    crate::effect_journal::initialize_effect_journal_schema(tx)?;
     tx.execute(
         "INSERT INTO core_meta (
             singleton, schema_version, daemon_installation_id, instance_id,
