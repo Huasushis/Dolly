@@ -23,3 +23,7 @@ path = "tests/argument_key.rs"
 [[test]]
 name = "contract"
 path = "tests/contract.rs"
+
+[[test]]
+name = "effect_journal_bridge_vector"
+path = "tests/effect_journal_bridge_vector.rs"

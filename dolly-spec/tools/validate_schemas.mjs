@@ -480,6 +480,29 @@ for (const [file, schemaId] of cases) {
       }
     }
   }
+  if (value.test_id === "TST-TOOL-014") {
+    const relative = path.relative(root, file);
+    assertValid(
+      `${relative}.initial.contract`,
+      `${schemaBase}effect-journal-bridge.schema.json`,
+      value.initial?.contract,
+    );
+    const cases = value.initial?.cases;
+    if (!Array.isArray(cases) || cases.length !== 4) {
+      throw new Error(`${relative}: cross-language bridge corpus must contain four outcome cases`);
+    }
+    for (const [index, entry] of cases.entries()) {
+      const target = entry.target;
+      const canonical = entry.canonical;
+      if (target?.record?.claim?.claim_token !== target?.claim?.claim_token) {
+        throw new Error(`${relative}.initial.cases[${index}]: journal Claim differs from mapped Claim`);
+      }
+      if (canonicalDigest(target.claim) !== canonical.claim_digest ||
+          canonicalDigest(target.record) !== canonical.record_digest) {
+        throw new Error(`${relative}.initial.cases[${index}]: canonical digest is stale`);
+      }
+    }
+  }
   if (value.test_id === "TST-CORE-009") {
     const evidenceDigests = new Map();
     for (const [caseName, replayCase] of Object.entries(value.stimulus?.cases ?? {})) {
