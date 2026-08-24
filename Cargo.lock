@@ -258,6 +258,8 @@ dependencies = [
  "dolly-tool-broker",
  "dolly-tool-coordinator",
  "getrandom",
+ "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

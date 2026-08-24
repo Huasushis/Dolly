@@ -17,7 +17,11 @@ use std::process::Child;
 use std::time::Instant;
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
-use dolly_storage::mcp_readiness::{McpTransportReadiness, prove_current_mcp_transport_readiness};
+use dolly_storage::mcp_readiness::{
+    McpReadinessError, McpTransportReadiness, prove_current_mcp_transport_readiness,
+};
+#[cfg(feature = "test-support")]
+use dolly_storage::mcp_readiness::test_prove_current_mcp_transport_readiness;
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::{
     ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
@@ -148,6 +152,63 @@ impl HostMcpStdioInvocation {
         server_id: &str,
         deadline: Instant,
     ) -> Result<McpTransportReadiness, StdioTransportError> {
+        self.initialize_with_readiness(
+            database,
+            runtime_binding,
+            process_generation,
+            server_id,
+            deadline,
+            prove_current_mcp_transport_readiness,
+        )
+    }
+
+    /// Test-support initialize: drives the identical production
+    /// initialize/handshake path but proves MCP transport readiness from the
+    /// current authority's persisted Host premise (via
+    /// `test_prove_current_mcp_transport_readiness`) instead of re-observing
+    /// the live Linux host. Gated to the `test-support` feature; production
+    /// builds never expose it.
+    #[cfg(feature = "test-support")]
+    pub fn initialize_with_verified_proof(
+        &mut self,
+        database: &Database,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        server_id: &str,
+        deadline: Instant,
+    ) -> Result<McpTransportReadiness, StdioTransportError> {
+        self.initialize_with_readiness(
+            database,
+            runtime_binding,
+            process_generation,
+            server_id,
+            deadline,
+            test_prove_current_mcp_transport_readiness,
+        )
+    }
+
+    /// Complete the one MCP initialize/initialized lifecycle on this exact
+    /// verified child using the supplied readiness prover. The resulting
+    /// readiness is consumer-only evidence; the child session remains owned by
+    /// this invocation for the later dispatch.
+    fn initialize_with_readiness<F>(
+        &mut self,
+        database: &Database,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        server_id: &str,
+        deadline: Instant,
+        prove: F,
+    ) -> Result<McpTransportReadiness, StdioTransportError>
+    where
+        F: FnOnce(
+            &rusqlite::Connection,
+            &RuntimeBinding,
+            &ProcessGeneration,
+            &str,
+            &mut McpStdioProbe,
+        ) -> Result<McpTransportReadiness, McpReadinessError>,
+    {
         let session = mem::replace(&mut self.session, HostMcpStdioSessionState::Consumed);
         let HostMcpStdioSessionState::Raw(host_session) = session else {
             self.host_handle.terminate();
@@ -159,7 +220,7 @@ impl HostMcpStdioInvocation {
             self.limits,
             deadline,
         )?;
-        match prove_current_mcp_transport_readiness(
+        match prove(
             database.connection(),
             runtime_binding,
             process_generation,

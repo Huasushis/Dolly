@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 dolly-canonical-json = { path = "../dolly-canonical-json" }
 dolly-core-domain = { path = "../dolly-core-domain" }

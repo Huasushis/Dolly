@@ -248,8 +248,12 @@ impl VerifiedLinuxHostProof {
         self.observed_at_unix_millis
     }
 }
-#[cfg(test)]
-pub(crate) fn test_proof_for_authority(
+/// Test-only proof constructor bound strictly to the current authority's
+/// persisted premise. Gated to `cfg(test)` and the `test-support` feature so a
+/// Worker/coordinator integration test can provision the durable Worker
+/// (start, dispatch, reopen) without a live Host observation.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_proof_for_authority(
     snapshot: &CurrentAuthoritySnapshot,
 ) -> VerifiedLinuxHostProof {
     let premise = snapshot
