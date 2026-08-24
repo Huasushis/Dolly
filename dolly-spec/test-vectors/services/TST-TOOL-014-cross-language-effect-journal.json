@@ -1,0 +1,612 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-TOOL-014",
+  "kind": "protocol",
+  "covers": [
+    "REQ-TOOL-014",
+    "INV-TOOL-014"
+  ],
+  "initial": {
+    "contract": {
+      "schema": "dolly.effect-journal-bridge/v1",
+      "source": {
+        "dialect": "typescript",
+        "intent_schema": "dolly.effect-intent/2",
+        "run_schema": "dolly.effect-run/1"
+      },
+      "target": {
+        "dialect": "rust",
+        "claim_schema": "dolly.claim/v2",
+        "journal_schema": "dolly.external-effect-journal/v2"
+      },
+      "identity_mapping": {
+        "source_fields": [
+          "moduleJobId",
+          "runId",
+          "attempt",
+          "claimToken",
+          "moduleGenerationId"
+        ],
+        "target_fields": [
+          "instance_id",
+          "module_id",
+          "operation_id",
+          "operation_digest",
+          "claim_token"
+        ],
+        "field_rules": [
+          {
+            "source": "moduleJobId",
+            "target": "module_id",
+            "rule": "exact-utf8-identifier"
+          },
+          {
+            "source": "idempotencyKey",
+            "target": "operation_id",
+            "rule": "exact-utf8-identifier"
+          },
+          {
+            "source": "intentDigest",
+            "target": "operation_digest",
+            "rule": "exact-sha256-digest"
+          },
+          {
+            "source": "claimToken",
+            "target": "claim_token",
+            "rule": "do-not-copy; retain-source-provenance-and-derive-target"
+          },
+          {
+            "source": "runId,attempt,moduleGenerationId",
+            "target": "authority",
+            "rule": "bind-by-explicit-generation-pair; no-type-coercion"
+          }
+        ],
+        "claim_token_rule": "sha256(JCS({schema,instance_id,module_id,operation_id,operation_digest,controller_generation,extension_generation,worker_epoch,package_digest,policy_premise_digest,effect_class}))"
+      },
+      "authority_mapping": {
+        "required_fields": [
+          "daemon_installation_id",
+          "instance_id",
+          "controller_generation",
+          "process.extension_generation",
+          "process.worker_epoch",
+          "process.binding_digest",
+          "process.session_id",
+          "process.process_id",
+          "package_digest",
+          "policy_premise_digest"
+        ],
+        "provenance_fields": [
+          "package_digest",
+          "executable_digest",
+          "transport_digest",
+          "process.binding_digest",
+          "process.session_id",
+          "process.process_id"
+        ],
+        "missing_disposition": "refuse-before-child-io"
+      },
+      "outcome_mapping": [
+        {
+          "source_kind": "intended",
+          "source_evidence_rule": "source.outcome.kind=intended",
+          "target_state": "INTENDED",
+          "journal_revision": 1,
+          "evidence_rule": "null",
+          "per_intent_evidence": "required",
+          "redispatch": "forbidden"
+        },
+        {
+          "source_kind": "no-effect",
+          "source_evidence_rule": "source.outcome.kind=no-effect",
+          "target_state": "NOT_APPLIED",
+          "journal_revision": 2,
+          "evidence_rule": "sha256(JCS(no-effect-proof))",
+          "per_intent_evidence": "required",
+          "redispatch": "forbidden"
+        },
+        {
+          "source_kind": "terminal",
+          "source_evidence_rule": "source.outcome.kind=terminal;require-resultDigest",
+          "target_state": "APPLIED",
+          "journal_revision": 2,
+          "evidence_rule": "source.outcome.resultDigest",
+          "per_intent_evidence": "required",
+          "redispatch": "forbidden"
+        },
+        {
+          "source_kind": "unknown",
+          "source_evidence_rule": "source.outcome.kind=unknown;retain-reason",
+          "target_state": "UNKNOWN_OUTCOME",
+          "journal_revision": 2,
+          "evidence_rule": "null",
+          "per_intent_evidence": "required",
+          "redispatch": "forbidden"
+        }
+      ],
+      "aggregate_evidence": "never-map-evidenceForRun-directly-to-one-Rust-record; require-each-intent-outcome",
+      "canonicalization": {
+        "scheme": "RFC8785-JCS",
+        "encoding": "UTF-8",
+        "digest": "sha256:<lowercase-hex>",
+        "semantic_depth": 64,
+        "wire_depth": 96,
+        "unknown_fields": "reject"
+      },
+      "transport": {
+        "extension_rpc": {
+          "dialect": "dolly-extension-rpc/3.0",
+          "framing": "four-byte-length-prefix",
+          "length_endian": "big",
+          "max_payload_bytes": 262144,
+          "wire_depth": 96,
+          "semantic_depth": 64
+        },
+        "mcp_stdio": {
+          "dialect": "mcp/2025-06-18",
+          "framing": "newline-delimited-json",
+          "delimiter": "LF",
+          "max_line_bytes": 262144,
+          "wire_depth": 96,
+          "semantic_depth": 64
+        },
+        "semantic_errors": [
+          {
+            "code": "EXTENSION_INVALID_PARAMS",
+            "source_codes": [
+              "FRAME_JSON_INVALID",
+              "FRAME_LENGTH_INVALID",
+              "FRAME_UTF8_INVALID",
+              "FRAME_TOO_DEEP"
+            ],
+            "phase": "pre-effect",
+            "outcome": "not_applied",
+            "connection": "reusable",
+            "redispatch": "forbidden"
+          },
+          {
+            "code": "EXTENSION_INVALID_RESPONSE",
+            "source_codes": [
+              "FRAME_JSON_INVALID",
+              "FRAME_LENGTH_INVALID",
+              "FRAME_UTF8_INVALID",
+              "FRAME_TOO_DEEP",
+              "FRAME_TRANSPORT_FAILED"
+            ],
+            "phase": "post-write",
+            "outcome": "unknown",
+            "connection": "closed",
+            "redispatch": "forbidden"
+          },
+          {
+            "code": "MCP_REQUEST_INVALID",
+            "source_codes": [
+              "InvalidFrame",
+              "RequestMismatch",
+              "NotInitialized"
+            ],
+            "phase": "pre-effect",
+            "outcome": "not_applied",
+            "connection": "closed",
+            "redispatch": "forbidden"
+          },
+          {
+            "code": "MCP_RESPONSE_INVALID",
+            "source_codes": [
+              "InvalidFrame"
+            ],
+            "phase": "post-write",
+            "outcome": "unknown",
+            "connection": "closed",
+            "redispatch": "forbidden"
+          },
+          {
+            "code": "MCP_DISCONNECTED",
+            "source_codes": [
+              "Disconnected",
+              "Io"
+            ],
+            "phase": "post-write",
+            "outcome": "unknown",
+            "connection": "closed",
+            "redispatch": "forbidden"
+          },
+          {
+            "code": "CLAIM_INTENT_PERSISTENCE_FAILED",
+            "source_codes": [
+              "EFFECT_INTENT_IO_FAILED",
+              "EFFECT_INTENT_CONFLICT"
+            ],
+            "phase": "pre-effect",
+            "outcome": "not_applied",
+            "connection": "closed",
+            "redispatch": "forbidden"
+          }
+        ]
+      },
+      "ordering": {
+        "before_child_io": [
+          "platform_gate",
+          "authority_gate",
+          "package_and_provenance_gate",
+          "claim_intent_commit",
+          "identity_pair_check"
+        ],
+        "first_external_write": "after-claim-intent-commit",
+        "replay": "refuse-without-new-claim"
+      },
+      "identity_checks": [
+        {
+          "left": "authority.daemon_installation_id",
+          "right": "installation.daemon_installation_id",
+          "mismatch": "refuse"
+        },
+        {
+          "left": "authority.instance_id",
+          "right": "claim.instance_id",
+          "mismatch": "refuse"
+        },
+        {
+          "left": "authority.controller_generation",
+          "right": "process.controller_generation",
+          "mismatch": "refuse"
+        },
+        {
+          "left": "authority.process.extension_generation",
+          "right": "journal.extension_generation",
+          "mismatch": "refuse"
+        },
+        {
+          "left": "authority.process.worker_epoch",
+          "right": "journal.worker_epoch",
+          "mismatch": "refuse"
+        },
+        {
+          "left": "authority.process.binding_digest",
+          "right": "runtime.binding_digest",
+          "mismatch": "refuse"
+        }
+      ]
+    },
+    "source_run": {
+      "schemaVersion": "dolly.effect-run/1",
+      "moduleJobId": "module-1",
+      "runId": "run-1",
+      "attempt": 1,
+      "claimToken": "claim-token-1",
+      "moduleGenerationId": "module-generation-1",
+      "state": "closed",
+      "intentCount": 4,
+      "intentSetDigest": "sha256:8b7feba6b861a41b557892d5c48ca85a5174da2eaa2552cfd730dc142880b3bb",
+      "createdAt": "2026-08-24T00:00:00.000Z",
+      "updatedAt": "2026-08-24T00:00:02.000Z"
+    },
+    "cases": [
+      {
+        "source": {
+          "schemaVersion": "dolly.effect-intent/2",
+          "moduleJobId": "module-1",
+          "runId": "run-1",
+          "attempt": 1,
+          "claimToken": "claim-token-1",
+          "moduleGenerationId": "module-generation-1",
+          "idempotencyKey": "job-1:effect-intended",
+          "capabilityType": "mcp",
+          "operation": "tools/call",
+          "intentDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "outcome": {
+            "kind": "intended"
+          },
+          "createdAt": "2026-08-24T00:00:00.000Z",
+          "updatedAt": "2026-08-24T00:00:01.000Z"
+        },
+        "target": {
+          "claim": {
+            "schema": "dolly.claim/v2",
+            "instance_id": "instance-1",
+            "module_id": "module-1",
+            "operation_id": "job-1:effect-intended",
+            "operation_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "claim_token": "sha256:cf5789f82466a6f2367c4cbc37350b8f4d07012ee10b12d97d9735f3e090054d"
+          },
+          "record": {
+            "schema": "dolly.external-effect-journal/v2",
+            "journal_revision": 1,
+            "state": "INTENDED",
+            "claim": {
+              "schema": "dolly.claim/v2",
+              "instance_id": "instance-1",
+              "module_id": "module-1",
+              "operation_id": "job-1:effect-intended",
+              "operation_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+              "claim_token": "sha256:cf5789f82466a6f2367c4cbc37350b8f4d07012ee10b12d97d9735f3e090054d"
+            },
+            "controller_generation": 7,
+            "extension_generation": 11,
+            "worker_epoch": "worker-epoch-1",
+            "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "policy_premise_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "operation_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "effect_class": "MCP_TOOLS_CALL",
+            "intent_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "evidence_digest": null
+          }
+        },
+        "canonical": {
+          "claim_utf8": "{\"claim_token\":\"sha256:cf5789f82466a6f2367c4cbc37350b8f4d07012ee10b12d97d9735f3e090054d\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"operation_id\":\"job-1:effect-intended\",\"schema\":\"dolly.claim/v2\"}",
+          "claim_digest": "sha256:595680e6648d07c5d600f8c1386dcbee1acd2694d326bd0f0579792aa99b4eab",
+          "record_utf8": "{\"claim\":{\"claim_token\":\"sha256:cf5789f82466a6f2367c4cbc37350b8f4d07012ee10b12d97d9735f3e090054d\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"operation_id\":\"job-1:effect-intended\",\"schema\":\"dolly.claim/v2\"},\"controller_generation\":7,\"effect_class\":\"MCP_TOOLS_CALL\",\"evidence_digest\":null,\"extension_generation\":11,\"intent_digest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"journal_revision\":1,\"operation_digest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"package_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_premise_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema\":\"dolly.external-effect-journal/v2\",\"state\":\"INTENDED\",\"worker_epoch\":\"worker-epoch-1\"}",
+          "record_digest": "sha256:d6fa12194705ae878e051d9b61e25ca06db36881eb9293f0cdb41c043de839f2",
+          "evidence_digest": null
+        },
+        "expected_state": "INTENDED"
+      },
+      {
+        "source": {
+          "schemaVersion": "dolly.effect-intent/2",
+          "moduleJobId": "module-1",
+          "runId": "run-1",
+          "attempt": 1,
+          "claimToken": "claim-token-1",
+          "moduleGenerationId": "module-generation-1",
+          "idempotencyKey": "job-1:effect-no-effect",
+          "capabilityType": "mcp",
+          "operation": "tools/call",
+          "intentDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "outcome": {
+            "kind": "no-effect",
+            "detail": "provider refused before transmission"
+          },
+          "createdAt": "2026-08-24T00:00:00.000Z",
+          "updatedAt": "2026-08-24T00:00:01.000Z"
+        },
+        "target": {
+          "claim": {
+            "schema": "dolly.claim/v2",
+            "instance_id": "instance-1",
+            "module_id": "module-1",
+            "operation_id": "job-1:effect-no-effect",
+            "operation_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "claim_token": "sha256:9898b5eecb078e2962e262cb0bb4d8a5421cb70eda74b4e40f414dfb75ea4c5c"
+          },
+          "record": {
+            "schema": "dolly.external-effect-journal/v2",
+            "journal_revision": 2,
+            "state": "NOT_APPLIED",
+            "claim": {
+              "schema": "dolly.claim/v2",
+              "instance_id": "instance-1",
+              "module_id": "module-1",
+              "operation_id": "job-1:effect-no-effect",
+              "operation_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+              "claim_token": "sha256:9898b5eecb078e2962e262cb0bb4d8a5421cb70eda74b4e40f414dfb75ea4c5c"
+            },
+            "controller_generation": 7,
+            "extension_generation": 11,
+            "worker_epoch": "worker-epoch-1",
+            "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "policy_premise_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "operation_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "effect_class": "MCP_TOOLS_CALL",
+            "intent_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "evidence_digest": "sha256:2c4f4e8b1d06a71e41e61d729708955f1af5a9104a1897721998ab804d565014"
+          }
+        },
+        "canonical": {
+          "claim_utf8": "{\"claim_token\":\"sha256:9898b5eecb078e2962e262cb0bb4d8a5421cb70eda74b4e40f414dfb75ea4c5c\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"operation_id\":\"job-1:effect-no-effect\",\"schema\":\"dolly.claim/v2\"}",
+          "claim_digest": "sha256:0c67907814468ceaf6156c4fd2a77f21b57999e89b9e96a9659214bfd08c2143",
+          "record_utf8": "{\"claim\":{\"claim_token\":\"sha256:9898b5eecb078e2962e262cb0bb4d8a5421cb70eda74b4e40f414dfb75ea4c5c\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"operation_id\":\"job-1:effect-no-effect\",\"schema\":\"dolly.claim/v2\"},\"controller_generation\":7,\"effect_class\":\"MCP_TOOLS_CALL\",\"evidence_digest\":\"sha256:2c4f4e8b1d06a71e41e61d729708955f1af5a9104a1897721998ab804d565014\",\"extension_generation\":11,\"intent_digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"journal_revision\":2,\"operation_digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"package_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_premise_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema\":\"dolly.external-effect-journal/v2\",\"state\":\"NOT_APPLIED\",\"worker_epoch\":\"worker-epoch-1\"}",
+          "record_digest": "sha256:b1ea4fd55ace0bc19e30466b672899eca76e2284fccc6d6fa45a52bdc2775333",
+          "evidence_digest": "sha256:2c4f4e8b1d06a71e41e61d729708955f1af5a9104a1897721998ab804d565014"
+        },
+        "expected_state": "NOT_APPLIED"
+      },
+      {
+        "source": {
+          "schemaVersion": "dolly.effect-intent/2",
+          "moduleJobId": "module-1",
+          "runId": "run-1",
+          "attempt": 1,
+          "claimToken": "claim-token-1",
+          "moduleGenerationId": "module-generation-1",
+          "idempotencyKey": "job-1:effect-terminal",
+          "capabilityType": "mcp",
+          "operation": "tools/call",
+          "intentDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "outcome": {
+            "kind": "terminal",
+            "resultDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "createdAt": "2026-08-24T00:00:00.000Z",
+          "updatedAt": "2026-08-24T00:00:01.000Z"
+        },
+        "target": {
+          "claim": {
+            "schema": "dolly.claim/v2",
+            "instance_id": "instance-1",
+            "module_id": "module-1",
+            "operation_id": "job-1:effect-terminal",
+            "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "claim_token": "sha256:ab52a943cdba79adf019f011e092cffdd222695a031f4bdfc246f1a791153d2c"
+          },
+          "record": {
+            "schema": "dolly.external-effect-journal/v2",
+            "journal_revision": 2,
+            "state": "APPLIED",
+            "claim": {
+              "schema": "dolly.claim/v2",
+              "instance_id": "instance-1",
+              "module_id": "module-1",
+              "operation_id": "job-1:effect-terminal",
+              "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+              "claim_token": "sha256:ab52a943cdba79adf019f011e092cffdd222695a031f4bdfc246f1a791153d2c"
+            },
+            "controller_generation": 7,
+            "extension_generation": 11,
+            "worker_epoch": "worker-epoch-1",
+            "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "policy_premise_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "effect_class": "MCP_TOOLS_CALL",
+            "intent_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "evidence_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        },
+        "canonical": {
+          "claim_utf8": "{\"claim_token\":\"sha256:ab52a943cdba79adf019f011e092cffdd222695a031f4bdfc246f1a791153d2c\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"operation_id\":\"job-1:effect-terminal\",\"schema\":\"dolly.claim/v2\"}",
+          "claim_digest": "sha256:7a0e50ea648f9f2df291a538cfa16dec507397895898e6c8d6b5cb8a56f56136",
+          "record_utf8": "{\"claim\":{\"claim_token\":\"sha256:ab52a943cdba79adf019f011e092cffdd222695a031f4bdfc246f1a791153d2c\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"operation_id\":\"job-1:effect-terminal\",\"schema\":\"dolly.claim/v2\"},\"controller_generation\":7,\"effect_class\":\"MCP_TOOLS_CALL\",\"evidence_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"extension_generation\":11,\"intent_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"journal_revision\":2,\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"package_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_premise_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema\":\"dolly.external-effect-journal/v2\",\"state\":\"APPLIED\",\"worker_epoch\":\"worker-epoch-1\"}",
+          "record_digest": "sha256:98950c149d5f7ba5fc467089f60d1763c6f54d3930caff6e7b479b30a019640d",
+          "evidence_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "expected_state": "APPLIED"
+      },
+      {
+        "source": {
+          "schemaVersion": "dolly.effect-intent/2",
+          "moduleJobId": "module-1",
+          "runId": "run-1",
+          "attempt": 1,
+          "claimToken": "claim-token-1",
+          "moduleGenerationId": "module-generation-1",
+          "idempotencyKey": "job-1:effect-unknown",
+          "capabilityType": "mcp",
+          "operation": "tools/call",
+          "intentDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+          "outcome": {
+            "kind": "unknown",
+            "reason": "response lost after request write"
+          },
+          "createdAt": "2026-08-24T00:00:00.000Z",
+          "updatedAt": "2026-08-24T00:00:01.000Z"
+        },
+        "target": {
+          "claim": {
+            "schema": "dolly.claim/v2",
+            "instance_id": "instance-1",
+            "module_id": "module-1",
+            "operation_id": "job-1:effect-unknown",
+            "operation_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "claim_token": "sha256:e5c00429927fbbc4d212e609f13cc2172598b4726bbd3ea65ca1d91ef1ae502a"
+          },
+          "record": {
+            "schema": "dolly.external-effect-journal/v2",
+            "journal_revision": 2,
+            "state": "UNKNOWN_OUTCOME",
+            "claim": {
+              "schema": "dolly.claim/v2",
+              "instance_id": "instance-1",
+              "module_id": "module-1",
+              "operation_id": "job-1:effect-unknown",
+              "operation_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+              "claim_token": "sha256:e5c00429927fbbc4d212e609f13cc2172598b4726bbd3ea65ca1d91ef1ae502a"
+            },
+            "controller_generation": 7,
+            "extension_generation": 11,
+            "worker_epoch": "worker-epoch-1",
+            "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "policy_premise_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "operation_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "effect_class": "MCP_TOOLS_CALL",
+            "intent_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "evidence_digest": null
+          }
+        },
+        "canonical": {
+          "claim_utf8": "{\"claim_token\":\"sha256:e5c00429927fbbc4d212e609f13cc2172598b4726bbd3ea65ca1d91ef1ae502a\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"operation_id\":\"job-1:effect-unknown\",\"schema\":\"dolly.claim/v2\"}",
+          "claim_digest": "sha256:010109431379605916ffba06eb92d9fb8f55012876c4cd3f6f51ca3d9bd109fd",
+          "record_utf8": "{\"claim\":{\"claim_token\":\"sha256:e5c00429927fbbc4d212e609f13cc2172598b4726bbd3ea65ca1d91ef1ae502a\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"operation_id\":\"job-1:effect-unknown\",\"schema\":\"dolly.claim/v2\"},\"controller_generation\":7,\"effect_class\":\"MCP_TOOLS_CALL\",\"evidence_digest\":null,\"extension_generation\":11,\"intent_digest\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"journal_revision\":2,\"operation_digest\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"package_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_premise_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema\":\"dolly.external-effect-journal/v2\",\"state\":\"UNKNOWN_OUTCOME\",\"worker_epoch\":\"worker-epoch-1\"}",
+          "record_digest": "sha256:d6d2d7f0da08ae674d72e05513a7a8cf315938d86571c33195ffd539ff3314e0",
+          "evidence_digest": null
+        },
+        "expected_state": "UNKNOWN_OUTCOME"
+      }
+    ],
+    "authority": {
+      "daemon_installation_id": "daemon-installation-1",
+      "instance_id": "instance-1",
+      "controller_generation": 7,
+      "process": {
+        "controller_generation": 7,
+        "extension_generation": 11,
+        "worker_epoch": "worker-epoch-1",
+        "binding_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "session_id": "session-1",
+        "process_id": 4242
+      },
+      "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "policy_premise_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "provenance": {
+        "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "executable_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "transport_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      }
+    },
+    "canonical_transport": {
+      "extension_payload_utf8": "{\"id\":\"effect-1\",\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"arguments\":{\"body\":\"hello\"},\"name\":\"send\"}}",
+      "extension_payload_sha256": "sha256:576e522ba964fd60808050a3520450ca0a013e68c8cd304aa8a4ae1a43c5a52a",
+      "extension_length_be": 109,
+      "mcp_payload_utf8": "{\"id\":\"effect-1\",\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"arguments\":{\"body\":\"hello\"},\"name\":\"send\"}}",
+      "mcp_payload_sha256": "sha256:576e522ba964fd60808050a3520450ca0a013e68c8cd304aa8a4ae1a43c5a52a",
+      "mcp_line_utf8": "{\"id\":\"effect-1\",\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"arguments\":{\"body\":\"hello\"},\"name\":\"send\"}}\n",
+      "mcp_line_bytes": 110,
+      "extension_wire_depth": 3,
+      "mcp_wire_depth": 3
+    },
+    "public_bridge": {
+      "daemon_to_worker_transport": "absent",
+      "ffi": "absent",
+      "disposition": "blocked-no-go"
+    }
+  },
+  "stimulus": {
+    "events": [
+      "validate_closed_contract",
+      "canonicalize_each_target_claim_and_record",
+      "compare_extension_and_mcp_frame_profiles",
+      "replay_claim_intent",
+      "mismatch_each_identity_pair"
+    ]
+  },
+  "expected": {
+    "outcome": "schema_and_jcs_contract_only_no_public_bridge",
+    "assertions": [
+      {
+        "path": "/cases",
+        "op": "count",
+        "value": 4
+      },
+      {
+        "path": "/cases/0/target/record/state",
+        "op": "equals",
+        "value": "INTENDED"
+      },
+      {
+        "path": "/cases/1/target/record/state",
+        "op": "equals",
+        "value": "NOT_APPLIED"
+      },
+      {
+        "path": "/cases/2/target/record/state",
+        "op": "equals",
+        "value": "APPLIED"
+      },
+      {
+        "path": "/cases/3/target/record/state",
+        "op": "equals",
+        "value": "UNKNOWN_OUTCOME"
+      },
+      {
+        "path": "/ordering/replay",
+        "op": "equals",
+        "value": "refuse-without-new-claim"
+      }
+    ],
+    "emitted": [
+      {
+        "event": "CrossLanguageEffectJournalVectorValidated"
+      }
+    ],
+    "crash_label": "public_daemon_worker_transport_absent"
+  }
+}
