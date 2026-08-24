@@ -561,30 +561,55 @@ impl ToolCallLedgerRecord {
     }
 }
 
-/// The verified facts a pure recovery decision reads from outside the closed
-/// record (spec §6): the record's exact-generation availability, whether its
-/// stored deadline has expired, and whether the exclusive send gate
-/// establishes zero-byte proof. No other fact is consulted.
+/// Host-owned recovery evidence for a nonterminal ledger row. These values are
+/// intentionally not accepted from Worker callers; the coordinator derives
+/// them only after its authoritative generation/fence checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryFacts {
-    /// Whether the exclusive transport gate proves zero bytes were eligible
-    /// or sent (INV-STORAGE-017 zero-byte proof).
-    pub zero_bytes_proved: bool,
-    /// Whether the record's frozen generation is still `Ready` for the
-    /// retained revision.
-    pub exact_generation_ready: bool,
-    /// Whether the record's authorized deadline has expired.
-    pub deadline_expired: bool,
+    pub(crate) zero_bytes_proved: bool,
+    pub(crate) exact_generation_ready: bool,
+    pub(crate) deadline_expired: bool,
+}
+
+impl RecoveryFacts {
+    /// Build facts only at the coordinator's Host-owned fence boundary.
+    /// Worker callers do not receive this authority as a dispatch argument.
+    pub fn from_authoritative_inputs(
+        zero_bytes_proved: bool,
+        exact_generation_ready: bool,
+        deadline_expired: bool,
+    ) -> Self {
+        Self {
+            zero_bytes_proved,
+            exact_generation_ready,
+            deadline_expired,
+        }
+    }
+
+    /// Facts for a newly accepted AUTHORIZED row immediately before its first
+    /// dispatch. The coordinator has already revalidated the current
+    /// authority and the row's persisted deadline.
+    pub fn for_authorized_dispatch() -> Self {
+        Self::from_authoritative_inputs(true, true, false)
+    }
+
+    /// Inspect whether the authoritative fence proved zero eligible bytes.
+    pub fn zero_bytes_proved(&self) -> bool {
+        self.zero_bytes_proved
+    }
+
+    /// Inspect current exact-generation readiness.
+    pub fn exact_generation_ready(&self) -> bool {
+        self.exact_generation_ready
+    }
+
+    /// Inspect authoritative deadline expiry.
+    pub fn deadline_expired(&self) -> bool {
+        self.deadline_expired
+    }
 }
 
 /// The recovery decision for a durable Tool-call row.
-///
-/// Every variant is terminal for the *decision*: none re-dispatches,
-/// re-resolves, or re-authorizes the same identity. Re-authorization after
-/// `not_applied` is a separately authorized fresh operation outside this
-/// crate's boundary. `ProposeDispatch` is the only proposal that may later
-/// cross the durable boundary, and only through the caller's successful
-/// compare-and-set before any send permit (REQ-TOOL-006 / INV-STORAGE-017).
 #[derive(Debug, Clone, PartialEq)]
 pub enum DispatchDisposition {
     /// The row already records a terminal result; replay it verbatim.
@@ -598,11 +623,11 @@ pub enum DispatchDisposition {
         allow_send_permit: bool,
     },
     /// Authoritative zero-byte non-application: FAILED /
-    /// TOOL_DISPATCH_NOT_APPLIED. The row identity and digests are kept.
+    /// `TOOL_DISPATCH_NOT_APPLIED`. The row identity and digests are kept.
     ProvedNotApplied { result: ToolResult },
-    /// The durable dispatch boundary may have been crossed (DISPATCHED, or an
-    /// AUTHORIZED row without zero-byte proof): UNKNOWN /
-    /// TOOL_EXTERNAL_OUTCOME_UNKNOWN. Never relabeled failed.
+    /// The durable dispatch boundary may have been crossed (`DISPATCHED`, or
+    /// an `AUTHORIZED` row without zero-byte proof): UNKNOWN /
+    /// `TOOL_EXTERNAL_OUTCOME_UNKNOWN`. Never relabeled failed.
     Unknown { result: ToolResult },
 }
 

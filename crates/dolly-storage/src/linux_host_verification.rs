@@ -249,10 +249,9 @@ impl VerifiedLinuxHostProof {
     }
 }
 /// Test-only proof constructor bound strictly to the current authority's
-/// persisted premise. Gated to `cfg(test)` and the `test-support` feature so a
-/// Worker/coordinator integration test can provision the durable Worker
-/// (start, dispatch, reopen) without a live Host observation.
-#[cfg(any(test, feature = "test-support"))]
+/// persisted premise. It is compiled only into this crate's unit tests, never
+/// into any production library artifact.
+#[cfg(test)]
 pub fn test_proof_for_authority(
     snapshot: &CurrentAuthoritySnapshot,
 ) -> VerifiedLinuxHostProof {

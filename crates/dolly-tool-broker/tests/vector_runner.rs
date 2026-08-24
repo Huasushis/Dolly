@@ -171,11 +171,7 @@ fn arguments_fixture() -> Value {
 
 /// Facts that make a crashed `DISPATCHED`/unfenced row ambiguous.
 fn unknown_facts() -> RecoveryFacts {
-    RecoveryFacts {
-        zero_bytes_proved: false,
-        exact_generation_ready: false,
-        deadline_expired: false,
-    }
+    RecoveryFacts::from_authoritative_inputs(false, false, false)
 }
 
 /// Build a closed `ToolCallLedgerRecord` for a vector initial state. `outbound`

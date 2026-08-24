@@ -1068,6 +1068,21 @@ fn initialized_notification() -> Result<Vec<u8>, StdioTransportError> {
         .map(|(bytes, _)| bytes.into_vec())
         .map_err(|_| StdioTransportError::InvalidFrame)
 }
+/// Digest the exact bytes sent by the versioned startup lifecycle. The
+/// response is deliberately excluded from authority; it is consumed only by
+/// the readiness verifier after this intent is durable.
+pub(crate) fn initialize_handshake_digest() -> Result<Sha256Digest, StdioTransportError> {
+    let request = initialize_request()?;
+    let notification = initialized_notification()?;
+    let descriptor = serde_json::json!({
+        "schema": "dolly.mcp-initialize-handshake/v1",
+        "initialize_request": request,
+        "initialized_notification": notification,
+    });
+    canonicalize(&descriptor)
+        .map(|(_, digest)| digest)
+        .map_err(|_| StdioTransportError::InvalidFrame)
+}
 
 fn validate_initialize_response(
     bytes: &[u8],

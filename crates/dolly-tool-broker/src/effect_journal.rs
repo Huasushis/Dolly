@@ -30,14 +30,14 @@ use crate::dispatch::ToolCallLedgerRecord;
 use crate::result::ToolErrorCode;
 
 /// The wire discriminator of the durable external-effect journal record.
-pub const EFFECT_JOURNAL_RECORD_SCHEMA: &str = "dolly.external-effect-journal/v1";
+pub const EFFECT_JOURNAL_RECORD_SCHEMA: &str = "dolly.external-effect-journal/v2";
 /// The wire discriminator of the embedded Claim record.
-pub const CLAIM_RECORD_SCHEMA: &str = "dolly.claim/v1";
+pub const CLAIM_RECORD_SCHEMA: &str = "dolly.claim/v2";
 /// Schema version of the journal record format. Recovery fails closed on any
 /// version mismatch (a later journal schema upgrade must keep this constant).
-pub const EFFECT_JOURNAL_SCHEMA_VERSION: u64 = 1;
+pub const EFFECT_JOURNAL_SCHEMA_VERSION: u64 = 2;
 
-/// The external-effect classes the journal records (v1 closed set). Every
+/// The external-effect classes the journal records (v2 closed set). Every
 /// journal row binds its exact effect class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -45,6 +45,11 @@ pub enum EffectClass {
     /// Writing one JSON-RPC `tools/call` frame to the installed MCP
     /// server's stdio.
     McpToolsCall,
+    /// The versioned MCP startup initialize/initialized child-I/O lifecycle.
+    /// This is a non-effect premise: it is journaled so startup never performs
+    /// unrecorded child I/O and recovery can only settle it, never replay it.
+    #[serde(rename = "MCP_INITIALIZE_HANDSHAKE_V1")]
+    McpInitializeHandshake,
 }
 
 impl EffectClass {
@@ -53,6 +58,7 @@ impl EffectClass {
     pub fn wire_name(self) -> &'static str {
         match self {
             EffectClass::McpToolsCall => "MCP_TOOLS_CALL",
+            EffectClass::McpInitializeHandshake => "MCP_INITIALIZE_HANDSHAKE_V1",
         }
     }
 
@@ -60,6 +66,7 @@ impl EffectClass {
     pub fn from_wire(spelling: &str) -> Option<Self> {
         match spelling {
             "MCP_TOOLS_CALL" => Some(EffectClass::McpToolsCall),
+            "MCP_INITIALIZE_HANDSHAKE_V1" => Some(EffectClass::McpInitializeHandshake),
             _ => None,
         }
     }
@@ -156,7 +163,7 @@ impl<'de> Deserialize<'de> for ClaimRecordSchemaTag {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Claim {
-    /// Wire discriminator: fixed `dolly.claim/v1`.
+    /// Wire discriminator: fixed `dolly.claim/v2`.
     pub schema: ClaimRecordSchemaTag,
     /// The Host instance identity.
     pub instance_id: String,
@@ -164,12 +171,15 @@ pub struct Claim {
     pub module_id: String,
     /// The original tool operation identity.
     pub operation_id: String,
+    /// Digest of the complete frozen operation binding.
+    pub operation_digest: Sha256Digest,
     /// Deterministic token of the exact attempt.
     pub claim_token: Sha256Digest,
 }
 
 /// Deterministically derive the token of the attempt from its full context
-/// (operation identity + crash-safe authority/package/policy/effect context).
+/// (operation identity + operation digest + crash-safe authority/package/
+/// policy/effect context).
 ///
 /// A new attempt under a changed context yields a new Claim; resetting
 /// nothing and re-deriving the same context reproduces the same Claim, which
@@ -179,6 +189,7 @@ pub fn derive_claim_token(
     instance_id: &str,
     module_id: &str,
     operation_id: &str,
+    operation_digest: &Sha256Digest,
     controller_generation: u64,
     extension_generation: u64,
     worker_epoch: &str,
@@ -187,9 +198,11 @@ pub fn derive_claim_token(
     effect_class: EffectClass,
 ) -> Sha256Digest {
     let context = serde_json::json!({
+        "schema": CLAIM_RECORD_SCHEMA,
         "instance_id": instance_id,
         "module_id": module_id,
         "operation_id": operation_id,
+        "operation_digest": operation_digest,
         "controller_generation": controller_generation,
         "extension_generation": extension_generation,
         "worker_epoch": worker_epoch,
@@ -200,10 +213,6 @@ pub fn derive_claim_token(
     let (bytes, _) = canonicalize(&context).expect("claim context is canonicalizable");
     Sha256Digest::compute(bytes.as_ref())
 }
-
-/// One durable external-effect journal row: the exact closed
-/// `dolly.external-effect-journal/v1` record.
-///
 /// A row stores only identities and digests; it never stores arguments,
 /// response payloads, or credentials. The intent digest is the digest of the
 /// item the Worker intends to apply (v1: the exact request frame bytes); the
@@ -292,6 +301,7 @@ impl ExternalEffectJournalRecord {
             &self.claim.instance_id,
             &self.claim.module_id,
             &self.claim.operation_id,
+            &self.operation_digest,
             self.controller_generation,
             self.extension_generation,
             &self.worker_epoch,
@@ -302,12 +312,17 @@ impl ExternalEffectJournalRecord {
     }
 
     /// Validate the record against the closed state-machine constraints plus
-    /// the exact claim token. Any invalid combination is corruption, never
-    /// a reinterpretation.
+    /// the exact claim token and operation binding. Any invalid combination is
+    /// corruption, never a reinterpretation.
     pub fn verify(&self) -> Result<(), EffectJournalRecordError> {
         if self.journal_revision == 0 {
             return Err(EffectJournalRecordError(
                 "journal_revision must be >= 1".into(),
+            ));
+        }
+        if self.claim.operation_digest != self.operation_digest {
+            return Err(EffectJournalRecordError(
+                "Claim operation_digest does not match the journal operation_digest".into(),
             ));
         }
         if self.recompute_claim_token() != self.claim.claim_token {
@@ -364,7 +379,7 @@ pub enum EffectSettlement {
 ///
 /// `ledger` is the authoritative Tool-call ledger record of the exact same
 /// operation — the only deterministic provider-specific evidence admitted by
-/// v1. The operation identity must match the exact Claim, and the recorded
+/// v2. The operation identity must match the exact Claim, and the recorded
 /// `intent_digest` must equal the ledger's dispatched `outbound_digest`;
 /// absence, ACK, response, cache, readiness, process exit, or stale authority
 /// never settles `APPLIED`/`NOT_APPLIED`.
@@ -372,15 +387,14 @@ pub fn recover_effect_journal(
     record: &ExternalEffectJournalRecord,
     ledger: Option<&ToolCallLedgerRecord>,
 ) -> EffectSettlement {
-    if record.state != EffectJournalState::Intended {
+    if record.state != EffectJournalState::Intended
+        || record.effect_class != EffectClass::McpToolsCall
+    {
         return EffectSettlement::UnknownOutcome;
     }
     let Some(ledger) = ledger else {
         return EffectSettlement::UnknownOutcome;
     };
-    if ledger.verify_field_combination().is_err() {
-        return EffectSettlement::UnknownOutcome;
-    }
     let binding = &ledger.operation_binding;
     // Evidence identity must match the same Claim and generation: operation
     // identity must match exactly (instance/module/operation and digest), and

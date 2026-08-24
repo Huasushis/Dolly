@@ -5,9 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[features]
-default = []
-test-support = ["dolly-storage/test-support", "dolly-tool-coordinator/test-support"]
 
 [dependencies]
 dolly-canonical-json = { path = "../dolly-canonical-json" }
@@ -16,6 +13,7 @@ dolly-storage = { path = "../dolly-storage" }
 dolly-tool-broker = { path = "../dolly-tool-broker" }
 dolly-tool-coordinator = { path = "../dolly-tool-coordinator" }
 getrandom = "0.3.4"
+serde_json = "1"
 thiserror = "2"
 
 [dev-dependencies]

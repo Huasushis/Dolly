@@ -17,17 +17,18 @@ use std::process::Child;
 use std::time::Instant;
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
-use dolly_storage::effect_journal::EffectJournalIntentAuthority;
-#[cfg(feature = "test-support")]
-use dolly_storage::mcp_readiness::test_prove_current_mcp_transport_readiness;
+use dolly_storage::effect_journal::{
+    EffectJournalIntentAuthority, retain_settled_effect_journal, settle_pending_effect_journal,
+    settle_unknown_intent,
+};
 use dolly_storage::mcp_readiness::{
     McpReadinessError, McpTransportReadiness, prove_current_mcp_transport_readiness,
 };
-use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::{
     ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
     validate_dispatch_binding,
 };
+use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_ledger::{
     CasKey, TransportCorrelation, cas_terminal, cas_to_dispatched, load_exact,
 };
@@ -141,6 +142,11 @@ impl HostMcpStdioInvocation {
     pub fn set_request_bytes(&mut self, request_bytes: Vec<u8>) {
         self.request_bytes = request_bytes;
     }
+    /// Digest of the exact versioned initialize request plus initialized
+    /// notification bytes that the next lifecycle will send.
+    pub fn initialize_intent_digest(&self) -> Result<Sha256Digest, StdioTransportError> {
+        crate::mcp_stdio::initialize_handshake_digest()
+    }
 
     /// Complete the one MCP initialize/initialized lifecycle on this exact
     /// verified child. The resulting readiness is consumer-only evidence; the
@@ -163,30 +169,6 @@ impl HostMcpStdioInvocation {
         )
     }
 
-    /// Test-support initialize: drives the identical production
-    /// initialize/handshake path but proves MCP transport readiness from the
-    /// current authority's persisted Host premise (via
-    /// `test_prove_current_mcp_transport_readiness`) instead of re-observing
-    /// the live Linux host. Gated to the `test-support` feature; production
-    /// builds never expose it.
-    #[cfg(feature = "test-support")]
-    pub fn initialize_with_verified_proof(
-        &mut self,
-        database: &Database,
-        runtime_binding: &RuntimeBinding,
-        process_generation: &ProcessGeneration,
-        server_id: &str,
-        deadline: Instant,
-    ) -> Result<McpTransportReadiness, StdioTransportError> {
-        self.initialize_with_readiness(
-            database,
-            runtime_binding,
-            process_generation,
-            server_id,
-            deadline,
-            test_prove_current_mcp_transport_readiness,
-        )
-    }
 
     /// Complete the one MCP initialize/initialized lifecycle on this exact
     /// verified child using the supplied readiness prover. The resulting
@@ -367,13 +349,40 @@ pub fn dispatch_operation_authorized(
         return Err(DispatchError::Storage(error));
     }
     let outcome = dispatch_operation(db, &row, facts)?;
-    let DispatchOutcome::Dispatched {
-        record: _,
-        permit: Some(permit),
-    } = outcome
-    else {
-        invocation.host_handle.terminate();
-        return Ok(outcome);
+    let permit = match outcome {
+        DispatchOutcome::Dispatched {
+            record: _,
+            permit: Some(permit),
+        } => permit,
+        DispatchOutcome::Dispatched {
+            record,
+            permit: None,
+        } => {
+            // A committed DISPATCHED row without an eligible permit is
+            // immediately ambiguous. Terminalize the ledger and journal it
+            // before returning; never leave a live child/session behind.
+            invocation.host_handle.terminate();
+            let terminal = dispatch_operation(db, &record, facts)?;
+            if matches!(terminal, DispatchOutcome::Dispatched { .. }) {
+                return match settle_unknown_intent(db.connection_mut(), journal_authority) {
+                    Ok(_) => Err(DispatchError::Ambiguous),
+                    Err(storage_error) => Err(DispatchError::Storage(storage_error)),
+                };
+            }
+            settle_unknown_intent(db.connection_mut(), journal_authority)
+                .map_err(DispatchError::Storage)?;
+            return Ok(match terminal {
+                DispatchOutcome::Stale { authoritative } => {
+                    dispatch_operation(db, &authoritative, facts)?
+                }
+                other => other,
+            });
+        }
+        other => {
+            invocation.host_handle.terminate();
+            settle_and_retain(db)?;
+            return Ok(other);
+        }
     };
     let parts = invocation.into_parts();
     let request_bytes = parts.request_bytes;
@@ -405,8 +414,15 @@ pub fn dispatch_operation_authorized(
         HostMcpStdioSessionState::Consumed => {
             service.settle_admission_unknown(db, parts.host_handle, permit, &request_bytes)
         }
-    }
-    .map_err(|error| DispatchError::Stdio(error.message()))?;
+    };
+    let service_outcome = match service_outcome {
+        Ok(outcome) => outcome,
+        Err(error) => match settle_unknown_intent(db.connection_mut(), journal_authority) {
+            Ok(_) => return Err(DispatchError::Stdio(error.message())),
+            Err(storage_error) => return Err(DispatchError::Storage(storage_error)),
+        },
+    };
+    settle_and_retain(db)?;
     map_service_outcome(service_outcome)
 }
 
@@ -452,12 +468,37 @@ pub fn dispatch_operation_authorized_reusable(
         return Err(DispatchError::Storage(error));
     }
     let outcome = dispatch_operation(db, &row, facts)?;
-    let DispatchOutcome::Dispatched {
-        record: _,
-        permit: Some(permit),
-    } = outcome
-    else {
-        return Ok(outcome);
+    let permit = match outcome {
+        DispatchOutcome::Dispatched {
+            record: _,
+            permit: Some(permit),
+        } => permit,
+        DispatchOutcome::Dispatched {
+            record,
+            permit: None,
+        } => {
+            invocation.host_handle.terminate();
+            let terminal = dispatch_operation(db, &record, facts)?;
+            if matches!(terminal, DispatchOutcome::Dispatched { .. }) {
+                return match settle_unknown_intent(db.connection_mut(), journal_authority) {
+                    Ok(_) => Err(DispatchError::Ambiguous),
+                    Err(storage_error) => Err(DispatchError::Storage(storage_error)),
+                };
+            }
+            settle_unknown_intent(db.connection_mut(), journal_authority)
+                .map_err(DispatchError::Storage)?;
+            return Ok(match terminal {
+                DispatchOutcome::Stale { authoritative } => {
+                    dispatch_operation(db, &authoritative, facts)?
+                }
+                other => other,
+            });
+        }
+        other => {
+            invocation.host_handle.terminate();
+            settle_and_retain(db)?;
+            return Ok(other);
+        }
     };
     let service_outcome = match &mut invocation.session {
         HostMcpStdioSessionState::Prepared(probe) => service.dispatch_prepared_reusable(
@@ -478,9 +519,21 @@ pub fn dispatch_operation_authorized_reusable(
                 permit,
                 &invocation.request_bytes,
             ),
-    }
-    .map_err(|error| DispatchError::Stdio(error.message()))?;
+    };
+    let service_outcome = match service_outcome {
+        Ok(outcome) => outcome,
+        Err(error) => match settle_unknown_intent(db.connection_mut(), journal_authority) {
+            Ok(_) => return Err(DispatchError::Stdio(error.message())),
+            Err(storage_error) => return Err(DispatchError::Storage(storage_error)),
+        },
+    };
+    settle_and_retain(db)?;
     map_service_outcome(service_outcome)
+}
+fn settle_and_retain(db: &mut Database) -> Result<(), DispatchError> {
+    settle_pending_effect_journal(db).map_err(DispatchError::Storage)?;
+    retain_settled_effect_journal(db).map_err(DispatchError::Storage)?;
+    Ok(())
 }
 fn map_service_outcome(outcome: ServiceOutcome) -> Result<DispatchOutcome, DispatchError> {
     match outcome {
