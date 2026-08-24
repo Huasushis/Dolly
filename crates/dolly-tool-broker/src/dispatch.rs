@@ -561,36 +561,42 @@ impl ToolCallLedgerRecord {
     }
 }
 
-/// Host-owned recovery evidence for a nonterminal ledger row. These values are
-/// intentionally not accepted from Worker callers; the coordinator derives
-/// them only after its authoritative generation/fence checks.
+/// Host-owned recovery evidence for a nonterminal ledger row. The fields are
+/// private so callers cannot mint individual authority booleans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryFacts {
-    pub(crate) zero_bytes_proved: bool,
-    pub(crate) exact_generation_ready: bool,
-    pub(crate) deadline_expired: bool,
+    zero_bytes_proved: bool,
+    exact_generation_ready: bool,
+    deadline_expired: bool,
+}
+
+/// An authoritative recovery-fence source. Implementations are an unsafe
+/// boundary: only the coordinator's Host-owned fence may implement this
+/// trait. In particular, callers MUST NOT implement it merely to mint
+/// recovery authority; Worker dispatch does not accept this trait.
+///
+/// The unsafe marker makes any attempt to forge recovery facts an explicit
+/// unsafe opt-in rather than a safe public bool constructor.
+pub unsafe trait RecoveryFactsSource {
+    fn facts_for(&self, record: &ToolCallLedgerRecord) -> (bool, bool, bool);
 }
 
 impl RecoveryFacts {
-    /// Build facts only at the coordinator's Host-owned fence boundary.
-    /// Worker callers do not receive this authority as a dispatch argument.
-    pub fn from_authoritative_inputs(
-        zero_bytes_proved: bool,
-        exact_generation_ready: bool,
-        deadline_expired: bool,
+    /// Derive an opaque facts value from an authoritative fence source for
+    /// this exact closed ledger row.
+    ///
+    /// There is deliberately no public constructor accepting booleans.
+    pub fn from_authoritative_source(
+        source: &dyn RecoveryFactsSource,
+        record: &ToolCallLedgerRecord,
     ) -> Self {
+        let (zero_bytes_proved, exact_generation_ready, deadline_expired) =
+            source.facts_for(record);
         Self {
             zero_bytes_proved,
             exact_generation_ready,
             deadline_expired,
         }
-    }
-
-    /// Facts for a newly accepted AUTHORIZED row immediately before its first
-    /// dispatch. The coordinator has already revalidated the current
-    /// authority and the row's persisted deadline.
-    pub fn for_authorized_dispatch() -> Self {
-        Self::from_authoritative_inputs(true, true, false)
     }
 
     /// Inspect whether the authoritative fence proved zero eligible bytes.

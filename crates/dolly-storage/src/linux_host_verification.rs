@@ -249,10 +249,10 @@ impl VerifiedLinuxHostProof {
     }
 }
 /// Test-only proof constructor bound strictly to the current authority's
-/// persisted premise. It is compiled only into this crate's unit tests, never
-/// into any production library artifact.
-#[cfg(test)]
-pub fn test_proof_for_authority(
+/// persisted premise. It is compiled only into test-support artifacts, never
+/// into a default production library artifact.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_proof_for_authority(
     snapshot: &CurrentAuthoritySnapshot,
 ) -> VerifiedLinuxHostProof {
     let premise = snapshot

@@ -6,23 +6,23 @@
 //! No downstream ACK/result/error/absence is read as permission: the only
 //! inputs are the verified closed rows and the injected `RecoveryFacts`.
 
+use std::time::SystemTime;
 use dolly_storage::Database;
 use dolly_storage::mcp_readiness::McpTransportReadiness;
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::{
-    ToolDispatchAuthority, revalidate_tool_dispatch_authority, validate_dispatch_binding,
+    ToolDispatchAuthority, revalidate_tool_dispatch_authority,
 };
 use dolly_storage::tool_ledger::enumerate_nonterminal;
-
 use crate::dispatch::{DispatchError, DispatchOutcome, dispatch_operation};
 use crate::permit::SendPermit;
-use crate::ports::RecoveryFactsProvider;
+use crate::ports::{Clock, FencedFactsProvider, RecoveryFactsProvider};
 
 /// Upper bound on pure re-decisions per row during one recovery pass.
 const MAX_DECISIONS_PER_ROW: usize = 6;
 /// The outcome of a full reopen recovery run.
 #[derive(Debug)]
-pub(crate) struct RecoveryOutcome {
+pub struct RecoveryOutcome {
     /// Number of nonterminal rows enumerated in deterministic
     /// `(module_id, operation_id)` order.
     pub rows_visited: usize,
@@ -36,13 +36,49 @@ pub(crate) struct RecoveryOutcome {
     pub permits: Vec<SendPermit>,
 }
 
+/// Wall clock used by the coordinator's conservative reopen fence.
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+/// Reopen recovery boundary used by Worker startup. It derives conservative
+/// no-send facts inside the coordinator fence, so persisted nonterminal rows
+/// become terminal UNKNOWN/NOT_APPLIED and are never redispatched.
+pub fn reopen_recovery(
+    db: &mut Database,
+    authority: &ToolDispatchAuthority,
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    readiness: &McpTransportReadiness,
+) -> Result<RecoveryOutcome, DispatchError> {
+    let clock = SystemClock;
+    let facts = FencedFactsProvider {
+        zero_bytes_proved: false,
+        readiness,
+        clock: &clock,
+    };
+    reopen_recovery_with_facts(
+        db,
+        authority,
+        runtime_binding,
+        process_generation,
+        readiness,
+        &facts,
+    )
+}
+
 /// Run reopen recovery with one producer-issued authority and the Host-owned
 /// facts provider. Authority and current premises are revalidated before every
 /// row disposition, so stale recovery cannot reach CAS or release a permit.
 ///
-/// Fails closed: a corrupt row, storage error, stale authority, or unbounded
-/// stale loop stops the whole recovery with `Err`.
-pub(crate) fn reopen_recovery(
+/// Fails closed: corrupt rows or storage errors stop the pass. A stale row's
+/// current-generation facts make it terminal UNKNOWN/NOT_APPLIED; it is never
+/// redispatched.
+pub(crate) fn reopen_recovery_with_facts(
     db: &mut Database,
     authority: &ToolDispatchAuthority,
     runtime_binding: &RuntimeBinding,
@@ -72,12 +108,6 @@ pub(crate) fn reopen_recovery(
                 runtime_binding,
                 process_generation,
                 readiness,
-            )?;
-            validate_dispatch_binding(
-                authority,
-                current.operation_binding.config_revision as i64,
-                &current.operation_binding.tool_server_id,
-                current.operation_binding.tool_server_generation,
             )?;
             let outcome_step = dispatch_operation(db, &current, &row_facts)?;
             match outcome_step {

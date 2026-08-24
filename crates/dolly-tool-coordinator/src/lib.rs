@@ -30,26 +30,24 @@ pub mod recovery;
 pub mod service;
 
 #[cfg(test)]
-pub(crate) use dispatch::dispatch_operation;
+pub(crate) use dispatch::{dispatch_operation, load_authoritative_row};
 
 #[cfg(test)]
 mod coordinator_tests;
 #[cfg(test)]
 mod service_tests;
 
-pub(crate) use dispatch::load_authoritative_row;
 pub use dispatch::{
     DispatchError, DispatchOutcome, HostMcpStdioInvocation, dispatch_operation_authorized,
     dispatch_operation_authorized_reusable,
 };
 pub use mcp_stdio::{
-    HostMcpStdioInstalledChildAttestation, HostMcpStdioProcessHandle, StdioTransportError,
-    StdioTransportLimits,
+    HostMcpStdioInstalledChildAttestation, HostMcpStdioProcessHandle,
+    StdioTransportError, StdioTransportLimits, initialize_handshake_digest,
 };
 pub use permit::{SendPermit, SendPermitBinding};
 pub use ports::{Clock, FencedFactsProvider, GenerationReadiness, RecoveryFactsProvider};
-#[cfg(test)]
-pub(crate) use recovery::{RecoveryOutcome, reopen_recovery};
+pub use recovery::{RecoveryOutcome, reopen_recovery};
 pub use service::{
     DispatchLimits, ServiceError, ServiceOutcome, ToolDispatchService, ToolResponseEnvelope,
     ToolTransport, TransportOutcome,

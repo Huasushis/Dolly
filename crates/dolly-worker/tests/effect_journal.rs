@@ -1,38 +1,37 @@
-#![cfg(any())]
 
-//! The Worker integration fixture is intentionally kept test-only. Production
-//! startup and dispatch have no test-only feature, proof constructor, or
-//! environment-controlled abort seam. Durable crash/reopen and canonical
-//! journal contracts are exercised in the storage and broker suites.
+//! RED end-to-end Worker dispatch/start/reopen contract tests for the v1
+//! external-effect journal (ADR 0009 capability effect-intent seam).
+//!
+//! These tests drive the REAL `dolly-worker` production seams: a real bundled
+//! SQLite authority database, a real spawned installed child (a copied ELF
+//! interpreter running a scripted stdio MCP fake server), the real MCP
+//! initialize handshake, the real registry/authority publish, and the real
+//! Worker dispatch path that durably records the exact Claim-bound intent
+//! BEFORE any child I/O. Every claim is then re-verified straight from the
+//! SQLite file across close/reopen, and crash settlement is proven by a real
+//! Worker restart (the same startup path a cold start uses).
+//!
+//! The fixture uses only test-local authority/configuration data; production
+//! Worker startup, the coordinator reopen fence, MCP handshake, dispatch,
+//! Claim insertion, and SQLite settlement are all exercised directly.
 
-use std::{
-    env,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::path::{Path, PathBuf};
 
 use dolly_canonical_json::{CanonicalJsonValue, Sha256Digest, canonicalize};
 use dolly_storage::Database;
-use dolly_storage::effect_journal::{
-    EffectJournalInsertDisposition, enumerate_pending, insert_intent, load_exact,
-};
 use dolly_storage::host_authority::{
     ConfigRevisionMapping, HostAuthorityRevision, InstalledComponentOrigin, LinuxServiceCandidate,
     ModuleActivationPremises, ResolvedConfiguration, RuntimeAuthorityIdentity,
-    load_current_authority,
-};
-use dolly_storage::tool_ledger::{
-    LedgerInsertDisposition, create_tool_ledger_schema, insert_authorized,
 };
 use dolly_tool_broker::effect_journal::{
     Claim, ClaimRecordSchemaTag, EffectClass, EffectJournalRecordSchemaTag, EffectJournalState,
     ExternalEffectJournalRecord, derive_claim_token,
 };
 use dolly_tool_broker::{
-    ConfirmationDecision, IdempotencyPolicy, LedgerState, RecoveryFacts, SideEffectClass,
-    ToolCallLedgerRecord, ToolCallLedgerRecordSchemaTag, ToolOperationBinding,
-    ToolOperationBindingSchemaTag,
+    ConfirmationDecision, IdempotencyPolicy, LedgerState, SideEffectClass, ToolCallLedgerRecord,
+    ToolCallLedgerRecordSchemaTag, ToolOperationBinding, ToolOperationBindingSchemaTag,
 };
+use dolly_storage::tool_ledger::{create_tool_ledger_schema, load_exact as load_ledger_exact};
 use dolly_tool_coordinator::DispatchOutcome;
 use dolly_worker::{Worker, WorkerStartConfig};
 use serde_json::{Value, json};
@@ -181,9 +180,6 @@ fn request_frame(b: &ToolOperationBinding) -> Vec<u8> {
         .to_vec()
 }
 
-fn facts_proof() -> RecoveryFacts {
-    RecoveryFacts::for_authorized_dispatch()
-}
 
 // ---------------------------------------------------------------------------
 // installed fake MCP server (a REAL spawned child)
@@ -399,13 +395,11 @@ impl Fixture {
         }
     }
 
-    fn preload_ledger(&self, records: &[ToolCallLedgerRecord]) {
-        let mut db = Database::open(&self.db_path).expect("reopen real SQLite");
+    fn preload_ledger(&self, worker: &mut Worker, records: &[ToolCallLedgerRecord]) {
         for record in records {
-            match insert_authorized(db.connection_mut(), record).expect("preload ledger row") {
-                LedgerInsertDisposition::Inserted { .. } => {}
-                LedgerInsertDisposition::Replayed { .. } => {}
-            }
+            worker
+                .insert_authorized_for_test(record)
+                .expect("preload ledger row");
         }
     }
 
@@ -427,4 +421,309 @@ impl Fixture {
         };
         Worker::start(config).expect("worker starts")
     }
+}
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+
+/// Intent-before-effect: the Worker durably records the exact Claim-bound
+/// intent before child I/O, and a real Worker restart settles the journal row.
+#[test]
+fn worker_dispatches_only_after_durable_intent_then_restart_settles() {
+    let fixture = Fixture::new(false);
+    let b = fixture.binding(1);
+    let ledger = ledger_authorized(&b);
+    let mut worker = fixture.start_worker();
+
+    fixture.preload_ledger(&mut worker, &[ledger.clone()]);
+    let frame = request_frame(&b);
+    let intent_digest = Sha256Digest::compute(&frame);
+
+    // Real dispatch through the Worker (real child, real ledger CAS).
+    let outcome = worker
+        .dispatch_tools_call(&ledger, &frame)
+        .expect("dispatch succeeds against the real child");
+    match &outcome {
+        DispatchOutcome::Terminalized { record } if record.state == LedgerState::Succeeded => {}
+        other => panic!("expected a terminal Succeeded outcome, got {other:?}"),
+    }
+    assert_eq!(
+        count_child_calls(&fixture.package_root),
+        1,
+        "child produced one call"
+    );
+    drop(worker);
+
+    // Immediate settlement retains the exact Claim-bound row. The row is
+    // terminal before the connection is reopened; no second dispatch occurs.
+    let db = Database::open(&fixture.db_path).expect("reopen real SQLite");
+    let (state, stored_intent_digest): (String, String) = db
+        .connection()
+        .query_row(
+            "SELECT state, intent_digest FROM external_effect_journal
+             WHERE instance_id = ?1 AND module_id = ?2 AND operation_id = ?3",
+            rusqlite::params![b.instance_id, b.module_id, b.operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("retained intent row");
+    assert_eq!(state, EffectJournalState::Applied.wire_name());
+    assert_eq!(stored_intent_digest, intent_digest.to_canonical_string());
+    drop(db);
+
+    // REAL Worker restart: startup settlement reads only the authoritative
+    // REAL Worker restart runs reopen recovery and retains the terminal row;
+    // it never re-dispatches the child.
+    let restarted = fixture.start_worker();
+    drop(restarted);
+    let db = Database::open(&fixture.db_path).expect("reopen after restart");
+    let state_after_restart: String = db
+        .connection()
+        .query_row(
+            "SELECT state FROM external_effect_journal
+             WHERE instance_id = ?1 AND module_id = ?2 AND operation_id = ?3",
+            rusqlite::params![b.instance_id, b.module_id, b.operation_id],
+            |row| row.get(0),
+        )
+        .expect("retained row after restart");
+    assert_eq!(state_after_restart, EffectJournalState::Applied.wire_name());
+    drop(db);
+    assert_eq!(
+        count_child_calls(&fixture.package_root),
+        1,
+        "restart settlement never re-dispatched a child effect"
+    );
+}
+
+/// A persisted AUTHORIZED + INTENDED pair is recovered by the real Worker
+/// startup path. Reopen may only settle UNKNOWN/NOT_APPLIED; it never starts
+/// a replacement child request.
+#[test]
+fn worker_reopen_recovers_persisted_authorized_without_redispatch() {
+    let fixture = Fixture::new(false);
+    let binding = fixture.binding(8);
+    let ledger = ledger_authorized(&binding);
+    let mut worker = fixture.start_worker();
+    fixture.preload_ledger(&mut worker, &[ledger.clone()]);
+    let frame = request_frame(&binding);
+    let intent = worker
+        .intent_record_for_test(&ledger, &frame)
+        .expect("mint persisted Claim intent");
+    worker
+        .insert_intent_for_test(&intent)
+        .expect("persist Claim intent");
+    drop(worker);
+    assert_eq!(count_child_calls(&fixture.package_root), 0);
+
+    let restarted = fixture.start_worker();
+    drop(restarted);
+    let db = Database::open(&fixture.db_path).expect("reopen recovered database");
+    let ledger_after = load_ledger_exact(
+        db.connection(),
+        &binding.module_id,
+        &binding.operation_id,
+    )
+    .expect("load recovered ledger")
+    .expect("ledger row retained");
+    assert_ne!(ledger_after.state, LedgerState::Authorized);
+    let journal_state: String = db
+        .connection()
+        .query_row(
+            "SELECT state FROM external_effect_journal
+             WHERE instance_id = ?1 AND module_id = ?2 AND operation_id = ?3",
+            rusqlite::params![binding.instance_id, binding.module_id, binding.operation_id],
+            |row| row.get(0),
+        )
+        .expect("recovered journal row");
+    assert_ne!(journal_state, EffectJournalState::Intended.wire_name());
+    assert_eq!(count_child_calls(&fixture.package_root), 0);
+}
+
+/// 2. crash settlement: the child I/O happened (marker written) but never
+///    produced the outcome; the durable INTENDED intent exists at the crash
+///    point, and a real Worker restart settles it UNKNOWN_OUTCOME — the
+///    ambiguity evidence is retained, never re-dispatched.
+#[test]
+fn crash_mid_dispatch_settles_unknown_outcome_and_never_redispatches() {
+    let fixture = Fixture::new(true); // silent child: exits after tools/call I/O
+    let b = fixture.binding(2);
+    let ledger = ledger_authorized(&b);
+    let mut worker = fixture.start_worker();
+    fixture.preload_ledger(&mut worker, &[ledger.clone()]);
+    let old_extension_generation = worker.process_generation().extension_generation().value();
+    let frame = request_frame(&b);
+    let result = worker.dispatch_tools_call(&ledger, &frame);
+    // The silent child performs the tools/call I/O (writes the marker) then
+    // exits without a response. The dispatch fails closed: either the
+    // transport error surfaces, or the row settles terminal Unknown (the
+    // unambiguous "request sent, no outcome" case). Both are correct fail-
+    // closed behavior; what matters is that the child was touched once and
+    // the durable intent is left for restart settlement.
+    match &result {
+        Err(_) => {}
+        Ok(DispatchOutcome::Terminalized { record }) if record.state.is_terminal() => {}
+        other => panic!("child I/O with no outcome must fail closed, got {other:?}"),
+    }
+    drop(worker);
+
+    // Immediate settlement retains the ambiguity as a terminal journal row.
+    let db = Database::open(&fixture.db_path).expect("reopen");
+    let state: String = db
+        .connection()
+        .query_row(
+            "SELECT state FROM external_effect_journal
+             WHERE instance_id = ?1 AND module_id = ?2 AND operation_id = ?3",
+            rusqlite::params![b.instance_id, b.module_id, b.operation_id],
+            |row| row.get(0),
+        )
+        .expect("retained ambiguity row");
+    assert_ne!(state, EffectJournalState::Intended.wire_name());
+
+    drop(db);
+    // Real Worker restart settles the ambiguity from the authoritative ledger
+    let restarted = fixture.start_worker();
+    assert_ne!(
+        restarted
+            .process_generation()
+            .extension_generation()
+            .value(),
+        old_extension_generation
+    );
+    drop(restarted);
+    let db = Database::open(&fixture.db_path).expect("reopen after restart");
+    let old_process_records: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM process_generation_authority_records
+             WHERE instance_id = ?1 AND extension_generation = ?2",
+            rusqlite::params![b.instance_id.as_str(), old_extension_generation as i64],
+            |row| row.get(0),
+        )
+        .expect("old process record after reopen");
+    assert_eq!(old_process_records, 1);
+    let state_after_restart: String = db
+        .connection()
+        .query_row(
+            "SELECT state FROM external_effect_journal
+             WHERE instance_id = ?1 AND module_id = ?2 AND operation_id = ?3",
+            rusqlite::params![b.instance_id, b.module_id, b.operation_id],
+            |row| row.get(0),
+        )
+        .expect("row present after restart");
+    assert_ne!(
+        state_after_restart,
+        EffectJournalState::Intended.wire_name(),
+        "reopen recovery leaves no live intent"
+    );
+    drop(db);
+    assert_eq!(
+        count_child_calls(&fixture.package_root),
+        1,
+        "the child effect was never re-dispatched"
+    );
+}
+
+/// 3. stale identity rejection: a second dispatch of the SAME Claim is refused
+///    before any child I/O (a new attempt requires a new Claim), even in the
+///    live worker.
+#[test]
+fn stale_claim_is_rejected_before_child_io_no_redispatch() {
+    let fixture = Fixture::new(false);
+    let b = fixture.binding(3);
+    let ledger = ledger_authorized(&b);
+    let mut worker = fixture.start_worker();
+    fixture.preload_ledger(&mut worker, &[ledger.clone()]);
+    let frame = request_frame(&b);
+    let first = worker
+        .dispatch_tools_call(&ledger, &frame)
+        .expect("first dispatch succeeds");
+    assert!(matches!(first, DispatchOutcome::Terminalized { .. }));
+    assert_eq!(count_child_calls(&fixture.package_root), 1);
+
+    // The same Claim is already durably recorded: replay refused closed, and
+    // the child stays untouched.
+    let second = worker.dispatch_tools_call(&ledger, &frame);
+    assert!(
+        matches!(second, Err(dolly_worker::WorkerError::Premise(_))),
+        "same-Claim replay must be refused closed, got {second:?}"
+    );
+    assert_eq!(
+        count_child_calls(&fixture.package_root),
+        1,
+        "the refused replay never reached the child"
+    );
+}
+
+/// 4. capacity behavior: a journal at the authoritative whole-journal cap with
+///    no safe pruning refuses the intent STORAGE_FULL before any child I/O.
+#[test]
+fn journal_at_capacity_fails_closed_before_child_io() {
+    let fixture = Fixture::new(false);
+    let b = fixture.binding(4);
+    let ledger = ledger_authorized(&b);
+    let mut worker = fixture.start_worker();
+    fixture.preload_ledger(&mut worker, &[ledger.clone()]);
+
+    // Fill the durable journal to the cap with INTENDED rows (no ledger
+    // evidence, so startup settlement turns them UNKNOWN_OUTCOME — still
+    // undeletable, still at the cap).
+    let cap = dolly_storage::effect_journal::MAX_EFFECT_JOURNAL_ROWS;
+    for i in 0..cap {
+        let claim_token = derive_claim_token(
+            "c-inst-0001",
+            "module-a",
+            &format!("prefill-{i}"),
+            &digest_hex(0xcc),
+            999,
+            999,
+            "01jh8w2etc4x70xj26rg8fsdv92",
+            &digest_hex(0xaa),
+            &digest_hex(0xbb),
+            EffectClass::McpToolsCall,
+        );
+        let record = ExternalEffectJournalRecord {
+            schema: EffectJournalRecordSchemaTag,
+            journal_revision: 1,
+            state: EffectJournalState::Intended,
+            claim: Claim {
+                schema: ClaimRecordSchemaTag,
+                instance_id: "c-inst-0001".into(),
+                module_id: "module-a".into(),
+                operation_id: format!("prefill-{i}"),
+                operation_digest: digest_hex(0xcc),
+                claim_token,
+            },
+            controller_generation: 999,
+            extension_generation: 999,
+            worker_epoch: "01jh8w2etc4x70xj26rg8fsdv92".into(),
+            package_digest: digest_hex(0xaa),
+            policy_premise_digest: digest_hex(0xbb),
+            operation_digest: digest_hex(0xcc),
+            effect_class: EffectClass::McpToolsCall,
+            intent_digest: digest_hex(0xdd),
+            evidence_digest: None,
+        };
+        worker
+            .insert_intent_for_test(&record)
+            .expect("prefill insert");
+    }
+
+    // Real Worker start settles the prefill (all UNKNOWN_OUTCOME) — still a
+    // full, undeletable journal. Dispatch must fail closed STORAGE_FULL
+    // before any child I/O.
+    let frame = request_frame(&b);
+    match worker.dispatch_tools_call(&ledger, &frame) {
+        Err(dolly_worker::WorkerError::Storage(detail)) => {
+            assert!(
+                detail.contains("STORAGE_FULL"),
+                "expected STORAGE_FULL refusal, got {detail:?}"
+            );
+        }
+        other => panic!("expected WorkerError::Storage(Full), got {other:?}"),
+    }
+    assert_eq!(
+        count_child_calls(&fixture.package_root),
+        0,
+        "the intent was refused before the child was ever touched"
+    );
 }

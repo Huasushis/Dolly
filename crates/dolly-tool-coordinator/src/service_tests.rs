@@ -18,8 +18,9 @@ use dolly_storage::tool_ledger::{
     LedgerInsertDisposition, create_tool_ledger_schema, enumerate_nonterminal, insert_authorized,
 };
 use dolly_tool_broker::{
-    ConfirmationDecision, IdempotencyPolicy, LedgerState, RecoveryFacts, SideEffectClass,
-    ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag, ToolStatus,
+    ConfirmationDecision, IdempotencyPolicy, LedgerState, RecoveryFacts, RecoveryFactsSource,
+    SideEffectClass, ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag,
+    ToolStatus,
 };
 use dolly_tool_coordinator::{
     DispatchLimits, DispatchOutcome, ServiceOutcome, ToolDispatchService, ToolTransport,
@@ -27,6 +28,15 @@ use dolly_tool_coordinator::{
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
+
+struct TestFacts;
+
+// SAFETY: this fixture is used only by coordinator unit tests.
+unsafe impl RecoveryFactsSource for TestFacts {
+    fn facts_for(&self, _record: &ToolCallLedgerRecord) -> (bool, bool, bool) {
+        (true, true, false)
+    }
+}
 
 fn digest(hex: u8) -> Sha256Digest {
     format!("sha256:{:064x}", hex as u128)
@@ -195,7 +205,7 @@ fn dispatch_permit(
     db: &mut Database,
     record: &ToolCallLedgerRecord,
 ) -> dolly_tool_coordinator::SendPermit {
-    let facts = RecoveryFacts::from_authoritative_inputs(true, true, false);
+    let facts = RecoveryFacts::from_authoritative_source(&TestFacts, record);
     match dolly_tool_coordinator::dispatch_operation(db, record, &facts)
         .expect("dispatch must settle")
     {

@@ -30,9 +30,9 @@
 use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
 use dolly_tool_broker::{
     ConfirmationDecision, DispatchDisposition, IdempotencyPolicy, LedgerRecordError, LedgerState,
-    RecoveryFacts, SideEffectClass, ToolCallLedgerRecord, ToolCallLedgerRecordSchemaTag,
-    ToolErrorCode, ToolOperationBinding, ToolOperationBindingSchemaTag, ToolStatus,
-    recover_operation,
+    RecoveryFacts, RecoveryFactsSource, SideEffectClass, ToolCallLedgerRecord,
+    ToolCallLedgerRecordSchemaTag, ToolErrorCode, ToolOperationBinding,
+    ToolOperationBindingSchemaTag, ToolStatus, recover_operation,
 };
 use serde_json::json;
 
@@ -186,6 +186,23 @@ fn authorized_zero_byte_row() -> ToolCallLedgerRecord {
     record(LedgerState::Authorized, 1, false, None, &binding)
 }
 
+
+struct TestFacts {
+    zero_bytes_proved: bool,
+    exact_generation_ready: bool,
+    deadline_expired: bool,
+}
+
+// SAFETY: this test source models the coordinator's private fence only.
+unsafe impl RecoveryFactsSource for TestFacts {
+    fn facts_for(&self, _record: &ToolCallLedgerRecord) -> (bool, bool, bool) {
+        (
+            self.zero_bytes_proved,
+            self.exact_generation_ready,
+            self.deadline_expired,
+        )
+    }
+}
 /// The facts a reopened AUTHORIZED row needs before a retry/pass disposition
 /// can be picked (depended on by every test that crosses the boundary).
 fn facts(
@@ -193,11 +210,13 @@ fn facts(
     exact_generation_ready: bool,
     deadline_expired: bool,
 ) -> RecoveryFacts {
-    RecoveryFacts::from_authoritative_inputs(
+    let source = TestFacts {
         zero_bytes_proved,
         exact_generation_ready,
         deadline_expired,
-    )
+    };
+    // The decision records below all carry the same closed-row identity.
+    RecoveryFacts::from_authoritative_source(&source, &authorized_zero_byte_row())
 }
 
 /// Full TST-TOOL-001 / REQ-TOOL-002 outcome: the durable `DISPATCHED` marker

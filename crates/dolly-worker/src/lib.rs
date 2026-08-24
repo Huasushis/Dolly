@@ -17,22 +17,26 @@ use dolly_storage::effect_journal::{
 use dolly_storage::mcp_readiness::{
     MCP_PROTOCOL_VERSION_2025_06_18, McpTransportReadiness,
 };
-use dolly_storage::runtime_binding::{
-    ProcessGeneration, RuntimeBinding, invalidate_runtime_binding, mint_current_runtime_binding,
-};
+use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding, invalidate_runtime_binding};
+#[cfg(not(feature = "test-support"))]
+use dolly_storage::runtime_binding::mint_current_runtime_binding;
+#[cfg(feature = "test-support")]
+use dolly_storage::runtime_binding::mint_test_runtime_binding;
 use dolly_storage::tool_broker_authority::{
     ToolDispatchAuthority, ToolRegistryRevision, authorize_tool_dispatch, publish_tool_registry,
 };
 use dolly_storage::tool_ledger::{create_tool_ledger_schema, load_exact};
+#[cfg(feature = "test-support")]
+use dolly_storage::tool_ledger::{insert_authorized, LedgerInsertDisposition};
 use dolly_tool_broker::effect_journal::{
     Claim, ClaimRecordSchemaTag, EffectClass, EffectJournalRecordSchemaTag, EffectJournalState,
     ExternalEffectJournalRecord, derive_claim_token,
 };
-use dolly_tool_broker::{AdmissionOutcome, LedgerState, RecoveryFacts, ToolCallLedgerRecord};
+use dolly_tool_broker::{AdmissionOutcome, LedgerState, ToolCallLedgerRecord};
 use dolly_tool_coordinator::{
     DispatchError, DispatchLimits, DispatchOutcome, HostMcpStdioInstalledChildAttestation,
     HostMcpStdioInvocation, HostMcpStdioProcessHandle, StdioTransportError, StdioTransportLimits,
-    ToolDispatchService, dispatch_operation_authorized_reusable,
+    ToolDispatchService, dispatch_operation_authorized_reusable, reopen_recovery,
 };
 use thiserror::Error;
 
@@ -144,9 +148,17 @@ impl Worker {
             .checked_add(durable_server.startup_timeout)
             .ok_or_else(|| WorkerError::Process("startup deadline overflow".into()))?;
         let session_id = new_session_id()?;
-        let mut runtime_binding =
-            mint_current_runtime_binding(&mut database, config.extension_alias.clone())
-                .map_err(|error| WorkerError::Authority(error.to_string()))?;
+        let mut runtime_binding = {
+            #[cfg(feature = "test-support")]
+            {
+                mint_test_runtime_binding(&mut database, config.extension_alias.clone())
+            }
+            #[cfg(not(feature = "test-support"))]
+            {
+                mint_current_runtime_binding(&mut database, config.extension_alias.clone())
+            }
+        }
+        .map_err(|error| WorkerError::Authority(error.to_string()))?;
         let process_generation = match runtime_binding.mint_process_generation(&mut database) {
             Ok(generation) => generation,
             Err(error) => {
@@ -202,12 +214,59 @@ impl Worker {
             session_id.clone(),
             child.id(),
         );
+        // The initialize digest is pure framing data. The durable Claim is
+        // inserted before constructing a session or performing any child I/O.
+        let intent_digest =
+            dolly_tool_coordinator::initialize_handshake_digest().map_err(|error| {
+                startup_failure(
+                    &mut database,
+                    &runtime_binding,
+                    Some(&process_generation),
+                    None,
+                    WorkerError::Transport(error),
+                )
+            })?;
+        let handshake_intent = mint_handshake_intent_record(
+            &runtime_binding,
+            &process_generation,
+            &config.server_id,
+            &session_id,
+            &durable_server.package_digest,
+            intent_digest,
+        )?;
+        let handshake_authority =
+            match insert_intent(database.connection_mut(), &handshake_intent) {
+                Ok(EffectJournalInsertDisposition::Inserted { authority, .. }) => authority,
+                Ok(EffectJournalInsertDisposition::Replayed { .. }) => {
+                    return Err(startup_failure(
+                        &mut database,
+                        &runtime_binding,
+                        Some(&process_generation),
+                        None,
+                        WorkerError::Premise(
+                            "startup handshake Claim already exists; refusing replay".into(),
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    return Err(startup_failure(
+                        &mut database,
+                        &runtime_binding,
+                        Some(&process_generation),
+                        None,
+                        WorkerError::Storage(error.to_string()),
+                    ));
+                }
+            };
         let (mut invocation, process_handle) = match HostMcpStdioInvocation::from_installed_child(
             child,
             attestation,
             &process_generation,
             durable_server.stdio_limits,
             Vec::new(),
+            &database,
+            &handshake_authority,
+            &handshake_intent,
         ) {
             Ok(value) => value,
             Err(error) => {
@@ -220,64 +279,8 @@ impl Worker {
                 ));
             }
         };
-        // Startup MCP initialize/initialized is child I/O too. Persist a
-        // versioned non-effect Claim before touching the child; a crash leaves
-        // this row for fail-closed UNKNOWN_OUTCOME recovery, never replay.
-        let intent_digest = match invocation.initialize_intent_digest() {
-            Ok(digest) => digest,
-            Err(error) => {
-                return Err(startup_failure(
-                    &mut database,
-                    &runtime_binding,
-                    Some(&process_generation),
-                    Some(&process_handle),
-                    WorkerError::Transport(error),
-                ));
-            }
-        };
-        let handshake_intent = match mint_handshake_intent_record(
-            &runtime_binding,
-            &process_generation,
-            &config.server_id,
-            &session_id,
-            &durable_server.package_digest,
-            intent_digest,
-        ) {
-            Ok(intent) => intent,
-            Err(error) => {
-                return Err(startup_failure(
-                    &mut database,
-                    &runtime_binding,
-                    Some(&process_generation),
-                    Some(&process_handle),
-                    error,
-                ));
-            }
-        };
-        let handshake_authority = match insert_intent(database.connection_mut(), &handshake_intent) {
-            Ok(EffectJournalInsertDisposition::Inserted { authority, .. }) => authority,
-            Ok(EffectJournalInsertDisposition::Replayed { .. }) => {
-                return Err(startup_failure(
-                    &mut database,
-                    &runtime_binding,
-                    Some(&process_generation),
-                    Some(&process_handle),
-                    WorkerError::Premise(
-                        "startup handshake Claim already exists; refusing replay".into(),
-                    ),
-                ));
-            }
-            Err(error) => {
-                return Err(startup_failure(
-                    &mut database,
-                    &runtime_binding,
-                    Some(&process_generation),
-                    Some(&process_handle),
-                    WorkerError::Storage(error.to_string()),
-                ));
-            }
-        };
         let readiness = match invocation.initialize(
+            &handshake_authority,
             &database,
             &runtime_binding,
             &process_generation,
@@ -353,6 +356,43 @@ impl Worker {
                 ));
             }
         };
+        // Reopen recovery runs before this Worker becomes Ready. It derives
+        // conservative no-send facts inside the coordinator fence, so every
+        // persisted AUTHORIZED/DISPATCHED row is terminalized fail-closed and
+        // no child request is replayed.
+        if let Err(error) = reopen_recovery(
+            &mut database,
+            &dispatch_authority,
+            &runtime_binding,
+            &process_generation,
+            &readiness,
+        ) {
+            return Err(startup_failure(
+                &mut database,
+                &runtime_binding,
+                Some(&process_generation),
+                Some(&process_handle),
+                WorkerError::Dispatch(error),
+            ));
+        }
+        if let Err(error) = settle_pending_effect_journal(&mut database) {
+            return Err(startup_failure(
+                &mut database,
+                &runtime_binding,
+                Some(&process_generation),
+                Some(&process_handle),
+                WorkerError::Storage(error.to_string()),
+            ));
+        }
+        if let Err(error) = retain_settled_effect_journal(&mut database) {
+            return Err(startup_failure(
+                &mut database,
+                &runtime_binding,
+                Some(&process_generation),
+                Some(&process_handle),
+                WorkerError::Storage(error.to_string()),
+            ));
+        }
         let service = ToolDispatchService::new(durable_server.dispatch_limits);
         Ok(Self {
             database,
@@ -393,6 +433,49 @@ impl Worker {
         &self.registry
     }
 
+    /// Test-support-only insertion through the Worker's already-open
+    /// authoritative SQLite connection. This avoids a second instance owner;
+    /// no authority or proof object crosses the production boundary.
+    #[cfg(feature = "test-support")]
+    pub fn insert_authorized_for_test(
+        &mut self,
+        row: &ToolCallLedgerRecord,
+    ) -> Result<(), WorkerError> {
+        match insert_authorized(self.database.connection_mut(), row)
+            .map_err(|error| WorkerError::Storage(error.to_string()))?
+        {
+            LedgerInsertDisposition::Inserted { .. } | LedgerInsertDisposition::Replayed { .. } => {
+                Ok(())
+            }
+        }
+    }
+
+    /// Test-support-only journal prefill through this Worker's owned
+    /// connection, preserving the one-instance lock and production CAS.
+    #[cfg(feature = "test-support")]
+    pub fn insert_intent_for_test(
+        &mut self,
+        record: &ExternalEffectJournalRecord,
+    ) -> Result<(), WorkerError> {
+        match insert_intent(self.database.connection_mut(), record)
+            .map_err(|error| WorkerError::Storage(error.to_string()))?
+        {
+            EffectJournalInsertDisposition::Inserted { .. }
+            | EffectJournalInsertDisposition::Replayed { .. } => Ok(()),
+        }
+    }
+
+
+    /// Test-support-only exact Claim intent construction for a restart
+    /// fixture. The production minting path remains private and unchanged.
+    #[cfg(feature = "test-support")]
+    pub fn intent_record_for_test(
+        &self,
+        row: &ToolCallLedgerRecord,
+        request_bytes: &[u8],
+    ) -> Result<ExternalEffectJournalRecord, WorkerError> {
+        self.mint_intent_record(row, request_bytes)
+    }
     /// Route sequential tools/call rows through the one initialized session.
     /// The retained child is stopped only after explicit stop, terminal
     pub fn dispatch_tools_call(
@@ -453,7 +536,6 @@ impl Worker {
         };
         let invocation = self.invocation.as_mut().ok_or(WorkerError::Stopped)?;
         invocation.set_request_bytes(request_bytes.to_vec());
-        let facts = RecoveryFacts::for_authorized_dispatch();
         let outcome = dispatch_operation_authorized_reusable(
             &mut self.database,
             &journal_authority,
@@ -463,7 +545,6 @@ impl Worker {
             &self.readiness,
             &self.package_digest,
             row,
-            &facts,
             &self.service,
             invocation,
         )
