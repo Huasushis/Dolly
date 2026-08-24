@@ -8,19 +8,17 @@ use dolly_canonical_json::{
 };
 use dolly_core_domain::ExtensionId;
 use dolly_storage::Database;
-use dolly_storage::effect_journal::{
-    EffectJournalInsertDisposition, EffectJournalIntentAuthority, gate_schema_version,
-    insert_intent, settle_pending_effect_journal,
-};
 use dolly_storage::host_authority::load_current_authority;
-#[cfg(feature = "test-support")]
-use dolly_storage::linux_host_verification::VerifiedLinuxHostProof;
-use dolly_storage::mcp_readiness::{MCP_PROTOCOL_VERSION_2025_06_18, McpTransportReadiness};
-#[cfg(feature = "test-support")]
-use dolly_storage::runtime_binding::mint_runtime_binding;
+use dolly_storage::effect_journal::{
+    EffectJournalInsertDisposition, EffectJournalIntentAuthority, assert_operation_claimable,
+    gate_schema_version, insert_intent, retain_settled_effect_journal, settle_non_effect_intent,
+    settle_pending_effect_journal, settle_unknown_intent,
+};
+use dolly_storage::mcp_readiness::{
+    MCP_PROTOCOL_VERSION_2025_06_18, McpTransportReadiness,
+};
 use dolly_storage::runtime_binding::{
-    ProcessGeneration, RuntimeBinding, RuntimeBindingError, invalidate_runtime_binding,
-    mint_current_runtime_binding,
+    ProcessGeneration, RuntimeBinding, invalidate_runtime_binding, mint_current_runtime_binding,
 };
 use dolly_storage::tool_broker_authority::{
     ToolDispatchAuthority, ToolRegistryRevision, authorize_tool_dispatch, publish_tool_registry,
@@ -91,33 +89,10 @@ impl Worker {
     /// Execute the bounded Linux-first startup sequence and retain one
     /// verified, initialized stdio session for the next tools/call dispatch.
     pub fn start(config: WorkerStartConfig) -> Result<Self, WorkerError> {
-        Self::start_internal(config, mint_current_runtime_binding, false)
+        Self::start_internal(config)
     }
 
-    /// Test-support constructor: drives the identical production startup
-    /// path but mints the runtime binding from an injected, already-verified
-    /// Host proof instead of re-observing the live Linux host. Gated to the
-    /// `test-support` feature; production builds never expose it.
-    #[cfg(feature = "test-support")]
-    pub fn start_with_verified_proof(
-        config: WorkerStartConfig,
-        verified_proof: VerifiedLinuxHostProof,
-    ) -> Result<Self, WorkerError> {
-        Self::start_internal(
-            config,
-            move |db, alias| mint_runtime_binding(db, alias, verified_proof),
-            true,
-        )
-    }
-
-    fn start_internal<F>(
-        config: WorkerStartConfig,
-        mint: F,
-        use_test_readiness: bool,
-    ) -> Result<Self, WorkerError>
-    where
-        F: FnOnce(&mut Database, ExtensionId) -> Result<RuntimeBinding, RuntimeBindingError>,
-    {
+    fn start_internal(config: WorkerStartConfig) -> Result<Self, WorkerError> {
         if !cfg!(target_os = "linux") {
             return Err(WorkerError::UnsupportedPlatform);
         }
@@ -162,13 +137,16 @@ impl Worker {
         // (or the private ambiguity path); nothing is re-dispatched.
         settle_pending_effect_journal(&mut database)
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
+        retain_settled_effect_journal(&mut database)
+            .map_err(|error| WorkerError::Storage(error.to_string()))?;
 
         let startup_deadline = Instant::now()
             .checked_add(durable_server.startup_timeout)
             .ok_or_else(|| WorkerError::Process("startup deadline overflow".into()))?;
         let session_id = new_session_id()?;
-        let mut runtime_binding = mint(&mut database, config.extension_alias.clone())
-            .map_err(|error| WorkerError::Authority(error.to_string()))?;
+        let mut runtime_binding =
+            mint_current_runtime_binding(&mut database, config.extension_alias.clone())
+                .map_err(|error| WorkerError::Authority(error.to_string()))?;
         let process_generation = match runtime_binding.mint_process_generation(&mut database) {
             Ok(generation) => generation,
             Err(error) => {
@@ -221,7 +199,7 @@ impl Worker {
             runtime_binding.extension_alias().clone(),
             process_generation.extension_generation(),
             runtime_binding.binding_digest().clone(),
-            session_id,
+            session_id.clone(),
             child.id(),
         );
         let (mut invocation, process_handle) = match HostMcpStdioInvocation::from_installed_child(
@@ -242,46 +220,102 @@ impl Worker {
                 ));
             }
         };
-        let readiness = {
-            #[cfg(feature = "test-support")]
-            let result = if use_test_readiness {
-                invocation.initialize_with_verified_proof(
-                    &database,
+        // Startup MCP initialize/initialized is child I/O too. Persist a
+        // versioned non-effect Claim before touching the child; a crash leaves
+        // this row for fail-closed UNKNOWN_OUTCOME recovery, never replay.
+        let intent_digest = match invocation.initialize_intent_digest() {
+            Ok(digest) => digest,
+            Err(error) => {
+                return Err(startup_failure(
+                    &mut database,
                     &runtime_binding,
-                    &process_generation,
-                    &config.server_id,
-                    startup_deadline,
-                )
-            } else {
-                invocation.initialize(
-                    &database,
+                    Some(&process_generation),
+                    Some(&process_handle),
+                    WorkerError::Transport(error),
+                ));
+            }
+        };
+        let handshake_intent = match mint_handshake_intent_record(
+            &runtime_binding,
+            &process_generation,
+            &config.server_id,
+            &session_id,
+            &durable_server.package_digest,
+            intent_digest,
+        ) {
+            Ok(intent) => intent,
+            Err(error) => {
+                return Err(startup_failure(
+                    &mut database,
                     &runtime_binding,
-                    &process_generation,
-                    &config.server_id,
-                    startup_deadline,
-                )
-            };
-            #[cfg(not(feature = "test-support"))]
-            let _ = use_test_readiness;
-            #[cfg(not(feature = "test-support"))]
-            let result = invocation.initialize(
-                &database,
-                &runtime_binding,
-                &process_generation,
-                &config.server_id,
-                startup_deadline,
-            );
-            match result {
-                Ok(readiness) => readiness,
-                Err(error) => {
+                    Some(&process_generation),
+                    Some(&process_handle),
+                    error,
+                ));
+            }
+        };
+        let handshake_authority = match insert_intent(database.connection_mut(), &handshake_intent) {
+            Ok(EffectJournalInsertDisposition::Inserted { authority, .. }) => authority,
+            Ok(EffectJournalInsertDisposition::Replayed { .. }) => {
+                return Err(startup_failure(
+                    &mut database,
+                    &runtime_binding,
+                    Some(&process_generation),
+                    Some(&process_handle),
+                    WorkerError::Premise(
+                        "startup handshake Claim already exists; refusing replay".into(),
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(startup_failure(
+                    &mut database,
+                    &runtime_binding,
+                    Some(&process_generation),
+                    Some(&process_handle),
+                    WorkerError::Storage(error.to_string()),
+                ));
+            }
+        };
+        let readiness = match invocation.initialize(
+            &database,
+            &runtime_binding,
+            &process_generation,
+            &config.server_id,
+            startup_deadline,
+        ) {
+            Ok(readiness) => {
+                if let Err(error) = settle_non_effect_intent(
+                    database.connection_mut(),
+                    &handshake_authority,
+                    Sha256Digest::compute(b"dolly-mcp-initialize-handshake-complete/v1"),
+                ) {
+                    let _ = settle_unknown_intent(database.connection_mut(), &handshake_authority);
                     return Err(startup_failure(
                         &mut database,
                         &runtime_binding,
                         Some(&process_generation),
                         Some(&process_handle),
-                        WorkerError::Transport(error),
+                        WorkerError::Storage(error.to_string()),
                     ));
                 }
+                readiness
+            }
+            Err(error) => {
+                let failure = match settle_unknown_intent(
+                    database.connection_mut(),
+                    &handshake_authority,
+                ) {
+                    Ok(_) => WorkerError::Transport(error),
+                    Err(settlement_error) => WorkerError::Storage(settlement_error.to_string()),
+                };
+                return Err(startup_failure(
+                    &mut database,
+                    &runtime_binding,
+                    Some(&process_generation),
+                    Some(&process_handle),
+                    failure,
+                ));
             }
         };
         let registry = match publish_tool_registry(
@@ -364,7 +398,6 @@ impl Worker {
     pub fn dispatch_tools_call(
         &mut self,
         row: &ToolCallLedgerRecord,
-        facts: &RecoveryFacts,
         request_bytes: &[u8],
     ) -> Result<DispatchOutcome, WorkerError> {
         if self.stopped {
@@ -391,6 +424,16 @@ impl Worker {
                 "dispatch row or exact outbound bytes are not authoritative".into(),
             ));
         }
+        // The operation-level gate runs before Claim minting. Recovery never
+        // creates a replacement Claim for an existing operation identity,
+        // including an old INTENDED or UNKNOWN row.
+        assert_operation_claimable(
+            self.database.connection(),
+            &row.operation_binding.instance_id,
+            &row.operation_binding.module_id,
+            &row.operation_binding.operation_id,
+        )
+        .map_err(|error| WorkerError::Premise(error.to_string()))?;
         // Durable Claim-bound intent BEFORE any child I/O: the intent is
         // durably recorded, then the child is touched. A persistence failure
         // or an identity collision (the same Claim already recorded) fails
@@ -408,12 +451,9 @@ impl Worker {
             }
             Err(error) => return Err(WorkerError::Storage(error.to_string())),
         };
-        #[cfg(feature = "test-support")]
-        if std::env::var_os("DOLLY_WORKER_TEST_CRASH_AFTER_INTENT").is_some() {
-            std::process::abort();
-        }
         let invocation = self.invocation.as_mut().ok_or(WorkerError::Stopped)?;
         invocation.set_request_bytes(request_bytes.to_vec());
+        let facts = RecoveryFacts::for_authorized_dispatch();
         let outcome = dispatch_operation_authorized_reusable(
             &mut self.database,
             &journal_authority,
@@ -423,11 +463,29 @@ impl Worker {
             &self.readiness,
             &self.package_digest,
             row,
-            facts,
+            &facts,
             &self.service,
             invocation,
         )
         .map_err(WorkerError::Dispatch);
+        let outcome = match outcome {
+            Ok(outcome) => match settle_pending_effect_journal(&mut self.database) {
+                Ok(_) => match retain_settled_effect_journal(&mut self.database) {
+                    Ok(_) => Ok(outcome),
+                    Err(error) => Err(WorkerError::Storage(error.to_string())),
+                },
+                Err(error) => Err(WorkerError::Storage(error.to_string())),
+            },
+            Err(error) => match settle_pending_effect_journal(&mut self.database) {
+                Ok(_) => match retain_settled_effect_journal(&mut self.database) {
+                    Ok(_) => Err(error),
+                    Err(settlement_error) => {
+                        Err(WorkerError::Storage(settlement_error.to_string()))
+                    }
+                },
+                Err(settlement_error) => Err(WorkerError::Storage(settlement_error.to_string())),
+            },
+        };
         let should_stop = match &outcome {
             Err(WorkerError::Dispatch(DispatchError::InvalidRecord)) => false,
             Err(_) => true,
@@ -461,6 +519,7 @@ impl Worker {
             &binding.instance_id,
             &binding.module_id,
             &binding.operation_id,
+            &row.operation_digest,
             self.runtime_binding.controller_generation().value(),
             self.process_generation.extension_generation().value(),
             &worker_epoch,
@@ -477,6 +536,7 @@ impl Worker {
                 instance_id: binding.instance_id.clone(),
                 module_id: binding.module_id.clone(),
                 operation_id: binding.operation_id.clone(),
+                operation_digest: row.operation_digest.clone(),
                 claim_token,
             },
             controller_generation: self.runtime_binding.controller_generation().value(),
@@ -519,6 +579,64 @@ impl Drop for Worker {
     }
 }
 
+fn mint_handshake_intent_record(
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    server_id: &str,
+    session_id: &str,
+    package_digest: &Sha256Digest,
+    intent_digest: Sha256Digest,
+) -> Result<ExternalEffectJournalRecord, WorkerError> {
+    let operation_id = format!("mcp-initialize-{session_id}");
+    let operation_digest = canonicalize(&serde_json::json!({
+        "schema": "dolly.mcp-initialize-operation/v1",
+        "server_id": server_id,
+        "session_id": session_id,
+    }))
+    .map_err(|error| WorkerError::Premise(format!("handshake operation is not canonical: {error}")))?
+    .1;
+    let worker_epoch = runtime_binding.worker_epoch().to_string();
+    let effect_class = EffectClass::McpInitializeHandshake;
+    let module_id = runtime_binding.extension_alias().to_string();
+    let claim_token = derive_claim_token(
+        runtime_binding.instance_id(),
+        &module_id,
+        &operation_id,
+        &operation_digest,
+        runtime_binding.controller_generation().value(),
+        process_generation.extension_generation().value(),
+        &worker_epoch,
+        package_digest,
+        runtime_binding.premises_digest(),
+        effect_class,
+    );
+    let record = ExternalEffectJournalRecord {
+        schema: EffectJournalRecordSchemaTag,
+        journal_revision: 1,
+        state: EffectJournalState::Intended,
+        claim: Claim {
+            schema: ClaimRecordSchemaTag,
+            instance_id: runtime_binding.instance_id().to_owned(),
+            module_id: runtime_binding.extension_alias().to_string(),
+            operation_id,
+            operation_digest: operation_digest.clone(),
+            claim_token,
+        },
+        controller_generation: runtime_binding.controller_generation().value(),
+        extension_generation: process_generation.extension_generation().value(),
+        worker_epoch,
+        package_digest: package_digest.clone(),
+        policy_premise_digest: runtime_binding.premises_digest().clone(),
+        operation_digest,
+        effect_class,
+        intent_digest,
+        evidence_digest: None,
+    };
+    record
+        .verify()
+        .map_err(|error| WorkerError::Premise(format!("handshake intent identity invalid: {error}")))?;
+    Ok(record)
+}
 fn startup_failure(
     database: &mut Database,
     runtime_binding: &RuntimeBinding,
@@ -571,6 +689,7 @@ fn load_durable_server(
     })?;
     let admitted = match dolly_tool_broker::admit_config(tool_broker_bytes.as_ref()) {
         AdmissionOutcome::Admitted(config) => config,
+
         AdmissionOutcome::Rejected(rejection) => {
             return Err(WorkerError::Premise(format!(
                 "tool-broker policy admission failed: {:?}",

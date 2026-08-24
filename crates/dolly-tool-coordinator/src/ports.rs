@@ -45,25 +45,25 @@ pub trait RecoveryFactsProvider {
 pub struct FencedFactsProvider<'a> {
     /// Whether the exclusive send gate proves zero bytes were eligible or
     /// sent (Host-owned).
-    pub zero_bytes_proved: bool,
+    pub(crate) zero_bytes_proved: bool,
     /// Host-owned generation readiness.
-    pub readiness: &'a dyn GenerationReadiness,
+    pub(crate) readiness: &'a dyn GenerationReadiness,
     /// Host-owned clock for deadline expiry.
-    pub clock: &'a dyn Clock,
+    pub(crate) clock: &'a dyn Clock,
 }
 
 impl RecoveryFactsProvider for FencedFactsProvider<'_> {
     fn facts_for(&self, row: &ToolCallLedgerRecord) -> RecoveryFacts {
         let binding = &row.operation_binding;
-        RecoveryFacts {
-            zero_bytes_proved: self.zero_bytes_proved,
-            exact_generation_ready: self.readiness.exact_generation_ready(
+        RecoveryFacts::from_authoritative_inputs(
+            self.zero_bytes_proved,
+            self.readiness.exact_generation_ready(
                 &binding.module_id,
                 &binding.tool_server_id,
                 binding.tool_server_generation,
             ),
-            deadline_expired: deadline_expired(&binding.authorized_deadline, self.clock.now()),
-        }
+            deadline_expired(&binding.authorized_deadline, self.clock.now()),
+        )
     }
 }
 

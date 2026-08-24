@@ -195,11 +195,7 @@ fn dispatch_permit(
     db: &mut Database,
     record: &ToolCallLedgerRecord,
 ) -> dolly_tool_coordinator::SendPermit {
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = RecoveryFacts::from_authoritative_inputs(true, true, false);
     match dolly_tool_coordinator::dispatch_operation(db, record, &facts)
         .expect("dispatch must settle")
     {

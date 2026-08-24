@@ -231,11 +231,7 @@ fn dispatch_with_proof(
     db: &mut Database,
     record: &ToolCallLedgerRecord,
 ) -> dolly_tool_coordinator::SendPermitBinding {
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = RecoveryFacts::from_authoritative_inputs(true, true, false);
     match dispatch_operation(db, record, &facts).expect("dispatch must settle") {
         DispatchOutcome::Dispatched { record: _, permit } => permit
             .expect("permit after committed proof dispatch")
@@ -328,11 +324,7 @@ fn no_permit_on_stale_or_ambiguous() {
     // The coordinator knows only the stale snapshot; the facts even permit a
     // send. A stale CAS returns `Stale` with the authoritative row and no
     // permit; the caller reruns the pure decision on that row (spec §6).
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = RecoveryFacts::from_authoritative_inputs(true, true, false);
     let authoritative = match dispatch_operation(&mut db, &authorized, &facts).expect("must settle")
     {
         DispatchOutcome::Stale { authoritative } => authoritative,
@@ -373,11 +365,7 @@ fn no_permit_on_ambiguous_no_proof() {
 
     // Without zero-byte proof the first CAS crosses DISPATCHED without a
     // permit; the second pure decision terminalizes UNKNOWN.
-    let facts = RecoveryFacts {
-        zero_bytes_proved: false,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = RecoveryFacts::from_authoritative_inputs(false, true, false);
     let first = dispatch_operation(&mut db, &authorized, &facts).expect("dispatch settles");
     match first {
         DispatchOutcome::Dispatched { permit: None, .. } => {}
@@ -426,11 +414,7 @@ fn dispatched_row_reopens_unknown_no_redispatch() {
     let dispatched = load_exact(db.connection(), "module-a", OP_A)
         .expect("load")
         .expect("present");
-    let facts = RecoveryFacts {
-        zero_bytes_proved: false,
-        exact_generation_ready: false,
-        deadline_expired: false,
-    };
+    let facts = RecoveryFacts::from_authoritative_inputs(false, false, false);
     match dispatch_operation(&mut db, &dispatched, &facts).expect("recovery settles") {
         DispatchOutcome::Terminalized { record } => {
             assert_eq!(record.state, LedgerState::Unknown);
@@ -471,11 +455,7 @@ fn authorized_reopen_with_proof_at_most_one_dispatch() {
 
     // First dispatch: proof permits exactly one committed send transition.
     let mut db = open_db(dir.path());
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = RecoveryFacts::from_authoritative_inputs(true, true, false);
     let outcome = dispatch_operation(&mut db, &authorized, &facts).expect("dispatch settles");
     let binding = match outcome {
         DispatchOutcome::Dispatched {
@@ -523,11 +503,7 @@ fn authorized_with_proof_and_dead_generation_fails_not_applied() {
     drop(db);
 
     let mut db = open_db(dir.path());
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: false,
-        deadline_expired: false,
-    };
+    let facts = RecoveryFacts::from_authoritative_inputs(true, false, false);
     let outcome = dispatch_operation(&mut db, &authorized, &facts).expect("dispatch settles");
     match outcome {
         DispatchOutcome::Terminalized { record } => {
@@ -621,11 +597,7 @@ fn terminal_row_unchanged_across_recovery() {
     let loaded_terminal = load_exact(db.connection(), "module-a", OP_A)
         .expect("load")
         .expect("present");
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = RecoveryFacts::from_authoritative_inputs(true, true, false);
     match dispatch_operation(&mut db, &loaded_terminal, &facts).expect("terminal settles") {
         DispatchOutcome::Unchanged { record } => {
             assert_eq!(record.state, LedgerState::Succeeded);
@@ -672,11 +644,7 @@ fn no_permit_when_outbound_unreconstructible() {
     let mut binding = authorized.operation_binding.clone();
     binding.server_contract = serde_json::from_value(json!({"tools": {}})).expect("empty");
     authorized.operation_binding = binding;
-    let facts = RecoveryFacts {
-        zero_bytes_proved: true,
-        exact_generation_ready: true,
-        deadline_expired: false,
-    };
+    let facts = RecoveryFacts::from_authoritative_inputs(true, true, false);
     let result = dispatch_operation(&mut db, &authorized, &facts);
     match &result {
         Err(DispatchError::InvalidRecord) | Err(DispatchError::Storage(_)) => {}
@@ -750,9 +718,9 @@ fn fenced_facts_provider_composes_ports() {
         clock: &PeakClock,
     };
     let facts = provider.facts_for(&authorized);
-    assert!(facts.zero_bytes_proved);
-    assert!(facts.exact_generation_ready);
-    assert!(!facts.deadline_expired, "deadline far in the future");
+    assert!(facts.zero_bytes_proved());
+    assert!(facts.exact_generation_ready());
+    assert!(!facts.deadline_expired(), "deadline far in the future");
 }
 
 #[test]

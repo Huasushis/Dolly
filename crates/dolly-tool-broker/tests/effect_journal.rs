@@ -159,6 +159,7 @@ fn intended_record(
         instance_id,
         module_id,
         operation_id,
+        &operation_digest,
         controller_generation,
         extension_generation,
         worker_epoch,
@@ -175,6 +176,7 @@ fn intended_record(
             instance_id: instance_id.into(),
             module_id: module_id.into(),
             operation_id: operation_id.into(),
+            operation_digest: operation_digest.clone(),
             claim_token,
         },
         controller_generation,
@@ -210,6 +212,7 @@ fn claim_token_is_deterministic_for_the_same_attempt() {
         INSTANCE,
         MODULE,
         "op-1",
+        &digest(0x33),
         1,
         2,
         EPOCH,
@@ -221,6 +224,7 @@ fn claim_token_is_deterministic_for_the_same_attempt() {
         INSTANCE,
         MODULE,
         "op-1",
+        &digest(0x33),
         1,
         2,
         EPOCH,
@@ -237,6 +241,7 @@ fn every_changed_context_mints_a_new_claim() {
         INSTANCE,
         MODULE,
         "op-1",
+        &digest(0x33),
         1,
         2,
         EPOCH,
@@ -249,6 +254,7 @@ fn every_changed_context_mints_a_new_claim() {
             "other-inst",
             MODULE,
             "op-1",
+            &digest(0x33),
             1,
             2,
             EPOCH,
@@ -260,6 +266,7 @@ fn every_changed_context_mints_a_new_claim() {
             INSTANCE,
             "module-b",
             "op-1",
+            &digest(0x33),
             1,
             2,
             EPOCH,
@@ -271,6 +278,7 @@ fn every_changed_context_mints_a_new_claim() {
             INSTANCE,
             MODULE,
             "op-2",
+            &digest(0x34),
             1,
             2,
             EPOCH,
@@ -282,6 +290,7 @@ fn every_changed_context_mints_a_new_claim() {
             INSTANCE,
             MODULE,
             "op-1",
+            &digest(0x33),
             9,
             2,
             EPOCH,
@@ -293,6 +302,7 @@ fn every_changed_context_mints_a_new_claim() {
             INSTANCE,
             MODULE,
             "op-1",
+            &digest(0x33),
             1,
             9,
             EPOCH,
@@ -304,6 +314,7 @@ fn every_changed_context_mints_a_new_claim() {
             INSTANCE,
             MODULE,
             "op-1",
+            &digest(0x33),
             1,
             2,
             "other-epoch",
@@ -315,6 +326,7 @@ fn every_changed_context_mints_a_new_claim() {
             INSTANCE,
             MODULE,
             "op-1",
+            &digest(0x33),
             1,
             2,
             EPOCH,
@@ -326,6 +338,7 @@ fn every_changed_context_mints_a_new_claim() {
             INSTANCE,
             MODULE,
             "op-1",
+            &digest(0x33),
             1,
             2,
             EPOCH,
@@ -397,11 +410,17 @@ fn settled_states_require_revision_two_and_evidence_only_for_applied() {
             claim_token: digest(0xaa),
             ..base.claim.clone()
         },
-        ..base
+        ..base.clone()
     };
     assert!(
         tampered.verify().is_err(),
         "tampered claim token is corruption"
+    );
+    let mut arbitrary_digest = base.clone();
+    arbitrary_digest.operation_digest = digest(0xbb);
+    assert!(
+        arbitrary_digest.verify().is_err(),
+        "an arbitrary operation digest cannot settle a different Claim"
     );
 }
 

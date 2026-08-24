@@ -276,11 +276,7 @@ fn authorized_zero_byte_safe_retry_disposition() {
     // deadline: propose dispatch with a permit (TST-TOOL-009).
     let disposition = propose_recovery(
         recovered,
-        &RecoveryFacts {
-            zero_bytes_proved: true,
-            exact_generation_ready: true,
-            deadline_expired: false,
-        },
+        &RecoveryFacts::from_authoritative_inputs(true, true, false),
     );
     let outbound_digest = match &disposition {
         DispatchDisposition::ProposeDispatch {
@@ -347,11 +343,7 @@ fn authorized_zero_byte_proof_unusable_generation_fails_not_applied() {
         .remove(0);
     let disposition = propose_recovery(
         &recovered,
-        &RecoveryFacts {
-            zero_bytes_proved: true,
-            exact_generation_ready: false, // frozen generation crashed
-            deadline_expired: false,
-        },
+        &RecoveryFacts::from_authoritative_inputs(true, false, false),
     );
     let terminal_result = match &disposition {
         DispatchDisposition::ProvedNotApplied { result } => result.clone(),
@@ -446,11 +438,7 @@ fn dispatched_row_becomes_unknown_without_redispatch() {
     assert_eq!(recovered.state, LedgerState::Dispatched);
     let disposition = propose_recovery(
         &recovered,
-        &RecoveryFacts {
-            zero_bytes_proved: false,
-            exact_generation_ready: false,
-            deadline_expired: false,
-        },
+        &RecoveryFacts::from_authoritative_inputs(false, false, false),
     );
     match &disposition {
         DispatchDisposition::Unknown { result } => {
@@ -518,11 +506,7 @@ fn dispatched_row_becomes_unknown_without_redispatch() {
     assert_eq!(loaded.ledger_revision, 3);
     let disposition = propose_recovery(
         &loaded,
-        &RecoveryFacts {
-            zero_bytes_proved: false,
-            exact_generation_ready: false,
-            deadline_expired: false,
-        },
+        &RecoveryFacts::from_authoritative_inputs(false, false, false),
     );
     assert!(
         matches!(disposition, DispatchDisposition::AlreadyTerminal { .. }),
@@ -620,11 +604,7 @@ fn terminal_commit_ack_lost_reopen_replays_exact() {
     // Recovery of a terminal row is a verbatim replay, never a redispatch.
     let disposition = propose_recovery(
         &loaded,
-        &RecoveryFacts {
-            zero_bytes_proved: false,
-            exact_generation_ready: false,
-            deadline_expired: false,
-        },
+        &RecoveryFacts::from_authoritative_inputs(false, false, false),
     );
     match &disposition {
         DispatchDisposition::AlreadyTerminal { result } => {

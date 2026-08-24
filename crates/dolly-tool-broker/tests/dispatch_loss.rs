@@ -193,11 +193,11 @@ fn facts(
     exact_generation_ready: bool,
     deadline_expired: bool,
 ) -> RecoveryFacts {
-    RecoveryFacts {
+    RecoveryFacts::from_authoritative_inputs(
         zero_bytes_proved,
         exact_generation_ready,
         deadline_expired,
-    }
+    )
 }
 
 /// Full TST-TOOL-001 / REQ-TOOL-002 outcome: the durable `DISPATCHED` marker

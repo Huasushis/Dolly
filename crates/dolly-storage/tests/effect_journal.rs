@@ -12,7 +12,7 @@
 use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
 use dolly_storage::effect_journal::{
     EffectCasKey, EffectCasOutcome, EffectCorrelation, EffectJournalInsertDisposition,
-    enumerate_pending, insert_intent, load_exact, propose_effect_recovery,
+    assert_operation_claimable, enumerate_pending, insert_intent, load_exact, propose_effect_recovery,
     settle_pending_effect_journal,
 };
 use dolly_storage::effect_journal::{cas_settle, gate_schema_version};
@@ -242,6 +242,7 @@ fn intended_record(
         INSTANCE,
         MODULE,
         operation_id,
+        &operation_digest,
         CONTROLLER,
         EXTENSION_GENERATION,
         EPOCH,
@@ -258,6 +259,7 @@ fn intended_record(
             instance_id: INSTANCE.into(),
             module_id: MODULE.into(),
             operation_id: operation_id.into(),
+            operation_digest: operation_digest.clone(),
             claim_token,
         },
         controller_generation: CONTROLLER,
@@ -689,6 +691,10 @@ fn reopen_recovery_settles_only_from_identity_matched_ledger_evidence() {
         settlement_unknown,
         EffectSettlement::UnknownOutcome
     ));
+    assert!(
+        assert_operation_claimable(db.connection(), INSTANCE, MODULE, "op-2").is_err(),
+        "an existing INTENDED operation blocks a replacement Claim before minting"
+    );
 }
 #[test]
 fn new_claim_cannot_consume_old_terminal_evidence() {
@@ -729,10 +735,12 @@ fn new_claim_cannot_consume_old_terminal_evidence() {
     new_record.controller_generation += 1;
     new_record.extension_generation += 1;
     new_record.worker_epoch = "01newclaimgeneration000000000000".into();
+    new_record.claim.operation_digest = new_record.operation_digest.clone();
     new_record.claim.claim_token = derive_claim_token(
         &new_record.claim.instance_id,
         &new_record.claim.module_id,
         &new_record.claim.operation_id,
+        &new_record.operation_digest,
         new_record.controller_generation,
         new_record.extension_generation,
         &new_record.worker_epoch,
@@ -782,13 +790,13 @@ fn version_mismatched_journal_fails_closed() {
         insert_intent(db.connection_mut(), &record),
         Ok(EffectJournalInsertDisposition::Inserted { .. })
     ));
-    // A version-2 singleton write is refused by the schema CHECK (= 1): the
+    // A version-3 singleton write is refused by the schema CHECK (= 2): the
     // runtime fails closed instead of writing a mismatched premise.
     let tamper = db.connection().execute(
-        "UPDATE external_effect_journal_meta SET schema_version = 2",
+        "UPDATE external_effect_journal_meta SET schema_version = 3",
         [],
     );
-    assert!(tamper.is_err(), "a version-2 singleton write is refused");
+    assert!(tamper.is_err(), "a version-3 singleton write is refused");
 
     // Delete the meta singleton: a missing premise fails closed as
     // STORAGE_MIGRATION_REQUIRED on every writer and reader gate.
@@ -834,6 +842,29 @@ fn ordinary_reopen_never_repairs_missing_journal_schema() {
         Database::open(&dir.path().join("instance.sqlite")),
         Err(StorageError::MigrationRequired)
     ));
+}
+
+#[test]
+fn tampered_physical_index_and_check_schema_fails_closed() {
+    let dir = tempdir();
+    let db = open_db(dir.path());
+    db.connection()
+        .execute_batch(
+            "PRAGMA writable_schema = ON;
+             UPDATE sqlite_master
+                SET sql = replace(sql, 'state, instance_id', 'instance_id, state')
+              WHERE type = 'index' AND name = 'effect_journal_recovery';
+             PRAGMA schema_version = 2;
+             PRAGMA writable_schema = OFF;",
+        )
+        .expect("tamper sqlite schema");
+    assert!(
+        matches!(
+            gate_schema_version(db.connection()),
+            Err(StorageError::Corrupt)
+        ),
+        "index order tampering must not be repaired or accepted"
+    );
 }
 
 #[test]
@@ -932,10 +963,12 @@ fn jcs_byte_ceiling_refuses_overlarge_intent() {
     // Force a record whose JCS exceeds the fixed per-record ceiling.
     let ceiling = dolly_storage::effect_journal::MAX_EFFECT_JOURNAL_JCS_BYTES;
     let padded_epoch = "e".repeat(ceiling + 1);
+    let operation_digest = digest(0xff);
     let claim_token = derive_claim_token(
         INSTANCE,
         MODULE,
         "op-big",
+        &operation_digest,
         CONTROLLER,
         EXTENSION_GENERATION,
         &padded_epoch,
@@ -952,6 +985,7 @@ fn jcs_byte_ceiling_refuses_overlarge_intent() {
             instance_id: INSTANCE.into(),
             module_id: MODULE.into(),
             operation_id: "op-big".into(),
+            operation_digest: operation_digest.clone(),
             claim_token,
         },
         controller_generation: CONTROLLER,
