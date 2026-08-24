@@ -202,6 +202,43 @@ impl HostMcpStdioInstalledChildAttestation {
             process_id,
         }
     }
+
+    /// Digest of every immutable installed-child attestation input. The
+    /// digest is carried into the durable initialize Claim before child I/O.
+    pub fn attestation_digest(&self) -> Sha256Digest {
+        canonicalize(&serde_json::json!({
+            "schema": "dolly.mcp-installed-child-attestation/v1",
+            "server_id": self.server_id,
+            "adapter": self.adapter,
+            "protocol_version": self.protocol_version,
+            "transport_kind": self.transport_kind,
+            "endpoint": self.endpoint,
+            "endpoint_digest": self.endpoint_digest,
+            "package_digest": self.package_digest,
+            "package_path": self.package_path.to_string_lossy(),
+            "executable_digest": self.executable_digest,
+            "executable_path": self.executable_path.to_string_lossy(),
+            "transport_digest": self.transport_digest,
+            "daemon_installation_id": self.daemon_installation_id,
+            "instance_id": self.instance_id,
+            "controller_generation": self.controller_generation.value(),
+            "worker_epoch": self.worker_epoch,
+            "extension_alias": self.extension_alias,
+            "extension_generation": self.extension_generation.value(),
+            "runtime_binding_digest": self.runtime_binding_digest,
+            "session_id": self.session_id,
+            "process_id": self.process_id,
+        }))
+        .expect("installed-child attestation is canonicalizable")
+        .1
+    }
+
+    pub fn package_digest(&self) -> &Sha256Digest {
+        &self.package_digest
+    }
+    pub fn server_id(&self) -> &str {
+        &self.server_id
+    }
 }
 
 /// Host-issued verified process/session capability. No raw Child constructor
@@ -1069,20 +1106,25 @@ fn initialized_notification() -> Result<Vec<u8>, StdioTransportError> {
         .map(|(bytes, _)| bytes.into_vec())
         .map_err(|_| StdioTransportError::InvalidFrame)
 }
-/// Digest the exact bytes sent by the versioned startup lifecycle. The
-/// response is deliberately excluded from authority; it is consumed only by
-/// the readiness verifier after this intent is durable.
-pub fn initialize_handshake_digest() -> Result<Sha256Digest, StdioTransportError> {
-    let request = initialize_request()?;
-    let notification = initialized_notification()?;
-    let descriptor = serde_json::json!({
-        "schema": "dolly.mcp-initialize-handshake/v1",
-        "initialize_request": request,
-        "initialized_notification": notification,
-    });
-    canonicalize(&descriptor)
-        .map(|(_, digest)| digest)
-        .map_err(|_| StdioTransportError::InvalidFrame)
+/// Digest the exact bytes sent by the versioned startup lifecycle, bound to
+/// the runtime/process/package/policy and installed-child attestation.
+pub fn initialize_handshake_digest(
+    runtime_binding: &dolly_storage::runtime_binding::RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    package_digest: &Sha256Digest,
+    server_id: &str,
+    operation_id: &str,
+    attested_child_digest: &Sha256Digest,
+) -> Result<Sha256Digest, StdioTransportError> {
+    dolly_storage::effect_journal::initialize_handshake_digest(
+        runtime_binding,
+        process_generation,
+        package_digest,
+        server_id,
+        operation_id,
+        attested_child_digest,
+    )
+    .map_err(|_| StdioTransportError::InvalidFrame)
 }
 
 fn validate_initialize_response(

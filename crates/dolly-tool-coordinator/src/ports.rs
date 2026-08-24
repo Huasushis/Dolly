@@ -10,11 +10,76 @@
 use std::time::SystemTime;
 use dolly_storage::mcp_readiness::McpTransportReadiness;
 
-use dolly_tool_broker::{RecoveryFacts, RecoveryProof, ToolCallLedgerRecord};
+use dolly_tool_broker::ToolCallLedgerRecord;
 
-/// Host-owned answer to "is the frozen generation still Ready for this
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoveryProof {
+    zero_bytes_proved: bool,
+    exact_generation_ready: bool,
+    deadline_expired: bool,
+}
+
+impl RecoveryProof {
+    pub(crate) fn coordinator_dispatch_ready() -> Self {
+        Self {
+            zero_bytes_proved: true,
+            exact_generation_ready: true,
+            deadline_expired: false,
+        }
+    }
+    pub(crate) fn coordinator_dispatch_unready() -> Self {
+        Self {
+            zero_bytes_proved: true,
+            exact_generation_ready: false,
+            deadline_expired: false,
+        }
+    }
+    pub(crate) fn coordinator_dispatch_expired() -> Self {
+        Self {
+            zero_bytes_proved: true,
+            exact_generation_ready: true,
+            deadline_expired: true,
+        }
+    }
+    pub(crate) fn coordinator_reopen() -> Self {
+        Self {
+            zero_bytes_proved: false,
+            exact_generation_ready: false,
+            deadline_expired: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoveryFacts {
+    zero_bytes_proved: bool,
+    exact_generation_ready: bool,
+    deadline_expired: bool,
+}
+
+impl RecoveryFacts {
+    pub(crate) fn from_proof(proof: RecoveryProof) -> Self {
+        Self {
+            zero_bytes_proved: proof.zero_bytes_proved,
+            exact_generation_ready: proof.exact_generation_ready,
+            deadline_expired: proof.deadline_expired,
+        }
+    }
+}
+
+impl RecoveryFacts {
+    pub(crate) fn zero_bytes_proved(&self) -> bool {
+        self.zero_bytes_proved
+    }
+    pub(crate) fn exact_generation_ready(&self) -> bool {
+        self.exact_generation_ready
+    }
+    pub(crate) fn deadline_expired(&self) -> bool {
+        self.deadline_expired
+    }
+}
 /// retained revision?" (tool-broker §4/§6).
-pub trait GenerationReadiness {
+pub(crate) trait GenerationReadiness {
     /// Whether the exact frozen generation of `(module_id, server_id)` is
     /// still Ready. `false` makes an `AUTHORIZED` row fail closed as
     /// `TOOL_DISPATCH_NOT_APPLIED` (given zero-byte proof).
@@ -38,7 +103,7 @@ impl GenerationReadiness for McpTransportReadiness {
 }
 
 /// Host-owned wall clock for deadline comparison (tool-broker §6).
-pub trait Clock {
+pub(crate) trait Clock {
     /// The current wall time; compared against the binding's stored
     /// `authorized_deadline`.
     fn now(&self) -> SystemTime;
@@ -46,7 +111,7 @@ pub trait Clock {
 
 /// Per-row `RecoveryFacts` production. Implementations MUST NOT read any
 /// downstream ACK, result, error, or absence as a fact.
-pub trait RecoveryFactsProvider {
+pub(crate) trait RecoveryFactsProvider {
     /// Build the verified facts for one nonterminal row.
     fn facts_for(&self, row: &ToolCallLedgerRecord) -> RecoveryFacts;
 }
@@ -54,7 +119,7 @@ pub trait RecoveryFactsProvider {
 /// Composite [`RecoveryFactsProvider`] from Host-owned readiness, clock, and
 /// zero-byte proof inputs. `zero_bytes_proved` is the result of the Host's
 /// exclusive write-lock recheck on the fence.
-pub struct FencedFactsProvider<'a> {
+pub(crate) struct FencedFactsProvider<'a> {
     /// Whether the exclusive send gate proves zero bytes were eligible or
     /// sent (Host-owned).
     pub(crate) zero_bytes_proved: bool,

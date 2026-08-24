@@ -20,11 +20,7 @@ use dolly_storage::effect_journal::{
     EffectJournalIntentAuthority, retain_settled_effect_journal, settle_pending_effect_journal,
     settle_unknown_intent,
 };
-use dolly_storage::mcp_readiness::{
-    McpReadinessError, McpTransportReadiness, prove_current_mcp_transport_readiness,
-};
-#[cfg(feature = "test-support")]
-use dolly_storage::mcp_readiness::test_prove_current_mcp_transport_readiness;
+use dolly_storage::mcp_readiness::{McpReadinessError, McpTransportReadiness};
 use dolly_storage::tool_broker_authority::{
     ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
     validate_dispatch_binding,
@@ -36,9 +32,9 @@ use dolly_storage::tool_ledger::{
 use dolly_storage::{Database, StorageError};
 use dolly_tool_broker::effect_journal::ExternalEffectJournalRecord;
 use dolly_tool_broker::{
-    DispatchDisposition, LedgerState, RecoveryFacts, ToolCallLedgerRecord, ToolResult,
-    recover_operation,
+    DispatchDisposition, LedgerState, ToolCallLedgerRecord, ToolErrorCode, ToolResult,
 };
+use crate::ports::RecoveryFacts;
 
 use crate::mcp_stdio::{
     HostMcpStdioInstalledChildAttestation, HostMcpStdioProcessHandle, HostOwnedMcpStdioSession,
@@ -122,6 +118,7 @@ pub struct HostMcpStdioInvocation {
     limits: StdioTransportLimits,
     handshake_authority: EffectJournalIntentAuthority,
     handshake_intent: ExternalEffectJournalRecord,
+    attestation_digest: Sha256Digest,
     request_bytes: Vec<u8>,
 }
 
@@ -134,6 +131,9 @@ pub(crate) enum HostMcpStdioSessionState {
 pub(crate) struct HostMcpStdioInvocationParts {
     pub(crate) session: HostMcpStdioSessionState,
     pub(crate) host_handle: HostMcpStdioProcessHandle,
+    pub(crate) handshake_authority: EffectJournalIntentAuthority,
+    pub(crate) handshake_intent: ExternalEffectJournalRecord,
+    pub(crate) attestation_digest: Sha256Digest,
     pub(crate) limits: StdioTransportLimits,
     pub(crate) request_bytes: Vec<u8>,
 }
@@ -145,6 +145,7 @@ impl HostMcpStdioInvocation {
     pub fn from_installed_child(
         child: Child,
         attestation: HostMcpStdioInstalledChildAttestation,
+        runtime_binding: &RuntimeBinding,
         process_generation: &ProcessGeneration,
         limits: StdioTransportLimits,
         request_bytes: Vec<u8>,
@@ -152,8 +153,17 @@ impl HostMcpStdioInvocation {
         handshake_authority: &EffectJournalIntentAuthority,
         handshake_intent: &ExternalEffectJournalRecord,
     ) -> Result<(Self, HostMcpStdioProcessHandle), StdioTransportError> {
+        let attestation_digest = attestation.attestation_digest();
         if handshake_authority
-            .verify_for_initialize(database.connection(), handshake_intent)
+            .verify_for_initialize(
+                database.connection(),
+                handshake_intent,
+                runtime_binding,
+                process_generation,
+                attestation.package_digest(),
+                attestation.server_id(),
+                &attestation_digest,
+            )
             .is_err()
         {
             let mut child = child;
@@ -169,6 +179,7 @@ impl HostMcpStdioInvocation {
             limits,
             handshake_authority: handshake_authority.clone(),
             handshake_intent: handshake_intent.clone(),
+            attestation_digest,
             request_bytes,
         };
         Ok((invocation, retained_handle))
@@ -202,19 +213,42 @@ impl HostMcpStdioInvocation {
         }
         if self
             .handshake_authority
-            .verify_for_initialize(database.connection(), &self.handshake_intent)
+            .verify_for_initialize(
+                database.connection(),
+                &self.handshake_intent,
+                runtime_binding,
+                process_generation,
+                &self.handshake_intent.package_digest,
+                server_id,
+                &self.attestation_digest,
+            )
             .is_err()
         {
             self.host_handle.terminate();
             return Err(StdioTransportError::HandshakeAuthorityMismatch);
         }
+        let handshake_authority = self.handshake_authority.clone();
+        let handshake_intent = self.handshake_intent.clone();
+        let attestation_digest = self.attestation_digest.clone();
         self.initialize_with_readiness(
             database,
             runtime_binding,
             process_generation,
             server_id,
             deadline,
-            prove_current_mcp_transport_readiness,
+            move |connection, runtime, process, server, probe| {
+                dolly_storage::mcp_readiness::prove_current_mcp_transport_readiness_with_intent(
+                    connection,
+                    runtime,
+                    process,
+                    server,
+                    probe,
+                    &handshake_authority,
+                    &handshake_intent,
+                    &handshake_intent.package_digest,
+                    &attestation_digest,
+                )
+            },
         )
     }
 
@@ -234,19 +268,42 @@ impl HostMcpStdioInvocation {
         if self.handshake_authority != *handshake_authority
             || self
                 .handshake_authority
-                .verify_for_initialize(database.connection(), &self.handshake_intent)
+                .verify_for_initialize(
+                    database.connection(),
+                    &self.handshake_intent,
+                    runtime_binding,
+                    process_generation,
+                    &self.handshake_intent.package_digest,
+                    server_id,
+                    &self.attestation_digest,
+                )
                 .is_err()
         {
             self.host_handle.terminate();
             return Err(StdioTransportError::HandshakeAuthorityMismatch);
         }
+        let handshake_authority = self.handshake_authority.clone();
+        let handshake_intent = self.handshake_intent.clone();
+        let attestation_digest = self.attestation_digest.clone();
         self.initialize_with_readiness(
             database,
             runtime_binding,
             process_generation,
             server_id,
             deadline,
-            test_prove_current_mcp_transport_readiness,
+            move |connection, runtime, process, server, probe| {
+                dolly_storage::mcp_readiness::test_prove_current_mcp_transport_readiness_with_intent(
+                    connection,
+                    runtime,
+                    process,
+                    server,
+                    probe,
+                    &handshake_authority,
+                    &handshake_intent,
+                    &handshake_intent.package_digest,
+                    &attestation_digest,
+                )
+            },
         )
     }
     /// Internal readiness prover used only after handshake authority validation.
@@ -301,6 +358,9 @@ impl HostMcpStdioInvocation {
         HostMcpStdioInvocationParts {
             session: self.session,
             host_handle: self.host_handle,
+            handshake_authority: self.handshake_authority,
+            handshake_intent: self.handshake_intent,
+            attestation_digest: self.attestation_digest,
             limits: self.limits,
             request_bytes: self.request_bytes,
         }
@@ -337,6 +397,53 @@ pub enum DispatchOutcome {
 /// facts, then applied by compare-and-set against the exact
 /// `(module_id, operation_id, ledger_revision, state)` of the row. No
 /// downstream ACK/result/error/absence is consulted.
+fn recover_operation(
+    record: &ToolCallLedgerRecord,
+    facts: &RecoveryFacts,
+) -> DispatchDisposition {
+    if let Some(result) = &record.terminal_result {
+        return DispatchDisposition::AlreadyTerminal {
+            result: result.clone(),
+        };
+    }
+    match record.state {
+        LedgerState::Dispatched => DispatchDisposition::Unknown {
+            result: ToolResult::unknown_outcome(record.operation_binding.operation_id.clone()),
+        },
+        LedgerState::Authorized => {
+            let outbound_digest = record
+                .recompute_outbound_digest()
+                .unwrap_or_else(|| Sha256Digest::compute(&[]));
+            if facts.zero_bytes_proved() {
+                if facts.exact_generation_ready() && !facts.deadline_expired() {
+                    DispatchDisposition::ProposeDispatch {
+                        outbound_digest,
+                        allow_send_permit: true,
+                    }
+                } else {
+                    DispatchDisposition::ProvedNotApplied {
+                        result: ToolResult::failed(
+                            record.operation_binding.operation_id.clone(),
+                            ToolErrorCode::DispatchNotApplied,
+                            "durable zero-byte proof: no request byte was eligible or sent before the dispatch boundary",
+                        ),
+                    }
+                }
+            } else {
+                DispatchDisposition::ProposeDispatch {
+                    outbound_digest,
+                    allow_send_permit: false,
+                }
+            }
+        }
+        LedgerState::Succeeded | LedgerState::Failed | LedgerState::Unknown => {
+            DispatchDisposition::Unknown {
+                result: ToolResult::unknown_outcome(record.operation_binding.operation_id.clone()),
+            }
+        }
+    }
+}
+
 pub(crate) fn dispatch_operation(
     db: &mut Database,
     row: &ToolCallLedgerRecord,
@@ -471,6 +578,9 @@ pub fn dispatch_operation_authorized(
             runtime_binding,
             process_generation,
             readiness,
+            &parts.handshake_authority,
+            &parts.handshake_intent,
+            &parts.attestation_digest,
             host_session,
             parts.host_handle,
             parts.limits,

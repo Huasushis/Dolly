@@ -21,11 +21,14 @@ use dolly_storage::tool_ledger::{
 };
 use dolly_storage::{Database, StorageError};
 use dolly_tool_broker::{
-    ConfirmationDecision, IdempotencyPolicy, LedgerState, RecoveryFacts, RecoveryProof,
-    SideEffectClass, ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag,
+    ConfirmationDecision, IdempotencyPolicy, LedgerState, SideEffectClass, ToolCallLedgerRecord,
+    ToolOperationBinding, ToolOperationBindingSchemaTag,
+};
+use crate::ports::{
+    Clock, FencedFactsProvider, GenerationReadiness, RecoveryFacts, RecoveryProof,
 };
 use dolly_tool_coordinator::{
-    DispatchError, DispatchOutcome, FencedFactsProvider, HostMcpStdioInstalledChildAttestation,
+    DispatchError, DispatchOutcome, HostMcpStdioInstalledChildAttestation,
     HostMcpStdioInvocation, HostMcpStdioProcessHandle, StdioTransportError, StdioTransportLimits,
     ToolDispatchService, dispatch_operation, dispatch_operation_authorized, load_authoritative_row,
     reopen_recovery,
@@ -713,13 +716,13 @@ fn corrupt_row_stops_entire_recovery() {
 #[test]
 fn fenced_facts_provider_composes_ports() {
     struct Ready;
-    impl dolly_tool_coordinator::GenerationReadiness for Ready {
+    impl GenerationReadiness for Ready {
         fn exact_generation_ready(&self, module_id: &str, _server: &str, generation: u64) -> bool {
             module_id == "module-a" && generation == 7
         }
     }
     struct PeakClock;
-    impl dolly_tool_coordinator::Clock for PeakClock {
+    impl Clock for PeakClock {
         fn now(&self) -> std::time::SystemTime {
             std::time::SystemTime::UNIX_EPOCH
         }
@@ -753,6 +756,7 @@ fn forged_recovery_proof_cannot_cross_worker_dispatch_boundary() {
     let _mints_verified_handoff: fn(
         Child,
         HostMcpStdioInstalledChildAttestation,
+        &RuntimeBinding,
         &ProcessGeneration,
         StdioTransportLimits,
         Vec<u8>,

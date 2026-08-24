@@ -1,4 +1,5 @@
 
+#![cfg(feature = "test-support")]
 //! RED end-to-end Worker dispatch/start/reopen contract tests for the v1
 //! external-effect journal (ADR 0009 capability effect-intent seam).
 //!

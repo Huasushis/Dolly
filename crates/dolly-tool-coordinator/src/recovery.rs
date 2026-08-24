@@ -10,7 +10,7 @@ use dolly_storage::Database;
 use dolly_storage::tool_ledger::enumerate_nonterminal;
 use crate::dispatch::{DispatchError, DispatchOutcome, dispatch_operation};
 use crate::permit::SendPermit;
-use dolly_tool_broker::{RecoveryFacts, RecoveryProof};
+use crate::ports::{RecoveryFacts, RecoveryProof};
 
 /// Upper bound on pure re-decisions per row during one recovery pass.
 const MAX_DECISIONS_PER_ROW: usize = 6;

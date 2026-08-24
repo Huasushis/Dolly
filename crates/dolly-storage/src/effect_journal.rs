@@ -27,7 +27,8 @@
 //! same limits.
 
 use dolly_canonical_json::{
-    MAX_SEMANTIC_JSON_NESTING_DEPTH, ParseLimits, Sha256Digest, deserialize_core_json,
+    MAX_SEMANTIC_JSON_NESTING_DEPTH, ParseLimits, Sha256Digest, canonicalize,
+    deserialize_core_json,
     parse_core_json,
 };
 use dolly_tool_broker::effect_journal::{
@@ -369,6 +370,64 @@ fn verify_table_shape(
     }
     Ok(())
 }
+/// Recompute the exact startup initialize intent digest from the framing
+/// bytes and every authority input that must remain bound to the Claim.
+pub fn initialize_handshake_digest(
+    runtime_binding: &RuntimeBinding,
+    process_generation: &ProcessGeneration,
+    package_digest: &Sha256Digest,
+    server_id: &str,
+    operation_id: &str,
+    attested_child_digest: &Sha256Digest,
+) -> StorageResult<Sha256Digest> {
+    let initialize_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "dolly-initialize",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "dolly", "version": "0.1.0"}
+        }
+    });
+    let initialized_notification = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    });
+    let descriptor = serde_json::json!({
+        "schema": "dolly.mcp-initialize-handshake/v2",
+        "initialize_request": canonicalize(&initialize_request)
+            .map_err(|_| StorageError::Corrupt)?
+            .0
+            .into_vec(),
+        "initialized_notification": canonicalize(&initialized_notification)
+            .map_err(|_| StorageError::Corrupt)?
+            .0
+            .into_vec(),
+        "authority": {
+            "daemon_installation_id": runtime_binding.daemon_installation_id(),
+            "instance_id": runtime_binding.instance_id(),
+            "module_id": runtime_binding.extension_alias().to_string(),
+            "controller_generation": runtime_binding.controller_generation().value(),
+            "worker_epoch": runtime_binding.worker_epoch().to_string(),
+            "runtime_binding_digest": runtime_binding.binding_digest(),
+            "process_controller_generation": process_generation.controller_generation().value(),
+            "process_extension_generation": process_generation.extension_generation().value(),
+            "process_worker_epoch": process_generation.worker_epoch().to_string(),
+            "process_binding_digest": process_generation.binding_digest(),
+            "package_digest": package_digest,
+            "policy_premise_digest": runtime_binding.premises_digest(),
+            "server_id": server_id,
+            "operation_id": operation_id,
+            "attested_child_digest": attested_child_digest,
+        }
+    });
+    canonicalize(&descriptor)
+        .map(|(_, digest)| digest)
+        .map_err(|_| StorageError::Corrupt)
+}
+
 
 /// The unforgeable capability returned only after a new Claim intent commits.
 /// Coordinator stdio dispatch requires this exact capability and re-verifies
@@ -417,6 +476,7 @@ impl EffectJournalIntentAuthority {
             || self.record.worker_epoch != runtime_binding.worker_epoch().to_string()
             || self.record.worker_epoch != process_generation.worker_epoch().to_string()
             || self.record.package_digest != *package_digest
+            || row.operation_binding.recompute_package_digest().as_ref() != Some(package_digest)
             || self.record.policy_premise_digest != *runtime_binding.premises_digest()
             || self.record.effect_class != EffectClass::McpToolsCall
             || row.operation_binding.instance_id != runtime_binding.instance_id()
@@ -432,6 +492,11 @@ impl EffectJournalIntentAuthority {
         &self,
         connection: &Connection,
         expected: &ExternalEffectJournalRecord,
+        runtime_binding: &RuntimeBinding,
+        process_generation: &ProcessGeneration,
+        package_digest: &Sha256Digest,
+        server_id: &str,
+        attested_child_digest: &Sha256Digest,
     ) -> StorageResult<()> {
         gate_schema_version(connection)?;
         if expected.state != EffectJournalState::Intended
@@ -443,7 +508,28 @@ impl EffectJournalIntentAuthority {
             return Err(StorageError::Corrupt);
         }
         let stored = load_exact(connection, &self.record.claim)?.ok_or(StorageError::Corrupt)?;
-        if stored != self.record || self.record != *expected {
+        let expected_digest = initialize_handshake_digest(
+            runtime_binding,
+            process_generation,
+            package_digest,
+            server_id,
+            &expected.claim.operation_id,
+            attested_child_digest,
+        )?;
+        if stored != self.record
+            || self.record != *expected
+            || self.record.claim.instance_id != runtime_binding.instance_id()
+            || self.record.claim.module_id != runtime_binding.extension_alias().to_string()
+            || process_generation.instance_id() != runtime_binding.instance_id()
+            || self.record.controller_generation != runtime_binding.controller_generation().value()
+            || self.record.controller_generation != process_generation.controller_generation().value()
+            || self.record.extension_generation != process_generation.extension_generation().value()
+            || self.record.worker_epoch != runtime_binding.worker_epoch().to_string()
+            || self.record.worker_epoch != process_generation.worker_epoch().to_string()
+            || self.record.package_digest != *package_digest
+            || self.record.policy_premise_digest != *runtime_binding.premises_digest()
+            || self.record.intent_digest != expected_digest
+        {
             return Err(StorageError::Corrupt);
         }
         Ok(())

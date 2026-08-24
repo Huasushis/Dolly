@@ -563,16 +563,16 @@ impl ToolCallLedgerRecord {
 
 /// Opaque recovery proof emitted by the authoritative coordinator fence.
 /// Callers never provide individual boolean authority inputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecoveryProof {
+#[cfg(test)]
+pub(crate) struct RecoveryProof {
     zero_bytes_proved: bool,
     exact_generation_ready: bool,
     deadline_expired: bool,
 }
 
+#[cfg(test)]
 impl RecoveryProof {
-    /// Proof for a live, exact-generation dispatch fence.
-    pub fn coordinator_dispatch_ready() -> Self {
+    pub(crate) fn coordinator_dispatch_ready() -> Self {
         Self {
             zero_bytes_proved: true,
             exact_generation_ready: true,
@@ -580,8 +580,7 @@ impl RecoveryProof {
         }
     }
 
-    /// Proof for a zero-byte fence whose generation is unusable.
-    pub fn coordinator_dispatch_unready() -> Self {
+    pub(crate) fn coordinator_dispatch_unready() -> Self {
         Self {
             zero_bytes_proved: true,
             exact_generation_ready: false,
@@ -589,8 +588,7 @@ impl RecoveryProof {
         }
     }
 
-    /// Proof for a zero-byte fence whose authorization deadline expired.
-    pub fn coordinator_dispatch_expired() -> Self {
+    pub(crate) fn coordinator_dispatch_expired() -> Self {
         Self {
             zero_bytes_proved: true,
             exact_generation_ready: true,
@@ -598,8 +596,7 @@ impl RecoveryProof {
         }
     }
 
-    /// Conservative reopen proof: no bytes are proven eligible or sent.
-    pub fn coordinator_reopen() -> Self {
+    pub(crate) fn coordinator_reopen() -> Self {
         Self {
             zero_bytes_proved: false,
             exact_generation_ready: false,
@@ -610,32 +607,23 @@ impl RecoveryProof {
 
 /// Host-owned recovery evidence. Its booleans remain private and can only be
 /// obtained from an opaque coordinator proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecoveryFacts {
+#[cfg(test)]
+pub(crate) struct RecoveryFacts {
     zero_bytes_proved: bool,
     exact_generation_ready: bool,
     deadline_expired: bool,
 }
 
+#[cfg(test)]
 impl RecoveryFacts {
-    pub fn from_proof(proof: RecoveryProof) -> Self {
+    pub(crate) fn from_proof(proof: RecoveryProof) -> Self {
         Self {
             zero_bytes_proved: proof.zero_bytes_proved,
             exact_generation_ready: proof.exact_generation_ready,
             deadline_expired: proof.deadline_expired,
         }
     }
-    pub fn zero_bytes_proved(&self) -> bool {
-        self.zero_bytes_proved
-    }
 
-    pub fn exact_generation_ready(&self) -> bool {
-        self.exact_generation_ready
-    }
-
-    pub fn deadline_expired(&self) -> bool {
-        self.deadline_expired
-    }
 }
 
 /// The recovery decision for a durable Tool-call row.
@@ -731,8 +719,8 @@ impl DispatchDisposition {
 ///                                          UNKNOWN (ambiguity; the caller CASes
 ///                                          DISPATCHED without releasing a
 ///                                          permit, reruns this decision on the
-///                                          new row and terminalizes UNKNOWN).
-pub fn recover_operation(
+#[cfg(test)]
+pub(crate) fn recover_operation(
     record: &ToolCallLedgerRecord,
     facts: &RecoveryFacts,
 ) -> DispatchDisposition {
