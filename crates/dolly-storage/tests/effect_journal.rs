@@ -911,6 +911,59 @@ fn tampered_physical_index_and_check_schema_fails_closed() {
 }
 
 #[test]
+fn lowercased_check_literals_fail_closed() {
+    let dir = tempdir();
+    let db = open_db(dir.path());
+    let actual_sql: String = db
+        .connection()
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'external_effect_journal'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("journal table SQL");
+    let lookalike_sql = actual_sql
+        .replace(
+            "state IN ('INTENDED', 'APPLIED', 'NOT_APPLIED', 'UNKNOWN_OUTCOME')",
+            "state IN ('intended', 'applied', 'not_applied', 'unknown_outcome')",
+        )
+        .replace(
+            "effect_class IN ('MCP_TOOLS_CALL', 'MCP_INITIALIZE_HANDSHAKE_V1')",
+            "effect_class IN ('mcp_tools_call', 'mcp_initialize_handshake_v1')",
+        );
+    assert_ne!(
+        actual_sql, lookalike_sql,
+        "fixture must alter the physical CHECK literals"
+    );
+
+    db.connection()
+        .execute_batch("PRAGMA writable_schema = ON;")
+        .expect("enable sqlite schema tampering");
+    db.connection()
+        .execute(
+            "UPDATE sqlite_master SET sql = ?1
+             WHERE type = 'table' AND name = 'external_effect_journal'",
+            rusqlite::params![lookalike_sql],
+        )
+        .expect("install lookalike journal schema");
+    db.connection()
+        .execute_batch(
+            "PRAGMA schema_version = 2;
+             PRAGMA writable_schema = OFF;",
+        )
+        .expect("reload lookalike journal schema");
+
+    assert!(
+        matches!(
+            gate_schema_version(db.connection()),
+            Err(StorageError::Corrupt)
+        ),
+        "lowercased CHECK literals must fail the physical schema gate"
+    );
+}
+
+#[test]
 fn corrupt_bytes_fail_closed_on_read_and_pending_enumeration() {
     let dir = tempdir();
     let mut db = open_db(dir.path());

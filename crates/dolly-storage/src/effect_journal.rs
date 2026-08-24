@@ -264,11 +264,45 @@ pub fn gate_schema_version(connection: &Connection) -> StorageResult<()> {
 }
 
 fn normalize_schema_sql(sql: &str) -> String {
-    sql.trim()
-        .trim_end_matches(';')
-        .split_whitespace()
-        .collect::<String>()
-        .to_ascii_lowercase()
+    let mut normalized = String::with_capacity(sql.len());
+    let mut quoted: Option<char> = None;
+    let mut characters = sql.chars().peekable();
+
+    while let Some(character) = characters.next() {
+        if let Some(quote) = quoted {
+            normalized.push(character);
+            if character == quote {
+                if characters.peek() == Some(&quote) {
+                    normalized.push(
+                        characters
+                            .next()
+                            .expect("peeked escaped schema quote must still exist"),
+                    );
+                } else {
+                    quoted = None;
+                }
+            }
+            continue;
+        }
+
+        let quote = match character {
+            '\'' | '"' | '`' => Some(character),
+            '[' => Some(']'),
+            _ => None,
+        };
+        if let Some(quote) = quote {
+            normalized.push(character);
+            quoted = Some(quote);
+        } else if !character.is_whitespace() {
+            normalized.push(character.to_ascii_lowercase());
+        }
+    }
+
+    while normalized.ends_with(';') {
+        normalized.pop();
+    }
+
+    normalized
 }
 
 fn verify_schema_sql(
