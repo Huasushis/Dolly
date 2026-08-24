@@ -403,7 +403,7 @@ pub fn load_exact(
     verify_row(row).map(Some)
 }
 
-fn load_verified_inner(
+pub(crate) fn load_verified_inner(
     transaction: &Transaction,
     module_id: &str,
     operation_id: &str,

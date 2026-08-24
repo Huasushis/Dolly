@@ -299,8 +299,19 @@ impl ToolOperationBinding {
         self.recompute_outbound_payload()
             .map(|bytes| Sha256Digest::compute(bytes.as_ref()))
     }
+    /// The installed package digest retained in the frozen server contract.
+    pub fn recompute_package_digest(&self) -> Option<Sha256Digest> {
+        let transport = match self.server_contract.get("transport")? {
+            dolly_canonical_json::CanonicalJsonValue::Object(value) => value,
+            _ => return None,
+        };
+        let package = match transport.get("package_digest")? {
+            dolly_canonical_json::CanonicalJsonValue::String(value) => value,
+            _ => return None,
+        };
+        package.parse().ok()
+    }
 }
-
 /// Copy of the operation-binding wire tag; equality is by the fixed string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ToolOperationBindingSchemaTag;

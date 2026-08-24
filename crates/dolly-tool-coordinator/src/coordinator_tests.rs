@@ -11,6 +11,7 @@
 use std::process::Child;
 
 use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
+use dolly_storage::effect_journal::EffectJournalIntentAuthority;
 use dolly_storage::mcp_readiness::McpTransportReadiness;
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::ToolDispatchAuthority;
@@ -759,10 +760,12 @@ fn authority_dispatch_requires_current_revalidation_api() {
     let _ = dolly_storage::tool_broker_authority::revalidate_tool_dispatch_authority;
     let _requires_stdio_handoff: fn(
         &mut Database,
+        &EffectJournalIntentAuthority,
         &ToolDispatchAuthority,
         &RuntimeBinding,
         &ProcessGeneration,
         &McpTransportReadiness,
+        &Sha256Digest,
         &ToolCallLedgerRecord,
         &RecoveryFacts,
         &ToolDispatchService,

@@ -302,8 +302,8 @@ impl ExternalEffectJournalRecord {
     }
 
     /// Validate the record against the closed state-machine constraints plus
-    /// the exact claim token. Any invalid combination is corruption, never a
-    /// reinterpretation.
+    /// the exact claim token. Any invalid combination is corruption, never
+    /// a reinterpretation.
     pub fn verify(&self) -> Result<(), EffectJournalRecordError> {
         if self.journal_revision == 0 {
             return Err(EffectJournalRecordError(
@@ -378,13 +378,20 @@ pub fn recover_effect_journal(
     let Some(ledger) = ledger else {
         return EffectSettlement::UnknownOutcome;
     };
+    if ledger.verify_field_combination().is_err() {
+        return EffectSettlement::UnknownOutcome;
+    }
     let binding = &ledger.operation_binding;
     // Evidence identity must match the same Claim and generation: operation
-    // identity must match exactly (instance/module/operation and digest).
+    // identity must match exactly (instance/module/operation and digest), and
+    // the retained package and exact outbound payload must be the same frozen
+    // premise. A terminal ledger row from another Claim is not evidence.
     if binding.instance_id != record.claim.instance_id
         || binding.module_id != record.claim.module_id
         || binding.operation_id != record.claim.operation_id
         || ledger.operation_digest != record.operation_digest
+        || binding.recompute_package_digest().as_ref() != Some(&record.package_digest)
+        || binding.recompute_outbound_digest().as_ref() != Some(&record.intent_digest)
     {
         return EffectSettlement::UnknownOutcome;
     }
@@ -408,8 +415,9 @@ pub fn recover_effect_journal(
         }
         crate::dispatch::LedgerState::Failed => {
             // `TOOL_DISPATCH_NOT_APPLIED` is zero-byte proof: the exact effect
-            // did not happen. The identity already matched; no outbound digest
-            // exists on this terminal (AUTHORIZED -> FAILED) by construction.
+            // did not happen. The exact frozen outbound payload was still
+            // reconstructed above, even though the ledger stores no outbound
+            // digest for this pre-dispatch failure.
             let not_applied = ledger
                 .terminal_result
                 .as_ref()

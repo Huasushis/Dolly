@@ -1,3 +1,5 @@
+#![cfg(feature = "test-support")]
+
 //! RED end-to-end Worker dispatch/start/reopen contract tests for the v1
 //! external-effect journal (ADR 0009 capability effect-intent seam).
 //!
@@ -17,13 +19,16 @@
 //! The whole suite is gated by `dolly-worker/test-support`; without the
 //! feature this crate compiles to zero tests.
 
-use std::path::{Path, PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use dolly_canonical_json::{CanonicalJsonValue, Sha256Digest, canonicalize};
 use dolly_storage::Database;
 use dolly_storage::effect_journal::{
-    EffectJournalInsertDisposition, create_effect_journal_schema, enumerate_pending,
-    insert_intent, load_exact,
+    EffectJournalInsertDisposition, enumerate_pending, insert_intent, load_exact,
 };
 use dolly_storage::host_authority::{
     ConfigRevisionMapping, HostAuthorityRevision, InstalledComponentOrigin, LinuxServiceCandidate,
@@ -34,14 +39,14 @@ use dolly_storage::linux_host_verification::test_proof_for_authority;
 use dolly_storage::tool_ledger::{
     LedgerInsertDisposition, create_tool_ledger_schema, insert_authorized,
 };
+use dolly_tool_broker::effect_journal::{
+    Claim, ClaimRecordSchemaTag, EffectClass, EffectJournalRecordSchemaTag, EffectJournalState,
+    ExternalEffectJournalRecord, derive_claim_token,
+};
 use dolly_tool_broker::{
     ConfirmationDecision, IdempotencyPolicy, LedgerState, RecoveryFacts, SideEffectClass,
     ToolCallLedgerRecord, ToolCallLedgerRecordSchemaTag, ToolOperationBinding,
     ToolOperationBindingSchemaTag,
-};
-use dolly_tool_broker::effect_journal::{
-    Claim, ClaimRecordSchemaTag, EffectClass, EffectJournalRecordSchemaTag, EffectJournalState,
-    ExternalEffectJournalRecord, derive_claim_token,
 };
 use dolly_tool_coordinator::DispatchOutcome;
 use dolly_worker::{Worker, WorkerStartConfig};
@@ -298,11 +303,8 @@ fn host_revision(broker_config: Value, instance_id: &str) -> HostAuthorityRevisi
         "mode": "user",
         "candidate_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     });
-    candidate_record["candidate_digest"] = json!(digest_of(&without(
-        &candidate_record,
-        "candidate_digest"
-    ))
-    .to_canonical_string());
+    candidate_record["candidate_digest"] =
+        json!(digest_of(&without(&candidate_record, "candidate_digest")).to_canonical_string());
     let candidate: LinuxServiceCandidate = serde_json::from_value(candidate_record).unwrap();
     let runtime_config = CanonicalJsonValue::try_from(json!({
         "spec": {"services": {"tool_broker": broker_config}}
@@ -364,6 +366,7 @@ struct Fixture {
     package_root: PathBuf,
     package_path: PathBuf,
     server: Value,
+    instance_id: String,
 }
 
 impl Fixture {
@@ -391,7 +394,6 @@ impl Fixture {
             .install_host_authority_revision(revision)
             .expect("install authority revision");
         create_tool_ledger_schema(db.connection()).expect("ledger schema");
-        create_effect_journal_schema(db.connection()).expect("journal schema");
         // Seed the FK parents the AUTHORIZED ledger row references.
         db.connection()
             .execute(
@@ -412,6 +414,7 @@ impl Fixture {
             package_root: package_root.clone(),
             package_path: package_root.join("package.bin"),
             server,
+            instance_id,
         }
     }
 
@@ -426,9 +429,11 @@ impl Fixture {
     }
 
     fn binding(&self, seed: u8) -> ToolOperationBinding {
-        let contract = CanonicalJsonValue::try_from(self.server.clone())
-            .expect("canonicalizable server");
-        binding(&contract, seed)
+        let contract =
+            CanonicalJsonValue::try_from(self.server.clone()).expect("canonicalizable server");
+        let mut binding = binding(&contract, seed);
+        binding.instance_id = self.instance_id.clone();
+        binding
     }
 
     fn start_worker(&self) -> Worker {
@@ -455,6 +460,132 @@ impl Fixture {
 // tests
 // ---------------------------------------------------------------------------
 
+/// Child-process helper for the true crash boundary test below. The
+/// `abort()` is in production Worker code compiled only for `test-support`;
+/// it occurs after the committed Claim intent and before coordinator entry.
+#[test]
+fn worker_crash_after_intent_child() {
+    let Some(report_path) = env::var_os("DOLLY_WORKER_TEST_CRASH_REPORT") else {
+        return;
+    };
+    let fixture = Fixture::new(false);
+    let binding = fixture.binding(9);
+    let ledger = ledger_authorized(&binding);
+    fixture.preload_ledger(&[ledger.clone()]);
+    let mut worker = fixture.start_worker();
+    let process_generation = worker.process_generation().extension_generation().value();
+    std::fs::write(
+        report_path,
+        serde_json::to_vec(&json!({
+            "db_path": fixture.db_path,
+            "package_root": fixture.package_root,
+            "package_path": fixture.package_path,
+            "operation_id": binding.operation_id,
+            "instance_id": binding.instance_id,
+            "extension_generation": process_generation,
+        }))
+        .expect("crash report JSON"),
+    )
+    .expect("write crash report");
+    let frame = request_frame(&binding);
+    let _ = worker.dispatch_tools_call(&ledger, &facts_proof(), &frame);
+    panic!("test-support crash seam did not abort");
+}
+
+#[test]
+fn crash_at_intent_boundary_recovers_unknown_and_process_record() {
+    let report_directory = tempdir().expect("report tempdir");
+    let report_path = report_directory.path().join("crash-report.json");
+    let status = Command::new(env::current_exe().expect("test executable"))
+        .arg("--exact")
+        .arg("worker_crash_after_intent_child")
+        .arg("--nocapture")
+        .env("DOLLY_WORKER_TEST_CRASH_REPORT", &report_path)
+        .env("DOLLY_WORKER_TEST_CRASH_AFTER_INTENT", "1")
+        .status()
+        .expect("spawn crash child");
+    assert!(
+        !status.success(),
+        "child must terminate at the crash boundary"
+    );
+
+    let report: Value = serde_json::from_slice(&std::fs::read(&report_path).expect("crash report"))
+        .expect("valid crash report");
+    let db_path = PathBuf::from(report["db_path"].as_str().expect("db path"));
+    let package_root = PathBuf::from(report["package_root"].as_str().expect("package root"));
+    let package_path = PathBuf::from(report["package_path"].as_str().expect("package path"));
+    let operation_id = report["operation_id"].as_str().expect("operation id");
+    let instance_id = report["instance_id"].as_str().expect("instance id");
+    let old_extension_generation = report["extension_generation"]
+        .as_u64()
+        .expect("extension generation");
+
+    let db = Database::open(&db_path).expect("reopen after process crash");
+    let pending = enumerate_pending(db.connection()).expect("enumerate pending");
+    let row = pending
+        .iter()
+        .find(|row| row.claim.operation_id == operation_id)
+        .expect("intent survived crash");
+    assert_eq!(row.state, EffectJournalState::Intended);
+    assert_eq!(
+        count_child_calls(&package_root),
+        0,
+        "crash occurred before stdio tools/call"
+    );
+    let old_process_records: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM process_generation_authority_records
+             WHERE instance_id = ?1 AND extension_generation = ?2",
+            rusqlite::params![instance_id, old_extension_generation as i64],
+            |row| row.get(0),
+        )
+        .expect("old process record");
+    assert_eq!(old_process_records, 1);
+    let snapshot = load_current_authority(db.connection())
+        .expect("load authority")
+        .expect("authority present");
+    let proof = test_proof_for_authority(&snapshot);
+    drop(db);
+
+    let config = WorkerStartConfig {
+        db_path: db_path.clone(),
+        extension_alias: "org.dolly.tools".parse().expect("extension id"),
+        server_id: "fs".into(),
+        package_root,
+        package_path,
+    };
+    let restarted =
+        Worker::start_with_verified_proof(config, proof).expect("reopen Worker after crash");
+    assert_ne!(
+        restarted
+            .process_generation()
+            .extension_generation()
+            .value(),
+        old_extension_generation
+    );
+    drop(restarted);
+
+    let db = Database::open(&db_path).expect("reopen after recovery");
+    let recovered = load_exact(db.connection(), &row.claim)
+        .expect("load recovered intent")
+        .expect("recovered row");
+    assert_eq!(recovered.state, EffectJournalState::UnknownOutcome);
+    let remaining_process_records: i64 = db
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM process_generation_authority_records
+             WHERE instance_id = ?1 AND extension_generation = ?2",
+            rusqlite::params![instance_id, old_extension_generation as i64],
+            |row| row.get(0),
+        )
+        .expect("old process record after recovery");
+    assert_eq!(remaining_process_records, 1);
+    drop(db);
+    std::fs::remove_dir_all(db_path.parent().expect("crash fixture parent"))
+        .expect("remove crash fixture");
+}
+
 /// 1. intent-before-effect: the Worker durably records the exact Claim-bound
 ///    INTENDED intent before any child I/O, and a real Worker restart settles
 ///    the row from the authoritative ledger evidence — no re-dispatch.
@@ -477,7 +608,11 @@ fn worker_dispatches_only_after_durable_intent_then_restart_settles() {
         DispatchOutcome::Terminalized { record } if record.state == LedgerState::Succeeded => {}
         other => panic!("expected a terminal Succeeded outcome, got {other:?}"),
     }
-    assert_eq!(count_child_calls(&fixture.package_root), 1, "child produced one call");
+    assert_eq!(
+        count_child_calls(&fixture.package_root),
+        1,
+        "child produced one call"
+    );
     drop(worker);
 
     // Crash point: reopen the SQLite file. The durable intent row exists with
@@ -489,7 +624,10 @@ fn worker_dispatches_only_after_durable_intent_then_restart_settles() {
         .find(|r| r.claim.operation_id == b.operation_id)
         .expect("durable intent row present after dispatch");
     assert_eq!(row.state, EffectJournalState::Intended);
-    assert_eq!(row.intent_digest, intent_digest, "intent = exact outbound frame");
+    assert_eq!(
+        row.intent_digest, intent_digest,
+        "intent = exact outbound frame"
+    );
     assert_eq!(row.claim.instance_id, b.instance_id);
     assert_eq!(row.claim.module_id, b.module_id);
     assert_eq!(row.claim.operation_id, b.operation_id);
@@ -503,10 +641,16 @@ fn worker_dispatches_only_after_durable_intent_then_restart_settles() {
     let loaded = load_exact(db.connection(), &row.claim)
         .expect("load settled row")
         .expect("row present after restart");
-    assert_eq!(loaded.state, EffectJournalState::Applied, "settled from authoritative Succeeded ledger");
+    assert_eq!(
+        loaded.state,
+        EffectJournalState::Applied,
+        "settled from authoritative Succeeded ledger"
+    );
     assert!(loaded.evidence_digest.is_some(), "settled with evidence");
     assert!(
-        enumerate_pending(db.connection()).expect("enumerate").is_empty(),
+        enumerate_pending(db.connection())
+            .expect("enumerate")
+            .is_empty(),
         "nothing remains pending after restart settlement"
     );
     drop(db);
@@ -539,13 +683,16 @@ fn crash_mid_dispatch_settles_unknown_outcome_and_never_redispatches() {
     // the durable intent is left for restart settlement.
     match &result {
         Err(_) => {}
-        Ok(DispatchOutcome::Terminalized { record })
-            if record.state == LedgerState::Unknown => {}
+        Ok(DispatchOutcome::Terminalized { record }) if record.state == LedgerState::Unknown => {}
         other => panic!(
             "child I/O with no outcome must fail closed (error or terminal Unknown), got {other:?}"
         ),
     }
-    assert_eq!(count_child_calls(&fixture.package_root), 1, "child I/O happened");
+    assert_eq!(
+        count_child_calls(&fixture.package_root),
+        1,
+        "child I/O happened"
+    );
     drop(worker);
 
     // Crash point: only the durable INTENDED intent exists.
@@ -573,7 +720,9 @@ fn crash_mid_dispatch_settles_unknown_outcome_and_never_redispatches() {
     );
     assert!(loaded.evidence_digest.is_none());
     assert!(
-        enumerate_pending(db.connection()).expect("enumerate").is_empty(),
+        enumerate_pending(db.connection())
+            .expect("enumerate")
+            .is_empty(),
         "nothing remains INTENDED after settlement"
     );
     drop(db);
@@ -664,9 +813,7 @@ fn journal_at_capacity_fails_closed_before_child_io() {
                 intent_digest: digest_hex(0xdd),
                 evidence_digest: None,
             };
-            match insert_intent(db.connection_mut(), &record)
-                .expect("prefill insert")
-            {
+            match insert_intent(db.connection_mut(), &record).expect("prefill insert") {
                 EffectJournalInsertDisposition::Inserted { .. } => {}
                 EffectJournalInsertDisposition::Replayed { .. } => {
                     panic!("prefill ids are unique")
