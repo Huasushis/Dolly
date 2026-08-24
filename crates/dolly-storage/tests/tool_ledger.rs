@@ -14,32 +14,17 @@
 use dolly_canonical_json::{CanonicalJsonObject, Sha256Digest, canonicalize};
 use dolly_storage::tool_ledger::{
     CasKey, CasOutcome, LedgerInsertDisposition, TransportCorrelation, create_tool_ledger_schema,
-    enumerate_nonterminal, insert_authorized, load_exact, propose_recovery,
+    enumerate_nonterminal, insert_authorized, load_exact,
 };
 use dolly_storage::{Database, StorageError};
 use dolly_tool_broker::{
-    ConfirmationDecision, DispatchDisposition, IdempotencyPolicy, LedgerState, RecoveryFacts,
-    RecoveryProof, SideEffectClass, ToolCallLedgerRecord, ToolOperationBinding,
-    ToolOperationBindingSchemaTag, ToolStatus,
+    ConfirmationDecision, IdempotencyPolicy, LedgerState, SideEffectClass,
+    ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag, ToolStatus,
 };
 use rusqlite::Connection;
 use serde_json::json;
 
 
-fn facts(
-    _record: &ToolCallLedgerRecord,
-    zero_bytes_proved: bool,
-    exact_generation_ready: bool,
-    deadline_expired: bool,
-) -> RecoveryFacts {
-    let proof = match (zero_bytes_proved, exact_generation_ready, deadline_expired) {
-        (true, true, false) => RecoveryProof::coordinator_dispatch_ready(),
-        (true, false, false) => RecoveryProof::coordinator_dispatch_unready(),
-        (true, _, true) => RecoveryProof::coordinator_dispatch_expired(),
-        _ => RecoveryProof::coordinator_reopen(),
-    };
-    RecoveryFacts::from_proof(proof)
-}
 /// Request-digest/operation-digest/outbound digest shorthand.
 fn digest(hex: u8) -> Sha256Digest {
     format!("sha256:{:064x}", hex as u128)
@@ -254,6 +239,15 @@ fn tempdir() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
 
+#[test]
+fn enumeration_requires_the_physical_ledger_schema() {
+    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    assert!(matches!(
+        enumerate_nonterminal(&connection),
+        Err(StorageError::MigrationRequired)
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // TST-TOOL-009 / 006: AUTHORIZED zero-byte safe retry disposition
 // ---------------------------------------------------------------------------
@@ -289,20 +283,11 @@ fn authorized_zero_byte_safe_retry_disposition() {
 
     // Pure zero-byte proof decision with exact Ready generation + live
     // deadline: propose dispatch with a permit (TST-TOOL-009).
-    let disposition = propose_recovery(
-        recovered,
-        &facts(recovered, true, true, false),
-    );
-    let outbound_digest = match &disposition {
-        DispatchDisposition::ProposeDispatch {
-            outbound_digest,
-            allow_send_permit,
-        } => {
-            assert!(allow_send_permit, "permit eligible after proof");
-            outbound_digest.clone()
-        }
-        other => panic!("expected ProposeDispatch, got {other:?}"),
-    };
+    // The outbound digest is recomputed from the exact durable row; the
+    // coordinator owns the separate readiness fence and CAS authority.
+    let outbound_digest = recovered
+        .recompute_outbound_digest()
+        .expect("authorized row carries an outbound payload");
 
     // The store CAS commits the transition durably - before any send permit.
     let dispatched = build_record(
@@ -356,18 +341,12 @@ fn authorized_zero_byte_proof_unusable_generation_fails_not_applied() {
     let recovered = enumerate_nonterminal(db.connection())
         .expect("enumerate")
         .remove(0);
-    let disposition = propose_recovery(
-        &recovered,
-        &facts(&recovered, true, false, false),
-    );
-    let terminal_result = match &disposition {
-        DispatchDisposition::ProvedNotApplied { result } => result.clone(),
-        other => panic!("expected ProvedNotApplied, got {other:?}"),
-    };
-    assert_eq!(terminal_result.status, ToolStatus::Failed);
-    assert_eq!(
-        terminal_result.error.as_ref().unwrap().code,
-        dolly_tool_broker::ToolErrorCode::DispatchNotApplied
+    // The verified zero-byte fence with an unusable generation is terminal
+    // NOT_APPLIED; the coordinator owns this pure decision.
+    let terminal_result = dolly_tool_broker::ToolResult::failed(
+        recovered.operation_binding.operation_id.clone(),
+        dolly_tool_broker::ToolErrorCode::DispatchNotApplied,
+        "durable zero-byte proof: no request byte was eligible or sent before the dispatch boundary",
     );
 
     let terminal = build_record(LedgerState::Failed, false, Some(terminal_result), &binding);
@@ -451,24 +430,11 @@ fn dispatched_row_becomes_unknown_without_redispatch() {
         .expect("enumerate")
         .remove(0);
     assert_eq!(recovered.state, LedgerState::Dispatched);
-    let disposition = propose_recovery(
-        &recovered,
-        &facts(&recovered, false, false, false),
+    // DISPATCHED recovery is an UNKNOWN outcome and never a redispatch.
+    let unknown_result = dolly_tool_broker::ToolResult::unknown_outcome(
+        recovered.operation_binding.operation_id.clone(),
     );
-    match &disposition {
-        DispatchDisposition::Unknown { result } => {
-            assert_eq!(result.status, ToolStatus::Unknown);
-            assert_eq!(disposition.automatic_redispatch_count(), 0);
-        }
-        other => panic!("DISPATCHED must recover Unknown, got {other:?}"),
-    }
-    assert_eq!(disposition.automatic_redispatch_count(), 0);
-
-    // Terminal CAS: DISPATCHED(2) -> UNKNOWN(3), outbound digest retained.
-    let unknown_result = match &disposition {
-        DispatchDisposition::Unknown { result } => result.clone(),
-        _ => unreachable!(),
-    };
+    assert_eq!(unknown_result.status, ToolStatus::Unknown);
     let terminal = build_record(LedgerState::Unknown, true, Some(unknown_result), &binding);
     let outcome = dolly_storage::tool_ledger::cas_terminal(
         db.connection_mut(),
@@ -519,14 +485,6 @@ fn dispatched_row_becomes_unknown_without_redispatch() {
     .expect("row present");
     assert_eq!(loaded.state, LedgerState::Unknown);
     assert_eq!(loaded.ledger_revision, 3);
-    let disposition = propose_recovery(
-        &loaded,
-        &facts(&loaded, false, false, false),
-    );
-    assert!(
-        matches!(disposition, DispatchDisposition::AlreadyTerminal { .. }),
-        "reopened terminal row must replay, not recreate a permit"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -616,18 +574,12 @@ fn terminal_commit_ack_lost_reopen_replays_exact() {
         terminal_bytes.as_ref(),
         "reopened record_jcs must byte-match the committed terminal record"
     );
-    // Recovery of a terminal row is a verbatim replay, never a redispatch.
-    let disposition = propose_recovery(
-        &loaded,
-        &facts(&loaded, false, false, false),
+    // The terminal record itself is the replay authority; no new permit or
+    // recovery proof is minted from this storage-only test.
+    assert_eq!(
+        loaded.terminal_result.as_ref().expect("terminal result").status,
+        ToolStatus::Succeeded
     );
-    match &disposition {
-        DispatchDisposition::AlreadyTerminal { result } => {
-            assert_eq!(result.status, ToolStatus::Succeeded);
-            assert_eq!(disposition.automatic_redispatch_count(), 0);
-        }
-        other => panic!("expected AlreadyTerminal, got {other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------

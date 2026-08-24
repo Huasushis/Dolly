@@ -18,14 +18,12 @@
 //!   once, and settle the row after closed correlation/schema/bounds checks;
 //! - [`service::ToolResponseEnvelope`] — the closed JSON-RPC response the
 //!   service admits;
-//! - [`ports::FencedFactsProvider`] — composite Host-owned facts provider;
-//! - [`SendPermit`] — the opaque one-use permit a transport consumes once.
 
 extern crate self as dolly_tool_coordinator;
 pub mod dispatch;
 mod mcp_stdio;
 pub mod permit;
-pub mod ports;
+mod ports;
 pub mod recovery;
 pub mod service;
 
@@ -46,7 +44,6 @@ pub use mcp_stdio::{
     StdioTransportError, StdioTransportLimits, initialize_handshake_digest,
 };
 pub use permit::{SendPermit, SendPermitBinding};
-pub use ports::{Clock, FencedFactsProvider, GenerationReadiness, RecoveryFactsProvider};
 pub use recovery::{RecoveryOutcome, reopen_recovery};
 pub use service::{
     DispatchLimits, ServiceError, ServiceOutcome, ToolDispatchService, ToolResponseEnvelope,

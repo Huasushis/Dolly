@@ -21,7 +21,7 @@ use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding, invalida
 use dolly_storage::tool_broker_authority::{
     ToolDispatchAuthority, ToolRegistryRevision, authorize_tool_dispatch, publish_tool_registry,
 };
-use dolly_storage::tool_ledger::load_exact;
+use dolly_storage::tool_ledger::{create_tool_ledger_schema, gate_tool_ledger_schema, load_exact};
 use dolly_tool_broker::effect_journal::{
     Claim, ClaimRecordSchemaTag, EffectClass, EffectJournalRecordSchemaTag, EffectJournalState,
     ExternalEffectJournalRecord, derive_claim_token,
@@ -171,6 +171,12 @@ impl Worker {
         // gates the exact physical schema and version; it never repairs it.
         gate_schema_version(database.connection())
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
+        // Reopen recovery reads the Tool-call ledger; install its required
+        // schema on first Worker use, then verify the exact physical shape.
+        create_tool_ledger_schema(database.connection())
+            .map_err(|error| WorkerError::Storage(error.to_string()))?;
+        gate_tool_ledger_schema(database.connection())
+            .map_err(|error| WorkerError::Storage(error.to_string()))?;
         // Any pending `INTENDED` intent from a previous incarnation is
         // settled only from identity-matched authoritative ledger evidence
         // (or the private ambiguity path); nothing is re-dispatched.
@@ -256,25 +262,17 @@ impl Worker {
             session_id.clone(),
             child.id(),
         );
-        // The initialize digest is pure framing data. The durable Claim is
-        // inserted before constructing a session or performing any child I/O.
-        let intent_digest =
-            dolly_tool_coordinator::initialize_handshake_digest().map_err(|error| {
-                startup_failure(
-                    &mut database,
-                    &runtime_binding,
-                    Some(&process_generation),
-                    None,
-                    WorkerError::Transport(error),
-                )
-            })?;
+        // The initialize digest binds exact framing plus runtime/process/
+        // package/policy and installed-child attestation inputs. The durable
+        // Claim is inserted before constructing a session or doing I/O.
+        let attestation_digest = attestation.attestation_digest();
         let handshake_intent = mint_handshake_intent_record(
             &runtime_binding,
             &process_generation,
             &config.server_id,
             &session_id,
             &durable_server.package_digest,
-            intent_digest,
+            &attestation_digest,
         )?;
         let handshake_authority =
             match insert_intent(database.connection_mut(), &handshake_intent) {
@@ -303,6 +301,7 @@ impl Worker {
         let (mut invocation, process_handle) = match HostMcpStdioInvocation::from_installed_child(
             child,
             attestation,
+            &runtime_binding,
             &process_generation,
             durable_server.stdio_limits,
             Vec::new(),
@@ -651,9 +650,18 @@ fn mint_handshake_intent_record(
     server_id: &str,
     session_id: &str,
     package_digest: &Sha256Digest,
-    intent_digest: Sha256Digest,
+    attested_child_digest: &Sha256Digest,
 ) -> Result<ExternalEffectJournalRecord, WorkerError> {
     let operation_id = format!("mcp-initialize-{session_id}");
+    let intent_digest = dolly_tool_coordinator::initialize_handshake_digest(
+        runtime_binding,
+        process_generation,
+        package_digest,
+        server_id,
+        &operation_id,
+        attested_child_digest,
+    )
+    .map_err(|error| WorkerError::Premise(format!("handshake digest is not canonical: {error:?}")))?;
     let operation_digest = canonicalize(&serde_json::json!({
         "schema": "dolly.mcp-initialize-operation/v1",
         "server_id": server_id,

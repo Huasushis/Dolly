@@ -20,9 +20,7 @@
 //! enforced; their fuller column sets arrive with their own storage slices.
 
 use dolly_canonical_json::{ParseLimits, Sha256Digest, deserialize_core_json};
-use dolly_tool_broker::{
-    DispatchDisposition, LedgerState, RecoveryFacts, ToolCallLedgerRecord, recover_operation,
-};
+use dolly_tool_broker::{LedgerState, ToolCallLedgerRecord};
 use rusqlite::{OptionalExtension, Row, Transaction};
 
 use crate::database::map_sqlite_error;
@@ -93,13 +91,139 @@ CREATE INDEX IF NOT EXISTS tool_call_ledger_recovery
 "#;
 
 /// Create the authoritative Tool-call ledger schema (table, parents, index).
+/// Existing objects are never repaired: their required columns and index
+/// shape are verified immediately and any mismatch fails closed.
 pub fn create_tool_ledger_schema(connection: &rusqlite::Connection) -> StorageResult<()> {
     connection
         .execute_batch(TOOL_CALL_LEDGER_SCHEMA_SQL)
         .map_err(map_sqlite_error)?;
     connection
         .execute_batch(TOOL_CALL_LEDGER_RECOVERY_INDEX_SQL)
-        .map_err(map_sqlite_error)
+        .map_err(map_sqlite_error)?;
+    gate_tool_ledger_schema(connection)
+}
+
+/// Verify the physical Tool-call ledger schema before any recovery query.
+/// Missing objects are migration-required; malformed objects are corrupt.
+pub fn gate_tool_ledger_schema(connection: &rusqlite::Connection) -> StorageResult<()> {
+    verify_required_columns(
+        connection,
+        "activations",
+        &[("activation_id", "TEXT", 1, 1)],
+        false,
+    )?;
+    verify_required_columns(
+        connection,
+        "config_revisions",
+        &[("config_revision", "INTEGER", 1, 1)],
+        false,
+    )?;
+    verify_required_columns(
+        connection,
+        TOOL_CALL_LEDGER_TABLE,
+        &[
+            ("instance_id", "TEXT", 1, 0),
+            ("module_id", "TEXT", 1, 1),
+            ("operation_id", "TEXT", 1, 2),
+            ("ledger_revision", "INTEGER", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("activation_id", "TEXT", 1, 0),
+            ("config_revision", "INTEGER", 1, 0),
+            ("tool_server_id", "TEXT", 1, 0),
+            ("tool_name", "TEXT", 1, 0),
+            ("tool_server_generation", "INTEGER", 1, 0),
+            ("server_request_id", "TEXT", 1, 0),
+            ("request_digest", "TEXT", 1, 0),
+            ("operation_digest", "TEXT", 1, 0),
+            ("outbound_digest", "TEXT", 0, 0),
+            ("idempotency_argument_pointer", "TEXT", 0, 0),
+            ("confirmation_id", "TEXT", 0, 0),
+            ("terminal_result_digest", "TEXT", 0, 0),
+            ("record_jcs", "BLOB", 1, 0),
+            ("record_digest", "TEXT", 1, 0),
+        ],
+        true,
+    )?;
+    let index_exists: Option<String> = connection
+        .query_row(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND name = 'tool_call_ledger_recovery'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    if index_exists.is_none() {
+        return Err(StorageError::MigrationRequired);
+    }
+    let mut statement = connection
+        .prepare("PRAGMA index_info(tool_call_ledger_recovery)")
+        .map_err(map_sqlite_error)?;
+    let actual = statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(2)?)))
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    if actual
+        != [
+            (0, "state".to_owned()),
+            (1, "module_id".to_owned()),
+            (2, "operation_id".to_owned()),
+        ]
+    {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(())
+}
+
+fn verify_required_columns(
+    connection: &rusqlite::Connection,
+    table: &str,
+    expected: &[(&str, &str, i64, i64)],
+    exact: bool,
+) -> StorageResult<()> {
+    let exists: Option<String> = connection
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    if exists.is_none() {
+        return Err(StorageError::MigrationRequired);
+    }
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(map_sqlite_error)?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sqlite_error)?;
+    if (exact && actual.len() != expected.len())
+        || actual.len() < expected.len()
+        || actual
+            .iter()
+            .take(expected.len())
+            .zip(expected)
+            .any(|(actual, expected)| {
+                actual.0 != expected.0
+                    || actual.1 != expected.1
+                    || actual.2 != expected.2
+                    || actual.3 != expected.3
+            })
+    {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(())
 }
 
 /// The result of inserting an `AUTHORIZED` ledger row.
@@ -516,6 +640,7 @@ fn verify_row(row: &Row) -> StorageResult<ToolCallLedgerRecord> {
 pub fn enumerate_nonterminal(
     connection: &rusqlite::Connection,
 ) -> StorageResult<Vec<ToolCallLedgerRecord>> {
+    gate_tool_ledger_schema(connection)?;
     let mut stmt = connection
         .prepare(ENUMERATE_SQL)
         .map_err(map_sqlite_error)?;
@@ -535,12 +660,3 @@ const ENUMERATE_SQL: &str = "SELECT instance_id, module_id, operation_id, ledger
              FROM tool_call_ledger
              WHERE state IN ('AUTHORIZED', 'DISPATCHED')
              ORDER BY module_id, operation_id";
-
-/// Apply the spec §6 pure recovery decision to one stored nonterminal row
-/// (pure, no I/O; the caller then compare-and-sets the proposal).
-pub fn propose_recovery(
-    record: &ToolCallLedgerRecord,
-    facts: &RecoveryFacts,
-) -> DispatchDisposition {
-    recover_operation(record, facts)
-}

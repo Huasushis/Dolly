@@ -23,7 +23,9 @@ use dolly_canonical_json::{
     CanonicalJsonValue, ParseLimits, Sha256Digest, canonicalize, parse_core_json,
 };
 use dolly_schema::SchemaValidator;
-use dolly_storage::mcp_readiness::{McpTransportReadiness, prove_current_mcp_transport_readiness};
+use dolly_storage::mcp_readiness::{
+    McpTransportReadiness, prove_current_mcp_transport_readiness_with_intent,
+};
 use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding};
 use dolly_storage::tool_broker_authority::{
     ToolBrokerAuthorityError, ToolDispatchAuthority, revalidate_tool_dispatch_authority,
@@ -33,6 +35,8 @@ use dolly_storage::tool_ledger::{
     CasKey, CasOutcome, TransportCorrelation, cas_terminal, load_exact,
 };
 use dolly_storage::{Database, StorageError};
+use dolly_storage::effect_journal::EffectJournalIntentAuthority;
+use dolly_tool_broker::effect_journal::ExternalEffectJournalRecord;
 use dolly_tool_broker::{
     ErrorOutcome, LedgerState, ToolCallLedgerRecord, ToolError, ToolErrorCode,
     ToolOperationBinding, ToolResult, ToolStatus,
@@ -203,6 +207,9 @@ impl ToolDispatchService {
         runtime_binding: &RuntimeBinding,
         process_generation: &ProcessGeneration,
         readiness: &McpTransportReadiness,
+        handshake_authority: &EffectJournalIntentAuthority,
+        handshake_intent: &ExternalEffectJournalRecord,
+        attestation_digest: &Sha256Digest,
         host_session: HostOwnedMcpStdioSession,
         host_handle: HostMcpStdioProcessHandle,
         limits: StdioTransportLimits,
@@ -215,6 +222,9 @@ impl ToolDispatchService {
             runtime_binding,
             process_generation,
             readiness,
+            handshake_authority,
+            handshake_intent,
+            attestation_digest,
             host_session,
             host_handle,
             limits,
@@ -334,6 +344,9 @@ impl ToolDispatchService {
         runtime_binding: &RuntimeBinding,
         process_generation: &ProcessGeneration,
         readiness: &McpTransportReadiness,
+        handshake_authority: &EffectJournalIntentAuthority,
+        handshake_intent: &ExternalEffectJournalRecord,
+        attestation_digest: &Sha256Digest,
         host_session: HostOwnedMcpStdioSession,
         host_handle: HostMcpStdioProcessHandle,
         limits: StdioTransportLimits,
@@ -372,12 +385,16 @@ impl ToolDispatchService {
             Ok(probe) => probe,
             Err(_) => return self.settle_admission_unknown(db, host_handle, permit, request_bytes),
         };
-        let readiness = match prove_current_mcp_transport_readiness(
+        let readiness = match prove_current_mcp_transport_readiness_with_intent(
             db.connection(),
             runtime_binding,
             process_generation,
             &server_id,
             &mut probe,
+            handshake_authority,
+            handshake_intent,
+            &handshake_intent.package_digest,
+            attestation_digest,
         ) {
             Ok(readiness) => readiness,
             Err(_) => {

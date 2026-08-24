@@ -4,9 +4,22 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 dolly-canonical-json = { path = "../dolly-canonical-json" }
 dolly-schema = { path = "../dolly-schema" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+
+[[test]]
+name = "effect_journal"
+path = "tests/effect_journal.rs"
+
+[[test]]
+name = "argument_key"
+path = "tests/argument_key.rs"
+
+[[test]]
+name = "contract"
+path = "tests/contract.rs"

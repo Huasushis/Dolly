@@ -18,10 +18,10 @@ use dolly_storage::tool_ledger::{
     LedgerInsertDisposition, create_tool_ledger_schema, enumerate_nonterminal, insert_authorized,
 };
 use dolly_tool_broker::{
-    ConfirmationDecision, IdempotencyPolicy, LedgerState, RecoveryFacts, RecoveryProof,
-    SideEffectClass, ToolCallLedgerRecord, ToolOperationBinding, ToolOperationBindingSchemaTag,
-    ToolStatus,
+    ConfirmationDecision, IdempotencyPolicy, LedgerState, SideEffectClass, ToolCallLedgerRecord,
+    ToolOperationBinding, ToolOperationBindingSchemaTag, ToolStatus,
 };
+use crate::ports::{RecoveryFacts, RecoveryProof};
 use dolly_tool_coordinator::{
     DispatchLimits, DispatchOutcome, ServiceOutcome, ToolDispatchService, ToolTransport,
     TransportOutcome,
