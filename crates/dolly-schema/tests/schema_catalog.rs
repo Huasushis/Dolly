@@ -1,4 +1,4 @@
-//! Schema catalog tests: verify the embedded catalog has exactly 76 unique
+//! Schema catalog tests: verify the embedded catalog has exactly 77 unique
 //! `$id`s, and that the embedded schemas match the imported sources.
 
 use dolly_canonical_json::parse_core_json;
@@ -9,11 +9,11 @@ use dolly_schema::embedded_schema_catalog;
 // ---------------------------------------------------------------------------
 
 #[test]
-fn catalog_has_76_unique_ids() {
+fn catalog_has_77_unique_ids() {
     let catalog = embedded_schema_catalog().expect("catalog should load");
-    assert_eq!(catalog.len(), 76);
+    assert_eq!(catalog.len(), 77);
     let ids = catalog.ids();
-    assert_eq!(ids.len(), 76);
+    assert_eq!(ids.len(), 77);
     let mut sorted = ids.to_vec();
     sorted.sort();
     let mut deduped = sorted.clone();
@@ -91,7 +91,7 @@ fn catalog_matches_imported_sources() {
     }
 
     assert_eq!(
-        imported_count, 76,
-        "should have matched exactly 76 imported schemas"
+        imported_count, 77,
+        "should have matched exactly 77 imported schemas"
     );
 }

@@ -4505,6 +4505,657 @@
   },
   {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://dolly.example/spec/0.1/schemas/effect-journal-bridge.schema.json",
+    "title": "Dolly cross-language effect journal bridge",
+    "$comment": "This is a language-neutral contract for a future public adapter. It records how the TypeScript effect-intent dialect maps to the Rust Claim and external-effect journal dialect without making either transport dialect interchangeable. No daemon or Worker transport is implied by this schema.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "schema",
+      "source",
+      "target",
+      "identity_mapping",
+      "authority_mapping",
+      "outcome_mapping",
+      "canonicalization",
+      "transport",
+      "ordering",
+      "identity_checks"
+    ],
+    "properties": {
+      "schema": {
+        "const": "dolly.effect-journal-bridge/v1"
+      },
+      "source": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "dialect",
+          "intent_schema",
+          "run_schema"
+        ],
+        "properties": {
+          "dialect": {
+            "const": "typescript"
+          },
+          "intent_schema": {
+            "const": "dolly.effect-intent/2"
+          },
+          "run_schema": {
+            "const": "dolly.effect-run/1"
+          }
+        }
+      },
+      "target": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "dialect",
+          "claim_schema",
+          "journal_schema"
+        ],
+        "properties": {
+          "dialect": {
+            "const": "rust"
+          },
+          "claim_schema": {
+            "const": "dolly.claim/v2"
+          },
+          "journal_schema": {
+            "const": "dolly.external-effect-journal/v2"
+          }
+        }
+      },
+      "identity_mapping": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source_fields",
+          "target_fields",
+          "field_rules",
+          "claim_token_rule"
+        ],
+        "properties": {
+          "source_fields": {
+            "const": [
+              "moduleJobId",
+              "runId",
+              "attempt",
+              "claimToken",
+              "moduleGenerationId"
+            ]
+          },
+          "target_fields": {
+            "const": [
+              "instance_id",
+              "module_id",
+              "operation_id",
+              "operation_digest",
+              "claim_token"
+            ]
+          },
+          "field_rules": {
+            "const": [
+              {
+                "source": "moduleJobId",
+                "target": "module_id",
+                "rule": "exact-utf8-identifier"
+              },
+              {
+                "source": "idempotencyKey",
+                "target": "operation_id",
+                "rule": "exact-utf8-identifier"
+              },
+              {
+                "source": "intentDigest",
+                "target": "operation_digest",
+                "rule": "exact-sha256-digest"
+              },
+              {
+                "source": "claimToken",
+                "target": "claim_token",
+                "rule": "do-not-copy; retain-source-provenance-and-derive-target"
+              },
+              {
+                "source": "runId,attempt,moduleGenerationId",
+                "target": "authority",
+                "rule": "bind-by-explicit-generation-pair; no-type-coercion"
+              }
+            ]
+          },
+          "claim_token_rule": {
+            "const": "sha256(JCS({schema,instance_id,module_id,operation_id,operation_digest,controller_generation,extension_generation,worker_epoch,package_digest,policy_premise_digest,effect_class}))"
+          }
+        }
+      },
+      "authority_mapping": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "required_fields",
+          "provenance_fields",
+          "missing_disposition"
+        ],
+        "properties": {
+          "required_fields": {
+            "const": [
+              "daemon_installation_id",
+              "instance_id",
+              "controller_generation",
+              "process.extension_generation",
+              "process.worker_epoch",
+              "process.binding_digest",
+              "process.session_id",
+              "process.process_id",
+              "package_digest",
+              "policy_premise_digest"
+            ]
+          },
+          "provenance_fields": {
+            "const": [
+              "package_digest",
+              "executable_digest",
+              "transport_digest",
+              "process.binding_digest",
+              "process.session_id",
+              "process.process_id"
+            ]
+          },
+          "missing_disposition": {
+            "const": "refuse-before-child-io"
+          }
+        }
+      },
+      "outcome_mapping": {
+        "type": "array",
+        "minItems": 4,
+        "maxItems": 4,
+        "uniqueItems": true,
+        "allOf": [
+          {
+            "contains": {
+              "required": [
+                "source_kind"
+              ],
+              "properties": {
+                "source_kind": {
+                  "const": "intended"
+                }
+              }
+            }
+          },
+          {
+            "contains": {
+              "required": [
+                "source_kind"
+              ],
+              "properties": {
+                "source_kind": {
+                  "const": "no-effect"
+                }
+              }
+            }
+          },
+          {
+            "contains": {
+              "required": [
+                "source_kind"
+              ],
+              "properties": {
+                "source_kind": {
+                  "const": "terminal"
+                }
+              }
+            }
+          },
+          {
+            "contains": {
+              "required": [
+                "source_kind"
+              ],
+              "properties": {
+                "source_kind": {
+                  "const": "unknown"
+                }
+              }
+            }
+          }
+        ],
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source_kind",
+            "source_evidence_rule",
+            "target_state",
+            "journal_revision",
+            "evidence_rule",
+            "per_intent_evidence",
+            "redispatch"
+          ],
+          "properties": {
+            "source_kind": {
+              "enum": [
+                "intended",
+                "no-effect",
+                "terminal",
+                "unknown"
+              ]
+            },
+            "source_evidence_rule": {
+              "enum": [
+                "source.outcome.kind=intended",
+                "source.outcome.kind=no-effect",
+                "source.outcome.kind=terminal;require-resultDigest",
+                "source.outcome.kind=unknown;retain-reason"
+              ]
+            },
+            "target_state": {
+              "enum": [
+                "INTENDED",
+                "NOT_APPLIED",
+                "APPLIED",
+                "UNKNOWN_OUTCOME"
+              ]
+            },
+            "journal_revision": {
+              "enum": [
+                1,
+                2
+              ]
+            },
+            "evidence_rule": {
+              "enum": [
+                "null",
+                "sha256(JCS(no-effect-proof))",
+                "source.outcome.resultDigest"
+              ]
+            },
+            "per_intent_evidence": {
+              "const": "required"
+            },
+            "redispatch": {
+              "const": "forbidden"
+            }
+          }
+        }
+      },
+      "aggregate_evidence": {
+        "const": "never-map-evidenceForRun-directly-to-one-Rust-record; require-each-intent-outcome"
+      },
+      "canonicalization": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "scheme",
+          "encoding",
+          "digest",
+          "semantic_depth",
+          "wire_depth",
+          "unknown_fields"
+        ],
+        "properties": {
+          "scheme": {
+            "const": "RFC8785-JCS"
+          },
+          "encoding": {
+            "const": "UTF-8"
+          },
+          "digest": {
+            "const": "sha256:<lowercase-hex>"
+          },
+          "semantic_depth": {
+            "const": 64
+          },
+          "wire_depth": {
+            "const": 96
+          },
+          "unknown_fields": {
+            "const": "reject"
+          }
+        }
+      },
+      "transport": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "extension_rpc",
+          "mcp_stdio",
+          "semantic_errors"
+        ],
+        "properties": {
+          "extension_rpc": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "dialect",
+              "framing",
+              "length_endian",
+              "max_payload_bytes",
+              "wire_depth",
+              "semantic_depth"
+            ],
+            "properties": {
+              "dialect": {
+                "const": "dolly-extension-rpc/3.0"
+              },
+              "framing": {
+                "const": "four-byte-length-prefix"
+              },
+              "length_endian": {
+                "const": "big"
+              },
+              "max_payload_bytes": {
+                "type": "integer",
+                "const": 262144
+              },
+              "wire_depth": {
+                "const": 96
+              },
+              "semantic_depth": {
+                "const": 64
+              }
+            }
+          },
+          "mcp_stdio": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "dialect",
+              "framing",
+              "delimiter",
+              "max_line_bytes",
+              "wire_depth",
+              "semantic_depth"
+            ],
+            "properties": {
+              "dialect": {
+                "const": "mcp/2025-06-18"
+              },
+              "framing": {
+                "const": "newline-delimited-json"
+              },
+              "delimiter": {
+                "const": "LF"
+              },
+              "max_line_bytes": {
+                "type": "integer",
+                "const": 262144
+              },
+              "wire_depth": {
+                "const": 96
+              },
+              "semantic_depth": {
+                "const": 64
+              }
+            }
+          },
+          "semantic_errors": {
+            "type": "array",
+            "minItems": 6,
+            "uniqueItems": true,
+            "allOf": [
+              {
+                "contains": {
+                  "properties": {
+                    "code": {
+                      "const": "EXTENSION_INVALID_PARAMS"
+                    }
+                  }
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "code": {
+                      "const": "EXTENSION_INVALID_RESPONSE"
+                    }
+                  }
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "code": {
+                      "const": "MCP_REQUEST_INVALID"
+                    }
+                  }
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "code": {
+                      "const": "MCP_RESPONSE_INVALID"
+                    }
+                  }
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "code": {
+                      "const": "MCP_DISCONNECTED"
+                    }
+                  }
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "code": {
+                      "const": "CLAIM_INTENT_PERSISTENCE_FAILED"
+                    }
+                  }
+                }
+              }
+            ],
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "code",
+                "source_codes",
+                "phase",
+                "outcome",
+                "connection",
+                "redispatch"
+              ],
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "source_codes": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "phase": {
+                  "enum": [
+                    "pre-effect",
+                    "post-write"
+                  ]
+                },
+                "outcome": {
+                  "enum": [
+                    "not_applied",
+                    "unknown"
+                  ]
+                },
+                "connection": {
+                  "enum": [
+                    "reusable",
+                    "closed"
+                  ]
+                },
+                "redispatch": {
+                  "const": "forbidden"
+                }
+              }
+            }
+          }
+        }
+      },
+      "ordering": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "before_child_io",
+          "first_external_write",
+          "replay"
+        ],
+        "properties": {
+          "before_child_io": {
+            "const": [
+              "platform_gate",
+              "authority_gate",
+              "package_and_provenance_gate",
+              "claim_intent_commit",
+              "identity_pair_check"
+            ]
+          },
+          "first_external_write": {
+            "const": "after-claim-intent-commit"
+          },
+          "replay": {
+            "const": "refuse-without-new-claim"
+          }
+        }
+      },
+      "identity_checks": {
+        "type": "array",
+        "minItems": 6,
+        "maxItems": 6,
+        "uniqueItems": true,
+        "allOf": [
+          {
+            "contains": {
+              "required": [
+                "left",
+                "right"
+              ],
+              "properties": {
+                "left": {
+                  "const": "authority.daemon_installation_id"
+                },
+                "right": {
+                  "const": "installation.daemon_installation_id"
+                }
+              }
+            }
+          },
+          {
+            "contains": {
+              "required": [
+                "left",
+                "right"
+              ],
+              "properties": {
+                "left": {
+                  "const": "authority.instance_id"
+                },
+                "right": {
+                  "const": "claim.instance_id"
+                }
+              }
+            }
+          },
+          {
+            "contains": {
+              "required": [
+                "left",
+                "right"
+              ],
+              "properties": {
+                "left": {
+                  "const": "authority.controller_generation"
+                },
+                "right": {
+                  "const": "process.controller_generation"
+                }
+              }
+            }
+          },
+          {
+            "contains": {
+              "required": [
+                "left",
+                "right"
+              ],
+              "properties": {
+                "left": {
+                  "const": "authority.process.extension_generation"
+                },
+                "right": {
+                  "const": "journal.extension_generation"
+                }
+              }
+            }
+          },
+          {
+            "contains": {
+              "required": [
+                "left",
+                "right"
+              ],
+              "properties": {
+                "left": {
+                  "const": "authority.process.worker_epoch"
+                },
+                "right": {
+                  "const": "journal.worker_epoch"
+                }
+              }
+            }
+          },
+          {
+            "contains": {
+              "required": [
+                "left",
+                "right"
+              ],
+              "properties": {
+                "left": {
+                  "const": "authority.process.binding_digest"
+                },
+                "right": {
+                  "const": "runtime.binding_digest"
+                }
+              }
+            }
+          }
+        ],
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "left",
+            "right",
+            "mismatch"
+          ],
+          "properties": {
+            "left": {
+              "type": "string",
+              "minLength": 1
+            },
+            "right": {
+              "type": "string",
+              "minLength": 1
+            },
+            "mismatch": {
+              "const": "refuse"
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "https://dolly.example/spec/0.1/schemas/error.schema.json",
     "title": "DollyError",
     "description": "Closed common Dolly error data envelope. Every JSON-RPC error.data value and every locally synthesized protocol error value is an independent semantic schema root: its root container has depth 1, its effective maximum cannot exceed 64, and JSON-RPC envelope objects do not consume that quota.",
