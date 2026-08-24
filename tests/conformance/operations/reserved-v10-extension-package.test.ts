@@ -120,7 +120,15 @@ function runtimeConfiguration(policyRevision: string, policyId = "storage-checkp
   };
 }
 
-function packageManifest(policyRevision: string, schemaVersion = "dolly.extension-package/10", capabilityVersion = "v2"): Record<string, unknown> {
+function packageManifest(
+  policyRevision: string,
+  schemaVersion = "dolly.extension-package/10",
+  capabilityVersion = "v2",
+  capabilityType:
+    | "model-operation"
+    | "tool-invocation"
+    | "module-private-storage" = "module-private-storage",
+): Record<string, unknown> {
   return {
     schemaVersion,
     extensionId: PACKAGE_ID,
@@ -143,7 +151,7 @@ function packageManifest(policyRevision: string, schemaVersion = "dolly.extensio
     }],
     requestedCapabilities: [{
       moduleKind: "worker",
-      capabilityType: "module-private-storage",
+      capabilityType,
       capabilityVersion,
       policyId: "storage-checkpoints",
       policyRevision,
@@ -248,7 +256,14 @@ function expectPackageError(operation: () => unknown): void {
   expect(operation).toThrow(ExtensionInstallationError);
 }
 
-function setup(maxCalls = 4): {
+function setup(
+  maxCalls = 4,
+  capabilityType:
+    | "model-operation"
+    | "tool-invocation"
+    | "module-private-storage" = "module-private-storage",
+  capabilityVersion = "v2",
+): {
   readonly root: string;
   readonly source: string;
   readonly installations: ExtensionInstallationRegistry;
@@ -271,7 +286,15 @@ function setup(maxCalls = 4): {
     component_revision: 1,
     component_digest: `sha256:${"0".repeat(64)}`,
   }, maxCalls);
-  writePackage(source, packageManifest(provisionalPolicy.revision));
+  writePackage(
+    source,
+    packageManifest(
+      provisionalPolicy.revision,
+      "dolly.extension-package/10",
+      capabilityVersion,
+      capabilityType,
+    ),
+  );
   installations.installNodePackage({ sourceDirectory: source, trust: "trusted" });
   const packageOrigin = origins.resolve({ extensionId: PACKAGE_ID, packageVersion: PACKAGE_VERSION });
   const policy = policyFixture(policyRoot, packageOrigin, maxCalls);
@@ -398,5 +421,11 @@ describe("reserved version-10 installed package producer", () => {
     const state = setup();
     writePackage(state.source, packageManifest(state.policyRevision, "dolly.extension-package/10", "v3"));
     expectPackageError(() => state.installations.installNodePackage({ sourceDirectory: state.source, trust: "trusted" }));
+  });
+  it("rejects capability models that are not bound to the durable policy kind/version", () => {
+    const mismatchedKind = setup(4, "model-operation", "v2");
+    expectPackageError(() => produce(mismatchedKind));
+    expect(() => setup(4, "module-private-storage", "v3"))
+      .toThrow(ExtensionInstallationError);
   });
 });

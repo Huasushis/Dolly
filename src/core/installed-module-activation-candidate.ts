@@ -29,6 +29,10 @@ import {
   type StartupAuthorityPermissionContext,
 } from "./startup-authority-premise.js";
 import { validateDollyInstanceConfigV10Draft } from "./runtime-config-v10.js";
+import {
+  produceReservedV10ExtensionPackageManifest,
+  type ReservedV10InstalledExtensionPackageManifest,
+} from "./reserved-v10-extension-package.js";
 
 export interface InstalledModuleActivationCandidateOptions
   extends StartupAuthorityPermissionContext {
@@ -182,12 +186,39 @@ export function composeInstalledModuleActivationCandidate(
   assertOptions(options);
   const runtimeConfig = runtimeConfiguration(options);
   const configuration = validateDollyInstanceConfigV10Draft(runtimeConfig);
+  const packageManifests = new Map<string, ReservedV10InstalledExtensionPackageManifest>();
   const modules = configuration.modules.map((module) => {
+    const installation = options.installations.resolve({
+      extensionId: module.extensionId,
+      packageVersion: module.packageVersion,
+    });
+    const packageKey = `${module.extensionId}\u0000${module.packageVersion}`;
+    let installedPackageManifest = packageManifests.get(packageKey);
+    if (
+      installedPackageManifest === undefined &&
+      installation.manifest.schemaVersion === "dolly.extension-package/10"
+    ) {
+      installedPackageManifest = produceReservedV10ExtensionPackageManifest({
+        installations: options.installations,
+        origins: options.origins,
+        database: options.database,
+        extensionId: module.extensionId,
+        packageVersion: module.packageVersion,
+      });
+      packageManifests.set(packageKey, installedPackageManifest);
+    }
     const installedModule = resolveReservedV10InstalledModulePlan({
       instanceConfiguration: configuration,
       moduleId: module.moduleId,
       installations: options.installations,
       configurations: options.configurations,
+      ...(installedPackageManifest === undefined
+        ? {}
+        : {
+            installedPackageManifest,
+            packageOrigins: options.origins,
+            packageDatabase: options.database,
+          }),
     });
     return Object.freeze({
       moduleId: module.moduleId,

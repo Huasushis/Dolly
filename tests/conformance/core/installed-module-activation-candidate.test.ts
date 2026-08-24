@@ -35,6 +35,7 @@ import {
   type InstalledModulePrivateStoragePolicy,
 } from "../../../src/adapters/installed-module-permission-policy.js";
 import { ModuleConfigurationStore } from "../../../src/core/module-configuration-store.js";
+import { resolveReservedV10InstalledModulePlan } from "../../../src/core/installed-extension-module.js";
 import {
   proveLinuxModuleActivation,
   consumeLinuxModuleActivationHandoff,
@@ -102,27 +103,38 @@ function digestWithout(record: Record<string, unknown>, field: string): string {
   return `sha256:${createHash("sha256").update(canonicalBytes(rest as never)).digest("hex")}`;
 }
 
-function writePackage(directory: string, extensionId: string, packageVersion: string): void {
+function writePackage(
+  directory: string,
+  extensionId: string,
+  packageVersion: string,
+  schemaVersion: "dolly.extension-package/1" | "dolly.extension-package/10" =
+    "dolly.extension-package/1",
+): void {
   mkdirSync(join(directory, "dist"), { recursive: true });
   writeFileSync(join(directory, "dist", "main.mjs"), "export const candidate = true;\n", "utf8");
+  const module: Record<string, unknown> = {
+    moduleKind: "transform",
+    activation: "reactive",
+    configVersion: 1,
+    configurationSchema: {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      additionalProperties: false,
+    },
+  };
+  if (schemaVersion === "dolly.extension-package/10") {
+    module.producedContentSchemas = [];
+    module.permissionPolicyReferences = [];
+  }
   writeFileSync(join(directory, "dolly-extension.json"), JSON.stringify({
-    schemaVersion: "dolly.extension-package/1",
+    schemaVersion,
     extensionId,
     packageVersion,
     displayName: "Candidate fixture",
     description: "Reserved candidate composition fixture.",
     supportedProtocolVersions: ["3.0"],
     entrypoint: "dist/main.mjs",
-    modules: [{
-      moduleKind: "transform",
-      activation: "reactive",
-      configVersion: 1,
-      configurationSchema: {
-        $schema: "https://json-schema.org/draft/2020-12/schema",
-        type: "object",
-        additionalProperties: false,
-      },
-    }],
+    modules: [module],
     requestedCapabilities: [],
   }, null, 2) + "\n", "utf8");
 }
@@ -365,10 +377,17 @@ interface Fixture {
 async function fixture(
   packageExtensionId = "org.example.candidate",
   serviceExtensionId = packageExtensionId,
+  packageSchemaVersion: "dolly.extension-package/1" | "dolly.extension-package/10" =
+    "dolly.extension-package/1",
 ): Promise<Fixture> {
   const root = scratch();
   const packageDirectory = join(root, "package");
-  writePackage(packageDirectory, packageExtensionId, "10.0.0");
+  writePackage(
+    packageDirectory,
+    packageExtensionId,
+    "10.0.0",
+    packageSchemaVersion,
+  );
   const serviceDirectory = join(root, "service-package");
   if (serviceExtensionId !== packageExtensionId) {
     writePackage(serviceDirectory, serviceExtensionId, "10.0.0");
@@ -499,6 +518,44 @@ describe("post-H3 installed Module activation candidate", () => {
       expect(Object.isFrozen(candidate)).toBe(true);
       expect(() => assertInstalledModuleActivationCandidate({ ...candidate })).toThrow(/not minted/u);
       expect(() => composeInstalledModuleActivationCandidate(options(current))).toThrow(/already consumed|once/u);
+    } finally {
+      await closeFixture(current);
+    }
+  });
+  it("produces the durable v10 package artifact inside activation composition", async () => {
+    const current = await fixture(
+      "org.example.v10-candidate",
+      "org.example.v10-candidate",
+      "dolly.extension-package/10",
+    );
+    try {
+      const candidate = composeInstalledModuleActivationCandidate(options(current));
+      expect(candidate.modules).toHaveLength(1);
+      expect(candidate.modules[0]!.installedModule.installation.manifest.schemaVersion)
+        .toBe("dolly.extension-package/10");
+      expect(candidate.modules[0]!.installedModule.provenanceDigest)
+        .toMatch(/^sha256:[0-9a-f]{64}$/u);
+    } finally {
+      await closeFixture(current);
+    }
+  });
+  it("refuses a v10 resolver call without the producer artifact and durable authorities", async () => {
+    const current = await fixture(
+      "org.example.v10-missing-premise",
+      "org.example.v10-missing-premise",
+      "dolly.extension-package/10",
+    );
+    try {
+      const runtimeConfig = current.database.readCurrentConfig()!.canonicalConfig as Record<
+        string,
+        JsonValue
+      >;
+      expect(() => resolveReservedV10InstalledModulePlan({
+        instanceConfiguration: runtimeConfig.runtime_config,
+        moduleId: "worker",
+        installations: current.installations,
+        configurations: current.configurations,
+      })).toThrow(/installer manifest and durable package authorities/u);
     } finally {
       await closeFixture(current);
     }

@@ -509,6 +509,110 @@ function immutablePolicy(
       ? immutableToolPolicy(policy)
       : immutableStoragePolicy(policy);
 }
+type InstalledCapabilityModel =
+  | {
+      readonly capabilityType: "model-operation";
+      readonly capabilityVersion: "v2" | "v3";
+    }
+  | {
+      readonly capabilityType: "tool-invocation" | "module-private-storage";
+      readonly capabilityVersion: "v2";
+    };
+
+function capabilityModelForPolicy(
+  policy: InstalledModulePermissionPolicy,
+): InstalledCapabilityModel {
+  if (policy.kind === "strict-streaming-chat") {
+    return {
+      capabilityType: "model-operation",
+      capabilityVersion: policy.mediaRequirementIds === undefined ? "v2" : "v3",
+    };
+  }
+  return {
+    capabilityType: policy.kind === "registered-tools"
+      ? "tool-invocation"
+      : "module-private-storage",
+    capabilityVersion: "v2",
+  };
+}
+function capabilityModelsForResolvedModule(
+  resolved: InstalledExtensionModule,
+  policies: readonly InstalledModulePermissionPolicy[],
+): readonly InstalledCapabilityModel[] {
+  const derived = policies.map(capabilityModelForPolicy);
+  const manifest = resolved.installation.manifest;
+  if (manifest.schemaVersion !== "dolly.extension-package/10") return derived;
+  const packageModule = manifest.modules.find(
+    (candidate) => candidate.moduleKind === resolved.module.moduleKind,
+  );
+  if (packageModule === undefined) {
+    throw new TypeError(
+      `Installed Module ${resolved.module.moduleKind} has no version-10 package declaration`,
+    );
+  }
+  return policies.map((policy, index) => {
+    const requests = manifest.requestedCapabilities.filter(
+      (capability) =>
+        capability.moduleKind === packageModule.moduleKind &&
+        capability.policyId === policy.policyId,
+    );
+    if (requests.length !== 1) {
+      throw new TypeError(
+        `Installed Module permission policy ${policy.policyId} has no unique version-10 capability request`,
+      );
+    }
+    const requested = requests[0]!;
+    const expected = derived[index]!;
+    if (
+      requested.capabilityType !== expected.capabilityType ||
+      requested.capabilityVersion !== expected.capabilityVersion
+    ) {
+      throw new TypeError(
+        `Installed Module capability ${requested.capabilityType}/${requested.capabilityVersion} does not match Host policy ${expected.capabilityType}/${expected.capabilityVersion}`,
+      );
+    }
+    return expected;
+  });
+}
+
+function capabilityModelForReservedPlan(
+  installed: ReservedV10InstalledModulePlan,
+  policy: InstalledModulePermissionPolicy,
+  reference: Readonly<{ readonly policyId: string; readonly revision: string }>,
+): InstalledCapabilityModel {
+  const expected = capabilityModelForPolicy(policy);
+  const manifest = installed.installation.manifest;
+  if (manifest.schemaVersion !== "dolly.extension-package/10") return expected;
+  const packageModule = manifest.modules.find(
+    (candidate) => candidate.moduleKind === installed.module.moduleKind,
+  );
+  if (packageModule === undefined) {
+    throw new TypeError(
+      `Reserved version-10 Module ${installed.module.moduleKind} has no package declaration`,
+    );
+  }
+  const requests = manifest.requestedCapabilities.filter(
+    (capability) =>
+      capability.moduleKind === packageModule.moduleKind &&
+      capability.policyId === reference.policyId &&
+      capability.policyRevision === reference.revision,
+  );
+  if (requests.length !== 1) {
+    throw new TypeError(
+      `Reserved version-10 policy ${policy.policyId}@${reference.revision} has no unique capability request`,
+    );
+  }
+  const requested = requests[0]!;
+  if (
+    requested.capabilityType !== expected.capabilityType ||
+    requested.capabilityVersion !== expected.capabilityVersion
+  ) {
+    throw new TypeError(
+      `Reserved version-10 capability ${requested.capabilityType}/${requested.capabilityVersion} does not match Host policy ${expected.capabilityType}/${expected.capabilityVersion}`,
+    );
+  }
+  return expected;
+}
 
 function definitionForImmutablePolicy(
   policy: InstalledModulePermissionPolicy,
@@ -947,7 +1051,23 @@ export class InstalledModulePermissionPolicySetup {
         "Installed Module permission setup does not match the created Extension Host",
       );
     }
-    const definitions = this.#policies.map((policy) => {
+    const definitions = this.#policies.map((policy, index) => {
+      const capability = this.snapshot.capabilities[index];
+      if (
+        capability === undefined ||
+        (policy.kind === "registered-tools" &&
+          (capability.capabilityType !== "tool-invocation" ||
+            capability.capabilityVersion !== "v2")) ||
+        (policy.kind === "module-private-storage" &&
+          (capability.capabilityType !== "module-private-storage" ||
+            capability.capabilityVersion !== "v2")) ||
+        (policy.kind === "strict-streaming-chat" &&
+          (capability.capabilityType !== "model-operation" ||
+            capability.capabilityVersion !==
+              (policy.mediaRequirementIds === undefined ? "v2" : "v3")))
+      ) {
+        throw new TypeError("Installed capability grant is not bound to its Host policy");
+      }
       const nowMs = this.#now();
       if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
         throw new TypeError("Installed model policy clock is invalid");
@@ -1026,12 +1146,13 @@ export class InstalledModulePermissionPolicySetup {
           : { nextRequestId: this.#nextRequestId }),
         outputContracts: policy.outputContracts,
       };
-      return policy.mediaRequirementIds === undefined
-        ? createModelOperationCapabilityV2(modelOptions)
-        : createModelOperationCapabilityV3({
-            ...modelOptions,
-            mediaRequirementIds: policy.mediaRequirementIds,
-          });
+      if (capability.capabilityVersion === "v2") {
+        return createModelOperationCapabilityV2(modelOptions);
+      }
+      return createModelOperationCapabilityV3({
+        ...modelOptions,
+        mediaRequirementIds: policy.mediaRequirementIds!,
+      });
     });
     this.#configuredHosts.add(host);
     for (const definition of definitions) {
@@ -1093,6 +1214,7 @@ export class InstalledModulePermissionPolicyRegistry {
       );
     }
     assertInstalledLlmConfigurationPolicyBinding(resolved, policies);
+    const capabilityModels = capabilityModelsForResolvedModule(resolved, policies);
     const reference = resolved.module.configurationReference;
     if (
       policies.some(
@@ -1115,8 +1237,35 @@ export class InstalledModulePermissionPolicyRegistry {
         packageDigest: resolved.installation.packageDigest,
         configurationRevision: reference.revision,
         policyIds,
-        capabilities: policies.map((policy) => {
+        capabilities: policies.map((policy, index) => {
+          const capabilityModel = capabilityModels[index]!;
+          if (
+            capabilityModel.capabilityType === "tool-invocation" &&
+            policy.kind !== "registered-tools"
+          ) {
+            throw new TypeError("Installed tool capability model does not match its Host policy");
+          }
+          if (
+            capabilityModel.capabilityType === "module-private-storage" &&
+            policy.kind !== "module-private-storage"
+          ) {
+            throw new TypeError(
+              "Installed private-storage capability model does not match its Host policy",
+            );
+          }
+          if (
+            capabilityModel.capabilityType === "model-operation" &&
+            policy.kind !== "strict-streaming-chat"
+          ) {
+            throw new TypeError("Installed model capability model does not match its Host policy");
+          }
           if (policy.kind === "registered-tools") {
+            if (
+              capabilityModel.capabilityType !== "tool-invocation" ||
+              capabilityModel.capabilityVersion !== "v2"
+            ) {
+              throw new TypeError("Installed tool grant model is not bound to its request");
+            }
             return {
               capabilityType: "tool-invocation" as const,
               capabilityVersion: "v2" as const,
@@ -1127,6 +1276,14 @@ export class InstalledModulePermissionPolicyRegistry {
             };
           }
           if (policy.kind === "module-private-storage") {
+            if (
+              capabilityModel.capabilityType !== "module-private-storage" ||
+              capabilityModel.capabilityVersion !== "v2"
+            ) {
+              throw new TypeError(
+                "Installed private-storage grant model is not bound to its request",
+              );
+            }
             return {
               capabilityType: "module-private-storage" as const,
               capabilityVersion: "v2" as const,
@@ -1136,16 +1293,27 @@ export class InstalledModulePermissionPolicyRegistry {
               effectPolicy: "persistent-storage" as const,
             };
           }
+          if (
+            capabilityModel.capabilityType !== "model-operation" ||
+            capabilityModel.capabilityVersion !==
+              (policy.mediaRequirementIds === undefined ? "v2" : "v3")
+          ) {
+            throw new TypeError("Installed model grant model is not bound to its request");
+          }
+          if (capabilityModel.capabilityVersion === "v2") {
+            return {
+              capabilityType: "model-operation" as const,
+              capabilityVersion: "v2" as const,
+              policyId: policy.policyId,
+              streaming: "required" as const,
+            };
+          }
           return {
             capabilityType: "model-operation" as const,
-            capabilityVersion: policy.mediaRequirementIds === undefined
-              ? "v2" as const
-              : "v3" as const,
+            capabilityVersion: "v3" as const,
             policyId: policy.policyId,
             streaming: "required" as const,
-            ...(policy.mediaRequirementIds === undefined
-              ? {}
-              : { mediaRequirementIds: [...policy.mediaRequirementIds] }),
+            mediaRequirementIds: [...policy.mediaRequirementIds!],
           };
         }),
       },
@@ -1223,6 +1391,13 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
       }
       return policy;
     });
+    const capabilityModels = policies.map((policy, index) =>
+      capabilityModelForReservedPlan(
+        installed,
+        policy,
+        installed.module.permissionPolicyReferences[index]!,
+      )
+    );
     const snapshot = deepFreeze({
       schemaVersion: "dolly.reserved-v10-permission-policy-selection/1",
       instanceId: installed.instanceId,
@@ -1234,6 +1409,8 @@ export class ReservedV10InstalledPermissionPolicyRegistry {
         policyId: reference.policyId,
         revision: reference.revision,
         kind: policies[index]!.kind,
+        capabilityType: capabilityModels[index]!.capabilityType,
+        capabilityVersion: capabilityModels[index]!.capabilityVersion,
       })),
     } satisfies JsonValue);
     const selection = Object.freeze({

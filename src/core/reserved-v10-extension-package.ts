@@ -358,16 +358,47 @@ function assertPolicyCompatibility(
     if (definition === undefined || !isJsonObject(definition.definition.definition)) {
       throw invalid("reserved version-10 capability request has no exact policy definition");
     }
-    const kind = definition.definition.definition.kind;
-    const expectedKind =
-      capability.capabilityType === "model-operation"
-        ? "strict-streaming-chat"
-        : capability.capabilityType === "tool-invocation"
-          ? "registered-tools"
-          : "module-private-storage";
-    if (kind !== expectedKind) {
+    const policyDefinition = definition.definition.definition;
+    if (policyDefinition.policyId !== capability.policyId) {
       throw invalid(
-        `reserved version-10 capability ${capability.capabilityType} is incompatible with policy ${capability.policyId}`,
+        `reserved version-10 capability ${capability.policyId} has a mismatched durable policy definition`,
+      );
+    }
+    const kind = policyDefinition.kind;
+    const expectedCapabilityType =
+      kind === "strict-streaming-chat"
+        ? "model-operation"
+        : kind === "registered-tools"
+          ? "tool-invocation"
+          : kind === "module-private-storage"
+            ? "module-private-storage"
+            : undefined;
+    if (expectedCapabilityType === undefined) {
+      throw invalid(
+        `reserved version-10 policy ${capability.policyId} has an unsupported durable policy kind`,
+      );
+    }
+    let expectedCapabilityVersion: "v2" | "v3";
+    if (expectedCapabilityType === "model-operation") {
+      const mediaRequirementIds = policyDefinition.mediaRequirementIds;
+      if (
+        !Array.isArray(mediaRequirementIds) ||
+        mediaRequirementIds.some((value) => typeof value !== "string")
+      ) {
+        throw invalid(
+          `reserved version-10 model policy ${capability.policyId} has no closed capability model`,
+        );
+      }
+      expectedCapabilityVersion = mediaRequirementIds.length === 0 ? "v2" : "v3";
+    } else {
+      expectedCapabilityVersion = "v2";
+    }
+    if (
+      capability.capabilityType !== expectedCapabilityType ||
+      capability.capabilityVersion !== expectedCapabilityVersion
+    ) {
+      throw invalid(
+        `reserved version-10 capability ${capability.capabilityType}/${capability.capabilityVersion} is incompatible with durable policy ${capability.policyId} (${expectedCapabilityType}/${expectedCapabilityVersion})`,
       );
     }
   }

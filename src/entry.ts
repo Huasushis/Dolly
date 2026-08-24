@@ -27,6 +27,11 @@ import {
   dollyInstanceConfigSchema,
   RuntimeConfigError,
 } from "./core/runtime-config.js";
+export {
+  produceReservedV10ExtensionPackageManifest,
+  type ProduceReservedV10ExtensionPackageManifestOptions,
+  type ReservedV10InstalledExtensionPackageManifest,
+} from "./core/reserved-v10-extension-package.js";
 
 export const DOLLY_CLI_HELP = `Usage: dolly <command> [options]
 
