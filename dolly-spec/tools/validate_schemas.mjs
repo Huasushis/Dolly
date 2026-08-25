@@ -488,8 +488,8 @@ for (const [file, schemaId] of cases) {
       value.initial?.contract,
     );
     const cases = value.initial?.cases;
-    if (!Array.isArray(cases) || cases.length !== 4) {
-      throw new Error(`${relative}: cross-language bridge corpus must contain four outcome cases`);
+    if (!Array.isArray(cases) || cases.length !== 5) {
+      throw new Error(`${relative}: cross-language bridge corpus must contain five outcome cases`);
     }
     for (const [index, entry] of cases.entries()) {
       const target = entry.target;
@@ -501,6 +501,33 @@ for (const [file, schemaId] of cases) {
           canonicalDigest(target.record) !== canonical.record_digest) {
         throw new Error(`${relative}.initial.cases[${index}]: canonical digest is stale`);
       }
+    }
+    const terminalContract = value.initial.contract.outcome_mapping.find(
+      (entry) => entry.source_kind === "terminal",
+    );
+    if (terminalContract.target_state !== "UNKNOWN_OUTCOME" ||
+        terminalContract.evidence_rule !== "null" ||
+        terminalContract.applied_premise?.premise !== "exact-authoritative-tool-call-ledger" ||
+        terminalContract.applied_premise?.terminal_state !== "SUCCEEDED" ||
+        terminalContract.applied_premise?.evidence_rule !== "ledger.terminal_result_digest") {
+      throw new Error(`${relative}: terminal outcome must settle UNKNOWN_OUTCOME without an authoritative Tool-call ledger premise and only APPLIED via that premise`);
+    }
+    const noPremise = cases.find((entry) => entry.ledger_premise === "absent");
+    const withPremise = cases.find((entry) => entry.ledger_premise?.kind === "exact-authoritative");
+    if (!noPremise || noPremise.expected_state !== "UNKNOWN_OUTCOME" ||
+        noPremise.target.record.state !== "UNKNOWN_OUTCOME" ||
+        noPremise.target.record.evidence_digest !== null) {
+      throw new Error(`${relative}: terminal outcome without an authoritative ledger premise must settle UNKNOWN_OUTCOME with null evidence`);
+    }
+    if (!withPremise || withPremise.expected_state !== "APPLIED" ||
+        withPremise.target.record.state !== "APPLIED" ||
+        withPremise.target.record.evidence_digest !== withPremise.ledger_premise?.evidence_digest ||
+        withPremise.ledger_premise?.terminal_state !== "SUCCEEDED") {
+      throw new Error(`${relative}: terminal outcome may settle APPLIED only via an identity-matching SUCCEEDED Tool-call ledger premise`);
+    }
+    if (value.initial.contract.aggregate_evidence !==
+        "never-map-evidenceForRun-directly-to-one-Rust-record; require-each-intent-outcome; terminal-outcome-without-authoritative-ledger-premise-settles-UNKNOWN_OUTCOME") {
+      throw new Error(`${relative}: aggregate_evidence must record the terminal-outcome fail-closed rule`);
     }
   }
   if (value.test_id === "TST-CORE-009") {

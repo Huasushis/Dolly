@@ -108,11 +108,24 @@
         {
           "source_kind": "terminal",
           "source_evidence_rule": "source.outcome.kind=terminal;require-resultDigest",
-          "target_state": "APPLIED",
+          "target_state": "UNKNOWN_OUTCOME",
           "journal_revision": 2,
-          "evidence_rule": "source.outcome.resultDigest",
+          "evidence_rule": "null",
           "per_intent_evidence": "required",
-          "redispatch": "forbidden"
+          "redispatch": "forbidden",
+          "applied_premise": {
+            "premise": "exact-authoritative-tool-call-ledger",
+            "identity_match": [
+              "instance_id",
+              "module_id",
+              "operation_id",
+              "operation_digest",
+              "package_digest",
+              "intent_digest==outbound_digest"
+            ],
+            "terminal_state": "SUCCEEDED",
+            "evidence_rule": "ledger.terminal_result_digest"
+          }
         },
         {
           "source_kind": "unknown",
@@ -124,7 +137,7 @@
           "redispatch": "forbidden"
         }
       ],
-      "aggregate_evidence": "never-map-evidenceForRun-directly-to-one-Rust-record; require-each-intent-outcome",
+      "aggregate_evidence": "never-map-evidenceForRun-directly-to-one-Rust-record; require-each-intent-outcome; terminal-outcome-without-authoritative-ledger-premise-settles-UNKNOWN_OUTCOME",
       "canonicalization": {
         "scheme": "RFC8785-JCS",
         "encoding": "UTF-8",
@@ -276,8 +289,8 @@
       "claimToken": "claim-token-1",
       "moduleGenerationId": "module-generation-1",
       "state": "closed",
-      "intentCount": 4,
-      "intentSetDigest": "sha256:8b7feba6b861a41b557892d5c48ca85a5174da2eaa2552cfd730dc142880b3bb",
+      "intentCount": 5,
+      "intentSetDigest": "sha256:a8541a430b37d6c3cbf0f02ee37eae5738f3ffe5290db8b9ed1bae3baf2cc55a",
       "createdAt": "2026-08-24T00:00:00.000Z",
       "updatedAt": "2026-08-24T00:00:02.000Z"
     },
@@ -409,7 +422,7 @@
           "attempt": 1,
           "claimToken": "claim-token-1",
           "moduleGenerationId": "module-generation-1",
-          "idempotencyKey": "job-1:effect-terminal",
+          "idempotencyKey": "job-1:effect-terminal-no-premise",
           "capabilityType": "mcp",
           "operation": "tools/call",
           "intentDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
@@ -420,14 +433,90 @@
           "createdAt": "2026-08-24T00:00:00.000Z",
           "updatedAt": "2026-08-24T00:00:01.000Z"
         },
+        "ledger_premise": "absent",
         "target": {
           "claim": {
             "schema": "dolly.claim/v2",
             "instance_id": "instance-1",
             "module_id": "module-1",
-            "operation_id": "job-1:effect-terminal",
+            "operation_id": "job-1:effect-terminal-no-premise",
             "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-            "claim_token": "sha256:ab52a943cdba79adf019f011e092cffdd222695a031f4bdfc246f1a791153d2c"
+            "claim_token": "sha256:130041d58915475a2af31602d7d2e3ab9a811b858c0dacc20eb119a4d2b388cf"
+          },
+          "record": {
+            "schema": "dolly.external-effect-journal/v2",
+            "journal_revision": 2,
+            "state": "UNKNOWN_OUTCOME",
+            "claim": {
+              "schema": "dolly.claim/v2",
+              "instance_id": "instance-1",
+              "module_id": "module-1",
+              "operation_id": "job-1:effect-terminal-no-premise",
+              "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+              "claim_token": "sha256:130041d58915475a2af31602d7d2e3ab9a811b858c0dacc20eb119a4d2b388cf"
+            },
+            "controller_generation": 7,
+            "extension_generation": 11,
+            "worker_epoch": "worker-epoch-1",
+            "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "policy_premise_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "effect_class": "MCP_TOOLS_CALL",
+            "intent_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "evidence_digest": null
+          }
+        },
+        "canonical": {
+          "claim_utf8": "{\"claim_token\":\"sha256:130041d58915475a2af31602d7d2e3ab9a811b858c0dacc20eb119a4d2b388cf\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"operation_id\":\"job-1:effect-terminal-no-premise\",\"schema\":\"dolly.claim/v2\"}",
+          "claim_digest": "sha256:d5fa97fa639b62990bd2a0ef2f14dd90564cb0e646ef7bdf754a4ea95c5e7d9b",
+          "record_utf8": "{\"claim\":{\"claim_token\":\"sha256:130041d58915475a2af31602d7d2e3ab9a811b858c0dacc20eb119a4d2b388cf\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"operation_id\":\"job-1:effect-terminal-no-premise\",\"schema\":\"dolly.claim/v2\"},\"controller_generation\":7,\"effect_class\":\"MCP_TOOLS_CALL\",\"evidence_digest\":null,\"extension_generation\":11,\"intent_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"journal_revision\":2,\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"package_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_premise_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema\":\"dolly.external-effect-journal/v2\",\"state\":\"UNKNOWN_OUTCOME\",\"worker_epoch\":\"worker-epoch-1\"}",
+          "record_digest": "sha256:82896fe696217edde0a13bb18186e0e4f41615fd1adde9193193273e2bd79b98",
+          "evidence_digest": null
+        },
+        "expected_state": "UNKNOWN_OUTCOME"
+      },
+      {
+        "source": {
+          "schemaVersion": "dolly.effect-intent/2",
+          "moduleJobId": "module-1",
+          "runId": "run-1",
+          "attempt": 1,
+          "claimToken": "claim-token-1",
+          "moduleGenerationId": "module-generation-1",
+          "idempotencyKey": "job-1:effect-terminal-premise",
+          "capabilityType": "mcp",
+          "operation": "tools/call",
+          "intentDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "outcome": {
+            "kind": "terminal",
+            "resultDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "createdAt": "2026-08-24T00:00:00.000Z",
+          "updatedAt": "2026-08-24T00:00:01.000Z"
+        },
+        "ledger_premise": {
+          "schema": "dolly.tool-call-ledger/v1",
+          "kind": "exact-authoritative",
+          "identity_match": [
+            "instance_id",
+            "module_id",
+            "operation_id",
+            "operation_digest",
+            "package_digest",
+            "intent_digest==outbound_digest"
+          ],
+          "terminal_state": "SUCCEEDED",
+          "evidence_digest_source": "ledger.terminal_result_digest",
+          "evidence_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "target": {
+          "claim": {
+            "schema": "dolly.claim/v2",
+            "instance_id": "instance-1",
+            "module_id": "module-1",
+            "operation_id": "job-1:effect-terminal-premise",
+            "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "claim_token": "sha256:62c9cba90dab7e7c98b5acd78cecc55e12bb80f7055153336e89db61be153c6e"
           },
           "record": {
             "schema": "dolly.external-effect-journal/v2",
@@ -437,9 +526,9 @@
               "schema": "dolly.claim/v2",
               "instance_id": "instance-1",
               "module_id": "module-1",
-              "operation_id": "job-1:effect-terminal",
+              "operation_id": "job-1:effect-terminal-premise",
               "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-              "claim_token": "sha256:ab52a943cdba79adf019f011e092cffdd222695a031f4bdfc246f1a791153d2c"
+              "claim_token": "sha256:62c9cba90dab7e7c98b5acd78cecc55e12bb80f7055153336e89db61be153c6e"
             },
             "controller_generation": 7,
             "extension_generation": 11,
@@ -453,10 +542,10 @@
           }
         },
         "canonical": {
-          "claim_utf8": "{\"claim_token\":\"sha256:ab52a943cdba79adf019f011e092cffdd222695a031f4bdfc246f1a791153d2c\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"operation_id\":\"job-1:effect-terminal\",\"schema\":\"dolly.claim/v2\"}",
-          "claim_digest": "sha256:7a0e50ea648f9f2df291a538cfa16dec507397895898e6c8d6b5cb8a56f56136",
-          "record_utf8": "{\"claim\":{\"claim_token\":\"sha256:ab52a943cdba79adf019f011e092cffdd222695a031f4bdfc246f1a791153d2c\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"operation_id\":\"job-1:effect-terminal\",\"schema\":\"dolly.claim/v2\"},\"controller_generation\":7,\"effect_class\":\"MCP_TOOLS_CALL\",\"evidence_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"extension_generation\":11,\"intent_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"journal_revision\":2,\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"package_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_premise_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema\":\"dolly.external-effect-journal/v2\",\"state\":\"APPLIED\",\"worker_epoch\":\"worker-epoch-1\"}",
-          "record_digest": "sha256:98950c149d5f7ba5fc467089f60d1763c6f54d3930caff6e7b479b30a019640d",
+          "claim_utf8": "{\"claim_token\":\"sha256:62c9cba90dab7e7c98b5acd78cecc55e12bb80f7055153336e89db61be153c6e\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"operation_id\":\"job-1:effect-terminal-premise\",\"schema\":\"dolly.claim/v2\"}",
+          "claim_digest": "sha256:fc5ac3948cd0954043456bf0fbb025128eb2a142c812cd27ccd1b5dc73043c6f",
+          "record_utf8": "{\"claim\":{\"claim_token\":\"sha256:62c9cba90dab7e7c98b5acd78cecc55e12bb80f7055153336e89db61be153c6e\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"operation_id\":\"job-1:effect-terminal-premise\",\"schema\":\"dolly.claim/v2\"},\"controller_generation\":7,\"effect_class\":\"MCP_TOOLS_CALL\",\"evidence_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"extension_generation\":11,\"intent_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"journal_revision\":2,\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"package_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_premise_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema\":\"dolly.external-effect-journal/v2\",\"state\":\"APPLIED\",\"worker_epoch\":\"worker-epoch-1\"}",
+          "record_digest": "sha256:a1712f4a1d14e41836d30d6682f27720987ca8c7b42d4e152f020c08aa7b32cf",
           "evidence_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         },
         "expected_state": "APPLIED"
@@ -565,16 +654,17 @@
       "canonicalize_each_target_claim_and_record",
       "compare_extension_and_mcp_frame_profiles",
       "replay_claim_intent",
+      "settle_terminal_outcome_only_with_authoritative_ledger_premise",
       "mismatch_each_identity_pair"
     ]
   },
   "expected": {
-    "outcome": "schema_and_jcs_contract_only_no_public_bridge",
+    "outcome": "terminal_outcome_requires_authoritative_ledger_premise_no_public_bridge",
     "assertions": [
       {
         "path": "/cases",
         "op": "count",
-        "value": 4
+        "value": 5
       },
       {
         "path": "/cases/0/target/record/state",
@@ -589,10 +679,35 @@
       {
         "path": "/cases/2/target/record/state",
         "op": "equals",
-        "value": "APPLIED"
+        "value": "UNKNOWN_OUTCOME"
+      },
+      {
+        "path": "/cases/2/ledger_premise",
+        "op": "equals",
+        "value": "absent"
       },
       {
         "path": "/cases/3/target/record/state",
+        "op": "equals",
+        "value": "APPLIED"
+      },
+      {
+        "path": "/cases/3/ledger_premise/kind",
+        "op": "equals",
+        "value": "exact-authoritative"
+      },
+      {
+        "path": "/cases/3/ledger_premise/terminal_state",
+        "op": "equals",
+        "value": "SUCCEEDED"
+      },
+      {
+        "path": "/cases/3/target/record/evidence_digest",
+        "op": "equals",
+        "value": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      {
+        "path": "/cases/4/target/record/state",
         "op": "equals",
         "value": "UNKNOWN_OUTCOME"
       },

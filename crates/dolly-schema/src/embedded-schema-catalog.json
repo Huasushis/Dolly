@@ -4768,7 +4768,7 @@
               "enum": [
                 "null",
                 "sha256(JCS(no-effect-proof))",
-                "source.outcome.resultDigest"
+                "ledger.terminal_result_digest"
               ]
             },
             "per_intent_evidence": {
@@ -4776,12 +4776,41 @@
             },
             "redispatch": {
               "const": "forbidden"
+            },
+            "applied_premise": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "premise",
+                "identity_match",
+                "terminal_state",
+                "evidence_rule"
+              ],
+              "properties": {
+                "premise": {
+                  "const": "exact-authoritative-tool-call-ledger"
+                },
+                "identity_match": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "terminal_state": {
+                  "const": "SUCCEEDED"
+                },
+                "evidence_rule": {
+                  "const": "ledger.terminal_result_digest"
+                }
+              }
             }
           }
         }
       },
       "aggregate_evidence": {
-        "const": "never-map-evidenceForRun-directly-to-one-Rust-record; require-each-intent-outcome"
+        "const": "never-map-evidenceForRun-directly-to-one-Rust-record; require-each-intent-outcome; terminal-outcome-without-authoritative-ledger-premise-settles-UNKNOWN_OUTCOME"
       },
       "canonicalization": {
         "type": "object",

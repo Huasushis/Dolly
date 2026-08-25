@@ -149,7 +149,7 @@ function assertContract(contract: RecordValue): void {
     expect(check.mismatch).toBe("refuse");
   }
   expect(contract.aggregate_evidence).toBe(
-    "never-map-evidenceForRun-directly-to-one-Rust-record; require-each-intent-outcome",
+    "never-map-evidenceForRun-directly-to-one-Rust-record; require-each-intent-outcome; terminal-outcome-without-authoritative-ledger-premise-settles-UNKNOWN_OUTCOME",
   );
   const outcomes = contract.outcome_mapping as RecordValue[];
   expect(outcomes.find((entry) => entry.source_kind === "intended")).toMatchObject({
@@ -170,11 +170,24 @@ function assertContract(contract: RecordValue): void {
   });
   expect(outcomes.find((entry) => entry.source_kind === "terminal")).toMatchObject({
     source_evidence_rule: "source.outcome.kind=terminal;require-resultDigest",
-    target_state: "APPLIED",
+    target_state: "UNKNOWN_OUTCOME",
     journal_revision: 2,
-    evidence_rule: "source.outcome.resultDigest",
+    evidence_rule: "null",
     per_intent_evidence: "required",
     redispatch: "forbidden",
+    applied_premise: {
+      premise: "exact-authoritative-tool-call-ledger",
+      identity_match: [
+        "instance_id",
+        "module_id",
+        "operation_id",
+        "operation_digest",
+        "package_digest",
+        "intent_digest==outbound_digest",
+      ],
+      terminal_state: "SUCCEEDED",
+      evidence_rule: "ledger.terminal_result_digest",
+    },
   });
   expect(outcomes.find((entry) => entry.source_kind === "unknown")).toMatchObject({
     source_evidence_rule: "source.outcome.kind=unknown;retain-reason",
@@ -205,7 +218,7 @@ describe("TST-TOOL-014 TypeScript side of the cross-language corpus", () => {
       throw new Error("TST-TOOL-014 source Run must be closed");
     }
     const cases = initial.cases as RecordValue[];
-    expect(cases).toHaveLength(4);
+    expect(cases).toHaveLength(5);
     const setMembers = cases.map((entry) => {
       const source = entry.source as RecordValue;
       assertEffectIntentRecord(source);
@@ -275,6 +288,27 @@ describe("TST-TOOL-014 TypeScript side of the cross-language corpus", () => {
       });
       expect(parsed).toEqual(record);
     }
+
+    // Premise direction: a terminal source outcome alone never mints APPLIED.
+    // It settles APPLIED only via an exact, durable, versioned Tool-call ledger
+    // premise (identity tuple match + SUCCEEDED terminal); otherwise fail-closed
+    // UNKNOWN_OUTCOME.
+    const noPremise = cases.find((entry) => entry.ledger_premise === "absent");
+    expect(noPremise).toBeDefined();
+    expect(noPremise!.expected_state).toBe("UNKNOWN_OUTCOME");
+    expect(noPremise!.target.record.state).toBe("UNKNOWN_OUTCOME");
+    expect(noPremise!.target.record.evidence_digest).toBeNull();
+
+    const withPremise = cases.find(
+      (entry) => (entry.ledger_premise as RecordValue | undefined)?.kind === "exact-authoritative",
+    );
+    expect(withPremise).toBeDefined();
+    expect(withPremise!.ledger_premise.terminal_state).toBe("SUCCEEDED");
+    expect(withPremise!.expected_state).toBe("APPLIED");
+    expect(withPremise!.target.record.state).toBe("APPLIED");
+    expect(withPremise!.target.record.evidence_digest).toBe(
+      withPremise!.ledger_premise.evidence_digest,
+    );
   });
 
   it("keeps Extension framing and MCP framing as separate dialects", async () => {
