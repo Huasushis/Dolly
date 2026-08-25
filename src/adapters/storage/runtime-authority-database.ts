@@ -1202,7 +1202,11 @@ function tokensReferenceAuthorityTable(tokens: readonly string[], authorityTable
 }
 
 function verifyAuthorityIndexes(connection: RuntimeSqliteConnection): void {
-  for (const table of Object.keys(AUTHORITY_SCHEMA_COLUMNS)) {
+  verifyAuthorityIndexesForTables(connection, Object.keys(AUTHORITY_SCHEMA_COLUMNS));
+}
+
+function verifyAuthorityIndexesForTables(connection: RuntimeSqliteConnection, tables: readonly string[]): void {
+  for (const table of tables) {
     const expected = AUTHORITY_SCHEMA_INDEXES[table] ?? [];
     const actual = connection.prepare(`PRAGMA index_list(${table})`).all();
     if (actual.length !== expected.length) {
@@ -1304,8 +1308,15 @@ function verifyLegacyAuthorityPhysicalSchema(
   connection: RuntimeSqliteConnection,
   allowMissingHostMeta: boolean,
 ): void {
+  // The Worker-start premise slice is a post-migration projection: it is
+  // created lazily by createWorkerStartPremiseSchema after v2 exists and is
+  // never part of the pre-bridge legacy or migrated v1 shape.
   const tables = Object.keys(AUTHORITY_SCHEMA_COLUMNS).filter(
-    (table) => table !== "core_meta" && table !== "commit_sequence" && table !== "core_journal",
+    (table) =>
+      table !== "core_meta" &&
+      table !== "commit_sequence" &&
+      table !== "core_journal" &&
+      table !== "worker_start_premises",
   );
   for (const table of tables) {
     const row = connection.prepare(
@@ -1343,7 +1354,7 @@ function verifyLegacyAuthorityPhysicalSchema(
       throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", `legacy authority table ${table} is missing a required constraint`);
     }
   }
-  verifyAuthorityIndexes(connection);
+  verifyAuthorityIndexesForTables(connection, tables);
   const foreignKeyViolations = connection.prepare("PRAGMA foreign_key_check").all();
   if (foreignKeyViolations.length > 0) {
     throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "legacy authority foreign-key check reported violations");
@@ -2007,6 +2018,17 @@ export class RuntimeAuthorityDatabase {
       if (!coreJournal) {
         this.#connection.prepare(
           "CREATE TABLE core_journal (journal_seq INTEGER PRIMARY KEY AUTOINCREMENT, event_kind TEXT NOT NULL, event_jcs BLOB NOT NULL, config_revision INTEGER, config_digest TEXT, premises_digest TEXT)",
+        ).run();
+      }
+      // The Worker-start premise slice is provisioned empty at migration so
+      // the post-migration physical gate sees the complete v2 projection;
+      // premises themselves are projected per-revision by the Host writer.
+      const workerPremises = this.#connection.prepare(
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'worker_start_premises'",
+      ).get();
+      if (!workerPremises) {
+        this.#connection.prepare(
+          "CREATE TABLE worker_start_premises (config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991), config_digest TEXT NOT NULL, extension_alias TEXT NOT NULL CHECK (length(extension_alias) > 0), server_id TEXT NOT NULL CHECK (length(server_id) > 0), package_root TEXT NOT NULL CHECK (length(package_root) > 0), package_path TEXT NOT NULL CHECK (length(package_path) > 0), package_digest TEXT NOT NULL CHECK (package_digest LIKE 'sha256:%'), executable_digest TEXT NOT NULL CHECK (executable_digest LIKE 'sha256:%'), endpoint TEXT NOT NULL CHECK (length(endpoint) > 0), record_jcs BLOB NOT NULL, record_digest TEXT NOT NULL, UNIQUE (config_revision, config_digest), FOREIGN KEY (config_revision, config_digest) REFERENCES config_revision_mappings(config_revision, config_digest), CHECK (substr(package_path, 1, length(package_root) + 1) = package_root || '/'))",
         ).run();
       }
       const recordBytes = Buffer.from(canonicalBytes(
