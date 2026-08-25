@@ -201,7 +201,8 @@ fn start_worker(config: &WorkerStartConfig) -> Worker {
     #[cfg(feature = "test-support")]
     {
         if std::env::var_os("DOLLY_WORKER_TEST_SUPPORT").is_some() {
-            return Worker::start_for_test(config.clone());
+            return Worker::start_for_test(config.clone())
+                .unwrap_or_else(|error| fail("WORKER_START_REFUSED", &error.to_string()));
         }
     }
     match Worker::start(config.clone()) {
