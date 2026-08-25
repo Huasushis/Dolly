@@ -7,12 +7,11 @@
 //! `unchanged`, plus subset comparison of the emitted event list.
 //!
 //! The frame boundary, JSON-RPC 2.0 envelope, and initialize-first ordering
-//! are enforced by `dolly-protocol`. The TST-PROTO-002 semantic depth bound is
-//! evaluated with the specification's schema-root rule: the declared semantic
-//! payload root starts at depth 1 and JSON-RPC/method-envelope objects do not
-//! consume that quota. The block-root depth is measured with the counting rule
-//! shared by `dolly-canonical-json` (`semantic_depth`) at the case's declared
-//! semantic root.
+//! are enforced by `dolly-protocol`. TST-PROTO-002 semantic depth is evaluated
+//! at the vector's selected schema root: the root starts at depth 1 and
+//! JSON-RPC/method-envelope objects do not consume that quota. The generated
+//! root is decoded through `DecodedMessage::payload` and checked with the same
+//! `semantic_depth` rule as `dolly-canonical-json`.
 
 use std::{
     fs,
@@ -73,6 +72,7 @@ fn count(value: &Value) -> Option<usize> {
         Value::Array(array) => Some(array.len()),
         Value::Object(map) => Some(map.len()),
         Value::String(text) => Some(text.len()),
+        Value::Number(number) => number.as_u64().map(|value| value as usize),
         _ => None,
     }
 }
@@ -190,27 +190,66 @@ fn frame_depth(text: &str) -> u16 {
     max_depth
 }
 
-/// Builds a request whose `params` member is a chain of `wrapper_count`
-/// non-empty envelope objects wrapping a leaf value nested `block_depth`
-/// object/array levels deep.
-///
-/// Complete-frame depth equals `1` (top-level object) + `wrapper_count` +
-/// `block_depth`. The `params` value is a key of the top-level object, not a
-/// separate nesting level.
-fn wrapped_block_request(wrapper_count: usize, block_depth: usize) -> String {
-    let mut wrappers_open = String::new();
-    for index in 0..wrapper_count {
-        wrappers_open.push_str(&format!("{{\"w{index}\":"));
+/// Builds a JSON value with exactly `depth` object/array containers. A
+/// primitive root has depth 0, while an object or array root has depth 1.
+fn nested_array(depth: usize) -> String {
+    if depth == 0 {
+        return "0".into();
     }
-    let mut block_open = String::new();
-    for _ in 0..block_depth {
-        block_open.push('[');
+    format!("{}0{}", "[".repeat(depth), "]".repeat(depth))
+}
+
+fn nested_object(depth: usize) -> String {
+    if depth == 0 {
+        return "0".into();
     }
-    let block_close = "]".repeat(block_depth);
+    if depth == 1 {
+        return "{}".into();
+    }
     format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"t\",\"method\":\"extension.ping\",\"params\":{wrappers_open}{block_open}0{block_close}{}}}",
-        "}".repeat(wrapper_count)
+        "{}0{}",
+        "{\"x\":".repeat(depth),
+        "}".repeat(depth)
     )
+}
+
+/// Builds the case's selected semantic root while keeping the JSON-RPC
+/// envelope outside that root. The frame-depth-97 control case uses an
+/// unrelated padding member so its params root remains at semantic depth 1.
+fn semantic_case_payload(case: &Value) -> String {
+    let case_name = case["case"].as_str().unwrap();
+    let semantic_depth = case["semantic_depth"].as_u64().unwrap() as usize;
+    let frame_depth_limit = case["frame_depth"].as_u64().unwrap() as usize;
+    let message_kind = case["message_kind"].as_str().unwrap();
+    if frame_depth_limit > semantic_depth + match message_kind {
+        "error_response" => 2,
+        _ => 1,
+    } {
+        let params = "{}";
+        let padding = nested_array(frame_depth_limit - 1);
+        return format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{case_name}\",\"method\":\"extension.ping\",\"params\":{params},\"padding\":{padding}}}"
+        );
+    }
+    match message_kind {
+        "request" => format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{case_name}\",\"method\":\"extension.ping\",\"params\":{}}}",
+            nested_object(semantic_depth)
+        ),
+        "notification" => format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"host.log.emit\",\"params\":{}}}",
+            nested_object(semantic_depth)
+        ),
+        "success_response" => format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{case_name}\",\"result\":{}}}",
+            nested_array(semantic_depth)
+        ),
+        "error_response" => format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{case_name}\",\"error\":{{\"code\":-32000,\"message\":\"peer failure\",\"data\":{}}}}}",
+            nested_array(semantic_depth)
+        ),
+        other => panic!("unsupported protocol semantic message kind {other}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,78 +337,170 @@ fn execute(vector: &Value) -> (Value, Value, String, Vec<Value>) {
                 semantic_limit(semantic_limit_val),
             )
             .expect("vector limit is within the contract");
-
-            let mut connection = Connection::new(limits);
-            // Drive the connection to the vector's `ready` precondition: the
-            // first accepted message must be a valid extension.initialize.
-            let initialize = encode_frame(
-                br#"{"jsonrpc":"2.0","id":"i","method":"extension.initialize","params":{}}"#,
-            );
-            connection
-                .feed(&initialize)
-                .expect("initialize accepted: envelope valid, init-first rule met");
-
-            let cases = stimulus["frames"].as_array().unwrap();
+            let cases = stimulus["cases"]
+                .as_array()
+                .expect("TST-PROTO-002 stimulus.cases is normative");
             let mut observed_cases = Map::new();
-            let mut outcome = "independent_frame_and_semantic_limits".to_string();
-            let mut reusable = true;
+            let mut emitted = Vec::new();
             for case in cases {
                 let case_name = case["case"].as_str().unwrap().to_string();
                 let declared_frame_depth = case["frame_depth"].as_u64().unwrap() as usize;
-                let block_depth = case
-                    .get("semantic_block_depth")
-                    .or_else(|| case.get("semantic_payload_depth"))
-                    .and_then(Value::as_u64)
-                    .unwrap() as usize;
-                // depth = 1 (top-level object) + wrapper_count + block_depth
-                let wrapper_count = declared_frame_depth - 1 - block_depth;
-                let payload = wrapped_block_request(wrapper_count, block_depth);
+                let semantic_depth = case["semantic_depth"].as_u64().unwrap() as usize;
+                let message_kind = case["message_kind"].as_str().unwrap();
+                let payload = semantic_case_payload(case);
                 assert_eq!(
                     frame_depth(&payload) as usize,
                     declared_frame_depth,
                     "{case_name} constructed frame depth"
                 );
+                let mut connection = Connection::new(limits);
+                let initialize = encode_frame(
+                    br#"{"jsonrpc":"2.0","id":"i","method":"extension.initialize","params":{}}"#,
+                );
+                connection
+                    .feed(&initialize)
+                    .expect("initialize accepted: envelope valid, init-first rule met");
                 let frame = encode_frame(payload.as_bytes());
+                let semantic_over_limit = semantic_depth > semantic_limit_val;
                 let result = match connection.feed(&frame) {
+                    Err(violation) => match violation.kind {
+                        ViolationKind::Message(MessageError::FrameTooDeep { limit, found }) => {
+                            assert!(!semantic_over_limit, "{case_name} frame rejection is independent");
+                            assert_eq!(limit as usize, frame_depth_limit);
+                            assert_eq!(found as usize, declared_frame_depth);
+                            json!({
+                                "accepted": false,
+                                "error": {"code": "frame_too_deep"},
+                                "method_handler_invocations": 0,
+                                "backend_dispatches": 0,
+                                "connection_state": "closed",
+                                "connection_reusable": false,
+                                "extension_process": "terminated",
+                            })
+                        }
+                        other => panic!("{case_name} unexpected protocol rejection: {other}"),
+                    },
                     Ok(messages) => {
-                        // Semantic bound at the case's declared payload root.
-                        if block_depth > semantic_limit_val {
-                            json!({"accepted": false, "error": {"code": "semantic_too_deep"}})
+                        assert_eq!(messages.len(), 1, "{case_name} one message per isolated frame");
+                        let message = &messages[0];
+                        match message_kind {
+                            "request" => assert_eq!(message.kind, MessageKind::Request),
+                            "notification" => assert_eq!(message.kind, MessageKind::Notification),
+                            "success_response" | "error_response" => {
+                                assert_eq!(message.kind, MessageKind::Response)
+                            }
+                            other => panic!("unsupported protocol semantic message kind {other}"),
+                        }
+                        assert_eq!(
+                            message
+                                .payload()
+                                .expect("{case_name} semantic root")
+                                .semantic_depth() as usize,
+                            semantic_depth,
+                            "{case_name} semantic root depth"
+                        );
+                        if !semantic_over_limit {
+                            json!({"accepted": true, "connection_reusable": true})
                         } else {
-                            let message = &messages[0];
-                            assert_eq!(message.method().as_deref(), Some("extension.ping"));
-                            assert_eq!(message.kind, MessageKind::Request);
-                            json!({"accepted": true})
+                            let params_error = json!({
+                                "code": "RPC_INVALID_PARAMS",
+                                "details": {"error_name": "invalid_params"},
+                                "retryable": false,
+                                "outcome": "not_applied",
+                            });
+                            let response_error = json!({
+                                "code": "PROTOCOL_INVALID_RESPONSE",
+                                "details": {"error_name": "invalid_response"},
+                                "retryable": false,
+                                "outcome": "unknown",
+                            });
+                            match message_kind {
+                                "request" => {
+                                    emitted.push(json!({
+                                        "case": case_name,
+                                        "jsonrpc_error": -32602,
+                                        "data": params_error,
+                                    }));
+                                    json!({
+                                        "accepted": false,
+                                        "error": {"jsonrpc_code": -32602, "data": params_error},
+                                        "method_handler_invocations": 0,
+                                        "backend_dispatches": 0,
+                                        "connection_state": "ready",
+                                        "connection_reusable": true,
+                                    })
+                                }
+                                "notification" => {
+                                    emitted.push(json!({
+                                        "case": case_name,
+                                        "local_diagnostic": params_error,
+                                    }));
+                                    json!({
+                                        "accepted": false,
+                                        "diagnostic": params_error,
+                                        "method_handler_invocations": 0,
+                                        "backend_dispatches": 0,
+                                        "connection_state": "ready",
+                                        "connection_reusable": true,
+                                    })
+                                }
+                                "success_response" => {
+                                    emitted.push(json!({
+                                        "case": case_name,
+                                        "local_error": response_error,
+                                    }));
+                                    json!({
+                                        "accepted": false,
+                                        "local_error": response_error,
+                                        "success_deliveries": [],
+                                        "receiver_method_handler_invocations": 0,
+                                        "receiver_backend_dispatches": 0,
+                                        "callee_handler_invocations": "unknown",
+                                        "callee_backend_dispatches": "unknown",
+                                        "external_effect_outcome": "unknown",
+                                        "connection_state": "closed",
+                                        "connection_reusable": false,
+                                    })
+                                }
+                                "error_response" => {
+                                    emitted.push(json!({
+                                        "case": case_name,
+                                        "local_error": response_error,
+                                    }));
+                                    json!({
+                                        "accepted": false,
+                                        "peer_error_deliveries": [],
+                                        "peer_error_outcome_trusted": false,
+                                        "local_error": response_error,
+                                        "receiver_method_handler_invocations": 0,
+                                        "receiver_backend_dispatches": 0,
+                                        "callee_handler_invocations": "unknown",
+                                        "callee_backend_dispatches": "unknown",
+                                        "external_effect_outcome": "unknown",
+                                        "connection_state": "closed",
+                                        "connection_reusable": false,
+                                    })
+                                }
+                                other => panic!("unsupported protocol semantic message kind {other}"),
+                            }
                         }
                     }
-                    Err(violation) => match &violation.kind {
-                        ViolationKind::Message(MessageError::FrameTooDeep { .. }) => {
-                            reusable = false;
-                            json!({"accepted": false, "error": {"code": "frame_too_deep"}})
-                        }
-                        other => {
-                            outcome = format!("unexpected rejection: {other}");
-                            reusable = false;
-                            json!({"accepted": false, "error": {"code": "unknown"}})
-                        }
-                    },
                 };
                 observed_cases.insert(case_name, result);
             }
-            // After a rejected frame the connection must not be reusable.
-            let probe = encode_frame(br#"{"jsonrpc":"2.0","id":"p","method":"x"}"#);
-            let probe_error = connection.feed(&probe).is_err() || !connection.is_ready();
-            let reusable_after_rejection = reusable && !probe_error;
-            let scenario = json!({
-                "cases": Value::Object(observed_cases),
-                "connection": {
-                    "reusable_after_frame_rejection": reusable_after_rejection,
-                    "state": state_name(connection.state()),
-                },
+            emitted.sort_by_key(|entry| match entry["case"].as_str().unwrap() {
+                "request-params-depth-65" => 0,
+                "notification-params-depth-65" => 1,
+                "success-result-depth-65" => 2,
+                "error-data-depth-65" => 3,
+                other => panic!("unexpected emitted protocol case {other}"),
             });
-            let before =
-                json!({"cases": {}, "connection": {"reusable_after_frame_rejection": true}});
-            (scenario, before, outcome, vec![])
+            (
+                json!({"cases": Value::Object(observed_cases)}),
+                json!({"cases": {}}),
+                "independent_semantic_roots_with_closed_dispositions".to_string(),
+                emitted,
+            )
         }
         "TST-PROTO-003" => {
             let initial = &vector["initial"];

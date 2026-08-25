@@ -169,6 +169,65 @@ describe("Core reference abstract machine", () => {
     expect(unverified.error?.code).toBe("ACTIVATION_REPLAY_EVIDENCE_INVALID");
   });
 
+  it("keeps replay evidence immutable while applying conflicts and idempotently replaying duplicates", () => {
+    const state = leasedState("dispatched");
+    state.activations.a!.manifest = {
+      manifest_digest: A,
+      module_id: "writer",
+      storage_scope_id: "scope-1",
+      frozen_replay_contract: {
+        mode: "fenced_replay",
+        evidence: "activation_ledger",
+        ledger: { namespace: "effects" },
+      },
+    };
+    state.activations.a!.extension_generation = 8;
+    state.leases.l!.manifest_digest = A;
+    state.leases.l!.extension_generation = 8;
+    const begun = run(state, { type: "BeginFence", command_id: "begin-replay", activation_id: "a" });
+    const record: JsonObject = {
+      activation_id: "a",
+      source_attempt: 1,
+      manifest_digest: A,
+      module_id: "writer",
+      storage_scope_id: "scope-1",
+      target_extension_generation: 8,
+      ledger: { namespace: "effects" },
+      ledger_state: "complete",
+    };
+    const evidence = {
+      verified: true,
+      activation_id: "a",
+      source_attempt: 1,
+      target_generation: 8,
+      observation: "succeeded" as const,
+      record,
+      digest: canonicalJsonDigest(record),
+    };
+    const command = (command_id: string): CoreCommand => ({ type: "RecordReplayEvidence", command_id, activation_id: "a" });
+    const first = run(begun.state, command("record"), { host_replay_evidence: evidence });
+    const duplicate = run(first.state, command("duplicate"), { host_replay_evidence: evidence });
+    expect(duplicate.error).toBeUndefined();
+    expect(duplicate.reply).toMatchObject({ evidence_digest: evidence.digest, idempotent: true });
+    expect(duplicate.state_hash).toBe(first.state_hash);
+    expect(duplicate.events).toEqual([]);
+
+    const conflictingRecord = { ...record, ledger_state: "failed" as const };
+    const conflict = run(first.state, command("conflict"), {
+      host_replay_evidence: {
+        ...evidence,
+        observation: "failed",
+        record: conflictingRecord,
+        digest: canonicalJsonDigest(conflictingRecord),
+      },
+    });
+    expect(conflict.outcome).toBe("committed");
+    expect(conflict.error).toMatchObject({ code: "STORAGE_IDEMPOTENCY_CONFLICT", outcome: "applied" });
+    expect(conflict.state.activations.a?.replay_evidence?.evidence_digest).toBe(evidence.digest);
+    expect(conflict.state.security_incidents).toContainEqual({ code: "STORAGE_IDEMPOTENCY_CONFLICT", activation_id: "a" });
+    expect(conflict.events.map((event) => event.event)).toEqual(["SecurityIncident"]);
+  });
+
   it("quarantines started never-auto-retry work and consumes safe retry authority once", () => {
     const started = leasedState("dispatched");
     started.activations.a!.manifest = { frozen_replay_contract: { mode: "never_auto_retry", evidence: "none" } };

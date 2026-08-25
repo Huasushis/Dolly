@@ -480,6 +480,78 @@ for (const [file, schemaId] of cases) {
       }
     }
   }
+  if (value.test_id === "TST-TOOL-014") {
+    const relative = path.relative(root, file);
+    assertValid(
+      `${relative}.initial.contract`,
+      `${schemaBase}effect-journal-bridge.schema.json`,
+      value.initial?.contract,
+    );
+    const cases = value.initial?.cases;
+    if (!Array.isArray(cases) || cases.length !== 5) {
+      throw new Error(`${relative}: cross-language bridge corpus must contain five outcome cases`);
+    }
+    for (const [index, entry] of cases.entries()) {
+      const target = entry.target;
+      const canonical = entry.canonical;
+      if (target?.record?.claim?.claim_token !== target?.claim?.claim_token) {
+        throw new Error(`${relative}.initial.cases[${index}]: journal Claim differs from mapped Claim`);
+      }
+      if (canonicalDigest(target.claim) !== canonical.claim_digest ||
+          canonicalDigest(target.record) !== canonical.record_digest) {
+        throw new Error(`${relative}.initial.cases[${index}]: canonical digest is stale`);
+      }
+    }
+    const terminalContract = value.initial.contract.outcome_mapping.find(
+      (entry) => entry.source_kind === "terminal",
+    );
+    if (terminalContract.target_state !== "UNKNOWN_OUTCOME" ||
+        terminalContract.evidence_rule !== "null" ||
+        terminalContract.applied_premise?.premise !== "exact-authoritative-tool-call-ledger" ||
+        terminalContract.applied_premise?.ledger_schema !== "dolly.tool-call-ledger/v1" ||
+        terminalContract.applied_premise?.ledger_record_validator !== "tool-call-ledger-record.schema.json" ||
+        (terminalContract.applied_premise?.identity_match?.length ?? 0) < 8 ||
+        terminalContract.applied_premise?.terminal_state !== "SUCCEEDED" ||
+        terminalContract.applied_premise?.evidence_rule !== "ledger.terminal_result_digest") {
+      throw new Error(`${relative}: terminal outcome must settle UNKNOWN_OUTCOME without an exact authoritative Tool-call ledger premise and only APPLIED via that premise`);
+    }
+    const noPremise = cases.find((entry) => entry.ledger_premise === "absent");
+    if (!noPremise || noPremise.expected_state !== "UNKNOWN_OUTCOME" ||
+        noPremise.target.record.state !== "UNKNOWN_OUTCOME" ||
+        noPremise.target.record.evidence_digest !== null) {
+      throw new Error(`${relative}: terminal outcome without an authoritative ledger premise must settle UNKNOWN_OUTCOME with null evidence`);
+    }
+    const withPremise = cases.find((entry) => entry.ledger_premise?.record?.schema === "dolly.tool-call-ledger/v1");
+    if (!withPremise || withPremise.expected_state !== "APPLIED" ||
+        withPremise.target.record.state !== "APPLIED") {
+      throw new Error(`${relative}: terminal outcome may settle APPLIED only via an exact authoritative Tool-call ledger premise`);
+    }
+    const ledgerRecord = withPremise.ledger_premise.record;
+    assertValid(
+      `${relative}.initial.cases[3].ledger_premise.record`,
+      `${schemaBase}tool-call-ledger-record.schema.json`,
+      ledgerRecord,
+    );
+    if (ledgerRecord.state !== "SUCCEEDED" || ledgerRecord.ledger_revision !== 3) {
+      throw new Error(`${relative}: APPLIED premise ledger record must be a SUCCEEDED revision-3 Tool-call ledger record`);
+    }
+    const claim = withPremise.target.claim;
+    const record = withPremise.target.record;
+    const binding = ledgerRecord.operation_binding;
+    if (claim.operation_id !== binding.operation_id ||
+        claim.instance_id !== binding.instance_id ||
+        claim.module_id !== binding.module_id ||
+        claim.operation_digest !== ledgerRecord.operation_digest ||
+        record.intent_digest !== ledgerRecord.outbound_digest ||
+        record.package_digest !== binding.server_contract.transport.package_digest ||
+        record.evidence_digest !== ledgerRecord.terminal_result_digest) {
+      throw new Error(`${relative}: APPLIED premise must prove concrete Claim/generation/outbound/terminal-result equality with the ledger record (operation_id, not idempotency_key)`);
+    }
+    if (value.initial.contract.aggregate_evidence !==
+        "never-map-evidenceForRun-directly-to-one-Rust-record; require-each-intent-outcome; terminal-outcome-without-authoritative-ledger-premise-settles-UNKNOWN_OUTCOME") {
+      throw new Error(`${relative}: aggregate_evidence must record the terminal-outcome fail-closed rule`);
+    }
+  }
   if (value.test_id === "TST-CORE-009") {
     const evidenceDigests = new Map();
     for (const [caseName, replayCase] of Object.entries(value.stimulus?.cases ?? {})) {

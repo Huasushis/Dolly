@@ -755,6 +755,117 @@ fn result_and_replay_authority_require_exact_execution_bindings() {
 }
 
 #[test]
+fn replay_evidence_conflict_is_applied_without_replacing_authority() {
+    let mut state = leased(ActivationState::Dispatched, None);
+    state
+        .activations
+        .get_mut("a")
+        .unwrap()
+        .extension_generation = Some(8);
+    state.activations.get_mut("a").unwrap().manifest = Some(json!({
+        "manifest_digest": A,
+        "module_id": "writer",
+        "storage_scope_id": "scope-1",
+        "frozen_replay_contract": {
+            "mode": "fenced_replay",
+            "evidence": "activation_ledger",
+            "ledger": {"namespace": "effects"},
+        },
+    }));
+    state.leases.get_mut("l").unwrap()["extension_generation"] = json!(8);
+    state.leases.get_mut("l").unwrap()["manifest_digest"] = json!(A);
+    let begun = reduce(
+        &state,
+        &CoreCommand::BeginFence(BeginFenceCommand {
+            command_id: "begin-replay".into(),
+            activation_id: "a".into(),
+        }),
+        &input(),
+    );
+    let record = json!({
+        "activation_id": "a",
+        "source_attempt": 1,
+        "manifest_digest": A,
+        "module_id": "writer",
+        "storage_scope_id": "scope-1",
+        "target_extension_generation": 8,
+        "ledger": {"namespace": "effects"},
+        "ledger_state": "complete",
+    });
+    let command = |command_id: &str| {
+        CoreCommand::RecordReplayEvidence(RecordReplayEvidenceCommand {
+            command_id: command_id.into(),
+            activation_id: "a".into(),
+        })
+    };
+    let mut first_input = input();
+    first_input.host_replay_evidence = Some(HostReplayEvidence {
+        verified: true,
+        activation_id: "a".into(),
+        source_attempt: 1,
+        target_generation: Some(8),
+        observation: ReplayEvidenceObservation::Succeeded,
+        digest: digest(&record),
+        record: record.clone(),
+    });
+    let first = reduce(&begun.state, &command("record"), &first_input);
+    let duplicate = reduce(&first.state, &command("duplicate"), &first_input);
+    assert!(duplicate.error.is_none());
+    assert_eq!(
+        duplicate.reply,
+        Some(json!({"evidence_digest": digest(&record), "idempotent": true}))
+    );
+    assert_eq!(duplicate.state, first.state);
+    assert!(duplicate.events.is_empty());
+
+    let conflicting_record = json!({
+        "activation_id": "a",
+        "source_attempt": 1,
+        "manifest_digest": A,
+        "module_id": "writer",
+        "storage_scope_id": "scope-1",
+        "target_extension_generation": 8,
+        "ledger": {"namespace": "effects"},
+        "ledger_state": "failed",
+    });
+    let mut conflict_input = first_input;
+    conflict_input.host_replay_evidence = Some(HostReplayEvidence {
+        verified: true,
+        activation_id: "a".into(),
+        source_attempt: 1,
+        target_generation: Some(8),
+        observation: ReplayEvidenceObservation::Failed,
+        digest: digest(&conflicting_record),
+        record: conflicting_record,
+    });
+    let conflict = reduce(&first.state, &command("conflict"), &conflict_input);
+    let error = conflict.error.unwrap();
+    assert_eq!(error.code, "STORAGE_IDEMPOTENCY_CONFLICT");
+    assert_eq!(error.outcome, ErrorOutcome::Applied);
+    assert_eq!(
+        conflict
+            .state
+            .activations
+            .get("a")
+            .unwrap()
+            .replay_evidence
+            .as_ref()
+            .unwrap()["evidence_digest"],
+        digest(&record)
+    );
+    assert_eq!(
+        conflict
+            .state
+            .security_incidents
+            .last()
+            .unwrap()["code"],
+        "STORAGE_IDEMPOTENCY_CONFLICT"
+    );
+    assert_eq!(conflict.events.len(), 1);
+    assert_eq!(conflict.events[0].event, "SecurityIncident");
+}
+
+#[test]
 fn invalid_dispositions_recovery_and_quarantine_resolution_preserve_state() {
     for command in [
         CoreCommand::DeadLetterRange(DeadLetterRangeCommand {

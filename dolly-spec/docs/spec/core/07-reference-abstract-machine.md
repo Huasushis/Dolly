@@ -204,7 +204,7 @@ An implementation MUST NOT expose a post-state before its transaction commits.
 | `ReceiveResult(retryable)` | current valid lease | `retry_wait`, or `quarantined` when attempts exhausted; cursor unchanged | unchanged |
 | `ReceiveResult(permanent)` | current valid lease | Activation and Module `quarantined` | unchanged |
 | `BeginFence` | lease timed out or transport outcome unknown | Activation and Module `fencing` | unchanged |
-| `RecordReplayEvidence` | Activation `fencing`; frozen contract is `activation_ledger`; Host verifier output available | one immutable target-generation-bound replay-evidence record | unchanged on invalid input or idempotency conflict |
+| `RecordReplayEvidence` | Activation `fencing`; frozen contract is `activation_ledger`; Host verifier output available | one immutable target-generation-bound replay-evidence record | unchanged evidence on invalid input or idempotency conflict; a conflict's durable security incident is an applied error |
 | `FenceComplete` | execution slot proven empty | `retry_wait`, or `cancelled` if authorized | quarantine if proof fails |
 | `ApplyResult` | `result_staged` or `commit_blocked` | Activation `committed`; Module `idle` | `commit_blocked`, unchanged, or quarantine |
 | `CancelActivation` | never dispatched, or execution successfully fenced | Activation `cancelled`; Module ownership cleared | unchanged |
@@ -729,8 +729,8 @@ RecordReplayEvidence(A, G, record):
   atomic {
     recheck A, its frozen Manifest/contract, source dispatch attempt, G, and every Host verification input
     if ActivationReplayEvidence[key] exists:
-      require its (canonical_record, evidence_digest) equals (JCS(record), digest); otherwise return STORAGE_IDEMPOTENCY_CONFLICT and record a security incident
-      return the existing digest
+      require its (canonical_record, evidence_digest) equals (JCS(record), digest); otherwise record a security incident in this transaction, return STORAGE_IDEMPOTENCY_CONFLICT with error outcome applied, and leave the existing evidence authoritative
+      return the existing digest as an idempotent duplicate
     ActivationReplayEvidence[key] = (canonical_record=JCS(record), evidence_digest=digest)
     Journal += ActivationReplayEvidenceRecorded(A.activation_id, A.attempt, G.generation, record.ledger_state, record.replay_disposition, digest)
   }
