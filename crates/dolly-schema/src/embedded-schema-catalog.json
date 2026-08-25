@@ -18055,6 +18055,7 @@
           "authority_schema_version",
           "daemon_installation_id",
           "instance_id",
+          "controller_generation_id",
           "current_config_revision",
           "current_config_digest"
         ],
@@ -18063,13 +18064,16 @@
             "const": "dolly.runtime-authority-state/v1"
           },
           "authority_schema_version": {
-            "const": 1
+            "const": 2
           },
           "daemon_installation_id": {
             "$ref": "common.schema.json#/$defs/UuidV7"
           },
           "instance_id": {
             "$ref": "common.schema.json#/$defs/StableId"
+          },
+          "controller_generation_id": {
+            "$ref": "common.schema.json#/$defs/UuidV7"
           },
           "current_config_revision": {
             "$ref": "common.schema.json#/$defs/Revision"

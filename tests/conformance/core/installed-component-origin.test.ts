@@ -41,6 +41,7 @@ const identity: RuntimeAuthorityIdentity = {
 
 class FakeLock {
   readonly held = true;
+  readonly controllerGenerationId = "0198ab11-6c44-7e8a-b2bb-000000000631";
 
   assertHeld(): void {}
 }

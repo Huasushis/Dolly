@@ -1,14 +1,14 @@
-use dolly_canonical_json::{CanonicalJsonValue, Sha256Digest, canonicalize};
-use dolly_storage::Database;
+use dolly_canonical_json::{canonicalize, CanonicalJsonValue, Sha256Digest};
 use dolly_storage::host_authority::{
-    ConfigRevisionMapping, HostAuthorityError, HostAuthorityRevision, InstallDisposition,
-    InstalledComponentOrigin, LinuxServiceCandidate, ModuleActivationPremises,
-    PermissionPolicyBackendBinding, PermissionPolicyDefinition, PermissionPolicySelection,
-    PolicyDefinitionOrigin, ResolvedConfiguration, RuntimeAuthorityIdentity,
-    install_host_authority_revision, load_current_authority,
+    install_host_authority_revision, load_current_authority, ConfigRevisionMapping,
+    HostAuthorityError, HostAuthorityRevision, InstallDisposition, InstalledComponentOrigin,
+    LinuxServiceCandidate, ModuleActivationPremises, PermissionPolicyBackendBinding,
+    PermissionPolicyDefinition, PermissionPolicySelection, PolicyDefinitionOrigin,
+    ResolvedConfiguration, RuntimeAuthorityIdentity,
 };
+use dolly_storage::Database;
 use rusqlite::params;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tempfile::tempdir;
 
 fn digest(value: &Value) -> Sha256Digest {
@@ -263,13 +263,11 @@ fn configuration_without_host_prerequisites_has_no_premise() {
         premise: None,
     };
     let db = bootstrap(&path, input);
-    assert!(
-        load_current_authority(db.connection())
-            .unwrap()
-            .unwrap()
-            .premise
-            .is_none()
-    );
+    assert!(load_current_authority(db.connection())
+        .unwrap()
+        .unwrap()
+        .premise
+        .is_none());
 }
 
 #[test]
@@ -309,8 +307,335 @@ fn orphan_next_revision_mapping_identity_is_rejected_before_pointer_publish() {
 
     let error = install_host_authority_revision(&mut db, incoming).unwrap_err();
     assert!(matches!(error, HostAuthorityError::RevisionConflict { .. }));
-    let after = load_current_authority(db.connection()).unwrap().unwrap();
-    assert_eq!(after.mapping.config_revision, prior.mapping.config_revision);
-    assert_eq!(after.mapping.config_digest, prior.mapping.config_digest);
-    assert_eq!(after.premise, prior.premise);
+    let state: (i64, String) = db
+        .connection()
+        .query_row(
+            "SELECT current_config_revision, current_config_digest
+             FROM runtime_authority_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state.0, prior.mapping.config_revision);
+    assert_eq!(state.1, prior.mapping.config_digest.to_string());
+    assert!(matches!(
+        load_current_authority(db.connection()),
+        Err(HostAuthorityError::RevisionConflict { .. })
+    ));
+}
+
+#[test]
+fn closed_validator_grammar_rejects_cross_language_cases_before_writes() {
+    fn rejects(input: HostAuthorityRevision) {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite3");
+        let mut db = bootstrap(&path, revision());
+        let error = install_host_authority_revision(&mut db, input);
+        assert!(
+            matches!(
+                error,
+                Err(HostAuthorityError::Malformed(_)) | Err(HostAuthorityError::DigestMismatch(_))
+            ),
+            "unexpected grammar error: {error:?}"
+        );
+    }
+
+    let mut uppercase_uuid = revision();
+    uppercase_uuid.mapping.daemon_installation_id = uppercase_uuid
+        .mapping
+        .daemon_installation_id
+        .to_ascii_uppercase();
+    rejects(uppercase_uuid);
+
+    let mut digit_first_instance = revision();
+    digit_first_instance.mapping.instance_id = "1instance".into();
+    rejects(digit_first_instance);
+
+    let mut uppercase_component = revision();
+    uppercase_component
+        .premise
+        .as_mut()
+        .unwrap()
+        .service_candidate
+        .origin
+        .component_id = "Org.dolly.host-runtime".into();
+    rejects(uppercase_component);
+
+    let mut short_unit = revision();
+    short_unit
+        .mapping
+        .canonical_config
+        .service_candidate
+        .as_mut()
+        .unwrap()
+        .unit_name = "a.servic".into();
+    rejects(short_unit);
+}
+
+#[test]
+fn executes_every_validator_parity_rejection_stimulus() {
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../../dolly-spec/test-vectors/core/TST-AUTH-008-validator-parity.json"
+    ))
+    .unwrap();
+    let cases = vector["stimulus"]["rejection_cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 16);
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let mut input = revision();
+        match name {
+            "uppercase_uuid_v7" => {
+                input.mapping.daemon_installation_id = case["value"].as_str().unwrap().into();
+            }
+            "digit_first_stable_id" | "uppercase_stable_id" | "oversized_stable_id" => {
+                input.mapping.instance_id = case["value"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "a".repeat(case["length"].as_u64().unwrap() as usize));
+            }
+            "digit_first_qualified_name"
+            | "uppercase_qualified_name"
+            | "oversized_qualified_name" => {
+                input
+                    .premise
+                    .as_mut()
+                    .unwrap()
+                    .service_candidate
+                    .origin
+                    .component_id = case["value"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "a".repeat(case["length"].as_u64().unwrap() as usize));
+            }
+            "short_unit_name" | "oversized_unit_name" => {
+                input.premise.as_mut().unwrap().service_candidate.unit_name = case["value"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}.service",
+                            "a".repeat(
+                                case["length"].as_u64().unwrap() as usize - ".service".len()
+                            )
+                        )
+                    });
+            }
+            "invalid_uri_reference_escape" => {
+                input
+                    .premise
+                    .as_mut()
+                    .unwrap()
+                    .permission_policy_definitions[0]
+                    .definition_schema_uri = case["value"].as_str().unwrap().into();
+            }
+            "definition_array" => {
+                input
+                    .premise
+                    .as_mut()
+                    .unwrap()
+                    .permission_policy_definitions[0]
+                    .definition = CanonicalJsonValue::try_from(json!([])).unwrap();
+            }
+            "definition_max_properties" => {
+                let mut object = serde_json::Map::new();
+                for index in 0..case["property_count"].as_u64().unwrap() {
+                    object.insert(format!("property{index}"), json!(true));
+                }
+                input
+                    .premise
+                    .as_mut()
+                    .unwrap()
+                    .permission_policy_definitions[0]
+                    .definition = CanonicalJsonValue::try_from(Value::Object(object)).unwrap();
+            }
+            "unsorted_policy_definitions" => {
+                let definition = input
+                    .premise
+                    .as_ref()
+                    .unwrap()
+                    .permission_policy_definitions[0]
+                    .clone();
+                input
+                    .premise
+                    .as_mut()
+                    .unwrap()
+                    .permission_policy_definitions = vec![definition.clone(), definition];
+            }
+            "unsorted_policy_bindings" => {
+                let binding = input
+                    .premise
+                    .as_ref()
+                    .unwrap()
+                    .permission_policy_backend_bindings[0]
+                    .clone();
+                input
+                    .premise
+                    .as_mut()
+                    .unwrap()
+                    .permission_policy_backend_bindings = vec![binding.clone(), binding];
+            }
+            "unsorted_policy_selections" => {
+                let selection =
+                    input.mapping.canonical_config.permission_policy_selections[0].clone();
+                input.mapping.canonical_config.permission_policy_selections =
+                    vec![selection.clone(), selection];
+            }
+            "oversized_canonical_record" => {
+                input.mapping.canonical_config.runtime_config =
+                    CanonicalJsonValue::try_from(json!({
+                        "payload": "a".repeat(case["length"].as_u64().unwrap() as usize)
+                    }))
+                    .unwrap();
+            }
+            other => panic!("unhandled validator parity case {other}"),
+        }
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("vector.sqlite3");
+        let mut db = bootstrap(&path, revision_for(&path));
+        let error = install_host_authority_revision(&mut db, input);
+        assert!(
+            matches!(
+                error,
+                Err(HostAuthorityError::Canonical(_))
+                    | Err(HostAuthorityError::Malformed(_))
+                    | Err(HostAuthorityError::DigestMismatch(_))
+                    | Err(HostAuthorityError::InvalidPremise(_))
+            ),
+            "{name}: unexpected validator result {error:?}"
+        );
+    }
+}
+
+#[test]
+fn unused_historical_selection_is_verified_against_its_premise() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("historical-selection.sqlite3");
+    let first = revision_for(&path);
+    let mut db = bootstrap(&path, first);
+    let mut second = revision_for(&path);
+    second.mapping.config_revision = 2;
+    let premise = second.premise.as_mut().unwrap();
+    premise.config_revision = 2;
+    let premise_value = serde_json::to_value(&*premise).unwrap();
+    premise.premises_digest = digest(&without(&premise_value, "premises_digest"));
+    install_host_authority_revision(&mut db, second).unwrap();
+    db.connection_mut()
+        .execute_batch("PRAGMA foreign_keys = OFF;")
+        .unwrap();
+    db.connection_mut()
+        .execute(
+            "UPDATE module_activation_premise_policy_selections
+             SET binding_digest = ?1 WHERE config_revision = 1",
+            ["sha256:3333333333333333333333333333333333333333333333333333333333333333"],
+        )
+        .unwrap();
+    db.connection_mut()
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .unwrap();
+    let error = load_current_authority(db.connection()).unwrap_err();
+    assert!(matches!(
+        error,
+        HostAuthorityError::DigestMismatch(_) | HostAuthorityError::Malformed(_)
+    ));
+}
+
+#[test]
+fn v2_reopen_rejects_hostile_objects_indexes_and_foreign_keys() {
+    for tamper in ["trigger", "index", "foreign_key"] {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(format!("{tamper}.sqlite3"));
+        let mut db = bootstrap(&path, revision_for(&path));
+        match tamper {
+            "trigger" => db
+                .connection_mut()
+                .execute_batch(
+                    "CREATE TRIGGER hostile_authority
+                     AFTER INSERT ON config_revision_mappings BEGIN SELECT 1; END;",
+                )
+                .unwrap(),
+            "index" => {
+                db.connection_mut()
+                    .execute(
+                        "CREATE INDEX hostile_authority_index
+                         ON config_revision_mappings(config_digest)",
+                        [],
+                    )
+                    .unwrap();
+            }
+            "foreign_key" => {
+                db.connection_mut()
+                    .execute_batch("PRAGMA foreign_keys = OFF;")
+                    .unwrap();
+                db.connection_mut()
+                    .execute(
+                        "INSERT INTO module_activation_premise_policy_selections (
+                            config_revision, policy_id, policy_revision,
+                            policy_definition_digest, binding_id, binding_revision,
+                            binding_digest
+                         ) VALUES (999, 'missing-policy', 1, ?1, 'missing-binding', 1, ?2)",
+                        params![
+                            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                        ],
+                    )
+                    .unwrap();
+                db.connection_mut()
+                    .execute_batch("PRAGMA foreign_keys = ON;")
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let error = load_current_authority(db.connection()).unwrap_err();
+        assert!(
+            matches!(error, HostAuthorityError::Malformed(_)),
+            "{tamper}: unexpected error {error:?}"
+        );
+    }
+}
+
+#[test]
+fn cross_reference_and_quoted_hostile_views_are_rejected_with_parity() {
+    // Each stimulus hides an authority-table reference behind an unrelated
+    // object name, a quoted identifier, or schema qualification.
+    let stimuli: [(&str, &str); 5] = [
+        (
+            "plain_cross_reference",
+            "CREATE VIEW unrelated_helper AS
+             SELECT 1 AS x WHERE EXISTS (SELECT 1 FROM config_revision_mappings)",
+        ),
+        (
+            "quoted_identifier",
+            "CREATE VIEW unrelated_helper AS
+             SELECT 1 AS x FROM unrelated_source WHERE y IN
+               (SELECT \"config_revision\" FROM \"config_revision_mappings\")",
+        ),
+        (
+            "bracket_identifier",
+            "CREATE VIEW unrelated_helper AS
+             SELECT * FROM unrelated_source JOIN [config_revision_mappings] ON 1 = 1",
+        ),
+        (
+            "schema_qualified",
+            "CREATE VIEW unrelated_helper AS SELECT * FROM main.config_revision_mappings",
+        ),
+        (
+            "backtick_identifier",
+            "CREATE TABLE unrelated_source (id INTEGER);
+             CREATE TRIGGER unrelated_trigger AFTER INSERT ON unrelated_source BEGIN
+               SELECT COUNT(*) FROM `runtime_authority_state`; END;",
+        ),
+    ];
+    for (name, sql) in stimuli {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("hostile-view.sqlite3");
+        let mut db = bootstrap(&path, revision_for(&path));
+        db.connection_mut().execute_batch(sql).unwrap_or_else(|error| {
+            panic!("{name}: stimulus must be valid SQLite: {error}")
+        });
+        let error = load_current_authority(db.connection()).unwrap_err();
+        assert!(
+            matches!(error, HostAuthorityError::Malformed(_)),
+            "{name}: unexpected error {error:?}"
+        );
+    }
 }

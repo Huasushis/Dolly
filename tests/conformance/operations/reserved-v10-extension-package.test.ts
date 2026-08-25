@@ -35,6 +35,7 @@ const temporaryRoots: string[] = [];
 
 class FakeAuthorityLock {
   readonly held = true;
+  readonly controllerGenerationId = "0198ab11-6c44-7e8a-b2bb-000000000731";
   assertHeld(): void {}
 }
 

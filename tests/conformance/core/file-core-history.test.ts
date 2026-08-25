@@ -27,6 +27,7 @@ const authorities: RuntimeAuthorityDatabase[] = [];
 
 class FakeLock {
   held = true;
+  readonly controllerGenerationId = "0198ab11-6c44-7e8a-b2bb-000000000601";
 
   assertHeld(): void {
     if (!this.held) throw new Error("controller lock is not held");

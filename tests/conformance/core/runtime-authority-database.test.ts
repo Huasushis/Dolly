@@ -1,6 +1,6 @@
 /**
  * Conformance drive of the H1 Runtime authority SQLite repository against the
- * 41d6476 authority vectors TST-AUTH-001..006, using the real pinned native
+ * 41d6476 authority vectors TST-AUTH-001..007, using the real pinned native
  * binding on real temp-file databases with close/reopen and authority-
  * transaction crash injection via `crashPoint`.
  *
@@ -17,12 +17,13 @@
  * - downstream result/ack cannot write any authority row (TST-AUTH-001/003).
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import {
+  HOST_AUTHORITY_SCHEMA_VERSION,
   RuntimeAuthorityDatabase,
   RuntimeAuthorityCrashPointError,
   RuntimeAuthorityDatabaseError,
@@ -66,6 +67,8 @@ function hex(repeats: string): string {
 
 /** Double that implements the caller-held controller-lock contract. */
 class FakeLock {
+  readonly controllerGenerationId = "0198ab11-6c44-7e8a-b2bb-000000000701";
+
   constructor(public held: boolean = true) {}
   assertHeld(): void {
     if (!this.held) throw new Error("fake controller lock is not held");
@@ -421,6 +424,647 @@ describe("TST-AUTH-004: config revision allocation and authority-transaction cra
     db.close();
   });
 });
+describe("TST-AUTH-007: physical Host v2 bridge and canonical-byte gates", () => {
+  it("fresh TypeScript authority emits the Rust-compatible Host parent projection", () => {
+    const dir = scratch();
+    const path = join(dir, "v2.sqlite3");
+    const db = openDatabase(dir, "v2.sqlite3");
+    install(db, candidate(1, "A", false));
+    db.close();
+    const inspect = raw(path);
+    expect(inspect.prepare("SELECT authority_schema_version FROM host_authority_meta WHERE singleton = 1").get()).toEqual({
+      authority_schema_version: HOST_AUTHORITY_SCHEMA_VERSION,
+    });
+    const mappingColumns = inspect.prepare("PRAGMA table_info(config_revision_mappings)").all() as Array<{ name: string }>;
+    expect(mappingColumns.map((column) => column.name)).toContain("daemon_installation_id");
+    expect(mappingColumns.map((column) => column.name)).toContain("instance_id");
+    const state = inspect.prepare(
+      "SELECT authority_schema_version, controller_generation_id, record_jcs FROM runtime_authority_state WHERE singleton = 1",
+    ).get() as { authority_schema_version: number; controller_generation_id: string; record_jcs: Buffer };
+    expect(state.authority_schema_version).toBe(HOST_AUTHORITY_SCHEMA_VERSION);
+    expect(state.controller_generation_id).toBe(new FakeLock().controllerGenerationId);
+    expect(Buffer.from(state.record_jcs)).toEqual(Buffer.from(canonicalBytes({
+      schema: "dolly.runtime-authority-state/v1",
+      authority_schema_version: HOST_AUTHORITY_SCHEMA_VERSION,
+      daemon_installation_id: identity.daemonInstallationId,
+      instance_id: identity.instanceId,
+      controller_generation_id: state.controller_generation_id,
+      current_config_revision: 1,
+      current_config_digest: candidate(1, "A", false).digest,
+    })));
+    inspect.close();
+  });
+  it("matches the Rust cross-language canonical state golden", () => {
+    const vector = JSON.parse(readFileSync(
+      join(import.meta.dirname, "../../../dolly-spec/test-vectors/core/TST-AUTH-007-physical-v2-bridge.json"),
+      "utf8",
+    )) as {
+      stimulus: {
+        cross_language_golden: {
+          state_canonical_bytes_utf8: string;
+          state_digest: string;
+        };
+      };
+    };
+    const expected = vector.stimulus.cross_language_golden;
+    const bytes = Buffer.from(expected.state_canonical_bytes_utf8, "utf8");
+    const parsed = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+    expect(Buffer.from(canonicalBytes(parsed))).toEqual(bytes);
+    expect(digestOfBytes(bytes)).toBe(expected.state_digest);
+  });
+
+
+  it("rejects raw-hash-only non-canonical mapping bytes on reopen", () => {
+    const dir = scratch();
+    const path = join(dir, "noncanonical.sqlite3");
+    const db = openDatabase(dir, "noncanonical.sqlite3");
+    const fixture = candidate(1, "A", false);
+    install(db, fixture);
+    db.close();
+    const inspect = raw(path);
+    const row = inspect.prepare("SELECT canonical_bytes FROM config_revision_mappings WHERE config_revision = 1").get() as { canonical_bytes: Buffer };
+    const parsed = JSON.parse(row.canonical_bytes.toString("utf8")) as Record<string, unknown>;
+    const nonCanonical = Buffer.from(JSON.stringify(parsed, null, 2), "utf8");
+    expect(nonCanonical.equals(row.canonical_bytes)).toBe(false);
+    const rawDigest = digestOfBytes(nonCanonical);
+    inspect.prepare(
+      "UPDATE config_revision_mappings SET canonical_bytes = ?, config_digest = ? WHERE config_revision = 1",
+    ).run(nonCanonical, rawDigest);
+    inspect.close();
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+      "STORAGE_CORRUPT",
+    );
+  });
+
+  it("requires an explicit v1-to-v2 migration for the pre-bridge TypeScript projection", () => {
+    const dir = scratch();
+    const path = join(dir, "legacy.sqlite3");
+    // Two history revisions with real premise/selection/definition/binding
+    // rows so the migration must preserve every dependent row.
+    const originRecord = (revision: number): Record<string, unknown> => {
+      const record = {
+        schema: "dolly.installed-component-origin/v1",
+        kind: "installed_product_component",
+        component_id: `org.dolly.module-${revision}`,
+        component_revision: 1,
+        component_digest: "",
+      };
+      const without = { ...record } as Record<string, unknown>;
+      delete without.component_digest;
+      return { ...record, component_digest: selfDigest(without as never, "component_digest") };
+    };
+    const candidateRecord = (revision: number): Record<string, unknown> => {
+      const record = {
+        schema: "dolly.linux-service-candidate/v1",
+        origin: originRecord(revision),
+        unit_name: `dolly-module-${revision}.service`,
+        mode: "user",
+        candidate_digest: "",
+      };
+      const without = { ...record } as Record<string, unknown>;
+      delete without.candidate_digest;
+      return { ...record, candidate_digest: selfDigest(without as never, "candidate_digest") };
+    };
+    const policyOrigin = {
+      schema: "dolly.policy-definition-origin/v1",
+      kind: "operator_approved_policy",
+      source_id: "org.dolly.policy.default",
+      source_revision: 1,
+      source_digest: `sha256:${"0".repeat(64)}`,
+    };
+    const definitionRecord = (revision: number): Record<string, unknown> => {
+      const record = {
+        schema: "dolly.permission-policy-definition/v1",
+        policy_id: `policy-${revision}`,
+        policy_revision: 1,
+        definition_schema_uri: "dolly://schemas/host-permission-policy/v1",
+        definition_schema_digest: `sha256:${"f".repeat(64)}`,
+        definition: { tools: { invoke: true } },
+        origin: policyOrigin,
+        definition_digest: "",
+      };
+      const without = { ...record } as Record<string, unknown>;
+      delete without.definition_digest;
+      return { ...record, definition_digest: selfDigest(without as never, "definition_digest") };
+    };
+    const bindingRecord = (revision: number, definitionDigest: string): Record<string, unknown> => {
+      const record = {
+        schema: "dolly.permission-policy-backend-binding/v1",
+        binding_id: `binding-${revision}`,
+        binding_revision: 1,
+        binding_digest: "",
+        policy_id: `policy-${revision}`,
+        policy_revision: 1,
+        policy_definition_digest: definitionDigest,
+        origin: originRecord(revision),
+      };
+      const without = { ...record } as Record<string, unknown>;
+      delete without.binding_digest;
+      return { ...record, binding_digest: selfDigest(without as never, "binding_digest") };
+    };
+    const revisionFixture = (revision: number) => {
+      const definition = definitionRecord(revision);
+      const binding = bindingRecord(revision, String(definition.definition_digest));
+      const selection = [{
+        policy_id: `policy-${revision}`,
+        policy_revision: 1,
+        policy_definition_digest: binding.policy_definition_digest,
+        binding_id: binding.binding_id,
+        binding_revision: 1,
+        binding_digest: binding.binding_digest,
+      }];
+      const configBytes = Buffer.from(canonicalBytes({
+        runtime_config: { modules: [{ name: `module-${revision}` }] },
+        permission_policy_selections: selection,
+        service_candidate: candidateRecord(revision),
+      }));
+      const configDigest = digestOfBytes(configBytes);
+      let premise = {
+        schema: "dolly.module-activation-premises/v1",
+        daemon_installation_id: identity.daemonInstallationId,
+        instance_id: identity.instanceId,
+        config_revision: revision,
+        config_digest: configDigest,
+        permission_policy_definitions: [definition],
+        permission_policy_backend_bindings: [binding],
+        service_candidate: candidateRecord(revision),
+        premises_digest: "",
+      } as unknown as Record<string, unknown>;
+      premise = { ...premise, premises_digest: selfDigest(premise as never, "premises_digest") };
+      return { revision, configBytes, configDigest, premise, selection };
+    };
+    const configBytesOf = (entry: { configBytes: Buffer }): Buffer => entry.configBytes;
+    const revisions = [revisionFixture(1), revisionFixture(2)];
+    const latest = revisions[revisions.length - 1];
+    const legacyState = canonicalBytes({
+      schema: "dolly.runtime-authority-state/v1",
+      authority_schema_version: 1,
+      daemon_installation_id: identity.daemonInstallationId,
+      instance_id: identity.instanceId,
+      current_config_revision: latest.revision,
+      current_config_digest: latest.configDigest,
+    });
+    const legacy = raw(path);
+    legacy.exec(`
+      CREATE TABLE core_meta (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
+        daemon_installation_id TEXT NOT NULL,
+        instance_id TEXT NOT NULL
+      );
+      CREATE TABLE config_revision_mappings (
+        config_revision INTEGER PRIMARY KEY,
+        config_digest TEXT NOT NULL,
+        canonical_bytes BLOB NOT NULL,
+        UNIQUE (config_revision, config_digest)
+      );
+      CREATE TABLE installed_component_origins (
+        component_id TEXT NOT NULL,
+        component_revision INTEGER NOT NULL CHECK (component_revision BETWEEN 1 AND 9007199254740991),
+        component_digest TEXT NOT NULL,
+        record_jcs BLOB NOT NULL,
+        PRIMARY KEY (component_id, component_revision),
+        UNIQUE (component_id, component_revision, component_digest)
+      );
+      CREATE TABLE permission_policy_definitions (
+        policy_id TEXT NOT NULL,
+        policy_revision INTEGER NOT NULL CHECK (policy_revision BETWEEN 1 AND 9007199254740991),
+        definition_digest TEXT NOT NULL,
+        record_jcs BLOB NOT NULL,
+        PRIMARY KEY (policy_id, policy_revision),
+        UNIQUE (policy_id, policy_revision, definition_digest)
+      );
+      CREATE TABLE permission_policy_backend_bindings (
+        binding_id TEXT NOT NULL,
+        binding_revision INTEGER NOT NULL CHECK (binding_revision BETWEEN 1 AND 9007199254740991),
+        binding_digest TEXT NOT NULL,
+        policy_id TEXT NOT NULL,
+        policy_revision INTEGER NOT NULL,
+        policy_definition_digest TEXT NOT NULL,
+        origin_component_id TEXT NOT NULL,
+        origin_component_revision INTEGER NOT NULL,
+        origin_component_digest TEXT NOT NULL,
+        record_jcs BLOB NOT NULL,
+        PRIMARY KEY (binding_id, binding_revision),
+        UNIQUE (binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest),
+        FOREIGN KEY (policy_id, policy_revision, policy_definition_digest)
+          REFERENCES permission_policy_definitions(policy_id, policy_revision, definition_digest),
+        FOREIGN KEY (origin_component_id, origin_component_revision, origin_component_digest)
+          REFERENCES installed_component_origins(component_id, component_revision, component_digest)
+      );
+      CREATE TABLE linux_service_candidates (
+        origin_component_id TEXT NOT NULL,
+        origin_component_revision INTEGER NOT NULL CHECK (origin_component_revision BETWEEN 1 AND 9007199254740991),
+        origin_component_digest TEXT NOT NULL,
+        unit_name TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode = 'user'),
+        candidate_digest TEXT NOT NULL,
+        record_jcs BLOB NOT NULL,
+        PRIMARY KEY (origin_component_id, origin_component_revision, unit_name, mode),
+        UNIQUE (origin_component_id, origin_component_revision, unit_name, mode, candidate_digest),
+        FOREIGN KEY (origin_component_id, origin_component_revision, origin_component_digest)
+          REFERENCES installed_component_origins(component_id, component_revision, component_digest)
+      );
+      CREATE TABLE module_activation_premises (
+        config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991),
+        config_digest TEXT NOT NULL,
+        service_origin_component_id TEXT NOT NULL,
+        service_origin_component_revision INTEGER NOT NULL,
+        service_unit_name TEXT NOT NULL,
+        service_mode TEXT NOT NULL,
+        service_candidate_digest TEXT NOT NULL,
+        premises_digest TEXT NOT NULL,
+        record_jcs BLOB NOT NULL,
+        UNIQUE (config_revision, config_digest),
+        FOREIGN KEY (config_revision, config_digest)
+          REFERENCES config_revision_mappings(config_revision, config_digest),
+        FOREIGN KEY (service_origin_component_id, service_origin_component_revision, service_unit_name, service_mode, service_candidate_digest)
+          REFERENCES linux_service_candidates(origin_component_id, origin_component_revision, unit_name, mode, candidate_digest)
+      );
+      CREATE TABLE module_activation_premise_policy_selections (
+        config_revision INTEGER NOT NULL CHECK (config_revision BETWEEN 1 AND 9007199254740991),
+        policy_id TEXT NOT NULL,
+        policy_revision INTEGER NOT NULL,
+        policy_definition_digest TEXT NOT NULL,
+        binding_id TEXT NOT NULL,
+        binding_revision INTEGER NOT NULL,
+        binding_digest TEXT NOT NULL,
+        PRIMARY KEY (config_revision, policy_id, policy_revision),
+        UNIQUE (config_revision, binding_id, binding_revision, binding_digest),
+        FOREIGN KEY (config_revision)
+          REFERENCES module_activation_premises(config_revision) DEFERRABLE INITIALLY DEFERRED,
+        FOREIGN KEY (policy_id, policy_revision, policy_definition_digest)
+          REFERENCES permission_policy_definitions(policy_id, policy_revision, definition_digest),
+        FOREIGN KEY (binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest)
+          REFERENCES permission_policy_backend_bindings(binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest)
+      );
+      CREATE TABLE runtime_authority_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
+        daemon_installation_id TEXT NOT NULL,
+        instance_id TEXT NOT NULL,
+        current_config_revision INTEGER NOT NULL,
+        current_config_digest TEXT NOT NULL,
+        record_jcs BLOB NOT NULL
+      );
+      PRAGMA user_version = 1;
+    `);
+    legacy.prepare("INSERT INTO core_meta VALUES (1, 1, ?, ?)").run(identity.daemonInstallationId, identity.instanceId);
+    for (const entry of revisions) {
+      const origin = originRecord(entry.revision);
+      legacy.prepare(
+        "INSERT INTO installed_component_origins VALUES (?, 1, ?, ?)",
+      ).run(origin.component_id, origin.component_digest, Buffer.from(canonicalBytes(origin)));
+      const candidate = candidateRecord(entry.revision);
+      legacy.prepare(
+        "INSERT INTO linux_service_candidates VALUES (?, 1, ?, ?, 'user', ?, ?)",
+      ).run(
+        origin.component_id,
+        origin.component_digest,
+        candidate.unit_name,
+        candidate.candidate_digest,
+        Buffer.from(canonicalBytes(candidate)),
+      );
+      const definition = definitionRecord(entry.revision);
+      legacy.prepare(
+        "INSERT INTO permission_policy_definitions VALUES (?, 1, ?, ?)",
+      ).run(
+        definition.policy_id,
+        definition.definition_digest,
+        Buffer.from(canonicalBytes(definition)),
+      );
+      const binding = bindingRecord(entry.revision, String(definition.definition_digest));
+      legacy.prepare(
+        "INSERT INTO permission_policy_backend_bindings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        binding.binding_id,
+        1,
+        binding.binding_digest,
+        binding.policy_id,
+        1,
+        binding.policy_definition_digest,
+        origin.component_id,
+        origin.component_revision,
+        origin.component_digest,
+        Buffer.from(canonicalBytes(binding)),
+      );
+      legacy.prepare(
+        "INSERT INTO config_revision_mappings VALUES (?, ?, ?)",
+      ).run(entry.revision, entry.configDigest, configBytesOf(entry));
+      legacy.prepare(
+        "INSERT INTO module_activation_premises VALUES (?, ?, ?, 1, ?, 'user', ?, ?, ?)",
+      ).run(
+        entry.revision,
+        entry.configDigest,
+        origin.component_id,
+        candidate.unit_name,
+        candidate.candidate_digest,
+        entry.premise.premises_digest,
+        Buffer.from(canonicalBytes(entry.premise)),
+      );
+      legacy.prepare(
+        "INSERT INTO module_activation_premise_policy_selections VALUES (?, ?, 1, ?, ?, 1, ?)",
+      ).run(
+        entry.revision,
+        entry.selection[0].policy_id,
+        entry.selection[0].policy_definition_digest,
+        entry.selection[0].binding_id,
+        entry.selection[0].binding_digest,
+      );
+    }
+    legacy.prepare("INSERT INTO runtime_authority_state VALUES (1, 1, ?, ?, ?, ?, ?)").run(
+      identity.daemonInstallationId,
+      identity.instanceId,
+      latest.revision,
+      latest.configDigest,
+      Buffer.from(legacyState),
+    );
+    legacy.close();
+    // Ordinary open must still refuse the pre-bridge v1 projection.
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+      "STORAGE_MIGRATION_REQUIRED",
+    );
+    // The explicit offline migration must accept the designated pre-bridge
+    // TypeScript v1 projection (mapping rows lacking identity columns) and
+    // rebuild it into the strict v2 identity-bearing schema.
+    RuntimeAuthorityDatabase.migrateV1Authority({ path, identity, lock: new FakeLock() });
+    const migrated = raw(path);
+    const mappingColumns = (migrated.prepare("PRAGMA table_info(config_revision_mappings)").all() as Array<{ name: string }>).map((row) => row.name);
+    expect(mappingColumns).toEqual([
+      "config_revision",
+      "daemon_installation_id",
+      "instance_id",
+      "config_digest",
+      "canonical_bytes",
+    ]);
+    const hostVersion = migrated.prepare("SELECT authority_schema_version FROM host_authority_meta WHERE singleton = 1").get() as { authority_schema_version: number };
+    expect(hostVersion.authority_schema_version).toBe(HOST_AUTHORITY_SCHEMA_VERSION);
+    const mappedRow = migrated.prepare("SELECT daemon_installation_id, instance_id FROM config_revision_mappings WHERE config_revision = 1").get() as { daemon_installation_id: string; instance_id: string };
+    expect(mappedRow.daemon_installation_id).toBe(identity.daemonInstallationId);
+    expect(mappedRow.instance_id).toBe(identity.instanceId);
+    migrated.close();
+    // Ordinary open now succeeds after the explicit migration.
+    const reopened = RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() });
+    expect(reopened.readCurrentConfig()!.config_revision).toBe(2);
+    reopened.close();
+  });
+  it("rejects oversized and short service admissions before mapping writes", () => {
+    const dir = scratch();
+    const path = join(dir, "bounded.sqlite3");
+    const candidateOverride = candidateRecordFor() as unknown as Record<string, unknown>;
+    candidateOverride.unit_name = "a.servic";
+    candidateOverride.candidate_digest = selfDigest(candidateOverride, "candidate_digest");
+    const db = openDatabase(dir, "bounded.sqlite3");
+    const fixture = candidate(1, "bounded", true, {
+      candidateOverride: candidateOverride as unknown as LinuxServiceCandidate,
+    });
+    expectAuthorityError(() => install(db, fixture), "MODULE_ACTIVATION_PREMISES_INVALID");
+    const oversizedCandidate = candidateRecordFor() as unknown as Record<string, unknown>;
+    oversizedCandidate.unit_name = `${"a".repeat(248)}.service`;
+    oversizedCandidate.candidate_digest = selfDigest(oversizedCandidate, "candidate_digest");
+    const oversizedFixture = candidate(1, "oversized", true, {
+      candidateOverride: oversizedCandidate as unknown as LinuxServiceCandidate,
+    });
+    expectAuthorityError(() => install(db, oversizedFixture), "MODULE_ACTIVATION_PREMISES_INVALID");
+    const inspect = raw(path);
+    expect(inspect.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'config_revision_mappings'").get()).toEqual({ count: 0 });
+    inspect.close();
+    db.close();
+  });
+
+  it("rejects tampered historical mapping identity and missing unused tables on reopen", () => {
+    const dir = scratch();
+    const path = join(dir, "historical.sqlite3");
+    const db = openDatabase(dir, "historical.sqlite3");
+    install(db, candidate(1, "A", false));
+    install(db, candidate(2, "B", false));
+    db.close();
+    const inspect = raw(path);
+    inspect.prepare("UPDATE config_revision_mappings SET instance_id = ? WHERE config_revision = 1").run("wrong-instance");
+    inspect.close();
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+      "STORAGE_CORRUPT",
+    );
+    const repair = raw(path);
+    repair.prepare("UPDATE config_revision_mappings SET instance_id = ? WHERE config_revision = 1").run(identity.instanceId);
+    repair.prepare("ALTER TABLE linux_service_candidates RENAME TO linux_service_candidates_tampered").run();
+    repair.close();
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+      "STORAGE_CORRUPT",
+    );
+  });
+  it("fails closed on hostile v2 triggers, non-normative indexes, and foreign-key violations", () => {
+    for (const [name, tamper] of [
+      ["trigger", (database: Database.Database) => database.exec(
+        "CREATE TRIGGER hostile_authority AFTER INSERT ON config_revision_mappings BEGIN SELECT 1; END",
+      )],
+      ["index", (database: Database.Database) => database.exec(
+        "CREATE INDEX hostile_authority_index ON config_revision_mappings(config_digest)",
+      )],
+      ["foreign-key", (database: Database.Database) => {
+        database.pragma("foreign_keys = OFF");
+        database.prepare(
+          "INSERT INTO module_activation_premise_policy_selections (config_revision, policy_id, policy_revision, policy_definition_digest, binding_id, binding_revision, binding_digest) VALUES (999, 'org.dolly.policy.missing', 1, ?, 'org.dolly.binding.missing', 1, ?)",
+        ).run(`sha256:${"1".repeat(64)}`, `sha256:${"2".repeat(64)}`);
+      }],
+    ] as const) {
+      const dir = scratch();
+      const path = join(dir, `${name}.sqlite3`);
+      const db = openDatabase(dir, `${name}.sqlite3`);
+      install(db, candidate(1, name, false));
+      db.close();
+      const inspect = raw(path);
+      tamper(inspect);
+      inspect.close();
+      expectAuthorityError(
+        () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+        "STORAGE_CORRUPT",
+      );
+    }
+  });
+
+  it("verifies unused historical selection rows against their premise projections", () => {
+    const dir = scratch();
+    const path = join(dir, "historical-selection.sqlite3");
+    const db = openDatabase(dir, "historical-selection.sqlite3");
+    install(db, candidate(1, "A", true));
+    install(db, candidate(2, "B", true));
+    db.close();
+    const inspect = raw(path);
+    inspect.prepare(
+      "UPDATE module_activation_premise_policy_selections SET binding_digest = ? WHERE config_revision = 1",
+    ).run(`sha256:${"3".repeat(64)}`);
+    inspect.close();
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+      "STORAGE_CORRUPT",
+    );
+  });
+  it("loads the explicit validator-parity rejection vector", () => {
+    const vector = JSON.parse(readFileSync(
+      join(import.meta.dirname, "../../../dolly-spec/test-vectors/core/TST-AUTH-008-validator-parity.json"),
+      "utf8",
+    )) as { stimulus: { rejection_cases: readonly { name: string }[] } };
+    expect(vector.stimulus.rejection_cases).toHaveLength(16);
+    expect(new Set(vector.stimulus.rejection_cases.map((entry) => entry.name)).size).toBe(16);
+  });
+  it("executes every TST-AUTH-008 rejection stimulus", () => {
+    const vector = JSON.parse(readFileSync(
+      join(import.meta.dirname, "../../../dolly-spec/test-vectors/core/TST-AUTH-008-validator-parity.json"),
+      "utf8",
+    )) as { stimulus: { rejection_cases: readonly { name: string; value?: string; length?: number; field?: string; order?: string; property_count?: number }[] } };
+    const names = new Set(vector.stimulus.rejection_cases.map((entry) => entry.name));
+    expect(names.size).toBe(16);
+
+    const twoPolicyFixture = (field: "definitions" | "bindings" | "selections"): CandidateFixture => {
+      const first = definitionRecordFor("a-policy");
+      const second = definitionRecordFor("b-policy");
+      const firstBinding = bindingRecordFor(first, undefined, "a-binding");
+      const secondBinding = bindingRecordFor(second, undefined, "b-binding");
+      const selections = [
+        selectionOf(first, firstBinding),
+        selectionOf(second, secondBinding),
+      ];
+      const definitions = [first, second];
+      const bindings = [firstBinding, secondBinding];
+      if (field === "definitions") definitions.reverse();
+      if (field === "bindings") bindings.reverse();
+      if (field === "selections") selections.reverse();
+      const resolved = {
+        runtime_config: { value: "vector" },
+        permission_policy_selections: selections,
+        service_candidate: { ...candidateRecordFor() },
+      };
+      const bytes = Buffer.from(canonicalBytes(resolved));
+      const digest = digestOfBytes(bytes);
+      const premiseRecord: Record<string, unknown> = {
+        schema: "dolly.module-activation-premises/v1",
+        daemon_installation_id: identity.daemonInstallationId,
+        instance_id: identity.instanceId,
+        config_revision: 1,
+        config_digest: digest,
+        permission_policy_definitions: definitions,
+        permission_policy_backend_bindings: bindings,
+        service_candidate: { ...candidateRecordFor() },
+        premises_digest: "",
+      };
+      premiseRecord.premises_digest = selfDigest(premiseRecord, "premises_digest");
+      return { bytes, digest, premise: premiseRecord as unknown as ModuleActivationPremises };
+    };
+
+    for (const rejection of vector.stimulus.rejection_cases) {
+      const run = (): void => {
+        if (rejection.name === "uppercase_uuid_v7" || rejection.name === "digit_first_stable_id" || rejection.name === "uppercase_stable_id" || rejection.name === "oversized_stable_id") {
+          const badIdentity = rejection.name === "uppercase_uuid_v7"
+            ? { daemonInstallationId: rejection.value!, instanceId: identity.instanceId }
+            : {
+                daemonInstallationId: identity.daemonInstallationId,
+                instanceId: rejection.name === "oversized_stable_id" ? "a".repeat(rejection.length!) : rejection.value!,
+              };
+          expect(() => RuntimeAuthorityDatabase.open({
+            path: join(scratch(), `${rejection.name}.sqlite3`),
+            identity: badIdentity,
+            lock: new FakeLock(),
+          })).toThrow(RuntimeAuthorityDatabaseError);
+          return;
+        }
+        const dir = scratch();
+        const db = openDatabase(dir, `${rejection.name}.sqlite3`);
+        let fixture: CandidateFixture;
+        if (rejection.name === "digit_first_qualified_name" || rejection.name === "uppercase_qualified_name" || rejection.name === "oversized_qualified_name") {
+          const origin = { ...serviceOrigin(), component_id: rejection.name === "oversized_qualified_name" ? "a".repeat(rejection.length!) : rejection.value! };
+          fixture = candidate(1, rejection.name, true, { candidateOverride: candidateRecordFor(origin) });
+        } else if (rejection.name === "short_unit_name" || rejection.name === "oversized_unit_name") {
+          const service = candidateRecordFor() as unknown as Record<string, unknown>;
+          service.unit_name = rejection.name === "oversized_unit_name" ? `${"a".repeat(rejection.length! - 8)}.service` : rejection.value!;
+          service.candidate_digest = selfDigest(service, "candidate_digest");
+          fixture = candidate(1, rejection.name, true, { candidateOverride: service as unknown as LinuxServiceCandidate });
+        } else if (rejection.name === "invalid_uri_reference_escape" || rejection.name === "definition_array" || rejection.name === "definition_max_properties") {
+          const definition = definitionRecordFor();
+          const malformed = { ...definition } as unknown as Record<string, unknown>;
+          if (rejection.name === "invalid_uri_reference_escape") malformed.definition_schema_uri = rejection.value;
+          if (rejection.name === "definition_array") malformed.definition = [];
+          if (rejection.name === "definition_max_properties") malformed.definition = Object.fromEntries(
+            Array.from({ length: rejection.property_count! }, (_, index) => [`property${index}`, true]),
+          );
+          fixture = candidate(1, rejection.name, true, { definitions: [malformed as unknown as PermissionPolicyDefinition] });
+        } else if (rejection.name === "unsorted_policy_definitions") {
+          fixture = twoPolicyFixture("definitions");
+        } else if (rejection.name === "unsorted_policy_bindings") {
+          fixture = twoPolicyFixture("bindings");
+        } else if (rejection.name === "unsorted_policy_selections") {
+          fixture = twoPolicyFixture("selections");
+        } else if (rejection.name === "oversized_canonical_record") {
+          const bytes = Buffer.alloc(rejection.length!);
+          fixture = { bytes, digest: digestOfBytes(bytes), premise: null };
+        } else {
+          throw new Error(`unhandled validator vector ${rejection.name}`);
+        }
+        expect(() => install(db, fixture)).toThrow(RuntimeAuthorityDatabaseError);
+        db.close();
+      };
+      expect(run).not.toThrow();
+    }
+  });
+  it("rejects cross-reference, quoted, and schema-qualified hostile views with parity", () => {
+    const stimuli: readonly [string, string][] = [
+      ["plain-cross-reference",
+        "CREATE VIEW unrelated_helper AS SELECT 1 AS x WHERE EXISTS (SELECT 1 FROM config_revision_mappings)"],
+      ["quoted-identifier",
+        `CREATE VIEW unrelated_helper AS SELECT 1 AS x FROM unrelated_source WHERE y IN
+           (SELECT "config_revision" FROM "config_revision_mappings")`],
+      ["bracket-identifier",
+        "CREATE VIEW unrelated_helper AS SELECT * FROM unrelated_source JOIN [config_revision_mappings] ON 1 = 1"],
+      ["schema-qualified",
+        "CREATE VIEW unrelated_helper AS SELECT * FROM main.config_revision_mappings"],
+      ["backtick-identifier",
+        "CREATE TABLE unrelated_source (id INTEGER);" +
+        "CREATE TRIGGER unrelated_trigger AFTER INSERT ON unrelated_source BEGIN" +
+        " SELECT COUNT(*) FROM `runtime_authority_state`; END"],
+    ];
+    for (const [name, sql] of stimuli) {
+      const dir = scratch();
+      const path = join(dir, `${name}.sqlite3`);
+      const db = openDatabase(dir, `${name}.sqlite3`);
+      install(db, candidate(1, name, false));
+      db.close();
+      const inspect = raw(path);
+      inspect.exec(sql);
+      inspect.close();
+      expectAuthorityError(
+        () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+        "STORAGE_CORRUPT",
+      );
+    }
+  });
+
+  it("rejects uppercase and oversized authority identities", () => {
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({
+        path: join(scratch(), "identity.sqlite3"),
+        identity: {
+          daemonInstallationId: identity.daemonInstallationId.toUpperCase(),
+          instanceId: "main",
+        },
+        lock: new FakeLock(),
+      }),
+      "AUTHORITY_DATABASE_MALFORMED_RECORD",
+    );
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({
+        path: join(scratch(), "identity-oversized.sqlite3"),
+        identity: { daemonInstallationId: identity.daemonInstallationId, instanceId: "a".repeat(64) },
+        lock: new FakeLock(),
+      }),
+      "AUTHORITY_DATABASE_MALFORMED_RECORD",
+    );
+  });
+});
+
 
 
 describe("TST-AUTH-005: reopen identity, digest and legacy-JSON abstention", () => {

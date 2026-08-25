@@ -92,7 +92,7 @@ Physical normalization MAY differ, but a conforming database MUST enforce the eq
 | `core_journal` | unique `journal_seq` | replay and audit events |
 
 
-### 3.1 Runtime authority database schema version 1
+### 3.1 Runtime authority database schema version 1 and Host projection version 2
 
 The **Runtime authority database** is the one SQLite database whose committed
 rows decide current Runtime configuration and Core state. TypeScript and Rust
@@ -102,28 +102,45 @@ second authority. The Tool call ledger, implemented by `ToolCallLedger` in
 components that use that identifier, remains the `tool_call_ledger` logical
 table in this database.
 
+The logical record discriminator remains `runtime-authority-record/v1`
+(`dolly.runtime-authority-state/v1` for the state record). It is distinct from
+the physical Host authority projection. `PRAGMA user_version = 1` identifies
+the Core database layout; `host_authority_meta.authority_schema_version = 2`
+identifies the Host authority projection. The physical v2 gate MUST include
+`host_authority_meta`, identity-bearing config parent mappings, all parent
+tables below, and `controller_generation_id` in both `core_meta` and
+`runtime_authority_state`. The two identity columns and generation MUST agree
+with the caller-held controller lock.
+
 `REQ-AUTH-001` — The database identity is the tuple
-`(daemon_installation_id, instance_id)` stored in `core_meta` and repeated in
-the closed `dolly.runtime-authority-state/v1` record. The requested tuple, both
-stored copies, and the controller-lock owner MUST agree before a writable
-transaction. A configured filesystem path only locates candidate bytes. A path,
-file name, symbolic link, environment value, command-line value, current
-working directory, or equal copied database never proves instance ownership.
-Moving the same database does not change its identity; changing either identity
-member is an explicit offline restore/migration, never a path edit. All aliases
-for one database MUST resolve to the same controller-lock domain, and a copied
-database cannot be opened as a second writer under the original identity.
+`(daemon_installation_id, instance_id)` stored in `core_meta`, repeated in
+`config_revision_mappings` and the closed `dolly.runtime-authority-state/v1`
+record. The requested tuple, all stored copies, and the controller-lock owner
+MUST agree before a writable transaction. A configured filesystem path only
+locates candidate bytes. A path, file name, symbolic link, environment value,
+command-line value, current working directory, or equal copied database never
+proves instance ownership. Moving the same database does not change its
+identity; changing either identity member is an explicit offline
+restore/migration, never a path edit. All aliases for one database MUST resolve
+to the same controller-lock domain, and a copied database cannot be opened as a
+second writer under the original identity.
 
 Every logical record named below MUST validate against its definition in
 [`runtime-authority-record.schema.json`](../../../schemas/runtime-authority-record.schema.json)
 before insertion and after loading. Indexed columns are projections of the
 stored canonical JavaScript Object Notation (JSON) bytes and MUST compare equal
-to those bytes. The minimum relational constraints are:
+to those bytes. Implementations MUST parse using the shared depth/size limits,
+re-encode canonical bytes, compare bytes exactly, and recompute every digest
+from those canonical bytes; a raw hash of non-canonical bytes is insufficient.
+Missing, malformed, unknown-schema, non-canonical, identity-mismatched,
+digest-mismatched, foreign-key-invalid, and generation-mismatched reachable
+rows MUST fail closed as corruption. The minimum relational constraints are:
 
 | Table | Mandatory identity, digest, and relationship constraints |
 | --- | --- |
-| `runtime_authority_state` | singleton `1`; `authority_schema_version = 1`; installation/instance identity equals `core_meta`; `(current_config_revision, current_config_digest)` references `config_revision_mappings` |
-| `config_revision_mappings` | primary key `config_revision` in `1..9007199254740991`; stores exact canonical resolved-config JCS bytes and `config_digest = sha256(bytes)`; composite unique key `(config_revision, config_digest)` for foreign keys |
+| `host_authority_meta` | singleton `1`; `authority_schema_version = 2`; ordinary open MUST reject absent, malformed, or downgraded rows |
+| `runtime_authority_state` | singleton `1`; physical authority schema `2`; installation/instance identity equals `core_meta`; controller generation equals `core_meta`; `(current_config_revision, current_config_digest)` references `config_revision_mappings` |
+| `config_revision_mappings` | identity-bearing parent row `(daemon_installation_id, instance_id, config_revision)`; primary key `config_revision` in `1..9007199254740991`; stores exact canonical resolved-config JCS bytes and `config_digest = sha256(canonical_bytes)`; composite unique key `(config_revision, config_digest)` for foreign keys |
 | `installed_component_origins` | primary key `(component_id, component_revision)`; stores exact component digest and closed origin record; composite unique key including `component_digest` for foreign keys |
 | `permission_policy_definitions` | primary key `(policy_id, policy_revision)`; stores closed definition bytes and verified `definition_digest`; composite unique key including that digest |
 | `permission_policy_backend_bindings` | primary key `(binding_id, binding_revision)`; exact definition triple foreign key; exact installed-component-origin triple foreign key; closed binding bytes and verified `binding_digest`; composite unique key containing the binding identity, digest, and definition triple |
@@ -200,15 +217,27 @@ required by the configuration contract, but never resolved secret values.
 ### 3.2 Reopen and legacy JSON migration
 
 `REQ-AUTH-004` — Every reopen under the controller lock MUST verify the SQLite
-build attestation, required PRAGMAs, `user_version`, `quick_check`, foreign-key
-check, `core_meta`/authority-state identity agreement, current-pointer foreign
-key, canonical current bytes/digest, every reachable prerequisite digest, and
-premise cardinality before recovery or Ready. A stale pointer, unknown schema
-version, same revision with different bytes, digest mismatch, missing row,
-cross-origin foreign key, or candidate record from another installation is
-`STORAGE_CORRUPT` or a more specific fail-closed activation error. Startup does
-not repair it from a file path, legacy JSON, log, cache, process record, Ready
-response, result, or acknowledgement.
+build attestation, required PRAGMAs, `user_version`, `host_authority_meta`,
+`quick_check`, foreign-key check, `core_meta`/authority-state identity and
+controller-generation agreement, current-pointer foreign key, exact canonical
+current bytes/digest, every reachable prerequisite digest, and premise
+cardinality before recovery or Ready. A stale pointer, absent or downgraded
+physical host metadata, unknown schema version, same revision with different
+bytes, non-canonical bytes, digest mismatch, missing row, cross-origin foreign
+key, or candidate record from another installation is `STORAGE_CORRUPT` or a
+more specific fail-closed activation error. Startup does not repair it from a
+file path, legacy JSON, log, cache, process record, Ready response, result, or
+acknowledgement.
+
+The pre-bridge TypeScript v1 physical shape (Core `core_meta` carrying
+`authority_schema_version`, no `host_authority_meta`, no controller generation,
+and mapping rows without the identity pair) is accepted only by the explicit
+offline v1-to-v2 migration. That migration validates the complete old current
+mapping and premise, creates identity-bearing parent columns and the v1
+migration marker, rewrites the state record with the live controller
+generation, and commits schema/data/version together. Ordinary open MUST
+return `STORAGE_MIGRATION_REQUIRED` and MUST NOT repair, downgrade, or accept a
+parallel `config_revisions` table.
 
 `REQ-AUTH-005` — Import from a legacy JSON configuration is an offline,
 explicitly expected migration under the same instance controller lock. With no

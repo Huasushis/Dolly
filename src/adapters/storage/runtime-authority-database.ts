@@ -1,17 +1,19 @@
 /**
  * H1 Runtime SQLite authority database repository.
  *
- * Owns the durable "Runtime authority database schema version 1" defined in
- * `dolly-spec/docs/spec/core/06-storage-and-recovery.md` section 3.1 and the
- * closed records in `dolly-spec/schemas/runtime-authority-record.schema.json`
- * (spec snapshot 41d6476). It opens the shared database through the H0
- * Host-internal native SQLite loader/attestation adapter, so every open first
- * attests the pinned SQLite build and the durable PRAGMA profile before any
- * repository method runs.
+ * Owns the durable Runtime authority record contract. The logical records
+ * retain the `.../v1` discriminators from ADR 0015; the Host-owned physical
+ * authority projection is schema version 2 and is shared byte-for-byte with
+ * Rust (`host_authority_meta`, identity-bearing parent mappings, and the
+ * controller generation projection).
+ *
+ * It opens the shared database through the H0 Host-internal native SQLite
+ * loader/attestation adapter, so every open first attests the pinned SQLite
+ * build and the durable PRAGMA profile before any repository method runs.
  *
  * Scope boundary: this is an internal storage repository. It does NOT wire the
- * database into the daemon, bootstrap, installed-Linux activation, live binding
- * resolver, or any product composition, and it does not touch
+ * database into the daemon, bootstrap, installed-Linux activation, live
+ * binding resolver, or any product composition, and it does not touch
  * `InstanceConfigStore` - legacy JSON import commits SQLite as the sole
  * authority and never dual-writes or updates the JSON instance store.
  *
@@ -35,6 +37,7 @@ import {
   assertCanonicalJsonValue,
   canonicalBytes,
   canonicalJsonDigest,
+  DEFAULT_MAX_JSON_BYTES,
   parseCanonicalJsonBytes,
   type JsonValue,
 } from "../../schema-bundle/index.js";
@@ -46,20 +49,24 @@ import {
   FileCoreHistoryStore,
   type FileCoreHistoryOptions,
 } from "../../core/file-core-history.js";
-
 /** Largest revision a conforming database may assign (REQ-AUTH-002 step 4). */
 export const MAX_CONFIG_REVISION = 9_007_199_254_740_991;
 
-/** `PRAGMA user_version` for the supported Runtime authority schema version 1. */
+/** `PRAGMA user_version` for the shared Core database schema. */
 export const RUNTIME_AUTHORITY_SCHEMA_VERSION = 1;
+
+/** Physical Host authority projection version (logical records remain `/v1`). */
+export const HOST_AUTHORITY_SCHEMA_VERSION = 2;
+
+/** Logical closed-record discriminator version. */
+export const RUNTIME_AUTHORITY_RECORD_SCHEMA_VERSION = 1;
 
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const UUIDV7_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const STABLE_ID_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
 const QUALIFIED_NAME_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*)+$/u;
 const UNIT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,246}\.service$/u;
-const URI_REFERENCE_PATTERN = /^.{1,512}$/us;
-
+const URI_REFERENCE_PATTERN = /^[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+$/u;
 export type RuntimeAuthorityDatabaseErrorCode =
   | "CONTROLLER_LOCK_NOT_HELD"
   | "STORAGE_INSTANCE_LOCKED"
@@ -104,6 +111,12 @@ export interface RuntimeAuthorityIdentity {
 /** Caller-held controller-lock handle the repository asserts before writes. */
 export interface RuntimeAuthorityLockHandle {
   readonly held: boolean;
+  /**
+   * The concrete controller exposes this under `info`; test doubles may expose
+   * the direct projection. One of the two is required for a committed write.
+   */
+  readonly controllerGenerationId?: string;
+  readonly info?: { readonly controllerGenerationId: string };
   assertHeld(): void;
 }
 
@@ -183,6 +196,7 @@ export interface ModuleActivationPremises {
 export interface CurrentAuthoritySnapshot {
   readonly config_revision: number;
   readonly config_digest: string;
+  readonly controller_generation_id: string;
   /** Exact canonical resolved-config bytes of the current revision. */
   readonly canonicalConfigBytes: Uint8Array;
   readonly canonicalConfig: JsonValue;
@@ -306,6 +320,55 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
   return true;
 }
 
+function isStableId(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 63 && STABLE_ID_PATTERN.test(value);
+}
+
+function isQualifiedName(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 3 &&
+    value.length <= 255 &&
+    QUALIFIED_NAME_PATTERN.test(value) &&
+    value.split(".").every((part) => part.length <= 63)
+  );
+}
+
+function isUriReference(value: unknown): value is string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 512 || !URI_REFERENCE_PATTERN.test(value)) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] === "%") {
+      const escape = value.slice(index + 1, index + 3);
+      if (!/^[0-9A-Fa-f]{2}$/u.test(escape)) return false;
+      index += 2;
+    }
+  }
+  return true;
+}
+
+function assertSortedUniquePolicyRevision(
+  values: readonly { readonly policy_id: string; readonly policy_revision: number }[],
+  label: string,
+): void {
+  let previous: { readonly policy_id: string; readonly policy_revision: number } | undefined;
+  const seen = new Set<string>();
+  for (const value of values) {
+    const key = `${value.policy_id}\u0000${String(value.policy_revision)}`;
+    if (
+      seen.has(key) ||
+      (previous !== undefined &&
+        (previous.policy_id > value.policy_id ||
+          (previous.policy_id === value.policy_id && previous.policy_revision >= value.policy_revision)))
+    ) {
+      throw malformed(`${label} must be sorted and unique by policy_id, policy_revision`);
+    }
+    seen.add(key);
+    previous = value;
+  }
+}
+
 /**
  * Self-referential digest of a closed record: the record serialized with one
  * named field removed, then hashed, exactly as the digest `comment` for
@@ -315,7 +378,11 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
 function recordDigestWithoutField(record: Record<string, unknown>, field: string): string {
   const { [field]: _digest, ...rest } = record;
   assertCanonicalJsonValue(rest as unknown as JsonValue);
-  return sha256DigestOfBytes(canonicalBytes(rest as unknown as JsonValue));
+  const bytes = canonicalBytes(rest as unknown as JsonValue);
+  if (bytes.byteLength > DEFAULT_MAX_JSON_BYTES) {
+    throw malformed(`${field} record exceeds the ${DEFAULT_MAX_JSON_BYTES}-byte JSON limit`);
+  }
+  return sha256DigestOfBytes(bytes);
 }
 
 function malformed(label: string): RuntimeAuthorityDatabaseError {
@@ -330,15 +397,27 @@ function assertClosedRecord(value: unknown, keys: readonly string[], label: stri
 }
 
 function validateIdentity(identity: RuntimeAuthorityIdentity): void {
-  if (!identity || !UUIDV7_PATTERN.test(identity.daemonInstallationId)) throw malformed("identity.daemonInstallationId");
-  if (!STABLE_ID_PATTERN.test(identity.instanceId)) throw malformed("identity.instanceId");
+  if (!identity || typeof identity !== "object" || !UUIDV7_PATTERN.test(identity.daemonInstallationId)) throw malformed("identity.daemonInstallationId");
+  if (!isStableId(identity.instanceId)) throw malformed("identity.instanceId");
+}
+function controllerGenerationFromLock(lock: RuntimeAuthorityLockHandle): string {
+  const direct = lock.controllerGenerationId;
+  const nested = lock.info?.controllerGenerationId;
+  const generation = direct ?? nested;
+  if (typeof generation !== "string" || !UUIDV7_PATTERN.test(generation)) {
+    throw new RuntimeAuthorityDatabaseError(
+      "CONTROLLER_LOCK_NOT_HELD",
+      "The controller lock does not expose a valid live controller generation",
+    );
+  }
+  return generation;
 }
 
 function validateOrigin(value: unknown, label: string): InstalledComponentOrigin {
   assertClosedRecord(value, ["schema", "kind", "component_id", "component_revision", "component_digest"], label);
   const v = value as Record<string, unknown>;
   if (v.schema !== "dolly.installed-component-origin/v1" || v.kind !== "installed_product_component") throw malformed(`${label}.schema`);
-  if (typeof v.component_id !== "string" || !QUALIFIED_NAME_PATTERN.test(v.component_id)) throw malformed(`${label}.component_id`);
+  if (!isQualifiedName(v.component_id)) throw malformed(`${label}.component_id`);
   if (!isIntegralInRange(v.component_revision, 1, MAX_CONFIG_REVISION)) throw malformed(`${label}.component_revision`);
   if (!isSha256(v.component_digest)) throw malformed(`${label}.component_digest`);
   return v as unknown as InstalledComponentOrigin;
@@ -348,7 +427,7 @@ function validatePolicyOrigin(value: unknown, label: string): PolicyDefinitionOr
   assertClosedRecord(value, ["schema", "kind", "source_id", "source_revision", "source_digest"], label);
   const v = value as Record<string, unknown>;
   if (v.schema !== "dolly.policy-definition-origin/v1" || v.kind !== "operator_approved_policy") throw malformed(`${label}.schema`);
-  if (typeof v.source_id !== "string" || !QUALIFIED_NAME_PATTERN.test(v.source_id)) throw malformed(`${label}.source_id`);
+  if (!isQualifiedName(v.source_id)) throw malformed(`${label}.source_id`);
   if (!isIntegralInRange(v.source_revision, 1, MAX_CONFIG_REVISION)) throw malformed(`${label}.source_revision`);
   if (!isSha256(v.source_digest)) throw malformed(`${label}.source_digest`);
   return v as unknown as PolicyDefinitionOrigin;
@@ -362,10 +441,15 @@ function validateDefinition(value: unknown, label: string): void {
   );
   const v = value as Record<string, unknown>;
   if (v.schema !== "dolly.permission-policy-definition/v1") throw malformed(`${label}.schema`);
-  if (typeof v.policy_id !== "string" || !STABLE_ID_PATTERN.test(v.policy_id)) throw malformed(`${label}.policy_id`);
+  if (!isStableId(v.policy_id)) throw malformed(`${label}.policy_id`);
   if (!isIntegralInRange(v.policy_revision, 1, MAX_CONFIG_REVISION)) throw malformed(`${label}.policy_revision`);
-  if (typeof v.definition_schema_uri !== "string" || !URI_REFERENCE_PATTERN.test(v.definition_schema_uri)) throw malformed(`${label}.definition_schema_uri`);
+  if (!isUriReference(v.definition_schema_uri)) throw malformed(`${label}.definition_schema_uri`);
   if (!isSha256(v.definition_schema_digest)) throw malformed(`${label}.definition_schema_digest`);
+  if (v.definition === null || typeof v.definition !== "object" || Array.isArray(v.definition)) {
+    throw malformed(`${label}.definition`);
+  }
+  if (Object.keys(v.definition).length > 256) throw malformed(`${label}.definition`);
+  assertCanonicalJsonValue(v.definition);
   validatePolicyOrigin(v.origin, `${label}.origin`);
   const computed = recordDigestWithoutField(v, "definition_digest");
   if (v.definition_digest !== computed) {
@@ -381,9 +465,9 @@ function validateBinding(value: unknown, label: string): void {
   );
   const v = value as Record<string, unknown>;
   if (v.schema !== "dolly.permission-policy-backend-binding/v1") throw malformed(`${label}.schema`);
-  if (typeof v.binding_id !== "string" || !STABLE_ID_PATTERN.test(v.binding_id)) throw malformed(`${label}.binding_id`);
+  if (!isStableId(v.binding_id)) throw malformed(`${label}.binding_id`);
   if (!isIntegralInRange(v.binding_revision, 1, MAX_CONFIG_REVISION)) throw malformed(`${label}.binding_revision`);
-  if (typeof v.policy_id !== "string" || !STABLE_ID_PATTERN.test(v.policy_id)) throw malformed(`${label}.policy_id`);
+  if (!isStableId(v.policy_id)) throw malformed(`${label}.policy_id`);
   if (!isIntegralInRange(v.policy_revision, 1, MAX_CONFIG_REVISION)) throw malformed(`${label}.policy_revision`);
   if (!isSha256(v.policy_definition_digest) || !isSha256(v.binding_digest)) throw malformed(`${label}.digest`);
   validateOrigin(v.origin, `${label}.origin`);
@@ -417,7 +501,7 @@ function validatePremise(value: unknown, label: string): ModuleActivationPremise
   );
   const v = value as Record<string, unknown>;
   if (v.schema !== "dolly.module-activation-premises/v1") throw malformed(`${label}.schema`);
-  if (!UUIDV7_PATTERN.test(String(v.daemon_installation_id)) || !STABLE_ID_PATTERN.test(String(v.instance_id))) throw malformed(`${label}.identity`);
+  if (!UUIDV7_PATTERN.test(String(v.daemon_installation_id)) || !isStableId(v.instance_id)) throw malformed(`${label}.identity`);
   if (!isIntegralInRange(v.config_revision, 1, MAX_CONFIG_REVISION) || !isSha256(String(v.config_digest))) throw malformed(`${label}.revision/digest`);
   if (!Array.isArray(v.permission_policy_definitions) || v.permission_policy_definitions.length > 1024) throw malformed(`${label}.permission_policy_definitions`);
   if (!Array.isArray(v.permission_policy_backend_bindings) || v.permission_policy_backend_bindings.length > 1024) throw malformed(`${label}.permission_policy_backend_bindings`);
@@ -427,6 +511,8 @@ function validatePremise(value: unknown, label: string): ModuleActivationPremise
   for (let index = 0; index < v.permission_policy_backend_bindings.length; index += 1) {
     validateBinding(v.permission_policy_backend_bindings[index], `${label}.permission_policy_backend_bindings[${index}]`);
   }
+  assertSortedUniquePolicyRevision(v.permission_policy_definitions as PermissionPolicyDefinition[], `${label}.permission_policy_definitions`);
+  assertSortedUniquePolicyRevision(v.permission_policy_backend_bindings as PermissionPolicyBackendBinding[], `${label}.permission_policy_backend_bindings`);
   validateServiceCandidate(v.service_candidate, `${label}.service_candidate`);
   const computed = recordDigestWithoutField(v, "premises_digest");
   if (v.premises_digest !== computed) {
@@ -451,13 +537,14 @@ function validateResolvedConfiguration(value: unknown, label: string): ResolvedC
   for (let index = 0; index < v.permission_policy_selections.length; index += 1) {
     const s = v.permission_policy_selections[index] as Record<string, unknown>;
     assertClosedRecord(s, ["policy_id", "policy_revision", "policy_definition_digest", "binding_id", "binding_revision", "binding_digest"], `${label}.permission_policy_selections[${index}]`);
-    if (!STABLE_ID_PATTERN.test(String(s.policy_id)) || !isIntegralInRange(s.policy_revision, 1, MAX_CONFIG_REVISION) || !isSha256(String(s.policy_definition_digest))) {
+    if (!isStableId(s.policy_id) || !isIntegralInRange(s.policy_revision, 1, MAX_CONFIG_REVISION) || !isSha256(String(s.policy_definition_digest))) {
       throw malformed(`${label}.permission_policy_selections[${index}]`);
     }
-    if (!STABLE_ID_PATTERN.test(String(s.binding_id)) || !isIntegralInRange(s.binding_revision, 1, MAX_CONFIG_REVISION) || !isSha256(String(s.binding_digest))) {
+    if (!isStableId(s.binding_id) || !isIntegralInRange(s.binding_revision, 1, MAX_CONFIG_REVISION) || !isSha256(String(s.binding_digest))) {
       throw malformed(`${label}.permission_policy_selections[${index}]`);
     }
   }
+  assertSortedUniquePolicyRevision(v.permission_policy_selections as PermissionPolicySelection[], `${label}.permission_policy_selections`);
   if (v.service_candidate !== null) {
     validateServiceCandidate(v.service_candidate, `${label}.service_candidate`);
   }
@@ -495,18 +582,35 @@ function originKey(origin: InstalledComponentOrigin): string {
 }
 
 // ---------------------------------------------------------------------------
-// Schema version 1 (physical normalization of spec section 3.1)
+// Physical Host schema version 2. Logical record discriminators remain /v1.
 // ---------------------------------------------------------------------------
 
 export const RUNTIME_AUTHORITY_SCHEMA_SQL = `
 CREATE TABLE core_meta (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
-  daemon_installation_id TEXT NOT NULL,
-  instance_id TEXT NOT NULL
+  schema_version INTEGER NOT NULL,
+  daemon_installation_id TEXT,
+  instance_id TEXT,
+  controller_generation_id TEXT,
+  clean_shutdown INTEGER NOT NULL CHECK (clean_shutdown IN (0, 1)),
+  sqlite_version_number INTEGER NOT NULL,
+  sqlite_source_id TEXT NOT NULL,
+  sqlite_artifact_digest TEXT NOT NULL
 );
+CREATE TABLE commit_sequence (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  next_value INTEGER NOT NULL
+);
+CREATE TABLE host_authority_meta (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = ${HOST_AUTHORITY_SCHEMA_VERSION})
+);
+INSERT INTO host_authority_meta (singleton, authority_schema_version)
+  VALUES (1, ${HOST_AUTHORITY_SCHEMA_VERSION});
 CREATE TABLE config_revision_mappings (
   config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND ${MAX_CONFIG_REVISION}),
+  daemon_installation_id TEXT NOT NULL,
+  instance_id TEXT NOT NULL,
   config_digest TEXT NOT NULL,
   canonical_bytes BLOB NOT NULL,
   UNIQUE (config_revision, config_digest)
@@ -598,9 +702,10 @@ CREATE TABLE module_activation_premises (
 );
 CREATE TABLE runtime_authority_state (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
+  authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = ${HOST_AUTHORITY_SCHEMA_VERSION}),
   daemon_installation_id TEXT NOT NULL,
   instance_id TEXT NOT NULL,
+  controller_generation_id TEXT NOT NULL,
   current_config_revision INTEGER NOT NULL CHECK (current_config_revision BETWEEN 1 AND ${MAX_CONFIG_REVISION}),
   current_config_digest TEXT NOT NULL,
   record_jcs BLOB NOT NULL,
@@ -617,16 +722,549 @@ CREATE TABLE core_journal (
 );
 `;
 
-function stateRecord(identity: RuntimeAuthorityIdentity, revision: number, digest: string): JsonValue {
+const AUTHORITY_TABLE_NAMES: readonly string[] = Object.freeze([
+  "host_authority_meta",
+  "config_revision_mappings",
+  "installed_component_origins",
+  "permission_policy_definitions",
+  "permission_policy_backend_bindings",
+  "linux_service_candidates",
+  "module_activation_premises",
+  "module_activation_premise_policy_selections",
+  "runtime_authority_state",
+]);
+
+interface AuthoritySchemaColumn {
+  readonly name: string;
+  readonly type: string;
+  readonly notNull: number;
+  readonly primaryKey: number;
+}
+
+const AUTHORITY_SCHEMA_COLUMNS: Readonly<Record<string, readonly AuthoritySchemaColumn[]>> = Object.freeze({
+  core_meta: [
+    { name: "singleton", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "schema_version", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "daemon_installation_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+    { name: "instance_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+    { name: "controller_generation_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+    { name: "clean_shutdown", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "sqlite_version_number", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "sqlite_source_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "sqlite_artifact_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+  ],
+  commit_sequence: [
+    { name: "singleton", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "next_value", type: "INTEGER", notNull: 1, primaryKey: 0 },
+  ],
+  host_authority_meta: [
+    { name: "singleton", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "authority_schema_version", type: "INTEGER", notNull: 1, primaryKey: 0 },
+  ],
+  config_revision_mappings: [
+    { name: "config_revision", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "daemon_installation_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "instance_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "config_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "canonical_bytes", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  installed_component_origins: [
+    { name: "component_id", type: "TEXT", notNull: 1, primaryKey: 1 },
+    { name: "component_revision", type: "INTEGER", notNull: 1, primaryKey: 2 },
+    { name: "component_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  permission_policy_definitions: [
+    { name: "policy_id", type: "TEXT", notNull: 1, primaryKey: 1 },
+    { name: "policy_revision", type: "INTEGER", notNull: 1, primaryKey: 2 },
+    { name: "definition_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  permission_policy_backend_bindings: [
+    { name: "binding_id", type: "TEXT", notNull: 1, primaryKey: 1 },
+    { name: "binding_revision", type: "INTEGER", notNull: 1, primaryKey: 2 },
+    { name: "binding_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "policy_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "policy_revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "policy_definition_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "origin_component_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "origin_component_revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "origin_component_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  linux_service_candidates: [
+    { name: "origin_component_id", type: "TEXT", notNull: 1, primaryKey: 1 },
+    { name: "origin_component_revision", type: "INTEGER", notNull: 1, primaryKey: 2 },
+    { name: "origin_component_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "unit_name", type: "TEXT", notNull: 1, primaryKey: 3 },
+    { name: "mode", type: "TEXT", notNull: 1, primaryKey: 4 },
+    { name: "candidate_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  module_activation_premises: [
+    { name: "config_revision", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "config_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "service_origin_component_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "service_origin_component_revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "service_unit_name", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "service_mode", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "service_candidate_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "premises_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  module_activation_premise_policy_selections: [
+    { name: "config_revision", type: "INTEGER", notNull: 1, primaryKey: 1 },
+    { name: "policy_id", type: "TEXT", notNull: 1, primaryKey: 2 },
+    { name: "policy_revision", type: "INTEGER", notNull: 1, primaryKey: 3 },
+    { name: "policy_definition_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "binding_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "binding_revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "binding_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+  ],
+  runtime_authority_state: [
+    { name: "singleton", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "authority_schema_version", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "daemon_installation_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "instance_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "controller_generation_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "current_config_revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "current_config_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  core_journal: [
+    { name: "journal_seq", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "event_kind", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "event_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+    { name: "config_revision", type: "INTEGER", notNull: 0, primaryKey: 0 },
+    { name: "config_digest", type: "TEXT", notNull: 0, primaryKey: 0 },
+    { name: "premises_digest", type: "TEXT", notNull: 0, primaryKey: 0 },
+  ],
+});
+
+const AUTHORITY_SCHEMA_CHECKS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  core_meta: ["check (singleton = 1)", "check (clean_shutdown in (0, 1))"],
+  commit_sequence: ["check (singleton = 1)"],
+  host_authority_meta: ["check (singleton = 1)", "check (authority_schema_version = 2)"],
+  config_revision_mappings: [
+    "check (config_revision between 1 and 9007199254740991)",
+    "unique (config_revision, config_digest)",
+  ],
+  installed_component_origins: [
+    "check (component_revision between 1 and 9007199254740991)",
+    "unique (component_id, component_revision, component_digest)",
+  ],
+  permission_policy_definitions: [
+    "check (policy_revision between 1 and 9007199254740991)",
+    "unique (policy_id, policy_revision, definition_digest)",
+  ],
+  permission_policy_backend_bindings: [
+    "check (binding_revision between 1 and 9007199254740991)",
+    "unique (binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest)",
+  ],
+  linux_service_candidates: [
+    "check (origin_component_revision between 1 and 9007199254740991)",
+    "check (mode = 'user')",
+    "unique (origin_component_id, origin_component_revision, unit_name, mode, candidate_digest)",
+  ],
+  module_activation_premises: [
+    "check (config_revision between 1 and 9007199254740991)",
+    "unique (config_revision, config_digest)",
+  ],
+  module_activation_premise_policy_selections: [
+    "check (config_revision between 1 and 9007199254740991)",
+    "unique (config_revision, binding_id, binding_revision, binding_digest)",
+    "deferrable initially deferred",
+  ],
+  runtime_authority_state: [
+    "check (singleton = 1)",
+    "check (authority_schema_version = 2)",
+    "check (current_config_revision between 1 and 9007199254740991)",
+  ],
+});
+
+const AUTHORITY_SCHEMA_FOREIGN_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  permission_policy_backend_bindings: [
+    "0:0:installed_component_origins:origin_component_id:component_id:NO ACTION:NO ACTION:NONE",
+    "0:1:installed_component_origins:origin_component_revision:component_revision:NO ACTION:NO ACTION:NONE",
+    "0:2:installed_component_origins:origin_component_digest:component_digest:NO ACTION:NO ACTION:NONE",
+    "1:0:permission_policy_definitions:policy_id:policy_id:NO ACTION:NO ACTION:NONE",
+    "1:1:permission_policy_definitions:policy_revision:policy_revision:NO ACTION:NO ACTION:NONE",
+    "1:2:permission_policy_definitions:policy_definition_digest:definition_digest:NO ACTION:NO ACTION:NONE",
+  ],
+  linux_service_candidates: [
+    "0:0:installed_component_origins:origin_component_id:component_id:NO ACTION:NO ACTION:NONE",
+    "0:1:installed_component_origins:origin_component_revision:component_revision:NO ACTION:NO ACTION:NONE",
+    "0:2:installed_component_origins:origin_component_digest:component_digest:NO ACTION:NO ACTION:NONE",
+  ],
+  module_activation_premises: [
+    "0:0:linux_service_candidates:service_origin_component_id:origin_component_id:NO ACTION:NO ACTION:NONE",
+    "0:1:linux_service_candidates:service_origin_component_revision:origin_component_revision:NO ACTION:NO ACTION:NONE",
+    "0:2:linux_service_candidates:service_unit_name:unit_name:NO ACTION:NO ACTION:NONE",
+    "0:3:linux_service_candidates:service_mode:mode:NO ACTION:NO ACTION:NONE",
+    "0:4:linux_service_candidates:service_candidate_digest:candidate_digest:NO ACTION:NO ACTION:NONE",
+    "1:0:config_revision_mappings:config_revision:config_revision:NO ACTION:NO ACTION:NONE",
+    "1:1:config_revision_mappings:config_digest:config_digest:NO ACTION:NO ACTION:NONE",
+  ],
+  module_activation_premise_policy_selections: [
+    "0:0:permission_policy_backend_bindings:binding_id:binding_id:NO ACTION:NO ACTION:NONE",
+    "0:1:permission_policy_backend_bindings:binding_revision:binding_revision:NO ACTION:NO ACTION:NONE",
+    "0:2:permission_policy_backend_bindings:binding_digest:binding_digest:NO ACTION:NO ACTION:NONE",
+    "0:3:permission_policy_backend_bindings:policy_id:policy_id:NO ACTION:NO ACTION:NONE",
+    "0:4:permission_policy_backend_bindings:policy_revision:policy_revision:NO ACTION:NO ACTION:NONE",
+    "0:5:permission_policy_backend_bindings:policy_definition_digest:policy_definition_digest:NO ACTION:NO ACTION:NONE",
+    "1:0:permission_policy_definitions:policy_id:policy_id:NO ACTION:NO ACTION:NONE",
+    "1:1:permission_policy_definitions:policy_revision:policy_revision:NO ACTION:NO ACTION:NONE",
+    "1:2:permission_policy_definitions:policy_definition_digest:definition_digest:NO ACTION:NO ACTION:NONE",
+    "2:0:module_activation_premises:config_revision:config_revision:NO ACTION:NO ACTION:NONE",
+  ],
+  runtime_authority_state: [
+    "0:0:config_revision_mappings:current_config_revision:config_revision:NO ACTION:NO ACTION:NONE",
+    "0:1:config_revision_mappings:current_config_digest:config_digest:NO ACTION:NO ACTION:NONE",
+  ],
+});
+
+type AuthorityIndexSpec = readonly [unique: number, origin: string, partial: number, columns: readonly string[]];
+
+const AUTHORITY_SCHEMA_INDEXES: Readonly<Record<string, readonly AuthorityIndexSpec[]>> = Object.freeze({
+  host_authority_meta: [],
+  config_revision_mappings: [[1, "u", 0, ["config_revision", "config_digest"]]],
+  installed_component_origins: [
+    [1, "pk", 0, ["component_id", "component_revision"]],
+    [1, "u", 0, ["component_id", "component_revision", "component_digest"]],
+  ],
+  permission_policy_definitions: [
+    [1, "pk", 0, ["policy_id", "policy_revision"]],
+    [1, "u", 0, ["policy_id", "policy_revision", "definition_digest"]],
+  ],
+  permission_policy_backend_bindings: [
+    [1, "pk", 0, ["binding_id", "binding_revision"]],
+    [1, "u", 0, ["binding_id", "binding_revision", "binding_digest", "policy_id", "policy_revision", "policy_definition_digest"]],
+  ],
+  linux_service_candidates: [
+    [1, "pk", 0, ["origin_component_id", "origin_component_revision", "unit_name", "mode"]],
+    [1, "u", 0, ["origin_component_id", "origin_component_revision", "unit_name", "mode", "candidate_digest"]],
+  ],
+  module_activation_premises: [[1, "u", 0, ["config_revision", "config_digest"]]],
+  module_activation_premise_policy_selections: [
+    [1, "pk", 0, ["config_revision", "policy_id", "policy_revision"]],
+    [1, "u", 0, ["config_revision", "binding_id", "binding_revision", "binding_digest"]],
+  ],
+  runtime_authority_state: [],
+  core_meta: [],
+  commit_sequence: [],
+  core_journal: [],
+});
+
+function sqlTokens(sql: unknown): string[] {
+  const source = String(sql ?? "");
+  const tokens: string[] = [];
+  let index = 0;
+  while (index < source.length) {
+    const character = source[index]!;
+    if (/\s/u.test(character)) {
+      index += 1;
+      continue;
+    }
+    if (character === "-" && source[index + 1] === "-") {
+      index += 2;
+      while (index < source.length && source[index] !== "\n") index += 1;
+      continue;
+    }
+    if (character === "/" && source[index + 1] === "*") {
+      index += 2;
+      while (index + 1 < source.length && !(source[index] === "*" && source[index + 1] === "/")) index += 1;
+      index = Math.min(index + 2, source.length);
+      continue;
+    }
+    if (character === "'" || character === "\"" || character === "`") {
+      const quote = character;
+      const start = index;
+      index += 1;
+      while (index < source.length) {
+        if (source[index] === quote) {
+          if (source[index + 1] === quote) {
+            index += 2;
+            continue;
+          }
+          index += 1;
+          break;
+        }
+        index += 1;
+      }
+      tokens.push(source.slice(start, index).toLowerCase());
+      continue;
+    }
+    if (character === "[") {
+      const start = index;
+      index += 1;
+      while (index < source.length && source[index] !== "]") index += 1;
+      index = Math.min(index + 1, source.length);
+      tokens.push(source.slice(start, index).toLowerCase());
+      continue;
+    }
+    const start = index;
+    while (
+      index < source.length &&
+      !/\s/u.test(source[index]!) &&
+      !/[\(\),=<>+\-*\/;\[\]]/u.test(source[index]!)
+    ) {
+      index += 1;
+    }
+    if (start === index) {
+      tokens.push(source[index]!.toLowerCase());
+      index += 1;
+    } else {
+      tokens.push(source.slice(start, index).toLowerCase());
+    }
+  }
+  return tokens;
+}
+
+function sqlHasTokenSequence(tokens: readonly string[], fragment: string): boolean {
+  const expected = sqlTokens(fragment);
+  return expected.length > 0 && tokens.some((_, index) =>
+    expected.every((token, offset) => tokens[index + offset] === token),
+  );
+}
+
+/**
+ * True when any token, after stripping identifier quoting ("...", `...`,
+ * '...', [...]) and splitting schema-qualified names on '.', names one of the
+ * authority tables.
+ */
+function tokensReferenceAuthorityTable(tokens: readonly string[], authorityTables: readonly string[]): boolean {
+  return tokens.some((token) =>
+    token.split(".").some((part) => {
+      const trimmed = part.startsWith("[") && part.endsWith("]")
+        ? part.slice(1, -1)
+        : part.startsWith('"') && part.endsWith('"')
+          ? part.slice(1, -1)
+          : part.startsWith("`") && part.endsWith("`")
+            ? part.slice(1, -1)
+            : part;
+      return authorityTables.some((table) => table.toLowerCase() === trimmed.toLowerCase());
+    }),
+  );
+}
+
+function verifyAuthorityIndexes(connection: RuntimeSqliteConnection): void {
+  for (const table of Object.keys(AUTHORITY_SCHEMA_COLUMNS)) {
+    const expected = AUTHORITY_SCHEMA_INDEXES[table] ?? [];
+    const actual = connection.prepare(`PRAGMA index_list(${table})`).all();
+    if (actual.length !== expected.length) {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} has a non-canonical index shape`);
+    }
+    const matched = expected.map(() => false);
+    for (const row of actual) {
+      const indexName = String(row.name);
+      const escapedName = indexName.replace(/'/gu, "''");
+      const columns = connection.prepare(`PRAGMA index_xinfo('${escapedName}')`).all()
+        .filter((entry) => Number(entry.key) === 1)
+        .sort((left, right) => Number(left.seqno) - Number(right.seqno));
+      const position = expected.findIndex((spec, index) =>
+        !matched[index] &&
+        Number(row.unique) === spec[0] &&
+        String(row.origin) === spec[1] &&
+        Number(row.partial) === spec[2] &&
+        columns.length === spec[3].length &&
+        columns.every((column, columnIndex) =>
+          String(column.name) === spec[3][columnIndex] &&
+          Number(column.desc) === 0 &&
+          String(column.coll).toUpperCase() === "BINARY",
+        ),
+      );
+      if (position < 0) {
+        throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} has a wrong index shape`);
+      }
+      matched[position] = true;
+    }
+    if (matched.some((value) => !value)) {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} is missing a normative index`);
+    }
+  }
+}
+
+function verifyAuthorityPhysicalSchema(connection: RuntimeSqliteConnection): void {
+  const tableNames = Object.keys(AUTHORITY_SCHEMA_COLUMNS);
+  // Enumerate every persisted trigger and view alongside the authority tables:
+  // a tbl_name filter would hide cross-referencing hostile objects whose own
+  // name is unrelated to any authority table.
+  const rows = connection.prepare(
+    "SELECT type, name, tbl_name, sql FROM sqlite_master " +
+      "WHERE name = 'config_revisions' OR type IN ('trigger', 'view') OR tbl_name IN (" +
+      tableNames.map(() => "?").join(",") +
+      ")",
+  ).all(...tableNames);
+  if (rows.some((row) => row.name === "config_revisions")) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", "parallel config_revisions table is not part of the Host-owned authority schema");
+  }
+  for (const table of tableNames) {
+    const tableRow = rows.find((row) => row.type === "table" && row.name === table);
+    if (!tableRow) throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `required authority table ${table} is missing`);
+    const columns = connection.prepare(`PRAGMA table_info(${table})`).all();
+    const expected = AUTHORITY_SCHEMA_COLUMNS[table]!;
+    if (
+      columns.length !== expected.length ||
+      columns.some((column, index) => {
+        const wanted = expected[index]!;
+        return column.name !== wanted.name ||
+          String(column.type).toUpperCase() !== wanted.type ||
+          Number(column.notnull) !== wanted.notNull ||
+          Number(column.pk) !== wanted.primaryKey;
+      })
+    ) {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} has a non-canonical column shape`);
+    }
+    const sql = sqlTokens(tableRow.sql);
+    for (const fragment of AUTHORITY_SCHEMA_CHECKS[table] ?? []) {
+      if (!sqlHasTokenSequence(sql, fragment)) throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} is missing constraint ${fragment}`);
+    }
+    // Exact normative FK metadata: group id, in-group order, parent table,
+    // columns, and update/delete/match semantics.
+    const foreignKeys = connection.prepare(`PRAGMA foreign_key_list(${table})`).all().map(
+      (foreignKey) => `${foreignKey.id}:${foreignKey.seq}:${foreignKey.table}:${foreignKey.from}:${foreignKey.to ?? ""}:${foreignKey.on_update}:${foreignKey.on_delete}:${foreignKey.match}`,
+    ).sort();
+    const expectedForeignKeys = [...(AUTHORITY_SCHEMA_FOREIGN_KEYS[table] ?? [])].sort();
+    if (foreignKeys.length !== expectedForeignKeys.length || foreignKeys.some((value, index) => value !== expectedForeignKeys[index])) {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} has a non-canonical foreign-key shape`);
+    }
+  }
+  // Enumerate every persisted trigger and view before scanning; do not
+  // pre-filter by sqlite_master.tbl_name, which records only the first FROM
+  // item of a view and would miss cross-references through subqueries.
+  const hostileObjects = rows.filter((row) => {
+    if (row.type !== "trigger" && row.type !== "view") return false;
+    if (AUTHORITY_SCHEMA_COLUMNS[row.tbl_name as string] !== undefined) return true;
+    return tokensReferenceAuthorityTable(sqlTokens(row.sql), AUTHORITY_TABLE_NAMES);
+  });
+  if (hostileObjects.length > 0) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", "authority tables have unexpected triggers or views");
+  }
+  verifyAuthorityIndexes(connection);
+  const foreignKeyViolations = connection.prepare("PRAGMA foreign_key_check").all();
+  if (foreignKeyViolations.length > 0) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", "authority foreign-key check reported violations");
+  }
+}
+function verifyLegacyAuthorityPhysicalSchema(
+  connection: RuntimeSqliteConnection,
+  allowMissingHostMeta: boolean,
+): void {
+  const tables = Object.keys(AUTHORITY_SCHEMA_COLUMNS).filter(
+    (table) => table !== "core_meta" && table !== "commit_sequence" && table !== "core_journal",
+  );
+  for (const table of tables) {
+    const row = connection.prepare(
+      "SELECT type, sql FROM sqlite_master WHERE name = ?",
+    ).get(table);
+    if (!row) {
+      if (allowMissingHostMeta && table === "host_authority_meta") continue;
+      throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", `legacy authority table ${table} is missing`);
+    }
+    if (row.type !== "table") {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", `legacy authority object ${table} is not a table`);
+    }
+    const expected = AUTHORITY_SCHEMA_COLUMNS[table]!;
+    let legacyExpected = table === "runtime_authority_state"
+      ? expected.filter((column) => column.name !== "controller_generation_id")
+      : expected;
+    if (table === "config_revision_mappings") {
+      const mappingColumnSet = new Set(connection.prepare(`PRAGMA table_info(${table})`).all().map((column) => String(column.name)));
+      if (!mappingColumnSet.has("daemon_installation_id") || !mappingColumnSet.has("instance_id")) {
+        legacyExpected = legacyExpected.filter((column) => column.name !== "daemon_installation_id" && column.name !== "instance_id");
+      }
+    }
+    const columns = connection.prepare(`PRAGMA table_info(${table})`).all();
+    if (
+      columns.length !== legacyExpected.length ||
+      columns.some((column, index) => String(column.name) !== legacyExpected[index]!.name)
+    ) {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", `legacy authority table ${table} has a non-canonical column shape`);
+    }
+    const sql = sqlTokens(row.sql);
+    if (
+      !sqlHasTokenSequence(sql, "primary key") ||
+      (table !== "host_authority_meta" && table !== "runtime_authority_state" && !sqlHasTokenSequence(sql, "unique"))
+    ) {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", `legacy authority table ${table} is missing a required constraint`);
+    }
+  }
+  verifyAuthorityIndexes(connection);
+  const foreignKeyViolations = connection.prepare("PRAGMA foreign_key_check").all();
+  if (foreignKeyViolations.length > 0) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "legacy authority foreign-key check reported violations");
+  }
+  // Enumerate every persisted trigger and view before scanning; do not
+  // pre-filter by sqlite_master.tbl_name, which records only the first FROM
+  // item of a view and would miss cross-references through subqueries.
+  const hostile = connection.prepare(
+    "SELECT type, tbl_name, sql FROM sqlite_master WHERE type IN ('trigger', 'view')",
+  ).all() as Array<{ type: string; tbl_name: string; sql: string }>;
+  const hostileObject = hostile.find((row) => {
+    if (tables.includes(row.tbl_name)) return true;
+    return tokensReferenceAuthorityTable(sqlTokens(row.sql), tables);
+  });
+  if (hostileObject !== undefined) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "legacy authority tables have unexpected triggers or views");
+  }
+}
+function verifyLegacyCorePhysicalSchema(connection: RuntimeSqliteConnection, typescriptV1: boolean): void {
+  const expected = typescriptV1
+    ? [
+        ["singleton", "INTEGER", 0, 1],
+        ["authority_schema_version", "INTEGER", 1, 0],
+        ["daemon_installation_id", "TEXT", 1, 0],
+        ["instance_id", "TEXT", 1, 0],
+      ]
+    : [
+        ["singleton", "INTEGER", 0, 1],
+        ["schema_version", "INTEGER", 1, 0],
+        ["daemon_installation_id", "TEXT", 0, 0],
+        ["instance_id", "TEXT", 0, 0],
+        ["clean_shutdown", "INTEGER", 1, 0],
+        ["sqlite_version_number", "INTEGER", 1, 0],
+        ["sqlite_source_id", "TEXT", 1, 0],
+        ["sqlite_artifact_digest", "TEXT", 1, 0],
+      ];
+  const columns = connection.prepare("PRAGMA table_info(core_meta)").all();
+  if (
+    columns.length !== expected.length ||
+    columns.some((column, index) => {
+      const wanted = expected[index]!;
+      return String(column.name) !== wanted[0] ||
+        String(column.type).toUpperCase() !== wanted[1] ||
+        Number(column.notnull) !== wanted[2] ||
+        Number(column.pk) !== wanted[3];
+    })
+  ) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "legacy core_meta has a non-canonical physical shape");
+  }
+  const row = connection.prepare("SELECT type, sql FROM sqlite_master WHERE name = 'core_meta'").get();
+  const tokens = sqlTokens(row?.sql);
+  const requiredChecks = typescriptV1
+    ? ["check (singleton = 1)", "check (authority_schema_version = 1)"]
+    : ["check (singleton = 1)", "check (clean_shutdown in (0, 1))"];
+  if (
+    row?.type !== "table" ||
+    requiredChecks.some((fragment) => !sqlHasTokenSequence(tokens, fragment))
+  ) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "legacy core_meta is missing an authoritative constraint");
+  }
+}
+
+
+function stateRecord(identity: RuntimeAuthorityIdentity, controllerGenerationId: string, revision: number, digest: string): JsonValue {
   return {
     schema: "dolly.runtime-authority-state/v1",
-    authority_schema_version: RUNTIME_AUTHORITY_SCHEMA_VERSION,
+    authority_schema_version: HOST_AUTHORITY_SCHEMA_VERSION,
     daemon_installation_id: identity.daemonInstallationId,
     instance_id: identity.instanceId,
+    controller_generation_id: controllerGenerationId,
     current_config_revision: revision,
     current_config_digest: digest,
   };
 }
+
 
 /**
  * Internal repository over the Runtime authority database. A caller must hold
@@ -637,12 +1275,19 @@ export class RuntimeAuthorityDatabase {
   readonly #connection: RuntimeSqliteConnection;
   readonly #identity: RuntimeAuthorityIdentity;
   readonly #lock: RuntimeAuthorityLockHandle;
+  readonly #controllerGenerationId: string;
   #closed = false;
 
-  private constructor(connection: RuntimeSqliteConnection, identity: RuntimeAuthorityIdentity, lock: RuntimeAuthorityLockHandle) {
+  private constructor(
+    connection: RuntimeSqliteConnection,
+    identity: RuntimeAuthorityIdentity,
+    lock: RuntimeAuthorityLockHandle,
+    controllerGenerationId: string,
+  ) {
     this.#connection = connection;
     this.#identity = identity;
     this.#lock = lock;
+    this.#controllerGenerationId = controllerGenerationId;
   }
 
   /** Opens through the H0 attested loader and verifies the committed DB (REQ-AUTH-004). */
@@ -657,14 +1302,51 @@ export class RuntimeAuthorityDatabase {
         "A legitimate controller lock owner must open the Runtime authority database for writing",
       );
     }
+    const controllerGenerationId = controllerGenerationFromLock(options.lock);
     const handle = openAttestedNativeSqlite(options.path);
     try {
-      const repository = new RuntimeAuthorityDatabase(asRuntimeSqliteConnection(handle.database), options.identity, options.lock);
+      const repository = new RuntimeAuthorityDatabase(
+        asRuntimeSqliteConnection(handle.database),
+        options.identity,
+        options.lock,
+        controllerGenerationId,
+      );
       repository.#verifyOnOpen();
       return repository;
     } catch (error) {
       handle.close();
       throw error;
+    }
+  }
+  /**
+   * Performs the one explicit bridge from the pre-H1 TypeScript projection.
+   * Ordinary `open` refuses that shape with STORAGE_MIGRATION_REQUIRED; this
+   * entry point is the only path that may normalize it.
+   */
+  static migrateV1Authority(options: RuntimeAuthorityDatabaseOptions): void {
+    validateIdentity(options.identity);
+    if (typeof options.path !== "string" || options.path.length === 0 || options.path.includes("\0")) {
+      throw new TypeError("Runtime authority database path must be a non-empty filesystem path");
+    }
+    if (!options.lock || !options.lock.held) {
+      throw new RuntimeAuthorityDatabaseError(
+        "CONTROLLER_LOCK_NOT_HELD",
+        "A legitimate controller lock owner must run the Runtime authority migration",
+      );
+    }
+    const controllerGenerationId = controllerGenerationFromLock(options.lock);
+    const handle = openAttestedNativeSqlite(options.path);
+    try {
+      const repository = new RuntimeAuthorityDatabase(
+        asRuntimeSqliteConnection(handle.database),
+        options.identity,
+        options.lock,
+        controllerGenerationId,
+      );
+      repository.#migrateLegacyV1();
+      repository.#verifyOnOpen();
+    } finally {
+      handle.close();
     }
   }
 
@@ -726,6 +1408,9 @@ export class RuntimeAuthorityDatabase {
 
   get identity(): RuntimeAuthorityIdentity {
     return { ...this.#identity };
+  }
+  get controllerGenerationId(): string {
+    return this.#controllerGenerationId;
   }
 
   /**
@@ -845,6 +1530,13 @@ export class RuntimeAuthorityDatabase {
         "Writable Runtime authority access requires the caller-held instance controller lock",
       );
     }
+    this.#lock.assertHeld();
+    if (controllerGenerationFromLock(this.#lock) !== this.#controllerGenerationId) {
+      throw new RuntimeAuthorityDatabaseError(
+        "CONTROLLER_LOCK_NOT_HELD",
+        "The controller generation changed while this Runtime authority handle was open",
+      );
+    }
   }
 
   #fileCoreHistoryProducerCapability() {
@@ -909,6 +1601,7 @@ export class RuntimeAuthorityDatabase {
     return new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `Runtime authority database is corrupt: ${detail}`);
   }
 
+
   // -------------------------------------------------------------------------
   // Open verification (REQ-AUTH-004)
   // -------------------------------------------------------------------------
@@ -930,20 +1623,317 @@ export class RuntimeAuthorityDatabase {
     return typeof value === "number" ? value : Number(value ?? 0);
   }
 
+  #migrateLegacyV1(): void {
+    this.#requireOpen();
+    if (this.#userVersion() !== RUNTIME_AUTHORITY_SCHEMA_VERSION) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_MIGRATION_REQUIRED",
+        "Only the pre-H1 user_version 1 authority projection can be migrated",
+      );
+    }
+    const hostTable = this.#connection.prepare(
+      "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'host_authority_meta'",
+    ).get();
+    const hostVersion = hostTable
+      ? Number(this.#connection.prepare(
+          "SELECT authority_schema_version FROM host_authority_meta WHERE singleton = 1",
+        ).get()?.authority_schema_version)
+      : null;
+    if (hostVersion !== null && hostVersion !== 1) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_MIGRATION_REQUIRED",
+        "The physical Host authority schema is not an expected v1 migration source",
+      );
+    }
+    const coreColumns = new Set(
+      this.#connection.prepare("PRAGMA table_info(core_meta)").all().map((column) => String(column.name)),
+    );
+    const runtimeColumns = new Set(
+      this.#connection.prepare("PRAGMA table_info(runtime_authority_state)").all().map((column) => String(column.name)),
+    );
+    const typescriptV1 = hostVersion === null && coreColumns.has("authority_schema_version") && !coreColumns.has("schema_version");
+    const rustV1 = hostVersion === 1 && coreColumns.has("schema_version");
+    if ((!typescriptV1 && !rustV1) || runtimeColumns.has("controller_generation_id")) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_MIGRATION_REQUIRED",
+        "The database is not an expected v1 authority migration source",
+      );
+    }
+    const mappingColumns = this.#connection.prepare("PRAGMA table_info(config_revision_mappings)").all();
+    const mappingColumnNames = new Set(mappingColumns.map((entry) => String(entry.name)));
+    const mappingLacksIdentity = !mappingColumnNames.has("daemon_installation_id") || !mappingColumnNames.has("instance_id");
+    if (!mappingLacksIdentity) {
+      const mappingIdentityColumns = mappingColumns.filter(
+        (entry) => entry.name === "daemon_installation_id" || entry.name === "instance_id",
+      );
+      if (mappingIdentityColumns.some((entry) => Number(entry.notnull) !== 1)) {
+        throw new RuntimeAuthorityDatabaseError(
+          "STORAGE_MIGRATION_REQUIRED",
+          "Legacy mapping identity columns are nullable and cannot be altered into v2",
+        );
+      }
+    }
+    const parallelConfigRevisions = this.#connection.prepare(
+      "SELECT 1 AS present FROM sqlite_master WHERE name = 'config_revisions'",
+    ).get();
+    if (parallelConfigRevisions) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_MIGRATION_REQUIRED",
+        "parallel config_revisions object blocks legacy migration",
+      );
+    }
+    verifyLegacyCorePhysicalSchema(this.#connection, typescriptV1);
+    verifyLegacyAuthorityPhysicalSchema(this.#connection, typescriptV1);
+    const state = this.#connection.prepare(
+      "SELECT authority_schema_version, daemon_installation_id, instance_id, current_config_revision, current_config_digest, record_jcs FROM runtime_authority_state WHERE singleton = 1",
+    ).get();
+    if (!state || Number(state.authority_schema_version) !== RUNTIME_AUTHORITY_RECORD_SCHEMA_VERSION) {
+      throw this.#corrupt("legacy authority-state singleton is missing or has an unknown record version");
+    }
+    if (state.daemon_installation_id !== this.#identity.daemonInstallationId || state.instance_id !== this.#identity.instanceId) {
+      throw this.#corrupt("legacy authority-state identity does not match the requested tuple");
+    }
+    const revision = Number(state.current_config_revision);
+    const digest = String(state.current_config_digest);
+    const mapping = this.#resolveLegacyMapping(revision, digest);
+    if (mapping === null) throw this.#corrupt("legacy current pointer references a missing mapping");
+    let legacyStateRecord: JsonValue;
+    try {
+      legacyStateRecord = parseCanonicalJsonBytes(toBytes(state.record_jcs));
+      assertCanonicalJsonValue(legacyStateRecord);
+    assertClosedRecord(
+      legacyStateRecord,
+      ["schema", "authority_schema_version", "daemon_installation_id", "instance_id", "current_config_revision", "current_config_digest"],
+      "legacy authority-state record",
+    );
+    } catch (error) {
+      if (error instanceof RuntimeAuthorityDatabaseError) throw error;
+      throw this.#corrupt(`legacy authority-state record is malformed: ${String(error)}`);
+    }
+    if (
+      legacyStateRecord.schema !== "dolly.runtime-authority-state/v1" ||
+      legacyStateRecord.authority_schema_version !== 1 ||
+      legacyStateRecord.daemon_installation_id !== this.#identity.daemonInstallationId ||
+      legacyStateRecord.instance_id !== this.#identity.instanceId ||
+      legacyStateRecord.current_config_revision !== revision ||
+      legacyStateRecord.current_config_digest !== digest ||
+      !sameBytes(toBytes(state.record_jcs), canonicalBytes(legacyStateRecord))
+    ) {
+      throw this.#corrupt("legacy authority-state record disagrees with its relational projection");
+    }
+    const legacyConfig = validateResolvedConfiguration(parseCanonicalJsonBytes(mapping.bytes), "legacy current canonical config");
+    const legacyPremise = this.#loadPremise(revision, digest);
+    if ((legacyConfig.service_candidate !== null) !== (legacyPremise !== null)) {
+      throw this.#corrupt("legacy current config and premise presence disagree");
+    }
+    // Blocker 3: verify every persisted row (reachable and unused) before any
+    // schema commit so tampered historical rows cannot enter the v2 projection.
+    this.#verifyAllCommittedRows();
+
+    this.#statement("BEGIN IMMEDIATE").run();
+    try {
+      const sqliteIdentity = this.#connection.prepare(
+        "SELECT sqlite_version() AS version, sqlite_source_id() AS source_id",
+      ).get();
+      const versionParts = String(sqliteIdentity?.version ?? "").split(".").map((part) => Number(part));
+      const versionNumber =
+        versionParts.length === 3 && versionParts.every((part) => Number.isSafeInteger(part))
+          ? (versionParts[0] ?? 0) * 1_000_000 + (versionParts[1] ?? 0) * 1_000 + (versionParts[2] ?? 0)
+          : 0;
+      const sourceId = String(sqliteIdentity?.source_id ?? "");
+      const artifactDigest = sha256DigestOfBytes(Buffer.from(sourceId, "utf8"));
+      const coreRow = this.#connection.prepare("SELECT * FROM core_meta WHERE singleton = 1").get() as Record<string, unknown> | undefined;
+      const coreDaemon = coreRow?.daemon_installation_id;
+      const coreInstance = coreRow?.instance_id;
+      const legacySchemaVersion = typescriptV1 ? coreRow?.authority_schema_version : coreRow?.schema_version;
+      if (
+        typeof coreDaemon !== "string" ||
+        typeof coreInstance !== "string" ||
+        coreDaemon !== this.#identity.daemonInstallationId ||
+        coreInstance !== this.#identity.instanceId ||
+        Number(legacySchemaVersion) !== 1
+      ) {
+        throw this.#corrupt("legacy core_meta identity or schema version is invalid");
+      }
+      const cleanShutdown = typescriptV1 ? 0 : Number(coreRow?.clean_shutdown);
+      const legacySqliteVersion = typescriptV1 ? versionNumber : Number(coreRow?.sqlite_version_number);
+      const legacySourceId = typescriptV1 ? sourceId : String(coreRow?.sqlite_source_id ?? "");
+      const legacyArtifactDigest = typescriptV1 ? artifactDigest : String(coreRow?.sqlite_artifact_digest ?? "");
+      if (
+        !Number.isInteger(cleanShutdown) ||
+        ![0, 1].includes(cleanShutdown) ||
+        !Number.isSafeInteger(legacySqliteVersion) ||
+        legacySourceId.length === 0 ||
+        !isSha256(legacyArtifactDigest)
+      ) {
+        throw this.#corrupt("legacy core_meta diagnostic projection is invalid");
+      }
+      this.#connection.prepare(
+          "CREATE TABLE core_meta_v2 (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), schema_version INTEGER NOT NULL, daemon_installation_id TEXT, instance_id TEXT, controller_generation_id TEXT, clean_shutdown INTEGER NOT NULL CHECK (clean_shutdown IN (0, 1)), sqlite_version_number INTEGER NOT NULL, sqlite_source_id TEXT NOT NULL, sqlite_artifact_digest TEXT NOT NULL)",
+        ).run();
+        this.#connection.prepare(
+          "INSERT INTO core_meta_v2 (singleton, schema_version, daemon_installation_id, instance_id, controller_generation_id, clean_shutdown, sqlite_version_number, sqlite_source_id, sqlite_artifact_digest) SELECT 1, 1, ?, ?, ?, ?, ?, ?, ? FROM core_meta WHERE singleton = 1",
+        ).run(
+          coreRow!.daemon_installation_id,
+          coreRow!.instance_id,
+          this.#controllerGenerationId,
+          cleanShutdown,
+          legacySqliteVersion,
+          legacySourceId,
+          legacyArtifactDigest,
+        );
+        this.#connection.prepare("DROP TABLE core_meta").run();
+        this.#connection.prepare("ALTER TABLE core_meta_v2 RENAME TO core_meta").run();
+      if (mappingLacksIdentity) {
+        // config_revision_mappings is referenced by module_activation_premises
+        // and runtime_authority_state, and PRAGMA foreign_keys cannot be
+        // disabled inside an active transaction. Rebuild the mapping and every
+        // referencing table in dependency-safe order: replacements are created
+        // and populated first (their FK checks resolve against the still-
+        // present old parents), then old children are dropped child-first,
+        // then old parents, then each replacement takes the canonical name.
+        this.#connection.prepare(
+          "CREATE TABLE config_revision_mappings_v2 (config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991), daemon_installation_id TEXT NOT NULL, instance_id TEXT NOT NULL, config_digest TEXT NOT NULL, canonical_bytes BLOB NOT NULL, UNIQUE (config_revision, config_digest))",
+        ).run();
+        this.#connection.prepare(
+          "INSERT INTO config_revision_mappings_v2 (config_revision, daemon_installation_id, instance_id, config_digest, canonical_bytes) SELECT config_revision, ?, ?, config_digest, canonical_bytes FROM config_revision_mappings",
+        ).run(this.#identity.daemonInstallationId, this.#identity.instanceId);
+        this.#connection.prepare(
+          "CREATE TABLE module_activation_premises_v2 (config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991), config_digest TEXT NOT NULL, service_origin_component_id TEXT NOT NULL, service_origin_component_revision INTEGER NOT NULL, service_unit_name TEXT NOT NULL, service_mode TEXT NOT NULL, service_candidate_digest TEXT NOT NULL, premises_digest TEXT NOT NULL, record_jcs BLOB NOT NULL, UNIQUE (config_revision, config_digest), FOREIGN KEY (config_revision, config_digest) REFERENCES config_revision_mappings_v2(config_revision, config_digest), FOREIGN KEY (service_origin_component_id, service_origin_component_revision, service_unit_name, service_mode, service_candidate_digest) REFERENCES linux_service_candidates(origin_component_id, origin_component_revision, unit_name, mode, candidate_digest))",
+        ).run();
+        this.#connection.prepare("INSERT INTO module_activation_premises_v2 SELECT * FROM module_activation_premises").run();
+        this.#connection.prepare(
+          "CREATE TABLE module_activation_premise_policy_selections_v2 (config_revision INTEGER NOT NULL CHECK (config_revision BETWEEN 1 AND 9007199254740991), policy_id TEXT NOT NULL, policy_revision INTEGER NOT NULL, policy_definition_digest TEXT NOT NULL, binding_id TEXT NOT NULL, binding_revision INTEGER NOT NULL, binding_digest TEXT NOT NULL, PRIMARY KEY (config_revision, policy_id, policy_revision), UNIQUE (config_revision, binding_id, binding_revision, binding_digest), FOREIGN KEY (config_revision) REFERENCES module_activation_premises_v2(config_revision) DEFERRABLE INITIALLY DEFERRED, FOREIGN KEY (policy_id, policy_revision, policy_definition_digest) REFERENCES permission_policy_definitions(policy_id, policy_revision, definition_digest), FOREIGN KEY (binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest) REFERENCES permission_policy_backend_bindings(binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest))",
+        ).run();
+        this.#connection.prepare("INSERT INTO module_activation_premise_policy_selections_v2 SELECT * FROM module_activation_premise_policy_selections").run();
+        const stateColumns = this.#connection.prepare("PRAGMA table_info(runtime_authority_state)").all() as Array<{ name: string }>;
+        const stateHasGeneration = stateColumns.some((column) => column.name === "controller_generation_id");
+        if (stateHasGeneration) {
+          this.#connection.prepare(
+            "CREATE TABLE runtime_authority_state_v2 (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1), daemon_installation_id TEXT NOT NULL, instance_id TEXT NOT NULL, controller_generation_id TEXT NOT NULL, current_config_revision INTEGER NOT NULL CHECK (current_config_revision BETWEEN 1 AND 9007199254740991), current_config_digest TEXT NOT NULL, record_jcs BLOB NOT NULL, FOREIGN KEY (current_config_revision, current_config_digest) REFERENCES config_revision_mappings_v2(config_revision, config_digest))",
+          ).run();
+        } else {
+          this.#connection.prepare(
+            "CREATE TABLE runtime_authority_state_v2 (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1), daemon_installation_id TEXT NOT NULL, instance_id TEXT NOT NULL, current_config_revision INTEGER NOT NULL CHECK (current_config_revision BETWEEN 1 AND 9007199254740991), current_config_digest TEXT NOT NULL, record_jcs BLOB NOT NULL, FOREIGN KEY (current_config_revision, current_config_digest) REFERENCES config_revision_mappings_v2(config_revision, config_digest))",
+          ).run();
+        }
+        this.#connection.prepare("INSERT INTO runtime_authority_state_v2 SELECT * FROM runtime_authority_state").run();
+        this.#connection.prepare("DROP TABLE module_activation_premise_policy_selections").run();
+        this.#connection.prepare("DROP TABLE module_activation_premises").run();
+        this.#connection.prepare("DROP TABLE runtime_authority_state").run();
+        this.#connection.prepare("DROP TABLE config_revision_mappings").run();
+        this.#connection.prepare("ALTER TABLE module_activation_premise_policy_selections_v2 RENAME TO module_activation_premise_policy_selections").run();
+        this.#connection.prepare("ALTER TABLE module_activation_premises_v2 RENAME TO module_activation_premises").run();
+        this.#connection.prepare("ALTER TABLE runtime_authority_state_v2 RENAME TO runtime_authority_state").run();
+        this.#connection.prepare("ALTER TABLE config_revision_mappings_v2 RENAME TO config_revision_mappings").run();
+      }
+      if (hostVersion === 1) {
+        this.#connection.prepare("DROP TABLE host_authority_meta").run();
+      }
+      this.#connection.prepare(
+        "CREATE TABLE host_authority_meta (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 2))",
+      ).run();
+      this.#connection.prepare(
+        "INSERT INTO host_authority_meta (singleton, authority_schema_version) VALUES (1, 2)",
+      ).run();
+      const commitSequence = this.#connection.prepare(
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'commit_sequence'",
+      ).get();
+      if (!commitSequence) {
+        this.#connection.prepare(
+          "CREATE TABLE commit_sequence (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_value INTEGER NOT NULL)",
+        ).run();
+        this.#connection.prepare(
+          "INSERT INTO commit_sequence (singleton, next_value) SELECT 1, COALESCE(MAX(config_revision), 0) + 1 FROM config_revision_mappings",
+        ).run();
+      }
+      const coreJournal = this.#connection.prepare(
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'core_journal'",
+      ).get();
+      if (!coreJournal) {
+        this.#connection.prepare(
+          "CREATE TABLE core_journal (journal_seq INTEGER PRIMARY KEY AUTOINCREMENT, event_kind TEXT NOT NULL, event_jcs BLOB NOT NULL, config_revision INTEGER, config_digest TEXT, premises_digest TEXT)",
+        ).run();
+      }
+      const recordBytes = Buffer.from(canonicalBytes(
+        stateRecord(this.#identity, this.#controllerGenerationId, revision, digest),
+      ));
+      this.#connection.prepare(
+        "CREATE TABLE runtime_authority_state_v2 (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 2), daemon_installation_id TEXT NOT NULL, instance_id TEXT NOT NULL, controller_generation_id TEXT NOT NULL, current_config_revision INTEGER NOT NULL CHECK (current_config_revision BETWEEN 1 AND 9007199254740991), current_config_digest TEXT NOT NULL, record_jcs BLOB NOT NULL, FOREIGN KEY (current_config_revision, current_config_digest) REFERENCES config_revision_mappings(config_revision, config_digest))",
+      ).run();
+      this.#connection.prepare(
+        "INSERT INTO runtime_authority_state_v2 (singleton, authority_schema_version, daemon_installation_id, instance_id, controller_generation_id, current_config_revision, current_config_digest, record_jcs) VALUES (1, 2, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        this.#identity.daemonInstallationId,
+        this.#identity.instanceId,
+        this.#controllerGenerationId,
+        revision,
+        digest,
+        recordBytes,
+      );
+      this.#connection.prepare("DROP TABLE runtime_authority_state").run();
+      this.#connection.prepare("ALTER TABLE runtime_authority_state_v2 RENAME TO runtime_authority_state").run();
+      verifyAuthorityPhysicalSchema(this.#connection);
+      this.#statement("COMMIT").run();
+    } catch (error) {
+      try {
+        this.#statement("ROLLBACK").run();
+      } catch {
+        /* preserve the original migration error */
+      }
+      throw this.#translateError(error);
+    }
+  }
+
   #verifyOnOpen(): void {
     this.#requireOpen();
+    const parallelConfigRevisions = this.#connection.prepare(
+      "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'config_revisions'",
+    ).get();
+    if (parallelConfigRevisions) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_CORRUPT",
+        "parallel config_revisions table is not part of the Host-owned authority schema",
+      );
+    }
     const version = this.#userVersion();
-    if (version === 0) return; // uninitialized candidate bytes; first write bootstraps schema 1
+    if (version === 0) {
+      const objects = Number(this.#connection.prepare(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type IN ('table', 'index', 'trigger', 'view') AND name NOT LIKE 'sqlite_%'",
+      ).get()?.count ?? 0);
+      if (objects !== 0) throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "uninitialized authority bytes contain a partial schema");
+      return;
+    }
     if (version !== RUNTIME_AUTHORITY_SCHEMA_VERSION) {
       throw new RuntimeAuthorityDatabaseError(
         "STORAGE_MIGRATION_REQUIRED",
         `Runtime authority database user_version ${version} is not supported; expected ${RUNTIME_AUTHORITY_SCHEMA_VERSION}`,
       );
     }
+    const hostTable = this.#connection.prepare(
+      "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'host_authority_meta'",
+    ).get();
+    const hostMeta = hostTable
+      ? this.#connection.prepare(
+          "SELECT authority_schema_version FROM host_authority_meta WHERE singleton = 1",
+        ).get()
+      : undefined;
+    const stateColumns = this.#connection.prepare("PRAGMA table_info(runtime_authority_state)").all();
+    if (
+      Number(hostMeta?.authority_schema_version) !== HOST_AUTHORITY_SCHEMA_VERSION ||
+      !stateColumns.some((column) => column.name === "controller_generation_id")
+    ) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_MIGRATION_REQUIRED",
+        "Runtime authority database uses the legacy physical Host schema; invoke the explicit v1 migration",
+      );
+    }
     this.#verifyCommitted();
+    this.#refreshControllerGeneration();
   }
 
   #verifyCommitted(): void {
+    verifyAuthorityPhysicalSchema(this.#connection);
     const quickCheck = this.#connection.prepare("PRAGMA quick_check").all();
     if (quickCheck.length !== 1 || String(quickCheck[0]?.quick_check ?? "") !== "ok") {
       throw this.#corrupt("PRAGMA quick_check did not report ok");
@@ -952,30 +1942,55 @@ export class RuntimeAuthorityDatabase {
     if (violations.length > 0) {
       throw this.#corrupt("foreign-key check reported violations");
     }
+    this.#verifyAllCommittedRows();
     const meta = this.#connection.prepare(
-      "SELECT authority_schema_version, daemon_installation_id, instance_id FROM core_meta WHERE singleton = 1",
+      "SELECT schema_version, daemon_installation_id, instance_id, controller_generation_id FROM core_meta WHERE singleton = 1",
     ).get();
     const state = this.#connection.prepare(
-      "SELECT authority_schema_version, daemon_installation_id, instance_id, current_config_revision, current_config_digest FROM runtime_authority_state WHERE singleton = 1",
+      "SELECT authority_schema_version, daemon_installation_id, instance_id, controller_generation_id, current_config_revision, current_config_digest, record_jcs FROM runtime_authority_state WHERE singleton = 1",
     ).get();
     if (!meta || !state) {
       throw this.#corrupt("core_meta or authority-state singleton is missing");
     }
-    if (Number(meta.authority_schema_version) !== RUNTIME_AUTHORITY_SCHEMA_VERSION || Number(state.authority_schema_version) !== RUNTIME_AUTHORITY_SCHEMA_VERSION) {
-      throw this.#corrupt("stored authority schema version disagrees with the supported version");
+    if (Number(meta.schema_version) !== RUNTIME_AUTHORITY_SCHEMA_VERSION || Number(state.authority_schema_version) !== HOST_AUTHORITY_SCHEMA_VERSION) {
+      throw this.#corrupt("stored authority schema version disagrees with the supported physical versions");
     }
     if (meta.daemon_installation_id !== this.#identity.daemonInstallationId || meta.instance_id !== this.#identity.instanceId) {
       throw this.#corrupt("core_meta identity does not match the requested tuple");
     }
-    if (state.daemon_installation_id !== meta.daemon_installation_id || state.instance_id !== meta.instance_id) {
-      throw this.#corrupt("core_meta/authority-state identity agreement failed");
+    if (
+      state.daemon_installation_id !== meta.daemon_installation_id ||
+      state.instance_id !== meta.instance_id ||
+      typeof meta.controller_generation_id !== "string" ||
+      !UUIDV7_PATTERN.test(meta.controller_generation_id) ||
+      state.controller_generation_id !== meta.controller_generation_id
+    ) {
+      throw this.#corrupt("core_meta/authority-state identity or generation agreement failed");
     }
     const current = this.#resolveMapping(Number(state.current_config_revision), String(state.current_config_digest));
     if (current === null) {
       throw this.#corrupt("current pointer references a missing or digest-mismatched mapping");
     }
-    const canonicalConfig = parseCanonicalJsonBytes(current.bytes);
-    assertCanonicalJsonValue(canonicalConfig);
+    let stateRecordValue: JsonValue;
+    try {
+      stateRecordValue = parseCanonicalJsonBytes(toBytes(state.record_jcs));
+      assertCanonicalJsonValue(stateRecordValue);
+    } catch (error) {
+      throw this.#corrupt(`authority-state record_jcs is malformed: ${String(error)}`);
+    }
+    const expectedStateRecord = canonicalBytes(
+      stateRecord(this.#identity, String(state.controller_generation_id), Number(state.current_config_revision), String(state.current_config_digest)),
+    );
+    if (!sameBytes(toBytes(state.record_jcs), expectedStateRecord)) {
+      throw this.#corrupt("authority-state canonical bytes disagree with the relational projection");
+    }
+    let canonicalConfig: JsonValue;
+    try {
+      canonicalConfig = parseCanonicalJsonBytes(current.bytes);
+      assertCanonicalJsonValue(canonicalConfig);
+    } catch (error) {
+      throw this.#corrupt(`current canonical config bytes are malformed: ${String(error)}`);
+    }
     const premise = this.#loadPremise(Number(state.current_config_revision), String(state.current_config_digest));
     if (asResolvedConfiguration(canonicalConfig).service_candidate !== null && premise === null) {
       throw this.#corrupt("an installed Linux Module config has no premise row");
@@ -989,22 +2004,317 @@ export class RuntimeAuthorityDatabase {
       throw this.#corrupt("an installed Linux Module config has no premise row");
     }
   }
+  #verifyAllCommittedRows(): void {
+    const mappingRows = this.#connection.prepare(
+      "SELECT config_revision, config_digest FROM config_revision_mappings ORDER BY config_revision",
+    ).all();
+    const expectedSelectionsByRevision: Record<string, readonly PermissionPolicySelection[]> = Object.create(null);
+    const mappingDigestByRevision: Record<string, string> = Object.create(null);
+    const mappingHasIdentity = mappingRows.length === 0
+      ? true
+      : this.#connection.prepare("PRAGMA table_info(config_revision_mappings)").all().some((column) => column.name === "daemon_installation_id");
+    for (const row of mappingRows) {
+      const revision = Number(row.config_revision);
+      const digest = String(row.config_digest);
+      const mapping = mappingHasIdentity ? this.#resolveMapping(revision, digest) : this.#resolveLegacyMapping(revision, digest);
+      if (mapping === null) throw this.#corrupt(`mapping revision ${revision} disappeared during verification`);
+      const config = asResolvedConfiguration(parseCanonicalJsonBytes(mapping.bytes));
+      expectedSelectionsByRevision[String(revision)] = config.permission_policy_selections;
+      mappingDigestByRevision[String(revision)] = digest;
+    }
+    const originRows = this.#connection.prepare(
+      "SELECT component_id, component_revision, component_digest, record_jcs FROM installed_component_origins",
+    ).all();
+    for (const row of originRows) {
+      const bytes = toBytes(row.record_jcs);
+      let record: JsonValue;
+      try {
+        record = parseCanonicalJsonBytes(bytes);
+        assertCanonicalJsonValue(record);
+        validateOrigin(record, "stored installed component origin");
+      } catch (error) {
+        throw this.#corrupt(`stored installed component origin is malformed: ${String(error)}`);
+      }
+      if (
+        !sameBytes(bytes, canonicalBytes(record)) ||
+        (record as Record<string, unknown>).component_id !== row.component_id ||
+        (record as Record<string, unknown>).component_revision !== Number(row.component_revision) ||
+        (record as Record<string, unknown>).component_digest !== row.component_digest
+      ) {
+        throw this.#corrupt("installed component origin projection disagrees with its canonical record");
+      }
+    }
 
-  /** Loads a committed mapping with full verification; null when absent. */
+    const definitionRows = this.#connection.prepare(
+      "SELECT policy_id, policy_revision, definition_digest, record_jcs FROM permission_policy_definitions",
+    ).all();
+    for (const row of definitionRows) {
+      const bytes = toBytes(row.record_jcs);
+      let record: JsonValue;
+      try {
+        record = parseCanonicalJsonBytes(bytes);
+        assertCanonicalJsonValue(record);
+        validateDefinition(record, "stored permission policy definition");
+      } catch (error) {
+        throw this.#corrupt(`stored permission policy definition is malformed: ${String(error)}`);
+      }
+      const object = record as Record<string, unknown>;
+      if (
+        !sameBytes(bytes, canonicalBytes(record)) ||
+        object.policy_id !== row.policy_id ||
+        object.policy_revision !== Number(row.policy_revision) ||
+        object.definition_digest !== row.definition_digest
+      ) {
+        throw this.#corrupt("permission policy definition projection disagrees with its canonical record");
+      }
+    }
+
+    const bindingRows = this.#connection.prepare(
+      "SELECT binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest, origin_component_id, origin_component_revision, origin_component_digest, record_jcs FROM permission_policy_backend_bindings",
+    ).all();
+    for (const row of bindingRows) {
+      const bytes = toBytes(row.record_jcs);
+      let record: JsonValue;
+      try {
+        record = parseCanonicalJsonBytes(bytes);
+        assertCanonicalJsonValue(record);
+        validateBinding(record, "stored permission policy backend binding");
+      } catch (error) {
+        throw this.#corrupt(`stored permission policy backend binding is malformed: ${String(error)}`);
+      }
+      const object = record as Record<string, unknown>;
+      const origin = object.origin as Record<string, unknown>;
+      if (
+        !sameBytes(bytes, canonicalBytes(record)) ||
+        object.binding_id !== row.binding_id ||
+        object.binding_revision !== Number(row.binding_revision) ||
+        object.binding_digest !== row.binding_digest ||
+        object.policy_id !== row.policy_id ||
+        object.policy_revision !== Number(row.policy_revision) ||
+        object.policy_definition_digest !== row.policy_definition_digest ||
+        origin.component_id !== row.origin_component_id ||
+        origin.component_revision !== Number(row.origin_component_revision) ||
+        origin.component_digest !== row.origin_component_digest
+      ) {
+        throw this.#corrupt("permission policy backend binding projection disagrees with its canonical record");
+      }
+    }
+
+    const candidateRows = this.#connection.prepare(
+      "SELECT origin_component_id, origin_component_revision, origin_component_digest, unit_name, mode, candidate_digest, record_jcs FROM linux_service_candidates",
+    ).all();
+    for (const row of candidateRows) {
+      const bytes = toBytes(row.record_jcs);
+      let record: JsonValue;
+      try {
+        record = parseCanonicalJsonBytes(bytes);
+        assertCanonicalJsonValue(record);
+        validateServiceCandidate(record, "stored Linux service candidate");
+      } catch (error) {
+        throw this.#corrupt(`stored Linux service candidate is malformed: ${String(error)}`);
+      }
+      const object = record as Record<string, unknown>;
+      const origin = object.origin as Record<string, unknown>;
+      if (
+        !sameBytes(bytes, canonicalBytes(record)) ||
+        origin.component_id !== row.origin_component_id ||
+        origin.component_revision !== Number(row.origin_component_revision) ||
+        origin.component_digest !== row.origin_component_digest ||
+        object.unit_name !== row.unit_name ||
+        object.mode !== row.mode ||
+        object.candidate_digest !== row.candidate_digest
+      ) {
+        throw this.#corrupt("Linux service candidate projection disagrees with its canonical record");
+      }
+    }
+
+    const selectionRowsByRevision: Record<string, PermissionPolicySelection[]> = Object.create(null);
+    const premiseRows = this.#connection.prepare(
+      "SELECT config_revision, config_digest, service_origin_component_id, service_origin_component_revision, service_unit_name, service_mode, service_candidate_digest, premises_digest FROM module_activation_premises",
+    ).all();
+    for (const row of premiseRows) {
+      const revision = Number(row.config_revision);
+      const premise = this.#loadPremise(revision, String(row.config_digest));
+      if (premise === null) throw this.#corrupt(`stored premise ${revision} disappeared during verification`);
+      const candidate = premise.service_candidate;
+      if (
+        candidate.origin.component_id !== row.service_origin_component_id ||
+        candidate.origin.component_revision !== Number(row.service_origin_component_revision) ||
+        candidate.unit_name !== row.service_unit_name ||
+        candidate.mode !== row.service_mode ||
+        candidate.candidate_digest !== row.service_candidate_digest ||
+        premise.premises_digest !== row.premises_digest
+      ) {
+        throw this.#corrupt(`premise projection disagrees with its canonical record for revision ${revision}`);
+      }
+    }
+
+    const selectionRows = this.#connection.prepare(
+      "SELECT config_revision, policy_id, policy_revision, policy_definition_digest, binding_id, binding_revision, binding_digest FROM module_activation_premise_policy_selections ORDER BY config_revision, policy_id, policy_revision",
+    ).all();
+    for (const row of selectionRows) {
+      const revision = Number(row.config_revision);
+      const selection: PermissionPolicySelection = {
+        policy_id: String(row.policy_id),
+        policy_revision: Number(row.policy_revision),
+        policy_definition_digest: String(row.policy_definition_digest),
+        binding_id: String(row.binding_id),
+        binding_revision: Number(row.binding_revision),
+        binding_digest: String(row.binding_digest),
+      };
+      if (
+        !isIntegralInRange(revision, 1, MAX_CONFIG_REVISION) ||
+        !isStableId(selection.policy_id) ||
+        !isStableId(selection.binding_id) ||
+        !isIntegralInRange(selection.policy_revision, 1, MAX_CONFIG_REVISION) ||
+        !isIntegralInRange(selection.binding_revision, 1, MAX_CONFIG_REVISION) ||
+        !isSha256(selection.policy_definition_digest) ||
+        !isSha256(selection.binding_digest)
+      ) {
+        throw this.#corrupt("stored premise-policy selection is malformed");
+      }
+      const expectedSelections = expectedSelectionsByRevision[String(revision)];
+      if (
+        expectedSelections === undefined ||
+        !expectedSelections.some((expected) => selectionKey(expected) === selectionKey(selection))
+      ) {
+        throw this.#corrupt("stored premise-policy selection differs from canonical config");
+      }
+      const configDigest = mappingDigestByRevision[String(revision)];
+      const premise = configDigest === undefined ? null : this.#loadPremise(revision, configDigest);
+      if (premise === null) throw this.#corrupt(`stored selection ${revision} has no canonical premise`);
+      const definition = premise.permission_policy_definitions.find(
+        (value) => value.policy_id === selection.policy_id && value.policy_revision === selection.policy_revision,
+      );
+      if (definition === undefined || definition.definition_digest !== selection.policy_definition_digest) {
+        throw this.#corrupt("stored premise-policy selection definition projection disagrees with its premise");
+      }
+      const binding = premise.permission_policy_backend_bindings.find(
+        (value) => value.binding_id === selection.binding_id && value.binding_revision === selection.binding_revision,
+      );
+      if (
+        binding === undefined ||
+        binding.binding_digest !== selection.binding_digest ||
+        binding.policy_id !== selection.policy_id ||
+        binding.policy_revision !== selection.policy_revision ||
+        binding.policy_definition_digest !== selection.policy_definition_digest
+      ) {
+        throw this.#corrupt("stored premise-policy selection binding projection disagrees with its premise");
+      }
+      (selectionRowsByRevision[String(revision)] ??= []).push(selection);
+    }
+    if (Object.keys(selectionRowsByRevision).some((revision) =>
+      expectedSelectionsByRevision[revision] === undefined,
+    )) {
+      throw this.#corrupt("stored premise-policy selection references a missing mapping");
+    }
+    for (const row of premiseRows) {
+      const revision = Number(row.config_revision);
+      const expectedSelections = expectedSelectionsByRevision[String(revision)];
+      const actualSelections = selectionRowsByRevision[String(revision)] ?? [];
+      if (
+        expectedSelections === undefined ||
+        actualSelections.map(selectionKey).join("\u0001") !== expectedSelections.map(selectionKey).join("\u0001")
+      ) {
+        throw this.#corrupt(`premise selection projection disagrees with canonical config for revision ${revision}`);
+      }
+    }
+  }
+
+
+  #refreshControllerGeneration(): void {
+    this.#statement("BEGIN IMMEDIATE").run();
+    try {
+      const state = this.#connection.prepare(
+        "SELECT current_config_revision, current_config_digest FROM runtime_authority_state WHERE singleton = 1",
+      ).get();
+      if (!state) throw this.#corrupt("authority-state singleton disappeared during generation refresh");
+      const recordBytes = Buffer.from(
+        canonicalBytes(
+          stateRecord(
+            this.#identity,
+            this.#controllerGenerationId,
+            Number(state.current_config_revision),
+            String(state.current_config_digest),
+          ),
+        ),
+      );
+      this.#connection.prepare(
+        "UPDATE core_meta SET controller_generation_id = ? WHERE singleton = 1",
+      ).run(this.#controllerGenerationId);
+      this.#connection.prepare(
+        "UPDATE runtime_authority_state SET controller_generation_id = ?, record_jcs = ? WHERE singleton = 1",
+      ).run(this.#controllerGenerationId, recordBytes);
+      this.#statement("COMMIT").run();
+    } catch (error) {
+      try {
+        this.#statement("ROLLBACK").run();
+      } catch {
+        /* preserve the original failure */
+      }
+      throw this.#translateError(error);
+    }
+  }
+
+  /** Loads a committed mapping with full identity/config verification; null when absent. */
   #resolveMapping(revision: number, declaredDigest: string): { bytes: Uint8Array; digest: string } | null {
+    const row = this.#connection.prepare(
+      "SELECT config_revision, daemon_installation_id, instance_id, config_digest, canonical_bytes FROM config_revision_mappings WHERE config_revision = ?",
+    ).get(revision);
+    if (!row) return null;
+    if (
+      Number(row.config_revision) !== revision ||
+      row.daemon_installation_id !== this.#identity.daemonInstallationId ||
+      row.instance_id !== this.#identity.instanceId ||
+      String(row.config_digest) !== declaredDigest
+    ) {
+      throw this.#corrupt("config mapping projection disagrees with its stored authority identity or record");
+    }
+    const bytes = toBytes(row.canonical_bytes);
+    let parsed: JsonValue;
+    try {
+      parsed = parseCanonicalJsonBytes(bytes);
+      assertCanonicalJsonValue(parsed);
+      validateResolvedConfiguration(parsed, `revision ${revision} canonical config`);
+    } catch (error) {
+      if (error instanceof RuntimeAuthorityDatabaseError) throw error;
+      throw this.#corrupt(`revision ${revision} canonical_bytes are malformed: ${String(error)}`);
+    }
+    const canonical = canonicalBytes(parsed);
+    if (!sameBytes(bytes, canonical)) {
+      throw this.#corrupt(`revision ${revision} canonical_bytes are not canonical JSON bytes`);
+    }
+    const computed = sha256DigestOfBytes(canonical);
+    if (computed !== declaredDigest) {
+      throw this.#corrupt(`revision ${revision} canonical bytes do not match the stored digest`);
+    }
+    return { bytes: canonical, digest: declaredDigest };
+  }
+
+  /** Legacy source mapping reader used only before the v2 identity columns exist. */
+  #resolveLegacyMapping(revision: number, declaredDigest: string): { bytes: Uint8Array; digest: string } | null {
     const row = this.#connection.prepare(
       "SELECT config_revision, config_digest, canonical_bytes FROM config_revision_mappings WHERE config_revision = ?",
     ).get(revision);
     if (!row) return null;
     if (Number(row.config_revision) !== revision || String(row.config_digest) !== declaredDigest) {
-      throw this.#corrupt("config mapping projection disagrees with its stored record");
+      throw this.#corrupt("legacy config mapping projection disagrees with its stored record");
     }
     const bytes = toBytes(row.canonical_bytes);
-    const computed = sha256DigestOfBytes(bytes);
-    if (computed !== declaredDigest) {
-      throw this.#corrupt(`revision ${revision} canonical bytes do not match the stored digest`);
+    let parsed: JsonValue;
+    try {
+      parsed = parseCanonicalJsonBytes(bytes);
+      assertCanonicalJsonValue(parsed);
+      validateResolvedConfiguration(parsed, `legacy revision ${revision} canonical config`);
+    } catch (error) {
+      if (error instanceof RuntimeAuthorityDatabaseError) throw error;
+      throw this.#corrupt(`legacy revision ${revision} canonical_bytes are malformed: ${String(error)}`);
     }
-    return { bytes, digest: declaredDigest };
+    const canonical = canonicalBytes(parsed);
+    if (!sameBytes(bytes, canonical) || sha256DigestOfBytes(canonical) !== declaredDigest) {
+      throw this.#corrupt(`legacy revision ${revision} canonical bytes disagree with its digest`);
+    }
+    return { bytes: canonical, digest: declaredDigest };
   }
 
   /** Loads and verifies the one premise of a revision (digest + projection). Returns null when none. */
@@ -1018,11 +2328,26 @@ export class RuntimeAuthorityDatabase {
     if (Number(row.config_revision) !== revision || String(row.config_digest) !== configDigest) {
       throw this.#corrupt(`premise projection disagrees with revision ${revision}`);
     }
-    const record = parseCanonicalJsonBytes(toBytes(row.record_jcs));
-    assertCanonicalJsonValue(record);
+    const rawRecordBytes = toBytes(row.record_jcs);
+    let record: JsonValue;
+    try {
+      record = parseCanonicalJsonBytes(rawRecordBytes);
+      assertCanonicalJsonValue(record);
+    } catch (error) {
+      throw this.#corrupt(`premise record_jcs for revision ${revision} is malformed: ${String(error)}`);
+    }
+    const canonicalRecordBytes = canonicalBytes(record);
+    if (!sameBytes(rawRecordBytes, canonicalRecordBytes)) {
+      throw this.#corrupt(`premise record_jcs for revision ${revision} is not canonical JSON bytes`);
+    }
     const premise = validatePremise(record, `revision ${revision} premise`);
-    if (premise.config_revision !== revision || premise.config_digest !== configDigest) {
-      throw this.#corrupt(`premise record disagrees with revision ${revision}`);
+    if (
+      premise.daemon_installation_id !== this.#identity.daemonInstallationId ||
+      premise.instance_id !== this.#identity.instanceId ||
+      premise.config_revision !== revision ||
+      premise.config_digest !== configDigest
+    ) {
+      throw this.#corrupt(`premise record disagrees with revision ${revision} authority identity`);
     }
     if (premise.premises_digest !== String(row.premises_digest)) {
       throw this.#corrupt(`premise digest projection disagrees with the stored record for revision ${revision}`);
@@ -1054,7 +2379,7 @@ export class RuntimeAuthorityDatabase {
     if (this.#userVersion() === 0) return null;
     this.#verifyCommitted();
     const state = this.#connection.prepare(
-      "SELECT current_config_revision, current_config_digest FROM runtime_authority_state WHERE singleton = 1",
+      "SELECT current_config_revision, current_config_digest, controller_generation_id FROM runtime_authority_state WHERE singleton = 1",
     ).get();
     const revision = Number(state?.current_config_revision);
     const digest = String(state?.current_config_digest);
@@ -1074,6 +2399,7 @@ export class RuntimeAuthorityDatabase {
     return {
       config_revision: revision,
       config_digest: digest,
+      controller_generation_id: String(state?.controller_generation_id),
       canonicalConfigBytes: mapping.bytes,
       canonicalConfig,
       premise,
@@ -1197,7 +2523,7 @@ export class RuntimeAuthorityDatabase {
       }
     }
     const state = this.#connection.prepare(
-      "SELECT current_config_revision, current_config_digest, daemon_installation_id, instance_id FROM runtime_authority_state WHERE singleton = 1",
+      "SELECT current_config_revision, current_config_digest, daemon_installation_id, instance_id, controller_generation_id FROM runtime_authority_state WHERE singleton = 1",
     ).get();
     let currentRevision: number | null = null;
     let currentDigest: string | null = null;
@@ -1234,6 +2560,16 @@ export class RuntimeAuthorityDatabase {
         "a configuration selecting no installed Linux Module must not carry a premise",
       );
     }
+    if (premiseRequired) {
+      try {
+        validatePremise(input.premise, "premise");
+      } catch (error) {
+        if (error instanceof RuntimeAuthorityDatabaseError && error.message.includes("sorted and unique")) {
+          throw new RuntimeAuthorityDatabaseError("MODULE_ACTIVATION_PREMISES_INVALID", error.message, { cause: error });
+        }
+        throw error;
+      }
+    }
     // Reuse the exact current mapping: identical digest AND bytes.
     if (currentRevision !== null && currentDigest === input.configDigest) {
       if (currentBytes !== null && sameBytes(currentBytes, input.canonicalConfigBytes)) {
@@ -1256,11 +2592,18 @@ export class RuntimeAuthorityDatabase {
     if (crashPoint === "after_begin_immediate_before_mapping") {
       throw new RuntimeAuthorityCrashPointError(crashPoint);
     }
-    // Insert the append-only mapping (REQ-AUTH-002 step 5).
+    // Insert the append-only mapping (REQ-AUTH-002 step 5). The identity
+    // columns are Host-owned parent projections, not a parallel revision key.
     try {
       this.#connection.prepare(
-        "INSERT INTO config_revision_mappings (config_revision, config_digest, canonical_bytes) VALUES (?, ?, ?)",
-      ).run(next, input.configDigest, Buffer.from(input.canonicalConfigBytes));
+        "INSERT INTO config_revision_mappings (config_revision, daemon_installation_id, instance_id, config_digest, canonical_bytes) VALUES (?, ?, ?, ?, ?)",
+      ).run(
+        next,
+        input.identity.daemonInstallationId,
+        input.identity.instanceId,
+        input.configDigest,
+        Buffer.from(input.canonicalConfigBytes),
+      );
     } catch (error) {
       throw this.#translateError(error);
     }
@@ -1292,8 +2635,18 @@ export class RuntimeAuthorityDatabase {
     // Closed-record validation first: a premise record (and every embedded
     // definition/binding/candidate) must satisfy the closed runtime-authority
     // definitions before any row is written, so a record smuggling a path,
-    // secret, function, or live-object shape is refused before admission.
-    validatePremise(premise, "premise");
+    try {
+      validatePremise(premise, "premise");
+    } catch (error) {
+      if (error instanceof RuntimeAuthorityDatabaseError && error.message.includes("sorted and unique")) {
+        throw new RuntimeAuthorityDatabaseError(
+          "MODULE_ACTIVATION_PREMISES_INVALID",
+          error.message,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
     if (premise.config_revision !== next) {
       throw new RuntimeAuthorityDatabaseError(
         "MODULE_ACTIVATION_PREMISES_INVALID",
@@ -1492,19 +2845,44 @@ export class RuntimeAuthorityDatabase {
 
   #updateCurrentPointer(next: number, input: InstallAuthorityConfigInput, first: boolean): void {
     if (first) {
+      const identity = this.#connection.prepare(
+        "SELECT sqlite_version() AS version, sqlite_source_id() AS source_id",
+      ).get();
+      const versionParts = String(identity?.version ?? "").split(".").map((part) => Number(part));
+      const versionNumber =
+        versionParts.length === 3 && versionParts.every((part) => Number.isSafeInteger(part))
+          ? (versionParts[0] ?? 0) * 1_000_000 + (versionParts[1] ?? 0) * 1_000 + (versionParts[2] ?? 0)
+          : 0;
+      const sourceId = String(identity?.source_id ?? "");
+      const artifactDigest = sha256DigestOfBytes(Buffer.from(sourceId, "utf8"));
       this.#connection.prepare(
-        "INSERT INTO core_meta (singleton, authority_schema_version, daemon_installation_id, instance_id) VALUES (1, ?, ?, ?)",
-      ).run(RUNTIME_AUTHORITY_SCHEMA_VERSION, input.identity.daemonInstallationId, input.identity.instanceId);
+        "INSERT INTO core_meta (singleton, schema_version, daemon_installation_id, instance_id, controller_generation_id, clean_shutdown, sqlite_version_number, sqlite_source_id, sqlite_artifact_digest) VALUES (1, ?, ?, ?, ?, 0, ?, ?, ?)",
+      ).run(
+        RUNTIME_AUTHORITY_SCHEMA_VERSION,
+        input.identity.daemonInstallationId,
+        input.identity.instanceId,
+        this.#controllerGenerationId,
+        versionNumber,
+        sourceId,
+        artifactDigest,
+      );
+      this.#connection.prepare(
+        "INSERT INTO commit_sequence (singleton, next_value) VALUES (1, ?)",
+      ).run(2);
     }
-    const bytes = Buffer.from(canonicalBytes(stateRecord(input.identity, next, input.configDigest)));
+    const bytes = Buffer.from(
+      canonicalBytes(stateRecord(input.identity, this.#controllerGenerationId, next, input.configDigest)),
+    );
     this.#connection.prepare(
-      "INSERT INTO runtime_authority_state (singleton, authority_schema_version, daemon_installation_id, instance_id, current_config_revision, current_config_digest, record_jcs) VALUES (1, ?, ?, ?, ?, ?, ?) " +
+      "INSERT INTO runtime_authority_state (singleton, authority_schema_version, daemon_installation_id, instance_id, controller_generation_id, current_config_revision, current_config_digest, record_jcs) VALUES (1, ?, ?, ?, ?, ?, ?, ?) " +
       "ON CONFLICT(singleton) DO UPDATE SET authority_schema_version = excluded.authority_schema_version, " +
+      "daemon_installation_id = excluded.daemon_installation_id, instance_id = excluded.instance_id, controller_generation_id = excluded.controller_generation_id, " +
       "current_config_revision = excluded.current_config_revision, current_config_digest = excluded.current_config_digest, record_jcs = excluded.record_jcs",
     ).run(
-      RUNTIME_AUTHORITY_SCHEMA_VERSION,
+      HOST_AUTHORITY_SCHEMA_VERSION,
       input.identity.daemonInstallationId,
       input.identity.instanceId,
+      this.#controllerGenerationId,
       next,
       input.configDigest,
       bytes,

@@ -1,0 +1,66 @@
+{
+  "schema": "dolly.test-vector/v1",
+  "test_id": "TST-AUTH-007",
+  "kind": "core_transition",
+  "covers": ["REQ-AUTH-001", "REQ-AUTH-004", "REQ-AUTH-005", "INV-AUTH-001"],
+  "initial": {
+    "physical_projection": "typescript-pre-bridge-v1",
+    "user_version": 1,
+    "host_authority_meta": null,
+    "core_meta": {
+      "authority_schema_version": 1,
+      "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000551",
+      "instance_id": "main"
+    },
+    "mapping_columns": ["config_revision", "config_digest", "canonical_bytes"],
+    "state_record": {
+      "schema": "dolly.runtime-authority-state/v1",
+      "authority_schema_version": 1,
+      "daemon_installation_id": "0198ab31-6c44-7e8a-b2bb-000000000551",
+      "instance_id": "main",
+      "current_config_revision": 1,
+      "current_config_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "stimulus": {
+    "commands": [
+      "ValidateAllReachableV1RowsAndCanonicalBytes",
+      "BeginImmediateExplicitV1ToV2Migration",
+      "ReopenWithControllerGeneration"
+    ],
+    "required_checks": [
+      "HostAuthorityMetaVersion2",
+      "IdentityBearingConfigRevisionMapping",
+      "ControllerGenerationAgreement",
+      "CanonicalBytesRoundTrip",
+      "DigestFromCanonicalBytes",
+      "ParserDepthAndSizeLimits",
+      "MissingMalformedFailClosed"
+    ],
+    "hostile_cases": [
+      "noncanonical_mapping_bytes",
+      "raw_hash_only_mapping",
+      "missing_host_authority_meta",
+      "parallel_config_revisions",
+      "malformed_controller_generation"
+    ],
+    "cross_language_golden": {
+      "state_canonical_bytes_utf8": "{\"authority_schema_version\":2,\"controller_generation_id\":\"0198ab31-6c44-7e8a-b2bb-000000000651\",\"current_config_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"current_config_revision\":1,\"daemon_installation_id\":\"0198ab31-6c44-7e8a-b2bb-000000000551\",\"instance_id\":\"main\",\"schema\":\"dolly.runtime-authority-state/v1\"}",
+      "state_digest": "sha256:950f18fc5e675a745ea15e312aef6936621aa0c5a60184c2565cd0a64b4c8b57"
+    }
+  },
+  "expected": {
+    "outcome": "explicit-v1-bridge-publishes-rich-v2-host-projection-or-fails-closed",
+    "assertions": [
+      {"path": "/migration/ordinary_open", "op": "equals", "value": "STORAGE_MIGRATION_REQUIRED"},
+      {"path": "/migration/explicit_open", "op": "equals", "value": "STORAGE_MIGRATION_REQUIRED"},
+      {"path": "/migration/config_revision_mappings/identity_columns", "op": "equals", "value": ["config_revision", "config_digest", "canonical_bytes"]},
+      {"path": "/hostile_results/noncanonical_mapping_bytes/error", "op": "equals", "value": "STORAGE_CORRUPT"},
+      {"path": "/hostile_results/raw_hash_only_mapping/error", "op": "equals", "value": "STORAGE_CORRUPT"},
+      {"path": "/hostile_results/missing_host_authority_meta/error", "op": "equals", "value": "STORAGE_MIGRATION_REQUIRED"},
+      {"path": "/hostile_results/parallel_config_revisions/error", "op": "equals", "value": "STORAGE_CORRUPT"},
+      {"path": "/hostile_results/malformed_controller_generation/error", "op": "equals", "value": "STORAGE_CORRUPT"}
+    ],
+    "emitted": []
+  }
+}
