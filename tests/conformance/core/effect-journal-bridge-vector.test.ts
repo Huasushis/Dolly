@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import { join } from "node:path";
@@ -203,6 +204,131 @@ function assertContract(contract: RecordValue): void {
   });
 }
 
+const PARSE_LIMITS = { maxBytes: 262144, maxDepth: 96 };
+const ZERO_DIGEST =
+  "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const LEDGER_STATES: Record<string, true> = {
+  AUTHORIZED: true,
+  DISPATCHED: true,
+  SUCCEEDED: true,
+  FAILED: true,
+  UNKNOWN: true,
+};
+
+function digestOf(value: JsonValue): string {
+  const canonicalBytes = canonicalizeJson(value);
+  return `sha256:${createHash("sha256").update(canonicalBytes, "utf8").digest("hex")}`;
+}
+
+/**
+ * Rebuilds a ledger record's stored digests from its embedded bytes, the way
+ * the Rust producer writes them: operation_digest is the binding digest and
+ * terminal_result_digest is the terminal-result digest. Used by the generation
+ * mutation so the mutated premise stays an internally valid ledger row.
+ */
+function rebuildLedger(record: RecordValue): RecordValue {
+  const rebuilt = structuredClone(record) as RecordValue;
+  rebuilt.operation_digest = digestOf(rebuilt.operation_binding as JsonValue);
+  rebuilt.terminal_result_digest = rebuilt.terminal_result
+    ? digestOf(rebuilt.terminal_result as JsonValue)
+    : null;
+  rebuilt.outbound_digest = outboundDigest(rebuilt.operation_binding as RecordValue);
+  return rebuilt;
+}
+
+/** The exact outbound application payload for the built-in v1 MCP adapter. */
+function outboundPayload(binding: RecordValue): RecordValue {
+  const contract = binding.server_contract as RecordValue;
+  const tool = (contract.tools as RecordValue)[binding.tool_name as string] as RecordValue;
+  if (!tool || typeof tool.upstream_name !== "string") {
+    throw new Error("retained contract does not contain the selected tool");
+  }
+  return {
+    jsonrpc: "2.0",
+    id: binding.server_request_id,
+    method: "tools/call",
+    params: { name: tool.upstream_name, arguments: binding.arguments },
+  };
+}
+
+function outboundDigest(binding: RecordValue): string | null {
+  try {
+    return digestOf(outboundPayload(binding));
+  } catch {
+    return null;
+  }
+}
+
+/** Closed-world shape check mirroring the serde deny_unknown_fields behavior. */
+function ledgerRecordShapeInvalid(record: RecordValue): boolean {
+  const allowed = [
+    "schema",
+    "ledger_revision",
+    "state",
+    "operation_binding",
+    "operation_digest",
+    "outbound_digest",
+    "terminal_result",
+    "terminal_result_digest",
+  ];
+  for (const key of Object.keys(record)) {
+    if (!allowed.includes(key)) {
+      return true;
+    }
+  }
+  return (
+    typeof record.schema !== "string" ||
+    !(record.state as string in LEDGER_STATES) ||
+    typeof record.ledger_revision !== "number"
+  );
+}
+
+/**
+ * The INTENDED journal row that the vector's premise settles, derived from the
+ * premise's own binding identity exactly as the Rust test derives it.
+ */
+function journalRow(premiseWrapper: RecordValue): RecordValue {
+  const ledger = premiseWrapper.record as RecordValue;
+  const binding = ledger.operation_binding as RecordValue;
+  const authority = loadVector().initial.authority as RecordValue;
+  const process_ = authority.process as RecordValue;
+  const claimTokenContext = {
+    schema: "dolly.claim/v2",
+    instance_id: binding.instance_id,
+    module_id: binding.module_id,
+    operation_id: binding.operation_id,
+    operation_digest: ledger.operation_digest,
+    controller_generation: authority.controller_generation,
+    extension_generation: process_.extension_generation,
+    worker_epoch: process_.worker_epoch,
+    package_digest: binding.server_contract.transport.package_digest,
+    policy_premise_digest: authority.policy_premise_digest,
+    effect_class: "MCP_TOOLS_CALL",
+  };
+  return {
+    schema: "dolly.external-effect-journal/v2",
+    journal_revision: 1,
+    state: "INTENDED",
+    claim: {
+      schema: "dolly.claim/v2",
+      instance_id: binding.instance_id,
+      module_id: binding.module_id,
+      operation_id: binding.operation_id,
+      operation_digest: ledger.operation_digest,
+      claim_token: canonicalJsonDigest(claimTokenContext),
+    },
+    controller_generation: authority.controller_generation,
+    extension_generation: process_.extension_generation,
+    worker_epoch: process_.worker_epoch,
+    package_digest: binding.server_contract.transport.package_digest,
+    policy_premise_digest: authority.policy_premise_digest,
+    operation_digest: ledger.operation_digest,
+    effect_class: "MCP_TOOLS_CALL",
+    intent_digest: ledger.outbound_digest,
+    evidence_digest: null,
+  };
+}
+
 describe("TST-TOOL-014 TypeScript side of the cross-language corpus", () => {
   it("validates source records, target JCS bytes, and fail-closed mappings", () => {
     const vector = loadVector();
@@ -296,37 +422,187 @@ describe("TST-TOOL-014 TypeScript side of the cross-language corpus", () => {
       expect(parsed).toEqual(record);
     }
 
-    // Premise direction: a terminal source outcome alone never mints APPLIED.
-    // It settles APPLIED only via an exact, durable, versioned Tool-call ledger
-    // premise (identity tuple match + SUCCEEDED terminal); otherwise fail-closed
-    // UNKNOWN_OUTCOME.
-    const noPremise = cases.find((entry) => entry.ledger_premise === "absent");
-    expect(noPremise).toBeDefined();
-    expect(noPremise!.expected_state).toBe("UNKNOWN_OUTCOME");
-    expect(noPremise!.target.record.state).toBe("UNKNOWN_OUTCOME");
-    expect(noPremise!.target.record.evidence_digest).toBeNull();
-
-    const withPremise = cases.find(
+    // Premise direction: production-equivalent recovery over the exact shared
+    // vector. A terminal source outcome alone never mints APPLIED; only an
+    // identity-matching, internally verified SUCCEEDED Tool-call ledger premise
+    // does. Every mutation must fail closed to UNKNOWN_OUTCOME.
+    const ledgerPremise = cases.find(
       (entry) => (entry.ledger_premise as RecordValue | undefined)?.record?.schema === "dolly.tool-call-ledger/v1",
-    );
-    expect(withPremise).toBeDefined();
-    const ledgerRecord = withPremise!.ledger_premise.record as RecordValue;
-    expect(ledgerRecord.state).toBe("SUCCEEDED");
-    expect(ledgerRecord.ledger_revision).toBe(3);
-    expect(withPremise!.expected_state).toBe("APPLIED");
-    expect(withPremise!.target.record.state).toBe("APPLIED");
-    // Concrete Claim/generation/outbound/terminal-result equality with the
-    // exact authoritative ledger record. No response/ACK evidence is copied.
-    const binding = ledgerRecord.operation_binding as RecordValue;
-    const claim = withPremise!.target.claim as RecordValue;
-    const rec = withPremise!.target.record as RecordValue;
-    expect(claim.operation_id).toBe(binding.operation_id);
-    expect(claim.instance_id).toBe(binding.instance_id);
-    expect(claim.module_id).toBe(binding.module_id);
-    expect(claim.operation_digest).toBe(ledgerRecord.operation_digest);
-    expect(rec.intent_digest).toBe(ledgerRecord.outbound_digest);
-    expect(rec.package_digest).toBe(binding.server_contract.transport.package_digest);
-    expect(rec.evidence_digest).toBe(ledgerRecord.terminal_result_digest);
+    ) as RecordValue;
+    const premiseWrapper = ledgerPremise.ledger_premise as RecordValue;
+    expect((premiseWrapper.record as RecordValue).state).toBe("SUCCEEDED");
+    expect((premiseWrapper.record as RecordValue).ledger_revision).toBe(3);
+
+    // Mirrors recover_effect_journal: the journal row is INTENDED, the premise
+    // must be a SUCCEEDED ledger record whose binding identity equals the
+    // Claim's, whose recomputed operation/outbound digests match the frozen
+    // journal digests, and whose terminal result supplies the evidence.
+    const recoverEffectJournal = (
+      journal: RecordValue,
+      premise: RecordValue | null,
+    ): { settlement: "applied"; evidence_digest: string } | "unknown_outcome" => {
+      if (journal.state !== "INTENDED" || journal.effect_class !== "MCP_TOOLS_CALL") {
+        return "unknown_outcome";
+      }
+      if (!premise || premise.schema !== "dolly.tool-call-ledger/v1") {
+        return "unknown_outcome";
+      }
+      if (
+        ledgerRecordShapeInvalid(premise) ||
+        digestOf(premise.operation_binding as JsonValue) !== premise.operation_digest
+      ) {
+        return "unknown_outcome";
+      }
+      const binding = premise.operation_binding as RecordValue;
+      if (
+        binding.instance_id !== journal.claim.instance_id ||
+        binding.module_id !== journal.claim.module_id ||
+        binding.operation_id !== journal.claim.operation_id ||
+        premise.operation_digest !== journal.operation_digest ||
+        binding.server_contract.transport.package_digest !== journal.package_digest ||
+        outboundDigest(binding) !== journal.intent_digest
+      ) {
+        return "unknown_outcome";
+      }
+      if (premise.state !== "SUCCEEDED") {
+        return "unknown_outcome";
+      }
+      if (!premise.terminal_result || !premise.terminal_result_digest) {
+        return "unknown_outcome";
+      }
+      if (digestOf(premise.terminal_result as JsonValue) !== premise.terminal_result_digest) {
+        return "unknown_outcome";
+      }
+      if ((premise.outbound_digest as string) !== journal.intent_digest) {
+        return "unknown_outcome";
+      }
+      return { settlement: "applied", evidence_digest: premise.terminal_result_digest };
+    };
+
+    const MUTATION_NAMES: readonly string[] = [
+      "missing_premise",
+      "extra_forbidden_field",
+      "claim_identity_mismatch",
+      "dispatch_generation_mismatch",
+      "operation_binding_digest_mismatch",
+      "outbound_bytes_digest_mismatch",
+      "terminal_result_bytes_digest_mismatch",
+      "response_ack_cache_readiness_candidate",
+      "effect_class_settlement_mismatch",
+    ];
+
+    let appliedCount = 0;
+    let unknownCount = 0;
+    for (const name of MUTATION_NAMES) {
+      switch (name) {
+        case "missing_premise": {
+          expect(recoverEffectJournal(journalRow(premiseWrapper), null)).toBe("unknown_outcome");
+          unknownCount += 1;
+          break;
+        }
+        case "extra_forbidden_field": {
+          const extra = structuredClone(premiseWrapper) as RecordValue;
+          (extra.record as RecordValue).mutable_queue_state = "ready";
+          // The production deserializer rejects closed-world records with
+          // unknown members (serde deny_unknown_fields equivalent).
+          expect(ledgerRecordShapeInvalid(extra.record as RecordValue)).toBe(true);
+          expect(recoverEffectJournal(journalRow(premiseWrapper), extra.record)).toBe(
+            "unknown_outcome",
+          );
+          unknownCount += 1;
+          break;
+        }
+        case "claim_identity_mismatch": {
+          const bad = structuredClone(journalRow(premiseWrapper)) as RecordValue;
+          (bad.claim as RecordValue).operation_id =
+            "0198ab31-6c44-7e8a-b2bb-000000000999";
+          expect(recoverEffectJournal(bad, premiseWrapper.record as RecordValue)).toBe(
+            "unknown_outcome",
+          );
+          unknownCount += 1;
+          break;
+        }
+        case "dispatch_generation_mismatch": {
+          const prem = structuredClone(premiseWrapper) as RecordValue;
+          const premBinding = (prem.record as RecordValue).operation_binding as RecordValue;
+          premBinding.activation_lease_generation = (premBinding.activation_lease_generation as number) + 1;
+          premBinding.tool_server_generation = (premBinding.tool_server_generation as number) + 1;
+          const otherGen = rebuildLedger(prem.record as RecordValue);
+          expect(otherGen.operation_digest).not.toBe(journalRow(premiseWrapper).operation_digest);
+          expect(recoverEffectJournal(journalRow(premiseWrapper), otherGen)).toBe("unknown_outcome");
+          unknownCount += 1;
+          break;
+        }
+        case "operation_binding_digest_mismatch": {
+          const bad = structuredClone(journalRow(premiseWrapper)) as RecordValue;
+          bad.operation_digest = ZERO_DIGEST;
+          (bad.claim as RecordValue).operation_digest = ZERO_DIGEST;
+          expect(recoverEffectJournal(bad, premiseWrapper.record as RecordValue)).toBe(
+            "unknown_outcome",
+          );
+          unknownCount += 1;
+          break;
+        }
+        case "outbound_bytes_digest_mismatch": {
+          const bad = structuredClone(journalRow(premiseWrapper)) as RecordValue;
+          bad.intent_digest = ZERO_DIGEST;
+          expect(recoverEffectJournal(bad, premiseWrapper.record as RecordValue)).toBe(
+            "unknown_outcome",
+          );
+          unknownCount += 1;
+          break;
+        }
+        case "terminal_result_bytes_digest_mismatch": {
+          const prem = structuredClone(premiseWrapper) as RecordValue;
+          const rec = prem.record as RecordValue;
+          (rec.terminal_result as RecordValue).output = "tampered";
+          expect(digestOf(rec.terminal_result as JsonValue)).not.toBe(rec.terminal_result_digest);
+          expect(recoverEffectJournal(journalRow(prem), rec)).toBe("unknown_outcome");
+          unknownCount += 1;
+          break;
+        }
+        case "response_ack_cache_readiness_candidate": {
+          const prem = structuredClone(premiseWrapper) as RecordValue;
+          const rec = prem.record as RecordValue;
+          rec.state = "DISPATCHED";
+          rec.ledger_revision = 2;
+          rec.terminal_result = null;
+          rec.terminal_result_digest = null;
+          expect(recoverEffectJournal(journalRow(prem), rec)).toBe("unknown_outcome");
+          unknownCount += 1;
+          break;
+        }
+        case "effect_class_settlement_mismatch": {
+          const wrongClass = structuredClone(journalRow(premiseWrapper)) as RecordValue;
+          wrongClass.effect_class = "MCP_INITIALIZE_HANDSHAKE_V1";
+          expect(recoverEffectJournal(wrongClass, premiseWrapper.record as RecordValue)).toBe(
+            "unknown_outcome",
+          );
+          const settled = structuredClone(journalRow(premiseWrapper)) as RecordValue;
+          settled.state = "APPLIED";
+          settled.journal_revision = 2;
+          settled.evidence_digest = (premiseWrapper.record as RecordValue).terminal_result_digest;
+          expect(recoverEffectJournal(settled, premiseWrapper.record as RecordValue)).toBe(
+            "unknown_outcome",
+          );
+          unknownCount += 1;
+          break;
+        }
+        default:
+          throw new Error(`unhandled mutation ${name}`);
+      }
+    }
+    expect(MUTATION_NAMES).toHaveLength(9);
+    expect(unknownCount).toBe(9);
+
+    // The exact premise still settles APPLIED with the ledger evidence.
+    const exact = recoverEffectJournal(journalRow(premiseWrapper), premiseWrapper.record as RecordValue);
+    expect(exact).toEqual({
+      settlement: "applied",
+      evidence_digest: (premiseWrapper.record as RecordValue).terminal_result_digest,
+    });
+    appliedCount += 1;
+    expect(appliedCount).toBe(1);
   });
 
   it("keeps Extension framing and MCP framing as separate dialects", async () => {

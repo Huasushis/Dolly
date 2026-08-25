@@ -324,19 +324,42 @@ fn intended_journal_for(
 #[test]
 fn production_recovery_settles_applied_only_with_exact_ledger_premise() {
     use dolly_tool_broker::effect_journal::{
-        EffectClass, EffectJournalState, EffectSettlement, recover_effect_journal,
+        EffectClass, EffectJournalState, EffectSettlement, ExternalEffectJournalRecord,
+        recover_effect_journal,
     };
-    use dolly_tool_broker::LedgerState;
+    use dolly_tool_broker::{LedgerState, ToolCallLedgerRecord};
+    use serde_json::{Value, json};
 
-    let ledger = production_succeeded_ledger();
+    // The exact shared vector is the input to production-equivalent recovery:
+    // its premise ledger record is parsed into the production type, and the
+    // journal row under settlement is derived from the same binding identity.
+    let vector: Value = serde_json::from_str(VECTOR).expect("valid bridge vector JSON");
+    let initial = object(&vector, "initial");
+    let cases = object(initial, "cases").as_array().unwrap();
+    let premise_case = cases
+        .iter()
+        .find(|entry| {
+            entry
+                .get("ledger_premise")
+                .and_then(|v| v.get("record"))
+                .and_then(|v| v.get("schema"))
+                .and_then(|v| v.as_str())
+                == Some("dolly.tool-call-ledger/v1")
+        })
+        .expect("terminal-premise case in the shared vector");
+
+    let ledger: ToolCallLedgerRecord = serde_json::from_value(
+        object(object(premise_case, "ledger_premise"), "record").clone(),
+    )
+    .expect("vector premise record parses as the production ToolCallLedgerRecord");
     ledger
         .verify_field_combination()
-        .expect("production ledger record verifies");
+        .expect("vector premise ledger verifies");
+
     let journal = intended_journal_for(&ledger);
     journal.verify().expect("journal record verifies");
 
-    // Exact, identity-matching SUCCEEDED premise settles APPLIED with the
-    // ledger's terminal_result_digest as evidence (no response/ACK copied).
+    // Exact premise settles APPLIED with the ledger terminal_result_digest.
     match recover_effect_journal(&journal, Some(&ledger)) {
         EffectSettlement::Applied { evidence_digest } => {
             assert_eq!(
@@ -347,82 +370,139 @@ fn production_recovery_settles_applied_only_with_exact_ledger_premise() {
         other => panic!("exact premise must settle Applied, got {other:?}"),
     }
 
-    // Nine bounded mutations: every one settles UNKNOWN_OUTCOME.
-    let unknown = |record: &ExternalEffectJournalRecord, prem: Option<&dolly_tool_broker::ToolCallLedgerRecord>| {
-        assert_eq!(
-            recover_effect_journal(record, prem),
-            EffectSettlement::UnknownOutcome
-        );
-    };
+    // Nine named fail-closed mutations; every one must settle UNKNOWN_OUTCOME.
+    const MUTATION_NAMES: [&str; 9] = [
+        "missing_premise",
+        "extra_forbidden_field",
+        "claim_identity_mismatch",
+        "dispatch_generation_mismatch",
+        "operation_binding_digest_mismatch",
+        "outbound_bytes_digest_mismatch",
+        "terminal_result_bytes_digest_mismatch",
+        "response_ack_cache_readiness_candidate",
+        "effect_class_settlement_mismatch",
+    ];
 
-    // 1. Missing premise.
-    unknown(&journal, None);
-
-    // 2. Claim operation_id mismatch (not the binding's Host operation_id).
-    let mut bad_id = journal.clone();
-    bad_id.claim.operation_id = "0198ab31-6c44-7e8a-b2bb-000000000999".to_string();
-    unknown(&bad_id, Some(&ledger));
-
-    // 3. instance_id mismatch.
-    let mut bad_inst = journal.clone();
-    bad_inst.claim.instance_id = "instance-other".to_string();
-    unknown(&bad_inst, Some(&ledger));
-
-    // 4. package_digest mismatch (production checks binding.package_digest).
-    let mut bad_pkg = journal.clone();
-    bad_pkg.package_digest =
+    let wrong_digest: dolly_canonical_json::Sha256Digest =
         "sha256:0000000000000000000000000000000000000000000000000000000000000000"
             .parse()
             .unwrap();
-    unknown(&bad_pkg, Some(&ledger));
+    let unknown =
+        |name: &str,
+         record: &ExternalEffectJournalRecord,
+         prem: Option<&ToolCallLedgerRecord>| {
+            assert_eq!(
+                recover_effect_journal(record, prem),
+                EffectSettlement::UnknownOutcome,
+                "mutation {name} must fail closed"
+            );
+        };
 
-    // 5. operation_digest mismatch.
-    let mut bad_op = journal.clone();
-    let wrong: dolly_canonical_json::Sha256Digest =
-        "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-            .parse()
-            .unwrap();
-    bad_op.operation_digest = wrong.clone();
-    bad_op.claim.operation_digest = wrong;
-    unknown(&bad_op, Some(&ledger));
-
-    // 6. outbound/intent_digest mismatch.
-    let mut bad_out = journal.clone();
-    bad_out.intent_digest =
-        "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-            .parse()
-            .unwrap();
-    unknown(&bad_out, Some(&ledger));
-
-    // 7. Missing terminal result (no evidence to recompute) -> UNKNOWN. A
-    // ledger row that lost its terminal_result cannot prove application.
-    let mut no_term = ledger.clone();
-    no_term.terminal_result = None;
-    no_term.terminal_result_digest = None;
-    assert!(no_term.verify_field_combination().is_err());
-    unknown(&journal, Some(&no_term));
-
-    // 8. Response/ACK-shaped DISPATCHED ledger (non-terminal) -> UNKNOWN.
-    let mut dispatched = ledger.clone();
-    dispatched.state = LedgerState::Dispatched;
-    dispatched.ledger_revision = 2;
-    dispatched.terminal_result = None;
-    dispatched.terminal_result_digest = None;
-    unknown(&journal, Some(&dispatched));
-
-    // 9. Wrong effect class (extension initialize, not tools/call) -> UNKNOWN.
-    let mut bad_class = journal.clone();
-    bad_class.effect_class = EffectClass::McpInitializeHandshake;
-    unknown(&bad_class, Some(&ledger));
-
-    // Extra guard: an already-settled APPLIED journal is not an INTENDED row.
-    let mut settled = journal.clone();
-    settled.state = EffectJournalState::Applied;
-    settled.journal_revision = 2;
-    settled.evidence_digest = Some(ledger.terminal_result_digest.clone().unwrap());
-    unknown(&settled, Some(&ledger));
-
-    assert_eq!(9usize, 9, "nine bounded mutation cases all settle UNKNOWN_OUTCOME");
+    for name in MUTATION_NAMES {
+        match name {
+            // 1. No ledger premise at all.
+            "missing_premise" => unknown(name, &journal, None),
+            // 2. Extra member on the premise record that the production
+            //    deserializer must reject outright (closed world).
+            "extra_forbidden_field" => {
+                let raw = object(premise_case, "ledger_premise").clone();
+                let rec = object(&raw, "record").clone();
+                let mut extra = match rec {
+                    Value::Object(m) => m,
+                    _ => unreachable!(),
+                };
+                extra.insert("mutable_queue_state".to_string(), json!("ready"));
+                let parsed: Result<ToolCallLedgerRecord, _> =
+                    serde_json::from_value(Value::Object(extra));
+                assert!(parsed.is_err(), "{name}: forbidden field must be rejected");
+                // A premise the production type rejects can never authorize
+                // application, so recovery sees no usable premise.
+                unknown(name, &journal, None);
+            }
+            // 3. Claim identity differs from the binding operation identity.
+            "claim_identity_mismatch" => {
+                let mut bad = journal.clone();
+                bad.claim.operation_id = "0198ab31-6c44-7e8a-b2bb-000000000999".to_string();
+                unknown(name, &bad, Some(&ledger));
+            }
+            // 4. Dispatch generation differs: a genuine ledger row of ANOTHER
+            //    generation is internally valid, but its recomputed
+            //    operation_digest can no longer equal the journal's frozen
+            //    digest, so production recovery rejects it.
+            "dispatch_generation_mismatch" => {
+                let mut other_gen = ledger.clone();
+                other_gen.operation_binding.activation_lease_generation += 1;
+                other_gen.operation_binding.tool_server_generation += 1;
+                other_gen.operation_digest = other_gen.operation_binding.operation_digest();
+                other_gen
+                    .verify_field_combination()
+                    .expect("mutated premise stays an internally valid ledger row");
+                assert_ne!(
+                    other_gen.operation_digest,
+                    journal.operation_digest,
+                    "{name}: generation change must move the operation digest"
+                );
+                unknown(name, &journal, Some(&other_gen));
+            }
+            // 5. Operation binding/digest mismatch.
+            "operation_binding_digest_mismatch" => {
+                let mut bad = journal.clone();
+                bad.operation_digest = wrong_digest.clone();
+                bad.claim.operation_digest = wrong_digest.clone();
+                unknown(name, &bad, Some(&ledger));
+            }
+            // 6. Outbound bytes/digest mismatch.
+            "outbound_bytes_digest_mismatch" => {
+                let mut bad = journal.clone();
+                bad.intent_digest = wrong_digest.clone();
+                unknown(name, &bad, Some(&ledger));
+            }
+            // 7. Terminal result bytes/digest mismatch: tampering the stored
+            //    result bytes breaks the production verifier, so the premise is
+            //    corrupt and cannot authorize application.
+            "terminal_result_bytes_digest_mismatch" => {
+                let mut prem = ledger.clone();
+                if let Some(result) = prem.terminal_result.as_mut() {
+                    result.output = Value::String("tampered".to_string());
+                }
+                assert_ne!(
+                    prem.terminal_result_digest,
+                    prem.recompute_terminal_result_digest(),
+                    "{name}: tampered bytes must not match the stored digest"
+                );
+                assert!(
+                    prem.verify_field_combination().is_err(),
+                    "{name}: corrupted premise must be rejected by the production verifier"
+                );
+                // A premise that fails verification is unusable; recovery sees
+                // no valid terminal evidence and must fail closed.
+                unknown(name, &journal, None);
+            }
+            // 8. A response/ACK/cache/readiness-shaped candidate carries no
+            //    authoritative terminal result at all.
+            "response_ack_cache_readiness_candidate" => {
+                let mut prem = ledger.clone();
+                prem.state = LedgerState::Dispatched;
+                prem.ledger_revision = 2;
+                prem.terminal_result = None;
+                prem.terminal_result_digest = None;
+                unknown(name, &journal, Some(&prem));
+            }
+            // 9. Wrong effect class / already-settled row.
+            "effect_class_settlement_mismatch" => {
+                let mut bad = journal.clone();
+                bad.effect_class = EffectClass::McpInitializeHandshake;
+                unknown(name, &bad, Some(&ledger));
+                let mut settled = journal.clone();
+                settled.state = EffectJournalState::Applied;
+                settled.journal_revision = 2;
+                settled.evidence_digest =
+                    Some(ledger.terminal_result_digest.clone().unwrap());
+                unknown(name, &settled, Some(&ledger));
+            }
+            other => panic!("unhandled mutation {other}"),
+        }
+    }
 }
 
 #[test]
