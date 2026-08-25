@@ -63,4 +63,19 @@ describe("instance controller lock platform preflight", () => {
       expect(existsSync(controllersDirectory)).toBe(false);
     },
   );
+
+  it("does not carry a dead Windows endpoint or a Windows support claim", async () => {
+    // The acquire preflight refuses every non-Linux host, so a Windows
+    // named-pipe endpoint is unreachable. A surviving Windows support
+    // message would contradict that refusal and be untruthful. This guards
+    // the boundary text, not Linux behavior.
+    const { readFile } = await import("node:fs/promises");
+    const source = await readFile(
+      new URL("../../../src/core/instance-controller-lock.ts", import.meta.url),
+      "utf8",
+    );
+    expect(source).not.toContain("currently supported on Linux and Windows");
+    expect(source).not.toContain("\\\\.\\\\pipe\\\\dolly-controller");
+    expect(source).toContain("CONTROLLER_LOCK_PLATFORM_UNSUPPORTED");
+  });
 });

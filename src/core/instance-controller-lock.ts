@@ -99,19 +99,18 @@ function canonicalDirectory(input: string): string {
 }
 
 function controllerEndpoint(id: string): { name: string } {
+  // The acquire preflight (see `observeHostPlatform` above) refuses every
+  // non-Linux host before this function can run, so a Windows named-pipe
+  // endpoint is unreachable and a Windows support claim would be untrue.
+  // Linux abstract Unix-domain sockets are the only supported endpoint.
   const digest = createHash("sha256").update(id, "utf8").digest("hex");
-  return process.platform === "linux"
-    ? { name: `\0dolly-controller-${digest}` }
-    : process.platform === "win32"
-      ? { name: `\\\\.\\pipe\\dolly-controller-${digest}` }
-      : throwUnsupported();
-}
-
-function throwUnsupported(): never {
-  throw new InstanceControllerLockError(
-    "CONTROLLER_LOCK_PLATFORM_UNSUPPORTED",
-    "Crash-recoverable controller locking is currently supported on Linux and Windows",
-  );
+  if (process.platform !== "linux") {
+    throw new InstanceControllerLockError(
+      "CONTROLLER_LOCK_PLATFORM_UNSUPPORTED",
+      "Crash-recoverable controller locking requires Linux but this process is not on Linux",
+    );
+  }
+  return { name: `\0dolly-controller-${digest}` };
 }
 
 function validateInstanceId(instanceId: unknown): asserts instanceId is string {
