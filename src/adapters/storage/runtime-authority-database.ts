@@ -31,6 +31,7 @@
  *   premise-policy selections, and only as part of the exact current revision.
  */
 import { createHash } from "node:crypto";
+import { isAbsolute, resolve, sep } from "node:path";
 import { openAttestedNativeSqlite } from "./native-sqlite.js";
 import type { NativeSqliteConnection } from "./native-sqlite-binding.js";
 import {
@@ -80,6 +81,7 @@ export type RuntimeAuthorityDatabaseErrorCode =
   | "MODULE_ACTIVATION_PREMISES_INVALID"
   | "MODULE_ACTIVATION_POLICY_BINDING_UNAVAILABLE"
   | "AUTHORITY_DATABASE_UNINITIALIZED"
+  | "WORKER_START_PREMISE_CONFLICT"
   | "AUTHORITY_DATABASE_ALREADY_COMMITTED"
   | "AUTHORITY_DATABASE_MALFORMED_RECORD";
 
@@ -235,6 +237,20 @@ export interface InstallAuthorityConfigInput {
   /** When set, the transaction rechecks the pointer still names this revision/digest. */
   readonly expectedCurrent?: { readonly revision: number; readonly digest: string };
   readonly options?: AuthorityTransactionOptions;
+}
+
+/** Closed Worker-start premise projection input (Host-owned producer only). */
+export interface InstallWorkerStartPremiseInput {
+  readonly extensionAlias: string;
+  readonly serverId: string;
+  /** Absolute installed package root; must contain `packagePath`. */
+  readonly packageRoot: string;
+  /** Absolute installed package archive path inside `packageRoot`. */
+  readonly packagePath: string;
+  readonly packageDigest: string;
+  readonly executableDigest: string;
+  /** Package-root-relative executable endpoint (safe relative member). */
+  readonly endpoint: string;
 }
 
 export interface FileCoreHistoryMigrationInput extends FileCoreHistoryOptions {
@@ -394,6 +410,96 @@ function malformed(label: string): RuntimeAuthorityDatabaseError {
 
 function assertClosedRecord(value: unknown, keys: readonly string[], label: string): asserts value is Record<string, unknown> {
   if (!isClosedObject(value, keys)) throw malformed(label);
+}
+
+const WORKER_START_PREMISE_RECORD_SCHEMA = "dolly.worker-start-premise/v1";
+
+function validateWorkerStartPremiseInput(input: InstallWorkerStartPremiseInput): void {
+  if (!STABLE_ID_PATTERN.test(input.extensionAlias) && !QUALIFIED_NAME_PATTERN.test(input.extensionAlias)) {
+    throw new RuntimeAuthorityDatabaseError(
+      "AUTHORITY_DATABASE_MALFORMED_RECORD",
+      "extensionAlias must be a qualified lowercase identifier",
+    );
+  }
+  if (typeof input.serverId !== "string" || input.serverId.length === 0 || input.serverId.length > 255) {
+    throw new RuntimeAuthorityDatabaseError(
+      "AUTHORITY_DATABASE_MALFORMED_RECORD",
+      "serverId must be a non-empty string of at most 255 bytes",
+    );
+  }
+  if (!isSha256(input.packageDigest) || !isSha256(input.executableDigest)) {
+    throw new RuntimeAuthorityDatabaseError(
+      "CORE_DIGEST_MISMATCH",
+      "package and executable digests must be sha256 digests",
+    );
+  }
+  if (!isSafeRelativeEndpoint(input.endpoint)) {
+    throw new RuntimeAuthorityDatabaseError(
+      "AUTHORITY_DATABASE_MALFORMED_RECORD",
+      "endpoint must be a safe package-root-relative member",
+    );
+  }
+  if (!isAbsolute(input.packageRoot) || !isAbsolute(input.packagePath)) {
+    throw new RuntimeAuthorityDatabaseError(
+      "AUTHORITY_DATABASE_MALFORMED_RECORD",
+      "package locations must be absolute paths",
+    );
+  }
+  const root = resolve(input.packageRoot);
+  const packagePath = resolve(input.packagePath);
+  if (root !== input.packageRoot || !packagePath.startsWith(root + sep)) {
+    throw new RuntimeAuthorityDatabaseError(
+      "AUTHORITY_DATABASE_MALFORMED_RECORD",
+      "installed package path must sit inside the canonical package root",
+    );
+  }
+}
+
+function isSafeRelativeEndpoint(value: string): boolean {
+  return (
+    value.length > 0 &&
+    !value.includes("\\") &&
+    value.split("/").every((part) => part.length > 0 && part !== "." && part !== "..")
+  );
+}
+
+interface SealedWorkerStartPremise {
+  readonly bytes: Uint8Array;
+  readonly recordDigest: string;
+}
+
+function buildSealedWorkerStartPremise(unsigned: {
+  readonly daemon_installation_id: string;
+  readonly instance_id: string;
+  readonly config_revision: number;
+  readonly config_digest: string;
+  readonly extension_alias: string;
+  readonly server_id: string;
+  readonly package_root: string;
+  readonly package_path: string;
+  readonly package_digest: string;
+  readonly executable_digest: string;
+  readonly endpoint: string;
+}): SealedWorkerStartPremise {
+  const record = {
+    schema: WORKER_START_PREMISE_RECORD_SCHEMA,
+    daemon_installation_id: unsigned.daemon_installation_id,
+    instance_id: unsigned.instance_id,
+    config_revision: unsigned.config_revision,
+    config_digest: unsigned.config_digest,
+    extension_alias: unsigned.extension_alias,
+    server_id: unsigned.server_id,
+    package_root: unsigned.package_root,
+    package_path: unsigned.package_path,
+    package_digest: unsigned.package_digest,
+    executable_digest: unsigned.executable_digest,
+    endpoint: unsigned.endpoint,
+    record_digest: "",
+  };
+  const { record_digest: _omit, ...unsignedRecord } = record;
+  const digest = canonicalJsonDigest(unsignedRecord as unknown as JsonValue);
+  const sealed = { ...record, record_digest: digest };
+  return { bytes: canonicalBytes(sealed as unknown as JsonValue), recordDigest: digest };
 }
 
 function validateIdentity(identity: RuntimeAuthorityIdentity): void {
@@ -712,6 +818,23 @@ CREATE TABLE runtime_authority_state (
   FOREIGN KEY (current_config_revision, current_config_digest)
     REFERENCES config_revision_mappings(config_revision, config_digest)
 );
+CREATE TABLE worker_start_premises (
+  config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND ${MAX_CONFIG_REVISION}),
+  config_digest TEXT NOT NULL,
+  extension_alias TEXT NOT NULL CHECK (length(extension_alias) > 0),
+  server_id TEXT NOT NULL CHECK (length(server_id) > 0),
+  package_root TEXT NOT NULL CHECK (length(package_root) > 0),
+  package_path TEXT NOT NULL CHECK (length(package_path) > 0),
+  package_digest TEXT NOT NULL CHECK (package_digest LIKE 'sha256:%'),
+  executable_digest TEXT NOT NULL CHECK (executable_digest LIKE 'sha256:%'),
+  endpoint TEXT NOT NULL CHECK (length(endpoint) > 0),
+  record_jcs BLOB NOT NULL,
+  record_digest TEXT NOT NULL,
+  UNIQUE (config_revision, config_digest),
+  FOREIGN KEY (config_revision, config_digest)
+    REFERENCES config_revision_mappings(config_revision, config_digest),
+  CHECK (substr(package_path, 1, length(package_root) + 1) = package_root || '/')
+);
 CREATE TABLE core_journal (
   journal_seq INTEGER PRIMARY KEY AUTOINCREMENT,
   event_kind TEXT NOT NULL,
@@ -732,6 +855,7 @@ const AUTHORITY_TABLE_NAMES: readonly string[] = Object.freeze([
   "module_activation_premises",
   "module_activation_premise_policy_selections",
   "runtime_authority_state",
+  "worker_start_premises",
 ]);
 
 interface AuthoritySchemaColumn {
@@ -831,6 +955,19 @@ const AUTHORITY_SCHEMA_COLUMNS: Readonly<Record<string, readonly AuthoritySchema
     { name: "current_config_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
     { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
   ],
+  worker_start_premises: [
+    { name: "config_revision", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "config_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "extension_alias", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "server_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "package_root", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "package_path", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "package_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "executable_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "endpoint", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+    { name: "record_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+  ],
   core_journal: [
     { name: "journal_seq", type: "INTEGER", notNull: 0, primaryKey: 1 },
     { name: "event_kind", type: "TEXT", notNull: 1, primaryKey: 0 },
@@ -880,6 +1017,18 @@ const AUTHORITY_SCHEMA_CHECKS: Readonly<Record<string, readonly string[]>> = Obj
     "check (authority_schema_version = 2)",
     "check (current_config_revision between 1 and 9007199254740991)",
   ],
+  worker_start_premises: [
+    "check (config_revision between 1 and 9007199254740991)",
+    "check (length(extension_alias) > 0)",
+    "check (length(server_id) > 0)",
+    "check (length(package_root) > 0)",
+    "check (length(package_path) > 0)",
+    "check (package_digest like 'sha256:%')",
+    "check (executable_digest like 'sha256:%')",
+    "check (length(endpoint) > 0)",
+    "unique (config_revision, config_digest)",
+    "check (substr(package_path, 1, length(package_root) + 1) = package_root || '/')",
+  ],
 });
 
 const AUTHORITY_SCHEMA_FOREIGN_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
@@ -921,6 +1070,10 @@ const AUTHORITY_SCHEMA_FOREIGN_KEYS: Readonly<Record<string, readonly string[]>>
     "0:0:config_revision_mappings:current_config_revision:config_revision:NO ACTION:NO ACTION:NONE",
     "0:1:config_revision_mappings:current_config_digest:config_digest:NO ACTION:NO ACTION:NONE",
   ],
+  worker_start_premises: [
+    "0:0:config_revision_mappings:config_revision:config_revision:NO ACTION:NO ACTION:NONE",
+    "0:1:config_revision_mappings:config_digest:config_digest:NO ACTION:NO ACTION:NONE",
+  ],
 });
 
 type AuthorityIndexSpec = readonly [unique: number, origin: string, partial: number, columns: readonly string[]];
@@ -950,6 +1103,7 @@ const AUTHORITY_SCHEMA_INDEXES: Readonly<Record<string, readonly AuthorityIndexS
     [1, "u", 0, ["config_revision", "binding_id", "binding_revision", "binding_digest"]],
   ],
   runtime_authority_state: [],
+  worker_start_premises: [[1, "u", 0, ["config_revision", "config_digest"]]],
   core_meta: [],
   commit_sequence: [],
   core_journal: [],
@@ -2427,6 +2581,86 @@ export class RuntimeAuthorityDatabase {
   // -------------------------------------------------------------------------
   // Write path
   // -------------------------------------------------------------------------
+
+  /**
+   * Project the closed Worker-start premise for the CURRENT authority
+   * revision. Host-owned producers only: the caller must hold the controller
+   * lock, and the premise is sealed (JCS record digest) and pinned to the
+   * current `(config_revision, config_digest)` inside the same immediate-
+   * transaction discipline as `installConfig`. Re-projecting the identical
+   * premise is an idempotent no-op; any conflicting rewrite refuses closed.
+   */
+  installWorkerStartPremise(input: InstallWorkerStartPremiseInput): { readonly projected: boolean } {
+    this.#requireOpen();
+    this.#requireLockHeld();
+    const snapshot = this.readCurrentConfig();
+    if (snapshot === null) {
+      throw new RuntimeAuthorityDatabaseError(
+        "AUTHORITY_DATABASE_UNINITIALIZED",
+        "Worker-start premise requires a committed current configuration",
+      );
+    }
+    validateWorkerStartPremiseInput(input);
+    const record = buildSealedWorkerStartPremise({
+      daemon_installation_id: this.#identity.daemonInstallationId,
+      instance_id: this.#identity.instanceId,
+      config_revision: snapshot.config_revision,
+      config_digest: snapshot.config_digest,
+      extension_alias: input.extensionAlias,
+      server_id: input.serverId,
+      package_root: input.packageRoot,
+      package_path: input.packagePath,
+      package_digest: input.packageDigest,
+      executable_digest: input.executableDigest,
+      endpoint: input.endpoint,
+    });
+    let projected = false;
+    this.#inAuthorityTransaction(undefined, () => {
+      // Pointer must still name the premise revision inside the transaction.
+      const state = this.#connection.prepare(
+        "SELECT current_config_revision, current_config_digest FROM runtime_authority_state WHERE singleton = 1",
+      ).get();
+      if (
+        state === undefined ||
+        Number(state.current_config_revision) !== snapshot.config_revision ||
+        String(state.current_config_digest) !== snapshot.config_digest
+      ) {
+        throw new RuntimeAuthorityDatabaseError(
+          "CONFIG_REVISION_CONFLICT",
+          "current pointer moved while projecting the Worker-start premise",
+        );
+      }
+      const existing = this.#connection.prepare(
+        "SELECT record_digest FROM worker_start_premises WHERE config_revision = ?",
+      ).get(snapshot.config_revision);
+      if (existing !== undefined) {
+        if (String(existing.record_digest) === record.recordDigest) {
+          return; // idempotent identical projection
+        }
+        throw new RuntimeAuthorityDatabaseError(
+          "WORKER_START_PREMISE_CONFLICT",
+          "a different Worker-start premise is already projected for this revision",
+        );
+      }
+      this.#connection.prepare(
+        "INSERT INTO worker_start_premises (config_revision, config_digest, extension_alias, server_id, package_root, package_path, package_digest, executable_digest, endpoint, record_jcs, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        snapshot.config_revision,
+        snapshot.config_digest,
+        input.extensionAlias,
+        input.serverId,
+        input.packageRoot,
+        input.packagePath,
+        input.packageDigest,
+        input.executableDigest,
+        input.endpoint,
+        record.bytes,
+        record.recordDigest,
+      );
+      projected = true;
+    });
+    return { projected };
+  }
 
   installConfig(input: InstallAuthorityConfigInput): InstallAuthorityConfigResult {
     this.#requireOpen();

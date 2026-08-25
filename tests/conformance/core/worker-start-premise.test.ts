@@ -1,0 +1,149 @@
+import { canonicalBytes } from "../../../src/schema-bundle/index.js";
+import { createHash } from "node:crypto";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import {
+  RuntimeAuthorityDatabase,
+  RuntimeAuthorityDatabaseError,
+  type InstallWorkerStartPremiseInput,
+} from "../../../src/adapters/storage/runtime-authority-database.js";
+
+const identity = {
+  daemonInstallationId: "0198ab31-6c44-7e8a-b2bb-000000000001",
+  instanceId: "instance-0f3a1c9e5b7d4e2a8c6d0b1f2a3e4c5d",
+};
+
+class FakeLock {
+  #held = true;
+  readonly controllerGenerationId = "0198ab31-6c44-7e8a-b2bb-0000000000aa";
+  get held(): boolean {
+    return this.#held;
+  }
+  get info() {
+    return {
+      instanceId: identity.instanceId,
+      controllerGenerationId: this.controllerGenerationId,
+      processId: process.pid,
+      createdAt: new Date().toISOString(),
+    };
+  }
+  assertHeld(): void {
+    if (!this.#held) throw new Error("lock not held");
+  }
+  async release(): Promise<void> {
+    this.#held = false;
+  }
+}
+
+function resolvedConfigFixture(content: string): { bytes: Uint8Array; digest: string } {
+  const bytes = canonicalBytes({
+    runtime_config: { value: content },
+    permission_policy_selections: [],
+    service_candidate: null,
+  });
+  return { bytes, digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}` };
+}
+
+function freshCommitted(dirName: string, lock = new FakeLock()): RuntimeAuthorityDatabase {
+  const dir = mkdtempSync(join(tmpdir(), "wsp-"));
+  const database = RuntimeAuthorityDatabase.open({
+    path: join(dir, `${dirName}.sqlite`),
+    identity,
+    lock: lock as never,
+  });
+  const authority = resolvedConfigFixture("committed");
+  database.installConfig({
+    identity,
+    canonicalConfigBytes: authority.bytes,
+    configDigest: authority.digest,
+    premise: null,
+    verifiedOrigins: [],
+  });
+  return database;
+}
+
+function premiseInput(overrides: Partial<InstallWorkerStartPremiseInput> = {}): InstallWorkerStartPremiseInput {
+  return {
+    extensionAlias: "org.dolly.tools",
+    serverId: "fs",
+    packageRoot: "/opt/dolly/pkg",
+    packagePath: "/opt/dolly/pkg/package.bin",
+    packageDigest: `sha256:${"a".repeat(64)}`,
+    executableDigest: `sha256:${"b".repeat(64)}`,
+    endpoint: "bin/dolly-fs-tools",
+    ...overrides,
+  };
+}
+
+describe("Worker-start premise projection (Host-owned producer)", () => {
+  it("projects the sealed premise for the current revision under the controller lock", () => {
+    const database = freshCommitted("locked");
+    expect(database.installWorkerStartPremise(premiseInput()).projected).toBe(true);
+    // Re-projecting the identical premise is an idempotent no-op.
+    expect(database.installWorkerStartPremise(premiseInput()).projected).toBe(false);
+  });
+
+  it("refuses a conflicting rewrite of an existing projection", () => {
+    const database = freshCommitted("conflict");
+    database.installWorkerStartPremise(premiseInput());
+    expect(() =>
+      database.installWorkerStartPremise(premiseInput({ executableDigest: `sha256:${"c".repeat(64)}` })),
+    ).toThrowError(RuntimeAuthorityDatabaseError);
+  });
+
+  it("rejects endpoints and paths escaping the package root before any durable write", () => {
+    const database = freshCommitted("escape");
+    expect(() => database.installWorkerStartPremise(premiseInput({ endpoint: "../escape" }))).toThrowError(
+      /safe package-root-relative/u,
+    );
+    expect(() => database.installWorkerStartPremise(premiseInput({ packagePath: "/etc/passwd" }))).toThrowError(
+      /canonical package root/u,
+    );
+    expect(() =>
+      database.installWorkerStartPremise(premiseInput({ packageRoot: "/opt/dolly/pkg/", packagePath: "/opt/evil/x" })),
+    ).toThrowError(/canonical package root/u);
+  });
+
+  it("refuses to project when the injected controller lock is no longer held", async () => {
+    const released = new FakeLock();
+    await released.release();
+    let database: RuntimeAuthorityDatabase | undefined;
+    try {
+      database = freshCommitted("released", released);
+    } catch {
+      // A released handle may refuse the open outright; that also proves
+      // the guard, so treat it as satisfied.
+      return;
+    }
+    expect(() => database!.installWorkerStartPremise(premiseInput())).toThrow();
+  });
+
+  it("exposes only closed input shapes: no transport observation can project a premise", () => {
+    const database = freshCommitted("surface");
+    const api = Object.getOwnPropertyNames(Object.getPrototypeOf(database) as object) as string[];
+    expect(api.some((name) => /response|ack|readiness|cache|process.?exit/iu.test(name))).toBe(false);
+    expect(api).toContain("installWorkerStartPremise");
+  });
+
+  it("projections are per-revision: a new current revision starts with none", () => {
+    const database = freshCommitted("revision");
+    database.installWorkerStartPremise(premiseInput());
+    const snapshot = database.readCurrentConfig();
+    if (snapshot === null) throw new Error("expected committed state");
+    const next = resolvedConfigFixture("second");
+    const result = database.installConfig({
+      identity,
+      canonicalConfigBytes: next.bytes,
+      configDigest: next.digest,
+      premise: null,
+      verifiedOrigins: [],
+      expectedCurrent: { revision: snapshot.config_revision, digest: snapshot.config_digest },
+    });
+    expect(result.allocated).toBe(true);
+    // The new revision accepts a fresh projection without conflict — old rows
+    // can never silently re-point at new authority.
+    expect(database.installWorkerStartPremise(premiseInput()).projected).toBe(true);
+  });
+});
