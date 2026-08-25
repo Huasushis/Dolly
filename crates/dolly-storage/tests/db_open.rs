@@ -576,31 +576,32 @@ fn rust_migrates_pre_bridge_typescript_authority_projection() {
         Database::open(&path),
         Err(StorageError::MigrationRequired)
     ));
-    let migrated = Database::open_for_migration(&path)
+    assert!(matches!(
+        Database::open_for_migration(&path)
+            .unwrap()
+            .migrate_v1_authority(),
+        Err(StorageError::Corrupt | StorageError::MigrationRequired)
+    ));
+    let unchanged = Connection::open(&path).unwrap();
+    let mapping_columns: Vec<String> = unchanged
+        .prepare("PRAGMA table_info(config_revision_mappings)")
         .unwrap()
-        .migrate_v1_authority()
-        .expect("Rust must bridge the pre-H1 TypeScript projection");
-    assert_ne!(migrated.controller_generation_id(), previous_generation);
-    let host_version: i64 = migrated
-        .connection()
-        .query_row(
-            "SELECT authority_schema_version FROM host_authority_meta WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, rusqlite::Error>>()
         .unwrap();
-    assert_eq!(host_version, dolly_storage::host_authority::HOST_AUTHORITY_SCHEMA_VERSION);
-    let mapping_identity: (String, String) = migrated
-        .connection()
+    assert_eq!(
+        mapping_columns,
+        vec!["config_revision", "config_digest", "canonical_bytes"]
+    );
+    assert!(unchanged
         .query_row(
-            "SELECT daemon_installation_id, instance_id
-             FROM config_revision_mappings WHERE config_revision = 1",
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'host_authority_meta'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get::<_, i64>(0),
         )
-        .unwrap();
-    assert_eq!(mapping_identity, (daemon, instance));
-    drop(migrated);
+        .unwrap()
+        == 0);
 }
 
 

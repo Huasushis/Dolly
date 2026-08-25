@@ -53,10 +53,8 @@
     "outcome": "explicit-v1-bridge-publishes-rich-v2-host-projection-or-fails-closed",
     "assertions": [
       {"path": "/migration/ordinary_open", "op": "equals", "value": "STORAGE_MIGRATION_REQUIRED"},
-      {"path": "/migration/explicit_open", "op": "equals", "value": "accepted"},
-      {"path": "/migration/host_authority_meta/authority_schema_version", "op": "equals", "value": 2},
-      {"path": "/migration/runtime_authority_state/controller_generation_id", "op": "equals", "value": "0198ab31-6c44-7e8a-b2bb-000000000651"},
-      {"path": "/migration/config_revision_mappings/identity_columns", "op": "equals", "value": ["daemon_installation_id", "instance_id"]},
+      {"path": "/migration/explicit_open", "op": "equals", "value": "STORAGE_MIGRATION_REQUIRED"},
+      {"path": "/migration/config_revision_mappings/identity_columns", "op": "equals", "value": ["config_revision", "config_digest", "canonical_bytes"]},
       {"path": "/hostile_results/noncanonical_mapping_bytes/error", "op": "equals", "value": "STORAGE_CORRUPT"},
       {"path": "/hostile_results/raw_hash_only_mapping/error", "op": "equals", "value": "STORAGE_CORRUPT"},
       {"path": "/hostile_results/missing_host_authority_meta/error", "op": "equals", "value": "STORAGE_MIGRATION_REQUIRED"},

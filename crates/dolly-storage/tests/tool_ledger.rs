@@ -221,6 +221,18 @@ fn seed_parents(conn: &Connection) {
         rusqlite::params!["0198ab31-6c44-7e8a-b2bb-000000000101"],
     )
     .expect("seed activation");
+    let authority_mapping: (String, String, String, Vec<u8>) = conn
+        .query_row(
+            "SELECT s.daemon_installation_id, s.instance_id,
+                    m.config_digest, m.canonical_bytes
+             FROM runtime_authority_state AS s
+             JOIN config_revision_mappings AS m
+               ON m.config_revision = s.current_config_revision
+             WHERE s.singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("current authority mapping");
     conn.execute(
         "INSERT OR IGNORE INTO config_revision_mappings (
              config_revision, daemon_installation_id, instance_id,
@@ -228,10 +240,10 @@ fn seed_parents(conn: &Connection) {
          ) VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![
             11_i64,
-            "daemon-test",
-            "instance-test",
-            "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
-            &b"{}"[..],
+            authority_mapping.0,
+            authority_mapping.1,
+            authority_mapping.2,
+            authority_mapping.3,
         ],
     )
     .expect("config revision mapping parent");

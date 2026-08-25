@@ -22,16 +22,30 @@ pub const MAX_SEMANTIC_JSON_NESTING_DEPTH: u16 = 64;
 /// The protocol wire parse-depth limit (separate from the semantic limit).
 pub const PROTOCOL_WIRE_PARSE_DEPTH: u16 = 96;
 
+/// Maximum bytes accepted for one canonical Core JSON document.
+///
+/// TypeScript's schema-bundle parser uses the same 8 MiB document budget.
+/// Keeping the byte bound in the shared parser prevents a Rust authority
+/// reader from accepting a record that the TypeScript reader would refuse.
+pub const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
+
 /// Positive maximum nesting depth for JSON parsing.
 #[derive(Clone, Copy, Debug)]
 pub struct ParseLimits {
     max_nesting_depth: u16,
+    max_bytes: usize,
 }
 
 impl ParseLimits {
     /// Create a `ParseLimits` with the given maximum nesting depth.
-    /// The depth must be at least 1.
+    /// The depth must be at least 1. The shared byte budget is applied.
     pub fn new(max_nesting_depth: u16) -> Result<Self, CanonicalError> {
+        Self::with_bytes(max_nesting_depth, MAX_JSON_BYTES)
+    }
+
+    /// Create limits with an explicit byte budget no larger than the shared
+    /// Core ceiling.
+    pub fn with_bytes(max_nesting_depth: u16, max_bytes: usize) -> Result<Self, CanonicalError> {
         if max_nesting_depth == 0 {
             return Err(CanonicalError::invalid_json(
                 "max_nesting_depth must be at least 1",
@@ -42,12 +56,25 @@ impl ParseLimits {
                 "max_nesting_depth must not exceed PROTOCOL_WIRE_PARSE_DEPTH ({PROTOCOL_WIRE_PARSE_DEPTH}), got {max_nesting_depth}"
             )));
         }
-        Ok(Self { max_nesting_depth })
+        if max_bytes == 0 || max_bytes > MAX_JSON_BYTES {
+            return Err(CanonicalError::invalid_json(format!(
+                "max_bytes must be in 1..={MAX_JSON_BYTES}, got {max_bytes}"
+            )));
+        }
+        Ok(Self {
+            max_nesting_depth,
+            max_bytes,
+        })
     }
 
     /// Returns the maximum nesting depth.
     pub const fn max_nesting_depth(&self) -> u16 {
         self.max_nesting_depth
+    }
+
+    /// Returns the maximum input/output byte budget.
+    pub const fn max_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     /// Semantic limit: 1..=64. The hard ceiling is 64.
@@ -57,15 +84,14 @@ impl ParseLimits {
                 "semantic depth limit must be in 1..={MAX_SEMANTIC_JSON_NESTING_DEPTH}, got {policy_limit}"
             )));
         }
-        Ok(Self {
-            max_nesting_depth: policy_limit,
-        })
+        Self::with_bytes(policy_limit, MAX_JSON_BYTES)
     }
 
-    /// Protocol wire limit: 96.
+    /// Protocol wire limit: 96, with the shared document byte budget.
     pub const fn protocol_wire() -> Self {
         Self {
             max_nesting_depth: PROTOCOL_WIRE_PARSE_DEPTH,
+            max_bytes: MAX_JSON_BYTES,
         }
     }
 }
@@ -74,11 +100,17 @@ impl ParseLimits {
 ///
 /// Enforces the Dolly Core JSON profile: rejects BOM, invalid UTF-8, lone
 /// surrogates, duplicate object names, non-finite numbers, negative zero,
-/// and enforces the supplied nesting depth limit.
+/// and enforces the supplied depth and byte limits.
 pub fn parse_core_json(
     input: &[u8],
     limits: ParseLimits,
 ) -> Result<CanonicalJsonValue, CanonicalError> {
+    if input.len() > limits.max_bytes() {
+        return Err(CanonicalError::invalid_json(format!(
+            "JSON exceeds its {}-byte limit",
+            limits.max_bytes()
+        )));
+    }
     let parser = parser::CoreJsonParser::new(input, limits.max_nesting_depth());
     parser.parse()
 }
@@ -98,7 +130,7 @@ pub fn deserialize_core_json<T: serde::de::DeserializeOwned>(
 
 /// Canonicalize a serializable value to JCS bytes and its SHA-256 digest.
 ///
-/// Uses the default semantic depth limit (64).
+/// Uses the default semantic depth and byte limits (64 levels, 8 MiB).
 pub fn canonicalize<T: Serialize>(
     value: &T,
 ) -> Result<(CanonicalBytes, Sha256Digest), CanonicalError> {
@@ -109,7 +141,7 @@ pub fn canonicalize<T: Serialize>(
 }
 
 /// Canonicalize a serializable value to JCS bytes and its SHA-256 digest,
-/// with an explicit depth limit.
+/// with an explicit depth and byte limit.
 pub fn canonicalize_with_limits<T: Serialize>(
     value: &T,
     limits: ParseLimits,
@@ -121,7 +153,7 @@ pub fn canonicalize_with_limits<T: Serialize>(
         .try_into()
         .map_err(CanonicalError::invalid_json)?;
 
-    // Enforce semantic depth
+    // Enforce semantic depth.
     let depth = json_value.semantic_depth();
     if depth > limits.max_nesting_depth() {
         return Err(CanonicalError::invalid_json(format!(
@@ -131,6 +163,12 @@ pub fn canonicalize_with_limits<T: Serialize>(
     }
 
     let bytes = serializer::serialize_canonical(&json_value)?;
+    if bytes.len() > limits.max_bytes() {
+        return Err(CanonicalError::invalid_json(format!(
+            "canonical JSON exceeds its {}-byte limit",
+            limits.max_bytes()
+        )));
+    }
     let digest = Sha256Digest::compute(&bytes);
     Ok((CanonicalBytes::from_vec(bytes), digest))
 }

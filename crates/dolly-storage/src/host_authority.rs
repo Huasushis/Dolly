@@ -32,9 +32,13 @@ pub(crate) fn is_uuid_v7(value: &str) -> bool {
         && bytes
             .iter()
             .enumerate()
-            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
+            .all(|(index, byte)| {
+                [8, 13, 18, 23].contains(&index)
+                    || byte.is_ascii_digit()
+                    || byte.is_ascii_lowercase() && byte.is_ascii_hexdigit()
+            })
         && bytes[14] == b'7'
-        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b' | b'A' | b'B')
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
 }
 
 /// Physical tables for the Host prerequisite authority. The table names and
@@ -355,6 +359,403 @@ pub fn create_host_authority_schema(connection: &Connection) -> Result<(), HostA
     Ok(())
 }
 
+/// Verify the complete v2 Host authority projection before reading or writing
+/// any reachable row. SQLite's foreign-key check cannot detect an absent
+/// prerequisite table, nullable identity column, altered CHECK, or an
+/// unexpected trigger, so the physical shape is checked independently.
+pub(crate) fn verify_authority_schema(
+    connection: &Connection,
+) -> Result<(), HostAuthorityError> {
+    let tables = [
+        "host_authority_meta",
+        "config_revision_mappings",
+        "installed_component_origins",
+        "permission_policy_definitions",
+        "permission_policy_backend_bindings",
+        "linux_service_candidates",
+        "module_activation_premises",
+        "module_activation_premise_policy_selections",
+        "runtime_authority_state",
+    ];
+    let parallel: Option<String> = connection
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE name = 'config_revisions'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if parallel.is_some() {
+        return Err(HostAuthorityError::Malformed(
+            "parallel config_revisions object is not part of the authority schema".into(),
+        ));
+    }
+    for table in tables {
+        let kind: Option<String> = connection
+            .query_row(
+                "SELECT type FROM sqlite_master WHERE name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if kind.as_deref() != Some("table") {
+            return Err(HostAuthorityError::Malformed(format!(
+                "required authority table {table} is missing or is not a table"
+            )));
+        }
+    }
+    verify_table_shape(
+        connection,
+        "host_authority_meta",
+        &[
+            ("singleton", "INTEGER", 0, 1),
+            ("authority_schema_version", "INTEGER", 1, 0),
+        ],
+        &["check (singleton = 1)", "check (authority_schema_version = 2)"],
+        &[],
+    )?;
+    verify_table_shape(
+        connection,
+        "config_revision_mappings",
+        &[
+            ("config_revision", "INTEGER", 0, 1),
+            ("daemon_installation_id", "TEXT", 1, 0),
+            ("instance_id", "TEXT", 1, 0),
+            ("config_digest", "TEXT", 1, 0),
+            ("canonical_bytes", "BLOB", 1, 0),
+        ],
+        &[
+            "check (config_revision between 1 and 9007199254740991)",
+            "unique (config_revision, config_digest)",
+        ],
+        &[],
+    )?;
+    verify_table_shape(
+        connection,
+        "installed_component_origins",
+        &[
+            ("component_id", "TEXT", 1, 1),
+            ("component_revision", "INTEGER", 1, 2),
+            ("component_digest", "TEXT", 1, 0),
+            ("record_jcs", "BLOB", 1, 0),
+        ],
+        &[
+            "check (component_revision between 1 and 9007199254740991)",
+            "unique (component_id, component_revision, component_digest)",
+        ],
+        &[],
+    )?;
+    verify_table_shape(
+        connection,
+        "permission_policy_definitions",
+        &[
+            ("policy_id", "TEXT", 1, 1),
+            ("policy_revision", "INTEGER", 1, 2),
+            ("definition_digest", "TEXT", 1, 0),
+            ("record_jcs", "BLOB", 1, 0),
+        ],
+        &[
+            "check (policy_revision between 1 and 9007199254740991)",
+            "unique (policy_id, policy_revision, definition_digest)",
+        ],
+        &[],
+    )?;
+    verify_table_shape(
+        connection,
+        "permission_policy_backend_bindings",
+        &[
+            ("binding_id", "TEXT", 1, 1),
+            ("binding_revision", "INTEGER", 1, 2),
+            ("binding_digest", "TEXT", 1, 0),
+            ("policy_id", "TEXT", 1, 0),
+            ("policy_revision", "INTEGER", 1, 0),
+            ("policy_definition_digest", "TEXT", 1, 0),
+            ("origin_component_id", "TEXT", 1, 0),
+            ("origin_component_revision", "INTEGER", 1, 0),
+            ("origin_component_digest", "TEXT", 1, 0),
+            ("record_jcs", "BLOB", 1, 0),
+        ],
+        &[
+            "check (binding_revision between 1 and 9007199254740991)",
+            "unique (binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest)",
+        ],
+        &[
+            "permission_policy_definitions|policy_id|policy_id",
+            "permission_policy_definitions|policy_revision|policy_revision",
+            "permission_policy_definitions|policy_definition_digest|definition_digest",
+            "installed_component_origins|origin_component_id|component_id",
+            "installed_component_origins|origin_component_revision|component_revision",
+            "installed_component_origins|origin_component_digest|component_digest",
+        ],
+    )?;
+    verify_table_shape(
+        connection,
+        "linux_service_candidates",
+        &[
+            ("origin_component_id", "TEXT", 1, 1),
+            ("origin_component_revision", "INTEGER", 1, 2),
+            ("origin_component_digest", "TEXT", 1, 0),
+            ("unit_name", "TEXT", 1, 3),
+            ("mode", "TEXT", 1, 4),
+            ("candidate_digest", "TEXT", 1, 0),
+            ("record_jcs", "BLOB", 1, 0),
+        ],
+        &[
+            "check (origin_component_revision between 1 and 9007199254740991)",
+            "check (mode = 'user')",
+            "unique (origin_component_id, origin_component_revision, unit_name, mode, candidate_digest)",
+        ],
+        &[
+            "installed_component_origins|origin_component_id|component_id",
+            "installed_component_origins|origin_component_revision|component_revision",
+            "installed_component_origins|origin_component_digest|component_digest",
+        ],
+    )?;
+    verify_table_shape(
+        connection,
+        "module_activation_premises",
+        &[
+            ("config_revision", "INTEGER", 0, 1),
+            ("config_digest", "TEXT", 1, 0),
+            ("service_origin_component_id", "TEXT", 1, 0),
+            ("service_origin_component_revision", "INTEGER", 1, 0),
+            ("service_unit_name", "TEXT", 1, 0),
+            ("service_mode", "TEXT", 1, 0),
+            ("service_candidate_digest", "TEXT", 1, 0),
+            ("premises_digest", "TEXT", 1, 0),
+            ("record_jcs", "BLOB", 1, 0),
+        ],
+        &[
+            "check (config_revision between 1 and 9007199254740991)",
+            "unique (config_revision, config_digest)",
+        ],
+        &[
+            "config_revision_mappings|config_revision|config_revision",
+            "config_revision_mappings|config_digest|config_digest",
+            "linux_service_candidates|service_origin_component_id|origin_component_id",
+            "linux_service_candidates|service_origin_component_revision|origin_component_revision",
+            "linux_service_candidates|service_unit_name|unit_name",
+            "linux_service_candidates|service_mode|mode",
+            "linux_service_candidates|service_candidate_digest|candidate_digest",
+        ],
+    )?;
+    verify_table_shape(
+        connection,
+        "module_activation_premise_policy_selections",
+        &[
+            ("config_revision", "INTEGER", 1, 1),
+            ("policy_id", "TEXT", 1, 2),
+            ("policy_revision", "INTEGER", 1, 3),
+            ("policy_definition_digest", "TEXT", 1, 0),
+            ("binding_id", "TEXT", 1, 0),
+            ("binding_revision", "INTEGER", 1, 0),
+            ("binding_digest", "TEXT", 1, 0),
+        ],
+        &[
+            "check (config_revision between 1 and 9007199254740991)",
+            "unique (config_revision, binding_id, binding_revision, binding_digest)",
+            "deferrable initially deferred",
+        ],
+        &[
+            "module_activation_premises|config_revision|config_revision",
+            "permission_policy_definitions|policy_id|policy_id",
+            "permission_policy_definitions|policy_revision|policy_revision",
+            "permission_policy_definitions|policy_definition_digest|definition_digest",
+            "permission_policy_backend_bindings|binding_id|binding_id",
+            "permission_policy_backend_bindings|binding_revision|binding_revision",
+            "permission_policy_backend_bindings|binding_digest|binding_digest",
+            "permission_policy_backend_bindings|policy_id|policy_id",
+            "permission_policy_backend_bindings|policy_revision|policy_revision",
+            "permission_policy_backend_bindings|policy_definition_digest|policy_definition_digest",
+        ],
+    )?;
+    verify_table_shape(
+        connection,
+        "runtime_authority_state",
+        &[
+            ("singleton", "INTEGER", 0, 1),
+            ("authority_schema_version", "INTEGER", 1, 0),
+            ("daemon_installation_id", "TEXT", 1, 0),
+            ("instance_id", "TEXT", 1, 0),
+            ("controller_generation_id", "TEXT", 1, 0),
+            ("current_config_revision", "INTEGER", 1, 0),
+            ("current_config_digest", "TEXT", 1, 0),
+            ("record_jcs", "BLOB", 1, 0),
+        ],
+        &[
+            "check (singleton = 1)",
+            "check (authority_schema_version = 2)",
+            "check (current_config_revision between 1 and 9007199254740991)",
+        ],
+        &[
+            "config_revision_mappings|current_config_revision|config_revision",
+            "config_revision_mappings|current_config_digest|config_digest",
+        ],
+    )?;
+    Ok(())
+}
+
+fn verify_table_shape(
+    connection: &Connection,
+    table: &str,
+    expected_columns: &[(&str, &str, i64, i64)],
+    checks: &[&str],
+    expected_foreign_keys: &[&str],
+) -> Result<(), HostAuthorityError> {
+    let columns: Vec<(String, String, i64, i64)> = {
+        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?
+    };
+    if columns.len() != expected_columns.len()
+        || columns.iter().zip(expected_columns).any(|(actual, expected)| {
+            actual.0 != expected.0
+                || actual.1.to_ascii_uppercase() != expected.1
+                || actual.2 != expected.2
+                || actual.3 != expected.3
+        })
+    {
+        return Err(HostAuthorityError::Malformed(format!(
+            "authority table {table} has a non-canonical column shape"
+        )));
+    }
+    let sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get(0),
+    )?;
+    let normalized = sql.to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    for check in checks {
+        if !normalized.contains(check) {
+            return Err(HostAuthorityError::Malformed(format!(
+                "authority table {table} is missing constraint {check}"
+            )));
+        }
+    }
+    let mut foreign_keys = {
+        let mut statement = connection.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
+        statement
+            .query_map([], |row| {
+                Ok(format!(
+                    "{}|{}|{}",
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?
+                ))
+            })?
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?
+    };
+    foreign_keys.sort();
+    let mut expected = expected_foreign_keys.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+    expected.sort();
+    if foreign_keys != expected {
+        return Err(HostAuthorityError::Malformed(format!(
+            "authority table {table} has a non-canonical foreign-key shape"
+        )));
+    }
+    Ok(())
+}
+
+/// Preflight the v1 authority projection without changing any object. This
+/// uses the same table/column/constraint contract as v2, except for the
+/// v1 Host meta/state version and the deliberately absent controller
+/// generation column. Migration callers run this before opening their write
+/// transaction so malformed unused parents cannot be discovered after ALTER.
+pub(crate) fn verify_legacy_authority_schema(
+    connection: &Connection,
+) -> Result<(), HostAuthorityError> {
+    let specs: [(&str, &[&str], &[&str]); 9] = [
+        ("host_authority_meta", &["singleton", "authority_schema_version"], &["authority_schema_version = 1"]),
+        (
+            "config_revision_mappings",
+            &["config_revision", "daemon_installation_id", "instance_id", "config_digest", "canonical_bytes"],
+            &["unique"],
+        ),
+        (
+            "installed_component_origins",
+            &["component_id", "component_revision", "component_digest", "record_jcs"],
+            &["unique"],
+        ),
+        (
+            "permission_policy_definitions",
+            &["policy_id", "policy_revision", "definition_digest", "record_jcs"],
+            &["unique"],
+        ),
+        (
+            "permission_policy_backend_bindings",
+            &[
+                "binding_id", "binding_revision", "binding_digest", "policy_id",
+                "policy_revision", "policy_definition_digest", "origin_component_id",
+                "origin_component_revision", "origin_component_digest", "record_jcs",
+            ],
+            &["unique", "foreign key"],
+        ),
+        (
+            "linux_service_candidates",
+            &[
+                "origin_component_id", "origin_component_revision", "origin_component_digest",
+                "unit_name", "mode", "candidate_digest", "record_jcs",
+            ],
+            &["unique", "foreign key"],
+        ),
+        (
+            "module_activation_premises",
+            &[
+                "config_revision", "config_digest", "service_origin_component_id",
+                "service_origin_component_revision", "service_unit_name", "service_mode",
+                "service_candidate_digest", "premises_digest", "record_jcs",
+            ],
+            &["unique", "foreign key"],
+        ),
+        (
+            "module_activation_premise_policy_selections",
+            &[
+                "config_revision", "policy_id", "policy_revision",
+                "policy_definition_digest", "binding_id", "binding_revision", "binding_digest",
+            ],
+            &["unique", "foreign key"],
+        ),
+        (
+            "runtime_authority_state",
+            &[
+                "singleton", "authority_schema_version", "daemon_installation_id",
+                "instance_id", "current_config_revision", "current_config_digest", "record_jcs",
+            ],
+            &["authority_schema_version = 1", "foreign key"],
+        ),
+    ];
+    for (table, expected_columns, sql_fragments) in specs {
+        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+        let actual: Vec<String> = statement
+            .query_map([], |row| row.get(1))?
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+        if actual.iter().map(String::as_str).ne(expected_columns.iter().copied()) {
+            return Err(HostAuthorityError::Malformed(format!(
+                "legacy authority table {table} has a non-canonical column shape"
+            )));
+        }
+        let sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        let normalized = sql.to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+        if sql_fragments.iter().any(|fragment| !normalized.contains(fragment)) {
+            return Err(HostAuthorityError::Malformed(format!(
+                "legacy authority table {table} is missing a required constraint"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Atomically install one config mapping and its final premise authority.
 pub fn install_host_authority_revision(
     db: &mut crate::Database,
@@ -570,6 +971,7 @@ pub fn load_current_authority(
 pub(crate) fn load_current_authority_with_generation(
     connection: &Connection,
 ) -> Result<Option<(CurrentAuthoritySnapshot, String)>, HostAuthorityError> {
+    verify_authority_schema(connection)?;
     let parallel: i64 = connection.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config_revisions'
@@ -761,6 +1163,7 @@ fn load_authority_snapshot(
         .transpose()?;
     let snapshot = CurrentAuthoritySnapshot { mapping, premise };
     verify_persisted_snapshot(connection, &snapshot)?;
+    verify_all_persisted_rows(connection, &identity)?;
     validate_loaded_snapshot(&snapshot)?;
     Ok(snapshot)
 }
@@ -1038,6 +1441,151 @@ fn verify_persisted_snapshot(
                     "configuration without a premise has retained prerequisite rows".into(),
                 ));
             }
+        }
+    }
+    Ok(())
+}
+fn verify_all_persisted_rows(
+    connection: &Connection,
+    authority_identity: &RuntimeAuthorityIdentity,
+) -> Result<(), HostAuthorityError> {
+    let mapping_rows: Vec<(String, String, i64, String, Vec<u8>)> = connection
+        .prepare(
+            "SELECT daemon_installation_id, instance_id, config_revision,
+                    config_digest, canonical_bytes
+             FROM config_revision_mappings ORDER BY config_revision",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    for (daemon_id, instance_id, revision, digest_text, bytes) in mapping_rows {
+        if daemon_id != authority_identity.daemon_installation_id
+            || instance_id != authority_identity.instance_id
+        {
+            return Err(HostAuthorityError::RevisionConflict {
+                config_revision: revision,
+                reason: "historical mapping identity differs from authority identity".into(),
+            });
+        }
+        let digest = digest_text
+            .parse::<Sha256Digest>()
+            .map_err(|_| HostAuthorityError::Malformed("historical mapping digest".into()))?;
+        let mapping = ConfigRevisionMapping {
+            schema: "dolly.config-revision-mapping/v1".into(),
+            daemon_installation_id: daemon_id,
+            instance_id,
+            config_revision: revision,
+            config_digest: digest,
+            canonical_config: decode_record(&bytes, "historical resolved config")?,
+        };
+        validate_mapping(&mapping)?;
+        if bytes != canonical_bytes(&mapping.canonical_config, "historical resolved config")? {
+            return Err(HostAuthorityError::DigestMismatch(
+                "historical mapping canonical bytes".into(),
+            ));
+        }
+    }
+
+    let origin_bytes: Vec<Vec<u8>> = connection
+        .prepare("SELECT record_jcs FROM installed_component_origins")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    for bytes in origin_bytes {
+        let origin: InstalledComponentOrigin = decode_record(&bytes, "historical installed origin")?;
+        validate_origin(&origin)?;
+        verify_origin_row(connection, &origin)?;
+    }
+
+    let definition_bytes: Vec<Vec<u8>> = connection
+        .prepare("SELECT record_jcs FROM permission_policy_definitions")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    for bytes in definition_bytes {
+        let definition: PermissionPolicyDefinition =
+            decode_record(&bytes, "historical permission policy definition")?;
+        validate_definition(&definition)?;
+        verify_definition_row(connection, &definition)?;
+    }
+
+    let binding_bytes: Vec<Vec<u8>> = connection
+        .prepare("SELECT record_jcs FROM permission_policy_backend_bindings")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    for bytes in binding_bytes {
+        let binding: PermissionPolicyBackendBinding =
+            decode_record(&bytes, "historical backend binding")?;
+        validate_binding(&binding)?;
+        verify_binding_row(connection, &binding)?;
+    }
+
+    let candidate_bytes: Vec<Vec<u8>> = connection
+        .prepare("SELECT record_jcs FROM linux_service_candidates")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    for bytes in candidate_bytes {
+        let candidate: LinuxServiceCandidate =
+            decode_record(&bytes, "historical Linux service candidate")?;
+        validate_candidate(&candidate)?;
+        verify_candidate_row(connection, &candidate)?;
+    }
+
+    let premise_rows: Vec<(i64, String, Vec<u8>)> = connection
+        .prepare(
+            "SELECT config_revision, config_digest, record_jcs
+             FROM module_activation_premises ORDER BY config_revision",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    for (revision, digest_text, bytes) in premise_rows {
+        let premise: ModuleActivationPremises = decode_record(&bytes, "historical activation premise")?;
+        validate_premise(&premise)?;
+        if premise.config_revision != revision
+            || premise.config_digest.to_string() != digest_text
+            || premise.daemon_installation_id != authority_identity.daemon_installation_id
+            || premise.instance_id != authority_identity.instance_id
+            || bytes != canonical_bytes(&premise, "historical activation premise")?
+        {
+            return Err(HostAuthorityError::DigestMismatch(
+                "historical activation premise projection".into(),
+            ));
+        }
+        let projection: (String, i64, String, String, String, String, String) = connection
+            .query_row(
+                "SELECT service_origin_component_id, service_origin_component_revision,
+                        service_unit_name, service_mode, service_candidate_digest,
+                        premises_digest, config_digest
+                 FROM module_activation_premises WHERE config_revision = ?1",
+                [revision],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )?;
+        if projection.0 != premise.service_candidate.origin.component_id
+            || projection.1 != premise.service_candidate.origin.component_revision
+            || projection.2 != premise.service_candidate.unit_name
+            || projection.3 != premise.service_candidate.mode
+            || projection.4 != premise.service_candidate.candidate_digest.to_string()
+            || projection.5 != premise.premises_digest.to_string()
+            || projection.6 != premise.config_digest.to_string()
+        {
+            return Err(HostAuthorityError::DigestMismatch(
+                "historical activation premise indexed projection".into(),
+            ));
         }
     }
     Ok(())
@@ -1422,7 +1970,7 @@ fn validate_definition(definition: &PermissionPolicyDefinition) -> Result<(), Ho
         ));
     }
     validate_revision_number(definition.policy_revision, "policy revision")?;
-    if definition.definition_schema_uri.is_empty() || definition.definition_schema_uri.len() > 512 {
+    if !valid_uri_reference(&definition.definition_schema_uri) {
         return Err(HostAuthorityError::Malformed(
             "definition_schema_uri".into(),
         ));
@@ -1581,12 +2129,69 @@ fn validate_revision_number(value: i64, label: &str) -> Result<(), HostAuthority
     Ok(())
 }
 
+fn valid_uri_reference(value: &str) -> bool {
+    if value.is_empty() || value.len() > 512 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    let allowed = |byte: u8| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b':'
+                    | b'/'
+                    | b'?'
+                    | b'#'
+                    | b'['
+                    | b']'
+                    | b'@'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b'%'
+            )
+    };
+    let mut index = 0;
+    while index < bytes.len() {
+        if !allowed(bytes[index]) {
+            return false;
+        }
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+
 fn valid_stable_id(value: &str) -> bool {
+    if value.is_empty() || value.len() > 63 {
+        return false;
+    }
     let mut pieces = value.split('-');
     let Some(first) = pieces.next() else {
         return false;
     };
     !first.is_empty()
+        && first.as_bytes()[0].is_ascii_lowercase()
         && first
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
@@ -1601,27 +2206,18 @@ fn valid_stable_id(value: &str) -> bool {
 fn valid_qualified_name(value: &str) -> bool {
     let mut pieces = value.split('.');
     let count = pieces.clone().count();
-    count >= 2 && pieces.all(valid_stable_id)
+    count >= 2 && value.len() >= 3 && value.len() <= 255 && pieces.all(valid_stable_id)
 }
 
 fn valid_uuid_v7(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 36
-        && [8, 13, 18, 23]
-            .into_iter()
-            .all(|index| bytes[index] == b'-')
-        && bytes
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| ![8, 13, 18, 23].contains(index))
-            .all(|(_, byte)| byte.is_ascii_hexdigit())
-        && bytes[14] == b'7'
-        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+    is_uuid_v7(value)
 }
 
 fn valid_unit_name(value: &str) -> bool {
     let bytes = value.as_bytes();
-    !bytes.is_empty()
+    value.len() >= 9
+        && value.len() <= 255
+        && !bytes.is_empty()
         && bytes[0].is_ascii_alphanumeric()
         && value.ends_with(".service")
         && bytes.iter().all(|byte| {
@@ -1654,12 +2250,11 @@ fn decode_record<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
     label: &str,
 ) -> Result<T, HostAuthorityError> {
-    let limits = ParseLimits::new(MAX_SEMANTIC_JSON_NESTING_DEPTH)
+    let limits = ParseLimits::semantic(MAX_SEMANTIC_JSON_NESTING_DEPTH)
         .map_err(|error| HostAuthorityError::Canonical(error.to_string()))?;
     deserialize_core_json(bytes, limits)
         .map_err(|error| HostAuthorityError::Malformed(format!("{label}: {error}")))
 }
-
 fn load_state_row(
     tx: &Transaction<'_>,
 ) -> Result<Option<(RuntimeAuthorityIdentity, i64, Sha256Digest)>, HostAuthorityError> {

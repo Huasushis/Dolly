@@ -309,8 +309,68 @@ fn orphan_next_revision_mapping_identity_is_rejected_before_pointer_publish() {
 
     let error = install_host_authority_revision(&mut db, incoming).unwrap_err();
     assert!(matches!(error, HostAuthorityError::RevisionConflict { .. }));
-    let after = load_current_authority(db.connection()).unwrap().unwrap();
-    assert_eq!(after.mapping.config_revision, prior.mapping.config_revision);
-    assert_eq!(after.mapping.config_digest, prior.mapping.config_digest);
-    assert_eq!(after.premise, prior.premise);
+    let state: (i64, String) = db
+        .connection()
+        .query_row(
+            "SELECT current_config_revision, current_config_digest
+             FROM runtime_authority_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state.0, prior.mapping.config_revision);
+    assert_eq!(state.1, prior.mapping.config_digest.to_string());
+    assert!(matches!(
+        load_current_authority(db.connection()),
+        Err(HostAuthorityError::RevisionConflict { .. })
+    ));
+}
+
+#[test]
+fn closed_validator_grammar_rejects_cross_language_cases_before_writes() {
+    fn rejects(input: HostAuthorityRevision) {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite3");
+        let mut db = bootstrap(&path, revision());
+        let error = install_host_authority_revision(&mut db, input);
+        assert!(
+            matches!(
+                error,
+                Err(HostAuthorityError::Malformed(_))
+                    | Err(HostAuthorityError::DigestMismatch(_))
+            ),
+            "unexpected grammar error: {error:?}"
+        );
+    }
+
+    let mut uppercase_uuid = revision();
+    uppercase_uuid.mapping.daemon_installation_id = uppercase_uuid
+        .mapping
+        .daemon_installation_id
+        .to_ascii_uppercase();
+    rejects(uppercase_uuid);
+
+    let mut digit_first_instance = revision();
+    digit_first_instance.mapping.instance_id = "1instance".into();
+    rejects(digit_first_instance);
+
+    let mut uppercase_component = revision();
+    uppercase_component
+        .premise
+        .as_mut()
+        .unwrap()
+        .service_candidate
+        .origin
+        .component_id = "Org.dolly.host-runtime".into();
+    rejects(uppercase_component);
+
+    let mut short_unit = revision();
+    short_unit
+        .mapping
+        .canonical_config
+        .service_candidate
+        .as_mut()
+        .unwrap()
+        .unit_name = "a.servic".into();
+    rejects(short_unit);
 }

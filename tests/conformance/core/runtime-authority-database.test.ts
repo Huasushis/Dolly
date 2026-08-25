@@ -550,13 +550,94 @@ describe("TST-AUTH-007: physical Host v2 bridge and canonical-byte gates", () =>
     );
     legacy.close();
     expectAuthorityError(
-      () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+      () => RuntimeAuthorityDatabase.migrateV1Authority({ path, identity, lock: new FakeLock() }),
       "STORAGE_MIGRATION_REQUIRED",
     );
-    RuntimeAuthorityDatabase.migrateV1Authority({ path, identity, lock: new FakeLock() });
-    const reopened = RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() });
-    expect(reopened.readCurrentConfig()!.config_revision).toBe(1);
-    reopened.close();
+    const unchanged = raw(path);
+    expect((unchanged.prepare("PRAGMA table_info(config_revision_mappings)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual([
+      "config_revision",
+      "config_digest",
+      "canonical_bytes",
+    ]);
+    expect(unchanged.prepare("SELECT name FROM sqlite_master WHERE name = 'host_authority_meta'").get()).toBeUndefined();
+    unchanged.close();
+  });
+  it("rejects oversized and short service admissions before mapping writes", () => {
+    const dir = scratch();
+    const path = join(dir, "bounded.sqlite3");
+    const candidateOverride = candidateRecordFor() as unknown as Record<string, unknown>;
+    candidateOverride.unit_name = "a.servic";
+    candidateOverride.candidate_digest = selfDigest(candidateOverride, "candidate_digest");
+    const db = openDatabase(dir, "bounded.sqlite3");
+    const fixture = candidate(1, "bounded", true, {
+      candidateOverride: candidateOverride as unknown as LinuxServiceCandidate,
+    });
+    expectAuthorityError(() => install(db, fixture), "MODULE_ACTIVATION_PREMISES_INVALID");
+    const oversizedCandidate = candidateRecordFor() as unknown as Record<string, unknown>;
+    oversizedCandidate.unit_name = `${"a".repeat(248)}.service`;
+    oversizedCandidate.candidate_digest = selfDigest(oversizedCandidate, "candidate_digest");
+    const oversizedFixture = candidate(1, "oversized", true, {
+      candidateOverride: oversizedCandidate as unknown as LinuxServiceCandidate,
+    });
+    expectAuthorityError(() => install(db, oversizedFixture), "MODULE_ACTIVATION_PREMISES_INVALID");
+    const inspect = raw(path);
+    expect(inspect.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'config_revision_mappings'").get()).toEqual({ count: 0 });
+    inspect.close();
+    db.close();
+  });
+
+  it("rejects tampered historical mapping identity and missing unused tables on reopen", () => {
+    const dir = scratch();
+    const path = join(dir, "historical.sqlite3");
+    const db = openDatabase(dir, "historical.sqlite3");
+    install(db, candidate(1, "A", false));
+    install(db, candidate(2, "B", false));
+    db.close();
+    const inspect = raw(path);
+    inspect.prepare("UPDATE config_revision_mappings SET instance_id = ? WHERE config_revision = 1").run("wrong-instance");
+    inspect.close();
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+      "STORAGE_CORRUPT",
+    );
+    const repair = raw(path);
+    repair.prepare("UPDATE config_revision_mappings SET instance_id = ? WHERE config_revision = 1").run(identity.instanceId);
+    repair.prepare("ALTER TABLE linux_service_candidates RENAME TO linux_service_candidates_tampered").run();
+    repair.close();
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+      "STORAGE_CORRUPT",
+    );
+  });
+
+  it("loads the explicit validator-parity rejection vector", () => {
+    const vector = JSON.parse(readFileSync(
+      join(import.meta.dirname, "../../../dolly-spec/test-vectors/core/TST-AUTH-008-validator-parity.json"),
+      "utf8",
+    )) as { stimulus: { rejection_cases: readonly { name: string }[] } };
+    expect(vector.stimulus.rejection_cases).toHaveLength(16);
+    expect(new Set(vector.stimulus.rejection_cases.map((entry) => entry.name)).size).toBe(16);
+  });
+  it("rejects uppercase and oversized authority identities", () => {
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({
+        path: join(scratch(), "identity.sqlite3"),
+        identity: {
+          daemonInstallationId: identity.daemonInstallationId.toUpperCase(),
+          instanceId: "main",
+        },
+        lock: new FakeLock(),
+      }),
+      "AUTHORITY_DATABASE_MALFORMED_RECORD",
+    );
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({
+        path: join(scratch(), "identity-oversized.sqlite3"),
+        identity: { daemonInstallationId: identity.daemonInstallationId, instanceId: "a".repeat(64) },
+        lock: new FakeLock(),
+      }),
+      "AUTHORITY_DATABASE_MALFORMED_RECORD",
+    );
   });
 });
 

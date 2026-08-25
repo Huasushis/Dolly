@@ -37,6 +37,7 @@ import {
   assertCanonicalJsonValue,
   canonicalBytes,
   canonicalJsonDigest,
+  DEFAULT_MAX_JSON_BYTES,
   parseCanonicalJsonBytes,
   type JsonValue,
 } from "../../schema-bundle/index.js";
@@ -65,7 +66,7 @@ const UUIDV7_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-
 const STABLE_ID_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u;
 const QUALIFIED_NAME_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*)+$/u;
 const UNIT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,246}\.service$/u;
-const URI_REFERENCE_PATTERN = /^.{1,512}$/us;
+const URI_REFERENCE_PATTERN = /^[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+$/u;
 export type RuntimeAuthorityDatabaseErrorCode =
   | "CONTROLLER_LOCK_NOT_HELD"
   | "STORAGE_INSTANCE_LOCKED"
@@ -319,6 +320,55 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
   return true;
 }
 
+function isStableId(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 63 && STABLE_ID_PATTERN.test(value);
+}
+
+function isQualifiedName(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 3 &&
+    value.length <= 255 &&
+    QUALIFIED_NAME_PATTERN.test(value) &&
+    value.split(".").every((part) => part.length <= 63)
+  );
+}
+
+function isUriReference(value: unknown): value is string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 512 || !URI_REFERENCE_PATTERN.test(value)) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] === "%") {
+      const escape = value.slice(index + 1, index + 3);
+      if (!/^[0-9A-Fa-f]{2}$/u.test(escape)) return false;
+      index += 2;
+    }
+  }
+  return true;
+}
+
+function assertSortedUniquePolicyRevision(
+  values: readonly { readonly policy_id: string; readonly policy_revision: number }[],
+  label: string,
+): void {
+  let previous: { readonly policy_id: string; readonly policy_revision: number } | undefined;
+  const seen = new Set<string>();
+  for (const value of values) {
+    const key = `${value.policy_id}\u0000${String(value.policy_revision)}`;
+    if (
+      seen.has(key) ||
+      (previous !== undefined &&
+        (previous.policy_id > value.policy_id ||
+          (previous.policy_id === value.policy_id && previous.policy_revision >= value.policy_revision)))
+    ) {
+      throw malformed(`${label} must be sorted and unique by policy_id, policy_revision`);
+    }
+    seen.add(key);
+    previous = value;
+  }
+}
+
 /**
  * Self-referential digest of a closed record: the record serialized with one
  * named field removed, then hashed, exactly as the digest `comment` for
@@ -328,7 +378,11 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
 function recordDigestWithoutField(record: Record<string, unknown>, field: string): string {
   const { [field]: _digest, ...rest } = record;
   assertCanonicalJsonValue(rest as unknown as JsonValue);
-  return sha256DigestOfBytes(canonicalBytes(rest as unknown as JsonValue));
+  const bytes = canonicalBytes(rest as unknown as JsonValue);
+  if (bytes.byteLength > DEFAULT_MAX_JSON_BYTES) {
+    throw malformed(`${field} record exceeds the ${DEFAULT_MAX_JSON_BYTES}-byte JSON limit`);
+  }
+  return sha256DigestOfBytes(bytes);
 }
 
 function malformed(label: string): RuntimeAuthorityDatabaseError {
@@ -343,8 +397,8 @@ function assertClosedRecord(value: unknown, keys: readonly string[], label: stri
 }
 
 function validateIdentity(identity: RuntimeAuthorityIdentity): void {
-  if (!identity || !UUIDV7_PATTERN.test(identity.daemonInstallationId)) throw malformed("identity.daemonInstallationId");
-  if (!STABLE_ID_PATTERN.test(identity.instanceId)) throw malformed("identity.instanceId");
+  if (!identity || typeof identity !== "object" || !UUIDV7_PATTERN.test(identity.daemonInstallationId)) throw malformed("identity.daemonInstallationId");
+  if (!isStableId(identity.instanceId)) throw malformed("identity.instanceId");
 }
 function controllerGenerationFromLock(lock: RuntimeAuthorityLockHandle): string {
   const direct = lock.controllerGenerationId;
@@ -363,7 +417,7 @@ function validateOrigin(value: unknown, label: string): InstalledComponentOrigin
   assertClosedRecord(value, ["schema", "kind", "component_id", "component_revision", "component_digest"], label);
   const v = value as Record<string, unknown>;
   if (v.schema !== "dolly.installed-component-origin/v1" || v.kind !== "installed_product_component") throw malformed(`${label}.schema`);
-  if (typeof v.component_id !== "string" || !QUALIFIED_NAME_PATTERN.test(v.component_id)) throw malformed(`${label}.component_id`);
+  if (!isQualifiedName(v.component_id)) throw malformed(`${label}.component_id`);
   if (!isIntegralInRange(v.component_revision, 1, MAX_CONFIG_REVISION)) throw malformed(`${label}.component_revision`);
   if (!isSha256(v.component_digest)) throw malformed(`${label}.component_digest`);
   return v as unknown as InstalledComponentOrigin;
@@ -373,7 +427,7 @@ function validatePolicyOrigin(value: unknown, label: string): PolicyDefinitionOr
   assertClosedRecord(value, ["schema", "kind", "source_id", "source_revision", "source_digest"], label);
   const v = value as Record<string, unknown>;
   if (v.schema !== "dolly.policy-definition-origin/v1" || v.kind !== "operator_approved_policy") throw malformed(`${label}.schema`);
-  if (typeof v.source_id !== "string" || !QUALIFIED_NAME_PATTERN.test(v.source_id)) throw malformed(`${label}.source_id`);
+  if (!isQualifiedName(v.source_id)) throw malformed(`${label}.source_id`);
   if (!isIntegralInRange(v.source_revision, 1, MAX_CONFIG_REVISION)) throw malformed(`${label}.source_revision`);
   if (!isSha256(v.source_digest)) throw malformed(`${label}.source_digest`);
   return v as unknown as PolicyDefinitionOrigin;
@@ -387,10 +441,15 @@ function validateDefinition(value: unknown, label: string): void {
   );
   const v = value as Record<string, unknown>;
   if (v.schema !== "dolly.permission-policy-definition/v1") throw malformed(`${label}.schema`);
-  if (typeof v.policy_id !== "string" || !STABLE_ID_PATTERN.test(v.policy_id)) throw malformed(`${label}.policy_id`);
+  if (!isStableId(v.policy_id)) throw malformed(`${label}.policy_id`);
   if (!isIntegralInRange(v.policy_revision, 1, MAX_CONFIG_REVISION)) throw malformed(`${label}.policy_revision`);
-  if (typeof v.definition_schema_uri !== "string" || !URI_REFERENCE_PATTERN.test(v.definition_schema_uri)) throw malformed(`${label}.definition_schema_uri`);
+  if (!isUriReference(v.definition_schema_uri)) throw malformed(`${label}.definition_schema_uri`);
   if (!isSha256(v.definition_schema_digest)) throw malformed(`${label}.definition_schema_digest`);
+  if (v.definition === null || typeof v.definition !== "object" || Array.isArray(v.definition)) {
+    throw malformed(`${label}.definition`);
+  }
+  if (Object.keys(v.definition).length > 256) throw malformed(`${label}.definition`);
+  assertCanonicalJsonValue(v.definition);
   validatePolicyOrigin(v.origin, `${label}.origin`);
   const computed = recordDigestWithoutField(v, "definition_digest");
   if (v.definition_digest !== computed) {
@@ -406,9 +465,9 @@ function validateBinding(value: unknown, label: string): void {
   );
   const v = value as Record<string, unknown>;
   if (v.schema !== "dolly.permission-policy-backend-binding/v1") throw malformed(`${label}.schema`);
-  if (typeof v.binding_id !== "string" || !STABLE_ID_PATTERN.test(v.binding_id)) throw malformed(`${label}.binding_id`);
+  if (!isStableId(v.binding_id)) throw malformed(`${label}.binding_id`);
   if (!isIntegralInRange(v.binding_revision, 1, MAX_CONFIG_REVISION)) throw malformed(`${label}.binding_revision`);
-  if (typeof v.policy_id !== "string" || !STABLE_ID_PATTERN.test(v.policy_id)) throw malformed(`${label}.policy_id`);
+  if (!isStableId(v.policy_id)) throw malformed(`${label}.policy_id`);
   if (!isIntegralInRange(v.policy_revision, 1, MAX_CONFIG_REVISION)) throw malformed(`${label}.policy_revision`);
   if (!isSha256(v.policy_definition_digest) || !isSha256(v.binding_digest)) throw malformed(`${label}.digest`);
   validateOrigin(v.origin, `${label}.origin`);
@@ -442,7 +501,7 @@ function validatePremise(value: unknown, label: string): ModuleActivationPremise
   );
   const v = value as Record<string, unknown>;
   if (v.schema !== "dolly.module-activation-premises/v1") throw malformed(`${label}.schema`);
-  if (!UUIDV7_PATTERN.test(String(v.daemon_installation_id)) || !STABLE_ID_PATTERN.test(String(v.instance_id))) throw malformed(`${label}.identity`);
+  if (!UUIDV7_PATTERN.test(String(v.daemon_installation_id)) || !isStableId(v.instance_id)) throw malformed(`${label}.identity`);
   if (!isIntegralInRange(v.config_revision, 1, MAX_CONFIG_REVISION) || !isSha256(String(v.config_digest))) throw malformed(`${label}.revision/digest`);
   if (!Array.isArray(v.permission_policy_definitions) || v.permission_policy_definitions.length > 1024) throw malformed(`${label}.permission_policy_definitions`);
   if (!Array.isArray(v.permission_policy_backend_bindings) || v.permission_policy_backend_bindings.length > 1024) throw malformed(`${label}.permission_policy_backend_bindings`);
@@ -452,6 +511,8 @@ function validatePremise(value: unknown, label: string): ModuleActivationPremise
   for (let index = 0; index < v.permission_policy_backend_bindings.length; index += 1) {
     validateBinding(v.permission_policy_backend_bindings[index], `${label}.permission_policy_backend_bindings[${index}]`);
   }
+  assertSortedUniquePolicyRevision(v.permission_policy_definitions as PermissionPolicyDefinition[], `${label}.permission_policy_definitions`);
+  assertSortedUniquePolicyRevision(v.permission_policy_backend_bindings as PermissionPolicyBackendBinding[], `${label}.permission_policy_backend_bindings`);
   validateServiceCandidate(v.service_candidate, `${label}.service_candidate`);
   const computed = recordDigestWithoutField(v, "premises_digest");
   if (v.premises_digest !== computed) {
@@ -476,13 +537,14 @@ function validateResolvedConfiguration(value: unknown, label: string): ResolvedC
   for (let index = 0; index < v.permission_policy_selections.length; index += 1) {
     const s = v.permission_policy_selections[index] as Record<string, unknown>;
     assertClosedRecord(s, ["policy_id", "policy_revision", "policy_definition_digest", "binding_id", "binding_revision", "binding_digest"], `${label}.permission_policy_selections[${index}]`);
-    if (!STABLE_ID_PATTERN.test(String(s.policy_id)) || !isIntegralInRange(s.policy_revision, 1, MAX_CONFIG_REVISION) || !isSha256(String(s.policy_definition_digest))) {
+    if (!isStableId(s.policy_id) || !isIntegralInRange(s.policy_revision, 1, MAX_CONFIG_REVISION) || !isSha256(String(s.policy_definition_digest))) {
       throw malformed(`${label}.permission_policy_selections[${index}]`);
     }
-    if (!STABLE_ID_PATTERN.test(String(s.binding_id)) || !isIntegralInRange(s.binding_revision, 1, MAX_CONFIG_REVISION) || !isSha256(String(s.binding_digest))) {
+    if (!isStableId(s.binding_id) || !isIntegralInRange(s.binding_revision, 1, MAX_CONFIG_REVISION) || !isSha256(String(s.binding_digest))) {
       throw malformed(`${label}.permission_policy_selections[${index}]`);
     }
   }
+  assertSortedUniquePolicyRevision(v.permission_policy_selections as PermissionPolicySelection[], `${label}.permission_policy_selections`);
   if (v.service_candidate !== null) {
     validateServiceCandidate(v.service_candidate, `${label}.service_candidate`);
   }
@@ -659,6 +721,287 @@ CREATE TABLE core_journal (
   premises_digest TEXT
 );
 `;
+
+interface AuthoritySchemaColumn {
+  readonly name: string;
+  readonly type: string;
+  readonly notNull: number;
+  readonly primaryKey: number;
+}
+
+const AUTHORITY_SCHEMA_COLUMNS: Readonly<Record<string, readonly AuthoritySchemaColumn[]>> = Object.freeze({
+  core_meta: [
+    { name: "singleton", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "schema_version", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "daemon_installation_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+    { name: "instance_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+    { name: "controller_generation_id", type: "TEXT", notNull: 0, primaryKey: 0 },
+    { name: "clean_shutdown", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "sqlite_version_number", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "sqlite_source_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "sqlite_artifact_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+  ],
+  commit_sequence: [
+    { name: "singleton", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "next_value", type: "INTEGER", notNull: 1, primaryKey: 0 },
+  ],
+  host_authority_meta: [
+    { name: "singleton", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "authority_schema_version", type: "INTEGER", notNull: 1, primaryKey: 0 },
+  ],
+  config_revision_mappings: [
+    { name: "config_revision", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "daemon_installation_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "instance_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "config_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "canonical_bytes", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  installed_component_origins: [
+    { name: "component_id", type: "TEXT", notNull: 1, primaryKey: 1 },
+    { name: "component_revision", type: "INTEGER", notNull: 1, primaryKey: 2 },
+    { name: "component_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  permission_policy_definitions: [
+    { name: "policy_id", type: "TEXT", notNull: 1, primaryKey: 1 },
+    { name: "policy_revision", type: "INTEGER", notNull: 1, primaryKey: 2 },
+    { name: "definition_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  permission_policy_backend_bindings: [
+    { name: "binding_id", type: "TEXT", notNull: 1, primaryKey: 1 },
+    { name: "binding_revision", type: "INTEGER", notNull: 1, primaryKey: 2 },
+    { name: "binding_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "policy_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "policy_revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "policy_definition_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "origin_component_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "origin_component_revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "origin_component_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  linux_service_candidates: [
+    { name: "origin_component_id", type: "TEXT", notNull: 1, primaryKey: 1 },
+    { name: "origin_component_revision", type: "INTEGER", notNull: 1, primaryKey: 2 },
+    { name: "origin_component_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "unit_name", type: "TEXT", notNull: 1, primaryKey: 3 },
+    { name: "mode", type: "TEXT", notNull: 1, primaryKey: 4 },
+    { name: "candidate_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  module_activation_premises: [
+    { name: "config_revision", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "config_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "service_origin_component_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "service_origin_component_revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "service_unit_name", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "service_mode", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "service_candidate_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "premises_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  module_activation_premise_policy_selections: [
+    { name: "config_revision", type: "INTEGER", notNull: 1, primaryKey: 1 },
+    { name: "policy_id", type: "TEXT", notNull: 1, primaryKey: 2 },
+    { name: "policy_revision", type: "INTEGER", notNull: 1, primaryKey: 3 },
+    { name: "policy_definition_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "binding_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "binding_revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "binding_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+  ],
+  runtime_authority_state: [
+    { name: "singleton", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "authority_schema_version", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "daemon_installation_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "instance_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "controller_generation_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "current_config_revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "current_config_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+  ],
+  core_journal: [
+    { name: "journal_seq", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "event_kind", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "event_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+    { name: "config_revision", type: "INTEGER", notNull: 0, primaryKey: 0 },
+    { name: "config_digest", type: "TEXT", notNull: 0, primaryKey: 0 },
+    { name: "premises_digest", type: "TEXT", notNull: 0, primaryKey: 0 },
+  ],
+});
+
+const AUTHORITY_SCHEMA_CHECKS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  core_meta: ["check (singleton = 1)", "check (clean_shutdown in (0, 1))"],
+  commit_sequence: ["check (singleton = 1)"],
+  host_authority_meta: ["check (singleton = 1)", "check (authority_schema_version = 2)"],
+  config_revision_mappings: [
+    "check (config_revision between 1 and 9007199254740991)",
+    "unique (config_revision, config_digest)",
+  ],
+  installed_component_origins: [
+    "check (component_revision between 1 and 9007199254740991)",
+    "unique (component_id, component_revision, component_digest)",
+  ],
+  permission_policy_definitions: [
+    "check (policy_revision between 1 and 9007199254740991)",
+    "unique (policy_id, policy_revision, definition_digest)",
+  ],
+  permission_policy_backend_bindings: [
+    "check (binding_revision between 1 and 9007199254740991)",
+    "unique (binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest)",
+  ],
+  linux_service_candidates: [
+    "check (origin_component_revision between 1 and 9007199254740991)",
+    "check (mode = 'user')",
+    "unique (origin_component_id, origin_component_revision, unit_name, mode, candidate_digest)",
+  ],
+  module_activation_premises: [
+    "check (config_revision between 1 and 9007199254740991)",
+    "unique (config_revision, config_digest)",
+  ],
+  module_activation_premise_policy_selections: [
+    "check (config_revision between 1 and 9007199254740991)",
+    "unique (config_revision, binding_id, binding_revision, binding_digest)",
+    "deferrable initially deferred",
+  ],
+  runtime_authority_state: [
+    "check (singleton = 1)",
+    "check (authority_schema_version = 2)",
+    "check (current_config_revision between 1 and 9007199254740991)",
+  ],
+});
+
+const AUTHORITY_SCHEMA_FOREIGN_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  permission_policy_backend_bindings: [
+    "permission_policy_definitions|policy_id|policy_id",
+    "permission_policy_definitions|policy_revision|policy_revision",
+    "permission_policy_definitions|policy_definition_digest|definition_digest",
+    "installed_component_origins|origin_component_id|component_id",
+    "installed_component_origins|origin_component_revision|component_revision",
+    "installed_component_origins|origin_component_digest|component_digest",
+  ],
+  linux_service_candidates: [
+    "installed_component_origins|origin_component_id|component_id",
+    "installed_component_origins|origin_component_revision|component_revision",
+    "installed_component_origins|origin_component_digest|component_digest",
+  ],
+  module_activation_premises: [
+    "config_revision_mappings|config_revision|config_revision",
+    "config_revision_mappings|config_digest|config_digest",
+    "linux_service_candidates|service_origin_component_id|origin_component_id",
+    "linux_service_candidates|service_origin_component_revision|origin_component_revision",
+    "linux_service_candidates|service_unit_name|unit_name",
+    "linux_service_candidates|service_mode|mode",
+    "linux_service_candidates|service_candidate_digest|candidate_digest",
+  ],
+  module_activation_premise_policy_selections: [
+    "module_activation_premises|config_revision|config_revision",
+    "permission_policy_definitions|policy_id|policy_id",
+    "permission_policy_definitions|policy_revision|policy_revision",
+    "permission_policy_definitions|policy_definition_digest|definition_digest",
+    "permission_policy_backend_bindings|binding_id|binding_id",
+    "permission_policy_backend_bindings|binding_revision|binding_revision",
+    "permission_policy_backend_bindings|binding_digest|binding_digest",
+    "permission_policy_backend_bindings|policy_id|policy_id",
+    "permission_policy_backend_bindings|policy_revision|policy_revision",
+    "permission_policy_backend_bindings|policy_definition_digest|policy_definition_digest",
+  ],
+  runtime_authority_state: [
+    "config_revision_mappings|current_config_revision|config_revision",
+    "config_revision_mappings|current_config_digest|config_digest",
+  ],
+});
+
+function normalizedSql(sql: unknown): string {
+  return String(sql ?? "").toLowerCase().replace(/\s+/gu, " ").trim();
+}
+
+function verifyAuthorityPhysicalSchema(connection: RuntimeSqliteConnection): void {
+  const tableNames = Object.keys(AUTHORITY_SCHEMA_COLUMNS);
+  const rows = connection.prepare(
+    "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name = 'config_revisions' OR tbl_name IN (" +
+      tableNames.map(() => "?").join(",") +
+      ")",
+  ).all(...tableNames);
+  if (rows.some((row) => row.name === "config_revisions")) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", "parallel config_revisions table is not part of the Host-owned authority schema");
+  }
+  for (const table of tableNames) {
+    const tableRow = rows.find((row) => row.type === "table" && row.name === table);
+    if (!tableRow) throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `required authority table ${table} is missing`);
+    const columns = connection.prepare(`PRAGMA table_info(${table})`).all();
+    const expected = AUTHORITY_SCHEMA_COLUMNS[table]!;
+    if (
+      columns.length !== expected.length ||
+      columns.some((column, index) => {
+        const wanted = expected[index]!;
+        return column.name !== wanted.name ||
+          String(column.type).toUpperCase() !== wanted.type ||
+          Number(column.notnull) !== wanted.notNull ||
+          Number(column.pk) !== wanted.primaryKey;
+      })
+    ) {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} has a non-canonical column shape`);
+    }
+    const sql = normalizedSql(tableRow.sql);
+    for (const fragment of AUTHORITY_SCHEMA_CHECKS[table] ?? []) {
+      if (!sql.includes(fragment)) throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} is missing constraint ${fragment}`);
+    }
+    const foreignKeys = connection.prepare(`PRAGMA foreign_key_list(${table})`).all().map(
+      (foreignKey) => `${foreignKey.table}|${foreignKey.from}|${foreignKey.to}`,
+    ).sort();
+    const expectedForeignKeys = [...(AUTHORITY_SCHEMA_FOREIGN_KEYS[table] ?? [])].sort();
+    if (foreignKeys.length !== expectedForeignKeys.length || foreignKeys.some((value, index) => value !== expectedForeignKeys[index])) {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} has a non-canonical foreign-key shape`);
+    }
+  }
+  const hostileObjects = rows.filter((row) => row.type === "trigger" || row.type === "view");
+  if (hostileObjects.length > 0) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", "authority tables have unexpected triggers or views");
+  }
+}
+function verifyLegacyAuthorityPhysicalSchema(
+  connection: RuntimeSqliteConnection,
+  allowMissingHostMeta: boolean,
+): void {
+  const tables = Object.keys(AUTHORITY_SCHEMA_COLUMNS).filter(
+    (table) => table !== "core_meta" && table !== "commit_sequence" && table !== "core_journal",
+  );
+  for (const table of tables) {
+    const row = connection.prepare(
+      "SELECT type, sql FROM sqlite_master WHERE name = ?",
+    ).get(table);
+    if (!row) {
+      if (allowMissingHostMeta && table === "host_authority_meta") continue;
+      throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", `legacy authority table ${table} is missing`);
+    }
+    if (row.type !== "table") {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", `legacy authority object ${table} is not a table`);
+    }
+    const expected = AUTHORITY_SCHEMA_COLUMNS[table]!;
+    const legacyExpected = table === "runtime_authority_state"
+      ? expected.filter((column) => column.name !== "controller_generation_id")
+      : expected;
+    const columns = connection.prepare(`PRAGMA table_info(${table})`).all();
+    if (
+      columns.length !== legacyExpected.length ||
+      columns.some((column, index) => String(column.name) !== legacyExpected[index]!.name)
+    ) {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", `legacy authority table ${table} has a non-canonical column shape`);
+    }
+    const sql = normalizedSql(row.sql);
+    if (!sql.includes("primary key") || (table !== "host_authority_meta" && !sql.includes("unique"))) {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", `legacy authority table ${table} is missing a required constraint`);
+    }
+  }
+  const hostile = connection.prepare(
+    "SELECT type, name FROM sqlite_master WHERE type IN ('trigger', 'view') AND tbl_name IN (" +
+      tables.map(() => "?").join(",") +
+      ")",
+  ).all(...tables);
+  if (hostile.length > 0) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "legacy authority tables have unexpected triggers or views");
+  }
+}
 
 function stateRecord(identity: RuntimeAuthorityIdentity, controllerGenerationId: string, revision: number, digest: string): JsonValue {
   return {
@@ -1066,6 +1409,33 @@ export class RuntimeAuthorityDatabase {
         "The database is not an expected v1 authority migration source",
       );
     }
+    const mappingColumns = this.#connection.prepare("PRAGMA table_info(config_revision_mappings)").all();
+    const mappingColumnNames = new Set(mappingColumns.map((entry) => String(entry.name)));
+    if (!mappingColumnNames.has("daemon_installation_id") || !mappingColumnNames.has("instance_id")) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_MIGRATION_REQUIRED",
+        "Legacy mapping identity columns are absent; rebuild the mapping table before migration",
+      );
+    }
+    const mappingIdentityColumns = mappingColumns.filter(
+      (entry) => entry.name === "daemon_installation_id" || entry.name === "instance_id",
+    );
+    if (mappingIdentityColumns.some((entry) => Number(entry.notnull) !== 1)) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_MIGRATION_REQUIRED",
+        "Legacy mapping identity columns are nullable and cannot be altered into v2",
+      );
+    }
+    const parallelConfigRevisions = this.#connection.prepare(
+      "SELECT 1 AS present FROM sqlite_master WHERE name = 'config_revisions'",
+    ).get();
+    if (parallelConfigRevisions) {
+      throw new RuntimeAuthorityDatabaseError(
+        "STORAGE_MIGRATION_REQUIRED",
+        "parallel config_revisions object blocks legacy migration",
+      );
+    }
+    verifyLegacyAuthorityPhysicalSchema(this.#connection, typescriptV1);
     const state = this.#connection.prepare(
       "SELECT authority_schema_version, daemon_installation_id, instance_id, current_config_revision, current_config_digest, record_jcs FROM runtime_authority_state WHERE singleton = 1",
     ).get();
@@ -1077,12 +1447,36 @@ export class RuntimeAuthorityDatabase {
     }
     const revision = Number(state.current_config_revision);
     const digest = String(state.current_config_digest);
-    const mapping = this.#resolveMapping(revision, digest);
+    const mapping = this.#resolveLegacyMapping(revision, digest);
     if (mapping === null) throw this.#corrupt("legacy current pointer references a missing mapping");
-    const legacyRecord = parseCanonicalJsonBytes(toBytes(state.record_jcs));
-    assertCanonicalJsonValue(legacyRecord);
-    if (!sameBytes(toBytes(state.record_jcs), canonicalBytes(legacyRecord))) {
-      throw this.#corrupt("legacy authority-state record_jcs is not canonical");
+    let legacyStateRecord: JsonValue;
+    try {
+      legacyStateRecord = parseCanonicalJsonBytes(toBytes(state.record_jcs));
+      assertCanonicalJsonValue(legacyStateRecord);
+    assertClosedRecord(
+      legacyStateRecord,
+      ["schema", "authority_schema_version", "daemon_installation_id", "instance_id", "current_config_revision", "current_config_digest"],
+      "legacy authority-state record",
+    );
+    } catch (error) {
+      if (error instanceof RuntimeAuthorityDatabaseError) throw error;
+      throw this.#corrupt(`legacy authority-state record is malformed: ${String(error)}`);
+    }
+    if (
+      legacyStateRecord.schema !== "dolly.runtime-authority-state/v1" ||
+      legacyStateRecord.authority_schema_version !== 1 ||
+      legacyStateRecord.daemon_installation_id !== this.#identity.daemonInstallationId ||
+      legacyStateRecord.instance_id !== this.#identity.instanceId ||
+      legacyStateRecord.current_config_revision !== revision ||
+      legacyStateRecord.current_config_digest !== digest ||
+      !sameBytes(toBytes(state.record_jcs), canonicalBytes(legacyStateRecord))
+    ) {
+      throw this.#corrupt("legacy authority-state record disagrees with its relational projection");
+    }
+    const legacyConfig = validateResolvedConfiguration(parseCanonicalJsonBytes(mapping.bytes), "legacy current canonical config");
+    const legacyPremise = this.#loadPremise(revision, digest);
+    if ((legacyConfig.service_candidate !== null) !== (legacyPremise !== null)) {
+      throw this.#corrupt("legacy current config and premise presence disagree");
     }
 
     this.#statement("BEGIN IMMEDIATE").run();
@@ -1172,6 +1566,7 @@ export class RuntimeAuthorityDatabase {
       );
       this.#connection.prepare("DROP TABLE runtime_authority_state").run();
       this.#connection.prepare("ALTER TABLE runtime_authority_state_v2 RENAME TO runtime_authority_state").run();
+      verifyAuthorityPhysicalSchema(this.#connection);
       this.#statement("COMMIT").run();
     } catch (error) {
       try {
@@ -1195,7 +1590,13 @@ export class RuntimeAuthorityDatabase {
       );
     }
     const version = this.#userVersion();
-    if (version === 0) return; // uninitialized candidate bytes; first write bootstraps schema 1
+    if (version === 0) {
+      const objects = Number(this.#connection.prepare(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type IN ('table', 'index', 'trigger', 'view') AND name NOT LIKE 'sqlite_%'",
+      ).get()?.count ?? 0);
+      if (objects !== 0) throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "uninitialized authority bytes contain a partial schema");
+      return;
+    }
     if (version !== RUNTIME_AUTHORITY_SCHEMA_VERSION) {
       throw new RuntimeAuthorityDatabaseError(
         "STORAGE_MIGRATION_REQUIRED",
@@ -1225,6 +1626,7 @@ export class RuntimeAuthorityDatabase {
   }
 
   #verifyCommitted(): void {
+    verifyAuthorityPhysicalSchema(this.#connection);
     const quickCheck = this.#connection.prepare("PRAGMA quick_check").all();
     if (quickCheck.length !== 1 || String(quickCheck[0]?.quick_check ?? "") !== "ok") {
       throw this.#corrupt("PRAGMA quick_check did not report ok");
@@ -1233,6 +1635,7 @@ export class RuntimeAuthorityDatabase {
     if (violations.length > 0) {
       throw this.#corrupt("foreign-key check reported violations");
     }
+    this.#verifyAllCommittedRows();
     const meta = this.#connection.prepare(
       "SELECT schema_version, daemon_installation_id, instance_id, controller_generation_id FROM core_meta WHERE singleton = 1",
     ).get();
@@ -1294,6 +1697,163 @@ export class RuntimeAuthorityDatabase {
       throw this.#corrupt("an installed Linux Module config has no premise row");
     }
   }
+  #verifyAllCommittedRows(): void {
+    const mappingRows = this.#connection.prepare(
+      "SELECT config_revision, config_digest FROM config_revision_mappings ORDER BY config_revision",
+    ).all();
+    for (const row of mappingRows) {
+      const revision = Number(row.config_revision);
+      const digest = String(row.config_digest);
+      if (this.#resolveMapping(revision, digest) === null) throw this.#corrupt(`mapping revision ${revision} disappeared during verification`);
+    }
+
+    const originRows = this.#connection.prepare(
+      "SELECT component_id, component_revision, component_digest, record_jcs FROM installed_component_origins",
+    ).all();
+    for (const row of originRows) {
+      const bytes = toBytes(row.record_jcs);
+      let record: JsonValue;
+      try {
+        record = parseCanonicalJsonBytes(bytes);
+        assertCanonicalJsonValue(record);
+        validateOrigin(record, "stored installed component origin");
+      } catch (error) {
+        throw this.#corrupt(`stored installed component origin is malformed: ${String(error)}`);
+      }
+      if (
+        !sameBytes(bytes, canonicalBytes(record)) ||
+        (record as Record<string, unknown>).component_id !== row.component_id ||
+        (record as Record<string, unknown>).component_revision !== Number(row.component_revision) ||
+        (record as Record<string, unknown>).component_digest !== row.component_digest
+      ) {
+        throw this.#corrupt("installed component origin projection disagrees with its canonical record");
+      }
+    }
+
+    const definitionRows = this.#connection.prepare(
+      "SELECT policy_id, policy_revision, definition_digest, record_jcs FROM permission_policy_definitions",
+    ).all();
+    for (const row of definitionRows) {
+      const bytes = toBytes(row.record_jcs);
+      let record: JsonValue;
+      try {
+        record = parseCanonicalJsonBytes(bytes);
+        assertCanonicalJsonValue(record);
+        validateDefinition(record, "stored permission policy definition");
+      } catch (error) {
+        throw this.#corrupt(`stored permission policy definition is malformed: ${String(error)}`);
+      }
+      const object = record as Record<string, unknown>;
+      if (
+        !sameBytes(bytes, canonicalBytes(record)) ||
+        object.policy_id !== row.policy_id ||
+        object.policy_revision !== Number(row.policy_revision) ||
+        object.definition_digest !== row.definition_digest
+      ) {
+        throw this.#corrupt("permission policy definition projection disagrees with its canonical record");
+      }
+    }
+
+    const bindingRows = this.#connection.prepare(
+      "SELECT binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest, origin_component_id, origin_component_revision, origin_component_digest, record_jcs FROM permission_policy_backend_bindings",
+    ).all();
+    for (const row of bindingRows) {
+      const bytes = toBytes(row.record_jcs);
+      let record: JsonValue;
+      try {
+        record = parseCanonicalJsonBytes(bytes);
+        assertCanonicalJsonValue(record);
+        validateBinding(record, "stored permission policy backend binding");
+      } catch (error) {
+        throw this.#corrupt(`stored permission policy backend binding is malformed: ${String(error)}`);
+      }
+      const object = record as Record<string, unknown>;
+      const origin = object.origin as Record<string, unknown>;
+      if (
+        !sameBytes(bytes, canonicalBytes(record)) ||
+        object.binding_id !== row.binding_id ||
+        object.binding_revision !== Number(row.binding_revision) ||
+        object.binding_digest !== row.binding_digest ||
+        object.policy_id !== row.policy_id ||
+        object.policy_revision !== Number(row.policy_revision) ||
+        object.policy_definition_digest !== row.policy_definition_digest ||
+        origin.component_id !== row.origin_component_id ||
+        origin.component_revision !== Number(row.origin_component_revision) ||
+        origin.component_digest !== row.origin_component_digest
+      ) {
+        throw this.#corrupt("permission policy backend binding projection disagrees with its canonical record");
+      }
+    }
+
+    const candidateRows = this.#connection.prepare(
+      "SELECT origin_component_id, origin_component_revision, origin_component_digest, unit_name, mode, candidate_digest, record_jcs FROM linux_service_candidates",
+    ).all();
+    for (const row of candidateRows) {
+      const bytes = toBytes(row.record_jcs);
+      let record: JsonValue;
+      try {
+        record = parseCanonicalJsonBytes(bytes);
+        assertCanonicalJsonValue(record);
+        validateServiceCandidate(record, "stored Linux service candidate");
+      } catch (error) {
+        throw this.#corrupt(`stored Linux service candidate is malformed: ${String(error)}`);
+      }
+      const object = record as Record<string, unknown>;
+      const origin = object.origin as Record<string, unknown>;
+      if (
+        !sameBytes(bytes, canonicalBytes(record)) ||
+        origin.component_id !== row.origin_component_id ||
+        origin.component_revision !== Number(row.origin_component_revision) ||
+        origin.component_digest !== row.origin_component_digest ||
+        object.unit_name !== row.unit_name ||
+        object.mode !== row.mode ||
+        object.candidate_digest !== row.candidate_digest
+      ) {
+        throw this.#corrupt("Linux service candidate projection disagrees with its canonical record");
+      }
+    }
+
+    const premiseRows = this.#connection.prepare(
+      "SELECT config_revision, config_digest, service_origin_component_id, service_origin_component_revision, service_unit_name, service_mode, service_candidate_digest, premises_digest FROM module_activation_premises",
+    ).all();
+    for (const row of premiseRows) {
+      const revision = Number(row.config_revision);
+      const premise = this.#loadPremise(revision, String(row.config_digest));
+      if (premise === null) throw this.#corrupt(`stored premise ${revision} disappeared during verification`);
+      const candidate = premise.service_candidate;
+      if (
+        candidate.origin.component_id !== row.service_origin_component_id ||
+        candidate.origin.component_revision !== Number(row.service_origin_component_revision) ||
+        candidate.unit_name !== row.service_unit_name ||
+        candidate.mode !== row.service_mode ||
+        candidate.candidate_digest !== row.service_candidate_digest ||
+        premise.premises_digest !== row.premises_digest
+      ) {
+        throw this.#corrupt(`premise projection disagrees with its canonical record for revision ${revision}`);
+      }
+    }
+
+    const selectionRows = this.#connection.prepare(
+      "SELECT config_revision, policy_id, policy_revision, policy_definition_digest, binding_id, binding_revision, binding_digest FROM module_activation_premise_policy_selections",
+    ).all();
+    for (const row of selectionRows) {
+      const selection = {
+        policy_id: String(row.policy_id),
+        policy_revision: Number(row.policy_revision),
+        policy_definition_digest: String(row.policy_definition_digest),
+        binding_id: String(row.binding_id),
+        binding_revision: Number(row.binding_revision),
+        binding_digest: String(row.binding_digest),
+      };
+      if (!isStableId(selection.policy_id) || !isStableId(selection.binding_id) ||
+          !isIntegralInRange(selection.policy_revision, 1, MAX_CONFIG_REVISION) ||
+          !isIntegralInRange(selection.binding_revision, 1, MAX_CONFIG_REVISION) ||
+          !isSha256(selection.policy_definition_digest) || !isSha256(selection.binding_digest)) {
+        throw this.#corrupt("stored premise-policy selection is malformed");
+      }
+    }
+  }
+
 
   #refreshControllerGeneration(): void {
     this.#statement("BEGIN IMMEDIATE").run();
@@ -1329,21 +1889,28 @@ export class RuntimeAuthorityDatabase {
     }
   }
 
-  /** Loads a committed mapping with full verification; null when absent. */
+  /** Loads a committed mapping with full identity/config verification; null when absent. */
   #resolveMapping(revision: number, declaredDigest: string): { bytes: Uint8Array; digest: string } | null {
     const row = this.#connection.prepare(
-      "SELECT config_revision, config_digest, canonical_bytes FROM config_revision_mappings WHERE config_revision = ?",
+      "SELECT config_revision, daemon_installation_id, instance_id, config_digest, canonical_bytes FROM config_revision_mappings WHERE config_revision = ?",
     ).get(revision);
     if (!row) return null;
-    if (Number(row.config_revision) !== revision || String(row.config_digest) !== declaredDigest) {
-      throw this.#corrupt("config mapping projection disagrees with its stored record");
+    if (
+      Number(row.config_revision) !== revision ||
+      row.daemon_installation_id !== this.#identity.daemonInstallationId ||
+      row.instance_id !== this.#identity.instanceId ||
+      String(row.config_digest) !== declaredDigest
+    ) {
+      throw this.#corrupt("config mapping projection disagrees with its stored authority identity or record");
     }
     const bytes = toBytes(row.canonical_bytes);
     let parsed: JsonValue;
     try {
       parsed = parseCanonicalJsonBytes(bytes);
       assertCanonicalJsonValue(parsed);
+      validateResolvedConfiguration(parsed, `revision ${revision} canonical config`);
     } catch (error) {
+      if (error instanceof RuntimeAuthorityDatabaseError) throw error;
       throw this.#corrupt(`revision ${revision} canonical_bytes are malformed: ${String(error)}`);
     }
     const canonical = canonicalBytes(parsed);
@@ -1353,6 +1920,32 @@ export class RuntimeAuthorityDatabase {
     const computed = sha256DigestOfBytes(canonical);
     if (computed !== declaredDigest) {
       throw this.#corrupt(`revision ${revision} canonical bytes do not match the stored digest`);
+    }
+    return { bytes: canonical, digest: declaredDigest };
+  }
+
+  /** Legacy source mapping reader used only before the v2 identity columns exist. */
+  #resolveLegacyMapping(revision: number, declaredDigest: string): { bytes: Uint8Array; digest: string } | null {
+    const row = this.#connection.prepare(
+      "SELECT config_revision, config_digest, canonical_bytes FROM config_revision_mappings WHERE config_revision = ?",
+    ).get(revision);
+    if (!row) return null;
+    if (Number(row.config_revision) !== revision || String(row.config_digest) !== declaredDigest) {
+      throw this.#corrupt("legacy config mapping projection disagrees with its stored record");
+    }
+    const bytes = toBytes(row.canonical_bytes);
+    let parsed: JsonValue;
+    try {
+      parsed = parseCanonicalJsonBytes(bytes);
+      assertCanonicalJsonValue(parsed);
+      validateResolvedConfiguration(parsed, `legacy revision ${revision} canonical config`);
+    } catch (error) {
+      if (error instanceof RuntimeAuthorityDatabaseError) throw error;
+      throw this.#corrupt(`legacy revision ${revision} canonical_bytes are malformed: ${String(error)}`);
+    }
+    const canonical = canonicalBytes(parsed);
+    if (!sameBytes(bytes, canonical) || sha256DigestOfBytes(canonical) !== declaredDigest) {
+      throw this.#corrupt(`legacy revision ${revision} canonical bytes disagree with its digest`);
     }
     return { bytes: canonical, digest: declaredDigest };
   }
@@ -1381,8 +1974,13 @@ export class RuntimeAuthorityDatabase {
       throw this.#corrupt(`premise record_jcs for revision ${revision} is not canonical JSON bytes`);
     }
     const premise = validatePremise(record, `revision ${revision} premise`);
-    if (premise.config_revision !== revision || premise.config_digest !== configDigest) {
-      throw this.#corrupt(`premise record disagrees with revision ${revision}`);
+    if (
+      premise.daemon_installation_id !== this.#identity.daemonInstallationId ||
+      premise.instance_id !== this.#identity.instanceId ||
+      premise.config_revision !== revision ||
+      premise.config_digest !== configDigest
+    ) {
+      throw this.#corrupt(`premise record disagrees with revision ${revision} authority identity`);
     }
     if (premise.premises_digest !== String(row.premises_digest)) {
       throw this.#corrupt(`premise digest projection disagrees with the stored record for revision ${revision}`);
@@ -1595,6 +2193,16 @@ export class RuntimeAuthorityDatabase {
         "a configuration selecting no installed Linux Module must not carry a premise",
       );
     }
+    if (premiseRequired) {
+      try {
+        validatePremise(input.premise, "premise");
+      } catch (error) {
+        if (error instanceof RuntimeAuthorityDatabaseError && error.message.includes("sorted and unique")) {
+          throw new RuntimeAuthorityDatabaseError("MODULE_ACTIVATION_PREMISES_INVALID", error.message, { cause: error });
+        }
+        throw error;
+      }
+    }
     // Reuse the exact current mapping: identical digest AND bytes.
     if (currentRevision !== null && currentDigest === input.configDigest) {
       if (currentBytes !== null && sameBytes(currentBytes, input.canonicalConfigBytes)) {
@@ -1660,8 +2268,18 @@ export class RuntimeAuthorityDatabase {
     // Closed-record validation first: a premise record (and every embedded
     // definition/binding/candidate) must satisfy the closed runtime-authority
     // definitions before any row is written, so a record smuggling a path,
-    // secret, function, or live-object shape is refused before admission.
-    validatePremise(premise, "premise");
+    try {
+      validatePremise(premise, "premise");
+    } catch (error) {
+      if (error instanceof RuntimeAuthorityDatabaseError && error.message.includes("sorted and unique")) {
+        throw new RuntimeAuthorityDatabaseError(
+          "MODULE_ACTIVATION_PREMISES_INVALID",
+          error.message,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
     if (premise.config_revision !== next) {
       throw new RuntimeAuthorityDatabaseError(
         "MODULE_ACTIVATION_PREMISES_INVALID",
