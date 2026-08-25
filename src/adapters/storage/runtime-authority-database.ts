@@ -1027,6 +1027,26 @@ function sqlHasTokenSequence(tokens: readonly string[], fragment: string): boole
   );
 }
 
+/**
+ * True when any token, after stripping identifier quoting ("...", `...`,
+ * '...', [...]) and splitting schema-qualified names on '.', names one of the
+ * authority tables.
+ */
+function tokensReferenceAuthorityTable(tokens: readonly string[], authorityTables: readonly string[]): boolean {
+  return tokens.some((token) =>
+    token.split(".").some((part) => {
+      const trimmed = part.startsWith("[") && part.endsWith("]")
+        ? part.slice(1, -1)
+        : part.startsWith('"') && part.endsWith('"')
+          ? part.slice(1, -1)
+          : part.startsWith("`") && part.endsWith("`")
+            ? part.slice(1, -1)
+            : part;
+      return authorityTables.some((table) => table.toLowerCase() === trimmed.toLowerCase());
+    }),
+  );
+}
+
 function verifyAuthorityIndexes(connection: RuntimeSqliteConnection): void {
   for (const table of Object.keys(AUTHORITY_SCHEMA_COLUMNS)) {
     const expected = AUTHORITY_SCHEMA_INDEXES[table] ?? [];
@@ -1066,8 +1086,12 @@ function verifyAuthorityIndexes(connection: RuntimeSqliteConnection): void {
 
 function verifyAuthorityPhysicalSchema(connection: RuntimeSqliteConnection): void {
   const tableNames = Object.keys(AUTHORITY_SCHEMA_COLUMNS);
+  // Enumerate every persisted trigger and view alongside the authority tables:
+  // a tbl_name filter would hide cross-referencing hostile objects whose own
+  // name is unrelated to any authority table.
   const rows = connection.prepare(
-    "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name = 'config_revisions' OR tbl_name IN (" +
+    "SELECT type, name, tbl_name, sql FROM sqlite_master " +
+      "WHERE name = 'config_revisions' OR type IN ('trigger', 'view') OR tbl_name IN (" +
       tableNames.map(() => "?").join(",") +
       ")",
   ).all(...tableNames);
@@ -1105,14 +1129,13 @@ function verifyAuthorityPhysicalSchema(connection: RuntimeSqliteConnection): voi
       throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} has a non-canonical foreign-key shape`);
     }
   }
+  // Enumerate every persisted trigger and view before scanning; do not
+  // pre-filter by sqlite_master.tbl_name, which records only the first FROM
+  // item of a view and would miss cross-references through subqueries.
   const hostileObjects = rows.filter((row) => {
     if (row.type !== "trigger" && row.type !== "view") return false;
-    // sqlite_master.tbl_name records only the first FROM item, so a view or
-    // trigger that reaches an authority table through a subquery, join, or
-    // later FROM item would slip through a tbl_name-only filter; scan its body.
     if (AUTHORITY_SCHEMA_COLUMNS[row.tbl_name as string] !== undefined) return true;
-    const bodyTokens = sqlTokens(row.sql);
-    return AUTHORITY_TABLE_NAMES.some((table) => sqlHasTokenSequence(bodyTokens, table));
+    return tokensReferenceAuthorityTable(sqlTokens(row.sql), AUTHORITY_TABLE_NAMES);
   });
   if (hostileObjects.length > 0) {
     throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", "authority tables have unexpected triggers or views");
@@ -1171,12 +1194,17 @@ function verifyLegacyAuthorityPhysicalSchema(
   if (foreignKeyViolations.length > 0) {
     throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "legacy authority foreign-key check reported violations");
   }
+  // Enumerate every persisted trigger and view before scanning; do not
+  // pre-filter by sqlite_master.tbl_name, which records only the first FROM
+  // item of a view and would miss cross-references through subqueries.
   const hostile = connection.prepare(
-    "SELECT type, name FROM sqlite_master WHERE type IN ('trigger', 'view') AND tbl_name IN (" +
-      tables.map(() => "?").join(",") +
-      ")",
-  ).all(...tables);
-  if (hostile.length > 0) {
+    "SELECT type, tbl_name, sql FROM sqlite_master WHERE type IN ('trigger', 'view')",
+  ).all() as Array<{ type: string; tbl_name: string; sql: string }>;
+  const hostileObject = hostile.find((row) => {
+    if (tables.includes(row.tbl_name)) return true;
+    return tokensReferenceAuthorityTable(sqlTokens(row.sql), tables);
+  });
+  if (hostileObject !== undefined) {
     throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "legacy authority tables have unexpected triggers or views");
   }
 }

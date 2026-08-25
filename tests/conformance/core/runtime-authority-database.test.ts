@@ -1010,6 +1010,38 @@ describe("TST-AUTH-007: physical Host v2 bridge and canonical-byte gates", () =>
       expect(run).not.toThrow();
     }
   });
+  it("rejects cross-reference, quoted, and schema-qualified hostile views with parity", () => {
+    const stimuli: readonly [string, string][] = [
+      ["plain-cross-reference",
+        "CREATE VIEW unrelated_helper AS SELECT 1 AS x WHERE EXISTS (SELECT 1 FROM config_revision_mappings)"],
+      ["quoted-identifier",
+        `CREATE VIEW unrelated_helper AS SELECT 1 AS x FROM unrelated_source WHERE y IN
+           (SELECT "config_revision" FROM "config_revision_mappings")`],
+      ["bracket-identifier",
+        "CREATE VIEW unrelated_helper AS SELECT * FROM unrelated_source JOIN [config_revision_mappings] ON 1 = 1"],
+      ["schema-qualified",
+        "CREATE VIEW unrelated_helper AS SELECT * FROM main.config_revision_mappings"],
+      ["backtick-identifier",
+        "CREATE TABLE unrelated_source (id INTEGER);" +
+        "CREATE TRIGGER unrelated_trigger AFTER INSERT ON unrelated_source BEGIN" +
+        " SELECT COUNT(*) FROM `runtime_authority_state`; END"],
+    ];
+    for (const [name, sql] of stimuli) {
+      const dir = scratch();
+      const path = join(dir, `${name}.sqlite3`);
+      const db = openDatabase(dir, `${name}.sqlite3`);
+      install(db, candidate(1, name, false));
+      db.close();
+      const inspect = raw(path);
+      inspect.exec(sql);
+      inspect.close();
+      expectAuthorityError(
+        () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+        "STORAGE_CORRUPT",
+      );
+    }
+  });
+
   it("rejects uppercase and oversized authority identities", () => {
     expectAuthorityError(
       () => RuntimeAuthorityDatabase.open({

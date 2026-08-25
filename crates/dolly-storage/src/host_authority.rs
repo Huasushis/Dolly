@@ -626,6 +626,9 @@ pub(crate) fn reject_hostile_authority_objects(
            AND (tbl_name IN ({}) OR sql IS NOT NULL)",
         AUTHORITY_TABLES.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", ")
     ))?;
+    // Enumerate every persisted trigger and view before scanning; do not
+    // pre-filter by sqlite_master.tbl_name, which records only the first FROM
+    // item of a view and would miss cross-references through subqueries.
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let object_type: String = row.get(0)?;
@@ -633,9 +636,7 @@ pub(crate) fn reject_hostile_authority_objects(
         let tbl_name: String = row.get(2)?;
         let body: String = row.get(3)?;
         let attached = AUTHORITY_TABLES.iter().any(|table| *table == tbl_name);
-        let referencing = AUTHORITY_TABLES
-            .iter()
-            .any(|table| sql_has_token_sequence(&sql_tokens(&body), table));
+        let referencing = tokens_reference_authority_table(&sql_tokens(&body), &AUTHORITY_TABLES);
         if attached || referencing {
             return Err(HostAuthorityError::Malformed(format!(
                 "{legacy_prefix}authority tables have unexpected {object_type} {name}",
@@ -644,6 +645,24 @@ pub(crate) fn reject_hostile_authority_objects(
         }
     }
     Ok(())
+}
+
+/// True when any token, after stripping identifier quoting (`"..."`,
+/// \`...\`, '...', [...]) and splitting schema-qualified names on '.',
+/// names one of the authority tables.
+fn tokens_reference_authority_table(tokens: &[String], authority_tables: &[&str]) -> bool {
+    tokens.iter().any(|token| {
+        let mut parts = token.split('.');
+        parts.any(|part| {
+            let trimmed = part
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .or_else(|| part.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
+                .or_else(|| part.strip_prefix('`').and_then(|v| v.strip_suffix('`')))
+                .unwrap_or(part);
+            authority_tables.iter().any(|table| table.eq_ignore_ascii_case(trimmed))
+        })
+    })
 }
 
 fn verify_authority_indexes(connection: &Connection) -> Result<(), HostAuthorityError> {
@@ -1155,6 +1174,7 @@ pub(crate) fn verify_legacy_authority_schema(
             "legacy authority foreign-key check reported violations".into(),
         ));
     }
+    reject_hostile_authority_objects(connection, true)?;
     Ok(())
 }
 

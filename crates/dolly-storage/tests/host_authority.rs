@@ -592,3 +592,50 @@ fn v2_reopen_rejects_hostile_objects_indexes_and_foreign_keys() {
         );
     }
 }
+
+#[test]
+fn cross_reference_and_quoted_hostile_views_are_rejected_with_parity() {
+    // Each stimulus hides an authority-table reference behind an unrelated
+    // object name, a quoted identifier, or schema qualification.
+    let stimuli: [(&str, &str); 5] = [
+        (
+            "plain_cross_reference",
+            "CREATE VIEW unrelated_helper AS
+             SELECT 1 AS x WHERE EXISTS (SELECT 1 FROM config_revision_mappings)",
+        ),
+        (
+            "quoted_identifier",
+            "CREATE VIEW unrelated_helper AS
+             SELECT 1 AS x FROM unrelated_source WHERE y IN
+               (SELECT \"config_revision\" FROM \"config_revision_mappings\")",
+        ),
+        (
+            "bracket_identifier",
+            "CREATE VIEW unrelated_helper AS
+             SELECT * FROM unrelated_source JOIN [config_revision_mappings] ON 1 = 1",
+        ),
+        (
+            "schema_qualified",
+            "CREATE VIEW unrelated_helper AS SELECT * FROM main.config_revision_mappings",
+        ),
+        (
+            "backtick_identifier",
+            "CREATE TABLE unrelated_source (id INTEGER);
+             CREATE TRIGGER unrelated_trigger AFTER INSERT ON unrelated_source BEGIN
+               SELECT COUNT(*) FROM `runtime_authority_state`; END;",
+        ),
+    ];
+    for (name, sql) in stimuli {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("hostile-view.sqlite3");
+        let mut db = bootstrap(&path, revision_for(&path));
+        db.connection_mut().execute_batch(sql).unwrap_or_else(|error| {
+            panic!("{name}: stimulus must be valid SQLite: {error}")
+        });
+        let error = load_current_authority(db.connection()).unwrap_err();
+        assert!(
+            matches!(error, HostAuthorityError::Malformed(_)),
+            "{name}: unexpected error {error:?}"
+        );
+    }
+}
