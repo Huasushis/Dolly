@@ -477,12 +477,12 @@ pub(crate) fn verify_authority_schema(connection: &Connection) -> Result<(), Hos
             "unique (binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest)",
         ],
         &[
-            "permission_policy_definitions|policy_id|policy_id",
-            "permission_policy_definitions|policy_revision|policy_revision",
-            "permission_policy_definitions|policy_definition_digest|definition_digest",
-            "installed_component_origins|origin_component_id|component_id",
-            "installed_component_origins|origin_component_revision|component_revision",
-            "installed_component_origins|origin_component_digest|component_digest",
+            "0:0:installed_component_origins:origin_component_id:component_id:NO ACTION:NO ACTION:NONE",
+            "0:1:installed_component_origins:origin_component_revision:component_revision:NO ACTION:NO ACTION:NONE",
+            "0:2:installed_component_origins:origin_component_digest:component_digest:NO ACTION:NO ACTION:NONE",
+            "1:0:permission_policy_definitions:policy_id:policy_id:NO ACTION:NO ACTION:NONE",
+            "1:1:permission_policy_definitions:policy_revision:policy_revision:NO ACTION:NO ACTION:NONE",
+            "1:2:permission_policy_definitions:policy_definition_digest:definition_digest:NO ACTION:NO ACTION:NONE",
         ],
     )?;
     verify_table_shape(
@@ -503,9 +503,9 @@ pub(crate) fn verify_authority_schema(connection: &Connection) -> Result<(), Hos
             "unique (origin_component_id, origin_component_revision, unit_name, mode, candidate_digest)",
         ],
         &[
-            "installed_component_origins|origin_component_id|component_id",
-            "installed_component_origins|origin_component_revision|component_revision",
-            "installed_component_origins|origin_component_digest|component_digest",
+            "0:0:installed_component_origins:origin_component_id:component_id:NO ACTION:NO ACTION:NONE",
+            "0:1:installed_component_origins:origin_component_revision:component_revision:NO ACTION:NO ACTION:NONE",
+            "0:2:installed_component_origins:origin_component_digest:component_digest:NO ACTION:NO ACTION:NONE",
         ],
     )?;
     verify_table_shape(
@@ -527,13 +527,13 @@ pub(crate) fn verify_authority_schema(connection: &Connection) -> Result<(), Hos
             "unique (config_revision, config_digest)",
         ],
         &[
-            "config_revision_mappings|config_revision|config_revision",
-            "config_revision_mappings|config_digest|config_digest",
-            "linux_service_candidates|service_origin_component_id|origin_component_id",
-            "linux_service_candidates|service_origin_component_revision|origin_component_revision",
-            "linux_service_candidates|service_unit_name|unit_name",
-            "linux_service_candidates|service_mode|mode",
-            "linux_service_candidates|service_candidate_digest|candidate_digest",
+            "0:0:linux_service_candidates:service_origin_component_id:origin_component_id:NO ACTION:NO ACTION:NONE",
+            "0:1:linux_service_candidates:service_origin_component_revision:origin_component_revision:NO ACTION:NO ACTION:NONE",
+            "0:2:linux_service_candidates:service_unit_name:unit_name:NO ACTION:NO ACTION:NONE",
+            "0:3:linux_service_candidates:service_mode:mode:NO ACTION:NO ACTION:NONE",
+            "0:4:linux_service_candidates:service_candidate_digest:candidate_digest:NO ACTION:NO ACTION:NONE",
+            "1:0:config_revision_mappings:config_revision:config_revision:NO ACTION:NO ACTION:NONE",
+            "1:1:config_revision_mappings:config_digest:config_digest:NO ACTION:NO ACTION:NONE",
         ],
     )?;
     verify_table_shape(
@@ -554,16 +554,16 @@ pub(crate) fn verify_authority_schema(connection: &Connection) -> Result<(), Hos
             "deferrable initially deferred",
         ],
         &[
-            "module_activation_premises|config_revision|config_revision",
-            "permission_policy_definitions|policy_id|policy_id",
-            "permission_policy_definitions|policy_revision|policy_revision",
-            "permission_policy_definitions|policy_definition_digest|definition_digest",
-            "permission_policy_backend_bindings|binding_id|binding_id",
-            "permission_policy_backend_bindings|binding_revision|binding_revision",
-            "permission_policy_backend_bindings|binding_digest|binding_digest",
-            "permission_policy_backend_bindings|policy_id|policy_id",
-            "permission_policy_backend_bindings|policy_revision|policy_revision",
-            "permission_policy_backend_bindings|policy_definition_digest|policy_definition_digest",
+            "0:0:permission_policy_backend_bindings:binding_id:binding_id:NO ACTION:NO ACTION:NONE",
+            "0:1:permission_policy_backend_bindings:binding_revision:binding_revision:NO ACTION:NO ACTION:NONE",
+            "0:2:permission_policy_backend_bindings:binding_digest:binding_digest:NO ACTION:NO ACTION:NONE",
+            "0:3:permission_policy_backend_bindings:policy_id:policy_id:NO ACTION:NO ACTION:NONE",
+            "0:4:permission_policy_backend_bindings:policy_revision:policy_revision:NO ACTION:NO ACTION:NONE",
+            "0:5:permission_policy_backend_bindings:policy_definition_digest:policy_definition_digest:NO ACTION:NO ACTION:NONE",
+            "1:0:permission_policy_definitions:policy_id:policy_id:NO ACTION:NO ACTION:NONE",
+            "1:1:permission_policy_definitions:policy_revision:policy_revision:NO ACTION:NO ACTION:NONE",
+            "1:2:permission_policy_definitions:policy_definition_digest:definition_digest:NO ACTION:NO ACTION:NONE",
+            "2:0:module_activation_premises:config_revision:config_revision:NO ACTION:NO ACTION:NONE",
         ],
     )?;
     verify_table_shape(
@@ -585,8 +585,8 @@ pub(crate) fn verify_authority_schema(connection: &Connection) -> Result<(), Hos
             "check (current_config_revision between 1 and 9007199254740991)",
         ],
         &[
-            "config_revision_mappings|current_config_revision|config_revision",
-            "config_revision_mappings|current_config_digest|config_digest",
+            "0:0:config_revision_mappings:current_config_revision:config_revision:NO ACTION:NO ACTION:NONE",
+            "0:1:config_revision_mappings:current_config_digest:config_digest:NO ACTION:NO ACTION:NONE",
         ],
     )?;
     verify_authority_indexes(connection)?;
@@ -596,27 +596,52 @@ pub(crate) fn verify_authority_schema(connection: &Connection) -> Result<(), Hos
             "authority foreign-key check reported violations".into(),
         ));
     }
-    let hostile_objects: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_master
+    reject_hostile_authority_objects(connection, false)?;
+    Ok(())
+}
+
+/// Reject every trigger or view attached to, or whose body references, any
+/// authority table. `sqlite_master.tbl_name` records only the first table of
+/// a view's FROM clause, so a view that reaches an authority table through a
+/// subquery, join, or later FROM item would otherwise slip through; the body
+/// of every trigger and view is therefore token-scanned as well.
+pub(crate) fn reject_hostile_authority_objects(
+    connection: &Connection,
+    legacy: bool,
+) -> Result<(), HostAuthorityError> {
+    const AUTHORITY_TABLES: [&str; 9] = [
+        "host_authority_meta",
+        "config_revision_mappings",
+        "installed_component_origins",
+        "permission_policy_definitions",
+        "permission_policy_backend_bindings",
+        "linux_service_candidates",
+        "module_activation_premises",
+        "module_activation_premise_policy_selections",
+        "runtime_authority_state",
+    ];
+    let mut statement = connection.prepare(&format!(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master
          WHERE type IN ('trigger', 'view')
-           AND tbl_name IN (
-             'host_authority_meta',
-             'config_revision_mappings',
-             'installed_component_origins',
-             'permission_policy_definitions',
-             'permission_policy_backend_bindings',
-             'linux_service_candidates',
-             'module_activation_premises',
-             'module_activation_premise_policy_selections',
-             'runtime_authority_state'
-           )",
-        [],
-        |row| row.get(0),
-    )?;
-    if hostile_objects != 0 {
-        return Err(HostAuthorityError::Malformed(
-            "authority tables have unexpected triggers or views".into(),
-        ));
+           AND (tbl_name IN ({}) OR sql IS NOT NULL)",
+        AUTHORITY_TABLES.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", ")
+    ))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let object_type: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        let tbl_name: String = row.get(2)?;
+        let body: String = row.get(3)?;
+        let attached = AUTHORITY_TABLES.iter().any(|table| *table == tbl_name);
+        let referencing = AUTHORITY_TABLES
+            .iter()
+            .any(|table| sql_has_token_sequence(&sql_tokens(&body), table));
+        if attached || referencing {
+            return Err(HostAuthorityError::Malformed(format!(
+                "{legacy_prefix}authority tables have unexpected {object_type} {name}",
+                legacy_prefix = if legacy { "legacy " } else { "" },
+            )));
+        }
     }
     Ok(())
 }
@@ -941,15 +966,25 @@ fn verify_table_shape(
             )));
         }
     }
+    // Exact normative foreign-key metadata: group id (multi-column grouping),
+    // in-group column order, referenced table and columns, and the update,
+    // delete, and match semantics. PRAGMA foreign_key_list reports one row per
+    // child column with id = FK group, seq = position inside that group.
     let mut foreign_keys = {
         let mut statement = connection.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
         statement
             .query_map([], |row| {
+                let group: i64 = row.get(0)?;
+                let order: i64 = row.get(1)?;
+                let parent: String = row.get(2)?;
+                let from_column: String = row.get(3)?;
+                let to_column: Option<String> = row.get(4)?;
+                let on_update: String = row.get(5)?;
+                let on_delete: String = row.get(6)?;
+                let match_semantics: String = row.get(7)?;
                 Ok(format!(
-                    "{}|{}|{}",
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?
+                    "{group}:{order}:{parent}:{from_column}:{}:{on_update}:{on_delete}:{match_semantics}",
+                    to_column.unwrap_or_default()
                 ))
             })?
             .collect::<Result<Vec<_>, rusqlite::Error>>()?
@@ -2196,6 +2231,9 @@ fn verify_origin_row(
     if digest != origin.component_digest.to_string()
         || bytes != canonical_bytes(origin, "installed component origin")?
     {
+        eprintln!("DBG origin mismatch: stored_digest={digest} expected={:?} stored_len={} canon_len={}",
+            origin.component_digest.to_string(), bytes.len(),
+            canonical_bytes(origin, "installed component origin").map(|b| b.len()).unwrap_or(0));
         return Err(HostAuthorityError::DigestMismatch(
             "installed component origin row".into(),
         ));
@@ -2547,6 +2585,9 @@ fn validate_premise(premise: &ModuleActivationPremises) -> Result<(), HostAuthor
 }
 
 fn validate_definition(definition: &PermissionPolicyDefinition) -> Result<(), HostAuthorityError> {
+    eprintln!("DBG definition: policy_id={} uri={} def_kind={}",
+        definition.policy_id, definition.definition_schema_uri,
+        match &definition.definition { dolly_canonical_json::CanonicalJsonValue::Object(_) => "object", _ => "other" });
     if definition.schema != "dolly.permission-policy-definition/v1"
         || !valid_stable_id(&definition.policy_id)
     {
@@ -2583,6 +2624,8 @@ fn validate_definition(definition: &PermissionPolicyDefinition) -> Result<(), Ho
 }
 
 fn validate_policy_origin(origin: &PolicyDefinitionOrigin) -> Result<(), HostAuthorityError> {
+    eprintln!("DBG policy origin: schema={} kind={} source_id={} rev={}",
+        origin.schema, origin.kind, origin.source_id, origin.source_revision);
     if origin.schema != "dolly.policy-definition-origin/v1"
         || origin.kind != "operator_approved_policy"
         || !valid_qualified_name(&origin.source_id)

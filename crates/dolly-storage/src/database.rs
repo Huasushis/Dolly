@@ -40,7 +40,7 @@ use crate::host_authority::{
     RuntimeAuthorityIdentity, install_host_authority_revision_in_transaction,
     load_current_authority_with_generation, load_legacy_current_authority,
     migrate_legacy_authority_in_transaction, refresh_controller_generation_in_transaction,
-    validate_revision, verify_legacy_authority_schema,
+    reject_hostile_authority_objects, validate_revision, verify_legacy_authority_schema,
 };
 
 /// Highest schema version this binary understands.
@@ -1793,8 +1793,7 @@ fn bridge_typescript_v1_schema_in_transaction(
         table_columns(tx, "config_revision_mappings")?.contains("daemon_installation_id");
     if !mapping_has_identity {
         tx.execute_batch(
-            "PRAGMA legacy_alter_table = ON;
-             CREATE TABLE config_revision_mappings__dolly_v2 (
+            "CREATE TABLE config_revision_mappings__dolly_v2 (
                 config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991),
                 daemon_installation_id TEXT NOT NULL,
                 instance_id TEXT NOT NULL,
@@ -1813,12 +1812,125 @@ fn bridge_typescript_v1_schema_in_transaction(
             rusqlite::params![&daemon_installation_id, &instance_id],
         )
         .map_err(map_sqlite_error)?;
+        // config_revision_mappings is referenced by module_activation_premises
+        // and runtime_authority_state, and PRAGMA foreign_keys cannot be
+        // disabled inside an active transaction. Rebuild every referencing
+        // table in dependency-safe order: replacements are created and
+        // populated first (their FK checks resolve against the still-present
+        // old parents), then old children are dropped child-first, then old
+        // parents, then each replacement takes the canonical name.
         tx.execute_batch(
-            "PRAGMA foreign_keys = OFF;
-             DROP TABLE config_revision_mappings;
-             PRAGMA legacy_alter_table = OFF;
-             ALTER TABLE config_revision_mappings__dolly_v2 RENAME TO config_revision_mappings;
-             PRAGMA foreign_keys = ON;",
+            "CREATE TABLE module_activation_premises__dolly_v2 (
+                config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991),
+                config_digest TEXT NOT NULL,
+                service_origin_component_id TEXT NOT NULL,
+                service_origin_component_revision INTEGER NOT NULL,
+                service_unit_name TEXT NOT NULL,
+                service_mode TEXT NOT NULL,
+                service_candidate_digest TEXT NOT NULL,
+                premises_digest TEXT NOT NULL,
+                record_jcs BLOB NOT NULL,
+                UNIQUE (config_revision, config_digest),
+                FOREIGN KEY (config_revision, config_digest)
+                  REFERENCES config_revision_mappings__dolly_v2(config_revision, config_digest),
+                FOREIGN KEY (
+                  service_origin_component_id, service_origin_component_revision,
+                  service_unit_name, service_mode, service_candidate_digest
+                ) REFERENCES linux_service_candidates(
+                  origin_component_id, origin_component_revision, unit_name, mode, candidate_digest
+                )
+             );",
+        )
+        .map_err(map_sqlite_error)?;
+        tx.execute(
+            "INSERT INTO module_activation_premises__dolly_v2 SELECT * FROM module_activation_premises",
+            [],
+        )
+        .map_err(map_sqlite_error)?;
+        tx.execute_batch(
+            "CREATE TABLE module_activation_premise_policy_selections__dolly_v2 (
+                config_revision INTEGER NOT NULL CHECK (config_revision BETWEEN 1 AND 9007199254740991),
+                policy_id TEXT NOT NULL,
+                policy_revision INTEGER NOT NULL,
+                policy_definition_digest TEXT NOT NULL,
+                binding_id TEXT NOT NULL,
+                binding_revision INTEGER NOT NULL,
+                binding_digest TEXT NOT NULL,
+                PRIMARY KEY (config_revision, policy_id, policy_revision),
+                UNIQUE (config_revision, binding_id, binding_revision, binding_digest),
+                FOREIGN KEY (config_revision)
+                  REFERENCES module_activation_premises__dolly_v2(config_revision)
+                  DEFERRABLE INITIALLY DEFERRED,
+                FOREIGN KEY (policy_id, policy_revision, policy_definition_digest)
+                  REFERENCES permission_policy_definitions(policy_id, policy_revision, definition_digest),
+                FOREIGN KEY (
+                  binding_id, binding_revision, binding_digest,
+                  policy_id, policy_revision, policy_definition_digest
+                ) REFERENCES permission_policy_backend_bindings(
+                  binding_id, binding_revision, binding_digest,
+                  policy_id, policy_revision, policy_definition_digest
+                )
+             );",
+        )
+        .map_err(map_sqlite_error)?;
+        tx.execute(
+            "INSERT INTO module_activation_premise_policy_selections__dolly_v2
+             SELECT * FROM module_activation_premise_policy_selections",
+            [],
+        )
+        .map_err(map_sqlite_error)?;
+        let state_has_controller =
+            table_columns(tx, "runtime_authority_state")?.contains("controller_generation_id");
+        if state_has_controller {
+            tx.execute_batch(
+                "CREATE TABLE runtime_authority_state__dolly_v2 (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
+                    daemon_installation_id TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    controller_generation_id TEXT NOT NULL,
+                    current_config_revision INTEGER NOT NULL CHECK (current_config_revision BETWEEN 1 AND 9007199254740991),
+                    current_config_digest TEXT NOT NULL,
+                    record_jcs BLOB NOT NULL,
+                    FOREIGN KEY (current_config_revision, current_config_digest)
+                      REFERENCES config_revision_mappings__dolly_v2(config_revision, config_digest)
+                 );",
+            )
+            .map_err(map_sqlite_error)?;
+        } else {
+            tx.execute_batch(
+                "CREATE TABLE runtime_authority_state__dolly_v2 (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
+                    daemon_installation_id TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    current_config_revision INTEGER NOT NULL CHECK (current_config_revision BETWEEN 1 AND 9007199254740991),
+                    current_config_digest TEXT NOT NULL,
+                    record_jcs BLOB NOT NULL,
+                    FOREIGN KEY (current_config_revision, current_config_digest)
+                      REFERENCES config_revision_mappings__dolly_v2(config_revision, config_digest)
+                 );",
+            )
+            .map_err(map_sqlite_error)?;
+        }
+        tx.execute(
+            "INSERT INTO runtime_authority_state__dolly_v2 SELECT * FROM runtime_authority_state",
+            [],
+        )
+        .map_err(map_sqlite_error)?;
+        tx.execute_batch(
+            "DROP TABLE module_activation_premise_policy_selections;
+             DROP TABLE module_activation_premises;
+             DROP TABLE runtime_authority_state;
+             DROP TABLE config_revision_mappings;",
+        )
+        .map_err(map_sqlite_error)?;
+        tx.execute_batch(
+            "ALTER TABLE module_activation_premise_policy_selections__dolly_v2
+               RENAME TO module_activation_premise_policy_selections;
+             ALTER TABLE module_activation_premises__dolly_v2 RENAME TO module_activation_premises;
+             ALTER TABLE runtime_authority_state__dolly_v2 RENAME TO runtime_authority_state;
+             ALTER TABLE config_revision_mappings__dolly_v2 RENAME TO config_revision_mappings;",
         )
         .map_err(map_sqlite_error)?;
     } else {
@@ -1959,27 +2071,8 @@ fn validate_legacy_schema(
             return Err(StorageError::MigrationRequired);
         }
     }
-    let hostile_objects: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master
-             WHERE type IN ('trigger', 'view')
-               AND tbl_name IN (
-                   'config_revision_mappings',
-                   'installed_component_origins',
-                   'permission_policy_definitions',
-                   'permission_policy_backend_bindings',
-                   'linux_service_candidates',
-                   'module_activation_premises',
-                   'module_activation_premise_policy_selections',
-                   'runtime_authority_state'
-               )",
-            [],
-            |row| row.get(0),
-        )
+    reject_hostile_authority_objects(connection, true)
         .map_err(|_| StorageError::MigrationRequired)?;
-    if hostile_objects != 0 {
-        return Err(StorageError::MigrationRequired);
-    }
     if !ts_v1_bridge {
         validate_legacy_mapping_identity_shape(connection)?;
         verify_legacy_authority_schema(connection).map_err(map_host_authority_error)?;

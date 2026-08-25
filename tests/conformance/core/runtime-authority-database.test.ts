@@ -500,14 +500,110 @@ describe("TST-AUTH-007: physical Host v2 bridge and canonical-byte gates", () =>
   it("requires an explicit v1-to-v2 migration for the pre-bridge TypeScript projection", () => {
     const dir = scratch();
     const path = join(dir, "legacy.sqlite3");
-    const fixture = candidate(1, "legacy", false);
+    // Two history revisions with real premise/selection/definition/binding
+    // rows so the migration must preserve every dependent row.
+    const originRecord = (revision: number): Record<string, unknown> => {
+      const record = {
+        schema: "dolly.installed-component-origin/v1",
+        kind: "installed_product_component",
+        component_id: `org.dolly.module-${revision}`,
+        component_revision: 1,
+        component_digest: "",
+      };
+      const without = { ...record } as Record<string, unknown>;
+      delete without.component_digest;
+      return { ...record, component_digest: selfDigest(without as never, "component_digest") };
+    };
+    const candidateRecord = (revision: number): Record<string, unknown> => {
+      const record = {
+        schema: "dolly.linux-service-candidate/v1",
+        origin: originRecord(revision),
+        unit_name: `dolly-module-${revision}.service`,
+        mode: "user",
+        candidate_digest: "",
+      };
+      const without = { ...record } as Record<string, unknown>;
+      delete without.candidate_digest;
+      return { ...record, candidate_digest: selfDigest(without as never, "candidate_digest") };
+    };
+    const policyOrigin = {
+      schema: "dolly.policy-definition-origin/v1",
+      kind: "operator_approved_policy",
+      source_id: "org.dolly.policy.default",
+      source_revision: 1,
+      source_digest: `sha256:${"0".repeat(64)}`,
+    };
+    const definitionRecord = (revision: number): Record<string, unknown> => {
+      const record = {
+        schema: "dolly.permission-policy-definition/v1",
+        policy_id: `policy-${revision}`,
+        policy_revision: 1,
+        definition_schema_uri: "dolly://schemas/host-permission-policy/v1",
+        definition_schema_digest: `sha256:${"f".repeat(64)}`,
+        definition: { tools: { invoke: true } },
+        origin: policyOrigin,
+        definition_digest: "",
+      };
+      const without = { ...record } as Record<string, unknown>;
+      delete without.definition_digest;
+      return { ...record, definition_digest: selfDigest(without as never, "definition_digest") };
+    };
+    const bindingRecord = (revision: number, definitionDigest: string): Record<string, unknown> => {
+      const record = {
+        schema: "dolly.permission-policy-backend-binding/v1",
+        binding_id: `binding-${revision}`,
+        binding_revision: 1,
+        binding_digest: "",
+        policy_id: `policy-${revision}`,
+        policy_revision: 1,
+        policy_definition_digest: definitionDigest,
+        origin: originRecord(revision),
+      };
+      const without = { ...record } as Record<string, unknown>;
+      delete without.binding_digest;
+      return { ...record, binding_digest: selfDigest(without as never, "binding_digest") };
+    };
+    const revisionFixture = (revision: number) => {
+      const definition = definitionRecord(revision);
+      const binding = bindingRecord(revision, String(definition.definition_digest));
+      const selection = [{
+        policy_id: `policy-${revision}`,
+        policy_revision: 1,
+        policy_definition_digest: binding.policy_definition_digest,
+        binding_id: binding.binding_id,
+        binding_revision: 1,
+        binding_digest: binding.binding_digest,
+      }];
+      const configBytes = Buffer.from(canonicalBytes({
+        runtime_config: { modules: [{ name: `module-${revision}` }] },
+        permission_policy_selections: selection,
+        service_candidate: candidateRecord(revision),
+      }));
+      const configDigest = digestOfBytes(configBytes);
+      let premise = {
+        schema: "dolly.module-activation-premises/v1",
+        daemon_installation_id: identity.daemonInstallationId,
+        instance_id: identity.instanceId,
+        config_revision: revision,
+        config_digest: configDigest,
+        permission_policy_definitions: [definition],
+        permission_policy_backend_bindings: [binding],
+        service_candidate: candidateRecord(revision),
+        premises_digest: "",
+      } as unknown as Record<string, unknown>;
+      premise = { ...premise, premises_digest: selfDigest(premise as never, "premises_digest") };
+      return { revision, configBytes, configDigest, premise, selection };
+    };
+    const configBytesOf = (entry: { configBytes: Buffer }): Buffer => entry.configBytes;
+    const revisions = [revisionFixture(1), revisionFixture(2)];
+    const latest = revisions[revisions.length - 1];
     const legacyState = canonicalBytes({
       schema: "dolly.runtime-authority-state/v1",
       authority_schema_version: 1,
       daemon_installation_id: identity.daemonInstallationId,
       instance_id: identity.instanceId,
-      current_config_revision: 1,
-      current_config_digest: fixture.digest,
+      current_config_revision: latest.revision,
+      current_config_digest: latest.configDigest,
     });
     const legacy = raw(path);
     legacy.exec(`
@@ -615,11 +711,73 @@ describe("TST-AUTH-007: physical Host v2 bridge and canonical-byte gates", () =>
       PRAGMA user_version = 1;
     `);
     legacy.prepare("INSERT INTO core_meta VALUES (1, 1, ?, ?)").run(identity.daemonInstallationId, identity.instanceId);
-    legacy.prepare("INSERT INTO config_revision_mappings VALUES (1, ?, ?)").run(fixture.digest, Buffer.from(fixture.bytes));
-    legacy.prepare("INSERT INTO runtime_authority_state VALUES (1, 1, ?, ?, 1, ?, ?)").run(
+    for (const entry of revisions) {
+      const origin = originRecord(entry.revision);
+      legacy.prepare(
+        "INSERT INTO installed_component_origins VALUES (?, 1, ?, ?)",
+      ).run(origin.component_id, origin.component_digest, Buffer.from(canonicalBytes(origin)));
+      const candidate = candidateRecord(entry.revision);
+      legacy.prepare(
+        "INSERT INTO linux_service_candidates VALUES (?, 1, ?, ?, 'user', ?, ?)",
+      ).run(
+        origin.component_id,
+        origin.component_digest,
+        candidate.unit_name,
+        candidate.candidate_digest,
+        Buffer.from(canonicalBytes(candidate)),
+      );
+      const definition = definitionRecord(entry.revision);
+      legacy.prepare(
+        "INSERT INTO permission_policy_definitions VALUES (?, 1, ?, ?)",
+      ).run(
+        definition.policy_id,
+        definition.definition_digest,
+        Buffer.from(canonicalBytes(definition)),
+      );
+      const binding = bindingRecord(entry.revision, String(definition.definition_digest));
+      legacy.prepare(
+        "INSERT INTO permission_policy_backend_bindings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        binding.binding_id,
+        1,
+        binding.binding_digest,
+        binding.policy_id,
+        1,
+        binding.policy_definition_digest,
+        origin.component_id,
+        origin.component_revision,
+        origin.component_digest,
+        Buffer.from(canonicalBytes(binding)),
+      );
+      legacy.prepare(
+        "INSERT INTO config_revision_mappings VALUES (?, ?, ?)",
+      ).run(entry.revision, entry.configDigest, configBytesOf(entry));
+      legacy.prepare(
+        "INSERT INTO module_activation_premises VALUES (?, ?, ?, 1, ?, 'user', ?, ?, ?)",
+      ).run(
+        entry.revision,
+        entry.configDigest,
+        origin.component_id,
+        candidate.unit_name,
+        candidate.candidate_digest,
+        entry.premise.premises_digest,
+        Buffer.from(canonicalBytes(entry.premise)),
+      );
+      legacy.prepare(
+        "INSERT INTO module_activation_premise_policy_selections VALUES (?, ?, 1, ?, ?, 1, ?)",
+      ).run(
+        entry.revision,
+        entry.selection[0].policy_id,
+        entry.selection[0].policy_definition_digest,
+        entry.selection[0].binding_id,
+        entry.selection[0].binding_digest,
+      );
+    }
+    legacy.prepare("INSERT INTO runtime_authority_state VALUES (1, 1, ?, ?, ?, ?, ?)").run(
       identity.daemonInstallationId,
       identity.instanceId,
-      fixture.digest,
+      latest.revision,
+      latest.configDigest,
       Buffer.from(legacyState),
     );
     legacy.close();
@@ -649,7 +807,7 @@ describe("TST-AUTH-007: physical Host v2 bridge and canonical-byte gates", () =>
     migrated.close();
     // Ordinary open now succeeds after the explicit migration.
     const reopened = RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() });
-    expect(reopened.readCurrentConfig()!.config_revision).toBe(1);
+    expect(reopened.readCurrentConfig()!.config_revision).toBe(2);
     reopened.close();
   });
   it("rejects oversized and short service admissions before mapping writes", () => {

@@ -722,6 +722,18 @@ CREATE TABLE core_journal (
 );
 `;
 
+const AUTHORITY_TABLE_NAMES: readonly string[] = Object.freeze([
+  "host_authority_meta",
+  "config_revision_mappings",
+  "installed_component_origins",
+  "permission_policy_definitions",
+  "permission_policy_backend_bindings",
+  "linux_service_candidates",
+  "module_activation_premises",
+  "module_activation_premise_policy_selections",
+  "runtime_authority_state",
+]);
+
 interface AuthoritySchemaColumn {
   readonly name: string;
   readonly type: string;
@@ -872,42 +884,42 @@ const AUTHORITY_SCHEMA_CHECKS: Readonly<Record<string, readonly string[]>> = Obj
 
 const AUTHORITY_SCHEMA_FOREIGN_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   permission_policy_backend_bindings: [
-    "permission_policy_definitions|policy_id|policy_id",
-    "permission_policy_definitions|policy_revision|policy_revision",
-    "permission_policy_definitions|policy_definition_digest|definition_digest",
-    "installed_component_origins|origin_component_id|component_id",
-    "installed_component_origins|origin_component_revision|component_revision",
-    "installed_component_origins|origin_component_digest|component_digest",
+    "0:0:installed_component_origins:origin_component_id:component_id:NO ACTION:NO ACTION:NONE",
+    "0:1:installed_component_origins:origin_component_revision:component_revision:NO ACTION:NO ACTION:NONE",
+    "0:2:installed_component_origins:origin_component_digest:component_digest:NO ACTION:NO ACTION:NONE",
+    "1:0:permission_policy_definitions:policy_id:policy_id:NO ACTION:NO ACTION:NONE",
+    "1:1:permission_policy_definitions:policy_revision:policy_revision:NO ACTION:NO ACTION:NONE",
+    "1:2:permission_policy_definitions:policy_definition_digest:definition_digest:NO ACTION:NO ACTION:NONE",
   ],
   linux_service_candidates: [
-    "installed_component_origins|origin_component_id|component_id",
-    "installed_component_origins|origin_component_revision|component_revision",
-    "installed_component_origins|origin_component_digest|component_digest",
+    "0:0:installed_component_origins:origin_component_id:component_id:NO ACTION:NO ACTION:NONE",
+    "0:1:installed_component_origins:origin_component_revision:component_revision:NO ACTION:NO ACTION:NONE",
+    "0:2:installed_component_origins:origin_component_digest:component_digest:NO ACTION:NO ACTION:NONE",
   ],
   module_activation_premises: [
-    "config_revision_mappings|config_revision|config_revision",
-    "config_revision_mappings|config_digest|config_digest",
-    "linux_service_candidates|service_origin_component_id|origin_component_id",
-    "linux_service_candidates|service_origin_component_revision|origin_component_revision",
-    "linux_service_candidates|service_unit_name|unit_name",
-    "linux_service_candidates|service_mode|mode",
-    "linux_service_candidates|service_candidate_digest|candidate_digest",
+    "0:0:linux_service_candidates:service_origin_component_id:origin_component_id:NO ACTION:NO ACTION:NONE",
+    "0:1:linux_service_candidates:service_origin_component_revision:origin_component_revision:NO ACTION:NO ACTION:NONE",
+    "0:2:linux_service_candidates:service_unit_name:unit_name:NO ACTION:NO ACTION:NONE",
+    "0:3:linux_service_candidates:service_mode:mode:NO ACTION:NO ACTION:NONE",
+    "0:4:linux_service_candidates:service_candidate_digest:candidate_digest:NO ACTION:NO ACTION:NONE",
+    "1:0:config_revision_mappings:config_revision:config_revision:NO ACTION:NO ACTION:NONE",
+    "1:1:config_revision_mappings:config_digest:config_digest:NO ACTION:NO ACTION:NONE",
   ],
   module_activation_premise_policy_selections: [
-    "module_activation_premises|config_revision|config_revision",
-    "permission_policy_definitions|policy_id|policy_id",
-    "permission_policy_definitions|policy_revision|policy_revision",
-    "permission_policy_definitions|policy_definition_digest|definition_digest",
-    "permission_policy_backend_bindings|binding_id|binding_id",
-    "permission_policy_backend_bindings|binding_revision|binding_revision",
-    "permission_policy_backend_bindings|binding_digest|binding_digest",
-    "permission_policy_backend_bindings|policy_id|policy_id",
-    "permission_policy_backend_bindings|policy_revision|policy_revision",
-    "permission_policy_backend_bindings|policy_definition_digest|policy_definition_digest",
+    "0:0:permission_policy_backend_bindings:binding_id:binding_id:NO ACTION:NO ACTION:NONE",
+    "0:1:permission_policy_backend_bindings:binding_revision:binding_revision:NO ACTION:NO ACTION:NONE",
+    "0:2:permission_policy_backend_bindings:binding_digest:binding_digest:NO ACTION:NO ACTION:NONE",
+    "0:3:permission_policy_backend_bindings:policy_id:policy_id:NO ACTION:NO ACTION:NONE",
+    "0:4:permission_policy_backend_bindings:policy_revision:policy_revision:NO ACTION:NO ACTION:NONE",
+    "0:5:permission_policy_backend_bindings:policy_definition_digest:policy_definition_digest:NO ACTION:NO ACTION:NONE",
+    "1:0:permission_policy_definitions:policy_id:policy_id:NO ACTION:NO ACTION:NONE",
+    "1:1:permission_policy_definitions:policy_revision:policy_revision:NO ACTION:NO ACTION:NONE",
+    "1:2:permission_policy_definitions:policy_definition_digest:definition_digest:NO ACTION:NO ACTION:NONE",
+    "2:0:module_activation_premises:config_revision:config_revision:NO ACTION:NO ACTION:NONE",
   ],
   runtime_authority_state: [
-    "config_revision_mappings|current_config_revision|config_revision",
-    "config_revision_mappings|current_config_digest|config_digest",
+    "0:0:config_revision_mappings:current_config_revision:config_revision:NO ACTION:NO ACTION:NONE",
+    "0:1:config_revision_mappings:current_config_digest:config_digest:NO ACTION:NO ACTION:NONE",
   ],
 });
 
@@ -1083,15 +1095,25 @@ function verifyAuthorityPhysicalSchema(connection: RuntimeSqliteConnection): voi
     for (const fragment of AUTHORITY_SCHEMA_CHECKS[table] ?? []) {
       if (!sqlHasTokenSequence(sql, fragment)) throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} is missing constraint ${fragment}`);
     }
+    // Exact normative FK metadata: group id, in-group order, parent table,
+    // columns, and update/delete/match semantics.
     const foreignKeys = connection.prepare(`PRAGMA foreign_key_list(${table})`).all().map(
-      (foreignKey) => `${foreignKey.table}|${foreignKey.from}|${foreignKey.to}`,
+      (foreignKey) => `${foreignKey.id}:${foreignKey.seq}:${foreignKey.table}:${foreignKey.from}:${foreignKey.to ?? ""}:${foreignKey.on_update}:${foreignKey.on_delete}:${foreignKey.match}`,
     ).sort();
     const expectedForeignKeys = [...(AUTHORITY_SCHEMA_FOREIGN_KEYS[table] ?? [])].sort();
     if (foreignKeys.length !== expectedForeignKeys.length || foreignKeys.some((value, index) => value !== expectedForeignKeys[index])) {
       throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} has a non-canonical foreign-key shape`);
     }
   }
-  const hostileObjects = rows.filter((row) => row.type === "trigger" || row.type === "view");
+  const hostileObjects = rows.filter((row) => {
+    if (row.type !== "trigger" && row.type !== "view") return false;
+    // sqlite_master.tbl_name records only the first FROM item, so a view or
+    // trigger that reaches an authority table through a subquery, join, or
+    // later FROM item would slip through a tbl_name-only filter; scan its body.
+    if (AUTHORITY_SCHEMA_COLUMNS[row.tbl_name as string] !== undefined) return true;
+    const bodyTokens = sqlTokens(row.sql);
+    return AUTHORITY_TABLE_NAMES.some((table) => sqlHasTokenSequence(bodyTokens, table));
+  });
   if (hostileObjects.length > 0) {
     throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", "authority tables have unexpected triggers or views");
   }
@@ -1719,32 +1741,63 @@ export class RuntimeAuthorityDatabase {
         throw this.#corrupt("legacy core_meta diagnostic projection is invalid");
       }
       this.#connection.prepare(
-        "CREATE TABLE core_meta_v2 (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), schema_version INTEGER NOT NULL, daemon_installation_id TEXT, instance_id TEXT, controller_generation_id TEXT, clean_shutdown INTEGER NOT NULL CHECK (clean_shutdown IN (0, 1)), sqlite_version_number INTEGER NOT NULL, sqlite_source_id TEXT NOT NULL, sqlite_artifact_digest TEXT NOT NULL)",
-      ).run();
-      this.#connection.prepare(
-        "INSERT INTO core_meta_v2 (singleton, schema_version, daemon_installation_id, instance_id, controller_generation_id, clean_shutdown, sqlite_version_number, sqlite_source_id, sqlite_artifact_digest) VALUES (1, 1, ?, ?, ?, ?, ?, ?, ?)",
-      ).run(
-        coreDaemon,
-        coreInstance,
-        this.#controllerGenerationId,
-        cleanShutdown,
-        legacySqliteVersion,
-        legacySourceId,
-        legacyArtifactDigest,
-      );
-      this.#connection.prepare("DROP TABLE core_meta").run();
-      this.#connection.prepare("ALTER TABLE core_meta_v2 RENAME TO core_meta").run();
+          "CREATE TABLE core_meta_v2 (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), schema_version INTEGER NOT NULL, daemon_installation_id TEXT, instance_id TEXT, controller_generation_id TEXT, clean_shutdown INTEGER NOT NULL CHECK (clean_shutdown IN (0, 1)), sqlite_version_number INTEGER NOT NULL, sqlite_source_id TEXT NOT NULL, sqlite_artifact_digest TEXT NOT NULL)",
+        ).run();
+        this.#connection.prepare(
+          "INSERT INTO core_meta_v2 (singleton, schema_version, daemon_installation_id, instance_id, controller_generation_id, clean_shutdown, sqlite_version_number, sqlite_source_id, sqlite_artifact_digest) SELECT 1, 1, ?, ?, ?, ?, ?, ?, ? FROM core_meta WHERE singleton = 1",
+        ).run(
+          coreRow!.daemon_installation_id,
+          coreRow!.instance_id,
+          this.#controllerGenerationId,
+          cleanShutdown,
+          legacySqliteVersion,
+          legacySourceId,
+          legacyArtifactDigest,
+        );
+        this.#connection.prepare("DROP TABLE core_meta").run();
+        this.#connection.prepare("ALTER TABLE core_meta_v2 RENAME TO core_meta").run();
       if (mappingLacksIdentity) {
+        // config_revision_mappings is referenced by module_activation_premises
+        // and runtime_authority_state, and PRAGMA foreign_keys cannot be
+        // disabled inside an active transaction. Rebuild the mapping and every
+        // referencing table in dependency-safe order: replacements are created
+        // and populated first (their FK checks resolve against the still-
+        // present old parents), then old children are dropped child-first,
+        // then old parents, then each replacement takes the canonical name.
         this.#connection.prepare(
           "CREATE TABLE config_revision_mappings_v2 (config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991), daemon_installation_id TEXT NOT NULL, instance_id TEXT NOT NULL, config_digest TEXT NOT NULL, canonical_bytes BLOB NOT NULL, UNIQUE (config_revision, config_digest))",
         ).run();
         this.#connection.prepare(
           "INSERT INTO config_revision_mappings_v2 (config_revision, daemon_installation_id, instance_id, config_digest, canonical_bytes) SELECT config_revision, ?, ?, config_digest, canonical_bytes FROM config_revision_mappings",
         ).run(this.#identity.daemonInstallationId, this.#identity.instanceId);
-        this.#connection.prepare("PRAGMA foreign_keys = OFF").run();
+        this.#connection.prepare(
+          "CREATE TABLE module_activation_premises_v2 (config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991), config_digest TEXT NOT NULL, service_origin_component_id TEXT NOT NULL, service_origin_component_revision INTEGER NOT NULL, service_unit_name TEXT NOT NULL, service_mode TEXT NOT NULL, service_candidate_digest TEXT NOT NULL, premises_digest TEXT NOT NULL, record_jcs BLOB NOT NULL, UNIQUE (config_revision, config_digest), FOREIGN KEY (config_revision, config_digest) REFERENCES config_revision_mappings_v2(config_revision, config_digest), FOREIGN KEY (service_origin_component_id, service_origin_component_revision, service_unit_name, service_mode, service_candidate_digest) REFERENCES linux_service_candidates(origin_component_id, origin_component_revision, unit_name, mode, candidate_digest))",
+        ).run();
+        this.#connection.prepare("INSERT INTO module_activation_premises_v2 SELECT * FROM module_activation_premises").run();
+        this.#connection.prepare(
+          "CREATE TABLE module_activation_premise_policy_selections_v2 (config_revision INTEGER NOT NULL CHECK (config_revision BETWEEN 1 AND 9007199254740991), policy_id TEXT NOT NULL, policy_revision INTEGER NOT NULL, policy_definition_digest TEXT NOT NULL, binding_id TEXT NOT NULL, binding_revision INTEGER NOT NULL, binding_digest TEXT NOT NULL, PRIMARY KEY (config_revision, policy_id, policy_revision), UNIQUE (config_revision, binding_id, binding_revision, binding_digest), FOREIGN KEY (config_revision) REFERENCES module_activation_premises_v2(config_revision) DEFERRABLE INITIALLY DEFERRED, FOREIGN KEY (policy_id, policy_revision, policy_definition_digest) REFERENCES permission_policy_definitions(policy_id, policy_revision, definition_digest), FOREIGN KEY (binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest) REFERENCES permission_policy_backend_bindings(binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest))",
+        ).run();
+        this.#connection.prepare("INSERT INTO module_activation_premise_policy_selections_v2 SELECT * FROM module_activation_premise_policy_selections").run();
+        const stateColumns = this.#connection.prepare("PRAGMA table_info(runtime_authority_state)").all() as Array<{ name: string }>;
+        const stateHasGeneration = stateColumns.some((column) => column.name === "controller_generation_id");
+        if (stateHasGeneration) {
+          this.#connection.prepare(
+            "CREATE TABLE runtime_authority_state_v2 (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1), daemon_installation_id TEXT NOT NULL, instance_id TEXT NOT NULL, controller_generation_id TEXT NOT NULL, current_config_revision INTEGER NOT NULL CHECK (current_config_revision BETWEEN 1 AND 9007199254740991), current_config_digest TEXT NOT NULL, record_jcs BLOB NOT NULL, FOREIGN KEY (current_config_revision, current_config_digest) REFERENCES config_revision_mappings_v2(config_revision, config_digest))",
+          ).run();
+        } else {
+          this.#connection.prepare(
+            "CREATE TABLE runtime_authority_state_v2 (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1), daemon_installation_id TEXT NOT NULL, instance_id TEXT NOT NULL, current_config_revision INTEGER NOT NULL CHECK (current_config_revision BETWEEN 1 AND 9007199254740991), current_config_digest TEXT NOT NULL, record_jcs BLOB NOT NULL, FOREIGN KEY (current_config_revision, current_config_digest) REFERENCES config_revision_mappings_v2(config_revision, config_digest))",
+          ).run();
+        }
+        this.#connection.prepare("INSERT INTO runtime_authority_state_v2 SELECT * FROM runtime_authority_state").run();
+        this.#connection.prepare("DROP TABLE module_activation_premise_policy_selections").run();
+        this.#connection.prepare("DROP TABLE module_activation_premises").run();
+        this.#connection.prepare("DROP TABLE runtime_authority_state").run();
         this.#connection.prepare("DROP TABLE config_revision_mappings").run();
+        this.#connection.prepare("ALTER TABLE module_activation_premise_policy_selections_v2 RENAME TO module_activation_premise_policy_selections").run();
+        this.#connection.prepare("ALTER TABLE module_activation_premises_v2 RENAME TO module_activation_premises").run();
+        this.#connection.prepare("ALTER TABLE runtime_authority_state_v2 RENAME TO runtime_authority_state").run();
         this.#connection.prepare("ALTER TABLE config_revision_mappings_v2 RENAME TO config_revision_mappings").run();
-        this.#connection.prepare("PRAGMA foreign_keys = ON").run();
       }
       if (hostVersion === 1) {
         this.#connection.prepare("DROP TABLE host_authority_meta").run();
