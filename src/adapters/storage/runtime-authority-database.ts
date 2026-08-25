@@ -1120,9 +1120,15 @@ function verifyLegacyAuthorityPhysicalSchema(
       throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", `legacy authority object ${table} is not a table`);
     }
     const expected = AUTHORITY_SCHEMA_COLUMNS[table]!;
-    const legacyExpected = table === "runtime_authority_state"
+    let legacyExpected = table === "runtime_authority_state"
       ? expected.filter((column) => column.name !== "controller_generation_id")
       : expected;
+    if (table === "config_revision_mappings") {
+      const mappingColumnSet = new Set(connection.prepare(`PRAGMA table_info(${table})`).all().map((column) => String(column.name)));
+      if (!mappingColumnSet.has("daemon_installation_id") || !mappingColumnSet.has("instance_id")) {
+        legacyExpected = legacyExpected.filter((column) => column.name !== "daemon_installation_id" && column.name !== "instance_id");
+      }
+    }
     const columns = connection.prepare(`PRAGMA table_info(${table})`).all();
     if (
       columns.length !== legacyExpected.length ||
@@ -1133,7 +1139,7 @@ function verifyLegacyAuthorityPhysicalSchema(
     const sql = sqlTokens(row.sql);
     if (
       !sqlHasTokenSequence(sql, "primary key") ||
-      (table !== "host_authority_meta" && !sqlHasTokenSequence(sql, "unique"))
+      (table !== "host_authority_meta" && table !== "runtime_authority_state" && !sqlHasTokenSequence(sql, "unique"))
     ) {
       throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", `legacy authority table ${table} is missing a required constraint`);
     }
@@ -1605,20 +1611,17 @@ export class RuntimeAuthorityDatabase {
     }
     const mappingColumns = this.#connection.prepare("PRAGMA table_info(config_revision_mappings)").all();
     const mappingColumnNames = new Set(mappingColumns.map((entry) => String(entry.name)));
-    if (!mappingColumnNames.has("daemon_installation_id") || !mappingColumnNames.has("instance_id")) {
-      throw new RuntimeAuthorityDatabaseError(
-        "STORAGE_MIGRATION_REQUIRED",
-        "Legacy mapping identity columns are absent; rebuild the mapping table before migration",
+    const mappingLacksIdentity = !mappingColumnNames.has("daemon_installation_id") || !mappingColumnNames.has("instance_id");
+    if (!mappingLacksIdentity) {
+      const mappingIdentityColumns = mappingColumns.filter(
+        (entry) => entry.name === "daemon_installation_id" || entry.name === "instance_id",
       );
-    }
-    const mappingIdentityColumns = mappingColumns.filter(
-      (entry) => entry.name === "daemon_installation_id" || entry.name === "instance_id",
-    );
-    if (mappingIdentityColumns.some((entry) => Number(entry.notnull) !== 1)) {
-      throw new RuntimeAuthorityDatabaseError(
-        "STORAGE_MIGRATION_REQUIRED",
-        "Legacy mapping identity columns are nullable and cannot be altered into v2",
-      );
+      if (mappingIdentityColumns.some((entry) => Number(entry.notnull) !== 1)) {
+        throw new RuntimeAuthorityDatabaseError(
+          "STORAGE_MIGRATION_REQUIRED",
+          "Legacy mapping identity columns are nullable and cannot be altered into v2",
+        );
+      }
     }
     const parallelConfigRevisions = this.#connection.prepare(
       "SELECT 1 AS present FROM sqlite_master WHERE name = 'config_revisions'",
@@ -1731,6 +1734,18 @@ export class RuntimeAuthorityDatabase {
       );
       this.#connection.prepare("DROP TABLE core_meta").run();
       this.#connection.prepare("ALTER TABLE core_meta_v2 RENAME TO core_meta").run();
+      if (mappingLacksIdentity) {
+        this.#connection.prepare(
+          "CREATE TABLE config_revision_mappings_v2 (config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991), daemon_installation_id TEXT NOT NULL, instance_id TEXT NOT NULL, config_digest TEXT NOT NULL, canonical_bytes BLOB NOT NULL, UNIQUE (config_revision, config_digest))",
+        ).run();
+        this.#connection.prepare(
+          "INSERT INTO config_revision_mappings_v2 (config_revision, daemon_installation_id, instance_id, config_digest, canonical_bytes) SELECT config_revision, ?, ?, config_digest, canonical_bytes FROM config_revision_mappings",
+        ).run(this.#identity.daemonInstallationId, this.#identity.instanceId);
+        this.#connection.prepare("PRAGMA foreign_keys = OFF").run();
+        this.#connection.prepare("DROP TABLE config_revision_mappings").run();
+        this.#connection.prepare("ALTER TABLE config_revision_mappings_v2 RENAME TO config_revision_mappings").run();
+        this.#connection.prepare("PRAGMA foreign_keys = ON").run();
+      }
       if (hostVersion === 1) {
         this.#connection.prepare("DROP TABLE host_authority_meta").run();
       }
@@ -1749,6 +1764,14 @@ export class RuntimeAuthorityDatabase {
         ).run();
         this.#connection.prepare(
           "INSERT INTO commit_sequence (singleton, next_value) SELECT 1, COALESCE(MAX(config_revision), 0) + 1 FROM config_revision_mappings",
+        ).run();
+      }
+      const coreJournal = this.#connection.prepare(
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'core_journal'",
+      ).get();
+      if (!coreJournal) {
+        this.#connection.prepare(
+          "CREATE TABLE core_journal (journal_seq INTEGER PRIMARY KEY AUTOINCREMENT, event_kind TEXT NOT NULL, event_jcs BLOB NOT NULL, config_revision INTEGER, config_digest TEXT, premises_digest TEXT)",
         ).run();
       }
       const recordBytes = Buffer.from(canonicalBytes(
@@ -1906,16 +1929,18 @@ export class RuntimeAuthorityDatabase {
     ).all();
     const expectedSelectionsByRevision: Record<string, readonly PermissionPolicySelection[]> = Object.create(null);
     const mappingDigestByRevision: Record<string, string> = Object.create(null);
+    const mappingHasIdentity = mappingRows.length === 0
+      ? true
+      : this.#connection.prepare("PRAGMA table_info(config_revision_mappings)").all().some((column) => column.name === "daemon_installation_id");
     for (const row of mappingRows) {
       const revision = Number(row.config_revision);
       const digest = String(row.config_digest);
-      const mapping = this.#resolveMapping(revision, digest);
+      const mapping = mappingHasIdentity ? this.#resolveMapping(revision, digest) : this.#resolveLegacyMapping(revision, digest);
       if (mapping === null) throw this.#corrupt(`mapping revision ${revision} disappeared during verification`);
       const config = asResolvedConfiguration(parseCanonicalJsonBytes(mapping.bytes));
       expectedSelectionsByRevision[String(revision)] = config.permission_policy_selections;
       mappingDigestByRevision[String(revision)] = digest;
     }
-
     const originRows = this.#connection.prepare(
       "SELECT component_id, component_revision, component_digest, record_jcs FROM installed_component_origins",
     ).all();

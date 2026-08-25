@@ -1894,40 +1894,56 @@ fn verify_all_persisted_rows(
     connection: &Connection,
     authority_identity: &RuntimeAuthorityIdentity,
 ) -> Result<(), HostAuthorityError> {
-    let mapping_rows: Vec<(String, String, i64, String, Vec<u8>)> = connection
-        .prepare(
-            "SELECT daemon_installation_id, instance_id, config_revision,
-                    config_digest, canonical_bytes
-             FROM config_revision_mappings ORDER BY config_revision",
-        )?
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    let mapping_identity_present =
+        table_has_column(connection, "config_revision_mappings", "daemon_installation_id")?
+            && table_has_column(connection, "config_revision_mappings", "instance_id")?;
+    let mapping_rows: Vec<(Option<String>, Option<String>, i64, String, Vec<u8>)> = if mapping_identity_present {
+        connection
+            .prepare(
+                "SELECT daemon_installation_id, instance_id, config_revision,
+                        config_digest, canonical_bytes
+                 FROM config_revision_mappings ORDER BY config_revision",
+            )?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            })?
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?
+    } else {
+        connection
+            .prepare(
+                "SELECT NULL, NULL, config_revision,
+                        config_digest, canonical_bytes
+                 FROM config_revision_mappings ORDER BY config_revision",
+            )?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            })?
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?
+    };
     let mut expected_selections_by_revision: BTreeMap<i64, Vec<PermissionPolicySelection>> =
         BTreeMap::new();
     for (daemon_id, instance_id, revision, digest_text, bytes) in mapping_rows {
-        if daemon_id != authority_identity.daemon_installation_id
-            || instance_id != authority_identity.instance_id
-        {
-            return Err(HostAuthorityError::RevisionConflict {
-                config_revision: revision,
-                reason: "historical mapping identity differs from authority identity".into(),
-            });
+        if let (Some(daemon_id), Some(instance_id)) = (&daemon_id, &instance_id) {
+            if *daemon_id != authority_identity.daemon_installation_id
+                || *instance_id != authority_identity.instance_id
+            {
+                return Err(HostAuthorityError::RevisionConflict {
+                    config_revision: revision,
+                    reason: "historical mapping identity differs from authority identity".into(),
+                });
+            }
         }
         let digest = digest_text
             .parse::<Sha256Digest>()
             .map_err(|_| HostAuthorityError::Malformed("historical mapping digest".into()))?;
         let mapping = ConfigRevisionMapping {
             schema: "dolly.config-revision-mapping/v1".into(),
-            daemon_installation_id: daemon_id,
-            instance_id,
+            daemon_installation_id: daemon_id
+                .clone()
+                .unwrap_or_else(|| authority_identity.daemon_installation_id.clone()),
+            instance_id: instance_id
+                .clone()
+                .unwrap_or_else(|| authority_identity.instance_id.clone()),
             config_revision: revision,
             config_digest: digest,
             canonical_config: decode_record(&bytes, "historical resolved config")?,

@@ -1785,37 +1785,54 @@ fn bridge_typescript_v1_schema_in_transaction(
     )
     .map_err(map_sqlite_error)?;
 
-    let mapping_columns = table_columns(tx, "config_revision_mappings")?;
-    let mut mapping_identity_not_null = std::collections::BTreeMap::new();
-    let mut mapping_info = tx
-        .prepare("PRAGMA table_info(config_revision_mappings)")
-        .map_err(map_sqlite_error)?;
-    let mapping_rows = mapping_info
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
-        })
-        .map_err(map_sqlite_error)?;
-    for row in mapping_rows {
-        let (name, not_null) = row.map_err(map_sqlite_error)?;
-        mapping_identity_not_null.insert(name, not_null);
-    }
-    for column in ["daemon_installation_id", "instance_id"] {
-        if !mapping_columns.contains(column) || mapping_identity_not_null.get(column) != Some(&1) {
-            // ALTER TABLE ADD COLUMN would create a nullable v2 identity
-            // projection. Require an offline table rebuild instead.
-            return Err(StorageError::MigrationRequired);
-        }
-    }
-    let null_identity_count: i64 = tx
-        .query_row(
-            "SELECT COUNT(*) FROM config_revision_mappings
-             WHERE daemon_installation_id IS NULL OR instance_id IS NULL",
-            [],
-            |row| row.get(0),
+    // The pre-bridge TypeScript v1 projection did not repeat the authority
+    // identity on each mapping row. Rebuild the mapping table into the strict
+    // v2 identity-bearing shape, stamping both identity columns from the
+    // authority singleton and preserving every canonical byte/digest.
+    let mapping_has_identity =
+        table_columns(tx, "config_revision_mappings")?.contains("daemon_installation_id");
+    if !mapping_has_identity {
+        tx.execute_batch(
+            "PRAGMA legacy_alter_table = ON;
+             CREATE TABLE config_revision_mappings__dolly_v2 (
+                config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991),
+                daemon_installation_id TEXT NOT NULL,
+                instance_id TEXT NOT NULL,
+                config_digest TEXT NOT NULL,
+                canonical_bytes BLOB NOT NULL,
+                UNIQUE (config_revision, config_digest)
+             );",
         )
         .map_err(map_sqlite_error)?;
-    if null_identity_count != 0 {
-        return Err(StorageError::MigrationRequired);
+        tx.execute(
+            "INSERT INTO config_revision_mappings__dolly_v2 (
+                config_revision, daemon_installation_id, instance_id,
+                config_digest, canonical_bytes
+             ) SELECT config_revision, ?1, ?2, config_digest, canonical_bytes
+             FROM config_revision_mappings",
+            rusqlite::params![&daemon_installation_id, &instance_id],
+        )
+        .map_err(map_sqlite_error)?;
+        tx.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE config_revision_mappings;
+             PRAGMA legacy_alter_table = OFF;
+             ALTER TABLE config_revision_mappings__dolly_v2 RENAME TO config_revision_mappings;
+             PRAGMA foreign_keys = ON;",
+        )
+        .map_err(map_sqlite_error)?;
+    } else {
+        let null_identity_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM config_revision_mappings
+                 WHERE daemon_installation_id IS NULL OR instance_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        if null_identity_count != 0 {
+            return Err(StorageError::MigrationRequired);
+        }
     }
     tx.execute_batch(
         "CREATE TABLE host_authority_meta (
@@ -1963,8 +1980,10 @@ fn validate_legacy_schema(
     if hostile_objects != 0 {
         return Err(StorageError::MigrationRequired);
     }
-    validate_legacy_mapping_identity_shape(connection)?;
-    verify_legacy_authority_schema(connection).map_err(map_host_authority_error)?;
+    if !ts_v1_bridge {
+        validate_legacy_mapping_identity_shape(connection)?;
+        verify_legacy_authority_schema(connection).map_err(map_host_authority_error)?;
+    }
     if ts_v1_bridge {
         let authority_version: Option<i64> = connection
             .query_row(

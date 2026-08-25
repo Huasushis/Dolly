@@ -523,6 +523,86 @@ describe("TST-AUTH-007: physical Host v2 bridge and canonical-byte gates", () =>
         canonical_bytes BLOB NOT NULL,
         UNIQUE (config_revision, config_digest)
       );
+      CREATE TABLE installed_component_origins (
+        component_id TEXT NOT NULL,
+        component_revision INTEGER NOT NULL CHECK (component_revision BETWEEN 1 AND 9007199254740991),
+        component_digest TEXT NOT NULL,
+        record_jcs BLOB NOT NULL,
+        PRIMARY KEY (component_id, component_revision),
+        UNIQUE (component_id, component_revision, component_digest)
+      );
+      CREATE TABLE permission_policy_definitions (
+        policy_id TEXT NOT NULL,
+        policy_revision INTEGER NOT NULL CHECK (policy_revision BETWEEN 1 AND 9007199254740991),
+        definition_digest TEXT NOT NULL,
+        record_jcs BLOB NOT NULL,
+        PRIMARY KEY (policy_id, policy_revision),
+        UNIQUE (policy_id, policy_revision, definition_digest)
+      );
+      CREATE TABLE permission_policy_backend_bindings (
+        binding_id TEXT NOT NULL,
+        binding_revision INTEGER NOT NULL CHECK (binding_revision BETWEEN 1 AND 9007199254740991),
+        binding_digest TEXT NOT NULL,
+        policy_id TEXT NOT NULL,
+        policy_revision INTEGER NOT NULL,
+        policy_definition_digest TEXT NOT NULL,
+        origin_component_id TEXT NOT NULL,
+        origin_component_revision INTEGER NOT NULL,
+        origin_component_digest TEXT NOT NULL,
+        record_jcs BLOB NOT NULL,
+        PRIMARY KEY (binding_id, binding_revision),
+        UNIQUE (binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest),
+        FOREIGN KEY (policy_id, policy_revision, policy_definition_digest)
+          REFERENCES permission_policy_definitions(policy_id, policy_revision, definition_digest),
+        FOREIGN KEY (origin_component_id, origin_component_revision, origin_component_digest)
+          REFERENCES installed_component_origins(component_id, component_revision, component_digest)
+      );
+      CREATE TABLE linux_service_candidates (
+        origin_component_id TEXT NOT NULL,
+        origin_component_revision INTEGER NOT NULL CHECK (origin_component_revision BETWEEN 1 AND 9007199254740991),
+        origin_component_digest TEXT NOT NULL,
+        unit_name TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode = 'user'),
+        candidate_digest TEXT NOT NULL,
+        record_jcs BLOB NOT NULL,
+        PRIMARY KEY (origin_component_id, origin_component_revision, unit_name, mode),
+        UNIQUE (origin_component_id, origin_component_revision, unit_name, mode, candidate_digest),
+        FOREIGN KEY (origin_component_id, origin_component_revision, origin_component_digest)
+          REFERENCES installed_component_origins(component_id, component_revision, component_digest)
+      );
+      CREATE TABLE module_activation_premises (
+        config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991),
+        config_digest TEXT NOT NULL,
+        service_origin_component_id TEXT NOT NULL,
+        service_origin_component_revision INTEGER NOT NULL,
+        service_unit_name TEXT NOT NULL,
+        service_mode TEXT NOT NULL,
+        service_candidate_digest TEXT NOT NULL,
+        premises_digest TEXT NOT NULL,
+        record_jcs BLOB NOT NULL,
+        UNIQUE (config_revision, config_digest),
+        FOREIGN KEY (config_revision, config_digest)
+          REFERENCES config_revision_mappings(config_revision, config_digest),
+        FOREIGN KEY (service_origin_component_id, service_origin_component_revision, service_unit_name, service_mode, service_candidate_digest)
+          REFERENCES linux_service_candidates(origin_component_id, origin_component_revision, unit_name, mode, candidate_digest)
+      );
+      CREATE TABLE module_activation_premise_policy_selections (
+        config_revision INTEGER NOT NULL CHECK (config_revision BETWEEN 1 AND 9007199254740991),
+        policy_id TEXT NOT NULL,
+        policy_revision INTEGER NOT NULL,
+        policy_definition_digest TEXT NOT NULL,
+        binding_id TEXT NOT NULL,
+        binding_revision INTEGER NOT NULL,
+        binding_digest TEXT NOT NULL,
+        PRIMARY KEY (config_revision, policy_id, policy_revision),
+        UNIQUE (config_revision, binding_id, binding_revision, binding_digest),
+        FOREIGN KEY (config_revision)
+          REFERENCES module_activation_premises(config_revision) DEFERRABLE INITIALLY DEFERRED,
+        FOREIGN KEY (policy_id, policy_revision, policy_definition_digest)
+          REFERENCES permission_policy_definitions(policy_id, policy_revision, definition_digest),
+        FOREIGN KEY (binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest)
+          REFERENCES permission_policy_backend_bindings(binding_id, binding_revision, binding_digest, policy_id, policy_revision, policy_definition_digest)
+      );
       CREATE TABLE runtime_authority_state (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         authority_schema_version INTEGER NOT NULL CHECK (authority_schema_version = 1),
@@ -530,12 +610,6 @@ describe("TST-AUTH-007: physical Host v2 bridge and canonical-byte gates", () =>
         instance_id TEXT NOT NULL,
         current_config_revision INTEGER NOT NULL,
         current_config_digest TEXT NOT NULL,
-        record_jcs BLOB NOT NULL
-      );
-      CREATE TABLE module_activation_premises (
-        config_revision INTEGER PRIMARY KEY,
-        config_digest TEXT NOT NULL,
-        premises_digest TEXT NOT NULL,
         record_jcs BLOB NOT NULL
       );
       PRAGMA user_version = 1;
@@ -549,18 +623,34 @@ describe("TST-AUTH-007: physical Host v2 bridge and canonical-byte gates", () =>
       Buffer.from(legacyState),
     );
     legacy.close();
+    // Ordinary open must still refuse the pre-bridge v1 projection.
     expectAuthorityError(
-      () => RuntimeAuthorityDatabase.migrateV1Authority({ path, identity, lock: new FakeLock() }),
+      () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
       "STORAGE_MIGRATION_REQUIRED",
     );
-    const unchanged = raw(path);
-    expect((unchanged.prepare("PRAGMA table_info(config_revision_mappings)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual([
+    // The explicit offline migration must accept the designated pre-bridge
+    // TypeScript v1 projection (mapping rows lacking identity columns) and
+    // rebuild it into the strict v2 identity-bearing schema.
+    RuntimeAuthorityDatabase.migrateV1Authority({ path, identity, lock: new FakeLock() });
+    const migrated = raw(path);
+    const mappingColumns = (migrated.prepare("PRAGMA table_info(config_revision_mappings)").all() as Array<{ name: string }>).map((row) => row.name);
+    expect(mappingColumns).toEqual([
       "config_revision",
+      "daemon_installation_id",
+      "instance_id",
       "config_digest",
       "canonical_bytes",
     ]);
-    expect(unchanged.prepare("SELECT name FROM sqlite_master WHERE name = 'host_authority_meta'").get()).toBeUndefined();
-    unchanged.close();
+    const hostVersion = migrated.prepare("SELECT authority_schema_version FROM host_authority_meta WHERE singleton = 1").get() as { authority_schema_version: number };
+    expect(hostVersion.authority_schema_version).toBe(HOST_AUTHORITY_SCHEMA_VERSION);
+    const mappedRow = migrated.prepare("SELECT daemon_installation_id, instance_id FROM config_revision_mappings WHERE config_revision = 1").get() as { daemon_installation_id: string; instance_id: string };
+    expect(mappedRow.daemon_installation_id).toBe(identity.daemonInstallationId);
+    expect(mappedRow.instance_id).toBe(identity.instanceId);
+    migrated.close();
+    // Ordinary open now succeeds after the explicit migration.
+    const reopened = RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() });
+    expect(reopened.readCurrentConfig()!.config_revision).toBe(1);
+    reopened.close();
   });
   it("rejects oversized and short service admissions before mapping writes", () => {
     const dir = scratch();

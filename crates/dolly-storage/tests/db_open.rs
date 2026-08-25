@@ -572,36 +572,62 @@ fn rust_migrates_pre_bridge_typescript_authority_projection() {
     connection.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
     drop(connection);
 
+    // Ordinary open must still refuse the pre-bridge v1 projection.
     assert!(matches!(
         Database::open(&path),
         Err(StorageError::MigrationRequired)
     ));
-    assert!(matches!(
-        Database::open_for_migration(&path)
-            .unwrap()
-            .migrate_v1_authority(),
-        Err(StorageError::Corrupt | StorageError::MigrationRequired)
-    ));
-    let unchanged = Connection::open(&path).unwrap();
-    let mapping_columns: Vec<String> = unchanged
-        .prepare("PRAGMA table_info(config_revision_mappings)")
+    // The explicit offline migration must accept the designated pre-bridge
+    // TypeScript v1 projection (mapping rows lacking identity columns) and
+    // rebuild it into the strict v2 identity-bearing schema.
+    let migrated = Database::open_for_migration(&path)
         .unwrap()
-        .query_map([], |row| row.get(1))
-        .unwrap()
-        .collect::<Result<Vec<_>, rusqlite::Error>>()
+        .migrate_v1_authority()
+        .expect("explicit offline v1 migration succeeds for the pre-bridge TS projection");
+    assert_ne!(migrated.controller_generation_id(), previous_generation);
+    let host_version: i64 = migrated
+        .connection()
+        .query_row(
+            "SELECT authority_schema_version FROM host_authority_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(
-        mapping_columns,
-        vec!["config_revision", "config_digest", "canonical_bytes"]
+        host_version,
+        dolly_storage::host_authority::HOST_AUTHORITY_SCHEMA_VERSION
     );
-    assert!(unchanged
+    let (mapped_daemon, mapped_instance): (String, String) = migrated
+        .connection()
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'host_authority_meta'",
-            [],
-            |row| row.get::<_, i64>(0),
+            "SELECT daemon_installation_id, instance_id
+             FROM config_revision_mappings WHERE config_revision = ?1",
+            [revision],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .unwrap()
-        == 0);
+        .unwrap();
+    assert_eq!(mapped_daemon, daemon);
+    assert_eq!(mapped_instance, instance);
+    let (state_daemon, state_instance, state_revision, state_digest): (String, String, i64, String) = migrated
+        .connection()
+        .query_row(
+            "SELECT daemon_installation_id, instance_id, current_config_revision, current_config_digest
+             FROM runtime_authority_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(state_daemon, daemon);
+    assert_eq!(state_instance, instance);
+    assert_eq!(state_revision, revision);
+    assert_eq!(state_digest, digest);
+    assert!(
+        dolly_storage::host_authority::load_current_authority(migrated.connection())
+            .unwrap()
+            .is_some()
+    );
+    drop(migrated);
+    Database::open(&path).expect("ordinary open after explicit migration");
 }
 
 
