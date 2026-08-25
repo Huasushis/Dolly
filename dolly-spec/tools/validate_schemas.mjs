@@ -510,7 +510,7 @@ for (const [file, schemaId] of cases) {
         terminalContract.applied_premise?.premise !== "exact-authoritative-tool-call-ledger" ||
         terminalContract.applied_premise?.ledger_schema !== "dolly.tool-call-ledger/v1" ||
         terminalContract.applied_premise?.ledger_record_validator !== "tool-call-ledger-record.schema.json" ||
-        (terminalContract.applied_premise?.identity_match?.length ?? 0) < 6 ||
+        (terminalContract.applied_premise?.identity_match?.length ?? 0) < 8 ||
         terminalContract.applied_premise?.terminal_state !== "SUCCEEDED" ||
         terminalContract.applied_premise?.evidence_rule !== "ledger.terminal_result_digest") {
       throw new Error(`${relative}: terminal outcome must settle UNKNOWN_OUTCOME without an exact authoritative Tool-call ledger premise and only APPLIED via that premise`);
@@ -538,13 +538,14 @@ for (const [file, schemaId] of cases) {
     const claim = withPremise.target.claim;
     const record = withPremise.target.record;
     const binding = ledgerRecord.operation_binding;
-    if (claim.operation_id !== binding.idempotency_key ||
+    if (claim.operation_id !== binding.operation_id ||
         claim.instance_id !== binding.instance_id ||
         claim.module_id !== binding.module_id ||
         claim.operation_digest !== ledgerRecord.operation_digest ||
         record.intent_digest !== ledgerRecord.outbound_digest ||
+        record.package_digest !== binding.server_contract.transport.package_digest ||
         record.evidence_digest !== ledgerRecord.terminal_result_digest) {
-      throw new Error(`${relative}: APPLIED premise must prove concrete Claim/generation/outbound/terminal-result equality with the ledger record`);
+      throw new Error(`${relative}: APPLIED premise must prove concrete Claim/generation/outbound/terminal-result equality with the ledger record (operation_id, not idempotency_key)`);
     }
     if (value.initial.contract.aggregate_evidence !==
         "never-map-evidenceForRun-directly-to-one-Rust-record; require-each-intent-outcome; terminal-outcome-without-authoritative-ledger-premise-settles-UNKNOWN_OUTCOME") {

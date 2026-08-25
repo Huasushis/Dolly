@@ -196,7 +196,7 @@
               "ledger_record_validator": { "const": "tool-call-ledger-record.schema.json" },
               "identity_match": {
                 "type": "array",
-                "minItems": 6,
+                "minItems": 8,
                 "items": { "type": "string", "minLength": 1 }
               },
               "terminal_state": { "const": "SUCCEEDED" },

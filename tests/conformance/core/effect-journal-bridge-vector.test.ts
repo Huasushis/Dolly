@@ -180,11 +180,13 @@ function assertContract(contract: RecordValue): void {
       ledger_schema: "dolly.tool-call-ledger/v1",
       ledger_record_validator: "tool-call-ledger-record.schema.json",
       identity_match: [
-        "claim.operation_id == ledger.operation_binding.idempotency_key",
+        "claim.operation_id == ledger.operation_binding.operation_id",
         "claim.instance_id == ledger.operation_binding.instance_id",
         "claim.module_id == ledger.operation_binding.module_id",
         "claim.operation_digest == ledger.operation_digest",
-        "claim.intent_digest == ledger.outbound_digest",
+        "record.intent_digest == ledger.outbound_digest",
+        "record.package_digest == ledger.operation_binding.server_contract.transport.package_digest",
+        "record.evidence_digest == ledger.terminal_result_digest",
         "ledger.state == SUCCEEDED",
       ],
       terminal_state: "SUCCEEDED",
@@ -318,11 +320,12 @@ describe("TST-TOOL-014 TypeScript side of the cross-language corpus", () => {
     const binding = ledgerRecord.operation_binding as RecordValue;
     const claim = withPremise!.target.claim as RecordValue;
     const rec = withPremise!.target.record as RecordValue;
-    expect(claim.operation_id).toBe(binding.idempotency_key);
+    expect(claim.operation_id).toBe(binding.operation_id);
     expect(claim.instance_id).toBe(binding.instance_id);
     expect(claim.module_id).toBe(binding.module_id);
     expect(claim.operation_digest).toBe(ledgerRecord.operation_digest);
     expect(rec.intent_digest).toBe(ledgerRecord.outbound_digest);
+    expect(rec.package_digest).toBe(binding.server_contract.transport.package_digest);
     expect(rec.evidence_digest).toBe(ledgerRecord.terminal_result_digest);
   });
 
