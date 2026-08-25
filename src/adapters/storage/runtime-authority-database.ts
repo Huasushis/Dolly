@@ -911,8 +911,145 @@ const AUTHORITY_SCHEMA_FOREIGN_KEYS: Readonly<Record<string, readonly string[]>>
   ],
 });
 
-function normalizedSql(sql: unknown): string {
-  return String(sql ?? "").toLowerCase().replace(/\s+/gu, " ").trim();
+type AuthorityIndexSpec = readonly [unique: number, origin: string, partial: number, columns: readonly string[]];
+
+const AUTHORITY_SCHEMA_INDEXES: Readonly<Record<string, readonly AuthorityIndexSpec[]>> = Object.freeze({
+  host_authority_meta: [],
+  config_revision_mappings: [[1, "u", 0, ["config_revision", "config_digest"]]],
+  installed_component_origins: [
+    [1, "pk", 0, ["component_id", "component_revision"]],
+    [1, "u", 0, ["component_id", "component_revision", "component_digest"]],
+  ],
+  permission_policy_definitions: [
+    [1, "pk", 0, ["policy_id", "policy_revision"]],
+    [1, "u", 0, ["policy_id", "policy_revision", "definition_digest"]],
+  ],
+  permission_policy_backend_bindings: [
+    [1, "pk", 0, ["binding_id", "binding_revision"]],
+    [1, "u", 0, ["binding_id", "binding_revision", "binding_digest", "policy_id", "policy_revision", "policy_definition_digest"]],
+  ],
+  linux_service_candidates: [
+    [1, "pk", 0, ["origin_component_id", "origin_component_revision", "unit_name", "mode"]],
+    [1, "u", 0, ["origin_component_id", "origin_component_revision", "unit_name", "mode", "candidate_digest"]],
+  ],
+  module_activation_premises: [[1, "u", 0, ["config_revision", "config_digest"]]],
+  module_activation_premise_policy_selections: [
+    [1, "pk", 0, ["config_revision", "policy_id", "policy_revision"]],
+    [1, "u", 0, ["config_revision", "binding_id", "binding_revision", "binding_digest"]],
+  ],
+  runtime_authority_state: [],
+  core_meta: [],
+  commit_sequence: [],
+  core_journal: [],
+});
+
+function sqlTokens(sql: unknown): string[] {
+  const source = String(sql ?? "");
+  const tokens: string[] = [];
+  let index = 0;
+  while (index < source.length) {
+    const character = source[index]!;
+    if (/\s/u.test(character)) {
+      index += 1;
+      continue;
+    }
+    if (character === "-" && source[index + 1] === "-") {
+      index += 2;
+      while (index < source.length && source[index] !== "\n") index += 1;
+      continue;
+    }
+    if (character === "/" && source[index + 1] === "*") {
+      index += 2;
+      while (index + 1 < source.length && !(source[index] === "*" && source[index + 1] === "/")) index += 1;
+      index = Math.min(index + 2, source.length);
+      continue;
+    }
+    if (character === "'" || character === "\"" || character === "`") {
+      const quote = character;
+      const start = index;
+      index += 1;
+      while (index < source.length) {
+        if (source[index] === quote) {
+          if (source[index + 1] === quote) {
+            index += 2;
+            continue;
+          }
+          index += 1;
+          break;
+        }
+        index += 1;
+      }
+      tokens.push(source.slice(start, index).toLowerCase());
+      continue;
+    }
+    if (character === "[") {
+      const start = index;
+      index += 1;
+      while (index < source.length && source[index] !== "]") index += 1;
+      index = Math.min(index + 1, source.length);
+      tokens.push(source.slice(start, index).toLowerCase());
+      continue;
+    }
+    const start = index;
+    while (
+      index < source.length &&
+      !/\s/u.test(source[index]!) &&
+      !/[\(\),=<>+\-*\/;\[\]]/u.test(source[index]!)
+    ) {
+      index += 1;
+    }
+    if (start === index) {
+      tokens.push(source[index]!.toLowerCase());
+      index += 1;
+    } else {
+      tokens.push(source.slice(start, index).toLowerCase());
+    }
+  }
+  return tokens;
+}
+
+function sqlHasTokenSequence(tokens: readonly string[], fragment: string): boolean {
+  const expected = sqlTokens(fragment);
+  return expected.length > 0 && tokens.some((_, index) =>
+    expected.every((token, offset) => tokens[index + offset] === token),
+  );
+}
+
+function verifyAuthorityIndexes(connection: RuntimeSqliteConnection): void {
+  for (const table of Object.keys(AUTHORITY_SCHEMA_COLUMNS)) {
+    const expected = AUTHORITY_SCHEMA_INDEXES[table] ?? [];
+    const actual = connection.prepare(`PRAGMA index_list(${table})`).all();
+    if (actual.length !== expected.length) {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} has a non-canonical index shape`);
+    }
+    const matched = expected.map(() => false);
+    for (const row of actual) {
+      const indexName = String(row.name);
+      const escapedName = indexName.replace(/'/gu, "''");
+      const columns = connection.prepare(`PRAGMA index_xinfo('${escapedName}')`).all()
+        .filter((entry) => Number(entry.key) === 1)
+        .sort((left, right) => Number(left.seqno) - Number(right.seqno));
+      const position = expected.findIndex((spec, index) =>
+        !matched[index] &&
+        Number(row.unique) === spec[0] &&
+        String(row.origin) === spec[1] &&
+        Number(row.partial) === spec[2] &&
+        columns.length === spec[3].length &&
+        columns.every((column, columnIndex) =>
+          String(column.name) === spec[3][columnIndex] &&
+          Number(column.desc) === 0 &&
+          String(column.coll).toUpperCase() === "BINARY",
+        ),
+      );
+      if (position < 0) {
+        throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} has a wrong index shape`);
+      }
+      matched[position] = true;
+    }
+    if (matched.some((value) => !value)) {
+      throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} is missing a normative index`);
+    }
+  }
 }
 
 function verifyAuthorityPhysicalSchema(connection: RuntimeSqliteConnection): void {
@@ -942,9 +1079,9 @@ function verifyAuthorityPhysicalSchema(connection: RuntimeSqliteConnection): voi
     ) {
       throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} has a non-canonical column shape`);
     }
-    const sql = normalizedSql(tableRow.sql);
+    const sql = sqlTokens(tableRow.sql);
     for (const fragment of AUTHORITY_SCHEMA_CHECKS[table] ?? []) {
-      if (!sql.includes(fragment)) throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} is missing constraint ${fragment}`);
+      if (!sqlHasTokenSequence(sql, fragment)) throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", `authority table ${table} is missing constraint ${fragment}`);
     }
     const foreignKeys = connection.prepare(`PRAGMA foreign_key_list(${table})`).all().map(
       (foreignKey) => `${foreignKey.table}|${foreignKey.from}|${foreignKey.to}`,
@@ -957,6 +1094,11 @@ function verifyAuthorityPhysicalSchema(connection: RuntimeSqliteConnection): voi
   const hostileObjects = rows.filter((row) => row.type === "trigger" || row.type === "view");
   if (hostileObjects.length > 0) {
     throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", "authority tables have unexpected triggers or views");
+  }
+  verifyAuthorityIndexes(connection);
+  const foreignKeyViolations = connection.prepare("PRAGMA foreign_key_check").all();
+  if (foreignKeyViolations.length > 0) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_CORRUPT", "authority foreign-key check reported violations");
   }
 }
 function verifyLegacyAuthorityPhysicalSchema(
@@ -988,10 +1130,18 @@ function verifyLegacyAuthorityPhysicalSchema(
     ) {
       throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", `legacy authority table ${table} has a non-canonical column shape`);
     }
-    const sql = normalizedSql(row.sql);
-    if (!sql.includes("primary key") || (table !== "host_authority_meta" && !sql.includes("unique"))) {
+    const sql = sqlTokens(row.sql);
+    if (
+      !sqlHasTokenSequence(sql, "primary key") ||
+      (table !== "host_authority_meta" && !sqlHasTokenSequence(sql, "unique"))
+    ) {
       throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", `legacy authority table ${table} is missing a required constraint`);
     }
+  }
+  verifyAuthorityIndexes(connection);
+  const foreignKeyViolations = connection.prepare("PRAGMA foreign_key_check").all();
+  if (foreignKeyViolations.length > 0) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "legacy authority foreign-key check reported violations");
   }
   const hostile = connection.prepare(
     "SELECT type, name FROM sqlite_master WHERE type IN ('trigger', 'view') AND tbl_name IN (" +
@@ -1002,6 +1152,50 @@ function verifyLegacyAuthorityPhysicalSchema(
     throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "legacy authority tables have unexpected triggers or views");
   }
 }
+function verifyLegacyCorePhysicalSchema(connection: RuntimeSqliteConnection, typescriptV1: boolean): void {
+  const expected = typescriptV1
+    ? [
+        ["singleton", "INTEGER", 0, 1],
+        ["authority_schema_version", "INTEGER", 1, 0],
+        ["daemon_installation_id", "TEXT", 1, 0],
+        ["instance_id", "TEXT", 1, 0],
+      ]
+    : [
+        ["singleton", "INTEGER", 0, 1],
+        ["schema_version", "INTEGER", 1, 0],
+        ["daemon_installation_id", "TEXT", 0, 0],
+        ["instance_id", "TEXT", 0, 0],
+        ["clean_shutdown", "INTEGER", 1, 0],
+        ["sqlite_version_number", "INTEGER", 1, 0],
+        ["sqlite_source_id", "TEXT", 1, 0],
+        ["sqlite_artifact_digest", "TEXT", 1, 0],
+      ];
+  const columns = connection.prepare("PRAGMA table_info(core_meta)").all();
+  if (
+    columns.length !== expected.length ||
+    columns.some((column, index) => {
+      const wanted = expected[index]!;
+      return String(column.name) !== wanted[0] ||
+        String(column.type).toUpperCase() !== wanted[1] ||
+        Number(column.notnull) !== wanted[2] ||
+        Number(column.pk) !== wanted[3];
+    })
+  ) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "legacy core_meta has a non-canonical physical shape");
+  }
+  const row = connection.prepare("SELECT type, sql FROM sqlite_master WHERE name = 'core_meta'").get();
+  const tokens = sqlTokens(row?.sql);
+  const requiredChecks = typescriptV1
+    ? ["check (singleton = 1)", "check (authority_schema_version = 1)"]
+    : ["check (singleton = 1)", "check (clean_shutdown in (0, 1))"];
+  if (
+    row?.type !== "table" ||
+    requiredChecks.some((fragment) => !sqlHasTokenSequence(tokens, fragment))
+  ) {
+    throw new RuntimeAuthorityDatabaseError("STORAGE_MIGRATION_REQUIRED", "legacy core_meta is missing an authoritative constraint");
+  }
+}
+
 
 function stateRecord(identity: RuntimeAuthorityIdentity, controllerGenerationId: string, revision: number, digest: string): JsonValue {
   return {
@@ -1435,6 +1629,7 @@ export class RuntimeAuthorityDatabase {
         "parallel config_revisions object blocks legacy migration",
       );
     }
+    verifyLegacyCorePhysicalSchema(this.#connection, typescriptV1);
     verifyLegacyAuthorityPhysicalSchema(this.#connection, typescriptV1);
     const state = this.#connection.prepare(
       "SELECT authority_schema_version, daemon_installation_id, instance_id, current_config_revision, current_config_digest, record_jcs FROM runtime_authority_state WHERE singleton = 1",
@@ -1478,6 +1673,9 @@ export class RuntimeAuthorityDatabase {
     if ((legacyConfig.service_candidate !== null) !== (legacyPremise !== null)) {
       throw this.#corrupt("legacy current config and premise presence disagree");
     }
+    // Blocker 3: verify every persisted row (reachable and unused) before any
+    // schema commit so tampered historical rows cannot enter the v2 projection.
+    this.#verifyAllCommittedRows();
 
     this.#statement("BEGIN IMMEDIATE").run();
     try {
@@ -1491,43 +1689,48 @@ export class RuntimeAuthorityDatabase {
           : 0;
       const sourceId = String(sqliteIdentity?.source_id ?? "");
       const artifactDigest = sha256DigestOfBytes(Buffer.from(sourceId, "utf8"));
-      for (const [column, sqlType] of [
-        ["schema_version", "INTEGER"],
-        ["clean_shutdown", "INTEGER"],
-        ["sqlite_version_number", "INTEGER"],
-        ["sqlite_source_id", "TEXT"],
-        ["sqlite_artifact_digest", "TEXT"],
-        ["controller_generation_id", "TEXT"],
-      ] as const) {
-        if (!coreColumns.has(column)) {
-          this.#connection.prepare(`ALTER TABLE core_meta ADD COLUMN ${column} ${sqlType}`).run();
-        }
+      const coreRow = this.#connection.prepare("SELECT * FROM core_meta WHERE singleton = 1").get() as Record<string, unknown> | undefined;
+      const coreDaemon = coreRow?.daemon_installation_id;
+      const coreInstance = coreRow?.instance_id;
+      const legacySchemaVersion = typescriptV1 ? coreRow?.authority_schema_version : coreRow?.schema_version;
+      if (
+        typeof coreDaemon !== "string" ||
+        typeof coreInstance !== "string" ||
+        coreDaemon !== this.#identity.daemonInstallationId ||
+        coreInstance !== this.#identity.instanceId ||
+        Number(legacySchemaVersion) !== 1
+      ) {
+        throw this.#corrupt("legacy core_meta identity or schema version is invalid");
       }
-      if (typescriptV1) {
-        this.#connection.prepare(
-          "UPDATE core_meta SET schema_version = authority_schema_version, clean_shutdown = 0, sqlite_version_number = ?, sqlite_source_id = ?, sqlite_artifact_digest = ?, controller_generation_id = ? WHERE singleton = 1",
-        ).run(
-          versionNumber,
-          sourceId,
-          artifactDigest,
-          this.#controllerGenerationId,
-        );
-      } else {
-        this.#connection.prepare(
-          "UPDATE core_meta SET controller_generation_id = ? WHERE singleton = 1",
-        ).run(this.#controllerGenerationId);
+      const cleanShutdown = typescriptV1 ? 0 : Number(coreRow?.clean_shutdown);
+      const legacySqliteVersion = typescriptV1 ? versionNumber : Number(coreRow?.sqlite_version_number);
+      const legacySourceId = typescriptV1 ? sourceId : String(coreRow?.sqlite_source_id ?? "");
+      const legacyArtifactDigest = typescriptV1 ? artifactDigest : String(coreRow?.sqlite_artifact_digest ?? "");
+      if (
+        !Number.isInteger(cleanShutdown) ||
+        ![0, 1].includes(cleanShutdown) ||
+        !Number.isSafeInteger(legacySqliteVersion) ||
+        legacySourceId.length === 0 ||
+        !isSha256(legacyArtifactDigest)
+      ) {
+        throw this.#corrupt("legacy core_meta diagnostic projection is invalid");
       }
-      const mappingColumns = new Set(
-        this.#connection.prepare("PRAGMA table_info(config_revision_mappings)").all().map((entry) => String(entry.name)),
+      this.#connection.prepare(
+        "CREATE TABLE core_meta_v2 (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), schema_version INTEGER NOT NULL, daemon_installation_id TEXT, instance_id TEXT, controller_generation_id TEXT, clean_shutdown INTEGER NOT NULL CHECK (clean_shutdown IN (0, 1)), sqlite_version_number INTEGER NOT NULL, sqlite_source_id TEXT NOT NULL, sqlite_artifact_digest TEXT NOT NULL)",
+      ).run();
+      this.#connection.prepare(
+        "INSERT INTO core_meta_v2 (singleton, schema_version, daemon_installation_id, instance_id, controller_generation_id, clean_shutdown, sqlite_version_number, sqlite_source_id, sqlite_artifact_digest) VALUES (1, 1, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        coreDaemon,
+        coreInstance,
+        this.#controllerGenerationId,
+        cleanShutdown,
+        legacySqliteVersion,
+        legacySourceId,
+        legacyArtifactDigest,
       );
-      for (const [column, sqlType] of [
-        ["daemon_installation_id", "TEXT"],
-        ["instance_id", "TEXT"],
-      ] as const) {
-        if (!mappingColumns.has(column)) {
-          this.#connection.prepare(`ALTER TABLE config_revision_mappings ADD COLUMN ${column} ${sqlType}`).run();
-        }
-      }
+      this.#connection.prepare("DROP TABLE core_meta").run();
+      this.#connection.prepare("ALTER TABLE core_meta_v2 RENAME TO core_meta").run();
       if (hostVersion === 1) {
         this.#connection.prepare("DROP TABLE host_authority_meta").run();
       }
@@ -1701,10 +1904,16 @@ export class RuntimeAuthorityDatabase {
     const mappingRows = this.#connection.prepare(
       "SELECT config_revision, config_digest FROM config_revision_mappings ORDER BY config_revision",
     ).all();
+    const expectedSelectionsByRevision: Record<string, readonly PermissionPolicySelection[]> = Object.create(null);
+    const mappingDigestByRevision: Record<string, string> = Object.create(null);
     for (const row of mappingRows) {
       const revision = Number(row.config_revision);
       const digest = String(row.config_digest);
-      if (this.#resolveMapping(revision, digest) === null) throw this.#corrupt(`mapping revision ${revision} disappeared during verification`);
+      const mapping = this.#resolveMapping(revision, digest);
+      if (mapping === null) throw this.#corrupt(`mapping revision ${revision} disappeared during verification`);
+      const config = asResolvedConfiguration(parseCanonicalJsonBytes(mapping.bytes));
+      expectedSelectionsByRevision[String(revision)] = config.permission_policy_selections;
+      mappingDigestByRevision[String(revision)] = digest;
     }
 
     const originRows = this.#connection.prepare(
@@ -1813,6 +2022,7 @@ export class RuntimeAuthorityDatabase {
       }
     }
 
+    const selectionRowsByRevision: Record<string, PermissionPolicySelection[]> = Object.create(null);
     const premiseRows = this.#connection.prepare(
       "SELECT config_revision, config_digest, service_origin_component_id, service_origin_component_revision, service_unit_name, service_mode, service_candidate_digest, premises_digest FROM module_activation_premises",
     ).all();
@@ -1834,10 +2044,11 @@ export class RuntimeAuthorityDatabase {
     }
 
     const selectionRows = this.#connection.prepare(
-      "SELECT config_revision, policy_id, policy_revision, policy_definition_digest, binding_id, binding_revision, binding_digest FROM module_activation_premise_policy_selections",
+      "SELECT config_revision, policy_id, policy_revision, policy_definition_digest, binding_id, binding_revision, binding_digest FROM module_activation_premise_policy_selections ORDER BY config_revision, policy_id, policy_revision",
     ).all();
     for (const row of selectionRows) {
-      const selection = {
+      const revision = Number(row.config_revision);
+      const selection: PermissionPolicySelection = {
         policy_id: String(row.policy_id),
         policy_revision: Number(row.policy_revision),
         policy_definition_digest: String(row.policy_definition_digest),
@@ -1845,11 +2056,61 @@ export class RuntimeAuthorityDatabase {
         binding_revision: Number(row.binding_revision),
         binding_digest: String(row.binding_digest),
       };
-      if (!isStableId(selection.policy_id) || !isStableId(selection.binding_id) ||
-          !isIntegralInRange(selection.policy_revision, 1, MAX_CONFIG_REVISION) ||
-          !isIntegralInRange(selection.binding_revision, 1, MAX_CONFIG_REVISION) ||
-          !isSha256(selection.policy_definition_digest) || !isSha256(selection.binding_digest)) {
+      if (
+        !isIntegralInRange(revision, 1, MAX_CONFIG_REVISION) ||
+        !isStableId(selection.policy_id) ||
+        !isStableId(selection.binding_id) ||
+        !isIntegralInRange(selection.policy_revision, 1, MAX_CONFIG_REVISION) ||
+        !isIntegralInRange(selection.binding_revision, 1, MAX_CONFIG_REVISION) ||
+        !isSha256(selection.policy_definition_digest) ||
+        !isSha256(selection.binding_digest)
+      ) {
         throw this.#corrupt("stored premise-policy selection is malformed");
+      }
+      const expectedSelections = expectedSelectionsByRevision[String(revision)];
+      if (
+        expectedSelections === undefined ||
+        !expectedSelections.some((expected) => selectionKey(expected) === selectionKey(selection))
+      ) {
+        throw this.#corrupt("stored premise-policy selection differs from canonical config");
+      }
+      const configDigest = mappingDigestByRevision[String(revision)];
+      const premise = configDigest === undefined ? null : this.#loadPremise(revision, configDigest);
+      if (premise === null) throw this.#corrupt(`stored selection ${revision} has no canonical premise`);
+      const definition = premise.permission_policy_definitions.find(
+        (value) => value.policy_id === selection.policy_id && value.policy_revision === selection.policy_revision,
+      );
+      if (definition === undefined || definition.definition_digest !== selection.policy_definition_digest) {
+        throw this.#corrupt("stored premise-policy selection definition projection disagrees with its premise");
+      }
+      const binding = premise.permission_policy_backend_bindings.find(
+        (value) => value.binding_id === selection.binding_id && value.binding_revision === selection.binding_revision,
+      );
+      if (
+        binding === undefined ||
+        binding.binding_digest !== selection.binding_digest ||
+        binding.policy_id !== selection.policy_id ||
+        binding.policy_revision !== selection.policy_revision ||
+        binding.policy_definition_digest !== selection.policy_definition_digest
+      ) {
+        throw this.#corrupt("stored premise-policy selection binding projection disagrees with its premise");
+      }
+      (selectionRowsByRevision[String(revision)] ??= []).push(selection);
+    }
+    if (Object.keys(selectionRowsByRevision).some((revision) =>
+      expectedSelectionsByRevision[revision] === undefined,
+    )) {
+      throw this.#corrupt("stored premise-policy selection references a missing mapping");
+    }
+    for (const row of premiseRows) {
+      const revision = Number(row.config_revision);
+      const expectedSelections = expectedSelectionsByRevision[String(revision)];
+      const actualSelections = selectionRowsByRevision[String(revision)] ?? [];
+      if (
+        expectedSelections === undefined ||
+        actualSelections.map(selectionKey).join("\u0001") !== expectedSelections.map(selectionKey).join("\u0001")
+      ) {
+        throw this.#corrupt(`premise selection projection disagrees with canonical config for revision ${revision}`);
       }
     }
   }

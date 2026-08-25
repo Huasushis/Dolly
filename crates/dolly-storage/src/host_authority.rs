@@ -9,7 +9,7 @@
 //! transaction.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use dolly_canonical_json::{
@@ -29,14 +29,11 @@ pub(crate) fn is_uuid_v7(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 36
         && [8, 13, 18, 23].iter().all(|index| bytes[*index] == b'-')
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| {
-                [8, 13, 18, 23].contains(&index)
-                    || byte.is_ascii_digit()
-                    || byte.is_ascii_lowercase() && byte.is_ascii_hexdigit()
-            })
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            [8, 13, 18, 23].contains(&index)
+                || byte.is_ascii_digit()
+                || byte.is_ascii_lowercase() && byte.is_ascii_hexdigit()
+        })
         && bytes[14] == b'7'
         && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
 }
@@ -363,9 +360,7 @@ pub fn create_host_authority_schema(connection: &Connection) -> Result<(), HostA
 /// any reachable row. SQLite's foreign-key check cannot detect an absent
 /// prerequisite table, nullable identity column, altered CHECK, or an
 /// unexpected trigger, so the physical shape is checked independently.
-pub(crate) fn verify_authority_schema(
-    connection: &Connection,
-) -> Result<(), HostAuthorityError> {
+pub(crate) fn verify_authority_schema(connection: &Connection) -> Result<(), HostAuthorityError> {
     let tables = [
         "host_authority_meta",
         "config_revision_mappings",
@@ -410,7 +405,10 @@ pub(crate) fn verify_authority_schema(
             ("singleton", "INTEGER", 0, 1),
             ("authority_schema_version", "INTEGER", 1, 0),
         ],
-        &["check (singleton = 1)", "check (authority_schema_version = 2)"],
+        &[
+            "check (singleton = 1)",
+            "check (authority_schema_version = 2)",
+        ],
         &[],
     )?;
     verify_table_shape(
@@ -591,7 +589,308 @@ pub(crate) fn verify_authority_schema(
             "config_revision_mappings|current_config_digest|config_digest",
         ],
     )?;
+    verify_authority_indexes(connection)?;
+    let mut foreign_key_check = connection.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(HostAuthorityError::Malformed(
+            "authority foreign-key check reported violations".into(),
+        ));
+    }
+    let hostile_objects: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type IN ('trigger', 'view')
+           AND tbl_name IN (
+             'host_authority_meta',
+             'config_revision_mappings',
+             'installed_component_origins',
+             'permission_policy_definitions',
+             'permission_policy_backend_bindings',
+             'linux_service_candidates',
+             'module_activation_premises',
+             'module_activation_premise_policy_selections',
+             'runtime_authority_state'
+           )",
+        [],
+        |row| row.get(0),
+    )?;
+    if hostile_objects != 0 {
+        return Err(HostAuthorityError::Malformed(
+            "authority tables have unexpected triggers or views".into(),
+        ));
+    }
     Ok(())
+}
+
+fn verify_authority_indexes(connection: &Connection) -> Result<(), HostAuthorityError> {
+    let expected: [(&str, &[(bool, &str, bool, &[&str])]); 9] = [
+        ("host_authority_meta", &[]),
+        (
+            "config_revision_mappings",
+            &[(true, "u", false, &["config_revision", "config_digest"])],
+        ),
+        (
+            "installed_component_origins",
+            &[
+                (true, "pk", false, &["component_id", "component_revision"]),
+                (
+                    true,
+                    "u",
+                    false,
+                    &["component_id", "component_revision", "component_digest"],
+                ),
+            ],
+        ),
+        (
+            "permission_policy_definitions",
+            &[
+                (true, "pk", false, &["policy_id", "policy_revision"]),
+                (
+                    true,
+                    "u",
+                    false,
+                    &["policy_id", "policy_revision", "definition_digest"],
+                ),
+            ],
+        ),
+        (
+            "permission_policy_backend_bindings",
+            &[
+                (true, "pk", false, &["binding_id", "binding_revision"]),
+                (
+                    true,
+                    "u",
+                    false,
+                    &[
+                        "binding_id",
+                        "binding_revision",
+                        "binding_digest",
+                        "policy_id",
+                        "policy_revision",
+                        "policy_definition_digest",
+                    ],
+                ),
+            ],
+        ),
+        (
+            "linux_service_candidates",
+            &[
+                (
+                    true,
+                    "pk",
+                    false,
+                    &[
+                        "origin_component_id",
+                        "origin_component_revision",
+                        "unit_name",
+                        "mode",
+                    ],
+                ),
+                (
+                    true,
+                    "u",
+                    false,
+                    &[
+                        "origin_component_id",
+                        "origin_component_revision",
+                        "unit_name",
+                        "mode",
+                        "candidate_digest",
+                    ],
+                ),
+            ],
+        ),
+        (
+            "module_activation_premises",
+            &[(true, "u", false, &["config_revision", "config_digest"])],
+        ),
+        (
+            "module_activation_premise_policy_selections",
+            &[
+                (
+                    true,
+                    "pk",
+                    false,
+                    &["config_revision", "policy_id", "policy_revision"],
+                ),
+                (
+                    true,
+                    "u",
+                    false,
+                    &[
+                        "config_revision",
+                        "binding_id",
+                        "binding_revision",
+                        "binding_digest",
+                    ],
+                ),
+            ],
+        ),
+        ("runtime_authority_state", &[]),
+    ];
+    for (table, expected_indexes) in expected {
+        let mut statement = connection.prepare(&format!("PRAGMA index_list({table})"))?;
+        let actual = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                ))
+            })?
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+        if actual.len() != expected_indexes.len() {
+            return Err(HostAuthorityError::Malformed(format!(
+                "authority table {table} has a non-canonical index shape"
+            )));
+        }
+        let mut matched = vec![false; expected_indexes.len()];
+        for (index_name, unique, origin, partial) in actual {
+            let escaped_name = index_name.replace('\'', "''");
+            let mut xinfo = connection.prepare(&format!("PRAGMA index_xinfo('{escaped_name}')"))?;
+            let mut columns = xinfo
+                .query_map([], |row| {
+                    let key: i64 = row.get(5)?;
+                    if key == 0 {
+                        return Ok(None);
+                    }
+                    Ok(Some((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    )))
+                })?
+                .collect::<Result<Vec<_>, rusqlite::Error>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            columns.sort_by_key(|column| column.0);
+            let Some((position, _expected_index)) =
+                expected_indexes
+                    .iter()
+                    .enumerate()
+                    .find(|(_, expected_index)| {
+                        expected_index.0 == unique
+                            && expected_index.1 == origin
+                            && expected_index.2 == partial
+                            && expected_index.3.len() == columns.len()
+                            && expected_index.3.iter().zip(&columns).all(|(name, column)| {
+                                column.1.as_deref() == Some(*name)
+                                    && column.2 == 0
+                                    && column.3.eq_ignore_ascii_case("BINARY")
+                            })
+                    })
+            else {
+                return Err(HostAuthorityError::Malformed(format!(
+                    "authority table {table} has a wrong index shape"
+                )));
+            };
+            if matched[position] {
+                return Err(HostAuthorityError::Malformed(format!(
+                    "authority table {table} has duplicate normative indexes"
+                )));
+            }
+            matched[position] = true;
+        }
+        if matched.iter().any(|value| !value) {
+            return Err(HostAuthorityError::Malformed(format!(
+                "authority table {table} is missing a normative index"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn sql_tokens(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'-' && bytes.get(index + 1) == Some(&b'-') {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        if matches!(bytes[index], b'\'' | b'"' | b'`') {
+            let quote = bytes[index];
+            let start = index;
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == quote {
+                    if bytes.get(index + 1) == Some(&quote) {
+                        index += 2;
+                        continue;
+                    }
+                    index += 1;
+                    break;
+                }
+                index += 1;
+            }
+            tokens.push(String::from_utf8_lossy(&bytes[start..index]).to_ascii_lowercase());
+            continue;
+        }
+        if bytes[index] == b'[' {
+            let start = index;
+            index += 1;
+            while index < bytes.len() && bytes[index] != b']' {
+                index += 1;
+            }
+            index = (index + 1).min(bytes.len());
+            tokens.push(String::from_utf8_lossy(&bytes[start..index]).to_ascii_lowercase());
+            continue;
+        }
+        let start = index;
+        while index < bytes.len()
+            && !bytes[index].is_ascii_whitespace()
+            && !matches!(
+                bytes[index],
+                b'(' | b')'
+                    | b','
+                    | b'='
+                    | b'<'
+                    | b'>'
+                    | b'+'
+                    | b'-'
+                    | b'*'
+                    | b'/'
+                    | b'['
+                    | b']'
+                    | b';'
+            )
+        {
+            index += 1;
+        }
+        if start == index {
+            tokens.push(String::from_utf8_lossy(&bytes[index..=index]).to_ascii_lowercase());
+            index += 1;
+        } else {
+            tokens.push(String::from_utf8_lossy(&bytes[start..index]).to_ascii_lowercase());
+        }
+    }
+    tokens
+}
+
+fn sql_has_token_sequence(tokens: &[String], fragment: &str) -> bool {
+    let expected = sql_tokens(fragment);
+    !expected.is_empty()
+        && tokens
+            .windows(expected.len())
+            .any(|window| window == expected.as_slice())
 }
 
 fn verify_table_shape(
@@ -615,12 +914,15 @@ fn verify_table_shape(
             .collect::<Result<Vec<_>, rusqlite::Error>>()?
     };
     if columns.len() != expected_columns.len()
-        || columns.iter().zip(expected_columns).any(|(actual, expected)| {
-            actual.0 != expected.0
-                || actual.1.to_ascii_uppercase() != expected.1
-                || actual.2 != expected.2
-                || actual.3 != expected.3
-        })
+        || columns
+            .iter()
+            .zip(expected_columns)
+            .any(|(actual, expected)| {
+                actual.0 != expected.0
+                    || actual.1.to_ascii_uppercase() != expected.1
+                    || actual.2 != expected.2
+                    || actual.3 != expected.3
+            })
     {
         return Err(HostAuthorityError::Malformed(format!(
             "authority table {table} has a non-canonical column shape"
@@ -631,9 +933,9 @@ fn verify_table_shape(
         [table],
         |row| row.get(0),
     )?;
-    let normalized = sql.to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    let tokens = sql_tokens(&sql);
     for check in checks {
-        if !normalized.contains(check) {
+        if !sql_has_token_sequence(&tokens, check) {
             return Err(HostAuthorityError::Malformed(format!(
                 "authority table {table} is missing constraint {check}"
             )));
@@ -653,7 +955,10 @@ fn verify_table_shape(
             .collect::<Result<Vec<_>, rusqlite::Error>>()?
     };
     foreign_keys.sort();
-    let mut expected = expected_foreign_keys.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+    let mut expected = expected_foreign_keys
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
     expected.sort();
     if foreign_keys != expected {
         return Err(HostAuthorityError::Malformed(format!(
@@ -672,61 +977,109 @@ pub(crate) fn verify_legacy_authority_schema(
     connection: &Connection,
 ) -> Result<(), HostAuthorityError> {
     let specs: [(&str, &[&str], &[&str]); 9] = [
-        ("host_authority_meta", &["singleton", "authority_schema_version"], &["authority_schema_version = 1"]),
+        (
+            "host_authority_meta",
+            &["singleton", "authority_schema_version"],
+            &["authority_schema_version = 1"],
+        ),
         (
             "config_revision_mappings",
-            &["config_revision", "daemon_installation_id", "instance_id", "config_digest", "canonical_bytes"],
+            &[
+                "config_revision",
+                "daemon_installation_id",
+                "instance_id",
+                "config_digest",
+                "canonical_bytes",
+            ],
             &["unique"],
         ),
         (
             "installed_component_origins",
-            &["component_id", "component_revision", "component_digest", "record_jcs"],
+            &[
+                "component_id",
+                "component_revision",
+                "component_digest",
+                "record_jcs",
+            ],
             &["unique"],
         ),
         (
             "permission_policy_definitions",
-            &["policy_id", "policy_revision", "definition_digest", "record_jcs"],
+            &[
+                "policy_id",
+                "policy_revision",
+                "definition_digest",
+                "record_jcs",
+            ],
             &["unique"],
         ),
         (
             "permission_policy_backend_bindings",
             &[
-                "binding_id", "binding_revision", "binding_digest", "policy_id",
-                "policy_revision", "policy_definition_digest", "origin_component_id",
-                "origin_component_revision", "origin_component_digest", "record_jcs",
+                "binding_id",
+                "binding_revision",
+                "binding_digest",
+                "policy_id",
+                "policy_revision",
+                "policy_definition_digest",
+                "origin_component_id",
+                "origin_component_revision",
+                "origin_component_digest",
+                "record_jcs",
             ],
             &["unique", "foreign key"],
         ),
         (
             "linux_service_candidates",
             &[
-                "origin_component_id", "origin_component_revision", "origin_component_digest",
-                "unit_name", "mode", "candidate_digest", "record_jcs",
+                "origin_component_id",
+                "origin_component_revision",
+                "origin_component_digest",
+                "unit_name",
+                "mode",
+                "candidate_digest",
+                "record_jcs",
             ],
             &["unique", "foreign key"],
         ),
         (
             "module_activation_premises",
             &[
-                "config_revision", "config_digest", "service_origin_component_id",
-                "service_origin_component_revision", "service_unit_name", "service_mode",
-                "service_candidate_digest", "premises_digest", "record_jcs",
+                "config_revision",
+                "config_digest",
+                "service_origin_component_id",
+                "service_origin_component_revision",
+                "service_unit_name",
+                "service_mode",
+                "service_candidate_digest",
+                "premises_digest",
+                "record_jcs",
             ],
             &["unique", "foreign key"],
         ),
         (
             "module_activation_premise_policy_selections",
             &[
-                "config_revision", "policy_id", "policy_revision",
-                "policy_definition_digest", "binding_id", "binding_revision", "binding_digest",
+                "config_revision",
+                "policy_id",
+                "policy_revision",
+                "policy_definition_digest",
+                "binding_id",
+                "binding_revision",
+                "binding_digest",
             ],
             &["unique", "foreign key"],
         ),
         (
             "runtime_authority_state",
             &[
-                "singleton", "authority_schema_version", "daemon_installation_id",
-                "instance_id", "current_config_revision", "current_config_digest", "record_jcs",
+                "singleton",
+                "authority_schema_version",
+                "daemon_installation_id",
+                "instance_id",
+                "current_config_revision",
+                "current_config_digest",
+                "record_jcs",
             ],
             &["authority_schema_version = 1", "foreign key"],
         ),
@@ -736,7 +1089,11 @@ pub(crate) fn verify_legacy_authority_schema(
         let actual: Vec<String> = statement
             .query_map([], |row| row.get(1))?
             .collect::<Result<Vec<_>, rusqlite::Error>>()?;
-        if actual.iter().map(String::as_str).ne(expected_columns.iter().copied()) {
+        if actual
+            .iter()
+            .map(String::as_str)
+            .ne(expected_columns.iter().copied())
+        {
             return Err(HostAuthorityError::Malformed(format!(
                 "legacy authority table {table} has a non-canonical column shape"
             )));
@@ -746,12 +1103,22 @@ pub(crate) fn verify_legacy_authority_schema(
             [table],
             |row| row.get(0),
         )?;
-        let normalized = sql.to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
-        if sql_fragments.iter().any(|fragment| !normalized.contains(fragment)) {
+        let tokens = sql_tokens(&sql);
+        if sql_fragments
+            .iter()
+            .any(|fragment| !sql_has_token_sequence(&tokens, fragment))
+        {
             return Err(HostAuthorityError::Malformed(format!(
                 "legacy authority table {table} is missing a required constraint"
             )));
         }
+    }
+    verify_authority_indexes(connection)?;
+    let mut foreign_key_check = connection.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(HostAuthorityError::Malformed(
+            "legacy authority foreign-key check reported violations".into(),
+        ));
     }
     Ok(())
 }
@@ -1086,8 +1453,12 @@ fn load_authority_snapshot(
     revision: i64,
     digest: &str,
 ) -> Result<CurrentAuthoritySnapshot, HostAuthorityError> {
-    let has_mapping_identity = table_has_column(connection, "config_revision_mappings", "daemon_installation_id")?
-        && table_has_column(connection, "config_revision_mappings", "instance_id")?;
+    let has_mapping_identity =
+        table_has_column(
+            connection,
+            "config_revision_mappings",
+            "daemon_installation_id",
+        )? && table_has_column(connection, "config_revision_mappings", "instance_id")?;
     let mapping_row: Option<(String, String, i64, String, Vec<u8>)> = if has_mapping_identity {
         connection
             .query_row(
@@ -1096,7 +1467,15 @@ fn load_authority_snapshot(
                  FROM config_revision_mappings
                  WHERE config_revision = ?1 AND config_digest = ?2",
                 params![revision, digest],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?
     } else {
@@ -1134,7 +1513,8 @@ fn load_authority_snapshot(
             "current mapping is missing".into(),
         ));
     };
-    if mapping_daemon != identity.daemon_installation_id || mapping_instance != identity.instance_id {
+    if mapping_daemon != identity.daemon_installation_id || mapping_instance != identity.instance_id
+    {
         return Err(HostAuthorityError::InvalidPremise(
             "current mapping identity differs from authority state".into(),
         ));
@@ -1222,25 +1602,90 @@ pub(crate) fn migrate_legacy_authority_in_transaction(
             "offline migration target already has controller generation".into(),
         ));
     }
-    let mut core_columns = BTreeSet::new();
-    let mut core_statement = tx.prepare("PRAGMA table_info(core_meta)")?;
-    let core_rows = core_statement.query_map([], |row| row.get::<_, String>(1))?;
-    for row in core_rows {
-        core_columns.insert(row?);
-    }
-    if !core_columns.contains("controller_generation_id") {
-        tx.execute_batch("ALTER TABLE core_meta ADD COLUMN controller_generation_id TEXT")?;
-    }
-    let updated = tx.execute(
-        "UPDATE core_meta SET controller_generation_id = ?1
-         WHERE singleton = 1",
-        [generation],
-    )?;
-    if updated != 1 {
+    let core_row: Option<(
+        i64,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+        String,
+        String,
+    )> = tx
+        .query_row(
+            "SELECT schema_version, daemon_installation_id, instance_id, clean_shutdown,
+                    sqlite_version_number, sqlite_source_id, sqlite_artifact_digest
+             FROM core_meta WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        schema_version,
+        Some(core_daemon),
+        Some(core_instance),
+        clean_shutdown,
+        sqlite_version_number,
+        sqlite_source_id,
+        sqlite_artifact_digest,
+    )) = core_row
+    else {
         return Err(HostAuthorityError::Malformed(
-            "core authority generation row is missing".into(),
+            "core authority identity row is missing or nullable".into(),
+        ));
+    };
+    if schema_version != 1
+        || core_daemon != snapshot.mapping.daemon_installation_id
+        || core_instance != snapshot.mapping.instance_id
+        || !matches!(clean_shutdown, 0 | 1)
+    {
+        return Err(HostAuthorityError::Malformed(
+            "legacy core authority row disagrees with the authority identity".into(),
         ));
     }
+    tx.execute_batch(
+        "CREATE TABLE core_meta__dolly_v2 (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            schema_version INTEGER NOT NULL,
+            daemon_installation_id TEXT,
+            instance_id TEXT,
+            controller_generation_id TEXT,
+            clean_shutdown INTEGER NOT NULL CHECK (clean_shutdown IN (0, 1)),
+            sqlite_version_number INTEGER NOT NULL,
+            sqlite_source_id TEXT NOT NULL,
+            sqlite_artifact_digest TEXT NOT NULL
+        );",
+    )?;
+    tx.execute(
+        "INSERT INTO core_meta__dolly_v2 (
+            singleton, schema_version, daemon_installation_id, instance_id,
+            controller_generation_id, clean_shutdown, sqlite_version_number,
+            sqlite_source_id, sqlite_artifact_digest
+         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            schema_version,
+            core_daemon,
+            core_instance,
+            generation,
+            clean_shutdown,
+            sqlite_version_number,
+            sqlite_source_id,
+            sqlite_artifact_digest,
+        ],
+    )?;
+    tx.execute_batch(
+        "DROP TABLE core_meta;
+         ALTER TABLE core_meta__dolly_v2 RENAME TO core_meta;",
+    )?;
 
     let state = RuntimeAuthorityStateRecord {
         schema: "dolly.runtime-authority-state/v1".into(),
@@ -1413,7 +1858,7 @@ fn verify_persisted_snapshot(
                             .map_err(|_| rusqlite::Error::InvalidQuery)?,
                     })
                 })?
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, rusqlite::Error>>()?;
             if selections
                 != snapshot
                     .mapping
@@ -1465,6 +1910,8 @@ fn verify_all_persisted_rows(
             ))
         })?
         .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    let mut expected_selections_by_revision: BTreeMap<i64, Vec<PermissionPolicySelection>> =
+        BTreeMap::new();
     for (daemon_id, instance_id, revision, digest_text, bytes) in mapping_rows {
         if daemon_id != authority_identity.daemon_installation_id
             || instance_id != authority_identity.instance_id
@@ -1491,6 +1938,13 @@ fn verify_all_persisted_rows(
                 "historical mapping canonical bytes".into(),
             ));
         }
+        expected_selections_by_revision.insert(
+            revision,
+            mapping
+                .canonical_config
+                .permission_policy_selections
+                .clone(),
+        );
     }
 
     let origin_bytes: Vec<Vec<u8>> = connection
@@ -1498,7 +1952,8 @@ fn verify_all_persisted_rows(
         .query_map([], |row| row.get(0))?
         .collect::<Result<Vec<_>, rusqlite::Error>>()?;
     for bytes in origin_bytes {
-        let origin: InstalledComponentOrigin = decode_record(&bytes, "historical installed origin")?;
+        let origin: InstalledComponentOrigin =
+            decode_record(&bytes, "historical installed origin")?;
         validate_origin(&origin)?;
         verify_origin_row(connection, &origin)?;
     }
@@ -1535,6 +1990,101 @@ fn verify_all_persisted_rows(
         validate_candidate(&candidate)?;
         verify_candidate_row(connection, &candidate)?;
     }
+    let mut selection_rows_by_revision: BTreeMap<i64, Vec<PermissionPolicySelection>> =
+        BTreeMap::new();
+    let selection_rows: Vec<(i64, PermissionPolicySelection)> = connection
+        .prepare(
+            "SELECT config_revision, policy_id, policy_revision,
+                    policy_definition_digest, binding_id, binding_revision, binding_digest
+             FROM module_activation_premise_policy_selections
+             ORDER BY config_revision, policy_id, policy_revision",
+        )?
+        .query_map([], |row| {
+            let policy_definition_digest: String = row.get(3)?;
+            let binding_digest: String = row.get(6)?;
+            Ok((
+                row.get(0)?,
+                PermissionPolicySelection {
+                    policy_id: row.get(1)?,
+                    policy_revision: row.get(2)?,
+                    policy_definition_digest: policy_definition_digest
+                        .parse::<Sha256Digest>()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    binding_id: row.get(4)?,
+                    binding_revision: row.get(5)?,
+                    binding_digest: binding_digest
+                        .parse::<Sha256Digest>()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                },
+            ))
+        })?
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    for (revision, selection) in selection_rows {
+        validate_selection(&selection)?;
+        let Some(expected) = expected_selections_by_revision.get(&revision) else {
+            return Err(HostAuthorityError::InvalidPremise(
+                "policy selection references a missing mapping".into(),
+            ));
+        };
+        if !expected.contains(&selection) {
+            return Err(HostAuthorityError::DigestMismatch(
+                "historical policy selection differs from canonical config".into(),
+            ));
+        }
+        let premise_bytes: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT record_jcs FROM module_activation_premises WHERE config_revision = ?1",
+                [revision],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(premise_bytes) = premise_bytes else {
+            return Err(HostAuthorityError::InvalidPremise(
+                "policy selection references a missing premise".into(),
+            ));
+        };
+        let premise: ModuleActivationPremises =
+            decode_record(&premise_bytes, "historical selection premise")?;
+        validate_premise(&premise)?;
+        let Some(definition) = premise.permission_policy_definitions.iter().find(|value| {
+            value.policy_id == selection.policy_id
+                && value.policy_revision == selection.policy_revision
+        }) else {
+            return Err(HostAuthorityError::InvalidPremise(
+                "policy selection references a missing definition".into(),
+            ));
+        };
+        if definition.definition_digest != selection.policy_definition_digest {
+            return Err(HostAuthorityError::DigestMismatch(
+                "policy selection definition digest".into(),
+            ));
+        }
+        let Some(binding) = premise
+            .permission_policy_backend_bindings
+            .iter()
+            .find(|value| {
+                value.binding_id == selection.binding_id
+                    && value.binding_revision == selection.binding_revision
+            })
+        else {
+            return Err(HostAuthorityError::InvalidPremise(
+                "policy selection references a missing binding".into(),
+            ));
+        };
+        if binding.binding_digest != selection.binding_digest
+            || binding.policy_id != selection.policy_id
+            || binding.policy_revision != selection.policy_revision
+            || binding.policy_definition_digest != selection.policy_definition_digest
+        {
+            return Err(HostAuthorityError::DigestMismatch(
+                "policy selection binding projection".into(),
+            ));
+        }
+        selection_rows_by_revision
+            .entry(revision)
+            .or_default()
+            .push(selection);
+    }
 
     let premise_rows: Vec<(i64, String, Vec<u8>)> = connection
         .prepare(
@@ -1544,7 +2094,8 @@ fn verify_all_persisted_rows(
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<Vec<_>, rusqlite::Error>>()?;
     for (revision, digest_text, bytes) in premise_rows {
-        let premise: ModuleActivationPremises = decode_record(&bytes, "historical activation premise")?;
+        let premise: ModuleActivationPremises =
+            decode_record(&bytes, "historical activation premise")?;
         validate_premise(&premise)?;
         if premise.config_revision != revision
             || premise.config_digest.to_string() != digest_text
@@ -1587,6 +2138,24 @@ fn verify_all_persisted_rows(
                 "historical activation premise indexed projection".into(),
             ));
         }
+        let Some(expected) = expected_selections_by_revision.get(&revision) else {
+            return Err(HostAuthorityError::InvalidPremise(
+                "historical premise references a missing mapping".into(),
+            ));
+        };
+        let actual = selection_rows_by_revision
+            .remove(&revision)
+            .unwrap_or_default();
+        if actual != *expected {
+            return Err(HostAuthorityError::InvalidPremise(
+                "historical policy-selection projection differs from canonical config".into(),
+            ));
+        }
+    }
+    if !selection_rows_by_revision.is_empty() {
+        return Err(HostAuthorityError::InvalidPremise(
+            "historical policy selection has no premise".into(),
+        ));
     }
     Ok(())
 }

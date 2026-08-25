@@ -977,7 +977,10 @@ fn read_legacy_authority(
     Ok(Some((identity, snapshot)))
 }
 
-fn table_columns(connection: &Connection, table: &str) -> StorageResult<std::collections::BTreeSet<String>> {
+fn table_columns(
+    connection: &Connection,
+    table: &str,
+) -> StorageResult<std::collections::BTreeSet<String>> {
     let mut columns = std::collections::BTreeSet::new();
     let mut statement = connection
         .prepare(&format!("PRAGMA table_info({table})"))
@@ -1000,15 +1003,16 @@ fn validate_legacy_mapping_identity_shape(connection: &Connection) -> StorageRes
         .prepare("PRAGMA table_info(config_revision_mappings)")
         .map_err(|_| StorageError::MigrationRequired)?;
     let rows = statement
-        .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+        })
         .map_err(|_| StorageError::MigrationRequired)?;
     let mut not_null = std::collections::BTreeMap::new();
     for row in rows {
         let (name, value) = row.map_err(|_| StorageError::MigrationRequired)?;
         not_null.insert(name, value);
     }
-    if not_null.get("daemon_installation_id") != Some(&1)
-        || not_null.get("instance_id") != Some(&1)
+    if not_null.get("daemon_installation_id") != Some(&1) || not_null.get("instance_id") != Some(&1)
     {
         return Err(StorageError::MigrationRequired);
     }
@@ -1116,7 +1120,9 @@ fn read_controller_generation(connection: &Connection) -> StorageResult<Option<S
         .optional()
         .map_err(map_sqlite_error)
         .and_then(|generation: Option<Option<String>>| match generation {
-            Some(Some(generation)) if crate::host_authority::is_uuid_v7(&generation) => Ok(Some(generation)),
+            Some(Some(generation)) if crate::host_authority::is_uuid_v7(&generation) => {
+                Ok(Some(generation))
+            }
             Some(None) => Ok(None),
             None => Err(StorageError::Corrupt),
             Some(Some(_)) => Err(StorageError::Corrupt),
@@ -1718,25 +1724,54 @@ fn bridge_typescript_v1_schema_in_transaction(
         return Err(StorageError::MigrationRequired);
     }
 
-    for (column, sql_type) in [
-        ("schema_version", "INTEGER"),
-        ("clean_shutdown", "INTEGER"),
-        ("sqlite_version_number", "INTEGER"),
-        ("sqlite_source_id", "TEXT"),
-        ("sqlite_artifact_digest", "TEXT"),
-        ("controller_generation_id", "TEXT"),
-    ] {
-        if !core_columns.contains(column) {
-            tx.execute(
-                &format!("ALTER TABLE core_meta ADD COLUMN {column} {sql_type}"),
-                [],
-            )
-            .map_err(map_sqlite_error)?;
-        }
+    let (authority_version, daemon_installation_id, instance_id): (i64, String, String) = tx
+        .query_row(
+            "SELECT authority_schema_version, daemon_installation_id, instance_id
+             FROM core_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(map_sqlite_error)?;
+    if authority_version != 1 || daemon_installation_id.is_empty() || instance_id.is_empty() {
+        return Err(StorageError::MigrationRequired);
     }
+    tx.execute_batch(
+        "CREATE TABLE core_meta__dolly_rust_v1 (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            schema_version INTEGER NOT NULL,
+            daemon_installation_id TEXT,
+            instance_id TEXT,
+            controller_generation_id TEXT,
+            clean_shutdown INTEGER NOT NULL CHECK (clean_shutdown IN (0, 1)),
+            sqlite_version_number INTEGER NOT NULL,
+            sqlite_source_id TEXT NOT NULL,
+            sqlite_artifact_digest TEXT NOT NULL
+         );",
+    )
+    .map_err(map_sqlite_error)?;
+    tx.execute(
+        "INSERT INTO core_meta__dolly_rust_v1 (
+            singleton, schema_version, daemon_installation_id, instance_id,
+            controller_generation_id, clean_shutdown, sqlite_version_number,
+            sqlite_source_id, sqlite_artifact_digest
+         ) VALUES (1, 1, ?1, ?2, NULL, 0, ?3, ?4, ?5)",
+        rusqlite::params![
+            daemon_installation_id,
+            instance_id,
+            verified.version_number as i64,
+            &verified.source_id,
+            verified.artifact_digest.to_string(),
+        ],
+    )
+    .map_err(map_sqlite_error)?;
+    tx.execute_batch(
+        "DROP TABLE core_meta;
+         ALTER TABLE core_meta__dolly_rust_v1 RENAME TO core_meta;",
+    )
+    .map_err(map_sqlite_error)?;
     tx.execute(
         "UPDATE core_meta
-         SET schema_version = authority_schema_version,
+         SET schema_version = 1,
              clean_shutdown = 0,
              sqlite_version_number = ?1,
              sqlite_source_id = ?2,
@@ -1756,16 +1791,16 @@ fn bridge_typescript_v1_schema_in_transaction(
         .prepare("PRAGMA table_info(config_revision_mappings)")
         .map_err(map_sqlite_error)?;
     let mapping_rows = mapping_info
-        .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+        })
         .map_err(map_sqlite_error)?;
     for row in mapping_rows {
         let (name, not_null) = row.map_err(map_sqlite_error)?;
         mapping_identity_not_null.insert(name, not_null);
     }
     for column in ["daemon_installation_id", "instance_id"] {
-        if !mapping_columns.contains(column)
-            || mapping_identity_not_null.get(column) != Some(&1)
-        {
+        if !mapping_columns.contains(column) || mapping_identity_not_null.get(column) != Some(&1) {
             // ALTER TABLE ADD COLUMN would create a nullable v2 identity
             // projection. Require an offline table rebuild instead.
             return Err(StorageError::MigrationRequired);
@@ -1815,7 +1850,6 @@ fn bridge_typescript_v1_schema_in_transaction(
     .map_err(map_sqlite_error)?;
     Ok(())
 }
-
 
 /// Validate the pre-generation physical schema without writing it. This is
 /// used only by the explicit offline v1 authority migration; ordinary opens
@@ -1891,9 +1925,7 @@ fn validate_legacy_schema(
     } else {
         None
     };
-    if (!ts_v1_bridge && host_version != Some(1))
-        || (ts_v1_bridge && host_version.is_some())
-    {
+    if (!ts_v1_bridge && host_version != Some(1)) || (ts_v1_bridge && host_version.is_some()) {
         return Err(StorageError::MigrationRequired);
     }
     for table in [
@@ -2026,12 +2058,16 @@ fn verify_core_physical_schema(connection: &Connection) -> StorageResult<()> {
         let mut actual_columns = actual;
         actual_columns.sort_by(|left, right| left.0.cmp(&right.0));
         if actual_columns.len() != expected_columns.len()
-            || actual_columns.iter().zip(expected_columns).any(|(actual, expected)| {
-                actual.0 != expected.0
-                    || actual.1.to_ascii_uppercase() != expected.1
-                    || actual.2 != expected.2
-                    || actual.3 != expected.3
-            }) {
+            || actual_columns
+                .iter()
+                .zip(expected_columns)
+                .any(|(actual, expected)| {
+                    actual.0 != expected.0
+                        || actual.1.to_ascii_uppercase() != expected.1
+                        || actual.2 != expected.2
+                        || actual.3 != expected.3
+                })
+        {
             return Err(StorageError::Corrupt);
         }
         let sql: String = connection
@@ -2041,7 +2077,11 @@ fn verify_core_physical_schema(connection: &Connection) -> StorageResult<()> {
                 |row| row.get(0),
             )
             .map_err(|_| StorageError::Corrupt)?;
-        let normalized = sql.to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized = sql
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         if checks.iter().any(|check| !normalized.contains(check)) {
             return Err(StorageError::Corrupt);
         }
@@ -2207,6 +2247,7 @@ fn validate_authority_state(
     if host_schema_version != Some(crate::host_authority::HOST_AUTHORITY_SCHEMA_VERSION) {
         return Err(StorageError::Corrupt);
     }
+    crate::host_authority::verify_authority_schema(connection).map_err(map_host_authority_error)?;
 
     let core_meta: Option<(Option<String>, Option<String>, Option<String>)> = connection
         .query_row(

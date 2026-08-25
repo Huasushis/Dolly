@@ -609,7 +609,53 @@ describe("TST-AUTH-007: physical Host v2 bridge and canonical-byte gates", () =>
       "STORAGE_CORRUPT",
     );
   });
+  it("fails closed on hostile v2 triggers, non-normative indexes, and foreign-key violations", () => {
+    for (const [name, tamper] of [
+      ["trigger", (database: Database.Database) => database.exec(
+        "CREATE TRIGGER hostile_authority AFTER INSERT ON config_revision_mappings BEGIN SELECT 1; END",
+      )],
+      ["index", (database: Database.Database) => database.exec(
+        "CREATE INDEX hostile_authority_index ON config_revision_mappings(config_digest)",
+      )],
+      ["foreign-key", (database: Database.Database) => {
+        database.pragma("foreign_keys = OFF");
+        database.prepare(
+          "INSERT INTO module_activation_premise_policy_selections (config_revision, policy_id, policy_revision, policy_definition_digest, binding_id, binding_revision, binding_digest) VALUES (999, 'org.dolly.policy.missing', 1, ?, 'org.dolly.binding.missing', 1, ?)",
+        ).run(`sha256:${"1".repeat(64)}`, `sha256:${"2".repeat(64)}`);
+      }],
+    ] as const) {
+      const dir = scratch();
+      const path = join(dir, `${name}.sqlite3`);
+      const db = openDatabase(dir, `${name}.sqlite3`);
+      install(db, candidate(1, name, false));
+      db.close();
+      const inspect = raw(path);
+      tamper(inspect);
+      inspect.close();
+      expectAuthorityError(
+        () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+        "STORAGE_CORRUPT",
+      );
+    }
+  });
 
+  it("verifies unused historical selection rows against their premise projections", () => {
+    const dir = scratch();
+    const path = join(dir, "historical-selection.sqlite3");
+    const db = openDatabase(dir, "historical-selection.sqlite3");
+    install(db, candidate(1, "A", true));
+    install(db, candidate(2, "B", true));
+    db.close();
+    const inspect = raw(path);
+    inspect.prepare(
+      "UPDATE module_activation_premise_policy_selections SET binding_digest = ? WHERE config_revision = 1",
+    ).run(`sha256:${"3".repeat(64)}`);
+    inspect.close();
+    expectAuthorityError(
+      () => RuntimeAuthorityDatabase.open({ path, identity, lock: new FakeLock() }),
+      "STORAGE_CORRUPT",
+    );
+  });
   it("loads the explicit validator-parity rejection vector", () => {
     const vector = JSON.parse(readFileSync(
       join(import.meta.dirname, "../../../dolly-spec/test-vectors/core/TST-AUTH-008-validator-parity.json"),
@@ -617,6 +663,104 @@ describe("TST-AUTH-007: physical Host v2 bridge and canonical-byte gates", () =>
     )) as { stimulus: { rejection_cases: readonly { name: string }[] } };
     expect(vector.stimulus.rejection_cases).toHaveLength(16);
     expect(new Set(vector.stimulus.rejection_cases.map((entry) => entry.name)).size).toBe(16);
+  });
+  it("executes every TST-AUTH-008 rejection stimulus", () => {
+    const vector = JSON.parse(readFileSync(
+      join(import.meta.dirname, "../../../dolly-spec/test-vectors/core/TST-AUTH-008-validator-parity.json"),
+      "utf8",
+    )) as { stimulus: { rejection_cases: readonly { name: string; value?: string; length?: number; field?: string; order?: string; property_count?: number }[] } };
+    const names = new Set(vector.stimulus.rejection_cases.map((entry) => entry.name));
+    expect(names.size).toBe(16);
+
+    const twoPolicyFixture = (field: "definitions" | "bindings" | "selections"): CandidateFixture => {
+      const first = definitionRecordFor("a-policy");
+      const second = definitionRecordFor("b-policy");
+      const firstBinding = bindingRecordFor(first, undefined, "a-binding");
+      const secondBinding = bindingRecordFor(second, undefined, "b-binding");
+      const selections = [
+        selectionOf(first, firstBinding),
+        selectionOf(second, secondBinding),
+      ];
+      const definitions = [first, second];
+      const bindings = [firstBinding, secondBinding];
+      if (field === "definitions") definitions.reverse();
+      if (field === "bindings") bindings.reverse();
+      if (field === "selections") selections.reverse();
+      const resolved = {
+        runtime_config: { value: "vector" },
+        permission_policy_selections: selections,
+        service_candidate: { ...candidateRecordFor() },
+      };
+      const bytes = Buffer.from(canonicalBytes(resolved));
+      const digest = digestOfBytes(bytes);
+      const premiseRecord: Record<string, unknown> = {
+        schema: "dolly.module-activation-premises/v1",
+        daemon_installation_id: identity.daemonInstallationId,
+        instance_id: identity.instanceId,
+        config_revision: 1,
+        config_digest: digest,
+        permission_policy_definitions: definitions,
+        permission_policy_backend_bindings: bindings,
+        service_candidate: { ...candidateRecordFor() },
+        premises_digest: "",
+      };
+      premiseRecord.premises_digest = selfDigest(premiseRecord, "premises_digest");
+      return { bytes, digest, premise: premiseRecord as unknown as ModuleActivationPremises };
+    };
+
+    for (const rejection of vector.stimulus.rejection_cases) {
+      const run = (): void => {
+        if (rejection.name === "uppercase_uuid_v7" || rejection.name === "digit_first_stable_id" || rejection.name === "uppercase_stable_id" || rejection.name === "oversized_stable_id") {
+          const badIdentity = rejection.name === "uppercase_uuid_v7"
+            ? { daemonInstallationId: rejection.value!, instanceId: identity.instanceId }
+            : {
+                daemonInstallationId: identity.daemonInstallationId,
+                instanceId: rejection.name === "oversized_stable_id" ? "a".repeat(rejection.length!) : rejection.value!,
+              };
+          expect(() => RuntimeAuthorityDatabase.open({
+            path: join(scratch(), `${rejection.name}.sqlite3`),
+            identity: badIdentity,
+            lock: new FakeLock(),
+          })).toThrow(RuntimeAuthorityDatabaseError);
+          return;
+        }
+        const dir = scratch();
+        const db = openDatabase(dir, `${rejection.name}.sqlite3`);
+        let fixture: CandidateFixture;
+        if (rejection.name === "digit_first_qualified_name" || rejection.name === "uppercase_qualified_name" || rejection.name === "oversized_qualified_name") {
+          const origin = { ...serviceOrigin(), component_id: rejection.name === "oversized_qualified_name" ? "a".repeat(rejection.length!) : rejection.value! };
+          fixture = candidate(1, rejection.name, true, { candidateOverride: candidateRecordFor(origin) });
+        } else if (rejection.name === "short_unit_name" || rejection.name === "oversized_unit_name") {
+          const service = candidateRecordFor() as unknown as Record<string, unknown>;
+          service.unit_name = rejection.name === "oversized_unit_name" ? `${"a".repeat(rejection.length! - 8)}.service` : rejection.value!;
+          service.candidate_digest = selfDigest(service, "candidate_digest");
+          fixture = candidate(1, rejection.name, true, { candidateOverride: service as unknown as LinuxServiceCandidate });
+        } else if (rejection.name === "invalid_uri_reference_escape" || rejection.name === "definition_array" || rejection.name === "definition_max_properties") {
+          const definition = definitionRecordFor();
+          const malformed = { ...definition } as unknown as Record<string, unknown>;
+          if (rejection.name === "invalid_uri_reference_escape") malformed.definition_schema_uri = rejection.value;
+          if (rejection.name === "definition_array") malformed.definition = [];
+          if (rejection.name === "definition_max_properties") malformed.definition = Object.fromEntries(
+            Array.from({ length: rejection.property_count! }, (_, index) => [`property${index}`, true]),
+          );
+          fixture = candidate(1, rejection.name, true, { definitions: [malformed as unknown as PermissionPolicyDefinition] });
+        } else if (rejection.name === "unsorted_policy_definitions") {
+          fixture = twoPolicyFixture("definitions");
+        } else if (rejection.name === "unsorted_policy_bindings") {
+          fixture = twoPolicyFixture("bindings");
+        } else if (rejection.name === "unsorted_policy_selections") {
+          fixture = twoPolicyFixture("selections");
+        } else if (rejection.name === "oversized_canonical_record") {
+          const bytes = Buffer.alloc(rejection.length!);
+          fixture = { bytes, digest: digestOfBytes(bytes), premise: null };
+        } else {
+          throw new Error(`unhandled validator vector ${rejection.name}`);
+        }
+        expect(() => install(db, fixture)).toThrow(RuntimeAuthorityDatabaseError);
+        db.close();
+      };
+      expect(run).not.toThrow();
+    }
   });
   it("rejects uppercase and oversized authority identities", () => {
     expectAuthorityError(
