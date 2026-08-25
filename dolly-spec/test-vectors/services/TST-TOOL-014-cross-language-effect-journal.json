@@ -115,13 +115,15 @@
           "redispatch": "forbidden",
           "applied_premise": {
             "premise": "exact-authoritative-tool-call-ledger",
+            "ledger_schema": "dolly.tool-call-ledger/v1",
+            "ledger_record_validator": "tool-call-ledger-record.schema.json",
             "identity_match": [
-              "instance_id",
-              "module_id",
-              "operation_id",
-              "operation_digest",
-              "package_digest",
-              "intent_digest==outbound_digest"
+              "claim.operation_id == ledger.operation_binding.idempotency_key",
+              "claim.instance_id == ledger.operation_binding.instance_id",
+              "claim.module_id == ledger.operation_binding.module_id",
+              "claim.operation_digest == ledger.operation_digest",
+              "claim.intent_digest == ledger.outbound_digest",
+              "ledger.state == SUCCEEDED"
             ],
             "terminal_state": "SUCCEEDED",
             "evidence_rule": "ledger.terminal_result_digest"
@@ -290,7 +292,7 @@
       "moduleGenerationId": "module-generation-1",
       "state": "closed",
       "intentCount": 5,
-      "intentSetDigest": "sha256:a8541a430b37d6c3cbf0f02ee37eae5738f3ffe5290db8b9ed1bae3baf2cc55a",
+      "intentSetDigest": "sha256:dbb469e5d9db527971f85602b482d39e95676f424f9be3602b449034a587fcca",
       "createdAt": "2026-08-24T00:00:00.000Z",
       "updatedAt": "2026-08-24T00:00:02.000Z"
     },
@@ -425,10 +427,10 @@
           "idempotencyKey": "job-1:effect-terminal-no-premise",
           "capabilityType": "mcp",
           "operation": "tools/call",
-          "intentDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "intentDigest": "sha256:88303d6cb43129854024d8c49628070a662e740b8c5ea5c887bbc298f41d3139",
           "outcome": {
             "kind": "terminal",
-            "resultDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            "resultDigest": "sha256:594db355d57f76d136869be1bb017e4940910067a33156f9484199db82e65a62"
           },
           "createdAt": "2026-08-24T00:00:00.000Z",
           "updatedAt": "2026-08-24T00:00:01.000Z"
@@ -440,8 +442,8 @@
             "instance_id": "instance-1",
             "module_id": "module-1",
             "operation_id": "job-1:effect-terminal-no-premise",
-            "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-            "claim_token": "sha256:130041d58915475a2af31602d7d2e3ab9a811b858c0dacc20eb119a4d2b388cf"
+            "operation_digest": "sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b",
+            "claim_token": "sha256:5d6f6b4eaa0f61f8095d50c40590e879dd00938578092e6c172e56e36623a131"
           },
           "record": {
             "schema": "dolly.external-effect-journal/v2",
@@ -452,25 +454,25 @@
               "instance_id": "instance-1",
               "module_id": "module-1",
               "operation_id": "job-1:effect-terminal-no-premise",
-              "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-              "claim_token": "sha256:130041d58915475a2af31602d7d2e3ab9a811b858c0dacc20eb119a4d2b388cf"
+              "operation_digest": "sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b",
+              "claim_token": "sha256:5d6f6b4eaa0f61f8095d50c40590e879dd00938578092e6c172e56e36623a131"
             },
             "controller_generation": 7,
             "extension_generation": 11,
             "worker_epoch": "worker-epoch-1",
             "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "policy_premise_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "operation_digest": "sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b",
             "effect_class": "MCP_TOOLS_CALL",
-            "intent_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "intent_digest": "sha256:88303d6cb43129854024d8c49628070a662e740b8c5ea5c887bbc298f41d3139",
             "evidence_digest": null
           }
         },
         "canonical": {
-          "claim_utf8": "{\"claim_token\":\"sha256:130041d58915475a2af31602d7d2e3ab9a811b858c0dacc20eb119a4d2b388cf\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"operation_id\":\"job-1:effect-terminal-no-premise\",\"schema\":\"dolly.claim/v2\"}",
-          "claim_digest": "sha256:d5fa97fa639b62990bd2a0ef2f14dd90564cb0e646ef7bdf754a4ea95c5e7d9b",
-          "record_utf8": "{\"claim\":{\"claim_token\":\"sha256:130041d58915475a2af31602d7d2e3ab9a811b858c0dacc20eb119a4d2b388cf\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"operation_id\":\"job-1:effect-terminal-no-premise\",\"schema\":\"dolly.claim/v2\"},\"controller_generation\":7,\"effect_class\":\"MCP_TOOLS_CALL\",\"evidence_digest\":null,\"extension_generation\":11,\"intent_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"journal_revision\":2,\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"package_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_premise_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema\":\"dolly.external-effect-journal/v2\",\"state\":\"UNKNOWN_OUTCOME\",\"worker_epoch\":\"worker-epoch-1\"}",
-          "record_digest": "sha256:82896fe696217edde0a13bb18186e0e4f41615fd1adde9193193273e2bd79b98",
+          "claim_utf8": "{\"claim_token\":\"sha256:5d6f6b4eaa0f61f8095d50c40590e879dd00938578092e6c172e56e36623a131\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b\",\"operation_id\":\"job-1:effect-terminal-no-premise\",\"schema\":\"dolly.claim/v2\"}",
+          "claim_digest": "sha256:4ac7bb0adfc0332f6d964003c5651584fda4d50c6e6e21d3ba8d7a2e4bc82739",
+          "record_utf8": "{\"claim\":{\"claim_token\":\"sha256:5d6f6b4eaa0f61f8095d50c40590e879dd00938578092e6c172e56e36623a131\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b\",\"operation_id\":\"job-1:effect-terminal-no-premise\",\"schema\":\"dolly.claim/v2\"},\"controller_generation\":7,\"effect_class\":\"MCP_TOOLS_CALL\",\"evidence_digest\":null,\"extension_generation\":11,\"intent_digest\":\"sha256:88303d6cb43129854024d8c49628070a662e740b8c5ea5c887bbc298f41d3139\",\"journal_revision\":2,\"operation_digest\":\"sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b\",\"package_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_premise_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema\":\"dolly.external-effect-journal/v2\",\"state\":\"UNKNOWN_OUTCOME\",\"worker_epoch\":\"worker-epoch-1\"}",
+          "record_digest": "sha256:55cacebfdcb09b160f05c4319b88f865defbf24561a8c7b139a1d25d7f25656a",
           "evidence_digest": null
         },
         "expected_state": "UNKNOWN_OUTCOME"
@@ -486,28 +488,157 @@
           "idempotencyKey": "job-1:effect-terminal-premise",
           "capabilityType": "mcp",
           "operation": "tools/call",
-          "intentDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "intentDigest": "sha256:88303d6cb43129854024d8c49628070a662e740b8c5ea5c887bbc298f41d3139",
           "outcome": {
             "kind": "terminal",
-            "resultDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            "resultDigest": "sha256:594db355d57f76d136869be1bb017e4940910067a33156f9484199db82e65a62"
           },
           "createdAt": "2026-08-24T00:00:00.000Z",
           "updatedAt": "2026-08-24T00:00:01.000Z"
         },
         "ledger_premise": {
           "schema": "dolly.tool-call-ledger/v1",
-          "kind": "exact-authoritative",
-          "identity_match": [
-            "instance_id",
-            "module_id",
-            "operation_id",
-            "operation_digest",
-            "package_digest",
-            "intent_digest==outbound_digest"
-          ],
-          "terminal_state": "SUCCEEDED",
-          "evidence_digest_source": "ledger.terminal_result_digest",
-          "evidence_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          "record": {
+            "schema": "dolly.tool-call-ledger/v1",
+            "ledger_revision": 3,
+            "state": "SUCCEEDED",
+            "operation_binding": {
+              "schema": "dolly.tool-operation-binding/v1",
+              "instance_id": "instance-1",
+              "module_id": "module-1",
+              "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000501",
+              "tool_transaction_id": "0198ab31-6c44-7e8a-b2bb-000000000502",
+              "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000503",
+              "activation_lease_generation": 1,
+              "config_revision": 1,
+              "tool_server_id": "local-files",
+              "tool_name": "send",
+              "tool_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "arguments": {
+                "name": "send",
+                "arguments": {
+                  "body": "hello"
+                }
+              },
+              "side_effect_class": "idempotent_write",
+              "idempotency": {
+                "kind": "argument_key",
+                "argument_pointer": "/arguments/body"
+              },
+              "idempotency_key": "job-1:effect-terminal-premise",
+              "authorized_deadline": "2026-08-21T01:02:03.000000Z",
+              "request_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+              "tool_server_generation": 7,
+              "server_request_id": "0198ab31-6c44-7e8a-b2bb-000000000504",
+              "server_contract": {
+                "enabled": true,
+                "adapter": "mcp",
+                "protocol_version": "2025-06-18",
+                "transport": {
+                  "kind": "stdio",
+                  "package_id": "org.dolly.tools.files",
+                  "package_version": "1.0.0",
+                  "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "executable": "bin/dolly-file-tools",
+                  "executable_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "args": [
+                    "--stdio"
+                  ],
+                  "secret_bindings": {}
+                },
+                "allowed_modules": [
+                  "main-brain"
+                ],
+                "limits": {
+                  "startup_timeout_ms": 10000,
+                  "request_timeout_ms": 30000,
+                  "max_concurrency": 4,
+                  "max_request_bytes": 1048576,
+                  "max_response_bytes": 4194304
+                },
+                "tools": {
+                  "read-file": {
+                    "upstream_name": "read_file",
+                    "description": "Read one policy-authorized text file.",
+                    "input_schema": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "path"
+                      ],
+                      "properties": {
+                        "path": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 4096
+                        }
+                      }
+                    },
+                    "input_schema_digest": "sha256:cc312e640fbf1a761a84f981be0997e94b5e0a5c13a54808048852bc42fb9368",
+                    "output_schema": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "text"
+                      ],
+                      "properties": {
+                        "text": {
+                          "type": "string",
+                          "maxLength": 1048576
+                        }
+                      }
+                    },
+                    "output_schema_digest": "sha256:f90646d61a7a2375f63be072d059dc207b571b46a00d14aef909c094bf1ef6bb",
+                    "side_effect_class": "read_only",
+                    "idempotency": {
+                      "kind": "none"
+                    },
+                    "requires_confirmation": false,
+                    "enabled": true
+                  }
+                }
+              },
+              "confirmation_decision": "not_required"
+            },
+            "operation_digest": "sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b",
+            "outbound_digest": "sha256:88303d6cb43129854024d8c49628070a662e740b8c5ea5c887bbc298f41d3139",
+            "terminal_result": {
+              "operation_id": "0198ab31-6c44-7e8a-b2bb-000000000501",
+              "status": "succeeded",
+              "output": {
+                "text": "sent"
+              },
+              "error": null,
+              "server_request_id": "0198ab31-6c44-7e8a-b2bb-000000000504"
+            },
+            "terminal_result_digest": "sha256:594db355d57f76d136869be1bb017e4940910067a33156f9484199db82e65a62"
+          },
+          "premise_match": {
+            "claim_operation_id": "job-1:effect-terminal-premise",
+            "ledger_idempotency_key": "job-1:effect-terminal-premise",
+            "claim_instance_id": "instance-1",
+            "ledger_instance_id": "instance-1",
+            "claim_module_id": "module-1",
+            "ledger_module_id": "module-1",
+            "claim_operation_digest": "sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b",
+            "ledger_operation_digest": "sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b",
+            "claim_intent_digest": "sha256:88303d6cb43129854024d8c49628070a662e740b8c5ea5c887bbc298f41d3139",
+            "ledger_outbound_digest": "sha256:88303d6cb43129854024d8c49628070a662e740b8c5ea5c887bbc298f41d3139",
+            "controller_generation": 7,
+            "ledger_activation_lease_generation": 1,
+            "evidence_digest": "sha256:594db355d57f76d136869be1bb017e4940910067a33156f9484199db82e65a62",
+            "ledger_terminal_result_digest": "sha256:594db355d57f76d136869be1bb017e4940910067a33156f9484199db82e65a62",
+            "equalities": [
+              "claim.operation_id == ledger.operation_binding.idempotency_key",
+              "claim.instance_id == ledger.operation_binding.instance_id",
+              "claim.module_id == ledger.operation_binding.module_id",
+              "claim.operation_digest == ledger.operation_digest",
+              "claim.intent_digest == ledger.outbound_digest",
+              "ledger.state == SUCCEEDED",
+              "claim.evidence_digest == ledger.terminal_result_digest"
+            ]
+          },
+          "validated_against": "tool-call-ledger-record.schema.json"
         },
         "target": {
           "claim": {
@@ -515,8 +646,8 @@
             "instance_id": "instance-1",
             "module_id": "module-1",
             "operation_id": "job-1:effect-terminal-premise",
-            "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-            "claim_token": "sha256:62c9cba90dab7e7c98b5acd78cecc55e12bb80f7055153336e89db61be153c6e"
+            "operation_digest": "sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b",
+            "claim_token": "sha256:d3f014214075e03902760dba4326e15ed5a7eedaac7560cb4138fddd538469fc"
           },
           "record": {
             "schema": "dolly.external-effect-journal/v2",
@@ -527,26 +658,26 @@
               "instance_id": "instance-1",
               "module_id": "module-1",
               "operation_id": "job-1:effect-terminal-premise",
-              "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-              "claim_token": "sha256:62c9cba90dab7e7c98b5acd78cecc55e12bb80f7055153336e89db61be153c6e"
+              "operation_digest": "sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b",
+              "claim_token": "sha256:d3f014214075e03902760dba4326e15ed5a7eedaac7560cb4138fddd538469fc"
             },
             "controller_generation": 7,
             "extension_generation": 11,
             "worker_epoch": "worker-epoch-1",
             "package_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "policy_premise_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "operation_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "operation_digest": "sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b",
             "effect_class": "MCP_TOOLS_CALL",
-            "intent_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-            "evidence_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            "intent_digest": "sha256:88303d6cb43129854024d8c49628070a662e740b8c5ea5c887bbc298f41d3139",
+            "evidence_digest": "sha256:594db355d57f76d136869be1bb017e4940910067a33156f9484199db82e65a62"
           }
         },
         "canonical": {
-          "claim_utf8": "{\"claim_token\":\"sha256:62c9cba90dab7e7c98b5acd78cecc55e12bb80f7055153336e89db61be153c6e\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"operation_id\":\"job-1:effect-terminal-premise\",\"schema\":\"dolly.claim/v2\"}",
-          "claim_digest": "sha256:fc5ac3948cd0954043456bf0fbb025128eb2a142c812cd27ccd1b5dc73043c6f",
-          "record_utf8": "{\"claim\":{\"claim_token\":\"sha256:62c9cba90dab7e7c98b5acd78cecc55e12bb80f7055153336e89db61be153c6e\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"operation_id\":\"job-1:effect-terminal-premise\",\"schema\":\"dolly.claim/v2\"},\"controller_generation\":7,\"effect_class\":\"MCP_TOOLS_CALL\",\"evidence_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"extension_generation\":11,\"intent_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"journal_revision\":2,\"operation_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"package_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_premise_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema\":\"dolly.external-effect-journal/v2\",\"state\":\"APPLIED\",\"worker_epoch\":\"worker-epoch-1\"}",
-          "record_digest": "sha256:a1712f4a1d14e41836d30d6682f27720987ca8c7b42d4e152f020c08aa7b32cf",
-          "evidence_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          "claim_utf8": "{\"claim_token\":\"sha256:d3f014214075e03902760dba4326e15ed5a7eedaac7560cb4138fddd538469fc\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b\",\"operation_id\":\"job-1:effect-terminal-premise\",\"schema\":\"dolly.claim/v2\"}",
+          "claim_digest": "sha256:806117b3d1d31d83852d209fdd15fb375d1981143a9cbdacee645c7c6bda92cf",
+          "record_utf8": "{\"claim\":{\"claim_token\":\"sha256:d3f014214075e03902760dba4326e15ed5a7eedaac7560cb4138fddd538469fc\",\"instance_id\":\"instance-1\",\"module_id\":\"module-1\",\"operation_digest\":\"sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b\",\"operation_id\":\"job-1:effect-terminal-premise\",\"schema\":\"dolly.claim/v2\"},\"controller_generation\":7,\"effect_class\":\"MCP_TOOLS_CALL\",\"evidence_digest\":\"sha256:594db355d57f76d136869be1bb017e4940910067a33156f9484199db82e65a62\",\"extension_generation\":11,\"intent_digest\":\"sha256:88303d6cb43129854024d8c49628070a662e740b8c5ea5c887bbc298f41d3139\",\"journal_revision\":2,\"operation_digest\":\"sha256:fd4c15c91ab18079605b0817dd4365f80a7520e288fb2d71bdc568889ec6e22b\",\"package_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policy_premise_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema\":\"dolly.external-effect-journal/v2\",\"state\":\"APPLIED\",\"worker_epoch\":\"worker-epoch-1\"}",
+          "record_digest": "sha256:cf938bf51c0c45082b9be58a9e272c95140c343a461c69ac98c0c777022d108a",
+          "evidence_digest": "sha256:594db355d57f76d136869be1bb017e4940910067a33156f9484199db82e65a62"
         },
         "expected_state": "APPLIED"
       },
@@ -659,7 +790,7 @@
     ]
   },
   "expected": {
-    "outcome": "terminal_outcome_requires_authoritative_ledger_premise_no_public_bridge",
+    "outcome": "terminal_outcome_requires_exact_authoritative_ledger_premise_no_public_bridge",
     "assertions": [
       {
         "path": "/cases",
@@ -692,19 +823,29 @@
         "value": "APPLIED"
       },
       {
-        "path": "/cases/3/ledger_premise/kind",
-        "op": "equals",
-        "value": "exact-authoritative"
-      },
-      {
-        "path": "/cases/3/ledger_premise/terminal_state",
+        "path": "/cases/3/ledger_premise/record/state",
         "op": "equals",
         "value": "SUCCEEDED"
       },
       {
+        "path": "/cases/3/ledger_premise/record/ledger_revision",
+        "op": "equals",
+        "value": 3
+      },
+      {
+        "path": "/cases/3/ledger_premise/premise_match/equalities",
+        "op": "count",
+        "value": 7
+      },
+      {
         "path": "/cases/3/target/record/evidence_digest",
         "op": "equals",
-        "value": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        "value": "sha256:594db355d57f76d136869be1bb017e4940910067a33156f9484199db82e65a62"
+      },
+      {
+        "path": "/cases/3/ledger_premise/record/terminal_result_digest",
+        "op": "equals",
+        "value": "sha256:594db355d57f76d136869be1bb017e4940910067a33156f9484199db82e65a62"
       },
       {
         "path": "/cases/4/target/record/state",

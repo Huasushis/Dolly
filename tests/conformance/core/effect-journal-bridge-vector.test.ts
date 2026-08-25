@@ -177,13 +177,15 @@ function assertContract(contract: RecordValue): void {
     redispatch: "forbidden",
     applied_premise: {
       premise: "exact-authoritative-tool-call-ledger",
+      ledger_schema: "dolly.tool-call-ledger/v1",
+      ledger_record_validator: "tool-call-ledger-record.schema.json",
       identity_match: [
-        "instance_id",
-        "module_id",
-        "operation_id",
-        "operation_digest",
-        "package_digest",
-        "intent_digest==outbound_digest",
+        "claim.operation_id == ledger.operation_binding.idempotency_key",
+        "claim.instance_id == ledger.operation_binding.instance_id",
+        "claim.module_id == ledger.operation_binding.module_id",
+        "claim.operation_digest == ledger.operation_digest",
+        "claim.intent_digest == ledger.outbound_digest",
+        "ledger.state == SUCCEEDED",
       ],
       terminal_state: "SUCCEEDED",
       evidence_rule: "ledger.terminal_result_digest",
@@ -279,7 +281,10 @@ describe("TST-TOOL-014 TypeScript side of the cross-language corpus", () => {
       expect(claim.claim_token).toBe(
         canonicalJsonDigest(claimTokenContext(claim, authority)),
       );
-      expect(record.intent_digest).toBe(record.operation_digest);
+      // The journal binds the Claim operation identity (operation_digest) and
+      // the dispatched payload (intent_digest) as separate digests; only the
+      // Claim's operation_digest must equal the record's operation_digest.
+      expect(claim.operation_digest).toBe(record.operation_digest);
       expect(record.evidence_digest).toBe(canonical.evidence_digest ?? null);
       expect(entry.expected_state).toBe(record.state);
       const parsed = parseStrictJsonText(canonical.record_utf8, {
@@ -300,15 +305,25 @@ describe("TST-TOOL-014 TypeScript side of the cross-language corpus", () => {
     expect(noPremise!.target.record.evidence_digest).toBeNull();
 
     const withPremise = cases.find(
-      (entry) => (entry.ledger_premise as RecordValue | undefined)?.kind === "exact-authoritative",
+      (entry) => (entry.ledger_premise as RecordValue | undefined)?.record?.schema === "dolly.tool-call-ledger/v1",
     );
     expect(withPremise).toBeDefined();
-    expect(withPremise!.ledger_premise.terminal_state).toBe("SUCCEEDED");
+    const ledgerRecord = withPremise!.ledger_premise.record as RecordValue;
+    expect(ledgerRecord.state).toBe("SUCCEEDED");
+    expect(ledgerRecord.ledger_revision).toBe(3);
     expect(withPremise!.expected_state).toBe("APPLIED");
     expect(withPremise!.target.record.state).toBe("APPLIED");
-    expect(withPremise!.target.record.evidence_digest).toBe(
-      withPremise!.ledger_premise.evidence_digest,
-    );
+    // Concrete Claim/generation/outbound/terminal-result equality with the
+    // exact authoritative ledger record. No response/ACK evidence is copied.
+    const binding = ledgerRecord.operation_binding as RecordValue;
+    const claim = withPremise!.target.claim as RecordValue;
+    const rec = withPremise!.target.record as RecordValue;
+    expect(claim.operation_id).toBe(binding.idempotency_key);
+    expect(claim.instance_id).toBe(binding.instance_id);
+    expect(claim.module_id).toBe(binding.module_id);
+    expect(claim.operation_digest).toBe(ledgerRecord.operation_digest);
+    expect(rec.intent_digest).toBe(ledgerRecord.outbound_digest);
+    expect(rec.evidence_digest).toBe(ledgerRecord.terminal_result_digest);
   });
 
   it("keeps Extension framing and MCP framing as separate dialects", async () => {

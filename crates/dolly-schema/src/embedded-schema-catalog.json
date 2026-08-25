@@ -4782,6 +4782,8 @@
               "additionalProperties": false,
               "required": [
                 "premise",
+                "ledger_schema",
+                "ledger_record_validator",
                 "identity_match",
                 "terminal_state",
                 "evidence_rule"
@@ -4790,9 +4792,15 @@
                 "premise": {
                   "const": "exact-authoritative-tool-call-ledger"
                 },
+                "ledger_schema": {
+                  "const": "dolly.tool-call-ledger/v1"
+                },
+                "ledger_record_validator": {
+                  "const": "tool-call-ledger-record.schema.json"
+                },
                 "identity_match": {
                   "type": "array",
-                  "minItems": 1,
+                  "minItems": 6,
                   "items": {
                     "type": "string",
                     "minLength": 1

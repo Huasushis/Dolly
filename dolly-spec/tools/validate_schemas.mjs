@@ -508,22 +508,43 @@ for (const [file, schemaId] of cases) {
     if (terminalContract.target_state !== "UNKNOWN_OUTCOME" ||
         terminalContract.evidence_rule !== "null" ||
         terminalContract.applied_premise?.premise !== "exact-authoritative-tool-call-ledger" ||
+        terminalContract.applied_premise?.ledger_schema !== "dolly.tool-call-ledger/v1" ||
+        terminalContract.applied_premise?.ledger_record_validator !== "tool-call-ledger-record.schema.json" ||
+        (terminalContract.applied_premise?.identity_match?.length ?? 0) < 6 ||
         terminalContract.applied_premise?.terminal_state !== "SUCCEEDED" ||
         terminalContract.applied_premise?.evidence_rule !== "ledger.terminal_result_digest") {
-      throw new Error(`${relative}: terminal outcome must settle UNKNOWN_OUTCOME without an authoritative Tool-call ledger premise and only APPLIED via that premise`);
+      throw new Error(`${relative}: terminal outcome must settle UNKNOWN_OUTCOME without an exact authoritative Tool-call ledger premise and only APPLIED via that premise`);
     }
     const noPremise = cases.find((entry) => entry.ledger_premise === "absent");
-    const withPremise = cases.find((entry) => entry.ledger_premise?.kind === "exact-authoritative");
     if (!noPremise || noPremise.expected_state !== "UNKNOWN_OUTCOME" ||
         noPremise.target.record.state !== "UNKNOWN_OUTCOME" ||
         noPremise.target.record.evidence_digest !== null) {
       throw new Error(`${relative}: terminal outcome without an authoritative ledger premise must settle UNKNOWN_OUTCOME with null evidence`);
     }
+    const withPremise = cases.find((entry) => entry.ledger_premise?.record?.schema === "dolly.tool-call-ledger/v1");
     if (!withPremise || withPremise.expected_state !== "APPLIED" ||
-        withPremise.target.record.state !== "APPLIED" ||
-        withPremise.target.record.evidence_digest !== withPremise.ledger_premise?.evidence_digest ||
-        withPremise.ledger_premise?.terminal_state !== "SUCCEEDED") {
-      throw new Error(`${relative}: terminal outcome may settle APPLIED only via an identity-matching SUCCEEDED Tool-call ledger premise`);
+        withPremise.target.record.state !== "APPLIED") {
+      throw new Error(`${relative}: terminal outcome may settle APPLIED only via an exact authoritative Tool-call ledger premise`);
+    }
+    const ledgerRecord = withPremise.ledger_premise.record;
+    assertValid(
+      `${relative}.initial.cases[3].ledger_premise.record`,
+      `${schemaBase}tool-call-ledger-record.schema.json`,
+      ledgerRecord,
+    );
+    if (ledgerRecord.state !== "SUCCEEDED" || ledgerRecord.ledger_revision !== 3) {
+      throw new Error(`${relative}: APPLIED premise ledger record must be a SUCCEEDED revision-3 Tool-call ledger record`);
+    }
+    const claim = withPremise.target.claim;
+    const record = withPremise.target.record;
+    const binding = ledgerRecord.operation_binding;
+    if (claim.operation_id !== binding.idempotency_key ||
+        claim.instance_id !== binding.instance_id ||
+        claim.module_id !== binding.module_id ||
+        claim.operation_digest !== ledgerRecord.operation_digest ||
+        record.intent_digest !== ledgerRecord.outbound_digest ||
+        record.evidence_digest !== ledgerRecord.terminal_result_digest) {
+      throw new Error(`${relative}: APPLIED premise must prove concrete Claim/generation/outbound/terminal-result equality with the ledger record`);
     }
     if (value.initial.contract.aggregate_evidence !==
         "never-map-evidenceForRun-directly-to-one-Rust-record; require-each-intent-outcome; terminal-outcome-without-authoritative-ledger-premise-settles-UNKNOWN_OUTCOME") {

@@ -116,8 +116,17 @@ fn validates_rust_records_and_exact_shared_jcs_bytes() {
     assert_eq!(string(terminal_rule, "evidence_rule"), "null");
     let applied_premise = object(terminal_rule, "applied_premise");
     assert_eq!(string(applied_premise, "premise"), "exact-authoritative-tool-call-ledger");
+    assert_eq!(string(applied_premise, "ledger_schema"), "dolly.tool-call-ledger/v1");
+    assert_eq!(string(applied_premise, "ledger_record_validator"), "tool-call-ledger-record.schema.json");
     assert_eq!(string(applied_premise, "terminal_state"), "SUCCEEDED");
     assert_eq!(string(applied_premise, "evidence_rule"), "ledger.terminal_result_digest");
+    assert!(
+        applied_premise
+            .get("identity_match")
+            .and_then(|v| v.as_array())
+            .map_or(false, |arr| arr.len() >= 6),
+        "applied_premise must list at least six concrete identity equalities"
+    );
 
     let no_premise = cases
         .iter()
@@ -135,19 +144,32 @@ fn validates_rust_records_and_exact_shared_jcs_bytes() {
         .find(|entry| {
             entry
                 .get("ledger_premise")
-                .and_then(|v| v.get("kind"))
+                .and_then(|v| v.get("record"))
+                .and_then(|v| v.get("schema"))
                 .and_then(|v| v.as_str())
-                == Some("exact-authoritative")
+                == Some("dolly.tool-call-ledger/v1")
         })
         .expect("terminal-premise case");
     {
         let prem = object(with_premise, "ledger_premise");
-        assert_eq!(string(prem, "terminal_state"), "SUCCEEDED");
+        let ledger_record = object(prem, "record");
+        assert_eq!(string(ledger_record, "schema"), "dolly.tool-call-ledger/v1");
+        assert_eq!(string(ledger_record, "state"), "SUCCEEDED");
+        assert_eq!(ledger_record.get("ledger_revision").and_then(|v| v.as_u64()), Some(3));
+        let binding = object(ledger_record, "operation_binding");
+        let claim = object(object(with_premise, "target"), "claim");
         let rec = object(object(with_premise, "target"), "record");
         assert_eq!(string(rec, "state"), "APPLIED");
+        // Concrete Claim/generation/outbound/terminal-result equality with the
+        // exact authoritative ledger record. No response/ACK evidence is copied.
+        assert_eq!(claim.get("operation_id"), binding.get("idempotency_key"));
+        assert_eq!(string(claim, "instance_id"), string(binding, "instance_id"));
+        assert_eq!(string(claim, "module_id"), string(binding, "module_id"));
+        assert_eq!(claim.get("operation_digest"), ledger_record.get("operation_digest"));
+        assert_eq!(rec.get("intent_digest"), ledger_record.get("outbound_digest"));
         assert_eq!(
-            rec.get("evidence_digest").and_then(|v| v.as_str()),
-            prem.get("evidence_digest").and_then(|v| v.as_str())
+            rec.get("evidence_digest"),
+            ledger_record.get("terminal_result_digest")
         );
     }
 }
