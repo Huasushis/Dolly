@@ -111,7 +111,7 @@ fn binding(
         tool_transaction_id: "0198ab31-6c44-7e8a-b2bb-000000000099".into(),
         activation_id: "0198ab31-6c44-7e8a-b2bb-000000000101".into(),
         activation_lease_generation: 1,
-        config_revision: 11,
+        config_revision: 1,
         tool_server_id: "fs".into(),
         tool_name: "read-file".into(),
         tool_schema_digest: digest(0x44),
@@ -225,20 +225,10 @@ fn seed_parents(conn: &Connection) {
         rusqlite::params!["0198ab31-6c44-7e8a-b2bb-000000000101"],
     )
     .expect("seed activation");
-    conn.execute(
-        "INSERT OR IGNORE INTO config_revision_mappings (
-             config_revision, daemon_installation_id, instance_id,
-             config_digest, canonical_bytes
-         ) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![
-            11_i64,
-            "daemon-test",
-            "instance-test",
-            "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
-            &b"{}"[..],
-        ],
-    )
-    .expect("config revision mapping parent");
+    // The Host-owned config-revision parent is the migrated revision-1
+    // authority mapping installed by `open_db`. Host-v2 re-verifies every
+    // retained mapping row (identity and canonical bytes) on reopen, so
+    // fixtures must not synthesize additional mapping rows.
 }
 
 fn insert_authorized_row(db: &mut Database, record: &ToolCallLedgerRecord) {
