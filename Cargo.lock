@@ -263,6 +263,7 @@ version = "0.1.0"
 dependencies = [
  "dolly-canonical-json",
  "dolly-core-domain",
+ "dolly-protocol",
  "dolly-storage",
  "dolly-tool-broker",
  "dolly-tool-coordinator",

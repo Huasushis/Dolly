@@ -45,6 +45,7 @@ pub struct WorkerStartConfig {
 }
 #[cfg(feature = "test-support")]
 mod test_support;
+pub mod premise;
 
 type StartupMint =
     fn(&mut Database, ExtensionId) -> Result<RuntimeBinding, WorkerError>;
@@ -510,6 +511,26 @@ impl Worker {
 
     /// Route sequential tools/call rows through the one initialized session.
     /// The retained child is stopped only after explicit stop, terminal
+    /// settlement, or Drop.
+
+    /// Load one authoritative Tool-call row for identity-only callers.
+    ///
+    /// The public worker-host control channel names an operation; the exact
+    /// ledger content is loaded here from this process's own verified
+    /// database view. `dispatch_tools_call` re-verifies every field before
+    /// any child I/O, so this accessor adds no trust.
+    pub fn load_authorized_row(
+        &self,
+        module_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<ToolCallLedgerRecord>, String> {
+        load_exact(self.database.connection(), module_id, operation_id)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Route sequential tools/call rows through the one initialized session.
+    /// The retained child is stopped only after explicit stop, terminal
+    /// settlement, or Drop.
     pub fn dispatch_tools_call(
         &mut self,
         row: &ToolCallLedgerRecord,

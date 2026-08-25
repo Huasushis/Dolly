@@ -11,6 +11,7 @@ test-support = ["dolly-storage/test-support", "dolly-tool-coordinator/test-suppo
 [dependencies]
 dolly-canonical-json = { path = "../dolly-canonical-json" }
 dolly-core-domain = { path = "../dolly-core-domain" }
+dolly-protocol = { path = "../dolly-protocol" }
 dolly-storage = { path = "../dolly-storage" }
 dolly-tool-broker = { path = "../dolly-tool-broker" }
 dolly-tool-coordinator = { path = "../dolly-tool-coordinator" }

@@ -21,6 +21,7 @@ pub mod runtime_binding;
 pub mod tool_broker_authority;
 pub mod tool_ledger;
 pub mod transaction;
+pub mod worker_start_premise;
 
 pub use attestation::{
     LoadedSqlite, ReleaseAttestation, SQLITE_VERSION_NUMBER_MIN, SqliteBuildGate,
