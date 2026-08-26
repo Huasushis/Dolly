@@ -1,0 +1,349 @@
+{
+  "snapshot": "cffd29d6f0a9adcc5035a882d86701d56c3224f4",
+  "claim_boundary": "Deterministic retrieval post-analysis only; no reader LLM or official QA judge.",
+  "locomo": {
+    "turn_methods": [
+      {
+        "method": "rrf_neighbor",
+        "n": 1977,
+        "recall_at_10": 0.6336871809370952,
+        "complete_at_10": 0.5953464845725848,
+        "mrr": 0.35778998938149725,
+        "ndcg_at_10": 0.4071940966446985
+      },
+      {
+        "method": "word_all",
+        "n": 1977,
+        "recall_at_10": 0.6128744397525786,
+        "complete_at_10": 0.5720789074355084,
+        "mrr": 0.4645492052357084,
+        "ndcg_at_10": 0.4811855294393766
+      },
+      {
+        "method": "rrf_word_bigram",
+        "n": 1977,
+        "recall_at_10": 0.6127058341211505,
+        "complete_at_10": 0.5715730905412241,
+        "mrr": 0.46271449231795436,
+        "ndcg_at_10": 0.47998235525452454
+      },
+      {
+        "method": "rrf_word_alternate",
+        "n": 1977,
+        "recall_at_10": 0.611999478710698,
+        "complete_at_10": 0.569549822964087,
+        "mrr": 0.4645629317706164,
+        "ndcg_at_10": 0.48050193232364624
+      },
+      {
+        "method": "word_alternate",
+        "n": 1977,
+        "recall_at_10": 0.6104735977462739,
+        "complete_at_10": 0.5680323722812342,
+        "mrr": 0.4668460614159104,
+        "ndcg_at_10": 0.4813946136132886
+      },
+      {
+        "method": "bigram_all",
+        "n": 1977,
+        "recall_at_10": 0.6075774128318795,
+        "complete_at_10": 0.5670207384926657,
+        "mrr": 0.4594735509916991,
+        "ndcg_at_10": 0.47608079685091537
+      },
+      {
+        "method": "rrf_plus_recency",
+        "n": 1977,
+        "recall_at_10": 0.606441886964139,
+        "complete_at_10": 0.5665149215983813,
+        "mrr": 0.3640214381718106,
+        "ndcg_at_10": 0.4073094292406511
+      }
+    ],
+    "session_methods": [
+      {
+        "method": "rrf_word_bigram",
+        "n": 1977,
+        "recall_at_5": 0.8749448017278063,
+        "complete_at_5": 0.8320687910976227,
+        "mrr": 0.8035851780153073,
+        "ndcg_at_5": 0.7991465468539924
+      },
+      {
+        "method": "bigram_all",
+        "n": 1977,
+        "recall_at_5": 0.8742366580758083,
+        "complete_at_5": 0.8320687910976227,
+        "mrr": 0.805963307669613,
+        "ndcg_at_5": 0.8013838734309523
+      },
+      {
+        "method": "word_all",
+        "n": 1977,
+        "recall_at_5": 0.8705189039028189,
+        "complete_at_5": 0.8265048052604957,
+        "mrr": 0.797216679748676,
+        "ndcg_at_5": 0.7928722597523409
+      },
+      {
+        "method": "rrf_word_alternate",
+        "n": 1977,
+        "recall_at_5": 0.8674418511292563,
+        "complete_at_5": 0.8229640870005058,
+        "mrr": 0.7936550310864631,
+        "ndcg_at_5": 0.7890974688870236
+      },
+      {
+        "method": "word_alternate",
+        "n": 1977,
+        "recall_at_5": 0.8640697385006945,
+        "complete_at_5": 0.8199291856348002,
+        "mrr": 0.7924336780497389,
+        "ndcg_at_5": 0.7867806172276024
+      },
+      {
+        "method": "rrf_plus_recency",
+        "n": 1977,
+        "recall_at_5": 0.86122993793707,
+        "complete_at_5": 0.815882650480526,
+        "mrr": 0.6993343946051067,
+        "ndcg_at_5": 0.7190829058467706
+      },
+      {
+        "method": "rrf_neighbor",
+        "n": 1977,
+        "recall_at_5": 0.7872024311326283,
+        "complete_at_5": 0.7420333839150227,
+        "mrr": 0.6303088825363337,
+        "ndcg_at_5": 0.6423933816445767
+      }
+    ],
+    "category_winners_turn_recall10": {
+      "category_1": {
+        "method": "rrf_word_alternate",
+        "value": 0.28883688786292266
+      },
+      "category_2": {
+        "method": "word_all",
+        "value": 0.6966145833333333
+      },
+      "category_3": {
+        "method": "rrf_neighbor",
+        "value": 0.28288169200264374
+      },
+      "category_4": {
+        "method": "rrf_neighbor",
+        "value": 0.7314704716607213
+      },
+      "category_5": {
+        "method": "rrf_neighbor",
+        "value": 0.7141255605381166
+      }
+    },
+    "caption_delta_all_turn_recall10": 0.0024008420063047486,
+    "caption_delta_image_turn_recall10": 0.00962247916740333,
+    "neighbor_delta_turn_recall10": 0.020981346815944657,
+    "recency_delta_turn_recall10": -0.006263947157011507,
+    "confidence_auc": {
+      "word_all": 0.7102231214522565,
+      "bigram_all": 0.687348957455179,
+      "rrf_word_bigram": 0.4814252796043388,
+      "rrf_plus_recency": 0.318945652784803,
+      "rrf_neighbor": 0.510088236947114,
+      "word_alternate": 0.690018546619457,
+      "rrf_word_alternate": 0.3462878660147249
+    }
+  },
+  "longmemeval": {
+    "turn_methods": [
+      {
+        "method": "rrf_word_bigram",
+        "n": 470,
+        "recall_at_10": 0.7713475177304965,
+        "complete_at_10": 0.6893617021276596,
+        "mrr": 0.6501889080268256,
+        "ndcg_at_10": 0.6372961652824417
+      },
+      {
+        "method": "bigram_all",
+        "n": 470,
+        "recall_at_10": 0.7691489361702127,
+        "complete_at_10": 0.6829787234042554,
+        "mrr": 0.6516569535158643,
+        "ndcg_at_10": 0.6369498967674077
+      },
+      {
+        "method": "word_all",
+        "n": 470,
+        "recall_at_10": 0.7663120567375887,
+        "complete_at_10": 0.6872340425531915,
+        "mrr": 0.636850920202398,
+        "ndcg_at_10": 0.6283027536516476
+      },
+      {
+        "method": "rrf_plus_recency",
+        "n": 470,
+        "recall_at_10": 0.7618085106382979,
+        "complete_at_10": 0.674468085106383,
+        "mrr": 0.5708829668437982,
+        "ndcg_at_10": 0.5733267857948854
+      },
+      {
+        "method": "rrf_word_alternate",
+        "n": 470,
+        "recall_at_10": 0.7272695035460993,
+        "complete_at_10": 0.6510638297872341,
+        "mrr": 0.6365749176788096,
+        "ndcg_at_10": 0.6208538537653994
+      },
+      {
+        "method": "rrf_neighbor",
+        "n": 470,
+        "recall_at_10": 0.7183333333333334,
+        "complete_at_10": 0.6106382978723405,
+        "mrr": 0.4248093680185324,
+        "ndcg_at_10": 0.4616373470148662
+      },
+      {
+        "method": "word_alternate",
+        "n": 470,
+        "recall_at_10": 0.7154255319148937,
+        "complete_at_10": 0.6382978723404256,
+        "mrr": 0.6181458934701252,
+        "ndcg_at_10": 0.606490795161404
+      }
+    ],
+    "session_methods": [
+      {
+        "method": "rrf_word_bigram",
+        "n": 470,
+        "recall_at_5": 0.9185106382978723,
+        "complete_at_5": 0.8404255319148937,
+        "mrr": 0.9100707338598453,
+        "ndcg_at_5": 0.8848211218001143
+      },
+      {
+        "method": "word_all",
+        "n": 470,
+        "recall_at_5": 0.9158510638297872,
+        "complete_at_5": 0.8340425531914893,
+        "mrr": 0.9131651276457284,
+        "ndcg_at_5": 0.8853043749953735
+      },
+      {
+        "method": "bigram_all",
+        "n": 470,
+        "recall_at_5": 0.9145390070921985,
+        "complete_at_5": 0.8361702127659575,
+        "mrr": 0.9114157186622769,
+        "ndcg_at_5": 0.8848280498281368
+      },
+      {
+        "method": "rrf_word_alternate",
+        "n": 470,
+        "recall_at_5": 0.9102127659574468,
+        "complete_at_5": 0.8446808510638298,
+        "mrr": 0.9109836506966966,
+        "ndcg_at_5": 0.8859368359122312
+      },
+      {
+        "method": "word_alternate",
+        "n": 470,
+        "recall_at_5": 0.8999645390070923,
+        "complete_at_5": 0.8276595744680851,
+        "mrr": 0.8995664763150887,
+        "ndcg_at_5": 0.8719278852393919
+      },
+      {
+        "method": "rrf_plus_recency",
+        "n": 470,
+        "recall_at_5": 0.899290780141844,
+        "complete_at_5": 0.8063829787234043,
+        "mrr": 0.7869863611565739,
+        "ndcg_at_5": 0.7708544649342716
+      },
+      {
+        "method": "rrf_neighbor",
+        "n": 470,
+        "recall_at_5": 0.8189361702127659,
+        "complete_at_5": 0.6829787234042554,
+        "mrr": 0.7494684731095705,
+        "ndcg_at_5": 0.7063502514413943
+      }
+    ],
+    "category_winners_session_recall5": {
+      "all_answerable": {
+        "method": "rrf_word_bigram",
+        "value": 0.9185106382978723
+      },
+      "knowledge-update": {
+        "method": "word_alternate",
+        "value": 0.9930555555555556
+      },
+      "multi-session": {
+        "method": "rrf_word_alternate",
+        "value": 0.8581267217630854
+      },
+      "single-session-assistant": {
+        "method": "word_all",
+        "value": 1.0
+      },
+      "single-session-preference": {
+        "method": "word_all",
+        "value": 0.8666666666666667
+      },
+      "single-session-user": {
+        "method": "word_alternate",
+        "value": 1.0
+      },
+      "temporal-reasoning": {
+        "method": "rrf_word_bigram",
+        "value": 0.8795275590551181
+      }
+    },
+    "neighbor_delta_session_recall5": -0.0995744680851064,
+    "recency_delta_session_recall5": -0.019219858156028224,
+    "user_only_delta_session_recall5": -0.015886524822694925,
+    "confidence_auc": {
+      "word_all": 0.6395035460992908,
+      "bigram_all": 0.6763120567375887,
+      "rrf_word_bigram": 0.5719148936170213,
+      "rrf_plus_recency": 0.4325531914893617,
+      "rrf_neighbor": 0.4829078014184397,
+      "word_alternate": 0.5342553191489362,
+      "rrf_word_alternate": 0.5204964539007092
+    }
+  },
+  "decisions": [
+    {
+      "topic": "retrieval_granularity",
+      "status": "ADOPT_TWO_STAGE_CANDIDATE",
+      "decision": "Retrieve sessions/episodes first, then retrieve turns/evidence inside the selected sessions. Preserve both scores and provenance; do not compare the two recall numbers as if their relevance sets were identical."
+    },
+    {
+      "topic": "lexical_baseline",
+      "status": "ADOPT",
+      "decision": "Keep word BM25 plus word/bigram reciprocal-rank fusion as a mandatory cheap baseline before embeddings or graph expansion."
+    },
+    {
+      "topic": "temporal_neighbor_expansion",
+      "status": "FEATURE_FLAG",
+      "decision": "One-hop neighbor expansion improved LoCoMo turn Recall@10 by +0.0210 over lexical RRF, but must retain a token cap, evidence link and no-association abstention control."
+    },
+    {
+      "topic": "fixed_recency_bias",
+      "status": "REJECT_GLOBAL_DEFAULT",
+      "decision": "A fixed recency boost changed LongMemEval session Recall@5 by -0.0192; recency should be a query/category feature, not an unconditional global prior."
+    },
+    {
+      "topic": "image_caption_view",
+      "status": "KEEP_VERSIONED_DERIVED_VIEW",
+      "decision": "Caption text changed Recall@10 on image-bearing LoCoMo evidence by +0.0096. Preserve raw media and versioned captions, but route captions through retrieval/rerank experiments rather than always concatenating them."
+    },
+    {
+      "topic": "automatic_recall_abstention",
+      "status": "NOT_READY",
+      "decision": "Best confidence AUROC was 0.710 on LoCoMo and 0.676 on LongMemEval. A top-score heuristic is not reliable enough for silent automatic memory injection; explicit query and conservative thresholding remain the default."
+    }
+  ]
+}
