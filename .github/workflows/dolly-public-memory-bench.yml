@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   locomo:
@@ -78,3 +78,31 @@ jobs:
           path: research/dolly_research_layer/out-public-longmemeval/
           if-no-files-found: error
           retention-days: 30
+
+  publish-results:
+    needs: [locomo, longmemeval]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/dolly-layer-2026-08-26
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dolly-public-*-${{ github.sha }}
+          path: downloaded-public-results
+          merge-multiple: false
+      - name: Stage immutable result snapshot
+        run: |
+          target=research/dolly_research_layer/results/public/${GITHUB_SHA}
+          mkdir -p "$target/locomo" "$target/longmemeval"
+          cp -a downloaded-public-results/dolly-public-locomo-${GITHUB_SHA}/. "$target/locomo/"
+          cp -a downloaded-public-results/dolly-public-longmemeval-${GITHUB_SHA}/. "$target/longmemeval/"
+          printf '%s\n' "source_commit=${GITHUB_SHA}" "workflow_run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" > "$target/run.txt"
+      - name: Commit result snapshot to research branch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add research/dolly_research_layer/results/public/${GITHUB_SHA}
+          git commit -m "research(results): public memory retrieval ${GITHUB_SHA}" \
+            || { echo "No result changes"; exit 0; }
+          git push origin HEAD:research/dolly-layer-2026-08-26
