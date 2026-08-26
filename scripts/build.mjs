@@ -13,34 +13,10 @@ if (dirname(distDirectory) !== repositoryRoot || basename(distDirectory) !== "di
   throw new Error(`Refusing to clean unexpected build directory: ${distDirectory}`);
 }
 
-rmSync(distDirectory, { recursive: true, force: true });
-
-const compiler = resolve(repositoryRoot, "node_modules", "typescript", "bin", "tsc");
-const compileResult = spawnSync(
-  process.execPath,
-  [compiler, "--project", resolve(repositoryRoot, "tsconfig.build.json")],
-  { cwd: repositoryRoot, stdio: "inherit" },
-);
-
-if (compileResult.error) {
-  throw compileResult.error;
-}
-if (compileResult.status !== 0) {
-  process.exit(compileResult.status ?? 1);
-}
-
-copyRuntimeAssets({
-  repositoryRoot,
-  outputDirectory: distDirectory,
-});
-
-// Build the installed worker-host binary from the pinned Rust workspace.
-// The cargo target directory stays OUTSIDE the checkout (rust-gate
-// precedent). When WORKER_HOST_CARGO_TARGET_DIR is not provided, a UNIQUE
-// temporary target is created and removed in finally — never a shared or
-// stale path. The reviewed digest is extracted from the authoritative
-// adapter source and enforced on BOTH the built source binary and the
-// copied output.
+// Worker-host cargo-target resolution and validation happen BEFORE any
+// mutation: an invalid explicit override (or a TMPDIR redirected into the
+// checkout) must refuse without erasing prior dist output or running any
+// build step.
 const adapterSource = readFileSync(
   resolve(repositoryRoot, "src", "adapters", "installed-worker-host.ts"),
   "utf8",
@@ -51,7 +27,7 @@ const digestMatch = adapterSource.match(
 if (!digestMatch) {
   throw new Error("REVIEWED_WORKER_HOST_DIGEST not found in adapter source");
 }
-const reviewedWorkerHostDigest = digestMatch[1];
+assertOutsideRepository(tempDirectory());
 
 function sha256File(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
@@ -80,8 +56,6 @@ function assertOutsideRepository(resolvedPath) {
 
 // The TMPDIR base is environment-controlled; validate it before mkdtemp so a
 // redirected temp directory inside the checkout cannot pass silently.
-assertOutsideRepository(tempDirectory());
-
 let workerHostTargetDir = process.env.WORKER_HOST_CARGO_TARGET_DIR;
 let targetIsTemporary = false;
 if (!workerHostTargetDir || workerHostTargetDir === "") {
@@ -91,11 +65,36 @@ if (!workerHostTargetDir || workerHostTargetDir === "") {
   // An explicit override must live OUTSIDE the repository: equal to it or a
   // descendant would put build output inside the checkout and risk cleanup
   // or packaging contamination.
-  const resolvedOverride = resolve(workerHostTargetDir);
-  assertOutsideRepository(resolvedOverride);
+  assertOutsideRepository(resolve(workerHostTargetDir));
 }
 
 try {
+  rmSync(distDirectory, { recursive: true, force: true });
+
+  const compiler = resolve(repositoryRoot, "node_modules", "typescript", "bin", "tsc");
+  const compileResult = spawnSync(
+    process.execPath,
+    [compiler, "--project", resolve(repositoryRoot, "tsconfig.build.json")],
+    { cwd: repositoryRoot, stdio: "inherit" },
+  );
+
+  if (compileResult.error) {
+    throw compileResult.error;
+  }
+  if (compileResult.status !== 0) {
+    throw new Error(`tsc build failed with status ${compileResult.status}`);
+  }
+
+  copyRuntimeAssets({
+    repositoryRoot,
+    outputDirectory: distDirectory,
+  });
+
+  // Build the installed worker-host binary from the pinned Rust workspace.
+  // The reviewed digest was extracted from the authoritative adapter source
+  // above and is enforced on BOTH the built source binary and the copied
+  // output.
+  const reviewedWorkerHostDigest = digestMatch[1];
   const workerHostBuild = spawnSync(
     "cargo",
     ["build", "--locked", "--release", "-p", "dolly-worker", "--bin", "worker_host"],

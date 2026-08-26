@@ -175,10 +175,19 @@ const nodeInstallVerifier: WorkerHostInstallVerifier = {
   },
 };
 
-/** Overridable for unit tests only; production always uses node checks. */
+/**
+ * Active verifier. Production always uses the node implementation below;
+ * conformance tests may substitute a deterministic verifier through
+ * `setWorkerHostInstallVerifierForTests`. This module is not exported from
+ * any product entry point, so the seam is unreachable in production while
+ * the public migration guard remains unconditional.
+ */
 let activeInstallVerifier: WorkerHostInstallVerifier = nodeInstallVerifier;
 
-/** Test-only seam to swap the install verifier. */
+/**
+ * Test-only seam to replace the fixed-layout/digest verification. Returns a
+ * restore function; tests must restore before finishing.
+ */
 export function setWorkerHostInstallVerifierForTests(
   verifier: WorkerHostInstallVerifier,
 ): () => void {

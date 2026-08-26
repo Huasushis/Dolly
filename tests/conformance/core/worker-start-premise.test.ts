@@ -210,76 +210,76 @@ describe("Installed worker-host composition (Host production route)", () => {
     }
 
     async function runCompositionScenario(): Promise<void> {
-    const dir = mkdtempSync(join(tmpdir(), "wsp-route-"));
-    const packageRoot = join(dir, "pkg");
-    mkdirSync(join(packageRoot, "bin"), { recursive: true });
-    const packagePath = join(packageRoot, "package.bin");
-    writeFileSync(packagePath, Buffer.from("dolly-fs-tools-package-v1"));
-    const executable = join(packageRoot, "bin/dolly-fs-tools");
-    copyFileSync("/usr/bin/python3", executable);
-    chmodSync(executable, 0o755);
-    const sha256 = (bytes: Uint8Array): string =>
-      `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+      const dir = mkdtempSync(join(tmpdir(), "wsp-route-"));
+      const packageRoot = join(dir, "pkg");
+      mkdirSync(join(packageRoot, "bin"), { recursive: true });
+      const packagePath = join(packageRoot, "package.bin");
+      writeFileSync(packagePath, Buffer.from("dolly-fs-tools-package-v1"));
+      const executable = join(packageRoot, "bin/dolly-fs-tools");
+      copyFileSync("/usr/bin/python3", executable);
+      chmodSync(executable, 0o755);
+      const sha256 = (bytes: Uint8Array): string =>
+        `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 
-    const dbDir = mkdtempSync(join(tmpdir(), "wsp-route-db-"));
-    const databasePath = join(dbDir, "authority.sqlite");
-    const database = RuntimeAuthorityDatabase.open({
-      path: databasePath,
-      identity,
-      lock: new FakeLock() as never,
-    });
-    const authority = resolvedConfigFixture("committed");
-    database.installConfig({
-      identity,
-      canonicalConfigBytes: authority.bytes,
-      configDigest: authority.digest,
-      premise: null,
-      verifiedOrigins: [],
-    });
+      const dbDir = mkdtempSync(join(tmpdir(), "wsp-route-db-"));
+      const databasePath = join(dbDir, "authority.sqlite");
+      const database = RuntimeAuthorityDatabase.open({
+        path: databasePath,
+        identity,
+        lock: new FakeLock() as never,
+      });
+      const authority = resolvedConfigFixture("committed");
+      database.installConfig({
+        identity,
+        canonicalConfigBytes: authority.bytes,
+        configDigest: authority.digest,
+        premise: null,
+        verifiedOrigins: [],
+      });
 
-    const spawnCalls: Array<{ command: string; args: readonly string[] }> = [];
-    const premise = premiseInput({
-      packageRoot,
-      packagePath,
-      packageDigest: sha256(readFileSync(packagePath)),
-      executableDigest: sha256(readFileSync(executable)),
-    });
+      const spawnCalls: Array<{ command: string; args: readonly string[] }> = [];
+      const premise = premiseInput({
+        packageRoot,
+        packagePath,
+        packageDigest: sha256(readFileSync(packagePath)),
+        executableDigest: sha256(readFileSync(executable)),
+      });
 
-    const handle = await launchInstalledWorkerHost({
-      database,
-      premise,
-      spawn: (command, args) => {
-        spawnCalls.push({ command, args });
-        return fakeWorkerHostChild();
-      },
-    });
-    expect(handle.pid).toBeGreaterThan(0);
-    // Framed lifecycle over the deterministic fake child.
-    await handle.status();
-    await handle.stop();
-
-    // The adapter projected through the repository exactly once: durable
-    // here, idempotent on re-projection.
-    expect(database.installWorkerStartPremise(premise).projected).toBe(false);
-    // Host-owned command resolution + frozen three-part argv.
-    expect(spawnCalls).toHaveLength(1);
-    expect(spawnCalls[0].command).toMatch(/worker_host$/u);
-    expect(spawnCalls[0].args).toEqual([databasePath, "org.dolly.tools", "fs"]);
-
-    // Conflict means zero spawn: a conflicting rewrite throws out of the
-    // repository before the adapter reaches its process boundary again.
-    const spawnsBefore = spawnCalls.length;
-    await expect(
-      launchInstalledWorkerHost({
+      const handle = await launchInstalledWorkerHost({
         database,
-        premise: premiseInput({ ...premise, packageDigest: `sha256:${"d".repeat(64)}` }),
+        premise,
         spawn: (command, args) => {
           spawnCalls.push({ command, args });
           return fakeWorkerHostChild();
         },
-      }),
-    ).rejects.toThrow(RuntimeAuthorityDatabaseError);
-    expect(spawnCalls.length).toBe(spawnsBefore);
+      });
+      expect(handle.pid).toBeGreaterThan(0);
+      // Framed lifecycle over the deterministic fake child.
+      await handle.status();
+      await handle.stop();
+
+      // The adapter projected through the repository exactly once: durable
+      // here, idempotent on re-projection.
+      expect(database.installWorkerStartPremise(premise).projected).toBe(false);
+      // Host-owned command resolution + frozen three-part argv.
+      expect(spawnCalls).toHaveLength(1);
+      expect(spawnCalls[0].command).toMatch(/worker_host$/u);
+      expect(spawnCalls[0].args).toEqual([databasePath, "org.dolly.tools", "fs"]);
+
+      // Conflict means zero spawn: a conflicting rewrite throws out of the
+      // repository before the adapter reaches its process boundary again.
+      const spawnsBefore = spawnCalls.length;
+      await expect(
+        launchInstalledWorkerHost({
+          database,
+          premise: premiseInput({ ...premise, packageDigest: `sha256:${"d".repeat(64)}` }),
+          spawn: (command, args) => {
+            spawnCalls.push({ command, args });
+            return fakeWorkerHostChild();
+          },
+        }),
+      ).rejects.toThrow(RuntimeAuthorityDatabaseError);
+      expect(spawnCalls.length).toBe(spawnsBefore);
     }
   });
 });

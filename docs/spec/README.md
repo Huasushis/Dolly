@@ -78,6 +78,10 @@ and distinguishes its identity from its storage records.
 - `security-operations.md`: trust boundaries, networking, background-service
   operation, interprocess communication (IPC), secrets, and operational
   recovery.
+- `worker-host-launch.md`: the Host-owned Worker-start premise projection,
+  read-only canonical preflight, single writable open with equality binding,
+  fixed installed binary location and reviewed digest, and the frozen framed
+  control-channel lifecycle for `worker_host`.
 - Experiment protocols belong under `docs/experiments`, not in product specs.
 - Migration plans and progress reports belong under `docs/takeover`, not here.
 
