@@ -53,6 +53,11 @@ import {
 /** Largest revision a conforming database may assign (REQ-AUTH-002 step 4). */
 export const MAX_CONFIG_REVISION = 9_007_199_254_740_991;
 
+/** Shared protocol wire parse-depth ceiling (mirrors Rust `PROTOCOL_WIRE_PARSE_DEPTH`). */
+export const PROTOCOL_WIRE_PARSE_DEPTH = 96;
+/** Shared semantic JSON depth ceiling (mirrors Rust `MAX_SEMANTIC_JSON_NESTING_DEPTH`). */
+export const MAX_SEMANTIC_JSON_NESTING_DEPTH = 64;
+
 /** `PRAGMA user_version` for the shared Core database schema. */
 export const RUNTIME_AUTHORITY_SCHEMA_VERSION = 1;
 
@@ -251,6 +256,24 @@ export interface InstallWorkerStartPremiseInput {
   readonly executableDigest: string;
   /** Package-root-relative executable endpoint (safe relative member). */
   readonly endpoint: string;
+  /** Exact spawn argv beyond the executable (Host-owned, sealed as JCS). */
+  readonly spawnArgs: readonly string[];
+  /** Sealed MCP startup deadline in milliseconds. */
+  readonly startupTimeoutMs: number;
+  /** Sealed stdio frame byte cap shared by request and response frames. */
+  readonly maxFrameBytes: number;
+  /** Sealed maximum admitted response frame size in bytes. */
+  readonly maxResponseBytes: number;
+  /** Sealed wire parse-depth ceiling for every frame (1..=96). */
+  readonly wireDepth: number;
+  /** Sealed semantic JSON depth ceiling for every frame (1..=64). */
+  readonly semanticDepth: number;
+  /** Sealed maximum total object members across one response tree. */
+  readonly maxDispatchMembers: number;
+  /** Sealed maximum nesting depth inside one dispatch response. */
+  readonly maxDispatchDepth: number;
+  /** Digest of the canonical transport contract this projection seals. */
+  readonly transportDigest: string;
 }
 
 export interface FileCoreHistoryMigrationInput extends FileCoreHistoryOptions {
@@ -412,7 +435,7 @@ function assertClosedRecord(value: unknown, keys: readonly string[], label: stri
   if (!isClosedObject(value, keys)) throw malformed(label);
 }
 
-const WORKER_START_PREMISE_RECORD_SCHEMA = "dolly.worker-start-premise/v1";
+const WORKER_START_PREMISE_RECORD_SCHEMA = "dolly.worker-start-premise/v2";
 
 function validateWorkerStartPremiseInput(input: InstallWorkerStartPremiseInput): void {
   if (!STABLE_ID_PATTERN.test(input.extensionAlias) && !QUALIFIED_NAME_PATTERN.test(input.extensionAlias)) {
@@ -453,6 +476,48 @@ function validateWorkerStartPremiseInput(input: InstallWorkerStartPremiseInput):
       "installed package path must sit inside the canonical package root",
     );
   }
+  if (
+    !Array.isArray(input.spawnArgs) ||
+    input.spawnArgs.length === 0 ||
+    input.spawnArgs.length > 64 ||
+    input.spawnArgs.some((argument) => typeof argument !== "string" || argument.length === 0 || argument.length > 4096)
+  ) {
+    throw new RuntimeAuthorityDatabaseError(
+      "AUTHORITY_DATABASE_MALFORMED_RECORD",
+      "spawnArgs must be a non-empty JSON string array of at most 64 arguments",
+    );
+  }
+  for (const [label, value, upper] of [
+    ["startupTimeoutMs", input.startupTimeoutMs, MAX_CONFIG_REVISION],
+    ["maxFrameBytes", input.maxFrameBytes, 4_294_967_295],
+    ["maxResponseBytes", input.maxResponseBytes, 4_294_967_295],
+    ["maxDispatchMembers", input.maxDispatchMembers, MAX_CONFIG_REVISION],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 1 || value > upper) {
+      throw new RuntimeAuthorityDatabaseError(
+        "AUTHORITY_DATABASE_MALFORMED_RECORD",
+        `${label} must be a positive safe integer at most ${upper}`,
+      );
+    }
+  }
+  for (const [label, value, upper] of [
+    ["wireDepth", input.wireDepth, PROTOCOL_WIRE_PARSE_DEPTH],
+    ["semanticDepth", input.semanticDepth, MAX_SEMANTIC_JSON_NESTING_DEPTH],
+    ["maxDispatchDepth", input.maxDispatchDepth, MAX_SEMANTIC_JSON_NESTING_DEPTH],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 1 || value > upper) {
+      throw new RuntimeAuthorityDatabaseError(
+        "AUTHORITY_DATABASE_MALFORMED_RECORD",
+        `${label} must be in 1..=${upper}`,
+      );
+    }
+  }
+  if (!isSha256(input.transportDigest)) {
+    throw new RuntimeAuthorityDatabaseError(
+      "CORE_DIGEST_MISMATCH",
+      "transportDigest must be a sha256 digest",
+    );
+  }
 }
 
 function isSafeRelativeEndpoint(value: string): boolean {
@@ -480,6 +545,15 @@ function buildSealedWorkerStartPremise(unsigned: {
   readonly package_digest: string;
   readonly executable_digest: string;
   readonly endpoint: string;
+  readonly spawn_args_json: string;
+  readonly startup_timeout_ms: number;
+  readonly max_frame_bytes: number;
+  readonly max_response_bytes: number;
+  readonly wire_depth: number;
+  readonly semantic_depth: number;
+  readonly max_dispatch_members: number;
+  readonly max_dispatch_depth: number;
+  readonly transport_digest: string;
 }): SealedWorkerStartPremise {
   const record = {
     schema: WORKER_START_PREMISE_RECORD_SCHEMA,
@@ -494,6 +568,15 @@ function buildSealedWorkerStartPremise(unsigned: {
     package_digest: unsigned.package_digest,
     executable_digest: unsigned.executable_digest,
     endpoint: unsigned.endpoint,
+    spawn_args_json: unsigned.spawn_args_json,
+    startup_timeout_ms: unsigned.startup_timeout_ms,
+    max_frame_bytes: unsigned.max_frame_bytes,
+    max_response_bytes: unsigned.max_response_bytes,
+    wire_depth: unsigned.wire_depth,
+    semantic_depth: unsigned.semantic_depth,
+    max_dispatch_members: unsigned.max_dispatch_members,
+    max_dispatch_depth: unsigned.max_dispatch_depth,
+    transport_digest: unsigned.transport_digest,
     record_digest: "",
   };
   const { record_digest: _omit, ...unsignedRecord } = record;
@@ -828,6 +911,15 @@ CREATE TABLE worker_start_premises (
   package_digest TEXT NOT NULL CHECK (package_digest LIKE 'sha256:%'),
   executable_digest TEXT NOT NULL CHECK (executable_digest LIKE 'sha256:%'),
   endpoint TEXT NOT NULL CHECK (length(endpoint) > 0),
+  spawn_args_json TEXT NOT NULL CHECK (json_valid(spawn_args_json) AND json_type(spawn_args_json) = 'array'),
+  startup_timeout_ms INTEGER NOT NULL CHECK (startup_timeout_ms BETWEEN 1 AND 9007199254740991),
+  max_frame_bytes INTEGER NOT NULL CHECK (max_frame_bytes BETWEEN 1 AND 4294967295),
+  max_response_bytes INTEGER NOT NULL CHECK (max_response_bytes BETWEEN 1 AND 4294967295),
+  wire_depth INTEGER NOT NULL CHECK (wire_depth BETWEEN 1 AND 96),
+  semantic_depth INTEGER NOT NULL CHECK (semantic_depth BETWEEN 1 AND 64),
+  max_dispatch_members INTEGER NOT NULL CHECK (max_dispatch_members BETWEEN 1 AND 9007199254740991),
+  max_dispatch_depth INTEGER NOT NULL CHECK (max_dispatch_depth BETWEEN 1 AND 64),
+  transport_digest TEXT NOT NULL CHECK (transport_digest LIKE 'sha256:%'),
   record_jcs BLOB NOT NULL,
   record_digest TEXT NOT NULL,
   PRIMARY KEY (config_revision, extension_alias, server_id),
@@ -965,6 +1057,15 @@ const AUTHORITY_SCHEMA_COLUMNS: Readonly<Record<string, readonly AuthoritySchema
     { name: "package_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
     { name: "executable_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
     { name: "endpoint", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "spawn_args_json", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "startup_timeout_ms", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "max_frame_bytes", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "max_response_bytes", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "wire_depth", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "semantic_depth", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "max_dispatch_members", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "max_dispatch_depth", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "transport_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
     { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
     { name: "record_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
   ],
@@ -1026,6 +1127,15 @@ const AUTHORITY_SCHEMA_CHECKS: Readonly<Record<string, readonly string[]>> = Obj
     "check (package_digest like 'sha256:%')",
     "check (executable_digest like 'sha256:%')",
     "check (length(endpoint) > 0)",
+    "check (json_valid(spawn_args_json) and json_type(spawn_args_json) = 'array')",
+    "check (startup_timeout_ms between 1 and 9007199254740991)",
+    "check (max_frame_bytes between 1 and 4294967295)",
+    "check (max_response_bytes between 1 and 4294967295)",
+    "check (wire_depth between 1 and 96)",
+    "check (semantic_depth between 1 and 64)",
+    "check (max_dispatch_members between 1 and 9007199254740991)",
+    "check (max_dispatch_depth between 1 and 64)",
+    "check (transport_digest like 'sha256:%')",
     "primary key (config_revision, extension_alias, server_id)",
     "check (substr(package_path, 1, length(package_root) + 1) = package_root || '/')",
   ],
@@ -2039,7 +2149,7 @@ export class RuntimeAuthorityDatabase {
       ).get();
       if (!workerPremises) {
         this.#connection.prepare(
-          "CREATE TABLE worker_start_premises (config_revision INTEGER NOT NULL CHECK (config_revision BETWEEN 1 AND 9007199254740991), config_digest TEXT NOT NULL, extension_alias TEXT NOT NULL CHECK (length(extension_alias) > 0), server_id TEXT NOT NULL CHECK (length(server_id) > 0), package_root TEXT NOT NULL CHECK (length(package_root) > 0), package_path TEXT NOT NULL CHECK (length(package_path) > 0), package_digest TEXT NOT NULL CHECK (package_digest LIKE 'sha256:%'), executable_digest TEXT NOT NULL CHECK (executable_digest LIKE 'sha256:%'), endpoint TEXT NOT NULL CHECK (length(endpoint) > 0), record_jcs BLOB NOT NULL, record_digest TEXT NOT NULL, PRIMARY KEY (config_revision, extension_alias, server_id), FOREIGN KEY (config_revision, config_digest) REFERENCES config_revision_mappings(config_revision, config_digest), CHECK (substr(package_path, 1, length(package_root) + 1) = package_root || '/'))",
+          "CREATE TABLE worker_start_premises (config_revision INTEGER NOT NULL CHECK (config_revision BETWEEN 1 AND 9007199254740991), config_digest TEXT NOT NULL, extension_alias TEXT NOT NULL CHECK (length(extension_alias) > 0), server_id TEXT NOT NULL CHECK (length(server_id) > 0), package_root TEXT NOT NULL CHECK (length(package_root) > 0), package_path TEXT NOT NULL CHECK (length(package_path) > 0), package_digest TEXT NOT NULL CHECK (package_digest LIKE 'sha256:%'), executable_digest TEXT NOT NULL CHECK (executable_digest LIKE 'sha256:%'), endpoint TEXT NOT NULL CHECK (length(endpoint) > 0), spawn_args_json TEXT NOT NULL CHECK (json_valid(spawn_args_json) AND json_type(spawn_args_json) = 'array'), startup_timeout_ms INTEGER NOT NULL CHECK (startup_timeout_ms BETWEEN 1 AND 9007199254740991), max_frame_bytes INTEGER NOT NULL CHECK (max_frame_bytes BETWEEN 1 AND 4294967295), max_response_bytes INTEGER NOT NULL CHECK (max_response_bytes BETWEEN 1 AND 4294967295), wire_depth INTEGER NOT NULL CHECK (wire_depth BETWEEN 1 AND 96), semantic_depth INTEGER NOT NULL CHECK (semantic_depth BETWEEN 1 AND 64), max_dispatch_members INTEGER NOT NULL CHECK (max_dispatch_members BETWEEN 1 AND 9007199254740991), max_dispatch_depth INTEGER NOT NULL CHECK (max_dispatch_depth BETWEEN 1 AND 64), transport_digest TEXT NOT NULL CHECK (transport_digest LIKE 'sha256:%'), record_jcs BLOB NOT NULL, record_digest TEXT NOT NULL, PRIMARY KEY (config_revision, extension_alias, server_id), FOREIGN KEY (config_revision, config_digest) REFERENCES config_revision_mappings(config_revision, config_digest), CHECK (substr(package_path, 1, length(package_root) + 1) = package_root || '/'))",
         ).run();
       }
       const recordBytes = Buffer.from(canonicalBytes(
@@ -2646,6 +2756,15 @@ export class RuntimeAuthorityDatabase {
       package_digest: input.packageDigest,
       executable_digest: input.executableDigest,
       endpoint: input.endpoint,
+      spawn_args_json: JSON.stringify(input.spawnArgs),
+      startup_timeout_ms: input.startupTimeoutMs,
+      max_frame_bytes: input.maxFrameBytes,
+      max_response_bytes: input.maxResponseBytes,
+      wire_depth: input.wireDepth,
+      semantic_depth: input.semanticDepth,
+      max_dispatch_members: input.maxDispatchMembers,
+      max_dispatch_depth: input.maxDispatchDepth,
+      transport_digest: input.transportDigest,
     });
     let projected = false;
     this.#inAuthorityTransaction(undefined, () => {
@@ -2676,7 +2795,7 @@ export class RuntimeAuthorityDatabase {
         );
       }
       this.#connection.prepare(
-        "INSERT INTO worker_start_premises (config_revision, config_digest, extension_alias, server_id, package_root, package_path, package_digest, executable_digest, endpoint, record_jcs, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO worker_start_premises (config_revision, config_digest, extension_alias, server_id, package_root, package_path, package_digest, executable_digest, endpoint, spawn_args_json, startup_timeout_ms, max_frame_bytes, max_response_bytes, wire_depth, semantic_depth, max_dispatch_members, max_dispatch_depth, transport_digest, record_jcs, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       ).run(
         snapshot.config_revision,
         snapshot.config_digest,
@@ -2687,6 +2806,15 @@ export class RuntimeAuthorityDatabase {
         input.packageDigest,
         input.executableDigest,
         input.endpoint,
+        JSON.stringify(input.spawnArgs),
+        input.startupTimeoutMs,
+        input.maxFrameBytes,
+        input.maxResponseBytes,
+        input.wireDepth,
+        input.semanticDepth,
+        input.maxDispatchMembers,
+        input.maxDispatchDepth,
+        input.transportDigest,
         record.bytes,
         record.recordDigest,
       );

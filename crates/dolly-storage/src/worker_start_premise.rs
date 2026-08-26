@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
-use dolly_canonical_json::{Sha256Digest, canonicalize};
+use dolly_canonical_json::{
+    MAX_SEMANTIC_JSON_NESTING_DEPTH, PROTOCOL_WIRE_PARSE_DEPTH, Sha256Digest, canonicalize,
+};
 
 use crate::error::{StorageError, StorageResult};
 use crate::host_authority::{
@@ -27,11 +29,13 @@ use crate::host_authority::{
 };
 
 /// Physical schema version of the Worker-start premise slice.
-pub const WORKER_START_PREMISE_SCHEMA_VERSION: i64 = 1;
+pub const WORKER_START_PREMISE_SCHEMA_VERSION: i64 = 2;
 /// Closed logical record schema for one Worker-start premise row.
-pub const WORKER_START_PREMISE_RECORD_SCHEMA: &str = "dolly.worker-start-premise/v1";
+pub const WORKER_START_PREMISE_RECORD_SCHEMA: &str = "dolly.worker-start-premise/v2";
 /// The single projected table.
 pub const WORKER_START_PREMISE_TABLE: &str = "worker_start_premises";
+/// Hard ceiling on sealed spawn arguments per premise row.
+pub const MAX_SPAWN_ARGS: usize = 64;
 
 /// Closed physical schema for the Worker-start premise projection.
 ///
@@ -51,6 +55,15 @@ CREATE TABLE IF NOT EXISTS worker_start_premises (
     package_digest      TEXT    NOT NULL CHECK (package_digest LIKE 'sha256:%'),
     executable_digest   TEXT    NOT NULL CHECK (executable_digest LIKE 'sha256:%'),
     endpoint            TEXT    NOT NULL CHECK (length(endpoint) > 0),
+    spawn_args_json     TEXT    NOT NULL CHECK (json_valid(spawn_args_json) AND json_type(spawn_args_json) = 'array'),
+    startup_timeout_ms  INTEGER NOT NULL CHECK (startup_timeout_ms BETWEEN 1 AND 9007199254740991),
+    max_frame_bytes     INTEGER NOT NULL CHECK (max_frame_bytes BETWEEN 1 AND 4294967295),
+    max_response_bytes  INTEGER NOT NULL CHECK (max_response_bytes BETWEEN 1 AND 4294967295),
+    wire_depth          INTEGER NOT NULL CHECK (wire_depth BETWEEN 1 AND 96),
+    semantic_depth      INTEGER NOT NULL CHECK (semantic_depth BETWEEN 1 AND 64),
+    max_dispatch_members INTEGER NOT NULL CHECK (max_dispatch_members BETWEEN 1 AND 9007199254740991),
+    max_dispatch_depth  INTEGER NOT NULL CHECK (max_dispatch_depth BETWEEN 1 AND 64),
+    transport_digest    TEXT    NOT NULL CHECK (transport_digest LIKE 'sha256:%'),
     record_jcs          BLOB    NOT NULL,
     record_digest       TEXT    NOT NULL,
     PRIMARY KEY (config_revision, extension_alias, server_id),
@@ -79,6 +92,25 @@ pub struct WorkerStartPremise {
     pub package_digest: String,
     pub executable_digest: String,
     pub endpoint: String,
+    /// Exact spawn argv beyond the executable, sealed as a JSON string
+    /// array. The Worker spawns with exactly these arguments.
+    pub spawn_args_json: String,
+    /// Sealed MCP startup deadline in milliseconds (1..=2^53-1).
+    pub startup_timeout_ms: i64,
+    /// Sealed stdio frame byte cap shared by request and response frames.
+    pub max_frame_bytes: i64,
+    /// Sealed maximum admitted response frame size in bytes.
+    pub max_response_bytes: i64,
+    /// Sealed wire parse-depth ceiling for every frame (1..=96).
+    pub wire_depth: i64,
+    /// Sealed semantic JSON depth ceiling for every frame (1..=64).
+    pub semantic_depth: i64,
+    /// Sealed maximum total object members across one dispatch response.
+    pub max_dispatch_members: i64,
+    /// Sealed maximum nesting depth inside one dispatch response.
+    pub max_dispatch_depth: i64,
+    /// Digest of the canonical transport contract this projection seals.
+    pub transport_digest: String,
     pub record_digest: String,
 }
 
@@ -98,6 +130,15 @@ impl WorkerStartPremise {
             package_digest: &self.package_digest,
             executable_digest: &self.executable_digest,
             endpoint: &self.endpoint,
+            spawn_args_json: &self.spawn_args_json,
+            startup_timeout_ms: self.startup_timeout_ms,
+            max_frame_bytes: self.max_frame_bytes,
+            max_response_bytes: self.max_response_bytes,
+            wire_depth: self.wire_depth,
+            semantic_depth: self.semantic_depth,
+            max_dispatch_members: self.max_dispatch_members,
+            max_dispatch_depth: self.max_dispatch_depth,
+            transport_digest: &self.transport_digest,
         }
     }
 
@@ -130,12 +171,14 @@ impl WorkerStartPremise {
             "config_digest",
             "package_digest",
             "executable_digest",
+            "transport_digest",
             "record_digest",
         ] {
             let value = match label {
                 "config_digest" => &self.config_digest,
                 "package_digest" => &self.package_digest,
                 "executable_digest" => &self.executable_digest,
+                "transport_digest" => &self.transport_digest,
                 _ => &self.record_digest,
             };
             if !is_sha256_digest(value) {
@@ -162,6 +205,56 @@ impl WorkerStartPremise {
                 "endpoint escapes the installed package root".into(),
             ));
         }
+        if !(1..=9_007_199_254_740_991_i64).contains(&self.startup_timeout_ms) {
+            return Err(WorkerStartPremiseError(
+                "startup_timeout_ms out of the safe-integer range".into(),
+            ));
+        }
+        for label in ["max_frame_bytes", "max_response_bytes"] {
+            let value = match label {
+                "max_frame_bytes" => self.max_frame_bytes,
+                _ => self.max_response_bytes,
+            };
+            if !(1..=4_294_967_295_i64).contains(&value) {
+                return Err(WorkerStartPremiseError(format!(
+                    "{label} out of the u32 range"
+                )));
+            }
+        }
+        if !(1..=i64::from(PROTOCOL_WIRE_PARSE_DEPTH)).contains(&self.wire_depth) {
+            return Err(WorkerStartPremiseError(
+                "wire_depth exceeds the protocol wire ceiling".into(),
+            ));
+        }
+        for (label, value) in [
+            ("semantic_depth", self.semantic_depth),
+            ("max_dispatch_depth", self.max_dispatch_depth),
+        ] {
+            if !(1..=i64::from(MAX_SEMANTIC_JSON_NESTING_DEPTH)).contains(&value) {
+                return Err(WorkerStartPremiseError(format!(
+                    "{label} exceeds the semantic depth ceiling"
+                )));
+            }
+        }
+        if !(1..=9_007_199_254_740_991_i64).contains(&self.max_dispatch_members) {
+            return Err(WorkerStartPremiseError(
+                "max_dispatch_members out of the safe-integer range".into(),
+            ));
+        }
+        match serde_json::from_str::<Vec<String>>(&self.spawn_args_json) {
+            Ok(args) => {
+                if args.len() > MAX_SPAWN_ARGS {
+                    return Err(WorkerStartPremiseError(
+                        "spawn_args_json carries too many arguments".into(),
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(WorkerStartPremiseError(
+                    "spawn_args_json is not a JSON string array".into(),
+                ));
+            }
+        }
         let root = Path::new(&self.package_root);
         let package = Path::new(&self.package_path);
         if !root.is_absolute() || !package.is_absolute() {
@@ -176,6 +269,7 @@ impl WorkerStartPremise {
         }
         self.verify_record_digest()
     }
+
 
     /// The database-relative inputs a `WorkerStartConfig` needs.
     pub fn package_root_path(&self) -> PathBuf {
@@ -201,6 +295,15 @@ struct WorkerStartPremiseUnsigned<'a> {
     package_digest: &'a str,
     executable_digest: &'a str,
     endpoint: &'a str,
+    spawn_args_json: &'a str,
+    startup_timeout_ms: i64,
+    max_frame_bytes: i64,
+    max_response_bytes: i64,
+    wire_depth: i64,
+    semantic_depth: i64,
+    max_dispatch_members: i64,
+    max_dispatch_depth: i64,
+    transport_digest: &'a str,
 }
 
 impl WorkerStartPremiseUnsigned<'_> {
@@ -213,6 +316,16 @@ impl WorkerStartPremiseUnsigned<'_> {
     }
 }
 
+/// True when `value` is a safe relative member: non-empty, no `\`, no
+/// absolute or drive components, and no separators beyond `/`.
+pub(crate) fn is_safe_relative_member(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('\\')
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
 /// True when the string is exactly `sha256:` plus 64 lowercase hex digits.
 pub(crate) fn is_sha256_digest(value: &str) -> bool {
     let bytes = value.as_bytes();
@@ -221,16 +334,6 @@ pub(crate) fn is_sha256_digest(value: &str) -> bool {
         && bytes[7..]
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-}
-
-/// True when `value` is a safe relative member: non-empty, no `..`, no
-/// absolute or drive components, and no separators beyond `/`.
-pub(crate) fn is_safe_relative_member(value: &str) -> bool {
-    !value.is_empty()
-        && !value.contains('\\')
-        && value
-            .split('/')
-            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 /// Build the canonical JCS bytes and sealing digest for a premise record.
@@ -250,6 +353,15 @@ pub(crate) fn seal_premise_record(
         package_digest: unsigned.package_digest,
         executable_digest: unsigned.executable_digest,
         endpoint: unsigned.endpoint,
+        spawn_args_json: unsigned.spawn_args_json,
+        startup_timeout_ms: unsigned.startup_timeout_ms,
+        max_frame_bytes: unsigned.max_frame_bytes,
+        max_response_bytes: unsigned.max_response_bytes,
+        wire_depth: unsigned.wire_depth,
+        semantic_depth: unsigned.semantic_depth,
+        max_dispatch_members: unsigned.max_dispatch_members,
+        max_dispatch_depth: unsigned.max_dispatch_depth,
+        transport_digest: unsigned.transport_digest,
         record_digest: String::new(),
     };
     let digest = premise
@@ -283,6 +395,17 @@ pub(crate) struct WorkerStartPremiseInput {
     pub package_digest: String,
     pub executable_digest: String,
     pub endpoint: String,
+    /// Exact spawn argv beyond the executable, already JSON-encoded as a
+    /// string array by the Host producer.
+    pub spawn_args_json: String,
+    pub startup_timeout_ms: i64,
+    pub max_frame_bytes: i64,
+    pub max_response_bytes: i64,
+    pub wire_depth: i64,
+    pub semantic_depth: i64,
+    pub max_dispatch_members: i64,
+    pub max_dispatch_depth: i64,
+    pub transport_digest: String,
 }
 
 /// Insert one sealed premise row inside the caller's open transaction.
@@ -321,8 +444,10 @@ pub(crate) fn insert_worker_start_premise_in_transaction(
         "INSERT INTO worker_start_premises (
             config_revision, config_digest, extension_alias, server_id,
             package_root, package_path, package_digest, executable_digest,
-            endpoint, record_jcs, record_digest
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            endpoint, spawn_args_json, startup_timeout_ms, max_frame_bytes,
+            max_response_bytes, wire_depth, semantic_depth, max_dispatch_members,
+            max_dispatch_depth, transport_digest, record_jcs, record_digest
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         rusqlite::params![
             input.config_revision,
             input.config_digest,
@@ -333,6 +458,15 @@ pub(crate) fn insert_worker_start_premise_in_transaction(
             input.package_digest,
             input.executable_digest,
             input.endpoint,
+            input.spawn_args_json,
+            input.startup_timeout_ms,
+            input.max_frame_bytes,
+            input.max_response_bytes,
+            input.wire_depth,
+            input.semantic_depth,
+            input.max_dispatch_members,
+            input.max_dispatch_depth,
+            input.transport_digest,
             bytes,
             record_digest,
         ],
@@ -382,7 +516,10 @@ pub fn load_worker_start_premise(
     let row = connection
         .query_row(
             "SELECT config_digest, package_root, package_path,
-                    package_digest, executable_digest, endpoint, record_jcs, record_digest
+                    package_digest, executable_digest, endpoint, spawn_args_json,
+                    startup_timeout_ms, max_frame_bytes, max_response_bytes,
+                    wire_depth, semantic_depth, max_dispatch_members,
+                    max_dispatch_depth, transport_digest, record_jcs, record_digest
              FROM worker_start_premises
              WHERE config_revision = ?1 AND extension_alias = ?2 AND server_id = ?3",
             rusqlite::params![revision, extension_alias, server_id],
@@ -394,8 +531,17 @@ pub fn load_worker_start_premise(
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, Vec<u8>>(6)?,
-                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, Vec<u8>>(15)?,
+                    row.get::<_, String>(16)?,
                 ))
             },
         )
@@ -408,6 +554,15 @@ pub fn load_worker_start_premise(
         package_digest,
         executable_digest,
         endpoint,
+        spawn_args_json,
+        startup_timeout_ms,
+        max_frame_bytes,
+        max_response_bytes,
+        wire_depth,
+        semantic_depth,
+        max_dispatch_members,
+        max_dispatch_depth,
+        transport_digest,
         record_bytes,
         record_digest,
     )) = row
@@ -466,6 +621,15 @@ pub fn load_worker_start_premise(
         || premise.package_digest != package_digest
         || premise.executable_digest != executable_digest
         || premise.endpoint != endpoint
+        || premise.spawn_args_json != spawn_args_json
+        || premise.startup_timeout_ms != startup_timeout_ms
+        || premise.max_frame_bytes != max_frame_bytes
+        || premise.max_response_bytes != max_response_bytes
+        || premise.wire_depth != wire_depth
+        || premise.semantic_depth != semantic_depth
+        || premise.max_dispatch_members != max_dispatch_members
+        || premise.max_dispatch_depth != max_dispatch_depth
+        || premise.transport_digest != transport_digest
         || premise.record_digest != record_digest
     {
         return Err(WorkerStartPremiseError(
@@ -476,8 +640,6 @@ pub fn load_worker_start_premise(
     Ok(Some(premise))
 }
 
-/// Read-only hostile-preflight handle over an existing authority database.
-///
 /// Opens SQLite with the driver's read-only flag (no create/write) and sets
 /// `query_only` on the connection. SQLite's WAL reader materializes -shm/
 /// -wal sidecars even for read-only connections; the keeper-connection
@@ -615,6 +777,15 @@ fn gate_worker_start_premise_schema_with(
             ("package_digest", "TEXT", 1, 0),
             ("executable_digest", "TEXT", 1, 0),
             ("endpoint", "TEXT", 1, 0),
+            ("spawn_args_json", "TEXT", 1, 0),
+            ("startup_timeout_ms", "INTEGER", 1, 0),
+            ("max_frame_bytes", "INTEGER", 1, 0),
+            ("max_response_bytes", "INTEGER", 1, 0),
+            ("wire_depth", "INTEGER", 1, 0),
+            ("semantic_depth", "INTEGER", 1, 0),
+            ("max_dispatch_members", "INTEGER", 1, 0),
+            ("max_dispatch_depth", "INTEGER", 1, 0),
+            ("transport_digest", "TEXT", 1, 0),
             ("record_jcs", "BLOB", 1, 0),
             ("record_digest", "TEXT", 1, 0),
         ],
@@ -756,6 +927,15 @@ mod tests {
             package_digest: format!("sha256:{}", "a".repeat(64)),
             executable_digest: format!("sha256:{}", "b".repeat(64)),
             endpoint: "bin/dolly-fs-tools".into(),
+            spawn_args_json: r#"["server.py"]"#.into(),
+            startup_timeout_ms: 10_000,
+            max_frame_bytes: 262_144,
+            max_response_bytes: 262_144,
+            wire_depth: 96,
+            semantic_depth: 64,
+            max_dispatch_members: 4_096,
+            max_dispatch_depth: 64,
+            transport_digest: format!("sha256:{}", "e".repeat(64)),
         }
     }
 
@@ -955,6 +1135,15 @@ mod tests {
             package_digest: format!("sha256:{}", "a".repeat(64)),
             executable_digest: format!("sha256:{}", "b".repeat(64)),
             endpoint: "bin/tool".into(),
+            spawn_args_json: r#"["server.py"]"#.into(),
+            startup_timeout_ms: 10_000,
+            max_frame_bytes: 262_144,
+            max_response_bytes: 262_144,
+            wire_depth: 96,
+            semantic_depth: 64,
+            max_dispatch_members: 4_096,
+            max_dispatch_depth: 64,
+            transport_digest: format!("sha256:{}", "e".repeat(64)),
             record_digest: String::new(),
         };
         assert!(escape.verify_content().is_err());

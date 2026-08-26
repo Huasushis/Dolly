@@ -86,6 +86,15 @@ function premiseInput(overrides: Partial<InstallWorkerStartPremiseInput> = {}): 
     packageDigest: `sha256:${"a".repeat(64)}`,
     executableDigest: `sha256:${"b".repeat(64)}`,
     endpoint: "bin/dolly-fs-tools",
+    spawnArgs: ["server.py"],
+    startupTimeoutMs: 10_000,
+    maxFrameBytes: 262_144,
+    maxResponseBytes: 262_144,
+    wireDepth: 96,
+    semanticDepth: 64,
+    maxDispatchMembers: 4_096,
+    maxDispatchDepth: 64,
+    transportDigest: `sha256:${"e".repeat(64)}`,
     ...overrides,
   };
 }
