@@ -394,7 +394,7 @@ def run_suite(seeds: int = 30, horizon: int = 4200) -> dict[str, Any]:
             "no_progress_cells": sum(r["sustained_no_progress"] > 0 for r in cell_rows),
             "unfinished_cells": sum(r["pending_after_drain"] > 0 for r in cell_rows),
             "mean_queue_cv": mean([r["queue_cv"] for r in cell_rows]),
-            "mean_fairness": mean([r["source_fairness"] for r in cell_rows),
+            "mean_fairness": mean([r["source_fairness"] for r in cell_rows]),
         }
 
     best_aimd = max(aimd_robustness, key=lambda p: (aimd_robustness[p]["win_fraction"], aimd_robustness[p]["safe_fraction"]))
