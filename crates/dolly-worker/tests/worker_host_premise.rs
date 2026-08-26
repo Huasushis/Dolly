@@ -72,8 +72,18 @@ struct Fixture {
 fn digest_of(value: &serde_json::Value) -> Sha256Digest {
     canonicalize(value).expect("canonicalize").1
 }
+
+/// The installed child's entry writes this file into its cwd (the package
+/// root) the moment it starts, so its absence after a refused run proves the
+/// child process never executed — independent of the parent's stdout.
+const CHILD_START_MARKER: &str = "child-started.marker";
+
 fn fake_server_bytes() -> Vec<u8> {
     r#"import json, sys
+
+# Child-entry marker: only the spawned child process writes this file, into
+# its cwd (the package root the Worker selected).
+open("child-started.marker", "w").close()
 
 for line in sys.stdin:
     line = line.strip()
@@ -760,6 +770,7 @@ fn rewrite_sealed_premise_field(db_path: &Path, column: &str, record_key: &str, 
 /// The Worker creates these tables AFTER the sealed-contract comparison, so
 /// their absence across a refused run proves the comparison voted before the
 /// schema mutations could run.
+/// True when the Tool-call ledger slice the Worker installs on startup exists.
 fn tool_ledger_slice_present(db_path: &Path) -> bool {
     let connection = Connection::open(db_path).expect("reopen raw");
     let count: i64 = connection
@@ -774,11 +785,59 @@ fn tool_ledger_slice_present(db_path: &Path) -> bool {
     count != 0
 }
 
+/// True when the effect-journal slice the Worker installs on startup exists.
+fn effect_journal_slice_present(db_path: &Path) -> bool {
+    let connection = Connection::open(db_path).expect("reopen raw");
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+               AND name IN ('external_effect_journal', 'external_effect_journal_meta')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count journal tables");
+    drop(connection);
+    count != 0
+}
+
+/// Remove the effect-journal slice a committed authority fixture inherits
+/// from `install_host_authority_revision`, so the Worker's OWN first-use
+/// journal install (the first mutation after the sealed-contract check) is
+/// what a refused run must prove absent.
+fn drop_effect_journal_slice(db_path: &Path) {
+    let connection = Connection::open(db_path).expect("reopen raw");
+    connection
+        .execute_batch(
+            "DROP TABLE IF EXISTS external_effect_journal;
+             DROP TABLE IF EXISTS external_effect_journal_meta;
+             DROP INDEX IF EXISTS effect_journal_recovery;",
+        )
+        .expect("drop effect-journal slice");
+    drop(connection);
+    assert!(
+        !effect_journal_slice_present(db_path),
+        "effect-journal slice must be gone after drop"
+    );
+}
+
+/// A committed authority fixture WITHOUT the effect-journal slice, so the
+/// Worker's first schema mutation is observable across the mismatch vectors.
+fn fixture_without_effect_journal(insert: bool) -> Fixture {
+    let fixture = fixture_with_premise(insert);
+    drop_effect_journal_slice(&fixture.db_path);
+    fixture
+}
+
 /// Common assertions for one sealed-contract mismatch: the production binary
-/// refuses typed before any started frame and before the Worker's own schema
-/// mutations, so no child could have been spawned.
+/// refuses typed before any started frame, before the Worker's schema
+/// mutations (effect journal AND tool ledger), and before any child process
+/// could write its entry marker.
 #[cfg(target_os = "linux")]
-fn assert_sealed_contract_mismatch_refuses_before_spawn(db_path: &Path, label: &str) {
+fn assert_sealed_contract_mismatch_refuses_before_spawn(
+    db_path: &Path,
+    package_root: &Path,
+    label: &str,
+) {
     let (code, stdout, stderr) = run_host(db_path);
     assert_ne!(code, Some(0), "{label}: mismatch must not start the host");
     assert!(
@@ -789,9 +848,20 @@ fn assert_sealed_contract_mismatch_refuses_before_spawn(db_path: &Path, label: &
         stdout.is_empty(),
         "{label}: refusal must precede any stdout frame"
     );
+    // The child-start marker is written only by the spawned child process
+    // entry; its absence proves no child existed, not just no stdout frame.
+    let marker = package_root.join(CHILD_START_MARKER);
+    assert!(
+        !marker.exists(),
+        "{label}: child entry marker exists, so a child was spawned"
+    );
+    assert!(
+        !effect_journal_slice_present(db_path),
+        "{label}: the Worker's effect-journal schema mutation must not run before the sealed-contract refusal"
+    );
     assert!(
         !tool_ledger_slice_present(db_path),
-        "{label}: the Worker's schema mutations must not run before the sealed-contract refusal"
+        "{label}: the Worker's tool-ledger schema mutation must not run before the sealed-contract refusal"
     );
 }
 
@@ -800,9 +870,13 @@ fn assert_sealed_contract_mismatch_refuses_before_spawn(db_path: &Path, label: &
 #[cfg(target_os = "linux")]
 #[test]
 fn frame_limit_mismatch_refuses_before_spawn_or_schema() {
-    let fixture = fixture_with_premise(true);
+    let fixture = fixture_without_effect_journal(true);
     rewrite_sealed_premise_field(&fixture.db_path, "max_frame_bytes", "max_frame_bytes", 12345);
-    assert_sealed_contract_mismatch_refuses_before_spawn(&fixture.db_path, "frame limit");
+    assert_sealed_contract_mismatch_refuses_before_spawn(
+        &fixture.db_path,
+        &fixture.package_root,
+        "frame limit",
+    );
 }
 
 /// A sealed wire depth below the reloaded protocol ceiling must refuse the
@@ -810,9 +884,13 @@ fn frame_limit_mismatch_refuses_before_spawn_or_schema() {
 #[cfg(target_os = "linux")]
 #[test]
 fn wire_depth_mismatch_refuses_before_spawn_or_schema() {
-    let fixture = fixture_with_premise(true);
+    let fixture = fixture_without_effect_journal(true);
     rewrite_sealed_premise_field(&fixture.db_path, "wire_depth", "wire_depth", 95);
-    assert_sealed_contract_mismatch_refuses_before_spawn(&fixture.db_path, "wire depth");
+    assert_sealed_contract_mismatch_refuses_before_spawn(
+        &fixture.db_path,
+        &fixture.package_root,
+        "wire depth",
+    );
 }
 
 /// A sealed dispatch member limit that disagrees with the admitted server
@@ -820,14 +898,18 @@ fn wire_depth_mismatch_refuses_before_spawn_or_schema() {
 #[cfg(target_os = "linux")]
 #[test]
 fn dispatch_limits_mismatch_refuses_before_spawn_or_schema() {
-    let fixture = fixture_with_premise(true);
+    let fixture = fixture_without_effect_journal(true);
     rewrite_sealed_premise_field(
         &fixture.db_path,
         "max_dispatch_members",
         "max_dispatch_members",
         999,
     );
-    assert_sealed_contract_mismatch_refuses_before_spawn(&fixture.db_path, "dispatch members");
+    assert_sealed_contract_mismatch_refuses_before_spawn(
+        &fixture.db_path,
+        &fixture.package_root,
+        "dispatch members",
+    );
 }
 
 /// A sealed semantic depth ceiling below the reloaded protocol ceiling must
@@ -836,9 +918,13 @@ fn dispatch_limits_mismatch_refuses_before_spawn_or_schema() {
 #[cfg(target_os = "linux")]
 #[test]
 fn semantic_depth_mismatch_refuses_before_spawn_or_schema() {
-    let fixture = fixture_with_premise(true);
+    let fixture = fixture_without_effect_journal(true);
     rewrite_sealed_premise_field(&fixture.db_path, "semantic_depth", "semantic_depth", 63);
-    assert_sealed_contract_mismatch_refuses_before_spawn(&fixture.db_path, "semantic depth");
+    assert_sealed_contract_mismatch_refuses_before_spawn(
+        &fixture.db_path,
+        &fixture.package_root,
+        "semantic depth",
+    );
 }
 
 /// Driving the production binary against an unusable stored premise leaves
@@ -952,6 +1038,13 @@ fn retained_lifecycle_answers_started_status_then_stop() {
 
     let exit = child.wait().expect("reap worker_host after stop");
     assert!(exit.success(), "explicit stop must exit cleanly: {exit}");
+    // Positive control for the mismatch vectors: the started child wrote the
+    // entry marker, so its absence in the refused runs is real evidence no
+    // child executed.
+    assert!(
+        fixture.package_root.join(CHILD_START_MARKER).exists(),
+        "the started child must have written its entry marker"
+    );
 }
 
 /// A status request split across two pipe writes (header bytes first, body
@@ -998,6 +1091,13 @@ fn fragmented_status_frame_is_reassembled_and_answered() {
     );
     let exit = child.wait().expect("reap worker_host after stop");
     assert!(exit.success(), "explicit stop must exit cleanly: {exit}");
+    // Positive control for the mismatch vectors: the started child wrote the
+    // entry marker, so its absence in the refused runs is real evidence no
+    // child executed.
+    assert!(
+        fixture.package_root.join(CHILD_START_MARKER).exists(),
+        "the started child must have written its entry marker"
+    );
 }
 
 /// A declared frame length over the frozen 262144-byte cap is typed fatal:
