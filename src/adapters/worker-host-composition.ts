@@ -19,14 +19,24 @@ import {
   InstalledWorkerHostError,
   launchInstalledWorkerHost,
   type InstalledWorkerHostHandle,
+  type InstalledWorkerHostSpawnOptions,
 } from "./installed-worker-host.js";
 import {
   MAX_SEMANTIC_JSON_NESTING_DEPTH,
   PROTOCOL_WIRE_PARSE_DEPTH,
+  RuntimeAuthorityDatabase,
+  type CurrentAuthoritySnapshot,
   type InstallWorkerStartPremiseInput,
-  type RuntimeAuthorityDatabase,
 } from "./storage/runtime-authority-database.js";
 import { canonicalJsonDigest, type JsonValue } from "../schema-bundle/index.js";
+import {
+  ExtensionInstallationRegistry,
+  type ResolvedExtensionInstallation,
+} from "../core/extension-installation-registry.js";
+import { InstanceControllerLock } from "../core/instance-controller-lock.js";
+import { InstalledComponentOriginRegistry } from "../core/installed-component-origin.js";
+import type { ChildProcess } from "node:child_process";
+import type { StartupAuthorityPermissionContext } from "../core/startup-authority-premise.js";
 
 /** Spawn-argument ceiling shared with the Rust MAX_SPAWN_ARGS. */
 const MAX_SPAWN_ARGS = 64;
@@ -42,6 +52,12 @@ export interface HostWorkerHostLaunchOptions {
   readonly installedPackageRoot: string;
   /** Absolute installed package archive path inside `installedPackageRoot`. */
   readonly installedPackagePath: string;
+  /** Process-boundary injection (deterministic tests only), forwarded to the adapter. */
+  readonly spawn?: (
+    command: string,
+    args: readonly string[],
+    options: InstalledWorkerHostSpawnOptions,
+  ) => ChildProcess;
 }
 
 function objectField(value: JsonValue, name: string, label: string): Record<string, JsonValue> {
@@ -283,5 +299,184 @@ export async function launchHostWorkerHost(
 ): Promise<InstalledWorkerHostHandle> {
   const premise = deriveWorkerStartPremise(options);
   options.database.installWorkerStartPremise(premise);
-  return launchInstalledWorkerHost({ database: options.database, premise });
+  return launchInstalledWorkerHost({
+    database: options.database,
+    premise,
+    ...(options.spawn === undefined ? {} : { spawn: options.spawn }),
+  });
+}
+
+/**
+ * Production per-instance owner of the installed tool-broker worker hosts.
+ *
+ * The Runtime Worker already holds the live `{database, controller,
+ * origins}` authority context and the Host-owned `ExtensionInstallationRegistry`
+ * of immutable package bytes. This owner preflights EVERY admitted identity
+ * pair read-only against that context — absent or mismatched current config,
+ * unknown/disabled server, and absent or mismatched installation all refuse
+ * before any compose spawn or durable premise projection — then launches
+ * each server through `launchHostWorkerHost`, retaining the returned handles
+ * so shutdown can stop and reap every Tool Broker descendant before storage
+ * close and lock release.
+ */
+export interface HostWorkerHostOwnerOptions
+  extends StartupAuthorityPermissionContext {
+  /** Host-owned register of immutable installed package bytes. */
+  readonly installations: ExtensionInstallationRegistry;
+  readonly extensionAlias: string;
+  /** Configured tool-broker server identifiers to launch, unique and non-empty. */
+  readonly serverIds: readonly string[];
+  /** Process-boundary injection (deterministic tests only). */
+  readonly spawn?: HostWorkerHostLaunchOptions["spawn"];
+}
+
+export interface HostWorkerHostOwner {
+  readonly serverIds: readonly string[];
+  readonly handles: readonly { readonly serverId: string; readonly pid: number }[];
+  /** Idempotent stop: stops and reaps every retained worker host. */
+  stop(): Promise<void>;
+}
+
+function assertHostWorkerHostOwnerOptions(
+  value: unknown,
+): asserts value is HostWorkerHostOwnerOptions {
+  const candidate = value as Record<string, unknown> | null;
+  if (
+    candidate === null ||
+    typeof candidate !== "object" ||
+    !(candidate.database instanceof RuntimeAuthorityDatabase) ||
+    !(candidate.controller instanceof InstanceControllerLock) ||
+    !(candidate.origins instanceof InstalledComponentOriginRegistry) ||
+    !(candidate.installations instanceof ExtensionInstallationRegistry)
+  ) {
+    throw new InstalledWorkerHostError(
+      "WORKER_START_INVALID",
+      "worker-host owner requires the live Host authority context and installation register",
+    );
+  }
+  const options = value as HostWorkerHostOwnerOptions;
+  if (
+    typeof options.extensionAlias !== "string" ||
+    options.extensionAlias.length === 0 ||
+    !Array.isArray(options.serverIds) ||
+    options.serverIds.length === 0 ||
+    options.serverIds.some(
+      (serverId) => typeof serverId !== "string" || serverId.length === 0,
+    ) ||
+    new Set(options.serverIds).size !== options.serverIds.length
+  ) {
+    throw new InstalledWorkerHostError(
+      "WORKER_START_INVALID",
+      "worker-host owner requires a non-empty extension alias and unique server identifiers",
+    );
+  }
+}
+
+/**
+ * Resolves one admitted tool-broker identity pair to the Host-owned managed
+ * package bytes. Refuses before any compose spawn or durable projection when
+ * the current config, the server contract, or the installation is absent or
+ * mismatched.
+ */
+function admittedInstallation(
+  snapshot: CurrentAuthoritySnapshot,
+  installations: ExtensionInstallationRegistry,
+  serverId: string,
+): { installedPackageRoot: string; installedPackagePath: string; packageDigest: string } {
+  const { transport } = admittedServerContract(snapshot.canonicalConfig, serverId);
+  const packageId = requireString(transport, "package_id", "stdio transport");
+  const packageVersion = requireString(transport, "package_version", "stdio transport");
+  let installed: ResolvedExtensionInstallation;
+  try {
+    installed = installations.resolve({ extensionId: packageId, packageVersion });
+  } catch (error) {
+    if (error instanceof InstalledWorkerHostError) throw error;
+    throw new InstalledWorkerHostError(
+      "WORKER_START_INVALID",
+      `configured tool-broker server ${serverId} has no Host-owned installation for ${packageId}@${packageVersion}`,
+    );
+  }
+  if (installed.packageDigest !== requireString(transport, "package_digest", "stdio transport")) {
+    throw new InstalledWorkerHostError(
+      "WORKER_START_INVALID",
+      `configured tool-broker server ${serverId} package digest does not match the Host-owned installation`,
+    );
+  }
+  return {
+    installedPackageRoot: installed.workingDirectory,
+    installedPackagePath: installed.entrypointPath,
+    packageDigest: installed.packageDigest,
+  };
+}
+
+/**
+ * Start and own every configured tool-broker worker host for one instance.
+ *
+ * All admission preflights complete read-only before the first projection or
+ * spawn, so a refused pair leaves the repository at its prior revision with
+ * zero durable effects. A mid-composition launch failure rolls back by
+ * stopping and reaping every handle already retained, then rethrows.
+ */
+export async function startHostWorkerHost(
+  options: HostWorkerHostOwnerOptions,
+): Promise<HostWorkerHostOwner> {
+  assertHostWorkerHostOwnerOptions(options);
+  const { database, extensionAlias, installations, serverIds, spawn } = options;
+  const snapshot = database.readCurrentConfig();
+  if (snapshot === null) {
+    throw new InstalledWorkerHostError(
+      "WORKER_START_INVALID",
+      "no committed current configuration",
+    );
+  }
+  const launches = serverIds.map((serverId) => {
+    const installed = admittedInstallation(snapshot, installations, serverId);
+    const premise = deriveWorkerStartPremise({
+      database,
+      extensionAlias,
+      serverId,
+      installedPackageRoot: installed.installedPackageRoot,
+      installedPackagePath: installed.installedPackagePath,
+    });
+    if (premise.packageDigest !== installed.packageDigest) {
+      throw new InstalledWorkerHostError(
+        "WORKER_START_INVALID",
+        `configured tool-broker server ${serverId} premise package digest does not match the Host-owned installation`,
+      );
+    }
+    return { serverId, ...installed };
+  });
+  const retained: Array<{ serverId: string; handle: InstalledWorkerHostHandle }> = [];
+  try {
+    for (const launch of launches) {
+      const handle = await launchHostWorkerHost({
+        database,
+        extensionAlias,
+        serverId: launch.serverId,
+        installedPackageRoot: launch.installedPackageRoot,
+        installedPackagePath: launch.installedPackagePath,
+        ...(spawn === undefined ? {} : { spawn }),
+      });
+      retained.push({ serverId: launch.serverId, handle });
+    }
+  } catch (error) {
+    // Rollback: stop and reap every already-launched descendant before leaving.
+    await Promise.all(retained.map((entry) => entry.handle.stop()));
+    throw error;
+  }
+  let stopped = false;
+  return Object.freeze({
+    serverIds: Object.freeze([...serverIds]),
+    handles: Object.freeze(
+      retained.map((entry) =>
+        Object.freeze({ serverId: entry.serverId, pid: entry.handle.pid }),
+      ),
+    ),
+    stop: async () => {
+      if (stopped) return;
+      stopped = true;
+      await Promise.all(retained.map((entry) => entry.handle.stop()));
+      retained.length = 0;
+    },
+  });
 }
