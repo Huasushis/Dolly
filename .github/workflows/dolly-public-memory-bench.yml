@@ -1,0 +1,79 @@
+name: Dolly public memory retrieval
+
+on:
+  push:
+    branches:
+      - research/dolly-layer-2026-08-26
+    paths:
+      - "research/dolly_research_layer/public_retrieval_bench.py"
+      - ".github/workflows/dolly-public-memory-bench.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  locomo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Download pinned LoCoMo data
+        run: |
+          mkdir -p .cache/datasets
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://raw.githubusercontent.com/snap-research/locomo/d95b872480b413d935821fdc3c84f8a8f5f29e73/data/locomo10.json \
+            --output .cache/datasets/locomo10.json
+          echo "d95b872480b413d935821fdc3c84f8a8f5f29e73  upstream Git blob" > .cache/datasets/locomo.source.txt
+          ls -lh .cache/datasets/locomo10.json
+      - name: Run LoCoMo evidence-retrieval diagnostics
+        run: |
+          python research/dolly_research_layer/public_retrieval_bench.py \
+            --locomo .cache/datasets/locomo10.json \
+            --out research/dolly_research_layer/out-public-locomo
+      - name: Print summary
+        run: cat research/dolly_research_layer/out-public-locomo/public_summary.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dolly-public-locomo-${{ github.sha }}
+          path: research/dolly_research_layer/out-public-locomo/
+          if-no-files-found: error
+          retention-days: 30
+
+  longmemeval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: .cache/datasets/longmemeval_s_cleaned.json
+          key: longmemeval-s-cleaned-98d7416-v1
+      - name: Download pinned LongMemEval-S-cleaned data
+        run: |
+          mkdir -p .cache/datasets
+          if [ ! -s .cache/datasets/longmemeval_s_cleaned.json ]; then
+            curl --fail --location --retry 5 --retry-all-errors \
+              https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/98d7416c24c778c2fee6e6f3006e7a073259d48f/longmemeval_s_cleaned.json?download=true \
+              --output .cache/datasets/longmemeval_s_cleaned.json
+          fi
+          ls -lh .cache/datasets/longmemeval_s_cleaned.json
+      - name: Run LongMemEval evidence-retrieval diagnostics
+        run: |
+          python research/dolly_research_layer/public_retrieval_bench.py \
+            --longmemeval .cache/datasets/longmemeval_s_cleaned.json \
+            --out research/dolly_research_layer/out-public-longmemeval
+      - name: Print summary
+        run: cat research/dolly_research_layer/out-public-longmemeval/public_summary.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dolly-public-longmemeval-${{ github.sha }}
+          path: research/dolly_research_layer/out-public-longmemeval/
+          if-no-files-found: error
+          retention-days: 30
