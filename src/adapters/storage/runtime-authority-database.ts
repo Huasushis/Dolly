@@ -819,7 +819,7 @@ CREATE TABLE runtime_authority_state (
     REFERENCES config_revision_mappings(config_revision, config_digest)
 );
 CREATE TABLE worker_start_premises (
-  config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND ${MAX_CONFIG_REVISION}),
+  config_revision INTEGER NOT NULL CHECK (config_revision BETWEEN 1 AND ${MAX_CONFIG_REVISION}),
   config_digest TEXT NOT NULL,
   extension_alias TEXT NOT NULL CHECK (length(extension_alias) > 0),
   server_id TEXT NOT NULL CHECK (length(server_id) > 0),
@@ -830,7 +830,7 @@ CREATE TABLE worker_start_premises (
   endpoint TEXT NOT NULL CHECK (length(endpoint) > 0),
   record_jcs BLOB NOT NULL,
   record_digest TEXT NOT NULL,
-  UNIQUE (config_revision, config_digest),
+  PRIMARY KEY (config_revision, extension_alias, server_id),
   FOREIGN KEY (config_revision, config_digest)
     REFERENCES config_revision_mappings(config_revision, config_digest),
   CHECK (substr(package_path, 1, length(package_root) + 1) = package_root || '/')
@@ -956,10 +956,10 @@ const AUTHORITY_SCHEMA_COLUMNS: Readonly<Record<string, readonly AuthoritySchema
     { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
   ],
   worker_start_premises: [
-    { name: "config_revision", type: "INTEGER", notNull: 0, primaryKey: 1 },
+    { name: "config_revision", type: "INTEGER", notNull: 1, primaryKey: 1 },
     { name: "config_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
-    { name: "extension_alias", type: "TEXT", notNull: 1, primaryKey: 0 },
-    { name: "server_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "extension_alias", type: "TEXT", notNull: 1, primaryKey: 2 },
+    { name: "server_id", type: "TEXT", notNull: 1, primaryKey: 3 },
     { name: "package_root", type: "TEXT", notNull: 1, primaryKey: 0 },
     { name: "package_path", type: "TEXT", notNull: 1, primaryKey: 0 },
     { name: "package_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
@@ -1026,11 +1026,10 @@ const AUTHORITY_SCHEMA_CHECKS: Readonly<Record<string, readonly string[]>> = Obj
     "check (package_digest like 'sha256:%')",
     "check (executable_digest like 'sha256:%')",
     "check (length(endpoint) > 0)",
-    "unique (config_revision, config_digest)",
+    "primary key (config_revision, extension_alias, server_id)",
     "check (substr(package_path, 1, length(package_root) + 1) = package_root || '/')",
   ],
 });
-
 const AUTHORITY_SCHEMA_FOREIGN_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   permission_policy_backend_bindings: [
     "0:0:installed_component_origins:origin_component_id:component_id:NO ACTION:NO ACTION:NONE",
@@ -1102,8 +1101,7 @@ const AUTHORITY_SCHEMA_INDEXES: Readonly<Record<string, readonly AuthorityIndexS
     [1, "pk", 0, ["config_revision", "policy_id", "policy_revision"]],
     [1, "u", 0, ["config_revision", "binding_id", "binding_revision", "binding_digest"]],
   ],
-  runtime_authority_state: [],
-  worker_start_premises: [[1, "u", 0, ["config_revision", "config_digest"]]],
+  worker_start_premises: [[1, "pk", 0, ["config_revision", "extension_alias", "server_id"]]],
   core_meta: [],
   commit_sequence: [],
   core_journal: [],
@@ -1437,6 +1435,7 @@ function stateRecord(identity: RuntimeAuthorityIdentity, controllerGenerationId:
  * it for writing; every writable operation re-asserts that handle.
  */
 export class RuntimeAuthorityDatabase {
+  readonly #databasePath: string;
   readonly #connection: RuntimeSqliteConnection;
   readonly #identity: RuntimeAuthorityIdentity;
   readonly #lock: RuntimeAuthorityLockHandle;
@@ -1448,11 +1447,21 @@ export class RuntimeAuthorityDatabase {
     identity: RuntimeAuthorityIdentity,
     lock: RuntimeAuthorityLockHandle,
     controllerGenerationId: string,
+    databasePath: string,
   ) {
+    this.#databasePath = databasePath;
     this.#connection = connection;
     this.#identity = identity;
     this.#lock = lock;
     this.#controllerGenerationId = controllerGenerationId;
+  }
+
+  /** Narrow read-only accessor for the opened database path. Exists so the
+   * installed-worker-host adapter can compose the frozen child argv from
+   * the repository itself instead of a second caller-supplied path; the
+   * repository never spawns processes. */
+  get path(): string {
+    return this.#databasePath;
   }
 
   /** Opens through the H0 attested loader and verifies the committed DB (REQ-AUTH-004). */
@@ -1475,6 +1484,7 @@ export class RuntimeAuthorityDatabase {
         options.identity,
         options.lock,
         controllerGenerationId,
+        options.path,
       );
       repository.#verifyOnOpen();
       return repository;
@@ -1507,6 +1517,7 @@ export class RuntimeAuthorityDatabase {
         options.identity,
         options.lock,
         controllerGenerationId,
+        options.path,
       );
       repository.#migrateLegacyV1();
       repository.#verifyOnOpen();
@@ -2028,7 +2039,7 @@ export class RuntimeAuthorityDatabase {
       ).get();
       if (!workerPremises) {
         this.#connection.prepare(
-          "CREATE TABLE worker_start_premises (config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991), config_digest TEXT NOT NULL, extension_alias TEXT NOT NULL CHECK (length(extension_alias) > 0), server_id TEXT NOT NULL CHECK (length(server_id) > 0), package_root TEXT NOT NULL CHECK (length(package_root) > 0), package_path TEXT NOT NULL CHECK (length(package_path) > 0), package_digest TEXT NOT NULL CHECK (package_digest LIKE 'sha256:%'), executable_digest TEXT NOT NULL CHECK (executable_digest LIKE 'sha256:%'), endpoint TEXT NOT NULL CHECK (length(endpoint) > 0), record_jcs BLOB NOT NULL, record_digest TEXT NOT NULL, UNIQUE (config_revision, config_digest), FOREIGN KEY (config_revision, config_digest) REFERENCES config_revision_mappings(config_revision, config_digest), CHECK (substr(package_path, 1, length(package_root) + 1) = package_root || '/'))",
+          "CREATE TABLE worker_start_premises (config_revision INTEGER NOT NULL CHECK (config_revision BETWEEN 1 AND 9007199254740991), config_digest TEXT NOT NULL, extension_alias TEXT NOT NULL CHECK (length(extension_alias) > 0), server_id TEXT NOT NULL CHECK (length(server_id) > 0), package_root TEXT NOT NULL CHECK (length(package_root) > 0), package_path TEXT NOT NULL CHECK (length(package_path) > 0), package_digest TEXT NOT NULL CHECK (package_digest LIKE 'sha256:%'), executable_digest TEXT NOT NULL CHECK (executable_digest LIKE 'sha256:%'), endpoint TEXT NOT NULL CHECK (length(endpoint) > 0), record_jcs BLOB NOT NULL, record_digest TEXT NOT NULL, PRIMARY KEY (config_revision, extension_alias, server_id), FOREIGN KEY (config_revision, config_digest) REFERENCES config_revision_mappings(config_revision, config_digest), CHECK (substr(package_path, 1, length(package_root) + 1) = package_root || '/'))",
         ).run();
       }
       const recordBytes = Buffer.from(canonicalBytes(
@@ -2653,15 +2664,15 @@ export class RuntimeAuthorityDatabase {
         );
       }
       const existing = this.#connection.prepare(
-        "SELECT record_digest FROM worker_start_premises WHERE config_revision = ?",
-      ).get(snapshot.config_revision);
+        "SELECT record_digest FROM worker_start_premises WHERE config_revision = ? AND extension_alias = ? AND server_id = ?",
+      ).get(snapshot.config_revision, input.extensionAlias, input.serverId);
       if (existing !== undefined) {
         if (String(existing.record_digest) === record.recordDigest) {
-          return; // idempotent identical projection
+          return; // Idempotent identical projection for this identity pair.
         }
         throw new RuntimeAuthorityDatabaseError(
           "WORKER_START_PREMISE_CONFLICT",
-          "a different Worker-start premise is already projected for this revision",
+          "a different Worker-start premise is already projected for this identity pair",
         );
       }
       this.#connection.prepare(
