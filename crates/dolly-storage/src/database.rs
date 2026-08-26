@@ -472,6 +472,22 @@ impl Database {
         open_internal(db_path, attestation).map(|database| database)
     }
 
+    /// Open an existing committed authority database that was written by the
+    /// Host-owned TypeScript authority writer (not by this Rust build).
+    ///
+    /// The Worker is the sanctioned consumer of such databases: it installs
+    /// its required effect-journal and tool-ledger slices on first startup,
+    /// so the open refuses only a present-but-corrupt slice, never an absent
+    /// one. Identity, schema, and lock discipline are identical to
+    /// [`Database::open`].
+    pub fn open_host_authority(db_path: &Path) -> StorageResult<Self> {
+        open_internal_with(
+            db_path,
+            &crate::attestation::release_attestation(),
+            crate::effect_journal::JournalPresencePolicy::AbsentIsEmpty,
+        )
+    }
+
     /// Open the smallest explicit offline handle used to initialize/migrate
     /// an empty database. The handle has no public connection surface and
     /// performs no SQLite or lock setup until migration input is validated.
@@ -789,8 +805,19 @@ impl OfflineDatabase {
         self.migrate_legacy_json(&bytes)
     }
 }
-
 fn open_internal(db_path: &Path, attestation: &ReleaseAttestation) -> StorageResult<Database> {
+    open_internal_with(
+        db_path,
+        attestation,
+        crate::effect_journal::JournalPresencePolicy::Required,
+    )
+}
+
+fn open_internal_with(
+    db_path: &Path,
+    attestation: &ReleaseAttestation,
+    journal_presence: crate::effect_journal::JournalPresencePolicy,
+) -> StorageResult<Database> {
     reject_symlink_components(db_path)?;
     let path_lock_path = instance_lock_path(db_path);
     reject_symlink_components(&path_lock_path)?;
@@ -837,7 +864,7 @@ fn open_internal(db_path: &Path, attestation: &ReleaseAttestation) -> StorageRes
         cleanup.note_database_artifacts()?;
         let schema_version = ensure_schema(&connection, &verified)?;
         verify_sqlite_integrity(&connection)?;
-        crate::effect_journal::verify_open_limits(&connection)?;
+        crate::effect_journal::verify_open_limits_with_policy(&connection, journal_presence)?;
         let authority_identity =
             validate_authority_state(&connection)?.ok_or(StorageError::MigrationRequired)?;
         let persisted_generation = read_controller_generation(&connection)?;
@@ -2269,10 +2296,22 @@ fn ensure_schema(connection: &Connection, verified: &VerifiedSqliteBuild) -> Sto
     if schema_version != SCHEMA_VERSION {
         return Err(StorageError::MigrationRequired);
     }
-    if version_number != verified.version_number as i64
-        || source_id != verified.source_id
-        || artifact_digest != verified.artifact_digest.to_string()
-    {
+    // The shared authority database has two sanctioned writers, so the
+    // core_meta diagnostic fingerprint may belong to either one. A database
+    // written by this Rust build records exactly this build's attested
+    // library identity. The Host-owned TypeScript authority writer records
+    // its H0-attested native SQLite identity as `sha256(sqlite_source_id)`,
+    // because ITS open was already attested on the Host side. Either
+    // fingerprint must be self-consistent under its own scheme; anything
+    // else is corruption. The loaded-library attestation of THIS process is
+    // enforced separately by `SqliteBuildGate` before this check runs.
+    let same_build_fingerprint = version_number == verified.version_number as i64
+        && source_id == verified.source_id
+        && artifact_digest == verified.artifact_digest.to_string();
+    let host_writer_fingerprint = Sha256Digest::compute(source_id.as_bytes())
+        .to_canonical_string()
+        == artifact_digest;
+    if !same_build_fingerprint && !host_writer_fingerprint {
         return Err(StorageError::Corrupt);
     }
     Ok(SCHEMA_VERSION)

@@ -10,7 +10,8 @@ use dolly_core_domain::ExtensionId;
 use dolly_storage::Database;
 use dolly_storage::effect_journal::{
     EffectJournalInsertDisposition, EffectJournalIntentAuthority, assert_operation_claimable,
-    gate_schema_version, insert_intent, retain_settled_effect_journal, settle_non_effect_intent,
+    create_effect_journal_schema, gate_schema_version, insert_intent,
+    retain_settled_effect_journal, settle_non_effect_intent,
     settle_pending_effect_journal, settle_unknown_intent,
 };
 use dolly_storage::host_authority::load_current_authority;
@@ -48,6 +49,25 @@ pub struct WorkerStartConfig {
     pub executable_digest: String,
     pub endpoint: String,
     pub record_digest: String,
+    /// Exact spawn argv beyond the executable, equality-bound to the sealed
+    /// premise row. The child is spawned with exactly these arguments.
+    pub spawn_args: Vec<String>,
+    /// Sealed startup deadline in milliseconds.
+    pub startup_timeout_ms: i64,
+    /// Sealed stdio frame byte cap for request and response frames.
+    pub max_frame_bytes: i64,
+    /// Sealed maximum admitted response frame size in bytes.
+    pub max_response_bytes: i64,
+    /// Sealed wire parse-depth ceiling for every frame.
+    pub wire_depth: i64,
+    /// Sealed semantic JSON depth ceiling for every frame.
+    pub semantic_depth: i64,
+    /// Sealed maximum total members across one dispatch response tree.
+    pub max_dispatch_members: i64,
+    /// Sealed maximum nesting depth inside one dispatch response.
+    pub max_dispatch_depth: i64,
+    /// Digest of the canonical transport contract this config was derived from.
+    pub transport_digest: String,
 }
 pub mod premise;
 #[cfg(feature = "test-support")]
@@ -180,6 +200,18 @@ fn bind_premise_fields(
         || durable_premise.executable_digest != config.executable_digest
         || durable_premise.endpoint != config.endpoint
         || durable_premise.record_digest != config.record_digest
+        || serde_json::from_str::<Vec<String>>(&durable_premise.spawn_args_json)
+            .map(|args| args == config.spawn_args)
+            .unwrap_or(false)
+            != true
+        || durable_premise.startup_timeout_ms != config.startup_timeout_ms
+        || durable_premise.max_frame_bytes != config.max_frame_bytes
+        || durable_premise.max_response_bytes != config.max_response_bytes
+        || durable_premise.wire_depth != config.wire_depth
+        || durable_premise.semantic_depth != config.semantic_depth
+        || durable_premise.max_dispatch_members != config.max_dispatch_members
+        || durable_premise.max_dispatch_depth != config.max_dispatch_depth
+        || durable_premise.transport_digest != config.transport_digest
         || snapshot.mapping.config_revision != config.config_revision
         || snapshot.mapping.config_digest.to_canonical_string() != config.config_digest
     {
@@ -209,7 +241,7 @@ impl Worker {
         }
         Self::preflight_premise(&config)?;
 
-        let mut database = Database::open(&config.db_path)
+        let mut database = Database::open_host_authority(&config.db_path)
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
 
         let snapshot = load_current_authority(database.connection())
@@ -281,6 +313,14 @@ impl Worker {
             || durable_premise.executable_digest != config.executable_digest
             || durable_premise.endpoint != config.endpoint
             || durable_premise.record_digest != config.record_digest
+            || durable_premise.startup_timeout_ms != config.startup_timeout_ms
+            || durable_premise.max_frame_bytes != config.max_frame_bytes
+            || durable_premise.max_response_bytes != config.max_response_bytes
+            || durable_premise.wire_depth != config.wire_depth
+            || durable_premise.semantic_depth != config.semantic_depth
+            || durable_premise.max_dispatch_members != config.max_dispatch_members
+            || durable_premise.max_dispatch_depth != config.max_dispatch_depth
+            || durable_premise.transport_digest != config.transport_digest
         {
             return Err(WorkerError::Premise(
                 "carried Worker-start premise disagrees with the durable projection".into(),
@@ -303,7 +343,7 @@ impl Worker {
         if config.server_id.is_empty() {
             return Err(WorkerError::Premise("server identity is empty".into()));
         }
-        let mut database = Database::open(&config.db_path)
+        let mut database = Database::open_host_authority(&config.db_path)
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
         let snapshot = load_current_authority(database.connection())
             .map_err(|error| WorkerError::Authority(error.to_string()))?
@@ -351,11 +391,13 @@ impl Worker {
             &durable_server.executable_digest,
             "installed executable",
         )?;
-        // gates the exact physical schema and version; it never repairs it.
+        // The effect-journal and Tool-call-ledger slices are installed on
+        // first Worker use, then gated exactly; install may only add
+        // genuinely missing objects and any mismatch fails closed.
+        create_effect_journal_schema(database.connection())
+            .map_err(|error| WorkerError::Storage(error.to_string()))?;
         gate_schema_version(database.connection())
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
-        // Reopen recovery reads the Tool-call ledger; install its required
-        // schema on first Worker use, then verify the exact physical shape.
         create_tool_ledger_schema(database.connection())
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
         gate_tool_ledger_schema(database.connection())
@@ -368,8 +410,19 @@ impl Worker {
         retain_settled_effect_journal(&mut database)
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
 
+        // The startup deadline comes ONLY from the sealed premise value
+        // carried in the equality-bound config, and the reloaded durable
+        // server must agree with that sealed value; no caller or default can
+        // widen it.
+        let sealed_startup_timeout_ms = u64::try_from(config.startup_timeout_ms)
+            .map_err(|_| WorkerError::Premise("sealed startup_timeout_ms is negative".into()))?;
+        if durable_server.startup_timeout != Duration::from_millis(sealed_startup_timeout_ms) {
+            return Err(WorkerError::Premise(
+                "admitted server startup timeout disagrees with the sealed premise".into(),
+            ));
+        }
         let startup_deadline = Instant::now()
-            .checked_add(durable_server.startup_timeout)
+            .checked_add(Duration::from_millis(sealed_startup_timeout_ms))
             .ok_or_else(|| WorkerError::Process("startup deadline overflow".into()))?;
         let session_id = new_session_id()?;
         let mut runtime_binding =
@@ -403,9 +456,38 @@ impl Worker {
             }
         };
 
+        // Spawn argv: the executable plus EXACTLY the sealed premise args.
+        // The durable-server contract must agree with the sealed projection;
+        // any disagreement is a startup refusal, never a silent choice.
+        if durable_server.args != config.spawn_args {
+            return Err(startup_failure(
+                &mut database,
+                &runtime_binding,
+                Some(&process_generation),
+                None,
+                WorkerError::Premise(
+                    "admitted server args disagree with the sealed Worker-start premise".into(),
+                ),
+            ));
+        }
+        // The attestation seals the reloaded transport digest to the child's
+        // identity; the sealed premise's transport digest must bind it, so a
+        // divergent reloaded value refuses before any child exists rather
+        // than feeding split authority into the attestation.
+        if durable_server.transport_digest.to_canonical_string() != config.transport_digest {
+            return Err(startup_failure(
+                &mut database,
+                &runtime_binding,
+                Some(&process_generation),
+                None,
+                WorkerError::Premise(
+                    "admitted server transport digest disagrees with the sealed premise".into(),
+                ),
+            ));
+        }
         let mut command = Command::new(&executable_path);
         command
-            .args(&durable_server.args)
+            .args(&config.spawn_args)
             .current_dir(&package_root)
             .env_clear()
             .stdin(Stdio::piped())
@@ -484,12 +566,35 @@ impl Worker {
                 ));
             }
         };
+        // Stdio/frame limits come ONLY from the sealed premise values in
+        // the equality-bound config; the admitted server contract must agree
+        // on frame bytes and nesting depths.
+        let sealed_stdio_limits = StdioTransportLimits::new(
+            usize::try_from(config.max_frame_bytes).map_err(|_| {
+                WorkerError::Premise("sealed max_frame_bytes is negative".into())
+            })?,
+            u16::try_from(config.wire_depth).map_err(|_| {
+                WorkerError::Premise("sealed wire_depth is negative".into())
+            })?,
+        )
+        .map_err(WorkerError::Transport)?;
+        if durable_server.stdio_limits != sealed_stdio_limits {
+            return Err(startup_failure(
+                &mut database,
+                &runtime_binding,
+                Some(&process_generation),
+                None,
+                WorkerError::Premise(
+                    "admitted server stdio limits disagree with the sealed premise".into(),
+                ),
+            ));
+        }
         let (mut invocation, process_handle) = match HostMcpStdioInvocation::from_installed_child(
             child.into_child(),
             attestation,
             &runtime_binding,
             &process_generation,
-            durable_server.stdio_limits,
+            sealed_stdio_limits,
             Vec::new(),
             &database,
             &handshake_authority,
@@ -604,7 +709,32 @@ impl Worker {
                 WorkerError::Storage(error.to_string()),
             ));
         }
-        let service = ToolDispatchService::new(durable_server.dispatch_limits);
+        // Dispatch limits come ONLY from the sealed premise values carried
+        // in the equality-bound config; the admitted server contract must
+        // agree on every one of them.
+        let sealed_dispatch_limits = DispatchLimits {
+            max_response_bytes: usize::try_from(config.max_response_bytes).map_err(|_| {
+                WorkerError::Premise("sealed max_response_bytes is negative".into())
+            })?,
+            max_members: usize::try_from(config.max_dispatch_members).map_err(|_| {
+                WorkerError::Premise("sealed max_dispatch_members is negative".into())
+            })?,
+            max_depth: u16::try_from(config.max_dispatch_depth).map_err(|_| {
+                WorkerError::Premise("sealed max_dispatch_depth is negative".into())
+            })?,
+        };
+        if durable_server.dispatch_limits != sealed_dispatch_limits {
+            return Err(startup_failure(
+                &mut database,
+                &runtime_binding,
+                Some(&process_generation),
+                Some(&process_handle),
+                WorkerError::Premise(
+                    "admitted server dispatch limits disagree with the sealed premise".into(),
+                ),
+            ));
+        }
+        let service = ToolDispatchService::new(sealed_dispatch_limits);
         Ok(Self {
             database,
             runtime_binding,

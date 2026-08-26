@@ -507,6 +507,15 @@ impl Fixture {
             executable_digest: self.executable_digest.to_canonical_string(),
             endpoint: "bin/dolly-fs-tools".into(),
             record_digest: self.premise_record_digest.clone(),
+            spawn_args: vec!["server.py".to_string()],
+            startup_timeout_ms: 10_000,
+            max_frame_bytes: 4_194_304,
+            max_response_bytes: 4_194_304,
+            wire_depth: 96,
+            semantic_depth: 64,
+            max_dispatch_members: 4_096,
+            max_dispatch_depth: 64,
+            transport_digest: digest_of(&self.server["transport"]).to_canonical_string(),
         }
     }
 

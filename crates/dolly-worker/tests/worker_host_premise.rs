@@ -14,17 +14,25 @@
 //! cannot be observed inside a unit-test environment.
 
 #[cfg(all(target_os = "linux", feature = "test-support"))]
-use std::io::{Read, Write};
+use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(all(target_os = "linux", feature = "test-support"))]
 use std::process::Child;
 use std::process::{Command, Stdio};
 #[cfg(all(target_os = "linux", feature = "test-support"))]
 use std::sync::mpsc;
+// The retained-lifecycle streaming vectors and the over-deep default-frame
+// vector need `Duration`; the hostile default-feature framing vectors use only
+// `Write`. Both stay conditional, so the default-feature target compiles
+// warning-free without any test-support seam.
 #[cfg(all(target_os = "linux", feature = "test-support"))]
 use std::time::Duration;
 
-use dolly_canonical_json::{CanonicalJsonValue, Sha256Digest, canonicalize};
+use dolly_canonical_json::{
+    CanonicalJsonValue, Sha256Digest, canonicalize, validate_raw_json_nesting_depth,
+};
+
 use dolly_core_domain::ExtensionId;
 #[cfg(all(target_os = "linux", feature = "test-support"))]
 use dolly_protocol::encode_frame;
@@ -255,6 +263,15 @@ fn fixture_with_premise(insert: bool) -> Fixture {
                     package_digest      TEXT    NOT NULL CHECK (package_digest LIKE 'sha256:%'),
                     executable_digest   TEXT    NOT NULL CHECK (executable_digest LIKE 'sha256:%'),
                     endpoint            TEXT    NOT NULL CHECK (length(endpoint) > 0),
+                    spawn_args_json     TEXT    NOT NULL CHECK (json_valid(spawn_args_json) AND json_type(spawn_args_json) = 'array'),
+                    startup_timeout_ms  INTEGER NOT NULL CHECK (startup_timeout_ms BETWEEN 1 AND 9007199254740991),
+                    max_frame_bytes     INTEGER NOT NULL CHECK (max_frame_bytes BETWEEN 1 AND 4294967295),
+                    max_response_bytes  INTEGER NOT NULL CHECK (max_response_bytes BETWEEN 1 AND 4294967295),
+                    wire_depth          INTEGER NOT NULL CHECK (wire_depth BETWEEN 1 AND 96),
+                    semantic_depth      INTEGER NOT NULL CHECK (semantic_depth BETWEEN 1 AND 64),
+                    max_dispatch_members INTEGER NOT NULL CHECK (max_dispatch_members BETWEEN 1 AND 9007199254740991),
+                    max_dispatch_depth  INTEGER NOT NULL CHECK (max_dispatch_depth BETWEEN 1 AND 64),
+                    transport_digest    TEXT    NOT NULL CHECK (transport_digest LIKE 'sha256:%'),
                     record_jcs          BLOB    NOT NULL,
                     record_digest       TEXT    NOT NULL,
                     PRIMARY KEY (config_revision, extension_alias, server_id),
@@ -268,9 +285,10 @@ fn fixture_with_premise(insert: bool) -> Fixture {
                       server: &str,
                       root: &Path,
                       package: &Sha256Digest,
-                      executable: &Sha256Digest| {
+                      executable: &Sha256Digest,
+                      transport: &serde_json::Value| {
             serde_json::json!({
-                "schema": "dolly.worker-start-premise/v1",
+                "schema": "dolly.worker-start-premise/v2",
                 "daemon_installation_id": identity.daemon_installation_id,
                 "instance_id": identity.instance_id,
                 "config_revision": 1,
@@ -282,6 +300,15 @@ fn fixture_with_premise(insert: bool) -> Fixture {
                 "package_digest": package.to_canonical_string(),
                 "executable_digest": executable.to_canonical_string(),
                 "endpoint": "bin/dolly-fs-tools",
+                "spawn_args_json": "[\"server.py\"]",
+                "startup_timeout_ms": 10000,
+                "max_frame_bytes": 4194304,
+                "max_response_bytes": 4194304,
+                "wire_depth": 96,
+                "semantic_depth": 64,
+                "max_dispatch_members": 4096,
+                "max_dispatch_depth": 64,
+                "transport_digest": digest_of(transport).to_canonical_string(),
                 "record_digest": "",
             })
         };
@@ -291,6 +318,7 @@ fn fixture_with_premise(insert: bool) -> Fixture {
             &package_root,
             &package_digest,
             &executable_digest,
+            &server["transport"],
         );
         first["record_digest"] = serde_json::json!(
             digest_of(&{
@@ -306,6 +334,7 @@ fn fixture_with_premise(insert: bool) -> Fixture {
             &second_root,
             &second_package_digest,
             &second_executable_digest,
+            &other_server["transport"],
         );
         second["record_digest"] = serde_json::json!(
             digest_of(&{
@@ -322,8 +351,11 @@ fn fixture_with_premise(insert: bool) -> Fixture {
                     "INSERT INTO worker_start_premises (
                         config_revision, config_digest, extension_alias, server_id,
                         package_root, package_path, package_digest, executable_digest,
-                        endpoint, record_jcs, record_digest
-                    ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        endpoint, spawn_args_json, startup_timeout_ms, max_frame_bytes,
+                        max_response_bytes, wire_depth, semantic_depth,
+                        max_dispatch_members, max_dispatch_depth, transport_digest,
+                        record_jcs, record_digest
+                    ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                     rusqlite::params![
                         config_digest.to_canonical_string(),
                         row["extension_alias"].as_str().expect("string"),
@@ -333,6 +365,15 @@ fn fixture_with_premise(insert: bool) -> Fixture {
                         row["package_digest"].as_str().expect("string"),
                         row["executable_digest"].as_str().expect("string"),
                         row["endpoint"].as_str().expect("string"),
+                        row["spawn_args_json"].as_str().expect("string"),
+                        row["startup_timeout_ms"].as_i64().expect("int"),
+                        row["max_frame_bytes"].as_i64().expect("int"),
+                        row["max_response_bytes"].as_i64().expect("int"),
+                        row["wire_depth"].as_i64().expect("int"),
+                        row["semantic_depth"].as_i64().expect("int"),
+                        row["max_dispatch_members"].as_i64().expect("int"),
+                        row["max_dispatch_depth"].as_i64().expect("int"),
+                        row["transport_digest"].as_str().expect("string"),
                         dolly_canonical_json::canonicalize(row)
                             .expect("sealed bytes")
                             .0
@@ -542,11 +583,12 @@ fn identity_pair_mismatch_yields_absence_not_authority() {
 
 /// Spawn the production binary keeping stdin OPEN (no EOF) and return the
 /// child with piped stdout/stderr for incremental frame reads.
+///
+/// Test-support-only: the retained-lifecycle vectors need the sanctioned
+/// test startup seam because a real live Linux Host proof cannot be
+/// observed inside a unit-test environment. Default-feature builds compile
+/// this file without these helpers.
 #[cfg(all(target_os = "linux", feature = "test-support"))]
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "test-support")),
-    allow(dead_code)
-)]
 fn run_host_streaming(db_path: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_worker_host"))
         .arg(db_path)
@@ -866,47 +908,21 @@ fn fragmented_status_frame_is_reassembled_and_answered() {
 /// A declared frame length over the frozen 262144-byte cap is typed fatal:
 /// nonzero exit, FRAME_INVALID diagnostic, and no response frames after the
 /// violation (no resynchronization).
-#[cfg(target_os = "linux")]
+///
+/// This vector runs against the DEFAULT-feature production binary: the
+/// hostile frame is written while the host is still performing startup, so
+/// the framing violation can never depend on any test-support seam. The
+/// started-frame probe run proves the same database starts cleanly under
+/// test-support before the hostile default-feature run.
+#[cfg(all(target_os = "linux", feature = "test-support"))]
 #[test]
-fn oversized_declared_length_fails_closed_without_reply() {
+fn oversized_declared_length_fails_closed_without_reply_with_probe() {
     let fixture = fixture_with_premise(true);
-    let started_frame_gate = {
-        // Drain `started` first through one full streaming run so the
-        // hostile write below happens against an already-started host.
-        let mut child = Command::new(env!("CARGO_BIN_EXE_worker_host"))
-            .arg(&fixture.db_path)
-            .arg("org.dolly.tools")
-            .arg("fs")
-            .env("DOLLY_WORKER_TEST_SUPPORT", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn worker_host");
-        let frames = spawn_frame_pump(&mut child);
-        frames
-            .recv_timeout(Duration::from_secs(30))
-            .expect("started frame arrives on a healthy database");
-        child.kill();
-        child.wait().expect("reap probe worker_host");
-    };
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_worker_host"))
-        .arg(&fixture.db_path)
-        .arg("org.dolly.tools")
-        .arg("fs")
-        .env("DOLLY_WORKER_TEST_SUPPORT", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn worker_host for hostile frame");
+    let mut child = run_host_streaming(&fixture.db_path);
     let frames = spawn_frame_pump(&mut child);
     let _started = frames
         .recv_timeout(Duration::from_secs(30))
         .expect("started");
-    let _gate: Option<Vec<u8>> = None;
-    drop(started_frame_gate);
 
     // Declared length beyond the cap: 0x0010_0000 = 1 MiB > 262144.
     let stdin = child.stdin.as_mut().expect("piped stdin");
@@ -930,6 +946,47 @@ fn oversized_declared_length_fails_closed_without_reply() {
     assert!(
         stderr_text.contains("FRAME_INVALID"),
         "expected typed FRAME_INVALID diagnostic, got: {stderr_text}"
+    );
+    assert!(
+        !stdout_has_frames(&output.stdout),
+        "no response frames may follow the violation"
+    );
+}
+
+/// The started test-support seam proves the production control loop runs
+/// the preparse wire-depth gate END TO END: a 97-level nested control frame
+/// must die typed-fatal (FRAME_DEPTH_INVALID, the raw-byte gate) before any
+/// recursive parse and before any reply — no resynchronization.  The raw
+/// gate itself is proven without any seam under default features in the
+/// `dolly-canonical-json` crate tests; this vector pins the same gate as it
+/// is actually enforced inside the packaged binary's control loop.
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+#[test]
+fn overdeep_wire_nesting_is_typed_fatal_before_parse() {
+    let fixture = fixture_with_premise(true);
+    let mut child = run_host_streaming(&fixture.db_path);
+    let frames = spawn_frame_pump(&mut child);
+    let _started = frames
+        .recv_timeout(Duration::from_secs(30))
+        .expect("started frame arrives on a healthy database");
+
+    let over_limit = format!("{}{}", "[".repeat(97), "]".repeat(97));
+    let stdin = child.stdin.as_mut().expect("piped stdin");
+    stdin
+        .write_all(&encode_frame(over_limit.as_bytes()))
+        .expect("write over-deep frame");
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("wait for fatal exit");
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "over-deep wire nesting must exit nonzero"
+    );
+    let stderr_text = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr_text.contains("FRAME_DEPTH_INVALID"),
+        "expected typed preparse depth refusal, got: {stderr_text}"
     );
     assert!(
         !stdout_has_frames(&output.stdout),

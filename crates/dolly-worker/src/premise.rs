@@ -49,6 +49,18 @@ pub fn load_worker_start_config(
         executable_digest: premise.executable_digest.clone(),
         endpoint: premise.endpoint.clone(),
         record_digest: premise.record_digest.clone(),
+        spawn_args: serde_json::from_str::<Vec<String>>(&premise.spawn_args_json)
+            .map_err(|error| {
+                WorkerError::Premise(format!("sealed spawn args are invalid: {error}"))
+            })?,
+        startup_timeout_ms: premise.startup_timeout_ms,
+        max_frame_bytes: premise.max_frame_bytes,
+        max_response_bytes: premise.max_response_bytes,
+        wire_depth: premise.wire_depth,
+        semantic_depth: premise.semantic_depth,
+        max_dispatch_members: premise.max_dispatch_members,
+        max_dispatch_depth: premise.max_dispatch_depth,
+        transport_digest: premise.transport_digest.clone(),
         extension_alias: parsed_alias,
         server_id: server_id.to_string(),
     })

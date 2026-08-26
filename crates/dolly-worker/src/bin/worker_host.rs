@@ -54,7 +54,7 @@ enum ControlFlow {
 /// resynchronization after a fatal framing violation. On EOF,
 /// `FrameReader::finish` rejects any partial or trailing frame as a typed
 /// fatal error.
-fn run_control_loop(worker: &mut Worker, server_id: &str) {
+fn run_control_loop(worker: &mut Worker, server_id: &str, wire_depth: u16) {
     let mut stdout = std::io::stdout();
     let mut reader = FrameReader::new(control_limits());
     let mut input = [0u8; READ_BUFFER_SIZE];
@@ -67,7 +67,7 @@ fn run_control_loop(worker: &mut Worker, server_id: &str) {
                     .feed(&input[..read])
                     .unwrap_or_else(|error| fail("FRAME_INVALID", &error.to_string()));
                 for payload in payloads {
-                    if handle_control_frame(worker, &mut stdout, server_id, &payload)
+                    if handle_control_frame(worker, &mut stdout, server_id, &payload, wire_depth)
                         == ControlFlow::Stop
                     {
                         return;
@@ -87,8 +87,9 @@ fn handle_control_frame(
     stdout: &mut std::io::Stdout,
     server_id: &str,
     payload: &[u8],
+    wire_depth: u16,
 ) -> ControlFlow {
-    let frame = parse_control_frame(payload);
+    let frame = parse_control_frame(payload, wire_depth);
     let op = require_string(&frame, "op");
     match op.as_str() {
         "status" => {
@@ -139,9 +140,15 @@ fn handle_control_frame(
     ControlFlow::Continue
 }
 
-fn parse_control_frame(payload: &[u8]) -> CanonicalJsonValue {
-    // Depth gate (semantic 64) runs inside canonicalization; the wire-depth
-    // gate already ran in the framer. Unknown/loose JSON is refused closed.
+fn parse_control_frame(payload: &[u8], wire_depth: u16) -> CanonicalJsonValue {
+    // The wire-depth gate runs FIRST as a non-recursive raw-byte scan BEFORE
+    // any recursive serde_json parse can allocate a hostile deep tree. The
+    // bound is the sealed premise value carried through the equality-bound
+    // config — never a caller-supplied or ambient default. Then the semantic
+    // depth gate (64) runs inside canonicalization. Unknown/loose JSON is
+    // refused closed; malformed or over-deep payloads never reach recursion.
+    dolly_canonical_json::validate_raw_json_nesting_depth(payload, wire_depth)
+        .unwrap_or_else(|error| fail("FRAME_DEPTH_INVALID", &error.to_string()));
     canonicalize_with_limits(
         &serde_json::from_slice::<serde_json::Value>(payload)
             .unwrap_or_else(|error| fail("CONTROL_JSON_INVALID", &error.to_string())),
@@ -212,9 +219,11 @@ fn main() {
         }),
     );
 
+    let wire_depth = u16::try_from(bootstrap.config.wire_depth)
+        .unwrap_or_else(|_| fail("WORKER_PREMISE_REFUSED", "sealed wire_depth is negative"));
     // The Worker's Drop impl stops and reaps the retained child on any exit
     // path; an explicit `stop` frame returns from the control loop first.
-    run_control_loop(&mut worker, &server_id);
+    run_control_loop(&mut worker, &server_id, wire_depth);
 }
 
 #[allow(unreachable_code)]

@@ -149,6 +149,20 @@ pub(crate) fn initialize_effect_journal_schema(transaction: &Transaction<'_>) ->
         .map_err(map_sqlite_error)
 }
 
+/// Install the effect-journal slice next to an existing Host authority
+/// database (the Worker installs its required journal on first startup,
+/// mirroring the Tool-call ledger discipline). `IF NOT EXISTS` may only
+/// install genuinely missing objects; anything existing is compared against
+/// the exact authoritative definitions and any mismatch fails closed.
+pub fn create_effect_journal_schema(connection: &Connection) -> StorageResult<()> {
+    let mut transaction = connection
+        .unchecked_transaction()
+        .map_err(map_sqlite_error)?;
+    initialize_effect_journal_schema(&mut transaction)?;
+    transaction.commit().map_err(map_sqlite_error)?;
+    gate_schema_version(connection)
+}
+
 /// Fail-closed schema-version and physical-shape gate every journal
 /// reader/writer must pass. Ordinary opens never create or repair a missing
 /// table, index, metadata row, or metadata value.
@@ -327,6 +341,47 @@ fn verify_schema_sql(
         return Err(StorageError::Corrupt);
     }
     Ok(())
+}
+
+/// How an ordinary database open treats the effect-journal slice.
+#[derive(Clone, Copy)]
+pub(crate) enum JournalPresencePolicy {
+    /// The journal must already exist (Rust-initialized databases).
+    Required,
+    /// An absent journal is an empty initial state the Worker installs on
+    /// first startup; a present slice must still pass the exact gate.
+    AbsentIsEmpty,
+}
+
+/// Open-time limit gate that honors the caller's journal-present policy.
+pub(crate) fn verify_open_limits_with_policy(
+    connection: &Connection,
+    policy: JournalPresencePolicy,
+) -> StorageResult<()> {
+    match policy {
+        JournalPresencePolicy::Required => verify_open_limits(connection),
+        JournalPresencePolicy::AbsentIsEmpty => {
+            let present: i64 = connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_master
+                        WHERE type IN ('table', 'index')
+                          AND name IN (
+                            'external_effect_journal_meta',
+                            'external_effect_journal',
+                            'effect_journal_recovery'
+                          )
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(map_sqlite_error)?;
+            if present == 0 {
+                return Ok(());
+            }
+            verify_open_limits(connection)
+        }
+    }
 }
 
 /// Re-verify the bounded row count and every persisted row during an ordinary
