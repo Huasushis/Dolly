@@ -96,6 +96,84 @@ impl ParseLimits {
     }
 }
 
+/// Validate raw JSON wire bytes against a nesting-depth ceiling WITHOUT
+/// parsing or allocating any value tree.
+///
+/// This is a single left-to-right byte scan: string literals (including
+/// escape sequences) are skipped atomically, so quotes inside strings never
+/// affect depth; structural depth comes only from `{` and `[` outside
+/// strings. Trailing content after the top-level document is rejected, but
+/// no JSON grammar validation happens here — a byte scan that passes this
+/// gate may still be refused by the real parser. The bound is enforced
+/// BEFORE any recursive `serde_json` parse can allocate a hostile deep tree.
+pub fn validate_raw_json_nesting_depth(
+    input: &[u8],
+    max_depth: u16,
+) -> Result<(), CanonicalError> {
+    if max_depth == 0 {
+        return Err(CanonicalError::invalid_json(
+            "max_nesting_depth must be at least 1",
+        ));
+    }
+    let mut depth: u16 = 0;
+    let mut bytes = input.iter().copied();
+    loop {
+        let Some(byte) = bytes.next() else {
+            return Err(CanonicalError::invalid_json(
+                "raw JSON nesting scan found no document",
+            ));
+        };
+        match byte {
+            b' ' | b'\n' | b'\r' | b'\t' => continue,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > max_depth {
+                    return Err(CanonicalError::invalid_json(format!(
+                        "raw JSON exceeds its {max_depth}-level nesting limit"
+                    )));
+                }
+            }
+            b'}' | b']' => {
+                depth = match depth.checked_sub(1) {
+                    Some(remaining) => remaining,
+                    None => {
+                        return Err(CanonicalError::invalid_json(
+                            "unbalanced closing bracket in raw JSON",
+                        ));
+                    }
+                };
+            }
+            b'"' => {
+                let mut escaped = false;
+                loop {
+                    match bytes.next() {
+                        None => {
+                            return Err(CanonicalError::invalid_json(
+                                "unterminated JSON string in raw scan",
+                            ));
+                        }
+                        Some(b'"') if !escaped => break,
+                        Some(b'\\') => escaped = !escaped,
+                        Some(_) => escaped = false,
+                    }
+                }
+            }
+            _ => {}
+        }
+        if depth == 0 {
+            break;
+        }
+    }
+    for rest in bytes {
+        if !matches!(rest, b' ' | b'\n' | b'\r' | b'\t') {
+            return Err(CanonicalError::invalid_json(
+                "trailing data after the top-level JSON document",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parse untrusted JSON bytes into a `CanonicalJsonValue` tree.
 ///
 /// Enforces the Dolly Core JSON profile: rejects BOM, invalid UTF-8, lone

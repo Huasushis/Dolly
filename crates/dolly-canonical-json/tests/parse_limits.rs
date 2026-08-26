@@ -7,6 +7,7 @@
 
 use dolly_canonical_json::{
     MAX_SEMANTIC_JSON_NESTING_DEPTH, PROTOCOL_WIRE_PARSE_DEPTH, ParseLimits, parse_core_json,
+    validate_raw_json_nesting_depth,
 };
 
 /// Build deeply nested JSON of the given depth: `depth` open `[`, a `1`,
@@ -112,5 +113,56 @@ fn wire_depth_97_rejected() {
     assert!(
         result.is_err(),
         "depth-97 JSON should be rejected under protocol_wire limit"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Raw-byte preparse nesting gate (no allocation, no recursion)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn raw_gate_accepts_exact_wire_ceiling() {
+    validate_raw_json_nesting_depth(nested_json(96).as_bytes(), PROTOCOL_WIRE_PARSE_DEPTH)
+        .expect("96 nesting levels sit exactly at the wire ceiling");
+}
+
+#[test]
+fn raw_gate_refuses_one_above_wire_ceiling() {
+    let error =
+        validate_raw_json_nesting_depth(nested_json(97).as_bytes(), PROTOCOL_WIRE_PARSE_DEPTH)
+            .expect_err("97 levels must be refused by the raw byte scan");
+    assert!(error.to_string().contains("96-level"), "got: {error}");
+}
+
+#[test]
+fn raw_gate_ignores_strings_and_escapes() {
+    // A string full of brackets, quoted braces, and escaped quotes must not
+    // disturb the depth count; the only structural container is the object.
+    let payload = br#"{"a":"[[[","b":"{\"}\\\"[","c":[]}"#;
+    validate_raw_json_nesting_depth(payload, 2).expect("strings do not contribute depth");
+    // And an escaped quote inside a string must not terminate the string.
+    validate_raw_json_nesting_depth(br#"["\"]"]"#, 1).expect("escaped quote stays inside string");
+}
+
+#[test]
+fn raw_gate_rejects_trailing_non_whitespace() {
+    let error = validate_raw_json_nesting_depth(b"{} garbage", 1).expect_err("trailing data");
+    assert!(error.to_string().contains("trailing data"), "got: {error}");
+}
+
+#[test]
+fn raw_gate_rejects_unbalanced_and_unterminated() {
+    assert!(validate_raw_json_nesting_depth(b"[[}", 4).is_err(), "unbalanced must refuse");
+    assert!(
+        validate_raw_json_nesting_depth(br##"["open bad"##, 4).is_err(),
+        "unclosed string must refuse"
+    );
+}
+
+#[test]
+fn raw_gate_zero_limit_rejected() {
+    assert!(
+        validate_raw_json_nesting_depth(b"{}", 0).is_err(),
+        "max_depth 0 must be rejected up front"
     );
 }
