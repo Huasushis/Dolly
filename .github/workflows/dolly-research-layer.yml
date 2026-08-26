@@ -1,0 +1,37 @@
+name: Dolly research layer
+
+on:
+  push:
+    branches:
+      - research/dolly-layer-2026-08-26
+    paths:
+      - "research/dolly_research_layer/**"
+      - ".github/workflows/dolly-research-layer.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-screening:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Unit and reproducibility tests
+        working-directory: research/dolly_research_layer
+        run: python -m unittest -v test_suite.py
+      - name: Full deterministic experiment suite
+        run: python research/dolly_research_layer/run_suite.py --out research/dolly_research_layer/out
+      - name: Show generated summary
+        run: cat research/dolly_research_layer/out/summary.md
+      - name: Upload auditable outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: dolly-research-layer-${{ github.sha }}
+          path: research/dolly_research_layer/out/
+          if-no-files-found: error
+          retention-days: 30
