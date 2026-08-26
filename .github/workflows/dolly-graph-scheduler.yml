@@ -1,0 +1,56 @@
+name: Dolly graph scheduler research
+
+on:
+  push:
+    branches:
+      - research/dolly-layer-2026-08-26
+    paths:
+      - "research/dolly_research_layer/graph_scheduler_bench.py"
+      - ".github/workflows/dolly-graph-scheduler.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  graph-scheduler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Smoke test
+        run: |
+          python research/dolly_research_layer/graph_scheduler_bench.py \
+            --seeds 3 --horizon 1400 \
+            --out research/dolly_research_layer/out-scheduler-smoke
+      - name: Full graph matrix
+        run: |
+          python research/dolly_research_layer/graph_scheduler_bench.py \
+            --seeds 30 --horizon 4200 \
+            --out research/dolly_research_layer/out-scheduler
+      - name: Print decision summary
+        run: cat research/dolly_research_layer/out-scheduler/scheduler_summary.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dolly-graph-scheduler-${{ github.sha }}
+          path: research/dolly_research_layer/out-scheduler/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Commit immutable result snapshot
+        run: |
+          target=research/dolly_research_layer/results/scheduler/${GITHUB_SHA}
+          mkdir -p "$target"
+          cp -a research/dolly_research_layer/out-scheduler/. "$target/"
+          printf '%s\n' \
+            "source_commit=${GITHUB_SHA}" \
+            "workflow_run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            > "$target/run.txt"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add "$target"
+          git commit -m "research(results): graph scheduler ${GITHUB_SHA}" \
+            || { echo "No result changes"; exit 0; }
+          git push origin HEAD:research/dolly-layer-2026-08-26
