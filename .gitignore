@@ -1,10 +1,8 @@
 # Lumina build output
 .lumina/
 
-# Node.js
-node_modules/
-dist/
-*.tsbuildinfo
+# Rust build output
+/target/
 
 # Environment
 .env

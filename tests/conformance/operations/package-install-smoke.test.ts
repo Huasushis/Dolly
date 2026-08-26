@@ -11,6 +11,8 @@ import { createHash } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
+import { REVIEWED_WORKER_HOST_DIGEST } from "../../../src/adapters/installed-worker-host.js";
+
 import { describe, expect, it } from "vitest";
 
 interface PackResult {
@@ -199,13 +201,13 @@ describe("PKG-001 distributable package", () => {
         if (publishedPath.endsWith(".ts")) expect(publishedPath).toMatch(/\.d\.ts$/);
       }
       const tarball = readFileSync(join(packDirectory, manifest.filename));
-      expect(tarball.length).toBeLessThan(5_000_000);
+      expect(tarball.length).toBeLessThan(20_000_000);
       const tarFiles = readTarGzFiles(tarball);
       const unpackedSize = [...tarFiles.values()].reduce(
         (total, data) => total + data.length,
         0,
       );
-      expect(unpackedSize).toBeLessThan(10_000_000);
+      expect(unpackedSize).toBeLessThan(30_000_000);
       const packageJson = JSON.parse(
         tarFiles.get("package/package.json")?.toString("utf8") ?? "null",
       );
@@ -250,6 +252,14 @@ describe("PKG-001 distributable package", () => {
         expect(data, `missing tar entry ${archivePath}`).toBeDefined();
         expect(data!.length).toBeGreaterThan(0);
       }
+      // The reviewed installed worker-host binary must ship in the package
+      // at the fixed layout the production adapter resolves, byte-for-byte
+      // matching the reviewed digest enforced by scripts/build.mjs.
+      const packagedWorkerHost = tarFiles.get("package/dist/bin/worker_host");
+      expect(packagedWorkerHost, "missing packaged worker_host binary").toBeDefined();
+      expect(
+        `sha256:${createHash("sha256").update(packagedWorkerHost!).digest("hex")}`,
+      ).toBe(REVIEWED_WORKER_HOST_DIGEST);
       // The launcher asset must be shipped byte-for-byte as reviewed, so the
       // installed runtime graph can consume a fixed program.
       const packagedLauncher = tarFiles.get(
@@ -310,7 +320,7 @@ describe("PKG-001 distributable package", () => {
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 300_000);
 
   it("installs the packed tarball in a clean Node 20.20.2 consumer and attests the native SQLite binding through create, commit, close, reopen", async () => {
     const repositoryRoot = resolve(import.meta.dirname, "../../..");
