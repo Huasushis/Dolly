@@ -38,23 +38,105 @@ fn fail(code: &str, message: &str) -> ! {
     exit(1);
 }
 
-fn read_all_stdin() -> Vec<u8> {
-    let mut buffer = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut buffer)
-        .unwrap_or_else(|error| fail("WORKER_HOST_STDIN", &error.to_string()));
-    buffer
+/// Fixed-size stdin read buffer: bounded memory regardless of how long the
+/// control channel stays open.
+const READ_BUFFER_SIZE: usize = 8192;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlFlow {
+    Continue,
+    Stop,
 }
 
-fn decode_frames(bytes: &[u8]) -> Vec<Vec<u8>> {
+/// Incremental control loop: read stdin into a fixed-size buffer, feed the
+/// capped `FrameReader`, and process each complete frame immediately while
+/// stdin remains open. No unbounded buffering, no wait-for-EOF, and no
+/// resynchronization after a fatal framing violation. On EOF,
+/// `FrameReader::finish` rejects any partial or trailing frame as a typed
+/// fatal error.
+fn run_control_loop(worker: &mut Worker, server_id: &str) {
+    let mut stdout = std::io::stdout();
     let mut reader = FrameReader::new(control_limits());
-    let frames = reader
-        .feed(bytes)
-        .unwrap_or_else(|error| fail("FRAME_INVALID", &error.to_string()));
+    let mut input = [0u8; READ_BUFFER_SIZE];
+    let mut stdin = std::io::stdin().lock();
+    loop {
+        match stdin.read(&mut input) {
+            Ok(0) => break,
+            Ok(read) => {
+                let payloads = reader
+                    .feed(&input[..read])
+                    .unwrap_or_else(|error| fail("FRAME_INVALID", &error.to_string()));
+                for payload in payloads {
+                    if handle_control_frame(worker, &mut stdout, server_id, &payload)
+                        == ControlFlow::Stop
+                    {
+                        return;
+                    }
+                }
+            }
+            Err(error) => fail("WORKER_HOST_STDIN", &error.to_string()),
+        }
+    }
     if let Err(error) = reader.finish() {
         fail("FRAME_TRAILING", &error.to_string());
     }
-    frames
+}
+
+fn handle_control_frame(
+    worker: &mut Worker,
+    stdout: &mut std::io::Stdout,
+    server_id: &str,
+    payload: &[u8],
+) -> ControlFlow {
+    let frame = parse_control_frame(payload);
+    let op = require_string(&frame, "op");
+    match op.as_str() {
+        "status" => {
+            write_frame(
+                stdout,
+                &serde_json::json!({
+                    "v": 1,
+                    "event": "status",
+                    "state": "ready",
+                    "server_id": server_id,
+                }),
+            );
+        }
+        "dispatch" => {
+            let instance_id = require_string(&frame, "instance_id");
+            let module_id = require_string(&frame, "module_id");
+            let operation_id = require_string(&frame, "operation_id");
+            let response = handle_dispatch(worker, &instance_id, &module_id, &operation_id);
+            write_frame(stdout, &response);
+        }
+        "stop" => match worker.stop() {
+            Ok(()) => {
+                write_frame(stdout, &serde_json::json!({ "v": 1, "event": "stopped" }));
+                return ControlFlow::Stop;
+            }
+            Err(error) => {
+                write_frame(
+                    stdout,
+                    &serde_json::json!({
+                        "v": 1,
+                        "event": "stop_failed",
+                        "detail": error.to_string(),
+                    }),
+                );
+            }
+        },
+        other => {
+            write_frame(
+                stdout,
+                &serde_json::json!({
+                    "v": 1,
+                    "event": "unknown_op",
+                    "op": other,
+                }),
+            );
+        }
+    }
+    ControlFlow::Continue
 }
 
 fn parse_control_frame(payload: &[u8]) -> CanonicalJsonValue {
@@ -89,8 +171,8 @@ fn require_string(object: &CanonicalJsonValue, field: &str) -> String {
 }
 
 fn write_frame(stdout: &mut impl Write, value: &serde_json::Value) {
-    let payload =
-        serde_json::to_vec(value).unwrap_or_else(|error| fail("WORKER_HOST_ENCODE", &error.to_string()));
+    let payload = serde_json::to_vec(value)
+        .unwrap_or_else(|error| fail("WORKER_HOST_ENCODE", &error.to_string()));
     stdout
         .write_all(&encode_frame(&payload))
         .and_then(|_| stdout.flush())
@@ -106,26 +188,23 @@ fn bootstrap() -> Bootstrap {
     let [db_path, extension_alias, server_id] = args.as_slice() else {
         fail("WORKER_HOST_ARGS", CONTROL_USAGE);
     };
-    let test_support_requested = std::env::var_os("DOLLY_WORKER_TEST_SUPPORT").is_some();
     let config = load_worker_start_config(
         std::path::PathBuf::from(db_path),
         extension_alias,
         server_id,
     )
     .unwrap_or_else(|error| fail("WORKER_PREMISE_REFUSED", &error.to_string()));
-    let _ = test_support_requested;
     Bootstrap { config }
 }
 
 fn main() {
-    let mut stdout = std::io::stdout();
     let bootstrap = bootstrap();
     let worker = start_worker(&bootstrap.config);
     let mut worker = worker;
 
     let server_id = bootstrap.config.server_id.clone();
     write_frame(
-        &mut stdout,
+        &mut std::io::stdout(),
         &serde_json::json!({
             "v": 1,
             "event": "started",
@@ -133,67 +212,9 @@ fn main() {
         }),
     );
 
-    let stdin = read_all_stdin();
-    'frames: for payload in decode_frames(&stdin) {
-        let frame = parse_control_frame(&payload);
-        let op = require_string(&frame, "op");
-        match op.as_str() {
-            "status" => {
-                write_frame(
-                    &mut stdout,
-                    &serde_json::json!({
-                        "v": 1,
-                        "event": "status",
-                        "state": "ready",
-                        "server_id": server_id,
-                    }),
-                );
-            }
-            "dispatch" => {
-                let instance_id = require_string(&frame, "instance_id");
-                let module_id = require_string(&frame, "module_id");
-                let operation_id = require_string(&frame, "operation_id");
-                let response = handle_dispatch(&mut worker, &instance_id, &module_id, &operation_id);
-                write_frame(&mut stdout, &response);
-            }
-            "stop" => {
-                let result = worker.stop();
-                match result {
-                    Ok(()) => {
-                        write_frame(
-                            &mut stdout,
-                            &serde_json::json!({ "v": 1, "event": "stopped" }),
-                        );
-                        break 'frames;
-                    }
-                    Err(error) => {
-                        write_frame(
-                            &mut stdout,
-                            &serde_json::json!({
-                                "v": 1,
-                                "event": "stop_failed",
-                                "detail": error.to_string(),
-                            }),
-                        );
-                    }
-                }
-            }
-            other => {
-                write_frame(
-                    &mut stdout,
-                    &serde_json::json!({
-                        "v": 1,
-                        "event": "unknown_op",
-                        "op": other,
-                    }),
-                );
-            }
-        }
-    }
-
-    // The Worker's Drop impl stops and reaps the retained child even when the
-    // stream ended without an explicit stop frame.
-    drop(worker);
+    // The Worker's Drop impl stops and reaps the retained child on any exit
+    // path; an explicit `stop` frame returns from the control loop first.
+    run_control_loop(&mut worker, &server_id);
 }
 
 #[allow(unreachable_code)]

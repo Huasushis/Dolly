@@ -16,14 +16,14 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 
 use crate::error::{StorageError, StorageResult};
 use crate::host_authority::{
-    RuntimeAuthorityIdentity, HOST_AUTHORITY_SCHEMA_SQL, verify_authority_schema,
+    HOST_AUTHORITY_SCHEMA_SQL, RuntimeAuthorityIdentity, verify_authority_schema,
 };
 
 /// Physical schema version of the Worker-start premise slice.
@@ -40,9 +40,9 @@ pub const WORKER_START_PREMISE_TABLE: &str = "worker_start_premises";
 /// revision never silently re-points an existing projection. The CHECK
 /// constraints encode the cheap invariants; the complete record digest and
 /// identity agreement are verified on every load.
-pub const WORKER_START_PREMISE_SCHEMA_SQL: &str = r#"
+pub(crate) const WORKER_START_PREMISE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS worker_start_premises (
-    config_revision     INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991),
+    config_revision     INTEGER NOT NULL CHECK (config_revision BETWEEN 1 AND 9007199254740991),
     config_digest       TEXT    NOT NULL,
     extension_alias     TEXT    NOT NULL CHECK (length(extension_alias) > 0),
     server_id           TEXT    NOT NULL CHECK (length(server_id) > 0),
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS worker_start_premises (
     endpoint            TEXT    NOT NULL CHECK (length(endpoint) > 0),
     record_jcs          BLOB    NOT NULL,
     record_digest       TEXT    NOT NULL,
-    UNIQUE (config_revision, config_digest),
+    PRIMARY KEY (config_revision, extension_alias, server_id),
     FOREIGN KEY (config_revision, config_digest)
       REFERENCES config_revision_mappings(config_revision, config_digest),
     CHECK (substr(package_path, 1, length(package_root) + 1) = package_root || '/')
@@ -103,10 +103,9 @@ impl WorkerStartPremise {
 
     /// Recompute and verify the sealing record digest.
     pub fn verify_record_digest(&self) -> Result<(), WorkerStartPremiseError> {
-        let digest = self
-            .unsigned()
-            .record_digest()
-            .map_err(|error| WorkerStartPremiseError(format!("canonical digest failed: {error}")))?;
+        let digest = self.unsigned().record_digest().map_err(|error| {
+            WorkerStartPremiseError(format!("canonical digest failed: {error}"))
+        })?;
         if digest.to_canonical_string() != self.record_digest {
             return Err(WorkerStartPremiseError(
                 "record_digest does not match the canonical premise record".into(),
@@ -127,7 +126,12 @@ impl WorkerStartPremise {
                 "config_revision out of the safe-integer range".into(),
             ));
         }
-        for label in ["config_digest", "package_digest", "executable_digest", "record_digest"] {
+        for label in [
+            "config_digest",
+            "package_digest",
+            "executable_digest",
+            "record_digest",
+        ] {
             let value = match label {
                 "config_digest" => &self.config_digest,
                 "package_digest" => &self.package_digest,
@@ -135,11 +139,16 @@ impl WorkerStartPremise {
                 _ => &self.record_digest,
             };
             if !is_sha256_digest(value) {
-                return Err(WorkerStartPremiseError(format!("{label} is not a sha256 digest")));
+                return Err(WorkerStartPremiseError(format!(
+                    "{label} is not a sha256 digest"
+                )));
             }
         }
         if self.extension_alias.is_empty()
-            || !self.extension_alias.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
+            || !self
+                .extension_alias
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
         {
             return Err(WorkerStartPremiseError(
                 "extension_alias is not a qualified lowercase identifier".into(),
@@ -219,11 +228,13 @@ pub(crate) fn is_sha256_digest(value: &str) -> bool {
 pub(crate) fn is_safe_relative_member(value: &str) -> bool {
     !value.is_empty()
         && !value.contains('\\')
-        && value.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 /// Build the canonical JCS bytes and sealing digest for a premise record.
-pub fn seal_premise_record(
+pub(crate) fn seal_premise_record(
     unsigned: WorkerStartPremiseInput,
 ) -> Result<(Vec<u8>, String), WorkerStartPremiseError> {
     let premise = WorkerStartPremise {
@@ -247,17 +258,20 @@ pub fn seal_premise_record(
         .map_err(|error| WorkerStartPremiseError(format!("canonical digest failed: {error}")))?;
     let mut sealed = premise;
     sealed.record_digest = digest.to_canonical_string();
-    let bytes = canonicalize(&serde_json::to_value(&sealed).map_err(|error| {
-        WorkerStartPremiseError(format!("serialization failed: {error}"))
-    })?)
+    let bytes = canonicalize(
+        &serde_json::to_value(&sealed)
+            .map_err(|error| WorkerStartPremiseError(format!("serialization failed: {error}")))?,
+    )
     .map_err(|error| WorkerStartPremiseError(format!("canonicalization failed: {error}")))?
     .0;
     Ok((bytes.into_vec(), sealed.record_digest))
 }
 
-/// Unsigned premise content supplied by the Host-owned producer.
+/// Unsigned premise content supplied by the Host-owned producer. Sealing and
+/// insertion stay inside the storage crate; only the TS authority writer is
+/// the production producer.
 #[derive(Clone)]
-pub struct WorkerStartPremiseInput {
+pub(crate) struct WorkerStartPremiseInput {
     pub daemon_installation_id: String,
     pub instance_id: String,
     pub config_revision: i64,
@@ -273,18 +287,24 @@ pub struct WorkerStartPremiseInput {
 
 /// Insert one sealed premise row inside the caller's open transaction.
 ///
-/// The row is keyed by `(config_revision, config_digest)`; rewriting the
-/// identical projection is a no-op, any other rewrite refuses closed. The
-/// Host authority foreign key must hold inside this transaction.
-pub fn insert_worker_start_premise_in_transaction(
+/// Idempotence and conflict are scoped to one identity pair; two distinct
+/// identity pairs of one revision coexist as separate rows.
+pub(crate) fn insert_worker_start_premise_in_transaction(
     tx: &Transaction<'_>,
     input: WorkerStartPremiseInput,
 ) -> Result<bool, WorkerStartPremiseError> {
     let (bytes, record_digest) = seal_premise_record(input.clone())?;
+    // Idempotence and conflict are scoped to ONE identity pair: two distinct
+    // extension/server identities of the same revision coexist as rows.
     let existing: Option<String> = tx
         .query_row(
-            "SELECT record_digest FROM worker_start_premises WHERE config_revision = ?1",
-            [input.config_revision],
+            "SELECT record_digest FROM worker_start_premises
+             WHERE config_revision = ?1 AND extension_alias = ?2 AND server_id = ?3",
+            rusqlite::params![
+                input.config_revision,
+                input.extension_alias,
+                input.server_id
+            ],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -294,7 +314,7 @@ pub fn insert_worker_start_premise_in_transaction(
             return Ok(false);
         }
         return Err(WorkerStartPremiseError(
-            "a different Worker-start premise is already projected for this config revision".into(),
+            "a different Worker-start premise is already projected for this identity pair".into(),
         ));
     }
     tx.execute(
@@ -352,12 +372,20 @@ pub fn load_worker_start_premise(
     let Some((daemon, instance, revision, digest)) = state else {
         return Ok(None);
     };
+    if daemon != identity.daemon_installation_id || instance != identity.instance_id {
+        return Err(WorkerStartPremiseError(
+            "authority-state identity disagrees with the opened database tuple".into(),
+        ));
+    }
+    // The projection is looked up by the full identity key: one row per
+    // (current revision, extension alias, server id) pair.
     let row = connection
         .query_row(
-            "SELECT config_digest, extension_alias, server_id, package_root, package_path,
+            "SELECT config_digest, package_root, package_path,
                     package_digest, executable_digest, endpoint, record_jcs, record_digest
-             FROM worker_start_premises WHERE config_revision = ?1",
-            [revision],
+             FROM worker_start_premises
+             WHERE config_revision = ?1 AND extension_alias = ?2 AND server_id = ?3",
+            rusqlite::params![revision, extension_alias, server_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -366,10 +394,8 @@ pub fn load_worker_start_premise(
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, Vec<u8>>(6)?,
                     row.get::<_, String>(7)?,
-                    row.get::<_, Vec<u8>>(8)?,
-                    row.get::<_, String>(9)?,
                 ))
             },
         )
@@ -377,8 +403,6 @@ pub fn load_worker_start_premise(
         .map_err(|error| WorkerStartPremiseError(format!("premise lookup failed: {error}")))?;
     let Some((
         stored_config_digest,
-        stored_alias,
-        stored_server,
         package_root,
         package_path,
         package_digest,
@@ -388,34 +412,45 @@ pub fn load_worker_start_premise(
         record_digest,
     )) = row
     else {
-        // A projection that exists only for older revisions is stale, not
-        // absent: the Host authority moved without producing a new premise.
-        let any_row: i64 = connection
+        // Distinguish absence from staleness for THIS identity pair only:
+        // rows projected for the same pair under older revisions mean the
+        // Host authority moved without producing a new premise; rows for
+        // other identity pairs coexist and must not mask absence.
+        let stale_row: Option<i64> = connection
             .query_row(
-                "SELECT COUNT(*) FROM worker_start_premises",
-                [],
+                "SELECT config_revision FROM worker_start_premises
+                 WHERE extension_alias = ?1 AND server_id = ?2 LIMIT 1",
+                rusqlite::params![extension_alias, server_id],
                 |row| row.get::<_, i64>(0),
             )
+            .optional()
             .map_err(|error| WorkerStartPremiseError(format!("premise lookup failed: {error}")))?;
-        if any_row > 0 {
+        if stale_row.is_some() {
             return Err(WorkerStartPremiseError(
                 "Worker-start premise is projected for a different authority revision".into(),
             ));
         }
         return Ok(None);
     };
-    if daemon != identity.daemon_installation_id || instance != identity.instance_id {
-        return Err(WorkerStartPremiseError(
-            "authority-state identity disagrees with the opened database tuple".into(),
-        ));
-    }
     if stored_config_digest != digest {
         return Err(WorkerStartPremiseError(
             "projected premise belongs to a different authority revision".into(),
         ));
     }
-    if stored_alias != extension_alias || stored_server != server_id {
-        return Ok(None);
+    // Stored bytes must be byte-for-byte JSON Canonicalization Scheme output:
+    // the sealed document is re-canonicalized and compared byte-exactly.
+    let premise_value: serde_json::Value =
+        serde_json::from_slice(&record_bytes).map_err(|error| {
+            WorkerStartPremiseError(format!("stored premise record is malformed: {error}"))
+        })?;
+    let (canonical_bytes, _) =
+        dolly_canonical_json::canonicalize(&premise_value).map_err(|error| {
+            WorkerStartPremiseError(format!("stored premise record is not JCS: {error}"))
+        })?;
+    if canonical_bytes.as_ref() != record_bytes.as_slice() {
+        return Err(WorkerStartPremiseError(
+            "stored premise record bytes are not canonical JSON".into(),
+        ));
     }
     let premise: WorkerStartPremise = serde_json::from_slice(&record_bytes).map_err(|error| {
         WorkerStartPremiseError(format!("stored premise record is malformed: {error}"))
@@ -441,12 +476,89 @@ pub fn load_worker_start_premise(
     Ok(Some(premise))
 }
 
+/// Read-only hostile-preflight handle over an existing authority database.
+///
+/// Opens SQLite with the driver's read-only flag (no create/write) and sets
+/// `query_only` on the connection. SQLite's WAL reader materializes -shm/
+/// -wal sidecars even for read-only connections; the keeper-connection
+/// contract test therefore proves byte-for-byte equality of the complete
+/// file set (db, WAL, SHM) across the refused production run, with the
+/// sidecars held open by a live reader.
+pub struct ReadOnlyAuthorityPreflight {
+    connection: Connection,
+}
+
+impl ReadOnlyAuthorityPreflight {
+    /// Open `db_path` strictly read-only; a missing database file fails here
+    /// instead of being created.
+    pub fn open(db_path: &Path) -> StorageResult<Self> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let connection = Connection::open_with_flags(db_path, flags).map_err(map_sqlite_error)?;
+        connection
+            .execute_batch("PRAGMA query_only = ON")
+            .map_err(map_sqlite_error)?;
+        Ok(Self { connection })
+    }
+
+    pub fn connection(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+/// Read the persisted authority identity tuple `(daemon_installation_id,
+/// instance_id)` without any writable open or lock artifact.
+pub fn load_persisted_identity_tuple(
+    connection: &Connection,
+) -> StorageResult<Option<RuntimeAuthorityIdentity>> {
+    let row = connection
+        .query_row(
+            "SELECT daemon_installation_id, instance_id
+             FROM runtime_authority_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(RuntimeAuthorityIdentity {
+                    daemon_installation_id: row.get::<_, String>(0)?,
+                    instance_id: row.get::<_, String>(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    Ok(row)
+}
+
+/// Evaluate one identity pair's Worker-start premise against the current
+/// authority revision through exactly ONE read-only open: gate both schemas,
+/// read the persisted identity from that same connection, then load and fully
+/// verify the requested row. No controller generation is minted, no
+/// lock-owner state is rewritten, and no schema creation or migration can run.
+pub fn preflight_worker_start_premise(
+    db_path: &Path,
+    extension_alias: &str,
+    server_id: &str,
+) -> Result<Option<WorkerStartPremise>, WorkerStartPremiseError> {
+    let read_only = ReadOnlyAuthorityPreflight::open(db_path)
+        .map_err(|error| WorkerStartPremiseError(format!("read-only open refused: {error}")))?;
+    let connection = read_only.connection();
+    verify_authority_schema(connection).map_err(|error| {
+        WorkerStartPremiseError(format!("host authority schema refused: {error}"))
+    })?;
+    gate_worker_start_premise_schema(connection)
+        .map_err(|error| WorkerStartPremiseError(format!("premise schema refused: {error}")))?;
+    let identity = load_persisted_identity_tuple(connection)
+        .map_err(|error| WorkerStartPremiseError(format!("identity read failed: {error}")))?
+        .ok_or_else(|| {
+            WorkerStartPremiseError("authority identity is absent for this database".into())
+        })?;
+    load_worker_start_premise(connection, &identity, extension_alias, server_id)
+}
+
 /// Create the Worker-start premise slice next to an existing Host authority.
 ///
 /// Mirrors the Tool-call ledger discipline: `IF NOT EXISTS` may only install
 /// genuinely missing objects; anything existing is compared against the exact
 /// authoritative definitions and any mismatch fails closed.
-pub fn create_worker_start_premise_schema(connection: &Connection) -> StorageResult<()> {
+pub(crate) fn create_worker_start_premise_schema(connection: &Connection) -> StorageResult<()> {
     verify_authority_schema(connection).map_err(|_| StorageError::Corrupt)?;
     let expected = authoritative_premise_sql()?;
     let parent: Option<String> = connection
@@ -494,10 +606,10 @@ fn gate_worker_start_premise_schema_with(
         connection,
         WORKER_START_PREMISE_TABLE,
         &[
-            ("config_revision", "INTEGER", 0, 1),
+            ("config_revision", "INTEGER", 1, 1),
             ("config_digest", "TEXT", 1, 0),
-            ("extension_alias", "TEXT", 1, 0),
-            ("server_id", "TEXT", 1, 0),
+            ("extension_alias", "TEXT", 1, 2),
+            ("server_id", "TEXT", 1, 3),
             ("package_root", "TEXT", 1, 0),
             ("package_path", "TEXT", 1, 0),
             ("package_digest", "TEXT", 1, 0),
@@ -566,10 +678,9 @@ fn verify_required_columns(
         .collect::<Result<Vec<_>, _>>()
         .map_err(map_sqlite_error)?;
     if actual.len() != expected.len()
-        || actual
-            .iter()
-            .zip(expected.iter())
-            .any(|(got, want)| got.0 != want.0 || got.1 != want.1 || got.2 != want.2 || got.3 != want.3)
+        || actual.iter().zip(expected.iter()).any(|(got, want)| {
+            got.0 != want.0 || got.1 != want.1 || got.2 != want.2 || got.3 != want.3
+        })
     {
         return Err(StorageError::MigrationRequired);
     }
@@ -610,7 +721,9 @@ mod tests {
                      config_digest, canonical_bytes
                  ) VALUES (1, '0198ab31-6c44-7e8a-b2bb-000000000001',
                            'instance-a', ?1, x'7b7d')",
-                rusqlite::params!["sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"],
+                rusqlite::params![
+                    "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+                ],
             )
             .unwrap();
         connection
@@ -634,7 +747,8 @@ mod tests {
             daemon_installation_id: "0198ab31-6c44-7e8a-b2bb-000000000001".into(),
             instance_id: "instance-a".into(),
             config_revision: 1,
-            config_digest: "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into(),
+            config_digest:
+                "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into(),
             extension_alias: "org.dolly.tools".into(),
             server_id: "fs".into(),
             package_root: "/opt/dolly/pkg".into(),
@@ -645,10 +759,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn schema_gate_enforces_composite_identity_pk() {
+        let mut connection = seeded_connection();
+        // The authoritative table reports the composite identity primary key
+        // with ordinals 1/2/3 and NOT NULL on every key column.
+        let key: Vec<(String, i64, i64)> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT name, \"notnull\", pk FROM pragma_table_info('worker_start_premises')
+                     WHERE pk > 0 ORDER BY pk",
+                )
+                .expect("pragma table_info");
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .expect("query key columns");
+            rows.map(|row| row.expect("key column row")).collect()
+        };
+        assert_eq!(
+            key,
+            vec![
+                ("config_revision".to_string(), 1, 1),
+                ("extension_alias".to_string(), 1, 2),
+                ("server_id".to_string(), 1, 3),
+            ]
+        );
+        // A revision-only PK table must fail the exact-shape gate.
+        connection
+            .execute("DROP TABLE worker_start_premises", [])
+            .unwrap();
+        connection
+            .execute(
+                "CREATE TABLE worker_start_premises (
+                     config_revision INTEGER PRIMARY KEY CHECK (config_revision BETWEEN 1 AND 9007199254740991),
+                     config_digest TEXT NOT NULL,
+                     extension_alias TEXT NOT NULL,
+                     server_id TEXT NOT NULL,
+                     package_root TEXT NOT NULL,
+                     package_path TEXT NOT NULL,
+                     package_digest TEXT NOT NULL,
+                     executable_digest TEXT NOT NULL,
+                     endpoint TEXT NOT NULL,
+                     record_jcs BLOB NOT NULL,
+                     record_digest TEXT NOT NULL
+                 )",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            gate_worker_start_premise_schema(&connection),
+            Err(StorageError::MigrationRequired)
+        ));
+    }
+
     fn insert_sample(connection: &mut Connection, input: WorkerStartPremiseInput) -> bool {
         let tx = connection.transaction().expect("transaction");
-        let inserted =
-            insert_worker_start_premise_in_transaction(&tx, input).expect("insert");
+        let inserted = insert_worker_start_premise_in_transaction(&tx, input).expect("insert");
         tx.commit().expect("commit");
         inserted
     }
@@ -661,14 +833,9 @@ mod tests {
             daemon_installation_id: "0198ab31-6c44-7e8a-b2bb-000000000001".into(),
             instance_id: "instance-a".into(),
         };
-        let premise = load_worker_start_premise(
-            &connection,
-            &identity,
-            "org.dolly.tools",
-            "fs",
-        )
-        .expect("load")
-        .expect("premise present");
+        let premise = load_worker_start_premise(&connection, &identity, "org.dolly.tools", "fs")
+            .expect("load")
+            .expect("premise present");
         assert_eq!(premise.package_root, "/opt/dolly/pkg");
         assert_eq!(premise.endpoint, "bin/dolly-fs-tools");
         premise.verify_content().expect("content valid");
@@ -693,9 +860,11 @@ mod tests {
             daemon_installation_id: "0198ab31-6c44-7e8a-b2bb-000000000001".into(),
             instance_id: "instance-a".into(),
         };
-        assert!(load_worker_start_premise(&connection, &identity, "org.dolly.tools", "fs")
-            .expect("load")
-            .is_none());
+        assert!(
+            load_worker_start_premise(&connection, &identity, "org.dolly.tools", "fs")
+                .expect("load")
+                .is_none()
+        );
         assert!(
             load_worker_start_premise(&connection, &identity, "org.dolly.other", "fs")
                 .expect("load")
@@ -712,8 +881,7 @@ mod tests {
             instance_id: "instance-a".into(),
         };
         assert!(
-            load_worker_start_premise(&connection, &identity, "org.dolly.tools", "fs")
-                .is_err()
+            load_worker_start_premise(&connection, &identity, "org.dolly.tools", "fs").is_err()
         );
     }
 
@@ -735,8 +903,7 @@ mod tests {
             instance_id: "instance-a".into(),
         };
         assert!(
-            load_worker_start_premise(&connection, &identity, "org.dolly.tools", "fs")
-                .is_err()
+            load_worker_start_premise(&connection, &identity, "org.dolly.tools", "fs").is_err()
         );
     }
 
@@ -768,8 +935,7 @@ mod tests {
             instance_id: "instance-a".into(),
         };
         assert!(
-            load_worker_start_premise(&connection, &identity, "org.dolly.tools", "fs")
-                .is_err()
+            load_worker_start_premise(&connection, &identity, "org.dolly.tools", "fs").is_err()
         );
     }
 
@@ -780,7 +946,8 @@ mod tests {
             daemon_installation_id: "0198ab31-6c44-7e8a-b2bb-000000000001".into(),
             instance_id: "instance-a".into(),
             config_revision: 1,
-            config_digest: "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into(),
+            config_digest:
+                "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into(),
             extension_alias: "org.dolly.tools".into(),
             server_id: "fs".into(),
             package_root: "/opt/dolly/pkg".into(),
@@ -802,6 +969,35 @@ mod tests {
     fn schema_gate_requires_exact_shape() {
         let mut connection = seeded_connection();
         gate_worker_start_premise_schema(&connection).expect("gate passes");
+        {
+            let expected = authoritative_premise_sql().unwrap();
+            let got: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='worker_start_premises'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            eprintln!("DBG_EXPECTED={expected}");
+            eprintln!("DBG_GOT={got}");
+            let mut stmt = connection
+                .prepare("PRAGMA table_info(worker_start_premises)")
+                .unwrap();
+            let rows: Vec<String> = stmt
+                .query_map([], |r| {
+                    Ok(format!(
+                        "{}|{}|{}|{}",
+                        r.get::<_, String>(1).unwrap(),
+                        r.get::<_, String>(2).unwrap(),
+                        r.get::<_, i64>(3).unwrap(),
+                        r.get::<_, i64>(5).unwrap()
+                    ))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            eprintln!("DBG_PRAGMA={rows:?}");
+        }
         connection
             .execute("DROP TABLE worker_start_premises", [])
             .unwrap();

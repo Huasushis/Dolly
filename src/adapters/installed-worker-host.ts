@@ -31,7 +31,7 @@ import type {
   InstallWorkerStartPremiseInput,
   RuntimeAuthorityDatabase,
 } from "./storage/runtime-authority-database.js";
-import { FramedJsonChannel, FramedJsonError } from "../core/framed-json-channel.js";
+import { FramedJsonChannel } from "../core/framed-json-channel.js";
 import type { JsonValue } from "../core/canonical-json.js";
 
 /** Frozen control-frame cap shared with the Rust binary's `FrameLimits`. */
@@ -298,32 +298,35 @@ export async function launchInstalledWorkerHost(
     deadline: NodeJS.Timeout | undefined;
   };
   let pendingReply: PendingReply | undefined;
+  let stopped = false;
+  let stopAcknowledged = false;
 
   function rejectPending(detail: string): void {
     const pending = pendingReply;
     pendingReply = undefined;
     if (pending) {
       if (pending.deadline) clearTimeout(pending.deadline);
-      pending.reject(new InstalledWorkerHostError("WORKER_START_INVALID", detail));
+      pending.reject(
+        new InstalledWorkerHostError("WORKER_START_INVALID", stderrDiagnostics(detail)),
+      );
     }
   }
 
   let closed = false;
-  let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null =
-    null;
   const closeWaiter: Promise<void> = new Promise<void>((resolveClose) => {
     child.once("close", (code, signal) => {
       closed = true;
       // ENOENT-style failures emit error+close without exit; close alone
-      // settles the waiter so nothing waits forever.
-      exitInfo =
-        code !== null || signal !== null ? { code, signal } : exitInfo;
+      // settles the waiter so nothing waits forever. A pending reply at this
+      // point was required and can never arrive.
+      if (pendingReply !== undefined) {
+        rejectPending("worker_host stdio closed before replying");
+      }
       resolveClose();
     });
   });
   child.once("exit", (code, signal) => {
     exited = true;
-    exitInfo = { code, signal };
     if (!closed) {
       rejectPending(
         `worker_host exited before replying (${code ?? signal ?? "unknown"})`,
@@ -391,8 +394,8 @@ export async function launchInstalledWorkerHost(
   }
 
   // One serialized pending slot; a second concurrent request fails closed.
-// Startup gate registered BEFORE the channel attaches: a fast `started`
-// frame is consumed by this slot, not classified unsolicited.
+  // Startup gate registered BEFORE the channel attaches: a fast `started`
+  // frame is consumed by this slot, not classified unsolicited.
   const startedGate = awaitReply(STARTED_TIMEOUT_MS);
 
   const channel = new FramedJsonChannel(child.stdout, child.stdin, {
@@ -411,11 +414,15 @@ export async function launchInstalledWorkerHost(
     },
     onError: (error) => {
       failPending(error.message);
-      if (!child.killed) child.kill();
+      if (!stopAcknowledged && !child.killed) child.kill();
     },
     onEnd: () => {
-      failPending("worker_host closed stdout before stopping");
-      if (!child.killed) child.kill();
+      // Normal EOF is accepted only after an exact `stopped` acknowledgement;
+      // every earlier end-of-stream is fatal.
+      if (!(stopped && stopAcknowledged)) {
+        failPending("worker_host closed stdout before stopping");
+        if (!stopAcknowledged && !child.killed) child.kill();
+      }
     },
   });
 
@@ -426,6 +433,15 @@ export async function launchInstalledWorkerHost(
    * the caller awaits close/reap and propagates this original error.
    */
   function awaitReply(deadlineMs: number): Promise<JsonValue> {
+    if (pendingReply !== undefined) {
+      // Serialized queue should prevent this; fail closed if it ever happens.
+      return Promise.reject(
+        new InstalledWorkerHostError(
+          "WORKER_START_INVALID",
+          "concurrent request while another reply is pending",
+        ),
+      );
+    }
     return new Promise<JsonValue>((_resolveReply, rejectReply) => {
       let settled = false;
       const deadline = setTimeout(() => {
@@ -501,7 +517,6 @@ export async function launchInstalledWorkerHost(
   // Serialized operation queue: one in-flight status/stop at a time.
   let operationChain: Promise<unknown> = Promise.resolve();
   let stopPromise: Promise<void> | undefined;
-  let stopped = false;
 
   function enqueue<T>(operation: () => Promise<T>): Promise<T> {
     const run = operationChain.then(operation, operation);
@@ -536,12 +551,17 @@ export async function launchInstalledWorkerHost(
           try {
             await channel.send({ v: 1, op: "status" });
           } catch (sendError) {
-            rejectPending(
-              sendError instanceof Error
-                ? `status send failed: ${sendError.message}`
-                : "status send failed",
+            const typed = new InstalledWorkerHostError(
+              "WORKER_START_INVALID",
+              stderrDiagnostics(
+                sendError instanceof Error
+                  ? `status send failed: ${sendError.message}`
+                  : "status send failed",
+              ),
             );
-            throw sendError;
+            rejectPending(typed.message);
+            await pendingReplyGate.catch(() => undefined);
+            throw typed;
           }
           const raw = (await pendingReplyGate) as Record<string, unknown>;
           assertExactKeys(
@@ -563,9 +583,24 @@ export async function launchInstalledWorkerHost(
       stopPromise = enqueue(async () => {
         try {
           const replyPromise = awaitReply(STATUS_TIMEOUT_MS);
-          await channel.send({ v: 1, op: "stop" });
+          try {
+            await channel.send({ v: 1, op: "stop" });
+          } catch (sendError) {
+            const typed = new InstalledWorkerHostError(
+              "WORKER_START_INVALID",
+              stderrDiagnostics(
+                sendError instanceof Error
+                  ? `stop send failed: ${sendError.message}`
+                  : "stop send failed",
+              ),
+            );
+            rejectPending(typed.message);
+            await replyPromise.catch(() => undefined);
+            throw typed;
+          }
           const reply = (await replyPromise) as Record<string, unknown>;
           assertExactKeys(reply as JsonValue, { v: 1, event: "stopped" }, "stopped");
+          stopAcknowledged = true;
         } catch (firstError) {
           // Protocol or timeout failure: terminate, reap, then propagate
           // the ORIGINAL typed error (never converted to success).
@@ -576,10 +611,13 @@ export async function launchInstalledWorkerHost(
         // A valid `stopped` frame still requires PROOF of stdio closure:
         // race the close waiter against a bounded grace period; timeout here
         // is a typed failure, not silent success.
-        const closedInTime = await Promise.race([
-          closeWaiter.then(() => true),
-          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5000)),
-        ]);
+        const closedInTime = await new Promise<boolean>((resolveClosed) => {
+          const graceTimer = setTimeout(() => resolveClosed(false), 5000);
+          void closeWaiter.then(() => {
+            clearTimeout(graceTimer);
+            resolveClosed(true);
+          });
+        });
         if (!closedInTime) {
           if (!closed && !child.killed) child.kill();
           await closeWaiter;

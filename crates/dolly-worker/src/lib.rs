@@ -8,16 +8,16 @@ use dolly_canonical_json::{
 };
 use dolly_core_domain::ExtensionId;
 use dolly_storage::Database;
-use dolly_storage::host_authority::load_current_authority;
 use dolly_storage::effect_journal::{
     EffectJournalInsertDisposition, EffectJournalIntentAuthority, assert_operation_claimable,
     gate_schema_version, insert_intent, retain_settled_effect_journal, settle_non_effect_intent,
     settle_pending_effect_journal, settle_unknown_intent,
 };
-use dolly_storage::mcp_readiness::{
-    MCP_PROTOCOL_VERSION_2025_06_18, McpTransportReadiness,
+use dolly_storage::host_authority::load_current_authority;
+use dolly_storage::mcp_readiness::{MCP_PROTOCOL_VERSION_2025_06_18, McpTransportReadiness};
+use dolly_storage::runtime_binding::{
+    ProcessGeneration, RuntimeBinding, invalidate_runtime_binding,
 };
-use dolly_storage::runtime_binding::{ProcessGeneration, RuntimeBinding, invalidate_runtime_binding};
 use dolly_storage::tool_broker_authority::{
     ToolDispatchAuthority, ToolRegistryRevision, authorize_tool_dispatch, publish_tool_registry,
 };
@@ -38,17 +38,22 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub struct WorkerStartConfig {
     pub db_path: PathBuf,
+    pub config_revision: i64,
+    pub config_digest: String,
     pub extension_alias: ExtensionId,
     pub server_id: String,
     pub package_root: PathBuf,
     pub package_path: PathBuf,
+    pub package_digest: String,
+    pub executable_digest: String,
+    pub endpoint: String,
+    pub record_digest: String,
 }
+pub mod premise;
 #[cfg(feature = "test-support")]
 mod test_support;
-pub mod premise;
 
-type StartupMint =
-    fn(&mut Database, ExtensionId) -> Result<RuntimeBinding, WorkerError>;
+type StartupMint = fn(&mut Database, ExtensionId) -> Result<RuntimeBinding, WorkerError>;
 type StartupInitialize = fn(
     &mut HostMcpStdioInvocation,
     &EffectJournalIntentAuthority,
@@ -156,45 +161,177 @@ pub struct Worker {
     stopped: bool,
 }
 
+/// Bind the carried premise against the reloaded current authority snapshot
+/// and the exact reloaded premise row: every field must agree byte/value-
+/// exact. Paths are compared as UTF-8; non-UTF-8 caller paths refuse instead
+/// of aliasing replacement characters.
+fn bind_premise_fields(
+    config: &WorkerStartConfig,
+    snapshot: &dolly_storage::host_authority::CurrentAuthoritySnapshot,
+    durable_premise: &dolly_storage::worker_start_premise::WorkerStartPremise,
+) -> Result<(), WorkerError> {
+    if durable_premise.config_revision != config.config_revision
+        || durable_premise.config_digest != config.config_digest
+        || durable_premise.extension_alias != config.extension_alias.as_str()
+        || durable_premise.server_id != config.server_id
+        || Some(durable_premise.package_root.as_str()) != config.package_root.to_str()
+        || Some(durable_premise.package_path.as_str()) != config.package_path.to_str()
+        || durable_premise.package_digest != config.package_digest
+        || durable_premise.executable_digest != config.executable_digest
+        || durable_premise.endpoint != config.endpoint
+        || durable_premise.record_digest != config.record_digest
+        || snapshot.mapping.config_revision != config.config_revision
+        || snapshot.mapping.config_digest.to_canonical_string() != config.config_digest
+    {
+        return Err(WorkerError::Premise(
+            "carried Worker-start premise disagrees with the durable projection".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Worker {
     /// Execute the bounded Linux-first startup sequence and retain one
     /// verified, initialized stdio session for the next tools/call dispatch.
+    ///
+    /// Production entry ordering contract:
+    /// 1. non-Linux hosts refuse before ANY preflight, open, or lock action;
+    /// 2. one read-only hostile preflight re-verifies the carried premise;
+    /// 3. ONE writable open serves the whole startup; the same connection
+    ///    reloads the current authority AND the exact premise row (closing
+    ///    any preflight-to-lock race), and both are bound field-for-field to
+    ///    the carried config — a publicly constructed config cannot bypass
+    ///    durable equality;
+    /// 4. only then do byte-digest checks and spawn proceed.
     pub fn start(config: WorkerStartConfig) -> Result<Self, WorkerError> {
-        Self::start_internal_with(config, mint_live_runtime_binding, initialize_live)
+        if !cfg!(target_os = "linux") {
+            return Err(WorkerError::UnsupportedPlatform);
+        }
+        Self::preflight_premise(&config)?;
+
+        let mut database = Database::open(&config.db_path)
+            .map_err(|error| WorkerError::Storage(error.to_string()))?;
+
+        let snapshot = load_current_authority(database.connection())
+            .map_err(|error| WorkerError::Authority(error.to_string()))?
+            .ok_or_else(|| WorkerError::Premise("current Host authority is absent".into()))?;
+        // Reload the exact current premise row through THIS opened writable
+        // connection: closes a row-change race between the read-only
+        // preflight and lock acquisition.
+        let durable_premise = dolly_storage::worker_start_premise::load_worker_start_premise(
+            database.connection(),
+            database.authority_identity(),
+            config.extension_alias.as_str(),
+            &config.server_id,
+        )
+        .map_err(|error| WorkerError::Premise(error.to_string()))?
+        .ok_or_else(|| {
+            WorkerError::Premise(
+                "no durable Worker-start premise is projected for the current authority revision"
+                    .into(),
+            )
+        })?;
+        bind_premise_fields(&config, &snapshot, &durable_premise)?;
+
+        let durable_server = load_durable_server(&snapshot, &config.server_id)?;
+        if durable_server.package_digest.to_canonical_string() != config.package_digest
+            || durable_server.executable_digest.to_canonical_string() != config.executable_digest
+            || durable_server.endpoint != config.endpoint
+        {
+            return Err(WorkerError::Premise(
+                "admitted server contract disagrees with the verified premise".into(),
+            ));
+        }
+
+        Self::start_opened_with_observer(
+            database,
+            config,
+            durable_server,
+            mint_live_runtime_binding,
+            initialize_live,
+            ignore_spawn_observer,
+        )
+    }
+
+    /// Read-only hostile preflight of the carried premise. Opens SQLite
+    /// read-only with `query_only`; it performs no writes, no controller-
+    /// generation mint, and no lock-owner rewrite. SQLite's WAL reader may
+    /// materialize -shm/-wal sidecars even read-only; the durable-content
+    /// contract is proven by the keeper-backed byte-identity test.
+    fn preflight_premise(config: &WorkerStartConfig) -> Result<(), WorkerError> {
+        let durable_premise = dolly_storage::worker_start_premise::preflight_worker_start_premise(
+            &config.db_path,
+            config.extension_alias.as_str(),
+            &config.server_id,
+        )
+        .map_err(|error| WorkerError::Premise(error.to_string()))?
+        .ok_or_else(|| {
+            WorkerError::Premise(
+                "no durable Worker-start premise is projected for the current authority revision"
+                    .into(),
+            )
+        })?;
+        if durable_premise.config_revision != config.config_revision
+            || durable_premise.config_digest != config.config_digest
+            || durable_premise.extension_alias != config.extension_alias.as_str()
+            || durable_premise.server_id != config.server_id
+            || Some(durable_premise.package_root.as_str()) != config.package_root.to_str()
+            || Some(durable_premise.package_path.as_str()) != config.package_path.to_str()
+            || durable_premise.package_digest != config.package_digest
+            || durable_premise.executable_digest != config.executable_digest
+            || durable_premise.endpoint != config.endpoint
+            || durable_premise.record_digest != config.record_digest
+        {
+            return Err(WorkerError::Premise(
+                "carried Worker-start premise disagrees with the durable projection".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn start_internal_with(
         config: WorkerStartConfig,
         mint_runtime_binding: StartupMint,
         initialize_invocation: StartupInitialize,
-    ) -> Result<Self, WorkerError> {
-        Self::start_internal_with_observer(
-            config,
-            mint_runtime_binding,
-            initialize_invocation,
-            ignore_spawn_observer,
-        )
-    }
-
-    fn start_internal_with_observer(
-        config: WorkerStartConfig,
-        mint_runtime_binding: StartupMint,
-        initialize_invocation: StartupInitialize,
         spawn_observer: fn(u32),
     ) -> Result<Self, WorkerError> {
+        // Test-support path: opens its own database and loads the durable
+        // server without the production premise binding (sanctioned seam).
         if !cfg!(target_os = "linux") {
             return Err(WorkerError::UnsupportedPlatform);
         }
         if config.server_id.is_empty() {
             return Err(WorkerError::Premise("server identity is empty".into()));
         }
-
         let mut database = Database::open(&config.db_path)
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
         let snapshot = load_current_authority(database.connection())
             .map_err(|error| WorkerError::Authority(error.to_string()))?
             .ok_or_else(|| WorkerError::Premise("current Host authority is absent".into()))?;
         let durable_server = load_durable_server(&snapshot, &config.server_id)?;
+        Self::start_opened_with_observer(
+            database,
+            config,
+            durable_server,
+            mint_runtime_binding,
+            initialize_invocation,
+            spawn_observer,
+        )
+    }
+
+    /// Startup over an ALREADY-OPENED, already-bound database and verified
+    /// durable server: the production entry opens once in `start`, reloads
+    /// the exact premise row through this same connection (closing any
+    /// preflight-to-lock race), and hands the opened database here. No
+    /// second writable open, no second controller generation.
+    fn start_opened_with_observer(
+        mut database: Database,
+        config: WorkerStartConfig,
+        durable_server: DurableServer,
+        mint_runtime_binding: StartupMint,
+        initialize_invocation: StartupInitialize,
+        spawn_observer: fn(u32),
+    ) -> Result<Self, WorkerError> {
         let package_root = canonical_directory(&config.package_root)?;
         let package_path = canonical_file(&config.package_path, "package")?;
         let executable_path = package_root.join(&durable_server.endpoint);
@@ -323,30 +460,30 @@ impl Worker {
             &durable_server.package_digest,
             &attestation_digest,
         )?;
-        let handshake_authority =
-            match insert_intent(database.connection_mut(), &handshake_intent) {
-                Ok(EffectJournalInsertDisposition::Inserted { authority, .. }) => authority,
-                Ok(EffectJournalInsertDisposition::Replayed { .. }) => {
-                    return Err(startup_failure(
-                        &mut database,
-                        &runtime_binding,
-                        Some(&process_generation),
-                        None,
-                        WorkerError::Premise(
-                            "startup handshake Claim already exists; refusing replay".into(),
-                        ),
-                    ));
-                }
-                Err(error) => {
-                    return Err(startup_failure(
-                        &mut database,
-                        &runtime_binding,
-                        Some(&process_generation),
-                        None,
-                        WorkerError::Storage(error.to_string()),
-                    ));
-                }
-            };
+        let handshake_authority = match insert_intent(database.connection_mut(), &handshake_intent)
+        {
+            Ok(EffectJournalInsertDisposition::Inserted { authority, .. }) => authority,
+            Ok(EffectJournalInsertDisposition::Replayed { .. }) => {
+                return Err(startup_failure(
+                    &mut database,
+                    &runtime_binding,
+                    Some(&process_generation),
+                    None,
+                    WorkerError::Premise(
+                        "startup handshake Claim already exists; refusing replay".into(),
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(startup_failure(
+                    &mut database,
+                    &runtime_binding,
+                    Some(&process_generation),
+                    None,
+                    WorkerError::Storage(error.to_string()),
+                ));
+            }
+        };
         let (mut invocation, process_handle) = match HostMcpStdioInvocation::from_installed_child(
             child.into_child(),
             attestation,
@@ -396,13 +533,11 @@ impl Worker {
                 readiness
             }
             Err(error) => {
-                let failure = match settle_unknown_intent(
-                    database.connection_mut(),
-                    &handshake_authority,
-                ) {
-                    Ok(_) => WorkerError::Transport(error),
-                    Err(settlement_error) => WorkerError::Storage(settlement_error.to_string()),
-                };
+                let failure =
+                    match settle_unknown_intent(database.connection_mut(), &handshake_authority) {
+                        Ok(_) => WorkerError::Transport(error),
+                        Err(settlement_error) => WorkerError::Storage(settlement_error.to_string()),
+                    };
                 return Err(startup_failure(
                     &mut database,
                     &runtime_binding,
@@ -730,13 +865,17 @@ fn mint_handshake_intent_record(
         &operation_id,
         attested_child_digest,
     )
-    .map_err(|error| WorkerError::Premise(format!("handshake digest is not canonical: {error:?}")))?;
+    .map_err(|error| {
+        WorkerError::Premise(format!("handshake digest is not canonical: {error:?}"))
+    })?;
     let operation_digest = canonicalize(&serde_json::json!({
         "schema": "dolly.mcp-initialize-operation/v1",
         "server_id": server_id,
         "session_id": session_id,
     }))
-    .map_err(|error| WorkerError::Premise(format!("handshake operation is not canonical: {error}")))?
+    .map_err(|error| {
+        WorkerError::Premise(format!("handshake operation is not canonical: {error}"))
+    })?
     .1;
     let worker_epoch = runtime_binding.worker_epoch().to_string();
     let effect_class = EffectClass::McpInitializeHandshake;
@@ -775,9 +914,9 @@ fn mint_handshake_intent_record(
         intent_digest,
         evidence_digest: None,
     };
-    record
-        .verify()
-        .map_err(|error| WorkerError::Premise(format!("handshake intent identity invalid: {error}")))?;
+    record.verify().map_err(|error| {
+        WorkerError::Premise(format!("handshake intent identity invalid: {error}"))
+    })?;
     Ok(record)
 }
 fn startup_failure(
@@ -808,6 +947,16 @@ struct DurableServer {
     startup_timeout: Duration,
     stdio_limits: StdioTransportLimits,
     dispatch_limits: DispatchLimits,
+}
+
+/// Load the admitted durable server contract for `server_id` from an already
+/// verified authority snapshot. Exposed for premise binding in the public
+/// entry derivation; the snapshot itself is loaded by the caller.
+pub(crate) fn bind_durable_server(
+    snapshot: &dolly_storage::host_authority::CurrentAuthoritySnapshot,
+    server_id: &str,
+) -> Result<DurableServer, WorkerError> {
+    load_durable_server(snapshot, server_id)
 }
 
 fn load_durable_server(

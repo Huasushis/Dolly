@@ -1,4 +1,3 @@
-
 #![cfg(feature = "test-support")]
 //! RED end-to-end Worker dispatch/start/reopen contract tests for the v2
 //! external-effect journal (ADR 0009 capability effect-intent seam).
@@ -184,7 +183,6 @@ fn request_frame(b: &ToolOperationBinding) -> Vec<u8> {
         .as_ref()
         .to_vec()
 }
-
 
 // ---------------------------------------------------------------------------
 // installed fake MCP server (a REAL spawned child)
@@ -412,6 +410,9 @@ struct Fixture {
     package_path: PathBuf,
     server: Value,
     instance_id: String,
+    package_digest: Sha256Digest,
+    executable_digest: Sha256Digest,
+    premise_record_digest: String,
 }
 
 impl Fixture {
@@ -470,6 +471,9 @@ impl Fixture {
             package_path: package_root.join("package.bin"),
             server,
             instance_id,
+            package_digest,
+            executable_digest,
+            premise_record_digest: String::new(),
         }
     }
 
@@ -492,10 +496,17 @@ impl Fixture {
     fn config(&self) -> WorkerStartConfig {
         WorkerStartConfig {
             db_path: self.db_path.clone(),
+            config_revision: 1,
+            config_digest:
+                "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into(),
             extension_alias: "org.dolly.tools".parse().expect("extension id"),
             server_id: "fs".into(),
             package_root: self.package_root.clone(),
             package_path: self.package_path.clone(),
+            package_digest: self.package_digest.to_canonical_string(),
+            executable_digest: self.executable_digest.to_canonical_string(),
+            endpoint: "bin/dolly-fs-tools".into(),
+            record_digest: self.premise_record_digest.clone(),
         }
     }
 
@@ -607,13 +618,10 @@ fn worker_reopen_recovers_persisted_authorized_without_redispatch() {
     let restarted = fixture.start_worker();
     drop(restarted);
     let db = Database::open(&fixture.db_path).expect("reopen recovered database");
-    let ledger_after = load_ledger_exact(
-        db.connection(),
-        &binding.module_id,
-        &binding.operation_id,
-    )
-    .expect("load recovered ledger")
-    .expect("ledger row retained");
+    let ledger_after =
+        load_ledger_exact(db.connection(), &binding.module_id, &binding.operation_id)
+            .expect("load recovered ledger")
+            .expect("ledger row retained");
     assert_ne!(ledger_after.state, LedgerState::Authorized);
     let journal_state: String = db
         .connection()

@@ -1,17 +1,19 @@
 //! Public Worker-start entry derivation from the durable premise.
 //!
 //! The production worker-host binary receives only a database location plus
-//! the extension/server identity pair. Its entire spawn authority — installed
-//! locations and digests — is derived here exclusively from the closed
-//! Worker-start premise projected by the Host-owned TS authority writer for
-//! the current authority revision. An absent, stale, or tampered premise is a
-//! typed startup refusal before any process exists.
+//! the extension/server identity pair. This module performs the READ-ONLY
+//! hostile preflight exclusively: it opens the database once in read-only
+//! mode, gates both schemas, reads the persisted authority identity, and
+//! verifies the requested premise row. It never mints controller generations,
+//! rewrites lock owners, creates schemas, or opens the database writable —
+//! `Worker::start` owns that single writable open and re-binds every carried
+//! premise field against the freshly loaded current Host authority before any
+//! child process exists.
 
 use std::path::PathBuf;
 
 use dolly_core_domain::ExtensionId;
-use dolly_storage::Database;
-use dolly_storage::worker_start_premise::load_worker_start_premise;
+use dolly_storage::worker_start_premise::preflight_worker_start_premise;
 
 use crate::{WorkerError, WorkerStartConfig};
 
@@ -26,10 +28,7 @@ pub fn load_worker_start_config(
     extension_alias: &str,
     server_id: &str,
 ) -> Result<WorkerStartConfig, WorkerError> {
-    let database =
-        Database::open(&db_path).map_err(|error| WorkerError::Storage(error.to_string()))?;
-    let identity = database.authority_identity();
-    let premise = load_worker_start_premise(database.connection(), identity, extension_alias, server_id)
+    let premise = preflight_worker_start_premise(&db_path, extension_alias, server_id)
         .map_err(|error| WorkerError::Premise(error.to_string()))?
         .ok_or_else(|| {
             WorkerError::Premise(
@@ -37,18 +36,20 @@ pub fn load_worker_start_config(
                     .to_string(),
             )
         })?;
-    premise
-        .verify_content()
-        .map_err(|error| WorkerError::Premise(error.to_string()))?;
     let parsed_alias: ExtensionId = extension_alias
         .parse()
         .map_err(|error| WorkerError::Premise(format!("extension alias is invalid: {error}")))?;
-    drop(database);
     Ok(WorkerStartConfig {
+        config_revision: premise.config_revision,
+        config_digest: premise.config_digest.clone(),
         db_path,
-        extension_alias: parsed_alias,
-        server_id: server_id.to_string(),
         package_root: premise.package_root_path(),
         package_path: premise.package_path(),
+        package_digest: premise.package_digest.clone(),
+        executable_digest: premise.executable_digest.clone(),
+        endpoint: premise.endpoint.clone(),
+        record_digest: premise.record_digest.clone(),
+        extension_alias: parsed_alias,
+        server_id: server_id.to_string(),
     })
 }

@@ -8,8 +8,8 @@ use dolly_storage::effect_journal::{
 use dolly_storage::mcp_readiness::McpTransportReadiness;
 use dolly_storage::runtime_binding::{RuntimeBinding, mint_test_runtime_binding};
 use dolly_storage::tool_ledger::{LedgerInsertDisposition, insert_authorized};
-use dolly_tool_broker::effect_journal::ExternalEffectJournalRecord;
 use dolly_tool_broker::ToolCallLedgerRecord;
+use dolly_tool_broker::effect_journal::ExternalEffectJournalRecord;
 use dolly_tool_coordinator::{HostMcpStdioInvocation, StdioTransportError};
 
 use super::{
@@ -50,7 +50,7 @@ impl Worker {
     pub fn start_for_test(config: WorkerStartConfig) -> Result<Self, WorkerError> {
         let mint: StartupMint = mint_test;
         let initialize: StartupInitialize = initialize_test;
-        Self::start_internal_with(config, mint, initialize)
+        Self::start_internal_with(config, mint, initialize, |_| {})
     }
     /// Test-support-only startup seam that observes the real spawned PID
     /// without granting tests any child I/O or ownership capability.
@@ -60,7 +60,7 @@ impl Worker {
     ) -> Result<Self, WorkerError> {
         let mint: StartupMint = mint_test;
         let initialize: StartupInitialize = initialize_test;
-        Self::start_internal_with_observer(config, mint, initialize, observer)
+        Self::start_internal_with(config, mint, initialize, observer)
     }
 
     /// Test-support-only insertion through the Worker's already-open
