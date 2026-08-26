@@ -25,9 +25,10 @@ jobs:
         run: |
           mkdir -p .cache/datasets
           curl --fail --location --retry 5 --retry-all-errors \
-            https://raw.githubusercontent.com/snap-research/locomo/d95b872480b413d935821fdc3c84f8a8f5f29e73/data/locomo10.json \
+            https://raw.githubusercontent.com/snap-research/locomo/3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376/data/locomo10.json \
             --output .cache/datasets/locomo10.json
-          echo "d95b872480b413d935821fdc3c84f8a8f5f29e73  upstream Git blob" > .cache/datasets/locomo.source.txt
+          echo "repo_commit=3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376" > .cache/datasets/locomo.source.txt
+          echo "file_blob=d95b872480b413d935821fdc3c84f8a8f5f29e73" >> .cache/datasets/locomo.source.txt
           ls -lh .cache/datasets/locomo10.json
       - name: Run LoCoMo evidence-retrieval diagnostics
         run: |
