@@ -1,0 +1,12 @@
+{
+  "version": "2026.08.26-public-v1",
+  "source_sha256": "5e8c1c351f5cb182be2dee5ed95354632f6e3c5d26ff484b0a9ed704df6d604a",
+  "dataset_sha256": {
+    "locomo": {
+      "path": ".cache/datasets/locomo10.json",
+      "sha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4"
+    }
+  },
+  "command": "research/dolly_research_layer/public_retrieval_bench.py --locomo .cache/datasets/locomo10.json --out research/dolly_research_layer/out-public-locomo",
+  "claim_boundary": "No live model, LLM judge, or official QA accuracy in this run."
+}

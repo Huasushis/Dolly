@@ -1,0 +1,12 @@
+{
+  "version": "2026.08.26-public-v1",
+  "source_sha256": "5e8c1c351f5cb182be2dee5ed95354632f6e3c5d26ff484b0a9ed704df6d604a",
+  "dataset_sha256": {
+    "longmemeval": {
+      "path": ".cache/datasets/longmemeval_s_cleaned.json",
+      "sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442"
+    }
+  },
+  "command": "research/dolly_research_layer/public_retrieval_bench.py --longmemeval .cache/datasets/longmemeval_s_cleaned.json --out research/dolly_research_layer/out-public-longmemeval",
+  "claim_boundary": "No live model, LLM judge, or official QA accuracy in this run."
+}
