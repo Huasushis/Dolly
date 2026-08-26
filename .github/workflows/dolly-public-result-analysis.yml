@@ -1,0 +1,39 @@
+name: Dolly public result analysis
+
+on:
+  push:
+    branches:
+      - research/dolly-layer-2026-08-26
+    paths:
+      - "research/dolly_research_layer/analyze_public_results.py"
+      - ".github/workflows/dolly-public-result-analysis.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/dolly-layer-2026-08-26
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Analyze latest complete public snapshot
+        run: |
+          python research/dolly_research_layer/analyze_public_results.py \
+            --root research/dolly_research_layer/results/public \
+            --out research/dolly_research_layer/PUBLIC_RESULTS_ANALYSIS.md
+      - name: Commit analysis
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add research/dolly_research_layer/PUBLIC_RESULTS_ANALYSIS.md \
+                  research/dolly_research_layer/PUBLIC_RESULTS_ANALYSIS.json
+          git commit -m "research(results): analyze public memory retrieval" \
+            || { echo "No analysis changes"; exit 0; }
+          git push origin HEAD:research/dolly-layer-2026-08-26
