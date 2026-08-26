@@ -4,7 +4,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use dolly_canonical_json::{
-    CanonicalJsonObject, CanonicalJsonValue, PROTOCOL_WIRE_PARSE_DEPTH, Sha256Digest, canonicalize,
+    CanonicalJsonObject, CanonicalJsonValue, MAX_SEMANTIC_JSON_NESTING_DEPTH,
+    PROTOCOL_WIRE_PARSE_DEPTH, Sha256Digest, canonicalize,
 };
 use dolly_core_domain::ExtensionId;
 use dolly_storage::Database;
@@ -372,6 +373,13 @@ impl Worker {
         initialize_invocation: StartupInitialize,
         spawn_observer: fn(u32),
     ) -> Result<Self, WorkerError> {
+        // The complete sealed runtime contract is equality-compared against the
+        // reloaded durable server FIRST, before ANY schema or effect mutation,
+        // handshake-intent insertion, process spawn, registry publication,
+        // or dispatch authorization. No delayed comparison may authorize an earlier
+        // effect: every authority-bearing launch field below is sealed and
+        // consumed from the sealed contract alone.
+        let sealed = bind_sealed_runtime_contract(&config, &durable_server)?;
         let package_root = canonical_directory(&config.package_root)?;
         let package_path = canonical_file(&config.package_path, "package")?;
         let executable_path = package_root.join(&durable_server.endpoint);
@@ -410,19 +418,10 @@ impl Worker {
         retain_settled_effect_journal(&mut database)
             .map_err(|error| WorkerError::Storage(error.to_string()))?;
 
-        // The startup deadline comes ONLY from the sealed premise value
-        // carried in the equality-bound config, and the reloaded durable
-        // server must agree with that sealed value; no caller or default can
-        // widen it.
-        let sealed_startup_timeout_ms = u64::try_from(config.startup_timeout_ms)
-            .map_err(|_| WorkerError::Premise("sealed startup_timeout_ms is negative".into()))?;
-        if durable_server.startup_timeout != Duration::from_millis(sealed_startup_timeout_ms) {
-            return Err(WorkerError::Premise(
-                "admitted server startup timeout disagrees with the sealed premise".into(),
-            ));
-        }
+        // The startup deadline comes ONLY from the sealed contract value;
+        // the equality comparison already voted before any mutation ran.
         let startup_deadline = Instant::now()
-            .checked_add(Duration::from_millis(sealed_startup_timeout_ms))
+            .checked_add(Duration::from_millis(sealed.startup_timeout_ms))
             .ok_or_else(|| WorkerError::Process("startup deadline overflow".into()))?;
         let session_id = new_session_id()?;
         let mut runtime_binding =
@@ -456,38 +455,12 @@ impl Worker {
             }
         };
 
-        // Spawn argv: the executable plus EXACTLY the sealed premise args.
-        // The durable-server contract must agree with the sealed projection;
-        // any disagreement is a startup refusal, never a silent choice.
-        if durable_server.args != config.spawn_args {
-            return Err(startup_failure(
-                &mut database,
-                &runtime_binding,
-                Some(&process_generation),
-                None,
-                WorkerError::Premise(
-                    "admitted server args disagree with the sealed Worker-start premise".into(),
-                ),
-            ));
-        }
-        // The attestation seals the reloaded transport digest to the child's
-        // identity; the sealed premise's transport digest must bind it, so a
-        // divergent reloaded value refuses before any child exists rather
-        // than feeding split authority into the attestation.
-        if durable_server.transport_digest.to_canonical_string() != config.transport_digest {
-            return Err(startup_failure(
-                &mut database,
-                &runtime_binding,
-                Some(&process_generation),
-                None,
-                WorkerError::Premise(
-                    "admitted server transport digest disagrees with the sealed premise".into(),
-                ),
-            ));
-        }
+        // Spawn argv: the executable plus EXACTLY the sealed contract args.
+        // Equality with the reloaded durable server already voted before any
+        // schema or effect mutation; no second late comparison exists.
         let mut command = Command::new(&executable_path);
         command
-            .args(&config.spawn_args)
+            .args(&sealed.spawn_args)
             .current_dir(&package_root)
             .env_clear()
             .stdin(Stdio::piped())
@@ -519,7 +492,7 @@ impl Worker {
             package_path,
             durable_server.executable_digest.clone(),
             executable_path,
-            durable_server.transport_digest.clone(),
+            sealed.transport_digest.clone(),
             runtime_binding.daemon_installation_id().to_owned(),
             runtime_binding.instance_id().to_owned(),
             runtime_binding.controller_generation(),
@@ -566,35 +539,14 @@ impl Worker {
                 ));
             }
         };
-        // Stdio/frame limits come ONLY from the sealed premise values in
-        // the equality-bound config; the admitted server contract must agree
-        // on frame bytes and nesting depths.
-        let sealed_stdio_limits = StdioTransportLimits::new(
-            usize::try_from(config.max_frame_bytes).map_err(|_| {
-                WorkerError::Premise("sealed max_frame_bytes is negative".into())
-            })?,
-            u16::try_from(config.wire_depth).map_err(|_| {
-                WorkerError::Premise("sealed wire_depth is negative".into())
-            })?,
-        )
-        .map_err(WorkerError::Transport)?;
-        if durable_server.stdio_limits != sealed_stdio_limits {
-            return Err(startup_failure(
-                &mut database,
-                &runtime_binding,
-                Some(&process_generation),
-                None,
-                WorkerError::Premise(
-                    "admitted server stdio limits disagree with the sealed premise".into(),
-                ),
-            ));
-        }
+        // The sealed stdio/frame limits come from the sealed contract only;
+        // the equality comparison already voted before any mutation ran.
         let (mut invocation, process_handle) = match HostMcpStdioInvocation::from_installed_child(
             child.into_child(),
             attestation,
             &runtime_binding,
             &process_generation,
-            sealed_stdio_limits,
+            sealed.stdio_limits,
             Vec::new(),
             &database,
             &handshake_authority,
@@ -709,32 +661,9 @@ impl Worker {
                 WorkerError::Storage(error.to_string()),
             ));
         }
-        // Dispatch limits come ONLY from the sealed premise values carried
-        // in the equality-bound config; the admitted server contract must
-        // agree on every one of them.
-        let sealed_dispatch_limits = DispatchLimits {
-            max_response_bytes: usize::try_from(config.max_response_bytes).map_err(|_| {
-                WorkerError::Premise("sealed max_response_bytes is negative".into())
-            })?,
-            max_members: usize::try_from(config.max_dispatch_members).map_err(|_| {
-                WorkerError::Premise("sealed max_dispatch_members is negative".into())
-            })?,
-            max_depth: u16::try_from(config.max_dispatch_depth).map_err(|_| {
-                WorkerError::Premise("sealed max_dispatch_depth is negative".into())
-            })?,
-        };
-        if durable_server.dispatch_limits != sealed_dispatch_limits {
-            return Err(startup_failure(
-                &mut database,
-                &runtime_binding,
-                Some(&process_generation),
-                Some(&process_handle),
-                WorkerError::Premise(
-                    "admitted server dispatch limits disagree with the sealed premise".into(),
-                ),
-            ));
-        }
-        let service = ToolDispatchService::new(sealed_dispatch_limits);
+        // Dispatch limits come from the sealed contract only and already
+        // voted equal to the reloaded durable server before any mutation.
+        let service = ToolDispatchService::new(sealed.dispatch_limits);
         Ok(Self {
             database,
             runtime_binding,
@@ -1077,6 +1006,79 @@ struct DurableServer {
     startup_timeout: Duration,
     stdio_limits: StdioTransportLimits,
     dispatch_limits: DispatchLimits,
+    semantic_depth: u16,
+}
+
+/// The complete sealed runtime contract for one Worker incarnation.
+///
+/// Every authority-bearing launch field is sealed in the durable premise,
+/// carried through the equality-bound config, and equality-compared against
+/// the reloaded durable server BEFORE any schema or effect mutation, intent
+/// insertion, spawn, publication, or dispatch authorization. Startup then
+/// consumes ONLY these values; a mismatch refuses closed before any of those
+/// effects can run.
+struct SealedRuntimeContract {
+    startup_timeout_ms: u64,
+    spawn_args: Vec<String>,
+    transport_digest: Sha256Digest,
+    stdio_limits: StdioTransportLimits,
+    dispatch_limits: DispatchLimits,
+}
+
+/// Construct the sealed runtime contract and equality-compare every
+/// stdio/frame/wire/depth/dispatch field against the reloaded durable
+/// server. This is the first action after the durable-server reload reaches
+/// startup; nothing below may authorize an earlier effect.
+fn bind_sealed_runtime_contract(
+    config: &WorkerStartConfig,
+    durable_server: &DurableServer,
+) -> Result<SealedRuntimeContract, WorkerError> {
+    let startup_timeout_ms = u64::try_from(config.startup_timeout_ms)
+        .map_err(|_| WorkerError::Premise("sealed startup_timeout_ms is negative".into()))?;
+    let wire_depth = u16::try_from(config.wire_depth)
+        .map_err(|_| WorkerError::Premise("sealed wire_depth is negative".into()))?;
+    let semantic_depth = u16::try_from(config.semantic_depth)
+        .map_err(|_| WorkerError::Premise("sealed semantic_depth is negative".into()))?;
+    let stdio_limits = StdioTransportLimits::new(
+        usize::try_from(config.max_frame_bytes)
+            .map_err(|_| WorkerError::Premise("sealed max_frame_bytes is negative".into()))?,
+        wire_depth,
+    )
+    .map_err(WorkerError::Transport)?;
+    let dispatch_limits = DispatchLimits {
+        max_response_bytes: usize::try_from(config.max_response_bytes)
+            .map_err(|_| WorkerError::Premise("sealed max_response_bytes is negative".into()))?,
+        max_members: usize::try_from(config.max_dispatch_members)
+            .map_err(|_| WorkerError::Premise("sealed max_dispatch_members is negative".into()))?,
+        max_depth: u16::try_from(config.max_dispatch_depth)
+            .map_err(|_| WorkerError::Premise("sealed max_dispatch_depth is negative".into()))?,
+    };
+    let transport_digest = parse_digest(&config.transport_digest)?;
+    let refuse = || {
+        WorkerError::Premise(
+            "admitted durable server contract disagrees with the sealed Worker-start premise"
+                .into(),
+        )
+    };
+    if durable_server.endpoint != config.endpoint
+        || durable_server.args != config.spawn_args
+        || durable_server.package_digest.to_canonical_string() != config.package_digest
+        || durable_server.executable_digest.to_canonical_string() != config.executable_digest
+        || durable_server.transport_digest != transport_digest
+        || durable_server.startup_timeout != Duration::from_millis(startup_timeout_ms)
+        || durable_server.stdio_limits != stdio_limits
+        || durable_server.dispatch_limits != dispatch_limits
+        || durable_server.semantic_depth != semantic_depth
+    {
+        return Err(refuse());
+    }
+    Ok(SealedRuntimeContract {
+        startup_timeout_ms,
+        spawn_args: config.spawn_args.clone(),
+        transport_digest,
+        stdio_limits,
+        dispatch_limits,
+    })
 }
 
 /// Load the admitted durable server contract for `server_id` from an already
@@ -1201,8 +1203,10 @@ fn load_durable_server(
         .map_err(WorkerError::Transport)?;
     let dispatch_limits = DispatchLimits {
         max_response_bytes,
+        // The reloaded protocol ceiling, equality-bound to the sealed
+        // max_dispatch_depth; the runtime consumes the sealed value only.
         max_members: 4096,
-        max_depth: 64,
+        max_depth: u16::from(MAX_SEMANTIC_JSON_NESTING_DEPTH),
     };
     Ok(DurableServer {
         endpoint,
@@ -1214,6 +1218,7 @@ fn load_durable_server(
         startup_timeout: Duration::from_millis(startup_timeout_ms),
         stdio_limits,
         dispatch_limits,
+        semantic_depth: MAX_SEMANTIC_JSON_NESTING_DEPTH,
     })
 }
 

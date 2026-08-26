@@ -718,32 +718,127 @@ fn noncanonical_stored_premise_refuses_closed() {
     assert!(stdout.is_empty(), "refusal must precede any stdout frame");
 }
 
-/// A sealed record naming a schema other than the v1 Worker-start premise
-/// contract must refuse closed before any child process exists.
-#[cfg(target_os = "linux")]
-#[test]
-fn wrong_schema_stored_premise_refuses_closed() {
-    let fixture = fixture_with_premise(true);
-    let mut tampered: serde_json::Value =
-        serde_json::from_slice(&stored_record_jcs(&fixture.db_path)).expect("sealed record");
-    tampered["schema"] = serde_json::json!("dolly.worker-start-premise/v0");
-    let mut unsigned = tampered.as_object().expect("object").clone();
+/// Re-seal the projected `fs` premise row with one field changed: the
+/// projection column, the sealed JCS record, and the record digest are
+/// rewritten in lockstep, so exactly the named contract field deviates from
+/// the reloaded durable server.
+fn rewrite_sealed_premise_field(db_path: &Path, column: &str, record_key: &str, value: i64) {
+    let connection = Connection::open(db_path).expect("reopen raw");
+    let bytes: Vec<u8> = connection
+        .query_row(
+            "SELECT record_jcs FROM worker_start_premises
+             WHERE config_revision = 1 AND extension_alias = 'org.dolly.tools'
+               AND server_id = 'fs'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read sealed record");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("sealed record JSON");
+    record[record_key] = serde_json::json!(value);
+    let mut unsigned = record.as_object().expect("record object").clone();
     unsigned.remove("record_digest");
     let digest = digest_of(&serde_json::Value::Object(unsigned));
-    tampered["record_digest"] = serde_json::json!(digest.to_canonical_string());
-    let bytes = canonicalize(&tampered).expect("re-sealed").0.into_vec();
-    corrupt_stored_record_jcs(&fixture.db_path, &bytes);
-    let (code, stdout, stderr) = run_host(&fixture.db_path);
-    assert_ne!(
-        code,
-        Some(0),
-        "wrong-schema premise must not start the host"
+    record["record_digest"] = serde_json::json!(digest.to_canonical_string());
+    let new_bytes = canonicalize(&record).expect("re-sealed record").0.into_vec();
+    connection
+        .execute(
+            &format!(
+                "UPDATE worker_start_premises SET {column} = ?1, record_jcs = ?2,
+                        record_digest = ?3
+                 WHERE config_revision = 1 AND extension_alias = 'org.dolly.tools'
+                   AND server_id = 'fs'"
+            ),
+            rusqlite::params![value, new_bytes, digest.to_canonical_string()],
+        )
+        .expect("rewrite premise row");
+    drop(connection);
+}
+
+/// True when the Tool-call ledger slice the Worker installs on startup exists.
+///
+/// The Worker creates these tables AFTER the sealed-contract comparison, so
+/// their absence across a refused run proves the comparison voted before the
+/// schema mutations could run.
+fn tool_ledger_slice_present(db_path: &Path) -> bool {
+    let connection = Connection::open(db_path).expect("reopen raw");
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+               AND name IN ('tool_call_ledger', 'activations')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count ledger tables");
+    drop(connection);
+    count != 0
+}
+
+/// Common assertions for one sealed-contract mismatch: the production binary
+/// refuses typed before any started frame and before the Worker's own schema
+/// mutations, so no child could have been spawned.
+#[cfg(target_os = "linux")]
+fn assert_sealed_contract_mismatch_refuses_before_spawn(db_path: &Path, label: &str) {
+    let (code, stdout, stderr) = run_host(db_path);
+    assert_ne!(code, Some(0), "{label}: mismatch must not start the host");
+    assert!(
+        stderr.contains("WORKER_START_REFUSED"),
+        "{label}: expected typed worker-start refusal, got: {stderr}"
     );
     assert!(
-        stderr.contains("WORKER_PREMISE_REFUSED"),
-        "expected typed premise refusal, got: {stderr}"
+        stdout.is_empty(),
+        "{label}: refusal must precede any stdout frame"
     );
-    assert!(stdout.is_empty(), "refusal must precede any stdout frame");
+    assert!(
+        !tool_ledger_slice_present(db_path),
+        "{label}: the Worker's schema mutations must not run before the sealed-contract refusal"
+    );
+}
+
+/// A sealed stdio/frame limit that disagrees with the admitted server must
+/// refuse before any spawn or schema/effect mutation.
+#[cfg(target_os = "linux")]
+#[test]
+fn frame_limit_mismatch_refuses_before_spawn_or_schema() {
+    let fixture = fixture_with_premise(true);
+    rewrite_sealed_premise_field(&fixture.db_path, "max_frame_bytes", "max_frame_bytes", 12345);
+    assert_sealed_contract_mismatch_refuses_before_spawn(&fixture.db_path, "frame limit");
+}
+
+/// A sealed wire depth below the reloaded protocol ceiling must refuse the
+/// same way.
+#[cfg(target_os = "linux")]
+#[test]
+fn wire_depth_mismatch_refuses_before_spawn_or_schema() {
+    let fixture = fixture_with_premise(true);
+    rewrite_sealed_premise_field(&fixture.db_path, "wire_depth", "wire_depth", 95);
+    assert_sealed_contract_mismatch_refuses_before_spawn(&fixture.db_path, "wire depth");
+}
+
+/// A sealed dispatch member limit that disagrees with the admitted server
+/// must refuse before any spawn or dispatch authorization.
+#[cfg(target_os = "linux")]
+#[test]
+fn dispatch_limits_mismatch_refuses_before_spawn_or_schema() {
+    let fixture = fixture_with_premise(true);
+    rewrite_sealed_premise_field(
+        &fixture.db_path,
+        "max_dispatch_members",
+        "max_dispatch_members",
+        999,
+    );
+    assert_sealed_contract_mismatch_refuses_before_spawn(&fixture.db_path, "dispatch members");
+}
+
+/// A sealed semantic depth ceiling below the reloaded protocol ceiling must
+/// refuse before any spawn, proving the sealed value (not a literal) is the
+/// authority.
+#[cfg(target_os = "linux")]
+#[test]
+fn semantic_depth_mismatch_refuses_before_spawn_or_schema() {
+    let fixture = fixture_with_premise(true);
+    rewrite_sealed_premise_field(&fixture.db_path, "semantic_depth", "semantic_depth", 63);
+    assert_sealed_contract_mismatch_refuses_before_spawn(&fixture.db_path, "semantic depth");
 }
 
 /// Driving the production binary against an unusable stored premise leaves

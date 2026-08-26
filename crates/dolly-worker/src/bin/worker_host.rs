@@ -26,9 +26,11 @@ use dolly_protocol::{FrameLimits, FrameReader, encode_frame};
 use dolly_worker::premise::load_worker_start_config;
 use dolly_worker::{Worker, WorkerStartConfig};
 
-/// Frozen control-frame limits: 262144-byte cap, depth 96 wire / 64 semantic.
-fn control_limits() -> FrameLimits {
-    FrameLimits::new(262_144, 96, 64).expect("control frame limits are in contract")
+// Control-frame limits: the sealed wire and semantic depth ceilings (with
+// the frozen 262144-byte cap); no independent literal depth is authoritative.
+fn control_limits(wire_depth: u16, semantic_depth: u16) -> FrameLimits {
+    FrameLimits::new(262_144, wire_depth, semantic_depth)
+        .expect("sealed control frame limits are in contract")
 }
 
 const CONTROL_USAGE: &str = "usage: dolly-worker-host <db_path> <extension_alias> <server_id>";
@@ -54,9 +56,9 @@ enum ControlFlow {
 /// resynchronization after a fatal framing violation. On EOF,
 /// `FrameReader::finish` rejects any partial or trailing frame as a typed
 /// fatal error.
-fn run_control_loop(worker: &mut Worker, server_id: &str, wire_depth: u16) {
+fn run_control_loop(worker: &mut Worker, server_id: &str, wire_depth: u16, semantic_depth: u16) {
     let mut stdout = std::io::stdout();
-    let mut reader = FrameReader::new(control_limits());
+    let mut reader = FrameReader::new(control_limits(wire_depth, semantic_depth));
     let mut input = [0u8; READ_BUFFER_SIZE];
     let mut stdin = std::io::stdin().lock();
     loop {
@@ -67,8 +69,14 @@ fn run_control_loop(worker: &mut Worker, server_id: &str, wire_depth: u16) {
                     .feed(&input[..read])
                     .unwrap_or_else(|error| fail("FRAME_INVALID", &error.to_string()));
                 for payload in payloads {
-                    if handle_control_frame(worker, &mut stdout, server_id, &payload, wire_depth)
-                        == ControlFlow::Stop
+                    if handle_control_frame(
+                        worker,
+                        &mut stdout,
+                        server_id,
+                        &payload,
+                        wire_depth,
+                        semantic_depth,
+                    ) == ControlFlow::Stop
                     {
                         return;
                     }
@@ -88,8 +96,9 @@ fn handle_control_frame(
     server_id: &str,
     payload: &[u8],
     wire_depth: u16,
+    semantic_depth: u16,
 ) -> ControlFlow {
-    let frame = parse_control_frame(payload, wire_depth);
+    let frame = parse_control_frame(payload, wire_depth, semantic_depth);
     let op = require_string(&frame, "op");
     match op.as_str() {
         "status" => {
@@ -140,19 +149,19 @@ fn handle_control_frame(
     ControlFlow::Continue
 }
 
-fn parse_control_frame(payload: &[u8], wire_depth: u16) -> CanonicalJsonValue {
+fn parse_control_frame(payload: &[u8], wire_depth: u16, semantic_depth: u16) -> CanonicalJsonValue {
     // The wire-depth gate runs FIRST as a non-recursive raw-byte scan BEFORE
     // any recursive serde_json parse can allocate a hostile deep tree. The
-    // bound is the sealed premise value carried through the equality-bound
-    // config — never a caller-supplied or ambient default. Then the semantic
-    // depth gate (64) runs inside canonicalization. Unknown/loose JSON is
-    // refused closed; malformed or over-deep payloads never reach recursion.
+    // bounds are the sealed premise values carried through the
+    // equality-bound config — never caller-supplied or ambient defaults.
+    // Unknown/loose JSON is refused closed; malformed or over-deep payloads
+    // never reach recursion.
     dolly_canonical_json::validate_raw_json_nesting_depth(payload, wire_depth)
         .unwrap_or_else(|error| fail("FRAME_DEPTH_INVALID", &error.to_string()));
     canonicalize_with_limits(
         &serde_json::from_slice::<serde_json::Value>(payload)
             .unwrap_or_else(|error| fail("CONTROL_JSON_INVALID", &error.to_string())),
-        ParseLimits::new(64).expect("semantic depth is in contract"),
+        ParseLimits::semantic(semantic_depth).expect("sealed semantic depth is in contract"),
     )
     .map(|(bytes, _)| {
         CanonicalJsonValue::try_from(
@@ -221,9 +230,11 @@ fn main() {
 
     let wire_depth = u16::try_from(bootstrap.config.wire_depth)
         .unwrap_or_else(|_| fail("WORKER_PREMISE_REFUSED", "sealed wire_depth is negative"));
+    let semantic_depth = u16::try_from(bootstrap.config.semantic_depth)
+        .unwrap_or_else(|_| fail("WORKER_PREMISE_REFUSED", "sealed semantic_depth is negative"));
     // The Worker's Drop impl stops and reaps the retained child on any exit
     // path; an explicit `stop` frame returns from the control loop first.
-    run_control_loop(&mut worker, &server_id, wire_depth);
+    run_control_loop(&mut worker, &server_id, wire_depth, semantic_depth);
 }
 
 #[allow(unreachable_code)]
