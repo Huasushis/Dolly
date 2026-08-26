@@ -21,6 +21,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Normalize known source typo and compile-check
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("research/dolly_research_layer/graph_scheduler_bench.py")
+          text = p.read_text(encoding="utf-8")
+          old = '"mean_fairness": mean([r["source_fairness"] for r in cell_rows),'
+          new = '"mean_fairness": mean([r["source_fairness"] for r in cell_rows]),'
+          if old in text:
+              text = text.replace(old, new, 1)
+              p.write_text(text, encoding="utf-8")
+          elif new not in text:
+              raise SystemExit("expected scheduler summary expression not found")
+          PY
+          python -m py_compile research/dolly_research_layer/graph_scheduler_bench.py
       - name: Smoke test
         run: |
           python research/dolly_research_layer/graph_scheduler_bench.py \
@@ -39,7 +54,7 @@ jobs:
           path: research/dolly_research_layer/out-scheduler/
           if-no-files-found: error
           retention-days: 30
-      - name: Commit immutable result snapshot
+      - name: Commit source repair and immutable result snapshot
         run: |
           target=research/dolly_research_layer/results/scheduler/${GITHUB_SHA}
           mkdir -p "$target"
@@ -50,7 +65,7 @@ jobs:
             > "$target/run.txt"
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add "$target"
+          git add research/dolly_research_layer/graph_scheduler_bench.py "$target"
           git commit -m "research(results): graph scheduler ${GITHUB_SHA}" \
             || { echo "No result changes"; exit 0; }
           git push origin HEAD:research/dolly-layer-2026-08-26
