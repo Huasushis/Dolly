@@ -1610,12 +1610,24 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             }
             let projected = projected_pending(&next, &staged);
             if staged.page_limit.is_some_and(|limit| projected > limit) {
+                let first_commit_block = item.state != ActivationState::CommitBlocked;
                 let item = next.activations.get_mut(&c.activation_id).unwrap();
                 item.state = ActivationState::CommitBlocked;
                 item.authoritative_disposition = Some(ActivationState::CommitBlocked);
+                if first_commit_block {
+                    events.push(append_event(
+                        &mut next,
+                        &c.command_id,
+                        "ActivationCommitBlocked",
+                        Some(json!({
+                            "activation_id": c.activation_id,
+                            "projected_admission_entries": projected,
+                        })),
+                    ));
+                }
                 return success(
                     next,
-                    Vec::new(),
+                    events,
                     None,
                     Some(CoreError {
                         code: "ACTIVATION_COMMIT_BLOCKED".into(),

@@ -254,6 +254,88 @@ fn staged_application_is_atomic_and_cursor_conflict_commits_only_safety_stop() {
 }
 
 #[test]
+fn commit_blocked_journal_event_is_persisted_once() {
+    let mut state = staged(BTreeMap::from([("s".into(), 1)]), vec![]);
+    state.subscriptions.insert(
+        "s".into(),
+        SubscriptionRecord {
+            cursor: 1,
+            paused: None,
+        },
+    );
+    state.subscriptions.insert(
+        "lagging".into(),
+        SubscriptionRecord {
+            cursor: 1,
+            paused: None,
+        },
+    );
+    state.pages.insert(
+        "p".into(),
+        vec![PageRecord {
+            page_seq: 1,
+            entries: vec![json!({"pending":true})],
+            lossy: None,
+        }],
+    );
+    let staged_result = state
+        .activations
+        .get_mut("a")
+        .unwrap()
+        .staged_result
+        .as_mut()
+        .unwrap();
+    staged_result.projected_admission_entries = 1;
+    staged_result.page_limit = Some(1);
+    let pages = state.pages.clone();
+    let subscriptions = state.subscriptions.clone();
+    let outputs = state.outputs.clone();
+
+    let first = reduce(
+        &state,
+        &CoreCommand::ApplyResult(ApplyResultCommand {
+            command_id: "apply-first".into(),
+            activation_id: "a".into(),
+        }),
+        &input(),
+    );
+    assert_eq!(
+        first.state.activations["a"].state,
+        ActivationState::CommitBlocked
+    );
+    assert_eq!(
+        first.error.as_ref().map(|error| error.code.as_str()),
+        Some("ACTIVATION_COMMIT_BLOCKED")
+    );
+    assert_eq!(first.events.len(), 1);
+    assert_eq!(first.events[0].event, "ActivationCommitBlocked");
+    assert_eq!(
+        first.events[0].details,
+        Some(json!({"activation_id":"a","projected_admission_entries":2}))
+    );
+    assert_eq!(first.state.journal, first.events);
+    assert!(first.state.activations["a"].staged_result.is_some());
+    assert_eq!(first.state.pages, pages);
+    assert_eq!(first.state.subscriptions, subscriptions);
+    assert_eq!(first.state.outputs, outputs);
+
+    let repeat = reduce(
+        &first.state,
+        &CoreCommand::ApplyResult(ApplyResultCommand {
+            command_id: "apply-repeat".into(),
+            activation_id: "a".into(),
+        }),
+        &input(),
+    );
+    assert_eq!(repeat.state, first.state);
+    assert_eq!(repeat.events, Vec::<CoreEvent>::new());
+    assert_eq!(
+        repeat.error.as_ref().map(|error| error.code.as_str()),
+        Some("ACTIVATION_COMMIT_BLOCKED")
+    );
+}
+
+#[test]
 fn safe_retry_authorization_is_bound_and_consumed_once() {
     let state = leased(ActivationState::Leased, None);
     let begun = reduce(
