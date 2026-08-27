@@ -580,10 +580,36 @@ fn replay_evidence_valid(
     };
     evidence.observation == observation
 }
+fn replay_disposition_authorized(record: &Value) -> bool {
+    matches!(
+        (
+            object_str(record, "ledger_state"),
+            object_str(record, "replay_disposition")
+        ),
+        (Some("complete"), Some("return_result"))
+            | (Some("reconcilable"), Some("reconcile_only"))
+    )
+}
+
+fn replay_disposition_valid(record: &Value) -> bool {
+    matches!(
+        (
+            object_str(record, "ledger_state"),
+            object_str(record, "replay_disposition")
+        ),
+        (Some("complete"), Some("return_result" | "quarantine"))
+            | (Some("reconcilable"), Some("reconcile_only" | "quarantine"))
+            | (Some("failed" | "unknown"), Some("quarantine"))
+    )
+}
+
 fn stored_replay_evidence_valid(item: &ActivationRecord, activation_id: &str) -> bool {
     let Some(stored) = item.replay_evidence.as_ref() else {
         return false;
     };
+    if !replay_disposition_valid(stored) {
+        return false;
+    }
     let Some(target_generation) = object_i64(stored, "target_generation") else {
         return false;
     };
@@ -1472,12 +1498,10 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             let ledger_evidence_valid = stored_replay_evidence_valid(item, &c.activation_id);
             let ledger_authorized = contract.1 == "activation_ledger"
                 && ledger_evidence_valid
-                && matches!(
-                    item.replay_evidence
-                        .as_ref()
-                        .and_then(|value| object_str(value, "observation")),
-                    Some("succeeded" | "failed")
-                );
+                && item
+                    .replay_evidence
+                    .as_ref()
+                    .is_some_and(replay_disposition_authorized);
             if dispatch == "prepared" || ledger_authorized {
                 let evidence_digest = if dispatch == "prepared" {
                     proof.proof_digest.clone()

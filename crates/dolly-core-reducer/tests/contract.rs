@@ -866,6 +866,102 @@ fn first_result_requires_canonical_payload_digest() {
 }
 
 #[test]
+fn replay_disposition_pairs_gate_retry_authorization() {
+    let replay_record = |ledger_state: &str, replay_disposition: &str, observation: &str| {
+        let mut record = json!({
+            "schema": "dolly.activation-replay-evidence/v1",
+            "module_id": "writer",
+            "storage_scope_id": "scope-1",
+            "activation_id": "a",
+            "manifest_digest": A,
+            "source_attempt": 1,
+            "target_extension_generation": 8,
+            "ledger": {"namespace":"effects"},
+            "continuity": "retained",
+            "ledger_state": ledger_state,
+            "replay_disposition": replay_disposition,
+            "state_digest": A,
+            "result_digest": A,
+            "migration_operation_id": null,
+            "continuity_proof_digest": A,
+            "checked_at": "2026-08-10T22:00:00.000000Z",
+        });
+        let evidence_digest = digest(&record);
+        record["evidence_digest"] = json!(evidence_digest);
+        record["observation"] = json!(observation);
+        record["target_generation"] = json!(8);
+        record
+    };
+    let replay_state = |record: Value| {
+        let mut state = leased(ActivationState::Fencing, None);
+        let item = state.activations.get_mut("a").unwrap();
+        item.extension_generation = Some(8);
+        item.manifest = Some(json!({
+            "manifest_digest": A,
+            "module_id": "writer",
+            "storage_scope_id": "scope-1",
+            "frozen_replay_contract": {
+                "mode": "fenced_replay",
+                "evidence": "activation_ledger",
+                "ledger": {"namespace":"effects"},
+            },
+        }));
+        item.replay_evidence = Some(record);
+        state.leases.get_mut("l").unwrap()["extension_generation"] = json!(8);
+        state.leases.get_mut("l").unwrap()["manifest_digest"] = json!(A);
+        state
+    };
+    let fence = CoreCommand::FenceComplete(FenceCompleteCommand {
+        command_id: "fence".into(),
+        activation_id: "a".into(),
+        retry_delay: 19,
+    });
+
+    let complete = reduce(
+        &replay_state(replay_record("complete", "return_result", "succeeded")),
+        &fence,
+        &input(),
+    );
+    assert_eq!(
+        complete.state.activations["a"].state,
+        ActivationState::RetryWait
+    );
+    assert!(complete.state.activations["a"]
+        .next_attempt_authorization
+        .is_some());
+
+    let reconcilable = reduce(
+        &replay_state(replay_record("reconcilable", "reconcile_only", "unknown")),
+        &fence,
+        &input(),
+    );
+    assert_eq!(
+        reconcilable.state.activations["a"].state,
+        ActivationState::RetryWait
+    );
+    assert!(reconcilable.state.activations["a"]
+        .next_attempt_authorization
+        .is_some());
+
+    let crossed = reduce(
+        &replay_state(replay_record("complete", "reconcile_only", "succeeded")),
+        &fence,
+        &input(),
+    );
+    assert_eq!(
+        crossed.state.activations["a"].state,
+        ActivationState::Quarantined
+    );
+    assert!(crossed.state.activations["a"]
+        .next_attempt_authorization
+        .is_none());
+    assert_eq!(
+        crossed.state.quarantines["a"]["reason"],
+        "ACTIVATION_REPLAY_CONTRACT_VIOLATION"
+    );
+}
+
+#[test]
 fn invalid_dispositions_recovery_and_quarantine_resolution_preserve_state() {
     for command in [
         CoreCommand::DeadLetterRange(DeadLetterRangeCommand {
