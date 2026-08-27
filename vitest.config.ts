@@ -6,5 +6,6 @@ export default defineConfig({
     environment: "node",
     include: ["tests/conformance/**/*.test.ts", "tests/sdk/public-sdk.test.ts"],
     testTimeout: 30000,
+    fileParallelism: false,
   },
 });

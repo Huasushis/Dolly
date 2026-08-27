@@ -447,22 +447,26 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
   it("projects the premise and reaches the process boundary through the shipped bin, then tears storage and lock down", async () => {
     await ensureBuiltDist();
     // Healthy authority + real installation: the shipped bin genuinely
-    // invokes the worker-host composition (durable premise projection), and
-    // the only refusal is the adapter's process boundary. HEAD's reviewed
-    // worker-host binary admission refuses the recompile (pre-existing digest
-    // mismatch), so the fixed binary is absent and the adapter refuses there
-    // before any spawn. After the run the repository can be reopened and the
-    // controller lock re-acquired.
+    // invokes the worker-host composition and the reviewed packaged binary is
+    // admitted by digest, so the real child starts under the sealed premise
+    // and refuses inside its typed boundary. The engaged runtime commits the
+    // normalized tool-broker config with `extension_alias`, which the frozen
+    // tool-broker admission schema forbids, so the child's exact refusal is
+    // `WORKER_START_REFUSED` at the durable-premise boundary — never a binary
+    // absence and never a generic failure. The live-Linux-Host proof reason
+    // (`live Linux Host proof refused`) is proven by the packaged lifecycle
+    // suite, whose fixture bypasses that runtime normalization.
     const prepared = await prepareInstance({ installPackage: true, commitAuthority: true });
     try {
       const run = await launchCli(["run", "--config", prepared.configPath], {
         baseDir: prepared.baseDir,
         cwd: prepared.baseDir,
       });
-      expect(run.code).toBe(1);
-      expect(run.stderr).toMatch(/WORKER_HOST_BINARY_ABSENT/u);
+      expect(run.code, run.stderr + run.stdout).toBe(1);
+      expect(run.stderr).toMatch(/WORKER_START_REFUSED/u);
+      expect(run.stderr).not.toMatch(/WORKER_HOST_BINARY_ABSENT/u);
       expect(run.stdout).not.toContain("Dolly ready");
-      // The owner genuinely reached launchHostWorkerHost: the premise was
+      // The owner genuinely reached the process boundary: the premise was
       // projected durably exactly once during the run, so re-projecting the
       // identical identity pair is an idempotent no-op.
       const lock = await acquireControllerLock(prepared.directories.registryDirectory, prepared.instanceId);

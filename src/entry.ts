@@ -439,13 +439,21 @@ async function execute(
         configPath: parsed.configPath,
         ...directories,
       });
+      // Install SIGINT/SIGTERM shutdown handling BEFORE readiness is
+      // externally visible: an immediate signal after `Dolly ready` must be
+      // honored as a graceful stop, never race the handler installation.
+      const waitForShutdownHook = context.waitForShutdown;
+      const shutdownRequest =
+        waitForShutdownHook === undefined ? waitForProcessSignal() : undefined;
       const status = session.status();
       writeLine(stdout, `Dolly ready: ${status.instanceId}`);
       writeLine(stdout, JSON.stringify(status));
       try {
-        await (context.waitForShutdown ?? (() => waitForProcessSignal()))(
-          createPublicRuntimeSession(session),
-        );
+        if (shutdownRequest !== undefined) {
+          await shutdownRequest;
+        } else {
+          await waitForShutdownHook!(createPublicRuntimeSession(session));
+        }
       } finally {
         await session.stop();
       }
@@ -496,13 +504,21 @@ async function execute(
       }
       throw error;
     }
+    // Install SIGINT/SIGTERM shutdown handling BEFORE readiness is
+    // externally visible so an immediate signal after `Dolly ready` stops the
+    // worker-host gracefully instead of racing handler installation.
+    const waitForShutdownHook = context.waitForShutdown;
+    const shutdownRequest =
+      waitForShutdownHook === undefined ? waitForProcessSignal() : undefined;
     const status = session.status();
     writeLine(stdout, `Dolly ready: ${status.instanceId}`);
     writeLine(stdout, JSON.stringify(status));
     try {
-      await (context.waitForShutdown ?? (() => waitForProcessSignal()))(
-        createPublicRuntimeSession(session),
-      );
+      if (shutdownRequest !== undefined) {
+        await shutdownRequest;
+      } else {
+        await waitForShutdownHook!(createPublicRuntimeSession(session));
+      }
     } finally {
       // Caller-supplied lock: the session never releases it; this worker
       // lifecycle owns stop-then-close-then-release ordering.
