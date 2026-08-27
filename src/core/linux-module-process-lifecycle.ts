@@ -46,6 +46,22 @@ import type {
   ModuleProcessStartingRecordInput,
   ModuleProcessStoppedRecordWriter,
 } from "./module-process-records.js";
+const DEFAULT_LIFECYCLE_TERMINATION_TIMEOUT_MS = 5_000;
+const DEFAULT_LAUNCHER_EXIT_TIMEOUT_MS = 5_000;
+
+function withTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([operation, timeout]).finally(() => {
+    clearTimeout(timer);
+  });
+}
 
 /** The durable Module process record reads and writes one lifecycle needs. */
 export interface ModuleProcessRecordStore {
@@ -507,6 +523,10 @@ export async function stopModuleProcess(options: {
   readonly channelCloseTimeoutMs?: number;
 }): Promise<ModuleProcessStopResult> {
   const { records, processGenerationId, cgroup } = options;
+  const terminationTimeoutMs =
+    options.timeoutMs ?? DEFAULT_LIFECYCLE_TERMINATION_TIMEOUT_MS;
+  const channelCloseTimeoutMs =
+    options.channelCloseTimeoutMs ?? DEFAULT_LIFECYCLE_TERMINATION_TIMEOUT_MS;
   if (cgroup.identity.processGenerationId !== processGenerationId) {
     return {
       stopped: false,
@@ -544,13 +564,17 @@ export async function stopModuleProcess(options: {
   // record failure may leave the complete process tree running.
   let capabilityClose: Promise<void>;
   try {
-    capabilityClose = options.closeCapabilitySession();
+    capabilityClose = withTimeout(
+      Promise.resolve().then(() => options.closeCapabilitySession()),
+      terminationTimeoutMs,
+      "Module capability session closure exceeded its bounded wait",
+    );
   } catch (error) {
     capabilityClose = Promise.reject(error);
   }
   let channelClose: Promise<boolean>;
   try {
-    channelClose = options.waitForChannelClosed(options.channelCloseTimeoutMs ?? 5_000);
+    channelClose = options.waitForChannelClosed(channelCloseTimeoutMs);
   } catch (error) {
     channelClose = Promise.reject(error);
   }
@@ -560,7 +584,7 @@ export async function stopModuleProcess(options: {
   const cgroupTermination =
     cgroup.removed || launcherExitedBeforeExecutionAuthorization
     ? Promise.resolve(undefined)
-    : cgroup.terminate(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs });
+    : cgroup.terminate({ timeoutMs: terminationTimeoutMs });
   const [terminationOutcome, capabilityOutcome, channelOutcome] = await Promise.allSettled([
     cgroupTermination,
     capabilityClose,
@@ -602,11 +626,9 @@ export async function stopModuleProcess(options: {
   if (!cgroup.removed) {
     const removal = launcherExitedBeforeExecutionAuthorization
       ? await cgroup.removeAfterLauncherExitBeforeExecutionAuthorization()
-      : await cgroup.remove(
-          options.timeoutMs === undefined
-            ? {}
-            : { terminationWaitTimeoutMs: options.timeoutMs },
-        );
+      : await cgroup.remove({
+          terminationWaitTimeoutMs: terminationTimeoutMs,
+        });
     if (!removal.removed) {
       return { stopped: false, code: removal.code, detail: removal.detail };
     }
@@ -705,7 +727,11 @@ async function finishFailedStartBeforeExecutionAuthorization(
   let launcherExitObserved = knownLauncherExitObserved;
   if (launcherExitObserved === undefined) {
     try {
-      launcherExitObserved = await launcher.requestExit();
+      launcherExitObserved = await withTimeout(
+        Promise.resolve().then(() => launcher.requestExit()),
+        DEFAULT_LAUNCHER_EXIT_TIMEOUT_MS,
+        "Module launcher exit observation exceeded its bounded wait",
+      );
     } catch {
       launcherExitObserved = false;
     }
