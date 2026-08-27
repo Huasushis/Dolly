@@ -177,6 +177,67 @@ fn same_value(left: Option<&Value>, right: Option<&Value>) -> bool {
         _ => false,
     }
 }
+fn manifest_neighbor_projection_valid(manifest: &Value) -> bool {
+    let Some(neighbors) = manifest.get("neighbor_descriptors") else {
+        return true;
+    };
+    let Some(neighbors) = neighbors.as_array() else {
+        return false;
+    };
+    neighbors.iter().all(|neighbor| {
+        let Some(neighbor) = neighbor.as_object() else {
+            return false;
+        };
+        let wrapper_keys = [
+            "module_id",
+            "descriptor_revision",
+            "source_descriptor_digest",
+            "relationships",
+            "projection",
+        ];
+        if neighbor.len() != wrapper_keys.len()
+            || !wrapper_keys
+                .iter()
+                .all(|key| neighbor.contains_key(*key))
+        {
+            return false;
+        }
+        let Some(relationships) = neighbor.get("relationships").and_then(Value::as_array) else {
+            return false;
+        };
+        let input_producer = relationships.len() == 1
+            && relationships[0].as_str() == Some("input_producer");
+        let output_consumer = relationships.len() == 1
+            && relationships[0].as_str() == Some("output_consumer");
+        let both = relationships.len() == 2
+            && relationships[0].as_str() == Some("input_producer")
+            && relationships[1].as_str() == Some("output_consumer");
+        let allowed_projection_keys: &[&str] = if input_producer {
+            &["display_name", "trust", "metadata", "emits"]
+        } else if output_consumer {
+            &["display_name", "trust", "metadata", "accepts", "actions"]
+        } else if both {
+            &[
+                "display_name",
+                "trust",
+                "metadata",
+                "emits",
+                "accepts",
+                "actions",
+            ]
+        } else {
+            return false;
+        };
+        let Some(projection) = neighbor.get("projection").and_then(Value::as_object) else {
+            return false;
+        };
+        projection.len() == allowed_projection_keys.len()
+            && allowed_projection_keys
+                .iter()
+                .all(|key| projection.contains_key(*key))
+    })
+}
+
 fn lease_id_for(state: &CoreSnapshot, activation_id: &str) -> Option<String> {
     let attempt = state.activations.get(activation_id)?.attempt;
     let mut candidates = state.leases.iter().filter(|(_, value)| {
@@ -418,6 +479,47 @@ fn replay_evidence_valid(
     };
     evidence.observation == observation
 }
+fn stored_replay_evidence_valid(item: &ActivationRecord, activation_id: &str) -> bool {
+    let Some(stored) = item.replay_evidence.as_ref() else {
+        return false;
+    };
+    let Some(target_generation) = object_i64(stored, "target_generation") else {
+        return false;
+    };
+    if item.extension_generation != Some(target_generation) {
+        return false;
+    }
+    let Some(digest) = object_str(stored, "evidence_digest") else {
+        return false;
+    };
+    let observation = match object_str(stored, "observation") {
+        Some("succeeded") => ReplayEvidenceObservation::Succeeded,
+        Some("failed") => ReplayEvidenceObservation::Failed,
+        Some("unknown") => ReplayEvidenceObservation::Unknown,
+        _ => return false,
+    };
+    let mut source = stored.clone();
+    let Some(source) = source.as_object_mut() else {
+        return false;
+    };
+    source.remove("evidence_digest");
+    source.remove("observation");
+    source.remove("target_generation");
+    replay_evidence_valid(
+        item,
+        activation_id,
+        &HostReplayEvidence {
+            verified: true,
+            activation_id: activation_id.to_string(),
+            source_attempt: item.attempt,
+            target_generation: Some(target_generation),
+            observation,
+            record: Value::Object(source.clone()),
+            digest: digest.to_string(),
+        },
+    )
+}
+
 fn retry_authorization_valid(
     state: &CoreSnapshot,
     activation_id: &str,
@@ -762,6 +864,14 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                     json!({"reason":"graph_or_descriptor_changed"}),
                 );
             }
+            if !manifest_neighbor_projection_valid(&c.manifest) {
+                return failure(
+                    state,
+                    "MANIFEST_DESCRIPTOR_PROJECTION_INVALID",
+                    false,
+                    None,
+                );
+            }
             if canonical_digest(&c.manifest).is_none() {
                 return failure(state, "CANONICAL_JSON_INVALID", false, None);
             }
@@ -815,9 +925,7 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                         == Some(c.extension_connection_id.as_str())
                     && object_i64(existing, "worker_epoch") == Some(c.worker_epoch)
                     && object_i64(existing, "attempt") == Some(item.attempt)
-                    && c.extension_generation.is_none_or(|generation| {
-                        object_i64(existing, "extension_generation") == Some(generation)
-                    });
+                    && c.extension_generation == object_i64(existing, "extension_generation");
                 if !exact {
                     return failure(
                         state,
@@ -992,7 +1100,25 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                 .as_ref()
                 .is_some_and(|value| !verified_digest(value, &c.result_digest))
             {
-                return failure(state, "ACTIVATION_RESULT_DIGEST_MISMATCH", false, None);
+                events.push(record_quarantine(
+                    &mut next,
+                    &c.command_id,
+                    &c.activation_id,
+                    "ACTIVATION_RESULT_DIGEST_MISMATCH",
+                    false,
+                    "ModuleQuarantined",
+                ));
+                return success(
+                    next,
+                    events,
+                    None,
+                    Some(CoreError {
+                        code: "ACTIVATION_RESULT_DIGEST_MISMATCH".into(),
+                        retryable: false,
+                        outcome: ErrorOutcome::Applied,
+                        details: None,
+                    }),
+                );
             }
             let existing = next
                 .activations
@@ -1227,7 +1353,9 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             }
             let item = next.activations.get(&c.activation_id).unwrap();
             let contract = replay_contract(item);
+            let ledger_evidence_valid = stored_replay_evidence_valid(item, &c.activation_id);
             let ledger_authorized = contract.1 == "activation_ledger"
+                && ledger_evidence_valid
                 && matches!(
                     item.replay_evidence
                         .as_ref()
@@ -1265,6 +1393,11 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             } else {
                 let reason = if contract.0 == "never_auto_retry" {
                     "ACTIVATION_REPLAY_NOT_AUTHORIZED"
+                } else if contract.1 == "activation_ledger"
+                    && item.replay_evidence.is_some()
+                    && !ledger_evidence_valid
+                {
+                    "ACTIVATION_REPLAY_CONTRACT_VIOLATION"
                 } else {
                     "ACTIVATION_EXTERNAL_OUTCOME_UNKNOWN"
                 };
@@ -1332,7 +1465,15 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                 }
             }
             let projected = projected_pending(&next, &staged);
-            if staged.page_limit.is_some_and(|limit| projected > limit) {
+            if let Some(limit) = staged.page_limit.filter(|limit| projected > *limit) {
+                if staged.projected_admission_entries > limit {
+                    return failure(
+                        state,
+                        "ACTIVATION_COMMIT_BLOCKED",
+                        true,
+                        Some(json!({"projected_admission_entries":projected})),
+                    );
+                }
                 return failure(
                     state,
                     "PAGE_QUOTA_EXCEEDED",
