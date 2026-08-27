@@ -2,10 +2,11 @@
 //!
 //! The public Worker-host binary receives only a database location plus the
 //! `extension_alias`/`server_id` identity pair. Everything else it needs to
-//! spawn an installed stdio tool server — the installed package root and
-//! package path, their exact digests, the relative executable endpoint, and
-//! the config revision this projection belongs to — is loaded from this
-//! closed, versioned projection in the shared Runtime SQLite database.
+//! spawn an installed stdio tool server — the installed package root, the
+//! origin identity and digest of the installed product component, the exact
+//! package and executable digests, the relative executable endpoint, and the
+//! config revision this projection belongs to — is loaded from this closed,
+//! versioned projection in the shared Runtime SQLite database.
 //!
 //! The projection is produced exclusively by the Host-owned TS authority
 //! writer inside the controller-locked transaction discipline. This module is
@@ -51,7 +52,9 @@ CREATE TABLE IF NOT EXISTS worker_start_premises (
     extension_alias     TEXT    NOT NULL CHECK (length(extension_alias) > 0),
     server_id           TEXT    NOT NULL CHECK (length(server_id) > 0),
     package_root        TEXT    NOT NULL CHECK (length(package_root) > 0),
-    package_path        TEXT    NOT NULL CHECK (length(package_path) > 0),
+    origin_component_id TEXT    NOT NULL,
+    origin_component_revision INTEGER NOT NULL CHECK (origin_component_revision BETWEEN 1 AND 9007199254740991),
+    origin_component_digest TEXT NOT NULL,
     package_digest      TEXT    NOT NULL CHECK (package_digest LIKE 'sha256:%'),
     executable_digest   TEXT    NOT NULL CHECK (executable_digest LIKE 'sha256:%'),
     endpoint            TEXT    NOT NULL CHECK (length(endpoint) > 0),
@@ -69,7 +72,10 @@ CREATE TABLE IF NOT EXISTS worker_start_premises (
     PRIMARY KEY (config_revision, extension_alias, server_id),
     FOREIGN KEY (config_revision, config_digest)
       REFERENCES config_revision_mappings(config_revision, config_digest),
-    CHECK (substr(package_path, 1, length(package_root) + 1) = package_root || '/')
+    FOREIGN KEY (origin_component_id, origin_component_revision, origin_component_digest)
+      REFERENCES installed_component_origins(component_id, component_revision, component_digest),
+    CHECK (extension_alias = origin_component_id),
+    CHECK (package_digest = origin_component_digest)
 );
 "#;
 
@@ -88,7 +94,9 @@ pub struct WorkerStartPremise {
     pub extension_alias: String,
     pub server_id: String,
     pub package_root: String,
-    pub package_path: String,
+    pub origin_component_id: String,
+    pub origin_component_revision: i64,
+    pub origin_component_digest: String,
     pub package_digest: String,
     pub executable_digest: String,
     pub endpoint: String,
@@ -126,7 +134,9 @@ impl WorkerStartPremise {
             extension_alias: &self.extension_alias,
             server_id: &self.server_id,
             package_root: &self.package_root,
-            package_path: &self.package_path,
+            origin_component_id: &self.origin_component_id,
+            origin_component_revision: self.origin_component_revision,
+            origin_component_digest: &self.origin_component_digest,
             package_digest: &self.package_digest,
             executable_digest: &self.executable_digest,
             endpoint: &self.endpoint,
@@ -169,6 +179,7 @@ impl WorkerStartPremise {
         }
         for label in [
             "config_digest",
+            "origin_component_digest",
             "package_digest",
             "executable_digest",
             "transport_digest",
@@ -176,6 +187,7 @@ impl WorkerStartPremise {
         ] {
             let value = match label {
                 "config_digest" => &self.config_digest,
+                "origin_component_digest" => &self.origin_component_digest,
                 "package_digest" => &self.package_digest,
                 "executable_digest" => &self.executable_digest,
                 "transport_digest" => &self.transport_digest,
@@ -199,6 +211,16 @@ impl WorkerStartPremise {
         }
         if self.server_id.is_empty() {
             return Err(WorkerStartPremiseError("server_id is empty".into()));
+        }
+        if self.origin_component_id != self.extension_alias {
+            return Err(WorkerStartPremiseError(
+                "origin_component_id must equal the extension alias".into(),
+            ));
+        }
+        if !(1..=9_007_199_254_740_991_i64).contains(&self.origin_component_revision) {
+            return Err(WorkerStartPremiseError(
+                "origin_component_revision out of the safe-integer range".into(),
+            ));
         }
         if !is_safe_relative_member(&self.endpoint) {
             return Err(WorkerStartPremiseError(
@@ -255,29 +277,17 @@ impl WorkerStartPremise {
                 ));
             }
         }
-        let root = Path::new(&self.package_root);
-        let package = Path::new(&self.package_path);
-        if !root.is_absolute() || !package.is_absolute() {
+        if !Path::new(&self.package_root).is_absolute() {
             return Err(WorkerStartPremiseError(
-                "package locations must be absolute".into(),
-            ));
-        }
-        if !package.starts_with(root) || package == root {
-            return Err(WorkerStartPremiseError(
-                "installed package path must sit inside the package root".into(),
+                "package_root must be absolute".into(),
             ));
         }
         self.verify_record_digest()
     }
 
-
     /// The database-relative inputs a `WorkerStartConfig` needs.
     pub fn package_root_path(&self) -> PathBuf {
         PathBuf::from(&self.package_root)
-    }
-
-    pub fn package_path(&self) -> PathBuf {
-        PathBuf::from(&self.package_path)
     }
 }
 
@@ -291,7 +301,9 @@ struct WorkerStartPremiseUnsigned<'a> {
     extension_alias: &'a str,
     server_id: &'a str,
     package_root: &'a str,
-    package_path: &'a str,
+    origin_component_id: &'a str,
+    origin_component_revision: i64,
+    origin_component_digest: &'a str,
     package_digest: &'a str,
     executable_digest: &'a str,
     endpoint: &'a str,
@@ -349,7 +361,9 @@ pub(crate) fn seal_premise_record(
         extension_alias: unsigned.extension_alias,
         server_id: unsigned.server_id,
         package_root: unsigned.package_root,
-        package_path: unsigned.package_path,
+        origin_component_id: unsigned.origin_component_id,
+        origin_component_revision: unsigned.origin_component_revision,
+        origin_component_digest: unsigned.origin_component_digest,
         package_digest: unsigned.package_digest,
         executable_digest: unsigned.executable_digest,
         endpoint: unsigned.endpoint,
@@ -391,7 +405,9 @@ pub(crate) struct WorkerStartPremiseInput {
     pub extension_alias: String,
     pub server_id: String,
     pub package_root: String,
-    pub package_path: String,
+    pub origin_component_id: String,
+    pub origin_component_revision: i64,
+    pub origin_component_digest: String,
     pub package_digest: String,
     pub executable_digest: String,
     pub endpoint: String,
@@ -443,18 +459,21 @@ pub(crate) fn insert_worker_start_premise_in_transaction(
     tx.execute(
         "INSERT INTO worker_start_premises (
             config_revision, config_digest, extension_alias, server_id,
-            package_root, package_path, package_digest, executable_digest,
+            package_root, origin_component_id, origin_component_revision,
+            origin_component_digest, package_digest, executable_digest,
             endpoint, spawn_args_json, startup_timeout_ms, max_frame_bytes,
             max_response_bytes, wire_depth, semantic_depth, max_dispatch_members,
             max_dispatch_depth, transport_digest, record_jcs, record_digest
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
         rusqlite::params![
             input.config_revision,
             input.config_digest,
             input.extension_alias,
             input.server_id,
             input.package_root,
-            input.package_path,
+            input.origin_component_id,
+            input.origin_component_revision,
+            input.origin_component_digest,
             input.package_digest,
             input.executable_digest,
             input.endpoint,
@@ -515,8 +534,9 @@ pub fn load_worker_start_premise(
     // (current revision, extension alias, server id) pair.
     let row = connection
         .query_row(
-            "SELECT config_digest, package_root, package_path,
-                    package_digest, executable_digest, endpoint, spawn_args_json,
+            "SELECT config_digest, package_root, origin_component_id, origin_component_revision,
+                    origin_component_digest, package_digest, executable_digest,
+                    endpoint, spawn_args_json,
                     startup_timeout_ms, max_frame_bytes, max_response_bytes,
                     wire_depth, semantic_depth, max_dispatch_members,
                     max_dispatch_depth, transport_digest, record_jcs, record_digest
@@ -528,20 +548,22 @@ pub fn load_worker_start_premise(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                     row.get::<_, i64>(9)?,
                     row.get::<_, i64>(10)?,
                     row.get::<_, i64>(11)?,
                     row.get::<_, i64>(12)?,
                     row.get::<_, i64>(13)?,
-                    row.get::<_, String>(14)?,
-                    row.get::<_, Vec<u8>>(15)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, i64>(15)?,
                     row.get::<_, String>(16)?,
+                    row.get::<_, Vec<u8>>(17)?,
+                    row.get::<_, String>(18)?,
                 ))
             },
         )
@@ -550,7 +572,9 @@ pub fn load_worker_start_premise(
     let Some((
         stored_config_digest,
         package_root,
-        package_path,
+        origin_component_id,
+        origin_component_revision,
+        origin_component_digest,
         package_digest,
         executable_digest,
         endpoint,
@@ -617,7 +641,9 @@ pub fn load_worker_start_premise(
         || premise.extension_alias != extension_alias
         || premise.server_id != server_id
         || premise.package_root != package_root
-        || premise.package_path != package_path
+        || premise.origin_component_id != origin_component_id
+        || premise.origin_component_revision != origin_component_revision
+        || premise.origin_component_digest != origin_component_digest
         || premise.package_digest != package_digest
         || premise.executable_digest != executable_digest
         || premise.endpoint != endpoint
@@ -773,7 +799,9 @@ fn gate_worker_start_premise_schema_with(
             ("extension_alias", "TEXT", 1, 2),
             ("server_id", "TEXT", 1, 3),
             ("package_root", "TEXT", 1, 0),
-            ("package_path", "TEXT", 1, 0),
+            ("origin_component_id", "TEXT", 1, 0),
+            ("origin_component_revision", "INTEGER", 1, 0),
+            ("origin_component_digest", "TEXT", 1, 0),
             ("package_digest", "TEXT", 1, 0),
             ("executable_digest", "TEXT", 1, 0),
             ("endpoint", "TEXT", 1, 0),
@@ -899,6 +927,14 @@ mod tests {
             .unwrap();
         connection
             .execute(
+                "INSERT INTO installed_component_origins (
+                     component_id, component_revision, component_digest, record_jcs
+                 ) VALUES ('org.dolly.tools', 1, ?1, x'7b7d')",
+                rusqlite::params![format!("sha256:{}", "a".repeat(64))],
+            )
+            .unwrap();
+        connection
+            .execute(
                 "INSERT INTO runtime_authority_state (
                      singleton, authority_schema_version, daemon_installation_id,
                      instance_id, controller_generation_id, current_config_revision,
@@ -923,7 +959,9 @@ mod tests {
             extension_alias: "org.dolly.tools".into(),
             server_id: "fs".into(),
             package_root: "/opt/dolly/pkg".into(),
-            package_path: "/opt/dolly/pkg/package.bin".into(),
+            origin_component_id: "org.dolly.tools".into(),
+            origin_component_revision: 1,
+            origin_component_digest: format!("sha256:{}", "a".repeat(64)),
             package_digest: format!("sha256:{}", "a".repeat(64)),
             executable_digest: format!("sha256:{}", "b".repeat(64)),
             endpoint: "bin/dolly-fs-tools".into(),
@@ -982,7 +1020,6 @@ mod tests {
                      extension_alias TEXT NOT NULL,
                      server_id TEXT NOT NULL,
                      package_root TEXT NOT NULL,
-                     package_path TEXT NOT NULL,
                      package_digest TEXT NOT NULL,
                      executable_digest TEXT NOT NULL,
                      endpoint TEXT NOT NULL,
@@ -1018,6 +1055,12 @@ mod tests {
             .expect("premise present");
         assert_eq!(premise.package_root, "/opt/dolly/pkg");
         assert_eq!(premise.endpoint, "bin/dolly-fs-tools");
+        assert_eq!(premise.origin_component_id, "org.dolly.tools");
+        assert_eq!(premise.origin_component_revision, 1);
+        assert_eq!(
+            premise.origin_component_digest,
+            format!("sha256:{}", "a".repeat(64))
+        );
         premise.verify_content().expect("content valid");
     }
 
@@ -1027,7 +1070,7 @@ mod tests {
         assert!(insert_sample(&mut connection, sample_input()));
         assert!(!insert_sample(&mut connection, sample_input()));
         let mut conflicting = sample_input();
-        conflicting.package_digest = format!("sha256:{}", "c".repeat(64));
+        conflicting.executable_digest = format!("sha256:{}", "c".repeat(64));
         let tx = connection.transaction().expect("transaction");
         assert!(insert_worker_start_premise_in_transaction(&tx, conflicting).is_err());
         drop(tx);
@@ -1069,12 +1112,12 @@ mod tests {
     fn tampered_column_or_record_refuses() {
         let mut connection = seeded_connection();
         insert_sample(&mut connection, sample_input());
-        // Keep the cross-column containment CHECK satisfied so the tamper
-        // reaches the loader instead of tripping the schema guard.
+        // package_root is not cross-constrained by the v2 CHECKs, so the
+        // tamper reaches the loader's column-vs-record disagreement.
         connection
             .execute(
-                "UPDATE worker_start_premises SET package_root = '/opt/other',
-                     package_path = '/opt/other/package.bin' WHERE config_revision = 1",
+                "UPDATE worker_start_premises SET package_root = '/opt/other'
+                     WHERE config_revision = 1",
                 [],
             )
             .unwrap();
@@ -1120,8 +1163,8 @@ mod tests {
     }
 
     #[test]
-    fn content_validation_rejects_escape_paths_and_bad_digests() {
-        let escape = WorkerStartPremise {
+    fn content_validation_rejects_bad_origin_digests_and_escape_endpoints() {
+        let valid = WorkerStartPremise {
             schema: WORKER_START_PREMISE_RECORD_SCHEMA.into(),
             daemon_installation_id: "0198ab31-6c44-7e8a-b2bb-000000000001".into(),
             instance_id: "instance-a".into(),
@@ -1131,7 +1174,9 @@ mod tests {
             extension_alias: "org.dolly.tools".into(),
             server_id: "fs".into(),
             package_root: "/opt/dolly/pkg".into(),
-            package_path: "/etc/passwd".into(),
+            origin_component_id: "org.dolly.tools".into(),
+            origin_component_revision: 1,
+            origin_component_digest: format!("sha256:{}", "a".repeat(64)),
             package_digest: format!("sha256:{}", "a".repeat(64)),
             executable_digest: format!("sha256:{}", "b".repeat(64)),
             endpoint: "bin/tool".into(),
@@ -1146,10 +1191,15 @@ mod tests {
             transport_digest: format!("sha256:{}", "e".repeat(64)),
             record_digest: String::new(),
         };
-        assert!(escape.verify_content().is_err());
+        assert!(valid.verify_content().is_err());
+        let bad_origin = WorkerStartPremise {
+            origin_component_digest: "sha256:not-a-digest".into(),
+            ..valid.clone()
+        };
+        assert!(bad_origin.verify_content().is_err());
         let bad_endpoint = WorkerStartPremise {
             endpoint: "../escape".into(),
-            ..escape.clone()
+            ..valid.clone()
         };
         assert!(bad_endpoint.verify_content().is_err());
     }
@@ -1198,7 +1248,6 @@ mod tests {
                      extension_alias TEXT NOT NULL,
                      server_id TEXT NOT NULL,
                      package_root TEXT NOT NULL,
-                     package_path TEXT NOT NULL,
                      package_digest TEXT NOT NULL,
                      executable_digest TEXT NOT NULL,
                      record_jcs BLOB NOT NULL,

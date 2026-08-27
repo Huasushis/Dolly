@@ -23,6 +23,10 @@ import {
 		InstallWorkerStartPremiseInput,
 		RuntimeAuthorityDatabase,
 		RuntimeAuthorityDatabaseError,
+		type InstalledComponentOrigin,
+		type LinuxServiceCandidate,
+		type ModuleActivationPremises,
+		type PermissionPolicySelection,
 		type RuntimeAuthorityIdentity,
 	} from "../../../src/adapters/storage/runtime-authority-database.js";
 
@@ -157,6 +161,109 @@ function runtimeConfigDocument(server: unknown): unknown {
   };
 }
 
+function sha256Bytes(bytes: Uint8Array): string {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+/** Digest of the closed record with `field` removed (schema `comment` rules). */
+function selfDigest(record: Record<string, unknown>, field: string): string {
+  const { [field]: _digest, ...rest } = record;
+  return sha256Bytes(canonicalBytes(rest));
+}
+
+/**
+ * Builds the committed authority fixture for the packaged-binary proof: the
+ * tool-broker runtime config, the fs package planted as the one installed
+ * Linux Module (its installed-component origin becomes durable in
+ * `installed_component_origins`, which the Worker-start premise origin
+ * foreign key names), and the complete activation premise for it.
+ */
+function authorityWithFsOrigin(
+  runtimeConfig: unknown,
+  packageDigest: string,
+): {
+  bytes: Uint8Array;
+  digest: string;
+  premise: ModuleActivationPremises;
+  origin: InstalledComponentOrigin;
+} {
+  const origin: InstalledComponentOrigin = {
+    schema: "dolly.installed-component-origin/v1",
+    kind: "installed_product_component",
+    component_id: "org.dolly.tools.fs",
+    component_revision: 1,
+    component_digest: packageDigest,
+  };
+  const definitionRecord: Record<string, unknown> = {
+    schema: "dolly.permission-policy-definition/v1",
+    policy_id: "policy-tools",
+    policy_revision: 1,
+    definition_schema_uri: "dolly://schemas/host-permission-policy/v1",
+    definition_schema_digest: `sha256:${"f".repeat(64)}`,
+    definition: { tools: { invoke: true } },
+    origin: {
+      schema: "dolly.policy-definition-origin/v1",
+      kind: "operator_approved_policy",
+      source_id: "org.dolly.policy.default",
+      source_revision: 1,
+      source_digest: `sha256:${"0".repeat(64)}`,
+    },
+    definition_digest: "",
+  };
+  definitionRecord.definition_digest = selfDigest(definitionRecord, "definition_digest");
+  const bindingRecord: Record<string, unknown> = {
+    schema: "dolly.permission-policy-backend-binding/v1",
+    binding_id: "binding-tools",
+    binding_revision: 1,
+    binding_digest: "",
+    policy_id: String(definitionRecord.policy_id),
+    policy_revision: 1,
+    policy_definition_digest: String(definitionRecord.definition_digest),
+    origin,
+  };
+  bindingRecord.binding_digest = selfDigest(bindingRecord, "binding_digest");
+  const candidateRecord: Record<string, unknown> = {
+    schema: "dolly.linux-service-candidate/v1",
+    origin,
+    unit_name: "dolly-fs-tools.service",
+    mode: "user",
+    candidate_digest: "",
+  };
+  candidateRecord.candidate_digest = selfDigest(candidateRecord, "candidate_digest");
+  const selection = {
+    policy_id: String(definitionRecord.policy_id),
+    policy_revision: 1,
+    policy_definition_digest: String(definitionRecord.definition_digest),
+    binding_id: String(bindingRecord.binding_id),
+    binding_revision: 1,
+    binding_digest: String(bindingRecord.binding_digest),
+  };
+  const bytes = canonicalBytes({
+    runtime_config: runtimeConfig,
+    permission_policy_selections: [selection],
+    service_candidate: candidateRecord,
+  });
+  const digest = sha256Bytes(bytes);
+  const premiseRecord: Record<string, unknown> = {
+    schema: "dolly.module-activation-premises/v1",
+    daemon_installation_id: identity.daemonInstallationId,
+    instance_id: identity.instanceId,
+    config_revision: 1,
+    config_digest: digest,
+    permission_policy_definitions: [definitionRecord],
+    permission_policy_backend_bindings: [bindingRecord],
+    service_candidate: candidateRecord,
+    premises_digest: "",
+  };
+  premiseRecord.premises_digest = selfDigest(premiseRecord, "premises_digest");
+  return {
+    bytes: Uint8Array.from(Buffer.from(bytes)),
+    digest,
+    premise: premiseRecord as unknown as ModuleActivationPremises,
+    origin,
+  };
+}
+
 function freshCommittedFixture(): {
   directory: string;
   databasePath: string;
@@ -169,7 +276,7 @@ function freshCommittedFixture(): {
   const packageRoot = join(directory, "pkg");
   const installed = installInstalledServer(packageRoot);
   const server = serverContract(installed.packageDigest, installed.executableDigest);
-  const authority = resolvedConfigFixture(runtimeConfigDocument(server));
+  const authority = authorityWithFsOrigin(runtimeConfigDocument(server), installed.packageDigest);
   const databasePath = join(directory, "authority.sqlite");
   const database = RuntimeAuthorityDatabase.open({
     path: databasePath,
@@ -180,8 +287,8 @@ function freshCommittedFixture(): {
     identity,
     canonicalConfigBytes: authority.bytes,
     configDigest: authority.digest,
-    premise: null,
-    verifiedOrigins: [],
+    premise: authority.premise,
+    verifiedOrigins: [authority.origin],
   });
   return {
     directory,
@@ -192,20 +299,20 @@ function freshCommittedFixture(): {
     database,
   };
 }
-
-
 		type PremiseFixture = {
 			database: RuntimeAuthorityDatabase;
 			packageRoot: string;
-			packagePath: string;
+			packageDigest: string;
 		};
 		function premiseFor(fixture: PremiseFixture): InstallWorkerStartPremiseInput {
   return deriveWorkerStartPremise({
     database: fixture.database,
-    extensionAlias: "org.dolly.tools",
+    extensionAlias: "org.dolly.tools.fs",
     serverId: "fs",
     installedPackageRoot: fixture.packageRoot,
-    installedPackagePath: fixture.packagePath,
+    originComponentId: "org.dolly.tools.fs",
+    originComponentRevision: 1,
+    originComponentDigest: fixture.packageDigest,
   });
 }
 
@@ -237,10 +344,12 @@ describe.runIf(packagedBinaryPresent)("Packaged worker_host binary (production b
       await expect(
         launchHostWorkerHost({
           database: fixture.database,
-          extensionAlias: "org.dolly.tools",
+          extensionAlias: "org.dolly.tools.fs",
           serverId: "fs",
           installedPackageRoot: fixture.packageRoot,
-          installedPackagePath: fixture.packagePath,
+          originComponentId: "org.dolly.tools.fs",
+          originComponentRevision: 1,
+          originComponentDigest: fixture.packageDigest,
         }),
       ).rejects.toThrow(/WORKER_START_REFUSED/u);
       // The producer projected exactly once through the repository.
@@ -256,15 +365,22 @@ describe.runIf(packagedBinaryPresent)("Packaged worker_host binary (production b
     const fixture = freshCommittedFixture();
     writeFileSync(fixture.packagePath, Buffer.from("dolly-fs-tools-package-v1-TAMPERED"));
     try {
+      // The frozen installed origin commits the pristine digest, so a sealed
+      // premise naming the tampered bytes can never satisfy the durable
+      // origin foreign key: the projection refuses before any spawn or
+      // started frame.
+      const tamperedDigest = sha256File(fixture.packagePath);
       await expect(
         launchHostWorkerHost({
           database: fixture.database,
-          extensionAlias: "org.dolly.tools",
+          extensionAlias: "org.dolly.tools.fs",
           serverId: "fs",
           installedPackageRoot: fixture.packageRoot,
-          installedPackagePath: fixture.packagePath,
+          originComponentId: "org.dolly.tools.fs",
+          originComponentRevision: 1,
+          originComponentDigest: tamperedDigest,
         }),
-      ).rejects.toThrow(/WORKER_START_REFUSED/u);
+      ).rejects.toThrow(RuntimeAuthorityDatabaseError);
     } finally {
       fixture.database.close();
       rmSync(fixture.directory, { recursive: true, force: true });
@@ -281,10 +397,12 @@ describe.runIf(packagedBinaryPresent)("Packaged worker_host binary (production b
       await expect(
         launchHostWorkerHost({
           database: fixture.database,
-          extensionAlias: "org.dolly.tools",
+          extensionAlias: "org.dolly.tools.fs",
           serverId: "fs",
           installedPackageRoot: secondRoot,
-          installedPackagePath: second.packagePath,
+          originComponentId: "org.dolly.tools.fs",
+          originComponentRevision: 1,
+          originComponentDigest: fixture.packageDigest,
         }),
       ).rejects.toThrow(RuntimeAuthorityDatabaseError);
     } finally {
@@ -300,7 +418,7 @@ describe.runIf(packagedBinaryPresent)("Packaged worker_host binary (production b
     fixture.database.close();
     const child = spawn(
       packagedBinary,
-      [fixture.databasePath, "org.dolly.tools", "fs"],
+      [fixture.databasePath, "org.dolly.tools.fs", "fs"],
       { stdio: ["pipe", "pipe", "pipe"], env: {} },
     );
     const stderrPromise = collectStderr(child);

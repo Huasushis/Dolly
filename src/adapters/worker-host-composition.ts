@@ -51,10 +51,14 @@ export interface HostWorkerHostLaunchOptions {
   readonly database: RuntimeAuthorityDatabase;
   readonly extensionAlias: string;
   readonly serverId: string;
-  /** Absolute installed package root containing `installedPackagePath`. */
+  /** Absolute installed package root. */
   readonly installedPackageRoot: string;
-  /** Absolute installed package archive path inside `installedPackageRoot`. */
-  readonly installedPackagePath: string;
+  /** Frozen installed product component origin identity of the package. */
+  readonly originComponentId: string;
+  /** Frozen installed product component origin revision of the package. */
+  readonly originComponentRevision: number;
+  /** Frozen installed product component origin digest of the package. */
+  readonly originComponentDigest: string;
   /** Process-boundary injection (deterministic tests only), forwarded to the adapter. */
   readonly spawn?: (
     command: string,
@@ -265,6 +269,15 @@ export function deriveWorkerStartPremise(
     );
   }
   const { server, transport } = admittedServerContract(snapshot.canonicalConfig, serverId);
+  // The sealed premise extension alias IS the authoritative stdio transport
+  // package identifier: no caller, daemon-document alias, readiness result,
+  // or root config extension may name a different identity.
+  if (extensionAlias !== requireString(transport, "package_id", "stdio transport")) {
+    throw new InstalledWorkerHostError(
+      "WORKER_START_INVALID",
+      "sealed worker extension alias must equal the stdio transport package_id",
+    );
+  }
   const limits = objectField(
     requireField(server, "limits", "configured server"),
     "limits",
@@ -276,7 +289,9 @@ export function deriveWorkerStartPremise(
     extensionAlias,
     serverId,
     packageRoot: options.installedPackageRoot,
-    packagePath: options.installedPackagePath,
+    originComponentId: options.originComponentId,
+		originComponentRevision: options.originComponentRevision,
+		originComponentDigest: options.originComponentDigest,
     packageDigest: requireString(transport, "package_digest", "stdio transport"),
     executableDigest: requireString(transport, "executable_digest", "stdio transport"),
     endpoint: requireString(transport, "executable", "stdio transport"),
@@ -302,11 +317,24 @@ export async function launchHostWorkerHost(
 ): Promise<InstalledWorkerHostHandle> {
   const premise = deriveWorkerStartPremise(options);
   options.database.installWorkerStartPremise(premise);
-  return launchInstalledWorkerHost({
-    database: options.database,
-    premise,
-    ...(options.spawn === undefined ? {} : { spawn: options.spawn }),
-  });
+  try {
+    return await launchInstalledWorkerHost({
+      database: options.database,
+      premise,
+      ...(options.spawn === undefined ? {} : { spawn: options.spawn }),
+    });
+  } catch (error) {
+    if (
+      error instanceof InstalledWorkerHostError &&
+      error.code === "WORKER_START_REFUSED"
+    ) {
+      throw new InstalledWorkerHostError(
+        error.code,
+        `WORKER_START_REFUSED: ${error.message}`,
+      );
+    }
+    throw error;
+  }
 }
 
 /**
@@ -326,7 +354,6 @@ export interface HostWorkerHostOwnerOptions
   extends StartupAuthorityPermissionContext {
   /** Host-owned register of immutable installed package bytes. */
   readonly installations: ExtensionInstallationRegistry;
-  readonly extensionAlias: string;
   /** Configured tool-broker server identifiers to launch, unique and non-empty. */
   readonly serverIds: readonly string[];
   /** Process-boundary injection (deterministic tests only). */
@@ -359,8 +386,6 @@ function assertHostWorkerHostOwnerOptions(
   }
   const options = value as HostWorkerHostOwnerOptions;
   if (
-    typeof options.extensionAlias !== "string" ||
-    options.extensionAlias.length === 0 ||
     !Array.isArray(options.serverIds) ||
     options.serverIds.length === 0 ||
     options.serverIds.some(
@@ -385,7 +410,7 @@ function admittedInstallation(
   snapshot: CurrentAuthoritySnapshot,
   installations: ExtensionInstallationRegistry,
   serverId: string,
-): { installedPackageRoot: string; installedPackagePath: string; packageDigest: string } {
+): { installedPackageRoot: string; packageDigest: string } {
   const { transport } = admittedServerContract(snapshot.canonicalConfig, serverId);
   const packageId = requireString(transport, "package_id", "stdio transport");
   const packageVersion = requireString(transport, "package_version", "stdio transport");
@@ -407,7 +432,6 @@ function admittedInstallation(
   }
   return {
     installedPackageRoot: installed.workingDirectory,
-    installedPackagePath: installed.entrypointPath,
     packageDigest: installed.packageDigest,
   };
 }
@@ -424,7 +448,8 @@ export async function startHostWorkerHost(
   options: HostWorkerHostOwnerOptions,
 ): Promise<HostWorkerHostOwner> {
   assertHostWorkerHostOwnerOptions(options);
-  const { database, extensionAlias, installations, serverIds, spawn } = options;
+  const { database, installations, serverIds, spawn } = options;
+  const origins: InstalledComponentOriginRegistry = options.origins;
   const snapshot = database.readCurrentConfig();
   if (snapshot === null) {
     throw new InstalledWorkerHostError(
@@ -434,12 +459,25 @@ export async function startHostWorkerHost(
   }
   const launches = serverIds.map((serverId) => {
     const installed = admittedInstallation(snapshot, installations, serverId);
+    const { transport } = admittedServerContract(snapshot.canonicalConfig, serverId);
+    // Each committed server names exactly its authoritative immutable package
+    // through `transport.package_id`; only that identity may name the
+    // server's durable premise alias, and the immutable origin is resolved
+    // and revalidated through the Host origin registry first.
+    const packageId = requireString(transport, "package_id", "stdio transport");
+    const packageOrigin = origins.resolve({
+      extensionId: packageId,
+      packageVersion: requireString(transport, "package_version", "stdio transport"),
+    });
+    origins.assertCurrent(packageOrigin);
     const premise = deriveWorkerStartPremise({
       database,
-      extensionAlias,
+      extensionAlias: packageId,
       serverId,
       installedPackageRoot: installed.installedPackageRoot,
-      installedPackagePath: installed.installedPackagePath,
+      originComponentId: packageOrigin.component_id,
+      originComponentRevision: packageOrigin.component_revision,
+      originComponentDigest: packageOrigin.component_digest,
     });
     if (premise.packageDigest !== installed.packageDigest) {
       throw new InstalledWorkerHostError(
@@ -447,17 +485,26 @@ export async function startHostWorkerHost(
         `configured tool-broker server ${serverId} premise package digest does not match the Host-owned installation`,
       );
     }
-    return { serverId, ...installed };
+    return {
+      serverId,
+      extensionAlias: packageId,
+      installedPackageRoot: installed.installedPackageRoot,
+      originComponentId: packageOrigin.component_id,
+      originComponentRevision: packageOrigin.component_revision,
+      originComponentDigest: packageOrigin.component_digest,
+    };
   });
   const retained: Array<{ serverId: string; handle: InstalledWorkerHostHandle }> = [];
   try {
     for (const launch of launches) {
       const handle = await launchHostWorkerHost({
         database,
-        extensionAlias,
+        extensionAlias: launch.extensionAlias,
         serverId: launch.serverId,
         installedPackageRoot: launch.installedPackageRoot,
-        installedPackagePath: launch.installedPackagePath,
+        originComponentId: launch.originComponentId,
+        originComponentRevision: launch.originComponentRevision,
+        originComponentDigest: launch.originComponentDigest,
         ...(spawn === undefined ? {} : { spawn }),
       });
       retained.push({ serverId: launch.serverId, handle });
@@ -520,7 +567,7 @@ export interface RuntimeWorkerHost {
  */
 function toolBrokerContract(
   snapshot: CurrentAuthoritySnapshot | null,
-): { readonly extensionAlias: string; readonly serverIds: readonly string[] } | null {
+): { readonly serverIds: readonly string[] } | null {
   if (snapshot === null) {
     throw new InstalledWorkerHostError(
       "WORKER_START_INVALID",
@@ -555,13 +602,12 @@ function toolBrokerContract(
     "tool_broker",
     "runtime services",
   );
-  const extensionAlias = requireString(toolBroker, "extension_alias", "tool-broker config");
   const servers = objectField(
     requireField(toolBroker, "servers", "tool-broker config"),
     "servers",
     "tool-broker config",
   );
-  return { extensionAlias, serverIds: Object.keys(servers).sort() };
+  return { serverIds: Object.keys(servers).sort() };
 }
 
 function assertRuntimeWorkerHostOpenOptions(
@@ -650,7 +696,6 @@ export async function openRuntimeWorkerHost(
         controller: options.controllerLock,
         origins,
         installations,
-        extensionAlias: census.extensionAlias,
         serverIds: census.serverIds,
         ...(options.spawn === undefined ? {} : { spawn: options.spawn }),
       });

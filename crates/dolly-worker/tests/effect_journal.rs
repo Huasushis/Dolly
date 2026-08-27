@@ -48,6 +48,41 @@ use tempfile::{TempDir, tempdir};
 fn digest_of(value: &Value) -> Sha256Digest {
     canonicalize(value).unwrap().1
 }
+/// Mirror the registry's composite package identity: the manifest and every
+/// installed file path/digest are sealed together, rather than hashing one
+/// file such as `package.bin`.
+fn composite_package_digest(files: &[(&str, &[u8])]) -> Sha256Digest {
+    let mut file_records: Vec<Value> = files
+        .iter()
+        .map(|(path, bytes)| {
+            json!({
+                "path": path,
+                "digest": Sha256Digest::compute(bytes).to_canonical_string(),
+            })
+        })
+        .collect();
+    file_records.sort_by(|left, right| {
+        left["path"]
+            .as_str()
+            .expect("file path")
+            .cmp(right["path"].as_str().expect("file path"))
+    });
+    digest_of(&json!({
+        "manifest": {
+            "schemaVersion": "dolly.extension-package/1",
+            "extensionId": "org.dolly.tools",
+            "packageVersion": "1.0.0",
+            "displayName": "Dolly test tool",
+            "description": "Worker integration-test package",
+            "supportedProtocolVersions": ["2025-06-18"],
+            "entrypoint": "bin/dolly-fs-tools",
+            "modules": [],
+            "requestedCapabilities": []
+        },
+        "files": file_records
+    }))
+}
+
 
 fn without(value: &Value, field: &str) -> Value {
     let mut object = value.as_object().unwrap().clone();
@@ -69,6 +104,16 @@ fn origin() -> InstalledComponentOrigin {
         component_id: "org.dolly.host-runtime".into(),
         component_revision: 1,
         component_digest: digest_of(&record),
+    }
+}
+
+fn package_origin(package_digest: &Sha256Digest) -> InstalledComponentOrigin {
+    InstalledComponentOrigin {
+        schema: "dolly.installed-component-origin/v1".into(),
+        kind: "installed_product_component".into(),
+        component_id: "org.dolly.tools".into(),
+        component_revision: 1,
+        component_digest: package_digest.clone(),
     }
 }
 
@@ -230,11 +275,13 @@ for line in sys.stdin:
 }
 
 /// Install package.bin + server.py + the executable (a copy of `/usr/bin/env`
-/// or python3) under `root`; returns (package_digest, executable_digest).
+/// or python3) under `root`; returns the composite package and executable
+/// byte digests.
 fn install_fake_server(root: &Path, silent: bool) -> (Sha256Digest, Sha256Digest) {
     let package = b"dolly-fs-tools-package-v1";
     std::fs::write(root.join("package.bin"), package).expect("write package");
-    std::fs::write(root.join("server.py"), &fake_server_bytes(silent)).expect("write server.py");
+    let server = fake_server_bytes(silent);
+    std::fs::write(root.join("server.py"), &server).expect("write server.py");
 
     let interpreter = if Path::new("/usr/bin/python3").exists() {
         PathBuf::from("/usr/bin/python3")
@@ -258,11 +305,14 @@ fn install_fake_server(root: &Path, silent: bool) -> (Sha256Digest, Sha256Digest
     }
     let executable_bytes = std::fs::read(&executable).expect("read executable");
     (
-        Sha256Digest::compute(package),
+        composite_package_digest(&[
+            ("bin/dolly-fs-tools", &executable_bytes),
+            ("package.bin", package),
+            ("server.py", &server),
+        ]),
         Sha256Digest::compute(&executable_bytes),
     )
 }
-
 fn count_child_calls(root: &Path) -> usize {
     match std::fs::read_to_string(root.join("marker.txt")) {
         Ok(text) => text.lines().count(),
@@ -337,11 +387,14 @@ fn assert_process_reaped(pid: u32) {
 // durable authority fixture
 // ---------------------------------------------------------------------------
 
-fn host_revision(broker_config: Value, instance_id: &str) -> HostAuthorityRevision {
-    let origin = origin();
+fn host_revision(
+    broker_config: Value,
+    instance_id: &str,
+    origin: &InstalledComponentOrigin,
+) -> HostAuthorityRevision {
     let mut candidate_record = json!({
         "schema": "dolly.linux-service-candidate/v1",
-        "origin": serde_json::to_value(&origin).unwrap(),
+        "origin": serde_json::to_value(origin).unwrap(),
         "unit_name": "dollyd.service",
         "mode": "user",
         "candidate_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -407,13 +460,13 @@ struct Fixture {
     directory: TempDir,
     db_path: PathBuf,
     package_root: PathBuf,
-    package_path: PathBuf,
     server: Value,
     instance_id: String,
     package_digest: Sha256Digest,
     executable_digest: Sha256Digest,
     premise_record_digest: String,
 }
+
 
 impl Fixture {
     fn new(silent: bool) -> Self {
@@ -422,6 +475,8 @@ impl Fixture {
         std::fs::create_dir_all(&package_root).expect("pkg dir");
         let (package_digest, executable_digest) = install_fake_server(&package_root, silent);
         let server = server_value(&package_digest, &executable_digest);
+        let component_origin = package_origin(&package_digest);
+        let host_origin = origin();
 
         let db_path = directory.path().join("instance.sqlite");
         let instance_id = format!(
@@ -434,11 +489,30 @@ impl Fixture {
                 .replace('.', "d")
                 .to_ascii_lowercase()
         );
-        let revision = host_revision(tool_broker_config(&server), &instance_id);
+        let revision =
+            host_revision(tool_broker_config(&server), &instance_id, &host_origin);
         let db = Database::open_for_migration(&db_path)
             .expect("open for migration")
             .install_host_authority_revision(revision)
             .expect("install authority revision");
+        let origin_bytes =
+            canonicalize(&serde_json::to_value(&component_origin).unwrap())
+                .unwrap()
+                .0
+                .into_vec();
+        db.connection()
+            .execute(
+                "INSERT INTO installed_component_origins (
+                     component_id, component_revision, component_digest, record_jcs
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    &component_origin.component_id,
+                    component_origin.component_revision,
+                    component_origin.component_digest.to_canonical_string(),
+                    origin_bytes,
+                ],
+            )
+            .expect("package origin parent");
         create_tool_ledger_schema(db.connection()).expect("ledger schema");
         db.connection()
             .execute(
@@ -468,7 +542,6 @@ impl Fixture {
             directory,
             db_path,
             package_root: package_root.clone(),
-            package_path: package_root.join("package.bin"),
             server,
             instance_id,
             package_digest,
@@ -476,7 +549,6 @@ impl Fixture {
             premise_record_digest: String::new(),
         }
     }
-
     fn preload_ledger(&self, worker: &mut Worker, records: &[ToolCallLedgerRecord]) {
         for record in records {
             worker
@@ -502,7 +574,9 @@ impl Fixture {
             extension_alias: "org.dolly.tools".parse().expect("extension id"),
             server_id: "fs".into(),
             package_root: self.package_root.clone(),
-            package_path: self.package_path.clone(),
+            origin_component_id: "org.dolly.tools".into(),
+            origin_component_revision: 1,
+            origin_component_digest: self.package_digest.to_canonical_string(),
             package_digest: self.package_digest.to_canonical_string(),
             executable_digest: self.executable_digest.to_canonical_string(),
             endpoint: "bin/dolly-fs-tools".into(),

@@ -31,7 +31,7 @@
  *   premise-policy selections, and only as part of the exact current revision.
  */
 import { createHash } from "node:crypto";
-import { isAbsolute, resolve, sep } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { openAttestedNativeSqlite } from "./native-sqlite.js";
 import type { NativeSqliteConnection } from "./native-sqlite-binding.js";
 import {
@@ -248,10 +248,14 @@ export interface InstallAuthorityConfigInput {
 export interface InstallWorkerStartPremiseInput {
   readonly extensionAlias: string;
   readonly serverId: string;
-  /** Absolute installed package root; must contain `packagePath`. */
+  /** Absolute installed package root. */
   readonly packageRoot: string;
-  /** Absolute installed package archive path inside `packageRoot`. */
-  readonly packagePath: string;
+  /** Installed product component origin identity of the package. */
+  readonly originComponentId: string;
+  /** Installed product component origin revision of the package. */
+  readonly originComponentRevision: number;
+  /** Installed product component origin digest of the package. */
+  readonly originComponentDigest: string;
   readonly packageDigest: string;
   readonly executableDigest: string;
   /** Package-root-relative executable endpoint (safe relative member). */
@@ -462,18 +466,20 @@ function validateWorkerStartPremiseInput(input: InstallWorkerStartPremiseInput):
       "endpoint must be a safe package-root-relative member",
     );
   }
-  if (!isAbsolute(input.packageRoot) || !isAbsolute(input.packagePath)) {
+  if (!isAbsolute(input.packageRoot) || resolve(input.packageRoot) !== input.packageRoot) {
     throw new RuntimeAuthorityDatabaseError(
       "AUTHORITY_DATABASE_MALFORMED_RECORD",
-      "package locations must be absolute paths",
+      "packageRoot must be an absolute canonical path",
     );
   }
-  const root = resolve(input.packageRoot);
-  const packagePath = resolve(input.packagePath);
-  if (root !== input.packageRoot || !packagePath.startsWith(root + sep)) {
+  if (
+    !isQualifiedName(input.originComponentId) ||
+    !isIntegralInRange(input.originComponentRevision, 1, MAX_CONFIG_REVISION) ||
+    !isSha256(input.originComponentDigest)
+  ) {
     throw new RuntimeAuthorityDatabaseError(
       "AUTHORITY_DATABASE_MALFORMED_RECORD",
-      "installed package path must sit inside the canonical package root",
+      "origin tuple must name an installed product component origin",
     );
   }
   if (
@@ -541,7 +547,9 @@ function buildSealedWorkerStartPremise(unsigned: {
   readonly extension_alias: string;
   readonly server_id: string;
   readonly package_root: string;
-  readonly package_path: string;
+  readonly origin_component_id: string;
+  readonly origin_component_revision: number;
+  readonly origin_component_digest: string;
   readonly package_digest: string;
   readonly executable_digest: string;
   readonly endpoint: string;
@@ -564,7 +572,9 @@ function buildSealedWorkerStartPremise(unsigned: {
     extension_alias: unsigned.extension_alias,
     server_id: unsigned.server_id,
     package_root: unsigned.package_root,
-    package_path: unsigned.package_path,
+    origin_component_id: unsigned.origin_component_id,
+    origin_component_revision: unsigned.origin_component_revision,
+    origin_component_digest: unsigned.origin_component_digest,
     package_digest: unsigned.package_digest,
     executable_digest: unsigned.executable_digest,
     endpoint: unsigned.endpoint,
@@ -774,6 +784,40 @@ function originKey(origin: InstalledComponentOrigin): string {
 // Physical Host schema version 2. Logical record discriminators remain /v1.
 // ---------------------------------------------------------------------------
 
+const WORKER_START_PREMISES_V2_SCHEMA_SQL = `
+CREATE TABLE worker_start_premises (
+  config_revision INTEGER NOT NULL CHECK (config_revision BETWEEN 1 AND ${MAX_CONFIG_REVISION}),
+  config_digest TEXT NOT NULL,
+  extension_alias TEXT NOT NULL CHECK (length(extension_alias) > 0),
+  server_id TEXT NOT NULL CHECK (length(server_id) > 0),
+  package_root TEXT NOT NULL CHECK (length(package_root) > 0),
+  origin_component_id TEXT NOT NULL,
+  origin_component_revision INTEGER NOT NULL CHECK (origin_component_revision BETWEEN 1 AND ${MAX_CONFIG_REVISION}),
+  origin_component_digest TEXT NOT NULL,
+  package_digest TEXT NOT NULL CHECK (package_digest LIKE 'sha256:%'),
+  executable_digest TEXT NOT NULL CHECK (executable_digest LIKE 'sha256:%'),
+  endpoint TEXT NOT NULL CHECK (length(endpoint) > 0),
+  spawn_args_json TEXT NOT NULL CHECK (json_valid(spawn_args_json) AND json_type(spawn_args_json) = 'array'),
+  startup_timeout_ms INTEGER NOT NULL CHECK (startup_timeout_ms BETWEEN 1 AND ${MAX_CONFIG_REVISION}),
+  max_frame_bytes INTEGER NOT NULL CHECK (max_frame_bytes BETWEEN 1 AND 4294967295),
+  max_response_bytes INTEGER NOT NULL CHECK (max_response_bytes BETWEEN 1 AND 4294967295),
+  wire_depth INTEGER NOT NULL CHECK (wire_depth BETWEEN 1 AND 96),
+  semantic_depth INTEGER NOT NULL CHECK (semantic_depth BETWEEN 1 AND 64),
+  max_dispatch_members INTEGER NOT NULL CHECK (max_dispatch_members BETWEEN 1 AND ${MAX_CONFIG_REVISION}),
+  max_dispatch_depth INTEGER NOT NULL CHECK (max_dispatch_depth BETWEEN 1 AND 64),
+  transport_digest TEXT NOT NULL CHECK (transport_digest LIKE 'sha256:%'),
+  record_jcs BLOB NOT NULL,
+  record_digest TEXT NOT NULL,
+  PRIMARY KEY (config_revision, extension_alias, server_id),
+  FOREIGN KEY (config_revision, config_digest)
+    REFERENCES config_revision_mappings(config_revision, config_digest),
+  FOREIGN KEY (origin_component_id, origin_component_revision, origin_component_digest)
+    REFERENCES installed_component_origins(component_id, component_revision, component_digest),
+  CHECK (extension_alias = origin_component_id),
+  CHECK (package_digest = origin_component_digest)
+);
+`;
+
 export const RUNTIME_AUTHORITY_SCHEMA_SQL = `
 CREATE TABLE core_meta (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -901,32 +945,8 @@ CREATE TABLE runtime_authority_state (
   FOREIGN KEY (current_config_revision, current_config_digest)
     REFERENCES config_revision_mappings(config_revision, config_digest)
 );
-CREATE TABLE worker_start_premises (
-  config_revision INTEGER NOT NULL CHECK (config_revision BETWEEN 1 AND ${MAX_CONFIG_REVISION}),
-  config_digest TEXT NOT NULL,
-  extension_alias TEXT NOT NULL CHECK (length(extension_alias) > 0),
-  server_id TEXT NOT NULL CHECK (length(server_id) > 0),
-  package_root TEXT NOT NULL CHECK (length(package_root) > 0),
-  package_path TEXT NOT NULL CHECK (length(package_path) > 0),
-  package_digest TEXT NOT NULL CHECK (package_digest LIKE 'sha256:%'),
-  executable_digest TEXT NOT NULL CHECK (executable_digest LIKE 'sha256:%'),
-  endpoint TEXT NOT NULL CHECK (length(endpoint) > 0),
-  spawn_args_json TEXT NOT NULL CHECK (json_valid(spawn_args_json) AND json_type(spawn_args_json) = 'array'),
-  startup_timeout_ms INTEGER NOT NULL CHECK (startup_timeout_ms BETWEEN 1 AND 9007199254740991),
-  max_frame_bytes INTEGER NOT NULL CHECK (max_frame_bytes BETWEEN 1 AND 4294967295),
-  max_response_bytes INTEGER NOT NULL CHECK (max_response_bytes BETWEEN 1 AND 4294967295),
-  wire_depth INTEGER NOT NULL CHECK (wire_depth BETWEEN 1 AND 96),
-  semantic_depth INTEGER NOT NULL CHECK (semantic_depth BETWEEN 1 AND 64),
-  max_dispatch_members INTEGER NOT NULL CHECK (max_dispatch_members BETWEEN 1 AND 9007199254740991),
-  max_dispatch_depth INTEGER NOT NULL CHECK (max_dispatch_depth BETWEEN 1 AND 64),
-  transport_digest TEXT NOT NULL CHECK (transport_digest LIKE 'sha256:%'),
-  record_jcs BLOB NOT NULL,
-  record_digest TEXT NOT NULL,
-  PRIMARY KEY (config_revision, extension_alias, server_id),
-  FOREIGN KEY (config_revision, config_digest)
-    REFERENCES config_revision_mappings(config_revision, config_digest),
-  CHECK (substr(package_path, 1, length(package_root) + 1) = package_root || '/')
-);
+${WORKER_START_PREMISES_V2_SCHEMA_SQL}
+
 CREATE TABLE core_journal (
   journal_seq INTEGER PRIMARY KEY AUTOINCREMENT,
   event_kind TEXT NOT NULL,
@@ -1053,7 +1073,9 @@ const AUTHORITY_SCHEMA_COLUMNS: Readonly<Record<string, readonly AuthoritySchema
     { name: "extension_alias", type: "TEXT", notNull: 1, primaryKey: 2 },
     { name: "server_id", type: "TEXT", notNull: 1, primaryKey: 3 },
     { name: "package_root", type: "TEXT", notNull: 1, primaryKey: 0 },
-    { name: "package_path", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "origin_component_id", type: "TEXT", notNull: 1, primaryKey: 0 },
+    { name: "origin_component_revision", type: "INTEGER", notNull: 1, primaryKey: 0 },
+    { name: "origin_component_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
     { name: "package_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
     { name: "executable_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
     { name: "endpoint", type: "TEXT", notNull: 1, primaryKey: 0 },
@@ -1078,6 +1100,56 @@ const AUTHORITY_SCHEMA_COLUMNS: Readonly<Record<string, readonly AuthoritySchema
     { name: "premises_digest", type: "TEXT", notNull: 0, primaryKey: 0 },
   ],
 });
+const LEGACY_WORKER_START_PREMISE_SCHEMA_COLUMNS: readonly AuthoritySchemaColumn[] = [
+  { name: "config_revision", type: "INTEGER", notNull: 1, primaryKey: 1 },
+  { name: "config_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+  { name: "extension_alias", type: "TEXT", notNull: 1, primaryKey: 2 },
+  { name: "server_id", type: "TEXT", notNull: 1, primaryKey: 3 },
+  { name: "package_root", type: "TEXT", notNull: 1, primaryKey: 0 },
+  { name: "package_path", type: "TEXT", notNull: 1, primaryKey: 0 },
+  { name: "package_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+  { name: "executable_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+  { name: "endpoint", type: "TEXT", notNull: 1, primaryKey: 0 },
+  { name: "spawn_args_json", type: "TEXT", notNull: 1, primaryKey: 0 },
+  { name: "startup_timeout_ms", type: "INTEGER", notNull: 1, primaryKey: 0 },
+  { name: "max_frame_bytes", type: "INTEGER", notNull: 1, primaryKey: 0 },
+  { name: "max_response_bytes", type: "INTEGER", notNull: 1, primaryKey: 0 },
+  { name: "wire_depth", type: "INTEGER", notNull: 1, primaryKey: 0 },
+  { name: "semantic_depth", type: "INTEGER", notNull: 1, primaryKey: 0 },
+  { name: "max_dispatch_members", type: "INTEGER", notNull: 1, primaryKey: 0 },
+  { name: "max_dispatch_depth", type: "INTEGER", notNull: 1, primaryKey: 0 },
+  { name: "transport_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+  { name: "record_jcs", type: "BLOB", notNull: 1, primaryKey: 0 },
+  { name: "record_digest", type: "TEXT", notNull: 1, primaryKey: 0 },
+];
+
+const LEGACY_WORKER_START_PREMISE_SCHEMA_CHECKS: readonly string[] = [
+  "check (config_revision between 1 and 9007199254740991)",
+  "check (length(extension_alias) > 0)",
+  "check (length(server_id) > 0)",
+  "check (length(package_root) > 0)",
+  "check (length(package_path) > 0)",
+  "check (package_digest like 'sha256:%')",
+  "check (executable_digest like 'sha256:%')",
+  "check (length(endpoint) > 0)",
+  "check (json_valid(spawn_args_json) and json_type(spawn_args_json) = 'array')",
+  "check (startup_timeout_ms between 1 and 9007199254740991)",
+  "check (max_frame_bytes between 1 and 4294967295)",
+  "check (max_response_bytes between 1 and 4294967295)",
+  "check (wire_depth between 1 and 96)",
+  "check (semantic_depth between 1 and 64)",
+  "check (max_dispatch_members between 1 and 9007199254740991)",
+  "check (max_dispatch_depth between 1 and 64)",
+  "check (transport_digest like 'sha256:%')",
+  "primary key (config_revision, extension_alias, server_id)",
+  "check (substr(package_path, 1, length(package_root) + 1) = package_root || '/')",
+];
+
+const LEGACY_WORKER_START_PREMISE_SCHEMA_FOREIGN_KEYS: readonly string[] = [
+  "0:0:config_revision_mappings:config_revision:config_revision:NO ACTION:NO ACTION:NONE",
+  "0:1:config_revision_mappings:config_digest:config_digest:NO ACTION:NO ACTION:NONE",
+];
+
 
 const AUTHORITY_SCHEMA_CHECKS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   core_meta: ["check (singleton = 1)", "check (clean_shutdown in (0, 1))"],
@@ -1123,7 +1195,7 @@ const AUTHORITY_SCHEMA_CHECKS: Readonly<Record<string, readonly string[]>> = Obj
     "check (length(extension_alias) > 0)",
     "check (length(server_id) > 0)",
     "check (length(package_root) > 0)",
-    "check (length(package_path) > 0)",
+    "check (origin_component_revision between 1 and 9007199254740991)",
     "check (package_digest like 'sha256:%')",
     "check (executable_digest like 'sha256:%')",
     "check (length(endpoint) > 0)",
@@ -1137,7 +1209,8 @@ const AUTHORITY_SCHEMA_CHECKS: Readonly<Record<string, readonly string[]>> = Obj
     "check (max_dispatch_depth between 1 and 64)",
     "check (transport_digest like 'sha256:%')",
     "primary key (config_revision, extension_alias, server_id)",
-    "check (substr(package_path, 1, length(package_root) + 1) = package_root || '/')",
+    "check (extension_alias = origin_component_id)",
+	  "check (package_digest = origin_component_digest)",
   ],
 });
 const AUTHORITY_SCHEMA_FOREIGN_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
@@ -1180,8 +1253,11 @@ const AUTHORITY_SCHEMA_FOREIGN_KEYS: Readonly<Record<string, readonly string[]>>
     "0:1:config_revision_mappings:current_config_digest:config_digest:NO ACTION:NO ACTION:NONE",
   ],
   worker_start_premises: [
-    "0:0:config_revision_mappings:config_revision:config_revision:NO ACTION:NO ACTION:NONE",
-    "0:1:config_revision_mappings:config_digest:config_digest:NO ACTION:NO ACTION:NONE",
+        "0:0:installed_component_origins:origin_component_id:component_id:NO ACTION:NO ACTION:NONE",
+    "0:1:installed_component_origins:origin_component_revision:component_revision:NO ACTION:NO ACTION:NONE",
+    "0:2:installed_component_origins:origin_component_digest:component_digest:NO ACTION:NO ACTION:NONE",
+    "1:0:config_revision_mappings:config_revision:config_revision:NO ACTION:NO ACTION:NONE",
+    "1:1:config_revision_mappings:config_digest:config_digest:NO ACTION:NO ACTION:NONE",
   ],
 });
 
@@ -1349,6 +1425,60 @@ function verifyAuthorityIndexesForTables(connection: RuntimeSqliteConnection, ta
     }
   }
 }
+function hasExactLegacyWorkerStartPremisePhysicalSchema(connection: RuntimeSqliteConnection): boolean {
+  const table = connection.prepare(
+    "SELECT type, name, sql FROM sqlite_master WHERE name = 'worker_start_premises'",
+  ).get();
+  if (!table || table.type !== "table" || table.name !== "worker_start_premises") return false;
+  const columns = connection.prepare("PRAGMA table_info(worker_start_premises)").all();
+  const expectedColumns = LEGACY_WORKER_START_PREMISE_SCHEMA_COLUMNS;
+  if (
+    columns.length !== expectedColumns.length ||
+    columns.some((column, index) => {
+      const wanted = expectedColumns[index]!;
+      return column.name !== wanted.name ||
+        String(column.type).toUpperCase() !== wanted.type ||
+        Number(column.notnull) !== wanted.notNull ||
+        Number(column.pk) !== wanted.primaryKey;
+    })
+  ) {
+    return false;
+  }
+  const sql = sqlTokens(table.sql);
+  if (
+    LEGACY_WORKER_START_PREMISE_SCHEMA_CHECKS.some((fragment) => !sqlHasTokenSequence(sql, fragment)) ||
+    sql.filter((token) => token === "check").length !==
+      LEGACY_WORKER_START_PREMISE_SCHEMA_CHECKS.filter((fragment) => sqlTokens(fragment)[0] === "check").length
+  ) {
+    return false;
+  }
+  const foreignKeys = connection.prepare("PRAGMA foreign_key_list(worker_start_premises)").all().map(
+    (foreignKey) => `${foreignKey.id}:${foreignKey.seq}:${foreignKey.table}:${foreignKey.from}:${foreignKey.to ?? ""}:${foreignKey.on_update}:${foreignKey.on_delete}:${foreignKey.match}`,
+  ).sort();
+  const expectedForeignKeys = [...LEGACY_WORKER_START_PREMISE_SCHEMA_FOREIGN_KEYS].sort();
+  if (
+    foreignKeys.length !== expectedForeignKeys.length ||
+    foreignKeys.some((value, index) => value !== expectedForeignKeys[index])
+  ) {
+    return false;
+  }
+  const hostileObjects = connection.prepare(
+    "SELECT type, tbl_name, sql FROM sqlite_master WHERE type IN ('trigger', 'view')",
+  ).all();
+  if (hostileObjects.some((object) =>
+    object.tbl_name === "worker_start_premises" ||
+    tokensReferenceAuthorityTable(sqlTokens(object.sql), ["worker_start_premises"])
+  )) {
+    return false;
+  }
+  try {
+    verifyAuthorityIndexesForTables(connection, ["worker_start_premises"]);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
 
 function verifyAuthorityPhysicalSchema(connection: RuntimeSqliteConnection): void {
   const tableNames = Object.keys(AUTHORITY_SCHEMA_COLUMNS);
@@ -1909,6 +2039,34 @@ export class RuntimeAuthorityDatabase {
     return typeof value === "number" ? value : Number(value ?? 0);
   }
 
+  #migrateLegacyWorkerStartPremiseV1IfPresent(): void {
+    if (!hasExactLegacyWorkerStartPremisePhysicalSchema(this.#connection)) return;
+    try {
+      this.#statement("BEGIN IMMEDIATE").run();
+    } catch (error) {
+      throw this.#translateError(error);
+    }
+    try {
+      if (!hasExactLegacyWorkerStartPremisePhysicalSchema(this.#connection)) {
+        throw new RuntimeAuthorityDatabaseError(
+          "STORAGE_MIGRATION_REQUIRED",
+          "worker-start premise table changed before its migration transaction",
+        );
+      }
+      this.#connection.prepare("DROP TABLE worker_start_premises").run();
+      this.#connection.exec(WORKER_START_PREMISES_V2_SCHEMA_SQL);
+      verifyAuthorityPhysicalSchema(this.#connection);
+      this.#statement("COMMIT").run();
+    } catch (error) {
+      try {
+        this.#statement("ROLLBACK").run();
+      } catch {
+        /* preserve the original migration error */
+      }
+      throw this.#translateError(error);
+    }
+  }
+
   #migrateLegacyV1(): void {
     this.#requireOpen();
     if (this.#userVersion() !== RUNTIME_AUTHORITY_SCHEMA_VERSION) {
@@ -2141,17 +2299,24 @@ export class RuntimeAuthorityDatabase {
           "CREATE TABLE core_journal (journal_seq INTEGER PRIMARY KEY AUTOINCREMENT, event_kind TEXT NOT NULL, event_jcs BLOB NOT NULL, config_revision INTEGER, config_digest TEXT, premises_digest TEXT)",
         ).run();
       }
-      // The Worker-start premise slice is provisioned empty at migration so
-      // the post-migration physical gate sees the complete v2 projection;
-      // premises themselves are projected per-revision by the Host writer.
+      // The Worker-start premise slice is rebuilt empty at migration so the
+      // post-migration physical gate sees the complete v2 projection;
+      // obsolete derived rows are discarded (no UPDATE/DELETE authority), and
+      // premises are re-projected per-revision by the Host writer.
       const workerPremises = this.#connection.prepare(
         "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'worker_start_premises'",
       ).get();
-      if (!workerPremises) {
-        this.#connection.prepare(
-          "CREATE TABLE worker_start_premises (config_revision INTEGER NOT NULL CHECK (config_revision BETWEEN 1 AND 9007199254740991), config_digest TEXT NOT NULL, extension_alias TEXT NOT NULL CHECK (length(extension_alias) > 0), server_id TEXT NOT NULL CHECK (length(server_id) > 0), package_root TEXT NOT NULL CHECK (length(package_root) > 0), package_path TEXT NOT NULL CHECK (length(package_path) > 0), package_digest TEXT NOT NULL CHECK (package_digest LIKE 'sha256:%'), executable_digest TEXT NOT NULL CHECK (executable_digest LIKE 'sha256:%'), endpoint TEXT NOT NULL CHECK (length(endpoint) > 0), spawn_args_json TEXT NOT NULL CHECK (json_valid(spawn_args_json) AND json_type(spawn_args_json) = 'array'), startup_timeout_ms INTEGER NOT NULL CHECK (startup_timeout_ms BETWEEN 1 AND 9007199254740991), max_frame_bytes INTEGER NOT NULL CHECK (max_frame_bytes BETWEEN 1 AND 4294967295), max_response_bytes INTEGER NOT NULL CHECK (max_response_bytes BETWEEN 1 AND 4294967295), wire_depth INTEGER NOT NULL CHECK (wire_depth BETWEEN 1 AND 96), semantic_depth INTEGER NOT NULL CHECK (semantic_depth BETWEEN 1 AND 64), max_dispatch_members INTEGER NOT NULL CHECK (max_dispatch_members BETWEEN 1 AND 9007199254740991), max_dispatch_depth INTEGER NOT NULL CHECK (max_dispatch_depth BETWEEN 1 AND 64), transport_digest TEXT NOT NULL CHECK (transport_digest LIKE 'sha256:%'), record_jcs BLOB NOT NULL, record_digest TEXT NOT NULL, PRIMARY KEY (config_revision, extension_alias, server_id), FOREIGN KEY (config_revision, config_digest) REFERENCES config_revision_mappings(config_revision, config_digest), CHECK (substr(package_path, 1, length(package_root) + 1) = package_root || '/'))",
-        ).run();
+      if (workerPremises !== undefined) {
+        if (!hasExactLegacyWorkerStartPremisePhysicalSchema(this.#connection)) {
+          throw new RuntimeAuthorityDatabaseError(
+            "STORAGE_MIGRATION_REQUIRED",
+            "legacy worker-start premise table has an unknown physical shape",
+          );
+        }
+        this.#connection.prepare("DROP TABLE worker_start_premises").run();
       }
+      this.#connection.exec(WORKER_START_PREMISES_V2_SCHEMA_SQL);
+
       const recordBytes = Buffer.from(canonicalBytes(
         stateRecord(this.#identity, this.#controllerGenerationId, revision, digest),
       ));
@@ -2216,10 +2381,12 @@ export class RuntimeAuthorityDatabase {
         ).get()
       : undefined;
     const stateColumns = this.#connection.prepare("PRAGMA table_info(runtime_authority_state)").all();
-    if (
-      Number(hostMeta?.authority_schema_version) !== HOST_AUTHORITY_SCHEMA_VERSION ||
-      !stateColumns.some((column) => column.name === "controller_generation_id")
-    ) {
+    const hostVersion = Number(hostMeta?.authority_schema_version);
+    const hasControllerGeneration = stateColumns.some((column) => column.name === "controller_generation_id");
+    if (hostVersion === HOST_AUTHORITY_SCHEMA_VERSION && hasControllerGeneration) {
+      this.#migrateLegacyWorkerStartPremiseV1IfPresent();
+    }
+    if (hostVersion !== HOST_AUTHORITY_SCHEMA_VERSION || !hasControllerGeneration) {
       throw new RuntimeAuthorityDatabaseError(
         "STORAGE_MIGRATION_REQUIRED",
         "Runtime authority database uses the legacy physical Host schema; invoke the explicit v1 migration",
@@ -2752,7 +2919,9 @@ export class RuntimeAuthorityDatabase {
       extension_alias: input.extensionAlias,
       server_id: input.serverId,
       package_root: input.packageRoot,
-      package_path: input.packagePath,
+      origin_component_id: input.originComponentId,
+      origin_component_revision: input.originComponentRevision,
+      origin_component_digest: input.originComponentDigest,
       package_digest: input.packageDigest,
       executable_digest: input.executableDigest,
       endpoint: input.endpoint,
@@ -2795,14 +2964,16 @@ export class RuntimeAuthorityDatabase {
         );
       }
       this.#connection.prepare(
-        "INSERT INTO worker_start_premises (config_revision, config_digest, extension_alias, server_id, package_root, package_path, package_digest, executable_digest, endpoint, spawn_args_json, startup_timeout_ms, max_frame_bytes, max_response_bytes, wire_depth, semantic_depth, max_dispatch_members, max_dispatch_depth, transport_digest, record_jcs, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO worker_start_premises (config_revision, config_digest, extension_alias, server_id, package_root, origin_component_id, origin_component_revision, origin_component_digest, package_digest, executable_digest, endpoint, spawn_args_json, startup_timeout_ms, max_frame_bytes, max_response_bytes, wire_depth, semantic_depth, max_dispatch_members, max_dispatch_depth, transport_digest, record_jcs, record_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       ).run(
         snapshot.config_revision,
         snapshot.config_digest,
         input.extensionAlias,
         input.serverId,
         input.packageRoot,
-        input.packagePath,
+        input.originComponentId,
+        input.originComponentRevision,
+        input.originComponentDigest,
         input.packageDigest,
         input.executableDigest,
         input.endpoint,

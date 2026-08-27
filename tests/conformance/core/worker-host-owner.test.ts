@@ -1,3 +1,5 @@
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -17,14 +19,18 @@ import { describe, expect, it } from "vitest";
 import { canonicalBytes } from "../../../src/schema-bundle/index.js";
 import {
   RuntimeAuthorityDatabase,
+  type InstalledComponentOrigin,
+  type LinuxServiceCandidate,
+  type ModuleActivationPremises,
+  type PermissionPolicySelection,
   type RuntimeAuthorityIdentity,
 } from "../../../src/adapters/storage/runtime-authority-database.js";
 import { InstanceControllerLock } from "../../../src/core/instance-controller-lock.js";
 import { InstalledComponentOriginRegistry } from "../../../src/core/installed-component-origin.js";
 import { ExtensionInstallationRegistry } from "../../../src/core/extension-installation-registry.js";
 import { setWorkerHostInstallVerifierForTests } from "../../../src/adapters/installed-worker-host.js";
-import { deriveWorkerStartPremise } from "../../../src/adapters/worker-host-composition.js";
 import {
+  deriveWorkerStartPremise,
   openRuntimeWorkerHost,
   type RuntimeWorkerHostOpenOptions,
 } from "../../../src/adapters/worker-host-composition.js";
@@ -90,13 +96,112 @@ function resolvedConfigFixture(runtimeConfig: unknown): { bytes: Uint8Array; dig
   };
 }
 
+/** Digest of the closed record with `field` removed (schema `comment` rules). */
+function selfDigest(record: Record<string, unknown>, field: string): string {
+  const { [field]: _digest, ...rest } = record;
+  return sha256Bytes(canonicalBytes(rest));
+}
+
+/**
+ * Builds the committed authority fixture for one tool-broker instance: the
+ * tool-broker runtime config, the fs package planted as the one installed
+ * Linux Module (so its installed-component origin is durable in
+ * `installed_component_origins`, which the Worker-start premise origin
+ * foreign key names), and the complete activation premise for it.
+ */
+function authorityWithFsOrigin(
+  identity: RuntimeAuthorityIdentity,
+  runtimeConfig: unknown,
+  packageDigest: string,
+): {
+  bytes: Uint8Array;
+  digest: string;
+  premise: ModuleActivationPremises;
+  origin: InstalledComponentOrigin;
+} {
+  const origin: InstalledComponentOrigin = {
+    schema: "dolly.installed-component-origin/v1",
+    kind: "installed_product_component",
+    component_id: "org.dolly.tools.fs",
+    component_revision: 1,
+    component_digest: packageDigest,
+  };
+  const definitionRecord: Record<string, unknown> = {
+    schema: "dolly.permission-policy-definition/v1",
+    policy_id: "policy-tools",
+    policy_revision: 1,
+    definition_schema_uri: "dolly://schemas/host-permission-policy/v1",
+    definition_schema_digest: `sha256:${"f".repeat(64)}`,
+    definition: { tools: { invoke: true } },
+    origin: {
+      schema: "dolly.policy-definition-origin/v1",
+      kind: "operator_approved_policy",
+      source_id: "org.dolly.policy.default",
+      source_revision: 1,
+      source_digest: `sha256:${"0".repeat(64)}`,
+    },
+    definition_digest: "",
+  };
+  definitionRecord.definition_digest = selfDigest(definitionRecord, "definition_digest");
+  const bindingRecord: Record<string, unknown> = {
+    schema: "dolly.permission-policy-backend-binding/v1",
+    binding_id: "binding-tools",
+    binding_revision: 1,
+    binding_digest: "",
+    policy_id: String(definitionRecord.policy_id),
+    policy_revision: 1,
+    policy_definition_digest: String(definitionRecord.definition_digest),
+    origin,
+  };
+  bindingRecord.binding_digest = selfDigest(bindingRecord, "binding_digest");
+  const candidateRecord: Record<string, unknown> = {
+    schema: "dolly.linux-service-candidate/v1",
+    origin,
+    unit_name: "dolly-fs-tools.service",
+    mode: "user",
+    candidate_digest: "",
+  };
+  candidateRecord.candidate_digest = selfDigest(candidateRecord, "candidate_digest");
+  const selection = {
+    policy_id: String(definitionRecord.policy_id),
+    policy_revision: 1,
+    policy_definition_digest: String(definitionRecord.definition_digest),
+    binding_id: String(bindingRecord.binding_id),
+    binding_revision: 1,
+    binding_digest: String(bindingRecord.binding_digest),
+  };
+  const bytes = canonicalBytes({
+    runtime_config: runtimeConfig,
+    permission_policy_selections: [selection],
+    service_candidate: candidateRecord,
+  });
+  const digest = sha256Bytes(bytes);
+  const premiseRecord: Record<string, unknown> = {
+    schema: "dolly.module-activation-premises/v1",
+    daemon_installation_id: identity.daemonInstallationId,
+    instance_id: identity.instanceId,
+    config_revision: 1,
+    config_digest: digest,
+    permission_policy_definitions: [definitionRecord],
+    permission_policy_backend_bindings: [bindingRecord],
+    service_candidate: candidateRecord,
+    premises_digest: "",
+  };
+  premiseRecord.premises_digest = selfDigest(premiseRecord, "premises_digest");
+  return {
+    bytes: Uint8Array.from(Buffer.from(bytes)),
+    digest,
+    premise: premiseRecord as unknown as ModuleActivationPremises,
+    origin,
+  };
+}
+
 function runtimeConfigDocument(server: unknown): unknown {
   return {
     spec: {
       services: {
         tool_broker: {
           schema: "dolly.tool-broker-config/v1",
-          extension_alias: "org.dolly.tools",
           servers: { fs: server },
         },
       },
@@ -238,6 +343,10 @@ interface PreparedInstance {
   readonly databasePath: string;
   readonly authorityDigest: string;
   readonly daemonInstallationId: string;
+  /** Committed installed-product origin tuple the frozen premise names. */
+  readonly originComponentId: string;
+  readonly originComponentRevision: number;
+  readonly originComponentDigest: string;
   /** Realpath the worker route seals into the premise; undefined when the package is not installed. */
   readonly workingDirectory?: string;
   readonly entrypointPath?: string;
@@ -300,7 +409,7 @@ async function prepareInstance(options: {
     packageDigest,
     executableDigest: installed?.executableDigest ?? `sha256:${"b".repeat(64)}`,
   });
-  const authority = resolvedConfigFixture(runtimeConfigDocument(server));
+  const authority = authorityWithFsOrigin(projectIdentity(instanceId, daemonInstallationId), runtimeConfigDocument(server), packageDigest);
 
   if (options.commitAuthority) {
     const lock = await acquireControllerLock(directories.registryDirectory, instanceId);
@@ -314,8 +423,8 @@ async function prepareInstance(options: {
       identity: projectIdentity(instanceId, daemonInstallationId),
       canonicalConfigBytes: authority.bytes,
       configDigest: authority.digest,
-      premise: null,
-      verifiedOrigins: [],
+      premise: authority.premise,
+      verifiedOrigins: [authority.origin],
     });
     await lock.release();
   }
@@ -328,6 +437,9 @@ async function prepareInstance(options: {
     databasePath,
     authorityDigest: authority.digest,
     daemonInstallationId,
+    originComponentId: "org.dolly.tools.fs",
+    originComponentRevision: 1,
+    originComponentDigest: packageDigest,
     ...(workingDirectory === undefined ? {} : { workingDirectory, entrypointPath }),
     close: async () => {
       rmSync(baseDir, { recursive: true, force: true });
@@ -368,10 +480,12 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
         try {
           const premise = deriveWorkerStartPremise({
             database,
-            extensionAlias: "org.dolly.tools",
+            extensionAlias: "org.dolly.tools.fs",
             serverId: "fs",
             installedPackageRoot: join(prepared.stateDirectory, "authority", "installations"),
-            installedPackagePath: join(prepared.stateDirectory, "authority", "installations", "bin", "dolly-fs-tools.mjs"),
+            originComponentId: prepared.originComponentId,
+            originComponentRevision: prepared.originComponentRevision,
+            originComponentDigest: prepared.originComponentDigest,
           });
           expect(database.installWorkerStartPremise(premise).projected).toBe(true);
         } finally {
@@ -448,14 +562,13 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
     await ensureBuiltDist();
     // Healthy authority + real installation: the shipped bin genuinely
     // invokes the worker-host composition and the reviewed packaged binary is
-    // admitted by digest, so the real child starts under the sealed premise
-    // and refuses inside its typed boundary. The engaged runtime commits the
-    // normalized tool-broker config with `extension_alias`, which the frozen
-    // tool-broker admission schema forbids, so the child's exact refusal is
-    // `WORKER_START_REFUSED` at the durable-premise boundary — never a binary
-    // absence and never a generic failure. The live-Linux-Host proof reason
-    // (`live Linux Host proof refused`) is proven by the packaged lifecycle
-    // suite, whose fixture bypasses that runtime normalization.
+    // admitted by digest. The committed tool-broker config is schema-valid
+    // (no root extension alias), and the sealed premise alias comes only from
+    // the server's authoritative transport.package_id after the Host
+    // installation and immutable origin resolve, so the real child consumes
+    // the premise through every startup gate and refuses exactly at the
+    // live-Linux-Host proof boundary — never binary absence, never a generic
+    // failure.
     const prepared = await prepareInstance({ installPackage: true, commitAuthority: true });
     try {
       const run = await launchCli(["run", "--config", prepared.configPath], {
@@ -464,6 +577,7 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
       });
       expect(run.code, run.stderr + run.stdout).toBe(1);
       expect(run.stderr).toMatch(/WORKER_START_REFUSED/u);
+      expect(run.stderr).toContain("live Linux Host proof refused");
       expect(run.stderr).not.toMatch(/WORKER_HOST_BINARY_ABSENT/u);
       expect(run.stdout).not.toContain("Dolly ready");
       // The owner genuinely reached the process boundary: the premise was
@@ -479,10 +593,12 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
         try {
           const premise = deriveWorkerStartPremise({
             database,
-            extensionAlias: "org.dolly.tools",
+            extensionAlias: "org.dolly.tools.fs",
             serverId: "fs",
             installedPackageRoot: prepared.workingDirectory ?? join(prepared.stateDirectory, "authority", "installations"),
-            installedPackagePath: prepared.entrypointPath ?? join(prepared.stateDirectory, "authority", "installations", "bin", "dolly-fs-tools.mjs"),
+            originComponentId: prepared.originComponentId,
+            originComponentRevision: prepared.originComponentRevision,
+            originComponentDigest: prepared.originComponentDigest,
           });
           expect(database.installWorkerStartPremise(premise).projected).toBe(false);
         } finally {
@@ -574,6 +690,82 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
       await workerHost.close();
       await controllerLock.release();
     } finally {
+      restore();
+      await prepared.close();
+    }
+  }, 600_000);
+  it("waits for stderr completion before mapping a delayed startup refusal", async () => {
+    await ensureBuiltDist();
+    const restore = setWorkerHostInstallVerifierForTests({
+      assertInstallSafety: () => {},
+      verifyDigest: () => {},
+    });
+    const prepared = await prepareInstance({ installPackage: true, commitAuthority: true });
+    let controllerLock: InstanceControllerLock | undefined;
+    let delayedStderr: PassThrough | undefined;
+    let closeObserved = false;
+    let killCalls = 0;
+    try {
+      const spawnForTest: NonNullable<RuntimeWorkerHostOpenOptions["spawn"]> = () => {
+        const stdin = new PassThrough();
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        delayedStderr = stderr;
+        const child = new EventEmitter() as unknown as ChildProcess;
+        let killed = false;
+        Object.assign(child, {
+          stdin,
+          stdout,
+          stderr,
+          pid: 4242,
+          connected: true,
+        });
+        Object.defineProperty(child, "killed", {
+          configurable: true,
+          get: () => killed,
+        });
+        child.kill = () => {
+          killCalls += 1;
+          killed = true;
+          return true;
+        };
+        queueMicrotask(() => {
+          stdout.end();
+          child.emit("exit", 1, null);
+          closeObserved = true;
+          child.emit("close", 1, null);
+        });
+        return child;
+      };
+      controllerLock = await acquireControllerLock(prepared.directories.registryDirectory, prepared.instanceId);
+      const launch = openRuntimeWorkerHost({
+        registryDirectory: prepared.directories.registryDirectory,
+        stateDirectory: prepared.stateDirectory,
+        identity: projectIdentity(prepared.instanceId, prepared.daemonInstallationId),
+        controllerLock,
+        spawn: spawnForTest,
+      });
+      let settled = false;
+      void launch.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      await new Promise<void>((resolveNext) => setImmediate(resolveNext));
+      expect(settled).toBe(false);
+      delayedStderr!.write("WORKER_START_REFUSED: delayed live Host refusal\n");
+      delayedStderr!.end();
+      await expect(launch).rejects.toMatchObject({
+        code: "WORKER_START_REFUSED",
+        message: "WORKER_START_REFUSED: delayed live Host refusal",
+      });
+      expect(closeObserved).toBe(true);
+      expect(killCalls).toBe(0);
+    } finally {
+      if (controllerLock !== undefined) await controllerLock.release();
       restore();
       await prepared.close();
     }

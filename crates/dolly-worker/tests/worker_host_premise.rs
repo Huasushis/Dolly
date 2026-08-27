@@ -38,8 +38,9 @@ use dolly_core_domain::ExtensionId;
 use dolly_protocol::encode_frame;
 use dolly_storage::Database;
 use dolly_storage::host_authority::{
-    ConfigRevisionMapping, HostAuthorityRevision, LinuxServiceCandidate, ModuleActivationPremises,
-    ResolvedConfiguration, RuntimeAuthorityIdentity,
+    ConfigRevisionMapping, HostAuthorityRevision, InstalledComponentOrigin,
+    LinuxServiceCandidate, ModuleActivationPremises, ResolvedConfiguration,
+    RuntimeAuthorityIdentity,
 };
 use dolly_worker::premise::load_worker_start_config;
 use rusqlite::Connection;
@@ -52,7 +53,7 @@ enum HostilePremiseVariant {
     Malformed,
     /// Valid JSON document that is not canonical JCS output.
     NonCanonicalJcs,
-    /// Sealed record naming a different schema than the v1 contract.
+    /// Sealed record naming a different schema than the v2 contract.
     WrongSchema,
 }
 
@@ -64,9 +65,8 @@ struct Fixture {
     instance_id: String,
     config_revision_digest: String,
     package_root: PathBuf,
-    package_path: PathBuf,
+    package_digest: Sha256Digest,
     second_root: PathBuf,
-    second_package_path: PathBuf,
 }
 
 fn digest_of(value: &serde_json::Value) -> Sha256Digest {
@@ -105,15 +105,51 @@ for line in sys.stdin:
     .to_vec()
 }
 
+/// Mirror the registry's composite package identity: the manifest and every
+/// installed file path/digest are sealed together, rather than hashing one
+/// file such as `package.bin`.
+fn composite_package_digest(files: &[(&str, &[u8])]) -> Sha256Digest {
+    let mut file_records: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(path, bytes)| {
+            serde_json::json!({
+                "path": path,
+                "digest": Sha256Digest::compute(bytes).to_canonical_string(),
+            })
+        })
+        .collect();
+    file_records.sort_by(|left, right| {
+        left["path"]
+            .as_str()
+            .expect("file path")
+            .cmp(right["path"].as_str().expect("file path"))
+    });
+    digest_of(&serde_json::json!({
+        "manifest": {
+            "schemaVersion": "dolly.extension-package/1",
+            "extensionId": "org.dolly.tools",
+            "packageVersion": "1.0.0",
+            "displayName": "Dolly test tool",
+            "description": "Worker integration-test package",
+            "supportedProtocolVersions": ["2025-06-18"],
+            "entrypoint": "bin/dolly-fs-tools",
+            "modules": [],
+            "requestedCapabilities": []
+        },
+        "files": file_records
+    }))
+}
+
 /// Install package.bin, server.py, and a long-lived executable (a copy of
 /// the system python3 running server.py) under `root`; returns the real
-/// package and executable byte digests.
+/// composite package and executable byte digests.
 fn install_fake_package(root: &Path) -> (Sha256Digest, Sha256Digest) {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).expect("bin dir");
     let package = b"dolly-fs-tools-package-v1";
     std::fs::write(root.join("package.bin"), package).expect("write package");
-    std::fs::write(root.join("server.py"), fake_server_bytes()).expect("write server.py");
+    let server = fake_server_bytes();
+    std::fs::write(root.join("server.py"), &server).expect("write server.py");
     let executable = bin.join("dolly-fs-tools");
     std::fs::copy("/usr/bin/python3", &executable).expect("copy interpreter");
     #[cfg(unix)]
@@ -125,9 +161,14 @@ fn install_fake_package(root: &Path) -> (Sha256Digest, Sha256Digest) {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).expect("chmod executable");
     }
+    let executable_bytes = std::fs::read(&executable).expect("read executable");
     (
-        Sha256Digest::compute(package),
-        Sha256Digest::compute(&std::fs::read(&executable).expect("read executable")),
+        composite_package_digest(&[
+            ("bin/dolly-fs-tools", &executable_bytes),
+            ("package.bin", package),
+            ("server.py", &server),
+        ]),
+        Sha256Digest::compute(&executable_bytes),
     )
 }
 
@@ -177,7 +218,7 @@ fn fixture_with_premise(insert: bool) -> Fixture {
     );
 
     let origin_record = serde_json::json!({"component": "host-runtime", "revision": 1});
-    let origin = dolly_storage::host_authority::InstalledComponentOrigin {
+    let host_origin = InstalledComponentOrigin {
         schema: "dolly.installed-component-origin/v1".into(),
         kind: "installed_product_component".into(),
         component_id: "org.dolly.host-runtime".into(),
@@ -187,7 +228,7 @@ fn fixture_with_premise(insert: bool) -> Fixture {
     let candidate_record = {
         let mut value = serde_json::json!({
             "schema": "dolly.linux-service-candidate/v1",
-            "origin": serde_json::to_value(&origin).unwrap(),
+            "origin": serde_json::to_value(&host_origin).unwrap(),
             "unit_name": "dollyd.service",
             "mode": "user"
         });
@@ -206,6 +247,21 @@ fn fixture_with_premise(insert: bool) -> Fixture {
         &second_package_digest.to_canonical_string(),
         &second_executable_digest.to_canonical_string(),
     );
+    let first_origin = InstalledComponentOrigin {
+        schema: "dolly.installed-component-origin/v1".into(),
+        kind: "installed_product_component".into(),
+        component_id: "org.dolly.tools".into(),
+        component_revision: 1,
+        component_digest: package_digest.clone(),
+    };
+    let second_origin = InstalledComponentOrigin {
+        schema: "dolly.installed-component-origin/v1".into(),
+        kind: "installed_product_component".into(),
+        component_id: "org.dolly.other".into(),
+        component_revision: 1,
+        component_digest: second_package_digest.clone(),
+    };
+
     let config = ResolvedConfiguration {
         runtime_config: CanonicalJsonValue::try_from(serde_json::json!({
             "spec": {"services": {"tool_broker": {
@@ -255,8 +311,27 @@ fn fixture_with_premise(insert: bool) -> Fixture {
             premise: Some(premise),
         })
         .expect("install authority");
+    for origin in [&first_origin, &second_origin] {
+        let bytes = canonicalize(&serde_json::to_value(origin).expect("origin value"))
+            .expect("origin bytes")
+            .0
+            .into_vec();
+        database
+            .connection_mut()
+            .execute(
+                "INSERT INTO installed_component_origins (
+                     component_id, component_revision, component_digest, record_jcs
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    &origin.component_id,
+                    origin.component_revision,
+                    origin.component_digest.to_canonical_string(),
+                    bytes,
+                ],
+            )
+            .expect("insert package origin");
+    }
     if insert {
-        let package_root = package_root.clone();
         // Test-local exact DDL + raw projection: the storage crate exposes
         // no public Rust schema/write/seal producer surface, so this
         // integration fixture provisions the identical table itself.
@@ -269,7 +344,9 @@ fn fixture_with_premise(insert: bool) -> Fixture {
                     extension_alias     TEXT    NOT NULL CHECK (length(extension_alias) > 0),
                     server_id           TEXT    NOT NULL CHECK (length(server_id) > 0),
                     package_root        TEXT    NOT NULL CHECK (length(package_root) > 0),
-                    package_path        TEXT    NOT NULL CHECK (length(package_path) > 0),
+                    origin_component_id TEXT    NOT NULL,
+                    origin_component_revision INTEGER NOT NULL CHECK (origin_component_revision BETWEEN 1 AND 9007199254740991),
+                    origin_component_digest TEXT NOT NULL,
                     package_digest      TEXT    NOT NULL CHECK (package_digest LIKE 'sha256:%'),
                     executable_digest   TEXT    NOT NULL CHECK (executable_digest LIKE 'sha256:%'),
                     endpoint            TEXT    NOT NULL CHECK (length(endpoint) > 0),
@@ -287,13 +364,17 @@ fn fixture_with_premise(insert: bool) -> Fixture {
                     PRIMARY KEY (config_revision, extension_alias, server_id),
                     FOREIGN KEY (config_revision, config_digest)
                       REFERENCES config_revision_mappings(config_revision, config_digest),
-                    CHECK (substr(package_path, 1, length(package_root) + 1) = package_root || '/')
+                    FOREIGN KEY (origin_component_id, origin_component_revision, origin_component_digest)
+                      REFERENCES installed_component_origins(component_id, component_revision, component_digest),
+                    CHECK (extension_alias = origin_component_id),
+                    CHECK (package_digest = origin_component_digest)
                 );",
             )
             .expect("create premise schema");
         let sealed = |alias: &str,
                       server: &str,
                       root: &Path,
+                      origin: &InstalledComponentOrigin,
                       package: &Sha256Digest,
                       executable: &Sha256Digest,
                       transport: &serde_json::Value| {
@@ -306,7 +387,9 @@ fn fixture_with_premise(insert: bool) -> Fixture {
                 "extension_alias": alias,
                 "server_id": server,
                 "package_root": root.display().to_string(),
-                "package_path": root.join("package.bin").display().to_string(),
+                "origin_component_id": origin.component_id,
+                "origin_component_revision": origin.component_revision,
+                "origin_component_digest": origin.component_digest.to_canonical_string(),
                 "package_digest": package.to_canonical_string(),
                 "executable_digest": executable.to_canonical_string(),
                 "endpoint": "bin/dolly-fs-tools",
@@ -326,6 +409,7 @@ fn fixture_with_premise(insert: bool) -> Fixture {
             "org.dolly.tools",
             "fs",
             &package_root,
+            &first_origin,
             &package_digest,
             &executable_digest,
             &server["transport"],
@@ -342,6 +426,7 @@ fn fixture_with_premise(insert: bool) -> Fixture {
             "org.dolly.other",
             "other-server",
             &second_root,
+            &second_origin,
             &second_package_digest,
             &second_executable_digest,
             &other_server["transport"],
@@ -360,18 +445,21 @@ fn fixture_with_premise(insert: bool) -> Fixture {
                 .execute(
                     "INSERT INTO worker_start_premises (
                         config_revision, config_digest, extension_alias, server_id,
-                        package_root, package_path, package_digest, executable_digest,
+                        package_root, origin_component_id, origin_component_revision,
+                        origin_component_digest, package_digest, executable_digest,
                         endpoint, spawn_args_json, startup_timeout_ms, max_frame_bytes,
                         max_response_bytes, wire_depth, semantic_depth,
                         max_dispatch_members, max_dispatch_depth, transport_digest,
                         record_jcs, record_digest
-                    ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                    ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                     rusqlite::params![
                         config_digest.to_canonical_string(),
                         row["extension_alias"].as_str().expect("string"),
                         row["server_id"].as_str().expect("string"),
                         row["package_root"].as_str().expect("string"),
-                        row["package_path"].as_str().expect("string"),
+                        row["origin_component_id"].as_str().expect("string"),
+                        row["origin_component_revision"].as_i64().expect("int"),
+                        row["origin_component_digest"].as_str().expect("string"),
                         row["package_digest"].as_str().expect("string"),
                         row["executable_digest"].as_str().expect("string"),
                         row["endpoint"].as_str().expect("string"),
@@ -401,9 +489,8 @@ fn fixture_with_premise(insert: bool) -> Fixture {
         instance_id,
         config_revision_digest: config_digest.to_canonical_string(),
         package_root: package_root.clone(),
-        package_path: package_root.join("package.bin"),
+        package_digest,
         second_root: second_root.clone(),
-        second_package_path: second_root.join("package.bin"),
     }
 }
 
@@ -463,7 +550,6 @@ fn sqlite_file_set_snapshot(db_path: &Path) -> Vec<(String, Option<Vec<u8>>)> {
         })
         .collect()
 }
-
 #[cfg(target_os = "linux")]
 #[test]
 fn absent_premise_refuses_before_spawn() {
@@ -533,19 +619,13 @@ fn tampered_premise_refuses_closed() {
     {
         let mut database = Database::open(&fixture.db_path).expect("reopen");
         let connection = database.connection_mut();
-        // Keep the cross-column containment CHECK satisfied so the tamper
-        // reaches the loader's digest verification instead of tripping the
-        // schema guard.
         let updated = connection
             .execute(
-                "UPDATE worker_start_premises SET package_root = ?1,
-                     package_path = ?2 WHERE config_revision = 1
-                       AND extension_alias = 'org.dolly.tools'
-                       AND server_id = 'fs'",
-                rusqlite::params![
-                    fixture.package_root.display().to_string(),
-                    fixture.package_root.join("other.bin").display().to_string(),
-                ],
+                "UPDATE worker_start_premises SET package_root = ?1
+                 WHERE config_revision = 1
+                   AND extension_alias = 'org.dolly.tools'
+                   AND server_id = 'fs'",
+                rusqlite::params![fixture.package_root.join("other").display().to_string()],
             )
             .expect("tamper update");
         assert_eq!(updated, 1, "tamper must touch the projected row");
@@ -556,6 +636,80 @@ fn tampered_premise_refuses_closed() {
     assert!(stdout.is_empty());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn origin_package_mismatch_refuses_before_spawn() {
+    let fixture = fixture_without_effect_journal(true);
+    let mismatch_digest = Sha256Digest::compute(b"origin-package-mismatch");
+    let mismatch_origin = InstalledComponentOrigin {
+        schema: "dolly.installed-component-origin/v1".into(),
+        kind: "installed_product_component".into(),
+        component_id: "org.dolly.tools".into(),
+        component_revision: 2,
+        component_digest: mismatch_digest.clone(),
+    };
+    let connection = Connection::open(&fixture.db_path).expect("reopen raw");
+    connection
+        .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;")
+        .expect("allow hostile premise rewrite");
+    let origin_bytes = canonicalize(&serde_json::to_value(&mismatch_origin).expect("origin value"))
+        .expect("origin bytes")
+        .0
+        .into_vec();
+    connection
+        .execute(
+            "INSERT INTO installed_component_origins (
+                 component_id, component_revision, component_digest, record_jcs
+             ) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                &mismatch_origin.component_id,
+                mismatch_origin.component_revision,
+                mismatch_digest.to_canonical_string(),
+                origin_bytes,
+            ],
+        )
+        .expect("insert mismatch origin");
+    let bytes: Vec<u8> = connection
+        .query_row(
+            "SELECT record_jcs FROM worker_start_premises
+             WHERE config_revision = 1 AND extension_alias = 'org.dolly.tools'
+               AND server_id = 'fs'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read sealed record");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("sealed record JSON");
+    record["origin_component_revision"] = serde_json::json!(2);
+    record["origin_component_digest"] =
+        serde_json::json!(mismatch_digest.to_canonical_string());
+    let mut unsigned = record.as_object().expect("record object").clone();
+    unsigned.remove("record_digest");
+    let record_digest = digest_of(&serde_json::Value::Object(unsigned));
+    record["record_digest"] = serde_json::json!(record_digest.to_canonical_string());
+    let new_bytes = canonicalize(&record).expect("re-sealed record").0.into_vec();
+    connection
+        .execute(
+            "UPDATE worker_start_premises
+             SET origin_component_revision = 2, origin_component_digest = ?1,
+                 record_jcs = ?2, record_digest = ?3
+             WHERE config_revision = 1
+               AND extension_alias = 'org.dolly.tools'
+               AND server_id = 'fs'",
+            rusqlite::params![
+                mismatch_digest.to_canonical_string(),
+                new_bytes,
+                record_digest.to_canonical_string(),
+            ],
+        )
+        .expect("rewrite origin/package mismatch");
+    drop(connection);
+    assert_sealed_contract_mismatch_refuses_before_spawn(
+        &fixture.db_path,
+        &fixture.package_root,
+        "origin/package mismatch",
+    );
+}
 #[test]
 fn derived_config_matches_the_durable_premise_exactly() {
     if !cfg!(target_os = "linux") {
@@ -572,7 +726,23 @@ fn derived_config_matches_the_durable_premise_exactly() {
         "org.dolly.tools".parse::<ExtensionId>().unwrap()
     );
     assert_eq!(config.package_root, fixture.package_root);
-    assert_eq!(config.package_path, fixture.package_path);
+    assert_eq!(config.origin_component_id, "org.dolly.tools");
+    assert_eq!(config.origin_component_revision, 1);
+    assert_eq!(
+        config.origin_component_digest,
+        fixture.package_digest.to_canonical_string()
+    );
+    assert_eq!(
+        config.package_digest,
+        fixture.package_digest.to_canonical_string()
+    );
+    assert_ne!(
+        config.package_digest,
+        Sha256Digest::compute(&std::fs::read(fixture.package_root.join("package.bin")).unwrap())
+            .to_canonical_string(),
+        "package identity must cover the multifile package, not package.bin alone"
+    );
+    assert_eq!(config.endpoint, "bin/dolly-fs-tools");
 }
 
 #[test]
@@ -647,25 +817,22 @@ fn spawn_frame_pump(child: &mut Child) -> mpsc::Receiver<Vec<u8>> {
     receiver
 }
 
-/// Installed package bytes changed after the premise was projected must be
-/// refused closed before any child process exists.
+/// Installed executable bytes changed after the premise was projected must be
+/// refused closed before any child process or Worker schema/effect mutation.
 #[cfg(target_os = "linux")]
 #[test]
-fn tampered_on_disk_package_refuses_closed_before_spawn() {
-    let fixture = fixture_with_premise(true);
-    std::fs::write(&fixture.package_path, b"dolly-fs-tools-package-v1-TAMPERED")
-        .expect("tamper installed package bytes");
-    let (code, stdout, stderr) = run_host(&fixture.db_path);
-    assert_ne!(
-        code,
-        Some(0),
-        "tampered package bytes must not start the host"
+fn tampered_on_disk_executable_refuses_closed_before_spawn() {
+    let fixture = fixture_without_effect_journal(true);
+    std::fs::write(
+        fixture.package_root.join("bin/dolly-fs-tools"),
+        b"dolly-fs-tools-executable-TAMPERED",
+    )
+    .expect("tamper installed executable bytes");
+    assert_sealed_contract_mismatch_refuses_before_spawn(
+        &fixture.db_path,
+        &fixture.package_root,
+        "executable tamper",
     );
-    assert!(
-        stderr.contains("WORKER_START_REFUSED"),
-        "expected typed worker-start refusal, got: {stderr}"
-    );
-    assert!(stdout.is_empty(), "refusal must precede any stdout frame");
 }
 
 /// A stored premise whose sealed record is not decodable JCS bytes must

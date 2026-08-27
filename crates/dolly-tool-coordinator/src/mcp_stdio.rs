@@ -140,7 +140,7 @@ pub struct HostMcpStdioInstalledChildAttestation {
     endpoint: String,
     endpoint_digest: Sha256Digest,
     package_digest: Sha256Digest,
-    package_path: PathBuf,
+    package_root: PathBuf,
     executable_digest: Sha256Digest,
     executable_path: PathBuf,
     transport_digest: Sha256Digest,
@@ -165,7 +165,7 @@ impl HostMcpStdioInstalledChildAttestation {
         endpoint: String,
         endpoint_digest: Sha256Digest,
         package_digest: Sha256Digest,
-        package_path: PathBuf,
+        package_root: PathBuf,
         executable_digest: Sha256Digest,
         executable_path: PathBuf,
         transport_digest: Sha256Digest,
@@ -187,7 +187,7 @@ impl HostMcpStdioInstalledChildAttestation {
             endpoint,
             endpoint_digest,
             package_digest,
-            package_path,
+            package_root,
             executable_digest,
             executable_path,
             transport_digest,
@@ -207,7 +207,7 @@ impl HostMcpStdioInstalledChildAttestation {
     /// digest is carried into the durable initialize Claim before child I/O.
     pub fn attestation_digest(&self) -> Sha256Digest {
         canonicalize(&serde_json::json!({
-            "schema": "dolly.mcp-installed-child-attestation/v1",
+            "schema": "dolly.mcp-installed-child-attestation/v2",
             "server_id": self.server_id,
             "adapter": self.adapter,
             "protocol_version": self.protocol_version,
@@ -215,7 +215,7 @@ impl HostMcpStdioInstalledChildAttestation {
             "endpoint": self.endpoint,
             "endpoint_digest": self.endpoint_digest,
             "package_digest": self.package_digest,
-            "package_path": self.package_path.to_string_lossy(),
+            "package_root": self.package_root.to_string_lossy(),
             "executable_digest": self.executable_digest,
             "executable_path": self.executable_path.to_string_lossy(),
             "transport_digest": self.transport_digest,
@@ -302,10 +302,16 @@ fn installed_child_is_attested(
 ) -> bool {
     #[cfg(target_os = "linux")]
     {
-        let Ok(package) = std::fs::read(&attestation.package_path) else {
+        let Ok(package_root) = std::fs::canonicalize(&attestation.package_root) else {
             return false;
         };
-        if Sha256Digest::compute(&package) != attestation.package_digest {
+        if !package_root.is_dir() {
+            return false;
+        }
+        let Ok(expected_path) = std::fs::canonicalize(&attestation.executable_path) else {
+            return false;
+        };
+        if !expected_path.is_file() || !expected_path.starts_with(&package_root) {
             return false;
         }
         let Ok(actual_link) = std::fs::read_link(format!("/proc/{}/exe", child.id())) else {
@@ -314,13 +320,10 @@ fn installed_child_is_attested(
         let Ok(actual_path) = std::fs::canonicalize(actual_link) else {
             return false;
         };
-        let Ok(expected_path) = std::fs::canonicalize(&attestation.executable_path) else {
-            return false;
-        };
         if actual_path != expected_path {
             return false;
         }
-        let Ok(executable) = std::fs::read(actual_path) else {
+        let Ok(executable) = std::fs::read(&expected_path) else {
             return false;
         };
         Sha256Digest::compute(&executable) == attestation.executable_digest
@@ -1254,8 +1257,11 @@ mod tests {
             transport_kind: MCP_STDIO_KIND.to_owned(),
             endpoint,
             endpoint_digest,
+            package_root: executable_path
+                .parent()
+                .expect("executable package root")
+                .to_path_buf(),
             package_digest: artifact_digest.clone(),
-            package_path: executable_path.clone(),
             executable_digest: artifact_digest,
             executable_path,
             transport_digest:

@@ -45,7 +45,9 @@ pub struct WorkerStartConfig {
     pub extension_alias: ExtensionId,
     pub server_id: String,
     pub package_root: PathBuf,
-    pub package_path: PathBuf,
+    pub origin_component_id: String,
+    pub origin_component_revision: i64,
+    pub origin_component_digest: String,
     pub package_digest: String,
     pub executable_digest: String,
     pub endpoint: String,
@@ -196,7 +198,9 @@ fn bind_premise_fields(
         || durable_premise.extension_alias != config.extension_alias.as_str()
         || durable_premise.server_id != config.server_id
         || Some(durable_premise.package_root.as_str()) != config.package_root.to_str()
-        || Some(durable_premise.package_path.as_str()) != config.package_path.to_str()
+        || durable_premise.origin_component_id != config.origin_component_id
+        || durable_premise.origin_component_revision != config.origin_component_revision
+        || durable_premise.origin_component_digest != config.origin_component_digest
         || durable_premise.package_digest != config.package_digest
         || durable_premise.executable_digest != config.executable_digest
         || durable_premise.endpoint != config.endpoint
@@ -309,7 +313,9 @@ impl Worker {
             || durable_premise.extension_alias != config.extension_alias.as_str()
             || durable_premise.server_id != config.server_id
             || Some(durable_premise.package_root.as_str()) != config.package_root.to_str()
-            || Some(durable_premise.package_path.as_str()) != config.package_path.to_str()
+            || durable_premise.origin_component_id != config.origin_component_id
+            || durable_premise.origin_component_revision != config.origin_component_revision
+            || durable_premise.origin_component_digest != config.origin_component_digest
             || durable_premise.package_digest != config.package_digest
             || durable_premise.executable_digest != config.executable_digest
             || durable_premise.endpoint != config.endpoint
@@ -380,8 +386,15 @@ impl Worker {
         // effect: every authority-bearing launch field below is sealed and
         // consumed from the sealed contract alone.
         let sealed = bind_sealed_runtime_contract(&config, &durable_server)?;
+        if config.origin_component_id != config.extension_alias.as_str()
+            || config.origin_component_digest != config.package_digest
+            || !(1..=9_007_199_254_740_991_i64).contains(&config.origin_component_revision)
+        {
+            return Err(WorkerError::Premise(
+                "installed-component origin identity disagrees with the installed package".into(),
+            ));
+        }
         let package_root = canonical_directory(&config.package_root)?;
-        let package_path = canonical_file(&config.package_path, "package")?;
         let executable_path = package_root.join(&durable_server.endpoint);
         let executable_path = canonical_file(&executable_path, "executable")?;
         if !executable_path.starts_with(&package_root) {
@@ -389,11 +402,6 @@ impl Worker {
                 "stdio executable escapes the installed package root".into(),
             ));
         }
-        verify_digest(
-            &package_path,
-            &durable_server.package_digest,
-            "installed package",
-        )?;
         verify_digest(
             &executable_path,
             &durable_server.executable_digest,
@@ -489,7 +497,7 @@ impl Worker {
             durable_server.endpoint.clone(),
             durable_server.endpoint_digest.clone(),
             durable_server.package_digest.clone(),
-            package_path,
+            package_root.clone(),
             durable_server.executable_digest.clone(),
             executable_path,
             sealed.transport_digest.clone(),

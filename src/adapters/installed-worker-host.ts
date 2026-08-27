@@ -48,19 +48,42 @@ const CONTROL_MAX_FRAME_BYTES = 262_144;
  * refuses a substituted binary before spawn.
  */
 export const REVIEWED_WORKER_HOST_DIGEST =
-  "sha256:ced65b28f7bacbdf233c5f712c8ab68a0e462b640d1df538d1def27aa40211ba";
+  "sha256:43125710bae56880814754184dc7154c2021414663cf4284b055512dd4403133";
 /** Bounded diagnostics: retain at most this many stderr bytes. */
 const STDERR_TAIL_BYTES = 8192;
 /** Deadline for the mandatory first `started` frame. */
 const STARTED_TIMEOUT_MS = 10_000;
 /** Deadline for one bounded `status` reply. */
 const STATUS_TIMEOUT_MS = 10_000;
+/**
+ * Parse the final bounded stderr line without accepting a substring, partial
+ * line, or repeated refusal. The Rust producer's fixed diagnostic prefix is
+ * normalized to the adapter's exact refusal line before parsing.
+ */
+function parseWorkerStartRefusal(stderrTail: Buffer): string | undefined {
+  const text = stderrTail.toString("utf8");
+  const withoutTrailingLf = text.endsWith("\n") ? text.slice(0, -1) : text;
+  const lines = withoutTrailingLf.split("\n");
+  const finalLine = lines.at(-1);
+  if (finalLine === undefined || finalLine === "") return undefined;
+  const rustPrefix = "dolly-worker-host: [WORKER_START_REFUSED] ";
+  const canonicalLine = finalLine.startsWith(rustPrefix)
+    ? `WORKER_START_REFUSED: ${finalLine.slice(rustPrefix.length)}`
+    : finalLine;
+  const match = /^WORKER_START_REFUSED: ([^\r\n]+)$/u.exec(canonicalLine);
+  if (match === null || match[1].trim() === "") return undefined;
+  if (lines.slice(0, -1).some((line) => line.includes("WORKER_START_REFUSED"))) {
+    return undefined;
+  }
+  return match[1];
+}
 
 export class InstalledWorkerHostError extends Error {
   constructor(
     readonly code:
       | "WORKER_HOST_BINARY_ABSENT"
       | "WORKER_PREMISE_REFUSED"
+      | "WORKER_START_REFUSED"
       | "WORKER_START_INVALID"
       | "WORKER_START_TIMEOUT",
     message: string,
@@ -295,12 +318,20 @@ export async function launchInstalledWorkerHost(
     env: {},
   });
 
-  // 4. Attach ONE error and ONE exit observer IMMEDIATELY after spawn —
+  // 4. Attach error, exit, and close observers IMMEDIATELY after spawn —
   //    before any stdio validation — so ENOENT/launch failures and exits can
-  //    never hang a launch. Node may emit error+close without exit (ENOENT);
-  //    the close waiter resolves exactly once either way.
-  let exited = false;
+  //    never hang a launch. The close observer only records reaping; startup
+  //    refusal precedence is finalized after stderr completes.
+  let exitCode: number | null | undefined;
+  let exitSignal: NodeJS.Signals | null | undefined;
   let spawnError: Error | undefined;
+  let terminationRequested = false;
+  let startupGatePending = false;
+  let stdoutEnded = false;
+  let stderrComplete = false;
+  let stderrInvalid = false;
+  let stderrEnded = false;
+  let stderrClosed = false;
   type PendingReply = {
     resolve: (message: JsonValue) => void;
     reject: (error: InstalledWorkerHostError) => void;
@@ -310,47 +341,84 @@ export async function launchInstalledWorkerHost(
   let stopped = false;
   let stopAcknowledged = false;
 
-  function rejectPending(detail: string): void {
+  let closed = false;
+  let stderrTail: Buffer = Buffer.alloc(0);
+
+  function requestTermination(): void {
+    if (!closed && !child.killed) {
+      terminationRequested = true;
+      child.kill();
+    }
+  }
+
+  function rejectPending(errorOrDetail: InstalledWorkerHostError | string): void {
     const pending = pendingReply;
     pendingReply = undefined;
     if (pending) {
-      if (pending.deadline) clearTimeout(pending.deadline);
+      clearTimeout(pending.deadline);
       pending.reject(
-        new InstalledWorkerHostError("WORKER_START_INVALID", stderrDiagnostics(detail)),
+        typeof errorOrDetail === "string"
+          ? new InstalledWorkerHostError("WORKER_START_INVALID", stderrDiagnostics(errorOrDetail))
+          : errorOrDetail,
       );
     }
   }
 
-  let closed = false;
+  function finalizeStartupIfReady(): void {
+    if (
+      !closed ||
+      !stderrComplete ||
+      stderrInvalid ||
+      !startupGatePending ||
+      pendingReply === undefined
+    ) {
+      return;
+    }
+    if (spawnError !== undefined) {
+      rejectPending(
+        new InstalledWorkerHostError(
+          "WORKER_HOST_BINARY_ABSENT",
+          `worker_host failed to launch: ${spawnError.message}`,
+        ),
+      );
+      return;
+    }
+    const naturalExit =
+      !terminationRequested &&
+      !child.killed &&
+      exitCode !== undefined &&
+      exitCode !== null &&
+      exitCode !== 0 &&
+      exitSignal === null;
+    const refusalReason = naturalExit
+      ? parseWorkerStartRefusal(stderrTail)
+      : undefined;
+    rejectPending(
+      refusalReason === undefined
+        ? "worker_host closed stdout before starting"
+        : new InstalledWorkerHostError("WORKER_START_REFUSED", refusalReason),
+    );
+  }
+
   const closeWaiter: Promise<void> = new Promise<void>((resolveClose) => {
-    child.once("close", (code, signal) => {
+    child.once("close", () => {
       closed = true;
-      // ENOENT-style failures emit error+close without exit; close alone
-      // settles the waiter so nothing waits forever. A pending reply at this
-      // point was required and can never arrive.
-      if (pendingReply !== undefined) {
-        rejectPending("worker_host stdio closed before replying");
-      }
       resolveClose();
+      finalizeStartupIfReady();
     });
   });
   child.once("exit", (code, signal) => {
-    exited = true;
-    if (!closed) {
-      rejectPending(
-        `worker_host exited before replying (${code ?? signal ?? "unknown"})`,
-      );
-    }
+    exitCode = code;
+    exitSignal = signal;
   });
   child.once("error", (error) => {
     spawnError = error;
-    rejectPending(`worker_host failed to launch: ${error.message}`);
   });
 
   // Missing piped stdio cannot run the protocol: terminate via the attached
   // waiter and refuse.
   if (!child.stdin || !child.stdout || !child.stderr) {
-    if (!child.killed) child.kill();
+    requestTermination();
     await closeWaiter;
     throw new InstalledWorkerHostError(
       "WORKER_START_INVALID",
@@ -360,7 +428,6 @@ export async function launchInstalledWorkerHost(
 
   // 5. Bounded stderr tail: retain exactly the last <= STDERR_TAIL_BYTES
   // bytes as a single buffer.
-  let stderrTail: Buffer = Buffer.alloc(0);
   child.stderr.on("data", (chunk: Buffer) => {
     // Reduce an arbitrarily large chunk to its own last <=8192 bytes first,
     // then append only the required suffix of old-tail + reduced-chunk.
@@ -378,10 +445,31 @@ export async function launchInstalledWorkerHost(
     }
     stderrTail = piece;
   });
+  child.stderr.once("end", () => {
+    stderrEnded = true;
+    if (stderrClosed && !stderrInvalid) {
+      stderrComplete = true;
+      finalizeStartupIfReady();
+    }
+  });
+  child.stderr.once("close", () => {
+    stderrClosed = true;
+    if (!stderrEnded) {
+      stderrInvalid = true;
+      return;
+    }
+    if (!stderrInvalid) {
+      stderrComplete = true;
+      finalizeStartupIfReady();
+    }
+  });
+  child.stderr.once("error", () => {
+    stderrInvalid = true;
+  });
 
   /** Kill-and-reap: kills if needed and resolves on observed close/exit. */
   async function killAndReap(): Promise<void> {
-    if (!closed && !child.killed) child.kill();
+    requestTermination();
     await closeWaiter;
   }
 
@@ -395,7 +483,7 @@ export async function launchInstalledWorkerHost(
     const pending = pendingReply;
     pendingReply = undefined;
     if (pending) {
-      if (pending.deadline) clearTimeout(pending.deadline);
+      clearTimeout(pending.deadline);
       pending.reject(
         new InstalledWorkerHostError("WORKER_START_INVALID", stderrDiagnostics(detail)),
       );
@@ -406,6 +494,8 @@ export async function launchInstalledWorkerHost(
   // Startup gate registered BEFORE the channel attaches: a fast `started`
   // frame is consumed by this slot, not classified unsolicited.
   const startedGate = awaitReply(STARTED_TIMEOUT_MS);
+  startupGatePending = true;
+  finalizeStartupIfReady();
 
   const channel = new FramedJsonChannel(child.stdout, child.stdin, {
     maxFrameBytes: CONTROL_MAX_FRAME_BYTES,
@@ -418,20 +508,15 @@ export async function launchInstalledWorkerHost(
         return;
       }
       pendingReply = undefined;
-      if (pending.deadline) clearTimeout(pending.deadline);
+      clearTimeout(pending.deadline);
       pending.resolve(message);
     },
     onError: (error) => {
       failPending(error.message);
-      if (!stopAcknowledged && !child.killed) child.kill();
+      requestTermination();
     },
     onEnd: () => {
-      // Normal EOF is accepted only after an exact `stopped` acknowledgement;
-      // every earlier end-of-stream is fatal.
-      if (!(stopped && stopAcknowledged)) {
-        failPending("worker_host closed stdout before stopping");
-        if (!stopAcknowledged && !child.killed) child.kill();
-      }
+      stdoutEnded = true;
     },
   });
 
@@ -456,7 +541,7 @@ export async function launchInstalledWorkerHost(
       const deadline = setTimeout(() => {
         if (pendingReply?.resolve === onMessage) {
           pendingReply = undefined;
-          if (!child.killed) child.kill();
+          requestTermination();
         }
         settled = true;
         rejectReply(
@@ -511,12 +596,22 @@ export async function launchInstalledWorkerHost(
       { v: 1, event: "started", server_id: premise.serverId },
       "started",
     );
+    if (stdoutEnded || closed) {
+      throw new InstalledWorkerHostError(
+        "WORKER_START_INVALID",
+        "worker_host closed stdout before stopping",
+      );
+    }
   } catch (error) {
-    if (!closed && !child.killed) child.kill();
+    startupGatePending = false;
+    requestTermination();
     await closeWaiter;
     throw error;
   }
+  startupGatePending = false;
   if (spawnError) {
+    requestTermination();
+    await closeWaiter;
     throw new InstalledWorkerHostError(
       "WORKER_HOST_BINARY_ABSENT",
       `worker_host failed to launch: ${spawnError.message}`,
@@ -552,6 +647,14 @@ export async function launchInstalledWorkerHost(
         );
       }
       return enqueue(async () => {
+        if (stdoutEnded || closed) {
+          requestTermination();
+          await closeWaiter;
+          throw new InstalledWorkerHostError(
+            "WORKER_START_INVALID",
+            "worker_host closed stdout before stopping",
+          );
+        }
         // ENTIRE operation covered — pending registration, send, await,
         // validation. ANY failure terminates and reaps before the original
         // typed error propagates.
@@ -580,7 +683,7 @@ export async function launchInstalledWorkerHost(
           );
           return raw as { v: number; event: string; state: string; server_id: string };
         } catch (error) {
-          if (!closed && !child.killed) child.kill();
+          requestTermination();
           await closeWaiter;
           throw error;
         }
@@ -590,6 +693,14 @@ export async function launchInstalledWorkerHost(
       if (stopPromise) return stopPromise;
       stopped = true;
       stopPromise = enqueue(async () => {
+        if (stdoutEnded || closed) {
+          requestTermination();
+          await closeWaiter;
+          throw new InstalledWorkerHostError(
+            "WORKER_START_INVALID",
+            "worker_host closed stdout before stopping",
+          );
+        }
         try {
           const replyPromise = awaitReply(STATUS_TIMEOUT_MS);
           try {
@@ -613,7 +724,7 @@ export async function launchInstalledWorkerHost(
         } catch (firstError) {
           // Protocol or timeout failure: terminate, reap, then propagate
           // the ORIGINAL typed error (never converted to success).
-          if (!closed && !child.killed) child.kill();
+          requestTermination();
           await closeWaiter;
           throw firstError;
         }
@@ -628,7 +739,7 @@ export async function launchInstalledWorkerHost(
           });
         });
         if (!closedInTime) {
-          if (!closed && !child.killed) child.kill();
+          requestTermination();
           await closeWaiter;
           throw new InstalledWorkerHostError(
             "WORKER_START_INVALID",
