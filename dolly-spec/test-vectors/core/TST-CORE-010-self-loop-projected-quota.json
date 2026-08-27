@@ -33,7 +33,7 @@
       },
       "activation": {
         "module_id": "worker",
-        "state": "commit_blocked",
+        "state": "result_staged",
         "cursor_span": {"page_id": "loop-control", "from_page_seq": 1, "to_page_seq": 2},
         "output_page_ids": ["loop-control"],
         "candidate_output_canonical_bytes": 128
