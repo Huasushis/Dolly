@@ -445,6 +445,33 @@ impl CoreTransaction for SqliteCoreTransaction<'_> {
             if transition.state != *loaded_state {
                 return Err(StorageError::Corrupt);
             }
+            if !self.operation_written
+                && !self.expected_command_id.as_deref().unwrap_or("").is_empty()
+            {
+                let command_id = self
+                    .expected_command_id
+                    .clone()
+                    .ok_or(StorageError::Corrupt)?;
+                let request_digest = self.request_digest.clone().ok_or(StorageError::Corrupt)?;
+                let (transition_bytes, transition_digest) = canonical_digest(transition)?;
+                let state_revision = self.loaded_state_revision.ok_or(StorageError::Corrupt)?;
+                self.transaction_mut()?
+                    .execute(
+                        "INSERT INTO core_operations
+                         (command_id, request_digest, transition_digest, transition_jcs, state_revision)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            command_id,
+                            request_digest,
+                            transition_digest,
+                            transition_bytes,
+                            state_revision
+                        ],
+                    )
+                    .map_err(map_sqlite_error)?;
+                self.operation_written = true;
+            }
+            self.journal_appended = true;
             return Ok(());
         }
         let (state_bytes, state_hash) = encode_projection(&transition.state)?;
@@ -602,8 +629,8 @@ impl<'connection> SqliteCoreStore<'connection> {
             return Ok(replayed);
         }
         let transition = reduce(&snapshot, command, input);
+        transaction.compare_and_apply(&transition)?;
         if transition.outcome != TransitionOutcome::RolledBack {
-            transaction.compare_and_apply(&transition)?;
             transaction.append_journal(&transition.events)?;
         }
         transaction.commit()?;
@@ -665,6 +692,58 @@ mod tests {
         let _ = tx.compare_and_apply(&tmpl());
         let _ = tx.append_journal(&[]);
         assert!(tx.commit().is_ok());
+    }
+
+    #[test]
+    fn rolled_back_transition_replay_is_identity_bound() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        let mut store = SqliteCoreStore::new(&mut connection).expect("core schema");
+        let input = EnvironmentInput {
+            now: "2026-08-27T00:00:00Z".into(),
+            ..Default::default()
+        };
+        let issue = CoreCommand::IssueLease(dolly_core_reducer::IssueLeaseCommand {
+            command_id: "rollback-issue".into(),
+            activation_id: "activation-later".into(),
+            lease_id: "lease-1".into(),
+            token_digest: "sha256:token".into(),
+            extension_connection_id: "connection-1".into(),
+            worker_epoch: 1,
+            extension_generation: None,
+        });
+
+        let rollback = store.transact(&issue, &input).expect("rollback transition");
+        assert_eq!(rollback.outcome, TransitionOutcome::RolledBack);
+        assert!(rollback.events.is_empty());
+        assert_eq!(store.snapshot().expect("rollback snapshot"), empty_core_snapshot());
+
+        let build = CoreCommand::BuildManifest(dolly_core_reducer::BuildManifestCommand {
+            command_id: "build-later".into(),
+            activation_id: "activation-later".into(),
+            manifest: serde_json::json!({"producer":"later"}),
+            expected_graph_revision: None,
+            expected_descriptor_revision: None,
+        });
+        let built = store.transact(&build, &input).expect("later manifest");
+        assert_eq!(built.outcome, TransitionOutcome::Committed);
+        let after_build = store.snapshot().expect("built snapshot");
+
+        let replay = store.transact(&issue, &input).expect("rollback replay");
+        assert_eq!(replay, rollback);
+        assert_eq!(store.snapshot().expect("replay snapshot"), after_build);
+
+        let different_request = match &issue {
+            CoreCommand::IssueLease(command) => {
+                let mut command = command.clone();
+                command.lease_id = "lease-2".into();
+                CoreCommand::IssueLease(command)
+            }
+            _ => unreachable!("issue command shape"),
+        };
+        assert_eq!(
+            store.transact(&different_request, &input).unwrap_err(),
+            StorageError::IdempotencyConflict
+        );
     }
 
     fn tmpl() -> Transition {
