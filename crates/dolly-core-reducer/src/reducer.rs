@@ -1416,7 +1416,11 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             let Some(item) = next.activations.get(&c.activation_id) else {
                 return failure(state, "ACTIVATION_RESULT_NOT_STAGED", false, None);
             };
-            if item.state != ActivationState::ResultStaged || item.staged_result.is_none() {
+            if !matches!(
+                item.state,
+                ActivationState::ResultStaged | ActivationState::CommitBlocked
+            ) || item.staged_result.is_none()
+            {
                 return failure(state, "ACTIVATION_RESULT_NOT_STAGED", false, None);
             }
             let staged = item.staged_result.clone().unwrap();
@@ -1467,11 +1471,21 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             let projected = projected_pending(&next, &staged);
             if let Some(limit) = staged.page_limit.filter(|limit| projected > *limit) {
                 if staged.projected_admission_entries > limit {
-                    return failure(
-                        state,
-                        "ACTIVATION_COMMIT_BLOCKED",
-                        true,
-                        Some(json!({"projected_admission_entries":projected})),
+                    let item = next.activations.get_mut(&c.activation_id).unwrap();
+                    item.state = ActivationState::CommitBlocked;
+                    item.authoritative_disposition = Some(ActivationState::CommitBlocked);
+                    return success(
+                        next,
+                        Vec::new(),
+                        None,
+                        Some(CoreError {
+                            code: "ACTIVATION_COMMIT_BLOCKED".into(),
+                            retryable: true,
+                            outcome: ErrorOutcome::Applied,
+                            details: Some(
+                                json!({"projected_admission_entries":projected}),
+                            ),
+                        }),
                     );
                 }
                 return failure(

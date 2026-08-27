@@ -26,6 +26,7 @@ pub enum ActivationState {
     Dispatched,
     Fencing,
     ResultStaged,
+    CommitBlocked,
     Committed,
     RetryWait,
     Quarantined,
