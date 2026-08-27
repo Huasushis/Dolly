@@ -1021,7 +1021,7 @@ fn execute(vector: &Value) -> (Value, Value, String, Vec<Value>) {
                 |_| {},
             );
             let outcome = if applied.state.activations["a"].state == ActivationState::Committed
-                && blocked.error.as_ref().unwrap().code == "PAGE_QUOTA_EXCEEDED"
+                && blocked.error.as_ref().unwrap().code == "ACTIVATION_COMMIT_BLOCKED"
             {
                 "committed_with_projected_pending_count_one"
             } else {

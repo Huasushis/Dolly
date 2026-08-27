@@ -1585,30 +1585,22 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                 }
             }
             let projected = projected_pending(&next, &staged);
-            if let Some(limit) = staged.page_limit.filter(|limit| projected > *limit) {
-                if staged.projected_admission_entries > limit {
-                    let item = next.activations.get_mut(&c.activation_id).unwrap();
-                    item.state = ActivationState::CommitBlocked;
-                    item.authoritative_disposition = Some(ActivationState::CommitBlocked);
-                    return success(
-                        next,
-                        Vec::new(),
-                        None,
-                        Some(CoreError {
-                            code: "ACTIVATION_COMMIT_BLOCKED".into(),
-                            retryable: true,
-                            outcome: ErrorOutcome::Applied,
-                            details: Some(
-                                json!({"projected_admission_entries":projected}),
-                            ),
-                        }),
-                    );
-                }
-                return failure(
-                    state,
-                    "PAGE_QUOTA_EXCEEDED",
-                    true,
-                    Some(json!({"projected_admission_entries":projected})),
+            if staged.page_limit.is_some_and(|limit| projected > limit) {
+                let item = next.activations.get_mut(&c.activation_id).unwrap();
+                item.state = ActivationState::CommitBlocked;
+                item.authoritative_disposition = Some(ActivationState::CommitBlocked);
+                return success(
+                    next,
+                    Vec::new(),
+                    None,
+                    Some(CoreError {
+                        code: "ACTIVATION_COMMIT_BLOCKED".into(),
+                        retryable: true,
+                        outcome: ErrorOutcome::Applied,
+                        details: Some(
+                            json!({"projected_admission_entries":projected}),
+                        ),
+                    }),
                 );
             }
             for (id, expected) in &staged.expected_cursors {
