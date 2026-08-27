@@ -1211,30 +1211,6 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             if !result_binding_valid(&next, c, input) {
                 return failure(state, "ACTIVATION_FENCE_INVALID", false, None);
             }
-            if c.result
-                .as_ref()
-                .is_some_and(|value| !verified_digest(value, &c.result_digest))
-            {
-                events.push(record_quarantine(
-                    &mut next,
-                    &c.command_id,
-                    &c.activation_id,
-                    "ACTIVATION_RESULT_DIGEST_MISMATCH",
-                    false,
-                    "ModuleQuarantined",
-                ));
-                return success(
-                    next,
-                    events,
-                    None,
-                    Some(CoreError {
-                        code: "ACTIVATION_RESULT_DIGEST_MISMATCH".into(),
-                        retryable: false,
-                        outcome: ErrorOutcome::Applied,
-                        details: None,
-                    }),
-                );
-            }
             let existing = next
                 .activations
                 .get(&c.activation_id)
@@ -1269,6 +1245,31 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                     None,
                     Some(CoreError {
                         code: "ACTIVATION_RESULT_CONFLICT".into(),
+                        retryable: false,
+                        outcome: ErrorOutcome::Applied,
+                        details: None,
+                    }),
+                );
+            }
+            if !c
+                .result
+                .as_ref()
+                .is_some_and(|value| verified_digest(value, &c.result_digest))
+            {
+                events.push(record_quarantine(
+                    &mut next,
+                    &c.command_id,
+                    &c.activation_id,
+                    "ACTIVATION_RESULT_DIGEST_MISMATCH",
+                    false,
+                    "ModuleQuarantined",
+                ));
+                return success(
+                    next,
+                    events,
+                    None,
+                    Some(CoreError {
+                        code: "ACTIVATION_RESULT_DIGEST_MISMATCH".into(),
                         retryable: false,
                         outcome: ErrorOutcome::Applied,
                         details: None,

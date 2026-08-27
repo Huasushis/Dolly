@@ -809,6 +809,63 @@ fn result_and_replay_authority_require_exact_execution_bindings() {
 }
 
 #[test]
+fn first_result_requires_canonical_payload_digest() {
+    let missing_digest = "arbitrary";
+    let missing_command = CoreCommand::ReceiveResult(ReceiveResultCommand {
+        command_id: "missing-result".into(),
+        activation_id: "a".into(),
+        lease_id: "l".into(),
+        result_digest: missing_digest.into(),
+        status: ReceiveResultStatus::Success,
+        result: None,
+    });
+    let mut missing_input = input();
+    missing_input.host_result_verification = Some(result_proof(missing_digest));
+    let quarantined = reduce(
+        &leased(ActivationState::Dispatched, None),
+        &missing_command,
+        &missing_input,
+    );
+    assert_eq!(quarantined.outcome, TransitionOutcome::Committed);
+    assert_eq!(
+        quarantined.error.as_ref().map(|error| error.code.as_str()),
+        Some("ACTIVATION_RESULT_DIGEST_MISMATCH")
+    );
+    assert_eq!(
+        quarantined.state.activations["a"].state,
+        ActivationState::Quarantined
+    );
+
+    let payload = json!({"status":"ok"});
+    let payload_digest = digest(&payload);
+    let valid_command = CoreCommand::ReceiveResult(ReceiveResultCommand {
+        command_id: "valid-result".into(),
+        activation_id: "a".into(),
+        lease_id: "l".into(),
+        result_digest: payload_digest.clone(),
+        status: ReceiveResultStatus::Success,
+        result: Some(payload),
+    });
+    let mut valid_input = input();
+    valid_input.host_result_verification = Some(result_proof(&payload_digest));
+    let staged = reduce(
+        &leased(ActivationState::Dispatched, None),
+        &valid_command,
+        &valid_input,
+    );
+    assert!(staged.error.is_none());
+    assert_eq!(
+        staged.state.activations["a"].state,
+        ActivationState::ResultStaged
+    );
+    assert!(staged.state.activations["a"].staged_result.is_some());
+    assert_eq!(
+        staged.state.activations["a"].result_digest.as_deref(),
+        Some(payload_digest.as_str())
+    );
+}
+
+#[test]
 fn invalid_dispositions_recovery_and_quarantine_resolution_preserve_state() {
     for command in [
         CoreCommand::DeadLetterRange(DeadLetterRangeCommand {
