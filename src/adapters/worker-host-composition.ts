@@ -501,8 +501,6 @@ export interface RuntimeWorkerHostOpenOptions {
   /** The instance state root that also holds the legacy Core state. */
   readonly stateDirectory: string;
   readonly identity: RuntimeAuthorityIdentity;
-  /** The tool-broker extension identity the daemon assigned to this worker. */
-  readonly extensionAlias: string;
   /** The live controller lock the Runtime Worker already holds for the instance. */
   readonly controllerLock: InstanceControllerLock;
   /** Process-boundary injection (deterministic tests only). */
@@ -520,9 +518,9 @@ export interface RuntimeWorkerHost {
  * Server identifiers in the ONE committed authority revision, or refusal when
  * an engaged worker route finds no committed current configuration.
  */
-function configuredWorkerServerIds(
+function toolBrokerContract(
   snapshot: CurrentAuthoritySnapshot | null,
-): readonly string[] {
+): { readonly extensionAlias: string; readonly serverIds: readonly string[] } | null {
   if (snapshot === null) {
     throw new InstalledWorkerHostError(
       "WORKER_START_INVALID",
@@ -550,19 +548,20 @@ function configuredWorkerServerIds(
     "runtime config spec",
   );
   if (!("tool_broker" in services)) {
-    return [];
+    return null;
   }
   const toolBroker = objectField(
     requireField(services, "tool_broker", "runtime services"),
     "tool_broker",
     "runtime services",
   );
+  const extensionAlias = requireString(toolBroker, "extension_alias", "tool-broker config");
   const servers = objectField(
     requireField(toolBroker, "servers", "tool-broker config"),
     "servers",
     "tool-broker config",
   );
-  return Object.keys(servers).sort();
+  return { extensionAlias, serverIds: Object.keys(servers).sort() };
 }
 
 function assertRuntimeWorkerHostOpenOptions(
@@ -584,13 +583,11 @@ function assertRuntimeWorkerHostOpenOptions(
     typeof options.registryDirectory !== "string" ||
     options.registryDirectory.length === 0 ||
     typeof options.stateDirectory !== "string" ||
-    options.stateDirectory.length === 0 ||
-    typeof options.extensionAlias !== "string" ||
-    options.extensionAlias.length === 0
+    options.stateDirectory.length === 0
   ) {
     throw new InstalledWorkerHostError(
       "WORKER_START_INVALID",
-      "Runtime Worker host requires the instance roots and extension alias",
+      "Runtime Worker host requires the instance roots",
     );
   }
   if (
@@ -633,8 +630,8 @@ export async function openRuntimeWorkerHost(
   });
   let owner: HostWorkerHostOwner;
   try {
-    const serverIds = configuredWorkerServerIds(database.readCurrentConfig());
-    if (serverIds.length === 0) {
+    const census = toolBrokerContract(database.readCurrentConfig());
+    if (census === null || census.serverIds.length === 0) {
       owner = Object.freeze({
         serverIds: Object.freeze([] as string[]),
         handles: Object.freeze([]),
@@ -653,8 +650,8 @@ export async function openRuntimeWorkerHost(
         controller: options.controllerLock,
         origins,
         installations,
-        extensionAlias: options.extensionAlias,
-        serverIds,
+        extensionAlias: census.extensionAlias,
+        serverIds: census.serverIds,
         ...(options.spawn === undefined ? {} : { spawn: options.spawn }),
       });
     }

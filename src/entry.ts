@@ -18,8 +18,11 @@ import {
   type RuntimeWorkerHost,
 } from "./adapters/worker-host-composition.js";
 import { InstalledWorkerHostError } from "./adapters/installed-worker-host.js";
-
 import { projectRuntimeInstanceStableId } from "./core/runtime-authority-identities.js";
+import {
+  DaemonConfigError,
+  DaemonConfigStore,
+} from "./daemon/daemon-config.js";
 import {
   defaultDollyRuntimeDirectories,
   openDollyRuntime,
@@ -95,16 +98,6 @@ export interface DollyCliContext {
   readonly stderr?: TextOutput;
   /** Test and embedding hook. The default waits for SIGINT or SIGTERM. */
   readonly waitForShutdown?: (session: DollyRuntimeSession) => Promise<void>;
-  /**
-   * Set when dollyd launches this per-instance Runtime Worker: the daemon
-   * installation identity and the tool-broker extension alias this worker
-   * owns. When absent the worker-host route is not engaged and `run` is the
-   * legacy-only runtime.
-   */
-  readonly runtimeWorker?: {
-    readonly daemonInstallationId: string;
-    readonly extensionAlias: string;
-  };
 }
 
 function createPublicRuntimeSession(
@@ -436,8 +429,12 @@ async function execute(
     if (parsed.positionals.length !== 1) {
       throw new DollyCliError("CLI_ARGUMENT_INVALID", "Usage: dolly run [--config <path>]");
     }
-    const runtimeWorker = context.runtimeWorker;
-    if (runtimeWorker === undefined) {
+    // The per-instance Runtime Worker is daemon-owned: the durable daemon
+    // installation identity comes from the registry's daemon document,
+    // never from a caller. Without a daemon installation the worker-host
+    // route is not engaged and `run` is the legacy-only runtime.
+    const daemonConfig = new DaemonConfigStore({ directory: directories.registryDirectory });
+    if (!daemonConfig.exists()) {
       const session = await openDollyRuntime({
         configPath: parsed.configPath,
         ...directories,
@@ -456,6 +453,7 @@ async function execute(
       return 0;
     }
     const inspected = admissionConfigStore(directories).inspect(parsed.configPath);
+    const daemonInstallationId = daemonConfig.load().config.daemonInstallationId;
     const controllerLock = await InstanceControllerLock.acquire({
       directory: join(resolve(directories.registryDirectory), "controllers"),
       instanceId: inspected.instanceId,
@@ -472,10 +470,9 @@ async function execute(
         registryDirectory: directories.registryDirectory,
         stateDirectory: inspected.stateDirectory,
         identity: {
-          daemonInstallationId: runtimeWorker.daemonInstallationId,
+          daemonInstallationId,
           instanceId: projectRuntimeInstanceStableId(inspected.instanceId),
         },
-        extensionAlias: runtimeWorker.extensionAlias,
         controllerLock,
       });
     } catch (error) {
@@ -527,7 +524,8 @@ function publicError(error: unknown): { readonly code: string; readonly message:
     error instanceof InstanceControllerLockError ||
     error instanceof RuntimeBootstrapError ||
     error instanceof RuntimeConfigError ||
-    error instanceof InstalledWorkerHostError
+    error instanceof InstalledWorkerHostError ||
+    error instanceof DaemonConfigError
   ) {
     return { code: error.code, message: error.message };
   }

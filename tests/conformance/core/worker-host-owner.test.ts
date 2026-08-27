@@ -10,7 +10,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { canonicalBytes } from "../../../src/schema-bundle/index.js";
 import {
@@ -26,14 +27,16 @@ import {
   openRuntimeWorkerHost,
   type RuntimeWorkerHostOpenOptions,
 } from "../../../src/adapters/worker-host-composition.js";
-import {
-  runDollyCli,
-  type DollyCliContext,
-} from "../../../src/entry.js";
+import { DaemonConfigStore } from "../../../src/daemon/daemon-config.js";
+import { runDollyCli } from "../../../src/entry.js";
 import { projectRuntimeInstanceStableId } from "../../../src/core/runtime-authority-identities.js";
 
+const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
+const launcher = resolve(repositoryRoot, "src", "main.ts");
+const tsxBinary = resolve(repositoryRoot, "node_modules", ".bin", "tsx");
+
 const identity: RuntimeAuthorityIdentity = {
-  daemonInstallationId: "0198ab31-6c44-7e8a-b2bb-000000000002",
+  daemonInstallationId: "01234567-89ab-4def-8123-456789abcdef00",
   instanceId: "placeholder",
 };
 
@@ -63,6 +66,7 @@ function runtimeConfigDocument(server: unknown): unknown {
       services: {
         tool_broker: {
           schema: "dolly.tool-broker-config/v1",
+          extension_alias: "org.dolly.tools",
           servers: { fs: server },
         },
       },
@@ -155,21 +159,55 @@ async function acquireControllerLock(
   });
 }
 
-function runtimeIdentityFor(instanceId: string): RuntimeAuthorityIdentity {
-  return {
-    daemonInstallationId: identity.daemonInstallationId,
-    instanceId: projectRuntimeInstanceStableId(instanceId),
+interface LaunchedCli {
+  readonly code: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/** Enters through the shipped CLI process boundary (src/main.ts, no context). */
+async function launchCli(
+  args: readonly string[],
+  options: { readonly baseDir: string; readonly cwd: string; readonly signalOnMatch?: RegExp },
+): Promise<LaunchedCli> {
+  const child = spawn(tsxBinary, [launcher, ...args], {
+    cwd: options.cwd,
+    env: { ...process.env, XDG_STATE_HOME: options.baseDir },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  let signalled = false;
+  const signalWhenReady = (text: string): void => {
+    if (options.signalOnMatch !== undefined && !signalled && options.signalOnMatch.test(text)) {
+      signalled = true;
+      child.kill("SIGTERM");
+    }
   };
+  child.stdout!.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString("utf8");
+    signalWhenReady(stdout);
+  });
+  child.stderr!.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString("utf8");
+    signalWhenReady(stderr);
+  });
+  const code = await new Promise<number>((resolveCode, reject) => {
+    child.once("error", reject);
+    child.once("close", (exitCode) => resolveCode(exitCode ?? -1));
+  });
+  return { code, stdout, stderr };
 }
 
 interface PreparedInstance {
-  readonly root: string;
+  readonly baseDir: string;
   readonly configPath: string;
   readonly directories: { readonly registryDirectory: string; readonly defaultStateRoot: string };
   readonly instanceId: string;
   readonly stateDirectory: string;
   readonly databasePath: string;
   readonly authorityDigest: string;
+  readonly daemonInstallationId: string;
   /** Realpath the worker route seals into the premise; undefined when the package is not installed. */
   readonly workingDirectory?: string;
   readonly entrypointPath?: string;
@@ -177,29 +215,35 @@ interface PreparedInstance {
 }
 
 /**
- * Creates a real registered instance (entry `init`), then optionally commits a
- * real Runtime authority repository under the instance state root and installs
- * a real Host package into the Runtime Worker's installation register.
+ * Creates a real registered instance (real `dolly init`), a real durable daemon
+ * document (`DaemonConfigStore.loadOrInitialize`), and optionally a real
+ * committed Runtime authority repository plus a real installed Host package
+ * under the instance state root.
  */
 async function prepareInstance(options: {
   readonly installPackage: boolean;
   readonly commitAuthority: boolean;
+  readonly packageDigestOverride?: string;
 }): Promise<PreparedInstance> {
-  const root = mkdtempSync(join(tmpdir(), "wsp-owner-entry-"));
+  const baseDir = mkdtempSync(join(tmpdir(), "wsp-owner-entry-"));
   const directories = {
-    registryDirectory: join(root, "registry"),
-    defaultStateRoot: join(root, "instances"),
+    registryDirectory: join(baseDir, "dolly", "registry"),
+    defaultStateRoot: join(baseDir, "dolly", "instances"),
   };
-  const configPath = join(root, "instance.json");
+  const configPath = join(baseDir, "instance.json");
   const initStdout = capture();
   const initStderr = capture();
   const initCode = await runDollyCli(
     ["init", "--config", configPath],
-    { cwd: root, directories, stdout: initStdout.output, stderr: initStderr.output },
+    { cwd: baseDir, directories, stdout: initStdout.output, stderr: initStderr.output },
   );
   if (initCode !== 0) {
     throw new Error(`instance init failed: ${initStderr.text()}`);
   }
+  const daemonLoaded = await new DaemonConfigStore({
+    directory: directories.registryDirectory,
+  }).loadOrInitialize();
+  const daemonInstallationId = daemonLoaded.config.daemonInstallationId;
   const instanceId = (JSON.parse(readFileSync(configPath, "utf8")) as { instanceId: string }).instanceId;
   const stateDirectory = join(directories.defaultStateRoot, instanceId);
   const installationsDirectory = join(stateDirectory, "authority", "installations");
@@ -210,7 +254,7 @@ async function prepareInstance(options: {
   let entrypointPath: string | undefined;
   if (options.installPackage) {
     const installations = new ExtensionInstallationRegistry({ directory: installationsDirectory });
-    const sourceDirectory = join(root, "source");
+    const sourceDirectory = join(baseDir, "source");
     sourcePackage(sourceDirectory);
     const resolved = installations.installNodePackage({ sourceDirectory, trust: "trusted" });
     workingDirectory = resolved.workingDirectory;
@@ -220,8 +264,10 @@ async function prepareInstance(options: {
       executableDigest: sha256File(join(resolved.workingDirectory, "bin", "dolly-fs-tools")),
     };
   }
+  const packageDigest = installed?.packageDigest ??
+    (options.packageDigestOverride ?? `sha256:${"a".repeat(64)}`);
   const server = serverContract({
-    packageDigest: installed?.packageDigest ?? `sha256:${"a".repeat(64)}`,
+    packageDigest,
     executableDigest: installed?.executableDigest ?? `sha256:${"b".repeat(64)}`,
   });
   const authority = resolvedConfigFixture(runtimeConfigDocument(server));
@@ -231,11 +277,11 @@ async function prepareInstance(options: {
     mkdirSync(join(stateDirectory, "authority"), { recursive: true });
     const database = RuntimeAuthorityDatabase.open({
       path: databasePath,
-      identity: runtimeIdentityFor(instanceId),
+      identity: projectIdentity(instanceId, daemonInstallationId),
       lock,
     });
     database.installConfig({
-      identity: runtimeIdentityFor(instanceId),
+      identity: projectIdentity(instanceId, daemonInstallationId),
       canonicalConfigBytes: authority.bytes,
       configDigest: authority.digest,
       premise: null,
@@ -244,62 +290,48 @@ async function prepareInstance(options: {
     await lock.release();
   }
   return {
-    root,
+    baseDir,
     configPath,
     directories,
     instanceId,
     stateDirectory,
     databasePath,
     authorityDigest: authority.digest,
+    daemonInstallationId,
     ...(workingDirectory === undefined ? {} : { workingDirectory, entrypointPath }),
     close: async () => {
-      rmSync(root, { recursive: true, force: true });
+      rmSync(baseDir, { recursive: true, force: true });
     },
   };
 }
 
-function runContext(
-  prepared: PreparedInstance,
-  overrides: DollyCliContext = {},
-): { value: DollyCliContext; stdout: { text(): string }; stderr: { text(): string } } {
-  const stdout = capture();
-  const stderr = capture();
+function projectIdentity(instanceId: string, daemonInstallationId: string): RuntimeAuthorityIdentity {
   return {
-    value: {
-      cwd: prepared.root,
-      directories: prepared.directories,
-      stdout: stdout.output,
-      stderr: stderr.output,
-      runtimeWorker: {
-        daemonInstallationId: identity.daemonInstallationId,
-        extensionAlias: "org.dolly.tools",
-      },
-      waitForShutdown: async () => undefined,
-      ...overrides,
-    },
-    stdout,
-    stderr,
+    daemonInstallationId,
+    instanceId: projectRuntimeInstanceStableId(instanceId),
   };
 }
 
-describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host through the real run entry", () => {
+describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host through the shipped CLI process boundary", () => {
   it("refuses an absent installation before any spawn or durable premise projection", async () => {
-    // A registered instance with a committed authority config naming a server
-    // whose package is NOT installed: the engaged worker route must refuse
-    // through the real `dolly run` entry before spawning or projecting.
+    // Real daemon document present, committed authority config naming a server
+    // whose package is NOT installed: the shipped CLI process must refuse
+    // before spawning or projecting.
     const prepared = await prepareInstance({ installPackage: false, commitAuthority: true });
     try {
-      const { value, stdout, stderr } = runContext(prepared);
-      const code = await runDollyCli(["run", "--config", prepared.configPath], value);
-      expect(code).toBe(1);
-      expect(stderr.text()).toContain("no Host-owned installation");
-      expect(stdout.text()).not.toContain("Dolly ready");
+      const run = await launchCli(["run", "--config", prepared.configPath], {
+        baseDir: prepared.baseDir,
+        cwd: prepared.baseDir,
+      });
+      expect(run.code).toBe(1);
+      expect(run.stderr).toContain("no Host-owned installation");
+      expect(run.stdout).not.toContain("Dolly ready");
       // Zero durable startup effects: the legitimate premise was never projected.
       const lock = await acquireControllerLock(prepared.directories.registryDirectory, prepared.instanceId);
       try {
         const database = RuntimeAuthorityDatabase.open({
           path: prepared.databasePath,
-          identity: runtimeIdentityFor(prepared.instanceId),
+          identity: projectIdentity(prepared.instanceId, prepared.daemonInstallationId),
           lock,
         });
         try {
@@ -330,7 +362,7 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
     try {
       const database = RuntimeAuthorityDatabase.open({
         path: prepared.databasePath,
-        identity: runtimeIdentityFor(prepared.instanceId),
+        identity: projectIdentity(prepared.instanceId, prepared.daemonInstallationId),
         lock,
       });
       const server = serverContract({
@@ -339,7 +371,7 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
       });
       const authority = resolvedConfigFixture(runtimeConfigDocument(server));
       database.installConfig({
-        identity: runtimeIdentityFor(prepared.instanceId),
+        identity: projectIdentity(prepared.instanceId, prepared.daemonInstallationId),
         canonicalConfigBytes: authority.bytes,
         configDigest: authority.digest,
         premise: null,
@@ -350,45 +382,50 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
       await lock.release();
     }
     try {
-      const { value, stdout, stderr } = runContext(prepared);
-      const code = await runDollyCli(["run", "--config", prepared.configPath], value);
-      expect(code).toBe(1);
-      expect(stderr.text()).toContain("package digest does not match");
-      expect(stdout.text()).not.toContain("Dolly ready");
+      const run = await launchCli(["run", "--config", prepared.configPath], {
+        baseDir: prepared.baseDir,
+        cwd: prepared.baseDir,
+      });
+      expect(run.code).toBe(1);
+      expect(run.stderr).toContain("package digest does not match");
+      expect(run.stdout).not.toContain("Dolly ready");
     } finally {
       await prepared.close();
     }
   });
 
   it("refuses absent committed current configuration before any spawn or durable effect", async () => {
-    // Engaged worker route over an empty authority repository: no committed
+    // Real daemon document present, empty authority repository: no committed
     // current configuration must refuse before any spawn or durable effect.
     const prepared = await prepareInstance({ installPackage: false, commitAuthority: false });
     try {
-      const { value, stdout, stderr } = runContext(prepared);
-      const code = await runDollyCli(["run", "--config", prepared.configPath], value);
-      expect(code).toBe(1);
-      expect(stderr.text()).toContain("no committed current configuration");
-      expect(stdout.text()).not.toContain("Dolly ready");
+      const run = await launchCli(["run", "--config", prepared.configPath], {
+        baseDir: prepared.baseDir,
+        cwd: prepared.baseDir,
+      });
+      expect(run.code).toBe(1);
+      expect(run.stderr).toContain("no committed current configuration");
+      expect(run.stdout).not.toContain("Dolly ready");
     } finally {
       await prepared.close();
     }
   });
 
-  it("projects the premise and reaches the process boundary through the real run entry, then tears storage and lock down", async () => {
-    // Healthy authority + real installation: the engaged entry genuinely
-    // invokes the worker-host composition (durable premise projection), and
-    // the only refusal is the adapter's process boundary (the fixed packaged
-    // binary is a build artifact). After the run every owned resource is
-    // closed: the repository can be reopened and the controller lock
-    // re-acquired.
+  it("projects the premise and reaches the process boundary through the shipped CLI, then tears storage and lock down", async () => {
+    // Healthy authority + real installation: the engaged CLI process
+    // genuinely invokes the worker-host composition (durable premise
+    // projection), and the only refusal is the adapter's process boundary
+    // (the fixed packaged binary is a build artifact). After the run the
+    // repository can be reopened and the controller lock re-acquired.
     const prepared = await prepareInstance({ installPackage: true, commitAuthority: true });
     try {
-      const { value, stdout, stderr } = runContext(prepared);
-      const code = await runDollyCli(["run", "--config", prepared.configPath], value);
-      expect(code).toBe(1);
-      expect(stderr.text()).toMatch(/WORKER_HOST_BINARY_ABSENT/u);
-      expect(stdout.text()).not.toContain("Dolly ready");
+      const run = await launchCli(["run", "--config", prepared.configPath], {
+        baseDir: prepared.baseDir,
+        cwd: prepared.baseDir,
+      });
+      expect(run.code).toBe(1);
+      expect(run.stderr).toMatch(/WORKER_HOST_BINARY_ABSENT/u);
+      expect(run.stdout).not.toContain("Dolly ready");
       // The owner genuinely reached launchHostWorkerHost: the premise was
       // projected durably exactly once during the run, so re-projecting the
       // identical identity pair is an idempotent no-op.
@@ -396,7 +433,7 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
       try {
         const database = RuntimeAuthorityDatabase.open({
           path: prepared.databasePath,
-          identity: runtimeIdentityFor(prepared.instanceId),
+          identity: projectIdentity(prepared.instanceId, prepared.daemonInstallationId),
           lock,
         });
         try {
@@ -419,6 +456,29 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
     }
   });
 
+  it("a legacy run without a daemon document never engages the worker route", async () => {
+    // Current non-runtime CLI behavior: with no durable daemon document the
+    // worker route is not engaged and `dolly run` is the legacy runtime.
+    const prepared = await prepareInstance({ installPackage: false, commitAuthority: false });
+    try {
+      const daemonPath = join(prepared.directories.registryDirectory, "daemon.json");
+      const daemonStore = new DaemonConfigStore({ directory: prepared.directories.registryDirectory });
+      if (daemonStore.exists()) {
+        rmSync(daemonPath);
+      }
+      const run = await launchCli(["run", "--config", prepared.configPath], {
+        baseDir: prepared.baseDir,
+        cwd: prepared.baseDir,
+        signalOnMatch: /Dolly ready/u,
+      });
+      expect(run.code).toBe(0);
+      expect(run.stdout).toContain("Dolly ready");
+      expect(run.stdout).toContain("Dolly stopped");
+    } finally {
+      await prepared.close();
+    }
+  });
+
   it("retains the returned owner; close() stops/reaps descendants before storage close and lock release", async () => {
     // Lifecycle contract of the per-instance Runtime Worker host object the
     // entry uses: with the existing process-boundary pattern (fake child,
@@ -429,60 +489,19 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
       assertInstallSafety: () => {},
       verifyDigest: () => {},
     });
-    const root = mkdtempSync(join(tmpdir(), "wsp-owner-lifecycle-"));
+    const prepared = await prepareInstance({ installPackage: true, commitAuthority: true });
     try {
-      const directories = { registryDirectory: join(root, "registry"), defaultStateRoot: join(root, "instances") };
-      const configPath = join(root, "instance.json");
-      const initStdout = capture();
-      const initCode = await runDollyCli(
-        ["init", "--config", configPath],
-        { cwd: root, directories, stdout: initStdout.output, stderr: initStdout.output },
-      );
-      expect(initCode).toBe(0);
-      const instanceId = (JSON.parse(readFileSync(configPath, "utf8")) as { instanceId: string }).instanceId;
-      const stateDirectory = join(directories.defaultStateRoot, instanceId);
-      const installations = new ExtensionInstallationRegistry({
-        directory: join(stateDirectory, "authority", "installations"),
-      });
-      const sourceDirectory = join(root, "source");
-      sourcePackage(sourceDirectory);
-      const resolved = installations.installNodePackage({ sourceDirectory, trust: "trusted" });
-      const executableDigest = sha256File(join(resolved.workingDirectory, "bin", "dolly-fs-tools"));
-      const server = serverContract({
-        packageDigest: resolved.packageDigest,
-        executableDigest,
-      });
-      const authority = resolvedConfigFixture(runtimeConfigDocument(server));
-      const controllerLock = await acquireControllerLock(directories.registryDirectory, instanceId);
-      const database = RuntimeAuthorityDatabase.open({
-        path: join(stateDirectory, "authority", "authority.sqlite"),
-        identity: runtimeIdentityFor(instanceId),
-        lock: controllerLock,
-      });
-      database.installConfig({
-        identity: runtimeIdentityFor(instanceId),
-        canonicalConfigBytes: authority.bytes,
-        configDigest: authority.digest,
-        premise: null,
-        verifiedOrigins: [],
-      });
-      database.close();
-
       let spawnedChild: ChildProcess | undefined;
       const spawnForTest: NonNullable<RuntimeWorkerHostOpenOptions["spawn"]> = () => {
         const child = fakeWorkerHostChild();
         spawnedChild = child;
         return child;
       };
-      const origins = new InstalledComponentOriginRegistry({
-        directory: join(stateDirectory, "authority", "origins"),
-        installations,
-      });
+      const controllerLock = await acquireControllerLock(prepared.directories.registryDirectory, prepared.instanceId);
       const workerHost = await openRuntimeWorkerHost({
-        registryDirectory: directories.registryDirectory,
-        stateDirectory,
-        identity: runtimeIdentityFor(instanceId),
-        extensionAlias: "org.dolly.tools",
+        registryDirectory: prepared.directories.registryDirectory,
+        stateDirectory: prepared.stateDirectory,
+        identity: projectIdentity(prepared.instanceId, prepared.daemonInstallationId),
         controllerLock,
         spawn: spawnForTest,
       });
@@ -498,11 +517,11 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
       expect(spawnedChild!.killed || !spawnedChild!.connected).toBe(true);
       // ...closed the repository (reopening the same path succeeds with a
       // fresh lock) and released the real controller lock.
-      const reacquired = await acquireControllerLock(directories.registryDirectory, instanceId);
+      const reacquired = await acquireControllerLock(prepared.directories.registryDirectory, prepared.instanceId);
       try {
         const reopened = RuntimeAuthorityDatabase.open({
-          path: join(stateDirectory, "authority", "authority.sqlite"),
-          identity: runtimeIdentityFor(instanceId),
+          path: prepared.databasePath,
+          identity: projectIdentity(prepared.instanceId, prepared.daemonInstallationId),
           lock: reacquired,
         });
         reopened.close();
@@ -514,7 +533,7 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
       await controllerLock.release();
     } finally {
       restore();
-      rmSync(root, { recursive: true, force: true });
+      await prepared.close();
     }
   });
 });
