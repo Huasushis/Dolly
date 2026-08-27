@@ -7,6 +7,7 @@ members = [
     "crates/dolly-core-reducer",
     "crates/dolly-protocol",
     "crates/dolly-storage",
+    "crates/dolly-runtime",
     "crates/dolly-tool-broker",
     "crates/dolly-tool-coordinator",
     "crates/dolly-worker",
