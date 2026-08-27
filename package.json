@@ -46,7 +46,7 @@
     "dev": "tsx watch src/main.ts",
     "start": "node bin/dolly.js run",
     "build": "node scripts/build.mjs",
-    "prepack": "npm run build",
+    "prepack": "node scripts/build.mjs",
     "typecheck": "node --max-old-space-size=4096 node_modules/typescript/bin/tsc --noEmit",
     "test": "vitest run --config vitest.config.ts",
     "test:conformance": "vitest run --config vitest.config.ts tests/conformance",

@@ -6,7 +6,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { createHash } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -130,6 +130,84 @@ function parsePackOutput(stdout: string): PackResult {
   throw new Error(`npm pack did not return one JSON result:\n${stdout}`);
 }
 
+/**
+ * One pack invocation for the candidate checkout. The intended root comes from
+ * the actual npm-script working directory (`INIT_CWD`, set by the launcher)
+ * and is validated there (must be the dolly package) — never from `import.meta`
+ * transformed module realpaths, node_modules virtual-store realpaths, an
+ * ambient prefix, or a bare absolute host path. The active package manager is
+ * invoked with an explicit root selection (pnpm `--dir`, npm `--prefix`) and
+ * the lifecycle-visible state (cwd, PWD, INIT_CWD, npm_config_prefix) is bound
+ * to that root, so prepack/build resolve to the candidate checkout. The
+ * returned receipt names the sanitized root identity for same-root proof.
+ */
+interface PackReceipt {
+  readonly root: string;
+  readonly name: string;
+  readonly version: string;
+}
+
+interface PackInvocation {
+  readonly packed: SpawnSyncReturns<string>;
+  readonly receipt: PackReceipt;
+}
+
+function packCandidatePackage(
+  packDirectory: string,
+  cacheDirectory: string,
+): PackInvocation {
+  const root = process.env.INIT_CWD;
+  if (!root) {
+    throw new Error("Package smoke test must run through an npm script");
+  }
+  let rootPackageJson: { name?: unknown; version?: unknown };
+  try {
+    rootPackageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
+      name?: unknown;
+      version?: unknown;
+    };
+  } catch {
+    throw new Error(`Candidate checkout has no readable package.json: ${root}`);
+  }
+  if (rootPackageJson.name !== "dolly" || typeof rootPackageJson.version !== "string") {
+    throw new Error(`Candidate checkout root does not carry the dolly identity: ${root}`);
+  }
+  const npmCli = process.env.npm_execpath;
+  if (!npmCli) {
+    throw new Error("Package smoke test must run through an npm script");
+  }
+  const isPnpm = basename(npmCli).toLowerCase().startsWith("pnpm");
+  const packArguments = [
+    npmCli,
+    ...(isPnpm ? ["--dir", root] : ["--prefix", root]),
+    "pack",
+    "--json",
+    "--pack-destination",
+    packDirectory,
+  ];
+  if (!isPnpm) {
+    packArguments.push("--cache", cacheDirectory);
+  }
+  const packed = spawnSync(process.execPath, packArguments, {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PWD: root,
+      INIT_CWD: root,
+      npm_config_prefix: root,
+      NO_COLOR: "1",
+    },
+  });
+  const receipt: PackReceipt = {
+    root,
+    name: rootPackageJson.name,
+    version: rootPackageJson.version,
+  };
+  console.log(`package root ${basename(root)} identity ${receipt.name}@${receipt.version}`);
+  return { packed, receipt };
+}
+
 describe("PKG-001 distributable package", () => {
   it("packs only runtime files and runs the extracted CLI metadata commands", async () => {
     const repositoryRoot = resolve(import.meta.dirname, "../../..");
@@ -141,29 +219,7 @@ describe("PKG-001 distributable package", () => {
       mkdirSync(packDirectory, { recursive: true });
       mkdirSync(cacheDirectory, { recursive: true });
 
-      const npmCli = process.env.npm_execpath;
-      if (!npmCli) {
-        throw new Error("Package smoke test must run through an npm script");
-      }
-      const packArguments = [
-        npmCli,
-        "pack",
-        "--json",
-        "--pack-destination",
-        packDirectory,
-      ];
-      if (!basename(npmCli).toLowerCase().startsWith("pnpm")) {
-        packArguments.push("--cache", cacheDirectory);
-      }
-      const packed = spawnSync(
-        process.execPath,
-        packArguments,
-        {
-          cwd: repositoryRoot,
-          encoding: "utf8",
-          env: { ...process.env, NO_COLOR: "1" },
-        },
-      );
+      const { packed, receipt } = packCandidatePackage(packDirectory, cacheDirectory);
       expect(packed.error).toBeUndefined();
       expect(packed.status, packed.stderr).toBe(0);
 
@@ -229,6 +285,11 @@ describe("PKG-001 distributable package", () => {
         types: "./dist/src/entry.d.ts",
         bin: { dolly: "./bin/dolly.js" },
       });
+      // Same-root receipt: the packed manifest identity must equal the root
+      // this test packed from, so package authority never drifted to another
+      // checkout (an observed production-tooling failure mode).
+      expect(packageJson.name).toBe(receipt.name);
+      expect(packageJson.version).toBe(receipt.version);
       expect(packageJson.exports).toMatchObject({
         ".": {
           types: "./dist/src/entry.d.ts",
@@ -344,29 +405,7 @@ describe("PKG-001 distributable package", () => {
       mkdirSync(packDirectory, { recursive: true });
       mkdirSync(cacheDirectory, { recursive: true });
 
-      const npmCli = process.env.npm_execpath;
-      if (!npmCli) {
-        throw new Error("Package smoke test must run through an npm script");
-      }
-      const packArguments = [
-        npmCli,
-        "pack",
-        "--json",
-        "--pack-destination",
-        packDirectory,
-      ];
-      if (!basename(npmCli).toLowerCase().startsWith("pnpm")) {
-        packArguments.push("--cache", cacheDirectory);
-      }
-      const packed = spawnSync(
-        process.execPath,
-        packArguments,
-        {
-          cwd: repositoryRoot,
-          encoding: "utf8",
-          env: { ...process.env, NO_COLOR: "1" },
-        },
-      );
+      const { packed, receipt } = packCandidatePackage(packDirectory, cacheDirectory);
       expect(packed.error).toBeUndefined();
       expect(packed.status, packed.stderr).toBe(0);
 

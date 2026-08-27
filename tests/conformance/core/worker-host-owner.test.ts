@@ -40,10 +40,10 @@ const distDaemonConfig = resolve(repositoryRoot, "dist", "src", "daemon", "daemo
 
 /**
  * Produces the compiled production entry and its complete module closure with
- * the sanctioned build. HEAD's reviewed worker-host binary admission refuses
- * the recompile (pre-existing reviewed-digest mismatch), so build.mjs exits
- * non-zero at its cargo stage; this helper requires exactly that refusal and
- * the compiled closure, and surfaces any other failure.
+ * the sanctioned build. The reviewed worker-host binary admission now accepts
+ * the pinned-toolchain recompile, so build.mjs must succeed end-to-end and
+ * place the packaged binary at dist/bin/worker_host for the shipped-bin tests
+ * below to exercise the real process boundary.
  */
 let distBuild: Promise<void> | undefined;
 function ensureBuiltDist(): Promise<void> {
@@ -62,13 +62,7 @@ async function buildDistOnce(): Promise<void> {
     },
     timeout: 600_000,
   });
-  if (built.status !== 0) {
-    // The single expected failure is the reviewed worker_host digest admission
-    // refusing a recompile (pre-existing input); the compiled closure must
-    // still be present. build.mjs refuses with "built worker_host digest <d>
-    // != reviewed <r>".
-    expect(JSON.stringify(built.stderr + built.stdout)).toMatch(/!= reviewed /u);
-  }
+  expect(built.status, built.stderr + built.stdout).toBe(0);
   expect(existsSync(distEntry), "compiled dist/src/entry.js missing").toBe(true);
   expect(
     existsSync(distDaemonConfig),

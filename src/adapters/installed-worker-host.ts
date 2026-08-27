@@ -48,7 +48,7 @@ const CONTROL_MAX_FRAME_BYTES = 262_144;
  * refuses a substituted binary before spawn.
  */
 export const REVIEWED_WORKER_HOST_DIGEST =
-  "sha256:b6a9977ecda960f3fe4891a59eed7b4078f8e4fc63d8004f99eb50270e31ca98";
+  "sha256:ced65b28f7bacbdf233c5f712c8ab68a0e462b640d1df538d1def27aa40211ba";
 /** Bounded diagnostics: retain at most this many stderr bytes. */
 const STDERR_TAIL_BYTES = 8192;
 /** Deadline for the mandatory first `started` frame. */
