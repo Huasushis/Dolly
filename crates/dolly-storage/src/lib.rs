@@ -1,13 +1,9 @@
-//! `dolly-storage` first slice: the SQLite build-attestation gate and the
-//! DB-open slice (open, PRAGMA, lock, migration).
+//! `dolly-storage` owns the attested SQLite connection, Host authority
+//! records, and the Page/Activation transaction engine.
 //!
-//! The crate depends on the bundled SQLite (`rusqlite` +
-//! `libsqlite3-sys`, ADR 0006/REQ-TECH-003) and deliberately has no Tokio or
-//! network dependency. It provides the closed attestation types and the gate
-//! that enforces REQ-TECH-003 / ADR 0006 on the real library probe, the
-//! instance-open sequence of storage-and-recovery §2/§10, plus the frozen
-//! `CoreTransaction` boundary required by INV-TXN-001 for the future atomic
-//! transition and journal/outbox implementation.
+//! The engine executes the pure reducer inside one immediate SQLite
+//! transaction, verifies the canonical durable projection on every load, and
+//! publishes no semantic acknowledgement before commit.
 
 pub mod attestation;
 pub mod database;
@@ -21,7 +17,6 @@ pub mod runtime_binding;
 pub mod tool_broker_authority;
 pub mod tool_ledger;
 pub mod transaction;
-
 pub use attestation::{
     LoadedSqlite, ReleaseAttestation, SQLITE_VERSION_NUMBER_MIN, SqliteBuildGate,
     VerifiedSqliteBuild, release_attestation,
@@ -35,4 +30,7 @@ pub use restore_identity::{
     RestoreIdentityMode, RestoreIdentityModesPlan, RestoreIdentityPlannerError,
     RestoreIdentityPlannerErrorCode, evaluate_restore_identity_modes,
 };
-pub use transaction::CoreTransaction;
+pub use transaction::{
+    CoreTransaction, CORE_ENGINE_SCHEMA_SQL, CORE_ENGINE_SCHEMA_VERSION, SqliteCoreStore,
+    SqliteCoreTransaction, initialize_core_engine_schema,
+};
