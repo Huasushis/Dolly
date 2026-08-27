@@ -1,0 +1,80 @@
+{
+  "schema": "dolly.g1-runtime-conformance/v1",
+  "spec_basis": [
+    "REQ-ACT-001",
+    "INV-ACTIVATION-002",
+    "INV-ACTIVATION-003",
+    "INV-ACTIVATION-005"
+  ],
+  "accepted_boundary": [
+    {
+      "id": "G1-BOUNDARY-NEIGHBOR-FORGED",
+      "name": "forged_neighbor_premise_fails_closed",
+      "references": [
+        "crates/dolly-core-reducer/tests/wp004_conformance.rs::manifest_rejects_untrusted_descriptor_field",
+        "crates/dolly-core-reducer/tests/desc_neighbor_projection.rs::build_manifest_binds_neighbors_to_authoritative_graph"
+      ]
+    },
+    {
+      "id": "G1-BOUNDARY-NEIGHBOR-REVERSED",
+      "name": "reversed_neighbor_premise_fails_closed",
+      "references": [
+        "crates/dolly-core-reducer/tests/desc_neighbor_projection.rs::reversed_or_unrelated_neighbors_are_not_projected",
+        "crates/dolly-core-reducer/tests/desc_neighbor_projection.rs::build_manifest_binds_neighbors_to_authoritative_graph"
+      ]
+    },
+    {
+      "id": "G1-BOUNDARY-NEIGHBOR-UNRELATED",
+      "name": "unrelated_neighbor_premise_fails_closed",
+      "references": [
+        "crates/dolly-core-reducer/tests/desc_neighbor_projection.rs::reversed_or_unrelated_neighbors_are_not_projected",
+        "crates/dolly-core-reducer/tests/desc_neighbor_projection.rs::build_manifest_binds_neighbors_to_authoritative_graph"
+      ]
+    },
+    {
+      "id": "G1-BOUNDARY-NEIGHBOR-CROSS-EXTENSION",
+      "name": "cross_extension_neighbor_premise_fails_closed",
+      "references": [
+        "crates/dolly-core-reducer/tests/desc_neighbor_projection.rs::build_manifest_binds_neighbors_to_authoritative_graph"
+      ]
+    },
+    {
+      "id": "G1-BOUNDARY-FENCE",
+      "name": "generation_revision_digest_and_ordering_are_bound_before_authority",
+      "references": [
+        "crates/dolly-core-reducer/tests/wp004_conformance.rs::lease_replay_requires_extension_generation",
+        "crates/dolly-core-reducer/tests/desc_neighbor_projection.rs::build_manifest_binds_neighbors_to_authoritative_graph",
+        "crates/dolly-core-reducer/tests/contract.rs::result_and_replay_authority_require_exact_execution_bindings"
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "id": "G1-EXEC-001",
+      "name": "valid_durable_activation_emits_exact_module_activate_premise_before_effect",
+      "kind": "valid_execution",
+      "expected": "product_red",
+      "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000111",
+      "module_id": "timer",
+      "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000110",
+      "extension_generation": 7,
+      "lease_generation": 1,
+      "lease_token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "token_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "rpc_id": "rpc-g1-activation-001",
+      "effect_consumer_calls": 0,
+      "expected_request": {
+        "jsonrpc": "2.0",
+        "id": "rpc-g1-activation-001",
+        "method": "module.activate",
+        "params": {
+          "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000110",
+          "extension_generation": 7,
+          "lease_generation": 1,
+          "lease_token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "attempt": 1
+        }
+      }
+    }
+  ]
+}
