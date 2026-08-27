@@ -621,6 +621,67 @@ describe("Linux Module process lifecycle order", () => {
     expect(records.log.at(-1)).toBe("state:stopped");
     expect(fileSystem.directories.has(started.cgroup.path)).toBe(false);
   });
+  it("closes capability admission synchronously before starting termination", async () => {
+    const records = recordStore();
+    const baseFileSystem = fakeCgroupFileSystem();
+    const order: string[] = [];
+    let capabilityAdmissionOpen = true;
+    let admittedCapabilityCalls = 0;
+    const fileSystem = {
+      ...baseFileSystem,
+      async writeTextFile(path: string, contents: string): Promise<void> {
+        if (path.endsWith("/cgroup.kill")) {
+          order.push("terminate");
+        }
+        await baseFileSystem.writeTextFile(path, contents);
+      },
+    };
+    const started = await startModuleProcess({
+      records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
+      processRecord: processRecord(),
+      delegatedRootCgroupPath: DELEGATED_ROOT,
+      identity: IDENTITY,
+      limits: LIMITS,
+      maxOpenFiles: 256,
+      startLauncher: async () => launcher(),
+      execution: EXECUTION,
+      cgroupFileSystem: fileSystem,
+    });
+    expect(started.executionAuthorized).toBe(true);
+    if (!started.executionAuthorized) throw new Error("expected a start");
+
+    let releaseCapabilityClose!: () => void;
+    const capabilityCloseComplete = new Promise<void>((resolve) => {
+      releaseCapabilityClose = resolve;
+    });
+    const admitCapabilityCall = (): boolean => {
+      if (!capabilityAdmissionOpen) return false;
+      admittedCapabilityCalls += 1;
+      return true;
+    };
+    const stopOperation = stopModuleProcess({
+      ...NO_PROTOCOL_SESSION,
+      records,
+      stoppedRecordWriter: records.stoppedRecordWriter,
+      processGenerationId: IDENTITY.processGenerationId,
+      cgroup: started.cgroup,
+      timeoutMs: 200,
+      closeCapabilitySession: () => {
+        order.push("close");
+        capabilityAdmissionOpen = false;
+        return capabilityCloseComplete;
+      },
+    });
+    try {
+      expect(order).toEqual(["close", "terminate"]);
+      expect(admitCapabilityCall()).toBe(false);
+      expect(admittedCapabilityCalls).toBe(0);
+    } finally {
+      releaseCapabilityClose();
+    }
+    await expect(stopOperation).resolves.toMatchObject({ stopped: true });
+  });
 
   it("does not report a normal stop complete when a structural writer performs no write", async () => {
     const records = recordStore();

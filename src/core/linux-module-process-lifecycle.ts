@@ -565,7 +565,7 @@ export async function stopModuleProcess(options: {
   let capabilityClose: Promise<void>;
   try {
     capabilityClose = withTimeout(
-      Promise.resolve().then(() => options.closeCapabilitySession()),
+      options.closeCapabilitySession(),
       terminationTimeoutMs,
       "Module capability session closure exceeded its bounded wait",
     );
