@@ -29,7 +29,7 @@
     "dist/src/daemon/daemon-config.d.ts",
     "dist/src/daemon/daemon-config.js.map",
     "!dist/src/config.*",
-    "!dist/src/config.*",
+    "!dist/src/extensions/**",
     "!dist/src/core/block-manager.*",
     "!dist/src/core/ipc.*",
     "!dist/src/core/legacy-in-process-extension.*",
