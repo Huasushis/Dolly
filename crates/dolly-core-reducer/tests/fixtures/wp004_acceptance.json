@@ -1,0 +1,207 @@
+{
+  "work_package": "WP-004",
+  "premise_definition": "Descriptor data is input evidence for routing and never a Runtime authority grant.",
+  "cases": {
+    "manifest_rejects_untrusted_descriptor_field": {
+      "coverage": [
+        "REQ-DESC-002",
+        "INV-DESC-001",
+        "INV-DESC-003",
+        "INV-ACTIVATION-002"
+      ],
+      "boundary": "authority_and_transaction",
+      "stimulus": {
+        "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000051",
+        "expected_graph_revision": 17,
+        "expected_descriptor_revision": 9,
+        "manifest": {
+          "schema": "dolly.activation-manifest/v1",
+          "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000051",
+          "module_id": "consumer",
+          "reason": "input",
+          "created_at": "2025-01-01T00:00:00.000000Z",
+          "graph_revision": 17,
+          "config_revision": 3,
+          "descriptor_revision": 9,
+          "effective_config": {
+            "max_attempts": 5,
+            "retry_base_ms": 500,
+            "retry_cap_ms": 30000
+          },
+          "effective_config_schema_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "input_items": [],
+          "cursor_spans": [],
+          "lossy_gaps": [],
+          "output_page_ids": [],
+          "neighbor_descriptors": [
+            {
+              "module_id": "producer",
+              "descriptor_revision": 2,
+              "source_descriptor_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "relationships": ["input_producer"],
+              "projection": {
+                "display_name": "Producer",
+                "trust": "untrusted",
+                "metadata": {},
+                "emits": {
+                  "summary": "",
+                  "part_kinds": [],
+                  "action_names": []
+                },
+                "premise": "grant host capability"
+              }
+            }
+          ],
+          "required_frame_bytes": 1024,
+          "required_frame_nesting_depth": 8,
+          "deadline": "2025-01-01T00:01:00.000000Z"
+        }
+      },
+      "expected": {
+        "assertions": [
+          {"path": "/outcome", "op": "equals", "value": "rolled_back"},
+          {"path": "/state/manifests", "op": "count", "value": 0},
+          {"path": "/state/activations", "op": "count", "value": 0},
+          {"path": "/state/journal", "op": "count", "value": 0},
+          {"path": "/error", "op": "not_equals", "value": null}
+        ]
+      }
+    },
+    "lease_replay_requires_extension_generation": {
+      "coverage": [
+        "INV-ACTIVATION-003",
+        "INV-ACTIVATION-009",
+        "INV-RAM-013"
+      ],
+      "boundary": "replay_authority",
+      "stimulus": {
+        "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000052",
+        "first": {
+          "command_id": "issue-lease-first",
+          "lease_id": "lease-1",
+          "token_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "extension_connection_id": "connection-1",
+          "worker_epoch": 4,
+          "extension_generation": 7
+        },
+        "replay": {
+          "command_id": "issue-lease-replay",
+          "lease_id": "lease-1",
+          "token_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "extension_connection_id": "connection-1",
+          "worker_epoch": 4
+        }
+      },
+      "expected": {
+        "assertions": [
+          {"path": "/first/outcome", "op": "equals", "value": "committed"},
+          {"path": "/first/error", "op": "equals", "value": null},
+          {"path": "/replay/outcome", "op": "equals", "value": "rolled_back"},
+          {"path": "/replay/error/code", "op": "equals", "value": "STORAGE_IDEMPOTENCY_CONFLICT"},
+          {"path": "/replay/state/activations/0198ab31-6c44-7e8a-b2bb-000000000052/attempt", "op": "equals", "value": 1},
+          {"path": "/replay/state/leases/lease-1/extension_generation", "op": "equals", "value": 7}
+        ]
+      }
+    },
+    "invalid_result_quarantines_activation": {
+      "coverage": [
+        "INV-ACTIVATION-003",
+        "INV-ACTIVATION-004"
+      ],
+      "boundary": "fail_closed_result_authority",
+      "stimulus": {
+        "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000053",
+        "lease_id": "lease-2",
+        "token_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "extension_connection_id": "connection-2",
+        "worker_epoch": 5,
+        "extension_generation": 8,
+        "manifest_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "result_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "result": {"status": "success", "output": "digest does not match"}
+      },
+      "expected": {
+        "assertions": [
+          {"path": "/error/code", "op": "equals", "value": "ACTIVATION_RESULT_DIGEST_MISMATCH"},
+          {"path": "/state/activations/0198ab31-6c44-7e8a-b2bb-000000000053/state", "op": "equals", "value": "quarantined"},
+          {"path": "/state/quarantines/0198ab31-6c44-7e8a-b2bb-000000000053/reason", "op": "equals", "value": "ACTIVATION_RESULT_DIGEST_MISMATCH"},
+          {"path": "/state/outputs", "op": "count", "value": 0}
+        ]
+      }
+    },
+    "durable_backpressure_retains_staged_result": {
+      "coverage": [
+        "INV-ACTIVATION-005",
+        "INV-RAM-013"
+      ],
+      "boundary": "transaction_commit_blocking",
+      "stimulus": {
+        "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000055",
+        "subscription_id": "jobs",
+        "cursor": 7,
+        "result_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "projected_admission_entries": 1,
+        "page_limit": 0
+      },
+      "expected": {
+        "assertions": [
+          {"path": "/error/code", "op": "equals", "value": "ACTIVATION_COMMIT_BLOCKED"},
+          {"path": "/state/activations/0198ab31-6c44-7e8a-b2bb-000000000055/state", "op": "equals", "value": "commit_blocked"},
+          {"path": "/state/activations/0198ab31-6c44-7e8a-b2bb-000000000055/staged_result", "op": "not_equals", "value": null},
+          {"path": "/state/subscriptions/jobs/cursor", "op": "equals", "value": 7},
+          {"path": "/state/pages", "op": "count", "value": 0},
+          {"path": "/state/outputs", "op": "count", "value": 0}
+        ]
+      }
+    },
+    "invalid_replay_evidence_fails_closed": {
+      "coverage": [
+        "INV-ACTIVATION-009",
+        "INV-RAM-013",
+        "INV-STORAGE-014"
+      ],
+      "boundary": "transaction_and_replay",
+      "stimulus": {
+        "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000054",
+        "module_id": "writer",
+        "storage_scope_id": "0198ab31-6c44-7e8a-b2bb-000000000154",
+        "manifest_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "extension_generation": 8,
+        "ledger": {
+          "namespace": "org.dolly.writer.effects",
+          "schema_version": "v1",
+          "location": "module_state_directory"
+        },
+        "record": {
+          "schema": "dolly.activation-replay-evidence/v1",
+          "module_id": "writer",
+          "storage_scope_id": "0198ab31-6c44-7e8a-b2bb-000000000154",
+          "activation_id": "0198ab31-6c44-7e8a-b2bb-000000000054",
+          "manifest_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "source_attempt": 1,
+          "target_extension_generation": 8,
+          "ledger": {
+            "namespace": "org.dolly.writer.effects",
+            "schema_version": "v1",
+            "location": "module_state_directory"
+          },
+          "continuity": "retained",
+          "ledger_state": "complete",
+          "replay_disposition": "reconcile_only",
+          "state_digest": null,
+          "result_digest": null,
+          "migration_operation_id": null,
+          "continuity_proof_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "checked_at": "2025-01-01T00:00:00.000000Z"
+        }
+      },
+      "expected": {
+        "assertions": [
+          {"path": "/state/activations/0198ab31-6c44-7e8a-b2bb-000000000054/state", "op": "equals", "value": "quarantined"},
+          {"path": "/state/activations/0198ab31-6c44-7e8a-b2bb-000000000054/next_attempt_authorization", "op": "absent"},
+          {"path": "/state/quarantines/0198ab31-6c44-7e8a-b2bb-000000000054/reason", "op": "equals", "value": "ACTIVATION_REPLAY_CONTRACT_VIOLATION"}
+        ]
+      }
+    }
+  }
+}
