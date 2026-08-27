@@ -193,6 +193,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dolly-runtime"
+version = "0.1.0"
+dependencies = [
+ "dolly-canonical-json",
+ "dolly-core-domain",
+ "dolly-core-reducer",
+ "dolly-schema",
+ "dolly-storage",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "dolly-schema"
 version = "0.1.0"
 dependencies = [
