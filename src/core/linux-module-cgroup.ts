@@ -100,6 +100,20 @@ const MAX_CPU_PERIOD_MICROS = 1_000_000;
 const DEFAULT_TERMINATION_TIMEOUT_MS = 5_000;
 const DEFAULT_MEMBERSHIP_TIMEOUT_MS = 5_000;
 
+function withTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([operation, timeout]).finally(() => {
+    clearTimeout(timer);
+  });
+}
+
 /**
  * Interval between `cgroup.events` readings while waiting for a group to empty
  * or to gain its first member.
@@ -884,18 +898,28 @@ export class ModuleCgroup {
    * verification later fails. A launcher's own report is never evidence.
    */
   recordObservedProcessIds(processIds: readonly number[]): void {
-    if (processIds.length === 0) {
+    if (
+      !Array.isArray(processIds) ||
+      processIds.length === 0 ||
+      processIds.some((processId) => !Number.isSafeInteger(processId) || processId < 1)
+    ) {
       throw new TypeError(
-        "recordObservedProcessIds needs at least one process identifier read from cgroup.procs",
+        "recordObservedProcessIds needs positive process identifiers read from cgroup.procs",
       );
     }
     this.#membershipObserved = true;
   }
 
   /** Reads `cgroup.events` once. `undefined` means the reading was unusable. */
-  async readPopulated(): Promise<boolean | undefined> {
+  async readPopulated(
+    timeoutMs = DEFAULT_TERMINATION_TIMEOUT_MS,
+  ): Promise<boolean | undefined> {
     try {
-      const content = await this.#fileSystem.readTextFile(`${this.path}/cgroup.events`);
+      const content = await withTimeout(
+        this.#fileSystem.readTextFile(`${this.path}/cgroup.events`),
+        timeoutMs,
+        `reading cgroup.events of ${this.path} exceeded its bounded wait`,
+      );
       const populated = parseCgroupEventsPopulated(content);
       if (populated === true) this.#membershipObserved = true;
       return populated;
@@ -957,12 +981,8 @@ export class ModuleCgroup {
     const startedAt = Date.now();
     let lastReadable = true;
     for (;;) {
-      const populated = await this.readPopulated();
-      lastReadable = populated !== undefined;
-      if (populated === true) {
-        return { observed: true, waitedMs: Date.now() - startedAt };
-      }
-      if (Date.now() - startedAt >= timeoutMs) {
+      const remainingMs = timeoutMs - (Date.now() - startedAt);
+      if (remainingMs <= 0) {
         return lastReadable
           ? {
               observed: false,
@@ -977,7 +997,30 @@ export class ModuleCgroup {
               waitedMs: Date.now() - startedAt,
             };
       }
-      await sleep(intervalMs);
+      const populated = await this.readPopulated(
+        Math.min(remainingMs, DEFAULT_TERMINATION_TIMEOUT_MS),
+      );
+      lastReadable = populated !== undefined;
+      if (populated === true) {
+        return { observed: true, waitedMs: Date.now() - startedAt };
+      }
+      const waitedMs = Date.now() - startedAt;
+      if (waitedMs >= timeoutMs) {
+        return lastReadable
+          ? {
+              observed: false,
+              code: "MODULE_CGROUP_MEMBERSHIP_TIMEOUT",
+              detail: `no process joined ${this.path} within ${timeoutMs} ms`,
+              waitedMs,
+            }
+          : {
+              observed: false,
+              code: "MODULE_CGROUP_PATH_UNAVAILABLE",
+              detail: `cgroup.events of ${this.path} could not be read while waiting for membership`,
+              waitedMs,
+            };
+      }
+      await sleep(Math.min(intervalMs, timeoutMs - waitedMs));
     }
   }
 
