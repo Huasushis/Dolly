@@ -27,6 +27,7 @@ import {
   RuntimeAuthorityDatabase,
   type CurrentAuthoritySnapshot,
   type InstallWorkerStartPremiseInput,
+  type RuntimeAuthorityIdentity,
 } from "./storage/runtime-authority-database.js";
 import { canonicalJsonDigest, type JsonValue } from "../schema-bundle/index.js";
 import {
@@ -35,6 +36,8 @@ import {
 } from "../core/extension-installation-registry.js";
 import { InstanceControllerLock } from "../core/instance-controller-lock.js";
 import { InstalledComponentOriginRegistry } from "../core/installed-component-origin.js";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import type { StartupAuthorityPermissionContext } from "../core/startup-authority-premise.js";
 
@@ -477,6 +480,198 @@ export async function startHostWorkerHost(
       stopped = true;
       await Promise.all(retained.map((entry) => entry.handle.stop()));
       retained.length = 0;
+    },
+  });
+}
+
+/**
+ * The per-instance Runtime Worker host lifecycle the `dolly run` entry uses.
+ *
+ * The per-instance Runtime Worker owns the live instance controller lock and
+ * this writable Runtime authority repository; `dollyd` supervises that worker
+ * process. This composition opens both under the existing instance roots,
+ * derives the tool-broker server set from the ONE committed authority
+ * revision, projects and launches every worker host through
+ * `startHostWorkerHost`, and retains the returned owner so shutdown stops and
+ * reaps every Tool Broker descendant before storage close and controller-lock
+ * release.
+ */
+export interface RuntimeWorkerHostOpenOptions {
+  readonly registryDirectory: string;
+  /** The instance state root that also holds the legacy Core state. */
+  readonly stateDirectory: string;
+  readonly identity: RuntimeAuthorityIdentity;
+  /** The tool-broker extension identity the daemon assigned to this worker. */
+  readonly extensionAlias: string;
+  /** The live controller lock the Runtime Worker already holds for the instance. */
+  readonly controllerLock: InstanceControllerLock;
+  /** Process-boundary injection (deterministic tests only). */
+  readonly spawn?: HostWorkerHostLaunchOptions["spawn"];
+}
+
+export interface RuntimeWorkerHost {
+  readonly database: RuntimeAuthorityDatabase;
+  readonly owner: HostWorkerHostOwner;
+  /** Idempotent close: stops/reaps worker hosts, then closes storage, then releases the lock. */
+  close(): Promise<void>;
+}
+
+/**
+ * Server identifiers in the ONE committed authority revision, or refusal when
+ * an engaged worker route finds no committed current configuration.
+ */
+function configuredWorkerServerIds(
+  snapshot: CurrentAuthoritySnapshot | null,
+): readonly string[] {
+  if (snapshot === null) {
+    throw new InstalledWorkerHostError(
+      "WORKER_START_INVALID",
+      "no committed current configuration",
+    );
+  }
+  const root = objectField(
+    snapshot.canonicalConfig,
+    "resolved configuration",
+    "resolved configuration",
+  );
+  const runtimeConfig = objectField(
+    requireField(root, "runtime_config", "resolved configuration"),
+    "runtime_config",
+    "resolved configuration",
+  );
+  const spec = objectField(
+    requireField(runtimeConfig, "spec", "runtime config"),
+    "spec",
+    "runtime config",
+  );
+  const services = objectField(
+    requireField(spec, "services", "runtime config spec"),
+    "services",
+    "runtime config spec",
+  );
+  if (!("tool_broker" in services)) {
+    return [];
+  }
+  const toolBroker = objectField(
+    requireField(services, "tool_broker", "runtime services"),
+    "tool_broker",
+    "runtime services",
+  );
+  const servers = objectField(
+    requireField(toolBroker, "servers", "tool-broker config"),
+    "servers",
+    "tool-broker config",
+  );
+  return Object.keys(servers).sort();
+}
+
+function assertRuntimeWorkerHostOpenOptions(
+  value: unknown,
+): asserts value is RuntimeWorkerHostOpenOptions {
+  const candidate = value as Record<string, unknown> | null;
+  if (
+    candidate === null ||
+    typeof candidate !== "object" ||
+    !(candidate.controllerLock instanceof InstanceControllerLock)
+  ) {
+    throw new InstalledWorkerHostError(
+      "WORKER_START_INVALID",
+      "Runtime Worker host requires the live controller lock",
+    );
+  }
+  const options = value as RuntimeWorkerHostOpenOptions;
+  if (
+    typeof options.registryDirectory !== "string" ||
+    options.registryDirectory.length === 0 ||
+    typeof options.stateDirectory !== "string" ||
+    options.stateDirectory.length === 0 ||
+    typeof options.extensionAlias !== "string" ||
+    options.extensionAlias.length === 0
+  ) {
+    throw new InstalledWorkerHostError(
+      "WORKER_START_INVALID",
+      "Runtime Worker host requires the instance roots and extension alias",
+    );
+  }
+  if (
+    typeof options.identity !== "object" ||
+    options.identity === null ||
+    typeof options.identity.daemonInstallationId !== "string" ||
+    typeof options.identity.instanceId !== "string"
+  ) {
+    throw new InstalledWorkerHostError(
+      "WORKER_START_INVALID",
+      "Runtime Worker host requires the daemon and instance identity",
+    );
+  }
+  options.identity;
+  if (!(options.controllerLock.held)) {
+    throw new InstalledWorkerHostError(
+      "WORKER_START_INVALID",
+      "Runtime Worker host controller lock is not held",
+    );
+  }
+}
+
+/**
+ * Open the per-instance Runtime Worker host: open the writable authority
+ * repository under the instance root, derive the configured tool-broker
+ * server set from the committed revision, start and own every worker host,
+ * and rethrow a refusal (absent or mismatched config or installation) before
+ * any spawn or durable startup effect.
+ */
+export async function openRuntimeWorkerHost(
+  options: RuntimeWorkerHostOpenOptions,
+): Promise<RuntimeWorkerHost> {
+  assertRuntimeWorkerHostOpenOptions(options);
+  const authorityDirectory = join(options.stateDirectory, "authority");
+  mkdirSync(authorityDirectory, { recursive: true });
+  const database = RuntimeAuthorityDatabase.open({
+    path: join(authorityDirectory, "authority.sqlite"),
+    identity: options.identity,
+    lock: options.controllerLock,
+  });
+  let owner: HostWorkerHostOwner;
+  try {
+    const serverIds = configuredWorkerServerIds(database.readCurrentConfig());
+    if (serverIds.length === 0) {
+      owner = Object.freeze({
+        serverIds: Object.freeze([] as string[]),
+        handles: Object.freeze([]),
+        stop: async () => undefined,
+      });
+    } else {
+      const installations = new ExtensionInstallationRegistry({
+        directory: join(options.stateDirectory, "authority", "installations"),
+      });
+      const origins = new InstalledComponentOriginRegistry({
+        directory: join(options.stateDirectory, "authority", "origins"),
+        installations,
+      });
+      owner = await startHostWorkerHost({
+        database,
+        controller: options.controllerLock,
+        origins,
+        installations,
+        extensionAlias: options.extensionAlias,
+        serverIds,
+        ...(options.spawn === undefined ? {} : { spawn: options.spawn }),
+      });
+    }
+  } catch (error) {
+    database.close();
+    throw error;
+  }
+  let closed = false;
+  return Object.freeze({
+    database,
+    owner,
+    close: async () => {
+      if (closed) return;
+      closed = true;
+      await owner.stop();
+      database.close();
+      await options.controllerLock.release();
     },
   });
 }

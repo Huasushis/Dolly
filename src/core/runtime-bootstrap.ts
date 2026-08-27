@@ -71,6 +71,13 @@ export interface OpenDollyRuntimeOptions extends DollyRuntimeDirectories {
     kind: "delivery" | "module-job" | "run" | "claim" | "lease" | "dead-letter",
   ) => string;
   readonly processId?: number;
+  /**
+   * The controller lock the per-instance Runtime Worker already owns for this
+   * instance. When supplied the session neither acquires nor releases it
+   * (the owning worker lifecycle does); otherwise the session acquires and
+   * releases its own lock as before.
+   */
+  readonly controllerLock?: InstanceControllerLock;
 }
 
 function usableEnvironmentPath(
@@ -171,6 +178,7 @@ export class DollyRuntimeSession {
   readonly recovery: CoreStartupRecoveryReport;
   readonly providerAccessMarkedUnknownCount: number;
   readonly #controllerLock: InstanceControllerLock;
+  readonly #ownsControllerLock: boolean;
   #state: DollyRuntimeSessionState = "ready";
   #stopOperation: Promise<void> | undefined;
 
@@ -181,6 +189,7 @@ export class DollyRuntimeSession {
     readonly recovery: CoreStartupRecoveryReport;
     readonly providerAccessMarkedUnknownCount: number;
     readonly controllerLock: InstanceControllerLock;
+    readonly ownsControllerLock: boolean;
   }) {
     this.config = options.config;
     this.core = options.core;
@@ -188,6 +197,7 @@ export class DollyRuntimeSession {
     this.recovery = options.recovery;
     this.providerAccessMarkedUnknownCount = options.providerAccessMarkedUnknownCount;
     this.#controllerLock = options.controllerLock;
+    this.#ownsControllerLock = options.ownsControllerLock;
   }
 
   get state(): DollyRuntimeSessionState {
@@ -216,7 +226,9 @@ export class DollyRuntimeSession {
     this.#stopOperation = Promise.resolve().then(async () => {
       try {
         this.core.flush();
-        await this.#controllerLock.release();
+        if (this.#ownsControllerLock) {
+          await this.#controllerLock.release();
+        }
         this.#state = "stopped";
       } catch (error) {
         this.#state = "failed";
@@ -248,12 +260,15 @@ export async function openDollyRuntime(
       ? options.mediaInspector ?? await createDefaultMediaInspector()
       : undefined;
 
-  const controllerLock = await InstanceControllerLock.acquire({
-    directory: join(resolve(options.registryDirectory), "controllers"),
-    instanceId: inspected.instanceId,
-    ...(options.processId === undefined ? {} : { processId: options.processId }),
-    now,
-  });
+  const ownsControllerLock = options.controllerLock === undefined;
+  const controllerLock =
+    options.controllerLock ??
+    await InstanceControllerLock.acquire({
+      directory: join(resolve(options.registryDirectory), "controllers"),
+      instanceId: inspected.instanceId,
+      ...(options.processId === undefined ? {} : { processId: options.processId }),
+      now,
+    });
   try {
     let config: LoadedInstanceConfig<DollyInstanceConfigDialect>;
     try {
@@ -345,10 +360,13 @@ export async function openDollyRuntime(
       recovery,
       providerAccessMarkedUnknownCount: providerAccessMarkedUnknown.length,
       controllerLock,
+      ownsControllerLock,
     });
   } catch (error) {
     try {
-      await controllerLock.release();
+      if (ownsControllerLock) {
+        await controllerLock.release();
+      }
     } catch (releaseError) {
       throw new RuntimeBootstrapError(
         "RUNTIME_START_CLEANUP_FAILED",

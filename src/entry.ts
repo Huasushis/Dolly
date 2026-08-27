@@ -14,6 +14,13 @@ import {
   InstanceControllerLockError,
 } from "./core/instance-controller-lock.js";
 import {
+  openRuntimeWorkerHost,
+  type RuntimeWorkerHost,
+} from "./adapters/worker-host-composition.js";
+import { InstalledWorkerHostError } from "./adapters/installed-worker-host.js";
+
+import { projectRuntimeInstanceStableId } from "./core/runtime-authority-identities.js";
+import {
   defaultDollyRuntimeDirectories,
   openDollyRuntime,
   RuntimeBootstrapError,
@@ -88,6 +95,16 @@ export interface DollyCliContext {
   readonly stderr?: TextOutput;
   /** Test and embedding hook. The default waits for SIGINT or SIGTERM. */
   readonly waitForShutdown?: (session: DollyRuntimeSession) => Promise<void>;
+  /**
+   * Set when dollyd launches this per-instance Runtime Worker: the daemon
+   * installation identity and the tool-broker extension alias this worker
+   * owns. When absent the worker-host route is not engaged and `run` is the
+   * legacy-only runtime.
+   */
+  readonly runtimeWorker?: {
+    readonly daemonInstallationId: string;
+    readonly extensionAlias: string;
+  };
 }
 
 function createPublicRuntimeSession(
@@ -419,10 +436,69 @@ async function execute(
     if (parsed.positionals.length !== 1) {
       throw new DollyCliError("CLI_ARGUMENT_INVALID", "Usage: dolly run [--config <path>]");
     }
-    const session = await openDollyRuntime({
-      configPath: parsed.configPath,
-      ...directories,
+    const runtimeWorker = context.runtimeWorker;
+    if (runtimeWorker === undefined) {
+      const session = await openDollyRuntime({
+        configPath: parsed.configPath,
+        ...directories,
+      });
+      const status = session.status();
+      writeLine(stdout, `Dolly ready: ${status.instanceId}`);
+      writeLine(stdout, JSON.stringify(status));
+      try {
+        await (context.waitForShutdown ?? (() => waitForProcessSignal()))(
+          createPublicRuntimeSession(session),
+        );
+      } finally {
+        await session.stop();
+      }
+      writeLine(stdout, "Dolly stopped");
+      return 0;
+    }
+    const inspected = admissionConfigStore(directories).inspect(parsed.configPath);
+    const controllerLock = await InstanceControllerLock.acquire({
+      directory: join(resolve(directories.registryDirectory), "controllers"),
+      instanceId: inspected.instanceId,
     });
+    let session: InternalDollyRuntimeSession | undefined;
+    let workerHost: RuntimeWorkerHost | undefined;
+    try {
+      session = await openDollyRuntime({
+        configPath: parsed.configPath,
+        ...directories,
+        controllerLock,
+      });
+      workerHost = await openRuntimeWorkerHost({
+        registryDirectory: directories.registryDirectory,
+        stateDirectory: inspected.stateDirectory,
+        identity: {
+          daemonInstallationId: runtimeWorker.daemonInstallationId,
+          instanceId: projectRuntimeInstanceStableId(inspected.instanceId),
+        },
+        extensionAlias: runtimeWorker.extensionAlias,
+        controllerLock,
+      });
+    } catch (error) {
+      if (workerHost !== undefined) {
+        try {
+          await workerHost.close();
+        } catch {
+          // Propagate the original startup failure.
+        }
+      } else {
+        try {
+          await session?.stop();
+        } catch {
+          // Continue to release the owned controller lock.
+        }
+        try {
+          await controllerLock.release();
+        } catch {
+          // Continue to propagate the original startup failure.
+        }
+      }
+      throw error;
+    }
     const status = session.status();
     writeLine(stdout, `Dolly ready: ${status.instanceId}`);
     writeLine(stdout, JSON.stringify(status));
@@ -431,7 +507,10 @@ async function execute(
         createPublicRuntimeSession(session),
       );
     } finally {
+      // Caller-supplied lock: the session never releases it; this worker
+      // lifecycle owns stop-then-close-then-release ordering.
       await session.stop();
+      await workerHost.close();
     }
     writeLine(stdout, "Dolly stopped");
     return 0;
@@ -447,7 +526,8 @@ function publicError(error: unknown): { readonly code: string; readonly message:
     error instanceof InstanceConfigError ||
     error instanceof InstanceControllerLockError ||
     error instanceof RuntimeBootstrapError ||
-    error instanceof RuntimeConfigError
+    error instanceof RuntimeConfigError ||
+    error instanceof InstalledWorkerHostError
   ) {
     return { code: error.code, message: error.message };
   }
