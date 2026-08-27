@@ -184,12 +184,23 @@ describe("PKG-001 distributable package", () => {
         "dist/src/adapters/linux-module-launcher/launcher.py",
         "dist/src/daemon/daemon-config.js",
         "dist/src/daemon/daemon-config.d.ts",
+        "dist/src/daemon/daemon-config.js.map",
       ];
+      // The compiled CLI entry needs exactly the daemon-config compilation;
+      // every other dist/src/daemon/** artifact must stay excluded.
+      const shippedDaemonAllowlist = new Set([
+        "dist/src/daemon/daemon-config.js",
+        "dist/src/daemon/daemon-config.d.ts",
+        "dist/src/daemon/daemon-config.js.map",
+      ]);
       for (const requiredPath of requiredPaths) {
         expect(publishedPaths, `missing ${requiredPath}`).toContain(requiredPath);
       }
 
       for (const publishedPath of publishedPaths) {
+        if (publishedPath.startsWith("dist/src/daemon/")) {
+          expect(shippedDaemonAllowlist, `unexpected daemon artifact ${publishedPath}`).toContain(publishedPath);
+        }
         expect(publishedPath).not.toMatch(/^dist\/src\/extensions(?:\/|$)/);
         expect(publishedPath).not.toMatch(/^dist\/src\/core\/ipc(?:\.|$)/);
         expect(publishedPath).not.toMatch(
