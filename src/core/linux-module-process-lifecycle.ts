@@ -585,8 +585,23 @@ export async function stopModuleProcess(options: {
     cgroup.removed || launcherExitedBeforeExecutionAuthorization
     ? Promise.resolve(undefined)
     : cgroup.terminate({ timeoutMs: terminationTimeoutMs });
-  const [terminationOutcome, capabilityOutcome, channelOutcome] = await Promise.allSettled([
+  const cgroupRemoval = cgroupTermination.then(async (termination) => {
+    if (termination !== undefined && !termination.terminated) return undefined;
+    if (recordFailure !== undefined || cgroup.removed) return undefined;
+    return launcherExitedBeforeExecutionAuthorization
+      ? await cgroup.removeAfterLauncherExitBeforeExecutionAuthorization()
+      : await cgroup.remove({
+          terminationWaitTimeoutMs: terminationTimeoutMs,
+        });
+  });
+  const [
+    terminationOutcome,
+    removalOutcome,
+    capabilityOutcome,
+    channelOutcome,
+  ] = await Promise.allSettled([
     cgroupTermination,
+    cgroupRemoval,
     capabilityClose,
     channelClose,
   ]);
@@ -601,6 +616,17 @@ export async function stopModuleProcess(options: {
   const termination = terminationOutcome.value;
   if (termination !== undefined && !termination.terminated) {
     return { stopped: false, code: termination.code, detail: termination.detail };
+  }
+  if (removalOutcome.status === "rejected") {
+    return {
+      stopped: false,
+      code: "MODULE_CGROUP_REMOVAL_FAILED",
+      detail: `the Module control-group removal operation failed: ${describe(removalOutcome.reason)}`,
+    };
+  }
+  const removal = removalOutcome.value;
+  if (removal !== undefined && !removal.removed) {
+    return { stopped: false, code: removal.code, detail: removal.detail };
   }
   if (capabilityOutcome.status === "rejected") {
     return {
@@ -623,16 +649,6 @@ export async function stopModuleProcess(options: {
     return { stopped: false, ...recordFailure };
   }
 
-  if (!cgroup.removed) {
-    const removal = launcherExitedBeforeExecutionAuthorization
-      ? await cgroup.removeAfterLauncherExitBeforeExecutionAuthorization()
-      : await cgroup.remove({
-          terminationWaitTimeoutMs: terminationTimeoutMs,
-        });
-    if (!removal.removed) {
-      return { stopped: false, code: removal.code, detail: removal.detail };
-    }
-  }
   let finalRecord: ModuleProcessRecord | undefined;
   try {
     finalRecord = records.getModuleProcessRecord(processGenerationId);
