@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use dolly_canonical_json::canonicalize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::command::*;
@@ -11,12 +12,13 @@ use crate::effective_config::{
 use crate::projection::{hash_core_state, project_core_state};
 use crate::types::*;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SafetyStop {
     pub state: CoreSnapshot,
     pub event: CoreEvent,
 }
-#[derive(Debug, Clone, PartialEq)]
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Transition {
     pub outcome: TransitionOutcome,
     pub state: CoreSnapshot,

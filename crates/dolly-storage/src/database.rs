@@ -1,7 +1,8 @@
 //! Durable SQLite instance open and connection configuration (DB-open slice).
 //!
-//! Implements the normative startup sequence of `docs/spec/core/06-storage-and-recovery.md`
-//! §2 and §10 plus REQ-TECH-003 / ADR 0006:
+//! Implements the normative startup sequence of
+//! `docs/spec/core/06-storage-and-recovery.md` §2 and §10 plus
+//! REQ-TECH-003 / ADR 0006:
 //!
 //! 1. refuse unsafe paths (any symlinkable component), refusing to touch a
 //!    substituted target;
@@ -11,10 +12,12 @@
 //! 4. open the connection and set+verify the required PRAGMAs, mapping any
 //!    mismatch to `STORAGE_UNSAFE_CONFIGURATION`;
 //! 5. create or check the schema version singleton, mapping a newer schema to
-//!    `STORAGE_MIGRATION_REQUIRED`.
+//!    `STORAGE_MIGRATION_REQUIRED`; and
+//! 6. install the reducer projection used by the Page/Activation transaction
+//!    engine without changing the Host authority tables.
 //!
-//! Crash-point recovery, sequence allocation, and the `CoreTransaction` write
-//! path are out of scope for this slice (`transaction.rs` stays untouched).
+//! Core transition execution remains in `transaction.rs`; this module owns
+//! startup, locking, and the attested SQLite connection.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -1820,6 +1823,7 @@ fn create_fresh_schema(
     .map_err(map_sqlite_error)?;
     tx.execute_batch(HOST_AUTHORITY_SCHEMA_SQL)
         .map_err(map_sqlite_error)?;
+    crate::transaction::initialize_core_engine_schema_in_transaction(&tx)?;
     crate::effect_journal::initialize_effect_journal_schema(tx)?;
     tx.execute(
         "INSERT INTO core_meta (
