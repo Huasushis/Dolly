@@ -10,6 +10,7 @@ use crate::effective_config::{
     MAX_EFFECTIVE_CONFIG_PROPERTIES,
 };
 use crate::projection::{hash_core_state, project_core_state};
+use crate::neighbors::{FrozenDescriptor, NeighborGraph, build_neighbor_descriptors};
 use crate::types::*;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -237,6 +238,106 @@ fn manifest_neighbor_projection_valid(manifest: &Value) -> bool {
                 .all(|key| projection.contains_key(*key))
     })
 }
+#[derive(Deserialize)]
+struct GraphDescriptor {
+    module_id: String,
+    descriptor_revision: i64,
+    source_descriptor_digest: String,
+    value: Value,
+}
+
+#[derive(Deserialize)]
+struct GraphSnapshot {
+    receiving_module: String,
+    input_pages: BTreeMap<String, Vec<String>>,
+    output_pages: BTreeMap<String, Vec<String>>,
+    subscriptions: BTreeMap<String, Vec<String>>,
+    descriptors: BTreeMap<String, GraphDescriptor>,
+    authorized_metadata_namespaces: Vec<String>,
+    authorized_action_names: Vec<String>,
+}
+
+fn manifest_neighbor_projection_matches_graph(
+    state: &CoreSnapshot,
+    manifest: &Value,
+) -> bool {
+    let Some(neighbors) = manifest.get("neighbor_descriptors") else {
+        return true;
+    };
+    let Some(graph_revision) = state.graph.get("revision").and_then(Value::as_i64) else {
+        return false;
+    };
+    if manifest.get("graph_revision").and_then(Value::as_i64) != Some(graph_revision) {
+        return false;
+    }
+    let Some(module_id) = manifest.get("module_id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(graph_value) = state.graph.get("graph") else {
+        return false;
+    };
+    let Some(graph_digest) = state.graph.get("digest").and_then(Value::as_str) else {
+        return false;
+    };
+    if !verified_digest(graph_value, graph_digest) {
+        return false;
+    }
+    let Ok(snapshot) = serde_json::from_value::<GraphSnapshot>(graph_value.clone()) else {
+        return false;
+    };
+    if snapshot.receiving_module != module_id {
+        return false;
+    }
+    let GraphSnapshot {
+        receiving_module: _,
+        input_pages,
+        output_pages,
+        subscriptions,
+        descriptors,
+        authorized_metadata_namespaces,
+        authorized_action_names,
+    } = snapshot;
+    let mut frozen_descriptors = BTreeMap::new();
+    for (descriptor_id, descriptor) in descriptors {
+        if descriptor.module_id != descriptor_id
+            || descriptor.value.get("module_id").and_then(Value::as_str)
+                != Some(descriptor_id.as_str())
+            || descriptor
+                .value
+                .get("descriptor_revision")
+                .and_then(Value::as_i64)
+                != Some(descriptor.descriptor_revision)
+        {
+            return false;
+        }
+        frozen_descriptors.insert(
+            descriptor_id.clone(),
+            FrozenDescriptor {
+                module_id: descriptor.module_id,
+                descriptor_revision: descriptor.descriptor_revision,
+                source_descriptor_digest: descriptor.source_descriptor_digest,
+                value: descriptor.value,
+            },
+        );
+    }
+    let graph = NeighborGraph {
+        receiving_module: module_id.to_string(),
+        input_pages,
+        output_pages,
+        subscriptions,
+        descriptors: frozen_descriptors,
+        authorized_metadata_namespaces,
+        authorized_action_names,
+    };
+    let Ok(expected) = build_neighbor_descriptors(&graph) else {
+        return false;
+    };
+    let Ok(expected) = serde_json::to_value(expected) else {
+        return false;
+    };
+    same_value(Some(&expected), Some(neighbors))
+}
+
 
 fn lease_id_for(state: &CoreSnapshot, activation_id: &str) -> Option<String> {
     let attempt = state.activations.get(activation_id)?.attempt;
@@ -865,6 +966,14 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                 );
             }
             if !manifest_neighbor_projection_valid(&c.manifest) {
+                return failure(
+                    state,
+                    "MANIFEST_DESCRIPTOR_PROJECTION_INVALID",
+                    false,
+                    None,
+                );
+            }
+            if !manifest_neighbor_projection_matches_graph(state, &c.manifest) {
                 return failure(
                     state,
                     "MANIFEST_DESCRIPTOR_PROJECTION_INVALID",

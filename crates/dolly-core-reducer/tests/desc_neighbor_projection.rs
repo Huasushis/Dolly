@@ -121,6 +121,45 @@ fn graph_from_vector(vector: &Value) -> NeighborGraph {
     }
 }
 
+fn graph_snapshot_value(graph: &NeighborGraph) -> Value {
+    let descriptors = graph
+        .descriptors
+        .iter()
+        .map(|(module_id, descriptor)| {
+            (
+                module_id.clone(),
+                json!({
+                    "module_id": descriptor.module_id,
+                    "descriptor_revision": descriptor.descriptor_revision,
+                    "source_descriptor_digest": descriptor.source_descriptor_digest,
+                    "value": descriptor.value,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "receiving_module": graph.receiving_module,
+        "input_pages": &graph.input_pages,
+        "output_pages": &graph.output_pages,
+        "subscriptions": &graph.subscriptions,
+        "descriptors": descriptors,
+        "authorized_metadata_namespaces": &graph.authorized_metadata_namespaces,
+        "authorized_action_names": &graph.authorized_action_names,
+    })
+}
+
+fn state_with_graph(graph: &NeighborGraph) -> dolly_core_reducer::CoreSnapshot {
+    let graph_value = graph_snapshot_value(graph);
+    let (_, digest) = canonicalize(&graph_value).expect("graph snapshot canonicalizes");
+    let mut state = empty_core_snapshot();
+    state.graph = json!({
+        "revision": 1,
+        "graph": graph_value,
+        "digest": digest.to_canonical_string(),
+    });
+    state
+}
+
 /// Build JSON neighbor wrappers from the frozen projection builder.
 fn build_neighbors_json(graph: &NeighborGraph) -> Value {
     let neighbors = build_neighbor_descriptors(graph).expect("valid graph builds");
@@ -148,8 +187,9 @@ fn build_scenario_projection(vector: &Value) -> (Value, dolly_core_reducer::Tran
         "required_frame_bytes":1,"required_frame_nesting_depth":1,"deadline":null,
         "manifest_digest": null,
     });
+    let state = state_with_graph(&graph);
     let result = reduce(
-        &empty_core_snapshot(),
+        &state,
         &CoreCommand::BuildManifest(BuildManifestCommand {
             command_id: "build".into(),
             activation_id: "r".into(),
@@ -596,6 +636,7 @@ fn reversed_or_unrelated_neighbors_are_not_projected() {
     for module_id in ["reverse-consumer", "reverse-producer", "unrelated-module"] {
         let mut value = base.clone();
         value["module_id"] = json!(module_id);
+
         let (_, digest) = canonicalize(&value).unwrap();
         graph.descriptors.insert(
             module_id.to_string(),
@@ -634,5 +675,80 @@ fn wrapper_and_projection_never_alias_a_module_descriptor() {
         // Projection and wrapper are not the ModuleDescriptor itself, so the
         // wrapper must not carry the source's `module_id` non-nested as identity.
         assert_eq!(entry.module_id, "analyst");
+    }
+}
+#[test]
+fn build_manifest_binds_neighbors_to_authoritative_graph() {
+    let vector = read(spec_root().join("test-vectors/core/TST-DESC-001-neighbor-projection.json"));
+    let graph = graph_from_vector(&vector);
+    let authoritative = build_neighbors_json(&graph);
+    let state = state_with_graph(&graph);
+    let manifest = |neighbors: Value| {
+        json!({
+            "module_id": "reviewer",
+            "graph_revision": 1,
+            "neighbor_descriptors": neighbors,
+        })
+    };
+    let input = dolly_core_reducer::EnvironmentInput {
+        now: "2026-08-10T22:00:00.000000Z".into(),
+        graph_revision: Some(1),
+        descriptor_revision: Some(9),
+        ..Default::default()
+    };
+    let legitimate = reduce(
+        &state,
+        &CoreCommand::BuildManifest(BuildManifestCommand {
+            command_id: "legitimate".into(),
+            activation_id: "legitimate".into(),
+            manifest: manifest(authoritative.clone()),
+            expected_graph_revision: Some(1),
+            expected_descriptor_revision: Some(9),
+        }),
+        &input,
+    );
+    assert_eq!(legitimate.outcome, dolly_core_reducer::TransitionOutcome::Committed);
+    assert!(legitimate.error.is_none());
+
+    let mut forged_identity = authoritative.clone();
+    forged_identity[0]["module_id"] = json!("invented-neighbor");
+    let mut forged_digest = authoritative.clone();
+    forged_digest[0]["source_descriptor_digest"] =
+        json!("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let mut forged_revision = authoritative.clone();
+    forged_revision[0]["descriptor_revision"] = json!(10);
+    let mut forged_direction = authoritative.clone();
+    forged_direction[0]["relationships"] = json!(["output_consumer"]);
+    forged_direction[0]["projection"]
+        .as_object_mut()
+        .unwrap()
+        .remove("emits");
+    let mut forged_projection = authoritative.clone();
+    forged_projection[0]["projection"]["display_name"] = json!("Invented");
+    for (label, neighbors) in [
+        ("identity", forged_identity),
+        ("digest", forged_digest),
+        ("revision", forged_revision),
+        ("direction", forged_direction),
+        ("projection", forged_projection),
+    ] {
+        let transition = reduce(
+            &state,
+            &CoreCommand::BuildManifest(BuildManifestCommand {
+                command_id: format!("forged-{label}"),
+                activation_id: format!("forged-{label}"),
+                manifest: manifest(neighbors),
+                expected_graph_revision: Some(1),
+                expected_descriptor_revision: Some(9),
+            }),
+            &input,
+        );
+        assert_eq!(
+            transition.outcome,
+            dolly_core_reducer::TransitionOutcome::RolledBack,
+            "{label} neighbor must roll back"
+        );
+        assert_eq!(transition.state, state, "{label} forgery mutated state");
+        assert!(transition.events.is_empty(), "{label} forgery emitted an event");
     }
 }
