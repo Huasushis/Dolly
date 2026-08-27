@@ -1034,7 +1034,9 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
                         == Some(c.extension_connection_id.as_str())
                     && object_i64(existing, "worker_epoch") == Some(c.worker_epoch)
                     && object_i64(existing, "attempt") == Some(item.attempt)
-                    && c.extension_generation == object_i64(existing, "extension_generation");
+                    && existing
+                        .get("requested_extension_generation")
+                        .is_some_and(|value| value.as_i64() == c.extension_generation);
                 if !exact {
                     return failure(
                         state,
@@ -1116,6 +1118,10 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             if let Some(value) = generation {
                 lease.insert("extension_generation".into(), json!(value));
             }
+            lease.insert(
+                "requested_extension_generation".into(),
+                json!(c.extension_generation),
+            );
             if let Some(value) = manifest_digest {
                 lease.insert("manifest_digest".into(), json!(value));
             }

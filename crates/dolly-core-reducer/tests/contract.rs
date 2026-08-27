@@ -647,6 +647,60 @@ fn current_lease_controls_each_retry_attempt() {
 }
 
 #[test]
+fn lease_replay_preserves_requested_generation_presence() {
+    let mut state = empty_core_snapshot();
+    state.activations.insert(
+        "a".into(),
+        ActivationRecord {
+            state: ActivationState::Ready,
+            ..Default::default()
+        },
+    );
+    state.current_generation = Some(7);
+    state.generations.push(json!({
+        "generation": 7,
+        "compatible": true,
+    }));
+    let issue = |command_id: &str, extension_generation| {
+        CoreCommand::IssueLease(IssueLeaseCommand {
+            command_id: command_id.into(),
+            activation_id: "a".into(),
+            lease_id: "l".into(),
+            token_digest: "token".into(),
+            extension_connection_id: "connection-1".into(),
+            worker_epoch: 1,
+            extension_generation,
+        })
+    };
+
+    let first = reduce(&state, &issue("issue-none", None), &input());
+    assert!(first.error.is_none());
+    assert_eq!(first.state.activations["a"].extension_generation, Some(7));
+    assert_eq!(
+        first.state.leases["l"]["requested_extension_generation"],
+        Value::Null
+    );
+
+    let exact = reduce(
+        &first.state,
+        &issue("issue-none-replay", None),
+        &input(),
+    );
+    assert_eq!(exact.outcome, TransitionOutcome::Committed);
+    assert!(exact.error.is_none());
+    assert_eq!(exact.state, first.state);
+    assert_eq!(exact.reply, first.reply);
+
+    let forged = reduce(&first.state, &issue("issue-some", Some(7)), &input());
+    assert_eq!(forged.outcome, TransitionOutcome::RolledBack);
+    assert_eq!(
+        forged.error.as_ref().map(|error| error.code.as_str()),
+        Some("STORAGE_IDEMPOTENCY_CONFLICT")
+    );
+    assert_eq!(forged.state, first.state);
+}
+
+#[test]
 fn result_and_replay_authority_require_exact_execution_bindings() {
     let payload = json!({});
     let payload_digest = digest(&payload);
