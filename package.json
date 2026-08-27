@@ -24,7 +24,6 @@
     "bin/",
     "dist/",
     "LICENSE",
-    "!dist/src/daemon/**",
     "!dist/src/extensions/**",
     "!dist/src/config.*",
     "!dist/src/core/block-manager.*",

@@ -182,13 +182,14 @@ describe("PKG-001 distributable package", () => {
         "dist/src/adapters/linux-process-confinement.js",
         "dist/src/adapters/linux-module-launcher/linux-module-launcher-process.js",
         "dist/src/adapters/linux-module-launcher/launcher.py",
+        "dist/src/daemon/daemon-config.js",
+        "dist/src/daemon/daemon-config.d.ts",
       ];
       for (const requiredPath of requiredPaths) {
         expect(publishedPaths, `missing ${requiredPath}`).toContain(requiredPath);
       }
 
       for (const publishedPath of publishedPaths) {
-        expect(publishedPath).not.toMatch(/^dist\/src\/daemon(?:\/|$)/);
         expect(publishedPath).not.toMatch(/^dist\/src\/extensions(?:\/|$)/);
         expect(publishedPath).not.toMatch(/^dist\/src\/core\/ipc(?:\.|$)/);
         expect(publishedPath).not.toMatch(

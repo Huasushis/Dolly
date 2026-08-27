@@ -1,8 +1,9 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -32,13 +33,48 @@ import { runDollyCli } from "../../../src/entry.js";
 import { projectRuntimeInstanceStableId } from "../../../src/core/runtime-authority-identities.js";
 
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
-const launcher = resolve(repositoryRoot, "src", "main.ts");
-const tsxBinary = resolve(repositoryRoot, "node_modules", ".bin", "tsx");
+const cliBin = resolve(repositoryRoot, "bin", "dolly.js");
+const buildScript = resolve(repositoryRoot, "scripts", "build.mjs");
+const distEntry = resolve(repositoryRoot, "dist", "src", "entry.js");
+const distDaemonConfig = resolve(repositoryRoot, "dist", "src", "daemon", "daemon-config.js");
 
-const identity: RuntimeAuthorityIdentity = {
-  daemonInstallationId: "01234567-89ab-4def-8123-456789abcdef00",
-  instanceId: "placeholder",
-};
+/**
+ * Produces the compiled production entry and its complete module closure with
+ * the sanctioned build. HEAD's reviewed worker-host binary admission refuses
+ * the recompile (pre-existing reviewed-digest mismatch), so build.mjs exits
+ * non-zero at its cargo stage; this helper requires exactly that refusal and
+ * the compiled closure, and surfaces any other failure.
+ */
+let distBuild: Promise<void> | undefined;
+function ensureBuiltDist(): Promise<void> {
+  distBuild ??= buildDistOnce();
+  return distBuild;
+}
+
+async function buildDistOnce(): Promise<void> {
+  const built = spawnSync(process.execPath, [buildScript], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      CARGO_BUILD_JOBS: "2",
+      WORKER_HOST_CARGO_TARGET_DIR: "",
+    },
+    timeout: 600_000,
+  });
+  if (built.status !== 0) {
+    // The single expected failure is the reviewed worker_host digest admission
+    // refusing a recompile (pre-existing input); the compiled closure must
+    // still be present. build.mjs refuses with "built worker_host digest <d>
+    // != reviewed <r>".
+    expect(JSON.stringify(built.stderr + built.stdout)).toMatch(/!= reviewed /u);
+  }
+  expect(existsSync(distEntry), "compiled dist/src/entry.js missing").toBe(true);
+  expect(
+    existsSync(distDaemonConfig),
+    "compiled dist/src/daemon/daemon-config.js missing",
+  ).toBe(true);
+}
 
 function sha256File(path: string): string {
   return `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
@@ -165,12 +201,12 @@ interface LaunchedCli {
   readonly stderr: string;
 }
 
-/** Enters through the shipped CLI process boundary (src/main.ts, no context). */
+/** Executes the actual shipped bin (bin/dolly.js over the compiled dist). */
 async function launchCli(
   args: readonly string[],
   options: { readonly baseDir: string; readonly cwd: string; readonly signalOnMatch?: RegExp },
 ): Promise<LaunchedCli> {
-  const child = spawn(tsxBinary, [launcher, ...args], {
+  const child = spawn(process.execPath, [cliBin, ...args], {
     cwd: options.cwd,
     env: { ...process.env, XDG_STATE_HOME: options.baseDir },
     stdio: ["ignore", "pipe", "pipe"],
@@ -312,11 +348,12 @@ function projectIdentity(instanceId: string, daemonInstallationId: string): Runt
   };
 }
 
-describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host through the shipped CLI process boundary", () => {
+describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host through the shipped bin", () => {
   it("refuses an absent installation before any spawn or durable premise projection", async () => {
+    await ensureBuiltDist();
     // Real daemon document present, committed authority config naming a server
-    // whose package is NOT installed: the shipped CLI process must refuse
-    // before spawning or projecting.
+    // whose package is NOT installed: the shipped bin must refuse before
+    // spawning or projecting.
     const prepared = await prepareInstance({ installPackage: false, commitAuthority: true });
     try {
       const run = await launchCli(["run", "--config", prepared.configPath], {
@@ -352,9 +389,10 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
     } finally {
       await prepared.close();
     }
-  });
+  }, 600_000);
 
   it("refuses a mismatched package digest before any spawn or durable premise projection", async () => {
+    await ensureBuiltDist();
     const prepared = await prepareInstance({ installPackage: true, commitAuthority: true });
     // Re-commit the CURRENT revision with a mismatched declared package
     // digest against the same real installation register.
@@ -392,9 +430,10 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
     } finally {
       await prepared.close();
     }
-  });
+  }, 600_000);
 
   it("refuses absent committed current configuration before any spawn or durable effect", async () => {
+    await ensureBuiltDist();
     // Real daemon document present, empty authority repository: no committed
     // current configuration must refuse before any spawn or durable effect.
     const prepared = await prepareInstance({ installPackage: false, commitAuthority: false });
@@ -409,14 +448,17 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
     } finally {
       await prepared.close();
     }
-  });
+  }, 600_000);
 
-  it("projects the premise and reaches the process boundary through the shipped CLI, then tears storage and lock down", async () => {
-    // Healthy authority + real installation: the engaged CLI process
-    // genuinely invokes the worker-host composition (durable premise
-    // projection), and the only refusal is the adapter's process boundary
-    // (the fixed packaged binary is a build artifact). After the run the
-    // repository can be reopened and the controller lock re-acquired.
+  it("projects the premise and reaches the process boundary through the shipped bin, then tears storage and lock down", async () => {
+    await ensureBuiltDist();
+    // Healthy authority + real installation: the shipped bin genuinely
+    // invokes the worker-host composition (durable premise projection), and
+    // the only refusal is the adapter's process boundary. HEAD's reviewed
+    // worker-host binary admission refuses the recompile (pre-existing digest
+    // mismatch), so the fixed binary is absent and the adapter refuses there
+    // before any spawn. After the run the repository can be reopened and the
+    // controller lock re-acquired.
     const prepared = await prepareInstance({ installPackage: true, commitAuthority: true });
     try {
       const run = await launchCli(["run", "--config", prepared.configPath], {
@@ -454,11 +496,12 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
     } finally {
       await prepared.close();
     }
-  });
+  }, 600_000);
 
   it("a legacy run without a daemon document never engages the worker route", async () => {
+    await ensureBuiltDist();
     // Current non-runtime CLI behavior: with no durable daemon document the
-    // worker route is not engaged and `dolly run` is the legacy runtime.
+    // worker route is not engaged and the shipped bin runs the legacy runtime.
     const prepared = await prepareInstance({ installPackage: false, commitAuthority: false });
     try {
       const daemonPath = join(prepared.directories.registryDirectory, "daemon.json");
@@ -477,9 +520,10 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
     } finally {
       await prepared.close();
     }
-  });
+  }, 600_000);
 
   it("retains the returned owner; close() stops/reaps descendants before storage close and lock release", async () => {
+    await ensureBuiltDist();
     // Lifecycle contract of the per-instance Runtime Worker host object the
     // entry uses: with the existing process-boundary pattern (fake child,
     // install verifier seam) it returns an owner whose retained handle is
@@ -535,7 +579,7 @@ describe.runIf(process.platform === "linux")("Per-instance Runtime Worker host t
       restore();
       await prepared.close();
     }
-  });
+  }, 600_000);
 });
 
 /** Long-lived NDJSON MCP responder (the real installed-child contract). */
