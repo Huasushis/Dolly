@@ -7,8 +7,9 @@
 //! The stop gate is held through the effect callback, so a completed stop
 //! cannot race a later effect.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
@@ -176,6 +177,134 @@ impl PartialEq for ConfigurationTransactionAuthority {
 
 impl Eq for ConfigurationTransactionAuthority {}
 
+/// Opaque ownership context for one admitted Extension and Module.
+///
+/// Host creates it from the admitted premise and live daemon lifecycle. Its
+/// private fields prevent callers from substituting raw identity values.
+#[derive(Clone)]
+pub struct SecretOwner {
+    extension_id: String,
+    module_id: String,
+    extension_connection_id: String,
+    host_incarnation_revision: i64,
+    worker_epoch: WorkerEpoch,
+    worker_epoch_fence: i64,
+    extension_generation: i64,
+    config_revision: u64,
+    lifecycle: Option<DaemonLifecycleToken>,
+}
+
+impl SecretOwner {
+    fn from_premise(premise: &OperationalPremise) -> Result<Self, ExternalIoError> {
+        let lifecycle = premise
+            .lifecycle
+            .as_ref()
+            .ok_or(ExternalIoError::StaleGeneration)?;
+        lifecycle.check().map_err(map_lifecycle_error)?;
+        let extension_id = premise
+            .extension_id()
+            .ok_or(ExternalIoError::Unauthorized)?
+            .to_owned();
+        if !lifecycle.matches_owner(
+            &extension_id,
+            premise.module_id(),
+            premise.invocation.extension_connection_id(),
+            premise.invocation.incarnation_revision(),
+            premise.invocation.worker_epoch(),
+            premise.invocation.worker_epoch_fence(),
+            premise.extension_generation(),
+        ) {
+            return Err(ExternalIoError::StaleGeneration);
+        }
+        Ok(Self {
+            extension_id,
+            module_id: premise.module_id().to_owned(),
+            extension_connection_id: premise.invocation.extension_connection_id().to_owned(),
+            host_incarnation_revision: premise.invocation.incarnation_revision(),
+            worker_epoch: premise.invocation.worker_epoch().clone(),
+            worker_epoch_fence: premise.invocation.worker_epoch_fence(),
+            extension_generation: premise.extension_generation(),
+            config_revision: premise.config_revision(),
+            lifecycle: Some(lifecycle.clone()),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        extension_id: &str,
+        module_id: &str,
+        extension_connection_id: &str,
+        config_revision: u64,
+        extension_generation: i64,
+    ) -> Self {
+        Self {
+            extension_id: extension_id.to_owned(),
+            module_id: module_id.to_owned(),
+            extension_connection_id: extension_connection_id.to_owned(),
+            host_incarnation_revision: 1,
+            worker_epoch: "018f0f00-0000-7000-8000-000000000001"
+                .parse()
+                .expect("WorkerEpoch"),
+            worker_epoch_fence: 1,
+            extension_generation,
+            config_revision,
+            lifecycle: None,
+        }
+    }
+
+    fn check_live(&self) -> Result<(), SecretError> {
+        match self.lifecycle.as_ref() {
+            Some(lifecycle) => lifecycle
+                .check()
+                .map_err(|_| SecretError::Unavailable),
+            None => {
+                #[cfg(test)]
+                {
+                    Ok(())
+                }
+                #[cfg(not(test))]
+                {
+                    Err(SecretError::Unavailable)
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Debug for SecretOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretOwner(<sealed>)")
+    }
+}
+
+impl PartialEq for SecretOwner {
+    fn eq(&self, other: &Self) -> bool {
+        self.extension_id == other.extension_id
+            && self.module_id == other.module_id
+            && self.extension_connection_id == other.extension_connection_id
+            && self.host_incarnation_revision == other.host_incarnation_revision
+            && self.worker_epoch == other.worker_epoch
+            && self.worker_epoch_fence == other.worker_epoch_fence
+            && self.extension_generation == other.extension_generation
+            && self.config_revision == other.config_revision
+    }
+}
+
+impl Eq for SecretOwner {}
+
+impl std::hash::Hash for SecretOwner {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.extension_id.hash(state);
+        self.module_id.hash(state);
+        self.extension_connection_id.hash(state);
+        self.host_incarnation_revision.hash(state);
+        self.worker_epoch.hash(state);
+        self.worker_epoch_fence.hash(state);
+        self.extension_generation.hash(state);
+        self.config_revision.hash(state);
+    }
+}
+
 /// The explicit operational premise produced from one accepted G2 invocation.
 ///
 /// Its private field preserves the G2 fence and prevents callers from
@@ -237,6 +366,10 @@ impl OperationalPremise {
 
     pub fn extension_generation(&self) -> i64 {
         self.invocation.extension_generation()
+    }
+    /// Create the sealed owner context for Host secret storage and resolution.
+    pub fn secret_owner(&self) -> Result<SecretOwner, ExternalIoError> {
+        SecretOwner::from_premise(self)
     }
 
     /// Create the immutable configuration authority for this live invocation.
@@ -559,7 +692,7 @@ impl SecretMaterial {
         Self(bytes.to_vec())
     }
 
-    pub fn with_bytes<T>(&self, callback: impl FnOnce(&[u8]) -> T) -> T {
+    pub(crate) fn with_bytes<T>(&self, callback: impl FnOnce(&[u8]) -> T) -> T {
         callback(&self.0)
     }
 }
@@ -580,10 +713,14 @@ impl Drop for SecretMaterial {
     }
 }
 
-/// Host-owned provider interface. Implementations return material only to the
-/// sealed Host authority; callers receive it through a use callback.
+/// Host-owned provider interface. Implementations must bind lookups to the
+/// supplied sealed owner and reference.
 pub trait SecretProvider: Send + Sync {
-    fn resolve(&self, reference: &SecretRef) -> Result<SecretMaterial, SecretError>;
+    fn resolve(
+        &self,
+        owner: &SecretOwner,
+        reference: &SecretRef,
+    ) -> Result<SecretMaterial, SecretError>;
 }
 
 /// Fail-closed secret provider errors; references and material are omitted.
@@ -606,10 +743,13 @@ impl HostSecretAuthority {
 
     fn with_secret<T>(
         &self,
+        owner: &SecretOwner,
         reference: &SecretRef,
         callback: impl FnOnce(&[u8]) -> T,
     ) -> Result<T, SecretError> {
-        let material = self.provider.resolve(reference)?;
+        owner.check_live()?;
+        let material = self.provider.resolve(owner, reference)?;
+        owner.check_live()?;
         Ok(material.with_bytes(callback))
     }
 }
@@ -624,13 +764,13 @@ impl fmt::Debug for HostSecretAuthority {
 /// implement `SecretProvider` without exposing durable plaintext.
 #[derive(Default)]
 pub struct InMemorySecretProvider {
-    values: Mutex<BTreeMap<SecretRef, Vec<u8>>>,
+    values: Mutex<HashMap<(SecretOwner, SecretRef), Vec<u8>>>,
 }
 
 impl InMemorySecretProvider {
-    pub fn insert(&self, reference: SecretRef, bytes: &[u8]) {
+    pub fn insert(&self, owner: &SecretOwner, reference: SecretRef, bytes: &[u8]) {
         if let Ok(mut values) = self.values.lock() {
-            values.insert(reference, bytes.to_vec());
+            values.insert((owner.clone(), reference), bytes.to_vec());
         }
     }
 }
@@ -642,10 +782,14 @@ impl fmt::Debug for InMemorySecretProvider {
 }
 
 impl SecretProvider for InMemorySecretProvider {
-    fn resolve(&self, reference: &SecretRef) -> Result<SecretMaterial, SecretError> {
+    fn resolve(
+        &self,
+        owner: &SecretOwner,
+        reference: &SecretRef,
+    ) -> Result<SecretMaterial, SecretError> {
         let values = self.values.lock().map_err(|_| SecretError::Unavailable)?;
         values
-            .get(reference)
+            .get(&(owner.clone(), reference.clone()))
             .map(|bytes| SecretMaterial::from_bytes(bytes))
             .ok_or(SecretError::Unavailable)
     }
@@ -714,12 +858,14 @@ impl HostExternalIoAuthority {
             .as_ref()
             .ok_or(ExternalIoError::StaleGeneration)?;
         lifecycle.check().map_err(map_lifecycle_error)?;
+        let owner = SecretOwner::from_premise(premise)?;
         self.authorize_claims_with_lifecycle(
             premise.extension_id(),
             premise.config_revision(),
             premise.extension_generation(),
             request,
             Some(lifecycle.clone()),
+            owner,
         )
     }
 
@@ -737,9 +883,16 @@ impl HostExternalIoAuthority {
             generation,
             request,
             None,
+            SecretOwner::for_test(
+                premise_extension.unwrap_or("org.example.extension"),
+                "module-one",
+                "connection-one",
+                config_revision,
+                generation,
+            ),
         )
-    }
 
+    }
     fn authorize_claims_with_lifecycle(
         &self,
         premise_extension: Option<&str>,
@@ -747,6 +900,7 @@ impl HostExternalIoAuthority {
         generation: i64,
         request: ExternalIoRequest,
         lifecycle: Option<DaemonLifecycleToken>,
+        owner: SecretOwner,
     ) -> Result<ExternalIoPermit, ExternalIoError> {
         if let Some(lifecycle) = &lifecycle {
             lifecycle.check().map_err(map_lifecycle_error)?;
@@ -790,6 +944,7 @@ impl HostExternalIoAuthority {
             request,
             generation,
             lifecycle,
+            owner,
         })
     }
 }
@@ -799,6 +954,7 @@ pub struct ExternalIoPermit {
     request: ExternalIoRequest,
     generation: i64,
     lifecycle: Option<DaemonLifecycleToken>,
+    owner: SecretOwner,
 }
 
 impl fmt::Debug for HostExternalIoAuthority {
@@ -904,19 +1060,23 @@ impl ExternalIoPermit {
 
         let result = match self.request.secret_ref() {
             Some(reference) => {
-                let resolved = self.authority.secrets.with_secret(reference, |secret| {
-                    if let Some(scope) = &in_flight {
-                        scope.check().map_err(|error| {
-                            ExternalIoExecutionError::Denied(map_lifecycle_error(error))
-                        })?;
-                    }
-                    effect(ExternalIoContext {
-                        request: &self.request,
-                        secret: Some(secret),
-                        cancellation: in_flight.as_ref(),
-                    })
-                    .map_err(ExternalIoExecutionError::Effect)
-                });
+                let resolved = self.authority.secrets.with_secret(
+                    &self.owner,
+                    reference,
+                    |secret| {
+                        if let Some(scope) = &in_flight {
+                            scope.check().map_err(|error| {
+                                ExternalIoExecutionError::Denied(map_lifecycle_error(error))
+                            })?;
+                        }
+                        effect(ExternalIoContext {
+                            request: &self.request,
+                            secret: Some(secret),
+                            cancellation: in_flight.as_ref(),
+                        })
+                        .map_err(ExternalIoExecutionError::Effect)
+                    },
+                );
                 match resolved {
                     Ok(result) => result,
                     Err(_) => return Err(ExternalIoExecutionError::SecretUnavailable),
@@ -987,17 +1147,24 @@ mod tests {
     #[test]
     fn secret_material_is_not_debuggable_and_resolves_only_in_a_callback() {
         let reference: SecretRef = "secret://vault/api".parse().expect("reference");
+        let owner = SecretOwner::for_test(
+            "org.example.extension",
+            "module-one",
+            "connection-one",
+            1,
+            4,
+        );
         let provider = Arc::new(InMemorySecretProvider::default());
-        provider.insert(reference.clone(), b"plain-secret");
+        provider.insert(&owner, reference.clone(), b"plain-secret");
         let authority = HostSecretAuthority::new(provider);
         let debug = format!("{authority:?}");
         assert!(!debug.contains("plain-secret"));
         let used = authority
-            .with_secret(&reference, |secret| secret == b"plain-secret")
+            .with_secret(&owner, &reference, |secret| secret == b"plain-secret")
             .expect("resolved");
         assert!(used);
         assert!(matches!(
-            authority.with_secret(&"secret://vault/missing".parse().unwrap(), |_| ()),
+            authority.with_secret(&owner, &"secret://vault/missing".parse().unwrap(), |_| ()),
             Err(SecretError::Unavailable)
         ));
     }
@@ -1018,8 +1185,15 @@ mod tests {
     #[test]
     fn stop_is_checked_before_secret_resolution_and_effect() {
         let reference: SecretRef = "secret://vault/api".parse().unwrap();
+        let owner = SecretOwner::for_test(
+            "org.example.extension",
+            "module-one",
+            "connection-one",
+            1,
+            4,
+        );
         let provider = Arc::new(InMemorySecretProvider::default());
-        provider.insert(reference.clone(), b"plain-secret");
+        provider.insert(&owner, reference.clone(), b"plain-secret");
         let target = ExternalTarget::new("https", "api.example.test", 443, "/v1/data").unwrap();
         let mut policy = ExternalIoPolicy::new("org.example.extension", 1, 4).unwrap();
         policy.allow_operation("read").unwrap();
@@ -1076,6 +1250,84 @@ mod tests {
             Err(ExternalIoExecutionError::SecretUnavailable)
         ));
         assert_eq!(effects.get(), 0);
+    }
+
+    #[test]
+    fn extension_a_cannot_use_extension_b_or_module_b_secret_reference() {
+        let reference: SecretRef = "secret://vault/shared".parse().unwrap();
+        let owner_a =
+            SecretOwner::for_test("org.example.extension", "module-one", "connection-one", 1, 4);
+        let owner_b_extension =
+            SecretOwner::for_test("org.other.extension", "module-one", "connection-two", 1, 4);
+        let owner_b_module =
+            SecretOwner::for_test("org.example.extension", "module-two", "connection-three", 1, 4);
+        let provider = Arc::new(InMemorySecretProvider::default());
+        provider.insert(
+            &owner_b_extension,
+            reference.clone(),
+            b"extension-b-secret",
+        );
+        provider.insert(&owner_b_module, reference.clone(), b"module-b-secret");
+        let mut policy = ExternalIoPolicy::new("org.example.extension", 1, 4).unwrap();
+        policy.allow_operation("read").unwrap();
+        let target = ExternalTarget::new("https", "api.example.test", 443, "/v1/data").unwrap();
+        policy.allow_target(target.clone());
+        let authority = HostExternalIoAuthority::new(
+            policy.clone(),
+            HostSecretAuthority::new(provider),
+        );
+        let request = ExternalIoRequest::new(
+            "org.example.extension",
+            "read",
+            target.clone(),
+            Some(reference.clone()),
+        )
+        .unwrap();
+        let permit = authority
+            .authorize_claims(Some("org.example.extension"), 1, 4, request)
+            .unwrap();
+        let effects = std::cell::Cell::new(0);
+        let result = permit.execute(|_| {
+            effects.set(effects.get() + 1);
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(
+            result,
+            Err(ExternalIoExecutionError::SecretUnavailable)
+        ));
+        assert_eq!(effects.get(), 0);
+
+        let collision_provider = Arc::new(InMemorySecretProvider::default());
+        collision_provider.insert(&owner_a, reference.clone(), b"extension-a-secret");
+        collision_provider.insert(
+            &owner_b_extension,
+            reference.clone(),
+            b"extension-b-secret",
+        );
+        collision_provider.insert(&owner_b_module, reference.clone(), b"module-b-secret");
+        let collision_authority =
+            HostExternalIoAuthority::new(policy, HostSecretAuthority::new(collision_provider));
+        let collision_request = ExternalIoRequest::new(
+            "org.example.extension",
+            "read",
+            target,
+            Some(reference),
+        )
+        .unwrap();
+        let permit = collision_authority
+            .authorize_claims(Some("org.example.extension"), 1, 4, collision_request)
+            .unwrap();
+        let effects = std::cell::Cell::new(0);
+        let result = permit.execute(|context| {
+            effects.set(effects.get() + 1);
+            assert_eq!(
+                context.secret_bytes(),
+                Some(b"extension-a-secret".as_slice())
+            );
+            Ok::<_, ()>(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(effects.get(), 1);
     }
 
     #[test]

@@ -14,10 +14,11 @@ use dolly_core_reducer::{
 };
 use dolly_extension_host::{
     ConfigurationDisposition, ConfigurationError, ConfigurationStore, ConfigurationTransaction,
+    InMemorySecretProvider, SecretRef,
 };
+use dolly_storage::SqliteCoreStore;
 use dolly_protocol::FrameLimits;
 use dolly_runtime::{DispatchResult, ExecutionPremise, LeaseRequest, RuntimeTransactionEngine};
-use dolly_storage::SqliteCoreStore;
 use dolly_worker::daemon::{
     DaemonCommand, DaemonError, DaemonGeneration, DaemonLifecycleIdentity, DaemonReadinessConfig,
     DaemonState, LocalDaemonSupervisor, RestartBounds,
@@ -879,17 +880,21 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     .expect("external policy");
     policy.allow_operation("read").expect("operation");
     policy.allow_target(target.clone());
+    let secret_owner = operational
+        .secret_owner()
+        .expect("live premise must create a secret owner");
+    let secret_reference: SecretRef = "secret://vault/g3".parse().expect("secret reference");
+    let secret_provider = Arc::new(InMemorySecretProvider::default());
+    secret_provider.insert(&secret_owner, secret_reference.clone(), b"g3-secret");
     let authority = dolly_extension_host::HostExternalIoAuthority::new(
         policy,
-        dolly_extension_host::HostSecretAuthority::new(Arc::new(
-            dolly_extension_host::InMemorySecretProvider::default(),
-        )),
+        dolly_extension_host::HostSecretAuthority::new(secret_provider),
     );
     let request = dolly_extension_host::ExternalIoRequest::new(
         "org.example.extension",
         "read",
         target.clone(),
-        None,
+        Some(secret_reference.clone()),
     )
     .expect("external request");
     let stopped_permit = authority

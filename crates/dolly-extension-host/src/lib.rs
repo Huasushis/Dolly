@@ -40,7 +40,7 @@ pub use operability::{
     ConfigurationTransactionAuthority, ExternalIoContext, ExternalIoError,
     ExternalIoExecutionError, ExternalIoPermit, ExternalIoPolicy, ExternalIoRequest,
     ExternalTarget, HostExternalIoAuthority, HostSecretAuthority, InMemorySecretProvider,
-    IoPolicyError, OperationalPremise, SecretError, SecretMaterial, SecretProvider,
+    IoPolicyError, OperationalPremise, SecretError, SecretMaterial, SecretOwner, SecretProvider,
 };
 
 use thiserror::Error;
