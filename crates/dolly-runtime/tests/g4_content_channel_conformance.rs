@@ -1,25 +1,43 @@
 //! Authoritative G4 conformance for the WP-010 Asset and WP-013A/013B
 //! Channel content/channel substrate.
 //!
-//! This suite freezes the PRODUCT_RED/acceptance matrix for G4 without
-//! implementing production behavior. The matrix fixture is the authoritative
-//! document: every case names its expected outcome (`product_red`, `pass`, or
-//! `blocked`), the stable interface seam it expects from Asset and Channel,
-//! and the exact causal red when product behavior is missing.
+//! This suite freezes the PRODUCT_RED/acceptance matrix for G4. The matrix
+//! fixture is the authoritative document: every case names its expected
+//! outcome (`product_red`, `pass`, or `blocked`), the stable interface seam
+//! it expects from Asset and Channel, and the exact causal red when product
+//! behavior is missing.
 //!
-//! Executables here split into three groups:
+//! Executables here split into four groups:
 //!
 //! - fail-closed controls (`G4-CONTROL-*`, expected `pass`): negative
 //!   authority and premise-direction properties already enforced by the
 //!   accepted G1-G3 boundaries. They run against the current product and must
 //!   stay green.
-//! - product-red probes (`G4-WP010-*`, `G4-WP013A-*`, expected `product_red`):
-//!   each first proves the harness is healthy (config install, graph install,
-//!   durable Core ingress commit all succeed) and then asserts a WP-010/013A
-//!   contract the current product does not provide, failing with an exact
-//!   `PRODUCT_RED` message naming the seam. These are red until the product
-//!   implements the seam, at which point the probe is rewritten to drive it.
-//! - blocked declarations (`G4-WP013B-*`, `expected product_red` with
+//! - verified crate contracts (`G4-WP010-*`, `G4-WP013A-*`, expected
+//!   `pass`): the probe drives the integrated `dolly-asset`/`dolly-channel`
+//!   public surface directly — `AssetService`/`ImportPipeline`, and the
+//!   Channel pipeline (`process_event`/`reconcile_inbound`/`dispatch_send`)
+//!   through an in-test `host.ingress.*` adapter backed by the real Core
+//!   transaction. Where the crate behavior meets the spec, the case is a real
+//!   green acceptance and a regression here is a product violation.
+//! - product-red probes (`G4-WP010-*`, `G4-WP013A-*`, expected
+//!   `product_red`): each first drives the harness (config install, graph
+//!   install, durable Core ingress commit) AND the integrated crate surface
+//!   for the seam it names, so every crate contract exercised above is proven
+//!   working; only the exact absent Host/runtime adapter seam named in
+//!   `causal_red` turns the case red. Remaining REDs are confined to the four
+//!   Host/runtime adapter seams: (A) Asset Host — no route from a committed
+//!   `asset_input` block into `AssetService`, no `host.asset.import`/
+//!   `host.asset.status` including an authoritative `absent` outcome;
+//!   (B) Core ingress Host — no `host.ingress.submit`/`host.ingress.status`
+//!   adapter backed by the real Core (the only `CoreIngress` impls in the
+//!   workspace are test doubles); (C) Channel inbound persistence/wiring —
+//!   no runtime backing for the Channel durable ledger; (D) committed-Action
+//!   outbound consumer — no runtime consumer that feeds committed blocks
+//!   into `dispatch_send`, and no caller-deadline queue in that path. The
+//!   message distinguishes compile/API absence from runtime behavior and
+//!   never calls a harness failure a PRODUCT_RED.
+//! - blocked declarations (`G4-WP013B-*`, expected `product_red` with
 //!   `blocked: true`): retained in the matrix, asserted to be blocked, and
 //!   never executed until WP-010 and WP-013A interfaces freeze.
 //!
@@ -38,8 +56,36 @@ use dolly_storage::SqliteCoreStore;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
+// ---------------------------------------------------------------------------
+// Integrated crate surfaces under test (dev-dependencies).
+// ---------------------------------------------------------------------------
+
+use dolly_asset::clock::FixedClock;
+use dolly_asset::config::{ReplicaConfig, ResolvedAssetConfig};
+use dolly_asset::error::AssetErrorCode;
+use dolly_asset::identity::{AssetId, ContentHash};
+use dolly_asset::record::{ImportRequest, MediaKind, Source};
+use dolly_asset::remote::DeniedFetcher;
+use dolly_asset::replica::{DisabledReplica, InMemoryReplica};
+use dolly_asset::service::AssetService;
+use dolly_asset::AssetCapability;
+use dolly_channel::config::SessionMappingPolicy;
+use dolly_channel::{
+    ChannelConfig, ChannelConfigBuilder, ChannelLedger, CoreIngress, CoreIngressError,
+    EventKind, IngressCommit, IngressOutcome, IngressStatusResult, IngressSubmitReceipt,
+    IngressSubmitRequest, OutboundAdmission, OutboundState, ScriptedTransport,
+    SendDispatchResult, TransportPieceOutcome, TransportSendResult, VirtualClock,
+    dispatch_send, parse_event, parse_send_action, process_event, reconcile_inbound,
+};
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
 const MATRIX: &str = include_str!("fixtures/g4_content_channel_conformance.json");
 const TARGET_PAGE: &str = "page-web-primary";
+const CHANNEL_NOW: &str = "2026-08-28T00:00:00.000000Z";
+/// A fixed unix-millisecond instant for the asset harness.
+const ASSET_T0: u64 = 1_800_000_000_000;
 
 fn matrix() -> Value {
     serde_json::from_str(MATRIX).expect("G4 matrix fixture must be valid JSON")
@@ -64,7 +110,7 @@ fn canonical_digest(value: &Value) -> String {
 
 fn input() -> EnvironmentInput {
     EnvironmentInput {
-        now: "2026-08-28T00:00:00.000000Z".into(),
+        now: CHANNEL_NOW.into(),
         ..Default::default()
     }
 }
@@ -202,14 +248,17 @@ fn transact_ingress(
         .expect("ingress transaction must execute")
 }
 
-/// The exact causal red: every harness step succeeded; only the missing
+/// The exact causal red: every causal step above (harness health plus the
+/// integrated crate surface the probe drives) succeeded; only the missing
 /// product behavior named by the seam turns the case red.
 fn product_red(case_id: &str, seam: &str, cause: &str, area: &str) -> ! {
     panic!(
         "PRODUCT_RED [{case_id}] seam={seam} cause={cause} area={area}; \
-         every harness step above (config install, graph install, durable Core \
-         ingress commit) succeeded, so this failure is causal to the missing \
-         product behavior, not a harness, build, or environment failure"
+         every causal step above (config install, graph install, the real Core \
+         transaction, and the integrated dolly-asset/dolly-channel surface this \
+         probe drives) succeeded, so this failure is attributable to the missing \
+         Host/runtime adapter seam named in the cause — not a harness, build, \
+         or environment failure"
     )
 }
 
@@ -254,16 +303,444 @@ fn asset_input_draft(media_type: &str, base64_payload: &str, domain: &str) -> Va
     })
 }
 
-fn assert_harness_committed(transition: &Transition) {
-    assert_eq!(
-        transition.outcome,
-        TransitionOutcome::Committed,
-        "harness: durable ingress commit must succeed before the seam probe"
-    );
-    assert!(
-        transition.state.blocks.values().next().is_some(),
-        "harness: the committed block must be durable in the Core snapshot"
-    );
+// ---------------------------------------------------------------------------
+// Asset harness: the integrated dolly-asset public surface.
+// ---------------------------------------------------------------------------
+
+/// A unique scratch root per test; removed on drop. No extra dependency.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new(tag: &str) -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "g4-asset-{tag}-{}-{stamp:x}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        ScratchDir(dir)
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A minimal byte sequence that sniffs as a WxH PNG (signature + IHDR + pad).
+fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.extend_from_slice(&[0, 0, 0, 13]);
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&w.to_be_bytes());
+    bytes.extend_from_slice(&h.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes.extend_from_slice(&[0u8; 24]); // tail junk; the sniffer reads only the head
+    bytes
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const B64: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in bytes {
+        acc = (acc << 8) | b as u32;
+        bits += 8;
+        while bits >= 6 {
+            bits -= 6;
+            out.push(B64[((acc >> bits) & 0x3f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(B64[((acc << (6 - bits)) & 0x3f) as usize] as char);
+    }
+    while out.len() % 4 != 0 {
+        out.push('=');
+    }
+    let _ = dolly_asset::source::strict_base64_decoded_len(&out)
+        .expect("round-trip encoding is canonical");
+    out
+}
+
+fn import_id(n: u64) -> String {
+    format!("0198ab31-6c44-7e8a-b2bb-{n:012}")
+}
+
+fn asset_config_at(dir: &Path) -> ResolvedAssetConfig {
+    let mut config = ResolvedAssetConfig::with_local_root(dir.to_path_buf());
+    config.max_decoded_bytes = 64 * 1024;
+    config.max_inline_base64_chars = 128 * 1024;
+    config.max_image_pixels = 1_000_000;
+    config.gc_grace_ms = 60_000;
+    config
+}
+
+/// A shared, advanceable clock: the test advances the SAME clock instance
+/// the service holds, so GC expiry and grace paths are deterministic.
+#[derive(Clone)]
+struct SharedClock(Arc<Mutex<u64>>);
+
+impl SharedClock {
+    fn new(millis: u64) -> Self {
+        Self(Arc::new(Mutex::new(millis)))
+    }
+    fn advance(&self, delta_ms: u64) {
+        *self.0.lock().expect("clock mutex") += delta_ms;
+    }
+}
+
+impl dolly_asset::clock::Clock for SharedClock {
+    fn now(&mut self) -> dolly_asset::ClockTime {
+        let millis = *self.0.lock().expect("clock mutex");
+        dolly_asset::ClockTime::new(millis)
+    }
+}
+
+/// A fixed-clock, single-instance asset service over a scratch root. The
+/// returned clock is the very clock the service advances on, so the test can
+/// drive expiry deterministically.
+fn asset_service_at(dir: &Path) -> (AssetService, SharedClock) {
+    let clock = SharedClock::new(ASSET_T0);
+    let service = AssetService::open_with(
+        asset_config_at(dir),
+        clock.clone(),
+        DeniedFetcher,
+        DisabledReplica::new("assets"),
+    )
+    .expect("asset service opens");
+    (service, clock)
+}
+
+fn asset_capability(service: &AssetService) -> AssetCapability {
+    service.issue_capability("personal", "instance-a", "module-a")
+}
+
+fn asset_request(
+    import_id: &str,
+    source: Source,
+    declared: Option<&str>,
+    remote_required: bool,
+) -> ImportRequest {
+    ImportRequest {
+        import_id: import_id.to_string(),
+        instance_id: "instance-a".to_string(),
+        module_id: "module-a".to_string(),
+        activation_id: None,
+        lease_token: None,
+        media_kind: MediaKind::Image,
+        source,
+        declared_media_type: declared.map(|m| m.parse().expect("valid media type")),
+        remote_required,
+        expected_byte_length: None,
+        deadline: "2026-08-09T15:00:00.000000Z".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Channel harness: the in-test host.ingress.* adapter over the real Core.
+// ---------------------------------------------------------------------------
+
+/// The in-test `host.ingress.submit` / `host.ingress.status` adapter backing
+/// the integrated `dolly_channel` pipeline with the REAL Core transaction
+/// (`CoreCommand::Ingress` over `SqliteCoreStore`). It plays the exact
+/// product adapter seam B that the shipping runtime does not ship; here it is
+/// the harness that lets the Channel's real production modules talk to the
+/// real Core, so every crate contract is proven against the actual durable
+/// premise.
+struct CoreBackedIngress<'a> {
+    connection: &'a mut Connection,
+    runtime_source: String,
+    fail_submits: u64,
+    /// Submits that COMMIT durably to Core but whose response is lost.
+    commit_then_drop_submits: u64,
+    fail_statuses: u64,
+    next_seq: u64,
+    pub submit_calls: u64,
+    pub status_calls: u64,
+}
+
+impl<'a> CoreBackedIngress<'a> {
+    fn new(connection: &'a mut Connection, module_id: &str) -> Self {
+        Self {
+            connection,
+            runtime_source: format!("{module_id}/channel"),
+            fail_submits: 0,
+            commit_then_drop_submits: 0,
+            fail_statuses: 0,
+            next_seq: 0,
+            submit_calls: 0,
+            status_calls: 0,
+        }
+    }
+
+    fn mint_block_id(&mut self) -> String {
+        self.next_seq += 1;
+        format!("0198ab31-6c44-7e8a-b2bb-{:012}", self.next_seq)
+    }
+
+    fn identity(&self, idempotency_key: &str) -> String {
+        format!("{}\0{}", self.runtime_source, idempotency_key)
+    }
+
+    fn commit_from_snapshot(
+        &mut self,
+        snapshot: &dolly_core_reducer::CoreSnapshot,
+        block_id: &str,
+    ) -> IngressCommit {
+        let graph_revision = snapshot
+            .graph
+            .get("revision")
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+        let deliveries: Vec<(String, i64, i64)> = snapshot
+            .deliveries
+            .iter()
+            .filter(|delivery| delivery["block_id"] == block_id)
+            .enumerate()
+            .map(|(index, delivery)| {
+                let page_id = delivery["page_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let commit_seq = delivery["commit_seq"].as_i64().unwrap_or(index as i64);
+                (page_id, index as i64 + 1, commit_seq)
+            })
+            .collect();
+        IngressCommit {
+            ingress_id: format!("ingress-{block_id}"),
+            block_id: block_id.to_string(),
+            graph_revision,
+            deliveries,
+        }
+    }
+}
+
+impl CoreIngress for CoreBackedIngress<'_> {
+    fn submit(
+        &mut self,
+        request: &IngressSubmitRequest,
+    ) -> Result<IngressSubmitReceipt, CoreIngressError> {
+        self.submit_calls += 1;
+        if self.fail_submits > 0 {
+            self.fail_submits -= 1;
+            return Err(CoreIngressError::UnknownOutcome);
+        }
+        let digest = request
+            .operation_digest()
+            .map_err(|_| CoreIngressError::Rejected {
+                code: "CORE_INVALID_JSON".to_string(),
+            })?;
+        let block: Value = serde_json::to_value(&request.draft)
+            .map_err(|_| CoreIngressError::Rejected {
+                code: "CORE_INVALID_JSON".to_string(),
+            })?;
+        let block_id = self.mint_block_id();
+        let transition = transact_ingress(
+            &mut *self.connection,
+            &self.runtime_source,
+            &request.idempotency_key,
+            &digest,
+            &block_id,
+            block,
+            request.target_page_ids.clone(),
+            &format!("channel-submit-{}", self.submit_calls),
+        );
+        match transition.outcome {
+            TransitionOutcome::Committed => {
+                let idempotent = transition
+                    .reply
+                    .as_ref()
+                    .and_then(|reply| reply.get("idempotent"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if self.commit_then_drop_submits > 0 {
+                    self.commit_then_drop_submits -= 1;
+                    // The commit IS durable in Core; only this response is lost.
+                    return Err(CoreIngressError::UnknownOutcome);
+                }
+                let committed_block_id = transition
+                    .reply
+                    .as_ref()
+                    .and_then(|reply| reply.get("block_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&block_id)
+                    .to_string();
+                let commit =
+                    self.commit_from_snapshot(&transition.state, &committed_block_id);
+                Ok(IngressSubmitReceipt::Committed {
+                    idempotent,
+                    commit,
+                })
+            }
+            TransitionOutcome::RolledBack => {
+                let code = transition
+                    .error
+                    .map(|error| error.code)
+                    .unwrap_or_else(|| "CORE_REJECTED".to_string());
+                Err(CoreIngressError::Rejected { code })
+            }
+            TransitionOutcome::RolledBackWithSafetyStop => {
+                let code = transition
+                    .error
+                    .map(|error| error.code)
+                    .unwrap_or_else(|| "CORE_SAFETY_STOP".to_string());
+                Err(CoreIngressError::Rejected { code })
+            }
+        }
+    }
+
+    fn status(
+        &mut self,
+        _operation_id: &str,
+        _module_id: &str,
+        idempotency_key: &str,
+        _deadline: &str,
+    ) -> Result<IngressStatusResult, CoreIngressError> {
+        self.status_calls += 1;
+        if self.fail_statuses > 0 {
+            self.fail_statuses -= 1;
+            return Err(CoreIngressError::UnknownOutcome);
+        }
+        let store = SqliteCoreStore::new(&mut *self.connection).expect("core schema");
+        let snapshot = store.snapshot().expect("snapshot");
+        let identity = self.identity(idempotency_key);
+        match snapshot.ingress.get(&identity) {
+            Some(record) => {
+                let commit = self.commit_from_snapshot(&snapshot, &record.block_id);
+                Ok(IngressStatusResult::Committed { commit })
+            }
+            None => Ok(IngressStatusResult::Absent),
+        }
+    }
+}
+
+fn channel_config() -> ChannelConfig {
+    ChannelConfigBuilder::new("web", "account-a", "web-channel", 1)
+        .target_pages(&[TARGET_PAGE])
+        .build()
+}
+
+fn channel_clock() -> VirtualClock {
+    use std::str::FromStr;
+    VirtualClock::at(dolly_core_domain::Timestamp::from_str(CHANNEL_NOW).expect("timestamp"))
+}
+
+fn channel_event(
+    account: &str,
+    conversation: &str,
+    message_id: &str,
+    text: &str,
+) -> dolly_channel::InboundEvent {
+    use std::str::FromStr;
+    dolly_channel::InboundEvent {
+        channel_id: "web-primary".to_string(),
+        transport: "web".to_string(),
+        account: account.to_string(),
+        external_conversation_id: conversation.to_string(),
+        external_message_id: message_id.to_string(),
+        sender_class: "user".to_string(),
+        sender_id: format!("sender-{account}"),
+        text: text.to_string(),
+        received_at: dolly_core_domain::Timestamp::from_str(CHANNEL_NOW).expect("timestamp"),
+        event_kind: EventKind::Message,
+        references_external_message_id: None,
+    }
+}
+
+/// The exact raw transport event JSON accepted by `parse_event`, with room
+/// for hostile extra fields on top (parse must ignore them).
+fn channel_raw_event(extra: &Value) -> Value {
+    let mut raw = json!({
+        "channel_id": "web-primary",
+        "transport": "web",
+        "account": "account-a",
+        "external_conversation_id": "conv-1",
+        "external_message_id": "msg-1",
+        "sender_class": "user",
+        "sender_id": "sender-account-a",
+        "event_kind": "message",
+        "text": "Hello, Dolly.",
+        "received_at": CHANNEL_NOW
+    });
+    if let Some(object) = extra.as_object() {
+        for (key, value) in object {
+            raw[key] = value.clone();
+        }
+    }
+    raw
+}
+
+/// A committed Block carrying a targeted channel send action, exactly as Core
+/// would deliver committed Actions to the module (the seam-D input shape).
+fn channel_send_block(action_id: &str, session_id: &str, texts: &[&str]) -> Value {
+    let parts: Vec<Value> = texts
+        .iter()
+        .map(|t| json!({"kind": "text", "text": t, "format": "plain"}))
+        .collect();
+    json!({
+        "schema": "dolly.block/v1",
+        "id": "0198ab31-6c44-7e8a-b2bb-000000000001",
+        "body": {
+            "description": "model response",
+            "parts": parts,
+            "actions": [{
+                "action_id": action_id,
+                "name": "org.dolly.channel.send",
+                "target": {"module_id": "web-channel"},
+                "arguments": {
+                    "session_id": session_id,
+                    "parts": parts,
+                    "reply_to_external_message_id": null
+                },
+                "contract_binding": {
+                    "module_id": "web-channel",
+                    "descriptor_revision": 1,
+                    "action_contract_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    "action_contract": {
+                        "name": "org.dolly.channel.send",
+                        "arguments_schema": {
+                            "uri": "https://dolly.example/spec/0.1/schemas/channel-send.schema.json",
+                            "schema_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                            "semantic_validator": null
+                        },
+                        "result_schema": {
+                            "uri": "https://dolly.example/spec/0.1/schemas/channel-send-result.schema.json",
+                            "schema_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                            "semantic_validator": {
+                                "id": "org.dolly.validator.channel-send-result",
+                                "revision": 1
+                            }
+                        },
+                        "description": "send a message",
+                        "side_effect_class": "idempotent_write"
+                    }
+                }
+            }]
+        }
+    })
+}
+
+/// Dispatch a committed block's send action; requires an existing session.
+fn channel_dispatch(
+    config: &ChannelConfig,
+    ledger: &mut ChannelLedger,
+    transport: &mut ScriptedTransport,
+    block: &Value,
+    action_id: &str,
+) -> SendDispatchResult {
+    let action = parse_send_action(block).expect("block carries a channel send action");
+    assert_eq!(action.action_id, action_id, "block action id matches");
+    let mut admission = OutboundAdmission::new();
+    dispatch_send(config, &channel_clock(), ledger, transport, &mut admission, &action)
 }
 
 // ---------------------------------------------------------------------------
@@ -329,14 +806,6 @@ fn g4_matrix_retains_all_declared_cases_and_causal_classification() {
             "case {id}: expected must be product_red or pass, got {expected}"
         );
         if expected == "product_red" {
-            assert!(
-                entry["seam"].as_str().expect("seam").len() > 20,
-                "case {id} must name the stable interface seam expected from Asset and Channel"
-            );
-            assert!(
-                entry["causal_red"].as_str().expect("causal_red").len() > 20,
-                "case {id} must state the exact causal red"
-            );
             if entry["blocked"].as_bool().unwrap_or(false) {
                 let reason = entry["blocked_reason"].as_str().expect("blocked_reason");
                 assert!(
@@ -347,12 +816,28 @@ fn g4_matrix_retains_all_declared_cases_and_causal_classification() {
                     entry["unblocked_when"].as_array().expect("unblocked_when").len() >= 1,
                     "case {id}: blocked cases must name the unblock conditions"
                 );
+            } else {
+                assert!(
+                    entry["seam"].as_str().expect("seam").len() > 20,
+                    "case {id} must name the stable interface seam expected from Asset and Channel"
+                );
+                assert!(
+                    entry["causal_red"].as_str().expect("causal_red").len() > 20,
+                    "case {id} must state the exact causal red"
+                );
             }
         } else {
             let references = entry["references"]
                 .as_array()
-                .expect("pass control must reference existing tests");
-            assert!(!references.is_empty(), "case {id}: pass control needs references");
+                .expect("pass case must reference the crate surface it drives");
+            assert!(!references.is_empty(), "case {id}: pass case needs references");
+            if !id.starts_with("G4-CONTROL-") {
+                let basis = entry["pass_basis"].as_str().expect("pass_basis");
+                assert!(
+                    basis.len() > 20,
+                    "case {id}: pass_basis must state the exact verified contract"
+                );
+            }
         }
     }
 
@@ -396,16 +881,22 @@ fn g4_matrix_retains_all_declared_cases_and_causal_classification() {
 #[test]
 fn g4_matrix_retains_all_declared_controls() {
     for entry in matrix()["cases"].as_array().expect("cases") {
-        if entry["expected"] == "pass" {
-            let id = entry["id"].as_str().expect("control id");
-            assert!(
-                id.starts_with("G4-CONTROL-"),
-                "control {id} must use the G4-CONTROL- prefix"
-            );
+        let id = entry["id"].as_str().expect("control id");
+        if id.starts_with("G4-CONTROL-") {
+            assert_eq!(entry["expected"], "pass", "control {id} must be pass");
             let assertion = entry["assertion"].as_str().expect("control assertion");
             assert!(
                 assertion.len() > 20,
                 "control {id} must state its executable assertion"
+            );
+        } else if entry["expected"] == "pass" {
+            // Verified WP-010/013A crate-contract cases carry a causal basis
+            // and their own references; they are not controls.
+            let basis = entry["pass_basis"].as_str().expect("wp pass_basis");
+            assert!(basis.len() > 20, "case {id} must state its verified contract");
+            assert!(
+                entry["references"].as_array().expect("references").len() >= 1,
+                "case {id} must reference the crate surface it drives"
             );
         }
     }
@@ -752,7 +1243,7 @@ fn g4_control_block_bytes_stay_untrusted_until_a_core_asset_authority_exists() {
 }
 
 // ---------------------------------------------------------------------------
-// WP-010 Asset product-red probes.
+// WP-010 Asset probes: the integrated dolly-asset public surface.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -761,211 +1252,473 @@ fn g4_wp010_bounded_import_and_crash_recovery_round_trip() {
     assert_eq!(entry["expected"], "product_red");
     let seam = entry["seam"].as_str().expect("seam");
 
-    let mut connection = probe_connection("web-channel", "g4-import-bound");
-    let draft = asset_input_draft("image/png", "aW1hZ2UtYnl0ZXM=", "personal");
-    let transition = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &canonical_digest(&draft),
-        "g4-import-bound-block",
-        draft.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-import-bound",
-    );
-    assert_harness_committed(&transition);
+    // 1. Prove the crate surface: bounded inline import reaches AVAILABLE
+    //    with a canonical AssetRef, and an over-limit source is cut off.
+    let scratch = ScratchDir::new("import-bound");
+    let (mut service, _clock) = asset_service_at(scratch.path());
+    let capability = asset_capability(&service);
+    let png = png_bytes(4, 2);
+    let result = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(601),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("bounded import must commit at the crate surface");
+    assert_eq!(result.state, "available");
+    assert!(result.terminal);
+    let asset = result.asset.as_ref().expect("AssetRef on AVAILABLE");
+    assert_eq!(asset.byte_length, png.len() as u64);
     assert_eq!(
-        transition.state.blocks["g4-import-bound-block"]["asset_input"]["source_kind"],
-        "inline_base64",
-        "harness: the draft arrives at the only durable route that exists"
+        asset.asset_id,
+        AssetId::from_digest(ContentHash::of_bytes(&png).digest)
     );
+
+    // 2. Over-limit source: rejected with SIZE_LIMIT and no asset.
+    let mut big = png_bytes(4, 2);
+    big.resize(200 * 1024, 0); // exceeds the 64 KiB decoded bound
+    let rejected = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(602),
+                Source::InlineBase64 {
+                    base64: base64(&big),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("over-limit import is a recorded rejection");
+    assert_eq!(rejected.state, "rejected");
+    assert!(rejected.asset.is_none());
+    assert_eq!(rejected.error.as_ref().expect("envelope")["code"], "SIZE_LIMIT");
+
+    // 3. Crash recovery: a fresh service over the same root resolves the
+    //    durable record exactly (crash restart from the durable state).
+    let (mut service2, _clock2) = asset_service_at(scratch.path());
+    let capability2 = asset_capability(&service2);
+    let recovered = service2
+        .status(&capability2, &import_id(601))
+        .expect("durable import record survives reopen");
+    assert_eq!(recovered.state, "available");
 
     product_red(
         "G4-WP010-IMPORT-BOUND-001",
         seam,
-        "the only durable route is CoreCommand::Ingress, which commits the block verbatim with a caller-chosen block_id; there is no ImportId persisted ACCEPTED before acquisition, no byte bound, no private staging object, no AVAILABLE gate, and no crash restart from ACCEPTED",
-        "WP-010 Asset import",
+        "the dolly_asset service implements the bounded ACCEPTED->AVAILABLE machine with crash restart (proven above), but the runtime Core route (CoreCommand::Ingress) commits asset_input blocks verbatim and never invokes AssetService, so no ImportId or AssetRef ever enters a committed record, and AssetService.status answers NotFound for an unknown import_id instead of an explicit absent, so a Host cannot distinguish never-submitted from committed (Asset Host seam A)",
+        "WP-010 Asset Host seam (A)",
     );
 }
 
 #[test]
 fn g4_wp010_canonical_identity_and_dedup_are_core_authority_only() {
     let entry = case("G4-WP010-IDENTITY-DEDUP-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
-    let mut connection = probe_connection("web-channel", "g4-identity");
-    let draft = asset_input_draft("image/png", "aW1hZ2UtYnl0ZXM=", "personal");
-    let first = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &canonical_digest(&draft),
-        "g4-identity-block-1",
-        draft.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-identity-1",
+    let scratch = ScratchDir::new("identity-dedup");
+    let (mut service, _clock) = asset_service_at(scratch.path());
+    let capability = asset_capability(&service);
+    let png = png_bytes(4, 2);
+    let encoded = base64(&png);
+
+    let first = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(611),
+                Source::InlineBase64 {
+                    base64: encoded.clone(),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("first import");
+    let second = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(612),
+                Source::InlineBase64 { base64: encoded },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("second import");
+
+    // Identical accepted bytes within one security domain resolve to one
+    // AssetId and one durable lifecycle record.
+    let id1 = first.asset.expect("first AssetRef").asset_id;
+    let id2 = second.asset.expect("second AssetRef").asset_id;
+    assert_eq!(id1, id2, "identical bytes must deduplicate to one AssetId");
+    assert!(id1.as_str().starts_with("ast_b3_"), "canonical AssetId prefix");
+    assert_eq!(
+        id1,
+        AssetId::from_digest(ContentHash::of_bytes(&png).digest),
+        "AssetId is ast_b3_ + base32(blake3-256) over accepted bytes"
     );
-    assert_harness_committed(&first);
-    let second = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-43",
-        &canonical_digest(&draft),
-        "g4-identity-block-2",
-        draft.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-identity-2",
-    );
-    assert_harness_committed(&second);
     assert!(
-        first.state.blocks.contains_key("g4-identity-block-1")
-            && second.state.blocks.contains_key("g4-identity-block-2"),
-        "harness: identical accepted bytes can be committed twice as distinct blocks"
+        scratch.path().join("objects").join(id1.as_str()).exists(),
+        "one content-addressed object"
     );
 
-    product_red(
-        "G4-WP010-IDENTITY-DEDUP-001",
-        seam,
-        "there is no ast_b3_ AssetId minting authority and no content-addressed import record, so identical accepted bytes within one security domain cannot resolve to a single AssetId and deduplication is unverifiable",
-        "WP-010 Asset identity",
+    // Non-canonical encodings are rejected: an AssetId string must match the
+    // exact pattern and re-encode to the canonical base32 form. A real minted
+    // AssetId round-trips; hand-crafted near-misses are refused.
+    let canonical = AssetId::from_digest([0u8; 32]);
+    assert!(
+        canonical.as_str().parse::<AssetId>().is_ok(),
+        "a minted AssetId parses back to itself"
+    );
+    assert!(
+        "ast-b3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+            .parse::<AssetId>()
+            .is_err(),
+        "wrong prefix"
+    );
+    assert!(
+        "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz"
+            .parse::<AssetId>()
+            .is_err(),
+        "z is outside the base32 alphabet"
+    );
+    assert!(
+        "ast_b3_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse::<AssetId>()
+            .is_err(),
+        "too short"
     );
 }
 
 #[test]
 fn g4_wp010_mime_and_security_refusal_precede_availability() {
     let entry = case("G4-WP010-MIME-SECURITY-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
-    let mut connection = probe_connection("web-channel", "g4-mime");
-    // HTML bytes declared as image/png: a MIME spoof the Asset Service must refuse.
-    let html_b64 = base64_html();
-    let draft = asset_input_draft("image/png", &html_b64, "personal");
-    let transition = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &canonical_digest(&draft),
-        "g4-mime-block",
-        draft.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-mime",
-    );
-    assert_harness_committed(&transition);
+    let scratch = ScratchDir::new("mime-security");
+    let (mut service, _clock) = asset_service_at(scratch.path());
+    let capability = asset_capability(&service);
+
+    // 1. Active content declared as image/png is refused: MEDIA_TYPE_MISMATCH,
+    //    never relabeled to an available asset.
+    let svg = b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\"/>";
+    let refused = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(621),
+                Source::InlineBase64 {
+                    base64: base64(svg),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("media mismatch is a recorded rejection");
+    assert_eq!(refused.state, "rejected");
     assert_eq!(
-        transition.state.blocks["g4-mime-block"]["asset_input"]["media_type"],
-        "image/png",
-        "harness: the declared media type is persisted today with no sniffing"
+        refused.error.as_ref().expect("envelope")["code"],
+        "MEDIA_TYPE_MISMATCH"
     );
+    assert!(refused.asset.is_none(), "no availability before refusal");
 
-    product_red(
-        "G4-WP010-MIME-SECURITY-001",
-        seam,
-        "untrusted bytes ride verbatim inside a committed Block with no bounded sniffing, no media allowlist, no MEDIA_TYPE_MISMATCH/UNSAFE_MEDIA refusal, no SOURCE_DENIED SSRF policy, and no strict base64 or bounded-stream limit",
-        "WP-010 Asset MIME and security",
+    // 2. Strict base64: malformed encodings fail before any durable record.
+    let invalid = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(622),
+                Source::InlineBase64 {
+                    base64: "aGVsbG8!".to_string(),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect_err("invalid base64 must be refused");
+    assert_eq!(invalid.code, AssetErrorCode::InvalidBase64);
+
+    // 3. SSRF policy: a remote URL carrying credentials is SOURCE_DENIED.
+    let denied = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(623),
+                Source::RemoteUrl {
+                    url: "https://user:pass@example.com/a.png".to_string(),
+                    max_bytes: 1024,
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect_err("credential-bearing remote source must be denied");
+    assert_eq!(denied.code, AssetErrorCode::SourceDenied);
+
+    // 4. A remote URL with no Host transport is unavailable, never fabricated.
+    let unavailable = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(624),
+                Source::RemoteUrl {
+                    url: "https://example.com/a.png".to_string(),
+                    max_bytes: 1024,
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("remote without transport records rejection");
+    assert_eq!(unavailable.state, "rejected");
+    assert_eq!(
+        unavailable.error.as_ref().expect("envelope")["code"],
+        "SOURCE_UNAVAILABLE"
     );
 }
 
 #[test]
 fn g4_wp010_leases_pins_and_gc_use_atomic_durable_retention() {
     let entry = case("G4-WP010-LEASE-GC-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
-    let mut connection = probe_connection("web-channel", "g4-lease-gc");
-    let draft = asset_input_draft("image/png", "aW1hZ2UtYnl0ZXM=", "personal");
-    let transition = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &canonical_digest(&draft),
-        "g4-lease-gc-block",
-        draft.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-lease-gc",
-    );
-    assert_harness_committed(&transition);
+    let scratch = ScratchDir::new("lease-gc");
+    let (mut service, clock) = asset_service_at(scratch.path());
+    let capability = asset_capability(&service);
+    let png = png_bytes(4, 2);
+    let available = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(631),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("import");
+    let asset_id = available.asset.expect("AssetRef").asset_id.as_str().to_string();
 
-    product_red(
-        "G4-WP010-LEASE-GC-001",
-        seam,
-        "there is no unguessable LeaseId, no finite-lease record atomic with a non-tombstone check, no durable pin, and no mark/tombstone/sweep GC, so retention races and tombstone-resurrection semantics cannot be exercised",
-        "WP-010 Asset leases and GC",
+    // Finite lease with an unguessable id; the lease blocks GC while live.
+    let lease = service
+        .lease(&capability, &asset_id, "model-op-1", "provider output", 240_000)
+        .expect("finite lease");
+    assert!(lease.lease_id.len() >= 32, "unguessable LeaseId");
+    assert!(lease.expires_at > lease.created_at, "finite expiry");
+    clock.advance(120_000);
+    let gc = service.run_gc().expect("gc");
+    assert_eq!(gc.tombstones_created, 0, "a live lease is atomic against GC");
+    assert!(service.release_lease(&lease.lease_id).expect("release"));
+
+    // After the lease and grace pass, the sweep tombstones the object.
+    clock.advance(120_000);
+    let gc = service.run_gc().expect("gc");
+    assert_eq!(gc.tombstones_created, 1);
+    assert!(
+        !scratch.path().join("objects").join(&asset_id).exists(),
+        "sweep removes the object"
     );
+
+    // The tombstone never resurrects: a new lease against it fails.
+    let err = service
+        .lease(&capability, &asset_id, "model-op-2", "late lease", 1000)
+        .expect_err("tombstone must block new leases");
+    assert_eq!(err.code, AssetErrorCode::NotFound);
 }
 
 #[test]
 fn g4_wp010_required_replicas_never_expose_unverified_bytes() {
     let entry = case("G4-WP010-REPLICA-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
-    let mut connection = probe_connection("web-channel", "g4-replica");
-    let mut draft = asset_input_draft("image/png", "aW1hZ2UtYnl0ZXM=", "personal");
-    draft["asset_input"]["remote_required"] = json!(true);
-    let transition = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &canonical_digest(&draft),
-        "g4-replica-block",
-        draft.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-replica",
+    // 1. remote_required with no replica is refused before acquisition.
+    let scratch = ScratchDir::new("replica-none");
+    let (mut service, _clock) = asset_service_at(scratch.path());
+    let capability = asset_capability(&service);
+    let png = png_bytes(4, 2);
+    let refused = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(641),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                true,
+            ),
+        )
+        .expect_err("remote_required without a replica must refuse");
+    assert_eq!(refused.code, AssetErrorCode::RemoteReplicaFailed);
+
+    // 2. remote_required with a failing replica: the row is REPLICA_FAILED
+    //    and never exposes an asset (REMOTE_REPLICA_FAILED).
+    let scratch2 = ScratchDir::new("replica-failing");
+    let mut config = asset_config_at(scratch2.path());
+    config.replica = ReplicaConfig {
+        enabled: true,
+        endpoint: Some("https://oss.example".to_string()),
+        bucket: Some("dolly".to_string()),
+        prefix: Some("assets".to_string()),
+        credential_ref: Some("k8s://dolly/oss".to_string()),
+    };
+    let mut replica = InMemoryReplica::new("assets", "dolly", "dolly-bucket");
+    replica.fail_uploads = true;
+    let mut service2 = AssetService::open_with(
+        config,
+        FixedClock::new(ASSET_T0),
+        DeniedFetcher,
+        replica,
+    )
+    .expect("service with failing replica");
+    let capability2 = asset_capability(&service2);
+    let held = service2
+        .import(
+            &capability2,
+            &asset_request(
+                &import_id(642),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                true,
+            ),
+        )
+        .expect("replica failure is a recorded state");
+    assert_eq!(held.state, "replica_failed");
+    assert!(!held.terminal, "REPLICA_FAILED is not AVAILABLE");
+    assert!(held.asset.is_none(), "unverified replica bytes are not exposed");
+    assert_eq!(
+        held.error.as_ref().expect("envelope")["code"],
+        "REMOTE_REPLICA_FAILED"
     );
-    assert_harness_committed(&transition);
 
-    product_red(
-        "G4-WP010-REPLICA-001",
-        seam,
-        "there is no replica state machine and no remote_required demand, so an unverified required replica could never be held non-available or return REMOTE_REPLICA_FAILED",
-        "WP-010 Asset replicas",
+    // 3. remote_required with a working replica reaches AVAILABLE only after
+    //    the replica verifies the same content hash.
+    let scratch3 = ScratchDir::new("replica-working");
+    let mut config3 = asset_config_at(scratch3.path());
+    config3.replica = ReplicaConfig {
+        enabled: true,
+        endpoint: Some("https://oss.example".to_string()),
+        bucket: Some("dolly".to_string()),
+        prefix: Some("assets".to_string()),
+        credential_ref: Some("k8s://dolly/oss".to_string()),
+    };
+    let mut service3 = AssetService::open_with(
+        config3,
+        FixedClock::new(ASSET_T0),
+        DeniedFetcher,
+        InMemoryReplica::new("assets", "dolly", "dolly-bucket"),
+    )
+    .expect("service with working replica");
+    let capability3 = asset_capability(&service3);
+    let verified = service3
+        .import(
+            &capability3,
+            &asset_request(
+                &import_id(643),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                true,
+            ),
+        )
+        .expect("verified replica import");
+    assert_eq!(verified.state, "available");
+    assert_eq!(
+        verified.asset.expect("AssetRef").asset_id,
+        AssetId::from_digest(ContentHash::of_bytes(&png).digest)
     );
 }
 
 #[test]
 fn g4_wp010_security_domain_isolation_is_recorded_and_enforced() {
     let entry = case("G4-WP010-DOMAIN-ISOLATION-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
-    let mut connection = probe_connection("web-channel", "g4-domain");
-    let personal = asset_input_draft("image/png", "aW1hZ2UtYnl0ZXM=", "personal");
-    let work = asset_input_draft("image/png", "aW1hZ2UtYnl0ZXM=", "work");
-    let first = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &canonical_digest(&personal),
-        "g4-domain-personal-block",
-        personal.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-domain-1",
-    );
-    assert_harness_committed(&first);
-    let second = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-43",
-        &canonical_digest(&work),
-        "g4-domain-work-block",
-        work.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-domain-2",
-    );
-    assert_harness_committed(&second);
+    let scratch = ScratchDir::new("domain-isolation");
+    let (mut service, _clock) = asset_service_at(scratch.path());
+    let domain_a = service.issue_capability("work", "instance-a", "module-a");
+    let domain_b = service.issue_capability("personal", "instance-a", "module-a");
+    let png = png_bytes(4, 2);
 
-    product_red(
-        "G4-WP010-DOMAIN-ISOLATION-001",
-        seam,
-        "the durable snapshot has no security_domain asset record, so identical bytes in two domains are indistinguishable and a cross-domain read cannot be denied",
-        "WP-010 Asset domain isolation",
+    let a = service
+        .import(
+            &domain_a,
+            &asset_request(
+                &import_id(651),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("domain A import");
+    let b = service
+        .import(
+            &domain_b,
+            &asset_request(
+                &import_id(652),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("domain B import");
+    let asset_a = a.asset.expect("A AssetRef");
+    let asset_b = b.asset.expect("B AssetRef");
+    assert_eq!(asset_a.asset_id, asset_b.asset_id, "identical bytes");
+
+    // Domain isolation: a domain that never imported the bytes must NOT read
+    // them, even though a hash match exists in another domain.
+    assert!(service.read(&domain_a, asset_a.asset_id.as_str()).is_ok());
+    let uninvolved = service.issue_capability("other", "instance-a", "module-a");
+    match service.read(&uninvolved, asset_a.asset_id.as_str()) {
+        Ok(_) => panic!("cross-domain read must be denied"),
+        Err(denied) => assert_eq!(denied.code, AssetErrorCode::NotFound),
+    }
+
+    // Capability coupling: module+instance must match the request.
+    let wrong_module = service.issue_capability("personal", "instance-a", "module-b");
+    let denied = service
+        .import(
+            &wrong_module,
+            &asset_request(
+                &import_id(653),
+                Source::InlineBase64 {
+                    base64: base64(&png),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect_err("capability module mismatch must be Unauthorized");
+    assert_eq!(denied.code, AssetErrorCode::Unauthorized);
+
+    // Shared object is retained: neither domain's live row may be GC'd away.
+    let gc = service.run_gc().expect("gc");
+    assert_eq!(gc.tombstones_created, 0);
+    assert!(
+        scratch.path().join("objects").join(asset_a.asset_id.as_str()).exists()
     );
 }
 
 // ---------------------------------------------------------------------------
-// WP-013A Channel product-red probes.
+// WP-013A Channel probes: the integrated dolly-channel public surface over
+// the real Core transaction.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -974,31 +1727,69 @@ fn g4_wp013a_authenticated_text_round_trip_runs_producer_to_premise_to_consumer(
     assert_eq!(entry["expected"], "product_red");
     let seam = entry["seam"].as_str().expect("seam");
 
+    // Integrate the Channel pipeline with the REAL Core transaction through
+    // the in-test host.ingress adapter.
     let mut connection = probe_connection("web-channel", "g4-roundtrip");
-    let block = channel_metadata_block("Hello.");
-    let transition = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &canonical_digest(&block),
-        "g4-roundtrip-block",
-        block.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-roundtrip",
+    let config = channel_config();
+    let clock = channel_clock();
+    let mut ledger = ChannelLedger::new();
+
+    // Producer leg: an authenticated event becomes a committed durable
+    // premise in real Core; the Channel ledger settles to accepted.
+    let (block_id, submit_calls) = {
+        let mut core = CoreBackedIngress::new(&mut connection, "web-channel");
+        let outcome = process_event(
+            &config,
+            &clock,
+            &mut ledger,
+            &mut core,
+            &channel_event("account-a", "conv-1", "in-1", "What is the weather?"),
+        );
+        (
+            outcome
+                .committed_block_id()
+                .expect("inbound event committed")
+                .to_string(),
+            core.submit_calls,
+        )
+    };
+    assert_eq!(submit_calls, 1);
+    let snapshot = {
+        let store = SqliteCoreStore::new(&mut connection).expect("core schema");
+        store.snapshot().expect("snapshot")
+    };
+    assert!(
+        snapshot.blocks.contains_key(&block_id),
+        "the Channel premise is durable in the real Core snapshot"
     );
-    assert_harness_committed(&transition);
-    assert_eq!(
-        transition.state.blocks["g4-roundtrip-block"]["metadata"]["org.dolly.channel"]
-            ["channel_id"],
-        "web-primary",
-        "harness: the channel-shaped draft reaches the durable Core premise"
-    );
+    let session_id = ledger
+        .session("account-a", "conv-1")
+        .expect("session mapped")
+        .clone();
+
+    // Consumer leg: a committed send Action dispatches to a confirmed
+    // ActionResult through the transport seam.
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000701";
+    let block = channel_send_block(action_id, &session_id, &["It will be sunny."]);
+    let mut transport = ScriptedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["transport-reply-1".to_string()],
+    });
+    let outbound = channel_dispatch(&config, &mut ledger, &mut transport, &block, action_id);
+    match outbound {
+        SendDispatchResult::Terminal {
+            state: OutboundState::Confirmed,
+            ..
+        } => {}
+        other => panic!("expected confirmed outbound, got {other:?}"),
+    }
+    assert_eq!(transport.calls().len(), 1);
 
     product_red(
         "G4-WP013A-ROUNDTRIP-001",
         seam,
-        "CoreCommand::Ingress accepts a caller-shaped block and block_id verbatim, so no producer identity is derived by the Host; there is no Channel package, no activation that consumes the committed draft into a channel-owned org.dolly.channel.send action, and no send ActionContract execution",
-        "WP-013A Channel text round trip",
+        "the dolly_channel pipeline runs producer->durable premise->consumer over the real Core when a host.ingress adapter is supplied (proven above), but the shipping runtime ships no host.ingress.submit/status adapter (the only CoreIngress impls in the workspace are test doubles) and no committed-Action consumer, so no product process can derive a producer-bound ingress or dispatch a committed send; Core additionally accepts a caller-chosen block_id, so Block identity is never assigned by the Host (Core ingress Host seam B + committed-Action consumer seam D)",
+        "WP-013A Core ingress Host (B) / committed-Action consumer (D)",
     );
 }
 
@@ -1009,148 +1800,260 @@ fn g4_wp013a_ingress_reconciliation_reads_status_instead_of_resubmitting() {
     let seam = entry["seam"].as_str().expect("seam");
 
     let mut connection = probe_connection("web-channel", "g4-reconcile");
-    let block = channel_metadata_block("Hello.");
-    let digest = canonical_digest(&block);
-    let first = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &digest,
-        "g4-reconcile-block",
-        block.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-reconcile-1",
+    let config = channel_config();
+    let clock = channel_clock();
+    let mut ledger = ChannelLedger::new();
+    let mut core = CoreBackedIngress::new(&mut connection, "web-channel");
+    // The submit COMMITS durably in real Core, but the response is lost.
+    core.commit_then_drop_submits = 1;
+
+    let outcome = process_event(
+        &config,
+        &clock,
+        &mut ledger,
+        &mut core,
+        &channel_event("account-a", "conv-1", "in-1", "Hello."),
     );
-    assert_harness_committed(&first);
-    // Simulate a lost response: the caller only knows it submitted. The only
-    // reconciliation today is resubmitting the identical command, which must
-    // answer the committed mapping.
-    let retried = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &digest,
-        "g4-reconcile-block",
-        block.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-reconcile-2",
+    assert!(
+        matches!(outcome, IngressOutcome::SubmissionPending),
+        "lost response leaves the row submitted"
     );
-    assert_eq!(
-        retried.reply,
-        Some(json!({"block_id": "g4-reconcile-block", "idempotent": true})),
-        "harness: identical resubmission answers the prior mapping"
-    );
+
+    // Reconciliation reads status and settles — with NO resubmission.
+    let unresolved = reconcile_inbound(&config, &clock, &mut ledger, &mut core);
+    assert_eq!(unresolved, 0, "status read settles the row");
+    assert_eq!(core.submit_calls, 1, "no resubmission after a committed state");
+    assert_eq!(core.status_calls, 1, "reconciliation used the status read");
+    let entry = ledger
+        .inbound_entry("account-a", "in-1")
+        .expect("ledger row");
+    assert_eq!(entry.state, dolly_channel::InboundState::Accepted);
+    assert!(entry.block_id.is_some(), "status returned the prior mapping");
 
     product_red(
         "G4-WP013A-INGRESS-RECONCILE-001",
         seam,
-        "host.ingress.status does not exist: a lost-response caller cannot read absent|committed for its principal and key without resubmitting, so reconciliation forces a resubmission that the product contract forbids after an authoritative state",
-        "WP-013A Channel ingress reconciliation",
+        "dolly_channel::reconcile_inbound fully implements status-first reconciliation against the real Core (proven above: a lost-submit row is settled by a status read with no resubmission), but the runtime ships no host.ingress.status service and no CoreIngress implementation, so a lost-response caller in any running product process cannot read absent|committed and must resubmit (Core ingress Host seam B)",
+        "WP-013A Core ingress Host seam (B)",
     );
 }
 
 #[test]
 fn g4_wp013a_sender_conversation_session_and_capability_are_authorized_before_dispatch() {
     let entry = case("G4-WP013A-AUTHORIZATION-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
     let mut connection = probe_connection("web-channel", "g4-authz");
-    // An unauthenticated event with no session: the Channel must refuse before
-    // any ingest or dispatch record exists.
-    let mut hostile = channel_metadata_block("Hello.");
-    hostile["metadata"]["org.dolly.channel"]["sender_class"] = json!("anonymous");
-    hostile["metadata"]["org.dolly.channel"]["session_id"] = json!(Value::Null);
-    let transition = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &canonical_digest(&hostile),
-        "g4-authz-block",
-        hostile.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-authz",
-    );
-    assert_harness_committed(&transition);
+    let config = channel_config();
+    let clock = channel_clock();
+    let mut ledger = ChannelLedger::new();
 
-    product_red(
-        "G4-WP013A-AUTHORIZATION-001",
-        seam,
-        "no Channel transport, session map, or capability check exists, so an unauthenticated event or session-missing send has no authorization decision to fail before dispatch",
-        "WP-013A Channel authorization",
+    // 1. Cross-owner account: refused before any durable mutation.
+    let outcome = {
+        let mut core = CoreBackedIngress::new(&mut connection, "web-channel");
+        process_event(
+            &config,
+            &clock,
+            &mut ledger,
+            &mut core,
+            &channel_event("account-other", "conv-1", "m1", "hello"),
+        )
+    };
+    match outcome {
+        IngressOutcome::RejectedBeforeMutation { error } => {
+            assert_eq!(error.code, "CHANNEL_AUTHENTICATION_FAILED");
+        }
+        other => panic!("expected rejection, got {other:?}"),
+    }
+    assert!(ledger.inbound.is_empty(), "no durable mutation before refusal");
+    assert!(ledger.sessions.is_empty(), "no session created");
+
+    // 2. Unauthorized sender: refused before any Core call.
+    let mut hostile = channel_event("account-a", "conv-1", "m2", "hello");
+    hostile.sender_id = "mallory".to_string();
+    let config_restricted = ChannelConfigBuilder::new("web", "account-a", "web-channel", 1)
+        .allowed_senders(&["sender-account-a"])
+        .target_pages(&[TARGET_PAGE])
+        .build();
+    let outcome = {
+        let mut core = CoreBackedIngress::new(&mut connection, "web-channel");
+        process_event(
+            &config_restricted,
+            &clock,
+            &mut ledger,
+            &mut core,
+            &hostile,
+        )
+    };
+    match outcome {
+        IngressOutcome::RejectedBeforeMutation { error } => {
+            assert_eq!(error.code, "CHANNEL_AUTHORIZATION_FAILED");
+        }
+        other => panic!("expected rejection, got {other:?}"),
+    }
+
+    // 3. Session-missing send under require_known: refused before dispatch.
+    ledger.insert_session("account-a", "conv-1", "session-main");
+    let mut transport = ScriptedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["mid".to_string()],
+    });
+    let config_known = ChannelConfigBuilder::new("web", "account-a", "web-channel", 1)
+        .target_pages(&[TARGET_PAGE])
+        .session_policy(SessionMappingPolicy::RequireKnown)
+        .build();
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000702";
+    let wrong_session_block = channel_send_block(action_id, "session-not-owned", &["hi"]);
+    let outcome = channel_dispatch(
+        &config_known,
+        &mut ledger,
+        &mut transport,
+        &wrong_session_block,
+        action_id,
     );
+    match outcome {
+        SendDispatchResult::Rejected(error) => {
+            assert_eq!(error.code, "CHANNEL_SESSION_MISSING");
+        }
+        other => panic!("expected pre-dispatch rejection, got {other:?}"),
+    }
+    assert_eq!(transport.calls().len(), 0, "no transport call before authorization");
 }
 
 #[test]
 fn g4_wp013a_outbound_replay_returns_the_existing_result_without_resend() {
     let entry = case("G4-WP013A-REPLAY-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
-    let mut connection = probe_connection("web-channel", "g4-replay");
-    let action = json!({
-        "name": "org.dolly.channel.send",
-        "action_id": "0198ab31-6c44-7e8a-b2bb-000000000091",
-        "target": {"module_id": "web-channel"},
-        "arguments": {
-            "session_id": "session-main",
-            "parts": [{"kind": "text", "text": "Hello.", "format": "plain"}],
-            "reply_to_external_message_id": null
+    let config = channel_config();
+    let mut ledger = ChannelLedger::new();
+    ledger.insert_session("account-a", "conv-1", "session-main");
+    let mut transport = ScriptedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["transport-msg-001".to_string()],
+    });
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000703";
+    let block = channel_send_block(action_id, "session-main", &["Hello."]);
+
+    let first = channel_dispatch(&config, &mut ledger, &mut transport, &block, action_id);
+    let (first_state, first_result) = match &first {
+        SendDispatchResult::Terminal { state, result } => (state.clone(), result.clone()),
+        other => panic!("expected Terminal, got {other:?}"),
+    };
+
+    // At-least-once redelivery of the same committed action: the confirmed
+    // replay returns the existing result and never re-dispatches.
+    let second = channel_dispatch(&config, &mut ledger, &mut transport, &block, action_id);
+    match second {
+        SendDispatchResult::Terminal { state, result } => {
+            assert_eq!(state, first_state);
+            assert_eq!(result, first_result, "replay returns the existing result");
         }
-    });
-    let block = json!({
-        "schema": "dolly.block/v1",
-        "parts": [{"kind": "action", "action": action}]
-    });
-    let transition = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &canonical_digest(&block),
-        "g4-replay-block",
-        block.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-replay",
+        other => panic!("expected Terminal replay, got {other:?}"),
+    }
+    assert_eq!(transport.calls().len(), 1, "no re-dispatch of a confirmed send");
+    let entry = ledger.outbound_entry(action_id).expect("one outbound row");
+    assert_eq!(
+        entry.attempts.iter().filter(|a| a.kind == "settle").count(),
+        1,
+        "exactly one terminal settle for the single dispatch"
     );
-    assert_harness_committed(&transition);
-
-    product_red(
-        "G4-WP013A-REPLAY-001",
-        seam,
-        "no outbound ledger and no action_id identity exist, so a confirmed action replay cannot return the existing result and an unknown send has no quarantine disposition",
-        "WP-013A Channel replay and idempotency",
+    assert_eq!(
+        entry.attempts.iter().filter(|a| a.kind == "prepare").count(),
+        1,
+        "the replay added no second prepare"
     );
 }
 
 #[test]
 fn g4_wp013a_unknown_and_partial_outcomes_are_explicit_and_non_retryable() {
     let entry = case("G4-WP013A-UNKNOWN-PARTIAL-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
-    let mut connection = probe_connection("web-channel", "g4-unknown-partial");
-    let block = json!({
-        "schema": "dolly.block/v1",
-        "parts": [{"kind": "text", "text": "split", "format": "plain"}]
+    let config = channel_config();
+
+    // 1. Lost send response: the row stays dispatched, then recovery
+    //    reconciles to a terminal `unknown` (never `failed`, never re-sent).
+    let mut ledger = ChannelLedger::new();
+    ledger.insert_session("account-a", "conv-1", "session-main");
+    let mut transport = ScriptedTransport::new(false);
+    transport.push(TransportSendResult::Timeout);
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000704";
+    let block = channel_send_block(action_id, "session-main", &["Hello."]);
+    let outcome = channel_dispatch(&config, &mut ledger, &mut transport, &block, action_id);
+    assert!(
+        matches!(outcome, SendDispatchResult::DispatchedPending),
+        "timeout after possible send must be unresolved"
+    );
+    assert_eq!(
+        ledger.outbound_entry(action_id).unwrap().state,
+        OutboundState::Dispatched
+    );
+    let mut clock = channel_clock();
+    clock.advance_seconds(config.outbound_limits.unknown_after_seconds as i64 + 1);
+    let recovered = dolly_channel::recover_outbound(&config, &clock, &mut ledger);
+    assert_eq!(recovered, vec![action_id.to_string()]);
+    assert_eq!(
+        ledger.outbound_entry(action_id).unwrap().state,
+        OutboundState::Unknown
+    );
+    assert_eq!(transport.calls().len(), 1, "recovery never re-dispatches");
+
+    // 2. Partial multi-piece send: terminal `partial` with the exact frozen
+    //    ActionResult mapping (CHANNEL_PARTIAL_DELIVERY, retryable false,
+    //    outcome applied, per-piece ordinals).
+    let mut ledger2 = ChannelLedger::new();
+    ledger2.insert_session("account-a", "conv-1", "session-main");
+    let mut transport2 = ScriptedTransport::new(true);
+    transport2.push(TransportSendResult::PerPiece {
+        pieces: vec![
+            TransportPieceOutcome::Confirmed {
+                ordinal: 0,
+                message_id: "mid-0".to_string(),
+            },
+            TransportPieceOutcome::Rejected {
+                ordinal: 1,
+                code: "REMOTE_REFUSED".to_string(),
+            },
+        ],
     });
-    let transition = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &canonical_digest(&block),
-        "g4-unknown-partial-block",
-        block.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-unknown-partial",
-    );
-    assert_harness_committed(&transition);
-
-    product_red(
-        "G4-WP013A-UNKNOWN-PARTIAL-001",
-        seam,
-        "no dispatch record or outcome envelope exists, so a timeout or crash after possible send has no `unknown` disposition, and a split send has no terminal `partial` ActionResult with code CHANNEL_PARTIAL_DELIVERY, retryable false, outcome applied, and per-piece ordinals",
-        "WP-013A Channel unknown and partial outbound",
-    );
+    let action_id2 = "0198ab31-6c44-7e8a-b2bb-000000000705";
+    let block2 = channel_send_block(action_id2, "session-main", &["part one", "part two"]);
+    let outcome2 = channel_dispatch(&config, &mut ledger2, &mut transport2, &block2, action_id2);
+    match outcome2 {
+        SendDispatchResult::Terminal { state, result } => {
+            assert_eq!(state, OutboundState::Partial);
+            let json: Value = serde_json::from_str(
+                &dolly_canonical_json::canonicalize(&result)
+                    .map(|(bytes, _)| String::from_utf8(bytes.as_bytes().to_vec()).unwrap())
+                    .expect("canonical result"),
+            )
+            .expect("result JSON");
+            assert_eq!(json["status"], "failed");
+            assert_eq!(json["result"], Value::Null);
+            assert_eq!(json["error"]["code"], "CHANNEL_PARTIAL_DELIVERY");
+            assert_eq!(json["error"]["retryable"], false);
+            assert_eq!(json["error"]["outcome"], "applied");
+            assert_eq!(json["error"]["details"]["delivery_outcome"], "partial");
+            assert_eq!(
+                json["error"]["details"]["confirmed_ordinals"],
+                json!([0])
+            );
+            assert_eq!(json["error"]["details"]["failed_ordinals"], json!([1]));
+            assert_eq!(json["error"]["details"]["unknown_ordinals"], json!([]));
+        }
+        other => panic!("expected terminal partial, got {other:?}"),
+    }
+    // Never collapsed to success and never retried wholesale.
+    let replay = channel_dispatch(&config, &mut ledger2, &mut transport2, &block2, action_id2);
+    assert!(matches!(
+        replay,
+        SendDispatchResult::Terminal {
+            state: OutboundState::Partial,
+            ..
+        }
+    ));
+    assert_eq!(transport2.calls().len(), 1, "no wholesale retry of a partial send");
 }
 
 #[test]
@@ -1159,119 +2062,175 @@ fn g4_wp013a_outbound_rate_limits_use_bounded_queues_and_caller_deadlines() {
     assert_eq!(entry["expected"], "product_red");
     let seam = entry["seam"].as_str().expect("seam");
 
-    let mut connection = probe_connection("web-channel", "g4-backpressure");
-    let block = channel_metadata_block("burst");
-    let transition = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &canonical_digest(&block),
-        "g4-backpressure-block",
-        block.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-backpressure",
+    // Prove the crate's bounded admission at the surface: one piece is
+    // admitted; a burst past the per-session rate limit is refused as
+    // retryable CHANNEL_RATE_LIMITED.
+    let config = ChannelConfigBuilder::new("web", "account-a", "web-channel", 1)
+        .target_pages(&[TARGET_PAGE])
+        .max_pieces_per_second_per_session(2)
+        .build();
+    let mut ledger = ChannelLedger::new();
+    ledger.insert_session("account-a", "conv-1", "session-main");
+    let mut transport = ScriptedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["m1".to_string()],
+    });
+    let action_id1 = "0198ab31-6c44-7e8a-b2bb-000000000706";
+    let block1 = channel_send_block(action_id1, "session-main", &["one"]);
+    let admitted = channel_dispatch(&config, &mut ledger, &mut transport, &block1, action_id1);
+    assert!(
+        matches!(admitted, SendDispatchResult::Terminal { .. }),
+        "a one-piece dispatch under the limit succeeds at the crate surface"
     );
-    assert_harness_committed(&transition);
+
+    // A three-piece burst on the same session in the same second is refused.
+    let action_id2 = "0198ab31-6c44-7e8a-b2bb-000000000707";
+    let block2 = channel_send_block(
+        action_id2,
+        "session-main",
+        &["one", "two", "three"],
+    );
+    let over = channel_dispatch(&config, &mut ledger, &mut transport, &block2, action_id2);
+    match over {
+        SendDispatchResult::Rejected(error) => {
+            assert_eq!(error.code, "CHANNEL_RATE_LIMITED");
+            assert!(error.retryable, "rate refusal is retryable, not a failure");
+        }
+        other => panic!("expected rate-limited rejection, got {other:?}"),
+    }
+    assert_eq!(transport.calls().len(), 1, "the refused burst never reaches the transport");
 
     product_red(
         "G4-WP013A-BACKPRESSURE-001",
         seam,
-        "no outbound transport queue, rate/concurrency configuration, or caller deadline exists, so a burst cannot be bounded and transport unavailability cannot be proven to leave Core input state untouched",
-        "WP-013A Channel backpressure",
+        "dolly_channel admission bounds pending sends and rate limits per session (proven above: a burst past the limit is CHANNEL_RATE_LIMITED and retryable), but there is no bounded outbound QUEUE primitive and no caller-deadline wait/expiry in the dispatch path — a burst is rejected, not queued under a caller deadline, and no caller deadline is carried into a queue (committed-Action consumer seam D)",
+        "WP-013A committed-Action consumer seam (D)",
     );
 }
 
 #[test]
 fn g4_wp013a_credentials_paths_and_signed_urls_never_enter_metadata_or_logs() {
     let entry = case("G4-WP013A-REDACTION-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
     let mut connection = probe_connection("web-channel", "g4-redaction");
-    let mut credential_carrying = channel_metadata_block("Hello.");
-    credential_carrying["metadata"]["org.dolly.channel"]["authorization"] =
-        json!("Bearer super-secret-token");
-    credential_carrying["metadata"]["org.dolly.channel"]["attachment_path"] =
-        json!("/home/ubuntu/secrets/private.png");
-    let transition = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &canonical_digest(&credential_carrying),
-        "g4-redaction-block",
-        credential_carrying.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-redaction",
-    );
-    assert_harness_committed(&transition);
-    assert_eq!(
-        transition.state.blocks["g4-redaction-block"]["metadata"]["org.dolly.channel"]
-            ["authorization"],
-        "Bearer super-secret-token",
-        "harness: the credential-shaped field is persisted verbatim today"
+    let config = channel_config();
+    let clock = channel_clock();
+    let mut ledger = ChannelLedger::new();
+
+    // A hostile raw event carries credentials, a local path, and a signed
+    // URL. parse_event reads only the validated allowlist; the committed
+    // draft must never contain any of them.
+    let raw = channel_raw_event(&json!({
+        "authorization": "Bearer super-secret-token",
+        "cookie": "session=leaky",
+        "attachment_path": "/home/ubuntu/secrets/private.png",
+        "signed_url": "https://storage.example/presigned?token=abc"
+    }));
+    let event = parse_event(&raw).expect("hostile fields are ignored by parse");
+    let outcome = {
+        let mut core = CoreBackedIngress::new(&mut connection, "web-channel");
+        process_event(&config, &clock, &mut ledger, &mut core, &event)
+    };
+    assert!(
+        outcome.committed_block_id().is_some(),
+        "the event committed through the Channel's only durable route"
     );
 
-    product_red(
-        "G4-WP013A-REDACTION-001",
-        seam,
-        "the durable block copies whatever JSON the caller submits, so a draft carrying credentials or a local path is persisted verbatim with no namespaced-metadata filtering and no redaction boundary",
-        "WP-013A Channel redaction",
+    let entry = ledger
+        .inbound_entry("account-a", "msg-1")
+        .expect("ledger row");
+    for secret in [
+        "authorization".to_string(),
+        "Bearer".to_string(),
+        "cookie".to_string(),
+        "attachment_path".to_string(),
+        "signed_url".to_string(),
+        "super-secret-token".to_string(),
+        "secrets/private.png".to_string(),
+    ] {
+        assert!(
+            !entry.request_jcs.contains(&secret),
+            "draft must not contain {secret}"
+        );
+        assert!(
+            !entry
+                .attempts
+                .iter()
+                .any(|a| a.detail_digest.contains(&secret)),
+            "attempt history must not contain {secret}"
+        );
+    }
+    // The namespaced metadata record is the fixed allowlist, and the draft
+    // schema is the channel block-draft tag, not a caller-shaped block.
+    assert!(
+        entry.request_jcs.contains("\"org.dolly.channel\""),
+        "channel metadata namespace present"
+    );
+    assert!(
+        entry.request_jcs.contains("\"dolly.block-draft/v1\""),
+        "draft is the channel block-draft schema"
+    );
+    assert!(
+        !entry.request_jcs.contains("dolly.block/v1"),
+        "the producer cannot force a caller-shaped block through the Channel"
     );
 }
 
 #[test]
 fn g4_wp013a_channel_cannot_append_to_a_page_or_advance_a_cursor_directly() {
     let entry = case("G4-WP013A-NO-DIRECT-MUTATION-001");
-    assert_eq!(entry["expected"], "product_red");
-    let seam = entry["seam"].as_str().expect("seam");
+    assert_eq!(entry["expected"], "pass");
 
+    // The Channel's only durable write route is the host.ingress.submit seam
+    // backed by the real Core transaction. Drive the full inbound pipeline
+    // and prove the draft reaches the Page as a committed Block delivery,
+    // never as a Page append or Module cursor advance.
     let mut connection = probe_connection("web-channel", "g4-nodirect-channel");
-    let block = channel_metadata_block("Hello.");
-    let transition = transact_ingress(
-        &mut connection,
-        "channel-web",
-        "ext-42",
-        &canonical_digest(&block),
-        "g4-nodirect-channel-block",
-        block.clone(),
-        vec![TARGET_PAGE.into()],
-        "g4-nodirect-channel",
-    );
-    assert_harness_committed(&transition);
-
-    product_red(
-        "G4-WP013A-NO-DIRECT-MUTATION-001",
-        seam,
-        "a Channel implementation does not exist, so the negative direct-mutation route set cannot be exercised against it; the Core-side premise that no third-party direct-mutation command exists is enforced by G4-CONTROL-NO-DIRECT-MUTATION-001, and a future Channel must route every write through host.ingress.submit",
-        "WP-013A Channel no direct Page or cursor mutation",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Small HTML payload, base64-encoded: a MIME spoof when declared as image/png.
-fn base64_html() -> String {
-    const HTML: &[u8] = b"<html><body>not an image</body></html>";
-    let mut encoded = String::with_capacity(HTML.len().div_ceil(3) * 4);
-    use std::fmt::Write as _;
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut i = 0;
-    while i < HTML.len() {
-        let b0 = HTML[i] as u32;
-        let b1 = if i + 1 < HTML.len() { HTML[i + 1] as u32 } else { 0 };
-        let b2 = if i + 2 < HTML.len() { HTML[i + 2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        let _ = write!(
-            encoded,
-            "{}{}{}{}",
-            TABLE[(triple >> 18) as usize & 63] as char,
-            TABLE[(triple >> 12) as usize & 63] as char,
-            if i + 1 < HTML.len() { TABLE[(triple >> 6) as usize & 63] as char } else { '=' },
-            if i + 2 < HTML.len() { TABLE[triple as usize & 63] as char } else { '=' }
+    let config = channel_config();
+    let clock = channel_clock();
+    let mut ledger = ChannelLedger::new();
+    let block_id = {
+        let mut core = CoreBackedIngress::new(&mut connection, "web-channel");
+        let outcome = process_event(
+            &config,
+            &clock,
+            &mut ledger,
+            &mut core,
+            &channel_event("account-a", "conv-1", "in-1", "Hello."),
         );
-        i += 3;
-    }
-    encoded
+        outcome
+            .committed_block_id()
+            .expect("inbound event committed")
+            .to_string()
+    };
+
+    let snapshot = {
+        let store = SqliteCoreStore::new(&mut connection).expect("core schema");
+        store.snapshot().expect("snapshot")
+    };
+    // The committed Block is the durable premise; the Page sees it only
+    // through the block's deliveries, and no Page record is fabricated and no
+    // Module cursor is advanced by the Channel.
+    assert!(snapshot.blocks.contains_key(&block_id));
+    assert!(
+        snapshot.deliveries.iter().any(|delivery| {
+            delivery["block_id"] == block_id && delivery["page_id"] == TARGET_PAGE
+        }),
+        "the draft reaches the Page only as a committed Block delivery"
+    );
+    assert!(
+        snapshot.pages.is_empty(),
+        "no Page record is fabricated by the Channel"
+    );
+    assert!(
+        snapshot.ingress.values().all(|record| record.block_id == block_id),
+        "the only durable write is the Core ingress premise"
+    );
+    // The channel ledger rows carry pages: the target is declared there for
+    // the Host adapter, never applied by the Channel itself.
+    let entry = ledger
+        .inbound_entry("account-a", "in-1")
+        .expect("ledger row");
+    assert_eq!(entry.pages, vec![TARGET_PAGE.to_string()]);
 }

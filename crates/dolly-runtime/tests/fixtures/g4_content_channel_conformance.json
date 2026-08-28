@@ -3,8 +3,8 @@
   "spec_basis": [
     "REQ-ASSET-001",
     "REQ-CHANNEL-001",
-    "docs/spec/services/assets.md::1-9 Asset service normative boundaries",
-    "docs/spec/extensions/channel.md::1-7 Channel Extension normative boundaries",
+    "crates/dolly-asset/src/lib.rs::Core-owned binary Asset service (WP-010) import, identity, media, lease/GC, replica, domain contracts",
+    "crates/dolly-channel/src/lib.rs::org.dolly.channel v1 text ingress and outbound effect ledger contracts",
     "docs/spec/extension-protocol/03-host-services-and-capabilities.md::6 Ingress and Activation status services",
     "docs/spec/extension-protocol/03-host-services-and-capabilities.md::7 Asset services",
     "docs/spec/roadmap/04-critical-path-and-early-use.md::G4 Content/channel substrate",
@@ -21,8 +21,8 @@
     "effect_boundary": "before Asset import, host.ingress.submit, and outbound Channel effects"
   },
   "classification": {
-    "product_red": "asserts a WP-010/013A/013B product contract that is not yet implemented; the probe exercises the current durable Core transaction first, so every harness step succeeds and only the missing named seam turns the case red",
-    "pass": "negative authority or premise-direction control already enforced by the accepted G1-G3 boundaries; regression here is a product violation, so the case must stay green",
+    "product_red": "asserts a WP-010/013A contract that only a Host/runtime adapter seam can satisfy. The probe first drives the harness (config install, graph install, real Core transaction) AND the integrated dolly-asset/dolly-channel public surface for the seam it names, so every crate contract it exercises is proven working; only the exact absent Host/runtime adapter seam named in causal_red turns the case red",
+    "pass": "verified against the integrated dolly-asset/dolly-channel public surface: AssetService/ImportPipeline for WP-010 and the Channel pipeline (process_event/reconcile_inbound/dispatch_send) over the real Core transaction for WP-013A. A regression here is a product violation, so the case must stay green",
     "blocked": "later WP-013B seam whose interfaces (WP-010 Asset authority and WP-013A Channel send contract) are not frozen; retained in the matrix, never executed until both freeze"
   },
   "evidence": {
@@ -49,126 +49,158 @@
       "name": "bounded_import_and_crash_recovery_require_a_core_owned_import_seam",
       "kind": "asset_import_bound",
       "expected": "product_red",
-      "seam": "host.asset.import and host.asset.status (schemas/asset-import.schema.json); ImportId persists ACCEPTED before acquisition; crash restarts from ACCEPTED unless a verified staging object exists",
-      "causal_red": "the only durable draft route today is CoreCommand::Ingress, which commits the block verbatim with a caller-chosen block_id; there is no ImportId, byte bound, staging object, AVAILABLE gate, or crash-restart record, so the round trip cannot begin",
-      "verify": "submit an asset_input ingress draft, then require an import record bound to an ImportId with an enforced size limit; absent -> PRODUCT_RED"
+      "seam": "Asset Host seam (A): a runtime host.asset.import / host.asset.status route from a committed asset_input block into dolly_asset::AssetService, with StatusResult answering an authoritative absent for a never-created import",
+      "causal_red": "dolly_asset::AssetService implements the bounded ACCEPTED->AVAILABLE machine with crash restart (proven by driving it), but the runtime Core route (CoreCommand::Ingress) commits asset_input blocks verbatim and never invokes the service, so no ImportId or AssetRef ever enters a committed record; AssetService.status answers NotFound for an unknown import_id, not an explicit absent, so a Host cannot distinguish never-submitted from committed",
+      "verify": "drive service import and crash recovery, then require the runtime to route a committed asset_input block to ImportId/AssetRef and expose a status that can answer absent; absent -> PRODUCT_RED"
     },
     {
       "id": "G4-WP010-IDENTITY-DEDUP-001",
       "name": "canonical_asset_identity_and_dedup_are_core_authority_only",
       "kind": "asset_identity_dedup",
-      "expected": "product_red",
-      "seam": "AssetId = ast_b3_ + lowercase unpadded base32 of blake3-256 over accepted bytes; identical accepted bytes within one security domain resolve to one AssetId; non-canonical encodings rejected",
-      "causal_red": "no AssetId minting authority exists anywhere in the Core transaction catalog, so identical accepted bytes cannot resolve to a single content-addressed identity and dedup is unverifiable",
-      "verify": "import identical bytes twice through the seam and require one AssetId and one durable lifecycle record; absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "the dolly-asset service mints AssetId = ast_b3_ + lowercase unpadded base32 of blake3-256 over accepted bytes, deduplicates identical accepted bytes within one security domain to one AssetId and one object, rejects non-canonical encodings, and emits the exact AssetRef wire shape",
+      "assertion": "import identical bytes twice through AssetService; require one AssetId, one content-addressed object, and canonical/non-canonical AssetId parse behavior",
+      "references": [
+        "crates/dolly-asset/src/identity.rs::AssetId/AssetRef canonical wire shape",
+        "crates/dolly-asset/tests/conformance.rs::identical_bytes_deduplicate_to_one_asset_id_and_object"
+      ]
     },
     {
       "id": "G4-WP010-MIME-SECURITY-001",
       "name": "mime_sniffing_and_security_refusal_precede_availability",
       "kind": "asset_mime_security",
-      "expected": "product_red",
-      "seam": "declared media type is only a hint; bounded sniffing, MEDIA_TYPE_MISMATCH, UNSAFE_MEDIA, SOURCE_DENIED, SSRF policy, strict base64, and bounded streams",
-      "causal_red": "untrusted bytes ride verbatim inside a committed Block with no sniffing, no media allowlist, no SSRF policy, and no bounded acquisition, so refusal outcomes cannot be produced",
-      "verify": "ingress an HTML payload labeled image/png and require MEDIA_TYPE_MISMATCH or UNSAFE_MEDIA before any availability; absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "the dolly-asset service sniffs declared media against actual bytes before any availability: MEDIA_TYPE_MISMATCH for active content labeled image/png, INVALID_BASE64 for malformed encodings with no durable record, SIZE_LIMIT cut-off for over-limit sources, SOURCE_DENIED for SSRF-credential URLs, and SOURCE_UNAVAILABLE for remotes with no Host transport",
+      "assertion": "drive AssetService refusals for a MIME spoof, bad base64, an over-limit payload, and an SSRF-shaped URL; require the exact refusal codes before availability",
+      "references": [
+        "crates/dolly-asset/src/media.rs::bounded sniffing and refusal codes",
+        "crates/dolly-asset/tests/conformance.rs::declared_media_mismatch_is_rejected_and_active_content_is_not_relabeled"
+      ]
     },
     {
       "id": "G4-WP010-LEASE-GC-001",
       "name": "leases_pins_and_gc_use_atomic_durable_retention",
       "kind": "asset_lease_gc",
-      "expected": "product_red",
-      "seam": "unguessable LeaseId with finite expiry; lease creation atomic with non-tombstone check; mark/tombstone/sweep with reference recheck; tombstone never resurrects",
-      "causal_red": "there is no lease, pin, or GC record in the durable snapshot, so retention races and tombstone semantics cannot be exercised",
-      "verify": "acquire a finite model-output lease, then require the lease to be atomic with a non-tombstone check and a GC sweep that aborts on a new reference; absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "the dolly-asset service issues an unguessable LeaseId with finite expiry, makes lease creation atomic against a non-tombstone check, runs mark/tombstone/sweep GC with a live-lease/pin/reference abort, and never resurrects a tombstoned asset",
+      "assertion": "drive lease/pin/reference retention and GC sweep; require the tombstone to block new leases and the sweep to remove the object only after every reference is gone",
+      "references": [
+        "crates/dolly-asset/src/retention.rs::lease/pin/tombstone retention",
+        "crates/dolly-asset/tests/conformance.rs::lease_ownership_blocks_gc_and_tombstone_blocks_new_leases"
+      ]
     },
     {
       "id": "G4-WP010-REPLICA-001",
       "name": "required_replicas_never_expose_unverified_bytes",
       "kind": "asset_replica",
-      "expected": "product_red",
-      "seam": "replica state machine disabled|pending_upload|present|upload_failed|pending_delete|delete_failed|deleted; remote_required stays REPLICATING/REPLICA_FAILED and returns REMOTE_REPLICA_FAILED",
-      "causal_red": "no replica state exists and no remote_required path can be demanded, so an unverified required replica could never be refused today",
-      "verify": "request remote_required and require non-available REPLICATING with REMOTE_REPLICA_FAILED on unverified upload; absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "the dolly-asset service refuses remote_required without a replica before acquisition, holds a failing replica as REPLICA_FAILED with REMOTE_REPLICA_FAILED and no exposed asset, and reaches AVAILABLE only after the replica verifies the same content hash",
+      "assertion": "drive remote_required across no-replica, failing-replica, and working-replica configurations; require REFUSED/REPLICA_FAILED/non-available semantics and verify-after-upload",
+      "references": [
+        "crates/dolly-asset/src/replica.rs::replica state machine",
+        "crates/dolly-asset/tests/conformance.rs::remote_required_with_replica_never_exposes_unverified_replica"
+      ]
     },
     {
       "id": "G4-WP010-DOMAIN-ISOLATION-001",
       "name": "security_domain_isolation_is_recorded_and_enforced",
       "kind": "asset_domain_isolation",
-      "expected": "product_red",
-      "seam": "durable security_domain per asset record; read/stream/view authorize the caller domain; a hash match across domains grants no cross-domain read",
-      "causal_red": "the durable snapshot has no asset record and therefore no security_domain field, so identical bytes in two domains are indistinguishable and cross-domain reads are unenforceable",
-      "verify": "import identical bytes in two security domains and require distinct domain-bound records with a denied cross-domain read; absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "the dolly-asset service records a durable security_domain per asset row, authorizes import by the capability's module+instance+domain, and denies any read/stream/view from a domain that never imported the bytes even when a hash match exists elsewhere",
+      "assertion": "import identical bytes in two domains; require distinct domain-bound records, a denied cross-domain read, and Unauthorized on module/instance capability mismatch",
+      "references": [
+        "crates/dolly-asset/src/service.rs::AssetCapability domain/module/instance enforcement",
+        "crates/dolly-asset/tests/conformance.rs::security_domain_isolation_keeps_identical_bytes_apart"
+      ]
     },
     {
       "id": "G4-WP013A-ROUNDTRIP-001",
       "name": "authenticated_text_round_trip_runs_producer_to_durable_premise_to_consumer",
       "kind": "channel_text_round_trip",
       "expected": "product_red",
-      "seam": "host.ingress.submit derives producer identity and assigns Ingress/Block identity; Channel module consumes committed Blocks and emits only org.dolly.channel.send ActionResult parts",
-      "causal_red": "CoreCommand::Ingress accepts a caller-shaped block and block_id verbatim, so no producer identity is derived; there is no Channel package, no send ActionContract execution, and no round trip",
-      "verify": "derive a producer-bound text ingress, deliver it to a Channel module, and require a channel-owned outbound send action from activation output; absent -> PRODUCT_RED"
+      "seam": "Core ingress Host seam (B) + committed-Action consumer seam (D): host.ingress.submit assigns Ingress/Block identity from the authenticated principal, and a runtime consumer feeds committed org.dolly.channel.send Actions into dispatch_send",
+      "causal_red": "the dolly_channel pipeline commits a producer-bound premise through the real Core transaction and dispatches a committed send to a confirmed ActionResult when a CoreIngress adapter is supplied (proven), but the shipping runtime ships no host.ingress.submit/status adapter (the only CoreIngress impls in the workspace are test doubles) and no committed-Action consumer, so no product process can derive a producer-bound ingress or dispatch a committed send; Core additionally accepts a caller-chosen block_id, so Block identity is never assigned by the Host",
+      "verify": "drive the integrated pipeline over the real Core (in-test host.ingress adapter), then require the shipping runtime to expose host.ingress.submit and a committed-Action consumer; absent -> PRODUCT_RED"
     },
     {
       "id": "G4-WP013A-INGRESS-RECONCILE-001",
       "name": "ingress_reconciliation_reads_status_instead_of_resubmitting",
       "kind": "channel_ingress_reconcile",
       "expected": "product_red",
-      "seam": "host.ingress.status returns absent|committed for the same authenticated principal and key; only authoritative absent permits a byte-identical replay",
-      "causal_red": "the only reconciliation today is resubmitting the identical CoreCommand::Ingress, which returns the prior mapping; there is no status read, so a lost-response caller cannot distinguish absent from committed without resubmission",
-      "verify": "after a committed ingress with a lost response, require a status read that returns the committed mapping without resubmitting; absent -> PRODUCT_RED"
+      "seam": "Core ingress Host seam (B): host.ingress.status returns absent|committed for the same authenticated principal and key; only authoritative absent permits a byte-identical replay",
+      "causal_red": "dolly_channel::reconcile_inbound fully implements status-first reconciliation against the real Core (proven: a lost-submit row is settled by a status read with no resubmission), but the runtime ships no host.ingress.status service and no CoreIngress implementation, so a lost-response caller in any running process cannot read absent|committed and must resubmit",
+      "verify": "drive reconcile_inbound over a Core-backed adapter, then require the runtime to expose host.ingress.status for the authenticated principal and key; absent -> PRODUCT_RED"
     },
     {
       "id": "G4-WP013A-AUTHORIZATION-001",
       "name": "sender_conversation_session_and_capability_are_authorized_before_any_dispatch",
       "kind": "channel_authorization",
-      "expected": "product_red",
-      "seam": "authenticated transport, authorized sender/conversation/session, capability check before send, session bound to account and policy, no discovery of other sessions",
-      "causal_red": "no Channel transport or session map exists, so there is no authorization decision for any inbound event or outbound action to fail before dispatch",
-      "verify": "present an unauthenticated event and a session-missing send and require refusal before any dispatch record; absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "the dolly-channel pipeline authorizes the transport account, sender, conversation, sender class, and session BEFORE any durable mutation or Core call, and refuses a session-missing send before any dispatch; no discovery of other sessions",
+      "assertion": "drive process_event with a cross-owner account, an unauthorized sender, and a session-missing send; require CHANNEL_AUTHENTICATION_FAILED / CHANNEL_AUTHORIZATION_FAILED / CHANNEL_SESSION_MISSING with zero Core calls and zero transport calls",
+      "references": [
+        "crates/dolly-channel/src/ingress.rs::process_event authorization gates",
+        "crates/dolly-channel/src/outbound.rs::dispatch_send session authorization",
+        "crates/dolly-channel/tests/ingress.rs::cross_owner_account_fails_before_mutation"
+      ]
     },
     {
       "id": "G4-WP013A-REPLAY-001",
       "name": "outbound_replay_returns_the_existing_result_without_resend",
       "kind": "channel_replay_idempotency",
-      "expected": "product_red",
-      "seam": "action_id is the outbound idempotency key; confirmed action replay returns the existing result; unknown sends are never auto-repeated",
-      "causal_red": "no outbound ledger or action_id identity exists, so confirmed replay cannot return a prior result and unknown-send quarantine cannot be proven",
-      "verify": "dispatch once, confirm, replay the same action_id and require the existing result with a single dispatch record; absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "the dolly-channel outbound ledger keys by action_id: a confirmed action replay returns the existing result with a single dispatch record and never re-dispatches; unknown sends are never auto-repeated",
+      "assertion": "dispatch once to confirmed, replay the same committed action, and require the existing result, exactly one transport call, and one dispatch record",
+      "references": [
+        "crates/dolly-channel/src/outbound.rs::dispatch_send terminal-row replay",
+        "crates/dolly-channel/tests/outbound.rs::confirmed_action_replay_returns_existing_result_and_never_re_dispatches"
+      ]
     },
     {
       "id": "G4-WP013A-UNKNOWN-PARTIAL-001",
       "name": "unknown_and_partial_outcomes_are_explicit_and_non_retryable",
       "kind": "channel_unknown_partial",
-      "expected": "product_red",
-      "seam": "timeout or crash after possible send yields outcome unknown; partial multi-piece send is terminal partial with result null, code CHANNEL_PARTIAL_DELIVERY, retryable false, outcome applied, per-piece ordinal details",
-      "causal_red": "no dispatch record or outcome envelope exists, so a lost send response has no unknown disposition and a partial send has no failed/applied ActionResult mapping",
-      "verify": "lose a send response and require outcome unknown; split a send and require terminal partial with the exact ActionResult mapping; absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "the dolly-channel outbound ledger maps a lost send response to a terminal unknown (never failed, never re-dispatched) and a partial multi-piece send to a terminal partial with result null, code CHANNEL_PARTIAL_DELIVERY, retryable false, outcome applied, and per-piece ordinals",
+      "assertion": "drive a Timeout send to unknown recovery and a split send to terminal partial; require the exact ActionResult envelope fields and no wholesale retry",
+      "references": [
+        "crates/dolly-channel/src/outbound.rs::recover_outbound and settle_outbound_entry",
+        "crates/dolly-channel/tests/outbound.rs::timeout_after_send_is_unknown_never_failed"
+      ]
     },
     {
       "id": "G4-WP013A-BACKPRESSURE-001",
       "name": "outbound_rate_limits_use_bounded_queues_and_caller_deadlines",
       "kind": "channel_backpressure",
       "expected": "product_red",
-      "seam": "bounded outbound queues, configured rate/concurrency limits, caller deadlines, transport unavailability never blocks Core input state",
-      "causal_red": "there is no outbound transport queue or rate configuration, so no backpressure or deadline decision can be observed",
-      "verify": "surpass a rate limit and require bounded queuing with caller deadline failure rather than unbounded growth; absent -> PRODUCT_RED"
+      "seam": "committed-Action consumer seam (D): a bounded outbound queue with caller-deadline enforcement in the dispatch path, so a burst is queued under a caller deadline and transport unavailability never blocks Core input state",
+      "causal_red": "dolly_channel admission bounds pending sends and rate limits per session (proven: a burst past the limit is CHANNEL_RATE_LIMITED and retryable), but there is no bounded outbound QUEUE primitive and no caller-deadline wait/expiry in the dispatch path — a burst is rejected, not queued under a caller deadline, and no caller deadline is carried into a queue",
+      "verify": "drive the admission limit, then require a bounded queue with caller-deadline expiry for the rejected burst; absent -> PRODUCT_RED"
     },
     {
       "id": "G4-WP013A-REDACTION-001",
       "name": "credentials_paths_and_signed_urls_never_enter_metadata_or_logs",
       "kind": "channel_redaction",
-      "expected": "product_red",
-      "seam": "inbound metadata omits transport credentials, cookies, local paths, signed attachment URLs; channel metadata is namespaced and content-free",
-      "causal_red": "the durable block today copies whatever JSON the caller submits, so a draft carrying credentials or a local path would be persisted verbatim with no redaction boundary",
-      "verify": "ingress a draft carrying a credential-shaped field and require it to be absent from the committed record; absent -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "the dolly-channel pipeline builds drafts from a fixed allowlist record: transport credentials, cookies, local paths, and signed URLs carried by a hostile event never enter the committed draft, the ledger row, or attempt history; channel metadata is namespaced and content-free",
+      "assertion": "ingress a hostile event carrying credential/path/signed-URL fields; require none of them in the committed draft or attempt history",
+      "references": [
+        "crates/dolly-channel/src/ingress.rs::build_draft fixed-field allowlist",
+        "crates/dolly-channel/tests/ingress.rs::authenticated_message_commits_to_durable_premise"
+      ]
     },
     {
       "id": "G4-WP013A-NO-DIRECT-MUTATION-001",
       "name": "channel_cannot_append_to_a_page_or_advance_a_cursor_directly",
       "kind": "channel_no_direct_mutation",
-      "expected": "product_red",
-      "seam": "the Channel's only durable write route is host.ingress.submit; it must never append to a Page, mint a Block or Asset ID, or advance a Module cursor",
-      "causal_red": "a Channel implementation does not exist, so the negative route set cannot be exercised against it; the Core-side premise that there is no third-party direct-mutation command is covered by G4-CONTROL-NO-DIRECT-MUTATION-001",
-      "verify": "once the Channel seam exists, prove every Channel write lands in a committed Block through ingress and none mutates a Page or Module cursor directly; absent implementation -> PRODUCT_RED"
+      "expected": "pass",
+      "pass_basis": "the dolly-channel pipeline's only durable write route is the host.ingress.submit seam backed by the real Core transaction; a committed draft reaches the Page only as a Block delivery, no Page record is fabricated, and no Module cursor is advanced by the Channel",
+      "assertion": "run the inbound pipeline over real Core and require the committed block plus its block delivery to the target Page, with no Page or cursor mutation commands",
+      "references": [
+        "crates/dolly-channel/src/ingress.rs::CoreIngress is the only durable route",
+        "crates/dolly-channel/src/ledger.rs::no page or cursor state",
+        "crates/dolly-runtime/tests/g4_content_channel_conformance.rs::g4_control_core_catalog_has_no_third_party_page_or_cursor_mutation"
+      ]
     },
     {
       "id": "G4-WP013B-ASSET-SEND-SEAM-001",
@@ -182,7 +214,7 @@
         "G4-WP013A-ROUNDTRIP-001 is green"
       ],
       "seam": "org.dolly.channel.send carries Core Part AssetRefs; the Channel imports or pins through host.asset.import and never trusts action media_type",
-      "causal_red": "no AssetRef Part exists, so a Channel send cannot bind parts to committed hash-checked Assets"
+      "causal_red": "no AssetRef Part exists in the v1 channel send profile, so a Channel send cannot bind parts to committed hash-checked Assets"
     },
     {
       "id": "G4-WP013B-MIME-LEASE-001",
@@ -196,7 +228,7 @@
         "G4-WP010-LEASE-GC-001 is green"
       ],
       "seam": "outbound Asset parts read under a short Asset lease with authoritative detected media type",
-      "causal_red": "no lease or detected-media-type authority exists today"
+      "causal_red": "no lease or detected-media-type authority exists on the channel send path today"
     },
     {
       "id": "G4-WP013B-MEDIA-ABUSE-001",
@@ -211,7 +243,7 @@
         "G4-WP013A-AUTHORIZATION-001 is green"
       ],
       "seam": "unsafe media, cross-domain AssetRefs, and forged media_type are refused before any send dispatch",
-      "causal_red": "no media or domain authority exists, so abuse cannot be refused"
+      "causal_red": "no media or domain authority exists on the channel send path, so abuse cannot be refused"
     },
     {
       "id": "G4-CONTROL-PREMISE-DIRECTION-001",

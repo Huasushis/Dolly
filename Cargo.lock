@@ -311,7 +311,9 @@ dependencies = [
 name = "dolly-runtime"
 version = "0.1.0"
 dependencies = [
+ "dolly-asset",
  "dolly-canonical-json",
+ "dolly-channel",
  "dolly-core-domain",
  "dolly-core-reducer",
  "dolly-extension-host",
