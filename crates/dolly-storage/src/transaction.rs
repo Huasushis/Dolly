@@ -17,7 +17,7 @@ use dolly_core_reducer::{
     hash_core_state, project_core_state, reduce,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::database::map_sqlite_error;
@@ -636,7 +636,415 @@ impl HostConnectionAuthority {
         self.incarnation_revision
     }
 }
+/// Schema for the Host-owned capability grant table.
+pub const HOST_CAPABILITY_GRANT_RECORD_SCHEMA: &str =
+    "dolly.host-capability-grant/v1";
+const HOST_CAPABILITY_GRANT_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS host_capability_grants (
+    extension_id TEXT NOT NULL,
+    module_id TEXT NOT NULL,
+    grant_revision INTEGER NOT NULL CHECK (grant_revision BETWEEN 1 AND 9007199254740991),
+    grant_digest TEXT NOT NULL,
+    extension_connection_id TEXT NOT NULL,
+    worker_epoch TEXT NOT NULL,
+    worker_epoch_fence INTEGER NOT NULL CHECK (worker_epoch_fence BETWEEN 1 AND 9007199254740991),
+    incarnation_revision INTEGER NOT NULL CHECK (incarnation_revision BETWEEN 1 AND 9007199254740991),
+    extension_generation INTEGER NOT NULL CHECK (extension_generation BETWEEN 1 AND 9007199254740991),
+    descriptor_revision INTEGER NOT NULL CHECK (descriptor_revision BETWEEN 1 AND 9007199254740991),
+    descriptor_digest TEXT NOT NULL,
+    manifest_revision INTEGER NOT NULL CHECK (manifest_revision BETWEEN 1 AND 9007199254740991),
+    manifest_digest TEXT NOT NULL,
+    graph_revision INTEGER NOT NULL CHECK (graph_revision BETWEEN 1 AND 9007199254740991),
+    graph_digest TEXT NOT NULL,
+    methods_jcs BLOB NOT NULL,
+    revoked INTEGER NOT NULL CHECK (revoked IN (0, 1)),
+    record_jcs BLOB NOT NULL,
+    PRIMARY KEY (extension_id, module_id)
+);
+"#;
+const HOST_CAPABILITY_GRANT_COLUMNS: &[&str] = &[
+    "extension_id",
+    "module_id",
+    "grant_revision",
+    "grant_digest",
+    "extension_connection_id",
+    "worker_epoch",
+    "worker_epoch_fence",
+    "incarnation_revision",
+    "extension_generation",
+    "descriptor_revision",
+    "descriptor_digest",
+    "manifest_revision",
+    "manifest_digest",
+    "graph_revision",
+    "graph_digest",
+    "methods_jcs",
+    "revoked",
+    "record_jcs",
+];
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredHostCapabilityGrant {
+    schema: String,
+    extension_id: String,
+    module_id: String,
+    extension_connection_id: String,
+    worker_epoch: String,
+    worker_epoch_fence: i64,
+    incarnation_revision: i64,
+    extension_generation: i64,
+    descriptor_revision: i64,
+    descriptor_digest: String,
+    manifest_revision: i64,
+    manifest_digest: String,
+    graph_revision: i64,
+    graph_digest: String,
+    grant_revision: i64,
+    methods: Vec<String>,
+    revoked: bool,
+}
+
+/// A sealed Host grant loaded from the dedicated durable grant table.
+///
+/// The type has no public constructor, clone, or deserializer. It can only be
+/// returned by a store after the current opaque Host authority was verified.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HostCapabilityGrant {
+    record: StoredHostCapabilityGrant,
+    grant_digest: String,
+}
+
+impl HostCapabilityGrant {
+    pub fn extension_id(&self) -> &str {
+        &self.record.extension_id
+    }
+
+    pub fn module_id(&self) -> &str {
+        &self.record.module_id
+    }
+
+    pub fn extension_connection_id(&self) -> &str {
+        &self.record.extension_connection_id
+    }
+
+    pub fn worker_epoch(&self) -> &str {
+        &self.record.worker_epoch
+    }
+
+    pub fn worker_epoch_fence(&self) -> i64 {
+        self.record.worker_epoch_fence
+    }
+
+    pub fn incarnation_revision(&self) -> i64 {
+        self.record.incarnation_revision
+    }
+
+    pub fn extension_generation(&self) -> i64 {
+        self.record.extension_generation
+    }
+
+    pub fn descriptor_revision(&self) -> i64 {
+        self.record.descriptor_revision
+    }
+
+    pub fn descriptor_digest(&self) -> &str {
+        &self.record.descriptor_digest
+    }
+
+    pub fn manifest_revision(&self) -> i64 {
+        self.record.manifest_revision
+    }
+
+    pub fn manifest_digest(&self) -> &str {
+        &self.record.manifest_digest
+    }
+
+    pub fn graph_revision(&self) -> i64 {
+        self.record.graph_revision
+    }
+
+    pub fn graph_digest(&self) -> &str {
+        &self.record.graph_digest
+    }
+
+    pub fn grant_revision(&self) -> i64 {
+        self.record.grant_revision
+    }
+
+    pub fn grant_digest(&self) -> &str {
+        &self.grant_digest
+    }
+
+    pub fn allows(&self, method: &str) -> bool {
+        self.record.methods.iter().any(|candidate| candidate == method)
+    }
+}
+
+fn ensure_host_capability_grant_schema(connection: &Connection) -> StorageResult<()> {
+    connection
+        .execute_batch(HOST_CAPABILITY_GRANT_SCHEMA_SQL)
+        .map_err(map_sqlite_error)?;
+    verify_table_columns(
+        connection,
+        "host_capability_grants",
+        HOST_CAPABILITY_GRANT_COLUMNS,
+    )
+}
+
+fn valid_grant_method(method: &str) -> bool {
+    !method.is_empty()
+        && method.len() <= 160
+        && method.starts_with("host.")
+        && method.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn validate_grant_text(value: &str) -> StorageResult<()> {
+    if value.is_empty() || value.len() > 256 || value.contains('\0') {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(())
+}
+
+fn validate_grant_digest(value: &str) -> StorageResult<()> {
+    let digest: Sha256Digest = value.parse().map_err(|_| StorageError::Corrupt)?;
+    if digest.to_canonical_string() != value {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(())
+}
+
+fn validate_grant_methods(methods: &[&str]) -> StorageResult<Vec<String>> {
+    let mut normalized = methods
+        .iter()
+        .map(|method| {
+            if !valid_grant_method(method) {
+                return Err(StorageError::Corrupt);
+            }
+            Ok((*method).to_owned())
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn validate_host_capability_grant_input(
+    extension_id: &str,
+    module_id: &str,
+    extension_generation: i64,
+    descriptor_revision: i64,
+    descriptor_digest: &str,
+    manifest_revision: i64,
+    manifest_digest: &str,
+    graph_revision: i64,
+    graph_digest: &str,
+    methods: &[&str],
+) -> StorageResult<()> {
+    validate_grant_text(extension_id)?;
+    validate_grant_text(module_id)?;
+    for revision in [
+        extension_generation,
+        descriptor_revision,
+        manifest_revision,
+        graph_revision,
+    ] {
+        if !(1..=CORE_MAX_SAFE_INTEGER).contains(&revision) {
+            return Err(StorageError::Corrupt);
+        }
+    }
+    for digest in [descriptor_digest, manifest_digest, graph_digest] {
+        validate_grant_digest(digest)?;
+    }
+    validate_grant_methods(methods)?;
+    Ok(())
+}
+
+fn persist_host_capability_grant(
+    transaction: &Transaction<'_>,
+    record: &StoredHostCapabilityGrant,
+) -> StorageResult<()> {
+    let (methods_jcs, _) = canonical_digest(&record.methods)?;
+    let (record_jcs, grant_digest) = canonical_digest(record)?;
+    transaction
+        .execute(
+            "INSERT INTO host_capability_grants (
+                extension_id, module_id, grant_revision, grant_digest,
+                extension_connection_id, worker_epoch, worker_epoch_fence,
+                incarnation_revision, extension_generation, descriptor_revision,
+                descriptor_digest, manifest_revision, manifest_digest,
+                graph_revision, graph_digest, methods_jcs, revoked, record_jcs
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, ?18
+             )
+             ON CONFLICT(extension_id, module_id) DO UPDATE SET
+                grant_revision = excluded.grant_revision,
+                grant_digest = excluded.grant_digest,
+                extension_connection_id = excluded.extension_connection_id,
+                worker_epoch = excluded.worker_epoch,
+                worker_epoch_fence = excluded.worker_epoch_fence,
+                incarnation_revision = excluded.incarnation_revision,
+                extension_generation = excluded.extension_generation,
+                descriptor_revision = excluded.descriptor_revision,
+                descriptor_digest = excluded.descriptor_digest,
+                manifest_revision = excluded.manifest_revision,
+                manifest_digest = excluded.manifest_digest,
+                graph_revision = excluded.graph_revision,
+                graph_digest = excluded.graph_digest,
+                methods_jcs = excluded.methods_jcs,
+                revoked = excluded.revoked,
+                record_jcs = excluded.record_jcs",
+            params![
+                record.extension_id,
+                record.module_id,
+                record.grant_revision,
+                grant_digest,
+                record.extension_connection_id,
+                record.worker_epoch,
+                record.worker_epoch_fence,
+                record.incarnation_revision,
+                record.extension_generation,
+                record.descriptor_revision,
+                record.descriptor_digest,
+                record.manifest_revision,
+                record.manifest_digest,
+                record.graph_revision,
+                record.graph_digest,
+                methods_jcs,
+                i64::from(record.revoked),
+                record_jcs,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    Ok(())
+}
+
+fn load_host_capability_grant_row(
+    connection: &Connection,
+    extension_id: &str,
+    module_id: &str,
+) -> StorageResult<Option<HostCapabilityGrant>> {
+    let row: Option<(
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+        i64,
+        String,
+        i64,
+        String,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+    )> = connection
+        .query_row(
+            "SELECT extension_id, module_id, grant_revision, grant_digest,
+                    extension_connection_id, worker_epoch, worker_epoch_fence,
+                    incarnation_revision, extension_generation, descriptor_revision,
+                    descriptor_digest, manifest_revision, manifest_digest,
+                    graph_revision, graph_digest, methods_jcs, revoked, record_jcs
+             FROM host_capability_grants
+             WHERE extension_id = ?1 AND module_id = ?2",
+            params![extension_id, module_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                    row.get(17)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    let Some((
+        row_extension_id,
+        row_module_id,
+        row_grant_revision,
+        row_grant_digest,
+        row_extension_connection_id,
+        row_worker_epoch,
+        row_worker_epoch_fence,
+        row_incarnation_revision,
+        row_extension_generation,
+        row_descriptor_revision,
+        row_descriptor_digest,
+        row_manifest_revision,
+        row_manifest_digest,
+        row_graph_revision,
+        row_graph_digest,
+        methods_jcs,
+        row_revoked,
+        record_jcs,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let record: StoredHostCapabilityGrant = decode_canonical(&record_jcs)?;
+    let (record_bytes, record_digest) = canonical_digest(&record)?;
+    if record_bytes != record_jcs
+        || record_digest != row_grant_digest
+        || record.schema != HOST_CAPABILITY_GRANT_RECORD_SCHEMA
+        || record.extension_id != row_extension_id
+        || record.module_id != row_module_id
+        || record.extension_connection_id != row_extension_connection_id
+        || record.worker_epoch != row_worker_epoch
+        || record.worker_epoch_fence != row_worker_epoch_fence
+        || record.incarnation_revision != row_incarnation_revision
+        || record.extension_generation != row_extension_generation
+        || record.descriptor_revision != row_descriptor_revision
+        || record.descriptor_digest != row_descriptor_digest
+        || record.manifest_revision != row_manifest_revision
+        || record.manifest_digest != row_manifest_digest
+        || record.graph_revision != row_graph_revision
+        || record.graph_digest != row_graph_digest
+        || record.revoked != (row_revoked != 0)
+        || record.grant_revision != row_grant_revision
+        || record.methods.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(StorageError::Corrupt);
+    }
+    let (methods_bytes, _) = canonical_digest(&record.methods)?;
+    if methods_bytes != methods_jcs {
+        return Err(StorageError::Corrupt);
+    }
+    for digest in [
+        record.descriptor_digest.as_str(),
+        record.manifest_digest.as_str(),
+        record.graph_digest.as_str(),
+    ] {
+        validate_grant_digest(digest)?;
+    }
+    Ok(Some(HostCapabilityGrant {
+        record,
+        grant_digest: row_grant_digest,
+    }))
+}
 fn host_connection_identity_from_snapshot(
     snapshot: &CoreSnapshot,
 ) -> StorageResult<HostConnectionIdentity> {
@@ -1098,6 +1506,125 @@ impl<'connection> SqliteCoreStore<'connection> {
     /// connection identity, WorkerEpoch, or fence.
     pub fn authenticated_host_connection(&self) -> StorageResult<HostConnectionAuthority> {
         host_connection_authority_from_snapshot(&self.snapshot()?)
+    }
+
+    /// Install or replace the current Host-owned capability grant.
+    ///
+    /// The opaque current Host authority is checked inside the same immediate
+    /// transaction that writes the dedicated grant row. Callers cannot submit
+    /// a Core command or construct a grant value directly.
+    pub fn install_host_capability_grant(
+        &mut self,
+        authority: &HostConnectionAuthority,
+        extension_id: &str,
+        module_id: &str,
+        extension_generation: i64,
+        descriptor_revision: i64,
+        descriptor_digest: &str,
+        manifest_revision: i64,
+        manifest_digest: &str,
+        graph_revision: i64,
+        graph_digest: &str,
+        methods: &[&str],
+    ) -> StorageResult<()> {
+        validate_host_capability_grant_input(
+            extension_id,
+            module_id,
+            extension_generation,
+            descriptor_revision,
+            descriptor_digest,
+            manifest_revision,
+            manifest_digest,
+            graph_revision,
+            graph_digest,
+            methods,
+        )?;
+        ensure_host_capability_grant_schema(self.connection)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let snapshot = load_snapshot(&transaction)?.0;
+        if host_connection_authority_from_snapshot(&snapshot)? != *authority {
+            return Err(StorageError::IdempotencyConflict);
+        }
+        let previous = load_host_capability_grant_row(&transaction, extension_id, module_id)?;
+        let grant_revision = previous
+            .map(|grant| grant.record.grant_revision)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(StorageError::SequenceConflict)?;
+        let record = StoredHostCapabilityGrant {
+            schema: HOST_CAPABILITY_GRANT_RECORD_SCHEMA.into(),
+            extension_id: extension_id.into(),
+            module_id: module_id.into(),
+            extension_connection_id: authority.extension_connection_id().into(),
+            worker_epoch: authority.worker_epoch().to_string(),
+            worker_epoch_fence: authority.worker_epoch_fence(),
+            incarnation_revision: authority.incarnation_revision(),
+            extension_generation,
+            descriptor_revision,
+            descriptor_digest: descriptor_digest.into(),
+            manifest_revision,
+            manifest_digest: manifest_digest.into(),
+            graph_revision,
+            graph_digest: graph_digest.into(),
+            grant_revision,
+            methods: validate_grant_methods(methods)?,
+            revoked: false,
+        };
+        persist_host_capability_grant(&transaction, &record)?;
+        transaction.commit().map_err(map_sqlite_error)
+    }
+
+    /// Revoke the current grant with an atomic monotonic revision update.
+    pub fn revoke_host_capability_grant(
+        &mut self,
+        authority: &HostConnectionAuthority,
+        extension_id: &str,
+        module_id: &str,
+    ) -> StorageResult<()> {
+        validate_grant_text(extension_id)?;
+        validate_grant_text(module_id)?;
+        ensure_host_capability_grant_schema(self.connection)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let snapshot = load_snapshot(&transaction)?.0;
+        if host_connection_authority_from_snapshot(&snapshot)? != *authority {
+            return Err(StorageError::IdempotencyConflict);
+        }
+        let Some(mut record) =
+            load_host_capability_grant_row(&transaction, extension_id, module_id)?
+                .map(|grant| grant.record)
+        else {
+            return Err(StorageError::IdempotencyConflict);
+        };
+        if record.revoked {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(());
+        }
+        record.grant_revision = record
+            .grant_revision
+            .checked_add(1)
+            .ok_or(StorageError::SequenceConflict)?;
+        record.revoked = true;
+        persist_host_capability_grant(&transaction, &record)?;
+        transaction.commit().map_err(map_sqlite_error)
+    }
+
+    /// Load the current active grant for one extension package and module.
+    pub fn current_host_capability_grant(
+        &self,
+        extension_id: &str,
+        module_id: &str,
+    ) -> StorageResult<Option<HostCapabilityGrant>> {
+        validate_grant_text(extension_id)?;
+        validate_grant_text(module_id)?;
+        ensure_host_capability_grant_schema(self.connection)?;
+        Ok(load_host_capability_grant_row(self.connection, extension_id, module_id)?
+            .filter(|grant| !grant.record.revoked))
     }
 
     /// Allocate a request identity while atomically checking the current Host

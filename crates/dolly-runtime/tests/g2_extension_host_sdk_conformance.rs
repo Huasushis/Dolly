@@ -221,6 +221,7 @@ struct G1Dispatch {
     premise: ExecutionPremise,
     result: DispatchResult,
     manifest: Value,
+    connection: Connection,
 }
 
 fn dispatch_g1_case(case: &Value) -> G1Dispatch {
@@ -265,10 +266,42 @@ fn dispatch_g1_case(case: &Value) -> G1Dispatch {
         result.transition().state.activations[activation_id].state,
         ActivationState::Dispatched
     );
+    drop(engine);
+    {
+        let mut store = SqliteCoreStore::new(&mut connection).expect("core schema");
+        let authority = store
+            .authenticated_host_connection()
+            .expect("current Host authority");
+        let module_id = premise.identity().module_id();
+        store
+            .install_host_capability_grant(
+                &authority,
+                "org.example.extension",
+                module_id,
+                premise.fence().extension_generation(),
+                manifest["descriptor_revision"]
+                    .as_i64()
+                    .expect("descriptor revision"),
+                &canonical_digest(&descriptor(module_id)),
+                manifest["config_revision"]
+                    .as_i64()
+                    .expect("manifest revision"),
+                manifest["manifest_digest"]
+                    .as_str()
+                    .expect("manifest digest"),
+                manifest["graph_revision"]
+                    .as_i64()
+                    .expect("graph revision"),
+                &canonical_digest(&graph_snapshot(module_id)),
+                &["host.block.get"],
+            )
+            .expect("sealed Host capability grant");
+    }
     G1Dispatch {
         premise,
         result,
         manifest,
+        connection,
     }
 }
 
@@ -304,7 +337,7 @@ fn g2_admission_001_valid_committed_g1_module_activate_reaches_one_host_admissio
     let admission_case = case("G2-ADMISSION-001");
     assert_eq!(admission_case["expected"], "product_red");
     let source = g1_case(admission_case["source_case"].as_str().expect("source case"));
-    let dispatch = dispatch_g1_case(&source);
+    let mut dispatch = dispatch_g1_case(&source);
     let observed = frame(&dispatch);
     let fence = dispatch.premise.fence();
     let mut expected = source["expected_request"].clone();
@@ -372,13 +405,15 @@ fn g2_admission_001_valid_committed_g1_module_activate_reaches_one_host_admissio
         state.blocks.is_empty(),
         "admission must not publish a Block"
     );
+    let premise = &dispatch.premise;
+    let store = SqliteCoreStore::new(&mut dispatch.connection).expect("core schema");
     let admitted = dolly_extension_host::admit_activation(
         &dispatch.premise,
         &dispatch.result,
+        &store,
         FrameLimits::defaults(),
     )
     .expect("accepted G1 dispatch must pass Host admission");
-    let premise = &dispatch.premise;
     let admitted_manifest =
         serde_json::to_value(admitted.manifest()).expect("admitted manifest must serialize");
     assert_eq!(admitted_manifest, dispatch.manifest);

@@ -13,10 +13,10 @@ dolly-core-reducer = { path = "../dolly-core-reducer" }
 dolly-protocol = { path = "../dolly-protocol" }
 dolly-runtime = { path = "../dolly-runtime" }
 dolly-schema = { path = "../dolly-schema" }
+dolly-storage = { path = "../dolly-storage" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 
 [dev-dependencies]
-dolly-storage = { path = "../dolly-storage" }
 rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }

@@ -31,6 +31,7 @@ pub use restore_identity::{
     RestoreIdentityPlannerErrorCode, evaluate_restore_identity_modes,
 };
 pub use transaction::{
-    CoreTransaction, HostConnectionAuthority, CORE_ENGINE_SCHEMA_SQL, CORE_ENGINE_SCHEMA_VERSION,
+    CoreTransaction, HostCapabilityGrant, HostConnectionAuthority,
+    HOST_CAPABILITY_GRANT_RECORD_SCHEMA, CORE_ENGINE_SCHEMA_SQL, CORE_ENGINE_SCHEMA_VERSION,
     SqliteCoreStore, SqliteCoreTransaction, initialize_core_engine_schema,
 };

@@ -64,7 +64,7 @@ fn graph() -> Value {
                 "value": source
             }
         },
-        "authorized_metadata_namespaces": [],
+        "authorized_metadata_namespaces": ["org.example.extension"],
         "authorized_action_names": []
     })
 }
@@ -145,6 +145,29 @@ fn manifest() -> Value {
     value["manifest_digest"] = json!(digest(&digestable));
     value
 }
+fn install_grant(
+    store: &mut SqliteCoreStore<'_>,
+    manifest: &Value,
+    extension_id: &str,
+    extension_generation: i64,
+) {
+    let authority = store.authenticated_host_connection().unwrap();
+    store
+        .install_host_capability_grant(
+            &authority,
+            extension_id,
+            "timer",
+            extension_generation,
+            manifest["descriptor_revision"].as_i64().unwrap(),
+            &digest(&descriptor()),
+            manifest["config_revision"].as_i64().unwrap(),
+            manifest["manifest_digest"].as_str().unwrap(),
+            manifest["graph_revision"].as_i64().unwrap(),
+            &digest(&graph()),
+            &["host.block.get"],
+        )
+        .unwrap();
+}
 
 #[test]
 fn accepted_g1_frame_becomes_fenced_premise_and_replay_is_same_key() {
@@ -153,38 +176,62 @@ fn accepted_g1_frame_becomes_fenced_premise_and_replay_is_same_key() {
         let mut store = SqliteCoreStore::new(&mut connection).unwrap();
         install(&mut store);
     }
-    let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
     let manifest = manifest();
-    let build = BuildManifestCommand {
-        command_id: "g2-build".into(),
-        activation_id: ACTIVATION_ID.into(),
-        manifest,
-        expected_graph_revision: Some(1),
-        expected_descriptor_revision: Some(1),
+    let (premise, dispatch, lease_token) = {
+        let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
+        let build = BuildManifestCommand {
+            command_id: "g2-build".into(),
+            activation_id: ACTIVATION_ID.into(),
+            manifest: manifest.clone(),
+            expected_graph_revision: Some(1),
+            expected_descriptor_revision: Some(1),
+        };
+        engine.accept_manifest(&build, &graph_input()).unwrap();
+        let lease_token: LeaseToken = LEASE_TOKEN.parse().unwrap();
+        let token_digest = Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
+        let request = LeaseRequest::new(
+            "g2-lease",
+            ACTIVATION_ID,
+            "g2-lease-id",
+            token_digest,
+            Some(7),
+        );
+        let reservation = engine.allocate_request(&request, &graph_input()).unwrap();
+        let premise = engine
+            .prepare_execution(&request, &reservation, &graph_input())
+            .unwrap();
+        let dispatch: DispatchResult = engine
+            .dispatch_execution(&premise, "g2-dispatch", &lease_token, &input())
+            .unwrap();
+        (premise, dispatch, lease_token)
     };
-    engine.accept_manifest(&build, &graph_input()).unwrap();
-    let lease_token: LeaseToken = LEASE_TOKEN.parse().unwrap();
-    let token_digest = Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
-    let request = LeaseRequest::new(
-        "g2-lease",
-        ACTIVATION_ID,
-        "g2-lease-id",
-        token_digest.clone(),
-        Some(7),
+    let mut store = SqliteCoreStore::new(&mut connection).unwrap();
+    assert_eq!(
+        admit_activation(
+            &premise,
+            &dispatch,
+            &store,
+            FrameLimits::defaults()
+        )
+        .unwrap_err(),
+        AdmissionError::CapabilityDenied
     );
-    let reservation = engine.allocate_request(&request, &graph_input()).unwrap();
-    let premise = engine
-        .prepare_execution(&request, &reservation, &graph_input())
-        .unwrap();
-    let dispatch: DispatchResult = engine
-        .dispatch_execution(&premise, "g2-dispatch", &lease_token, &input())
-        .unwrap();
-    let admitted = admit_activation(&premise, &dispatch, FrameLimits::defaults()).unwrap();
+    install_grant(
+        &mut store,
+        &manifest,
+        "org.example.extension",
+        premise.fence().extension_generation(),
+    );
+    let admitted =
+        admit_activation(&premise, &dispatch, &store, FrameLimits::defaults()).unwrap();
     assert_eq!(admitted.activation_id(), ACTIVATION_ID);
     assert_eq!(admitted.module_id(), "timer");
     assert_eq!(admitted.request_id(), premise.fence().request_id());
     assert_eq!(admitted.frame_digest().to_string(), dispatch.frame_digest());
-    assert_eq!(admitted.lease_token_digest().to_string(), token_digest);
+    assert_eq!(
+        admitted.lease_token_digest().to_string(),
+        Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string()
+    );
     assert_eq!(admitted.replay_key().0, ACTIVATION_ID);
     let arguments = CanonicalJsonObject::try_from_iter([(
         "page_id".into(),
@@ -216,10 +263,68 @@ fn accepted_g1_frame_becomes_fenced_premise_and_replay_is_same_key() {
         receipt.bytes()
     );
 
-    let replay = engine
-        .dispatch_execution(&premise, "g2-dispatch-replay", &lease_token, &input())
+    let authority = store.authenticated_host_connection().unwrap();
+    store
+        .revoke_host_capability_grant(&authority, "org.example.extension", "timer")
         .unwrap();
-    let replayed = admit_activation(&premise, &replay, FrameLimits::defaults()).unwrap();
+    assert_eq!(
+        admit_activation(
+            &premise,
+            &dispatch,
+            &store,
+            FrameLimits::defaults()
+        )
+        .unwrap_err(),
+        AdmissionError::CapabilityDenied
+    );
+    install_grant(
+        &mut store,
+        &manifest,
+        "org.other.extension",
+        premise.fence().extension_generation(),
+    );
+    assert_eq!(
+        admit_activation(
+            &premise,
+            &dispatch,
+            &store,
+            FrameLimits::defaults()
+        )
+        .unwrap_err(),
+        AdmissionError::CapabilityDenied
+    );
+    install_grant(
+        &mut store,
+        &manifest,
+        "org.example.extension",
+        premise.fence().extension_generation() + 1,
+    );
+    assert_eq!(
+        admit_activation(
+            &premise,
+            &dispatch,
+            &store,
+            FrameLimits::defaults()
+        )
+        .unwrap_err(),
+        AdmissionError::CapabilityDenied
+    );
+    install_grant(
+        &mut store,
+        &manifest,
+        "org.example.extension",
+        premise.fence().extension_generation(),
+    );
+    let replay = {
+        drop(store);
+        let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
+        engine
+            .dispatch_execution(&premise, "g2-dispatch-replay", &lease_token, &input())
+            .unwrap()
+    };
+    let store = SqliteCoreStore::new(&mut connection).unwrap();
+    let replayed =
+        admit_activation(&premise, &replay, &store, FrameLimits::defaults()).unwrap();
     assert_eq!(replayed.replay_key(), admitted.replay_key());
     assert_eq!(replayed.frame_digest(), admitted.frame_digest());
     assert_eq!(replay.transition().state, dispatch.transition().state);

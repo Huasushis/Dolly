@@ -22,6 +22,7 @@ use dolly_runtime::{
     DispatchResult, ExecutionOrder, ExecutionPremise, ReplayEvidence, ReplayMode, ReplayScope,
 };
 use dolly_schema::{ActivationManifest, BlockEnvelope, embedded_schema_catalog};
+use dolly_storage::{HostCapabilityGrant, SqliteCoreStore};
 use serde::de::{DeserializeOwned, IntoDeserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -65,11 +66,13 @@ pub struct FencedInvocationPremise {
 /// Host-owned capability policy bound to one admitted invocation premise.
 ///
 /// Its binding digest covers the authenticated connection, incarnation,
-/// generations, revisions, manifest, graph, descriptor, and dispatch digests.
-/// No public constructor or deserializer exists.
+/// generations, revisions, manifest, graph, descriptor, dispatch, and grant
+/// digests. No public constructor or deserializer exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CapabilityPolicy {
     extension_id: String,
+    grant_revision: i64,
+    grant_digest: String,
     binding_digest: Sha256Digest,
     allowed_methods: Vec<String>,
 }
@@ -79,17 +82,31 @@ impl CapabilityPolicy {
         premise: &FencedInvocationPremise,
         extension_id: String,
         allowed_methods: Vec<String>,
+        grant_revision: i64,
+        grant_digest: String,
     ) -> Result<Self, AdmissionError> {
         Ok(Self {
             extension_id: extension_id.clone(),
-            binding_digest: capability_binding_digest(premise, &extension_id)?,
+            grant_revision,
+            grant_digest: grant_digest.clone(),
+            binding_digest: capability_binding_digest(
+                premise,
+                &extension_id,
+                grant_revision,
+                &grant_digest,
+            )?,
             allowed_methods,
         })
     }
 
     fn matches(&self, premise: &FencedInvocationPremise) -> bool {
-        capability_binding_digest(premise, &self.extension_id)
-            .is_ok_and(|digest| digest == self.binding_digest)
+        capability_binding_digest(
+            premise,
+            &self.extension_id,
+            self.grant_revision,
+            &self.grant_digest,
+        )
+        .is_ok_and(|digest| digest == self.binding_digest)
     }
 }
 
@@ -172,8 +189,16 @@ impl FencedInvocationPremise {
         &mut self,
         extension_id: String,
         allowed_methods: Vec<String>,
+        grant_revision: i64,
+        grant_digest: String,
     ) -> Result<(), AdmissionError> {
-        let policy = CapabilityPolicy::bind(self, extension_id, allowed_methods)?;
+        let policy = CapabilityPolicy::bind(
+            self,
+            extension_id,
+            allowed_methods,
+            grant_revision,
+            grant_digest,
+        )?;
         self.capability_policy = Some(policy);
         Ok(())
     }
@@ -351,6 +376,7 @@ struct WireActivationRequest {
 pub fn admit_activation(
     premise: &ExecutionPremise,
     dispatch: &DispatchResult,
+    store: &SqliteCoreStore<'_>,
     limits: FrameLimits,
 ) -> Result<FencedInvocationPremise, AdmissionError> {
     let parsed = parse_frame(dispatch, limits)?;
@@ -359,8 +385,28 @@ pub fn admit_activation(
     }
     validate_frame(premise, dispatch, &parsed, limits)?;
     validate_durable_state(premise, dispatch, &parsed)?;
-    let (extension_id, allowed_methods) =
+    let (extension_id, requested_methods) =
         derive_capability_methods(premise, dispatch, &parsed.manifest)?;
+    let capability_binding = if let Some(extension_id) = extension_id {
+        let grant = store
+            .current_host_capability_grant(&extension_id, premise.identity().module_id())
+            .map_err(|_| AdmissionError::CapabilityDenied)?
+            .ok_or(AdmissionError::CapabilityDenied)?;
+        validate_host_capability_grant(&grant, &extension_id, premise, &parsed.manifest)?;
+        let effective_methods = requested_methods
+            .iter()
+            .filter(|method| grant.allows(method))
+            .cloned()
+            .collect::<Vec<_>>();
+        Some((
+            extension_id,
+            effective_methods,
+            grant.grant_revision(),
+            grant.grant_digest().to_owned(),
+        ))
+    } else {
+        None
+    };
     let mut admitted = FencedInvocationPremise {
         activation_id: premise.identity().activation_id().to_owned(),
         module_id: premise.identity().module_id().to_owned(),
@@ -398,10 +444,43 @@ pub fn admit_activation(
         replay_scope: premise.replay_scope().clone(),
         capability_policy: None,
     };
-    if let Some(extension_id) = extension_id {
-        admitted.bind_capability_policy(extension_id, allowed_methods)?;
+    if let Some((extension_id, effective_methods, grant_revision, grant_digest)) = capability_binding
+    {
+        admitted.bind_capability_policy(
+            extension_id,
+            effective_methods,
+            grant_revision,
+            grant_digest,
+        )?;
     }
     Ok(admitted)
+}
+
+fn validate_host_capability_grant(
+    grant: &HostCapabilityGrant,
+    extension_id: &str,
+    premise: &ExecutionPremise,
+    manifest: &ActivationManifest,
+) -> Result<(), AdmissionError> {
+    let worker_epoch = premise.fence().worker_epoch().to_string();
+    let manifest_digest = manifest.manifest_digest.to_canonical_string();
+    if grant.extension_id() != extension_id
+        || grant.module_id() != premise.identity().module_id()
+        || grant.extension_connection_id() != premise.fence().extension_connection_id()
+        || grant.worker_epoch() != worker_epoch
+        || grant.worker_epoch_fence() != premise.fence().worker_epoch_fence()
+        || grant.incarnation_revision() != premise.fence().incarnation_revision()
+        || grant.extension_generation() != premise.fence().extension_generation()
+        || grant.descriptor_revision() != manifest.descriptor_revision.value() as i64
+        || grant.descriptor_digest() != premise.digests().descriptor_digest()
+        || grant.manifest_revision() != manifest.config_revision.value() as i64
+        || grant.manifest_digest() != manifest_digest
+        || grant.graph_revision() != manifest.graph_revision.value() as i64
+        || grant.graph_digest() != premise.digests().graph_digest()
+    {
+        return Err(AdmissionError::CapabilityDenied);
+    }
+    Ok(())
 }
 
 fn derive_capability_methods(
@@ -508,6 +587,8 @@ fn derive_capability_methods(
 fn capability_binding_digest(
     premise: &FencedInvocationPremise,
     extension_id: &str,
+    grant_revision: i64,
+    grant_digest: &str,
 ) -> Result<Sha256Digest, AdmissionError> {
     let manifest = serde_json::to_value(premise.manifest())
         .map_err(|_| AdmissionError::CapabilityDenied)?;
@@ -527,6 +608,8 @@ fn capability_binding_digest(
         "attempt": premise.attempt(),
         "lease_token_digest": premise.lease_token_digest().to_string(),
         "frame_digest": premise.frame_digest().to_string(),
+        "grant_revision": grant_revision,
+        "grant_digest": grant_digest,
         "graph_digest": premise.graph_digest().to_string(),
         "descriptor_digest": premise.descriptor_digest().to_string(),
         "manifest_digest": premise.manifest_digest().to_string(),
