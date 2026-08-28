@@ -10,6 +10,7 @@ pub mod database;
 pub mod effect_journal;
 pub mod error;
 pub mod host_authority;
+pub mod host_ingress;
 pub mod module_state;
 pub mod linux_host_verification;
 pub mod mcp_readiness;
@@ -31,6 +32,7 @@ pub use restore_identity::{
     RestoreIdentityMode, RestoreIdentityModesPlan, RestoreIdentityPlannerError,
     RestoreIdentityPlannerErrorCode, evaluate_restore_identity_modes,
 };
+pub use host_ingress::{SqliteHostIngressStore, create_host_ingress_schema};
 pub use transaction::{
     ActivationTransaction, CoreTransaction, HostCapabilityGrant, HostConnectionAuthority,
     HOST_CAPABILITY_GRANT_RECORD_SCHEMA, CORE_ENGINE_SCHEMA_SQL, CORE_ENGINE_SCHEMA_VERSION,
