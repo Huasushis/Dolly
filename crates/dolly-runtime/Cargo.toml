@@ -16,6 +16,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 [dev-dependencies]
+dolly-asset = { path = "../dolly-asset" }
+dolly-channel = { path = "../dolly-channel" }
 dolly-extension-host = { path = "../dolly-extension-host" }
 dolly-protocol = { path = "../dolly-protocol" }
 dolly-extension-sdk = { path = "../dolly-extension-sdk" }
