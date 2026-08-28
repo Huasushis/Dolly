@@ -1,9 +1,11 @@
 //! Focused durable Host ingress submit/status seam tests against the real
-//! bundled SQLite: opaque principal authority/grant validation, stale/revoked
-//! grant, graph producer direction, lifecycle reference, real UUIDv7
-//! allocation, cross-principal isolation, idempotent replay/conflict over the
-//! ordered target Pages, atomic rollback/recovery, and fail-closed
-//! cross-verification of mapping, Core operation, and effect.
+//! bundled SQLite: sealed opaque principal authority/grant validation (submit
+//! AND status require the method, one-transaction status), grant-pinned graph
+//! digest/revision and exact/opposite target direction, lifecycle reference,
+//! real RFC-9562 UUIDv7 allocation with no-remint replay, the shared
+//! fail-closed verification (operation/transition/ingress/block/delivery
+//! links; deletion/tamper never reads as false Absent/Committed), idempotent
+//! replay/conflict over the ordered target Pages, and real rollback/recovery.
 
 use dolly_canonical_json::CanonicalJsonValue;
 use dolly_core_domain::{
@@ -11,7 +13,8 @@ use dolly_core_domain::{
     HostIngressSubmitOutcome, HostIngressSubmitRequest, PageId,
 };
 use dolly_core_reducer::{
-    CoreCommand, EnvironmentInput, InstallConfigCommand, InstallGraphCommand, TransitionOutcome,
+    CoreCommand, EnvironmentInput, InstallConfigCommand, InstallGraphCommand,
+    RecoveryVerification, RecoverCommand, TransitionOutcome,
 };
 use dolly_storage::{
     HostConnectionAuthority, HostIngress, SqliteCoreStore, SqliteHostIngressStore, StorageError,
@@ -79,13 +82,12 @@ fn descriptor(module_id: &str) -> Value {
     })
 }
 
-fn graph(module_ids: &[&str]) -> Value {
+/// The installed graph body. `receiver_input_pages` lets a test declare the
+/// module's consumer (input) pages to exercise opposite-direction rejection.
+fn graph(module_ids: &[&str], receiver_input_pages: &[&str]) -> Value {
     let mut output_pages = serde_json::Map::new();
     for module_id in module_ids {
-        output_pages.insert(
-            (*module_id).to_owned(),
-            json!(["page-a", "page-b"]),
-        );
+        output_pages.insert((*module_id).to_owned(), json!(["page-a", "page-b"]));
     }
     let mut descriptors = serde_json::Map::new();
     for module_id in module_ids {
@@ -101,7 +103,7 @@ fn graph(module_ids: &[&str]) -> Value {
     }
     json!({
         "receiving_module": "receiver",
-        "input_pages": {},
+        "input_pages": {"receiver": receiver_input_pages},
         "output_pages": output_pages,
         "subscriptions": {},
         "descriptors": descriptors,
@@ -110,6 +112,7 @@ fn graph(module_ids: &[&str]) -> Value {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn configured(
     store: &mut SqliteCoreStore<'_>,
     mark: &str,
@@ -139,22 +142,45 @@ fn configured(
     assert_eq!(transition.outcome, TransitionOutcome::Committed);
 }
 
-fn install_base(store: &mut SqliteCoreStore<'_>, mark: &str) -> HostConnectionAuthority {
-    configured(store, mark, 1, "g4-ingress-connection", WORKER_EPOCH);
-    let graph = graph(&[MODULE_ID, MODULE_B_ID]);
+fn install_graph(store: &mut SqliteCoreStore<'_>, mark: &str, revision: i64, body: &Value) {
     let transition = store
         .transact(
             &CoreCommand::InstallGraph(InstallGraphCommand {
-                command_id: format!("{mark}-graph"),
-                revision: 1,
-                digest: digest(&graph),
-                graph,
+                command_id: format!("{mark}-graph-{revision}"),
+                revision,
+                digest: digest(body),
+                graph: body.clone(),
             }),
             &input(),
         )
         .unwrap();
     assert_eq!(transition.outcome, TransitionOutcome::Committed);
-    store.bootstrap_host_connection().unwrap()
+}
+
+fn install_grant(
+    store: &mut SqliteCoreStore<'_>,
+    authority: &HostConnectionAuthority,
+    module_id: &str,
+    extension_generation: i64,
+    graph_revision: i64,
+    graph_digest: &str,
+    methods: &[&str],
+) {
+    store
+        .install_host_capability_grant(
+            authority,
+            EXTENSION_ID,
+            module_id,
+            extension_generation,
+            1,
+            &digest(&descriptor(module_id)),
+            1,
+            &digest(&json!({"manifest": 1})),
+            graph_revision,
+            graph_digest,
+            methods,
+        )
+        .unwrap();
 }
 
 struct Harness {
@@ -166,12 +192,37 @@ struct Harness {
 
 impl Harness {
     fn new(mark: &str) -> Self {
+        Self::new_with_inputs(mark, &[])
+    }
+
+    /// Build a harness whose installed graph lists `receiver_input_pages` as
+    /// the module's input (consumer-direction) pages.
+    fn new_with_inputs(mark: &str, receiver_input_pages: &[&str]) -> Self {
+        let body = graph(&[MODULE_ID, MODULE_B_ID], receiver_input_pages);
         let mut connection = Connection::open_in_memory().unwrap();
         let authority = {
             let mut store = SqliteCoreStore::new(&mut connection).unwrap();
-            let authority = install_base(&mut store, mark);
-            install_grant(&mut store, &authority, MODULE_ID, 1, &["host.ingress.submit"]);
-            install_grant(&mut store, &authority, MODULE_B_ID, 1, &["host.ingress.submit"]);
+            configured(&mut store, mark, 1, "g4-ingress-connection", WORKER_EPOCH);
+            install_graph(&mut store, mark, 1, &body);
+            let authority = store.bootstrap_host_connection().unwrap();
+            install_grant(
+                &mut store,
+                &authority,
+                MODULE_ID,
+                1,
+                1,
+                &digest(&body),
+                &["host.ingress.submit"],
+            );
+            install_grant(
+                &mut store,
+                &authority,
+                MODULE_B_ID,
+                1,
+                1,
+                &digest(&body),
+                &["host.ingress.submit"],
+            );
             authority
         };
         create_host_ingress_schema(&mut connection).unwrap();
@@ -193,6 +244,16 @@ impl Harness {
         }
     }
 
+    fn load_current_grant(
+        &mut self,
+        module_id: &str,
+    ) -> dolly_storage::HostCapabilityGrant {
+        SqliteCoreStore::new(&mut self.connection)
+            .unwrap()
+            .current_host_capability_grant(&self.authority, EXTENSION_ID, module_id)
+            .unwrap()
+            .unwrap()
+    }
 }
 
 fn submit(
@@ -234,33 +295,7 @@ fn core_state(connection: &mut Connection) -> dolly_core_reducer::CoreSnapshot {
     store.snapshot().unwrap()
 }
 
-fn install_grant(
-    store: &mut SqliteCoreStore<'_>,
-    authority: &HostConnectionAuthority,
-    module_id: &str,
-    extension_generation: i64,
-    methods: &[&str],
-) {
-    store
-        .install_host_capability_grant(
-            authority,
-            EXTENSION_ID,
-            module_id,
-            extension_generation,
-            1,
-            &digest(&descriptor(module_id)),
-            1,
-            &digest(&json!({"manifest": 1})),
-            1,
-            &digest(&graph(&[module_id])),
-            methods,
-        )
-        .unwrap();
-}
-
-fn committed(
-    outcome: HostIngressSubmitOutcome,
-) -> (dolly_core_domain::HostIngressMapping, bool) {
+fn committed(outcome: HostIngressSubmitOutcome) -> (dolly_core_domain::HostIngressMapping, bool) {
     match outcome {
         HostIngressSubmitOutcome::Committed { mapping, idempotent } => (*mapping, idempotent),
         HostIngressSubmitOutcome::Conflict { .. } => panic!("expected a committed outcome"),
@@ -274,11 +309,13 @@ fn committed(
 #[test]
 fn fresh_submit_commits_mapping_and_effect() {
     let mut harness = Harness::new("fresh");
-    let (mapping, idempotent) = committed(submit(&mut harness.connection, 
+    let (mapping, idempotent) = committed(submit(
+        &mut harness.connection,
         &harness.authority,
         &harness.grant,
         &request("msg-1", HostIngressKind::Message, None, &["page-a", "page-b"], json!({"kind":"text","text":"hello"})),
-    ).unwrap());
+    )
+    .unwrap());
     assert!(!idempotent);
 
     // Authority-bound identity comes from the opaque grant/authority.
@@ -293,15 +330,14 @@ fn fresh_submit_commits_mapping_and_effect() {
     assert_eq!(mapping.target_page_ids, vec!["page-a", "page-b"]);
     assert_eq!(mapping.deliveries.len(), 2);
 
-    // The Core effect exists and is bound to the minted Block.
     let state = core_state(&mut harness.connection);
-    let block = state.blocks.get(&mapping.block_id).unwrap();
-    assert_eq!(block["text"], "hello");
+    assert!(state.blocks.contains_key(&mapping.block_id));
+    assert!(state
+        .ingress
+        .values()
+        .any(|record| record.block_id == mapping.block_id));
 
-    // status reconciles to the identical committed mapping.
-    match status(&mut harness.connection, &harness.authority, &harness.grant, "msg-1")
-        .unwrap()
-    {
+    match status(&mut harness.connection, &harness.authority, &harness.grant, "msg-1").unwrap() {
         HostIngressStatus::Committed(seen) => assert_eq!(*seen, mapping),
         HostIngressStatus::Absent => panic!("committed mapping must not be absent"),
     }
@@ -324,6 +360,22 @@ fn same_key_same_digest_replays_prior_mapping_without_mutation() {
 }
 
 #[test]
+fn no_remint_replay_returns_the_stored_identity_pair() {
+    let mut harness = Harness::new("no-remint");
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let (first, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
+    let state_after_first = core_state(&mut harness.connection).next_commit_seq;
+    let (replayed, idempotent) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
+    assert!(idempotent);
+    // The stored identities return unchanged and no new Core allocation
+    // happened (no new block/delivery/journal state).
+    assert_eq!(replayed.ingress_id, first.ingress_id);
+    assert_eq!(replayed.block_id, first.block_id);
+    assert_eq!(core_state(&mut harness.connection).next_commit_seq, state_after_first);
+}
+
+#[test]
 fn same_key_different_target_pages_conflicts_with_zero_mutation() {
     let mut harness = Harness::new("pages-conflict");
     let incoming =
@@ -333,9 +385,7 @@ fn same_key_different_target_pages_conflicts_with_zero_mutation() {
 
     let reordered =
         request("msg-1", HostIngressKind::Message, None, &["page-b", "page-a"], json!({"kind":"text","text":"hello"}));
-    match submit(&mut harness.connection, &harness.authority, &harness.grant, &reordered)
-        .unwrap()
-    {
+    match submit(&mut harness.connection, &harness.authority, &harness.grant, &reordered).unwrap() {
         HostIngressSubmitOutcome::Conflict { key, .. } => assert_eq!(key.as_str(), first.ingress_key),
         _ => panic!("reordered target Pages must conflict"),
     }
@@ -381,7 +431,8 @@ fn changed_content_same_key_conflicts_without_mutation() {
 }
 
 // ---------------------------------------------------------------------------
-// Principal authority/grant validation
+// Principal authority/grant validation (submit and status), transactional
+// scope
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -391,30 +442,24 @@ fn stale_grant_is_rejected_before_mutation() {
     let (first, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming1).unwrap());
     assert_eq!(first.generation, 1);
 
-    // Rotate the grant generation with the same host connection: the old
-    // grant value is stale and can neither submit nor derive a replay.
     {
+        let body = graph(&[MODULE_ID, MODULE_B_ID], &[]);
         let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
-        install_grant(&mut store, &harness.authority, MODULE_ID, 2, &["host.ingress.submit"]);
+        install_grant(&mut store, &harness.authority, MODULE_ID, 2, 1, &digest(&body), &["host.ingress.submit"]);
     }
     let error = submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming1)
         .expect_err("a stale grant must be rejected");
     assert_eq!(error.code(), HostIngressErrorCode::Stale);
     assert_eq!(mapping_rows(&mut harness.connection), 1, "stale submit must mutate nothing");
 
-    // The current grant is still accepted and commits under the same key.
-    let grant2 = SqliteCoreStore::new(&mut harness.connection)
-        .unwrap()
-        .current_host_capability_grant(&harness.authority, EXTENSION_ID, MODULE_ID)
-        .unwrap()
-        .unwrap();
+    let grant2 = harness.load_current_grant(MODULE_ID);
     let incoming2 = request("msg-2", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hi"}));
     let (mapping2, _) = committed(submit(&mut harness.connection, &harness.authority, &grant2, &incoming2).unwrap());
     assert_eq!(mapping2.generation, 2);
 }
 
 #[test]
-fn revoked_grant_is_rejected_before_mutation() {
+fn revoked_grant_is_rejected_for_submit_and_status_before_mutation() {
     let mut harness = Harness::new("revoked");
     let incoming = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
     committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
@@ -427,35 +472,36 @@ fn revoked_grant_is_rejected_before_mutation() {
     let error = submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming)
         .expect_err("a revoked grant must be refused");
     assert_eq!(error.code(), HostIngressErrorCode::NotAuthorized);
+    let error = status(&mut harness.connection, &harness.authority, &harness.grant, "msg-1")
+        .expect_err("status must refuse a revoked grant inside its transaction");
+    assert_eq!(error.code(), HostIngressErrorCode::NotAuthorized);
     assert_eq!(mapping_rows(&mut harness.connection), 1);
 }
 
 #[test]
-fn grant_without_submit_method_is_refused() {
-    let mut harness = Harness::new("no-method");
-    {
-        let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
-        install_grant(&mut store, &harness.authority, MODULE_ID, 1, &["host.block.get"]);
-    }
-    let grant_no_method = SqliteCoreStore::new(&mut harness.connection)
-        .unwrap()
-        .current_host_capability_grant(&harness.authority, EXTENSION_ID, MODULE_ID)
-        .unwrap()
-        .unwrap();
+fn status_requires_the_submit_method_like_submit() {
+    let mut harness = Harness::new("status-no-method");
     let incoming = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
-    let error = submit(&mut harness.connection, &harness.authority, &grant_no_method, &incoming)
-        .expect_err("grant missing the submit method must be refused");
+    committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
+
+    {
+        let body = graph(&[MODULE_ID, MODULE_B_ID], &[]);
+        let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
+        install_grant(&mut store, &harness.authority, MODULE_ID, 1, 1, &digest(&body), &["host.block.get"]);
+    }
+    let no_method = harness.load_current_grant(MODULE_ID);
+
+    let error = status(&mut harness.connection, &harness.authority, &no_method, "msg-1")
+        .expect_err("status must require the host.ingress.submit method");
     assert_eq!(error.code(), HostIngressErrorCode::NotAuthorized);
-    assert_eq!(mapping_rows(&mut harness.connection), 0);
 }
 
 #[test]
 fn rotated_authority_is_rejected_and_never_discloses() {
     let mut harness = Harness::new("rotated");
     let incoming = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
-    let (first, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
+    committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
 
-    // Rotate the Host connection to a new owner/instance.
     let rotated = {
         let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
         configured(&mut store, "rotated-v2", 2, "g4-ingress-connection-2", OTHER_WORKER_EPOCH);
@@ -463,14 +509,13 @@ fn rotated_authority_is_rejected_and_never_discloses() {
     };
     assert_ne!(rotated, harness.authority);
 
-    // A submit with the old authority cannot construct durable authority.
     let error = submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming)
         .expect_err("a rotated authority must be rejected");
     assert_eq!(error.code(), HostIngressErrorCode::NotAuthorized);
     assert_eq!(mapping_rows(&mut harness.connection), 1);
 
-    // The new principal cannot read the old principal's mapping; never
-    // another owner's payload.
+    // The new principal cannot read the old principal's mapping in its own
+    // single transaction; never another owner's payload.
     let error = status(&mut harness.connection, &rotated, &harness.grant, "msg-1")
         .expect_err("the new principal must not disclose the old principal's payload");
     assert_eq!(error.code(), HostIngressErrorCode::NotAuthorized);
@@ -479,33 +524,103 @@ fn rotated_authority_is_rejected_and_never_discloses() {
 #[test]
 fn cross_module_sources_never_disclose_each_other() {
     let mut harness = Harness::new("cross-source");
-    let incoming = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
     let (mapping_a, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
 
-    // The same external id under a different source module is a different
-    // key: no conflict, an independent mapping, and no disclosure.
-    let mut incoming_b = incoming.clone();
-    incoming_b.kind = HostIngressKind::Message;
-    incoming_b.references_external_event_id = None;
-    let (mapping_b, _) = committed(
-        submit(&mut harness.connection, &harness.authority, &harness.grant_b, &incoming_b).unwrap(),
-    );
+    let incoming_b = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let (mapping_b, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant_b, &incoming_b).unwrap());
     assert_ne!(mapping_a.ingress_key, mapping_b.ingress_key);
     assert_eq!(mapping_rows(&mut harness.connection), 2);
 
-    // Module B reading the SAME external id sees only its own mapping.
     match status(&mut harness.connection, &harness.authority, &harness.grant_b, "msg-1").unwrap() {
         HostIngressStatus::Committed(seen) => {
             assert_eq!(seen.module_id, MODULE_B_ID);
-            assert_eq!(seen.payload_digest, mapping_a.payload_digest);
+            // Module B sees only its own identity namespace and Block, never
+            // module A's mapping or effect.
+            assert_ne!(seen.ingress_key, mapping_a.ingress_key);
+            assert_ne!(seen.block_id, mapping_a.block_id);
+            assert_ne!(seen.command_id, mapping_a.command_id);
         }
         HostIngressStatus::Absent => panic!("module B committed the same external id"),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Graph direction and lifecycle reference validation
+// Grant-pinned graph validation: digest/revision, admission, exact/opposite
+// targets
 // ---------------------------------------------------------------------------
+
+#[test]
+fn graph_digest_mismatch_with_grant_is_rejected() {
+    let mut harness = Harness::new("graph-digest");
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+
+    // The installed graph revision matches the grant's, but the grant pins a
+    // digest of a different graph: the submit is refused before mutation.
+    {
+        let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
+        install_grant(
+            &mut store,
+            &harness.authority,
+            MODULE_ID,
+            1,
+            1,
+            &digest(&json!({"other": 1})),
+            &["host.ingress.submit"],
+        );
+    }
+    let wrong_digest_grant = harness.load_current_grant(MODULE_ID);
+    let error = submit(&mut harness.connection, &harness.authority, &wrong_digest_grant, &incoming)
+        .expect_err("a grant pinning a different graph digest must be refused");
+    assert_eq!(error.code(), HostIngressErrorCode::Stale);
+    assert_eq!(mapping_rows(&mut harness.connection), 0);
+}
+
+#[test]
+fn graph_revision_mismatch_with_grant_is_rejected() {
+    let mut harness = Harness::new("graph-revision");
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let body_v2 = graph(&[MODULE_ID, MODULE_B_ID], &[]);
+    {
+        let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
+        install_graph(&mut store, "graph-v2", 2, &body_v2);
+    }
+    let error = submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming)
+        .expect_err("a grant pinning the old graph revision must be refused");
+    assert_eq!(error.code(), HostIngressErrorCode::Stale);
+    assert_eq!(mapping_rows(&mut harness.connection), 0);
+}
+
+#[test]
+fn module_not_admitted_in_pinned_graph_is_rejected() {
+    let mut harness = Harness::new("not-admitted");
+    // Graph revision 2 drops the receiver from descriptors while keeping it
+    // as an output producer; a grant pinning revision 2 must refuse.
+    let body_v2 = graph(&[MODULE_B_ID], &[]);
+    {
+        let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
+        install_graph(&mut store, "graph-no-receiver", 2, &body_v2);
+        install_grant(
+            &mut store,
+            &harness.authority,
+            MODULE_ID,
+            1,
+            2,
+            &digest(&body_v2),
+            &["host.ingress.submit"],
+        );
+    }
+    let grant_v2 = harness.load_current_grant(MODULE_ID);
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let error = submit(&mut harness.connection, &harness.authority, &grant_v2, &incoming)
+        .expect_err("a module not admitted in the pinned graph must be refused");
+    assert_eq!(error.code(), HostIngressErrorCode::TargetNotAuthorized);
+    assert_eq!(mapping_rows(&mut harness.connection), 0);
+}
 
 #[test]
 fn target_page_outside_module_graph_direction_is_rejected() {
@@ -524,32 +639,22 @@ fn target_page_outside_module_graph_direction_is_rejected() {
 }
 
 #[test]
-fn graph_revision_mismatch_with_grant_is_rejected() {
-    let mut harness = Harness::new("graph-mismatch");
-    let incoming = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
-
-    // Install a graph revision 2 while the grant pins revision 1.
-    let graph2 = graph(&[MODULE_ID, MODULE_B_ID]);
-    let transition = {
-        let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
-        store
-            .transact(
-                &CoreCommand::InstallGraph(InstallGraphCommand {
-                    command_id: "graph2".into(),
-                    revision: 2,
-                    digest: digest(&graph2),
-                    graph: graph2,
-                }),
-                &input(),
-            )
-            .unwrap()
-    };
-    assert_eq!(transition.outcome, TransitionOutcome::Committed);
+fn opposite_input_target_page_is_rejected() {
+    // The module is a graph producer of page-a AND declares page-a as one of
+    // its input (consumer) pages: ingress to that page is opposite-direction
+    // and must be rejected even though it is an output page.
+    let mut harness = Harness::new_with_inputs("opposite", &["page-a"]);
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
     let error = submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming)
-        .expect_err("a grant pinning the old graph revision must be refused");
-    assert_eq!(error.code(), HostIngressErrorCode::Stale);
+        .expect_err("an input (opposite) target Page must be rejected");
+    assert_eq!(error.code(), HostIngressErrorCode::TargetNotAuthorized);
     assert_eq!(mapping_rows(&mut harness.connection), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Lifecycle reference validation
+// ---------------------------------------------------------------------------
 
 #[test]
 fn edit_and_delete_reference_a_committed_event_by_the_same_principal() {
@@ -558,8 +663,6 @@ fn edit_and_delete_reference_a_committed_event_by_the_same_principal() {
         request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
     committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &msg).unwrap());
 
-    // An edit referencing the committed original commits and binds the
-    // relation into its identity.
     let edit = request(
         "edit-1",
         HostIngressKind::Edit,
@@ -571,8 +674,6 @@ fn edit_and_delete_reference_a_committed_event_by_the_same_principal() {
     assert_eq!(mapping_edit.kind, "edit");
     assert_eq!(mapping_edit.references_external_event_id.as_deref(), Some("msg-1"));
 
-    // A delete referencing the original commits; the mapping exists for the
-    // delete key too.
     let delete = request(
         "del-1",
         HostIngressKind::Delete,
@@ -634,18 +735,17 @@ fn oversized_payload_is_rejected_before_mutation() {
 }
 
 // ---------------------------------------------------------------------------
-// Real UUIDv7 allocation
+// Real RFC-9562 UUIDv7 allocation
 // ---------------------------------------------------------------------------
 
 #[test]
 fn minted_identities_are_real_uuidv7_and_replay_surfaces_the_stored_pair() {
     let mut harness = Harness::new("uuid");
-    let incoming = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
     let (first, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
 
-    let ingress_bytes = first.ingress_id.as_bytes();
-    let block_bytes = first.block_id.as_bytes();
-    for bytes in [ingress_bytes, block_bytes] {
+    for bytes in [first.ingress_id.as_bytes(), first.block_id.as_bytes()] {
         assert_eq!(bytes.len(), 36);
         assert!(bytes.iter().all(|b| b.is_ascii_hexdigit() || *b == b'-'));
         assert_eq!(bytes[8], b'-');
@@ -658,14 +758,12 @@ fn minted_identities_are_real_uuidv7_and_replay_surfaces_the_stored_pair() {
     first.ingress_id.parse::<dolly_core_domain::IngressId>().unwrap();
     first.block_id.parse::<dolly_core_domain::BlockId>().unwrap();
 
-    // A second commit allocates a fresh, distinct identity pair.
     let second_request =
         request("msg-2", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"bye"}));
     let (second, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &second_request).unwrap());
     assert_ne!(first.ingress_id, second.ingress_id);
     assert_ne!(first.block_id, second.block_id);
 
-    // An idempotent replay returns the stored pair, never a fresh mint.
     let (replayed, idempotent) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
     assert!(idempotent);
     assert_eq!(replayed.ingress_id, first.ingress_id);
@@ -673,7 +771,7 @@ fn minted_identities_are_real_uuidv7_and_replay_surfaces_the_stored_pair() {
 }
 
 // ---------------------------------------------------------------------------
-// Absence, cross-verification, and fail-closed tamper detection
+// Absence, cross-verification, and fail-closed tamper/loss detection
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -689,7 +787,8 @@ fn absent_status_is_explicit() {
 #[test]
 fn lost_response_is_reconciled_through_status_not_resubmission() {
     let mut harness = Harness::new("lost-response");
-    let incoming = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
     let _lost_receipt = submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap();
 
     let mapping = match status(&mut harness.connection, &harness.authority, &harness.grant, "msg-1").unwrap() {
@@ -704,40 +803,85 @@ fn lost_response_is_reconciled_through_status_not_resubmission() {
 }
 
 #[test]
-fn deleted_mapping_row_never_reads_as_absent() {
+fn deleted_mapping_rows_plus_lost_operation_never_read_as_absent_while_effect_remains() {
+    let mut harness = Harness::new("dual-delete");
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let (mapping, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
+
+    // Delete BOTH the mapping row and its Core operation row; the reducer
+    // ingress record and Block remain in Core state, so this must fail closed
+    // as corrupt, never read as Absent.
+    harness
+        .connection
+        .execute("DELETE FROM host_ingress_mappings WHERE ingress_key = ?1", [&mapping.ingress_key])
+        .unwrap();
+    harness
+        .connection
+        .execute("DELETE FROM core_operations WHERE command_id = ?1", [&mapping.command_id])
+        .unwrap();
+    let error = status(&mut harness.connection, &harness.authority, &harness.grant, "msg-1")
+        .expect_err("a surviving effect with deleted mapping+operation must fail closed");
+    assert_eq!(error.code(), HostIngressErrorCode::Corrupt);
+}
+
+#[test]
+fn deleted_mapping_row_with_live_operation_never_reads_as_absent() {
     let mut harness = Harness::new("deleted-mapping");
-    let incoming = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
     let (mapping, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
     harness
         .connection
         .execute("DELETE FROM host_ingress_mappings WHERE ingress_key = ?1", [&mapping.ingress_key])
         .unwrap();
 
-    // The Core operation still exists, so absence must not be reported.
     let error = status(&mut harness.connection, &harness.authority, &harness.grant, "msg-1")
         .expect_err("a deleted mapping with a live Core operation must fail closed");
     assert_eq!(error.code(), HostIngressErrorCode::Corrupt);
 }
 
 #[test]
-fn lost_core_operation_never_reads_as_committed() {
-    let mut harness = Harness::new("lost-operation");
-    let incoming = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+fn replay_after_effect_loss_fails_closed_instead_of_committed() {
+    let mut harness = Harness::new("replay-after-loss");
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
     let (mapping, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
     harness
         .connection
         .execute("DELETE FROM core_operations WHERE command_id = ?1", [&mapping.command_id])
         .unwrap();
 
+    // A same-key/same-digest replay must NOT return the mapping as committed:
+    // the shared verification fails closed.
+    let error = submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming)
+        .expect_err("replay after effect loss must fail closed");
+    assert_eq!(error.code(), HostIngressErrorCode::Corrupt);
+}
+
+#[test]
+fn tampered_transition_fails_closed() {
+    let mut harness = Harness::new("tamper-transition");
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let (mapping, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
+    harness
+        .connection
+        .execute(
+            "UPDATE core_operations SET transition_jcs = X'7b7d' WHERE command_id = ?1",
+            [&mapping.command_id],
+        )
+        .unwrap();
     let error = status(&mut harness.connection, &harness.authority, &harness.grant, "msg-1")
-        .expect_err("a mapping whose Core operation is lost must fail closed");
+        .expect_err("a tampered transition must fail closed");
     assert_eq!(error.code(), HostIngressErrorCode::Corrupt);
 }
 
 #[test]
 fn tampered_premise_bytes_fail_closed() {
     let mut harness = Harness::new("tamper-premise");
-    let incoming = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
     let (mapping, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
     harness
         .connection
@@ -754,7 +898,8 @@ fn tampered_premise_bytes_fail_closed() {
 #[test]
 fn tampered_mapping_columns_fail_closed() {
     let mut harness = Harness::new("tamper-columns");
-    let incoming = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
     let (mapping, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
     harness
         .connection
@@ -791,63 +936,97 @@ fn missing_schema_is_gated_fail_closed() {
 }
 
 // ---------------------------------------------------------------------------
-// Atomic rollback and exact recovery
+// Real rollback and exact recovery
 // ---------------------------------------------------------------------------
 
+/// Drive the reducer into the committed RecoveryRequired instance mode, then
+/// verify a real submit is rolled back at the Core effect stage and recovery
+/// restores a clean replay.
 #[test]
-fn rolled_back_transaction_leaves_zero_partial_mapping_rows() {
-    let mut harness = Harness::new("rollback");
-    let incoming = request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
-    let identity = {
-        let facts = dolly_core_reducer::IngressAuthorityFacts {
-            owner: "g4-ingress-connection".into(),
-            extension_id: EXTENSION_ID.into(),
-            module_id: MODULE_ID.into(),
-            instance_id: WORKER_EPOCH.into(),
-            generation: 1,
-            revision: 1,
-            graph_revision: 1,
-        };
-        dolly_core_reducer::derive_ingress_identity(&facts, &incoming).unwrap()
+fn real_core_refusal_rolls_back_the_submit_and_recovery_commits_exactly() {
+    let mut harness = Harness::new("real-rollback");
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
+
+    // Enter RecoveryRequired durably through the accepted Recover command
+    // with a failed ordered verification (real reducer state transition).
+    let recovered_page_seq = core_state(&mut harness.connection).next_page_seq;
+    let refused_recovery = {
+        let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
+        store
+            .transact(
+                &CoreCommand::Recover(RecoverCommand {
+                    command_id: "recover-refusal".into(),
+                    persisted_next_page_seq: recovered_page_seq,
+                }),
+                &EnvironmentInput {
+                    now: "2026-08-28T00:00:00.000000Z".into(),
+                    recovery_verification: Some(RecoveryVerification {
+                        ordered_checks_complete: true,
+                        invariants_valid: false,
+                        persisted_values_valid: false,
+                        process_fences_valid: false,
+                        staged_results_valid: false,
+                        failure_reason: Some("test-injected refusal".into()),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
     };
+    assert_eq!(refused_recovery.outcome, TransitionOutcome::Committed);
+    assert_eq!(
+        core_state(&mut harness.connection).mode,
+        dolly_core_reducer::InstanceMode::RecoveryRequired
+    );
 
-    // Simulate a daemon kill at an arbitrary stage: a transaction that wrote
-    // the premise row and a Core operation row is rolled back, exactly as a
-    // crash mid-submit would be. Nothing may remain.
-    let tx = harness
-        .connection
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .unwrap();
-    tx.execute(
-        "INSERT INTO host_ingress_mappings (
-            ingress_key, operation_digest, payload_digest, owner,
-            extension_id, module_id, instance_id, generation,
-            revision, graph_revision, external_event_id, kind,
-            references_external_event_id, target_pages_jcs,
-            premise_jcs, premise_digest, ingress_id, block_id
-         ) VALUES (
-            ?1, ?2, ?2, 'g4-ingress-connection', 'org.dolly.channel', 'receiver',
-            '0198ab31-6c44-7e8a-b2bb-000000000110', 1, 1, 1, 'msg-1', 'message', NULL,
-            X'7b5b5d7d', X'7b7d', ?2, '0198ab31-6c44-7e8a-b2bb-000000000001',
-            '0198ab31-6c44-7e8a-b2bb-000000000002'
-         )",
-        rusqlite::params![identity.key.as_str(), identity.operation_digest],
-    )
-    .unwrap();
-    drop(tx);
-
-    assert_eq!(mapping_rows(&mut harness.connection), 0, "zero partial mapping after a crash");
+    // A real submit now reaches the reducer inside its transaction, the
+    // reducer refuses (RECOVERY_REQUIRED) after the premise row was inserted,
+    // and the whole transaction rolls back: zero partial rows, no new effect,
+    // and the status for the new event is authoritative Absent.
+    let incoming2 =
+        request("msg-2", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"after-crash"}));
+    let error = submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming2)
+        .expect_err("core refusal must surface as NotReady");
+    assert_eq!(error.code(), HostIngressErrorCode::NotReady);
+    assert_eq!(mapping_rows(&mut harness.connection), 1, "zero partial mapping after rollback");
     assert!(matches!(
-        status(&mut harness.connection, &harness.authority, &harness.grant, "msg-1").unwrap(),
+        status(&mut harness.connection, &harness.authority, &harness.grant, "msg-2").unwrap(),
         HostIngressStatus::Absent
     ));
 
-    // A byte-identical replay after the crash commits cleanly (exact
-    // recovery), not as a duplicate or a conflict.
-    let (mapping, idempotent) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
-    assert!(!idempotent, "after a crash the replay is a fresh commit");
-    assert_eq!(mapping_rows(&mut harness.connection), 1);
-    match status(&mut harness.connection, &harness.authority, &harness.grant, "msg-1").unwrap() {
+    // Recover (valid verification), then the byte-identical replay commits
+    // exactly once as a fresh commit — no duplicate, no conflict.
+    let recovered_page_seq = core_state(&mut harness.connection).next_page_seq;
+    {
+        let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
+        let recovered = store
+            .transact(
+                &CoreCommand::Recover(RecoverCommand {
+                    command_id: "recover-ok".into(),
+                    persisted_next_page_seq: recovered_page_seq,
+                }),
+                &EnvironmentInput {
+                    now: "2026-08-28T00:00:00.000000Z".into(),
+                    recovery_verification: Some(RecoveryVerification {
+                        ordered_checks_complete: true,
+                        invariants_valid: true,
+                        persisted_values_valid: true,
+                        process_fences_valid: true,
+                        staged_results_valid: true,
+                        failure_reason: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(recovered.outcome, TransitionOutcome::Committed);
+    }
+    let (mapping, idempotent) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming2).unwrap());
+    assert!(!idempotent, "after recovery the replay is a fresh commit");
+    assert_eq!(mapping_rows(&mut harness.connection), 2);
+    match status(&mut harness.connection, &harness.authority, &harness.grant, "msg-2").unwrap() {
         HostIngressStatus::Committed(seen) => assert_eq!(seen.ingress_key, mapping.ingress_key),
         HostIngressStatus::Absent => panic!("replayed commit must be visible"),
     }

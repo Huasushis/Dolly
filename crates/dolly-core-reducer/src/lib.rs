@@ -21,9 +21,8 @@ pub use command::{
     RuntimeEventCommand, SkipRangeCommand,
 };
 pub use host_ingress::{
-    HostIngressPremiseError, IngressAuthorityFacts, IngressIdentity, build_ingress_command,
-    canonical_target_page_ids, derive_ingress_identity, derive_ingress_key,
-    validate_ingress_request,
+    HostIngressPremiseError, IngressIdentity, build_ingress_command, canonical_target_page_ids,
+    derive_ingress_identity, derive_ingress_key, validate_ingress_request,
 };
 pub use disposition::{Disposition, DispositionShapeError, validate_disposition_candidate};
 pub use effective_config::{
