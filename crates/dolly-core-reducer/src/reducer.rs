@@ -329,6 +329,8 @@ struct GraphDescriptor {
     module_id: String,
     descriptor_revision: i64,
     source_descriptor_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_extension_id: Option<String>,
     value: Value,
 }
 
@@ -393,6 +395,10 @@ fn manifest_neighbor_projection_matches_graph(
                 .get("descriptor_revision")
                 .and_then(Value::as_i64)
                 != Some(descriptor.descriptor_revision)
+            || descriptor
+                .owner_extension_id
+                .as_deref()
+                .is_some_and(|owner| owner.is_empty())
         {
             return false;
         }

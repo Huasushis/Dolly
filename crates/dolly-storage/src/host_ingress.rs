@@ -520,7 +520,13 @@ impl HostIngress for SqliteHostIngressStore<'_> {
             .load_command_snapshot(&command)
             .map_err(map_storage)?;
         let graph_revision =
-            verify_graph_direction(&snapshot, &facts, grant, &identity)?;
+            verify_graph_direction(
+                transaction.sql_transaction().map_err(map_storage)?,
+                &snapshot,
+                &facts,
+                grant,
+                &identity,
+            )?;
 
         // 4. An edit/delete MUST reference an event the same principal
         //    already committed, verified through the shared path.
@@ -803,6 +809,7 @@ fn verify_current_principal(
 /// or a Page of another Extension (the granted (extension, module) pair is
 /// the ownership/source binding).
 fn verify_graph_direction(
+    connection: &Connection,
     snapshot: &CoreSnapshot,
     facts: &PrincipalFacts,
     grant: &HostCapabilityGrant,
@@ -880,17 +887,62 @@ fn verify_graph_direction(
             ),
         ));
     }
-    let owner_extension_id = admitted
-        .get("owner_extension_id")
-        .and_then(Value::as_str);
-    if owner_extension_id != Some(&facts.extension_id) {
+    // The owner is not caller-shaped authority: it is derived from the
+    // Host-owned grant context (the extension(s) that hold a current,
+    // unrevoked grant pinning exactly this module's admitted descriptor in
+    // exactly this graph), and the graph's canonical field must agree with
+    // that derivation. Untrusted graph input can therefore never choose or
+    // spoof an owner that the Host never granted.
+    let owner_extension_id = admitted.get("owner_extension_id").and_then(Value::as_str);
+    let Some(owner_extension_id) = owner_extension_id else {
         return Err(HostIngressError::new(
             HostIngressErrorCode::NotAuthorized,
             format!(
-                "the graph admits module {} under Extension {:?}, not the grant's Extension {:?}",
-                facts.module_id,
-                owner_extension_id,
-                facts.extension_id
+                "the graph admission for module {} carries no Extension owner",
+                facts.module_id
+            ),
+        ));
+    };
+    let mut derived_owners: Vec<String> = Vec::new();
+    {
+        let mut statement = connection
+            .prepare(
+                "SELECT extension_id FROM host_capability_grants
+                 WHERE module_id = ?1 AND descriptor_digest = ?2
+                   AND graph_revision = ?3 AND graph_digest = ?4 AND revoked = 0",
+            )
+            .map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![
+                    facts.module_id,
+                    source_descriptor_digest.unwrap_or_default(),
+                    graph_revision,
+                    grant.graph_digest(),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(map_sqlite_error)?;
+        for row in rows {
+            derived_owners.push(row.map_err(map_sqlite_error)?);
+        }
+    }
+    let grant_owned = derived_owners.iter().any(|owner| owner == owner_extension_id);
+    if !grant_owned {
+        return Err(HostIngressError::new(
+            HostIngressErrorCode::NotAuthorized,
+            format!(
+                "the graph admission names Extension {owner_extension_id:?} for module {}, which holds no Host grant for this descriptor/graph",
+                facts.module_id
+            ),
+        ));
+    }
+    if owner_extension_id != facts.extension_id {
+        return Err(HostIngressError::new(
+            HostIngressErrorCode::NotAuthorized,
+            format!(
+                "the graph admits module {} under Extension {owner_extension_id:?}, not the grant's Extension {:?}",
+                facts.module_id, facts.extension_id
             ),
         ));
     }
