@@ -1825,6 +1825,7 @@ fn create_fresh_schema(
         .map_err(map_sqlite_error)?;
     crate::transaction::initialize_core_engine_schema_in_transaction(&tx)?;
     crate::effect_journal::initialize_effect_journal_schema(tx)?;
+    crate::host_ingress::initialize_host_ingress_schema(tx)?;
     tx.execute(
         "INSERT INTO core_meta (
             singleton, schema_version, daemon_installation_id, instance_id,

@@ -5,6 +5,7 @@
 mod command;
 mod disposition;
 mod effective_config;
+mod host_ingress;
 pub mod neighbors;
 mod projection;
 mod reducer;
@@ -18,6 +19,10 @@ pub use command::{
     ReceiveResultCommand, ReceiveResultStatus, RecordReplayEvidenceCommand, RecoverCommand,
     ReleaseStorageWriterCommand, ResolveQuarantineCommand, ResolveQuarantineResolution,
     RuntimeEventCommand, SkipRangeCommand,
+};
+pub use host_ingress::{
+    HostIngressPremiseError, IngressIdentity, build_ingress_command, canonical_target_page_ids,
+    derive_ingress_identity, derive_ingress_key,
 };
 pub use disposition::{Disposition, DispositionShapeError, validate_disposition_candidate};
 pub use effective_config::{

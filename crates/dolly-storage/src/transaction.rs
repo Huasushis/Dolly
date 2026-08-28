@@ -204,7 +204,7 @@ fn ensure_initial_state(connection: &Connection, tables_were_new: bool) -> Stora
     Ok(())
 }
 
-fn canonical_digest<T: Serialize>(value: &T) -> StorageResult<(Vec<u8>, String)> {
+pub(crate) fn canonical_digest<T: Serialize>(value: &T) -> StorageResult<(Vec<u8>, String)> {
     let (bytes, digest) = canonicalize(value).map_err(|_| StorageError::Corrupt)?;
     Ok((bytes.into_vec(), digest.to_canonical_string()))
 }
@@ -213,7 +213,7 @@ fn encode_projection(state: &CoreSnapshot) -> StorageResult<(Vec<u8>, String)> {
     canonical_digest(&project_core_state(state))
 }
 
-fn decode_canonical<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> StorageResult<T> {
+pub(crate) fn decode_canonical<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> StorageResult<T> {
     let value: Value = deserialize_core_json(
         bytes,
         ParseLimits::semantic(64).map_err(|_| StorageError::Corrupt)?,
@@ -363,9 +363,21 @@ impl<'connection> SqliteCoreTransaction<'connection> {
         Ok(transaction)
     }
 
+    /// Crate-private access to the live SQLite transaction so sibling storage
+    /// slices (the Host ingress mapping) execute inside the same atomic
+    /// commit without opening a second writer connection.
     /// Return the exact transition retained for an idempotent command replay.
     pub fn replayed_transition(&self) -> Option<&Transition> {
         self.replay.as_ref()
+    }
+
+    pub(crate) fn sql_transaction(&self) -> StorageResult<&Transaction<'connection>> {
+        self.transaction.as_ref().ok_or(StorageError::Corrupt)
+    }
+
+    /// Crate-private mutating access to the live SQLite transaction.
+    pub(crate) fn sql_transaction_mut(&mut self) -> StorageResult<&mut Transaction<'connection>> {
+        self.transaction.as_mut().ok_or(StorageError::Corrupt)
     }
 
     fn transaction(&self) -> StorageResult<&Transaction<'connection>> {

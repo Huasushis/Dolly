@@ -9,9 +9,18 @@ mod identifiers;
 mod numbers;
 mod shared;
 mod timestamp;
+mod ingress;
 
 pub use error_envelope::{
     CoreErrorCode, CoreErrorEnvelope, CoreOutcome, CursorSpan, DeliveryKey, FrozenConfig,
+};
+pub use ingress::{
+    HOST_INGRESS_RECORD_SCHEMA, HOST_INGRESS_SCHEMA_VERSION, HostIngress, HostIngressError,
+    HostIngressErrorCode, HostIngressKey, HostIngressKind, HostIngressMapping,
+    HostIngressPremise, HostIngressSource, HostIngressStatus, HostIngressSubmitOutcome,
+    IngressDelivery, MAX_HOST_INGRESS_ID_TEXT_BYTES, MAX_HOST_INGRESS_OWNER_BYTES,
+    MAX_HOST_INGRESS_PAYLOAD_JCS_BYTES, MAX_HOST_INGRESS_REVISION,
+    MAX_HOST_INGRESS_TARGET_PAGES,
 };
 pub use identifiers::{
     ActionId, ActionName, ActivationId, BlockId, DaemonInstallationId, ExtensionId, IngressId,
