@@ -308,6 +308,17 @@ struct TransactionRequest<'a> {
     input: &'a EnvironmentInput,
 }
 
+/// The canonical request-identity digest of one (command, input) pair, stored
+/// in `core_operations.request_digest`. Recomputable for cross-verification
+/// of a committed Core operation against its durable ingress mapping.
+pub(crate) fn request_identity_digest(
+    command: &CoreCommand,
+    input: &EnvironmentInput,
+) -> StorageResult<String> {
+    let (_, digest) = canonical_digest(&TransactionRequest { command, input })?;
+    Ok(digest)
+}
+
 /// A SQLite transaction carrying one reducer command and its optimistic fence.
 pub struct SqliteCoreTransaction<'connection> {
     transaction: Option<Transaction<'connection>>,
@@ -363,14 +374,14 @@ impl<'connection> SqliteCoreTransaction<'connection> {
         Ok(transaction)
     }
 
-    /// Crate-private access to the live SQLite transaction so sibling storage
-    /// slices (the Host ingress mapping) execute inside the same atomic
-    /// commit without opening a second writer connection.
     /// Return the exact transition retained for an idempotent command replay.
     pub fn replayed_transition(&self) -> Option<&Transition> {
         self.replay.as_ref()
     }
 
+    /// Crate-private access to the live SQLite transaction so sibling storage
+    /// slices (the Host ingress mapping) execute inside the same atomic
+    /// commit without opening a second writer connection.
     pub(crate) fn sql_transaction(&self) -> StorageResult<&Transaction<'connection>> {
         self.transaction.as_ref().ok_or(StorageError::Corrupt)
     }
@@ -378,6 +389,14 @@ impl<'connection> SqliteCoreTransaction<'connection> {
     /// Crate-private mutating access to the live SQLite transaction.
     pub(crate) fn sql_transaction_mut(&mut self) -> StorageResult<&mut Transaction<'connection>> {
         self.transaction.as_mut().ok_or(StorageError::Corrupt)
+    }
+
+    /// Crate-private read of the current Host authority from the live
+    /// transaction, without engaging the per-command replay machinery. Used
+    /// by the Host ingress slice to re-verify the scoped principal.
+    pub(crate) fn load_authority(&self) -> StorageResult<HostConnectionAuthority> {
+        let (snapshot, _, _) = load_snapshot(self.transaction()?)?;
+        host_connection_authority_from_snapshot(&snapshot)
     }
 
     fn transaction(&self) -> StorageResult<&Transaction<'connection>> {
@@ -1057,7 +1076,7 @@ fn load_host_capability_grant_row(
         grant_digest: row_grant_digest,
     }))
 }
-fn load_current_host_capability_grant(
+pub(crate) fn load_current_host_capability_grant(
     transaction: &Transaction<'_>,
     authority: &HostConnectionAuthority,
     extension_id: &str,
@@ -1127,7 +1146,7 @@ fn host_connection_identity_from_snapshot(
     })
 }
 
-fn host_connection_authority_from_snapshot(
+pub(crate) fn host_connection_authority_from_snapshot(
     snapshot: &CoreSnapshot,
 ) -> StorageResult<HostConnectionAuthority> {
     let record = snapshot.host_connection.as_ref().ok_or(StorageError::Corrupt)?;
