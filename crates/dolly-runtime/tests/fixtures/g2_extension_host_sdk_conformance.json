@@ -1,0 +1,62 @@
+{
+  "schema": "dolly.g2-extension-host-sdk-conformance/v1",
+  "spec_basis": [
+    "REQ-XRPC-002",
+    "REQ-XRPC-003",
+    "INV-XLIFE-001",
+    "INV-XLIFE-002",
+    "INV-XLIFE-004",
+    "INV-XCAP-001",
+    "INV-XCAP-002",
+    "REQ-XCAP-001"
+  ],
+  "source_boundary": {
+    "g1_fixture": "crates/dolly-runtime/tests/fixtures/g1_runtime_conformance.json",
+    "g1_case": "G1-EXEC-001",
+    "handoff": "committed module.activate frame and ExecutionPremise into one Host admission request",
+    "request_authority": "software development kit (SDK) and Extension provide request data only"
+  },
+  "cases": [
+    {
+      "id": "G2-ADMISSION-001",
+      "name": "valid_committed_g1_module_activate_reaches_one_host_admission_request",
+      "kind": "valid_admission",
+      "expected": "product_red",
+      "source_case": "G1-EXEC-001",
+      "fences": [
+        "activation_id",
+        "module_id",
+        "worker_epoch",
+        "worker_epoch_fence",
+        "extension_generation",
+        "lease_generation",
+        "manifest_digest",
+        "graph_revision",
+        "frame_digest",
+        "request_id",
+        "host_incarnation"
+      ],
+      "required_boundary": "one canonical invocation context and request",
+      "required_receipt": "Host admission receipt only",
+      "effect_boundary": "before Extension-specific effects"
+    },
+    {
+      "id": "G2-AUTHORITY-UNDECLARED-CAPABILITY",
+      "name": "undeclared_capability_fails_closed",
+      "kind": "fail_closed_control",
+      "expected": "pass",
+      "references": [
+        "tests/conformance/security/extension-capability-model-operation.test.ts::authorizes only the operations the bound descriptor defines"
+      ]
+    },
+    {
+      "id": "G2-AUTHORITY-CROSS-EXTENSION",
+      "name": "cross_extension_input_fails_closed",
+      "kind": "fail_closed_control",
+      "expected": "pass",
+      "references": [
+        "tests/conformance/security/extension-capability-model-operation.test.ts::rejects a handle used from another session, after revocation, or past its budget"
+      ]
+    }
+  ]
+}
