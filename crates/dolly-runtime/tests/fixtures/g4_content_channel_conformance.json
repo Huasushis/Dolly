@@ -26,22 +26,63 @@
     "blocked": "later WP-013B seam whose interfaces (WP-010 Asset authority and WP-013A Channel send contract) are not frozen; retained in the matrix, never executed until both freeze"
   },
   "evidence": {
-    "wp010_import_bound_and_crash_recovery": ["G4-WP010-IMPORT-BOUND-001"],
-    "wp010_canonical_identity_and_dedup": ["G4-WP010-IDENTITY-DEDUP-001"],
-    "wp010_mime_and_security_refusal": ["G4-WP010-MIME-SECURITY-001"],
-    "wp010_leases_and_gc": ["G4-WP010-LEASE-GC-001"],
-    "wp010_replicas_and_domain_isolation": ["G4-WP010-REPLICA-001", "G4-WP010-DOMAIN-ISOLATION-001"],
-    "wp013a_authenticated_text_round_trip": ["G4-WP013A-ROUNDTRIP-001"],
-    "wp013a_ingress_reconciliation": ["G4-WP013A-INGRESS-RECONCILE-001"],
-    "wp013a_authorization": ["G4-WP013A-AUTHORIZATION-001"],
-    "wp013a_replay_and_idempotency": ["G4-WP013A-REPLAY-001"],
-    "wp013a_unknown_and_partial_outbound": ["G4-WP013A-UNKNOWN-PARTIAL-001"],
-    "wp013a_backpressure": ["G4-WP013A-BACKPRESSURE-001"],
-    "wp013a_redaction": ["G4-WP013A-REDACTION-001"],
-    "wp013a_no_direct_page_or_cursor_mutation": ["G4-WP013A-NO-DIRECT-MUTATION-001"],
-    "wp013b_asset_import_and_send_seam": ["G4-WP013B-ASSET-SEND-SEAM-001"],
-    "wp013b_mime_lease_media_abuse_round_trip": ["G4-WP013B-MIME-LEASE-001", "G4-WP013B-MEDIA-ABUSE-001"],
-    "premise_direction_controls": ["G4-CONTROL-PREMISE-DIRECTION-001", "G4-CONTROL-SOURCE-SCOPED-001", "G4-CONTROL-ACTION-OWNER-001", "G4-CONTROL-NO-DIRECT-MUTATION-001", "G4-CONTROL-ASSET-UNTRUSTED-001"]
+    "wp010_import_bound_and_crash_recovery": [
+      "G4-WP010-IMPORT-BOUND-001"
+    ],
+    "wp010_canonical_identity_and_dedup": [
+      "G4-WP010-IDENTITY-DEDUP-001"
+    ],
+    "wp010_mime_and_security_refusal": [
+      "G4-WP010-MIME-SECURITY-001"
+    ],
+    "wp010_leases_and_gc": [
+      "G4-WP010-LEASE-GC-001"
+    ],
+    "wp010_replicas_and_domain_isolation": [
+      "G4-WP010-REPLICA-001",
+      "G4-WP010-DOMAIN-ISOLATION-001"
+    ],
+    "wp013a_authenticated_text_round_trip": [
+      "G4-WP013A-ROUNDTRIP-001"
+    ],
+    "wp013a_ingress_reconciliation": [
+      "G4-WP013A-INGRESS-RECONCILE-001"
+    ],
+    "wp013a_authorization": [
+      "G4-WP013A-AUTHORIZATION-001"
+    ],
+    "wp013a_replay_and_idempotency": [
+      "G4-WP013A-REPLAY-001"
+    ],
+    "wp013a_unknown_and_partial_outbound": [
+      "G4-WP013A-UNKNOWN-PARTIAL-001"
+    ],
+    "wp013a_backpressure": [
+      "G4-WP013A-BACKPRESSURE-001"
+    ],
+    "wp013a_redaction": [
+      "G4-WP013A-REDACTION-001"
+    ],
+    "wp013a_no_direct_page_or_cursor_mutation": [
+      "G4-WP013A-NO-DIRECT-MUTATION-001"
+    ],
+    "wp013b_asset_import_and_send_seam": [
+      "G4-WP013B-ASSET-SEND-SEAM-001"
+    ],
+    "wp013b_mime_lease_media_abuse_round_trip": [
+      "G4-WP013B-MIME-LEASE-001",
+      "G4-WP013B-MEDIA-ABUSE-001"
+    ],
+    "premise_direction_controls": [
+      "G4-CONTROL-PREMISE-DIRECTION-001",
+      "G4-CONTROL-SOURCE-SCOPED-001",
+      "G4-CONTROL-ACTION-OWNER-001",
+      "G4-CONTROL-NO-DIRECT-MUTATION-001",
+      "G4-CONTROL-ASSET-UNTRUSTED-001"
+    ],
+    "wp013a_committed_action_consumer": [
+      "G4-WP013A-CONSUMER-001"
+    ]
   },
   "cases": [
     {
@@ -50,8 +91,8 @@
       "kind": "asset_import_bound",
       "expected": "product_red",
       "seam": "Asset Host seam (A): a runtime host.asset.import / host.asset.status route from a committed asset_input block into dolly_asset::AssetService, with StatusResult answering an authoritative absent for a never-created import",
-      "causal_red": "dolly_asset::AssetService implements the bounded ACCEPTED->AVAILABLE machine with crash restart (proven by driving it), but the runtime Core route (CoreCommand::Ingress) commits asset_input blocks verbatim and never invokes the service, so no ImportId or AssetRef ever enters a committed record; AssetService.status answers NotFound for an unknown import_id, not an explicit absent, so a Host cannot distinguish never-submitted from committed",
-      "verify": "drive service import and crash recovery, then require the runtime to route a committed asset_input block to ImportId/AssetRef and expose a status that can answer absent; absent -> PRODUCT_RED"
+      "causal_red": "the exercised dolly_asset surface implements bounded ACCEPTED->AVAILABLE import, crash recovery, and answers NotFound (never an authoritative absent) for a never-created import (all proven by driving it), but the runtime Core route that this probe drove (CoreCommand::Ingress) commits asset_input blocks verbatim and never invokes AssetService, so no ImportId or AssetRef ever enters a committed record and no host.asset.import/status service exists to answer absent",
+      "verify": "drive service import, crash recovery, and a status read of a never-created import (NotFound, not absent), then require the runtime to route a committed asset_input block to ImportId/AssetRef and expose a status that can answer absent; absent -> PRODUCT_RED"
     },
     {
       "id": "G4-WP010-IDENTITY-DEDUP-001",
@@ -70,8 +111,8 @@
       "name": "mime_sniffing_and_security_refusal_precede_availability",
       "kind": "asset_mime_security",
       "expected": "pass",
-      "pass_basis": "the dolly-asset service sniffs declared media against actual bytes before any availability: MEDIA_TYPE_MISMATCH for active content labeled image/png, INVALID_BASE64 for malformed encodings with no durable record, SIZE_LIMIT cut-off for over-limit sources, SOURCE_DENIED for SSRF-credential URLs, and SOURCE_UNAVAILABLE for remotes with no Host transport",
-      "assertion": "drive AssetService refusals for a MIME spoof, bad base64, an over-limit payload, and an SSRF-shaped URL; require the exact refusal codes before availability",
+      "pass_basis": "the dolly-asset service sniffs declared media against actual bytes before any availability: MEDIA_TYPE_MISMATCH for active content labeled image/png, SIZE_LIMIT cut-off for over-limit sources, INVALID_BASE64 for malformed encodings with no durable record, SOURCE_DENIED for SSRF-credential URLs, and SOURCE_UNAVAILABLE for remotes with no Host transport",
+      "assertion": "drive AssetService refusals for a MIME spoof, an over-limit payload, bad base64, and an SSRF-shaped URL; require the exact refusal codes before availability",
       "references": [
         "crates/dolly-asset/src/media.rs::bounded sniffing and refusal codes",
         "crates/dolly-asset/tests/conformance.rs::declared_media_mismatch_is_rejected_and_active_content_is_not_relabeled"
@@ -82,8 +123,8 @@
       "name": "leases_pins_and_gc_use_atomic_durable_retention",
       "kind": "asset_lease_gc",
       "expected": "pass",
-      "pass_basis": "the dolly-asset service issues an unguessable LeaseId with finite expiry, makes lease creation atomic against a non-tombstone check, runs mark/tombstone/sweep GC with a live-lease/pin/reference abort, and never resurrects a tombstoned asset",
-      "assertion": "drive lease/pin/reference retention and GC sweep; require the tombstone to block new leases and the sweep to remove the object only after every reference is gone",
+      "pass_basis": "the dolly-asset service issues an unguessable LeaseId with finite expiry, makes lease creation atomic against a non-tombstone check, requires privilege for expiry-less pins, blocks the sweep with a live lease/pin/durable reference, runs mark/tombstone/sweep GC, never resurrects a tombstoned asset, and a reference created after a tombstone never wins",
+      "assertion": "drive lease, expiry-less pin, and durable-reference retention through GC sweep; require the sweep to stop on each live retention and to tombstone only after every reference is gone",
       "references": [
         "crates/dolly-asset/src/retention.rs::lease/pin/tombstone retention",
         "crates/dolly-asset/tests/conformance.rs::lease_ownership_blocks_gc_and_tombstone_blocks_new_leases"
@@ -118,9 +159,18 @@
       "name": "authenticated_text_round_trip_runs_producer_to_durable_premise_to_consumer",
       "kind": "channel_text_round_trip",
       "expected": "product_red",
-      "seam": "Core ingress Host seam (B) + committed-Action consumer seam (D): host.ingress.submit assigns Ingress/Block identity from the authenticated principal, and a runtime consumer feeds committed org.dolly.channel.send Actions into dispatch_send",
-      "causal_red": "the dolly_channel pipeline commits a producer-bound premise through the real Core transaction and dispatches a committed send to a confirmed ActionResult when a CoreIngress adapter is supplied (proven), but the shipping runtime ships no host.ingress.submit/status adapter (the only CoreIngress impls in the workspace are test doubles) and no committed-Action consumer, so no product process can derive a producer-bound ingress or dispatch a committed send; Core additionally accepts a caller-chosen block_id, so Block identity is never assigned by the Host",
-      "verify": "drive the integrated pipeline over the real Core (in-test host.ingress adapter), then require the shipping runtime to expose host.ingress.submit and a committed-Action consumer; absent -> PRODUCT_RED"
+      "seam": "Core ingress Host seam (B): host.ingress.submit assigns Ingress/Block identity from the authenticated principal; Core must not accept a caller-chosen block_id",
+      "causal_red": "the producer-bound premise, the causally derived downstream send, transport echo suppression, the opposite-premise conflict, and cross-Extension refusal all work over the real Core when a host.ingress adapter supplies identity (proven), but the shipping runtime ships no host.ingress.submit service (the only CoreIngress impls in the workspace are test doubles) and CoreCommand::Ingress takes a caller-chosen block_id, so no product process can derive a producer-bound ingress or have Block/Ingress identity assigned by the Host",
+      "verify": "drive the producer-bound premise, echo suppression, conflict, and cross-Extension refusal over real Core, then require the shipping runtime to expose host.ingress.submit that assigns identity; absent -> PRODUCT_RED"
+    },
+    {
+      "id": "G4-WP013A-CONSUMER-001",
+      "name": "committed_action_consumer_is_a_missing_runtime_loop",
+      "kind": "channel_committed_action_consumer",
+      "expected": "product_red",
+      "seam": "committed-Action outbound consumer seam (D): the runtime selects targeted org.dolly.channel.send Actions from committed Core Blocks and drives them through dispatch_send, the outbound ledger, and the transport",
+      "causal_red": "a committed org.dolly.channel.send Action sits durable in the real Core snapshot and the dolly_channel outbound pipeline turns it into a confirmed ActionResult, but only because the probe extracts the block and invokes parse_send_action/dispatch_send manually \u2014 the shipping runtime has no committed-Action outbound consumer loop that does that step",
+      "verify": "commit a send Action durably and prove the crate pipeline confirms it when invoked, then require the runtime consumer loop; absent -> PRODUCT_RED"
     },
     {
       "id": "G4-WP013A-INGRESS-RECONCILE-001",
@@ -173,9 +223,9 @@
       "name": "outbound_rate_limits_use_bounded_queues_and_caller_deadlines",
       "kind": "channel_backpressure",
       "expected": "product_red",
-      "seam": "committed-Action consumer seam (D): a bounded outbound queue with caller-deadline enforcement in the dispatch path, so a burst is queued under a caller deadline and transport unavailability never blocks Core input state",
-      "causal_red": "dolly_channel admission bounds pending sends and rate limits per session (proven: a burst past the limit is CHANNEL_RATE_LIMITED and retryable), but there is no bounded outbound QUEUE primitive and no caller-deadline wait/expiry in the dispatch path — a burst is rejected, not queued under a caller deadline, and no caller deadline is carried into a queue",
-      "verify": "drive the admission limit, then require a bounded queue with caller-deadline expiry for the rejected burst; absent -> PRODUCT_RED"
+      "seam": "committed-Action outbound consumer seam (D): a bounded outbound queue with caller-deadline enforcement in the dispatch path, so a burst is queued under a caller deadline and transport unavailability never blocks Core input state",
+      "causal_red": "the exercised dolly_channel admission path bounds pending sends and rate limits per session with a token bucket (verified: a one-piece send is admitted and confirmed while a three-piece burst is refused as CHANNEL_RATE_LIMITED retryable with no transport call). That proves admission, not queuing: there is no bounded outbound QUEUE primitive and no caller-deadline wait/expiry in the dispatch path, so a burst is REJECTED rather than queued under a caller deadline",
+      "verify": "drive the token-bucket admission limit (accept then refuse a burst), then require a bounded queue with caller-deadline expiry for the refused burst; absent -> PRODUCT_RED"
     },
     {
       "id": "G4-WP013A-REDACTION-001",

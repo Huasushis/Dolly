@@ -248,17 +248,19 @@ fn transact_ingress(
         .expect("ingress transaction must execute")
 }
 
-/// The exact causal red: every causal step above (harness health plus the
-/// integrated crate surface the probe drives) succeeded; only the missing
-/// product behavior named by the seam turns the case red.
+/// The exact causal red: every causal step this probe ACTUALLY drove
+/// succeeded; only the missing product behavior named by the seam turns the
+/// case red. Each cause states exactly which real Core transaction and/or
+/// integrated dolly-asset/dolly-channel surface operations ran, so no
+/// diagnostic claims steps a probe did not execute.
 fn product_red(case_id: &str, seam: &str, cause: &str, area: &str) -> ! {
     panic!(
         "PRODUCT_RED [{case_id}] seam={seam} cause={cause} area={area}; \
-         every causal step above (config install, graph install, the real Core \
-         transaction, and the integrated dolly-asset/dolly-channel surface this \
-         probe drives) succeeded, so this failure is attributable to the missing \
-         Host/runtime adapter seam named in the cause — not a harness, build, \
-         or environment failure"
+         every causal step this probe actually drove (the real Core transaction \
+         and/or integrated dolly-asset/dolly-channel surface operations named \
+         in the cause) succeeded, so this failure is attributable to the \
+         missing Host/runtime adapter seam named in the cause — not a harness, \
+         build, or environment failure"
     )
 }
 
@@ -860,6 +862,7 @@ fn g4_matrix_retains_all_declared_cases_and_causal_classification() {
         "wp010_leases_and_gc",
         "wp010_replicas_and_domain_isolation",
         "wp013a_authenticated_text_round_trip",
+        "wp013a_committed_action_consumer",
         "wp013a_ingress_reconciliation",
         "wp013a_authorization",
         "wp013a_replay_and_idempotency",
@@ -1309,10 +1312,22 @@ fn g4_wp010_bounded_import_and_crash_recovery_round_trip() {
         .expect("durable import record survives reopen");
     assert_eq!(recovered.state, "available");
 
+    // 4. Exactly the absent contract: a status read for a never-created
+    //    import answers NotFound, not an authoritative `absent` — verified
+    //    against the actual service, so a Host could not distinguish
+    //    never-submitted from committed through the current product either.
+    let never_created = service
+        .status(&capability, &import_id(901))
+        .expect_err("status for a never-created import must refuse");
+    assert_eq!(
+        never_created.code, AssetErrorCode::NotFound,
+        "no authoritative absent outcome exists — only NotFound"
+    );
+
     product_red(
         "G4-WP010-IMPORT-BOUND-001",
         seam,
-        "the dolly_asset service implements the bounded ACCEPTED->AVAILABLE machine with crash restart (proven above), but the runtime Core route (CoreCommand::Ingress) commits asset_input blocks verbatim and never invokes AssetService, so no ImportId or AssetRef ever enters a committed record, and AssetService.status answers NotFound for an unknown import_id instead of an explicit absent, so a Host cannot distinguish never-submitted from committed (Asset Host seam A)",
+        "the exercised dolly_asset surface implements bounded ACCEPTED->AVAILABLE import, crash recovery, and returns NotFound (never an authoritative absent) for a never-created import (all proven above), but the runtime Core route that this probe drove (CoreCommand::Ingress) commits asset_input blocks verbatim and never invokes AssetService, so no ImportId or AssetRef ever enters a committed record and no host.asset.import/status service exists to answer absent (Asset Host seam A)",
         "WP-010 Asset Host seam (A)",
     );
 }
@@ -1429,12 +1444,33 @@ fn g4_wp010_mime_and_security_refusal_precede_availability() {
     );
     assert!(refused.asset.is_none(), "no availability before refusal");
 
-    // 2. Strict base64: malformed encodings fail before any durable record.
-    let invalid = service
+    // 2. Over-limit source: cut off and rejected with SIZE_LIMIT before any
+    //    availability; no asset and no partial authority.
+    let mut big = png_bytes(4, 2);
+    big.resize(200 * 1024, 0); // exceeds the 64 KiB decoded bound
+    let over = service
         .import(
             &capability,
             &asset_request(
                 &import_id(622),
+                Source::InlineBase64 {
+                    base64: base64(&big),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("over-limit import is a recorded rejection");
+    assert_eq!(over.state, "rejected");
+    assert!(over.asset.is_none(), "no availability before the size refusal");
+    assert_eq!(over.error.as_ref().expect("envelope")["code"], "SIZE_LIMIT");
+
+    // 3. Strict base64: malformed encodings fail before any durable record.
+    let invalid = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(623),
                 Source::InlineBase64 {
                     base64: "aGVsbG8!".to_string(),
                 },
@@ -1445,12 +1481,12 @@ fn g4_wp010_mime_and_security_refusal_precede_availability() {
         .expect_err("invalid base64 must be refused");
     assert_eq!(invalid.code, AssetErrorCode::InvalidBase64);
 
-    // 3. SSRF policy: a remote URL carrying credentials is SOURCE_DENIED.
+    // 4. SSRF policy: a remote URL carrying credentials is SOURCE_DENIED.
     let denied = service
         .import(
             &capability,
             &asset_request(
-                &import_id(623),
+                &import_id(624),
                 Source::RemoteUrl {
                     url: "https://user:pass@example.com/a.png".to_string(),
                     max_bytes: 1024,
@@ -1462,12 +1498,12 @@ fn g4_wp010_mime_and_security_refusal_precede_availability() {
         .expect_err("credential-bearing remote source must be denied");
     assert_eq!(denied.code, AssetErrorCode::SourceDenied);
 
-    // 4. A remote URL with no Host transport is unavailable, never fabricated.
+    // 5. A remote URL with no Host transport is unavailable, never fabricated.
     let unavailable = service
         .import(
             &capability,
             &asset_request(
-                &import_id(624),
+                &import_id(625),
                 Source::RemoteUrl {
                     url: "https://example.com/a.png".to_string(),
                     max_bytes: 1024,
@@ -1533,6 +1569,81 @@ fn g4_wp010_leases_pins_and_gc_use_atomic_durable_retention() {
         .lease(&capability, &asset_id, "model-op-2", "late lease", 1000)
         .expect_err("tombstone must block new leases");
     assert_eq!(err.code, AssetErrorCode::NotFound);
+
+    // Pin retention: an expiry-less pin requires privilege, and a durable pin
+    // blocks the sweep (atomic non-tombstone check on retention, not just
+    // lease ownership).
+    let second = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(632),
+                Source::InlineBase64 {
+                    base64: base64(&png_bytes(6, 2)),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("second import for pin retention");
+    let pinned_id = second.asset.expect("AssetRef").asset_id.as_str().to_string();
+    let unprivileged = service
+        .pin(&capability, &pinned_id, "ops", "keep", None, false)
+        .expect_err("expiry-less pin without privilege must be refused");
+    assert_eq!(unprivileged.code, AssetErrorCode::Unauthorized);
+    service
+        .pin(&capability, &pinned_id, "ops", "keep", None, true)
+        .expect("privileged expiry-less pin");
+    let gc = service.run_gc().expect("gc");
+    assert_eq!(
+        gc.tombstones_created, 0,
+        "the durable pin blocks the sweep after lease expiry"
+    );
+
+    // Durable-reference retention: a live reference blocks GC; removing it
+    // lets the sweep tombstone; a reference created after the tombstone never
+    // wins (durable-reference/recheck semantics).
+    let third = service
+        .import(
+            &capability,
+            &asset_request(
+                &import_id(633),
+                Source::InlineBase64 {
+                    base64: base64(&png_bytes(8, 2)),
+                },
+                Some("image/png"),
+                false,
+            ),
+        )
+        .expect("third import for reference retention");
+    let referenced_id = third.asset.expect("AssetRef").asset_id.as_str().to_string();
+    let reference = service
+        .create_reference(&capability, &referenced_id, "block:b1", "block:b1")
+        .expect("durable reference");
+    let gc = service.run_gc().expect("gc");
+    assert_eq!(
+        gc.tombstones_created, 0,
+        "a live durable reference blocks the sweep"
+    );
+    service
+        .remove_reference(&capability, &referenced_id, reference.generation, "block:b1")
+        .expect("reference removed");
+    clock.advance(120_000);
+    let gc = service.run_gc().expect("gc");
+    assert_eq!(
+        gc.tombstones_created, 1,
+        "the sweep tombstones the unreferenced object"
+    );
+    let late = service
+        .create_reference(&capability, &referenced_id, "block:b2", "block:b2")
+        .expect_err("a reference racing a tombstone must never win");
+    assert!(
+        matches!(
+            late.code,
+            AssetErrorCode::NotFound | AssetErrorCode::Tombstoned
+        ),
+        "tombstone never resurrects"
+    );
 }
 
 #[test]
@@ -1734,8 +1845,8 @@ fn g4_wp013a_authenticated_text_round_trip_runs_producer_to_premise_to_consumer(
     let clock = channel_clock();
     let mut ledger = ChannelLedger::new();
 
-    // Producer leg: an authenticated event becomes a committed durable
-    // premise in real Core; the Channel ledger settles to accepted.
+    // 1. Producer leg: an authenticated event becomes a committed durable
+    //    premise in real Core; the Channel ledger settles to accepted.
     let (block_id, submit_calls) = {
         let mut core = CoreBackedIngress::new(&mut connection, "web-channel");
         let outcome = process_event(
@@ -1762,21 +1873,185 @@ fn g4_wp013a_authenticated_text_round_trip_runs_producer_to_premise_to_consumer(
         snapshot.blocks.contains_key(&block_id),
         "the Channel premise is durable in the real Core snapshot"
     );
+
+    // 2. The downstream outbound Action is causally derived from the
+    //    committed upstream premise: the session comes from the premise's
+    //    session map and the reply text is derived from the premise's
+    //    committed text part (read back from real Core, not from the test).
+    let premise_text = snapshot.blocks[&block_id]["parts"][0]["text"]
+        .as_str()
+        .expect("premise text part")
+        .to_string();
+    let session_id = ledger
+        .session("account-a", "conv-1")
+        .expect("session mapped")
+        .clone();
+    let reply = format!("Reply to: {premise_text}");
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000701";
+    let send_block = channel_send_block(action_id, &session_id, &[reply.as_str()]);
+    let mut transport = ScriptedTransport::new(true);
+    transport.push(TransportSendResult::AllConfirmed {
+        message_ids: vec!["transport-reply-1".to_string()],
+    });
+    let outbound = channel_dispatch(&config, &mut ledger, &mut transport, &send_block, action_id);
+    match outbound {
+        SendDispatchResult::Terminal {
+            state: OutboundState::Confirmed,
+            ..
+        } => {}
+        other => panic!("expected confirmed outbound, got {other:?}"),
+    }
+    assert_eq!(transport.calls().len(), 1);
+    assert_eq!(
+        transport.calls()[0].session_id, session_id,
+        "the downstream send stays bound to the upstream premise session"
+    );
+    assert_eq!(
+        transport.calls()[0].pieces[0].text, reply,
+        "the dispatched reply is causally derived from the committed premise"
+    );
+
+    // 3. Transport echo suppression: the confirmed external message ID
+    //    re-entering as an inbound event is ignored with zero Core calls, so
+    //    an outbound effect can never re-enter as a user premise.
+    let echo = {
+        let mut core2 = CoreBackedIngress::new(&mut connection, "web-channel");
+        let outcome = process_event(
+            &config,
+            &clock,
+            &mut ledger,
+            &mut core2,
+            &channel_event("account-a", "conv-1", "transport-reply-1", &reply),
+        );
+        (outcome, core2.submit_calls)
+    };
+    match echo.0 {
+        IngressOutcome::EchoIgnored => {}
+        other => panic!("transport echo must be suppressed inbound, got {other:?}"),
+    }
+    assert_eq!(echo.1, 0, "the echo never reaches Core");
+
+    // 4. Opposite premise: the committed producer key cannot be replaced with
+    //    different content — the premise is durable and irreversible.
+    let conflict = {
+        let mut core3 = CoreBackedIngress::new(&mut connection, "web-channel");
+        process_event(
+            &config,
+            &clock,
+            &mut ledger,
+            &mut core3,
+            &channel_event("account-a", "conv-1", "in-1", "Different question?"),
+        )
+    };
+    match conflict {
+        IngressOutcome::RejectedBeforeMutation { error } => {
+            assert_eq!(error.code, "CHANNEL_OPERATION_CONFLICT");
+        }
+        other => panic!("a premise must not be overwritable, got {other:?}"),
+    }
+
+    // 5. Cross-Extension leakage: a foreign-owner action is refused by the
+    //    Channel before any dispatch.
+    let foreign = json!({
+        "schema": "dolly.block/v1",
+        "id": "0198ab31-6c44-7e8a-b2bb-000000000002",
+        "body": {
+            "description": "other",
+            "parts": [],
+            "actions": [{
+                "action_id": "0198ab31-6c44-7e8a-b2bb-000000000099",
+                "name": "org.dolly.other.something",
+                "target": {"module_id": "web-channel"},
+                "arguments": {}
+            }]
+        }
+    });
+    assert!(
+        parse_send_action(&foreign).is_err(),
+        "a foreign-owner action must not be consumable by the Channel"
+    );
+
+    product_red(
+        "G4-WP013A-ROUNDTRIP-001",
+        seam,
+        "the producer-bound premise, the causally derived downstream send, transport echo suppression, the opposite-premise conflict, and cross-Extension refusal all work over the real Core when a host.ingress adapter supplies identity (proven above), but the shipping runtime ships no host.ingress.submit service — the only CoreIngress impls in the workspace are test doubles — and CoreCommand::Ingress takes a caller-chosen block_id, so no product process can derive a producer-bound ingress or have Block/Ingress identity assigned by the Host (Core ingress Host seam B)",
+        "WP-013A Core ingress Host seam (B)",
+    );
+}
+
+#[test]
+fn g4_wp013a_committed_action_consumer_remains_an_absent_runtime_loop() {
+    let entry = case("G4-WP013A-CONSUMER-001");
+    assert_eq!(entry["expected"], "product_red");
+    let seam = entry["seam"].as_str().expect("seam");
+
+    let mut connection = probe_connection("web-channel", "g4-consumer");
+    let config = channel_config();
+    let clock = channel_clock();
+    let mut ledger = ChannelLedger::new();
+
+    // 1. A session derived from a real committed upstream premise, so the
+    //    downstream dispatch is authorized under the premise's own identity.
+    {
+        let mut core = CoreBackedIngress::new(&mut connection, "web-channel");
+        let outcome = process_event(
+            &config,
+            &clock,
+            &mut ledger,
+            &mut core,
+            &channel_event("account-a", "conv-1", "in-1", "What is the weather?"),
+        );
+        assert!(
+            outcome.committed_block_id().is_some(),
+            "upstream premise committed in real Core"
+        );
+    }
     let session_id = ledger
         .session("account-a", "conv-1")
         .expect("session mapped")
         .clone();
 
-    // Consumer leg: a committed send Action dispatches to a confirmed
-    // ActionResult through the transport seam.
-    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000701";
-    let block = channel_send_block(action_id, &session_id, &["It will be sunny."]);
+    // 2. A committed send Action exists durably in the real Core snapshot.
+    let action_id = "0198ab31-6c44-7e8a-b2bb-000000000712";
+    let send_block = channel_send_block(action_id, &session_id, &["It will be sunny."]);
+    let committed = transact_ingress(
+        &mut connection,
+        "model/web-channel",
+        "action-1",
+        &canonical_digest(&send_block),
+        &format!("{action_id}-block"),
+        send_block.clone(),
+        vec![TARGET_PAGE.into()],
+        "g4-consumer-send",
+    );
+    assert_eq!(committed.outcome, TransitionOutcome::Committed);
+    let committed_block_id = committed
+        .reply
+        .as_ref()
+        .and_then(|reply| reply.get("block_id"))
+        .and_then(Value::as_str)
+        .expect("committed block id")
+        .to_string();
+    let snapshot = {
+        let store = SqliteCoreStore::new(&mut connection).expect("core schema");
+        store.snapshot().expect("snapshot")
+    };
+    let durable = &snapshot.blocks[&committed_block_id];
+    assert_eq!(
+        durable["body"]["actions"][0]["name"], "org.dolly.channel.send",
+        "the durable committed block carries the targeted channel send Action"
+    );
+
+    // 3. The Channel outbound pipeline turns that committed Action into a
+    //    confirmed ActionResult — but ONLY because this test extracts the
+    //    block and invokes dispatch_send by hand. The shipping runtime has no
+    //    consumer loop that does this step.
     let mut transport = ScriptedTransport::new(true);
     transport.push(TransportSendResult::AllConfirmed {
         message_ids: vec!["transport-reply-1".to_string()],
     });
-    let outbound = channel_dispatch(&config, &mut ledger, &mut transport, &block, action_id);
-    match outbound {
+    let outcome = channel_dispatch(&config, &mut ledger, &mut transport, &send_block, action_id);
+    match outcome {
         SendDispatchResult::Terminal {
             state: OutboundState::Confirmed,
             ..
@@ -1786,10 +2061,10 @@ fn g4_wp013a_authenticated_text_round_trip_runs_producer_to_premise_to_consumer(
     assert_eq!(transport.calls().len(), 1);
 
     product_red(
-        "G4-WP013A-ROUNDTRIP-001",
+        "G4-WP013A-CONSUMER-001",
         seam,
-        "the dolly_channel pipeline runs producer->durable premise->consumer over the real Core when a host.ingress adapter is supplied (proven above), but the shipping runtime ships no host.ingress.submit/status adapter (the only CoreIngress impls in the workspace are test doubles) and no committed-Action consumer, so no product process can derive a producer-bound ingress or dispatch a committed send; Core additionally accepts a caller-chosen block_id, so Block identity is never assigned by the Host (Core ingress Host seam B + committed-Action consumer seam D)",
-        "WP-013A Core ingress Host (B) / committed-Action consumer (D)",
+        "the exercised committed org.dolly.channel.send Action sits durable in the real Core snapshot and the dolly_channel outbound pipeline turns it into a confirmed ActionResult, but only because this probe extracts the block and invokes parse_send_action/dispatch_send manually — the shipping runtime has no committed-Action outbound consumer loop that selects targeted Actions from committed Blocks and drives them through the ledger and transport (committed-Action consumer seam D)",
+        "WP-013A committed-Action consumer seam (D)",
     );
 }
 
@@ -2103,7 +2378,7 @@ fn g4_wp013a_outbound_rate_limits_use_bounded_queues_and_caller_deadlines() {
     product_red(
         "G4-WP013A-BACKPRESSURE-001",
         seam,
-        "dolly_channel admission bounds pending sends and rate limits per session (proven above: a burst past the limit is CHANNEL_RATE_LIMITED and retryable), but there is no bounded outbound QUEUE primitive and no caller-deadline wait/expiry in the dispatch path — a burst is rejected, not queued under a caller deadline, and no caller deadline is carried into a queue (committed-Action consumer seam D)",
+        "the exercised dolly_channel admission path bounds pending sends and rate limits per session with a token bucket: the one-piece send is admitted into the real outbound ledger and then confirmed, while the three-piece burst is refused as CHANNEL_RATE_LIMITED retryable with no transport call (verified above). That proves admission exists, not queuing: there is no bounded outbound QUEUE primitive and no caller-deadline wait/expiry anywhere in the dispatch path, so a burst is REJECTED rather than queued under a caller deadline (committed-Action consumer seam D)",
         "WP-013A committed-Action consumer seam (D)",
     );
 }
