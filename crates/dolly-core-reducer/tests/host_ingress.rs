@@ -6,8 +6,9 @@
 use dolly_canonical_json::CanonicalJsonValue;
 use dolly_core_domain::{HostIngressKind, HostIngressSubmitRequest, PageId};
 use dolly_core_reducer::{
-    CoreCommand, HostIngressPremiseError, build_ingress_command, canonical_target_page_ids,
-    derive_ingress_identity, derive_ingress_key, validate_ingress_request,
+    CoreCommand, EnvironmentInput, HostIngressPremiseError, TransitionOutcome,
+    build_ingress_command, canonical_target_page_ids, derive_ingress_identity,
+    derive_ingress_key, empty_core_snapshot, reduce, validate_ingress_request,
 };
 use serde_json::{Value, json};
 
@@ -417,7 +418,8 @@ fn build_ingress_command_uses_minted_block_id_and_canonical_pages() {
         &["page-b", "page-a", "page-b"],
         json!({"text":"hello"}),
     );
-    let base_id = identity(&incoming);
+    let minted_ingress_id = "0198ab31-6c44-7e8a-b2bb-000000000002";
+    let base_id = identity(&incoming).with_ingress_id(minted_ingress_id.into());
     let block_id: dolly_core_domain::BlockId =
         "0198ab31-6c44-7e8a-b2bb-000000000001".parse().unwrap();
     let command = build_ingress_command(
@@ -438,8 +440,55 @@ fn build_ingress_command_uses_minted_block_id_and_canonical_pages() {
         ingress.runtime_source,
         "org.dolly.channel#receiver#0198ab31-6c44-7e8a-b2bb-000000000110"
     );
-    assert!(ingress.command_id.starts_with("host-ingress-"));
+    assert_eq!(
+        ingress.command_id,
+        format!("host-ingress-{}-{minted_ingress_id}", base_id.key)
+    );
     assert_eq!(ingress.block, json!({"text":"hello"}));
+}
+
+#[test]
+fn reduce_preserves_first_occurrence_target_order_and_collapses_duplicates() {
+    let incoming = request(
+        "msg-1",
+        HostIngressKind::Message,
+        None,
+        &["page-b", "page-a", "page-b"],
+        json!({"text":"hello"}),
+    );
+    let minted_ingress_id = "0198ab31-6c44-7e8a-b2bb-000000000002";
+    let base_id = identity(&incoming).with_ingress_id(minted_ingress_id.into());
+    let block_id: dolly_core_domain::BlockId =
+        "0198ab31-6c44-7e8a-b2bb-000000000001".parse().unwrap();
+    let command = build_ingress_command(
+        &base_id,
+        &block_id,
+        "org.dolly.channel#receiver#0198ab31-6c44-7e8a-b2bb-000000000110",
+        &incoming,
+    );
+    let transition = reduce(
+        &empty_core_snapshot(),
+        &command,
+        &EnvironmentInput {
+            now: "2026-08-28T00:00:00.000000Z".into(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(transition.outcome, TransitionOutcome::Committed);
+    let identity = format!("org.dolly.channel#receiver#0198ab31-6c44-7e8a-b2bb-000000000110\0{}", base_id.key);
+    let record = transition.state.ingress.get(&identity).unwrap();
+    assert_eq!(
+        record.pages,
+        vec!["page-b".to_string(), "page-a".to_string()],
+        "the reducer must preserve first-occurrence target order, never re-sort"
+    );
+    let page_order: Vec<&str> = transition
+        .state
+        .deliveries
+        .iter()
+        .filter_map(|delivery| delivery.get("page_id").and_then(serde_json::Value::as_str))
+        .collect();
+    assert_eq!(page_order, vec!["page-b", "page-a"]);
 }
 
 #[test]

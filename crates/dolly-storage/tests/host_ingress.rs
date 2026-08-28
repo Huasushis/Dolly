@@ -653,6 +653,124 @@ fn opposite_input_target_page_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// Non-lexical first-occurrence target order (end-to-end)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn non_lexical_target_order_commits_reconciles_replays_and_conflicts() {
+    let mut harness = Harness::new("nonlexical");
+    // page-b before page-a is valid: first-occurrence order is the contract,
+    // never a lexicographic re-sort.
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-b", "page-a", "page-b"], json!({"kind":"text","text":"hello"}));
+    let (mapping, idempotent) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
+    assert!(!idempotent);
+    assert_eq!(
+        mapping.target_page_ids,
+        vec!["page-b".to_string(), "page-a".to_string()],
+        "duplicates collapse in first-occurrence order without reordering"
+    );
+    assert_eq!(mapping.deliveries.len(), 2);
+    assert_eq!(mapping.deliveries[0].page_id, "page-b");
+    assert_eq!(mapping.deliveries[1].page_id, "page-a");
+
+    // status and replay reconcile the identical mapping.
+    match status(&mut harness.connection, &harness.authority, &harness.grant, "msg-1").unwrap() {
+        HostIngressStatus::Committed(seen) => {
+            assert_eq!(seen.target_page_ids, mapping.target_page_ids);
+            assert_eq!(seen.deliveries, mapping.deliveries);
+        }
+        HostIngressStatus::Absent => panic!("nonlexical commit must reconcile"),
+    }
+    let (replayed, idempotent) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
+    assert!(idempotent);
+    assert_eq!(replayed, mapping);
+    assert_ne!(replayed.ingress_id, String::new());
+
+    // Reordering targets remains a digest conflict as specified.
+    let reordered =
+        request("msg-1", HostIngressKind::Message, None, &["page-a", "page-b"], json!({"kind":"text","text":"hello"}));
+    assert!(matches!(
+        submit(&mut harness.connection, &harness.authority, &harness.grant, &reordered).unwrap(),
+        HostIngressSubmitOutcome::Conflict { .. }
+    ));
+    assert_eq!(mapping_rows(&mut harness.connection), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-Extension descriptor binding and identity-link tamper
+// ---------------------------------------------------------------------------
+
+#[test]
+fn live_grant_under_another_extension_cannot_reuse_module_outputs() {
+    let body = graph(&[MODULE_ID, MODULE_B_ID], &[]);
+    let mut harness = Harness::new("cross-extension");
+    // A second Extension holds a live grant for the SAME module id but pins
+    // its own (different) descriptor; it must not reuse this Module's graph
+    // outputs even though its graph revision/digest match.
+    {
+        let mut store = SqliteCoreStore::new(&mut harness.connection).unwrap();
+        store
+            .install_host_capability_grant(
+                &harness.authority,
+                "org.dolly.different-extension",
+                MODULE_ID,
+                1,
+                1,
+                &digest(&json!({"module_id": MODULE_ID, "kind": "other-extension"})),
+                1,
+                &digest(&json!({"manifest": 1})),
+                1,
+                &digest(&body),
+                &["host.ingress.submit"],
+            )
+            .unwrap();
+    }
+    let other_grant = SqliteCoreStore::new(&mut harness.connection)
+        .unwrap()
+        .current_host_capability_grant(&harness.authority, "org.dolly.different-extension", MODULE_ID)
+        .unwrap()
+        .unwrap();
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let error = submit(&mut harness.connection, &harness.authority, &other_grant, &incoming)
+        .expect_err("a grant under another Extension must not reuse this Module's outputs");
+    assert_eq!(error.code(), HostIngressErrorCode::NotAuthorized);
+    assert_eq!(mapping_rows(&mut harness.connection), 0);
+}
+
+#[test]
+fn substituted_consistent_command_identity_is_rejected() {
+    let mut harness = Harness::new("substituted");
+    let incoming =
+        request("msg-1", HostIngressKind::Message, None, &["page-a"], json!({"kind":"text","text":"hello"}));
+    let (mapping, _) = committed(submit(&mut harness.connection, &harness.authority, &harness.grant, &incoming).unwrap());
+
+    // A self-consistent substitution: swap BOTH the mapping command id and
+    // the Core operation command id to a different minted id string. The
+    // mapping's ingress id no longer matches, so the chain must fail closed
+    // (never Committed, never Absent).
+    let forged = format!("host-ingress-{}-0198ab31-6c44-7e8a-b2bb-00000000dead", mapping.ingress_key);
+    harness
+        .connection
+        .execute(
+            "UPDATE host_ingress_mappings SET command_id = ?1 WHERE ingress_key = ?2",
+            rusqlite::params![&forged, &mapping.ingress_key],
+        )
+        .unwrap();
+    harness
+        .connection
+        .execute(
+            "UPDATE core_operations SET command_id = ?1 WHERE command_id = ?2",
+            rusqlite::params![&forged, &mapping.command_id],
+        )
+        .unwrap();
+    let error = status(&mut harness.connection, &harness.authority, &harness.grant, "msg-1")
+        .expect_err("a substituted command identity must fail closed");
+    assert_eq!(error.code(), HostIngressErrorCode::Corrupt);
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle reference validation
 // ---------------------------------------------------------------------------
 

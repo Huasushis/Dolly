@@ -925,8 +925,14 @@ pub fn reduce(state: &CoreSnapshot, command: &CoreCommand, input: &EnvironmentIn
             if canonical_digest(&c.block).is_none() {
                 return failure(state, "CANONICAL_JSON_INVALID", false, None);
             }
-            let pages: BTreeSet<_> = c.pages.iter().cloned().collect();
-            let pages: Vec<_> = pages.into_iter().collect();
+            // The ordered target-Page contract is first-occurrence order with
+            // duplicates collapsed: never re-sort into lexicographic order.
+            let mut pages: Vec<String> = Vec::with_capacity(c.pages.len());
+            for page in &c.pages {
+                if !pages.contains(page) {
+                    pages.push(page.clone());
+                }
+            }
             next.ingress.insert(
                 identity,
                 IngressRecord {
