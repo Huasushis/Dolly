@@ -32,8 +32,9 @@ pub use projection::{hash_core_state, project_core_state};
 pub use reducer::{SafetyStop, Transition, reduce};
 pub use types::{
     ActivationRecord, ActivationState, CoreError, CoreEvent, CoreSnapshot, EnvironmentInput,
-    ErrorOutcome, HostFenceVerification, HostReplayEvidence, HostResultVerification, IngressRecord,
-    InstanceMode, PROJECTION_KIND, PageRecord, RecoveryVerification, ReplayEvidenceObservation,
-    RuntimeEventRecord, StagedResult, StorageObservation, SubscriptionRecord, TransitionOutcome,
+    ErrorOutcome, HostConnectionIdentity, HostConnectionRecord, HostFenceVerification,
+    HostReplayEvidence, HostResultVerification, InstanceMode, PROJECTION_KIND, PageRecord,
+    RecoveryVerification, ReplayEvidenceObservation, RuntimeEventRecord, StagedResult,
+    StorageObservation, SubscriptionRecord, TransitionOutcome,
     empty_core_snapshot,
 };

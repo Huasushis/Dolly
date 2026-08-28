@@ -119,6 +119,9 @@ fn install_config(store: &mut SqliteCoreStore<'_>) {
         .transact(&command, &input())
         .expect("configuration transaction must execute");
     assert_eq!(transition.outcome, TransitionOutcome::Committed);
+    store
+        .bootstrap_host_connection()
+        .expect("Host connection bootstrap");
 }
 
 fn install_graph(store: &mut SqliteCoreStore<'_>, module_id: &str, command_id: &str) {

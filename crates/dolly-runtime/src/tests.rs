@@ -174,6 +174,9 @@ fn setup() -> (Connection, Value) {
             store.transact(&config_command, &input).unwrap().outcome,
             TransitionOutcome::Committed
         );
+        store
+            .bootstrap_host_connection()
+            .expect("Host connection bootstrap");
         assert_eq!(
             store.transact(&graph_command, &input).unwrap().outcome,
             TransitionOutcome::Committed
@@ -450,6 +453,12 @@ fn mismatched_worker_epoch_cannot_authorize_frame() {
             store.transact(&changed, &input).unwrap().outcome,
             TransitionOutcome::Committed
         );
+        let current = store
+            .authenticated_host_connection()
+            .expect("current Host authority");
+        store
+            .rotate_host_connection(&current)
+            .expect("Host rotation");
     }
     let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
     let result = engine.dispatch_execution(
@@ -466,6 +475,71 @@ fn mismatched_worker_epoch_cannot_authorize_frame() {
     assert_eq!(
         engine.snapshot().unwrap().activations[ACTIVATION_ID].state,
         ActivationState::Leased
+    );
+}
+
+#[test]
+fn rotated_host_authority_dispatches_with_new_revision() {
+    let (mut connection, _) = setup();
+    let input = environment();
+    let mut rotated_config = runtime_config();
+    rotated_config["extension_connection_id"] = json!("connection-2");
+    rotated_config["worker_epoch"] =
+        json!("0198ab31-6c44-7e8a-b2bb-000000000011");
+    rotated_config["worker_epoch_fence"] = json!(2);
+    {
+        let mut store = SqliteCoreStore::new(&mut connection).unwrap();
+        let changed = CoreCommand::InstallConfig(InstallConfigCommand {
+            command_id: "install-config-rotation".into(),
+            revision: 2,
+            digest: digest(&rotated_config),
+            effective_config: rotated_config.clone(),
+        });
+        assert_eq!(
+            store.transact(&changed, &input).unwrap().outcome,
+            TransitionOutcome::Committed
+        );
+        let current = store
+            .authenticated_host_connection()
+            .expect("current Host authority");
+        let rotated = store
+            .rotate_host_connection(&current)
+            .expect("Host rotation");
+        assert_eq!(rotated.incarnation_revision(), 2);
+    }
+    let mut manifest = manifest("receiver", &rotated_config, SECOND_ACTIVATION_ID);
+    manifest["config_revision"] = json!(2);
+    manifest["required_frame_bytes"] = json!(2048);
+    manifest["required_frame_nesting_depth"] = json!(10);
+    manifest.as_object_mut().unwrap().remove("manifest_digest");
+    manifest["manifest_digest"] = Value::String(digest(&manifest));
+    let mut engine = RuntimeTransactionEngine::new(&mut connection).unwrap();
+    engine
+        .accept_manifest(
+            &build_command(manifest, SECOND_ACTIVATION_ID, "build-rotation"),
+            &input,
+        )
+        .unwrap();
+    let lease_token: LeaseToken =
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".parse().unwrap();
+    let token_digest =
+        Sha256Digest::compute(lease_token.expose_bytes()).to_canonical_string();
+    let lease = lease_command_for(
+        SECOND_ACTIVATION_ID,
+        "lease-rotation",
+        "lease-rotation",
+        &token_digest,
+    );
+    let reservation = engine.allocate_request(&lease, &input).unwrap();
+    assert_eq!(reservation.incarnation_revision, 2);
+    let premise = engine.prepare_execution(&lease, &reservation, &input).unwrap();
+    assert_eq!(premise.fence().incarnation_revision(), 2);
+    engine
+        .dispatch_execution(&premise, "dispatch-rotation", &lease_token, &input)
+        .unwrap();
+    assert_eq!(
+        engine.snapshot().unwrap().activations[SECOND_ACTIVATION_ID].state,
+        ActivationState::Dispatched
     );
 }
 

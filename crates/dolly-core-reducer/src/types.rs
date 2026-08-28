@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const PROJECTION_KIND: &str = "dolly.state-projection/v1";
 
@@ -103,6 +103,21 @@ pub struct ActivationRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation: Option<Value>,
 }
+/// The connection identity tuple used for one Host incarnation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct HostConnectionIdentity {
+    pub extension_connection_id: String,
+    pub worker_epoch_id: String,
+    pub worker_epoch_fence: i64,
+}
+
+/// Durable current Host connection state and its non-reusable revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostConnectionRecord {
+    pub identity: HostConnectionIdentity,
+    pub incarnation_revision: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoreSnapshot {
     pub projection_kind: String,
@@ -121,6 +136,10 @@ pub struct CoreSnapshot {
     pub manifests: BTreeMap<String, Value>,
     pub activations: BTreeMap<String, ActivationRecord>,
     pub leases: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_connection: Option<HostConnectionRecord>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub host_connection_history: BTreeSet<HostConnectionIdentity>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub host_request_reservations: BTreeMap<String, Value>,
     pub quarantines: BTreeMap<String, Value>,
@@ -248,6 +267,8 @@ pub fn empty_core_snapshot() -> CoreSnapshot {
         manifests: BTreeMap::new(),
         activations: BTreeMap::new(),
         leases: BTreeMap::new(),
+        host_connection: None,
+        host_connection_history: BTreeSet::new(),
         host_request_reservations: BTreeMap::new(),
         quarantines: BTreeMap::new(),
         generations: Vec::new(),

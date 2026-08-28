@@ -121,6 +121,7 @@ fn issue_lease_command(value: &Value, activation_id: &str) -> IssueLeaseCommand 
         worker_epoch: value["worker_epoch"].as_i64().unwrap(),
         request_id: None,
         worker_epoch_id: None,
+        incarnation_revision: None,
         extension_generation: value["extension_generation"].as_i64(),
     }
 }

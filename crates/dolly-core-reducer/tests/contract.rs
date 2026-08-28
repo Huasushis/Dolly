@@ -378,6 +378,7 @@ fn safe_retry_authorization_is_bound_and_consumed_once() {
             worker_epoch: 2,
             request_id: None,
             worker_epoch_id: None,
+            incarnation_revision: None,
             extension_generation: None,
         }),
         &input(),
@@ -400,6 +401,7 @@ fn safe_retry_authorization_is_bound_and_consumed_once() {
             worker_epoch: 3,
             request_id: None,
             worker_epoch_id: None,
+            incarnation_revision: None,
             extension_generation: None,
         }),
         &input(),
@@ -673,6 +675,7 @@ fn current_lease_controls_each_retry_attempt() {
             worker_epoch: 1,
             request_id: None,
             worker_epoch_id: None,
+            incarnation_revision: None,
             extension_generation: None,
         }),
         &input(),
@@ -706,6 +709,7 @@ fn current_lease_controls_each_retry_attempt() {
             worker_epoch: 2,
             request_id: None,
             worker_epoch_id: None,
+            incarnation_revision: None,
             extension_generation: None,
         }),
         &input(),
@@ -766,6 +770,7 @@ fn lease_replay_preserves_requested_generation_presence() {
             worker_epoch: 1,
             request_id: None,
             worker_epoch_id: None,
+            incarnation_revision: None,
             extension_generation,
         })
     };
@@ -1202,6 +1207,7 @@ fn lease_ids_are_immutable_across_activations_and_replay_exactly() {
         worker_epoch: 1,
         request_id: None,
         worker_epoch_id: None,
+        incarnation_revision: None,
         extension_generation: None,
     });
     let first = reduce(&state, &command, &input());
@@ -1220,6 +1226,7 @@ fn lease_ids_are_immutable_across_activations_and_replay_exactly() {
             worker_epoch: 2,
             request_id: None,
             worker_epoch_id: None,
+            incarnation_revision: None,
             extension_generation: None,
         }),
         &input(),
@@ -1373,6 +1380,7 @@ fn durable_counter_exhaustion_fails_closed_without_panicking() {
         worker_epoch: 1,
         request_id: None,
         worker_epoch_id: None,
+        incarnation_revision: None,
         extension_generation: None,
     });
     let result = reduce(&exhausted_attempt, &issue, &input());

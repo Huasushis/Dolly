@@ -41,6 +41,7 @@ pub struct ExecutionFence {
     request_id: String,
     worker_epoch: WorkerEpoch,
     worker_epoch_fence: i64,
+    incarnation_revision: i64,
     extension_generation: i64,
     lease_generation: i64,
     extension_connection_id: String,
@@ -53,6 +54,7 @@ impl ExecutionFence {
         request_id: String,
         worker_epoch: WorkerEpoch,
         worker_epoch_fence: i64,
+        incarnation_revision: i64,
         extension_generation: i64,
         lease_generation: i64,
         extension_connection_id: String,
@@ -63,6 +65,7 @@ impl ExecutionFence {
             request_id,
             worker_epoch,
             worker_epoch_fence,
+            incarnation_revision,
             extension_generation,
             lease_generation,
             extension_connection_id,
@@ -90,6 +93,11 @@ impl ExecutionFence {
     /// The legacy numeric fence retained by the accepted Core contract.
     pub fn worker_epoch_fence(&self) -> i64 {
         self.worker_epoch_fence
+    }
+
+    /// The non-reusable Host incarnation revision bound to this attempt.
+    pub fn incarnation_revision(&self) -> i64 {
+        self.incarnation_revision
     }
 
     /// The Extension process generation bound to this attempt.

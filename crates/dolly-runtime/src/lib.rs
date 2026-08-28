@@ -19,6 +19,7 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use thiserror::Error;
 
+pub use dolly_storage::HostConnectionAuthority;
 pub use premise::{
     CursorSpan, ExecutionDigests, ExecutionFence, ExecutionIdentity, ExecutionOrder,
     ExecutionPremise, InputItemOrder, InputOccurrence, LossyGap, ReplayEvidence, ReplayMode,
@@ -135,6 +136,7 @@ pub struct RequestReservation {
     extension_connection_id: String,
     worker_epoch: WorkerEpoch,
     worker_epoch_fence: i64,
+    incarnation_revision: i64,
 }
 
 /// Typed Host connection identity retained in verified durable Core state.
@@ -146,6 +148,7 @@ struct HostConnectionState {
     extension_connection_id: String,
     worker_epoch: WorkerEpoch,
     worker_epoch_fence: i64,
+    incarnation_revision: i64,
 }
 
 /// The production G1 transaction façade over one Core writer connection.
@@ -163,10 +166,28 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
             store: SqliteCoreStore::new(connection)?,
         })
     }
-
     /// Read the verified durable Core snapshot.
     pub fn snapshot(&self) -> RuntimeResult<dolly_core_reducer::CoreSnapshot> {
         Ok(self.store.snapshot()?)
+    }
+
+    /// Return the opaque current Host connection authority.
+    pub fn host_connection_authority(&self) -> RuntimeResult<HostConnectionAuthority> {
+        Ok(self.store.authenticated_host_connection()?)
+    }
+
+    /// Bootstrap the durable Host connection state from the accepted lifecycle
+    /// configuration. This can only initialize an absent Host state.
+    pub fn bootstrap_host_connection(&mut self) -> RuntimeResult<HostConnectionAuthority> {
+        Ok(self.store.bootstrap_host_connection()?)
+    }
+
+    /// Rotate the durable Host connection using the opaque prior authority.
+    pub fn rotate_host_connection(
+        &mut self,
+        current: &HostConnectionAuthority,
+    ) -> RuntimeResult<HostConnectionAuthority> {
+        Ok(self.store.rotate_host_connection(current)?)
     }
     /// Allocate one request identity from the current authenticated Host
     /// connection and durably bind it to the requested Activation and lease.
@@ -270,6 +291,7 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
             request_id: Some(reservation.request_id.clone()),
             worker_epoch: reservation.worker_epoch_fence,
             worker_epoch_id: Some(reservation.worker_epoch.to_string()),
+            incarnation_revision: Some(reservation.incarnation_revision),
             extension_generation: request.extension_generation,
         };
         validate_lease_request(&command)?;
@@ -335,6 +357,7 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
         if connection.extension_connection_id != premise.fence().extension_connection_id()
             || connection.worker_epoch != *premise.fence().worker_epoch()
             || connection.worker_epoch_fence != premise.fence().worker_epoch_fence()
+            || connection.incarnation_revision != premise.fence().incarnation_revision()
         {
             return Err(RuntimeError::PremiseUnavailable {
                 detail: "current Host connection no longer owns the prepared WorkerEpoch".into(),
@@ -390,6 +413,7 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
                 dispatch_state: DispatchState::Started,
                 reservation_id: Some(premise.fence().reservation_id().into()),
                 request_id: Some(premise.fence().request_id().into()),
+                incarnation_revision: Some(premise.fence().incarnation_revision()),
                 extension_connection_id: Some(premise.fence().extension_connection_id().into()),
                 frame_digest: Some(frame_digest.clone()),
             }),
@@ -441,39 +465,42 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
 fn host_connection_state(
     snapshot: &dolly_core_reducer::CoreSnapshot,
 ) -> RuntimeResult<HostConnectionState> {
-    let config = snapshot
-        .config
-        .get("effective_config")
-        .unwrap_or(&snapshot.config);
-    let extension_connection_id = config
-        .get("extension_connection_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
+    let record = snapshot
+        .host_connection
+        .as_ref()
         .ok_or_else(|| RuntimeError::GenerationInvalid {
+            detail: "verified Host connection state is absent".into(),
+        })?;
+    if record.incarnation_revision <= 0
+        || !snapshot.host_connection_history.contains(&record.identity)
+    {
+        return Err(RuntimeError::GenerationInvalid {
+            detail: "verified Host connection state is invalid".into(),
+        });
+    }
+    let extension_connection_id = record.identity.extension_connection_id.clone();
+    if extension_connection_id.is_empty() {
+        return Err(RuntimeError::GenerationInvalid {
             detail: "verified Host connection id is absent".into(),
-        })?
-        .to_owned();
-    let worker_epoch = config
-        .get("worker_epoch")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RuntimeError::GenerationInvalid {
-            detail: "verified Host WorkerEpoch is absent".into(),
-        })?
+        });
+    }
+    let worker_epoch = record
+        .identity
+        .worker_epoch_id
         .parse::<WorkerEpoch>()
         .map_err(|error| RuntimeError::GenerationInvalid {
             detail: format!("verified Host WorkerEpoch is invalid: {error}"),
         })?;
-    let worker_epoch_fence = config
-        .get("worker_epoch_fence")
-        .and_then(Value::as_i64)
-        .filter(|value| *value > 0)
-        .ok_or_else(|| RuntimeError::GenerationInvalid {
+    if record.identity.worker_epoch_fence <= 0 {
+        return Err(RuntimeError::GenerationInvalid {
             detail: "verified Host WorkerEpoch fence is absent or invalid".into(),
-        })?;
+        });
+    }
     Ok(HostConnectionState {
         extension_connection_id,
         worker_epoch,
-        worker_epoch_fence,
+        worker_epoch_fence: record.identity.worker_epoch_fence,
+        incarnation_revision: record.incarnation_revision,
     })
 }
 fn validate_request_id(value: &str) -> RuntimeResult<()> {
@@ -543,6 +570,13 @@ fn request_reservation_from_state(
         .ok_or_else(|| RuntimeError::PremiseUnavailable {
             detail: "request reservation WorkerEpoch fence is invalid".into(),
         })?;
+    let incarnation_revision = record
+        .get("incarnation_revision")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "request reservation has no Host incarnation revision".into(),
+        })?;
     Ok(RequestReservation {
         reservation_id: reservation_id.into(),
         request_id: request_id.into(),
@@ -551,6 +585,7 @@ fn request_reservation_from_state(
         extension_connection_id: extension_connection_id.into(),
         worker_epoch,
         worker_epoch_fence,
+        incarnation_revision,
     })
 }
 fn validate_request_reservation(
@@ -568,6 +603,7 @@ fn validate_request_reservation(
     if reservation.extension_connection_id != connection.extension_connection_id
         || reservation.worker_epoch != connection.worker_epoch
         || reservation.worker_epoch_fence != connection.worker_epoch_fence
+        || reservation.incarnation_revision != connection.incarnation_revision
     {
         return Err(RuntimeError::PremiseUnavailable {
             detail: "current Host connection no longer owns the request reservation".into(),
@@ -631,6 +667,7 @@ fn retained_manifest_for_dispatch(
         || reservation.request_id != premise.fence().request_id()
         || reservation.extension_connection_id
             != premise.fence().extension_connection_id()
+        || reservation.incarnation_revision != premise.fence().incarnation_revision()
     {
         return Err(RuntimeError::PremiseUnavailable {
             detail: "dispatch reservation binding differs from the premise".into(),
@@ -644,6 +681,8 @@ fn retained_manifest_for_dispatch(
             != Some(premise.fence().worker_epoch_fence())
         || lease.get("worker_epoch_id").and_then(Value::as_str)
             != Some(premise.fence().worker_epoch().to_string().as_str())
+        || lease.get("incarnation_revision").and_then(Value::as_i64)
+            != Some(premise.fence().incarnation_revision())
         || lease.get("reservation_id").and_then(Value::as_str)
             != Some(premise.fence().reservation_id())
         || lease.get("request_id").and_then(Value::as_str) != Some(premise.fence().request_id())
@@ -708,6 +747,17 @@ fn validate_lease_request(command: &IssueLeaseCommand) -> RuntimeResult<()> {
     {
         return Err(RuntimeError::LeaseUnavailable {
             detail: "command and lease identities are required".into(),
+        });
+    }
+    let incarnation_revision = command
+        .incarnation_revision
+        .filter(|value| *value > 0)
+        .ok_or_else(|| RuntimeError::GenerationInvalid {
+            detail: "Host incarnation revision is required for a Runtime lease".into(),
+        })?;
+    if incarnation_revision <= 0 {
+        return Err(RuntimeError::GenerationInvalid {
+            detail: "Host incarnation revision must be positive".into(),
         });
     }
     if command.worker_epoch <= 0 {
@@ -799,6 +849,8 @@ fn validate_existing_lease_or_state(
             && existing.get("worker_epoch").and_then(Value::as_i64) == Some(command.worker_epoch)
             && existing.get("worker_epoch_id").and_then(Value::as_str)
                 == command.worker_epoch_id.as_deref()
+            && existing.get("incarnation_revision").and_then(Value::as_i64)
+                == command.incarnation_revision
             && existing.get("request_id").and_then(Value::as_str)
                 == command.request_id.as_deref()
             && existing.get("reservation_id").and_then(Value::as_str)
@@ -876,6 +928,13 @@ fn build_premise(
         .ok_or_else(|| RuntimeError::PremiseUnavailable {
             detail: "committed lease has no Worker epoch fence".into(),
         })?;
+    let incarnation_revision = lease
+        .get("incarnation_revision")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| RuntimeError::PremiseUnavailable {
+            detail: "committed lease has no Host incarnation revision".into(),
+        })?;
     let worker_epoch = lease
         .get("worker_epoch_id")
         .and_then(Value::as_str)
@@ -901,6 +960,7 @@ fn build_premise(
     if attempt <= 0
         || worker_epoch_fence != command.worker_epoch
         || command.worker_epoch_id.as_deref() != Some(worker_epoch.to_string().as_str())
+        || command.incarnation_revision != Some(incarnation_revision)
         || extension_generation != command.extension_generation.unwrap_or_default()
         || command.request_id.as_deref() != Some(request_id.as_str())
         || command.reservation_id.as_deref() != Some(reservation_id.as_str())
@@ -926,6 +986,7 @@ fn build_premise(
             request_id,
             worker_epoch,
             worker_epoch_fence,
+            incarnation_revision,
             extension_generation,
             attempt,
             extension_connection_id.to_owned(),

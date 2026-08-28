@@ -12,8 +12,9 @@ use dolly_canonical_json::{
 };
 use dolly_core_reducer::{
     ActivationState, CoreCommand, CoreError, CoreEvent, CoreSnapshot, EnvironmentInput,
-    ErrorOutcome, InstanceMode, PROJECTION_KIND, RuntimeEventCommand, StorageObservation,
-    Transition, TransitionOutcome, empty_core_snapshot, hash_core_state, project_core_state, reduce,
+    ErrorOutcome, HostConnectionIdentity, HostConnectionRecord, InstanceMode, PROJECTION_KIND,
+    RuntimeEventCommand, StorageObservation, Transition, TransitionOutcome, empty_core_snapshot,
+    hash_core_state, project_core_state, reduce,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
@@ -609,14 +610,36 @@ impl CoreTransaction for SqliteCoreTransaction<'_> {
 /// again inside the allocation transaction before changing durable state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConnectionAuthority {
-    extension_connection_id: String,
+    identity: HostConnectionIdentity,
     worker_epoch: dolly_core_domain::WorkerEpoch,
-    worker_epoch_fence: i64,
+    incarnation_revision: i64,
 }
 
-fn host_connection_authority_from_snapshot(
+impl HostConnectionAuthority {
+    /// The authenticated Extension connection identity.
+    pub fn extension_connection_id(&self) -> &str {
+        &self.identity.extension_connection_id
+    }
+
+    /// The authenticated typed WorkerEpoch.
+    pub fn worker_epoch(&self) -> &dolly_core_domain::WorkerEpoch {
+        &self.worker_epoch
+    }
+
+    /// The authenticated numeric WorkerEpoch fence.
+    pub fn worker_epoch_fence(&self) -> i64 {
+        self.identity.worker_epoch_fence
+    }
+
+    /// The non-reusable Host incarnation revision.
+    pub fn incarnation_revision(&self) -> i64 {
+        self.incarnation_revision
+    }
+}
+
+fn host_connection_identity_from_snapshot(
     snapshot: &CoreSnapshot,
-) -> StorageResult<HostConnectionAuthority> {
+) -> StorageResult<HostConnectionIdentity> {
     let config = snapshot
         .config
         .get("effective_config")
@@ -627,10 +650,12 @@ fn host_connection_authority_from_snapshot(
         .filter(|value| !value.is_empty())
         .ok_or(StorageError::Corrupt)?
         .to_owned();
-    let worker_epoch = config
+    let worker_epoch_id = config
         .get("worker_epoch")
         .and_then(Value::as_str)
         .ok_or(StorageError::Corrupt)?
+        .to_owned();
+    worker_epoch_id
         .parse::<dolly_core_domain::WorkerEpoch>()
         .map_err(|_| StorageError::Corrupt)?;
     let worker_epoch_fence = config
@@ -638,10 +663,36 @@ fn host_connection_authority_from_snapshot(
         .and_then(Value::as_i64)
         .filter(|value| *value > 0)
         .ok_or(StorageError::Corrupt)?;
-    Ok(HostConnectionAuthority {
+    Ok(HostConnectionIdentity {
         extension_connection_id,
-        worker_epoch,
+        worker_epoch_id,
         worker_epoch_fence,
+    })
+}
+
+fn host_connection_authority_from_snapshot(
+    snapshot: &CoreSnapshot,
+) -> StorageResult<HostConnectionAuthority> {
+    let record = snapshot.host_connection.as_ref().ok_or(StorageError::Corrupt)?;
+    if record.incarnation_revision <= 0
+        || !snapshot.host_connection_history.contains(&record.identity)
+    {
+        return Err(StorageError::Corrupt);
+    }
+    let worker_epoch = record
+        .identity
+        .worker_epoch_id
+        .parse::<dolly_core_domain::WorkerEpoch>()
+        .map_err(|_| StorageError::Corrupt)?;
+    if record.identity.extension_connection_id.is_empty()
+        || record.identity.worker_epoch_fence <= 0
+    {
+        return Err(StorageError::Corrupt);
+    }
+    Ok(HostConnectionAuthority {
+        identity: record.identity.clone(),
+        worker_epoch,
+        incarnation_revision: record.incarnation_revision,
     })
 }
 
@@ -674,6 +725,84 @@ fn allocation_failure_with_details(
 fn allocation_failure(state: &CoreSnapshot, code: &str) -> StorageResult<Transition> {
     allocation_failure_with_details(state, code, None)
 }
+fn host_connection_transition(
+    state: &CoreSnapshot,
+    command_id: &str,
+    identity: HostConnectionIdentity,
+    incarnation_revision: i64,
+    event_name: &str,
+) -> StorageResult<Transition> {
+    if command_id.is_empty()
+        || incarnation_revision <= 0
+        || state.next_commit_seq <= 0
+        || state.next_commit_seq >= CORE_MAX_SAFE_INTEGER
+    {
+        return allocation_failure(state, "HOST_CONNECTION_STATE_INVALID");
+    }
+    let mut next = state.clone();
+    next.host_connection = Some(HostConnectionRecord {
+        identity: identity.clone(),
+        incarnation_revision,
+    });
+    next.host_connection_history.insert(identity.clone());
+    let event = CoreEvent {
+        event: event_name.into(),
+        commit_seq: next.next_commit_seq,
+        command_id: command_id.into(),
+        details: Some(serde_json::json!({
+            "extension_connection_id": identity.extension_connection_id,
+            "worker_epoch_id": identity.worker_epoch_id,
+            "worker_epoch_fence": identity.worker_epoch_fence,
+            "incarnation_revision": incarnation_revision,
+        })),
+    };
+    next.next_commit_seq += 1;
+    next.journal.push(event.clone());
+    let projection = project_core_state(&next);
+    let state_hash = hash_core_state(&next).map_err(|_| StorageError::Corrupt)?;
+    Ok(Transition {
+        outcome: TransitionOutcome::Committed,
+        state: next,
+        events: vec![event],
+        error: None,
+        reply: None,
+        projection,
+        state_hash,
+        safety_stop: None,
+    })
+}
+
+fn host_lifecycle_command(
+    command_id: String,
+    event_key: &str,
+    block: Value,
+) -> StorageResult<CoreCommand> {
+    let (_, operation_digest) = canonical_digest(&block)?;
+    Ok(CoreCommand::RuntimeEvent(RuntimeEventCommand {
+        command_id: command_id.clone(),
+        runtime_source: "host".into(),
+        event_key: event_key.into(),
+        operation_digest,
+        block_id: command_id,
+        block,
+        pages: Vec::new(),
+    }))
+}
+
+
+fn host_authority_matches(
+    snapshot: &CoreSnapshot,
+    extension_connection_id: &str,
+    worker_epoch_id: &str,
+    worker_epoch_fence: i64,
+    incarnation_revision: i64,
+) -> StorageResult<bool> {
+    let authority = host_connection_authority_from_snapshot(snapshot)?;
+    Ok(authority.extension_connection_id() == extension_connection_id
+        && authority.worker_epoch().to_string() == worker_epoch_id
+        && authority.worker_epoch_fence() == worker_epoch_fence
+        && authority.incarnation_revision() == incarnation_revision)
+}
 
 fn allocate_host_request_transition(
     state: &CoreSnapshot,
@@ -705,8 +834,8 @@ fn allocate_host_request_transition(
     if command_id.is_empty()
         || activation_id.is_empty()
         || lease_id.is_empty()
-        || authority.extension_connection_id.is_empty()
-        || authority.worker_epoch_fence <= 0
+        || authority.extension_connection_id().is_empty()
+        || authority.worker_epoch_fence() <= 0
     {
         return allocation_failure(state, "REQUEST_ALLOCATION_INVALID");
     }
@@ -735,12 +864,12 @@ fn allocate_host_request_transition(
             record.get("state").and_then(Value::as_str) == Some("bound")
                 && record.get("request_id").and_then(Value::as_str) == Some(request_id.as_str())
                 && record.get("extension_connection_id").and_then(Value::as_str)
-                    == Some(authority.extension_connection_id.as_str())
+                    == Some(authority.extension_connection_id())
         })
     {
         return allocation_failure(state, "REQUEST_ALLOCATION_INVALID");
     }
-    let worker_epoch_id = authority.worker_epoch.to_string();
+    let worker_epoch_id = authority.worker_epoch().to_string();
     let mut next = state.clone();
     next.host_request_reservations.insert(
         reservation_id.clone(),
@@ -750,9 +879,10 @@ fn allocate_host_request_transition(
             "activation_id": activation_id,
             "lease_id": lease_id,
             "request_id": request_id,
-            "extension_connection_id": authority.extension_connection_id,
+            "extension_connection_id": authority.extension_connection_id(),
             "worker_epoch_id": worker_epoch_id,
-            "worker_epoch": authority.worker_epoch_fence,
+            "worker_epoch": authority.worker_epoch_fence(),
+            "incarnation_revision": authority.incarnation_revision(),
         }),
     );
     let event = CoreEvent {
@@ -762,8 +892,9 @@ fn allocate_host_request_transition(
         details: Some(serde_json::json!({
             "reservation_id": reservation_id,
             "request_id": request_id,
-            "extension_connection_id": authority.extension_connection_id,
+            "extension_connection_id": authority.extension_connection_id(),
             "worker_epoch_id": worker_epoch_id,
+            "incarnation_revision": authority.incarnation_revision(),
         })),
     };
     next.next_commit_seq += 1;
@@ -808,6 +939,49 @@ impl<'connection> SqliteCoreStore<'connection> {
     ) -> StorageResult<Transition> {
         let mut transaction = SqliteCoreTransaction::begin_for(self.connection, command, input)?;
         let snapshot = transaction.load_command_snapshot(command)?;
+        match command {
+            CoreCommand::IssueLease(command) if command.reservation_id.is_some() => {
+                let (Some(connection_id), Some(worker_epoch_id), Some(revision)) = (
+                    Some(command.extension_connection_id.as_str()),
+                    command.worker_epoch_id.as_deref(),
+                    command.incarnation_revision,
+                ) else {
+                    return Err(StorageError::IdempotencyConflict);
+                };
+                if !host_authority_matches(
+                    &snapshot,
+                    connection_id,
+                    worker_epoch_id,
+                    command.worker_epoch,
+                    revision,
+                )? {
+                    return Err(StorageError::IdempotencyConflict);
+                }
+            }
+            CoreCommand::DispatchLease(command) if command.reservation_id.is_some() => {
+                let Some(lease) = snapshot.leases.get(&command.lease_id) else {
+                    return Err(StorageError::IdempotencyConflict);
+                };
+                let (Some(connection_id), Some(revision), Some(worker_epoch_id), Some(fence)) = (
+                    command.extension_connection_id.as_deref(),
+                    command.incarnation_revision,
+                    lease.get("worker_epoch_id").and_then(Value::as_str),
+                    lease.get("worker_epoch").and_then(Value::as_i64),
+                ) else {
+                    return Err(StorageError::IdempotencyConflict);
+                };
+                if !host_authority_matches(
+                    &snapshot,
+                    connection_id,
+                    worker_epoch_id,
+                    fence,
+                    revision,
+                )? {
+                    return Err(StorageError::IdempotencyConflict);
+                }
+            }
+            _ => {}
+        }
         if let Some(replayed) = transaction.replayed_transition().cloned() {
             transaction.commit()?;
             return Ok(replayed);
@@ -820,6 +994,103 @@ impl<'connection> SqliteCoreStore<'connection> {
         transaction.commit()?;
         Ok(transition)
     }
+    /// Bootstrap the dedicated Host connection state from the accepted
+    /// lifecycle configuration, without changing it when already initialized.
+    pub fn bootstrap_host_connection(&mut self) -> StorageResult<HostConnectionAuthority> {
+        let seed = self.snapshot()?;
+        if seed.host_connection.is_some() {
+            return host_connection_authority_from_snapshot(&seed);
+        }
+        let candidate = host_connection_identity_from_snapshot(&seed)?;
+        let command_id = format!("runtime-host-bootstrap-{}", seed.next_commit_seq);
+        let command = host_lifecycle_command(
+            command_id.clone(),
+            "host_connection_bootstrap",
+            serde_json::json!({"identity": candidate}),
+        )?;
+        let mut transaction = SqliteCoreTransaction::begin_for(self.connection, &command, &EnvironmentInput::default())?;
+        let snapshot = transaction.load_command_snapshot(&command)?;
+        if snapshot.host_connection.is_some() {
+            let authority = host_connection_authority_from_snapshot(&snapshot)?;
+            transaction.commit()?;
+            return Ok(authority);
+        }
+        if !snapshot.host_connection_history.is_empty() {
+            transaction.commit()?;
+            return Err(StorageError::Corrupt);
+        }
+        if transaction.replayed_transition().is_some() {
+            transaction.commit()?;
+            return Err(StorageError::Corrupt);
+        }
+        let candidate = host_connection_identity_from_snapshot(&snapshot)?;
+        let transition = host_connection_transition(
+            &snapshot,
+            &command_id,
+            candidate,
+            1,
+            "HostConnectionBootstrapped",
+        )?;
+        transaction.compare_and_apply(&transition)?;
+        transaction.append_journal(&transition.events)?;
+        transaction.commit()?;
+        host_connection_authority_from_snapshot(&transition.state)
+    }
+
+    /// Rotate dedicated Host connection state using the opaque prior
+    /// authority and the accepted lifecycle configuration as the candidate.
+    pub fn rotate_host_connection(
+        &mut self,
+        current: &HostConnectionAuthority,
+    ) -> StorageResult<HostConnectionAuthority> {
+        let seed = self.snapshot()?;
+        let candidate = host_connection_identity_from_snapshot(&seed)?;
+        let command_id = format!("runtime-host-rotation-{}", seed.next_commit_seq);
+        let command = host_lifecycle_command(
+            command_id.clone(),
+            "host_connection_rotation",
+            serde_json::json!({
+                "current_revision": current.incarnation_revision,
+                "candidate": candidate,
+            }),
+        )?;
+        let mut transaction = SqliteCoreTransaction::begin_for(self.connection, &command, &EnvironmentInput::default())?;
+        let snapshot = transaction.load_command_snapshot(&command)?;
+        let actual = host_connection_authority_from_snapshot(&snapshot)?;
+        if actual != *current {
+            transaction.commit()?;
+            return Err(StorageError::IdempotencyConflict);
+        }
+        if transaction.replayed_transition().is_some() {
+            transaction.commit()?;
+            return Ok(actual);
+        }
+        let candidate = host_connection_identity_from_snapshot(&snapshot)?;
+        if candidate == current.identity {
+            transaction.commit()?;
+            return Ok(actual);
+        }
+        if snapshot.host_connection_history.contains(&candidate) {
+            transaction.commit()?;
+            return Err(StorageError::IdempotencyConflict);
+        }
+        let revision = current
+            .incarnation_revision
+            .checked_add(1)
+            .ok_or(StorageError::Corrupt)?;
+        let transition = host_connection_transition(
+            &snapshot,
+            &command_id,
+            candidate,
+            revision,
+            "HostConnectionRotated",
+        )?;
+        transaction.compare_and_apply(&transition)?;
+        transaction.append_journal(&transition.events)?;
+        transaction.commit()?;
+        host_connection_authority_from_snapshot(&transition.state)
+    }
+
 
     /// Return an opaque authority for the current verified Host connection.
     ///
@@ -846,20 +1117,13 @@ impl<'connection> SqliteCoreStore<'connection> {
         let block = serde_json::json!({
             "activation_id": activation_id,
             "lease_id": lease_id,
-            "extension_connection_id": authority.extension_connection_id,
-            "worker_epoch_id": authority.worker_epoch.to_string(),
-            "worker_epoch": authority.worker_epoch_fence,
+            "extension_connection_id": authority.extension_connection_id(),
+            "worker_epoch_id": authority.worker_epoch().to_string(),
+            "worker_epoch": authority.worker_epoch_fence(),
+            "incarnation_revision": authority.incarnation_revision(),
         });
-        let (_, operation_digest) = canonical_digest(&block)?;
-        let command = CoreCommand::RuntimeEvent(RuntimeEventCommand {
-            command_id: command_id.clone(),
-            runtime_source: "host".into(),
-            event_key: "host_request_allocation".into(),
-            operation_digest,
-            block_id: command_id.clone(),
-            block,
-            pages: Vec::new(),
-        });
+        let command =
+            host_lifecycle_command(command_id.clone(), "host_request_allocation", block)?;
         let mut transaction = SqliteCoreTransaction::begin_for(self.connection, &command, input)?;
         let snapshot = transaction.load_command_snapshot(&command)?;
         let current_authority = host_connection_authority_from_snapshot(&snapshot)?;
@@ -962,6 +1226,7 @@ mod tests {
             worker_epoch: 1,
             request_id: None,
             worker_epoch_id: None,
+            incarnation_revision: None,
             extension_generation: None,
         });
 
@@ -1044,56 +1309,69 @@ mod tests {
     }
 
     #[test]
-    fn stale_host_authority_cannot_allocate() {
+    fn a_to_b_to_a_rejects_stale_host_capability() {
         let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
         let mut store = SqliteCoreStore::new(&mut connection).expect("core schema");
         let input = EnvironmentInput::default();
-        let first_config = serde_json::json!({
+        let install = |store: &mut SqliteCoreStore<'_>, command_id: &str, revision: i64, config: Value| {
+            let (_, digest) = canonical_digest(&config).expect("config digest");
+            let command = CoreCommand::InstallConfig(dolly_core_reducer::InstallConfigCommand {
+                command_id: command_id.into(),
+                revision,
+                effective_config: config,
+                digest,
+            });
+            assert_eq!(
+                store.transact(&command, &input).expect("config").outcome,
+                TransitionOutcome::Committed
+            );
+        };
+        let config_a = serde_json::json!({
             "extension_connection_id": "connection-1",
             "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000010",
             "worker_epoch_fence": 1
         });
-        let (_, first_digest) = canonical_digest(&first_config).expect("first config digest");
-        let first = CoreCommand::InstallConfig(dolly_core_reducer::InstallConfigCommand {
-            command_id: "install-first-host".into(),
-            revision: 1,
-            effective_config: first_config,
-            digest: first_digest,
-        });
-        assert_eq!(
-            store.transact(&first, &input).expect("first config").outcome,
-            TransitionOutcome::Committed
-        );
-        let authority = store
-            .authenticated_host_connection()
-            .expect("first host authority");
-        let second_config = serde_json::json!({
-            "extension_connection_id": "connection-1",
+        install(&mut store, "install-host-a", 1, config_a.clone());
+        let authority_a = store
+            .bootstrap_host_connection()
+            .expect("Host A bootstrap");
+        let retained_a = authority_a.clone();
+        let config_b = serde_json::json!({
+            "extension_connection_id": "connection-2",
             "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000011",
             "worker_epoch_fence": 2
         });
-        let (_, second_digest) = canonical_digest(&second_config).expect("second config digest");
-        let second = CoreCommand::InstallConfig(dolly_core_reducer::InstallConfigCommand {
-            command_id: "install-second-host".into(),
-            revision: 2,
-            effective_config: second_config,
-            digest: second_digest,
+        install(&mut store, "install-host-b", 2, config_b);
+        let authority_b = store
+            .rotate_host_connection(&authority_a)
+            .expect("Host B rotation");
+        assert_eq!(authority_b.incarnation_revision(), 2);
+        let config_a_again = serde_json::json!({
+            "extension_connection_id": "connection-1",
+            "worker_epoch": "0198ab31-6c44-7e8a-b2bb-000000000010",
+            "worker_epoch_fence": 1
         });
+        install(&mut store, "install-host-a-again", 3, config_a_again);
         assert_eq!(
-            store.transact(&second, &input).expect("second config").outcome,
-            TransitionOutcome::Committed
+            store.authenticated_host_connection().unwrap(),
+            authority_b
         );
         assert_eq!(
             store
-                .allocate_host_request(&authority, "activation", "lease", &input)
+                .allocate_host_request(&retained_a, "activation", "lease", &input)
                 .unwrap_err(),
             StorageError::IdempotencyConflict
         );
-        assert!(store
-            .snapshot()
-            .expect("snapshot after stale authority")
-            .host_request_reservations
-            .is_empty());
+        assert_eq!(
+            store.rotate_host_connection(&authority_b).unwrap_err(),
+            StorageError::IdempotencyConflict
+        );
+        let state = store.snapshot().expect("Host lifecycle snapshot");
+        assert_eq!(state.host_connection_history.len(), 2);
+        assert_eq!(
+            state.host_connection.as_ref().unwrap().incarnation_revision,
+            2
+        );
     }
 
     fn tmpl() -> Transition {
