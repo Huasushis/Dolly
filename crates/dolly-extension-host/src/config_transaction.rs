@@ -13,8 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::transaction::HostConnectionAuthority;
-
+use crate::operability::ConfigurationTransactionAuthority;
 /// Maximum configuration revision accepted by the safe integer contract.
 pub const MAX_CONFIGURATION_REVISION: u64 = 9_007_199_254_740_991;
 /// Logical schema version for the configuration transaction ledger.
@@ -139,16 +138,6 @@ pub enum ConfigurationChange {
     Rollback { target_revision: u64 },
 }
 
-/// Opaque configuration authority supplied by the authenticated Host path.
-///
-/// Implementations must expose canonical authority bytes and the digest
-/// computed over those exact bytes. This is unsafe because storage cannot
-/// inspect the issuing Host and lifecycle objects across the crate boundary.
-pub unsafe trait ConfigurationAuthority {
-    fn authority_digest(&self) -> &Sha256Digest;
-    fn authority_jcs(&self) -> &[u8];
-}
-
 #[derive(Deserialize)]
 struct AuthorityRecord {
     extension_id: String,
@@ -184,8 +173,8 @@ struct AuthorityFields {
     authority_digest: Sha256Digest,
 }
 
-fn authority_fields<A: ConfigurationAuthority + ?Sized>(
-    authority: &A,
+fn authority_fields(
+    authority: &ConfigurationTransactionAuthority,
 ) -> Result<AuthorityFields, ConfigurationError> {
     let value: Value = serde_json::from_slice(authority.authority_jcs())
         .map_err(|_| ConfigurationError::InvalidAuthority)?;
@@ -214,8 +203,7 @@ fn authority_fields<A: ConfigurationAuthority + ?Sized>(
     }
     let (canonical, digest) =
         canonicalize(&value).map_err(|_| ConfigurationError::InvalidAuthority)?;
-    if canonical.as_ref() != authority.authority_jcs() || digest != *authority.authority_digest()
-    {
+    if canonical.as_ref() != authority.authority_jcs() || digest != *authority.authority_digest() {
         return Err(ConfigurationError::InvalidAuthority);
     }
     let record: AuthorityRecord =
@@ -285,10 +273,9 @@ fn valid_authority_identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 255 && !value.chars().any(char::is_whitespace)
 }
 
-fn verify_current_host_authority<A: ConfigurationAuthority + ?Sized>(
+fn verify_current_host_authority(
     connection: &Connection,
-    host: &HostConnectionAuthority,
-    authority: &A,
+    authority: &ConfigurationTransactionAuthority,
 ) -> Result<AuthorityFields, ConfigurationError> {
     let authority = authority_fields(authority)?;
     let row: Option<(String, Vec<u8>)> = connection
@@ -306,7 +293,9 @@ fn verify_current_host_authority<A: ConfigurationAuthority + ?Sized>(
         serde_json::from_slice(&state_jcs).map_err(|_| ConfigurationError::Corrupt)?;
     let (canonical_state, state_digest) =
         canonicalize(&state).map_err(|_| ConfigurationError::Corrupt)?;
-    let stored_digest: Sha256Digest = state_hash.parse().map_err(|_| ConfigurationError::Corrupt)?;
+    let stored_digest: Sha256Digest = state_hash
+        .parse()
+        .map_err(|_| ConfigurationError::Corrupt)?;
     if canonical_state.as_ref() != state_jcs.as_slice()
         || stored_digest.to_canonical_string() != state_hash
         || stored_digest != state_digest
@@ -339,43 +328,49 @@ fn verify_current_host_authority<A: ConfigurationAuthority + ?Sized>(
         .get("incarnation_revision")
         .and_then(Value::as_i64)
         .ok_or(ConfigurationError::Corrupt)?;
-    if current_connection != host.extension_connection_id()
-        || current_epoch != *host.worker_epoch()
-        || current_fence != host.worker_epoch_fence()
-        || current_incarnation != host.incarnation_revision()
-        || authority.extension_connection_id != host.extension_connection_id()
-        || authority.worker_epoch != *host.worker_epoch()
-        || authority.worker_epoch_fence != host.worker_epoch_fence()
-        || authority.host_incarnation_revision != host.incarnation_revision()
-        || authority.control_channel_id != host.extension_connection_id()
+    if current_connection != authority.extension_connection_id
+        || current_epoch != authority.worker_epoch
+        || current_fence != authority.worker_epoch_fence
+        || current_incarnation != authority.host_incarnation_revision
+        || authority.control_channel_id != authority.extension_connection_id
     {
         return Err(ConfigurationError::AuthorityConflict);
     }
-    let grant: Option<(String, String, String, String, i64, i64, i64, i64, String, i64)> =
-        connection
-            .query_row(
-                "SELECT extension_id, module_id, extension_connection_id, worker_epoch,
+    let grant: Option<(
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+        i64,
+    )> = connection
+        .query_row(
+            "SELECT extension_id, module_id, extension_connection_id, worker_epoch,
                         worker_epoch_fence, incarnation_revision, extension_generation,
                         graph_revision, graph_digest, revoked
                  FROM host_capability_grants WHERE extension_id = ?1 AND module_id = ?2",
-                params![&authority.extension_id, &authority.module_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(ConfigurationError::Storage)?;
+            params![&authority.extension_id, &authority.module_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(ConfigurationError::Storage)?;
     let Some((
         grant_extension_id,
         grant_module_id,
@@ -533,8 +528,6 @@ pub enum ConfigurationDisposition {
     Replayed,
 }
 
-
-
 /// Immutable receipt for a committed or replayed configuration transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigurationReceipt {
@@ -636,17 +629,16 @@ impl<'connection> ConfigurationStore<'connection> {
         load_state(self.connection)
     }
 
-    /// Establish the first sealed authority for this configuration ledger.
-    pub(crate) fn bind_authority<A: ConfigurationAuthority + ?Sized>(
+    pub(crate) fn bind_authority(
         &mut self,
-        host: &HostConnectionAuthority,
-        authority: &A,
+        authority: &ConfigurationTransactionAuthority,
     ) -> Result<(), ConfigurationError> {
+        authority.check_live()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ConfigurationError::Storage)?;
-        let authority_fields = verify_current_host_authority(&transaction, host, authority)?;
+        let authority_fields = verify_current_host_authority(&transaction, authority)?;
         verify_current_configuration_base(&transaction, &authority_fields)?;
         if let Some(current) = load_authority_digest(&transaction)? {
             if current != authority_fields.authority_digest {
@@ -661,15 +653,12 @@ impl<'connection> ConfigurationStore<'connection> {
     }
 
     /// Replace the current authority only with the exact next generation.
-    pub(crate) fn rotate_authority<
-        A: ConfigurationAuthority + ?Sized,
-        B: ConfigurationAuthority + ?Sized,
-    >(
+    pub(crate) fn rotate_authority(
         &mut self,
-        host: &HostConnectionAuthority,
-        previous: &A,
-        next: &B,
+        previous: &ConfigurationTransactionAuthority,
+        next: &ConfigurationTransactionAuthority,
     ) -> Result<(), ConfigurationError> {
+        next.check_live()?;
         let previous_fields = authority_fields(previous)?;
         let next_fields = authority_fields(next)?;
         if !next_generation(&previous_fields, &next_fields) {
@@ -679,10 +668,10 @@ impl<'connection> ConfigurationStore<'connection> {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ConfigurationError::Storage)?;
-        let current_next = verify_current_host_authority(&transaction, host, next)?;
+        let current_next = verify_current_host_authority(&transaction, next)?;
         verify_current_configuration_base(&transaction, &current_next)?;
-        let current = load_authority_digest(&transaction)?
-            .ok_or(ConfigurationError::AuthorityUnavailable)?;
+        let current =
+            load_authority_digest(&transaction)?.ok_or(ConfigurationError::AuthorityUnavailable)?;
         if current != previous_fields.authority_digest {
             return Err(ConfigurationError::AuthorityConflict);
         }
@@ -691,21 +680,23 @@ impl<'connection> ConfigurationStore<'connection> {
         Ok(())
     }
     /// Atomically apply a replacement or rollback under the exact authority.
-    pub fn apply<A: ConfigurationAuthority + ?Sized>(
+    pub fn apply(
         &mut self,
-        authority: &A,
+        authority: &ConfigurationTransactionAuthority,
         request: &ConfigurationTransaction,
     ) -> Result<ConfigurationReceipt, ConfigurationError> {
         request.validate()?;
+        authority.check_live()?;
         let (request_jcs, request_digest_value) = request_identity(request, authority)?;
         let request_digest = request_digest_value.to_canonical_string();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ConfigurationError::Storage)?;
+        verify_current_host_authority(&transaction, authority)?;
 
-        let current_authority = load_authority_digest(&transaction)?
-            .ok_or(ConfigurationError::AuthorityUnavailable)?;
+        let current_authority =
+            load_authority_digest(&transaction)?.ok_or(ConfigurationError::AuthorityUnavailable)?;
         if current_authority != *authority.authority_digest() {
             return Err(ConfigurationError::AuthorityConflict);
         }
@@ -740,9 +731,7 @@ impl<'connection> ConfigurationStore<'connection> {
         }
 
         let (configuration, operation, rollback_target_revision) = match request.change() {
-            ConfigurationChange::Replace(configuration) => {
-                (configuration.clone(), "replace", None)
-            }
+            ConfigurationChange::Replace(configuration) => (configuration.clone(), "replace", None),
             ConfigurationChange::Rollback { target_revision } => {
                 let (configuration, target_authority) =
                     load_revision_configuration(&transaction, *target_revision)?;
@@ -993,9 +982,9 @@ fn load_authority_digest(
         .transpose()
 }
 
-fn write_authority<A: ConfigurationAuthority + ?Sized>(
+fn write_authority(
     transaction: &Transaction<'_>,
-    authority: &A,
+    authority: &ConfigurationTransactionAuthority,
     fields: &AuthorityFields,
 ) -> Result<(), ConfigurationError> {
     transaction
@@ -1111,9 +1100,9 @@ fn canonical_configuration(
         canonicalize(configuration).map_err(|_| ConfigurationError::InvalidConfiguration)?;
     Ok((bytes.into_vec(), digest))
 }
-fn request_identity<A: ConfigurationAuthority + ?Sized>(
+fn request_identity(
     request: &ConfigurationTransaction,
-    authority: &A,
+    authority: &ConfigurationTransactionAuthority,
 ) -> Result<(Vec<u8>, Sha256Digest), ConfigurationError> {
     let change = match request.change() {
         ConfigurationChange::Replace(configuration) => json!({
@@ -1188,8 +1177,8 @@ fn load_transaction(
     }
     let request_value: Value =
         serde_json::from_slice(&request_jcs).map_err(|_| ConfigurationError::Corrupt)?;
-    let (canonical_request, computed_request_digest) = canonicalize(&request_value)
-        .map_err(|_| ConfigurationError::Corrupt)?;
+    let (canonical_request, computed_request_digest) =
+        canonicalize(&request_value).map_err(|_| ConfigurationError::Corrupt)?;
     if canonical_request.as_ref() != request_jcs.as_slice()
         || computed_request_digest != request_digest_value
     {
@@ -1306,7 +1295,7 @@ mod tests {
     };
     use rusqlite::{Connection, types::Value as SqlValue};
 
-    use crate::transaction::SqliteCoreStore;
+    use dolly_storage::{HostConnectionAuthority, SqliteCoreStore};
 
     fn host_authority(connection: &mut Connection) -> HostConnectionAuthority {
         let mut core = SqliteCoreStore::new(connection).expect("core schema");
@@ -1355,23 +1344,6 @@ mod tests {
         ConfigurationStore::new(connection).expect("schema")
     }
 
-    #[derive(Debug, PartialEq, Eq)]
-    struct TestAuthority {
-        digest: Sha256Digest,
-        jcs: Vec<u8>,
-    }
-
-
-    unsafe impl ConfigurationAuthority for TestAuthority {
-        fn authority_digest(&self) -> &Sha256Digest {
-            &self.digest
-        }
-
-        fn authority_jcs(&self) -> &[u8] {
-            &self.jcs
-        }
-    }
-
     fn authority(
         daemon_generation: u64,
         extension_generation: i64,
@@ -1379,34 +1351,32 @@ mod tests {
         base_digest: Sha256Digest,
         graph_revision: u64,
         graph_digest: Sha256Digest,
-    ) -> TestAuthority {
-        let value = json!({
-            "extension_id": "org.example.extension",
-            "module_id": "module-one",
-            "extension_connection_id": "connection-one",
-            "host_incarnation_revision": 1,
-            "worker_epoch": "018f0f00-0000-7000-8000-000000000001",
-            "worker_epoch_fence": 1,
-            "daemon_generation": daemon_generation,
-            "extension_generation": extension_generation,
-            "base_config_revision": base_revision,
-            "base_config_digest": base_digest.to_canonical_string(),
-            "graph_revision": graph_revision,
-            "graph_digest": graph_digest.to_canonical_string(),
-            "control_channel_id": "connection-one",
-        });
-        let (bytes, digest) = canonicalize(&value).expect("authority");
-        TestAuthority {
-            digest,
-            jcs: bytes.into_vec(),
-        }
+    ) -> ConfigurationTransactionAuthority {
+        ConfigurationTransactionAuthority::from_test_parts(
+            "org.example.extension",
+            "module-one",
+            "connection-one",
+            1,
+            "018f0f00-0000-7000-8000-000000000001"
+                .parse()
+                .expect("WorkerEpoch"),
+            1,
+            daemon_generation,
+            extension_generation,
+            base_revision,
+            base_digest,
+            graph_revision,
+            graph_digest,
+            "connection-one",
+        )
+        .expect("authority")
     }
 
     fn authority_for(
         store: &ConfigurationStore<'_>,
         daemon_generation: u64,
         extension_generation: i64,
-    ) -> TestAuthority {
+    ) -> ConfigurationTransactionAuthority {
         let base = store.current().expect("current");
         authority(
             daemon_generation,
@@ -1417,7 +1387,6 @@ mod tests {
             Sha256Digest::compute(b"graph-v1"),
         )
     }
-
 
     fn database_rows(store: &ConfigurationStore<'_>) -> Vec<(String, Vec<Vec<SqlValue>>)> {
         [
@@ -1451,12 +1420,10 @@ mod tests {
     #[test]
     fn replacement_is_atomic_and_exact_replay_is_idempotent() {
         let mut connection = Connection::open_in_memory().expect("database");
-        let host = host_authority(&mut connection);
+        let _host = host_authority(&mut connection);
         let mut store = new_store(&mut connection);
         let authority = authority_for(&store, 1, 1);
-        host
-            .bind_configuration_authority(&mut store, &authority)
-            .expect("bind");
+        store.bind_authority(&authority).expect("bind");
         let request = ConfigurationTransaction::new(
             "tx-1",
             Some(0),
@@ -1479,12 +1446,10 @@ mod tests {
     #[test]
     fn stale_revision_and_plaintext_secret_are_rejected_without_writes() {
         let mut connection = Connection::open_in_memory().expect("database");
-        let host = host_authority(&mut connection);
+        let _host = host_authority(&mut connection);
         let mut store = new_store(&mut connection);
         let authority = authority_for(&store, 1, 1);
-        host
-            .bind_configuration_authority(&mut store, &authority)
-            .expect("bind");
+        store.bind_authority(&authority).expect("bind");
         let first =
             ConfigurationTransaction::new("tx-1", Some(0), json!({"value": 1})).expect("request");
         store.apply(&authority, &first).expect("first");
@@ -1506,12 +1471,10 @@ mod tests {
     #[test]
     fn rollback_creates_new_revision_and_restores_historical_value() {
         let mut connection = Connection::open_in_memory().expect("database");
-        let host = host_authority(&mut connection);
+        let _host = host_authority(&mut connection);
         let mut store = new_store(&mut connection);
         let authority = authority_for(&store, 1, 1);
-        host
-            .bind_configuration_authority(&mut store, &authority)
-            .expect("bind");
+        store.bind_authority(&authority).expect("bind");
         store
             .apply(
                 &authority,
@@ -1537,9 +1500,7 @@ mod tests {
         let host = host_authority(&mut connection);
         let mut store = new_store(&mut connection);
         let old_authority = authority_for(&store, 1, 1);
-        host
-            .bind_configuration_authority(&mut store, &old_authority)
-            .expect("bind");
+        store.bind_authority(&old_authority).expect("bind");
         store
             .apply(
                 &old_authority,
@@ -1570,17 +1531,14 @@ mod tests {
         drop(core);
         let mut store = new_store(&mut connection);
         let fresh_authority = authority_for(&store, 2, 2);
-        host
-            .rotate_configuration_authority(&mut store, &old_authority, &fresh_authority)
+        store
+            .rotate_authority(&old_authority, &fresh_authority)
             .expect("rotate");
-        let proposed = ConfigurationTransaction::new(
-            "proposal-n",
-            Some(1),
-            json!({"mode": "next"}),
-        )
-        .expect("proposal");
-        let stale_rollback = ConfigurationTransaction::rollback("rollback-n", Some(1), 1)
-            .expect("rollback");
+        let proposed =
+            ConfigurationTransaction::new("proposal-n", Some(1), json!({"mode": "next"}))
+                .expect("proposal");
+        let stale_rollback =
+            ConfigurationTransaction::rollback("rollback-n", Some(1), 1).expect("rollback");
 
         let before = database_rows(&store);
         assert!(matches!(
@@ -1621,7 +1579,9 @@ mod tests {
         ));
         assert_eq!(database_rows(&store), before);
 
-        let committed = store.apply(&fresh_authority, &proposed).expect("fresh apply");
+        let committed = store
+            .apply(&fresh_authority, &proposed)
+            .expect("fresh apply");
         assert_eq!(committed.disposition(), ConfigurationDisposition::Committed);
         let replayed = store.apply(&fresh_authority, &proposed).expect("replay");
         assert_eq!(replayed.disposition(), ConfigurationDisposition::Replayed);
@@ -1635,8 +1595,8 @@ mod tests {
         ));
         assert_eq!(database_rows(&store), after_replay);
 
-        let rollback_current = ConfigurationTransaction::rollback("rollback-current", Some(2), 1)
-            .expect("rollback");
+        let rollback_current =
+            ConfigurationTransaction::rollback("rollback-current", Some(2), 1).expect("rollback");
         assert!(matches!(
             store.apply(&fresh_authority, &rollback_current),
             Err(ConfigurationError::RollbackAuthorityConflict)

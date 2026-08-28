@@ -635,27 +635,6 @@ impl HostConnectionAuthority {
     pub fn incarnation_revision(&self) -> i64 {
         self.incarnation_revision
     }
-    /// Bind an opaque configuration authority to this authenticated Host.
-    pub fn bind_configuration_authority<A: crate::ConfigurationAuthority + ?Sized>(
-        &self,
-        store: &mut crate::ConfigurationStore<'_>,
-        authority: &A,
-    ) -> Result<(), crate::ConfigurationError> {
-        store.bind_authority(self, authority)
-    }
-
-    /// Rotate an opaque configuration authority for this authenticated Host.
-    pub fn rotate_configuration_authority<
-        A: crate::ConfigurationAuthority + ?Sized,
-        B: crate::ConfigurationAuthority + ?Sized,
-    >(
-        &self,
-        store: &mut crate::ConfigurationStore<'_>,
-        previous: &A,
-        next: &B,
-    ) -> Result<(), crate::ConfigurationError> {
-        store.rotate_authority(self, previous, next)
-    }
 }
 /// Schema for the Host-owned capability grant table.
 pub const HOST_CAPABILITY_GRANT_RECORD_SCHEMA: &str =

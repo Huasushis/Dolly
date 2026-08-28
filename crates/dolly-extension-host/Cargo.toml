@@ -15,9 +15,7 @@ dolly-runtime = { path = "../dolly-runtime" }
 dolly-schema = { path = "../dolly-schema" }
 dolly-storage = { path = "../dolly-storage" }
 dolly-worker = { path = "../dolly-worker" }
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
-
-[dev-dependencies]
-rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }

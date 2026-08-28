@@ -7,6 +7,7 @@
 //! and ordering fence, then returns immutable data for a later Extension
 //! handler. This crate has no transport writer, process launcher, or effect
 //! executor.
+mod config_transaction;
 pub mod operability;
 
 
@@ -30,6 +31,11 @@ use serde::de::{DeserializeOwned, IntoDeserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 pub use dolly_core_domain::SecretRef;
+pub use config_transaction::{
+    CONFIGURATION_SCHEMA_SQL, CONFIGURATION_SCHEMA_VERSION, ConfigurationChange,
+    ConfigurationDisposition, ConfigurationError, ConfigurationReceipt, ConfigurationSnapshot,
+    ConfigurationStore, ConfigurationTransaction, MAX_CONFIGURATION_REVISION,
+};
 pub use operability::{
     ConfigurationTransactionAuthority, ExternalIoContext, ExternalIoError,
     ExternalIoExecutionError, ExternalIoPermit, ExternalIoPolicy, ExternalIoRequest,

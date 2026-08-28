@@ -13,9 +13,10 @@ use std::sync::{Arc, Mutex};
 
 use dolly_canonical_json::{Sha256Digest, canonicalize};
 use dolly_core_domain::{ExtensionId, WorkerEpoch};
-use dolly_storage::{
-    ConfigurationAuthority, ConfigurationSnapshot, HostCapabilityGrant,
-    HostConnectionAuthority, SqliteCoreStore, MAX_CONFIGURATION_REVISION,
+use dolly_storage::{HostCapabilityGrant, HostConnectionAuthority, SqliteCoreStore};
+
+use crate::config_transaction::{
+    ConfigurationError, ConfigurationSnapshot, ConfigurationStore, MAX_CONFIGURATION_REVISION,
 };
 
 use dolly_worker::daemon::{DaemonError, DaemonLifecycleToken, InFlightWork};
@@ -24,21 +25,24 @@ use crate::FencedInvocationPremise;
 use crate::SecretRef;
 
 /// Opaque configuration authority issued only from a live operational premise.
-#[derive(Debug, PartialEq, Eq)]
+/// It retains the daemon lifecycle token so stop and restart invalidate it.
 pub struct ConfigurationTransactionAuthority {
     authority_digest: Sha256Digest,
     authority_jcs: Vec<u8>,
+    lifecycle: Option<DaemonLifecycleToken>,
 }
 
 impl ConfigurationTransactionAuthority {
-    pub(crate) fn from_live(
+    fn from_live(
         extension_id: &str,
         module_id: &str,
         host: &HostConnectionAuthority,
         grant: &HostCapabilityGrant,
         base: &ConfigurationSnapshot,
-        lifecycle_generation: u64,
+        lifecycle: &DaemonLifecycleToken,
     ) -> Result<Self, ExternalIoError> {
+        lifecycle.check().map_err(map_lifecycle_error)?;
+        let lifecycle_generation = lifecycle.generation().value();
         let worker_epoch: WorkerEpoch = grant
             .worker_epoch()
             .parse()
@@ -84,24 +88,93 @@ impl ConfigurationTransactionAuthority {
         Ok(Self {
             authority_digest,
             authority_jcs: authority_bytes.into_vec(),
+            lifecycle: Some(lifecycle.clone()),
         })
     }
 
     pub fn authority_digest(&self) -> &Sha256Digest {
         &self.authority_digest
     }
-}
 
-// Safety: this implementation is the only storage view of this private type.
-unsafe impl ConfigurationAuthority for ConfigurationTransactionAuthority {
-    fn authority_digest(&self) -> &Sha256Digest {
-        &self.authority_digest
-    }
-
-    fn authority_jcs(&self) -> &[u8] {
+    pub(crate) fn authority_jcs(&self) -> &[u8] {
         &self.authority_jcs
     }
+    pub(crate) fn check_live(&self) -> Result<(), ConfigurationError> {
+        match self.lifecycle.as_ref() {
+            Some(lifecycle) => lifecycle
+                .check()
+                .map_err(|_| ConfigurationError::AuthorityConflict),
+            None => {
+                #[cfg(test)]
+                {
+                    Ok(())
+                }
+                #[cfg(not(test))]
+                {
+                    Err(ConfigurationError::AuthorityUnavailable)
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_test_parts(
+        extension_id: impl Into<String>,
+        module_id: impl Into<String>,
+        extension_connection_id: impl Into<String>,
+        host_incarnation_revision: i64,
+        worker_epoch: WorkerEpoch,
+        worker_epoch_fence: i64,
+        daemon_generation: u64,
+        extension_generation: i64,
+        base_config_revision: u64,
+        base_config_digest: Sha256Digest,
+        graph_revision: u64,
+        graph_digest: Sha256Digest,
+        control_channel_id: impl Into<String>,
+    ) -> Result<Self, ExternalIoError> {
+        let authority_value = serde_json::json!({
+            "extension_id": extension_id.into(),
+            "module_id": module_id.into(),
+            "extension_connection_id": extension_connection_id.into(),
+            "host_incarnation_revision": host_incarnation_revision,
+            "worker_epoch": worker_epoch.to_string(),
+            "worker_epoch_fence": worker_epoch_fence,
+            "daemon_generation": daemon_generation,
+            "extension_generation": extension_generation,
+            "base_config_revision": base_config_revision,
+            "base_config_digest": base_config_digest.to_canonical_string(),
+            "graph_revision": graph_revision,
+            "graph_digest": graph_digest.to_canonical_string(),
+            "control_channel_id": control_channel_id.into(),
+        });
+        let (authority_bytes, authority_digest) =
+            canonicalize(&authority_value).map_err(|_| ExternalIoError::StaleGeneration)?;
+        Ok(Self {
+            authority_digest,
+            authority_jcs: authority_bytes.into_vec(),
+            lifecycle: None,
+        })
+    }
 }
+
+impl fmt::Debug for ConfigurationTransactionAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigurationTransactionAuthority")
+            .field("authority_digest", &self.authority_digest)
+            .finish()
+    }
+}
+
+impl PartialEq for ConfigurationTransactionAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        self.authority_digest == other.authority_digest && self.authority_jcs == other.authority_jcs
+    }
+}
+
+impl Eq for ConfigurationTransactionAuthority {}
 
 /// The explicit operational premise produced from one accepted G2 invocation.
 ///
@@ -206,8 +279,43 @@ impl OperationalPremise {
             &host,
             &grant,
             base,
-            lifecycle.generation().value(),
+            lifecycle,
         )
+    }
+
+    /// Bind the authority to the configuration ledger after rechecking the
+    /// live lifecycle and durable Host state.
+    pub fn bind_configuration_authority(
+        &self,
+        store: &mut ConfigurationStore<'_>,
+        authority: &ConfigurationTransactionAuthority,
+    ) -> Result<(), ConfigurationError> {
+        let lifecycle = self
+            .lifecycle
+            .as_ref()
+            .ok_or(ConfigurationError::AuthorityUnavailable)?;
+        lifecycle
+            .check()
+            .map_err(|_| ConfigurationError::AuthorityConflict)?;
+        store.bind_authority(authority)
+    }
+
+    /// Rotate the authority after checking the live lifecycle and durable Host
+    /// state.
+    pub fn rotate_configuration_authority(
+        &self,
+        store: &mut ConfigurationStore<'_>,
+        previous: &ConfigurationTransactionAuthority,
+        next: &ConfigurationTransactionAuthority,
+    ) -> Result<(), ConfigurationError> {
+        let lifecycle = self
+            .lifecycle
+            .as_ref()
+            .ok_or(ConfigurationError::AuthorityUnavailable)?;
+        lifecycle
+            .check()
+            .map_err(|_| ConfigurationError::AuthorityConflict)?;
+        store.rotate_authority(previous, next)
     }
 }
 

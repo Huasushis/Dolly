@@ -12,11 +12,12 @@ use dolly_core_reducer::{
     ActivationState, BuildManifestCommand, CoreCommand, EnvironmentInput, InstallConfigCommand,
     InstallGraphCommand, TransitionOutcome,
 };
+use dolly_extension_host::{
+    ConfigurationDisposition, ConfigurationError, ConfigurationStore, ConfigurationTransaction,
+};
 use dolly_protocol::FrameLimits;
 use dolly_runtime::{DispatchResult, ExecutionPremise, LeaseRequest, RuntimeTransactionEngine};
-use dolly_storage::{
-    ConfigurationDisposition, ConfigurationStore, ConfigurationTransaction, SqliteCoreStore,
-};
+use dolly_storage::SqliteCoreStore;
 use dolly_worker::daemon::{
     DaemonCommand, DaemonError, DaemonGeneration, DaemonLifecycleIdentity, DaemonReadinessConfig,
     DaemonState, LocalDaemonSupervisor, RestartBounds,
@@ -705,7 +706,7 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     let baseline_receipt = {
         let mut configuration =
             ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
-        old_host_authority
+        operational
             .bind_configuration_authority(&mut configuration, &old_config_authority)
             .expect("initial configuration authority");
         let baseline = ConfigurationTransaction::new(
@@ -914,6 +915,40 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         configuration.current().expect("configuration after stop")
     };
     let before_stopped_issuance = durable_snapshot(&dispatch.connection);
+    let stopped_bind = {
+        let mut configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        operational.bind_configuration_authority(&mut configuration, &old_config_authority)
+    };
+    assert!(
+        matches!(stopped_bind, Err(ConfigurationError::AuthorityConflict)),
+        "stopped premise cannot bind a retained configuration authority"
+    );
+    assert_eq!(
+        durable_snapshot(&dispatch.connection),
+        before_stopped_issuance,
+        "stopped bind must not mutate durable rows"
+    );
+    let stopped_request = ConfigurationTransaction::new(
+        "g3-config-stopped",
+        Some(stopped_config_base.revision()),
+        json!({"mode": "stopped"}),
+    )
+    .expect("stopped configuration request");
+    let stopped_apply = {
+        let mut configuration =
+            ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
+        configuration.apply(&old_config_authority, &stopped_request)
+    };
+    assert!(
+        matches!(stopped_apply, Err(ConfigurationError::AuthorityConflict)),
+        "stopped authority cannot apply a configuration transaction"
+    );
+    assert_eq!(
+        durable_snapshot(&dispatch.connection),
+        before_stopped_issuance,
+        "stopped apply must not mutate durable rows"
+    );
     let stopped_issuance = {
         let stopped_host_store =
             SqliteCoreStore::new(&mut dispatch.connection).expect("Host state after stop");
@@ -1057,17 +1092,10 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
             )
             .expect("fresh Host capability grant");
     }
-    let current_host_authority = {
-        let host_store =
-            SqliteCoreStore::new(&mut dispatch.connection).expect("current Host state");
-        host_store
-            .authenticated_host_connection()
-            .expect("current Host authority")
-    };
     {
         let mut configuration =
             ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
-        current_host_authority
+        fresh_operational
             .rotate_configuration_authority(
                 &mut configuration,
                 &old_config_authority,
@@ -1081,13 +1109,13 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         ConfigurationStore::new(&mut fresh_configuration_connection)
             .expect("fresh configuration schema");
     assert!(
-        current_host_authority
+        fresh_operational
             .bind_configuration_authority(&mut fresh_configuration, &old_config_authority)
             .is_err(),
         "a public consumer cannot bootstrap an empty ledger without durable Host state"
     );
     assert!(
-        current_host_authority
+        fresh_operational
             .rotate_configuration_authority(
                 &mut fresh_configuration,
                 &old_config_authority,
@@ -1111,7 +1139,7 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
             ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
         assert!(matches!(
             configuration.apply(&old_config_authority, &stale_configuration),
-            Err(dolly_storage::ConfigurationError::AuthorityConflict)
+            Err(ConfigurationError::AuthorityConflict)
         ));
     }
     assert_eq!(
@@ -1124,7 +1152,7 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
             ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
         assert!(matches!(
             configuration.apply(&old_config_authority, &stale_rollback),
-            Err(dolly_storage::ConfigurationError::AuthorityConflict)
+            Err(ConfigurationError::AuthorityConflict)
         ));
     }
     assert_eq!(
@@ -1179,7 +1207,7 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
             ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
         assert!(matches!(
             configuration.apply(&fresh_config_authority, &changed_configuration),
-            Err(dolly_storage::ConfigurationError::IdempotencyConflict)
+            Err(ConfigurationError::IdempotencyConflict)
         ));
     }
     assert_eq!(
@@ -1195,7 +1223,7 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
             ConfigurationStore::new(&mut dispatch.connection).expect("configuration schema");
         assert!(matches!(
             configuration.apply(&fresh_config_authority, &incompatible_rollback),
-            Err(dolly_storage::ConfigurationError::RollbackAuthorityConflict)
+            Err(ConfigurationError::RollbackAuthorityConflict)
         ));
     }
     assert_eq!(
