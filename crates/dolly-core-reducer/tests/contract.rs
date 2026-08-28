@@ -543,7 +543,7 @@ fn canonical_integrity_digests_are_required() {
 }
 
 #[test]
-fn all_twenty_two_wire_variants_deserialize_and_reach_the_reducer() {
+fn all_twenty_one_wire_variants_deserialize_and_reach_the_reducer() {
     let values = vec![
         json!({"type":"InstallConfig","command_id":"1","revision":1,"effective_config":{},"digest":digest(&json!({}))}),
         json!({"type":"InstallGraph","command_id":"2","revision":1,"graph":{},"digest":digest(&json!({}))}),
@@ -552,7 +552,6 @@ fn all_twenty_two_wire_variants_deserialize_and_reach_the_reducer() {
         json!({"type":"GrantStorageWriter","command_id":"5","owner":"w"}),
         json!({"type":"ReleaseStorageWriter","command_id":"6","owner":"w"}),
         json!({"type":"BuildManifest","command_id":"7","activation_id":"a","manifest":{}}),
-        json!({"type":"AllocateRequest","command_id":"8a","activation_id":"a","lease_id":"l","extension_connection_id":"connection-1","worker_epoch_id":"0198ab31-6c44-7e8a-b2bb-000000000010","worker_epoch":1}),
         json!({"type":"IssueLease","command_id":"8","activation_id":"a","lease_id":"l","token_digest":"t","extension_connection_id":"connection-1","worker_epoch":1}),
         json!({"type":"DispatchLease","command_id":"9","activation_id":"a","lease_id":"l","dispatch_state":"started"}),
         json!({"type":"ReceiveResult","command_id":"10","activation_id":"a","lease_id":"l","result_digest":A,"status":"success"}),
@@ -568,7 +567,7 @@ fn all_twenty_two_wire_variants_deserialize_and_reach_the_reducer() {
         json!({"type":"LossyEvict","command_id":"20","page_id":"p","start":1,"end_exclusive":2,"reason":"x"}),
         json!({"type":"Recover","command_id":"21","persisted_next_page_seq":2}),
     ];
-    assert_eq!(values.len(), 22);
+    assert_eq!(values.len(), 21);
     for value in values {
         let command: CoreCommand = serde_json::from_value(value).unwrap();
         let transition = reduce(&empty_core_snapshot(), &command, &input());

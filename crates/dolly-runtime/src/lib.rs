@@ -11,9 +11,8 @@ mod validation;
 use dolly_canonical_json::{canonicalize, Sha256Digest};
 use dolly_core_domain::{LeaseToken, WorkerEpoch};
 use dolly_core_reducer::{
-    ActivationState, AllocateRequestCommand, BuildManifestCommand, CoreCommand,
-    DispatchLeaseCommand, DispatchState, EnvironmentInput, IssueLeaseCommand, Transition,
-    TransitionOutcome,
+    ActivationState, BuildManifestCommand, CoreCommand, DispatchLeaseCommand, DispatchState,
+    EnvironmentInput, IssueLeaseCommand, Transition, TransitionOutcome,
 };
 use dolly_storage::{SqliteCoreStore, StorageError};
 use rusqlite::Connection;
@@ -176,20 +175,13 @@ impl<'connection> RuntimeTransactionEngine<'connection> {
         request: &LeaseRequest,
         input: &EnvironmentInput,
     ) -> RuntimeResult<RequestReservation> {
-        let snapshot = self.store.snapshot()?;
-        let connection = host_connection_state(&snapshot)?;
-        let command = CoreCommand::AllocateRequest(AllocateRequestCommand {
-            command_id: format!(
-                "runtime-host-request-allocation-{}",
-                snapshot.next_commit_seq
-            ),
-            activation_id: request.activation_id.clone(),
-            lease_id: request.lease_id.clone(),
-            extension_connection_id: connection.extension_connection_id,
-            worker_epoch_id: connection.worker_epoch.to_string(),
-            worker_epoch: connection.worker_epoch_fence,
-        });
-        let transition = self.store.transact(&command, input)?;
+        let authority = self.store.authenticated_host_connection()?;
+        let transition = self.store.allocate_host_request(
+            &authority,
+            &request.activation_id,
+            &request.lease_id,
+            input,
+        )?;
         require_committed(&transition)?;
         let reservation_id = transition
             .reply
