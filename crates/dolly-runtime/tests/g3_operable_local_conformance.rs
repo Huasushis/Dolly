@@ -14,7 +14,6 @@ use dolly_core_reducer::{
 };
 use dolly_extension_host::{
     ConfigurationDisposition, ConfigurationError, ConfigurationStore, ConfigurationTransaction,
-    InMemorySecretProvider, SecretRef,
 };
 use dolly_storage::SqliteCoreStore;
 use dolly_protocol::FrameLimits;
@@ -25,7 +24,6 @@ use dolly_worker::daemon::{
 };
 use rusqlite::{Connection, types::Value as SqlValue};
 use serde_json::{Value, json};
-use std::sync::Arc;
 use std::time::Duration;
 
 fn canonical_digest(value: &Value) -> String {
@@ -880,21 +878,14 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
     .expect("external policy");
     policy.allow_operation("read").expect("operation");
     policy.allow_target(target.clone());
-    let secret_owner = operational
-        .secret_owner()
-        .expect("live premise must create a secret owner");
-    let secret_reference: SecretRef = "secret://vault/g3".parse().expect("secret reference");
-    let secret_provider = Arc::new(InMemorySecretProvider::default());
-    secret_provider.insert(&secret_owner, secret_reference.clone(), b"g3-secret");
-    let authority = dolly_extension_host::HostExternalIoAuthority::new(
-        policy,
-        dolly_extension_host::HostSecretAuthority::new(secret_provider),
-    );
+    let authority = operational
+        .external_io_authority(policy)
+        .expect("live external authority");
     let request = dolly_extension_host::ExternalIoRequest::new(
         "org.example.extension",
         "read",
         target.clone(),
-        Some(secret_reference.clone()),
+        Some("secret://vault/g3".parse().expect("secret reference")),
     )
     .expect("external request");
     let stopped_permit = authority
@@ -1246,12 +1237,9 @@ fn g3_operable_local_001_valid_committed_g2_invocation_reaches_supervised_local_
         .allow_operation("read")
         .expect("fresh operation");
     fresh_policy.allow_target(target.clone());
-    let fresh_authority = dolly_extension_host::HostExternalIoAuthority::new(
-        fresh_policy,
-        dolly_extension_host::HostSecretAuthority::new(Arc::new(
-            dolly_extension_host::InMemorySecretProvider::default(),
-        )),
-    );
+    let fresh_authority = fresh_operational
+        .external_io_authority(fresh_policy)
+        .expect("fresh external authority");
     let fresh_request =
         dolly_extension_host::ExternalIoRequest::new("org.example.extension", "read", target, None)
             .expect("fresh external request");

@@ -182,7 +182,7 @@ impl Eq for ConfigurationTransactionAuthority {}
 /// Host creates it from the admitted premise and live daemon lifecycle. Its
 /// private fields prevent callers from substituting raw identity values.
 #[derive(Clone)]
-pub struct SecretOwner {
+struct SecretOwner {
     extension_id: String,
     module_id: String,
     extension_connection_id: String,
@@ -230,7 +230,7 @@ impl SecretOwner {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(
+    fn for_test(
         extension_id: &str,
         module_id: &str,
         extension_connection_id: &str,
@@ -367,9 +367,14 @@ impl OperationalPremise {
     pub fn extension_generation(&self) -> i64 {
         self.invocation.extension_generation()
     }
-    /// Create the sealed owner context for Host secret storage and resolution.
-    pub fn secret_owner(&self) -> Result<SecretOwner, ExternalIoError> {
-        SecretOwner::from_premise(self)
+
+    /// Create a Host external-I/O authority for this admitted premise.
+    pub fn external_io_authority(
+        &self,
+        policy: ExternalIoPolicy,
+    ) -> Result<HostExternalIoAuthority, ExternalIoError> {
+        let owner = SecretOwner::from_premise(self)?;
+        HostExternalIoAuthority::from_owner(policy, owner)
     }
 
     /// Create the immutable configuration authority for this live invocation.
@@ -685,10 +690,10 @@ pub enum ExternalIoExecutionError<E> {
 
 /// Secret bytes exist only inside a Host callback and are wiped on drop.
 /// There is no `Debug`, `Serialize`, or raw-byte accessor.
-pub struct SecretMaterial(Vec<u8>);
+struct SecretMaterial(Vec<u8>);
 
 impl SecretMaterial {
-    pub fn from_bytes(bytes: &[u8]) -> Self {
+    fn from_bytes(bytes: &[u8]) -> Self {
         Self(bytes.to_vec())
     }
 
@@ -715,7 +720,7 @@ impl Drop for SecretMaterial {
 
 /// Host-owned provider interface. Implementations must bind lookups to the
 /// supplied sealed owner and reference.
-pub trait SecretProvider: Send + Sync {
+trait SecretProvider: Send + Sync {
     fn resolve(
         &self,
         owner: &SecretOwner,
@@ -725,19 +730,19 @@ pub trait SecretProvider: Send + Sync {
 
 /// Fail-closed secret provider errors; references and material are omitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum SecretError {
+enum SecretError {
     #[error("secret is unavailable")]
     Unavailable,
 }
 
 /// Sealed Host authority for resolving a `SecretRef` at use time.
 #[derive(Clone)]
-pub struct HostSecretAuthority {
+struct HostSecretAuthority {
     provider: Arc<dyn SecretProvider>,
 }
 
 impl HostSecretAuthority {
-    pub fn new(provider: Arc<dyn SecretProvider>) -> Self {
+    fn new(provider: Arc<dyn SecretProvider>) -> Self {
         Self { provider }
     }
 
@@ -760,15 +765,16 @@ impl fmt::Debug for HostSecretAuthority {
     }
 }
 
-/// In-memory Host provider for local process tests. Production providers can
-/// implement `SecretProvider` without exposing durable plaintext.
+/// Host-controlled in-memory provider used by local process tests and Host
+/// external-I/O authority composition.
 #[derive(Default)]
-pub struct InMemorySecretProvider {
+struct InMemorySecretProvider {
     values: Mutex<HashMap<(SecretOwner, SecretRef), Vec<u8>>>,
 }
 
 impl InMemorySecretProvider {
-    pub fn insert(&self, owner: &SecretOwner, reference: SecretRef, bytes: &[u8]) {
+    #[cfg(test)]
+    fn insert(&self, owner: &SecretOwner, reference: SecretRef, bytes: &[u8]) {
         if let Ok(mut values) = self.values.lock() {
             values.insert((owner.clone(), reference), bytes.to_vec());
         }
@@ -805,22 +811,57 @@ struct GateState {
 /// gate held across the actual effect callback.
 #[derive(Clone)]
 pub struct HostExternalIoAuthority {
+    owner: SecretOwner,
     policy: Arc<ExternalIoPolicy>,
     secrets: HostSecretAuthority,
     gate: Arc<Mutex<GateState>>,
 }
 
 impl HostExternalIoAuthority {
-    pub fn new(policy: ExternalIoPolicy, secrets: HostSecretAuthority) -> Self {
+    fn from_owner(
+        policy: ExternalIoPolicy,
+        owner: SecretOwner,
+    ) -> Result<Self, ExternalIoError> {
+        Self::from_owner_with_provider(
+            policy,
+            owner,
+            HostSecretAuthority::new(Arc::new(InMemorySecretProvider::default())),
+        )
+    }
+
+    fn from_owner_with_provider(
+        policy: ExternalIoPolicy,
+        owner: SecretOwner,
+        secrets: HostSecretAuthority,
+    ) -> Result<Self, ExternalIoError> {
+        if policy.extension_id() != owner.extension_id
+            || policy.config_revision() != owner.config_revision
+            || policy.extension_generation() != owner.extension_generation
+        {
+            return Err(ExternalIoError::Unauthorized);
+        }
         let generation = policy.extension_generation();
-        Self {
+        Ok(Self {
+            owner,
             policy: Arc::new(policy),
             secrets,
             gate: Arc::new(Mutex::new(GateState {
                 active_generation: generation,
                 stopped: false,
             })),
-        }
+        })
+    }
+
+    #[cfg(test)]
+    fn from_test(policy: ExternalIoPolicy, secrets: HostSecretAuthority) -> Self {
+        let owner = SecretOwner::for_test(
+            policy.extension_id(),
+            "module-one",
+            "connection-one",
+            policy.config_revision(),
+            policy.extension_generation(),
+        );
+        Self::from_owner_with_provider(policy, owner, secrets).expect("test authority")
     }
 
     pub fn policy(&self) -> &ExternalIoPolicy {
@@ -859,6 +900,9 @@ impl HostExternalIoAuthority {
             .ok_or(ExternalIoError::StaleGeneration)?;
         lifecycle.check().map_err(map_lifecycle_error)?;
         let owner = SecretOwner::from_premise(premise)?;
+        if owner != self.owner {
+            return Err(ExternalIoError::StaleGeneration);
+        }
         self.authorize_claims_with_lifecycle(
             premise.extension_id(),
             premise.config_revision(),
@@ -1198,7 +1242,10 @@ mod tests {
         let mut policy = ExternalIoPolicy::new("org.example.extension", 1, 4).unwrap();
         policy.allow_operation("read").unwrap();
         policy.allow_target(target.clone());
-        let authority = HostExternalIoAuthority::new(policy, HostSecretAuthority::new(provider));
+        let authority = HostExternalIoAuthority::from_test(
+            policy,
+            HostSecretAuthority::new(provider),
+        );
         let request =
             ExternalIoRequest::new("org.example.extension", "read", target, Some(reference))
                 .unwrap();
@@ -1224,7 +1271,7 @@ mod tests {
         let mut policy = ExternalIoPolicy::new("org.example.extension", 1, 4).unwrap();
         policy.allow_operation("read").unwrap();
         policy.allow_target(target.clone());
-        let authority = HostExternalIoAuthority::new(
+        let authority = HostExternalIoAuthority::from_test(
             policy,
             HostSecretAuthority::new(Arc::new(InMemorySecretProvider::default())),
         );
@@ -1272,7 +1319,7 @@ mod tests {
         policy.allow_operation("read").unwrap();
         let target = ExternalTarget::new("https", "api.example.test", 443, "/v1/data").unwrap();
         policy.allow_target(target.clone());
-        let authority = HostExternalIoAuthority::new(
+        let authority = HostExternalIoAuthority::from_test(
             policy.clone(),
             HostSecretAuthority::new(provider),
         );
@@ -1305,8 +1352,10 @@ mod tests {
             b"extension-b-secret",
         );
         collision_provider.insert(&owner_b_module, reference.clone(), b"module-b-secret");
-        let collision_authority =
-            HostExternalIoAuthority::new(policy, HostSecretAuthority::new(collision_provider));
+        let collision_authority = HostExternalIoAuthority::from_test(
+            policy,
+            HostSecretAuthority::new(collision_provider),
+        );
         let collision_request = ExternalIoRequest::new(
             "org.example.extension",
             "read",
@@ -1336,7 +1385,7 @@ mod tests {
         let mut policy = ExternalIoPolicy::new("org.example.extension", 1, 4).unwrap();
         policy.allow_operation("read").unwrap();
         policy.allow_target(target.clone());
-        let authority = HostExternalIoAuthority::new(
+        let authority = HostExternalIoAuthority::from_test(
             policy,
             HostSecretAuthority::new(Arc::new(InMemorySecretProvider::default())),
         );
