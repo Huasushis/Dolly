@@ -1,0 +1,124 @@
+{
+  "schema": "dolly.g3-operable-local-conformance/v1",
+  "spec_basis": [
+    "INV-ADMIN-001",
+    "REQ-ADMIN-001",
+    "REQ-ADMIN-002",
+    "REQ-ADMIN-003",
+    "INV-CFG-001",
+    "REQ-CFG-001",
+    "REQ-CFG-004",
+    "INV-CTXN-001",
+    "REQ-CTXN-001",
+    "INV-SEC-002",
+    "REQ-SEC-001",
+    "REQ-SEC-002",
+    "REQ-OBS-001",
+    "INV-REC-001",
+    "INV-REC-002",
+    "REQ-REC-004",
+    "INV-XCAP-001",
+    "INV-XCAP-004",
+    "INV-XCAP-005"
+  ],
+  "source_boundary": {
+    "g1_fixture": "crates/dolly-runtime/tests/fixtures/g1_runtime_conformance.json",
+    "g1_case": "G1-EXEC-001",
+    "g2_fixture": "crates/dolly-runtime/tests/fixtures/g2_extension_host_sdk_conformance.json",
+    "g2_case": "G2-ADMISSION-001",
+    "handoff": "accepted G2 invocation context to one daemon-supervised local operational premise",
+    "authority": "G1 and G2 fences are inherited; local supervision may fence but never mint authority",
+    "effect_boundary": "before external I/O"
+  },
+  "cases": [
+    {
+      "id": "G3-OPERABLE-LOCAL-001",
+      "name": "valid_committed_g2_invocation_reaches_supervised_local_operational_premise_before_external_io",
+      "kind": "valid_operational_premise",
+      "expected": "product_red",
+      "source_case": "G2-ADMISSION-001",
+      "fences": [
+        "activation_id",
+        "module_id",
+        "worker_epoch",
+        "worker_epoch_fence",
+        "extension_generation",
+        "lease_generation",
+        "manifest_digest",
+        "graph_revision",
+        "frame_digest",
+        "request_id",
+        "host_incarnation"
+      ],
+      "required_boundary": "one explicit supervised-local operational premise",
+      "effect_boundary": "before external I/O",
+      "stop_conditions": [
+        "no credential resolution",
+        "no external transport invocation",
+        "no new authority or storage scope"
+      ]
+    },
+    {
+      "id": "G3-CONTROL-CONFIG-RESTART-001",
+      "name": "configuration_revision_generation_and_restart_fencing_remain_bound",
+      "kind": "fail_closed_control",
+      "expected": "pass",
+      "references": [
+        "tests/conformance/operations/instance-config-identity.test.ts::uses revision compare-and-swap and leaves the last valid file intact on rejection",
+        "tests/conformance/operations/daemon-readiness-generation.test.ts::ignores stale readiness and exit callbacks after a replacement generation is running"
+      ]
+    },
+    {
+      "id": "G3-CONTROL-SECRET-UNRESOLVED-001",
+      "name": "unresolved_secret_ref_fails_closed_before_external_io",
+      "kind": "fail_closed_control",
+      "expected": "pass",
+      "references": [
+        "tests/conformance/model-provider/broker-private-binding.test.ts::rejects exhausted budgets before resolving a secret or dispatching",
+        "tests/conformance/model-provider/broker-private-binding.test.ts::keeps URL and secret authority inside the host transport"
+      ]
+    },
+    {
+      "id": "G3-CONTROL-SECRET-DISCLOSURE-001",
+      "name": "secret_values_are_not_returned_or_recorded",
+      "kind": "fail_closed_control",
+      "expected": "pass",
+      "references": [
+        "tests/conformance/security/extension-capability-outbound-http.test.ts::attaches the bound credential host-side and never hands it back",
+        "tests/conformance/security/extension-capability-structured-log.test.ts::redacts credential shapes that no literal field-name list would catch"
+      ]
+    },
+    {
+      "id": "G3-CONTROL-EXTERNAL-IO-001",
+      "name": "unauthorized_external_io_fails_closed_before_transport",
+      "kind": "fail_closed_control",
+      "expected": "pass",
+      "references": [
+        "tests/conformance/security/extension-capability-outbound-http.test.ts::denies every destination, method, and header outside the grant",
+        "tests/conformance/model-provider/node-http-transport.test.ts::rejects mixed/private DNS and network-scope mismatches before opening a connection"
+      ]
+    },
+    {
+      "id": "G3-CONTROL-OBSERVABILITY-001",
+      "name": "telemetry_and_simulation_replay_remain_bounded_and_non_authoritative",
+      "kind": "fail_closed_control",
+      "expected": "pass",
+      "references": [
+        "tests/conformance/security/extension-capability-structured-log.test.ts::bounds the record rate inside one window and recovers in the next",
+        "tests/conformance/core/effect-intent-journal.test.ts::reports an unknown outcome when the intent survives a crash unsettled",
+        "tests/conformance/core/effect-intent-journal.test.ts::stores no argument values, response payload, or credential"
+      ]
+    },
+    {
+      "id": "G3-CONTROL-RESTORE-SCOPE-001",
+      "name": "module_scope_backup_restore_cannot_mint_authority_or_leak_secrets",
+      "kind": "fail_closed_control",
+      "expected": "pass",
+      "references": [
+        "crates/dolly-storage/tests/restore_identity_modes.rs::isolated_clone_mode_disables_external_authority",
+        "crates/dolly-storage/tests/restore_identity_modes.rs::portable_fork_mode_remaps_scope_and_disables_opaque_module",
+        "tests/conformance/security/extension-capability-module-private-storage.test.ts::refuses a document that was moved into another Module's namespace"
+      ]
+    }
+  ]
+}
