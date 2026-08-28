@@ -13,7 +13,7 @@ use dolly_canonical_json::{
     canonicalize, parse_core_json,
 };
 use dolly_core_domain::{
-    Attempt, ExtensionGeneration, LeaseGeneration, LeaseToken, ModuleId, WorkerEpoch,
+    Attempt, ExtensionGeneration, LeaseGeneration, LeaseToken, WorkerEpoch,
 };
 use dolly_core_reducer::{ActivationState, TransitionOutcome};
 use dolly_extension_sdk::{CapabilityRequest as SdkCapabilityRequest, ResultData};
@@ -23,7 +23,8 @@ use dolly_runtime::{
 };
 use dolly_schema::{ActivationManifest, BlockEnvelope, embedded_schema_catalog};
 use serde::de::{DeserializeOwned, IntoDeserializer};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use thiserror::Error;
 /// The only invocation method admitted by this G2 boundary.
 pub const MODULE_ACTIVATE_METHOD: &str = "module.activate";
@@ -31,14 +32,6 @@ pub const MODULE_ACTIVATE_METHOD: &str = "module.activate";
 pub const ACTIVATION_REQUEST_SCHEMA_ID: &str =
     "https://dolly.example/spec/0.1/schemas/activation-request.schema.json";
 
-/// Direction of a closed Extension RPC request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RpcDirection {
-    /// Host sends a lifecycle or activation request to an Extension.
-    HostToExtension,
-    /// Extension sends a Host-service request to the Host.
-    ExtensionToHost,
-}
 
 /// The immutable G2 premise produced only after G1 dispatch admission.
 #[derive(Clone, Debug)]
@@ -66,6 +59,38 @@ pub struct FencedInvocationPremise {
     manifest: ActivationManifest,
     order: ExecutionOrder,
     replay_scope: ReplayScope,
+    capability_policy: Option<CapabilityPolicy>,
+}
+
+/// Host-owned capability policy bound to one admitted invocation premise.
+///
+/// Its binding digest covers the authenticated connection, incarnation,
+/// generations, revisions, manifest, graph, descriptor, and dispatch digests.
+/// No public constructor or deserializer exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapabilityPolicy {
+    extension_id: String,
+    binding_digest: Sha256Digest,
+    allowed_methods: Vec<String>,
+}
+
+impl CapabilityPolicy {
+    fn bind(
+        premise: &FencedInvocationPremise,
+        extension_id: String,
+        allowed_methods: Vec<String>,
+    ) -> Result<Self, AdmissionError> {
+        Ok(Self {
+            extension_id: extension_id.clone(),
+            binding_digest: capability_binding_digest(premise, &extension_id)?,
+            allowed_methods,
+        })
+    }
+
+    fn matches(&self, premise: &FencedInvocationPremise) -> bool {
+        capability_binding_digest(premise, &self.extension_id)
+            .is_ok_and(|digest| digest == self.binding_digest)
+    }
 }
 
 impl FencedInvocationPremise {
@@ -142,6 +167,15 @@ impl FencedInvocationPremise {
             self.activation_id.clone(),
             self.manifest_digest.to_canonical_string(),
         )
+    }
+    fn bind_capability_policy(
+        &mut self,
+        extension_id: String,
+        allowed_methods: Vec<String>,
+    ) -> Result<(), AdmissionError> {
+        let policy = CapabilityPolicy::bind(self, extension_id, allowed_methods)?;
+        self.capability_policy = Some(policy);
+        Ok(())
     }
     /// Build a canonical result receipt after invocation admission.
     pub fn result_receipt(&self, result: &ResultData) -> Result<InvocationReceipt, AdmissionError> {
@@ -231,107 +265,6 @@ impl InvocationReceipt {
     }
 }
 
-/// A durable descriptor/Manifest capability projection used for one refusal
-/// check. It is policy data, not a capability token and has no executor.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CapabilityProjection {
-    extension_id: String,
-    module_id: String,
-    manifest_digest: Sha256Digest,
-    declared_methods: Vec<String>,
-}
-
-impl CapabilityProjection {
-    /// Construct a closed projection from Host-owned policy data.
-    pub fn new(
-        extension_id: &str,
-        module_id: &str,
-        manifest_digest: &str,
-        declared_methods: Vec<String>,
-    ) -> Result<Self, AdmissionError> {
-        if extension_id.is_empty()
-            || module_id.parse::<ModuleId>().is_err()
-            || manifest_digest.parse::<Sha256Digest>().is_err()
-            || declared_methods.is_empty()
-            || declared_methods.iter().any(|method| {
-                method.is_empty() || !method.starts_with("host.") || method.len() > 160
-            })
-        {
-            return Err(AdmissionError::CapabilityDenied);
-        }
-        let manifest_digest = manifest_digest
-            .parse::<Sha256Digest>()
-            .map_err(|_| AdmissionError::CapabilityDenied)?;
-        Ok(Self {
-            extension_id: extension_id.to_owned(),
-            module_id: module_id.to_owned(),
-            manifest_digest,
-            declared_methods,
-        })
-    }
-}
-
-/// Untrusted Extension capability request data.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CapabilityRequest {
-    extension_id: String,
-    module_id: String,
-    manifest_digest: Sha256Digest,
-    method: String,
-    direction: RpcDirection,
-}
-
-impl CapabilityRequest {
-    /// Parse a request without granting authority or calling a service.
-    pub fn new(
-        extension_id: &str,
-        module_id: &str,
-        manifest_digest: &str,
-        method: &str,
-        direction: RpcDirection,
-    ) -> Result<Self, AdmissionError> {
-        if extension_id.is_empty()
-            || module_id.parse::<ModuleId>().is_err()
-            || method.is_empty()
-            || method.len() > 160
-            || !method.starts_with("host.")
-            || direction != RpcDirection::ExtensionToHost
-        {
-            return Err(AdmissionError::CapabilityDenied);
-        }
-        Ok(Self {
-            extension_id: extension_id.to_owned(),
-            module_id: module_id.to_owned(),
-            manifest_digest: manifest_digest
-                .parse()
-                .map_err(|_| AdmissionError::CapabilityDenied)?,
-            method: method.to_owned(),
-            direction,
-        })
-    }
-}
-
-/// Admit only a method declared for the exact Extension/Module/Manifest.
-///
-/// The return value is intentionally unit: this G2 lane stops before any
-/// Host-service or external-effect call.
-pub fn admit_capability(
-    projection: &CapabilityProjection,
-    request: &CapabilityRequest,
-) -> Result<(), AdmissionError> {
-    if request.direction != RpcDirection::ExtensionToHost
-        || request.extension_id != projection.extension_id
-        || request.module_id != projection.module_id
-        || request.manifest_digest != projection.manifest_digest
-        || !projection
-            .declared_methods
-            .iter()
-            .any(|method| method == &request.method)
-    {
-        return Err(AdmissionError::CapabilityDenied);
-    }
-    Ok(())
-}
 
 /// Capability request data that passed Host admission. It has no executor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -353,13 +286,15 @@ impl AdmittedCapabilityRequest {
 /// Consume SDK request data only after the G1-derived premise exists.
 pub fn admit_sdk_capability(
     premise: &FencedInvocationPremise,
-    projection: &CapabilityProjection,
     request: SdkCapabilityRequest,
 ) -> Result<AdmittedCapabilityRequest, AdmissionError> {
-    if projection.module_id != premise.module_id
-        || projection.manifest_digest != premise.manifest_digest
-        || !projection
-            .declared_methods
+    let policy = premise
+        .capability_policy
+        .as_ref()
+        .ok_or(AdmissionError::CapabilityDenied)?;
+    if !policy.matches(premise)
+        || !policy
+            .allowed_methods
             .iter()
             .any(|method| method == request.method())
     {
@@ -424,7 +359,9 @@ pub fn admit_activation(
     }
     validate_frame(premise, dispatch, &parsed, limits)?;
     validate_durable_state(premise, dispatch, &parsed)?;
-    Ok(FencedInvocationPremise {
+    let (extension_id, allowed_methods) =
+        derive_capability_methods(premise, dispatch, &parsed.manifest)?;
+    let mut admitted = FencedInvocationPremise {
         activation_id: premise.identity().activation_id().to_owned(),
         module_id: premise.identity().module_id().to_owned(),
         request_id: premise.fence().request_id().to_owned(),
@@ -459,7 +396,159 @@ pub fn admit_activation(
         manifest: parsed.manifest,
         order: premise.order().clone(),
         replay_scope: premise.replay_scope().clone(),
-    })
+        capability_policy: None,
+    };
+    if let Some(extension_id) = extension_id {
+        admitted.bind_capability_policy(extension_id, allowed_methods)?;
+    }
+    Ok(admitted)
+}
+
+fn derive_capability_methods(
+    premise: &ExecutionPremise,
+    dispatch: &DispatchResult,
+    manifest: &ActivationManifest,
+) -> Result<(Option<String>, Vec<String>), AdmissionError> {
+    let envelope = dispatch
+        .transition()
+        .state
+        .graph
+        .as_object()
+        .ok_or(AdmissionError::FenceMismatch("graph"))?;
+    let graph_value = envelope
+        .get("graph")
+        .ok_or(AdmissionError::FenceMismatch("graph"))?;
+    let claimed_graph_digest = envelope
+        .get("digest")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<Sha256Digest>().ok())
+        .ok_or(AdmissionError::FenceMismatch("graph_digest"))?;
+    let (_, graph_digest) =
+        canonicalize(graph_value).map_err(|_| AdmissionError::FenceMismatch("graph_digest"))?;
+    if claimed_graph_digest != graph_digest
+        || graph_digest.to_string() != premise.digests().graph_digest()
+    {
+        return Err(AdmissionError::FenceMismatch("graph_digest"));
+    }
+    if envelope
+        .get("revision")
+        .and_then(Value::as_i64)
+        != Some(manifest.graph_revision.value() as i64)
+    {
+        return Err(AdmissionError::FenceMismatch("graph_revision"));
+    }
+    let graph = graph_value
+        .as_object()
+        .ok_or(AdmissionError::FenceMismatch("graph"))?;
+    let descriptor_entry = graph
+        .get("descriptors")
+        .and_then(Value::as_object)
+        .and_then(|descriptors| descriptors.get(premise.identity().module_id()))
+        .ok_or(AdmissionError::FenceMismatch("descriptor"))?;
+    if descriptor_entry.get("module_id").and_then(Value::as_str)
+        != Some(premise.identity().module_id())
+        || descriptor_entry
+            .get("descriptor_revision")
+            .and_then(Value::as_i64)
+            != Some(manifest.descriptor_revision.value() as i64)
+    {
+        return Err(AdmissionError::FenceMismatch("descriptor"));
+    }
+    let descriptor_value = descriptor_entry
+        .get("value")
+        .ok_or(AdmissionError::FenceMismatch("descriptor"))?;
+    if descriptor_value.get("module_id").and_then(Value::as_str)
+        != Some(premise.identity().module_id())
+    {
+        return Err(AdmissionError::FenceMismatch("descriptor"));
+    }
+    let (_, descriptor_digest) = canonicalize(descriptor_value)
+        .map_err(|_| AdmissionError::FenceMismatch("descriptor_digest"))?;
+    let claimed_descriptor_digest = descriptor_entry
+        .get("source_descriptor_digest")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<Sha256Digest>().ok())
+        .ok_or(AdmissionError::FenceMismatch("descriptor_digest"))?;
+    if claimed_descriptor_digest != descriptor_digest
+        || descriptor_digest.to_string() != premise.digests().descriptor_digest()
+    {
+        return Err(AdmissionError::FenceMismatch("descriptor_digest"));
+    }
+    let Some(metadata) = descriptor_value.get("metadata").and_then(Value::as_object) else {
+        return Ok((None, Vec::new()));
+    };
+    let mut declarations = metadata.iter().filter_map(|(extension_id, namespace)| {
+        namespace
+            .as_object()?
+            .get("capabilities")
+            .map(|methods| (extension_id, methods))
+    });
+    let Some((extension_id, capabilities)) = declarations.next() else {
+        return Ok((None, Vec::new()));
+    };
+    if declarations.next().is_some() {
+        return Err(AdmissionError::CapabilityDenied);
+    }
+    let methods = capabilities
+        .as_array()
+        .ok_or(AdmissionError::CapabilityDenied)?;
+    let mut allowed_methods = Vec::with_capacity(methods.len());
+    for method in methods {
+        let method = method.as_str().ok_or(AdmissionError::CapabilityDenied)?;
+        if !valid_host_method(method) {
+            return Err(AdmissionError::CapabilityDenied);
+        }
+        allowed_methods.push(method.to_owned());
+    }
+    allowed_methods.sort();
+    allowed_methods.dedup();
+    Ok((Some(extension_id.to_owned()), allowed_methods))
+}
+
+fn capability_binding_digest(
+    premise: &FencedInvocationPremise,
+    extension_id: &str,
+) -> Result<Sha256Digest, AdmissionError> {
+    let manifest = serde_json::to_value(premise.manifest())
+        .map_err(|_| AdmissionError::CapabilityDenied)?;
+    let binding = json!({
+        "extension_id": extension_id,
+        "activation_id": premise.activation_id(),
+        "module_id": premise.module_id(),
+        "request_id": premise.request_id(),
+        "reservation_id": premise.reservation_id(),
+        "lease_id": premise.lease_id(),
+        "worker_epoch": premise.worker_epoch().to_string(),
+        "worker_epoch_fence": premise.worker_epoch_fence(),
+        "incarnation_revision": premise.incarnation_revision(),
+        "extension_connection_id": premise.extension_connection_id(),
+        "extension_generation": premise.extension_generation(),
+        "lease_generation": premise.lease_generation(),
+        "attempt": premise.attempt(),
+        "lease_token_digest": premise.lease_token_digest().to_string(),
+        "frame_digest": premise.frame_digest().to_string(),
+        "graph_digest": premise.graph_digest().to_string(),
+        "descriptor_digest": premise.descriptor_digest().to_string(),
+        "manifest_digest": premise.manifest_digest().to_string(),
+        "effective_config_digest": premise.effective_config_digest().to_string(),
+        "effective_config_schema_digest": premise
+            .effective_config_schema_digest()
+            .to_string(),
+        "manifest": manifest,
+    });
+    canonicalize(&binding)
+        .map(|(_, digest)| digest)
+        .map_err(|_| AdmissionError::CapabilityDenied)
+}
+fn valid_host_method(method: &str) -> bool {
+    !method.is_empty()
+        && method.len() <= 160
+        && method.starts_with("host.")
+        && method.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'-')
+        })
 }
 
 fn parse_frame(
@@ -509,7 +598,7 @@ fn parse_frame(
         return Err(AdmissionError::InvalidFrame("attempt"));
     }
     let CanonicalJsonValue::Object(params_object) = params else {
-        return Err(AdmissionError::InvalidFrame("params"));
+        return Err(AdmissionError::InvalidFrame("manifest"));
     };
     let manifest_value = params_object
         .get("manifest")
@@ -891,80 +980,4 @@ fn frame_nesting_depth(frame: &[u8]) -> u16 {
         }
     }
     maximum
-}
-
-impl Serialize for RpcDirection {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(match self {
-            Self::HostToExtension => "host_to_extension",
-            Self::ExtensionToHost => "extension_to_host",
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-    #[test]
-    fn undeclared_capability_is_rejected_without_an_executor() {
-        let projection = CapabilityProjection::new(
-            "org.example.extension",
-            "module",
-            DIGEST,
-            vec!["host.block.get".into()],
-        )
-        .unwrap();
-        let request = CapabilityRequest::new(
-            "org.example.extension",
-            "module",
-            DIGEST,
-            "host.model.invoke",
-            RpcDirection::ExtensionToHost,
-        )
-        .unwrap();
-        assert_eq!(
-            admit_capability(&projection, &request),
-            Err(AdmissionError::CapabilityDenied)
-        );
-    }
-
-    #[test]
-    fn cross_extension_capability_is_rejected_before_any_effect() {
-        let projection = CapabilityProjection::new(
-            "org.example.extension",
-            "module",
-            DIGEST,
-            vec!["host.block.get".into()],
-        )
-        .unwrap();
-        let request = CapabilityRequest::new(
-            "org.other.extension",
-            "module",
-            DIGEST,
-            "host.block.get",
-            RpcDirection::ExtensionToHost,
-        )
-        .unwrap();
-        assert_eq!(
-            admit_capability(&projection, &request),
-            Err(AdmissionError::CapabilityDenied)
-        );
-    }
-
-    #[test]
-    fn reverse_direction_is_rejected_before_any_effect() {
-        assert!(
-            CapabilityRequest::new(
-                "org.example.extension",
-                "module",
-                DIGEST,
-                "host.block.get",
-                RpcDirection::HostToExtension,
-            )
-            .is_err()
-        );
-    }
 }

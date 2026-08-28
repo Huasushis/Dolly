@@ -7,7 +7,9 @@
 //! and effect semantics. The two hostile inputs reference accepted capability
 //! controls instead of repeating them here.
 
-use dolly_canonical_json::{Sha256Digest, canonicalize};
+use dolly_canonical_json::{
+    CanonicalJsonObject, CanonicalJsonValue, Sha256Digest, canonicalize,
+};
 use dolly_core_domain::LeaseToken;
 use dolly_core_reducer::{
     ActivationState, BuildManifestCommand, CoreCommand, EnvironmentInput, InstallConfigCommand,
@@ -81,7 +83,7 @@ fn descriptor(module_id: &str) -> Value {
         "actions": [],
         "activation_replay_contract": {"mode":"fenced_replay","evidence":"pure_compute","ledger":null},
         "trust": "trusted",
-        "metadata": {}
+        "metadata": {"org.example.extension":{"capabilities":["host.block.get"]}}
     })
 }
 
@@ -103,7 +105,7 @@ fn graph_snapshot(module_id: &str) -> Value {
         "output_pages": {},
         "subscriptions": {},
         "descriptors": descriptors,
-        "authorized_metadata_namespaces": [],
+        "authorized_metadata_namespaces": ["org.example.extension"],
         "authorized_action_names": []
     })
 }
@@ -534,24 +536,26 @@ fn g2_admission_001_valid_committed_g1_module_activate_reaches_one_host_admissio
     assert_eq!(admitted.order(), premise.order());
     assert_eq!(admitted.replay_scope(), premise.replay_scope());
 
-    let capability_digest = admitted.manifest_digest().to_string();
-    let projection = dolly_extension_host::CapabilityProjection::new(
-        "org.example.extension",
-        admitted.module_id(),
-        &capability_digest,
-        vec!["host.block.get".into()],
-    )
-    .expect("Host capability projection");
-    let capability = dolly_extension_host::CapabilityRequest::new(
-        "org.example.extension",
-        admitted.module_id(),
-        &capability_digest,
-        "host.block.get",
-        dolly_extension_host::RpcDirection::ExtensionToHost,
-    )
-    .expect("Host capability request");
-    dolly_extension_host::admit_capability(&projection, &capability)
-        .expect("bound capability must pass Host admission");
+    let arguments = CanonicalJsonObject::try_from_iter([(
+        "page_id".into(),
+        CanonicalJsonValue::String("page".into()),
+    )])
+    .expect("capability arguments");
+    let sdk_request =
+        dolly_extension_sdk::CapabilityRequest::new("host.block.get", arguments.clone())
+            .expect("declared SDK capability");
+    let admitted_request =
+        dolly_extension_host::admit_sdk_capability(&admitted, sdk_request)
+            .expect("declared capability must pass Host admission");
+    assert_eq!(admitted_request.method(), "host.block.get");
+    assert_eq!(admitted_request.arguments(), &arguments);
+    let fabricated =
+        dolly_extension_sdk::CapabilityRequest::new("host.model.invoke", arguments)
+            .expect("fabricated SDK capability");
+    assert_eq!(
+        dolly_extension_host::admit_sdk_capability(&admitted, fabricated).unwrap_err(),
+        dolly_extension_host::AdmissionError::CapabilityDenied
+    );
 }
 
 #[test]

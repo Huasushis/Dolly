@@ -18,3 +18,4 @@ thiserror = "2"
 [dev-dependencies]
 dolly-extension-host = { path = "../dolly-extension-host" }
 dolly-protocol = { path = "../dolly-protocol" }
+dolly-extension-sdk = { path = "../dolly-extension-sdk" }

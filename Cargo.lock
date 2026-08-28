@@ -229,6 +229,7 @@ dependencies = [
  "dolly-core-domain",
  "dolly-core-reducer",
  "dolly-extension-host",
+ "dolly-extension-sdk",
  "dolly-protocol",
  "dolly-schema",
  "dolly-storage",

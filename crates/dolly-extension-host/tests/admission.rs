@@ -4,7 +4,7 @@ use dolly_core_reducer::{
     BuildManifestCommand, CoreCommand, EnvironmentInput, InstallConfigCommand, InstallGraphCommand,
     TransitionOutcome,
 };
-use dolly_extension_host::{CapabilityProjection, admit_activation, admit_sdk_capability};
+use dolly_extension_host::{admit_activation, admit_sdk_capability, AdmissionError};
 use dolly_extension_sdk::{CapabilityRequest, ResultData};
 use dolly_protocol::FrameLimits;
 use dolly_runtime::{DispatchResult, LeaseRequest, RuntimeTransactionEngine};
@@ -45,7 +45,7 @@ fn descriptor() -> Value {
         "actions": [],
         "activation_replay_contract": {"mode":"fenced_replay", "evidence":"pure_compute", "ledger":null},
         "trust": "trusted",
-        "metadata": {}
+        "metadata": {"org.example.extension":{"capabilities":["host.block.get"]}}
     })
 }
 
@@ -191,19 +191,15 @@ fn accepted_g1_frame_becomes_fenced_premise_and_replay_is_same_key() {
         CanonicalJsonValue::String("page".into()),
     )])
     .unwrap();
-    let projection = CapabilityProjection::new(
-        "org.example.extension",
-        "timer",
-        &admitted.manifest_digest().to_string(),
-        vec!["host.block.get".into()],
-    )
-    .unwrap();
     let sdk_request = CapabilityRequest::new("host.block.get", arguments.clone()).unwrap();
-    let admitted_request = admit_sdk_capability(&admitted, &projection, sdk_request).unwrap();
+    let admitted_request = admit_sdk_capability(&admitted, sdk_request).unwrap();
     assert_eq!(admitted_request.method(), "host.block.get");
     assert_eq!(admitted_request.arguments(), &arguments);
-    let undeclared = CapabilityRequest::new("host.model.invoke", arguments.clone()).unwrap();
-    assert!(admit_sdk_capability(&admitted, &projection, undeclared).is_err());
+    let fabricated = CapabilityRequest::new("host.model.invoke", arguments.clone()).unwrap();
+    assert_eq!(
+        admit_sdk_capability(&admitted, fabricated).unwrap_err(),
+        AdmissionError::CapabilityDenied
+    );
     let result = ResultData::success(None, None);
     let receipt = admitted.result_receipt(&result).unwrap();
     assert_eq!(receipt.replay_key(), admitted.replay_key());
