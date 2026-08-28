@@ -35,7 +35,7 @@
       "id": "G3-OPERABLE-LOCAL-001",
       "name": "valid_committed_g2_invocation_reaches_supervised_local_operational_premise_before_external_io",
       "kind": "valid_operational_premise",
-      "expected": "product_red",
+      "expected": "pass",
       "source_case": "G2-ADMISSION-001",
       "fences": [
         "activation_id",
